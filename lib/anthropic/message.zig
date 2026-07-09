@@ -1,0 +1,170 @@
+//! The conversation data model and JSON request serialization for the Messages
+//! API. Holds no state and does no I/O — callers own the message list and its
+//! backing memory; `Client` sends the bytes this module produces.
+
+const std = @import("std");
+
+/// Required first system block for subscription OAuth tokens.
+pub const system_header = "You are Claude Code, Anthropic's official CLI for Claude.";
+
+pub const Role = enum {
+    user,
+    assistant,
+
+    fn json(self: Role) []const u8 {
+        return @tagName(self);
+    }
+};
+
+pub const Block = union(enum) {
+    text: []const u8,
+    tool_use: ToolUse,
+    tool_result: ToolResult,
+
+    pub const ToolUse = struct {
+        id: []const u8,
+        name: []const u8,
+        /// Raw JSON object for the tool input; empty is serialized as `{}`.
+        input_json: []const u8,
+    };
+
+    pub const ToolResult = struct {
+        tool_use_id: []const u8,
+        content: []const u8,
+        is_error: bool,
+    };
+};
+
+pub const Message = struct {
+    role: Role,
+    blocks: []const Block,
+};
+
+pub const Tool = struct {
+    name: []const u8,
+    description: []const u8,
+    /// Raw JSON Schema object for the tool's input.
+    schema_json: []const u8,
+};
+
+pub const Request = struct {
+    model: []const u8,
+    tokens_max: u32,
+    system: []const u8,
+    messages: []const Message,
+    tools: []const Tool,
+};
+
+/// Serialize `request` into an owned JSON body; caller frees the result.
+pub fn serialize(gpa: std.mem.Allocator, request: Request) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    const writer = &out.writer;
+
+    try writer.writeAll("{\"model\":");
+    try string(writer, request.model);
+    try writer.print(",\"max_tokens\":{d},\"stream\":true,\"system\":[", .{request.tokens_max});
+    try writeSystemBlock(writer, system_header);
+    try writer.writeAll(",");
+    try writeSystemBlock(writer, request.system);
+    try writer.writeAll("]");
+
+    if (request.tools.len > 0) {
+        try writer.writeAll(",\"tools\":[");
+        for (request.tools, 0..) |tool, index| {
+            if (index > 0) try writer.writeAll(",");
+            try writer.writeAll("{\"name\":");
+            try string(writer, tool.name);
+            try writer.writeAll(",\"description\":");
+            try string(writer, tool.description);
+            try writer.writeAll(",\"input_schema\":");
+            try writer.writeAll(tool.schema_json);
+            try writer.writeAll("}");
+        }
+        try writer.writeAll("]");
+    }
+
+    try writer.writeAll(",\"messages\":[");
+    for (request.messages, 0..) |message, index| {
+        if (index > 0) try writer.writeAll(",");
+        try writeMessage(writer, message);
+    }
+    try writer.writeAll("]}");
+
+    return out.toOwnedSlice();
+}
+
+fn writeSystemBlock(writer: *std.Io.Writer, text: []const u8) !void {
+    try writer.writeAll("{\"type\":\"text\",\"text\":");
+    try string(writer, text);
+    try writer.writeAll("}");
+}
+
+fn writeMessage(writer: *std.Io.Writer, message: Message) !void {
+    try writer.writeAll("{\"role\":");
+    try string(writer, message.role.json());
+    try writer.writeAll(",\"content\":[");
+    for (message.blocks, 0..) |block, index| {
+        if (index > 0) try writer.writeAll(",");
+        try writeBlock(writer, block);
+    }
+    try writer.writeAll("]}");
+}
+
+fn writeBlock(writer: *std.Io.Writer, block: Block) !void {
+    switch (block) {
+        .text => |text| {
+            try writer.writeAll("{\"type\":\"text\",\"text\":");
+            try string(writer, text);
+            try writer.writeAll("}");
+        },
+        .tool_use => |use| {
+            try writer.writeAll("{\"type\":\"tool_use\",\"id\":");
+            try string(writer, use.id);
+            try writer.writeAll(",\"name\":");
+            try string(writer, use.name);
+            try writer.writeAll(",\"input\":");
+            try writer.writeAll(if (use.input_json.len == 0) "{}" else use.input_json);
+            try writer.writeAll("}");
+        },
+        .tool_result => |result| {
+            try writer.writeAll("{\"type\":\"tool_result\",\"tool_use_id\":");
+            try string(writer, result.tool_use_id);
+            try writer.print(",\"is_error\":{},\"content\":", .{result.is_error});
+            try string(writer, result.content);
+            try writer.writeAll("}");
+        },
+    }
+}
+
+fn string(writer: *std.Io.Writer, text: []const u8) !void {
+    try std.json.Stringify.value(text, .{}, writer);
+}
+
+test serialize {
+    const messages = [_]Message{
+        .{ .role = .user, .blocks = &.{.{ .text = "hi \"there\"" }} },
+    };
+    const tools = [_]Tool{
+        .{ .name = "read", .description = "read a file", .schema_json = "{\"type\":\"object\"}" },
+    };
+    const body = try serialize(std.testing.allocator, .{
+        .model = "claude-sonnet-4-6",
+        .tokens_max = 1024,
+        .system = "be terse",
+        .messages = &messages,
+        .tools = &tools,
+    });
+    defer std.testing.allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    try std.testing.expectEqualStrings("claude-sonnet-4-6", root.get("model").?.string);
+    try std.testing.expectEqual(true, root.get("stream").?.bool);
+    try std.testing.expectEqual(@as(usize, 2), root.get("system").?.array.items.len);
+    try std.testing.expectEqualStrings(
+        system_header,
+        root.get("system").?.array.items[0].object.get("text").?.string,
+    );
+}

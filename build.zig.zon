@@ -1,0 +1,12 @@
+.{
+    .name = .pith,
+    .version = "0.0.0",
+    .fingerprint = 0x547dab72a247675,
+    .minimum_zig_version = "0.16.0",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "bin",
+        "lib",
+    },
+}
