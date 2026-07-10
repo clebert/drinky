@@ -105,7 +105,10 @@ fn escapeLength(text: []const u8) usize {
             }
             return text.len;
         },
-        ']' => {
+        // String-terminated controls: OSC, APC, DCS, PM, SOS. Each runs to a
+        // BEL or the ST sequence (ESC `\`). The zero-width cursor marker is an
+        // APC string, so it is measured here and never counts toward a column.
+        ']', '_', 'P', '^', 'X' => {
             var index: usize = 2;
             while (index < text.len) : (index += 1) {
                 if (text[index] == 0x07) return index + 1;
@@ -125,6 +128,8 @@ test display {
     try std.testing.expectEqual(@as(usize, 3), display("a\x1b[31mbc\x1b[0m"));
     try std.testing.expectEqual(@as(usize, 2), display("\x1b]8;;http://x\x07hi\x1b]8;;\x07"));
     try std.testing.expectEqual(@as(usize, 1), display("é"));
+    // The APC cursor marker is zero-width and does not split a wrapped line.
+    try std.testing.expectEqual(@as(usize, 2), display("a\x1b_p\x1b\\b"));
 }
 
 test truncate {

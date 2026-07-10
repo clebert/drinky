@@ -27,10 +27,26 @@ pub const cursor_show = "\x1b[?25h";
 pub const line_clear = "\x1b[2K";
 /// Erase from the cursor to the end of the screen.
 pub const screen_clear_below = "\x1b[0J";
+/// Clear the whole screen, home the cursor, then drop the scrollback: the full
+/// reset used when a change lands above the viewport and the buffer must be
+/// reprinted from scratch.
+pub const screen_reset = "\x1b[2J\x1b[H\x1b[3J";
 
 /// Move the cursor up `count` rows. No-op at zero, so the sequence is never
 /// emitted with an implicit argument.
 pub fn cursorUp(writer: *std.Io.Writer, count: usize) !void {
     if (count == 0) return;
     try writer.print("\x1b[{d}A", .{count});
+}
+
+/// Move the cursor down `count` rows, no-op at zero.
+pub fn cursorDown(writer: *std.Io.Writer, count: usize) !void {
+    if (count == 0) return;
+    try writer.print("\x1b[{d}B", .{count});
+}
+
+/// Move the cursor right `count` columns, no-op at zero.
+pub fn cursorForward(writer: *std.Io.Writer, count: usize) !void {
+    if (count == 0) return;
+    try writer.print("\x1b[{d}C", .{count});
 }

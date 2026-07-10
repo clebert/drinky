@@ -1,8 +1,16 @@
-//! The composition root and event loop. Wires the terminal, renderer, input
-//! parser, editor, and agent together: ensures the user is authenticated, then
-//! reads keys into the editor and drives one agent turn per submitted line,
-//! streaming the reply into the live region. Presentation of agent events
-//! (`onText`/`onToolStart`/`onToolResult`/`onError`) lives here.
+//! The composition root and event loop. Wires the terminal, differential
+//! surface, input parser, editor, and agent together: ensures the user is
+//! authenticated, then reads keys into the editor and drives one agent turn per
+//! submitted line, streaming the reply into the transcript.
+//!
+//! Rendering is a single model: the whole frame is a list of lines, and every
+//! refresh rebuilds it and hands it to the `Surface`, which diffs and repaints
+//! the smallest region it can. The transcript is a list of `Entry` blocks (user
+//! messages, model text, tool results, notices), each caching its own rendered
+//! lines so only a changed block re-wraps; below it sit the live tail (a running
+//! tool's box and the spinner) and the footer (the editor or picker, with the
+//! status line). One layout rule spaces them: a single blank line separates
+//! adjacent blocks, and boxes carry their own colored padding.
 
 const std = @import("std");
 
@@ -25,6 +33,8 @@ const system_prompt =
     "with read, create or overwrite them with write, and change existing files with edit " ++
     "(give old_text that occurs exactly once).";
 
+const intro_text = "pith — enter: send · shift+enter: newline · esc: cancel · ctrl+c: clear (twice: quit) · ctrl+d: quit";
+
 const dim = "\x1b[2m";
 const red = "\x1b[31m";
 const reset = "\x1b[0m";
@@ -43,10 +53,24 @@ const spinner_frames = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", 
 /// Two Ctrl+C presses within this window quit; a lone press clears the editor.
 const ctrl_c_window_ms = 500;
 
-const Styled = struct { style: []const u8, prefix: []const u8, text: []const u8 };
+const BoxStyle = struct { background: []const u8, foreground: []const u8 };
 
-/// The tool call currently running: its blue box shows in the live region for
-/// the whole blocking call. Both strings are owned and freed on completion.
+/// One transcript block. `text` is the source; `lines` caches its rendering at
+/// width `columns` so a refresh re-wraps a block only when the width changes or
+/// the block is invalidated (`columns = 0`). The model-text block grows in place
+/// as its reply streams and is invalidated on each delta.
+const Entry = struct {
+    kind: Kind,
+    is_error: bool,
+    text: std.ArrayList(u8),
+    lines: std.ArrayList([]u8),
+    columns: usize,
+
+    const Kind = enum { intro, user, model, tool_result, feedback };
+};
+
+/// The tool call currently running: its blue box shows in the live tail for the
+/// whole blocking call. Both strings are owned and freed on completion.
 const ActiveTool = struct { name: []const u8, input_json: []const u8 };
 
 const Picking = struct {
@@ -58,29 +82,34 @@ const Picking = struct {
 gpa: std.mem.Allocator,
 io: std.Io,
 tty: terminal.Tty,
-renderer: tui.Renderer,
+surface: tui.Surface,
 input: tui.Input,
 editor: tui.Editor,
 auth: anthropic.Auth,
 agent: Agent,
-pending: std.ArrayList(u8),
+/// The permanent blocks above the live tail, oldest first.
+transcript: std.ArrayList(Entry),
+/// Index into `transcript` of the model-text block for the current text run, so
+/// streamed deltas keep appending to it until a tool call or turn boundary.
+current_model: ?usize,
+/// The composed frame handed to the surface: borrowed slices into the entry
+/// caches, the shared empty string for gaps, and `tail`. Rebuilt each refresh.
+frame: std.ArrayList([]const u8),
+/// Owns the live tail and footer lines for the current frame (freed each
+/// refresh); the transcript's own lines are owned by their entries.
+tail: std.ArrayList([]u8),
+/// Scratch reused to build one line before it is copied into a cache or `tail`;
+/// `lines` borrows it while a widget's rows are copied out.
 scratch: std.ArrayList(u8),
 lines: std.ArrayList([]const u8),
-/// The composed live region; owns each line so sections built into shared
-/// scratch buffers can be reused between them.
-live: std.ArrayList([]u8),
 status_buffer: std.ArrayList(u8),
 columns: usize,
+rows: usize,
 running: bool,
 /// A turn is streaming: show the spinner and keep the input box visible.
 busy: bool,
 spinner_frame: usize,
 active_tool: ?ActiveTool,
-/// The last committed row is a blank/padding row, so no extra gap is owed.
-trailing_gap: bool,
-/// Currently committing a run of assistant text, whose leading gap is emitted
-/// once at the run's start.
-in_text: bool,
 last_ctrl_c: i64,
 picking: ?Picking,
 
@@ -90,25 +119,28 @@ pub fn run(self: *App, gpa: std.mem.Allocator, io: std.Io, home: []const u8) !vo
     self.gpa = gpa;
     self.io = io;
     self.columns = 80;
+    self.rows = 24;
     self.last_ctrl_c = 0;
     self.picking = null;
     self.busy = false;
     self.spinner_frame = 0;
     self.active_tool = null;
-    self.trailing_gap = false;
-    self.in_text = false;
+    self.current_model = null;
     defer self.closePicker();
     defer self.clearActiveTool();
-    self.pending = .empty;
+    self.transcript = .empty;
+    self.frame = .empty;
+    self.tail = .empty;
     self.scratch = .empty;
     self.lines = .empty;
-    self.live = .empty;
     self.status_buffer = .empty;
-    defer self.pending.deinit(gpa);
+    defer self.transcript.deinit(gpa);
+    defer self.freeTranscript();
+    defer self.frame.deinit(gpa);
+    defer self.tail.deinit(gpa);
+    defer self.clearTail();
     defer self.scratch.deinit(gpa);
     defer self.lines.deinit(gpa);
-    defer self.live.deinit(gpa);
-    defer self.clearLive();
     defer self.status_buffer.deinit(gpa);
 
     self.auth = try anthropic.Auth.init(gpa, io, home);
@@ -120,14 +152,14 @@ pub fn run(self: *App, gpa: std.mem.Allocator, io: std.Io, home: []const u8) !vo
 
     try self.tty.init(io);
     defer self.tty.deinit();
-    self.renderer = tui.Renderer.init(gpa, self.tty.writer());
-    defer self.renderer.deinit();
+    self.surface = tui.Surface.init(gpa, self.tty.writer());
+    defer self.surface.deinit();
     self.input = tui.Input.init(gpa);
     defer self.input.deinit();
     self.editor = tui.Editor.init(gpa);
     defer self.editor.deinit();
 
-    try self.renderer.commit(&.{dim ++ "pith — enter: send · shift+enter: newline · esc: cancel · ctrl+c: clear (twice: quit) · ctrl+d: quit" ++ reset});
+    try self.appendEntry(.intro, false, intro_text);
     try self.refresh();
 
     self.running = true;
@@ -190,54 +222,175 @@ fn clearOrQuit(self: *App) void {
     }
 }
 
-/// Recompose and repaint the live region from the current state. Idle shows the
-/// input box; a picker replaces it; a turn stacks the in-progress output, the
-/// active tool's blue box, and the spinner above the (inert) input box. The
-/// status line stays pinned to the bottom in every phase.
+/// Rebuild the whole frame and hand it to the surface, which diffs and repaints.
+/// The transcript stacks first, each block from its own cache; then, unless a
+/// picker has taken over the footer, the live tail (a running tool's box and the
+/// spinner during a turn) and the footer (editor plus status). One blank line
+/// separates adjacent blocks.
 fn refresh(self: *App) !void {
-    self.columns = self.tty.size().columns;
-    self.clearLive();
+    const size = self.tty.size();
+    self.columns = size.columns;
+    self.rows = size.rows;
+    self.frame.clearRetainingCapacity();
+    self.clearTail();
+
+    for (self.transcript.items) |*entry| {
+        try self.gap();
+        try self.ensureEntry(entry);
+        for (entry.lines.items) |line| try self.frame.append(self.gpa, line);
+    }
+
     if (self.picking) |*picking| {
+        try self.gap();
         try picking.picker.render(self.columns, &self.scratch, &self.lines);
-        try self.pushLiveLines(self.lines.items);
+        for (self.lines.items) |line| try self.pushTail(line);
+        try self.pushTail(try self.statusLine());
     } else {
         if (self.busy) {
-            if (self.pending.items.len > 0) try self.pushLive(self.pending.items);
-            if (self.active_tool) |*active| try self.pushToolBox(active);
-            try self.pushSpinner();
+            if (self.active_tool) |*active| {
+                try self.gap();
+                try self.tailBox(.{ .background = tool_pending_bg, .foreground = tool_fg }, active);
+            }
+            try self.gap();
+            try self.pushTail(try self.spinnerLine());
         }
-        try self.editor.render(self.columns, &self.scratch, &self.lines);
-        try self.pushLiveLines(self.lines.items);
+        try self.gap();
+        try self.editor.render(self.columns, !self.busy, &self.scratch, &self.lines);
+        for (self.lines.items) |line| try self.pushTail(line);
+        try self.pushTail(try self.statusLine());
     }
-    try self.pushLive(try self.statusLine());
-    try self.renderer.render(self.live.items);
+
+    try self.surface.render(self.frame.items, .{ .columns = self.columns, .rows = self.rows });
 }
 
-/// Free the composed live region.
-fn clearLive(self: *App) void {
-    for (self.live.items) |line| self.gpa.free(line);
-    self.live.clearRetainingCapacity();
+/// The single layout rule: one blank line before every block but the first. The
+/// gap borrows a shared empty string, so it costs no allocation.
+fn gap(self: *App) !void {
+    if (self.frame.items.len > 0) try self.frame.append(self.gpa, "");
 }
 
-/// Copy `line` into an owned row of the live region.
-fn pushLive(self: *App, line: []const u8) !void {
-    try self.live.append(self.gpa, try self.gpa.dupe(u8, line));
+/// Copy `line` into a live-tail row, owned by `tail` and borrowed by `frame`.
+fn pushTail(self: *App, line: []const u8) !void {
+    const owned = try self.gpa.dupe(u8, line);
+    try self.tail.append(self.gpa, owned);
+    try self.frame.append(self.gpa, owned);
 }
 
-fn pushLiveLines(self: *App, lines: []const []const u8) !void {
-    for (lines) |line| try self.pushLive(line);
+fn clearTail(self: *App) void {
+    for (self.tail.items) |line| self.gpa.free(line);
+    self.tail.clearRetainingCapacity();
 }
 
-/// Push the running tool's blue box, showing the call and its arguments.
-fn pushToolBox(self: *App, active: *const ActiveTool) !void {
+fn freeTranscript(self: *App) void {
+    for (self.transcript.items) |*entry| {
+        entry.text.deinit(self.gpa);
+        for (entry.lines.items) |line| self.gpa.free(line);
+        entry.lines.deinit(self.gpa);
+    }
+}
+
+/// Rebuild `entry.lines` for the current width unless the cache is already valid.
+fn ensureEntry(self: *App, entry: *Entry) !void {
+    if (entry.columns == self.columns) return;
+    for (entry.lines.items) |line| self.gpa.free(line);
+    entry.lines.clearRetainingCapacity();
+    // Invalidate up front so a failed rebuild is retried, never left half-built
+    // behind a width that happens to match again later.
+    entry.columns = 0;
+    const text = entry.text.items;
+    switch (entry.kind) {
+        .intro => try self.renderStyledLines(&entry.lines, dim, "", text),
+        .feedback => try self.renderStyledLines(
+            &entry.lines,
+            if (entry.is_error) red else dim,
+            if (entry.is_error) "error: " else "",
+            text,
+        ),
+        .user => try self.renderBox(&entry.lines, .{ .background = user_bg, .foreground = user_fg }, text),
+        .model => try self.renderWrapped(&entry.lines, text),
+        .tool_result => try self.renderBox(&entry.lines, .{
+            .background = if (entry.is_error) tool_error_bg else tool_success_bg,
+            .foreground = tool_fg,
+        }, text),
+    }
+    entry.columns = self.columns;
+}
+
+/// Copy `line` into an owned row of `out`.
+fn pushLine(self: *App, out: *std.ArrayList([]u8), line: []const u8) !void {
+    try out.append(self.gpa, try self.gpa.dupe(u8, line));
+}
+
+/// Append `text` wrapped to the terminal width as plain lines (the model reply).
+fn renderWrapped(self: *App, out: *std.ArrayList([]u8), text: []const u8) !void {
+    var wrapped: std.ArrayList([]const u8) = .empty;
+    defer wrapped.deinit(self.gpa);
+    try tui.width.wrap(text, @max(self.columns, 1), &wrapped, self.gpa);
+    for (wrapped.items) |line| try self.pushLine(out, line);
+}
+
+/// Append each `\n`-separated line of `text`, styled and truncated to fit, with
+/// `prefix` on every line (a notice, error, or the intro).
+fn renderStyledLines(self: *App, out: *std.ArrayList([]u8), style: []const u8, prefix: []const u8, text: []const u8) !void {
+    var pieces = std.mem.splitScalar(u8, text, '\n');
+    while (pieces.next()) |piece| {
+        const available = self.columns -| tui.width.display(prefix);
+        const clipped = tui.width.truncate(piece, available);
+        self.scratch.clearRetainingCapacity();
+        try self.scratch.appendSlice(self.gpa, style);
+        try self.scratch.appendSlice(self.gpa, prefix);
+        try self.scratch.appendSlice(self.gpa, clipped);
+        try self.scratch.appendSlice(self.gpa, reset);
+        try self.pushLine(out, self.scratch.items);
+    }
+}
+
+/// Render the running tool's blue pending box into the live tail.
+fn tailBox(self: *App, style: BoxStyle, active: *const ActiveTool) !void {
     const text = try std.fmt.allocPrint(self.gpa, "{s} {s}", .{ active.name, active.input_json });
     defer self.gpa.free(text);
-    try self.renderBox(.{ .background = tool_pending_bg, .foreground = tool_fg }, text, &self.scratch, &self.lines);
-    try self.pushLiveLines(self.lines.items);
+    const start = self.tail.items.len;
+    try self.renderBox(&self.tail, style, text);
+    for (self.tail.items[start..]) |line| try self.frame.append(self.gpa, line);
 }
 
-/// Push the `⠋ Working…` spinner: accent glyph, muted message.
-fn pushSpinner(self: *App) !void {
+/// Append a padded background box: a blank padding row, `text` wrapped to the
+/// inner width with a one-space left pad and the background filled to full
+/// width, then a blank padding row. Self-separating, so it carries its own
+/// vertical breathing room inside the one-blank-line block gap around it.
+fn renderBox(self: *App, out: *std.ArrayList([]u8), style: BoxStyle, text: []const u8) !void {
+    var content: std.ArrayList([]const u8) = .empty;
+    defer content.deinit(self.gpa);
+    try tui.width.wrap(text, @max(self.columns -| 2, 1), &content, self.gpa);
+
+    try self.pushBoxBlank(out, style.background);
+    for (content.items) |line| try self.pushBoxLine(out, style, line);
+    try self.pushBoxBlank(out, style.background);
+}
+
+fn pushBoxBlank(self: *App, out: *std.ArrayList([]u8), background: []const u8) !void {
+    self.scratch.clearRetainingCapacity();
+    try self.scratch.appendSlice(self.gpa, background);
+    for (0..self.columns) |_| try self.scratch.append(self.gpa, ' ');
+    try self.scratch.appendSlice(self.gpa, reset);
+    try self.pushLine(out, self.scratch.items);
+}
+
+fn pushBoxLine(self: *App, out: *std.ArrayList([]u8), style: BoxStyle, line: []const u8) !void {
+    self.scratch.clearRetainingCapacity();
+    try self.scratch.appendSlice(self.gpa, style.background);
+    try self.scratch.appendSlice(self.gpa, style.foreground);
+    try self.scratch.append(self.gpa, ' ');
+    try self.scratch.appendSlice(self.gpa, line);
+    const used = 1 + tui.width.display(line);
+    for (0..self.columns -| used) |_| try self.scratch.append(self.gpa, ' ');
+    try self.scratch.appendSlice(self.gpa, reset);
+    try self.pushLine(out, self.scratch.items);
+}
+
+/// Build the `⠋ Working…` spinner line into `self.scratch`: accent glyph, muted
+/// message. Returns the composed slice, valid until `self.scratch` next changes.
+fn spinnerLine(self: *App) ![]const u8 {
     const gpa = self.gpa;
     const frame = spinner_frames[self.spinner_frame % spinner_frames.len];
     self.scratch.clearRetainingCapacity();
@@ -248,7 +401,7 @@ fn pushSpinner(self: *App) !void {
     try self.scratch.appendSlice(gpa, muted_fg);
     try self.scratch.appendSlice(gpa, "Working…");
     try self.scratch.appendSlice(gpa, reset);
-    try self.pushLive(self.scratch.items);
+    return self.scratch.items;
 }
 
 /// Advance the spinner one frame. The loop is blocked during a turn, so this
@@ -268,68 +421,77 @@ fn statusLine(self: *App) ![]const u8 {
     }, self.columns, &self.status_buffer, self.gpa);
 }
 
+/// Append a new transcript block copying `text` as its source.
+fn appendEntry(self: *App, kind: Entry.Kind, is_error: bool, text: []const u8) !void {
+    var list: std.ArrayList(u8) = .empty;
+    errdefer list.deinit(self.gpa);
+    try list.appendSlice(self.gpa, text);
+    try self.transcript.append(self.gpa, .{
+        .kind = kind,
+        .is_error = is_error,
+        .text = list,
+        .lines = .empty,
+        .columns = 0,
+    });
+}
+
+/// The model-text block for the current run, appending a fresh one on demand so
+/// a run of streamed text collects into a single block.
+fn currentModel(self: *App) !*Entry {
+    if (self.current_model == null) {
+        try self.appendEntry(.model, false, "");
+        self.current_model = self.transcript.items.len - 1;
+    }
+    return &self.transcript.items[self.current_model.?];
+}
+
 fn submit(self: *App) !void {
     const trimmed = std.mem.trim(u8, self.editor.content(), " \t\r\n");
     if (trimmed.len == 0) return;
     const text = try self.gpa.dupe(u8, trimmed);
     defer self.gpa.free(text);
     self.editor.clear();
-
     try self.refresh();
-    try self.commitUserMessage(text);
 
     if (std.mem.startsWith(u8, text, "/")) {
         try self.runCommand(text);
     } else {
+        try self.appendEntry(.user, false, text);
         try self.runTurn(text);
     }
     try self.refresh();
 }
 
-/// Drive one agent turn, streaming its reply into the live region while the
+/// Drive one agent turn, streaming its reply into the transcript while the
 /// spinner and (inert) input box stay pinned below it.
 fn runTurn(self: *App, text: []const u8) !void {
     self.busy = true;
-    self.in_text = false;
+    self.current_model = null;
     self.spinner_frame = 0;
     self.clearActiveTool();
     try self.refresh();
-    self.agent.run(text, self) catch |err| {
-        try self.flushPending();
-        try self.emitError(@errorName(err));
-    };
-    try self.flushPending();
+    self.agent.run(text, self) catch |err| try self.emitError(@errorName(err));
     self.clearActiveTool();
     self.busy = false;
+    self.current_model = null;
 }
 
 /// Handle a slash command locally: either print its feedback or open a picker.
 fn runCommand(self: *App, line: []const u8) !void {
     var context: command.Context = .{ .gpa = self.gpa, .agent = &self.agent };
     try self.handleOutcome(try command.run(&context, line));
+    try self.refresh();
 }
 
-/// Present a command outcome: print its feedback, or open its picker.
+/// Apply a command outcome to the transcript state; the caller refreshes.
 fn handleOutcome(self: *App, outcome: command.Outcome) !void {
     switch (outcome) {
         .feedback => |feedback| {
             defer self.gpa.free(feedback.content);
-            try self.commitFeedback(feedback.content, feedback.is_error);
+            try self.appendEntry(.feedback, feedback.is_error, feedback.content);
         },
         .pick => |pick| self.openPicker(pick),
     }
-}
-
-/// Commit a command's feedback one line per row, red when it reports failure.
-fn commitFeedback(self: *App, content: []const u8, is_error: bool) !void {
-    const style = if (is_error) red else dim;
-    const prefix = if (is_error) "error: " else "  ";
-    try self.gap();
-    var feedback = std.mem.splitScalar(u8, content, '\n');
-    while (feedback.next()) |feedback_line| {
-        try self.commitLine(.{ .style = style, .prefix = prefix, .text = feedback_line });
-    }
-    self.trailing_gap = false;
 }
 
 /// Enter picker mode over a command's options; navigation and confirmation run
@@ -369,17 +531,13 @@ fn confirmPicker(self: *App) !void {
     var context: command.Context = .{ .gpa = self.gpa, .agent = &self.agent };
     const outcome = try command.apply(&context, picking.command, picking.picker.choice());
     self.closePicker();
-    try self.refresh();
     try self.handleOutcome(outcome);
     try self.refresh();
 }
 
 fn cancelPicker(self: *App) !void {
     self.closePicker();
-    try self.refresh();
-    try self.gap();
-    try self.commitLine(.{ .style = dim, .prefix = "  ", .text = "cancelled" });
-    self.trailing_gap = false;
+    try self.appendEntry(.feedback, false, "cancelled");
     try self.refresh();
 }
 
@@ -392,30 +550,16 @@ fn closePicker(self: *App) void {
 
 pub fn onText(self: *App, delta: []const u8) !void {
     self.advanceSpinner();
-    try self.pending.appendSlice(self.gpa, delta);
-    while (true) {
-        const line = self.pending.items;
-        if (std.mem.indexOfScalar(u8, line, '\n')) |newline| {
-            try self.beginText();
-            try self.renderer.commit(&.{line[0..newline]});
-            self.trailing_gap = newline == 0;
-            self.dropPending(newline + 1);
-            continue;
-        }
-        if (tui.width.display(line) <= self.columns) break;
-        const fit = tui.width.truncate(line, self.columns).len;
-        try self.beginText();
-        try self.renderer.commit(&.{line[0..fit]});
-        self.trailing_gap = false;
-        self.dropPending(fit);
-    }
+    const entry = try self.currentModel();
+    try entry.text.appendSlice(self.gpa, delta);
+    entry.columns = 0;
     try self.refresh();
 }
 
 pub fn onToolStart(self: *App, name: []const u8, input_json: []const u8) !void {
     self.advanceSpinner();
-    try self.flushPending();
     self.clearActiveTool();
+    self.current_model = null;
     self.active_tool = .{
         .name = try self.gpa.dupe(u8, name),
         .input_json = try self.gpa.dupe(u8, input_json),
@@ -426,133 +570,25 @@ pub fn onToolStart(self: *App, name: []const u8, input_json: []const u8) !void {
 pub fn onToolResult(self: *App, name: []const u8, content: []const u8, is_error: bool) !void {
     self.advanceSpinner();
     const first = content[0 .. std.mem.indexOfScalar(u8, content, '\n') orelse content.len];
-    const background = if (is_error) tool_error_bg else tool_success_bg;
-    const arguments = try self.gpa.dupe(u8, if (self.active_tool) |active| active.input_json else "");
-    defer self.gpa.free(arguments);
-    self.clearActiveTool();
-    try self.refresh();
+    const arguments = if (self.active_tool) |active| active.input_json else "";
     const text = try std.fmt.allocPrint(self.gpa, "{s} {s}\n→ {s}", .{ name, arguments, first });
     defer self.gpa.free(text);
-    try self.renderBox(.{ .background = background, .foreground = tool_fg }, text, &self.scratch, &self.lines);
-    try self.renderer.commit(self.lines.items);
-    self.trailing_gap = true;
+    self.clearActiveTool();
+    self.current_model = null;
+    try self.appendEntry(.tool_result, is_error, text);
+    try self.refresh();
 }
 
 pub fn onError(self: *App, text: []const u8) !void {
     self.advanceSpinner();
-    try self.flushPending();
     try self.emitError(text);
-    try self.refresh();
 }
 
-/// Commit an error line, separated from whatever precedes it.
+/// Record an error as a red transcript notice and repaint.
 fn emitError(self: *App, text: []const u8) !void {
-    try self.gap();
-    try self.commitLine(.{ .style = red, .prefix = "error: ", .text = text });
-    self.trailing_gap = false;
-}
-
-/// End a run of assistant text: commit the trailing partial line, if any, and
-/// drop it from the live region so it is not shown twice.
-fn flushPending(self: *App) !void {
-    if (self.pending.items.len > 0) {
-        try self.beginText();
-        const tail = try self.gpa.dupe(u8, self.pending.items);
-        defer self.gpa.free(tail);
-        self.pending.clearRetainingCapacity();
-        try self.refresh();
-        try self.renderer.commit(&.{tail});
-        self.trailing_gap = false;
-    }
-    self.in_text = false;
-}
-
-fn dropPending(self: *App, count: usize) void {
-    const kept = self.pending.items.len - count;
-    std.mem.copyForwards(u8, self.pending.items[0..kept], self.pending.items[count..]);
-    self.pending.shrinkRetainingCapacity(kept);
-}
-
-/// Commit the submitted message as a grey padded box filling the terminal width.
-fn commitUserMessage(self: *App, text: []const u8) !void {
-    try self.renderBox(.{ .background = user_bg, .foreground = user_fg }, text, &self.scratch, &self.lines);
-    try self.renderer.commit(self.lines.items);
-    self.trailing_gap = true;
-}
-
-/// Build a padded background block into `buffer`/`lines` (both cleared first): a
-/// blank padding row, the `text` wrapped to the inner width with a one-space
-/// left pad and the background filled to full width, and a blank padding row —
-/// at least three rows. `lines` borrows from `buffer`, so keep it alive.
-fn renderBox(
-    self: *App,
-    style: struct { background: []const u8, foreground: []const u8 },
-    text: []const u8,
-    buffer: *std.ArrayList(u8),
-    lines: *std.ArrayList([]const u8),
-) !void {
-    const gpa = self.gpa;
-    const columns = self.columns;
-    buffer.clearRetainingCapacity();
-    lines.clearRetainingCapacity();
-
-    var content: std.ArrayList([]const u8) = .empty;
-    defer content.deinit(gpa);
-    try tui.width.wrap(text, @max(columns -| 2, 1), &content, gpa);
-
-    // Build every row into `buffer`, then resolve the slices by offset only
-    // after the last append: growth can move the backing store and invalidate a
-    // slice taken earlier.
-    var offsets: std.ArrayList(usize) = .empty;
-    defer offsets.deinit(gpa);
-
-    try offsets.append(gpa, buffer.items.len);
-    try appendBlankRow(buffer, gpa, style.background, columns);
-    for (content.items) |line| {
-        try offsets.append(gpa, buffer.items.len);
-        try buffer.appendSlice(gpa, style.background);
-        try buffer.appendSlice(gpa, style.foreground);
-        try buffer.append(gpa, ' ');
-        try buffer.appendSlice(gpa, line);
-        const used = 1 + tui.width.display(line);
-        for (0..columns -| used) |_| try buffer.append(gpa, ' ');
-        try buffer.appendSlice(gpa, reset);
-    }
-    try offsets.append(gpa, buffer.items.len);
-    try appendBlankRow(buffer, gpa, style.background, columns);
-    const end = buffer.items.len;
-
-    for (offsets.items, 0..) |start, index| {
-        const stop = if (index + 1 < offsets.items.len) offsets.items[index + 1] else end;
-        try lines.append(gpa, buffer.items[start..stop]);
-    }
-}
-
-fn appendBlankRow(
-    buffer: *std.ArrayList(u8),
-    gpa: std.mem.Allocator,
-    background: []const u8,
-    columns: usize,
-) !void {
-    try buffer.appendSlice(gpa, background);
-    for (0..columns) |_| try buffer.append(gpa, ' ');
-    try buffer.appendSlice(gpa, reset);
-}
-
-/// Commit a blank separator unless the last committed row already was one.
-fn gap(self: *App) !void {
-    if (!self.trailing_gap) {
-        try self.renderer.commit(&.{""});
-        self.trailing_gap = true;
-    }
-}
-
-/// Emit the leading gap for a run of assistant text, once at the run's start.
-fn beginText(self: *App) !void {
-    if (!self.in_text) {
-        try self.gap();
-        self.in_text = true;
-    }
+    self.current_model = null;
+    try self.appendEntry(.feedback, true, text);
+    try self.refresh();
 }
 
 fn clearActiveTool(self: *App) void {
@@ -563,17 +599,8 @@ fn clearActiveTool(self: *App) void {
     }
 }
 
-/// Commit a single styled status line, truncating `line.text` to fit.
-fn commitLine(self: *App, line: Styled) !void {
-    const available = self.columns -| tui.width.display(line.prefix);
-    const clipped = tui.width.truncate(line.text, available);
-    const composed = try std.fmt.allocPrint(self.gpa, "{s}{s}{s}{s}", .{ line.style, line.prefix, clipped, reset });
-    defer self.gpa.free(composed);
-    try self.renderer.commit(&.{composed});
-}
-
 // Mirrors the read loop's inner pipeline without a tty: one read chunk carries
-// several keystrokes, which must decode, edit, and paint into the live region.
+// several keystrokes, which must decode, edit, and paint into the frame.
 test "a read chunk drives the editor and paints the result" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -583,8 +610,8 @@ test "a read chunk drives the editor and paints the result" {
     defer input.deinit();
     var editor = tui.Editor.init(gpa);
     defer editor.deinit();
-    var renderer = tui.Renderer.init(gpa, &out.writer);
-    defer renderer.deinit();
+    var surface = tui.Surface.init(gpa, &out.writer);
+    defer surface.deinit();
     var scratch: std.ArrayList(u8) = .empty;
     defer scratch.deinit(gpa);
     var lines: std.ArrayList([]const u8) = .empty;
@@ -596,8 +623,8 @@ test "a read chunk drives the editor and paints the result" {
         .backspace => editor.backspace(),
         else => {},
     };
-    try editor.render(80, &scratch, &lines);
-    try renderer.render(lines.items);
+    try editor.render(80, true, &scratch, &lines);
+    try surface.render(lines.items, .{ .columns = 80, .rows = 24 });
 
     try std.testing.expectEqualStrings("hllo", editor.content());
     const painted = out.written();

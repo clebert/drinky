@@ -136,11 +136,39 @@ Extension seams referenced here:
 
 ## UI
 
+- [ ] **Accurate display widths (wide glyphs).** `src/tui/width.zig` counts every
+      printable codepoint as one column, so CJK, emoji, and combining marks are miscounted. The
+      differential `Surface` does cursor math over the whole in-memory frame assuming one physical
+      row per frame line, so a line whose real width exceeds `columns` auto-wraps in the terminal
+      and permanently desyncs `cursor_row` until the next resize/full repaint. Add a `wcwidth`-style
+      table (East Asian Width + emoji + zero-width combining) to `width.display`/`truncate`/`wrap`;
+      `VirtualTerminal` should then model right-margin autowrap so a test can catch the desync.
+- [ ] **Extract block rendering into a `tui` widget + shared color namespace.** `src/App.zig` is
+      both the composition root and the renderer for every transcript block
+      (`renderBox`/`renderStyledLines`/`renderWrapped`/`pushBox*`) with a module-level color palette,
+      while `Editor`/`Picker` are self-rendering widgets with a `render(columns, …, buffer, lines)`
+      contract. Move block rendering behind that same contract (a `Box`/`block` module) so blocks are
+      unit-testable in isolation (today only the one integration test covers them) and App shrinks to
+      state + event loop + agent glue. Fold the SGR palette (`dim`/`reset`/`red`, box colors,
+      `separator`'s purple) into one `tui` color namespace so `App`, `Picker`, and `separator` stop
+      each defining their own.
+- [ ] **Make `App.Entry` a `union(Kind)`.** It is a struct with a `kind` enum plus `is_error` that is
+      dead for `intro`/`user`/`model`, and `text` is the only payload any variant carries. A tagged
+      union gives each block exactly its data, makes the `ensureEntry` switch exhaustive by
+      construction, and gives stateful blocks (a collapsible `thinking` run, a tool box tracking its
+      own status) somewhere to live. Ties into the block-widget extraction above.
 - [ ] **Richer UI with dedicated components.** Move beyond the current log + single-line editor to
       composable components (tool-call panels, streaming status, a stats/context footer, a model/
       effort indicator, command palette). Keep the line/string render model. `tui.Picker` (the
       `/model` chooser) is the first such component: a single-choice list rendered into the live
       region, reusable by any command that returns a `pick` outcome.
+- [ ] **Display model thinking.** Show the model's reasoning/thinking stream in the transcript,
+      visually distinct (dimmed) from the answer. Nothing decodes or renders it today: `llm.Block`
+      has only `text`/`tool_use`/`tool_result` and `llm.Event` only `text`/`tool_use`/`input_json`/
+      `stop`. Needs thinking-delta decode in `anthropic/wire.zig`, a thinking variant on `llm.Block`
+      and `llm.Event`, an `Agent.consume` branch, and an `App` handler/render path (a dimmed run,
+      separate from the answer text). Ties into `/effort`, which turns thinking on and sets its
+      budget.
 - [ ] **Steering.** Let the user type and send while a turn is running, queuing messages the way pi
       does. Today the read loop is frozen for the whole blocking `agent.run()`, so the input box is
       visible but inert. Depends on the off-thread networking work ("Networking off the UI thread"):
