@@ -17,10 +17,7 @@ zig build test     # run all tests
 
 Requires Zig 0.16.0.
 
-## Docs
+## Roadmap
 
-Research notes that inform the design live in [`docs/`](docs/):
-
-- [`docs/pi-tui-internals.md`](docs/pi-tui-internals.md) — how pi's renderer actually works.
-- [`docs/text-width.md`](docs/text-width.md) — the display-width problem and how to solve it in Zig.
-- [`docs/architecture.md`](docs/architecture.md) — the renderer model chosen here, and the traps.
+Planned features and where they hook into the current architecture live in
+[`BACKLOG.md`](BACKLOG.md).
