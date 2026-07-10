@@ -1,62 +1,16 @@
-//! The conversation data model and JSON request serialization for the Messages
-//! API. Holds no state and does no I/O — callers own the message list and its
-//! backing memory; `Client` sends the bytes this module produces.
+//! Translates a neutral `llm.Request` into an Anthropic Messages API JSON body.
+//! Holds no state and does no I/O — callers own the request and its backing
+//! memory; `Client` sends the bytes this module produces.
 
 const std = @import("std");
+
+const llm = @import("../llm.zig");
 
 /// Required first system block for subscription OAuth tokens.
 pub const system_header = "You are Claude Code, Anthropic's official CLI for Claude.";
 
-pub const Role = enum {
-    user,
-    assistant,
-
-    fn json(self: Role) []const u8 {
-        return @tagName(self);
-    }
-};
-
-pub const Block = union(enum) {
-    text: []const u8,
-    tool_use: ToolUse,
-    tool_result: ToolResult,
-
-    pub const ToolUse = struct {
-        id: []const u8,
-        name: []const u8,
-        /// Raw JSON object for the tool input; empty is serialized as `{}`.
-        input_json: []const u8,
-    };
-
-    pub const ToolResult = struct {
-        tool_use_id: []const u8,
-        content: []const u8,
-        is_error: bool,
-    };
-};
-
-pub const Message = struct {
-    role: Role,
-    blocks: []const Block,
-};
-
-pub const Tool = struct {
-    name: []const u8,
-    description: []const u8,
-    /// Raw JSON Schema object for the tool's input.
-    schema_json: []const u8,
-};
-
-pub const Request = struct {
-    model: []const u8,
-    tokens_max: u32,
-    system: []const u8,
-    messages: []const Message,
-    tools: []const Tool,
-};
-
 /// Serialize `request` into an owned JSON body; caller frees the result.
-pub fn serialize(gpa: std.mem.Allocator, request: Request) ![]u8 {
+pub fn serialize(gpa: std.mem.Allocator, request: llm.Request) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
     const writer = &out.writer;
@@ -100,9 +54,9 @@ fn writeSystemBlock(writer: *std.Io.Writer, text: []const u8) !void {
     try writer.writeAll("}");
 }
 
-fn writeMessage(writer: *std.Io.Writer, message: Message) !void {
+fn writeMessage(writer: *std.Io.Writer, message: llm.Message) !void {
     try writer.writeAll("{\"role\":");
-    try string(writer, message.role.json());
+    try string(writer, @tagName(message.role));
     try writer.writeAll(",\"content\":[");
     for (message.blocks, 0..) |block, index| {
         if (index > 0) try writer.writeAll(",");
@@ -111,7 +65,7 @@ fn writeMessage(writer: *std.Io.Writer, message: Message) !void {
     try writer.writeAll("]}");
 }
 
-fn writeBlock(writer: *std.Io.Writer, block: Block) !void {
+fn writeBlock(writer: *std.Io.Writer, block: llm.Block) !void {
     switch (block) {
         .text => |text| {
             try writer.writeAll("{\"type\":\"text\",\"text\":");
@@ -142,10 +96,10 @@ fn string(writer: *std.Io.Writer, text: []const u8) !void {
 }
 
 test serialize {
-    const messages = [_]Message{
+    const messages = [_]llm.Message{
         .{ .role = .user, .blocks = &.{.{ .text = "hi \"there\"" }} },
     };
-    const tools = [_]Tool{
+    const tools = [_]llm.Tool{
         .{ .name = "read", .description = "read a file", .schema_json = "{\"type\":\"object\"}" },
     };
     const body = try serialize(std.testing.allocator, .{

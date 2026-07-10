@@ -5,20 +5,15 @@
 
 const std = @import("std");
 
-const Client = @This();
+const llm = @import("../llm.zig");
+
+const Transport = @This();
 
 const messages_url = "https://api.anthropic.com/v1/messages";
 const beta = "claude-code-20250219,oauth-2025-04-20";
 
 gpa: std.mem.Allocator,
 io: std.Io,
-
-pub const Event = union(enum) {
-    text: []const u8,
-    tool_use: struct { id: []const u8, name: []const u8 },
-    input_json: []const u8,
-    stop: ?[]const u8,
-};
 
 /// A single Messages request in flight. Pin it: the HTTP response borrows the
 /// request and the SSE reader borrows this struct's buffers.
@@ -44,13 +39,19 @@ pub const Stream = struct {
         self.client.deinit();
     }
 
-    /// Error body text when `status` is not `.ok`; empty otherwise.
+    /// Whether the request head reported success. A false result means the
+    /// stream carries an error body, not events; read it with `errorText`.
+    pub fn ok(self: *const Stream) bool {
+        return self.status == .ok;
+    }
+
+    /// Error body text when the request failed; empty otherwise.
     pub fn errorText(self: *const Stream) []const u8 {
         return self.error_buffer[0..self.error_length];
     }
 
     /// Next decoded event, or null at end of stream.
-    pub fn next(self: *Stream) !?Event {
+    pub fn next(self: *Stream) !?llm.Event {
         if (self.parsed) |parsed| {
             parsed.deinit();
             self.parsed = null;
@@ -64,7 +65,7 @@ pub const Stream = struct {
         }
     }
 
-    fn decode(self: *Stream, json: []const u8) !?Event {
+    fn decode(self: *Stream, json: []const u8) !?llm.Event {
         const parsed = try std.json.parseFromSlice(std.json.Value, self.gpa, json, .{});
         const object = asObject(parsed.value) orelse {
             parsed.deinit();
@@ -97,7 +98,7 @@ pub const Stream = struct {
 };
 
 /// Open a streaming Messages request, filling `out` in place.
-pub fn send(self: *Client, out: *Stream, body: []const u8, access_token: []const u8) !void {
+pub fn send(self: *Transport, out: *Stream, body: []const u8, access_token: []const u8) !void {
     out.gpa = self.gpa;
     out.client = .{ .allocator = self.gpa, .io = self.io };
     errdefer out.client.deinit();
@@ -153,7 +154,7 @@ fn decompressBuffer(gpa: std.mem.Allocator, encoding: std.http.ContentEncoding) 
     };
 }
 
-fn classify(object: std.json.ObjectMap, kind: []const u8) ?Event {
+fn classify(object: std.json.ObjectMap, kind: []const u8) ?llm.Event {
     if (std.mem.eql(u8, kind, "content_block_delta")) {
         const delta = asObject(object.get("delta")) orelse return null;
         const delta_kind = asString(delta.get("type")) orelse return null;
@@ -236,5 +237,5 @@ test "next walks SSE data lines and ends at stream end" {
     try std.testing.expectEqualStrings("Hi", text.text);
     const stop = (try stream.next()).?;
     try std.testing.expectEqualStrings("end_turn", stop.stop.?);
-    try std.testing.expectEqual(@as(?Event, null), try stream.next());
+    try std.testing.expectEqual(@as(?llm.Event, null), try stream.next());
 }

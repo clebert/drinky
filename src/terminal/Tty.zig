@@ -7,7 +7,7 @@ const std = @import("std");
 
 const escape = @import("escape.zig");
 
-const Terminal = @This();
+const Tty = @This();
 
 pub const Size = struct { rows: u16, columns: u16 };
 
@@ -20,7 +20,7 @@ out_buffer: [16384]u8,
 in_stream: std.Io.File.Reader,
 out_stream: std.Io.File.Writer,
 
-pub fn init(self: *Terminal, io: std.Io) !void {
+pub fn init(self: *Tty, io: std.Io) !void {
     const stdin = std.Io.File.stdin();
     const stdout = std.Io.File.stdout();
     self.io = io;
@@ -52,7 +52,7 @@ pub fn init(self: *Terminal, io: std.Io) !void {
     try out.flush();
 }
 
-pub fn deinit(self: *Terminal) void {
+pub fn deinit(self: *Tty) void {
     const out = &self.out_stream.interface;
     out.writeAll(escape.paste_reset) catch {};
     out.writeAll(escape.cursor_show) catch {};
@@ -61,16 +61,16 @@ pub fn deinit(self: *Terminal) void {
     std.posix.tcsetattr(self.in_handle, .FLUSH, self.original) catch {};
 }
 
-pub fn writer(self: *Terminal) *std.Io.Writer {
+pub fn writer(self: *Tty) *std.Io.Writer {
     return &self.out_stream.interface;
 }
 
-pub fn reader(self: *Terminal) *std.Io.Reader {
+pub fn reader(self: *Tty) *std.Io.Reader {
     return &self.in_stream.interface;
 }
 
 /// Current window size, falling back to 80x24 if the query fails.
-pub fn size(self: *Terminal) Size {
+pub fn size(self: *Tty) Size {
     var window: std.posix.winsize = .{ .row = 0, .col = 0, .xpixel = 0, .ypixel = 0 };
     const result = self.io.operate(.{ .device_io_control = .{
         .file = .{ .handle = self.out_handle, .flags = .{ .nonblocking = false } },

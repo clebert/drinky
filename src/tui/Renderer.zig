@@ -9,7 +9,7 @@
 
 const std = @import("std");
 
-const escape = @import("../terminal/escape.zig");
+const terminal = @import("../terminal/root.zig");
 
 const Renderer = @This();
 
@@ -29,10 +29,10 @@ pub fn deinit(self: *Renderer) void {
 /// Replace the live region with `lines`.
 pub fn render(self: *Renderer, lines: []const []const u8) !void {
     const writer = self.writer;
-    try writer.writeAll(escape.sync_set);
+    try writer.writeAll(terminal.escape.sync_set);
     try self.eraseRegion();
     try writeRegion(writer, lines);
-    try writer.writeAll(escape.sync_reset);
+    try writer.writeAll(terminal.escape.sync_reset);
     try writer.flush();
     try self.storeLive(lines);
 }
@@ -40,22 +40,22 @@ pub fn render(self: *Renderer, lines: []const []const u8) !void {
 /// Print `lines` permanently above the live region, then redraw the region.
 pub fn commit(self: *Renderer, lines: []const []const u8) !void {
     const writer = self.writer;
-    try writer.writeAll(escape.sync_set);
+    try writer.writeAll(terminal.escape.sync_set);
     try self.eraseRegion();
     for (lines) |line| {
         try writer.writeAll(line);
         try writer.writeAll("\r\n");
     }
     try writeRegion(writer, self.live.items);
-    try writer.writeAll(escape.sync_reset);
+    try writer.writeAll(terminal.escape.sync_reset);
     try writer.flush();
 }
 
 fn eraseRegion(self: *Renderer) !void {
     const writer = self.writer;
     try writer.writeAll("\r");
-    if (self.live.items.len > 0) try escape.cursorUp(writer, self.live.items.len - 1);
-    try writer.writeAll(escape.screen_clear_below);
+    if (self.live.items.len > 0) try terminal.escape.cursorUp(writer, self.live.items.len - 1);
+    try writer.writeAll(terminal.escape.screen_clear_below);
 }
 
 fn writeRegion(writer: *std.Io.Writer, lines: []const []const u8) !void {
@@ -87,7 +87,7 @@ test "commit prints above a retained live region" {
 
     const written = out.written();
     try std.testing.expect(std.mem.indexOf(u8, written, "hello world") != null);
-    try std.testing.expect(std.mem.indexOf(u8, written, escape.sync_set) != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, terminal.escape.sync_set) != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "> prompt") != null);
 }
 

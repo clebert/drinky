@@ -1,4 +1,4 @@
-//! Incremental terminal-input parser: raw bytes in, `key.Key` events out.
+//! Incremental terminal-input parser: raw bytes in, `Key` events out.
 //!
 //! Bytes are fed in whatever chunks `read` returns; a single key or paste may
 //! span several chunks. Unconsumed bytes are retained so a sequence split
@@ -6,14 +6,33 @@
 
 const std = @import("std");
 
-const escape = @import("../terminal/escape.zig");
-const key = @import("key.zig");
+const terminal = @import("../terminal/root.zig");
 
 const Input = @This();
 
 gpa: std.mem.Allocator,
 pending: std.ArrayList(u8),
 start: usize,
+
+/// A single decoded input event from the terminal.
+pub const Key = union(enum) {
+    /// A printable Unicode codepoint the user typed.
+    char: u21,
+    /// A control combination, carrying the lowercase letter (`0x03` -> `'c'`).
+    ctrl: u8,
+    /// Bracketed-paste payload, borrowed from the parser's buffer for the call.
+    paste: []const u8,
+    enter,
+    backspace,
+    left,
+    right,
+    up,
+    down,
+    home,
+    end,
+    /// A recognized-but-unhandled sequence; callers ignore it.
+    unknown,
+};
 
 pub fn init(gpa: std.mem.Allocator) Input {
     return .{ .gpa = gpa, .pending = .empty, .start = 0 };
@@ -37,7 +56,7 @@ pub fn feed(self: *Input, bytes: []const u8) !void {
 /// Next decoded event, or null when the remaining bytes are empty or form an
 /// incomplete sequence awaiting more input. A returned `.paste` slice borrows
 /// the internal buffer and is valid only until the next `feed`.
-pub fn next(self: *Input) ?key.Key {
+pub fn next(self: *Input) ?Key {
     const data = self.pending.items[self.start..];
     if (data.len == 0) return null;
     const decoded = decode(data) orelse return null;
@@ -45,7 +64,7 @@ pub fn next(self: *Input) ?key.Key {
     return decoded.key;
 }
 
-const Decoded = struct { key: key.Key, consumed: usize };
+const Decoded = struct { key: Key, consumed: usize };
 
 fn decode(data: []const u8) ?Decoded {
     const byte = data[0];
@@ -82,13 +101,13 @@ fn decodeEscape(data: []const u8) ?Decoded {
 }
 
 fn decodeControlSequence(data: []const u8) ?Decoded {
-    if (std.mem.startsWith(u8, data, escape.paste_begin)) {
-        const body_start = escape.paste_begin.len;
-        const relative = std.mem.indexOf(u8, data[body_start..], escape.paste_end) orelse return null;
+    if (std.mem.startsWith(u8, data, terminal.escape.paste_begin)) {
+        const body_start = terminal.escape.paste_begin.len;
+        const relative = std.mem.indexOf(u8, data[body_start..], terminal.escape.paste_end) orelse return null;
         const body_end = body_start + relative;
         return .{
             .key = .{ .paste = data[body_start..body_end] },
-            .consumed = body_end + escape.paste_end.len,
+            .consumed = body_end + terminal.escape.paste_end.len,
         };
     }
     var index: usize = 2;
@@ -102,7 +121,7 @@ fn decodeControlSequence(data: []const u8) ?Decoded {
     return null;
 }
 
-fn mapControlSequence(parameters: []const u8, final: u8) key.Key {
+fn mapControlSequence(parameters: []const u8, final: u8) Key {
     if (final == '~') {
         if (std.mem.eql(u8, parameters, "1") or std.mem.eql(u8, parameters, "7")) return .home;
         if (std.mem.eql(u8, parameters, "4") or std.mem.eql(u8, parameters, "8")) return .end;
@@ -111,7 +130,7 @@ fn mapControlSequence(parameters: []const u8, final: u8) key.Key {
     return mapFinal(final);
 }
 
-fn mapFinal(final: u8) key.Key {
+fn mapFinal(final: u8) Key {
     return switch (final) {
         'A' => .up,
         'B' => .down,
@@ -125,7 +144,7 @@ fn mapFinal(final: u8) key.Key {
 
 const escape_start = 0x1b;
 
-fn expectKeys(bytes: []const u8, expected: []const key.Key) !void {
+fn expectKeys(bytes: []const u8, expected: []const Key) !void {
     var input = Input.init(std.testing.allocator);
     defer input.deinit();
     try input.feed(bytes);
@@ -133,7 +152,7 @@ fn expectKeys(bytes: []const u8, expected: []const key.Key) !void {
         const got = input.next() orelse return error.MissingKey;
         try std.testing.expectEqualDeep(want, got);
     }
-    try std.testing.expectEqual(@as(?key.Key, null), input.next());
+    try std.testing.expectEqual(@as(?Key, null), input.next());
 }
 
 test "printable and control" {
@@ -158,7 +177,7 @@ test "split sequence waits for rest" {
     var input = Input.init(std.testing.allocator);
     defer input.deinit();
     try input.feed("\x1b[");
-    try std.testing.expectEqual(@as(?key.Key, null), input.next());
+    try std.testing.expectEqual(@as(?Key, null), input.next());
     try input.feed("A");
-    try std.testing.expectEqualDeep(key.Key.up, input.next().?);
+    try std.testing.expectEqualDeep(Key.up, input.next().?);
 }

@@ -6,15 +6,11 @@
 
 const std = @import("std");
 
-const Agent = @import("agent/Agent.zig");
-const Auth = @import("anthropic/Auth.zig");
-const escape = @import("terminal/escape.zig");
-const Terminal = @import("terminal/Terminal.zig");
-const Editor = @import("tui/Editor.zig");
-const Input = @import("tui/Input.zig");
-const key = @import("tui/key.zig");
-const Renderer = @import("tui/Renderer.zig");
-const width = @import("tui/width.zig");
+const Agent = @import("Agent.zig");
+const anthropic = @import("anthropic/root.zig");
+const provider = @import("provider.zig");
+const terminal = @import("terminal/root.zig");
+const tui = @import("tui/root.zig");
 
 const App = @This();
 
@@ -29,13 +25,15 @@ const dim = "\x1b[2m";
 const red = "\x1b[31m";
 const reset = "\x1b[0m";
 
+const Styled = struct { style: []const u8, prefix: []const u8, text: []const u8 };
+
 gpa: std.mem.Allocator,
 io: std.Io,
-terminal: Terminal,
-renderer: Renderer,
-input: Input,
-editor: Editor,
-auth: Auth,
+tty: terminal.Tty,
+renderer: tui.Renderer,
+input: tui.Input,
+editor: tui.Editor,
+auth: anthropic.Auth,
 agent: Agent,
 pending: std.ArrayList(u8),
 scratch: std.ArrayList(u8),
@@ -56,20 +54,20 @@ pub fn run(self: *App, gpa: std.mem.Allocator, io: std.Io, home: []const u8) !vo
     defer self.scratch.deinit(gpa);
     defer self.lines.deinit(gpa);
 
-    self.auth = try Auth.init(gpa, io, home);
+    self.auth = try anthropic.Auth.init(gpa, io, home);
     defer self.auth.deinit();
     try self.ensureAuth();
 
-    self.agent = Agent.init(gpa, io, &self.auth, model, system_prompt);
+    self.agent = Agent.init(gpa, io, provider.Client.init(.anthropic, gpa, io, &self.auth), .{ .model = model, .system = system_prompt });
     defer self.agent.deinit();
 
-    try self.terminal.init(io);
-    defer self.terminal.deinit();
-    self.renderer = Renderer.init(gpa, self.terminal.writer());
+    try self.tty.init(io);
+    defer self.tty.deinit();
+    self.renderer = tui.Renderer.init(gpa, self.tty.writer());
     defer self.renderer.deinit();
-    self.input = Input.init(gpa);
+    self.input = tui.Input.init(gpa);
     defer self.input.deinit();
-    self.editor = Editor.init(gpa);
+    self.editor = tui.Editor.init(gpa);
     defer self.editor.deinit();
 
     try self.renderer.commit(&.{dim ++ "pith — enter to send, ctrl-c to quit" ++ reset});
@@ -79,7 +77,7 @@ pub fn run(self: *App, gpa: std.mem.Allocator, io: std.Io, home: []const u8) !vo
     var read_buffer: [4096]u8 = undefined;
     while (self.running) {
         var chunk: [1][]u8 = .{&read_buffer};
-        const count = self.terminal.reader().readVec(&chunk) catch break;
+        const count = self.tty.reader().readVec(&chunk) catch break;
         if (count == 0) break;
         try self.input.feed(read_buffer[0..count]);
         while (self.input.next()) |event| try self.handleKey(event);
@@ -93,7 +91,7 @@ fn ensureAuth(self: *App) !void {
     try self.auth.login(&stdout.interface);
 }
 
-fn handleKey(self: *App, event: key.Key) !void {
+fn handleKey(self: *App, event: tui.Input.Key) !void {
     switch (event) {
         .char => |codepoint| try self.editor.insertCodepoint(codepoint),
         .paste => |text| try self.editor.insert(text),
@@ -117,7 +115,7 @@ fn handleKey(self: *App, event: key.Key) !void {
 }
 
 fn renderPrompt(self: *App) !void {
-    self.columns = self.terminal.size().columns;
+    self.columns = self.tty.size().columns;
     try self.editor.render(self.columns, &self.scratch, &self.lines);
     try self.renderer.render(self.lines.items);
 }
@@ -130,12 +128,12 @@ fn submit(self: *App) !void {
     self.editor.clear();
 
     try self.renderer.render(&.{});
-    try self.commitWrapped(dim, "> ", text);
+    try self.commitWrapped(.{ .style = dim, .prefix = "> ", .text = text });
     try self.renderer.render(&.{dim ++ "…" ++ reset});
 
     self.agent.run(text, self) catch |err| {
         try self.flushPending();
-        try self.commitLine(red, "error: ", @errorName(err));
+        try self.commitLine(.{ .style = red, .prefix = "error: ", .text = @errorName(err) });
     };
     try self.flushPending();
     try self.renderPrompt();
@@ -150,8 +148,8 @@ pub fn onText(self: *App, delta: []const u8) !void {
             self.dropPending(newline + 1);
             continue;
         }
-        if (width.display(line) <= self.columns) break;
-        const fit = width.truncate(line, self.columns).len;
+        if (tui.width.display(line) <= self.columns) break;
+        const fit = tui.width.truncate(line, self.columns).len;
         try self.renderer.commit(&.{line[0..fit]});
         self.dropPending(fit);
     }
@@ -160,20 +158,20 @@ pub fn onText(self: *App, delta: []const u8) !void {
 
 pub fn onToolStart(self: *App, name: []const u8, input_json: []const u8) !void {
     try self.flushPending();
-    try self.commitLine(dim, "· ", name);
-    try self.commitLine(dim, "  ", input_json);
+    try self.commitLine(.{ .style = dim, .prefix = "· ", .text = name });
+    try self.commitLine(.{ .style = dim, .prefix = "  ", .text = input_json });
 }
 
 pub fn onToolResult(self: *App, name: []const u8, content: []const u8, is_error: bool) !void {
     _ = name;
     const first = content[0 .. std.mem.indexOfScalar(u8, content, '\n') orelse content.len];
     const style = if (is_error) red else dim;
-    try self.commitLine(style, "  → ", first);
+    try self.commitLine(.{ .style = style, .prefix = "  → ", .text = first });
 }
 
 pub fn onError(self: *App, text: []const u8) !void {
     try self.flushPending();
-    try self.commitLine(red, "error: ", text);
+    try self.commitLine(.{ .style = red, .prefix = "error: ", .text = text });
 }
 
 /// Commit the in-progress assistant line, if any, and empty the live region.
@@ -191,23 +189,24 @@ fn dropPending(self: *App, count: usize) void {
     self.pending.shrinkRetainingCapacity(kept);
 }
 
-/// Commit `text` wrapped to width, each line carrying `prefix` and `style`.
-fn commitWrapped(self: *App, style: []const u8, prefix: []const u8, text: []const u8) !void {
+/// Commit `line.text` wrapped to width, each row carrying `line.prefix` and
+/// `line.style`.
+fn commitWrapped(self: *App, line: Styled) !void {
     self.lines.clearRetainingCapacity();
-    const available = self.columns -| width.display(prefix);
-    try width.wrap(text, @max(available, 1), &self.lines, self.gpa);
-    for (self.lines.items) |line| {
-        const composed = try std.fmt.allocPrint(self.gpa, "{s}{s}{s}{s}", .{ style, prefix, line, reset });
+    const available = self.columns -| tui.width.display(line.prefix);
+    try tui.width.wrap(line.text, @max(available, 1), &self.lines, self.gpa);
+    for (self.lines.items) |wrapped| {
+        const composed = try std.fmt.allocPrint(self.gpa, "{s}{s}{s}{s}", .{ line.style, line.prefix, wrapped, reset });
         defer self.gpa.free(composed);
         try self.renderer.commit(&.{composed});
     }
 }
 
-/// Commit a single styled status line, truncating `text` to fit.
-fn commitLine(self: *App, style: []const u8, prefix: []const u8, text: []const u8) !void {
-    const available = self.columns -| width.display(prefix);
-    const clipped = width.truncate(text, available);
-    const composed = try std.fmt.allocPrint(self.gpa, "{s}{s}{s}{s}", .{ style, prefix, clipped, reset });
+/// Commit a single styled status line, truncating `line.text` to fit.
+fn commitLine(self: *App, line: Styled) !void {
+    const available = self.columns -| tui.width.display(line.prefix);
+    const clipped = tui.width.truncate(line.text, available);
+    const composed = try std.fmt.allocPrint(self.gpa, "{s}{s}{s}{s}", .{ line.style, line.prefix, clipped, reset });
     defer self.gpa.free(composed);
     try self.renderer.commit(&.{composed});
 }
@@ -219,11 +218,11 @@ test "a read chunk drives the editor and paints the result" {
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
 
-    var input = Input.init(gpa);
+    var input = tui.Input.init(gpa);
     defer input.deinit();
-    var editor = Editor.init(gpa);
+    var editor = tui.Editor.init(gpa);
     defer editor.deinit();
-    var renderer = Renderer.init(gpa, &out.writer);
+    var renderer = tui.Renderer.init(gpa, &out.writer);
     defer renderer.deinit();
     var scratch: std.ArrayList(u8) = .empty;
     defer scratch.deinit(gpa);
@@ -242,5 +241,5 @@ test "a read chunk drives the editor and paints the result" {
     try std.testing.expectEqualStrings("hllo", editor.content());
     const painted = out.written();
     try std.testing.expect(std.mem.indexOf(u8, painted, "hllo") != null);
-    try std.testing.expect(std.mem.indexOf(u8, painted, escape.sync_set) != null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, terminal.escape.sync_set) != null);
 }
