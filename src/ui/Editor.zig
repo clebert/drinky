@@ -7,9 +7,8 @@
 
 const std = @import("std");
 
-const cursor = @import("cursor.zig");
 const separator = @import("separator.zig");
-const width = @import("width.zig");
+const terminal = @import("terminal");
 
 const Editor = @This();
 
@@ -93,14 +92,14 @@ pub fn render(
 
     const body_start = buffer.items.len;
     try buffer.appendSlice(gpa, self.text.items[0..self.caret]);
-    if (focused) try buffer.appendSlice(gpa, cursor.marker);
+    if (focused) try buffer.appendSlice(gpa, terminal.cursor.marker);
     try buffer.appendSlice(gpa, self.text.items[self.caret..]);
 
     const separator_line = buffer.items[0..separator_end];
     const body = buffer.items[body_start..];
     const columns_min = 1;
     try lines.append(gpa, separator_line);
-    try width.wrap(body, @max(columns, columns_min), lines, gpa);
+    try terminal.width.wrap(body, @max(columns, columns_min), lines, gpa);
     try lines.append(gpa, separator_line);
 }
 
@@ -161,12 +160,12 @@ test render {
     defer lines.deinit(std.testing.allocator);
     try editor.render(80, true, &buffer, &lines);
     try std.testing.expectEqual(@as(usize, 3), lines.items.len);
-    try std.testing.expectEqual(@as(usize, 80), width.display(lines.items[0]));
+    try std.testing.expectEqual(@as(usize, 80), terminal.width.display(lines.items[0]));
     // The body is the text plus the zero-width caret marker at the cursor.
-    try std.testing.expectEqual(@as(usize, 2), width.display(lines.items[1]));
-    try std.testing.expectEqual(@as(?usize, 2), cursor.column(lines.items[1]));
-    try std.testing.expectEqual(@as(usize, 80), width.display(lines.items[2]));
+    try std.testing.expectEqual(@as(usize, 2), terminal.width.display(lines.items[1]));
+    try std.testing.expectEqual(@as(?usize, 2), terminal.cursor.column(lines.items[1]));
+    try std.testing.expectEqual(@as(usize, 80), terminal.width.display(lines.items[2]));
 
     try editor.render(80, false, &buffer, &lines);
-    try std.testing.expectEqual(@as(?usize, null), cursor.column(lines.items[1]));
+    try std.testing.expectEqual(@as(?usize, null), terminal.cursor.column(lines.items[1]));
 }

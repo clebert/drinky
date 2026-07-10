@@ -21,7 +21,7 @@
 const std = @import("std");
 
 const cursor = @import("cursor.zig");
-const terminal = @import("../terminal/root.zig");
+const escape = @import("escape.zig");
 
 const Surface = @This();
 
@@ -91,13 +91,13 @@ pub fn render(self: *Surface, lines: []const []const u8, size: struct { columns:
     if (new_len == 0) {
         // Nothing to show: wipe the region and hide the cursor. The app always
         // emits at least the status line, so this only guards misuse.
-        try writer.writeAll(terminal.escape.sync_set);
-        if (self.previous.items.len != 0) try writer.writeAll(terminal.escape.screen_reset);
+        try writer.writeAll(escape.sync_set);
+        if (self.previous.items.len != 0) try writer.writeAll(escape.screen_reset);
         if (self.cursor_visible) {
-            try writer.writeAll(terminal.escape.cursor_hide);
+            try writer.writeAll(escape.cursor_hide);
             self.cursor_visible = false;
         }
-        try writer.writeAll(terminal.escape.sync_reset);
+        try writer.writeAll(escape.sync_reset);
         try writer.flush();
         self.viewport_top = 0;
         self.cursor_row = 0;
@@ -113,9 +113,9 @@ pub fn render(self: *Surface, lines: []const []const u8, size: struct { columns:
 
     const first = firstDiff(self.previous.items, new.items) orelse {
         // The lines are unchanged; only the caret or its visibility may differ.
-        try writer.writeAll(terminal.escape.sync_set);
+        try writer.writeAll(escape.sync_set);
         try self.restoreCursor(self.cursor_row, marker_row, marker_column);
-        try writer.writeAll(terminal.escape.sync_reset);
+        try writer.writeAll(escape.sync_reset);
         try writer.flush();
         for (new.items) |line| self.gpa.free(line);
         new.deinit(self.gpa);
@@ -129,21 +129,21 @@ pub fn render(self: *Surface, lines: []const []const u8, size: struct { columns:
         return;
     }
 
-    try writer.writeAll(terminal.escape.sync_set);
+    try writer.writeAll(escape.sync_set);
     if (self.cursor_row >= anchor) {
-        try terminal.escape.cursorUp(writer, self.cursor_row - anchor);
+        try escape.cursorUp(writer, self.cursor_row - anchor);
     } else {
-        try terminal.escape.cursorDown(writer, anchor - self.cursor_row);
+        try escape.cursorDown(writer, anchor - self.cursor_row);
     }
     try writer.writeAll("\r");
-    try writer.writeAll(terminal.escape.screen_clear_below);
+    try writer.writeAll(escape.screen_clear_below);
     for (new.items[anchor..], anchor..) |line, index| {
         if (index > anchor) try writer.writeAll("\r\n");
         try writer.writeAll(line);
     }
     self.viewport_top = new_len -| self.rows;
     try self.restoreCursor(new_len - 1, marker_row, marker_column);
-    try writer.writeAll(terminal.escape.sync_reset);
+    try writer.writeAll(escape.sync_reset);
     try writer.flush();
     self.store(new);
 }
@@ -159,15 +159,15 @@ fn fullPaint(
     marker_column: usize,
 ) !void {
     const writer = self.writer;
-    try writer.writeAll(terminal.escape.sync_set);
-    if (clear) try writer.writeAll(terminal.escape.screen_reset);
+    try writer.writeAll(escape.sync_set);
+    if (clear) try writer.writeAll(escape.screen_reset);
     for (lines, 0..) |line, index| {
         if (index > 0) try writer.writeAll("\r\n");
         try writer.writeAll(line);
     }
     self.viewport_top = lines.len -| self.rows;
     try self.restoreCursor(lines.len - 1, marker_row, marker_column);
-    try writer.writeAll(terminal.escape.sync_reset);
+    try writer.writeAll(escape.sync_reset);
     try writer.flush();
 }
 
@@ -179,14 +179,14 @@ fn restoreCursor(self: *Surface, physical_row: usize, marker_row: ?usize, marker
     if (marker_row) |row| {
         if (row >= self.viewport_top) {
             if (physical_row >= row) {
-                try terminal.escape.cursorUp(writer, physical_row - row);
+                try escape.cursorUp(writer, physical_row - row);
             } else {
-                try terminal.escape.cursorDown(writer, row - physical_row);
+                try escape.cursorDown(writer, row - physical_row);
             }
             try writer.writeAll("\r");
-            try terminal.escape.cursorForward(writer, marker_column);
+            try escape.cursorForward(writer, marker_column);
             if (!self.cursor_visible) {
-                try writer.writeAll(terminal.escape.cursor_show);
+                try writer.writeAll(escape.cursor_show);
                 self.cursor_visible = true;
             }
             self.cursor_row = row;
@@ -194,7 +194,7 @@ fn restoreCursor(self: *Surface, physical_row: usize, marker_row: ?usize, marker
         }
     }
     if (self.cursor_visible) {
-        try writer.writeAll(terminal.escape.cursor_hide);
+        try writer.writeAll(escape.cursor_hide);
         self.cursor_visible = false;
     }
     self.cursor_row = physical_row;
@@ -225,13 +225,13 @@ fn firstDiff(old: []const []u8, new: []const []u8) ?usize {
     return null;
 }
 
-const VirtualTerminal = @import("VirtualTerminal.zig");
+const Emulator = @import("Emulator.zig");
 
 const Harness = struct {
     gpa: std.mem.Allocator,
     out: std.Io.Writer.Allocating,
     surface: Surface,
-    vt: VirtualTerminal,
+    emulator: Emulator,
     consumed: usize,
 
     fn init(gpa: std.mem.Allocator, columns: usize, rows: usize) !*Harness {
@@ -239,39 +239,39 @@ const Harness = struct {
         self.gpa = gpa;
         self.out = .init(gpa);
         self.surface = Surface.init(gpa, &self.out.writer);
-        self.vt = try VirtualTerminal.init(gpa, columns, rows);
+        self.emulator = try Emulator.init(gpa, columns, rows);
         self.consumed = 0;
         return self;
     }
 
     fn deinit(self: *Harness) void {
         self.surface.deinit();
-        self.vt.deinit();
+        self.emulator.deinit();
         self.out.deinit();
         self.gpa.destroy(self);
     }
 
     fn render(self: *Harness, lines: []const []const u8) !void {
-        try self.surface.render(lines, .{ .columns = self.vt.columns, .rows = self.vt.rows });
+        try self.surface.render(lines, .{ .columns = self.emulator.columns, .rows = self.emulator.rows });
         const written = self.out.written();
-        try self.vt.write(written[self.consumed..]);
+        try self.emulator.write(written[self.consumed..]);
         self.consumed = written.len;
     }
 
     fn resize(self: *Harness, columns: usize, rows: usize) !void {
-        self.vt.deinit();
-        self.vt = try VirtualTerminal.init(self.gpa, columns, rows);
+        self.emulator.deinit();
+        self.emulator = try Emulator.init(self.gpa, columns, rows);
         self.consumed = self.out.written().len;
     }
 
     fn expectRow(self: *Harness, row: usize, expected: []const u8) !void {
         var buffer: [256]u8 = undefined;
-        try std.testing.expectEqualStrings(expected, self.vt.rowText(row, &buffer));
+        try std.testing.expectEqualStrings(expected, self.emulator.rowText(row, &buffer));
     }
 
     fn expectScrollback(self: *Harness, index: usize, expected: []const u8) !void {
         var buffer: [256]u8 = undefined;
-        try std.testing.expectEqualStrings(expected, self.vt.scrollbackText(index, &buffer));
+        try std.testing.expectEqualStrings(expected, self.emulator.scrollbackText(index, &buffer));
     }
 };
 
@@ -283,8 +283,8 @@ test "first frame prints every line and leaves the cursor on the last" {
     try harness.expectRow(0, "one");
     try harness.expectRow(1, "two");
     try harness.expectRow(2, "three");
-    try std.testing.expectEqual(@as(usize, 2), harness.vt.cursor_row);
-    try std.testing.expectEqual(@as(usize, 0), harness.vt.scrollback.items.len);
+    try std.testing.expectEqual(@as(usize, 2), harness.emulator.cursor_row);
+    try std.testing.expectEqual(@as(usize, 0), harness.emulator.scrollback.items.len);
 }
 
 test "appending a line touches only the tail" {
@@ -296,7 +296,7 @@ test "appending a line touches only the tail" {
     try harness.expectRow(0, "one");
     try harness.expectRow(1, "two");
     try harness.expectRow(2, "three");
-    try std.testing.expectEqual(@as(usize, 2), harness.vt.cursor_row);
+    try std.testing.expectEqual(@as(usize, 2), harness.emulator.cursor_row);
 }
 
 test "changing a middle line repaints from there down" {
@@ -320,7 +320,7 @@ test "shrinking the frame clears the trailing rows" {
     try harness.expectRow(1, "two");
     try harness.expectRow(2, "");
     try harness.expectRow(3, "");
-    try std.testing.expectEqual(@as(usize, 1), harness.vt.cursor_row);
+    try std.testing.expectEqual(@as(usize, 1), harness.emulator.cursor_row);
 }
 
 test "growing past the screen scrolls the top into scrollback" {
@@ -373,9 +373,9 @@ test "the caret marker positions and shows the hardware cursor" {
     try harness.render(&.{ "prompt", "> hi" ++ cursor.marker });
 
     try harness.expectRow(1, "> hi");
-    try std.testing.expect(harness.vt.cursor_visible);
-    try std.testing.expectEqual(@as(usize, 1), harness.vt.cursor_row);
-    try std.testing.expectEqual(@as(usize, 4), harness.vt.cursor_column);
+    try std.testing.expect(harness.emulator.cursor_visible);
+    try std.testing.expectEqual(@as(usize, 1), harness.emulator.cursor_row);
+    try std.testing.expectEqual(@as(usize, 4), harness.emulator.cursor_column);
 }
 
 test "a caret inside the line lands between the characters" {
@@ -384,21 +384,21 @@ test "a caret inside the line lands between the characters" {
     try harness.render(&.{"> ab" ++ cursor.marker ++ "cd"});
 
     try harness.expectRow(0, "> abcd");
-    try std.testing.expectEqual(@as(usize, 0), harness.vt.cursor_row);
-    try std.testing.expectEqual(@as(usize, 4), harness.vt.cursor_column);
+    try std.testing.expectEqual(@as(usize, 0), harness.emulator.cursor_row);
+    try std.testing.expectEqual(@as(usize, 4), harness.emulator.cursor_column);
 }
 
 test "moving the caret on an unchanged line repositions the cursor" {
     var harness = try Harness.init(std.testing.allocator, 20, 5);
     defer harness.deinit();
     try harness.render(&.{"> abc" ++ cursor.marker});
-    try std.testing.expectEqual(@as(usize, 5), harness.vt.cursor_column);
+    try std.testing.expectEqual(@as(usize, 5), harness.emulator.cursor_column);
     // Same text, caret moved left two: the content is untouched, only the cursor.
     try harness.render(&.{"> a" ++ cursor.marker ++ "bc"});
 
     try harness.expectRow(0, "> abc");
-    try std.testing.expectEqual(@as(usize, 0), harness.vt.cursor_row);
-    try std.testing.expectEqual(@as(usize, 3), harness.vt.cursor_column);
+    try std.testing.expectEqual(@as(usize, 0), harness.emulator.cursor_row);
+    try std.testing.expectEqual(@as(usize, 3), harness.emulator.cursor_column);
 }
 
 test "a change above the caret repaints down through it" {
@@ -409,18 +409,18 @@ test "a change above the caret repaints down through it" {
 
     try harness.expectRow(0, "TOOL");
     try harness.expectRow(1, "> hi");
-    try std.testing.expect(harness.vt.cursor_visible);
-    try std.testing.expectEqual(@as(usize, 1), harness.vt.cursor_row);
-    try std.testing.expectEqual(@as(usize, 4), harness.vt.cursor_column);
+    try std.testing.expect(harness.emulator.cursor_visible);
+    try std.testing.expectEqual(@as(usize, 1), harness.emulator.cursor_row);
+    try std.testing.expectEqual(@as(usize, 4), harness.emulator.cursor_column);
 }
 
 test "dropping the marker hides the cursor" {
     var harness = try Harness.init(std.testing.allocator, 20, 5);
     defer harness.deinit();
     try harness.render(&.{"> hi" ++ cursor.marker});
-    try std.testing.expect(harness.vt.cursor_visible);
+    try std.testing.expect(harness.emulator.cursor_visible);
     try harness.render(&.{"> hi"});
-    try std.testing.expect(!harness.vt.cursor_visible);
+    try std.testing.expect(!harness.emulator.cursor_visible);
 }
 
 test "a resize reflows via a full repaint" {
@@ -432,5 +432,5 @@ test "a resize reflows via a full repaint" {
 
     try harness.expectRow(0, "one");
     try harness.expectRow(3, "four");
-    try std.testing.expectEqual(@as(usize, 3), harness.vt.cursor_row);
+    try std.testing.expectEqual(@as(usize, 3), harness.emulator.cursor_row);
 }

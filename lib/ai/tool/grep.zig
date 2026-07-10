@@ -118,19 +118,19 @@ test utf8FloorLength {
 test "grep finds a literal substring with a glob filter" {
     const context: Context = .{ .gpa = std.testing.allocator, .io = std.testing.io };
     const result = try run(&context,
-        \\{"pattern":"pub fn match","path":"src","glob":"**/glob.zig"}
+        \\{"pattern":"pub fn match","path":"lib","glob":"**/glob.zig"}
     );
     defer std.testing.allocator.free(result.content);
     try std.testing.expect(!result.is_error);
-    try std.testing.expect(std.mem.indexOf(u8, result.content, "src/tool/glob.zig:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "lib/ai/tool/glob.zig:") != null);
 }
 
 test "grep is case-insensitive when asked" {
     const context: Context = .{ .gpa = std.testing.allocator, .io = std.testing.io };
     const result = try run(&context,
-        \\{"pattern":"PUB FN MATCH","path":"src","glob":"**/glob.zig","ignore_case":true}
+        \\{"pattern":"PUB FN MATCH","path":"lib","glob":"**/glob.zig","ignore_case":true}
     );
     defer std.testing.allocator.free(result.content);
     try std.testing.expect(!result.is_error);
-    try std.testing.expect(std.mem.indexOf(u8, result.content, "src/tool/glob.zig:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "lib/ai/tool/glob.zig:") != null);
 }

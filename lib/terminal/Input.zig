@@ -6,7 +6,7 @@
 
 const std = @import("std");
 
-const terminal = @import("../terminal/root.zig");
+const escape = @import("escape.zig");
 
 const Input = @This();
 
@@ -105,13 +105,13 @@ fn decodeEscape(data: []const u8) ?Decoded {
 }
 
 fn decodeControlSequence(data: []const u8) ?Decoded {
-    if (std.mem.startsWith(u8, data, terminal.escape.paste_begin)) {
-        const body_start = terminal.escape.paste_begin.len;
-        const relative = std.mem.indexOf(u8, data[body_start..], terminal.escape.paste_end) orelse return null;
+    if (std.mem.startsWith(u8, data, escape.paste_begin)) {
+        const body_start = escape.paste_begin.len;
+        const relative = std.mem.indexOf(u8, data[body_start..], escape.paste_end) orelse return null;
         const body_end = body_start + relative;
         return .{
             .key = .{ .paste = data[body_start..body_end] },
-            .consumed = body_end + terminal.escape.paste_end.len,
+            .consumed = body_end + escape.paste_end.len,
         };
     }
     var index: usize = 2;

@@ -1,0 +1,17 @@
+//! The provider-neutral agent core: the `Agent` turn loop, the neutral `llm`
+//! wire types, the `models` table, the `provider` client, the `command`
+//! registry, the `tool` registry, and the `anthropic` provider transport.
+
+const std = @import("std");
+
+pub const Agent = @import("Agent.zig");
+pub const anthropic = @import("anthropic/root.zig");
+pub const command = @import("command/root.zig");
+pub const llm = @import("llm.zig");
+pub const models = @import("models.zig");
+pub const provider = @import("provider.zig");
+pub const tool = @import("tool/root.zig");
+
+test {
+    std.testing.refAllDecls(@This());
+}

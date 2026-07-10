@@ -14,18 +14,14 @@
 
 const std = @import("std");
 
-const Agent = @import("Agent.zig");
-const anthropic = @import("anthropic/root.zig");
-const command = @import("command/root.zig");
-const models = @import("models.zig");
-const provider = @import("provider.zig");
-const terminal = @import("terminal/root.zig");
-const tui = @import("tui/root.zig");
+const ai = @import("ai");
+const terminal = @import("terminal");
+const ui = @import("ui/root.zig");
 
 const App = @This();
 
 const model = "claude-sonnet-4-6";
-const model_info = models.get(.anthropic, model) orelse
+const model_info = ai.models.get(.anthropic, model) orelse
     @compileError("default model \"" ++ model ++ "\" is not in the model table");
 const system_prompt =
     "You are pith, a small coding assistant running in a terminal. Be concise. " ++
@@ -74,7 +70,7 @@ const Entry = struct {
 const ActiveTool = struct { name: []const u8, input_json: []const u8 };
 
 const Picking = struct {
-    picker: tui.Picker,
+    picker: ui.Picker,
     /// Command re-run with the chosen option when the picker is confirmed.
     command: []const u8,
 };
@@ -82,11 +78,11 @@ const Picking = struct {
 gpa: std.mem.Allocator,
 io: std.Io,
 tty: terminal.Tty,
-surface: tui.Surface,
-input: tui.Input,
-editor: tui.Editor,
-auth: anthropic.Auth,
-agent: Agent,
+surface: terminal.Surface,
+input: terminal.Input,
+editor: ui.Editor,
+auth: ai.anthropic.Auth,
+agent: ai.Agent,
 /// The permanent blocks above the live tail, oldest first.
 transcript: std.ArrayList(Entry),
 /// Index into `transcript` of the model-text block for the current text run, so
@@ -143,20 +139,20 @@ pub fn run(self: *App, gpa: std.mem.Allocator, io: std.Io, home: []const u8) !vo
     defer self.lines.deinit(gpa);
     defer self.status_buffer.deinit(gpa);
 
-    self.auth = try anthropic.Auth.init(gpa, io, home);
+    self.auth = try ai.anthropic.Auth.init(gpa, io, home);
     defer self.auth.deinit();
     try self.ensureAuth();
 
-    self.agent = Agent.init(gpa, io, provider.Client.init(.anthropic, gpa, io, &self.auth), .{ .model = model_info, .system = system_prompt });
+    self.agent = ai.Agent.init(gpa, io, ai.provider.Client.init(.anthropic, gpa, io, &self.auth), .{ .model = model_info, .system = system_prompt });
     defer self.agent.deinit();
 
     try self.tty.init(io);
     defer self.tty.deinit();
-    self.surface = tui.Surface.init(gpa, self.tty.writer());
+    self.surface = terminal.Surface.init(gpa, self.tty.writer());
     defer self.surface.deinit();
-    self.input = tui.Input.init(gpa);
+    self.input = terminal.Input.init(gpa);
     defer self.input.deinit();
-    self.editor = tui.Editor.init(gpa);
+    self.editor = ui.Editor.init(gpa);
     defer self.editor.deinit();
 
     try self.appendEntry(.intro, false, intro_text);
@@ -180,7 +176,7 @@ fn ensureAuth(self: *App) !void {
     try self.auth.login(&stdout.interface);
 }
 
-fn handleKey(self: *App, event: tui.Input.Key) !void {
+fn handleKey(self: *App, event: terminal.Input.Key) !void {
     if (self.picking != null) return self.handlePickerKey(event);
     switch (event) {
         .char => |codepoint| try self.editor.insertCodepoint(codepoint),
@@ -325,7 +321,7 @@ fn pushLine(self: *App, out: *std.ArrayList([]u8), line: []const u8) !void {
 fn renderWrapped(self: *App, out: *std.ArrayList([]u8), text: []const u8) !void {
     var wrapped: std.ArrayList([]const u8) = .empty;
     defer wrapped.deinit(self.gpa);
-    try tui.width.wrap(text, @max(self.columns, 1), &wrapped, self.gpa);
+    try terminal.width.wrap(text, @max(self.columns, 1), &wrapped, self.gpa);
     for (wrapped.items) |line| try self.pushLine(out, line);
 }
 
@@ -334,8 +330,8 @@ fn renderWrapped(self: *App, out: *std.ArrayList([]u8), text: []const u8) !void 
 fn renderStyledLines(self: *App, out: *std.ArrayList([]u8), style: []const u8, prefix: []const u8, text: []const u8) !void {
     var pieces = std.mem.splitScalar(u8, text, '\n');
     while (pieces.next()) |piece| {
-        const available = self.columns -| tui.width.display(prefix);
-        const clipped = tui.width.truncate(piece, available);
+        const available = self.columns -| terminal.width.display(prefix);
+        const clipped = terminal.width.truncate(piece, available);
         self.scratch.clearRetainingCapacity();
         try self.scratch.appendSlice(self.gpa, style);
         try self.scratch.appendSlice(self.gpa, prefix);
@@ -361,7 +357,7 @@ fn tailBox(self: *App, style: BoxStyle, active: *const ActiveTool) !void {
 fn renderBox(self: *App, out: *std.ArrayList([]u8), style: BoxStyle, text: []const u8) !void {
     var content: std.ArrayList([]const u8) = .empty;
     defer content.deinit(self.gpa);
-    try tui.width.wrap(text, @max(self.columns -| 2, 1), &content, self.gpa);
+    try terminal.width.wrap(text, @max(self.columns -| 2, 1), &content, self.gpa);
 
     try self.pushBoxBlank(out, style.background);
     for (content.items) |line| try self.pushBoxLine(out, style, line);
@@ -382,7 +378,7 @@ fn pushBoxLine(self: *App, out: *std.ArrayList([]u8), style: BoxStyle, line: []c
     try self.scratch.appendSlice(self.gpa, style.foreground);
     try self.scratch.append(self.gpa, ' ');
     try self.scratch.appendSlice(self.gpa, line);
-    const used = 1 + tui.width.display(line);
+    const used = 1 + terminal.width.display(line);
     for (0..self.columns -| used) |_| try self.scratch.append(self.gpa, ' ');
     try self.scratch.appendSlice(self.gpa, reset);
     try self.pushLine(out, self.scratch.items);
@@ -412,7 +408,7 @@ fn advanceSpinner(self: *App) void {
 
 fn statusLine(self: *App) ![]const u8 {
     const stats = self.agent.stats;
-    return tui.status.render(.{
+    return ui.status.render(.{
         .last = stats.last,
         .cost = stats.cost,
         .saved = stats.saved,
@@ -478,13 +474,13 @@ fn runTurn(self: *App, text: []const u8) !void {
 
 /// Handle a slash command locally: either print its feedback or open a picker.
 fn runCommand(self: *App, line: []const u8) !void {
-    var context: command.Context = .{ .gpa = self.gpa, .agent = &self.agent };
-    try self.handleOutcome(try command.run(&context, line));
+    var context: ai.command.Context = .{ .gpa = self.gpa, .agent = &self.agent };
+    try self.handleOutcome(try ai.command.run(&context, line));
     try self.refresh();
 }
 
 /// Apply a command outcome to the transcript state; the caller refreshes.
-fn handleOutcome(self: *App, outcome: command.Outcome) !void {
+fn handleOutcome(self: *App, outcome: ai.command.Outcome) !void {
     switch (outcome) {
         .feedback => |feedback| {
             defer self.gpa.free(feedback.content);
@@ -496,7 +492,7 @@ fn handleOutcome(self: *App, outcome: command.Outcome) !void {
 
 /// Enter picker mode over a command's options; navigation and confirmation run
 /// through `handlePickerKey`. Takes ownership of `pick.options`.
-fn openPicker(self: *App, pick: command.Outcome.Pick) void {
+fn openPicker(self: *App, pick: ai.command.Outcome.Pick) void {
     self.picking = .{
         .picker = .{
             .gpa = self.gpa,
@@ -509,7 +505,7 @@ fn openPicker(self: *App, pick: command.Outcome.Pick) void {
     };
 }
 
-fn handlePickerKey(self: *App, event: tui.Input.Key) !void {
+fn handlePickerKey(self: *App, event: terminal.Input.Key) !void {
     const picker = &self.picking.?.picker;
     switch (event) {
         .up => picker.moveUp(),
@@ -528,8 +524,8 @@ fn handlePickerKey(self: *App, event: tui.Input.Key) !void {
 /// Re-apply the picker's command with the highlighted option as its argument.
 fn confirmPicker(self: *App) !void {
     const picking = &self.picking.?;
-    var context: command.Context = .{ .gpa = self.gpa, .agent = &self.agent };
-    const outcome = try command.apply(&context, picking.command, picking.picker.choice());
+    var context: ai.command.Context = .{ .gpa = self.gpa, .agent = &self.agent };
+    const outcome = try ai.command.apply(&context, picking.command, picking.picker.choice());
     self.closePicker();
     try self.handleOutcome(outcome);
     try self.refresh();
@@ -606,11 +602,11 @@ test "a read chunk drives the editor and paints the result" {
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
 
-    var input = tui.Input.init(gpa);
+    var input = terminal.Input.init(gpa);
     defer input.deinit();
-    var editor = tui.Editor.init(gpa);
+    var editor = ui.Editor.init(gpa);
     defer editor.deinit();
-    var surface = tui.Surface.init(gpa, &out.writer);
+    var surface = terminal.Surface.init(gpa, &out.writer);
     defer surface.deinit();
     var scratch: std.ArrayList(u8) = .empty;
     defer scratch.deinit(gpa);

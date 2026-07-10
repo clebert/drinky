@@ -64,9 +64,9 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
 test "find matches files by glob under a directory" {
     const context: Context = .{ .gpa = std.testing.allocator, .io = std.testing.io };
     const result = try run(&context,
-        \\{"pattern":"**/glob.zig","path":"src"}
+        \\{"pattern":"**/glob.zig","path":"lib"}
     );
     defer std.testing.allocator.free(result.content);
     try std.testing.expect(!result.is_error);
-    try std.testing.expectEqualStrings("src/tool/glob.zig", result.content);
+    try std.testing.expectEqualStrings("lib/ai/tool/glob.zig", result.content);
 }

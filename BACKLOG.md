@@ -136,14 +136,14 @@ Extension seams referenced here:
 
 ## UI
 
-- [ ] **Accurate display widths (wide glyphs).** `src/tui/width.zig` counts every
+- [ ] **Accurate display widths (wide glyphs).** `lib/terminal/width.zig` counts every
       printable codepoint as one column, so CJK, emoji, and combining marks are miscounted. The
       differential `Surface` does cursor math over the whole in-memory frame assuming one physical
       row per frame line, so a line whose real width exceeds `columns` auto-wraps in the terminal
       and permanently desyncs `cursor_row` until the next resize/full repaint. Add a `wcwidth`-style
       table (East Asian Width + emoji + zero-width combining) to `width.display`/`truncate`/`wrap`;
-      `VirtualTerminal` should then model right-margin autowrap so a test can catch the desync.
-- [ ] **Extract block rendering into a `tui` widget + shared color namespace.** `src/App.zig` is
+      `Emulator` should then model right-margin autowrap so a test can catch the desync.
+- [ ] **Extract block rendering into a `ui` widget + shared color namespace.** `src/App.zig` is
       both the composition root and the renderer for every transcript block
       (`renderBox`/`renderStyledLines`/`renderWrapped`/`pushBox*`) with a module-level color palette,
       while `Editor`/`Picker` are self-rendering widgets with a `render(columns, …, buffer, lines)`
@@ -151,7 +151,8 @@ Extension seams referenced here:
       unit-testable in isolation (today only the one integration test covers them) and App shrinks to
       state + event loop + agent glue. Fold the SGR palette (`dim`/`reset`/`red`, box colors,
       `separator`'s purple) into one `tui` color namespace so `App`, `Picker`, and `separator` stop
-      each defining their own.
+      each defining their own. The palette is app style, so it belongs in the `ui` namespace, not the
+      generic `terminal` engine.
 - [ ] **Make `App.Entry` a `union(Kind)`.** It is a struct with a `kind` enum plus `is_error` that is
       dead for `intro`/`user`/`model`, and `text` is the only payload any variant carries. A tagged
       union gives each block exactly its data, makes the `ensureEntry` switch exhaustive by

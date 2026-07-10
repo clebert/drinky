@@ -4,14 +4,14 @@
 
 const std = @import("std");
 
-const llm = @import("../llm.zig");
-const width = @import("width.zig");
+const ai = @import("ai");
+const terminal = @import("terminal");
 
 const dim = "\x1b[2m";
 const reset = "\x1b[0m";
 
 pub const Info = struct {
-    last: llm.Usage,
+    last: ai.llm.Usage,
     cost: f64,
     saved: f64,
     context_window: u64,
@@ -32,8 +32,8 @@ pub fn render(
     defer stats.deinit(gpa);
     try writeStats(&stats, gpa, info);
 
-    const stats_columns = width.display(stats.items);
-    const model_columns = width.display(info.model);
+    const stats_columns = terminal.width.display(stats.items);
+    const model_columns = terminal.width.display(info.model);
 
     try buffer.appendSlice(gpa, dim);
     if (stats_columns + model_columns + 1 <= columns) {
@@ -41,7 +41,7 @@ pub fn render(
         try appendSpaces(buffer, gpa, columns - stats_columns - model_columns);
         try buffer.appendSlice(gpa, info.model);
     } else {
-        try buffer.appendSlice(gpa, width.truncate(stats.items, columns));
+        try buffer.appendSlice(gpa, terminal.width.truncate(stats.items, columns));
     }
     try buffer.appendSlice(gpa, reset);
     return buffer.items;
@@ -128,7 +128,7 @@ test render {
         .model = "claude-opus-4-8",
     }, 120, &buffer, std.testing.allocator);
 
-    try std.testing.expectEqual(@as(usize, 120), width.display(line));
+    try std.testing.expectEqual(@as(usize, 120), terminal.width.display(line));
     try std.testing.expect(std.mem.indexOf(u8, line, "ctx 21% (206k/1.0M)") != null);
     try std.testing.expect(std.mem.indexOf(u8, line, "cache 87%") != null);
     try std.testing.expect(std.mem.indexOf(u8, line, "$0.39 saved $0.82") != null);

@@ -8,7 +8,7 @@
 const std = @import("std");
 
 const separator = @import("separator.zig");
-const width = @import("width.zig");
+const terminal = @import("terminal");
 
 const Picker = @This();
 
@@ -87,7 +87,7 @@ pub fn render(
     try separator.rule(buffer, gpa, columns);
 
     const columns_min = 1;
-    try width.wrap(buffer.items, @max(columns, columns_min), lines, gpa);
+    try terminal.width.wrap(buffer.items, @max(columns, columns_min), lines, gpa);
 }
 
 fn testPicker(gpa: std.mem.Allocator, labels: []const []const u8, cursor: usize) !Picker {

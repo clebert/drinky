@@ -12,7 +12,7 @@
 
 const std = @import("std");
 
-const VirtualTerminal = @This();
+const Emulator = @This();
 
 const blank = ' ';
 
@@ -27,7 +27,7 @@ cursor_row: usize,
 cursor_column: usize,
 cursor_visible: bool,
 
-pub fn init(gpa: std.mem.Allocator, columns: usize, rows: usize) !VirtualTerminal {
+pub fn init(gpa: std.mem.Allocator, columns: usize, rows: usize) !Emulator {
     const grid = try gpa.alloc(u21, columns * rows);
     @memset(grid, blank);
     return .{
@@ -42,14 +42,14 @@ pub fn init(gpa: std.mem.Allocator, columns: usize, rows: usize) !VirtualTermina
     };
 }
 
-pub fn deinit(self: *VirtualTerminal) void {
+pub fn deinit(self: *Emulator) void {
     for (self.scrollback.items) |row| self.gpa.free(row);
     self.scrollback.deinit(self.gpa);
     self.gpa.free(self.grid);
 }
 
 /// Feed one chunk of renderer output, updating the grid, scrollback, and cursor.
-pub fn write(self: *VirtualTerminal, bytes: []const u8) !void {
+pub fn write(self: *Emulator, bytes: []const u8) !void {
     var index: usize = 0;
     while (index < bytes.len) {
         const byte = bytes[index];
@@ -69,12 +69,12 @@ pub fn write(self: *VirtualTerminal, bytes: []const u8) !void {
 }
 
 /// Visible text of `row`, written into `buffer` with trailing blanks trimmed.
-pub fn rowText(self: *const VirtualTerminal, row: usize, buffer: []u8) []const u8 {
+pub fn rowText(self: *const Emulator, row: usize, buffer: []u8) []const u8 {
     return trimmedText(self.grid[row * self.columns ..][0..self.columns], buffer);
 }
 
 /// Visible text of scrollback row `index` (0 = oldest), trailing blanks trimmed.
-pub fn scrollbackText(self: *const VirtualTerminal, index: usize, buffer: []u8) []const u8 {
+pub fn scrollbackText(self: *const Emulator, index: usize, buffer: []u8) []const u8 {
     return trimmedText(self.scrollback.items[index], buffer);
 }
 
@@ -90,7 +90,7 @@ fn trimmedText(row: []const u21, buffer: []u8) []const u8 {
     return buffer[0..length];
 }
 
-fn putCodepoint(self: *VirtualTerminal, bytes: []const u8) !usize {
+fn putCodepoint(self: *Emulator, bytes: []const u8) !usize {
     const length = std.unicode.utf8ByteSequenceLength(bytes[0]) catch 1;
     const step = @min(length, bytes.len);
     const codepoint = std.unicode.utf8Decode(bytes[0..step]) catch bytes[0];
@@ -101,7 +101,7 @@ fn putCodepoint(self: *VirtualTerminal, bytes: []const u8) !usize {
     return step;
 }
 
-fn lineFeed(self: *VirtualTerminal) !void {
+fn lineFeed(self: *Emulator) !void {
     if (self.cursor_row + 1 < self.rows) {
         self.cursor_row += 1;
         return;
@@ -109,7 +109,7 @@ fn lineFeed(self: *VirtualTerminal) !void {
     try self.scroll();
 }
 
-fn scroll(self: *VirtualTerminal) !void {
+fn scroll(self: *Emulator) !void {
     const first = try self.gpa.dupe(u21, self.grid[0..self.columns]);
     try self.scrollback.append(self.gpa, first);
     std.mem.copyForwards(u21, self.grid[0 .. (self.rows - 1) * self.columns], self.grid[self.columns..]);
@@ -117,7 +117,7 @@ fn scroll(self: *VirtualTerminal) !void {
 }
 
 /// Apply the escape sequence at the start of `text` and return its byte length.
-fn escape(self: *VirtualTerminal, text: []const u8) !usize {
+fn escape(self: *Emulator, text: []const u8) !usize {
     if (text.len < 2) return text.len;
     switch (text[1]) {
         '[' => return self.control(text),
@@ -135,7 +135,7 @@ fn escape(self: *VirtualTerminal, text: []const u8) !usize {
 }
 
 /// Apply a CSI (`ESC [`) sequence and return its byte length.
-fn control(self: *VirtualTerminal, text: []const u8) !usize {
+fn control(self: *Emulator, text: []const u8) !usize {
     var index: usize = 2;
     const private = index < text.len and text[index] == '?';
     if (private) index += 1;
@@ -167,7 +167,7 @@ fn control(self: *VirtualTerminal, text: []const u8) !usize {
     return index;
 }
 
-fn eraseDisplay(self: *VirtualTerminal, mode: usize) void {
+fn eraseDisplay(self: *Emulator, mode: usize) void {
     switch (mode) {
         0 => {
             const start = self.cursor_row * self.columns + self.cursor_column;
@@ -182,7 +182,7 @@ fn eraseDisplay(self: *VirtualTerminal, mode: usize) void {
     }
 }
 
-fn eraseLine(self: *VirtualTerminal, mode: usize) void {
+fn eraseLine(self: *Emulator, mode: usize) void {
     const row = self.grid[self.cursor_row * self.columns ..][0..self.columns];
     switch (mode) {
         0 => @memset(row[self.cursor_column..], blank),
