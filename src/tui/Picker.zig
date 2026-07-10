@@ -1,11 +1,13 @@
 //! A single-choice list for the live region: a title and a key hint above the
 //! options, each option on its own row with the selected one highlighted. It
-//! owns its option strings (freed on `deinit`) and borrows the title. A pure
-//! view otherwise — navigation moves the selection; the caller reads `choice`
-//! and acts on it.
+//! renders as a padded box framed by the input-area separators so it sits where
+//! the editor would. It owns its option strings (freed on `deinit`) and borrows
+//! the title. A pure view otherwise — navigation moves the selection; the caller
+//! reads `choice` and acts on it.
 
 const std = @import("std");
 
+const separator = @import("separator.zig");
 const width = @import("width.zig");
 
 const Picker = @This();
@@ -14,7 +16,7 @@ const dim = "\x1b[2m";
 const reset = "\x1b[0m";
 const highlight = "\x1b[7m";
 const highlight_reset = "\x1b[27m";
-const hint = "↑/↓ move · enter select · ctrl-c cancel";
+const hint = "↑/↓ move · enter select · esc cancel";
 
 gpa: std.mem.Allocator,
 title: []const u8,
@@ -55,11 +57,18 @@ pub fn render(
     lines.clearRetainingCapacity();
     const gpa = self.gpa;
 
+    // Top rule, then a blank padding row (`\n\n` after the rule leaves one empty
+    // line before the title); one leading space on every content row is the
+    // horizontal padding.
+    try separator.rule(buffer, gpa, columns);
+    try buffer.appendSlice(gpa, "\n\n");
     try buffer.appendSlice(gpa, dim);
+    try buffer.appendSlice(gpa, " ");
     try buffer.appendSlice(gpa, self.title);
     try buffer.appendSlice(gpa, reset);
     try buffer.appendSlice(gpa, "\n");
     try buffer.appendSlice(gpa, dim);
+    try buffer.appendSlice(gpa, " ");
     try buffer.appendSlice(gpa, hint);
     try buffer.appendSlice(gpa, reset);
 
@@ -67,11 +76,15 @@ pub fn render(
         const chosen = index == self.cursor;
         try buffer.appendSlice(gpa, "\n");
         try buffer.appendSlice(gpa, if (chosen) highlight else dim);
-        try buffer.appendSlice(gpa, if (chosen) "> " else "  ");
+        try buffer.appendSlice(gpa, if (chosen) " > " else "   ");
         try buffer.appendSlice(gpa, option);
         if (self.marked == index) try buffer.appendSlice(gpa, " (current)");
         try buffer.appendSlice(gpa, if (chosen) highlight_reset else reset);
     }
+
+    // Blank padding row, then the bottom rule.
+    try buffer.appendSlice(gpa, "\n\n");
+    try separator.rule(buffer, gpa, columns);
 
     const columns_min = 1;
     try width.wrap(buffer.items, @max(columns, columns_min), lines, gpa);
@@ -107,9 +120,10 @@ test "render shows the title, hint, options, and the current marker" {
     defer lines.deinit(gpa);
     try picker.render(80, &buffer, &lines);
 
-    try std.testing.expectEqual(@as(usize, 4), lines.items.len);
+    // Top rule, blank, title, hint, two options, blank, bottom rule.
+    try std.testing.expectEqual(@as(usize, 8), lines.items.len);
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "Pick") != null);
-    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "ctrl-c cancel") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "esc cancel") != null);
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "alpha (current)") != null);
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, highlight) != null);
 }

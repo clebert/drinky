@@ -48,12 +48,14 @@ pub fn init(self: *Tty, io: std.Io) !void {
 
     const out = &self.out_stream.interface;
     try out.writeAll(escape.paste_set);
+    try out.writeAll(escape.keyboard_set);
     try out.writeAll(escape.cursor_hide);
     try out.flush();
 }
 
 pub fn deinit(self: *Tty) void {
     const out = &self.out_stream.interface;
+    out.writeAll(escape.keyboard_reset) catch {};
     out.writeAll(escape.paste_reset) catch {};
     out.writeAll(escape.cursor_show) catch {};
     out.writeAll("\r\n") catch {};

@@ -13,6 +13,13 @@ pub const paste_reset = "\x1b[?2004l";
 pub const paste_begin = "\x1b[200~";
 pub const paste_end = "\x1b[201~";
 
+/// Push/pop the Kitty keyboard protocol with the disambiguate flag. It leaves
+/// plain Enter, Backspace, and printable keys as their legacy bytes but reports
+/// Shift+Enter, Escape, and Ctrl combinations as distinct `CSI ... u` sequences.
+/// Popping restores whatever mode was active before.
+pub const keyboard_set = "\x1b[>1u";
+pub const keyboard_reset = "\x1b[<u";
+
 pub const cursor_hide = "\x1b[?25l";
 pub const cursor_show = "\x1b[?25h";
 

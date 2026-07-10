@@ -6,11 +6,11 @@
 
 const std = @import("std");
 
+const separator = @import("separator.zig");
 const width = @import("width.zig");
 
 const Editor = @This();
 
-const prompt = "> ";
 const cursor_set = "\x1b[7m";
 const cursor_reset = "\x1b[27m";
 
@@ -82,7 +82,14 @@ pub fn render(
     buffer.clearRetainingCapacity();
     lines.clearRetainingCapacity();
     const gpa = self.gpa;
-    try buffer.appendSlice(gpa, prompt);
+
+    // Everything goes into `buffer` first; the separator and body slices are
+    // resolved by offset only after the last append, since growth can move the
+    // backing memory and invalidate a slice taken earlier.
+    try separator.rule(buffer, gpa, columns);
+    const separator_end = buffer.items.len;
+
+    const body_start = buffer.items.len;
     try buffer.appendSlice(gpa, self.text.items[0..self.cursor]);
     try buffer.appendSlice(gpa, cursor_set);
     if (self.cursor < self.text.items.len) {
@@ -94,8 +101,13 @@ pub fn render(
         try buffer.appendSlice(gpa, " ");
         try buffer.appendSlice(gpa, cursor_reset);
     }
+
+    const separator_line = buffer.items[0..separator_end];
+    const body = buffer.items[body_start..];
     const columns_min = 1;
-    try width.wrap(buffer.items, @max(columns, columns_min), lines, gpa);
+    try lines.append(gpa, separator_line);
+    try width.wrap(body, @max(columns, columns_min), lines, gpa);
+    try lines.append(gpa, separator_line);
 }
 
 fn stepFrom(self: *const Editor, index: usize) usize {
@@ -154,6 +166,8 @@ test render {
     var lines: std.ArrayList([]const u8) = .empty;
     defer lines.deinit(std.testing.allocator);
     try editor.render(80, &buffer, &lines);
-    try std.testing.expectEqual(@as(usize, 1), lines.items.len);
-    try std.testing.expectEqual(@as(usize, 5), width.display(lines.items[0]));
+    try std.testing.expectEqual(@as(usize, 3), lines.items.len);
+    try std.testing.expectEqual(@as(usize, 80), width.display(lines.items[0]));
+    try std.testing.expectEqual(@as(usize, 3), width.display(lines.items[1]));
+    try std.testing.expectEqual(@as(usize, 80), width.display(lines.items[2]));
 }

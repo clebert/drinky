@@ -23,6 +23,10 @@ pub const Key = union(enum) {
     /// Bracketed-paste payload, borrowed from the parser's buffer for the call.
     paste: []const u8,
     enter,
+    /// Shift+Enter (Kitty protocol): a literal newline that does not submit.
+    newline,
+    /// The Escape key (Kitty protocol reports it as `CSI 27 u`).
+    escape,
     backspace,
     left,
     right,
@@ -127,8 +131,47 @@ fn mapControlSequence(parameters: []const u8, final: u8) Key {
         if (std.mem.eql(u8, parameters, "4") or std.mem.eql(u8, parameters, "8")) return .end;
         return .unknown;
     }
+    if (final == 'u') return mapCsiU(parameters);
     return mapFinal(final);
 }
+
+/// Decode a Kitty-protocol `CSI codepoint;modifiers u` key. Only the events the
+/// UI acts on are recognized; anything else is `.unknown`.
+fn mapCsiU(parameters: []const u8) Key {
+    var codepoint_field = parameters;
+    var modifier_field: []const u8 = "1";
+    if (std.mem.indexOfScalar(u8, parameters, ';')) |semicolon| {
+        codepoint_field = parameters[0..semicolon];
+        modifier_field = parameters[semicolon + 1 ..];
+    }
+    const codepoint = std.fmt.parseInt(u21, beforeColon(codepoint_field), 10) catch return .unknown;
+    const modifiers = (std.fmt.parseInt(u21, beforeColon(modifier_field), 10) catch 1) -| 1;
+    const shift = modifiers & shift_bit != 0;
+    const ctrl = modifiers & ctrl_bit != 0;
+    if (codepoint == enter_key and shift) return .newline;
+    if (codepoint == escape_key) return .escape;
+    if (ctrl) {
+        const letter = asciiLetter(codepoint) orelse return .unknown;
+        return .{ .ctrl = letter };
+    }
+    return .unknown;
+}
+
+fn beforeColon(field: []const u8) []const u8 {
+    const colon = std.mem.indexOfScalar(u8, field, ':') orelse return field;
+    return field[0..colon];
+}
+
+fn asciiLetter(codepoint: u21) ?u8 {
+    if (codepoint >= 'a' and codepoint <= 'z') return @intCast(codepoint);
+    if (codepoint >= 'A' and codepoint <= 'Z') return @intCast(codepoint + 32);
+    return null;
+}
+
+const enter_key = 13;
+const escape_key = 27;
+const shift_bit = 0b001;
+const ctrl_bit = 0b100;
 
 fn mapFinal(final: u8) Key {
     return switch (final) {
@@ -161,6 +204,14 @@ test "printable and control" {
     try expectKeys("\x7f", &.{.backspace});
     try expectKeys("\x03", &.{.{ .ctrl = 'c' }});
     try expectKeys("\n", &.{.{ .ctrl = 'j' }});
+}
+
+test "kitty csi-u keys" {
+    try expectKeys("\x1b[13;2u", &.{.newline});
+    try expectKeys("\x1b[27u", &.{.escape});
+    try expectKeys("\x1b[99;5u", &.{.{ .ctrl = 'c' }});
+    try expectKeys("\x1b[106;5u", &.{.{ .ctrl = 'j' }});
+    try expectKeys("\x1b[13u", &.{.unknown});
 }
 
 test "arrows and navigation" {

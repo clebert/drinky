@@ -141,6 +141,16 @@ Extension seams referenced here:
       effort indicator, command palette). Keep the line/string render model. `tui.Picker` (the
       `/model` chooser) is the first such component: a single-choice list rendered into the live
       region, reusable by any command that returns a `pick` outcome.
+- [ ] **Steering.** Let the user type and send while a turn is running, queuing messages the way pi
+      does. Today the read loop is frozen for the whole blocking `agent.run()`, so the input box is
+      visible but inert. Depends on the off-thread networking work ("Networking off the UI thread"):
+      once stream I/O runs on its own thread, the event loop can keep reading keys, append submitted
+      lines to a pending-message queue, and feed them into the current or next turn.
+- [ ] **Smooth spinner animation.** Drive the `⠋ Working…` spinner from a timer
+      (`requestRender`-style) so it animates independently of stream events. It currently advances
+      one frame per stream event and freezes during the initial pre-first-token wait, because the
+      loop is blocked for the whole turn. Depends on the off-thread networking work so the UI thread
+      is free to tick a timer while the request is in flight.
 - [ ] **Context-window pressure signal.** The status line shows `ctx%` but nothing reacts to it.
       Warn as context fills (e.g. color the gauge past a threshold) and wire a threshold into
       `/handoff` compaction. Thresholds configurable with good defaults. Two model-specific
