@@ -30,8 +30,10 @@ Extension seams referenced here:
       registry. Everything below hangs off this.
 - [ ] **`/model`** — switch the active model at runtime. `Agent.init` already takes `model` as a
       param, so the seam is the hardcoded const in `App.zig` plus a live-reconfigure path.
-- [ ] **`/effort`** — set reasoning/effort level. Requires an effort field on `llm.Request` and
-      per-provider mapping (Anthropic thinking budget, OpenAI reasoning effort).
+- [ ] **`/effort`** — set reasoning/effort level, and show it on the status line so the right side
+      reads `model • effort` (e.g. `claude-opus-4-8 • xhigh`). Requires an effort field on
+      `llm.Request`, per-provider mapping (Anthropic thinking budget, OpenAI reasoning effort), and
+      threading `effort` into `tui.status.Info`.
 - [ ] **`/handoff`** — summarize/compact the current conversation and start fresh with the summary
       carried over, to reclaim context.
 - [ ] **`/subagent`** (or `/agents`) — list, pick, and dispatch to a user-defined subagent. Depends
@@ -55,12 +57,15 @@ Extension seams referenced here:
 
 ## Providers & efficiency
 
-- [ ] **Prompt caching.** No representation in `llm.zig` yet; add cache-control markers to the
-      neutral model and emit `cache_control` on system/tools/trailing blocks in
-      `anthropic/wire.zig`.
-- [ ] **Usage & cost stats.** `Transport.classify` currently drops `usage` from `message_start` /
-      `message_delta`. Surface it as an `llm.Event` variant and track tokens, cache hits/misses,
-      price, and context-window usage; display in the UI.
+- [x] **Prompt caching.** Always-on for Anthropic and model-independent: `wire.zig` places
+      `cache_control` breakpoints on the last system block, the last tool, and the last block of the
+      last message (3 of the 4 allowed), so the stable prefix and the growing history are cached each
+      turn. Anthropic applies its own per-model minimum-prefix rules server side.
+- [x] **Usage & cost stats.** `Transport` folds `message_start` / `message_delta` usage into
+      `llm.Usage`, carried on the `stop` event; `Agent.Stats` accumulates tokens and cost (priced by
+      `pricing.zig`), and the `tui.status` line shows tokens, cache-hit rate, cost, and context-
+      window fill. Remaining: prices are a small hardcoded table (grows per model); no per-turn /
+      `/session` breakdown yet.
 - [ ] **Other providers (OpenAI, …).** Add a `Kind` arm in `provider.zig` and an `openai/` module
       (wire + transport) mirroring `anthropic/`. Everything above `provider.zig` is already
       provider-agnostic. Reconciles with `/model`, `/effort`, caching, and stats.

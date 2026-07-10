@@ -7,6 +7,7 @@
 const std = @import("std");
 
 const llm = @import("llm.zig");
+const pricing = @import("pricing.zig");
 const provider = @import("provider.zig");
 const tool = @import("tool/root.zig");
 
@@ -22,6 +23,15 @@ model: []const u8,
 system: []const u8,
 arena: std.heap.ArenaAllocator,
 messages: std.ArrayList(llm.Message),
+stats: Stats,
+
+/// Cumulative token usage and dollar cost over the session, plus the most
+/// recent message's usage for the cache-hit and context-window gauges.
+const Stats = struct {
+    usage: llm.Usage = .{},
+    cost: f64 = 0,
+    last: llm.Usage = .{},
+};
 
 pub fn init(
     gpa: std.mem.Allocator,
@@ -37,6 +47,7 @@ pub fn init(
         .system = options.system,
         .arena = .init(gpa),
         .messages = .empty,
+        .stats = .{},
     };
 }
 
@@ -86,6 +97,16 @@ fn appendUser(self: *Agent, text: []const u8) !void {
     try self.messages.append(self.gpa, .{ .role = .user, .blocks = blocks });
 }
 
+/// Fold one assistant message's usage into the session totals and cost.
+fn recordUsage(self: *Agent, usage: llm.Usage) void {
+    self.stats.usage.input += usage.input;
+    self.stats.usage.output += usage.output;
+    self.stats.usage.cache_read += usage.cache_read;
+    self.stats.usage.cache_write += usage.cache_write;
+    self.stats.cost += pricing.lookup(self.model).cost(usage);
+    self.stats.last = usage;
+}
+
 /// Consume one streamed assistant message: record it, run its tools, and queue
 /// the results. Returns true when tools ran and another round is needed.
 fn consume(self: *Agent, stream: *provider.Stream, handler: anytype) !bool {
@@ -113,7 +134,7 @@ fn consume(self: *Agent, stream: *provider.Stream, handler: anytype) !bool {
             in_tool = true;
         },
         .input_json => |chunk| try input.appendSlice(self.gpa, chunk),
-        .stop => {},
+        .stop => |stop| self.recordUsage(stop.usage),
     };
     try flushText(arena, &blocks, &text);
     if (in_tool) try flushTool(arena, &blocks, .{ .id = tool_id, .name = tool_name }, &input);

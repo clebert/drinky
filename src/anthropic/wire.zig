@@ -13,7 +13,10 @@ pub const system_header = "You are Claude Code, Anthropic's official CLI for Cla
 pub fn serialize(gpa: std.mem.Allocator, request: llm.Request) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var json: std.json.Stringify = .{ .writer = &out.writer, .options = .{} };
+    var json: std.json.Stringify = .{
+        .writer = &out.writer,
+        .options = .{ .emit_null_optional_fields = false },
+    };
 
     try json.beginObject();
     try json.objectField("model");
@@ -23,22 +26,32 @@ pub fn serialize(gpa: std.mem.Allocator, request: llm.Request) ![]u8 {
     try json.objectField("stream");
     try json.write(true);
 
+    // Prompt-cache breakpoints, model-independent: Anthropic caches the request
+    // prefix (tools, then system, then messages, in that order) up to and
+    // including each marked block, applying its own per-model minimum server
+    // side. Mark the last system block and the last tool so the stable prefix is
+    // cached, and the last block of the last message so the growing history is
+    // read back next turn. Three of the four allowed breakpoints.
     try json.objectField("system");
     try json.beginArray();
     try json.write(TextBlock{ .text = system_header });
-    try json.write(TextBlock{ .text = request.system });
+    try json.write(TextBlock{ .text = request.system, .cache_control = .{} });
     try json.endArray();
 
     if (request.tools.len > 0) {
         try json.objectField("tools");
         try json.beginArray();
-        for (request.tools) |tool| try writeTool(&json, tool);
+        for (request.tools, 0..) |tool, index| {
+            try writeTool(&json, tool, index == request.tools.len - 1);
+        }
         try json.endArray();
     }
 
     try json.objectField("messages");
     try json.beginArray();
-    for (request.messages) |message| try writeMessage(&json, message);
+    for (request.messages, 0..) |message, index| {
+        try writeMessage(&json, message, index == request.messages.len - 1);
+    }
     try json.endArray();
     try json.endObject();
 
@@ -57,9 +70,14 @@ const RawJson = struct {
     }
 };
 
+/// A prompt-cache breakpoint: the request prefix up to and including the block
+/// carrying it is cached (5-minute ephemeral).
+const CacheControl = struct { type: []const u8 = "ephemeral" };
+
 const TextBlock = struct {
     type: []const u8 = "text",
     text: []const u8,
+    cache_control: ?CacheControl = null,
 };
 
 const ToolUseBlock = struct {
@@ -67,6 +85,7 @@ const ToolUseBlock = struct {
     id: []const u8,
     name: []const u8,
     input: RawJson,
+    cache_control: ?CacheControl = null,
 };
 
 const ToolResultBlock = struct {
@@ -74,9 +93,10 @@ const ToolResultBlock = struct {
     tool_use_id: []const u8,
     is_error: bool,
     content: []const u8,
+    cache_control: ?CacheControl = null,
 };
 
-fn writeTool(json: *std.json.Stringify, tool: llm.Tool) !void {
+fn writeTool(json: *std.json.Stringify, tool: llm.Tool, cache: bool) !void {
     try json.beginObject();
     try json.objectField("name");
     try json.write(tool.name);
@@ -105,33 +125,42 @@ fn writeTool(json: *std.json.Stringify, tool: llm.Tool) !void {
     }
     try json.endArray();
     try json.endObject();
+    if (cache) {
+        try json.objectField("cache_control");
+        try json.write(CacheControl{});
+    }
     try json.endObject();
 }
 
-fn writeMessage(json: *std.json.Stringify, message: llm.Message) !void {
+fn writeMessage(json: *std.json.Stringify, message: llm.Message, cache_last: bool) !void {
     try json.beginObject();
     try json.objectField("role");
     try json.write(@tagName(message.role));
     try json.objectField("content");
     try json.beginArray();
-    for (message.blocks) |block| try writeBlock(json, block);
+    for (message.blocks, 0..) |block, index| {
+        try writeBlock(json, block, cache_last and index == message.blocks.len - 1);
+    }
     try json.endArray();
     try json.endObject();
 }
 
-fn writeBlock(json: *std.json.Stringify, block: llm.Block) !void {
+fn writeBlock(json: *std.json.Stringify, block: llm.Block, cache: bool) !void {
+    const control: ?CacheControl = if (cache) .{} else null;
     switch (block) {
-        .text => |text| try json.write(TextBlock{ .text = text }),
+        .text => |text| try json.write(TextBlock{ .text = text, .cache_control = control }),
         // The model emits tool input as JSON already, so embed it verbatim.
         .tool_use => |use| try json.write(ToolUseBlock{
             .id = use.id,
             .name = use.name,
             .input = .{ .bytes = if (use.input_json.len == 0) "{}" else use.input_json },
+            .cache_control = control,
         }),
         .tool_result => |result| try json.write(ToolResultBlock{
             .tool_use_id = result.tool_use_id,
             .is_error = result.is_error,
             .content = result.content,
+            .cache_control = control,
         }),
     }
 }
@@ -210,4 +239,47 @@ test "tool_use input passes through raw, empty becomes an empty object" {
     try std.testing.expectEqualStrings("tool_result", result.get("type").?.string);
     try std.testing.expectEqual(true, result.get("is_error").?.bool);
     try std.testing.expectEqualStrings("ok", result.get("content").?.string);
+}
+
+// The model string is arbitrary here: cache breakpoints are placed the same way
+// for every model, so this proves caching does not depend on the model.
+test "cache_control marks the system prompt, last tool, and last message block" {
+    const tools = [_]llm.Tool{
+        .{ .name = "read", .description = "d", .parameters = &.{} },
+        .{ .name = "grep", .description = "d", .parameters = &.{} },
+    };
+    const first = [_]llm.Block{.{ .text = "hello" }};
+    const second = [_]llm.Block{ .{ .text = "a" }, .{ .text = "b" } };
+    const messages = [_]llm.Message{
+        .{ .role = .user, .blocks = &first },
+        .{ .role = .assistant, .blocks = &second },
+    };
+    const body = try serialize(std.testing.allocator, .{
+        .model = "any-model-x",
+        .tokens_max = 8,
+        .system = "sys",
+        .messages = &messages,
+        .tools = &tools,
+    });
+    defer std.testing.allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+
+    const system = root.get("system").?.array.items;
+    try std.testing.expect(system[0].object.get("cache_control") == null);
+    const marker = system[1].object.get("cache_control").?.object;
+    try std.testing.expectEqualStrings("ephemeral", marker.get("type").?.string);
+
+    const tool_items = root.get("tools").?.array.items;
+    try std.testing.expect(tool_items[0].object.get("cache_control") == null);
+    try std.testing.expect(tool_items[1].object.get("cache_control") != null);
+
+    const message_items = root.get("messages").?.array.items;
+    const first_blocks = message_items[0].object.get("content").?.array.items;
+    try std.testing.expect(first_blocks[0].object.get("cache_control") == null);
+    const last_blocks = message_items[1].object.get("content").?.array.items;
+    try std.testing.expect(last_blocks[0].object.get("cache_control") == null);
+    try std.testing.expect(last_blocks[1].object.get("cache_control") != null);
 }

@@ -8,6 +8,7 @@ const std = @import("std");
 
 const Agent = @import("Agent.zig");
 const anthropic = @import("anthropic/root.zig");
+const pricing = @import("pricing.zig");
 const provider = @import("provider.zig");
 const terminal = @import("terminal/root.zig");
 const tui = @import("tui/root.zig");
@@ -38,6 +39,8 @@ agent: Agent,
 pending: std.ArrayList(u8),
 scratch: std.ArrayList(u8),
 lines: std.ArrayList([]const u8),
+live: std.ArrayList([]const u8),
+status_buffer: std.ArrayList(u8),
 columns: usize,
 running: bool,
 
@@ -50,9 +53,13 @@ pub fn run(self: *App, gpa: std.mem.Allocator, io: std.Io, home: []const u8) !vo
     self.pending = .empty;
     self.scratch = .empty;
     self.lines = .empty;
+    self.live = .empty;
+    self.status_buffer = .empty;
     defer self.pending.deinit(gpa);
     defer self.scratch.deinit(gpa);
     defer self.lines.deinit(gpa);
+    defer self.live.deinit(gpa);
+    defer self.status_buffer.deinit(gpa);
 
     self.auth = try anthropic.Auth.init(gpa, io, home);
     defer self.auth.deinit();
@@ -117,7 +124,29 @@ fn handleKey(self: *App, event: tui.Input.Key) !void {
 fn renderPrompt(self: *App) !void {
     self.columns = self.tty.size().columns;
     try self.editor.render(self.columns, &self.scratch, &self.lines);
-    try self.renderer.render(self.lines.items);
+    try self.paint(self.lines.items);
+}
+
+/// Repaint the live region as `body` followed by the status line, which stays
+/// pinned to the bottom in every phase.
+fn paint(self: *App, body: []const []const u8) !void {
+    const status = try self.statusLine();
+    self.live.clearRetainingCapacity();
+    try self.live.appendSlice(self.gpa, body);
+    try self.live.append(self.gpa, status);
+    try self.renderer.render(self.live.items);
+}
+
+fn statusLine(self: *App) ![]const u8 {
+    const price = pricing.lookup(self.agent.model);
+    const stats = self.agent.stats;
+    return tui.status.render(.{
+        .usage = stats.usage,
+        .last = stats.last,
+        .cost = stats.cost,
+        .context_window = price.context_window,
+        .model = self.agent.model,
+    }, self.columns, &self.status_buffer, self.gpa);
 }
 
 fn submit(self: *App) !void {
@@ -127,9 +156,9 @@ fn submit(self: *App) !void {
     defer self.gpa.free(text);
     self.editor.clear();
 
-    try self.renderer.render(&.{});
+    try self.paint(&.{});
     try self.commitWrapped(.{ .style = dim, .prefix = "> ", .text = text });
-    try self.renderer.render(&.{dim ++ "…" ++ reset});
+    try self.paint(&.{dim ++ "…" ++ reset});
 
     self.agent.run(text, self) catch |err| {
         try self.flushPending();
@@ -153,7 +182,7 @@ pub fn onText(self: *App, delta: []const u8) !void {
         try self.renderer.commit(&.{line[0..fit]});
         self.dropPending(fit);
     }
-    try self.renderer.render(&.{self.pending.items});
+    try self.paint(&.{self.pending.items});
 }
 
 pub fn onToolStart(self: *App, name: []const u8, input_json: []const u8) !void {
@@ -176,7 +205,7 @@ pub fn onError(self: *App, text: []const u8) !void {
 
 /// Commit the in-progress assistant line, if any, and empty the live region.
 fn flushPending(self: *App) !void {
-    try self.renderer.render(&.{});
+    try self.paint(&.{});
     if (self.pending.items.len > 0) {
         try self.renderer.commit(&.{self.pending.items});
         self.pending.clearRetainingCapacity();

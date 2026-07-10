@@ -26,6 +26,7 @@ pub const Stream = struct {
     status: std.http.Status,
     error_length: usize,
     parsed: ?std.json.Parsed(std.json.Value),
+    usage: llm.Usage,
     decompress: std.http.Decompress,
     decompress_buffer: []u8,
     error_buffer: [512]u8,
@@ -82,13 +83,32 @@ pub const Stream = struct {
             return error.ApiError;
         }
 
-        const event = classify(object, kind);
-        if (event) |value| {
-            self.parsed = parsed;
-            return value;
+        // Usage arrives split across the stream: the prompt and cache counts in
+        // `message_start`, the final output count in `message_delta`. Fold both
+        // into the running total and hand it back on the stop event.
+        if (std.mem.eql(u8, kind, "message_start")) {
+            if (asObject(object.get("message"))) |message| {
+                if (asObject(message.get("usage"))) |usage| mergeUsage(&self.usage, usage);
+            }
+            parsed.deinit();
+            return null;
         }
-        parsed.deinit();
-        return null;
+
+        const event = classify(object, kind) orelse {
+            parsed.deinit();
+            return null;
+        };
+        switch (event) {
+            .stop => |stop| {
+                if (asObject(object.get("usage"))) |usage| mergeUsage(&self.usage, usage);
+                self.parsed = parsed;
+                return .{ .stop = .{ .reason = stop.reason, .usage = self.usage } };
+            },
+            else => {
+                self.parsed = parsed;
+                return event;
+            },
+        }
     }
 
     fn recordError(self: *Stream, message: []const u8) void {
@@ -104,6 +124,7 @@ pub fn send(self: *Transport, out: *Stream, body: []const u8, access_token: []co
     errdefer out.client.deinit();
     out.parsed = null;
     out.error_length = 0;
+    out.usage = .{};
 
     const authorization = try std.fmt.allocPrint(self.gpa, "Bearer {s}", .{access_token});
     defer self.gpa.free(authorization);
@@ -174,7 +195,7 @@ fn classify(object: std.json.ObjectMap, kind: []const u8) ?llm.Event {
     }
     if (std.mem.eql(u8, kind, "message_delta")) {
         const delta = asObject(object.get("delta")) orelse return null;
-        return .{ .stop = asString(delta.get("stop_reason")) };
+        return .{ .stop = .{ .reason = asString(delta.get("stop_reason")), .usage = .{} } };
     }
     return null;
 }
@@ -200,6 +221,23 @@ fn asString(value: ?std.json.Value) ?[]const u8 {
     };
 }
 
+fn asU64(value: ?std.json.Value) ?u64 {
+    const found = value orelse return null;
+    return switch (found) {
+        .integer => |integer| if (integer < 0) 0 else @intCast(integer),
+        else => null,
+    };
+}
+
+/// Overwrite each field present in `object`. Anthropic reports usage as
+/// cumulative message totals, so last-writer-per-field is the running total.
+fn mergeUsage(usage: *llm.Usage, object: std.json.ObjectMap) void {
+    if (asU64(object.get("input_tokens"))) |value| usage.input = value;
+    if (asU64(object.get("output_tokens"))) |value| usage.output = value;
+    if (asU64(object.get("cache_read_input_tokens"))) |value| usage.cache_read = value;
+    if (asU64(object.get("cache_creation_input_tokens"))) |value| usage.cache_write = value;
+}
+
 test classify {
     const json =
         \\{"type":"content_block_delta","delta":{"type":"text_delta","text":"hello"}}
@@ -220,22 +258,31 @@ test classify {
 
 test "next walks SSE data lines and ends at stream end" {
     const body =
+        "event: message_start\r\n" ++
+        "data: {\"type\":\"message_start\",\"message\":{\"usage\":" ++
+        "{\"input_tokens\":10,\"cache_read_input_tokens\":90,\"cache_creation_input_tokens\":5,\"output_tokens\":1}}}\r\n" ++
+        "\r\n" ++
         "event: content_block_delta\r\n" ++
         "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\r\n" ++
         "\r\n" ++
         "event: message_delta\r\n" ++
-        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\r\n" ++
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":42}}\r\n" ++
         "\r\n";
     var reader: std.Io.Reader = .fixed(body);
     var stream: Stream = undefined;
     stream.gpa = std.testing.allocator;
     stream.body = &reader;
     stream.parsed = null;
+    stream.usage = .{};
     defer if (stream.parsed) |parsed| parsed.deinit();
 
     const text = (try stream.next()).?;
     try std.testing.expectEqualStrings("Hi", text.text);
     const stop = (try stream.next()).?;
-    try std.testing.expectEqualStrings("end_turn", stop.stop.?);
+    try std.testing.expectEqualStrings("end_turn", stop.stop.reason.?);
+    try std.testing.expectEqual(@as(u64, 10), stop.stop.usage.input);
+    try std.testing.expectEqual(@as(u64, 42), stop.stop.usage.output);
+    try std.testing.expectEqual(@as(u64, 90), stop.stop.usage.cache_read);
+    try std.testing.expectEqual(@as(u64, 5), stop.stop.usage.cache_write);
     try std.testing.expectEqual(@as(?llm.Event, null), try stream.next());
 }
