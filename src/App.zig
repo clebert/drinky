@@ -21,7 +21,9 @@ const App = @This();
 const model = "claude-sonnet-4-6";
 const system_prompt =
     "You are pith, a small coding assistant running in a terminal. Be concise. " ++
-    "Read and write files in the working directory with the read and write tools.";
+    "Explore the working directory with find (by name) and grep (literal text in file contents), read files " ++
+    "with read, create or overwrite them with write, and change existing files with edit " ++
+    "(give old_text that occurs exactly once).";
 
 const dim = "\x1b[2m";
 const red = "\x1b[31m";
