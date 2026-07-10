@@ -11,9 +11,9 @@ const dim = "\x1b[2m";
 const reset = "\x1b[0m";
 
 pub const Info = struct {
-    usage: llm.Usage,
     last: llm.Usage,
     cost: f64,
+    saved: f64,
     context_window: u64,
     model: []const u8,
 };
@@ -66,14 +66,21 @@ fn writeStats(out: *std.ArrayList(u8), gpa: std.mem.Allocator, info: Info) !void
     try out.appendSlice(gpa, formatTokens(&scratch, info.context_window));
     try out.appendSlice(gpa, ")");
 
-    // Session cost at public API rates (an estimate: login type does not reveal
-    // billing). Cache reads recover 0.9x their input price, writes cost 0.25x
-    // extra; the rates cancel, so savings is pure token arithmetic.
+    // Last request's cache hit rate: reads over the whole prompt. Another "now"
+    // number, so it sits with ctx. Zero on a cold start, model switch, or cache
+    // expiry, making a miss visible where the cumulative "saved" figure can't.
+    const last_prompt = info.last.input + info.last.cache_read + info.last.cache_write;
+    if (last_prompt > 0) {
+        const hit = asFloat(info.last.cache_read) / asFloat(last_prompt) * 100.0;
+        try out.appendSlice(gpa, format(&scratch, " · cache {d:.0}%", .{hit}));
+    }
+
+    // Session cost, then the dollars caching saved versus sending the same
+    // tokens uncached. Both use public API rates (an estimate: login type does
+    // not reveal billing). Shown once a cache read has actually paid off.
     try out.appendSlice(gpa, format(&scratch, " · ${d:.2}", .{info.cost}));
-    if (info.usage.cache_read > 0) {
-        const baseline = info.usage.input + info.usage.cache_read + info.usage.cache_write;
-        const savings = 0.9 * asFloat(info.usage.cache_read) - 0.25 * asFloat(info.usage.cache_write);
-        try out.appendSlice(gpa, format(&scratch, " saved {d:.0}%", .{savings / asFloat(baseline) * 100.0}));
+    if (info.saved > 0) {
+        try out.appendSlice(gpa, format(&scratch, " saved ${d:.2}", .{info.saved}));
     }
 }
 
@@ -114,15 +121,16 @@ test render {
     var buffer: std.ArrayList(u8) = .empty;
     defer buffer.deinit(std.testing.allocator);
     const line = try render(.{
-        .usage = .{ .input = 22, .output = 6700, .cache_read = 160_000, .cache_write = 23_000 },
         .last = .{ .input = 22, .output = 23_000, .cache_read = 160_000, .cache_write = 23_000 },
         .cost = 0.393,
+        .saved = 0.82,
         .context_window = 1_000_000,
         .model = "claude-opus-4-8",
     }, 120, &buffer, std.testing.allocator);
 
     try std.testing.expectEqual(@as(usize, 120), width.display(line));
     try std.testing.expect(std.mem.indexOf(u8, line, "ctx 21% (206k/1.0M)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, line, "$0.39 saved 76%") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "cache 87%") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "$0.39 saved $0.82") != null);
     try std.testing.expect(std.mem.indexOf(u8, line, "claude-opus-4-8") != null);
 }

@@ -7,29 +7,28 @@
 const std = @import("std");
 
 const llm = @import("llm.zig");
-const pricing = @import("pricing.zig");
+const models = @import("models.zig");
 const provider = @import("provider.zig");
 const tool = @import("tool/root.zig");
 
 const Agent = @This();
 
-const tokens_max = 8192;
 const rounds_max = 50;
 
 gpa: std.mem.Allocator,
 io: std.Io,
 client: provider.Client,
-model: []const u8,
+model: models.Model,
 system: []const u8,
 arena: std.heap.ArenaAllocator,
 messages: std.ArrayList(llm.Message),
 stats: Stats,
 
-/// Cumulative token usage and dollar cost over the session, plus the most
+/// Cumulative dollar cost and cache savings over the session, plus the most
 /// recent message's usage for the cache-hit and context-window gauges.
 const Stats = struct {
-    usage: llm.Usage = .{},
     cost: f64 = 0,
+    saved: f64 = 0,
     last: llm.Usage = .{},
 };
 
@@ -37,7 +36,7 @@ pub fn init(
     gpa: std.mem.Allocator,
     io: std.Io,
     client: provider.Client,
-    options: struct { model: []const u8, system: []const u8 },
+    options: struct { model: models.Model, system: []const u8 },
 ) Agent {
     return .{
         .gpa = gpa,
@@ -65,8 +64,8 @@ pub fn run(self: *Agent, user_text: []const u8, handler: anytype) !void {
     while (round < rounds_max) : (round += 1) {
         var stream: provider.Stream = undefined;
         try self.client.send(&stream, .{
-            .model = self.model,
-            .tokens_max = tokens_max,
+            .model = self.model.name,
+            .tokens_max = self.model.tokens_max,
             .system = self.system,
             .messages = self.messages.items,
             .tools = &tool.specs,
@@ -99,11 +98,8 @@ fn appendUser(self: *Agent, text: []const u8) !void {
 
 /// Fold one assistant message's usage into the session totals and cost.
 fn recordUsage(self: *Agent, usage: llm.Usage) void {
-    self.stats.usage.input += usage.input;
-    self.stats.usage.output += usage.output;
-    self.stats.usage.cache_read += usage.cache_read;
-    self.stats.usage.cache_write += usage.cache_write;
-    self.stats.cost += pricing.lookup(self.model).cost(usage);
+    self.stats.cost += self.model.cost(usage);
+    self.stats.saved += self.model.savings(usage);
     self.stats.last = usage;
 }
 

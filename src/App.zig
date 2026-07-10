@@ -8,7 +8,7 @@ const std = @import("std");
 
 const Agent = @import("Agent.zig");
 const anthropic = @import("anthropic/root.zig");
-const pricing = @import("pricing.zig");
+const models = @import("models.zig");
 const provider = @import("provider.zig");
 const terminal = @import("terminal/root.zig");
 const tui = @import("tui/root.zig");
@@ -16,6 +16,8 @@ const tui = @import("tui/root.zig");
 const App = @This();
 
 const model = "claude-sonnet-4-6";
+const model_info = models.get(.anthropic, model) orelse
+    @compileError("default model \"" ++ model ++ "\" is not in the model table");
 const system_prompt =
     "You are pith, a small coding assistant running in a terminal. Be concise. " ++
     "Explore the working directory with find (by name) and grep (literal text in file contents), read files " ++
@@ -65,7 +67,7 @@ pub fn run(self: *App, gpa: std.mem.Allocator, io: std.Io, home: []const u8) !vo
     defer self.auth.deinit();
     try self.ensureAuth();
 
-    self.agent = Agent.init(gpa, io, provider.Client.init(.anthropic, gpa, io, &self.auth), .{ .model = model, .system = system_prompt });
+    self.agent = Agent.init(gpa, io, provider.Client.init(.anthropic, gpa, io, &self.auth), .{ .model = model_info, .system = system_prompt });
     defer self.agent.deinit();
 
     try self.tty.init(io);
@@ -138,14 +140,13 @@ fn paint(self: *App, body: []const []const u8) !void {
 }
 
 fn statusLine(self: *App) ![]const u8 {
-    const price = pricing.lookup(self.agent.model);
     const stats = self.agent.stats;
     return tui.status.render(.{
-        .usage = stats.usage,
         .last = stats.last,
         .cost = stats.cost,
-        .context_window = price.context_window,
-        .model = self.agent.model,
+        .saved = stats.saved,
+        .context_window = self.agent.model.context_window,
+        .model = self.agent.model.name,
     }, self.columns, &self.status_buffer, self.gpa);
 }
 

@@ -17,5 +17,5 @@ jobs:
         with:
           version: 0.16.0
       - run: zig build
-      - run: zig fmt --check build.zig bin lib
+      - run: zig fmt --check build.zig src
       - run: zig build test
