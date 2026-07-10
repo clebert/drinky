@@ -6,7 +6,7 @@ const std = @import("std");
 const llm = @import("../llm.zig");
 const Context = @import("Context.zig");
 const Result = @import("Result.zig");
-const field = @import("field.zig");
+const parse = @import("parse.zig");
 const walk = @import("walk.zig");
 
 const limit_default = 100;
@@ -16,21 +16,37 @@ const line_bytes_max = 300;
 pub const spec: llm.Tool = .{
     .name = "grep",
     .description = "Search file contents for a literal substring (not a regex). Returns matching lines as 'path:line:text', with paths relative to the working directory. Ignores .git, zig-out, and build cache directories.",
-    .schema_json =
-    \\{"type":"object","properties":{"pattern":{"type":"string","description":"Literal substring to search for"},"path":{"type":"string","description":"Directory to search (default: '.')"},"glob":{"type":"string","description":"Only search files whose path matches this glob; * and ? do not cross '/', so use a '**/' prefix to recurse (default: all files)"},"ignore_case":{"type":"boolean","description":"Case-insensitive search (default: false)"},"limit":{"type":"integer","description":"Maximum number of matching lines (default: 100)"}},"required":["pattern"]}
-    ,
+    .parameters = &.{
+        .{ .name = "pattern", .type = .string, .required = true, .description = "Literal substring to search for" },
+        .{ .name = "path", .type = .string, .description = "Directory to search (default: '.')" },
+        .{ .name = "glob", .type = .string, .description = "Only search files whose path matches this glob; * and ? do not cross '/', so use a '**/' prefix to recurse (default: all files)" },
+        .{ .name = "ignore_case", .type = .boolean, .description = "Case-insensitive search (default: false)" },
+        .{ .name = "limit", .type = .integer, .description = "Maximum number of matching lines (default: 100)" },
+    },
 };
+
+const Input = struct {
+    pattern: []const u8,
+    path: []const u8 = ".",
+    glob: []const u8 = "**",
+    ignore_case: bool = false,
+    limit: usize = limit_default,
+};
+
+comptime {
+    parse.check(Input, spec.parameters);
+}
 
 pub fn run(context: *const Context, input_json: []const u8) !Result {
     const gpa = context.gpa;
-    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, input_json, .{});
+    const parsed = try parse.input(Input, gpa, input_json);
     defer parsed.deinit();
-    const pattern = field.string(parsed.value, "pattern") orelse return Result.report(gpa, .err, "missing 'pattern'", .{});
+    const pattern = parsed.value.pattern;
     if (pattern.len == 0) return Result.report(gpa, .err, "pattern must not be empty", .{});
-    const base = field.string(parsed.value, "path") orelse ".";
-    const file_glob = field.string(parsed.value, "glob") orelse "**";
-    const ignore_case = field.boolean(parsed.value, "ignore_case") orelse false;
-    const limit = field.uint(parsed.value, "limit") orelse limit_default;
+    const base = parsed.value.path;
+    const file_glob = parsed.value.glob;
+    const ignore_case = parsed.value.ignore_case;
+    const limit = parsed.value.limit;
 
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();

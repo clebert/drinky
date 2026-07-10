@@ -6,7 +6,7 @@ const std = @import("std");
 const llm = @import("../llm.zig");
 const Context = @import("Context.zig");
 const Result = @import("Result.zig");
-const field = @import("field.zig");
+const parse = @import("parse.zig");
 
 const lines_max = 2000;
 const bytes_max = 50 * 1024;
@@ -15,18 +15,30 @@ const file_bytes_max = 16 << 20;
 pub const spec: llm.Tool = .{
     .name = "read",
     .description = "Read a UTF-8 text file. Output is truncated to 2000 lines or 50KB, whichever comes first; use offset and limit to page through large files (the output notes the next offset to continue from).",
-    .schema_json =
-    \\{"type":"object","properties":{"path":{"type":"string","description":"Path to the file (relative or absolute)"},"offset":{"type":"integer","description":"1-indexed line to start reading from (default: 1)"},"limit":{"type":"integer","description":"Maximum number of lines to read"}},"required":["path"]}
-    ,
+    .parameters = &.{
+        .{ .name = "path", .type = .string, .required = true, .description = "Path to the file (relative or absolute)" },
+        .{ .name = "offset", .type = .integer, .description = "1-indexed line to start reading from (default: 1)" },
+        .{ .name = "limit", .type = .integer, .description = "Maximum number of lines to read" },
+    },
 };
+
+const Input = struct {
+    path: []const u8,
+    offset: usize = 1,
+    limit: ?usize = null,
+};
+
+comptime {
+    parse.check(Input, spec.parameters);
+}
 
 pub fn run(context: *const Context, input_json: []const u8) !Result {
     const gpa = context.gpa;
-    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, input_json, .{});
+    const parsed = try parse.input(Input, gpa, input_json);
     defer parsed.deinit();
-    const path = field.string(parsed.value, "path") orelse return Result.report(gpa, .err, "missing 'path'", .{});
-    const offset = field.uint(parsed.value, "offset") orelse 1;
-    const limit = field.uint(parsed.value, "limit");
+    const path = parsed.value.path;
+    const offset = parsed.value.offset;
+    const limit = parsed.value.limit;
 
     const data = std.Io.Dir.cwd().readFileAlloc(context.io, path, gpa, .limited(file_bytes_max)) catch |err| switch (err) {
         error.StreamTooLong => return Result.report(gpa, .err, "{s} is larger than {d} bytes; read it another way", .{ path, file_bytes_max }),
@@ -66,6 +78,11 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
         try out.writer.print("\n\n[showing lines {d}-{d} of {d}; use offset={d} to continue]", .{ start + 1, last + 1, total, last + 2 });
     }
     return .{ .content = try out.toOwnedSlice(), .is_error = false };
+}
+
+test "read rejects invalid input" {
+    const context: Context = .{ .gpa = std.testing.allocator, .io = std.testing.io };
+    try std.testing.expectError(error.InvalidArguments, run(&context, "{}"));
 }
 
 test "read of missing file reports an error" {

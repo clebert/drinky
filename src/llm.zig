@@ -31,8 +31,16 @@ pub const Message = struct {
 pub const Tool = struct {
     name: []const u8,
     description: []const u8,
-    /// Raw JSON Schema object for the tool's input.
-    schema_json: []const u8,
+    parameters: []const Parameter,
+};
+
+pub const Parameter = struct {
+    name: []const u8,
+    type: Type,
+    description: []const u8,
+    required: bool = false,
+
+    pub const Type = enum { string, integer, boolean };
 };
 
 pub const Request = struct {

@@ -5,23 +5,35 @@ const std = @import("std");
 const llm = @import("../llm.zig");
 const Context = @import("Context.zig");
 const Result = @import("Result.zig");
-const field = @import("field.zig");
+const parse = @import("parse.zig");
 
 pub const spec: llm.Tool = .{
     .name = "edit",
     .description = "Replace an exact, unique span of text in an existing file. old_text must occur exactly once; include enough surrounding context to make it unique.",
-    .schema_json =
-    \\{"type":"object","properties":{"path":{"type":"string","description":"Path to the file"},"old_text":{"type":"string","description":"Exact text to replace; must occur exactly once"},"new_text":{"type":"string","description":"Replacement text"}},"required":["path","old_text","new_text"]}
-    ,
+    .parameters = &.{
+        .{ .name = "path", .type = .string, .required = true, .description = "Path to the file" },
+        .{ .name = "old_text", .type = .string, .required = true, .description = "Exact text to replace; must occur exactly once" },
+        .{ .name = "new_text", .type = .string, .required = true, .description = "Replacement text" },
+    },
 };
+
+const Input = struct {
+    path: []const u8,
+    old_text: []const u8,
+    new_text: []const u8,
+};
+
+comptime {
+    parse.check(Input, spec.parameters);
+}
 
 pub fn run(context: *const Context, input_json: []const u8) !Result {
     const gpa = context.gpa;
-    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, input_json, .{});
+    const parsed = try parse.input(Input, gpa, input_json);
     defer parsed.deinit();
-    const path = field.string(parsed.value, "path") orelse return Result.report(gpa, .err, "missing 'path'", .{});
-    const old = field.string(parsed.value, "old_text") orelse return Result.report(gpa, .err, "missing 'old_text'", .{});
-    const new = field.string(parsed.value, "new_text") orelse return Result.report(gpa, .err, "missing 'new_text'", .{});
+    const path = parsed.value.path;
+    const old = parsed.value.old_text;
+    const new = parsed.value.new_text;
 
     const data = std.Io.Dir.cwd().readFileAlloc(context.io, path, gpa, .unlimited) catch |err| {
         return Result.report(gpa, .err, "cannot read {s}: {s}", .{ path, @errorName(err) });

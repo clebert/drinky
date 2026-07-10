@@ -39,7 +39,11 @@ pub const specs = blk: {
 /// Execute tool `name` with `input_json`. Caller frees `Result.content`.
 pub fn run(context: *const Context, name: []const u8, input_json: []const u8) !Result {
     for (registry) |entry| {
-        if (std.mem.eql(u8, name, entry.tool.name)) return entry.run(context, input_json);
+        if (!std.mem.eql(u8, name, entry.tool.name)) continue;
+        return entry.run(context, input_json) catch |err| switch (err) {
+            error.InvalidArguments => try Result.report(context.gpa, .err, "invalid arguments for {s}", .{name}),
+            else => return err,
+        };
     }
     return Result.report(context.gpa, .err, "unknown tool: {s}", .{name});
 }
@@ -47,6 +51,13 @@ pub fn run(context: *const Context, name: []const u8, input_json: []const u8) !R
 test "unknown tool is an error" {
     const context: Context = .{ .gpa = std.testing.allocator, .io = std.testing.io };
     const result = try run(&context, "nope", "{}");
+    defer std.testing.allocator.free(result.content);
+    try std.testing.expect(result.is_error);
+}
+
+test "invalid arguments are reported, not raised" {
+    const context: Context = .{ .gpa = std.testing.allocator, .io = std.testing.io };
+    const result = try run(&context, "read", "{}");
     defer std.testing.allocator.free(result.content);
     try std.testing.expect(result.is_error);
 }
