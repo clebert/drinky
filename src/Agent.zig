@@ -55,6 +55,12 @@ pub fn deinit(self: *Agent) void {
     self.arena.deinit();
 }
 
+/// Switch the active model; takes effect on the next turn. History is untouched,
+/// so the new model reads the same conversation from its own context window.
+pub fn setModel(self: *Agent, model: models.Model) void {
+    self.model = model;
+}
+
 /// Run one user turn, streaming output through `handler`.
 pub fn run(self: *Agent, user_text: []const u8, handler: anytype) !void {
     const base = self.messages.items.len;

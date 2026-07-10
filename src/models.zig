@@ -93,6 +93,13 @@ pub fn get(kind: provider.Kind, name: []const u8) ?Model {
     return null;
 }
 
+/// Append every model offered by `kind` to `out`, in table order.
+pub fn list(kind: provider.Kind, out: *std.ArrayList(Model), gpa: std.mem.Allocator) !void {
+    for (table) |entry| {
+        if (entry.provider == kind) try out.append(gpa, entry.model);
+    }
+}
+
 fn asFloat(count: u64) f64 {
     return @floatFromInt(count);
 }

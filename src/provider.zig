@@ -20,10 +20,15 @@ pub const Client = union(Kind) {
         auth: *anthropic.Auth,
     };
 
-    pub fn init(kind: Kind, gpa: std.mem.Allocator, io: std.Io, auth: *anthropic.Auth) Client {
-        return switch (kind) {
+    pub fn init(provider: Kind, gpa: std.mem.Allocator, io: std.Io, auth: *anthropic.Auth) Client {
+        return switch (provider) {
             .anthropic => .{ .anthropic = .{ .gpa = gpa, .io = io, .auth = auth } },
         };
+    }
+
+    /// The provider backing this client.
+    pub fn kind(self: *const Client) Kind {
+        return std.meta.activeTag(self.*);
     }
 
     /// Open a streaming request for `request`, filling `out` in place. On

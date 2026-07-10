@@ -8,6 +8,7 @@ const std = @import("std");
 
 const Agent = @import("Agent.zig");
 const anthropic = @import("anthropic/root.zig");
+const command = @import("command/root.zig");
 const models = @import("models.zig");
 const provider = @import("provider.zig");
 const terminal = @import("terminal/root.zig");
@@ -30,6 +31,12 @@ const reset = "\x1b[0m";
 
 const Styled = struct { style: []const u8, prefix: []const u8, text: []const u8 };
 
+const Picking = struct {
+    picker: tui.Picker,
+    /// Command re-run with the chosen option when the picker is confirmed.
+    command: []const u8,
+};
+
 gpa: std.mem.Allocator,
 io: std.Io,
 tty: terminal.Tty,
@@ -45,6 +52,7 @@ live: std.ArrayList([]const u8),
 status_buffer: std.ArrayList(u8),
 columns: usize,
 running: bool,
+picking: ?Picking,
 
 /// Authenticate (logging in if needed), then run the interactive loop until
 /// the user quits or stdin closes. Pin the value: streams borrow its buffers.
@@ -52,6 +60,8 @@ pub fn run(self: *App, gpa: std.mem.Allocator, io: std.Io, home: []const u8) !vo
     self.gpa = gpa;
     self.io = io;
     self.columns = 80;
+    self.picking = null;
+    defer self.closePicker();
     self.pending = .empty;
     self.scratch = .empty;
     self.lines = .empty;
@@ -80,7 +90,7 @@ pub fn run(self: *App, gpa: std.mem.Allocator, io: std.Io, home: []const u8) !vo
     defer self.editor.deinit();
 
     try self.renderer.commit(&.{dim ++ "pith — enter to send, ctrl-c to quit" ++ reset});
-    try self.renderPrompt();
+    try self.refresh();
 
     self.running = true;
     var read_buffer: [4096]u8 = undefined;
@@ -101,6 +111,7 @@ fn ensureAuth(self: *App) !void {
 }
 
 fn handleKey(self: *App, event: tui.Input.Key) !void {
+    if (self.picking != null) return self.handlePickerKey(event);
     switch (event) {
         .char => |codepoint| try self.editor.insertCodepoint(codepoint),
         .paste => |text| try self.editor.insert(text),
@@ -120,12 +131,18 @@ fn handleKey(self: *App, event: tui.Input.Key) !void {
         },
         .up, .down, .unknown => return,
     }
-    try self.renderPrompt();
+    try self.refresh();
 }
 
-fn renderPrompt(self: *App) !void {
+/// Repaint the active mode's live region: the picker when one is open, the
+/// editor prompt otherwise.
+fn refresh(self: *App) !void {
     self.columns = self.tty.size().columns;
-    try self.editor.render(self.columns, &self.scratch, &self.lines);
+    if (self.picking) |*picking| {
+        try picking.picker.render(self.columns, &self.scratch, &self.lines);
+    } else {
+        try self.editor.render(self.columns, &self.scratch, &self.lines);
+    }
     try self.paint(self.lines.items);
 }
 
@@ -159,14 +176,105 @@ fn submit(self: *App) !void {
 
     try self.paint(&.{});
     try self.commitWrapped(.{ .style = dim, .prefix = "> ", .text = text });
-    try self.paint(&.{dim ++ "…" ++ reset});
 
+    if (std.mem.startsWith(u8, text, "/")) {
+        try self.runCommand(text);
+    } else {
+        try self.runTurn(text);
+    }
+    try self.refresh();
+}
+
+/// Drive one agent turn, streaming its reply into the live region.
+fn runTurn(self: *App, text: []const u8) !void {
+    try self.paint(&.{dim ++ "…" ++ reset});
     self.agent.run(text, self) catch |err| {
         try self.flushPending();
         try self.commitLine(.{ .style = red, .prefix = "error: ", .text = @errorName(err) });
     };
     try self.flushPending();
-    try self.renderPrompt();
+}
+
+/// Handle a slash command locally: either print its feedback or open a picker.
+fn runCommand(self: *App, line: []const u8) !void {
+    var context: command.Context = .{ .gpa = self.gpa, .agent = &self.agent };
+    try self.handleOutcome(try command.run(&context, line));
+}
+
+/// Present a command outcome: print its feedback, or open its picker.
+fn handleOutcome(self: *App, outcome: command.Outcome) !void {
+    switch (outcome) {
+        .feedback => |feedback| {
+            defer self.gpa.free(feedback.content);
+            try self.commitFeedback(feedback.content, feedback.is_error);
+        },
+        .pick => |pick| self.openPicker(pick),
+    }
+}
+
+/// Commit a command's feedback one line per row, red when it reports failure.
+fn commitFeedback(self: *App, content: []const u8, is_error: bool) !void {
+    const style = if (is_error) red else dim;
+    const prefix = if (is_error) "error: " else "  ";
+    var feedback = std.mem.splitScalar(u8, content, '\n');
+    while (feedback.next()) |feedback_line| {
+        try self.commitLine(.{ .style = style, .prefix = prefix, .text = feedback_line });
+    }
+}
+
+/// Enter picker mode over a command's options; navigation and confirmation run
+/// through `handlePickerKey`. Takes ownership of `pick.options`.
+fn openPicker(self: *App, pick: command.Outcome.Pick) void {
+    self.picking = .{
+        .picker = .{
+            .gpa = self.gpa,
+            .title = pick.title,
+            .options = pick.options,
+            .cursor = pick.current orelse 0,
+            .marked = pick.current,
+        },
+        .command = pick.command,
+    };
+}
+
+fn handlePickerKey(self: *App, event: tui.Input.Key) !void {
+    const picker = &self.picking.?.picker;
+    switch (event) {
+        .up => picker.moveUp(),
+        .down => picker.moveDown(),
+        .enter => return self.confirmPicker(),
+        .ctrl => |letter| switch (letter) {
+            'c', 'd' => return self.cancelPicker(),
+            else => return,
+        },
+        else => return,
+    }
+    try self.refresh();
+}
+
+/// Re-apply the picker's command with the highlighted option as its argument.
+fn confirmPicker(self: *App) !void {
+    const picking = &self.picking.?;
+    var context: command.Context = .{ .gpa = self.gpa, .agent = &self.agent };
+    const outcome = try command.apply(&context, picking.command, picking.picker.choice());
+    self.closePicker();
+    try self.paint(&.{});
+    try self.handleOutcome(outcome);
+    try self.refresh();
+}
+
+fn cancelPicker(self: *App) !void {
+    self.closePicker();
+    try self.paint(&.{});
+    try self.commitLine(.{ .style = dim, .prefix = "  ", .text = "cancelled" });
+    try self.refresh();
+}
+
+fn closePicker(self: *App) void {
+    if (self.picking) |*picking| {
+        picking.picker.deinit();
+        self.picking = null;
+    }
 }
 
 pub fn onText(self: *App, delta: []const u8) !void {

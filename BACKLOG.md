@@ -30,11 +30,23 @@ Extension seams referenced here:
 
 ## Command surface
 
-- [ ] **Slash-command parsing.** Intercept lines starting with `/` in the submit path (`App.submit`)
-      before they reach `Agent.run`. A small command registry (name → handler) parallel to the tool
-      registry. Everything below hangs off this.
-- [ ] **`/model`** — switch the active model at runtime. `Agent.init` already takes `model` as a
-      param, so the seam is the hardcoded const in `App.zig` plus a live-reconfigure path.
+- [x] **Slash-command parsing.** Lines starting with `/` are intercepted in `App.submit` and routed
+      to `command/root.zig` — a registry (name → handler) mirroring the tool registry, with a
+      `command.Context` (gpa + `*Agent`) and a `command.Outcome` union (`feedback` text/`is_error`,
+      or an interactive `pick` request). `command.run` parses a typed line; `command.apply` runs a
+      name + argument directly. Everything below hangs off this.
+- [x] **`/model`** — switch the active model at runtime by name, or with no argument open an
+      interactive picker (↑/↓, enter, ctrl-c) over the active provider's models with the current one
+      marked. `Agent.setModel` is the live-reconfigure seam (takes effect next turn);
+      `provider.Client.kind` and `models.list` back the list. A command returns a `command.Outcome`
+      (`feedback` or `pick`); the app owns the reusable `tui.Picker` and, on selection, re-applies
+      the command with the choice via `command.apply` — so the widget stays generic. Per-message cost
+      attribution across a switch is still the open item below.
+- [ ] **Slash-command Tab completion.** Complete a partial slash command on Tab: while the line
+      starts with `/` and no argument has been typed, match the prefix against the command registry
+      and fill in the rest, cycling or listing the candidates when several match. Needs a Tab key
+      (`Input` currently decodes it to `ctrl-i`) and a `command.complete(prefix)` seam beside
+      `command.apply`; the candidate list can reuse `tui.Picker`.
 - [ ] **`/effort`** — set reasoning/effort level, and show it on the status line so the right side
       reads `model • effort` (e.g. `claude-opus-4-8 • xhigh`). Requires an effort field on
       `llm.Request`, per-provider mapping (Anthropic thinking budget, OpenAI reasoning effort), and
@@ -126,7 +138,9 @@ Extension seams referenced here:
 
 - [ ] **Richer UI with dedicated components.** Move beyond the current log + single-line editor to
       composable components (tool-call panels, streaming status, a stats/context footer, a model/
-      effort indicator, command palette). Keep the line/string render model.
+      effort indicator, command palette). Keep the line/string render model. `tui.Picker` (the
+      `/model` chooser) is the first such component: a single-choice list rendered into the live
+      region, reusable by any command that returns a `pick` outcome.
 - [ ] **Context-window pressure signal.** The status line shows `ctx%` but nothing reacts to it.
       Warn as context fills (e.g. color the gauge past a threshold) and wire a threshold into
       `/handoff` compaction. Thresholds configurable with good defaults. Two model-specific
