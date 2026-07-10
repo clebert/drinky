@@ -3,6 +3,7 @@
 //! orchestration live in `Auth`; this module only speaks the protocol.
 
 const std = @import("std");
+const base64url = std.base64.url_safe_no_pad.Encoder;
 
 pub const client_id = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 pub const authorize_url = "https://claude.ai/oauth/authorize";
@@ -15,7 +16,6 @@ const scope_encoded = "org%3Acreate_api_key%20user%3Aprofile%20user%3Ainference"
     "%20user%3Asessions%3Aclaude_code%20user%3Amcp_servers%20user%3Afile_upload";
 const refresh_margin_ms = 5 * 60 * 1000;
 
-const base64url = std.base64.url_safe_no_pad.Encoder;
 const verifier_len = base64url.calcSize(32);
 
 pub const Pkce = struct {

@@ -5,15 +5,16 @@
 //! (`onText`/`onToolStart`/`onToolResult`/`onError`) lives here.
 
 const std = @import("std");
-const Terminal = @import("terminal/Terminal.zig");
-const escape = @import("terminal/escape.zig");
-const Renderer = @import("tui/Renderer.zig");
-const Input = @import("tui/Input.zig");
-const Editor = @import("tui/Editor.zig");
-const key = @import("tui/key.zig");
-const width = @import("tui/width.zig");
-const Auth = @import("anthropic/Auth.zig");
+
 const Agent = @import("agent/Agent.zig");
+const Auth = @import("anthropic/Auth.zig");
+const escape = @import("terminal/escape.zig");
+const Terminal = @import("terminal/Terminal.zig");
+const Editor = @import("tui/Editor.zig");
+const Input = @import("tui/Input.zig");
+const key = @import("tui/key.zig");
+const Renderer = @import("tui/Renderer.zig");
+const width = @import("tui/width.zig");
 
 const App = @This();
 

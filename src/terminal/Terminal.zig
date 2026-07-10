@@ -4,6 +4,7 @@
 //! stream buffers) and call `init` on the pointer.
 
 const std = @import("std");
+
 const escape = @import("escape.zig");
 
 const Terminal = @This();

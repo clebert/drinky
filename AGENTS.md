@@ -9,6 +9,6 @@ After code changes, always run:
 
 ```sh
 zig build
-zig fmt --check build.zig bin lib
+zig fmt --check build.zig src
 zig build test
 ```

@@ -4,10 +4,11 @@
 //! delegated to a `handler` with `onText`/`onToolStart`/`onToolResult`/`onError`.
 
 const std = @import("std");
-const message = @import("../anthropic/message.zig");
-const tools = @import("tools.zig");
+
 const Auth = @import("../anthropic/Auth.zig");
 const Client = @import("../anthropic/Client.zig");
+const message = @import("../anthropic/message.zig");
+const tools = @import("tools.zig");
 
 const Agent = @This();
 

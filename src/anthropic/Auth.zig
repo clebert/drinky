@@ -4,6 +4,7 @@
 //! through `oauth`; owns the on-disk state.
 
 const std = @import("std");
+
 const oauth = @import("oauth.zig");
 
 const Auth = @This();

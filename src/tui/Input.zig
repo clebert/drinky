@@ -5,8 +5,9 @@
 //! across reads is decoded once the rest arrives.
 
 const std = @import("std");
-const key = @import("key.zig");
+
 const escape = @import("../terminal/escape.zig");
+const key = @import("key.zig");
 
 const Input = @This();
 

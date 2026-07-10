@@ -5,6 +5,7 @@
 //! a reverse-video cell so the terminal's own cursor can stay hidden.
 
 const std = @import("std");
+
 const width = @import("width.zig");
 
 const Editor = @This();

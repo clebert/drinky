@@ -8,6 +8,7 @@
 //! already wrapped to the terminal width; the renderer does no width math.
 
 const std = @import("std");
+
 const escape = @import("../terminal/escape.zig");
 
 const Renderer = @This();
