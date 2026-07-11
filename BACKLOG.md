@@ -40,8 +40,8 @@ Extension seams referenced here:
       marked. `Agent.setModel` is the live-reconfigure seam (takes effect next turn);
       `provider.Client.kind` and `models.list` back the list. A command returns a `command.Outcome`
       (`feedback` or `pick`); the app owns the reusable `tui.Picker` and, on selection, re-applies
-      the command with the choice via `command.apply` — so the widget stays generic. Per-message cost
-      attribution across a switch is still the open item below.
+      the command with the choice via `command.apply` — so the widget stays generic. Per-message
+      cost attribution across a switch is still the open item below.
 - [ ] **Slash-command Tab completion.** Complete a partial slash command on Tab: while the line
       starts with `/` and no argument has been typed, match the prefix against the command registry
       and fill in the rest, cycling or listing the candidates when several match. Needs a Tab key
@@ -137,42 +137,42 @@ Extension seams referenced here:
 ## UI
 
 - [x] **Accurate display widths (wide glyphs).** The differential `Screen` (renamed from `Surface`)
-      counts *physical* terminal rows for every cursor move: each frame line spans `width.rows` rows
-      — the number of pieces `width.wrap` produces, not `ceil(width / columns)`, since a wide cluster
-      cannot straddle the margin — and `width.caret` maps a caret's display column to its physical
-      row and column within a wrapped line. A single `paint` helper drives every mode (first frame,
-      full reset, incremental) so all row arithmetic lives in one place, and `viewportTop` and the
-      caret restore both measure physical rows. A line wider than `columns` can no longer desync
-      `cursor_row`, so `Screen` is correct independently of the app pre-wrapping every line. A model
-      terminal in the test suite replays the exact escapes `Screen` emits with real auto-wrap and
-      asserts the reconstructed document and caret, covering the wide-line paths byte-level checks
-      cannot express.
+      counts _physical_ terminal rows for every cursor move: each frame line spans `width.rows` rows
+      — the number of pieces `width.wrap` produces, not `ceil(width / columns)`, since a wide
+      cluster cannot straddle the margin — and `width.caret` maps a caret's display column to its
+      physical row and column within a wrapped line. A single `paint` helper drives every mode
+      (first frame, full reset, incremental) so all row arithmetic lives in one place, and
+      `viewportTop` and the caret restore both measure physical rows. A line wider than `columns`
+      can no longer desync `cursor_row`, so `Screen` is correct independently of the app
+      pre-wrapping every line. A model terminal in the test suite replays the exact escapes `Screen`
+      emits with real auto-wrap and asserts the reconstructed document and caret, covering the
+      wide-line paths byte-level checks cannot express.
 - [x] **Grapheme-cluster display widths.** `width.ofText`/`truncate`/`wrap` measure per UAX #29
       grapheme cluster via the `grapheme` module, so a glyph built from several code points — an
-      emoji variation selector (`❤️`), a skin-tone modifier (`👍🏽`), a ZWJ sequence
-      (`👨‍👩‍👧‍👦`), a regional-indicator flag — takes the single cell a mode-2027 terminal draws,
-      and `truncate`/`wrap` never split a cluster. Mode-2027 runtimes only: on a per-codepoint
-      terminal a cluster under-fills its row (safe) rather than overflowing, so there is no dual
-      path.
+      emoji variation selector (`❤️`), a skin-tone modifier (`👍🏽`), a ZWJ sequence (`👨‍👩‍👧‍👦`), a
+      regional-indicator flag — takes the single cell a mode-2027 terminal draws, and
+      `truncate`/`wrap` never split a cluster. Mode-2027 runtimes only: on a per-codepoint terminal
+      a cluster under-fills its row (safe) rather than overflowing, so there is no dual path.
 
       `zig build unicode` (`scripts/generate_unicode_data.zig`) derives two tables from the Unicode
       Character Database (pinned to 17.0.0) into `lib/terminal/unicode_data.zig`: the display-width
       intervals and the Grapheme_Cluster_Break class table, refined with Indic_Conjunct_Break (for
       rule GB9c) and Extended_Pictographic (for GB11). `grapheme.stepAt` implements the full GB1–GB13
       rule set and is verified against the vendored `GraphemeBreakTest.txt` conformance corpus.
-- [ ] **Extract block rendering into a `ui` widget + shared color namespace.** `src/App.zig` is
-      both the composition root and the renderer for every transcript block
-      (`renderBox`/`renderStyledLines`/`renderWrapped`/`pushBox*`) with a module-level color palette,
-      while `Editor`/`Picker` are self-rendering widgets with a `render(columns, …, buffer, lines)`
-      contract. Move block rendering behind that same contract (a `Box`/`block` module) so blocks are
-      unit-testable in isolation (today only the one integration test covers them) and App shrinks to
-      state + event loop + agent glue. Fold the SGR palette (`dim`/`reset`/`red`, box colors,
-      `separator`'s purple) into one `tui` color namespace so `App`, `Picker`, and `separator` stop
-      each defining their own. The palette is app style, so it belongs in the `ui` namespace, not the
-      generic `terminal` engine.
-- [ ] **Make `App.Entry` a `union(Kind)`.** It is a struct with a `kind` enum plus `is_error` that is
-      dead for `intro`/`user`/`model`, and `text` is the only payload any variant carries. A tagged
-      union gives each block exactly its data, makes the `ensureEntry` switch exhaustive by
+
+- [ ] **Extract block rendering into a `ui` widget + shared color namespace.** `src/App.zig` is both
+      the composition root and the renderer for every transcript block
+      (`renderBox`/`renderStyledLines`/`renderWrapped`/`pushBox*`) with a module-level color
+      palette, while `Editor`/`Picker` are self-rendering widgets with a
+      `render(columns, …, buffer, lines)` contract. Move block rendering behind that same contract
+      (a `Box`/`block` module) so blocks are unit-testable in isolation (today only the one
+      integration test covers them) and App shrinks to state + event loop + agent glue. Fold the SGR
+      palette (`dim`/`reset`/`red`, box colors, `separator`'s purple) into one `tui` color namespace
+      so `App`, `Picker`, and `separator` stop each defining their own. The palette is app style, so
+      it belongs in the `ui` namespace, not the generic `terminal` engine.
+- [ ] **Make `App.Entry` a `union(Kind)`.** It is a struct with a `kind` enum plus `is_error` that
+      is dead for `intro`/`user`/`model`, and `text` is the only payload any variant carries. A
+      tagged union gives each block exactly its data, makes the `ensureEntry` switch exhaustive by
       construction, and gives stateful blocks (a collapsible `thinking` run, a tool box tracking its
       own status) somewhere to live. Ties into the block-widget extraction above.
 - [ ] **Richer UI with dedicated components.** Move beyond the current log + single-line editor to

@@ -7,7 +7,7 @@ behind our usage and cost figures — not an API integration guide.
 ## The three token buckets
 
 Every request sends the entire prompt: system instructions, tool definitions, and all messages. A
-*cache breakpoint* is a point in the prompt marked with `cache_control`; the prefix up to and
+_cache breakpoint_ is a point in the prompt marked with `cache_control`; the prefix up to and
 including that point is what gets cached. Anthropic splits the prompt's tokens into three
 non-overlapping buckets in the usage report:
 
@@ -41,15 +41,15 @@ message, when the breakpoint is placed before it. In that case `input_tokens` ro
 size of that trailing content and is unstable turn to turn, so it should not be surfaced as a
 headline number.
 
-Appending a small new segment *before* the breakpoint does **not** fall through to `input_tokens`: as
-long as the cumulative prefix at the breakpoint meets the model's minimum, that increment is written
-to the cache (billed as a cache write), even if it is only a handful of tokens. There is no
+Appending a small new segment _before_ the breakpoint does **not** fall through to `input_tokens`:
+as long as the cumulative prefix at the breakpoint meets the model's minimum, that increment is
+written to the cache (billed as a cache write), even if it is only a handful of tokens. There is no
 per-increment minimum.
 
 Turn by turn:
 
-- **Turn 1:** nothing cached yet → the prefix up to the breakpoint is a cache write, cache read is 0,
-  and `input_tokens` covers anything after the breakpoint.
+- **Turn 1:** nothing cached yet → the prefix up to the breakpoint is a cache write, cache read is
+  0, and `input_tokens` covers anything after the breakpoint.
 - **Turn 2:** the earlier prefix matches → cache read covers it; the new delta up to the breakpoint
   is a cache write; `input_tokens` is again only what follows the breakpoint.
 - **Later turns:** cache read dominates, cache write is the per-turn delta up to the breakpoint, and
@@ -62,12 +62,12 @@ normally without caching and without error. The minimum applies to the **total p
 a breakpoint, not to each incremental addition — once the cumulative prefix clears the threshold,
 even a few new tokens before the breakpoint are written to the cache.
 
-| minimum tokens | models (subset)                                                |
-| -------------- | -------------------------------------------------------------- |
-| 512            | Fable 5, Mythos 5                                              |
+| minimum tokens | models (subset)                                                        |
+| -------------- | ---------------------------------------------------------------------- |
+| 512            | Fable 5, Mythos 5                                                      |
 | 1,024          | Opus 4.8, Sonnet 5, Sonnet 4.6, Sonnet 4.5, Opus 4.1, Opus 4, Sonnet 4 |
-| 2,048          | Mythos Preview, Opus 4.7, Haiku 3.5                            |
-| 4,096          | Opus 4.6, Opus 4.5, Haiku 4.5                                  |
+| 2,048          | Mythos Preview, Opus 4.7, Haiku 3.5                                    |
+| 4,096          | Opus 4.6, Opus 4.5, Haiku 4.5                                          |
 
 The minimums do not follow a simple rule. They are not "Haiku vs the rest" (Haiku 4.5 is 4,096 while
 Sonnet 4.6 and Opus 4.8 are 1,024), and they do not track version numbers (Opus 4.8 is 1,024 while
