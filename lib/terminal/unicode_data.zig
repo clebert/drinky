@@ -1,7 +1,7 @@
-//! Display-width interval table generated from the Unicode Character Database,
-//! version 17.0.0. Do not edit by hand; regenerate with `zig build unicode`.
+//! Interval tables generated from the Unicode Character Database, version 17.0.0.
+//! Do not edit by hand; regenerate with `zig build unicode`.
 //!
-//! The table below is derived from Unicode data files and is distributed under
+//! The tables below are derived from Unicode data files and are distributed under
 //! the Unicode License V3:
 //!
 //!   Copyright (c) 1991-2025 Unicode, Inc. All rights reserved.

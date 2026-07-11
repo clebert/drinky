@@ -31,6 +31,6 @@ zig fmt --check build.zig src lib scripts
 sh scripts/test-audit.sh
 ```
 
-`zig build unicode` regenerates `lib/terminal/unicode.zig` (the display-width tables) from the
-Unicode Character Database; it fetches over the network and is run by hand, never as part of the
-default build.
+`zig build unicode` regenerates `lib/terminal/unicode_data.zig` (the display-width and
+grapheme-break tables) from the Unicode Character Database; it fetches over the network and is run
+by hand, never as part of the default build.

@@ -14,7 +14,7 @@
 
 const std = @import("std");
 
-const unicode = @import("unicode.zig");
+const unicode_data = @import("unicode_data.zig");
 
 pub const Step = struct { bytes: usize, columns: usize };
 
@@ -65,19 +65,19 @@ fn decode(text: []const u8) Decoded {
 fn cellWidth(codepoint: u21) usize {
     if (codepoint < 0x20 or codepoint == 0x7f) return 0;
     if (codepoint == 0xFE0F) return 2;
-    if (codepoint < unicode.width_ranges[0].first) return 1;
-    const range = search(unicode.WidthRange, &unicode.width_ranges, codepoint) orelse return 1;
+    if (codepoint < unicode_data.width_ranges[0].first) return 1;
+    const range = search(unicode_data.WidthRange, &unicode_data.width_ranges, codepoint) orelse return 1;
     return range.columns;
 }
 
 /// Grapheme_Cluster_Break class of `codepoint`, or `.other` when it is in no
 /// range of the generated table.
-fn classOf(codepoint: u21) unicode.Class {
+fn classOf(codepoint: u21) unicode_data.Class {
     // Printable ASCII carries no break class; skip the search on the hot path.
     // The C0 controls and DEL sit below and above this range, so they still fall
     // through to the table.
     if (codepoint >= 0x20 and codepoint < 0x7f) return .other;
-    const range = search(unicode.ClassRange, &unicode.class_ranges, codepoint) orelse return .other;
+    const range = search(unicode_data.ClassRange, &unicode_data.class_ranges, codepoint) orelse return .other;
     return range.class;
 }
 
@@ -100,7 +100,7 @@ fn search(comptime Range: type, ranges: []const Range, codepoint: u21) ?Range {
     return null;
 }
 
-fn isExtend(class: unicode.Class) bool {
+fn isExtend(class: unicode_data.Class) bool {
     return class == .extend or class == .extend_incb or class == .linker;
 }
 
@@ -116,7 +116,7 @@ const State = struct {
     pictographic: bool,
     pictographic_zwj: bool,
 
-    fn init(first: unicode.Class) State {
+    fn init(first: unicode_data.Class) State {
         var self: State = .{
             .regional_indicators = 0,
             .indic_armed = false,
@@ -129,7 +129,7 @@ const State = struct {
     }
 
     /// Fold a code point that joined the cluster into the running state.
-    fn advance(self: *State, class: unicode.Class) void {
+    fn advance(self: *State, class: unicode_data.Class) void {
         self.regional_indicators = if (class == .regional_indicator) self.regional_indicators + 1 else 0;
         switch (class) {
             .consonant => {
@@ -165,7 +165,7 @@ const State = struct {
 
     /// Whether UAX #29 places a cluster boundary between `previous` and `next`,
     /// with `self` describing the cluster up to and including `previous`.
-    fn breaks(self: State, previous: unicode.Class, next: unicode.Class) bool {
+    fn breaks(self: State, previous: unicode_data.Class, next: unicode_data.Class) bool {
         // GB3: CR × LF.
         if (previous == .cr and next == .lf) return false;
         // GB4/GB5: break around Control, CR, and LF.

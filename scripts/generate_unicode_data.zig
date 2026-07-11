@@ -1,4 +1,4 @@
-//! Regenerates lib/terminal/unicode.zig from the Unicode Character Database.
+//! Regenerates lib/terminal/unicode_data.zig from the Unicode Character Database.
 //!
 //! Fetches a pinned Unicode version's UCD files and emits two sorted, disjoint
 //! interval tables. The width table maps code point ranges to a display width of
@@ -15,7 +15,7 @@ const std = @import("std");
 
 const version = "17.0.0";
 const base = "https://www.unicode.org/Public/" ++ version ++ "/ucd";
-const output_path = "lib/terminal/unicode.zig";
+const output_path = "lib/terminal/unicode_data.zig";
 const test_output_path = "lib/terminal/GraphemeBreakTest.txt";
 const codepoint_max = 0x10FFFF;
 
@@ -297,14 +297,14 @@ fn parseHex(text: []const u8) ?u21 {
 }
 
 const header_prefix =
-    \\//! Display-width interval table generated from the Unicode Character Database,
-    \\//! version {s}. Do not edit by hand; regenerate with `zig build unicode`.
+    \\//! Interval tables generated from the Unicode Character Database, version {s}.
+    \\//! Do not edit by hand; regenerate with `zig build unicode`.
     \\
 ;
 
 const header_rest =
     \\//!
-    \\//! The table below is derived from Unicode data files and is distributed under
+    \\//! The tables below are derived from Unicode data files and are distributed under
     \\//! the Unicode License V3:
     \\//!
     \\//!   Copyright (c) 1991-2025 Unicode, Inc. All rights reserved.

@@ -152,8 +152,8 @@ Extension seams referenced here:
       terminal a cluster under-fills its row (safe) rather than overflowing, so there is no dual
       path.
 
-      `zig build unicode` (`scripts/generate_unicode.zig`) derives two tables from the Unicode
-      Character Database (pinned to 17.0.0) into `lib/terminal/unicode.zig`: the display-width
+      `zig build unicode` (`scripts/generate_unicode_data.zig`) derives two tables from the Unicode
+      Character Database (pinned to 17.0.0) into `lib/terminal/unicode_data.zig`: the display-width
       intervals and the Grapheme_Cluster_Break class table, refined with Indic_Conjunct_Break (for
       rule GB9c) and Extended_Pictographic (for GB11). `grapheme.stepAt` implements the full GB1–GB13
       rule set and is verified against the vendored `GraphemeBreakTest.txt` conformance corpus.
