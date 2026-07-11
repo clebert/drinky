@@ -434,3 +434,29 @@ test "a resize reflows via a full repaint" {
     try harness.expectRow(3, "four");
     try std.testing.expectEqual(@as(usize, 3), harness.emulator.cursor_row);
 }
+
+test "a line wider than the terminal autowraps and desyncs cursor tracking" {
+    var harness = try Harness.init(std.testing.allocator, 10, 6);
+    defer harness.deinit();
+    // The middle line is 12 columns wide in a 10-column terminal, so the
+    // terminal autowraps it onto two physical rows. The Surface counts one
+    // physical row per frame line, so from here its cursor_row trails the
+    // terminal by one row.
+    try harness.render(&.{ "top", "AAAAAAAAAAAA", "bot" });
+    try harness.expectRow(0, "top");
+    try harness.expectRow(1, "AAAAAAAAAA");
+    try harness.expectRow(2, "AA");
+    try harness.expectRow(3, "bot");
+
+    // Editing only the first line should rewrite row 0 in place. Because
+    // cursor_row is off by one, the repaint lands a row too low: "top" is left
+    // stale and "TOP" prints below it, shifting the whole frame down. This pins
+    // the desync until the Surface tracks physical rows; the app keeps it out of
+    // reach by wrapping every line to the terminal width before rendering.
+    try harness.render(&.{ "TOP", "AAAAAAAAAAAA", "bot" });
+    try harness.expectRow(0, "top");
+    try harness.expectRow(1, "TOP");
+    try harness.expectRow(2, "AAAAAAAAAA");
+    try harness.expectRow(3, "AA");
+    try harness.expectRow(4, "bot");
+}

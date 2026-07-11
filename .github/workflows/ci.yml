@@ -17,5 +17,5 @@ jobs:
         with:
           version: 0.16.0
       - run: zig build
-      - run: zig fmt --check build.zig src lib
+      - run: zig fmt --check build.zig src lib scripts
       - run: sh scripts/test-audit.sh

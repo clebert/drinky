@@ -1,11 +1,17 @@
 const std = @import("std");
 
+const unicode = @import("unicode.zig");
+
 /// Display width of `text` in terminal columns, skipping ANSI escape sequences.
 ///
-/// Approximation: one column per printable codepoint, zero for ASCII control
-/// bytes. CJK and emoji are not yet special-cased, so wide glyphs undercount by
-/// one column each. This matches a default-mode terminal for ASCII, Latin, and
-/// code, which is all the current UI emits.
+/// Each printable codepoint contributes its `wcwidth`-style column count: zero
+/// for combining marks and other zero-width code points, two for East Asian
+/// wide/fullwidth and emoji, one otherwise. ASCII control bytes count as zero.
+///
+/// Width is summed per codepoint, not per grapheme cluster, so a glyph built
+/// from several code points — an emoji with a variation selector, a skin-tone
+/// modifier, or a ZWJ join — is mismeasured. Precomposed characters and a base
+/// plus a zero-width combining mark are counted correctly.
 pub fn display(text: []const u8) usize {
     var columns: usize = 0;
     var index: usize = 0;
@@ -90,7 +96,38 @@ fn cellAt(text: []const u8) Cell {
         return .{ .bytes = 1, .columns = @intFromBool(printable) };
     }
     const length = std.unicode.utf8ByteSequenceLength(byte) catch return .{ .bytes = 1, .columns = 1 };
-    return .{ .bytes = @min(length, text.len), .columns = 1 };
+    const bytes = @min(length, text.len);
+    const codepoint = std.unicode.utf8Decode(text[0..bytes]) catch return .{ .bytes = bytes, .columns = 1 };
+    return .{ .bytes = bytes, .columns = of(codepoint) };
+}
+
+/// Display width of a single codepoint in terminal columns: zero for combining
+/// marks and other zero-width code points, two for East Asian wide/fullwidth
+/// and emoji, one otherwise.
+pub fn of(codepoint: u21) usize {
+    // Every code point below the first ranged one is a single column, which
+    // covers the bulk of real text; skip the search for it.
+    if (codepoint < unicode.widths[0].first) return 1;
+    return search(&unicode.widths, codepoint);
+}
+
+/// Display width of `codepoint` from the sorted, non-overlapping `ranges`, or
+/// one column when it falls in no range.
+fn search(ranges: []const unicode.Range, codepoint: u21) usize {
+    var low: usize = 0;
+    var high: usize = ranges.len;
+    while (low < high) {
+        const middle = low + @divFloor(high - low, 2);
+        const range = ranges[middle];
+        if (codepoint < range.first) {
+            high = middle;
+        } else if (codepoint > range.last) {
+            low = middle + 1;
+        } else {
+            return range.width;
+        }
+    }
+    return 1;
 }
 
 /// Byte length of the escape sequence at the start of `text` (`text[0]` is ESC).
@@ -132,11 +169,49 @@ test display {
     try std.testing.expectEqual(@as(usize, 2), display("a\x1b_p\x1b\\b"));
 }
 
+test of {
+    try std.testing.expectEqual(@as(usize, 1), of('a'));
+    try std.testing.expectEqual(@as(usize, 1), of('é'));
+    try std.testing.expectEqual(@as(usize, 2), of('你'));
+    try std.testing.expectEqual(@as(usize, 2), of('😀'));
+    try std.testing.expectEqual(@as(usize, 0), of('\u{0301}')); // combining acute accent
+    try std.testing.expectEqual(@as(usize, 0), of('\u{200d}')); // zero-width joiner
+}
+
+test "display measures wide glyphs and zero-width marks" {
+    try std.testing.expectEqual(@as(usize, 4), display("你好"));
+    try std.testing.expectEqual(@as(usize, 2), display("😀"));
+    try std.testing.expectEqual(@as(usize, 4), display("a你b"));
+    // A base letter plus a combining mark is a single column.
+    try std.testing.expectEqual(@as(usize, 1), display("e\u{0301}"));
+}
+
+test "multi-codepoint grapheme clusters are measured per codepoint" {
+    // Each of these renders as one glyph, but width is summed per codepoint with
+    // no grapheme folding, so the count diverges from the terminal. Pins the
+    // limitation until cluster segmentation lands.
+
+    // Heart plus emoji variation selector: the terminal shows two columns, but
+    // VS16 is zero-width here and does not promote the heart to emoji width.
+    try std.testing.expectEqual(@as(usize, 1), display("❤\u{FE0F}"));
+    // Thumbs-up plus skin-tone modifier: one glyph, but two wide code points.
+    try std.testing.expectEqual(@as(usize, 4), display("👍\u{1F3FD}"));
+    // ZWJ family: one glyph from four wide emoji joined by zero-width joiners.
+    try std.testing.expectEqual(@as(usize, 8), display("👨\u{200D}👩\u{200D}👧\u{200D}👦"));
+    // Regional-indicator flag: the terminal shows one two-column flag, but each
+    // indicator is a wide code point, so the pair overcounts to four.
+    try std.testing.expectEqual(@as(usize, 4), display("🇯🇵"));
+}
+
 test truncate {
     try std.testing.expectEqualStrings("hel", truncate("hello", 3));
     try std.testing.expectEqualStrings("hello", truncate("hello", 10));
     try std.testing.expectEqualStrings("", truncate("hello", 0));
     try std.testing.expectEqualStrings("a\x1b[31mb", truncate("a\x1b[31mbc", 2));
+    // "好" is two columns, so it never fits a single spare column.
+    try std.testing.expectEqualStrings("你", truncate("你好", 3));
+    try std.testing.expectEqualStrings("你", truncate("你好", 2));
+    try std.testing.expectEqualStrings("", truncate("你好", 1));
 }
 
 test wrap {
@@ -152,4 +227,12 @@ test wrap {
     try std.testing.expectEqual(@as(usize, 2), lines.items.len);
     try std.testing.expectEqualStrings("ab", lines.items[0]);
     try std.testing.expectEqualStrings("cd", lines.items[1]);
+
+    // A wide glyph that would straddle the limit breaks to the next line whole.
+    lines.clearRetainingCapacity();
+    try wrap("你好世", 3, &lines, std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 3), lines.items.len);
+    try std.testing.expectEqualStrings("你", lines.items[0]);
+    try std.testing.expectEqualStrings("好", lines.items[1]);
+    try std.testing.expectEqualStrings("世", lines.items[2]);
 }

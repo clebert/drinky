@@ -48,8 +48,25 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&b.addRunArtifact(tests).step);
     }
 
+    const unicode_generator = b.addExecutable(.{
+        .name = "generate-unicode",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("scripts/generate_unicode.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+        }),
+    });
+
+    const run_unicode = b.addRunArtifact(unicode_generator);
+    run_unicode.setCwd(b.path("."));
+    run_unicode.has_side_effects = true;
+
+    const unicode_step = b.step("unicode", "Regenerate lib/terminal/unicode.zig from the Unicode Character Database");
+    unicode_step.dependOn(&run_unicode.step);
+
     const check_step = b.step("check", "Check Zig code for errors (used by ZLS)");
 
     check_step.dependOn(&exe.step);
+    check_step.dependOn(&unicode_generator.step);
     b.default_step.dependOn(check_step);
 }

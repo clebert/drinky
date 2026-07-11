@@ -27,6 +27,10 @@ After code changes, always run:
 
 ```sh
 zig build
-zig fmt --check build.zig src lib
+zig fmt --check build.zig src lib scripts
 sh scripts/test-audit.sh
 ```
+
+`zig build unicode` regenerates `lib/terminal/unicode.zig` (the display-width tables) from the
+Unicode Character Database; it fetches over the network and is run by hand, never as part of the
+default build.
