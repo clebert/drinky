@@ -137,39 +137,26 @@ Extension seams referenced here:
 ## UI
 
 - [ ] **Accurate display widths (wide glyphs).** _Partly landed._ `width.ofText`/`truncate`/`wrap`
-      now measure each codepoint with a `wcwidth`-style table (East Asian Wide/Fullwidth + emoji +
-      zero-width combining), and `Emulator` models right-margin autowrap with deferred-wrap
-      semantics. What remains: the differential `Surface` does cursor math over the whole in-memory
-      frame assuming one physical row per frame line, so a line whose real width exceeds `columns`
-      auto-wraps in the terminal and permanently desyncs `cursor_row` until the next resize/full
-      repaint. A `Surface` characterization test pins that desync today, and the app keeps it out of
-      reach by wrapping every line to the terminal width before rendering. Close it by making
-      `Surface` track physical rows (a line spans `ceil(width / columns)` of them) so an unwrapped
-      wide line can no longer corrupt the frame.
-- [ ] **Grapheme-cluster display widths.** `width.ofText`/`truncate`/`wrap` sum width per codepoint
-      via `width.ofCodepoint` with no UAX #29 grapheme segmentation, so a glyph built from several code points
-      is mismeasured: an emoji variation selector (`❤️`) undercounts, a skin-tone modifier (`👍🏽`)
-      or ZWJ sequence (`👨‍👩‍👧‍👦`) overcounts, and `truncate`/`wrap` can split a cluster mid-glyph.
-      A characterization test pins these per-codepoint counts.
+      measure display columns from a generated `wcwidth`-style table (East Asian Wide/Fullwidth +
+      emoji + zero-width combining). What remains: the differential `Surface` does cursor math over
+      the whole in-memory frame assuming one physical row per frame line, so a line whose real width
+      exceeds `columns` auto-wraps in the terminal and permanently desyncs `cursor_row` until the
+      next resize/full repaint. The app keeps it out of reach by wrapping every line to the terminal
+      width before rendering. Close it by making `Surface` track physical rows (a line spans
+      `ceil(width / columns)` of them) so an unwrapped wide line can no longer corrupt the frame.
+- [x] **Grapheme-cluster display widths.** `width.ofText`/`truncate`/`wrap` measure per UAX #29
+      grapheme cluster via the `grapheme` module, so a glyph built from several code points — an
+      emoji variation selector (`❤️`), a skin-tone modifier (`👍🏽`), a ZWJ sequence
+      (`👨‍👩‍👧‍👦`), a regional-indicator flag — takes the single cell a mode-2027 terminal draws,
+      and `truncate`/`wrap` never split a cluster. Mode-2027 runtimes only: on a per-codepoint
+      terminal a cluster under-fills its row (safe) rather than overflowing, so there is no dual
+      path.
 
-      The width tables are no longer hand-maintained: `zig build unicode`
-      (`scripts/generate_unicode.zig`) derives them from the Unicode Character Database (pinned to
-      version 17.0.0) into `lib/terminal/unicode.zig`, closing the staleness gap (the old hand tables were frozen near
-      Unicode 5, missing ~1,110 combining marks and ~8,146 wide code points). What remains is
-      per-codepoint measurement with no clustering — the tables are now authoritative, but they are
-      still summed one code point at a time.
-
-      Ghostty (`src/unicode/`) is the reference design: a build-time codegen (`lut.zig` `Generator`)
-      emits a 3-stage lookup trie from the UCD (via the `uucode` library, pinned to a Unicode
-      version); UAX #29 breaks are a precomputed `(class × class × state) → (break, next_state)` table
-      (~8 KB); width is decided per cluster by a small kernel (`graphemeWidthEffect`: VS16→wide /
-      VS15→narrow only for valid emoji bases else drop-and-rewind, any non-zero continuation → width
-      2); extra cluster code points are stored per cell in a side allocator with `(wide, spacer_tail)`
-      cell pairs; and all of it is gated behind DECSET mode 2027, default off, so per-codepoint width
-      stays the fast path. Remaining for us: add a UAX #29 iterator so the three functions measure
-      clusters (coordinated with DECSET mode 2027 so the app agrees with the terminal), and have
-      `Emulator` attach zero-width marks to the previous cell (it drops them today) so the oracle stays
-      faithful.
+      `zig build unicode` (`scripts/generate_unicode.zig`) derives two tables from the Unicode
+      Character Database (pinned to 17.0.0) into `lib/terminal/unicode.zig`: the display-width
+      intervals and the Grapheme_Cluster_Break class table, refined with Indic_Conjunct_Break (for
+      rule GB9c) and Extended_Pictographic (for GB11). `grapheme.stepAt` implements the full GB1–GB13
+      rule set and is verified against the vendored `GraphemeBreakTest.txt` conformance corpus.
 - [ ] **Extract block rendering into a `ui` widget + shared color namespace.** `src/App.zig` is
       both the composition root and the renderer for every transcript block
       (`renderBox`/`renderStyledLines`/`renderWrapped`/`pushBox*`) with a module-level color palette,

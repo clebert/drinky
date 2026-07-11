@@ -1,27 +1,24 @@
 const std = @import("std");
 
-const unicode = @import("unicode.zig");
+const grapheme = @import("grapheme.zig");
 
 /// Display width of `text` in terminal columns, skipping ANSI escape sequences.
 ///
-/// Each printable codepoint contributes its `wcwidth`-style column count: zero
-/// for combining marks and other zero-width code points, two for East Asian
-/// wide/fullwidth and emoji, one otherwise. ASCII control bytes count as zero.
-///
-/// Width is summed per codepoint, not per grapheme cluster, so a glyph built
-/// from several code points — an emoji with a variation selector, a skin-tone
-/// modifier, or a ZWJ join — is mismeasured. Precomposed characters and a base
-/// plus a zero-width combining mark are counted correctly.
+/// Text is measured per UAX #29 grapheme cluster (via `grapheme`), matching a
+/// terminal with DECSET mode 2027: a multi-code-point glyph — a skin-tone
+/// modifier, a ZWJ join, a regional-indicator flag, a keycap — takes the single
+/// cell it renders as, not the sum of its code points. Combining marks and other
+/// zero-width code points add nothing; East Asian wide, fullwidth, and emoji
+/// clusters take two columns. ASCII control bytes count as zero.
 pub fn ofText(text: []const u8) usize {
     var columns: usize = 0;
     var index: usize = 0;
     while (index < text.len) {
-        const byte = text[index];
-        if (byte == escape_start) {
+        if (text[index] == escape_start) {
             index += escapeLength(text[index..]);
             continue;
         }
-        const step = stepAt(text[index..]);
+        const step = grapheme.stepAt(text[index..]);
         columns += step.columns;
         index += step.bytes;
     }
@@ -30,17 +27,17 @@ pub fn ofText(text: []const u8) usize {
 
 /// Longest prefix of `text` whose display width is at most `columns_max`,
 /// skipping ANSI escapes when measuring. A trailing escape sequence that would
-/// not add width is dropped along with the content it followed.
+/// not add width is dropped along with the content it followed. A grapheme
+/// cluster that would straddle the budget is dropped whole.
 pub fn truncate(text: []const u8, columns_max: usize) []const u8 {
     var columns: usize = 0;
     var index: usize = 0;
     while (index < text.len) {
-        const byte = text[index];
-        if (byte == escape_start) {
+        if (text[index] == escape_start) {
             index += escapeLength(text[index..]);
             continue;
         }
-        const step = stepAt(text[index..]);
+        const step = grapheme.stepAt(text[index..]);
         if (columns + step.columns > columns_max) break;
         columns += step.columns;
         index += step.bytes;
@@ -50,7 +47,8 @@ pub fn truncate(text: []const u8, columns_max: usize) []const u8 {
 
 /// Hard-wrap `text` into slices of at most `columns_max` display columns,
 /// appending each line into `lines`. Breaks strictly on width (no word
-/// awareness). An explicit `\n` starts a new line and is not emitted.
+/// awareness) and never inside a grapheme cluster. An explicit `\n` starts a new
+/// line and is not emitted.
 pub fn wrap(
     text: []const u8,
     columns_max: usize,
@@ -73,7 +71,7 @@ pub fn wrap(
             index += escapeLength(text[index..]);
             continue;
         }
-        const step = stepAt(text[index..]);
+        const step = grapheme.stepAt(text[index..]);
         if (columns + step.columns > columns_max and index > line_start) {
             try lines.append(gpa, text[line_start..index]);
             line_start = index;
@@ -85,52 +83,7 @@ pub fn wrap(
     try lines.append(gpa, text[line_start..]);
 }
 
-/// Display width of a single codepoint in terminal columns: zero for combining
-/// marks and other zero-width code points, two for East Asian wide/fullwidth
-/// and emoji, one otherwise.
-pub fn ofCodepoint(codepoint: u21) usize {
-    // Every code point below the first interval is a single column, which covers
-    // the bulk of real text; skip the search for it.
-    if (codepoint < unicode.intervals[0].first) return 1;
-    return search(&unicode.intervals, codepoint);
-}
-
 const escape_start = 0x1b;
-
-const Step = struct { bytes: usize, columns: usize };
-
-fn stepAt(text: []const u8) Step {
-    const byte = text[0];
-    if (byte < 0x80) {
-        const printable = byte >= 0x20 and byte != 0x7f;
-        return .{ .bytes = 1, .columns = @intFromBool(printable) };
-    }
-    const length = std.unicode.utf8ByteSequenceLength(byte) catch return .{ .bytes = 1, .columns = 1 };
-    // A sequence cut off at the buffer end is one replacement column; decoding
-    // the short slice would panic on the length mismatch.
-    if (text.len < length) return .{ .bytes = text.len, .columns = 1 };
-    const codepoint = std.unicode.utf8Decode(text[0..length]) catch return .{ .bytes = length, .columns = 1 };
-    return .{ .bytes = length, .columns = ofCodepoint(codepoint) };
-}
-
-/// Display width of `codepoint` from the sorted, non-overlapping `intervals`, or
-/// one column when it falls in no interval.
-fn search(intervals: []const unicode.Interval, codepoint: u21) usize {
-    var low: usize = 0;
-    var high: usize = intervals.len;
-    while (low < high) {
-        const middle = low + @divFloor(high - low, 2);
-        const interval = intervals[middle];
-        if (codepoint < interval.first) {
-            high = middle;
-        } else if (codepoint > interval.last) {
-            low = middle + 1;
-        } else {
-            return interval.columns;
-        }
-    }
-    return 1;
-}
 
 /// Byte length of the escape sequence at the start of `text` (`text[0]` is ESC).
 /// Always at least one so callers make progress on malformed input.
@@ -175,18 +128,6 @@ test ofText {
     try std.testing.expectEqual(@as(usize, 0), ofText("\x1b[31"));
 }
 
-test ofCodepoint {
-    try std.testing.expectEqual(@as(usize, 1), ofCodepoint('a'));
-    try std.testing.expectEqual(@as(usize, 1), ofCodepoint('é'));
-    try std.testing.expectEqual(@as(usize, 2), ofCodepoint('你'));
-    try std.testing.expectEqual(@as(usize, 2), ofCodepoint('😀'));
-    try std.testing.expectEqual(@as(usize, 0), ofCodepoint('\u{0301}')); // combining acute accent
-    try std.testing.expectEqual(@as(usize, 0), ofCodepoint('\u{200d}')); // zero-width joiner
-    // The seam between the single-column fast path and the first table interval.
-    try std.testing.expectEqual(@as(usize, 1), ofCodepoint('\u{02ff}'));
-    try std.testing.expectEqual(@as(usize, 0), ofCodepoint('\u{0300}'));
-}
-
 test "ofText measures wide glyphs and zero-width marks" {
     try std.testing.expectEqual(@as(usize, 4), ofText("你好"));
     try std.testing.expectEqual(@as(usize, 2), ofText("😀"));
@@ -208,21 +149,22 @@ test "ofText counts control bytes as zero and survives malformed utf-8" {
     try std.testing.expectEqual(@as(usize, 1), ofText("\xe4\xb8"));
 }
 
-test "multi-codepoint grapheme clusters are measured per codepoint" {
-    // Each of these renders as one glyph, but width is summed per codepoint with
-    // no grapheme folding, so the count diverges from the terminal. Pins the
-    // limitation until cluster segmentation lands.
+test "grapheme clusters measure as one terminal cell" {
+    // Each renders as a single glyph and is measured as the cell a mode-2027
+    // terminal draws, not the sum of its code points.
 
-    // Heart plus emoji variation selector: the terminal shows two columns, but
-    // VS16 is zero-width here and does not promote the heart to emoji width.
-    try std.testing.expectEqual(@as(usize, 1), ofText("❤\u{FE0F}"));
-    // Thumbs-up plus skin-tone modifier: one glyph, but two wide code points.
-    try std.testing.expectEqual(@as(usize, 4), ofText("👍\u{1F3FD}"));
-    // ZWJ family: one glyph from four wide emoji joined by zero-width joiners.
-    try std.testing.expectEqual(@as(usize, 8), ofText("👨\u{200D}👩\u{200D}👧\u{200D}👦"));
-    // Regional-indicator flag: the terminal shows one two-column flag, but each
-    // indicator is a wide code point, so the pair overcounts to four.
-    try std.testing.expectEqual(@as(usize, 4), ofText("🇯🇵"));
+    // Heart plus VS16 promotes to a two-cell emoji; VS15 keeps it at one.
+    try std.testing.expectEqual(@as(usize, 2), ofText("❤\u{FE0F}"));
+    try std.testing.expectEqual(@as(usize, 1), ofText("❤\u{FE0E}"));
+    // A keycap sequence — digit, selector, enclosing keycap — is two columns.
+    try std.testing.expectEqual(@as(usize, 2), ofText("1\u{FE0F}\u{20E3}"));
+    // Thumbs-up plus skin-tone modifier: one two-column glyph.
+    try std.testing.expectEqual(@as(usize, 2), ofText("👍\u{1F3FD}"));
+    // ZWJ family: four emoji joined into one two-column glyph.
+    try std.testing.expectEqual(@as(usize, 2), ofText("👨\u{200D}👩\u{200D}👧\u{200D}👦"));
+    // A regional-indicator flag is one two-column glyph; two flags are four.
+    try std.testing.expectEqual(@as(usize, 2), ofText("🇯🇵"));
+    try std.testing.expectEqual(@as(usize, 4), ofText("🇯🇵🇺🇸"));
 }
 
 test truncate {
@@ -237,6 +179,9 @@ test truncate {
     try std.testing.expectEqualStrings("你", truncate("你好", 3));
     try std.testing.expectEqualStrings("你", truncate("你好", 2));
     try std.testing.expectEqualStrings("", truncate("你好", 1));
+    // A flag is one two-column cluster: it fits two columns whole or not at all.
+    try std.testing.expectEqualStrings("🇯🇵", truncate("🇯🇵", 2));
+    try std.testing.expectEqualStrings("", truncate("🇯🇵", 1));
 }
 
 test wrap {
