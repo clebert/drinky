@@ -330,7 +330,7 @@ fn renderWrapped(self: *App, out: *std.ArrayList([]u8), text: []const u8) !void 
 fn renderStyledLines(self: *App, out: *std.ArrayList([]u8), style: []const u8, prefix: []const u8, text: []const u8) !void {
     var pieces = std.mem.splitScalar(u8, text, '\n');
     while (pieces.next()) |piece| {
-        const available = self.columns -| terminal.width.display(prefix);
+        const available = self.columns -| terminal.width.ofText(prefix);
         const clipped = terminal.width.truncate(piece, available);
         self.scratch.clearRetainingCapacity();
         try self.scratch.appendSlice(self.gpa, style);
@@ -378,7 +378,7 @@ fn pushBoxLine(self: *App, out: *std.ArrayList([]u8), style: BoxStyle, line: []c
     try self.scratch.appendSlice(self.gpa, style.foreground);
     try self.scratch.append(self.gpa, ' ');
     try self.scratch.appendSlice(self.gpa, line);
-    const used = 1 + terminal.width.display(line);
+    const used = 1 + terminal.width.ofText(line);
     for (0..self.columns -| used) |_| try self.scratch.append(self.gpa, ' ');
     try self.scratch.appendSlice(self.gpa, reset);
     try self.pushLine(out, self.scratch.items);

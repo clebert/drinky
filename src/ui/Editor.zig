@@ -160,11 +160,11 @@ test render {
     defer lines.deinit(std.testing.allocator);
     try editor.render(80, true, &buffer, &lines);
     try std.testing.expectEqual(@as(usize, 3), lines.items.len);
-    try std.testing.expectEqual(@as(usize, 80), terminal.width.display(lines.items[0]));
+    try std.testing.expectEqual(@as(usize, 80), terminal.width.ofText(lines.items[0]));
     // The body is the text plus the zero-width caret marker at the cursor.
-    try std.testing.expectEqual(@as(usize, 2), terminal.width.display(lines.items[1]));
+    try std.testing.expectEqual(@as(usize, 2), terminal.width.ofText(lines.items[1]));
     try std.testing.expectEqual(@as(?usize, 2), terminal.cursor.column(lines.items[1]));
-    try std.testing.expectEqual(@as(usize, 80), terminal.width.display(lines.items[2]));
+    try std.testing.expectEqual(@as(usize, 80), terminal.width.ofText(lines.items[2]));
 
     try editor.render(80, false, &buffer, &lines);
     try std.testing.expectEqual(@as(?usize, null), terminal.cursor.column(lines.items[1]));

@@ -12,9 +12,9 @@ const std = @import("std");
 const version = "17.0.0";
 const base = "https://www.unicode.org/Public/" ++ version ++ "/ucd";
 const output_path = "lib/terminal/unicode.zig";
-const max_code_point = 0x10FFFF;
+const codepoint_max = 0x10FFFF;
 
-const Range = struct { first: u21, last: u21, width: u8 };
+const Interval = struct { first: u21, last: u21, columns: u8 };
 const Bounds = struct { first: u21, last: u21 };
 
 pub fn main() !void {
@@ -33,25 +33,25 @@ pub fn main() !void {
     const east_asian = try fetch(arena, &client, "/EastAsianWidth.txt");
     const emoji = try fetch(arena, &client, "/emoji/emoji-data.txt");
 
-    const zero = try arena.alloc(bool, max_code_point + 1);
+    const zero = try arena.alloc(bool, codepoint_max + 1);
     @memset(zero, false);
     mark(categories, &.{ "Mn", "Me", "Cf" }, zero);
     zero[0x00AD] = false;
-    for (0x1160..0x1200) |code_point| zero[code_point] = true;
+    for (0x1160..0x1200) |codepoint| zero[codepoint] = true;
     zero[0x200B] = true;
 
-    const wide = try arena.alloc(bool, max_code_point + 1);
+    const wide = try arena.alloc(bool, codepoint_max + 1);
     @memset(wide, false);
     mark(east_asian, &.{ "W", "F" }, wide);
     mark(emoji, &.{"Emoji_Presentation"}, wide);
 
-    const ranges = try coalesce(arena, zero, wide);
+    const intervals = try coalesce(arena, zero, wide);
 
     var out: std.Io.Writer.Allocating = .init(arena);
-    try emit(&out.writer, ranges);
+    try emit(&out.writer, intervals);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = output_path, .data = out.written() });
 
-    std.debug.print("wrote {s}: {d} ranges from Unicode {s}\n", .{ output_path, ranges.len, version });
+    std.debug.print("wrote {s}: {d} intervals from Unicode {s}\n", .{ output_path, intervals.len, version });
 }
 
 /// Body of `base ++ path`, or an error when the server does not answer with 200.
@@ -81,41 +81,43 @@ fn mark(text: []const u8, wanted: []const []const u8, flags: []bool) void {
         const value = token(std.mem.trim(u8, line[semicolon + 1 ..], " \t"));
         if (!contains(wanted, value)) continue;
         const bounds = parseRange(field) orelse continue;
-        for (bounds.first..bounds.last + 1) |code_point| flags[code_point] = true;
+        if (bounds.first > codepoint_max) continue;
+        const last = @min(bounds.last, codepoint_max);
+        for (bounds.first..last + 1) |codepoint| flags[codepoint] = true;
     }
 }
 
-/// Sorted, non-overlapping ranges of the code points that are not one column,
-/// merging adjacent code points of the same width.
-fn coalesce(arena: std.mem.Allocator, zero: []const bool, wide: []const bool) ![]Range {
-    var ranges: std.ArrayList(Range) = .empty;
-    var open: ?Range = null;
-    for (0..max_code_point + 1) |code_point| {
-        const width: u8 = if (zero[code_point]) 0 else if (wide[code_point]) 2 else 1;
-        if (width == 1) {
-            if (open) |range| try ranges.append(arena, range);
+/// Sorted, non-overlapping intervals of the code points that are not one
+/// column, merging adjacent code points of the same width.
+fn coalesce(arena: std.mem.Allocator, zero: []const bool, wide: []const bool) ![]Interval {
+    var intervals: std.ArrayList(Interval) = .empty;
+    var open: ?Interval = null;
+    for (0..codepoint_max + 1) |codepoint| {
+        const columns: u8 = if (zero[codepoint]) 0 else if (wide[codepoint]) 2 else 1;
+        if (columns == 1) {
+            if (open) |interval| try intervals.append(arena, interval);
             open = null;
             continue;
         }
-        if (open) |*range| {
-            if (range.width == width) {
-                range.last = @intCast(code_point);
+        if (open) |*interval| {
+            if (interval.columns == columns) {
+                interval.last = @intCast(codepoint);
                 continue;
             }
-            try ranges.append(arena, range.*);
+            try intervals.append(arena, interval.*);
         }
-        open = .{ .first = @intCast(code_point), .last = @intCast(code_point), .width = width };
+        open = .{ .first = @intCast(codepoint), .last = @intCast(codepoint), .columns = columns };
     }
-    if (open) |range| try ranges.append(arena, range);
-    return ranges.toOwnedSlice(arena);
+    if (open) |interval| try intervals.append(arena, interval);
+    return intervals.toOwnedSlice(arena);
 }
 
-fn emit(writer: *std.Io.Writer, ranges: []const Range) !void {
+fn emit(writer: *std.Io.Writer, intervals: []const Interval) !void {
     try writer.print(header_prefix, .{version});
     try writer.writeAll(header_rest);
-    for (ranges) |range| try writer.print(
-        "    .{{ .first = 0x{x:0>4}, .last = 0x{x:0>4}, .width = {d} }},\n",
-        .{ range.first, range.last, range.width },
+    for (intervals) |interval| try writer.print(
+        "    .{{ .first = 0x{x:0>4}, .last = 0x{x:0>4}, .columns = {d} }},\n",
+        .{ interval.first, interval.last, interval.columns },
     );
     try writer.writeAll("};\n");
 }
@@ -169,7 +171,7 @@ const header_rest =
     \\//!   Data Files are furnished to do so, provided that this copyright and
     \\//!   permission notice appear with all copies of the Data Files.
     \\
-    \\pub const Range = struct { first: u21, last: u21, width: u8 };
+    \\pub const Interval = struct { first: u21, last: u21, columns: u8 };
     \\
     \\/// Code points whose display width is not one column, sorted and
     \\/// non-overlapping. Width zero covers nonspacing and enclosing combining marks,
@@ -177,6 +179,6 @@ const header_rest =
     \\/// space. Width two covers East Asian Wide and Fullwidth code points and the
     \\/// code points with default emoji presentation. A code point in no range is one
     \\/// column.
-    \\pub const widths = [_]Range{
+    \\pub const intervals = [_]Interval{
     \\
 ;

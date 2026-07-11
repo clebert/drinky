@@ -12,7 +12,7 @@ const unicode = @import("unicode.zig");
 /// from several code points — an emoji with a variation selector, a skin-tone
 /// modifier, or a ZWJ join — is mismeasured. Precomposed characters and a base
 /// plus a zero-width combining mark are counted correctly.
-pub fn display(text: []const u8) usize {
+pub fn ofText(text: []const u8) usize {
     var columns: usize = 0;
     var index: usize = 0;
     while (index < text.len) {
@@ -21,7 +21,7 @@ pub fn display(text: []const u8) usize {
             index += escapeLength(text[index..]);
             continue;
         }
-        const step = cellAt(text[index..]);
+        const step = stepAt(text[index..]);
         columns += step.columns;
         index += step.bytes;
     }
@@ -40,7 +40,7 @@ pub fn truncate(text: []const u8, columns_max: usize) []const u8 {
             index += escapeLength(text[index..]);
             continue;
         }
-        const step = cellAt(text[index..]);
+        const step = stepAt(text[index..]);
         if (columns + step.columns > columns_max) break;
         columns += step.columns;
         index += step.bytes;
@@ -73,7 +73,7 @@ pub fn wrap(
             index += escapeLength(text[index..]);
             continue;
         }
-        const step = cellAt(text[index..]);
+        const step = stepAt(text[index..]);
         if (columns + step.columns > columns_max and index > line_start) {
             try lines.append(gpa, text[line_start..index]);
             line_start = index;
@@ -85,46 +85,48 @@ pub fn wrap(
     try lines.append(gpa, text[line_start..]);
 }
 
+/// Display width of a single codepoint in terminal columns: zero for combining
+/// marks and other zero-width code points, two for East Asian wide/fullwidth
+/// and emoji, one otherwise.
+pub fn ofCodepoint(codepoint: u21) usize {
+    // Every code point below the first interval is a single column, which covers
+    // the bulk of real text; skip the search for it.
+    if (codepoint < unicode.intervals[0].first) return 1;
+    return search(&unicode.intervals, codepoint);
+}
+
 const escape_start = 0x1b;
 
-const Cell = struct { bytes: usize, columns: usize };
+const Step = struct { bytes: usize, columns: usize };
 
-fn cellAt(text: []const u8) Cell {
+fn stepAt(text: []const u8) Step {
     const byte = text[0];
     if (byte < 0x80) {
         const printable = byte >= 0x20 and byte != 0x7f;
         return .{ .bytes = 1, .columns = @intFromBool(printable) };
     }
     const length = std.unicode.utf8ByteSequenceLength(byte) catch return .{ .bytes = 1, .columns = 1 };
-    const bytes = @min(length, text.len);
-    const codepoint = std.unicode.utf8Decode(text[0..bytes]) catch return .{ .bytes = bytes, .columns = 1 };
-    return .{ .bytes = bytes, .columns = of(codepoint) };
+    // A sequence cut off at the buffer end is one replacement column; decoding
+    // the short slice would panic on the length mismatch.
+    if (text.len < length) return .{ .bytes = text.len, .columns = 1 };
+    const codepoint = std.unicode.utf8Decode(text[0..length]) catch return .{ .bytes = length, .columns = 1 };
+    return .{ .bytes = length, .columns = ofCodepoint(codepoint) };
 }
 
-/// Display width of a single codepoint in terminal columns: zero for combining
-/// marks and other zero-width code points, two for East Asian wide/fullwidth
-/// and emoji, one otherwise.
-pub fn of(codepoint: u21) usize {
-    // Every code point below the first ranged one is a single column, which
-    // covers the bulk of real text; skip the search for it.
-    if (codepoint < unicode.widths[0].first) return 1;
-    return search(&unicode.widths, codepoint);
-}
-
-/// Display width of `codepoint` from the sorted, non-overlapping `ranges`, or
-/// one column when it falls in no range.
-fn search(ranges: []const unicode.Range, codepoint: u21) usize {
+/// Display width of `codepoint` from the sorted, non-overlapping `intervals`, or
+/// one column when it falls in no interval.
+fn search(intervals: []const unicode.Interval, codepoint: u21) usize {
     var low: usize = 0;
-    var high: usize = ranges.len;
+    var high: usize = intervals.len;
     while (low < high) {
         const middle = low + @divFloor(high - low, 2);
-        const range = ranges[middle];
-        if (codepoint < range.first) {
+        const interval = intervals[middle];
+        if (codepoint < interval.first) {
             high = middle;
-        } else if (codepoint > range.last) {
+        } else if (codepoint > interval.last) {
             low = middle + 1;
         } else {
-            return range.width;
+            return interval.columns;
         }
     }
     return 1;
@@ -159,31 +161,51 @@ fn escapeLength(text: []const u8) usize {
     }
 }
 
-test display {
-    try std.testing.expectEqual(@as(usize, 5), display("hello"));
-    try std.testing.expectEqual(@as(usize, 0), display(""));
-    try std.testing.expectEqual(@as(usize, 3), display("a\x1b[31mbc\x1b[0m"));
-    try std.testing.expectEqual(@as(usize, 2), display("\x1b]8;;http://x\x07hi\x1b]8;;\x07"));
-    try std.testing.expectEqual(@as(usize, 1), display("é"));
+test ofText {
+    try std.testing.expectEqual(@as(usize, 5), ofText("hello"));
+    try std.testing.expectEqual(@as(usize, 0), ofText(""));
+    try std.testing.expectEqual(@as(usize, 3), ofText("a\x1b[31mbc\x1b[0m"));
+    try std.testing.expectEqual(@as(usize, 2), ofText("\x1b]8;;http://x\x07hi\x1b]8;;\x07"));
+    try std.testing.expectEqual(@as(usize, 1), ofText("é"));
     // The APC cursor marker is zero-width and does not split a wrapped line.
-    try std.testing.expectEqual(@as(usize, 2), display("a\x1b_p\x1b\\b"));
+    try std.testing.expectEqual(@as(usize, 2), ofText("a\x1b_p\x1b\\b"));
+    // An escape cut off at the buffer end is consumed without adding columns:
+    // a bare trailing ESC, then a CSI with no final byte.
+    try std.testing.expectEqual(@as(usize, 1), ofText("x\x1b"));
+    try std.testing.expectEqual(@as(usize, 0), ofText("\x1b[31"));
 }
 
-test of {
-    try std.testing.expectEqual(@as(usize, 1), of('a'));
-    try std.testing.expectEqual(@as(usize, 1), of('é'));
-    try std.testing.expectEqual(@as(usize, 2), of('你'));
-    try std.testing.expectEqual(@as(usize, 2), of('😀'));
-    try std.testing.expectEqual(@as(usize, 0), of('\u{0301}')); // combining acute accent
-    try std.testing.expectEqual(@as(usize, 0), of('\u{200d}')); // zero-width joiner
+test ofCodepoint {
+    try std.testing.expectEqual(@as(usize, 1), ofCodepoint('a'));
+    try std.testing.expectEqual(@as(usize, 1), ofCodepoint('é'));
+    try std.testing.expectEqual(@as(usize, 2), ofCodepoint('你'));
+    try std.testing.expectEqual(@as(usize, 2), ofCodepoint('😀'));
+    try std.testing.expectEqual(@as(usize, 0), ofCodepoint('\u{0301}')); // combining acute accent
+    try std.testing.expectEqual(@as(usize, 0), ofCodepoint('\u{200d}')); // zero-width joiner
+    // The seam between the single-column fast path and the first table interval.
+    try std.testing.expectEqual(@as(usize, 1), ofCodepoint('\u{02ff}'));
+    try std.testing.expectEqual(@as(usize, 0), ofCodepoint('\u{0300}'));
 }
 
-test "display measures wide glyphs and zero-width marks" {
-    try std.testing.expectEqual(@as(usize, 4), display("你好"));
-    try std.testing.expectEqual(@as(usize, 2), display("😀"));
-    try std.testing.expectEqual(@as(usize, 4), display("a你b"));
+test "ofText measures wide glyphs and zero-width marks" {
+    try std.testing.expectEqual(@as(usize, 4), ofText("你好"));
+    try std.testing.expectEqual(@as(usize, 2), ofText("😀"));
+    try std.testing.expectEqual(@as(usize, 4), ofText("a你b"));
     // A base letter plus a combining mark is a single column.
-    try std.testing.expectEqual(@as(usize, 1), display("e\u{0301}"));
+    try std.testing.expectEqual(@as(usize, 1), ofText("e\u{0301}"));
+}
+
+test "ofText counts control bytes as zero and survives malformed utf-8" {
+    // Tab and DEL are ASCII control bytes and add no columns.
+    try std.testing.expectEqual(@as(usize, 2), ofText("a\tb"));
+    try std.testing.expectEqual(@as(usize, 0), ofText("\x7f"));
+    // An invalid lead byte is one replacement column and still makes progress.
+    try std.testing.expectEqual(@as(usize, 1), ofText("\xff"));
+    // A multi-byte sequence cut off at the buffer end is one column, not a
+    // panic — a 4-byte emoji leader and a 3-byte CJK leader, each short a tail.
+    try std.testing.expectEqual(@as(usize, 1), ofText("\xf0\x9f"));
+    try std.testing.expectEqual(@as(usize, 1), ofText("\xf0\x9f\x98"));
+    try std.testing.expectEqual(@as(usize, 1), ofText("\xe4\xb8"));
 }
 
 test "multi-codepoint grapheme clusters are measured per codepoint" {
@@ -193,21 +215,24 @@ test "multi-codepoint grapheme clusters are measured per codepoint" {
 
     // Heart plus emoji variation selector: the terminal shows two columns, but
     // VS16 is zero-width here and does not promote the heart to emoji width.
-    try std.testing.expectEqual(@as(usize, 1), display("❤\u{FE0F}"));
+    try std.testing.expectEqual(@as(usize, 1), ofText("❤\u{FE0F}"));
     // Thumbs-up plus skin-tone modifier: one glyph, but two wide code points.
-    try std.testing.expectEqual(@as(usize, 4), display("👍\u{1F3FD}"));
+    try std.testing.expectEqual(@as(usize, 4), ofText("👍\u{1F3FD}"));
     // ZWJ family: one glyph from four wide emoji joined by zero-width joiners.
-    try std.testing.expectEqual(@as(usize, 8), display("👨\u{200D}👩\u{200D}👧\u{200D}👦"));
+    try std.testing.expectEqual(@as(usize, 8), ofText("👨\u{200D}👩\u{200D}👧\u{200D}👦"));
     // Regional-indicator flag: the terminal shows one two-column flag, but each
     // indicator is a wide code point, so the pair overcounts to four.
-    try std.testing.expectEqual(@as(usize, 4), display("🇯🇵"));
+    try std.testing.expectEqual(@as(usize, 4), ofText("🇯🇵"));
 }
 
 test truncate {
     try std.testing.expectEqualStrings("hel", truncate("hello", 3));
     try std.testing.expectEqualStrings("hello", truncate("hello", 10));
     try std.testing.expectEqualStrings("", truncate("hello", 0));
+    try std.testing.expectEqualStrings("", truncate("", 3));
     try std.testing.expectEqualStrings("a\x1b[31mb", truncate("a\x1b[31mbc", 2));
+    // Content past the budget is dropped together with the escape trailing it.
+    try std.testing.expectEqualStrings("ab", truncate("abc\x1b[0m", 2));
     // "好" is two columns, so it never fits a single spare column.
     try std.testing.expectEqualStrings("你", truncate("你好", 3));
     try std.testing.expectEqualStrings("你", truncate("你好", 2));
@@ -235,4 +260,16 @@ test wrap {
     try std.testing.expectEqualStrings("你", lines.items[0]);
     try std.testing.expectEqualStrings("好", lines.items[1]);
     try std.testing.expectEqualStrings("世", lines.items[2]);
+
+    // An empty input still yields one (empty) line.
+    lines.clearRetainingCapacity();
+    try wrap("", 3, &lines, std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), lines.items.len);
+    try std.testing.expectEqualStrings("", lines.items[0]);
+
+    // An embedded escape adds no width and does not force a break.
+    lines.clearRetainingCapacity();
+    try wrap("a\x1b[31mbc", 3, &lines, std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), lines.items.len);
+    try std.testing.expectEqualStrings("a\x1b[31mbc", lines.items[0]);
 }

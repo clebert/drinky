@@ -17,7 +17,7 @@ pub const marker = "\x1b_p\x1b\\";
 /// The caret's display column within `line` if it carries the marker.
 pub fn column(line: []const u8) ?usize {
     const at = std.mem.indexOf(u8, line, marker) orelse return null;
-    return width.display(line[0..at]);
+    return width.ofText(line[0..at]);
 }
 
 test column {

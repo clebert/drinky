@@ -113,7 +113,7 @@ fn putCodepoint(self: *Emulator, bytes: []const u8) !usize {
     const length = std.unicode.utf8ByteSequenceLength(bytes[0]) catch 1;
     const step = @min(length, bytes.len);
     const codepoint = std.unicode.utf8Decode(bytes[0..step]) catch bytes[0];
-    const glyph_columns = width.of(codepoint);
+    const glyph_columns = width.ofCodepoint(codepoint);
     // Zero-width marks take no column, so consume the bytes and leave the grid
     // unchanged.
     if (glyph_columns == 0) return step;

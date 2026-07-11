@@ -136,7 +136,7 @@ Extension seams referenced here:
 
 ## UI
 
-- [ ] **Accurate display widths (wide glyphs).** _Partly landed._ `width.display`/`truncate`/`wrap`
+- [ ] **Accurate display widths (wide glyphs).** _Partly landed._ `width.ofText`/`truncate`/`wrap`
       now measure each codepoint with a `wcwidth`-style table (East Asian Wide/Fullwidth + emoji +
       zero-width combining), and `Emulator` models right-margin autowrap with deferred-wrap
       semantics. What remains: the differential `Surface` does cursor math over the whole in-memory
@@ -146,8 +146,8 @@ Extension seams referenced here:
       reach by wrapping every line to the terminal width before rendering. Close it by making
       `Surface` track physical rows (a line spans `ceil(width / columns)` of them) so an unwrapped
       wide line can no longer corrupt the frame.
-- [ ] **Grapheme-cluster display widths.** `width.display`/`truncate`/`wrap` sum width per codepoint
-      via `width.of` with no UAX #29 grapheme segmentation, so a glyph built from several code points
+- [ ] **Grapheme-cluster display widths.** `width.ofText`/`truncate`/`wrap` sum width per codepoint
+      via `width.ofCodepoint` with no UAX #29 grapheme segmentation, so a glyph built from several code points
       is mismeasured: an emoji variation selector (`❤️`) undercounts, a skin-tone modifier (`👍🏽`)
       or ZWJ sequence (`👨‍👩‍👧‍👦`) overcounts, and `truncate`/`wrap` can split a cluster mid-glyph.
       A characterization test pins these per-codepoint counts.

@@ -32,8 +32,8 @@ pub fn render(
     defer stats.deinit(gpa);
     try writeStats(&stats, gpa, info);
 
-    const stats_columns = terminal.width.display(stats.items);
-    const model_columns = terminal.width.display(info.model);
+    const stats_columns = terminal.width.ofText(stats.items);
+    const model_columns = terminal.width.ofText(info.model);
 
     try buffer.appendSlice(gpa, dim);
     if (stats_columns + model_columns + 1 <= columns) {
@@ -128,7 +128,7 @@ test render {
         .model = "claude-opus-4-8",
     }, 120, &buffer, std.testing.allocator);
 
-    try std.testing.expectEqual(@as(usize, 120), terminal.width.display(line));
+    try std.testing.expectEqual(@as(usize, 120), terminal.width.ofText(line));
     try std.testing.expect(std.mem.indexOf(u8, line, "ctx 21% (206k/1.0M)") != null);
     try std.testing.expect(std.mem.indexOf(u8, line, "cache 87%") != null);
     try std.testing.expect(std.mem.indexOf(u8, line, "$0.39 saved $0.82") != null);
