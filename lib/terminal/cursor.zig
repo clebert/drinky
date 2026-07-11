@@ -1,12 +1,12 @@
 //! The hardware-cursor marker. Terminology: the *caret* is a component's own
 //! logical insertion point; the *cursor* is the terminal's hardware cursor. A
-//! focused component embeds `marker` at its caret so the `Surface` can learn
+//! focused component embeds `marker` at its caret so the `Screen` can learn
 //! which line and column that is, strip it, and move the hardware cursor there
 //! after the repaint.
 //!
 //! The marker is an APC string: terminals ignore it, and `width` measures it as
 //! zero columns, so it rides along through wrapping without shifting any text
-//! and never reaches the screen (the `Surface` removes it first).
+//! and never reaches the screen (the `Screen` removes it first).
 
 const std = @import("std");
 

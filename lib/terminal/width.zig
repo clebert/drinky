@@ -83,6 +83,80 @@ pub fn wrap(
     try lines.append(gpa, text[line_start..]);
 }
 
+/// Number of physical terminal rows `text` occupies once hard-wrapped to
+/// `columns_max` display columns — the count of pieces `wrap` produces. Always
+/// at least one; an explicit `\n` starts a new row. A wide cluster that would
+/// straddle the margin breaks to the next row, so this is not `ceil(width /
+/// columns)`.
+pub fn rows(text: []const u8, columns_max: usize) usize {
+    var count: usize = 1;
+    var columns: usize = 0;
+    var index: usize = 0;
+    var row_start: usize = 0;
+    while (index < text.len) {
+        const byte = text[index];
+        if (byte == '\n') {
+            count += 1;
+            columns = 0;
+            index += 1;
+            row_start = index;
+            continue;
+        }
+        if (byte == escape_start) {
+            index += escapeLength(text[index..]);
+            continue;
+        }
+        const step = grapheme.stepAt(text[index..]);
+        if (columns + step.columns > columns_max and index > row_start) {
+            count += 1;
+            columns = 0;
+            row_start = index;
+        }
+        columns += step.columns;
+        index += step.bytes;
+    }
+    return count;
+}
+
+pub const Caret = struct { rows_before: usize, column: usize };
+
+/// Physical position of a caret sitting `columns_target` display columns into
+/// `text` once wrapped to `columns_max`: how many row breaks precede it and its
+/// column within that row. Mirrors `wrap`, so a wide cluster near the margin
+/// pushes the caret to the next row. `columns_target` must land on a cluster
+/// boundary, as `cursor.column` reports.
+pub fn caret(text: []const u8, columns_target: usize, columns_max: usize) Caret {
+    var rows_before: usize = 0;
+    var column: usize = 0;
+    var consumed: usize = 0;
+    var index: usize = 0;
+    var row_start: usize = 0;
+    while (consumed < columns_target and index < text.len) {
+        const byte = text[index];
+        if (byte == '\n') {
+            rows_before += 1;
+            column = 0;
+            index += 1;
+            row_start = index;
+            continue;
+        }
+        if (byte == escape_start) {
+            index += escapeLength(text[index..]);
+            continue;
+        }
+        const step = grapheme.stepAt(text[index..]);
+        if (column + step.columns > columns_max and index > row_start) {
+            rows_before += 1;
+            column = 0;
+            row_start = index;
+        }
+        column += step.columns;
+        consumed += step.columns;
+        index += step.bytes;
+    }
+    return .{ .rows_before = rows_before, .column = column };
+}
+
 const escape_start = 0x1b;
 
 /// Byte length of the escape sequence at the start of `text` (`text[0]` is ESC).
@@ -217,4 +291,31 @@ test wrap {
     try wrap("a\x1b[31mbc", 3, &lines, std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), lines.items.len);
     try std.testing.expectEqualStrings("a\x1b[31mbc", lines.items[0]);
+}
+
+test rows {
+    try std.testing.expectEqual(@as(usize, 1), rows("", 3));
+    try std.testing.expectEqual(@as(usize, 1), rows("abc", 3));
+    try std.testing.expectEqual(@as(usize, 2), rows("abcd", 3));
+    // A wide cluster that cannot straddle the margin costs an extra row: three
+    // two-column glyphs in three columns take one row each, not two total.
+    try std.testing.expectEqual(@as(usize, 3), rows("你好世", 3));
+    // An explicit newline starts a fresh row; an escape adds none.
+    try std.testing.expectEqual(@as(usize, 2), rows("ab\ncd", 10));
+    try std.testing.expectEqual(@as(usize, 1), rows("a\x1b[31mbc", 3));
+}
+
+test caret {
+    // Within the first row, the caret column equals the display width consumed.
+    try std.testing.expectEqual(Caret{ .rows_before = 0, .column = 0 }, caret("hello", 0, 3));
+    try std.testing.expectEqual(Caret{ .rows_before = 0, .column = 2 }, caret("hello", 2, 3));
+    // At column 3 of a three-wide budget the caret sits pending at the margin.
+    try std.testing.expectEqual(Caret{ .rows_before = 0, .column = 3 }, caret("hello", 3, 3));
+    // Past the margin it wraps: column 4 is the second row, first column.
+    try std.testing.expectEqual(Caret{ .rows_before = 1, .column = 1 }, caret("hello", 4, 3));
+    // Wide glyphs push the wrap early: after two two-column glyphs the caret is
+    // on the second row at column two, not row one.
+    try std.testing.expectEqual(Caret{ .rows_before = 1, .column = 2 }, caret("你好世", 4, 3));
+    // An explicit newline starts a fresh row, like wrap.
+    try std.testing.expectEqual(Caret{ .rows_before = 1, .column = 1 }, caret("ab\ncd", 3, 10));
 }

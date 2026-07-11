@@ -1,10 +1,10 @@
 //! The composition root and event loop. Wires the terminal, differential
-//! surface, input parser, editor, and agent together: ensures the user is
+//! screen, input parser, editor, and agent together: ensures the user is
 //! authenticated, then reads keys into the editor and drives one agent turn per
 //! submitted line, streaming the reply into the transcript.
 //!
 //! Rendering is a single model: the whole frame is a list of lines, and every
-//! refresh rebuilds it and hands it to the `Surface`, which diffs and repaints
+//! refresh rebuilds it and hands it to the `Screen`, which diffs and repaints
 //! the smallest region it can. The transcript is a list of `Entry` blocks (user
 //! messages, model text, tool results, notices), each caching its own rendered
 //! lines so only a changed block re-wraps; below it sit the live tail (a running
@@ -78,7 +78,7 @@ const Picking = struct {
 gpa: std.mem.Allocator,
 io: std.Io,
 tty: terminal.Tty,
-surface: terminal.Surface,
+screen: terminal.Screen,
 input: terminal.Input,
 editor: ui.Editor,
 auth: ai.anthropic.Auth,
@@ -88,7 +88,7 @@ transcript: std.ArrayList(Entry),
 /// Index into `transcript` of the model-text block for the current text run, so
 /// streamed deltas keep appending to it until a tool call or turn boundary.
 current_model: ?usize,
-/// The composed frame handed to the surface: borrowed slices into the entry
+/// The composed frame handed to the screen: borrowed slices into the entry
 /// caches, the shared empty string for gaps, and `tail`. Rebuilt each refresh.
 frame: std.ArrayList([]const u8),
 /// Owns the live tail and footer lines for the current frame (freed each
@@ -148,8 +148,8 @@ pub fn run(self: *App, gpa: std.mem.Allocator, io: std.Io, home: []const u8) !vo
 
     try self.tty.init(io);
     defer self.tty.deinit();
-    self.surface = terminal.Surface.init(gpa, self.tty.writer());
-    defer self.surface.deinit();
+    self.screen = terminal.Screen.init(gpa, self.tty.writer());
+    defer self.screen.deinit();
     self.input = terminal.Input.init(gpa);
     defer self.input.deinit();
     self.editor = ui.Editor.init(gpa);
@@ -218,7 +218,7 @@ fn clearOrQuit(self: *App) void {
     }
 }
 
-/// Rebuild the whole frame and hand it to the surface, which diffs and repaints.
+/// Rebuild the whole frame and hand it to the screen, which diffs and repaints.
 /// The transcript stacks first, each block from its own cache; then, unless a
 /// picker has taken over the footer, the live tail (a running tool's box and the
 /// spinner during a turn) and the footer (editor plus status). One blank line
@@ -256,7 +256,7 @@ fn refresh(self: *App) !void {
         try self.pushTail(try self.statusLine());
     }
 
-    try self.surface.render(self.frame.items, .{ .columns = self.columns, .rows = self.rows });
+    try self.screen.render(self.frame.items, .{ .columns = self.columns, .rows = self.rows });
 }
 
 /// The single layout rule: one blank line before every block but the first. The
@@ -606,8 +606,8 @@ test "a read chunk drives the editor and paints the result" {
     defer input.deinit();
     var editor = ui.Editor.init(gpa);
     defer editor.deinit();
-    var surface = terminal.Surface.init(gpa, &out.writer);
-    defer surface.deinit();
+    var screen = terminal.Screen.init(gpa, &out.writer);
+    defer screen.deinit();
     var scratch: std.ArrayList(u8) = .empty;
     defer scratch.deinit(gpa);
     var lines: std.ArrayList([]const u8) = .empty;
@@ -620,7 +620,7 @@ test "a read chunk drives the editor and paints the result" {
         else => {},
     };
     try editor.render(80, true, &scratch, &lines);
-    try surface.render(lines.items, .{ .columns = 80, .rows = 24 });
+    try screen.render(lines.items, .{ .columns = 80, .rows = 24 });
 
     try std.testing.expectEqualStrings("hllo", editor.content());
     const painted = out.written();

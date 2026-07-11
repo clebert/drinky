@@ -136,14 +136,17 @@ Extension seams referenced here:
 
 ## UI
 
-- [ ] **Accurate display widths (wide glyphs).** _Partly landed._ `width.ofText`/`truncate`/`wrap`
-      measure display columns from a generated `wcwidth`-style table (East Asian Wide/Fullwidth +
-      emoji + zero-width combining). What remains: the differential `Surface` does cursor math over
-      the whole in-memory frame assuming one physical row per frame line, so a line whose real width
-      exceeds `columns` auto-wraps in the terminal and permanently desyncs `cursor_row` until the
-      next resize/full repaint. The app keeps it out of reach by wrapping every line to the terminal
-      width before rendering. Close it by making `Surface` track physical rows (a line spans
-      `ceil(width / columns)` of them) so an unwrapped wide line can no longer corrupt the frame.
+- [x] **Accurate display widths (wide glyphs).** The differential `Screen` (renamed from `Surface`)
+      counts *physical* terminal rows for every cursor move: each frame line spans `width.rows` rows
+      — the number of pieces `width.wrap` produces, not `ceil(width / columns)`, since a wide cluster
+      cannot straddle the margin — and `width.caret` maps a caret's display column to its physical
+      row and column within a wrapped line. A single `paint` helper drives every mode (first frame,
+      full reset, incremental) so all row arithmetic lives in one place, and `viewportTop` and the
+      caret restore both measure physical rows. A line wider than `columns` can no longer desync
+      `cursor_row`, so `Screen` is correct independently of the app pre-wrapping every line. A model
+      terminal in the test suite replays the exact escapes `Screen` emits with real auto-wrap and
+      asserts the reconstructed document and caret, covering the wide-line paths byte-level checks
+      cannot express.
 - [x] **Grapheme-cluster display widths.** `width.ofText`/`truncate`/`wrap` measure per UAX #29
       grapheme cluster via the `grapheme` module, so a glyph built from several code points — an
       emoji variation selector (`❤️`), a skin-tone modifier (`👍🏽`), a ZWJ sequence
