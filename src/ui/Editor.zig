@@ -1,9 +1,9 @@
 //! The input-line editing model: a UTF-8 text buffer with a codepoint caret.
 //!
 //! It owns editing state only. Submitting, quitting, and drawing are the
-//! caller's job; `render` produces the display lines and, when focused, places
-//! the `cursor` marker at the caret so the renderer can put the real terminal
-//! cursor there.
+//! caller's job; `render` produces the display lines and, when focused, reports
+//! the caret's `(sub-row, column)` within them so the caller can address the
+//! real terminal cursor.
 
 const std = @import("std");
 
@@ -69,9 +69,10 @@ pub fn moveEnd(self: *Editor) void {
     self.caret = self.text.items.len;
 }
 
-/// Build the wrapped display lines into `buffer`/`lines` (both cleared first).
-/// When `focused`, the caret marker is placed at the cursor so the renderer can
-/// position the hardware cursor there. `lines` borrows from `buffer`, so keep
+/// Build the wrapped display lines into `buffer`/`lines` (both cleared first),
+/// returning the caret's `(sub-row, column)` within `lines` when `focused`, else
+/// null. `sub-row` is an index into `lines`; the caller adds the block's base to
+/// resolve the window-relative row. `lines` borrows from `buffer`, so keep
 /// `buffer` alive while using them.
 pub fn render(
     self: *const Editor,
@@ -79,10 +80,11 @@ pub fn render(
     focused: bool,
     buffer: *std.ArrayList(u8),
     lines: *std.ArrayList([]const u8),
-) !void {
+) !?terminal.View.Caret {
     buffer.clearRetainingCapacity();
     lines.clearRetainingCapacity();
     const gpa = self.gpa;
+    const columns_max = @max(columns, 1);
 
     // Everything goes into `buffer` first; the separator and body slices are
     // resolved by offset only after the last append, since growth can move the
@@ -91,16 +93,21 @@ pub fn render(
     const separator_end = buffer.items.len;
 
     const body_start = buffer.items.len;
-    try buffer.appendSlice(gpa, self.text.items[0..self.caret]);
-    if (focused) try buffer.appendSlice(gpa, terminal.cursor.marker);
-    try buffer.appendSlice(gpa, self.text.items[self.caret..]);
+    try buffer.appendSlice(gpa, self.text.items);
 
     const separator_line = buffer.items[0..separator_end];
     const body = buffer.items[body_start..];
-    const columns_min = 1;
     try lines.append(gpa, separator_line);
-    try terminal.width.wrap(body, @max(columns, columns_min), lines, gpa);
+    const body_row = lines.items.len;
+    try terminal.width.wrap(body, columns_max, lines, gpa);
     try lines.append(gpa, separator_line);
+
+    if (!focused) return null;
+    // The caret sits `caret_column` display columns into the body; map it
+    // through the same wrapping to its sub-row and column.
+    const caret_column = terminal.width.ofText(self.text.items[0..self.caret]);
+    const position = terminal.width.caret(body, caret_column, columns_max);
+    return .{ .row = body_row + position.rows_before, .column = position.column };
 }
 
 fn stepFrom(self: *const Editor, index: usize) usize {
@@ -158,14 +165,13 @@ test render {
     defer buffer.deinit(std.testing.allocator);
     var lines: std.ArrayList([]const u8) = .empty;
     defer lines.deinit(std.testing.allocator);
-    try editor.render(80, true, &buffer, &lines);
+    const caret = try editor.render(80, true, &buffer, &lines);
     try std.testing.expectEqual(@as(usize, 3), lines.items.len);
     try std.testing.expectEqual(@as(usize, 80), terminal.width.ofText(lines.items[0]));
-    // The body is the text plus the zero-width caret marker at the cursor.
     try std.testing.expectEqual(@as(usize, 2), terminal.width.ofText(lines.items[1]));
-    try std.testing.expectEqual(@as(?usize, 2), terminal.cursor.column(lines.items[1]));
     try std.testing.expectEqual(@as(usize, 80), terminal.width.ofText(lines.items[2]));
+    // The caret is on the body row (index 1) at column 2, past "hi".
+    try std.testing.expectEqual(@as(?terminal.View.Caret, .{ .row = 1, .column = 2 }), caret);
 
-    try editor.render(80, false, &buffer, &lines);
-    try std.testing.expectEqual(@as(?usize, null), terminal.cursor.column(lines.items[1]));
+    try std.testing.expectEqual(@as(?terminal.View.Caret, null), try editor.render(80, false, &buffer, &lines));
 }

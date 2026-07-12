@@ -72,10 +72,13 @@ even under sustained fast input. Animation is no exception: a self-animating ele
 own periodic events, each rendered through the same path and active only while it animates — so even
 animation leaves an idle interface inert.
 
-## Allocation
+## Working memory
 
-Producing a frame allocates no memory: buffers are sized to the window and reused. Only structural
-changes — a terminal resize, or a change to the window's page count — may resize those buffers.
+The view's working memory — the buffers it composes and diffs frames in — is bounded to the window
+and reused across frames rather than rebuilt each time. It grows only to fit: a terminal resize, a
+change to the window's page count, or the largest frame it has had to lay out. It is not released
+between frames, so a steady interface settles at a bounded footprint that does not grow with the
+model.
 
 ## Invariants
 
@@ -85,7 +88,7 @@ changes — a terminal resize, or a change to the window's page count — may re
 - The renderer's working set is bounded to the window; repaint cost and memory are bounded
   regardless of model size.
 - The view is always anchored to the newest content and holds no scroll position of its own.
-- The steady-state render path performs no allocation.
+- The view's working memory is reused across frames rather than rebuilt each time.
 - Frames are rate-limited, event-driven, and coalesced; an idle interface is inert, and input echoes
   within one frame interval.
 - No partial frame is ever visible, and wrapping never desynchronizes the cursor.

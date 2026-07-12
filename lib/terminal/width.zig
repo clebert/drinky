@@ -55,32 +55,56 @@ pub fn wrap(
     lines: *std.ArrayList([]const u8),
     gpa: std.mem.Allocator,
 ) !void {
-    var line_start: usize = 0;
-    var columns: usize = 0;
-    var index: usize = 0;
-    while (index < text.len) {
-        const byte = text[index];
-        if (byte == '\n') {
-            try lines.append(gpa, text[line_start..index]);
-            index += 1;
-            line_start = index;
-            columns = 0;
-            continue;
+    var iterator = wrapper(text, columns_max);
+    while (iterator.next()) |line| try lines.append(gpa, line);
+}
+
+/// A streaming view of `wrap`: yields the same lines one at a time instead of
+/// appending them all at once, so a caller can drop the rows above a window
+/// without ever materializing the whole list. `next` returns each fitted line in
+/// turn (a slice into `text`), then null. The sequence is identical to `wrap`'s
+/// output, so `wrap`, `rows`, and this stay in lockstep.
+pub const Wrapper = struct {
+    text: []const u8,
+    columns_max: usize,
+    line_start: usize,
+    done: bool,
+
+    pub fn next(self: *Wrapper) ?[]const u8 {
+        if (self.done) return null;
+        const text = self.text;
+        var columns: usize = 0;
+        var index = self.line_start;
+        while (index < text.len) {
+            const byte = text[index];
+            if (byte == '\n') {
+                const line = text[self.line_start..index];
+                self.line_start = index + 1;
+                return line;
+            }
+            if (byte == escape_start) {
+                index += escapeLength(text[index..]);
+                continue;
+            }
+            const step = grapheme.stepAt(text[index..]);
+            if (columns + step.columns > self.columns_max and index > self.line_start) {
+                const line = text[self.line_start..index];
+                self.line_start = index;
+                return line;
+            }
+            columns += step.columns;
+            index += step.bytes;
         }
-        if (byte == escape_start) {
-            index += escapeLength(text[index..]);
-            continue;
-        }
-        const step = grapheme.stepAt(text[index..]);
-        if (columns + step.columns > columns_max and index > line_start) {
-            try lines.append(gpa, text[line_start..index]);
-            line_start = index;
-            columns = 0;
-        }
-        columns += step.columns;
-        index += step.bytes;
+        self.done = true;
+        return text[self.line_start..];
     }
-    try lines.append(gpa, text[line_start..]);
+};
+
+/// Wrap `text` to at most `columns_max` display columns one line at a time — the
+/// streaming form `wrap` and `rows` are both built on, so all three stay in
+/// lockstep by construction.
+pub fn wrapper(text: []const u8, columns_max: usize) Wrapper {
+    return .{ .text = text, .columns_max = columns_max, .line_start = 0, .done = false };
 }
 
 /// Number of physical terminal rows `text` occupies once hard-wrapped to
@@ -89,32 +113,9 @@ pub fn wrap(
 /// straddle the margin breaks to the next row, so this is not `ceil(width /
 /// columns)`.
 pub fn rows(text: []const u8, columns_max: usize) usize {
-    var count: usize = 1;
-    var columns: usize = 0;
-    var index: usize = 0;
-    var row_start: usize = 0;
-    while (index < text.len) {
-        const byte = text[index];
-        if (byte == '\n') {
-            count += 1;
-            columns = 0;
-            index += 1;
-            row_start = index;
-            continue;
-        }
-        if (byte == escape_start) {
-            index += escapeLength(text[index..]);
-            continue;
-        }
-        const step = grapheme.stepAt(text[index..]);
-        if (columns + step.columns > columns_max and index > row_start) {
-            count += 1;
-            columns = 0;
-            row_start = index;
-        }
-        columns += step.columns;
-        index += step.bytes;
-    }
+    var iterator = wrapper(text, columns_max);
+    var count: usize = 0;
+    while (iterator.next()) |_| count += 1;
     return count;
 }
 
@@ -123,8 +124,8 @@ pub const Caret = struct { rows_before: usize, column: usize };
 /// Physical position of a caret sitting `columns_target` display columns into
 /// `text` once wrapped to `columns_max`: how many row breaks precede it and its
 /// column within that row. Mirrors `wrap`, so a wide cluster near the margin
-/// pushes the caret to the next row. `columns_target` must land on a cluster
-/// boundary, as `cursor.column` reports.
+/// pushes the caret to the next row. `columns_target` must land on a grapheme
+/// cluster boundary.
 pub fn caret(text: []const u8, columns_target: usize, columns_max: usize) Caret {
     var rows_before: usize = 0;
     var column: usize = 0;
@@ -256,6 +257,30 @@ test truncate {
     // A flag is one two-column cluster: it fits two columns whole or not at all.
     try std.testing.expectEqualStrings("🇯🇵", truncate("🇯🇵", 2));
     try std.testing.expectEqualStrings("", truncate("🇯🇵", 1));
+}
+
+test wrapper {
+    // Width break, explicit newline, a wide cluster that cannot straddle, an
+    // empty input yielding one empty line, and a trailing newline's empty tail.
+    var basic = wrapper("abcdef", 3);
+    try std.testing.expectEqualStrings("abc", basic.next().?);
+    try std.testing.expectEqualStrings("def", basic.next().?);
+    try std.testing.expect(basic.next() == null);
+
+    var wide = wrapper("你好世", 3);
+    try std.testing.expectEqualStrings("你", wide.next().?);
+    try std.testing.expectEqualStrings("好", wide.next().?);
+    try std.testing.expectEqualStrings("世", wide.next().?);
+    try std.testing.expect(wide.next() == null);
+
+    var empty = wrapper("", 3);
+    try std.testing.expectEqualStrings("", empty.next().?);
+    try std.testing.expect(empty.next() == null);
+
+    var trailing = wrapper("ab\n", 10);
+    try std.testing.expectEqualStrings("ab", trailing.next().?);
+    try std.testing.expectEqualStrings("", trailing.next().?);
+    try std.testing.expect(trailing.next() == null);
 }
 
 test wrap {

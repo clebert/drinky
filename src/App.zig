@@ -1,16 +1,17 @@
-//! The composition root and event loop. Wires the terminal, differential
-//! screen, input parser, editor, and agent together: ensures the user is
+//! The composition root and event loop. Wires the terminal, reconciling view,
+//! input parser, editor, and agent together: ensures the user is
 //! authenticated, then reads keys into the editor and drives one agent turn per
 //! submitted line, streaming the reply into the transcript.
 //!
-//! Rendering is a single model: the whole frame is a list of lines, and every
-//! refresh rebuilds it and hands it to the `Screen`, which diffs and repaints
-//! the smallest region it can. The transcript is a list of `Entry` blocks (user
-//! messages, model text, tool results, notices), each caching its own rendered
-//! lines so only a changed block re-wraps; below it sit the live tail (a running
-//! tool's box and the spinner) and the footer (the editor or picker, with the
-//! status line). One layout rule spaces them: a single blank line separates
-//! adjacent blocks, and boxes carry their own colored padding.
+//! Rendering projects the model onto a bounded window. Each refresh walks the
+//! components — the `Entry` transcript blocks (user messages, model text, tool
+//! results, notices), then the chrome (a running tool's box and the spinner, or
+//! a picker, then the editor and status line) — newest first to find the visible
+//! tail, then composes that tail straight into the `View`'s sink, which diffs it
+//! and repaints the smallest region it can. Nothing is cached between frames:
+//! layout is recomputed from the model each time, bounded to the window. One
+//! layout rule spaces the components: a single blank line separates adjacent
+//! ones, and boxes carry their own colored padding.
 
 const std = @import("std");
 
@@ -46,21 +47,53 @@ const muted_fg = "\x1b[38;2;128;128;128m";
 /// Braille frames for the "Working…" spinner, advanced one step per stream event.
 const spinner_frames = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };
 
+/// Display width of the full `⠋ Working…` spinner: glyph, space, and message.
+const spinner_columns = 10;
+
 /// Two Ctrl+C presses within this window quit; a lone press clears the editor.
 const ctrl_c_window_ms = 500;
 
+/// The view retains this many pages (terminal heights) of the newest content.
+const window_pages = 8;
+
+/// Ids for the footer and live-tail rows, from a reserved high range a growing
+/// transcript index (a block's id) can never reach, so anchors never alias as
+/// the model grows.
+const tool_box_id = std.math.maxInt(usize) - 4;
+const spinner_id = std.math.maxInt(usize) - 3;
+const picker_id = std.math.maxInt(usize) - 2;
+const editor_id = std.math.maxInt(usize) - 1;
+const status_id = std.math.maxInt(usize);
+
 const BoxStyle = struct { background: []const u8, foreground: []const u8 };
 
-/// One transcript block. `text` is the source; `lines` caches its rendering at
-/// width `columns` so a refresh re-wraps a block only when the width changes or
-/// the block is invalidated (`columns = 0`). The model-text block grows in place
-/// as its reply streams and is invalidated on each delta.
+/// A notice's look: the SGR style opening every line and a prefix (an error tag,
+/// or empty) printed before each line's text.
+const Notice = struct { style: []const u8, prefix: []const u8 };
+
+/// One screen component: a transcript block or a piece of chrome (the running
+/// tool's box, the spinner, the editor, the picker, or the status line). Laid
+/// out by `measure` and `renderSlot`, which switch on the tag.
+const Component = union(enum) {
+    entry: *const Entry,
+    tool_box,
+    spinner,
+    editor,
+    picker,
+    status,
+};
+
+/// A component in screen order: its content, the stable anchor `id` its rows
+/// carry, and whether a blank separator row precedes it as its line 0.
+const Slot = struct { component: Component, id: usize, leading_blank: bool };
+
+/// One transcript block. `text` is the source; each frame wraps and styles it
+/// into rows by its `kind`. The model-text block grows in place as its reply
+/// streams.
 const Entry = struct {
     kind: Kind,
     is_error: bool,
     text: std.ArrayList(u8),
-    lines: std.ArrayList([]u8),
-    columns: usize,
 
     const Kind = enum { intro, user, model, tool_result, feedback };
 };
@@ -78,7 +111,7 @@ const Picking = struct {
 gpa: std.mem.Allocator,
 io: std.Io,
 tty: terminal.Tty,
-screen: terminal.Screen,
+view: terminal.View,
 input: terminal.Input,
 editor: ui.Editor,
 auth: ai.anthropic.Auth,
@@ -88,16 +121,16 @@ transcript: std.ArrayList(Entry),
 /// Index into `transcript` of the model-text block for the current text run, so
 /// streamed deltas keep appending to it until a tool call or turn boundary.
 current_model: ?usize,
-/// The composed frame handed to the screen: borrowed slices into the entry
-/// caches, the shared empty string for gaps, and `tail`. Rebuilt each refresh.
-frame: std.ArrayList([]const u8),
-/// Owns the live tail and footer lines for the current frame (freed each
-/// refresh); the transcript's own lines are owned by their entries.
-tail: std.ArrayList([]u8),
-/// Scratch reused to build one line before it is copied into a cache or `tail`;
-/// `lines` borrows it while a widget's rows are copied out.
+/// Scratch backing the editor's or picker's materialized rows: their bytes live
+/// in `scratch`, their row slices in `lines`, both reused each frame.
 scratch: std.ArrayList(u8),
 lines: std.ArrayList([]const u8),
+/// The caret the editor reported this frame, placed onto its row while
+/// composing; null when the editor is not shown.
+caret: ?terminal.View.Caret,
+/// The running tool's box text (`name input_json`), composed once per frame and
+/// read by both layout passes.
+tool_buffer: std.ArrayList(u8),
 status_buffer: std.ArrayList(u8),
 columns: usize,
 rows: usize,
@@ -125,18 +158,16 @@ pub fn run(self: *App, gpa: std.mem.Allocator, io: std.Io, home: []const u8) !vo
     defer self.closePicker();
     defer self.clearActiveTool();
     self.transcript = .empty;
-    self.frame = .empty;
-    self.tail = .empty;
     self.scratch = .empty;
     self.lines = .empty;
+    self.tool_buffer = .empty;
     self.status_buffer = .empty;
+    self.caret = null;
     defer self.transcript.deinit(gpa);
     defer self.freeTranscript();
-    defer self.frame.deinit(gpa);
-    defer self.tail.deinit(gpa);
-    defer self.clearTail();
     defer self.scratch.deinit(gpa);
     defer self.lines.deinit(gpa);
+    defer self.tool_buffer.deinit(gpa);
     defer self.status_buffer.deinit(gpa);
 
     self.auth = try ai.anthropic.Auth.init(gpa, io, home);
@@ -148,8 +179,8 @@ pub fn run(self: *App, gpa: std.mem.Allocator, io: std.Io, home: []const u8) !vo
 
     try self.tty.init(io);
     defer self.tty.deinit();
-    self.screen = terminal.Screen.init(gpa, self.tty.writer());
-    defer self.screen.deinit();
+    self.view = terminal.View.init(gpa, self.tty.writer());
+    defer self.view.deinit();
     self.input = terminal.Input.init(gpa);
     defer self.input.deinit();
     self.editor = ui.Editor.init(gpa);
@@ -218,203 +249,312 @@ fn clearOrQuit(self: *App) void {
     }
 }
 
-/// Rebuild the whole frame and hand it to the screen, which diffs and repaints.
-/// The transcript stacks first, each block from its own cache; then, unless a
-/// picker has taken over the footer, the live tail (a running tool's box and the
-/// spinner during a turn) and the footer (editor plus status). One blank line
-/// separates adjacent blocks.
+/// Repaint: read the terminal size and snapshot the agent's status, then
+/// project the model onto the window with those as inputs. Keeping projection a
+/// pure function of the model, the size, and that snapshot lets it be driven
+/// without a live tty or agent.
 fn refresh(self: *App) !void {
     const size = self.tty.size();
+    const stats = self.agent.stats;
+    try self.project(.{ .columns = size.columns, .rows = size.rows }, .{
+        .last = stats.last,
+        .cost = stats.cost,
+        .saved = stats.saved,
+        .context_window = self.agent.model.context_window,
+        .model = self.agent.model.name,
+    });
+}
+
+/// Project the model onto the window at `size` and hand it to the view, drawing
+/// the status line from `status`. Components stack in screen order — the
+/// transcript blocks oldest first, then the chrome (a running tool's box and the
+/// spinner during a turn, or a picker, then the editor and the status line). Two
+/// passes: pass one measures newest → oldest until the window is full, finding
+/// the topmost visible component (the clip) and how many of its rows fall above
+/// the window; pass two composes clip → newest into the sink, the clip alone
+/// dropping those top rows. A blank separator precedes every component but the
+/// first and the status line.
+fn project(self: *App, size: terminal.View.Size, status: ui.status.Info) !void {
     self.columns = size.columns;
     self.rows = size.rows;
-    self.frame.clearRetainingCapacity();
-    self.clearTail();
+    self.caret = null;
 
-    for (self.transcript.items) |*entry| {
-        try self.gap();
-        try self.ensureEntry(entry);
-        for (entry.lines.items) |line| try self.frame.append(self.gpa, line);
+    var chrome: [4]Slot = undefined;
+    const chrome_count = try self.chromeSlots(&chrome, status);
+    const slots = chrome[0..chrome_count];
+    const total_slots = self.transcript.items.len + chrome_count;
+    const capacity = @max(self.rows, 1) * window_pages;
+
+    var total: usize = 0;
+    var shown: usize = 0;
+    while (shown < total_slots) {
+        total += self.measure(slotAt(slots, self.transcript.items, shown), self.columns);
+        shown += 1;
+        if (total >= capacity) break;
     }
+    const skip = if (total > capacity) total - capacity else 0;
 
+    const sink = try self.view.beginFrame(.{ .columns = self.columns, .rows = self.rows }, window_pages);
+    var reverse = shown;
+    while (reverse > 0) {
+        reverse -= 1;
+        const slot = slotAt(slots, self.transcript.items, reverse);
+        const placement: Placement = .{
+            .sink = sink,
+            .id = slot.id,
+            .columns = self.columns,
+            .base = if (slot.leading_blank) 1 else 0,
+            .skip = if (reverse == shown - 1) skip else 0,
+        };
+        try self.renderSlot(slot, &placement);
+    }
+    try self.view.render();
+}
+
+/// Build the chrome components (bounded) into `out` in screen order and return
+/// how many. Materializes what both passes read: the editor's or picker's rows
+/// (and the editor caret) into `scratch`/`lines`, the tool box text into
+/// `tool_buffer`, and the status line into `status_buffer`.
+fn chromeSlots(self: *App, out: *[4]Slot, status: ui.status.Info) !usize {
+    var count: usize = 0;
     if (self.picking) |*picking| {
-        try self.gap();
         try picking.picker.render(self.columns, &self.scratch, &self.lines);
-        for (self.lines.items) |line| try self.pushTail(line);
-        try self.pushTail(try self.statusLine());
+        out[count] = .{ .component = .picker, .id = picker_id, .leading_blank = true };
+        count += 1;
     } else {
         if (self.busy) {
             if (self.active_tool) |*active| {
-                try self.gap();
-                try self.tailBox(.{ .background = tool_pending_bg, .foreground = tool_fg }, active);
+                self.tool_buffer.clearRetainingCapacity();
+                try self.tool_buffer.appendSlice(self.gpa, active.name);
+                try self.tool_buffer.append(self.gpa, ' ');
+                try self.tool_buffer.appendSlice(self.gpa, active.input_json);
+                out[count] = .{ .component = .tool_box, .id = tool_box_id, .leading_blank = true };
+                count += 1;
             }
-            try self.gap();
-            try self.pushTail(try self.spinnerLine());
+            out[count] = .{ .component = .spinner, .id = spinner_id, .leading_blank = true };
+            count += 1;
         }
-        try self.gap();
-        try self.editor.render(self.columns, !self.busy, &self.scratch, &self.lines);
-        for (self.lines.items) |line| try self.pushTail(line);
-        try self.pushTail(try self.statusLine());
+        self.caret = try self.editor.render(self.columns, !self.busy, &self.scratch, &self.lines);
+        out[count] = .{ .component = .editor, .id = editor_id, .leading_blank = true };
+        count += 1;
     }
-
-    try self.screen.render(self.frame.items, .{ .columns = self.columns, .rows = self.rows });
+    _ = try ui.status.render(status, self.columns, &self.status_buffer, self.gpa);
+    out[count] = .{ .component = .status, .id = status_id, .leading_blank = false };
+    count += 1;
+    return count;
 }
 
-/// The single layout rule: one blank line before every block but the first. The
-/// gap borrows a shared empty string, so it costs no allocation.
-fn gap(self: *App) !void {
-    if (self.frame.items.len > 0) try self.frame.append(self.gpa, "");
+/// The component `reverse` steps back from the newest: the chrome first (its
+/// newest last), then the transcript newest → oldest.
+fn slotAt(chrome: []const Slot, transcript: []const Entry, reverse: usize) Slot {
+    if (reverse < chrome.len) return chrome[chrome.len - 1 - reverse];
+    const index = transcript.len - 1 - (reverse - chrome.len);
+    return .{ .component = .{ .entry = &transcript[index] }, .id = index, .leading_blank = index > 0 };
 }
 
-/// Copy `line` into a live-tail row, owned by `tail` and borrowed by `frame`.
-fn pushTail(self: *App, line: []const u8) !void {
-    const owned = try self.gpa.dupe(u8, line);
-    try self.tail.append(self.gpa, owned);
-    try self.frame.append(self.gpa, owned);
+/// The physical rows `slot` occupies, its leading separator included. Must equal
+/// exactly what `renderSlot` emits — the parity the diff and window math rely on.
+fn measure(self: *App, slot: Slot, columns: usize) usize {
+    const lead: usize = if (slot.leading_blank) 1 else 0;
+    return lead + switch (slot.component) {
+        .entry => |entry| entryRows(entry, columns),
+        .tool_box => 2 + terminal.width.rows(self.tool_buffer.items, boxInner(columns)),
+        .spinner, .status => 1,
+        .editor, .picker => self.lines.items.len,
+    };
 }
 
-fn clearTail(self: *App) void {
-    for (self.tail.items) |line| self.gpa.free(line);
-    self.tail.clearRetainingCapacity();
+fn entryRows(entry: *const Entry, columns: usize) usize {
+    const text = entry.text.items;
+    return switch (entry.kind) {
+        .intro, .feedback => std.mem.count(u8, text, "\n") + 1,
+        .user, .tool_result => 2 + terminal.width.rows(text, boxInner(columns)),
+        .model => terminal.width.rows(text, @max(columns, 1)),
+    };
+}
+
+/// The wrap width inside a box: two columns narrower than the terminal, one for
+/// the left pad and one to keep the fill off the last cell.
+fn boxInner(columns: usize) usize {
+    return @max(columns -| 2, 1);
 }
 
 fn freeTranscript(self: *App) void {
-    for (self.transcript.items) |*entry| {
-        entry.text.deinit(self.gpa);
-        for (entry.lines.items) |line| self.gpa.free(line);
-        entry.lines.deinit(self.gpa);
+    for (self.transcript.items) |*entry| entry.text.deinit(self.gpa);
+}
+
+/// Where a component composes its rows: the sink to write into, the anchor `id`
+/// its rows carry, the terminal width, the line its content starts at (`base`,
+/// after any leading separator), and how many of its top rows to drop (`skip`,
+/// nonzero only for the clip).
+const Placement = struct {
+    sink: *terminal.View.Sink,
+    id: usize,
+    columns: usize,
+    base: usize,
+    skip: usize,
+};
+
+/// Compose `slot`'s rows through `placement`, dropping its top `skip` rows
+/// (nonzero only for the clip). Its leading separator, when present, is line 0
+/// and content follows from `base`.
+fn renderSlot(self: *App, slot: Slot, placement: *const Placement) !void {
+    if (slot.leading_blank and placement.skip == 0) {
+        _ = placement.sink.begin();
+        placement.sink.end(.{ .id = placement.id, .line = 0 });
+    }
+    switch (slot.component) {
+        .entry => |entry| try renderEntry(entry, placement),
+        .tool_box => try renderBox(
+            placement,
+            .{ .background = tool_pending_bg, .foreground = tool_fg },
+            self.tool_buffer.items,
+        ),
+        .spinner => try self.renderSpinner(placement),
+        .status => try renderSingle(placement, self.status_buffer.items),
+        .editor => try self.renderLines(placement, true),
+        .picker => try self.renderLines(placement, false),
     }
 }
 
-/// Rebuild `entry.lines` for the current width unless the cache is already valid.
-fn ensureEntry(self: *App, entry: *Entry) !void {
-    if (entry.columns == self.columns) return;
-    for (entry.lines.items) |line| self.gpa.free(line);
-    entry.lines.clearRetainingCapacity();
-    // Invalidate up front so a failed rebuild is retried, never left half-built
-    // behind a width that happens to match again later.
-    entry.columns = 0;
+fn renderEntry(entry: *const Entry, placement: *const Placement) !void {
     const text = entry.text.items;
     switch (entry.kind) {
-        .intro => try self.renderStyledLines(&entry.lines, dim, "", text),
-        .feedback => try self.renderStyledLines(
-            &entry.lines,
-            if (entry.is_error) red else dim,
-            if (entry.is_error) "error: " else "",
-            text,
-        ),
-        .user => try self.renderBox(&entry.lines, .{ .background = user_bg, .foreground = user_fg }, text),
-        .model => try self.renderWrapped(&entry.lines, text),
-        .tool_result => try self.renderBox(&entry.lines, .{
+        .intro => try renderNotice(placement, .{ .style = dim, .prefix = "" }, text),
+        .feedback => try renderNotice(placement, .{
+            .style = if (entry.is_error) red else dim,
+            .prefix = if (entry.is_error) "error: " else "",
+        }, text),
+        .user => try renderBox(placement, .{ .background = user_bg, .foreground = user_fg }, text),
+        .tool_result => try renderBox(placement, .{
             .background = if (entry.is_error) tool_error_bg else tool_success_bg,
             .foreground = tool_fg,
         }, text),
+        .model => try renderWrapped(placement, text),
     }
-    entry.columns = self.columns;
 }
 
-/// Copy `line` into an owned row of `out`.
-fn pushLine(self: *App, out: *std.ArrayList([]u8), line: []const u8) !void {
-    try out.append(self.gpa, try self.gpa.dupe(u8, line));
-}
-
-/// Append `text` wrapped to the terminal width as plain lines (the model reply).
-fn renderWrapped(self: *App, out: *std.ArrayList([]u8), text: []const u8) !void {
-    var wrapped: std.ArrayList([]const u8) = .empty;
-    defer wrapped.deinit(self.gpa);
-    try terminal.width.wrap(text, @max(self.columns, 1), &wrapped, self.gpa);
-    for (wrapped.items) |line| try self.pushLine(out, line);
-}
-
-/// Append each `\n`-separated line of `text`, styled and truncated to fit, with
-/// `prefix` on every line (a notice, error, or the intro).
-fn renderStyledLines(self: *App, out: *std.ArrayList([]u8), style: []const u8, prefix: []const u8, text: []const u8) !void {
+/// Each `\n`-separated line of `text`, styled and truncated to one row, with the
+/// notice's prefix on every line (a notice, error, or the intro).
+fn renderNotice(placement: *const Placement, notice: Notice, text: []const u8) !void {
     var pieces = std.mem.splitScalar(u8, text, '\n');
-    while (pieces.next()) |piece| {
-        const available = self.columns -| terminal.width.ofText(prefix);
+    var index: usize = 0;
+    while (pieces.next()) |piece| : (index += 1) {
+        const line = placement.base + index;
+        if (line < placement.skip) continue;
+        const shown_prefix = terminal.width.truncate(notice.prefix, placement.columns);
+        const available = placement.columns - terminal.width.ofText(shown_prefix);
         const clipped = terminal.width.truncate(piece, available);
-        self.scratch.clearRetainingCapacity();
-        try self.scratch.appendSlice(self.gpa, style);
-        try self.scratch.appendSlice(self.gpa, prefix);
-        try self.scratch.appendSlice(self.gpa, clipped);
-        try self.scratch.appendSlice(self.gpa, reset);
-        try self.pushLine(out, self.scratch.items);
+        const writer = placement.sink.begin();
+        try writer.writeAll(notice.style);
+        try writer.writeAll(shown_prefix);
+        try writer.writeAll(clipped);
+        try writer.writeAll(reset);
+        placement.sink.end(.{ .id = placement.id, .line = line });
     }
 }
 
-/// Render the running tool's blue pending box into the live tail.
-fn tailBox(self: *App, style: BoxStyle, active: *const ActiveTool) !void {
-    const text = try std.fmt.allocPrint(self.gpa, "{s} {s}", .{ active.name, active.input_json });
-    defer self.gpa.free(text);
-    const start = self.tail.items.len;
-    try self.renderBox(&self.tail, style, text);
-    for (self.tail.items[start..]) |line| try self.frame.append(self.gpa, line);
+/// `text` wrapped to the terminal width as plain rows (the model reply),
+/// streamed a row at a time so the clip never materializes its whole body. Each
+/// row borrows `text`, so nothing is copied but the emitted bytes.
+fn renderWrapped(placement: *const Placement, text: []const u8) !void {
+    var iterator = terminal.width.wrapper(text, @max(placement.columns, 1));
+    var index: usize = 0;
+    while (iterator.next()) |content| : (index += 1) {
+        const line = placement.base + index;
+        if (line < placement.skip) continue;
+        const writer = placement.sink.begin();
+        try writer.writeAll(content);
+        placement.sink.end(.{ .id = placement.id, .line = line });
+    }
 }
 
-/// Append a padded background box: a blank padding row, `text` wrapped to the
-/// inner width with a one-space left pad and the background filled to full
-/// width, then a blank padding row. Self-separating, so it carries its own
-/// vertical breathing room inside the one-blank-line block gap around it.
-fn renderBox(self: *App, out: *std.ArrayList([]u8), style: BoxStyle, text: []const u8) !void {
-    var content: std.ArrayList([]const u8) = .empty;
-    defer content.deinit(self.gpa);
-    try terminal.width.wrap(text, @max(self.columns -| 2, 1), &content, self.gpa);
-
-    try self.pushBoxBlank(out, style.background);
-    for (content.items) |line| try self.pushBoxLine(out, style, line);
-    try self.pushBoxBlank(out, style.background);
+/// A padded background box: a blank padding row, `text` wrapped to the inner
+/// width with a one-space left pad and the background filled to full width, then
+/// a blank padding row. Streamed a row at a time, self-separating inside the
+/// block gap around it.
+fn renderBox(placement: *const Placement, style: BoxStyle, text: []const u8) !void {
+    var line = placement.base;
+    try boxPad(placement, &line, style.background);
+    var iterator = terminal.width.wrapper(text, boxInner(placement.columns));
+    while (iterator.next()) |content| try boxLine(placement, &line, style, content);
+    try boxPad(placement, &line, style.background);
 }
 
-fn pushBoxBlank(self: *App, out: *std.ArrayList([]u8), background: []const u8) !void {
-    self.scratch.clearRetainingCapacity();
-    try self.scratch.appendSlice(self.gpa, background);
-    for (0..self.columns) |_| try self.scratch.append(self.gpa, ' ');
-    try self.scratch.appendSlice(self.gpa, reset);
-    try self.pushLine(out, self.scratch.items);
+/// A box's blank padding row: the background filled to full width.
+fn boxPad(placement: *const Placement, line: *usize, background: []const u8) !void {
+    defer line.* += 1;
+    if (line.* < placement.skip) return;
+    const writer = placement.sink.begin();
+    try writer.writeAll(background);
+    try writer.splatByteAll(' ', placement.columns);
+    try writer.writeAll(reset);
+    placement.sink.end(.{ .id = placement.id, .line = line.* });
 }
 
-fn pushBoxLine(self: *App, out: *std.ArrayList([]u8), style: BoxStyle, line: []const u8) !void {
-    self.scratch.clearRetainingCapacity();
-    try self.scratch.appendSlice(self.gpa, style.background);
-    try self.scratch.appendSlice(self.gpa, style.foreground);
-    try self.scratch.append(self.gpa, ' ');
-    try self.scratch.appendSlice(self.gpa, line);
-    const used = 1 + terminal.width.ofText(line);
-    for (0..self.columns -| used) |_| try self.scratch.append(self.gpa, ' ');
-    try self.scratch.appendSlice(self.gpa, reset);
-    try self.pushLine(out, self.scratch.items);
+/// A box's content row: a one-space left pad, `content`, then the background
+/// filled to full width. `content` is capped to leave room for the pad, so a
+/// window too narrow for the wrap width still yields one physical row.
+fn boxLine(placement: *const Placement, line: *usize, style: BoxStyle, content: []const u8) !void {
+    defer line.* += 1;
+    if (line.* < placement.skip) return;
+    const shown = terminal.width.truncate(content, placement.columns -| 1);
+    const writer = placement.sink.begin();
+    try writer.writeAll(style.background);
+    try writer.writeAll(style.foreground);
+    try writer.writeByte(' ');
+    try writer.writeAll(shown);
+    try writer.splatByteAll(' ', placement.columns -| (1 + terminal.width.ofText(shown)));
+    try writer.writeAll(reset);
+    placement.sink.end(.{ .id = placement.id, .line = line.* });
 }
 
-/// Build the `⠋ Working…` spinner line into `self.scratch`: accent glyph, muted
-/// message. Returns the composed slice, valid until `self.scratch` next changes.
-fn spinnerLine(self: *App) ![]const u8 {
-    const gpa = self.gpa;
+/// The `⠋ Working…` spinner: accent glyph, muted message. One content row; on a
+/// window too narrow for the whole message it shows just the glyph.
+fn renderSpinner(self: *App, placement: *const Placement) !void {
+    if (placement.base < placement.skip) return;
     const frame = spinner_frames[self.spinner_frame % spinner_frames.len];
-    self.scratch.clearRetainingCapacity();
-    try self.scratch.appendSlice(gpa, accent_fg);
-    try self.scratch.appendSlice(gpa, frame);
-    try self.scratch.appendSlice(gpa, reset);
-    try self.scratch.appendSlice(gpa, " ");
-    try self.scratch.appendSlice(gpa, muted_fg);
-    try self.scratch.appendSlice(gpa, "Working…");
-    try self.scratch.appendSlice(gpa, reset);
-    return self.scratch.items;
+    const writer = placement.sink.begin();
+    try writer.writeAll(accent_fg);
+    if (placement.columns >= spinner_columns) {
+        try writer.writeAll(frame);
+        try writer.writeAll(reset);
+        try writer.writeAll(" ");
+        try writer.writeAll(muted_fg);
+        try writer.writeAll("Working…");
+    } else {
+        try writer.writeAll(terminal.width.truncate(frame, placement.columns));
+    }
+    try writer.writeAll(reset);
+    placement.sink.end(.{ .id = placement.id, .line = placement.base });
+}
+
+/// One content row of pre-composed `bytes` (the status line).
+fn renderSingle(placement: *const Placement, bytes: []const u8) !void {
+    if (placement.base < placement.skip) return;
+    const writer = placement.sink.begin();
+    try writer.writeAll(bytes);
+    placement.sink.end(.{ .id = placement.id, .line = placement.base });
+}
+
+/// The editor's or picker's materialized rows (in `lines`), placing the editor
+/// caret on its row when `with_caret`.
+fn renderLines(self: *App, placement: *const Placement, with_caret: bool) !void {
+    const sink = placement.sink;
+    for (self.lines.items, 0..) |content, index| {
+        const line = placement.base + index;
+        if (line < placement.skip) continue;
+        const writer = sink.begin();
+        try writer.writeAll(content);
+        if (with_caret) if (self.caret) |caret| if (caret.row == index) sink.setCaret(caret.column);
+        sink.end(.{ .id = placement.id, .line = line });
+    }
 }
 
 /// Advance the spinner one frame. The loop is blocked during a turn, so this
 /// runs per stream event rather than on a timer.
 fn advanceSpinner(self: *App) void {
     self.spinner_frame = (self.spinner_frame + 1) % spinner_frames.len;
-}
-
-fn statusLine(self: *App) ![]const u8 {
-    const stats = self.agent.stats;
-    return ui.status.render(.{
-        .last = stats.last,
-        .cost = stats.cost,
-        .saved = stats.saved,
-        .context_window = self.agent.model.context_window,
-        .model = self.agent.model.name,
-    }, self.columns, &self.status_buffer, self.gpa);
 }
 
 /// Append a new transcript block copying `text` as its source.
@@ -426,8 +566,6 @@ fn appendEntry(self: *App, kind: Entry.Kind, is_error: bool, text: []const u8) !
         .kind = kind,
         .is_error = is_error,
         .text = list,
-        .lines = .empty,
-        .columns = 0,
     });
 }
 
@@ -548,7 +686,6 @@ pub fn onText(self: *App, delta: []const u8) !void {
     self.advanceSpinner();
     const entry = try self.currentModel();
     try entry.text.appendSlice(self.gpa, delta);
-    entry.columns = 0;
     try self.refresh();
 }
 
@@ -606,8 +743,8 @@ test "a read chunk drives the editor and paints the result" {
     defer input.deinit();
     var editor = ui.Editor.init(gpa);
     defer editor.deinit();
-    var screen = terminal.Screen.init(gpa, &out.writer);
-    defer screen.deinit();
+    var view = terminal.View.init(gpa, &out.writer);
+    defer view.deinit();
     var scratch: std.ArrayList(u8) = .empty;
     defer scratch.deinit(gpa);
     var lines: std.ArrayList([]const u8) = .empty;
@@ -619,11 +756,226 @@ test "a read chunk drives the editor and paints the result" {
         .backspace => editor.backspace(),
         else => {},
     };
-    try editor.render(80, true, &scratch, &lines);
-    try screen.render(lines.items, .{ .columns = 80, .rows = 24 });
+    const maybe_caret = try editor.render(80, true, &scratch, &lines);
+    const sink = try view.beginFrame(.{ .columns = 80, .rows = 24 }, 4);
+    for (lines.items, 0..) |item, index| {
+        const writer = sink.begin();
+        try writer.writeAll(item);
+        if (maybe_caret) |caret| if (caret.row == index) sink.setCaret(caret.column);
+        sink.end(.{ .id = 0, .line = index });
+    }
+    try view.render();
 
     try std.testing.expectEqualStrings("hllo", editor.content());
     const painted = out.written();
     try std.testing.expect(std.mem.indexOf(u8, painted, "hllo") != null);
     try std.testing.expect(std.mem.indexOf(u8, painted, terminal.escape.sync_set) != null);
+}
+
+// Physical rows in a fresh paint: rows are joined by `\r\n` and a row never
+// contains one (`Sink.end` rejects both bytes), so the separators count them.
+fn paintedRows(bytes: []const u8) usize {
+    return std.mem.count(u8, bytes, "\r\n") + 1;
+}
+
+fn testEntry(gpa: std.mem.Allocator, kind: Entry.Kind, is_error: bool, text: []const u8) !Entry {
+    var list: std.ArrayList(u8) = .empty;
+    try list.appendSlice(gpa, text);
+    return .{ .kind = kind, .is_error = is_error, .text = list };
+}
+
+// Rows `entry` paints into a fresh view, dropping its top `skip`. Fresh so the
+// paint is a full reprint whose rows `paintedRows` can count.
+fn renderedRows(gpa: std.mem.Allocator, entry: *const Entry, columns: usize, skip: usize) !usize {
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var view = terminal.View.init(gpa, &out.writer);
+    defer view.deinit();
+    const sink = try view.beginFrame(.{ .columns = columns, .rows = 100 }, window_pages);
+    const placement: Placement = .{ .sink = sink, .id = 0, .columns = columns, .base = 0, .skip = skip };
+    try renderEntry(entry, &placement);
+    try view.render();
+    return paintedRows(out.written());
+}
+
+// The parity contract: what `measure` counts is exactly what `renderSlot`
+// emits. Here per entry kind, with content that wraps and carries blank lines.
+test "each entry kind renders exactly the rows measure counts" {
+    const gpa = std.testing.allocator;
+    const cases = [_]struct { kind: Entry.Kind, is_error: bool, text: []const u8 }{
+        .{ .kind = .intro, .is_error = false, .text = "a single intro line" },
+        .{ .kind = .feedback, .is_error = false, .text = "first\nsecond\nthird" },
+        .{ .kind = .feedback, .is_error = true, .text = "boom" },
+        .{ .kind = .user, .is_error = false, .text = "a user message long enough to wrap across the narrow test width more than once" },
+        .{ .kind = .model, .is_error = false, .text = "model reply\nwith a blank\n\nthen a long paragraph that must wrap several rows" },
+        .{ .kind = .tool_result, .is_error = true, .text = "read foo.zig\n→ no such file" },
+        // A wide-glyph box, to exercise the narrow-width row cap.
+        .{ .kind = .user, .is_error = false, .text = "你好世界" },
+    };
+    // Includes widths narrower than a box's borders and the error prefix, where
+    // `Sink.end`'s one-row assertion pins the renderers' clamps.
+    const widths = [_]usize{ 16, 3, 2 };
+    for (cases) |case| {
+        var entry = try testEntry(gpa, case.kind, case.is_error, case.text);
+        defer entry.text.deinit(gpa);
+        for (widths) |columns|
+            try std.testing.expectEqual(entryRows(&entry, columns), try renderedRows(gpa, &entry, columns, 0));
+    }
+}
+
+// The clip drops its top `skip` rows and shows the rest; skip 0 shows all.
+test "a clipped block shows its bottom rows" {
+    const gpa = std.testing.allocator;
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(gpa);
+    for (0..40) |i| {
+        if (i > 0) try text.append(gpa, '\n');
+        var buffer: [8]u8 = undefined;
+        try text.appendSlice(gpa, std.fmt.bufPrint(&buffer, "L{d}", .{i}) catch unreachable);
+    }
+    const entry: Entry = .{ .kind = .model, .is_error = false, .text = text };
+    const columns = 20;
+    try std.testing.expectEqual(@as(usize, 40), entryRows(&entry, columns));
+    try std.testing.expectEqual(@as(usize, 40), try renderedRows(gpa, &entry, columns, 0));
+    try std.testing.expectEqual(@as(usize, 15), try renderedRows(gpa, &entry, columns, 25));
+}
+
+// Bounded memory: streaming a clipped block into a frame warmed to its full
+// size neither allocates nor grows a buffer — the clip's hidden top is never
+// materialized.
+test "a clipped block streams into a warmed frame without allocating" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const gpa = failing.allocator();
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var view = terminal.View.init(gpa, &out.writer);
+    defer view.deinit();
+
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(std.testing.allocator);
+    for (0..60) |i| {
+        if (i > 0) try text.append(std.testing.allocator, '\n');
+        var buffer: [8]u8 = undefined;
+        try text.appendSlice(std.testing.allocator, std.fmt.bufPrint(&buffer, "L{d}", .{i}) catch unreachable);
+    }
+    const entry: Entry = .{ .kind = .model, .is_error = false, .text = text };
+    const columns = 20;
+
+    // Warm both frames and the output at the block's full size.
+    for (0..2) |_| {
+        const sink = try view.beginFrame(.{ .columns = columns, .rows = 100 }, window_pages);
+        const placement: Placement = .{ .sink = sink, .id = 0, .columns = columns, .base = 0, .skip = 0 };
+        try renderEntry(&entry, &placement);
+        try view.render();
+    }
+
+    // Arm: any further allocation or growth now fails.
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+
+    const sink = try view.beginFrame(.{ .columns = columns, .rows = 100 }, window_pages);
+    const placement: Placement = .{ .sink = sink, .id = 0, .columns = columns, .base = 0, .skip = 30 };
+    try renderEntry(&entry, &placement);
+    try view.render();
+}
+
+// Wires up an `App` with only what `project` touches — the buffers, a real view
+// and editor, an empty transcript, and inert chrome — leaving the tty and agent
+// undefined, so the projection path runs end to end without either.
+fn projectionApp(app: *App, gpa: std.mem.Allocator, writer: *std.Io.Writer) void {
+    app.gpa = gpa;
+    app.view = terminal.View.init(gpa, writer);
+    app.editor = ui.Editor.init(gpa);
+    app.transcript = .empty;
+    app.scratch = .empty;
+    app.lines = .empty;
+    app.tool_buffer = .empty;
+    app.status_buffer = .empty;
+    app.caret = null;
+    app.picking = null;
+    app.busy = false;
+    app.active_tool = null;
+    app.spinner_frame = 0;
+}
+
+fn deinitProjectionApp(app: *App, gpa: std.mem.Allocator) void {
+    app.freeTranscript();
+    app.transcript.deinit(gpa);
+    app.scratch.deinit(gpa);
+    app.lines.deinit(gpa);
+    app.tool_buffer.deinit(gpa);
+    app.status_buffer.deinit(gpa);
+    app.editor.deinit();
+    app.view.deinit();
+}
+
+const test_status: ui.status.Info = .{
+    .last = .{},
+    .cost = 0,
+    .saved = 0,
+    .context_window = 1000,
+    .model = "footerqq",
+};
+
+// The whole projection end to end: a transcript plus chrome (the editor and the
+// status line) composed through a real view. Exercises the backward measure
+// walk and the two-pass compose across transcript and chrome together, screen
+// order newest at the bottom — none of which the per-entry tests reach.
+test "projection stacks the transcript above the chrome, newest at the bottom" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var app: App = undefined;
+    projectionApp(&app, gpa, &out.writer);
+    defer deinitProjectionApp(&app, gpa);
+
+    try app.transcript.append(gpa, try testEntry(gpa, .intro, false, "introxx"));
+    try app.transcript.append(gpa, try testEntry(gpa, .user, false, "useryy"));
+    try app.transcript.append(gpa, try testEntry(gpa, .model, false, "replyzz"));
+
+    try app.project(.{ .columns = 40, .rows = 24 }, test_status);
+
+    const painted = out.written();
+    const intro = std.mem.indexOf(u8, painted, "introxx").?;
+    const user = std.mem.indexOf(u8, painted, "useryy").?;
+    const reply = std.mem.indexOf(u8, painted, "replyzz").?;
+    const footer = std.mem.indexOf(u8, painted, "footerqq").?;
+    // Screen order top → bottom: intro, user box, model reply, then the footer.
+    try std.testing.expect(intro < user);
+    try std.testing.expect(user < reply);
+    try std.testing.expect(reply < footer);
+    // A small model in a tall window clips nothing, so the frame fits one page.
+    try std.testing.expect(paintedRows(painted) < 24);
+}
+
+// When the transcript overflows the window, the oldest visible block is clipped
+// to fill it exactly: the frame is `rows * window_pages` rows, that block's top
+// rows dropped while its newest content and the chrome below still show.
+test "projection clips the oldest block to fill the window exactly" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var app: App = undefined;
+    projectionApp(&app, gpa, &out.writer);
+    defer deinitProjectionApp(&app, gpa);
+
+    var text: std.ArrayList(u8) = .empty;
+    for (0..60) |i| {
+        if (i > 0) try text.append(gpa, '\n');
+        var buffer: [8]u8 = undefined;
+        try text.appendSlice(gpa, std.fmt.bufPrint(&buffer, "L{d}", .{i}) catch unreachable);
+    }
+    try app.transcript.append(gpa, .{ .kind = .model, .is_error = false, .text = text });
+
+    const rows: usize = 4;
+    try app.project(.{ .columns = 40, .rows = rows }, test_status);
+
+    const painted = out.written();
+    try std.testing.expectEqual(rows * window_pages, paintedRows(painted));
+    // The clip drops its top rows: its last line shows, its first does not, and
+    // the chrome still sits at the bottom.
+    try std.testing.expect(std.mem.indexOf(u8, painted, "L59") != null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "L0") == null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "footerqq") != null);
 }
