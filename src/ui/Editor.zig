@@ -1,4 +1,4 @@
-//! The input-line editing model: a UTF-8 text buffer with a codepoint caret.
+//! The input-line editing model: a UTF-8 text buffer with a grapheme-cluster caret.
 //!
 //! It owns editing state only. Submitting, quitting, and drawing are the
 //! caller's job; `render` produces the display lines and, when focused, reports
@@ -42,6 +42,11 @@ pub fn insertCodepoint(self: *Editor, codepoint: u21) !void {
 pub fn insert(self: *Editor, bytes: []const u8) !void {
     try self.text.insertSlice(self.gpa, self.caret, bytes);
     self.caret += bytes.len;
+    // Inserted text can fuse with what follows into a single cluster; advance
+    // the caret to that cluster's end so it stays on a grapheme boundary.
+    var index = self.previousBoundary();
+    while (index < self.caret) index += self.stepFrom(index);
+    self.caret = index;
 }
 
 pub fn backspace(self: *Editor) void {
@@ -135,18 +140,11 @@ pub fn render(
 }
 
 fn stepFrom(self: *const Editor, index: usize) usize {
-    const length = std.unicode.utf8ByteSequenceLength(self.text.items[index]) catch return 1;
-    return @min(length, self.text.items.len - index);
+    return terminal.grapheme.stepAt(self.text.items[index..]).bytes;
 }
 
 fn previousBoundary(self: *const Editor) usize {
-    var index = self.caret - 1;
-    while (index > 0 and isContinuation(self.text.items[index])) index -= 1;
-    return index;
-}
-
-fn isContinuation(byte: u8) bool {
-    return byte & 0b1100_0000 == 0b1000_0000;
+    return terminal.grapheme.boundaryBefore(self.text.items, self.caret);
 }
 
 test "insert and content" {
@@ -179,6 +177,80 @@ test "multibyte backspace deletes whole codepoint" {
     try std.testing.expectEqual(@as(usize, 2), editor.text.items.len);
     editor.backspace();
     try std.testing.expectEqual(@as(usize, 0), editor.text.items.len);
+}
+
+test "backspace deletes a whole grapheme cluster" {
+    var editor = Editor.init(std.testing.allocator);
+    defer editor.deinit();
+    // Base emoji plus skin-tone modifier is one cluster.
+    try editor.insert("👍\u{1F3FD}");
+    editor.backspace();
+    try std.testing.expectEqualStrings("", editor.content());
+    // Base letter plus a combining mark.
+    try editor.insert("e\u{0301}");
+    editor.backspace();
+    try std.testing.expectEqualStrings("", editor.content());
+    // A regional-indicator flag is one cluster of two indicators.
+    try editor.insert("🇯🇵");
+    editor.backspace();
+    try std.testing.expectEqualStrings("", editor.content());
+    // A four-emoji ZWJ family folds into one cluster.
+    try editor.insert("👨\u{200D}👩\u{200D}👧\u{200D}👦");
+    editor.backspace();
+    try std.testing.expectEqualStrings("", editor.content());
+}
+
+test "backspace peels one cluster at a time and leaves neighbours intact" {
+    var editor = Editor.init(std.testing.allocator);
+    defer editor.deinit();
+    try editor.insert("a👍\u{1F3FD}b");
+    editor.backspace();
+    try std.testing.expectEqualStrings("a👍\u{1F3FD}", editor.content());
+    editor.backspace();
+    try std.testing.expectEqualStrings("a", editor.content());
+    editor.backspace();
+    try std.testing.expectEqualStrings("", editor.content());
+}
+
+test "insert keeps the caret on a cluster boundary when text fuses" {
+    var editor = Editor.init(std.testing.allocator);
+    defer editor.deinit();
+    // Typing a base letter before a dangling combining mark lands the caret
+    // after the completed cluster, not inside it.
+    try editor.insert("\u{0301}");
+    editor.moveHome();
+    try editor.insert("e");
+    try std.testing.expectEqualStrings("e\u{0301}", editor.content());
+    try std.testing.expectEqual(@as(usize, 3), editor.caret);
+    editor.backspace();
+    try std.testing.expectEqualStrings("", editor.content());
+    // Typing one regional indicator before another completes a flag; the caret
+    // sits after the whole two-column glyph.
+    try editor.insert("🇵");
+    editor.moveHome();
+    try editor.insert("🇯");
+    try std.testing.expectEqualStrings("🇯🇵", editor.content());
+    try std.testing.expectEqual(@as(usize, 8), editor.caret);
+}
+
+test "left and right move by whole grapheme cluster" {
+    var editor = Editor.init(std.testing.allocator);
+    defer editor.deinit();
+    // "a"(1) + skin-tone cluster(8) + "b"(1): boundaries at 0, 1, 9, 10.
+    try editor.insert("a👍\u{1F3FD}b");
+    try std.testing.expectEqual(@as(usize, 10), editor.caret);
+    editor.moveLeft();
+    try std.testing.expectEqual(@as(usize, 9), editor.caret);
+    editor.moveLeft();
+    try std.testing.expectEqual(@as(usize, 1), editor.caret);
+    editor.moveLeft();
+    try std.testing.expectEqual(@as(usize, 0), editor.caret);
+    editor.moveRight();
+    try std.testing.expectEqual(@as(usize, 1), editor.caret);
+    editor.moveRight();
+    try std.testing.expectEqual(@as(usize, 9), editor.caret);
+    editor.moveRight();
+    try std.testing.expectEqual(@as(usize, 10), editor.caret);
 }
 
 test render {

@@ -160,18 +160,17 @@ Extension seams referenced here:
       rule GB9c) and Extended_Pictographic (for GB11). `grapheme.stepAt` implements the full GB1–GB13
       rule set and is verified against the vendored `GraphemeBreakTest.txt` conformance corpus.
 
-- [ ] **Grapheme-cluster caret movement.** `Editor` moves the caret and backspaces by UTF-8
-      codepoint (`stepFrom` advances one codepoint; `previousBoundary` walks back over continuation
-      bytes), while rendering measures by grapheme cluster (`terminal.width` + `grapheme`). The two
-      diverge on multi-codepoint clusters — a combining mark, a ZWJ emoji (`👨‍👩‍👧‍👦`), a
-      regional-indicator flag, a skin-tone modifier, a keycap — so the caret can land inside a
-      cluster and a backspace can strip one codepoint of a glyph rather than the whole thing. Move by
-      cluster instead. `grapheme.stepAt` is forward-only and needs a known cluster start, and UAX #29
-      breaking depends on preceding context, so backward movement must re-segment forward from a
-      known boundary (start of line or text) rather than scan backward byte by byte. Needs a
-      backward-capable boundary helper beside `stepAt` (or Editor-tracked cluster boundaries), used
-      by `moveLeft`/`moveRight`/`backspace`; once movement guarantees cluster boundaries,
-      `width.caret`'s precondition tightens from codepoint back to grapheme cluster.
+- [x] **Grapheme-cluster caret movement.** `Editor` moves the caret and backspaces by grapheme
+      cluster, matching the grapheme-cluster measurement rendering already uses (`terminal.width` +
+      `grapheme`). `grapheme.stepAt` is forward-only and needs a known cluster start, and UAX #29
+      breaking depends on preceding context, so backward movement re-segments forward from the start
+      of `text` rather than scanning backward byte by byte: `grapheme.boundaryBefore` sits beside
+      `stepAt` and backs `Editor.previousBoundary`, while `stepFrom` advances one cluster via
+      `stepAt`. `moveLeft`/`moveRight`/`backspace` step by whole cluster — a combining mark, a ZWJ
+      emoji (`👨‍👩‍👧‍👦`), a regional-indicator flag, a skin-tone modifier, a keycap — so the caret can no
+      longer land inside a cluster and a backspace deletes the whole glyph, and `insert` advances the
+      caret past any cluster its text fuses into. Editing and movement now keep the caret on cluster
+      boundaries, so `width.caret`'s precondition tightened from codepoint to grapheme cluster.
 
 - [ ] **Sticky goal column for vertical caret movement.** `Editor.moveUp`/`moveDown` recompute the
       target column from the live caret each step, so a vertical move through a row shorter than the

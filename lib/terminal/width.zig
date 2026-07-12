@@ -128,7 +128,7 @@ pub const Caret = struct { rows_before: usize, column: usize };
 /// suffix cannot change the answer. Built on `wrapper`, so it mirrors `wrap` for
 /// free: a wide cluster near the margin pushes the caret to the next row, and a
 /// trailing `\n` (or an empty line between newlines) lands it at column 0 of a
-/// fresh row. `text` must end on a codepoint boundary.
+/// fresh row. `text` must end on a grapheme cluster boundary.
 pub fn caret(text: []const u8, columns_max: usize) Caret {
     var iterator = wrapper(text, columns_max);
     var result: Caret = .{ .rows_before = 0, .column = 0 };
