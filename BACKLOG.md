@@ -172,15 +172,15 @@ Extension seams referenced here:
       caret past any cluster its text fuses into. Editing and movement now keep the caret on cluster
       boundaries, so `width.caret`'s precondition tightened from codepoint to grapheme cluster.
 
-- [ ] **Sticky goal column for vertical caret movement.** `Editor.moveUp`/`moveDown` recompute the
-      target column from the live caret each step, so a vertical move through a row shorter than the
-      caret's column clamps the column and then continues from the clamped position — stepping down
-      through a short line loses the original column instead of restoring it on the next long line,
-      unlike most editors. Track a desired display column set by the last horizontal move or edit and
-      target it on every vertical step, clamping the result for display without overwriting the goal;
-      reset the goal whenever a horizontal move, an edit, or `home`/`end` moves the caret.
-      `terminal.width.offsetAt` already maps a display `(row, column)` to a byte offset, so the work
-      is a goal-column field on `Editor` plus targeting it instead of the live column.
+- [x] **Sticky goal column for vertical caret movement.** `Editor` carries an optional
+      `goal_column`: the first `moveUp`/`moveDown` of a run captures the caret's display column into
+      it, and every subsequent vertical step targets that column via `terminal.width.offsetAt`
+      instead of the live one. A row shorter than the goal clamps the caret for display without
+      overwriting the goal, so a later step onto a wider row restores the column — the way most
+      editors behave. Any horizontal move or edit (`moveLeft`/`moveRight`/`moveHome`/`moveEnd`/
+      `insert`/`backspace`/`clear`) resets the goal to null so the next vertical run recaptures it. A
+      vertical move off the top or bottom row falls back to `moveHome`/`moveEnd`, so pressing up on
+      the first row jumps to the start and down on the last row jumps to the end.
 
 - [ ] **Extract block rendering into a `ui` widget + shared color namespace.** `src/App.zig` is both
       the composition root and the renderer for every transcript block

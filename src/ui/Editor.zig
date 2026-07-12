@@ -15,9 +15,15 @@ const Editor = @This();
 gpa: std.mem.Allocator,
 text: std.ArrayList(u8),
 caret: usize,
+/// Desired display column for vertical movement, remembered across consecutive
+/// `moveUp`/`moveDown` so a step through a shorter row does not forget it. Null
+/// until a vertical step captures the caret's column; a horizontal move, an
+/// edit, or a vertical move off the top or bottom row (which falls back to
+/// `moveHome`/`moveEnd`) clears it back to null.
+goal_column: ?usize,
 
 pub fn init(gpa: std.mem.Allocator) Editor {
-    return .{ .gpa = gpa, .text = .empty, .caret = 0 };
+    return .{ .gpa = gpa, .text = .empty, .caret = 0, .goal_column = null };
 }
 
 pub fn deinit(self: *Editor) void {
@@ -31,6 +37,7 @@ pub fn content(self: *const Editor) []const u8 {
 pub fn clear(self: *Editor) void {
     self.text.clearRetainingCapacity();
     self.caret = 0;
+    self.goal_column = null;
 }
 
 pub fn insertCodepoint(self: *Editor, codepoint: u21) !void {
@@ -40,6 +47,7 @@ pub fn insertCodepoint(self: *Editor, codepoint: u21) !void {
 }
 
 pub fn insert(self: *Editor, bytes: []const u8) !void {
+    self.goal_column = null;
     try self.text.insertSlice(self.gpa, self.caret, bytes);
     self.caret += bytes.len;
     // Inserted text can fuse with what follows into a single cluster; advance
@@ -50,6 +58,7 @@ pub fn insert(self: *Editor, bytes: []const u8) !void {
 }
 
 pub fn backspace(self: *Editor) void {
+    self.goal_column = null;
     if (self.caret == 0) return;
     const previous = self.previousBoundary();
     const removed = self.caret - previous;
@@ -59,43 +68,61 @@ pub fn backspace(self: *Editor) void {
 }
 
 pub fn moveLeft(self: *Editor) void {
+    self.goal_column = null;
     if (self.caret > 0) self.caret = self.previousBoundary();
 }
 
 pub fn moveRight(self: *Editor) void {
+    self.goal_column = null;
     if (self.caret < self.text.items.len) self.caret += self.stepFrom(self.caret);
 }
 
 pub fn moveHome(self: *Editor) void {
+    self.goal_column = null;
     self.caret = 0;
 }
 
 pub fn moveEnd(self: *Editor) void {
+    self.goal_column = null;
     self.caret = self.text.items.len;
 }
 
-/// Move the caret one wrapped row up, staying at the same display column (or the
-/// nearest one the shorter row allows), a no-op on the top row. `columns` is the
-/// wrap width `render` is given, so vertical steps follow the same row layout.
+/// Move the caret one wrapped row up, targeting the sticky goal column (the
+/// column a run of vertical moves began at). On the top row it falls back to
+/// `moveHome`, jumping to the start. The caret clamps to the target row's end
+/// without disturbing the goal, so a later step onto a wider row restores the
+/// column. `columns` is the wrap width `render` is given, so vertical steps
+/// follow the same row layout.
 pub fn moveUp(self: *Editor, columns: usize) void {
     const columns_max = @max(columns, 1);
     const position = terminal.width.caret(self.text.items[0..self.caret], columns_max);
-    if (position.rows_before == 0) return;
+    if (position.rows_before == 0) {
+        self.moveHome();
+        return;
+    }
+    const goal = self.goal_column orelse position.column;
+    self.goal_column = goal;
     self.caret = terminal.width.offsetAt(self.text.items, columns_max, .{
         .rows_before = position.rows_before - 1,
-        .column = position.column,
+        .column = goal,
     });
 }
 
-/// Move the caret one wrapped row down, staying at the same display column (or
-/// the nearest one the shorter row allows), a no-op on the bottom row.
+/// Move the caret one wrapped row down, targeting the sticky goal column; on the
+/// bottom row it falls back to `moveEnd`, jumping to the end. See `moveUp` for
+/// how the goal column persists.
 pub fn moveDown(self: *Editor, columns: usize) void {
     const columns_max = @max(columns, 1);
     const position = terminal.width.caret(self.text.items[0..self.caret], columns_max);
-    if (position.rows_before + 1 >= terminal.width.rows(self.text.items, columns_max)) return;
+    if (position.rows_before + 1 >= terminal.width.rows(self.text.items, columns_max)) {
+        self.moveEnd();
+        return;
+    }
+    const goal = self.goal_column orelse position.column;
+    self.goal_column = goal;
     self.caret = terminal.width.offsetAt(self.text.items, columns_max, .{
         .rows_before = position.rows_before + 1,
-        .column = position.column,
+        .column = goal,
     });
 }
 
@@ -346,16 +373,32 @@ test "moveUp and moveDown across wrapped continuation rows" {
     try std.testing.expectEqual(@as(usize, 1), editor.caret);
 }
 
-test "moveUp and moveDown are no-ops at the top and bottom rows" {
+test "moveUp off the top row jumps to the start and clears the goal" {
     var editor = Editor.init(std.testing.allocator);
     defer editor.deinit();
-    try editor.insert("hello\nworld");
-    editor.caret = 2; // Top row.
-    editor.moveUp(80);
-    try std.testing.expectEqual(@as(usize, 2), editor.caret);
-    editor.caret = 9; // Bottom row.
-    editor.moveDown(80);
-    try std.testing.expectEqual(@as(usize, 9), editor.caret);
+    try editor.insert("abcdef\nxyz\nghijkl");
+    editor.caret = 16; // Row 2, column 5.
+    editor.moveUp(80); // Row 1, clamped to column 3.
+    editor.moveUp(80); // Row 0, back at column 5 via the goal.
+    try std.testing.expectEqual(@as(usize, 5), editor.caret);
+    try std.testing.expectEqual(@as(?usize, 5), editor.goal_column);
+    editor.moveUp(80); // Top row: jump to the very start.
+    try std.testing.expectEqual(@as(usize, 0), editor.caret);
+    try std.testing.expectEqual(@as(?usize, null), editor.goal_column);
+}
+
+test "moveDown off the bottom row jumps to the end and clears the goal" {
+    var editor = Editor.init(std.testing.allocator);
+    defer editor.deinit();
+    try editor.insert("abcdef\nxyz\nghijkl");
+    editor.caret = 1; // Row 0, column 1.
+    editor.moveDown(80); // Row 1, column 1.
+    editor.moveDown(80); // Row 2, column 1.
+    try std.testing.expectEqual(@as(usize, 12), editor.caret);
+    try std.testing.expectEqual(@as(?usize, 1), editor.goal_column);
+    editor.moveDown(80); // Bottom row: jump to the very end.
+    try std.testing.expectEqual(@as(usize, 17), editor.caret);
+    try std.testing.expectEqual(@as(?usize, null), editor.goal_column);
 }
 
 test "moveDown lands on the visually adjacent row at the same column" {
@@ -372,6 +415,47 @@ test "moveDown lands on the visually adjacent row at the same column" {
     const after = try editor.render(80, true, &buffer, &lines);
     try std.testing.expectEqual(before.?.row + 1, after.?.row);
     try std.testing.expectEqual(before.?.column, after.?.column);
+}
+
+test "vertical movement keeps a sticky goal column across a shorter row" {
+    var editor = Editor.init(std.testing.allocator);
+    defer editor.deinit();
+    try editor.insert("abcdef\nxy\nghijkl");
+    editor.caret = 5; // Row 0, column 5.
+    editor.moveDown(80);
+    // "xy" is only two columns, so the caret clamps to its end.
+    try std.testing.expectEqual(@as(usize, 9), editor.caret);
+    editor.moveDown(80);
+    // The goal column survives the short row and lands at column 5 again.
+    try std.testing.expectEqual(@as(usize, 15), editor.caret);
+    editor.moveUp(80);
+    try std.testing.expectEqual(@as(usize, 9), editor.caret);
+    editor.moveUp(80);
+    try std.testing.expectEqual(@as(usize, 5), editor.caret);
+}
+
+test "a horizontal move resets the vertical goal column" {
+    var editor = Editor.init(std.testing.allocator);
+    defer editor.deinit();
+    try editor.insert("abcdef\nxy\nghijkl");
+    editor.caret = 5; // Row 0, column 5.
+    editor.moveDown(80); // Clamps to column 2 at the end of "xy".
+    editor.moveLeft(); // Column 1, and the old goal is forgotten.
+    editor.moveDown(80);
+    // The recaptured goal is column 1, not the original 5.
+    try std.testing.expectEqual(@as(usize, 11), editor.caret);
+}
+
+test "an edit resets the vertical goal column" {
+    var editor = Editor.init(std.testing.allocator);
+    defer editor.deinit();
+    try editor.insert("abcdef\nxy\nghijkl");
+    editor.caret = 5; // Row 0, column 5.
+    editor.moveDown(80); // Clamps to column 2 at the end of "xy".
+    try editor.insert("z"); // "xyz"; the edit forgets the old goal.
+    editor.moveDown(80);
+    // The recaptured goal is column 3, after "xyz", not the original 5.
+    try std.testing.expectEqual(@as(usize, 14), editor.caret);
 }
 
 test "moving right across blank lines does not skip rows" {
