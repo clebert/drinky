@@ -173,6 +173,16 @@ Extension seams referenced here:
       by `moveLeft`/`moveRight`/`backspace`; once movement guarantees cluster boundaries,
       `width.caret`'s precondition tightens from codepoint back to grapheme cluster.
 
+- [ ] **Sticky goal column for vertical caret movement.** `Editor.moveUp`/`moveDown` recompute the
+      target column from the live caret each step, so a vertical move through a row shorter than the
+      caret's column clamps the column and then continues from the clamped position — stepping down
+      through a short line loses the original column instead of restoring it on the next long line,
+      unlike most editors. Track a desired display column set by the last horizontal move or edit and
+      target it on every vertical step, clamping the result for display without overwriting the goal;
+      reset the goal whenever a horizontal move, an edit, or `home`/`end` moves the caret.
+      `terminal.width.offsetAt` already maps a display `(row, column)` to a byte offset, so the work
+      is a goal-column field on `Editor` plus targeting it instead of the live column.
+
 - [ ] **Extract block rendering into a `ui` widget + shared color namespace.** `src/App.zig` is both
       the composition root and the renderer for every transcript block
       (`renderBox`/`renderStyledLines`/`renderWrapped`/`pushBox*`) with a module-level color

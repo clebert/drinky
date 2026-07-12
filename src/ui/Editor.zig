@@ -69,6 +69,31 @@ pub fn moveEnd(self: *Editor) void {
     self.caret = self.text.items.len;
 }
 
+/// Move the caret one wrapped row up, staying at the same display column (or the
+/// nearest one the shorter row allows), a no-op on the top row. `columns` is the
+/// wrap width `render` is given, so vertical steps follow the same row layout.
+pub fn moveUp(self: *Editor, columns: usize) void {
+    const columns_max = @max(columns, 1);
+    const position = terminal.width.caret(self.text.items[0..self.caret], columns_max);
+    if (position.rows_before == 0) return;
+    self.caret = terminal.width.offsetAt(self.text.items, columns_max, .{
+        .rows_before = position.rows_before - 1,
+        .column = position.column,
+    });
+}
+
+/// Move the caret one wrapped row down, staying at the same display column (or
+/// the nearest one the shorter row allows), a no-op on the bottom row.
+pub fn moveDown(self: *Editor, columns: usize) void {
+    const columns_max = @max(columns, 1);
+    const position = terminal.width.caret(self.text.items[0..self.caret], columns_max);
+    if (position.rows_before + 1 >= terminal.width.rows(self.text.items, columns_max)) return;
+    self.caret = terminal.width.offsetAt(self.text.items, columns_max, .{
+        .rows_before = position.rows_before + 1,
+        .column = position.column,
+    });
+}
+
 /// Build the wrapped display lines into `buffer`/`lines` (both cleared first),
 /// returning the caret's `(sub-row, column)` within `lines` when `focused`, else
 /// null. `sub-row` is an index into `lines`; the caller adds the block's base to
@@ -215,6 +240,66 @@ test "consecutive newlines each add an occupiable row" {
     defer lines.deinit(std.testing.allocator);
     const caret = try editor.render(80, true, &buffer, &lines);
     try std.testing.expectEqual(@as(?terminal.View.Caret, .{ .row = 3, .column = 0 }), caret);
+}
+
+test "moveUp and moveDown across newline lines" {
+    var editor = Editor.init(std.testing.allocator);
+    defer editor.deinit();
+    try editor.insert("hello\nworld");
+    editor.caret = 3; // Row 0, column 3, between the two 'l's.
+    editor.moveDown(80);
+    try std.testing.expectEqual(@as(usize, 9), editor.caret); // Row 1, column 3.
+    editor.moveUp(80);
+    try std.testing.expectEqual(@as(usize, 3), editor.caret);
+}
+
+test "moveDown clamps to a shorter target row" {
+    var editor = Editor.init(std.testing.allocator);
+    defer editor.deinit();
+    try editor.insert("abcdef\nxy");
+    editor.caret = 5; // Row 0, column 5.
+    editor.moveDown(80);
+    // "xy" is only two columns wide, so the caret clamps to its end.
+    try std.testing.expectEqual(@as(usize, 9), editor.caret);
+}
+
+test "moveUp and moveDown across wrapped continuation rows" {
+    var editor = Editor.init(std.testing.allocator);
+    defer editor.deinit();
+    try editor.insert("abcdef");
+    editor.caret = 1; // Wrapped at width 3: row 0, column 1.
+    editor.moveDown(3);
+    try std.testing.expectEqual(@as(usize, 4), editor.caret); // Row 1, column 1.
+    editor.moveUp(3);
+    try std.testing.expectEqual(@as(usize, 1), editor.caret);
+}
+
+test "moveUp and moveDown are no-ops at the top and bottom rows" {
+    var editor = Editor.init(std.testing.allocator);
+    defer editor.deinit();
+    try editor.insert("hello\nworld");
+    editor.caret = 2; // Top row.
+    editor.moveUp(80);
+    try std.testing.expectEqual(@as(usize, 2), editor.caret);
+    editor.caret = 9; // Bottom row.
+    editor.moveDown(80);
+    try std.testing.expectEqual(@as(usize, 9), editor.caret);
+}
+
+test "moveDown lands on the visually adjacent row at the same column" {
+    var editor = Editor.init(std.testing.allocator);
+    defer editor.deinit();
+    try editor.insert("hello\nworld");
+    editor.caret = 3;
+    var buffer: std.ArrayList(u8) = .empty;
+    defer buffer.deinit(std.testing.allocator);
+    var lines: std.ArrayList([]const u8) = .empty;
+    defer lines.deinit(std.testing.allocator);
+    const before = try editor.render(80, true, &buffer, &lines);
+    editor.moveDown(80);
+    const after = try editor.render(80, true, &buffer, &lines);
+    try std.testing.expectEqual(before.?.row + 1, after.?.row);
+    try std.testing.expectEqual(before.?.column, after.?.column);
 }
 
 test "moving right across blank lines does not skip rows" {

@@ -215,6 +215,8 @@ fn handleKey(self: *App, event: terminal.Input.Key) !void {
         .backspace => self.editor.backspace(),
         .left => self.editor.moveLeft(),
         .right => self.editor.moveRight(),
+        .up => self.editor.moveUp(self.columns),
+        .down => self.editor.moveDown(self.columns),
         .home => self.editor.moveHome(),
         .end => self.editor.moveEnd(),
         .enter => return self.submit(),
@@ -233,7 +235,7 @@ fn handleKey(self: *App, event: terminal.Input.Key) !void {
             'j' => try self.editor.insert("\n"),
             else => return,
         },
-        .escape, .up, .down, .unknown => return,
+        .escape, .unknown => return,
     }
     try self.refresh();
 }
