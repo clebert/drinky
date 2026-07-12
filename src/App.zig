@@ -32,24 +32,6 @@ const system_prompt =
 
 const intro_text = "pith — enter: send · shift+enter: newline · esc: cancel · ctrl+c: clear (twice: quit) · ctrl+d: quit";
 
-const dim = "\x1b[2m";
-const red = "\x1b[31m";
-const reset = "\x1b[0m";
-const user_bg = "\x1b[48;2;52;53;65m";
-const user_fg = "\x1b[38;2;212;212;212m";
-const tool_fg = "\x1b[38;2;212;212;212m";
-const tool_pending_bg = "\x1b[48;2;40;40;50m";
-const tool_success_bg = "\x1b[48;2;40;50;40m";
-const tool_error_bg = "\x1b[48;2;60;40;40m";
-const accent_fg = "\x1b[38;2;138;190;183m";
-const muted_fg = "\x1b[38;2;128;128;128m";
-
-/// Braille frames for the "Working…" spinner, advanced one step per stream event.
-const spinner_frames = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };
-
-/// Display width of the full `⠋ Working…` spinner: glyph, space, and message.
-const spinner_columns = 10;
-
 /// Two Ctrl+C presses within this window quit; a lone press clears the editor.
 const ctrl_c_window_ms = 500;
 
@@ -65,17 +47,11 @@ const picker_id = std.math.maxInt(usize) - 2;
 const editor_id = std.math.maxInt(usize) - 1;
 const status_id = std.math.maxInt(usize);
 
-const BoxStyle = struct { background: []const u8, foreground: []const u8 };
-
-/// A notice's look: the SGR style opening every line and a prefix (an error tag,
-/// or empty) printed before each line's text.
-const Notice = struct { style: []const u8, prefix: []const u8 };
-
 /// One screen component: a transcript block or a piece of chrome (the running
 /// tool's box, the spinner, the editor, the picker, or the status line). Laid
 /// out by `measure` and `renderSlot`, which switch on the tag.
 const Component = union(enum) {
-    entry: *const Entry,
+    entry: *const ui.block.Entry,
     tool_box,
     spinner,
     editor,
@@ -86,17 +62,6 @@ const Component = union(enum) {
 /// A component in screen order: its content, the stable anchor `id` its rows
 /// carry, and whether a blank separator row precedes it as its line 0.
 const Slot = struct { component: Component, id: usize, leading_blank: bool };
-
-/// One transcript block. `text` is the source; each frame wraps and styles it
-/// into rows by its `kind`. The model-text block grows in place as its reply
-/// streams.
-const Entry = struct {
-    kind: Kind,
-    is_error: bool,
-    text: std.ArrayList(u8),
-
-    const Kind = enum { intro, user, model, tool_result, feedback };
-};
 
 /// The tool call currently running: its blue box shows in the live tail for the
 /// whole blocking call. Both strings are owned and freed on completion.
@@ -117,7 +82,7 @@ editor: ui.Editor,
 auth: ai.anthropic.Auth,
 agent: ai.Agent,
 /// The permanent blocks above the live tail, oldest first.
-transcript: std.ArrayList(Entry),
+transcript: std.ArrayList(ui.block.Entry),
 /// Index into `transcript` of the model-text block for the current text run, so
 /// streamed deltas keep appending to it until a tool call or turn boundary.
 current_model: ?usize,
@@ -301,7 +266,7 @@ fn project(self: *App, size: terminal.View.Size, status: ui.status.Info) !void {
     while (reverse > 0) {
         reverse -= 1;
         const slot = slotAt(slots, self.transcript.items, reverse);
-        const placement: Placement = .{
+        const placement: ui.paint.Placement = .{
             .sink = sink,
             .id = slot.id,
             .columns = self.columns,
@@ -348,7 +313,7 @@ fn chromeSlots(self: *App, out: *[4]Slot, status: ui.status.Info) !usize {
 
 /// The component `reverse` steps back from the newest: the chrome first (its
 /// newest last), then the transcript newest → oldest.
-fn slotAt(chrome: []const Slot, transcript: []const Entry, reverse: usize) Slot {
+fn slotAt(chrome: []const Slot, transcript: []const ui.block.Entry, reverse: usize) Slot {
     if (reverse < chrome.len) return chrome[chrome.len - 1 - reverse];
     const index = transcript.len - 1 - (reverse - chrome.len);
     return .{ .component = .{ .entry = &transcript[index] }, .id = index, .leading_blank = index > 0 };
@@ -359,189 +324,42 @@ fn slotAt(chrome: []const Slot, transcript: []const Entry, reverse: usize) Slot 
 fn measure(self: *App, slot: Slot, columns: usize) usize {
     const lead: usize = if (slot.leading_blank) 1 else 0;
     return lead + switch (slot.component) {
-        .entry => |entry| entryRows(entry, columns),
-        .tool_box => 2 + terminal.width.rows(self.tool_buffer.items, boxInner(columns)),
+        .entry => |entry| entry.rows(columns),
+        .tool_box => ui.paint.boxRows(self.tool_buffer.items, columns),
         .spinner, .status => 1,
         .editor, .picker => self.lines.items.len,
     };
 }
 
-fn entryRows(entry: *const Entry, columns: usize) usize {
-    const text = entry.text.items;
-    return switch (entry.kind) {
-        .intro, .feedback => std.mem.count(u8, text, "\n") + 1,
-        .user, .tool_result => 2 + terminal.width.rows(text, boxInner(columns)),
-        .model => terminal.width.rows(text, @max(columns, 1)),
-    };
-}
-
-/// The wrap width inside a box: two columns narrower than the terminal, one for
-/// the left pad and one to keep the fill off the last cell.
-fn boxInner(columns: usize) usize {
-    return @max(columns -| 2, 1);
-}
-
 fn freeTranscript(self: *App) void {
-    for (self.transcript.items) |*entry| entry.text.deinit(self.gpa);
+    for (self.transcript.items) |*entry| entry.deinit(self.gpa);
 }
-
-/// Where a component composes its rows: the sink to write into, the anchor `id`
-/// its rows carry, the terminal width, the line its content starts at (`base`,
-/// after any leading separator), and how many of its top rows to drop (`skip`,
-/// nonzero only for the clip).
-const Placement = struct {
-    sink: *terminal.View.Sink,
-    id: usize,
-    columns: usize,
-    base: usize,
-    skip: usize,
-};
 
 /// Compose `slot`'s rows through `placement`, dropping its top `skip` rows
 /// (nonzero only for the clip). Its leading separator, when present, is line 0
 /// and content follows from `base`.
-fn renderSlot(self: *App, slot: Slot, placement: *const Placement) !void {
+fn renderSlot(self: *App, slot: Slot, placement: *const ui.paint.Placement) !void {
     if (slot.leading_blank and placement.skip == 0) {
         _ = placement.sink.begin();
         placement.sink.end(.{ .id = placement.id, .line = 0 });
     }
     switch (slot.component) {
-        .entry => |entry| try renderEntry(entry, placement),
-        .tool_box => try renderBox(
+        .entry => |entry| try entry.render(placement),
+        .tool_box => try ui.paint.box(
             placement,
-            .{ .background = tool_pending_bg, .foreground = tool_fg },
+            .{ .background = ui.color.tool_pending_bg, .foreground = ui.color.tool_fg },
             self.tool_buffer.items,
         ),
-        .spinner => try self.renderSpinner(placement),
-        .status => try renderSingle(placement, self.status_buffer.items),
+        .spinner => try ui.paint.spinner(placement, self.spinner_frame),
+        .status => try ui.paint.row(placement, self.status_buffer.items),
         .editor => try self.renderLines(placement, true),
         .picker => try self.renderLines(placement, false),
     }
 }
 
-fn renderEntry(entry: *const Entry, placement: *const Placement) !void {
-    const text = entry.text.items;
-    switch (entry.kind) {
-        .intro => try renderNotice(placement, .{ .style = dim, .prefix = "" }, text),
-        .feedback => try renderNotice(placement, .{
-            .style = if (entry.is_error) red else dim,
-            .prefix = if (entry.is_error) "error: " else "",
-        }, text),
-        .user => try renderBox(placement, .{ .background = user_bg, .foreground = user_fg }, text),
-        .tool_result => try renderBox(placement, .{
-            .background = if (entry.is_error) tool_error_bg else tool_success_bg,
-            .foreground = tool_fg,
-        }, text),
-        .model => try renderWrapped(placement, text),
-    }
-}
-
-/// Each `\n`-separated line of `text`, styled and truncated to one row, with the
-/// notice's prefix on every line (a notice, error, or the intro).
-fn renderNotice(placement: *const Placement, notice: Notice, text: []const u8) !void {
-    var pieces = std.mem.splitScalar(u8, text, '\n');
-    var index: usize = 0;
-    while (pieces.next()) |piece| : (index += 1) {
-        const line = placement.base + index;
-        if (line < placement.skip) continue;
-        const shown_prefix = terminal.width.truncate(notice.prefix, placement.columns);
-        const available = placement.columns - terminal.width.ofText(shown_prefix);
-        const clipped = terminal.width.truncate(piece, available);
-        const writer = placement.sink.begin();
-        try writer.writeAll(notice.style);
-        try writer.writeAll(shown_prefix);
-        try writer.writeAll(clipped);
-        try writer.writeAll(reset);
-        placement.sink.end(.{ .id = placement.id, .line = line });
-    }
-}
-
-/// `text` wrapped to the terminal width as plain rows (the model reply),
-/// streamed a row at a time so the clip never materializes its whole body. Each
-/// row borrows `text`, so nothing is copied but the emitted bytes.
-fn renderWrapped(placement: *const Placement, text: []const u8) !void {
-    var iterator = terminal.width.wrapper(text, @max(placement.columns, 1));
-    var index: usize = 0;
-    while (iterator.next()) |content| : (index += 1) {
-        const line = placement.base + index;
-        if (line < placement.skip) continue;
-        const writer = placement.sink.begin();
-        try writer.writeAll(content);
-        placement.sink.end(.{ .id = placement.id, .line = line });
-    }
-}
-
-/// A padded background box: a blank padding row, `text` wrapped to the inner
-/// width with a one-space left pad and the background filled to full width, then
-/// a blank padding row. Streamed a row at a time, self-separating inside the
-/// block gap around it.
-fn renderBox(placement: *const Placement, style: BoxStyle, text: []const u8) !void {
-    var line = placement.base;
-    try boxPad(placement, &line, style.background);
-    var iterator = terminal.width.wrapper(text, boxInner(placement.columns));
-    while (iterator.next()) |content| try boxLine(placement, &line, style, content);
-    try boxPad(placement, &line, style.background);
-}
-
-/// A box's blank padding row: the background filled to full width.
-fn boxPad(placement: *const Placement, line: *usize, background: []const u8) !void {
-    defer line.* += 1;
-    if (line.* < placement.skip) return;
-    const writer = placement.sink.begin();
-    try writer.writeAll(background);
-    try writer.splatByteAll(' ', placement.columns);
-    try writer.writeAll(reset);
-    placement.sink.end(.{ .id = placement.id, .line = line.* });
-}
-
-/// A box's content row: a one-space left pad, `content`, then the background
-/// filled to full width. `content` is capped to leave room for the pad, so a
-/// window too narrow for the wrap width still yields one physical row.
-fn boxLine(placement: *const Placement, line: *usize, style: BoxStyle, content: []const u8) !void {
-    defer line.* += 1;
-    if (line.* < placement.skip) return;
-    const shown = terminal.width.truncate(content, placement.columns -| 1);
-    const writer = placement.sink.begin();
-    try writer.writeAll(style.background);
-    try writer.writeAll(style.foreground);
-    try writer.writeByte(' ');
-    try writer.writeAll(shown);
-    try writer.splatByteAll(' ', placement.columns -| (1 + terminal.width.ofText(shown)));
-    try writer.writeAll(reset);
-    placement.sink.end(.{ .id = placement.id, .line = line.* });
-}
-
-/// The `⠋ Working…` spinner: accent glyph, muted message. One content row; on a
-/// window too narrow for the whole message it shows just the glyph.
-fn renderSpinner(self: *App, placement: *const Placement) !void {
-    if (placement.base < placement.skip) return;
-    const frame = spinner_frames[self.spinner_frame % spinner_frames.len];
-    const writer = placement.sink.begin();
-    try writer.writeAll(accent_fg);
-    if (placement.columns >= spinner_columns) {
-        try writer.writeAll(frame);
-        try writer.writeAll(reset);
-        try writer.writeAll(" ");
-        try writer.writeAll(muted_fg);
-        try writer.writeAll("Working…");
-    } else {
-        try writer.writeAll(terminal.width.truncate(frame, placement.columns));
-    }
-    try writer.writeAll(reset);
-    placement.sink.end(.{ .id = placement.id, .line = placement.base });
-}
-
-/// One content row of pre-composed `bytes` (the status line).
-fn renderSingle(placement: *const Placement, bytes: []const u8) !void {
-    if (placement.base < placement.skip) return;
-    const writer = placement.sink.begin();
-    try writer.writeAll(bytes);
-    placement.sink.end(.{ .id = placement.id, .line = placement.base });
-}
-
 /// The editor's or picker's materialized rows (in `lines`), placing the editor
 /// caret on its row when `with_caret`.
-fn renderLines(self: *App, placement: *const Placement, with_caret: bool) !void {
+fn renderLines(self: *App, placement: *const ui.paint.Placement, with_caret: bool) !void {
     const sink = placement.sink;
     for (self.lines.items, 0..) |content, index| {
         const line = placement.base + index;
@@ -556,29 +374,24 @@ fn renderLines(self: *App, placement: *const Placement, with_caret: bool) !void 
 /// Advance the spinner one frame. The loop is blocked during a turn, so this
 /// runs per stream event rather than on a timer.
 fn advanceSpinner(self: *App) void {
-    self.spinner_frame = (self.spinner_frame + 1) % spinner_frames.len;
+    self.spinner_frame = ui.paint.spinnerStep(self.spinner_frame);
 }
 
 /// Append a new transcript block copying `text` as its source.
-fn appendEntry(self: *App, kind: Entry.Kind, is_error: bool, text: []const u8) !void {
-    var list: std.ArrayList(u8) = .empty;
-    errdefer list.deinit(self.gpa);
-    try list.appendSlice(self.gpa, text);
-    try self.transcript.append(self.gpa, .{
-        .kind = kind,
-        .is_error = is_error,
-        .text = list,
-    });
+fn appendEntry(self: *App, kind: ui.block.Entry.Kind, is_error: bool, text: []const u8) !void {
+    var entry = try ui.block.Entry.init(self.gpa, kind, is_error, text);
+    errdefer entry.deinit(self.gpa);
+    try self.transcript.append(self.gpa, entry);
 }
 
 /// The model-text block for the current run, appending a fresh one on demand so
 /// a run of streamed text collects into a single block.
-fn currentModel(self: *App) !*Entry {
+fn currentModel(self: *App) !*std.ArrayList(u8) {
     if (self.current_model == null) {
         try self.appendEntry(.model, false, "");
         self.current_model = self.transcript.items.len - 1;
     }
-    return &self.transcript.items[self.current_model.?];
+    return &self.transcript.items[self.current_model.?].model;
 }
 
 fn submit(self: *App) !void {
@@ -686,8 +499,8 @@ fn closePicker(self: *App) void {
 
 pub fn onText(self: *App, delta: []const u8) !void {
     self.advanceSpinner();
-    const entry = try self.currentModel();
-    try entry.text.appendSlice(self.gpa, delta);
+    const text = try self.currentModel();
+    try text.appendSlice(self.gpa, delta);
     try self.refresh();
 }
 
@@ -780,108 +593,6 @@ fn paintedRows(bytes: []const u8) usize {
     return std.mem.count(u8, bytes, "\r\n") + 1;
 }
 
-fn testEntry(gpa: std.mem.Allocator, kind: Entry.Kind, is_error: bool, text: []const u8) !Entry {
-    var list: std.ArrayList(u8) = .empty;
-    try list.appendSlice(gpa, text);
-    return .{ .kind = kind, .is_error = is_error, .text = list };
-}
-
-// Rows `entry` paints into a fresh view, dropping its top `skip`. Fresh so the
-// paint is a full reprint whose rows `paintedRows` can count.
-fn renderedRows(gpa: std.mem.Allocator, entry: *const Entry, columns: usize, skip: usize) !usize {
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var view = terminal.View.init(gpa, &out.writer);
-    defer view.deinit();
-    const sink = try view.beginFrame(.{ .columns = columns, .rows = 100 }, window_pages);
-    const placement: Placement = .{ .sink = sink, .id = 0, .columns = columns, .base = 0, .skip = skip };
-    try renderEntry(entry, &placement);
-    try view.render();
-    return paintedRows(out.written());
-}
-
-// The parity contract: what `measure` counts is exactly what `renderSlot`
-// emits. Here per entry kind, with content that wraps and carries blank lines.
-test "each entry kind renders exactly the rows measure counts" {
-    const gpa = std.testing.allocator;
-    const cases = [_]struct { kind: Entry.Kind, is_error: bool, text: []const u8 }{
-        .{ .kind = .intro, .is_error = false, .text = "a single intro line" },
-        .{ .kind = .feedback, .is_error = false, .text = "first\nsecond\nthird" },
-        .{ .kind = .feedback, .is_error = true, .text = "boom" },
-        .{ .kind = .user, .is_error = false, .text = "a user message long enough to wrap across the narrow test width more than once" },
-        .{ .kind = .model, .is_error = false, .text = "model reply\nwith a blank\n\nthen a long paragraph that must wrap several rows" },
-        .{ .kind = .tool_result, .is_error = true, .text = "read foo.zig\n→ no such file" },
-        // A wide-glyph box, to exercise the narrow-width row cap.
-        .{ .kind = .user, .is_error = false, .text = "你好世界" },
-    };
-    // Includes widths narrower than a box's borders and the error prefix, where
-    // `Sink.end`'s one-row assertion pins the renderers' clamps.
-    const widths = [_]usize{ 16, 3, 2 };
-    for (cases) |case| {
-        var entry = try testEntry(gpa, case.kind, case.is_error, case.text);
-        defer entry.text.deinit(gpa);
-        for (widths) |columns|
-            try std.testing.expectEqual(entryRows(&entry, columns), try renderedRows(gpa, &entry, columns, 0));
-    }
-}
-
-// The clip drops its top `skip` rows and shows the rest; skip 0 shows all.
-test "a clipped block shows its bottom rows" {
-    const gpa = std.testing.allocator;
-    var text: std.ArrayList(u8) = .empty;
-    defer text.deinit(gpa);
-    for (0..40) |i| {
-        if (i > 0) try text.append(gpa, '\n');
-        var buffer: [8]u8 = undefined;
-        try text.appendSlice(gpa, std.fmt.bufPrint(&buffer, "L{d}", .{i}) catch unreachable);
-    }
-    const entry: Entry = .{ .kind = .model, .is_error = false, .text = text };
-    const columns = 20;
-    try std.testing.expectEqual(@as(usize, 40), entryRows(&entry, columns));
-    try std.testing.expectEqual(@as(usize, 40), try renderedRows(gpa, &entry, columns, 0));
-    try std.testing.expectEqual(@as(usize, 15), try renderedRows(gpa, &entry, columns, 25));
-}
-
-// Bounded memory: streaming a clipped block into a frame warmed to its full
-// size neither allocates nor grows a buffer — the clip's hidden top is never
-// materialized.
-test "a clipped block streams into a warmed frame without allocating" {
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
-    const gpa = failing.allocator();
-
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var view = terminal.View.init(gpa, &out.writer);
-    defer view.deinit();
-
-    var text: std.ArrayList(u8) = .empty;
-    defer text.deinit(std.testing.allocator);
-    for (0..60) |i| {
-        if (i > 0) try text.append(std.testing.allocator, '\n');
-        var buffer: [8]u8 = undefined;
-        try text.appendSlice(std.testing.allocator, std.fmt.bufPrint(&buffer, "L{d}", .{i}) catch unreachable);
-    }
-    const entry: Entry = .{ .kind = .model, .is_error = false, .text = text };
-    const columns = 20;
-
-    // Warm both frames and the output at the block's full size.
-    for (0..2) |_| {
-        const sink = try view.beginFrame(.{ .columns = columns, .rows = 100 }, window_pages);
-        const placement: Placement = .{ .sink = sink, .id = 0, .columns = columns, .base = 0, .skip = 0 };
-        try renderEntry(&entry, &placement);
-        try view.render();
-    }
-
-    // Arm: any further allocation or growth now fails.
-    failing.fail_index = failing.alloc_index;
-    failing.resize_fail_index = failing.resize_index;
-
-    const sink = try view.beginFrame(.{ .columns = columns, .rows = 100 }, window_pages);
-    const placement: Placement = .{ .sink = sink, .id = 0, .columns = columns, .base = 0, .skip = 30 };
-    try renderEntry(&entry, &placement);
-    try view.render();
-}
-
 // Wires up an `App` with only what `project` touches — the buffers, a real view
 // and editor, an empty transcript, and inert chrome — leaving the tty and agent
 // undefined, so the projection path runs end to end without either.
@@ -932,9 +643,9 @@ test "projection stacks the transcript above the chrome, newest at the bottom" {
     projectionApp(&app, gpa, &out.writer);
     defer deinitProjectionApp(&app, gpa);
 
-    try app.transcript.append(gpa, try testEntry(gpa, .intro, false, "introxx"));
-    try app.transcript.append(gpa, try testEntry(gpa, .user, false, "useryy"));
-    try app.transcript.append(gpa, try testEntry(gpa, .model, false, "replyzz"));
+    try app.appendEntry(.intro, false, "introxx");
+    try app.appendEntry(.user, false, "useryy");
+    try app.appendEntry(.model, false, "replyzz");
 
     try app.project(.{ .columns = 40, .rows = 24 }, test_status);
 
@@ -963,12 +674,13 @@ test "projection clips the oldest block to fill the window exactly" {
     defer deinitProjectionApp(&app, gpa);
 
     var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(gpa);
     for (0..60) |i| {
         if (i > 0) try text.append(gpa, '\n');
         var buffer: [8]u8 = undefined;
         try text.appendSlice(gpa, std.fmt.bufPrint(&buffer, "L{d}", .{i}) catch unreachable);
     }
-    try app.transcript.append(gpa, .{ .kind = .model, .is_error = false, .text = text });
+    try app.appendEntry(.model, false, text.items);
 
     const rows: usize = 4;
     try app.project(.{ .columns = 40, .rows = rows }, test_status);

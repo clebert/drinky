@@ -7,8 +7,7 @@ const std = @import("std");
 const ai = @import("ai");
 const terminal = @import("terminal");
 
-const dim = "\x1b[2m";
-const reset = "\x1b[0m";
+const color = @import("color.zig");
 
 pub const Info = struct {
     last: ai.llm.Usage,
@@ -35,7 +34,7 @@ pub fn render(
     const stats_columns = terminal.width.ofText(stats.items);
     const model_columns = terminal.width.ofText(info.model);
 
-    try buffer.appendSlice(gpa, dim);
+    try buffer.appendSlice(gpa, color.dim);
     if (stats_columns + model_columns + 1 <= columns) {
         try buffer.appendSlice(gpa, stats.items);
         try appendSpaces(buffer, gpa, columns - stats_columns - model_columns);
@@ -43,7 +42,7 @@ pub fn render(
     } else {
         try buffer.appendSlice(gpa, terminal.width.truncate(stats.items, columns));
     }
-    try buffer.appendSlice(gpa, reset);
+    try buffer.appendSlice(gpa, color.reset);
     return buffer.items;
 }
 

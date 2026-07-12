@@ -7,15 +7,12 @@
 
 const std = @import("std");
 
+const color = @import("color.zig");
 const separator = @import("separator.zig");
 const terminal = @import("terminal");
 
 const Picker = @This();
 
-const dim = "\x1b[2m";
-const reset = "\x1b[0m";
-const highlight = "\x1b[7m";
-const highlight_reset = "\x1b[27m";
 const hint = "↑/↓ move · enter select · esc cancel";
 
 gpa: std.mem.Allocator,
@@ -62,24 +59,24 @@ pub fn render(
     // horizontal padding.
     try separator.rule(buffer, gpa, columns);
     try buffer.appendSlice(gpa, "\n\n");
-    try buffer.appendSlice(gpa, dim);
+    try buffer.appendSlice(gpa, color.dim);
     try buffer.appendSlice(gpa, " ");
     try buffer.appendSlice(gpa, self.title);
-    try buffer.appendSlice(gpa, reset);
+    try buffer.appendSlice(gpa, color.reset);
     try buffer.appendSlice(gpa, "\n");
-    try buffer.appendSlice(gpa, dim);
+    try buffer.appendSlice(gpa, color.dim);
     try buffer.appendSlice(gpa, " ");
     try buffer.appendSlice(gpa, hint);
-    try buffer.appendSlice(gpa, reset);
+    try buffer.appendSlice(gpa, color.reset);
 
     for (self.options, 0..) |option, index| {
         const chosen = index == self.cursor;
         try buffer.appendSlice(gpa, "\n");
-        try buffer.appendSlice(gpa, if (chosen) highlight else dim);
+        try buffer.appendSlice(gpa, if (chosen) color.highlight else color.dim);
         try buffer.appendSlice(gpa, if (chosen) " > " else "   ");
         try buffer.appendSlice(gpa, option);
         if (self.marked == index) try buffer.appendSlice(gpa, " (current)");
-        try buffer.appendSlice(gpa, if (chosen) highlight_reset else reset);
+        try buffer.appendSlice(gpa, if (chosen) color.highlight_reset else color.reset);
     }
 
     // Blank padding row, then the bottom rule.
@@ -125,5 +122,5 @@ test "render shows the title, hint, options, and the current marker" {
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "Pick") != null);
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "esc cancel") != null);
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "alpha (current)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, buffer.items, highlight) != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, color.highlight) != null);
 }

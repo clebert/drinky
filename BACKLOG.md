@@ -182,21 +182,22 @@ Extension seams referenced here:
       vertical move off the top or bottom row falls back to `moveHome`/`moveEnd`, so pressing up on
       the first row jumps to the start and down on the last row jumps to the end.
 
-- [ ] **Extract block rendering into a `ui` widget + shared color namespace.** `src/App.zig` is both
-      the composition root and the renderer for every transcript block
-      (`renderBox`/`renderStyledLines`/`renderWrapped`/`pushBox*`) with a module-level color
-      palette, while `Editor`/`Picker` are self-rendering widgets with a
-      `render(columns, …, buffer, lines)` contract. Move block rendering behind that same contract
-      (a `Box`/`block` module) so blocks are unit-testable in isolation (today only the one
-      integration test covers them) and App shrinks to state + event loop + agent glue. Fold the SGR
-      palette (`dim`/`reset`/`red`, box colors, `separator`'s purple) into one `tui` color namespace
-      so `App`, `Picker`, and `separator` stop each defining their own. The palette is app style, so
-      it belongs in the `ui` namespace, not the generic `terminal` engine.
-- [ ] **Make `App.Entry` a `union(Kind)`.** It is a struct with a `kind` enum plus `is_error` that
-      is dead for `intro`/`user`/`model`, and `text` is the only payload any variant carries. A
-      tagged union gives each block exactly its data, makes the `ensureEntry` switch exhaustive by
-      construction, and gives stateful blocks (a collapsible `thinking` run, a tool box tracking its
-      own status) somewhere to live. Ties into the block-widget extraction above.
+- [x] **Extract block rendering into a `ui` widget + shared color namespace.** Block rendering moved
+      out of `src/App.zig` into two `ui` modules, and the SGR palette into a third. `ui/color.zig` is
+      the one palette `App`, `paint`, `Picker`, `separator`, and `status` share. `ui/paint.zig` holds
+      the row-painting primitives (`Placement`, `BoxStyle`, `box`/`notice`/`wrapped`/`spinner`/`row`,
+      plus `boxRows`/`spinnerStep`), which stream one row at a time into the view sink — the
+      streaming `Placement` contract, deliberately *not* the `render(columns, …, buffer, lines)`
+      contract `Editor`/`Picker` use, so a clipped block never materializes its hidden top.
+      `ui/block.zig` is the transcript-block model (`Entry`, below), measuring and painting itself
+      via `paint`. App shrank to state + event loop + orchestration + agent glue + the
+      projection/layout pass, and the block renderers are now unit-tested in `block.zig`.
+- [x] **Make `App.Entry` a `union(Kind)`.** `Entry` (now in `ui/block.zig`) is a tagged union: the
+      `intro`/`user`/`model` blocks carry a byte buffer, `tool_result`/`feedback` a buffer plus an
+      `is_error` flag (`Flagged`). Each variant carries exactly its data — the `is_error` that was
+      dead for the plain blocks is gone — and `rows`/`render`/`deinit` switch on it exhaustively.
+      `Entry.init` owns the single kind→variant mapping. Stateful blocks (a collapsible `thinking`
+      run, a tool box tracking its own status) now have somewhere to live.
 - [ ] **Richer UI with dedicated components.** Move beyond the current log + single-line editor to
       composable components (tool-call panels, streaming status, a stats/context footer, a model/
       effort indicator, command palette). Keep the line/string render model. `tui.Picker` (the
