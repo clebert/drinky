@@ -160,6 +160,19 @@ Extension seams referenced here:
       rule GB9c) and Extended_Pictographic (for GB11). `grapheme.stepAt` implements the full GB1–GB13
       rule set and is verified against the vendored `GraphemeBreakTest.txt` conformance corpus.
 
+- [ ] **Grapheme-cluster caret movement.** `Editor` moves the caret and backspaces by UTF-8
+      codepoint (`stepFrom` advances one codepoint; `previousBoundary` walks back over continuation
+      bytes), while rendering measures by grapheme cluster (`terminal.width` + `grapheme`). The two
+      diverge on multi-codepoint clusters — a combining mark, a ZWJ emoji (`👨‍👩‍👧‍👦`), a
+      regional-indicator flag, a skin-tone modifier, a keycap — so the caret can land inside a
+      cluster and a backspace can strip one codepoint of a glyph rather than the whole thing. Move by
+      cluster instead. `grapheme.stepAt` is forward-only and needs a known cluster start, and UAX #29
+      breaking depends on preceding context, so backward movement must re-segment forward from a
+      known boundary (start of line or text) rather than scan backward byte by byte. Needs a
+      backward-capable boundary helper beside `stepAt` (or Editor-tracked cluster boundaries), used
+      by `moveLeft`/`moveRight`/`backspace`; once movement guarantees cluster boundaries,
+      `width.caret`'s precondition tightens from codepoint back to grapheme cluster.
+
 - [ ] **Extract block rendering into a `ui` widget + shared color namespace.** `src/App.zig` is both
       the composition root and the renderer for every transcript block
       (`renderBox`/`renderStyledLines`/`renderWrapped`/`pushBox*`) with a module-level color

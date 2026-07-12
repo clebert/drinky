@@ -30,7 +30,10 @@
 //!   the footer or tail shrank): the re-entered top rows are new this frame, so
 //!   the first changed row is `0`. The terminal cannot un-scroll its
 //!   scrollback, so this is never incremental above the viewport — it resets,
-//!   or reprints from row `0` when the window is a single page.
+//!   or reprints from row `0` when the window is a single page. A tail that
+//!   shrinks while the shared top row stays put counts here too when rows have
+//!   scrolled off: the shorter frame lifts its footer, so the last page must
+//!   reveal rows now in scrollback, and only a reset can.
 //! - **A change above the viewport, a resize, a page-count change, or no shared
 //!   anchor** clears the screen and scrollback and reprints the whole window.
 //!
@@ -264,7 +267,12 @@ pub fn render(self: *View) !void {
             return;
         };
         const delta = alignment.prev_index;
-        if (changed + delta < self.viewport_top) {
+        // A shorter tail lifts the footer off the bottom. When rows have scrolled
+        // off the top, the last page must now show some of them, which an inline
+        // terminal cannot reveal without reprinting — so this is a backward slide
+        // in disguise and resets, exactly like one whose shared row moved.
+        const shrank = back.rows.items.len + delta < prev.rows.items.len;
+        if (changed + delta < self.viewport_top or (shrank and self.viewport_top > 0)) {
             try self.paint(.reset, 0, back, 0);
         } else {
             // Reprint no lower than the previous frame's last row, which is on
@@ -416,14 +424,22 @@ fn viewportTop(frame: *const Frame, rows: usize) usize {
 // motion, clears, and text with real auto-wrap — to reconstruct what the screen
 // shows. Cursor position is physical, so a miscounted row surfaces as a
 // corrupted document or a misplaced caret. It keeps scrolled-off rows in its
-// document (native scrollback) and never trims except on a full clear. CUD and
-// CUF clamp at the bottom row and the right margin — they never scroll or reach
-// a pending-wrap cell — so a paint that moves the cursor past a margin corrupts
-// the reconstruction instead of silently "working".
+// document (native scrollback) and never trims except on a full clear. The
+// document splits at `screen_top` into the scrollback above and the `rows`-tall
+// screen at and below it: printing past the bottom row scrolls the top into
+// scrollback, and cursor-up and home stop at the screen top, so a row that
+// scrolled off is unaddressable. CUD and CUF clamp at the bottom row and the
+// right margin — they never scroll or reach a pending-wrap cell — so a paint
+// that moves the cursor past a margin, or one that assumes it can reach
+// scrolled-off content, corrupts the reconstruction instead of silently
+// "working".
 const Emulator = struct {
     gpa: std.mem.Allocator,
     columns: usize,
+    rows: usize,
     document: std.ArrayList(std.ArrayList(u8)),
+    // Document index of the screen's top row; the rows above it are scrollback.
+    screen_top: usize,
     cursor_row: usize,
     cursor_column: usize,
     cursor_visible: bool,
@@ -434,7 +450,9 @@ const Emulator = struct {
         return .{
             .gpa = gpa,
             .columns = columns,
+            .rows = 0,
             .document = document,
+            .screen_top = 0,
             .cursor_row = 0,
             .cursor_column = 0,
             .cursor_visible = false,
@@ -460,8 +478,7 @@ const Emulator = struct {
                 continue;
             }
             if (byte == '\n') {
-                self.cursor_row += 1;
-                try self.ensureRow(self.cursor_row);
+                try self.lineFeed();
                 index += 1;
                 continue;
             }
@@ -495,13 +512,16 @@ const Emulator = struct {
         if (index >= sequence.len) return sequence.len;
         const params = sequence[2..index];
         switch (sequence[index]) {
-            'A' => self.cursor_row -= @min(csiValue(params, 1), self.cursor_row),
+            'A' => {
+                std.debug.assert(self.cursor_row >= self.screen_top);
+                self.cursor_row -= @min(csiValue(params, 1), self.cursor_row - self.screen_top);
+            },
             // CUD clamps at the bottom row; it never scrolls or grows the document.
             'B' => self.cursor_row = @min(self.cursor_row + csiValue(params, 1), self.document.items.len - 1),
             // CUF clamps at the right margin; it cannot reach a pending-wrap cell.
             'C' => self.cursor_column = @min(self.cursor_column + csiValue(params, 1), self.columns - 1),
             'H' => {
-                self.cursor_row = 0;
+                self.cursor_row = self.screen_top;
                 self.cursor_column = 0;
             },
             'J' => switch (csiValue(params, 0)) {
@@ -526,6 +546,16 @@ const Emulator = struct {
         try self.document.append(self.gpa, .empty);
         self.cursor_row = 0;
         self.cursor_column = 0;
+        self.screen_top = 0;
+    }
+
+    // Advance the cursor one physical row, scrolling the screen's top row into
+    // scrollback when the cursor is already on the bottom row — a terminal's
+    // auto-scroll, which is what makes evicted rows unaddressable.
+    fn lineFeed(self: *Emulator) !void {
+        if (self.rows > 0 and self.cursor_row + 1 >= self.screen_top + self.rows) self.screen_top += 1;
+        self.cursor_row += 1;
+        try self.ensureRow(self.cursor_row);
     }
 
     fn clearBelow(self: *Emulator) !void {
@@ -542,7 +572,7 @@ const Emulator = struct {
 
     fn put(self: *Emulator, bytes: []const u8, columns: usize) !void {
         if (self.cursor_column + columns > self.columns and self.cursor_column > 0) {
-            self.cursor_row += 1;
+            try self.lineFeed();
             self.cursor_column = 0;
         }
         try self.ensureRow(self.cursor_row);
@@ -568,6 +598,17 @@ const Emulator = struct {
         try std.testing.expect(self.cursor_visible);
         try std.testing.expectEqual(self.document.items.len - frame_len + row, self.cursor_row);
         try std.testing.expectEqual(column, self.cursor_column);
+    }
+
+    // The physical screen: the `rows` rows at and below the scroll top. Rows
+    // that scrolled past the top are excluded, so a repaint that leaves stale
+    // content on screen or fails to reveal a row it moved into view is caught.
+    fn expectScreen(self: *Emulator, screen: []const []const u8) !void {
+        for (screen, 0..) |row, index| {
+            const at = self.screen_top + index;
+            const actual = if (at < self.document.items.len) self.document.items[at].items else "";
+            try std.testing.expectEqualStrings(row, actual);
+        }
     }
 };
 
@@ -598,6 +639,7 @@ const Harness = struct {
         }
         try self.view.render();
         const bytes = self.out.written();
+        self.emulator.rows = size.rows;
         try self.emulator.feed(bytes[self.consumed..]);
         self.consumed = bytes.len;
     }
@@ -695,6 +737,35 @@ test "a backward slide past one page resets" {
     const short = [_]Line{ line("r0", 0), line("r1", 1), line("r2", 2), line("r3", 3) };
     try h.render(&short, .{ .columns = 10, .rows = 2 }, 2);
     try h.emulator.expectVisible(&.{ "r0", "r1", "r2", "r3" });
+    try std.testing.expect(std.mem.indexOf(u8, h.lastBytes(), escape.screen_reset) != null);
+}
+
+test "a shrink while scrolled resets so the top of the frame returns" {
+    const gpa = std.testing.allocator;
+    const h = try harness(gpa, 10);
+    defer {
+        h.deinit();
+        gpa.destroy(h);
+    }
+    // Eight rows in a four-row screen: r0..r3 scroll off, r4..r7 show. The frame
+    // stays whole (well under the page budget), so its top anchor is always
+    // shared and the diff takes the forward path.
+    const tall = [_]Line{
+        line("r0", 0), line("r1", 1), line("r2", 2), line("r3", 3),
+        line("r4", 4), line("r5", 5), line("r6", 6), line("r7", 7),
+    };
+    try h.render(&tall, .{ .columns = 10, .rows = 4 }, 8);
+    try h.emulator.expectScreen(&.{ "r4", "r5", "r6", "r7" });
+
+    // Drop a row from the tail. The last page must now show r3, which had
+    // scrolled off the top — reachable only by clearing and reprinting, since an
+    // inline terminal cannot reveal its scrollback.
+    const short = [_]Line{
+        line("r0", 0), line("r1", 1), line("r2", 2), line("r3", 3),
+        line("r4", 4), line("r5", 5), line("r7", 7),
+    };
+    try h.render(&short, .{ .columns = 10, .rows = 4 }, 8);
+    try h.emulator.expectScreen(&.{ "r3", "r4", "r5", "r7" });
     try std.testing.expect(std.mem.indexOf(u8, h.lastBytes(), escape.screen_reset) != null);
 }
 

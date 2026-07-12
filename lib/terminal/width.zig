@@ -63,7 +63,7 @@ pub fn wrap(
 /// appending them all at once, so a caller can drop the rows above a window
 /// without ever materializing the whole list. `next` returns each fitted line in
 /// turn (a slice into `text`), then null. The sequence is identical to `wrap`'s
-/// output, so `wrap`, `rows`, and this stay in lockstep.
+/// output, so `wrap`, `rows`, `caret`, and this stay in lockstep.
 pub const Wrapper = struct {
     text: []const u8,
     columns_max: usize,
@@ -101,7 +101,7 @@ pub const Wrapper = struct {
 };
 
 /// Wrap `text` to at most `columns_max` display columns one line at a time — the
-/// streaming form `wrap` and `rows` are both built on, so all three stay in
+/// streaming form `wrap`, `rows`, and `caret` are all built on, so they stay in
 /// lockstep by construction.
 pub fn wrapper(text: []const u8, columns_max: usize) Wrapper {
     return .{ .text = text, .columns_max = columns_max, .line_start = 0, .done = false };
@@ -121,41 +121,24 @@ pub fn rows(text: []const u8, columns_max: usize) usize {
 
 pub const Caret = struct { rows_before: usize, column: usize };
 
-/// Physical position of a caret sitting `columns_target` display columns into
-/// `text` once wrapped to `columns_max`: how many row breaks precede it and its
-/// column within that row. Mirrors `wrap`, so a wide cluster near the margin
-/// pushes the caret to the next row. `columns_target` must land on a grapheme
-/// cluster boundary.
-pub fn caret(text: []const u8, columns_target: usize, columns_max: usize) Caret {
-    var rows_before: usize = 0;
-    var column: usize = 0;
-    var consumed: usize = 0;
-    var index: usize = 0;
-    var row_start: usize = 0;
-    while (consumed < columns_target and index < text.len) {
-        const byte = text[index];
-        if (byte == '\n') {
-            rows_before += 1;
-            column = 0;
-            index += 1;
-            row_start = index;
-            continue;
-        }
-        if (byte == escape_start) {
-            index += escapeLength(text[index..]);
-            continue;
-        }
-        const step = grapheme.stepAt(text[index..]);
-        if (column + step.columns > columns_max and index > row_start) {
-            rows_before += 1;
-            column = 0;
-            row_start = index;
-        }
-        column += step.columns;
-        consumed += step.columns;
-        index += step.bytes;
+/// Physical position of a caret sitting at the end of `text` once wrapped to
+/// `columns_max`: how many row breaks precede it and its column within that row.
+/// `text` is the content up to the caret, so pass the prefix before it — a
+/// greedy width wrap never lets later content move an earlier break, so the
+/// suffix cannot change the answer. Built on `wrapper`, so it mirrors `wrap` for
+/// free: a wide cluster near the margin pushes the caret to the next row, and a
+/// trailing `\n` (or an empty line between newlines) lands it at column 0 of a
+/// fresh row. `text` must end on a codepoint boundary.
+pub fn caret(text: []const u8, columns_max: usize) Caret {
+    var iterator = wrapper(text, columns_max);
+    var result: Caret = .{ .rows_before = 0, .column = 0 };
+    var first = true;
+    while (iterator.next()) |line| {
+        if (!first) result.rows_before += 1;
+        first = false;
+        result.column = ofText(line);
     }
-    return .{ .rows_before = rows_before, .column = column };
+    return result;
 }
 
 const escape_start = 0x1b;
@@ -331,16 +314,21 @@ test rows {
 }
 
 test caret {
-    // Within the first row, the caret column equals the display width consumed.
-    try std.testing.expectEqual(Caret{ .rows_before = 0, .column = 0 }, caret("hello", 0, 3));
-    try std.testing.expectEqual(Caret{ .rows_before = 0, .column = 2 }, caret("hello", 2, 3));
-    // At column 3 of a three-wide budget the caret sits pending at the margin.
-    try std.testing.expectEqual(Caret{ .rows_before = 0, .column = 3 }, caret("hello", 3, 3));
-    // Past the margin it wraps: column 4 is the second row, first column.
-    try std.testing.expectEqual(Caret{ .rows_before = 1, .column = 1 }, caret("hello", 4, 3));
+    // Within the first row, the caret column equals the prefix's display width.
+    try std.testing.expectEqual(Caret{ .rows_before = 0, .column = 0 }, caret("", 3));
+    try std.testing.expectEqual(Caret{ .rows_before = 0, .column = 2 }, caret("he", 3));
+    // A prefix that exactly fills the budget sits pending at the margin.
+    try std.testing.expectEqual(Caret{ .rows_before = 0, .column = 3 }, caret("hel", 3));
+    // One glyph past the margin wraps: the second row, first column.
+    try std.testing.expectEqual(Caret{ .rows_before = 1, .column = 1 }, caret("hell", 3));
     // Wide glyphs push the wrap early: after two two-column glyphs the caret is
     // on the second row at column two, not row one.
-    try std.testing.expectEqual(Caret{ .rows_before = 1, .column = 2 }, caret("你好世", 4, 3));
+    try std.testing.expectEqual(Caret{ .rows_before = 1, .column = 2 }, caret("你好", 3));
     // An explicit newline starts a fresh row, like wrap.
-    try std.testing.expectEqual(Caret{ .rows_before = 1, .column = 1 }, caret("ab\ncd", 3, 10));
+    try std.testing.expectEqual(Caret{ .rows_before = 1, .column = 1 }, caret("ab\nc", 10));
+    // A trailing newline lands the caret at column 0 of the empty next row
+    // (also the blank line between two newlines), and consecutive newlines each
+    // add another such row.
+    try std.testing.expectEqual(Caret{ .rows_before = 1, .column = 0 }, caret("a\n", 10));
+    try std.testing.expectEqual(Caret{ .rows_before = 2, .column = 0 }, caret("a\n\n", 10));
 }

@@ -103,10 +103,9 @@ pub fn render(
     try lines.append(gpa, separator_line);
 
     if (!focused) return null;
-    // The caret sits `caret_column` display columns into the body; map it
-    // through the same wrapping to its sub-row and column.
-    const caret_column = terminal.width.ofText(self.text.items[0..self.caret]);
-    const position = terminal.width.caret(body, caret_column, columns_max);
+    // The caret's row and column are fixed by the body prefix before it (see
+    // `width.caret`).
+    const position = terminal.width.caret(body[0..self.caret], columns_max);
     return .{ .row = body_row + position.rows_before, .column = position.column };
 }
 
@@ -174,4 +173,63 @@ test render {
     try std.testing.expectEqual(@as(?terminal.View.Caret, .{ .row = 1, .column = 2 }), caret);
 
     try std.testing.expectEqual(@as(?terminal.View.Caret, null), try editor.render(80, false, &buffer, &lines));
+}
+
+test "caret sits on the empty row after a trailing newline" {
+    var editor = Editor.init(std.testing.allocator);
+    defer editor.deinit();
+    try editor.insert("a\n");
+    var buffer: std.ArrayList(u8) = .empty;
+    defer buffer.deinit(std.testing.allocator);
+    var lines: std.ArrayList([]const u8) = .empty;
+    defer lines.deinit(std.testing.allocator);
+    const caret = try editor.render(80, true, &buffer, &lines);
+    // Separator, "a", the empty new line, separator.
+    try std.testing.expectEqual(@as(usize, 4), lines.items.len);
+    try std.testing.expectEqual(@as(?terminal.View.Caret, .{ .row = 2, .column = 0 }), caret);
+}
+
+test "caret occupies a blank row between two newlines" {
+    var editor = Editor.init(std.testing.allocator);
+    defer editor.deinit();
+    try editor.insert("a\n\nb");
+    editor.moveLeft();
+    editor.moveLeft();
+    // The caret now sits just after the first newline, on the blank middle row.
+    var buffer: std.ArrayList(u8) = .empty;
+    defer buffer.deinit(std.testing.allocator);
+    var lines: std.ArrayList([]const u8) = .empty;
+    defer lines.deinit(std.testing.allocator);
+    const caret = try editor.render(80, true, &buffer, &lines);
+    try std.testing.expectEqual(@as(usize, 5), lines.items.len);
+    try std.testing.expectEqual(@as(?terminal.View.Caret, .{ .row = 2, .column = 0 }), caret);
+}
+
+test "consecutive newlines each add an occupiable row" {
+    var editor = Editor.init(std.testing.allocator);
+    defer editor.deinit();
+    try editor.insert("\n\n");
+    var buffer: std.ArrayList(u8) = .empty;
+    defer buffer.deinit(std.testing.allocator);
+    var lines: std.ArrayList([]const u8) = .empty;
+    defer lines.deinit(std.testing.allocator);
+    const caret = try editor.render(80, true, &buffer, &lines);
+    try std.testing.expectEqual(@as(?terminal.View.Caret, .{ .row = 3, .column = 0 }), caret);
+}
+
+test "moving right across blank lines does not skip rows" {
+    var editor = Editor.init(std.testing.allocator);
+    defer editor.deinit();
+    try editor.insert("a\n\nb");
+    editor.moveHome();
+    var buffer: std.ArrayList(u8) = .empty;
+    defer buffer.deinit(std.testing.allocator);
+    var lines: std.ArrayList([]const u8) = .empty;
+    defer lines.deinit(std.testing.allocator);
+    const expected_rows = [_]usize{ 1, 1, 2, 3, 3 };
+    for (expected_rows) |row| {
+        const caret = try editor.render(80, true, &buffer, &lines);
+        try std.testing.expectEqual(row, caret.?.row);
+        editor.moveRight();
+    }
 }
