@@ -52,8 +52,9 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const files = walk.collect(context.io, arena, .{ .base = base, .pattern = file_glob }) catch |err| {
-        return Result.report(gpa, .err, "cannot search {s}: {s}", .{ base, @errorName(err) });
+    const files = walk.collect(context.io, arena, .{ .base = base, .pattern = file_glob }) catch |err| switch (err) {
+        error.Canceled => return err,
+        else => return Result.report(gpa, .err, "cannot search {s}: {s}", .{ base, @errorName(err) }),
     };
 
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -61,7 +62,10 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
     var count: usize = 0;
     var truncated = false;
     search: for (files) |path| {
-        const data = std.Io.Dir.cwd().readFileAlloc(context.io, path, gpa, .limited(file_bytes_max)) catch continue;
+        const data = std.Io.Dir.cwd().readFileAlloc(context.io, path, gpa, .limited(file_bytes_max)) catch |err| switch (err) {
+            error.Canceled => return err,
+            else => continue,
+        };
         defer gpa.free(data);
         if (std.mem.indexOfScalar(u8, data, 0) != null) continue;
 

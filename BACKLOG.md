@@ -126,13 +126,18 @@ Extension seams referenced here:
       Only whole requests are safe to retry, so a partially streamed assistant message must be
       discarded first. Sits above `Transport` (in `provider` / `Agent`) so it stays
       provider-neutral.
-- [ ] **Networking off the UI thread.** The read loop blocks the event loop for the whole turn, so
-      the UI is frozen while streaming. Move request/stream I/O onto its own thread and feed events
-      back to a single-threaded renderer. Enables mid-stream cancellation, concurrent tool
-      execution, and a live progress indicator.
-- [ ] **Streaming cancellation.** Handle ctrl-c mid-stream to abort a turn cleanly — drop the
-      partial assistant message and leave history a valid user/assistant alternation. Builds on
-      off-thread networking; needed before long-running tools (bash) and subagents are comfortable.
+- [x] **Networking off the UI thread.** The event loop is a single `std.Io.Queue(UiEvent)` consumer
+      fed by `io.concurrent` producers — a long-lived stdin reader, the turn worker (`agent.run` off
+      the UI thread), and a one-shot frame timer. The consumer solely owns the model and paints, so
+      request/stream I/O no longer freezes the UI. This unblocked mid-stream cancellation and a live
+      progress indicator; concurrent tool execution stays future work (tools still run inline on the
+      worker between rounds).
+- [x] **Streaming cancellation.** Ctrl-c/esc mid-turn cancels the turn worker's `Future`; the cancel
+      interrupts the blocking read, `Transport.next` maps it to `error.Canceled` via
+      `connection.getReadError()`, and `Agent.run`'s `errdefer` shrinks `messages` back to the
+      turn's base — dropping the partial assistant message and leaving a valid alternation. Tools
+      propagate `error.Canceled` too, and mutating tools write atomically so a cancelled write can't
+      truncate the target.
 
 ## UI
 
@@ -215,11 +220,11 @@ Extension seams referenced here:
       visible but inert. Depends on the off-thread networking work ("Networking off the UI thread"):
       once stream I/O runs on its own thread, the event loop can keep reading keys, append submitted
       lines to a pending-message queue, and feed them into the current or next turn.
-- [ ] **Smooth spinner animation.** Drive the `⠋ Working…` spinner from a timer
-      (`requestRender`-style) so it animates independently of stream events. It currently advances
-      one frame per stream event and freezes during the initial pre-first-token wait, because the
-      loop is blocked for the whole turn. Depends on the off-thread networking work so the UI thread
-      is free to tick a timer while the request is in flight.
+- [x] **Smooth spinner animation.** The `⠋ Working…` spinner is driven by the frame timer: while a
+      turn animates the consumer re-arms a tick each frame and `advanceFrame` steps the spinner even
+      when the model is clean, so it animates independently of stream events and no longer freezes
+      during the pre-first-token wait. Covered by the "a tick repaints and steps the spinner while a
+      turn animates" regression test.
 - [ ] **Extract the render consumer into a `Session` struct.** The off-thread event loop keeps the
       consumer-owned model (`Transcript`, tail/mode, editor, input, view, displayed stats/model) and
       its event-appliers (`applyStreamEvent`) and `paint` in `App`, alongside the composition root

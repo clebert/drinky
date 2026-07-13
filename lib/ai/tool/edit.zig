@@ -4,8 +4,9 @@ const std = @import("std");
 
 const llm = @import("../llm.zig");
 const Context = @import("Context.zig");
-const Result = @import("Result.zig");
+const fs = @import("fs.zig");
 const parse = @import("parse.zig");
+const Result = @import("Result.zig");
 
 pub const spec: llm.Tool = .{
     .name = "edit",
@@ -35,8 +36,9 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
     const old = parsed.value.old_text;
     const new = parsed.value.new_text;
 
-    const data = std.Io.Dir.cwd().readFileAlloc(context.io, path, gpa, .unlimited) catch |err| {
-        return Result.report(gpa, .err, "cannot read {s}: {s}", .{ path, @errorName(err) });
+    const data = std.Io.Dir.cwd().readFileAlloc(context.io, path, gpa, .unlimited) catch |err| switch (err) {
+        error.Canceled => return err,
+        else => return Result.report(gpa, .err, "cannot read {s}: {s}", .{ path, @errorName(err) }),
     };
     defer gpa.free(data);
 
@@ -48,8 +50,9 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
     };
     defer gpa.free(updated);
 
-    std.Io.Dir.cwd().writeFile(context.io, .{ .sub_path = path, .data = updated }) catch |err| {
-        return Result.report(gpa, .err, "cannot write {s}: {s}", .{ path, @errorName(err) });
+    fs.writeFile(context.io, std.Io.Dir.cwd(), .{ .sub_path = path, .data = updated }) catch |err| switch (err) {
+        error.Canceled => return err,
+        else => return Result.report(gpa, .err, "cannot write {s}: {s}", .{ path, @errorName(err) }),
     };
     return Result.report(gpa, .ok, "edited {s}", .{path});
 }

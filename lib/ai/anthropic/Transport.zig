@@ -58,7 +58,19 @@ pub const Stream = struct {
             self.parsed = null;
         }
         while (true) {
-            const line = (try self.body.takeDelimiter('\n')) orelse return null;
+            const line = (self.body.takeDelimiter('\n') catch |err| switch (err) {
+                // A cancel during the SSE read surfaces here as ReadFailed; the
+                // real cause lives on the connection. Treat a canceled read as
+                // a clean turn abort and leave every other failure on the
+                // network-error path.
+                error.ReadFailed => {
+                    if (self.request.connection.?.getReadError()) |read_error| {
+                        if (read_error == error.Canceled) return error.Canceled;
+                    }
+                    return err;
+                },
+                else => return err,
+            }) orelse return null;
             const trimmed = std.mem.trimEnd(u8, line, "\r");
             if (!std.mem.startsWith(u8, trimmed, "data:")) continue;
             const payload = std.mem.trimStart(u8, trimmed["data:".len..], " ");
@@ -148,6 +160,9 @@ pub fn send(self: *Transport, out: *Stream, body: []const u8, access_token: []co
     });
     errdefer out.request.deinit();
 
+    // A cancel during the calls below lands before Agent.run arms its
+    // `defer stream.deinit()`, so teardown falls to the errdefers above (client
+    // and request); that unwinds cleanly. This corner is untested.
     out.request.transfer_encoding = .{ .content_length = body.len };
     var writer = try out.request.sendBodyUnflushed(&.{});
     try writer.writer.writeAll(body);

@@ -32,9 +32,24 @@ pub fn collect(
     // unreadable subdirectory leaves its ancestors on the stack to be closed as
     // the walk completes.
     while (true) {
-        const entry = (walker.next(io) catch continue) orelse break;
+        const entry = (walker.next(io) catch |err| switch (err) {
+            // A canceled walk is a turn abort: record it so it propagates once
+            // the drain finishes. Any other iteration error skips the bad
+            // directory and keeps the walk resilient.
+            error.Canceled => {
+                failure = err;
+                continue;
+            },
+            else => continue,
+        }) orelse break;
         switch (entry.kind) {
-            .directory => if (!isNoise(entry.basename)) walker.enter(io, entry) catch {},
+            .directory => {
+                if (isNoise(entry.basename)) continue;
+                walker.enter(io, entry) catch |err| switch (err) {
+                    error.Canceled => failure = err,
+                    else => {},
+                };
+            },
             .file => {
                 if (failure != null or !glob.match(.{ .pattern = options.pattern, .path = entry.path })) continue;
                 const relative = if (at_root)

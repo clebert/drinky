@@ -42,8 +42,9 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const files = walk.collect(context.io, arena, .{ .base = base, .pattern = pattern }) catch |err| {
-        return Result.report(gpa, .err, "cannot search {s}: {s}", .{ base, @errorName(err) });
+    const files = walk.collect(context.io, arena, .{ .base = base, .pattern = pattern }) catch |err| switch (err) {
+        error.Canceled => return err,
+        else => return Result.report(gpa, .err, "cannot search {s}: {s}", .{ base, @errorName(err) }),
     };
     if (files.len == 0) return Result.report(gpa, .ok, "no files match {s}", .{pattern});
 
