@@ -85,7 +85,7 @@ const Component = union(enum) {
             .tool_box => |text| ui.paint.boxRows(text, columns),
             .spinner, .status => 1,
             .editor => |prompt| prompt.editor.rows(columns, viewport_rows),
-            .picker => |picker| picker.rows(columns),
+            .picker => |picker| picker.rows(columns, viewport_rows),
         };
     }
 
@@ -98,7 +98,7 @@ const Component = union(enum) {
             .spinner => |frame| try ui.paint.spinner(placement, frame),
             .status => |info| try ui.status.render(placement, info),
             .editor => |prompt| try prompt.editor.render(placement, viewport_rows, prompt.focused),
-            .picker => |picker| try picker.render(placement),
+            .picker => |picker| try picker.render(placement, viewport_rows),
         }
     }
 };

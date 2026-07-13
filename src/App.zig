@@ -232,7 +232,10 @@ fn refresh(self: *App) !void {
                 .editor = &self.editor,
             } };
         },
-        .picking => |*picking| .{ .picking = &picking.picker },
+        .picking => |*picking| picking: {
+            picking.picker.reflow(size.columns, size.rows);
+            break :picking .{ .picking = &picking.picker };
+        },
     };
     const scene: layout.Scene = .{
         .transcript = self.transcript.blocks(),

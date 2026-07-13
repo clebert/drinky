@@ -131,20 +131,13 @@ pub fn moveDown(self: *Editor, columns: usize) void {
     });
 }
 
-/// The tallest the wrapped body may grow before it scrolls within the frame:
-/// about a quarter of the viewport, never fewer than five rows nor more than
-/// fifteen, so the input stays usable without crowding out the transcript.
-fn bodyLimit(viewport_rows: usize) usize {
-    return @min(@max(@divFloor(viewport_rows, 4) + 1, 5), 15);
-}
-
 /// Re-clamp the scroll offset so the caret's wrapped row stays inside the visible
 /// window. Call once per repaint, passing the same `columns` and `viewport_rows`
 /// that `render` and `rows` will use, so all three agree on the window.
 pub fn reflow(self: *Editor, columns: usize, viewport_rows: usize) void {
     const columns_max = @max(columns, 1);
     const total_body = terminal.width.rows(self.text.items, columns_max);
-    const visible = @min(total_body, bodyLimit(viewport_rows));
+    const visible = @min(total_body, paint.bodyLimit(viewport_rows));
     const caret_row = terminal.width.caret(self.text.items[0..self.caret], columns_max).rows_before;
     if (caret_row < self.scroll) self.scroll = caret_row;
     if (caret_row >= self.scroll + visible) self.scroll = caret_row - visible + 1;
@@ -155,7 +148,7 @@ pub fn reflow(self: *Editor, columns: usize, viewport_rows: usize) void {
 /// body, the body capped to its scroll limit for `viewport_rows`.
 pub fn rows(self: *const Editor, columns: usize, viewport_rows: usize) usize {
     const total_body = terminal.width.rows(self.text.items, @max(columns, 1));
-    return paint.framedRows(@min(total_body, bodyLimit(viewport_rows)));
+    return paint.framedRows(@min(total_body, paint.bodyLimit(viewport_rows)));
 }
 
 /// Stream the framed input area — the rules and the wrapped text, windowed to
@@ -164,7 +157,7 @@ pub fn rows(self: *const Editor, columns: usize, viewport_rows: usize) usize {
 pub fn render(self: *const Editor, placement: *const paint.Placement, viewport_rows: usize, focused: bool) !void {
     const columns_max = @max(placement.columns, 1);
     const total_body = terminal.width.rows(self.text.items, columns_max);
-    const visible = @min(total_body, bodyLimit(viewport_rows));
+    const visible = @min(total_body, paint.bodyLimit(viewport_rows));
     try paint.framed(placement, &.{
         .body = self.text.items,
         .caret = if (focused) self.caretPosition(columns_max) else null,
@@ -470,16 +463,6 @@ test "moving right across blank lines does not skip rows" {
         try std.testing.expectEqual(row, editor.caretPosition(80).row);
         editor.moveRight();
     }
-}
-
-test "the body limit tracks a quarter of the viewport, clamped to five and fifteen" {
-    try std.testing.expectEqual(@as(usize, 5), bodyLimit(0));
-    try std.testing.expectEqual(@as(usize, 5), bodyLimit(19));
-    try std.testing.expectEqual(@as(usize, 6), bodyLimit(20));
-    try std.testing.expectEqual(@as(usize, 6), bodyLimit(23));
-    try std.testing.expectEqual(@as(usize, 7), bodyLimit(24));
-    try std.testing.expectEqual(@as(usize, 15), bodyLimit(56));
-    try std.testing.expectEqual(@as(usize, 15), bodyLimit(200));
 }
 
 test "a tall body caps its rows and scrolls the window to keep the caret in view" {

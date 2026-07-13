@@ -134,6 +134,14 @@ pub fn framedRows(body_rows: usize) usize {
     return 2 + body_rows;
 }
 
+/// The tallest a framed body may grow before it scrolls within its frame: about
+/// a quarter of the viewport, never fewer than five rows nor more than fifteen,
+/// so the live input stays usable without crowding out the transcript. Shared by
+/// the editor and the picker so both window to the same limit.
+pub fn bodyLimit(viewport_rows: usize) usize {
+    return @min(@max(@divFloor(viewport_rows, 4) + 1, 5), 15);
+}
+
 /// A framed input area — a full-width rule, a window of `body`'s wrapped rows,
 /// then a closing rule — streamed a row at a time. Shared by the editor and the
 /// picker so both sit in one border.
@@ -228,4 +236,14 @@ pub fn spinner(placement: *const Placement, frame: usize) !void {
     }
     try writer.writeAll(color.reset);
     placement.sink.end(.{ .id = placement.id, .line = placement.base });
+}
+
+test "the body limit tracks a quarter of the viewport, clamped to five and fifteen" {
+    try std.testing.expectEqual(@as(usize, 5), bodyLimit(0));
+    try std.testing.expectEqual(@as(usize, 5), bodyLimit(19));
+    try std.testing.expectEqual(@as(usize, 6), bodyLimit(20));
+    try std.testing.expectEqual(@as(usize, 6), bodyLimit(23));
+    try std.testing.expectEqual(@as(usize, 7), bodyLimit(24));
+    try std.testing.expectEqual(@as(usize, 15), bodyLimit(56));
+    try std.testing.expectEqual(@as(usize, 15), bodyLimit(200));
 }
