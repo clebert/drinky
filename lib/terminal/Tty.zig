@@ -71,14 +71,14 @@ pub fn reader(self: *Tty) *std.Io.Reader {
     return &self.in_stream.interface;
 }
 
-/// Current window size, falling back to 80x24 if the query fails.
-pub fn size(self: *Tty) Size {
+/// Current window size, or null when the terminal cannot report one.
+pub fn size(self: *Tty) ?Size {
     var window: std.posix.winsize = .{ .row = 0, .col = 0, .xpixel = 0, .ypixel = 0 };
     const result = self.io.operate(.{ .device_io_control = .{
         .file = .{ .handle = self.out_handle, .flags = .{ .nonblocking = false } },
         .code = std.posix.T.IOCGWINSZ,
         .arg = &window,
-    } }) catch return .{ .columns = 80, .rows = 24 };
-    if (result.device_io_control < 0 or window.col == 0) return .{ .columns = 80, .rows = 24 };
+    } }) catch return null;
+    if (result.device_io_control < 0 or window.col == 0) return null;
     return .{ .columns = window.col, .rows = window.row };
 }

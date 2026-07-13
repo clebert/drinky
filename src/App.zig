@@ -216,14 +216,17 @@ fn clearOrQuit(self: *App) void {
     }
 }
 
-/// Repaint: read the terminal size and snapshot the agent's status, then
-/// project the model onto the window with those as inputs. Keeping projection a
-/// pure function of the model, the size, and that snapshot lets it be driven
-/// without a live tty or agent.
+/// Repaint: read the terminal size (keeping the last known one if the query
+/// fails) and snapshot the agent's status, then project the model onto the
+/// window with those as inputs. Keeping projection a pure function of the model,
+/// the size, and that snapshot lets it be driven without a live tty or agent.
 fn refresh(self: *App) !void {
-    const size = self.tty.size();
     const stats = self.agent.stats;
-    try self.project(.{ .columns = size.columns, .rows = size.rows }, .{
+    const size: terminal.View.Size = if (self.tty.size()) |window|
+        .{ .columns = window.columns, .rows = window.rows }
+    else
+        .{ .columns = self.columns, .rows = self.rows };
+    try self.project(size, .{
         .last = stats.last,
         .cost = stats.cost,
         .saved = stats.saved,
