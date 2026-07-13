@@ -45,9 +45,9 @@
 
 const std = @import("std");
 
+const Emulator = @import("Emulator.zig");
 const escape = @import("escape.zig");
 const width = @import("width.zig");
-const Emulator = @import("Emulator.zig");
 
 const View = @This();
 
