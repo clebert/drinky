@@ -21,9 +21,10 @@ pub const rule_reset = "\x1b[39m";
 pub const user_bg = "\x1b[48;2;52;53;65m";
 pub const user_fg = "\x1b[38;2;212;212;212m";
 
-/// The tool boxes: one foreground, a background per call status.
+/// The tool boxes: one foreground, a background per call status. A running call
+/// is blue, a finished one green, a failed one red.
 pub const tool_fg = "\x1b[38;2;212;212;212m";
-pub const tool_pending_bg = "\x1b[48;2;40;40;50m";
+pub const tool_pending_bg = "\x1b[48;2;38;48;82m";
 pub const tool_success_bg = "\x1b[48;2;40;50;40m";
 pub const tool_error_bg = "\x1b[48;2;60;40;40m";
 
