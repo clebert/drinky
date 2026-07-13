@@ -225,13 +225,14 @@ Extension seams referenced here:
       when the model is clean, so it animates independently of stream events and no longer freezes
       during the pre-first-token wait. Covered by the "a tick repaints and steps the spinner while a
       turn animates" regression test.
-- [ ] **Extract the render consumer into a `Session` struct.** The off-thread event loop keeps the
-      consumer-owned model (`Transcript`, tail/mode, editor, input, view, displayed stats/model) and
-      its event-appliers (`applyStreamEvent`) and `paint` in `App`, alongside the composition root
-      and the producer tasks. Split that model plus `applyStreamEvent`/`paint` into a `Session`
-      struct so `App` is only the io/tasks/tty/agent wiring, giving the render loop an isolated,
-      io-free test surface instead of one built from a partially-initialized `App`. Deferred from
-      the off-thread-networking change, which kept it in `App` to stay scoped to the mechanism.
+- [x] **Extract the render consumer into a `Session` struct.** `src/Session.zig` owns the
+      consumer-side model and rendering — `Transcript`, live-tail `mode`, `editor`, `view`, the last
+      laid-out dimensions, and displayed stats/model — plus the event-appliers (`applyStreamEvent`)
+      and `paint`, io-/tty-/agent-free so the render loop has an isolated test surface built from a
+      real `Session.init` rather than a partially-initialized `App`. `App` keeps the io/tasks/tty/
+      agent wiring, the consumer loop, and the key/command/turn orchestration (which triggers io/
+      agent inline), driving the `Session` through its methods; key decoding (`input`) stays with
+      that orchestration in `App`.
 - [ ] **Signal-driven resize.** React to terminal resizes via `SIGWINCH` rather than polling.
       Depends on the off-thread networking work: once the event loop is a channel consumer, a
       resize must arrive as a `UiEvent`, but a POSIX signal handler is async-signal-safe only and
