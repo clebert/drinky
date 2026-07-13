@@ -34,6 +34,12 @@ const intro_text = "pith — enter: send · shift+enter: newline · esc: cancel 
 /// Two Ctrl+C presses within this window quit; a lone press clears the editor.
 const ctrl_c_window_ms = 500;
 
+/// Idle read timeout: how often the loop wakes to catch a terminal resize when
+/// no key is pressed.
+const resize_poll: std.Io.Timeout = .{
+    .duration = .{ .raw = std.Io.Duration.fromMilliseconds(100), .clock = .awake },
+};
+
 gpa: std.mem.Allocator,
 io: std.Io,
 tty: terminal.Tty,
@@ -103,12 +109,22 @@ pub fn run(self: *App, gpa: std.mem.Allocator, io: std.Io, home: []const u8) !vo
     self.running = true;
     var read_buffer: [4096]u8 = undefined;
     while (self.running) {
-        var chunk: [1][]u8 = .{&read_buffer};
-        const count = self.tty.reader().readVec(&chunk) catch break;
-        if (count == 0) break;
+        const count = (self.tty.read(&read_buffer, resize_poll) catch break) orelse {
+            try self.resizeIfChanged();
+            continue;
+        };
+        if (count == 0) continue;
         try self.input.feed(read_buffer[0..count]);
         while (self.input.next()) |event| try self.handleKey(event);
     }
+}
+
+/// Repaint if the terminal was resized while idle, so the frame follows the new
+/// size without waiting for the next keystroke.
+fn resizeIfChanged(self: *App) !void {
+    const window = self.tty.size() orelse return;
+    if (window.columns == self.columns and window.rows == self.rows) return;
+    try self.refresh();
 }
 
 fn ensureAuth(self: *App) !void {

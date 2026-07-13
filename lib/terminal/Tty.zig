@@ -1,7 +1,7 @@
 //! Owns the controlling terminal for the session: enters raw mode on `init`,
-//! restores it on `deinit`, exposes the window size, and hands out buffered
-//! stdin/stdout streams. Pin the value (it is self-referential through the
-//! stream buffers) and call `init` on the pointer.
+//! restores it on `deinit`, exposes the window size, reads stdin with a timeout,
+//! and hands out a buffered stdout stream. Pin the value (it is self-referential
+//! through the output buffer) and call `init` on the pointer.
 
 const std = @import("std");
 
@@ -13,9 +13,7 @@ io: std.Io,
 in_handle: std.posix.fd_t,
 out_handle: std.posix.fd_t,
 original: std.posix.termios,
-in_buffer: [4096]u8,
 out_buffer: [16384]u8,
-in_stream: std.Io.File.Reader,
 out_stream: std.Io.File.Writer,
 
 pub const Size = struct { columns: u16, rows: u16 };
@@ -43,7 +41,6 @@ pub fn init(self: *Tty, io: std.Io) !void {
     raw.cc[@intFromEnum(std.posix.V.TIME)] = 0;
     try std.posix.tcsetattr(self.in_handle, .FLUSH, raw);
 
-    self.in_stream = stdin.readerStreaming(io, &self.in_buffer);
     self.out_stream = stdout.writerStreaming(io, &self.out_buffer);
 
     const out = &self.out_stream.interface;
@@ -67,8 +64,19 @@ pub fn writer(self: *Tty) *std.Io.Writer {
     return &self.out_stream.interface;
 }
 
-pub fn reader(self: *Tty) *std.Io.Reader {
-    return &self.in_stream.interface;
+/// Read available input into `buffer`, blocking until some arrives or `timeout`
+/// elapses — in which case it returns null, so an idle caller can react to a
+/// resize between keystrokes. A closed input surfaces as `error.EndOfStream`.
+pub fn read(self: *Tty, buffer: []u8, timeout: std.Io.Timeout) !?usize {
+    var chunk: [1][]u8 = .{buffer};
+    const result = self.io.operateTimeout(.{ .file_read_streaming = .{
+        .file = .{ .handle = self.in_handle, .flags = .{ .nonblocking = false } },
+        .data = &chunk,
+    } }, timeout) catch |err| switch (err) {
+        error.Timeout => return null,
+        else => |other| return other,
+    };
+    return try result.file_read_streaming;
 }
 
 /// Current window size, or null when the terminal cannot report one.
