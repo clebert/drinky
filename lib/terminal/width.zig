@@ -62,8 +62,7 @@ pub fn wrap(
 /// A streaming view of `wrap`: yields the same lines one at a time instead of
 /// appending them all at once, so a caller can drop the rows above a window
 /// without ever materializing the whole list. `next` returns each fitted line in
-/// turn (a slice into `text`), then null. The sequence is identical to `wrap`'s
-/// output, so `wrap`, `rows`, `caret`, and this stay in lockstep.
+/// turn (a slice into `text`), then null.
 pub const Wrapper = struct {
     text: []const u8,
     columns_max: usize,
@@ -125,10 +124,10 @@ pub const Caret = struct { rows_before: usize, column: usize };
 /// `columns_max`: how many row breaks precede it and its column within that row.
 /// `text` is the content up to the caret, so pass the prefix before it — a
 /// greedy width wrap never lets later content move an earlier break, so the
-/// suffix cannot change the answer. Built on `wrapper`, so it mirrors `wrap` for
-/// free: a wide cluster near the margin pushes the caret to the next row, and a
-/// trailing `\n` (or an empty line between newlines) lands it at column 0 of a
-/// fresh row. `text` must end on a grapheme cluster boundary.
+/// suffix cannot change the answer. A wide cluster near the margin pushes the
+/// caret to the next row, and a trailing `\n` (or an empty line between newlines)
+/// lands it at column 0 of a fresh row. `text` must end on a grapheme cluster
+/// boundary.
 pub fn caret(text: []const u8, columns_max: usize) Caret {
     var iterator = wrapper(text, columns_max);
     var result: Caret = .{ .rows_before = 0, .column = 0 };
@@ -145,8 +144,7 @@ pub fn caret(text: []const u8, columns_max: usize) Caret {
 /// wrapped to `columns_max` — the inverse of `caret`. A target row past the last
 /// wrapped row clamps to the end of `text`; a target column past its row's
 /// content clamps to the row's end, landing on the last grapheme boundary that
-/// does not overshoot the column. Built on `wrapper` and `truncate`, so row
-/// breaks and column measurement stay in lockstep with `wrap` and `caret`.
+/// does not overshoot the column.
 pub fn offsetAt(text: []const u8, columns_max: usize, target: Caret) usize {
     var iterator = wrapper(text, columns_max);
     var row: usize = 0;

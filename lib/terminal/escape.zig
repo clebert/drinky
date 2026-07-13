@@ -23,8 +23,6 @@ pub const keyboard_reset = "\x1b[<u";
 pub const cursor_hide = "\x1b[?25l";
 pub const cursor_show = "\x1b[?25h";
 
-/// Erase the entire line the cursor sits on.
-pub const line_clear = "\x1b[2K";
 /// Erase from the cursor to the end of the screen.
 pub const screen_clear_below = "\x1b[0J";
 /// Clear the whole screen, home the cursor, then drop the scrollback: the full

@@ -9,8 +9,6 @@ const escape = @import("escape.zig");
 
 const Tty = @This();
 
-pub const Size = struct { rows: u16, columns: u16 };
-
 io: std.Io,
 in_handle: std.posix.fd_t,
 out_handle: std.posix.fd_t,
@@ -19,6 +17,8 @@ in_buffer: [4096]u8,
 out_buffer: [16384]u8,
 in_stream: std.Io.File.Reader,
 out_stream: std.Io.File.Writer,
+
+pub const Size = struct { columns: u16, rows: u16 };
 
 pub fn init(self: *Tty, io: std.Io) !void {
     const stdin = std.Io.File.stdin();
@@ -78,7 +78,7 @@ pub fn size(self: *Tty) Size {
         .file = .{ .handle = self.out_handle, .flags = .{ .nonblocking = false } },
         .code = std.posix.T.IOCGWINSZ,
         .arg = &window,
-    } }) catch return .{ .rows = 24, .columns = 80 };
-    if (result.device_io_control < 0 or window.col == 0) return .{ .rows = 24, .columns = 80 };
-    return .{ .rows = window.row, .columns = window.col };
+    } }) catch return .{ .columns = 80, .rows = 24 };
+    if (result.device_io_control < 0 or window.col == 0) return .{ .columns = 80, .rows = 24 };
+    return .{ .columns = window.col, .rows = window.row };
 }

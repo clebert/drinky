@@ -38,6 +38,14 @@ pub const Key = union(enum) {
     unknown,
 };
 
+const Decoded = struct { key: Key, consumed: usize };
+
+const escape_start = 0x1b;
+const enter_key = 13;
+const escape_key = 27;
+const shift_bit = 0b001;
+const ctrl_bit = 0b100;
+
 pub fn init(gpa: std.mem.Allocator) Input {
     return .{ .gpa = gpa, .pending = .empty, .start = 0 };
 }
@@ -67,8 +75,6 @@ pub fn next(self: *Input) ?Key {
     self.start += decoded.consumed;
     return decoded.key;
 }
-
-const Decoded = struct { key: Key, consumed: usize };
 
 fn decode(data: []const u8) ?Decoded {
     const byte = data[0];
@@ -168,11 +174,6 @@ fn asciiLetter(codepoint: u21) ?u8 {
     return null;
 }
 
-const enter_key = 13;
-const escape_key = 27;
-const shift_bit = 0b001;
-const ctrl_bit = 0b100;
-
 fn mapFinal(final: u8) Key {
     return switch (final) {
         'A' => .up,
@@ -184,8 +185,6 @@ fn mapFinal(final: u8) Key {
         else => .unknown,
     };
 }
-
-const escape_start = 0x1b;
 
 fn expectKeys(bytes: []const u8, expected: []const Key) !void {
     var input = Input.init(std.testing.allocator);

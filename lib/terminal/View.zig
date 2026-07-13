@@ -46,8 +46,8 @@
 const std = @import("std");
 
 const escape = @import("escape.zig");
-const grapheme = @import("grapheme.zig");
 const width = @import("width.zig");
+const Emulator = @import("Emulator.zig");
 
 const View = @This();
 
@@ -136,18 +136,6 @@ pub const Sink = struct {
     }
 };
 
-/// Whether `bytes` is exactly one physical row: at most `columns_max` display
-/// columns (escapes measured out) and free of the C0 controls that would move or
-/// split a row.
-fn oneRow(bytes: []const u8, columns_max: usize) bool {
-    if (width.ofText(bytes) > columns_max) return false;
-    for (bytes) |byte| switch (byte) {
-        '\n', '\r', '\t', 0x08, 0x0b, 0x0c => return false,
-        else => {},
-    };
-    return true;
-}
-
 /// A frame's two reused buffers plus the caret it resolved. `blob` holds all row
 /// bytes concatenated in screen order and grows to a high-water mark; `rows`
 /// indexes them in screen order with fixed capacity.
@@ -160,19 +148,19 @@ const Frame = struct {
         return .{ .blob = .init(gpa), .rows = .empty, .caret = null };
     }
 
-    fn deinit(f: *Frame, gpa: std.mem.Allocator) void {
-        f.blob.deinit();
-        f.rows.deinit(gpa);
+    fn deinit(self: *Frame, gpa: std.mem.Allocator) void {
+        self.blob.deinit();
+        self.rows.deinit(gpa);
     }
 
-    fn reset(f: *Frame) void {
-        f.blob.clearRetainingCapacity();
-        f.rows.clearRetainingCapacity();
-        f.caret = null;
+    fn reset(self: *Frame) void {
+        self.blob.clearRetainingCapacity();
+        self.rows.clearRetainingCapacity();
+        self.caret = null;
     }
 
-    fn bytes(f: *const Frame, row: Row) []const u8 {
-        return f.blob.writer.buffered()[row.offset..][0..row.len];
+    fn bytes(self: *const Frame, row: Row) []const u8 {
+        return self.blob.writer.buffered()[row.offset..][0..row.len];
     }
 };
 
@@ -249,43 +237,32 @@ pub fn render(self: *View) !void {
         return;
     }
 
-    // A plain index diff would reset on every append, since the window slides as
-    // content grows. Align on the first anchor the frames share instead.
+    // Align on the first shared anchor, not screen position, so a slide need not reset.
     const alignment = findAlignment(prev, back) orelse {
         try self.paint(.reset, 0, back, 0);
         self.front ^= 1;
         return;
     };
     if (alignment.back_index == 0) {
-        // Forward: the new top row is shared; rows above it scrolled away.
+        // Forward slide: the new top row is shared; rows above it scrolled away.
         const changed = firstChange(prev, alignment.prev_index, back) orelse {
-            // Rows unchanged; only the caret may have moved. A shared top row
-            // with identical content cannot have slid (a slide needs new content
-            // below), so `cursor_row` is already in this frame's coordinates.
+            // Content unchanged, so no slide happened: `cursor_row` is still valid.
             try self.paintCaretOnly(back);
             self.front ^= 1;
             return;
         };
         const delta = alignment.prev_index;
-        // A shorter tail lifts the footer off the bottom. When rows have scrolled
-        // off the top, the last page must now show some of them, which an inline
-        // terminal cannot reveal without reprinting — so this is a backward slide
-        // in disguise and resets, exactly like one whose shared row moved.
+        // A shrunk tail must reveal scrolled-off rows: a backward slide in disguise.
         const shrank = back.rows.items.len + delta < prev.rows.items.len;
         if (changed + delta < self.viewport_top or (shrank and self.viewport_top > 0)) {
             try self.paint(.reset, 0, back, 0);
         } else {
-            // Reprint no lower than the previous frame's last row, which is on
-            // screen; printing it and the rows below scrolls the terminal by
-            // `\r\n`. Moving the cursor below it with CUD would clamp at the
-            // margin, not scroll, and overwrite that row.
+            // Reprint no lower than the previous last row, so the append scrolls by \r\n.
             const deepest = @min(prev.rows.items.len - 1 - delta, back.rows.items.len - 1);
             try self.paint(.incremental, @min(changed, deepest), back, self.cursor_row -| delta);
         }
     } else {
-        // Backward: older rows re-entered above the shared anchor, so the first
-        // changed row is 0. It is reachable only when the whole window is on
-        // screen (a single page); otherwise it sits in scrollback.
+        // Backward slide: row 0 changed, reachable only when the whole window shows.
         if (self.viewport_top == 0) {
             try self.paint(.incremental, 0, back, self.cursor_row);
         } else {
@@ -420,197 +397,14 @@ fn viewportTop(frame: *const Frame, rows: usize) usize {
     return if (len > height) len - height else 0;
 }
 
-// A model terminal that applies exactly the escapes `View` emits — cursor
-// motion, clears, and text with real auto-wrap — to reconstruct what the screen
-// shows. Cursor position is physical, so a miscounted row surfaces as a
-// corrupted document or a misplaced caret. It keeps scrolled-off rows in its
-// document (native scrollback) and never trims except on a full clear. The
-// document splits at `screen_top` into the scrollback above and the `rows`-tall
-// screen at and below it: printing past the bottom row scrolls the top into
-// scrollback, and cursor-up and home stop at the screen top, so a row that
-// scrolled off is unaddressable. CUD and CUF clamp at the bottom row and the
-// right margin — they never scroll or reach a pending-wrap cell — so a paint
-// that moves the cursor past a margin, or one that assumes it can reach
-// scrolled-off content, corrupts the reconstruction instead of silently
-// "working".
-const Emulator = struct {
-    gpa: std.mem.Allocator,
-    columns: usize,
-    rows: usize,
-    document: std.ArrayList(std.ArrayList(u8)),
-    // Document index of the screen's top row; the rows above it are scrollback.
-    screen_top: usize,
-    cursor_row: usize,
-    cursor_column: usize,
-    cursor_visible: bool,
-
-    fn init(gpa: std.mem.Allocator, columns: usize) !Emulator {
-        var document: std.ArrayList(std.ArrayList(u8)) = .empty;
-        try document.append(gpa, .empty);
-        return .{
-            .gpa = gpa,
-            .columns = columns,
-            .rows = 0,
-            .document = document,
-            .screen_top = 0,
-            .cursor_row = 0,
-            .cursor_column = 0,
-            .cursor_visible = false,
-        };
-    }
-
-    fn deinit(self: *Emulator) void {
-        for (self.document.items) |*row| row.deinit(self.gpa);
-        self.document.deinit(self.gpa);
-    }
-
-    fn feed(self: *Emulator, bytes: []const u8) !void {
-        var index: usize = 0;
-        while (index < bytes.len) {
-            const byte = bytes[index];
-            if (byte == 0x1b) {
-                index += try self.control(bytes[index..]);
-                continue;
-            }
-            if (byte == '\r') {
-                self.cursor_column = 0;
-                index += 1;
-                continue;
-            }
-            if (byte == '\n') {
-                try self.lineFeed();
-                index += 1;
-                continue;
-            }
-            const step = grapheme.stepAt(bytes[index..]);
-            try self.put(bytes[index .. index + step.bytes], step.columns);
-            index += step.bytes;
-        }
-    }
-
-    fn control(self: *Emulator, sequence: []const u8) !usize {
-        if (sequence.len < 2) return sequence.len;
-        switch (sequence[1]) {
-            '[' => return self.csi(sequence),
-            ']', '_', 'P', '^', 'X' => {
-                var index: usize = 2;
-                while (index < sequence.len) : (index += 1) {
-                    if (sequence[index] == 0x07) return index + 1;
-                    if (sequence[index] == 0x1b and index + 1 < sequence.len and sequence[index + 1] == '\\') {
-                        return index + 2;
-                    }
-                }
-                return sequence.len;
-            },
-            else => return 2,
-        }
-    }
-
-    fn csi(self: *Emulator, sequence: []const u8) !usize {
-        var index: usize = 2;
-        while (index < sequence.len and (sequence[index] < 0x40 or sequence[index] > 0x7e)) : (index += 1) {}
-        if (index >= sequence.len) return sequence.len;
-        const params = sequence[2..index];
-        switch (sequence[index]) {
-            'A' => {
-                std.debug.assert(self.cursor_row >= self.screen_top);
-                self.cursor_row -= @min(csiValue(params, 1), self.cursor_row - self.screen_top);
-            },
-            // CUD clamps at the bottom row; it never scrolls or grows the document.
-            'B' => self.cursor_row = @min(self.cursor_row + csiValue(params, 1), self.document.items.len - 1),
-            // CUF clamps at the right margin; it cannot reach a pending-wrap cell.
-            'C' => self.cursor_column = @min(self.cursor_column + csiValue(params, 1), self.columns - 1),
-            'H' => {
-                self.cursor_row = self.screen_top;
-                self.cursor_column = 0;
-            },
-            'J' => switch (csiValue(params, 0)) {
-                2 => try self.clearScreen(),
-                0 => try self.clearBelow(),
-                else => {},
-            },
-            'h' => if (std.mem.eql(u8, params, "?25")) {
-                self.cursor_visible = true;
-            },
-            'l' => if (std.mem.eql(u8, params, "?25")) {
-                self.cursor_visible = false;
-            },
-            else => {},
-        }
-        return index + 1;
-    }
-
-    fn clearScreen(self: *Emulator) !void {
-        for (self.document.items) |*row| row.deinit(self.gpa);
-        self.document.clearRetainingCapacity();
-        try self.document.append(self.gpa, .empty);
-        self.cursor_row = 0;
-        self.cursor_column = 0;
-        self.screen_top = 0;
-    }
-
-    // Advance the cursor one physical row, scrolling the screen's top row into
-    // scrollback when the cursor is already on the bottom row — a terminal's
-    // auto-scroll, which is what makes evicted rows unaddressable.
-    fn lineFeed(self: *Emulator) !void {
-        if (self.rows > 0 and self.cursor_row + 1 >= self.screen_top + self.rows) self.screen_top += 1;
-        self.cursor_row += 1;
-        try self.ensureRow(self.cursor_row);
-    }
-
-    fn clearBelow(self: *Emulator) !void {
-        while (self.document.items.len > self.cursor_row + 1) {
-            var row = self.document.pop().?;
-            row.deinit(self.gpa);
-        }
-        self.document.items[self.cursor_row].clearRetainingCapacity();
-    }
-
-    fn ensureRow(self: *Emulator, row: usize) !void {
-        while (self.document.items.len <= row) try self.document.append(self.gpa, .empty);
-    }
-
-    fn put(self: *Emulator, bytes: []const u8, columns: usize) !void {
-        if (self.cursor_column + columns > self.columns and self.cursor_column > 0) {
-            try self.lineFeed();
-            self.cursor_column = 0;
-        }
-        try self.ensureRow(self.cursor_row);
-        try self.document.items[self.cursor_row].appendSlice(self.gpa, bytes);
-        self.cursor_column += columns;
-    }
-
-    fn csiValue(params: []const u8, default: usize) usize {
-        return std.fmt.parseInt(usize, params, 10) catch default;
-    }
-
-    // The current frame occupies the last `frame.len` rows of the document; the
-    // rows above are scrollback from earlier paints.
-    fn expectVisible(self: *Emulator, frame: []const []const u8) !void {
-        try std.testing.expect(self.document.items.len >= frame.len);
-        const base = self.document.items.len - frame.len;
-        for (frame, 0..) |row, index| {
-            try std.testing.expectEqualStrings(row, self.document.items[base + index].items);
-        }
-    }
-
-    fn expectCaret(self: *Emulator, frame_len: usize, row: usize, column: usize) !void {
-        try std.testing.expect(self.cursor_visible);
-        try std.testing.expectEqual(self.document.items.len - frame_len + row, self.cursor_row);
-        try std.testing.expectEqual(column, self.cursor_column);
-    }
-
-    // The physical screen: the `rows` rows at and below the scroll top. Rows
-    // that scrolled past the top are excluded, so a repaint that leaves stale
-    // content on screen or fails to reveal a row it moved into view is caught.
-    fn expectScreen(self: *Emulator, screen: []const []const u8) !void {
-        for (screen, 0..) |row, index| {
-            const at = self.screen_top + index;
-            const actual = if (at < self.document.items.len) self.document.items[at].items else "";
-            try std.testing.expectEqualStrings(row, actual);
-        }
-    }
-};
+fn oneRow(bytes: []const u8, columns_max: usize) bool {
+    if (width.ofText(bytes) > columns_max) return false;
+    for (bytes) |byte| switch (byte) {
+        '\n', '\r', '\t', 0x08, 0x0b, 0x0c => return false,
+        else => {},
+    };
+    return true;
+}
 
 // Drives one `render` and replays only the bytes it produced into the emulator.
 const Harness = struct {
