@@ -220,6 +220,20 @@ Extension seams referenced here:
       one frame per stream event and freezes during the initial pre-first-token wait, because the
       loop is blocked for the whole turn. Depends on the off-thread networking work so the UI thread
       is free to tick a timer while the request is in flight.
+- [ ] **Extract the render consumer into a `Session` struct.** The off-thread event loop keeps the
+      consumer-owned model (`Transcript`, tail/mode, editor, input, view, displayed stats/model) and
+      its event-appliers (`applyStreamEvent`) and `paint` in `App`, alongside the composition root
+      and the producer tasks. Split that model plus `applyStreamEvent`/`paint` into a `Session`
+      struct so `App` is only the io/tasks/tty/agent wiring, giving the render loop an isolated,
+      io-free test surface instead of one built from a partially-initialized `App`. Deferred from
+      the off-thread-networking change, which kept it in `App` to stay scoped to the mechanism.
+- [ ] **Signal-driven resize.** React to terminal resizes via `SIGWINCH` rather than polling.
+      Depends on the off-thread networking work: once the event loop is a channel consumer, a
+      resize must arrive as a `UiEvent`, but a POSIX signal handler is async-signal-safe only and
+      cannot take the channel lock to enqueue one — so this needs a signal-to-event bridge (a
+      dedicated task awaiting the signal through an io primitive, or a self-pipe). Interim behavior
+      is a `Tty.size()` check folded onto the frame tick while non-idle, which misses a resize that
+      happens while the interface is fully idle until the next event.
 - [ ] **Context-window pressure signal.** The status line shows `ctx%` but nothing reacts to it.
       Warn as context fills (e.g. color the gauge past a threshold) and wire a threshold into
       `/handoff` compaction. Thresholds configurable with good defaults. Two model-specific

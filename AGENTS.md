@@ -8,13 +8,14 @@ terminal UI renderer for modern terminals (Ghostty and friends).
 Three modules, wired in `build.zig`. Imports flow one way — `pith` depends on both libs; the libs
 never import each other or the app — and the module boundary makes a back-edge a compile error:
 
-- `lib/terminal/` — the reusable terminal rendering engine (`Tty`, `escape`, the differential
-  `Screen`, `Input`, the `cursor` marker, the UAX #29 `grapheme` segmenter, and the display-`width`
-  math built on it). Knows nothing about the app or the agent.
+- `lib/terminal/` — the reusable terminal rendering engine (`Tty`, `escape`, the reconciling `View`
+  renderer, `Input`, the UAX #29 `grapheme` segmenter, and the display-`width` math built on it).
+  Knows nothing about the app or the agent.
 - `lib/ai/` — the provider-neutral agent core (`Agent`, `llm`, `models`, `provider`, `command`,
   `tool`, `anthropic`).
-- `src/` — the `pith` app: `main`, `App` (composition root + transcript block rendering), and the
-  `ui/` widgets (`Editor`, `Picker`, `status`, `separator`) drawn on the engine.
+- `src/` — the `pith` app: `main`, `App` (composition root + event loop), the `Transcript` model,
+  the `layout` projection onto the bounded window, and the `ui/` widgets (`Editor`, `Picker`,
+  `status`, and the `block`, `color`, and `paint` primitives) drawn on the engine.
 
 Each module has its own test artifact, and its `root.zig` owns the public namespace (the only place
 re-exports are allowed). A test only runs if its file is reachable from the module `root.zig` (via a

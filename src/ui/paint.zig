@@ -10,7 +10,7 @@ const terminal = @import("terminal");
 
 const color = @import("color.zig");
 
-/// Braille frames for the "Working…" spinner, advanced one step per stream event.
+/// Braille frames for the "Working…" spinner, advanced one step per frame tick.
 const spinner_frames = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };
 
 /// Display width of the full `⠋ Working…` spinner: glyph, space, and message.

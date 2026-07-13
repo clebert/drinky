@@ -9,6 +9,10 @@ const escape = @import("escape.zig");
 
 const Tty = @This();
 
+// The read path (`in_handle`) and the write path (`out_handle`, `out_stream`,
+// `out_buffer`) share no mutable field, so an input-reader task blocked in `read`
+// and a render consumer writing through `writer` can run concurrently without a
+// lock. Preserve that split: do not add a field both paths touch.
 io: std.Io,
 in_handle: std.posix.fd_t,
 out_handle: std.posix.fd_t,

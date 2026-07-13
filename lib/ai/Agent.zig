@@ -2,7 +2,7 @@
 //! reply, run any tools it calls, feed the results back, and repeat until the
 //! model stops asking for tools. Owns the conversation history and talks to the
 //! model through a neutral `provider.Client`; presentation is delegated to a
-//! `handler` with `onText`/`onToolStart`/`onToolResult`/`onError`.
+//! `handler` with `onText`/`onToolStart`/`onToolResult`/`onUsage`/`onError`.
 
 const std = @import("std");
 
@@ -26,7 +26,7 @@ stats: Stats,
 
 /// Cumulative dollar cost and cache savings over the session, plus the most
 /// recent message's usage for the cache-hit and context-window gauges.
-const Stats = struct {
+pub const Stats = struct {
     cost: f64 = 0,
     saved: f64 = 0,
     last: llm.Usage = .{},
@@ -136,7 +136,10 @@ fn consume(self: *Agent, stream: *provider.Stream, handler: anytype) !bool {
             in_tool = true;
         },
         .input_json => |chunk| try input.appendSlice(self.gpa, chunk),
-        .stop => |stop| self.recordUsage(stop.usage),
+        .stop => |stop| {
+            self.recordUsage(stop.usage);
+            try handler.onUsage(self.stats);
+        },
     };
     try flushText(arena, &blocks, &text);
     if (in_tool) try flushTool(arena, &blocks, .{ .id = tool_id, .name = tool_name }, &input);

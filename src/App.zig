@@ -1,22 +1,31 @@
 //! The composition root and event loop. Wires the terminal, reconciling view,
 //! input parser, editor, and agent together: ensures the user is authenticated,
-//! then reads keys into the editor and drives one agent turn per submitted line,
-//! streaming the reply into the transcript.
+//! then drives the interface off a single event channel — producer tasks push
+//! `UiEvent`s onto it, one consumer applies them to the model and paints.
 //!
-//! It owns the long-lived subsystems and the interaction state, but delegates the
-//! two heavy jobs: `Transcript` holds the blocks above the live tail and the
-//! "model run" invariant, and `layout` projects the visible scene onto the
-//! bounded window. `refresh` is the seam — it snapshots the size and the agent's
-//! status, assembles a plain `layout.Scene`, and hands it off, so the render path
-//! is a pure function of the model with no live tty or agent needed.
+//! Network and stream I/O run off the UI thread. Three `io.concurrent` producers
+//! feed one `std.Io.Queue(UiEvent)`: a long-lived input reader (stdin → `.keys`),
+//! the current turn worker (`agent.run` → `.text`/`.tool_*`/`.usage`/`.turn_ended`),
+//! and a one-shot frame timer (sleep → `.tick`). The consumer — the sole owner of
+//! the model and the only thing that paints — blocks on the channel, drains a
+//! coalesced batch, applies each event (marking the model dirty, never painting),
+//! and paints only when it drains a `.tick`. A tick is armed whenever the model is
+//! dirty or a turn animates and none is pending, so a clean idle interface arms no
+//! tick and stays inert.
+//!
+//! `Transcript` holds the blocks above the live tail and the "model run"
+//! invariant; `layout` projects the visible scene onto the bounded window;
+//! `refresh`/`paint` are the render seam, a pure function of the consumer-owned
+//! model (stats and model snapshots included) with no live tty or agent needed.
 
 const std = @import("std");
 
 const ai = @import("ai");
 const terminal = @import("terminal");
+
 const layout = @import("layout.zig");
-const ui = @import("ui/root.zig");
 const Transcript = @import("Transcript.zig");
+const ui = @import("ui/root.zig");
 
 const App = @This();
 
@@ -34,11 +43,13 @@ const intro_text = "pith — enter: send · shift+enter: newline · esc: cancel 
 /// Two Ctrl+C presses within this window quit; a lone press clears the editor.
 const ctrl_c_window_ms = 500;
 
-/// Idle read timeout: how often the loop wakes to catch a terminal resize when
-/// no key is pressed.
-const resize_poll: std.Io.Timeout = .{
-    .duration = .{ .raw = std.Io.Duration.fromMilliseconds(100), .clock = .awake },
-};
+/// Target frame interval: paints are rate-limited to one per this window, so a
+/// keystroke echoes within it and a burst of stream events coalesces into it.
+const frame_interval_ms = 16;
+
+/// Events the channel buffers before a producer blocks in `putOne`. One batched
+/// `get` drains up to this many at once, so a whole burst collapses into a frame.
+const queue_capacity = 256;
 
 gpa: std.mem.Allocator,
 io: std.Io,
@@ -55,6 +66,28 @@ running: bool,
 last_ctrl_c: i64,
 /// The current interaction: waiting for input, streaming a turn, or picking.
 mode: Mode,
+/// The one cross-thread channel: producer tasks push `UiEvent`s, the consumer
+/// drains and applies them. Backed by `queue_buffer`, so pin the `App`.
+queue: std.Io.Queue(UiEvent),
+queue_buffer: [queue_capacity]UiEvent,
+/// The long-lived stdin reader task; cancelled and reaped at shutdown.
+input_future: std.Io.Future(void),
+/// The running turn worker, or null between turns.
+turn_future: ?std.Io.Future(void),
+/// The pending frame timer, or null when none is armed (idle or clean).
+tick_future: ?std.Io.Future(void),
+/// The model changed since the last paint; the next tick repaints and clears it.
+dirty: bool,
+/// A frame timer is armed and its `.tick` has not been drained yet.
+tick_pending: bool,
+/// Monotonic time of the last paint, so the next tick lands one interval later.
+last_paint_ms: i64,
+/// Consumer-owned copy of the agent's usage/cost, updated by `.usage` events so
+/// the status gauge never reads `agent.stats` across the worker thread.
+stats_shown: ai.Agent.Stats,
+/// Consumer-owned copy of the active model, updated by `/model`, so `paint` needs
+/// no agent for the context-window and model-name gauges.
+model_shown: ai.models.Model,
 
 /// The current interaction. Exactly one input is live: the editor while waiting
 /// (`prompt`) or streaming a turn (`turn`, where it is inert), or a `picker`.
@@ -91,8 +124,89 @@ const Picking = struct {
     command: []const u8,
 };
 
+/// A message from a producer task to the render consumer. Every payload owns its
+/// bytes: the producer allocates them from the shared gpa, the consumer frees
+/// them after applying. `.usage` is a plain value and `.tick` is empty; neither
+/// owns anything.
+const UiEvent = union(enum) {
+    keys: []u8,
+    text: []u8,
+    tool_start: Tool,
+    tool_result: ToolResult,
+    usage: ai.Agent.Stats,
+    turn_ended: ?[]u8,
+    tick,
+
+    const Tool = struct { name: []u8, input_json: []u8 };
+    const ToolResult = struct { name: []u8, content: []u8, is_error: bool };
+
+    fn deinit(self: UiEvent, gpa: std.mem.Allocator) void {
+        switch (self) {
+            .keys, .text => |bytes| gpa.free(bytes),
+            .tool_start => |tool| {
+                gpa.free(tool.name);
+                gpa.free(tool.input_json);
+            },
+            .tool_result => |result| {
+                gpa.free(result.name);
+                gpa.free(result.content);
+            },
+            .turn_ended => |maybe_text| if (maybe_text) |text| gpa.free(text),
+            .usage, .tick => {},
+        }
+    }
+};
+
+/// The turn worker's presentation handler: instead of mutating the transcript, it
+/// enqueues owned `UiEvent`s for the consumer. Lives on the worker thread, so it
+/// touches only the thread-safe channel and gpa. `agent.run`'s `anytype` handler
+/// makes this a drop-in for the consumer-side handler.
+const TurnHandler = struct {
+    app: *App,
+    /// Owned error text captured from `onError`, which the agent calls just before
+    /// a failed turn returns; the worker carries it into the single `.turn_ended`.
+    error_text: ?[]u8 = null,
+
+    pub fn onText(self: *TurnHandler, delta: []const u8) !void {
+        const copy = try self.app.gpa.dupe(u8, delta);
+        errdefer self.app.gpa.free(copy);
+        try self.app.queue.putOne(self.app.io, .{ .text = copy });
+    }
+
+    pub fn onToolStart(self: *TurnHandler, name: []const u8, input_json: []const u8) !void {
+        const name_copy = try self.app.gpa.dupe(u8, name);
+        errdefer self.app.gpa.free(name_copy);
+        const json_copy = try self.app.gpa.dupe(u8, input_json);
+        errdefer self.app.gpa.free(json_copy);
+        try self.app.queue.putOne(self.app.io, .{ .tool_start = .{ .name = name_copy, .input_json = json_copy } });
+    }
+
+    pub fn onToolResult(self: *TurnHandler, name: []const u8, content: []const u8, is_error: bool) !void {
+        const name_copy = try self.app.gpa.dupe(u8, name);
+        errdefer self.app.gpa.free(name_copy);
+        const content_copy = try self.app.gpa.dupe(u8, content);
+        errdefer self.app.gpa.free(content_copy);
+        try self.app.queue.putOne(self.app.io, .{ .tool_result = .{
+            .name = name_copy,
+            .content = content_copy,
+            .is_error = is_error,
+        } });
+    }
+
+    pub fn onUsage(self: *TurnHandler, stats: ai.Agent.Stats) !void {
+        try self.app.queue.putOne(self.app.io, .{ .usage = stats });
+    }
+
+    pub fn onError(self: *TurnHandler, text: []const u8) !void {
+        const copy = try self.app.gpa.dupe(u8, text);
+        if (self.error_text) |old| self.app.gpa.free(old);
+        self.error_text = copy;
+    }
+};
+
 /// Authenticate (logging in if needed), then run the interactive loop until the
-/// user quits or stdin closes. Pin the value: streams borrow its buffers.
+/// user quits or stdin closes. Pin the value: streams and the channel borrow its
+/// buffers.
 pub fn run(self: *App, gpa: std.mem.Allocator, io: std.Io, home: []const u8) !void {
     self.gpa = gpa;
     self.io = io;
@@ -100,6 +214,13 @@ pub fn run(self: *App, gpa: std.mem.Allocator, io: std.Io, home: []const u8) !vo
     self.rows = 24;
     self.last_ctrl_c = 0;
     self.mode = .prompt;
+    self.dirty = false;
+    self.tick_pending = false;
+    self.last_paint_ms = 0;
+    self.turn_future = null;
+    self.tick_future = null;
+    self.stats_shown = .{};
+    self.queue = std.Io.Queue(UiEvent).init(&self.queue_buffer);
     defer self.deinitMode();
     self.transcript = Transcript.init(gpa);
     defer self.transcript.deinit();
@@ -110,6 +231,7 @@ pub fn run(self: *App, gpa: std.mem.Allocator, io: std.Io, home: []const u8) !vo
 
     self.agent = ai.Agent.init(gpa, io, ai.provider.Client.init(.anthropic, gpa, io, &self.auth), .{ .model = model_info, .system = system_prompt });
     defer self.agent.deinit();
+    self.model_shown = self.agent.model;
 
     try self.tty.init(io);
     defer self.tty.deinit();
@@ -122,26 +244,150 @@ pub fn run(self: *App, gpa: std.mem.Allocator, io: std.Io, home: []const u8) !vo
 
     try self.transcript.append(.intro, false, intro_text);
     try self.refresh();
+    self.last_paint_ms = self.nowMs();
 
     self.running = true;
-    var read_buffer: [4096]u8 = undefined;
-    while (self.running) {
-        const count = (self.tty.read(&read_buffer, resize_poll) catch break) orelse {
-            try self.resizeIfChanged();
-            continue;
-        };
-        if (count == 0) continue;
-        try self.input.feed(read_buffer[0..count]);
-        while (self.input.next()) |event| try self.handleKey(event);
+    self.input_future = try self.io.concurrent(readInput, .{self});
+    defer self.shutdownTasks();
+
+    try self.runLoop();
+}
+
+/// Cancel and reap every producer task, then drain and free any events they left
+/// buffered. Runs before `tty.deinit`, so the reader has stopped touching stdin
+/// before termios is restored.
+fn shutdownTasks(self: *App) void {
+    if (self.turn_future) |*future| {
+        future.cancel(self.io);
+        self.turn_future = null;
+    }
+    self.input_future.cancel(self.io);
+    if (self.tick_future) |*future| {
+        future.cancel(self.io);
+        self.tick_future = null;
+    }
+    self.drainQueue();
+}
+
+/// Free every event still buffered on the channel. Only safe once the producers
+/// are reaped, so no new event can arrive mid-drain.
+fn drainQueue(self: *App) void {
+    var batch: [queue_capacity]UiEvent = undefined;
+    while (true) {
+        const count = self.queue.get(self.io, &batch, 0) catch break;
+        if (count == 0) break;
+        for (batch[0..count]) |event| event.deinit(self.gpa);
     }
 }
 
-/// Repaint if the terminal was resized while idle, so the frame follows the new
-/// size without waiting for the next keystroke.
-fn resizeIfChanged(self: *App) !void {
-    const window = self.tty.size() orelse return;
-    if (window.columns == self.columns and window.rows == self.rows) return;
-    try self.refresh();
+/// The consumer: block on the channel, drain a coalesced batch, apply each event
+/// to the model, and paint only on a `.tick`. A tick is armed whenever the model
+/// is dirty or a turn animates and none is pending, so a clean idle interface
+/// stays inert (no tick, blocked on an empty channel).
+fn runLoop(self: *App) !void {
+    var batch: [queue_capacity]UiEvent = undefined;
+    while (self.running) {
+        const count = self.queue.get(self.io, &batch, 1) catch |err| switch (err) {
+            error.Closed, error.Canceled => break,
+        };
+        var ticked = false;
+        for (batch[0..count]) |event| switch (event) {
+            .tick => ticked = true,
+            .keys => |bytes| {
+                defer self.gpa.free(bytes);
+                try self.handleKeys(bytes);
+            },
+            else => try self.applyStreamEvent(event),
+        };
+        if (!self.animating()) {
+            if (self.turn_future) |*future| {
+                future.await(self.io);
+                self.turn_future = null;
+            }
+        }
+        if (ticked) {
+            self.tick_pending = false;
+            if (self.tick_future) |*future| {
+                future.await(self.io);
+                self.tick_future = null;
+            }
+            if (self.advanceFrame()) {
+                try self.refresh();
+                self.dirty = false;
+                self.last_paint_ms = self.nowMs();
+            }
+        }
+        if ((self.dirty or self.animating()) and !self.tick_pending) self.armTick();
+    }
+}
+
+/// Arm the next frame: a one-shot timer that fires at `last_paint + interval`. On
+/// the impossible failure to spawn it, paint inline so the frame is not lost.
+fn armTick(self: *App) void {
+    const elapsed = self.nowMs() - self.last_paint_ms;
+    const delay_ms: i64 = if (elapsed >= frame_interval_ms) 0 else frame_interval_ms - elapsed;
+    self.tick_future = self.io.concurrent(frameTimer, .{ self, delay_ms }) catch {
+        self.refresh() catch {};
+        self.dirty = false;
+        self.last_paint_ms = self.nowMs();
+        return;
+    };
+    self.tick_pending = true;
+}
+
+/// Frame timer task: sleep until the deadline, then push one `.tick`. Cancelled at
+/// shutdown or when its frame is superseded; a cancel just drops the tick.
+fn frameTimer(self: *App, delay_ms: i64) void {
+    if (delay_ms > 0) self.io.sleep(.fromMilliseconds(delay_ms), .awake) catch return;
+    self.queue.putOne(self.io, .tick) catch {};
+}
+
+/// Input reader task: block on stdin and push each chunk as owned `.keys`. Exits
+/// on cancel (shutdown); on stdin close or a read fault it closes the channel so
+/// the consumer's `get` returns `error.Closed` and the program winds down.
+fn readInput(self: *App) void {
+    var buffer: [4096]u8 = undefined;
+    while (true) {
+        const result = self.tty.read(&buffer, .none) catch |err| switch (err) {
+            error.Canceled => return,
+            else => {
+                self.queue.close(self.io);
+                return;
+            },
+        };
+        const count = result orelse continue;
+        if (count == 0) continue;
+        const copy = self.gpa.dupe(u8, buffer[0..count]) catch {
+            self.queue.close(self.io);
+            return;
+        };
+        self.queue.putOne(self.io, .{ .keys = copy }) catch {
+            self.gpa.free(copy);
+            return;
+        };
+    }
+}
+
+/// Turn worker task: run one turn through a `TurnHandler`, then push the single
+/// `.turn_ended` (carrying any error text). A cancelled turn pushes nothing — the
+/// consumer that cancelled it owns the teardown. `agent.run`'s `errdefer` rolls
+/// `messages` back to the turn base on every error path.
+fn runTurnWorker(self: *App, text: []u8) void {
+    defer self.gpa.free(text);
+    var handler: TurnHandler = .{ .app = self };
+    self.agent.run(text, &handler) catch |err| switch (err) {
+        error.Canceled, error.Closed => {
+            if (handler.error_text) |extra| self.gpa.free(extra);
+            return;
+        },
+        else => {
+            if (handler.error_text == null)
+                handler.error_text = self.gpa.dupe(u8, @errorName(err)) catch null;
+        },
+    };
+    self.queue.putOne(self.io, .{ .turn_ended = handler.error_text }) catch {
+        if (handler.error_text) |extra| self.gpa.free(extra);
+    };
 }
 
 fn ensureAuth(self: *App) !void {
@@ -151,10 +397,17 @@ fn ensureAuth(self: *App) !void {
     try self.auth.login(&stdout.interface);
 }
 
+/// Decode a stdin chunk into key events and apply each. Runs on the consumer, so
+/// a submitted line spawns a turn worker and ctrl-c cancels a running one.
+fn handleKeys(self: *App, bytes: []const u8) !void {
+    try self.input.feed(bytes);
+    while (self.input.next()) |event| try self.handleKey(event);
+}
+
 fn handleKey(self: *App, event: terminal.Input.Key) !void {
     switch (self.mode) {
         .picking => return self.handlePickerKey(event),
-        .turn => return,
+        .turn => return self.handleTurnKey(event),
         .prompt => {},
     }
     switch (event) {
@@ -185,7 +438,35 @@ fn handleKey(self: *App, event: terminal.Input.Key) !void {
         },
         .escape, .unknown => return,
     }
-    try self.refresh();
+    self.dirty = true;
+}
+
+/// Keys during a streaming turn: ctrl-c or esc cancels it; everything else is
+/// ignored (steering — typing while a turn runs — is a separate backlog item).
+fn handleTurnKey(self: *App, event: terminal.Input.Key) !void {
+    switch (event) {
+        .escape => try self.cancelTurn(),
+        .ctrl => |letter| switch (letter) {
+            'c' => try self.cancelTurn(),
+            else => {},
+        },
+        else => {},
+    }
+}
+
+/// Abort the running turn: cancel and reap the worker (interrupting its blocked
+/// network read), close the open model run, and drop the turn's chrome. Any
+/// events the worker already queued are dropped when applied, since the mode is
+/// no longer a turn.
+fn cancelTurn(self: *App) !void {
+    if (self.turn_future) |*future| {
+        future.cancel(self.io);
+        self.turn_future = null;
+    }
+    self.transcript.endModelRun();
+    self.endTurn();
+    try self.transcript.append(.feedback, false, "cancelled");
+    self.dirty = true;
 }
 
 /// Ctrl+C: clear the editor, or quit when pressed twice inside the window.
@@ -200,8 +481,8 @@ fn clearOrQuit(self: *App) void {
 }
 
 /// Repaint: read the terminal size (keeping the last known one if the query
-/// fails), snapshot the agent's status, assemble the visible scene, and hand it
-/// to the layout projection.
+/// fails), then hand the model to the projection at that size. Reading size here
+/// picks up a resize on the next frame while a turn animates.
 fn refresh(self: *App) !void {
     const size: terminal.View.Size = if (self.tty.size()) |window|
         .{ .columns = window.columns, .rows = window.rows }
@@ -209,14 +490,19 @@ fn refresh(self: *App) !void {
         .{ .columns = self.columns, .rows = self.rows };
     self.columns = size.columns;
     self.rows = size.rows;
+    try self.paint(size);
+}
 
-    const stats = self.agent.stats;
+/// Assemble the visible scene from the consumer-owned model and project it. Pure
+/// in the model, stats, and model snapshots — no tty or agent — so the consumer
+/// can be driven from a scripted event sequence in tests.
+fn paint(self: *App, size: terminal.View.Size) !void {
     const status: ui.status.Info = .{
-        .last = stats.last,
-        .cost = stats.cost,
-        .saved = stats.saved,
-        .context_window = self.agent.model.context_window,
-        .model = self.agent.model.name,
+        .last = self.stats_shown.last,
+        .cost = self.stats_shown.cost,
+        .saved = self.stats_shown.saved,
+        .context_window = self.model_shown.context_window,
+        .model = self.model_shown.name,
     };
 
     const tail: layout.Tail = switch (self.mode) {
@@ -245,13 +531,29 @@ fn refresh(self: *App) !void {
     try layout.project(&self.view, size, &scene);
 }
 
-/// Advance the spinner one frame. The loop is blocked during a turn, so this runs
-/// per stream event rather than on a timer.
+/// Advance the spinner one frame. Driven by the frame timer while a turn runs, so
+/// it animates independently of stream events.
 fn advanceSpinner(self: *App) void {
     switch (self.mode) {
         .turn => |*turn| turn.spinner_frame = ui.paint.spinnerStep(turn.spinner_frame),
         else => {},
     }
+}
+
+/// Whether a component wants continuous frames: today, a streaming turn's spinner.
+fn animating(self: *const App) bool {
+    return switch (self.mode) {
+        .turn => true,
+        else => false,
+    };
+}
+
+/// Advance one animation frame and report whether this tick repaints. A turn
+/// steps the spinner every frame without marking the model dirty, so a tick
+/// repaints on new model content or ongoing animation.
+fn advanceFrame(self: *App) bool {
+    if (self.animating()) self.advanceSpinner();
+    return self.dirty or self.animating();
 }
 
 /// The running turn, if a turn is streaming.
@@ -262,13 +564,18 @@ fn activeTurn(self: *App) ?*Turn {
     };
 }
 
+/// Milliseconds on the monotonic clock, for frame scheduling.
+fn nowMs(self: *App) i64 {
+    return std.Io.Timestamp.now(self.io, .awake).toMilliseconds();
+}
+
 fn submit(self: *App) !void {
     const trimmed = std.mem.trim(u8, self.editor.content(), " \t\r\n");
     if (trimmed.len == 0) return;
     const text = try self.gpa.dupe(u8, trimmed);
     defer self.gpa.free(text);
     self.editor.clear();
-    try self.refresh();
+    self.dirty = true;
 
     if (std.mem.startsWith(u8, text, "/")) {
         try self.runCommand(text);
@@ -276,18 +583,24 @@ fn submit(self: *App) !void {
         try self.transcript.append(.user, false, text);
         try self.runTurn(text);
     }
-    try self.refresh();
 }
 
-/// Drive one agent turn, streaming its reply into the transcript while the
-/// spinner and (inert) input box stay pinned below it.
+/// Spawn a turn worker over `text` and enter turn mode. The worker owns its own
+/// copy of the prompt; only commit to turn mode once the spawn succeeds.
 fn runTurn(self: *App, text: []const u8) !void {
+    // A worker that finished earlier in this same batch (its `.turn_ended` already
+    // flipped the mode back to prompt) is not reaped until after the batch, so
+    // reap it here before its handle is overwritten.
+    if (self.turn_future) |*future| {
+        future.await(self.io);
+        self.turn_future = null;
+    }
+    const owned = try self.gpa.dupe(u8, text);
+    errdefer self.gpa.free(owned);
     self.transcript.endModelRun();
+    self.turn_future = try self.io.concurrent(runTurnWorker, .{ self, owned });
     self.mode = .{ .turn = .{ .spinner_frame = 0, .tools = .empty, .box_view = .empty } };
-    try self.refresh();
-    self.agent.run(text, self) catch |err| try self.emitError(@errorName(err));
-    self.endTurn();
-    self.transcript.endModelRun();
+    self.dirty = true;
 }
 
 /// Free the finished turn's tool state and return to waiting for input.
@@ -296,14 +609,51 @@ fn endTurn(self: *App) void {
     self.mode = .prompt;
 }
 
+/// Apply one worker event to the model, marking it dirty and freeing the event's
+/// bytes. Applying never paints. A worker event that arrives once the turn is over
+/// (a straggler from a just-cancelled turn) is freed and dropped.
+fn applyStreamEvent(self: *App, event: UiEvent) !void {
+    defer event.deinit(self.gpa);
+    if (!self.animating()) return;
+    self.dirty = true;
+    switch (event) {
+        .text => |delta| try self.transcript.appendModelText(delta),
+        .tool_start => |tool| {
+            self.transcript.endModelRun();
+            if (self.activeTurn()) |turn| try pushTool(turn, self.gpa, tool.name, tool.input_json);
+        },
+        .tool_result => |result| try self.applyToolResult(result),
+        .usage => |stats| self.stats_shown = stats,
+        .turn_ended => |maybe_text| {
+            if (maybe_text) |text| try self.transcript.append(.feedback, true, text);
+            self.transcript.endModelRun();
+            self.endTurn();
+        },
+        .keys, .tick => unreachable,
+    }
+}
+
+/// Record a finished tool call in the transcript: its first output line beside the
+/// box it closes, then free that box.
+fn applyToolResult(self: *App, result: UiEvent.ToolResult) !void {
+    const first = result.content[0 .. std.mem.indexOfScalar(u8, result.content, '\n') orelse result.content.len];
+    const finished = if (self.activeTurn()) |turn| takeTool(turn, result.name) else null;
+    defer if (finished) |*tool| self.freeTool(tool);
+    const arguments = if (finished) |tool| tool.input_json else "";
+    const text = try std.fmt.allocPrint(self.gpa, "{s} {s}\n→ {s}", .{ result.name, arguments, first });
+    defer self.gpa.free(text);
+    try self.transcript.append(.tool_result, result.is_error, text);
+}
+
 /// Handle a slash command locally: either print its feedback or open a picker.
 fn runCommand(self: *App, line: []const u8) !void {
     var context: ai.command.Context = .{ .gpa = self.gpa, .agent = &self.agent };
     try self.handleOutcome(try ai.command.run(&context, line));
-    try self.refresh();
+    self.model_shown = self.agent.model;
+    self.dirty = true;
 }
 
-/// Apply a command outcome to the transcript state; the caller refreshes.
+/// Apply a command outcome to the transcript state; the caller marks dirty.
 fn handleOutcome(self: *App, outcome: ai.command.Outcome) !void {
     switch (outcome) {
         .feedback => |feedback| {
@@ -340,7 +690,7 @@ fn handlePickerKey(self: *App, event: terminal.Input.Key) !void {
         },
         else => return,
     }
-    try self.refresh();
+    self.dirty = true;
 }
 
 /// Re-apply the picker's command with the highlighted option as its argument.
@@ -350,13 +700,14 @@ fn confirmPicker(self: *App) !void {
     const outcome = try ai.command.apply(&context, picking.command, picking.picker.choice());
     self.closePicker();
     try self.handleOutcome(outcome);
-    try self.refresh();
+    self.model_shown = self.agent.model;
+    self.dirty = true;
 }
 
 fn cancelPicker(self: *App) !void {
     self.closePicker();
     try self.transcript.append(.feedback, false, "cancelled");
-    try self.refresh();
+    self.dirty = true;
 }
 
 fn closePicker(self: *App) void {
@@ -367,19 +718,6 @@ fn closePicker(self: *App) void {
         },
         else => {},
     }
-}
-
-pub fn onText(self: *App, delta: []const u8) !void {
-    self.advanceSpinner();
-    try self.transcript.appendModelText(delta);
-    try self.refresh();
-}
-
-pub fn onToolStart(self: *App, name: []const u8, input_json: []const u8) !void {
-    self.advanceSpinner();
-    self.transcript.endModelRun();
-    if (self.activeTurn()) |turn| try pushTool(turn, self.gpa, name, input_json);
-    try self.refresh();
 }
 
 /// Allocate a running tool call's owned strings and record it on `turn`. Ends at
@@ -395,18 +733,6 @@ fn pushTool(turn: *Turn, gpa: std.mem.Allocator, name: []const u8, input_json: [
     try turn.tools.append(gpa, .{ .name = name_copy, .input_json = arguments, .box = box });
 }
 
-pub fn onToolResult(self: *App, name: []const u8, content: []const u8, is_error: bool) !void {
-    self.advanceSpinner();
-    const first = content[0 .. std.mem.indexOfScalar(u8, content, '\n') orelse content.len];
-    const finished = if (self.activeTurn()) |turn| takeTool(turn, name) else null;
-    defer if (finished) |*tool| self.freeTool(tool);
-    const arguments = if (finished) |tool| tool.input_json else "";
-    const text = try std.fmt.allocPrint(self.gpa, "{s} {s}\n→ {s}", .{ name, arguments, first });
-    defer self.gpa.free(text);
-    try self.transcript.append(.tool_result, is_error, text);
-    try self.refresh();
-}
-
 /// Remove the running tool matching `name` (or the oldest, if none matches) and
 /// hand it to the caller to free.
 fn takeTool(turn: *Turn, name: []const u8) ?ActiveTool {
@@ -415,17 +741,6 @@ fn takeTool(turn: *Turn, name: []const u8) ?ActiveTool {
     }
     if (turn.tools.items.len == 0) return null;
     return turn.tools.orderedRemove(0);
-}
-
-pub fn onError(self: *App, text: []const u8) !void {
-    self.advanceSpinner();
-    try self.emitError(text);
-}
-
-/// Record an error as a red transcript notice and repaint.
-fn emitError(self: *App, text: []const u8) !void {
-    try self.transcript.append(.feedback, true, text);
-    try self.refresh();
 }
 
 fn freeTool(self: *App, tool: *const ActiveTool) void {
@@ -478,4 +793,101 @@ test "a read chunk drives the editor and paints the result" {
     const painted = out.written();
     try std.testing.expect(std.mem.indexOf(u8, painted, "hllo") != null);
     try std.testing.expect(std.mem.indexOf(u8, painted, terminal.escape.sync_set) != null);
+}
+
+// The consumer seam without real io: a scripted turn's worker events drive the
+// transcript, usage, and turn teardown; applying marks dirty but never paints;
+// one paint then renders the coalesced frame. The heavy fields (io, tty, agent,
+// auth, channel, futures) are untouched by `applyStreamEvent` and `paint`.
+test "scripted stream events drive the model and one coalesced paint" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.gpa = gpa;
+    app.columns = 80;
+    app.rows = 24;
+    app.dirty = false;
+    app.stats_shown = .{};
+    app.model_shown = model_info;
+    app.transcript = Transcript.init(gpa);
+    defer app.transcript.deinit();
+    app.editor = ui.Editor.init(gpa);
+    defer app.editor.deinit();
+    app.view = terminal.View.init(gpa, &out.writer);
+    defer app.view.deinit();
+    app.mode = .{ .turn = .{ .spinner_frame = 0, .tools = .empty, .box_view = .empty } };
+    defer app.deinitMode();
+
+    // Owned payloads, exactly as a producer task would allocate them.
+    try app.applyStreamEvent(.{ .text = try gpa.dupe(u8, "he") });
+    try app.applyStreamEvent(.{ .text = try gpa.dupe(u8, "llo") });
+    try app.applyStreamEvent(.{ .tool_start = .{
+        .name = try gpa.dupe(u8, "read"),
+        .input_json = try gpa.dupe(u8, "{\"path\":\"x\"}"),
+    } });
+    try app.applyStreamEvent(.{ .tool_result = .{
+        .name = try gpa.dupe(u8, "read"),
+        .content = try gpa.dupe(u8, "first line\nsecond"),
+        .is_error = false,
+    } });
+    try app.applyStreamEvent(.{ .usage = .{ .cost = 1.5, .saved = 0.25, .last = .{ .input = 10, .output = 20 } } });
+
+    // Applying marks the model dirty but paints nothing.
+    try std.testing.expect(app.dirty);
+    try std.testing.expectEqual(@as(usize, 0), out.written().len);
+    try std.testing.expectEqual(@as(f64, 1.5), app.stats_shown.cost);
+
+    // A clean end leaves turn mode.
+    try app.applyStreamEvent(.{ .turn_ended = null });
+    try std.testing.expect(!app.animating());
+
+    // One paint renders the coalesced frame: streamed text and the tool result.
+    try app.paint(.{ .columns = 80, .rows = 24 });
+    const painted = out.written();
+    try std.testing.expect(std.mem.indexOf(u8, painted, "hello") != null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "read") != null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "first line") != null);
+}
+
+// A worker event arriving after the turn ends (a straggler from a cancelled turn)
+// is freed and dropped, not appended.
+test "stream events are dropped once the turn is over" {
+    const gpa = std.testing.allocator;
+    var app: App = undefined;
+    app.gpa = gpa;
+    app.dirty = false;
+    app.stats_shown = .{};
+    app.mode = .prompt;
+    app.transcript = Transcript.init(gpa);
+    defer app.transcript.deinit();
+
+    try app.applyStreamEvent(.{ .text = try gpa.dupe(u8, "straggler") });
+    try std.testing.expectEqual(@as(usize, 0), app.transcript.blocks().len);
+    try std.testing.expect(!app.dirty);
+}
+
+// Regression: while a turn animates, a tick must repaint even when the model is
+// clean, or the spinner freezes between stream events. `advanceFrame` also steps
+// the spinner, and reports no repaint when idle.
+test "a tick repaints and steps the spinner while a turn animates" {
+    var app: App = undefined;
+    app.gpa = std.testing.allocator;
+
+    // Animating and clean still repaints, and the spinner advances one frame.
+    app.dirty = false;
+    app.mode = .{ .turn = .{ .spinner_frame = 0, .tools = .empty, .box_view = .empty } };
+    try std.testing.expect(app.advanceFrame());
+    try std.testing.expectEqual(@as(usize, 1), app.mode.turn.spinner_frame);
+    app.deinitMode();
+
+    // Idle — clean and not animating — repaints nothing.
+    app.mode = .prompt;
+    app.dirty = false;
+    try std.testing.expect(!app.advanceFrame());
+
+    // New model content repaints even without animation.
+    app.dirty = true;
+    try std.testing.expect(app.advanceFrame());
 }
