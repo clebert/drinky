@@ -155,7 +155,7 @@ pub fn reflow(self: *Editor, columns: usize, viewport_rows: usize) void {
 /// body, the body capped to its scroll limit for `viewport_rows`.
 pub fn rows(self: *const Editor, columns: usize, viewport_rows: usize) usize {
     const total_body = terminal.width.rows(self.text.items, @max(columns, 1));
-    return 2 + @min(total_body, bodyLimit(viewport_rows));
+    return paint.framedRows(@min(total_body, bodyLimit(viewport_rows)));
 }
 
 /// Stream the framed input area — the rules and the wrapped text, windowed to

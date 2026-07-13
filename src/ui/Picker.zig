@@ -74,7 +74,7 @@ pub fn choice(self: *const Picker) []const u8 {
 
 /// Physical rows the picker occupies: the two framing rules plus the body.
 pub fn rows(self: *const Picker, columns: usize) usize {
-    return 2 + terminal.width.rows(self.content.items, @max(columns, 1));
+    return paint.framedRows(terminal.width.rows(self.content.items, @max(columns, 1)));
 }
 
 /// Stream the framed picker — the rules and the wrapped body — through `placement`.

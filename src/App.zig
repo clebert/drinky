@@ -52,17 +52,38 @@ transcript: Transcript,
 columns: usize,
 rows: usize,
 running: bool,
-/// A turn is streaming: show the spinner and keep the input box visible.
-busy: bool,
-spinner_frame: usize,
-active_tool: ?ActiveTool,
 last_ctrl_c: i64,
-picking: ?Picking,
+/// The current interaction: waiting for input, streaming a turn, or picking.
+mode: Mode,
 
-/// The tool call currently running: its blue box shows in the live tail for the
-/// whole blocking call. `box` is the box text (`name input_json`); `input_json`
-/// is kept to label the result. Both owned, freed on completion.
-const ActiveTool = struct { input_json: []const u8, box: []const u8 };
+/// The current interaction. Exactly one input is live: the editor while waiting
+/// (`prompt`) or streaming a turn (`turn`, where it is inert), or a `picker`.
+const Mode = union(enum) {
+    prompt,
+    turn: Turn,
+    picking: Picking,
+};
+
+/// A streaming turn: the spinner frame and the tool calls currently running,
+/// each shown as its own box in the live tail.
+const Turn = struct {
+    spinner_frame: usize,
+    tools: std.ArrayList(ActiveTool),
+    /// `tools`' box text, rebuilt each frame so the tail gets a
+    /// `[]const []const u8` without a fresh allocation per repaint.
+    box_view: std.ArrayList([]const u8),
+
+    fn boxes(self: *Turn, gpa: std.mem.Allocator) ![]const []const u8 {
+        self.box_view.clearRetainingCapacity();
+        for (self.tools.items) |tool| try self.box_view.append(gpa, tool.box);
+        return self.box_view.items;
+    }
+};
+
+/// One running tool call: its blue box shows in the live tail; `name` matches the
+/// result to it and `input_json` labels that result. `box` is the box text
+/// (`name input_json`). All owned, freed on completion.
+const ActiveTool = struct { name: []const u8, input_json: []const u8, box: []const u8 };
 
 const Picking = struct {
     picker: ui.Picker,
@@ -78,12 +99,8 @@ pub fn run(self: *App, gpa: std.mem.Allocator, io: std.Io, home: []const u8) !vo
     self.columns = 80;
     self.rows = 24;
     self.last_ctrl_c = 0;
-    self.picking = null;
-    self.busy = false;
-    self.spinner_frame = 0;
-    self.active_tool = null;
-    defer self.closePicker();
-    defer self.clearActiveTool();
+    self.mode = .prompt;
+    defer self.deinitMode();
     self.transcript = Transcript.init(gpa);
     defer self.transcript.deinit();
 
@@ -135,7 +152,11 @@ fn ensureAuth(self: *App) !void {
 }
 
 fn handleKey(self: *App, event: terminal.Input.Key) !void {
-    if (self.picking != null) return self.handlePickerKey(event);
+    switch (self.mode) {
+        .picking => return self.handlePickerKey(event),
+        .turn => return,
+        .prompt => {},
+    }
     switch (event) {
         .char => |codepoint| try self.editor.insertCodepoint(codepoint),
         .paste => |text| try self.editor.insert(text),
@@ -198,28 +219,44 @@ fn refresh(self: *App) !void {
         .model = self.agent.model.name,
     };
 
-    var scene: layout.Scene = .{
+    const tail: layout.Tail = switch (self.mode) {
+        .prompt => prompt: {
+            self.editor.reflow(size.columns, size.rows);
+            break :prompt .{ .prompt = &self.editor };
+        },
+        .turn => |*turn| turn: {
+            self.editor.reflow(size.columns, size.rows);
+            break :turn .{ .turn = .{
+                .tools = try turn.boxes(self.gpa),
+                .spinner = turn.spinner_frame,
+                .editor = &self.editor,
+            } };
+        },
+        .picking => |*picking| .{ .picking = &picking.picker },
+    };
+    const scene: layout.Scene = .{
         .transcript = self.transcript.blocks(),
+        .tail = tail,
         .status = &status,
     };
-    if (self.picking) |*picking| {
-        scene.picker = &picking.picker;
-    } else {
-        self.editor.reflow(size.columns, size.rows);
-        scene.editor = &self.editor;
-        scene.focused = !self.busy;
-        if (self.busy) {
-            scene.spinner = self.spinner_frame;
-            if (self.active_tool) |*active| scene.tool_box = active.box;
-        }
-    }
     try layout.project(&self.view, size, &scene);
 }
 
 /// Advance the spinner one frame. The loop is blocked during a turn, so this runs
 /// per stream event rather than on a timer.
 fn advanceSpinner(self: *App) void {
-    self.spinner_frame = ui.paint.spinnerStep(self.spinner_frame);
+    switch (self.mode) {
+        .turn => |*turn| turn.spinner_frame = ui.paint.spinnerStep(turn.spinner_frame),
+        else => {},
+    }
+}
+
+/// The running turn, if a turn is streaming.
+fn activeTurn(self: *App) ?*Turn {
+    return switch (self.mode) {
+        .turn => |*turn| turn,
+        else => null,
+    };
 }
 
 fn submit(self: *App) !void {
@@ -242,15 +279,18 @@ fn submit(self: *App) !void {
 /// Drive one agent turn, streaming its reply into the transcript while the
 /// spinner and (inert) input box stay pinned below it.
 fn runTurn(self: *App, text: []const u8) !void {
-    self.busy = true;
     self.transcript.endModelRun();
-    self.spinner_frame = 0;
-    self.clearActiveTool();
+    self.mode = .{ .turn = .{ .spinner_frame = 0, .tools = .empty, .box_view = .empty } };
     try self.refresh();
     self.agent.run(text, self) catch |err| try self.emitError(@errorName(err));
-    self.clearActiveTool();
-    self.busy = false;
+    self.endTurn();
     self.transcript.endModelRun();
+}
+
+/// Free the finished turn's tool state and return to waiting for input.
+fn endTurn(self: *App) void {
+    if (self.activeTurn()) |turn| self.freeTurn(turn);
+    self.mode = .prompt;
 }
 
 /// Handle a slash command locally: either print its feedback or open a picker.
@@ -278,14 +318,14 @@ fn openPicker(self: *App, pick: ai.command.Outcome.Pick) !void {
         for (pick.options) |option| self.gpa.free(option);
         self.gpa.free(pick.options);
     }
-    self.picking = .{
+    self.mode = .{ .picking = .{
         .picker = try ui.Picker.init(self.gpa, pick.title, pick.options, pick.current),
         .command = pick.command,
-    };
+    } };
 }
 
 fn handlePickerKey(self: *App, event: terminal.Input.Key) !void {
-    const picker = &self.picking.?.picker;
+    const picker = &self.mode.picking.picker;
     switch (event) {
         .up => try picker.moveUp(),
         .down => try picker.moveDown(),
@@ -302,7 +342,7 @@ fn handlePickerKey(self: *App, event: terminal.Input.Key) !void {
 
 /// Re-apply the picker's command with the highlighted option as its argument.
 fn confirmPicker(self: *App) !void {
-    const picking = &self.picking.?;
+    const picking = &self.mode.picking;
     var context: ai.command.Context = .{ .gpa = self.gpa, .agent = &self.agent };
     const outcome = try ai.command.apply(&context, picking.command, picking.picker.choice());
     self.closePicker();
@@ -317,9 +357,12 @@ fn cancelPicker(self: *App) !void {
 }
 
 fn closePicker(self: *App) void {
-    if (self.picking) |*picking| {
-        picking.picker.deinit();
-        self.picking = null;
+    switch (self.mode) {
+        .picking => |*picking| {
+            picking.picker.deinit();
+            self.mode = .prompt;
+        },
+        else => {},
     }
 }
 
@@ -331,26 +374,44 @@ pub fn onText(self: *App, delta: []const u8) !void {
 
 pub fn onToolStart(self: *App, name: []const u8, input_json: []const u8) !void {
     self.advanceSpinner();
-    self.clearActiveTool();
     self.transcript.endModelRun();
-    const box = try std.fmt.allocPrint(self.gpa, "{s} {s}", .{ name, input_json });
-    const arguments = self.gpa.dupe(u8, input_json) catch |err| {
-        self.gpa.free(box);
-        return err;
-    };
-    self.active_tool = .{ .input_json = arguments, .box = box };
+    if (self.activeTurn()) |turn| try pushTool(turn, self.gpa, name, input_json);
     try self.refresh();
+}
+
+/// Allocate a running tool call's owned strings and record it on `turn`. Ends at
+/// a committed append so a later fallible repaint can never orphan or double-free
+/// the strings; on any failure here nothing is retained.
+fn pushTool(turn: *Turn, gpa: std.mem.Allocator, name: []const u8, input_json: []const u8) !void {
+    const box = try std.fmt.allocPrint(gpa, "{s} {s}", .{ name, input_json });
+    errdefer gpa.free(box);
+    const name_copy = try gpa.dupe(u8, name);
+    errdefer gpa.free(name_copy);
+    const arguments = try gpa.dupe(u8, input_json);
+    errdefer gpa.free(arguments);
+    try turn.tools.append(gpa, .{ .name = name_copy, .input_json = arguments, .box = box });
 }
 
 pub fn onToolResult(self: *App, name: []const u8, content: []const u8, is_error: bool) !void {
     self.advanceSpinner();
     const first = content[0 .. std.mem.indexOfScalar(u8, content, '\n') orelse content.len];
-    const arguments = if (self.active_tool) |active| active.input_json else "";
+    const finished = if (self.activeTurn()) |turn| takeTool(turn, name) else null;
+    defer if (finished) |*tool| self.freeTool(tool);
+    const arguments = if (finished) |tool| tool.input_json else "";
     const text = try std.fmt.allocPrint(self.gpa, "{s} {s}\n→ {s}", .{ name, arguments, first });
     defer self.gpa.free(text);
-    self.clearActiveTool();
     try self.transcript.append(.tool_result, is_error, text);
     try self.refresh();
+}
+
+/// Remove the running tool matching `name` (or the oldest, if none matches) and
+/// hand it to the caller to free.
+fn takeTool(turn: *Turn, name: []const u8) ?ActiveTool {
+    for (turn.tools.items, 0..) |tool, index| {
+        if (std.mem.eql(u8, tool.name, name)) return turn.tools.orderedRemove(index);
+    }
+    if (turn.tools.items.len == 0) return null;
+    return turn.tools.orderedRemove(0);
 }
 
 pub fn onError(self: *App, text: []const u8) !void {
@@ -364,11 +425,24 @@ fn emitError(self: *App, text: []const u8) !void {
     try self.refresh();
 }
 
-fn clearActiveTool(self: *App) void {
-    if (self.active_tool) |active| {
-        self.gpa.free(active.input_json);
-        self.gpa.free(active.box);
-        self.active_tool = null;
+fn freeTool(self: *App, tool: *const ActiveTool) void {
+    self.gpa.free(tool.name);
+    self.gpa.free(tool.input_json);
+    self.gpa.free(tool.box);
+}
+
+fn freeTurn(self: *App, turn: *Turn) void {
+    for (turn.tools.items) |*tool| self.freeTool(tool);
+    turn.tools.deinit(self.gpa);
+    turn.box_view.deinit(self.gpa);
+}
+
+/// Free whatever the current mode owns; called on shutdown.
+fn deinitMode(self: *App) void {
+    switch (self.mode) {
+        .prompt => {},
+        .turn => |*turn| self.freeTurn(turn),
+        .picking => |*picking| picking.picker.deinit(),
     }
 }
 

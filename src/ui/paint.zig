@@ -129,6 +129,11 @@ fn boxLine(placement: *const Placement, line: *usize, style: *const BoxStyle, co
     placement.sink.end(.{ .id = placement.id, .line = line.* });
 }
 
+/// The physical rows a framed area occupies: its two rules plus `body_rows`.
+pub fn framedRows(body_rows: usize) usize {
+    return 2 + body_rows;
+}
+
 /// A framed input area — a full-width rule, a window of `body`'s wrapped rows,
 /// then a closing rule — streamed a row at a time. Shared by the editor and the
 /// picker so both sit in one border.
