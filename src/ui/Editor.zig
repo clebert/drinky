@@ -15,6 +15,10 @@ const Editor = @This();
 gpa: std.mem.Allocator,
 text: std.ArrayList(u8),
 caret: usize,
+/// The first wrapped body row shown when the body is taller than its slot; the
+/// window scrolls to keep the caret in view. `reflow` maintains it and `clear`
+/// resets it; the rows above it show as an "N more" label on the top rule.
+scroll: usize,
 /// Desired display column for vertical movement, remembered across consecutive
 /// `moveUp`/`moveDown` so a step through a shorter row does not forget it. Null
 /// until a vertical step captures the caret's column; a horizontal move, an
@@ -23,7 +27,7 @@ caret: usize,
 goal_column: ?usize,
 
 pub fn init(gpa: std.mem.Allocator) Editor {
-    return .{ .gpa = gpa, .text = .empty, .caret = 0, .goal_column = null };
+    return .{ .gpa = gpa, .text = .empty, .caret = 0, .scroll = 0, .goal_column = null };
 }
 
 pub fn deinit(self: *Editor) void {
@@ -37,6 +41,7 @@ pub fn content(self: *const Editor) []const u8 {
 pub fn clear(self: *Editor) void {
     self.text.clearRetainingCapacity();
     self.caret = 0;
+    self.scroll = 0;
     self.goal_column = null;
 }
 
@@ -126,26 +131,55 @@ pub fn moveDown(self: *Editor, columns: usize) void {
     });
 }
 
-/// Physical rows the editor occupies: the two framing rules plus the wrapped body.
-pub fn rows(self: *const Editor, columns: usize) usize {
-    return 2 + terminal.width.rows(self.text.items, @max(columns, 1));
+/// The tallest the wrapped body may grow before it scrolls within the frame:
+/// about a quarter of the viewport, never fewer than five rows nor more than
+/// fifteen, so the input stays usable without crowding out the transcript.
+fn bodyLimit(viewport_rows: usize) usize {
+    return @min(@max(@divFloor(viewport_rows, 4) + 1, 5), 15);
 }
 
-/// Stream the framed input area — the rules and the wrapped text — through
-/// `placement`, placing the terminal caret on its row when `focused`.
-pub fn render(self: *const Editor, placement: *const paint.Placement, focused: bool) !void {
-    const maybe_caret: ?terminal.View.Caret = if (focused)
-        self.caretPosition(@max(placement.columns, 1))
-    else
-        null;
-    try paint.framed(placement, self.text.items, maybe_caret);
+/// Re-clamp the scroll offset so the caret's wrapped row stays inside the visible
+/// window. Call once per repaint, passing the same `columns` and `viewport_rows`
+/// that `render` and `rows` will use, so all three agree on the window.
+pub fn reflow(self: *Editor, columns: usize, viewport_rows: usize) void {
+    const columns_max = @max(columns, 1);
+    const total_body = terminal.width.rows(self.text.items, columns_max);
+    const visible = @min(total_body, bodyLimit(viewport_rows));
+    const caret_row = terminal.width.caret(self.text.items[0..self.caret], columns_max).rows_before;
+    if (caret_row < self.scroll) self.scroll = caret_row;
+    if (caret_row >= self.scroll + visible) self.scroll = caret_row - visible + 1;
+    self.scroll = @min(self.scroll, total_body - visible);
 }
 
-/// The caret's position within the rendered rows: row 0 is the top rule, so the
-/// caret sits one below the body row the wrap places it on.
+/// Physical rows the editor occupies: the two framing rules plus the wrapped
+/// body, the body capped to its scroll limit for `viewport_rows`.
+pub fn rows(self: *const Editor, columns: usize, viewport_rows: usize) usize {
+    const total_body = terminal.width.rows(self.text.items, @max(columns, 1));
+    return 2 + @min(total_body, bodyLimit(viewport_rows));
+}
+
+/// Stream the framed input area — the rules and the wrapped text, windowed to
+/// its scroll limit for `viewport_rows` — through `placement`, placing the
+/// terminal caret on its row when `focused`. Assumes `reflow` set the scroll.
+pub fn render(self: *const Editor, placement: *const paint.Placement, viewport_rows: usize, focused: bool) !void {
+    const columns_max = @max(placement.columns, 1);
+    const total_body = terminal.width.rows(self.text.items, columns_max);
+    const visible = @min(total_body, bodyLimit(viewport_rows));
+    try paint.framed(placement, &.{
+        .body = self.text.items,
+        .caret = if (focused) self.caretPosition(columns_max) else null,
+        .hidden_above = self.scroll,
+        .shown = visible,
+        .hidden_below = total_body - self.scroll - visible,
+    });
+}
+
+/// The caret's position within the rendered rows: row 0 is the top rule and the
+/// scrolled-off rows above the window are hidden, so the caret sits one below the
+/// top rule plus its wrapped row's offset from the top of the window.
 fn caretPosition(self: *const Editor, columns_max: usize) terminal.View.Caret {
     const position = terminal.width.caret(self.text.items[0..self.caret], columns_max);
-    return .{ .row = 1 + position.rows_before, .column = position.column };
+    return .{ .row = 1 + (position.rows_before - self.scroll), .column = position.column };
 }
 
 fn stepFrom(self: *const Editor, index: usize) usize {
@@ -268,7 +302,7 @@ test render {
     defer editor.deinit();
     try editor.insert("hi");
     // Top rule, the body row, bottom rule.
-    try std.testing.expectEqual(@as(usize, 3), editor.rows(80));
+    try std.testing.expectEqual(@as(usize, 3), editor.rows(80, 24));
     // The caret is on the body row (row 1, below the top rule) at column 2.
     try std.testing.expectEqual(terminal.View.Caret{ .row = 1, .column = 2 }, editor.caretPosition(80));
 
@@ -278,7 +312,7 @@ test render {
     defer view.deinit();
     const sink = try view.beginFrame(.{ .columns = 80, .rows = 24 }, 4);
     const placement: paint.Placement = .{ .sink = sink, .id = 0, .columns = 80, .base = 0, .skip = 0 };
-    try editor.render(&placement, true);
+    try editor.render(&placement, 24, true);
     try view.render();
     const painted = out.written();
     try std.testing.expect(std.mem.indexOf(u8, painted, "hi") != null);
@@ -291,7 +325,7 @@ test "caret sits on the empty row after a trailing newline" {
     defer editor.deinit();
     try editor.insert("a\n");
     // Rules plus "a" plus the empty new line: four rows.
-    try std.testing.expectEqual(@as(usize, 4), editor.rows(80));
+    try std.testing.expectEqual(@as(usize, 4), editor.rows(80, 24));
     try std.testing.expectEqual(terminal.View.Caret{ .row = 2, .column = 0 }, editor.caretPosition(80));
 }
 
@@ -302,7 +336,7 @@ test "caret occupies a blank row between two newlines" {
     editor.moveLeft();
     editor.moveLeft();
     // The caret now sits just after the first newline, on the blank middle row.
-    try std.testing.expectEqual(@as(usize, 5), editor.rows(80));
+    try std.testing.expectEqual(@as(usize, 5), editor.rows(80, 24));
     try std.testing.expectEqual(terminal.View.Caret{ .row = 2, .column = 0 }, editor.caretPosition(80));
 }
 
@@ -436,4 +470,61 @@ test "moving right across blank lines does not skip rows" {
         try std.testing.expectEqual(row, editor.caretPosition(80).row);
         editor.moveRight();
     }
+}
+
+test "the body limit tracks a quarter of the viewport, clamped to five and fifteen" {
+    try std.testing.expectEqual(@as(usize, 5), bodyLimit(0));
+    try std.testing.expectEqual(@as(usize, 5), bodyLimit(19));
+    try std.testing.expectEqual(@as(usize, 6), bodyLimit(20));
+    try std.testing.expectEqual(@as(usize, 6), bodyLimit(23));
+    try std.testing.expectEqual(@as(usize, 7), bodyLimit(24));
+    try std.testing.expectEqual(@as(usize, 15), bodyLimit(56));
+    try std.testing.expectEqual(@as(usize, 15), bodyLimit(200));
+}
+
+test "a tall body caps its rows and scrolls the window to keep the caret in view" {
+    var editor = Editor.init(std.testing.allocator);
+    defer editor.deinit();
+    // Ten single-column rows; a 20-row viewport caps the body at six.
+    try editor.insert("l0\nl1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9");
+    editor.reflow(80, 20);
+    // Two rules plus the six shown body rows, not the whole ten-row body.
+    try std.testing.expectEqual(@as(usize, 8), editor.rows(80, 20));
+    // The caret ends on the last row, so the window ends there.
+    try std.testing.expectEqual(@as(usize, 4), editor.scroll);
+    // Window-relative: below the top rule and the five earlier shown rows.
+    try std.testing.expectEqual(@as(usize, 6), editor.caretPosition(80).row);
+
+    // Climbing to the top drags the window back up with the caret.
+    for (0..9) |_| editor.moveUp(80);
+    editor.reflow(80, 20);
+    try std.testing.expectEqual(@as(usize, 0), editor.scroll);
+    try std.testing.expectEqual(@as(usize, 1), editor.caretPosition(80).row);
+}
+
+test "the framing rules report the rows scrolled out of view" {
+    const gpa = std.testing.allocator;
+    var editor = Editor.init(gpa);
+    defer editor.deinit();
+    try editor.insert("l0\nl1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9");
+    for (0..3) |_| editor.moveUp(80); // The caret climbs to row 6.
+    editor.reflow(80, 20);
+    // The window shows rows 1..6: one row hidden above, three below.
+    try std.testing.expectEqual(@as(usize, 1), editor.scroll);
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var view = terminal.View.init(gpa, &out.writer);
+    defer view.deinit();
+    const sink = try view.beginFrame(.{ .columns = 40, .rows = 20 }, 4);
+    const placement: paint.Placement = .{ .sink = sink, .id = 0, .columns = 40, .base = 0, .skip = 0 };
+    try editor.render(&placement, 20, true);
+    try view.render();
+    const painted = out.written();
+    try std.testing.expect(std.mem.indexOf(u8, painted, "↑ 1 more") != null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "↓ 3 more") != null);
+    // The shown window carries its rows; the scrolled-off ones do not.
+    try std.testing.expect(std.mem.indexOf(u8, painted, "l6") != null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "l0") == null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "l9") == null);
 }

@@ -79,7 +79,7 @@ pub fn rows(self: *const Picker, columns: usize) usize {
 
 /// Stream the framed picker — the rules and the wrapped body — through `placement`.
 pub fn render(self: *const Picker, placement: *const paint.Placement) !void {
-    try paint.framed(placement, self.content.items, null);
+    try paint.framed(placement, &.{ .body = self.content.items });
 }
 
 /// Rebuild `content`: a blank padding row, the dimmed title and key hint, one

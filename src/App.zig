@@ -189,6 +189,7 @@ fn refresh(self: *App) !void {
     if (self.picking) |*picking| {
         scene.picker = &picking.picker;
     } else {
+        self.editor.reflow(size.columns, size.rows);
         scene.editor = &self.editor;
         scene.focused = !self.busy;
         if (self.busy) {
@@ -377,7 +378,7 @@ test "a read chunk drives the editor and paints the result" {
     };
     const sink = try view.beginFrame(.{ .columns = 80, .rows = 24 }, 4);
     const placement: ui.paint.Placement = .{ .sink = sink, .id = 0, .columns = 80, .base = 0, .skip = 0 };
-    try editor.render(&placement, true);
+    try editor.render(&placement, 24, true);
     try view.render();
 
     try std.testing.expectEqualStrings("hllo", editor.content());

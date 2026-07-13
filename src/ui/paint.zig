@@ -129,39 +129,80 @@ fn boxLine(placement: *const Placement, line: *usize, style: *const BoxStyle, co
     placement.sink.end(.{ .id = placement.id, .line = line.* });
 }
 
-/// A framed input area — a full-width rule, `body` wrapped to the terminal width
-/// as its rows, then a closing rule — streamed a row at a time. `maybe_caret`, when
-/// set, places the terminal caret on the body row it names (component-local row 0
-/// is the top rule). Shared by the editor and the picker so both sit in one border.
-pub fn framed(
-    placement: *const Placement,
+/// A framed input area — a full-width rule, a window of `body`'s wrapped rows,
+/// then a closing rule — streamed a row at a time. Shared by the editor and the
+/// picker so both sit in one border.
+pub const Framing = struct {
     body: []const u8,
-    maybe_caret: ?terminal.View.Caret,
-) !void {
+    /// When set, places the terminal caret on the body row it names
+    /// (component-local row 0 is the top rule), reported relative to the window.
+    caret: ?terminal.View.Caret = null,
+    /// Body rows dropped above the window; also the top rule's "N more" count.
+    hidden_above: usize = 0,
+    /// Body rows to show from `hidden_above` on; null shows all that remain.
+    shown: ?usize = null,
+    /// Body rows dropped below the window; also the bottom rule's "N more" count.
+    hidden_below: usize = 0,
+};
+
+/// Stream the framed area described by `framing`: the top rule (labelled with the
+/// rows hidden above), the windowed body rows, then the bottom rule (labelled
+/// with the rows hidden below). A body no taller than its slot leaves both counts
+/// zero, so the rules stay plain and the whole body shows.
+pub fn framed(placement: *const Placement, framing: *const Framing) !void {
     var line = placement.base;
-    try ruleRow(placement, &line);
-    var iterator = terminal.width.wrapper(body, @max(placement.columns, 1));
-    while (iterator.next()) |content| {
+    try ruleRow(placement, &line, "↑", framing.hidden_above);
+    var iterator = terminal.width.wrapper(framing.body, @max(placement.columns, 1));
+    const window_end = framing.hidden_above +| (framing.shown orelse std.math.maxInt(usize));
+    var index: usize = 0;
+    while (iterator.next()) |content| : (index += 1) {
+        if (index < framing.hidden_above) continue;
+        if (index >= window_end) break;
         defer line += 1;
         if (line < placement.skip) continue;
         const writer = placement.sink.begin();
         try writer.writeAll(content);
-        if (maybe_caret) |caret| if (placement.base + caret.row == line) placement.sink.setCaret(caret.column);
+        if (framing.caret) |caret| if (placement.base + caret.row == line) placement.sink.setCaret(caret.column);
         placement.sink.end(.{ .id = placement.id, .line = line });
     }
-    try ruleRow(placement, &line);
+    try ruleRow(placement, &line, "↓", framing.hidden_below);
 }
 
-/// One full-width rule row of a framed area, advancing `line` and dropping it
-/// when it falls in the clipped top.
-fn ruleRow(placement: *const Placement, line: *usize) !void {
+/// One rule row of a framed area: a full-width purple rule, or — when `more` rows
+/// are hidden past it — that rule with an `arrow N more` label set into it.
+/// Advances `line` and drops the row when it falls in the clipped top.
+fn ruleRow(placement: *const Placement, line: *usize, arrow: []const u8, more: usize) !void {
     defer line.* += 1;
     if (line.* < placement.skip) return;
+    var buffer: [32]u8 = undefined;
+    const maybe_label: ?[]const u8 = if (more > 0)
+        (std.fmt.bufPrint(&buffer, "{s} {d} more", .{ arrow, more }) catch null)
+    else
+        null;
     const writer = placement.sink.begin();
     try writer.writeAll(color.rule);
-    for (0..placement.columns) |_| try writer.writeAll(rule_cell);
+    try ruleCells(writer, placement.columns, maybe_label);
     try writer.writeAll(color.rule_reset);
     placement.sink.end(.{ .id = placement.id, .line = line.* });
+}
+
+/// Fill a rule row with `columns` rule cells, or — when `maybe_label` is set and
+/// fits after a short lead with a trailing cell to spare — a lead, the spaced
+/// label, then cells filling the rest.
+fn ruleCells(writer: *std.Io.Writer, columns: usize, maybe_label: ?[]const u8) !void {
+    const lead = 3;
+    if (maybe_label) |label| {
+        const used = lead + 1 + terminal.width.ofText(label) + 1;
+        if (columns > used) {
+            for (0..lead) |_| try writer.writeAll(rule_cell);
+            try writer.writeByte(' ');
+            try writer.writeAll(label);
+            try writer.writeByte(' ');
+            for (0..columns - used) |_| try writer.writeAll(rule_cell);
+            return;
+        }
+    }
+    for (0..columns) |_| try writer.writeAll(rule_cell);
 }
 
 /// The `⠋ Working…` spinner at `frame`: accent glyph, muted message. One content

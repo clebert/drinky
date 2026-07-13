@@ -75,7 +75,7 @@ pub fn project(view: *terminal.View, size: terminal.View.Size, scene: *const Sce
     var shown: usize = 0;
     while (shown < total_slots) {
         const slot = slotAt(slots, scene.transcript, shown);
-        total += measure(&slot, size.columns);
+        total += measure(&slot, size.columns, size.rows);
         shown += 1;
         if (total >= capacity) break;
     }
@@ -93,7 +93,7 @@ pub fn project(view: *terminal.View, size: terminal.View.Size, scene: *const Sce
             .base = if (slot.leading_blank) 1 else 0,
             .skip = if (reverse == shown - 1) skip else 0,
         };
-        try renderSlot(&slot, &placement);
+        try renderSlot(&slot, &placement, size.rows);
     }
     try view.render();
 }
@@ -138,20 +138,20 @@ fn slotAt(chrome: []const Slot, transcript: []const ui.block.Entry, reverse: usi
 
 /// The physical rows `slot` occupies, its leading separator included. Must equal
 /// exactly what `renderSlot` emits — the parity the diff and window math rely on.
-fn measure(slot: *const Slot, columns: usize) usize {
+fn measure(slot: *const Slot, columns: usize, viewport_rows: usize) usize {
     const lead: usize = if (slot.leading_blank) 1 else 0;
     return lead + switch (slot.component) {
         .entry => |entry| entry.rows(columns),
         .tool_box => |text| ui.paint.boxRows(text, columns),
         .spinner, .status => 1,
-        .editor => |prompt| prompt.editor.rows(columns),
+        .editor => |prompt| prompt.editor.rows(columns, viewport_rows),
         .picker => |picker| picker.rows(columns),
     };
 }
 
 /// Compose `slot`'s rows through `placement`, dropping its top `skip` rows
 /// (nonzero only for the clip). Its leading separator, when present, is line 0.
-fn renderSlot(slot: *const Slot, placement: *const ui.paint.Placement) !void {
+fn renderSlot(slot: *const Slot, placement: *const ui.paint.Placement, viewport_rows: usize) !void {
     if (slot.leading_blank and placement.skip == 0) {
         _ = placement.sink.begin();
         placement.sink.end(.{ .id = placement.id, .line = 0 });
@@ -161,7 +161,7 @@ fn renderSlot(slot: *const Slot, placement: *const ui.paint.Placement) !void {
         .tool_box => |text| try ui.paint.box(placement, &tool_box_style, text),
         .spinner => |frame| try ui.paint.spinner(placement, frame),
         .status => |info| try ui.status.render(placement, info),
-        .editor => |prompt| try prompt.editor.render(placement, prompt.focused),
+        .editor => |prompt| try prompt.editor.render(placement, viewport_rows, prompt.focused),
         .picker => |picker| try picker.render(placement),
     }
 }
