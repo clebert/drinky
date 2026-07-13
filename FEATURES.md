@@ -36,6 +36,9 @@ and the app (`src/`).
   concurrently without a lock.
 - Timed reads (returns null on timeout) so the caller can react to resize while otherwise blocked.
 - Queries the window size via `TIOCGWINSZ`, reporting null (not a fake default) when unavailable.
+- SIGWINCH watcher (`Resize`): a self-pipe turns the async-signal-safe handler into an awaitable fd
+  event (blocking read end, non-blocking write end), so a resize wakes an idle event loop; restores
+  the prior signal disposition on exit.
 - Escape helpers for synchronized-output bursts, bracketed-paste framing, cursor show/hide,
   erase-below, full screen+scrollback reset, and relative cursor motion (CUU/CUD/CUF).
 
@@ -175,12 +178,13 @@ and the app (`src/`).
 
 ### Composition & event loop (`App`, `main`)
 
-- Single event-queue consumer fed by three concurrent producers: a long-lived stdin reader, the turn
-  worker (agent runs off the UI thread), and a one-shot frame timer.
+- Single event-queue consumer fed by four concurrent producers: a long-lived stdin reader, the turn
+  worker (agent runs off the UI thread), a one-shot frame timer, and a SIGWINCH resize watcher.
 - The consumer solely owns the model and painting, so network and stream I/O never freeze the UI.
 - Frame-rate-limited repaints (~16 ms); a tick is armed only while dirty or animating, so a fully
   idle interface does no work.
-- Repaints on terminal resize while idle by folding a size check onto the frame tick.
+- Repaints on terminal resize (SIGWINCH): the watcher marks the session dirty, so even a fully idle
+  interface reflows at the new size; `refresh` re-reads the size each frame.
 - Authenticates (logging in if needed) before wiring the loop.
 - Ctrl+C clears the editor or quits on a double-press; Ctrl+D quits when the editor is empty.
 - Mid-turn Esc/Ctrl+C cancels the turn worker and drops the partial turn.

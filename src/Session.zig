@@ -70,8 +70,8 @@ const Picking = struct {
 
 /// A message from a producer task to the render consumer. Every payload owns its
 /// bytes: the producer allocates them from the shared gpa, the consumer frees
-/// them after applying. `.usage` is a plain value and `.tick` is empty; neither
-/// owns anything.
+/// them after applying. `.usage` is a plain value and `.tick`/`.resize` are empty;
+/// none of the three owns anything.
 pub const UiEvent = union(enum) {
     keys: []u8,
     text: []u8,
@@ -80,6 +80,7 @@ pub const UiEvent = union(enum) {
     usage: ai.Agent.Stats,
     turn_ended: ?[]u8,
     tick,
+    resize,
 
     const Tool = struct { name: []u8, input_json: []u8 };
     const ToolResult = struct { name: []u8, content: []u8, is_error: bool };
@@ -96,7 +97,7 @@ pub const UiEvent = union(enum) {
                 gpa.free(result.content);
             },
             .turn_ended => |maybe_text| if (maybe_text) |text| gpa.free(text),
-            .usage, .tick => {},
+            .usage, .tick, .resize => {},
         }
     }
 };
@@ -155,7 +156,7 @@ pub fn applyStreamEvent(self: *Session, event: UiEvent) !void {
             self.transcript.endModelRun();
             self.endTurn();
         },
-        .keys, .tick => unreachable,
+        .keys, .tick, .resize => unreachable,
     }
 }
 

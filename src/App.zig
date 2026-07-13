@@ -3,15 +3,16 @@
 //! producer tasks push `Session.UiEvent`s onto it and the consumer loop here
 //! drains them, driving the `Session` model and painting through it.
 //!
-//! Network and stream I/O run off the UI thread. Three `io.concurrent` producers
+//! Network and stream I/O run off the UI thread. Four `io.concurrent` producers
 //! feed one `std.Io.Queue(Session.UiEvent)`: a long-lived input reader
 //! (stdin → `.keys`), the current turn worker (`agent.run` →
-//! `.text`/`.tool_*`/`.usage`/`.turn_ended`), and a one-shot frame timer
-//! (sleep → `.tick`). The consumer blocks on the channel, drains a coalesced
-//! batch, applies each event to the `Session` (marking it dirty, never painting),
-//! and paints only when it drains a `.tick`. A tick is armed whenever the session
-//! is dirty or a turn animates and none is pending, so a clean idle interface
-//! arms no tick and stays inert.
+//! `.text`/`.tool_*`/`.usage`/`.turn_ended`), a one-shot frame timer
+//! (sleep → `.tick`), and a SIGWINCH watcher (self-pipe → `.resize`). The
+//! consumer blocks on the channel, drains a coalesced batch, applies each event
+//! to the `Session` (marking it dirty, never painting), and paints only when it
+//! drains a `.tick`. A tick is armed whenever the session is dirty or a turn
+//! animates and none is pending, so a clean idle interface arms no tick and stays
+//! inert until a key, a stream event, or a `.resize` marks it dirty again.
 //!
 //! The consumer-owned model and rendering — transcript, live tail, editor, view,
 //! stats/model snapshots, and the `applyStreamEvent`/`paint` seam — live in
@@ -53,6 +54,8 @@ const queue_capacity = 256;
 gpa: std.mem.Allocator,
 io: std.Io,
 tty: terminal.Tty,
+/// SIGWINCH watcher: turns terminal resizes into `.resize` events.
+resize: terminal.Resize,
 auth: ai.anthropic.Auth,
 agent: ai.Agent,
 /// The consumer-owned model and rendering, driven by the loop.
@@ -65,8 +68,12 @@ last_ctrl_c: i64,
 /// drains and applies them. Backed by `queue_buffer`, so pin the `App`.
 queue: std.Io.Queue(Session.UiEvent),
 queue_buffer: [queue_capacity]Session.UiEvent,
-/// The long-lived stdin reader task; cancelled and reaped at shutdown.
-input_future: std.Io.Future(void),
+/// The long-lived stdin reader task, or null before it is spawned; cancelled and
+/// reaped at shutdown.
+input_future: ?std.Io.Future(void),
+/// The long-lived SIGWINCH watcher task, or null before it is spawned; cancelled
+/// and reaped at shutdown.
+resize_future: ?std.Io.Future(void),
 /// The running turn worker, or null between turns.
 turn_future: ?std.Io.Future(void),
 /// The pending frame timer, or null when none is armed (idle or clean).
@@ -132,6 +139,8 @@ pub fn run(self: *App, gpa: std.mem.Allocator, io: std.Io, home: []const u8) !vo
     self.last_ctrl_c = 0;
     self.tick_pending = false;
     self.last_paint_ms = 0;
+    self.input_future = null;
+    self.resize_future = null;
     self.turn_future = null;
     self.tick_future = null;
     self.queue = std.Io.Queue(Session.UiEvent).init(&self.queue_buffer);
@@ -146,6 +155,9 @@ pub fn run(self: *App, gpa: std.mem.Allocator, io: std.Io, home: []const u8) !vo
     try self.tty.init(io);
     defer self.tty.deinit();
 
+    try self.resize.init();
+    defer self.resize.deinit();
+
     self.session = Session.init(gpa, self.tty.writer(), self.agent.model);
     defer self.session.deinit();
     self.input = terminal.Input.init(gpa);
@@ -156,8 +168,9 @@ pub fn run(self: *App, gpa: std.mem.Allocator, io: std.Io, home: []const u8) !vo
     self.last_paint_ms = self.nowMs();
 
     self.running = true;
-    self.input_future = try self.io.concurrent(readInput, .{self});
     defer self.shutdownTasks();
+    self.input_future = try self.io.concurrent(readInput, .{self});
+    self.resize_future = try self.io.concurrent(readResize, .{self});
 
     try self.runLoop();
 }
@@ -170,7 +183,14 @@ fn shutdownTasks(self: *App) void {
         future.cancel(self.io);
         self.turn_future = null;
     }
-    self.input_future.cancel(self.io);
+    if (self.input_future) |*future| {
+        future.cancel(self.io);
+        self.input_future = null;
+    }
+    if (self.resize_future) |*future| {
+        future.cancel(self.io);
+        self.resize_future = null;
+    }
     if (self.tick_future) |*future| {
         future.cancel(self.io);
         self.tick_future = null;
@@ -202,6 +222,7 @@ fn runLoop(self: *App) !void {
         var ticked = false;
         for (batch[0..count]) |event| switch (event) {
             .tick => ticked = true,
+            .resize => self.session.dirty = true,
             .keys => |bytes| {
                 defer self.gpa.free(bytes);
                 try self.handleKeys(bytes);
@@ -249,6 +270,16 @@ fn armTick(self: *App) void {
 fn frameTimer(self: *App, delay_ms: i64) void {
     if (delay_ms > 0) self.io.sleep(.fromMilliseconds(delay_ms), .awake) catch return;
     self.queue.putOne(self.io, .tick) catch {};
+}
+
+/// Resize watcher task: block on the SIGWINCH self-pipe and push one `.resize`
+/// per wake, so the consumer repaints at the new size (which `refresh` re-reads).
+/// Exits on cancel (shutdown) or a pipe fault.
+fn readResize(self: *App) void {
+    while (true) {
+        self.resize.wait(self.io) catch return;
+        self.queue.putOne(self.io, .resize) catch return;
+    }
 }
 
 /// Input reader task: block on stdin and push each chunk as owned `.keys`. Exits
@@ -387,8 +418,9 @@ fn clearOrQuit(self: *App) void {
 }
 
 /// Repaint: read the terminal size (keeping the last known one if the query
-/// fails), then hand it to the session's projection. Reading size here picks up a
-/// resize on the next frame while a turn animates.
+/// fails), then hand it to the session's projection. Reading size here is the
+/// source of truth every frame; a `.resize` event just forces the frame so an
+/// idle interface reflows too.
 fn refresh(self: *App) !void {
     const size: terminal.View.Size = if (self.tty.size()) |window|
         .{ .columns = window.columns, .rows = window.rows }

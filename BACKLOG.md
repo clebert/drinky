@@ -238,13 +238,14 @@ Extension seams referenced here:
       agent wiring, the consumer loop, and the key/command/turn orchestration (which triggers io/
       agent inline), driving the `Session` through its methods; key decoding (`input`) stays with
       that orchestration in `App`.
-- [ ] **Signal-driven resize.** React to terminal resizes via `SIGWINCH` rather than polling.
-      Depends on the off-thread networking work: once the event loop is a channel consumer, a
-      resize must arrive as a `UiEvent`, but a POSIX signal handler is async-signal-safe only and
-      cannot take the channel lock to enqueue one — so this needs a signal-to-event bridge (a
-      dedicated task awaiting the signal through an io primitive, or a self-pipe). Interim behavior
-      is a `Tty.size()` check folded onto the frame tick while non-idle, which misses a resize that
-      happens while the interface is fully idle until the next event.
+- [x] **Signal-driven resize.** Terminal resizes arrive via `SIGWINCH`. Since a POSIX signal handler
+      is async-signal-safe only and cannot take the channel lock, `terminal.Resize` uses the
+      self-pipe trick: the handler writes one byte to a pipe (write end non-blocking so a full pipe
+      drops the redundant wake) and `Resize.wait` blocks reading the other end (blocking end,
+      through `io.operateTimeout`). A fourth `io.concurrent` producer (`readResize`) turns each wake
+      into a `.resize` `UiEvent`; the consumer marks the session dirty, so even a fully idle
+      interface reflows at the new size (`refresh` re-reads `Tty.size()` each frame). The watcher is
+      cancelled and reaped before its pipe closes and its handler is uninstalled at shutdown.
 - [ ] **Context-window pressure signal.** The status line shows `ctx%` but nothing reacts to it.
       Warn as context fills (e.g. color the gauge past a threshold) and wire a threshold into
       `/handoff` compaction. Thresholds configurable with good defaults. Two model-specific
