@@ -81,7 +81,8 @@ and the app (`src/`).
 
 ### Agent loop (`Agent`)
 
-- Runs one user turn to completion: append the user message, stream the reply, run any tools, feed results back, and repeat until the model stops.
+- Runs one user turn to completion: append the user message, stream the reply, run its tools, feed results back, and repeat until the model stops.
+- Tool calls in one assistant message run concurrently: read-only calls are fanned out through an `std.Io.Group`, while mutating calls (write/edit) run serially in call order so two writes/edits to the same file can't race or lose an update. Results are queued in call order so each `tool_result` maps back to its `tool_use` id, and a mid-turn cancel propagates to the running tools.
 - Bounded tool-round loop (max 50) with a typed error on overrun.
 - Owns the conversation history and an arena; provider-neutral via a `provider.Client` handle.
 - Reports presentation through handler callbacks (text, tool start, tool result, usage, error) instead of drawing itself.
@@ -113,7 +114,7 @@ and the app (`src/`).
 
 ### Tools (`tool/`)
 
-- Compile-time tool registry + dispatcher advertising typed schemas to the provider; JSON args parsed into typed structs with a compile-time schema-vs-struct consistency check.
+- Compile-time tool registry + dispatcher advertising typed schemas to the provider; JSON args parsed into typed structs with a compile-time schema-vs-struct consistency check. Each entry declares whether it mutates the filesystem, which the agent uses to serialize mutating calls within a turn.
 - **read** — paginated UTF-8 file read (1-indexed offset + limit), truncated to 2000 lines / 50 KB, with a next-offset hint; rejects binary/oversized files.
 - **write** — create/overwrite a UTF-8 file atomically (temp file + rename).
 - **edit** — replace one exact, unique span; errors on empty, missing, or non-unique matches; atomic write.

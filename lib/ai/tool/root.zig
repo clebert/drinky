@@ -19,14 +19,17 @@ const grep = @import("grep.zig");
 const Entry = struct {
     tool: llm.Tool,
     run: *const fn (*const Context, []const u8) anyerror!Result,
+    /// Whether the tool writes to the filesystem. The agent runs mutating calls
+    /// serially so two writes/edits to the same file can't race within one turn.
+    mutates: bool,
 };
 
 const registry = [_]Entry{
-    .{ .tool = read.spec, .run = read.run },
-    .{ .tool = write.spec, .run = write.run },
-    .{ .tool = edit.spec, .run = edit.run },
-    .{ .tool = find.spec, .run = find.run },
-    .{ .tool = grep.spec, .run = grep.run },
+    .{ .tool = read.spec, .run = read.run, .mutates = false },
+    .{ .tool = write.spec, .run = write.run, .mutates = true },
+    .{ .tool = edit.spec, .run = edit.run, .mutates = true },
+    .{ .tool = find.spec, .run = find.run, .mutates = false },
+    .{ .tool = grep.spec, .run = grep.run, .mutates = false },
 };
 
 /// The schemas of every tool, for advertising to the provider in a request.
@@ -35,6 +38,16 @@ pub const specs = blk: {
     for (registry, 0..) |entry, index| list[index] = entry.tool;
     break :blk list;
 };
+
+/// Whether tool `name` writes to the filesystem, so the agent knows to run it
+/// serially. An unknown tool touches nothing, so it runs concurrently and just
+/// reports the unknown-tool error.
+pub fn mutates(name: []const u8) bool {
+    for (registry) |entry| {
+        if (std.mem.eql(u8, name, entry.tool.name)) return entry.mutates;
+    }
+    return false;
+}
 
 /// Execute tool `name` with `input_json`. Caller frees `Result.content`.
 pub fn run(context: *const Context, name: []const u8, input_json: []const u8) !Result {
@@ -46,6 +59,14 @@ pub fn run(context: *const Context, name: []const u8, input_json: []const u8) !R
         };
     }
     return Result.report(context.gpa, .err, "unknown tool: {s}", .{name});
+}
+
+test "mutating tools are marked, read-only tools are not" {
+    try std.testing.expect(mutates("write"));
+    try std.testing.expect(mutates("edit"));
+    try std.testing.expect(!mutates("read"));
+    try std.testing.expect(!mutates("grep"));
+    try std.testing.expect(!mutates("nope"));
 }
 
 test "unknown tool is an error" {

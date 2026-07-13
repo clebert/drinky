@@ -1,7 +1,8 @@
 //! Drives one user turn to completion: append the message, stream the model's
-//! reply, run any tools it calls, feed the results back, and repeat until the
-//! model stops asking for tools. Owns the conversation history and talks to the
-//! model through a neutral `provider.Client`; presentation is delegated to a
+//! reply, run the tools it calls (independent calls concurrently), feed the
+//! results back, and repeat until the model stops asking for tools. Owns the
+//! conversation history and talks to the model through a neutral
+//! `provider.Client`; presentation is delegated to a
 //! `handler` with `onText`/`onToolStart`/`onToolResult`/`onUsage`/`onError`.
 
 const std = @import("std");
@@ -30,6 +31,16 @@ pub const Stats = struct {
     cost: f64 = 0,
     saved: f64 = 0,
     last: llm.Usage = .{},
+};
+
+/// One scheduled tool call: the reply it answers and the slot its task fills.
+/// `runCall` reads `name`/`input_json` and writes `result`; the collector reads
+/// the rest once the task has finished.
+const Call = struct {
+    id: []const u8,
+    name: []const u8,
+    input_json: []const u8,
+    result: anyerror!tool.Result = undefined,
 };
 
 pub fn init(
@@ -147,25 +158,81 @@ fn consume(self: *Agent, stream: *provider.Stream, handler: anytype) !bool {
     const reply = try blocks.toOwnedSlice(arena);
     try self.messages.append(self.gpa, .{ .role = .assistant, .blocks = reply });
 
-    const context: tool.Context = .{ .gpa = self.gpa, .io = self.io };
-    var results: std.ArrayList(llm.Block) = .empty;
+    return self.runTools(reply, handler);
+}
+
+/// Run one call to completion into its slot. Spawned per call, so it touches only
+/// its own `call` and the shared read-only `context` (a thread-safe gpa and io).
+fn runCall(call: *Call, context: *const tool.Context) void {
+    call.result = tool.run(context, call.name, call.input_json);
+}
+
+/// Run every tool the assistant asked for, then queue the results in call order so
+/// each `tool_result` maps back to its `tool_use` id. Read-only calls run
+/// concurrently through the group; mutating calls run inline in call order, so two
+/// writes/edits to the same file can't race or lose an update within one turn.
+/// Returns false when the reply asked for no tools. A failing mutation (a
+/// mid-turn cancel included) aborts the turn at once, before any later call runs;
+/// a cancel observed while awaiting the read-only calls aborts the same way. On
+/// every early exit the errdefer reaps the group's in-flight tasks first.
+fn runTools(self: *Agent, reply: []const llm.Block, handler: anytype) !bool {
+    var count: usize = 0;
+    for (reply) |block| switch (block) {
+        .tool_use => count += 1,
+        else => {},
+    };
+    if (count == 0) return false;
+
+    const calls = try self.gpa.alloc(Call, count);
+    defer self.gpa.free(calls);
+    var index: usize = 0;
     for (reply) |block| switch (block) {
         .tool_use => |use| {
-            try handler.onToolStart(use.name, use.input_json);
-            const result = try tool.run(&context, use.name, use.input_json);
-            defer self.gpa.free(result.content);
-            try handler.onToolResult(use.name, result.content, result.is_error);
-            try results.append(arena, .{ .tool_result = .{
-                .tool_use_id = try arena.dupe(u8, use.id),
-                .content = try arena.dupe(u8, result.content),
-                .is_error = result.is_error,
-            } });
+            calls[index] = .{ .id = use.id, .name = use.name, .input_json = use.input_json };
+            index += 1;
         },
         else => {},
     };
 
-    if (results.items.len == 0) return false;
-    try self.messages.append(self.gpa, .{ .role = .user, .blocks = try results.toOwnedSlice(arena) });
+    const context: tool.Context = .{ .gpa = self.gpa, .io = self.io };
+    var group: std.Io.Group = .init;
+    var dispatched: usize = 0;
+    var collected: usize = 0;
+    // On any early exit, cancel and reap the group (interrupting running tools),
+    // then free the results of every finished-but-uncollected call.
+    errdefer {
+        group.cancel(self.io);
+        for (calls[collected..dispatched]) |call| {
+            const result = call.result catch continue;
+            self.gpa.free(result.content);
+        }
+    }
+
+    for (calls) |*call| {
+        try handler.onToolStart(call.name, call.input_json);
+        if (tool.mutates(call.name))
+            call.result = try tool.run(&context, call.name, call.input_json)
+        else
+            try group.concurrent(self.io, runCall, .{ call, &context });
+        dispatched += 1;
+    }
+    try group.await(self.io);
+
+    const arena = self.arena.allocator();
+    const results = try arena.alloc(llm.Block, count);
+    while (collected < count) : (collected += 1) {
+        const call = &calls[collected];
+        const result = try call.result;
+        try handler.onToolResult(call.name, result.content, result.is_error);
+        results[collected] = .{ .tool_result = .{
+            .tool_use_id = try arena.dupe(u8, call.id),
+            .content = try arena.dupe(u8, result.content),
+            .is_error = result.is_error,
+        } };
+        self.gpa.free(result.content);
+    }
+
+    try self.messages.append(self.gpa, .{ .role = .user, .blocks = results });
     return true;
 }
 

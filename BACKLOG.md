@@ -22,11 +22,16 @@ Extension seams referenced here:
       the `src/tool/root.zig` registry. Needs a working directory (thread through
       `tool/Context.zig`) and a decision on output capture/truncation and timeouts. No sandboxing or
       permission model exists yet — decide whether that gates this or follows.
-- [ ] **Parallel tool calls.** Anthropic (and most providers) already emit multiple `tool_use`
-      blocks in one assistant message when the calls are independent; `Agent.consume` collects them
-      but runs them one after another. Execute independent calls concurrently instead. Depends on
-      the off-thread networking work below; keep result ordering stable so each `tool_result` maps
-      back to its `tool_use` id. Confirm we never send `disable_parallel_tool_use`.
+- [x] **Parallel tool calls.** Anthropic (and most providers) already emit multiple `tool_use`
+      blocks in one assistant message when the calls are independent. `Agent.runTools` fans them out
+      through an `std.Io.Group` — one concurrent task per call writing into its own slot — then
+      collects the results in call order, so each `tool_result` still maps back to its `tool_use`
+      id and the UI's name-FIFO box matching is unchanged. Mutating calls (write/edit, flagged in
+      the tool registry) instead run inline in call order, so two writes/edits to the same file
+      can't race or lose an update within a turn. A mid-turn cancel propagates through `group.await`
+      to the running tools, preserving the interrupt-in-flight semantics the old sequential loop
+      had. We never send `disable_parallel_tool_use`, so the provider is free to batch independent
+      calls.
 
 ## Command surface
 
