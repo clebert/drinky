@@ -22,6 +22,14 @@ re-exports are allowed). A test only runs if its file is reachable from the modu
 re-export or an analyzed test path); an unwired test file passes silently, so `test-audit.sh` fails
 CI when the number of tests that ran differs from the number declared in source.
 
+## Features
+
+`FEATURES.md` is the inventory of what pith supports — one line per capability, grouped by module.
+Keep it current: when you land a new capability, add an entry (and mark the matching `BACKLOG.md`
+item done, if one exists); when you refactor, treat the relevant group as the checklist that must not
+regress. It
+records *what exists* — the *why*/*how* lives in commits, `BACKLOG.md`, and `docs/`.
+
 ## CI
 
 After code changes, always run:
