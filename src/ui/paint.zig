@@ -16,6 +16,9 @@ const spinner_frames = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", 
 /// Display width of the full `⠋ Working…` spinner: glyph, space, and message.
 const spinner_columns = 10;
 
+/// One cell of the purple rule that frames the input area, repeated to full width.
+const rule_cell = "─";
+
 pub const BoxStyle = struct { background: []const u8, foreground: []const u8 };
 
 /// A notice's look: the SGR style opening every line and a prefix (an error tag,
@@ -53,7 +56,7 @@ fn boxInner(columns: usize) usize {
 
 /// Each `\n`-separated line of `text`, styled and truncated to one row, with the
 /// notice's prefix on every line (a notice, error, or the intro).
-pub fn notice(placement: *const Placement, look: Notice, text: []const u8) !void {
+pub fn notice(placement: *const Placement, look: *const Notice, text: []const u8) !void {
     var pieces = std.mem.splitScalar(u8, text, '\n');
     var index: usize = 0;
     while (pieces.next()) |piece| : (index += 1) {
@@ -90,7 +93,7 @@ pub fn wrapped(placement: *const Placement, text: []const u8) !void {
 /// width with a one-space left pad and the background filled to full width, then
 /// a blank padding row. Streamed a row at a time, self-separating inside the
 /// block gap around it.
-pub fn box(placement: *const Placement, style: BoxStyle, text: []const u8) !void {
+pub fn box(placement: *const Placement, style: *const BoxStyle, text: []const u8) !void {
     var line = placement.base;
     try boxPad(placement, &line, style.background);
     var iterator = terminal.width.wrapper(text, boxInner(placement.columns));
@@ -112,7 +115,7 @@ fn boxPad(placement: *const Placement, line: *usize, background: []const u8) !vo
 /// A box's content row: a one-space left pad, `content`, then the background
 /// filled to full width. `content` is capped to leave room for the pad, so a
 /// window too narrow for the wrap width still yields one physical row.
-fn boxLine(placement: *const Placement, line: *usize, style: BoxStyle, content: []const u8) !void {
+fn boxLine(placement: *const Placement, line: *usize, style: *const BoxStyle, content: []const u8) !void {
     defer line.* += 1;
     if (line.* < placement.skip) return;
     const shown = terminal.width.truncate(content, placement.columns -| 1);
@@ -123,6 +126,41 @@ fn boxLine(placement: *const Placement, line: *usize, style: BoxStyle, content: 
     try writer.writeAll(shown);
     try writer.splatByteAll(' ', placement.columns -| (1 + terminal.width.ofText(shown)));
     try writer.writeAll(color.reset);
+    placement.sink.end(.{ .id = placement.id, .line = line.* });
+}
+
+/// A framed input area — a full-width rule, `body` wrapped to the terminal width
+/// as its rows, then a closing rule — streamed a row at a time. `maybe_caret`, when
+/// set, places the terminal caret on the body row it names (component-local row 0
+/// is the top rule). Shared by the editor and the picker so both sit in one border.
+pub fn framed(
+    placement: *const Placement,
+    body: []const u8,
+    maybe_caret: ?terminal.View.Caret,
+) !void {
+    var line = placement.base;
+    try ruleRow(placement, &line);
+    var iterator = terminal.width.wrapper(body, @max(placement.columns, 1));
+    while (iterator.next()) |content| {
+        defer line += 1;
+        if (line < placement.skip) continue;
+        const writer = placement.sink.begin();
+        try writer.writeAll(content);
+        if (maybe_caret) |caret| if (placement.base + caret.row == line) placement.sink.setCaret(caret.column);
+        placement.sink.end(.{ .id = placement.id, .line = line });
+    }
+    try ruleRow(placement, &line);
+}
+
+/// One full-width rule row of a framed area, advancing `line` and dropping it
+/// when it falls in the clipped top.
+fn ruleRow(placement: *const Placement, line: *usize) !void {
+    defer line.* += 1;
+    if (line.* < placement.skip) return;
+    const writer = placement.sink.begin();
+    try writer.writeAll(color.rule);
+    for (0..placement.columns) |_| try writer.writeAll(rule_cell);
+    try writer.writeAll(color.rule_reset);
     placement.sink.end(.{ .id = placement.id, .line = line.* });
 }
 
@@ -143,13 +181,5 @@ pub fn spinner(placement: *const Placement, frame: usize) !void {
         try writer.writeAll(terminal.width.truncate(glyph, placement.columns));
     }
     try writer.writeAll(color.reset);
-    placement.sink.end(.{ .id = placement.id, .line = placement.base });
-}
-
-/// One content row of pre-composed `bytes` (the status line).
-pub fn row(placement: *const Placement, bytes: []const u8) !void {
-    if (placement.base < placement.skip) return;
-    const writer = placement.sink.begin();
-    try writer.writeAll(bytes);
     placement.sink.end(.{ .id = placement.id, .line = placement.base });
 }

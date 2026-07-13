@@ -1,7 +1,8 @@
 //! The app's SGR palette: the colors and attributes the widgets and transcript
-//! blocks draw with, in one place so `App`, `block`, `Picker`, `separator`, and
-//! `status` stop each defining their own. App style, hence the `ui` namespace
-//! rather than the generic `terminal` engine.
+//! blocks draw with, in one place so the `paint` primitives, the transcript
+//! `block`s, and the `Picker` share one definition instead of each redefining
+//! their own. App style, hence the `ui` namespace rather than the generic
+//! `terminal` engine.
 
 /// Reset every attribute.
 pub const reset = "\x1b[0m";

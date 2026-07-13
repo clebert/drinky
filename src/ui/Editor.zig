@@ -7,7 +7,7 @@
 
 const std = @import("std");
 
-const separator = @import("separator.zig");
+const paint = @import("paint.zig");
 const terminal = @import("terminal");
 
 const Editor = @This();
@@ -126,44 +126,26 @@ pub fn moveDown(self: *Editor, columns: usize) void {
     });
 }
 
-/// Build the wrapped display lines into `buffer`/`lines` (both cleared first),
-/// returning the caret's `(sub-row, column)` within `lines` when `focused`, else
-/// null. `sub-row` is an index into `lines`; the caller adds the block's base to
-/// resolve the window-relative row. `lines` borrows from `buffer`, so keep
-/// `buffer` alive while using them.
-pub fn render(
-    self: *const Editor,
-    columns: usize,
-    focused: bool,
-    buffer: *std.ArrayList(u8),
-    lines: *std.ArrayList([]const u8),
-) !?terminal.View.Caret {
-    buffer.clearRetainingCapacity();
-    lines.clearRetainingCapacity();
-    const gpa = self.gpa;
-    const columns_max = @max(columns, 1);
+/// Physical rows the editor occupies: the two framing rules plus the wrapped body.
+pub fn rows(self: *const Editor, columns: usize) usize {
+    return 2 + terminal.width.rows(self.text.items, @max(columns, 1));
+}
 
-    // Everything goes into `buffer` first; the separator and body slices are
-    // resolved by offset only after the last append, since growth can move the
-    // backing memory and invalidate a slice taken earlier.
-    try separator.rule(buffer, gpa, columns);
-    const separator_end = buffer.items.len;
+/// Stream the framed input area — the rules and the wrapped text — through
+/// `placement`, placing the terminal caret on its row when `focused`.
+pub fn render(self: *const Editor, placement: *const paint.Placement, focused: bool) !void {
+    const maybe_caret: ?terminal.View.Caret = if (focused)
+        self.caretPosition(@max(placement.columns, 1))
+    else
+        null;
+    try paint.framed(placement, self.text.items, maybe_caret);
+}
 
-    const body_start = buffer.items.len;
-    try buffer.appendSlice(gpa, self.text.items);
-
-    const separator_line = buffer.items[0..separator_end];
-    const body = buffer.items[body_start..];
-    try lines.append(gpa, separator_line);
-    const body_row = lines.items.len;
-    try terminal.width.wrap(body, columns_max, lines, gpa);
-    try lines.append(gpa, separator_line);
-
-    if (!focused) return null;
-    // The caret's row and column are fixed by the body prefix before it (see
-    // `width.caret`).
-    const position = terminal.width.caret(body[0..self.caret], columns_max);
-    return .{ .row = body_row + position.rows_before, .column = position.column };
+/// The caret's position within the rendered rows: row 0 is the top rule, so the
+/// caret sits one below the body row the wrap places it on.
+fn caretPosition(self: *const Editor, columns_max: usize) terminal.View.Caret {
+    const position = terminal.width.caret(self.text.items[0..self.caret], columns_max);
+    return .{ .row = 1 + position.rows_before, .column = position.column };
 }
 
 fn stepFrom(self: *const Editor, index: usize) usize {
@@ -281,36 +263,36 @@ test "left and right move by whole grapheme cluster" {
 }
 
 test render {
-    var editor = Editor.init(std.testing.allocator);
+    const gpa = std.testing.allocator;
+    var editor = Editor.init(gpa);
     defer editor.deinit();
     try editor.insert("hi");
-    var buffer: std.ArrayList(u8) = .empty;
-    defer buffer.deinit(std.testing.allocator);
-    var lines: std.ArrayList([]const u8) = .empty;
-    defer lines.deinit(std.testing.allocator);
-    const caret = try editor.render(80, true, &buffer, &lines);
-    try std.testing.expectEqual(@as(usize, 3), lines.items.len);
-    try std.testing.expectEqual(@as(usize, 80), terminal.width.ofText(lines.items[0]));
-    try std.testing.expectEqual(@as(usize, 2), terminal.width.ofText(lines.items[1]));
-    try std.testing.expectEqual(@as(usize, 80), terminal.width.ofText(lines.items[2]));
-    // The caret is on the body row (index 1) at column 2, past "hi".
-    try std.testing.expectEqual(@as(?terminal.View.Caret, .{ .row = 1, .column = 2 }), caret);
+    // Top rule, the body row, bottom rule.
+    try std.testing.expectEqual(@as(usize, 3), editor.rows(80));
+    // The caret is on the body row (row 1, below the top rule) at column 2.
+    try std.testing.expectEqual(terminal.View.Caret{ .row = 1, .column = 2 }, editor.caretPosition(80));
 
-    try std.testing.expectEqual(@as(?terminal.View.Caret, null), try editor.render(80, false, &buffer, &lines));
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var view = terminal.View.init(gpa, &out.writer);
+    defer view.deinit();
+    const sink = try view.beginFrame(.{ .columns = 80, .rows = 24 }, 4);
+    const placement: paint.Placement = .{ .sink = sink, .id = 0, .columns = 80, .base = 0, .skip = 0 };
+    try editor.render(&placement, true);
+    try view.render();
+    const painted = out.written();
+    try std.testing.expect(std.mem.indexOf(u8, painted, "hi") != null);
+    // Focused, so the view shows the hardware cursor.
+    try std.testing.expect(std.mem.indexOf(u8, painted, terminal.escape.cursor_show) != null);
 }
 
 test "caret sits on the empty row after a trailing newline" {
     var editor = Editor.init(std.testing.allocator);
     defer editor.deinit();
     try editor.insert("a\n");
-    var buffer: std.ArrayList(u8) = .empty;
-    defer buffer.deinit(std.testing.allocator);
-    var lines: std.ArrayList([]const u8) = .empty;
-    defer lines.deinit(std.testing.allocator);
-    const caret = try editor.render(80, true, &buffer, &lines);
-    // Separator, "a", the empty new line, separator.
-    try std.testing.expectEqual(@as(usize, 4), lines.items.len);
-    try std.testing.expectEqual(@as(?terminal.View.Caret, .{ .row = 2, .column = 0 }), caret);
+    // Rules plus "a" plus the empty new line: four rows.
+    try std.testing.expectEqual(@as(usize, 4), editor.rows(80));
+    try std.testing.expectEqual(terminal.View.Caret{ .row = 2, .column = 0 }, editor.caretPosition(80));
 }
 
 test "caret occupies a blank row between two newlines" {
@@ -320,25 +302,15 @@ test "caret occupies a blank row between two newlines" {
     editor.moveLeft();
     editor.moveLeft();
     // The caret now sits just after the first newline, on the blank middle row.
-    var buffer: std.ArrayList(u8) = .empty;
-    defer buffer.deinit(std.testing.allocator);
-    var lines: std.ArrayList([]const u8) = .empty;
-    defer lines.deinit(std.testing.allocator);
-    const caret = try editor.render(80, true, &buffer, &lines);
-    try std.testing.expectEqual(@as(usize, 5), lines.items.len);
-    try std.testing.expectEqual(@as(?terminal.View.Caret, .{ .row = 2, .column = 0 }), caret);
+    try std.testing.expectEqual(@as(usize, 5), editor.rows(80));
+    try std.testing.expectEqual(terminal.View.Caret{ .row = 2, .column = 0 }, editor.caretPosition(80));
 }
 
 test "consecutive newlines each add an occupiable row" {
     var editor = Editor.init(std.testing.allocator);
     defer editor.deinit();
     try editor.insert("\n\n");
-    var buffer: std.ArrayList(u8) = .empty;
-    defer buffer.deinit(std.testing.allocator);
-    var lines: std.ArrayList([]const u8) = .empty;
-    defer lines.deinit(std.testing.allocator);
-    const caret = try editor.render(80, true, &buffer, &lines);
-    try std.testing.expectEqual(@as(?terminal.View.Caret, .{ .row = 3, .column = 0 }), caret);
+    try std.testing.expectEqual(terminal.View.Caret{ .row = 3, .column = 0 }, editor.caretPosition(80));
 }
 
 test "moveUp and moveDown across newline lines" {
@@ -406,15 +378,11 @@ test "moveDown lands on the visually adjacent row at the same column" {
     defer editor.deinit();
     try editor.insert("hello\nworld");
     editor.caret = 3;
-    var buffer: std.ArrayList(u8) = .empty;
-    defer buffer.deinit(std.testing.allocator);
-    var lines: std.ArrayList([]const u8) = .empty;
-    defer lines.deinit(std.testing.allocator);
-    const before = try editor.render(80, true, &buffer, &lines);
+    const before = editor.caretPosition(80);
     editor.moveDown(80);
-    const after = try editor.render(80, true, &buffer, &lines);
-    try std.testing.expectEqual(before.?.row + 1, after.?.row);
-    try std.testing.expectEqual(before.?.column, after.?.column);
+    const after = editor.caretPosition(80);
+    try std.testing.expectEqual(before.row + 1, after.row);
+    try std.testing.expectEqual(before.column, after.column);
 }
 
 test "vertical movement keeps a sticky goal column across a shorter row" {
@@ -463,14 +431,9 @@ test "moving right across blank lines does not skip rows" {
     defer editor.deinit();
     try editor.insert("a\n\nb");
     editor.moveHome();
-    var buffer: std.ArrayList(u8) = .empty;
-    defer buffer.deinit(std.testing.allocator);
-    var lines: std.ArrayList([]const u8) = .empty;
-    defer lines.deinit(std.testing.allocator);
     const expected_rows = [_]usize{ 1, 1, 2, 3, 3 };
     for (expected_rows) |row| {
-        const caret = try editor.render(80, true, &buffer, &lines);
-        try std.testing.expectEqual(row, caret.?.row);
+        try std.testing.expectEqual(row, editor.caretPosition(80).row);
         editor.moveRight();
     }
 }

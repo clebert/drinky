@@ -1,12 +1,11 @@
 //! The app's terminal widgets, drawn on the `terminal` engine: the input-line
-//! `Editor`, the single-choice `Picker`, the bottom `status` line, the
-//! `separator` rule the editor and picker share, the transcript `block` model,
-//! the `paint` row primitives, and the shared `color` palette.
+//! `Editor`, the single-choice `Picker`, the bottom `status` line, the transcript
+//! `block` model, the `paint` row primitives they stream through, and the shared
+//! `color` palette.
 
 pub const Editor = @import("Editor.zig");
 pub const Picker = @import("Picker.zig");
 pub const block = @import("block.zig");
 pub const color = @import("color.zig");
 pub const paint = @import("paint.zig");
-pub const separator = @import("separator.zig");
 pub const status = @import("status.zig");

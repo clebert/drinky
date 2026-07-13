@@ -60,13 +60,13 @@ pub const Entry = union(enum) {
     /// rows (nonzero only for the clip).
     pub fn render(self: *const Entry, placement: *const paint.Placement) !void {
         switch (self.*) {
-            .intro => |text| try paint.notice(placement, .{ .style = color.dim, .prefix = "" }, text.items),
-            .feedback => |flagged| try paint.notice(placement, .{
+            .intro => |text| try paint.notice(placement, &.{ .style = color.dim, .prefix = "" }, text.items),
+            .feedback => |flagged| try paint.notice(placement, &.{
                 .style = if (flagged.is_error) color.red else color.dim,
                 .prefix = if (flagged.is_error) "error: " else "",
             }, flagged.text.items),
-            .user => |text| try paint.box(placement, .{ .background = color.user_bg, .foreground = color.user_fg }, text.items),
-            .tool_result => |flagged| try paint.box(placement, .{
+            .user => |text| try paint.box(placement, &.{ .background = color.user_bg, .foreground = color.user_fg }, text.items),
+            .tool_result => |flagged| try paint.box(placement, &.{
                 .background = if (flagged.is_error) color.tool_error_bg else color.tool_success_bg,
                 .foreground = color.tool_fg,
             }, flagged.text.items),
