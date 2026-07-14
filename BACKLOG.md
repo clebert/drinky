@@ -46,7 +46,7 @@ Extension seams referenced here:
       `provider.Client.kind` and `models.list` back the list. A command returns a `command.Outcome`
       (`feedback` or `pick`); the app owns the reusable `tui.Picker` and, on selection, re-applies
       the command with the choice via `command.apply` — so the widget stays generic. Per-message
-      cost attribution across a switch is still the open item below.
+      cost attribution across a switch is handled below.
 - [ ] **Slash-command Tab completion.** Complete a partial slash command on Tab: while the line
       starts with `/` and no argument has been typed, match the prefix against the command registry
       and fill in the rest, cycling or listing the candidates when several match. Needs a Tab key
@@ -95,11 +95,14 @@ Extension seams referenced here:
       `llm.Usage`, carried on the `stop` event; `Agent.Stats` accumulates tokens and cost (priced by
       `models.zig`), and the `tui.status` line shows context fill, the last request's cache hit
       rate, session cost, and cumulative cache savings.
-- [ ] **Per-message cost attribution.** Cost and savings are priced with the session's single
-      current model, so a mid-session `/model` switch misprices earlier turns (a switch is a
-      one-turn cache rewrite that blends both models' rates). Record each assistant message's usage
-      against the model that produced it — carry the model or its rates with the usage — so
-      cumulative figures stay correct across a switch.
+- [x] **Per-message cost attribution.** Each assistant message is priced against the model that
+      produced it, not the session's live model: `fetchReply` captures the turn's model and threads
+      it through `readReply` to `Agent.recordUsage`, so a mid-session `/model` switch can't reprice
+      earlier turns (correctness is by construction, not by the old implicit "`self.model` is still
+      the right model at fold time" timing). `Agent.Stats` keeps the running cost/savings plus a
+      bounded per-model breakdown (cost, savings, tokens per model) — a plain value type that still
+      copies cleanly across the UI channel. The status line is unchanged; the breakdown backs the
+      `/session` summary below.
 - [ ] **Per-turn / `/session` breakdown.** Accounting is cumulative plus last-request only. Keep a
       per-turn record and add a `/session` summary (tokens, cost, cache savings, split by model).
       Re-adds the cumulative token totals recently trimmed from `Agent.Stats`.

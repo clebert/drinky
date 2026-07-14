@@ -58,6 +58,16 @@ pub const Usage = struct {
     output: u64 = 0,
     cache_read: u64 = 0,
     cache_write: u64 = 0,
+
+    /// Field-wise sum, for accumulating several messages' usage.
+    pub fn plus(self: Usage, other: Usage) Usage {
+        return .{
+            .input = self.input + other.input,
+            .output = self.output + other.output,
+            .cache_read = self.cache_read + other.cache_read,
+            .cache_write = self.cache_write + other.cache_write,
+        };
+    }
 };
 
 /// A decoded fragment of a streamed assistant reply.

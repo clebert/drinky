@@ -125,7 +125,9 @@ and the app (`src/`).
   alternation stays valid.
 - A mid-turn cancel is surfaced as a clean abort (partial assistant message dropped), not a network
   error.
-- Accumulates cost and cache savings, and carries the last request's usage.
+- Accumulates cost and cache savings, pricing each message against the model that produced it (so a
+  mid-session `/model` switch stays correctly priced) with a per-model breakdown, and carries the
+  last request's usage.
 
 ### Provider-neutral model (`llm`, `provider`, `models`)
 
