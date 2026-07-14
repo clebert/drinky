@@ -1,6 +1,6 @@
 //! The bottom status line: a context-window gauge, session cost, and cache
-//! savings on the left, the model right-aligned. A pure renderer — it holds no
-//! state and streams from a caller-built `Info` snapshot.
+//! savings on the left, the model and reasoning effort right-aligned. A pure
+//! renderer — it holds no state and streams from a caller-built `Info` snapshot.
 
 const std = @import("std");
 
@@ -16,11 +16,15 @@ pub const Info = struct {
     saved: f64,
     context_window: u64,
     model: []const u8,
+    effort: []const u8,
 };
 
-/// Stream the status line through `placement`: session stats on the left, `model`
-/// right-aligned to the terminal width. When they cannot both fit, the stats
-/// alone, truncated.
+/// Separates the model name from its effort level on the right of the line.
+const separator = " • ";
+
+/// Stream the status line through `placement`: session stats on the left, the
+/// `model • effort` indicator right-aligned to the terminal width. When they
+/// cannot both fit, the stats alone, truncated.
 pub fn render(placement: *const paint.Placement, info: *const Info) !void {
     if (placement.base < placement.skip) return;
 
@@ -31,14 +35,17 @@ pub fn render(placement: *const paint.Placement, info: *const Info) !void {
     writeStats(&stats, info) catch unreachable;
     const line = stats.buffered();
     const stats_columns = terminal.width.ofText(line);
-    const model_columns = terminal.width.ofText(info.model);
+    const right_columns = terminal.width.ofText(info.model) +
+        terminal.width.ofText(separator) + terminal.width.ofText(info.effort);
 
     const writer = placement.sink.begin();
     try writer.writeAll(color.dim);
-    if (stats_columns + model_columns + 1 <= placement.columns) {
+    if (stats_columns + right_columns + 1 <= placement.columns) {
         try writer.writeAll(line);
-        try writer.splatByteAll(' ', placement.columns - stats_columns - model_columns);
+        try writer.splatByteAll(' ', placement.columns - stats_columns - right_columns);
         try writer.writeAll(info.model);
+        try writer.writeAll(separator);
+        try writer.writeAll(info.effort);
     } else {
         try writer.writeAll(terminal.width.truncate(line, placement.columns));
     }
@@ -117,6 +124,7 @@ test render {
         .saved = 0.82,
         .context_window = 1_000_000,
         .model = "claude-opus-4-8",
+        .effort = "xhigh",
     };
 
     const sink = try view.beginFrame(.{ .columns = 120, .rows = 24 }, 4);
@@ -128,6 +136,6 @@ test render {
     try std.testing.expect(std.mem.indexOf(u8, painted, "ctx 21% (206k/1.0M)") != null);
     try std.testing.expect(std.mem.indexOf(u8, painted, "cache 87%") != null);
     try std.testing.expect(std.mem.indexOf(u8, painted, "$0.39 saved $0.82") != null);
-    // The model is right-aligned, so it lands after the left-hand stats.
-    try std.testing.expect(std.mem.indexOf(u8, painted, "claude-opus-4-8").? > std.mem.indexOf(u8, painted, "ctx 21%").?);
+    // The model and effort are right-aligned, so they land after the stats.
+    try std.testing.expect(std.mem.indexOf(u8, painted, "claude-opus-4-8 • xhigh").? > std.mem.indexOf(u8, painted, "ctx 21%").?);
 }

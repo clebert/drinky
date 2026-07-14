@@ -74,17 +74,21 @@ pub fn notice(placement: *const Placement, look: *const Notice, text: []const u8
     }
 }
 
-/// `text` wrapped to the terminal width as plain rows (the model reply),
-/// streamed a row at a time so the clip never materializes its whole body. Each
-/// row borrows `text`, so nothing is copied but the emitted bytes.
-pub fn wrapped(placement: *const Placement, text: []const u8) !void {
+/// `text` wrapped to the terminal width, streamed a row at a time so the clip
+/// never materializes its whole body. Each row borrows `text`, so nothing is
+/// copied but the emitted bytes; `maybe_style` (null for the plain model reply)
+/// opens every row and is reset after it, for a dimmed run like the thinking
+/// stream.
+pub fn wrapped(placement: *const Placement, maybe_style: ?[]const u8, text: []const u8) !void {
     var iterator = terminal.width.wrapper(text, @max(placement.columns, 1));
     var index: usize = 0;
     while (iterator.next()) |content| : (index += 1) {
         const line = placement.base + index;
         if (line < placement.skip) continue;
         const writer = placement.sink.begin();
+        if (maybe_style) |style| try writer.writeAll(style);
         try writer.writeAll(content);
+        if (maybe_style != null) try writer.writeAll(color.reset);
         placement.sink.end(.{ .id = placement.id, .line = line });
     }
 }

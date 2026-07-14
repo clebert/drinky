@@ -34,6 +34,9 @@ stats_shown: ai.Agent.Stats,
 /// Consumer-owned copy of the active model, updated after a command runs, so
 /// `paint` needs no agent for the context-window and model-name gauges.
 model_shown: ai.models.Model,
+/// Consumer-owned copy of the reasoning-effort level, updated after a command
+/// runs, for the status-line indicator.
+effort_shown: ai.llm.Effort,
 
 const Mode = union(enum) {
     prompt,
@@ -75,6 +78,7 @@ const Picking = struct {
 pub const UiEvent = union(enum) {
     keys: []u8,
     text: []u8,
+    thinking: []u8,
     tool_start: Tool,
     tool_result: ToolResult,
     usage: ai.Agent.Stats,
@@ -90,7 +94,7 @@ pub const UiEvent = union(enum) {
 
     pub fn deinit(self: UiEvent, gpa: std.mem.Allocator) void {
         switch (self) {
-            .keys, .text => |bytes| gpa.free(bytes),
+            .keys, .text, .thinking => |bytes| gpa.free(bytes),
             .tool_start => |tool| {
                 gpa.free(tool.name);
                 gpa.free(tool.input_json);
@@ -106,9 +110,9 @@ pub const UiEvent = union(enum) {
 };
 
 /// Build an empty session at the default terminal size, painting through `writer`
-/// and showing `model` until a command changes it. Infallible: the components own
-/// no resources until used.
-pub fn init(gpa: std.mem.Allocator, writer: *std.Io.Writer, model: ai.models.Model) Session {
+/// and showing `model` and `effort` until a command changes them. Infallible: the
+/// components own no resources until used.
+pub fn init(gpa: std.mem.Allocator, writer: *std.Io.Writer, model: ai.models.Model, effort: ai.llm.Effort) Session {
     return .{
         .gpa = gpa,
         .transcript = Transcript.init(gpa),
@@ -120,6 +124,7 @@ pub fn init(gpa: std.mem.Allocator, writer: *std.Io.Writer, model: ai.models.Mod
         .dirty = false,
         .stats_shown = .{},
         .model_shown = model,
+        .effort_shown = effort,
     };
 }
 
@@ -148,16 +153,17 @@ pub fn applyStreamEvent(self: *Session, event: UiEvent) !void {
     self.dirty = true;
     switch (event) {
         .text => |delta| try self.transcript.appendModelText(delta),
+        .thinking => |delta| try self.transcript.appendThinkingText(delta),
         .tool_start => |tool| {
-            self.transcript.endModelRun();
+            self.transcript.endMessage();
             if (self.activeTurn()) |turn| try pushTool(turn, self.gpa, tool.name, tool.input_json);
         },
         .tool_result => |result| try self.applyToolResult(result),
         .usage => |stats| self.stats_shown = stats,
-        .stream_reset => self.transcript.discardModelRun(),
+        .stream_reset => self.transcript.discardMessage(),
         .turn_ended => |maybe_text| {
             if (maybe_text) |text| try self.transcript.append(.feedback, true, text);
-            self.transcript.endModelRun();
+            self.transcript.endMessage();
             self.endTurn();
         },
         .keys, .tick, .resize => unreachable,
@@ -228,7 +234,7 @@ pub fn markDirty(self: *Session) void {
 /// Close any open model run, then enter turn mode with a fresh spinner and no
 /// active tools.
 pub fn beginTurn(self: *Session) void {
-    self.transcript.endModelRun();
+    self.transcript.endMessage();
     self.mode = .{ .turn = .{ .spinner_frame = 0, .tools = .empty, .box_view = .empty } };
     self.dirty = true;
 }
@@ -237,7 +243,7 @@ pub fn beginTurn(self: *Session) void {
 /// chrome, and record the cancellation. The io-side worker teardown is the
 /// caller's.
 pub fn abortTurn(self: *Session) !void {
-    self.transcript.endModelRun();
+    self.transcript.endMessage();
     self.endTurn();
     try self.transcript.append(.feedback, false, "cancelled");
     self.dirty = true;
@@ -261,6 +267,7 @@ pub fn paint(self: *Session, size: terminal.View.Size) !void {
         .saved = self.stats_shown.saved,
         .context_window = self.model_shown.context_window,
         .model = self.model_shown.name,
+        .effort = @tagName(self.effort_shown),
     };
 
     const tail: layout.Tail = switch (self.mode) {
@@ -399,7 +406,7 @@ test "scripted stream events drive the model and one coalesced paint" {
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
 
-    var session: Session = Session.init(gpa, &out.writer, test_model);
+    var session: Session = Session.init(gpa, &out.writer, test_model, .off);
     defer session.deinit();
     session.mode = .{ .turn = .{ .spinner_frame = 0, .tools = .empty, .box_view = .empty } };
 
@@ -440,7 +447,7 @@ test "stream events are dropped once the turn is over" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var session: Session = Session.init(gpa, &out.writer, test_model);
+    var session: Session = Session.init(gpa, &out.writer, test_model, .off);
     defer session.deinit();
 
     try session.applyStreamEvent(.{ .text = try gpa.dupe(u8, "straggler") });
@@ -455,7 +462,7 @@ test "a tick repaints and steps the spinner while a turn animates" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var session: Session = Session.init(gpa, &out.writer, test_model);
+    var session: Session = Session.init(gpa, &out.writer, test_model, .off);
     defer session.deinit();
 
     // Animating and clean still repaints, and the spinner advances one frame.

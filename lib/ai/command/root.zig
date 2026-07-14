@@ -9,6 +9,7 @@ const std = @import("std");
 pub const Context = @import("Context.zig");
 pub const Outcome = @import("outcome.zig").Outcome;
 
+const effort = @import("effort.zig");
 const model = @import("model.zig");
 
 const Entry = struct {
@@ -18,6 +19,7 @@ const Entry = struct {
 
 const registry = [_]Entry{
     .{ .name = model.name, .run = model.run },
+    .{ .name = effort.name, .run = effort.run },
 };
 
 /// Dispatch `line` (a full input line beginning with `/`) to its command.

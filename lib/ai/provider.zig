@@ -10,9 +10,7 @@ const anthropic = @import("anthropic/root.zig");
 const llm = @import("llm.zig");
 const net = @import("net.zig");
 
-pub const Kind = enum { anthropic };
-
-pub const Client = union(Kind) {
+pub const Client = union(llm.Provider) {
     anthropic: Anthropic,
 
     const Anthropic = struct {
@@ -23,7 +21,7 @@ pub const Client = union(Kind) {
     };
 
     pub fn init(
-        provider: Kind,
+        provider: llm.Provider,
         gpa: std.mem.Allocator,
         io: std.Io,
         auth: *anthropic.Auth,
@@ -35,7 +33,7 @@ pub const Client = union(Kind) {
     }
 
     /// The provider backing this client.
-    pub fn kind(self: *const Client) Kind {
+    pub fn kind(self: *const Client) llm.Provider {
         return std.meta.activeTag(self.*);
     }
 
@@ -56,7 +54,7 @@ pub const Client = union(Kind) {
 };
 
 /// A single request in flight, decoding to neutral `llm.Event`s.
-pub const Stream = union(Kind) {
+pub const Stream = union(llm.Provider) {
     anthropic: anthropic.Transport.Stream,
 
     pub fn deinit(self: *Stream) void {

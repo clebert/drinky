@@ -14,6 +14,7 @@ const paint = @import("paint.zig");
 pub const Entry = union(enum) {
     intro: std.ArrayList(u8),
     user: std.ArrayList(u8),
+    thinking: std.ArrayList(u8),
     model: std.ArrayList(u8),
     tool_result: Flagged,
     feedback: Flagged,
@@ -30,6 +31,7 @@ pub const Entry = union(enum) {
         return switch (kind) {
             .intro => .{ .intro = list },
             .user => .{ .user = list },
+            .thinking => .{ .thinking = list },
             .model => .{ .model = list },
             .tool_result => .{ .tool_result = .{ .text = list, .is_error = is_error } },
             .feedback => .{ .feedback = .{ .text = list, .is_error = is_error } },
@@ -38,7 +40,7 @@ pub const Entry = union(enum) {
 
     pub fn deinit(self: *Entry, gpa: std.mem.Allocator) void {
         switch (self.*) {
-            .intro, .user, .model => |*text| text.deinit(gpa),
+            .intro, .user, .thinking, .model => |*text| text.deinit(gpa),
             .tool_result, .feedback => |*flagged| flagged.text.deinit(gpa),
         }
     }
@@ -52,7 +54,7 @@ pub const Entry = union(enum) {
             .feedback => |flagged| std.mem.count(u8, flagged.text.items, "\n") + 1,
             .user => |text| paint.boxRows(text.items, columns),
             .tool_result => |flagged| paint.boxRows(flagged.text.items, columns),
-            .model => |text| terminal.width.rows(text.items, @max(columns, 1)),
+            .thinking, .model => |text| terminal.width.rows(text.items, @max(columns, 1)),
         };
     }
 
@@ -70,7 +72,8 @@ pub const Entry = union(enum) {
                 .background = if (flagged.is_error) color.tool_error_bg else color.tool_success_bg,
                 .foreground = color.tool_fg,
             }, flagged.text.items),
-            .model => |text| try paint.wrapped(placement, text.items),
+            .thinking => |text| try paint.wrapped(placement, color.dim, text.items),
+            .model => |text| try paint.wrapped(placement, null, text.items),
         }
     }
 };
@@ -106,6 +109,7 @@ test "each entry variant renders exactly the rows it counts" {
         .{ .kind = .feedback, .is_error = true, .text = "boom" },
         .{ .kind = .user, .is_error = false, .text = "a user message long enough to wrap across the narrow test width more than once" },
         .{ .kind = .model, .is_error = false, .text = "model reply\nwith a blank\n\nthen a long paragraph that must wrap several rows" },
+        .{ .kind = .thinking, .is_error = false, .text = "reasoning that runs on\n\nlong enough to wrap across the narrow test width more than once" },
         .{ .kind = .tool_result, .is_error = true, .text = "read foo.zig\n→ no such file" },
         // A wide-glyph box, to exercise the narrow-width row cap.
         .{ .kind = .user, .is_error = false, .text = "你好世界" },

@@ -3,7 +3,8 @@
 //! results back, and repeat until the model stops asking for tools. Owns the
 //! conversation history and talks to the model through a neutral
 //! `provider.Client`; presentation is delegated to a
-//! `handler` with `onText`/`onToolStart`/`onToolResult`/`onUsage`/`onError`.
+//! `handler` with
+//! `onText`/`onThinking`/`onToolStart`/`onToolResult`/`onUsage`/`onError`.
 
 const std = @import("std");
 
@@ -17,6 +18,10 @@ const Agent = @This();
 
 const rounds_max = 50;
 
+/// Placeholder surfaced for a redacted reasoning block, whose real content is
+/// encrypted and cannot be shown.
+const redacted_notice = "[redacted thinking]";
+
 /// Distinct models one session breaks its cost down by. Comfortably exceeds the
 /// compiled model table; a rarer overflow drops only the per-model detail, never
 /// the cumulative totals.
@@ -27,6 +32,7 @@ io: std.Io,
 client: provider.Client,
 model: models.Model,
 system: []const u8,
+effort: llm.Effort,
 retry: net.Retry,
 arena: std.heap.ArenaAllocator,
 messages: std.ArrayList(llm.Message),
@@ -90,7 +96,7 @@ pub fn init(
     gpa: std.mem.Allocator,
     io: std.Io,
     client: provider.Client,
-    options: struct { model: models.Model, system: []const u8, retry: net.Retry },
+    options: struct { model: models.Model, system: []const u8, retry: net.Retry, effort: llm.Effort = .off },
 ) Agent {
     return .{
         .gpa = gpa,
@@ -98,6 +104,7 @@ pub fn init(
         .client = client,
         .model = options.model,
         .system = options.system,
+        .effort = options.effort,
         .retry = options.retry,
         .arena = .init(gpa),
         .messages = .empty,
@@ -114,6 +121,11 @@ pub fn deinit(self: *Agent) void {
 /// so the new model reads the same conversation from its own context window.
 pub fn setModel(self: *Agent, model: models.Model) void {
     self.model = model;
+}
+
+/// Switch the reasoning-effort level; takes effect on the next turn.
+pub fn setEffort(self: *Agent, effort: llm.Effort) void {
+    self.effort = effort;
 }
 
 /// Run one user turn, streaming output through `handler`.
@@ -143,6 +155,7 @@ fn fetchReply(self: *Agent, handler: anytype, base: usize) !?[]const llm.Block {
         .system = self.system,
         .messages = self.messages.items,
         .tools = &tool.specs,
+        .effort = self.effort,
     };
     var attempt: u32 = 1;
     while (true) : (attempt += 1) {
@@ -230,8 +243,8 @@ fn appendUser(self: *Agent, text: []const u8) !void {
 /// `model` — the model that produced the message, threaded from the request so
 /// billing can't drift when a later `/model` switch changes `self.model`.
 fn recordUsage(self: *Agent, model: *const models.Model, usage: llm.Usage) void {
-    const cost = model.cost(usage);
-    const saved = model.savings(usage);
+    const cost = model.cost(&usage);
+    const saved = model.savings(&usage);
     self.stats.cost += cost;
     self.stats.saved += saved;
     self.stats.last = usage;
@@ -245,7 +258,7 @@ fn recordUsage(self: *Agent, model: *const models.Model, usage: llm.Usage) void 
 fn readReply(
     self: *Agent,
     model: *const models.Model,
-    stream: *provider.Stream,
+    stream: anytype,
     handler: anytype,
 ) ![]const llm.Block {
     const arena = self.arena.allocator();
@@ -257,15 +270,48 @@ fn readReply(
     var tool_id: []const u8 = "";
     var tool_name: []const u8 = "";
     var in_tool = false;
+    var thinking: std.ArrayList(u8) = .empty;
+    defer thinking.deinit(self.gpa);
+    var signature: std.ArrayList(u8) = .empty;
+    defer signature.deinit(self.gpa);
+    var in_thinking = false;
 
     while (try stream.next()) |event| switch (event) {
+        .thinking => |delta| {
+            in_thinking = true;
+            try thinking.appendSlice(self.gpa, delta);
+            try handler.onThinking(delta);
+        },
+        // The signature closes the reasoning run; mark it open so a block that
+        // carried only a signature (omitted reasoning) still round-trips.
+        .thinking_signature => |delta| {
+            in_thinking = true;
+            try signature.appendSlice(self.gpa, delta);
+        },
+        .thinking_redacted => |data| {
+            try flushThinking(arena, &blocks, &thinking, &signature, &in_thinking);
+            try blocks.append(arena, .{ .thinking = .{
+                .text = "",
+                .signature = try arena.dupe(u8, data),
+                .redacted = true,
+            } });
+            // The payload is encrypted, so stand a placeholder in for the display.
+            try handler.onThinking(redacted_notice);
+        },
         .text => |delta| {
+            try flushThinking(arena, &blocks, &thinking, &signature, &in_thinking);
             try text.appendSlice(self.gpa, delta);
             try handler.onText(delta);
         },
         .tool_use => |use| {
-            try flushText(arena, &blocks, &text);
+            // Commit the buffered blocks in stream order — the pending tool
+            // first, then the reasoning/answer that streamed after it — so the
+            // stored message keeps the order the model produced (thinking at the
+            // head, which the provider requires; tool and text calls interleaved
+            // as sent).
             if (in_tool) try flushTool(arena, &blocks, .{ .id = tool_id, .name = tool_name }, &input);
+            try flushThinking(arena, &blocks, &thinking, &signature, &in_thinking);
+            try flushText(arena, &blocks, &text);
             tool_id = try arena.dupe(u8, use.id);
             tool_name = try arena.dupe(u8, use.name);
             input.clearRetainingCapacity();
@@ -277,8 +323,11 @@ fn readReply(
             try handler.onUsage(self.stats);
         },
     };
-    try flushText(arena, &blocks, &text);
+    // Flush what streamed after the last tool in the order the intra-turn branch
+    // uses: the pending tool first, then any trailing reasoning and answer.
     if (in_tool) try flushTool(arena, &blocks, .{ .id = tool_id, .name = tool_name }, &input);
+    try flushThinking(arena, &blocks, &thinking, &signature, &in_thinking);
+    try flushText(arena, &blocks, &text);
 
     const reply = try blocks.toOwnedSlice(arena);
     try self.messages.append(self.gpa, .{ .role = .assistant, .blocks = reply });
@@ -370,6 +419,26 @@ fn flushText(
     text.clearRetainingCapacity();
 }
 
+/// Commit the open reasoning run as one thinking block (text plus its verbatim
+/// signature), preserving the head-of-message order the provider validates. A
+/// no-op when no run is open.
+fn flushThinking(
+    arena: std.mem.Allocator,
+    blocks: *std.ArrayList(llm.Block),
+    thinking: *std.ArrayList(u8),
+    signature: *std.ArrayList(u8),
+    in_thinking: *bool,
+) !void {
+    if (!in_thinking.*) return;
+    try blocks.append(arena, .{ .thinking = .{
+        .text = try arena.dupe(u8, thinking.items),
+        .signature = try arena.dupe(u8, signature.items),
+    } });
+    thinking.clearRetainingCapacity();
+    signature.clearRetainingCapacity();
+    in_thinking.* = false;
+}
+
 fn flushTool(
     arena: std.mem.Allocator,
     blocks: *std.ArrayList(llm.Block),
@@ -425,4 +494,125 @@ test "usage is attributed to the model that produced it across a switch" {
     try std.testing.expectEqual(@as(usize, 2), agent.stats.model_count);
     try std.testing.expectApproxEqAbs(@as(f64, 6), agent.stats.by_model[0].cost, 1e-9);
     try std.testing.expectEqual(@as(u64, 2_000_000), agent.stats.by_model[0].usage.input);
+}
+
+const ScriptedStream = struct {
+    events: []const llm.Event,
+    index: usize = 0,
+
+    fn next(self: *ScriptedStream) !?llm.Event {
+        if (self.index == self.events.len) return null;
+        defer self.index += 1;
+        return self.events[self.index];
+    }
+};
+
+const CaptureHandler = struct {
+    gpa: std.mem.Allocator,
+    thinking: std.ArrayList(u8) = .empty,
+    text: std.ArrayList(u8) = .empty,
+    usage_seen: bool = false,
+
+    fn deinit(self: *CaptureHandler) void {
+        self.thinking.deinit(self.gpa);
+        self.text.deinit(self.gpa);
+    }
+
+    fn onThinking(self: *CaptureHandler, delta: []const u8) !void {
+        try self.thinking.appendSlice(self.gpa, delta);
+    }
+
+    fn onText(self: *CaptureHandler, delta: []const u8) !void {
+        try self.text.appendSlice(self.gpa, delta);
+    }
+
+    fn onUsage(self: *CaptureHandler, stats: Stats) !void {
+        _ = stats;
+        self.usage_seen = true;
+    }
+};
+
+fn scriptedAgent(gpa: std.mem.Allocator) Agent {
+    const model = models.get(.anthropic, "claude-opus-4-8").?;
+    const client = provider.Client.init(.anthropic, gpa, std.testing.io, undefined, .{});
+    return Agent.init(gpa, std.testing.io, client, .{ .model = model, .system = "", .retry = .{} });
+}
+
+test "readReply assembles a reasoning run, answer, and tool call in stream order" {
+    const gpa = std.testing.allocator;
+    var agent = scriptedAgent(gpa);
+    defer agent.deinit();
+    var handler: CaptureHandler = .{ .gpa = gpa };
+    defer handler.deinit();
+
+    const events = [_]llm.Event{
+        .{ .thinking = "weigh " },
+        .{ .thinking = "it" },
+        .{ .thinking_signature = "sig" },
+        .{ .text = "answer" },
+        .{ .tool_use = .{ .id = "t1", .name = "read" } },
+        .{ .input_json = "{\"path\":\"a\"}" },
+        .{ .stop = .{ .reason = "tool_use", .usage = .{ .output = 5 } } },
+    };
+    var stream: ScriptedStream = .{ .events = &events };
+
+    const reply = try agent.readReply(&agent.model, &stream, &handler);
+    try std.testing.expectEqual(@as(usize, 3), reply.len);
+    try std.testing.expectEqualStrings("weigh it", reply[0].thinking.text);
+    try std.testing.expectEqualStrings("sig", reply[0].thinking.signature);
+    try std.testing.expect(!reply[0].thinking.redacted);
+    try std.testing.expectEqualStrings("answer", reply[1].text);
+    try std.testing.expectEqualStrings("t1", reply[2].tool_use.id);
+    try std.testing.expectEqualStrings("read", reply[2].tool_use.name);
+    try std.testing.expectEqualStrings("{\"path\":\"a\"}", reply[2].tool_use.input_json);
+    try std.testing.expectEqualStrings("weigh it", handler.thinking.items);
+    try std.testing.expect(handler.usage_seen);
+    try std.testing.expectEqual(@as(u64, 5), agent.stats.last.output);
+}
+
+test "readReply keeps a redacted block and a signature-only run in order" {
+    const gpa = std.testing.allocator;
+    var agent = scriptedAgent(gpa);
+    defer agent.deinit();
+    var handler: CaptureHandler = .{ .gpa = gpa };
+    defer handler.deinit();
+
+    const events = [_]llm.Event{
+        .{ .thinking_redacted = "enc" },
+        .{ .thinking_signature = "sigonly" },
+        .{ .text = "hi" },
+        .{ .stop = .{ .reason = "end_turn", .usage = .{} } },
+    };
+    var stream: ScriptedStream = .{ .events = &events };
+
+    const reply = try agent.readReply(&agent.model, &stream, &handler);
+    try std.testing.expectEqual(@as(usize, 3), reply.len);
+    try std.testing.expect(reply[0].thinking.redacted);
+    try std.testing.expectEqualStrings("enc", reply[0].thinking.signature);
+    try std.testing.expect(!reply[1].thinking.redacted);
+    try std.testing.expectEqualStrings("", reply[1].thinking.text);
+    try std.testing.expectEqualStrings("sigonly", reply[1].thinking.signature);
+    try std.testing.expectEqualStrings("hi", reply[2].text);
+    try std.testing.expectEqualStrings(redacted_notice, handler.thinking.items);
+}
+
+test "readReply commits trailing text after the final tool in stream order" {
+    const gpa = std.testing.allocator;
+    var agent = scriptedAgent(gpa);
+    defer agent.deinit();
+    var handler: CaptureHandler = .{ .gpa = gpa };
+    defer handler.deinit();
+
+    const events = [_]llm.Event{
+        .{ .tool_use = .{ .id = "t1", .name = "read" } },
+        .{ .input_json = "{}" },
+        .{ .text = "after" },
+        .{ .stop = .{ .reason = "end_turn", .usage = .{} } },
+    };
+    var stream: ScriptedStream = .{ .events = &events };
+
+    const reply = try agent.readReply(&agent.model, &stream, &handler);
+    try std.testing.expectEqual(@as(usize, 2), reply.len);
+    try std.testing.expectEqualStrings("t1", reply[0].tool_use.id);
+    try std.testing.expectEqualStrings("after", reply[1].text);
 }

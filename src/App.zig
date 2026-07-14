@@ -30,9 +30,10 @@ const Session = @import("Session.zig");
 
 const App = @This();
 
-const model = "claude-sonnet-4-6";
+const model = "claude-opus-4-8";
 const model_info = ai.models.get(.anthropic, model) orelse
     @compileError("default model \"" ++ model ++ "\" is not in the model table");
+const effort: ai.llm.Effort = .xhigh;
 const system_prompt =
     "You are pith, a small coding assistant running in a terminal. Be concise. " ++
     "Explore the working directory with find (by name) and grep (literal text in file contents), read files " ++
@@ -100,6 +101,12 @@ const TurnHandler = struct {
         try self.app.queue.putOne(self.app.io, .{ .text = copy });
     }
 
+    pub fn onThinking(self: *TurnHandler, delta: []const u8) !void {
+        const copy = try self.app.gpa.dupe(u8, delta);
+        errdefer self.app.gpa.free(copy);
+        try self.app.queue.putOne(self.app.io, .{ .thinking = copy });
+    }
+
     pub fn onToolStart(self: *TurnHandler, name: []const u8, input_json: []const u8) !void {
         const name_copy = try self.app.gpa.dupe(u8, name);
         errdefer self.app.gpa.free(name_copy);
@@ -157,7 +164,7 @@ pub fn run(self: *App, gpa: std.mem.Allocator, io: std.Io, home: []const u8) !vo
     try self.ensureAuth();
 
     const client = ai.provider.Client.init(.anthropic, gpa, io, &self.auth, config.timeouts);
-    self.agent = ai.Agent.init(gpa, io, client, .{ .model = model_info, .system = system_prompt, .retry = config.retry });
+    self.agent = ai.Agent.init(gpa, io, client, .{ .model = model_info, .system = system_prompt, .retry = config.retry, .effort = effort });
     defer self.agent.deinit();
 
     try self.tty.init(io);
@@ -166,7 +173,7 @@ pub fn run(self: *App, gpa: std.mem.Allocator, io: std.Io, home: []const u8) !vo
     try self.resize.init();
     defer self.resize.deinit();
 
-    self.session = Session.init(gpa, self.tty.writer(), self.agent.model);
+    self.session = Session.init(gpa, self.tty.writer(), self.agent.model, self.agent.effort);
     defer self.session.deinit();
     self.input = terminal.Input.init(gpa);
     defer self.input.deinit();
@@ -479,6 +486,7 @@ fn runCommand(self: *App, line: []const u8) !void {
     var context: ai.command.Context = .{ .gpa = self.gpa, .agent = &self.agent };
     try self.session.applyOutcome(try ai.command.run(&context, line));
     self.session.model_shown = self.agent.model;
+    self.session.effort_shown = self.agent.effort;
 }
 
 fn handlePickerKey(self: *App, event: terminal.Input.Key) !void {
@@ -505,4 +513,5 @@ fn confirmPicker(self: *App) !void {
     self.session.closePicker();
     try self.session.applyOutcome(outcome);
     self.session.model_shown = self.agent.model;
+    self.session.effort_shown = self.agent.effort;
 }

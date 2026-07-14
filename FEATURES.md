@@ -113,9 +113,13 @@ and the app (`src/`).
   tools.
 - Bounded tool-round loop (max 50) with a typed error on overrun.
 - Owns the conversation history and an arena; provider-neutral via a `provider.Client` handle.
-- Reports presentation through handler callbacks (text, tool start, tool result, usage, error)
-  instead of drawing itself.
-- `setModel` switches the active model mid-session, taking effect next turn with history untouched.
+- Reports presentation through handler callbacks (text, thinking, tool start, tool result, usage,
+  error) instead of drawing itself.
+- Buffers a streamed reasoning run into a `thinking` block (text + verbatim signature, or a redacted
+  payload) at the head of the assistant message, carried back unchanged on later turns so the
+  provider accepts the tool calls that followed it.
+- `setModel`/`setEffort` switch the active model and reasoning-effort level mid-session, taking
+  effect next turn with history untouched.
 - Retries a whole request on a timeout, transient network fault, or retryable status
   (408/429/5xx incl. Anthropic 529), honoring `retry-after`, with bounded attempts and exponential
   backoff; the partial reply of a failed attempt is discarded (never appended to history) and
@@ -131,11 +135,17 @@ and the app (`src/`).
 
 ### Provider-neutral model (`llm`, `provider`, `models`)
 
-- Pure data model of roles, blocks (text/tool_use/tool_result), messages, tools, requests, usage,
-  and stream events.
-- Provider seam (`Kind` enum, `Client`/`Stream` unions) with an Anthropic arm wired.
-- Compiled-in model table (Anthropic `claude-sonnet-4-6`, `claude-opus-4-8`, `claude-sonnet-4-5`,
-  `claude-haiku-4-5`) carrying per-model prices, context window, and max output tokens.
+- Pure data model of roles, reasoning-effort levels, blocks (thinking/text/tool_use/tool_result),
+  messages, tools, requests, usage, and stream events (text, thinking deltas, thinking signatures,
+  redacted reasoning, tool_use, input-json, stop).
+- Provider seam (`llm.Provider` enum, `Client`/`Stream` unions) with an Anthropic arm wired.
+- Compiled-in model table (Anthropic `claude-opus-4-8`, `claude-sonnet-5`, `claude-sonnet-4-6`)
+  carrying per-model prices, context window, maximum output tokens (sent in full as `max_tokens`,
+  the effort level governing actual spend), and a reasoning-effort map.
+- Per-model reasoning-effort map: each of our levels (`off`/`low`/`medium`/`high`/`xhigh`/`max`)
+  resolves to the provider effort name the model accepts, or none. A level a model lacks folds onto
+  the nearest it offers (Sonnet 4.6 maps `xhigh`→`high`); a model with no reasoning maps every level
+  to none; a model that cannot disable reasoning maps `off` up to a floor.
 - Per-model cost and cache-savings computation from USD-per-million rates; an unknown model is
   unsupported rather than guessed.
 - Neutral networking policy (`net`): request `Timeouts`/`Retry` option structs (defaults live here),
@@ -145,8 +155,12 @@ and the app (`src/`).
 
 ### Anthropic transport (`anthropic/`)
 
-- Streaming Messages API over SSE, decoding text deltas, tool_use starts, input-json chunks, usage,
-  stop reason, and API errors.
+- Streaming Messages API over SSE, decoding text deltas, thinking deltas and signatures, redacted
+  reasoning, tool_use starts, input-json chunks, usage, stop reason, and API errors.
+- Adaptive extended thinking: when reasoning is on, sends `thinking:{type:adaptive,
+  display:summarized}` plus `output_config:{effort:…}` — the effort resolved through the model's
+  effort map — so the model sizes its own budget; `max_tokens` stays the model's output ceiling. Off,
+  an unknown model, or a model with no reasoning omits both.
 - OAuth identity headers and `accept-encoding: identity` for verbatim SSE.
 - Always-on prompt caching: ephemeral breakpoints on the last system block, the last tool, and the
   last message block (3 of 4 allowed).
@@ -188,6 +202,8 @@ and the app (`src/`).
   unknown commands report an error.
 - **/model** — switch model by name, or with no argument open a picker over the provider's models
   with the current one marked.
+- **/effort** — set the reasoning-effort level by name, or with no argument open a picker over the
+  levels with the current one marked; shown on the status line as `model • effort`.
 
 ---
 
@@ -212,12 +228,14 @@ and the app (`src/`).
 
 ### Render consumer (`Session`, `Transcript`, `layout`)
 
-- `Session` owns the consumer-side model (transcript, live-tail mode, editor, view, stats/model
-  snapshots) and is io/tty/agent-free for scripted render tests.
+- `Session` owns the consumer-side model (transcript, live-tail mode, editor, view, stats/model/
+  effort snapshots) and is io/tty/agent-free for scripted render tests.
 - Live-tail modelled as a tagged union (prompt / streaming turn / picker) so exactly one live input
   is representable.
 - Streamed model text collects into one growing transcript block until a discrete block, tool call,
   or turn boundary ends the run.
+- Streamed reasoning collects into one growing dimmed `thinking` block, separate from the answer, so
+  the answer run never extends it.
 - Multiple concurrent tool boxes can render during a turn, colored by status: blue while the call
   runs, then replaced by a green (ok) or red (error) transcript line on completion.
 - Layout projects transcript + tail onto a bounded window (8 pages), measuring newest-to-oldest and
@@ -243,14 +261,14 @@ and the app (`src/`).
 ### Status line (`ui/status`)
 
 - Bottom line showing context-window fill, session cost, and cumulative cache savings, with the
-  model name right-aligned.
+  `model • effort` indicator right-aligned.
 - Last-request cache-hit rate shown when the prompt is non-empty; token counts in k/M shorthand.
-- Truncates to stats-only when the model name won't fit.
+- Truncates to stats-only when the model and effort won't fit.
 
 ### Transcript blocks & paint primitives (`ui/block`, `ui/paint`, `ui/color`)
 
-- Transcript entries as a tagged union: intro, user, model, tool_result, and feedback (the last two
-  flagged for error styling).
+- Transcript entries as a tagged union: intro, user, thinking (dimmed), model, tool_result, and
+  feedback (the last two flagged for error styling).
 - Notice, box, and wrapped renderers, each styled from one shared SGR palette.
 - Streaming row painters that emit one physical row at a time into the view sink, so a clipped block
   never materializes its hidden top.

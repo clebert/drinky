@@ -5,6 +5,7 @@
 const std = @import("std");
 
 const llm = @import("../llm.zig");
+const models = @import("../models.zig");
 
 /// Required first system block for subscription OAuth tokens.
 pub const system_header = "You are Claude Code, Anthropic's official CLI for Claude.";
@@ -25,6 +26,20 @@ pub fn serialize(gpa: std.mem.Allocator, request: llm.Request) ![]u8 {
     try json.write(request.tokens_max);
     try json.objectField("stream");
     try json.write(true);
+
+    // Reasoning: let the model size its own budget (adaptive thinking) and steer
+    // its depth with the named effort level, rather than picking a token budget
+    // client-side. `summarized` keeps the reasoning readable for display. Every
+    // level, off included, is resolved through the per-model effort map, so it
+    // maps to what the model accepts; a null result omits the config entirely and
+    // drops the stored thinking blocks from the history below.
+    const reasoning = effortName(request);
+    if (reasoning) |effort| {
+        try json.objectField("thinking");
+        try json.write(AdaptiveThinking{});
+        try json.objectField("output_config");
+        try json.write(OutputConfig{ .effort = effort });
+    }
 
     // Prompt-cache breakpoints, model-independent: Anthropic caches the request
     // prefix (tools, then system, then messages, in that order) up to and
@@ -50,12 +65,20 @@ pub fn serialize(gpa: std.mem.Allocator, request: llm.Request) ![]u8 {
     try json.objectField("messages");
     try json.beginArray();
     for (request.messages, 0..) |message, index| {
-        try writeMessage(&json, message, index == request.messages.len - 1);
+        try writeMessage(&json, message, index == request.messages.len - 1, reasoning != null);
     }
     try json.endArray();
     try json.endObject();
 
     return out.toOwnedSlice();
+}
+
+/// The Anthropic effort name for the request's level, resolved through the
+/// model's effort map, or null to omit the reasoning config. Off, an unknown
+/// model, and a level the model turns off all resolve to null.
+fn effortName(request: llm.Request) ?[]const u8 {
+    const model = models.get(.anthropic, request.model) orelse return null;
+    return model.effort.resolve(request.effort);
 }
 
 /// JSON bytes written through verbatim rather than re-encoded as a quoted
@@ -73,6 +96,27 @@ const RawJson = struct {
 /// A prompt-cache breakpoint: the request prefix up to and including the block
 /// carrying it is cached (5-minute ephemeral).
 const CacheControl = struct { type: []const u8 = "ephemeral" };
+
+/// Adaptive extended-thinking switch: the model sizes its own budget, and
+/// `summarized` reasoning is returned so it can be shown.
+const AdaptiveThinking = struct {
+    type: []const u8 = "adaptive",
+    display: []const u8 = "summarized",
+};
+
+/// The named effort level steering reasoning depth (and answer effort).
+const OutputConfig = struct { effort: []const u8 };
+
+const ThinkingBlock = struct {
+    type: []const u8 = "thinking",
+    thinking: []const u8,
+    signature: []const u8,
+};
+
+const RedactedThinkingBlock = struct {
+    type: []const u8 = "redacted_thinking",
+    data: []const u8,
+};
 
 const TextBlock = struct {
     type: []const u8 = "text",
@@ -132,22 +176,32 @@ fn writeTool(json: *std.json.Stringify, tool: llm.Tool, cache: bool) !void {
     try json.endObject();
 }
 
-fn writeMessage(json: *std.json.Stringify, message: llm.Message, cache_last: bool) !void {
+fn writeMessage(
+    json: *std.json.Stringify,
+    message: llm.Message,
+    cache_last: bool,
+    emit_thinking: bool,
+) !void {
     try json.beginObject();
     try json.objectField("role");
     try json.write(@tagName(message.role));
     try json.objectField("content");
     try json.beginArray();
     for (message.blocks, 0..) |block, index| {
-        try writeBlock(json, block, cache_last and index == message.blocks.len - 1);
+        try writeBlock(json, block, cache_last and index == message.blocks.len - 1, emit_thinking);
     }
     try json.endArray();
     try json.endObject();
 }
 
-fn writeBlock(json: *std.json.Stringify, block: llm.Block, cache: bool) !void {
+fn writeBlock(json: *std.json.Stringify, block: llm.Block, cache: bool, emit_thinking: bool) !void {
     const control: ?CacheControl = if (cache) .{} else null;
     switch (block) {
+        // Thinking sits only at the head of an assistant message, never as the
+        // cached last block, so it carries no cache breakpoint. With reasoning off
+        // it is dropped: the provider would only strip it and its signature can't
+        // be verified.
+        .thinking => |thinking| if (emit_thinking) try writeThinking(json, thinking),
         .text => |text| try json.write(TextBlock{ .text = text, .cache_control = control }),
         // The model emits tool input as JSON already, so embed it verbatim.
         .tool_use => |use| try json.write(ToolUseBlock{
@@ -163,6 +217,15 @@ fn writeBlock(json: *std.json.Stringify, block: llm.Block, cache: bool) !void {
             .cache_control = control,
         }),
     }
+}
+
+/// Serialize a stored reasoning block: a normal block with its verbatim
+/// signature, or a redacted block carrying its encrypted payload.
+fn writeThinking(json: *std.json.Stringify, thinking: llm.Block.Thinking) !void {
+    if (thinking.redacted)
+        try json.write(RedactedThinkingBlock{ .data = thinking.signature })
+    else
+        try json.write(ThinkingBlock{ .thinking = thinking.text, .signature = thinking.signature });
 }
 
 test serialize {
@@ -282,4 +345,128 @@ test "cache_control marks the system prompt, last tool, and last message block" 
     const last_blocks = message_items[1].object.get("content").?.array.items;
     try std.testing.expect(last_blocks[0].object.get("cache_control") == null);
     try std.testing.expect(last_blocks[1].object.get("cache_control") != null);
+}
+
+test "effort turns on adaptive thinking with the named level, max_tokens untouched" {
+    const blocks = [_]llm.Block{
+        .{ .thinking = .{ .text = "weigh it", .signature = "sig" } },
+        .{ .thinking = .{ .text = "", .signature = "secret", .redacted = true } },
+        .{ .text = "answer" },
+    };
+    const messages = [_]llm.Message{.{ .role = .assistant, .blocks = &blocks }};
+    const body = try serialize(std.testing.allocator, .{
+        .model = "claude-opus-4-8",
+        .tokens_max = 8192,
+        .system = "s",
+        .messages = &messages,
+        .tools = &.{},
+        .effort = .xhigh,
+    });
+    defer std.testing.allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+
+    const thinking = root.get("thinking").?.object;
+    try std.testing.expectEqualStrings("adaptive", thinking.get("type").?.string);
+    try std.testing.expectEqualStrings("summarized", thinking.get("display").?.string);
+    try std.testing.expectEqualStrings("xhigh", root.get("output_config").?.object.get("effort").?.string);
+    try std.testing.expectEqual(@as(i64, 8192), root.get("max_tokens").?.integer);
+
+    const content = root.get("messages").?.array.items[0].object.get("content").?.array.items;
+    try std.testing.expectEqualStrings("thinking", content[0].object.get("type").?.string);
+    try std.testing.expectEqualStrings("sig", content[0].object.get("signature").?.string);
+    try std.testing.expectEqualStrings("redacted_thinking", content[1].object.get("type").?.string);
+    try std.testing.expectEqualStrings("secret", content[1].object.get("data").?.string);
+}
+
+test "effort is dropped for a model with no table entry" {
+    // A model absent from the table has no effort map, so the requested level is
+    // dropped rather than emitted blindly — proof the level is resolved through
+    // the per-model table, not from @tagName.
+    const messages = [_]llm.Message{.{ .role = .user, .blocks = &.{.{ .text = "hi" }} }};
+    const body = try serialize(std.testing.allocator, .{
+        .model = "unlisted-model",
+        .tokens_max = 8192,
+        .system = "s",
+        .messages = &messages,
+        .tools = &.{},
+        .effort = .max,
+    });
+    defer std.testing.allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.object.get("thinking") == null);
+    try std.testing.expect(parsed.value.object.get("output_config") == null);
+}
+
+test "an effort level a model lacks folds to one it accepts" {
+    // Sonnet 4.6 has no xhigh; its per-model map folds an xhigh request onto
+    // high, so the default effort works without the user knowing.
+    const messages = [_]llm.Message{.{ .role = .user, .blocks = &.{.{ .text = "hi" }} }};
+    const body = try serialize(std.testing.allocator, .{
+        .model = "claude-sonnet-4-6",
+        .tokens_max = 128_000,
+        .system = "s",
+        .messages = &messages,
+        .tools = &.{},
+        .effort = .xhigh,
+    });
+    defer std.testing.allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(
+        "high",
+        parsed.value.object.get("output_config").?.object.get("effort").?.string,
+    );
+}
+
+test "no thinking or output_config when effort is off" {
+    const messages = [_]llm.Message{.{ .role = .user, .blocks = &.{.{ .text = "hi" }} }};
+    const body = try serialize(std.testing.allocator, .{
+        .model = "claude-opus-4-8",
+        .tokens_max = 8192,
+        .system = "s",
+        .messages = &messages,
+        .tools = &.{},
+    });
+    defer std.testing.allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.object.get("thinking") == null);
+    try std.testing.expect(parsed.value.object.get("output_config") == null);
+    try std.testing.expectEqual(@as(i64, 8192), parsed.value.object.get("max_tokens").?.integer);
+}
+
+test "stored thinking is dropped from history when reasoning is off" {
+    const blocks = [_]llm.Block{
+        .{ .thinking = .{ .text = "weigh it", .signature = "sig" } },
+        .{ .thinking = .{ .text = "", .signature = "secret", .redacted = true } },
+        .{ .text = "answer" },
+    };
+    const messages = [_]llm.Message{.{ .role = .assistant, .blocks = &blocks }};
+    const body = try serialize(std.testing.allocator, .{
+        .model = "claude-opus-4-8",
+        .tokens_max = 8192,
+        .system = "s",
+        .messages = &messages,
+        .tools = &.{},
+        .effort = .off,
+    });
+    defer std.testing.allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    // Reasoning is off: no thinking config, and the stored thinking blocks are
+    // gone, leaving only the answer.
+    try std.testing.expect(root.get("thinking") == null);
+    const content = root.get("messages").?.array.items[0].object.get("content").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), content.len);
+    try std.testing.expectEqualStrings("text", content[0].object.get("type").?.string);
+    try std.testing.expectEqualStrings("answer", content[0].object.get("text").?.string);
 }

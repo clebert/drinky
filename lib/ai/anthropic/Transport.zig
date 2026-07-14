@@ -300,11 +300,20 @@ fn classify(object: std.json.ObjectMap, kind: []const u8) ?llm.Event {
             return .{ .text = asString(delta.get("text")) orelse return null };
         if (std.mem.eql(u8, delta_kind, "input_json_delta"))
             return .{ .input_json = asString(delta.get("partial_json")) orelse return null };
+        if (std.mem.eql(u8, delta_kind, "thinking_delta"))
+            return .{ .thinking = asString(delta.get("thinking")) orelse return null };
+        if (std.mem.eql(u8, delta_kind, "signature_delta"))
+            return .{ .thinking_signature = asString(delta.get("signature")) orelse return null };
         return null;
     }
     if (std.mem.eql(u8, kind, "content_block_start")) {
         const block = asObject(object.get("content_block")) orelse return null;
-        if (!std.mem.eql(u8, asString(block.get("type")) orelse return null, "tool_use")) return null;
+        const block_kind = asString(block.get("type")) orelse return null;
+        if (std.mem.eql(u8, block_kind, "redacted_thinking"))
+            return .{ .thinking_redacted = asString(block.get("data")) orelse return null };
+        // A `thinking` start carries only empty seeds — its content arrives as
+        // deltas — so it, like any other non-tool block, yields no start event.
+        if (!std.mem.eql(u8, block_kind, "tool_use")) return null;
         return .{ .tool_use = .{
             .id = asString(block.get("id")) orelse return null,
             .name = asString(block.get("name")) orelse return null,
@@ -371,6 +380,27 @@ test classify {
     defer parsed_start.deinit();
     const start_event = classify(parsed_start.value.object, "content_block_start").?;
     try std.testing.expectEqualStrings("read", start_event.tool_use.name);
+
+    const thinking =
+        \\{"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"hmm"}}
+    ;
+    const parsed_thinking = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, thinking, .{});
+    defer parsed_thinking.deinit();
+    try std.testing.expectEqualStrings("hmm", classify(parsed_thinking.value.object, "content_block_delta").?.thinking);
+
+    const signature =
+        \\{"type":"content_block_delta","delta":{"type":"signature_delta","signature":"sig"}}
+    ;
+    const parsed_signature = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, signature, .{});
+    defer parsed_signature.deinit();
+    try std.testing.expectEqualStrings("sig", classify(parsed_signature.value.object, "content_block_delta").?.thinking_signature);
+
+    const redacted =
+        \\{"type":"content_block_start","content_block":{"type":"redacted_thinking","data":"enc"}}
+    ;
+    const parsed_redacted = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, redacted, .{});
+    defer parsed_redacted.deinit();
+    try std.testing.expectEqualStrings("enc", classify(parsed_redacted.value.object, "content_block_start").?.thinking_redacted);
 }
 
 test "next walks SSE data lines and ends at stream end" {

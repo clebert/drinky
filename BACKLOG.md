@@ -1,25 +1,28 @@
 # Backlog
 
-Planned features for pith, roughly ordered by dependency. The harness today is intentionally
-minimal: a single hardcoded model and system prompt, a fixed set of file/search tools, and a raw
-line submitted straight to the agent loop. Everything below builds on that base.
+Planned features for pith, roughly ordered by dependency. Everything below builds on the current
+base: a compiled-in model table (`/model` and `/effort` switch model and reasoning effort at
+runtime), a hardcoded system prompt, a fixed set of file/search tools, and slash commands
+intercepted from the input line before it reaches the agent loop.
 
 Extension seams referenced here:
 
-- `src/tool/root.zig` — compile-time tool registry + dispatcher.
-- `src/tool/Context.zig` — ambient tool state (the intended home for a working dir and a provider
+- `lib/ai/tool/root.zig` — compile-time tool registry + dispatcher.
+- `lib/ai/tool/Context.zig` — ambient tool state (the intended home for a working dir and a provider
   handle for subagents).
-- `src/llm.zig` — provider-neutral data model (roles, blocks, requests, events).
-- `src/provider.zig` — provider seam; `Kind` enum + `Client`/`Stream` unions.
-- `src/anthropic/wire.zig` — request serializer.
-- `src/anthropic/Transport.zig` — HTTP + SSE decode.
+- `lib/ai/llm.zig` — provider-neutral data model (roles, reasoning-effort levels, blocks incl.
+  thinking, requests, events).
+- `lib/ai/provider.zig` — provider seam; `Client`/`Stream` unions (the provider `Kind` now lives in
+  `llm.zig` as `Provider`).
+- `lib/ai/anthropic/wire.zig` — request serializer.
+- `lib/ai/anthropic/Transport.zig` — HTTP + SSE decode.
 - `src/App.zig` — composition root, event loop, key handling, submit path.
-- `src/Agent.zig` — the turn/tool-round loop.
+- `lib/ai/Agent.zig` — the turn/tool-round loop.
 
 ## Tools
 
 - [ ] **Bash tool.** Highest-leverage new tool. Add a module exposing `spec` + `run` and one line in
-      the `src/tool/root.zig` registry. Needs a working directory (thread through
+      the `lib/ai/tool/root.zig` registry. Needs a working directory (thread through
       `tool/Context.zig`) and a decision on output capture/truncation and timeouts. No sandboxing or
       permission model exists yet — decide whether that gates this or follows.
 - [x] **Parallel tool calls.** Anthropic (and most providers) already emit multiple `tool_use`
@@ -44,19 +47,23 @@ Extension seams referenced here:
       interactive picker (↑/↓, enter, ctrl-c) over the active provider's models with the current one
       marked. `Agent.setModel` is the live-reconfigure seam (takes effect next turn);
       `provider.Client.kind` and `models.list` back the list. A command returns a `command.Outcome`
-      (`feedback` or `pick`); the app owns the reusable `tui.Picker` and, on selection, re-applies
+      (`feedback` or `pick`); the app owns the reusable `ui.Picker` and, on selection, re-applies
       the command with the choice via `command.apply` — so the widget stays generic. Per-message
       cost attribution across a switch is handled below.
 - [ ] **Slash-command Tab completion.** Complete a partial slash command on Tab: while the line
       starts with `/` and no argument has been typed, match the prefix against the command registry
       and fill in the rest, cycling or listing the candidates when several match. Needs a Tab key
       (`Input` currently decodes it to `ctrl-i`) and a `command.complete(prefix)` seam beside
-      `command.apply`; the candidate list can reuse `tui.Picker`.
-- [ ] **`/effort`** — set reasoning/effort level, and show it on the status line so the right side
-      reads `model • effort` (e.g. `claude-opus-4-8 • xhigh`). Requires an effort field on
-      `llm.Request`, per-provider mapping (Anthropic thinking budget, OpenAI reasoning effort), and
-      threading `effort` into `tui.status.Info`. The per-model level→provider-value mapping (a
-      thinking-level map) belongs in `models.zig` alongside price and context window.
+      `command.apply`; the candidate list can reuse `ui.Picker`.
+- [x] **`/effort`** — set the reasoning-effort level by name, or with no argument open a picker over
+      the levels with the current one marked (mirroring `/model`); shown on the status line so the
+      right side reads `model • effort` (e.g. `claude-opus-4-8 • xhigh`). `llm.Effort`
+      (`off`/`low`/`medium`/`high`/`xhigh`/`max`) is threaded onto `llm.Request` and into
+      `ui.status.Info`, with `Agent.setEffort` the live-reconfigure seam (takes effect next turn).
+      The per-model level→provider-name mapping is a compiled `EffortMap` in `models.zig` (beside
+      price and context window), resolved in `wire.zig` to Anthropic's `output_config.effort`: a
+      level a model lacks folds onto the nearest it has (Sonnet 4.6 has no `xhigh`, so it maps to
+      `high`), so the default effort works on every model without the user knowing.
 - [ ] **`/cache-ttl`** — toggle the Anthropic cache write TTL between 5-minute (default) and 1-hour,
       gated on provider support. Threads a TTL choice into `wire.zig`'s `cache_control`
       (`{"type":"ephemeral","ttl":"1h"}`) and into the cost model: the 1-hour write premium is 2x
@@ -93,7 +100,7 @@ Extension seams referenced here:
       each turn. Anthropic applies its own per-model minimum-prefix rules server side.
 - [x] **Usage & cost stats.** `Transport` folds `message_start` / `message_delta` usage into
       `llm.Usage`, carried on the `stop` event; `Agent.Stats` accumulates tokens and cost (priced by
-      `models.zig`), and the `tui.status` line shows context fill, the last request's cache hit
+      `models.zig`), and the `ui.status` line shows context fill, the last request's cache hit
       rate, session cost, and cumulative cache savings.
 - [x] **Per-message cost attribution.** Each assistant message is priced against the model that
       produced it, not the session's live model: `fetchReply` captures the turn's model and threads
@@ -107,15 +114,15 @@ Extension seams referenced here:
       per-turn record and add a `/session` summary (tokens, cost, cache savings, split by model).
       Re-adds the cumulative token totals recently trimmed from `Agent.Stats`.
 - [ ] **Runtime model catalog.** `models.zig` is a compiled-in table namespaced by provider
-      (`get(kind, name)`) carrying price, context window, and max output tokens per model, with no
-      fallback — an unknown model is unsupported. Load an optional `$HOME/.pith/models.json`,
+      (`get(kind, name)`) carrying price, context window, max output tokens, and a reasoning-effort
+      map per model, with no fallback — an unknown model is unsupported. Load an optional `$HOME/.pith/models.json`,
       structured by provider (`{ "anthropic": { "claude-opus-4-8": { … } } }`), to override or
-      extend the compiled defaults so users control pricing, context windows, output caps, and (with
-      `/effort`) thinking-level maps without a rebuild. Compiled defaults stay authoritative, so a
+      extend the compiled defaults so users control pricing, context windows, output caps, and the
+      per-model reasoning-effort maps (today compiled `EffortMap`s) without a rebuild. Compiled defaults stay authoritative, so a
       known model always has a known window; the file only patches or adds. Ties into `/cache-ttl`
       (per-TTL write rates) and the `/model` / `/effort` commands.
-- [ ] **Other providers (OpenAI, …).** Add a `Kind` arm in `provider.zig` and an `openai/` module
-      (wire + transport) mirroring `anthropic/`. Everything above `provider.zig` is already
+- [ ] **Other providers (OpenAI, …).** Add a `Provider` arm in `llm.zig` (and a matching
+      `provider.zig` union arm) and an `openai/` module (wire + transport) mirroring `anthropic/`. Everything above `provider.zig` is already
       provider-agnostic. Reconciles with `/model`, `/effort`, caching, and stats.
 
 ## Networking & resilience
@@ -164,15 +171,15 @@ Extension seams referenced here:
 
 ## UI
 
-- [x] **Accurate display widths (wide glyphs).** The differential `Screen` (renamed from `Surface`)
+- [x] **Accurate display widths (wide glyphs).** The differential renderer `View`
       counts _physical_ terminal rows for every cursor move: each frame line spans `width.rows` rows
       — the number of pieces `width.wrap` produces, not `ceil(width / columns)`, since a wide
       cluster cannot straddle the margin — and `width.caret` maps a caret's display column to its
       physical row and column within a wrapped line. A single `paint` helper drives every mode
       (first frame, full reset, incremental) so all row arithmetic lives in one place, and
       `viewportTop` and the caret restore both measure physical rows. A line wider than `columns`
-      can no longer desync `cursor_row`, so `Screen` is correct independently of the app
-      pre-wrapping every line. A model terminal in the test suite replays the exact escapes `Screen`
+      can no longer desync `cursor_row`, so `View` is correct independently of the app
+      pre-wrapping every line. A model terminal in the test suite replays the exact escapes `View`
       emits with real auto-wrap and asserts the reconstructed document and caret, covering the
       wide-line paths byte-level checks cannot express.
 - [x] **Grapheme-cluster display widths.** `width.ofText`/`truncate`/`wrap` measure per UAX #29
@@ -228,16 +235,18 @@ Extension seams referenced here:
       run, a tool box tracking its own status) now have somewhere to live.
 - [ ] **Richer UI with dedicated components.** Move beyond the current log + single-line editor to
       composable components (tool-call panels, streaming status, a stats/context footer, a model/
-      effort indicator, command palette). Keep the line/string render model. `tui.Picker` (the
+      effort indicator, command palette). Keep the line/string render model. `ui.Picker` (the
       `/model` chooser) is the first such component: a single-choice list rendered into the live
       region, reusable by any command that returns a `pick` outcome.
-- [ ] **Display model thinking.** Show the model's reasoning/thinking stream in the transcript,
-      visually distinct (dimmed) from the answer. Nothing decodes or renders it today: `llm.Block`
-      has only `text`/`tool_use`/`tool_result` and `llm.Event` only `text`/`tool_use`/`input_json`/
-      `stop`. Needs thinking-delta decode in `anthropic/wire.zig`, a thinking variant on `llm.Block`
-      and `llm.Event`, an `Agent.consume` branch, and an `App` handler/render path (a dimmed run,
-      separate from the answer text). Ties into `/effort`, which turns thinking on and sets its
-      budget.
+- [x] **Display model thinking.** The model's reasoning streams into the transcript dimmed, separate
+      from the answer. `anthropic/wire.zig` sends adaptive thinking (`thinking:{type:adaptive,
+      display:summarized}`) and `Transport` decodes thinking deltas, signatures, and redacted
+      reasoning; `llm.Block` and `llm.Event` gained a `thinking` variant; `Agent` buffers a reasoning
+      run into a `thinking` block (carried back verbatim so the provider accepts the tool calls that
+      followed) and reports it via `handler.onThinking`; `Transcript` collects a run into one growing
+      dimmed `thinking` block that the answer run does not extend, painted by `ui/block`. Adaptive
+      thinking lets the model size its own budget, so no client-side budget is set; `/effort` steers
+      its depth.
 - [ ] **Steering.** Let the user type and send while a turn is running, queuing messages the way pi
       does. Today the read loop is frozen for the whole blocking `agent.run()`, so the input box is
       visible but inert. Depends on the off-thread networking work ("Networking off the UI thread"):
