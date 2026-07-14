@@ -127,11 +127,15 @@ Extension seams referenced here:
       is already buffered, so only a read that must wait on the socket spawns tasks. A user cancel of
       the turn stays distinct (`error.Canceled`). Defaults 30s connect / 60s idle, set via
       `config.json`.
-- [ ] **SSE keep-alive / stall handling.** Anthropic streams periodic `ping` events; a hiccup can
-      stall the byte stream without closing it. Port the ping/keep-alive workaround used for `pi` in
-      our container (recover the exact behavior from that setup) — at minimum treat a ping gap
-      longer than an idle bound as a stall so the timeout/retry path engages. `Transport.next`
-      currently skips ping events silently.
+- [x] **SSE keep-alive / stall handling.** Anthropic streams periodic `ping` events; a hiccup can
+      stall the byte stream without closing it, and a per-read idle timeout that any arriving byte
+      resets can't tell a stalled-but-pinging stream from a live one. Ported the `pi` container
+      workaround's semantics: the idle window now counts only *real* frames. `net.Deadline` fixes one
+      instant and bounds each streamed read by the time left until it; `Transport.next` restarts the
+      window on every non-ping frame but lets a `ping` (now classified apart from other frames) draw
+      it down, so a stream that stalls or sends nothing but pings surfaces `error.Timeout` and the
+      retry path engages. The buffered fast-path is unchanged — a read only consults the deadline
+      when it must wait on the socket.
 - [x] **Request retries.** `Agent.fetchReply` retries a whole request on a timeout, a transient
       network fault, or a retryable status (408 / 429 / 5xx, including Anthropic's 529 overloaded),
       honoring `retry-after` when present, with a bounded attempt count (default 3) and exponential

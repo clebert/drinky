@@ -136,9 +136,10 @@ and the app (`src/`).
   `claude-haiku-4-5`) carrying per-model prices, context window, and max output tokens.
 - Per-model cost and cache-savings computation from USD-per-million rates; an unknown model is
   unsupported rather than guessed.
-- Neutral networking policy (`net`): request `Timeouts`/`Retry` option structs (defaults live here)
-  and `withTimeout`, which bounds a blocking operation by racing it against a timer via
-  `std.Io.Select` and reaping the loser, surfacing `error.Timeout`.
+- Neutral networking policy (`net`): request `Timeouts`/`Retry` option structs (defaults live here),
+  `withTimeout`, which bounds a blocking operation by racing it against a timer via `std.Io.Select`
+  and reaping the loser (surfacing `error.Timeout`), and `Deadline`, a shared idle window that bounds
+  a run of reads by the time left until one instant so activity without progress can't extend it.
 
 ### Anthropic transport (`anthropic/`)
 
@@ -148,10 +149,12 @@ and the app (`src/`).
 - Always-on prompt caching: ephemeral breakpoints on the last system block, the last tool, and the
   last message block (3 of 4 allowed).
 - Usage folded across `message_start`/`message_delta` into a single `llm.Usage`.
-- Request phases are timeout-bounded: `send` (connect + response head) by a connect timeout and each
-  streamed read by an idle timeout; a streamed read races the timer only when no full line is
-  buffered. A stall surfaces `error.Timeout`; a failed head exposes a retryable classification and
-  the parsed `retry-after`.
+- Request phases are timeout-bounded: `send` (connect + response head) by a connect timeout and the
+  read of each streamed event by an idle window (a shared `net.Deadline`). Keepalive `ping` events
+  draw the window down without resetting it — only a real frame restarts it — so a stream that stalls
+  or sends nothing but pings still surfaces `error.Timeout`. A streamed read races the timer only
+  when no full line is buffered; a failed head exposes a retryable classification and the parsed
+  `retry-after`.
 - A cancel during the read is mapped to a clean `error.Canceled` abort, distinct from a timeout.
 
 ### Authentication (`anthropic/Auth`, `oauth`)

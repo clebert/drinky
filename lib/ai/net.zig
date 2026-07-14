@@ -9,6 +9,11 @@
 //! blocked operation is cancelled and reaped, surfacing `error.Timeout`. A cancel
 //! of the *caller* (a user aborting the turn) propagates through as
 //! `error.Canceled`, distinct from a timeout.
+//!
+//! `Deadline` layers on top: it fixes one instant and bounds a run of reads by
+//! the time left until it, so activity that makes no progress (an Anthropic
+//! stream sending only keepalive pings) cannot hold the window open the way a
+//! fresh per-read timeout would.
 
 const std = @import("std");
 
@@ -18,9 +23,10 @@ pub const Timeouts = struct {
     /// Time to the response head: DNS, connect, TLS, request send, and first
     /// byte. Bounds `Transport.send`.
     connect_ms: u64 = 30_000,
-    /// Longest gap tolerated between streamed events; a healthy stream never
-    /// idles this long because the provider sends periodic keep-alives. Bounds
-    /// each streamed read.
+    /// Longest gap tolerated between real streamed events. Anthropic sends
+    /// periodic keepalive pings, so a healthy stream never idles this long — and,
+    /// because pings do not count as progress, a stream that only pings still
+    /// trips it. Bounds the read of each event.
     idle_ms: u64 = 60_000,
 };
 
@@ -97,6 +103,49 @@ fn sleep(io: std.Io, milliseconds: u64) std.Io.Cancelable!void {
     return io.sleep(.fromMilliseconds(@intCast(@min(milliseconds, std.math.maxInt(i64)))), .awake);
 }
 
+/// An idle window shared across a run of timed reads. Where `withTimeout` starts
+/// a fresh window on every call — so a stream of quick reads never expires — a
+/// `Deadline` fixes one instant and bounds each read by the time left until it.
+/// A read that returns without making progress draws the window down instead of
+/// resetting it, so a source that stays busy without progress (an Anthropic
+/// stream sending only keepalive pings) still trips the timeout.
+pub const Deadline = struct {
+    /// Monotonic instant the window closes, or null when unbounded.
+    at: ?std.Io.Timestamp,
+
+    /// A window `timeout_ms` wide opening now; unbounded when `timeout_ms` is 0.
+    pub fn start(io: std.Io, timeout_ms: u64) Deadline {
+        if (timeout_ms == 0) return .{ .at = null };
+        const ms: i64 = @intCast(@min(timeout_ms, std.math.maxInt(i64)));
+        return .{ .at = std.Io.Clock.awake.now(io).addDuration(.fromMilliseconds(ms)) };
+    }
+
+    /// Whether the window has already closed; an unbounded deadline never has.
+    /// Lets a caller time out a source that stays busy without blocking a read
+    /// (a stream flooding pings), which the read-bounding `call` never reaches.
+    pub fn expired(self: Deadline, io: std.Io) bool {
+        const at = self.at orelse return false;
+        return std.Io.Clock.awake.now(io).durationTo(at).nanoseconds <= 0;
+    }
+
+    /// Run `function(args)` bounded by the time left until the deadline: its
+    /// result if it finishes first, `error.Timeout` once the window has closed
+    /// (refused without running when already past it). An unbounded deadline runs
+    /// it without a bound.
+    pub fn call(
+        self: Deadline,
+        io: std.Io,
+        comptime function: anytype,
+        args: std.meta.ArgsTuple(@TypeOf(function)),
+    ) Timed(@TypeOf(function)) {
+        const at = self.at orelse return withTimeout(io, 0, function, args);
+        const remaining_ns = std.Io.Clock.awake.now(io).durationTo(at).nanoseconds;
+        if (remaining_ns <= 0) return error.Timeout;
+        const remaining_ms: u64 = @intCast(@divFloor(remaining_ns, std.time.ns_per_ms) + 1);
+        return withTimeout(io, remaining_ms, function, args);
+    }
+};
+
 test "delayMs doubles per attempt and caps" {
     const retry: Retry = .{ .backoff_ms_initial = 500, .backoff_ms_max = 16_000 };
     try std.testing.expectEqual(@as(u64, 500), retry.delayMs(1));
@@ -127,4 +176,25 @@ test "withTimeout times out and reaps a stalled operation" {
     defer threaded.deinit();
     const io = threaded.io();
     try std.testing.expectError(error.Timeout, withTimeout(io, 20, slowWork, .{io}));
+}
+
+test "Deadline with a zero timeout is unbounded" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    try std.testing.expectEqual(@as(?std.Io.Timestamp, null), Deadline.start(threaded.io(), 0).at);
+}
+
+test "Deadline draws its window down instead of resetting per read" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const deadline = Deadline.start(io, 100);
+    // A read inside the window returns its result and, unlike a fresh per-read
+    // timeout, does not extend the window.
+    try std.testing.expect(!deadline.expired(io));
+    try std.testing.expectEqual(@as(u64, 42), try deadline.call(io, fastWork, .{io}));
+    // Past the window, it is expired and the next read is refused without running.
+    try io.sleep(.fromMilliseconds(150), .awake);
+    try std.testing.expect(deadline.expired(io));
+    try std.testing.expectError(error.Timeout, deadline.call(io, fastWork, .{io}));
 }

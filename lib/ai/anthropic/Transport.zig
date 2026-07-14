@@ -21,6 +21,19 @@ gpa: std.mem.Allocator,
 io: std.Io,
 timeouts: net.Timeouts,
 
+/// The outcome of decoding one SSE `data:` line. A ping is called out from the
+/// other frames so the idle window can discount it: only a `ping` fails to count
+/// as progress, so a stream that sends nothing else still trips the timeout.
+const Decoded = union(enum) {
+    /// An event to hand back to the caller.
+    event: llm.Event,
+    /// A recognized frame with no event for the caller (usage, block
+    /// boundaries) — real progress against the idle window.
+    progress,
+    /// A keepalive ping: ignored, and deliberately not counted as progress.
+    ping,
+};
+
 /// A single Messages request in flight. Pin it: the HTTP response borrows the
 /// request and the SSE reader borrows this struct's buffers.
 pub const Stream = struct {
@@ -83,21 +96,35 @@ pub const Stream = struct {
             parsed.deinit();
             self.parsed = null;
         }
+        // One idle window spans the read of each event. Anthropic sends keepalive
+        // `ping` events between real ones, so a stalled stream can keep sending
+        // bytes without progress; a shared `Deadline` (rather than a fresh
+        // per-read timeout) lets pings draw the window down while every other
+        // frame restarts it, so only a genuine stall surfaces `error.Timeout`.
+        var deadline = net.Deadline.start(self.io, self.idle_ms);
         while (true) {
-            const line = (try self.takeLine()) orelse return null;
+            const line = (try self.takeLine(deadline)) orelse return null;
             const trimmed = std.mem.trimEnd(u8, line, "\r");
             if (!std.mem.startsWith(u8, trimmed, "data:")) continue;
             const payload = std.mem.trimStart(u8, trimmed["data:".len..], " ");
-            if (try self.decode(payload)) |event| return event;
+            switch (try self.decode(payload)) {
+                .event => |event| return event,
+                .progress => deadline = net.Deadline.start(self.io, self.idle_ms),
+                // A ping never restarts the window, so a stream that only pings
+                // trips the timeout even when its bytes arrive buffered and no
+                // read ever blocks on `deadline.call`.
+                .ping => if (deadline.expired(self.io)) return error.Timeout,
+            }
         }
     }
 
     /// The next SSE line. A line already buffered is returned without a timed
-    /// read; a read that must wait on the socket is bounded by the idle timeout,
-    /// so a stalled stream surfaces `error.Timeout` for the retry path.
-    fn takeLine(self: *Stream) !?[]const u8 {
+    /// read; a read that must wait on the socket is bounded by the time left in
+    /// the idle window, so a stream that stalls — silent, or sending only
+    /// keepalive pings — surfaces `error.Timeout` for the retry path.
+    fn takeLine(self: *Stream, deadline: net.Deadline) !?[]const u8 {
         if (std.mem.indexOfScalar(u8, self.body.buffered(), '\n') != null) return self.readLine();
-        return net.withTimeout(self.io, self.idle_ms, readLine, .{self});
+        return deadline.call(self.io, readLine, .{self});
     }
 
     /// Take one delimited line, mapping a canceled read to `error.Canceled`. A
@@ -117,17 +144,21 @@ pub const Stream = struct {
         };
     }
 
-    fn decode(self: *Stream, json: []const u8) !?llm.Event {
+    fn decode(self: *Stream, json: []const u8) !Decoded {
         const parsed = try std.json.parseFromSlice(std.json.Value, self.gpa, json, .{});
         const object = asObject(parsed.value) orelse {
             parsed.deinit();
-            return null;
+            return .progress;
         };
         const kind = asString(object.get("type")) orelse {
             parsed.deinit();
-            return null;
+            return .progress;
         };
 
+        if (std.mem.eql(u8, kind, "ping")) {
+            parsed.deinit();
+            return .ping;
+        }
         if (std.mem.eql(u8, kind, "error")) {
             self.recordError(errorMessage(object) orelse kind);
             parsed.deinit();
@@ -142,22 +173,22 @@ pub const Stream = struct {
                 if (asObject(message.get("usage"))) |usage| mergeUsage(&self.usage, usage);
             }
             parsed.deinit();
-            return null;
+            return .progress;
         }
 
         const event = classify(object, kind) orelse {
             parsed.deinit();
-            return null;
+            return .progress;
         };
         switch (event) {
             .stop => |stop| {
                 if (asObject(object.get("usage"))) |usage| mergeUsage(&self.usage, usage);
                 self.parsed = parsed;
-                return .{ .stop = .{ .reason = stop.reason, .usage = self.usage } };
+                return .{ .event = .{ .stop = .{ .reason = stop.reason, .usage = self.usage } } };
             },
             else => {
                 self.parsed = parsed;
-                return event;
+                return .{ .event = event };
             },
         }
     }
@@ -348,6 +379,9 @@ test "next walks SSE data lines and ends at stream end" {
         "data: {\"type\":\"message_start\",\"message\":{\"usage\":" ++
         "{\"input_tokens\":10,\"cache_read_input_tokens\":90,\"cache_creation_input_tokens\":5,\"output_tokens\":1}}}\r\n" ++
         "\r\n" ++
+        "event: ping\r\n" ++
+        "data: {\"type\":\"ping\"}\r\n" ++
+        "\r\n" ++
         "event: content_block_delta\r\n" ++
         "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\r\n" ++
         "\r\n" ++
@@ -375,6 +409,26 @@ test "next walks SSE data lines and ends at stream end" {
     try std.testing.expectEqual(@as(u64, 90), stop.stop.usage.cache_read);
     try std.testing.expectEqual(@as(u64, 5), stop.stop.usage.cache_write);
     try std.testing.expectEqual(@as(?llm.Event, null), try stream.next());
+}
+
+test "decode separates pings from progress and events" {
+    var stream: Stream = undefined;
+    stream.gpa = std.testing.allocator;
+    stream.parsed = null;
+    stream.usage = .{};
+    defer if (stream.parsed) |parsed| parsed.deinit();
+
+    try std.testing.expectEqual(@as(Decoded, .ping), try stream.decode(
+        \\{"type":"ping"}
+    ));
+    try std.testing.expectEqual(@as(Decoded, .progress), try stream.decode(
+        \\{"type":"message_start","message":{"usage":{"input_tokens":3}}}
+    ));
+    try std.testing.expectEqual(@as(u64, 3), stream.usage.input);
+    const delta = try stream.decode(
+        \\{"type":"content_block_delta","delta":{"type":"text_delta","text":"hi"}}
+    );
+    try std.testing.expectEqualStrings("hi", delta.event.text);
 }
 
 test retryAfter {
