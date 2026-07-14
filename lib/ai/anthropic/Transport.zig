@@ -6,25 +6,38 @@
 const std = @import("std");
 
 const llm = @import("../llm.zig");
+const net = @import("../net.zig");
 
 const Transport = @This();
 
 const messages_url = "https://api.anthropic.com/v1/messages";
 const beta = "claude-code-20250219,oauth-2025-04-20";
 
+/// Statuses worth retrying: rate limiting, request timeout, and the transient
+/// server faults (including Anthropic's 529 "overloaded").
+const retryable_statuses = [_]std.http.Status{ .request_timeout, .too_many_requests, .internal_server_error, .bad_gateway, .service_unavailable, .gateway_timeout, @enumFromInt(529) };
+
 gpa: std.mem.Allocator,
 io: std.Io,
+timeouts: net.Timeouts,
 
 /// A single Messages request in flight. Pin it: the HTTP response borrows the
 /// request and the SSE reader borrows this struct's buffers.
 pub const Stream = struct {
     gpa: std.mem.Allocator,
+    /// Whether `connect` ran to completion, so `out` owns resources `deinit` must
+    /// free. Set last by a successful connect; the timeout error path reads it to
+    /// tell a fully-built stream from a cancelled or partial one.
+    established: bool,
     client: std.http.Client,
     request: std.http.Client.Request,
     response: std.http.Client.Response,
     body: *std.Io.Reader,
+    io: std.Io,
+    idle_ms: u64,
     status: std.http.Status,
     error_length: usize,
+    retry_after_ms: ?u64,
     parsed: ?std.json.Parsed(std.json.Value),
     usage: llm.Usage,
     decompress: std.http.Decompress,
@@ -51,6 +64,19 @@ pub const Stream = struct {
         return self.error_buffer[0..self.error_length];
     }
 
+    /// Whether a failed head carries a status worth retrying.
+    pub fn retryable(self: *const Stream) bool {
+        for (retryable_statuses) |status| {
+            if (self.status == status) return true;
+        }
+        return false;
+    }
+
+    /// The `retry-after` the head asked for, in milliseconds, or null.
+    pub fn retryAfterMs(self: *const Stream) ?u64 {
+        return self.retry_after_ms;
+    }
+
     /// Next decoded event, or null at end of stream.
     pub fn next(self: *Stream) !?llm.Event {
         if (self.parsed) |parsed| {
@@ -58,24 +84,37 @@ pub const Stream = struct {
             self.parsed = null;
         }
         while (true) {
-            const line = (self.body.takeDelimiter('\n') catch |err| switch (err) {
-                // A cancel during the SSE read surfaces here as ReadFailed; the
-                // real cause lives on the connection. Treat a canceled read as
-                // a clean turn abort and leave every other failure on the
-                // network-error path.
-                error.ReadFailed => {
-                    if (self.request.connection.?.getReadError()) |read_error| {
-                        if (read_error == error.Canceled) return error.Canceled;
-                    }
-                    return err;
-                },
-                else => return err,
-            }) orelse return null;
+            const line = (try self.takeLine()) orelse return null;
             const trimmed = std.mem.trimEnd(u8, line, "\r");
             if (!std.mem.startsWith(u8, trimmed, "data:")) continue;
             const payload = std.mem.trimStart(u8, trimmed["data:".len..], " ");
             if (try self.decode(payload)) |event| return event;
         }
+    }
+
+    /// The next SSE line. A line already buffered is returned without a timed
+    /// read; a read that must wait on the socket is bounded by the idle timeout,
+    /// so a stalled stream surfaces `error.Timeout` for the retry path.
+    fn takeLine(self: *Stream) !?[]const u8 {
+        if (std.mem.indexOfScalar(u8, self.body.buffered(), '\n') != null) return self.readLine();
+        return net.withTimeout(self.io, self.idle_ms, readLine, .{self});
+    }
+
+    /// Take one delimited line, mapping a canceled read to `error.Canceled`. A
+    /// cancel during the read surfaces as ReadFailed; the real cause lives on the
+    /// connection. Treat a canceled read as a clean abort (a turn cancel, or the
+    /// idle timer reaping this task) and leave every other failure on the
+    /// network-error path.
+    fn readLine(self: *Stream) anyerror!?[]const u8 {
+        return self.body.takeDelimiter('\n') catch |err| switch (err) {
+            error.ReadFailed => {
+                if (self.request.connection.?.getReadError()) |read_error| {
+                    if (read_error == error.Canceled) return error.Canceled;
+                }
+                return err;
+            },
+            else => return err,
+        };
     }
 
     fn decode(self: *Stream, json: []const u8) !?llm.Event {
@@ -129,13 +168,31 @@ pub const Stream = struct {
     }
 };
 
-/// Open a streaming Messages request, filling `out` in place.
+/// Open a streaming Messages request, filling `out` in place. The connect,
+/// send, and receive-head phase is bounded by the connect timeout; on expiry (or
+/// any failure) `out` is torn down and `error.Timeout` surfaces, so a caller that
+/// sees an error never owns `out`.
 pub fn send(self: *Transport, out: *Stream, body: []const u8, access_token: []const u8) !void {
+    out.io = self.io;
+    out.idle_ms = self.timeouts.idle_ms;
+    out.established = false;
+    net.withTimeout(self.io, self.timeouts.connect_ms, connect, .{ self, out, body, access_token }) catch |err| {
+        // The timeout races `connect`, so a connect that finished right at the
+        // deadline can still surface as `error.Timeout`. `established` (set last
+        // by a full connect) marks that fully-built stream — free it here — apart
+        // from a cancelled or partial connect, whose own errdefers already ran.
+        if (out.established) out.deinit();
+        return err;
+    };
+}
+
+fn connect(self: *Transport, out: *Stream, body: []const u8, access_token: []const u8) anyerror!void {
     out.gpa = self.gpa;
     out.client = .{ .allocator = self.gpa, .io = self.io };
     errdefer out.client.deinit();
     out.parsed = null;
     out.error_length = 0;
+    out.retry_after_ms = null;
     out.usage = .{};
 
     const authorization = try std.fmt.allocPrint(self.gpa, "Bearer {s}", .{access_token});
@@ -176,7 +233,21 @@ pub fn send(self: *Transport, out: *Stream, body: []const u8, access_token: []co
     if (out.status != .ok) {
         const read = out.body.readSliceShort(&out.error_buffer) catch 0;
         out.error_length = read;
+        out.retry_after_ms = retryAfter(out.response.head);
     }
+    out.established = true;
+}
+
+/// Parse the `retry-after` header (whole seconds) into milliseconds; null when
+/// absent or an HTTP-date the backoff falls back on.
+fn retryAfter(head: std.http.Client.Response.Head) ?u64 {
+    var headers = head.iterateHeaders();
+    while (headers.next()) |header| {
+        if (!std.ascii.eqlIgnoreCase(header.name, "retry-after")) continue;
+        const seconds = std.fmt.parseInt(u64, std.mem.trim(u8, header.value, " \t"), 10) catch return null;
+        return seconds *| 1000;
+    }
+    return null;
 }
 
 /// A decompression window sized for `encoding`, or an empty slice when the body
@@ -283,9 +354,13 @@ test "next walks SSE data lines and ends at stream end" {
         "event: message_delta\r\n" ++
         "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":42}}\r\n" ++
         "\r\n";
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
     var reader: std.Io.Reader = .fixed(body);
     var stream: Stream = undefined;
     stream.gpa = std.testing.allocator;
+    stream.io = threaded.io();
+    stream.idle_ms = 60_000;
     stream.body = &reader;
     stream.parsed = null;
     stream.usage = .{};
@@ -300,4 +375,25 @@ test "next walks SSE data lines and ends at stream end" {
     try std.testing.expectEqual(@as(u64, 90), stop.stop.usage.cache_read);
     try std.testing.expectEqual(@as(u64, 5), stop.stop.usage.cache_write);
     try std.testing.expectEqual(@as(?llm.Event, null), try stream.next());
+}
+
+test retryAfter {
+    const with = "HTTP/1.1 429 Too Many Requests\r\nretry-after: 7\r\ncontent-length:0\r\n\r\n";
+    const head = try std.http.Client.Response.Head.parse(with);
+    try std.testing.expectEqual(@as(?u64, 7000), retryAfter(head));
+
+    const without = "HTTP/1.1 503 Service Unavailable\r\ncontent-length:0\r\n\r\n";
+    try std.testing.expectEqual(@as(?u64, null), retryAfter(try std.http.Client.Response.Head.parse(without)));
+}
+
+test "retryable classifies the head status" {
+    var stream: Stream = undefined;
+    stream.status = .too_many_requests;
+    try std.testing.expect(stream.retryable());
+    stream.status = @enumFromInt(529);
+    try std.testing.expect(stream.retryable());
+    stream.status = .ok;
+    try std.testing.expect(!stream.retryable());
+    stream.status = .bad_request;
+    try std.testing.expect(!stream.retryable());
 }

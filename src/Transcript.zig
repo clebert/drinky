@@ -50,6 +50,16 @@ pub fn endModelRun(self: *Transcript) void {
     self.current_model = null;
 }
 
+/// Drop the open model run and free its block, so a reply being retried leaves
+/// no partial text behind. A no-op when no run is open. The open run is always
+/// the last entry, since nothing discrete has ended it.
+pub fn discardModelRun(self: *Transcript) void {
+    const index = self.current_model orelse return;
+    self.current_model = null;
+    var entry = self.entries.orderedRemove(index);
+    entry.deinit(self.gpa);
+}
+
 /// The blocks above the live tail, oldest first, for projection.
 pub fn blocks(self: *const Transcript) []const ui.block.Entry {
     return self.entries.items;
@@ -79,5 +89,27 @@ test "endModelRun forces the next delta into a new block" {
     try transcript.appendModelText("a");
     transcript.endModelRun();
     try transcript.appendModelText("b");
+    try std.testing.expectEqual(@as(usize, 2), transcript.entries.items.len);
+}
+
+test "discardModelRun drops the open run so a retry starts clean" {
+    const gpa = std.testing.allocator;
+    var transcript = Transcript.init(gpa);
+    defer transcript.deinit();
+
+    try transcript.append(.user, false, "hi");
+    try transcript.appendModelText("partial");
+    try std.testing.expectEqual(@as(usize, 2), transcript.entries.items.len);
+
+    transcript.discardModelRun();
+    try std.testing.expectEqual(@as(usize, 1), transcript.entries.items.len);
+
+    try transcript.appendModelText("fresh");
+    try std.testing.expectEqual(@as(usize, 2), transcript.entries.items.len);
+    try std.testing.expectEqualStrings("fresh", transcript.entries.items[1].model.items);
+
+    // A no-op when no run is open.
+    transcript.endModelRun();
+    transcript.discardModelRun();
     try std.testing.expectEqual(@as(usize, 2), transcript.entries.items.len);
 }

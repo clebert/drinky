@@ -9,6 +9,7 @@ pub const anthropic = @import("anthropic/root.zig");
 pub const command = @import("command/root.zig");
 pub const llm = @import("llm.zig");
 pub const models = @import("models.zig");
+pub const net = @import("net.zig");
 pub const provider = @import("provider.zig");
 pub const tool = @import("tool/root.zig");
 

@@ -52,10 +52,11 @@ pub fn run(context: *Context, args: []const u8) !Outcome {
 }
 
 fn testAgent(gpa: std.mem.Allocator) Agent {
-    const client = provider.Client.init(.anthropic, gpa, std.testing.io, undefined);
+    const client = provider.Client.init(.anthropic, gpa, std.testing.io, undefined, .{});
     return Agent.init(gpa, std.testing.io, client, .{
         .model = models.get(.anthropic, "claude-sonnet-4-6").?,
         .system = "",
+        .retry = .{},
     });
 }
 

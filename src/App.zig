@@ -25,6 +25,7 @@ const std = @import("std");
 const ai = @import("ai");
 const terminal = @import("terminal");
 
+const Config = @import("Config.zig");
 const Session = @import("Session.zig");
 
 const App = @This();
@@ -123,6 +124,10 @@ const TurnHandler = struct {
         try self.app.queue.putOne(self.app.io, .{ .usage = stats });
     }
 
+    pub fn onStreamReset(self: *TurnHandler) !void {
+        try self.app.queue.putOne(self.app.io, .stream_reset);
+    }
+
     pub fn onError(self: *TurnHandler, text: []const u8) !void {
         const copy = try self.app.gpa.dupe(u8, text);
         if (self.error_text) |old| self.app.gpa.free(old);
@@ -145,11 +150,14 @@ pub fn run(self: *App, gpa: std.mem.Allocator, io: std.Io, home: []const u8) !vo
     self.tick_future = null;
     self.queue = std.Io.Queue(Session.UiEvent).init(&self.queue_buffer);
 
+    const config = try Config.load(gpa, io, home);
+
     self.auth = try ai.anthropic.Auth.init(gpa, io, home);
     defer self.auth.deinit();
     try self.ensureAuth();
 
-    self.agent = ai.Agent.init(gpa, io, ai.provider.Client.init(.anthropic, gpa, io, &self.auth), .{ .model = model_info, .system = system_prompt });
+    const client = ai.provider.Client.init(.anthropic, gpa, io, &self.auth, config.timeouts);
+    self.agent = ai.Agent.init(gpa, io, client, .{ .model = model_info, .system = system_prompt, .retry = config.retry });
     defer self.agent.deinit();
 
     try self.tty.init(io);

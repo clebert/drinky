@@ -117,20 +117,31 @@ Extension seams referenced here:
 
 ## Networking & resilience
 
-- [ ] **Request timeouts.** Nothing bounds a request today; a stalled connect, send, or read hangs
-      the turn indefinitely. Bound each phase (connect / send / idle-read) in
-      `anthropic/Transport.zig` with sensible defaults, surfaced as a typed error the retry and
-      cancellation paths can act on.
+- [x] **Request timeouts.** Each phase is bounded in `anthropic/Transport.zig`: `Transport.send`
+      (connect + send + response head) by a connect timeout, and each streamed read by an idle
+      timeout. Zig's `std.http` has no request deadline and owns its own socket reads, so a timeout
+      can't attach to an operation directly; `net.withTimeout` instead races the operation against a
+      timer as two concurrent `std.Io.Select` tasks and cancels the loser — the operation wins with
+      its result, or the timer wins and the stalled operation is cancelled and reaped, surfacing the
+      typed `error.Timeout` the retry path acts on. A streamed read skips the race when a full line
+      is already buffered, so only a read that must wait on the socket spawns tasks. A user cancel of
+      the turn stays distinct (`error.Canceled`). Defaults 30s connect / 60s idle, set via
+      `config.json`.
 - [ ] **SSE keep-alive / stall handling.** Anthropic streams periodic `ping` events; a hiccup can
       stall the byte stream without closing it. Port the ping/keep-alive workaround used for `pi` in
       our container (recover the exact behavior from that setup) — at minimum treat a ping gap
       longer than an idle bound as a stall so the timeout/retry path engages. `Transport.next`
       currently skips ping events silently.
-- [ ] **Request retries.** Retry a failed request — timeout, stall, network error, or retryable HTTP
-      status (429 / 5xx) — with bounded attempts and backoff (honor `retry-after` when present).
-      Only whole requests are safe to retry, so a partially streamed assistant message must be
-      discarded first. Sits above `Transport` (in `provider` / `Agent`) so it stays
-      provider-neutral.
+- [x] **Request retries.** `Agent.fetchReply` retries a whole request on a timeout, a transient
+      network fault, or a retryable status (408 / 429 / 5xx, including Anthropic's 529 overloaded),
+      honoring `retry-after` when present, with a bounded attempt count (default 3) and exponential
+      backoff. It sits above `Transport`, so it stays provider-neutral (the transport only classifies
+      its own status via `Stream.retryable`/`retryAfterMs`). Only whole requests are safe to retry:
+      the streamed read appends the assistant message to history only on success, so a failed
+      attempt's partial reply is discarded automatically, and `handler.onStreamReset` clears the
+      partial text already shown in the transcript before the next attempt re-streams. Tool execution
+      runs after the retried read and is never retried; a user cancel or channel close is never
+      retried.
 - [x] **Networking off the UI thread.** The event loop is a single `std.Io.Queue(UiEvent)` consumer
       fed by `io.concurrent` producers — a long-lived stdin reader, the turn worker (`agent.run` off
       the UI thread), and a one-shot frame timer. The consumer solely owns the model and paints, so
@@ -258,5 +269,11 @@ Extension seams referenced here:
 
 - [ ] **Permission model.** No allow/deny concept exists. Bash, subagent tool allowlists, and
       write/edit gating all want a shared answer here.
-- [ ] **Config file.** Several items above (system prompt, model/effort defaults, provider keys,
-      skill/agent/prompt directories) imply a single config source. Decide format and location.
+- [ ] **Config file.** Format and location are now settled: `$HOME/.pith/config.json`, loaded by
+      `src/Config.zig` (typed
+      `std.json` parse; a missing file, section, or field falls back to a built-in default and
+      unknown keys are ignored, so it is optional, partial, and forward-compatible). Today it carries
+      only the `request` section (network timeouts + retry policy), folded into the neutral
+      `ai.net.Timeouts`/`ai.net.Retry` structs. Still to fold in as those features land: system
+      prompt, model/effort defaults, provider keys, skill/agent/prompt directories (see the
+      `models.json` runtime catalog item, which may merge here).

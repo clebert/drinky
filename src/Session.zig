@@ -78,6 +78,9 @@ pub const UiEvent = union(enum) {
     tool_start: Tool,
     tool_result: ToolResult,
     usage: ai.Agent.Stats,
+    /// A retry is about to re-stream the reply: drop the partial text shown so
+    /// far so the retried attempt starts clean.
+    stream_reset,
     turn_ended: ?[]u8,
     tick,
     resize,
@@ -97,7 +100,7 @@ pub const UiEvent = union(enum) {
                 gpa.free(result.content);
             },
             .turn_ended => |maybe_text| if (maybe_text) |text| gpa.free(text),
-            .usage, .tick, .resize => {},
+            .usage, .stream_reset, .tick, .resize => {},
         }
     }
 };
@@ -151,6 +154,7 @@ pub fn applyStreamEvent(self: *Session, event: UiEvent) !void {
         },
         .tool_result => |result| try self.applyToolResult(result),
         .usage => |stats| self.stats_shown = stats,
+        .stream_reset => self.transcript.discardModelRun(),
         .turn_ended => |maybe_text| {
             if (maybe_text) |text| try self.transcript.append(.feedback, true, text);
             self.transcript.endModelRun();

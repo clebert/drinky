@@ -8,6 +8,7 @@ const std = @import("std");
 
 const anthropic = @import("anthropic/root.zig");
 const llm = @import("llm.zig");
+const net = @import("net.zig");
 
 pub const Kind = enum { anthropic };
 
@@ -18,11 +19,18 @@ pub const Client = union(Kind) {
         gpa: std.mem.Allocator,
         io: std.Io,
         auth: *anthropic.Auth,
+        timeouts: net.Timeouts,
     };
 
-    pub fn init(provider: Kind, gpa: std.mem.Allocator, io: std.Io, auth: *anthropic.Auth) Client {
+    pub fn init(
+        provider: Kind,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        auth: *anthropic.Auth,
+        timeouts: net.Timeouts,
+    ) Client {
         return switch (provider) {
-            .anthropic => .{ .anthropic = .{ .gpa = gpa, .io = io, .auth = auth } },
+            .anthropic => .{ .anthropic = .{ .gpa = gpa, .io = io, .auth = auth, .timeouts = timeouts } },
         };
     }
 
@@ -40,7 +48,7 @@ pub const Client = union(Kind) {
                 const body = try anthropic.wire.serialize(client.gpa, request);
                 defer client.gpa.free(body);
                 out.* = .{ .anthropic = undefined };
-                var transport: anthropic.Transport = .{ .gpa = client.gpa, .io = client.io };
+                var transport: anthropic.Transport = .{ .gpa = client.gpa, .io = client.io, .timeouts = client.timeouts };
                 try transport.send(&out.anthropic, body, token);
             },
         }
@@ -69,6 +77,22 @@ pub const Stream = union(Kind) {
     pub fn errorText(self: *const Stream) []const u8 {
         return switch (self.*) {
             inline else => |*stream| stream.errorText(),
+        };
+    }
+
+    /// Whether a failed head (see `ok`) is worth retrying — a rate-limit or a
+    /// transient server status the provider marks retryable.
+    pub fn retryable(self: *const Stream) bool {
+        return switch (self.*) {
+            inline else => |*stream| stream.retryable(),
+        };
+    }
+
+    /// The server's requested wait before a retry (`retry-after`) in
+    /// milliseconds, or null when it gave none.
+    pub fn retryAfterMs(self: *const Stream) ?u64 {
+        return switch (self.*) {
+            inline else => |*stream| stream.retryAfterMs(),
         };
     }
 

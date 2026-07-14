@@ -116,6 +116,11 @@ and the app (`src/`).
 - Reports presentation through handler callbacks (text, tool start, tool result, usage, error)
   instead of drawing itself.
 - `setModel` switches the active model mid-session, taking effect next turn with history untouched.
+- Retries a whole request on a timeout, transient network fault, or retryable status
+  (408/429/5xx incl. Anthropic 529), honoring `retry-after`, with bounded attempts and exponential
+  backoff; the partial reply of a failed attempt is discarded (never appended to history) and
+  `handler.onStreamReset` clears the partial transcript text before the next attempt re-streams.
+  Tool execution runs after the retried read and is never retried.
 - On a stream failure or API error, rolls history back to the turn base so the user/assistant
   alternation stays valid.
 - A mid-turn cancel is surfaced as a clean abort (partial assistant message dropped), not a network
@@ -131,6 +136,9 @@ and the app (`src/`).
   `claude-haiku-4-5`) carrying per-model prices, context window, and max output tokens.
 - Per-model cost and cache-savings computation from USD-per-million rates; an unknown model is
   unsupported rather than guessed.
+- Neutral networking policy (`net`): request `Timeouts`/`Retry` option structs (defaults live here)
+  and `withTimeout`, which bounds a blocking operation by racing it against a timer via
+  `std.Io.Select` and reaping the loser, surfacing `error.Timeout`.
 
 ### Anthropic transport (`anthropic/`)
 
@@ -140,7 +148,11 @@ and the app (`src/`).
 - Always-on prompt caching: ephemeral breakpoints on the last system block, the last tool, and the
   last message block (3 of 4 allowed).
 - Usage folded across `message_start`/`message_delta` into a single `llm.Usage`.
-- A cancel during the read is mapped to a clean `error.Canceled` abort.
+- Request phases are timeout-bounded: `send` (connect + response head) by a connect timeout and each
+  streamed read by an idle timeout; a streamed read races the timer only when no full line is
+  buffered. A stall surfaces `error.Timeout`; a failed head exposes a retryable classification and
+  the parsed `retry-after`.
+- A cancel during the read is mapped to a clean `error.Canceled` abort, distinct from a timeout.
 
 ### Authentication (`anthropic/Auth`, `oauth`)
 
@@ -185,6 +197,8 @@ and the app (`src/`).
   idle interface does no work.
 - Repaints on terminal resize (SIGWINCH): the watcher marks the session dirty, so even a fully idle
   interface reflows at the new size; `refresh` re-reads the size each frame.
+- Loads `$HOME/.pith/config.json` (`Config`) at startup — optional, partial, and
+  forward-compatible — threading request timeouts and retry policy into the client and agent.
 - Authenticates (logging in if needed) before wiring the loop.
 - Ctrl+C clears the editor or quits on a double-press; Ctrl+D quits when the editor is empty.
 - Mid-turn Esc/Ctrl+C cancels the turn worker and drops the partial turn.

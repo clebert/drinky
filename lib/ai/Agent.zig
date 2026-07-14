@@ -9,6 +9,7 @@ const std = @import("std");
 
 const llm = @import("llm.zig");
 const models = @import("models.zig");
+const net = @import("net.zig");
 const provider = @import("provider.zig");
 const tool = @import("tool/root.zig");
 
@@ -21,6 +22,7 @@ io: std.Io,
 client: provider.Client,
 model: models.Model,
 system: []const u8,
+retry: net.Retry,
 arena: std.heap.ArenaAllocator,
 messages: std.ArrayList(llm.Message),
 stats: Stats,
@@ -47,7 +49,7 @@ pub fn init(
     gpa: std.mem.Allocator,
     io: std.Io,
     client: provider.Client,
-    options: struct { model: models.Model, system: []const u8 },
+    options: struct { model: models.Model, system: []const u8, retry: net.Retry },
 ) Agent {
     return .{
         .gpa = gpa,
@@ -55,6 +57,7 @@ pub fn init(
         .client = client,
         .model = options.model,
         .system = options.system,
+        .retry = options.retry,
         .arena = .init(gpa),
         .messages = .empty,
         .stats = .{},
@@ -79,24 +82,92 @@ pub fn run(self: *Agent, user_text: []const u8, handler: anytype) !void {
     try self.appendUser(user_text);
     var round: usize = 0;
     while (round < rounds_max) : (round += 1) {
-        var stream: provider.Stream = undefined;
-        try self.client.send(&stream, .{
-            .model = self.model.name,
-            .tokens_max = self.model.tokens_max,
-            .system = self.system,
-            .messages = self.messages.items,
-            .tools = &tool.specs,
-        });
-        defer stream.deinit();
-
-        if (!stream.ok()) return self.reportAndReset(handler, stream.errorText(), base);
-        const more = self.consume(&stream, handler) catch |err| switch (err) {
-            error.ApiError => return self.reportAndReset(handler, stream.errorText(), base),
-            else => return err,
-        };
-        if (!more) return;
+        const reply = (try self.fetchReply(handler, base)) orelse return;
+        if (!try self.runTools(reply, handler)) return;
     }
     return error.TooManyToolRounds;
+}
+
+/// Stream one assistant reply, retrying the whole request on a transient failure
+/// (timeout, network fault, or a retryable status). Only whole requests are safe
+/// to retry, so a failed attempt's partial reply is discarded here (history is
+/// left untouched) and `handler.onStreamReset` clears any partial output before
+/// the next attempt. Returns the reply's blocks (already appended to history), or
+/// null when a non-retryable error was reported and the turn ends.
+fn fetchReply(self: *Agent, handler: anytype, base: usize) !?[]const llm.Block {
+    const request: llm.Request = .{
+        .model = self.model.name,
+        .tokens_max = self.model.tokens_max,
+        .system = self.system,
+        .messages = self.messages.items,
+        .tools = &tool.specs,
+    };
+    var attempt: u32 = 1;
+    while (true) : (attempt += 1) {
+        if (attempt > 1) try handler.onStreamReset();
+        var stream: provider.Stream = undefined;
+        self.client.send(&stream, request) catch |err| {
+            if (retryableError(err) and attempt < self.retry.attempts_max) {
+                try self.backoff(attempt, 0);
+                continue;
+            }
+            return err;
+        };
+        defer stream.deinit();
+
+        if (!stream.ok()) {
+            if (stream.retryable() and attempt < self.retry.attempts_max) {
+                try self.backoff(attempt, stream.retryAfterMs() orelse 0);
+                continue;
+            }
+            try self.reportAndReset(handler, stream.errorText(), base);
+            return null;
+        }
+        const reply = self.readReply(&stream, handler) catch |err| switch (err) {
+            error.ApiError => {
+                try self.reportAndReset(handler, stream.errorText(), base);
+                return null;
+            },
+            error.Canceled, error.Closed => return err,
+            else => {
+                if (retryableError(err) and attempt < self.retry.attempts_max) {
+                    try self.backoff(attempt, 0);
+                    continue;
+                }
+                return err;
+            },
+        };
+        return reply;
+    }
+}
+
+/// Wait before the retry following a failed `attempt`: the server's `retry-after`
+/// when it gave one, else an exponential backoff. A cancel during the wait aborts
+/// the turn.
+fn backoff(self: *Agent, attempt: u32, suggested_ms: u64) !void {
+    const delay_ms = if (suggested_ms > 0) suggested_ms else self.retry.delayMs(attempt);
+    const bounded: u64 = @min(delay_ms, std.math.maxInt(i64));
+    try self.io.sleep(.fromMilliseconds(@intCast(bounded)), .awake);
+}
+
+/// Whether a transport error is worth retrying: a timeout or a transient network
+/// fault. A user cancel or a channel close is never retried.
+fn retryableError(err: anyerror) bool {
+    return switch (err) {
+        error.Timeout,
+        error.ReadFailed,
+        error.WriteFailed,
+        error.EndOfStream,
+        error.ConnectionResetByPeer,
+        error.ConnectionRefused,
+        error.ConnectionTimedOut,
+        error.NetworkUnreachable,
+        error.TemporaryNameServerFailure,
+        error.NameServerFailure,
+        error.TlsConnectionTruncated,
+        => true,
+        else => false,
+    };
 }
 
 /// Surface a failed turn to the handler and drop its messages so the history
@@ -120,9 +191,11 @@ fn recordUsage(self: *Agent, usage: llm.Usage) void {
     self.stats.last = usage;
 }
 
-/// Consume one streamed assistant message: record it, run its tools, and queue
-/// the results. Returns true when tools ran and another round is needed.
-fn consume(self: *Agent, stream: *provider.Stream, handler: anytype) !bool {
+/// Read one streamed assistant message to completion, recording usage and
+/// appending it to history; returns its blocks. A stream or API error returns
+/// before the append, so history stays untouched and the whole request can be
+/// retried without a duplicated or partial message.
+fn readReply(self: *Agent, stream: *provider.Stream, handler: anytype) ![]const llm.Block {
     const arena = self.arena.allocator();
     var blocks: std.ArrayList(llm.Block) = .empty;
     var text: std.ArrayList(u8) = .empty;
@@ -157,8 +230,7 @@ fn consume(self: *Agent, stream: *provider.Stream, handler: anytype) !bool {
 
     const reply = try blocks.toOwnedSlice(arena);
     try self.messages.append(self.gpa, .{ .role = .assistant, .blocks = reply });
-
-    return self.runTools(reply, handler);
+    return reply;
 }
 
 /// Run one call to completion into its slot. Spawned per call, so it touches only
@@ -257,4 +329,12 @@ fn flushTool(
         .name = use.name,
         .input_json = try arena.dupe(u8, input.items),
     } });
+}
+
+test retryableError {
+    try std.testing.expect(retryableError(error.Timeout));
+    try std.testing.expect(retryableError(error.ConnectionResetByPeer));
+    try std.testing.expect(!retryableError(error.Canceled));
+    try std.testing.expect(!retryableError(error.Closed));
+    try std.testing.expect(!retryableError(error.OutOfMemory));
 }
