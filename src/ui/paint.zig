@@ -160,6 +160,10 @@ pub const Framing = struct {
     shown: ?usize = null,
     /// Body rows dropped below the window; also the bottom rule's "N more" count.
     hidden_below: usize = 0,
+    /// An extra empty body row after the wrapped body — the row a caret sitting at
+    /// a full-width final line wraps onto, which the wrap itself never yields. It
+    /// is the last body row, so it shows only when the window reaches it.
+    trailing_row: bool = false,
 };
 
 /// Stream the framed area described by `framing`: the top rule (labelled with the
@@ -175,14 +179,25 @@ pub fn framed(placement: *const Placement, framing: *const Framing) !void {
     while (iterator.next()) |content| : (index += 1) {
         if (index < framing.hidden_above) continue;
         if (index >= window_end) break;
-        defer line += 1;
-        if (line < placement.skip) continue;
-        const writer = placement.sink.begin();
-        try writer.writeAll(content);
-        if (framing.caret) |caret| if (placement.base + caret.row == line) placement.sink.setCaret(caret.column);
-        placement.sink.end(.{ .id = placement.id, .line = line });
+        try framedRow(placement, framing, &line, content);
+    }
+    // The wrapper exhausts at `index == wrapped rows`, the trailing row's index;
+    // emit it when the window reaches it (a `break` above leaves it out of view).
+    if (framing.trailing_row and index >= framing.hidden_above and index < window_end) {
+        try framedRow(placement, framing, &line, "");
     }
     try ruleRow(placement, &line, "↓", framing.hidden_below);
+}
+
+/// One windowed body row of a framed area: the row's `content`, then the caret
+/// when it names this row. Advances `line` and drops the row in the clipped top.
+fn framedRow(placement: *const Placement, framing: *const Framing, line: *usize, content: []const u8) !void {
+    defer line.* += 1;
+    if (line.* < placement.skip) return;
+    const writer = placement.sink.begin();
+    try writer.writeAll(content);
+    if (framing.caret) |caret| if (placement.base + caret.row == line.*) placement.sink.setCaret(caret.column);
+    placement.sink.end(.{ .id = placement.id, .line = line.* });
 }
 
 /// One rule row of a framed area: a full-width purple rule, or — when `more` rows

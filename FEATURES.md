@@ -261,6 +261,8 @@ and the app (`src/`).
 - Vertical movement (up/down) by wrapped row with a sticky goal column preserved across shorter rows
   and reset on any horizontal move or edit.
 - Up on the first row jumps to start, down on the last row jumps to end.
+- A caret at the end of a full-width line wraps onto an empty trailing row rather than clamping onto
+  the last cell.
 - Internally scrolled and windowed to keep the caret in view, with "↑ N more" / "↓ N more"
   hidden-row labels.
 

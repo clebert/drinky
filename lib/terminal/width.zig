@@ -125,9 +125,11 @@ pub const Caret = struct { rows_before: usize, column: usize };
 /// `text` is the content up to the caret, so pass the prefix before it — a
 /// greedy width wrap never lets later content move an earlier break, so the
 /// suffix cannot change the answer. A wide cluster near the margin pushes the
-/// caret to the next row, and a trailing `\n` (or an empty line between newlines)
-/// lands it at column 0 of a fresh row. `text` must end on a grapheme cluster
-/// boundary.
+/// caret to the next row; a prefix that fills a row exactly wraps the caret onto
+/// the next row's first column, the cell the following glyph would take, since no
+/// cell exists at the margin; and a trailing `\n` (or an empty line between
+/// newlines) lands it at column 0 of a fresh row. `text` must end on a grapheme
+/// cluster boundary.
 pub fn caret(text: []const u8, columns_max: usize) Caret {
     var iterator = wrapper(text, columns_max);
     var result: Caret = .{ .rows_before = 0, .column = 0 };
@@ -136,6 +138,10 @@ pub fn caret(text: []const u8, columns_max: usize) Caret {
         if (!first) result.rows_before += 1;
         first = false;
         result.column = ofText(line);
+    }
+    if (columns_max != 0 and result.column == columns_max) {
+        result.rows_before += 1;
+        result.column = 0;
     }
     return result;
 }
@@ -341,6 +347,9 @@ test offsetAt {
     try std.testing.expectEqual(@as(usize, 11), offsetAt("hello\nworld", 10, .{ .rows_before = 5, .column = 0 }));
     // A column inside a two-cell cluster lands on the boundary before it.
     try std.testing.expectEqual(@as(usize, 3), offsetAt("你好世", 10, .{ .rows_before = 0, .column = 3 }));
+    // The inverse of the full-width-margin caret: the next row's first column
+    // maps back to the end of the filled row.
+    try std.testing.expectEqual(@as(usize, 3), offsetAt("hel", 3, .{ .rows_before = 1, .column = 0 }));
     // Column 0 of a blank row between two newlines.
     try std.testing.expectEqual(@as(usize, 2), offsetAt("a\n\nb", 10, .{ .rows_before = 1, .column = 0 }));
 }
@@ -349,8 +358,11 @@ test caret {
     // Within the first row, the caret column equals the prefix's display width.
     try std.testing.expectEqual(Caret{ .rows_before = 0, .column = 0 }, caret("", 3));
     try std.testing.expectEqual(Caret{ .rows_before = 0, .column = 2 }, caret("he", 3));
-    // A prefix that exactly fills the budget sits pending at the margin.
-    try std.testing.expectEqual(Caret{ .rows_before = 0, .column = 3 }, caret("hel", 3));
+    // A prefix that fills the row exactly leaves no cell at the margin, so the
+    // caret wraps onto the next row's first column.
+    try std.testing.expectEqual(Caret{ .rows_before = 1, .column = 0 }, caret("hel", 3));
+    // A wide cluster that fills the row exactly wraps the same way.
+    try std.testing.expectEqual(Caret{ .rows_before = 1, .column = 0 }, caret("你你", 4));
     // One glyph past the margin wraps: the second row, first column.
     try std.testing.expectEqual(Caret{ .rows_before = 1, .column = 1 }, caret("hell", 3));
     // Wide glyphs push the wrap early: after two two-column glyphs the caret is
