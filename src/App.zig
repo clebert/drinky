@@ -135,6 +135,12 @@ const TurnHandler = struct {
         try self.app.queue.putOne(self.app.io, .stream_reset);
     }
 
+    pub fn onSteering(self: *TurnHandler, text: []const u8, count: usize) !void {
+        const copy = try self.app.gpa.dupe(u8, text);
+        errdefer self.app.gpa.free(copy);
+        try self.app.queue.putOne(self.app.io, .{ .steering_consumed = .{ .text = copy, .count = count } });
+    }
+
     pub fn onError(self: *TurnHandler, text: []const u8) !void {
         const copy = try self.app.gpa.dupe(u8, text);
         if (self.error_text) |old| self.app.gpa.free(old);
@@ -249,6 +255,12 @@ fn runLoop(self: *App) !void {
                 future.await(self.io);
                 self.turn_future = null;
             }
+            // A steering message that landed too late to fold into the turn just
+            // ended opens the next turn on its own. Gating on the display mirror is
+            // safe: `.steering_consumed` precedes `.turn_ended` in the channel, so
+            // the mirror and the queue are in sync once the mode flips to prompt.
+            if (self.session.mode == .prompt and !self.session.steeringEmpty())
+                try self.startSteeringTurn();
         }
         if (ticked) {
             self.tick_pending = false;
@@ -365,6 +377,27 @@ fn handleKey(self: *App, event: terminal.Input.Key) !void {
         .turn => return self.handleTurnKey(event),
         .prompt => {},
     }
+    if (try self.editKey(event)) return;
+    switch (event) {
+        .enter => try self.submit(),
+        .ctrl => |letter| switch (letter) {
+            'c' => {
+                self.clearOrQuit();
+                if (self.running) self.session.markDirty();
+            },
+            'd' => if (self.session.editor.content().len == 0) {
+                self.running = false;
+            },
+            else => {},
+        },
+        else => {},
+    }
+}
+
+/// Apply an editing key to the live editor, marking the session dirty; returns
+/// whether `event` was an editing key. Shared by the prompt and by a running
+/// turn, where the editor stays live so the user can steer.
+fn editKey(self: *App, event: terminal.Input.Key) !bool {
     const editor = &self.session.editor;
     switch (event) {
         .char => |codepoint| try editor.insertCodepoint(codepoint),
@@ -376,31 +409,25 @@ fn handleKey(self: *App, event: terminal.Input.Key) !void {
         .down => editor.moveDown(self.session.columns),
         .home => editor.moveHome(),
         .end => editor.moveEnd(),
-        .enter => return self.submit(),
         .newline => try editor.insert("\n"),
         .ctrl => |letter| switch (letter) {
-            'c' => {
-                self.clearOrQuit();
-                if (!self.running) return;
-            },
-            'd' => {
-                if (editor.content().len == 0) {
-                    self.running = false;
-                    return;
-                }
-            },
             'j' => try editor.insert("\n"),
-            else => return,
+            else => return false,
         },
-        .escape, .unknown => return,
+        else => return false,
     }
     self.session.markDirty();
+    return true;
 }
 
-/// Keys during a streaming turn: ctrl-c or esc cancels it; everything else is
-/// ignored (steering — typing while a turn runs — is a separate backlog item).
+/// Keys during a streaming turn: the editor stays live for steering — typing and
+/// editing work, Enter queues a steering message, Alt+Up recalls the queue into
+/// the editor — while Esc or Ctrl+C cancels the turn.
 fn handleTurnKey(self: *App, event: terminal.Input.Key) !void {
+    if (try self.editKey(event)) return;
     switch (event) {
+        .enter => try self.submitSteering(),
+        .alt_up => try self.pullSteering(),
         .escape => try self.cancelTurn(),
         .ctrl => |letter| switch (letter) {
             'c' => try self.cancelTurn(),
@@ -410,13 +437,80 @@ fn handleTurnKey(self: *App, event: terminal.Input.Key) !void {
     }
 }
 
+/// Enter during a turn: queue the line as a steering message, shown at once and
+/// carried to the worker to fold into the turn. A slash command can't run
+/// mid-turn (it may open a picker, which a turn can't host), so it stays in the
+/// editor to send once the turn ends.
+fn submitSteering(self: *App) !void {
+    const trimmed = std.mem.trim(u8, self.session.editor.content(), " \t\r\n");
+    if (trimmed.len == 0 or std.mem.startsWith(u8, trimmed, "/")) return;
+    const text = try self.gpa.dupe(u8, trimmed);
+    defer self.gpa.free(text);
+    // Channel first (the worker's source of truth), then the display mirror.
+    try self.agent.steering.push(text);
+    try self.session.queueSteering(text);
+    self.session.editor.clear();
+    self.session.markDirty();
+}
+
+/// Alt+Up during a turn: pull the whole steering queue back into the editor to
+/// edit, appended after any in-progress line.
+fn pullSteering(self: *App) !void {
+    const joined = (try self.takeSteering()) orelse return;
+    defer self.gpa.free(joined);
+    try self.appendToEditor(joined);
+    self.session.markDirty();
+}
+
+/// Take every not-yet-delivered steering message as one blank-line-joined
+/// string, clearing the display mirror and the channel. Sourced from the channel
+/// so a message the worker already folded into the running turn is not handed
+/// back to the editor too (it will appear as a sent message instead). Null when
+/// nothing is queued.
+fn takeSteering(self: *App) !?[]u8 {
+    self.session.clearSteering();
+    const taken = try self.agent.steering.take();
+    defer {
+        for (taken) |message| self.gpa.free(message);
+        self.gpa.free(taken);
+    }
+    if (taken.len == 0) return null;
+    return try ai.Steering.join(self.gpa, taken);
+}
+
+/// Append `text` to the editor, after a blank-line separator when it already
+/// holds an in-progress line.
+fn appendToEditor(self: *App, text: []const u8) !void {
+    const editor = &self.session.editor;
+    editor.moveEnd();
+    if (editor.content().len > 0) try editor.insert("\n\n");
+    try editor.insert(text);
+}
+
+/// Start a turn from steering the worker never took because the previous turn
+/// ended first: show it as a user message and run it.
+fn startSteeringTurn(self: *App) !void {
+    const joined = (try self.takeSteering()) orelse return;
+    defer self.gpa.free(joined);
+    try self.session.transcript.append(.user, false, joined);
+    self.session.markDirty();
+    try self.runTurn(joined);
+}
+
 /// Abort the running turn: cancel and reap the worker (interrupting its blocked
 /// network read), then drop the turn's model state. Any events the worker already
 /// queued are dropped when applied, since the mode is no longer a turn.
 fn cancelTurn(self: *App) !void {
+    // Cancel first (which joins the worker), so taking the queue can't race an
+    // in-flight drain; nothing queued is lost — pending steering returns to the
+    // editor.
     if (self.turn_future) |*future| {
         future.cancel(self.io);
         self.turn_future = null;
+    }
+    if (try self.takeSteering()) |joined| {
+        defer self.gpa.free(joined);
+        try self.appendToEditor(joined);
     }
     try self.session.abortTurn();
 }

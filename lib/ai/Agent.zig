@@ -12,6 +12,7 @@ const llm = @import("llm.zig");
 const models = @import("models.zig");
 const net = @import("net.zig");
 const provider = @import("provider.zig");
+const Steering = @import("Steering.zig");
 const tool = @import("tool/root.zig");
 
 const Agent = @This();
@@ -37,6 +38,9 @@ retry: net.Retry,
 arena: std.heap.ArenaAllocator,
 messages: std.ArrayList(llm.Message),
 stats: Stats,
+/// Steering messages the user submitted mid-turn, drained into the running turn
+/// at each round boundary. Thread-safe: the UI thread pushes, the worker takes.
+steering: Steering,
 
 /// Cumulative dollar cost and cache savings over the session, plus the most
 /// recent message's usage for the cache-hit and context-window gauges. Each
@@ -109,11 +113,13 @@ pub fn init(
         .arena = .init(gpa),
         .messages = .empty,
         .stats = .{},
+        .steering = Steering.init(gpa, io),
     };
 }
 
 pub fn deinit(self: *Agent) void {
     self.messages.deinit(self.gpa);
+    self.steering.deinit();
     self.arena.deinit();
 }
 
@@ -136,9 +142,49 @@ pub fn run(self: *Agent, user_text: []const u8, handler: anytype) !void {
     var round: usize = 0;
     while (round < rounds_max) : (round += 1) {
         const reply = (try self.fetchReply(handler, base)) orelse return;
-        if (!try self.runTools(reply, handler)) return;
+        const ran_tools = try self.runTools(reply, handler);
+        // Fold any mid-turn steering into this turn before the next round; when
+        // the model asked for no tools, a steering message keeps the turn going
+        // rather than ending it, so the message still lands mid-turn.
+        const steered = try self.drainSteering(handler);
+        if (!ran_tools and !steered) return;
     }
     return error.TooManyToolRounds;
+}
+
+/// Deliver every queued steering message into the running turn: combine them
+/// into one user message (blank-line separated), append it to history, and
+/// report it. Returns whether anything was delivered.
+fn drainSteering(self: *Agent, handler: anytype) !bool {
+    const pending = try self.steering.take();
+    defer {
+        for (pending) |message| self.gpa.free(message);
+        self.gpa.free(pending);
+    }
+    if (pending.len == 0) return false;
+    const combined = try Steering.join(self.gpa, pending);
+    defer self.gpa.free(combined);
+    try self.appendSteering(combined);
+    try handler.onSteering(combined, pending.len);
+    return true;
+}
+
+/// Append steering text as user input, folding it into a trailing user message
+/// (the tool results of the round just run) when there is one so history stays a
+/// valid user/assistant alternation.
+fn appendSteering(self: *Agent, text: []const u8) !void {
+    if (self.messages.items.len > 0) {
+        const last = &self.messages.items[self.messages.items.len - 1];
+        if (last.role == .user) {
+            const arena = self.arena.allocator();
+            const blocks = try arena.alloc(llm.Block, last.blocks.len + 1);
+            @memcpy(blocks[0..last.blocks.len], last.blocks);
+            blocks[last.blocks.len] = .{ .text = try arena.dupe(u8, text) };
+            last.blocks = blocks;
+            return;
+        }
+    }
+    try self.appendUser(text);
 }
 
 /// Stream one assistant reply, retrying the whole request on a transient failure
@@ -506,6 +552,62 @@ const ScriptedStream = struct {
         return self.events[self.index];
     }
 };
+
+const SteerHandler = struct {
+    gpa: std.mem.Allocator,
+    text: std.ArrayList(u8) = .empty,
+    count: usize = 0,
+
+    fn deinit(self: *SteerHandler) void {
+        self.text.deinit(self.gpa);
+    }
+
+    fn onSteering(self: *SteerHandler, text: []const u8, count: usize) !void {
+        try self.text.appendSlice(self.gpa, text);
+        self.count = count;
+    }
+};
+
+test "steering is delivered as one combined user message" {
+    const gpa = std.testing.allocator;
+    var agent = scriptedAgent(gpa);
+    defer agent.deinit();
+    var handler: SteerHandler = .{ .gpa = gpa };
+    defer handler.deinit();
+
+    try agent.steering.push("a");
+    try agent.steering.push("b");
+    try std.testing.expect(try agent.drainSteering(&handler));
+
+    try std.testing.expectEqual(@as(usize, 1), agent.messages.items.len);
+    try std.testing.expectEqual(llm.Role.user, agent.messages.items[0].role);
+    try std.testing.expectEqualStrings("a\n\nb", agent.messages.items[0].blocks[0].text);
+    try std.testing.expectEqualStrings("a\n\nb", handler.text.items);
+    try std.testing.expectEqual(@as(usize, 2), handler.count);
+
+    // An empty queue delivers nothing.
+    try std.testing.expect(!try agent.drainSteering(&handler));
+}
+
+test "steering folds into a trailing user message" {
+    const gpa = std.testing.allocator;
+    var agent = scriptedAgent(gpa);
+    defer agent.deinit();
+    var handler: SteerHandler = .{ .gpa = gpa };
+    defer handler.deinit();
+
+    // A trailing user message, as a round's tool results would leave it.
+    try agent.appendUser("tool results");
+    try agent.steering.push("steer");
+    try std.testing.expect(try agent.drainSteering(&handler));
+
+    // No new message; the steering text joins the existing user turn.
+    try std.testing.expectEqual(@as(usize, 1), agent.messages.items.len);
+    const blocks = agent.messages.items[0].blocks;
+    try std.testing.expectEqual(@as(usize, 2), blocks.len);
+    try std.testing.expectEqualStrings("tool results", blocks[0].text);
+    try std.testing.expectEqualStrings("steer", blocks[1].text);
+}
 
 const CaptureHandler = struct {
     gpa: std.mem.Allocator,

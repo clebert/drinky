@@ -242,6 +242,43 @@ pub fn spinner(placement: *const Placement, frame: usize) !void {
     placement.sink.end(.{ .id = placement.id, .line = placement.base });
 }
 
+/// Physical rows the steering queue occupies: one row per queued message plus a
+/// hint row. Zero when the queue is empty, so it contributes no component.
+pub fn steeringRows(messages: []const []const u8) usize {
+    if (messages.len == 0) return 0;
+    return messages.len + 1;
+}
+
+/// The steering queue: a `Steering: <message>` row per queued message (each cut
+/// to its first line and the window width), then a dim hint row.
+pub fn steering(placement: *const Placement, messages: []const []const u8) !void {
+    var line = placement.base;
+    for (messages) |message| {
+        defer line += 1;
+        if (line < placement.skip) continue;
+        // Truncate the label first, then give the message whatever width is left,
+        // so a window narrower than the label can never overflow the row.
+        const label = terminal.width.truncate("Steering: ", placement.columns);
+        const first = message[0 .. std.mem.indexOfScalar(u8, message, '\n') orelse message.len];
+        const shown = terminal.width.truncate(first, placement.columns -| terminal.width.ofText(label));
+        const writer = placement.sink.begin();
+        try writer.writeAll(color.accent_fg);
+        try writer.writeAll(label);
+        try writer.writeAll(color.reset);
+        try writer.writeAll(color.muted_fg);
+        try writer.writeAll(shown);
+        try writer.writeAll(color.reset);
+        placement.sink.end(.{ .id = placement.id, .line = line });
+    }
+    if (line < placement.skip) return;
+    const hint = terminal.width.truncate("\u{21B3} Alt+Up to edit all queued messages", placement.columns);
+    const writer = placement.sink.begin();
+    try writer.writeAll(color.dim);
+    try writer.writeAll(hint);
+    try writer.writeAll(color.reset);
+    placement.sink.end(.{ .id = placement.id, .line = line });
+}
+
 test "the body limit tracks a quarter of the viewport, clamped to five and fifteen" {
     try std.testing.expectEqual(@as(usize, 5), bodyLimit(0));
     try std.testing.expectEqual(@as(usize, 5), bodyLimit(19));

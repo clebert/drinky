@@ -69,6 +69,8 @@ and the app (`src/`).
   arrows, Home, End, and bracketed-paste payloads.
 - Legacy control-byte mapping (CR→enter, DEL/BS→backspace, 0x01–0x1a→ctrl, LF→ctrl-j).
 - Kitty `CSI u` decoding with modifiers, SS3 arrows, and `CSI ~` tilde keys.
+- Plain Alt+Up (legacy modified arrow) decoded as a distinct key for steering recall; other
+  modifier combinations fall back to the bare arrow.
 - Malformed/truncated UTF-8 decodes as `unknown` while always making forward progress.
 
 ### Grapheme segmentation (`grapheme`)
@@ -120,6 +122,10 @@ and the app (`src/`).
   provider accepts the tool calls that followed it.
 - `setModel`/`setEffort` switch the active model and reasoning-effort level mid-session, taking
   effect next turn with history untouched.
+- Steering: a thread-safe queue (`Steering`, `std.Io.Mutex`) the UI thread pushes onto and the turn
+  worker drains at each round boundary (and when the model would end the turn), combining the pending
+  messages into one blank-line-joined user message folded into the trailing user turn so alternation
+  stays valid, reported via `handler.onSteering`.
 - Retries a whole request on a timeout, transient network fault, or retryable status
   (408/429/5xx incl. Anthropic 529), honoring `retry-after`, with bounded attempts and exponential
   backoff; the partial reply of a failed attempt is discarded (never appended to history) and
@@ -222,7 +228,11 @@ and the app (`src/`).
   forward-compatible — threading request timeouts and retry policy into the client and agent.
 - Authenticates (logging in if needed) before wiring the loop.
 - Ctrl+C clears the editor or quits on a double-press; Ctrl+D quits when the editor is empty.
-- Mid-turn Esc/Ctrl+C cancels the turn worker and drops the partial turn.
+- Mid-turn Esc/Ctrl+C cancels the turn worker and drops the partial turn, returning any pending
+  steering to the editor.
+- Steering: the editor stays live during a turn — Enter queues a steering message, Alt+Up recalls the
+  whole queue into the editor (blank-line-joined, appended after any in-progress line), and steering
+  left unqueued when a turn ends opens the next turn; slash commands are disabled mid-turn.
 - Graceful shutdown cancels and reaps all tasks and drains buffered events before restoring the
   terminal.
 
@@ -238,6 +248,8 @@ and the app (`src/`).
   the answer run never extends it.
 - Multiple concurrent tool boxes can render during a turn, colored by status: blue while the call
   runs, then replaced by a green (ok) or red (error) transcript line on completion.
+- Steering queue shown as `Steering:` tail rows with an Alt+Up recall hint while a turn runs; a
+  consumed batch becomes one normal user block and its rows drop.
 - Layout projects transcript + tail onto a bounded window (8 pages), measuring newest-to-oldest and
   clipping the top, recomputed each frame.
 
@@ -274,3 +286,5 @@ and the app (`src/`).
   never materializes its hidden top.
 - Framed input area (purple rules + windowed body + optional caret) shared by the editor and picker.
 - A ten-frame Braille "Working…" spinner that advances per frame tick, independent of stream events.
+- Steering-queue row painter: a `Steering: <message>` row per queued message (first line, truncated)
+  plus a dim recall hint.

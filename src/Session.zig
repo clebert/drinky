@@ -22,7 +22,8 @@ transcript: Transcript,
 editor: ui.Editor,
 view: terminal.View,
 /// The current interaction. Exactly one input is live: the editor while waiting
-/// (`prompt`) or streaming a turn (`turn`, where it is inert), or a `picker`.
+/// (`prompt`) or streaming a turn (`turn`, where it stays live for steering), or
+/// a `picker`.
 mode: Mode,
 columns: usize,
 rows: usize,
@@ -37,6 +38,11 @@ model_shown: ai.models.Model,
 /// Consumer-owned copy of the reasoning-effort level, updated after a command
 /// runs, for the status-line indicator.
 effort_shown: ai.llm.Effort,
+/// Steering messages queued while a turn runs, shown as the `Steering:` tail
+/// rows. The display mirror of the agent's channel: `App` adds here and to the
+/// channel together, and a `.steering_consumed` event drops the front as the
+/// worker takes them. Each string owned.
+steering: std.ArrayList([]u8),
 
 const Mode = union(enum) {
     prompt,
@@ -85,12 +91,16 @@ pub const UiEvent = union(enum) {
     /// A retry is about to re-stream the reply: drop the partial text shown so
     /// far so the retried attempt starts clean.
     stream_reset,
+    /// The worker folded `count` queued steering messages into the running turn
+    /// as one combined message: show it and drop those rows from the queue.
+    steering_consumed: SteeringConsumed,
     turn_ended: ?[]u8,
     tick,
     resize,
 
     const Tool = struct { name: []u8, input_json: []u8 };
     const ToolResult = struct { name: []u8, content: []u8, is_error: bool };
+    const SteeringConsumed = struct { text: []u8, count: usize };
 
     pub fn deinit(self: UiEvent, gpa: std.mem.Allocator) void {
         switch (self) {
@@ -103,6 +113,7 @@ pub const UiEvent = union(enum) {
                 gpa.free(result.name);
                 gpa.free(result.content);
             },
+            .steering_consumed => |consumed| gpa.free(consumed.text),
             .turn_ended => |maybe_text| if (maybe_text) |text| gpa.free(text),
             .usage, .stream_reset, .tick, .resize => {},
         }
@@ -125,11 +136,14 @@ pub fn init(gpa: std.mem.Allocator, writer: *std.Io.Writer, model: ai.models.Mod
         .stats_shown = .{},
         .model_shown = model,
         .effort_shown = effort,
+        .steering = .empty,
     };
 }
 
 pub fn deinit(self: *Session) void {
     self.deinitMode();
+    self.clearSteering();
+    self.steering.deinit(self.gpa);
     self.transcript.deinit();
     self.view.deinit();
     self.editor.deinit();
@@ -161,6 +175,13 @@ pub fn applyStreamEvent(self: *Session, event: UiEvent) !void {
         .tool_result => |result| try self.applyToolResult(result),
         .usage => |stats| self.stats_shown = stats,
         .stream_reset => self.transcript.discardMessage(),
+        .steering_consumed => |consumed| {
+            try self.transcript.append(.user, false, consumed.text);
+            var removed: usize = 0;
+            while (removed < consumed.count and self.steering.items.len > 0) : (removed += 1) {
+                self.gpa.free(self.steering.orderedRemove(0));
+            }
+        },
         .turn_ended => |maybe_text| {
             if (maybe_text) |text| try self.transcript.append(.feedback, true, text);
             self.transcript.endMessage();
@@ -231,6 +252,27 @@ pub fn markDirty(self: *Session) void {
     self.dirty = true;
 }
 
+/// Queue a steering message for display while a turn runs. `App` pushes the same
+/// text onto the agent's channel so the worker can take it.
+pub fn queueSteering(self: *Session, text: []const u8) !void {
+    const copy = try self.gpa.dupe(u8, text);
+    errdefer self.gpa.free(copy);
+    try self.steering.append(self.gpa, copy);
+    self.dirty = true;
+}
+
+/// Whether the steering queue is empty.
+pub fn steeringEmpty(self: *const Session) bool {
+    return self.steering.items.len == 0;
+}
+
+/// Drop every queued steering message.
+pub fn clearSteering(self: *Session) void {
+    for (self.steering.items) |message| self.gpa.free(message);
+    self.steering.clearRetainingCapacity();
+    self.dirty = true;
+}
+
 /// Close any open model run, then enter turn mode with a fresh spinner and no
 /// active tools.
 pub fn beginTurn(self: *Session) void {
@@ -280,6 +322,7 @@ pub fn paint(self: *Session, size: terminal.View.Size) !void {
             break :turn .{ .turn = .{
                 .tools = try turn.boxes(self.gpa),
                 .spinner = turn.spinner_frame,
+                .steering = self.steering.items,
                 .editor = &self.editor,
             } };
         },
@@ -453,6 +496,31 @@ test "stream events are dropped once the turn is over" {
     try session.applyStreamEvent(.{ .text = try gpa.dupe(u8, "straggler") });
     try std.testing.expectEqual(@as(usize, 0), session.transcript.blocks().len);
     try std.testing.expect(!session.dirty);
+}
+
+// Queued steering shows in the tail; a consumed event moves the combined text
+// into the transcript as one user block and drops the queued rows.
+test "steering queues, then a consumed event shows it and clears the queue" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var session: Session = Session.init(gpa, &out.writer, test_model, .off);
+    defer session.deinit();
+    session.mode = .{ .turn = .{ .spinner_frame = 0, .tools = .empty, .box_view = .empty } };
+
+    try session.queueSteering("fix it");
+    try session.queueSteering("and test");
+    try std.testing.expect(!session.steeringEmpty());
+    try std.testing.expectEqual(@as(usize, 2), session.steering.items.len);
+    try std.testing.expectEqualStrings("fix it", session.steering.items[0]);
+
+    try session.applyStreamEvent(.{ .steering_consumed = .{
+        .text = try gpa.dupe(u8, "fix it\n\nand test"),
+        .count = 2,
+    } });
+    try std.testing.expect(session.steeringEmpty());
+    try std.testing.expectEqual(@as(usize, 1), session.transcript.blocks().len);
+    try std.testing.expectEqualStrings("fix it\n\nand test", session.transcript.blocks()[0].user.items);
 }
 
 // Regression: while a turn animates, a tick must repaint even when the model is

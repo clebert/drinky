@@ -34,6 +34,8 @@ pub const Key = union(enum) {
     down,
     home,
     end,
+    /// Alt+Up (Kitty legacy-modified arrow), decoded distinctly from a bare Up.
+    alt_up,
     /// A recognized-but-unhandled sequence; callers ignore it.
     unknown,
 };
@@ -44,6 +46,7 @@ const escape_start = 0x1b;
 const enter_key = 13;
 const escape_key = 27;
 const shift_bit = 0b001;
+const alt_bit = 0b010;
 const ctrl_bit = 0b100;
 
 pub fn init(gpa: std.mem.Allocator) Input {
@@ -138,7 +141,17 @@ fn mapControlSequence(parameters: []const u8, final: u8) Key {
         return .unknown;
     }
     if (final == 'u') return mapCsiU(parameters);
+    // A modified arrow arrives as `CSI 1 ; modifiers <final>` (Kitty leaves
+    // these in the legacy encoding). Only plain Alt+Up is distinguished; any
+    // other modifier combination decodes as the bare key.
+    if (final == 'A' and modifiersOf(parameters) == alt_bit) return .alt_up;
     return mapFinal(final);
+}
+
+/// The modifier bitmask of a `row;modifiers` legacy sequence, zero when absent.
+fn modifiersOf(parameters: []const u8) u21 {
+    const semicolon = std.mem.indexOfScalar(u8, parameters, ';') orelse return 0;
+    return (std.fmt.parseInt(u21, parameters[semicolon + 1 ..], 10) catch 1) -| 1;
 }
 
 /// Decode a Kitty-protocol `CSI codepoint;modifiers u` key. Only the events the
@@ -217,6 +230,14 @@ test "arrows and navigation" {
     try expectKeys("\x1b[A\x1b[D", &.{ .up, .left });
     try expectKeys("\x1bOC", &.{.right});
     try expectKeys("\x1b[H\x1b[4~", &.{ .home, .end });
+}
+
+test "alt+up decodes apart from a bare or otherwise-modified up" {
+    try expectKeys("\x1b[1;3A", &.{.alt_up});
+    // Other modifiers on Up (here Shift) fall back to the bare key.
+    try expectKeys("\x1b[1;2A", &.{.up});
+    // Alt on another arrow is not acted on.
+    try expectKeys("\x1b[1;3B", &.{.down});
 }
 
 test "bracketed paste" {

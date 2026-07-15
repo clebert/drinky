@@ -73,6 +73,14 @@ Extension seams referenced here:
       a prefix reused after the 5-minute window but within the hour; otherwise it is a 2x write tax.
 - [ ] **`/handoff`** — summarize/compact the current conversation and start fresh with the summary
       carried over, to reclaim context.
+- [ ] **`/stage`** — stage all changes in git (`git add -A` in the working directory), then let the
+      agent know the working tree was staged so its next diff shows only its own new edits. When a
+      turn is running this is a steering message (depends on **Steering** under UI); when the agent
+      is idle it prefills the input line with the notice instead of sending, leaving the user to
+      review and submit. Needs three seams: a way to run git — a subprocess helper shared with the
+      **Bash tool** above, none exists yet — the working directory from `tool/Context.zig`, and a
+      new `command.Outcome` arm for "prefill the editor" beside the current `feedback`/`pick`
+      (routed in `App.submit`). The active-turn path also needs the steering message queue.
 - [ ] **`/subagent`** (or `/agents`) — list, pick, and dispatch to a user-defined subagent. Depends
       on the subagent runtime below.
 
@@ -247,11 +255,22 @@ Extension seams referenced here:
       dimmed `thinking` block that the answer run does not extend, painted by `ui/block`. Adaptive
       thinking lets the model size its own budget, so no client-side budget is set; `/effort` steers
       its depth.
-- [ ] **Steering.** Let the user type and send while a turn is running, queuing messages the way pi
-      does. Today the read loop is frozen for the whole blocking `agent.run()`, so the input box is
-      visible but inert. Depends on the off-thread networking work ("Networking off the UI thread"):
-      once stream I/O runs on its own thread, the event loop can keep reading keys, append submitted
-      lines to a pending-message queue, and feed them into the current or next turn.
+- [x] **Steering.** The user types and submits while a turn runs, queuing messages the pi way. The
+      editor stays live during a turn (it was inert by policy, not by blocking — the off-thread
+      networking work had already unfrozen the read loop): `App.editKey` drives the editor in both
+      prompt and turn modes, Enter queues a steering message, and Alt+Up recalls the whole queue into
+      the editor. A queued message rides two representations — `Session.steering` (the UI-thread
+      `Steering:` display rows) and `ai.Steering`, a thread-safe (`std.Io.Mutex`) FIFO the turn
+      worker takes from — fed together on submit. `Agent.run` drains the channel at each round
+      boundary (and when the model would otherwise end the turn, so a message still lands mid-turn),
+      combines the pending messages into one blank-line-joined user message folded into the trailing
+      user turn (keeping the user/assistant alternation valid), and reports it via
+      `handler.onSteering`; the consumer shows it as one normal user block and drops those queue
+      rows. A message that lands after the final drain starts the next turn on its own. Alt+Up and
+      cancel recall pending steering from the channel (so a message already folded into the turn is
+      not also handed back — it shows as sent instead), blank-line-joined, into the editor. Slash
+      commands can't run mid-turn (a picker can't coexist with a turn), so a `/`-line stays in the
+      editor to send once the turn ends.
 - [x] **Smooth spinner animation.** The `⠋ Working…` spinner is driven by the frame timer: while a
       turn animates the consumer re-arms a tick each frame and `advanceFrame` steps the spinner even
       when the model is clean, so it animates independently of stream events and no longer freezes
