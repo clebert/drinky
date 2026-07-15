@@ -28,13 +28,12 @@ Extension seams referenced here:
 - [x] **Parallel tool calls.** Anthropic (and most providers) already emit multiple `tool_use`
       blocks in one assistant message when the calls are independent. `Agent.runTools` fans them out
       through an `std.Io.Group` — one concurrent task per call writing into its own slot — then
-      collects the results in call order, so each `tool_result` still maps back to its `tool_use`
-      id and the UI's name-FIFO box matching is unchanged. Mutating calls (write/edit, flagged in
-      the tool registry) instead run inline in call order, so two writes/edits to the same file
-      can't race or lose an update within a turn. A mid-turn cancel propagates through `group.await`
-      to the running tools, preserving the interrupt-in-flight semantics the old sequential loop
-      had. We never send `disable_parallel_tool_use`, so the provider is free to batch independent
-      calls.
+      collects the results in call order, so each `tool_result` still maps back to its `tool_use` id
+      and the UI's name-FIFO box matching is unchanged. Mutating calls (write/edit, flagged in the
+      tool registry) instead run inline in call order, so two writes/edits to the same file can't
+      race or lose an update within a turn. A mid-turn cancel propagates through `group.await` to
+      the running tools, preserving the interrupt-in-flight semantics the old sequential loop had.
+      We never send `disable_parallel_tool_use`, so the provider is free to batch independent calls.
 
 ## Command surface
 
@@ -72,7 +71,9 @@ Extension seams referenced here:
       breakpoints sidesteps the "1h-before-5min ordering" rule. Payoff is narrow: 1-hour only helps
       a prefix reused after the 5-minute window but within the hour; otherwise it is a 2x write tax.
 - [ ] **`/handoff`** — summarize/compact the current conversation and start fresh with the summary
-      carried over, to reclaim context.
+      carried over, to reclaim context. Once **Commit partial turns to history on cancel** lands,
+      compaction must also summarize cancelled turns and their synthesized "cancelled"
+      `tool_result`s, which carry no completed answer.
 - [ ] **`/stage`** — stage all changes in git (`git add -A` in the working directory), then let the
       agent know the working tree was staged so its next diff shows only its own new edits. When a
       turn is running this is a steering message (depends on **Steering** under UI); when the agent
@@ -108,8 +109,8 @@ Extension seams referenced here:
       each turn. Anthropic applies its own per-model minimum-prefix rules server side.
 - [x] **Usage & cost stats.** `Transport` folds `message_start` / `message_delta` usage into
       `llm.Usage`, carried on the `stop` event; `Agent.Stats` accumulates tokens and cost (priced by
-      `models.zig`), and the `ui.status` line shows context fill, the last request's cache hit
-      rate, session cost, and cumulative cache savings.
+      `models.zig`), and the `ui.status` line shows context fill, the last request's cache hit rate,
+      session cost, and cumulative cache savings.
 - [x] **Per-message cost attribution.** Each assistant message is priced against the model that
       produced it, not the session's live model: `fetchReply` captures the turn's model and threads
       it through `readReply` to `Agent.recordUsage`, so a mid-session `/model` switch can't reprice
@@ -123,15 +124,17 @@ Extension seams referenced here:
       Re-adds the cumulative token totals recently trimmed from `Agent.Stats`.
 - [ ] **Runtime model catalog.** `models.zig` is a compiled-in table namespaced by provider
       (`get(kind, name)`) carrying price, context window, max output tokens, and a reasoning-effort
-      map per model, with no fallback — an unknown model is unsupported. Load an optional `$HOME/.pith/models.json`,
-      structured by provider (`{ "anthropic": { "claude-opus-4-8": { … } } }`), to override or
-      extend the compiled defaults so users control pricing, context windows, output caps, and the
-      per-model reasoning-effort maps (today compiled `EffortMap`s) without a rebuild. Compiled defaults stay authoritative, so a
-      known model always has a known window; the file only patches or adds. Ties into `/cache-ttl`
+      map per model, with no fallback — an unknown model is unsupported. Load an optional
+      `$HOME/.pith/models.json`, structured by provider
+      (`{ "anthropic": { "claude-opus-4-8": { … } } }`), to override or extend the compiled defaults
+      so users control pricing, context windows, output caps, and the per-model reasoning-effort
+      maps (today compiled `EffortMap`s) without a rebuild. Compiled defaults stay authoritative, so
+      a known model always has a known window; the file only patches or adds. Ties into `/cache-ttl`
       (per-TTL write rates) and the `/model` / `/effort` commands.
 - [ ] **Other providers (OpenAI, …).** Add a `Provider` arm in `llm.zig` (and a matching
-      `provider.zig` union arm) and an `openai/` module (wire + transport) mirroring `anthropic/`. Everything above `provider.zig` is already
-      provider-agnostic. Reconciles with `/model`, `/effort`, caching, and stats.
+      `provider.zig` union arm) and an `openai/` module (wire + transport) mirroring `anthropic/`.
+      Everything above `provider.zig` is already provider-agnostic. Reconciles with `/model`,
+      `/effort`, caching, and stats.
 
 ## Networking & resilience
 
@@ -142,28 +145,28 @@ Extension seams referenced here:
       timer as two concurrent `std.Io.Select` tasks and cancels the loser — the operation wins with
       its result, or the timer wins and the stalled operation is cancelled and reaped, surfacing the
       typed `error.Timeout` the retry path acts on. A streamed read skips the race when a full line
-      is already buffered, so only a read that must wait on the socket spawns tasks. A user cancel of
-      the turn stays distinct (`error.Canceled`). Defaults 30s connect / 60s idle, set via
+      is already buffered, so only a read that must wait on the socket spawns tasks. A user cancel
+      of the turn stays distinct (`error.Canceled`). Defaults 30s connect / 60s idle, set via
       `config.json`.
 - [x] **SSE keep-alive / stall handling.** Anthropic streams periodic `ping` events; a hiccup can
       stall the byte stream without closing it, and a per-read idle timeout that any arriving byte
       resets can't tell a stalled-but-pinging stream from a live one. Ported the `pi` container
-      workaround's semantics: the idle window now counts only *real* frames. `net.Deadline` fixes one
-      instant and bounds each streamed read by the time left until it; `Transport.next` restarts the
-      window on every non-ping frame but lets a `ping` (now classified apart from other frames) draw
-      it down, so a stream that stalls or sends nothing but pings surfaces `error.Timeout` and the
-      retry path engages. The buffered fast-path is unchanged — a read only consults the deadline
-      when it must wait on the socket.
+      workaround's semantics: the idle window now counts only _real_ frames. `net.Deadline` fixes
+      one instant and bounds each streamed read by the time left until it; `Transport.next` restarts
+      the window on every non-ping frame but lets a `ping` (now classified apart from other frames)
+      draw it down, so a stream that stalls or sends nothing but pings surfaces `error.Timeout` and
+      the retry path engages. The buffered fast-path is unchanged — a read only consults the
+      deadline when it must wait on the socket.
 - [x] **Request retries.** `Agent.fetchReply` retries a whole request on a timeout, a transient
       network fault, or a retryable status (408 / 429 / 5xx, including Anthropic's 529 overloaded),
       honoring `retry-after` when present, with a bounded attempt count (default 3) and exponential
-      backoff. It sits above `Transport`, so it stays provider-neutral (the transport only classifies
-      its own status via `Stream.retryable`/`retryAfterMs`). Only whole requests are safe to retry:
-      the streamed read appends the assistant message to history only on success, so a failed
-      attempt's partial reply is discarded automatically, and `handler.onStreamReset` clears the
-      partial text already shown in the transcript before the next attempt re-streams. Tool execution
-      runs after the retried read and is never retried; a user cancel or channel close is never
-      retried.
+      backoff. It sits above `Transport`, so it stays provider-neutral (the transport only
+      classifies its own status via `Stream.retryable`/`retryAfterMs`). Only whole requests are safe
+      to retry: the streamed read appends the assistant message to history only on success, so a
+      failed attempt's partial reply is discarded automatically, and `handler.onStreamReset` clears
+      the partial text already shown in the transcript before the next attempt re-streams. Tool
+      execution runs after the retried read and is never retried; a user cancel or channel close is
+      never retried.
 - [x] **Networking off the UI thread.** The event loop is a single `std.Io.Queue(UiEvent)` consumer
       fed by `io.concurrent` producers — a long-lived stdin reader, the turn worker (`agent.run` off
       the UI thread), and a one-shot frame timer. The consumer solely owns the model and paints, so
@@ -176,20 +179,55 @@ Extension seams referenced here:
       turn's base — dropping the partial assistant message and leaving a valid alternation. Tools
       propagate `error.Canceled` too, and mutating tools write atomically so a cancelled write can't
       truncate the target.
+- [ ] **Commit partial turns to history on cancel.** Today `Agent.run` treats a turn as atomic: an
+      `errdefer self.messages.shrinkRetainingCapacity(base)` rolls the whole message list back to
+      the pre-turn length on any early exit, so a mid-turn cancel drops everything the turn produced
+      — the user prompt, a completed assistant reply (thinking + text), the `tool_use` blocks, and
+      the `tool_result`s already appended by `readReply`/`runTools`. When the model has already
+      emitted completed request/response pairs or run tools, forgetting them is wrong on two counts.
+      First, the work is real: a completed assistant turn is a valid history entry, and re-deriving
+      it costs tokens. Second, and more seriously, mutating tools have side effects the rollback
+      cannot undo — an edit/write has already hit disk, and a bash command (once the **Bash tool**
+      lands) may have done anything at all. edit/write we could in principle reverse; arbitrary bash
+      we cannot. So the only way to keep history honest with the world is to _keep the events_, not
+      to unwind them: after a cancel, `messages` should retain every completed assistant message and
+      its tool results (a valid user/assistant alternation) so the next turn's model knows what it
+      already thought and did. The commit boundary should be the **last complete round** — only
+      fully-drained `readReply` output is provider-valid. An in-flight partial cannot be committed
+      as-is: a thinking block cancelled before its `thinking_signature` has an empty signature
+      (Anthropic rejects that on replay with tool use), and a `tool_use` cancelled mid-`input_json`
+      carries truncated JSON. So the boundary is the last `.stop`-terminated reply, not the byte the
+      cancel landed on. This is an `error.Canceled`-only behavior: `run`'s single errdefer and
+      `runTurnWorker` today treat user-cancel and `error.Closed`/shutdown identically, but "keep the
+      events" applies only to a user cancel — shutdown is moot, and genuine errors already discard
+      cleanly via `reportAndReset`, so the commit logic is an error-kind split, not a blanket
+      errdefer change. It is also distinct from the retry path, which deliberately _discards_
+      partials (`onStreamReset` → `discardMessage`; a failed attempt will re-run): a failed attempt
+      discards, a user cancel keeps. Open questions remain: how to close a dangling `tool_use` whose
+      result never came back (a synthesized "cancelled" `tool_result` keeps the alternation valid —
+      note this history marker for the model is separate from the "cancelled" _feedback block_ the
+      transcript shows the user). Landing this reverses the invariant stated in the DONE **Streaming
+      cancellation** entry ("dropping the partial assistant message"), so update that entry and
+      `FEATURES.md` when it ships. The joined `agent.messages` (`cancelTurn` already joins the
+      worker before teardown) should be the single source of truth that both this commit and the
+      transcript rewind derive from — a parallel UI-side heuristic would let the two disagree and
+      reintroduce the divergence **Show only committed content in the transcript** exists to kill.
+      Pairs with that item (the still-uncommitted tail is what gets rewound) and ties into the
+      **Permission model** and **Bash tool**.
 
 ## UI
 
-- [x] **Accurate display widths (wide glyphs).** The differential renderer `View`
-      counts _physical_ terminal rows for every cursor move: each frame line spans `width.rows` rows
-      — the number of pieces `width.wrap` produces, not `ceil(width / columns)`, since a wide
-      cluster cannot straddle the margin — and `width.caret` maps a caret's display column to its
-      physical row and column within a wrapped line. A single `paint` helper drives every mode
-      (first frame, full reset, incremental) so all row arithmetic lives in one place, and
-      `viewportTop` and the caret restore both measure physical rows. A line wider than `columns`
-      can no longer desync `cursor_row`, so `View` is correct independently of the app
-      pre-wrapping every line. A model terminal in the test suite replays the exact escapes `View`
-      emits with real auto-wrap and asserts the reconstructed document and caret, covering the
-      wide-line paths byte-level checks cannot express.
+- [x] **Accurate display widths (wide glyphs).** The differential renderer `View` counts _physical_
+      terminal rows for every cursor move: each frame line spans `width.rows` rows — the number of
+      pieces `width.wrap` produces, not `ceil(width / columns)`, since a wide cluster cannot
+      straddle the margin — and `width.caret` maps a caret's display column to its physical row and
+      column within a wrapped line. A single `paint` helper drives every mode (first frame, full
+      reset, incremental) so all row arithmetic lives in one place, and `viewportTop` and the caret
+      restore both measure physical rows. A line wider than `columns` can no longer desync
+      `cursor_row`, so `View` is correct independently of the app pre-wrapping every line. A model
+      terminal in the test suite replays the exact escapes `View` emits with real auto-wrap and
+      asserts the reconstructed document and caret, covering the wide-line paths byte-level checks
+      cannot express.
 - [x] **Grapheme-cluster display widths.** `width.ofText`/`truncate`/`wrap` measure per UAX #29
       grapheme cluster via the `grapheme` module, so a glyph built from several code points — an
       emoji variation selector (`❤️`), a skin-tone modifier (`👍🏽`), a ZWJ sequence (`👨‍👩‍👧‍👦`), a
@@ -211,9 +249,10 @@ Extension seams referenced here:
       `stepAt` and backs `Editor.previousBoundary`, while `stepFrom` advances one cluster via
       `stepAt`. `moveLeft`/`moveRight`/`backspace` step by whole cluster — a combining mark, a ZWJ
       emoji (`👨‍👩‍👧‍👦`), a regional-indicator flag, a skin-tone modifier, a keycap — so the caret can no
-      longer land inside a cluster and a backspace deletes the whole glyph, and `insert` advances the
-      caret past any cluster its text fuses into. Editing and movement now keep the caret on cluster
-      boundaries, so `width.caret`'s precondition tightened from codepoint to grapheme cluster.
+      longer land inside a cluster and a backspace deletes the whole glyph, and `insert` advances
+      the caret past any cluster its text fuses into. Editing and movement now keep the caret on
+      cluster boundaries, so `width.caret`'s precondition tightened from codepoint to grapheme
+      cluster.
 
 - [x] **Sticky goal column for vertical caret movement.** `Editor` carries an optional
       `goal_column`: the first `moveUp`/`moveDown` of a run captures the caret's display column into
@@ -221,20 +260,21 @@ Extension seams referenced here:
       instead of the live one. A row shorter than the goal clamps the caret for display without
       overwriting the goal, so a later step onto a wider row restores the column — the way most
       editors behave. Any horizontal move or edit (`moveLeft`/`moveRight`/`moveHome`/`moveEnd`/
-      `insert`/`backspace`/`clear`) resets the goal to null so the next vertical run recaptures it. A
-      vertical move off the top or bottom row falls back to `moveHome`/`moveEnd`, so pressing up on
-      the first row jumps to the start and down on the last row jumps to the end.
+      `insert`/`backspace`/`clear`) resets the goal to null so the next vertical run recaptures it.
+      A vertical move off the top or bottom row falls back to `moveHome`/`moveEnd`, so pressing up
+      on the first row jumps to the start and down on the last row jumps to the end.
 
 - [x] **Extract block rendering into a `ui` widget + shared color namespace.** Block rendering moved
-      out of `src/App.zig` into two `ui` modules, and the SGR palette into a third. `ui/color.zig` is
-      the one palette `App`, `paint`, `Picker`, `separator`, and `status` share. `ui/paint.zig` holds
-      the row-painting primitives (`Placement`, `BoxStyle`, `box`/`notice`/`wrapped`/`spinner`/`row`,
-      plus `boxRows`/`spinnerStep`), which stream one row at a time into the view sink — the
-      streaming `Placement` contract, deliberately *not* the `render(columns, …, buffer, lines)`
-      contract `Editor`/`Picker` use, so a clipped block never materializes its hidden top.
-      `ui/block.zig` is the transcript-block model (`Entry`, below), measuring and painting itself
-      via `paint`. App shrank to state + event loop + orchestration + agent glue + the
-      projection/layout pass, and the block renderers are now unit-tested in `block.zig`.
+      out of `src/App.zig` into two `ui` modules, and the SGR palette into a third. `ui/color.zig`
+      is the one palette `App`, `paint`, `Picker`, `separator`, and `status` share. `ui/paint.zig`
+      holds the row-painting primitives (`Placement`, `BoxStyle`,
+      `box`/`notice`/`wrapped`/`spinner`/`row`, plus `boxRows`/`spinnerStep`), which stream one row
+      at a time into the view sink — the streaming `Placement` contract, deliberately _not_ the
+      `render(columns, …, buffer, lines)` contract `Editor`/`Picker` use, so a clipped block never
+      materializes its hidden top. `ui/block.zig` is the transcript-block model (`Entry`, below),
+      measuring and painting itself via `paint`. App shrank to state + event loop + orchestration +
+      agent glue + the projection/layout pass, and the block renderers are now unit-tested in
+      `block.zig`.
 - [x] **Make `App.Entry` a `union(Kind)`.** `Entry` (now in `ui/block.zig`) is a tagged union: the
       `intro`/`user`/`model` blocks carry a byte buffer, `tool_result`/`feedback` a buffer plus an
       `is_error` flag (`Flagged`). Each variant carries exactly its data — the `is_error` that was
@@ -247,21 +287,21 @@ Extension seams referenced here:
       `/model` chooser) is the first such component: a single-choice list rendered into the live
       region, reusable by any command that returns a `pick` outcome.
 - [x] **Display model thinking.** The model's reasoning streams into the transcript dimmed, separate
-      from the answer. `anthropic/wire.zig` sends adaptive thinking (`thinking:{type:adaptive,
-      display:summarized}`) and `Transport` decodes thinking deltas, signatures, and redacted
-      reasoning; `llm.Block` and `llm.Event` gained a `thinking` variant; `Agent` buffers a reasoning
-      run into a `thinking` block (carried back verbatim so the provider accepts the tool calls that
-      followed) and reports it via `handler.onThinking`; `Transcript` collects a run into one growing
-      dimmed `thinking` block that the answer run does not extend, painted by `ui/block`. Adaptive
-      thinking lets the model size its own budget, so no client-side budget is set; `/effort` steers
-      its depth.
+      from the answer. `anthropic/wire.zig` sends adaptive thinking
+      (`thinking:{type:adaptive,     display:summarized}`) and `Transport` decodes thinking deltas,
+      signatures, and redacted reasoning; `llm.Block` and `llm.Event` gained a `thinking` variant;
+      `Agent` buffers a reasoning run into a `thinking` block (carried back verbatim so the provider
+      accepts the tool calls that followed) and reports it via `handler.onThinking`; `Transcript`
+      collects a run into one growing dimmed `thinking` block that the answer run does not extend,
+      painted by `ui/block`. Adaptive thinking lets the model size its own budget, so no client-side
+      budget is set; `/effort` steers its depth.
 - [x] **Steering.** The user types and submits while a turn runs, queuing messages the pi way. The
       editor stays live during a turn (it was inert by policy, not by blocking — the off-thread
       networking work had already unfrozen the read loop): `App.editKey` drives the editor in both
-      prompt and turn modes, Enter queues a steering message, and Alt+Up recalls the whole queue into
-      the editor. A queued message rides two representations — `Session.steering` (the UI-thread
-      `Steering:` display rows) and `ai.Steering`, a thread-safe (`std.Io.Mutex`) FIFO the turn
-      worker takes from — fed together on submit. `Agent.run` drains the channel at each round
+      prompt and turn modes, Enter queues a steering message, and Alt+Up recalls the whole queue
+      into the editor. A queued message rides two representations — `Session.steering` (the
+      UI-thread `Steering:` display rows) and `ai.Steering`, a thread-safe (`std.Io.Mutex`) FIFO the
+      turn worker takes from — fed together on submit. `Agent.run` drains the channel at each round
       boundary (and when the model would otherwise end the turn, so a message still lands mid-turn),
       combines the pending messages into one blank-line-joined user message folded into the trailing
       user turn (keeping the user/assistant alternation valid), and reports it via
@@ -298,17 +338,74 @@ Extension seams referenced here:
       dimensions to fold in: tiered pricing (some models cost more above a context threshold — needs
       tiered rates in `models.zig`, cf. pi's per-model `tiers`) and the degradation of output
       quality as context fills. Evidence-based numbers for the latter are unlikely, so expose it as
-      a configurable soft warning rather than a hardcoded rule — an idea to revisit.
+      a configurable soft warning rather than a hardcoded rule — an idea to revisit. Note that once
+      **Commit partial turns to history on cancel** lands, cancelled turns consume context where
+      they previously vanished, so pressure builds faster than the old drop-on-cancel behavior
+      implied.
+- [ ] **Offer partial reasoning/text as a citation on cancel.** A common workflow is to watch the
+      model's streamed reasoning, spot a misunderstanding early, and cancel to correct it — often
+      _instead_ of steering, precisely to cut off a long inner monologue once the user sees they can
+      help. But a cancel mid-stream lands before `readReply` appends the assistant message, so the
+      reasoning the user just read is never in history and the model can't see its own aborted train
+      of thought. When a turn is cancelled while the model was mid-generation (partial thinking or
+      text streamed but no `stop`), detect it and offer to fold that partial output into the next
+      prompt as a quoted citation, so the user can hand the model back its own reasoning and comment
+      on it ("you were about to X, but …"). The partial text already lives in the display transcript
+      (streamed via `onThinking`/`onText`) and a cancel keeps it there today (`abortTurn` ends the
+      run via `endMessage` without discarding it — unlike the retry path's `discardMessage`). So the
+      capture is only needed once **Show only committed content in the transcript** starts rewinding
+      that tail: snapshot the partial there before removing it, and present a prompt-line option to
+      include it. Open questions: the affordance (a prompt on cancel, a key, or a command), how much
+      to include (thinking vs. answer, truncation), and a citation format that reads well back to
+      the model.
+- [ ] **Show only committed content in the transcript.** `App.submit` appends the user's message to
+      the display transcript immediately and synchronously, and the streamed reply renders into it
+      as it arrives — but on a cancel before the turn commits anything (no completed assistant
+      response), that content is left on screen even though history never kept it (`Agent.run`'s
+      errdefer rolled `messages` back). The transcript then shows a prompt the model never answered
+      and never will, diverging from what the model actually knows. The principle: the transcript
+      should mirror committed state. Optimistic display _during_ a turn is fine — showing the prompt
+      and the streaming reply while we assume they will commit — but once a cancel means they will
+      not, un-persist them: remove the uncommitted **tail** — the user prompt _and_ the partial
+      reply that streamed under it — from the transcript and return the prompt text to the editor
+      (mirroring how `cancelTurn` already recalls pending steering into the editor, though the
+      original prompt today is not), so the user can edit and resend. `discardMessage` already drops
+      the streamed assistant tail (from `message_start`), but the user block index is not tracked,
+      so rewinding the prompt needs a new bit of transcript state. Seams: `App.submit` (the
+      optimistic append), `App.cancelTurn`/`Session.abortTurn` (the teardown that today appends a
+      "cancelled" feedback block rather than rewinding), and the rewind-vs-keep decision, which
+      should derive from the joined `agent.messages` (see **Commit partial turns to history on
+      cancel**) rather than a parallel UI-side "at least one completed response" test, so the
+      transcript and history can't disagree. Interacts with that item: once completed rounds are
+      committed, only the still-uncommitted tail is rewound.
+- [ ] **Account cancelled turns' token cost.** `recordUsage` fires only on the stream's `.stop`
+      event, which a mid-stream cancel never reaches, so a cancelled turn's tokens go unrecorded in
+      `Agent.Stats` — yet the provider still bills the full input prompt (and the output streamed so
+      far). The session cost gauge therefore under-counts exactly the turns a user cancels most, and
+      committing the partial to history (see **Commit partial turns to history on cancel**) without
+      its cost widens that gap. Completed rounds are fine (they hit `.stop`); the hole is the
+      in-flight request. `message_start`/`message_delta` already carry incremental usage the retry
+      path ignores — capture it at cancel and fold it into `Agent.Stats` so the gauge reflects money
+      actually spent.
+- [ ] **Define editor composition on cancel.** After a cancel the editor can receive up to four
+      writers: text the user was already typing, pending steering that `cancelTurn` recalls today,
+      the original prompt returned by **Show only committed content in the transcript**, and the
+      partial-reasoning citation from **Offer partial reasoning/text as a citation on cancel**.
+      `appendToEditor` blank-line-joins in call order, and nothing defines which leads or how they
+      separate — but they are not interchangeable: the returned prompt should precede recalled
+      steering, the citation is the model's words (not the user's) and wants its own quoted framing,
+      and in-progress typing must not be clobbered. Define the composition — order, separators, and
+      framing per source — as one model rather than letting each feature append blindly. This is the
+      underspecified linchpin of the cancel cluster.
 
 ## Cross-cutting / open questions
 
 - [ ] **Permission model.** No allow/deny concept exists. Bash, subagent tool allowlists, and
       write/edit gating all want a shared answer here.
 - [ ] **Config file.** Format and location are now settled: `$HOME/.pith/config.json`, loaded by
-      `src/Config.zig` (typed
-      `std.json` parse; a missing file, section, or field falls back to a built-in default and
-      unknown keys are ignored, so it is optional, partial, and forward-compatible). Today it carries
-      only the `request` section (network timeouts + retry policy), folded into the neutral
-      `ai.net.Timeouts`/`ai.net.Retry` structs. Still to fold in as those features land: system
-      prompt, model/effort defaults, provider keys, skill/agent/prompt directories (see the
-      `models.json` runtime catalog item, which may merge here).
+      `src/Config.zig` (typed `std.json` parse; a missing file, section, or field falls back to a
+      built-in default and unknown keys are ignored, so it is optional, partial, and
+      forward-compatible). Today it carries only the `request` section (network timeouts + retry
+      policy), folded into the neutral `ai.net.Timeouts`/`ai.net.Retry` structs. Still to fold in as
+      those features land: system prompt, model/effort defaults, provider keys, skill/agent/prompt
+      directories (see the `models.json` runtime catalog item, which may merge here).
