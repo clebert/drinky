@@ -103,7 +103,7 @@ pub fn init(
     gpa: std.mem.Allocator,
     io: std.Io,
     client: ?provider.Client,
-    options: struct { model: models.Model, system: []const u8, retry: net.Retry, effort: llm.Effort = .off },
+    options: struct { model: models.Model, system: []const u8, retry: net.Retry, effort: llm.Effort = .none },
 ) Agent {
     return .{
         .gpa = gpa,

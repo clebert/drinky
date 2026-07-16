@@ -72,9 +72,9 @@ pub const Role = enum { user, assistant };
 
 /// A named reasoning-effort level passed through to the provider, which picks
 /// the actual thinking depth itself (Anthropic maps it to `output_config.effort`
-/// under adaptive thinking; OpenAI to its reasoning-effort control). `off` turns
-/// reasoning off; the rest match Anthropic's effort ladder.
-pub const Effort = enum { off, low, medium, high, xhigh, max };
+/// under adaptive thinking; OpenAI to its reasoning-effort control). `none`
+/// disables reasoning; the rest match Anthropic's effort ladder.
+pub const Effort = enum { none, low, medium, high, xhigh, max };
 
 /// One entry in the flat, ordered conversation history. Every provider
 /// translates its wire format to and from this list; the agent loop appends
@@ -155,7 +155,7 @@ pub const Request = struct {
     system: []const u8,
     items: []const Item,
     tools: []const Tool,
-    effort: Effort = .off,
+    effort: Effort = .none,
 };
 
 /// Token counts for one assistant message. `input` is uncached prompt tokens;

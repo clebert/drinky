@@ -163,10 +163,10 @@ commit history, `BACKLOG.md` (planned work), and `docs/`.
   (1,000,000-token context) and OpenAI `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna`
   (1,050,000-token context) — each with prices, maximum output tokens (128,000, with the effort
   level governing actual spend), and a reasoning-effort map.
-- Reasoning-effort levels `off` / `low` / `medium` / `high` / `xhigh` / `max`, each mapping to what
+- Reasoning-effort levels `none` / `low` / `medium` / `high` / `xhigh` / `max`, each mapping to what
   a given model supports: a level a model lacks folds to the nearest it offers (`claude-sonnet-4-6`
-  folds `xhigh` to `high`), a model without reasoning maps every level to off, and a model that
-  cannot disable reasoning raises `off` to its minimum.
+  folds `xhigh` to `high`), a model without reasoning maps every level to none, and a model that
+  cannot disable reasoning raises `none` to its minimum.
 - Cost and cache savings computed per model from its USD-per-million-token rates; an unknown model
   is rejected, not guessed.
 
@@ -187,7 +187,7 @@ commit history, `BACKLOG.md` (planned work), and `docs/`.
   and API errors.
 - When reasoning is enabled, requests adaptive, summarized extended thinking at the resolved effort
   level so the model sizes its own budget while the output ceiling stays fixed; omitted when effort
-  is off, the model has no reasoning, or the model is unknown.
+  is none, the model has no reasoning, or the model is unknown.
 - Forks by account: the subscription path adds the Claude Code identity (a leading system block and
   OAuth identity headers) and authorizes with a Bearer token; the API-key path omits both and
   authorizes with `x-api-key`. Both request an unencoded response so SSE frames arrive verbatim.

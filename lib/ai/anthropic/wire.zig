@@ -35,7 +35,7 @@ pub fn serialize(gpa: std.mem.Allocator, request: llm.Request, account: llm.Acco
     // Reasoning: let the model size its own budget (adaptive thinking) and steer
     // its depth with the named effort level, rather than picking a token budget
     // client-side. `summarized` keeps the reasoning readable for display. Every
-    // level, off included, is resolved through the per-model effort map, so it
+    // level, none included, is resolved through the per-model effort map, so it
     // maps to what the model accepts; a null result omits the config entirely and
     // drops the stored thinking blocks from the history below.
     const reasoning = effortName(request);
@@ -73,7 +73,7 @@ pub fn serialize(gpa: std.mem.Allocator, request: llm.Request, account: llm.Acco
     // (reasoning already arrives at the head from the agent) and never
     // concatenating adjacent text (each stays its own block, preserving
     // `[tool_use, text]` interleaving and multi-text turns). An item that emits no
-    // block (a reasoning item dropped because reasoning is off or its origin is a
+    // block (a reasoning item dropped because reasoning is disabled or its origin is a
     // different account) is skipped without opening an envelope, so an
     // assistant run that was reasoning-only never serializes to an empty
     // `content` array (which Anthropic rejects with a 400); two user runs left
@@ -105,8 +105,8 @@ pub fn serialize(gpa: std.mem.Allocator, request: llm.Request, account: llm.Acco
 }
 
 /// The Anthropic effort name for the request's level, resolved through the
-/// model's effort map, or null to omit the reasoning config. Off, an unknown
-/// model, and a level the model turns off all resolve to null.
+/// model's effort map, or null to omit the reasoning config. The none level, an
+/// unknown model, and any level a model disables all resolve to null.
 fn effortName(request: llm.Request) ?[]const u8 {
     const model = models.get(.anthropic, request.model) orelse return null;
     return model.effort.resolve(request.effort);
@@ -208,7 +208,7 @@ fn writeTool(json: *std.json.Stringify, tool: llm.Tool, cache: bool) !void {
 }
 
 /// Whether an item serializes to a content block. Every item does except a
-/// reasoning item that is dropped — reasoning off, or a blob from a different
+/// reasoning item that is dropped — reasoning disabled, or a blob from a different
 /// account, neither of which this serializer can replay.
 fn emitsBlock(item: llm.Item, emit_thinking: bool, account: llm.Account) bool {
     return switch (item) {
@@ -464,7 +464,7 @@ test "an effort level a model lacks folds to one it accepts" {
     );
 }
 
-test "no thinking or output_config when effort is off" {
+test "no thinking or output_config when effort is none" {
     const items = [_]llm.Item{.{ .message = .{ .role = .user, .text = "hi" } }};
     const body = try serialize(std.testing.allocator, .{
         .model = "claude-opus-4-8",
@@ -482,7 +482,7 @@ test "no thinking or output_config when effort is off" {
     try std.testing.expectEqual(@as(i64, 8192), parsed.value.object.get("max_tokens").?.integer);
 }
 
-test "stored thinking is dropped from history when reasoning is off" {
+test "stored thinking is dropped from history when effort is none" {
     const items = [_]llm.Item{
         .{ .reasoning = .{ .text = "weigh it", .blob = "sig", .origin = .anthropic_subscription } },
         .{ .reasoning = .{ .text = "", .blob = "secret", .redacted = true, .origin = .anthropic_subscription } },
@@ -494,14 +494,14 @@ test "stored thinking is dropped from history when reasoning is off" {
         .system = "s",
         .items = &items,
         .tools = &.{},
-        .effort = .off,
+        .effort = .none,
     }, .anthropic_subscription);
     defer std.testing.allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
     defer parsed.deinit();
     const root = parsed.value.object;
-    // Reasoning is off: no thinking config, and the stored thinking blocks are
+    // Reasoning disabled: no thinking config, and the stored thinking blocks are
     // gone, leaving only the answer.
     try std.testing.expect(root.get("thinking") == null);
     const content = root.get("messages").?.array.items[0].object.get("content").?.array.items;
@@ -533,15 +533,16 @@ const golden_on =
     \\{"model":"claude-opus-4-8","max_tokens":8192,"stream":true,"thinking":{"type":"adaptive","display":"summarized"},"output_config":{"effort":"xhigh"},"system":[{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."},{"type":"text","text":"be terse","cache_control":{"type":"ephemeral"}}],"messages":[{"role":"user","content":[{"type":"text","text":"first"},{"type":"text","text":"second"}]},{"role":"assistant","content":[{"type":"thinking","thinking":"weigh it","signature":"sig"},{"type":"redacted_thinking","data":"secret"},{"type":"tool_use","id":"t1","name":"read","input":{"path":"a.zig"}},{"type":"text","text":"checking"}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","is_error":false,"content":"contents"}]},{"role":"assistant","content":[{"type":"thinking","thinking":"more","signature":"sig2"},{"type":"tool_use","id":"t2","name":"write","input":{"path":"b"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"t2","is_error":true,"content":"done"}]},{"role":"assistant","content":[{"type":"text","text":"all set","cache_control":{"type":"ephemeral"}}]}]}
 ;
 
-const golden_off =
+const golden_none =
     \\{"model":"claude-opus-4-8","max_tokens":8192,"stream":true,"system":[{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."},{"type":"text","text":"be terse","cache_control":{"type":"ephemeral"}}],"messages":[{"role":"user","content":[{"type":"text","text":"first"},{"type":"text","text":"second"}]},{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"read","input":{"path":"a.zig"}},{"type":"text","text":"checking"}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","is_error":false,"content":"contents"}]},{"role":"assistant","content":[{"type":"tool_use","id":"t2","name":"write","input":{"path":"b"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"t2","is_error":true,"content":"done"}]},{"role":"assistant","content":[{"type":"text","text":"all set","cache_control":{"type":"ephemeral"}}]}]}
 ;
 
 // Byte-identity with the pre-reshape output guards the pure-refactor claim and
 // Anthropic's server-side prompt cache: a changed prefix invalidates the cache
-// across a deploy. Serializing on and off proves reasoning-off drops the
-// thinking blocks and the reasoning config with no other byte change. Both use
-// the subscription account, whose reasoning origin matches so the blocks replay.
+// across a deploy. Serializing with reasoning on, then at effort none, proves
+// the none level drops the thinking blocks and the reasoning config with no
+// other byte change. Both use the subscription account, whose reasoning origin
+// matches so the blocks replay.
 test "serialized bytes match the pre-reshape wire output" {
     const on = try serialize(std.testing.allocator, .{
         .model = "claude-opus-4-8",
@@ -554,16 +555,16 @@ test "serialized bytes match the pre-reshape wire output" {
     defer std.testing.allocator.free(on);
     try std.testing.expectEqualStrings(golden_on, on);
 
-    const off = try serialize(std.testing.allocator, .{
+    const none = try serialize(std.testing.allocator, .{
         .model = "claude-opus-4-8",
         .tokens_max = 8192,
         .system = "be terse",
         .items = &golden_items,
         .tools = &.{},
-        .effort = .off,
+        .effort = .none,
     }, .anthropic_subscription);
-    defer std.testing.allocator.free(off);
-    try std.testing.expectEqualStrings(golden_off, off);
+    defer std.testing.allocator.free(none);
+    try std.testing.expectEqualStrings(golden_none, none);
 }
 
 // The API-key account drops the Claude Code `system_header` (sending only the

@@ -83,7 +83,7 @@ test "select applies the level at a row index, rejecting out of range" {
     defer agent.deinit();
     var context: Context = .{ .gpa = gpa, .agent = &agent, .accounts = undefined };
 
-    // Levels are declared off, low, medium, high, xhigh, max — index 4 is xhigh.
+    // Levels are declared none, low, medium, high, xhigh, max — index 4 is xhigh.
     switch (try select(&context, 4)) {
         .feedback => |feedback| {
             defer gpa.free(feedback.content);

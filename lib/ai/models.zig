@@ -26,14 +26,14 @@ pub const Model = struct {
 
     /// The provider outcome for each of our effort levels on this model: a
     /// provider effort name to send, or null to send no reasoning at all. Total
-    /// over every level, off included, so each model states exactly what it does
+    /// over every level, none included, so each model states exactly what it does
     /// with each choice — including the awkward ends:
     ///   - a model missing a level folds it onto the nearest it has (Sonnet 4.6
     ///     has no xhigh, so xhigh maps to high);
-    ///   - a model with no reasoning maps every level, off included, to null;
-    ///   - a model that cannot disable reasoning maps off up to a floor level.
+    ///   - a model with no reasoning maps every level, none included, to null;
+    ///   - a model that cannot disable reasoning maps none up to a floor level.
     pub const EffortMap = struct {
-        off: ?[]const u8,
+        none: ?[]const u8,
         low: ?[]const u8,
         medium: ?[]const u8,
         high: ?[]const u8,
@@ -44,7 +44,7 @@ pub const Model = struct {
         /// reasoning config.
         pub fn resolve(self: *const EffortMap, effort: llm.Effort) ?[]const u8 {
             return switch (effort) {
-                .off => self.off,
+                .none => self.none,
                 .low => self.low,
                 .medium => self.medium,
                 .high => self.high,
@@ -76,11 +76,11 @@ const Entry = struct {
     model: Model,
 };
 
-// Anthropic names its effort levels exactly like ours and lets reasoning be
-// turned off, so a full-ladder model maps off to none and each level to its own
-// name.
+// Anthropic names its effort levels like ours and can disable reasoning, so a
+// full-ladder model sends no reasoning config for none and each other level
+// under its own name.
 const anthropic_effort: Model.EffortMap = .{
-    .off = null,
+    .none = null,
     .low = "low",
     .medium = "medium",
     .high = "high",
@@ -91,7 +91,7 @@ const anthropic_effort: Model.EffortMap = .{
 // Sonnet 4.6 has no xhigh, so it folds an xhigh request onto high; otherwise the
 // standard ladder.
 const anthropic_effort_no_xhigh: Model.EffortMap = .{
-    .off = null,
+    .none = null,
     .low = "low",
     .medium = "medium",
     .high = "high",
@@ -101,10 +101,10 @@ const anthropic_effort_no_xhigh: Model.EffortMap = .{
 
 // OpenAI's reasoning-effort domain is a superset of ours, so every level maps to
 // its own name. These are reasoning-only models with no way to disable
-// reasoning, so off floors on `none` (the API's minimal level) rather than
+// reasoning, so the none level floors on the API's minimal `none` rather than
 // omitting the reasoning config, which would default the model to medium.
 const openai_effort: Model.EffortMap = .{
-    .off = "none",
+    .none = "none",
     .low = "low",
     .medium = "medium",
     .high = "high",
@@ -220,32 +220,32 @@ test get {
     try std.testing.expectApproxEqAbs(@as(f64, 1.95), model.savings(&usage), 1e-9);
 }
 
-test "EffortMap.resolve maps every level, off included, to the model's outcome" {
-    // A model that cannot disable reasoning maps off up to a floor level.
+test "EffortMap.resolve maps every level, none included, to the model's outcome" {
+    // A model that cannot disable reasoning maps none up to a floor level.
     const floored: Model.EffortMap = .{
-        .off = "low",
+        .none = "low",
         .low = "low",
         .medium = "medium",
         .high = "high",
         .xhigh = "xhigh",
         .max = "max",
     };
-    try std.testing.expectEqualStrings("low", floored.resolve(.off).?);
+    try std.testing.expectEqualStrings("low", floored.resolve(.none).?);
 
-    // A model with no reasoning maps every level, off included, to null.
-    const none: Model.EffortMap = .{
-        .off = null,
+    // A model with no reasoning maps every level, none included, to null.
+    const no_reasoning: Model.EffortMap = .{
+        .none = null,
         .low = null,
         .medium = null,
         .high = null,
         .xhigh = null,
         .max = null,
     };
-    try std.testing.expectEqual(@as(?[]const u8, null), none.resolve(.max));
+    try std.testing.expectEqual(@as(?[]const u8, null), no_reasoning.resolve(.max));
 
-    // Opus 4.8 and Sonnet 5 carry the full ladder and turn reasoning off for
-    // off; Sonnet 4.6 folds its missing xhigh onto high.
-    try std.testing.expectEqual(@as(?[]const u8, null), get(.anthropic, "claude-opus-4-8").?.effort.resolve(.off));
+    // Opus 4.8 and Sonnet 5 carry the full ladder and disable reasoning for
+    // none; Sonnet 4.6 folds its missing xhigh onto high.
+    try std.testing.expectEqual(@as(?[]const u8, null), get(.anthropic, "claude-opus-4-8").?.effort.resolve(.none));
     try std.testing.expectEqualStrings("xhigh", get(.anthropic, "claude-opus-4-8").?.effort.resolve(.xhigh).?);
     try std.testing.expectEqualStrings("xhigh", get(.anthropic, "claude-sonnet-5").?.effort.resolve(.xhigh).?);
     try std.testing.expectEqualStrings("high", get(.anthropic, "claude-sonnet-4-6").?.effort.resolve(.xhigh).?);

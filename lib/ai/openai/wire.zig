@@ -29,8 +29,8 @@ pub fn serialize(gpa: std.mem.Allocator, request: llm.Request, account: llm.Acco
     try json.write(request.system);
 
     // Reasoning-only models: steer depth with the named effort (resolved through
-    // the per-model map, off floored on `none`) and ask for a readable summary.
-    // A null result — an unknown model — omits the config entirely.
+    // the per-model map; the none level floors on the API's `none`) and ask for
+    // a readable summary. A null result — an unknown model — omits the config.
     if (effortName(request, account)) |effort| {
         try json.objectField("reasoning");
         try json.write(Reasoning{ .effort = effort });
@@ -77,7 +77,8 @@ pub fn serialize(gpa: std.mem.Allocator, request: llm.Request, account: llm.Acco
 
 /// The OpenAI effort name for the request's level, resolved through the model's
 /// effort map, or null to omit the reasoning config. An unknown model resolves
-/// to null; every known openai model floors off on `none`, so it never does.
+/// to null; every known openai model floors the none level on `none`, so it
+/// never does.
 fn effortName(request: llm.Request, account: llm.Account) ?[]const u8 {
     const model = models.get(llm.provider(account), request.model) orelse return null;
     return model.effort.resolve(request.effort);

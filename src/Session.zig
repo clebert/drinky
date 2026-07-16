@@ -460,7 +460,7 @@ test "scripted stream events drive the model and one coalesced paint" {
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
 
-    var session: Session = Session.init(gpa, &out.writer, test_model, .off);
+    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
     defer session.deinit();
     session.mode = .{ .turn = .{ .spinner_frame = 0, .tools = .empty, .box_view = .empty } };
 
@@ -501,7 +501,7 @@ test "stream events are dropped once the turn is over" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var session: Session = Session.init(gpa, &out.writer, test_model, .off);
+    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
     defer session.deinit();
 
     try session.applyStreamEvent(.{ .text = try gpa.dupe(u8, "straggler") });
@@ -515,7 +515,7 @@ test "steering queues, then a consumed event shows it and clears the queue" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var session: Session = Session.init(gpa, &out.writer, test_model, .off);
+    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
     defer session.deinit();
     session.mode = .{ .turn = .{ .spinner_frame = 0, .tools = .empty, .box_view = .empty } };
 
@@ -541,7 +541,7 @@ test "a tick repaints and steps the spinner while a turn animates" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var session: Session = Session.init(gpa, &out.writer, test_model, .off);
+    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
     defer session.deinit();
 
     // Animating and clean still repaints, and the spinner advances one frame.

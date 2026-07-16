@@ -62,7 +62,7 @@ Extension seams referenced here:
 - [x] **`/effort`** — pick the reasoning-effort level from a picker over the levels with the current
       one marked (picker-only, mirroring `/model`); shown on the status line so the
       right side reads `model • effort` (e.g. `claude-opus-4-8 • xhigh`). `llm.Effort`
-      (`off`/`low`/`medium`/`high`/`xhigh`/`max`) is threaded onto `llm.Request` and into
+      (`none`/`low`/`medium`/`high`/`xhigh`/`max`) is threaded onto `llm.Request` and into
       `ui.status.Info`, with `Agent.setEffort` the live-reconfigure seam (takes effect next turn).
       The per-model level→provider-name mapping is a compiled `EffortMap` in `models.zig` (beside
       price and context window), resolved in `wire.zig` to Anthropic's `output_config.effort`: a
@@ -176,7 +176,7 @@ Extension seams referenced here:
       latter reachable through the `/login` picker.
 - [x] **Account switch: empty assistant content (Anthropic 400).** The Anthropic serializer skips an
       assistant envelope that would emit zero blocks — a reasoning-only run whose reasoning is
-      dropped by exact-account replay (`origin != account`) or by reasoning-off — instead of sending
+      dropped by exact-account replay (`origin != account`) or by disabled reasoning — instead of sending
       `"content":[]`, which Anthropic rejects with a 400. Two user runs left adjacent by such a skip
       merge into one envelope, and the history cache breakpoint moves to the last block actually
       emitted. Covered by a switch that drops a reasoning-only run.
