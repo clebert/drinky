@@ -4,11 +4,14 @@
 //! bytes — so a client built here stays valid for the whole session. Reports
 //! which accounts are authenticated and builds a client for one on demand;
 //! selection is always an explicit account, never inferred from a precedence.
+//! Also owns best-effort account-specific model limits so the provider-wide
+//! compiled catalog remains immutable.
 
 const std = @import("std");
 
 const anthropic = @import("anthropic/root.zig");
 const llm = @import("llm.zig");
+const models = @import("models.zig");
 const net = @import("net.zig");
 const openai = @import("openai/root.zig");
 const provider = @import("provider.zig");
@@ -24,6 +27,14 @@ keys: ApiKeys,
 /// Whether each subscription store loaded a credential from `auth.json`.
 anthropic_subscription_ready: bool,
 openai_subscription_ready: bool,
+/// Valid account-specific context windows discovered for known OpenAI models.
+/// Empty means every subscription model uses its compiled fallback.
+openai_subscription_context_windows: std.ArrayList(ContextWindow),
+
+const ContextWindow = struct {
+    model: []const u8,
+    tokens: u64,
+};
 
 /// The per-vendor API keys, each null when its environment variable is unset.
 /// Borrowed for the process lifetime (they point into the environment), so they
@@ -51,7 +62,7 @@ pub fn init(
     const anthropic_ready = try anthropic_auth.load();
     const openai_ready = try openai_auth.load();
 
-    return .{
+    var accounts: Accounts = .{
         .gpa = gpa,
         .io = io,
         .timeouts = timeouts,
@@ -60,10 +71,14 @@ pub fn init(
         .keys = keys,
         .anthropic_subscription_ready = anthropic_ready,
         .openai_subscription_ready = openai_ready,
+        .openai_subscription_context_windows = .empty,
     };
+    if (openai_ready) accounts.refreshOpenaiSubscriptionModels();
+    return accounts;
 }
 
 pub fn deinit(self: *Accounts) void {
+    self.openai_subscription_context_windows.deinit(self.gpa);
     self.anthropic_auth.deinit();
     self.openai_auth.deinit();
 }
@@ -107,6 +122,32 @@ pub fn client(self: *Accounts, account: llm.Account) ?provider.Client {
     return provider.Client.init(self.gpa, self.io, credentials, self.timeouts);
 }
 
+/// Overlay account-specific metadata onto a compiled or configured model.
+/// API-key and Anthropic accounts always receive the model unchanged.
+pub fn resolveModel(self: *const Accounts, account: llm.Account, base: models.Model) models.Model {
+    if (account != .openai_subscription) return base;
+    var resolved = base;
+    for (self.openai_subscription_context_windows.items) |context_window| {
+        if (!std.mem.eql(u8, context_window.model, base.name)) continue;
+        resolved.context_window = context_window.tokens;
+        break;
+    }
+    return resolved;
+}
+
+/// Append every compiled model offered to `account`, applying only that
+/// account's valid metadata overlays.
+pub fn listModels(
+    self: *const Accounts,
+    account: llm.Account,
+    out: *std.ArrayList(models.Model),
+    gpa: std.mem.Allocator,
+) !void {
+    const start = out.items.len;
+    try models.list(llm.provider(account), out, gpa);
+    for (out.items[start..]) |*model| model.* = self.resolveModel(account, model.*);
+}
+
 /// Run the interactive OAuth login for a subscription `account`, marking it
 /// authenticated on success. An API account has no login (its key comes from the
 /// environment), so it is an error.
@@ -119,6 +160,7 @@ pub fn login(self: *Accounts, account: llm.Account, out: *std.Io.Writer) !void {
         .openai_subscription => {
             try self.openai_auth.login(out);
             self.openai_subscription_ready = true;
+            self.refreshOpenaiSubscriptionModels();
         },
         .anthropic_api, .openai_api => return error.ApiAccountHasNoLogin,
     }
@@ -136,9 +178,48 @@ pub fn logout(self: *Accounts, account: llm.Account) !void {
         .openai_subscription => {
             try self.openai_auth.logout();
             self.openai_subscription_ready = false;
+            self.openai_subscription_context_windows.clearAndFree(self.gpa);
         },
         .anthropic_api, .openai_api => return error.ApiAccountHasNoLogout,
     }
+}
+
+/// Replace this account's discovered limits. Any fetch, envelope, or allocation
+/// failure leaves the override set empty, restoring every compiled fallback.
+fn refreshOpenaiSubscriptionModels(self: *Accounts) void {
+    self.replaceOpenaiSubscriptionCatalog(openai.ModelCatalog.fetch(
+        self.gpa,
+        self.io,
+        self.timeouts,
+        &self.openai_auth,
+    ));
+}
+
+fn replaceOpenaiSubscriptionCatalog(
+    self: *Accounts,
+    result: anyerror!openai.ModelCatalog,
+) void {
+    self.openai_subscription_context_windows.clearAndFree(self.gpa);
+
+    var catalog = result catch return;
+    defer catalog.deinit();
+
+    var vendor_models: std.ArrayList(models.Model) = .empty;
+    defer vendor_models.deinit(self.gpa);
+    models.list(.openai, &vendor_models, self.gpa) catch return;
+
+    var replacement: std.ArrayList(ContextWindow) = .empty;
+    var applied = false;
+    defer if (!applied) replacement.deinit(self.gpa);
+    for (vendor_models.items) |model| {
+        const context_window = catalog.contextWindow(model.name) orelse continue;
+        replacement.append(self.gpa, .{
+            .model = model.name,
+            .tokens = context_window,
+        }) catch return;
+    }
+    self.openai_subscription_context_windows = replacement;
+    applied = true;
 }
 
 fn testAccounts(keys: ApiKeys, anthropic_ready: bool, openai_ready: bool) Accounts {
@@ -151,6 +232,7 @@ fn testAccounts(keys: ApiKeys, anthropic_ready: bool, openai_ready: bool) Accoun
         .keys = keys,
         .anthropic_subscription_ready = anthropic_ready,
         .openai_subscription_ready = openai_ready,
+        .openai_subscription_context_windows = .empty,
     };
 }
 
@@ -183,4 +265,72 @@ test "client selects the arm for an authenticated account, null otherwise" {
     try std.testing.expectEqual(llm.Account.anthropic_api, accounts.client(.anthropic_api).?.account());
     try std.testing.expect(accounts.client(.openai_api) == null);
     try std.testing.expect(accounts.client(.anthropic_subscription) == null);
+}
+
+test "catalog limits apply to known subscription models only" {
+    const gpa = std.testing.allocator;
+    var accounts = testAccounts(.{ .openai = "sk-openai" }, false, true);
+    defer accounts.openai_subscription_context_windows.deinit(gpa);
+
+    const response =
+        \\{ "models": [
+        \\  { "slug": "gpt-5.6-sol", "context_window": 372000 },
+        \\  { "slug": "not-compiled", "context_window": 999999 }
+        \\] }
+    ;
+    accounts.replaceOpenaiSubscriptionCatalog(try openai.ModelCatalog.parse(gpa, response));
+
+    const sol = models.get(.openai, "gpt-5.6-sol").?;
+    const terra = models.get(.openai, "gpt-5.6-terra").?;
+    try std.testing.expectEqual(
+        @as(u64, 372_000),
+        accounts.resolveModel(.openai_subscription, sol).context_window,
+    );
+    try std.testing.expectEqual(
+        @as(u64, 1_050_000),
+        accounts.resolveModel(.openai_subscription, terra).context_window,
+    );
+    try std.testing.expectEqual(
+        @as(u64, 1_050_000),
+        accounts.resolveModel(.openai_api, sol).context_window,
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        accounts.openai_subscription_context_windows.items.len,
+    );
+
+    var listed: std.ArrayList(models.Model) = .empty;
+    defer listed.deinit(gpa);
+    try accounts.listModels(.openai_subscription, &listed, gpa);
+    try std.testing.expectEqual(@as(u64, 372_000), listed.items[0].context_window);
+}
+
+test "catalog request failure restores compiled subscription defaults" {
+    const gpa = std.testing.allocator;
+    var accounts = testAccounts(.{}, false, true);
+    defer accounts.openai_subscription_context_windows.deinit(gpa);
+
+    const response =
+        \\{ "models": [
+        \\  { "slug": "gpt-5.6-sol", "context_window": 372000 }
+        \\] }
+    ;
+    accounts.replaceOpenaiSubscriptionCatalog(try openai.ModelCatalog.parse(gpa, response));
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        accounts.openai_subscription_context_windows.items.len,
+    );
+
+    accounts.replaceOpenaiSubscriptionCatalog(
+        @as(anyerror!openai.ModelCatalog, error.ConnectionRefused),
+    );
+    const sol = models.get(.openai, "gpt-5.6-sol").?;
+    try std.testing.expectEqual(
+        @as(u64, 1_050_000),
+        accounts.resolveModel(.openai_subscription, sol).context_window,
+    );
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        accounts.openai_subscription_context_windows.items.len,
+    );
 }

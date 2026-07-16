@@ -4,7 +4,8 @@
 //! than derived, so a provider with different cache economics slots in as new
 //! entries. An unknown model has no entry — without a known context window it
 //! cannot be sized, so it is unsupported rather than given a guessed fallback.
-//! The table is compiled in; a runtime override file is future work.
+//! The table is compiled in. Account-aware metadata may overlay a copied model
+//! at runtime without mutating these provider-wide defaults.
 
 const std = @import("std");
 
@@ -149,9 +150,10 @@ const table = [_]Entry{
         .effort = anthropic_effort_no_xhigh,
     } },
     // The gpt-5.6 family reaches the same models over the API-key and the
-    // ChatGPT-subscription (Codex) backends — only the transport base and auth
-    // differ — so one openai vendor row serves both accounts. Standard-tier
-    // pricing, per million tokens; 1.05M context, 128K max output.
+    // ChatGPT-subscription (Codex) backends, so one openai vendor row supplies
+    // prices and fallback limits to both accounts. Subscription discovery may
+    // overlay its context windows per account. Standard-tier pricing, per
+    // million tokens; 1.05M fallback context, 128K max output.
     .{ .provider = .openai, .model = .{
         .name = "gpt-5.6-sol",
         .input = 5,

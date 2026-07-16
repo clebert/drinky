@@ -399,7 +399,8 @@ fn compiledDefault(account: ai.llm.Account) ai.models.Model {
 /// The model to start `account` on: the configured default, else the compiled
 /// per-vendor fallback.
 fn defaultModel(self: *const App, account: ai.llm.Account) ai.models.Model {
-    return self.default_models.get(account) orelse compiledDefault(account);
+    const base = self.default_models.get(account) orelse compiledDefault(account);
+    return self.accounts.resolveModel(account, base);
 }
 
 /// Decode a stdin chunk into key events and apply each. Runs on the consumer, so

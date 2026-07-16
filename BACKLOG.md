@@ -426,8 +426,12 @@ Extension seams referenced here:
       `/handoff` compaction. Thresholds configurable with good defaults. Two model-specific
       dimensions to fold in: tiered pricing (some models cost more above a context threshold — needs
       tiered rates in `models.zig`, cf. pi's per-model `tiers`) and the degradation of output
-      quality as context fills. Evidence-based numbers for the latter are unlikely, so expose it as
-      a configurable soft warning rather than a hardcoded rule — an idea to revisit. Note that once
+      quality as context fills. OpenAI subscription discovery also decodes
+      `effective_context_window_percent` but does not retain or apply it yet; when pressure
+      budgeting lands, retain it per account/model and use the effective window for warning and
+      compaction thresholds while keeping the raw catalog window as the displayed model limit.
+      Evidence-based numbers for quality degradation are unlikely, so expose it as a configurable
+      soft warning rather than a hardcoded rule — an idea to revisit. Note that once
       **Commit partial turns to history on cancel** lands, cancelled turns consume context where
       they previously vanished, so pressure builds faster than the old drop-on-cancel behavior
       implied.

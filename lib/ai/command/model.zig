@@ -77,7 +77,7 @@ fn collect(accounts: *const Accounts, out: *std.ArrayList(Combo), gpa: std.mem.A
         if (!accounts.isAuthenticated(account)) continue;
         var vendor_models: std.ArrayList(models.Model) = .empty;
         defer vendor_models.deinit(gpa);
-        try models.list(llm.provider(account), &vendor_models, gpa);
+        try accounts.listModels(account, &vendor_models, gpa);
         for (vendor_models.items) |vendor_model|
             try out.append(gpa, .{ .account = account, .model = vendor_model });
     }
@@ -93,6 +93,7 @@ fn apiAccounts(gpa: std.mem.Allocator) Accounts {
         .keys = .{ .anthropic = "sk-ant", .openai = "sk-openai" },
         .anthropic_subscription_ready = false,
         .openai_subscription_ready = false,
+        .openai_subscription_context_windows = .empty,
     };
 }
 

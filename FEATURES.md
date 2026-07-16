@@ -161,8 +161,11 @@ commit history, `BACKLOG.md` (planned work), and `docs/`.
 
 - Built-in model catalog: Anthropic `claude-opus-4-8`, `claude-sonnet-5`, and `claude-sonnet-4-6`
   (1,000,000-token context) and OpenAI `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna`
-  (1,050,000-token context) — each with prices, maximum output tokens (128,000, with the effort
-  level governing actual spend), and a reasoning-effort map.
+  (1,050,000-token fallback context) — each with prices, maximum output tokens (128,000, with the
+  effort level governing actual spend), and a reasoning-effort map.
+- An authenticated OpenAI subscription refreshes its account-aware model context windows after
+  login and on every startup; valid known-model limits replace only that account's fallback window,
+  while request/schema failures and each missing or invalid model value retain compiled defaults.
 - Reasoning-effort levels `none` / `low` / `medium` / `high` / `xhigh` / `max`, each mapping to what
   a given model supports: a level a model lacks folds to the nearest it offers (`claude-sonnet-4-6`
   folds `xhigh` to `high`), a model without reasoning maps every level to none, and a model that

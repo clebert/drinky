@@ -71,6 +71,7 @@ fn testAccounts(anthropic_ready: bool, openai_ready: bool) Accounts {
         .keys = .{ .anthropic = "sk-ant" },
         .anthropic_subscription_ready = anthropic_ready,
         .openai_subscription_ready = openai_ready,
+        .openai_subscription_context_windows = .empty,
     };
 }
 

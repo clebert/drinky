@@ -78,6 +78,7 @@ fn testAccounts(anthropic_key: ?[]const u8, anthropic_ready: bool, openai_ready:
         .keys = .{ .anthropic = anthropic_key },
         .anthropic_subscription_ready = anthropic_ready,
         .openai_subscription_ready = openai_ready,
+        .openai_subscription_context_windows = .empty,
     };
 }
 
