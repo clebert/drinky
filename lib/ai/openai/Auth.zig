@@ -121,7 +121,7 @@ pub fn logout(self: *Auth) !void {
     // Remove the on-disk entry first: a failed remove then leaves the credentials
     // fully intact (in memory and the caller's readiness flag), so logout is
     // atomic rather than leaving a token-less account still marked authenticated.
-    try auth_store.remove(self.gpa, self.io, self.path, account_key, .{});
+    try auth_store.remove(self.gpa, self.io, self.path, account_key);
     if (self.tokens) |tokens| tokens.deinit(self.gpa);
     self.tokens = null;
 }
@@ -141,7 +141,7 @@ fn save(self: *Auth) !void {
         .refresh = tokens.refresh,
         .expires_ms = tokens.expires_ms,
         .account_id = tokens.account_id,
-    }, .{});
+    });
 }
 
 const Callback = struct { code: []const u8, state: []const u8 };

@@ -4,10 +4,7 @@
 //! through `oauth`; the keyed on-disk store is shared through `auth_store`.
 //!
 //! Credentials live under `"anthropic_subscription"` in the shared keyed file, so
-//! a save is a load-merge-write that never clobbers another account's entry. A
-//! legacy flat file (a top-level `access`, from before the keyed layout) is read
-//! as this account's entry — no forced re-login — and its stale top-level keys are
-//! dropped the first time the file is rewritten keyed.
+//! a save is a load-merge-write that never clobbers another account's entry.
 
 const std = @import("std");
 
@@ -37,13 +34,12 @@ pub fn deinit(self: *Auth) void {
 }
 
 /// Load stored tokens. Returns false when the file is absent or holds no
-/// Anthropic subscription credential (keyed or legacy-flat).
+/// Anthropic subscription credential.
 pub fn load(self: *Auth) !bool {
     var file = (try auth_store.open(self.gpa, self.io, self.path)) orelse return false;
     defer file.deinit();
 
-    // The keyed entry, or a legacy flat file read whole as this account's entry.
-    const entry = file.entry(account_key) orelse file.legacyFlat() orelse return false;
+    const entry = file.entry(account_key) orelse return false;
 
     const access = try self.gpa.dupe(u8, jsonString(entry, "access") orelse return error.BadCredentials);
     errdefer self.gpa.free(access);
@@ -110,13 +106,12 @@ pub fn login(self: *Auth, out: *std.Io.Writer) !void {
 }
 
 /// Drop this account's credentials: clear the in-memory tokens and remove its
-/// entry from `auth.json`, dropping the legacy flat keys too (this account owned
-/// them) while preserving every other account's entry.
+/// entry from `auth.json`, preserving every other account's entry.
 pub fn logout(self: *Auth) !void {
     // Remove the on-disk entry first: a failed remove then leaves the credentials
     // fully intact (in memory and the caller's readiness flag), so logout is
     // atomic rather than leaving a token-less account still marked authenticated.
-    try auth_store.remove(self.gpa, self.io, self.path, account_key, .{ .drop_flat = true });
+    try auth_store.remove(self.gpa, self.io, self.path, account_key);
     if (self.tokens) |tokens| tokens.deinit(self.gpa);
     self.tokens = null;
 }
@@ -134,7 +129,7 @@ fn save(self: *Auth) !void {
         .access = tokens.access,
         .refresh = tokens.refresh,
         .expires_ms = tokens.expires_ms,
-    }, .{ .drop_flat = true });
+    });
 }
 
 const Callback = struct { code: []const u8, state: []const u8 };
