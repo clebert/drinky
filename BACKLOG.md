@@ -68,13 +68,25 @@ Extension seams referenced here:
       price and context window), resolved in `wire.zig` to Anthropic's `output_config.effort`: a
       level a model lacks folds onto the nearest it has (Sonnet 4.6 has no `xhigh`, so it maps to
       `high`), so the default effort works on every model without the user knowing.
-- [ ] **`/cache-ttl`** — toggle the Anthropic cache write TTL between 5-minute (default) and 1-hour,
-      gated on provider support. Threads a TTL choice into `wire.zig`'s `cache_control`
-      (`{"type":"ephemeral","ttl":"1h"}`) and into the cost model: the 1-hour write premium is 2x
-      base input vs 1.25x for 5-minute, so `models.zig` needs a per-TTL write rate (a
-      `cache_write_1h` alongside the current 5-minute `cache_write`). A uniform TTL across
-      breakpoints sidesteps the "1h-before-5min ordering" rule. Payoff is narrow: 1-hour only helps
-      a prefix reused after the 5-minute window but within the hour; otherwise it is a 2x write tax.
+- [ ] **`/cache-retention`** — expose the active account/model's prompt-cache retention choices
+      rather than assuming providers share one TTL. Anthropic supports `5m` (default) and `1h`
+      through each
+      breakpoint's `cache_control.ttl`; use one TTL across all breakpoints to sidestep the
+      "1h-before-5m ordering" rule. Its 1-hour write premium is 2x base input vs 1.25x for 5-minute,
+      so `models.zig` needs a per-TTL write rate (`cache_write_1h` beside the current 5-minute
+      `cache_write`). The payoff is narrow: 1-hour only helps a prefix reused after the 5-minute
+      window but within the hour; otherwise it is a 2x write tax. OpenAI must be model-gated:
+      GPT-5.6+ accepts request-wide `prompt_cache_options.ttl`, but `30m` is currently both its only
+      value and its default minimum lifetime, so the built-in OpenAI models offer no actual choice.
+      Earlier models use the deprecated `prompt_cache_retention` policy instead of an exact TTL,
+      with model-dependent support for `in_memory` and `24h`; `in_memory` usually lasts 5–10 minutes
+      of inactivity (at most 1 hour). Where both policies are supported, the omitted-field default
+      is `24h` without ZDR and `in_memory` with ZDR. Encode model wire support separately from
+      account-level policy, treat these durations as retention guarantees/policies rather than exact
+      deletion deadlines, and never guess: when policy is unknown omit the field and report the
+      provider default; when only one value is supported report it instead of opening a picker. The
+      choice belongs only to the active account/model; `/model` resets it to the omitted provider
+      default and reports that transition rather than translating a provider-specific value.
 - [ ] **`/handoff`** — summarize/compact the current conversation and start fresh with the summary
       carried over, to reclaim context. Once **Commit partial turns to history on cancel** lands,
       compaction must also summarize cancelled turns and their synthesized "cancelled"
@@ -130,7 +142,15 @@ Extension seams referenced here:
 - [ ] **Subagents.** User-maintained agent definitions — each its own prompt and allowed-tools set.
       Needs: a nested agent loop reachable from a tool/command, agent definitions loaded from disk,
       per-agent tool allowlists enforced in dispatch, and a provider handle exposed via
-      `tool/Context.zig` (already anticipated there). Backs `/subagent`.
+      `tool/Context.zig` (already anticipated there). Start with one nesting level: a bounded,
+      non-recursive scheduler drives root and child loops from explicit task state rather than
+      calling a child `Agent.run` from parent tool dispatch, and a child cannot invoke another
+      subagent. Each child propagates usage/cost deltas that the parent folds exactly once, never a
+      cumulative snapshot. Failed/cancelled runs contribute whatever usage the provider reported.
+      Keep root-agent and subagent cost subtotals so status can show
+      `$5.00 (+$2.00)` (root plus all subagents), and include both in aggregate cost, cache savings,
+      and per-model totals without replacing the root request's context/cache gauges with a child's
+      last usage. Backs `/subagent`.
 - [ ] **Persist the active account and model across sessions.** `/model` switches and the startup
       account are session-only, so a restart falls back to the first authenticated account (enum
       order) and its configured/compiled default model. Remember the last-used account+model
@@ -138,6 +158,18 @@ Extension seams referenced here:
       be shared, e.g. committed across installations), so it wants a separate local state file — and
       a deliberate naming choice for the split (a shared `config` vs. a local `settings`/state
       file), not an ad-hoc second file.
+- [ ] **Save and resume conversations.** Persist the durable agent history and conversation-owned
+      metadata so a conversation can reopen after restart rather than starting empty. The OpenAI
+      `prompt_cache_key` is part of that state: generate it exactly once for a new conversation,
+      keep it stable across turns, retries, and account/model switches, serialize it beside the
+      history, and restore it verbatim so resuming soon enough with the same OpenAI account and
+      unchanged prefix can reuse the provider's cache. Rotate it only when intentionally starting a
+      fresh conversation (including `/handoff`); an older save with no key gets a newly generated
+      one. A saved provider/billing-product enum is not sufficient provenance for opaque reasoning:
+      persist a durable, non-secret provider-principal identity and replay such blocks only when it
+      matches, otherwise drop them. This is separate from the machine-local last-account/model
+      preference above. Before implementation, define checkpoint timing, the storage location and
+      resume-selection UX; the on-disk format must be versioned, atomic, and owner-only.
 
 ## Providers & efficiency
 
@@ -167,8 +199,8 @@ Extension seams referenced here:
       (`{ "anthropic": { "claude-opus-4-8": { … } } }`), to override or extend the compiled defaults
       so users control pricing, context windows, output caps, and the per-model reasoning-effort
       maps (today compiled `EffortMap`s) without a rebuild. Compiled defaults stay authoritative, so
-      a known model always has a known window; the file only patches or adds. Ties into `/cache-ttl`
-      (per-TTL write rates) and the `/model` / `/effort` commands.
+      a known model always has a known window; the file only patches or adds. Ties into
+      `/cache-retention` (per-TTL write rates) and the `/model` / `/effort` commands.
 - [x] **Other providers (OpenAI).** An `openai/` module (Responses wire + SSE transport) sits behind
       the two-axis provider seam; the neutral item model, `/model`, `/effort`, caching, and stats
       are provider-agnostic and reconcile with it. Two accounts share it: `openai_api` (env
