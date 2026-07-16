@@ -262,7 +262,10 @@ Extension seams referenced here:
       transcript rewind derive from — a parallel UI-side heuristic would let the two disagree and
       reintroduce the divergence **Show only committed content in the transcript** exists to kill.
       Pairs with that item (the still-uncommitted tail is what gets rewound) and ties into the
-      **Permission model** and **Bash tool**.
+      **Permission model** and **Bash tool**. Landing it needs test infrastructure that does not
+      exist yet — a scripted stream that can raise the cancel at a chosen event, and a way to drive
+      the tool-round loop against fake tools in isolation (today's tests exercise reply parsing
+      directly, never the full turn loop) — so build those first and size the work to include them.
 - [ ] **Configurable tool-round cap.** The per-turn tool-round loop is bounded by a compiled-in 50
       rounds (`rounds_max` in `lib/ai/Agent.zig`), failing cleanly on overrun. Expose it via
       `config.json` (folded through `src/Config.zig` like the `request` section) with 50 as the
