@@ -1,7 +1,8 @@
-//! The Messages API transport: sends a serialized request with the OAuth
-//! identity headers and exposes the response as a pull stream of decoded SSE
-//! events. Knows nothing about conversation state or tools — it turns bytes
-//! into `Event`s.
+//! The Messages API transport: sends a serialized request and exposes the
+//! response as a pull stream of decoded SSE events. Knows nothing about
+//! conversation state or tools — it turns bytes into `Event`s. The identity it
+//! sends forks by `Identity`: the subscription path carries the OAuth Bearer
+//! token and the Claude Code headers; the API-key path carries only `x-api-key`.
 
 const std = @import("std");
 
@@ -11,7 +12,18 @@ const net = @import("../net.zig");
 const Transport = @This();
 
 const messages_url = "https://api.anthropic.com/v1/messages";
+const anthropic_version = "2023-06-01";
 const beta = "claude-code-20250219,oauth-2025-04-20";
+const user_agent = "claude-cli/2.1.75";
+
+/// How a request authenticates and identifies itself. Subscription OAuth sends a
+/// `Bearer` access token plus the Claude Code identity headers (`anthropic-beta`,
+/// the `claude-cli` user agent, `x-app`); the API key sends only `x-api-key` with
+/// the caller's own system prompt and no identity headers.
+pub const Identity = union(enum) {
+    subscription: []const u8,
+    api_key: []const u8,
+};
 
 /// Statuses worth retrying: rate limiting, request timeout, and the transient
 /// server faults (including Anthropic's 529 "overloaded").
@@ -20,6 +32,7 @@ const retryable_statuses = [_]std.http.Status{ .request_timeout, .too_many_reque
 gpa: std.mem.Allocator,
 io: std.Io,
 timeouts: net.Timeouts,
+identity: Identity,
 
 /// The outcome of decoding one SSE `data:` line. A ping is called out from the
 /// other frames so the idle window can discount it: only a `ping` fails to count
@@ -210,11 +223,11 @@ pub const Stream = struct {
 /// send, and receive-head phase is bounded by the connect timeout; on expiry (or
 /// any failure) `out` is torn down and `error.Timeout` surfaces, so a caller that
 /// sees an error never owns `out`.
-pub fn send(self: *Transport, out: *Stream, body: []const u8, access_token: []const u8) !void {
+pub fn send(self: *Transport, out: *Stream, body: []const u8) !void {
     out.io = self.io;
     out.idle_ms = self.timeouts.idle_ms;
     out.established = false;
-    net.withTimeout(self.io, self.timeouts.connect_ms, connect, .{ self, out, body, access_token }) catch |err| {
+    net.withTimeout(self.io, self.timeouts.connect_ms, connect, .{ self, out, body }) catch |err| {
         // The timeout races `connect`, so a connect that finished right at the
         // deadline can still surface as `error.Timeout`. `established` (set last
         // by a full connect) marks that fully-built stream — free it here — apart
@@ -224,7 +237,7 @@ pub fn send(self: *Transport, out: *Stream, body: []const u8, access_token: []co
     };
 }
 
-fn connect(self: *Transport, out: *Stream, body: []const u8, access_token: []const u8) anyerror!void {
+fn connect(self: *Transport, out: *Stream, body: []const u8) anyerror!void {
     out.gpa = self.gpa;
     out.client = .{ .allocator = self.gpa, .io = self.io };
     errdefer out.client.deinit();
@@ -233,26 +246,43 @@ fn connect(self: *Transport, out: *Stream, body: []const u8, access_token: []con
     out.retry_after_ms = null;
     out.usage = .{};
 
-    const authorization = try std.fmt.allocPrint(self.gpa, "Bearer {s}", .{access_token});
-    defer self.gpa.free(authorization);
+    // The Bearer header outlives the send below (which happens after the request
+    // is built), so allocate it at connect scope; the API-key path needs none.
+    const authorization: ?[]u8 = switch (self.identity) {
+        .subscription => |token| try std.fmt.allocPrint(self.gpa, "Bearer {s}", .{token}),
+        .api_key => null,
+    };
+    defer if (authorization) |value| self.gpa.free(value);
 
+    // Read the event stream uncompressed on both paths. SSE is consumed one line
+    // at a time as chunks arrive, so a verbatim body keeps event delivery
+    // independent of any decompressor's own buffering.
     const uri = try std.Uri.parse(messages_url);
-    out.request = try out.client.request(.POST, uri, .{
-        .headers = .{
-            .content_type = .{ .override = "application/json" },
-            .authorization = .{ .override = authorization },
-            .user_agent = .{ .override = "claude-cli/2.1.75" },
-            // Read the event stream uncompressed. SSE is consumed one line at
-            // a time as chunks arrive, so a verbatim body keeps event delivery
-            // independent of any decompressor's own buffering.
-            .accept_encoding = .{ .override = "identity" },
-        },
-        .extra_headers = &.{
-            .{ .name = "anthropic-version", .value = "2023-06-01" },
-            .{ .name = "anthropic-beta", .value = beta },
-            .{ .name = "x-app", .value = "cli" },
-        },
-    });
+    out.request = switch (self.identity) {
+        .subscription => try out.client.request(.POST, uri, .{
+            .headers = .{
+                .content_type = .{ .override = "application/json" },
+                .authorization = .{ .override = authorization.? },
+                .user_agent = .{ .override = user_agent },
+                .accept_encoding = .{ .override = "identity" },
+            },
+            .extra_headers = &.{
+                .{ .name = "anthropic-version", .value = anthropic_version },
+                .{ .name = "anthropic-beta", .value = beta },
+                .{ .name = "x-app", .value = "cli" },
+            },
+        }),
+        .api_key => |key| try out.client.request(.POST, uri, .{
+            .headers = .{
+                .content_type = .{ .override = "application/json" },
+                .accept_encoding = .{ .override = "identity" },
+            },
+            .extra_headers = &.{
+                .{ .name = "x-api-key", .value = key },
+                .{ .name = "anthropic-version", .value = anthropic_version },
+            },
+        }),
+    };
     errdefer out.request.deinit();
 
     // A cancel during the calls below lands before Agent.run arms its

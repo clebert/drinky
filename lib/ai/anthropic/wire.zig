@@ -7,11 +7,16 @@ const std = @import("std");
 const llm = @import("../llm.zig");
 const models = @import("../models.zig");
 
-/// Required first system block for subscription OAuth tokens.
+/// Required first system block on the subscription OAuth path (the Claude Code
+/// identity). The API-key path omits it and sends only the user's own prompt.
 pub const system_header = "You are Claude Code, Anthropic's official CLI for Claude.";
 
 /// Serialize `request` into an owned JSON body; caller frees the result.
-pub fn serialize(gpa: std.mem.Allocator, request: llm.Request) ![]u8 {
+/// `account` is the active Anthropic account: the subscription path prepends the
+/// Claude Code `system_header` and replays subscription-origin reasoning, while
+/// the API-key path omits the header and replays only api-origin reasoning
+/// (reasoning is kept only on an exact account match).
+pub fn serialize(gpa: std.mem.Allocator, request: llm.Request, account: llm.Account) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
     var json: std.json.Stringify = .{
@@ -49,7 +54,7 @@ pub fn serialize(gpa: std.mem.Allocator, request: llm.Request) ![]u8 {
     // read back next turn. Three of the four allowed breakpoints.
     try json.objectField("system");
     try json.beginArray();
-    try json.write(TextBlock{ .text = system_header });
+    if (account == .anthropic_subscription) try json.write(TextBlock{ .text = system_header });
     try json.write(TextBlock{ .text = request.system, .cache_control = .{} });
     try json.endArray();
 
@@ -84,7 +89,7 @@ pub fn serialize(gpa: std.mem.Allocator, request: llm.Request) ![]u8 {
             try json.beginArray();
             open_role = role;
         }
-        try writeItem(&json, item, index == request.items.len - 1, reasoning != null);
+        try writeItem(&json, item, index == request.items.len - 1, reasoning != null, account);
     }
     if (open_role != null) try endMessage(&json);
     try json.endArray();
@@ -211,15 +216,16 @@ fn endMessage(json: *std.json.Stringify) !void {
     try json.endObject();
 }
 
-fn writeItem(json: *std.json.Stringify, item: llm.Item, cache: bool, emit_thinking: bool) !void {
+fn writeItem(json: *std.json.Stringify, item: llm.Item, cache: bool, emit_thinking: bool, account: llm.Account) !void {
     const control: ?CacheControl = if (cache) .{} else null;
     switch (item) {
         .message => |message| try json.write(TextBlock{ .text = message.text, .cache_control = control }),
         // Reasoning sits only at the head of an assistant message, never as the
-        // cached last block, so it carries no cache breakpoint. A foreign blob is
-        // dropped whole (its signature can't be verified here), and with
-        // reasoning off it is dropped too: the provider would only strip it.
-        .reasoning => |reasoning| if (emit_thinking and reasoning.origin == .anthropic)
+        // cached last block, so it carries no cache breakpoint. A blob from any
+        // other account is dropped whole (its signature can't be verified here),
+        // and with reasoning off it is dropped too: the provider would only strip
+        // it.
+        .reasoning => |reasoning| if (emit_thinking and reasoning.origin == account)
             try writeThinking(json, reasoning),
         // The model emits tool arguments as JSON already, so embed them verbatim.
         .tool_call => |call| try json.write(ToolUseBlock{
@@ -261,7 +267,7 @@ test serialize {
         .system = "be terse",
         .items = &items,
         .tools = &tools,
-    });
+    }, .anthropic_subscription);
     defer std.testing.allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
@@ -299,7 +305,7 @@ test "tool_call arguments pass through raw, empty becomes an empty object" {
         .system = "s",
         .items = &items,
         .tools = &.{},
-    });
+    }, .anthropic_subscription);
     defer std.testing.allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
@@ -334,7 +340,7 @@ test "cache_control marks the system prompt, last tool, and last message block" 
         .system = "sys",
         .items = &items,
         .tools = &tools,
-    });
+    }, .anthropic_subscription);
     defer std.testing.allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
@@ -360,8 +366,8 @@ test "cache_control marks the system prompt, last tool, and last message block" 
 
 test "effort turns on adaptive thinking with the named level, max_tokens untouched" {
     const items = [_]llm.Item{
-        .{ .reasoning = .{ .text = "weigh it", .blob = "sig", .origin = .anthropic } },
-        .{ .reasoning = .{ .text = "", .blob = "secret", .redacted = true, .origin = .anthropic } },
+        .{ .reasoning = .{ .text = "weigh it", .blob = "sig", .origin = .anthropic_subscription } },
+        .{ .reasoning = .{ .text = "", .blob = "secret", .redacted = true, .origin = .anthropic_subscription } },
         .{ .message = .{ .role = .assistant, .text = "answer" } },
     };
     const body = try serialize(std.testing.allocator, .{
@@ -371,7 +377,7 @@ test "effort turns on adaptive thinking with the named level, max_tokens untouch
         .items = &items,
         .tools = &.{},
         .effort = .xhigh,
-    });
+    }, .anthropic_subscription);
     defer std.testing.allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
@@ -403,7 +409,7 @@ test "effort is dropped for a model with no table entry" {
         .items = &items,
         .tools = &.{},
         .effort = .max,
-    });
+    }, .anthropic_subscription);
     defer std.testing.allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
@@ -423,7 +429,7 @@ test "an effort level a model lacks folds to one it accepts" {
         .items = &items,
         .tools = &.{},
         .effort = .xhigh,
-    });
+    }, .anthropic_subscription);
     defer std.testing.allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
@@ -442,7 +448,7 @@ test "no thinking or output_config when effort is off" {
         .system = "s",
         .items = &items,
         .tools = &.{},
-    });
+    }, .anthropic_subscription);
     defer std.testing.allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
@@ -454,8 +460,8 @@ test "no thinking or output_config when effort is off" {
 
 test "stored thinking is dropped from history when reasoning is off" {
     const items = [_]llm.Item{
-        .{ .reasoning = .{ .text = "weigh it", .blob = "sig", .origin = .anthropic } },
-        .{ .reasoning = .{ .text = "", .blob = "secret", .redacted = true, .origin = .anthropic } },
+        .{ .reasoning = .{ .text = "weigh it", .blob = "sig", .origin = .anthropic_subscription } },
+        .{ .reasoning = .{ .text = "", .blob = "secret", .redacted = true, .origin = .anthropic_subscription } },
         .{ .message = .{ .role = .assistant, .text = "answer" } },
     };
     const body = try serialize(std.testing.allocator, .{
@@ -465,7 +471,7 @@ test "stored thinking is dropped from history when reasoning is off" {
         .items = &items,
         .tools = &.{},
         .effort = .off,
-    });
+    }, .anthropic_subscription);
     defer std.testing.allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
@@ -488,12 +494,12 @@ test "stored thinking is dropped from history when reasoning is off" {
 const golden_items = [_]llm.Item{
     .{ .message = .{ .role = .user, .text = "first" } },
     .{ .message = .{ .role = .user, .text = "second" } },
-    .{ .reasoning = .{ .text = "weigh it", .blob = "sig", .origin = .anthropic } },
-    .{ .reasoning = .{ .text = "", .blob = "secret", .redacted = true, .origin = .anthropic } },
+    .{ .reasoning = .{ .text = "weigh it", .blob = "sig", .origin = .anthropic_subscription } },
+    .{ .reasoning = .{ .text = "", .blob = "secret", .redacted = true, .origin = .anthropic_subscription } },
     .{ .tool_call = .{ .call_id = "t1", .name = "read", .arguments_json = "{\"path\":\"a.zig\"}" } },
     .{ .message = .{ .role = .assistant, .text = "checking" } },
     .{ .tool_result = .{ .call_id = "t1", .content = "contents", .is_error = false } },
-    .{ .reasoning = .{ .text = "more", .blob = "sig2", .origin = .anthropic } },
+    .{ .reasoning = .{ .text = "more", .blob = "sig2", .origin = .anthropic_subscription } },
     .{ .tool_call = .{ .call_id = "t2", .name = "write", .arguments_json = "{\"path\":\"b\"}" } },
     .{ .tool_result = .{ .call_id = "t2", .content = "done", .is_error = true } },
     .{ .message = .{ .role = .assistant, .text = "all set" } },
@@ -510,7 +516,8 @@ const golden_off =
 // Byte-identity with the pre-reshape output guards the pure-refactor claim and
 // Anthropic's server-side prompt cache: a changed prefix invalidates the cache
 // across a deploy. Serializing on and off proves reasoning-off drops the
-// thinking blocks and the reasoning config with no other byte change.
+// thinking blocks and the reasoning config with no other byte change. Both use
+// the subscription account, whose reasoning origin matches so the blocks replay.
 test "serialized bytes match the pre-reshape wire output" {
     const on = try serialize(std.testing.allocator, .{
         .model = "claude-opus-4-8",
@@ -519,7 +526,7 @@ test "serialized bytes match the pre-reshape wire output" {
         .items = &golden_items,
         .tools = &.{},
         .effort = .xhigh,
-    });
+    }, .anthropic_subscription);
     defer std.testing.allocator.free(on);
     try std.testing.expectEqualStrings(golden_on, on);
 
@@ -530,7 +537,61 @@ test "serialized bytes match the pre-reshape wire output" {
         .items = &golden_items,
         .tools = &.{},
         .effort = .off,
-    });
+    }, .anthropic_subscription);
     defer std.testing.allocator.free(off);
     try std.testing.expectEqualStrings(golden_off, off);
+}
+
+// The API-key account drops the Claude Code `system_header` (sending only the
+// user's own system prompt) and replays reasoning tagged with its own account,
+// with every other block byte-identical to the subscription path. This fixture
+// covers a user turn, an api-origin thinking block replayed at the assistant
+// head, an interleaved tool call, and the cached final text block.
+const golden_items_api = [_]llm.Item{
+    .{ .message = .{ .role = .user, .text = "first" } },
+    .{ .reasoning = .{ .text = "weigh it", .blob = "sig", .origin = .anthropic_api } },
+    .{ .tool_call = .{ .call_id = "t1", .name = "read", .arguments_json = "{\"path\":\"a.zig\"}" } },
+    .{ .message = .{ .role = .assistant, .text = "all set" } },
+};
+
+const golden_api =
+    \\{"model":"claude-opus-4-8","max_tokens":8192,"stream":true,"thinking":{"type":"adaptive","display":"summarized"},"output_config":{"effort":"xhigh"},"system":[{"type":"text","text":"be terse","cache_control":{"type":"ephemeral"}}],"messages":[{"role":"user","content":[{"type":"text","text":"first"}]},{"role":"assistant","content":[{"type":"thinking","thinking":"weigh it","signature":"sig"},{"type":"tool_use","id":"t1","name":"read","input":{"path":"a.zig"}},{"type":"text","text":"all set","cache_control":{"type":"ephemeral"}}]}]}
+;
+
+test "the api-key account omits the system header and keeps every other block" {
+    const body = try serialize(std.testing.allocator, .{
+        .model = "claude-opus-4-8",
+        .tokens_max = 8192,
+        .system = "be terse",
+        .items = &golden_items_api,
+        .tools = &.{},
+        .effort = .xhigh,
+    }, .anthropic_api);
+    defer std.testing.allocator.free(body);
+    try std.testing.expectEqualStrings(golden_api, body);
+}
+
+test "reasoning is dropped when its origin account differs, even within the vendor" {
+    // A subscription-origin reasoning item serialized under the api-key account:
+    // replay is an exact account match, so it drops though both are Anthropic.
+    const items = [_]llm.Item{
+        .{ .reasoning = .{ .text = "weigh it", .blob = "sig", .origin = .anthropic_subscription } },
+        .{ .message = .{ .role = .assistant, .text = "answer" } },
+    };
+    const body = try serialize(std.testing.allocator, .{
+        .model = "claude-opus-4-8",
+        .tokens_max = 8192,
+        .system = "s",
+        .items = &items,
+        .tools = &.{},
+        .effort = .xhigh,
+    }, .anthropic_api);
+    defer std.testing.allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+    const content = parsed.value.object.get("messages").?.array.items[0].object.get("content").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), content.len);
+    try std.testing.expectEqualStrings("text", content[0].object.get("type").?.string);
+    try std.testing.expectEqualStrings("answer", content[0].object.get("text").?.string);
 }

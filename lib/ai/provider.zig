@@ -14,36 +14,38 @@ const openai = @import("openai/root.zig");
 const openai_url = "https://api.openai.com/v1/responses";
 const codex_url = "https://chatgpt.com/backend-api/codex/responses";
 
-/// What a client needs to authenticate, tagged by the provider it belongs to.
-/// Anthropic and Codex hold a subscription `Auth` (owned by the caller, refreshed
-/// on demand); the API-key provider holds a bare key (owned by the caller). The
-/// active tag picks the provider, so `Client.init` needs no separate selector.
-pub const Credentials = union(llm.Provider) {
-    anthropic: *anthropic.Auth,
-    openai: []const u8,
-    openai_codex: *openai.Auth,
+/// What a client needs to authenticate, tagged by the account it belongs to. A
+/// subscription account holds an OAuth `Auth` (owned by the caller, refreshed on
+/// demand); an API account holds a bare key (owned by the caller). The active tag
+/// picks the account, so `Client.init` needs no separate selector.
+pub const Credentials = union(llm.Account) {
+    anthropic_api: []const u8,
+    anthropic_subscription: *anthropic.Auth,
+    openai_api: []const u8,
+    openai_subscription: *openai.Auth,
 };
 
-pub const Client = union(llm.Provider) {
-    anthropic: Anthropic,
-    openai: Openai,
-    openai_codex: Codex,
+pub const Client = union(llm.Account) {
+    anthropic_api: ApiKey,
+    anthropic_subscription: AnthropicSubscription,
+    openai_api: ApiKey,
+    openai_subscription: OpenaiSubscription,
 
-    const Anthropic = struct {
-        gpa: std.mem.Allocator,
-        io: std.Io,
-        auth: *anthropic.Auth,
-        timeouts: net.Timeouts,
-    };
-
-    const Openai = struct {
+    const ApiKey = struct {
         gpa: std.mem.Allocator,
         io: std.Io,
         key: []const u8,
         timeouts: net.Timeouts,
     };
 
-    const Codex = struct {
+    const AnthropicSubscription = struct {
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        auth: *anthropic.Auth,
+        timeouts: net.Timeouts,
+    };
+
+    const OpenaiSubscription = struct {
         gpa: std.mem.Allocator,
         io: std.Io,
         auth: *openai.Auth,
@@ -57,33 +59,57 @@ pub const Client = union(llm.Provider) {
         timeouts: net.Timeouts,
     ) Client {
         return switch (credentials) {
-            .anthropic => |auth| .{ .anthropic = .{ .gpa = gpa, .io = io, .auth = auth, .timeouts = timeouts } },
-            .openai => |key| .{ .openai = .{ .gpa = gpa, .io = io, .key = key, .timeouts = timeouts } },
-            .openai_codex => |auth| .{ .openai_codex = .{ .gpa = gpa, .io = io, .auth = auth, .timeouts = timeouts } },
+            .anthropic_api => |key| .{ .anthropic_api = .{ .gpa = gpa, .io = io, .key = key, .timeouts = timeouts } },
+            .anthropic_subscription => |auth| .{ .anthropic_subscription = .{ .gpa = gpa, .io = io, .auth = auth, .timeouts = timeouts } },
+            .openai_api => |key| .{ .openai_api = .{ .gpa = gpa, .io = io, .key = key, .timeouts = timeouts } },
+            .openai_subscription => |auth| .{ .openai_subscription = .{ .gpa = gpa, .io = io, .auth = auth, .timeouts = timeouts } },
         };
     }
 
-    /// The provider backing this client.
-    pub fn kind(self: *const Client) llm.Provider {
+    /// The account backing this client — vendor and billing product.
+    pub fn account(self: *const Client) llm.Account {
         return std.meta.activeTag(self.*);
+    }
+
+    /// The vendor backing this client, keying the model table and the wire
+    /// serializer both accounts of a vendor share.
+    pub fn provider(self: *const Client) llm.Provider {
+        return llm.provider(self.account());
     }
 
     /// Open a streaming request for `request`, filling `out` in place. On
     /// success the caller owns `out` and must `deinit` it.
     pub fn send(self: *Client, out: *Stream, request: llm.Request) !void {
         switch (self.*) {
-            .anthropic => |*client| {
-                const token = try client.auth.accessToken();
-                const body = try anthropic.wire.serialize(client.gpa, request);
+            .anthropic_api => |*client| {
+                const body = try anthropic.wire.serialize(client.gpa, request, .anthropic_api);
                 defer client.gpa.free(body);
-                out.* = .{ .anthropic = undefined };
-                var transport: anthropic.Transport = .{ .gpa = client.gpa, .io = client.io, .timeouts = client.timeouts };
-                try transport.send(&out.anthropic, body, token);
+                out.* = .{ .anthropic_api = undefined };
+                var transport: anthropic.Transport = .{
+                    .gpa = client.gpa,
+                    .io = client.io,
+                    .timeouts = client.timeouts,
+                    .identity = .{ .api_key = client.key },
+                };
+                try transport.send(&out.anthropic_api, body);
             },
-            .openai => |*client| {
-                const body = try openai.wire.serialize(client.gpa, request, .openai);
+            .anthropic_subscription => |*client| {
+                const token = try client.auth.accessToken();
+                const body = try anthropic.wire.serialize(client.gpa, request, .anthropic_subscription);
                 defer client.gpa.free(body);
-                out.* = .{ .openai = undefined };
+                out.* = .{ .anthropic_subscription = undefined };
+                var transport: anthropic.Transport = .{
+                    .gpa = client.gpa,
+                    .io = client.io,
+                    .timeouts = client.timeouts,
+                    .identity = .{ .subscription = token },
+                };
+                try transport.send(&out.anthropic_subscription, body);
+            },
+            .openai_api => |*client| {
+                const body = try openai.wire.serialize(client.gpa, request, .openai_api);
+                defer client.gpa.free(body);
+                out.* = .{ .openai_api = undefined };
                 var transport: openai.Transport = .{
                     .gpa = client.gpa,
                     .io = client.io,
@@ -91,13 +117,13 @@ pub const Client = union(llm.Provider) {
                     .endpoint = openai_url,
                     .account_id = "",
                 };
-                try transport.send(&out.openai, body, client.key);
+                try transport.send(&out.openai_api, body, client.key);
             },
-            .openai_codex => |*client| {
+            .openai_subscription => |*client| {
                 const token = try client.auth.accessToken();
-                const body = try openai.wire.serialize(client.gpa, request, .openai_codex);
+                const body = try openai.wire.serialize(client.gpa, request, .openai_subscription);
                 defer client.gpa.free(body);
-                out.* = .{ .openai_codex = undefined };
+                out.* = .{ .openai_subscription = undefined };
                 var transport: openai.Transport = .{
                     .gpa = client.gpa,
                     .io = client.io,
@@ -105,19 +131,20 @@ pub const Client = union(llm.Provider) {
                     .endpoint = codex_url,
                     .account_id = client.auth.accountId(),
                 };
-                try transport.send(&out.openai_codex, body, token);
+                try transport.send(&out.openai_subscription, body, token);
             },
         }
     }
 };
 
-/// A single request in flight, decoding to neutral `llm.Event`s. The two openai
-/// arms share the same transport stream — they differ only in how the request
-/// was sent, not in how the response decodes.
-pub const Stream = union(llm.Provider) {
-    anthropic: anthropic.Transport.Stream,
-    openai: openai.Transport.Stream,
-    openai_codex: openai.Transport.Stream,
+/// A single request in flight, decoding to neutral `llm.Event`s. Both accounts of
+/// a vendor share that vendor's transport stream — they differ only in how the
+/// request was sent, not in how the response decodes.
+pub const Stream = union(llm.Account) {
+    anthropic_api: anthropic.Transport.Stream,
+    anthropic_subscription: anthropic.Transport.Stream,
+    openai_api: openai.Transport.Stream,
+    openai_subscription: openai.Transport.Stream,
 
     pub fn deinit(self: *Stream) void {
         switch (self.*) {
@@ -172,19 +199,25 @@ pub const Stream = union(llm.Provider) {
     }
 };
 
-test "init selects the arm matching the credentials" {
+test "init selects the arm matching the credentials, with the right vendor" {
     const gpa = std.testing.allocator;
-    const anthropic_client = Client.init(gpa, std.testing.io, .{ .anthropic = undefined }, .{});
-    try std.testing.expectEqual(llm.Provider.anthropic, anthropic_client.kind());
-    const key_client = Client.init(gpa, std.testing.io, .{ .openai = "sk-test" }, .{});
-    try std.testing.expectEqual(llm.Provider.openai, key_client.kind());
-    const codex_client = Client.init(gpa, std.testing.io, .{ .openai_codex = undefined }, .{});
-    try std.testing.expectEqual(llm.Provider.openai_codex, codex_client.kind());
+    const subscription = Client.init(gpa, std.testing.io, .{ .anthropic_subscription = undefined }, .{});
+    try std.testing.expectEqual(llm.Account.anthropic_subscription, subscription.account());
+    try std.testing.expectEqual(llm.Provider.anthropic, subscription.provider());
+    const anthropic_key = Client.init(gpa, std.testing.io, .{ .anthropic_api = "sk-ant" }, .{});
+    try std.testing.expectEqual(llm.Account.anthropic_api, anthropic_key.account());
+    try std.testing.expectEqual(llm.Provider.anthropic, anthropic_key.provider());
+    const openai_key = Client.init(gpa, std.testing.io, .{ .openai_api = "sk-test" }, .{});
+    try std.testing.expectEqual(llm.Account.openai_api, openai_key.account());
+    try std.testing.expectEqual(llm.Provider.openai, openai_key.provider());
+    const codex = Client.init(gpa, std.testing.io, .{ .openai_subscription = undefined }, .{});
+    try std.testing.expectEqual(llm.Account.openai_subscription, codex.account());
+    try std.testing.expectEqual(llm.Provider.openai, codex.provider());
 }
 
 test "usageSoFar reads accumulated usage through the stream seam" {
-    var stream: Stream = .{ .anthropic = undefined };
-    stream.anthropic.usage = .{ .input = 7, .output = 3, .cache_read = 90 };
+    var stream: Stream = .{ .anthropic_subscription = undefined };
+    stream.anthropic_subscription.usage = .{ .input = 7, .output = 3, .cache_read = 90 };
     try std.testing.expectEqual(@as(u64, 7), stream.usageSoFar().input);
     try std.testing.expectEqual(@as(u64, 3), stream.usageSoFar().output);
     try std.testing.expectEqual(@as(u64, 90), stream.usageSoFar().cache_read);

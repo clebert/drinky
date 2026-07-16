@@ -290,9 +290,9 @@ fn readReply(
     handler: anytype,
 ) ![]const llm.Item {
     const arena = self.arena.allocator();
-    // Tag reasoning with the provider that produced it, so a serializer replays
-    // only its own opaque blobs and drops a foreign reasoning item whole.
-    const origin = self.client.kind();
+    // Tag reasoning with the account that produced it, so a serializer replays
+    // its blobs only for the exact same account and drops any other whole.
+    const origin = self.client.account();
     var items: std.ArrayList(llm.Item) = .empty;
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(self.gpa);
@@ -473,7 +473,7 @@ fn flushThinking(
     blob: *std.ArrayList(u8),
     reasoning_id: *std.ArrayList(u8),
     in_thinking: *bool,
-    origin: llm.Provider,
+    origin: llm.Account,
 ) !void {
     if (!in_thinking.*) return;
     try items.append(arena, .{ .reasoning = .{
@@ -513,7 +513,7 @@ test "usage is attributed to the model that produced it across a switch" {
     const gpa = std.testing.allocator;
     const sonnet = models.get(.anthropic, "claude-sonnet-4-6").?;
     const opus = models.get(.anthropic, "claude-opus-4-8").?;
-    const client = provider.Client.init(gpa, std.testing.io, .{ .anthropic = undefined }, .{});
+    const client = provider.Client.init(gpa, std.testing.io, .{ .anthropic_subscription = undefined }, .{});
     var agent = Agent.init(gpa, std.testing.io, client, .{
         .model = sonnet,
         .system = "",
@@ -640,7 +640,7 @@ const CaptureHandler = struct {
 
 fn scriptedAgent(gpa: std.mem.Allocator) Agent {
     const model = models.get(.anthropic, "claude-opus-4-8").?;
-    const client = provider.Client.init(gpa, std.testing.io, .{ .anthropic = undefined }, .{});
+    const client = provider.Client.init(gpa, std.testing.io, .{ .anthropic_subscription = undefined }, .{});
     return Agent.init(gpa, std.testing.io, client, .{ .model = model, .system = "", .retry = .{} });
 }
 
@@ -667,7 +667,7 @@ test "readReply assembles a reasoning run, answer, and tool call in stream order
     try std.testing.expectEqualStrings("weigh it", reply[0].reasoning.text);
     try std.testing.expectEqualStrings("sig", reply[0].reasoning.blob);
     try std.testing.expect(!reply[0].reasoning.redacted);
-    try std.testing.expectEqual(llm.Provider.anthropic, reply[0].reasoning.origin);
+    try std.testing.expectEqual(llm.Account.anthropic_subscription, reply[0].reasoning.origin);
     try std.testing.expectEqualStrings("answer", reply[1].message.text);
     try std.testing.expectEqualStrings("t1", reply[2].tool_call.call_id);
     try std.testing.expectEqualStrings("read", reply[2].tool_call.name);
@@ -752,9 +752,9 @@ test "readReply threads a stream-assigned reasoning-item id into the item" {
 
 test "readReply tags reasoning with the active provider as origin" {
     const gpa = std.testing.allocator;
-    // An openai-backed agent must stamp its reasoning items `.openai`, not the
-    // Anthropic default, or the openai serializer would drop them as foreign.
-    const client = provider.Client.init(gpa, std.testing.io, .{ .openai = "sk-test" }, .{});
+    // An openai-backed agent must stamp its reasoning items with its own account,
+    // not an Anthropic one, or the openai serializer would drop them as foreign.
+    const client = provider.Client.init(gpa, std.testing.io, .{ .openai_api = "sk-test" }, .{});
     var agent = Agent.init(gpa, std.testing.io, client, .{
         .model = models.get(.openai, "gpt-5.6-sol").?,
         .system = "",
@@ -772,6 +772,6 @@ test "readReply tags reasoning with the active provider as origin" {
     };
     var stream: ScriptedStream = .{ .events = &events };
     const reply = try agent.readReply(&agent.model, &stream, &handler);
-    try std.testing.expectEqual(llm.Provider.openai, reply[0].reasoning.origin);
+    try std.testing.expectEqual(llm.Account.openai_api, reply[0].reasoning.origin);
     try std.testing.expectEqualStrings("rs_1", reply[0].reasoning.id);
 }

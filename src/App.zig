@@ -169,7 +169,7 @@ pub fn run(self: *App, gpa: std.mem.Allocator, io: std.Io, home: []const u8) !vo
     defer self.auth.deinit();
     try self.ensureAuth();
 
-    const client = ai.provider.Client.init(gpa, io, .{ .anthropic = &self.auth }, config.timeouts);
+    const client = ai.provider.Client.init(gpa, io, .{ .anthropic_subscription = &self.auth }, config.timeouts);
     self.agent = ai.Agent.init(gpa, io, client, .{ .model = model_info, .system = system_prompt, .retry = config.retry, .effort = effort });
     defer self.agent.deinit();
 

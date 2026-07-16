@@ -7,6 +7,7 @@ const std = @import("std");
 
 pub const Agent = @import("Agent.zig");
 pub const anthropic = @import("anthropic/root.zig");
+pub const auth_store = @import("auth_store.zig");
 pub const command = @import("command/root.zig");
 pub const llm = @import("llm.zig");
 pub const models = @import("models.zig");

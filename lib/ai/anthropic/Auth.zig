@@ -1,55 +1,55 @@
 //! Credential lifecycle for subscription OAuth: load and persist tokens under
 //! `<home>/.pith/auth.json`, refresh a stale access token on demand, and run
 //! the interactive login (browser + loopback callback). Speaks the protocol
-//! through `oauth`; owns the on-disk state.
+//! through `oauth`; the keyed on-disk store is shared through `auth_store`.
+//!
+//! Credentials live under `"anthropic_subscription"` in the shared keyed file, so
+//! a save is a load-merge-write that never clobbers another account's entry. A
+//! legacy flat file (a top-level `access`, from before the keyed layout) is read
+//! as this account's entry — no forced re-login — and its stale top-level keys are
+//! dropped the first time the file is rewritten keyed.
 
 const std = @import("std");
 
+const auth_store = @import("../auth_store.zig");
 const oauth = @import("oauth.zig");
 
 const Auth = @This();
+
+/// Top-level key this account's credentials live under in `auth.json`.
+const account_key = "anthropic_subscription";
 
 const response_page = "pith authorized \xe2\x80\x94 you can close this tab.";
 
 gpa: std.mem.Allocator,
 io: std.Io,
-dir: []const u8,
 path: []const u8,
 tokens: ?oauth.Tokens,
 
 pub fn init(gpa: std.mem.Allocator, io: std.Io, home: []const u8) !Auth {
-    const dir = try std.fs.path.join(gpa, &.{ home, ".pith" });
-    errdefer gpa.free(dir);
-    const path = try std.fs.path.join(gpa, &.{ dir, "auth.json" });
-    return .{ .gpa = gpa, .io = io, .dir = dir, .path = path, .tokens = null };
+    const path = try std.fs.path.join(gpa, &.{ home, ".pith", "auth.json" });
+    return .{ .gpa = gpa, .io = io, .path = path, .tokens = null };
 }
 
 pub fn deinit(self: *Auth) void {
     if (self.tokens) |tokens| tokens.deinit(self.gpa);
     self.gpa.free(self.path);
-    self.gpa.free(self.dir);
 }
 
-/// Load stored tokens. Returns false when no credential file exists yet.
+/// Load stored tokens. Returns false when the file is absent or holds no
+/// Anthropic subscription credential (keyed or legacy-flat).
 pub fn load(self: *Auth) !bool {
-    const data = std.Io.Dir.cwd().readFileAlloc(self.io, self.path, self.gpa, .unlimited) catch |err| switch (err) {
-        error.FileNotFound => return false,
-        else => return err,
-    };
-    defer self.gpa.free(data);
+    var file = (try auth_store.open(self.gpa, self.io, self.path)) orelse return false;
+    defer file.deinit();
 
-    const parsed = try std.json.parseFromSlice(std.json.Value, self.gpa, data, .{});
-    defer parsed.deinit();
-    const object = switch (parsed.value) {
-        .object => |object| object,
-        else => return error.BadCredentials,
-    };
+    // The keyed entry, or a legacy flat file read whole as this account's entry.
+    const entry = file.entry(account_key) orelse file.legacyFlat() orelse return false;
 
-    const access = try self.gpa.dupe(u8, jsonString(object, "access") orelse return error.BadCredentials);
+    const access = try self.gpa.dupe(u8, jsonString(entry, "access") orelse return error.BadCredentials);
     errdefer self.gpa.free(access);
-    const refresh = try self.gpa.dupe(u8, jsonString(object, "refresh") orelse return error.BadCredentials);
+    const refresh = try self.gpa.dupe(u8, jsonString(entry, "refresh") orelse return error.BadCredentials);
     errdefer self.gpa.free(refresh);
-    const expires_ms = jsonInt(object, "expires_ms") orelse return error.BadCredentials;
+    const expires_ms = jsonInt(entry, "expires_ms") orelse return error.BadCredentials;
 
     self.tokens = .{ .access = access, .refresh = refresh, .expires_ms = expires_ms };
     return true;
@@ -109,23 +109,20 @@ pub fn login(self: *Auth, out: *std.Io.Writer) !void {
     try out.flush();
 }
 
+/// The on-disk shape of this account's entry.
+const Entry = struct {
+    access: []const u8,
+    refresh: []const u8,
+    expires_ms: i64,
+};
+
 fn save(self: *Auth) !void {
     const tokens = self.tokens orelse return error.NotAuthenticated;
-    std.Io.Dir.cwd().createDirPath(self.io, self.dir) catch |err| switch (err) {
-        error.PathAlreadyExists => {},
-        else => return err,
-    };
-    const body = try std.fmt.allocPrint(
-        self.gpa,
-        "{{\"access\":\"{s}\",\"refresh\":\"{s}\",\"expires_ms\":{d}}}",
-        .{ tokens.access, tokens.refresh, tokens.expires_ms },
-    );
-    defer self.gpa.free(body);
-    try std.Io.Dir.cwd().writeFile(self.io, .{
-        .sub_path = self.path,
-        .data = body,
-        .flags = .{ .permissions = @enumFromInt(0o600) },
-    });
+    try auth_store.save(self.gpa, self.io, self.path, account_key, Entry{
+        .access = tokens.access,
+        .refresh = tokens.refresh,
+        .expires_ms = tokens.expires_ms,
+    }, .{ .drop_flat = true });
 }
 
 const Callback = struct { code: []const u8, state: []const u8 };

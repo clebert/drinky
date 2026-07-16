@@ -148,59 +148,54 @@ const table = [_]Entry{
         .tokens_max = 128_000,
         .effort = anthropic_effort_no_xhigh,
     } },
-} ++ openaiModels(.openai) ++ openaiModels(.openai_codex);
+    // The gpt-5.6 family reaches the same models over the API-key and the
+    // ChatGPT-subscription (Codex) backends — only the transport base and auth
+    // differ — so one openai vendor row serves both accounts. Standard-tier
+    // pricing, per million tokens; 1.05M context, 128K max output.
+    .{ .provider = .openai, .model = .{
+        .name = "gpt-5.6-sol",
+        .input = 5,
+        .output = 30,
+        .cache_read = 0.5,
+        .cache_write = 6.25,
+        .context_window = 1_050_000,
+        .tokens_max = 128_000,
+        .effort = openai_effort,
+    } },
+    .{ .provider = .openai, .model = .{
+        .name = "gpt-5.6-terra",
+        .input = 2.5,
+        .output = 15,
+        .cache_read = 0.25,
+        .cache_write = 3.125,
+        .context_window = 1_050_000,
+        .tokens_max = 128_000,
+        .effort = openai_effort,
+    } },
+    .{ .provider = .openai, .model = .{
+        .name = "gpt-5.6-luna",
+        .input = 1,
+        .output = 6,
+        .cache_read = 0.1,
+        .cache_write = 1.25,
+        .context_window = 1_050_000,
+        .tokens_max = 128_000,
+        .effort = openai_effort,
+    } },
+};
 
-// The gpt-5.6 family is offered identically on the official API-key backend and
-// the ChatGPT-subscription (Codex) backend, so both providers carry the same
-// three entries; only the transport base and auth differ. Standard-tier pricing,
-// per million tokens; 1.05M context, 128K max output.
-fn openaiModels(comptime provider: llm.Provider) [3]Entry {
-    return .{
-        .{ .provider = provider, .model = .{
-            .name = "gpt-5.6-sol",
-            .input = 5,
-            .output = 30,
-            .cache_read = 0.5,
-            .cache_write = 6.25,
-            .context_window = 1_050_000,
-            .tokens_max = 128_000,
-            .effort = openai_effort,
-        } },
-        .{ .provider = provider, .model = .{
-            .name = "gpt-5.6-terra",
-            .input = 2.5,
-            .output = 15,
-            .cache_read = 0.25,
-            .cache_write = 3.125,
-            .context_window = 1_050_000,
-            .tokens_max = 128_000,
-            .effort = openai_effort,
-        } },
-        .{ .provider = provider, .model = .{
-            .name = "gpt-5.6-luna",
-            .input = 1,
-            .output = 6,
-            .cache_read = 0.1,
-            .cache_write = 1.25,
-            .context_window = 1_050_000,
-            .tokens_max = 128_000,
-            .effort = openai_effort,
-        } },
-    };
-}
-
-/// The model `name` offered by `kind`, or null when it is not in the table.
-pub fn get(kind: llm.Provider, name: []const u8) ?Model {
+/// The model `name` offered by `provider`, or null when it is not in the table.
+pub fn get(provider: llm.Provider, name: []const u8) ?Model {
     for (table) |entry| {
-        if (entry.provider == kind and std.mem.eql(u8, entry.model.name, name)) return entry.model;
+        if (entry.provider == provider and std.mem.eql(u8, entry.model.name, name)) return entry.model;
     }
     return null;
 }
 
-/// Append every model offered by `kind` to `out`, in table order.
-pub fn list(kind: llm.Provider, out: *std.ArrayList(Model), gpa: std.mem.Allocator) !void {
+/// Append every model offered by `provider` to `out`, in table order.
+pub fn list(provider: llm.Provider, out: *std.ArrayList(Model), gpa: std.mem.Allocator) !void {
     for (table) |entry| {
-        if (entry.provider == kind) try out.append(gpa, entry.model);
+        if (entry.provider == provider) try out.append(gpa, entry.model);
     }
 }
 

@@ -1,8 +1,9 @@
 //! Translates a neutral `llm.Request` into an OpenAI Responses API JSON body.
-//! Shared by the API-key (`openai`) and ChatGPT-subscription (`openai_codex`)
-//! providers — they differ only in transport base and auth, never wire shape.
-//! Holds no state and does no I/O: callers own the request and its backing
-//! memory; `Transport` sends the bytes this module produces.
+//! Shared by the API-key (`openai_api`) and ChatGPT-subscription
+//! (`openai_subscription`) accounts — they differ only in transport base and
+//! auth, never wire shape. Holds no state and does no I/O: callers own the
+//! request and its backing memory; `Transport` sends the bytes this module
+//! produces.
 
 const std = @import("std");
 
@@ -10,10 +11,10 @@ const llm = @import("../llm.zig");
 const models = @import("../models.zig");
 
 /// Serialize `request` into an owned JSON body; caller frees the result.
-/// `provider` is the active openai arm: it keys the per-model effort lookup and,
-/// through the reasoning origin, guards which stored reasoning items are
-/// replayed (only openai-family blobs, never a foreign Anthropic signature).
-pub fn serialize(gpa: std.mem.Allocator, request: llm.Request, provider: llm.Provider) ![]u8 {
+/// `account` is the active openai account: it keys the per-model effort lookup
+/// (through its vendor) and guards which stored reasoning items are replayed —
+/// only blobs the exact same account produced, never a foreign one.
+pub fn serialize(gpa: std.mem.Allocator, request: llm.Request, account: llm.Account) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
     var json: std.json.Stringify = .{
@@ -30,7 +31,7 @@ pub fn serialize(gpa: std.mem.Allocator, request: llm.Request, provider: llm.Pro
     // Reasoning-only models: steer depth with the named effort (resolved through
     // the per-model map, off floored on `none`) and ask for a readable summary.
     // A null result — an unknown model — omits the config entirely.
-    if (effortName(request, provider)) |effort| {
+    if (effortName(request, account)) |effort| {
         try json.objectField("reasoning");
         try json.write(Reasoning{ .effort = effort });
     }
@@ -64,7 +65,7 @@ pub fn serialize(gpa: std.mem.Allocator, request: llm.Request, provider: llm.Pro
     // stand as their own item — so unlike Anthropic there is nothing to group.
     try json.objectField("input");
     try json.beginArray();
-    for (request.items) |item| try writeItem(&json, gpa, item);
+    for (request.items) |item| try writeItem(&json, gpa, item, account);
     try json.endArray();
 
     try json.objectField("stream");
@@ -77,8 +78,8 @@ pub fn serialize(gpa: std.mem.Allocator, request: llm.Request, provider: llm.Pro
 /// The OpenAI effort name for the request's level, resolved through the model's
 /// effort map, or null to omit the reasoning config. An unknown model resolves
 /// to null; every known openai model floors off on `none`, so it never does.
-fn effortName(request: llm.Request, provider: llm.Provider) ?[]const u8 {
-    const model = models.get(provider, request.model) orelse return null;
+fn effortName(request: llm.Request, account: llm.Account) ?[]const u8 {
+    const model = models.get(llm.provider(account), request.model) orelse return null;
     return model.effort.resolve(request.effort);
 }
 
@@ -89,22 +90,13 @@ const Reasoning = struct {
     summary: []const u8 = "auto",
 };
 
-/// Whether `provider` is an openai arm, so its reasoning blobs (encrypted
-/// content) can be replayed to either openai backend but never to Anthropic.
-fn isOpenAi(provider: llm.Provider) bool {
-    return switch (provider) {
-        .openai, .openai_codex => true,
-        .anthropic => false,
-    };
-}
-
-fn writeItem(json: *std.json.Stringify, gpa: std.mem.Allocator, item: llm.Item) !void {
+fn writeItem(json: *std.json.Stringify, gpa: std.mem.Allocator, item: llm.Item, account: llm.Account) !void {
     switch (item) {
         .message => |message| try writeMessage(json, message),
-        // A foreign reasoning item is dropped whole (its blob can't be replayed
-        // here); an openai one with no blob is dropped too, since it can't be
-        // round-tripped without its encrypted token.
-        .reasoning => |reasoning| if (isOpenAi(reasoning.origin) and reasoning.blob.len > 0)
+        // A reasoning item from any other account is dropped whole (its encrypted
+        // content can't be replayed here); one from this account with no blob is
+        // dropped too, since it can't be round-tripped without that token.
+        .reasoning => |reasoning| if (reasoning.origin == account and reasoning.blob.len > 0)
             try writeReasoning(json, reasoning),
         .tool_call => |call| try writeToolCall(json, call),
         .tool_result => |result| try writeToolResult(json, gpa, result),
@@ -241,7 +233,7 @@ test serialize {
         .items = &items,
         .tools = &tools,
         .effort = .high,
-    }, .openai);
+    }, .openai_api);
     defer std.testing.allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
@@ -291,7 +283,7 @@ test "tool_call arguments serialize as a JSON string, error output is prefixed" 
         .system = "s",
         .items = &items,
         .tools = &.{},
-    }, .openai);
+    }, .openai_api);
     defer std.testing.allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
@@ -308,11 +300,11 @@ test "tool_call arguments serialize as a JSON string, error output is prefixed" 
     try std.testing.expectEqualStrings("ok", input[3].object.get("output").?.string);
 }
 
-test "reasoning replays only openai-family blobs, dropping foreign and blobless" {
+test "reasoning replays only the active account's blobs, dropping foreign and blobless" {
     const items = [_]llm.Item{
-        .{ .reasoning = .{ .text = "weigh it", .blob = "enc", .id = "rs_1", .origin = .openai } },
-        .{ .reasoning = .{ .text = "foreign", .blob = "sig", .id = "", .origin = .anthropic } },
-        .{ .reasoning = .{ .text = "no blob", .blob = "", .id = "rs_2", .origin = .openai } },
+        .{ .reasoning = .{ .text = "weigh it", .blob = "enc", .id = "rs_1", .origin = .openai_subscription } },
+        .{ .reasoning = .{ .text = "foreign", .blob = "sig", .id = "", .origin = .openai_api } },
+        .{ .reasoning = .{ .text = "no blob", .blob = "", .id = "rs_2", .origin = .openai_subscription } },
         .{ .message = .{ .role = .assistant, .text = "done" } },
     };
     const body = try serialize(std.testing.allocator, .{
@@ -321,14 +313,15 @@ test "reasoning replays only openai-family blobs, dropping foreign and blobless"
         .system = "s",
         .items = &items,
         .tools = &.{},
-    }, .openai_codex);
+    }, .openai_subscription);
     defer std.testing.allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
     defer parsed.deinit();
     const input = parsed.value.object.get("input").?.array.items;
-    // Only the first reasoning item (openai origin, has a blob) and the message
-    // survive; the foreign and blobless reasoning items are dropped.
+    // Only the first reasoning item (this account's origin, has a blob) and the
+    // message survive; a different account's item and the blobless one are
+    // dropped — replay is an exact account match, even within the same vendor.
     try std.testing.expectEqual(@as(usize, 2), input.len);
     try std.testing.expectEqualStrings("reasoning", input[0].object.get("type").?.string);
     try std.testing.expectEqualStrings("rs_1", input[0].object.get("id").?.string);
@@ -351,7 +344,7 @@ test "assistant text uses output_text, unknown model omits reasoning" {
         .items = &items,
         .tools = &.{},
         .effort = .high,
-    }, .openai);
+    }, .openai_api);
     defer std.testing.allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
@@ -369,14 +362,14 @@ test "assistant text uses output_text, unknown model omits reasoning" {
 // structural tests above would miss.
 const golden_items = [_]llm.Item{
     .{ .message = .{ .role = .user, .text = "first" } },
-    .{ .reasoning = .{ .text = "think", .blob = "enc1", .id = "rs_1", .origin = .openai } },
+    .{ .reasoning = .{ .text = "think", .blob = "enc1", .id = "rs_1", .origin = .openai_api } },
     .{ .tool_call = .{ .call_id = "call_1", .name = "read", .arguments_json = "{\"path\":\"a.zig\"}" } },
     .{ .message = .{ .role = .assistant, .text = "checking" } },
     .{ .tool_result = .{ .call_id = "call_1", .content = "contents", .is_error = false } },
-    .{ .reasoning = .{ .text = "", .blob = "enc2", .id = "rs_2", .origin = .openai } },
+    .{ .reasoning = .{ .text = "", .blob = "enc2", .id = "rs_2", .origin = .openai_api } },
     .{ .tool_call = .{ .call_id = "call_2", .name = "write", .arguments_json = "{\"path\":\"b\"}" } },
     .{ .tool_result = .{ .call_id = "call_2", .content = "denied", .is_error = true } },
-    .{ .reasoning = .{ .text = "foreign", .blob = "sig", .id = "", .origin = .anthropic } },
+    .{ .reasoning = .{ .text = "foreign", .blob = "sig", .id = "", .origin = .openai_subscription } },
     .{ .message = .{ .role = .assistant, .text = "all set" } },
 };
 
@@ -397,7 +390,7 @@ test "serialized bytes match the expected Responses wire output" {
         .items = &golden_items,
         .tools = &tools,
         .effort = .xhigh,
-    }, .openai);
+    }, .openai_api);
     defer std.testing.allocator.free(body);
     try std.testing.expectEqualStrings(golden, body);
 }

@@ -2,12 +2,38 @@
 //! format to and from these types, so the agent loop and tools depend only on
 //! this module — never on a specific provider. Pure data: no state, no I/O.
 
-/// The model providers the agent core supports: the neutral tag the `provider`
-/// module keys its `Client` union on, and that `models` tags each table entry
-/// with, so both can name a provider without depending on a concrete client.
-/// `openai` is the official API-key backend; `openai_codex` is the same wire
-/// protocol over the ChatGPT-subscription backend (different base and auth).
-pub const Provider = enum { anthropic, openai, openai_codex };
+const std = @import("std");
+
+/// A configured account: a vendor crossed with the billing product that
+/// authorizes its requests. The auth *mechanism* — an API key or an OAuth
+/// subscription — is data held by `provider.Credentials`, not part of the
+/// identity. This is the tag `provider.Client`/`Stream` key on, and the origin
+/// stamped on stored reasoning so only the exact account that produced a blob
+/// replays it.
+pub const Account = enum {
+    /// Per-token platform API, authorized with `x-api-key`.
+    anthropic_api,
+    /// Claude Pro/Max subscription OAuth, authorized with a `Bearer` token and
+    /// the Claude Code identity headers.
+    anthropic_subscription,
+    /// Per-token platform API, authorized with a `Bearer` key.
+    openai_api,
+    /// ChatGPT (Codex) subscription OAuth.
+    openai_subscription,
+};
+
+/// The vendor axis: whose wire protocol and model table an account uses. Both
+/// accounts of a vendor share one serializer and one set of models, so the model
+/// table and the serializers key on this rather than on the full account.
+pub const Provider = enum { anthropic, openai };
+
+/// The vendor an account belongs to.
+pub fn provider(account: Account) Provider {
+    return switch (account) {
+        .anthropic_api, .anthropic_subscription => .anthropic,
+        .openai_api, .openai_subscription => .openai,
+    };
+}
 
 pub const Role = enum { user, assistant };
 
@@ -53,9 +79,11 @@ pub const Item = union(enum) {
         /// OpenAI reasoning-item id, needed to replay the item under
         /// `store:false`; empty for Anthropic.
         id: []const u8 = "",
-        /// Which provider produced `blob`, so a serializer only replays its own
-        /// and drops a foreign reasoning item whole.
-        origin: Provider,
+        /// Which account produced `blob`: a serializer replays a blob only for
+        /// the exact active account and drops any other reasoning item whole,
+        /// since neither a foreign vendor's signature nor another account's token
+        /// can be verified here.
+        origin: Account,
     };
 
     pub const ToolCall = struct {
@@ -149,3 +177,10 @@ pub const Event = union(enum) {
         usage: Usage,
     };
 };
+
+test provider {
+    try std.testing.expectEqual(Provider.anthropic, provider(.anthropic_api));
+    try std.testing.expectEqual(Provider.anthropic, provider(.anthropic_subscription));
+    try std.testing.expectEqual(Provider.openai, provider(.openai_api));
+    try std.testing.expectEqual(Provider.openai, provider(.openai_subscription));
+}

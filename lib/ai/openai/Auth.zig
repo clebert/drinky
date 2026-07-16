@@ -1,61 +1,45 @@
-//! Credential lifecycle for the ChatGPT-subscription (Codex) provider: load and
+//! Credential lifecycle for the ChatGPT-subscription (Codex) account: load and
 //! persist tokens under `<home>/.pith/auth.json`, refresh a stale access token
 //! on demand, and run the interactive login (browser + loopback callback).
-//! Speaks the protocol through `oauth`; owns the on-disk state.
+//! Speaks the protocol through `oauth`; the keyed on-disk store is shared through
+//! `auth_store`.
 //!
-//! Credentials are stored provider-keyed under `"openai-codex"`, and a save is a
-//! load-merge-write of the whole file so it never clobbers another provider's
-//! entry alongside it.
+//! Credentials live under `"openai_subscription"` in the shared keyed file, so a
+//! save is a load-merge-write that never clobbers another account's entry.
 
 const std = @import("std");
 
+const auth_store = @import("../auth_store.zig");
 const oauth = @import("oauth.zig");
 
 const Auth = @This();
 
-/// Top-level key this provider's credentials live under in `auth.json`.
-const provider_key = "openai-codex";
+/// Top-level key this account's credentials live under in `auth.json`.
+const account_key = "openai_subscription";
 
 const response_page = "pith authorized \xe2\x80\x94 you can close this tab.";
 
 gpa: std.mem.Allocator,
 io: std.Io,
-dir: []const u8,
 path: []const u8,
 tokens: ?oauth.Tokens,
 
 pub fn init(gpa: std.mem.Allocator, io: std.Io, home: []const u8) !Auth {
-    const dir = try std.fs.path.join(gpa, &.{ home, ".pith" });
-    errdefer gpa.free(dir);
-    const path = try std.fs.path.join(gpa, &.{ dir, "auth.json" });
-    return .{ .gpa = gpa, .io = io, .dir = dir, .path = path, .tokens = null };
+    const path = try std.fs.path.join(gpa, &.{ home, ".pith", "auth.json" });
+    return .{ .gpa = gpa, .io = io, .path = path, .tokens = null };
 }
 
 pub fn deinit(self: *Auth) void {
     if (self.tokens) |tokens| tokens.deinit(self.gpa);
     self.gpa.free(self.path);
-    self.gpa.free(self.dir);
 }
 
 /// Load stored tokens. Returns false when the file is absent or holds no
-/// `openai-codex` entry (this provider is simply not logged in).
+/// `openai_subscription` entry (this account is simply not logged in).
 pub fn load(self: *Auth) !bool {
-    const data = std.Io.Dir.cwd().readFileAlloc(self.io, self.path, self.gpa, .unlimited) catch |err| switch (err) {
-        error.FileNotFound => return false,
-        else => return err,
-    };
-    defer self.gpa.free(data);
-
-    const parsed = try std.json.parseFromSlice(std.json.Value, self.gpa, data, .{});
-    defer parsed.deinit();
-    const root = switch (parsed.value) {
-        .object => |object| object,
-        else => return error.BadCredentials,
-    };
-    const entry = switch (root.get(provider_key) orelse return false) {
-        .object => |object| object,
-        else => return error.BadCredentials,
-    };
+    var file = (try auth_store.open(self.gpa, self.io, self.path)) orelse return false;
+    defer file.deinit();
+    const entry = file.entry(account_key) orelse return false;
 
     const access = try self.gpa.dupe(u8, jsonString(entry, "access") orelse return error.BadCredentials);
     errdefer self.gpa.free(access);
@@ -131,31 +115,7 @@ pub fn login(self: *Auth, out: *std.Io.Writer) !void {
     try out.flush();
 }
 
-fn save(self: *Auth) !void {
-    const tokens = self.tokens orelse return error.NotAuthenticated;
-    std.Io.Dir.cwd().createDirPath(self.io, self.dir) catch |err| switch (err) {
-        error.PathAlreadyExists => {},
-        else => return err,
-    };
-
-    // Read the whole file first so this provider's entry is merged in without
-    // dropping another provider's — an absent file starts from nothing.
-    const existing: ?[]u8 = std.Io.Dir.cwd().readFileAlloc(self.io, self.path, self.gpa, .unlimited) catch |err| switch (err) {
-        error.FileNotFound => null,
-        else => return err,
-    };
-    defer if (existing) |data| self.gpa.free(data);
-
-    const body = try serializeMerged(self.gpa, existing, tokens);
-    defer self.gpa.free(body);
-    try std.Io.Dir.cwd().writeFile(self.io, .{
-        .sub_path = self.path,
-        .data = body,
-        .flags = .{ .permissions = @enumFromInt(0o600) },
-    });
-}
-
-/// The on-disk shape of one provider's entry.
+/// The on-disk shape of this account's entry.
 const Entry = struct {
     access: []const u8,
     refresh: []const u8,
@@ -163,44 +123,14 @@ const Entry = struct {
     account_id: []const u8,
 };
 
-/// The whole `auth.json` with this provider's `openai-codex` entry set,
-/// preserving every other top-level key by re-emitting it verbatim. An absent,
-/// unparseable, or non-object `existing` starts from a fresh object. Caller
-/// frees the result.
-fn serializeMerged(gpa: std.mem.Allocator, existing: ?[]const u8, tokens: oauth.Tokens) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var json: std.json.Stringify = .{ .writer = &out.writer };
-
-    try json.beginObject();
-    if (existing) |data| {
-        const parsed = std.json.parseFromSlice(std.json.Value, gpa, data, .{}) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => null,
-        };
-        if (parsed) |result| {
-            defer result.deinit();
-            if (result.value == .object) {
-                var entries = result.value.object.iterator();
-                while (entries.next()) |field| {
-                    // Skip our own entry; it is rewritten fresh below.
-                    if (std.mem.eql(u8, field.key_ptr.*, provider_key)) continue;
-                    try json.objectField(field.key_ptr.*);
-                    try json.write(field.value_ptr.*);
-                }
-            }
-        }
-    }
-    try json.objectField(provider_key);
-    try json.write(Entry{
+fn save(self: *Auth) !void {
+    const tokens = self.tokens orelse return error.NotAuthenticated;
+    try auth_store.save(self.gpa, self.io, self.path, account_key, Entry{
         .access = tokens.access,
         .refresh = tokens.refresh,
         .expires_ms = tokens.expires_ms,
         .account_id = tokens.account_id,
-    });
-    try json.endObject();
-
-    return out.toOwnedSlice();
+    }, .{});
 }
 
 const Callback = struct { code: []const u8, state: []const u8 };
@@ -260,51 +190,4 @@ test queryParam {
     defer std.testing.allocator.free(state);
     try std.testing.expectEqualStrings("abc123", code);
     try std.testing.expectEqualStrings("xyz", state);
-}
-
-test "serializeMerged adds the entry, preserving other providers" {
-    const gpa = std.testing.allocator;
-    const tokens: oauth.Tokens = .{
-        .access = "at",
-        .refresh = "rt",
-        .expires_ms = 1234,
-        .account_id = "acct_1",
-    };
-
-    // A legacy flat (implicitly Anthropic) file: the flat keys survive and the
-    // codex entry is added alongside them.
-    const merged = try serializeMerged(gpa, "{\"access\":\"anth\",\"refresh\":\"anthr\",\"expires_ms\":9}", tokens);
-    defer gpa.free(merged);
-    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, merged, .{});
-    defer parsed.deinit();
-    const root = parsed.value.object;
-    try std.testing.expectEqualStrings("anth", root.get("access").?.string);
-    const entry = root.get("openai-codex").?.object;
-    try std.testing.expectEqualStrings("at", entry.get("access").?.string);
-    try std.testing.expectEqualStrings("acct_1", entry.get("account_id").?.string);
-    try std.testing.expectEqual(@as(i64, 1234), entry.get("expires_ms").?.integer);
-}
-
-test "serializeMerged from nothing writes just the entry, and replaces its own" {
-    const gpa = std.testing.allocator;
-    const tokens: oauth.Tokens = .{ .access = "new", .refresh = "rt", .expires_ms = 1, .account_id = "a" };
-
-    const fresh = try serializeMerged(gpa, null, tokens);
-    defer gpa.free(fresh);
-    var parsed = try std.json.parseFromSlice(std.json.Value, gpa, fresh, .{});
-    defer parsed.deinit();
-    try std.testing.expectEqual(@as(usize, 1), parsed.value.object.count());
-    try std.testing.expectEqualStrings("new", parsed.value.object.get("openai-codex").?.object.get("access").?.string);
-
-    // An existing codex entry is replaced, while a sibling provider is kept.
-    const replaced = try serializeMerged(
-        gpa,
-        "{\"anthropic\":{\"access\":\"keep\"},\"openai-codex\":{\"access\":\"old\"}}",
-        tokens,
-    );
-    defer gpa.free(replaced);
-    const parsed_replaced = try std.json.parseFromSlice(std.json.Value, gpa, replaced, .{});
-    defer parsed_replaced.deinit();
-    try std.testing.expectEqualStrings("keep", parsed_replaced.value.object.get("anthropic").?.object.get("access").?.string);
-    try std.testing.expectEqualStrings("new", parsed_replaced.value.object.get("openai-codex").?.object.get("access").?.string);
 }

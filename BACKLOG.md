@@ -135,6 +135,23 @@ Extension seams referenced here:
       `provider.zig` union arm) and an `openai/` module (wire + transport) mirroring `anthropic/`.
       Everything above `provider.zig` is already provider-agnostic. Reconciles with `/model`,
       `/effort`, caching, and stats.
+- [ ] **Account switch: empty assistant content (Anthropic 400).** [Deferred to the account-switch
+      commit — reachable only once the active account can change mid-session.] Reasoning replay is
+      an exact account match (`origin == account` in `anthropic/wire.zig`), so a mid-session account
+      switch drops every reasoning item the old account produced. An assistant run that was
+      reasoning-only (a reasoning item with no following text or tool call — a turn that stopped
+      right after thinking) then serializes to a message envelope with `"content":[]`, which
+      Anthropic rejects with a 400. Not reachable while one account is hardwired per session. Fix
+      when the switch lands: have the serializer skip an assistant envelope that would emit zero
+      blocks (a small look-ahead), and test it against a switch that drops a reasoning-only run.
+- [ ] **Account switch: corrupt `auth.json` clobbers a sibling account on save.** [Deferred to the
+      account-switch commit — blast radius appears only with multiple stored accounts.]
+      `auth_store.serializeMerged` tolerates an unparseable existing file by starting from a fresh
+      object, so a token-refresh save would drop every other account's entry. Guarded today because
+      `load` parses (and errors) before any save, and only one account is ever written; with several
+      accounts persisted, an externally corrupted file could make one account's refresh wipe
+      another's. Fix when the registry lands: make `serializeMerged`/`save` return an error on an
+      unparseable existing file rather than silently starting fresh.
 
 ## Networking & resilience
 

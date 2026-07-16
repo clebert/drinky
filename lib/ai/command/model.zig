@@ -15,11 +15,11 @@ pub const name = "model";
 
 pub fn run(context: *Context, args: []const u8) !Outcome {
     const gpa = context.gpa;
-    const kind = context.agent.client.kind();
+    const vendor = context.agent.client.provider();
     const requested = std.mem.trim(u8, args, " \t");
 
     if (requested.len != 0) {
-        const chosen = models.get(kind, requested) orelse
+        const chosen = models.get(vendor, requested) orelse
             return Outcome.report(gpa, .err, "unknown model: {s}", .{requested});
         context.agent.setModel(chosen);
         return Outcome.report(gpa, .ok, "switched to {s}", .{chosen.name});
@@ -27,7 +27,7 @@ pub fn run(context: *Context, args: []const u8) !Outcome {
 
     var available: std.ArrayList(models.Model) = .empty;
     defer available.deinit(gpa);
-    try models.list(kind, &available, gpa);
+    try models.list(vendor, &available, gpa);
     if (available.items.len == 0) return Outcome.report(gpa, .err, "no models available", .{});
 
     const current = context.agent.model.name;
@@ -52,7 +52,7 @@ pub fn run(context: *Context, args: []const u8) !Outcome {
 }
 
 fn testAgent(gpa: std.mem.Allocator) Agent {
-    const client = provider.Client.init(gpa, std.testing.io, .{ .anthropic = undefined }, .{});
+    const client = provider.Client.init(gpa, std.testing.io, .{ .anthropic_subscription = undefined }, .{});
     return Agent.init(gpa, std.testing.io, client, .{
         .model = models.get(.anthropic, "claude-sonnet-4-6").?,
         .system = "",
