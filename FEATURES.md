@@ -211,6 +211,8 @@ commit history, `BACKLOG.md` (planned work), and `docs/`.
 - When reasoning is enabled, requests a summarized reasoning stream at the resolved effort level and
   round-trips each reasoning item's encrypted payload and id verbatim so later turns replay it; no
   server-side conversation state is retained between requests.
+- Relies on OpenAI's automatic server-side prompt caching (no per-block cache markers) and sends a
+  stable per-conversation cache key so a session's growing requests route to one cache.
 - Partitions the prompt token count into cache-read, cache-write, and uncached buckets, so each
   token is billed once at its bucket's rate.
 - Authorized with a platform API key (Bearer).

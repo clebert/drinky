@@ -28,6 +28,17 @@ pub fn serialize(gpa: std.mem.Allocator, request: llm.Request, account: llm.Acco
     try json.objectField("instructions");
     try json.write(request.system);
 
+    // OpenAI prompt caching is automatic and server-side (no per-block markers,
+    // unlike Anthropic): a prefix of >=1024 tokens is cached on its own. The key
+    // only steers routing — it is combined with the prompt-prefix hash so a
+    // session's growing requests land on the same cache — and the gpt-5.6 family
+    // needs it set for the more reliable matching. Omitted when the caller sends
+    // no key.
+    if (request.cache_key.len > 0) {
+        try json.objectField("prompt_cache_key");
+        try json.write(request.cache_key);
+    }
+
     // Reasoning-only models: steer depth with the named effort (resolved through
     // the per-model map; the none level floors on the API's `none`) and ask for
     // a readable summary. A null result — an unknown model — omits the config.
@@ -269,6 +280,42 @@ test serialize {
         schema.get("properties").?.object.get("path").?.object.get("type").?.string,
     );
     try std.testing.expectEqualStrings("path", schema.get("required").?.array.items[0].string);
+}
+
+test "prompt_cache_key is sent when set and omitted when empty" {
+    const items = [_]llm.Item{
+        .{ .message = .{ .role = .user, .text = "hi" } },
+    };
+    const with_key = try serialize(std.testing.allocator, .{
+        .model = "gpt-5.6-sol",
+        .tokens_max = 8,
+        .system = "s",
+        .items = &items,
+        .tools = &.{},
+        .cache_key = "session-abc",
+    }, .openai_api);
+    defer std.testing.allocator.free(with_key);
+    {
+        const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, with_key, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings("session-abc", parsed.value.object.get("prompt_cache_key").?.string);
+    }
+
+    // The default empty key omits the field; OpenAI still caches automatically
+    // server-side.
+    const no_key = try serialize(std.testing.allocator, .{
+        .model = "gpt-5.6-sol",
+        .tokens_max = 8,
+        .system = "s",
+        .items = &items,
+        .tools = &.{},
+    }, .openai_api);
+    defer std.testing.allocator.free(no_key);
+    {
+        const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, no_key, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value.object.get("prompt_cache_key") == null);
+    }
 }
 
 test "tool_call arguments serialize as a JSON string, error output is prefixed" {

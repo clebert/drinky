@@ -44,6 +44,9 @@ stats: Stats,
 /// Steering messages the user submitted mid-turn, drained into the running turn
 /// at each round boundary. Thread-safe: the UI thread pushes, the worker takes.
 steering: Steering,
+/// A stable per-session key sent to providers that route prompt-cache lookups by
+/// it (OpenAI); generated once at init so every turn in the session shares it.
+cache_key: [32]u8,
 
 /// Cumulative dollar cost and cache savings over the session, plus the most
 /// recent message's usage for the cache-hit and context-window gauges. Each
@@ -105,6 +108,8 @@ pub fn init(
     client: ?provider.Client,
     options: struct { model: models.Model, system: []const u8, retry: net.Retry, effort: llm.Effort = .none },
 ) Agent {
+    var seed: [16]u8 = undefined;
+    io.random(&seed);
     return .{
         .gpa = gpa,
         .io = io,
@@ -117,6 +122,7 @@ pub fn init(
         .items = .empty,
         .stats = .{},
         .steering = Steering.init(gpa, io),
+        .cache_key = std.fmt.bytesToHex(seed, .lower),
     };
 }
 
@@ -199,6 +205,7 @@ fn fetchReply(self: *Agent, handler: anytype, base: usize) !?[]const llm.Item {
         .items = self.items.items,
         .tools = &tool.specs,
         .effort = self.effort,
+        .cache_key = &self.cache_key,
     };
     var attempt: u32 = 1;
     while (true) : (attempt += 1) {

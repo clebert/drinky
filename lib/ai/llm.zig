@@ -156,6 +156,11 @@ pub const Request = struct {
     items: []const Item,
     tools: []const Tool,
     effort: Effort = .none,
+    /// A stable per-conversation key a provider may use to improve prompt-cache
+    /// routing; empty to send none. OpenAI combines it with the prompt-prefix
+    /// hash to keep a session's growing requests on one cache; Anthropic ignores
+    /// it (its caching is driven by explicit breakpoints).
+    cache_key: []const u8 = "",
 };
 
 /// Token counts for one assistant message. `input` is uncached prompt tokens;
