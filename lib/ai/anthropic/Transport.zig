@@ -90,6 +90,13 @@ pub const Stream = struct {
         return self.retry_after_ms;
     }
 
+    /// Usage accumulated so far. Anthropic splits it across the stream (prompt
+    /// and cache counts in `message_start`, output in `message_delta`), so this
+    /// grows as those frames arrive and is complete by the stop event.
+    pub fn usageSoFar(self: *const Stream) llm.Usage {
+        return self.usage;
+    }
+
     /// Next decoded event, or null at end of stream.
     pub fn next(self: *Stream) !?llm.Event {
         if (self.parsed) |parsed| {
@@ -301,21 +308,21 @@ fn classify(object: std.json.ObjectMap, kind: []const u8) ?llm.Event {
         if (std.mem.eql(u8, delta_kind, "input_json_delta"))
             return .{ .input_json = asString(delta.get("partial_json")) orelse return null };
         if (std.mem.eql(u8, delta_kind, "thinking_delta"))
-            return .{ .thinking = asString(delta.get("thinking")) orelse return null };
+            return .{ .thinking = .{ .text = asString(delta.get("thinking")) orelse return null } };
         if (std.mem.eql(u8, delta_kind, "signature_delta"))
-            return .{ .thinking_signature = asString(delta.get("signature")) orelse return null };
+            return .{ .thinking_blob = .{ .blob = asString(delta.get("signature")) orelse return null } };
         return null;
     }
     if (std.mem.eql(u8, kind, "content_block_start")) {
         const block = asObject(object.get("content_block")) orelse return null;
         const block_kind = asString(block.get("type")) orelse return null;
         if (std.mem.eql(u8, block_kind, "redacted_thinking"))
-            return .{ .thinking_redacted = asString(block.get("data")) orelse return null };
+            return .{ .thinking_redacted = .{ .blob = asString(block.get("data")) orelse return null } };
         // A `thinking` start carries only empty seeds — its content arrives as
         // deltas — so it, like any other non-tool block, yields no start event.
         if (!std.mem.eql(u8, block_kind, "tool_use")) return null;
         return .{ .tool_use = .{
-            .id = asString(block.get("id")) orelse return null,
+            .call_id = asString(block.get("id")) orelse return null,
             .name = asString(block.get("name")) orelse return null,
         } };
     }
@@ -386,21 +393,21 @@ test classify {
     ;
     const parsed_thinking = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, thinking, .{});
     defer parsed_thinking.deinit();
-    try std.testing.expectEqualStrings("hmm", classify(parsed_thinking.value.object, "content_block_delta").?.thinking);
+    try std.testing.expectEqualStrings("hmm", classify(parsed_thinking.value.object, "content_block_delta").?.thinking.text);
 
     const signature =
         \\{"type":"content_block_delta","delta":{"type":"signature_delta","signature":"sig"}}
     ;
     const parsed_signature = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, signature, .{});
     defer parsed_signature.deinit();
-    try std.testing.expectEqualStrings("sig", classify(parsed_signature.value.object, "content_block_delta").?.thinking_signature);
+    try std.testing.expectEqualStrings("sig", classify(parsed_signature.value.object, "content_block_delta").?.thinking_blob.blob);
 
     const redacted =
         \\{"type":"content_block_start","content_block":{"type":"redacted_thinking","data":"enc"}}
     ;
     const parsed_redacted = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, redacted, .{});
     defer parsed_redacted.deinit();
-    try std.testing.expectEqualStrings("enc", classify(parsed_redacted.value.object, "content_block_start").?.thinking_redacted);
+    try std.testing.expectEqualStrings("enc", classify(parsed_redacted.value.object, "content_block_start").?.thinking_redacted.blob);
 }
 
 test "next walks SSE data lines and ends at stream end" {
@@ -438,6 +445,9 @@ test "next walks SSE data lines and ends at stream end" {
     try std.testing.expectEqual(@as(u64, 42), stop.stop.usage.output);
     try std.testing.expectEqual(@as(u64, 90), stop.stop.usage.cache_read);
     try std.testing.expectEqual(@as(u64, 5), stop.stop.usage.cache_write);
+    // The same totals are visible mid-stream through `usageSoFar`.
+    try std.testing.expectEqual(@as(u64, 10), stream.usageSoFar().input);
+    try std.testing.expectEqual(@as(u64, 42), stream.usageSoFar().output);
     try std.testing.expectEqual(@as(?llm.Event, null), try stream.next());
 }
 

@@ -15,43 +15,60 @@ pub const Role = enum { user, assistant };
 /// reasoning off; the rest match Anthropic's effort ladder.
 pub const Effort = enum { off, low, medium, high, xhigh, max };
 
-pub const Block = union(enum) {
-    thinking: Thinking,
-    text: []const u8,
-    tool_use: ToolUse,
+/// One entry in the flat, ordered conversation history. Every provider
+/// translates its wire format to and from this list; the agent loop appends
+/// items in the exact order the model produced them (reasoning first, then text
+/// and tool calls interleaved as streamed) and a provider serializer replays
+/// them one-item-one-block, sharing a role envelope over a run of same-role
+/// items but never reordering or concatenating.
+pub const Item = union(enum) {
+    /// A user or assistant text turn.
+    message: Message,
+    /// One run of model reasoning (assistant-only).
+    reasoning: Reasoning,
+    /// The model asking to call a tool (assistant-only).
+    tool_call: ToolCall,
+    /// The outcome of a tool call, fed back on the input side.
     tool_result: ToolResult,
+
+    pub const Message = struct {
+        role: Role,
+        text: []const u8,
+    };
 
     /// A run of model reasoning, carried back verbatim on later turns so the
     /// provider accepts the tool calls that followed it.
-    pub const Thinking = struct {
-        /// Human-readable reasoning; empty for a redacted or omitted block.
+    pub const Reasoning = struct {
+        /// Human-visible reasoning/summary; empty when redacted or none.
         text: []const u8,
         /// Opaque token round-tripped unchanged so the provider can verify the
-        /// reasoning: a signature for a normal block, the encrypted payload for
-        /// a redacted one (told apart by `redacted`).
-        signature: []const u8,
+        /// reasoning: Anthropic `signature` / redacted `data`, or OpenAI
+        /// `encrypted_content`. Never cross-fed between providers.
+        blob: []const u8,
         /// The reasoning was withheld by the provider's safety filter; `text` is
-        /// empty and `signature` holds its encrypted payload.
+        /// empty and `blob` holds its encrypted payload.
         redacted: bool = false,
+        /// OpenAI reasoning-item id, needed to replay the item under
+        /// `store:false`; empty for Anthropic.
+        id: []const u8 = "",
+        /// Which provider produced `blob`, so a serializer only replays its own
+        /// and drops a foreign reasoning item whole.
+        origin: Provider,
     };
 
-    pub const ToolUse = struct {
-        id: []const u8,
+    pub const ToolCall = struct {
+        /// Unified call key: Anthropic `tool_use.id` == OpenAI `call_id`.
+        call_id: []const u8,
         name: []const u8,
-        /// Raw JSON object for the tool input; empty means an empty object.
-        input_json: []const u8,
+        /// Raw JSON object for the arguments; empty means an empty object.
+        arguments_json: []const u8,
     };
 
     pub const ToolResult = struct {
-        tool_use_id: []const u8,
+        call_id: []const u8,
         content: []const u8,
         is_error: bool,
     };
-};
-
-pub const Message = struct {
-    role: Role,
-    blocks: []const Block,
 };
 
 pub const Tool = struct {
@@ -73,7 +90,7 @@ pub const Request = struct {
     model: []const u8,
     tokens_max: u32,
     system: []const u8,
-    messages: []const Message,
+    items: []const Item,
     tools: []const Tool,
     effort: Effort = .off,
 };
@@ -101,14 +118,28 @@ pub const Usage = struct {
 pub const Event = union(enum) {
     text: []const u8,
     /// A chunk of streamed reasoning text.
-    thinking: []const u8,
-    /// The signature closing the current reasoning run, carried back verbatim.
-    thinking_signature: []const u8,
+    thinking: Thinking,
+    /// The opaque blob closing the current reasoning run, carried back verbatim.
+    thinking_blob: Blob,
     /// A complete redacted reasoning block: its opaque encrypted payload.
-    thinking_redacted: []const u8,
-    tool_use: struct { id: []const u8, name: []const u8 },
+    thinking_redacted: Blob,
+    tool_use: struct { call_id: []const u8, name: []const u8 },
     input_json: []const u8,
     stop: Stop,
+
+    /// A reasoning text delta tagged with its reasoning-item id (empty for
+    /// Anthropic; OpenAI's server-assigned `reasoning.id`).
+    pub const Thinking = struct {
+        id: []const u8 = "",
+        text: []const u8,
+    };
+
+    /// An opaque reasoning blob (signature, redacted payload, or encrypted
+    /// content) tagged with its reasoning-item id (empty for Anthropic).
+    pub const Blob = struct {
+        id: []const u8 = "",
+        blob: []const u8,
+    };
 
     /// End of an assistant message: why it ended, and its cumulative usage.
     pub const Stop = struct {

@@ -62,11 +62,31 @@ pub fn serialize(gpa: std.mem.Allocator, request: llm.Request) ![]u8 {
         try json.endArray();
     }
 
+    // Rebuild alternating messages from the flat item list: open a message
+    // envelope for each run of consecutive same-role items (a `tool_result` is a
+    // `user` item) and emit one block per item in list order — never reordering
+    // (reasoning already arrives at the head from the agent) and never
+    // concatenating adjacent text (each stays its own block, preserving
+    // `[tool_use, text]` interleaving and multi-text turns). The last block of
+    // the last message is the last item overall, so it carries the history cache
+    // breakpoint.
     try json.objectField("messages");
     try json.beginArray();
-    for (request.messages, 0..) |message, index| {
-        try writeMessage(&json, message, index == request.messages.len - 1, reasoning != null);
+    var open_role: ?llm.Role = null;
+    for (request.items, 0..) |item, index| {
+        const role = itemRole(item);
+        if (open_role == null or open_role.? != role) {
+            if (open_role != null) try endMessage(&json);
+            try json.beginObject();
+            try json.objectField("role");
+            try json.write(@tagName(role));
+            try json.objectField("content");
+            try json.beginArray();
+            open_role = role;
+        }
+        try writeItem(&json, item, index == request.items.len - 1, reasoning != null);
     }
+    if (open_role != null) try endMessage(&json);
     try json.endArray();
     try json.endObject();
 
@@ -176,42 +196,40 @@ fn writeTool(json: *std.json.Stringify, tool: llm.Tool, cache: bool) !void {
     try json.endObject();
 }
 
-fn writeMessage(
-    json: *std.json.Stringify,
-    message: llm.Message,
-    cache_last: bool,
-    emit_thinking: bool,
-) !void {
-    try json.beginObject();
-    try json.objectField("role");
-    try json.write(@tagName(message.role));
-    try json.objectField("content");
-    try json.beginArray();
-    for (message.blocks, 0..) |block, index| {
-        try writeBlock(json, block, cache_last and index == message.blocks.len - 1, emit_thinking);
-    }
+/// The Anthropic message role an item belongs to: reasoning and tool calls are
+/// assistant output; a tool result is fed back as a user item.
+fn itemRole(item: llm.Item) llm.Role {
+    return switch (item) {
+        .message => |message| message.role,
+        .reasoning, .tool_call => .assistant,
+        .tool_result => .user,
+    };
+}
+
+fn endMessage(json: *std.json.Stringify) !void {
     try json.endArray();
     try json.endObject();
 }
 
-fn writeBlock(json: *std.json.Stringify, block: llm.Block, cache: bool, emit_thinking: bool) !void {
+fn writeItem(json: *std.json.Stringify, item: llm.Item, cache: bool, emit_thinking: bool) !void {
     const control: ?CacheControl = if (cache) .{} else null;
-    switch (block) {
-        // Thinking sits only at the head of an assistant message, never as the
-        // cached last block, so it carries no cache breakpoint. With reasoning off
-        // it is dropped: the provider would only strip it and its signature can't
-        // be verified.
-        .thinking => |thinking| if (emit_thinking) try writeThinking(json, thinking),
-        .text => |text| try json.write(TextBlock{ .text = text, .cache_control = control }),
-        // The model emits tool input as JSON already, so embed it verbatim.
-        .tool_use => |use| try json.write(ToolUseBlock{
-            .id = use.id,
-            .name = use.name,
-            .input = .{ .bytes = if (use.input_json.len == 0) "{}" else use.input_json },
+    switch (item) {
+        .message => |message| try json.write(TextBlock{ .text = message.text, .cache_control = control }),
+        // Reasoning sits only at the head of an assistant message, never as the
+        // cached last block, so it carries no cache breakpoint. A foreign blob is
+        // dropped whole (its signature can't be verified here), and with
+        // reasoning off it is dropped too: the provider would only strip it.
+        .reasoning => |reasoning| if (emit_thinking and reasoning.origin == .anthropic)
+            try writeThinking(json, reasoning),
+        // The model emits tool arguments as JSON already, so embed them verbatim.
+        .tool_call => |call| try json.write(ToolUseBlock{
+            .id = call.call_id,
+            .name = call.name,
+            .input = .{ .bytes = if (call.arguments_json.len == 0) "{}" else call.arguments_json },
             .cache_control = control,
         }),
         .tool_result => |result| try json.write(ToolResultBlock{
-            .tool_use_id = result.tool_use_id,
+            .tool_use_id = result.call_id,
             .is_error = result.is_error,
             .content = result.content,
             .cache_control = control,
@@ -219,18 +237,18 @@ fn writeBlock(json: *std.json.Stringify, block: llm.Block, cache: bool, emit_thi
     }
 }
 
-/// Serialize a stored reasoning block: a normal block with its verbatim
+/// Serialize a stored reasoning item: a normal block with its verbatim
 /// signature, or a redacted block carrying its encrypted payload.
-fn writeThinking(json: *std.json.Stringify, thinking: llm.Block.Thinking) !void {
-    if (thinking.redacted)
-        try json.write(RedactedThinkingBlock{ .data = thinking.signature })
+fn writeThinking(json: *std.json.Stringify, reasoning: llm.Item.Reasoning) !void {
+    if (reasoning.redacted)
+        try json.write(RedactedThinkingBlock{ .data = reasoning.blob })
     else
-        try json.write(ThinkingBlock{ .thinking = thinking.text, .signature = thinking.signature });
+        try json.write(ThinkingBlock{ .thinking = reasoning.text, .signature = reasoning.blob });
 }
 
 test serialize {
-    const messages = [_]llm.Message{
-        .{ .role = .user, .blocks = &.{.{ .text = "hi \"there\"" }} },
+    const items = [_]llm.Item{
+        .{ .message = .{ .role = .user, .text = "hi \"there\"" } },
     };
     const tools = [_]llm.Tool{
         .{ .name = "read", .description = "read a file", .parameters = &.{
@@ -241,7 +259,7 @@ test serialize {
         .model = "claude-sonnet-4-6",
         .tokens_max = 1024,
         .system = "be terse",
-        .messages = &messages,
+        .items = &items,
         .tools = &tools,
     });
     defer std.testing.allocator.free(body);
@@ -269,36 +287,30 @@ test serialize {
     try std.testing.expectEqualStrings("path", input_schema.get("required").?.array.items[0].string);
 }
 
-test "tool_use input passes through raw, empty becomes an empty object" {
-    const calls = [_]llm.Block{
-        .{ .tool_use = .{ .id = "t1", .name = "read", .input_json = "{\"path\":\"a.zig\"}" } },
-        .{ .tool_use = .{ .id = "t2", .name = "list", .input_json = "" } },
-    };
-    const results = [_]llm.Block{
-        .{ .tool_result = .{ .tool_use_id = "t1", .content = "ok", .is_error = true } },
-    };
-    const messages = [_]llm.Message{
-        .{ .role = .assistant, .blocks = &calls },
-        .{ .role = .user, .blocks = &results },
+test "tool_call arguments pass through raw, empty becomes an empty object" {
+    const items = [_]llm.Item{
+        .{ .tool_call = .{ .call_id = "t1", .name = "read", .arguments_json = "{\"path\":\"a.zig\"}" } },
+        .{ .tool_call = .{ .call_id = "t2", .name = "list", .arguments_json = "" } },
+        .{ .tool_result = .{ .call_id = "t1", .content = "ok", .is_error = true } },
     };
     const body = try serialize(std.testing.allocator, .{
         .model = "m",
         .tokens_max = 8,
         .system = "s",
-        .messages = &messages,
+        .items = &items,
         .tools = &.{},
     });
     defer std.testing.allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
     defer parsed.deinit();
-    const items = parsed.value.object.get("messages").?.array.items;
-    const calls_content = items[0].object.get("content").?.array.items;
+    const messages = parsed.value.object.get("messages").?.array.items;
+    const calls_content = messages[0].object.get("content").?.array.items;
     try std.testing.expectEqualStrings("tool_use", calls_content[0].object.get("type").?.string);
     try std.testing.expectEqualStrings("a.zig", calls_content[0].object.get("input").?.object.get("path").?.string);
     try std.testing.expectEqual(@as(usize, 0), calls_content[1].object.get("input").?.object.count());
 
-    const result = items[1].object.get("content").?.array.items[0].object;
+    const result = messages[1].object.get("content").?.array.items[0].object;
     try std.testing.expectEqualStrings("tool_result", result.get("type").?.string);
     try std.testing.expectEqual(true, result.get("is_error").?.bool);
     try std.testing.expectEqualStrings("ok", result.get("content").?.string);
@@ -311,17 +323,16 @@ test "cache_control marks the system prompt, last tool, and last message block" 
         .{ .name = "read", .description = "d", .parameters = &.{} },
         .{ .name = "grep", .description = "d", .parameters = &.{} },
     };
-    const first = [_]llm.Block{.{ .text = "hello" }};
-    const second = [_]llm.Block{ .{ .text = "a" }, .{ .text = "b" } };
-    const messages = [_]llm.Message{
-        .{ .role = .user, .blocks = &first },
-        .{ .role = .assistant, .blocks = &second },
+    const items = [_]llm.Item{
+        .{ .message = .{ .role = .user, .text = "hello" } },
+        .{ .message = .{ .role = .assistant, .text = "a" } },
+        .{ .message = .{ .role = .assistant, .text = "b" } },
     };
     const body = try serialize(std.testing.allocator, .{
         .model = "any-model-x",
         .tokens_max = 8,
         .system = "sys",
-        .messages = &messages,
+        .items = &items,
         .tools = &tools,
     });
     defer std.testing.allocator.free(body);
@@ -348,17 +359,16 @@ test "cache_control marks the system prompt, last tool, and last message block" 
 }
 
 test "effort turns on adaptive thinking with the named level, max_tokens untouched" {
-    const blocks = [_]llm.Block{
-        .{ .thinking = .{ .text = "weigh it", .signature = "sig" } },
-        .{ .thinking = .{ .text = "", .signature = "secret", .redacted = true } },
-        .{ .text = "answer" },
+    const items = [_]llm.Item{
+        .{ .reasoning = .{ .text = "weigh it", .blob = "sig", .origin = .anthropic } },
+        .{ .reasoning = .{ .text = "", .blob = "secret", .redacted = true, .origin = .anthropic } },
+        .{ .message = .{ .role = .assistant, .text = "answer" } },
     };
-    const messages = [_]llm.Message{.{ .role = .assistant, .blocks = &blocks }};
     const body = try serialize(std.testing.allocator, .{
         .model = "claude-opus-4-8",
         .tokens_max = 8192,
         .system = "s",
-        .messages = &messages,
+        .items = &items,
         .tools = &.{},
         .effort = .xhigh,
     });
@@ -385,12 +395,12 @@ test "effort is dropped for a model with no table entry" {
     // A model absent from the table has no effort map, so the requested level is
     // dropped rather than emitted blindly — proof the level is resolved through
     // the per-model table, not from @tagName.
-    const messages = [_]llm.Message{.{ .role = .user, .blocks = &.{.{ .text = "hi" }} }};
+    const items = [_]llm.Item{.{ .message = .{ .role = .user, .text = "hi" } }};
     const body = try serialize(std.testing.allocator, .{
         .model = "unlisted-model",
         .tokens_max = 8192,
         .system = "s",
-        .messages = &messages,
+        .items = &items,
         .tools = &.{},
         .effort = .max,
     });
@@ -405,12 +415,12 @@ test "effort is dropped for a model with no table entry" {
 test "an effort level a model lacks folds to one it accepts" {
     // Sonnet 4.6 has no xhigh; its per-model map folds an xhigh request onto
     // high, so the default effort works without the user knowing.
-    const messages = [_]llm.Message{.{ .role = .user, .blocks = &.{.{ .text = "hi" }} }};
+    const items = [_]llm.Item{.{ .message = .{ .role = .user, .text = "hi" } }};
     const body = try serialize(std.testing.allocator, .{
         .model = "claude-sonnet-4-6",
         .tokens_max = 128_000,
         .system = "s",
-        .messages = &messages,
+        .items = &items,
         .tools = &.{},
         .effort = .xhigh,
     });
@@ -425,12 +435,12 @@ test "an effort level a model lacks folds to one it accepts" {
 }
 
 test "no thinking or output_config when effort is off" {
-    const messages = [_]llm.Message{.{ .role = .user, .blocks = &.{.{ .text = "hi" }} }};
+    const items = [_]llm.Item{.{ .message = .{ .role = .user, .text = "hi" } }};
     const body = try serialize(std.testing.allocator, .{
         .model = "claude-opus-4-8",
         .tokens_max = 8192,
         .system = "s",
-        .messages = &messages,
+        .items = &items,
         .tools = &.{},
     });
     defer std.testing.allocator.free(body);
@@ -443,17 +453,16 @@ test "no thinking or output_config when effort is off" {
 }
 
 test "stored thinking is dropped from history when reasoning is off" {
-    const blocks = [_]llm.Block{
-        .{ .thinking = .{ .text = "weigh it", .signature = "sig" } },
-        .{ .thinking = .{ .text = "", .signature = "secret", .redacted = true } },
-        .{ .text = "answer" },
+    const items = [_]llm.Item{
+        .{ .reasoning = .{ .text = "weigh it", .blob = "sig", .origin = .anthropic } },
+        .{ .reasoning = .{ .text = "", .blob = "secret", .redacted = true, .origin = .anthropic } },
+        .{ .message = .{ .role = .assistant, .text = "answer" } },
     };
-    const messages = [_]llm.Message{.{ .role = .assistant, .blocks = &blocks }};
     const body = try serialize(std.testing.allocator, .{
         .model = "claude-opus-4-8",
         .tokens_max = 8192,
         .system = "s",
-        .messages = &messages,
+        .items = &items,
         .tools = &.{},
         .effort = .off,
     });
@@ -469,4 +478,59 @@ test "stored thinking is dropped from history when reasoning is off" {
     try std.testing.expectEqual(@as(usize, 1), content.len);
     try std.testing.expectEqualStrings("text", content[0].object.get("type").?.string);
     try std.testing.expectEqualStrings("answer", content[0].object.get("text").?.string);
+}
+
+// A representative multi-round conversation exercising every serializer path
+// that affects the bytes: a steering-folded two-text-block user turn (two
+// consecutive user items sharing one envelope), an assistant run with a normal
+// and a redacted reasoning block at its head, an interleaved [tool_call, text]
+// run, tool results with both is_error values, and several role transitions.
+const golden_items = [_]llm.Item{
+    .{ .message = .{ .role = .user, .text = "first" } },
+    .{ .message = .{ .role = .user, .text = "second" } },
+    .{ .reasoning = .{ .text = "weigh it", .blob = "sig", .origin = .anthropic } },
+    .{ .reasoning = .{ .text = "", .blob = "secret", .redacted = true, .origin = .anthropic } },
+    .{ .tool_call = .{ .call_id = "t1", .name = "read", .arguments_json = "{\"path\":\"a.zig\"}" } },
+    .{ .message = .{ .role = .assistant, .text = "checking" } },
+    .{ .tool_result = .{ .call_id = "t1", .content = "contents", .is_error = false } },
+    .{ .reasoning = .{ .text = "more", .blob = "sig2", .origin = .anthropic } },
+    .{ .tool_call = .{ .call_id = "t2", .name = "write", .arguments_json = "{\"path\":\"b\"}" } },
+    .{ .tool_result = .{ .call_id = "t2", .content = "done", .is_error = true } },
+    .{ .message = .{ .role = .assistant, .text = "all set" } },
+};
+
+const golden_on =
+    \\{"model":"claude-opus-4-8","max_tokens":8192,"stream":true,"thinking":{"type":"adaptive","display":"summarized"},"output_config":{"effort":"xhigh"},"system":[{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."},{"type":"text","text":"be terse","cache_control":{"type":"ephemeral"}}],"messages":[{"role":"user","content":[{"type":"text","text":"first"},{"type":"text","text":"second"}]},{"role":"assistant","content":[{"type":"thinking","thinking":"weigh it","signature":"sig"},{"type":"redacted_thinking","data":"secret"},{"type":"tool_use","id":"t1","name":"read","input":{"path":"a.zig"}},{"type":"text","text":"checking"}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","is_error":false,"content":"contents"}]},{"role":"assistant","content":[{"type":"thinking","thinking":"more","signature":"sig2"},{"type":"tool_use","id":"t2","name":"write","input":{"path":"b"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"t2","is_error":true,"content":"done"}]},{"role":"assistant","content":[{"type":"text","text":"all set","cache_control":{"type":"ephemeral"}}]}]}
+;
+
+const golden_off =
+    \\{"model":"claude-opus-4-8","max_tokens":8192,"stream":true,"system":[{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."},{"type":"text","text":"be terse","cache_control":{"type":"ephemeral"}}],"messages":[{"role":"user","content":[{"type":"text","text":"first"},{"type":"text","text":"second"}]},{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"read","input":{"path":"a.zig"}},{"type":"text","text":"checking"}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","is_error":false,"content":"contents"}]},{"role":"assistant","content":[{"type":"tool_use","id":"t2","name":"write","input":{"path":"b"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"t2","is_error":true,"content":"done"}]},{"role":"assistant","content":[{"type":"text","text":"all set","cache_control":{"type":"ephemeral"}}]}]}
+;
+
+// Byte-identity with the pre-reshape output guards the pure-refactor claim and
+// Anthropic's server-side prompt cache: a changed prefix invalidates the cache
+// across a deploy. Serializing on and off proves reasoning-off drops the
+// thinking blocks and the reasoning config with no other byte change.
+test "serialized bytes match the pre-reshape wire output" {
+    const on = try serialize(std.testing.allocator, .{
+        .model = "claude-opus-4-8",
+        .tokens_max = 8192,
+        .system = "be terse",
+        .items = &golden_items,
+        .tools = &.{},
+        .effort = .xhigh,
+    });
+    defer std.testing.allocator.free(on);
+    try std.testing.expectEqualStrings(golden_on, on);
+
+    const off = try serialize(std.testing.allocator, .{
+        .model = "claude-opus-4-8",
+        .tokens_max = 8192,
+        .system = "be terse",
+        .items = &golden_items,
+        .tools = &.{},
+        .effort = .off,
+    });
+    defer std.testing.allocator.free(off);
+    try std.testing.expectEqualStrings(golden_off, off);
 }

@@ -36,7 +36,7 @@ system: []const u8,
 effort: llm.Effort,
 retry: net.Retry,
 arena: std.heap.ArenaAllocator,
-messages: std.ArrayList(llm.Message),
+items: std.ArrayList(llm.Item),
 stats: Stats,
 /// Steering messages the user submitted mid-turn, drained into the running turn
 /// at each round boundary. Thread-safe: the UI thread pushes, the worker takes.
@@ -111,14 +111,14 @@ pub fn init(
         .effort = options.effort,
         .retry = options.retry,
         .arena = .init(gpa),
-        .messages = .empty,
+        .items = .empty,
         .stats = .{},
         .steering = Steering.init(gpa, io),
     };
 }
 
 pub fn deinit(self: *Agent) void {
-    self.messages.deinit(self.gpa);
+    self.items.deinit(self.gpa);
     self.steering.deinit();
     self.arena.deinit();
 }
@@ -136,8 +136,8 @@ pub fn setEffort(self: *Agent, effort: llm.Effort) void {
 
 /// Run one user turn, streaming output through `handler`.
 pub fn run(self: *Agent, user_text: []const u8, handler: anytype) !void {
-    const base = self.messages.items.len;
-    errdefer self.messages.shrinkRetainingCapacity(base);
+    const base = self.items.items.len;
+    errdefer self.items.shrinkRetainingCapacity(base);
     try self.appendUser(user_text);
     var round: usize = 0;
     while (round < rounds_max) : (round += 1) {
@@ -164,42 +164,24 @@ fn drainSteering(self: *Agent, handler: anytype) !bool {
     if (pending.len == 0) return false;
     const combined = try Steering.join(self.gpa, pending);
     defer self.gpa.free(combined);
-    try self.appendSteering(combined);
+    try self.appendUser(combined);
     try handler.onSteering(combined, pending.len);
     return true;
-}
-
-/// Append steering text as user input, folding it into a trailing user message
-/// (the tool results of the round just run) when there is one so history stays a
-/// valid user/assistant alternation.
-fn appendSteering(self: *Agent, text: []const u8) !void {
-    if (self.messages.items.len > 0) {
-        const last = &self.messages.items[self.messages.items.len - 1];
-        if (last.role == .user) {
-            const arena = self.arena.allocator();
-            const blocks = try arena.alloc(llm.Block, last.blocks.len + 1);
-            @memcpy(blocks[0..last.blocks.len], last.blocks);
-            blocks[last.blocks.len] = .{ .text = try arena.dupe(u8, text) };
-            last.blocks = blocks;
-            return;
-        }
-    }
-    try self.appendUser(text);
 }
 
 /// Stream one assistant reply, retrying the whole request on a transient failure
 /// (timeout, network fault, or a retryable status). Only whole requests are safe
 /// to retry, so a failed attempt's partial reply is discarded here (history is
 /// left untouched) and `handler.onStreamReset` clears any partial output before
-/// the next attempt. Returns the reply's blocks (already appended to history), or
+/// the next attempt. Returns the reply's items (already appended to history), or
 /// null when a non-retryable error was reported and the turn ends.
-fn fetchReply(self: *Agent, handler: anytype, base: usize) !?[]const llm.Block {
+fn fetchReply(self: *Agent, handler: anytype, base: usize) !?[]const llm.Item {
     const model = self.model;
     const request: llm.Request = .{
         .model = model.name,
         .tokens_max = model.tokens_max,
         .system = self.system,
-        .messages = self.messages.items,
+        .items = self.items.items,
         .tools = &tool.specs,
         .effort = self.effort,
     };
@@ -271,18 +253,16 @@ fn retryableError(err: anyerror) bool {
     };
 }
 
-/// Surface a failed turn to the handler and drop its messages so the history
-/// stays a valid user/assistant alternation for the next turn.
+/// Surface a failed turn to the handler and drop its items so the history is
+/// restored to the turn's start for the next turn.
 fn reportAndReset(self: *Agent, handler: anytype, text: []const u8, base: usize) !void {
-    self.messages.shrinkRetainingCapacity(base);
+    self.items.shrinkRetainingCapacity(base);
     try handler.onError(text);
 }
 
 fn appendUser(self: *Agent, text: []const u8) !void {
     const arena = self.arena.allocator();
-    const blocks = try arena.alloc(llm.Block, 1);
-    blocks[0] = .{ .text = try arena.dupe(u8, text) };
-    try self.messages.append(self.gpa, .{ .role = .user, .blocks = blocks });
+    try self.items.append(self.gpa, .{ .message = .{ .role = .user, .text = try arena.dupe(u8, text) } });
 }
 
 /// Fold one assistant message's usage into the session totals, priced with
@@ -298,17 +278,19 @@ fn recordUsage(self: *Agent, model: *const models.Model, usage: llm.Usage) void 
 }
 
 /// Read one streamed assistant message to completion, recording usage and
-/// appending it to history; returns its blocks. A stream or API error returns
-/// before the append, so history stays untouched and the whole request can be
-/// retried without a duplicated or partial message.
+/// appending its items to history; returns that run of items. A stream or API
+/// error returns before the append, so history stays untouched and the whole
+/// request can be retried without a duplicated or partial message. The returned
+/// slice is arena-owned, so it stays valid while `runTools` appends `tool_result`
+/// items to the history list.
 fn readReply(
     self: *Agent,
     model: *const models.Model,
     stream: anytype,
     handler: anytype,
-) ![]const llm.Block {
+) ![]const llm.Item {
     const arena = self.arena.allocator();
-    var blocks: std.ArrayList(llm.Block) = .empty;
+    var items: std.ArrayList(llm.Item) = .empty;
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(self.gpa);
     var input: std.ArrayList(u8) = .empty;
@@ -318,47 +300,53 @@ fn readReply(
     var in_tool = false;
     var thinking: std.ArrayList(u8) = .empty;
     defer thinking.deinit(self.gpa);
-    var signature: std.ArrayList(u8) = .empty;
-    defer signature.deinit(self.gpa);
+    var blob: std.ArrayList(u8) = .empty;
+    defer blob.deinit(self.gpa);
+    var reasoning_id: std.ArrayList(u8) = .empty;
+    defer reasoning_id.deinit(self.gpa);
     var in_thinking = false;
 
     while (try stream.next()) |event| switch (event) {
-        .thinking => |delta| {
+        .thinking => |chunk| {
             in_thinking = true;
-            try thinking.appendSlice(self.gpa, delta);
-            try handler.onThinking(delta);
+            if (chunk.id.len != 0) try setId(self.gpa, &reasoning_id, chunk.id);
+            try thinking.appendSlice(self.gpa, chunk.text);
+            try handler.onThinking(chunk.text);
         },
-        // The signature closes the reasoning run; mark it open so a block that
-        // carried only a signature (omitted reasoning) still round-trips.
-        .thinking_signature => |delta| {
+        // The blob closes the reasoning run; mark it open so a run that carried
+        // only a blob (omitted reasoning) still round-trips.
+        .thinking_blob => |chunk| {
             in_thinking = true;
-            try signature.appendSlice(self.gpa, delta);
+            if (chunk.id.len != 0) try setId(self.gpa, &reasoning_id, chunk.id);
+            try blob.appendSlice(self.gpa, chunk.blob);
         },
-        .thinking_redacted => |data| {
-            try flushThinking(arena, &blocks, &thinking, &signature, &in_thinking);
-            try blocks.append(arena, .{ .thinking = .{
+        .thinking_redacted => |chunk| {
+            try flushThinking(arena, &items, &thinking, &blob, &reasoning_id, &in_thinking);
+            try items.append(arena, .{ .reasoning = .{
                 .text = "",
-                .signature = try arena.dupe(u8, data),
+                .blob = try arena.dupe(u8, chunk.blob),
                 .redacted = true,
+                .id = try arena.dupe(u8, chunk.id),
+                .origin = .anthropic,
             } });
             // The payload is encrypted, so stand a placeholder in for the display.
             try handler.onThinking(redacted_notice);
         },
         .text => |delta| {
-            try flushThinking(arena, &blocks, &thinking, &signature, &in_thinking);
+            try flushThinking(arena, &items, &thinking, &blob, &reasoning_id, &in_thinking);
             try text.appendSlice(self.gpa, delta);
             try handler.onText(delta);
         },
         .tool_use => |use| {
-            // Commit the buffered blocks in stream order — the pending tool
+            // Commit the buffered items in stream order — the pending tool
             // first, then the reasoning/answer that streamed after it — so the
-            // stored message keeps the order the model produced (thinking at the
+            // stored run keeps the order the model produced (reasoning at the
             // head, which the provider requires; tool and text calls interleaved
             // as sent).
-            if (in_tool) try flushTool(arena, &blocks, .{ .id = tool_id, .name = tool_name }, &input);
-            try flushThinking(arena, &blocks, &thinking, &signature, &in_thinking);
-            try flushText(arena, &blocks, &text);
-            tool_id = try arena.dupe(u8, use.id);
+            if (in_tool) try flushTool(arena, &items, .{ .id = tool_id, .name = tool_name }, &input);
+            try flushThinking(arena, &items, &thinking, &blob, &reasoning_id, &in_thinking);
+            try flushText(arena, &items, &text);
+            tool_id = try arena.dupe(u8, use.call_id);
             tool_name = try arena.dupe(u8, use.name);
             input.clearRetainingCapacity();
             in_tool = true;
@@ -371,12 +359,12 @@ fn readReply(
     };
     // Flush what streamed after the last tool in the order the intra-turn branch
     // uses: the pending tool first, then any trailing reasoning and answer.
-    if (in_tool) try flushTool(arena, &blocks, .{ .id = tool_id, .name = tool_name }, &input);
-    try flushThinking(arena, &blocks, &thinking, &signature, &in_thinking);
-    try flushText(arena, &blocks, &text);
+    if (in_tool) try flushTool(arena, &items, .{ .id = tool_id, .name = tool_name }, &input);
+    try flushThinking(arena, &items, &thinking, &blob, &reasoning_id, &in_thinking);
+    try flushText(arena, &items, &text);
 
-    const reply = try blocks.toOwnedSlice(arena);
-    try self.messages.append(self.gpa, .{ .role = .assistant, .blocks = reply });
+    const reply = try items.toOwnedSlice(arena);
+    try self.items.appendSlice(self.gpa, reply);
     return reply;
 }
 
@@ -387,17 +375,17 @@ fn runCall(call: *Call, context: *const tool.Context) void {
 }
 
 /// Run every tool the assistant asked for, then queue the results in call order so
-/// each `tool_result` maps back to its `tool_use` id. Read-only calls run
-/// concurrently through the group; mutating calls run inline in call order, so two
-/// writes/edits to the same file can't race or lose an update within one turn.
+/// each `tool_result` maps back to its `tool_call` by `call_id`. Read-only calls
+/// run concurrently through the group; mutating calls run inline in call order, so
+/// two writes/edits to the same file can't race or lose an update within one turn.
 /// Returns false when the reply asked for no tools. A failing mutation (a
 /// mid-turn cancel included) aborts the turn at once, before any later call runs;
 /// a cancel observed while awaiting the read-only calls aborts the same way. On
 /// every early exit the errdefer reaps the group's in-flight tasks first.
-fn runTools(self: *Agent, reply: []const llm.Block, handler: anytype) !bool {
+fn runTools(self: *Agent, reply: []const llm.Item, handler: anytype) !bool {
     var count: usize = 0;
-    for (reply) |block| switch (block) {
-        .tool_use => count += 1,
+    for (reply) |item| switch (item) {
+        .tool_call => count += 1,
         else => {},
     };
     if (count == 0) return false;
@@ -405,9 +393,9 @@ fn runTools(self: *Agent, reply: []const llm.Block, handler: anytype) !bool {
     const calls = try self.gpa.alloc(Call, count);
     defer self.gpa.free(calls);
     var index: usize = 0;
-    for (reply) |block| switch (block) {
-        .tool_use => |use| {
-            calls[index] = .{ .id = use.id, .name = use.name, .input_json = use.input_json };
+    for (reply) |item| switch (item) {
+        .tool_call => |call| {
+            calls[index] = .{ .id = call.call_id, .name = call.name, .input_json = call.arguments_json };
             index += 1;
         },
         else => {},
@@ -438,63 +426,74 @@ fn runTools(self: *Agent, reply: []const llm.Block, handler: anytype) !bool {
     try group.await(self.io);
 
     const arena = self.arena.allocator();
-    const results = try arena.alloc(llm.Block, count);
+    const results = try arena.alloc(llm.Item, count);
     while (collected < count) : (collected += 1) {
         const call = &calls[collected];
         const result = try call.result;
         try handler.onToolResult(call.name, result.content, result.is_error);
         results[collected] = .{ .tool_result = .{
-            .tool_use_id = try arena.dupe(u8, call.id),
+            .call_id = try arena.dupe(u8, call.id),
             .content = try arena.dupe(u8, result.content),
             .is_error = result.is_error,
         } };
         self.gpa.free(result.content);
     }
 
-    try self.messages.append(self.gpa, .{ .role = .user, .blocks = results });
+    try self.items.appendSlice(self.gpa, results);
     return true;
+}
+
+/// Replace the open reasoning run's item id with `id` (the provider's
+/// server-assigned reasoning-item id; empty and unused for Anthropic).
+fn setId(gpa: std.mem.Allocator, reasoning_id: *std.ArrayList(u8), id: []const u8) !void {
+    reasoning_id.clearRetainingCapacity();
+    try reasoning_id.appendSlice(gpa, id);
 }
 
 fn flushText(
     arena: std.mem.Allocator,
-    blocks: *std.ArrayList(llm.Block),
+    items: *std.ArrayList(llm.Item),
     text: *std.ArrayList(u8),
 ) !void {
     if (text.items.len == 0) return;
-    try blocks.append(arena, .{ .text = try arena.dupe(u8, text.items) });
+    try items.append(arena, .{ .message = .{ .role = .assistant, .text = try arena.dupe(u8, text.items) } });
     text.clearRetainingCapacity();
 }
 
-/// Commit the open reasoning run as one thinking block (text plus its verbatim
-/// signature), preserving the head-of-message order the provider validates. A
-/// no-op when no run is open.
+/// Commit the open reasoning run as one reasoning item (text plus its verbatim
+/// blob and item id), preserving the head-of-message order the provider
+/// validates. A no-op when no run is open.
 fn flushThinking(
     arena: std.mem.Allocator,
-    blocks: *std.ArrayList(llm.Block),
+    items: *std.ArrayList(llm.Item),
     thinking: *std.ArrayList(u8),
-    signature: *std.ArrayList(u8),
+    blob: *std.ArrayList(u8),
+    reasoning_id: *std.ArrayList(u8),
     in_thinking: *bool,
 ) !void {
     if (!in_thinking.*) return;
-    try blocks.append(arena, .{ .thinking = .{
+    try items.append(arena, .{ .reasoning = .{
         .text = try arena.dupe(u8, thinking.items),
-        .signature = try arena.dupe(u8, signature.items),
+        .blob = try arena.dupe(u8, blob.items),
+        .id = try arena.dupe(u8, reasoning_id.items),
+        .origin = .anthropic,
     } });
     thinking.clearRetainingCapacity();
-    signature.clearRetainingCapacity();
+    blob.clearRetainingCapacity();
+    reasoning_id.clearRetainingCapacity();
     in_thinking.* = false;
 }
 
 fn flushTool(
     arena: std.mem.Allocator,
-    blocks: *std.ArrayList(llm.Block),
+    items: *std.ArrayList(llm.Item),
     use: struct { id: []const u8, name: []const u8 },
     input: *std.ArrayList(u8),
 ) !void {
-    try blocks.append(arena, .{ .tool_use = .{
-        .id = use.id,
+    try items.append(arena, .{ .tool_call = .{
+        .call_id = use.id,
         .name = use.name,
-        .input_json = try arena.dupe(u8, input.items),
+        .arguments_json = try arena.dupe(u8, input.items),
     } });
 }
 
@@ -579,9 +578,9 @@ test "steering is delivered as one combined user message" {
     try agent.steering.push("b");
     try std.testing.expect(try agent.drainSteering(&handler));
 
-    try std.testing.expectEqual(@as(usize, 1), agent.messages.items.len);
-    try std.testing.expectEqual(llm.Role.user, agent.messages.items[0].role);
-    try std.testing.expectEqualStrings("a\n\nb", agent.messages.items[0].blocks[0].text);
+    try std.testing.expectEqual(@as(usize, 1), agent.items.items.len);
+    try std.testing.expectEqual(llm.Role.user, agent.items.items[0].message.role);
+    try std.testing.expectEqualStrings("a\n\nb", agent.items.items[0].message.text);
     try std.testing.expectEqualStrings("a\n\nb", handler.text.items);
     try std.testing.expectEqual(@as(usize, 2), handler.count);
 
@@ -589,24 +588,25 @@ test "steering is delivered as one combined user message" {
     try std.testing.expect(!try agent.drainSteering(&handler));
 }
 
-test "steering folds into a trailing user message" {
+test "steering appends a separate user item, leaving grouping to the serializer" {
     const gpa = std.testing.allocator;
     var agent = scriptedAgent(gpa);
     defer agent.deinit();
     var handler: SteerHandler = .{ .gpa = gpa };
     defer handler.deinit();
 
-    // A trailing user message, as a round's tool results would leave it.
+    // A trailing user item, as a round's tool results would leave it. The Agent
+    // appends a separate user item; the Anthropic serializer merges the run into
+    // one message envelope.
     try agent.appendUser("tool results");
     try agent.steering.push("steer");
     try std.testing.expect(try agent.drainSteering(&handler));
 
-    // No new message; the steering text joins the existing user turn.
-    try std.testing.expectEqual(@as(usize, 1), agent.messages.items.len);
-    const blocks = agent.messages.items[0].blocks;
-    try std.testing.expectEqual(@as(usize, 2), blocks.len);
-    try std.testing.expectEqualStrings("tool results", blocks[0].text);
-    try std.testing.expectEqualStrings("steer", blocks[1].text);
+    try std.testing.expectEqual(@as(usize, 2), agent.items.items.len);
+    try std.testing.expectEqual(llm.Role.user, agent.items.items[0].message.role);
+    try std.testing.expectEqualStrings("tool results", agent.items.items[0].message.text);
+    try std.testing.expectEqual(llm.Role.user, agent.items.items[1].message.role);
+    try std.testing.expectEqualStrings("steer", agent.items.items[1].message.text);
 }
 
 const CaptureHandler = struct {
@@ -648,11 +648,11 @@ test "readReply assembles a reasoning run, answer, and tool call in stream order
     defer handler.deinit();
 
     const events = [_]llm.Event{
-        .{ .thinking = "weigh " },
-        .{ .thinking = "it" },
-        .{ .thinking_signature = "sig" },
+        .{ .thinking = .{ .text = "weigh " } },
+        .{ .thinking = .{ .text = "it" } },
+        .{ .thinking_blob = .{ .blob = "sig" } },
         .{ .text = "answer" },
-        .{ .tool_use = .{ .id = "t1", .name = "read" } },
+        .{ .tool_use = .{ .call_id = "t1", .name = "read" } },
         .{ .input_json = "{\"path\":\"a\"}" },
         .{ .stop = .{ .reason = "tool_use", .usage = .{ .output = 5 } } },
     };
@@ -660,13 +660,14 @@ test "readReply assembles a reasoning run, answer, and tool call in stream order
 
     const reply = try agent.readReply(&agent.model, &stream, &handler);
     try std.testing.expectEqual(@as(usize, 3), reply.len);
-    try std.testing.expectEqualStrings("weigh it", reply[0].thinking.text);
-    try std.testing.expectEqualStrings("sig", reply[0].thinking.signature);
-    try std.testing.expect(!reply[0].thinking.redacted);
-    try std.testing.expectEqualStrings("answer", reply[1].text);
-    try std.testing.expectEqualStrings("t1", reply[2].tool_use.id);
-    try std.testing.expectEqualStrings("read", reply[2].tool_use.name);
-    try std.testing.expectEqualStrings("{\"path\":\"a\"}", reply[2].tool_use.input_json);
+    try std.testing.expectEqualStrings("weigh it", reply[0].reasoning.text);
+    try std.testing.expectEqualStrings("sig", reply[0].reasoning.blob);
+    try std.testing.expect(!reply[0].reasoning.redacted);
+    try std.testing.expectEqual(llm.Provider.anthropic, reply[0].reasoning.origin);
+    try std.testing.expectEqualStrings("answer", reply[1].message.text);
+    try std.testing.expectEqualStrings("t1", reply[2].tool_call.call_id);
+    try std.testing.expectEqualStrings("read", reply[2].tool_call.name);
+    try std.testing.expectEqualStrings("{\"path\":\"a\"}", reply[2].tool_call.arguments_json);
     try std.testing.expectEqualStrings("weigh it", handler.thinking.items);
     try std.testing.expect(handler.usage_seen);
     try std.testing.expectEqual(@as(u64, 5), agent.stats.last.output);
@@ -680,8 +681,8 @@ test "readReply keeps a redacted block and a signature-only run in order" {
     defer handler.deinit();
 
     const events = [_]llm.Event{
-        .{ .thinking_redacted = "enc" },
-        .{ .thinking_signature = "sigonly" },
+        .{ .thinking_redacted = .{ .blob = "enc" } },
+        .{ .thinking_blob = .{ .blob = "sigonly" } },
         .{ .text = "hi" },
         .{ .stop = .{ .reason = "end_turn", .usage = .{} } },
     };
@@ -689,12 +690,12 @@ test "readReply keeps a redacted block and a signature-only run in order" {
 
     const reply = try agent.readReply(&agent.model, &stream, &handler);
     try std.testing.expectEqual(@as(usize, 3), reply.len);
-    try std.testing.expect(reply[0].thinking.redacted);
-    try std.testing.expectEqualStrings("enc", reply[0].thinking.signature);
-    try std.testing.expect(!reply[1].thinking.redacted);
-    try std.testing.expectEqualStrings("", reply[1].thinking.text);
-    try std.testing.expectEqualStrings("sigonly", reply[1].thinking.signature);
-    try std.testing.expectEqualStrings("hi", reply[2].text);
+    try std.testing.expect(reply[0].reasoning.redacted);
+    try std.testing.expectEqualStrings("enc", reply[0].reasoning.blob);
+    try std.testing.expect(!reply[1].reasoning.redacted);
+    try std.testing.expectEqualStrings("", reply[1].reasoning.text);
+    try std.testing.expectEqualStrings("sigonly", reply[1].reasoning.blob);
+    try std.testing.expectEqualStrings("hi", reply[2].message.text);
     try std.testing.expectEqualStrings(redacted_notice, handler.thinking.items);
 }
 
@@ -706,7 +707,7 @@ test "readReply commits trailing text after the final tool in stream order" {
     defer handler.deinit();
 
     const events = [_]llm.Event{
-        .{ .tool_use = .{ .id = "t1", .name = "read" } },
+        .{ .tool_use = .{ .call_id = "t1", .name = "read" } },
         .{ .input_json = "{}" },
         .{ .text = "after" },
         .{ .stop = .{ .reason = "end_turn", .usage = .{} } },
@@ -715,6 +716,32 @@ test "readReply commits trailing text after the final tool in stream order" {
 
     const reply = try agent.readReply(&agent.model, &stream, &handler);
     try std.testing.expectEqual(@as(usize, 2), reply.len);
-    try std.testing.expectEqualStrings("t1", reply[0].tool_use.id);
-    try std.testing.expectEqualStrings("after", reply[1].text);
+    try std.testing.expectEqualStrings("t1", reply[0].tool_call.call_id);
+    try std.testing.expectEqualStrings("after", reply[1].message.text);
+}
+
+test "readReply threads a stream-assigned reasoning-item id into the item" {
+    const gpa = std.testing.allocator;
+    var agent = scriptedAgent(gpa);
+    defer agent.deinit();
+    var handler: CaptureHandler = .{ .gpa = gpa };
+    defer handler.deinit();
+
+    // Anthropic sends no reasoning id, but the plumbing must carry one when a
+    // provider does (OpenAI's server-assigned `reasoning.id`, replayed under
+    // `store:false`). A scripted stream stands in for that provider.
+    const events = [_]llm.Event{
+        .{ .thinking = .{ .id = "rs_1", .text = "hmm" } },
+        .{ .thinking_blob = .{ .id = "rs_1", .blob = "enc" } },
+        .{ .text = "done" },
+        .{ .stop = .{ .reason = "end_turn", .usage = .{} } },
+    };
+    var stream: ScriptedStream = .{ .events = &events };
+
+    const reply = try agent.readReply(&agent.model, &stream, &handler);
+    try std.testing.expectEqual(@as(usize, 2), reply.len);
+    try std.testing.expectEqualStrings("rs_1", reply[0].reasoning.id);
+    try std.testing.expectEqualStrings("hmm", reply[0].reasoning.text);
+    try std.testing.expectEqualStrings("enc", reply[0].reasoning.blob);
+    try std.testing.expectEqualStrings("done", reply[1].message.text);
 }

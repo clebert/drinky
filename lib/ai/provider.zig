@@ -100,4 +100,20 @@ pub const Stream = union(llm.Provider) {
             inline else => |*stream| stream.next(),
         };
     }
+
+    /// Usage accumulated over this stream so far, before its stop event; whatever
+    /// counts the provider has delivered up to now.
+    pub fn usageSoFar(self: *const Stream) llm.Usage {
+        return switch (self.*) {
+            inline else => |*stream| stream.usageSoFar(),
+        };
+    }
 };
+
+test "usageSoFar reads accumulated usage through the stream seam" {
+    var stream: Stream = .{ .anthropic = undefined };
+    stream.anthropic.usage = .{ .input = 7, .output = 3, .cache_read = 90 };
+    try std.testing.expectEqual(@as(u64, 7), stream.usageSoFar().input);
+    try std.testing.expectEqual(@as(u64, 3), stream.usageSoFar().output);
+    try std.testing.expectEqual(@as(u64, 90), stream.usageSoFar().cache_read);
+}
