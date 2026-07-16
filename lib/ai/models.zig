@@ -99,6 +99,19 @@ const anthropic_effort_no_xhigh: Model.EffortMap = .{
     .max = "max",
 };
 
+// OpenAI's reasoning-effort domain is a superset of ours, so every level maps to
+// its own name. These are reasoning-only models with no way to disable
+// reasoning, so off floors on `none` (the API's minimal level) rather than
+// omitting the reasoning config, which would default the model to medium.
+const openai_effort: Model.EffortMap = .{
+    .off = "none",
+    .low = "low",
+    .medium = "medium",
+    .high = "high",
+    .xhigh = "xhigh",
+    .max = "max",
+};
+
 // Anthropic cache rates follow fixed multipliers of the base input price: 0.1x
 // for a read, 1.25x for a 5-minute write. Each model states its real context
 // window and maximum output; nothing is defaulted.
@@ -135,7 +148,46 @@ const table = [_]Entry{
         .tokens_max = 128_000,
         .effort = anthropic_effort_no_xhigh,
     } },
-};
+} ++ openaiModels(.openai) ++ openaiModels(.openai_codex);
+
+// The gpt-5.6 family is offered identically on the official API-key backend and
+// the ChatGPT-subscription (Codex) backend, so both providers carry the same
+// three entries; only the transport base and auth differ. Standard-tier pricing,
+// per million tokens; 1.05M context, 128K max output.
+fn openaiModels(comptime provider: llm.Provider) [3]Entry {
+    return .{
+        .{ .provider = provider, .model = .{
+            .name = "gpt-5.6-sol",
+            .input = 5,
+            .output = 30,
+            .cache_read = 0.5,
+            .cache_write = 6.25,
+            .context_window = 1_050_000,
+            .tokens_max = 128_000,
+            .effort = openai_effort,
+        } },
+        .{ .provider = provider, .model = .{
+            .name = "gpt-5.6-terra",
+            .input = 2.5,
+            .output = 15,
+            .cache_read = 0.25,
+            .cache_write = 3.125,
+            .context_window = 1_050_000,
+            .tokens_max = 128_000,
+            .effort = openai_effort,
+        } },
+        .{ .provider = provider, .model = .{
+            .name = "gpt-5.6-luna",
+            .input = 1,
+            .output = 6,
+            .cache_read = 0.1,
+            .cache_write = 1.25,
+            .context_window = 1_050_000,
+            .tokens_max = 128_000,
+            .effort = openai_effort,
+        } },
+    };
+}
 
 /// The model `name` offered by `kind`, or null when it is not in the table.
 pub fn get(kind: llm.Provider, name: []const u8) ?Model {

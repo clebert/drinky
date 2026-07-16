@@ -290,6 +290,9 @@ fn readReply(
     handler: anytype,
 ) ![]const llm.Item {
     const arena = self.arena.allocator();
+    // Tag reasoning with the provider that produced it, so a serializer replays
+    // only its own opaque blobs and drops a foreign reasoning item whole.
+    const origin = self.client.kind();
     var items: std.ArrayList(llm.Item) = .empty;
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(self.gpa);
@@ -321,19 +324,19 @@ fn readReply(
             try blob.appendSlice(self.gpa, chunk.blob);
         },
         .thinking_redacted => |chunk| {
-            try flushThinking(arena, &items, &thinking, &blob, &reasoning_id, &in_thinking);
+            try flushThinking(arena, &items, &thinking, &blob, &reasoning_id, &in_thinking, origin);
             try items.append(arena, .{ .reasoning = .{
                 .text = "",
                 .blob = try arena.dupe(u8, chunk.blob),
                 .redacted = true,
                 .id = try arena.dupe(u8, chunk.id),
-                .origin = .anthropic,
+                .origin = origin,
             } });
             // The payload is encrypted, so stand a placeholder in for the display.
             try handler.onThinking(redacted_notice);
         },
         .text => |delta| {
-            try flushThinking(arena, &items, &thinking, &blob, &reasoning_id, &in_thinking);
+            try flushThinking(arena, &items, &thinking, &blob, &reasoning_id, &in_thinking, origin);
             try text.appendSlice(self.gpa, delta);
             try handler.onText(delta);
         },
@@ -344,7 +347,7 @@ fn readReply(
             // head, which the provider requires; tool and text calls interleaved
             // as sent).
             if (in_tool) try flushTool(arena, &items, .{ .id = tool_id, .name = tool_name }, &input);
-            try flushThinking(arena, &items, &thinking, &blob, &reasoning_id, &in_thinking);
+            try flushThinking(arena, &items, &thinking, &blob, &reasoning_id, &in_thinking, origin);
             try flushText(arena, &items, &text);
             tool_id = try arena.dupe(u8, use.call_id);
             tool_name = try arena.dupe(u8, use.name);
@@ -360,7 +363,7 @@ fn readReply(
     // Flush what streamed after the last tool in the order the intra-turn branch
     // uses: the pending tool first, then any trailing reasoning and answer.
     if (in_tool) try flushTool(arena, &items, .{ .id = tool_id, .name = tool_name }, &input);
-    try flushThinking(arena, &items, &thinking, &blob, &reasoning_id, &in_thinking);
+    try flushThinking(arena, &items, &thinking, &blob, &reasoning_id, &in_thinking, origin);
     try flushText(arena, &items, &text);
 
     const reply = try items.toOwnedSlice(arena);
@@ -470,13 +473,14 @@ fn flushThinking(
     blob: *std.ArrayList(u8),
     reasoning_id: *std.ArrayList(u8),
     in_thinking: *bool,
+    origin: llm.Provider,
 ) !void {
     if (!in_thinking.*) return;
     try items.append(arena, .{ .reasoning = .{
         .text = try arena.dupe(u8, thinking.items),
         .blob = try arena.dupe(u8, blob.items),
         .id = try arena.dupe(u8, reasoning_id.items),
-        .origin = .anthropic,
+        .origin = origin,
     } });
     thinking.clearRetainingCapacity();
     blob.clearRetainingCapacity();
@@ -509,7 +513,7 @@ test "usage is attributed to the model that produced it across a switch" {
     const gpa = std.testing.allocator;
     const sonnet = models.get(.anthropic, "claude-sonnet-4-6").?;
     const opus = models.get(.anthropic, "claude-opus-4-8").?;
-    const client = provider.Client.init(.anthropic, gpa, std.testing.io, undefined, .{});
+    const client = provider.Client.init(gpa, std.testing.io, .{ .anthropic = undefined }, .{});
     var agent = Agent.init(gpa, std.testing.io, client, .{
         .model = sonnet,
         .system = "",
@@ -636,7 +640,7 @@ const CaptureHandler = struct {
 
 fn scriptedAgent(gpa: std.mem.Allocator) Agent {
     const model = models.get(.anthropic, "claude-opus-4-8").?;
-    const client = provider.Client.init(.anthropic, gpa, std.testing.io, undefined, .{});
+    const client = provider.Client.init(gpa, std.testing.io, .{ .anthropic = undefined }, .{});
     return Agent.init(gpa, std.testing.io, client, .{ .model = model, .system = "", .retry = .{} });
 }
 
@@ -744,4 +748,30 @@ test "readReply threads a stream-assigned reasoning-item id into the item" {
     try std.testing.expectEqualStrings("hmm", reply[0].reasoning.text);
     try std.testing.expectEqualStrings("enc", reply[0].reasoning.blob);
     try std.testing.expectEqualStrings("done", reply[1].message.text);
+}
+
+test "readReply tags reasoning with the active provider as origin" {
+    const gpa = std.testing.allocator;
+    // An openai-backed agent must stamp its reasoning items `.openai`, not the
+    // Anthropic default, or the openai serializer would drop them as foreign.
+    const client = provider.Client.init(gpa, std.testing.io, .{ .openai = "sk-test" }, .{});
+    var agent = Agent.init(gpa, std.testing.io, client, .{
+        .model = models.get(.openai, "gpt-5.6-sol").?,
+        .system = "",
+        .retry = .{},
+    });
+    defer agent.deinit();
+    var handler: CaptureHandler = .{ .gpa = gpa };
+    defer handler.deinit();
+
+    const events = [_]llm.Event{
+        .{ .thinking = .{ .id = "rs_1", .text = "hmm" } },
+        .{ .thinking_blob = .{ .id = "rs_1", .blob = "enc" } },
+        .{ .text = "done" },
+        .{ .stop = .{ .reason = "completed", .usage = .{} } },
+    };
+    var stream: ScriptedStream = .{ .events = &events };
+    const reply = try agent.readReply(&agent.model, &stream, &handler);
+    try std.testing.expectEqual(llm.Provider.openai, reply[0].reasoning.origin);
+    try std.testing.expectEqualStrings("rs_1", reply[0].reasoning.id);
 }

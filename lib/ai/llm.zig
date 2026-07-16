@@ -5,7 +5,9 @@
 /// The model providers the agent core supports: the neutral tag the `provider`
 /// module keys its `Client` union on, and that `models` tags each table entry
 /// with, so both can name a provider without depending on a concrete client.
-pub const Provider = enum { anthropic };
+/// `openai` is the official API-key backend; `openai_codex` is the same wire
+/// protocol over the ChatGPT-subscription backend (different base and auth).
+pub const Provider = enum { anthropic, openai, openai_codex };
 
 pub const Role = enum { user, assistant };
 
