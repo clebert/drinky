@@ -214,6 +214,11 @@ Extension seams referenced here:
       reintroduce the divergence **Show only committed content in the transcript** exists to kill.
       Pairs with that item (the still-uncommitted tail is what gets rewound) and ties into the
       **Permission model** and **Bash tool**.
+- [ ] **Configurable tool-round cap.** The per-turn tool-round loop is bounded by a compiled-in 50
+      rounds (`rounds_max` in `lib/ai/Agent.zig`), failing cleanly on overrun. Expose it via
+      `config.json` (folded through `src/Config.zig` like the `request` section) with 50 as the
+      default, so deep tool chains can raise it and a runaway guard can lower it. Clamp to at least
+      one round; ties into the **Config file** item.
 
 ## UI
 
@@ -397,6 +402,12 @@ Extension seams referenced here:
       and in-progress typing must not be clobbered. Define the composition — order, separators, and
       framing per source — as one model rather than letting each feature append blindly. This is the
       underspecified linchpin of the cancel cluster.
+- [ ] **Configurable transcript window.** The live view retains a compiled-in 8 pages (terminal
+      heights) of the newest content (`window_pages` in `src/layout.zig`): the frame keeps
+      `rows * window_pages` rows measured newest-first and clips the rest at the top. Expose it via
+      `config.json` (folded through `src/Config.zig`) with 8 as the default, trading scrollback
+      retention against per-frame measure and redraw cost. Clamp to at least one page; ties into the
+      **Config file** item.
 
 ## Cross-cutting / open questions
 
@@ -408,4 +419,6 @@ Extension seams referenced here:
       forward-compatible). Today it carries only the `request` section (network timeouts + retry
       policy), folded into the neutral `ai.net.Timeouts`/`ai.net.Retry` structs. Still to fold in as
       those features land: system prompt, model/effort defaults, provider keys, skill/agent/prompt
-      directories (see the `models.json` runtime catalog item, which may merge here).
+      directories (see the `models.json` runtime catalog item, which may merge here), and the
+      compiled-in limits exposed elsewhere in this backlog — the transcript window (UI) and the
+      tool-round cap (Networking & resilience).
