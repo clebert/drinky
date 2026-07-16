@@ -1,292 +1,315 @@
 # FEATURES.md
 
-An inventory of what pith supports today — one line per capability, grouped by module. This is not a
-design doc: it records _what exists_ and may state the guarantee a capability upholds (the thing a
-regression check asserts), but not the implementation rationale — for the _why_ and the _how_ see
-the commit history, `BACKLOG.md` (planned work), and `docs/`.
+The complete catalog of what pith does — one line per capability, grouped by area. It describes
+features at the concept level: the observable behavior and the guarantee each upholds, so it reads
+as a specification that could guide a reimplementation in any language. The _why_ and _how_ live in
+commit history, `BACKLOG.md` (planned work), and `docs/`.
 
-## How to use this file
+## Maintaining this file
 
-- **Adding a feature.** When you land a new capability, add a one-line entry under the right group
-  (create a group if none fits). Keep it terse — a line, not a paragraph. Mark the matching
-  `BACKLOG.md` item done in the same change, if one exists.
-- **Refactoring.** Before and after a refactor, read the relevant group and confirm every listed
-  capability still holds. This list is the checklist against which a refactor must not regress: if a
-  behavior here disappears, that is a bug, not a cleanup.
-- **Granularity.** Fine-grained sub-features are welcome (individual caret movements, specific
-  escape sequences, per-tool options) when they are worth guarding against regression. Merge or drop
-  entries that no longer earn their line.
-- **Scope.** Only implemented behavior belongs here, stated as the capability and its guarantee, not
-  the rationale. Planned or partial work stays in `BACKLOG.md` until it ships.
-
-Groups mirror the module layout: the terminal engine (`lib/terminal/`), the agent core (`lib/ai/`),
-and the app (`src/`).
+- **Concept level only.** Describe what a capability does and the behavior it guarantees, never how
+  the code spells it — no type, function, module, field, or test names, and no language- or
+  library-specific APIs. Keep genuine domain facts that are part of the feature itself: user-facing
+  command and file names, wire-protocol facts (SSE, HTTP status codes), model identifiers, numeric
+  limits that define observable behavior, and recognized standards and protocols (e.g. UAX #29,
+  OAuth PKCE, the Kitty keyboard protocol, ANSI escape classes such as CSI/OSC/APC/DCS).
+- **Timeless.** State only what exists, as if written correctly from the start. No references to
+  past or future implementations, no "previously / now / instead", no change history.
+- **Concise.** One entry per capability, kept as terse as clarity allows; less is more. A capability
+  with several tightly-coupled guarantees may bundle them in one entry rather than fragment them,
+  and fine-grained sub-features (individual caret moves, specific limits, per-tool options) are
+  welcome when worth guarding against regression. Trim redundancy; state each fact once.
+- **Complete.** Every implemented behavior belongs here; a reader should be able to enumerate the
+  whole feature set from this file alone. Planned or partial work stays in `BACKLOG.md` until it
+  ships.
+- **Keeping it true.** When a capability lands, add its line under the right group (create a group
+  if none fits) and mark any matching `BACKLOG.md` item done. Before and after a refactor, treat the
+  relevant group as the checklist that must not regress — a behavior that vanishes is a bug, not a
+  cleanup. Use this file to review the implementation for drift.
 
 ---
 
-## Terminal engine (`lib/terminal/`)
+## Terminal & rendering
 
-### TTY & terminal control (`Tty`, `escape`)
+### Terminal control
 
-- Enters raw mode (no echo/canonical/signals/flow-control) and restores the original termios on
-  exit.
-- Enables bracketed paste, pushes the Kitty keyboard protocol, and hides the cursor on start;
-  reverses all three on exit.
-- Buffered stdout writer with split read/write handles so an input reader and the render writer run
-  concurrently without a lock.
-- Timed reads (returns null on timeout) so the caller can react to resize while otherwise blocked.
-- Queries the window size via `TIOCGWINSZ`, reporting null (not a fake default) when unavailable.
-- SIGWINCH watcher (`Resize`): a self-pipe turns the async-signal-safe handler into an awaitable fd
-  event (blocking read end, non-blocking write end), so a resize wakes an idle event loop; restores
-  the prior signal disposition on exit.
-- Escape helpers for synchronized-output bursts, bracketed-paste framing, cursor show/hide,
-  erase-below, full screen+scrollback reset, and relative cursor motion (CUU/CUD/CUF).
+- Enters raw mode (no echo, canonical processing, signals, or flow control) and restores the
+  original terminal state on exit.
+- On start, enables bracketed paste, the Kitty keyboard protocol (disambiguate level), and cursor
+  hiding; reverses all three on exit.
+- Input reading and output writing proceed concurrently; output is buffered.
+- Reads can time out, so a reader blocked on input can still react to events such as a resize.
+- Queries the terminal window size, reporting absence rather than a fabricated default when
+  unavailable.
+- A terminal resize is delivered as an event that wakes an idle event loop; the prior signal
+  handling is restored on exit.
+- Escape-sequence support for synchronized-output bursts, bracketed-paste framing, cursor show/hide,
+  erase-below, full screen-and-scrollback reset, and relative cursor motion (up/down/forward).
 
-### Reconciling inline renderer (`View`)
+### Inline rendering
 
-- Draws a bounded window of the newest content into the normal buffer (never the alt screen).
-- Diffs frames by opaque anchor identity (id + line), not screen position, so scrolled content
+- Renders a bounded window of the newest content into the normal screen buffer, never the alternate
+  screen.
+- Diffs frames by stable content-anchor identity rather than screen position, so scrolled content
   reconciles correctly.
-- Incremental forward-slide repaint from the first changed row, scrolling committed rows into native
-  scrollback.
-- Backward-slide single-page reprint and full reset (clear screen + scrollback) for the cases a
-  slide cannot express (change above viewport, resize, page-count change, shrunk tail, no shared
-  anchor).
-- Caret-only repaint when rows are unchanged; emits cursor show/hide only on a visibility change.
-- Double-buffered ping-pong frames with retained capacity, so steady-state repaints allocate
-  nothing.
-- Every repaint wrapped in a synchronized-output burst to avoid tearing.
-- Counts physical terminal rows for wide glyphs so a line wider than the terminal never desyncs the
-  cursor.
-- A test model terminal (`Emulator`) replays the exact escapes `View` emits and reconstructs the
-  document and caret for byte-level rendering assertions.
+- Incremental forward repaint from the first changed row, scrolling settled rows into the terminal's
+  native scrollback.
+- Falls back to a single-page reprint or a full reset (clear screen and scrollback) when an
+  incremental repaint cannot express the change: a change above the viewport, a resize, a page-count
+  change, a shrunk tail, or no shared anchor.
+- Repaints only the caret when rows are unchanged, and emits cursor show/hide only when visibility
+  changes.
+- Steady-state repaints allocate nothing.
+- Wraps every repaint in a synchronized-output burst to prevent tearing.
+- A line wider than the terminal never desyncs the cursor.
 
-### Input decoding (`Input`)
+### Input decoding
 
-- Incremental parser that retains unconsumed bytes across reads, so a key sequence split across
+- Incremental parsing that retains unconsumed bytes across reads, so a key sequence split across
   chunks still decodes.
-- Decodes printable codepoints, ctrl-letters, Enter, Shift+Enter (newline), Escape, Backspace,
+- Decodes printable characters, ctrl-letters, Enter, Shift+Enter (newline), Escape, Backspace,
   arrows, Home, End, and bracketed-paste payloads.
-- Legacy control-byte mapping (CR→enter, DEL/BS→backspace, 0x01–0x1a→ctrl, LF→ctrl-j).
-- Kitty `CSI u` decoding with modifiers, SS3 arrows, and `CSI ~` tilde keys.
-- Plain Alt+Up (legacy modified arrow) decoded as a distinct key for steering recall; other
-  modifier combinations fall back to the bare arrow.
-- Malformed/truncated UTF-8 decodes as `unknown` while always making forward progress.
+- Decodes both encodings the terminal produces: the keys the Kitty protocol reports as unambiguous
+  escape sequences (Escape, Shift+Enter, and ctrl-combinations, with modifiers), and the traditional
+  encoding used for the rest — control bytes (carriage return as Enter, delete/backspace as
+  Backspace, control codes as ctrl-letters) and arrow, navigation, and modified-arrow escape
+  sequences.
+- Alt+Up decodes as a distinct key (used for steering recall); other modifier combinations fall back
+  to the bare arrow.
+- Malformed or truncated UTF-8 decodes as an unknown key while always making forward progress.
 
-### Grapheme segmentation (`grapheme`)
+### Grapheme segmentation
 
-- Full UAX #29 extended grapheme cluster rules GB1–GB13 (CRLF, Hangul,
-  Extend/ZWJ/SpacingMark/Prepend, Indic conjunct GB9c, emoji-ZWJ GB11, regional-indicator pairs
-  GB12/13).
-- `stepAt` returns a cluster's byte length and display width; `boundaryBefore` finds the previous
-  cluster boundary by forward re-segmentation.
-- Validated against the vendored `GraphemeBreakTest.txt` conformance corpus.
+- Full extended grapheme cluster segmentation per the Unicode standard (UAX #29): CRLF, Hangul
+  syllables, combining/joiner/prepend marks, Indic conjuncts, emoji ZWJ sequences, and
+  regional-indicator (flag) pairs.
+- Reports each cluster's byte length and display width, and finds the previous cluster boundary.
+- Validated against the official Unicode grapheme-break conformance corpus.
 - Malformed UTF-8 falls back to a one-column replacement step.
 
-### Display width (`width`)
+### Display width
 
-- Per-grapheme-cluster column measurement (`ofText`) that skips ANSI escape sequences.
-- `truncate` and `wrap`/`wrapper` never split a cluster and never let a wide cluster straddle the
-  margin.
-- `rows` counts physical rows for wrapped text; `caret` maps a prefix to (row, column) and
-  `offsetAt` inverts it.
-- Cell widths follow mode-2027 semantics: 0 for control/combining, 2 for East Asian wide/fullwidth
-  and default-emoji (VS16 forces 2), 1 otherwise.
-- `escapeLength` measures CSI and string-terminated OSC/APC/DCS/PM/SOS as zero width.
+- Measures display columns per grapheme cluster, skipping ANSI escape sequences.
+- Truncation and wrapping never split a cluster and never let a wide cluster straddle the margin.
+- Counts physical rows for wrapped text and maps between a text offset and its (row, column)
+  position in both directions.
+- Cell widths: 0 for control and combining marks, 2 for East Asian wide/fullwidth and default-emoji
+  characters (the emoji-presentation selector VS16 forces 2, the text selector VS15 keeps 1), 1
+  otherwise.
+- Escape sequences — CSI, and string-terminated OSC/APC/DCS and kin — measure as zero width.
 
-### Generated Unicode tables (`unicode_data`)
+### Unicode data
 
-- Display-width intervals and Grapheme_Cluster_Break class table derived from the Unicode Character
-  Database (pinned to 17.0.0), refined with Indic_Conjunct_Break and Extended_Pictographic.
-- Regenerated by `zig build unicode` (network fetch, run by hand).
+- Display-width and grapheme-break classification tables derived from the Unicode Character Database
+  (pinned to version 17.0.0), including Indic conjunct-break and extended-pictographic refinements.
+- Regenerated on demand from the published Unicode data (a manual, network-fetching step).
 
 ---
 
-## Agent core (`lib/ai/`)
+## Agent & conversation
 
-### Agent loop (`Agent`)
+### Agent loop
 
 - Runs one user turn to completion: append the user message, stream the reply, run its tools, feed
   results back, and repeat until the model stops.
-- Tool calls in one assistant message run concurrently: read-only calls are fanned out through an
-  `std.Io.Group`, while mutating calls (write/edit) run serially in call order so two writes/edits
-  to the same file can't race or lose an update. Results are queued in call order so each
-  `tool_result` maps back to its `tool_use` id, and a mid-turn cancel propagates to the running
-  tools.
-- Bounded tool-round loop (max 50) with a typed error on overrun.
-- Owns the conversation history and an arena; provider-neutral via a `provider.Client` handle.
-- Reports presentation through handler callbacks (text, thinking, tool start, tool result, usage,
-  error) instead of drawing itself.
-- Buffers a streamed reasoning run into a `thinking` block (text + verbatim signature, or a redacted
-  payload) at the head of the assistant message, carried back unchanged on later turns so the
-  provider accepts the tool calls that followed it.
-- `setModel`/`setEffort` switch the active model and reasoning-effort level mid-session, taking
-  effect next turn with history untouched.
-- Steering: a thread-safe queue (`Steering`, `std.Io.Mutex`) the UI thread pushes onto and the turn
-  worker drains at each round boundary (and when the model would end the turn), combining the pending
-  messages into one blank-line-joined user message folded into the trailing user turn so alternation
-  stays valid, reported via `handler.onSteering`.
-- Retries a whole request on a timeout, transient network fault, or retryable status
-  (408/429/5xx incl. Anthropic 529), honoring `retry-after`, with bounded attempts and exponential
-  backoff; the partial reply of a failed attempt is discarded (never appended to history) and
-  `handler.onStreamReset` clears the partial transcript text before the next attempt re-streams.
-  Tool execution runs after the retried read and is never retried.
-- On a stream failure or API error, rolls history back to the turn base so the user/assistant
-  alternation stays valid.
-- A mid-turn cancel is surfaced as a clean abort (partial assistant message dropped), not a network
-  error.
-- Accumulates cost and cache savings, pricing each message against the model that produced it (so a
-  mid-session `/model` switch stays correctly priced) with a per-model breakdown, and carries the
-  last request's usage.
+- Tool calls within one assistant message run concurrently: read-only calls in parallel, while
+  mutating calls (write, edit) run serially in call order so two edits to the same file cannot race
+  or lose an update. Results are collected in call order so each maps back to its call, and a
+  mid-turn cancel propagates to running tools.
+- Bounded tool-round loop (at most 50 rounds), failing cleanly on overrun.
+- Holds the conversation history and reaches the model through a provider-neutral interface, so
+  neither the loop nor its tools depend on a specific provider.
+- Emits presentation events (text, reasoning, tool start, tool result, usage, error) for the
+  presentation layer to render.
+- Coalesces each streamed reasoning run into one entry — its text plus a verbatim opaque token, or a
+  redacted payload — kept in stream order ahead of the text and tool calls that followed it, so a
+  turn preserves reasoning interleaved with its tool calls; each entry is replayed unchanged in
+  every later request so the provider still accepts those tool calls.
+- Switches the active model and reasoning-effort level mid-session; the change takes effect on the
+  next turn and leaves history untouched.
+- Messages queued during a turn are drained at each tool-round boundary (and when the model would
+  otherwise end the turn), combined into one blank-line-joined user turn, appended to history, and
+  reported to the presentation layer.
+- Retries an entire request on a timeout, transient network fault, or retryable status (408, 429,
+  5xx, including Anthropic's 529), honoring the server's retry-after hint, with bounded attempts and
+  exponential backoff. A failed attempt's partial reply is discarded (never kept in history) and the
+  presentation layer clears partial text before the retry re-streams. Tool execution happens only
+  after a successful read and is never retried.
+- On a stream failure or API error, discards the turn's items so history returns to where the turn
+  began.
+- A mid-turn cancel surfaces as a clean abort (the partial assistant message is dropped), not a
+  network error.
+- Accumulates cost and cache savings, pricing each message against the model that produced it so a
+  mid-session model switch stays correctly priced; keeps a bounded per-model breakdown (cumulative
+  totals stay exact past the bound) and the last request's usage.
 
-### Provider-neutral model (`llm`, `provider`, `models`)
+### Conversation model
 
-- Pure data model of roles, reasoning-effort levels, blocks (thinking/text/tool_use/tool_result),
-  messages, tools, requests, usage, and stream events (text, thinking deltas, thinking signatures,
-  redacted reasoning, tool_use, input-json, stop).
-- Provider seam (`llm.Provider` enum, `Client`/`Stream` unions) with an Anthropic arm wired.
-- Compiled-in model table (Anthropic `claude-opus-4-8`, `claude-sonnet-5`, `claude-sonnet-4-6`)
-  carrying per-model prices, context window, maximum output tokens (sent in full as `max_tokens`,
-  the effort level governing actual spend), and a reasoning-effort map.
-- Per-model reasoning-effort map: each of our levels (`off`/`low`/`medium`/`high`/`xhigh`/`max`)
-  resolves to the provider effort name the model accepts, or none. A level a model lacks folds onto
-  the nearest it offers (Sonnet 4.6 maps `xhigh`→`high`); a model with no reasoning maps every level
-  to none; a model that cannot disable reasoning maps `off` up to a floor.
-- Per-model cost and cache-savings computation from USD-per-million rates; an unknown model is
-  unsupported rather than guessed.
-- Neutral networking policy (`net`): request `Timeouts`/`Retry` option structs (defaults live here),
-  `withTimeout`, which bounds a blocking operation by racing it against a timer via `std.Io.Select`
-  and reaping the loser (surfacing `error.Timeout`), and `Deadline`, a shared idle window that bounds
-  a run of reads by the time left until one instant so activity without progress can't extend it.
+- The conversation is a flat, ordered sequence of items: user and assistant messages, reasoning
+  runs, tool calls, and tool results.
+- A reasoning run records the provider that produced its opaque token, so only that provider replays
+  it and never feeds another's.
+- A provider-neutral interface every provider implements, producing a common stream of reply events
+  (text, reasoning and its opaque token, redacted reasoning, tool-call starts, tool-argument chunks,
+  completion) with usage-so-far readable mid-stream; each provider translates the item sequence to
+  and from its own wire format, so nothing above depends on a specific provider.
+- Implemented providers: Anthropic.
 
-### Anthropic transport (`anthropic/`)
+### Model catalog & reasoning effort
 
-- Streaming Messages API over SSE, decoding text deltas, thinking deltas and signatures, redacted
-  reasoning, tool_use starts, input-json chunks, usage, stop reason, and API errors.
-- Adaptive extended thinking: when reasoning is on, sends `thinking:{type:adaptive,
-  display:summarized}` plus `output_config:{effort:…}` — the effort resolved through the model's
-  effort map — so the model sizes its own budget; `max_tokens` stays the model's output ceiling. Off,
-  an unknown model, or a model with no reasoning omits both.
-- OAuth identity headers and `accept-encoding: identity` for verbatim SSE.
-- Always-on prompt caching: ephemeral breakpoints on the last system block, the last tool, and the
-  last message block (3 of 4 allowed).
-- Usage folded across `message_start`/`message_delta` into a single `llm.Usage`.
-- Request phases are timeout-bounded: `send` (connect + response head) by a connect timeout and the
-  read of each streamed event by an idle window (a shared `net.Deadline`). Keepalive `ping` events
-  draw the window down without resetting it — only a real frame restarts it — so a stream that stalls
-  or sends nothing but pings still surfaces `error.Timeout`. A streamed read races the timer only
-  when no full line is buffered; a failed head exposes a retryable classification and the parsed
-  `retry-after`.
-- A cancel during the read is mapped to a clean `error.Canceled` abort, distinct from a timeout.
+- Built-in model catalog — Anthropic `claude-opus-4-8`, `claude-sonnet-5`, and `claude-sonnet-4-6` —
+  each with prices, context window (1,000,000 tokens), maximum output tokens (128,000, with the
+  effort level governing actual spend), and a reasoning-effort map.
+- Reasoning-effort levels `off` / `low` / `medium` / `high` / `xhigh` / `max`, each mapping to what
+  a given model supports: a level a model lacks folds to the nearest it offers (`claude-sonnet-4-6`
+  folds `xhigh` to `high`), a model without reasoning maps every level to off, and a model that
+  cannot disable reasoning raises `off` to its minimum.
+- Cost and cache savings computed per model from its USD-per-million-token rates; an unknown model
+  is rejected, not guessed.
 
-### Authentication (`anthropic/Auth`, `oauth`)
+### Networking policy
 
-- Credentials stored at `~/.pith/auth.json` with 0600 permissions.
+- Provider-neutral policy with configurable request timeouts and retry parameters.
+- An operation that exceeds its timeout fails with a timeout error.
+- A shared idle window bounds a run of reads: activity without progress cannot extend it, so a
+  stalled read eventually times out.
+
+### Anthropic transport
+
+- Builds each request by grouping conversation items into alternating user and assistant messages:
+  consecutive same-role items merge into one message (a tool result counts as user), each item maps
+  to one content block in order, and reasoning stays first, never reordered or merged — so the
+  serialized prefix stays byte-stable and server-side prompt-cache hits persist.
+- Streams responses over SSE, decoding them into the neutral reply events plus usage, stop reason,
+  and API errors.
+- When reasoning is enabled, requests adaptive, summarized extended thinking at the resolved effort
+  level so the model sizes its own budget while the output ceiling stays fixed; omitted when effort
+  is off, the model has no reasoning, or the model is unknown.
+- Sends OAuth identity headers and requests an unencoded response so SSE frames arrive verbatim.
+- Always-on prompt caching: cache breakpoints on the last system block, the last tool, and the last
+  message block (3 of the 4 allowed).
+- Usage from all streamed events is folded into one total.
+- Each request phase is time-bounded: connecting and reading the response head by a connect timeout,
+  and each streamed event by an idle window. Keepalive pings draw the idle window down without
+  resetting it — only a real frame restarts it — so a stream that stalls or emits nothing but pings
+  still times out. A failed response head reports whether it is retryable and the server's
+  retry-after hint.
+- A cancel during the read surfaces as a clean abort, distinct from a timeout.
+
+### Authentication
+
+- Credentials stored at `~/.pith/auth.json` with owner-only permissions.
 - OAuth login: PKCE (S256), browser launch, and a loopback callback server to capture the code.
 - Access tokens refreshed and re-persisted automatically when expired.
 
-### Tools (`tool/`)
+### Tools
 
-- Compile-time tool registry + dispatcher advertising typed schemas to the provider; JSON args
-  parsed into typed structs with a compile-time schema-vs-struct consistency check. Each entry
-  declares whether it mutates the filesystem, which the agent uses to serialize mutating calls
-  within a turn.
-- **read** — paginated UTF-8 file read (1-indexed offset + limit), truncated to 2000 lines / 50 KB,
-  with a next-offset hint; rejects binary/oversized files.
-- **write** — create/overwrite a UTF-8 file atomically (temp file + rename).
-- **edit** — replace one exact, unique span; errors on empty, missing, or non-unique matches; atomic
-  write.
-- **find** — glob file search returning relative paths, with a base path and result limit.
-- **grep** — literal substring search (`path:line:text`) with glob filter, case-insensitivity, and a
-  result limit; skips binary files and caps line length.
-- Internal helpers: glob matcher (`*`/`?`/`**`), sorted recursive tree walk skipping noise dirs,
-  atomic-write filesystem helper, all propagating cancellation.
+- A tool registry advertises each tool's input schema, validates arguments against it, and marks
+  whether the tool mutates the filesystem; every tool honors cancellation.
+- **read** — paginated UTF-8 file read (1-indexed offset, with a line limit), truncated to 2000
+  lines or 50 KB with a next-offset hint; rejects binary or oversized (over 16 MB) files.
+- **write** — create or overwrite a UTF-8 file atomically.
+- **edit** — replace one exact, unique text span; errors on an empty, missing, or non-unique match;
+  written atomically.
+- **find** — glob file search returning relative paths under a base path, bounded by a result limit
+  (default 1000).
+- **grep** — literal substring search reporting `path:line:text`, with a glob filter, optional
+  case-insensitivity, and a result limit (default 100); skips binary and large (over 4 MB) files and
+  caps reported line length (300 bytes).
+- Glob patterns support `*`, `?`, and `**`; file searches walk directories recursively in sorted
+  order and skip noise directories (version-control and build directories).
 
-### Slash commands (`command/`)
+### Slash commands
 
-- Registry-based command dispatch returning an outcome (feedback text or an interactive picker);
-  unknown commands report an error.
-- **/model** — switch model by name, or with no argument open a picker over the provider's models
-  with the current one marked.
+- Slash commands dispatch to produce either feedback text or an interactive picker; an unknown
+  command reports an error.
+- **/model** — switch the model by name, or with no argument open a picker over the available models
+  with the active one marked.
 - **/effort** — set the reasoning-effort level by name, or with no argument open a picker over the
-  levels with the current one marked; shown on the status line as `model • effort`.
+  levels with the active one marked.
 
 ---
 
-## App (`src/`)
+## Application & interface
 
-### Composition & event loop (`App`, `main`)
+### Startup & event loop
 
-- Single event-queue consumer fed by four concurrent producers: a long-lived stdin reader, the turn
-  worker (agent runs off the UI thread), a one-shot frame timer, and a SIGWINCH resize watcher.
-- The consumer solely owns the model and painting, so network and stream I/O never freeze the UI.
-- Frame-rate-limited repaints (~16 ms); a tick is armed only while dirty or animating, so a fully
-  idle interface does no work.
-- Repaints on terminal resize (SIGWINCH): the watcher marks the session dirty, so even a fully idle
-  interface reflows at the new size; `refresh` re-reads the size each frame.
-- Loads `$HOME/.pith/config.json` (`Config`) at startup — optional, partial, and
-  forward-compatible — threading request timeouts and retry policy into the client and agent.
-- Authenticates (logging in if needed) before wiring the loop.
-- Ctrl+C clears the editor or quits on a double-press; Ctrl+D quits when the editor is empty.
-- Mid-turn Esc/Ctrl+C cancels the turn worker and drops the partial turn, returning any pending
-  steering to the editor.
-- Steering: the editor stays live during a turn — Enter queues a steering message, Alt+Up recalls the
-  whole queue into the editor (blank-line-joined, appended after any in-progress line), and steering
-  left unqueued when a turn ends opens the next turn; slash commands are disabled mid-turn.
-- Graceful shutdown cancels and reaps all tasks and drains buffered events before restoring the
+- Starts with a default model (`claude-opus-4-8`) and reasoning effort (`xhigh`) and sends a fixed
+  system prompt describing the agent and its tools.
+- On launch, shows an intro line summarizing the key bindings.
+- The interface stays responsive throughout a turn: keyboard input, agent progress, frame ticks, and
+  resizes are handled concurrently, so network and streaming I/O never freeze the interface.
+- Repaints are frame-rate-limited (~16 ms) and scheduled only while the interface is dirty or
+  animating, so an idle interface does no work.
+- A terminal resize marks the interface dirty and re-reads the size, so even an idle interface
+  reflows to the new dimensions.
+- Reads an optional configuration file at `~/.pith/config.json` — partial and forward-compatible —
+  supplying request timeouts and retry policy (connect and idle timeouts, maximum attempts, and
+  initial and maximum backoff).
+- Authenticates, logging in if needed, before starting.
+- Ctrl+C clears the editor, or quits on a second press in quick succession; Ctrl+D quits when the
+  editor is empty.
+- During a turn, Esc or Ctrl+C cancels it and drops the partial turn, returning any pending steering
+  to the editor.
+- The editor stays live during a turn: Enter queues a steering message, Alt+Up recalls the whole
+  queue into the editor (blank-line-joined, after any in-progress text), and any steering still
+  queued when a turn ends starts the next turn. Slash commands are disabled during a turn.
+- Graceful shutdown cancels all background work and drains buffered events before restoring the
   terminal.
 
-### Render consumer (`Session`, `Transcript`, `layout`)
+### Session state & transcript projection
 
-- `Session` owns the consumer-side model (transcript, live-tail mode, editor, view, stats/model/
-  effort snapshots) and is io/tty/agent-free for scripted render tests.
-- Live-tail modelled as a tagged union (prompt / streaming turn / picker) so exactly one live input
-  is representable.
-- Streamed model text collects into one growing transcript block until a discrete block, tool call,
-  or turn boundary ends the run.
-- Streamed reasoning collects into one growing dimmed `thinking` block, separate from the answer, so
-  the answer run never extends it.
-- Multiple concurrent tool boxes can render during a turn, colored by status: blue while the call
-  runs, then replaced by a green (ok) or red (error) transcript line on completion.
-- Steering queue shown as `Steering:` tail rows with an Alt+Up recall hint while a turn runs; a
-  consumed batch becomes one normal user block and its rows drop.
-- Layout projects transcript + tail onto a bounded window (8 pages), measuring newest-to-oldest and
-  clipping the top, recomputed each frame.
+- Rendering is a deterministic function of a state snapshot — transcript history, live-tail mode,
+  editor contents, and the current stats, model, and effort — independent of I/O.
+- The live tail always holds exactly one live input: the editor — at the idle prompt, or kept
+  beneath a streaming turn's spinner, tool boxes, and steering rows so the turn can be steered — or
+  a picker that replaces it.
+- Streamed answer text accumulates into one growing block until a tool call, a distinct block, or
+  the turn boundary ends it.
+- Streamed reasoning accumulates into its own dimmed thinking block, kept separate from the answer.
+- Multiple concurrent tool calls render as boxes during a turn — blue while running, replaced on
+  completion by a green (success) or red (error) line.
+- While a turn runs, the steering queue shows as `Steering:` rows with an Alt+Up recall hint; once
+  consumed, the batch becomes one normal user block and its rows drop.
+- The transcript and tail project onto a bounded window (8 pages), measured newest-first and clipped
+  at the top, recomputed each frame.
 
-### Input editor (`ui/Editor`)
+### Input editor
 
-- UTF-8 buffer with a grapheme-cluster caret; insert, paste, and backspace all operate on whole
+- UTF-8 buffer with a grapheme-cluster caret; insert, paste, and backspace operate on whole
   clusters.
 - Horizontal movement by cluster (left/right) and to line start/end (home/end).
 - Vertical movement (up/down) by wrapped row with a sticky goal column preserved across shorter rows
   and reset on any horizontal move or edit.
-- Up on the first row jumps to start, down on the last row jumps to end.
+- Up on the first row jumps to the start, down on the last row jumps to the end.
 - A caret at the end of a full-width line wraps onto an empty trailing row rather than clamping onto
   the last cell.
 - Internally scrolled and windowed to keep the caret in view, with "↑ N more" / "↓ N more"
   hidden-row labels.
 
-### Picker (`ui/Picker`)
+### Picker
 
-- Single-choice list with a title, key hint, inverse-video selection, and a "(current)" tag on the
-  pre-existing choice.
+- Single-choice list with a title, a key hint, inverse-video selection, and a "(current)" tag on the
+  active choice.
 - Bounded up/down navigation, internally scrolled to keep the selection visible.
+- Dismissed by Esc, Ctrl+C, or Ctrl+D.
 
-### Status line (`ui/status`)
+### Status line
 
-- Bottom line showing context-window fill, session cost, and cumulative cache savings, with the
+- Bottom line showing context-window fill, session cost, and cumulative cache savings, with a
   `model • effort` indicator right-aligned.
-- Last-request cache-hit rate shown when the prompt is non-empty; token counts in k/M shorthand.
-- Truncates to stats-only when the model and effort won't fit.
+- Last-request cache-hit rate shown once a request has sent prompt tokens; token counts in k/M
+  shorthand.
+- Truncates to stats-only when the model and effort will not fit.
 
-### Transcript blocks & paint primitives (`ui/block`, `ui/paint`, `ui/color`)
+### Transcript rendering
 
-- Transcript entries as a tagged union: intro, user, thinking (dimmed), model, tool_result, and
-  feedback (the last two flagged for error styling).
-- Notice, box, and wrapped renderers, each styled from one shared SGR palette.
-- Streaming row painters that emit one physical row at a time into the view sink, so a clipped block
-  never materializes its hidden top.
-- Framed input area (purple rules + windowed body + optional caret) shared by the editor and picker.
-- A ten-frame Braille "Working…" spinner that advances per frame tick, independent of stream events.
-- Steering-queue row painter: a `Steering: <message>` row per queued message (first line, truncated)
-  plus a dim recall hint.
+- Transcript entry kinds: intro, user, thinking (dimmed), answer, tool result, and feedback (the
+  last two can carry error styling).
+- Notice, box, and wrapped-text renderers, each drawn from one shared color palette.
+- Blocks paint one physical row at a time, so a clipped block never renders its hidden portion.
+- A framed input area (colored rules, windowed body, optional caret) shared by the editor and
+  picker.
+- A ten-frame Braille "Working…" spinner that advances on each frame tick, independent of stream
+  events.
+- One `Steering: <message>` row per queued message, showing its first line, truncated.
