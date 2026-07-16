@@ -38,6 +38,10 @@ model_shown: ai.models.Model,
 /// Consumer-owned copy of the reasoning-effort level, updated after a command
 /// runs, for the status-line indicator.
 effort_shown: ai.llm.Effort,
+/// Whether an account is active, mirrored from the agent after a command runs.
+/// When false the status line shows a signed-out indicator and the model/effort
+/// snapshots are stale placeholders.
+signed_in: bool,
 /// Steering messages queued while a turn runs, shown as the `Steering:` tail
 /// rows. The display mirror of the agent's channel: `App` adds here and to the
 /// channel together, and a `.steering_consumed` event drops the front as the
@@ -136,6 +140,7 @@ pub fn init(gpa: std.mem.Allocator, writer: *std.Io.Writer, model: ai.models.Mod
         .stats_shown = .{},
         .model_shown = model,
         .effort_shown = effort,
+        .signed_in = true,
         .steering = .empty,
     };
 }
@@ -211,6 +216,9 @@ pub fn applyOutcome(self: *Session, outcome: ai.command.Outcome) !void {
             try self.transcript.append(.feedback, feedback.is_error, feedback.content);
         },
         .pick => |pick| try self.openPicker(pick),
+        // The app intercepts account actions (they need the tty and the agent);
+        // they never reach the io-free session.
+        .login, .logout => unreachable,
     }
     self.dirty = true;
 }
@@ -221,10 +229,12 @@ fn openPicker(self: *Session, pick: ai.command.Outcome.Pick) !void {
         for (pick.options) |option| self.gpa.free(option);
         self.gpa.free(pick.options);
     }
-    self.mode = .{ .picking = .{
-        .picker = try ui.Picker.init(self.gpa, pick.title, pick.options, pick.current),
-        .command = pick.command,
-    } };
+    const picker = try ui.Picker.init(self.gpa, pick.title, pick.options, pick.current);
+    // Init succeeded and now owns the options; drop whatever the previous mode
+    // held before replacing it, so opening a picker over a live turn or picker
+    // cannot leak.
+    self.deinitMode();
+    self.mode = .{ .picking = .{ .picker = picker, .command = pick.command } };
 }
 
 /// Leave picker mode, freeing the picker; a no-op in any other mode.
@@ -310,6 +320,7 @@ pub fn paint(self: *Session, size: terminal.View.Size) !void {
         .context_window = self.model_shown.context_window,
         .model = self.model_shown.name,
         .effort = @tagName(self.effort_shown),
+        .signed_in = self.signed_in,
     };
 
     const tail: layout.Tail = switch (self.mode) {

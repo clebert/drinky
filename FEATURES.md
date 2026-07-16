@@ -217,8 +217,9 @@ commit history, `BACKLOG.md` (planned work), and `docs/`.
 
 ### Authentication
 
-- Two authentication mechanisms per provider: an interactive subscription OAuth login, and a
-  platform API key read from the environment (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`).
+- Two authentication mechanisms per provider: an interactive subscription OAuth login (at startup
+  and mid-session), and a platform API key read from the environment (`ANTHROPIC_API_KEY`,
+  `OPENAI_API_KEY`).
 - Subscription credentials stored at `~/.pith/auth.json` with owner-only permissions, keyed by
   account so several coexist in one file; a token refresh rewrites only its own account's entry, and
   a save aborts rather than discarding the file's other accounts when it cannot be read back.
@@ -226,7 +227,10 @@ commit history, `BACKLOG.md` (planned work), and `docs/`.
 - Access tokens refreshed and re-persisted automatically when expired.
 - At startup the active account is the first authenticated one — a stored subscription or an
   available API key, preferring a subscription over a paid key when both are present; when none is
-  available, an interactive subscription login runs first.
+  available, the session starts signed out and the login picker opens.
+- While signed out — no authenticated account, or after logging out the last one — the status line
+  reads "not signed in" and a normal message is refused with a prompt to `/login`, while the login
+  picker (the same one `/login` opens) lets the user sign in without a restart.
 
 ### Tools
 
@@ -253,6 +257,13 @@ commit history, `BACKLOG.md` (planned work), and `docs/`.
   (each authenticated account's models, labeled by account), with the active one marked; selecting
   one switches the active account and model together.
 - **/effort** — open a picker over the reasoning-effort levels with the active one marked.
+- **/login** — open a picker over all accounts: an unauthenticated subscription runs its OAuth login
+  and switches to it on its default model; an environment API account reports which variable to set
+  and to restart; an already-active account is marked and does nothing. The same picker opens at
+  startup and after logging out the last account.
+- **/logout** — open a picker over the logged-in subscription accounts and drop the chosen one's
+  credentials; logging out the active account switches to the next authenticated account, or drops
+  to a signed-out state with the login picker open.
 
 ---
 
@@ -273,8 +284,10 @@ commit history, `BACKLOG.md` (planned work), and `docs/`.
 - Reads an optional configuration file at `~/.pith/config.json` — partial and forward-compatible —
   supplying request timeouts and retry policy (connect and idle timeouts, maximum attempts, and
   initial and maximum backoff) and a default model per account. It holds no secrets; API keys come
-  from the environment.
-- Authenticates, logging in if needed, before starting.
+  from the environment. A configured model name that is not valid for its account's vendor is
+  reported and falls back to the compiled default.
+- When no account is authenticated, starts signed out and opens the login picker, so a first run
+  signs in through the same interactive picker as a mid-session `/login`.
 - Ctrl+C clears the editor, or quits on a second press in quick succession; Ctrl+D quits when the
   editor is empty.
 - During a turn, Esc or Ctrl+C cancels it and drops the partial turn, returning any pending steering

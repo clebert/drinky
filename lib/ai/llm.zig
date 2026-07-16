@@ -22,6 +22,37 @@ pub const Account = enum {
     openai_subscription,
     /// Per-token platform API, authorized with a `Bearer` key.
     openai_api,
+
+    /// Whether this account authenticates with an interactive OAuth subscription
+    /// login (as opposed to an environment API key), so it can be logged in and
+    /// out mid-session.
+    pub fn isSubscription(self: Account) bool {
+        return switch (self) {
+            .anthropic_subscription, .openai_subscription => true,
+            .anthropic_api, .openai_api => false,
+        };
+    }
+
+    /// The human-readable label, e.g. "anthropic subscription".
+    pub fn label(self: Account) []const u8 {
+        return switch (self) {
+            .anthropic_subscription => "anthropic subscription",
+            .anthropic_api => "anthropic api",
+            .openai_subscription => "openai subscription",
+            .openai_api => "openai api",
+        };
+    }
+
+    /// The environment variable that supplies an API account's key, or null for a
+    /// subscription (whose credential comes from an interactive login, not the
+    /// environment).
+    pub fn apiKeyEnv(self: Account) ?[]const u8 {
+        return switch (self) {
+            .anthropic_api => "ANTHROPIC_API_KEY",
+            .openai_api => "OPENAI_API_KEY",
+            .anthropic_subscription, .openai_subscription => null,
+        };
+    }
 };
 
 /// The vendor axis: whose wire protocol and model table an account uses. Both
@@ -185,4 +216,16 @@ test provider {
     try std.testing.expectEqual(Provider.anthropic, provider(.anthropic_subscription));
     try std.testing.expectEqual(Provider.openai, provider(.openai_api));
     try std.testing.expectEqual(Provider.openai, provider(.openai_subscription));
+}
+
+test "account subscription flag and label" {
+    try std.testing.expect(Account.anthropic_subscription.isSubscription());
+    try std.testing.expect(Account.openai_subscription.isSubscription());
+    try std.testing.expect(!Account.anthropic_api.isSubscription());
+    try std.testing.expect(!Account.openai_api.isSubscription());
+    try std.testing.expectEqualStrings("openai subscription", Account.openai_subscription.label());
+    try std.testing.expectEqualStrings("anthropic api", Account.anthropic_api.label());
+    try std.testing.expectEqualStrings("ANTHROPIC_API_KEY", Account.anthropic_api.apiKeyEnv().?);
+    try std.testing.expectEqualStrings("OPENAI_API_KEY", Account.openai_api.apiKeyEnv().?);
+    try std.testing.expect(Account.anthropic_subscription.apiKeyEnv() == null);
 }

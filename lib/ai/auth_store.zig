@@ -134,6 +134,67 @@ fn serializeMerged(
     return out.toOwnedSlice();
 }
 
+/// Remove `key` from the `auth.json` at `path`, rewriting every other entry
+/// verbatim; with `.drop_flat` the legacy flat keys go too (used when dropping the
+/// account that owned them). A missing file is a no-op — nothing to remove. An
+/// unparseable or non-object file is `error.BadCredentials` rather than a
+/// destructive rewrite, matching `save`.
+pub fn remove(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    key: []const u8,
+    options: struct { drop_flat: bool = false },
+) !void {
+    const existing = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .unlimited) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer gpa.free(existing);
+
+    const body = try serializeWithout(gpa, existing, key, options.drop_flat);
+    defer gpa.free(body);
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = path,
+        .data = body,
+        .flags = .{ .permissions = @enumFromInt(0o600) },
+    });
+}
+
+/// The whole `auth.json` with `key` dropped, re-emitting every other top-level
+/// key verbatim (and the flat keys too when `drop_flat`). An unparseable or
+/// non-object file is `error.BadCredentials`, so a removal never wipes a sibling
+/// account by starting over on a file it could not read. Caller frees the result.
+fn serializeWithout(
+    gpa: std.mem.Allocator,
+    existing: []const u8,
+    key: []const u8,
+    drop_flat: bool,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var json: std.json.Stringify = .{ .writer = &out.writer };
+
+    const parsed = std.json.parseFromSlice(std.json.Value, gpa, existing, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.BadCredentials,
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.BadCredentials;
+
+    try json.beginObject();
+    var entries = parsed.value.object.iterator();
+    while (entries.next()) |field| {
+        if (std.mem.eql(u8, field.key_ptr.*, key)) continue;
+        if (drop_flat and isFlatKey(field.key_ptr.*)) continue;
+        try json.objectField(field.key_ptr.*);
+        try json.write(field.value_ptr.*);
+    }
+    try json.endObject();
+
+    return out.toOwnedSlice();
+}
+
 fn isFlatKey(name: []const u8) bool {
     for (flat_keys) |flat| {
         if (std.mem.eql(u8, name, flat)) return true;
@@ -252,6 +313,55 @@ test "serializeMerged errors on an unparseable or non-object existing file" {
     try std.testing.expectError(
         error.BadCredentials,
         serializeMerged(gpa, "[1,2,3]", "openai_subscription", entry, false),
+    );
+}
+
+test "serializeWithout drops a key, preserving other accounts" {
+    const gpa = std.testing.allocator;
+    const merged = try serializeWithout(
+        gpa,
+        "{\"anthropic_subscription\":{\"access\":\"a\"},\"openai_subscription\":{\"access\":\"o\"}}",
+        "openai_subscription",
+        false,
+    );
+    defer gpa.free(merged);
+    var parsed = try std.json.parseFromSlice(std.json.Value, gpa, merged, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    try std.testing.expect(root.get("openai_subscription") == null);
+    try std.testing.expectEqualStrings("a", root.get("anthropic_subscription").?.object.get("access").?.string);
+
+    // Removing the last account leaves a valid empty object, not a wipe error.
+    const emptied = try serializeWithout(gpa, merged, "anthropic_subscription", false);
+    defer gpa.free(emptied);
+    var parsed_empty = try std.json.parseFromSlice(std.json.Value, gpa, emptied, .{});
+    defer parsed_empty.deinit();
+    try std.testing.expectEqual(@as(usize, 0), parsed_empty.value.object.count());
+}
+
+test "serializeWithout drops legacy flat keys with drop_flat, and errors on a corrupt file" {
+    const gpa = std.testing.allocator;
+
+    // Dropping the Anthropic subscription also clears the legacy flat keys (its
+    // pre-keyed representation), leaving the openai entry intact.
+    const merged = try serializeWithout(
+        gpa,
+        "{\"access\":\"flat\",\"refresh\":\"r\",\"expires_ms\":5," ++
+            "\"openai_subscription\":{\"access\":\"o\"}}",
+        "anthropic_subscription",
+        true,
+    );
+    defer gpa.free(merged);
+    var parsed = try std.json.parseFromSlice(std.json.Value, gpa, merged, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    try std.testing.expect(root.get("access") == null);
+    try std.testing.expectEqualStrings("o", root.get("openai_subscription").?.object.get("access").?.string);
+
+    // A corrupt file is rejected rather than overwritten with a wipe.
+    try std.testing.expectError(
+        error.BadCredentials,
+        serializeWithout(gpa, "{ not json", "openai_subscription", false),
     );
 }
 

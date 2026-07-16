@@ -89,13 +89,32 @@ Extension seams referenced here:
       (routed in `App.submit`). The active-turn path also needs the steering message queue.
 - [ ] **`/subagent`** (or `/agents`) — list, pick, and dispatch to a user-defined subagent. Depends
       on the subagent runtime below.
-- [ ] **`/login` and `/logout`.** Authenticate or drop an account's credentials mid-session without
-      a restart. Login runs the subscription OAuth flow (browser + loopback callback) that today
-      runs only pre-tty at startup, so it must suspend the tty and restore it afterward; logout
-      removes an account's `auth.json` entry, and logging out the active account leaves the session
-      with no client until the next `/model` switch — the reason `Agent.client` would become an
-      optional, deferred here with it. This is what makes an `openai_subscription` (Codex) account
-      reachable; API-key accounts have no login (their key is env-sourced).
+- [x] **`/login` and `/logout`.** Authenticate or drop credentials mid-session without a restart,
+      both picker-driven, and the same login picker serves the first-run bootstrap and the
+      fall-through after logging out the last account. `/login` lists every account: an
+      unauthenticated subscription runs its OAuth flow (the browser + loopback callback that once ran
+      pre-tty at startup) with the app suspending the tty — restoring cooked mode so the URL prints
+      and the callback completes — and forcing a full repaint after, then switching to it on its
+      default model; an environment API account reports which variable to set and to restart; an
+      already-active account is marked and does nothing. `/logout` lists the logged-in subscriptions
+      and drops the chosen one's `auth.json` entry (an `auth_store` remove that preserves every
+      sibling account). `Agent.client` is optional: with no account signed in the session runs signed
+      out (status reads "not signed in", a normal message is refused with a `/login` prompt) rather
+      than forcing a login, and logging out the active account switches to the next authenticated
+      account (enum order, its default model) or drops to that signed-out state with the login picker
+      open. A picker cannot open mid-turn, so a logout never races a running turn. This makes an
+      `openai_subscription` (Codex) account reachable. Command outcomes gained a `login`/`logout` arm
+      the app executes (the command layer names the account; the app owns the tty and the account
+      switch), and `firstAuthenticated` backs the fall-through.
+- [ ] **API-key login by paste.** Let `/login` accept an API key typed or pasted in-session for an
+      API account, rather than only pointing at the environment variable. Departs from today's
+      env-only keys: the key would have to be stored (owner-only, likely in `auth.json` beside the
+      subscription tokens), so it needs a deliberate on-disk shape and the same abort-rather-than-wipe
+      save discipline.
+- [ ] **Console/API OAuth (`platform.claude.com`).** Add the Anthropic Console OAuth flow (the
+      developer-platform login that mints an API key or platform token) as a `/login` target, if the
+      grant is available to this client — a third authentication mechanism beyond subscription OAuth
+      and an environment key.
 
 ## Configuration & context
 
@@ -153,8 +172,8 @@ Extension seams referenced here:
 - [x] **Other providers (OpenAI).** An `openai/` module (Responses wire + SSE transport) sits behind
       the two-axis provider seam; the neutral item model, `/model`, `/effort`, caching, and stats
       are provider-agnostic and reconcile with it. Two accounts share it: `openai_api` (env
-      `OPENAI_API_KEY`, Bearer, `api.openai.com`) is user-reachable now; `openai_subscription`
-      (Codex OAuth) is built but reachable only once mid-session `/login` lands (below).
+      `OPENAI_API_KEY`, Bearer, `api.openai.com`) and `openai_subscription` (Codex OAuth), the
+      latter reachable through the `/login` picker.
 - [x] **Account switch: empty assistant content (Anthropic 400).** The Anthropic serializer skips an
       assistant envelope that would emit zero blocks — a reasoning-only run whose reasoning is
       dropped by exact-account replay (`origin != account`) or by reasoning-off — instead of sending

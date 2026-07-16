@@ -30,7 +30,7 @@ pub fn run(context: *Context, args: []const u8) !Outcome {
     if (combos.items.len == 0)
         return Outcome.report(gpa, .err, "no authenticated accounts", .{});
 
-    const active_account = context.agent.client.account();
+    const active_account: ?llm.Account = if (context.agent.client) |client| client.account() else null;
     const active_model = context.agent.model.name;
 
     const options = try gpa.alloc([]const u8, combos.items.len);
@@ -41,10 +41,12 @@ pub fn run(context: *Context, args: []const u8) !Outcome {
     }
     var current: ?usize = null;
     for (combos.items, 0..) |combo, index| {
-        options[index] = try std.fmt.allocPrint(gpa, "{s} ({s})", .{ combo.model.name, label(combo.account) });
+        options[index] = try std.fmt.allocPrint(gpa, "{s} ({s})", .{ combo.model.name, combo.account.label() });
         filled += 1;
-        if (combo.account == active_account and std.mem.eql(u8, combo.model.name, active_model))
-            current = index;
+        if (active_account) |account| {
+            if (combo.account == account and std.mem.eql(u8, combo.model.name, active_model))
+                current = index;
+        }
     }
     return .{ .pick = .{
         .command = name,
@@ -64,7 +66,7 @@ pub fn select(context: *Context, index: usize) !Outcome {
 
     const combo = combos.items[index];
     context.agent.switchTo(context.accounts.client(combo.account).?, combo.model);
-    return Outcome.report(gpa, .ok, "switched to {s} ({s})", .{ combo.model.name, label(combo.account) });
+    return Outcome.report(gpa, .ok, "switched to {s} ({s})", .{ combo.model.name, combo.account.label() });
 }
 
 /// Every authenticated account's models, in account-enum then table order — the
@@ -79,17 +81,6 @@ fn collect(accounts: *const Accounts, out: *std.ArrayList(Combo), gpa: std.mem.A
         for (vendor_models.items) |vendor_model|
             try out.append(gpa, .{ .account = account, .model = vendor_model });
     }
-}
-
-/// The human account descriptor shown beside a model, e.g. "anthropic
-/// subscription".
-fn label(account: llm.Account) []const u8 {
-    return switch (account) {
-        .anthropic_api => "anthropic api",
-        .anthropic_subscription => "anthropic subscription",
-        .openai_api => "openai api",
-        .openai_subscription => "openai subscription",
-    };
 }
 
 fn apiAccounts(gpa: std.mem.Allocator) Accounts {
@@ -134,7 +125,7 @@ test "the picker lists every authenticated account's models, marking the active 
             // The active account+model (anthropic api, sonnet 4.6) is preselected.
             try std.testing.expectEqualStrings("claude-sonnet-4-6 (anthropic api)", pick.options[pick.current.?]);
         },
-        .feedback => return error.ExpectedPick,
+        else => return error.ExpectedPick,
     }
 }
 
@@ -151,10 +142,10 @@ test "select switches to the chosen account and model" {
             defer gpa.free(feedback.content);
             try std.testing.expect(!feedback.is_error);
         },
-        .pick => return error.ExpectedFeedback,
+        else => return error.ExpectedFeedback,
     }
     try std.testing.expectEqualStrings("gpt-5.6-sol", agent.model.name);
-    try std.testing.expectEqual(llm.Account.openai_api, agent.client.account());
+    try std.testing.expectEqual(llm.Account.openai_api, agent.client.?.account());
 
     // An out-of-range index is reported, leaving the model unchanged.
     switch (try select(&context, 99)) {
@@ -162,7 +153,7 @@ test "select switches to the chosen account and model" {
             defer gpa.free(feedback.content);
             try std.testing.expect(feedback.is_error);
         },
-        .pick => return error.ExpectedFeedback,
+        else => return error.ExpectedFeedback,
     }
     try std.testing.expectEqualStrings("gpt-5.6-sol", agent.model.name);
 }

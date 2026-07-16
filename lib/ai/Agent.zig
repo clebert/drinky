@@ -30,7 +30,10 @@ const by_model_max = 16;
 
 gpa: std.mem.Allocator,
 io: std.Io,
-client: provider.Client,
+/// The active account's transport, or null while signed out (no account has a
+/// usable credential). `run` requires a client; the app refuses to start a turn
+/// while signed out, so the internal uses assume one.
+client: ?provider.Client,
 model: models.Model,
 system: []const u8,
 effort: llm.Effort,
@@ -99,7 +102,7 @@ const Call = struct {
 pub fn init(
     gpa: std.mem.Allocator,
     io: std.Io,
-    client: provider.Client,
+    client: ?provider.Client,
     options: struct { model: models.Model, system: []const u8, retry: net.Retry, effort: llm.Effort = .off },
 ) Agent {
     return .{
@@ -134,6 +137,12 @@ pub fn switchTo(self: *Agent, client: provider.Client, model: models.Model) void
     self.model = model;
 }
 
+/// Drop the active account, leaving the agent signed out. `model` is kept as the
+/// last-shown value; a later `switchTo` restores a client before the next turn.
+pub fn signOut(self: *Agent) void {
+    self.client = null;
+}
+
 /// Switch the reasoning-effort level; takes effect on the next turn.
 pub fn setEffort(self: *Agent, effort: llm.Effort) void {
     self.effort = effort;
@@ -141,6 +150,7 @@ pub fn setEffort(self: *Agent, effort: llm.Effort) void {
 
 /// Run one user turn, streaming output through `handler`.
 pub fn run(self: *Agent, user_text: []const u8, handler: anytype) !void {
+    if (self.client == null) return error.SignedOut;
     const base = self.items.items.len;
     errdefer self.items.shrinkRetainingCapacity(base);
     try self.appendUser(user_text);
@@ -194,7 +204,7 @@ fn fetchReply(self: *Agent, handler: anytype, base: usize) !?[]const llm.Item {
     while (true) : (attempt += 1) {
         if (attempt > 1) try handler.onStreamReset();
         var stream: provider.Stream = undefined;
-        self.client.send(&stream, request) catch |err| {
+        self.client.?.send(&stream, request) catch |err| {
             if (retryableError(err) and attempt < self.retry.attempts_max) {
                 try self.backoff(attempt, 0);
                 continue;
@@ -297,7 +307,7 @@ fn readReply(
     const arena = self.arena.allocator();
     // Tag reasoning with the account that produced it, so a serializer replays
     // its blobs only for the exact same account and drops any other whole.
-    const origin = self.client.account();
+    const origin = self.client.?.account();
     var items: std.ArrayList(llm.Item) = .empty;
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(self.gpa);

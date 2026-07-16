@@ -29,7 +29,17 @@ pub fn init(self: *Tty, io: std.Io) !void {
     self.in_handle = stdin.handle;
     self.out_handle = stdout.handle;
     self.original = try std.posix.tcgetattr(self.in_handle);
+    self.out_stream = stdout.writerStreaming(io, &self.out_buffer);
+    try self.enterRaw();
+}
 
+pub fn deinit(self: *Tty) void {
+    self.leaveRaw();
+}
+
+/// Enter raw mode and enable the input/render escape modes. Used at startup and
+/// to restore the interface after a suspend (`leaveRaw`).
+pub fn enterRaw(self: *Tty) !void {
     var raw = self.original;
     raw.lflag.ECHO = false;
     raw.lflag.ICANON = false;
@@ -45,8 +55,6 @@ pub fn init(self: *Tty, io: std.Io) !void {
     raw.cc[@intFromEnum(std.posix.V.TIME)] = 0;
     try std.posix.tcsetattr(self.in_handle, .FLUSH, raw);
 
-    self.out_stream = stdout.writerStreaming(io, &self.out_buffer);
-
     const out = &self.out_stream.interface;
     try out.writeAll(escape.paste_set);
     try out.writeAll(escape.keyboard_set);
@@ -54,7 +62,10 @@ pub fn init(self: *Tty, io: std.Io) !void {
     try out.flush();
 }
 
-pub fn deinit(self: *Tty) void {
+/// Reverse the escape modes and restore the terminal's original cooked state, so
+/// plain output is readable. Used at shutdown (`deinit`) and to suspend the
+/// interface for a mid-session login flow; pair with `enterRaw` to resume.
+pub fn leaveRaw(self: *Tty) void {
     const out = &self.out_stream.interface;
     out.writeAll(escape.keyboard_reset) catch {};
     out.writeAll(escape.paste_reset) catch {};

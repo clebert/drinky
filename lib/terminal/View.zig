@@ -75,6 +75,10 @@ sink: Sink,
 /// Set by `beginFrame` when the columns, rows, or page count changed since the
 /// last frame, forcing `render` to repaint the whole window.
 structural_change: bool,
+/// Set by `invalidate` when external output has scrolled the terminal out from
+/// under the view, forcing the next `render` to clear the screen and reprint
+/// rather than diff against a screen that no longer matches.
+force_reset: bool,
 
 pub const Size = struct { columns: usize, rows: usize };
 
@@ -190,11 +194,22 @@ pub fn init(gpa: std.mem.Allocator, writer: *std.Io.Writer) View {
         .cursor_visible = false,
         .sink = undefined,
         .structural_change = false,
+        .force_reset = false,
     };
 }
 
 pub fn deinit(self: *View) void {
     for (&self.frames) |*frame| frame.deinit(self.gpa);
+}
+
+/// Discard the view's belief about what is on screen: force the next `render` to
+/// clear the screen and scrollback and reprint the whole window. Used after
+/// external output (an OAuth login flow) has scrolled the terminal, so the diff
+/// against the last painted frame no longer holds. The caller has re-hidden the
+/// cursor, so tracking is reset to match.
+pub fn invalidate(self: *View) void {
+    self.force_reset = true;
+    self.cursor_visible = false;
 }
 
 /// Begin composing the next frame at `size` and `pages`: reset the back frame
@@ -226,7 +241,15 @@ pub fn render(self: *View) !void {
     const prev_empty = prev.rows.items.len == 0;
 
     if (back.rows.items.len == 0) {
-        try self.paintEmpty(prev_empty);
+        try self.paintEmpty(prev_empty and !self.force_reset);
+        self.force_reset = false;
+        self.front ^= 1;
+        return;
+    }
+
+    if (self.force_reset) {
+        self.force_reset = false;
+        try self.paint(.reset, 0, back, 0);
         self.front ^= 1;
         return;
     }
@@ -698,6 +721,25 @@ test "an unchanged frame emits only caret motion" {
     try std.testing.expect(std.mem.indexOf(u8, h.lastBytes(), escape.screen_reset) == null);
     try std.testing.expect(std.mem.indexOf(u8, h.lastBytes(), escape.screen_clear_below) == null);
     try std.testing.expect(std.mem.indexOf(u8, h.lastBytes(), "ab") == null);
+}
+
+test "invalidate forces a full reset even when content is unchanged" {
+    const gpa = std.testing.allocator;
+    const h = try harness(gpa, 10);
+    defer {
+        h.deinit();
+        gpa.destroy(h);
+    }
+    const frame = [_]Line{ line("hello", 0), line("world", 1) };
+    try h.render(&frame, .{ .columns = 10, .rows = 4 }, 2);
+    try h.emulator.expectVisible(&.{ "hello", "world" });
+
+    // External output scrolled the terminal; the same content must reprint from a
+    // full clear rather than diff to a caret-only paint.
+    h.view.invalidate();
+    try h.render(&frame, .{ .columns = 10, .rows = 4 }, 2);
+    try h.emulator.expectVisible(&.{ "hello", "world" });
+    try std.testing.expect(std.mem.indexOf(u8, h.lastBytes(), escape.screen_reset) != null);
 }
 
 test "a styled row reprinted from its own start carries its escapes" {

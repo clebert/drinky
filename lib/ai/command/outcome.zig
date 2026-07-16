@@ -5,9 +5,19 @@
 
 const std = @import("std");
 
+const llm = @import("../llm.zig");
+
 pub const Outcome = union(enum) {
     feedback: Feedback,
     pick: Pick,
+    /// Authenticate this subscription account, then switch to it. The app owns
+    /// the flow (it must suspend the tty around the OAuth browser callback); the
+    /// command only names the account.
+    login: llm.Account,
+    /// Drop this subscription account's stored credentials. The app owns the
+    /// aftermath: logging out the active account hands the session to the next
+    /// authenticated account, or forces a login when none remains.
+    logout: llm.Account,
 
     pub const Status = enum { ok, err };
 

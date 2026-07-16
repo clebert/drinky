@@ -73,7 +73,7 @@ test "the picker lists every level, preselecting the current one" {
             try std.testing.expectEqual(levels.len, pick.options.len);
             try std.testing.expectEqualStrings("high", pick.options[pick.current.?]);
         },
-        .feedback => return error.ExpectedPick,
+        else => return error.ExpectedPick,
     }
 }
 
@@ -89,7 +89,7 @@ test "select applies the level at a row index, rejecting out of range" {
             defer gpa.free(feedback.content);
             try std.testing.expect(!feedback.is_error);
         },
-        .pick => return error.ExpectedFeedback,
+        else => return error.ExpectedFeedback,
     }
     try std.testing.expectEqual(llm.Effort.xhigh, agent.effort);
 
@@ -98,7 +98,7 @@ test "select applies the level at a row index, rejecting out of range" {
             defer gpa.free(feedback.content);
             try std.testing.expect(feedback.is_error);
         },
-        .pick => return error.ExpectedFeedback,
+        else => return error.ExpectedFeedback,
     }
     try std.testing.expectEqual(llm.Effort.xhigh, agent.effort);
 }

@@ -233,6 +233,7 @@ const test_status: ui.status.Info = .{
     .context_window = 1000,
     .model = "footerqq",
     .effort = "high",
+    .signed_in = true,
 };
 
 // The whole projection end to end: a transcript plus the tail (the prompt editor

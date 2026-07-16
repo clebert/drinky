@@ -124,6 +124,23 @@ pub fn login(self: *Accounts, account: llm.Account, out: *std.Io.Writer) !void {
     }
 }
 
+/// Drop a subscription `account`'s stored credentials, marking it no longer
+/// authenticated. An API account has no login to drop (its key comes from the
+/// environment), so it is an error.
+pub fn logout(self: *Accounts, account: llm.Account) !void {
+    switch (account) {
+        .anthropic_subscription => {
+            try self.anthropic_auth.logout();
+            self.anthropic_subscription_ready = false;
+        },
+        .openai_subscription => {
+            try self.openai_auth.logout();
+            self.openai_subscription_ready = false;
+        },
+        .anthropic_api, .openai_api => return error.ApiAccountHasNoLogout,
+    }
+}
+
 fn testAccounts(keys: ApiKeys, anthropic_ready: bool, openai_ready: bool) Accounts {
     return .{
         .gpa = std.testing.allocator,
@@ -153,6 +170,12 @@ test "isAuthenticated and firstAuthenticated read keys and readiness, subscripti
 
     var none = testAccounts(.{}, false, false);
     try std.testing.expect(none.firstAuthenticated() == null);
+}
+
+test "logout rejects api accounts, which are env-sourced" {
+    var accounts = testAccounts(.{ .anthropic = "sk-ant" }, false, false);
+    try std.testing.expectError(error.ApiAccountHasNoLogout, accounts.logout(.anthropic_api));
+    try std.testing.expectError(error.ApiAccountHasNoLogout, accounts.logout(.openai_api));
 }
 
 test "client selects the arm for an authenticated account, null otherwise" {

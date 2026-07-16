@@ -17,7 +17,13 @@ pub const Info = struct {
     context_window: u64,
     model: []const u8,
     effort: []const u8,
+    /// Whether an account is active. When false the right side reads "not signed
+    /// in" instead of the model and effort, which are then unusable.
+    signed_in: bool,
 };
+
+/// The right-side indicator shown while no account is active.
+const signed_out_label = "not signed in";
 
 /// Separates the model name from its effort level on the right of the line.
 const separator = " • ";
@@ -35,17 +41,23 @@ pub fn render(placement: *const paint.Placement, info: *const Info) !void {
     writeStats(&stats, info) catch unreachable;
     const line = stats.buffered();
     const stats_columns = terminal.width.ofText(line);
-    const right_columns = terminal.width.ofText(info.model) +
-        terminal.width.ofText(separator) + terminal.width.ofText(info.effort);
+    const right_columns = if (info.signed_in)
+        terminal.width.ofText(info.model) + terminal.width.ofText(separator) + terminal.width.ofText(info.effort)
+    else
+        terminal.width.ofText(signed_out_label);
 
     const writer = placement.sink.begin();
     try writer.writeAll(color.dim);
     if (stats_columns + right_columns + 1 <= placement.columns) {
         try writer.writeAll(line);
         try writer.splatByteAll(' ', placement.columns - stats_columns - right_columns);
-        try writer.writeAll(info.model);
-        try writer.writeAll(separator);
-        try writer.writeAll(info.effort);
+        if (info.signed_in) {
+            try writer.writeAll(info.model);
+            try writer.writeAll(separator);
+            try writer.writeAll(info.effort);
+        } else {
+            try writer.writeAll(signed_out_label);
+        }
     } else {
         try writer.writeAll(terminal.width.truncate(line, placement.columns));
     }
@@ -125,6 +137,7 @@ test render {
         .context_window = 1_000_000,
         .model = "claude-opus-4-8",
         .effort = "xhigh",
+        .signed_in = true,
     };
 
     const sink = try view.beginFrame(.{ .columns = 120, .rows = 24 }, 4);
@@ -138,4 +151,30 @@ test render {
     try std.testing.expect(std.mem.indexOf(u8, painted, "$0.39 saved $0.82") != null);
     // The model and effort are right-aligned, so they land after the stats.
     try std.testing.expect(std.mem.indexOf(u8, painted, "claude-opus-4-8 • xhigh").? > std.mem.indexOf(u8, painted, "ctx 21%").?);
+}
+
+test "a signed-out status shows the indicator in place of the model" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var view = terminal.View.init(gpa, &out.writer);
+    defer view.deinit();
+    const info: Info = .{
+        .last = .{},
+        .cost = 0,
+        .saved = 0,
+        .context_window = 200_000,
+        .model = "claude-opus-4-8",
+        .effort = "xhigh",
+        .signed_in = false,
+    };
+
+    const sink = try view.beginFrame(.{ .columns = 120, .rows = 24 }, 4);
+    const placement: paint.Placement = .{ .sink = sink, .id = 0, .columns = 120, .base = 0, .skip = 0 };
+    try render(&placement, &info);
+    try view.render();
+
+    const painted = out.written();
+    try std.testing.expect(std.mem.indexOf(u8, painted, "not signed in") != null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "claude-opus-4-8") == null);
 }

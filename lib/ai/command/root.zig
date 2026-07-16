@@ -10,6 +10,8 @@ pub const Context = @import("Context.zig");
 pub const Outcome = @import("outcome.zig").Outcome;
 
 const effort = @import("effort.zig");
+const login = @import("login.zig");
+const logout = @import("logout.zig");
 const model = @import("model.zig");
 
 const Entry = struct {
@@ -23,6 +25,8 @@ const Entry = struct {
 const registry = [_]Entry{
     .{ .name = model.name, .run = model.run, .select = model.select },
     .{ .name = effort.name, .run = effort.run, .select = effort.select },
+    .{ .name = login.name, .run = login.run, .select = login.select },
+    .{ .name = logout.name, .run = logout.run, .select = logout.select },
 };
 
 /// Dispatch `line` (a full input line beginning with `/`) to its command,
@@ -64,6 +68,6 @@ test "unknown command is reported" {
             defer gpa.free(feedback.content);
             try std.testing.expect(feedback.is_error);
         },
-        .pick => return error.ExpectedFeedback,
+        else => return error.ExpectedFeedback,
     }
 }

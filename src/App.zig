@@ -62,6 +62,9 @@ tty: terminal.Tty,
 /// SIGWINCH watcher: turns terminal resizes into `.resize` events.
 resize: terminal.Resize,
 accounts: ai.Accounts,
+/// The configured default model per account, so switching accounts mid-session
+/// (a `/model`, `/login`, or `/logout`) resolves the same model startup would.
+default_models: Config.DefaultModels,
 agent: ai.Agent,
 /// The consumer-owned model and rendering, driven by the loop.
 session: Session,
@@ -151,9 +154,10 @@ const TurnHandler = struct {
     }
 };
 
-/// Authenticate (logging in if needed), then run the interactive loop until the
-/// user quits or stdin closes. Pin the value: streams and the channel borrow its
-/// buffers.
+/// Wire up the tty, agent, and session, then run the interactive loop until the
+/// user quits or stdin closes. When no account is authenticated the session
+/// starts signed out and the login picker opens so the user signs in. Pin the
+/// value: streams and the channel borrow its buffers.
 pub fn run(self: *App, gpa: std.mem.Allocator, io: std.Io, home: []const u8, api_keys: ai.Accounts.ApiKeys) !void {
     self.gpa = gpa;
     self.io = io;
@@ -167,14 +171,20 @@ pub fn run(self: *App, gpa: std.mem.Allocator, io: std.Io, home: []const u8, api
     self.queue = std.Io.Queue(Session.UiEvent).init(&self.queue_buffer);
 
     const config = try Config.load(gpa, io, home);
+    defer config.deinit(gpa);
 
     self.accounts = try ai.Accounts.init(gpa, io, home, config.timeouts, api_keys);
     defer self.accounts.deinit();
-    const active = try self.ensureAnyAuth();
+    self.default_models = config.default_models;
 
-    const active_model = config.default_models.get(active) orelse compiledDefault(active);
-    const client = self.accounts.client(active).?;
-    self.agent = ai.Agent.init(gpa, io, client, .{ .model = active_model, .system = system_prompt, .retry = config.retry, .effort = effort });
+    // Start on the first authenticated account, or signed out (no client) when
+    // none is — the login picker opens below to sign in. The model is resolved
+    // for the chosen or placeholder account either way, so the status line has one
+    // to show.
+    const active = self.accounts.firstAuthenticated();
+    const start_account = active orelse .anthropic_subscription;
+    const start_client = if (active) |account| self.accounts.client(account) else null;
+    self.agent = ai.Agent.init(gpa, io, start_client, .{ .model = self.defaultModel(start_account), .system = system_prompt, .retry = config.retry, .effort = effort });
     defer self.agent.deinit();
 
     try self.tty.init(io);
@@ -185,10 +195,21 @@ pub fn run(self: *App, gpa: std.mem.Allocator, io: std.Io, home: []const u8, api
 
     self.session = Session.init(gpa, self.tty.writer(), self.agent.model, self.agent.effort);
     defer self.session.deinit();
+    self.session.signed_in = self.signedIn();
     self.input = terminal.Input.init(gpa);
     defer self.input.deinit();
 
     try self.session.transcript.append(.intro, false, intro_text);
+    // Surface any configured default-model name that did not resolve, so a typo or
+    // wrong-vendor entry is not silently ignored.
+    for (config.dropped_defaults) |dropped|
+        try self.report(.err, "config: default model \"{s}\" is not a valid model for {s}; using {s}", .{ dropped.name, dropped.account.label(), self.defaultModel(dropped.account).name });
+    // No account signed in: open the login picker (the same one /login opens) so
+    // the user chooses how to sign in.
+    if (!self.signedIn()) {
+        try self.report(.ok, "no account is signed in — choose one to log in", .{});
+        try self.openLoginPicker();
+    }
     try self.refresh();
     self.last_paint_ms = self.nowMs();
 
@@ -361,16 +382,10 @@ fn runTurnWorker(self: *App, text: []u8) void {
     };
 }
 
-/// Choose and authenticate the session's active account: the first account with a
-/// stored credential or an environment key, in enum order. When none is present,
-/// bootstrap with an interactive Anthropic subscription login (before the tty is
-/// live), matching the first-run flow.
-fn ensureAnyAuth(self: *App) !ai.llm.Account {
-    if (self.accounts.firstAuthenticated()) |account| return account;
-    var buffer: [4096]u8 = undefined;
-    var stdout = std.Io.File.stdout().writerStreaming(self.io, &buffer);
-    try self.accounts.login(.anthropic_subscription, &stdout.interface);
-    return .anthropic_subscription;
+/// Whether an account is active (the agent has a client). False leaves the
+/// session signed out — normal messages are refused until a login.
+fn signedIn(self: *const App) bool {
+    return self.agent.client != null;
 }
 
 /// The compiled fallback model for `account`'s vendor.
@@ -379,6 +394,12 @@ fn compiledDefault(account: ai.llm.Account) ai.models.Model {
         .anthropic => anthropic_default,
         .openai => openai_default,
     };
+}
+
+/// The model to start `account` on: the configured default, else the compiled
+/// per-vendor fallback.
+fn defaultModel(self: *const App, account: ai.llm.Account) ai.models.Model {
+    return self.default_models.get(account) orelse compiledDefault(account);
 }
 
 /// Decode a stdin chunk into key events and apply each. Runs on the consumer, so
@@ -570,6 +591,8 @@ fn submit(self: *App) !void {
 
     if (std.mem.startsWith(u8, text, "/")) {
         try self.runCommand(text);
+    } else if (!self.signedIn()) {
+        try self.report(.err, "not signed in — use /login to sign in", .{});
     } else {
         try self.session.transcript.append(.user, false, text);
         try self.runTurn(text);
@@ -592,12 +615,88 @@ fn runTurn(self: *App, text: []const u8) !void {
     self.session.beginTurn();
 }
 
-/// Handle a slash command locally, applying its outcome to the session.
+/// Handle a slash command locally, applying its outcome.
 fn runCommand(self: *App, line: []const u8) !void {
     var context: ai.command.Context = .{ .gpa = self.gpa, .agent = &self.agent, .accounts = &self.accounts };
-    try self.session.applyOutcome(try ai.command.run(&context, line));
+    try self.applyOutcome(try ai.command.run(&context, line));
+}
+
+/// Apply a command outcome: account actions (`/login`, `/logout`) need the tty
+/// and the agent, so the app runs them; everything else the session shows.
+fn applyOutcome(self: *App, outcome: ai.command.Outcome) !void {
+    switch (outcome) {
+        .login => |account| try self.loginAccount(account),
+        .logout => |account| try self.logoutAccount(account),
+        else => try self.session.applyOutcome(outcome),
+    }
     self.session.model_shown = self.agent.model;
     self.session.effort_shown = self.agent.effort;
+    self.session.signed_in = self.signedIn();
+}
+
+/// Open the login picker — the same picker `/login` opens — so the user chooses
+/// how to sign in. Used at startup and after logging out the last account.
+fn openLoginPicker(self: *App) !void {
+    var context: ai.command.Context = .{ .gpa = self.gpa, .agent = &self.agent, .accounts = &self.accounts };
+    try self.session.applyOutcome(try ai.command.run(&context, "/login"));
+}
+
+/// Log in to a subscription `account`, then switch to it on its default model.
+/// A failed login leaves the current account untouched.
+fn loginAccount(self: *App, account: ai.llm.Account) !void {
+    self.runOauth(account) catch |err| {
+        return self.report(.err, "login failed: {s}", .{@errorName(err)});
+    };
+    self.adopt(account);
+    try self.report(.ok, "logged in to {s}; using {s}", .{ account.label(), self.agent.model.name });
+}
+
+/// Drop a subscription `account`'s credentials. Logging out the active account
+/// hands the session to the next authenticated account (its default model), or —
+/// when none remains — drops to a signed-out state and opens the login picker so
+/// the user chooses how to sign back in. Commands cannot run mid-turn, so this
+/// never races a turn.
+fn logoutAccount(self: *App, account: ai.llm.Account) !void {
+    const was_active = if (self.agent.client) |client| client.account() == account else false;
+    self.accounts.logout(account) catch |err| {
+        return self.report(.err, "logout failed: {s}", .{@errorName(err)});
+    };
+    if (!was_active)
+        return self.report(.ok, "logged out of {s}", .{account.label()});
+    if (self.accounts.firstAuthenticated()) |next| {
+        self.adopt(next);
+        return self.report(.ok, "logged out of {s}; switched to {s} ({s})", .{ account.label(), self.agent.model.name, next.label() });
+    }
+    // No account remains: sign out and let the user choose from the login picker —
+    // no forced browser, no loop.
+    self.agent.signOut();
+    try self.report(.ok, "logged out of {s}; no account is signed in — choose one to log in", .{account.label()});
+    try self.openLoginPicker();
+}
+
+/// Run an account's interactive OAuth flow, suspending the raw-mode interface
+/// around it so the URL prints cleanly and the browser callback can complete,
+/// then restoring raw mode and forcing a full repaint. The blocked input reader
+/// touches only stdin, so it does not interfere.
+fn runOauth(self: *App, account: ai.llm.Account) !void {
+    self.tty.leaveRaw();
+    defer {
+        self.tty.enterRaw() catch {};
+        self.session.view.invalidate();
+        self.session.markDirty();
+    }
+    try self.accounts.login(account, self.tty.writer());
+}
+
+/// Switch the agent to `account` on its default model. The client is present
+/// because the caller just authenticated the account or read it from the registry.
+fn adopt(self: *App, account: ai.llm.Account) void {
+    self.agent.switchTo(self.accounts.client(account).?, self.defaultModel(account));
+}
+
+/// Show one feedback line in the transcript.
+fn report(self: *App, status: ai.command.Outcome.Status, comptime format: []const u8, args: anytype) !void {
+    try self.session.applyOutcome(try ai.command.Outcome.report(self.gpa, status, format, args));
 }
 
 fn handlePickerKey(self: *App, event: terminal.Input.Key) !void {
@@ -622,7 +721,5 @@ fn confirmPicker(self: *App) !void {
     var context: ai.command.Context = .{ .gpa = self.gpa, .agent = &self.agent, .accounts = &self.accounts };
     const outcome = try ai.command.select(&context, picking.command, picking.picker.selectedIndex());
     self.session.closePicker();
-    try self.session.applyOutcome(outcome);
-    self.session.model_shown = self.agent.model;
-    self.session.effort_shown = self.agent.effort;
+    try self.applyOutcome(outcome);
 }

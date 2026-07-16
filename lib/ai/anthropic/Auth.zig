@@ -109,6 +109,18 @@ pub fn login(self: *Auth, out: *std.Io.Writer) !void {
     try out.flush();
 }
 
+/// Drop this account's credentials: clear the in-memory tokens and remove its
+/// entry from `auth.json`, dropping the legacy flat keys too (this account owned
+/// them) while preserving every other account's entry.
+pub fn logout(self: *Auth) !void {
+    // Remove the on-disk entry first: a failed remove then leaves the credentials
+    // fully intact (in memory and the caller's readiness flag), so logout is
+    // atomic rather than leaving a token-less account still marked authenticated.
+    try auth_store.remove(self.gpa, self.io, self.path, account_key, .{ .drop_flat = true });
+    if (self.tokens) |tokens| tokens.deinit(self.gpa);
+    self.tokens = null;
+}
+
 /// The on-disk shape of this account's entry.
 const Entry = struct {
     access: []const u8,
