@@ -19,17 +19,17 @@ const codex_url = "https://chatgpt.com/backend-api/codex/responses";
 /// demand); an API account holds a bare key (owned by the caller). The active tag
 /// picks the account, so `Client.init` needs no separate selector.
 pub const Credentials = union(llm.Account) {
-    anthropic_api: []const u8,
     anthropic_subscription: *anthropic.Auth,
-    openai_api: []const u8,
+    anthropic_api: []const u8,
     openai_subscription: *openai.Auth,
+    openai_api: []const u8,
 };
 
 pub const Client = union(llm.Account) {
-    anthropic_api: ApiKey,
     anthropic_subscription: AnthropicSubscription,
-    openai_api: ApiKey,
+    anthropic_api: ApiKey,
     openai_subscription: OpenaiSubscription,
+    openai_api: ApiKey,
 
     const ApiKey = struct {
         gpa: std.mem.Allocator,
@@ -141,10 +141,10 @@ pub const Client = union(llm.Account) {
 /// a vendor share that vendor's transport stream — they differ only in how the
 /// request was sent, not in how the response decodes.
 pub const Stream = union(llm.Account) {
-    anthropic_api: anthropic.Transport.Stream,
     anthropic_subscription: anthropic.Transport.Stream,
-    openai_api: openai.Transport.Stream,
+    anthropic_api: anthropic.Transport.Stream,
     openai_subscription: openai.Transport.Stream,
+    openai_api: openai.Transport.Stream,
 
     pub fn deinit(self: *Stream) void {
         switch (self.*) {

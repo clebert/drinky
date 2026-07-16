@@ -123,9 +123,14 @@ pub fn deinit(self: *Agent) void {
     self.arena.deinit();
 }
 
-/// Switch the active model; takes effect on the next turn. History is untouched,
-/// so the new model reads the same conversation from its own context window.
-pub fn setModel(self: *Agent, model: models.Model) void {
+/// Switch the active account and model together; takes effect on the next turn.
+/// The client carries both the provider transport and the account whose reasoning
+/// blobs replay, so an account change and a model change are one atomic step — a
+/// model can never be paired with a foreign vendor's client. History is untouched:
+/// the new account reads the same conversation, dropping any reasoning it did not
+/// itself produce.
+pub fn switchTo(self: *Agent, client: provider.Client, model: models.Model) void {
+    self.client = client;
     self.model = model;
 }
 
@@ -525,7 +530,7 @@ test "usage is attributed to the model that produced it across a switch" {
 
     // `self.model` is opus, but this message was produced by sonnet. Pricing must
     // follow the passed model ($3, sonnet), not `self.model` ($5, opus).
-    agent.setModel(opus);
+    agent.switchTo(client, opus);
     agent.recordUsage(&sonnet, one_million);
     try std.testing.expectApproxEqAbs(@as(f64, 3), agent.stats.cost, 1e-9);
     try std.testing.expectApproxEqAbs(@as(f64, 3), agent.stats.by_model[0].cost, 1e-9);

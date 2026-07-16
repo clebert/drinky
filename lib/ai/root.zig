@@ -5,6 +5,7 @@
 
 const std = @import("std");
 
+pub const Accounts = @import("Accounts.zig");
 pub const Agent = @import("Agent.zig");
 pub const anthropic = @import("anthropic/root.zig");
 pub const auth_store = @import("auth_store.zig");

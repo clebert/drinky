@@ -125,8 +125,8 @@ commit history, `BACKLOG.md` (planned work), and `docs/`.
   redacted payload — kept in stream order ahead of the text and tool calls that followed it, so a
   turn preserves reasoning interleaved with its tool calls; each entry is replayed unchanged in
   every later request so the provider still accepts those tool calls.
-- Switches the active model and reasoning-effort level mid-session; the change takes effect on the
-  next turn and leaves history untouched.
+- Switches the active account, model, and reasoning-effort level mid-session; the change takes effect
+  on the next turn and leaves history untouched.
 - Messages queued during a turn are drained at each tool-round boundary (and when the model would
   otherwise end the turn), combined into one blank-line-joined user turn, appended to history, and
   reported to the presentation layer.
@@ -147,19 +147,22 @@ commit history, `BACKLOG.md` (planned work), and `docs/`.
 
 - The conversation is a flat, ordered sequence of items: user and assistant messages, reasoning
   runs, tool calls, and tool results.
-- A reasoning run records the provider that produced its opaque token, so only that provider replays
-  it and never feeds another's.
+- A reasoning run records the account that produced its opaque token; only that exact account
+  replays it, so any account switch — even between two billing products of one vendor — drops the
+  reasoning it did not itself produce, and an assistant turn left with nothing replayable is omitted
+  rather than sent as an empty message.
 - A provider-neutral interface every provider implements, producing a common stream of reply events
   (text, reasoning and its opaque token, redacted reasoning, tool-call starts, tool-argument chunks,
   completion) with usage-so-far readable mid-stream; each provider translates the item sequence to
   and from its own wire format, so nothing above depends on a specific provider.
-- Implemented providers: Anthropic.
+- Implemented providers: Anthropic and OpenAI.
 
 ### Model catalog & reasoning effort
 
-- Built-in model catalog — Anthropic `claude-opus-4-8`, `claude-sonnet-5`, and `claude-sonnet-4-6` —
-  each with prices, context window (1,000,000 tokens), maximum output tokens (128,000, with the
-  effort level governing actual spend), and a reasoning-effort map.
+- Built-in model catalog: Anthropic `claude-opus-4-8`, `claude-sonnet-5`, and `claude-sonnet-4-6`
+  (1,000,000-token context) and OpenAI `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna`
+  (1,050,000-token context) — each with prices, maximum output tokens (128,000, with the effort
+  level governing actual spend), and a reasoning-effort map.
 - Reasoning-effort levels `off` / `low` / `medium` / `high` / `xhigh` / `max`, each mapping to what
   a given model supports: a level a model lacks folds to the nearest it offers (`claude-sonnet-4-6`
   folds `xhigh` to `high`), a model without reasoning maps every level to off, and a model that
@@ -185,7 +188,9 @@ commit history, `BACKLOG.md` (planned work), and `docs/`.
 - When reasoning is enabled, requests adaptive, summarized extended thinking at the resolved effort
   level so the model sizes its own budget while the output ceiling stays fixed; omitted when effort
   is off, the model has no reasoning, or the model is unknown.
-- Sends OAuth identity headers and requests an unencoded response so SSE frames arrive verbatim.
+- Forks by account: the subscription path adds the Claude Code identity (a leading system block and
+  OAuth identity headers) and authorizes with a Bearer token; the API-key path omits both and
+  authorizes with `x-api-key`. Both request an unencoded response so SSE frames arrive verbatim.
 - Always-on prompt caching: cache breakpoints on the last system block, the last tool, and the last
   message block (3 of the 4 allowed).
 - Usage from all streamed events is folded into one total.
@@ -196,11 +201,32 @@ commit history, `BACKLOG.md` (planned work), and `docs/`.
   retry-after hint.
 - A cancel during the read surfaces as a clean abort, distinct from a timeout.
 
+### OpenAI transport
+
+- Builds each request for the Responses API from the same conversation items, sending each item as
+  its own input entry (never merged), with the system prompt as instructions and the tools as
+  function tools.
+- Streams responses over SSE, decoding them into the neutral reply events plus usage and stop
+  reason; the terminal completion carries the full usage, and a `[DONE]` sentinel ends the stream.
+- When reasoning is enabled, requests a summarized reasoning stream at the resolved effort level and
+  round-trips each reasoning item's encrypted payload and id verbatim so later turns replay it; no
+  server-side conversation state is retained between requests.
+- Partitions the prompt token count into cache-read, cache-write, and uncached buckets, so each
+  token is billed once at its bucket's rate.
+- Authorized with a platform API key (Bearer).
+
 ### Authentication
 
-- Credentials stored at `~/.pith/auth.json` with owner-only permissions.
+- Two authentication mechanisms per provider: an interactive subscription OAuth login, and a
+  platform API key read from the environment (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`).
+- Subscription credentials stored at `~/.pith/auth.json` with owner-only permissions, keyed by
+  account so several coexist in one file; a token refresh rewrites only its own account's entry, and
+  a save aborts rather than discarding the file's other accounts when it cannot be read back.
 - OAuth login: PKCE (S256), browser launch, and a loopback callback server to capture the code.
 - Access tokens refreshed and re-persisted automatically when expired.
+- At startup the active account is the first authenticated one — a stored subscription or an
+  available API key, preferring a subscription over a paid key when both are present; when none is
+  available, an interactive subscription login runs first.
 
 ### Tools
 
@@ -223,10 +249,10 @@ commit history, `BACKLOG.md` (planned work), and `docs/`.
 
 - Slash commands dispatch to produce either feedback text or an interactive picker; an unknown
   command reports an error.
-- **/model** — switch the model by name, or with no argument open a picker over the available models
-  with the active one marked.
-- **/effort** — set the reasoning-effort level by name, or with no argument open a picker over the
-  levels with the active one marked.
+- **/model** — open a picker over every account-qualified model the session is authenticated for
+  (each authenticated account's models, labeled by account), with the active one marked; selecting
+  one switches the active account and model together.
+- **/effort** — open a picker over the reasoning-effort levels with the active one marked.
 
 ---
 
@@ -234,8 +260,9 @@ commit history, `BACKLOG.md` (planned work), and `docs/`.
 
 ### Startup & event loop
 
-- Starts with a default model (`claude-opus-4-8`) and reasoning effort (`xhigh`) and sends a fixed
-  system prompt describing the agent and its tools.
+- Starts on the active account's model — named per account in configuration, or a compiled per-vendor
+  default (`claude-opus-4-8` for Anthropic, `gpt-5.6-sol` for OpenAI) — at a fixed reasoning effort
+  (`xhigh`), and sends a fixed system prompt describing the agent and its tools.
 - On launch, shows an intro line summarizing the key bindings.
 - The interface stays responsive throughout a turn: keyboard input, agent progress, frame ticks, and
   resizes are handled concurrently, so network and streaming I/O never freeze the interface.
@@ -245,7 +272,8 @@ commit history, `BACKLOG.md` (planned work), and `docs/`.
   reflows to the new dimensions.
 - Reads an optional configuration file at `~/.pith/config.json` — partial and forward-compatible —
   supplying request timeouts and retry policy (connect and idle timeouts, maximum attempts, and
-  initial and maximum backoff).
+  initial and maximum backoff) and a default model per account. It holds no secrets; API keys come
+  from the environment.
 - Authenticates, logging in if needed, before starting.
 - Ctrl+C clears the editor, or quits on a second press in quick succession; Ctrl+D quits when the
   editor is empty.

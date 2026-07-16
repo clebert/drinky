@@ -5,7 +5,12 @@
 
 const std = @import("std");
 
+const Accounts = @import("../Accounts.zig");
 const Agent = @import("../Agent.zig");
 
 gpa: std.mem.Allocator,
 agent: *Agent,
+/// The session's account registry: which accounts are authenticated and the
+/// client to switch to for one, so a command can select an account-qualified
+/// model.
+accounts: *Accounts,

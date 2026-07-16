@@ -1,7 +1,6 @@
-//! `/effort`: with no argument, open a picker over the reasoning-effort levels,
-//! preselecting the current one; with a name, switch to it from the next turn
-//! onward. An unknown name is reported, not applied. The picker feeds its choice
-//! back through the name path, mirroring `/model`.
+//! `/effort`: open a picker over the reasoning-effort levels, preselecting the
+//! current one; selecting one switches it from the next turn onward. There is no
+//! typed form — any argument is ignored and the picker opens regardless.
 
 const std = @import("std");
 
@@ -17,15 +16,8 @@ pub const name = "effort";
 const levels = std.enums.values(llm.Effort);
 
 pub fn run(context: *Context, args: []const u8) !Outcome {
+    _ = args;
     const gpa = context.gpa;
-    const requested = std.mem.trim(u8, args, " \t");
-
-    if (requested.len != 0) {
-        const chosen = std.meta.stringToEnum(llm.Effort, requested) orelse
-            return Outcome.report(gpa, .err, "unknown effort: {s}", .{requested});
-        context.agent.setEffort(chosen);
-        return Outcome.report(gpa, .ok, "effort set to {s}", .{@tagName(chosen)});
-    }
 
     const options = try gpa.alloc([]const u8, levels.len);
     var filled: usize = 0;
@@ -33,18 +25,26 @@ pub fn run(context: *Context, args: []const u8) !Outcome {
         for (options[0..filled]) |option| gpa.free(option);
         gpa.free(options);
     }
-    var current_index: ?usize = null;
+    var current: ?usize = null;
     for (levels, 0..) |level, index| {
         options[index] = try gpa.dupe(u8, @tagName(level));
         filled += 1;
-        if (level == context.agent.effort) current_index = index;
+        if (level == context.agent.effort) current = index;
     }
     return .{ .pick = .{
         .command = name,
         .title = "Select reasoning effort",
         .options = options,
-        .current = current_index,
+        .current = current,
     } };
+}
+
+pub fn select(context: *Context, index: usize) !Outcome {
+    const gpa = context.gpa;
+    if (index >= levels.len) return Outcome.report(gpa, .err, "invalid selection", .{});
+    const level = levels[index];
+    context.agent.setEffort(level);
+    return Outcome.report(gpa, .ok, "effort set to {s}", .{@tagName(level)});
 }
 
 fn testAgent(gpa: std.mem.Allocator) Agent {
@@ -56,37 +56,12 @@ fn testAgent(gpa: std.mem.Allocator) Agent {
     });
 }
 
-test "switch to a known level, reject an unknown one" {
-    const gpa = std.testing.allocator;
-    var agent = testAgent(gpa);
-    defer agent.deinit();
-    var context: Context = .{ .gpa = gpa, .agent = &agent };
-
-    switch (try run(&context, "xhigh")) {
-        .feedback => |feedback| {
-            defer gpa.free(feedback.content);
-            try std.testing.expect(!feedback.is_error);
-        },
-        .pick => return error.ExpectedFeedback,
-    }
-    try std.testing.expectEqual(llm.Effort.xhigh, agent.effort);
-
-    switch (try run(&context, "turbo")) {
-        .feedback => |feedback| {
-            defer gpa.free(feedback.content);
-            try std.testing.expect(feedback.is_error);
-        },
-        .pick => return error.ExpectedFeedback,
-    }
-    try std.testing.expectEqual(llm.Effort.xhigh, agent.effort);
-}
-
-test "no argument opens a picker preselecting the current level" {
+test "the picker lists every level, preselecting the current one" {
     const gpa = std.testing.allocator;
     var agent = testAgent(gpa);
     defer agent.deinit();
     agent.setEffort(.high);
-    var context: Context = .{ .gpa = gpa, .agent = &agent };
+    var context: Context = .{ .gpa = gpa, .agent = &agent, .accounts = undefined };
 
     switch (try run(&context, "")) {
         .pick => |pick| {
@@ -100,4 +75,30 @@ test "no argument opens a picker preselecting the current level" {
         },
         .feedback => return error.ExpectedPick,
     }
+}
+
+test "select applies the level at a row index, rejecting out of range" {
+    const gpa = std.testing.allocator;
+    var agent = testAgent(gpa);
+    defer agent.deinit();
+    var context: Context = .{ .gpa = gpa, .agent = &agent, .accounts = undefined };
+
+    // Levels are declared off, low, medium, high, xhigh, max — index 4 is xhigh.
+    switch (try select(&context, 4)) {
+        .feedback => |feedback| {
+            defer gpa.free(feedback.content);
+            try std.testing.expect(!feedback.is_error);
+        },
+        .pick => return error.ExpectedFeedback,
+    }
+    try std.testing.expectEqual(llm.Effort.xhigh, agent.effort);
+
+    switch (try select(&context, 99)) {
+        .feedback => |feedback| {
+            defer gpa.free(feedback.content);
+            try std.testing.expect(feedback.is_error);
+        },
+        .pick => return error.ExpectedFeedback,
+    }
+    try std.testing.expectEqual(llm.Effort.xhigh, agent.effort);
 }

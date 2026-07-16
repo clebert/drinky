@@ -1,8 +1,8 @@
 # Backlog
 
 Planned features for pith, roughly ordered by dependency. Everything below builds on the current
-base: a compiled-in model table (`/model` and `/effort` switch model and reasoning effort at
-runtime), a hardcoded system prompt, a fixed set of file/search tools, and slash commands
+base: a compiled-in model table (`/model` and `/effort` switch the account+model and reasoning
+effort at runtime), a hardcoded system prompt, a fixed set of file/search tools, and slash commands
 intercepted from the input line before it reaches the agent loop.
 
 Extension seams referenced here:
@@ -12,8 +12,10 @@ Extension seams referenced here:
   handle for subagents).
 - `lib/ai/llm.zig` — provider-neutral data model (roles, reasoning-effort levels, blocks incl.
   thinking, requests, events).
-- `lib/ai/provider.zig` — provider seam; `Client`/`Stream` unions (the provider `Kind` now lives in
-  `llm.zig` as `Provider`).
+- `lib/ai/provider.zig` — provider seam; `Client`/`Stream`/`Credentials` unions keyed by
+  `llm.Account` (vendor × billing product), with `llm.Provider` the coarser vendor axis.
+- `lib/ai/Accounts.zig` — the account registry: which accounts are authenticated (an env API key or
+  a stored subscription) and the client to switch to for one.
 - `lib/ai/anthropic/wire.zig` — request serializer.
 - `lib/ai/anthropic/Transport.zig` — HTTP + SSE decode.
 - `src/App.zig` — composition root, event loop, key handling, submit path.
@@ -39,23 +41,26 @@ Extension seams referenced here:
 
 - [x] **Slash-command parsing.** Lines starting with `/` are intercepted in `App.submit` and routed
       to `command/root.zig` — a registry (name → handler) mirroring the tool registry, with a
-      `command.Context` (gpa + `*Agent`) and a `command.Outcome` union (`feedback` text/`is_error`,
-      or an interactive `pick` request). `command.run` parses a typed line; `command.apply` runs a
-      name + argument directly. Everything below hangs off this.
-- [x] **`/model`** — switch the active model at runtime by name, or with no argument open an
-      interactive picker (↑/↓, enter, ctrl-c) over the active provider's models with the current one
-      marked. `Agent.setModel` is the live-reconfigure seam (takes effect next turn);
-      `provider.Client.kind` and `models.list` back the list. A command returns a `command.Outcome`
-      (`feedback` or `pick`); the app owns the reusable `ui.Picker` and, on selection, re-applies
-      the command with the choice via `command.apply` — so the widget stays generic. Per-message
-      cost attribution across a switch is handled below.
+      `command.Context` (gpa + `*Agent` + `*Accounts`) and a `command.Outcome` union (`feedback`
+      text/`is_error`, or an interactive `pick` request). `command.run` parses and dispatches a
+      typed line; `command.select` applies a chosen picker row by index. Everything below hangs off
+      this.
+- [x] **`/model`** — a picker-only chooser (↑/↓, enter, ctrl-c) over every account-qualified model
+      the session is authenticated for (each authenticated account's models, labeled by account),
+      with the active one marked; there is no typed form, since a model is always chosen together
+      with its account. `Agent.switchTo` swaps the client and model together (takes effect next
+      turn), the client built from the `Accounts` registry; `Accounts.isAuthenticated` /
+      `models.list` back the list. A command returns a `command.Outcome` (`feedback` or `pick`); the app owns the reusable
+      `ui.Picker` and, on selection, applies the chosen row index via `command.select`, which
+      re-derives the list — so the widget stays generic. Per-message cost attribution across a
+      switch is handled below.
 - [ ] **Slash-command Tab completion.** Complete a partial slash command on Tab: while the line
       starts with `/` and no argument has been typed, match the prefix against the command registry
       and fill in the rest, cycling or listing the candidates when several match. Needs a Tab key
       (`Input` currently decodes it to `ctrl-i`) and a `command.complete(prefix)` seam beside
-      `command.apply`; the candidate list can reuse `ui.Picker`.
-- [x] **`/effort`** — set the reasoning-effort level by name, or with no argument open a picker over
-      the levels with the current one marked (mirroring `/model`); shown on the status line so the
+      `command.run`; the candidate list can reuse `ui.Picker`.
+- [x] **`/effort`** — pick the reasoning-effort level from a picker over the levels with the current
+      one marked (picker-only, mirroring `/model`); shown on the status line so the
       right side reads `model • effort` (e.g. `claude-opus-4-8 • xhigh`). `llm.Effort`
       (`off`/`low`/`medium`/`high`/`xhigh`/`max`) is threaded onto `llm.Request` and into
       `ui.status.Info`, with `Agent.setEffort` the live-reconfigure seam (takes effect next turn).
@@ -84,6 +89,13 @@ Extension seams referenced here:
       (routed in `App.submit`). The active-turn path also needs the steering message queue.
 - [ ] **`/subagent`** (or `/agents`) — list, pick, and dispatch to a user-defined subagent. Depends
       on the subagent runtime below.
+- [ ] **`/login` and `/logout`.** Authenticate or drop an account's credentials mid-session without
+      a restart. Login runs the subscription OAuth flow (browser + loopback callback) that today
+      runs only pre-tty at startup, so it must suspend the tty and restore it afterward; logout
+      removes an account's `auth.json` entry, and logging out the active account leaves the session
+      with no client until the next `/model` switch — the reason `Agent.client` would become an
+      optional, deferred here with it. This is what makes an `openai_subscription` (Codex) account
+      reachable; API-key accounts have no login (their key is env-sourced).
 
 ## Configuration & context
 
@@ -100,6 +112,13 @@ Extension seams referenced here:
       Needs: a nested agent loop reachable from a tool/command, agent definitions loaded from disk,
       per-agent tool allowlists enforced in dispatch, and a provider handle exposed via
       `tool/Context.zig` (already anticipated there). Backs `/subagent`.
+- [ ] **Persist the active account and model across sessions.** `/model` switches and the startup
+      account are session-only, so a restart falls back to the first authenticated account (enum
+      order) and its configured/compiled default model. Remember the last-used account+model
+      instead. This is mutable, machine-local state that does not belong in `config.json` (meant to
+      be shared, e.g. committed across installations), so it wants a separate local state file — and
+      a deliberate naming choice for the split (a shared `config` vs. a local `settings`/state
+      file), not an ad-hoc second file.
 
 ## Providers & efficiency
 
@@ -131,27 +150,21 @@ Extension seams referenced here:
       maps (today compiled `EffortMap`s) without a rebuild. Compiled defaults stay authoritative, so
       a known model always has a known window; the file only patches or adds. Ties into `/cache-ttl`
       (per-TTL write rates) and the `/model` / `/effort` commands.
-- [ ] **Other providers (OpenAI, …).** Add a `Provider` arm in `llm.zig` (and a matching
-      `provider.zig` union arm) and an `openai/` module (wire + transport) mirroring `anthropic/`.
-      Everything above `provider.zig` is already provider-agnostic. Reconciles with `/model`,
-      `/effort`, caching, and stats.
-- [ ] **Account switch: empty assistant content (Anthropic 400).** [Deferred to the account-switch
-      commit — reachable only once the active account can change mid-session.] Reasoning replay is
-      an exact account match (`origin == account` in `anthropic/wire.zig`), so a mid-session account
-      switch drops every reasoning item the old account produced. An assistant run that was
-      reasoning-only (a reasoning item with no following text or tool call — a turn that stopped
-      right after thinking) then serializes to a message envelope with `"content":[]`, which
-      Anthropic rejects with a 400. Not reachable while one account is hardwired per session. Fix
-      when the switch lands: have the serializer skip an assistant envelope that would emit zero
-      blocks (a small look-ahead), and test it against a switch that drops a reasoning-only run.
-- [ ] **Account switch: corrupt `auth.json` clobbers a sibling account on save.** [Deferred to the
-      account-switch commit — blast radius appears only with multiple stored accounts.]
-      `auth_store.serializeMerged` tolerates an unparseable existing file by starting from a fresh
-      object, so a token-refresh save would drop every other account's entry. Guarded today because
-      `load` parses (and errors) before any save, and only one account is ever written; with several
-      accounts persisted, an externally corrupted file could make one account's refresh wipe
-      another's. Fix when the registry lands: make `serializeMerged`/`save` return an error on an
-      unparseable existing file rather than silently starting fresh.
+- [x] **Other providers (OpenAI).** An `openai/` module (Responses wire + SSE transport) sits behind
+      the two-axis provider seam; the neutral item model, `/model`, `/effort`, caching, and stats
+      are provider-agnostic and reconcile with it. Two accounts share it: `openai_api` (env
+      `OPENAI_API_KEY`, Bearer, `api.openai.com`) is user-reachable now; `openai_subscription`
+      (Codex OAuth) is built but reachable only once mid-session `/login` lands (below).
+- [x] **Account switch: empty assistant content (Anthropic 400).** The Anthropic serializer skips an
+      assistant envelope that would emit zero blocks — a reasoning-only run whose reasoning is
+      dropped by exact-account replay (`origin != account`) or by reasoning-off — instead of sending
+      `"content":[]`, which Anthropic rejects with a 400. Two user runs left adjacent by such a skip
+      merge into one envelope, and the history cache breakpoint moves to the last block actually
+      emitted. Covered by a switch that drops a reasoning-only run.
+- [x] **Account switch: corrupt `auth.json` clobbers a sibling account on save.**
+      `auth_store.serializeMerged` / `save` return `error.BadCredentials` on an unparseable or
+      non-object existing file instead of starting from a fresh object, so a token-refresh save can
+      never wipe every other account's entry by rewriting a file it could not read back.
 
 ## Networking & resilience
 
@@ -430,12 +443,14 @@ Extension seams referenced here:
 
 - [ ] **Permission model.** No allow/deny concept exists. Bash, subagent tool allowlists, and
       write/edit gating all want a shared answer here.
-- [ ] **Config file.** Format and location are now settled: `$HOME/.pith/config.json`, loaded by
+- [ ] **Config file.** Format and location are settled: `$HOME/.pith/config.json`, loaded by
       `src/Config.zig` (typed `std.json` parse; a missing file, section, or field falls back to a
       built-in default and unknown keys are ignored, so it is optional, partial, and
-      forward-compatible). Today it carries only the `request` section (network timeouts + retry
-      policy), folded into the neutral `ai.net.Timeouts`/`ai.net.Retry` structs. Still to fold in as
-      those features land: system prompt, model/effort defaults, provider keys, skill/agent/prompt
-      directories (see the `models.json` runtime catalog item, which may merge here), and the
-      compiled-in limits exposed elsewhere in this backlog — the transcript window (UI) and the
-      tool-round cap (Networking & resilience).
+      forward-compatible). It carries the `request` section (network timeouts + retry policy, folded
+      into the neutral `ai.net.Timeouts`/`ai.net.Retry` structs) and `default_models` (a model name
+      per account, resolved against the compiled table). API keys are deliberately env-only, never
+      config — no secrets in a shareable file. Still to fold in as those features land: system
+      prompt, skill/agent/prompt directories (see the `models.json` runtime catalog item, which may
+      merge here), and the compiled-in limits exposed elsewhere in this backlog — the transcript
+      window (UI) and the tool-round cap (Networking & resilience). Mutable machine-local state (the
+      active account+model, see Configuration & context) belongs in a separate local file, not here.

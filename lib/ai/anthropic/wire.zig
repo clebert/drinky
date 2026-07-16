@@ -72,13 +72,19 @@ pub fn serialize(gpa: std.mem.Allocator, request: llm.Request, account: llm.Acco
     // `user` item) and emit one block per item in list order — never reordering
     // (reasoning already arrives at the head from the agent) and never
     // concatenating adjacent text (each stays its own block, preserving
-    // `[tool_use, text]` interleaving and multi-text turns). The last block of
-    // the last message is the last item overall, so it carries the history cache
-    // breakpoint.
+    // `[tool_use, text]` interleaving and multi-text turns). An item that emits no
+    // block (a reasoning item dropped because reasoning is off or its origin is a
+    // different account) is skipped without opening an envelope, so an
+    // assistant run that was reasoning-only never serializes to an empty
+    // `content` array (which Anthropic rejects with a 400); two user runs left
+    // adjacent by such a skip merge into one envelope. The last emitted block
+    // carries the history cache breakpoint.
     try json.objectField("messages");
     try json.beginArray();
+    const last_block = lastBlockIndex(request.items, reasoning != null, account);
     var open_role: ?llm.Role = null;
     for (request.items, 0..) |item, index| {
+        if (!emitsBlock(item, reasoning != null, account)) continue;
         const role = itemRole(item);
         if (open_role == null or open_role.? != role) {
             if (open_role != null) try endMessage(&json);
@@ -89,7 +95,7 @@ pub fn serialize(gpa: std.mem.Allocator, request: llm.Request, account: llm.Acco
             try json.beginArray();
             open_role = role;
         }
-        try writeItem(&json, item, index == request.items.len - 1, reasoning != null, account);
+        try writeItem(&json, item, index == last_block);
     }
     if (open_role != null) try endMessage(&json);
     try json.endArray();
@@ -201,6 +207,26 @@ fn writeTool(json: *std.json.Stringify, tool: llm.Tool, cache: bool) !void {
     try json.endObject();
 }
 
+/// Whether an item serializes to a content block. Every item does except a
+/// reasoning item that is dropped — reasoning off, or a blob from a different
+/// account, neither of which this serializer can replay.
+fn emitsBlock(item: llm.Item, emit_thinking: bool, account: llm.Account) bool {
+    return switch (item) {
+        .reasoning => |reasoning| emit_thinking and reasoning.origin == account,
+        else => true,
+    };
+}
+
+/// Index of the last item that emits a block, or null when none do — the block
+/// that carries the history cache breakpoint.
+fn lastBlockIndex(items: []const llm.Item, emit_thinking: bool, account: llm.Account) ?usize {
+    var last: ?usize = null;
+    for (items, 0..) |item, index| {
+        if (emitsBlock(item, emit_thinking, account)) last = index;
+    }
+    return last;
+}
+
 /// The Anthropic message role an item belongs to: reasoning and tool calls are
 /// assistant output; a tool result is fed back as a user item.
 fn itemRole(item: llm.Item) llm.Role {
@@ -216,17 +242,15 @@ fn endMessage(json: *std.json.Stringify) !void {
     try json.endObject();
 }
 
-fn writeItem(json: *std.json.Stringify, item: llm.Item, cache: bool, emit_thinking: bool, account: llm.Account) !void {
+fn writeItem(json: *std.json.Stringify, item: llm.Item, cache: bool) !void {
     const control: ?CacheControl = if (cache) .{} else null;
     switch (item) {
         .message => |message| try json.write(TextBlock{ .text = message.text, .cache_control = control }),
-        // Reasoning sits only at the head of an assistant message, never as the
-        // cached last block, so it carries no cache breakpoint. A blob from any
-        // other account is dropped whole (its signature can't be verified here),
-        // and with reasoning off it is dropped too: the provider would only strip
-        // it.
-        .reasoning => |reasoning| if (emit_thinking and reasoning.origin == account)
-            try writeThinking(json, reasoning),
+        // `emitsBlock` already dropped any reasoning this account cannot replay, so
+        // reaching here means the blob is ours. Reasoning sits at the head of an
+        // assistant message, never as the cached last block, so it carries no
+        // cache breakpoint.
+        .reasoning => |reasoning| try writeThinking(json, reasoning),
         // The model emits tool arguments as JSON already, so embed them verbatim.
         .tool_call => |call| try json.write(ToolUseBlock{
             .id = call.call_id,
@@ -569,6 +593,40 @@ test "the api-key account omits the system header and keeps every other block" {
     }, .anthropic_api);
     defer std.testing.allocator.free(body);
     try std.testing.expectEqualStrings(golden_api, body);
+}
+
+test "a reasoning-only run dropped by an account switch emits no empty envelope" {
+    // A reasoning-only assistant run (reasoning produced by the subscription
+    // account, then the turn stopped) sits between two user turns. Serialized
+    // under the api-key account, exact-account replay drops that reasoning, so the
+    // assistant run would be empty — it must be skipped, not written as
+    // `"content":[]` (a 400), and the two user turns then share one envelope.
+    const items = [_]llm.Item{
+        .{ .message = .{ .role = .user, .text = "hi" } },
+        .{ .reasoning = .{ .text = "weigh it", .blob = "sig", .origin = .anthropic_subscription } },
+        .{ .message = .{ .role = .user, .text = "again" } },
+    };
+    const body = try serialize(std.testing.allocator, .{
+        .model = "claude-opus-4-8",
+        .tokens_max = 8192,
+        .system = "s",
+        .items = &items,
+        .tools = &.{},
+        .effort = .xhigh,
+    }, .anthropic_api);
+    defer std.testing.allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+    const messages = parsed.value.object.get("messages").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), messages.len);
+    try std.testing.expectEqualStrings("user", messages[0].object.get("role").?.string);
+    const content = messages[0].object.get("content").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), content.len);
+    try std.testing.expectEqualStrings("hi", content[0].object.get("text").?.string);
+    try std.testing.expectEqualStrings("again", content[1].object.get("text").?.string);
+    // The last emitted block carries the history cache breakpoint.
+    try std.testing.expect(content[1].object.get("cache_control") != null);
 }
 
 test "reasoning is dropped when its origin account differs, even within the vendor" {

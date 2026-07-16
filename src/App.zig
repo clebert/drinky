@@ -30,9 +30,12 @@ const Session = @import("Session.zig");
 
 const App = @This();
 
-const model = "claude-opus-4-8";
-const model_info = ai.models.get(.anthropic, model) orelse
-    @compileError("default model \"" ++ model ++ "\" is not in the model table");
+// The compiled fallback model per vendor, used when config names none for the
+// active account. Resolved at compile time so a bad name is a build error.
+const anthropic_default = ai.models.get(.anthropic, "claude-opus-4-8") orelse
+    @compileError("default anthropic model is not in the model table");
+const openai_default = ai.models.get(.openai, "gpt-5.6-sol") orelse
+    @compileError("default openai model is not in the model table");
 const effort: ai.llm.Effort = .xhigh;
 const system_prompt =
     "You are pith, a small coding assistant running in a terminal. Be concise. " ++
@@ -58,7 +61,7 @@ io: std.Io,
 tty: terminal.Tty,
 /// SIGWINCH watcher: turns terminal resizes into `.resize` events.
 resize: terminal.Resize,
-auth: ai.anthropic.Auth,
+accounts: ai.Accounts,
 agent: ai.Agent,
 /// The consumer-owned model and rendering, driven by the loop.
 session: Session,
@@ -151,7 +154,7 @@ const TurnHandler = struct {
 /// Authenticate (logging in if needed), then run the interactive loop until the
 /// user quits or stdin closes. Pin the value: streams and the channel borrow its
 /// buffers.
-pub fn run(self: *App, gpa: std.mem.Allocator, io: std.Io, home: []const u8) !void {
+pub fn run(self: *App, gpa: std.mem.Allocator, io: std.Io, home: []const u8, api_keys: ai.Accounts.ApiKeys) !void {
     self.gpa = gpa;
     self.io = io;
     self.last_ctrl_c = 0;
@@ -165,12 +168,13 @@ pub fn run(self: *App, gpa: std.mem.Allocator, io: std.Io, home: []const u8) !vo
 
     const config = try Config.load(gpa, io, home);
 
-    self.auth = try ai.anthropic.Auth.init(gpa, io, home);
-    defer self.auth.deinit();
-    try self.ensureAuth();
+    self.accounts = try ai.Accounts.init(gpa, io, home, config.timeouts, api_keys);
+    defer self.accounts.deinit();
+    const active = try self.ensureAnyAuth();
 
-    const client = ai.provider.Client.init(gpa, io, .{ .anthropic_subscription = &self.auth }, config.timeouts);
-    self.agent = ai.Agent.init(gpa, io, client, .{ .model = model_info, .system = system_prompt, .retry = config.retry, .effort = effort });
+    const active_model = config.default_models.get(active) orelse compiledDefault(active);
+    const client = self.accounts.client(active).?;
+    self.agent = ai.Agent.init(gpa, io, client, .{ .model = active_model, .system = system_prompt, .retry = config.retry, .effort = effort });
     defer self.agent.deinit();
 
     try self.tty.init(io);
@@ -357,11 +361,24 @@ fn runTurnWorker(self: *App, text: []u8) void {
     };
 }
 
-fn ensureAuth(self: *App) !void {
-    if (try self.auth.load()) return;
+/// Choose and authenticate the session's active account: the first account with a
+/// stored credential or an environment key, in enum order. When none is present,
+/// bootstrap with an interactive Anthropic subscription login (before the tty is
+/// live), matching the first-run flow.
+fn ensureAnyAuth(self: *App) !ai.llm.Account {
+    if (self.accounts.firstAuthenticated()) |account| return account;
     var buffer: [4096]u8 = undefined;
     var stdout = std.Io.File.stdout().writerStreaming(self.io, &buffer);
-    try self.auth.login(&stdout.interface);
+    try self.accounts.login(.anthropic_subscription, &stdout.interface);
+    return .anthropic_subscription;
+}
+
+/// The compiled fallback model for `account`'s vendor.
+fn compiledDefault(account: ai.llm.Account) ai.models.Model {
+    return switch (ai.llm.provider(account)) {
+        .anthropic => anthropic_default,
+        .openai => openai_default,
+    };
 }
 
 /// Decode a stdin chunk into key events and apply each. Runs on the consumer, so
@@ -577,7 +594,7 @@ fn runTurn(self: *App, text: []const u8) !void {
 
 /// Handle a slash command locally, applying its outcome to the session.
 fn runCommand(self: *App, line: []const u8) !void {
-    var context: ai.command.Context = .{ .gpa = self.gpa, .agent = &self.agent };
+    var context: ai.command.Context = .{ .gpa = self.gpa, .agent = &self.agent, .accounts = &self.accounts };
     try self.session.applyOutcome(try ai.command.run(&context, line));
     self.session.model_shown = self.agent.model;
     self.session.effort_shown = self.agent.effort;
@@ -599,11 +616,11 @@ fn handlePickerKey(self: *App, event: terminal.Input.Key) !void {
     self.session.markDirty();
 }
 
-/// Re-apply the picker's command with the highlighted option as its argument.
+/// Apply the highlighted picker row through its command's selection handler.
 fn confirmPicker(self: *App) !void {
     const picking = &self.session.mode.picking;
-    var context: ai.command.Context = .{ .gpa = self.gpa, .agent = &self.agent };
-    const outcome = try ai.command.apply(&context, picking.command, picking.picker.choice());
+    var context: ai.command.Context = .{ .gpa = self.gpa, .agent = &self.agent, .accounts = &self.accounts };
+    const outcome = try ai.command.select(&context, picking.command, picking.picker.selectedIndex());
     self.session.closePicker();
     try self.session.applyOutcome(outcome);
     self.session.model_shown = self.agent.model;

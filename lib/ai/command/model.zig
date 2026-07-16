@@ -1,11 +1,15 @@
-//! `/model`: with no argument, open a picker over the models the active provider
-//! offers, preselecting the current one; with a name, switch to it from the next
-//! turn onward. An unknown name is reported, not applied — the model stays as it
-//! was. The picker feeds its choice back through the name path.
+//! `/model`: open a picker over every account-qualified model the session is
+//! authenticated for — each of an authenticated account's models, labeled by its
+//! account — with the active one marked. Selecting one switches the active
+//! account and model together from the next turn onward. There is no typed form:
+//! a model is always chosen together with its account, so any argument is ignored
+//! and the picker opens regardless.
 
 const std = @import("std");
 
+const Accounts = @import("../Accounts.zig");
 const Agent = @import("../Agent.zig");
+const llm = @import("../llm.zig");
 const models = @import("../models.zig");
 const provider = @import("../provider.zig");
 const Context = @import("Context.zig");
@@ -13,46 +17,96 @@ const Outcome = @import("outcome.zig").Outcome;
 
 pub const name = "model";
 
+/// One selectable list row: a model bound to the account it runs under.
+const Combo = struct { account: llm.Account, model: models.Model };
+
 pub fn run(context: *Context, args: []const u8) !Outcome {
+    _ = args;
     const gpa = context.gpa;
-    const vendor = context.agent.client.provider();
-    const requested = std.mem.trim(u8, args, " \t");
 
-    if (requested.len != 0) {
-        const chosen = models.get(vendor, requested) orelse
-            return Outcome.report(gpa, .err, "unknown model: {s}", .{requested});
-        context.agent.setModel(chosen);
-        return Outcome.report(gpa, .ok, "switched to {s}", .{chosen.name});
-    }
+    var combos: std.ArrayList(Combo) = .empty;
+    defer combos.deinit(gpa);
+    try collect(context.accounts, &combos, gpa);
+    if (combos.items.len == 0)
+        return Outcome.report(gpa, .err, "no authenticated accounts", .{});
 
-    var available: std.ArrayList(models.Model) = .empty;
-    defer available.deinit(gpa);
-    try models.list(vendor, &available, gpa);
-    if (available.items.len == 0) return Outcome.report(gpa, .err, "no models available", .{});
+    const active_account = context.agent.client.account();
+    const active_model = context.agent.model.name;
 
-    const current = context.agent.model.name;
-    const options = try gpa.alloc([]const u8, available.items.len);
+    const options = try gpa.alloc([]const u8, combos.items.len);
     var filled: usize = 0;
     errdefer {
         for (options[0..filled]) |option| gpa.free(option);
         gpa.free(options);
     }
-    var current_index: ?usize = null;
-    for (available.items, 0..) |entry, index| {
-        options[index] = try gpa.dupe(u8, entry.name);
+    var current: ?usize = null;
+    for (combos.items, 0..) |combo, index| {
+        options[index] = try std.fmt.allocPrint(gpa, "{s} ({s})", .{ combo.model.name, label(combo.account) });
         filled += 1;
-        if (std.mem.eql(u8, entry.name, current)) current_index = index;
+        if (combo.account == active_account and std.mem.eql(u8, combo.model.name, active_model))
+            current = index;
     }
     return .{ .pick = .{
         .command = name,
         .title = "Select a model",
         .options = options,
-        .current = current_index,
+        .current = current,
     } };
 }
 
-fn testAgent(gpa: std.mem.Allocator) Agent {
-    const client = provider.Client.init(gpa, std.testing.io, .{ .anthropic_subscription = undefined }, .{});
+pub fn select(context: *Context, index: usize) !Outcome {
+    const gpa = context.gpa;
+    var combos: std.ArrayList(Combo) = .empty;
+    defer combos.deinit(gpa);
+    try collect(context.accounts, &combos, gpa);
+    if (index >= combos.items.len)
+        return Outcome.report(gpa, .err, "invalid selection", .{});
+
+    const combo = combos.items[index];
+    context.agent.switchTo(context.accounts.client(combo.account).?, combo.model);
+    return Outcome.report(gpa, .ok, "switched to {s} ({s})", .{ combo.model.name, label(combo.account) });
+}
+
+/// Every authenticated account's models, in account-enum then table order — the
+/// picker's rows, re-derived identically by `run` (to list) and `select` (to
+/// resolve an index).
+fn collect(accounts: *const Accounts, out: *std.ArrayList(Combo), gpa: std.mem.Allocator) !void {
+    for (std.enums.values(llm.Account)) |account| {
+        if (!accounts.isAuthenticated(account)) continue;
+        var vendor_models: std.ArrayList(models.Model) = .empty;
+        defer vendor_models.deinit(gpa);
+        try models.list(llm.provider(account), &vendor_models, gpa);
+        for (vendor_models.items) |vendor_model|
+            try out.append(gpa, .{ .account = account, .model = vendor_model });
+    }
+}
+
+/// The human account descriptor shown beside a model, e.g. "anthropic
+/// subscription".
+fn label(account: llm.Account) []const u8 {
+    return switch (account) {
+        .anthropic_api => "anthropic api",
+        .anthropic_subscription => "anthropic subscription",
+        .openai_api => "openai api",
+        .openai_subscription => "openai subscription",
+    };
+}
+
+fn apiAccounts(gpa: std.mem.Allocator) Accounts {
+    return .{
+        .gpa = gpa,
+        .io = std.testing.io,
+        .timeouts = .{},
+        .anthropic_auth = undefined,
+        .openai_auth = undefined,
+        .keys = .{ .anthropic = "sk-ant", .openai = "sk-openai" },
+        .anthropic_subscription_ready = false,
+        .openai_subscription_ready = false,
+    };
+}
+
+fn apiAgent(gpa: std.mem.Allocator) Agent {
+    const client = provider.Client.init(gpa, std.testing.io, .{ .anthropic_api = "sk-ant" }, .{});
     return Agent.init(gpa, std.testing.io, client, .{
         .model = models.get(.anthropic, "claude-sonnet-4-6").?,
         .system = "",
@@ -60,36 +114,12 @@ fn testAgent(gpa: std.mem.Allocator) Agent {
     });
 }
 
-test "switch to a known model, reject an unknown one" {
+test "the picker lists every authenticated account's models, marking the active one" {
     const gpa = std.testing.allocator;
-    var agent = testAgent(gpa);
+    var accounts = apiAccounts(gpa);
+    var agent = apiAgent(gpa);
     defer agent.deinit();
-    var context: Context = .{ .gpa = gpa, .agent = &agent };
-
-    switch (try run(&context, "claude-opus-4-8")) {
-        .feedback => |feedback| {
-            defer gpa.free(feedback.content);
-            try std.testing.expect(!feedback.is_error);
-        },
-        .pick => return error.ExpectedFeedback,
-    }
-    try std.testing.expectEqualStrings("claude-opus-4-8", agent.model.name);
-
-    switch (try run(&context, "does-not-exist")) {
-        .feedback => |feedback| {
-            defer gpa.free(feedback.content);
-            try std.testing.expect(feedback.is_error);
-        },
-        .pick => return error.ExpectedFeedback,
-    }
-    try std.testing.expectEqualStrings("claude-opus-4-8", agent.model.name);
-}
-
-test "no argument opens a picker preselecting the current model" {
-    const gpa = std.testing.allocator;
-    var agent = testAgent(gpa);
-    defer agent.deinit();
-    var context: Context = .{ .gpa = gpa, .agent = &agent };
+    var context: Context = .{ .gpa = gpa, .agent = &agent, .accounts = &accounts };
 
     switch (try run(&context, "")) {
         .pick => |pick| {
@@ -97,11 +127,42 @@ test "no argument opens a picker preselecting the current model" {
                 for (pick.options) |option| gpa.free(option);
                 gpa.free(pick.options);
             }
-            try std.testing.expectEqualStrings("model", pick.command);
-            try std.testing.expect(pick.options.len >= 2);
-            try std.testing.expect(pick.current != null);
-            try std.testing.expectEqualStrings("claude-sonnet-4-6", pick.options[pick.current.?]);
+            // Three anthropic models plus three openai models, both keys present.
+            try std.testing.expectEqual(@as(usize, 6), pick.options.len);
+            try std.testing.expectEqualStrings("claude-opus-4-8 (anthropic api)", pick.options[0]);
+            try std.testing.expectEqualStrings("gpt-5.6-sol (openai api)", pick.options[3]);
+            // The active account+model (anthropic api, sonnet 4.6) is preselected.
+            try std.testing.expectEqualStrings("claude-sonnet-4-6 (anthropic api)", pick.options[pick.current.?]);
         },
         .feedback => return error.ExpectedPick,
     }
+}
+
+test "select switches to the chosen account and model" {
+    const gpa = std.testing.allocator;
+    var accounts = apiAccounts(gpa);
+    var agent = apiAgent(gpa);
+    defer agent.deinit();
+    var context: Context = .{ .gpa = gpa, .agent = &agent, .accounts = &accounts };
+
+    // Row 3 is the first openai model, so selecting it crosses vendors.
+    switch (try select(&context, 3)) {
+        .feedback => |feedback| {
+            defer gpa.free(feedback.content);
+            try std.testing.expect(!feedback.is_error);
+        },
+        .pick => return error.ExpectedFeedback,
+    }
+    try std.testing.expectEqualStrings("gpt-5.6-sol", agent.model.name);
+    try std.testing.expectEqual(llm.Account.openai_api, agent.client.account());
+
+    // An out-of-range index is reported, leaving the model unchanged.
+    switch (try select(&context, 99)) {
+        .feedback => |feedback| {
+            defer gpa.free(feedback.content);
+            try std.testing.expect(feedback.is_error);
+        },
+        .pick => return error.ExpectedFeedback,
+    }
+    try std.testing.expectEqualStrings("gpt-5.6-sol", agent.model.name);
 }

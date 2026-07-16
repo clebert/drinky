@@ -4,7 +4,7 @@
 //! area as the editor, so it sits where the editor would. It owns its option
 //! strings and the composed `content` buffer (freed on `deinit`) and borrows the
 //! title. Navigation moves the selection; `reflow` windows a tall list to keep
-//! it in view. The caller reads `choice` and acts on it.
+//! it in view. The caller reads `selectedIndex` and acts on the selected row.
 
 const std = @import("std");
 
@@ -75,9 +75,9 @@ pub fn moveDown(self: *Picker) !void {
     try self.compose();
 }
 
-/// The currently highlighted option.
-pub fn choice(self: *const Picker) []const u8 {
-    return self.options[self.cursor];
+/// The selected row's index, applied by the command that opened the picker.
+pub fn selectedIndex(self: *const Picker) usize {
+    return self.cursor;
 }
 
 /// Re-clamp the scroll offset so the highlighted option's wrapped row stays
@@ -158,17 +158,17 @@ fn testPicker(gpa: std.mem.Allocator, labels: []const []const u8, cursor: usize)
     return picker;
 }
 
-test "navigation stays in bounds and choice tracks the selection" {
+test "navigation stays in bounds and the cursor tracks the selection" {
     const gpa = std.testing.allocator;
     var picker = try testPicker(gpa, &.{ "alpha", "beta" }, 0);
     defer picker.deinit();
 
     try picker.moveUp();
-    try std.testing.expectEqualStrings("alpha", picker.choice());
+    try std.testing.expectEqual(@as(usize, 0), picker.selectedIndex());
     try picker.moveDown();
-    try std.testing.expectEqualStrings("beta", picker.choice());
+    try std.testing.expectEqual(@as(usize, 1), picker.selectedIndex());
     try picker.moveDown();
-    try std.testing.expectEqualStrings("beta", picker.choice());
+    try std.testing.expectEqual(@as(usize, 1), picker.selectedIndex());
 }
 
 test "compose lays out the title, hint, options, and the current marker" {

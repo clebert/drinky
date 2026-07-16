@@ -94,8 +94,10 @@ pub fn save(
 
 /// The whole `auth.json` with `key` set to `entry`, re-emitting every other
 /// top-level key verbatim (except this `key`, always rewritten, and the flat
-/// keys when `drop_flat`). An absent, unparseable, or non-object `existing`
-/// starts from a fresh object. Caller frees the result.
+/// keys when `drop_flat`). An absent `existing` starts from a fresh object; an
+/// unparseable or non-object `existing` is `error.BadCredentials` rather than a
+/// fresh start, so a save can never wipe a sibling account by starting over on a
+/// file it could not read. Caller frees the result.
 fn serializeMerged(
     gpa: std.mem.Allocator,
     existing: ?[]const u8,
@@ -111,21 +113,18 @@ fn serializeMerged(
     if (existing) |data| {
         const parsed = std.json.parseFromSlice(std.json.Value, gpa, data, .{}) catch |err| switch (err) {
             error.OutOfMemory => return err,
-            else => null,
+            else => return error.BadCredentials,
         };
-        if (parsed) |result| {
-            defer result.deinit();
-            if (result.value == .object) {
-                var entries = result.value.object.iterator();
-                while (entries.next()) |field| {
-                    // Skip our own entry (rewritten fresh below) and, when
-                    // migrating, the legacy flat keys.
-                    if (std.mem.eql(u8, field.key_ptr.*, key)) continue;
-                    if (drop_flat and isFlatKey(field.key_ptr.*)) continue;
-                    try json.objectField(field.key_ptr.*);
-                    try json.write(field.value_ptr.*);
-                }
-            }
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.BadCredentials;
+        var entries = parsed.value.object.iterator();
+        while (entries.next()) |field| {
+            // Skip our own entry (rewritten fresh below) and, when migrating, the
+            // legacy flat keys.
+            if (std.mem.eql(u8, field.key_ptr.*, key)) continue;
+            if (drop_flat and isFlatKey(field.key_ptr.*)) continue;
+            try json.objectField(field.key_ptr.*);
+            try json.write(field.value_ptr.*);
         }
     }
     try json.objectField(key);
@@ -237,6 +236,23 @@ test "drop_flat migrates a legacy flat Anthropic file beside an existing openai 
     try std.testing.expect(root.get("expires_ms") == null);
     try std.testing.expectEqualStrings("oa", root.get("openai_subscription").?.object.get("access").?.string);
     try std.testing.expectEqualStrings("migrated", root.get("anthropic_subscription").?.object.get("access").?.string);
+}
+
+test "serializeMerged errors on an unparseable or non-object existing file" {
+    const gpa = std.testing.allocator;
+    const entry: TestEntry = .{ .access = "at", .refresh = "rt", .expires_ms = 1 };
+
+    // A corrupt existing file must not be silently overwritten — that would drop
+    // every sibling account's entry on a refresh save. Both a syntactically
+    // invalid file and a valid non-object value are rejected.
+    try std.testing.expectError(
+        error.BadCredentials,
+        serializeMerged(gpa, "{ not valid json", "openai_subscription", entry, false),
+    );
+    try std.testing.expectError(
+        error.BadCredentials,
+        serializeMerged(gpa, "[1,2,3]", "openai_subscription", entry, false),
+    );
 }
 
 test "serializeMerged without drop_flat keeps a legacy flat entry untouched" {

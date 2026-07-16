@@ -17,11 +17,11 @@ pub const Outcome = union(enum) {
         is_error: bool,
     };
 
-    /// A request to open a picker. On selection the app re-applies `command`
-    /// with the chosen option as its argument, so the command's own argument
-    /// path is the single place the action happens. `options` (each string and
-    /// the slice) transfers to the app, freed when the picker closes; `current`,
-    /// if set, is the row to mark and preselect.
+    /// A request to open a picker. On selection the app hands `command` the
+    /// chosen row index (`command.select`), which re-derives its list and acts on
+    /// that row. `options` (each string and the slice) transfers to the app,
+    /// freed when the picker closes; `current`, if set, is the row to mark and
+    /// preselect.
     pub const Pick = struct {
         command: []const u8,
         title: []const u8,
