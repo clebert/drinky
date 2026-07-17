@@ -411,6 +411,15 @@ test "callback provider error redirects close without success response" {
     }
 }
 
+test "callback error after a partial parse frees the acquired parameter" {
+    // `code` present but `state` absent leaves `output.code` allocated when the
+    // state lookup fails; the leak-detecting allocator proves the error path frees it.
+    var fake: Fake = .{ .request = "GET /callback?code=code HTTP/1.1\r\n" };
+    try std.testing.expectError(error.MissingCallbackParam, receiveFake(&fake));
+    try std.testing.expectEqual(@as(usize, 1), fake.close_count);
+    try std.testing.expectEqual(@as(usize, 0), fake.response_count);
+}
+
 test "a deadline race cleans an acquired callback result" {
     var fake: Fake = .{
         .behavior = .deadline_wins_after_success,
