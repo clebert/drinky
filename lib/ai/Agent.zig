@@ -93,8 +93,8 @@ pub const Stats = struct {
 };
 
 /// One scheduled tool call: the reply it answers and the slot its task fills.
-/// `runCall` reads `name`/`input_json` and writes `result`; the collector reads
-/// the rest once the task has finished.
+/// The concurrent runner reads `name`/`input_json` and writes `result`; the
+/// collector reads the rest once the task has finished.
 const Call = struct {
     id: []const u8,
     name: []const u8,
@@ -400,21 +400,40 @@ fn readReply(
     return reply;
 }
 
-/// Run one call to completion into its slot. Spawned per call, so it touches only
-/// its own `call` and the shared read-only `context` (a thread-safe gpa and io).
-fn runCall(call: *Call, context: *const tool.Context) void {
-    call.result = tool.run(context, call.name, call.input_json);
+/// The concurrent read-only task body, one monomorphization per `Dispatch` type
+/// so the real turn loop keeps a direct call rather than an indirect one.
+fn Runner(comptime Dispatch: type) type {
+    return struct {
+        fn run(call: *Call, context: *const tool.Context) void {
+            call.result = Dispatch.run(context, call.name, call.input_json);
+        }
+    };
+}
+
+/// Run the assistant's tool calls through the real tool registry.
+fn runTools(self: *Agent, reply: []const llm.Item, handler: anytype) !bool {
+    return self.runToolsWith(tool, reply, handler);
 }
 
 /// Run every tool the assistant asked for, then queue the results in call order so
-/// each `tool_result` maps back to its `tool_call` by `call_id`. Read-only calls
-/// run concurrently through the group; mutating calls run inline in call order, so
-/// two writes/edits to the same file can't race or lose an update within one turn.
-/// Returns false when the reply asked for no tools. A failing mutation (a
-/// mid-turn cancel included) aborts the turn at once, before any later call runs;
-/// a cancel observed while awaiting the read-only calls aborts the same way. On
-/// every early exit the errdefer reaps the group's in-flight tasks first.
-fn runTools(self: *Agent, reply: []const llm.Item, handler: anytype) !bool {
+/// each `tool_result` maps back to its `tool_call` by `call_id`. `Dispatch` names
+/// the tool source (`mutates` and `run`); the turn loop passes the real registry,
+/// and tests inject controllable tools into this same scheduling path.
+///
+/// Each contiguous run of read-only calls runs concurrently through the group. A
+/// mutating call is a barrier: it awaits every earlier read, runs alone, and
+/// completes before any later call starts, so no mutation overlaps a read or
+/// another mutation and call order gives a coherent filesystem view. Returns
+/// false when the reply asked for no tools. A failing mutation (a mid-turn cancel
+/// included) aborts the turn at once, before any later call runs; a cancel
+/// observed while awaiting read-only calls aborts the same way. On every early
+/// exit the errdefer reaps the group's in-flight tasks first.
+fn runToolsWith(
+    self: *Agent,
+    comptime Dispatch: type,
+    reply: []const llm.Item,
+    handler: anytype,
+) !bool {
     var count: usize = 0;
     for (reply) |item| switch (item) {
         .tool_call => count += 1,
@@ -449,10 +468,15 @@ fn runTools(self: *Agent, reply: []const llm.Item, handler: anytype) !bool {
 
     for (calls) |*call| {
         try handler.onToolStart(call.name, call.input_json);
-        if (tool.mutates(call.name))
-            call.result = try tool.run(&context, call.name, call.input_json)
-        else
-            try group.concurrent(self.io, runCall, .{ call, &context });
+        if (Dispatch.mutates(call.name)) {
+            // Drain earlier reads so the mutation can't race a concurrent read,
+            // then reuse the emptied group for the reads that follow.
+            try group.await(self.io);
+            group = .init;
+            call.result = try Dispatch.run(&context, call.name, call.input_json);
+        } else {
+            try group.concurrent(self.io, Runner(Dispatch).run, .{ call, &context });
+        }
         dispatched += 1;
     }
     try group.await(self.io);
@@ -1042,4 +1066,166 @@ test "readReply tags reasoning with the active provider as origin" {
     const reply = try agent.readReply(&agent.model, &stream, &handler);
     try std.testing.expectEqual(llm.Account.openai_api, reply[0].reasoning.origin);
     try std.testing.expectEqualStrings("rs_1", reply[0].reasoning.id);
+}
+
+// A scheduling seam that wraps a real threaded executor to observe tool ordering.
+// It counts read-only tasks launched into the group but not yet awaited
+// (`outstanding`), records their peak, and flags whether a mutation ran while any
+// read was still outstanding. `groupConcurrent`, the inline mutation (through
+// `probe.run`), and `groupAwait` all execute on the thread driving
+// `runToolsWith`, so these counters carry no data race.
+const ScheduleLog = struct {
+    backend: std.Io,
+    vtable: std.Io.VTable,
+    outstanding: usize = 0,
+    outstanding_peak: usize = 0,
+    mutation_overlap: bool = false,
+    // When set, the next group await reports cancellation without draining, so the
+    // caller's errdefer must reap the launched reads through `cancelGroup`.
+    cancel_at_await: bool = false,
+
+    fn init(backend: std.Io) ScheduleLog {
+        var vtable = backend.vtable.*;
+        vtable.groupConcurrent = concurrent;
+        vtable.groupAwait = awaitGroup;
+        vtable.groupCancel = cancelGroup;
+        return .{ .backend = backend, .vtable = vtable };
+    }
+
+    fn io(self: *ScheduleLog) std.Io {
+        return .{ .userdata = self, .vtable = &self.vtable };
+    }
+
+    fn recordMutation(self: *ScheduleLog) void {
+        if (self.outstanding > 0) self.mutation_overlap = true;
+    }
+
+    fn concurrent(
+        userdata: ?*anyopaque,
+        group: *std.Io.Group,
+        context: []const u8,
+        context_alignment: std.mem.Alignment,
+        start: *const fn (context: *const anyopaque) void,
+    ) std.Io.ConcurrentError!void {
+        const self: *ScheduleLog = @ptrCast(@alignCast(userdata));
+        try self.backend.vtable.groupConcurrent(
+            self.backend.userdata,
+            group,
+            context,
+            context_alignment,
+            start,
+        );
+        self.outstanding += 1;
+        self.outstanding_peak = @max(self.outstanding_peak, self.outstanding);
+    }
+
+    fn awaitGroup(
+        userdata: ?*anyopaque,
+        group: *std.Io.Group,
+        token: *anyopaque,
+    ) std.Io.Cancelable!void {
+        const self: *ScheduleLog = @ptrCast(@alignCast(userdata));
+        if (self.cancel_at_await) {
+            self.cancel_at_await = false;
+            return error.Canceled;
+        }
+        try self.backend.vtable.groupAwait(self.backend.userdata, group, token);
+        self.outstanding = 0;
+    }
+
+    fn cancelGroup(userdata: ?*anyopaque, group: *std.Io.Group, token: *anyopaque) void {
+        const self: *ScheduleLog = @ptrCast(@alignCast(userdata));
+        self.backend.vtable.groupCancel(self.backend.userdata, group, token);
+        self.outstanding = 0;
+    }
+};
+
+// A controllable tool source for `runToolsWith`: "write" mutates, everything else
+// is read-only. A mutation notes any scheduling overlap through the wrapped io;
+// every call returns a trivial owned result.
+const probe = struct {
+    fn mutates(name: []const u8) bool {
+        return std.mem.eql(u8, name, "write");
+    }
+
+    fn run(context: *const tool.Context, name: []const u8, input_json: []const u8) !tool.Result {
+        _ = input_json;
+        if (mutates(name)) {
+            const log: *ScheduleLog = @ptrCast(@alignCast(context.io.userdata));
+            log.recordMutation();
+        }
+        return .{ .content = try context.gpa.dupe(u8, "ok"), .is_error = false };
+    }
+};
+
+test "a mutating call is a barrier between the reads around it" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var log: ScheduleLog = .init(threaded.io());
+
+    var agent = scriptedAgent(gpa);
+    agent.io = log.io();
+    defer agent.deinit();
+    var handler: CaptureHandler = .{ .gpa = gpa };
+    defer handler.deinit();
+
+    // Two reads, then a mutation, then a read: the leading reads run concurrently,
+    // the mutation must drain them before it runs, and the trailing read starts
+    // only after the mutation completes.
+    const reply = [_]llm.Item{
+        .{ .tool_call = .{ .call_id = "r1", .name = "read", .arguments_json = "{}" } },
+        .{ .tool_call = .{ .call_id = "r2", .name = "read", .arguments_json = "{}" } },
+        .{ .tool_call = .{ .call_id = "w1", .name = "write", .arguments_json = "{}" } },
+        .{ .tool_call = .{ .call_id = "r3", .name = "read", .arguments_json = "{}" } },
+    };
+    try std.testing.expect(try agent.runToolsWith(probe, &reply, &handler));
+
+    // The mutation never ran while a read was still outstanding...
+    try std.testing.expect(!log.mutation_overlap);
+    // ...yet the two leading reads were in flight together.
+    try std.testing.expectEqual(@as(usize, 2), log.outstanding_peak);
+
+    // Results stay in call order, one per call.
+    try std.testing.expectEqual(@as(usize, 4), agent.items.items.len);
+    try std.testing.expectEqualStrings("r1", agent.items.items[0].tool_result.call_id);
+    try std.testing.expectEqualStrings("r2", agent.items.items[1].tool_result.call_id);
+    try std.testing.expectEqualStrings("w1", agent.items.items[2].tool_result.call_id);
+    try std.testing.expectEqualStrings("r3", agent.items.items[3].tool_result.call_id);
+    try std.testing.expectEqual(@as(usize, 4), handler.tool_start_count);
+    try std.testing.expectEqual(@as(usize, 4), handler.tool_result_count);
+}
+
+test "a cancel at the barrier reaps launched reads and starts nothing after it" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var log: ScheduleLog = .init(threaded.io());
+    log.cancel_at_await = true;
+
+    var agent = scriptedAgent(gpa);
+    agent.io = log.io();
+    defer agent.deinit();
+    var handler: CaptureHandler = .{ .gpa = gpa };
+    defer handler.deinit();
+
+    const reply = [_]llm.Item{
+        .{ .tool_call = .{ .call_id = "r1", .name = "read", .arguments_json = "{}" } },
+        .{ .tool_call = .{ .call_id = "w1", .name = "write", .arguments_json = "{}" } },
+        .{ .tool_call = .{ .call_id = "r3", .name = "read", .arguments_json = "{}" } },
+    };
+    // Inject cancellation at the barrier await (without draining) to force the
+    // errdefer's live-task reap path -- the path a real mid-batch early exit takes
+    // while a read is still in flight: the launched read is reaped and its result
+    // freed exactly once (the leak-checking allocator proves it), the mutation
+    // never runs, and the trailing read never starts.
+    try std.testing.expectError(
+        error.Canceled,
+        agent.runToolsWith(probe, &reply, &handler),
+    );
+    try std.testing.expect(!log.mutation_overlap);
+    // r1 and the w1 barrier were announced; r3, past the cancelled barrier, was not.
+    try std.testing.expectEqual(@as(usize, 2), handler.tool_start_count);
+    try std.testing.expectEqual(@as(usize, 0), handler.tool_result_count);
+    try std.testing.expectEqual(@as(usize, 0), agent.items.items.len);
 }

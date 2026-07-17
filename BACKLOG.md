@@ -31,10 +31,11 @@ Extension seams referenced here:
       blocks in one assistant message when the calls are independent. `Agent.runTools` fans them out
       through an `std.Io.Group` — one concurrent task per call writing into its own slot — then
       collects the results in call order, so each `tool_result` still maps back to its `tool_use` id
-      and the UI's name-FIFO box matching is unchanged. Mutating calls (write/edit, flagged in the
-      tool registry) instead run inline in call order, so two writes/edits to the same file can't
-      race or lose an update within a turn. A mid-turn cancel propagates through `group.await` to
-      the running tools, preserving the interrupt-in-flight semantics the old sequential loop had.
+      and the UI's name-FIFO box matching is unchanged. A mutating call (write/edit, flagged in the
+      tool registry) is a barrier: it awaits every earlier read, runs alone, and completes before any
+      later call, so no mutation overlaps a read or another mutation within a turn. A mid-turn cancel
+      propagates through `group.await` to the running tools, preserving the interrupt-in-flight
+      semantics the old sequential loop had.
       We never send `disable_parallel_tool_use`, so the provider is free to batch independent calls.
 
 ## Command surface

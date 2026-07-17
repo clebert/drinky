@@ -116,10 +116,11 @@ commit history, `BACKLOG.md` (planned work), and `docs/`.
 
 - Runs one user turn to completion: append the user message, stream the reply, run its tools, feed
   results back, and repeat until the model stops.
-- Tool calls within one assistant message run concurrently: read-only calls in parallel, while
-  mutating calls (write, edit) run serially in call order so two edits to the same file cannot race
-  or lose an update. Results are collected in call order so each maps back to its call, and a
-  mid-turn cancel propagates to running tools.
+- Tool calls within one assistant message run concurrently: each contiguous run of read-only calls
+  executes in parallel, while a mutating call (write, edit) is a barrier -- it waits for all earlier
+  reads to finish, runs alone, and completes before any later call begins -- so no mutation overlaps
+  a read or another mutation and call order gives a coherent filesystem view. Results are collected
+  in call order so each maps back to its call, and a mid-turn cancel propagates to running tools.
 - Bounded tool-round loop (at most 50 rounds), failing cleanly on overrun.
 - Holds the conversation history and reaches the model through a provider-neutral interface, so
   neither the loop nor its tools depend on a specific provider.

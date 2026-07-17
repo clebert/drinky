@@ -19,8 +19,9 @@ const grep = @import("grep.zig");
 const Entry = struct {
     tool: llm.Tool,
     run: *const fn (*const Context, []const u8) anyerror!Result,
-    /// Whether the tool writes to the filesystem. The agent runs mutating calls
-    /// serially so two writes/edits to the same file can't race within one turn.
+    /// Whether the tool writes to the filesystem. The agent runs a mutating call
+    /// as a barrier -- after all earlier reads finish and before any later call --
+    /// so it can't race a concurrent read or another mutation within one turn.
     mutates: bool,
 };
 
@@ -39,8 +40,8 @@ pub const specs = blk: {
     break :blk list;
 };
 
-/// Whether tool `name` writes to the filesystem, so the agent knows to run it
-/// serially. An unknown tool touches nothing, so it runs concurrently and just
+/// Whether tool `name` writes to the filesystem, so the agent knows to run it as
+/// a barrier. An unknown tool touches nothing, so it runs concurrently and just
 /// reports the unknown-tool error.
 pub fn mutates(name: []const u8) bool {
     for (registry) |entry| {
