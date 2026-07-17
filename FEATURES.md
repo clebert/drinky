@@ -286,6 +286,8 @@ commit history, `BACKLOG.md` (planned work), and `docs/`.
 - On launch, shows an intro line summarizing the key bindings.
 - The interface stays responsive throughout a turn: keyboard input, agent progress, frame ticks, and
   resizes are handled concurrently, so network and streaming I/O never freeze the interface.
+- Turn progress and completion remain bound to their originating turn, so cancelling and immediately
+  starting a successor cannot apply queued output or completion from the cancelled turn.
 - Repaints are frame-rate-limited (~16 ms) and scheduled only while the interface is dirty or
   animating, so an idle interface does no work.
 - A terminal resize marks the interface dirty and re-reads the size, so even an idle interface

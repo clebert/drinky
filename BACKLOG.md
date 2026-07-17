@@ -251,9 +251,12 @@ Extension seams referenced here:
 - [x] **Networking off the UI thread.** The event loop is a single `std.Io.Queue(UiEvent)` consumer
       fed by `io.concurrent` producers — a long-lived stdin reader, the turn worker (`agent.run` off
       the UI thread), and a one-shot frame timer. The consumer solely owns the model and paints, so
-      request/stream I/O no longer freezes the UI. This unblocked mid-stream cancellation and a live
-      progress indicator; concurrent tool execution stays future work (tools still run inline on the
-      worker between rounds).
+      request/stream I/O no longer freezes the UI. Each turn worker captures an immutable generation;
+      every event it produces carries that generation, and the consumer frees and drops an event
+      unless its turn is still active, so queued stragglers cannot cross a cancel-and-resubmit
+      boundary. This unblocked mid-stream cancellation and a live progress indicator; tool scheduling
+      remains worker-side, where independent read-only calls can run concurrently without touching the
+      consumer.
 - [x] **Streaming cancellation.** Ctrl-c/esc mid-turn cancels the turn worker's `Future`; the cancel
       interrupts the blocking read, `Transport.next` maps it to `error.Canceled` via
       `connection.getReadError()`, and `Agent.run`'s `errdefer` shrinks `messages` back to the
@@ -402,7 +405,7 @@ Extension seams referenced here:
       turn animates" regression test.
 - [x] **Extract the render consumer into a `Session` struct.** `src/Session.zig` owns the
       consumer-side model and rendering — `Transcript`, live-tail `mode`, `editor`, `view`, the last
-      laid-out dimensions, and displayed stats/model — plus the event-appliers (`applyStreamEvent`)
+      laid-out dimensions, and displayed stats/model — plus the event-appliers (`applyTurnEvent`)
       and `paint`, io-/tty-/agent-free so the render loop has an isolated test surface built from a
       real `Session.init` rather than a partially-initialized `App`. `App` keeps the io/tasks/tty/
       agent wiring, the consumer loop, and the key/command/turn orchestration (which triggers io/

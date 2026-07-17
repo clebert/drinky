@@ -5,8 +5,8 @@
 //!
 //! Network and stream I/O run off the UI thread. Four `io.concurrent` producers
 //! feed one `std.Io.Queue(Session.UiEvent)`: a long-lived input reader
-//! (stdin → `.keys`), the current turn worker (`agent.run` →
-//! `.text`/`.tool_*`/`.usage`/`.turn_ended`), a one-shot frame timer
+//! (stdin → `.keys`), the current turn worker (`agent.run` → generation-tagged
+//! `.turn` events), a one-shot frame timer
 //! (sleep → `.tick`), and a SIGWINCH watcher (self-pipe → `.resize`). The
 //! consumer blocks on the channel, drains a coalesced batch, applies each event
 //! to the `Session` (marking it dirty, never painting), and paints only when it
@@ -15,7 +15,7 @@
 //! inert until a key, a stream event, or a `.resize` marks it dirty again.
 //!
 //! The consumer-owned model and rendering — transcript, live tail, editor, view,
-//! stats/model snapshots, and the `applyStreamEvent`/`paint` seam — live in
+//! stats/model snapshots, and the `applyTurnEvent`/`paint` seam — live in
 //! `Session`, which is io-, tty-, and agent-free so the render loop can be tested
 //! from a scripted event sequence. `App` keeps only the io, tasks, tty, and agent
 //! wiring and the key/command/turn orchestration that drives the `Session`.
@@ -84,6 +84,8 @@ input_future: ?std.Io.Future(void),
 resize_future: ?std.Io.Future(void),
 /// The running turn worker, or null between turns.
 turn_future: ?std.Io.Future(void),
+/// Last generation reserved for a turn worker. A generation is never reused.
+turn_generation: u64,
 /// The pending frame timer, or null when none is armed (idle or clean).
 tick_future: ?std.Io.Future(void),
 /// A frame timer is armed and its `.tick` has not been drained yet.
@@ -97,6 +99,7 @@ last_paint_ms: i64,
 /// makes this a drop-in for the consumer-side handler.
 const TurnHandler = struct {
     app: *App,
+    generation: u64,
     /// Owned error text captured from `onError`, which the agent calls just before
     /// a failed turn returns; the worker carries it into the single `.turn_ended`.
     error_text: ?[]u8 = null,
@@ -104,13 +107,13 @@ const TurnHandler = struct {
     pub fn onText(self: *TurnHandler, delta: []const u8) !void {
         const copy = try self.app.gpa.dupe(u8, delta);
         errdefer self.app.gpa.free(copy);
-        try self.app.queue.putOne(self.app.io, .{ .text = copy });
+        try self.enqueue(.{ .text = copy });
     }
 
     pub fn onThinking(self: *TurnHandler, delta: []const u8) !void {
         const copy = try self.app.gpa.dupe(u8, delta);
         errdefer self.app.gpa.free(copy);
-        try self.app.queue.putOne(self.app.io, .{ .thinking = copy });
+        try self.enqueue(.{ .thinking = copy });
     }
 
     pub fn onToolStart(self: *TurnHandler, name: []const u8, input_json: []const u8) !void {
@@ -118,7 +121,7 @@ const TurnHandler = struct {
         errdefer self.app.gpa.free(name_copy);
         const json_copy = try self.app.gpa.dupe(u8, input_json);
         errdefer self.app.gpa.free(json_copy);
-        try self.app.queue.putOne(self.app.io, .{ .tool_start = .{ .name = name_copy, .input_json = json_copy } });
+        try self.enqueue(.{ .tool_start = .{ .name = name_copy, .input_json = json_copy } });
     }
 
     pub fn onToolResult(self: *TurnHandler, name: []const u8, content: []const u8, is_error: bool) !void {
@@ -126,7 +129,7 @@ const TurnHandler = struct {
         errdefer self.app.gpa.free(name_copy);
         const content_copy = try self.app.gpa.dupe(u8, content);
         errdefer self.app.gpa.free(content_copy);
-        try self.app.queue.putOne(self.app.io, .{ .tool_result = .{
+        try self.enqueue(.{ .tool_result = .{
             .name = name_copy,
             .content = content_copy,
             .is_error = is_error,
@@ -134,23 +137,30 @@ const TurnHandler = struct {
     }
 
     pub fn onUsage(self: *TurnHandler, stats: ai.Agent.Stats) !void {
-        try self.app.queue.putOne(self.app.io, .{ .usage = stats });
+        try self.enqueue(.{ .usage = stats });
     }
 
     pub fn onStreamReset(self: *TurnHandler) !void {
-        try self.app.queue.putOne(self.app.io, .stream_reset);
+        try self.enqueue(.stream_reset);
     }
 
     pub fn onSteering(self: *TurnHandler, text: []const u8, count: usize) !void {
         const copy = try self.app.gpa.dupe(u8, text);
         errdefer self.app.gpa.free(copy);
-        try self.app.queue.putOne(self.app.io, .{ .steering_consumed = .{ .text = copy, .count = count } });
+        try self.enqueue(.{ .steering_consumed = .{ .text = copy, .count = count } });
     }
 
     pub fn onError(self: *TurnHandler, text: []const u8) !void {
         const copy = try self.app.gpa.dupe(u8, text);
         if (self.error_text) |old| self.app.gpa.free(old);
         self.error_text = copy;
+    }
+
+    fn enqueue(self: *TurnHandler, payload: Session.TurnEvent.Payload) !void {
+        try self.app.queue.putOne(self.app.io, .{ .turn = .{
+            .generation = self.generation,
+            .payload = payload,
+        } });
     }
 };
 
@@ -197,6 +207,7 @@ pub fn run(self: *App, gpa: std.mem.Allocator, io: std.Io, home: []const u8, api
     self.input_future = null;
     self.resize_future = null;
     self.turn_future = null;
+    self.turn_generation = 0;
     self.tick_future = null;
     self.queue = std.Io.Queue(Session.UiEvent).init(&self.queue_buffer);
 
@@ -295,16 +306,7 @@ fn runLoop(self: *App) !void {
         const count = self.queue.get(self.io, &batch, 1) catch |err| switch (err) {
             error.Closed, error.Canceled => break,
         };
-        var ticked = false;
-        for (batch[0..count]) |event| switch (event) {
-            .tick => ticked = true,
-            .resize => self.session.dirty = true,
-            .keys => |bytes| {
-                defer self.gpa.free(bytes);
-                try self.handleKeys(bytes);
-            },
-            else => try self.session.applyStreamEvent(event),
-        };
+        const ticked = try self.applyBatch(batch[0..count]);
         if (!self.session.animating()) {
             if (self.turn_future) |*future| {
                 future.await(self.io);
@@ -331,6 +333,29 @@ fn runLoop(self: *App) !void {
         }
         if ((self.session.dirty or self.session.animating()) and !self.tick_pending) self.armTick();
     }
+}
+
+/// Apply one bounded queue batch. Once the queue hands the batch to the consumer,
+/// this function owns every event; an error frees the unprocessed suffix.
+fn applyBatch(self: *App, events: []const Session.UiEvent) !bool {
+    std.debug.assert(events.len <= queue_capacity);
+    var applied_count: usize = 0;
+    errdefer for (events[applied_count..]) |event| event.deinit(self.gpa);
+
+    var ticked = false;
+    for (events) |event| {
+        applied_count += 1;
+        switch (event) {
+            .tick => ticked = true,
+            .resize => self.session.dirty = true,
+            .keys => |bytes| {
+                defer self.gpa.free(bytes);
+                try self.handleKeys(bytes);
+            },
+            .turn => |turn_event| try self.session.applyTurnEvent(turn_event),
+        }
+    }
+    return ticked;
 }
 
 /// Arm the next frame: a one-shot timer that fires at `last_paint + interval`. On
@@ -391,12 +416,12 @@ fn readInput(self: *App) void {
 }
 
 /// Turn worker task: run one turn through a `TurnHandler`, then push the single
-/// `.turn_ended` (carrying any error text). A cancelled turn pushes nothing — the
-/// consumer that cancelled it owns the teardown. `agent.run`'s `errdefer` rolls
-/// `messages` back to the turn base on every error path.
-fn runTurnWorker(self: *App, text: []u8) void {
+/// `.turn_ended` (carrying any error text). Cancellation suppresses that final
+/// event; any output queued before cancellation remains consumer-owned and tagged
+/// with this worker's generation. `agent.run` rolls its items back on error.
+fn runTurnWorker(self: *App, text: []u8, generation: u64) void {
     defer self.gpa.free(text);
-    var handler: TurnHandler = .{ .app = self };
+    var handler: TurnHandler = .{ .app = self, .generation = generation };
     self.agent.run(text, &handler) catch |err| switch (err) {
         error.Canceled, error.Closed => {
             if (handler.error_text) |extra| self.gpa.free(extra);
@@ -407,7 +432,7 @@ fn runTurnWorker(self: *App, text: []u8) void {
                 handler.error_text = self.gpa.dupe(u8, @errorName(err)) catch null;
         },
     };
-    self.queue.putOne(self.io, .{ .turn_ended = handler.error_text }) catch {
+    handler.enqueue(.{ .turn_ended = handler.error_text }) catch {
         if (handler.error_text) |extra| self.gpa.free(extra);
     };
 }
@@ -567,8 +592,8 @@ fn startSteeringTurn(self: *App) !void {
 }
 
 /// Abort the running turn: cancel and reap the worker (interrupting its blocked
-/// network read), then drop the turn's model state. Any events the worker already
-/// queued are dropped when applied, since the mode is no longer a turn.
+/// network read), then drop the turn's model state. Events the worker already
+/// queued retain its generation and cannot affect a successor.
 fn cancelTurn(self: *App) !void {
     // Cancel first (which joins the worker), so taking the queue can't race an
     // in-flight drain; nothing queued is lost — pending steering returns to the
@@ -640,10 +665,19 @@ fn runTurn(self: *App, text: []const u8) !void {
         future.await(self.io);
         self.turn_future = null;
     }
+    const generation = try self.reserveTurnGeneration();
     const owned = try self.gpa.dupe(u8, text);
     errdefer self.gpa.free(owned);
-    self.turn_future = try self.io.concurrent(runTurnWorker, .{ self, owned });
-    self.session.beginTurn();
+    self.turn_future = try self.io.concurrent(runTurnWorker, .{ self, owned, generation });
+    self.session.beginTurn(generation);
+}
+
+/// Permanently reserve the next turn generation before a worker can observe it.
+/// Failed allocation or spawn may leave a gap, but no generation is reused.
+fn reserveTurnGeneration(self: *App) !u64 {
+    if (self.turn_generation == std.math.maxInt(u64)) return error.TurnGenerationExhausted;
+    self.turn_generation += 1;
+    return self.turn_generation;
 }
 
 /// Handle a slash command locally, applying its outcome.
@@ -769,4 +803,175 @@ test "OAuth prompts render runtime fields as inert text" {
     try std.testing.expect(std.mem.indexOf(u8, written, "\x1b[2J") == null);
     try std.testing.expect(std.mem.indexOf(u8, written, "https://example.test/\u{200B}�\u{200B}]52;c;b3duZWQ=\u{200B}�\u{200B}") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "/home/\u{200B}�\u{200B}[2J/.pith/auth.json") != null);
+}
+
+test "turn producers keep their captured generation" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const generation: u64 = 42;
+
+    var app: App = undefined;
+    app.gpa = gpa;
+    app.io = io;
+    app.queue = std.Io.Queue(Session.UiEvent).init(&app.queue_buffer);
+    defer app.drainQueue();
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = anthropic_default,
+        .system = "",
+        .retry = .{},
+    });
+    defer app.agent.deinit();
+
+    var handler: TurnHandler = .{ .app = &app, .generation = generation };
+    try handler.onText("text");
+    try handler.onThinking("thinking");
+    try handler.onToolStart("read", "{}");
+    try handler.onToolResult("read", "result", false);
+    try handler.onUsage(.{});
+    try handler.onStreamReset();
+    try handler.onSteering("steer", 1);
+    runTurnWorker(&app, try gpa.dupe(u8, "prompt"), generation);
+
+    var events: [8]Session.UiEvent = undefined;
+    const count = try app.queue.get(io, &events, events.len);
+    defer for (events[0..count]) |event| event.deinit(gpa);
+    try std.testing.expectEqual(events.len, count);
+    for (events[0..count]) |event| switch (event) {
+        .turn => |turn_event| try std.testing.expectEqual(generation, turn_event.generation),
+        else => return error.UnexpectedEvent,
+    };
+    switch (events[events.len - 1].turn.payload) {
+        .turn_ended => |maybe_text| try std.testing.expectEqualStrings("SignedOut", maybe_text.?),
+        else => return error.UnexpectedEvent,
+    }
+}
+
+test "cancelling a turn joins and clears its active worker" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.gpa = gpa;
+    app.io = io;
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = anthropic_default,
+        .system = "",
+        .retry = .{},
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+    app.session.beginTurn(1);
+
+    var started: std.atomic.Value(bool) = .init(false);
+    var stopped: std.atomic.Value(bool) = .init(false);
+    const work = struct {
+        const State = struct {
+            ready: *std.atomic.Value(bool),
+            done: *std.atomic.Value(bool),
+        };
+
+        fn wait(worker_io: std.Io, state: State) void {
+            state.ready.store(true, .release);
+            defer state.done.store(true, .release);
+            worker_io.sleep(.fromSeconds(60), .awake) catch {};
+        }
+    };
+    app.turn_future = try io.concurrent(work.wait, .{ io, work.State{
+        .ready = &started,
+        .done = &stopped,
+    } });
+    defer if (app.turn_future) |*future| future.cancel(io);
+
+    var poll: usize = 0;
+    while (!started.load(.acquire) and poll < 1000) : (poll += 1)
+        io.sleep(.fromMilliseconds(1), .awake) catch {};
+    try std.testing.expect(started.load(.acquire));
+
+    try app.cancelTurn();
+    try std.testing.expect(app.turn_future == null);
+    try std.testing.expect(stopped.load(.acquire));
+    try std.testing.expect(app.session.mode == .prompt);
+}
+
+// The lifecycle calls model cancellation and resubmission key entries from a
+// batch App already drained; the remaining entries use the real outer queue union
+// and batch dispatcher.
+test "a drained batch routes only the active turn generation" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.gpa = gpa;
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+
+    app.session.beginTurn(1);
+    const first = [_]Session.UiEvent{.{ .turn = .{
+        .generation = 1,
+        .payload = .{ .text = try gpa.dupe(u8, "turn A") },
+    } }};
+    try std.testing.expect(!try app.applyBatch(&first));
+    try app.session.abortTurn();
+    app.session.beginTurn(2);
+
+    const rest = [_]Session.UiEvent{
+        .{ .turn = .{
+            .generation = 1,
+            .payload = .{ .text = try gpa.dupe(u8, "stale A") },
+        } },
+        .{ .turn = .{ .generation = 1, .payload = .{ .turn_ended = null } } },
+        .{ .turn = .{
+            .generation = 1,
+            .payload = .{ .turn_ended = try gpa.dupe(u8, "turn A failed") },
+        } },
+        .{ .turn = .{
+            .generation = 2,
+            .payload = .{ .text = try gpa.dupe(u8, "turn B") },
+        } },
+        .{ .turn = .{ .generation = 2, .payload = .{ .turn_ended = null } } },
+    };
+    try std.testing.expect(!try app.applyBatch(&rest));
+
+    try std.testing.expect(!app.session.animating());
+    try std.testing.expectEqual(@as(usize, 3), app.session.transcript.blocks().len);
+    try std.testing.expectEqualStrings("turn B", app.session.transcript.blocks()[2].model.items);
+}
+
+test "a failed batch frees its unprocessed turn events" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const gpa = failing.allocator();
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.gpa = gpa;
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+    app.session.beginTurn(1);
+
+    const events = [_]Session.UiEvent{
+        .{ .turn = .{
+            .generation = 1,
+            .payload = .{ .text = try gpa.dupe(u8, "current") },
+        } },
+        .{ .turn = .{
+            .generation = 1,
+            .payload = .{ .text = try gpa.dupe(u8, "unprocessed") },
+        } },
+    };
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+    try std.testing.expectError(error.OutOfMemory, app.applyBatch(&events));
+}
+
+test "turn generations cannot wrap or be reused" {
+    var app: App = undefined;
+    app.turn_generation = std.math.maxInt(u64);
+
+    try std.testing.expectError(error.TurnGenerationExhausted, app.reserveTurnGeneration());
+    try std.testing.expectEqual(std.math.maxInt(u64), app.turn_generation);
 }
