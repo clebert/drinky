@@ -235,7 +235,9 @@ commit history, `BACKLOG.md` (planned work), and `docs/`.
 - Subscription credentials stored at `~/.pith/auth.json` with owner-only permissions, keyed by
   account so several coexist in one file; a token refresh rewrites only its own account's entry, and
   a save aborts rather than discarding the file's other accounts when it cannot be read back.
-- OAuth login: PKCE (S256), browser launch, and a loopback callback server to capture the code.
+- OAuth login: PKCE (S256), a loopback callback listener ready before browser launch, and a
+  best-effort launcher whose lifetime never blocks the callback; unavailable launchers warn while
+  the printed URL remains usable for manual authorization.
 - Access tokens refreshed and re-persisted automatically when expired.
 - At startup the active account is the first authenticated one — a stored subscription or an
   available API key, preferring a subscription over a paid key when both are present; when none is

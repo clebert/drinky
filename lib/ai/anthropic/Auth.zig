@@ -9,6 +9,7 @@
 const std = @import("std");
 
 const auth_store = @import("../auth_store.zig");
+const oauth_login = @import("../oauth_login.zig");
 const oauth = @import("oauth.zig");
 
 const Auth = @This();
@@ -87,10 +88,12 @@ pub fn login(self: *Auth, prompt: anytype) !void {
     const url = try oauth.authorizeUrl(self.gpa, &pair);
     defer self.gpa.free(url);
 
-    try prompt.showAuthorization(url);
-    openBrowser(self.io, url);
-
-    const callback = try self.awaitCallback();
+    const callback = try oauth_login.receive(Callback, &.{
+        .url = url,
+        .prompt = prompt,
+        .browser = oauth_login.Browser{ .io = self.io },
+        .callback = CallbackSource{ .auth = self },
+    });
     defer {
         self.gpa.free(callback.code);
         self.gpa.free(callback.state);
@@ -133,41 +136,49 @@ fn save(self: *Auth) !void {
 
 const Callback = struct { code: []const u8, state: []const u8 };
 
-fn awaitCallback(self: *Auth) !Callback {
-    var address: std.Io.net.IpAddress = .{ .ip4 = .loopback(oauth.callback_port) };
-    var server = try address.listen(self.io, .{ .reuse_address = true });
-    defer server.deinit(self.io);
+const CallbackSource = struct {
+    auth: *Auth,
 
-    var stream = try server.accept(self.io);
-    defer stream.close(self.io);
+    pub fn listen(self: CallbackSource) !CallbackListener {
+        var address: std.Io.net.IpAddress = .{ .ip4 = .loopback(oauth.callback_port) };
+        return .{
+            .auth = self.auth,
+            .server = try address.listen(self.auth.io, .{ .reuse_address = true }),
+        };
+    }
+};
 
-    var read_buffer: [8192]u8 = undefined;
-    var stream_reader = stream.reader(self.io, &read_buffer);
-    const request_line = try stream_reader.interface.takeDelimiterExclusive('\n');
+const CallbackListener = struct {
+    auth: *Auth,
+    server: std.Io.net.Server,
 
-    const code = try queryParam(self.gpa, request_line, "code");
-    errdefer self.gpa.free(code);
-    const state = try queryParam(self.gpa, request_line, "state");
+    pub fn deinit(self: *CallbackListener) void {
+        self.server.deinit(self.auth.io);
+    }
 
-    var write_buffer: [512]u8 = undefined;
-    var stream_writer = stream.writer(self.io, &write_buffer);
-    try stream_writer.interface.print(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
-        .{ response_page.len, response_page },
-    );
-    try stream_writer.interface.flush();
+    pub fn receive(self: *CallbackListener) !Callback {
+        var stream = try self.server.accept(self.auth.io);
+        defer stream.close(self.auth.io);
 
-    return .{ .code = code, .state = state };
-}
+        var read_buffer: [8192]u8 = undefined;
+        var stream_reader = stream.reader(self.auth.io, &read_buffer);
+        const request_line = try stream_reader.interface.takeDelimiterExclusive('\n');
 
-fn openBrowser(io: std.Io, url: []const u8) void {
-    var child = std.process.spawn(io, .{ .argv = &.{ "xdg-open", url } }) catch {
-        var fallback = std.process.spawn(io, .{ .argv = &.{ "open", url } }) catch return;
-        _ = fallback.wait(io) catch {};
-        return;
-    };
-    _ = child.wait(io) catch {};
-}
+        const code = try queryParam(self.auth.gpa, request_line, "code");
+        errdefer self.auth.gpa.free(code);
+        const state = try queryParam(self.auth.gpa, request_line, "state");
+
+        var write_buffer: [512]u8 = undefined;
+        var stream_writer = stream.writer(self.auth.io, &write_buffer);
+        try stream_writer.interface.print(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
+            .{ response_page.len, response_page },
+        );
+        try stream_writer.interface.flush();
+
+        return .{ .code = code, .state = state };
+    }
+};
 
 /// Value of query parameter `name` in an HTTP request line, owned by the caller.
 fn queryParam(gpa: std.mem.Allocator, request_line: []const u8, name: []const u8) ![]const u8 {

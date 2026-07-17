@@ -104,9 +104,10 @@ Extension seams referenced here:
 - [x] **`/login` and `/logout`.** Authenticate or drop credentials mid-session without a restart,
       both picker-driven, and the same login picker serves the first-run bootstrap and the
       fall-through after logging out the last account. `/login` lists every account: an
-      unauthenticated subscription runs its OAuth flow (the browser + loopback callback that once ran
-      pre-tty at startup) with the app suspending the tty — restoring cooked mode so the URL prints
-      and the callback completes — and forcing a full repaint after, then switching to it on its
+      unauthenticated subscription runs its OAuth flow (an already-listening loopback callback plus
+      a best-effort browser launch, with a printed manual fallback) with the app suspending the tty —
+      restoring cooked mode so the URL prints and the callback completes — and forcing a full
+      repaint after, then switching to it on its
       default model; an environment API account reports which variable to set and to restart; an
       already-active account is marked and does nothing. `/logout` lists the logged-in subscriptions
       and drops the chosen one's `auth.json` entry (an `auth_store` remove that preserves every

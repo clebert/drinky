@@ -176,6 +176,13 @@ const OauthPrompt = struct {
         try self.writer.flush();
     }
 
+    pub fn showBrowserLaunchFailed(self: *OauthPrompt) !void {
+        try self.writer.writeAll(
+            "Could not open a browser automatically; open the URL above manually.\n",
+        );
+        try self.writer.flush();
+    }
+
     pub fn showAuthorized(self: *OauthPrompt, path: []const u8) !void {
         try self.writer.writeAll("Authorized. Credentials saved to ");
         try self.writeText(path);
@@ -709,8 +716,13 @@ fn openLoginPicker(self: *App) !void {
 /// Log in to a subscription `account`, then switch to it on its default model.
 /// A failed login leaves the current account untouched.
 fn loginAccount(self: *App, account: ai.llm.Account) !void {
-    self.runOauth(account) catch |err| {
-        return self.report(.err, "login failed: {s}", .{@errorName(err)});
+    return self.finishLogin(account, self.runOauth(account));
+}
+
+fn finishLogin(self: *App, account: ai.llm.Account, result: anyerror!void) !void {
+    result catch |err| switch (err) {
+        error.Canceled => return error.Canceled,
+        else => return self.report(.err, "login failed: {s}", .{@errorName(err)}),
     };
     self.adopt(account);
     try self.report(.ok, "logged in to {s}; using {s}", .{ account.label(), self.agent.model.name });
@@ -796,6 +808,7 @@ test "OAuth prompts render runtime fields as inert text" {
     var prompt: OauthPrompt = .{ .writer = &out.writer };
 
     try prompt.showAuthorization("https://example.test/\x1b]52;c;b3duZWQ=\x07");
+    try prompt.showBrowserLaunchFailed();
     try prompt.showAuthorized("/home/\x1b[2J/.pith/auth.json");
 
     const written = out.written();
@@ -803,6 +816,24 @@ test "OAuth prompts render runtime fields as inert text" {
     try std.testing.expect(std.mem.indexOf(u8, written, "\x1b[2J") == null);
     try std.testing.expect(std.mem.indexOf(u8, written, "https://example.test/\u{200B}�\u{200B}]52;c;b3duZWQ=\u{200B}�\u{200B}") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "/home/\u{200B}�\u{200B}[2J/.pith/auth.json") != null);
+}
+
+test "OAuth login cancellation escapes without failure feedback" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.gpa = gpa;
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+
+    const block_count = app.session.transcript.blocks().len;
+    try std.testing.expectError(
+        error.Canceled,
+        app.finishLogin(.anthropic_subscription, error.Canceled),
+    );
+    try std.testing.expectEqual(block_count, app.session.transcript.blocks().len);
 }
 
 test "turn producers keep their captured generation" {

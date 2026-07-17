@@ -5,6 +5,8 @@
 
 const std = @import("std");
 
+const oauth_login = @import("oauth_login.zig");
+
 pub const Accounts = @import("Accounts.zig");
 pub const Agent = @import("Agent.zig");
 pub const anthropic = @import("anthropic/root.zig");
@@ -20,4 +22,5 @@ pub const tool = @import("tool/root.zig");
 
 test {
     std.testing.refAllDecls(@This());
+    _ = oauth_login;
 }
