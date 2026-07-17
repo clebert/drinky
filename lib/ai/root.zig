@@ -5,6 +5,7 @@
 
 const std = @import("std");
 
+const oauth_callback = @import("oauth_callback.zig");
 const oauth_login = @import("oauth_login.zig");
 
 pub const Accounts = @import("Accounts.zig");
@@ -22,5 +23,6 @@ pub const tool = @import("tool/root.zig");
 
 test {
     std.testing.refAllDecls(@This());
+    _ = oauth_callback;
     _ = oauth_login;
 }

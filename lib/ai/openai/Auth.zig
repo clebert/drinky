@@ -10,6 +10,7 @@
 const std = @import("std");
 
 const auth_store = @import("../auth_store.zig");
+const oauth_callback = @import("../oauth_callback.zig");
 const oauth_login = @import("../oauth_login.zig");
 const oauth = @import("oauth.zig");
 
@@ -17,8 +18,6 @@ const Auth = @This();
 
 /// Top-level key this account's credentials live under in `auth.json`.
 const account_key = "openai_subscription";
-
-const response_page = "pith authorized \xe2\x80\x94 you can close this tab.";
 
 gpa: std.mem.Allocator,
 io: std.Io,
@@ -96,7 +95,7 @@ pub fn login(self: *Auth, prompt: anytype) !void {
     const url = try oauth.authorizeUrl(self.gpa, &pair);
     defer self.gpa.free(url);
 
-    const callback = try oauth_login.receive(Callback, &.{
+    const callback = try oauth_login.receive(oauth_callback.Callback, &.{
         .url = url,
         .prompt = prompt,
         .browser = oauth_login.Browser{ .io = self.io },
@@ -146,8 +145,6 @@ fn save(self: *Auth) !void {
     });
 }
 
-const Callback = struct { code: []const u8, state: []const u8 };
-
 const CallbackSource = struct {
     auth: *Auth,
 
@@ -168,47 +165,7 @@ const CallbackListener = struct {
         self.server.deinit(self.auth.io);
     }
 
-    pub fn receive(self: *CallbackListener) !Callback {
-        var stream = try self.server.accept(self.auth.io);
-        defer stream.close(self.auth.io);
-
-        var read_buffer: [8192]u8 = undefined;
-        var stream_reader = stream.reader(self.auth.io, &read_buffer);
-        const request_line = try stream_reader.interface.takeDelimiterExclusive('\n');
-
-        const code = try queryParam(self.auth.gpa, request_line, "code");
-        errdefer self.auth.gpa.free(code);
-        const state = try queryParam(self.auth.gpa, request_line, "state");
-
-        var write_buffer: [512]u8 = undefined;
-        var stream_writer = stream.writer(self.auth.io, &write_buffer);
-        try stream_writer.interface.print(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
-            .{ response_page.len, response_page },
-        );
-        try stream_writer.interface.flush();
-
-        return .{ .code = code, .state = state };
+    pub fn receive(self: *CallbackListener) !oauth_callback.Callback {
+        return oauth_callback.receive(self.auth.gpa, self.auth.io, &self.server);
     }
 };
-
-/// Value of query parameter `name` in an HTTP request line, owned by the caller.
-fn queryParam(gpa: std.mem.Allocator, request_line: []const u8, name: []const u8) ![]const u8 {
-    var needle_buffer: [16]u8 = undefined;
-    const needle = std.fmt.bufPrint(&needle_buffer, "{s}=", .{name}) catch return error.BadCallback;
-    const at = std.mem.indexOf(u8, request_line, needle) orelse return error.MissingCallbackParam;
-    const rest = request_line[at + needle.len ..];
-    var end: usize = 0;
-    while (end < rest.len and rest[end] != '&' and rest[end] != ' ' and rest[end] != '\r') end += 1;
-    return gpa.dupe(u8, rest[0..end]);
-}
-
-test queryParam {
-    const line = "GET /auth/callback?code=abc123&state=xyz HTTP/1.1\r";
-    const code = try queryParam(std.testing.allocator, line, "code");
-    defer std.testing.allocator.free(code);
-    const state = try queryParam(std.testing.allocator, line, "state");
-    defer std.testing.allocator.free(state);
-    try std.testing.expectEqualStrings("abc123", code);
-    try std.testing.expectEqualStrings("xyz", state);
-}

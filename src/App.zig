@@ -722,6 +722,21 @@ fn loginAccount(self: *App, account: ai.llm.Account) !void {
 fn finishLogin(self: *App, account: ai.llm.Account, result: anyerror!void) !void {
     result catch |err| switch (err) {
         error.Canceled => return error.Canceled,
+        error.CallbackTimeout => return self.report(
+            .err,
+            "login timed out waiting for the browser callback",
+            .{},
+        ),
+        error.CallbackRequestTooLarge => return self.report(
+            .err,
+            "login failed: browser callback request was too large",
+            .{},
+        ),
+        error.CallbackTimeoutUnavailable => return self.report(
+            .err,
+            "login failed: browser callback deadline was unavailable",
+            .{},
+        ),
         else => return self.report(.err, "login failed: {s}", .{@errorName(err)}),
     };
     self.adopt(account);
@@ -834,6 +849,41 @@ test "OAuth login cancellation escapes without failure feedback" {
         app.finishLogin(.anthropic_subscription, error.Canceled),
     );
     try std.testing.expectEqual(block_count, app.session.transcript.blocks().len);
+}
+
+test "OAuth callback bounds have friendly failure feedback" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.gpa = gpa;
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+
+    try app.finishLogin(.anthropic_subscription, error.CallbackTimeout);
+    const timeout = app.session.transcript.blocks()[0].feedback;
+    try std.testing.expect(timeout.is_error);
+    try std.testing.expectEqualStrings(
+        "login timed out waiting for the browser callback",
+        timeout.text.items,
+    );
+
+    try app.finishLogin(.openai_subscription, error.CallbackRequestTooLarge);
+    const oversized = app.session.transcript.blocks()[1].feedback;
+    try std.testing.expect(oversized.is_error);
+    try std.testing.expectEqualStrings(
+        "login failed: browser callback request was too large",
+        oversized.text.items,
+    );
+
+    try app.finishLogin(.anthropic_subscription, error.CallbackTimeoutUnavailable);
+    const unavailable = app.session.transcript.blocks()[2].feedback;
+    try std.testing.expect(unavailable.is_error);
+    try std.testing.expectEqualStrings(
+        "login failed: browser callback deadline was unavailable",
+        unavailable.text.items,
+    );
 }
 
 test "turn producers keep their captured generation" {

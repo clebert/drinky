@@ -237,7 +237,9 @@ commit history, `BACKLOG.md` (planned work), and `docs/`.
   a save aborts rather than discarding the file's other accounts when it cannot be read back.
 - OAuth login: PKCE (S256), a loopback callback listener ready before browser launch, and a
   best-effort launcher whose lifetime never blocks the callback; unavailable launchers warn while
-  the printed URL remains usable for manual authorization.
+  the printed URL remains usable for manual authorization. Callback acceptance and its first HTTP
+  request line share a five-minute deadline; the request line is limited to 8 KiB including its
+  newline, and timeout, oversize, or cancellation closes callback resources cleanly.
 - Access tokens refreshed and re-persisted automatically when expired.
 - At startup the active account is the first authenticated one — a stored subscription or an
   available API key, preferring a subscription over a paid key when both are present; when none is
