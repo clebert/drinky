@@ -12,6 +12,11 @@ const walk = @import("walk.zig");
 const limit_default = 100;
 const file_bytes_max = 4 << 20;
 const line_bytes_max = 300;
+// Retained candidate paths (bounds the path-list memory) and the running total
+// of bytes read across searched files (bounds the actual I/O work, which a bare
+// `files_max * file_bytes_max` ceiling would leave at hundreds of gigabytes).
+const files_max = 100_000;
+const bytes_read_max = 256 << 20;
 
 pub const spec: llm.Tool = .{
     .name = "grep",
@@ -48,25 +53,32 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
     const ignore_case = parsed.value.ignore_case;
     const limit = parsed.value.limit;
 
-    var arena_state: std.heap.ArenaAllocator = .init(gpa);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const files = walk.collect(context.io, arena, .{ .base = base, .pattern = file_glob }) catch |err| switch (err) {
+    var matches = walk.collect(context.io, gpa, .{ .base = base, .pattern = file_glob, .retain = files_max }) catch |err| switch (err) {
         error.Canceled => return err,
         else => return Result.report(gpa, .err, "cannot search {s}: {s}", .{ base, @errorName(err) }),
     };
+    defer matches.deinit(gpa);
+    // Fewer candidates retained than found, or a capped walk, means some files
+    // were never searched.
+    const files_incomplete = matches.capped or matches.matched > matches.paths.len;
 
     var out: std.Io.Writer.Allocating = .init(gpa);
     errdefer out.deinit();
     var count: usize = 0;
-    var truncated = false;
-    search: for (files) |path| {
+    var line_capped = false;
+    var bytes_read: usize = 0;
+    var bytes_capped = false;
+    search: for (matches.paths) |path| {
+        if (bytes_read >= bytes_read_max) {
+            bytes_capped = true;
+            break :search;
+        }
         const data = std.Io.Dir.cwd().readFileAlloc(context.io, path, gpa, .limited(file_bytes_max)) catch |err| switch (err) {
             error.Canceled => return err,
             else => continue,
         };
         defer gpa.free(data);
+        bytes_read += data.len;
         if (std.mem.indexOfScalar(u8, data, 0) != null) continue;
 
         var line_number: usize = 0;
@@ -75,7 +87,7 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
             line_number += 1;
             if (!lineContains(.{ .line = line, .needle = pattern, .ignore_case = ignore_case })) continue;
             if (count == limit) {
-                truncated = true;
+                line_capped = true;
                 break :search;
             }
             const shown = line[0..utf8FloorLength(line, line_bytes_max)];
@@ -84,9 +96,19 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
             count += 1;
         }
     }
-    if (count == 0) return Result.report(gpa, .ok, "no matches for {s}", .{pattern});
-    if (truncated) {
+    if (count == 0) {
+        if (line_capped or bytes_capped or files_incomplete)
+            return Result.report(gpa, .ok, "no matches for {s} in the portion searched; the search was incomplete — narrow the path or glob", .{pattern});
+        return Result.report(gpa, .ok, "no matches for {s}", .{pattern});
+    }
+    // Report the reason the result may be incomplete, most specific first: a hit
+    // result budget, then the I/O budget, then unsearched files.
+    if (line_capped) {
         try out.writer.print("\n... stopped at the limit of {d} matches; refine the search or raise limit", .{limit});
+    } else if (bytes_capped) {
+        try out.writer.print("\n... stopped after reading {d} MB; refine the search or narrow the path or glob", .{bytes_read_max >> 20});
+    } else if (files_incomplete) {
+        try out.writer.writeAll("\n... search incomplete: the tree is too large to scan fully; some files were not searched");
     }
     return .{ .content = try out.toOwnedSlice(), .is_error = false };
 }

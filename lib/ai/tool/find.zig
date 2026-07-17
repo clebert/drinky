@@ -38,26 +38,29 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
     const base = parsed.value.path;
     const limit = parsed.value.limit;
 
-    var arena_state: std.heap.ArenaAllocator = .init(gpa);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const files = walk.collect(context.io, arena, .{ .base = base, .pattern = pattern }) catch |err| switch (err) {
+    var matches = walk.collect(context.io, gpa, .{ .base = base, .pattern = pattern, .retain = limit }) catch |err| switch (err) {
         error.Canceled => return err,
         else => return Result.report(gpa, .err, "cannot search {s}: {s}", .{ base, @errorName(err) }),
     };
-    if (files.len == 0) return Result.report(gpa, .ok, "no files match {s}", .{pattern});
+    defer matches.deinit(gpa);
+    if (matches.matched == 0) {
+        if (matches.capped) return Result.report(gpa, .ok, "no files match {s} in the portion searched; the tree is too large to scan fully — narrow the path or pattern", .{pattern});
+        return Result.report(gpa, .ok, "no files match {s}", .{pattern});
+    }
 
-    const shown = @min(files.len, limit);
+    const shown = matches.paths.len;
     var out: std.Io.Writer.Allocating = .init(gpa);
     errdefer out.deinit();
-    for (files[0..shown], 0..) |path, index| {
+    for (matches.paths, 0..) |path, index| {
         if (index > 0) try out.writer.writeAll("\n");
         try out.writer.writeAll(path);
     }
-    if (files.len > shown) {
+    if (matches.capped) {
         if (shown > 0) try out.writer.writeAll("\n");
-        try out.writer.print("... {d} more (raise limit to see them)", .{files.len - shown});
+        try out.writer.print("... search stopped: the tree is too large to scan fully; showing the {d} smallest matches — narrow the path or pattern", .{shown});
+    } else if (matches.matched > shown) {
+        if (shown > 0) try out.writer.writeAll("\n");
+        try out.writer.print("... {d} more (raise limit to see them)", .{matches.matched - shown});
     }
     return .{ .content = try out.toOwnedSlice(), .is_error = false };
 }

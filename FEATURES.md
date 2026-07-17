@@ -260,15 +260,19 @@ commit history, `BACKLOG.md` (planned work), and `docs/`.
 - **write** — create or overwrite a UTF-8 file atomically.
 - **edit** — replace one exact, unique text span; errors on an empty, missing, or non-unique match;
   written atomically.
-- **find** — glob file search returning relative paths under a base path, bounded by a result limit
-  (default 1000).
+- **find** — glob file search returning matching paths relative to the working directory, the
+  lexicographically-smallest first, bounded by a result limit (default 1000); reports how many more
+  matched, and reports honestly when the tree was too large to scan fully.
 - **grep** — literal substring search reporting `path:line:text`, with a glob filter, optional
-  case-insensitivity, and a result limit (default 100); skips binary and large (over 4 MB) files and
-  caps reported line length (300 bytes).
-- Glob patterns support `*`, `?`, and `**`; file searches walk directories recursively in sorted
-  order and skip noise directories (version-control and build directories). An unreadable directory
-  is skipped rather than fatal, while cancellation stops the walk at once — without traversing the
-  rest of the tree — and still releases every open directory handle.
+  case-insensitivity, and a result limit (default 100); skips binary and large (over 4 MB) files,
+  caps reported line length (300 bytes), and bounds work by reading at most 256 MB across at most
+  100,000 candidate files, reporting honestly when a budget stopped it.
+- Glob patterns support `*`, `?`, and `**`; file searches walk directories recursively and skip
+  noise directories (version-control and build directories), returning matches sorted by path. The
+  walk is bounded independent of tree size: it retains only the smallest matches the caller needs
+  rather than the whole tree, and stops after a fixed number of visited entries (1,000,000). An
+  unreadable directory is skipped rather than fatal, while cancellation stops the walk at once —
+  without traversing the rest of the tree — and every exit releases every open directory handle.
 
 ### Slash commands
 
