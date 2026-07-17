@@ -34,9 +34,9 @@ commit history, `BACKLOG.md` (planned work), and `docs/`.
 ### Terminal control
 
 - Enters raw mode (no echo, canonical processing, signals, or flow control) and restores the
-  original terminal state on exit.
+  original terminal state on exit or startup failure.
 - On start, enables bracketed paste, the Kitty keyboard protocol (disambiguate level), and cursor
-  hiding; reverses all three on exit.
+  hiding; reverses all three on exit and rolls back any partially applied setup.
 - Input reading and output writing proceed concurrently; output is buffered.
 - Reads can time out, so a reader blocked on input can still react to events such as a resize.
 - Queries the terminal window size, reporting absence rather than a fabricated default when
