@@ -38,7 +38,6 @@ model: models.Model,
 system: []const u8,
 effort: llm.Effort,
 retry: net.Retry,
-arena: std.heap.ArenaAllocator,
 items: std.ArrayList(llm.Item),
 stats: Stats,
 /// Steering messages the user submitted mid-turn, drained into the running turn
@@ -118,7 +117,6 @@ pub fn init(
         .system = options.system,
         .effort = options.effort,
         .retry = options.retry,
-        .arena = .init(gpa),
         .items = .empty,
         .stats = .{},
         .steering = Steering.init(gpa, io),
@@ -127,9 +125,9 @@ pub fn init(
 }
 
 pub fn deinit(self: *Agent) void {
+    for (self.items.items) |item| freeItem(self.gpa, item);
     self.items.deinit(self.gpa);
     self.steering.deinit();
-    self.arena.deinit();
 }
 
 /// Switch the active account and model together; takes effect on the next turn.
@@ -158,7 +156,7 @@ pub fn setEffort(self: *Agent, effort: llm.Effort) void {
 pub fn run(self: *Agent, user_text: []const u8, handler: anytype) !void {
     if (self.client == null) return error.SignedOut;
     const base = self.items.items.len;
-    errdefer self.items.shrinkRetainingCapacity(base);
+    errdefer self.rollback(base);
     try self.appendUser(user_text);
     var round: usize = 0;
     while (round < rounds_max) : (round += 1) {
@@ -277,16 +275,47 @@ fn retryableError(err: anyerror) bool {
     };
 }
 
-/// Surface a failed turn to the handler and drop its items so the history is
+/// Surface a failed turn to the handler and free its items so the history is
 /// restored to the turn's start for the next turn.
 fn reportAndReset(self: *Agent, handler: anytype, text: []const u8, base: usize) !void {
-    self.items.shrinkRetainingCapacity(base);
+    self.rollback(base);
     try handler.onError(text);
 }
 
+/// Free and drop every history item from `base` on, restoring the list to that
+/// length. Retained capacity is kept so a rolled-back turn does not thrash the
+/// list backing.
+fn rollback(self: *Agent, base: usize) void {
+    for (self.items.items[base..]) |item| freeItem(self.gpa, item);
+    self.items.shrinkRetainingCapacity(base);
+}
+
+/// Free the owned strings of one history item. An empty string (a redacted
+/// reasoning's visible text) frees as a no-op.
+fn freeItem(gpa: std.mem.Allocator, item: llm.Item) void {
+    switch (item) {
+        .message => |message| gpa.free(message.text),
+        .reasoning => |reasoning| {
+            gpa.free(reasoning.text);
+            gpa.free(reasoning.blob);
+            gpa.free(reasoning.id);
+        },
+        .tool_call => |call| {
+            gpa.free(call.call_id);
+            gpa.free(call.name);
+            gpa.free(call.arguments_json);
+        },
+        .tool_result => |result| {
+            gpa.free(result.call_id);
+            gpa.free(result.content);
+        },
+    }
+}
+
 fn appendUser(self: *Agent, text: []const u8) !void {
-    const arena = self.arena.allocator();
-    try self.items.append(self.gpa, .{ .message = .{ .role = .user, .text = try arena.dupe(u8, text) } });
+    const owned = try self.gpa.dupe(u8, text);
+    errdefer self.gpa.free(owned);
+    try self.items.append(self.gpa, .{ .message = .{ .role = .user, .text = owned } });
 }
 
 /// Fold one assistant message's usage into the session totals, priced with
@@ -302,28 +331,35 @@ fn recordUsage(self: *Agent, model: *const models.Model, usage: llm.Usage) void 
 }
 
 /// Read one streamed assistant message to completion, recording usage and
-/// appending its items to history; returns that run of items. A stream or API
-/// error returns before the append, so history stays untouched and the whole
-/// request can be retried without a duplicated or partial message. The returned
-/// slice is arena-owned, so it stays valid while `runTools` appends `tool_result`
-/// items to the history list.
+/// appending its items to history; returns that run of items. The reply is built
+/// in a local list and committed to history only once complete, so a stream or
+/// API error frees the partial work and leaves history (and the in-flight
+/// request's view of it) untouched, and the whole request can be retried without
+/// a duplicated or partial message. The returned slice views the committed tail
+/// of `self.items`; it stays valid until the next append to that list, which
+/// `runTools` performs only after reading the reply.
 fn readReply(
     self: *Agent,
     model: *const models.Model,
     stream: anytype,
     handler: anytype,
 ) ![]const llm.Item {
-    const arena = self.arena.allocator();
     // Tag reasoning with the account that produced it, so a serializer replays
     // its blobs only for the exact same account and drops any other whole.
     const origin = self.client.?.account();
-    var items: std.ArrayList(llm.Item) = .empty;
+    // The defer frees the list backing; the errdefer frees the finished items
+    // only on failure, since a successful commit hands them to `self.items`.
+    var pending: std.ArrayList(llm.Item) = .empty;
+    defer pending.deinit(self.gpa);
+    errdefer for (pending.items) |item| freeItem(self.gpa, item);
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(self.gpa);
     var input: std.ArrayList(u8) = .empty;
     defer input.deinit(self.gpa);
-    var tool_id: []const u8 = "";
-    var tool_name: []const u8 = "";
+    var tool_id: std.ArrayList(u8) = .empty;
+    defer tool_id.deinit(self.gpa);
+    var tool_name: std.ArrayList(u8) = .empty;
+    defer tool_name.deinit(self.gpa);
     var in_tool = false;
     var thinking: std.ArrayList(u8) = .empty;
     defer thinking.deinit(self.gpa);
@@ -337,7 +373,7 @@ fn readReply(
     while (try stream.next()) |event| switch (event) {
         .thinking => |chunk| {
             in_thinking = true;
-            if (chunk.id.len != 0) try setId(self.gpa, &reasoning_id, chunk.id);
+            if (chunk.id.len != 0) try setBuffer(self.gpa, &reasoning_id, chunk.id);
             try thinking.appendSlice(self.gpa, chunk.text);
             try handler.onThinking(chunk.text);
         },
@@ -345,23 +381,17 @@ fn readReply(
         // only a blob (omitted reasoning) still round-trips.
         .thinking_blob => |chunk| {
             in_thinking = true;
-            if (chunk.id.len != 0) try setId(self.gpa, &reasoning_id, chunk.id);
+            if (chunk.id.len != 0) try setBuffer(self.gpa, &reasoning_id, chunk.id);
             try blob.appendSlice(self.gpa, chunk.blob);
         },
         .thinking_redacted => |chunk| {
-            try flushThinking(arena, &items, &thinking, &blob, &reasoning_id, &in_thinking, origin);
-            try items.append(arena, .{ .reasoning = .{
-                .text = "",
-                .blob = try arena.dupe(u8, chunk.blob),
-                .redacted = true,
-                .id = try arena.dupe(u8, chunk.id),
-                .origin = origin,
-            } });
+            try flushThinking(self.gpa, &pending, &thinking, &blob, &reasoning_id, &in_thinking, origin);
+            try appendRedacted(self.gpa, &pending, chunk, origin);
             // The payload is encrypted, so stand a placeholder in for the display.
             try handler.onThinking(redacted_notice);
         },
         .text => |delta| {
-            try flushThinking(arena, &items, &thinking, &blob, &reasoning_id, &in_thinking, origin);
+            try flushThinking(self.gpa, &pending, &thinking, &blob, &reasoning_id, &in_thinking, origin);
             try text.appendSlice(self.gpa, delta);
             try handler.onText(delta);
         },
@@ -371,11 +401,16 @@ fn readReply(
             // stored run keeps the order the model produced (reasoning at the
             // head, which the provider requires; tool and text calls interleaved
             // as sent).
-            if (in_tool) try flushTool(arena, &items, .{ .id = tool_id, .name = tool_name }, &input);
-            try flushThinking(arena, &items, &thinking, &blob, &reasoning_id, &in_thinking, origin);
-            try flushText(arena, &items, &text);
-            tool_id = try arena.dupe(u8, use.call_id);
-            tool_name = try arena.dupe(u8, use.name);
+            if (in_tool) try flushTool(
+                self.gpa,
+                &pending,
+                .{ .id = tool_id.items, .name = tool_name.items },
+                &input,
+            );
+            try flushThinking(self.gpa, &pending, &thinking, &blob, &reasoning_id, &in_thinking, origin);
+            try flushText(self.gpa, &pending, &text);
+            try setBuffer(self.gpa, &tool_id, use.call_id);
+            try setBuffer(self.gpa, &tool_name, use.name);
             input.clearRetainingCapacity();
             in_tool = true;
         },
@@ -391,13 +426,18 @@ fn readReply(
 
     // Flush what streamed after the last tool in the order the intra-turn branch
     // uses: the pending tool first, then any trailing reasoning and answer.
-    if (in_tool) try flushTool(arena, &items, .{ .id = tool_id, .name = tool_name }, &input);
-    try flushThinking(arena, &items, &thinking, &blob, &reasoning_id, &in_thinking, origin);
-    try flushText(arena, &items, &text);
+    if (in_tool) try flushTool(
+        self.gpa,
+        &pending,
+        .{ .id = tool_id.items, .name = tool_name.items },
+        &input,
+    );
+    try flushThinking(self.gpa, &pending, &thinking, &blob, &reasoning_id, &in_thinking, origin);
+    try flushText(self.gpa, &pending, &text);
 
-    const reply = try items.toOwnedSlice(arena);
-    try self.items.appendSlice(self.gpa, reply);
-    return reply;
+    const start = self.items.items.len;
+    try self.items.appendSlice(self.gpa, pending.items);
+    return self.items.items[start..];
 }
 
 /// The concurrent read-only task body, one monomorphization per `Dispatch` type
@@ -481,15 +521,20 @@ fn runToolsWith(
     }
     try group.await(self.io);
 
-    const arena = self.arena.allocator();
-    const results = try arena.alloc(llm.Item, count);
+    const results = try self.gpa.alloc(llm.Item, count);
+    defer self.gpa.free(results);
+    errdefer for (results[0..collected]) |item| freeItem(self.gpa, item);
     while (collected < count) : (collected += 1) {
         const call = &calls[collected];
         const result = try call.result;
         try handler.onToolResult(call.name, result.content, result.is_error);
+        const call_id = try self.gpa.dupe(u8, call.id);
+        errdefer self.gpa.free(call_id);
+        const content = try self.gpa.dupe(u8, result.content);
+        errdefer self.gpa.free(content);
         results[collected] = .{ .tool_result = .{
-            .call_id = try arena.dupe(u8, call.id),
-            .content = try arena.dupe(u8, result.content),
+            .call_id = call_id,
+            .content = content,
             .is_error = result.is_error,
         } };
         self.gpa.free(result.content);
@@ -499,28 +544,32 @@ fn runToolsWith(
     return true;
 }
 
-/// Replace the open reasoning run's item id with `id` (the provider's
-/// server-assigned reasoning-item id; empty and unused for Anthropic).
-fn setId(gpa: std.mem.Allocator, reasoning_id: *std.ArrayList(u8), id: []const u8) !void {
-    reasoning_id.clearRetainingCapacity();
-    try reasoning_id.appendSlice(gpa, id);
+/// Replace `buffer`'s contents with `bytes`, retaining its capacity. Used for the
+/// open reasoning run's item id and the pending tool call's id and name.
+fn setBuffer(gpa: std.mem.Allocator, buffer: *std.ArrayList(u8), bytes: []const u8) !void {
+    buffer.clearRetainingCapacity();
+    try buffer.appendSlice(gpa, bytes);
 }
 
 fn flushText(
-    arena: std.mem.Allocator,
+    gpa: std.mem.Allocator,
     items: *std.ArrayList(llm.Item),
     text: *std.ArrayList(u8),
 ) !void {
     if (text.items.len == 0) return;
-    try items.append(arena, .{ .message = .{ .role = .assistant, .text = try arena.dupe(u8, text.items) } });
+    const text_copy = try gpa.dupe(u8, text.items);
+    errdefer gpa.free(text_copy);
+    try items.append(gpa, .{ .message = .{ .role = .assistant, .text = text_copy } });
     text.clearRetainingCapacity();
 }
 
 /// Commit the open reasoning run as one reasoning item (text plus its verbatim
 /// blob and item id), preserving the head-of-message order the provider
-/// validates. A no-op when no run is open.
+/// validates. A no-op when no run is open. Each string is duped before the item
+/// is appended, and every dupe is freed if a later dupe or the append fails, so a
+/// failure leaves no orphaned allocation.
 fn flushThinking(
-    arena: std.mem.Allocator,
+    gpa: std.mem.Allocator,
     items: *std.ArrayList(llm.Item),
     thinking: *std.ArrayList(u8),
     blob: *std.ArrayList(u8),
@@ -529,10 +578,16 @@ fn flushThinking(
     origin: llm.Account,
 ) !void {
     if (!in_thinking.*) return;
-    try items.append(arena, .{ .reasoning = .{
-        .text = try arena.dupe(u8, thinking.items),
-        .blob = try arena.dupe(u8, blob.items),
-        .id = try arena.dupe(u8, reasoning_id.items),
+    const text_copy = try gpa.dupe(u8, thinking.items);
+    errdefer gpa.free(text_copy);
+    const blob_copy = try gpa.dupe(u8, blob.items);
+    errdefer gpa.free(blob_copy);
+    const id_copy = try gpa.dupe(u8, reasoning_id.items);
+    errdefer gpa.free(id_copy);
+    try items.append(gpa, .{ .reasoning = .{
+        .text = text_copy,
+        .blob = blob_copy,
+        .id = id_copy,
         .origin = origin,
     } });
     thinking.clearRetainingCapacity();
@@ -541,16 +596,43 @@ fn flushThinking(
     in_thinking.* = false;
 }
 
+/// Commit one complete redacted reasoning block: its encrypted blob and item id
+/// with empty visible text. Fails atomically like `flushThinking`.
+fn appendRedacted(
+    gpa: std.mem.Allocator,
+    items: *std.ArrayList(llm.Item),
+    chunk: llm.Event.Blob,
+    origin: llm.Account,
+) !void {
+    const blob_copy = try gpa.dupe(u8, chunk.blob);
+    errdefer gpa.free(blob_copy);
+    const id_copy = try gpa.dupe(u8, chunk.id);
+    errdefer gpa.free(id_copy);
+    try items.append(gpa, .{ .reasoning = .{
+        .text = "",
+        .blob = blob_copy,
+        .redacted = true,
+        .id = id_copy,
+        .origin = origin,
+    } });
+}
+
 fn flushTool(
-    arena: std.mem.Allocator,
+    gpa: std.mem.Allocator,
     items: *std.ArrayList(llm.Item),
     use: struct { id: []const u8, name: []const u8 },
     input: *std.ArrayList(u8),
 ) !void {
-    try items.append(arena, .{ .tool_call = .{
-        .call_id = use.id,
-        .name = use.name,
-        .arguments_json = try arena.dupe(u8, input.items),
+    const id_copy = try gpa.dupe(u8, use.id);
+    errdefer gpa.free(id_copy);
+    const name_copy = try gpa.dupe(u8, use.name);
+    errdefer gpa.free(name_copy);
+    const json_copy = try gpa.dupe(u8, input.items);
+    errdefer gpa.free(json_copy);
+    try items.append(gpa, .{ .tool_call = .{
+        .call_id = id_copy,
+        .name = name_copy,
+        .arguments_json = json_copy,
     } });
 }
 
@@ -793,6 +875,104 @@ test "readReply stops before a post-completion timeout" {
     try std.testing.expectEqual(@as(usize, 1), reply.len);
     try std.testing.expectEqualStrings("done", reply[0].message.text);
     try std.testing.expectEqual(@as(usize, 1), handler.usage_count);
+}
+
+test "a failed reply attempt reclaims its transient allocations" {
+    var failing: std.testing.FailingAllocator = .init(std.testing.allocator, .{});
+    const gpa = failing.allocator();
+    var agent = scriptedAgent(gpa);
+    defer agent.deinit();
+    var handler: CaptureHandler = .{ .gpa = gpa };
+    defer handler.deinit();
+
+    // A large text chunk then a tool call forces the reply builder to commit an
+    // assistant message and the tool identity before the stream ends without a
+    // stop event, so each attempt allocates item memory and then fails.
+    const big = "x" ** 4096;
+    const events = [_]llm.Event{
+        .{ .text = big },
+        .{ .tool_use = .{ .call_id = "t1", .name = "read" } },
+    };
+
+    // One warm-up attempt settles the reusable capacities (the item list, the
+    // handler buffers) so the measured window isolates per-attempt retention.
+    handler.text.clearRetainingCapacity();
+    var warmup: ScriptedStream = .{ .events = &events, .terminal_error = error.Timeout };
+    try std.testing.expectError(error.Timeout, agent.readReply(&agent.model, &warmup, &handler));
+    try std.testing.expectEqual(@as(usize, 0), agent.items.items.len);
+    const settled = failing.allocated_bytes - failing.freed_bytes;
+
+    const attempts = 64;
+    for (0..attempts) |_| {
+        handler.text.clearRetainingCapacity();
+        var stream: ScriptedStream = .{ .events = &events, .terminal_error = error.Timeout };
+        try std.testing.expectError(error.Timeout, agent.readReply(&agent.model, &stream, &handler));
+        try std.testing.expectEqual(@as(usize, 0), agent.items.items.len);
+    }
+
+    // History returned to empty every time, so retained bytes must not scale with
+    // attempts. A session-lifetime arena keeps each attempt's items, adding at
+    // least `big` per attempt; bounded ownership frees them on rollback.
+    const grew = (failing.allocated_bytes - failing.freed_bytes) - settled;
+    try std.testing.expect(grew < big.len);
+}
+
+test "rollback frees every item appended since the base" {
+    const gpa = std.testing.allocator;
+    var agent = scriptedAgent(gpa);
+    defer agent.deinit();
+    var handler: CaptureHandler = .{ .gpa = gpa };
+    defer handler.deinit();
+
+    try agent.appendUser("keep me");
+    const base = agent.items.items.len;
+
+    // Commit a full multi-string reply past the base: a reasoning run, an answer,
+    // and a tool call, each holding several owned strings.
+    const events = [_]llm.Event{
+        .{ .thinking = .{ .id = "rs_1", .text = "weigh it" } },
+        .{ .thinking_blob = .{ .id = "rs_1", .blob = "sig" } },
+        .{ .text = "answer" },
+        .{ .tool_use = .{ .call_id = "t1", .name = "read" } },
+        .{ .input_json = "{}" },
+        .{ .stop = .{ .reason = "tool_use", .usage = .{} } },
+    };
+    var stream: ScriptedStream = .{ .events = &events };
+    const reply = try agent.readReply(&agent.model, &stream, &handler);
+    try std.testing.expectEqual(@as(usize, 3), reply.len);
+    try std.testing.expect(agent.items.items.len > base);
+
+    // Rolling back to the base frees every appended item exactly once (the
+    // leak-checking allocator proves it) and leaves the user message intact.
+    agent.rollback(base);
+    try std.testing.expectEqual(base, agent.items.items.len);
+    try std.testing.expectEqualStrings("keep me", agent.items.items[base - 1].message.text);
+}
+
+fn readReplyUnderOom(allocator: std.mem.Allocator) !void {
+    var agent = scriptedAgent(allocator);
+    defer agent.deinit();
+    var handler: CaptureHandler = .{ .gpa = allocator };
+    defer handler.deinit();
+
+    // Exercise every multi-string item builder in one reply: a reasoning run, a
+    // redacted block, an answer, a tool call, and trailing text.
+    const events = [_]llm.Event{
+        .{ .thinking = .{ .id = "rs_1", .text = "weigh it" } },
+        .{ .thinking_blob = .{ .id = "rs_1", .blob = "sig" } },
+        .{ .thinking_redacted = .{ .id = "rs_2", .blob = "enc" } },
+        .{ .text = "answer" },
+        .{ .tool_use = .{ .call_id = "t1", .name = "read" } },
+        .{ .input_json = "{\"path\":\"a\"}" },
+        .{ .text = "trailing" },
+        .{ .stop = .{ .reason = "tool_use", .usage = .{ .output = 5 } } },
+    };
+    var stream: ScriptedStream = .{ .events = &events };
+    _ = try agent.readReply(&agent.model, &stream, &handler);
+}
+
+test "readReply frees partial work at every allocation-failure point" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, readReplyUnderOom, .{});
 }
 
 test "readReply accepts Anthropic message_stop without waiting for later traffic" {
@@ -1228,4 +1408,29 @@ test "a cancel at the barrier reaps launched reads and starts nothing after it" 
     try std.testing.expectEqual(@as(usize, 2), handler.tool_start_count);
     try std.testing.expectEqual(@as(usize, 0), handler.tool_result_count);
     try std.testing.expectEqual(@as(usize, 0), agent.items.items.len);
+}
+
+fn runToolsUnderOom(allocator: std.mem.Allocator) !void {
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    var log: ScheduleLog = .init(threaded.io());
+
+    var agent = scriptedAgent(allocator);
+    agent.io = log.io();
+    defer agent.deinit();
+    var handler: CaptureHandler = .{ .gpa = allocator };
+    defer handler.deinit();
+
+    // All-mutation calls run inline (no concurrent task spawn), so this sweeps the
+    // tool-result builder and its history commit deterministically under every
+    // injected allocation failure.
+    const reply = [_]llm.Item{
+        .{ .tool_call = .{ .call_id = "w1", .name = "write", .arguments_json = "{}" } },
+        .{ .tool_call = .{ .call_id = "w2", .name = "write", .arguments_json = "{}" } },
+    };
+    _ = try agent.runToolsWith(probe, &reply, &handler);
+}
+
+test "runTools frees partial work at every allocation-failure point" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, runToolsUnderOom, .{});
 }

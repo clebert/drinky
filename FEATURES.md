@@ -143,7 +143,9 @@ commit history, `BACKLOG.md` (planned work), and `docs/`.
   terminal event; a failed attempt's partial text and tool calls are discarded, the presentation
   layer clears partial text before retrying, and tools execute only after a committed reply.
 - On a stream failure or API error, discards the turn's items so history returns to where the turn
-  began.
+  began, freeing their memory at once rather than at session end; each history item owns its memory,
+  so repeated failed, retried, or cancelled turns keep retained memory bounded to the surviving
+  history.
 - A mid-turn cancel surfaces as a clean abort (the partial assistant message is dropped), not a
   network error.
 - Accumulates cost and cache savings, pricing each message against the model that produced it so a
