@@ -8,7 +8,6 @@ const std = @import("std");
 
 const terminal = @import("terminal");
 
-const color = @import("color.zig");
 const paint = @import("paint.zig");
 
 pub const Entry = union(enum) {
@@ -62,24 +61,27 @@ pub const Entry = union(enum) {
     /// rows (nonzero only for the clip).
     pub fn render(self: *const Entry, placement: *const paint.Placement) !void {
         switch (self.*) {
-            .intro => |text| try paint.notice(placement, &.{ .style = color.dim, .prefix = "" }, text.items),
+            .intro => |text| try paint.notice(placement, &.{ .style = .dim, .prefix = "" }, text.items),
             .feedback => |flagged| try paint.notice(placement, &.{
-                .style = if (flagged.is_error) color.red else color.dim,
+                .style = if (flagged.is_error) .red else .dim,
                 .prefix = if (flagged.is_error) "error: " else "",
             }, flagged.text.items),
-            .user => |text| try paint.box(placement, &.{ .background = color.user_bg, .foreground = color.user_fg }, text.items),
+            .user => |text| try paint.box(placement, &.{
+                .background = .user_background,
+                .foreground = .user_foreground,
+            }, text.items),
             .tool_result => |flagged| try paint.box(placement, &.{
-                .background = if (flagged.is_error) color.tool_error_bg else color.tool_success_bg,
-                .foreground = color.tool_fg,
+                .background = if (flagged.is_error) .tool_error_background else .tool_success_background,
+                .foreground = .tool_foreground,
             }, flagged.text.items),
-            .thinking => |text| try paint.wrapped(placement, color.dim, text.items),
+            .thinking => |text| try paint.wrapped(placement, .dim, text.items),
             .model => |text| try paint.wrapped(placement, null, text.items),
         }
     }
 };
 
-// Physical rows in a fresh paint: rows are joined by `\r\n` and a row never
-// contains one (`Sink.end` rejects both bytes), so the separators count them.
+// Physical rows in a fresh paint: the view joins its inert rows with `\r\n`,
+// and row text cannot emit those separators, so they count physical rows.
 fn paintedRows(bytes: []const u8) usize {
     return std.mem.count(u8, bytes, "\r\n") + 1;
 }

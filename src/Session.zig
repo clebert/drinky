@@ -452,6 +452,39 @@ test "a read chunk drives the editor and paints the result" {
     try std.testing.expect(std.mem.indexOf(u8, painted, terminal.escape.sync_set) != null);
 }
 
+test "a bracketed paste cannot emit terminal controls" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var input = terminal.Input.init(gpa);
+    defer input.deinit();
+    var editor = ui.Editor.init(gpa);
+    defer editor.deinit();
+    var view = terminal.View.init(gpa, &out.writer);
+    defer view.deinit();
+
+    const payload = "paste\x1b[9A\x1b]52;c;cGFzdGU=\x07\x1bPdata\x1b\\done";
+    try input.feed(terminal.escape.paste_begin ++ payload ++ terminal.escape.paste_end);
+    const event = input.next().?;
+    switch (event) {
+        .paste => |text| try editor.insert(text),
+        else => return error.UnexpectedInput,
+    }
+    const sink = try view.beginFrame(.{ .columns = 120, .rows = 24 }, 4);
+    const placement: ui.paint.Placement = .{ .sink = sink, .id = 0, .columns = 120, .base = 0, .skip = 0 };
+    try editor.render(&placement, 24, true);
+    try view.render();
+
+    const painted = out.written();
+    for ([_][]const u8{ "paste", "[9A", "]52;c;cGFzdGU=", "Pdata", "done", "\u{200B}�\u{200B}" }) |text| {
+        try std.testing.expect(std.mem.indexOf(u8, painted, text) != null);
+    }
+    for ([_][]const u8{ "\x1b[9A", "\x1b]52;c;cGFzdGU=\x07", "\x1bPdata\x1b\\" }) |control| {
+        try std.testing.expect(std.mem.indexOf(u8, painted, control) == null);
+    }
+}
+
 // The consumer seam without real io: a scripted turn's worker events drive the
 // transcript, usage, and turn teardown; applying marks dirty but never paints;
 // one paint then renders the coalesced frame.
@@ -493,6 +526,49 @@ test "scripted stream events drive the model and one coalesced paint" {
     try std.testing.expect(std.mem.indexOf(u8, painted, "hello") != null);
     try std.testing.expect(std.mem.indexOf(u8, painted, "read") != null);
     try std.testing.expect(std.mem.indexOf(u8, painted, "first line") != null);
+}
+
+test "streamed and tool text cannot emit terminal controls" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    defer session.deinit();
+    session.mode = .{ .turn = .{ .spinner_frame = 0, .tools = .empty, .box_view = .empty } };
+
+    const streamed = "reply\x1b[8A\x1b]52;c;bW9kZWw=\x07\x1b_payload\x1b\\done";
+    const tool = "tool\x1b]52;c;dG9vbA==\x1b\\\x1bPpayload\x1b\\\xc2\x9b2Jdone";
+    try session.applyStreamEvent(.{ .text = try gpa.dupe(u8, streamed) });
+    try session.applyStreamEvent(.{ .tool_start = .{
+        .name = try gpa.dupe(u8, "read"),
+        .input_json = try gpa.dupe(u8, "{}"),
+    } });
+    try session.applyStreamEvent(.{ .tool_result = .{
+        .name = try gpa.dupe(u8, "read"),
+        .content = try gpa.dupe(u8, tool),
+        .is_error = false,
+    } });
+    try session.applyStreamEvent(.{ .turn_ended = null });
+    try session.paint(.{ .columns = 160, .rows = 24 });
+
+    const painted = out.written();
+    for ([_][]const u8{
+        "reply", "[8A", "]52;c;bW9kZWw=", "_payload", "tool", "]52;c;dG9vbA==", "Ppayload", "2Jdone",
+        "\u{200B}�\u{200B}",
+    }) |text| {
+        try std.testing.expect(std.mem.indexOf(u8, painted, text) != null);
+    }
+    for ([_][]const u8{
+        "\x1b[8A",
+        "\x1b]52;c;bW9kZWw=\x07",
+        "\x1b_payload\x1b\\",
+        "\x1b]52;c;dG9vbA==\x1b\\",
+        "\x1bPpayload\x1b\\",
+        "\xc2\x9b2J",
+    }) |control| {
+        try std.testing.expect(std.mem.indexOf(u8, painted, control) == null);
+    }
 }
 
 // A worker event arriving after the turn ends (a straggler from a cancelled turn)

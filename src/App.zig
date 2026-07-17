@@ -154,6 +154,36 @@ const TurnHandler = struct {
     }
 };
 
+/// Cooked-mode OAuth output keeps trusted prompt text separate from runtime URL
+/// and path values, which pass through the terminal's inert-text policy.
+const OauthPrompt = struct {
+    writer: *std.Io.Writer,
+
+    pub fn showAuthorization(self: *OauthPrompt, url: []const u8) !void {
+        try self.writer.writeAll("Open this URL to authorize pith:\n\n");
+        try self.writeText(url);
+        try self.writer.writeAll("\n\nWaiting for the browser callback...\n");
+        try self.writer.flush();
+    }
+
+    pub fn showAuthorized(self: *OauthPrompt, path: []const u8) !void {
+        try self.writer.writeAll("Authorized. Credentials saved to ");
+        try self.writeText(path);
+        try self.writer.writeByte('\n');
+        try self.writer.flush();
+    }
+
+    fn writeText(self: *OauthPrompt, text: []const u8) !void {
+        var lines = std.mem.splitScalar(u8, text, '\n');
+        var first = true;
+        while (lines.next()) |line| {
+            if (!first) try self.writer.writeByte('\n');
+            _ = try terminal.width.writeText(self.writer, line);
+            first = false;
+        }
+    }
+};
+
 /// Wire up the tty, agent, and session, then run the interactive loop until the
 /// user quits or stdin closes. When no account is authenticated the session
 /// starts signed out and the login picker opens so the user signs in. Pin the
@@ -686,7 +716,8 @@ fn runOauth(self: *App, account: ai.llm.Account) !void {
         self.session.view.invalidate();
         self.session.markDirty();
     }
-    try self.accounts.login(account, self.tty.writer());
+    var prompt: OauthPrompt = .{ .writer = self.tty.writer() };
+    try self.accounts.login(account, &prompt);
 }
 
 /// Switch the agent to `account` on its default model. The client is present
@@ -723,4 +754,19 @@ fn confirmPicker(self: *App) !void {
     const outcome = try ai.command.select(&context, picking.command, picking.picker.selectedIndex());
     self.session.closePicker();
     try self.applyOutcome(outcome);
+}
+
+test "OAuth prompts render runtime fields as inert text" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var prompt: OauthPrompt = .{ .writer = &out.writer };
+
+    try prompt.showAuthorization("https://example.test/\x1b]52;c;b3duZWQ=\x07");
+    try prompt.showAuthorized("/home/\x1b[2J/.pith/auth.json");
+
+    const written = out.written();
+    try std.testing.expect(std.mem.indexOf(u8, written, "\x1b]52;c;b3duZWQ=\x07") == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "\x1b[2J") == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "https://example.test/\u{200B}�\u{200B}]52;c;b3duZWQ=\u{200B}�\u{200B}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "/home/\u{200B}�\u{200B}[2J/.pith/auth.json") != null);
 }

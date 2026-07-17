@@ -61,6 +61,10 @@ commit history, `BACKLOG.md` (planned work), and `docs/`.
   changes.
 - Steady-state repaints allocate nothing.
 - Wraps every repaint in a synchronized-output burst to prevent tearing.
+- Keeps runtime terminal text — including user, model, tool, OAuth URL, and credential-path values —
+  inert: newline remains a layout break, tab becomes one space, and terminal controls, malformed
+  UTF-8, or a glyph wider than the whole terminal become visible replacement characters; trusted
+  application SGR styling and renderer controls use separate channels.
 - A line wider than the terminal never desyncs the cursor.
 
 ### Input decoding
@@ -89,14 +93,14 @@ commit history, `BACKLOG.md` (planned work), and `docs/`.
 
 ### Display width
 
-- Measures display columns per grapheme cluster, skipping ANSI escape sequences.
+- Measures inert text by the same canonical representation emitted to the terminal, so wrapping,
+  truncation, caret placement, and output agree for controls and malformed UTF-8.
 - Truncation and wrapping never split a cluster and never let a wide cluster straddle the margin.
 - Counts physical rows for wrapped text and maps between a text offset and its (row, column)
   position in both directions.
-- Cell widths: 0 for control and combining marks, 2 for East Asian wide/fullwidth and default-emoji
+- Printable cell widths: 0 for combining marks, 2 for East Asian wide/fullwidth and default-emoji
   characters (the emoji-presentation selector VS16 forces 2, the text selector VS15 keeps 1), 1
   otherwise.
-- Escape sequences — CSI, and string-terminated OSC/APC/DCS and kin — measure as zero width.
 
 ### Unicode data
 
@@ -322,8 +326,9 @@ commit history, `BACKLOG.md` (planned work), and `docs/`.
 
 ### Input editor
 
-- UTF-8 buffer with a grapheme-cluster caret; insert, paste, and backspace operate on whole
-  clusters.
+- Text buffer with a display-unit caret: valid UTF-8 moves by grapheme cluster, while each control
+  or malformed-byte replacement remains independently editable; insert, paste, and backspace preserve
+  those boundaries.
 - Horizontal movement by cluster (left/right) and to line start/end (home/end).
 - Vertical movement (up/down) by wrapped row with a sticky goal column preserved across shorter rows
   and reset on any horizontal move or edit.

@@ -46,22 +46,22 @@ pub fn render(placement: *const paint.Placement, info: *const Info) !void {
     else
         terminal.width.ofText(signed_out_label);
 
-    const writer = placement.sink.begin();
-    try writer.writeAll(color.dim);
+    placement.sink.begin();
+    try color.apply(placement.sink, .dim);
     if (stats_columns + right_columns + 1 <= placement.columns) {
-        try writer.writeAll(line);
-        try writer.splatByteAll(' ', placement.columns - stats_columns - right_columns);
+        try placement.sink.text(line);
+        try placement.sink.spaces(placement.columns - stats_columns - right_columns);
         if (info.signed_in) {
-            try writer.writeAll(info.model);
-            try writer.writeAll(separator);
-            try writer.writeAll(info.effort);
+            try placement.sink.text(info.model);
+            try placement.sink.text(separator);
+            try placement.sink.text(info.effort);
         } else {
-            try writer.writeAll(signed_out_label);
+            try placement.sink.text(signed_out_label);
         }
     } else {
-        try writer.writeAll(terminal.width.truncate(line, placement.columns));
+        try placement.sink.text(terminal.width.truncate(line, placement.columns));
     }
-    try writer.writeAll(color.reset);
+    try color.apply(placement.sink, .reset);
     placement.sink.end(.{ .id = placement.id, .line = placement.base });
 }
 
@@ -150,7 +150,8 @@ test render {
     try std.testing.expect(std.mem.indexOf(u8, painted, "cache 87%") != null);
     try std.testing.expect(std.mem.indexOf(u8, painted, "$0.39 saved $0.82") != null);
     // The model and effort are right-aligned, so they land after the stats.
-    try std.testing.expect(std.mem.indexOf(u8, painted, "claude-opus-4-8 • xhigh").? > std.mem.indexOf(u8, painted, "ctx 21%").?);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "claude-opus-4-8\u{200B} • \u{200B}xhigh").? >
+        std.mem.indexOf(u8, painted, "ctx 21%").?);
 }
 
 test "a signed-out status shows the indicator in place of the model" {

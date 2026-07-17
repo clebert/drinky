@@ -37,8 +37,8 @@ fn idTool(index: usize) usize {
 }
 
 const tool_box_style: ui.paint.BoxStyle = .{
-    .background = ui.color.tool_pending_bg,
-    .foreground = ui.color.tool_fg,
+    .background = .tool_pending_background,
+    .foreground = .tool_foreground,
 };
 
 /// Everything one frame draws: the transcript blocks and the live tail below them.
@@ -214,14 +214,14 @@ fn slotRows(slot: *const Slot, columns: usize, viewport_rows: usize) usize {
 /// and not clipped) as line 0.
 fn paintSlot(slot: *const Slot, placement: *const ui.paint.Placement, viewport_rows: usize) !void {
     if (slot.leading_blank and placement.skip == 0) {
-        _ = placement.sink.begin();
+        placement.sink.begin();
         placement.sink.end(.{ .id = placement.id, .line = 0 });
     }
     try slot.component.render(placement, viewport_rows);
 }
 
-// Physical rows in a fresh paint: rows are joined by `\r\n` and a row never
-// contains one (`Sink.end` rejects both bytes), so the separators count them.
+// Physical rows in a fresh paint: the view joins its inert rows with `\r\n`,
+// and row text cannot emit those separators, so they count physical rows.
 fn paintedRows(bytes: []const u8) usize {
     return std.mem.count(u8, bytes, "\r\n") + 1;
 }

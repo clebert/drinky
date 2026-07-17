@@ -7,10 +7,9 @@
 //! (GB11) — and measures each cluster's column width.
 //!
 //! Only length is offered: `stepAt` returns the next cluster's byte length and
-//! column width. ANSI escapes are not this module's concern; `width` skips them
-//! and hands only printable runs here. Because CR, LF, and the C0/C1 controls are
-//! their own `Control` clusters under the rules, a run never merges across an
-//! escape, so `width` can keep splitting on `\n` and ESC itself.
+//! column width. Terminal escape syntax is not this module's concern. Because
+//! CR, LF, and the C0/C1 controls are their own `Control` clusters under the
+//! rules, display policy can classify them before handing printable runs here.
 
 const std = @import("std");
 
@@ -41,23 +40,6 @@ pub fn stepAt(text: []const u8) Step {
         state.advance(class);
     }
     return .{ .bytes = offset, .columns = columns };
-}
-
-/// The byte offset of the grapheme cluster boundary immediately before
-/// `offset` in `text`, where `offset` is itself a cluster boundary (0, the end
-/// of `text`, or a `stepAt` result). Because UAX #29 breaks depend on the run of
-/// preceding code points — regional-indicator parity, an emoji ZWJ chain, an
-/// Indic conjunct — this re-segments forward from the start of `text` rather
-/// than scanning backward, so the boundary matches the one `stepAt` produces
-/// going forward. `offset` of 0 has no earlier boundary and returns 0.
-pub fn boundaryBefore(text: []const u8, offset: usize) usize {
-    var boundary: usize = 0;
-    var index: usize = 0;
-    while (index < offset) {
-        boundary = index;
-        index += stepAt(text[index..]).bytes;
-    }
-    return boundary;
 }
 
 const replacement = 0xFFFD;
@@ -247,21 +229,6 @@ test "stepAt survives malformed utf-8 by advancing" {
     try std.testing.expectEqual(Step{ .bytes = 1, .columns = 1 }, stepAt("\xff"));
     try std.testing.expectEqual(Step{ .bytes = 2, .columns = 1 }, stepAt("\xf0\x9f"));
     try std.testing.expectEqual(Step{ .bytes = 2, .columns = 1 }, stepAt("\xe4\xb8"));
-}
-
-test "boundaryBefore steps back one whole cluster" {
-    // Plain ASCII: every byte is its own boundary.
-    try std.testing.expectEqual(@as(usize, 2), boundaryBefore("abc", 3));
-    try std.testing.expectEqual(@as(usize, 0), boundaryBefore("abc", 1));
-    // A multi-code-point cluster is stepped over whole: a skin-tone emoji, a
-    // regional-indicator flag, a base letter plus combining mark.
-    try std.testing.expectEqual(@as(usize, 0), boundaryBefore("👍\u{1F3FD}", 8));
-    try std.testing.expectEqual(@as(usize, 0), boundaryBefore("🇯🇵", 8));
-    try std.testing.expectEqual(@as(usize, 0), boundaryBefore("e\u{0301}", 3));
-    // A leading letter shifts the flag's start boundary past it.
-    try std.testing.expectEqual(@as(usize, 1), boundaryBefore("a🇯🇵", 9));
-    // The start of text has no earlier boundary.
-    try std.testing.expectEqual(@as(usize, 0), boundaryBefore("👍\u{1F3FD}", 0));
 }
 
 test "UAX #29 grapheme cluster boundaries match the conformance corpus" {

@@ -27,6 +27,9 @@ marked: ?usize,
 /// The body between the framing rules, rebuilt whenever the selection moves.
 /// Columns-independent, so `rows` and `render` only wrap it to fit.
 content: std.ArrayList(u8),
+/// Trusted presentation metadata for each logical line in `content`; style
+/// bytes never share storage with option text.
+line_styles: std.ArrayList(?color.Style),
 /// The first wrapped body row shown when the body is taller than its slot; the
 /// window scrolls to keep the selection in view. `reflow` maintains it.
 scroll: usize,
@@ -49,10 +52,12 @@ pub fn init(
         .cursor = current orelse 0,
         .marked = current,
         .content = .empty,
+        .line_styles = .empty,
         .scroll = 0,
         .cursor_offset = 0,
     };
     errdefer self.content.deinit(gpa);
+    errdefer self.line_styles.deinit(gpa);
     try self.compose();
     return self;
 }
@@ -61,6 +66,7 @@ pub fn deinit(self: *Picker) void {
     for (self.options) |option| self.gpa.free(option);
     self.gpa.free(self.options);
     self.content.deinit(self.gpa);
+    self.line_styles.deinit(self.gpa);
 }
 
 pub fn moveUp(self: *Picker) !void {
@@ -113,40 +119,53 @@ pub fn render(self: *const Picker, placement: *const paint.Placement, viewport_r
         .hidden_above = self.scroll,
         .shown = visible,
         .hidden_below = total_body - self.scroll - visible,
+        .maybe_line_styles = self.line_styles.items,
     });
 }
 
 /// Rebuild `content`: a blank padding row, the dimmed title and key hint, one
 /// row per option (the selected one inverse-video, any pre-existing choice
 /// tagged), then a blank padding row. Rows are `\n`-separated and carry a
-/// one-space left pad; the framing rules are added by `render`.
+/// one-space left pad; trusted style is stored separately in `line_styles`.
 fn compose(self: *Picker) !void {
-    const gpa = self.gpa;
     self.content.clearRetainingCapacity();
+    self.line_styles.clearRetainingCapacity();
 
-    try self.content.append(gpa, '\n');
-    try self.content.appendSlice(gpa, color.dim);
-    try self.content.appendSlice(gpa, " ");
-    try self.content.appendSlice(gpa, self.title);
-    try self.content.appendSlice(gpa, color.reset);
-    try self.content.append(gpa, '\n');
-    try self.content.appendSlice(gpa, color.dim);
-    try self.content.appendSlice(gpa, " ");
-    try self.content.appendSlice(gpa, hint);
-    try self.content.appendSlice(gpa, color.reset);
+    try self.startLine(null);
+    try self.startLine(.dim);
+    try self.content.append(self.gpa, ' ');
+    try self.appendText(self.title, .dim);
+    try self.startLine(.dim);
+    try self.content.append(self.gpa, ' ');
+    try self.appendText(hint, .dim);
 
     for (self.options, 0..) |option, index| {
         const chosen = index == self.cursor;
-        try self.content.append(gpa, '\n');
+        const style: color.Style = if (chosen) .highlight else .dim;
+        try self.startLine(style);
         if (chosen) self.cursor_offset = self.content.items.len;
-        try self.content.appendSlice(gpa, if (chosen) color.highlight else color.dim);
-        try self.content.appendSlice(gpa, if (chosen) " > " else "   ");
-        try self.content.appendSlice(gpa, option);
-        if (self.marked == index) try self.content.appendSlice(gpa, " (current)");
-        try self.content.appendSlice(gpa, if (chosen) color.highlight_reset else color.reset);
+        try self.content.appendSlice(self.gpa, if (chosen) " > " else "   ");
+        try self.appendText(option, style);
+        if (self.marked == index) try self.content.appendSlice(self.gpa, " (current)");
     }
 
-    try self.content.append(gpa, '\n');
+    try self.startLine(null);
+}
+
+fn startLine(self: *Picker, maybe_style: ?color.Style) !void {
+    if (self.line_styles.items.len > 0) try self.content.append(self.gpa, '\n');
+    try self.line_styles.append(self.gpa, maybe_style);
+}
+
+/// Append text to the current logical line, extending style metadata when
+/// untrusted text itself contains a row break.
+fn appendText(self: *Picker, text: []const u8, style: color.Style) !void {
+    var pieces = std.mem.splitScalar(u8, text, '\n');
+    try self.content.appendSlice(self.gpa, pieces.next().?);
+    while (pieces.next()) |piece| {
+        try self.startLine(style);
+        try self.content.appendSlice(self.gpa, piece);
+    }
 }
 
 fn testPicker(gpa: std.mem.Allocator, labels: []const []const u8, cursor: usize) !Picker {
@@ -181,7 +200,8 @@ test "compose lays out the title, hint, options, and the current marker" {
     try std.testing.expect(std.mem.indexOf(u8, picker.content.items, "Pick") != null);
     try std.testing.expect(std.mem.indexOf(u8, picker.content.items, "esc cancel") != null);
     try std.testing.expect(std.mem.indexOf(u8, picker.content.items, "alpha (current)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, picker.content.items, color.highlight) != null);
+    try std.testing.expect(std.mem.indexOfScalar(u8, picker.content.items, 0x1b) == null);
+    try std.testing.expectEqual(color.Style.highlight, picker.line_styles.items[4].?);
 }
 
 test "a tall option list scrolls the window to keep the selection in view" {
@@ -217,6 +237,7 @@ test "a tall option list scrolls the window to keep the selection in view" {
     // The selected tail option shows, the scrolled-off head does not, and the
     // top rule reports the rows hidden above the window.
     try std.testing.expect(std.mem.indexOf(u8, painted, "row19") != null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "\x1b[7m > row19\x1b[0m") != null);
     try std.testing.expect(std.mem.indexOf(u8, painted, "row00") == null);
     try std.testing.expect(std.mem.indexOf(u8, painted, "↑ 17 more") != null);
 }

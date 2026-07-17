@@ -80,14 +80,14 @@ pub fn accessToken(self: *Auth) ![]const u8 {
     return self.tokens.?.access;
 }
 
-/// Run the interactive OAuth login, writing user-facing prompts to `out`.
-pub fn login(self: *Auth, out: *std.Io.Writer) !void {
+/// Run the interactive OAuth login, reporting runtime text through the caller's
+/// presentation boundary.
+pub fn login(self: *Auth, prompt: anytype) !void {
     const pair = oauth.pkce(self.io);
     const url = try oauth.authorizeUrl(self.gpa, &pair);
     defer self.gpa.free(url);
 
-    try out.print("Open this URL to authorize pith:\n\n{s}\n\nWaiting for the browser callback...\n", .{url});
-    try out.flush();
+    try prompt.showAuthorization(url);
     openBrowser(self.io, url);
 
     const callback = try self.awaitCallback();
@@ -101,8 +101,7 @@ pub fn login(self: *Auth, out: *std.Io.Writer) !void {
     self.tokens = tokens;
     try self.save();
 
-    try out.print("Authorized. Credentials saved to {s}\n", .{self.path});
-    try out.flush();
+    try prompt.showAuthorized(self.path);
 }
 
 /// Drop this account's credentials: clear the in-memory tokens and remove its

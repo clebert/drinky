@@ -151,14 +151,14 @@ pub fn listModels(
 /// Run the interactive OAuth login for a subscription `account`, marking it
 /// authenticated on success. An API account has no login (its key comes from the
 /// environment), so it is an error.
-pub fn login(self: *Accounts, account: llm.Account, out: *std.Io.Writer) !void {
+pub fn login(self: *Accounts, account: llm.Account, prompt: anytype) !void {
     switch (account) {
         .anthropic_subscription => {
-            try self.anthropic_auth.login(out);
+            try self.anthropic_auth.login(prompt);
             self.anthropic_subscription_ready = true;
         },
         .openai_subscription => {
-            try self.openai_auth.login(out);
+            try self.openai_auth.login(prompt);
             self.openai_subscription_ready = true;
             self.refreshOpenaiSubscriptionModels();
         },

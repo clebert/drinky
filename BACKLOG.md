@@ -330,18 +330,13 @@ Extension seams referenced here:
       rule GB9c) and Extended_Pictographic (for GB11). `grapheme.stepAt` implements the full GB1–GB13
       rule set and is verified against the vendored `GraphemeBreakTest.txt` conformance corpus.
 
-- [x] **Grapheme-cluster caret movement.** `Editor` moves the caret and backspaces by grapheme
-      cluster, matching the grapheme-cluster measurement rendering already uses (`terminal.width` +
-      `grapheme`). `grapheme.stepAt` is forward-only and needs a known cluster start, and UAX #29
-      breaking depends on preceding context, so backward movement re-segments forward from the start
-      of `text` rather than scanning backward byte by byte: `grapheme.boundaryBefore` sits beside
-      `stepAt` and backs `Editor.previousBoundary`, while `stepFrom` advances one cluster via
-      `stepAt`. `moveLeft`/`moveRight`/`backspace` step by whole cluster — a combining mark, a ZWJ
-      emoji (`👨‍👩‍👧‍👦`), a regional-indicator flag, a skin-tone modifier, a keycap — so the caret can no
-      longer land inside a cluster and a backspace deletes the whole glyph, and `insert` advances
-      the caret past any cluster its text fuses into. Editing and movement now keep the caret on
-      cluster boundaries, so `width.caret`'s precondition tightened from codepoint to grapheme
-      cluster.
+- [x] **Grapheme-cluster caret movement.** `Editor` follows the same canonical display boundaries as
+      terminal width and emission: valid UTF-8 moves and backspaces by whole grapheme cluster — a
+      combining sequence, ZWJ emoji (`👨‍👩‍👧‍👦`), regional-indicator flag, skin-tone modifier, or keycap
+      — while each control or malformed-byte replacement remains a separate editable unit. Boundary
+      lookup re-segments forward because UAX #29 depends on preceding context. Insertions and
+      deletions re-clamp to the resulting boundary, so fusing neighboring text or turning malformed
+      bytes into valid UTF-8 cannot leave the caret inside a rendered unit.
 
 - [x] **Sticky goal column for vertical caret movement.** `Editor` carries an optional
       `goal_column`: the first `moveUp`/`moveDown` of a run captures the caret's display column into

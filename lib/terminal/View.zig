@@ -7,10 +7,10 @@
 //! stays bounded however far the content grows.
 //!
 //! Each frame is composed through `beginFrame`, which resets the back frame and
-//! hands back a `Sink` bound to it. The caller emits one row at a time — its
-//! bytes fitted to at most `columns` display width and carrying their own style
-//! escapes verbatim, an opaque `Anchor` (stable cross-frame identity), and an
-//! optional caret column — then calls `render` to diff and repaint. The view
+//! hands back a `Sink` bound to it. The caller emits one row at a time through
+//! separate inert-text and trusted-SGR operations, fitted to at most `columns`
+//! display width and carrying an opaque `Anchor` (stable cross-frame identity)
+//! and optional caret column, then calls `render` to diff and repaint. The view
 //! keeps two frames and ping-pongs them — this frame in one, last frame in the
 //! other — resetting the older with retained capacity each frame, so after
 //! warmup no frame allocates.
@@ -107,30 +107,74 @@ const Row = struct { offset: usize, len: usize, anchor: Anchor };
 pub const Caret = struct { row: usize, column: usize };
 
 /// Composes rows directly into the back frame's `blob`. The caller opens a row
-/// with `begin`, writes its bytes through the returned writer, optionally marks
-/// the caret with `setCaret`, and closes it with `end`. Handed out by
-/// `beginFrame`; valid until the paired `render`.
+/// with `begin`, writes inert display content through `text` and application
+/// styling through `sgr`, optionally marks the caret with `setCaret`, and closes
+/// it with `end`. The underlying writer is never exposed, so runtime content
+/// cannot enter the trusted terminal-control channel.
 pub const Sink = struct {
     frame: *Frame,
     columns: usize,
     offset: usize,
+    columns_written: usize,
+    has_text: bool,
 
-    /// Open a row: capture the current `blob` end and return the writer that
-    /// composes into it. The bytes may move as `blob` grows, so the row is
-    /// recorded by offset, not slice.
-    pub fn begin(self: *Sink) *std.Io.Writer {
+    /// Open a row and capture the current `blob` end. The bytes may move as
+    /// `blob` grows, so the row is recorded by offset, not slice.
+    pub fn begin(self: *Sink) void {
         self.offset = self.frame.blob.writer.end;
-        return &self.frame.blob.writer;
+        self.columns_written = 0;
+        self.has_text = false;
     }
 
-    /// Close the row opened by `begin`, recording it under `anchor`. Asserts the
-    /// row is exactly one physical row: at most `columns` display columns
-    /// (escapes measured out) and free of the C0 controls that move or split a
-    /// row. Inline SGR escapes are fine — zero width, no motion.
+    /// Append inert display text. Terminal controls and malformed UTF-8 are
+    /// canonicalized by the same scanner used for layout and width accounting.
+    /// A zero-width break between calls prevents separately measured fragments
+    /// from fusing into a different terminal grapheme.
+    pub fn text(self: *Sink, bytes: []const u8) !void {
+        if (bytes.len == 0) return;
+        if (self.has_text) try self.frame.blob.writer.writeAll("\u{200B}");
+        const available = self.columns -| self.columns_written;
+        self.columns_written += try width.writeFitted(&self.frame.blob.writer, bytes, available);
+        self.has_text = true;
+    }
+
+    /// Append up to `count` ordinary spaces without exposing the row writer.
+    pub fn spaces(self: *Sink, count: usize) !void {
+        const shown = @min(count, self.columns -| self.columns_written);
+        if (shown == 0) return;
+        if (self.has_text) try self.frame.blob.writer.writeAll("\u{200B}");
+        try self.frame.blob.writer.splatByteAll(' ', shown);
+        self.columns_written += shown;
+        self.has_text = true;
+    }
+
+    /// Append up to `count` copies of a compile-time single-column `cell` as one
+    /// contiguous run, so a filled row carries no inter-cell boundaries. `cell`
+    /// must be a plain decorative glyph (such as a rule dash) whose copies do not
+    /// combine into a wider cluster, so `count` copies stay `count` columns.
+    pub fn repeat(self: *Sink, comptime cell: []const u8, count: usize) !void {
+        comptime std.debug.assert(width.ofText(cell) == 1);
+        const shown = @min(count, self.columns -| self.columns_written);
+        if (shown == 0) return;
+        if (self.has_text) try self.frame.blob.writer.writeAll("\u{200B}");
+        try self.frame.blob.writer.splatBytesAll(cell, shown);
+        self.columns_written += shown;
+        self.has_text = true;
+    }
+
+    /// Append a compile-time-known Select Graphic Rendition sequence. Only SGR
+    /// syntax is accepted; cursor, screen, and string controls remain private to
+    /// the renderer.
+    pub fn sgr(self: *Sink, comptime sequence: []const u8) !void {
+        comptime if (!validSgr(sequence)) @compileError("trusted style must be one complete SGR sequence");
+        try self.frame.blob.writer.writeAll(sequence);
+    }
+
+    /// Close the row opened by `begin`, recording it under `anchor`.
     pub fn end(self: *Sink, anchor: Anchor) void {
-        const bytes = self.frame.blob.writer.buffered()[self.offset..];
-        std.debug.assert(oneRow(bytes, self.columns));
-        self.frame.rows.appendAssumeCapacity(.{ .offset = self.offset, .len = bytes.len, .anchor = anchor });
+        std.debug.assert(self.columns_written <= self.columns);
+        const len = self.frame.blob.writer.end - self.offset;
+        self.frame.rows.appendAssumeCapacity(.{ .offset = self.offset, .len = len, .anchor = anchor });
     }
 
     /// Place the caret on the row currently being composed — the one opened by
@@ -228,7 +272,13 @@ pub fn beginFrame(self: *View, size: Size, pages: usize) !*Sink {
     back.reset();
     const capacity = @max(self.rows, 1) * @max(self.pages, 1);
     try back.rows.ensureTotalCapacity(self.gpa, capacity);
-    self.sink = .{ .frame = back, .columns = size.columns, .offset = 0 };
+    self.sink = .{
+        .frame = back,
+        .columns = size.columns,
+        .offset = 0,
+        .columns_written = 0,
+        .has_text = false,
+    };
     return &self.sink;
 }
 
@@ -420,12 +470,13 @@ fn viewportTop(frame: *const Frame, rows: usize) usize {
     return if (len > height) len - height else 0;
 }
 
-fn oneRow(bytes: []const u8, columns_max: usize) bool {
-    if (width.ofText(bytes) > columns_max) return false;
-    for (bytes) |byte| switch (byte) {
-        '\n', '\r', '\t', 0x08, 0x0b, 0x0c => return false,
-        else => {},
-    };
+fn validSgr(comptime sequence: []const u8) bool {
+    if (sequence.len < 3 or sequence[0] != 0x1b or sequence[1] != '[' or sequence[sequence.len - 1] != 'm') {
+        return false;
+    }
+    for (sequence[2 .. sequence.len - 1]) |byte| {
+        if (byte != ';' and (byte < '0' or byte > '9')) return false;
+    }
     return true;
 }
 
@@ -449,8 +500,10 @@ const Harness = struct {
         const capacity = @max(size.rows, 1) * @max(pages, 1);
         const start = if (lines.len > capacity) lines.len - capacity else 0;
         for (lines[start..]) |item| {
-            const writer = sink.begin();
-            try writer.writeAll(item.bytes);
+            sink.begin();
+            if (item.bold) try sink.sgr("\x1b[1m");
+            try sink.text(item.bytes);
+            if (item.bold) try sink.sgr("\x1b[0m");
             if (item.caret) |column| sink.setCaret(column);
             sink.end(item.anchor);
         }
@@ -482,10 +535,14 @@ fn harness(gpa: std.mem.Allocator, columns: usize) !*Harness {
 
 /// The row a test composes through the view's `Sink`: bytes, anchor, and an
 /// optional caret column.
-const Line = struct { bytes: []const u8, anchor: Anchor, caret: ?usize = null };
+const Line = struct { bytes: []const u8, anchor: Anchor, caret: ?usize = null, bold: bool = false };
 
 fn line(bytes: []const u8, id: usize) Line {
     return .{ .bytes = bytes, .anchor = .{ .id = id, .line = 0 } };
+}
+
+fn boldLine(bytes: []const u8, id: usize) Line {
+    return .{ .bytes = bytes, .anchor = .{ .id = id, .line = 0 }, .bold = true };
 }
 
 fn caretLine(bytes: []const u8, id: usize, column: usize) Line {
@@ -742,6 +799,35 @@ test "invalidate forces a full reset even when content is unchanged" {
     try std.testing.expect(std.mem.indexOf(u8, h.lastBytes(), escape.screen_reset) != null);
 }
 
+test "canonical text boundaries survive separate sink writes" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var view = View.init(gpa, &out.writer);
+    defer view.deinit();
+
+    const sink = try view.beginFrame(.{ .columns = 9, .rows = 4 }, 1);
+    sink.begin();
+    try sink.text("\x1b");
+    try sink.text("\u{FE0F}");
+    try sink.text("👨\u{200D}");
+    try sink.text("👩");
+    try sink.sgr("\x1b[0m");
+    try sink.spaces(2);
+    sink.end(.{ .id = 0, .line = 0 });
+    sink.begin();
+    try sink.spaces(1);
+    try sink.text("\u{FE0F}");
+    sink.end(.{ .id = 1, .line = 0 });
+    try view.render();
+
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "\u{200B}�\u{200B}\u{200B}\u{FE0F}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "👨\u{200D}\u{200B}👩") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "👩\x1b[0m\u{200B}  ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), " \u{200B}\u{FE0F}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "\x1b\u{FE0F}") == null);
+}
+
 test "a styled row reprinted from its own start carries its escapes" {
     const gpa = std.testing.allocator;
     const h = try harness(gpa, 20);
@@ -754,7 +840,7 @@ test "a styled row reprinted from its own start carries its escapes" {
     try h.render(&first, .{ .columns = 20, .rows = 4 }, 2);
 
     // Only the second row changes, so the incremental repaint begins at it.
-    const second = [_]Line{ line("a", 0), line(styled, 1) };
+    const second = [_]Line{ line("a", 0), boldLine("BOLD", 1) };
     try h.render(&second, .{ .columns = 20, .rows = 4 }, 2);
     try h.emulator.expectVisible(&.{ "a", "BOLD" });
     // The row re-opens and closes its own SGR, relying on no state from above.

@@ -2,47 +2,44 @@ const std = @import("std");
 
 const grapheme = @import("grapheme.zig");
 
-/// Display width of `text` in terminal columns, skipping ANSI escape sequences.
-///
-/// Text is measured per UAX #29 grapheme cluster (via `grapheme`), matching a
-/// terminal with DECSET mode 2027: a multi-code-point glyph — a skin-tone
-/// modifier, a ZWJ join, a regional-indicator flag, a keycap — takes the single
-/// cell it renders as, not the sum of its code points. Combining marks and other
-/// zero-width code points add nothing; East Asian wide, fullwidth, and emoji
-/// clusters take two columns. ASCII control bytes count as zero.
+/// Display width of inert `text` in terminal columns after canonicalizing it for
+/// safe terminal output. Text is measured per UAX #29 grapheme cluster (via
+/// `grapheme`), matching a terminal with DECSET mode 2027. LF is a logical row
+/// break and adds no columns, TAB is one space, and every other C0/C1 control,
+/// DEL, or malformed UTF-8 unit is one replacement-character column.
 pub fn ofText(text: []const u8) usize {
-    var columns: usize = 0;
-    var index: usize = 0;
-    while (index < text.len) {
-        if (text[index] == escape_start) {
-            index += escapeLength(text[index..]);
-            continue;
-        }
-        const step = grapheme.stepAt(text[index..]);
-        columns += step.columns;
-        index += step.bytes;
-    }
-    return columns;
+    return fittedWidth(text, std.math.maxInt(usize));
 }
 
-/// Longest prefix of `text` whose display width is at most `columns_max`,
-/// skipping ANSI escapes when measuring. A trailing escape sequence that would
-/// not add width is dropped along with the content it followed. A grapheme
-/// cluster that would straddle the budget is dropped whole.
+/// Longest single-line prefix of `text` whose canonical display width is at
+/// most `columns_max`. A grapheme cluster that would straddle the budget is
+/// dropped whole.
 pub fn truncate(text: []const u8, columns_max: usize) []const u8 {
     var columns: usize = 0;
     var index: usize = 0;
     while (index < text.len) {
-        if (text[index] == escape_start) {
-            index += escapeLength(text[index..]);
-            continue;
-        }
-        const step = grapheme.stepAt(text[index..]);
-        if (columns + step.columns > columns_max) break;
-        columns += step.columns;
-        index += step.bytes;
+        const unit = displayUnit(text[index..]);
+        const unit_columns = fittedColumns(&unit, columns_max);
+        if (unit.kind == .line_break or (unit.columns > 0 and unit_columns == 0) or
+            columns + unit_columns > columns_max) break;
+        columns += unit_columns;
+        index += unit.bytes;
     }
     return text[0..index];
+}
+
+/// Write the canonical, inert representation of `text`, returning its display
+/// width. A logical LF emits only a zero-width grapheme boundary; callers that
+/// accept multiline text split it with `wrapper` before composing physical rows.
+pub fn writeText(writer: *std.Io.Writer, text: []const u8) !usize {
+    return writeCanonical(writer, text, std.math.maxInt(usize));
+}
+
+/// Write one physical row fitted to `columns_max`. A printable grapheme wider
+/// than the row is represented by the same one-column replacement used for
+/// controls, so even a one-column terminal remains synchronized.
+pub fn writeFitted(writer: *std.Io.Writer, text: []const u8, columns_max: usize) !usize {
+    return writeCanonical(writer, text, columns_max);
 }
 
 /// Hard-wrap `text` into slices of at most `columns_max` display columns,
@@ -81,18 +78,15 @@ pub const Wrapper = struct {
                 self.line_start = index + 1;
                 return line;
             }
-            if (byte == escape_start) {
-                index += escapeLength(text[index..]);
-                continue;
-            }
-            const step = grapheme.stepAt(text[index..]);
-            if (columns + step.columns > self.columns_max and index > self.line_start) {
+            const unit = displayUnit(text[index..]);
+            const unit_columns = fittedColumns(&unit, self.columns_max);
+            if (columns + unit_columns > self.columns_max and index > self.line_start) {
                 const line = text[self.line_start..index];
                 self.line_start = index;
                 return line;
             }
-            columns += step.columns;
-            index += step.bytes;
+            columns += unit_columns;
+            index += unit.bytes;
         }
         self.done = true;
         return text[self.line_start..];
@@ -128,8 +122,8 @@ pub const Caret = struct { rows_before: usize, column: usize };
 /// caret to the next row; a prefix that fills a row exactly wraps the caret onto
 /// the next row's first column, the cell the following glyph would take, since no
 /// cell exists at the margin; and a trailing `\n` (or an empty line between
-/// newlines) lands it at column 0 of a fresh row. `text` must end on a grapheme
-/// cluster boundary.
+/// newlines) lands it at column 0 of a fresh row. `text` must end on a canonical
+/// display boundary.
 pub fn caret(text: []const u8, columns_max: usize) Caret {
     var iterator = wrapper(text, columns_max);
     var result: Caret = .{ .rows_before = 0, .column = 0 };
@@ -137,7 +131,7 @@ pub fn caret(text: []const u8, columns_max: usize) Caret {
     while (iterator.next()) |line| {
         if (!first) result.rows_before += 1;
         first = false;
-        result.column = ofText(line);
+        result.column = fittedWidth(line, columns_max);
     }
     if (columns_max != 0 and result.column == columns_max) {
         result.rows_before += 1;
@@ -149,7 +143,7 @@ pub fn caret(text: []const u8, columns_max: usize) Caret {
 /// Byte offset into `text` whose prefix `caret` maps to `target` once `text` is
 /// wrapped to `columns_max` — the inverse of `caret`. A target row past the last
 /// wrapped row clamps to the end of `text`; a target column past its row's
-/// content clamps to the row's end, landing on the last grapheme boundary that
+/// content clamps to the row's end, landing on the last display boundary that
 /// does not overshoot the column.
 pub fn offsetAt(text: []const u8, columns_max: usize, target: Caret) usize {
     var iterator = wrapper(text, columns_max);
@@ -157,54 +151,157 @@ pub fn offsetAt(text: []const u8, columns_max: usize, target: Caret) usize {
     while (iterator.next()) |line| : (row += 1) {
         if (row != target.rows_before) continue;
         const start = @intFromPtr(line.ptr) - @intFromPtr(text.ptr);
-        return start + truncate(line, target.column).len;
+        return start + offsetAtColumn(line, columns_max, target.column);
     }
     return text.len;
 }
 
-const escape_start = 0x1b;
-
-/// Byte length of the escape sequence at the start of `text` (`text[0]` is ESC).
-/// Always at least one so callers make progress on malformed input.
-fn escapeLength(text: []const u8) usize {
-    if (text.len < 2) return text.len;
-    switch (text[1]) {
-        '[' => {
-            var index: usize = 2;
-            while (index < text.len) : (index += 1) {
-                if (text[index] >= 0x40 and text[index] <= 0x7e) return index + 1;
-            }
-            return text.len;
-        },
-        // String-terminated controls: OSC, APC, DCS, PM, SOS. Each runs to a
-        // BEL or the ST sequence (ESC `\`). The zero-width cursor marker is an
-        // APC string, so it is measured here and never counts toward a column.
-        ']', '_', 'P', '^', 'X' => {
-            var index: usize = 2;
-            while (index < text.len) : (index += 1) {
-                if (text[index] == 0x07) return index + 1;
-                if (text[index] == escape_start and index + 1 < text.len and text[index + 1] == '\\') {
-                    return index + 2;
-                }
-            }
-            return text.len;
-        },
-        else => return 2,
+fn offsetAtColumn(line: []const u8, columns_max: usize, target_column: usize) usize {
+    var columns: usize = 0;
+    var index: usize = 0;
+    while (index < line.len) {
+        const unit = displayUnit(line[index..]);
+        const unit_columns = fittedColumns(&unit, columns_max);
+        if (columns + unit_columns > target_column) break;
+        columns += unit_columns;
+        index += unit.bytes;
     }
+    return index;
+}
+
+/// Byte offset immediately after the canonical display unit at `offset`.
+pub fn boundaryAfter(text: []const u8, offset: usize) usize {
+    if (offset >= text.len) return text.len;
+    return offset + displayUnit(text[offset..]).bytes;
+}
+
+/// Byte offset of the canonical display-unit boundary immediately before
+/// `offset`, which must itself be a boundary; an offset past the end clamps to
+/// the end first.
+pub fn boundaryBefore(text: []const u8, offset: usize) usize {
+    const target = @min(offset, text.len);
+    var boundary: usize = 0;
+    var index: usize = 0;
+    while (index < target) {
+        boundary = index;
+        index = boundaryAfter(text, index);
+    }
+    return boundary;
+}
+
+/// First canonical display boundary at or after an arbitrary byte offset.
+pub fn boundaryAtOrAfter(text: []const u8, offset: usize) usize {
+    var index: usize = 0;
+    while (index < offset and index < text.len) index = boundaryAfter(text, index);
+    return index;
+}
+
+const grapheme_boundary = "\u{200B}";
+const replacement = grapheme_boundary ++ "�" ++ grapheme_boundary;
+
+const UnitKind = enum { text, space, replacement, line_break };
+
+const DisplayUnit = struct {
+    bytes: usize,
+    columns: usize,
+    kind: UnitKind,
+};
+
+/// The next source unit and the shape it has after canonical display. Invalid
+/// UTF-8 advances one byte, so malformed input cannot swallow printable bytes.
+fn displayUnit(text: []const u8) DisplayUnit {
+    const lead = text[0];
+    if (lead < 0x80) return switch (lead) {
+        '\n' => .{ .bytes = 1, .columns = 0, .kind = .line_break },
+        '\t' => .{ .bytes = 1, .columns = 1, .kind = .space },
+        0x00...0x08, 0x0b...0x1f, 0x7f => .{ .bytes = 1, .columns = 1, .kind = .replacement },
+        else => printableUnit(text),
+    };
+
+    const length = std.unicode.utf8ByteSequenceLength(lead) catch return replacementUnit();
+    if (text.len < length) return replacementUnit();
+    const codepoint = std.unicode.utf8Decode(text[0..length]) catch return replacementUnit();
+    if (codepoint >= 0x80 and codepoint <= 0x9f) {
+        return .{ .bytes = length, .columns = 1, .kind = .replacement };
+    }
+    return printableUnit(text);
+}
+
+fn printableUnit(text: []const u8) DisplayUnit {
+    const step = grapheme.stepAt(text);
+    var safe_len: usize = 0;
+    while (safe_len < step.bytes) {
+        const lead = text[safe_len];
+        if (lead < 0x80) {
+            if (lead < 0x20 or lead == 0x7f) break;
+            safe_len += 1;
+            continue;
+        }
+        const length = std.unicode.utf8ByteSequenceLength(lead) catch break;
+        if (step.bytes - safe_len < length) break;
+        const codepoint = std.unicode.utf8Decode(text[safe_len..][0..length]) catch break;
+        if (codepoint >= 0x80 and codepoint <= 0x9f) break;
+        safe_len += length;
+    }
+    if (safe_len == step.bytes) {
+        return .{ .bytes = step.bytes, .columns = step.columns, .kind = .text };
+    }
+    std.debug.assert(safe_len > 0);
+    const safe_step = grapheme.stepAt(text[0..safe_len]);
+    return .{ .bytes = safe_step.bytes, .columns = safe_step.columns, .kind = .text };
+}
+
+fn replacementUnit() DisplayUnit {
+    return .{ .bytes = 1, .columns = 1, .kind = .replacement };
+}
+
+fn fittedWidth(text: []const u8, columns_max: usize) usize {
+    var columns: usize = 0;
+    var index: usize = 0;
+    while (index < text.len) {
+        const unit = displayUnit(text[index..]);
+        columns += fittedColumns(&unit, columns_max);
+        index += unit.bytes;
+    }
+    return columns;
+}
+
+fn fittedColumns(unit: *const DisplayUnit, columns_max: usize) usize {
+    if (unit.columns == 0 or unit.columns <= columns_max) return unit.columns;
+    return @intFromBool(columns_max > 0);
+}
+
+fn writeCanonical(writer: *std.Io.Writer, text: []const u8, columns_max: usize) !usize {
+    var columns: usize = 0;
+    var index: usize = 0;
+    while (index < text.len) {
+        const unit = displayUnit(text[index..]);
+        const columns_available = columns_max -| columns;
+        const unit_columns = fittedColumns(&unit, columns_available);
+        switch (unit.kind) {
+            .text => if (unit.columns == 0 or unit.columns <= columns_available) {
+                try writer.writeAll(text[index..][0..unit.bytes]);
+            } else if (unit_columns > 0) {
+                try writer.writeAll(replacement);
+            },
+            .space => if (unit_columns > 0) try writer.writeAll(grapheme_boundary ++ " " ++ grapheme_boundary),
+            .replacement => if (unit_columns > 0) try writer.writeAll(replacement),
+            .line_break => try writer.writeAll(grapheme_boundary),
+        }
+        columns += unit_columns;
+        index += unit.bytes;
+    }
+    return columns;
 }
 
 test ofText {
     try std.testing.expectEqual(@as(usize, 5), ofText("hello"));
     try std.testing.expectEqual(@as(usize, 0), ofText(""));
-    try std.testing.expectEqual(@as(usize, 3), ofText("a\x1b[31mbc\x1b[0m"));
-    try std.testing.expectEqual(@as(usize, 2), ofText("\x1b]8;;http://x\x07hi\x1b]8;;\x07"));
     try std.testing.expectEqual(@as(usize, 1), ofText("é"));
-    // The APC cursor marker is zero-width and does not split a wrapped line.
-    try std.testing.expectEqual(@as(usize, 2), ofText("a\x1b_p\x1b\\b"));
-    // An escape cut off at the buffer end is consumed without adding columns:
-    // a bare trailing ESC, then a CSI with no final byte.
-    try std.testing.expectEqual(@as(usize, 1), ofText("x\x1b"));
-    try std.testing.expectEqual(@as(usize, 0), ofText("\x1b[31"));
+    // ESC is one visible replacement and the printable tail stays visible.
+    try std.testing.expectEqual(@as(usize, 6), ofText("a\x1b[31m"));
+    try std.testing.expectEqual(@as(usize, 2), ofText("x\x1b"));
+    try std.testing.expectEqual(@as(usize, 4), ofText("\x1b[31"));
 }
 
 test "ofText measures wide glyphs and zero-width marks" {
@@ -215,17 +312,71 @@ test "ofText measures wide glyphs and zero-width marks" {
     try std.testing.expectEqual(@as(usize, 1), ofText("e\u{0301}"));
 }
 
-test "ofText counts control bytes as zero and survives malformed utf-8" {
-    // Tab and DEL are ASCII control bytes and add no columns.
-    try std.testing.expectEqual(@as(usize, 2), ofText("a\tb"));
-    try std.testing.expectEqual(@as(usize, 0), ofText("\x7f"));
-    // An invalid lead byte is one replacement column and still makes progress.
+test "ofText canonicalizes controls and malformed utf-8" {
+    try std.testing.expectEqual(@as(usize, 3), ofText("a\tb"));
+    try std.testing.expectEqual(@as(usize, 1), ofText("\x7f"));
+    try std.testing.expectEqual(@as(usize, 1), ofText("\xc2\x9b"));
     try std.testing.expectEqual(@as(usize, 1), ofText("\xff"));
-    // A multi-byte sequence cut off at the buffer end is one column, not a
-    // panic — a 4-byte emoji leader and a 3-byte CJK leader, each short a tail.
-    try std.testing.expectEqual(@as(usize, 1), ofText("\xf0\x9f"));
-    try std.testing.expectEqual(@as(usize, 1), ofText("\xf0\x9f\x98"));
-    try std.testing.expectEqual(@as(usize, 1), ofText("\xe4\xb8"));
+    // Truncated or invalid multibyte input advances one byte per replacement.
+    try std.testing.expectEqual(@as(usize, 2), ofText("\xf0\x9f"));
+    try std.testing.expectEqual(@as(usize, 3), ofText("\xf0\x9f\x98"));
+    try std.testing.expectEqual(@as(usize, 2), ofText("\xe4\xb8"));
+    try std.testing.expectEqual(@as(usize, 2), ofText("\xe2A"));
+}
+
+test writeText {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+
+    const input = "a\t\x07\x1b\xc2\x9b\x7f\xff\xf0\x9f\nb";
+    const columns = try writeText(&out.writer, input);
+    try std.testing.expectEqualStrings(
+        "a" ++ grapheme_boundary ++ " " ++ grapheme_boundary ++ replacement ++ replacement ++ replacement ++ replacement ++
+            replacement ++ replacement ++ replacement ++ grapheme_boundary ++ "b",
+        out.written(),
+    );
+    try std.testing.expectEqual(@as(usize, 10), columns);
+    try std.testing.expectEqual(columns, ofText(out.written()));
+
+    out.clearRetainingCapacity();
+    _ = try writeText(&out.writer, "\xd8\x80\xff");
+    try std.testing.expectEqualStrings("\xd8\x80" ++ replacement, out.written());
+
+    out.clearRetainingCapacity();
+    const separated_columns = try writeText(&out.writer, "\x1b\u{FE0F}");
+    try std.testing.expectEqualStrings(replacement ++ "\u{FE0F}", out.written());
+    try std.testing.expectEqual(@as(usize, 3), separated_columns);
+    try std.testing.expectEqual(separated_columns, ofText(out.written()));
+
+    out.clearRetainingCapacity();
+    const tab_columns = try writeText(&out.writer, "\t\u{FE0F}");
+    try std.testing.expectEqualStrings(grapheme_boundary ++ " " ++ grapheme_boundary ++ "\u{FE0F}", out.written());
+    try std.testing.expectEqual(@as(usize, 3), tab_columns);
+    try std.testing.expectEqual(tab_columns, ofText(out.written()));
+
+    out.clearRetainingCapacity();
+    const prepend_columns = try writeText(&out.writer, "\u{0D4E}\t\x1b");
+    try std.testing.expectEqualStrings(
+        "\u{0D4E}" ++ grapheme_boundary ++ " " ++ grapheme_boundary ++ replacement,
+        out.written(),
+    );
+    try std.testing.expectEqual(prepend_columns, ofText(out.written()));
+
+    out.clearRetainingCapacity();
+    const line_break_columns = try writeText(&out.writer, "\u{0D4E}\nA");
+    try std.testing.expectEqualStrings("\u{0D4E}" ++ grapheme_boundary ++ "A", out.written());
+    try std.testing.expectEqual(line_break_columns, ofText(out.written()));
+}
+
+test "a grapheme wider than one column has a fitted replacement" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+
+    const columns = try writeFitted(&out.writer, "你", 1);
+    try std.testing.expectEqualStrings(replacement, out.written());
+    try std.testing.expectEqual(@as(usize, 1), columns);
+    try std.testing.expectEqual(@as(usize, 1), rows("你", 1));
+    try std.testing.expectEqual(Caret{ .rows_before = 1, .column = 0 }, caret("你", 1));
 }
 
 test "grapheme clusters measure as one terminal cell" {
@@ -251,16 +402,16 @@ test truncate {
     try std.testing.expectEqualStrings("hello", truncate("hello", 10));
     try std.testing.expectEqualStrings("", truncate("hello", 0));
     try std.testing.expectEqualStrings("", truncate("", 3));
-    try std.testing.expectEqualStrings("a\x1b[31mb", truncate("a\x1b[31mbc", 2));
-    // Content past the budget is dropped together with the escape trailing it.
+    try std.testing.expectEqualStrings("a\x1b", truncate("a\x1b[31mbc", 2));
     try std.testing.expectEqualStrings("ab", truncate("abc\x1b[0m", 2));
-    // "好" is two columns, so it never fits a single spare column.
+    try std.testing.expectEqualStrings("ab", truncate("ab\ncd", 10));
+    // Wide clusters stay whole. One wider than the whole row is retained so the
+    // fitted writer can display its one-column replacement.
     try std.testing.expectEqualStrings("你", truncate("你好", 3));
     try std.testing.expectEqualStrings("你", truncate("你好", 2));
-    try std.testing.expectEqualStrings("", truncate("你好", 1));
-    // A flag is one two-column cluster: it fits two columns whole or not at all.
+    try std.testing.expectEqualStrings("你", truncate("你好", 1));
     try std.testing.expectEqualStrings("🇯🇵", truncate("🇯🇵", 2));
-    try std.testing.expectEqualStrings("", truncate("🇯🇵", 1));
+    try std.testing.expectEqualStrings("🇯🇵", truncate("🇯🇵", 1));
 }
 
 test wrapper {
@@ -315,11 +466,13 @@ test wrap {
     try std.testing.expectEqual(@as(usize, 1), lines.items.len);
     try std.testing.expectEqualStrings("", lines.items[0]);
 
-    // An embedded escape adds no width and does not force a break.
+    // An embedded ESC is a replacement-width unit; its printable tail wraps.
     lines.clearRetainingCapacity();
     try wrap("a\x1b[31mbc", 3, &lines, std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 1), lines.items.len);
-    try std.testing.expectEqualStrings("a\x1b[31mbc", lines.items[0]);
+    try std.testing.expectEqual(@as(usize, 3), lines.items.len);
+    try std.testing.expectEqualStrings("a\x1b[", lines.items[0]);
+    try std.testing.expectEqualStrings("31m", lines.items[1]);
+    try std.testing.expectEqualStrings("bc", lines.items[2]);
 }
 
 test rows {
@@ -329,9 +482,18 @@ test rows {
     // A wide cluster that cannot straddle the margin costs an extra row: three
     // two-column glyphs in three columns take one row each, not two total.
     try std.testing.expectEqual(@as(usize, 3), rows("你好世", 3));
-    // An explicit newline starts a fresh row; an escape adds none.
+    // An explicit newline starts a fresh row; an ESC occupies a replacement cell.
     try std.testing.expectEqual(@as(usize, 2), rows("ab\ncd", 10));
-    try std.testing.expectEqual(@as(usize, 1), rows("a\x1b[31mbc", 3));
+    try std.testing.expectEqual(@as(usize, 3), rows("a\x1b[31mbc", 3));
+}
+
+test "canonical display boundaries follow rendered replacement units" {
+    try std.testing.expectEqual(@as(usize, 1), boundaryAfter("\xf0\x9f", 0));
+    try std.testing.expectEqual(@as(usize, 1), boundaryBefore("\xf0\x9f", 2));
+    try std.testing.expectEqual(@as(usize, 1), boundaryBefore("ab", 100));
+    try std.testing.expectEqual(@as(usize, 1), boundaryBefore("\r\n", 2));
+    try std.testing.expectEqual(@as(usize, 2), boundaryAfter("\xc2\x9b", 0));
+    try std.testing.expectEqual(@as(usize, 3), boundaryAtOrAfter("e\u{0301}", 1));
 }
 
 test offsetAt {
@@ -346,6 +508,7 @@ test offsetAt {
     // A row past the last wrapped row clamps to the end of text.
     try std.testing.expectEqual(@as(usize, 11), offsetAt("hello\nworld", 10, .{ .rows_before = 5, .column = 0 }));
     // A column inside a two-cell cluster lands on the boundary before it.
+    try std.testing.expectEqual(@as(usize, 0), offsetAt("你好世", 10, .{ .rows_before = 0, .column = 1 }));
     try std.testing.expectEqual(@as(usize, 3), offsetAt("你好世", 10, .{ .rows_before = 0, .column = 3 }));
     // The inverse of the full-width-margin caret: the next row's first column
     // maps back to the end of the filled row.

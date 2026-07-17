@@ -19,11 +19,11 @@ const spinner_columns = 10;
 /// One cell of the purple rule that frames the input area, repeated to full width.
 const rule_cell = "─";
 
-pub const BoxStyle = struct { background: []const u8, foreground: []const u8 };
+pub const BoxStyle = struct { background: color.Style, foreground: color.Style };
 
 /// A notice's look: the SGR style opening every line and a prefix (an error tag,
 /// or empty) printed before each line's text.
-const Notice = struct { style: []const u8, prefix: []const u8 };
+const Notice = struct { style: color.Style, prefix: []const u8 };
 
 /// Where a component composes its rows: the sink to write into, the anchor `id`
 /// its rows carry, the terminal width, the line its content starts at (`base`,
@@ -65,11 +65,11 @@ pub fn notice(placement: *const Placement, look: *const Notice, text: []const u8
         const shown_prefix = terminal.width.truncate(look.prefix, placement.columns);
         const available = placement.columns - terminal.width.ofText(shown_prefix);
         const clipped = terminal.width.truncate(piece, available);
-        const writer = placement.sink.begin();
-        try writer.writeAll(look.style);
-        try writer.writeAll(shown_prefix);
-        try writer.writeAll(clipped);
-        try writer.writeAll(color.reset);
+        placement.sink.begin();
+        try color.apply(placement.sink, look.style);
+        try placement.sink.text(shown_prefix);
+        try placement.sink.text(clipped);
+        try color.apply(placement.sink, .reset);
         placement.sink.end(.{ .id = placement.id, .line = line });
     }
 }
@@ -79,16 +79,16 @@ pub fn notice(placement: *const Placement, look: *const Notice, text: []const u8
 /// copied but the emitted bytes; `maybe_style` (null for the plain model reply)
 /// opens every row and is reset after it, for a dimmed run like the thinking
 /// stream.
-pub fn wrapped(placement: *const Placement, maybe_style: ?[]const u8, text: []const u8) !void {
+pub fn wrapped(placement: *const Placement, maybe_style: ?color.Style, text: []const u8) !void {
     var iterator = terminal.width.wrapper(text, @max(placement.columns, 1));
     var index: usize = 0;
     while (iterator.next()) |content| : (index += 1) {
         const line = placement.base + index;
         if (line < placement.skip) continue;
-        const writer = placement.sink.begin();
-        if (maybe_style) |style| try writer.writeAll(style);
-        try writer.writeAll(content);
-        if (maybe_style != null) try writer.writeAll(color.reset);
+        placement.sink.begin();
+        if (maybe_style) |style| try color.apply(placement.sink, style);
+        try placement.sink.text(content);
+        if (maybe_style != null) try color.apply(placement.sink, .reset);
         placement.sink.end(.{ .id = placement.id, .line = line });
     }
 }
@@ -106,13 +106,13 @@ pub fn box(placement: *const Placement, style: *const BoxStyle, text: []const u8
 }
 
 /// A box's blank padding row: the background filled to full width.
-fn boxPad(placement: *const Placement, line: *usize, background: []const u8) !void {
+fn boxPad(placement: *const Placement, line: *usize, background: color.Style) !void {
     defer line.* += 1;
     if (line.* < placement.skip) return;
-    const writer = placement.sink.begin();
-    try writer.writeAll(background);
-    try writer.splatByteAll(' ', placement.columns);
-    try writer.writeAll(color.reset);
+    placement.sink.begin();
+    try color.apply(placement.sink, background);
+    try placement.sink.spaces(placement.columns);
+    try color.apply(placement.sink, .reset);
     placement.sink.end(.{ .id = placement.id, .line = line.* });
 }
 
@@ -123,13 +123,13 @@ fn boxLine(placement: *const Placement, line: *usize, style: *const BoxStyle, co
     defer line.* += 1;
     if (line.* < placement.skip) return;
     const shown = terminal.width.truncate(content, placement.columns -| 1);
-    const writer = placement.sink.begin();
-    try writer.writeAll(style.background);
-    try writer.writeAll(style.foreground);
-    try writer.writeByte(' ');
-    try writer.writeAll(shown);
-    try writer.splatByteAll(' ', placement.columns -| (1 + terminal.width.ofText(shown)));
-    try writer.writeAll(color.reset);
+    placement.sink.begin();
+    try color.apply(placement.sink, style.background);
+    try color.apply(placement.sink, style.foreground);
+    try placement.sink.text(" ");
+    try placement.sink.text(shown);
+    try placement.sink.spaces(placement.columns -| (1 + terminal.width.ofText(shown)));
+    try color.apply(placement.sink, .reset);
     placement.sink.end(.{ .id = placement.id, .line = line.* });
 }
 
@@ -164,6 +164,9 @@ pub const Framing = struct {
     /// a full-width final line wraps onto, which the wrap itself never yields. It
     /// is the last body row, so it shows only when the window reaches it.
     trailing_row: bool = false,
+    /// Optional style for each logical `\n`-delimited body line. Wrapped
+    /// continuations retain their source line's style.
+    maybe_line_styles: ?[]const ?color.Style = null,
 };
 
 /// Stream the framed area described by `framing`: the top rule (labelled with the
@@ -175,27 +178,44 @@ pub fn framed(placement: *const Placement, framing: *const Framing) !void {
     try ruleRow(placement, &line, "↑", framing.hidden_above);
     var iterator = terminal.width.wrapper(framing.body, @max(placement.columns, 1));
     const window_end = framing.hidden_above +| (framing.shown orelse std.math.maxInt(usize));
+    var source_offset: usize = 0;
+    var source_line: usize = 0;
     var index: usize = 0;
     while (iterator.next()) |content| : (index += 1) {
+        const content_offset = @intFromPtr(content.ptr) - @intFromPtr(framing.body.ptr);
+        source_line += std.mem.count(u8, framing.body[source_offset..content_offset], "\n");
+        source_offset = content_offset;
         if (index < framing.hidden_above) continue;
         if (index >= window_end) break;
-        try framedRow(placement, framing, &line, content);
+        const maybe_style = if (framing.maybe_line_styles) |line_styles|
+            if (source_line < line_styles.len) line_styles[source_line] else null
+        else
+            null;
+        try framedRow(placement, framing, &line, content, maybe_style);
     }
     // The wrapper exhausts at `index == wrapped rows`, the trailing row's index;
     // emit it when the window reaches it (a `break` above leaves it out of view).
     if (framing.trailing_row and index >= framing.hidden_above and index < window_end) {
-        try framedRow(placement, framing, &line, "");
+        try framedRow(placement, framing, &line, "", null);
     }
     try ruleRow(placement, &line, "↓", framing.hidden_below);
 }
 
 /// One windowed body row of a framed area: the row's `content`, then the caret
 /// when it names this row. Advances `line` and drops the row in the clipped top.
-fn framedRow(placement: *const Placement, framing: *const Framing, line: *usize, content: []const u8) !void {
+fn framedRow(
+    placement: *const Placement,
+    framing: *const Framing,
+    line: *usize,
+    content: []const u8,
+    maybe_style: ?color.Style,
+) !void {
     defer line.* += 1;
     if (line.* < placement.skip) return;
-    const writer = placement.sink.begin();
-    try writer.writeAll(content);
+    placement.sink.begin();
+    if (maybe_style) |style| try color.apply(placement.sink, style);
+    try placement.sink.text(content);
+    if (maybe_style != null) try color.apply(placement.sink, .reset);
     if (framing.caret) |caret| if (placement.base + caret.row == line.*) placement.sink.setCaret(caret.column);
     placement.sink.end(.{ .id = placement.id, .line = line.* });
 }
@@ -211,30 +231,30 @@ fn ruleRow(placement: *const Placement, line: *usize, arrow: []const u8, more: u
         (std.fmt.bufPrint(&buffer, "{s} {d} more", .{ arrow, more }) catch null)
     else
         null;
-    const writer = placement.sink.begin();
-    try writer.writeAll(color.rule);
-    try ruleCells(writer, placement.columns, maybe_label);
-    try writer.writeAll(color.rule_reset);
+    placement.sink.begin();
+    try color.apply(placement.sink, .rule);
+    try ruleCells(placement.sink, placement.columns, maybe_label);
+    try color.apply(placement.sink, .reset);
     placement.sink.end(.{ .id = placement.id, .line = line.* });
 }
 
 /// Fill a rule row with `columns` rule cells, or — when `maybe_label` is set and
 /// fits after a short lead with a trailing cell to spare — a lead, the spaced
 /// label, then cells filling the rest.
-fn ruleCells(writer: *std.Io.Writer, columns: usize, maybe_label: ?[]const u8) !void {
+fn ruleCells(sink: *terminal.View.Sink, columns: usize, maybe_label: ?[]const u8) !void {
     const lead = 3;
     if (maybe_label) |label| {
         const used = lead + 1 + terminal.width.ofText(label) + 1;
         if (columns > used) {
-            for (0..lead) |_| try writer.writeAll(rule_cell);
-            try writer.writeByte(' ');
-            try writer.writeAll(label);
-            try writer.writeByte(' ');
-            for (0..columns - used) |_| try writer.writeAll(rule_cell);
+            try sink.repeat(rule_cell, lead);
+            try sink.text(" ");
+            try sink.text(label);
+            try sink.text(" ");
+            try sink.repeat(rule_cell, columns - used);
             return;
         }
     }
-    for (0..columns) |_| try writer.writeAll(rule_cell);
+    try sink.repeat(rule_cell, columns);
 }
 
 /// The `⠋ Working…` spinner at `frame`: accent glyph, muted message. One content
@@ -242,18 +262,18 @@ fn ruleCells(writer: *std.Io.Writer, columns: usize, maybe_label: ?[]const u8) !
 pub fn spinner(placement: *const Placement, frame: usize) !void {
     if (placement.base < placement.skip) return;
     const glyph = spinner_frames[frame % spinner_frames.len];
-    const writer = placement.sink.begin();
-    try writer.writeAll(color.accent_fg);
+    placement.sink.begin();
+    try color.apply(placement.sink, .accent_foreground);
     if (placement.columns >= spinner_columns) {
-        try writer.writeAll(glyph);
-        try writer.writeAll(color.reset);
-        try writer.writeAll(" ");
-        try writer.writeAll(color.muted_fg);
-        try writer.writeAll("Working…");
+        try placement.sink.text(glyph);
+        try color.apply(placement.sink, .reset);
+        try placement.sink.text(" ");
+        try color.apply(placement.sink, .muted_foreground);
+        try placement.sink.text("Working…");
     } else {
-        try writer.writeAll(terminal.width.truncate(glyph, placement.columns));
+        try placement.sink.text(terminal.width.truncate(glyph, placement.columns));
     }
-    try writer.writeAll(color.reset);
+    try color.apply(placement.sink, .reset);
     placement.sink.end(.{ .id = placement.id, .line = placement.base });
 }
 
@@ -276,21 +296,21 @@ pub fn steering(placement: *const Placement, messages: []const []const u8) !void
         const label = terminal.width.truncate("Steering: ", placement.columns);
         const first = message[0 .. std.mem.indexOfScalar(u8, message, '\n') orelse message.len];
         const shown = terminal.width.truncate(first, placement.columns -| terminal.width.ofText(label));
-        const writer = placement.sink.begin();
-        try writer.writeAll(color.accent_fg);
-        try writer.writeAll(label);
-        try writer.writeAll(color.reset);
-        try writer.writeAll(color.muted_fg);
-        try writer.writeAll(shown);
-        try writer.writeAll(color.reset);
+        placement.sink.begin();
+        try color.apply(placement.sink, .accent_foreground);
+        try placement.sink.text(label);
+        try color.apply(placement.sink, .reset);
+        try color.apply(placement.sink, .muted_foreground);
+        try placement.sink.text(shown);
+        try color.apply(placement.sink, .reset);
         placement.sink.end(.{ .id = placement.id, .line = line });
     }
     if (line < placement.skip) return;
     const hint = terminal.width.truncate("\u{21B3} Alt+Up to edit all queued messages", placement.columns);
-    const writer = placement.sink.begin();
-    try writer.writeAll(color.dim);
-    try writer.writeAll(hint);
-    try writer.writeAll(color.reset);
+    placement.sink.begin();
+    try color.apply(placement.sink, .dim);
+    try placement.sink.text(hint);
+    try color.apply(placement.sink, .reset);
     placement.sink.end(.{ .id = placement.id, .line = line });
 }
 

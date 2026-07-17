@@ -1,4 +1,6 @@
-//! The input-line editing model: a UTF-8 text buffer with a grapheme-cluster caret.
+//! The input-line editing model: a text buffer whose caret follows rendered
+//! units — grapheme clusters for valid UTF-8 and one unit per canonical
+//! replacement for malformed or control input.
 //!
 //! It owns editing state only. Submitting, quitting, and drawing are the
 //! caller's job; `render` produces the display lines and, when focused, reports
@@ -55,11 +57,9 @@ pub fn insert(self: *Editor, bytes: []const u8) !void {
     self.goal_column = null;
     try self.text.insertSlice(self.gpa, self.caret, bytes);
     self.caret += bytes.len;
-    // Inserted text can fuse with what follows into a single cluster; advance
-    // the caret to that cluster's end so it stays on a grapheme boundary.
-    var index = self.previousBoundary();
-    while (index < self.caret) index += self.stepFrom(index);
-    self.caret = index;
+    // Inserted text can fuse with what follows into one rendered unit; advance
+    // the caret to its end so it stays on a display boundary.
+    self.caret = terminal.width.boundaryAtOrAfter(self.text.items, self.caret);
 }
 
 pub fn backspace(self: *Editor) void {
@@ -69,7 +69,9 @@ pub fn backspace(self: *Editor) void {
     const removed = self.caret - previous;
     std.mem.copyForwards(u8, self.text.items[previous..], self.text.items[self.caret..]);
     self.text.items.len -= removed;
-    self.caret = previous;
+    // The bytes on either side can become one grapheme or valid UTF-8 after the
+    // deletion, so re-clamp the old position to the resulting display boundary.
+    self.caret = terminal.width.boundaryAtOrAfter(self.text.items, previous);
 }
 
 pub fn moveLeft(self: *Editor) void {
@@ -188,11 +190,11 @@ fn caretPosition(self: *const Editor, columns_max: usize) terminal.View.Caret {
 }
 
 fn stepFrom(self: *const Editor, index: usize) usize {
-    return terminal.grapheme.stepAt(self.text.items[index..]).bytes;
+    return terminal.width.boundaryAfter(self.text.items, index) - index;
 }
 
 fn previousBoundary(self: *const Editor) usize {
-    return terminal.grapheme.boundaryBefore(self.text.items, self.caret);
+    return terminal.width.boundaryBefore(self.text.items, self.caret);
 }
 
 test "insert and content" {
@@ -216,6 +218,36 @@ test "caret movement and backspace" {
     try std.testing.expectEqual(@as(usize, 0), editor.caret);
     editor.moveEnd();
     try std.testing.expectEqual(@as(usize, 3), editor.caret);
+}
+
+test "malformed bytes and controls move by displayed units" {
+    var editor = Editor.init(std.testing.allocator);
+    defer editor.deinit();
+    try editor.insert("\xf0\x9f");
+    editor.moveLeft();
+    try std.testing.expectEqual(@as(usize, 1), editor.caret);
+    editor.moveEnd();
+    editor.backspace();
+    try std.testing.expectEqualStrings("\xf0", editor.content());
+
+    editor.clear();
+    try editor.insert("\r\n");
+    editor.moveLeft();
+    try std.testing.expectEqual(@as(usize, 1), editor.caret);
+
+    editor.clear();
+    try editor.insert("e\r\u{0301}");
+    editor.moveLeft();
+    editor.backspace();
+    try std.testing.expectEqualStrings("e\u{0301}", editor.content());
+    try std.testing.expectEqual(editor.content().len, editor.caret);
+
+    editor.clear();
+    try editor.insert("\xc3\xff\xa9");
+    editor.moveLeft();
+    editor.backspace();
+    try std.testing.expectEqualStrings("é", editor.content());
+    try std.testing.expectEqual(editor.content().len, editor.caret);
 }
 
 test "multibyte backspace deletes whole codepoint" {
