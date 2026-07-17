@@ -191,8 +191,9 @@ fn drainSteering(self: *Agent, handler: anytype) !bool {
 }
 
 /// Stream one assistant reply, retrying the whole request on a transient failure
-/// (timeout, network fault, or a retryable status). Only whole requests are safe
-/// to retry, so a failed attempt's partial reply is discarded here (history is
+/// (timeout, premature stream end, network fault, or retryable status). Only whole
+/// requests are safe to retry, so a failed attempt's partial reply is discarded
+/// here (history is
 /// left untouched) and `handler.onStreamReset` clears any partial output before
 /// the next attempt. Returns the reply's items (already appended to history), or
 /// null when a non-retryable error was reported and the turn ends.
@@ -255,11 +256,12 @@ fn backoff(self: *Agent, attempt: u32, suggested_ms: u64) !void {
     try self.io.sleep(.fromMilliseconds(@intCast(bounded)), .awake);
 }
 
-/// Whether a transport error is worth retrying: a timeout or a transient network
-/// fault. A user cancel or a channel close is never retried.
+/// Whether a transport error is worth retrying: a timeout, premature stream end,
+/// or transient network fault. A user cancel or channel close is never retried.
 fn retryableError(err: anyerror) bool {
     return switch (err) {
         error.Timeout,
+        error.IncompleteReply,
         error.ReadFailed,
         error.WriteFailed,
         error.EndOfStream,
@@ -330,6 +332,7 @@ fn readReply(
     var reasoning_id: std.ArrayList(u8) = .empty;
     defer reasoning_id.deinit(self.gpa);
     var in_thinking = false;
+    var maybe_usage: ?llm.Usage = null;
 
     while (try stream.next()) |event| switch (event) {
         .thinking => |chunk| {
@@ -378,10 +381,14 @@ fn readReply(
         },
         .input_json => |chunk| try input.appendSlice(self.gpa, chunk),
         .stop => |stop| {
-            self.recordUsage(model, stop.usage);
-            try handler.onUsage(self.stats);
+            maybe_usage = stop.usage;
+            break;
         },
     };
+    const usage = maybe_usage orelse return error.IncompleteReply;
+    self.recordUsage(model, usage);
+    try handler.onUsage(self.stats);
+
     // Flush what streamed after the last tool in the order the intra-turn branch
     // uses: the pending tool first, then any trailing reasoning and answer.
     if (in_tool) try flushTool(arena, &items, .{ .id = tool_id, .name = tool_name }, &input);
@@ -525,6 +532,7 @@ fn flushTool(
 
 test retryableError {
     try std.testing.expect(retryableError(error.Timeout));
+    try std.testing.expect(retryableError(error.IncompleteReply));
     try std.testing.expect(retryableError(error.ConnectionResetByPeer));
     try std.testing.expect(!retryableError(error.Canceled));
     try std.testing.expect(!retryableError(error.Closed));
@@ -570,9 +578,13 @@ test "usage is attributed to the model that produced it across a switch" {
 const ScriptedStream = struct {
     events: []const llm.Event,
     index: usize = 0,
+    terminal_error: ?anyerror = null,
 
     fn next(self: *ScriptedStream) !?llm.Event {
-        if (self.index == self.events.len) return null;
+        if (self.index == self.events.len) {
+            if (self.terminal_error) |terminal_error| return terminal_error;
+            return null;
+        }
         defer self.index += 1;
         return self.events[self.index];
     }
@@ -639,7 +651,9 @@ const CaptureHandler = struct {
     gpa: std.mem.Allocator,
     thinking: std.ArrayList(u8) = .empty,
     text: std.ArrayList(u8) = .empty,
-    usage_seen: bool = false,
+    usage_count: usize = 0,
+    tool_start_count: usize = 0,
+    tool_result_count: usize = 0,
 
     fn deinit(self: *CaptureHandler) void {
         self.thinking.deinit(self.gpa);
@@ -656,14 +670,246 @@ const CaptureHandler = struct {
 
     fn onUsage(self: *CaptureHandler, stats: Stats) !void {
         _ = stats;
-        self.usage_seen = true;
+        self.usage_count += 1;
+    }
+
+    fn onToolStart(self: *CaptureHandler, name: []const u8, input_json: []const u8) !void {
+        _ = name;
+        _ = input_json;
+        self.tool_start_count += 1;
+    }
+
+    fn onToolResult(
+        self: *CaptureHandler,
+        name: []const u8,
+        content: []const u8,
+        is_error: bool,
+    ) !void {
+        _ = name;
+        _ = content;
+        _ = is_error;
+        self.tool_result_count += 1;
     }
 };
 
 fn scriptedAgent(gpa: std.mem.Allocator) Agent {
     const model = models.get(.anthropic, "claude-opus-4-8").?;
-    const client = provider.Client.init(gpa, std.testing.io, .{ .anthropic_subscription = undefined }, .{});
+    const client = provider.Client.init(
+        gpa,
+        std.testing.io,
+        .{ .anthropic_subscription = undefined },
+        .{},
+    );
+    return Agent.init(gpa, std.testing.io, client, .{
+        .model = model,
+        .system = "",
+        .retry = .{},
+    });
+}
+
+fn openaiScriptedAgent(gpa: std.mem.Allocator) Agent {
+    const model = models.get(.openai, "gpt-5.6-sol").?;
+    const client = provider.Client.init(gpa, std.testing.io, .{ .openai_api = "sk-test" }, .{});
     return Agent.init(gpa, std.testing.io, client, .{ .model = model, .system = "", .retry = .{} });
+}
+
+fn anthropicStream(io: std.Io, reader: *std.Io.Reader, idle_ms: u64) provider.Stream {
+    var stream: provider.Stream = .{ .anthropic_subscription = undefined };
+    stream.anthropic_subscription.gpa = std.testing.allocator;
+    stream.anthropic_subscription.io = io;
+    stream.anthropic_subscription.idle_ms = idle_ms;
+    stream.anthropic_subscription.body = reader;
+    stream.anthropic_subscription.parsed = null;
+    stream.anthropic_subscription.terminal_delta = null;
+    stream.anthropic_subscription.usage = .{};
+    return stream;
+}
+
+fn openaiStream(io: std.Io, reader: *std.Io.Reader) provider.Stream {
+    var stream: provider.Stream = .{ .openai_api = undefined };
+    stream.openai_api.gpa = std.testing.allocator;
+    stream.openai_api.io = io;
+    stream.openai_api.idle_ms = 60_000;
+    stream.openai_api.body = reader;
+    stream.openai_api.parsed = null;
+    stream.openai_api.usage = .{};
+    return stream;
+}
+
+fn expectIncompleteToolStream(
+    agent: *Agent,
+    stream: *provider.Stream,
+    handler: *CaptureHandler,
+) !void {
+    const maybe_reply: ?[]const llm.Item =
+        agent.readReply(&agent.model, stream, handler) catch |err| switch (err) {
+            error.IncompleteReply => null,
+            else => return err,
+        };
+    if (maybe_reply) |reply| _ = try agent.runTools(reply, handler);
+
+    try std.testing.expect(maybe_reply == null);
+    try std.testing.expectEqual(@as(usize, 0), handler.tool_start_count);
+    try std.testing.expectEqual(@as(usize, 0), handler.tool_result_count);
+    try std.testing.expectEqual(@as(usize, 0), agent.items.items.len);
+}
+
+test "readReply stops before a post-completion timeout" {
+    const events = [_]llm.Event{
+        .{ .text = "done" },
+        .{ .stop = .{ .reason = "end_turn", .usage = .{ .output = 4 } } },
+    };
+    var stream: ScriptedStream = .{ .events = &events, .terminal_error = error.Timeout };
+    var agent = scriptedAgent(std.testing.allocator);
+    defer agent.deinit();
+    var handler: CaptureHandler = .{ .gpa = std.testing.allocator };
+    defer handler.deinit();
+
+    const reply = try agent.readReply(&agent.model, &stream, &handler);
+    try std.testing.expectEqual(@as(usize, 1), reply.len);
+    try std.testing.expectEqualStrings("done", reply[0].message.text);
+    try std.testing.expectEqual(@as(usize, 1), handler.usage_count);
+}
+
+test "readReply accepts Anthropic message_stop without waiting for later traffic" {
+    const body =
+        "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10}}}\n\n" ++
+        "data: {\"type\":\"content_block_delta\"," ++
+        "\"delta\":{\"type\":\"text_delta\",\"text\":\"done\"}}\n\n" ++
+        "data: {\"type\":\"message_delta\"," ++
+        "\"delta\":{\"stop_reason\":\"end_turn\"}," ++
+        "\"usage\":{\"output_tokens\":4}}\n\n" ++
+        "data: {\"type\":\"message_stop\"}\n\n" ++
+        "data: {\"type\":\"ping\"}\n\n";
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var reader: std.Io.Reader = .fixed(body);
+    var stream = anthropicStream(threaded.io(), &reader, 0);
+    defer if (stream.anthropic_subscription.parsed) |parsed| parsed.deinit();
+    defer if (stream.anthropic_subscription.terminal_delta) |terminal_delta| terminal_delta.deinit();
+    var agent = scriptedAgent(std.testing.allocator);
+    defer agent.deinit();
+    var handler: CaptureHandler = .{ .gpa = std.testing.allocator };
+    defer handler.deinit();
+
+    const reply = try agent.readReply(&agent.model, &stream, &handler);
+    try std.testing.expectEqual(@as(usize, 1), reply.len);
+    try std.testing.expectEqualStrings("done", reply[0].message.text);
+    try std.testing.expectEqual(@as(u64, 10), agent.stats.last.input);
+    try std.testing.expectEqual(@as(u64, 4), agent.stats.last.output);
+    try std.testing.expectEqual(@as(usize, 1), handler.usage_count);
+    try std.testing.expect(std.mem.indexOf(u8, reader.buffered(), "message_stop") == null);
+    try std.testing.expect(std.mem.indexOf(u8, reader.buffered(), "ping") != null);
+}
+
+test "readReply accepts OpenAI completion without consuming its done sentinel" {
+    const body =
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"done\"}\n\n" ++
+        "data: {\"type\":\"response.completed\"," ++
+        "\"response\":{\"status\":\"completed\",\"usage\":" ++
+        "{\"input_tokens\":10,\"output_tokens\":4}}}\n\n" ++
+        "data: [DONE]\n\n";
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var reader: std.Io.Reader = .fixed(body);
+    var stream = openaiStream(threaded.io(), &reader);
+    defer if (stream.openai_api.parsed) |parsed| parsed.deinit();
+    var agent = openaiScriptedAgent(std.testing.allocator);
+    defer agent.deinit();
+    var handler: CaptureHandler = .{ .gpa = std.testing.allocator };
+    defer handler.deinit();
+
+    const reply = try agent.readReply(&agent.model, &stream, &handler);
+    try std.testing.expectEqual(@as(usize, 1), reply.len);
+    try std.testing.expectEqualStrings("done", reply[0].message.text);
+    try std.testing.expectEqual(@as(u64, 10), agent.stats.last.input);
+    try std.testing.expectEqual(@as(u64, 4), agent.stats.last.output);
+    try std.testing.expectEqual(@as(usize, 1), handler.usage_count);
+    try std.testing.expect(std.mem.indexOf(u8, reader.buffered(), "[DONE]") != null);
+}
+
+test "readReply rejects provider EOF before text completion" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+
+    {
+        const body =
+            "data: {\"type\":\"content_block_delta\"," ++
+            "\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n";
+        var reader: std.Io.Reader = .fixed(body);
+        var stream = anthropicStream(threaded.io(), &reader, 60_000);
+        defer if (stream.anthropic_subscription.parsed) |parsed| parsed.deinit();
+        defer if (stream.anthropic_subscription.terminal_delta) |terminal_delta| terminal_delta.deinit();
+        var agent = scriptedAgent(std.testing.allocator);
+        defer agent.deinit();
+        var handler: CaptureHandler = .{ .gpa = std.testing.allocator };
+        defer handler.deinit();
+
+        try std.testing.expectError(
+            error.IncompleteReply,
+            agent.readReply(&agent.model, &stream, &handler),
+        );
+        try std.testing.expectEqual(@as(usize, 0), agent.items.items.len);
+        try std.testing.expectEqual(@as(usize, 0), handler.usage_count);
+    }
+
+    {
+        const body = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n";
+        var reader: std.Io.Reader = .fixed(body);
+        var stream = openaiStream(threaded.io(), &reader);
+        defer if (stream.openai_api.parsed) |parsed| parsed.deinit();
+        var agent = openaiScriptedAgent(std.testing.allocator);
+        defer agent.deinit();
+        var handler: CaptureHandler = .{ .gpa = std.testing.allocator };
+        defer handler.deinit();
+
+        try std.testing.expectError(
+            error.IncompleteReply,
+            agent.readReply(&agent.model, &stream, &handler),
+        );
+        try std.testing.expectEqual(@as(usize, 0), agent.items.items.len);
+        try std.testing.expectEqual(@as(usize, 0), handler.usage_count);
+    }
+}
+
+test "incomplete provider tool calls never enter history or execute" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+
+    {
+        const body =
+            "data: {\"type\":\"content_block_start\",\"content_block\":" ++
+            "{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"nope\"}}\n\n" ++
+            "data: {\"type\":\"content_block_delta\",\"delta\":" ++
+            "{\"type\":\"input_json_delta\",\"partial_json\":\"{\"}}\n\n";
+        var reader: std.Io.Reader = .fixed(body);
+        var stream = anthropicStream(threaded.io(), &reader, 60_000);
+        defer if (stream.anthropic_subscription.parsed) |parsed| parsed.deinit();
+        defer if (stream.anthropic_subscription.terminal_delta) |terminal_delta| terminal_delta.deinit();
+        var agent = scriptedAgent(std.testing.allocator);
+        defer agent.deinit();
+        var handler: CaptureHandler = .{ .gpa = std.testing.allocator };
+        defer handler.deinit();
+
+        try expectIncompleteToolStream(&agent, &stream, &handler);
+    }
+
+    {
+        const body =
+            "data: {\"type\":\"response.output_item.added\",\"item\":" ++
+            "{\"type\":\"function_call\",\"call_id\":\"t1\"," ++
+            "\"name\":\"nope\"}}\n\n" ++
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"delta\":\"{\"}\n\n";
+        var reader: std.Io.Reader = .fixed(body);
+        var stream = openaiStream(threaded.io(), &reader);
+        defer if (stream.openai_api.parsed) |parsed| parsed.deinit();
+        var agent = openaiScriptedAgent(std.testing.allocator);
+        defer agent.deinit();
+        var handler: CaptureHandler = .{ .gpa = std.testing.allocator };
+        defer handler.deinit();
+
+        try expectIncompleteToolStream(&agent, &stream, &handler);
+    }
 }
 
 test "readReply assembles a reasoning run, answer, and tool call in stream order" {
@@ -695,7 +941,7 @@ test "readReply assembles a reasoning run, answer, and tool call in stream order
     try std.testing.expectEqualStrings("read", reply[2].tool_call.name);
     try std.testing.expectEqualStrings("{\"path\":\"a\"}", reply[2].tool_call.arguments_json);
     try std.testing.expectEqualStrings("weigh it", handler.thinking.items);
-    try std.testing.expect(handler.usage_seen);
+    try std.testing.expectEqual(@as(usize, 1), handler.usage_count);
     try std.testing.expectEqual(@as(u64, 5), agent.stats.last.output);
 }
 

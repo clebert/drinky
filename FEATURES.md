@@ -134,11 +134,11 @@ commit history, `BACKLOG.md` (planned work), and `docs/`.
 - Messages queued during a turn are drained at each tool-round boundary (and when the model would
   otherwise end the turn), combined into one blank-line-joined user turn, appended to history, and
   reported to the presentation layer.
-- Retries an entire request on a timeout, transient network fault, or retryable status (408, 429,
-  5xx, including Anthropic's 529), honoring the server's retry-after hint, with bounded attempts and
-  exponential backoff. A failed attempt's partial reply is discarded (never kept in history) and the
-  presentation layer clears partial text before the retry re-streams. Tool execution happens only
-  after a successful read and is never retried.
+- Retries an entire request on a timeout, transient network fault, premature stream end, or
+  retryable status (408, 429, 5xx, including Anthropic's 529), honoring the server's retry-after
+  hint, with bounded attempts and exponential backoff. A reply commits only at its provider's
+  terminal event; a failed attempt's partial text and tool calls are discarded, the presentation
+  layer clears partial text before retrying, and tools execute only after a committed reply.
 - On a stream failure or API error, discards the turn's items so history returns to where the turn
   began.
 - A mid-turn cancel surfaces as a clean abort (the partial assistant message is dropped), not a
@@ -191,7 +191,8 @@ commit history, `BACKLOG.md` (planned work), and `docs/`.
   to one content block in order, and reasoning stays first, never reordered or merged — so the
   serialized prefix stays byte-stable and server-side prompt-cache hits persist.
 - Streams responses over SSE, decoding them into the neutral reply events plus usage, stop reason,
-  and API errors.
+  and API errors; only the final `message_stop` completes a reply, after the preceding
+  `message_delta` supplies its cumulative usage and stop reason.
 - When reasoning is enabled, requests adaptive, summarized extended thinking at the resolved effort
   level so the model sizes its own budget while the output ceiling stays fixed; omitted when effort
   is none, the model has no reasoning, or the model is unknown.
@@ -214,7 +215,9 @@ commit history, `BACKLOG.md` (planned work), and `docs/`.
   its own input entry (never merged), with the system prompt as instructions and the tools as
   function tools.
 - Streams responses over SSE, decoding them into the neutral reply events plus usage and stop
-  reason; the terminal completion carries the full usage, and a `[DONE]` sentinel ends the stream.
+  reason; `response.completed` and `response.incomplete` are authoritative terminal events, usage
+  is folded when their response object supplies it, and an optional `[DONE]` compatibility sentinel
+  only ends the byte stream.
 - When reasoning is enabled, requests a summarized reasoning stream at the resolved effort level and
   round-trips each reasoning item's encrypted payload and id verbatim so later turns replay it; no
   server-side conversation state is retained between requests.

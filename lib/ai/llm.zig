@@ -209,7 +209,7 @@ pub const Event = union(enum) {
         blob: []const u8,
     };
 
-    /// End of an assistant message: why it ended, and its cumulative usage.
+    /// Authoritative end of an assistant message: why it ended, and its cumulative usage.
     pub const Stop = struct {
         reason: ?[]const u8,
         usage: Usage,

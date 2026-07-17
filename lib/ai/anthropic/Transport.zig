@@ -65,6 +65,7 @@ pub const Stream = struct {
     error_length: usize,
     retry_after_ms: ?u64,
     parsed: ?std.json.Parsed(std.json.Value),
+    terminal_delta: ?std.json.Parsed(std.json.Value),
     usage: llm.Usage,
     decompress: std.http.Decompress,
     decompress_buffer: []u8,
@@ -75,6 +76,7 @@ pub const Stream = struct {
     pub fn deinit(self: *Stream) void {
         if (self.decompress_buffer.len != 0) self.gpa.free(self.decompress_buffer);
         if (self.parsed) |parsed| parsed.deinit();
+        if (self.terminal_delta) |terminal_delta| terminal_delta.deinit();
         self.request.deinit();
         self.client.deinit();
     }
@@ -105,7 +107,7 @@ pub const Stream = struct {
 
     /// Usage accumulated so far. Anthropic splits it across the stream (prompt
     /// and cache counts in `message_start`, output in `message_delta`), so this
-    /// grows as those frames arrive and is complete by the stop event.
+    /// grows as those frames arrive and is complete by the final `message_stop`.
     pub fn usageSoFar(self: *const Stream) llm.Usage {
         return self.usage;
     }
@@ -115,6 +117,10 @@ pub const Stream = struct {
         if (self.parsed) |parsed| {
             parsed.deinit();
             self.parsed = null;
+        }
+        if (self.terminal_delta) |terminal_delta| {
+            terminal_delta.deinit();
+            self.terminal_delta = null;
         }
         // One idle window spans the read of each event. Anthropic sends keepalive
         // `ping` events between real ones, so a stalled stream can keep sending
@@ -186,8 +192,34 @@ pub const Stream = struct {
         }
 
         // Usage arrives split across the stream: the prompt and cache counts in
-        // `message_start`, the final output count in `message_delta`. Fold both
-        // into the running total and hand it back on the stop event.
+        // `message_start`, the final output count in `message_delta`. The latter
+        // also carries the stop reason, but only the following `message_stop` is
+        // terminal. Retain the parsed delta so its reason outlives that event.
+        if (std.mem.eql(u8, kind, "message_delta")) {
+            if (asObject(object.get("usage"))) |usage| mergeUsage(&self.usage, usage);
+            if (self.terminal_delta) |previous| previous.deinit();
+            self.terminal_delta = null;
+            if (messageDeltaStopReason(object) != null)
+                self.terminal_delta = parsed
+            else
+                parsed.deinit();
+            return .progress;
+        }
+        if (std.mem.eql(u8, kind, "message_stop")) {
+            if (self.terminal_delta == null) {
+                parsed.deinit();
+                return error.IncompleteReply;
+            }
+            const reason = messageDeltaStopReason(self.terminal_delta.?.value.object).?;
+            parsed.deinit();
+            return .{ .event = .{ .stop = .{ .reason = reason, .usage = self.usage } } };
+        }
+        if (self.terminal_delta) |terminal_delta| {
+            terminal_delta.deinit();
+            self.terminal_delta = null;
+            parsed.deinit();
+            return error.IncompleteReply;
+        }
         if (std.mem.eql(u8, kind, "message_start")) {
             if (asObject(object.get("message"))) |message| {
                 if (asObject(message.get("usage"))) |usage| mergeUsage(&self.usage, usage);
@@ -200,17 +232,8 @@ pub const Stream = struct {
             parsed.deinit();
             return .progress;
         };
-        switch (event) {
-            .stop => |stop| {
-                if (asObject(object.get("usage"))) |usage| mergeUsage(&self.usage, usage);
-                self.parsed = parsed;
-                return .{ .event = .{ .stop = .{ .reason = stop.reason, .usage = self.usage } } };
-            },
-            else => {
-                self.parsed = parsed;
-                return .{ .event = event };
-            },
-        }
+        self.parsed = parsed;
+        return .{ .event = event };
     }
 
     fn recordError(self: *Stream, message: []const u8) void {
@@ -242,6 +265,7 @@ fn connect(self: *Transport, out: *Stream, body: []const u8) anyerror!void {
     out.client = .{ .allocator = self.gpa, .io = self.io };
     errdefer out.client.deinit();
     out.parsed = null;
+    out.terminal_delta = null;
     out.error_length = 0;
     out.retry_after_ms = null;
     out.usage = .{};
@@ -356,11 +380,12 @@ fn classify(object: std.json.ObjectMap, kind: []const u8) ?llm.Event {
             .name = asString(block.get("name")) orelse return null,
         } };
     }
-    if (std.mem.eql(u8, kind, "message_delta")) {
-        const delta = asObject(object.get("delta")) orelse return null;
-        return .{ .stop = .{ .reason = asString(delta.get("stop_reason")), .usage = .{} } };
-    }
     return null;
+}
+
+fn messageDeltaStopReason(object: std.json.ObjectMap) ?[]const u8 {
+    const delta = asObject(object.get("delta")) orelse return null;
+    return asString(delta.get("stop_reason"));
 }
 
 fn errorMessage(object: std.json.ObjectMap) ?[]const u8 {
@@ -454,6 +479,9 @@ test "next walks SSE data lines and ends at stream end" {
         "\r\n" ++
         "event: message_delta\r\n" ++
         "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":42}}\r\n" ++
+        "\r\n" ++
+        "event: message_stop\r\n" ++
+        "data: {\"type\":\"message_stop\"}\r\n" ++
         "\r\n";
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();
@@ -464,8 +492,10 @@ test "next walks SSE data lines and ends at stream end" {
     stream.idle_ms = 60_000;
     stream.body = &reader;
     stream.parsed = null;
+    stream.terminal_delta = null;
     stream.usage = .{};
     defer if (stream.parsed) |parsed| parsed.deinit();
+    defer if (stream.terminal_delta) |terminal_delta| terminal_delta.deinit();
 
     const text = (try stream.next()).?;
     try std.testing.expectEqualStrings("Hi", text.text);
@@ -485,8 +515,10 @@ test "decode separates pings from progress and events" {
     var stream: Stream = undefined;
     stream.gpa = std.testing.allocator;
     stream.parsed = null;
+    stream.terminal_delta = null;
     stream.usage = .{};
     defer if (stream.parsed) |parsed| parsed.deinit();
+    defer if (stream.terminal_delta) |terminal_delta| terminal_delta.deinit();
 
     try std.testing.expectEqual(@as(Decoded, .ping), try stream.decode(
         \\{"type":"ping"}
@@ -499,6 +531,46 @@ test "decode separates pings from progress and events" {
         \\{"type":"content_block_delta","delta":{"type":"text_delta","text":"hi"}}
     );
     try std.testing.expectEqualStrings("hi", delta.event.text);
+}
+
+test "message_stop requires a final delta with a stop reason" {
+    var stream: Stream = undefined;
+    stream.gpa = std.testing.allocator;
+    stream.parsed = null;
+    stream.terminal_delta = null;
+    stream.usage = .{};
+    defer if (stream.parsed) |parsed| parsed.deinit();
+    defer if (stream.terminal_delta) |terminal_delta| terminal_delta.deinit();
+
+    try std.testing.expectError(error.IncompleteReply, stream.decode(
+        \\{"type":"message_stop"}
+    ));
+    try std.testing.expectEqual(@as(Decoded, .progress), try stream.decode(
+        \\{"type":"message_delta","delta":{"stop_reason":null},"usage":{"output_tokens":1}}
+    ));
+    try std.testing.expectError(error.IncompleteReply, stream.decode(
+        \\{"type":"message_stop"}
+    ));
+
+    try std.testing.expectEqual(@as(Decoded, .progress), try stream.decode(
+        \\{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}
+    ));
+    try std.testing.expectError(error.IncompleteReply, stream.decode(
+        \\{"type":"content_block_delta","delta":{"type":"text_delta","text":"late"}}
+    ));
+    try std.testing.expect(stream.terminal_delta == null);
+
+    try std.testing.expectEqual(@as(Decoded, .progress), try stream.decode(
+        \\{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":3}}
+    ));
+    try std.testing.expectEqual(@as(Decoded, .progress), try stream.decode(
+        \\{"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":4}}
+    ));
+    const stop = try stream.decode(
+        \\{"type":"message_stop"}
+    );
+    try std.testing.expectEqualStrings("max_tokens", stop.event.stop.reason.?);
+    try std.testing.expectEqual(@as(u64, 4), stop.event.stop.usage.output);
 }
 
 test retryAfter {

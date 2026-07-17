@@ -96,8 +96,8 @@ pub const Stream = struct {
         return self.retry_after_ms;
     }
 
-    /// Usage accumulated so far. Responses delivers the full counts once, on
-    /// `response.completed`, so this is zero until the stop event.
+    /// Usage accumulated so far. Responses may deliver full counts on a
+    /// terminal response event, so this is zero until then or when omitted.
     pub fn usageSoFar(self: *const Stream) llm.Usage {
         return self.usage;
     }
@@ -118,7 +118,8 @@ pub const Stream = struct {
             if (!std.mem.startsWith(u8, trimmed, "data:")) continue;
             const payload = std.mem.trimStart(u8, trimmed["data:".len..], " ");
             // Some deployments close the stream with a Chat-Completions-style
-            // sentinel; treat it as end of stream rather than parse it as JSON.
+            // sentinel. It ends the byte stream; the Agent separately requires
+            // a preceding Responses terminal event before committing the reply.
             if (std.mem.eql(u8, payload, "[DONE]")) return null;
             switch (try self.decode(payload)) {
                 .event => |event| return event,
@@ -319,21 +320,23 @@ fn classify(object: std.json.ObjectMap, kind: []const u8) ?llm.Event {
             .blob = asString(item.get("encrypted_content")) orelse return null,
         } };
     }
-    // Both terminal frames carry the full response (with usage and status);
-    // `completed` is a clean finish, `incomplete` a truncation (output cap or
-    // content filter). Neither is an error — the reply so far still stands — so
-    // both close the stream with a stop event and fold in the reported usage.
-    if (std.mem.eql(u8, kind, "response.completed") or std.mem.eql(u8, kind, "response.incomplete")) {
-        const response = asObject(object.get("response"));
+    // Both terminal frames carry a response object; `completed` is a clean
+    // finish, `incomplete` a truncation (output cap or content filter). Neither
+    // is an error — the reply so far still stands — so both close the stream
+    // with a stop event. Status and usage are optional within the response.
+    if (std.mem.eql(u8, kind, "response.completed") or
+        std.mem.eql(u8, kind, "response.incomplete"))
+    {
+        const response = asObject(object.get("response")) orelse return null;
         return .{ .stop = .{
-            .reason = if (response) |found| asString(found.get("status")) else null,
+            .reason = asString(response.get("status")),
             .usage = .{},
         } };
     }
     return null;
 }
 
-/// The `usage` object nested under a `response.completed` frame's response.
+/// The optional `usage` object nested under a terminal frame's response.
 fn completedUsage(object: std.json.ObjectMap) ?std.json.ObjectMap {
     const response = asObject(object.get("response")) orelse return null;
     return asObject(response.get("usage"));
@@ -490,6 +493,23 @@ test "next walks response.* SSE lines and maps usage on completion" {
     try std.testing.expectEqual(@as(u64, 42), stop.stop.usage.output);
     try std.testing.expectEqual(@as(u64, 0), stop.stop.usage.cache_write);
     try std.testing.expectEqual(@as(?llm.Event, null), try stream.next());
+}
+
+test "terminal events require a response object" {
+    var stream: Stream = undefined;
+    stream.gpa = std.testing.allocator;
+    stream.parsed = null;
+    stream.usage = .{};
+    defer if (stream.parsed) |parsed| parsed.deinit();
+
+    try std.testing.expectEqual(@as(Decoded, .progress), try stream.decode(
+        \\{"type":"response.completed"}
+    ));
+    const decoded = try stream.decode(
+        \\{"type":"response.incomplete","response":{}}
+    );
+    try std.testing.expectEqual(@as(?[]const u8, null), decoded.event.stop.reason);
+    try std.testing.expectEqual(@as(llm.Usage, .{}), decoded.event.stop.usage);
 }
 
 test "decode maps response.incomplete to a stop carrying its usage" {

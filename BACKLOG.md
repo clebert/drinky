@@ -238,15 +238,15 @@ Extension seams referenced here:
       draw it down, so a stream that stalls or sends nothing but pings surfaces `error.Timeout` and
       the retry path engages. The buffered fast-path is unchanged — a read only consults the
       deadline when it must wait on the socket.
-- [x] **Request retries.** `Agent.fetchReply` retries a whole request on a timeout, a transient
-      network fault, or a retryable status (408 / 429 / 5xx, including Anthropic's 529 overloaded),
-      honoring `retry-after` when present, with a bounded attempt count (default 3) and exponential
-      backoff. It sits above `Transport`, so it stays provider-neutral (the transport only
-      classifies its own status via `Stream.retryable`/`retryAfterMs`). Only whole requests are safe
-      to retry: the streamed read appends the assistant message to history only on success, so a
-      failed attempt's partial reply is discarded automatically, and `handler.onStreamReset` clears
-      the partial text already shown in the transcript before the next attempt re-streams. Tool
-      execution runs after the retried read and is never retried; a user cancel or channel close is
+- [x] **Request retries.** `Agent.fetchReply` retries a whole request on a timeout, premature stream
+      end, transient network fault, or retryable status (408 / 429 / 5xx, including Anthropic's 529
+      overloaded), honoring `retry-after` when present, with a bounded attempt count (default 3) and
+      exponential backoff. It sits above `Transport`, so it stays provider-neutral (the transport
+      only classifies its own status via `Stream.retryable`/`retryAfterMs`). Only whole requests are
+      safe to retry: the provider's authoritative terminal event commits the assistant message;
+      EOF, `[DONE]`, or an error before it discards partial text and tool calls, and
+      `handler.onStreamReset` clears displayed partial text before the next attempt re-streams. Tool
+      execution runs only after that commit and is never retried; a user cancel or channel close is
       never retried.
 - [x] **Networking off the UI thread.** The event loop is a single `std.Io.Queue(UiEvent)` consumer
       fed by `io.concurrent` producers — a long-lived stdin reader, the turn worker (`agent.run` off
