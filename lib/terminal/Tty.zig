@@ -131,15 +131,16 @@ pub fn read(self: *Tty, buffer: []u8, timeout: std.Io.Timeout) !?usize {
     return try result.file_read_streaming;
 }
 
-/// Current window size, or null when the terminal cannot report one.
+/// Current window size, or null when the terminal cannot report one. The
+/// `TIOCGWINSZ` ioctl is an instantaneous kernel query with nothing to block or
+/// cancel on, so it goes straight to the syscall rather than through `io` — which
+/// also sidesteps a `std.Io.Threaded` device-control path that returns spurious
+/// `ENOTTY` on a valid tty under ReleaseSafe on aarch64-macOS
+/// (codeberg.org/ziglang/zig/issues/36218).
 pub fn size(self: *Tty) ?Size {
     var window: std.posix.winsize = .{ .row = 0, .col = 0, .xpixel = 0, .ypixel = 0 };
-    const result = self.io.operate(.{ .device_io_control = .{
-        .file = .{ .handle = self.out_handle, .flags = .{ .nonblocking = false } },
-        .code = std.posix.T.IOCGWINSZ,
-        .arg = &window,
-    } }) catch return null;
-    if (result.device_io_control < 0 or window.col == 0) return null;
+    const rc = std.posix.system.ioctl(self.out_handle, std.posix.T.IOCGWINSZ, @intFromPtr(&window));
+    if (std.posix.errno(rc) != .SUCCESS or window.col == 0) return null;
     return .{ .columns = window.col, .rows = window.row };
 }
 
