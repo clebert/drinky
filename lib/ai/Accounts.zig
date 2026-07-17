@@ -54,9 +54,9 @@ pub fn init(
     timeouts: net.Timeouts,
     keys: ApiKeys,
 ) !Accounts {
-    var anthropic_auth = try anthropic.Auth.init(gpa, io, home);
+    var anthropic_auth = try anthropic.Auth.init(gpa, io, home, timeouts);
     errdefer anthropic_auth.deinit();
-    var openai_auth = try openai.Auth.init(gpa, io, home);
+    var openai_auth = try openai.Auth.init(gpa, io, home, timeouts);
     errdefer openai_auth.deinit();
 
     const anthropic_ready = try anthropic_auth.load();

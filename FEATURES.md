@@ -240,7 +240,10 @@ commit history, `BACKLOG.md` (planned work), and `docs/`.
   the printed URL remains usable for manual authorization. Callback acceptance and its first HTTP
   request line share a five-minute deadline; the request line is limited to 8 KiB including its
   newline, and timeout, oversize, or cancellation closes callback resources cleanly.
-- Access tokens refreshed and re-persisted automatically when expired.
+- Access tokens refreshed and re-persisted automatically when expired. Token exchange and refresh
+  are bounded by the shared connect timeout and cap the response body at 256 KiB, so a stalled or
+  oversized provider response cannot block or allocate without bound; a failed refresh leaves the
+  stored credential intact.
 - At startup the active account is the first authenticated one — a stored subscription or an
   available API key, preferring a subscription over a paid key when both are present; when none is
   available, the session starts signed out and the login picker opens.

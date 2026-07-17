@@ -8,6 +8,9 @@
 //! off-label surface (the API-key provider is the official fallback).
 
 const std = @import("std");
+
+const net = @import("../net.zig");
+
 const base64url = std.base64.url_safe_no_pad.Encoder;
 const base64url_decoder = std.base64.url_safe_no_pad.Decoder;
 
@@ -22,6 +25,9 @@ const scope = "openid profile email offline_access";
 const scope_encoded = "openid%20profile%20email%20offline_access";
 const originator = "pith";
 const refresh_margin_ms = 5 * 60 * 1000;
+/// Hard cap on a token response body: a larger response fails before it can
+/// allocate without bound. Well above any real exchange or refresh payload.
+const token_response_bytes_max = 256 * 1024;
 
 /// The JWT claim namespace OpenAI nests the ChatGPT identity under.
 const auth_claim = "https://api.openai.com/auth";
@@ -79,7 +85,13 @@ pub fn authorizeUrl(gpa: std.mem.Allocator, code: *const Pkce) ![]u8 {
 /// Exchange an authorization `code` for tokens (form-urlencoded body). Caller
 /// frees the result. `code` is left as received from the callback — not
 /// re-encoded — so it is not double-escaped into the form body.
-pub fn exchange(gpa: std.mem.Allocator, io: std.Io, code: []const u8, verifier: []const u8) !Tokens {
+pub fn exchange(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    timeouts: net.Timeouts,
+    code: []const u8,
+    verifier: []const u8,
+) !Tokens {
     const body = try std.fmt.allocPrint(
         gpa,
         "grant_type=authorization_code&client_id=" ++ client_id ++
@@ -87,19 +99,19 @@ pub fn exchange(gpa: std.mem.Allocator, io: std.Io, code: []const u8, verifier: 
         .{ code, verifier },
     );
     defer gpa.free(body);
-    return post(gpa, io, body, "application/x-www-form-urlencoded", .{});
+    return post(gpa, io, timeouts, body, "application/x-www-form-urlencoded", .{});
 }
 
 /// Trade a refresh token for fresh tokens (JSON body). A refresh response may
 /// omit the refresh token or id token, so the current `account_id` and
 /// `refresh_token` are carried over when the response leaves them out. Caller
 /// frees the result.
-pub fn refresh(gpa: std.mem.Allocator, io: std.Io, tokens: Tokens) !Tokens {
+pub fn refresh(gpa: std.mem.Allocator, io: std.Io, timeouts: net.Timeouts, tokens: Tokens) !Tokens {
     const body = try std.fmt.allocPrint(gpa,
         \\{{"grant_type":"refresh_token","client_id":"{s}","refresh_token":"{s}"}}
     , .{ client_id, tokens.refresh });
     defer gpa.free(body);
-    return post(gpa, io, body, "application/json", .{
+    return post(gpa, io, timeouts, body, "application/json", .{
         .refresh = tokens.refresh,
         .account_id = tokens.account_id,
     });
@@ -107,13 +119,55 @@ pub fn refresh(gpa: std.mem.Allocator, io: std.Io, tokens: Tokens) !Tokens {
 
 const Fallback = struct { refresh: []const u8 = "", account_id: []const u8 = "" };
 
+/// The token request bounded by the connect timeout: the whole connect, send,
+/// receive-head, and body read must finish within it, or it is cancelled and
+/// reaped as `error.Timeout`.
 fn post(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    timeouts: net.Timeouts,
+    body: []const u8,
+    content_type: []const u8,
+    fallback: Fallback,
+) !Tokens {
+    var out: ?Tokens = null;
+    return awaitTokens(
+        gpa,
+        io,
+        timeouts.connect_ms,
+        &out,
+        fetchInto,
+        .{ gpa, io, body, content_type, fallback, &out },
+    );
+}
+
+/// Run `work` (which writes its result into `out`) bounded by `timeout_ms`. The
+/// timeout races the request, so one that finished right at the deadline can
+/// still surface as an error with its result discarded; reclaim anything left in
+/// `out` on any error so a completed-at-the-deadline request cannot leak.
+fn awaitTokens(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    timeout_ms: u64,
+    out: *?Tokens,
+    comptime work: anytype,
+    args: std.meta.ArgsTuple(@TypeOf(work)),
+) !Tokens {
+    net.withTimeout(io, timeout_ms, work, args) catch |err| {
+        if (out.*) |tokens| tokens.deinit(gpa);
+        return err;
+    };
+    return out.* orelse error.TokenRequestFailed;
+}
+
+fn fetchInto(
     gpa: std.mem.Allocator,
     io: std.Io,
     body: []const u8,
     content_type: []const u8,
     fallback: Fallback,
-) !Tokens {
+    out: *?Tokens,
+) !void {
     const uri = try std.Uri.parse(token_url);
     var client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer client.deinit();
@@ -131,6 +185,7 @@ fn post(
 
     var redirect_buffer: [2048]u8 = undefined;
     var response = try request.receiveHead(&redirect_buffer);
+    if (response.head.status != .ok) return error.TokenRequestFailed;
 
     const decompress_buffer = try decompressBuffer(gpa, response.head.content_encoding);
     defer if (decompress_buffer.len != 0) gpa.free(decompress_buffer);
@@ -138,12 +193,18 @@ fn post(
     var transfer_buffer: [4096]u8 = undefined;
     const reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
 
-    var payload: std.Io.Writer.Allocating = .init(gpa);
-    defer payload.deinit();
-    _ = try reader.streamRemaining(&payload.writer);
+    const payload = try readBody(gpa, reader);
+    defer gpa.free(payload);
+    out.* = try parseTokens(gpa, payload, fallback);
+}
 
-    if (response.head.status != .ok) return error.TokenRequestFailed;
-    return parseTokens(gpa, payload.written(), fallback);
+/// The response body, capped at `token_response_bytes_max`: a larger body fails
+/// with `error.TokenResponseTooLarge` rather than allocating without bound.
+fn readBody(gpa: std.mem.Allocator, reader: *std.Io.Reader) ![]u8 {
+    return reader.allocRemaining(gpa, .limited(token_response_bytes_max)) catch |err| switch (err) {
+        error.StreamTooLong => error.TokenResponseTooLarge,
+        else => err,
+    };
 }
 
 /// A decompression window sized for `encoding`, or an empty slice when the body
@@ -351,4 +412,46 @@ test "parseTokens rejects a token whose JWT has no expiry" {
     const body = try std.fmt.allocPrint(gpa, "{{\"access_token\":\"{s}\",\"refresh_token\":\"rt\"}}", .{access});
     defer gpa.free(body);
     try std.testing.expectError(error.MissingExpiry, parseTokens(gpa, body, .{}));
+}
+
+test "readBody rejects an oversized token response" {
+    const gpa = std.testing.allocator;
+    const oversized = try gpa.alloc(u8, token_response_bytes_max);
+    defer gpa.free(oversized);
+    @memset(oversized, 'x');
+    var buffer: [64]u8 = undefined;
+    var reader = std.testing.Reader.init(&buffer, &.{.{ .buffer = oversized }});
+    try std.testing.expectError(error.TokenResponseTooLarge, readBody(gpa, &reader.interface));
+}
+
+test "readBody returns a normal token response body" {
+    const gpa = std.testing.allocator;
+    const body =
+        \\{"access_token":"at","refresh_token":"rt","id_token":"it"}
+    ;
+    var buffer: [64]u8 = undefined;
+    var reader = std.testing.Reader.init(&buffer, &.{.{ .buffer = body }});
+    const read = try readBody(gpa, &reader.interface);
+    defer gpa.free(read);
+    try std.testing.expectEqualStrings(body, read);
+}
+
+fn produceThenFail(gpa: std.mem.Allocator, out: *?Tokens) anyerror!void {
+    out.* = .{
+        .access = try gpa.dupe(u8, "access"),
+        .refresh = try gpa.dupe(u8, "refresh"),
+        .expires_ms = 0,
+        .account_id = try gpa.dupe(u8, "account"),
+    };
+    return error.Canceled;
+}
+
+test "a token request that fails after producing a result frees it" {
+    const gpa = std.testing.allocator;
+    var out: ?Tokens = null;
+    // The leak-detecting allocator proves the discarded result was freed.
+    try std.testing.expectError(
+        error.Canceled,
+        awaitTokens(gpa, std.testing.io, 1000, &out, produceThenFail, .{ gpa, &out }),
+    );
 }

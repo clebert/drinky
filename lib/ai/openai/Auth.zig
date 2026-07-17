@@ -10,6 +10,7 @@
 const std = @import("std");
 
 const auth_store = @import("../auth_store.zig");
+const net = @import("../net.zig");
 const oauth_callback = @import("../oauth_callback.zig");
 const oauth_login = @import("../oauth_login.zig");
 const oauth = @import("oauth.zig");
@@ -21,12 +22,13 @@ const account_key = "openai_subscription";
 
 gpa: std.mem.Allocator,
 io: std.Io,
+timeouts: net.Timeouts,
 path: []const u8,
 tokens: ?oauth.Tokens,
 
-pub fn init(gpa: std.mem.Allocator, io: std.Io, home: []const u8) !Auth {
+pub fn init(gpa: std.mem.Allocator, io: std.Io, home: []const u8, timeouts: net.Timeouts) !Auth {
     const path = try std.fs.path.join(gpa, &.{ home, ".pith", "auth.json" });
-    return .{ .gpa = gpa, .io = io, .path = path, .tokens = null };
+    return .{ .gpa = gpa, .io = io, .timeouts = timeouts, .path = path, .tokens = null };
 }
 
 pub fn deinit(self: *Auth) void {
@@ -74,7 +76,7 @@ pub fn accessToken(self: *Auth) ![]const u8 {
     const tokens = self.tokens orelse return error.NotAuthenticated;
     const now_ms = std.Io.Timestamp.now(self.io, .real).toMilliseconds();
     if (now_ms >= tokens.expires_ms) {
-        const fresh = try oauth.refresh(self.gpa, self.io, tokens);
+        const fresh = try oauth.refresh(self.gpa, self.io, self.timeouts, tokens);
         tokens.deinit(self.gpa);
         self.tokens = fresh;
         try self.save();
@@ -108,7 +110,13 @@ pub fn login(self: *Auth, prompt: anytype) !void {
     // The verifier doubles as `state`; a mismatch means the callback is not ours.
     if (!std.mem.eql(u8, callback.state, &pair.verifier)) return error.StateMismatch;
 
-    const tokens = try oauth.exchange(self.gpa, self.io, callback.code, &pair.verifier);
+    const tokens = try oauth.exchange(
+        self.gpa,
+        self.io,
+        self.timeouts,
+        callback.code,
+        &pair.verifier,
+    );
     if (self.tokens) |old| old.deinit(self.gpa);
     self.tokens = tokens;
     try self.save();
