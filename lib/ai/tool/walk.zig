@@ -10,9 +10,11 @@ const noise_dirs = [_][]const u8{ ".git", ".zig-cache", "zig-cache", "zig-out" }
 
 /// Regular-file paths under `options.base` whose base-relative path matches
 /// `options.pattern`, returned sorted, relative to the working directory, and
-/// owned by `arena`. The walk always drains — even on I/O or allocation failure
-/// — so the walker's open directory handles are released (its `deinit` does not
-/// close them).
+/// owned by `arena`. An unreadable directory is skipped and the walk keeps
+/// going; cancellation stops it at once, because Zig cancellation is one-shot,
+/// so resuming the walk would perform real traversal I/O the aborted turn no
+/// longer wants. Either way the walker's open directory handles are released
+/// before returning — its `deinit` does not close them.
 pub fn collect(
     io: std.Io,
     arena: std.mem.Allocator,
@@ -27,18 +29,15 @@ pub fn collect(
     var files: std.ArrayList([]const u8) = .empty;
     var failure: ?anyerror = null;
     const at_root = std.mem.eql(u8, options.base, ".");
-    // Drain the whole tree even on errors so the walker's directory handles are
-    // released: `next` closes the directory it fails on, and skipping an
-    // unreadable subdirectory leaves its ancestors on the stack to be closed as
-    // the walk completes.
-    while (true) {
+    walk: while (true) {
         const entry = (walker.next(io) catch |err| switch (err) {
-            // A canceled walk is a turn abort: record it so it propagates once
-            // the drain finishes. Any other iteration error skips the bad
-            // directory and keeps the walk resilient.
+            // Cancellation aborts the turn, so stop the walk at once: it is
+            // one-shot, and resuming would do real traversal I/O. Any other
+            // iteration error skips the bad directory (the walker has already
+            // closed it) and keeps the walk resilient.
             error.Canceled => {
                 failure = err;
-                continue;
+                break :walk;
             },
             else => continue,
         }) orelse break;
@@ -46,7 +45,10 @@ pub fn collect(
             .directory => {
                 if (isNoise(entry.basename)) continue;
                 walker.enter(io, entry) catch |err| switch (err) {
-                    error.Canceled => failure = err,
+                    error.Canceled => {
+                        failure = err;
+                        break :walk;
+                    },
                     else => {},
                 };
             },
@@ -67,6 +69,12 @@ pub fn collect(
             else => {},
         }
     }
+    // Release directory handles still open on the walker stack: `deinit` frees
+    // its memory but not its handles. A completed walk has already drained the
+    // stack; a walk stopped by cancellation leaves entered subdirectories open,
+    // so close them here. `leave` never closes the base directory, which `dir`
+    // closes on return.
+    while (walker.stack.items.len > 0) walker.leave(io);
     if (failure) |err| return err;
     const result = try files.toOwnedSlice(arena);
     std.mem.sort([]const u8, result, {}, lessThan);
@@ -82,4 +90,162 @@ fn isNoise(basename: []const u8) bool {
 
 fn lessThan(_: void, a: []const u8, b: []const u8) bool {
     return std.mem.lessThan(u8, a, b);
+}
+
+// Wraps a real io, failing one directory syscall with an injected error to model
+// a failure mid-walk, then counting the traversal opens and reads that follow
+// it. Zig cancellation is one-shot: the injected error is delivered once, so a
+// walk that keeps traversing afterward does real I/O the counter catches.
+// Directory closes are cleanup and never counted, and the open/close balance
+// proves every opened handle was released.
+const FaultyIo = struct {
+    backend: std.Io,
+    vtable: std.Io.VTable,
+    trigger: Trigger,
+    inject: anyerror,
+    opens: usize = 0,
+    injected: bool = false,
+    traversal_after_inject: usize = 0,
+    open_handles: usize = 0,
+
+    // Which syscall to fail, exercising each production cancellation site: the
+    // `enter` open and the `next` read.
+    const Trigger = union(enum) {
+        // Fail the Nth `dirOpenDir` (1-based); the base opens first, so 2 is the
+        // first entered subdirectory.
+        open_call: usize,
+        // Fail the first `dirRead` taken once at least this many directories are
+        // open, i.e. while reading inside an entered subdirectory.
+        subdir_read: usize,
+    };
+
+    fn init(backend: std.Io, options: struct {
+        trigger: Trigger,
+        inject: anyerror,
+    }) FaultyIo {
+        var vtable = backend.vtable.*;
+        vtable.dirOpenDir = openDir;
+        vtable.dirRead = read;
+        vtable.dirClose = close;
+        return .{
+            .backend = backend,
+            .vtable = vtable,
+            .trigger = options.trigger,
+            .inject = options.inject,
+        };
+    }
+
+    fn io(self: *FaultyIo) std.Io {
+        return .{ .userdata = self, .vtable = &self.vtable };
+    }
+
+    fn openDir(
+        userdata: ?*anyopaque,
+        dir: std.Io.Dir,
+        path: []const u8,
+        options: std.Io.Dir.OpenOptions,
+    ) std.Io.Dir.OpenError!std.Io.Dir {
+        const self: *FaultyIo = @ptrCast(@alignCast(userdata));
+        self.opens += 1;
+        if (self.injected) {
+            self.traversal_after_inject += 1;
+        } else switch (self.trigger) {
+            .open_call => |n| if (self.opens == n) {
+                self.injected = true;
+                return @errorCast(self.inject);
+            },
+            .subdir_read => {},
+        }
+        const result = try self.backend.vtable.dirOpenDir(self.backend.userdata, dir, path, options);
+        self.open_handles += 1;
+        return result;
+    }
+
+    fn read(
+        userdata: ?*anyopaque,
+        reader: *std.Io.Dir.Reader,
+        entries: []std.Io.Dir.Entry,
+    ) std.Io.Dir.Reader.Error!usize {
+        const self: *FaultyIo = @ptrCast(@alignCast(userdata));
+        if (self.injected) {
+            self.traversal_after_inject += 1;
+        } else switch (self.trigger) {
+            .subdir_read => |n| if (self.open_handles >= n) {
+                self.injected = true;
+                return @errorCast(self.inject);
+            },
+            .open_call => {},
+        }
+        return self.backend.vtable.dirRead(self.backend.userdata, reader, entries);
+    }
+
+    fn close(userdata: ?*anyopaque, dirs: []const std.Io.Dir) void {
+        const self: *FaultyIo = @ptrCast(@alignCast(userdata));
+        self.open_handles -= dirs.len;
+        self.backend.vtable.dirClose(self.backend.userdata, dirs);
+    }
+};
+
+test "collect stops walking when an entered directory is cancelled" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    // The base opens first; failing the second open cancels the first entered
+    // subdirectory (the `enter` site) while its siblings still await traversal.
+    var faulty: FaultyIo = .init(threaded.io(), .{
+        .trigger = .{ .open_call = 2 },
+        .inject = error.Canceled,
+    });
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    try std.testing.expectError(error.Canceled, collect(
+        faulty.io(),
+        arena_state.allocator(),
+        .{ .base = "lib", .pattern = "**" },
+    ));
+    try std.testing.expectEqual(@as(usize, 0), faulty.traversal_after_inject);
+    try std.testing.expectEqual(@as(usize, 0), faulty.open_handles);
+}
+
+test "collect stops walking when a subdirectory read is cancelled" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    // Cancel a read taken with the base and one subdirectory open (the `next`
+    // site), so an ancestor and unvisited siblings remain.
+    var faulty: FaultyIo = .init(threaded.io(), .{
+        .trigger = .{ .subdir_read = 2 },
+        .inject = error.Canceled,
+    });
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    try std.testing.expectError(error.Canceled, collect(
+        faulty.io(),
+        arena_state.allocator(),
+        .{ .base = "lib", .pattern = "**" },
+    ));
+    try std.testing.expectEqual(@as(usize, 0), faulty.traversal_after_inject);
+    try std.testing.expectEqual(@as(usize, 0), faulty.open_handles);
+}
+
+test "collect skips an unreadable directory and keeps walking" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var faulty: FaultyIo = .init(threaded.io(), .{
+        .trigger = .{ .open_call = 2 },
+        .inject = error.AccessDenied,
+    });
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    const files = try collect(
+        faulty.io(),
+        arena_state.allocator(),
+        .{ .base = "lib", .pattern = "**/*.zig" },
+    );
+    // An ordinary error is not an abort: the walk skips the subtree, traverses
+    // its siblings, and still returns their files with every handle released.
+    try std.testing.expect(files.len > 0);
+    try std.testing.expect(faulty.traversal_after_inject > 0);
+    try std.testing.expectEqual(@as(usize, 0), faulty.open_handles);
 }

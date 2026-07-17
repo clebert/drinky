@@ -266,7 +266,9 @@ commit history, `BACKLOG.md` (planned work), and `docs/`.
   case-insensitivity, and a result limit (default 100); skips binary and large (over 4 MB) files and
   caps reported line length (300 bytes).
 - Glob patterns support `*`, `?`, and `**`; file searches walk directories recursively in sorted
-  order and skip noise directories (version-control and build directories).
+  order and skip noise directories (version-control and build directories). An unreadable directory
+  is skipped rather than fatal, while cancellation stops the walk at once — without traversing the
+  rest of the tree — and still releases every open directory handle.
 
 ### Slash commands
 
