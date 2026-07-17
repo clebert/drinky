@@ -34,7 +34,9 @@ commit history, `BACKLOG.md` (planned work), and `docs/`.
 ### Terminal control
 
 - Enters raw mode (no echo, canonical processing, signals, or flow control) and restores the
-  original terminal state on exit or startup failure.
+  original terminal state on exit or startup failure. Teardown restores the cooked terminal mode
+  before (and independently of) any escape-reset output and applies it immediately, so a wedged,
+  flow-controlled, or failing terminal write cannot strand the terminal in raw mode.
 - On start, enables bracketed paste, the Kitty keyboard protocol (disambiguate level), and cursor
   hiding; reverses all three on exit and rolls back any partially applied setup.
 - Input reading and output writing proceed concurrently; output is buffered.

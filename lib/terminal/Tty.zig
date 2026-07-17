@@ -38,12 +38,16 @@ const PosixSetup = struct {
     raw: *const std.posix.termios,
     original: *const std.posix.termios,
 
+    // Entry flushes pending input (`.FLUSH`) for a clean raw-mode slate. Restore
+    // uses `.NOW` so it applies immediately: `.FLUSH`/`.DRAIN` block until the
+    // terminal's output queue transmits, which a wedged or flow-controlled
+    // terminal never does, and that would strand the terminal in raw mode.
     fn setRaw(self: *const PosixSetup) !void {
         try std.posix.tcsetattr(self.in_handle, .FLUSH, self.raw.*);
     }
 
     fn restore(self: *const PosixSetup) !void {
-        try std.posix.tcsetattr(self.in_handle, .FLUSH, self.original.*);
+        try std.posix.tcsetattr(self.in_handle, .NOW, self.original.*);
     }
 };
 
@@ -52,7 +56,7 @@ const PosixRestore = struct {
     original: *const std.posix.termios,
 
     fn restore(self: *const PosixRestore) !void {
-        try std.posix.tcsetattr(self.in_handle, .FLUSH, self.original.*);
+        try std.posix.tcsetattr(self.in_handle, .NOW, self.original.*);
     }
 };
 
@@ -96,8 +100,9 @@ pub fn enterRaw(self: *Tty) !void {
     try enterWith(&self.raw_state, &self.out_stream.interface, &control);
 }
 
-/// Reverse the escape modes and restore the terminal's original cooked state, so
-/// plain output is readable. Used at shutdown (`deinit`) and to suspend the
+/// Restore the terminal's original cooked state, then reverse the escape modes, so
+/// plain output is readable. Restoring first keeps a blocking or failing escape
+/// write from stranding raw mode. Used at shutdown (`deinit`) and to suspend the
 /// interface for a mid-session login flow; pair with `enterRaw` to resume.
 pub fn leaveRaw(self: *Tty) void {
     var control: PosixRestore = .{
@@ -167,6 +172,14 @@ fn cleanupWith(
     control: anytype,
     write_newline: bool,
 ) void {
+    // Restore the OS terminal mode before any presentation output, so a write or
+    // flush that blocks on a wedged or flow-controlled terminal cannot postpone it.
+    // On restore failure keep raw ownership and every pending reset flag so a later
+    // cleanup retries the restore, then writes the resets, exactly once.
+    if (state.raw_owned) {
+        control.restore() catch return;
+        state.raw_owned = false;
+    }
     var flush_needed = false;
     if (state.cursor_show_pending) {
         state.cursor_show_pending = false;
@@ -191,10 +204,6 @@ fn cleanupWith(
         }
     }
     if (flush_needed) output.flush() catch {};
-    if (state.raw_owned) {
-        control.restore() catch return;
-        state.raw_owned = false;
-    }
 }
 
 const TestControl = struct {
@@ -202,6 +211,7 @@ const TestControl = struct {
     set_count: usize = 0,
     restore_count: usize = 0,
     restore_fails: bool = false,
+    log: ?*TestWriter = null,
 
     fn setRaw(self: *TestControl) !void {
         self.set_count += 1;
@@ -210,6 +220,7 @@ const TestControl = struct {
 
     fn restore(self: *TestControl) !void {
         self.restore_count += 1;
+        if (self.log) |recorder| recorder.record(.restore);
         if (self.restore_fails) return error.RestoreFailed;
         self.raw = false;
     }
@@ -238,6 +249,7 @@ const TestWriter = struct {
         paste_reset,
         newline,
         flush,
+        restore,
     };
 
     fn record(self: *TestWriter, item: Operation) void {
@@ -421,4 +433,48 @@ test "successful setup and repeated cleanup manage every terminal mode once" {
         },
         output.operations[0..output.operations_len],
     );
+}
+
+test "shutdown restores cooked mode before the potentially blocking presentation output" {
+    var output: TestWriter = .{};
+    var control: TestControl = .{ .log = &output };
+    var state: RawState = .{};
+
+    try enterWith(&state, &output.interface, &control);
+    leaveWith(&state, &output.interface, &control);
+
+    try std.testing.expect(!control.raw);
+    try std.testing.expectEqual(RawState{}, state);
+    try std.testing.expectEqualSlices(
+        TestWriter.Operation,
+        &.{
+            .paste_set,
+            .keyboard_set,
+            .cursor_hide,
+            .flush,
+            .restore,
+            .cursor_show,
+            .keyboard_reset,
+            .paste_reset,
+            .newline,
+            .flush,
+        },
+        output.operations[0..output.operations_len],
+    );
+}
+
+test "shutdown restores cooked mode even when presentation output fails" {
+    var output: TestWriter = .{ .drain_fail_at = 4, .flush_fail_at = 2 };
+    var control: TestControl = .{ .log = &output };
+    var state: RawState = .{};
+
+    try enterWith(&state, &output.interface, &control);
+    leaveWith(&state, &output.interface, &control);
+
+    try std.testing.expect(!control.raw);
+    try std.testing.expectEqual(@as(usize, 1), control.restore_count);
+    try std.testing.expectEqual(RawState{}, state);
+    // Restoration precedes any presentation write, so a failing (or blocking) write
+    // cannot strand the terminal in raw mode.
+    try std.testing.expectEqual(TestWriter.Operation.restore, output.operations[4]);
 }
