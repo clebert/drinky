@@ -1,8 +1,9 @@
 //! The seam between the neutral agent loop and concrete model providers. A
 //! `Client` is a live connection to whichever provider the session selected; it
 //! serializes a neutral `llm.Request`, sends it, and hands back a `Stream` of
-//! neutral `llm.Event`s. Each provider is a union arm, so adding one is a new
-//! arm plus its module — the loop and tools never change.
+//! neutral `llm.Event`s. Each provider account is a `Credentials`/`Stream` union
+//! arm, so adding one is a new arm plus its module — the loop and tools never
+//! change.
 
 const std = @import("std");
 
@@ -25,32 +26,11 @@ pub const Credentials = union(llm.Account) {
     openai_api: []const u8,
 };
 
-pub const Client = union(llm.Account) {
-    anthropic_subscription: AnthropicSubscription,
-    anthropic_api: ApiKey,
-    openai_subscription: OpenaiSubscription,
-    openai_api: ApiKey,
-
-    const ApiKey = struct {
-        gpa: std.mem.Allocator,
-        io: std.Io,
-        key: []const u8,
-        timeouts: net.Timeouts,
-    };
-
-    const AnthropicSubscription = struct {
-        gpa: std.mem.Allocator,
-        io: std.Io,
-        auth: *anthropic.Auth,
-        timeouts: net.Timeouts,
-    };
-
-    const OpenaiSubscription = struct {
-        gpa: std.mem.Allocator,
-        io: std.Io,
-        auth: *openai.Auth,
-        timeouts: net.Timeouts,
-    };
+pub const Client = struct {
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    credentials: Credentials,
+    timeouts: net.Timeouts,
 
     pub fn init(
         gpa: std.mem.Allocator,
@@ -58,17 +38,12 @@ pub const Client = union(llm.Account) {
         credentials: Credentials,
         timeouts: net.Timeouts,
     ) Client {
-        return switch (credentials) {
-            .anthropic_api => |key| .{ .anthropic_api = .{ .gpa = gpa, .io = io, .key = key, .timeouts = timeouts } },
-            .anthropic_subscription => |auth| .{ .anthropic_subscription = .{ .gpa = gpa, .io = io, .auth = auth, .timeouts = timeouts } },
-            .openai_api => |key| .{ .openai_api = .{ .gpa = gpa, .io = io, .key = key, .timeouts = timeouts } },
-            .openai_subscription => |auth| .{ .openai_subscription = .{ .gpa = gpa, .io = io, .auth = auth, .timeouts = timeouts } },
-        };
+        return .{ .gpa = gpa, .io = io, .credentials = credentials, .timeouts = timeouts };
     }
 
     /// The account backing this client — vendor and billing product.
     pub fn account(self: *const Client) llm.Account {
-        return std.meta.activeTag(self.*);
+        return std.meta.activeTag(self.credentials);
     }
 
     /// The vendor backing this client, keying the model table and the wire
@@ -80,58 +55,37 @@ pub const Client = union(llm.Account) {
     /// Open a streaming request for `request`, filling `out` in place. On
     /// success the caller owns `out` and must `deinit` it.
     pub fn send(self: *Client, out: *Stream, request: llm.Request) !void {
-        switch (self.*) {
-            .anthropic_api => |*client| {
-                const body = try anthropic.wire.serialize(client.gpa, request, .anthropic_api);
-                defer client.gpa.free(body);
-                out.* = .{ .anthropic_api = undefined };
+        switch (self.credentials) {
+            inline .anthropic_subscription, .anthropic_api => |credential, tag| {
+                const identity: anthropic.Transport.Identity = if (tag == .anthropic_subscription)
+                    .{ .subscription = try credential.accessToken() }
+                else
+                    .{ .api_key = credential };
+                const body = try anthropic.wire.serialize(self.gpa, request, tag);
+                defer self.gpa.free(body);
+                out.* = @unionInit(Stream, @tagName(tag), undefined);
                 var transport: anthropic.Transport = .{
-                    .gpa = client.gpa,
-                    .io = client.io,
-                    .timeouts = client.timeouts,
-                    .identity = .{ .api_key = client.key },
+                    .gpa = self.gpa,
+                    .io = self.io,
+                    .timeouts = self.timeouts,
+                    .identity = identity,
                 };
-                try transport.send(&out.anthropic_api, body);
+                try transport.send(&@field(out.*, @tagName(tag)), body);
             },
-            .anthropic_subscription => |*client| {
-                const token = try client.auth.accessToken();
-                const body = try anthropic.wire.serialize(client.gpa, request, .anthropic_subscription);
-                defer client.gpa.free(body);
-                out.* = .{ .anthropic_subscription = undefined };
-                var transport: anthropic.Transport = .{
-                    .gpa = client.gpa,
-                    .io = client.io,
-                    .timeouts = client.timeouts,
-                    .identity = .{ .subscription = token },
-                };
-                try transport.send(&out.anthropic_subscription, body);
-            },
-            .openai_api => |*client| {
-                const body = try openai.wire.serialize(client.gpa, request, .openai_api);
-                defer client.gpa.free(body);
-                out.* = .{ .openai_api = undefined };
+            inline .openai_subscription, .openai_api => |credential, tag| {
+                const subscription = tag == .openai_subscription;
+                const token = if (subscription) try credential.accessToken() else credential;
+                const body = try openai.wire.serialize(self.gpa, request, tag);
+                defer self.gpa.free(body);
+                out.* = @unionInit(Stream, @tagName(tag), undefined);
                 var transport: openai.Transport = .{
-                    .gpa = client.gpa,
-                    .io = client.io,
-                    .timeouts = client.timeouts,
-                    .endpoint = openai_url,
-                    .account_id = "",
+                    .gpa = self.gpa,
+                    .io = self.io,
+                    .timeouts = self.timeouts,
+                    .endpoint = if (subscription) codex_url else openai_url,
+                    .account_id = if (subscription) credential.accountId() else "",
                 };
-                try transport.send(&out.openai_api, body, client.key);
-            },
-            .openai_subscription => |*client| {
-                const token = try client.auth.accessToken();
-                const body = try openai.wire.serialize(client.gpa, request, .openai_subscription);
-                defer client.gpa.free(body);
-                out.* = .{ .openai_subscription = undefined };
-                var transport: openai.Transport = .{
-                    .gpa = client.gpa,
-                    .io = client.io,
-                    .timeouts = client.timeouts,
-                    .endpoint = codex_url,
-                    .account_id = client.auth.accountId(),
-                };
-                try transport.send(&out.openai_subscription, body, token);
+                try transport.send(&@field(out.*, @tagName(tag)), body, token);
             },
         }
     }
