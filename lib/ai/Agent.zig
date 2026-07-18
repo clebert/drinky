@@ -365,87 +365,58 @@ fn readReply(
     stream: anytype,
     handler: anytype,
 ) ![]const llm.Item {
+    const gpa = self.gpa;
     // Tag reasoning with the account that produced it, so a serializer replays
     // its blobs only for the exact same account and drops any other whole.
     const origin = self.client.?.account();
-    // The defer frees the list backing; the errdefer frees the finished items
+    // The defer frees the buffer backings; the errdefer frees the finished items
     // only on failure, since a successful commit hands them to `self.items`.
-    var pending: std.ArrayList(llm.Item) = .empty;
-    defer pending.deinit(self.gpa);
-    errdefer for (pending.items) |item| freeItem(self.gpa, item);
-    var text: std.ArrayList(u8) = .empty;
-    defer text.deinit(self.gpa);
-    var input: std.ArrayList(u8) = .empty;
-    defer input.deinit(self.gpa);
-    var tool_id: std.ArrayList(u8) = .empty;
-    defer tool_id.deinit(self.gpa);
-    var tool_name: std.ArrayList(u8) = .empty;
-    defer tool_name.deinit(self.gpa);
-    var in_tool = false;
-    var thinking: std.ArrayList(u8) = .empty;
-    defer thinking.deinit(self.gpa);
-    var blob: std.ArrayList(u8) = .empty;
-    defer blob.deinit(self.gpa);
-    var reasoning_id: std.ArrayList(u8) = .empty;
-    defer reasoning_id.deinit(self.gpa);
-    var in_thinking = false;
+    var state: Pending = .{};
+    defer state.deinit(gpa);
+    errdefer for (state.items.items) |item| freeItem(gpa, item);
     var maybe_usage: ?llm.Usage = null;
 
     while (try stream.next()) |event| switch (event) {
         .thinking => |chunk| {
             // A run whose blob already arrived is finished, as is one whose
             // item id differs: commit it so adjacent runs stay separate items.
-            if (blob.items.len != 0 or newRunId(reasoning_id.items, chunk.id))
-                try flushThinking(self.gpa, &pending, &thinking, &blob, &reasoning_id, &in_thinking, origin);
-            if (!in_thinking)
-                try flushBeforeRun(self.gpa, &pending, tool_id.items, tool_name.items, &input, &in_tool, &text);
-            in_thinking = true;
-            if (chunk.id.len != 0) try setBuffer(self.gpa, &reasoning_id, chunk.id);
-            try thinking.appendSlice(self.gpa, chunk.text);
+            if (state.blob.items.len != 0 or newRunId(state.reasoning_id.items, chunk.id))
+                try state.flushThinking(gpa, origin);
+            if (!state.in_thinking) try state.flushBeforeRun(gpa);
+            state.in_thinking = true;
+            if (chunk.id.len != 0) try setBuffer(gpa, &state.reasoning_id, chunk.id);
+            try state.thinking.appendSlice(gpa, chunk.text);
             try handler.onThinking(chunk.text);
         },
         // The blob closes the reasoning run; mark it open so a run that carried
         // only a blob (omitted reasoning) still round-trips.
         .thinking_blob => |chunk| {
-            if (newRunId(reasoning_id.items, chunk.id))
-                try flushThinking(self.gpa, &pending, &thinking, &blob, &reasoning_id, &in_thinking, origin);
-            if (!in_thinking)
-                try flushBeforeRun(self.gpa, &pending, tool_id.items, tool_name.items, &input, &in_tool, &text);
-            in_thinking = true;
-            if (chunk.id.len != 0) try setBuffer(self.gpa, &reasoning_id, chunk.id);
-            try blob.appendSlice(self.gpa, chunk.blob);
+            if (newRunId(state.reasoning_id.items, chunk.id))
+                try state.flushThinking(gpa, origin);
+            if (!state.in_thinking) try state.flushBeforeRun(gpa);
+            state.in_thinking = true;
+            if (chunk.id.len != 0) try setBuffer(gpa, &state.reasoning_id, chunk.id);
+            try state.blob.appendSlice(gpa, chunk.blob);
         },
         .thinking_redacted => |chunk| {
-            try flushThinking(self.gpa, &pending, &thinking, &blob, &reasoning_id, &in_thinking, origin);
-            try appendRedacted(self.gpa, &pending, chunk, origin);
+            try state.flushThinking(gpa, origin);
+            try state.appendRedacted(gpa, chunk, origin);
             // The payload is encrypted, so stand a placeholder in for the display.
             try handler.onThinking(redacted_notice);
         },
         .text => |delta| {
-            try flushThinking(self.gpa, &pending, &thinking, &blob, &reasoning_id, &in_thinking, origin);
-            try text.appendSlice(self.gpa, delta);
+            try state.flushThinking(gpa, origin);
+            try state.text.appendSlice(gpa, delta);
             try handler.onText(delta);
         },
         .tool_use => |use| {
-            // Commit the buffered items in stream order — the pending tool
-            // first, then the reasoning/answer that streamed after it — so the
-            // stored run keeps the order the model produced (reasoning at the
-            // head, which the provider requires; tool and text calls interleaved
-            // as sent).
-            if (in_tool) try flushTool(
-                self.gpa,
-                &pending,
-                .{ .id = tool_id.items, .name = tool_name.items },
-                &input,
-            );
-            try flushThinking(self.gpa, &pending, &thinking, &blob, &reasoning_id, &in_thinking, origin);
-            try flushText(self.gpa, &pending, &text);
-            try setBuffer(self.gpa, &tool_id, use.call_id);
-            try setBuffer(self.gpa, &tool_name, use.name);
-            input.clearRetainingCapacity();
-            in_tool = true;
+            try state.flushAll(gpa, origin);
+            try setBuffer(gpa, &state.tool_id, use.call_id);
+            try setBuffer(gpa, &state.tool_name, use.name);
+            state.input.clearRetainingCapacity();
+            state.in_tool = true;
         },
-        .input_json => |chunk| try input.appendSlice(self.gpa, chunk),
+        .input_json => |chunk| try state.input.appendSlice(gpa, chunk),
         .stop => |stop| {
             maybe_usage = stop.usage;
             break;
@@ -454,20 +425,10 @@ fn readReply(
     const usage = maybe_usage orelse return error.IncompleteReply;
     self.recordUsage(model, usage);
     try handler.onUsage(self.stats);
-
-    // Flush what streamed after the last tool in the order the intra-turn branch
-    // uses: the pending tool first, then any trailing reasoning and answer.
-    if (in_tool) try flushTool(
-        self.gpa,
-        &pending,
-        .{ .id = tool_id.items, .name = tool_name.items },
-        &input,
-    );
-    try flushThinking(self.gpa, &pending, &thinking, &blob, &reasoning_id, &in_thinking, origin);
-    try flushText(self.gpa, &pending, &text);
+    try state.flushAll(gpa, origin);
 
     const start = self.items.items.len;
-    try self.items.appendSlice(self.gpa, pending.items);
+    try self.items.appendSlice(gpa, state.items.items);
     return self.items.items[start..];
 }
 
@@ -505,23 +466,18 @@ fn runToolsWith(
     reply: []const llm.Item,
     handler: anytype,
 ) !bool {
-    var count: usize = 0;
+    var call_list: std.ArrayList(Call) = .empty;
+    defer call_list.deinit(self.gpa);
     for (reply) |item| switch (item) {
-        .tool_call => count += 1,
+        .tool_call => |call| try call_list.append(
+            self.gpa,
+            .{ .id = call.call_id, .name = call.name, .input_json = call.arguments_json },
+        ),
         else => {},
     };
-    if (count == 0) return false;
-
-    const calls = try self.gpa.alloc(Call, count);
-    defer self.gpa.free(calls);
-    var index: usize = 0;
-    for (reply) |item| switch (item) {
-        .tool_call => |call| {
-            calls[index] = .{ .id = call.call_id, .name = call.name, .input_json = call.arguments_json };
-            index += 1;
-        },
-        else => {},
-    };
+    // Stable from here on: nothing appends once the tasks hold pointers.
+    const calls = call_list.items;
+    if (calls.len == 0) return false;
 
     const context: tool.Context = .{ .gpa = self.gpa, .io = self.io };
     var group: std.Io.Group = .init;
@@ -552,10 +508,10 @@ fn runToolsWith(
     }
     try group.await(self.io);
 
-    const results = try self.gpa.alloc(llm.Item, count);
+    const results = try self.gpa.alloc(llm.Item, calls.len);
     defer self.gpa.free(results);
     errdefer for (results[0..collected]) |item| freeItem(self.gpa, item);
-    while (collected < count) : (collected += 1) {
+    while (collected < calls.len) : (collected += 1) {
         const call = &calls[collected];
         const result = try call.result;
         try handler.onToolResult(call.name, result.content, result.is_error);
@@ -588,108 +544,108 @@ fn newRunId(current: []const u8, incoming: []const u8) bool {
     return current.len != 0 and incoming.len != 0 and !std.mem.eql(u8, current, incoming);
 }
 
-/// Commit the pending tool call and buffered answer text ahead of a fresh
-/// reasoning run, so the committed items keep the stream order.
-fn flushBeforeRun(
-    gpa: std.mem.Allocator,
-    items: *std.ArrayList(llm.Item),
-    tool_id: []const u8,
-    tool_name: []const u8,
-    input: *std.ArrayList(u8),
-    in_tool: *bool,
-    text: *std.ArrayList(u8),
-) !void {
-    if (in_tool.*) {
-        try flushTool(gpa, items, .{ .id = tool_id, .name = tool_name }, input);
-        in_tool.* = false;
+/// One streamed reply under assembly: the committed items plus the open answer,
+/// reasoning-run, and tool-call buffers. Flush methods commit a buffer as one
+/// item, duping each string before the append and freeing every dupe if a later
+/// step fails, so a failure leaves no orphaned allocation.
+const Pending = struct {
+    items: std.ArrayList(llm.Item) = .empty,
+    text: std.ArrayList(u8) = .empty,
+    thinking: std.ArrayList(u8) = .empty,
+    blob: std.ArrayList(u8) = .empty,
+    reasoning_id: std.ArrayList(u8) = .empty,
+    in_thinking: bool = false,
+    tool_id: std.ArrayList(u8) = .empty,
+    tool_name: std.ArrayList(u8) = .empty,
+    input: std.ArrayList(u8) = .empty,
+    in_tool: bool = false,
+
+    /// Frees the list backings only; the finished items belong to the caller.
+    fn deinit(self: *Pending, gpa: std.mem.Allocator) void {
+        inline for (@typeInfo(Pending).@"struct".fields) |field| {
+            if (field.type != bool) @field(self, field.name).deinit(gpa);
+        }
     }
-    try flushText(gpa, items, text);
-}
 
-fn flushText(
-    gpa: std.mem.Allocator,
-    items: *std.ArrayList(llm.Item),
-    text: *std.ArrayList(u8),
-) !void {
-    if (text.items.len == 0) return;
-    const text_copy = try gpa.dupe(u8, text.items);
-    errdefer gpa.free(text_copy);
-    try items.append(gpa, .{ .message = .{ .role = .assistant, .text = text_copy } });
-    text.clearRetainingCapacity();
-}
+    /// Commit the pending tool call and buffered answer text ahead of a fresh
+    /// reasoning run, so the committed items keep the stream order.
+    fn flushBeforeRun(self: *Pending, gpa: std.mem.Allocator) !void {
+        if (self.in_tool) try self.flushTool(gpa);
+        try self.flushText(gpa);
+    }
 
-/// Commit the open reasoning run as one reasoning item (text plus its verbatim
-/// blob and item id), preserving the head-of-message order the provider
-/// validates. A no-op when no run is open. Each string is duped before the item
-/// is appended, and every dupe is freed if a later dupe or the append fails, so a
-/// failure leaves no orphaned allocation.
-fn flushThinking(
-    gpa: std.mem.Allocator,
-    items: *std.ArrayList(llm.Item),
-    thinking: *std.ArrayList(u8),
-    blob: *std.ArrayList(u8),
-    reasoning_id: *std.ArrayList(u8),
-    in_thinking: *bool,
-    origin: llm.Account,
-) !void {
-    if (!in_thinking.*) return;
-    const text_copy = try gpa.dupe(u8, thinking.items);
-    errdefer gpa.free(text_copy);
-    const blob_copy = try gpa.dupe(u8, blob.items);
-    errdefer gpa.free(blob_copy);
-    const id_copy = try gpa.dupe(u8, reasoning_id.items);
-    errdefer gpa.free(id_copy);
-    try items.append(gpa, .{ .reasoning = .{
-        .text = text_copy,
-        .blob = blob_copy,
-        .id = id_copy,
-        .origin = origin,
-    } });
-    thinking.clearRetainingCapacity();
-    blob.clearRetainingCapacity();
-    reasoning_id.clearRetainingCapacity();
-    in_thinking.* = false;
-}
+    /// Commit everything buffered in stream order — the pending tool first, then
+    /// the reasoning/answer that streamed after it — so the stored run keeps the
+    /// order the model produced (reasoning at the head, which the provider
+    /// requires; tool and text calls interleaved as sent).
+    fn flushAll(self: *Pending, gpa: std.mem.Allocator, origin: llm.Account) !void {
+        if (self.in_tool) try self.flushTool(gpa);
+        try self.flushThinking(gpa, origin);
+        try self.flushText(gpa);
+    }
 
-/// Commit one complete redacted reasoning block: its encrypted blob and item id
-/// with empty visible text. Fails atomically like `flushThinking`.
-fn appendRedacted(
-    gpa: std.mem.Allocator,
-    items: *std.ArrayList(llm.Item),
-    chunk: llm.Event.Blob,
-    origin: llm.Account,
-) !void {
-    const blob_copy = try gpa.dupe(u8, chunk.blob);
-    errdefer gpa.free(blob_copy);
-    const id_copy = try gpa.dupe(u8, chunk.id);
-    errdefer gpa.free(id_copy);
-    try items.append(gpa, .{ .reasoning = .{
-        .text = "",
-        .blob = blob_copy,
-        .redacted = true,
-        .id = id_copy,
-        .origin = origin,
-    } });
-}
+    fn flushText(self: *Pending, gpa: std.mem.Allocator) !void {
+        if (self.text.items.len == 0) return;
+        const text_copy = try gpa.dupe(u8, self.text.items);
+        errdefer gpa.free(text_copy);
+        try self.items.append(gpa, .{ .message = .{ .role = .assistant, .text = text_copy } });
+        self.text.clearRetainingCapacity();
+    }
 
-fn flushTool(
-    gpa: std.mem.Allocator,
-    items: *std.ArrayList(llm.Item),
-    use: struct { id: []const u8, name: []const u8 },
-    input: *std.ArrayList(u8),
-) !void {
-    const id_copy = try gpa.dupe(u8, use.id);
-    errdefer gpa.free(id_copy);
-    const name_copy = try gpa.dupe(u8, use.name);
-    errdefer gpa.free(name_copy);
-    const json_copy = try gpa.dupe(u8, input.items);
-    errdefer gpa.free(json_copy);
-    try items.append(gpa, .{ .tool_call = .{
-        .call_id = id_copy,
-        .name = name_copy,
-        .arguments_json = json_copy,
-    } });
-}
+    /// Commit the open reasoning run as one reasoning item (text plus its
+    /// verbatim blob and item id), preserving the head-of-message order the
+    /// provider validates. A no-op when no run is open.
+    fn flushThinking(self: *Pending, gpa: std.mem.Allocator, origin: llm.Account) !void {
+        if (!self.in_thinking) return;
+        const text_copy = try gpa.dupe(u8, self.thinking.items);
+        errdefer gpa.free(text_copy);
+        const blob_copy = try gpa.dupe(u8, self.blob.items);
+        errdefer gpa.free(blob_copy);
+        const id_copy = try gpa.dupe(u8, self.reasoning_id.items);
+        errdefer gpa.free(id_copy);
+        try self.items.append(gpa, .{ .reasoning = .{
+            .text = text_copy,
+            .blob = blob_copy,
+            .id = id_copy,
+            .origin = origin,
+        } });
+        self.thinking.clearRetainingCapacity();
+        self.blob.clearRetainingCapacity();
+        self.reasoning_id.clearRetainingCapacity();
+        self.in_thinking = false;
+    }
+
+    /// Commit one complete redacted reasoning block: its encrypted blob and item
+    /// id with empty visible text.
+    fn appendRedacted(self: *Pending, gpa: std.mem.Allocator, chunk: llm.Event.Blob, origin: llm.Account) !void {
+        const blob_copy = try gpa.dupe(u8, chunk.blob);
+        errdefer gpa.free(blob_copy);
+        const id_copy = try gpa.dupe(u8, chunk.id);
+        errdefer gpa.free(id_copy);
+        try self.items.append(gpa, .{ .reasoning = .{
+            .text = "",
+            .blob = blob_copy,
+            .redacted = true,
+            .id = id_copy,
+            .origin = origin,
+        } });
+    }
+
+    fn flushTool(self: *Pending, gpa: std.mem.Allocator) !void {
+        const id_copy = try gpa.dupe(u8, self.tool_id.items);
+        errdefer gpa.free(id_copy);
+        const name_copy = try gpa.dupe(u8, self.tool_name.items);
+        errdefer gpa.free(name_copy);
+        const json_copy = try gpa.dupe(u8, self.input.items);
+        errdefer gpa.free(json_copy);
+        try self.items.append(gpa, .{ .tool_call = .{
+            .call_id = id_copy,
+            .name = name_copy,
+            .arguments_json = json_copy,
+        } });
+        self.in_tool = false;
+    }
+};
 
 test retryableError {
     try std.testing.expect(retryableError(error.Timeout));
