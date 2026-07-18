@@ -242,8 +242,8 @@ Extension seams referenced here:
       deadline when it must wait on the socket.
 - [x] **Request retries.** `Agent.fetchReply` retries a whole request on a timeout, premature stream
       end, transient network fault, or retryable status (408 / 429 / 5xx, including Anthropic's 529
-      overloaded), honoring `retry-after` when present, with a bounded attempt count (default 3) and
-      exponential backoff. It sits above `Transport`, so it stays provider-neutral (the transport
+      overloaded), honoring `retry-after` when present (capped at the maximum backoff), with a
+      bounded attempt count (default 3) and exponential backoff. It sits above `Transport`, so it stays provider-neutral (the transport
       only classifies its own status via `Stream.retryable`/`retryAfterMs`). Only whole requests are
       safe to retry: the provider's authoritative terminal event commits the assistant message;
       EOF, `[DONE]`, or an error before it discards partial text and tool calls, and

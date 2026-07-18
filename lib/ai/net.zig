@@ -46,6 +46,15 @@ pub const Retry = struct {
         const scaled = self.backoff_ms_initial *| (@as(u64, 1) << steps);
         return @min(scaled, self.backoff_ms_max);
     }
+
+    /// Wait before the retry following a failed `attempt` (1-based). A server
+    /// `retry-after` hint (`suggested_ms`, 0 when absent) takes precedence over the
+    /// computed backoff but is capped at `backoff_ms_max`, so a server cannot make a
+    /// turn wait longer than local policy allows; without a hint, `delayMs` applies.
+    pub fn backoffMs(self: Retry, attempt: u32, suggested_ms: u64) u64 {
+        if (suggested_ms > 0) return @min(suggested_ms, self.backoff_ms_max);
+        return self.delayMs(attempt);
+    }
 };
 
 fn Timed(comptime Function: type) type {
@@ -213,6 +222,21 @@ test "delayMs doubles per attempt and caps" {
     try std.testing.expectEqual(@as(u64, 1000), retry.delayMs(2));
     try std.testing.expectEqual(@as(u64, 2000), retry.delayMs(3));
     try std.testing.expectEqual(@as(u64, 16_000), retry.delayMs(10));
+}
+
+test "backoffMs caps a server hint at the max backoff" {
+    const retry: Retry = .{ .backoff_ms_initial = 500, .backoff_ms_max = 16_000 };
+    // A hint longer than local policy is capped, so a turn never waits longer than
+    // the computed backoff's ceiling; a saturated hint cannot wrap past it either.
+    try std.testing.expectEqual(@as(u64, 16_000), retry.backoffMs(1, 3_600_000));
+    try std.testing.expectEqual(@as(u64, 16_000), retry.backoffMs(1, 16_000));
+    try std.testing.expectEqual(@as(u64, 16_000), retry.backoffMs(1, std.math.maxInt(u64)));
+    // A hint at or below the cap takes precedence over the computed backoff, whether
+    // it is longer or shorter than that backoff would be.
+    try std.testing.expectEqual(@as(u64, 5000), retry.backoffMs(1, 5000));
+    try std.testing.expectEqual(@as(u64, 200), retry.backoffMs(3, 200));
+    // No hint falls back to the exponential backoff.
+    try std.testing.expectEqual(@as(u64, 1000), retry.backoffMs(2, 0));
 }
 
 fn fastWork(io: std.Io) anyerror!u64 {

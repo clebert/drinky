@@ -872,6 +872,14 @@ test retryAfter {
 
     const without = "HTTP/1.1 503 Service Unavailable\r\ncontent-length:0\r\n\r\n";
     try std.testing.expectEqual(@as(?u64, null), retryAfter(try std.http.Client.Response.Head.parse(without)));
+
+    // An HTTP-date form is unsupported and falls back to the computed backoff.
+    const dated = "HTTP/1.1 503 Service Unavailable\r\nretry-after: Wed, 21 Oct 2015 07:28:00 GMT\r\ncontent-length:0\r\n\r\n";
+    try std.testing.expectEqual(@as(?u64, null), retryAfter(try std.http.Client.Response.Head.parse(dated)));
+
+    // A huge value saturates rather than wrapping, so the backoff cap still bounds it.
+    const huge = "HTTP/1.1 429 Too Many Requests\r\nretry-after: 99999999999999999\r\ncontent-length:0\r\n\r\n";
+    try std.testing.expectEqual(@as(?u64, std.math.maxInt(u64)), retryAfter(try std.http.Client.Response.Head.parse(huge)));
 }
 
 test "retryable classifies the head status" {

@@ -139,9 +139,10 @@ commit history, `BACKLOG.md` (planned work), and `docs/`.
   reported to the presentation layer.
 - Retries an entire request on a timeout, transient network fault, premature stream end, or
   retryable status (408, 429, 5xx, including Anthropic's 529), honoring the server's retry-after
-  hint, with bounded attempts and exponential backoff. A reply commits only at its provider's
-  terminal event; a failed attempt's partial text and tool calls are discarded, the presentation
-  layer clears partial text before retrying, and tools execute only after a committed reply.
+  hint capped at the maximum backoff, with bounded attempts and exponential backoff. A reply
+  commits only at its provider's terminal event; a failed attempt's partial text and tool calls
+  are discarded, the presentation layer clears partial text before retrying, and tools execute
+  only after a committed reply.
 - On a stream failure or API error, discards the turn's items so history returns to where the turn
   began, freeing their memory at once rather than at session end; each history item owns its memory,
   so repeated failed, retried, or cancelled turns keep retained memory bounded to the surviving

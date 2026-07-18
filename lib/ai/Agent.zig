@@ -246,10 +246,10 @@ fn fetchReply(self: *Agent, handler: anytype, base: usize) !?[]const llm.Item {
 }
 
 /// Wait before the retry following a failed `attempt`: the server's `retry-after`
-/// when it gave one, else an exponential backoff. A cancel during the wait aborts
-/// the turn.
+/// when it gave one (capped at the local maximum backoff), else an exponential
+/// backoff. A cancel during the wait aborts the turn.
 fn backoff(self: *Agent, attempt: u32, suggested_ms: u64) !void {
-    const delay_ms = if (suggested_ms > 0) suggested_ms else self.retry.delayMs(attempt);
+    const delay_ms = self.retry.backoffMs(attempt, suggested_ms);
     const bounded: u64 = @min(delay_ms, std.math.maxInt(i64));
     try self.io.sleep(.fromMilliseconds(@intCast(bounded)), .awake);
 }
