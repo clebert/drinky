@@ -30,34 +30,22 @@ pub const screen_clear_below = "\x1b[0J";
 /// reprinted from scratch.
 pub const screen_reset = "\x1b[2J\x1b[H\x1b[3J";
 
-/// Move the cursor up `count` rows. No-op at zero, so the sequence is never
-/// emitted with an implicit argument.
-pub fn cursorUp(writer: *std.Io.Writer, count: usize) !void {
+/// Move the cursor `count` steps: up (`'A'`), down (`'B'`), or right (`'C'`).
+/// No-op at zero, so the sequence is never emitted with an implicit argument.
+pub fn cursorMove(writer: *std.Io.Writer, comptime final: u8, count: usize) !void {
     if (count == 0) return;
-    try writer.print("\x1b[{d}A", .{count});
-}
-
-/// Move the cursor down `count` rows, no-op at zero.
-pub fn cursorDown(writer: *std.Io.Writer, count: usize) !void {
-    if (count == 0) return;
-    try writer.print("\x1b[{d}B", .{count});
-}
-
-/// Move the cursor right `count` columns, no-op at zero.
-pub fn cursorForward(writer: *std.Io.Writer, count: usize) !void {
-    if (count == 0) return;
-    try writer.print("\x1b[{d}C", .{count});
+    try writer.print("\x1b[{d}{c}", .{ count, final });
 }
 
 test "cursor motion emits nothing at zero" {
     var buffer: [16]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buffer);
-    try cursorUp(&writer, 0);
-    try cursorDown(&writer, 0);
-    try cursorForward(&writer, 0);
+    try cursorMove(&writer, 'A', 0);
+    try cursorMove(&writer, 'B', 0);
+    try cursorMove(&writer, 'C', 0);
     try std.testing.expectEqualStrings("", writer.buffered());
-    try cursorUp(&writer, 2);
-    try cursorDown(&writer, 3);
-    try cursorForward(&writer, 4);
+    try cursorMove(&writer, 'A', 2);
+    try cursorMove(&writer, 'B', 3);
+    try cursorMove(&writer, 'C', 4);
     try std.testing.expectEqualStrings("\x1b[2A\x1b[3B\x1b[4C", writer.buffered());
 }

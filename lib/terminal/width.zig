@@ -42,24 +42,11 @@ pub fn writeFitted(writer: *std.Io.Writer, text: []const u8, columns_max: usize)
     return writeCanonical(writer, text, columns_max);
 }
 
-/// Hard-wrap `text` into slices of at most `columns_max` display columns,
-/// appending each line into `lines`. Breaks strictly on width (no word
-/// awareness) and never inside a grapheme cluster. An explicit `\n` starts a new
-/// line and is not emitted.
-pub fn wrap(
-    text: []const u8,
-    columns_max: usize,
-    lines: *std.ArrayList([]const u8),
-    gpa: std.mem.Allocator,
-) !void {
-    var iterator = wrapper(text, columns_max);
-    while (iterator.next()) |line| try lines.append(gpa, line);
-}
-
-/// A streaming view of `wrap`: yields the same lines one at a time instead of
-/// appending them all at once, so a caller can drop the rows above a window
-/// without ever materializing the whole list. `next` returns each fitted line in
-/// turn (a slice into `text`), then null.
+/// Streaming hard-wrap: `next` yields each line of at most `columns_max`
+/// display columns in turn (a slice into `text`), then null, so a caller can
+/// drop the rows above a window without ever materializing the whole list.
+/// Breaks strictly on width (no word awareness) and never inside a grapheme
+/// cluster. An explicit `\n` starts a new line and is not emitted.
 pub const Wrapper = struct {
     text: []const u8,
     columns_max: usize,
@@ -93,15 +80,15 @@ pub const Wrapper = struct {
     }
 };
 
-/// Wrap `text` to at most `columns_max` display columns one line at a time — the
-/// streaming form `wrap`, `rows`, and `caret` are all built on, so they stay in
-/// lockstep by construction.
+/// Wrap `text` to at most `columns_max` display columns one line at a time —
+/// the form `rows` and `caret` are built on, so they stay in lockstep by
+/// construction.
 pub fn wrapper(text: []const u8, columns_max: usize) Wrapper {
     return .{ .text = text, .columns_max = columns_max, .line_start = 0, .done = false };
 }
 
 /// Number of physical terminal rows `text` occupies once hard-wrapped to
-/// `columns_max` display columns — the count of pieces `wrap` produces. Always
+/// `columns_max` display columns — the count of lines `wrapper` yields. Always
 /// at least one; an explicit `\n` starts a new row. A wide cluster that would
 /// straddle the margin breaks to the next row, so this is not `ceil(width /
 /// columns)`.
@@ -436,20 +423,11 @@ test wrapper {
     try std.testing.expectEqualStrings("ab", trailing.next().?);
     try std.testing.expectEqualStrings("", trailing.next().?);
     try std.testing.expect(trailing.next() == null);
-}
 
-test wrap {
-    var lines: std.ArrayList([]const u8) = .empty;
-    defer lines.deinit(std.testing.allocator);
-    try wrap("ab\ncd", 10, &lines, std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 2), lines.items.len);
-    try std.testing.expectEqualStrings("ab", lines.items[0]);
-    try std.testing.expectEqualStrings("cd", lines.items[1]);
-
-    lines.clearRetainingCapacity();
-    try wrap("", 3, &lines, std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 1), lines.items.len);
-    try std.testing.expectEqualStrings("", lines.items[0]);
+    var newline = wrapper("ab\ncd", 10);
+    try std.testing.expectEqualStrings("ab", newline.next().?);
+    try std.testing.expectEqualStrings("cd", newline.next().?);
+    try std.testing.expect(newline.next() == null);
 }
 
 test rows {
@@ -501,7 +479,7 @@ test caret {
     // Wide glyphs push the wrap early: after two two-column glyphs the caret is
     // on the second row at column two, not row one.
     try std.testing.expectEqual(Caret{ .rows_before = 1, .column = 2 }, caret("你好", 3));
-    // An explicit newline starts a fresh row, like wrap.
+    // An explicit newline starts a fresh row, like wrapper.
     try std.testing.expectEqual(Caret{ .rows_before = 1, .column = 1 }, caret("ab\nc", 10));
     // A trailing newline lands the caret at column 0 of the empty next row
     // (also the blank line between two newlines), and consecutive newlines each

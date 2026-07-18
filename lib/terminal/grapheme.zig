@@ -83,20 +83,14 @@ fn classOf(codepoint: u21) unicode_data.Class {
 /// The range in the sorted, non-overlapping `ranges` that contains `codepoint`,
 /// or null when it falls in none.
 fn search(comptime Range: type, ranges: []const Range, codepoint: u21) ?Range {
-    var low: usize = 0;
-    var high: usize = ranges.len;
-    while (low < high) {
-        const middle = low + @divFloor(high - low, 2);
-        const range = ranges[middle];
-        if (codepoint < range.first) {
-            high = middle;
-        } else if (codepoint > range.last) {
-            low = middle + 1;
-        } else {
-            return range;
+    const order = struct {
+        fn order(context: u21, range: Range) std.math.Order {
+            if (context < range.first) return .lt;
+            return if (context > range.last) .gt else .eq;
         }
-    }
-    return null;
+    }.order;
+    const index = std.sort.binarySearch(Range, ranges, codepoint, order) orelse return null;
+    return ranges[index];
 }
 
 fn isExtend(class: unicode_data.Class) bool {
@@ -109,20 +103,14 @@ fn isExtend(class: unicode_data.Class) bool {
 /// emoji sequence (GB11) — a tail matching `Extended_Pictographic Extend*`, and
 /// one matching that followed by a single pivoting `ZWJ`.
 const State = struct {
-    regional_indicators: usize,
-    indic_armed: bool,
-    indic_linker: bool,
-    pictographic: bool,
-    pictographic_zwj: bool,
+    regional_indicators: usize = 0,
+    indic_armed: bool = false,
+    indic_linker: bool = false,
+    pictographic: bool = false,
+    pictographic_zwj: bool = false,
 
     fn init(first: unicode_data.Class) State {
-        var self: State = .{
-            .regional_indicators = 0,
-            .indic_armed = false,
-            .indic_linker = false,
-            .pictographic = false,
-            .pictographic_zwj = false,
-        };
+        var self: State = .{};
         self.advance(first);
         return self;
     }

@@ -66,20 +66,8 @@ pub fn feed(self: *Emulator, bytes: []const u8) !void {
 
 fn control(self: *Emulator, sequence: []const u8) !usize {
     if (sequence.len < 2) return sequence.len;
-    switch (sequence[1]) {
-        '[' => return self.csi(sequence),
-        ']', '_', 'P', '^', 'X' => {
-            var index: usize = 2;
-            while (index < sequence.len) : (index += 1) {
-                if (sequence[index] == 0x07) return index + 1;
-                if (sequence[index] == 0x1b and index + 1 < sequence.len and sequence[index + 1] == '\\') {
-                    return index + 2;
-                }
-            }
-            return sequence.len;
-        },
-        else => return 2,
-    }
+    if (sequence[1] == '[') return self.csi(sequence);
+    return 2;
 }
 
 fn csi(self: *Emulator, sequence: []const u8) !usize {

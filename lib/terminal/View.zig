@@ -140,12 +140,7 @@ pub const Sink = struct {
 
     /// Append up to `count` ordinary spaces without exposing the row writer.
     pub fn spaces(self: *Sink, count: usize) !void {
-        const shown = @min(count, self.columns -| self.columns_written);
-        if (shown == 0) return;
-        if (self.has_text) try self.frame.blob.writer.writeAll("\u{200B}");
-        try self.frame.blob.writer.splatByteAll(' ', shown);
-        self.columns_written += shown;
-        self.has_text = true;
+        return self.repeat(" ", count);
     }
 
     /// Append up to `count` copies of a compile-time single-column `cell` as one
@@ -292,64 +287,43 @@ pub fn render(self: *View) !void {
 
     if (back.rows.items.len == 0) {
         try self.paintEmpty(prev_empty and !self.force_reset);
-        self.force_reset = false;
-        self.front ^= 1;
-        return;
-    }
-
-    if (self.force_reset) {
-        self.force_reset = false;
+    } else if (self.force_reset) {
         try self.paint(.reset, 0, back, 0);
-        self.front ^= 1;
-        return;
-    }
-
-    if (prev_empty or self.structural_change) {
+    } else if (prev_empty or self.structural_change) {
         try self.paint(if (prev_empty) .fresh else .reset, 0, back, 0);
-        self.front ^= 1;
-        return;
-    }
-
-    // Align on the first shared anchor, not screen position, so a slide need not reset.
-    const alignment = findAlignment(prev, back) orelse {
-        try self.paint(.reset, 0, back, 0);
-        self.front ^= 1;
-        return;
-    };
-    if (alignment.back_index == 0) {
-        // Forward slide: the new top row is shared; rows above it scrolled away.
-        const delta = alignment.prev_index;
-        const changed = firstChange(prev, delta, back) orelse {
-            if (delta == 0) {
+    } else if (findAlignment(prev, back)) |alignment| {
+        if (alignment.back_index == 0) {
+            // Forward slide: the new top row is shared; rows above it scrolled away.
+            const delta = alignment.prev_index;
+            const deepest = @min(prev.rows.items.len - 1 - delta, back.rows.items.len - 1);
+            if (firstChange(prev, delta, back)) |changed| {
+                // A shrunk tail must reveal scrolled-off rows: a backward slide in disguise.
+                const shrank = back.rows.items.len + delta < prev.rows.items.len;
+                if (changed + delta < self.viewport_top or (shrank and self.viewport_top > 0)) {
+                    try self.paint(.reset, 0, back, 0);
+                } else {
+                    // Reprint no lower than the previous last row, so the append scrolls by \r\n.
+                    try self.paint(.incremental, @min(changed, deepest), back, self.cursor_row -| delta);
+                }
+            } else if (delta == 0) {
                 // Content unchanged, so no slide happened: `cursor_row` is still valid.
                 try self.paintCaretOnly(back);
             } else if (self.viewport_top > 0) {
                 try self.paint(.reset, 0, back, 0);
             } else {
                 // A pure top-trim keeps the tail bytes but slides the window, so rebase.
-                const deepest = @min(prev.rows.items.len - 1 - delta, back.rows.items.len - 1);
                 try self.paint(.incremental, deepest, back, self.cursor_row -| delta);
             }
-            self.front ^= 1;
-            return;
-        };
-        // A shrunk tail must reveal scrolled-off rows: a backward slide in disguise.
-        const shrank = back.rows.items.len + delta < prev.rows.items.len;
-        if (changed + delta < self.viewport_top or (shrank and self.viewport_top > 0)) {
-            try self.paint(.reset, 0, back, 0);
-        } else {
-            // Reprint no lower than the previous last row, so the append scrolls by \r\n.
-            const deepest = @min(prev.rows.items.len - 1 - delta, back.rows.items.len - 1);
-            try self.paint(.incremental, @min(changed, deepest), back, self.cursor_row -| delta);
-        }
-    } else {
-        // Backward slide: row 0 changed, reachable only when the whole window shows.
-        if (self.viewport_top == 0) {
+        } else if (self.viewport_top == 0) {
+            // Backward slide: row 0 changed, reachable only when the whole window shows.
             try self.paint(.incremental, 0, back, self.cursor_row);
         } else {
             try self.paint(.reset, 0, back, 0);
         }
+    } else {
+        try self.paint(.reset, 0, back, 0);
     }
+    self.force_reset = false;
     self.front ^= 1;
 }
 
@@ -364,9 +338,9 @@ fn paint(self: *View, mode: Mode, anchor: usize, frame: *const Frame, cursor_fro
         .reset => try writer.writeAll(escape.screen_reset),
         .incremental => {
             if (cursor_from >= anchor) {
-                try escape.cursorUp(writer, cursor_from - anchor);
+                try escape.cursorMove(writer, 'A', cursor_from - anchor);
             } else {
-                try escape.cursorDown(writer, anchor - cursor_from);
+                try escape.cursorMove(writer, 'B', anchor - cursor_from);
             }
             try writer.writeAll("\r");
             try writer.writeAll(escape.screen_clear_below);
@@ -377,7 +351,8 @@ fn paint(self: *View, mode: Mode, anchor: usize, frame: *const Frame, cursor_fro
         if (index > anchor) try writer.writeAll("\r\n");
         try writer.writeAll(frame.bytes(row));
     }
-    self.viewport_top = viewportTop(frame, self.rows);
+    // The last `rows` physical rows are visible; everything above is scrollback.
+    self.viewport_top = frame.rows.items.len -| @max(self.rows, 1);
     try self.restoreCursor(items.len - 1, frame);
     try writer.writeAll(escape.sync_reset);
     try writer.flush();
@@ -417,12 +392,12 @@ fn restoreCursor(self: *View, from_row: usize, frame: *const Frame) !void {
     if (frame.caret) |caret| {
         if (caret.row >= self.viewport_top) {
             if (from_row >= caret.row) {
-                try escape.cursorUp(writer, from_row - caret.row);
+                try escape.cursorMove(writer, 'A', from_row - caret.row);
             } else {
-                try escape.cursorDown(writer, caret.row - from_row);
+                try escape.cursorMove(writer, 'B', caret.row - from_row);
             }
             try writer.writeAll("\r");
-            try escape.cursorForward(writer, caret.column);
+            try escape.cursorMove(writer, 'C', caret.column);
             if (!self.cursor_visible) {
                 try writer.writeAll(escape.cursor_show);
                 self.cursor_visible = true;
@@ -468,14 +443,6 @@ fn firstChange(prev: *const Frame, prev_start: usize, back: *const Frame) ?usize
         }
     }
     return null;
-}
-
-/// Window-relative index of the topmost row still on screen: the last `rows`
-/// physical rows are visible, everything above sits in scrollback.
-fn viewportTop(frame: *const Frame, rows: usize) usize {
-    const len = frame.rows.items.len;
-    const height = @max(rows, 1);
-    return if (len > height) len - height else 0;
 }
 
 fn validSgr(comptime sequence: []const u8) bool {

@@ -51,15 +51,6 @@ const PosixSetup = struct {
     }
 };
 
-const PosixRestore = struct {
-    in_handle: std.posix.fd_t,
-    original: *const std.posix.termios,
-
-    fn restore(self: *const PosixRestore) !void {
-        try std.posix.tcsetattr(self.in_handle, .NOW, self.original.*);
-    }
-};
-
 pub fn init(self: *Tty, io: std.Io) !void {
     const stdin = std.Io.File.stdin();
     const stdout = std.Io.File.stdout();
@@ -105,11 +96,13 @@ pub fn enterRaw(self: *Tty) !void {
 /// write from stranding raw mode. Used at shutdown (`deinit`) and to suspend the
 /// interface for a mid-session login flow; pair with `enterRaw` to resume.
 pub fn leaveRaw(self: *Tty) void {
-    var control: PosixRestore = .{
+    // `raw` is unused on the restore path.
+    var control: PosixSetup = .{
         .in_handle = self.in_handle,
+        .raw = &self.original,
         .original = &self.original,
     };
-    leaveWith(&self.raw_state, &self.out_stream.interface, &control);
+    cleanupWith(&self.raw_state, &self.out_stream.interface, &control, true);
 }
 
 pub fn writer(self: *Tty) *std.Io.Writer {
@@ -147,7 +140,7 @@ pub fn size(self: *Tty) ?Size {
 fn enterWith(state: *RawState, output: *std.Io.Writer, control: anytype) !void {
     try control.setRaw();
     state.raw_owned = true;
-    errdefer rollbackWith(state, output, control);
+    errdefer cleanupWith(state, output, control, false);
 
     state.paste_reset_pending = true;
     try output.writeAll(escape.paste_set);
@@ -157,14 +150,6 @@ fn enterWith(state: *RawState, output: *std.Io.Writer, control: anytype) !void {
     try output.writeAll(escape.cursor_hide);
     try output.flush();
     state.setup_complete = true;
-}
-
-fn rollbackWith(state: *RawState, output: *std.Io.Writer, control: anytype) void {
-    cleanupWith(state, output, control, false);
-}
-
-fn leaveWith(state: *RawState, output: *std.Io.Writer, control: anytype) void {
-    cleanupWith(state, output, control, true);
 }
 
 fn cleanupWith(
@@ -323,7 +308,7 @@ fn expectSetupFailure(
         error.WriteFailed,
         enterWith(&state, &output.interface, &control),
     );
-    rollbackWith(&state, &output.interface, &control);
+    cleanupWith(&state, &output.interface, &control, false);
 
     try std.testing.expect(!control.raw);
     try std.testing.expectEqual(@as(usize, 1), control.set_count);
@@ -413,8 +398,8 @@ test "setup rollback preserves the setup error when termios restoration fails" {
     try std.testing.expectEqual(@as(usize, 1), control.restore_count);
 
     control.restore_fails = false;
-    rollbackWith(&state, &output.interface, &control);
-    rollbackWith(&state, &output.interface, &control);
+    cleanupWith(&state, &output.interface, &control, false);
+    cleanupWith(&state, &output.interface, &control, false);
     try std.testing.expect(!control.raw);
     try std.testing.expectEqual(@as(usize, 2), control.restore_count);
     try std.testing.expectEqual(RawState{}, state);
@@ -441,8 +426,8 @@ test "successful setup and repeated cleanup manage every terminal mode once" {
         output.operations[0..output.operations_len],
     );
 
-    leaveWith(&state, &output.interface, &control);
-    leaveWith(&state, &output.interface, &control);
+    cleanupWith(&state, &output.interface, &control, true);
+    cleanupWith(&state, &output.interface, &control, true);
     try std.testing.expect(!control.raw);
     try std.testing.expectEqual(@as(usize, 1), control.restore_count);
     try std.testing.expectEqual(RawState{}, state);
@@ -469,7 +454,7 @@ test "shutdown restores cooked mode before the potentially blocking presentation
     var state: RawState = .{};
 
     try enterWith(&state, &output.interface, &control);
-    leaveWith(&state, &output.interface, &control);
+    cleanupWith(&state, &output.interface, &control, true);
 
     try std.testing.expect(!control.raw);
     try std.testing.expectEqual(RawState{}, state);
@@ -497,7 +482,7 @@ test "shutdown restores cooked mode even when presentation output fails" {
     var state: RawState = .{};
 
     try enterWith(&state, &output.interface, &control);
-    leaveWith(&state, &output.interface, &control);
+    cleanupWith(&state, &output.interface, &control, true);
 
     try std.testing.expect(!control.raw);
     try std.testing.expectEqual(@as(usize, 1), control.restore_count);
