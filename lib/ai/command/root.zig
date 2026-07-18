@@ -9,6 +9,11 @@ const std = @import("std");
 pub const Context = @import("Context.zig");
 pub const Outcome = @import("outcome.zig").Outcome;
 
+const Agent = @import("../Agent.zig");
+const llm = @import("../llm.zig");
+const models = @import("../models.zig");
+const provider = @import("../provider.zig");
+
 const effort = @import("effort.zig");
 const login = @import("login.zig");
 const logout = @import("logout.zig");
@@ -65,6 +70,55 @@ test "unknown command is reported" {
     var context: Context = .{ .gpa = gpa, .agent = undefined, .accounts = undefined };
     const outcome = try run(&context, "/nope");
     switch (outcome) {
+        .feedback => |feedback| {
+            defer gpa.free(feedback.content);
+            try std.testing.expect(feedback.is_error);
+        },
+        else => return error.ExpectedFeedback,
+    }
+}
+
+test "run routes a known command, passing the ignored argument tail" {
+    const gpa = std.testing.allocator;
+    const client = provider.Client.init(gpa, std.testing.io, .{ .anthropic_subscription = undefined }, .{});
+    var agent = Agent.init(gpa, std.testing.io, client, .{
+        .model = models.get(.anthropic, "claude-sonnet-4-6").?,
+        .system = "",
+        .retry = .{},
+    });
+    defer agent.deinit();
+    var context: Context = .{ .gpa = gpa, .agent = &agent, .accounts = undefined };
+
+    switch (try run(&context, "/effort xhigh trailing")) {
+        .pick => |pick| {
+            defer {
+                for (pick.options) |option| gpa.free(option);
+                gpa.free(pick.options);
+            }
+            try std.testing.expectEqualStrings("effort", pick.command);
+        },
+        else => return error.ExpectedPick,
+    }
+}
+
+test "select reaches the named command's entry, reporting an unknown name" {
+    const gpa = std.testing.allocator;
+    const client = provider.Client.init(gpa, std.testing.io, .{ .anthropic_subscription = undefined }, .{});
+    var agent = Agent.init(gpa, std.testing.io, client, .{
+        .model = models.get(.anthropic, "claude-sonnet-4-6").?,
+        .system = "",
+        .retry = .{},
+    });
+    defer agent.deinit();
+    var context: Context = .{ .gpa = gpa, .agent = &agent, .accounts = undefined };
+
+    switch (try select(&context, "effort", 4)) {
+        .feedback => |feedback| gpa.free(feedback.content),
+        else => return error.ExpectedFeedback,
+    }
+    try std.testing.expectEqual(llm.Effort.xhigh, agent.effort);
+
+    switch (try select(&context, "nope", 0)) {
         .feedback => |feedback| {
             defer gpa.free(feedback.content);
             try std.testing.expect(feedback.is_error);

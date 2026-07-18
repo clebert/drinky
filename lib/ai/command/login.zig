@@ -99,8 +99,8 @@ fn testAccounts(anthropic_key: ?[]const u8, anthropic_ready: bool, openai_ready:
     };
 }
 
-fn testAgent(gpa: std.mem.Allocator) Agent {
-    const client = provider.Client.init(gpa, std.testing.io, .{ .anthropic_api = "sk-ant" }, .{});
+fn testAgent(gpa: std.mem.Allocator, credentials: provider.Credentials) Agent {
+    const client = provider.Client.init(gpa, std.testing.io, credentials, .{});
     return Agent.init(gpa, std.testing.io, client, .{
         .model = models.get(.anthropic, "claude-sonnet-4-6").?,
         .system = "",
@@ -113,7 +113,7 @@ test "the picker lists every account, marking the active and authenticated ones"
     // An anthropic subscription logged in and an anthropic API key set (the
     // active account); both openai accounts unauthenticated.
     var accounts = testAccounts("sk-ant", true, false);
-    var agent = testAgent(gpa);
+    var agent = testAgent(gpa, .{ .anthropic_api = "sk-ant" });
     defer agent.deinit();
     var context: Context = .{ .gpa = gpa, .agent = &agent, .accounts = &accounts };
 
@@ -137,7 +137,7 @@ test "the picker lists every account, marking the active and authenticated ones"
 test "select logs in a subscription, instructs an API account, and no-ops the active one" {
     const gpa = std.testing.allocator;
     var accounts = testAccounts("sk-ant", false, false);
-    var agent = testAgent(gpa);
+    var agent = testAgent(gpa, .{ .anthropic_api = "sk-ant" });
     defer agent.deinit();
     var context: Context = .{ .gpa = gpa, .agent = &agent, .accounts = &accounts };
 
@@ -178,10 +178,28 @@ test "select logs in a subscription, instructs an API account, and no-ops the ac
     }
 }
 
+test "select never re-runs the login for the active subscription" {
+    const gpa = std.testing.allocator;
+    var accounts = testAccounts(null, true, false);
+    var agent = testAgent(gpa, .{ .anthropic_subscription = undefined });
+    defer agent.deinit();
+    var context: Context = .{ .gpa = gpa, .agent = &agent, .accounts = &accounts };
+
+    switch (try select(&context, 0)) {
+        .feedback => |feedback| {
+            defer gpa.free(feedback.content);
+            try std.testing.expect(!feedback.is_error);
+            try std.testing.expect(std.mem.indexOf(u8, feedback.content, "already active") != null);
+        },
+        else => return error.ExpectedFeedback,
+    }
+    try std.testing.expectEqual(llm.Account.anthropic_subscription, agent.client.?.account());
+}
+
 test "select switches to an authenticated but inactive subscription without a login" {
     const gpa = std.testing.allocator;
     var accounts = testAccounts("sk-ant", true, false);
-    var agent = testAgent(gpa);
+    var agent = testAgent(gpa, .{ .anthropic_api = "sk-ant" });
     defer agent.deinit();
     var context: Context = .{ .gpa = gpa, .agent = &agent, .accounts = &accounts };
 

@@ -94,10 +94,14 @@ pub fn isAuthenticated(self: *const Accounts, account: llm.Account) bool {
     };
 }
 
-/// The first authenticated account in enum order, or null when none is — the
-/// session's active account is chosen this way at startup (there is no configured
-/// active account and no precedence beyond the declaration order).
+/// The first authenticated account, or null when none is — the session's active
+/// account is chosen this way at startup (there is no configured active
+/// account). A stored subscription is preferred over a paid API key, across
+/// vendors; within a tier, enum declaration order decides.
 pub fn firstAuthenticated(self: *const Accounts) ?llm.Account {
+    for (std.enums.values(llm.Account)) |account| {
+        if (account.isSubscription() and self.isAuthenticated(account)) return account;
+    }
     for (std.enums.values(llm.Account)) |account| {
         if (self.isAuthenticated(account)) return account;
     }
@@ -249,6 +253,9 @@ test "isAuthenticated and firstAuthenticated read keys and readiness, subscripti
     // With only API keys, the first authenticated in enum order (anthropic) wins.
     var api_only = testAccounts(.{ .anthropic = "sk-ant", .openai = "sk-openai" }, false, false);
     try std.testing.expectEqual(llm.Account.anthropic_api, api_only.firstAuthenticated().?);
+
+    var cross_vendor = testAccounts(.{ .anthropic = "sk-ant" }, false, true);
+    try std.testing.expectEqual(llm.Account.openai_subscription, cross_vendor.firstAuthenticated().?);
 
     var none = testAccounts(.{}, false, false);
     try std.testing.expect(none.firstAuthenticated() == null);

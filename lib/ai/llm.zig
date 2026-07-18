@@ -9,9 +9,8 @@ const std = @import("std");
 /// subscription — is data held by `provider.Credentials`, not part of the
 /// identity. This is the tag `provider.Client`/`Stream` key on, and the origin
 /// stamped on stored reasoning so only the exact account that produced a blob
-/// replays it. Declaration order is the startup preference — a vendor's
-/// subscription precedes its API key, so a subscription is chosen over a paid key
-/// when both are authenticated.
+/// replays it. At startup any subscription is preferred over any paid API key,
+/// across vendors; within a tier, declaration order decides.
 pub const Account = enum {
     /// Claude Pro/Max subscription OAuth, authorized with a `Bearer` token and
     /// the Claude Code identity headers.

@@ -338,35 +338,9 @@ fn connect(self: *Transport, out: *Stream, body: []const u8) anyerror!void {
     };
     defer if (authorization) |value| self.gpa.free(value);
 
-    // Read the event stream uncompressed on both paths. SSE is consumed one line
-    // at a time as chunks arrive, so a verbatim body keeps event delivery
-    // independent of any decompressor's own buffering.
     const uri = try std.Uri.parse(messages_url);
-    out.request = switch (self.identity) {
-        .subscription => try out.client.request(.POST, uri, .{
-            .headers = .{
-                .content_type = .{ .override = "application/json" },
-                .authorization = .{ .override = authorization.? },
-                .user_agent = .{ .override = user_agent },
-                .accept_encoding = .{ .override = "identity" },
-            },
-            .extra_headers = &.{
-                .{ .name = "anthropic-version", .value = anthropic_version },
-                .{ .name = "anthropic-beta", .value = beta },
-                .{ .name = "x-app", .value = "cli" },
-            },
-        }),
-        .api_key => |key| try out.client.request(.POST, uri, .{
-            .headers = .{
-                .content_type = .{ .override = "application/json" },
-                .accept_encoding = .{ .override = "identity" },
-            },
-            .extra_headers = &.{
-                .{ .name = "x-api-key", .value = key },
-                .{ .name = "anthropic-version", .value = anthropic_version },
-            },
-        }),
-    };
+    var extra: [3]std.http.Header = undefined;
+    out.request = try out.client.request(.POST, uri, requestOptions(self.identity, authorization, &extra));
     errdefer out.request.deinit();
 
     // A cancel during the calls below lands before Agent.run arms its
@@ -389,6 +363,48 @@ fn connect(self: *Transport, out: *Stream, body: []const u8) anyerror!void {
         out.error_length = read;
     }
     out.established = true;
+}
+
+/// The built request's identity fork: the subscription path authorizes with the
+/// OAuth Bearer token and carries the Claude Code identity headers; the API-key
+/// path sends only `x-api-key`. Both request an unencoded response — SSE is
+/// consumed one line at a time as chunks arrive, so a verbatim body keeps event
+/// delivery independent of any decompressor's own buffering. `extra` backs the
+/// returned options and must outlive the request send.
+fn requestOptions(
+    identity: Identity,
+    authorization: ?[]const u8,
+    extra: *[3]std.http.Header,
+) std.http.Client.RequestOptions {
+    switch (identity) {
+        .subscription => {
+            extra.* = .{
+                .{ .name = "anthropic-version", .value = anthropic_version },
+                .{ .name = "anthropic-beta", .value = beta },
+                .{ .name = "x-app", .value = "cli" },
+            };
+            return .{
+                .headers = .{
+                    .content_type = .{ .override = "application/json" },
+                    .authorization = .{ .override = authorization.? },
+                    .user_agent = .{ .override = user_agent },
+                    .accept_encoding = .{ .override = "identity" },
+                },
+                .extra_headers = extra,
+            };
+        },
+        .api_key => |key| {
+            extra[0] = .{ .name = "x-api-key", .value = key };
+            extra[1] = .{ .name = "anthropic-version", .value = anthropic_version };
+            return .{
+                .headers = .{
+                    .content_type = .{ .override = "application/json" },
+                    .accept_encoding = .{ .override = "identity" },
+                },
+                .extra_headers = extra[0..2],
+            };
+        },
+    }
 }
 
 /// Parse the `retry-after` header (whole seconds) into milliseconds; null when
@@ -735,6 +751,34 @@ test "decode ignores a malformed data line instead of failing the turn" {
     ));
 }
 
+test "decode surfaces a streamed error frame" {
+    var stream: Stream = undefined;
+    stream.gpa = std.testing.allocator;
+    stream.parsed = null;
+    stream.terminal_delta = null;
+    stream.usage = .{};
+    defer if (stream.parsed) |parsed| parsed.deinit();
+    defer if (stream.terminal_delta) |terminal_delta| terminal_delta.deinit();
+
+    try std.testing.expectError(error.ApiError, stream.decode(
+        \\{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}
+    ));
+    try std.testing.expectEqualStrings("Overloaded", stream.errorText());
+
+    // A frame without a message falls back to reporting its kind.
+    try std.testing.expectError(error.ApiError, stream.decode(
+        \\{"type":"error","error":{}}
+    ));
+    try std.testing.expectEqualStrings("error", stream.errorText());
+
+    // A message longer than the error buffer is truncated, never out of bounds.
+    const long = "x" ** 600;
+    try std.testing.expectError(error.ApiError, stream.decode(
+        "{\"type\":\"error\",\"error\":{\"message\":\"" ++ long ++ "\"}}",
+    ));
+    try std.testing.expectEqualStrings(long[0..stream.error_buffer.len], stream.errorText());
+}
+
 test "next times out on buffered filler that makes no progress" {
     // A comment line and unrecognized `data:` frames carry no protocol progress,
     // so a stream of only filler must trip the idle window even though every line
@@ -910,6 +954,83 @@ test "next rejects a single frame larger than the stream budget" {
     defer if (stream.terminal_delta) |terminal_delta| terminal_delta.deinit();
 
     try std.testing.expectError(error.StreamResponseTooLarge, stream.next());
+}
+
+fn failedRead(reader: *std.Io.Reader, writer: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+    _ = reader;
+    _ = writer;
+    _ = limit;
+    return error.ReadFailed;
+}
+
+test "a canceled read surfaces as a clean abort, not a network error" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var buffer: [16]u8 = undefined;
+    var reader: std.Io.Reader = .{
+        .vtable = &.{ .stream = failedRead },
+        .buffer = &buffer,
+        .seek = 0,
+        .end = 0,
+    };
+    // The connection records why the read failed: a cancel refines to a clean
+    // abort, any other cause stays on the network-error path.
+    var connection: std.http.Client.Connection = undefined;
+    connection.protocol = .plain;
+    connection.stream_reader.err = error.Canceled;
+    var stream: Stream = undefined;
+    stream.gpa = std.testing.allocator;
+    stream.io = threaded.io();
+    stream.idle_ms = 60_000;
+    stream.budget = .{ .max = net.stream_response_bytes_max };
+    stream.body = &reader;
+    stream.parsed = null;
+    stream.terminal_delta = null;
+    stream.usage = .{};
+    stream.request.connection = &connection;
+
+    try std.testing.expectError(error.Canceled, stream.next());
+    connection.stream_reader.err = error.ConnectionResetByPeer;
+    try std.testing.expectError(error.ReadFailed, stream.next());
+}
+
+test "send leaves the caller owning nothing when connect fails partway" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    // Fail connect's first allocation (the Bearer header), after the client is
+    // already set up: the error surfaces with `established` still false, so
+    // `send` frees nothing the connect errdefers already unwound.
+    var failing: std.testing.FailingAllocator = .init(std.testing.allocator, .{ .fail_index = 0 });
+    var transport: Transport = .{
+        .gpa = failing.allocator(),
+        .io = threaded.io(),
+        .timeouts = .{},
+        .identity = .{ .subscription = "token" },
+    };
+    var stream: Stream = undefined;
+    try std.testing.expectError(error.OutOfMemory, transport.send(&stream, "{}"));
+    try std.testing.expect(!stream.established);
+}
+
+test "requestOptions forks the identity headers by account" {
+    var extra: [3]std.http.Header = undefined;
+    const subscription = requestOptions(.{ .subscription = "tok" }, "Bearer tok", &extra);
+    try std.testing.expectEqualStrings("Bearer tok", subscription.headers.authorization.override);
+    try std.testing.expectEqualStrings(user_agent, subscription.headers.user_agent.override);
+    try std.testing.expectEqualStrings("identity", subscription.headers.accept_encoding.override);
+    try std.testing.expectEqual(@as(usize, 3), subscription.extra_headers.len);
+    try std.testing.expectEqualStrings("anthropic-beta", subscription.extra_headers[1].name);
+    try std.testing.expectEqualStrings(beta, subscription.extra_headers[1].value);
+    try std.testing.expectEqualStrings("x-app", subscription.extra_headers[2].name);
+
+    const keyed = requestOptions(.{ .api_key = "sk-key" }, null, &extra);
+    try std.testing.expect(keyed.headers.authorization == .default);
+    try std.testing.expect(keyed.headers.user_agent == .default);
+    try std.testing.expectEqualStrings("identity", keyed.headers.accept_encoding.override);
+    try std.testing.expectEqual(@as(usize, 2), keyed.extra_headers.len);
+    try std.testing.expectEqualStrings("x-api-key", keyed.extra_headers[0].name);
+    try std.testing.expectEqualStrings("sk-key", keyed.extra_headers[0].value);
+    try std.testing.expectEqualStrings("anthropic-version", keyed.extra_headers[1].name);
 }
 
 test retryAfter {

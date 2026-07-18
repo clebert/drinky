@@ -6,6 +6,7 @@ const std = @import("std");
 const llm = @import("../llm.zig");
 const Context = @import("Context.zig");
 const Result = @import("Result.zig");
+const fs = @import("fs.zig");
 const parse = @import("parse.zig");
 
 const lines_max = 2000;
@@ -118,31 +119,145 @@ test "read of missing file reports an error" {
 }
 
 test "read paginates and points at the next offset" {
-    const context: Context = .{ .gpa = std.testing.allocator, .io = std.testing.io };
-    const result = try run(&context,
-        \\{"path":"build.zig.zon","limit":1}
-    );
-    defer std.testing.allocator.free(result.content);
+    const gpa = std.testing.allocator;
+    const context: Context = .{ .gpa = gpa, .io = std.testing.io };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "f.txt", .data = "one\ntwo\nthree" });
+    var input_buf: [128]u8 = undefined;
+    const input = try std.fmt.bufPrint(&input_buf,
+        \\{{"path":".zig-cache/tmp/{s}/f.txt","limit":1}}
+    , .{tmp.sub_path});
+    const result = try run(&context, input);
+    defer gpa.free(result.content);
     try std.testing.expect(!result.is_error);
+    try std.testing.expect(std.mem.startsWith(u8, result.content, "one\n"));
     try std.testing.expect(std.mem.indexOf(u8, result.content, "use offset=2 to continue") != null);
 }
 
 test "read rejects an offset past the end of the file" {
-    const context: Context = .{ .gpa = std.testing.allocator, .io = std.testing.io };
-    const result = try run(&context,
-        \\{"path":"build.zig.zon","offset":100000}
-    );
-    defer std.testing.allocator.free(result.content);
+    const gpa = std.testing.allocator;
+    const context: Context = .{ .gpa = gpa, .io = std.testing.io };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "f.txt", .data = "one\ntwo" });
+    var input_buf: [128]u8 = undefined;
+    const input = try std.fmt.bufPrint(&input_buf,
+        \\{{"path":".zig-cache/tmp/{s}/f.txt","offset":100000}}
+    , .{tmp.sub_path});
+    const result = try run(&context, input);
+    defer gpa.free(result.content);
     try std.testing.expect(result.is_error);
 }
 
 test "read rejects a zero limit" {
-    const context: Context = .{ .gpa = std.testing.allocator, .io = std.testing.io };
-    const result = try run(&context,
-        \\{"path":"build.zig.zon","limit":0}
-    );
-    defer std.testing.allocator.free(result.content);
+    const gpa = std.testing.allocator;
+    const context: Context = .{ .gpa = gpa, .io = std.testing.io };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "f.txt", .data = "one" });
+    var input_buf: [128]u8 = undefined;
+    const input = try std.fmt.bufPrint(&input_buf,
+        \\{{"path":".zig-cache/tmp/{s}/f.txt","limit":0}}
+    , .{tmp.sub_path});
+    const result = try run(&context, input);
+    defer gpa.free(result.content);
     try std.testing.expect(result.is_error);
+}
+
+test "read rejects a binary or non-UTF-8 file" {
+    const gpa = std.testing.allocator;
+    const context: Context = .{ .gpa = gpa, .io = std.testing.io };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "bin.dat", .data = "a\x00b" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "latin1.txt", .data = "caf\xE9" });
+    for ([_][]const u8{ "bin.dat", "latin1.txt" }) |name| {
+        var input_buf: [128]u8 = undefined;
+        const input = try std.fmt.bufPrint(&input_buf,
+            \\{{"path":".zig-cache/tmp/{s}/{s}"}}
+        , .{ tmp.sub_path, name });
+        const result = try run(&context, input);
+        defer gpa.free(result.content);
+        try std.testing.expect(result.is_error);
+        try std.testing.expect(std.mem.indexOf(u8, result.content, "not a UTF-8 text file") != null);
+    }
+}
+
+test "read rejects an oversized file" {
+    const gpa = std.testing.allocator;
+    const context: Context = .{ .gpa = gpa, .io = std.testing.io };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data = try gpa.alloc(u8, file_bytes_max + 1);
+    defer gpa.free(data);
+    @memset(data, 'a');
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "big.txt", .data = data });
+    var input_buf: [128]u8 = undefined;
+    const input = try std.fmt.bufPrint(&input_buf,
+        \\{{"path":".zig-cache/tmp/{s}/big.txt"}}
+    , .{tmp.sub_path});
+    const result = try run(&context, input);
+    defer gpa.free(result.content);
+    try std.testing.expect(result.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "larger than") != null);
+}
+
+test "read stops at the byte cap with a next-offset hint" {
+    const gpa = std.testing.allocator;
+    const context: Context = .{ .gpa = gpa, .io = std.testing.io };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data = try gpa.alloc(u8, 60 * 1024);
+    defer gpa.free(data);
+    @memset(data, 'x');
+    for (0..60) |i| data[i * 1024 + 1023] = '\n';
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "wide.txt", .data = data });
+    var input_buf: [128]u8 = undefined;
+    const input = try std.fmt.bufPrint(&input_buf,
+        \\{{"path":".zig-cache/tmp/{s}/wide.txt"}}
+    , .{tmp.sub_path});
+    const result = try run(&context, input);
+    defer gpa.free(result.content);
+    try std.testing.expect(!result.is_error);
+    try std.testing.expect(result.content.len <= bytes_max + 128);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "use offset=51 to continue") != null);
+}
+
+test "read truncates to the line cap by default" {
+    const gpa = std.testing.allocator;
+    const context: Context = .{ .gpa = gpa, .io = std.testing.io };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data = try gpa.alloc(u8, (lines_max + 100) * 2);
+    defer gpa.free(data);
+    for (0..lines_max + 100) |i| {
+        data[i * 2] = 'x';
+        data[i * 2 + 1] = '\n';
+    }
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "many.txt", .data = data });
+    var input_buf: [128]u8 = undefined;
+    const input = try std.fmt.bufPrint(&input_buf,
+        \\{{"path":".zig-cache/tmp/{s}/many.txt"}}
+    , .{tmp.sub_path});
+    const result = try run(&context, input);
+    defer gpa.free(result.content);
+    try std.testing.expect(!result.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "use offset=2001 to continue") != null);
+}
+
+test "read cancelled while opening propagates" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "f.txt", .data = "one" });
+    var input_buf: [128]u8 = undefined;
+    const input = try std.fmt.bufPrint(&input_buf,
+        \\{{"path":".zig-cache/tmp/{s}/f.txt"}}
+    , .{tmp.sub_path});
+    var cancel: fs.CancelIo = .init(.file_open);
+    const context: Context = .{ .gpa = gpa, .io = cancel.io() };
+    try std.testing.expectError(error.Canceled, run(&context, input));
 }
 
 test "read truncates a single line longer than the byte cap" {

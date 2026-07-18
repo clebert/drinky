@@ -429,6 +429,17 @@ test "parseTokens rejects a token whose JWT has no expiry" {
     try std.testing.expectError(error.MissingExpiry, parseTokens(gpa, body, .{}));
 }
 
+test "parseTokens skips a crafted expiry that would overflow" {
+    const gpa = std.testing.allocator;
+    // An `exp` near maxInt(i64) must fail cleanly like a missing one, not crash
+    // converting to milliseconds.
+    const access = try makeJwt(gpa, "{\"exp\":9223372036854775807}");
+    defer gpa.free(access);
+    const body = try std.fmt.allocPrint(gpa, "{{\"access_token\":\"{s}\",\"refresh_token\":\"rt\"}}", .{access});
+    defer gpa.free(body);
+    try std.testing.expectError(error.MissingExpiry, parseTokens(gpa, body, .{}));
+}
+
 test "readBody rejects an oversized token response" {
     const gpa = std.testing.allocator;
     const oversized = try gpa.alloc(u8, token_response_bytes_max);

@@ -155,12 +155,30 @@ pub fn setEffort(self: *Agent, effort: llm.Effort) void {
 /// Run one user turn, streaming output through `handler`.
 pub fn run(self: *Agent, user_text: []const u8, handler: anytype) !void {
     if (self.client == null) return error.SignedOut;
+    var fetch: ClientFetch = .{ .client = &self.client.? };
+    return self.runWith(&fetch, user_text, handler);
+}
+
+/// The production fetch: `provider.Client.send` on the active account. `runWith`
+/// takes a fetch pointer like `runToolsWith` takes `Dispatch`, so tests can
+/// script whole turns through this same loop.
+const ClientFetch = struct {
+    client: *provider.Client,
+
+    const Stream = provider.Stream;
+
+    fn send(self: *ClientFetch, stream: *provider.Stream, request: llm.Request) !void {
+        return self.client.send(stream, request);
+    }
+};
+
+fn runWith(self: *Agent, fetch: anytype, user_text: []const u8, handler: anytype) !void {
     const base = self.items.items.len;
     errdefer self.rollback(base);
     try self.appendUser(user_text);
     var round: usize = 0;
     while (round < rounds_max) : (round += 1) {
-        const reply = (try self.fetchReply(handler, base)) orelse return;
+        const reply = (try self.fetchReply(fetch, handler, base)) orelse return;
         const ran_tools = try self.runTools(reply, handler);
         // Fold any mid-turn steering into this turn before the next round; when
         // the model asked for no tools, a steering message keeps the turn going
@@ -198,7 +216,7 @@ fn drainSteering(self: *Agent, handler: anytype) !bool {
 /// left untouched) and `handler.onStreamReset` clears any partial output before
 /// the next attempt. Returns the reply's items (already appended to history), or
 /// null when a non-retryable error was reported and the turn ends.
-fn fetchReply(self: *Agent, handler: anytype, base: usize) !?[]const llm.Item {
+fn fetchReply(self: *Agent, fetch: anytype, handler: anytype, base: usize) !?[]const llm.Item {
     const model = self.model;
     const request: llm.Request = .{
         .model = model.name,
@@ -212,8 +230,8 @@ fn fetchReply(self: *Agent, handler: anytype, base: usize) !?[]const llm.Item {
     var attempt: u32 = 1;
     while (true) : (attempt += 1) {
         if (attempt > 1) try handler.onStreamReset();
-        var stream: provider.Stream = undefined;
-        self.client.?.send(&stream, request) catch |err| {
+        var stream: @TypeOf(fetch.*).Stream = undefined;
+        fetch.send(&stream, request) catch |err| {
             if (retryableError(err) and attempt < self.retry.attempts_max) {
                 try self.backoff(attempt, 0);
                 continue;
@@ -720,10 +738,32 @@ test "usage is attributed to the model that produced it across a switch" {
     try std.testing.expectEqual(@as(u64, 2_000_000), agent.stats.by_model[0].usage.input);
 }
 
+test "cumulative totals stay exact past the per-model bound" {
+    var agent = scriptedAgent(std.testing.allocator);
+    defer agent.deinit();
+
+    // 17 distinct models at $5 per message: the 17th opens no bucket, yet the
+    // session totals and the last-usage gauge still include it.
+    const opus = models.get(.anthropic, "claude-opus-4-8").?;
+    inline for (0..by_model_max + 1) |index| {
+        var model = opus;
+        model.name = std.fmt.comptimePrint("m{d}", .{index});
+        agent.recordUsage(&model, .{ .input = 1_000_000 });
+    }
+    try std.testing.expectEqual(@as(usize, by_model_max), agent.stats.model_count);
+    try std.testing.expectEqualStrings("m15", agent.stats.by_model[by_model_max - 1].name);
+    try std.testing.expectApproxEqAbs(@as(f64, 85), agent.stats.cost, 1e-9);
+    try std.testing.expectEqual(@as(u64, 1_000_000), agent.stats.last.input);
+}
+
 const ScriptedStream = struct {
     events: []const llm.Event,
     index: usize = 0,
     terminal_error: ?anyerror = null,
+    head_ok: bool = true,
+    head_retryable: bool = false,
+    retry_after_ms: ?u64 = null,
+    error_text: []const u8 = "",
 
     fn next(self: *ScriptedStream) !?llm.Event {
         if (self.index == self.events.len) {
@@ -732,6 +772,69 @@ const ScriptedStream = struct {
         }
         defer self.index += 1;
         return self.events[self.index];
+    }
+
+    fn deinit(self: *ScriptedStream) void {
+        _ = self;
+    }
+
+    fn ok(self: *const ScriptedStream) bool {
+        return self.head_ok;
+    }
+
+    fn retryable(self: *const ScriptedStream) bool {
+        return self.head_retryable;
+    }
+
+    fn retryAfterMs(self: *const ScriptedStream) ?u64 {
+        return self.retry_after_ms;
+    }
+
+    fn errorText(self: *const ScriptedStream) []const u8 {
+        return self.error_text;
+    }
+};
+
+// A scripted fetch for `runWith`: each send consumes the next attempt (the last
+// repeats), either failing outright or handing out a fresh copy of its stream.
+const ScriptedFetch = struct {
+    attempts: []const Attempt,
+    sends: usize = 0,
+
+    const Attempt = union(enum) { fail: anyerror, stream: ScriptedStream };
+    const Stream = ScriptedStream;
+
+    fn send(self: *ScriptedFetch, stream: *ScriptedStream, request: llm.Request) !void {
+        _ = request;
+        defer self.sends += 1;
+        switch (self.attempts[@min(self.sends, self.attempts.len - 1)]) {
+            .fail => |err| return err,
+            .stream => |scripted| stream.* = scripted,
+        }
+    }
+};
+
+// An io seam that records each requested sleep in milliseconds and returns at
+// once, so retry backoffs are observable without waiting them out.
+const SleepLog = struct {
+    vtable: std.Io.VTable,
+    slept_ms: [8]u64 = undefined,
+    count: usize = 0,
+
+    fn init(backend: std.Io) SleepLog {
+        var vtable = backend.vtable.*;
+        vtable.sleep = sleep;
+        return .{ .vtable = vtable };
+    }
+
+    fn io(self: *SleepLog) std.Io {
+        return .{ .userdata = self, .vtable = &self.vtable };
+    }
+
+    fn sleep(userdata: ?*anyopaque, timeout: std.Io.Timeout) std.Io.Cancelable!void {
+        const self: *SleepLog = @ptrCast(@alignCast(userdata));
+        self.slept_ms[self.count] = @intCast(timeout.duration.raw.toMilliseconds());
+        self.count += 1;
     }
 };
 
@@ -828,13 +931,30 @@ const CaptureHandler = struct {
     gpa: std.mem.Allocator,
     thinking: std.ArrayList(u8) = .empty,
     text: std.ArrayList(u8) = .empty,
+    errors: std.ArrayList(u8) = .empty,
     usage_count: usize = 0,
     tool_start_count: usize = 0,
     tool_result_count: usize = 0,
+    stream_reset_count: usize = 0,
+    steer_count: usize = 0,
 
     fn deinit(self: *CaptureHandler) void {
         self.thinking.deinit(self.gpa);
         self.text.deinit(self.gpa);
+        self.errors.deinit(self.gpa);
+    }
+
+    fn onStreamReset(self: *CaptureHandler) !void {
+        self.stream_reset_count += 1;
+    }
+
+    fn onError(self: *CaptureHandler, text: []const u8) !void {
+        try self.errors.appendSlice(self.gpa, text);
+    }
+
+    fn onSteering(self: *CaptureHandler, text: []const u8, count: usize) !void {
+        _ = text;
+        self.steer_count += count;
     }
 
     fn onThinking(self: *CaptureHandler, delta: []const u8) !void {
@@ -1269,32 +1389,6 @@ test "readReply commits trailing text after the final tool in stream order" {
     try std.testing.expectEqualStrings("after", reply[1].message.text);
 }
 
-test "readReply threads a stream-assigned reasoning-item id into the item" {
-    const gpa = std.testing.allocator;
-    var agent = scriptedAgent(gpa);
-    defer agent.deinit();
-    var handler: CaptureHandler = .{ .gpa = gpa };
-    defer handler.deinit();
-
-    // Anthropic sends no reasoning id, but the plumbing must carry one when a
-    // provider does (OpenAI's server-assigned `reasoning.id`, replayed under
-    // `store:false`). A scripted stream stands in for that provider.
-    const events = [_]llm.Event{
-        .{ .thinking = .{ .id = "rs_1", .text = "hmm" } },
-        .{ .thinking_blob = .{ .id = "rs_1", .blob = "enc" } },
-        .{ .text = "done" },
-        .{ .stop = .{ .reason = "end_turn", .usage = .{} } },
-    };
-    var stream: ScriptedStream = .{ .events = &events };
-
-    const reply = try agent.readReply(&agent.model, &stream, &handler);
-    try std.testing.expectEqual(@as(usize, 2), reply.len);
-    try std.testing.expectEqualStrings("rs_1", reply[0].reasoning.id);
-    try std.testing.expectEqualStrings("hmm", reply[0].reasoning.text);
-    try std.testing.expectEqualStrings("enc", reply[0].reasoning.blob);
-    try std.testing.expectEqualStrings("done", reply[1].message.text);
-}
-
 test "readReply keeps adjacent reasoning runs as separate items in stream order" {
     const gpa = std.testing.allocator;
     var agent = scriptedAgent(gpa);
@@ -1334,16 +1428,12 @@ test "readReply keeps adjacent reasoning runs as separate items in stream order"
     try std.testing.expectEqualStrings("t1", reply[4].tool_call.call_id);
 }
 
-test "readReply tags reasoning with the active provider as origin" {
+test "readReply tags reasoning with the active provider as origin, threading its id" {
     const gpa = std.testing.allocator;
     // An openai-backed agent must stamp its reasoning items with its own account,
-    // not an Anthropic one, or the openai serializer would drop them as foreign.
-    const client = provider.Client.init(gpa, std.testing.io, .{ .openai_api = "sk-test" }, .{});
-    var agent = Agent.init(gpa, std.testing.io, client, .{
-        .model = models.get(.openai, "gpt-5.6-sol").?,
-        .system = "",
-        .retry = .{},
-    });
+    // not an Anthropic one, or the openai serializer would drop them as foreign;
+    // the server-assigned reasoning id must ride along for replay.
+    var agent = openaiScriptedAgent(gpa);
     defer agent.deinit();
     var handler: CaptureHandler = .{ .gpa = gpa };
     defer handler.deinit();
@@ -1356,8 +1446,12 @@ test "readReply tags reasoning with the active provider as origin" {
     };
     var stream: ScriptedStream = .{ .events = &events };
     const reply = try agent.readReply(&agent.model, &stream, &handler);
+    try std.testing.expectEqual(@as(usize, 2), reply.len);
     try std.testing.expectEqual(llm.Account.openai_api, reply[0].reasoning.origin);
     try std.testing.expectEqualStrings("rs_1", reply[0].reasoning.id);
+    try std.testing.expectEqualStrings("hmm", reply[0].reasoning.text);
+    try std.testing.expectEqualStrings("enc", reply[0].reasoning.blob);
+    try std.testing.expectEqualStrings("done", reply[1].message.text);
 }
 
 // A scheduling seam that wraps a real threaded executor to observe tool ordering.
@@ -1545,4 +1639,174 @@ fn runToolsUnderOom(allocator: std.mem.Allocator) !void {
 
 test "runTools frees partial work at every allocation-failure point" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, runToolsUnderOom, .{});
+}
+
+const tool_round_events = [_]llm.Event{
+    .{ .tool_use = .{ .call_id = "t1", .name = "write" } },
+    .{ .input_json = "{}" },
+    .{ .stop = .{ .reason = "tool_use", .usage = .{} } },
+};
+
+const end_turn_events = [_]llm.Event{
+    .{ .text = "hi" },
+    .{ .stop = .{ .reason = "end_turn", .usage = .{} } },
+};
+
+test "run fails cleanly on round-bound overrun with the turn rolled back" {
+    const gpa = std.testing.allocator;
+    var agent = scriptedAgent(gpa);
+    defer agent.deinit();
+    var handler: CaptureHandler = .{ .gpa = gpa };
+    defer handler.deinit();
+
+    // A model that asks for a tool every round overruns the bound after exactly
+    // `rounds_max` rounds; the whole turn (user message included) is dropped.
+    var fetch: ScriptedFetch = .{ .attempts = &.{.{ .stream = .{ .events = &tool_round_events } }} };
+    try std.testing.expectError(error.TooManyToolRounds, agent.runWith(&fetch, "go", &handler));
+    try std.testing.expectEqual(@as(usize, rounds_max), fetch.sends);
+    try std.testing.expectEqual(@as(usize, rounds_max), handler.tool_result_count);
+    try std.testing.expectEqual(@as(usize, 0), agent.items.items.len);
+}
+
+test "run commits a no-tool reply and ends the turn" {
+    const gpa = std.testing.allocator;
+    var agent = scriptedAgent(gpa);
+    defer agent.deinit();
+    var handler: CaptureHandler = .{ .gpa = gpa };
+    defer handler.deinit();
+
+    var fetch: ScriptedFetch = .{ .attempts = &.{.{ .stream = .{ .events = &end_turn_events } }} };
+    try agent.runWith(&fetch, "go", &handler);
+    try std.testing.expectEqual(@as(usize, 1), fetch.sends);
+    try std.testing.expectEqual(@as(usize, 2), agent.items.items.len);
+    try std.testing.expectEqualStrings("go", agent.items.items[0].message.text);
+    try std.testing.expectEqualStrings("hi", agent.items.items[1].message.text);
+    try std.testing.expectEqual(llm.Role.assistant, agent.items.items[1].message.role);
+}
+
+test "run retries transient failures, resetting the stream before each reattempt" {
+    const gpa = std.testing.allocator;
+    var log: SleepLog = .init(std.testing.io);
+    var agent = scriptedAgent(gpa);
+    agent.io = log.io();
+    defer agent.deinit();
+    var handler: CaptureHandler = .{ .gpa = gpa };
+    defer handler.deinit();
+
+    // attempts_max is 3: a connect failure, a mid-stream failure, then success.
+    var fetch: ScriptedFetch = .{ .attempts = &.{
+        .{ .fail = error.ConnectionRefused },
+        .{ .stream = .{ .events = &.{}, .terminal_error = error.Timeout } },
+        .{ .stream = .{ .events = &end_turn_events } },
+    } };
+    try agent.runWith(&fetch, "go", &handler);
+    try std.testing.expectEqual(@as(usize, 3), fetch.sends);
+    try std.testing.expectEqual(@as(usize, 2), handler.stream_reset_count);
+    try std.testing.expectEqual(@as(usize, 2), agent.items.items.len);
+    try std.testing.expectEqualStrings("hi", agent.items.items[1].message.text);
+    try std.testing.expectEqualStrings("hi", handler.text.items);
+}
+
+test "run surfaces the failure once the attempt bound is exhausted" {
+    const gpa = std.testing.allocator;
+    var log: SleepLog = .init(std.testing.io);
+    var agent = scriptedAgent(gpa);
+    agent.io = log.io();
+    defer agent.deinit();
+    var handler: CaptureHandler = .{ .gpa = gpa };
+    defer handler.deinit();
+
+    var fetch: ScriptedFetch = .{ .attempts = &.{.{ .fail = error.Timeout }} };
+    try std.testing.expectError(error.Timeout, agent.runWith(&fetch, "go", &handler));
+    try std.testing.expectEqual(@as(usize, 3), fetch.sends);
+    try std.testing.expectEqual(@as(usize, 2), handler.stream_reset_count);
+    try std.testing.expectEqual(@as(usize, 0), agent.items.items.len);
+}
+
+test "a retryable head's retry-after hint reaches backoff" {
+    const gpa = std.testing.allocator;
+    var log: SleepLog = .init(std.testing.io);
+    var agent = scriptedAgent(gpa);
+    agent.io = log.io();
+    defer agent.deinit();
+    var handler: CaptureHandler = .{ .gpa = gpa };
+    defer handler.deinit();
+
+    // Without the hint the first backoff would be backoff_ms_initial (500ms).
+    var fetch: ScriptedFetch = .{ .attempts = &.{
+        .{ .stream = .{ .events = &.{}, .head_ok = false, .head_retryable = true, .retry_after_ms = 5000 } },
+        .{ .stream = .{ .events = &end_turn_events } },
+    } };
+    try agent.runWith(&fetch, "go", &handler);
+    try std.testing.expectEqual(@as(usize, 1), log.count);
+    try std.testing.expectEqual(@as(u64, 5000), log.slept_ms[0]);
+    try std.testing.expectEqual(@as(usize, 1), handler.stream_reset_count);
+    try std.testing.expectEqualStrings("hi", handler.text.items);
+}
+
+test "a mid-stream cancel propagates without a retry" {
+    const gpa = std.testing.allocator;
+    var agent = scriptedAgent(gpa);
+    defer agent.deinit();
+    var handler: CaptureHandler = .{ .gpa = gpa };
+    defer handler.deinit();
+
+    var fetch: ScriptedFetch = .{
+        .attempts = &.{.{ .stream = .{ .events = &.{}, .terminal_error = error.Canceled } }},
+    };
+    try std.testing.expectError(error.Canceled, agent.runWith(&fetch, "go", &handler));
+    try std.testing.expectEqual(@as(usize, 1), fetch.sends);
+    try std.testing.expectEqual(@as(usize, 0), handler.stream_reset_count);
+    try std.testing.expectEqual(@as(usize, 0), agent.items.items.len);
+}
+
+test "an API error reports onError, rolls the turn back, and ends it cleanly" {
+    const gpa = std.testing.allocator;
+    var agent = scriptedAgent(gpa);
+    defer agent.deinit();
+    var handler: CaptureHandler = .{ .gpa = gpa };
+    defer handler.deinit();
+
+    // A committed tool round, then an API error frame: the whole turn unwinds.
+    var fetch: ScriptedFetch = .{ .attempts = &.{
+        .{ .stream = .{ .events = &tool_round_events } },
+        .{ .stream = .{ .events = &.{}, .terminal_error = error.ApiError, .error_text = "boom" } },
+    } };
+    try agent.runWith(&fetch, "go", &handler);
+    try std.testing.expectEqualStrings("boom", handler.errors.items);
+    try std.testing.expectEqual(@as(usize, 0), agent.items.items.len);
+
+    // A failed non-retryable head takes the same clean-abort path.
+    var head_fetch: ScriptedFetch = .{
+        .attempts = &.{.{ .stream = .{ .events = &.{}, .head_ok = false, .error_text = "denied" } }},
+    };
+    try agent.runWith(&head_fetch, "go", &handler);
+    try std.testing.expectEqual(@as(usize, 1), head_fetch.sends);
+    try std.testing.expectEqualStrings("boomdenied", handler.errors.items);
+    try std.testing.expectEqual(@as(usize, 0), agent.items.items.len);
+}
+
+test "steering queued when the model would stop keeps the turn alive" {
+    const gpa = std.testing.allocator;
+    var agent = scriptedAgent(gpa);
+    defer agent.deinit();
+    var handler: CaptureHandler = .{ .gpa = gpa };
+    defer handler.deinit();
+
+    const second_events = [_]llm.Event{
+        .{ .text = "more" },
+        .{ .stop = .{ .reason = "end_turn", .usage = .{} } },
+    };
+    var fetch: ScriptedFetch = .{ .attempts = &.{
+        .{ .stream = .{ .events = &end_turn_events } },
+        .{ .stream = .{ .events = &second_events } },
+    } };
+    try agent.steering.push("steer");
+    try agent.runWith(&fetch, "go", &handler);
+    try std.testing.expectEqual(@as(usize, 2), fetch.sends);
+    try std.testing.expectEqual(@as(usize, 1), handler.steer_count);
+    try std.testing.expectEqual(@as(usize, 4), agent.items.items.len);
+    try std.testing.expectEqual(llm.Role.user, agent.items.items[2].message.role);
+    try std.testing.expectEqualStrings("steer", agent.items.items[2].message.text);
+    try std.testing.expectEqualStrings("more", agent.items.items[3].message.text);
 }

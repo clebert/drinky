@@ -304,6 +304,49 @@ test "save replaces the file atomically at owner-only permissions" {
     try std.testing.expectEqualStrings("at", file.entry("anthropic_subscription").?.get("access").?.string);
 }
 
+test "remove drops only its key on disk, and a missing file opens as null" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/auth.json", .{tmp.sub_path});
+    const entry: TestEntry = .{ .access = "at", .refresh = "rt", .expires_ms = 1 };
+
+    try std.testing.expect((try open(gpa, io, path)) == null);
+
+    try save(gpa, io, path, "openai_subscription", entry);
+    try save(gpa, io, path, "anthropic_subscription", entry);
+    try remove(gpa, io, path, "openai_subscription");
+
+    var file = (try open(gpa, io, path)).?;
+    defer file.deinit();
+    try std.testing.expect(file.entry("openai_subscription") == null);
+    try std.testing.expectEqualStrings("at", file.entry("anthropic_subscription").?.get("access").?.string);
+}
+
+test "save and remove refuse a corrupt file, leaving it intact on disk" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/auth.json", .{tmp.sub_path});
+    const entry: TestEntry = .{ .access = "at", .refresh = "rt", .expires_ms = 1 };
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "auth.json", .data = "{ not json" });
+    try std.testing.expectError(error.BadCredentials, save(gpa, io, path, "openai_subscription", entry));
+    try std.testing.expectError(error.BadCredentials, remove(gpa, io, path, "openai_subscription"));
+
+    const data = try tmp.dir.readFileAlloc(io, "auth.json", gpa, .unlimited);
+    defer gpa.free(data);
+    try std.testing.expectEqualStrings("{ not json", data);
+}
+
 test "serializeWithout errors on a corrupt file" {
     const gpa = std.testing.allocator;
 

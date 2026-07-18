@@ -87,6 +87,58 @@ test applyEdit {
     try std.testing.expectError(error.EmptyOldText, applyEdit(gpa, .{ .data = "abc", .old = "", .new = "y" }));
 }
 
+test "edit rewrites the file on disk" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const context: Context = .{ .gpa = gpa, .io = io };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "f.txt", .data = "one two three" });
+    var input_buf: [160]u8 = undefined;
+    const input = try std.fmt.bufPrint(&input_buf,
+        \\{{"path":".zig-cache/tmp/{s}/f.txt","old_text":"two","new_text":"2"}}
+    , .{tmp.sub_path});
+    const result = try run(&context, input);
+    defer gpa.free(result.content);
+    try std.testing.expect(!result.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "edited") != null);
+    const data = try tmp.dir.readFileAlloc(io, "f.txt", gpa, .limited(64));
+    defer gpa.free(data);
+    try std.testing.expectEqualStrings("one 2 three", data);
+}
+
+test "edit cancelled while reading propagates" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "f.txt", .data = "one two three" });
+    var input_buf: [160]u8 = undefined;
+    const input = try std.fmt.bufPrint(&input_buf,
+        \\{{"path":".zig-cache/tmp/{s}/f.txt","old_text":"two","new_text":"2"}}
+    , .{tmp.sub_path});
+    var cancel: fs.CancelIo = .init(.file_open);
+    const context: Context = .{ .gpa = gpa, .io = cancel.io() };
+    try std.testing.expectError(error.Canceled, run(&context, input));
+}
+
+test "edit cancelled mid-write propagates and leaves the file untouched" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "f.txt", .data = "one two three" });
+    var input_buf: [160]u8 = undefined;
+    const input = try std.fmt.bufPrint(&input_buf,
+        \\{{"path":".zig-cache/tmp/{s}/f.txt","old_text":"two","new_text":"2"}}
+    , .{tmp.sub_path});
+    var cancel: fs.CancelIo = .init(.file_write);
+    const context: Context = .{ .gpa = gpa, .io = cancel.io() };
+    try std.testing.expectError(error.Canceled, run(&context, input));
+    const data = try tmp.dir.readFileAlloc(io, "f.txt", gpa, .limited(64));
+    defer gpa.free(data);
+    try std.testing.expectEqualStrings("one two three", data);
+}
+
 test "edit rejects an oversized file" {
     const gpa = std.testing.allocator;
     const context: Context = .{ .gpa = gpa, .io = std.testing.io };

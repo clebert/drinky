@@ -66,11 +66,56 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
 }
 
 test "find matches files by glob under a directory" {
-    const context: Context = .{ .gpa = std.testing.allocator, .io = std.testing.io };
-    const result = try run(&context,
-        \\{"pattern":"**/glob.zig","path":"lib"}
-    );
-    defer std.testing.allocator.free(result.content);
+    const gpa = std.testing.allocator;
+    const context: Context = .{ .gpa = gpa, .io = std.testing.io };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "a.zig", .data = "" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "b.txt", .data = "" });
+    var input_buf: [128]u8 = undefined;
+    const input = try std.fmt.bufPrint(&input_buf,
+        \\{{"pattern":"**/*.zig","path":".zig-cache/tmp/{s}"}}
+    , .{tmp.sub_path});
+    const result = try run(&context, input);
+    defer gpa.free(result.content);
     try std.testing.expect(!result.is_error);
-    try std.testing.expectEqualStrings("lib/ai/tool/glob.zig", result.content);
+    var expected_buf: [128]u8 = undefined;
+    const expected = try std.fmt.bufPrint(&expected_buf, ".zig-cache/tmp/{s}/a.zig", .{tmp.sub_path});
+    try std.testing.expectEqualStrings(expected, result.content);
+}
+
+test "find reports how many more matched beyond the limit" {
+    const gpa = std.testing.allocator;
+    const context: Context = .{ .gpa = gpa, .io = std.testing.io };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_][]const u8{ "a.txt", "b.txt", "c.txt" }) |name| {
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = name, .data = "" });
+    }
+    var input_buf: [128]u8 = undefined;
+    const input = try std.fmt.bufPrint(&input_buf,
+        \\{{"pattern":"*.txt","path":".zig-cache/tmp/{s}","limit":1}}
+    , .{tmp.sub_path});
+    const result = try run(&context, input);
+    defer gpa.free(result.content);
+    try std.testing.expect(!result.is_error);
+    var expected_buf: [128]u8 = undefined;
+    const expected = try std.fmt.bufPrint(&expected_buf, ".zig-cache/tmp/{s}/a.txt\n... 2 more (raise limit to see them)", .{tmp.sub_path});
+    try std.testing.expectEqualStrings(expected, result.content);
+}
+
+test "find reports when no files match" {
+    const gpa = std.testing.allocator;
+    const context: Context = .{ .gpa = gpa, .io = std.testing.io };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "a.txt", .data = "" });
+    var input_buf: [128]u8 = undefined;
+    const input = try std.fmt.bufPrint(&input_buf,
+        \\{{"pattern":"*.md","path":".zig-cache/tmp/{s}"}}
+    , .{tmp.sub_path});
+    const result = try run(&context, input);
+    defer gpa.free(result.content);
+    try std.testing.expect(!result.is_error);
+    try std.testing.expectEqualStrings("no files match *.md", result.content);
 }

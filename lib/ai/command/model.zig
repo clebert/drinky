@@ -83,22 +83,22 @@ fn collect(accounts: *const Accounts, out: *std.ArrayList(Combo), gpa: std.mem.A
     }
 }
 
-fn apiAccounts(gpa: std.mem.Allocator) Accounts {
+fn testAccounts(keys: Accounts.ApiKeys, anthropic_ready: bool) Accounts {
     return .{
-        .gpa = gpa,
+        .gpa = std.testing.allocator,
         .io = std.testing.io,
         .timeouts = .{},
         .anthropic_auth = undefined,
         .openai_auth = undefined,
-        .keys = .{ .anthropic = "sk-ant", .openai = "sk-openai" },
-        .anthropic_subscription_ready = false,
+        .keys = keys,
+        .anthropic_subscription_ready = anthropic_ready,
         .openai_subscription_ready = false,
         .openai_subscription_context_windows = .empty,
     };
 }
 
-fn apiAgent(gpa: std.mem.Allocator) Agent {
-    const client = provider.Client.init(gpa, std.testing.io, .{ .anthropic_api = "sk-ant" }, .{});
+fn testAgent(gpa: std.mem.Allocator, credentials: provider.Credentials) Agent {
+    const client = provider.Client.init(gpa, std.testing.io, credentials, .{});
     return Agent.init(gpa, std.testing.io, client, .{
         .model = models.get(.anthropic, "claude-sonnet-4-6").?,
         .system = "",
@@ -108,8 +108,8 @@ fn apiAgent(gpa: std.mem.Allocator) Agent {
 
 test "the picker lists every authenticated account's models, marking the active one" {
     const gpa = std.testing.allocator;
-    var accounts = apiAccounts(gpa);
-    var agent = apiAgent(gpa);
+    var accounts = testAccounts(.{ .anthropic = "sk-ant", .openai = "sk-openai" }, false);
+    var agent = testAgent(gpa, .{ .anthropic_api = "sk-ant" });
     defer agent.deinit();
     var context: Context = .{ .gpa = gpa, .agent = &agent, .accounts = &accounts };
 
@@ -132,8 +132,8 @@ test "the picker lists every authenticated account's models, marking the active 
 
 test "select switches to the chosen account and model" {
     const gpa = std.testing.allocator;
-    var accounts = apiAccounts(gpa);
-    var agent = apiAgent(gpa);
+    var accounts = testAccounts(.{ .anthropic = "sk-ant", .openai = "sk-openai" }, false);
+    var agent = testAgent(gpa, .{ .anthropic_api = "sk-ant" });
     defer agent.deinit();
     var context: Context = .{ .gpa = gpa, .agent = &agent, .accounts = &accounts };
 
@@ -157,4 +157,58 @@ test "select switches to the chosen account and model" {
         else => return error.ExpectedFeedback,
     }
     try std.testing.expectEqualStrings("gpt-5.6-sol", agent.model.name);
+}
+
+test "no authenticated accounts reports an error instead of a picker" {
+    const gpa = std.testing.allocator;
+    var accounts = testAccounts(.{}, false);
+    var context: Context = .{ .gpa = gpa, .agent = undefined, .accounts = &accounts };
+
+    switch (try run(&context, "")) {
+        .feedback => |feedback| {
+            defer gpa.free(feedback.content);
+            try std.testing.expect(feedback.is_error);
+        },
+        else => return error.ExpectedFeedback,
+    }
+}
+
+test "the active mark matches the account, not just the model name" {
+    const gpa = std.testing.allocator;
+    // Both anthropic accounts are authenticated, so every model name appears
+    // twice; the mark must land on the active subscription's row.
+    var accounts = testAccounts(.{ .anthropic = "sk-ant" }, true);
+    var agent = testAgent(gpa, .{ .anthropic_subscription = undefined });
+    defer agent.deinit();
+    var context: Context = .{ .gpa = gpa, .agent = &agent, .accounts = &accounts };
+
+    switch (try run(&context, "")) {
+        .pick => |pick| {
+            defer {
+                for (pick.options) |option| gpa.free(option);
+                gpa.free(pick.options);
+            }
+            try std.testing.expectEqualStrings("claude-sonnet-4-6 (anthropic subscription)", pick.options[pick.current.?]);
+        },
+        else => return error.ExpectedPick,
+    }
+}
+
+fn runUnderOom(gpa: std.mem.Allocator) !void {
+    var accounts = testAccounts(.{ .anthropic = "sk-ant", .openai = "sk-openai" }, false);
+    var agent = testAgent(gpa, .{ .anthropic_api = "sk-ant" });
+    defer agent.deinit();
+    var context: Context = .{ .gpa = gpa, .agent = &agent, .accounts = &accounts };
+
+    switch (try run(&context, "")) {
+        .pick => |pick| {
+            for (pick.options) |option| gpa.free(option);
+            gpa.free(pick.options);
+        },
+        else => return error.ExpectedPick,
+    }
+}
+
+test "a failed picker build frees every partial allocation" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, runUnderOom, .{});
 }

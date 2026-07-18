@@ -336,6 +336,33 @@ fn expectSetupFailure(
     );
 }
 
+test "read maps a timeout to null and a closed input to end of stream" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var tty: Tty = undefined;
+    tty.io = threaded.io();
+    const fds = try std.Io.Threaded.pipe2(.{ .CLOEXEC = true });
+    defer _ = std.posix.system.close(fds[0]);
+    tty.in_handle = fds[0];
+    var buffer: [8]u8 = undefined;
+    const timeout: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(5), .clock = .awake } };
+    try std.testing.expectEqual(@as(?usize, null), try tty.read(&buffer, timeout));
+    _ = std.posix.system.write(fds[1], "x", 1);
+    try std.testing.expectEqual(@as(?usize, 1), try tty.read(&buffer, .none));
+    _ = std.posix.system.close(fds[1]);
+    try std.testing.expectError(error.EndOfStream, tty.read(&buffer, .none));
+}
+
+test "size reports absence on a handle that is not a terminal" {
+    const fds = try std.Io.Threaded.pipe2(.{ .CLOEXEC = true });
+    defer for (fds) |handle| {
+        _ = std.posix.system.close(handle);
+    };
+    var tty: Tty = undefined;
+    tty.out_handle = fds[1];
+    try std.testing.expectEqual(@as(?Size, null), tty.size());
+}
+
 test "setup failure restores cooked mode and only reverses attempted terminal modes" {
     try expectSetupFailure(
         &.{ .paste_set, .paste_reset, .flush },

@@ -81,3 +81,21 @@ pub fn wait(self: *Resize, io: std.Io) !void {
     } }, .none);
     _ = try result.file_read_streaming;
 }
+
+test "a sigwinch wakes wait and deinit restores the prior disposition" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var before: std.posix.Sigaction = undefined;
+    std.posix.sigaction(.WINCH, null, &before);
+    var resize: Resize = undefined;
+    try resize.init();
+    try std.posix.raise(.WINCH);
+    try std.posix.raise(.WINCH);
+    try resize.wait(io);
+    resize.deinit();
+    var after: std.posix.Sigaction = undefined;
+    std.posix.sigaction(.WINCH, null, &after);
+    try std.testing.expectEqual(before.handler.handler, after.handler.handler);
+    try std.posix.raise(.WINCH);
+}

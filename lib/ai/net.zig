@@ -249,6 +249,10 @@ fn slowWork(io: std.Io) anyerror!u64 {
     return 0;
 }
 
+fn timedSlowWork(io: std.Io) anyerror!u64 {
+    return withTimeout(io, 60_000, slowWork, .{io});
+}
+
 test "withTimeout returns the result when the operation wins" {
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();
@@ -261,6 +265,15 @@ test "withTimeout times out and reaps a stalled operation" {
     defer threaded.deinit();
     const io = threaded.io();
     try std.testing.expectError(error.Timeout, withTimeout(io, 20, slowWork, .{io}));
+}
+
+test "withTimeout propagates a caller cancel as Canceled, not Timeout" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var future = try io.concurrent(timedSlowWork, .{io});
+    try io.sleep(.fromMilliseconds(10), .awake);
+    try std.testing.expectError(error.Canceled, future.cancel(io));
 }
 
 test "Deadline with a zero timeout is unbounded" {

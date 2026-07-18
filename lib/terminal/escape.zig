@@ -48,3 +48,16 @@ pub fn cursorForward(writer: *std.Io.Writer, count: usize) !void {
     if (count == 0) return;
     try writer.print("\x1b[{d}C", .{count});
 }
+
+test "cursor motion emits nothing at zero" {
+    var buffer: [16]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    try cursorUp(&writer, 0);
+    try cursorDown(&writer, 0);
+    try cursorForward(&writer, 0);
+    try std.testing.expectEqualStrings("", writer.buffered());
+    try cursorUp(&writer, 2);
+    try cursorDown(&writer, 3);
+    try cursorForward(&writer, 4);
+    try std.testing.expectEqualStrings("\x1b[2A\x1b[3B\x1b[4C", writer.buffered());
+}

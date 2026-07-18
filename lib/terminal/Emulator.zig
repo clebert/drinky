@@ -88,14 +88,16 @@ fn csi(self: *Emulator, sequence: []const u8) !usize {
     if (index >= sequence.len) return sequence.len;
     const params = sequence[2..index];
     switch (sequence[index]) {
+        // A real terminal treats an explicit 0 count as 1, so an emitted `\x1b[0A`
+        // moves here too instead of masking a missing zero guard in `escape`.
         'A' => {
             std.debug.assert(self.cursor_row >= self.screen_top);
-            self.cursor_row -= @min(csiValue(params, 1), self.cursor_row - self.screen_top);
+            self.cursor_row -= @min(@max(csiValue(params, 1), 1), self.cursor_row - self.screen_top);
         },
         // CUD clamps at the bottom row; it never scrolls or grows the document.
-        'B' => self.cursor_row = @min(self.cursor_row + csiValue(params, 1), self.document.items.len - 1),
+        'B' => self.cursor_row = @min(self.cursor_row + @max(csiValue(params, 1), 1), self.document.items.len - 1),
         // CUF clamps at the right margin; it cannot reach a pending-wrap cell.
-        'C' => self.cursor_column = @min(self.cursor_column + csiValue(params, 1), self.columns - 1),
+        'C' => self.cursor_column = @min(self.cursor_column + @max(csiValue(params, 1), 1), self.columns - 1),
         'H' => {
             self.cursor_row = self.screen_top;
             self.cursor_column = 0;

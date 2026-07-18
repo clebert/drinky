@@ -252,4 +252,5 @@ test "EffortMap.resolve maps every level, none included, to the model's outcome"
     try std.testing.expectEqualStrings("xhigh", get(.anthropic, "claude-sonnet-5").?.effort.resolve(.xhigh).?);
     try std.testing.expectEqualStrings("high", get(.anthropic, "claude-sonnet-4-6").?.effort.resolve(.xhigh).?);
     try std.testing.expectEqualStrings("max", get(.anthropic, "claude-sonnet-4-6").?.effort.resolve(.max).?);
+    try std.testing.expectEqualStrings("none", get(.openai, "gpt-5.6-sol").?.effort.resolve(.none).?);
 }

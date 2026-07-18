@@ -839,6 +839,88 @@ test "next rejects a single frame larger than the stream budget" {
     try std.testing.expectError(error.StreamResponseTooLarge, stream.next());
 }
 
+test "next ends the byte stream at a [DONE] sentinel" {
+    // The sentinel only ends the byte stream: whatever trails it is never
+    // decoded, so a deployment closing with [DONE] cannot fail the turn.
+    const body =
+        "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"m1\",\"delta\":\"hi\"}\n" ++
+        "data: [DONE]\n" ++
+        "data: not json\n";
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var reader: std.Io.Reader = .fixed(body);
+    var stream: Stream = undefined;
+    stream.gpa = std.testing.allocator;
+    stream.io = threaded.io();
+    stream.idle_ms = 60_000;
+    stream.budget = .{ .max = net.stream_response_bytes_max };
+    stream.body = &reader;
+    stream.parsed = null;
+    stream.usage = .{};
+    defer if (stream.parsed) |parsed| parsed.deinit();
+
+    try std.testing.expectEqualStrings("hi", (try stream.next()).?.text);
+    try std.testing.expectEqual(@as(?llm.Event, null), try stream.next());
+}
+
+fn failRead(_: *std.Io.Reader, _: *std.Io.Writer, _: std.Io.Limit) std.Io.Reader.StreamError!usize {
+    return error.ReadFailed;
+}
+
+test "next refines a canceled connection read into a clean abort" {
+    // The reply reader fails at the wire; the connection's recorded read error
+    // decides whether that is a user cancel or a genuine network fault.
+    var buffer: [16]u8 = undefined;
+    var reader: std.Io.Reader = .{
+        .vtable = &.{ .stream = failRead },
+        .buffer = &buffer,
+        .seek = 0,
+        .end = 0,
+    };
+    var connection: std.http.Client.Connection = undefined;
+    connection.protocol = .plain;
+    connection.stream_reader.err = error.Canceled;
+    var stream: Stream = undefined;
+    stream.gpa = std.testing.allocator;
+    stream.idle_ms = 0;
+    stream.budget = .{ .max = net.stream_response_bytes_max };
+    stream.body = &reader;
+    stream.request.connection = &connection;
+    stream.parsed = null;
+    stream.usage = .{};
+
+    try std.testing.expectError(error.Canceled, stream.next());
+    connection.stream_reader.err = error.ConnectionResetByPeer;
+    try std.testing.expectError(error.ReadFailed, stream.next());
+}
+
+test "send tears down a request that times out awaiting the response head" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    // The listener accepts the connection but never answers, so the connect
+    // phase stalls in its head read until the timer wins the race. The testing
+    // allocator proves the reaped request leaked nothing.
+    var address: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try address.listen(io, .{});
+    defer server.deinit(io);
+    const endpoint = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "http://127.0.0.1:{d}/v1/responses",
+        .{server.socket.address.getPort()},
+    );
+    defer std.testing.allocator.free(endpoint);
+    var transport: Transport = .{
+        .gpa = std.testing.allocator,
+        .io = io,
+        .timeouts = .{ .connect_ms = 50 },
+        .endpoint = endpoint,
+        .account_id = "",
+    };
+    var stream: Stream = undefined;
+    try std.testing.expectError(error.Timeout, transport.send(&stream, "{}", "token"));
+}
+
 test "next surfaces a stream truncated mid data-line as a retryable premature end" {
     // The final chunk ends inside a `data:` frame; the truncated JSON must take
     // the retryable premature-stream-end path, not a fatal parse error.

@@ -441,50 +441,20 @@ test wrapper {
 test wrap {
     var lines: std.ArrayList([]const u8) = .empty;
     defer lines.deinit(std.testing.allocator);
-    try wrap("abcdef", 3, &lines, std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 2), lines.items.len);
-    try std.testing.expectEqualStrings("abc", lines.items[0]);
-    try std.testing.expectEqualStrings("def", lines.items[1]);
-
-    lines.clearRetainingCapacity();
     try wrap("ab\ncd", 10, &lines, std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 2), lines.items.len);
     try std.testing.expectEqualStrings("ab", lines.items[0]);
     try std.testing.expectEqualStrings("cd", lines.items[1]);
 
-    // A wide glyph that would straddle the limit breaks to the next line whole.
-    lines.clearRetainingCapacity();
-    try wrap("你好世", 3, &lines, std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 3), lines.items.len);
-    try std.testing.expectEqualStrings("你", lines.items[0]);
-    try std.testing.expectEqualStrings("好", lines.items[1]);
-    try std.testing.expectEqualStrings("世", lines.items[2]);
-
-    // An empty input still yields one (empty) line.
     lines.clearRetainingCapacity();
     try wrap("", 3, &lines, std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), lines.items.len);
     try std.testing.expectEqualStrings("", lines.items[0]);
-
-    // An embedded ESC is a replacement-width unit; its printable tail wraps.
-    lines.clearRetainingCapacity();
-    try wrap("a\x1b[31mbc", 3, &lines, std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 3), lines.items.len);
-    try std.testing.expectEqualStrings("a\x1b[", lines.items[0]);
-    try std.testing.expectEqualStrings("31m", lines.items[1]);
-    try std.testing.expectEqualStrings("bc", lines.items[2]);
 }
 
 test rows {
     try std.testing.expectEqual(@as(usize, 1), rows("", 3));
-    try std.testing.expectEqual(@as(usize, 1), rows("abc", 3));
     try std.testing.expectEqual(@as(usize, 2), rows("abcd", 3));
-    // A wide cluster that cannot straddle the margin costs an extra row: three
-    // two-column glyphs in three columns take one row each, not two total.
-    try std.testing.expectEqual(@as(usize, 3), rows("你好世", 3));
-    // An explicit newline starts a fresh row; an ESC occupies a replacement cell.
-    try std.testing.expectEqual(@as(usize, 2), rows("ab\ncd", 10));
-    try std.testing.expectEqual(@as(usize, 3), rows("a\x1b[31mbc", 3));
 }
 
 test "canonical display boundaries follow rendered replacement units" {

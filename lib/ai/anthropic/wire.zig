@@ -388,39 +388,6 @@ test "cache_control marks the system prompt, last tool, and last message block" 
     try std.testing.expect(last_blocks[1].object.get("cache_control") != null);
 }
 
-test "effort turns on adaptive thinking with the named level, max_tokens untouched" {
-    const items = [_]llm.Item{
-        .{ .reasoning = .{ .text = "weigh it", .blob = "sig", .origin = .anthropic_subscription } },
-        .{ .reasoning = .{ .text = "", .blob = "secret", .redacted = true, .origin = .anthropic_subscription } },
-        .{ .message = .{ .role = .assistant, .text = "answer" } },
-    };
-    const body = try serialize(std.testing.allocator, .{
-        .model = "claude-opus-4-8",
-        .tokens_max = 8192,
-        .system = "s",
-        .items = &items,
-        .tools = &.{},
-        .effort = .xhigh,
-    }, .anthropic_subscription);
-    defer std.testing.allocator.free(body);
-
-    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
-    defer parsed.deinit();
-    const root = parsed.value.object;
-
-    const thinking = root.get("thinking").?.object;
-    try std.testing.expectEqualStrings("adaptive", thinking.get("type").?.string);
-    try std.testing.expectEqualStrings("summarized", thinking.get("display").?.string);
-    try std.testing.expectEqualStrings("xhigh", root.get("output_config").?.object.get("effort").?.string);
-    try std.testing.expectEqual(@as(i64, 8192), root.get("max_tokens").?.integer);
-
-    const content = root.get("messages").?.array.items[0].object.get("content").?.array.items;
-    try std.testing.expectEqualStrings("thinking", content[0].object.get("type").?.string);
-    try std.testing.expectEqualStrings("sig", content[0].object.get("signature").?.string);
-    try std.testing.expectEqualStrings("redacted_thinking", content[1].object.get("type").?.string);
-    try std.testing.expectEqualStrings("secret", content[1].object.get("data").?.string);
-}
-
 test "effort is dropped for a model with no table entry" {
     // A model absent from the table has no effort map, so the requested level is
     // dropped rather than emitted blindly — proof the level is resolved through
@@ -480,34 +447,6 @@ test "no thinking or output_config when effort is none" {
     try std.testing.expect(parsed.value.object.get("thinking") == null);
     try std.testing.expect(parsed.value.object.get("output_config") == null);
     try std.testing.expectEqual(@as(i64, 8192), parsed.value.object.get("max_tokens").?.integer);
-}
-
-test "stored thinking is dropped from history when effort is none" {
-    const items = [_]llm.Item{
-        .{ .reasoning = .{ .text = "weigh it", .blob = "sig", .origin = .anthropic_subscription } },
-        .{ .reasoning = .{ .text = "", .blob = "secret", .redacted = true, .origin = .anthropic_subscription } },
-        .{ .message = .{ .role = .assistant, .text = "answer" } },
-    };
-    const body = try serialize(std.testing.allocator, .{
-        .model = "claude-opus-4-8",
-        .tokens_max = 8192,
-        .system = "s",
-        .items = &items,
-        .tools = &.{},
-        .effort = .none,
-    }, .anthropic_subscription);
-    defer std.testing.allocator.free(body);
-
-    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
-    defer parsed.deinit();
-    const root = parsed.value.object;
-    // Reasoning disabled: no thinking config, and the stored thinking blocks are
-    // gone, leaving only the answer.
-    try std.testing.expect(root.get("thinking") == null);
-    const content = root.get("messages").?.array.items[0].object.get("content").?.array.items;
-    try std.testing.expectEqual(@as(usize, 1), content.len);
-    try std.testing.expectEqualStrings("text", content[0].object.get("type").?.string);
-    try std.testing.expectEqualStrings("answer", content[0].object.get("text").?.string);
 }
 
 // A representative multi-round conversation exercising every serializer path

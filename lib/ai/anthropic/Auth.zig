@@ -71,10 +71,17 @@ fn jsonInt(object: std.json.ObjectMap, name: []const u8) ?i64 {
 
 /// A valid access token, refreshing and persisting it first if it has expired.
 pub fn accessToken(self: *Auth) ![]const u8 {
+    return self.accessTokenVia(oauth.refresh);
+}
+
+/// `accessToken` over any refresher with `oauth.refresh`'s shape, so tests pin
+/// the credential lifecycle without the network. Refresh before touching the
+/// stored tokens: a failed refresh leaves the stored credential intact.
+fn accessTokenVia(self: *Auth, comptime refreshFn: anytype) ![]const u8 {
     const tokens = self.tokens orelse return error.NotAuthenticated;
     const now_ms = std.Io.Timestamp.now(self.io, .real).toMilliseconds();
     if (now_ms >= tokens.expires_ms) {
-        const fresh = try oauth.refresh(self.gpa, self.io, self.timeouts, tokens.refresh);
+        const fresh = try refreshFn(self.gpa, self.io, self.timeouts, tokens.refresh);
         tokens.deinit(self.gpa);
         self.tokens = fresh;
         try self.save();
@@ -166,3 +173,94 @@ const CallbackListener = struct {
         return oauth_callback.receive(self.auth.gpa, self.auth.io, &self.server);
     }
 };
+
+fn refuseRefresh(gpa: std.mem.Allocator, io: std.Io, timeouts: net.Timeouts, refresh_token: []const u8) anyerror!oauth.Tokens {
+    _ = gpa;
+    _ = io;
+    _ = timeouts;
+    _ = refresh_token;
+    return error.TokenRequestFailed;
+}
+
+fn grantRefresh(gpa: std.mem.Allocator, io: std.Io, timeouts: net.Timeouts, refresh_token: []const u8) anyerror!oauth.Tokens {
+    _ = io;
+    _ = timeouts;
+    _ = refresh_token;
+    return .{
+        .access = try gpa.dupe(u8, "fresh"),
+        .refresh = try gpa.dupe(u8, "next"),
+        .expires_ms = std.math.maxInt(i64),
+    };
+}
+
+test "a live access token is returned without a refresh" {
+    var auth: Auth = .{
+        .gpa = std.testing.allocator,
+        .io = std.testing.io,
+        .timeouts = .{},
+        .path = "",
+        .tokens = .{ .access = "live", .refresh = "keep", .expires_ms = std.math.maxInt(i64) },
+    };
+    try std.testing.expectEqualStrings("live", try auth.accessTokenVia(refuseRefresh));
+}
+
+test "a failed refresh leaves the stored credential intact" {
+    var auth: Auth = .{
+        .gpa = std.testing.allocator,
+        .io = std.testing.io,
+        .timeouts = .{},
+        .path = "",
+        .tokens = .{ .access = "stale", .refresh = "keep", .expires_ms = 0 },
+    };
+    try std.testing.expectError(error.TokenRequestFailed, auth.accessTokenVia(refuseRefresh));
+    try std.testing.expectEqualStrings("stale", auth.tokens.?.access);
+    try std.testing.expectEqualStrings("keep", auth.tokens.?.refresh);
+}
+
+test "an expired access token is refreshed and re-persisted" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/auth.json", .{tmp.sub_path});
+    var auth: Auth = .{
+        .gpa = gpa,
+        .io = std.testing.io,
+        .timeouts = .{},
+        .path = path,
+        .tokens = .{
+            .access = try gpa.dupe(u8, "stale"),
+            .refresh = try gpa.dupe(u8, "old"),
+            .expires_ms = 0,
+        },
+    };
+    defer auth.tokens.?.deinit(gpa);
+
+    try std.testing.expectEqualStrings("fresh", try auth.accessTokenVia(grantRefresh));
+    try std.testing.expectEqualStrings("next", auth.tokens.?.refresh);
+
+    var file = (try auth_store.open(gpa, std.testing.io, path)).?;
+    defer file.deinit();
+    try std.testing.expectEqualStrings("next", file.entry(account_key).?.get("refresh").?.string);
+}
+
+test "load rejects an entry missing a credential field" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "auth.json",
+        .data = "{\"anthropic_subscription\":{\"access\":\"a\"}}",
+    });
+    var path_buf: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/auth.json", .{tmp.sub_path});
+    var auth: Auth = .{
+        .gpa = gpa,
+        .io = std.testing.io,
+        .timeouts = .{},
+        .path = path,
+        .tokens = null,
+    };
+    try std.testing.expectError(error.BadCredentials, auth.load());
+    try std.testing.expect(auth.tokens == null);
+}

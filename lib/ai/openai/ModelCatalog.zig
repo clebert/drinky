@@ -278,3 +278,11 @@ test "malformed catalog envelopes are rejected" {
         parse(std.testing.allocator, "{\"models\":{}}"),
     );
 }
+
+test "parse bounds the catalog's model count" {
+    const at_max = "{\"models\":[{}" ++ (",{}" ** (model_count_max - 1)) ++ "]}";
+    var catalog = try parse(std.testing.allocator, at_max);
+    catalog.deinit();
+    const over = "{\"models\":[{}" ++ (",{}" ** model_count_max) ++ "]}";
+    try std.testing.expectError(error.BadModelCatalog, parse(std.testing.allocator, over));
+}

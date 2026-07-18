@@ -39,49 +39,49 @@ duplication claims double-count somewhat (realistic net win ≈ 1,500 lines).
 
 ## Tests
 
-- [ ] `lib/ai/Agent.zig:171` **high** — Round bound (50) and clean overrun failure have no test; run() is never driven
-- [ ] `lib/ai/Agent.zig:211` **high** — fetchReply retry orchestration untested: attempt bound, onStreamReset, retry-after, cancel-not-retried
-- [ ] `lib/ai/net.zig:102` **high** — No test that a caller cancel surfaces as Canceled, not Timeout, through withTimeout
-- [ ] `lib/ai/tool/write.zig:29` **high** — Mutating tools (write, edit round-trip, fs.writeFile) have zero end-to-end tests
-- [ ] `lib/terminal/Input.zig:92` **high** — Malformed/truncated UTF-8 decoding and forward progress are completely untested
-- [ ] `lib/ai/Accounts.zig:100` **medium** — Cross-vendor startup preference unpinned: a paid Anthropic key beats an OpenAI subscription
-- [ ] `lib/ai/Agent.zig:280` **medium** — API-error path (rollback + onError, turn ends cleanly) has no test
-- [ ] `lib/ai/anthropic/Auth.zig:77` **medium** — Auth.zig has zero tests; failed-refresh guarantee unguarded
-- [ ] `lib/ai/anthropic/Transport.zig:216` **medium** — Cancel-during-read clean-abort path has no test
-- [ ] `lib/ai/anthropic/Transport.zig:238` **medium** — Mid-stream API error frame (error.ApiError + errorText) untested
-- [ ] `lib/ai/anthropic/Transport.zig:314` **medium** — send's established-race teardown (ownership-on-failure) untested
-- [ ] `lib/ai/auth_store.zig:74` **medium** — save/remove/open never exercised; the owner-only (0o600) permission guarantee is unprotected
-- [ ] `lib/ai/command/login.zig:50` **medium** — Select on an already-logged-in subscription is untested
-- [ ] `lib/ai/command/model.zig:38` **medium** — No allocation-failure coverage for the picker option builders
-- [ ] `lib/ai/command/model.zig:47` **medium** — Active-row marking's account comparison is untestable by current test
-- [ ] `lib/ai/command/root.zig:34` **medium** — Known-command dispatch and select routing have no test anywhere
-- [ ] `lib/ai/openai/Auth.zig:75` **medium** — Auth.zig has zero tests: failed-refresh-intact and load error paths unpinned
-- [ ] `lib/ai/openai/Transport.zig:145` **medium** — No test ever consumes the [DONE] compatibility sentinel
-- [ ] `lib/ai/openai/Transport.zig:195` **medium** — Canceled-vs-ReadFailed refinement in readFailed is untested
-- [ ] `lib/ai/openai/Transport.zig:252` **medium** — send()'s connect-timeout teardown (established flag) is never tested
-- [ ] `lib/ai/tool/find.zig:63` **medium** — find's overflow count and too-large-to-scan reports untested
-- [ ] `lib/ai/tool/grep.zig:106` **medium** — grep's result limit, skips, line cap, and honesty reports untested
-- [ ] `lib/ai/tool/read.zig:45` **medium** — Cancellation propagation from tool file I/O is completely untested
-- [ ] `lib/terminal/Emulator.zig:93` **medium** — Emulator models CSI 0 A/B/C as a zero move; real terminals treat 0 as 1, masking the zero-guard
-- [ ] `lib/terminal/Input.zig:62` **medium** — feed()'s compaction branch (start > 0) is never executed by any test
-- [ ] `lib/terminal/Resize.zig:39` **medium** — Resize watcher has zero tests for the SIGWINCH-wake and disposition-restore guarantee
-- [ ] `lib/terminal/View.zig:264` **medium** — The resize fallback (columns/rows change forces a reset) has no test
-- [ ] `lib/ai/Agent.zig:86` **low** — Per-model stats bound overflow (cumulative totals stay exact past 16) untested
-- [ ] `lib/ai/Agent.zig:1203` **low** — Reasoning-id threading test duplicates the origin-tagging test's script and asserts (~20 lines)
-- [ ] `lib/ai/anthropic/Transport.zig:341` **low** — Identity fork (headers, unencoded response, error head) untested
-- [ ] `lib/ai/anthropic/wire.zig:485` **low** — Two effort-shape tests fully subsumed by the golden byte tests (~59 lines)
-- [ ] `lib/ai/models.zig:108` **low** — Shipped OpenAI effort maps untested: the none-floor guarantee is only tested on a fabricated map
-- [ ] `lib/ai/oauth_login.zig:199` **low** — Cancellation test duplicates the callback-error test's exact code path (~13 lines)
-- [ ] `lib/ai/openai/ModelCatalog.zig:143` **low** — model_count_max envelope bound is untested
-- [ ] `lib/ai/openai/oauth.zig:295` **low** — jwtExpiryMs crafted-exp overflow guard has no test
-- [ ] `lib/ai/tool/find.zig:75` **low** — find/grep/read happy-path tests assert live repo layout, not fixtures
-- [ ] `lib/terminal/Input.zig:225` **low** — Duplicate ctrl-lowercase CSI-u row while the uppercase branch is untested
-- [ ] `lib/terminal/Tty.zig:122` **low** — Tty.read's timeout-to-null and EndOfStream mapping is untested
-- [ ] `lib/terminal/Tty.zig:140` **low** — Tty.size's absence-not-default contract has no test
-- [ ] `lib/terminal/View.zig:137` **low** — No test composes an over-wide row through the Sink
-- [ ] `lib/terminal/View.zig:763` **low** — Cursor show/hide dedupe (emit only on visibility change) is unasserted
-- [ ] `lib/terminal/View.zig:824` **low** — Boundary test pins exact ZWB byte layout instead of the non-fusing property
-- [ ] `lib/terminal/width.zig:441` **low** — test wrap and test rows re-cover equivalence classes already pinned by test wrapper (~29 lines)
+- [x] `lib/ai/Agent.zig:171` **high** — Round bound (50) and clean overrun failure have no test; run() is never driven
+- [x] `lib/ai/Agent.zig:211` **high** — fetchReply retry orchestration untested: attempt bound, onStreamReset, retry-after, cancel-not-retried
+- [x] `lib/ai/net.zig:102` **high** — No test that a caller cancel surfaces as Canceled, not Timeout, through withTimeout
+- [x] `lib/ai/tool/write.zig:29` **high** — Mutating tools (write, edit round-trip, fs.writeFile) have zero end-to-end tests
+- [x] `lib/terminal/Input.zig:92` **high** — Malformed/truncated UTF-8 decoding and forward progress are completely untested
+- [x] `lib/ai/Accounts.zig:100` **medium** — Cross-vendor startup preference unpinned: a paid Anthropic key beats an OpenAI subscription
+- [x] `lib/ai/Agent.zig:280` **medium** — API-error path (rollback + onError, turn ends cleanly) has no test
+- [x] `lib/ai/anthropic/Auth.zig:77` **medium** — Auth.zig has zero tests; failed-refresh guarantee unguarded
+- [x] `lib/ai/anthropic/Transport.zig:216` **medium** — Cancel-during-read clean-abort path has no test
+- [x] `lib/ai/anthropic/Transport.zig:238` **medium** — Mid-stream API error frame (error.ApiError + errorText) untested
+- [x] `lib/ai/anthropic/Transport.zig:314` **medium** — send's established-race teardown (ownership-on-failure) untested
+- [x] `lib/ai/auth_store.zig:74` **medium** — save/remove/open never exercised; the owner-only (0o600) permission guarantee is unprotected
+- [x] `lib/ai/command/login.zig:50` **medium** — Select on an already-logged-in subscription is untested
+- [x] `lib/ai/command/model.zig:38` **medium** — No allocation-failure coverage for the picker option builders
+- [x] `lib/ai/command/model.zig:47` **medium** — Active-row marking's account comparison is untestable by current test
+- [x] `lib/ai/command/root.zig:34` **medium** — Known-command dispatch and select routing have no test anywhere
+- [x] `lib/ai/openai/Auth.zig:75` **medium** — Auth.zig has zero tests: failed-refresh-intact and load error paths unpinned
+- [x] `lib/ai/openai/Transport.zig:145` **medium** — No test ever consumes the [DONE] compatibility sentinel
+- [x] `lib/ai/openai/Transport.zig:195` **medium** — Canceled-vs-ReadFailed refinement in readFailed is untested
+- [x] `lib/ai/openai/Transport.zig:252` **medium** — send()'s connect-timeout teardown (established flag) is never tested
+- [x] `lib/ai/tool/find.zig:63` **medium** — find's overflow count and too-large-to-scan reports untested
+- [x] `lib/ai/tool/grep.zig:106` **medium** — grep's result limit, skips, line cap, and honesty reports untested
+- [x] `lib/ai/tool/read.zig:45` **medium** — Cancellation propagation from tool file I/O is completely untested
+- [x] `lib/terminal/Emulator.zig:93` **medium** — Emulator models CSI 0 A/B/C as a zero move; real terminals treat 0 as 1, masking the zero-guard
+- [x] `lib/terminal/Input.zig:62` **medium** — feed()'s compaction branch (start > 0) is never executed by any test
+- [x] `lib/terminal/Resize.zig:39` **medium** — Resize watcher has zero tests for the SIGWINCH-wake and disposition-restore guarantee
+- [x] `lib/terminal/View.zig:264` **medium** — The resize fallback (columns/rows change forces a reset) has no test
+- [x] `lib/ai/Agent.zig:86` **low** — Per-model stats bound overflow (cumulative totals stay exact past 16) untested
+- [x] `lib/ai/Agent.zig:1203` **low** — Reasoning-id threading test duplicates the origin-tagging test's script and asserts (~20 lines)
+- [x] `lib/ai/anthropic/Transport.zig:341` **low** — Identity fork (headers, unencoded response, error head) untested
+- [x] `lib/ai/anthropic/wire.zig:485` **low** — Two effort-shape tests fully subsumed by the golden byte tests (~59 lines)
+- [x] `lib/ai/models.zig:108` **low** — Shipped OpenAI effort maps untested: the none-floor guarantee is only tested on a fabricated map
+- [x] `lib/ai/oauth_login.zig:199` **low** — Cancellation test duplicates the callback-error test's exact code path (~13 lines)
+- [x] `lib/ai/openai/ModelCatalog.zig:143` **low** — model_count_max envelope bound is untested
+- [x] `lib/ai/openai/oauth.zig:295` **low** — jwtExpiryMs crafted-exp overflow guard has no test
+- [x] `lib/ai/tool/find.zig:75` **low** — find/grep/read happy-path tests assert live repo layout, not fixtures
+- [x] `lib/terminal/Input.zig:225` **low** — Duplicate ctrl-lowercase CSI-u row while the uppercase branch is untested
+- [x] `lib/terminal/Tty.zig:122` **low** — Tty.read's timeout-to-null and EndOfStream mapping is untested
+- [x] `lib/terminal/Tty.zig:140` **low** — Tty.size's absence-not-default contract has no test
+- [x] `lib/terminal/View.zig:137` **low** — No test composes an over-wide row through the Sink
+- [x] `lib/terminal/View.zig:763` **low** — Cursor show/hide dedupe (emit only on visibility change) is unasserted
+- [x] `lib/terminal/View.zig:824` **low** — Boundary test pins exact ZWB byte layout instead of the non-fusing property
+- [x] `lib/terminal/width.zig:441` **low** — test wrap and test rows re-cover equivalence classes already pinned by test wrapper (~29 lines)
 
 ## Concision
 
@@ -174,6 +174,15 @@ duplication claims double-count somewhat (realistic net win ≈ 1,500 lines).
 - Refuted claims worth remembering as non-bugs: queryParameter substring matching (guarded),
   Resize SIGWINCH use-after-deinit (refuted from std semantics), "steady-state allocates nothing"
   test gap (covered).
+
+Test gaps deliberately left open (each needs a seam or infrastructure not worth its weight yet):
+
+- [ ] `lib/ai/openai/Auth.zig` — failed-refresh-leaves-credential-intact: `oauth.refresh` hits a
+  comptime-const token_url; the anthropic side is pinned via its refresh seam.
+- [ ] Both transports — the established=true half of send's teardown (timer wins after a full
+  connect) needs a real socket plus URL injection.
+- [ ] `lib/ai/tool/find.zig` / `grep.zig` — the too-large-to-scan and 256 MB/100k-file budget
+  honesty reports sit behind hard-coded consts.
 
 Follow-ups surfaced while fixing:
 

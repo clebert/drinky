@@ -177,3 +177,58 @@ const CallbackListener = struct {
         return oauth_callback.receive(self.auth.gpa, self.auth.io, &self.server);
     }
 };
+
+test "load distinguishes signed out from corrupt credentials" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var home_buf: [128]u8 = undefined;
+    const home = try std.fmt.bufPrint(&home_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+
+    var auth = try init(gpa, io, home, .{});
+    defer auth.deinit();
+    // An absent file and a file holding only a sibling account's entry are both
+    // simply signed out; an own entry missing a field is corrupt, not ignored.
+    try std.testing.expect(!try auth.load());
+    try auth_store.save(gpa, io, auth.path, "anthropic_subscription", .{ .access = "a" });
+    try std.testing.expect(!try auth.load());
+    try auth_store.save(gpa, io, auth.path, account_key, .{ .access = "at", .refresh = "rt" });
+    try std.testing.expectError(error.BadCredentials, auth.load());
+}
+
+test "save and load round-trip credentials an unexpired token serves unchanged" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var home_buf: [128]u8 = undefined;
+    const home = try std.fmt.bufPrint(&home_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+
+    var auth = try init(gpa, io, home, .{});
+    defer auth.deinit();
+    auth.tokens = .{
+        .access = try gpa.dupe(u8, "at"),
+        .refresh = try gpa.dupe(u8, "rt"),
+        .expires_ms = std.math.maxInt(i64),
+        .account_id = try gpa.dupe(u8, "acct"),
+    };
+    try auth.save();
+
+    var loaded = try init(gpa, io, home, .{});
+    defer loaded.deinit();
+    try std.testing.expect(try loaded.load());
+    try std.testing.expectEqualStrings("at", try loaded.accessToken());
+    try std.testing.expectEqualStrings("acct", loaded.accountId());
+}
+
+test "a signed-out account refuses a token and reports no account id" {
+    var auth = try init(std.testing.allocator, undefined, "home", .{});
+    defer auth.deinit();
+    try std.testing.expectError(error.NotAuthenticated, auth.accessToken());
+    try std.testing.expectEqualStrings("", auth.accountId());
+}

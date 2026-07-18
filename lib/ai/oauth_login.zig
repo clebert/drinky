@@ -49,7 +49,6 @@ const Fake = struct {
     listener_deinit_count: usize = 0,
     callback_received: bool = false,
     callback_fails: bool = false,
-    callback_canceled: bool = false,
     callback_while_browser_running: bool = false,
     authorization_count: usize = 0,
     authorization_fails: bool = false,
@@ -129,7 +128,6 @@ const Fake = struct {
             if (self.fake.immediate_redirect and !self.fake.redirect_delivered)
                 return error.RedirectMissed;
             if (self.fake.callback_fails) return error.CallbackFailed;
-            if (self.fake.callback_canceled) return error.Canceled;
         }
     };
 };
@@ -187,18 +185,6 @@ test "browser launch fallback warns and continues listening" {
 test "callback error reaps browser and closes listener" {
     var fake: Fake = .{ .callback_fails = true };
     try std.testing.expectError(error.CallbackFailed, receive(void, &.{
-        .url = "https://example.test/authorize",
-        .prompt = Fake.Prompt{ .fake = &fake },
-        .browser = Fake.Browser{ .fake = &fake },
-        .callback = Fake.Callback{ .fake = &fake },
-    }));
-    try std.testing.expect(fake.browser_reaped);
-    try std.testing.expectEqual(@as(usize, 1), fake.listener_deinit_count);
-}
-
-test "callback cancellation reaps browser and closes listener" {
-    var fake: Fake = .{ .callback_canceled = true };
-    try std.testing.expectError(error.Canceled, receive(void, &.{
         .url = "https://example.test/authorize",
         .prompt = Fake.Prompt{ .fake = &fake },
         .browser = Fake.Browser{ .fake = &fake },

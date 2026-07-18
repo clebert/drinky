@@ -704,6 +704,23 @@ test "a page-count change resets" {
     try std.testing.expect(std.mem.indexOf(u8, h.lastBytes(), escape.screen_reset) != null);
 }
 
+test "a resize resets" {
+    const gpa = std.testing.allocator;
+    const h = try harness(gpa, 10);
+    defer {
+        h.deinit();
+        gpa.destroy(h);
+    }
+    const frame = [_]Line{ line("a", 0), line("b", 1) };
+    try h.render(&frame, .{ .columns = 10, .rows = 4 }, 2);
+    try h.render(&frame, .{ .columns = 8, .rows = 4 }, 2);
+    try h.emulator.expectVisible(&.{ "a", "b" });
+    try std.testing.expect(std.mem.indexOf(u8, h.lastBytes(), escape.screen_reset) != null);
+    try h.render(&frame, .{ .columns = 8, .rows = 3 }, 2);
+    try h.emulator.expectVisible(&.{ "a", "b" });
+    try std.testing.expect(std.mem.indexOf(u8, h.lastBytes(), escape.screen_reset) != null);
+}
+
 test "a jump with no shared anchor resets" {
     const gpa = std.testing.allocator;
     const h = try harness(gpa, 10);
@@ -734,6 +751,33 @@ test "a full-width row places the caret at the pending-wrap margin" {
     try h.emulator.expectCaret(1, 0, 2);
 }
 
+test "an over-wide row clips at the margin and keeps the cursor synced" {
+    const gpa = std.testing.allocator;
+    const h = try harness(gpa, 3);
+    defer {
+        h.deinit();
+        gpa.destroy(h);
+    }
+    const sink = try h.view.beginFrame(.{ .columns = 3, .rows = 4 }, 1);
+    sink.begin();
+    try sink.text("abcdef");
+    // A second fragment after the budget is spent adds no columns.
+    try sink.text("gh");
+    sink.end(.{ .id = 0, .line = 0 });
+    sink.begin();
+    try sink.text("z");
+    sink.setCaret(1);
+    sink.end(.{ .id = 1, .line = 0 });
+    try h.view.render();
+    h.emulator.rows = 4;
+    try h.emulator.feed(h.out.written());
+    // The over-wide row never wraps, so the frame stays two physical rows.
+    try std.testing.expectEqual(@as(usize, 2), h.emulator.document.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, h.emulator.document.items[0].items, "abc") != null);
+    try std.testing.expect(std.mem.indexOfAny(u8, h.emulator.document.items[0].items, "defgh") == null);
+    try h.emulator.expectCaret(2, 1, 1);
+}
+
 test "the caret is hidden with no caret and when above the viewport" {
     const gpa = std.testing.allocator;
     const h = try harness(gpa, 5);
@@ -744,6 +788,9 @@ test "the caret is hidden with no caret and when above the viewport" {
     const none = [_]Line{ line("a", 0), line("b", 1) };
     try h.render(&none, .{ .columns = 5, .rows = 2 }, 2);
     try std.testing.expect(!h.emulator.cursor_visible);
+    // The cursor is already hidden, so a caret-less frame emits no redundant hide.
+    try h.render(&none, .{ .columns = 5, .rows = 2 }, 2);
+    try std.testing.expect(std.mem.indexOf(u8, h.lastBytes(), escape.cursor_hide) == null);
 
     // A caret on the top row of a four-row window whose viewport is two rows:
     // it is above the viewport and must stay hidden.
@@ -786,6 +833,8 @@ test "an unchanged frame emits only caret motion" {
     try std.testing.expect(std.mem.indexOf(u8, h.lastBytes(), escape.screen_reset) == null);
     try std.testing.expect(std.mem.indexOf(u8, h.lastBytes(), escape.screen_clear_below) == null);
     try std.testing.expect(std.mem.indexOf(u8, h.lastBytes(), "ab") == null);
+    // The caret was already visible, so no redundant show is emitted.
+    try std.testing.expect(std.mem.indexOf(u8, h.lastBytes(), escape.cursor_show) == null);
 }
 
 test "a pure top-trim repaints the identical tail and rebases the caret" {
@@ -859,25 +908,27 @@ test "canonical text boundaries survive separate sink writes" {
     var view = View.init(gpa, &out.writer);
     defer view.deinit();
 
+    // Fragments whose adjacent edges would fuse into different graphemes (an
+    // emoji ZWJ join, a variation selector after a replacement, one after a
+    // space): each row must measure as the sum of its separately measured
+    // fragments once composed.
     const sink = try view.beginFrame(.{ .columns = 9, .rows = 4 }, 1);
     sink.begin();
     try sink.text("\x1b");
     try sink.text("\u{FE0F}");
     try sink.text("👨\u{200D}");
     try sink.text("👩");
-    try sink.sgr("\x1b[0m");
     try sink.spaces(2);
     sink.end(.{ .id = 0, .line = 0 });
+    try std.testing.expectEqual(sink.columns_written, width.ofText(sink.frame.bytes(sink.frame.rows.items[0])));
     sink.begin();
     try sink.spaces(1);
     try sink.text("\u{FE0F}");
     sink.end(.{ .id = 1, .line = 0 });
+    try std.testing.expectEqual(sink.columns_written, width.ofText(sink.frame.bytes(sink.frame.rows.items[1])));
     try view.render();
 
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "\u{200B}�\u{200B}\u{200B}\u{FE0F}") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "👨\u{200D}\u{200B}👩") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "👩\x1b[0m\u{200B}  ") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), " \u{200B}\u{FE0F}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "\u{200D}👩") == null);
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "\x1b\u{FE0F}") == null);
 }
 

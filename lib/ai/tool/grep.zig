@@ -6,6 +6,7 @@ const std = @import("std");
 const llm = @import("../llm.zig");
 const Context = @import("Context.zig");
 const Result = @import("Result.zig");
+const fs = @import("fs.zig");
 const parse = @import("parse.zig");
 const walk = @import("walk.zig");
 
@@ -148,13 +149,22 @@ test utf8FloorLength {
 }
 
 test "grep finds a literal substring with a glob filter" {
-    const context: Context = .{ .gpa = std.testing.allocator, .io = std.testing.io };
-    const result = try run(&context,
-        \\{"pattern":"pub fn match","path":"lib","glob":"**/glob.zig"}
-    );
-    defer std.testing.allocator.free(result.content);
+    const gpa = std.testing.allocator;
+    const context: Context = .{ .gpa = gpa, .io = std.testing.io };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "a.zig", .data = "nope\nneedle here\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "b.txt", .data = "needle here\n" });
+    var input_buf: [128]u8 = undefined;
+    const input = try std.fmt.bufPrint(&input_buf,
+        \\{{"pattern":"needle","path":".zig-cache/tmp/{s}","glob":"**/*.zig"}}
+    , .{tmp.sub_path});
+    const result = try run(&context, input);
+    defer gpa.free(result.content);
     try std.testing.expect(!result.is_error);
-    try std.testing.expect(std.mem.indexOf(u8, result.content, "lib/ai/tool/glob.zig:") != null);
+    var expected_buf: [128]u8 = undefined;
+    const expected = try std.fmt.bufPrint(&expected_buf, ".zig-cache/tmp/{s}/a.zig:2:needle here", .{tmp.sub_path});
+    try std.testing.expectEqualStrings(expected, result.content);
 }
 
 test "grep replaces invalid UTF-8 in matched lines" {
@@ -176,11 +186,112 @@ test "grep replaces invalid UTF-8 in matched lines" {
 }
 
 test "grep is case-insensitive when asked" {
-    const context: Context = .{ .gpa = std.testing.allocator, .io = std.testing.io };
-    const result = try run(&context,
-        \\{"pattern":"PUB FN MATCH","path":"lib","glob":"**/glob.zig","ignore_case":true}
-    );
-    defer std.testing.allocator.free(result.content);
+    const gpa = std.testing.allocator;
+    const context: Context = .{ .gpa = gpa, .io = std.testing.io };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "a.txt", .data = "Needle Here\n" });
+    var input_buf: [128]u8 = undefined;
+    const input = try std.fmt.bufPrint(&input_buf,
+        \\{{"pattern":"NEEDLE","path":".zig-cache/tmp/{s}","ignore_case":true}}
+    , .{tmp.sub_path});
+    const result = try run(&context, input);
+    defer gpa.free(result.content);
     try std.testing.expect(!result.is_error);
-    try std.testing.expect(std.mem.indexOf(u8, result.content, "lib/ai/tool/glob.zig:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "a.txt:1:Needle Here") != null);
+}
+
+test "grep stops at the result limit and reports it" {
+    const gpa = std.testing.allocator;
+    const context: Context = .{ .gpa = gpa, .io = std.testing.io };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "f.txt", .data = "hit one\nhit two\nhit three\n" });
+    var input_buf: [128]u8 = undefined;
+    const input = try std.fmt.bufPrint(&input_buf,
+        \\{{"pattern":"hit","path":".zig-cache/tmp/{s}","limit":2}}
+    , .{tmp.sub_path});
+    const result = try run(&context, input);
+    defer gpa.free(result.content);
+    try std.testing.expect(!result.is_error);
+    var expected_buf: [256]u8 = undefined;
+    const expected = try std.fmt.bufPrint(
+        &expected_buf,
+        ".zig-cache/tmp/{s}/f.txt:1:hit one\n.zig-cache/tmp/{s}/f.txt:2:hit two\n... stopped at the limit of 2 matches; refine the search or raise limit",
+        .{ tmp.sub_path, tmp.sub_path },
+    );
+    try std.testing.expectEqualStrings(expected, result.content);
+}
+
+test "grep skips binary and oversized files" {
+    const gpa = std.testing.allocator;
+    const context: Context = .{ .gpa = gpa, .io = std.testing.io };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "bin.dat", .data = "hit\x00\n" });
+    const big = try gpa.alloc(u8, file_bytes_max + 1);
+    defer gpa.free(big);
+    @memset(big, 'a');
+    @memcpy(big[0..3], "hit");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "huge.txt", .data = big });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "small.txt", .data = "hit\n" });
+    var input_buf: [128]u8 = undefined;
+    const input = try std.fmt.bufPrint(&input_buf,
+        \\{{"pattern":"hit","path":".zig-cache/tmp/{s}"}}
+    , .{tmp.sub_path});
+    const result = try run(&context, input);
+    defer gpa.free(result.content);
+    try std.testing.expect(!result.is_error);
+    var expected_buf: [128]u8 = undefined;
+    const expected = try std.fmt.bufPrint(&expected_buf, ".zig-cache/tmp/{s}/small.txt:1:hit", .{tmp.sub_path});
+    try std.testing.expectEqualStrings(expected, result.content);
+}
+
+test "grep caps the reported line length" {
+    const gpa = std.testing.allocator;
+    const context: Context = .{ .gpa = gpa, .io = std.testing.io };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const line = "hit" ++ "a" ** 397;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "long.txt", .data = line ++ "\n" });
+    var input_buf: [128]u8 = undefined;
+    const input = try std.fmt.bufPrint(&input_buf,
+        \\{{"pattern":"hit","path":".zig-cache/tmp/{s}"}}
+    , .{tmp.sub_path});
+    const result = try run(&context, input);
+    defer gpa.free(result.content);
+    try std.testing.expect(!result.is_error);
+    var expected_buf: [512]u8 = undefined;
+    const expected = try std.fmt.bufPrint(&expected_buf, ".zig-cache/tmp/{s}/long.txt:1:{s}", .{ tmp.sub_path, line[0..line_bytes_max] });
+    try std.testing.expectEqualStrings(expected, result.content);
+}
+
+test "grep reports an incomplete search when nothing was shown" {
+    const gpa = std.testing.allocator;
+    const context: Context = .{ .gpa = gpa, .io = std.testing.io };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "f.txt", .data = "hit\n" });
+    var input_buf: [128]u8 = undefined;
+    const input = try std.fmt.bufPrint(&input_buf,
+        \\{{"pattern":"hit","path":".zig-cache/tmp/{s}","limit":0}}
+    , .{tmp.sub_path});
+    const result = try run(&context, input);
+    defer gpa.free(result.content);
+    try std.testing.expect(!result.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "the search was incomplete") != null);
+}
+
+test "grep cancelled while reading a file propagates" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "f.txt", .data = "hit\n" });
+    var input_buf: [128]u8 = undefined;
+    const input = try std.fmt.bufPrint(&input_buf,
+        \\{{"pattern":"hit","path":".zig-cache/tmp/{s}"}}
+    , .{tmp.sub_path});
+    var cancel: fs.CancelIo = .init(.file_open);
+    const context: Context = .{ .gpa = gpa, .io = cancel.io() };
+    try std.testing.expectError(error.Canceled, run(&context, input));
 }

@@ -242,9 +242,20 @@ test "printable and control" {
 test "kitty csi-u keys" {
     try expectKeys("\x1b[13;2u", &.{.newline});
     try expectKeys("\x1b[27u", &.{.escape});
-    try expectKeys("\x1b[99;5u", &.{.{ .ctrl = 'c' }});
+    try expectKeys("\x1b[67;5u", &.{.{ .ctrl = 'c' }});
     try expectKeys("\x1b[106;5u", &.{.{ .ctrl = 'j' }});
     try expectKeys("\x1b[13u", &.{.unknown});
+}
+
+test "malformed or truncated utf-8 decodes as unknown with forward progress" {
+    try expectKeys("\xffa", &.{ .unknown, .{ .char = 'a' } });
+    try expectKeys("\xc3(x", &.{ .unknown, .{ .char = 'x' } });
+    var input = Input.init(std.testing.allocator);
+    defer input.deinit();
+    try input.feed("\xe2\x82");
+    try std.testing.expectEqual(@as(?Key, null), input.next());
+    try input.feed("\xac");
+    try std.testing.expectEqualDeep(Key{ .char = '€' }, input.next().?);
 }
 
 test "arrows and navigation" {
@@ -288,8 +299,10 @@ test "an unterminated paste past the limit flushes and stays a paste" {
 test "split sequence waits for rest" {
     var input = Input.init(std.testing.allocator);
     defer input.deinit();
-    try input.feed("\x1b[");
+    try input.feed("a\x1b[");
+    try std.testing.expectEqualDeep(Key{ .char = 'a' }, input.next().?);
     try std.testing.expectEqual(@as(?Key, null), input.next());
     try input.feed("A");
     try std.testing.expectEqualDeep(Key.up, input.next().?);
+    try std.testing.expectEqual(@as(?Key, null), input.next());
 }
