@@ -9,10 +9,8 @@ const std = @import("std");
 pub const Context = @import("Context.zig");
 pub const Outcome = @import("outcome.zig").Outcome;
 
-const Agent = @import("../Agent.zig");
 const llm = @import("../llm.zig");
-const models = @import("../models.zig");
-const provider = @import("../provider.zig");
+const testing = @import("testing.zig");
 
 const effort = @import("effort.zig");
 const login = @import("login.zig");
@@ -21,10 +19,9 @@ const model = @import("model.zig");
 
 const Entry = struct {
     name: []const u8,
-    run: *const fn (*Context, []const u8) anyerror!Outcome,
-    /// Applies a picker choice by its row index; null for a command that opens no
-    /// picker.
-    select: ?*const fn (*Context, usize) anyerror!Outcome = null,
+    run: *const fn (*Context) anyerror!Outcome,
+    /// Applies a picker choice by its row index.
+    select: *const fn (*Context, usize) anyerror!Outcome,
 };
 
 const registry = [_]Entry{
@@ -39,11 +36,10 @@ const registry = [_]Entry{
 pub fn run(context: *Context, line: []const u8) !Outcome {
     const body = line[1..];
     // Editor input can carry interior newlines (Shift+Enter, paste).
-    const split = std.mem.indexOfAny(u8, body, " \t\r\n") orelse body.len;
-    const name = body[0..split];
+    const name = body[0 .. std.mem.indexOfAny(u8, body, " \t\r\n") orelse body.len];
     const entry = find(name) orelse
         return Outcome.report(context.gpa, .err, "unknown command: /{s}", .{name});
-    return entry.run(context, body[split..]);
+    return entry.run(context);
 }
 
 /// Apply the choice at row `index` from the picker the command `name` opened. The
@@ -52,9 +48,7 @@ pub fn run(context: *Context, line: []const u8) !Outcome {
 pub fn select(context: *Context, name: []const u8, index: usize) !Outcome {
     const entry = find(name) orelse
         return Outcome.report(context.gpa, .err, "unknown command: /{s}", .{name});
-    const handler = entry.select orelse
-        return Outcome.report(context.gpa, .err, "/{s} has no picker", .{name});
-    return handler(context, index);
+    return entry.select(context, index);
 }
 
 /// The registered command named `name`, or null when none matches.
@@ -66,26 +60,13 @@ fn find(name: []const u8) ?*const Entry {
 }
 
 test "unknown command is reported" {
-    const gpa = std.testing.allocator;
-    var context: Context = .{ .gpa = gpa, .agent = undefined, .accounts = undefined };
-    const outcome = try run(&context, "/nope");
-    switch (outcome) {
-        .feedback => |feedback| {
-            defer gpa.free(feedback.content);
-            try std.testing.expect(feedback.is_error);
-        },
-        else => return error.ExpectedFeedback,
-    }
+    var context: Context = .{ .gpa = std.testing.allocator, .agent = undefined, .accounts = undefined };
+    try Outcome.expectFeedback(try run(&context, "/nope"), .err);
 }
 
-test "run routes a known command, passing the ignored argument tail" {
+test "run routes a known command, ignoring the argument tail" {
     const gpa = std.testing.allocator;
-    const client = provider.Client.init(gpa, std.testing.io, .{ .anthropic_subscription = undefined }, .{});
-    var agent = Agent.init(gpa, std.testing.io, client, .{
-        .model = models.get(.anthropic, "claude-sonnet-4-6").?,
-        .system = "",
-        .retry = .{},
-    });
+    var agent = testing.agent(gpa, .{ .anthropic_subscription = undefined });
     defer agent.deinit();
     var context: Context = .{ .gpa = gpa, .agent = &agent, .accounts = undefined };
 
@@ -103,28 +84,13 @@ test "run routes a known command, passing the ignored argument tail" {
 
 test "select reaches the named command's entry, reporting an unknown name" {
     const gpa = std.testing.allocator;
-    const client = provider.Client.init(gpa, std.testing.io, .{ .anthropic_subscription = undefined }, .{});
-    var agent = Agent.init(gpa, std.testing.io, client, .{
-        .model = models.get(.anthropic, "claude-sonnet-4-6").?,
-        .system = "",
-        .retry = .{},
-    });
+    var agent = testing.agent(gpa, .{ .anthropic_subscription = undefined });
     defer agent.deinit();
     var context: Context = .{ .gpa = gpa, .agent = &agent, .accounts = undefined };
 
-    switch (try select(&context, "effort", 4)) {
-        .feedback => |feedback| gpa.free(feedback.content),
-        else => return error.ExpectedFeedback,
-    }
+    try Outcome.expectFeedback(try select(&context, "effort", 4), .ok);
     try std.testing.expectEqual(llm.Effort.xhigh, agent.effort);
-
-    switch (try select(&context, "nope", 0)) {
-        .feedback => |feedback| {
-            defer gpa.free(feedback.content);
-            try std.testing.expect(feedback.is_error);
-        },
-        else => return error.ExpectedFeedback,
-    }
+    try Outcome.expectFeedback(try select(&context, "nope", 0), .err);
 }
 
 test "a newline delimits the command name like a space" {

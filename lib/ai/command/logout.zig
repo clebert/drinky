@@ -11,31 +11,23 @@ const Accounts = @import("../Accounts.zig");
 const llm = @import("../llm.zig");
 const Context = @import("Context.zig");
 const Outcome = @import("outcome.zig").Outcome;
+const testing = @import("testing.zig");
 
 pub const name = "logout";
 
-pub fn run(context: *Context, args: []const u8) !Outcome {
-    _ = args;
-    const gpa = context.gpa;
+pub fn run(context: *Context) !Outcome {
     var buffer: [account_count]llm.Account = undefined;
     const accounts = loggedIn(context.accounts, &buffer);
     if (accounts.len == 0)
-        return Outcome.report(gpa, .err, "no subscription accounts to log out", .{});
+        return Outcome.report(context.gpa, .err, "no subscription accounts to log out", .{});
 
-    const options = try gpa.alloc([]const u8, accounts.len);
-    var filled: usize = 0;
-    errdefer {
-        for (options[0..filled]) |option| gpa.free(option);
-        gpa.free(options);
-    }
-    for (accounts, 0..) |account, index| {
-        options[index] = try gpa.dupe(u8, account.label());
-        filled += 1;
-    }
+    var options: Outcome.Options = .{ .gpa = context.gpa };
+    errdefer options.deinit();
+    for (accounts) |account| try options.print("{s}", .{account.label()});
     return .{ .pick = .{
         .command = name,
         .title = "Log out of an account",
-        .options = options,
+        .options = try options.toOwnedSlice(),
         .current = null,
     } };
 }
@@ -61,26 +53,12 @@ fn loggedIn(accounts: *const Accounts, buffer: []llm.Account) []llm.Account {
     return buffer[0..count];
 }
 
-fn testAccounts(anthropic_ready: bool, openai_ready: bool) Accounts {
-    return .{
-        .gpa = std.testing.allocator,
-        .io = std.testing.io,
-        .timeouts = .{},
-        .anthropic_auth = undefined,
-        .openai_auth = undefined,
-        .keys = .{ .anthropic = "sk-ant" },
-        .anthropic_subscription_ready = anthropic_ready,
-        .openai_subscription_ready = openai_ready,
-        .openai_subscription_context_windows = .empty,
-    };
-}
-
 test "the picker lists only logged-in subscriptions; none reports an error" {
     const gpa = std.testing.allocator;
 
-    var some = testAccounts(false, true);
+    var some = testing.accounts(.{ .anthropic = "sk-ant" }, false, true);
     var context: Context = .{ .gpa = gpa, .agent = undefined, .accounts = &some };
-    switch (try run(&context, "")) {
+    switch (try run(&context)) {
         .pick => |pick| {
             defer {
                 for (pick.options) |option| gpa.free(option);
@@ -93,31 +71,19 @@ test "the picker lists only logged-in subscriptions; none reports an error" {
         else => return error.ExpectedPick,
     }
 
-    var none = testAccounts(false, false);
+    var none = testing.accounts(.{ .anthropic = "sk-ant" }, false, false);
     context.accounts = &none;
-    switch (try run(&context, "")) {
-        .feedback => |feedback| {
-            defer gpa.free(feedback.content);
-            try std.testing.expect(feedback.is_error);
-        },
-        else => return error.ExpectedFeedback,
-    }
+    try Outcome.expectFeedback(try run(&context), .err);
 }
 
 test "select names the chosen logged-in account, rejecting out of range" {
     const gpa = std.testing.allocator;
-    var accounts = testAccounts(true, false);
+    var accounts = testing.accounts(.{ .anthropic = "sk-ant" }, true, false);
     var context: Context = .{ .gpa = gpa, .agent = undefined, .accounts = &accounts };
 
     switch (try select(&context, 0)) {
         .logout => |account| try std.testing.expectEqual(llm.Account.anthropic_subscription, account),
         else => return error.ExpectedLogout,
     }
-    switch (try select(&context, 99)) {
-        .feedback => |feedback| {
-            defer gpa.free(feedback.content);
-            try std.testing.expect(feedback.is_error);
-        },
-        else => return error.ExpectedFeedback,
-    }
+    try Outcome.expectFeedback(try select(&context, 99), .err);
 }

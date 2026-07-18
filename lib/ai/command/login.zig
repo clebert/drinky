@@ -10,35 +10,23 @@
 
 const std = @import("std");
 
-const Accounts = @import("../Accounts.zig");
-const Agent = @import("../Agent.zig");
 const llm = @import("../llm.zig");
 const models = @import("../models.zig");
-const provider = @import("../provider.zig");
 const Context = @import("Context.zig");
 const Outcome = @import("outcome.zig").Outcome;
+const testing = @import("testing.zig");
 
 pub const name = "login";
 
-pub fn run(context: *Context, args: []const u8) !Outcome {
-    _ = args;
-    const gpa = context.gpa;
-    const accounts = std.enums.values(llm.Account);
-
-    const options = try gpa.alloc([]const u8, accounts.len);
-    var filled: usize = 0;
-    errdefer {
-        for (options[0..filled]) |option| gpa.free(option);
-        gpa.free(options);
-    }
-    for (accounts, 0..) |account, index| {
-        options[index] = try std.fmt.allocPrint(gpa, "{s}{s}", .{ account.label(), marker(context, account) });
-        filled += 1;
-    }
+pub fn run(context: *Context) !Outcome {
+    var options: Outcome.Options = .{ .gpa = context.gpa };
+    errdefer options.deinit();
+    for (std.enums.values(llm.Account)) |account|
+        try options.print("{s}{s}", .{ account.label(), marker(context, account) });
     return .{ .pick = .{
         .command = name,
         .title = "Log in to an account",
-        .options = options,
+        .options = try options.toOwnedSlice(),
         .current = null,
     } };
 }
@@ -85,39 +73,16 @@ fn isActive(context: *const Context, account: llm.Account) bool {
     return client.account() == account;
 }
 
-fn testAccounts(anthropic_key: ?[]const u8, anthropic_ready: bool, openai_ready: bool) Accounts {
-    return .{
-        .gpa = std.testing.allocator,
-        .io = std.testing.io,
-        .timeouts = .{},
-        .anthropic_auth = undefined,
-        .openai_auth = undefined,
-        .keys = .{ .anthropic = anthropic_key },
-        .anthropic_subscription_ready = anthropic_ready,
-        .openai_subscription_ready = openai_ready,
-        .openai_subscription_context_windows = .empty,
-    };
-}
-
-fn testAgent(gpa: std.mem.Allocator, credentials: provider.Credentials) Agent {
-    const client = provider.Client.init(gpa, std.testing.io, credentials, .{});
-    return Agent.init(gpa, std.testing.io, client, .{
-        .model = models.get(.anthropic, "claude-sonnet-4-6").?,
-        .system = "",
-        .retry = .{},
-    });
-}
-
 test "the picker lists every account, marking the active and authenticated ones" {
     const gpa = std.testing.allocator;
     // An anthropic subscription logged in and an anthropic API key set (the
     // active account); both openai accounts unauthenticated.
-    var accounts = testAccounts("sk-ant", true, false);
-    var agent = testAgent(gpa, .{ .anthropic_api = "sk-ant" });
+    var accounts = testing.accounts(.{ .anthropic = "sk-ant" }, true, false);
+    var agent = testing.agent(gpa, .{ .anthropic_api = "sk-ant" });
     defer agent.deinit();
     var context: Context = .{ .gpa = gpa, .agent = &agent, .accounts = &accounts };
 
-    switch (try run(&context, "")) {
+    switch (try run(&context)) {
         .pick => |pick| {
             defer {
                 for (pick.options) |option| gpa.free(option);
@@ -136,8 +101,8 @@ test "the picker lists every account, marking the active and authenticated ones"
 
 test "select logs in a subscription, instructs an API account, and no-ops the active one" {
     const gpa = std.testing.allocator;
-    var accounts = testAccounts("sk-ant", false, false);
-    var agent = testAgent(gpa, .{ .anthropic_api = "sk-ant" });
+    var accounts = testing.accounts(.{ .anthropic = "sk-ant" }, false, false);
+    var agent = testing.agent(gpa, .{ .anthropic_api = "sk-ant" });
     defer agent.deinit();
     var context: Context = .{ .gpa = gpa, .agent = &agent, .accounts = &accounts };
 
@@ -149,68 +114,34 @@ test "select logs in a subscription, instructs an API account, and no-ops the ac
 
     // An unauthenticated API account explains how to set its key rather than
     // attempting a login.
-    switch (try select(&context, 3)) {
-        .feedback => |feedback| {
-            defer gpa.free(feedback.content);
-            try std.testing.expect(!feedback.is_error);
-            try std.testing.expect(std.mem.indexOf(u8, feedback.content, "OPENAI_API_KEY") != null);
-        },
-        else => return error.ExpectedFeedback,
-    }
+    try Outcome.expectFeedbackContaining(try select(&context, 3), .ok, "OPENAI_API_KEY");
 
     // The active account (the env API key) does nothing but say so.
-    switch (try select(&context, 1)) {
-        .feedback => |feedback| {
-            defer gpa.free(feedback.content);
-            try std.testing.expect(!feedback.is_error);
-            try std.testing.expect(std.mem.indexOf(u8, feedback.content, "already active") != null);
-        },
-        else => return error.ExpectedFeedback,
-    }
+    try Outcome.expectFeedbackContaining(try select(&context, 1), .ok, "already active");
 
     // An out-of-range index is reported.
-    switch (try select(&context, 99)) {
-        .feedback => |feedback| {
-            defer gpa.free(feedback.content);
-            try std.testing.expect(feedback.is_error);
-        },
-        else => return error.ExpectedFeedback,
-    }
+    try Outcome.expectFeedback(try select(&context, 99), .err);
 }
 
 test "select never re-runs the login for the active subscription" {
     const gpa = std.testing.allocator;
-    var accounts = testAccounts(null, true, false);
-    var agent = testAgent(gpa, .{ .anthropic_subscription = undefined });
+    var accounts = testing.accounts(.{}, true, false);
+    var agent = testing.agent(gpa, .{ .anthropic_subscription = undefined });
     defer agent.deinit();
     var context: Context = .{ .gpa = gpa, .agent = &agent, .accounts = &accounts };
 
-    switch (try select(&context, 0)) {
-        .feedback => |feedback| {
-            defer gpa.free(feedback.content);
-            try std.testing.expect(!feedback.is_error);
-            try std.testing.expect(std.mem.indexOf(u8, feedback.content, "already active") != null);
-        },
-        else => return error.ExpectedFeedback,
-    }
+    try Outcome.expectFeedbackContaining(try select(&context, 0), .ok, "already active");
     try std.testing.expectEqual(llm.Account.anthropic_subscription, agent.client.?.account());
 }
 
 test "select switches to an authenticated but inactive subscription without a login" {
     const gpa = std.testing.allocator;
-    var accounts = testAccounts("sk-ant", true, false);
-    var agent = testAgent(gpa, .{ .anthropic_api = "sk-ant" });
+    var accounts = testing.accounts(.{ .anthropic = "sk-ant" }, true, false);
+    var agent = testing.agent(gpa, .{ .anthropic_api = "sk-ant" });
     defer agent.deinit();
     var context: Context = .{ .gpa = gpa, .agent = &agent, .accounts = &accounts };
 
-    switch (try select(&context, 0)) {
-        .feedback => |feedback| {
-            defer gpa.free(feedback.content);
-            try std.testing.expect(!feedback.is_error);
-            try std.testing.expect(std.mem.indexOf(u8, feedback.content, "switched to") != null);
-        },
-        else => return error.ExpectedFeedback,
-    }
+    try Outcome.expectFeedbackContaining(try select(&context, 0), .ok, "switched to");
     try std.testing.expectEqual(llm.Account.anthropic_subscription, agent.client.?.account());
     try std.testing.expectEqualStrings("claude-opus-4-8", agent.model.name);
 }
