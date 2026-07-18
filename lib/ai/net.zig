@@ -13,7 +13,9 @@
 //! `Deadline` layers on top: it fixes one instant and bounds a run of reads by
 //! the time left until it, so activity that makes no progress (an Anthropic
 //! stream sending only keepalive pings) cannot hold the window open the way a
-//! fresh per-read timeout would.
+//! fresh per-read timeout would. `Budget` is the volume counterpart: it caps one
+//! stream's total bytes, so a peer that keeps making progress — never letting
+//! `Deadline` trip — still hits an aggregate ceiling.
 
 const std = @import("std");
 
@@ -145,6 +147,46 @@ pub const Deadline = struct {
         return withTimeout(io, remaining_ms, function, args);
     }
 };
+
+/// A hard ceiling on the total wire bytes one streamed response body may deliver.
+/// Every model tops out at 128k output tokens (~14 MB of framed SSE at one token
+/// per frame), so this clears any real reply several times over while bounding a
+/// stream that never ends. A safety limit, not a tunable, like the OAuth
+/// token-response cap.
+pub const stream_response_bytes_max = 64 << 20;
+
+/// A running byte budget for one streamed response, shared across its reads.
+/// Where `Deadline` bounds how long a single read may block, `Budget` bounds a
+/// whole stream's volume, so a peer that makes frequent valid progress —
+/// restarting the idle window on every frame, so `Deadline` never trips — still
+/// hits an aggregate ceiling. Bytes are charged after decompression, the
+/// memory-relevant quantity.
+pub const Budget = struct {
+    /// Bytes charged so far.
+    used: usize = 0,
+    /// Ceiling; a charge that carries `used` past it fails.
+    max: usize,
+
+    /// Charge `bytes` against the budget, failing once the running total passes
+    /// the ceiling. Saturating, so no single charge can wrap the counter back
+    /// under the ceiling.
+    pub fn take(self: *Budget, bytes: usize) error{StreamResponseTooLarge}!void {
+        self.used +|= bytes;
+        if (self.used > self.max) return error.StreamResponseTooLarge;
+    }
+};
+
+test "Budget charges until the running total passes its ceiling" {
+    var budget: Budget = .{ .max = 10 };
+    try budget.take(4);
+    try budget.take(6); // used == max is still within budget
+    try std.testing.expectEqual(@as(usize, 10), budget.used);
+    try std.testing.expectError(error.StreamResponseTooLarge, budget.take(1));
+    // Saturating, so an absurd charge trips without wrapping the counter back
+    // under the ceiling.
+    try std.testing.expectError(error.StreamResponseTooLarge, budget.take(std.math.maxInt(usize)));
+    try std.testing.expectEqual(@as(usize, std.math.maxInt(usize)), budget.used);
+}
 
 test "delayMs doubles per attempt and caps" {
     const retry: Retry = .{ .backoff_ms_initial = 500, .backoff_ms_max = 16_000 };

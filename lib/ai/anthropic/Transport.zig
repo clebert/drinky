@@ -65,6 +65,7 @@ pub const Stream = struct {
     body: *std.Io.Reader,
     io: std.Io,
     idle_ms: u64,
+    budget: net.Budget,
     status: std.http.Status,
     error_length: usize,
     retry_after_ms: ?u64,
@@ -135,6 +136,12 @@ pub const Stream = struct {
         var deadline = net.Deadline.start(self.io, self.idle_ms);
         while (true) {
             const line = (try self.takeLine(deadline)) orelse return null;
+            // Charge every line against the whole-stream budget, so a peer that
+            // makes frequent valid progress (each frame restarting the idle
+            // window) still hits an aggregate ceiling. Counting here, after a
+            // clean read, also bounds an eventless-`.progress` flood that never
+            // returns an event to the caller.
+            try self.budget.take(line.len + 1);
             const trimmed = std.mem.trimEnd(u8, line, "\r");
             if (!std.mem.startsWith(u8, trimmed, "data:")) {
                 // A non-`data:` line (comment, `event:` field, blank) is not
@@ -265,6 +272,7 @@ pub const Stream = struct {
 pub fn send(self: *Transport, out: *Stream, body: []const u8) !void {
     out.io = self.io;
     out.idle_ms = self.timeouts.idle_ms;
+    out.budget = .{ .max = net.stream_response_bytes_max };
     out.established = false;
     net.withTimeout(self.io, self.timeouts.connect_ms, connect, .{ self, out, body }) catch |err| {
         // The timeout races `connect`, so a connect that finished right at the
@@ -506,6 +514,7 @@ test "next walks SSE data lines and ends at stream end" {
     stream.gpa = std.testing.allocator;
     stream.io = threaded.io();
     stream.idle_ms = 60_000;
+    stream.budget = .{ .max = net.stream_response_bytes_max };
     stream.body = &reader;
     stream.parsed = null;
     stream.terminal_delta = null;
@@ -666,6 +675,7 @@ test "next times out on buffered filler that makes no progress" {
     stream.gpa = std.testing.allocator;
     stream.io = clock.io();
     stream.idle_ms = 100;
+    stream.budget = .{ .max = net.stream_response_bytes_max };
     stream.body = &reader;
     stream.parsed = null;
     stream.terminal_delta = null;
@@ -676,6 +686,63 @@ test "next times out on buffered filler that makes no progress" {
     // The window is 100 ms and the logical clock advances 40 ms per reading, so it
     // closes after a few filler lines — before the trailing real event or EOF.
     try std.testing.expectError(error.Timeout, stream.next());
+}
+
+test "next stops a stream once its aggregate byte budget is spent" {
+    // Each frame is a valid text delta — real progress that restarts the idle
+    // window — so only the aggregate byte budget, not the idle deadline, ends the
+    // flood. The budget spans two frames, so it trips on their sum rather than any
+    // single line (a lone oversized line is RH-09C's concern).
+    const frame =
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"chunk\"}}\n";
+    const body = frame ** 5;
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var reader: std.Io.Reader = .fixed(body);
+    var stream: Stream = undefined;
+    stream.gpa = std.testing.allocator;
+    stream.io = threaded.io();
+    stream.idle_ms = 60_000;
+    stream.budget = .{ .max = frame.len * 2 };
+    stream.body = &reader;
+    stream.parsed = null;
+    stream.terminal_delta = null;
+    stream.usage = .{};
+    defer if (stream.parsed) |parsed| parsed.deinit();
+    defer if (stream.terminal_delta) |terminal_delta| terminal_delta.deinit();
+
+    // Each read charges the line plus its newline. Two frames land inside the
+    // budget; the third carries the running total past it, before EOF.
+    try std.testing.expectEqualStrings("chunk", (try stream.next()).?.text);
+    try std.testing.expectEqualStrings("chunk", (try stream.next()).?.text);
+    try std.testing.expectError(error.StreamResponseTooLarge, stream.next());
+}
+
+test "next bounds a flood of eventless progress frames" {
+    // A `content_block_stop` is recognized progress with no event, so it loops
+    // inside `next`, restarting the idle window and never returning to the
+    // caller. The aggregate budget must still stop the flood — which an
+    // Agent-level counter, fed only returned events, could not.
+    const frame = "data: {\"type\":\"content_block_stop\",\"index\":0}\n";
+    const body = frame ** 100;
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var reader: std.Io.Reader = .fixed(body);
+    var stream: Stream = undefined;
+    stream.gpa = std.testing.allocator;
+    stream.io = threaded.io();
+    stream.idle_ms = 60_000;
+    stream.budget = .{ .max = frame.len * 3 };
+    stream.body = &reader;
+    stream.parsed = null;
+    stream.terminal_delta = null;
+    stream.usage = .{};
+    defer if (stream.parsed) |parsed| parsed.deinit();
+    defer if (stream.terminal_delta) |terminal_delta| terminal_delta.deinit();
+
+    // A single `next` never returns an event (every frame is `.progress`); it
+    // consumes lines until the running total passes the ceiling.
+    try std.testing.expectError(error.StreamResponseTooLarge, stream.next());
 }
 
 test retryAfter {

@@ -643,6 +643,8 @@ test retryableError {
     try std.testing.expect(!retryableError(error.Canceled));
     try std.testing.expect(!retryableError(error.Closed));
     try std.testing.expect(!retryableError(error.OutOfMemory));
+    // An oversize stream reproduces on the same request, so it is not retried.
+    try std.testing.expect(!retryableError(error.StreamResponseTooLarge));
 }
 
 test "usage is attributed to the model that produced it across a switch" {
@@ -824,6 +826,7 @@ fn anthropicStream(io: std.Io, reader: *std.Io.Reader, idle_ms: u64) provider.St
     stream.anthropic_subscription.gpa = std.testing.allocator;
     stream.anthropic_subscription.io = io;
     stream.anthropic_subscription.idle_ms = idle_ms;
+    stream.anthropic_subscription.budget = .{ .max = net.stream_response_bytes_max };
     stream.anthropic_subscription.body = reader;
     stream.anthropic_subscription.parsed = null;
     stream.anthropic_subscription.terminal_delta = null;
@@ -836,6 +839,7 @@ fn openaiStream(io: std.Io, reader: *std.Io.Reader) provider.Stream {
     stream.openai_api.gpa = std.testing.allocator;
     stream.openai_api.io = io;
     stream.openai_api.idle_ms = 60_000;
+    stream.openai_api.budget = .{ .max = net.stream_response_bytes_max };
     stream.openai_api.body = reader;
     stream.openai_api.parsed = null;
     stream.openai_api.usage = .{};

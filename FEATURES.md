@@ -189,6 +189,10 @@ commit history, `BACKLOG.md` (planned work), and `docs/`.
 - A shared idle window bounds a run of reads: activity that makes no progress cannot extend it —
   even buffered filler that never blocks a read draws it down — so a stalled or filler-only read
   eventually times out.
+- A shared byte budget bounds one streamed response's total size: every line is charged (after
+  decompression) across the whole stream, so a peer that makes frequent valid progress — restarting
+  the idle window on every frame — still fails with a typed too-large error once it passes a hard
+  ceiling (64 MiB, far above any real reply). Not retried, since the same request reproduces it.
 
 ### Anthropic transport
 
