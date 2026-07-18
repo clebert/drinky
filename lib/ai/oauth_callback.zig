@@ -1,5 +1,7 @@
 const std = @import("std");
 
+const net = @import("net.zig");
+
 const callback_timeout_ms = 5 * std.time.ms_per_min;
 const request_bytes_max = 8 * 1024;
 const response_page = "pith authorized \xe2\x80\x94 you can close this tab.";
@@ -15,7 +17,7 @@ pub fn receive(
     server: *std.Io.net.Server,
 ) !Callback {
     var source: ServerSource = .{ .io = io, .server = server };
-    var bound = TimeoutBound.init(io, callback_timeout_ms);
+    var bound: TimeoutBound = .{ .io = io, .timeout_ms = callback_timeout_ms };
     return receiveWith(gpa, &bound, &source);
 }
 
@@ -67,14 +69,14 @@ fn Wire(comptime Source: type) type {
                         error.EndOfStream, error.ReadFailed => continue,
                         else => return err,
                     };
-                output.code = queryParameter(gpa, request_line, .code) catch |err| switch (err) {
+                output.code = queryParameter(gpa, request_line, "code=") catch |err| switch (err) {
                     error.MissingCallbackParam => if (std.mem.indexOf(u8, request_line, "error=") == null)
                         continue
                     else
                         return err,
                     else => return err,
                 };
-                output.state = try queryParameter(gpa, request_line, .state);
+                output.state = try queryParameter(gpa, request_line, "state=");
                 try connection.respondAuthorized();
                 return;
             }
@@ -123,22 +125,15 @@ fn takeRequestLine(reader: *std.Io.Reader) ![]const u8 {
     return request_line[0 .. request_line.len - 1];
 }
 
-const QueryParameter = enum { code, state };
-
 fn queryParameter(
     gpa: std.mem.Allocator,
     request_line: []const u8,
-    parameter: QueryParameter,
+    needle: []const u8,
 ) ![]const u8 {
-    var needle_buffer: [16]u8 = undefined;
-    const needle = std.fmt.bufPrint(&needle_buffer, "{s}=", .{@tagName(parameter)}) catch
-        return error.BadCallback;
     const at = std.mem.indexOf(u8, request_line, needle) orelse
         return error.MissingCallbackParam;
     const rest = request_line[at + needle.len ..];
-    var end: usize = 0;
-    while (end < rest.len and rest[end] != '&' and rest[end] != ' ' and rest[end] != '\r')
-        end += 1;
+    const end = std.mem.findAny(u8, rest, "& \r") orelse rest.len;
     return gpa.dupe(u8, rest[0..end]);
 }
 
@@ -146,40 +141,16 @@ const TimeoutBound = struct {
     io: std.Io,
     timeout_ms: u64,
 
-    fn init(io: std.Io, timeout_ms: u64) TimeoutBound {
-        return .{ .io = io, .timeout_ms = timeout_ms };
-    }
-
     fn call(
         self: *const TimeoutBound,
         comptime function: anytype,
         args: std.meta.ArgsTuple(@TypeOf(function)),
     ) anyerror!void {
-        const Racer = union(enum) {
-            work: @typeInfo(@TypeOf(function)).@"fn".return_type.?,
-            timer: std.Io.Cancelable!void,
-        };
-
-        var buffer: [2]Racer = undefined;
-        var select = std.Io.Select(Racer).init(self.io, &buffer);
-        defer select.cancelDiscard();
-
-        try select.concurrent(.timer, sleep, .{ self.io, self.timeout_ms });
-        try select.concurrent(.work, function, args);
-        const first = try select.await();
-        return switch (first) {
-            .work => |result| result,
-            .timer => error.Timeout,
-        };
+        // `net.race` reserves the timer before the work, and its outer error
+        // propagates: the callback refuses to run unbounded.
+        return try net.race(self.io, self.timeout_ms, function, args);
     }
 };
-
-fn sleep(io: std.Io, timeout_ms: u64) std.Io.Cancelable!void {
-    return io.sleep(
-        .fromMilliseconds(@intCast(@min(timeout_ms, std.math.maxInt(i64)))),
-        .awake,
-    );
-}
 
 const Fake = struct {
     behavior: Behavior = .request,
@@ -304,7 +275,7 @@ fn stalledWork(io: std.Io) anyerror!void {
 test "callback refuses to run without deadline concurrency" {
     var threaded: std.Io.Threaded = .init_single_threaded;
     const io = threaded.io();
-    var bound = TimeoutBound.init(io, 1);
+    var bound: TimeoutBound = .{ .io = io, .timeout_ms = 1 };
     var fake: Fake = .{
         .request = "GET /callback?code=code&state=state HTTP/1.1\r\n",
     };
@@ -327,7 +298,7 @@ test "callback work does not start unless its deadline timer is reserved" {
     );
     defer threaded.deinit();
     const io = threaded.io();
-    var bound = TimeoutBound.init(io, callback_timeout_ms);
+    var bound: TimeoutBound = .{ .io = io, .timeout_ms = callback_timeout_ms };
     var fake: Fake = .{
         .request = "GET /callback?code=code&state=state HTTP/1.1\r\n",
     };
@@ -350,7 +321,7 @@ test "callback deadline cancels and reaps work when its timer wins" {
     );
     defer threaded.deinit();
     const io = threaded.io();
-    var bound = TimeoutBound.init(io, 1);
+    var bound: TimeoutBound = .{ .io = io, .timeout_ms = 1 };
     try std.testing.expectError(error.Timeout, bound.call(stalledWork, .{io}));
 }
 

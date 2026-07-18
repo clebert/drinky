@@ -4,20 +4,17 @@ pub const Browser = struct {
     io: std.Io,
 
     pub fn launch(self: Browser, url: []const u8) error{Canceled}!?Process {
-        const child = std.process.spawn(
-            self.io,
-            .{ .argv = &.{ "xdg-open", url } },
-        ) catch |err| switch (err) {
-            error.Canceled => return error.Canceled,
-            else => std.process.spawn(
+        for ([_][]const u8{ "xdg-open", "open" }) |launcher| {
+            const child = std.process.spawn(
                 self.io,
-                .{ .argv = &.{ "open", url } },
-            ) catch |fallback_error| switch (fallback_error) {
+                .{ .argv = &.{ launcher, url } },
+            ) catch |err| switch (err) {
                 error.Canceled => return error.Canceled,
-                else => return null,
-            },
-        };
-        return .{ .io = self.io, .child = child };
+                else => continue,
+            };
+            return .{ .io = self.io, .child = child };
+        }
+        return null;
     }
 };
 

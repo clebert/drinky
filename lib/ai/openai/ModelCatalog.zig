@@ -26,11 +26,6 @@ const Metadata = struct {
     effective_context_window_percent: ?u8,
 };
 
-const Credentials = struct {
-    access_token: []const u8,
-    account_id: []const u8,
-};
-
 pub fn deinit(self: *ModelCatalog) void {
     self.parsed.deinit();
 }
@@ -62,25 +57,19 @@ fn fetchInto(
     auth: *Auth,
     out: *?ModelCatalog,
 ) !void {
-    const credentials: Credentials = .{
-        .access_token = try auth.accessToken(),
-        .account_id = auth.accountId(),
-    };
-    out.* = try request(gpa, io, &credentials);
+    out.* = try request(gpa, io, try auth.accessToken(), auth.accountId());
 }
 
 fn request(
     gpa: std.mem.Allocator,
     io: std.Io,
-    credentials: *const Credentials,
+    access_token: []const u8,
+    account_id: []const u8,
 ) !ModelCatalog {
-    if (!validHeaderValue(credentials.access_token) or
-        !validHeaderValue(credentials.account_id))
-    {
+    if (!validHeaderValue(access_token) or !validHeaderValue(account_id))
         return error.BadModelCatalogCredentials;
-    }
 
-    const authorization = try std.fmt.allocPrint(gpa, "Bearer {s}", .{credentials.access_token});
+    const authorization = try std.fmt.allocPrint(gpa, "Bearer {s}", .{access_token});
     defer gpa.free(authorization);
 
     const uri = try std.Uri.parse(endpoint);
@@ -89,7 +78,7 @@ fn request(
 
     const extra_headers = [_]std.http.Header{
         .{ .name = "accept", .value = "application/json" },
-        .{ .name = "chatgpt-account-id", .value = credentials.account_id },
+        .{ .name = "chatgpt-account-id", .value = account_id },
         .{ .name = "originator", .value = originator },
     };
     var catalog_request = try client.request(.GET, uri, .{

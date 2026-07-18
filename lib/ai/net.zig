@@ -39,21 +39,15 @@ pub const Retry = struct {
     backoff_ms_initial: u64 = 500,
     backoff_ms_max: u64 = 16_000,
 
-    /// Backoff before the retry that follows a failed `attempt` (1-based): the
-    /// initial delay doubled once per prior attempt, capped at `backoff_ms_max`.
-    pub fn delayMs(self: Retry, attempt: u32) u64 {
-        const steps: u6 = @intCast(@min(attempt -| 1, 20));
-        const scaled = self.backoff_ms_initial *| (@as(u64, 1) << steps);
-        return @min(scaled, self.backoff_ms_max);
-    }
-
-    /// Wait before the retry following a failed `attempt` (1-based). A server
+    /// Wait before the retry following a failed `attempt` (1-based): the initial
+    /// delay doubled once per prior attempt, capped at `backoff_ms_max`. A server
     /// `retry-after` hint (`suggested_ms`, 0 when absent) takes precedence over the
-    /// computed backoff but is capped at `backoff_ms_max`, so a server cannot make a
-    /// turn wait longer than local policy allows; without a hint, `delayMs` applies.
+    /// computed backoff but is capped too, so a server cannot make a turn wait
+    /// longer than local policy allows.
     pub fn backoffMs(self: Retry, attempt: u32, suggested_ms: u64) u64 {
         if (suggested_ms > 0) return @min(suggested_ms, self.backoff_ms_max);
-        return self.delayMs(attempt);
+        const steps: u6 = @intCast(@min(attempt -| 1, 20));
+        return @min(self.backoff_ms_initial *| (@as(u64, 1) << steps), self.backoff_ms_max);
     }
 };
 
@@ -82,32 +76,38 @@ pub fn withTimeout(
     comptime function: anytype,
     args: std.meta.ArgsTuple(@TypeOf(function)),
 ) Timed(@TypeOf(function)) {
-    const Result = @typeInfo(@TypeOf(function)).@"fn".return_type.?;
     // A zero bound disables the timeout: run the operation unbounded.
     if (timeout_ms == 0) return @call(.auto, function, args);
+    return race(io, timeout_ms, function, args) catch @call(.auto, function, args);
+}
+
+/// The bare race behind `withTimeout`: the timer is registered before the work,
+/// so the operation never starts without its bound, and a failed registration
+/// surfaces as the outer `error.ConcurrencyUnavailable` — distinct from the
+/// operation's own result, which lives in the payload — for the caller to map
+/// to its policy (run unbounded, or refuse as the OAuth callback must).
+pub fn race(
+    io: std.Io,
+    timeout_ms: u64,
+    comptime function: anytype,
+    args: std.meta.ArgsTuple(@TypeOf(function)),
+) error{ConcurrencyUnavailable}!Timed(@TypeOf(function)) {
     const Racer = union(enum) {
-        work: Result,
+        work: @typeInfo(@TypeOf(function)).@"fn".return_type.?,
         timer: std.Io.Cancelable!void,
     };
 
     var buffer: [2]Racer = undefined;
     var select = std.Io.Select(Racer).init(io, &buffer);
-    select.concurrent(.work, function, args) catch |err| switch (err) {
-        error.ConcurrencyUnavailable => return @call(.auto, function, args),
-    };
-    select.concurrent(.timer, sleep, .{ io, timeout_ms }) catch |err| switch (err) {
-        error.ConcurrencyUnavailable => {},
-    };
+    defer select.cancelDiscard();
 
-    const first = select.await() catch |err| {
-        select.cancelDiscard();
-        return err;
-    };
-    select.cancelDiscard();
-    return switch (first) {
+    try select.concurrent(.timer, sleep, .{ io, timeout_ms });
+    try select.concurrent(.work, function, args);
+    const first = select.await() catch |err| return @as(Timed(@TypeOf(function)), err);
+    return @as(Timed(@TypeOf(function)), switch (first) {
         .work => |result| result,
         .timer => error.Timeout,
-    };
+    });
 }
 
 fn sleep(io: std.Io, milliseconds: u64) std.Io.Cancelable!void {
@@ -216,12 +216,12 @@ test "Budget reports the bytes remaining before its ceiling" {
     try std.testing.expectEqual(@as(usize, 0), budget.remaining());
 }
 
-test "delayMs doubles per attempt and caps" {
+test "backoffMs without a hint doubles per attempt and caps" {
     const retry: Retry = .{ .backoff_ms_initial = 500, .backoff_ms_max = 16_000 };
-    try std.testing.expectEqual(@as(u64, 500), retry.delayMs(1));
-    try std.testing.expectEqual(@as(u64, 1000), retry.delayMs(2));
-    try std.testing.expectEqual(@as(u64, 2000), retry.delayMs(3));
-    try std.testing.expectEqual(@as(u64, 16_000), retry.delayMs(10));
+    try std.testing.expectEqual(@as(u64, 500), retry.backoffMs(1, 0));
+    try std.testing.expectEqual(@as(u64, 1000), retry.backoffMs(2, 0));
+    try std.testing.expectEqual(@as(u64, 2000), retry.backoffMs(3, 0));
+    try std.testing.expectEqual(@as(u64, 16_000), retry.backoffMs(10, 0));
 }
 
 test "backoffMs caps a server hint at the max backoff" {

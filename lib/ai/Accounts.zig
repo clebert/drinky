@@ -212,18 +212,13 @@ fn replaceOpenaiSubscriptionCatalog(
     defer vendor_models.deinit(self.gpa);
     models.list(.openai, &vendor_models, self.gpa) catch return;
 
-    var replacement: std.ArrayList(ContextWindow) = .empty;
-    var applied = false;
-    defer if (!applied) replacement.deinit(self.gpa);
     for (vendor_models.items) |model| {
         const context_window = catalog.contextWindow(model.name) orelse continue;
-        replacement.append(self.gpa, .{
+        self.openai_subscription_context_windows.append(self.gpa, .{
             .model = model.name,
             .tokens = context_window,
-        }) catch return;
+        }) catch return self.openai_subscription_context_windows.clearAndFree(self.gpa);
     }
-    self.openai_subscription_context_windows = replacement;
-    applied = true;
 }
 
 fn testAccounts(keys: ApiKeys, anthropic_ready: bool, openai_ready: bool) Accounts {

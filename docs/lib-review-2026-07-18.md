@@ -85,53 +85,53 @@ duplication claims double-count somewhat (realistic net win ≈ 1,500 lines).
 
 ## Concision
 
-- [ ] `lib/ai/anthropic/Transport.zig:121` **medium** — Entire SSE pull-stream engine duplicated across the two provider Transports (~320 lines)
-- [ ] `lib/ai/anthropic/Auth.zig:28` **medium** — Auth.zig credential lifecycle is one file duplicated per provider (~150 lines)
-- [ ] `lib/ai/anthropic/oauth.zig:100` **high** — Bounded token-POST plumbing duplicated across the two oauth modules (~105 lines)
-- [ ] `lib/ai/tool/walk.zig:75` **high** — Manual failure-routing plumbing in collect replaced by one drain defer (~31 lines)
-- [ ] `lib/ai/Agent.zig:404` **medium** — readReply's flush epilogue duplicated; 10 loose accumulation locals (~20 lines)
+- [x] `lib/ai/anthropic/Transport.zig:121` **medium** — Entire SSE pull-stream engine duplicated across the two provider Transports (~320 lines)
+- [x] `lib/ai/anthropic/Auth.zig:28` **medium** — Auth.zig credential lifecycle is one file duplicated per provider (~150 lines)
+- [x] `lib/ai/anthropic/oauth.zig:100` **high** — Bounded token-POST plumbing duplicated across the two oauth modules (~105 lines)
+- [x] `lib/ai/tool/walk.zig:75` **high** — Manual failure-routing plumbing in collect replaced by one drain defer (~31 lines)
+- [x] `lib/ai/Agent.zig:404` **medium** — readReply's flush epilogue duplicated; 10 loose accumulation locals (~20 lines)
 - [ ] `lib/ai/anthropic/Transport.zig:452` **medium** — std.json.Value scanning helpers redefined in six provider files (~65 lines)
-- [ ] `lib/ai/anthropic/Transport.zig:545` **medium** — Nine tests repeat the same 7-11 line Stream field-by-field setup (~50 lines)
-- [ ] `lib/ai/anthropic/Transport.zig:785` **medium** — ChunkedReader hand-rolls std.testing.Reader's artificial_limit (~34 lines)
-- [ ] `lib/ai/anthropic/oauth.zig:45` **medium** — PKCE generation duplicated verbatim in both oauth modules (~26 lines)
+- [x] `lib/ai/anthropic/Transport.zig:545` **medium** — Nine tests repeat the same 7-11 line Stream field-by-field setup (~50 lines)
+- [x] `lib/ai/anthropic/Transport.zig:785` **medium** — ChunkedReader hand-rolls std.testing.Reader's artificial_limit (~34 lines)
+- [x] `lib/ai/anthropic/oauth.zig:45` **medium** — PKCE generation duplicated verbatim in both oauth modules (~26 lines)
 - [ ] `lib/ai/anthropic/wire.zig:181` **medium** — Tool parameters JSON-schema writer duplicated across the wire serializers (~17 lines)
 - [ ] `lib/ai/auth_store.zig:146` **medium** — serializeWithout is serializeMerged minus two lines; save/remove repeat read/write blocks (~28 lines)
-- [ ] `lib/ai/command/login.zig:71` **medium** — Three identical 13-line Accounts factories and two 8-line Agent factories in tests (~37 lines)
-- [ ] `lib/ai/command/outcome.zig:24` **medium** — 10 copies of the feedback-assert switch across the command tests (~47 lines)
+- [x] `lib/ai/command/login.zig:71` **medium** — Three identical 13-line Accounts factories and two 8-line Agent factories in tests (~37 lines)
+- [x] `lib/ai/command/outcome.zig:24` **medium** — 10 copies of the feedback-assert switch across the command tests (~47 lines)
 - [ ] `lib/ai/command/root.zig:46` **medium** — Name-keyed select dispatch is a round-trip; Pick can carry the select fn directly (~12 lines)
-- [ ] `lib/ai/oauth_callback.zig:128` **medium** — TimeoutBound and its sleep re-implement net.zig's Select race (~20 lines)
+- [x] `lib/ai/oauth_callback.zig:128` **medium** — TimeoutBound and its sleep re-implement net.zig's Select race (~20 lines)
 - [ ] `lib/ai/openai/Auth.zig:58` **medium** — Four hand-rolled JSON accessor sets duplicated across the openai module (~36 lines)
-- [ ] `lib/ai/openai/oauth.zig:148` **medium** — awaitTokens is a single-production-use generic wrapper over withTimeout (~36 lines)
-- [ ] `lib/ai/provider.zig:28` **medium** — Client union duplicates gpa/io/timeouts per arm; Stream and send duplicate per-vendor pairs (~45 lines)
-- [ ] `lib/terminal/View.zig:288` **medium** — render() repeats `self.front ^= 1; return;` in five branches and clears force_reset twice (~14 lines)
-- [ ] `lib/terminal/width.zig:49` **medium** — Materializing `wrap` is used only by its own test; all real callers use `wrapper` (~39 lines)
-- [ ] `lib/ai/Accounts.zig:211` **low** — Shadow replacement list with an applied flag is a clear-on-failure append (~5 lines)
-- [ ] `lib/ai/Agent.zig:477` **low** — runToolsWith walks the reply twice to count then fill calls (~6 lines)
-- [ ] `lib/ai/anthropic/Auth.zig:56` **low** — jsonString/jsonInt are byte-identical copies of oauth.zig's (~15 lines)
+- [x] `lib/ai/openai/oauth.zig:148` **medium** — awaitTokens is a single-production-use generic wrapper over withTimeout (~36 lines)
+- [x] `lib/ai/provider.zig:28` **medium** — Client union duplicates gpa/io/timeouts per arm; Stream and send duplicate per-vendor pairs (~45 lines)
+- [x] `lib/terminal/View.zig:288` **medium** — render() repeats `self.front ^= 1; return;` in five branches and clears force_reset twice (~14 lines)
+- [x] `lib/terminal/width.zig:49` **medium** — Materializing `wrap` is used only by its own test; all real callers use `wrapper` (~39 lines)
+- [x] `lib/ai/Accounts.zig:211` **low** — Shadow replacement list with an applied flag is a clear-on-failure append (~5 lines)
+- [x] `lib/ai/Agent.zig:477` **low** — runToolsWith walks the reply twice to count then fill calls (~6 lines)
+- [x] `lib/ai/anthropic/Auth.zig:56` **low** — jsonString/jsonInt are byte-identical copies of oauth.zig's (~15 lines)
 - [ ] `lib/ai/anthropic/Transport.zig:403` **low** — decompressBuffer and json accessors duplicated across the provider (~24 lines)
-- [ ] `lib/ai/anthropic/oauth.zig:166` **low** — decompressBuffer duplicates Transport.zig's byte-for-byte (~9 lines)
-- [ ] `lib/ai/command/model.zig:36` **low** — alloc/filled/errdefer options boilerplate copy-pasted into all four pickers (~7 lines)
-- [ ] `lib/ai/command/root.zig:19` **low** — The args parameter is plumbed to every run handler and ignored by all of them
+- [x] `lib/ai/anthropic/oauth.zig:166` **low** — decompressBuffer duplicates Transport.zig's byte-for-byte (~9 lines)
+- [x] `lib/ai/command/model.zig:36` **low** — alloc/filled/errdefer options boilerplate copy-pasted into all four pickers (~7 lines)
+- [x] `lib/ai/command/root.zig:19` **low** — The args parameter is plumbed to every run handler and ignored by all of them
 - [ ] `lib/ai/llm.zig:214` **low** — Event.Stop.reason is produced but never consumed (~11 lines)
 - [ ] `lib/ai/models.zig:46` **low** — EffortMap.resolve's six-arm switch is an inline-else field access (~5 lines)
-- [ ] `lib/ai/net.zig:44` **low** — delayMs is only called by backoffMs; fold it in (~6 lines)
-- [ ] `lib/ai/oauth_callback.zig:111` **low** — queryParameter's enum, bufPrint needle, and manual scan collapse; error.BadCallback is dead (~7 lines)
-- [ ] `lib/ai/oauth_login.zig:6` **low** — Browser.launch's nested fallback is a loop over two launchers
-- [ ] `lib/ai/openai/ModelCatalog.zig:65` **low** — Credentials struct exists only to shuttle two values between two private fns (~8 lines)
+- [x] `lib/ai/net.zig:44` **low** — delayMs is only called by backoffMs; fold it in (~6 lines)
+- [x] `lib/ai/oauth_callback.zig:111` **low** — queryParameter's enum, bufPrint needle, and manual scan collapse; error.BadCallback is dead (~7 lines)
+- [x] `lib/ai/oauth_login.zig:6` **low** — Browser.launch's nested fallback is a loop over two launchers
+- [x] `lib/ai/openai/ModelCatalog.zig:65` **low** — Credentials struct exists only to shuttle two values between two private fns (~8 lines)
 - [ ] `lib/ai/openai/Transport.zig:333` **low** — decompressBuffer duplicated verbatim in three openai files (~16 lines)
-- [ ] `lib/ai/openai/Transport.zig:519` **low** — Ten tests copy-paste the same Stream field-initialization stanza (~43 lines)
-- [ ] `lib/ai/openai/oauth.zig:21` **low** — pub const redirect_uri is never referenced
-- [ ] `lib/ai/tool/edit.zig:39` **low** — Copy-pasted Canceled-vs-report catch switch across five tool call sites (~5 lines)
-- [ ] `lib/ai/tool/glob.zig:51` **low** — match and matchSegment are the same backtracking loop at two granularities (~12 lines)
-- [ ] `lib/ai/tool/grep.zig:124` **low** — lineContains hand-rolls std.ascii.findIgnoreCase (~11 lines)
-- [ ] `lib/terminal/Emulator.zig:71` **low** — OSC/DCS/APC/PM/SOS skip branch is unreachable in the test emulator (~10 lines)
-- [ ] `lib/terminal/Tty.zig:54` **low** — PosixRestore duplicates PosixSetup's restore; one control struct suffices (~8 lines)
-- [ ] `lib/terminal/Tty.zig:162` **low** — rollbackWith/leaveWith are one-line forwarders around cleanupWith (~7 lines)
-- [ ] `lib/terminal/View.zig:142` **low** — Sink.spaces duplicates Sink.repeat body byte for byte (~5 lines)
-- [ ] `lib/terminal/View.zig:467` **low** — Single-use viewportTop helper inlines to one saturating subtraction (~8 lines)
-- [ ] `lib/terminal/escape.zig:35` **low** — Three identical cursor-motion functions collapse to one with a final-byte parameter (~12 lines)
-- [ ] `lib/terminal/grapheme.zig:85` **low** — Hand-rolled binary search duplicates std.sort.binarySearch (~8 lines)
-- [ ] `lib/terminal/grapheme.zig:118` **low** — State.init hand-zeroes five fields instead of using default field values (~6 lines)
+- [x] `lib/ai/openai/Transport.zig:519` **low** — Ten tests copy-paste the same Stream field-initialization stanza (~43 lines)
+- [x] `lib/ai/openai/oauth.zig:21` **low** — pub const redirect_uri is never referenced
+- [x] `lib/ai/tool/edit.zig:39` **low** — Copy-pasted Canceled-vs-report catch switch across five tool call sites (~5 lines)
+- [x] `lib/ai/tool/glob.zig:51` **low** — match and matchSegment are the same backtracking loop at two granularities (~12 lines)
+- [x] `lib/ai/tool/grep.zig:124` **low** — lineContains hand-rolls std.ascii.findIgnoreCase (~11 lines)
+- [x] `lib/terminal/Emulator.zig:71` **low** — OSC/DCS/APC/PM/SOS skip branch is unreachable in the test emulator (~10 lines)
+- [x] `lib/terminal/Tty.zig:54` **low** — PosixRestore duplicates PosixSetup's restore; one control struct suffices (~8 lines)
+- [x] `lib/terminal/Tty.zig:162` **low** — rollbackWith/leaveWith are one-line forwarders around cleanupWith (~7 lines)
+- [x] `lib/terminal/View.zig:142` **low** — Sink.spaces duplicates Sink.repeat body byte for byte (~5 lines)
+- [x] `lib/terminal/View.zig:467` **low** — Single-use viewportTop helper inlines to one saturating subtraction (~8 lines)
+- [x] `lib/terminal/escape.zig:35` **low** — Three identical cursor-motion functions collapse to one with a final-byte parameter (~12 lines)
+- [x] `lib/terminal/grapheme.zig:85` **low** — Hand-rolled binary search duplicates std.sort.binarySearch (~8 lines)
+- [x] `lib/terminal/grapheme.zig:118` **low** — State.init hand-zeroes five fields instead of using default field values (~6 lines)
 
 ## Comments
 
@@ -164,7 +164,7 @@ duplication claims double-count somewhat (realistic net win ≈ 1,500 lines).
 - [ ] `FEATURES.md:234` **low** — OpenAI decode entry omits streamed API-error surfacing
 - [ ] `lib/ai/command/outcome.zig:22` **low** — Same ok/err report enum named Status in commands but Outcome in tools
 - [ ] `lib/ai/llm.zig:64` **low** — Account's vendor lookup is a free function while its siblings are methods
-- [ ] `lib/terminal/width.zig:49` **low** — Allocator/io parameter position drifts from the dominant gpa-first order
+- [x] `lib/terminal/width.zig:49` **low** — Allocator/io parameter position drifts from the dominant gpa-first order
 
 ## Notes
 
