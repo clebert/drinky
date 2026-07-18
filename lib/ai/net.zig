@@ -174,6 +174,13 @@ pub const Budget = struct {
         self.used +|= bytes;
         if (self.used > self.max) return error.StreamResponseTooLarge;
     }
+
+    /// Bytes the stream may still deliver before the ceiling; zero once spent.
+    /// Bounding one line's read by this stops a single oversized frame from
+    /// allocating past what the whole stream is allowed, before it is buffered.
+    pub fn remaining(self: Budget) usize {
+        return self.max -| self.used;
+    }
 };
 
 test "Budget charges until the running total passes its ceiling" {
@@ -186,6 +193,18 @@ test "Budget charges until the running total passes its ceiling" {
     // under the ceiling.
     try std.testing.expectError(error.StreamResponseTooLarge, budget.take(std.math.maxInt(usize)));
     try std.testing.expectEqual(@as(usize, std.math.maxInt(usize)), budget.used);
+}
+
+test "Budget reports the bytes remaining before its ceiling" {
+    var budget: Budget = .{ .max = 10 };
+    try std.testing.expectEqual(@as(usize, 10), budget.remaining());
+    try budget.take(4);
+    try std.testing.expectEqual(@as(usize, 6), budget.remaining());
+    try budget.take(6); // exactly spent
+    try std.testing.expectEqual(@as(usize, 0), budget.remaining());
+    // Saturating, so an overshooting charge leaves remaining at zero, never wrapped.
+    try std.testing.expectError(error.StreamResponseTooLarge, budget.take(5));
+    try std.testing.expectEqual(@as(usize, 0), budget.remaining());
 }
 
 test "delayMs doubles per attempt and caps" {

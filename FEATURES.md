@@ -193,6 +193,11 @@ commit history, `BACKLOG.md` (planned work), and `docs/`.
   decompression) across the whole stream, so a peer that makes frequent valid progress — restarting
   the idle window on every frame — still fails with a typed too-large error once it passes a hard
   ceiling (64 MiB, far above any real reply). Not retried, since the same request reproduces it.
+- Each SSE line streams into a growable buffer bounded by the budget still remaining, so one frame
+  larger than the whole stream may deliver fails with that same typed too-large error before it is
+  fully buffered — while a legitimately large single frame (a terminal frame carrying the entire
+  response, or a large reasoning blob) is read intact rather than being capped to a fixed reader
+  buffer.
 
 ### Anthropic transport
 

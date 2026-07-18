@@ -308,6 +308,24 @@ Extension seams referenced here:
       `config.json` (folded through `src/Config.zig` like the `request` section) with 50 as the
       default, so deep tool chains can raise it and a runaway guard can lower it. Clamp to at least
       one round; ties into the **Config file** item.
+- [ ] **Unify the two provider transports.** `lib/ai/anthropic/Transport.zig` and
+      `lib/ai/openai/Transport.zig` share most of their structure: the `Stream` struct skeleton, the
+      `next` read loop, `takeLine`/`readLine`/`readFailed`, the `net.Deadline`/`net.Budget` idle and
+      byte bounds, `decompressBuffer`, `retryAfter`, the `ok`/`errorText`/`retryable`/`retryAfterMs`/
+      `usageSoFar` accessors, the `send`/`connect` skeleton, the `asObject`/`asString`/`asU64` JSON
+      helpers, the `Decoded` enum shape, and the `TickingIo`/`ChunkedReader` test doubles are all
+      duplicated near-verbatim. Only the wire mapping (`decode`/`classify`), request building
+      (headers, auth, endpoint, body), and a few provider quirks differ: Anthropic's terminal-delta /
+      `message_stop` commit and `.ping` folding; OpenAI's `[DONE]` sentinel and runtime
+      `header_buffer`. Extract the SSE transport core into one module (e.g. `lib/ai/sse.zig`)
+      parameterized by a per-provider `decode` (comptime fn or vtable) and a request builder, leaving
+      each `*/Transport.zig` with only its wire logic and auth. The trigger: each transport-hardening
+      change to this layer (idle window, aggregate byte budget, per-frame allocation bound) had to be
+      applied twice, identically, to both files, so the copy-paste surface now outweighs the
+      parallel-file clarity. Do it after the current transport-hardening work settles so the
+      extraction lands on stable, fully-bounded transports and preserves that hardening (the idle,
+      byte, and per-frame bounds, plus the stream-completion and cancellation semantics) exactly;
+      keep both the per-provider wire tests and the shared-core tests green.
 
 ## UI
 

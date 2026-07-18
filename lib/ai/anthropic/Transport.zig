@@ -127,6 +127,11 @@ pub const Stream = struct {
             terminal_delta.deinit();
             self.terminal_delta = null;
         }
+        // One growable buffer holds the current line, reused across the filler
+        // lines this call skips and freed when it returns; the event handed back
+        // borrows `self.parsed`, not this buffer.
+        var line_buffer: std.Io.Writer.Allocating = .init(self.gpa);
+        defer line_buffer.deinit();
         // One idle window spans the read of each event. Anthropic sends keepalive
         // `ping` events between real ones, so a stalled stream can keep sending
         // bytes without progress; a shared `Deadline` (rather than a fresh
@@ -135,7 +140,7 @@ pub const Stream = struct {
         // `error.Timeout`.
         var deadline = net.Deadline.start(self.io, self.idle_ms);
         while (true) {
-            const line = (try self.takeLine(deadline)) orelse return null;
+            const line = (try self.takeLine(deadline, &line_buffer)) orelse return null;
             // Charge every line against the whole-stream budget, so a peer that
             // makes frequent valid progress (each frame restarting the idle
             // window) still hits an aggregate ceiling. Counting here, after a
@@ -166,26 +171,53 @@ pub const Stream = struct {
     /// read; a read that must wait on the socket is bounded by the time left in
     /// the idle window, so a stream that stalls — silent, or sending only
     /// keepalive pings — surfaces `error.Timeout` for the retry path.
-    fn takeLine(self: *Stream, deadline: net.Deadline) !?[]const u8 {
-        if (std.mem.indexOfScalar(u8, self.body.buffered(), '\n') != null) return self.readLine();
-        return deadline.call(self.io, readLine, .{self});
+    fn takeLine(
+        self: *Stream,
+        deadline: net.Deadline,
+        buffer: *std.Io.Writer.Allocating,
+    ) !?[]const u8 {
+        if (std.mem.indexOfScalar(u8, self.body.buffered(), '\n') != null)
+            return self.readLine(buffer);
+        return deadline.call(self.io, readLine, .{ self, buffer });
     }
 
-    /// Take one delimited line, mapping a canceled read to `error.Canceled`. A
-    /// cancel during the read surfaces as ReadFailed; the real cause lives on the
-    /// connection. Treat a canceled read as a clean abort (a turn cancel, or the
-    /// idle timer reaping this task) and leave every other failure on the
-    /// network-error path.
-    fn readLine(self: *Stream) anyerror!?[]const u8 {
-        return self.body.takeDelimiter('\n') catch |err| switch (err) {
-            error.ReadFailed => {
-                if (self.request.connection.?.getReadError()) |read_error| {
-                    if (read_error == error.Canceled) return error.Canceled;
-                }
-                return err;
-            },
-            else => return err,
+    /// Take one delimited line into the reused line buffer, mapping a canceled
+    /// read to `error.Canceled` (a turn cancel, or the idle timer reaping this
+    /// task) and leaving every other failure on the network-error path. The line
+    /// streams into a growable buffer bounded by what the whole-stream budget may
+    /// still deliver, so a single frame larger than that is rejected before it is
+    /// fully buffered rather than after. One `data:` line is one event — no
+    /// multi-line frame is assembled — so this bounds the assembled frame too.
+    fn readLine(self: *Stream, buffer: *std.Io.Writer.Allocating) anyerror!?[]const u8 {
+        buffer.clearRetainingCapacity();
+        // A spent budget makes the read below fail `StreamResponseTooLarge`
+        // before it can reach end of stream — the right verdict at the ceiling.
+        const cap: std.Io.Limit = .limited(self.budget.remaining());
+        _ = self.body.streamDelimiterLimit(&buffer.writer, '\n', cap) catch |err| switch (err) {
+            error.StreamTooLong => return error.StreamResponseTooLarge,
+            error.WriteFailed => return error.OutOfMemory,
+            error.ReadFailed => return self.readFailed(),
         };
+        // The delimiter, if any, is left buffered: a '\n' closes this line; end
+        // of stream with nothing buffered ends the reply, and a final line with
+        // no trailing newline is returned once before that.
+        const pending = self.body.peekByte() catch |err| switch (err) {
+            error.EndOfStream => return if (buffer.written().len == 0) null else buffer.written(),
+            error.ReadFailed => return self.readFailed(),
+        };
+        std.debug.assert(pending == '\n');
+        self.body.toss(1);
+        return buffer.written();
+    }
+
+    /// Refine a reader `ReadFailed` into `error.Canceled` when the connection
+    /// recorded a canceled read, else leave it as `error.ReadFailed` for the
+    /// network-error path.
+    fn readFailed(self: *Stream) anyerror {
+        if (self.request.connection.?.getReadError()) |read_error| {
+            if (read_error == error.Canceled) return error.Canceled;
+        }
+        return error.ReadFailed;
     }
 
     fn decode(self: *Stream, json: []const u8) !Decoded {
@@ -692,7 +724,7 @@ test "next stops a stream once its aggregate byte budget is spent" {
     // Each frame is a valid text delta — real progress that restarts the idle
     // window — so only the aggregate byte budget, not the idle deadline, ends the
     // flood. The budget spans two frames, so it trips on their sum rather than any
-    // single line (a lone oversized line is RH-09C's concern).
+    // single line, whose own read is separately bounded.
     const frame =
         "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"chunk\"}}\n";
     const body = frame ** 5;
@@ -742,6 +774,94 @@ test "next bounds a flood of eventless progress frames" {
 
     // A single `next` never returns an event (every frame is `.progress`); it
     // consumes lines until the running total passes the ceiling.
+    try std.testing.expectError(error.StreamResponseTooLarge, stream.next());
+}
+
+/// A `std.Io.Reader` with a small buffer that serves an in-memory source in
+/// chunks, standing in for a bounded-buffer network reader: production reads
+/// through a 16 KiB `transfer_buffer`, so a line longer than the buffer must be
+/// streamed into the growable line buffer rather than held whole. `stream`
+/// writes at most `chunk` bytes per call, so one line spans several fills.
+const ChunkedReader = struct {
+    source: []const u8,
+    pos: usize,
+    chunk: usize,
+    interface: std.Io.Reader,
+
+    fn init(source: []const u8, buffer: []u8, chunk: usize) ChunkedReader {
+        return .{
+            .source = source,
+            .pos = 0,
+            .chunk = chunk,
+            .interface = .{ .vtable = &vtable, .buffer = buffer, .seek = 0, .end = 0 },
+        };
+    }
+
+    const vtable: std.Io.Reader.VTable = .{ .stream = stream };
+
+    fn stream(
+        reader: *std.Io.Reader,
+        writer: *std.Io.Writer,
+        limit: std.Io.Limit,
+    ) std.Io.Reader.StreamError!usize {
+        const self: *ChunkedReader = @alignCast(@fieldParentPtr("interface", reader));
+        if (self.pos >= self.source.len) return error.EndOfStream;
+        const rest = self.source[self.pos..];
+        const take = @min(@min(self.chunk, rest.len), @intFromEnum(limit));
+        const written = try writer.write(rest[0..take]);
+        self.pos += written;
+        return written;
+    }
+};
+
+test "next reads a data frame larger than the reader buffer" {
+    // A `text_delta` whose text far exceeds the reader buffer. The line streams
+    // into the growable line buffer instead of having to fit the reader buffer,
+    // so it decodes intact rather than failing `StreamTooLong`.
+    const text = "A" ** 4000;
+    const body = "data: {\"type\":\"content_block_delta\",\"delta\":" ++
+        "{\"type\":\"text_delta\",\"text\":\"" ++ text ++ "\"}}\n";
+    var buffer: [256]u8 = undefined;
+    var chunked: ChunkedReader = .init(body, &buffer, 64);
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var stream: Stream = undefined;
+    stream.gpa = std.testing.allocator;
+    stream.io = threaded.io();
+    stream.idle_ms = 60_000;
+    stream.budget = .{ .max = net.stream_response_bytes_max };
+    stream.body = &chunked.interface;
+    stream.parsed = null;
+    stream.terminal_delta = null;
+    stream.usage = .{};
+    defer if (stream.parsed) |parsed| parsed.deinit();
+    defer if (stream.terminal_delta) |terminal_delta| terminal_delta.deinit();
+
+    try std.testing.expectEqualStrings(text, (try stream.next()).?.text);
+    try std.testing.expect((try stream.next()) == null);
+}
+
+test "next rejects a single frame larger than the stream budget" {
+    // The budget is smaller than one frame, so the line's own read trips the
+    // ceiling before the frame is buffered — the per-frame bound, distinct from
+    // the cumulative flood the budget also stops.
+    const body = "data: {\"type\":\"content_block_delta\",\"delta\":" ++
+        "{\"type\":\"text_delta\",\"text\":\"chunk\"}}\n";
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var reader: std.Io.Reader = .fixed(body);
+    var stream: Stream = undefined;
+    stream.gpa = std.testing.allocator;
+    stream.io = threaded.io();
+    stream.idle_ms = 60_000;
+    stream.budget = .{ .max = 32 };
+    stream.body = &reader;
+    stream.parsed = null;
+    stream.terminal_delta = null;
+    stream.usage = .{};
+    defer if (stream.parsed) |parsed| parsed.deinit();
+    defer if (stream.terminal_delta) |terminal_delta| terminal_delta.deinit();
+
     try std.testing.expectError(error.StreamResponseTooLarge, stream.next());
 }
 
