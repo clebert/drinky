@@ -1,17 +1,13 @@
-//! Credential lifecycle for subscription OAuth: load and persist tokens under
-//! `<home>/.pith/auth.json`, refresh a stale access token on demand, and run
-//! the interactive login (browser + loopback callback). Speaks the protocol
-//! through `oauth`; the keyed on-disk store is shared through `auth_store`.
-//!
-//! Credentials live under `"anthropic_subscription"` in the shared keyed file, so
-//! a save is a load-merge-write that never clobbers another account's entry.
+//! Credential lifecycle for subscription OAuth: the shared `auth` lifecycle
+//! instantiated over `oauth`'s protocol for the `"anthropic_subscription"`
+//! entry in `<home>/.pith/auth.json`.
 
 const std = @import("std");
 
+const auth = @import("../auth.zig");
 const auth_store = @import("../auth_store.zig");
 const net = @import("../net.zig");
 const oauth_callback = @import("../oauth_callback.zig");
-const oauth_login = @import("../oauth_login.zig");
 const oauth = @import("oauth.zig");
 
 const Auth = @This();
@@ -38,154 +34,42 @@ pub fn deinit(self: *Auth) void {
 /// Load stored tokens. Returns false when the file is absent or holds no
 /// Anthropic subscription credential.
 pub fn load(self: *Auth) !bool {
-    var file = (try auth_store.open(self.gpa, self.io, self.path)) orelse return false;
-    defer file.deinit();
-
-    const entry = file.entry(account_key) orelse return false;
-
-    const access = try self.gpa.dupe(u8, jsonString(entry, "access") orelse return error.BadCredentials);
-    errdefer self.gpa.free(access);
-    const refresh = try self.gpa.dupe(u8, jsonString(entry, "refresh") orelse return error.BadCredentials);
-    errdefer self.gpa.free(refresh);
-    const expires_ms = jsonInt(entry, "expires_ms") orelse return error.BadCredentials;
-
-    self.tokens = .{ .access = access, .refresh = refresh, .expires_ms = expires_ms };
-    return true;
-}
-
-fn jsonString(object: std.json.ObjectMap, name: []const u8) ?[]const u8 {
-    const value = object.get(name) orelse return null;
-    return switch (value) {
-        .string => |string| string,
-        else => null,
-    };
-}
-
-fn jsonInt(object: std.json.ObjectMap, name: []const u8) ?i64 {
-    const value = object.get(name) orelse return null;
-    return switch (value) {
-        .integer => |integer| integer,
-        else => null,
-    };
+    return auth.load(self, account_key);
 }
 
 /// A valid access token, refreshing and persisting it first if it has expired.
 pub fn accessToken(self: *Auth) ![]const u8 {
-    return self.accessTokenVia(oauth.refresh);
+    return auth.accessToken(self, account_key, refreshTokens);
 }
 
-/// `accessToken` over any refresher with `oauth.refresh`'s shape, so tests pin
-/// the credential lifecycle without the network. Refresh before touching the
-/// stored tokens: a failed refresh leaves the stored credential intact.
-fn accessTokenVia(self: *Auth, comptime refreshFn: anytype) ![]const u8 {
-    const tokens = self.tokens orelse return error.NotAuthenticated;
-    const now_ms = std.Io.Timestamp.now(self.io, .real).toMilliseconds();
-    if (now_ms >= tokens.expires_ms) {
-        const fresh = try refreshFn(self.gpa, self.io, self.timeouts, tokens.refresh);
-        tokens.deinit(self.gpa);
-        self.tokens = fresh;
-        try self.save();
-    }
-    return self.tokens.?.access;
+/// `oauth.refresh` in the shared lifecycle's shape (which passes whole tokens).
+fn refreshTokens(gpa: std.mem.Allocator, io: std.Io, timeouts: net.Timeouts, tokens: oauth.Tokens) !oauth.Tokens {
+    return oauth.refresh(gpa, io, timeouts, tokens.refresh);
 }
 
 /// Run the interactive OAuth login, reporting runtime text through the caller's
 /// presentation boundary.
 pub fn login(self: *Auth, prompt: anytype) !void {
-    const pair = oauth.pkce(self.io);
-    const url = try oauth.authorizeUrl(self.gpa, &pair);
-    defer self.gpa.free(url);
+    return auth.login(self, account_key, oauth, exchangeCallback, prompt);
+}
 
-    const callback = try oauth_login.receive(oauth_callback.Callback, &.{
-        .url = url,
-        .prompt = prompt,
-        .browser = oauth_login.Browser{ .io = self.io },
-        .callback = CallbackSource{ .auth = self },
-    });
-    defer {
-        self.gpa.free(callback.code);
-        self.gpa.free(callback.state);
-    }
-
-    const tokens = try oauth.exchange(
-        self.gpa,
-        self.io,
-        self.timeouts,
-        callback.code,
-        callback.state,
-        &pair.verifier,
-    );
-    if (self.tokens) |old| old.deinit(self.gpa);
-    self.tokens = tokens;
-    try self.save();
-
-    try prompt.showAuthorized(self.path);
+/// `oauth.exchange` over the received callback: the code, its `state`, and the
+/// PKCE verifier all go into the token request.
+fn exchangeCallback(self: *Auth, callback: oauth_callback.Callback, pair: *const oauth.Pkce) !oauth.Tokens {
+    return oauth.exchange(self.gpa, self.io, self.timeouts, callback.code, callback.state, &pair.verifier);
 }
 
 /// Drop this account's credentials: clear the in-memory tokens and remove its
 /// entry from `auth.json`, preserving every other account's entry.
 pub fn logout(self: *Auth) !void {
-    // Remove the on-disk entry first: a failed remove then leaves the credentials
-    // fully intact (in memory and the caller's readiness flag), so logout is
-    // atomic rather than leaving a token-less account still marked authenticated.
-    try auth_store.remove(self.gpa, self.io, self.path, account_key);
-    if (self.tokens) |tokens| tokens.deinit(self.gpa);
-    self.tokens = null;
+    return auth.logout(self, account_key);
 }
 
-/// The on-disk shape of this account's entry.
-const Entry = struct {
-    access: []const u8,
-    refresh: []const u8,
-    expires_ms: i64,
-};
-
-fn save(self: *Auth) !void {
-    const tokens = self.tokens orelse return error.NotAuthenticated;
-    try auth_store.save(self.gpa, self.io, self.path, account_key, Entry{
-        .access = tokens.access,
-        .refresh = tokens.refresh,
-        .expires_ms = tokens.expires_ms,
-    });
-}
-
-const CallbackSource = struct {
-    auth: *Auth,
-
-    pub fn listen(self: CallbackSource) !CallbackListener {
-        var address: std.Io.net.IpAddress = .{ .ip4 = .loopback(oauth.callback_port) };
-        return .{
-            .auth = self.auth,
-            .server = try address.listen(self.auth.io, .{ .reuse_address = true }),
-        };
-    }
-};
-
-const CallbackListener = struct {
-    auth: *Auth,
-    server: std.Io.net.Server,
-
-    pub fn deinit(self: *CallbackListener) void {
-        self.server.deinit(self.auth.io);
-    }
-
-    pub fn receive(self: *CallbackListener) !oauth_callback.Callback {
-        return oauth_callback.receive(self.auth.gpa, self.auth.io, &self.server);
-    }
-};
-
-fn refuseRefresh(gpa: std.mem.Allocator, io: std.Io, timeouts: net.Timeouts, refresh_token: []const u8) anyerror!oauth.Tokens {
-    _ = gpa;
-    _ = io;
-    _ = timeouts;
-    _ = refresh_token;
+fn refuseRefresh(_: std.mem.Allocator, _: std.Io, _: net.Timeouts, _: oauth.Tokens) anyerror!oauth.Tokens {
     return error.TokenRequestFailed;
 }
 
-fn grantRefresh(gpa: std.mem.Allocator, io: std.Io, timeouts: net.Timeouts, refresh_token: []const u8) anyerror!oauth.Tokens {
-    _ = io;
-    _ = timeouts;
-    _ = refresh_token;
+fn grantRefresh(gpa: std.mem.Allocator, _: std.Io, _: net.Timeouts, _: oauth.Tokens) anyerror!oauth.Tokens {
     return .{
         .access = try gpa.dupe(u8, "fresh"),
         .refresh = try gpa.dupe(u8, "next"),
@@ -194,27 +78,27 @@ fn grantRefresh(gpa: std.mem.Allocator, io: std.Io, timeouts: net.Timeouts, refr
 }
 
 test "a live access token is returned without a refresh" {
-    var auth: Auth = .{
+    var subject: Auth = .{
         .gpa = std.testing.allocator,
         .io = std.testing.io,
         .timeouts = .{},
         .path = "",
         .tokens = .{ .access = "live", .refresh = "keep", .expires_ms = std.math.maxInt(i64) },
     };
-    try std.testing.expectEqualStrings("live", try auth.accessTokenVia(refuseRefresh));
+    try std.testing.expectEqualStrings("live", try auth.accessToken(&subject, account_key, refuseRefresh));
 }
 
 test "a failed refresh leaves the stored credential intact" {
-    var auth: Auth = .{
+    var subject: Auth = .{
         .gpa = std.testing.allocator,
         .io = std.testing.io,
         .timeouts = .{},
         .path = "",
         .tokens = .{ .access = "stale", .refresh = "keep", .expires_ms = 0 },
     };
-    try std.testing.expectError(error.TokenRequestFailed, auth.accessTokenVia(refuseRefresh));
-    try std.testing.expectEqualStrings("stale", auth.tokens.?.access);
-    try std.testing.expectEqualStrings("keep", auth.tokens.?.refresh);
+    try std.testing.expectError(error.TokenRequestFailed, auth.accessToken(&subject, account_key, refuseRefresh));
+    try std.testing.expectEqualStrings("stale", subject.tokens.?.access);
+    try std.testing.expectEqualStrings("keep", subject.tokens.?.refresh);
 }
 
 test "an expired access token is refreshed and re-persisted" {
@@ -223,7 +107,7 @@ test "an expired access token is refreshed and re-persisted" {
     defer tmp.cleanup();
     var path_buf: [128]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/auth.json", .{tmp.sub_path});
-    var auth: Auth = .{
+    var subject: Auth = .{
         .gpa = gpa,
         .io = std.testing.io,
         .timeouts = .{},
@@ -234,10 +118,10 @@ test "an expired access token is refreshed and re-persisted" {
             .expires_ms = 0,
         },
     };
-    defer auth.tokens.?.deinit(gpa);
+    defer subject.tokens.?.deinit(gpa);
 
-    try std.testing.expectEqualStrings("fresh", try auth.accessTokenVia(grantRefresh));
-    try std.testing.expectEqualStrings("next", auth.tokens.?.refresh);
+    try std.testing.expectEqualStrings("fresh", try auth.accessToken(&subject, account_key, grantRefresh));
+    try std.testing.expectEqualStrings("next", subject.tokens.?.refresh);
 
     var file = (try auth_store.open(gpa, std.testing.io, path)).?;
     defer file.deinit();
@@ -254,13 +138,13 @@ test "load rejects an entry missing a credential field" {
     });
     var path_buf: [128]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/auth.json", .{tmp.sub_path});
-    var auth: Auth = .{
+    var subject: Auth = .{
         .gpa = gpa,
         .io = std.testing.io,
         .timeouts = .{},
         .path = path,
         .tokens = null,
     };
-    try std.testing.expectError(error.BadCredentials, auth.load());
-    try std.testing.expect(auth.tokens == null);
+    try std.testing.expectError(error.BadCredentials, subject.load());
+    try std.testing.expect(subject.tokens == null);
 }
