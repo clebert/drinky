@@ -15,3 +15,10 @@ pub const Outcome = enum { ok, err };
 pub fn report(gpa: std.mem.Allocator, outcome: Outcome, comptime format: []const u8, args: anytype) !Result {
     return .{ .content = try std.fmt.allocPrint(gpa, format, args), .is_error = outcome == .err };
 }
+
+/// Report an I/O failure as `cannot <verb> <path>: <error>` — except
+/// cancellation, which propagates so the aborted turn stops at once.
+pub fn cannot(gpa: std.mem.Allocator, err: anyerror, comptime verb: []const u8, path: []const u8) !Result {
+    if (err == error.Canceled) return error.Canceled;
+    return report(gpa, .err, "cannot " ++ verb ++ " {s}: {s}", .{ path, @errorName(err) });
+}

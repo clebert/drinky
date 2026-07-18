@@ -40,8 +40,7 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
 
     const data = std.Io.Dir.cwd().readFileAlloc(context.io, path, gpa, .limited(file_bytes_max)) catch |err| switch (err) {
         error.StreamTooLong => return Result.report(gpa, .err, "{s} is larger than {d} bytes; edit it another way", .{ path, file_bytes_max }),
-        error.Canceled => return err,
-        else => return Result.report(gpa, .err, "cannot read {s}: {s}", .{ path, @errorName(err) }),
+        else => return Result.cannot(gpa, err, "read", path),
     };
     defer gpa.free(data);
 
@@ -53,10 +52,8 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
     };
     defer gpa.free(updated);
 
-    fs.writeFile(context.io, std.Io.Dir.cwd(), .{ .sub_path = path, .data = updated }) catch |err| switch (err) {
-        error.Canceled => return err,
-        else => return Result.report(gpa, .err, "cannot write {s}: {s}", .{ path, @errorName(err) }),
-    };
+    fs.writeFile(context.io, std.Io.Dir.cwd(), .{ .sub_path = path, .data = updated }) catch |err|
+        return Result.cannot(gpa, err, "write", path);
     return Result.report(gpa, .ok, "edited {s}", .{path});
 }
 

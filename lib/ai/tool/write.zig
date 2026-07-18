@@ -33,10 +33,8 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
     const path = parsed.value.path;
     const contents = parsed.value.content;
 
-    fs.writeFile(context.io, std.Io.Dir.cwd(), .{ .sub_path = path, .data = contents }) catch |err| switch (err) {
-        error.Canceled => return err,
-        else => return Result.report(gpa, .err, "cannot write {s}: {s}", .{ path, @errorName(err) }),
-    };
+    fs.writeFile(context.io, std.Io.Dir.cwd(), .{ .sub_path = path, .data = contents }) catch |err|
+        return Result.cannot(gpa, err, "write", path);
     return Result.report(gpa, .ok, "wrote {d} bytes to {s}", .{ contents.len, path });
 }
 

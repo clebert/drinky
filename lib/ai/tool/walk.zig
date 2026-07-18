@@ -64,6 +64,10 @@ pub fn collect(
 
     var walker = try dir.walkSelectively(gpa);
     defer walker.deinit();
+    // Release directory handles still open on the walker stack on every exit:
+    // `deinit` frees its memory but not its handles, and `leave` never closes
+    // the base directory, which `dir` closes on return.
+    defer while (walker.stack.items.len > 0) walker.leave(io);
 
     var keeper: Keeper = .{ .retain = options.retain };
     errdefer keeper.deinit(gpa);
@@ -72,84 +76,50 @@ pub fn collect(
     defer path_buf.deinit(gpa);
 
     const at_root = std.mem.eql(u8, options.base, ".");
-    var failure: ?anyerror = null;
     var visited: usize = 0;
     var capped = false;
-    walk: while (true) {
+    while (true) {
         const entry = (walker.next(io) catch |err| switch (err) {
             // Cancellation aborts the turn, so stop the walk at once: it is
             // one-shot, and resuming would do real traversal I/O. Any other
             // iteration error skips the bad directory (the walker has already
             // closed it) and keeps the walk resilient.
-            error.Canceled => {
-                failure = err;
-                break :walk;
-            },
+            error.Canceled => return err,
             else => continue,
         }) orelse break;
         // Stop only once a further entry proves the tree is not exhausted, so a
         // tree with exactly `entries_max` entries is not falsely flagged.
         if (visited >= options.entries_max) {
             capped = true;
-            break :walk;
+            break;
         }
         visited += 1;
         switch (entry.kind) {
             .directory => {
                 if (isNoise(entry.basename)) continue;
                 walker.enter(io, entry) catch |err| switch (err) {
-                    error.Canceled => {
-                        failure = err;
-                        break :walk;
-                    },
+                    error.Canceled => return err,
                     else => {},
                 };
             },
             .file => {
                 if (!glob.match(.{ .pattern = options.pattern, .path = entry.path })) continue;
-                // Route allocation failure through `failure` rather than a bare
-                // `try` so the stack-draining cleanup below still runs.
-                record(gpa, &keeper, &path_buf, .{
-                    .base = options.base,
-                    .at_root = at_root,
-                    .path = entry.path,
-                }) catch |err| {
-                    failure = err;
-                    break :walk;
-                };
+                path_buf.clearRetainingCapacity();
+                if (!at_root) {
+                    try path_buf.appendSlice(gpa, options.base);
+                    try path_buf.append(gpa, '/');
+                }
+                try path_buf.appendSlice(gpa, entry.path);
+                try keeper.offer(gpa, path_buf.items);
             },
             else => {},
         }
     }
-    // Release directory handles still open on the walker stack: `deinit` frees
-    // its memory but not its handles. A completed walk has already drained the
-    // stack; a walk stopped by cancellation or the entry cap leaves entered
-    // subdirectories open, so close them here. `leave` never closes the base
-    // directory, which `dir` closes on return.
-    while (walker.stack.items.len > 0) walker.leave(io);
-    if (failure) |err| return err;
     return .{
         .paths = try keeper.toOwnedSorted(gpa),
         .matched = keeper.matched,
         .capped = capped,
     };
-}
-
-/// Formats the working-directory-relative display path into `path_buf` and
-/// offers it to `keeper`.
-fn record(
-    gpa: std.mem.Allocator,
-    keeper: *Keeper,
-    path_buf: *std.ArrayList(u8),
-    options: struct { base: []const u8, at_root: bool, path: []const u8 },
-) !void {
-    path_buf.clearRetainingCapacity();
-    if (!options.at_root) {
-        try path_buf.appendSlice(gpa, options.base);
-        try path_buf.append(gpa, '/');
-    }
-    try path_buf.appendSlice(gpa, options.path);
-    try keeper.offer(gpa, path_buf.items);
 }
 
 /// Retains the lexicographically-smallest `retain` paths offered to it, freeing

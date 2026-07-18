@@ -54,10 +54,8 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
     const ignore_case = parsed.value.ignore_case;
     const limit = parsed.value.limit;
 
-    var matches = walk.collect(context.io, gpa, .{ .base = base, .pattern = file_glob, .retain = files_max }) catch |err| switch (err) {
-        error.Canceled => return err,
-        else => return Result.report(gpa, .err, "cannot search {s}: {s}", .{ base, @errorName(err) }),
-    };
+    var matches = walk.collect(context.io, gpa, .{ .base = base, .pattern = file_glob, .retain = files_max }) catch |err|
+        return Result.cannot(gpa, err, "search", base);
     defer matches.deinit(gpa);
     // Fewer candidates retained than found, or a capped walk, means some files
     // were never searched.
@@ -91,7 +89,8 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
         var lines = std.mem.splitScalar(u8, data, '\n');
         while (lines.next()) |line| {
             line_number += 1;
-            if (!lineContains(.{ .line = line, .needle = pattern, .ignore_case = ignore_case })) continue;
+            const hit = if (ignore_case) std.ascii.findIgnoreCase(line, pattern) else std.mem.indexOf(u8, line, pattern);
+            if (hit == null) continue;
             if (count == limit) {
                 line_capped = true;
                 break :search;
@@ -126,19 +125,6 @@ fn utf8FloorLength(bytes: []const u8, max: usize) usize {
     var end = @min(bytes.len, max);
     while (end > 0 and end < bytes.len and bytes[end] & 0xC0 == 0x80) end -= 1;
     return end;
-}
-
-fn lineContains(options: struct { line: []const u8, needle: []const u8, ignore_case: bool }) bool {
-    const line = options.line;
-    const needle = options.needle;
-    if (needle.len == 0 or line.len < needle.len) return false;
-    if (!options.ignore_case) return std.mem.indexOf(u8, line, needle) != null;
-    const last = line.len - needle.len;
-    var start: usize = 0;
-    while (start <= last) : (start += 1) {
-        if (std.ascii.startsWithIgnoreCase(line[start..], needle)) return true;
-    }
-    return false;
 }
 
 test utf8FloorLength {

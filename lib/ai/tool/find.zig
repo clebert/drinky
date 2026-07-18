@@ -38,10 +38,8 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
     const base = parsed.value.path;
     const limit = parsed.value.limit;
 
-    var matches = walk.collect(context.io, gpa, .{ .base = base, .pattern = pattern, .retain = limit }) catch |err| switch (err) {
-        error.Canceled => return err,
-        else => return Result.report(gpa, .err, "cannot search {s}: {s}", .{ base, @errorName(err) }),
-    };
+    var matches = walk.collect(context.io, gpa, .{ .base = base, .pattern = pattern, .retain = limit }) catch |err|
+        return Result.cannot(gpa, err, "search", base);
     defer matches.deinit(gpa);
     if (matches.matched == 0) {
         if (matches.capped) return Result.report(gpa, .ok, "no files match {s} in the portion searched; the tree is too large to scan fully — narrow the path or pattern", .{pattern});
