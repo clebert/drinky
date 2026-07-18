@@ -5,8 +5,7 @@
 const std = @import("std");
 
 const net = @import("../net.zig");
-
-const base64url = std.base64.url_safe_no_pad.Encoder;
+const oauth_wire = @import("../oauth_wire.zig");
 
 pub const client_id = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 pub const authorize_url = "https://claude.ai/oauth/authorize";
@@ -18,16 +17,11 @@ const redirect_encoded = "http%3A%2F%2Flocalhost%3A53692%2Fcallback";
 const scope_encoded = "org%3Acreate_api_key%20user%3Aprofile%20user%3Ainference" ++
     "%20user%3Asessions%3Aclaude_code%20user%3Amcp_servers%20user%3Afile_upload";
 const refresh_margin_ms = 5 * 60 * 1000;
-/// Hard cap on a token response body: a larger response fails before it can
-/// allocate without bound. Well above any real exchange or refresh payload.
-const token_response_bytes_max = 256 * 1024;
 
-const verifier_len = base64url.calcSize(32);
+pub const Pkce = oauth_wire.Pkce;
 
-pub const Pkce = struct {
-    verifier: [verifier_len]u8,
-    challenge: [verifier_len]u8,
-};
+/// A fresh PKCE verifier/challenge pair drawn from the Io's CSPRNG.
+pub const pkce = oauth_wire.pkce;
 
 pub const Tokens = struct {
     access: []const u8,
@@ -40,18 +34,6 @@ pub const Tokens = struct {
         gpa.free(self.refresh);
     }
 };
-
-/// A fresh PKCE verifier/challenge pair drawn from the Io's CSPRNG.
-pub fn pkce(io: std.Io) Pkce {
-    var seed: [32]u8 = undefined;
-    io.random(&seed);
-    var result: Pkce = undefined;
-    _ = base64url.encode(&result.verifier, &seed);
-    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(&result.verifier, &digest, .{});
-    _ = base64url.encode(&result.challenge, &digest);
-    return result;
-}
 
 /// The browser authorize URL for `code`. Caller frees the result.
 pub fn authorizeUrl(gpa: std.mem.Allocator, code: *const Pkce) ![]u8 {
@@ -112,82 +94,10 @@ pub fn refresh(
     return post(gpa, io, timeouts, body);
 }
 
-/// The token request bounded by the connect timeout: the whole connect, send,
-/// receive-head, and body read must finish within it, or it is cancelled and
-/// reaped as `error.Timeout`.
 fn post(gpa: std.mem.Allocator, io: std.Io, timeouts: net.Timeouts, body: []const u8) !Tokens {
-    var out: ?Tokens = null;
-    return awaitTokens(gpa, io, timeouts.connect_ms, &out, fetchInto, .{ gpa, io, body, &out });
-}
-
-/// Run `work` (which writes its result into `out`) bounded by `timeout_ms`. The
-/// timeout races the request, so one that finished right at the deadline can
-/// still surface as an error with its result discarded; reclaim anything left in
-/// `out` on any error so a completed-at-the-deadline request cannot leak.
-fn awaitTokens(
-    gpa: std.mem.Allocator,
-    io: std.Io,
-    timeout_ms: u64,
-    out: *?Tokens,
-    comptime work: anytype,
-    args: std.meta.ArgsTuple(@TypeOf(work)),
-) !Tokens {
-    net.withTimeout(io, timeout_ms, work, args) catch |err| {
-        if (out.*) |tokens| tokens.deinit(gpa);
-        return err;
-    };
-    return out.* orelse error.TokenRequestFailed;
-}
-
-fn fetchInto(gpa: std.mem.Allocator, io: std.Io, body: []const u8, out: *?Tokens) !void {
-    const uri = try std.Uri.parse(token_url);
-    var client: std.http.Client = .{ .allocator = gpa, .io = io };
-    defer client.deinit();
-
-    var request = try client.request(.POST, uri, .{
-        .headers = .{ .content_type = .{ .override = "application/json" } },
-    });
-    defer request.deinit();
-
-    request.transfer_encoding = .{ .content_length = body.len };
-    var send = try request.sendBodyUnflushed(&.{});
-    try send.writer.writeAll(body);
-    try send.end();
-    try request.connection.?.flush();
-
-    var redirect_buffer: [2048]u8 = undefined;
-    var response = try request.receiveHead(&redirect_buffer);
-    if (response.head.status != .ok) return error.TokenRequestFailed;
-
-    const decompress_buffer = try decompressBuffer(gpa, response.head.content_encoding);
-    defer if (decompress_buffer.len != 0) gpa.free(decompress_buffer);
-    var decompress: std.http.Decompress = undefined;
-    var transfer_buffer: [4096]u8 = undefined;
-    const reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
-
-    const payload = try readBody(gpa, reader);
+    const payload = try oauth_wire.post(gpa, io, timeouts, token_url, "application/json", body);
     defer gpa.free(payload);
-    out.* = try parseTokens(gpa, io, payload);
-}
-
-/// The response body, capped at `token_response_bytes_max`: a larger body fails
-/// with `error.TokenResponseTooLarge` rather than allocating without bound.
-fn readBody(gpa: std.mem.Allocator, reader: *std.Io.Reader) ![]u8 {
-    return reader.allocRemaining(gpa, .limited(token_response_bytes_max)) catch |err| switch (err) {
-        error.StreamTooLong => error.TokenResponseTooLarge,
-        else => err,
-    };
-}
-
-/// A decompression window sized for `encoding`, or an empty slice when the body
-/// is not compressed. Caller frees a non-empty result.
-fn decompressBuffer(gpa: std.mem.Allocator, encoding: std.http.ContentEncoding) ![]u8 {
-    return switch (encoding) {
-        .identity => &.{},
-        .gzip, .deflate => gpa.alloc(u8, std.compress.flate.max_window_len),
-        .zstd => gpa.alloc(u8, std.compress.zstd.default_window_len),
-        .compress => error.UnsupportedContentEncoding,
-    };
+    return parseTokens(gpa, io, payload);
 }
 
 fn parseTokens(gpa: std.mem.Allocator, io: std.Io, body: []const u8) !Tokens {
@@ -231,15 +141,6 @@ fn jsonInt(object: std.json.ObjectMap, name: []const u8) ?i64 {
     };
 }
 
-test pkce {
-    const code = pkce(std.testing.io);
-    var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(&code.verifier, &digest, .{});
-    var expected: [verifier_len]u8 = undefined;
-    _ = base64url.encode(&expected, &digest);
-    try std.testing.expectEqualStrings(&expected, &code.challenge);
-}
-
 test authorizeUrl {
     var code: Pkce = undefined;
     @memset(&code.verifier, 'v');
@@ -276,46 +177,5 @@ test "parseTokens rejects an expiry that would overflow" {
     try std.testing.expectError(
         error.MissingExpiry,
         parseTokens(std.testing.allocator, std.testing.io, body),
-    );
-}
-
-test "readBody rejects an oversized token response" {
-    const gpa = std.testing.allocator;
-    const oversized = try gpa.alloc(u8, token_response_bytes_max);
-    defer gpa.free(oversized);
-    @memset(oversized, 'x');
-    var buffer: [64]u8 = undefined;
-    var reader = std.testing.Reader.init(&buffer, &.{.{ .buffer = oversized }});
-    try std.testing.expectError(error.TokenResponseTooLarge, readBody(gpa, &reader.interface));
-}
-
-test "readBody returns a normal token response body" {
-    const gpa = std.testing.allocator;
-    const body =
-        \\{"access_token":"sk-ant-oat-x","refresh_token":"sk-ant-ort-y","expires_in":3600}
-    ;
-    var buffer: [64]u8 = undefined;
-    var reader = std.testing.Reader.init(&buffer, &.{.{ .buffer = body }});
-    const read = try readBody(gpa, &reader.interface);
-    defer gpa.free(read);
-    try std.testing.expectEqualStrings(body, read);
-}
-
-fn produceThenFail(gpa: std.mem.Allocator, out: *?Tokens) anyerror!void {
-    out.* = .{
-        .access = try gpa.dupe(u8, "access"),
-        .refresh = try gpa.dupe(u8, "refresh"),
-        .expires_ms = 0,
-    };
-    return error.Canceled;
-}
-
-test "a token request that fails after producing a result frees it" {
-    const gpa = std.testing.allocator;
-    var out: ?Tokens = null;
-    // The leak-detecting allocator proves the discarded result was freed.
-    try std.testing.expectError(
-        error.Canceled,
-        awaitTokens(gpa, std.testing.io, 1000, &out, produceThenFail, .{ gpa, &out }),
     );
 }
