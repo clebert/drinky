@@ -73,11 +73,27 @@ pub fn exchange(
     state: []const u8,
     verifier: []const u8,
 ) !Tokens {
-    const body = try std.fmt.allocPrint(gpa,
-        \\{{"grant_type":"authorization_code","client_id":"{s}","code":"{s}","state":"{s}","redirect_uri":"{s}","code_verifier":"{s}"}}
-    , .{ client_id, code, state, redirect_uri, verifier });
+    const body = try exchangeBody(gpa, code, state, verifier);
     defer gpa.free(body);
     return post(gpa, io, timeouts, body);
+}
+
+/// The exchange body via the JSON serializer, so hostile callback bytes cannot
+/// inject members into the token request. Caller frees the result.
+fn exchangeBody(
+    gpa: std.mem.Allocator,
+    code: []const u8,
+    state: []const u8,
+    verifier: []const u8,
+) error{OutOfMemory}![]u8 {
+    return std.json.Stringify.valueAlloc(gpa, .{
+        .grant_type = "authorization_code",
+        .client_id = client_id,
+        .code = code,
+        .state = state,
+        .redirect_uri = redirect_uri,
+        .code_verifier = verifier,
+    }, .{});
 }
 
 /// Trade a refresh token for a fresh access token. Caller frees the result.
@@ -87,9 +103,11 @@ pub fn refresh(
     timeouts: net.Timeouts,
     refresh_token: []const u8,
 ) !Tokens {
-    const body = try std.fmt.allocPrint(gpa,
-        \\{{"grant_type":"refresh_token","client_id":"{s}","refresh_token":"{s}"}}
-    , .{ client_id, refresh_token });
+    const body = try std.json.Stringify.valueAlloc(gpa, .{
+        .grant_type = "refresh_token",
+        .client_id = client_id,
+        .refresh_token = refresh_token,
+    }, .{});
     defer gpa.free(body);
     return post(gpa, io, timeouts, body);
 }
@@ -182,6 +200,8 @@ fn parseTokens(gpa: std.mem.Allocator, io: std.Io, body: []const u8) !Tokens {
     const access = jsonString(object, "access_token") orelse return error.MissingAccessToken;
     const refresh_token = jsonString(object, "refresh_token") orelse return error.MissingRefreshToken;
     const expires_in = jsonInt(object, "expires_in") orelse return error.MissingExpiry;
+    // A crafted expiry must fail cleanly, not overflow and crash.
+    const expires_scaled = std.math.mul(i64, expires_in, 1000) catch return error.MissingExpiry;
 
     const access_owned = try gpa.dupe(u8, access);
     errdefer gpa.free(access_owned);
@@ -191,7 +211,7 @@ fn parseTokens(gpa: std.mem.Allocator, io: std.Io, body: []const u8) !Tokens {
     return .{
         .access = access_owned,
         .refresh = refresh_owned,
-        .expires_ms = now_ms + expires_in * 1000 - refresh_margin_ms,
+        .expires_ms = now_ms +| expires_scaled -| refresh_margin_ms,
     };
 }
 
@@ -230,6 +250,15 @@ test authorizeUrl {
     try std.testing.expect(std.mem.indexOf(u8, url, client_id) != null);
 }
 
+test exchangeBody {
+    const body = try exchangeBody(std.testing.allocator, "c\"ode", "st\\ate", "verifier");
+    defer std.testing.allocator.free(body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("c\"ode", parsed.value.object.get("code").?.string);
+    try std.testing.expectEqualStrings("st\\ate", parsed.value.object.get("state").?.string);
+}
+
 test parseTokens {
     const body =
         \\{"access_token":"sk-ant-oat-x","refresh_token":"sk-ant-ort-y","expires_in":3600}
@@ -238,6 +267,16 @@ test parseTokens {
     defer tokens.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("sk-ant-oat-x", tokens.access);
     try std.testing.expectEqualStrings("sk-ant-ort-y", tokens.refresh);
+}
+
+test "parseTokens rejects an expiry that would overflow" {
+    const body =
+        \\{"access_token":"a","refresh_token":"r","expires_in":9223372036854775807}
+    ;
+    try std.testing.expectError(
+        error.MissingExpiry,
+        parseTokens(std.testing.allocator, std.testing.io, body),
+    );
 }
 
 test "readBody rejects an oversized token response" {

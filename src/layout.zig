@@ -31,9 +31,11 @@ const id_input = id_reserved + 1;
 const id_spinner = id_reserved + 2;
 const id_steering = id_reserved + 3;
 
-/// The anchor id of the tool box at `index` in the running turn.
+/// The anchor id of the tool box at `index` in the running turn. Grows downward
+/// from just below the fixed ids, so it never wraps past `maxInt` however many
+/// boxes one turn shows.
 fn idTool(index: usize) usize {
-    return id_reserved + 4 + index;
+    return id_reserved - 1 - index;
 }
 
 const tool_box_style: ui.paint.BoxStyle = .{
@@ -305,6 +307,28 @@ test "a turn tail stacks the tool boxes, spinner, and editor" {
     try std.testing.expect(first < second);
     try std.testing.expect(second < spin);
     try std.testing.expect(spin < footer);
+}
+
+// Regression: 253 concurrent tool boxes used to wrap the anchor-id arithmetic
+// past maxInt(usize); the ids must stay unique and in range.
+test "a turn with 253 tool boxes keeps its anchor ids from wrapping" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var view = terminal.View.init(gpa, &out.writer);
+    defer view.deinit();
+    var editor = ui.Editor.init(gpa);
+    defer editor.deinit();
+
+    const tools = [_][]const u8{"toolbox"} ** 253;
+    const scene: Scene = .{
+        .transcript = &[_]ui.block.Entry{},
+        .tail = .{ .turn = .{ .tools = &tools, .spinner = 0, .steering = &.{}, .editor = &editor } },
+        .status = &test_status,
+    };
+    try project(&view, .{ .columns = 40, .rows = 24 }, &scene);
+
+    try std.testing.expect(idTool(252) < id_reserved);
 }
 
 // A turn tail with queued steering shows each "Steering:" row and the recall

@@ -33,7 +33,8 @@ const registry = [_]Entry{
 /// reporting an unknown command as an error (mirroring an unknown tool).
 pub fn run(context: *Context, line: []const u8) !Outcome {
     const body = line[1..];
-    const split = std.mem.indexOfAny(u8, body, " \t") orelse body.len;
+    // Editor input can carry interior newlines (Shift+Enter, paste).
+    const split = std.mem.indexOfAny(u8, body, " \t\r\n") orelse body.len;
     const name = body[0..split];
     const entry = find(name) orelse
         return Outcome.report(context.gpa, .err, "unknown command: /{s}", .{name});
@@ -67,6 +68,19 @@ test "unknown command is reported" {
         .feedback => |feedback| {
             defer gpa.free(feedback.content);
             try std.testing.expect(feedback.is_error);
+        },
+        else => return error.ExpectedFeedback,
+    }
+}
+
+test "a newline delimits the command name like a space" {
+    const gpa = std.testing.allocator;
+    var context: Context = .{ .gpa = gpa, .agent = undefined, .accounts = undefined };
+    const outcome = try run(&context, "/nope\nfoo");
+    switch (outcome) {
+        .feedback => |feedback| {
+            defer gpa.free(feedback.content);
+            try std.testing.expectEqualStrings("unknown command: /nope", feedback.content);
         },
         else => return error.ExpectedFeedback,
     }

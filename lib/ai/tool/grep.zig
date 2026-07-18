@@ -74,7 +74,12 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
             break :search;
         }
         const data = std.Io.Dir.cwd().readFileAlloc(context.io, path, gpa, .limited(file_bytes_max)) catch |err| switch (err) {
-            error.Canceled => return err,
+            error.Canceled, error.OutOfMemory => return err,
+            // An oversized file streams the full limit off disk before failing.
+            error.StreamTooLong => {
+                bytes_read += file_bytes_max;
+                continue;
+            },
             else => continue,
         };
         defer gpa.free(data);
@@ -92,7 +97,8 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
             }
             const shown = line[0..utf8FloorLength(line, line_bytes_max)];
             if (count > 0) try out.writer.writeAll("\n");
-            try out.writer.print("{s}:{d}:{s}", .{ path, line_number, shown });
+            // U+FFFD-substitute invalid bytes so the result serializes as a JSON string.
+            try out.writer.print("{f}:{d}:{f}", .{ std.unicode.fmtUtf8(path), line_number, std.unicode.fmtUtf8(shown) });
             count += 1;
         }
     }
@@ -149,6 +155,24 @@ test "grep finds a literal substring with a glob filter" {
     defer std.testing.allocator.free(result.content);
     try std.testing.expect(!result.is_error);
     try std.testing.expect(std.mem.indexOf(u8, result.content, "lib/ai/tool/glob.zig:") != null);
+}
+
+test "grep replaces invalid UTF-8 in matched lines" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "latin1.txt", .data = "caf\xE9 latte\n" });
+    var input_buf: [128]u8 = undefined;
+    const input = try std.fmt.bufPrint(&input_buf,
+        \\{{"pattern":"caf","path":".zig-cache/tmp/{s}"}}
+    , .{tmp.sub_path});
+
+    const context: Context = .{ .gpa = std.testing.allocator, .io = io };
+    const result = try run(&context, input);
+    defer std.testing.allocator.free(result.content);
+    try std.testing.expect(!result.is_error);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(result.content));
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "latin1.txt:1:caf\u{FFFD} latte") != null);
 }
 
 test "grep is case-insensitive when asked" {

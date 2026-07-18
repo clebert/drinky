@@ -181,6 +181,9 @@ fn drainSteering(self: *Agent, handler: anytype) !bool {
         self.gpa.free(pending);
     }
     if (pending.len == 0) return false;
+    // A failure mid-delivery (a cancel included) rolls the turn back, so return
+    // the taken batch to the queue for the cancel path to hand back to the editor.
+    errdefer for (pending) |message| self.steering.push(message) catch break;
     const combined = try Steering.join(self.gpa, pending);
     defer self.gpa.free(combined);
     try self.appendUser(combined);
@@ -372,6 +375,12 @@ fn readReply(
 
     while (try stream.next()) |event| switch (event) {
         .thinking => |chunk| {
+            // A run whose blob already arrived is finished, as is one whose
+            // item id differs: commit it so adjacent runs stay separate items.
+            if (blob.items.len != 0 or newRunId(reasoning_id.items, chunk.id))
+                try flushThinking(self.gpa, &pending, &thinking, &blob, &reasoning_id, &in_thinking, origin);
+            if (!in_thinking)
+                try flushBeforeRun(self.gpa, &pending, tool_id.items, tool_name.items, &input, &in_tool, &text);
             in_thinking = true;
             if (chunk.id.len != 0) try setBuffer(self.gpa, &reasoning_id, chunk.id);
             try thinking.appendSlice(self.gpa, chunk.text);
@@ -380,6 +389,10 @@ fn readReply(
         // The blob closes the reasoning run; mark it open so a run that carried
         // only a blob (omitted reasoning) still round-trips.
         .thinking_blob => |chunk| {
+            if (newRunId(reasoning_id.items, chunk.id))
+                try flushThinking(self.gpa, &pending, &thinking, &blob, &reasoning_id, &in_thinking, origin);
+            if (!in_thinking)
+                try flushBeforeRun(self.gpa, &pending, tool_id.items, tool_name.items, &input, &in_tool, &text);
             in_thinking = true;
             if (chunk.id.len != 0) try setBuffer(self.gpa, &reasoning_id, chunk.id);
             try blob.appendSlice(self.gpa, chunk.blob);
@@ -549,6 +562,30 @@ fn runToolsWith(
 fn setBuffer(gpa: std.mem.Allocator, buffer: *std.ArrayList(u8), bytes: []const u8) !void {
     buffer.clearRetainingCapacity();
     try buffer.appendSlice(gpa, bytes);
+}
+
+/// Whether an incoming chunk's item id names a different reasoning item than
+/// the open run's, marking a run boundary. An empty id (Anthropic) never does.
+fn newRunId(current: []const u8, incoming: []const u8) bool {
+    return current.len != 0 and incoming.len != 0 and !std.mem.eql(u8, current, incoming);
+}
+
+/// Commit the pending tool call and buffered answer text ahead of a fresh
+/// reasoning run, so the committed items keep the stream order.
+fn flushBeforeRun(
+    gpa: std.mem.Allocator,
+    items: *std.ArrayList(llm.Item),
+    tool_id: []const u8,
+    tool_name: []const u8,
+    input: *std.ArrayList(u8),
+    in_tool: *bool,
+    text: *std.ArrayList(u8),
+) !void {
+    if (in_tool.*) {
+        try flushTool(gpa, items, .{ .id = tool_id, .name = tool_name }, input);
+        in_tool.* = false;
+    }
+    try flushText(gpa, items, text);
 }
 
 fn flushText(
@@ -753,6 +790,38 @@ test "steering appends a separate user item, leaving grouping to the serializer"
     try std.testing.expectEqualStrings("tool results", agent.items.items[0].message.text);
     try std.testing.expectEqual(llm.Role.user, agent.items.items[1].message.role);
     try std.testing.expectEqualStrings("steer", agent.items.items[1].message.text);
+}
+
+test "a cancel during steering delivery returns the taken batch to the queue" {
+    const gpa = std.testing.allocator;
+    var agent = scriptedAgent(gpa);
+    defer agent.deinit();
+
+    // A handler cancelled while reporting the drained batch, as a mid-turn Esc
+    // racing the round-boundary drain leaves it.
+    const CancelHandler = struct {
+        fn onSteering(self: *@This(), text: []const u8, count: usize) !void {
+            _ = self;
+            _ = text;
+            _ = count;
+            return error.Canceled;
+        }
+    };
+    var handler: CancelHandler = .{};
+
+    try agent.steering.push("a");
+    try agent.steering.push("b");
+    try std.testing.expectError(error.Canceled, agent.drainSteering(&handler));
+
+    // The batch is back in the queue, in order, for cancel to return to the editor.
+    const taken = try agent.steering.take();
+    defer {
+        for (taken) |message| gpa.free(message);
+        gpa.free(taken);
+    }
+    try std.testing.expectEqual(@as(usize, 2), taken.len);
+    try std.testing.expectEqualStrings("a", taken[0]);
+    try std.testing.expectEqualStrings("b", taken[1]);
 }
 
 const CaptureHandler = struct {
@@ -1224,6 +1293,45 @@ test "readReply threads a stream-assigned reasoning-item id into the item" {
     try std.testing.expectEqualStrings("hmm", reply[0].reasoning.text);
     try std.testing.expectEqualStrings("enc", reply[0].reasoning.blob);
     try std.testing.expectEqualStrings("done", reply[1].message.text);
+}
+
+test "readReply keeps adjacent reasoning runs as separate items in stream order" {
+    const gpa = std.testing.allocator;
+    var agent = scriptedAgent(gpa);
+    defer agent.deinit();
+    var handler: CaptureHandler = .{ .gpa = gpa };
+    defer handler.deinit();
+
+    // Two back-to-back runs, then answer text, then a third run: each run keeps
+    // its own blob and id, and the text stays between the runs it streamed
+    // between rather than sinking below them.
+    const events = [_]llm.Event{
+        .{ .thinking = .{ .id = "rs_a", .text = "A" } },
+        .{ .thinking_blob = .{ .id = "rs_a", .blob = "encA" } },
+        .{ .thinking = .{ .id = "rs_b", .text = "B" } },
+        .{ .thinking_blob = .{ .id = "rs_b", .blob = "encB" } },
+        .{ .text = "between" },
+        .{ .thinking = .{ .id = "rs_c", .text = "C" } },
+        .{ .thinking_blob = .{ .id = "rs_c", .blob = "encC" } },
+        .{ .tool_use = .{ .call_id = "t1", .name = "read" } },
+        .{ .input_json = "{}" },
+        .{ .stop = .{ .reason = "tool_use", .usage = .{} } },
+    };
+    var stream: ScriptedStream = .{ .events = &events };
+
+    const reply = try agent.readReply(&agent.model, &stream, &handler);
+    try std.testing.expectEqual(@as(usize, 5), reply.len);
+    try std.testing.expectEqualStrings("A", reply[0].reasoning.text);
+    try std.testing.expectEqualStrings("encA", reply[0].reasoning.blob);
+    try std.testing.expectEqualStrings("rs_a", reply[0].reasoning.id);
+    try std.testing.expectEqualStrings("B", reply[1].reasoning.text);
+    try std.testing.expectEqualStrings("encB", reply[1].reasoning.blob);
+    try std.testing.expectEqualStrings("rs_b", reply[1].reasoning.id);
+    try std.testing.expectEqualStrings("between", reply[2].message.text);
+    try std.testing.expectEqualStrings("C", reply[3].reasoning.text);
+    try std.testing.expectEqualStrings("encC", reply[3].reasoning.blob);
+    try std.testing.expectEqualStrings("rs_c", reply[3].reasoning.id);
+    try std.testing.expectEqualStrings("t1", reply[4].tool_call.call_id);
 }
 
 test "readReply tags reasoning with the active provider as origin" {

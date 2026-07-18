@@ -74,7 +74,9 @@ commit history, `BACKLOG.md` (planned work), and `docs/`.
 - Incremental parsing that retains unconsumed bytes across reads, so a key sequence split across
   chunks still decodes.
 - Decodes printable characters, ctrl-letters, Enter, Shift+Enter (newline), Escape, Backspace,
-  arrows, Home, End, and bracketed-paste payloads.
+  arrows, Home, End, and bracketed-paste payloads. An unterminated paste flushes as bounded
+  partial paste payloads (1 MiB) instead of buffering without bound, and later bytes stay paste
+  payload until the terminator arrives.
 - Decodes both encodings the terminal produces: the keys the Kitty protocol reports as unambiguous
   escape sequences (Escape, Shift+Enter, and ctrl-combinations, with modifiers), and the traditional
   encoding used for the rest — control bytes (carriage return as Enter, delete/backspace as
@@ -250,12 +252,15 @@ commit history, `BACKLOG.md` (planned work), and `docs/`.
   `OPENAI_API_KEY`).
 - Subscription credentials stored at `~/.pith/auth.json` with owner-only permissions, keyed by
   account so several coexist in one file; a token refresh rewrites only its own account's entry, and
-  a save aborts rather than discarding the file's other accounts when it cannot be read back.
+  a save aborts rather than discarding the file's other accounts when it cannot be read back. Saves
+  replace the file atomically, so an interrupted save leaves the previous contents intact.
 - OAuth login: PKCE (S256), a loopback callback listener ready before browser launch, and a
   best-effort launcher whose lifetime never blocks the callback; unavailable launchers warn while
   the printed URL remains usable for manual authorization. Callback acceptance and its first HTTP
   request line share a five-minute deadline; the request line is limited to 8 KiB including its
-  newline, and timeout, oversize, or cancellation closes callback resources cleanly.
+  newline, and timeout, oversize, or cancellation closes callback resources cleanly. Stray
+  connections without callback parameters (probes, prefetches) are closed and ignored rather than
+  consuming the wait.
 - Access tokens refreshed and re-persisted automatically when expired. Token exchange and refresh
   are bounded by the shared connect timeout and cap the response body at 256 KiB, so a stalled or
   oversized provider response cannot block or allocate without bound; a failed refresh leaves the
@@ -272,17 +277,19 @@ commit history, `BACKLOG.md` (planned work), and `docs/`.
 - A tool registry advertises each tool's input schema, validates arguments against it, and marks
   whether the tool mutates the filesystem; every tool honors cancellation.
 - **read** — paginated UTF-8 file read (1-indexed offset, with a line limit), truncated to 2000
-  lines or 50 KB with a next-offset hint; rejects binary or oversized (over 16 MB) files.
+  lines or 50 KB — even within a single line — with a next-offset hint; rejects binary or
+  oversized (over 16 MB) files.
 - **write** — create or overwrite a UTF-8 file atomically.
-- **edit** — replace one exact, unique text span; errors on an empty, missing, or non-unique match;
-  written atomically.
+- **edit** — replace one exact, unique text span; errors on an empty, missing, or non-unique match
+  and rejects oversized (over 16 MB) files; written atomically.
 - **find** — glob file search returning matching paths relative to the working directory, the
   lexicographically-smallest first, bounded by a result limit (default 1000); reports how many more
   matched, and reports honestly when the tree was too large to scan fully.
 - **grep** — literal substring search reporting `path:line:text`, with a glob filter, optional
   case-insensitivity, and a result limit (default 100); skips binary and large (over 4 MB) files,
-  caps reported line length (300 bytes), and bounds work by reading at most 256 MB across at most
-  100,000 candidate files, reporting honestly when a budget stopped it.
+  caps reported line length (300 bytes), reports text as valid UTF-8 (invalid bytes become
+  replacement characters), and bounds work by reading at most 256 MB across at most 100,000
+  candidate files, reporting honestly when a budget stopped it.
 - Glob patterns support `*`, `?`, and `**`; file searches walk directories recursively and skip
   noise directories (version-control and build directories), returning matches sorted by path. The
   walk is bounded independent of tree size: it retains only the smallest matches the caller needs
@@ -300,8 +307,9 @@ commit history, `BACKLOG.md` (planned work), and `docs/`.
 - **/effort** — open a picker over the reasoning-effort levels with the active one marked.
 - **/login** — open a picker over all accounts: an unauthenticated subscription runs its OAuth login
   and switches to it on its default model; an environment API account reports which variable to set
-  and to restart; an already-active account is marked and does nothing. The same picker opens at
-  startup and after logging out the last account.
+  and to restart; an authenticated but inactive account switches to it without a login; the active
+  account is marked and does nothing. The same picker opens at startup and after logging out the
+  last account.
 - **/logout** — open a picker over the logged-in subscription accounts and drop the chosen one's
   credentials; logging out the active account switches to the next authenticated account, or drops
   to a signed-out state with the login picker open.

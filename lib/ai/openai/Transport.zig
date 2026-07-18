@@ -14,10 +14,6 @@ const Transport = @This();
 /// Header value identifying this client on the ChatGPT-subscription backend.
 const originator = "pith";
 
-/// Statuses worth retrying: rate limiting, request timeout, and the transient
-/// server faults.
-const retryable_statuses = [_]std.http.Status{ .request_timeout, .too_many_requests, .internal_server_error, .bad_gateway, .service_unavailable, .gateway_timeout };
-
 gpa: std.mem.Allocator,
 io: std.Io,
 timeouts: net.Timeouts,
@@ -88,12 +84,11 @@ pub const Stream = struct {
         return self.error_buffer[0..self.error_length];
     }
 
-    /// Whether a failed head carries a status worth retrying.
+    /// Whether a failed head carries a status worth retrying: request timeout,
+    /// rate limiting, or any 5xx server fault.
     pub fn retryable(self: *const Stream) bool {
-        for (retryable_statuses) |status| {
-            if (self.status == status) return true;
-        }
-        return false;
+        return self.status == .request_timeout or self.status == .too_many_requests or
+            self.status.class() == .server_error;
     }
 
     /// The `retry-after` the head asked for, in milliseconds, or null.
@@ -178,10 +173,10 @@ pub const Stream = struct {
             error.ReadFailed => return self.readFailed(),
         };
         // The delimiter, if any, is left buffered: a '\n' closes this line; end
-        // of stream with nothing buffered ends the reply, and a final line with
-        // no trailing newline is returned once before that.
+        // of stream with nothing buffered ends the reply, and a non-empty final
+        // line with no newline is a truncated frame — retryable, never decoded.
         const pending = self.body.peekByte() catch |err| switch (err) {
-            error.EndOfStream => return if (buffer.written().len == 0) null else buffer.written(),
+            error.EndOfStream => return if (buffer.written().len == 0) null else error.IncompleteReply,
             error.ReadFailed => return self.readFailed(),
         };
         std.debug.assert(pending == '\n');
@@ -261,6 +256,12 @@ pub fn send(self: *Transport, out: *Stream, body: []const u8, access_token: []co
 }
 
 fn connect(self: *Transport, out: *Stream, body: []const u8, access_token: []const u8) anyerror!void {
+    // Credentials become header values; reject ones that would split the head.
+    if (!validHeaderValue(access_token) or
+        (self.account_id.len != 0 and !validHeaderValue(self.account_id)))
+    {
+        return error.BadCredentials;
+    }
     out.gpa = self.gpa;
     out.client = .{ .allocator = self.gpa, .io = self.io };
     errdefer out.client.deinit();
@@ -306,12 +307,13 @@ fn connect(self: *Transport, out: *Stream, body: []const u8, access_token: []con
 
     out.response = try out.request.receiveHead(&out.redirect_buffer);
     out.status = out.response.head.status;
+    // Read the head's headers before the body reader invalidates them.
+    out.retry_after_ms = retryAfter(out.response.head);
     out.decompress_buffer = try decompressBuffer(self.gpa, out.response.head.content_encoding);
     out.body = out.response.readerDecompressing(&out.transfer_buffer, &out.decompress, out.decompress_buffer);
     if (out.status != .ok) {
         const read = out.body.readSliceShort(&out.error_buffer) catch 0;
         out.error_length = read;
-        out.retry_after_ms = retryAfter(out.response.head);
     }
     out.established = true;
 }
@@ -326,6 +328,10 @@ fn retryAfter(head: std.http.Client.Response.Head) ?u64 {
         return seconds *| 1000;
     }
     return null;
+}
+
+fn validHeaderValue(value: []const u8) bool {
+    return value.len != 0 and std.mem.indexOfAny(u8, value, "\r\n") == null;
 }
 
 /// A decompression window sized for `encoding`, or an empty slice when the body
@@ -833,6 +839,40 @@ test "next rejects a single frame larger than the stream budget" {
     try std.testing.expectError(error.StreamResponseTooLarge, stream.next());
 }
 
+test "next surfaces a stream truncated mid data-line as a retryable premature end" {
+    // The final chunk ends inside a `data:` frame; the truncated JSON must take
+    // the retryable premature-stream-end path, not a fatal parse error.
+    const body = "data: {\"type\":\"response.out";
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var reader: std.Io.Reader = .fixed(body);
+    var stream: Stream = undefined;
+    stream.gpa = std.testing.allocator;
+    stream.io = threaded.io();
+    stream.idle_ms = 60_000;
+    stream.budget = .{ .max = net.stream_response_bytes_max };
+    stream.body = &reader;
+    stream.parsed = null;
+    stream.usage = .{};
+    defer if (stream.parsed) |parsed| parsed.deinit();
+
+    try std.testing.expectError(error.IncompleteReply, stream.next());
+}
+
+test "connect rejects credentials that would split the request head" {
+    var transport: Transport = .{
+        .gpa = std.testing.allocator,
+        .io = undefined,
+        .timeouts = .{},
+        .endpoint = "https://example.com/v1/responses",
+        .account_id = "",
+    };
+    var stream: Stream = undefined;
+    try std.testing.expectError(error.BadCredentials, connect(&transport, &stream, "{}", "token\r\nleaked: value"));
+    transport.account_id = "account\ninjected: value";
+    try std.testing.expectError(error.BadCredentials, connect(&transport, &stream, "{}", "token"));
+}
+
 test retryAfter {
     const with = "HTTP/1.1 429 Too Many Requests\r\nretry-after: 7\r\ncontent-length:0\r\n\r\n";
     const head = try std.http.Client.Response.Head.parse(with);
@@ -855,6 +895,9 @@ test "retryable classifies the head status" {
     stream.status = .too_many_requests;
     try std.testing.expect(stream.retryable());
     stream.status = .service_unavailable;
+    try std.testing.expect(stream.retryable());
+    // Any 5xx is retryable, not just the enumerated common ones.
+    stream.status = @enumFromInt(520);
     try std.testing.expect(stream.retryable());
     stream.status = .ok;
     try std.testing.expect(!stream.retryable());

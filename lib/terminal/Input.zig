@@ -13,6 +13,9 @@ const Input = @This();
 gpa: std.mem.Allocator,
 pending: std.ArrayList(u8),
 start: usize,
+/// Set while an over-limit paste is being flushed in chunks: its begin marker
+/// is consumed, but its terminator has not arrived yet.
+in_paste: bool,
 
 /// A single decoded input event from the terminal.
 pub const Key = union(enum) {
@@ -40,7 +43,11 @@ pub const Key = union(enum) {
     unknown,
 };
 
-const Decoded = struct { key: Key, consumed: usize };
+const Decoded = struct { key: Key, consumed: usize, in_paste: bool = false };
+
+/// Retained bytes at which an unterminated paste is flushed as a partial
+/// payload, so a missing terminator cannot buffer unboundedly or wedge input.
+const paste_flush_len = 1 << 20;
 
 const escape_start = 0x1b;
 const enter_key = 13;
@@ -50,7 +57,7 @@ const alt_bit = 0b010;
 const ctrl_bit = 0b100;
 
 pub fn init(gpa: std.mem.Allocator) Input {
-    return .{ .gpa = gpa, .pending = .empty, .start = 0 };
+    return .{ .gpa = gpa, .pending = .empty, .start = 0, .in_paste = false };
 }
 
 pub fn deinit(self: *Input) void {
@@ -74,7 +81,8 @@ pub fn feed(self: *Input, bytes: []const u8) !void {
 pub fn next(self: *Input) ?Key {
     const data = self.pending.items[self.start..];
     if (data.len == 0) return null;
-    const decoded = decode(data) orelse return null;
+    const decoded = (if (self.in_paste) decodePasteBody(data) else decode(data)) orelse return null;
+    self.in_paste = decoded.in_paste;
     self.start += decoded.consumed;
     return decoded.key;
 }
@@ -116,11 +124,11 @@ fn decodeEscape(data: []const u8) ?Decoded {
 fn decodeControlSequence(data: []const u8) ?Decoded {
     if (std.mem.startsWith(u8, data, escape.paste_begin)) {
         const body_start = escape.paste_begin.len;
-        const relative = std.mem.indexOf(u8, data[body_start..], escape.paste_end) orelse return null;
-        const body_end = body_start + relative;
+        const decoded = decodePasteBody(data[body_start..]) orelse return null;
         return .{
-            .key = .{ .paste = data[body_start..body_end] },
-            .consumed = body_end + escape.paste_end.len,
+            .key = decoded.key,
+            .consumed = body_start + decoded.consumed,
+            .in_paste = decoded.in_paste,
         };
     }
     var index: usize = 2;
@@ -132,6 +140,19 @@ fn decodeControlSequence(data: []const u8) ?Decoded {
         }
     }
     return null;
+}
+
+/// A paste body whose begin marker is already consumed: complete once the
+/// terminator arrives, otherwise flushed as a bounded partial payload
+/// (`in_paste` set) once it reaches `paste_flush_len`.
+fn decodePasteBody(body: []const u8) ?Decoded {
+    if (std.mem.indexOf(u8, body, escape.paste_end)) |end| {
+        return .{ .key = .{ .paste = body[0..end] }, .consumed = end + escape.paste_end.len };
+    }
+    if (body.len < paste_flush_len) return null;
+    // Hold back a partial terminator so a marker split across reads still ends the paste.
+    const kept = escape.paste_end.len - 1;
+    return .{ .key = .{ .paste = body[0 .. body.len - kept] }, .consumed = body.len - kept, .in_paste = true };
 }
 
 fn mapControlSequence(parameters: []const u8, final: u8) Key {
@@ -242,6 +263,26 @@ test "alt+up decodes apart from a bare or otherwise-modified up" {
 
 test "bracketed paste" {
     try expectKeys("\x1b[200~ab\ncd\x1b[201~", &.{.{ .paste = "ab\ncd" }});
+}
+
+test "an unterminated paste past the limit flushes and stays a paste" {
+    const gpa = std.testing.allocator;
+    var input = Input.init(gpa);
+    defer input.deinit();
+    const body = try gpa.alloc(u8, paste_flush_len);
+    defer gpa.free(body);
+    @memset(body, 'x');
+    try input.feed(escape.paste_begin);
+    try input.feed(body);
+    const flushed = input.next() orelse return error.MissingKey;
+    try std.testing.expectEqual(paste_flush_len - escape.paste_end.len + 1, flushed.paste.len);
+    // Later bytes stay paste payload — not keystrokes — until the terminator.
+    try input.feed("\rab");
+    try std.testing.expectEqual(@as(?Key, null), input.next());
+    try input.feed(escape.paste_end ++ "c");
+    try std.testing.expectEqualDeep(Key{ .paste = "xxxxx\rab" }, input.next().?);
+    try std.testing.expectEqualDeep(Key{ .char = 'c' }, input.next().?);
+    try std.testing.expectEqual(@as(?Key, null), input.next());
 }
 
 test "split sequence waits for rest" {

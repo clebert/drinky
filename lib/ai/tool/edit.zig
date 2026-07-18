@@ -8,6 +8,8 @@ const fs = @import("fs.zig");
 const parse = @import("parse.zig");
 const Result = @import("Result.zig");
 
+const file_bytes_max = 16 << 20;
+
 pub const spec: llm.Tool = .{
     .name = "edit",
     .description = "Replace an exact, unique span of text in an existing file. old_text must occur exactly once; include enough surrounding context to make it unique.",
@@ -36,7 +38,8 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
     const old = parsed.value.old_text;
     const new = parsed.value.new_text;
 
-    const data = std.Io.Dir.cwd().readFileAlloc(context.io, path, gpa, .unlimited) catch |err| switch (err) {
+    const data = std.Io.Dir.cwd().readFileAlloc(context.io, path, gpa, .limited(file_bytes_max)) catch |err| switch (err) {
+        error.StreamTooLong => return Result.report(gpa, .err, "{s} is larger than {d} bytes; edit it another way", .{ path, file_bytes_max }),
         error.Canceled => return err,
         else => return Result.report(gpa, .err, "cannot read {s}: {s}", .{ path, @errorName(err) }),
     };
@@ -82,4 +85,23 @@ test applyEdit {
     try std.testing.expectError(error.NotUnique, applyEdit(gpa, .{ .data = "a a a", .old = "a", .new = "b" }));
     try std.testing.expectError(error.NotUnique, applyEdit(gpa, .{ .data = "aaa", .old = "aa", .new = "b" }));
     try std.testing.expectError(error.EmptyOldText, applyEdit(gpa, .{ .data = "abc", .old = "", .new = "y" }));
+}
+
+test "edit rejects an oversized file" {
+    const gpa = std.testing.allocator;
+    const context: Context = .{ .gpa = gpa, .io = std.testing.io };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data = try gpa.alloc(u8, file_bytes_max + 1);
+    defer gpa.free(data);
+    @memset(data, 'a');
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "big.txt", .data = data });
+    var input_buf: [160]u8 = undefined;
+    const input = try std.fmt.bufPrint(&input_buf,
+        \\{{"path":".zig-cache/tmp/{s}/big.txt","old_text":"a","new_text":"b"}}
+    , .{tmp.sub_path});
+    const result = try run(&context, input);
+    defer gpa.free(result.content);
+    try std.testing.expect(result.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "larger than") != null);
 }

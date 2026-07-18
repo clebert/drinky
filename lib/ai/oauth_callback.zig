@@ -54,13 +54,30 @@ fn Wire(comptime Source: type) type {
             request_buffer: *[request_bytes_max]u8,
             output: *Output,
         ) !void {
-            var connection = try source.accept();
-            defer connection.close();
+            // A stray connection (probe, prefetch, favicon) must not consume the
+            // only accept: ignore it and keep listening until the deadline. A
+            // request carrying `code=` or `error=` is the provider redirect and
+            // still fails fast when malformed or denied.
+            while (true) {
+                var connection = try source.accept();
+                defer connection.close();
 
-            const request_line = try connection.readRequestLine(request_buffer);
-            output.code = try queryParameter(gpa, request_line, .code);
-            output.state = try queryParameter(gpa, request_line, .state);
-            try connection.respondAuthorized();
+                const request_line = connection.readRequestLine(request_buffer) catch |err|
+                    switch (err) {
+                        error.EndOfStream, error.ReadFailed => continue,
+                        else => return err,
+                    };
+                output.code = queryParameter(gpa, request_line, .code) catch |err| switch (err) {
+                    error.MissingCallbackParam => if (std.mem.indexOf(u8, request_line, "error=") == null)
+                        continue
+                    else
+                        return err,
+                    else => return err,
+                };
+                output.state = try queryParameter(gpa, request_line, .state);
+                try connection.respondAuthorized();
+                return;
+            }
         }
     };
 }
@@ -167,6 +184,8 @@ fn sleep(io: std.Io, timeout_ms: u64) std.Io.Cancelable!void {
 const Fake = struct {
     behavior: Behavior = .request,
     request: []const u8 = "",
+    /// Request lines served one per accept before `request`.
+    stray_requests: []const []const u8 = &.{},
     clock_ms: u64 = 0,
     timeout_ms: u64 = 3,
     deadline_ms: ?u64 = null,
@@ -253,7 +272,11 @@ const Fake = struct {
             self: *Fake.Connection,
             buffer: *[request_bytes_max]u8,
         ) ![]const u8 {
-            var reader = std.testing.Reader.init(buffer, &.{.{ .buffer = self.fake.request }});
+            const raw = if (self.fake.stray_requests.len == 0) self.fake.request else next: {
+                defer self.fake.stray_requests = self.fake.stray_requests[1..];
+                break :next self.fake.stray_requests[0];
+            };
+            var reader = std.testing.Reader.init(buffer, &.{.{ .buffer = raw }});
             const request_line = try takeRequestLine(&reader.interface);
             self.fake.request_byte_count = request_line.len + 1;
             return request_line;
@@ -390,13 +413,26 @@ test "callback accepts normal requests for both provider paths" {
     }
 }
 
-test "callback rejects an incomplete request line" {
+test "callback ignores stray connections until the real redirect arrives" {
     var fake: Fake = .{
-        .request = "GET /callback?code=code&state=state HTTP/1.1\r",
+        .stray_requests = &.{
+            // A connection closed before its request line completes, then a
+            // request without callback parameters.
+            "GET /callback?code=code&state=state HTTP/1.1\r",
+            "GET /favicon.ico HTTP/1.1\r\n",
+        },
+        .request = "GET /callback?code=code&state=state HTTP/1.1\r\n",
     };
-    try std.testing.expectError(error.EndOfStream, receiveFake(&fake));
-    try std.testing.expectEqual(@as(usize, 1), fake.close_count);
-    try std.testing.expectEqual(@as(usize, 0), fake.response_count);
+    const callback = try receiveFake(&fake);
+    defer {
+        std.testing.allocator.free(callback.code);
+        std.testing.allocator.free(callback.state);
+    }
+    try std.testing.expectEqualStrings("code", callback.code);
+    try std.testing.expectEqualStrings("state", callback.state);
+    try std.testing.expectEqual(@as(usize, 3), fake.accept_count);
+    try std.testing.expectEqual(@as(usize, 3), fake.close_count);
+    try std.testing.expectEqual(@as(usize, 1), fake.response_count);
 }
 
 test "callback provider error redirects close without success response" {

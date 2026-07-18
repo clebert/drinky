@@ -25,10 +25,6 @@ pub const Identity = union(enum) {
     api_key: []const u8,
 };
 
-/// Statuses worth retrying: rate limiting, request timeout, and the transient
-/// server faults (including Anthropic's 529 "overloaded").
-const retryable_statuses = [_]std.http.Status{ .request_timeout, .too_many_requests, .internal_server_error, .bad_gateway, .service_unavailable, .gateway_timeout, @enumFromInt(529) };
-
 gpa: std.mem.Allocator,
 io: std.Io,
 timeouts: net.Timeouts,
@@ -97,12 +93,11 @@ pub const Stream = struct {
         return self.error_buffer[0..self.error_length];
     }
 
-    /// Whether a failed head carries a status worth retrying.
+    /// Whether a failed head carries a status worth retrying: request timeout,
+    /// rate limiting, or any 5xx server fault (Anthropic's 529 included).
     pub fn retryable(self: *const Stream) bool {
-        for (retryable_statuses) |status| {
-            if (self.status == status) return true;
-        }
-        return false;
+        if (self.status == .request_timeout or self.status == .too_many_requests) return true;
+        return @intFromEnum(self.status) / 100 == 5;
     }
 
     /// The `retry-after` the head asked for, in milliseconds, or null.
@@ -221,7 +216,12 @@ pub const Stream = struct {
     }
 
     fn decode(self: *Stream, json: []const u8) !Decoded {
-        const parsed = try std.json.parseFromSlice(std.json.Value, self.gpa, json, .{});
+        // A malformed payload is filler, not progress; a truncated tail then
+        // surfaces as an incomplete reply at end of stream, which is retried.
+        const parsed = std.json.parseFromSlice(std.json.Value, self.gpa, json, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return .ignored,
+        };
         const object = asObject(parsed.value) orelse {
             parsed.deinit();
             return .ignored;
@@ -264,12 +264,16 @@ pub const Stream = struct {
             parsed.deinit();
             return .{ .event = .{ .stop = .{ .reason = reason, .usage = self.usage } } };
         }
-        if (self.terminal_delta) |terminal_delta| {
+        // Only recognized content past the terminal delta breaks the reply;
+        // an unrecognized frame there is still ignored filler.
+        const content = std.mem.eql(u8, kind, "message_start") or
+            std.mem.startsWith(u8, kind, "content_block_");
+        if (content) if (self.terminal_delta) |terminal_delta| {
             terminal_delta.deinit();
             self.terminal_delta = null;
             parsed.deinit();
             return error.IncompleteReply;
-        }
+        };
         if (std.mem.eql(u8, kind, "message_start")) {
             if (asObject(object.get("message"))) |message| {
                 if (asObject(message.get("usage"))) |usage| mergeUsage(&self.usage, usage);
@@ -376,12 +380,13 @@ fn connect(self: *Transport, out: *Stream, body: []const u8) anyerror!void {
 
     out.response = try out.request.receiveHead(&out.redirect_buffer);
     out.status = out.response.head.status;
+    // Read the head's headers now: creating the body reader invalidates them.
+    if (out.status != .ok) out.retry_after_ms = retryAfter(out.response.head);
     out.decompress_buffer = try decompressBuffer(self.gpa, out.response.head.content_encoding);
     out.body = out.response.readerDecompressing(&out.transfer_buffer, &out.decompress, out.decompress_buffer);
     if (out.status != .ok) {
         const read = out.body.readSliceShort(&out.error_buffer) catch 0;
         out.error_length = read;
-        out.retry_after_ms = retryAfter(out.response.head);
     }
     out.established = true;
 }
@@ -630,6 +635,29 @@ test "message_stop requires a final delta with a stop reason" {
     try std.testing.expectEqual(@as(u64, 4), stop.event.stop.usage.output);
 }
 
+test "an unrecognized frame after the terminal delta stays ignored" {
+    var stream: Stream = undefined;
+    stream.gpa = std.testing.allocator;
+    stream.parsed = null;
+    stream.terminal_delta = null;
+    stream.usage = .{};
+    defer if (stream.parsed) |parsed| parsed.deinit();
+    defer if (stream.terminal_delta) |terminal_delta| terminal_delta.deinit();
+
+    try std.testing.expectEqual(@as(Decoded, .progress), try stream.decode(
+        \\{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}
+    ));
+    // Filler between the terminal delta and `message_stop` must not turn a
+    // complete reply into an incomplete one.
+    try std.testing.expectEqual(@as(Decoded, .ignored), try stream.decode(
+        \\{"type":"surprise_new_event"}
+    ));
+    const stop = try stream.decode(
+        \\{"type":"message_stop"}
+    );
+    try std.testing.expectEqualStrings("end_turn", stop.event.stop.reason.?);
+}
+
 /// A logical clock over a real backend: `now` returns the current tick and then
 /// advances by a fixed step, so a bounded run of non-progress reads drives the
 /// idle window to expiry deterministically without real time passing. Only `now`
@@ -685,6 +713,25 @@ test "decode ignores unrecognized frames instead of counting them as progress" {
     // A recognized block boundary that carries no event is still progress.
     try std.testing.expectEqual(@as(Decoded, .progress), try stream.decode(
         \\{"type":"content_block_stop","index":0}
+    ));
+}
+
+test "decode ignores a malformed data line instead of failing the turn" {
+    var stream: Stream = undefined;
+    stream.gpa = std.testing.allocator;
+    stream.parsed = null;
+    stream.terminal_delta = null;
+    stream.usage = .{};
+    defer if (stream.parsed) |parsed| parsed.deinit();
+    defer if (stream.terminal_delta) |terminal_delta| terminal_delta.deinit();
+
+    // A truncated frame (a connection cut mid-line) and a corrupt one are both
+    // filler: ignored, never progress, never a non-retryable parse error.
+    try std.testing.expectEqual(@as(Decoded, .ignored), try stream.decode(
+        \\{"type":"content_block_delta","del
+    ));
+    try std.testing.expectEqual(@as(Decoded, .ignored), try stream.decode(
+        \\not json at all
     ));
 }
 
@@ -887,6 +934,11 @@ test "retryable classifies the head status" {
     stream.status = .too_many_requests;
     try std.testing.expect(stream.retryable());
     stream.status = @enumFromInt(529);
+    try std.testing.expect(stream.retryable());
+    // Any 5xx is retryable, not just the enumerated transient ones.
+    stream.status = @enumFromInt(521);
+    try std.testing.expect(stream.retryable());
+    stream.status = .not_implemented;
     try std.testing.expect(stream.retryable());
     stream.status = .ok;
     try std.testing.expect(!stream.retryable());

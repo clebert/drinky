@@ -318,13 +318,21 @@ pub fn render(self: *View) !void {
     };
     if (alignment.back_index == 0) {
         // Forward slide: the new top row is shared; rows above it scrolled away.
-        const changed = firstChange(prev, alignment.prev_index, back) orelse {
-            // Content unchanged, so no slide happened: `cursor_row` is still valid.
-            try self.paintCaretOnly(back);
+        const delta = alignment.prev_index;
+        const changed = firstChange(prev, delta, back) orelse {
+            if (delta == 0) {
+                // Content unchanged, so no slide happened: `cursor_row` is still valid.
+                try self.paintCaretOnly(back);
+            } else if (self.viewport_top > 0) {
+                try self.paint(.reset, 0, back, 0);
+            } else {
+                // A pure top-trim keeps the tail bytes but slides the window, so rebase.
+                const deepest = @min(prev.rows.items.len - 1 - delta, back.rows.items.len - 1);
+                try self.paint(.incremental, deepest, back, self.cursor_row -| delta);
+            }
             self.front ^= 1;
             return;
         };
-        const delta = alignment.prev_index;
         // A shrunk tail must reveal scrolled-off rows: a backward slide in disguise.
         const shrank = back.rows.items.len + delta < prev.rows.items.len;
         if (changed + delta < self.viewport_top or (shrank and self.viewport_top > 0)) {
@@ -778,6 +786,51 @@ test "an unchanged frame emits only caret motion" {
     try std.testing.expect(std.mem.indexOf(u8, h.lastBytes(), escape.screen_reset) == null);
     try std.testing.expect(std.mem.indexOf(u8, h.lastBytes(), escape.screen_clear_below) == null);
     try std.testing.expect(std.mem.indexOf(u8, h.lastBytes(), "ab") == null);
+}
+
+test "a pure top-trim repaints the identical tail and rebases the caret" {
+    const gpa = std.testing.allocator;
+    const h = try harness(gpa, 10);
+    defer {
+        h.deinit();
+        gpa.destroy(h);
+    }
+    const first = [_]Line{ line("a", 0), line("b", 1), caretLine("c", 2, 1) };
+    try h.render(&first, .{ .columns = 10, .rows = 3 }, 1);
+    try h.emulator.expectCaret(3, 2, 1);
+
+    // The top row is trimmed and the remaining rows are byte-identical: the
+    // window still slid, so a caret-only paint would desync `cursor_row`.
+    const second = [_]Line{ line("b", 1), caretLine("c", 2, 1) };
+    try h.render(&second, .{ .columns = 10, .rows = 3 }, 1);
+    try h.emulator.expectCaret(2, 1, 1);
+    try std.testing.expect(std.mem.indexOf(u8, h.lastBytes(), escape.screen_reset) == null);
+
+    const third = [_]Line{ line("b", 1), line("c", 2), caretLine("d", 3, 1) };
+    try h.render(&third, .{ .columns = 10, .rows = 3 }, 1);
+    try h.emulator.expectScreen(&.{ "b", "c", "d" });
+    try h.emulator.expectCaret(3, 2, 1);
+}
+
+test "a pure top-trim with rows scrolled off resets" {
+    const gpa = std.testing.allocator;
+    const h = try harness(gpa, 10);
+    defer {
+        h.deinit();
+        gpa.destroy(h);
+    }
+    // Four rows over two pages of two: rows 0 and 1 sit in scrollback.
+    const first = [_]Line{ line("r0", 0), line("r1", 1), line("r2", 2), caretLine("r3", 3, 1) };
+    try h.render(&first, .{ .columns = 10, .rows = 2 }, 2);
+    try h.emulator.expectScreen(&.{ "r2", "r3" });
+
+    // Trim the top row with the tail byte-identical: the slid window cannot be
+    // reconciled incrementally against a partly scrolled-off screen.
+    const second = [_]Line{ line("r1", 1), line("r2", 2), caretLine("r3", 3, 1) };
+    try h.render(&second, .{ .columns = 10, .rows = 2 }, 2);
+    try h.emulator.expectScreen(&.{ "r2", "r3" });
+    try h.emulator.expectCaret(3, 2, 1);
+    try std.testing.expect(std.mem.indexOf(u8, h.lastBytes(), escape.screen_reset) != null);
 }
 
 test "invalidate forces a full reset even when content is unchanged" {

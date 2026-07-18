@@ -18,7 +18,6 @@ pub const client_id = "app_EMoamEEZ73f0CkXaXp7hrann";
 pub const authorize_url = "https://auth.openai.com/oauth/authorize";
 pub const token_url = "https://auth.openai.com/oauth/token";
 pub const callback_port = 1455;
-pub const redirect_uri = "http://localhost:1455/auth/callback";
 
 const redirect_encoded = "http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback";
 const scope = "openid profile email offline_access";
@@ -107,14 +106,22 @@ pub fn exchange(
 /// `refresh_token` are carried over when the response leaves them out. Caller
 /// frees the result.
 pub fn refresh(gpa: std.mem.Allocator, io: std.Io, timeouts: net.Timeouts, tokens: Tokens) !Tokens {
-    const body = try std.fmt.allocPrint(gpa,
-        \\{{"grant_type":"refresh_token","client_id":"{s}","refresh_token":"{s}"}}
-    , .{ client_id, tokens.refresh });
+    const body = try refreshBody(gpa, tokens.refresh);
     defer gpa.free(body);
     return post(gpa, io, timeouts, body, "application/json", .{
         .refresh = tokens.refresh,
         .account_id = tokens.account_id,
     });
+}
+
+/// The refresh body via the JSON serializer, so a refresh token needing escaping
+/// cannot break the request. Caller frees the result.
+fn refreshBody(gpa: std.mem.Allocator, refresh_token: []const u8) error{OutOfMemory}![]u8 {
+    return std.json.Stringify.valueAlloc(gpa, .{
+        .grant_type = "refresh_token",
+        .client_id = client_id,
+        .refresh_token = refresh_token,
+    }, .{});
 }
 
 const Fallback = struct { refresh: []const u8 = "", account_id: []const u8 = "" };
@@ -352,6 +359,14 @@ test authorizeUrl {
     try std.testing.expect(std.mem.indexOf(u8, url, client_id) != null);
     try std.testing.expect(std.mem.indexOf(u8, url, "codex_cli_simplified_flow=true") != null);
     try std.testing.expect(std.mem.indexOf(u8, url, "state=vvv") != null);
+}
+
+test refreshBody {
+    const body = try refreshBody(std.testing.allocator, "r\"t");
+    defer std.testing.allocator.free(body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("r\"t", parsed.value.object.get("refresh_token").?.string);
 }
 
 /// A JWT with `payload` as its (unsigned) body, for exercising the extractors.

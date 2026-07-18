@@ -68,11 +68,21 @@ pub fn save(
 
     const body = try serializeMerged(gpa, existing, key, entry);
     defer gpa.free(body);
-    try std.Io.Dir.cwd().writeFile(io, .{
-        .sub_path = path,
-        .data = body,
-        .flags = .{ .permissions = @enumFromInt(0o600) },
+    try replaceFile(io, path, body);
+}
+
+/// Atomically replace the file at `path` with `body` at owner-only
+/// permissions: a temp file in the same directory renamed over the
+/// destination, so a crash or cancellation mid-save leaves the old file
+/// intact rather than truncated.
+fn replaceFile(io: std.Io, path: []const u8, body: []const u8) !void {
+    var atomic = try std.Io.Dir.cwd().createFileAtomic(io, path, .{
+        .permissions = @enumFromInt(0o600),
+        .replace = true,
     });
+    defer atomic.deinit(io);
+    try atomic.file.writeStreamingAll(io, body);
+    try atomic.replace(io);
 }
 
 /// The whole `auth.json` with `key` set to `entry`, re-emitting every other
@@ -132,11 +142,7 @@ pub fn remove(
 
     const body = try serializeWithout(gpa, existing, key);
     defer gpa.free(body);
-    try std.Io.Dir.cwd().writeFile(io, .{
-        .sub_path = path,
-        .data = body,
-        .flags = .{ .permissions = @enumFromInt(0o600) },
-    });
+    try replaceFile(io, path, body);
 }
 
 /// The whole `auth.json` with `key` dropped, re-emitting every other top-level
@@ -270,6 +276,32 @@ test "serializeWithout drops a key, preserving other accounts" {
     var parsed_empty = try std.json.parseFromSlice(std.json.Value, gpa, emptied, .{});
     defer parsed_empty.deinit();
     try std.testing.expectEqual(@as(usize, 0), parsed_empty.value.object.count());
+}
+
+test "save replaces the file atomically at owner-only permissions" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/auth.json", .{tmp.sub_path});
+    const entry: TestEntry = .{ .access = "at", .refresh = "rt", .expires_ms = 1 };
+
+    try save(gpa, io, path, "openai_subscription", entry);
+    const before = try tmp.dir.statFile(io, "auth.json", .{});
+    try std.testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(@intFromEnum(before.permissions))) & 0o777);
+
+    // A rewrite lands on a fresh inode — renamed over, never truncated in place.
+    try save(gpa, io, path, "anthropic_subscription", entry);
+    const after = try tmp.dir.statFile(io, "auth.json", .{});
+    try std.testing.expect(before.inode != after.inode);
+
+    var file = (try open(gpa, io, path)).?;
+    defer file.deinit();
+    try std.testing.expectEqualStrings("at", file.entry("openai_subscription").?.get("access").?.string);
+    try std.testing.expectEqualStrings("at", file.entry("anthropic_subscription").?.get("access").?.string);
 }
 
 test "serializeWithout errors on a corrupt file" {

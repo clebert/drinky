@@ -56,7 +56,8 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
     if (start >= total) {
         return Result.report(gpa, .err, "offset {d} is past the end of {s} ({d} lines)", .{ offset, path, total });
     }
-    const shown_max = limit orelse lines_max;
+    const shown_max = @min(limit orelse lines_max, lines_max);
+    if (shown_max == 0) return Result.report(gpa, .err, "limit must be at least 1", .{});
 
     var out: std.Io.Writer.Allocating = .init(gpa);
     errdefer out.deinit();
@@ -64,21 +65,42 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
     var shown: usize = 0;
     var bytes: usize = 0;
     var last = start;
+    var truncated = false;
     var lines = std.mem.splitScalar(u8, data, '\n');
     while (lines.next()) |line| : (index += 1) {
         if (index < start) continue;
         if (shown >= shown_max) break;
         if (shown > 0 and bytes + line.len > bytes_max) break;
+        // The first line is exempt from the byte budget so a page always makes
+        // progress, but it must not carry the whole cap away on its own.
+        if (shown == 0 and line.len > bytes_max) {
+            try out.writer.writeAll(line[0..utf8FloorLength(line, bytes_max)]);
+            last = index;
+            shown = 1;
+            truncated = true;
+            break;
+        }
         if (shown > 0) try out.writer.writeAll("\n");
         try out.writer.writeAll(line);
         bytes += line.len + 1;
         last = index;
         shown += 1;
     }
+    if (truncated) {
+        try out.writer.print("\n\n[line {d} exceeds {d} bytes and was truncated]", .{ last + 1, bytes_max });
+    }
     if (last + 1 < total) {
         try out.writer.print("\n\n[showing lines {d}-{d} of {d}; use offset={d} to continue]", .{ start + 1, last + 1, total, last + 2 });
     }
     return .{ .content = try out.toOwnedSlice(), .is_error = false };
+}
+
+/// Largest length no greater than `max` that does not split a UTF-8 codepoint,
+/// so a truncated line stays valid UTF-8 for JSON serialization.
+fn utf8FloorLength(bytes: []const u8, max: usize) usize {
+    var end = @min(bytes.len, max);
+    while (end > 0 and end < bytes.len and bytes[end] & 0xC0 == 0x80) end -= 1;
+    return end;
 }
 
 test "read rejects invalid input" {
@@ -112,4 +134,55 @@ test "read rejects an offset past the end of the file" {
     );
     defer std.testing.allocator.free(result.content);
     try std.testing.expect(result.is_error);
+}
+
+test "read rejects a zero limit" {
+    const context: Context = .{ .gpa = std.testing.allocator, .io = std.testing.io };
+    const result = try run(&context,
+        \\{"path":"build.zig.zon","limit":0}
+    );
+    defer std.testing.allocator.free(result.content);
+    try std.testing.expect(result.is_error);
+}
+
+test "read truncates a single line longer than the byte cap" {
+    const gpa = std.testing.allocator;
+    const context: Context = .{ .gpa = gpa, .io = std.testing.io };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const line = try gpa.alloc(u8, bytes_max + 100);
+    defer gpa.free(line);
+    @memset(line, 'a');
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "long.txt", .data = line });
+    var input_buf: [128]u8 = undefined;
+    const input = try std.fmt.bufPrint(&input_buf,
+        \\{{"path":".zig-cache/tmp/{s}/long.txt"}}
+    , .{tmp.sub_path});
+    const result = try run(&context, input);
+    defer gpa.free(result.content);
+    try std.testing.expect(!result.is_error);
+    try std.testing.expect(result.content.len < bytes_max + 100);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "truncated") != null);
+}
+
+test "read clamps an explicit limit to the line cap" {
+    const gpa = std.testing.allocator;
+    const context: Context = .{ .gpa = gpa, .io = std.testing.io };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data = try gpa.alloc(u8, (lines_max + 100) * 2);
+    defer gpa.free(data);
+    for (0..lines_max + 100) |i| {
+        data[i * 2] = 'x';
+        data[i * 2 + 1] = '\n';
+    }
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "many.txt", .data = data });
+    var input_buf: [128]u8 = undefined;
+    const input = try std.fmt.bufPrint(&input_buf,
+        \\{{"path":".zig-cache/tmp/{s}/many.txt","limit":100000}}
+    , .{tmp.sub_path});
+    const result = try run(&context, input);
+    defer gpa.free(result.content);
+    try std.testing.expect(!result.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "use offset=2001 to continue") != null);
 }
