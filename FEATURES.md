@@ -186,8 +186,9 @@ commit history, `BACKLOG.md` (planned work), and `docs/`.
 
 - Provider-neutral policy with configurable request timeouts and retry parameters.
 - An operation that exceeds its timeout fails with a timeout error.
-- A shared idle window bounds a run of reads: activity without progress cannot extend it, so a
-  stalled read eventually times out.
+- A shared idle window bounds a run of reads: activity that makes no progress cannot extend it —
+  even buffered filler that never blocks a read draws it down — so a stalled or filler-only read
+  eventually times out.
 
 ### Anthropic transport
 
@@ -208,10 +209,10 @@ commit history, `BACKLOG.md` (planned work), and `docs/`.
   message block (3 of the 4 allowed).
 - Usage from all streamed events is folded into one total.
 - Each request phase is time-bounded: connecting and reading the response head by a connect timeout,
-  and each streamed event by an idle window. Keepalive pings draw the idle window down without
-  resetting it — only a real frame restarts it — so a stream that stalls or emits nothing but pings
-  still times out. A failed response head reports whether it is retryable and the server's
-  retry-after hint.
+  and each streamed event by an idle window. Only a recognized frame restarts the window; keepalive
+  pings and any other filler (comments, blank lines, or frames the protocol does not define) draw it
+  down instead, so a stream that stalls or sends only filler still times out. A failed response head
+  reports whether it is retryable and the server's retry-after hint.
 - A cancel during the read surfaces as a clean abort, distinct from a timeout.
 
 ### OpenAI transport

@@ -45,6 +45,10 @@ const Decoded = union(enum) {
     progress,
     /// A keepalive ping: ignored, and deliberately not counted as progress.
     ping,
+    /// An unrecognized frame (not an object, no `type`, or a `type` the protocol
+    /// does not define): ignored, and — like a ping — never counted as progress,
+    /// so filler cannot hold the idle window open.
+    ignored,
 };
 
 /// A single Messages request in flight. Pin it: the HTTP response borrows the
@@ -125,21 +129,28 @@ pub const Stream = struct {
         // One idle window spans the read of each event. Anthropic sends keepalive
         // `ping` events between real ones, so a stalled stream can keep sending
         // bytes without progress; a shared `Deadline` (rather than a fresh
-        // per-read timeout) lets pings draw the window down while every other
-        // frame restarts it, so only a genuine stall surfaces `error.Timeout`.
+        // per-read timeout) lets pings and other filler draw the window down while
+        // every recognized frame restarts it, so only a genuine stall surfaces
+        // `error.Timeout`.
         var deadline = net.Deadline.start(self.io, self.idle_ms);
         while (true) {
             const line = (try self.takeLine(deadline)) orelse return null;
             const trimmed = std.mem.trimEnd(u8, line, "\r");
-            if (!std.mem.startsWith(u8, trimmed, "data:")) continue;
+            if (!std.mem.startsWith(u8, trimmed, "data:")) {
+                // A non-`data:` line (comment, `event:` field, blank) is not
+                // progress; check the window so buffered filler that never blocks
+                // a read cannot spin here forever.
+                if (deadline.expired(self.io)) return error.Timeout;
+                continue;
+            }
             const payload = std.mem.trimStart(u8, trimmed["data:".len..], " ");
             switch (try self.decode(payload)) {
                 .event => |event| return event,
                 .progress => deadline = net.Deadline.start(self.io, self.idle_ms),
-                // A ping never restarts the window, so a stream that only pings
-                // trips the timeout even when its bytes arrive buffered and no
-                // read ever blocks on `deadline.call`.
-                .ping => if (deadline.expired(self.io)) return error.Timeout,
+                // A ping or an unrecognized frame never restarts the window, so a
+                // stream of only filler trips the timeout even when its bytes
+                // arrive buffered and no read ever blocks on `deadline.call`.
+                .ping, .ignored => if (deadline.expired(self.io)) return error.Timeout,
             }
         }
     }
@@ -174,11 +185,11 @@ pub const Stream = struct {
         const parsed = try std.json.parseFromSlice(std.json.Value, self.gpa, json, .{});
         const object = asObject(parsed.value) orelse {
             parsed.deinit();
-            return .progress;
+            return .ignored;
         };
         const kind = asString(object.get("type")) orelse {
             parsed.deinit();
-            return .progress;
+            return .ignored;
         };
 
         if (std.mem.eql(u8, kind, "ping")) {
@@ -228,12 +239,17 @@ pub const Stream = struct {
             return .progress;
         }
 
-        const event = classify(object, kind) orelse {
-            parsed.deinit();
-            return .progress;
-        };
-        self.parsed = parsed;
-        return .{ .event = event };
+        if (classify(object, kind)) |event| {
+            self.parsed = parsed;
+            return .{ .event = event };
+        }
+        // A recognized `content_block_*` frame with no event (a block boundary, or
+        // a delta subtype not surfaced) is still progress; any other `type` is
+        // filler that must not hold the idle window open. Read `kind` (which
+        // borrows `parsed`) before freeing it.
+        const recognized = std.mem.startsWith(u8, kind, "content_block_");
+        parsed.deinit();
+        return if (recognized) .progress else .ignored;
     }
 
     fn recordError(self: *Stream, message: []const u8) void {
@@ -571,6 +587,95 @@ test "message_stop requires a final delta with a stop reason" {
     );
     try std.testing.expectEqualStrings("max_tokens", stop.event.stop.reason.?);
     try std.testing.expectEqual(@as(u64, 4), stop.event.stop.usage.output);
+}
+
+/// A logical clock over a real backend: `now` returns the current tick and then
+/// advances by a fixed step, so a bounded run of non-progress reads drives the
+/// idle window to expiry deterministically without real time passing. Only `now`
+/// is overridden, so the callers must never reach another vtable entry with this
+/// wrapper's userdata: the tests feed a fully buffered `.fixed` reader whose
+/// lines are always available, so `takeLine` returns them directly and never
+/// reaches `deadline.call` (the sole path to a backend-owned timed operation).
+const TickingIo = struct {
+    backend: std.Io,
+    vtable: std.Io.VTable,
+    tick_ns: i96,
+    step_ns: i96,
+
+    fn init(backend: std.Io, step_ns: i96) TickingIo {
+        var vtable = backend.vtable.*;
+        vtable.now = now;
+        return .{ .backend = backend, .vtable = vtable, .tick_ns = 0, .step_ns = step_ns };
+    }
+
+    fn io(self: *TickingIo) std.Io {
+        return .{ .userdata = self, .vtable = &self.vtable };
+    }
+
+    fn now(userdata: ?*anyopaque, clock: std.Io.Clock) std.Io.Timestamp {
+        _ = clock;
+        const self: *TickingIo = @ptrCast(@alignCast(userdata));
+        const current = self.tick_ns;
+        self.tick_ns += self.step_ns;
+        return .{ .nanoseconds = current };
+    }
+};
+
+test "decode ignores unrecognized frames instead of counting them as progress" {
+    var stream: Stream = undefined;
+    stream.gpa = std.testing.allocator;
+    stream.parsed = null;
+    stream.terminal_delta = null;
+    stream.usage = .{};
+    defer if (stream.parsed) |parsed| parsed.deinit();
+    defer if (stream.terminal_delta) |terminal_delta| terminal_delta.deinit();
+
+    // An unknown top-level type, a payload with no type, and a non-object payload
+    // are all filler the protocol does not define: ignored, never progress.
+    try std.testing.expectEqual(@as(Decoded, .ignored), try stream.decode(
+        \\{"type":"surprise_new_event"}
+    ));
+    try std.testing.expectEqual(@as(Decoded, .ignored), try stream.decode(
+        \\{"note":"no type here"}
+    ));
+    try std.testing.expectEqual(@as(Decoded, .ignored), try stream.decode(
+        \\42
+    ));
+    // A recognized block boundary that carries no event is still progress.
+    try std.testing.expectEqual(@as(Decoded, .progress), try stream.decode(
+        \\{"type":"content_block_stop","index":0}
+    ));
+}
+
+test "next times out on buffered filler that makes no progress" {
+    // A comment line and unrecognized `data:` frames carry no protocol progress,
+    // so a stream of only filler must trip the idle window even though every line
+    // is buffered and no read ever blocks on the deadline.
+    const body =
+        ": keepalive comment\n" ++
+        "data: {\"type\":\"surprise_new_event\"}\n" ++
+        "data: {\"type\":\"surprise_new_event\"}\n" ++
+        "data: {\"type\":\"surprise_new_event\"}\n" ++
+        "data: {\"type\":\"surprise_new_event\"}\n" ++
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"late\"}}\n";
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var clock: TickingIo = .init(threaded.io(), 40 * std.time.ns_per_ms);
+    var reader: std.Io.Reader = .fixed(body);
+    var stream: Stream = undefined;
+    stream.gpa = std.testing.allocator;
+    stream.io = clock.io();
+    stream.idle_ms = 100;
+    stream.body = &reader;
+    stream.parsed = null;
+    stream.terminal_delta = null;
+    stream.usage = .{};
+    defer if (stream.parsed) |parsed| parsed.deinit();
+    defer if (stream.terminal_delta) |terminal_delta| terminal_delta.deinit();
+
+    // The window is 100 ms and the logical clock advances 40 ms per reading, so it
+    // closes after a few filler lines — before the trailing real event or EOF.
+    try std.testing.expectError(error.Timeout, stream.next());
 }
 
 test retryAfter {
