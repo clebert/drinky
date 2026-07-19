@@ -208,9 +208,9 @@ commit history, `BACKLOG.md` (planned work), and `docs/`.
   consecutive same-role items merge into one message (a tool result counts as user), each item maps
   to one content block in order, and reasoning stays first, never reordered or merged — so the
   serialized prefix stays byte-stable and server-side prompt-cache hits persist.
-- Streams responses over SSE, decoding them into the neutral reply events plus usage, stop reason,
-  and API errors; only the final `message_stop` completes a reply, after the preceding
-  `message_delta` supplies its cumulative usage and stop reason.
+- Streams responses over SSE, decoding them into the neutral reply events plus usage and API
+  errors; only the final `message_stop` completes a reply, after the preceding `message_delta`
+  supplies its cumulative usage and a stop reason gating termination.
 - When reasoning is enabled, requests adaptive, summarized extended thinking at the resolved effort
   level so the model sizes its own budget while the output ceiling stays fixed; omitted when effort
   is none, the model has no reasoning, or the model is unknown.
@@ -232,9 +232,9 @@ commit history, `BACKLOG.md` (planned work), and `docs/`.
 - Builds each request for the Responses API from the same conversation items, sending each item as
   its own input entry (never merged), with the system prompt as instructions and the tools as
   function tools.
-- Streams responses over SSE, decoding them into the neutral reply events plus usage and stop
-  reason; `response.completed` and `response.incomplete` are authoritative terminal events, usage
-  is folded when their response object supplies it, and an optional `[DONE]` compatibility sentinel
+- Streams responses over SSE, decoding them into the neutral reply events plus usage;
+  `response.completed` and `response.incomplete` are authoritative terminal events, usage is
+  folded when their response object supplies it, and an optional `[DONE]` compatibility sentinel
   only ends the byte stream.
 - When reasoning is enabled, requests a summarized reasoning stream at the resolved effort level and
   round-trips each reasoning item's encrypted payload and id verbatim so later turns replay it; no

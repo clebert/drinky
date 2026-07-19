@@ -5,6 +5,7 @@
 const std = @import("std");
 
 const Auth = @import("Auth.zig");
+const json = @import("../json.zig");
 const net = @import("../net.zig");
 
 /// Numeric semantic version used by the Codex catalog for client filtering.
@@ -97,7 +98,7 @@ fn request(
     var response = try catalog_request.receiveHead(&redirect_buffer);
     if (response.head.status != .ok) return error.ModelCatalogRequestFailed;
 
-    const decompress_buffer = try decompressBuffer(gpa, response.head.content_encoding);
+    const decompress_buffer = try net.decompressBuffer(gpa, response.head.content_encoding);
     defer if (decompress_buffer.len != 0) gpa.free(decompress_buffer);
     var decompress: std.http.Decompress = undefined;
     var transfer_buffer: [16384]u8 = undefined;
@@ -112,23 +113,14 @@ fn validHeaderValue(value: []const u8) bool {
     return value.len != 0 and std.mem.indexOfAny(u8, value, "\r\n") == null;
 }
 
-fn decompressBuffer(gpa: std.mem.Allocator, encoding: std.http.ContentEncoding) ![]u8 {
-    return switch (encoding) {
-        .identity => &.{},
-        .gzip, .deflate => gpa.alloc(u8, std.compress.flate.max_window_len),
-        .zstd => gpa.alloc(u8, std.compress.zstd.default_window_len),
-        .compress => error.UnsupportedContentEncoding,
-    };
-}
-
 /// Decode a complete catalog response. Individual malformed entries remain
 /// ignorable; a malformed envelope rejects the catalog as a whole.
 pub fn parse(gpa: std.mem.Allocator, body: []const u8) !ModelCatalog {
     var parsed = try std.json.parseFromSlice(std.json.Value, gpa, body, .{});
     errdefer parsed.deinit();
 
-    const object = asObject(&parsed.value) orelse return error.BadModelCatalog;
-    const entries = asArray(object.getPtr("models")) orelse return error.BadModelCatalog;
+    const object = json.object(parsed.value) orelse return error.BadModelCatalog;
+    const entries = json.array(object.get("models")) orelse return error.BadModelCatalog;
     if (entries.items.len > model_count_max) return error.BadModelCatalog;
 
     return .{ .parsed = parsed };
@@ -143,21 +135,20 @@ pub fn contextWindow(self: *const ModelCatalog, slug: []const u8) ?u64 {
 }
 
 fn metadata(self: *const ModelCatalog, slug: []const u8) ?Metadata {
-    const object = asObject(&self.parsed.value) orelse unreachable;
-    const entries = asArray(object.getPtr("models")) orelse unreachable;
-    for (entries.items) |*entry| {
-        const model = asObject(entry) orelse continue;
-        const found_slug = asString(model.getPtr("slug")) orelse continue;
+    const object = json.object(self.parsed.value) orelse unreachable;
+    const entries = json.array(object.get("models")) orelse unreachable;
+    for (entries.items) |entry| {
+        const model = json.object(entry) orelse continue;
+        const found_slug = json.string(model.get("slug")) orelse continue;
         if (!std.mem.eql(u8, found_slug, slug)) continue;
 
-        const max_context_window = positiveInt(model.getPtr("max_context_window"));
-        const maybe_context_window = model.getPtr("context_window");
-        const context_window = if (maybe_context_window) |value| switch (value.*) {
+        const max_context_window = positiveInt(model.get("max_context_window"));
+        const context_window = if (model.get("context_window")) |value| switch (value) {
             .null => max_context_window orelse return null,
             else => positiveInt(value) orelse return null,
         } else max_context_window orelse return null;
         const effective_context_window_percent: ?u8 =
-            if (model.getPtr("effective_context_window_percent")) |value|
+            if (model.get("effective_context_window_percent")) |value|
                 percent(value)
             else
                 effective_context_window_percent_default;
@@ -170,42 +161,14 @@ fn metadata(self: *const ModelCatalog, slug: []const u8) ?Metadata {
     return null;
 }
 
-fn asObject(value: *const std.json.Value) ?*const std.json.ObjectMap {
-    return switch (value.*) {
-        .object => |*object| object,
-        else => null,
-    };
+fn positiveInt(value: ?std.json.Value) ?u64 {
+    const found = json.integer(value) orelse return null;
+    return if (found > 0) @intCast(found) else null;
 }
 
-fn asArray(maybe_value: ?*const std.json.Value) ?*const std.json.Array {
-    const value = maybe_value orelse return null;
-    return switch (value.*) {
-        .array => |*array| array,
-        else => null,
-    };
-}
-
-fn asString(maybe_value: ?*const std.json.Value) ?[]const u8 {
-    const value = maybe_value orelse return null;
-    return switch (value.*) {
-        .string => |string| string,
-        else => null,
-    };
-}
-
-fn positiveInt(maybe_value: ?*const std.json.Value) ?u64 {
-    const value = maybe_value orelse return null;
-    return switch (value.*) {
-        .integer => |integer| if (integer > 0) @intCast(integer) else null,
-        else => null,
-    };
-}
-
-fn percent(value: *const std.json.Value) ?u8 {
-    return switch (value.*) {
-        .integer => |integer| if (integer > 0 and integer <= 100) @intCast(integer) else null,
-        else => null,
-    };
+fn percent(value: std.json.Value) ?u8 {
+    const found = json.integer(value) orelse return null;
+    return if (found > 0 and found <= 100) @intCast(found) else null;
 }
 
 test "credential header values cannot inject another header" {

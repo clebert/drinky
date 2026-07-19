@@ -6,6 +6,7 @@ const std = @import("std");
 
 const llm = @import("../llm.zig");
 const models = @import("../models.zig");
+const writeParametersSchema = @import("../json.zig").writeParametersSchema;
 
 /// Required first system block on the subscription OAuth path (the Claude Code
 /// identity). The API-key path omits it and sends only the user's own prompt.
@@ -178,28 +179,7 @@ fn writeTool(json: *std.json.Stringify, tool: llm.Tool, cache: bool) !void {
     try json.objectField("description");
     try json.write(tool.description);
     try json.objectField("input_schema");
-    try json.beginObject();
-    try json.objectField("type");
-    try json.write("object");
-    try json.objectField("properties");
-    try json.beginObject();
-    for (tool.parameters) |parameter| {
-        try json.objectField(parameter.name);
-        try json.beginObject();
-        try json.objectField("type");
-        try json.write(@tagName(parameter.type));
-        try json.objectField("description");
-        try json.write(parameter.description);
-        try json.endObject();
-    }
-    try json.endObject();
-    try json.objectField("required");
-    try json.beginArray();
-    for (tool.parameters) |parameter| {
-        if (parameter.required) try json.write(parameter.name);
-    }
-    try json.endArray();
-    try json.endObject();
+    try writeParametersSchema(json, tool.parameters);
     if (cache) {
         try json.objectField("cache_control");
         try json.write(CacheControl{});

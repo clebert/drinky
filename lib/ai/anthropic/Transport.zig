@@ -7,6 +7,7 @@
 
 const std = @import("std");
 
+const json = @import("../json.zig");
 const llm = @import("../llm.zig");
 const net = @import("../net.zig");
 const sse = @import("../sse.zig");
@@ -55,9 +56,9 @@ pub const Stream = struct {
     retry_after_ms: ?u64,
     /// Backs the event handed to the caller; freed by the next read.
     parsed: ?std.json.Parsed(std.json.Value),
-    /// The `message_delta` carrying the stop reason, retained so its reason
-    /// outlives that frame until the following `message_stop` closes the reply.
-    terminal_delta: ?std.json.Parsed(std.json.Value),
+    /// A `message_delta` carrying a stop reason arrived; only then may the
+    /// following `message_stop` close the reply.
+    terminal: bool,
     usage: llm.Usage,
     decompress: std.http.Decompress,
     decompress_buffer: []u8,
@@ -82,25 +83,23 @@ pub const Stream = struct {
     pub fn reset(self: *Stream) void {
         if (self.parsed) |parsed| parsed.deinit();
         self.parsed = null;
-        if (self.terminal_delta) |terminal_delta| terminal_delta.deinit();
-        self.terminal_delta = null;
     }
 
     /// Decode one Messages `data:` payload. A keepalive `ping` decodes as
     /// filler (`.ignored`), so a stream of only pings draws the idle window
     /// down.
-    pub fn decode(self: *Stream, json: []const u8) !sse.Decoded {
+    pub fn decode(self: *Stream, payload: []const u8) !sse.Decoded {
         // A malformed payload is filler, not progress; a truncated tail then
         // surfaces as an incomplete reply at end of stream, which is retried.
-        const parsed = std.json.parseFromSlice(std.json.Value, self.gpa, json, .{}) catch |err| switch (err) {
+        const parsed = std.json.parseFromSlice(std.json.Value, self.gpa, payload, .{}) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return .ignored,
         };
-        const object = asObject(parsed.value) orelse {
+        const object = json.object(parsed.value) orelse {
             parsed.deinit();
             return .ignored;
         };
-        const kind = asString(object.get("type")) orelse {
+        const kind = json.string(object.get("type")) orelse {
             parsed.deinit();
             return .ignored;
         };
@@ -118,39 +117,30 @@ pub const Stream = struct {
         // Usage arrives split across the stream: the prompt and cache counts in
         // `message_start`, the final output count in `message_delta`. The latter
         // also carries the stop reason, but only the following `message_stop` is
-        // terminal. Retain the parsed delta so its reason outlives that event.
+        // terminal.
         if (std.mem.eql(u8, kind, "message_delta")) {
-            if (asObject(object.get("usage"))) |usage| mergeUsage(&self.usage, usage);
-            if (self.terminal_delta) |previous| previous.deinit();
-            self.terminal_delta = null;
-            if (messageDeltaStopReason(object) != null)
-                self.terminal_delta = parsed
-            else
-                parsed.deinit();
+            if (json.object(object.get("usage"))) |usage| mergeUsage(&self.usage, usage);
+            self.terminal = messageDeltaStopReason(object) != null;
+            parsed.deinit();
             return .progress;
         }
         if (std.mem.eql(u8, kind, "message_stop")) {
-            if (self.terminal_delta == null) {
-                parsed.deinit();
-                return error.IncompleteReply;
-            }
-            const reason = messageDeltaStopReason(self.terminal_delta.?.value.object).?;
             parsed.deinit();
-            return .{ .event = .{ .stop = .{ .reason = reason, .usage = self.usage } } };
+            if (!self.terminal) return error.IncompleteReply;
+            return .{ .event = .{ .stop = .{ .usage = self.usage } } };
         }
         // Only recognized content past the terminal delta breaks the reply;
         // an unrecognized frame there is still ignored filler.
         const content = std.mem.eql(u8, kind, "message_start") or
             std.mem.startsWith(u8, kind, "content_block_");
-        if (content) if (self.terminal_delta) |terminal_delta| {
-            terminal_delta.deinit();
-            self.terminal_delta = null;
+        if (content and self.terminal) {
+            self.terminal = false;
             parsed.deinit();
             return error.IncompleteReply;
-        };
+        }
         if (std.mem.eql(u8, kind, "message_start")) {
-            if (asObject(object.get("message"))) |message| {
-                if (asObject(message.get("usage"))) |usage| mergeUsage(&self.usage, usage);
+            if (json.object(object.get("message"))) |message| {
+                if (json.object(message.get("usage"))) |usage| mergeUsage(&self.usage, usage);
             }
             parsed.deinit();
             return .progress;
@@ -181,7 +171,7 @@ fn connect(self: *Transport, out: *Stream, body: []const u8) anyerror!void {
     const engine = sse.Engine(Stream);
     engine.begin(out, self.gpa, self.io);
     errdefer out.client.deinit();
-    out.terminal_delta = null;
+    out.terminal = false;
 
     // The Bearer header outlives the send below (which happens after the request
     // is built), so allocate it at connect scope; the API-key path needs none.
@@ -246,75 +236,51 @@ fn requestOptions(
 
 fn classify(object: std.json.ObjectMap, kind: []const u8) ?llm.Event {
     if (std.mem.eql(u8, kind, "content_block_delta")) {
-        const delta = asObject(object.get("delta")) orelse return null;
-        const delta_kind = asString(delta.get("type")) orelse return null;
+        const delta = json.object(object.get("delta")) orelse return null;
+        const delta_kind = json.string(delta.get("type")) orelse return null;
         if (std.mem.eql(u8, delta_kind, "text_delta"))
-            return .{ .text = asString(delta.get("text")) orelse return null };
+            return .{ .text = json.string(delta.get("text")) orelse return null };
         if (std.mem.eql(u8, delta_kind, "input_json_delta"))
-            return .{ .input_json = asString(delta.get("partial_json")) orelse return null };
+            return .{ .input_json = json.string(delta.get("partial_json")) orelse return null };
         if (std.mem.eql(u8, delta_kind, "thinking_delta"))
-            return .{ .thinking = .{ .text = asString(delta.get("thinking")) orelse return null } };
+            return .{ .thinking = .{ .text = json.string(delta.get("thinking")) orelse return null } };
         if (std.mem.eql(u8, delta_kind, "signature_delta"))
-            return .{ .thinking_blob = .{ .blob = asString(delta.get("signature")) orelse return null } };
+            return .{ .thinking_blob = .{ .blob = json.string(delta.get("signature")) orelse return null } };
         return null;
     }
     if (std.mem.eql(u8, kind, "content_block_start")) {
-        const block = asObject(object.get("content_block")) orelse return null;
-        const block_kind = asString(block.get("type")) orelse return null;
+        const block = json.object(object.get("content_block")) orelse return null;
+        const block_kind = json.string(block.get("type")) orelse return null;
         if (std.mem.eql(u8, block_kind, "redacted_thinking"))
-            return .{ .thinking_redacted = .{ .blob = asString(block.get("data")) orelse return null } };
+            return .{ .thinking_redacted = .{ .blob = json.string(block.get("data")) orelse return null } };
         // A `thinking` start carries only empty seeds — its content arrives as
         // deltas — so it, like any other non-tool block, yields no start event.
         if (!std.mem.eql(u8, block_kind, "tool_use")) return null;
         return .{ .tool_use = .{
-            .call_id = asString(block.get("id")) orelse return null,
-            .name = asString(block.get("name")) orelse return null,
+            .call_id = json.string(block.get("id")) orelse return null,
+            .name = json.string(block.get("name")) orelse return null,
         } };
     }
     return null;
 }
 
 fn messageDeltaStopReason(object: std.json.ObjectMap) ?[]const u8 {
-    const delta = asObject(object.get("delta")) orelse return null;
-    return asString(delta.get("stop_reason"));
+    const delta = json.object(object.get("delta")) orelse return null;
+    return json.string(delta.get("stop_reason"));
 }
 
 fn errorMessage(object: std.json.ObjectMap) ?[]const u8 {
-    const detail = asObject(object.get("error")) orelse return null;
-    return asString(detail.get("message"));
-}
-
-fn asObject(value: ?std.json.Value) ?std.json.ObjectMap {
-    const found = value orelse return null;
-    return switch (found) {
-        .object => |object| object,
-        else => null,
-    };
-}
-
-fn asString(value: ?std.json.Value) ?[]const u8 {
-    const found = value orelse return null;
-    return switch (found) {
-        .string => |string| string,
-        else => null,
-    };
-}
-
-fn asU64(value: ?std.json.Value) ?u64 {
-    const found = value orelse return null;
-    return switch (found) {
-        .integer => |integer| if (integer < 0) 0 else @intCast(integer),
-        else => null,
-    };
+    const detail = json.object(object.get("error")) orelse return null;
+    return json.string(detail.get("message"));
 }
 
 /// Overwrite each field present in `object`. Anthropic reports usage as
 /// cumulative message totals, so last-writer-per-field is the running total.
 fn mergeUsage(usage: *llm.Usage, object: std.json.ObjectMap) void {
-    if (asU64(object.get("input_tokens"))) |value| usage.input = value;
-    if (asU64(object.get("output_tokens"))) |value| usage.output = value;
-    if (asU64(object.get("cache_read_input_tokens"))) |value| usage.cache_read = value;
-    if (asU64(object.get("cache_creation_input_tokens"))) |value| usage.cache_write = value;
+    if (json.unsigned(object.get("input_tokens"))) |value| usage.input = value;
+    if (json.unsigned(object.get("output_tokens"))) |value| usage.output = value;
+    if (json.unsigned(object.get("cache_read_input_tokens"))) |value| usage.cache_read = value;
+    if (json.unsigned(object.get("cache_creation_input_tokens"))) |value| usage.cache_write = value;
 }
 
 /// A stream over `body` for the tests: test allocator, fresh decode state, and
@@ -328,16 +294,16 @@ fn testStream(io: std.Io, body: *std.Io.Reader, idle_ms: u64, budget_max: usize)
     stream.budget = .{ .max = budget_max };
     stream.body = body;
     stream.parsed = null;
-    stream.terminal_delta = null;
+    stream.terminal = false;
     stream.usage = .{};
     return stream;
 }
 
 test classify {
-    const json =
+    const payload =
         \\{"type":"content_block_delta","delta":{"type":"text_delta","text":"hello"}}
     ;
-    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
     defer parsed.deinit();
     const event = classify(parsed.value.object, "content_block_delta").?;
     try std.testing.expectEqualStrings("hello", event.text);
@@ -399,7 +365,6 @@ test "next walks SSE data lines and ends at stream end" {
     const text = (try stream.next()).?;
     try std.testing.expectEqualStrings("Hi", text.text);
     const stop = (try stream.next()).?;
-    try std.testing.expectEqualStrings("end_turn", stop.stop.reason.?);
     try std.testing.expectEqual(@as(u64, 10), stop.stop.usage.input);
     try std.testing.expectEqual(@as(u64, 42), stop.stop.usage.output);
     try std.testing.expectEqual(@as(u64, 90), stop.stop.usage.cache_read);
@@ -448,7 +413,7 @@ test "message_stop requires a final delta with a stop reason" {
     try std.testing.expectError(error.IncompleteReply, stream.decode(
         \\{"type":"content_block_delta","delta":{"type":"text_delta","text":"late"}}
     ));
-    try std.testing.expect(stream.terminal_delta == null);
+    try std.testing.expect(!stream.terminal);
 
     try std.testing.expectEqual(@as(sse.Decoded, .progress), try stream.decode(
         \\{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":3}}
@@ -459,7 +424,6 @@ test "message_stop requires a final delta with a stop reason" {
     const stop = try stream.decode(
         \\{"type":"message_stop"}
     );
-    try std.testing.expectEqualStrings("max_tokens", stop.event.stop.reason.?);
     try std.testing.expectEqual(@as(u64, 4), stop.event.stop.usage.output);
 }
 
@@ -478,7 +442,7 @@ test "an unrecognized frame after the terminal delta stays ignored" {
     const stop = try stream.decode(
         \\{"type":"message_stop"}
     );
-    try std.testing.expectEqualStrings("end_turn", stop.event.stop.reason.?);
+    try std.testing.expect(stop.event == .stop);
 }
 
 test "decode ignores unrecognized frames instead of counting them as progress" {

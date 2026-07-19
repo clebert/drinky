@@ -157,6 +157,17 @@ pub const Deadline = struct {
     }
 };
 
+/// A decompression window sized for `encoding`, or an empty slice when the body
+/// is not compressed. Caller frees a non-empty result.
+pub fn decompressBuffer(gpa: std.mem.Allocator, encoding: std.http.ContentEncoding) ![]u8 {
+    return switch (encoding) {
+        .identity => &.{},
+        .gzip, .deflate => gpa.alloc(u8, std.compress.flate.max_window_len),
+        .zstd => gpa.alloc(u8, std.compress.zstd.default_window_len),
+        .compress => error.UnsupportedContentEncoding,
+    };
+}
+
 /// A hard ceiling on the total wire bytes one streamed response body may deliver.
 /// Every model tops out at 128k output tokens (~14 MB of framed SSE at one token
 /// per frame), so this clears any real reply several times over while bounding a

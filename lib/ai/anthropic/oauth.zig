@@ -4,6 +4,7 @@
 
 const std = @import("std");
 
+const json = @import("../json.zig");
 const net = @import("../net.zig");
 const oauth_wire = @import("../oauth_wire.zig");
 
@@ -103,13 +104,10 @@ fn post(gpa: std.mem.Allocator, io: std.Io, timeouts: net.Timeouts, body: []cons
 fn parseTokens(gpa: std.mem.Allocator, io: std.Io, body: []const u8) !Tokens {
     const parsed = try std.json.parseFromSlice(std.json.Value, gpa, body, .{});
     defer parsed.deinit();
-    const object = switch (parsed.value) {
-        .object => |object| object,
-        else => return error.BadTokenResponse,
-    };
-    const access = jsonString(object, "access_token") orelse return error.MissingAccessToken;
-    const refresh_token = jsonString(object, "refresh_token") orelse return error.MissingRefreshToken;
-    const expires_in = jsonInt(object, "expires_in") orelse return error.MissingExpiry;
+    const object = json.object(parsed.value) orelse return error.BadTokenResponse;
+    const access = json.string(object.get("access_token")) orelse return error.MissingAccessToken;
+    const refresh_token = json.string(object.get("refresh_token")) orelse return error.MissingRefreshToken;
+    const expires_in = json.integer(object.get("expires_in")) orelse return error.MissingExpiry;
     // A crafted expiry must fail cleanly, not overflow and crash.
     const expires_scaled = std.math.mul(i64, expires_in, 1000) catch return error.MissingExpiry;
 
@@ -122,22 +120,6 @@ fn parseTokens(gpa: std.mem.Allocator, io: std.Io, body: []const u8) !Tokens {
         .access = access_owned,
         .refresh = refresh_owned,
         .expires_ms = now_ms +| expires_scaled -| refresh_margin_ms,
-    };
-}
-
-fn jsonString(object: std.json.ObjectMap, name: []const u8) ?[]const u8 {
-    const value = object.get(name) orelse return null;
-    return switch (value) {
-        .string => |string| string,
-        else => null,
-    };
-}
-
-fn jsonInt(object: std.json.ObjectMap, name: []const u8) ?i64 {
-    const value = object.get(name) orelse return null;
-    return switch (value) {
-        .integer => |integer| integer,
-        else => null,
     };
 }
 

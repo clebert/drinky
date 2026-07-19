@@ -974,7 +974,7 @@ fn anthropicStream(io: std.Io, reader: *std.Io.Reader, idle_ms: u64) provider.St
     stream.anthropic_subscription.budget = .{ .max = net.stream_response_bytes_max };
     stream.anthropic_subscription.body = reader;
     stream.anthropic_subscription.parsed = null;
-    stream.anthropic_subscription.terminal_delta = null;
+    stream.anthropic_subscription.terminal = false;
     stream.anthropic_subscription.usage = .{};
     return stream;
 }
@@ -1012,7 +1012,7 @@ fn expectIncompleteToolStream(
 test "readReply stops before a post-completion timeout" {
     const events = [_]llm.Event{
         .{ .text = "done" },
-        .{ .stop = .{ .reason = "end_turn", .usage = .{ .output = 4 } } },
+        .{ .stop = .{ .usage = .{ .output = 4 } } },
     };
     var stream: ScriptedStream = .{ .events = &events, .terminal_error = error.Timeout };
     var agent = scriptedAgent(std.testing.allocator);
@@ -1084,7 +1084,7 @@ test "rollback frees every item appended since the base" {
         .{ .text = "answer" },
         .{ .tool_use = .{ .call_id = "t1", .name = "read" } },
         .{ .input_json = "{}" },
-        .{ .stop = .{ .reason = "tool_use", .usage = .{} } },
+        .{ .stop = .{ .usage = .{} } },
     };
     var stream: ScriptedStream = .{ .events = &events };
     const reply = try agent.readReply(&agent.model, &stream, &handler);
@@ -1114,7 +1114,7 @@ fn readReplyUnderOom(allocator: std.mem.Allocator) !void {
         .{ .tool_use = .{ .call_id = "t1", .name = "read" } },
         .{ .input_json = "{\"path\":\"a\"}" },
         .{ .text = "trailing" },
-        .{ .stop = .{ .reason = "tool_use", .usage = .{ .output = 5 } } },
+        .{ .stop = .{ .usage = .{ .output = 5 } } },
     };
     var stream: ScriptedStream = .{ .events = &events };
     _ = try agent.readReply(&agent.model, &stream, &handler);
@@ -1139,7 +1139,6 @@ test "readReply accepts Anthropic message_stop without waiting for later traffic
     var reader: std.Io.Reader = .fixed(body);
     var stream = anthropicStream(threaded.io(), &reader, 0);
     defer if (stream.anthropic_subscription.parsed) |parsed| parsed.deinit();
-    defer if (stream.anthropic_subscription.terminal_delta) |terminal_delta| terminal_delta.deinit();
     var agent = scriptedAgent(std.testing.allocator);
     defer agent.deinit();
     var handler: CaptureHandler = .{ .gpa = std.testing.allocator };
@@ -1192,7 +1191,6 @@ test "readReply rejects provider EOF before text completion" {
         var reader: std.Io.Reader = .fixed(body);
         var stream = anthropicStream(threaded.io(), &reader, 60_000);
         defer if (stream.anthropic_subscription.parsed) |parsed| parsed.deinit();
-        defer if (stream.anthropic_subscription.terminal_delta) |terminal_delta| terminal_delta.deinit();
         var agent = scriptedAgent(std.testing.allocator);
         defer agent.deinit();
         var handler: CaptureHandler = .{ .gpa = std.testing.allocator };
@@ -1238,7 +1236,6 @@ test "incomplete provider tool calls never enter history or execute" {
         var reader: std.Io.Reader = .fixed(body);
         var stream = anthropicStream(threaded.io(), &reader, 60_000);
         defer if (stream.anthropic_subscription.parsed) |parsed| parsed.deinit();
-        defer if (stream.anthropic_subscription.terminal_delta) |terminal_delta| terminal_delta.deinit();
         var agent = scriptedAgent(std.testing.allocator);
         defer agent.deinit();
         var handler: CaptureHandler = .{ .gpa = std.testing.allocator };
@@ -1279,7 +1276,7 @@ test "readReply assembles a reasoning run, answer, and tool call in stream order
         .{ .text = "answer" },
         .{ .tool_use = .{ .call_id = "t1", .name = "read" } },
         .{ .input_json = "{\"path\":\"a\"}" },
-        .{ .stop = .{ .reason = "tool_use", .usage = .{ .output = 5 } } },
+        .{ .stop = .{ .usage = .{ .output = 5 } } },
     };
     var stream: ScriptedStream = .{ .events = &events };
 
@@ -1309,7 +1306,7 @@ test "readReply keeps a redacted block and a signature-only run in order" {
         .{ .thinking_redacted = .{ .blob = "enc" } },
         .{ .thinking_blob = .{ .blob = "sigonly" } },
         .{ .text = "hi" },
-        .{ .stop = .{ .reason = "end_turn", .usage = .{} } },
+        .{ .stop = .{ .usage = .{} } },
     };
     var stream: ScriptedStream = .{ .events = &events };
 
@@ -1335,7 +1332,7 @@ test "readReply commits trailing text after the final tool in stream order" {
         .{ .tool_use = .{ .call_id = "t1", .name = "read" } },
         .{ .input_json = "{}" },
         .{ .text = "after" },
-        .{ .stop = .{ .reason = "end_turn", .usage = .{} } },
+        .{ .stop = .{ .usage = .{} } },
     };
     var stream: ScriptedStream = .{ .events = &events };
 
@@ -1365,7 +1362,7 @@ test "readReply keeps adjacent reasoning runs as separate items in stream order"
         .{ .thinking_blob = .{ .id = "rs_c", .blob = "encC" } },
         .{ .tool_use = .{ .call_id = "t1", .name = "read" } },
         .{ .input_json = "{}" },
-        .{ .stop = .{ .reason = "tool_use", .usage = .{} } },
+        .{ .stop = .{ .usage = .{} } },
     };
     var stream: ScriptedStream = .{ .events = &events };
 
@@ -1398,7 +1395,7 @@ test "readReply tags reasoning with the active provider as origin, threading its
         .{ .thinking = .{ .id = "rs_1", .text = "hmm" } },
         .{ .thinking_blob = .{ .id = "rs_1", .blob = "enc" } },
         .{ .text = "done" },
-        .{ .stop = .{ .reason = "completed", .usage = .{} } },
+        .{ .stop = .{ .usage = .{} } },
     };
     var stream: ScriptedStream = .{ .events = &events };
     const reply = try agent.readReply(&agent.model, &stream, &handler);
@@ -1600,12 +1597,12 @@ test "runTools frees partial work at every allocation-failure point" {
 const tool_round_events = [_]llm.Event{
     .{ .tool_use = .{ .call_id = "t1", .name = "write" } },
     .{ .input_json = "{}" },
-    .{ .stop = .{ .reason = "tool_use", .usage = .{} } },
+    .{ .stop = .{ .usage = .{} } },
 };
 
 const end_turn_events = [_]llm.Event{
     .{ .text = "hi" },
-    .{ .stop = .{ .reason = "end_turn", .usage = .{} } },
+    .{ .stop = .{ .usage = .{} } },
 };
 
 test "run fails cleanly on round-bound overrun with the turn rolled back" {
@@ -1751,7 +1748,7 @@ test "steering queued when the model would stop keeps the turn alive" {
 
     const second_events = [_]llm.Event{
         .{ .text = "more" },
-        .{ .stop = .{ .reason = "end_turn", .usage = .{} } },
+        .{ .stop = .{ .usage = .{} } },
     };
     var fetch: ScriptedFetch = .{ .attempts = &.{
         .{ .stream = .{ .events = &end_turn_events } },

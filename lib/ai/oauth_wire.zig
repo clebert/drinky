@@ -96,7 +96,7 @@ fn fetchInto(
     var response = try request.receiveHead(&redirect_buffer);
     if (response.head.status != .ok) return error.TokenRequestFailed;
 
-    const decompress_buffer = try decompressBuffer(gpa, response.head.content_encoding);
+    const decompress_buffer = try net.decompressBuffer(gpa, response.head.content_encoding);
     defer if (decompress_buffer.len != 0) gpa.free(decompress_buffer);
     var decompress: std.http.Decompress = undefined;
     var transfer_buffer: [4096]u8 = undefined;
@@ -111,17 +111,6 @@ fn readBody(gpa: std.mem.Allocator, reader: *std.Io.Reader) ![]u8 {
     return reader.allocRemaining(gpa, .limited(token_response_bytes_max)) catch |err| switch (err) {
         error.StreamTooLong => error.TokenResponseTooLarge,
         else => err,
-    };
-}
-
-/// A decompression window sized for `encoding`, or an empty slice when the body
-/// is not compressed. Caller frees a non-empty result.
-fn decompressBuffer(gpa: std.mem.Allocator, encoding: std.http.ContentEncoding) ![]u8 {
-    return switch (encoding) {
-        .identity => &.{},
-        .gzip, .deflate => gpa.alloc(u8, std.compress.flate.max_window_len),
-        .zstd => gpa.alloc(u8, std.compress.zstd.default_window_len),
-        .compress => error.UnsupportedContentEncoding,
     };
 }
 

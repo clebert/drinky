@@ -125,7 +125,7 @@ pub fn Engine(comptime S: type) type {
             stream.status = stream.response.head.status;
             // Read the head's headers now: creating the body reader invalidates them.
             stream.retry_after_ms = retryAfter(stream.response.head);
-            stream.decompress_buffer = try decompressBuffer(stream.gpa, stream.response.head.content_encoding);
+            stream.decompress_buffer = try net.decompressBuffer(stream.gpa, stream.response.head.content_encoding);
             stream.body = stream.response.readerDecompressing(&stream.transfer_buffer, &stream.decompress, stream.decompress_buffer);
             if (stream.status != .ok)
                 stream.error_length = stream.body.readSliceShort(&stream.error_buffer) catch 0;
@@ -244,17 +244,6 @@ fn retryAfter(head: std.http.Client.Response.Head) ?u64 {
         return seconds *| 1000;
     }
     return null;
-}
-
-/// A decompression window sized for `encoding`, or an empty slice when the body
-/// is not compressed. Caller frees a non-empty result.
-fn decompressBuffer(gpa: std.mem.Allocator, encoding: std.http.ContentEncoding) ![]u8 {
-    return switch (encoding) {
-        .identity => &.{},
-        .gzip, .deflate => gpa.alloc(u8, std.compress.flate.max_window_len),
-        .zstd => gpa.alloc(u8, std.compress.zstd.default_window_len),
-        .compress => error.UnsupportedContentEncoding,
-    };
 }
 
 /// A logical clock over a real backend, for the transports' idle-window tests:

@@ -9,6 +9,7 @@
 
 const std = @import("std");
 
+const json = @import("../json.zig");
 const net = @import("../net.zig");
 const oauth_wire = @import("../oauth_wire.zig");
 
@@ -125,16 +126,13 @@ fn post(
 fn parseTokens(gpa: std.mem.Allocator, body: []const u8, fallback: Fallback) !Tokens {
     const parsed = try std.json.parseFromSlice(std.json.Value, gpa, body, .{});
     defer parsed.deinit();
-    const object = switch (parsed.value) {
-        .object => |object| object,
-        else => return error.BadTokenResponse,
-    };
+    const object = json.object(parsed.value) orelse return error.BadTokenResponse;
 
-    const access_str = jsonString(object, "access_token") orelse return error.MissingAccessToken;
-    const id_token = jsonString(object, "id_token");
+    const access_str = json.string(object.get("access_token")) orelse return error.MissingAccessToken;
+    const id_token = json.string(object.get("id_token"));
     // A refresh may reissue neither the refresh token nor the id token; carry the
     // current values over when the response omits them.
-    const refresh_str = jsonString(object, "refresh_token") orelse fallback.refresh;
+    const refresh_str = json.string(object.get("refresh_token")) orelse fallback.refresh;
     if (refresh_str.len == 0) return error.MissingRefreshToken;
 
     const expires_ms = (try jwtExpiryMs(gpa, access_str)) orelse return error.MissingExpiry;
@@ -178,9 +176,9 @@ fn accountId(
 fn claimAccountId(gpa: std.mem.Allocator, token: []const u8) error{OutOfMemory}!?[]const u8 {
     const parsed = (try decodePayload(gpa, token)) orelse return null;
     defer parsed.deinit();
-    const object = jsonObject(parsed.value) orelse return null;
-    const auth = jsonObject(object.get(auth_claim) orelse return null) orelse return null;
-    const id = jsonStringValue(auth.get("chatgpt_account_id") orelse return null) orelse return null;
+    const object = json.object(parsed.value) orelse return null;
+    const auth = json.object(object.get(auth_claim)) orelse return null;
+    const id = json.string(auth.get("chatgpt_account_id")) orelse return null;
     return try gpa.dupe(u8, id);
 }
 
@@ -189,11 +187,8 @@ fn claimAccountId(gpa: std.mem.Allocator, token: []const u8) error{OutOfMemory}!
 fn jwtExpiryMs(gpa: std.mem.Allocator, token: []const u8) error{OutOfMemory}!?i64 {
     const parsed = (try decodePayload(gpa, token)) orelse return null;
     defer parsed.deinit();
-    const object = jsonObject(parsed.value) orelse return null;
-    const exp = switch (object.get("exp") orelse return null) {
-        .integer => |integer| integer,
-        else => return null,
-    };
+    const object = json.object(parsed.value) orelse return null;
+    const exp = json.integer(object.get("exp")) orelse return null;
     // A crafted `exp` must be skipped, not crash: overflow yields a null expiry
     // (a clean MissingExpiry upstream) rather than a panic.
     const millis = std.math.mul(i64, exp, 1000) catch return null;
@@ -215,24 +210,6 @@ fn decodePayload(gpa: std.mem.Allocator, token: []const u8) error{OutOfMemory}!?
     base64url_decoder.decode(buffer, payload) catch return null;
     return std.json.parseFromSlice(std.json.Value, gpa, buffer, .{}) catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,
-        else => null,
-    };
-}
-
-fn jsonString(object: std.json.ObjectMap, name: []const u8) ?[]const u8 {
-    return jsonStringValue(object.get(name) orelse return null);
-}
-
-fn jsonStringValue(value: std.json.Value) ?[]const u8 {
-    return switch (value) {
-        .string => |string| string,
-        else => null,
-    };
-}
-
-fn jsonObject(value: std.json.Value) ?std.json.ObjectMap {
-    return switch (value) {
-        .object => |object| object,
         else => null,
     };
 }

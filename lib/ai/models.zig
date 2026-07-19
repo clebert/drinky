@@ -45,12 +45,7 @@ pub const Model = struct {
         /// reasoning config.
         pub fn resolve(self: *const EffortMap, effort: llm.Effort) ?[]const u8 {
             return switch (effort) {
-                .none => self.none,
-                .low => self.low,
-                .medium => self.medium,
-                .high => self.high,
-                .xhigh => self.xhigh,
-                .max => self.max,
+                inline else => |level| @field(self, @tagName(level)),
             };
         }
     };

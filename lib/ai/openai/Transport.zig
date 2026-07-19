@@ -7,6 +7,7 @@
 
 const std = @import("std");
 
+const json = @import("../json.zig");
 const llm = @import("../llm.zig");
 const net = @import("../net.zig");
 const sse = @import("../sse.zig");
@@ -79,17 +80,17 @@ pub const Stream = struct {
     }
 
     /// Decode one Responses `data:` payload.
-    pub fn decode(self: *Stream, json: []const u8) !sse.Decoded {
+    pub fn decode(self: *Stream, payload: []const u8) !sse.Decoded {
         // Some deployments close the stream with a Chat-Completions-style
         // sentinel. It ends the byte stream; the Agent separately requires a
         // preceding Responses terminal event before committing the reply.
-        if (std.mem.eql(u8, json, "[DONE]")) return .done;
-        const parsed = try std.json.parseFromSlice(std.json.Value, self.gpa, json, .{});
-        const object = asObject(parsed.value) orelse {
+        if (std.mem.eql(u8, payload, "[DONE]")) return .done;
+        const parsed = try std.json.parseFromSlice(std.json.Value, self.gpa, payload, .{});
+        const object = json.object(parsed.value) orelse {
             parsed.deinit();
             return .ignored;
         };
-        const kind = asString(object.get("type")) orelse {
+        const kind = json.string(object.get("type")) orelse {
             parsed.deinit();
             return .ignored;
         };
@@ -111,10 +112,10 @@ pub const Stream = struct {
         switch (event) {
             // Usage rides on the completed response; fold it in and hand back the
             // running total with the stop event.
-            .stop => |stop| {
+            .stop => {
                 if (completedUsage(object)) |usage| mergeUsage(&self.usage, usage);
                 self.parsed = parsed;
-                return .{ .event = .{ .stop = .{ .reason = stop.reason, .usage = self.usage } } };
+                return .{ .event = .{ .stop = .{ .usage = self.usage } } };
             },
             else => {
                 self.parsed = parsed;
@@ -183,90 +184,63 @@ fn validHeaderValue(value: []const u8) bool {
 /// boundaries, argument-less item bookkeeping).
 fn classify(object: std.json.ObjectMap, kind: []const u8) ?llm.Event {
     if (std.mem.eql(u8, kind, "response.output_text.delta"))
-        return .{ .text = asString(object.get("delta")) orelse return null };
+        return .{ .text = json.string(object.get("delta")) orelse return null };
     if (std.mem.eql(u8, kind, "response.reasoning_summary_text.delta"))
         return .{ .thinking = .{
-            .id = asString(object.get("item_id")) orelse "",
-            .text = asString(object.get("delta")) orelse return null,
+            .id = json.string(object.get("item_id")) orelse "",
+            .text = json.string(object.get("delta")) orelse return null,
         } };
     if (std.mem.eql(u8, kind, "response.function_call_arguments.delta"))
-        return .{ .input_json = asString(object.get("delta")) orelse return null };
+        return .{ .input_json = json.string(object.get("delta")) orelse return null };
     if (std.mem.eql(u8, kind, "response.output_item.added")) {
-        const item = asObject(object.get("item")) orelse return null;
+        const item = json.object(object.get("item")) orelse return null;
         // Only a function call opens a tool use here; its arguments stream as
         // `function_call_arguments.delta`. Message and reasoning items yield no
         // start event (their content arrives as deltas / on done).
-        if (!std.mem.eql(u8, asString(item.get("type")) orelse return null, "function_call")) return null;
+        if (!std.mem.eql(u8, json.string(item.get("type")) orelse return null, "function_call")) return null;
         return .{ .tool_use = .{
-            .call_id = asString(item.get("call_id")) orelse return null,
-            .name = asString(item.get("name")) orelse return null,
+            .call_id = json.string(item.get("call_id")) orelse return null,
+            .name = json.string(item.get("name")) orelse return null,
         } };
     }
     if (std.mem.eql(u8, kind, "response.output_item.done")) {
-        const item = asObject(object.get("item")) orelse return null;
+        const item = json.object(object.get("item")) orelse return null;
         // The reasoning item's encrypted token arrives complete here, closing the
         // reasoning run; other items' content already streamed as deltas.
-        if (!std.mem.eql(u8, asString(item.get("type")) orelse return null, "reasoning")) return null;
+        if (!std.mem.eql(u8, json.string(item.get("type")) orelse return null, "reasoning")) return null;
         return .{ .thinking_blob = .{
-            .id = asString(item.get("id")) orelse "",
-            .blob = asString(item.get("encrypted_content")) orelse return null,
+            .id = json.string(item.get("id")) orelse "",
+            .blob = json.string(item.get("encrypted_content")) orelse return null,
         } };
     }
     // Both terminal frames carry a response object; `completed` is a clean
     // finish, `incomplete` a truncation (output cap or content filter). Neither
     // is an error — the reply so far still stands — so both close the stream
-    // with a stop event. Status and usage are optional within the response.
+    // with a stop event. Usage is optional within the response.
     if (std.mem.eql(u8, kind, "response.completed") or
         std.mem.eql(u8, kind, "response.incomplete"))
     {
-        const response = asObject(object.get("response")) orelse return null;
-        return .{ .stop = .{
-            .reason = asString(response.get("status")),
-            .usage = .{},
-        } };
+        _ = json.object(object.get("response")) orelse return null;
+        return .{ .stop = .{ .usage = .{} } };
     }
     return null;
 }
 
 /// The optional `usage` object nested under a terminal frame's response.
 fn completedUsage(object: std.json.ObjectMap) ?std.json.ObjectMap {
-    const response = asObject(object.get("response")) orelse return null;
-    return asObject(response.get("usage"));
+    const response = json.object(object.get("response")) orelse return null;
+    return json.object(response.get("usage"));
 }
 
 fn errorMessage(object: std.json.ObjectMap) ?[]const u8 {
-    if (asString(object.get("message"))) |message| return message;
-    if (asObject(object.get("error"))) |detail| {
-        if (asString(detail.get("message"))) |message| return message;
+    if (json.string(object.get("message"))) |message| return message;
+    if (json.object(object.get("error"))) |detail| {
+        if (json.string(detail.get("message"))) |message| return message;
     }
-    if (asObject(object.get("response"))) |response| {
-        if (asObject(response.get("error"))) |detail| return asString(detail.get("message"));
+    if (json.object(object.get("response"))) |response| {
+        if (json.object(response.get("error"))) |detail| return json.string(detail.get("message"));
     }
     return null;
-}
-
-fn asObject(value: ?std.json.Value) ?std.json.ObjectMap {
-    const found = value orelse return null;
-    return switch (found) {
-        .object => |object| object,
-        else => null,
-    };
-}
-
-fn asString(value: ?std.json.Value) ?[]const u8 {
-    const found = value orelse return null;
-    return switch (found) {
-        .string => |string| string,
-        else => null,
-    };
-}
-
-fn asU64(value: ?std.json.Value) ?u64 {
-    const found = value orelse return null;
-    return switch (found) {
-        .integer => |integer| if (integer < 0) 0 else @intCast(integer),
-        else => null,
-    };
 }
 
 /// Fold a `response.usage` object into the running total. `input_tokens` is the
@@ -276,17 +250,17 @@ fn asU64(value: ?std.json.Value) ?u64 {
 /// free), so each bucket is tracked separately and priced at its own rate.
 /// `output_tokens` already counts reasoning tokens (billed as output).
 fn mergeUsage(usage: *llm.Usage, object: std.json.ObjectMap) void {
-    const total_input = asU64(object.get("input_tokens")) orelse 0;
+    const total_input = json.unsigned(object.get("input_tokens")) orelse 0;
     var cached: u64 = 0;
     var written: u64 = 0;
-    if (asObject(object.get("input_tokens_details"))) |details| {
-        cached = asU64(details.get("cached_tokens")) orelse 0;
-        written = asU64(details.get("cache_write_tokens")) orelse 0;
+    if (json.object(object.get("input_tokens_details"))) |details| {
+        cached = json.unsigned(details.get("cached_tokens")) orelse 0;
+        written = json.unsigned(details.get("cache_write_tokens")) orelse 0;
     }
     usage.cache_read = cached;
     usage.cache_write = written;
     usage.input = total_input -| cached -| written;
-    if (asU64(object.get("output_tokens"))) |value| usage.output = value;
+    if (json.unsigned(object.get("output_tokens"))) |value| usage.output = value;
 }
 
 /// A stream over `body` for the tests: test allocator, fresh decode state, and
@@ -387,7 +361,6 @@ test "next walks response.* SSE lines and maps usage on completion" {
     const text = (try stream.next()).?;
     try std.testing.expectEqualStrings("done", text.text);
     const stop = (try stream.next()).?;
-    try std.testing.expectEqualStrings("completed", stop.stop.reason.?);
     // input = input_tokens - cached; cache_read = cached; output as-is; no write.
     try std.testing.expectEqual(@as(u64, 10), stop.stop.usage.input);
     try std.testing.expectEqual(@as(u64, 90), stop.stop.usage.cache_read);
@@ -406,7 +379,6 @@ test "terminal events require a response object" {
     const decoded = try stream.decode(
         \\{"type":"response.incomplete","response":{}}
     );
-    try std.testing.expectEqual(@as(?[]const u8, null), decoded.event.stop.reason);
     try std.testing.expectEqual(@as(llm.Usage, .{}), decoded.event.stop.usage);
 }
 
@@ -421,7 +393,6 @@ test "decode maps response.incomplete to a stop carrying its usage" {
     const decoded = try stream.decode(
         \\{"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":50,"input_tokens_details":{"cached_tokens":10,"cache_write_tokens":5},"output_tokens":128000}}}
     );
-    try std.testing.expectEqualStrings("incomplete", decoded.event.stop.reason.?);
     try std.testing.expectEqual(@as(u64, 35), decoded.event.stop.usage.input);
     try std.testing.expectEqual(@as(u64, 10), decoded.event.stop.usage.cache_read);
     try std.testing.expectEqual(@as(u64, 5), decoded.event.stop.usage.cache_write);
