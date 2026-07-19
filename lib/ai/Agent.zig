@@ -93,7 +93,9 @@ const Call = struct {
     id: []const u8,
     name: []const u8,
     input_json: []const u8,
-    result: anyerror!tool.Result = undefined,
+    // A never-started task keeps this sentinel, so the errdefer's `catch
+    // continue` skips it instead of reading an uninitialized result.
+    result: anyerror!tool.Result = error.NotRun,
 };
 
 /// The production fetch: `provider.Client.send` on the active account. A seam
