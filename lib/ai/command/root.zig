@@ -1,8 +1,5 @@
-//! Slash commands: input lines the user starts with `/`, which the app handles
-//! itself instead of sending to the model. Each command is a module exposing a
-//! `name` and a `run` handler; the registry pairs them, mirroring the tool
-//! registry, so a command is added by writing its module and registering it
-//! below.
+//! Slash-command registry, mirroring the tool registry: each command module
+//! exposes `name`/`run`/`select` and is registered below.
 
 const std = @import("std");
 
@@ -20,7 +17,6 @@ const model = @import("model.zig");
 const Entry = struct {
     name: []const u8,
     run: *const fn (*Context) anyerror!Outcome,
-    /// Applies a picker choice by its row index.
     select: *const fn (*Context, usize) anyerror!Outcome,
 };
 
@@ -31,8 +27,7 @@ const registry = [_]Entry{
     .{ .name = logout.name, .run = logout.run, .select = logout.select },
 };
 
-/// Dispatch `line` (a full input line beginning with `/`) to its command,
-/// reporting an unknown command as an error (mirroring an unknown tool).
+/// Dispatch a `/`-prefixed input line to its command; an unknown command is an error.
 pub fn run(context: *Context, line: []const u8) !Outcome {
     const body = line[1..];
     // Editor input can carry interior newlines (Shift+Enter, paste).
@@ -42,16 +37,14 @@ pub fn run(context: *Context, line: []const u8) !Outcome {
     return entry.run(context);
 }
 
-/// Apply the choice at row `index` from the picker the command `name` opened. The
-/// command re-derives its option list and acts on the chosen row, so a picker
-/// selection never routes through a typed argument.
+/// Apply the picker choice at row `index`: the command `name` re-derives its
+/// option list, so a selection never routes through a typed argument.
 pub fn select(context: *Context, name: []const u8, index: usize) !Outcome {
     const entry = find(name) orelse
         return Outcome.report(context.gpa, .err, "unknown command: /{s}", .{name});
     return entry.select(context, index);
 }
 
-/// The registered command named `name`, or null when none matches.
 fn find(name: []const u8) ?*const Entry {
     for (&registry) |*entry| {
         if (std.mem.eql(u8, name, entry.name)) return entry;

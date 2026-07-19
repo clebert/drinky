@@ -72,9 +72,7 @@ const Entry = struct {
     model: Model,
 };
 
-// Anthropic names its effort levels like ours and can disable reasoning, so a
-// full-ladder model sends no reasoning config for none and each other level
-// under its own name.
+// Full Anthropic ladder: none sends no reasoning config, each level its own name.
 const anthropic_effort: Model.EffortMap = .{
     .none = null,
     .low = "low",
@@ -84,8 +82,7 @@ const anthropic_effort: Model.EffortMap = .{
     .max = "max",
 };
 
-// Sonnet 4.6 has no xhigh, so it folds an xhigh request onto high; otherwise the
-// standard ladder.
+// Sonnet 4.6 has no xhigh; it folds onto high.
 const anthropic_effort_no_xhigh: Model.EffortMap = .{
     .none = null,
     .low = "low",
@@ -95,10 +92,8 @@ const anthropic_effort_no_xhigh: Model.EffortMap = .{
     .max = "max",
 };
 
-// OpenAI's reasoning-effort domain is a superset of ours, so every level maps to
-// its own name. These are reasoning-only models with no way to disable
-// reasoning, so the none level floors on the API's minimal `none` rather than
-// omitting the reasoning config, which would default the model to medium.
+// Reasoning-only models: none floors on the API's minimal `none` — omitting the
+// reasoning config would default the model to medium.
 const openai_effort: Model.EffortMap = .{
     .none = "none",
     .low = "low",
@@ -218,7 +213,6 @@ test get {
 }
 
 test "EffortMap.resolve maps every level, none included, to the model's outcome" {
-    // A model that cannot disable reasoning maps none up to a floor level.
     const floored: Model.EffortMap = .{
         .none = "low",
         .low = "low",
@@ -229,7 +223,6 @@ test "EffortMap.resolve maps every level, none included, to the model's outcome"
     };
     try std.testing.expectEqualStrings("low", floored.resolve(.none).?);
 
-    // A model with no reasoning maps every level, none included, to null.
     const no_reasoning: Model.EffortMap = .{
         .none = null,
         .low = null,
@@ -240,8 +233,7 @@ test "EffortMap.resolve maps every level, none included, to the model's outcome"
     };
     try std.testing.expectEqual(@as(?[]const u8, null), no_reasoning.resolve(.max));
 
-    // Opus 4.8 and Sonnet 5 carry the full ladder and disable reasoning for
-    // none; Sonnet 4.6 folds its missing xhigh onto high.
+    // The shipped maps.
     try std.testing.expectEqual(@as(?[]const u8, null), get(.anthropic, "claude-opus-4-8").?.effort.resolve(.none));
     try std.testing.expectEqualStrings("xhigh", get(.anthropic, "claude-opus-4-8").?.effort.resolve(.xhigh).?);
     try std.testing.expectEqualStrings("xhigh", get(.anthropic, "claude-sonnet-5").?.effort.resolve(.xhigh).?);

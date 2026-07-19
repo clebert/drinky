@@ -452,7 +452,7 @@ fn signedIn(self: *const App) bool {
 
 /// The compiled fallback model for `account`'s vendor.
 fn compiledDefault(account: ai.llm.Account) ai.models.Model {
-    return switch (ai.llm.provider(account)) {
+    return switch (account.provider()) {
         .anthropic => anthropic_default,
         .openai => openai_default,
     };

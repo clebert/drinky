@@ -1,10 +1,7 @@
 //! The provider-keyed `auth.json` both credential stores share: a top-level
-//! object mapping each account key to that account's token entry. This module
-//! owns the file shape — opening it and reading one account's entry, and a
-//! load-merge-write that rewrites one entry while preserving every other
-//! account's verbatim so a refresh never clobbers a sibling account. Each
-//! provider owns its own entry fields (passed as `anytype`); nothing here knows
-//! a token shape.
+//! object mapping each account key to that account's token entry. Owns the file
+//! shape only — each provider owns its entry fields (passed as `anytype`);
+//! nothing here knows a token shape.
 
 const std = @import("std");
 
@@ -103,10 +100,10 @@ fn replaceFile(io: std.Io, path: []const u8, body: []const u8) !void {
 
 /// The whole `auth.json` with `key` set to `entry` — or dropped, for a null
 /// `entry` — re-emitting every other top-level key verbatim. An absent
-/// `existing` starts from a fresh object; an unparseable or non-object
-/// `existing` is `error.BadCredentials` rather than a fresh start, so neither a
-/// save nor a removal can wipe a sibling account by starting over on a file it
-/// could not read. Caller frees the result.
+/// `existing` starts from a fresh object, but an unparseable or non-object one
+/// is `error.BadCredentials` rather than a fresh start, so no rewrite can wipe
+/// a sibling account by starting over on a file it could not read. Caller frees
+/// the result.
 fn serialize(
     gpa: std.mem.Allocator,
     existing: ?[]const u8,
@@ -127,8 +124,7 @@ fn serialize(
         if (parsed.value != .object) return error.BadCredentials;
         var entries = parsed.value.object.iterator();
         while (entries.next()) |field| {
-            // Skip our own entry (rewritten fresh below, or dropped); re-emit
-            // every sibling.
+            // Skip our own entry (rewritten fresh below, or dropped).
             if (std.mem.eql(u8, field.key_ptr.*, key)) continue;
             try stringify.objectField(field.key_ptr.*);
             try stringify.write(field.value_ptr.*);
@@ -209,9 +205,6 @@ test "serialize errors on an unparseable or non-object existing file" {
     const gpa = std.testing.allocator;
     const entry: TestEntry = .{ .access = "at", .refresh = "rt", .expires_ms = 1 };
 
-    // A corrupt existing file must not be silently overwritten — that would drop
-    // every sibling account's entry on a refresh save. Both a syntactically
-    // invalid file and a valid non-object value are rejected.
     try std.testing.expectError(
         error.BadCredentials,
         serialize(gpa, "{ not valid json", "openai_subscription", entry),
@@ -317,7 +310,6 @@ test "save and remove refuse a corrupt file, leaving it intact on disk" {
 test "serialize errors on a corrupt file" {
     const gpa = std.testing.allocator;
 
-    // A corrupt file is rejected rather than overwritten with a wipe.
     try std.testing.expectError(
         error.BadCredentials,
         serialize(gpa, "{ not json", "openai_subscription", null),

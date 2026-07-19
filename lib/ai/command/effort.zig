@@ -1,6 +1,5 @@
-//! `/effort`: open a picker over the reasoning-effort levels, preselecting the
-//! current one; selecting one switches it from the next turn onward. There is no
-//! typed form — any argument is ignored and the picker opens regardless.
+//! `/effort`: picker over the reasoning-effort levels, preselecting the current
+//! one; selecting one switches it from the next turn. Any argument is ignored.
 
 const std = @import("std");
 

@@ -52,20 +52,20 @@ pub const Account = enum {
             .anthropic_subscription, .openai_subscription => null,
         };
     }
+
+    /// The vendor this account belongs to.
+    pub fn provider(self: Account) Provider {
+        return switch (self) {
+            .anthropic_api, .anthropic_subscription => .anthropic,
+            .openai_api, .openai_subscription => .openai,
+        };
+    }
 };
 
 /// The vendor axis: whose wire protocol and model table an account uses. Both
 /// accounts of a vendor share one serializer and one set of models, so the model
 /// table and the serializers key on this rather than on the full account.
 pub const Provider = enum { anthropic, openai };
-
-/// The vendor an account belongs to.
-pub fn provider(account: Account) Provider {
-    return switch (account) {
-        .anthropic_api, .anthropic_subscription => .anthropic,
-        .openai_api, .openai_subscription => .openai,
-    };
-}
 
 pub const Role = enum { user, assistant };
 
@@ -214,11 +214,11 @@ pub const Event = union(enum) {
     };
 };
 
-test provider {
-    try std.testing.expectEqual(Provider.anthropic, provider(.anthropic_api));
-    try std.testing.expectEqual(Provider.anthropic, provider(.anthropic_subscription));
-    try std.testing.expectEqual(Provider.openai, provider(.openai_api));
-    try std.testing.expectEqual(Provider.openai, provider(.openai_subscription));
+test "Account.provider maps each account to its vendor" {
+    try std.testing.expectEqual(Provider.anthropic, Account.anthropic_api.provider());
+    try std.testing.expectEqual(Provider.anthropic, Account.anthropic_subscription.provider());
+    try std.testing.expectEqual(Provider.openai, Account.openai_api.provider());
+    try std.testing.expectEqual(Provider.openai, Account.openai_subscription.provider());
 }
 
 test "account subscription flag and label" {

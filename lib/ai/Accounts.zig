@@ -148,7 +148,7 @@ pub fn listModels(
     gpa: std.mem.Allocator,
 ) !void {
     const start = out.items.len;
-    try models.list(llm.provider(account), out, gpa);
+    try models.list(account.provider(), out, gpa);
     for (out.items[start..]) |*model| model.* = self.resolveModel(account, model.*);
 }
 

@@ -9,11 +9,11 @@ const Result = @This();
 content: []const u8,
 is_error: bool,
 
-pub const Outcome = enum { ok, err };
+pub const Status = enum { ok, err };
 
 /// Build a result whose content is `format` rendered with `args`.
-pub fn report(gpa: std.mem.Allocator, outcome: Outcome, comptime format: []const u8, args: anytype) !Result {
-    return .{ .content = try std.fmt.allocPrint(gpa, format, args), .is_error = outcome == .err };
+pub fn report(gpa: std.mem.Allocator, status: Status, comptime format: []const u8, args: anytype) !Result {
+    return .{ .content = try std.fmt.allocPrint(gpa, format, args), .is_error = status == .err };
 }
 
 /// Report an I/O failure as `cannot <verb> <path>: <error>` — except

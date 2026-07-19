@@ -1,3 +1,6 @@
+//! The loopback OAuth redirect receiver: one bounded HTTP request line under a
+//! shared five-minute deadline, with stray connections ignored.
+
 const std = @import("std");
 
 const net = @import("net.zig");

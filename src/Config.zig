@@ -144,7 +144,7 @@ fn resolveModel(
     name: ?[]const u8,
 ) !?ai.models.Model {
     const model_name = name orelse return null;
-    if (ai.models.get(ai.llm.provider(account), model_name)) |model| return model;
+    if (ai.models.get(account.provider(), model_name)) |model| return model;
     const owned = try gpa.dupe(u8, model_name);
     errdefer gpa.free(owned);
     try dropped.append(gpa, .{ .account = account, .name = owned });

@@ -1,3 +1,6 @@
+//! Display-width measurement, canonicalization, and hard-wrapping of text as a
+//! mode-2027 terminal renders it: one UAX #29 grapheme cluster per cell step.
+
 const std = @import("std");
 
 const grapheme = @import("grapheme.zig");
@@ -42,11 +45,10 @@ pub fn writeFitted(writer: *std.Io.Writer, text: []const u8, columns_max: usize)
     return writeCanonical(writer, text, columns_max);
 }
 
-/// Streaming hard-wrap: `next` yields each line of at most `columns_max`
-/// display columns in turn (a slice into `text`), then null, so a caller can
-/// drop the rows above a window without ever materializing the whole list.
-/// Breaks strictly on width (no word awareness) and never inside a grapheme
-/// cluster. An explicit `\n` starts a new line and is not emitted.
+/// Streaming hard-wrap: `next` yields each line (a slice into `text`) of at most
+/// `columns_max` display columns, then null, so a caller can drop the rows above
+/// a window without materializing the list. Breaks strictly on width, never
+/// inside a grapheme cluster; an explicit `\n` starts a new line and is not emitted.
 pub const Wrapper = struct {
     text: []const u8,
     columns_max: usize,
@@ -80,18 +82,15 @@ pub const Wrapper = struct {
     }
 };
 
-/// Wrap `text` to at most `columns_max` display columns one line at a time —
-/// the form `rows` and `caret` are built on, so they stay in lockstep by
-/// construction.
+/// Wrap `text` to at most `columns_max` display columns — the form `rows` and
+/// `caret` are built on, so they stay in lockstep by construction.
 pub fn wrapper(text: []const u8, columns_max: usize) Wrapper {
     return .{ .text = text, .columns_max = columns_max, .line_start = 0, .done = false };
 }
 
-/// Number of physical terminal rows `text` occupies once hard-wrapped to
-/// `columns_max` display columns — the count of lines `wrapper` yields. Always
-/// at least one; an explicit `\n` starts a new row. A wide cluster that would
-/// straddle the margin breaks to the next row, so this is not `ceil(width /
-/// columns)`.
+/// Physical rows `text` occupies once hard-wrapped to `columns_max` — the count
+/// of lines `wrapper` yields, always at least one. A wide cluster that would
+/// straddle the margin breaks to the next row, so this is not `ceil(width / columns)`.
 pub fn rows(text: []const u8, columns_max: usize) usize {
     var iterator = wrapper(text, columns_max);
     var count: usize = 0;
@@ -101,15 +100,12 @@ pub fn rows(text: []const u8, columns_max: usize) usize {
 
 pub const Caret = struct { rows_before: usize, column: usize };
 
-/// Physical position of a caret sitting at the end of `text` once wrapped to
+/// Physical position of a caret at the end of `text` once wrapped to
 /// `columns_max`: how many row breaks precede it and its column within that row.
-/// `text` is the content up to the caret, so pass the prefix before it — a
-/// greedy width wrap never lets later content move an earlier break, so the
-/// suffix cannot change the answer. A wide cluster near the margin pushes the
-/// caret to the next row; a prefix that fills a row exactly wraps the caret onto
-/// the next row's first column, the cell the following glyph would take, since no
-/// cell exists at the margin; and a trailing `\n` (or an empty line between
-/// newlines) lands it at column 0 of a fresh row. `text` must end on a canonical
+/// Pass the prefix before the caret — a greedy width wrap never lets later
+/// content move an earlier break, so the suffix cannot change the answer. A
+/// prefix that fills a row exactly wraps the caret onto the next row's first
+/// column, since no cell exists at the margin. `text` must end on a canonical
 /// display boundary.
 pub fn caret(text: []const u8, columns_max: usize) Caret {
     var iterator = wrapper(text, columns_max);
@@ -402,8 +398,6 @@ test truncate {
 }
 
 test wrapper {
-    // Width break, explicit newline, a wide cluster that cannot straddle, an
-    // empty input yielding one empty line, and a trailing newline's empty tail.
     var basic = wrapper("abcdef", 3);
     try std.testing.expectEqualStrings("abc", basic.next().?);
     try std.testing.expectEqualStrings("def", basic.next().?);
@@ -466,24 +460,13 @@ test offsetAt {
 }
 
 test caret {
-    // Within the first row, the caret column equals the prefix's display width.
     try std.testing.expectEqual(Caret{ .rows_before = 0, .column = 0 }, caret("", 3));
     try std.testing.expectEqual(Caret{ .rows_before = 0, .column = 2 }, caret("he", 3));
-    // A prefix that fills the row exactly leaves no cell at the margin, so the
-    // caret wraps onto the next row's first column.
     try std.testing.expectEqual(Caret{ .rows_before = 1, .column = 0 }, caret("hel", 3));
-    // A wide cluster that fills the row exactly wraps the same way.
     try std.testing.expectEqual(Caret{ .rows_before = 1, .column = 0 }, caret("你你", 4));
-    // One glyph past the margin wraps: the second row, first column.
     try std.testing.expectEqual(Caret{ .rows_before = 1, .column = 1 }, caret("hell", 3));
-    // Wide glyphs push the wrap early: after two two-column glyphs the caret is
-    // on the second row at column two, not row one.
     try std.testing.expectEqual(Caret{ .rows_before = 1, .column = 2 }, caret("你好", 3));
-    // An explicit newline starts a fresh row, like wrapper.
     try std.testing.expectEqual(Caret{ .rows_before = 1, .column = 1 }, caret("ab\nc", 10));
-    // A trailing newline lands the caret at column 0 of the empty next row
-    // (also the blank line between two newlines), and consecutive newlines each
-    // add another such row.
     try std.testing.expectEqual(Caret{ .rows_before = 1, .column = 0 }, caret("a\n", 10));
     try std.testing.expectEqual(Caret{ .rows_before = 2, .column = 0 }, caret("a\n\n", 10));
 }

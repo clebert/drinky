@@ -1,9 +1,6 @@
-//! `/model`: open a picker over every account-qualified model the session is
-//! authenticated for — each of an authenticated account's models, labeled by its
-//! account — with the active one marked. Selecting one switches the active
-//! account and model together from the next turn onward. There is no typed form:
-//! a model is always chosen together with its account, so any argument is ignored
-//! and the picker opens regardless.
+//! `/model`: picker over every authenticated account's models, the active one
+//! marked; a model is always chosen together with its account. Any argument is
+//! ignored.
 
 const std = @import("std");
 
@@ -62,9 +59,8 @@ pub fn select(context: *Context, index: usize) !Outcome {
     return Outcome.report(gpa, .ok, "switched to {s} ({s})", .{ combo.model.name, combo.account.label() });
 }
 
-/// Every authenticated account's models, in account-enum then table order — the
-/// picker's rows, re-derived identically by `run` (to list) and `select` (to
-/// resolve an index).
+/// The picker's rows in account-enum then table order, re-derived identically by
+/// `run` and `select`.
 fn collect(accounts: *const Accounts, out: *std.ArrayList(Combo), gpa: std.mem.Allocator) !void {
     for (std.enums.values(llm.Account)) |account| {
         if (!accounts.isAuthenticated(account)) continue;
@@ -93,7 +89,6 @@ test "the picker lists every authenticated account's models, marking the active 
             try std.testing.expectEqual(@as(usize, 6), pick.options.len);
             try std.testing.expectEqualStrings("claude-opus-4-8 (anthropic api)", pick.options[0]);
             try std.testing.expectEqualStrings("gpt-5.6-sol (openai api)", pick.options[3]);
-            // The active account+model (anthropic api, sonnet 4.6) is preselected.
             try std.testing.expectEqualStrings("claude-sonnet-4-6 (anthropic api)", pick.options[pick.current.?]);
         },
         else => return error.ExpectedPick,
@@ -112,7 +107,6 @@ test "select switches to the chosen account and model" {
     try std.testing.expectEqualStrings("gpt-5.6-sol", agent.model.name);
     try std.testing.expectEqual(llm.Account.openai_api, agent.client.?.account());
 
-    // An out-of-range index is reported, leaving the model unchanged.
     try Outcome.expectFeedback(try select(&context, 99), .err);
     try std.testing.expectEqualStrings("gpt-5.6-sol", agent.model.name);
 }

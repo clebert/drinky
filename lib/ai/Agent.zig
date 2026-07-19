@@ -1,10 +1,7 @@
-//! Drives one user turn to completion: append the message, stream the model's
-//! reply, run the tools it calls (independent calls concurrently), feed the
-//! results back, and repeat until the model stops asking for tools. Owns the
-//! conversation history and talks to the model through a neutral
-//! `provider.Client`; presentation is delegated to a
-//! `handler` with
-//! `onText`/`onThinking`/`onToolStart`/`onToolResult`/`onUsage`/`onError`.
+//! Drives one user turn to completion: append the message, stream the reply,
+//! run the tools it calls, feed the results back, and repeat until the model
+//! stops asking for tools. Owns the conversation history; talks to the model
+//! through a neutral `provider.Client` and delegates presentation to a handler.
 
 const std = @import("std");
 
@@ -19,20 +16,17 @@ const Agent = @This();
 
 const rounds_max = 50;
 
-/// Placeholder surfaced for a redacted reasoning block, whose real content is
-/// encrypted and cannot be shown.
+/// Placeholder shown for a redacted reasoning block (its content is encrypted).
 const redacted_notice = "[redacted thinking]";
 
-/// Distinct models one session breaks its cost down by. Comfortably exceeds the
-/// compiled model table; a rarer overflow drops only the per-model detail, never
-/// the cumulative totals.
+/// Distinct models one session breaks its cost down by; an overflow drops only
+/// the per-model detail, never the cumulative totals.
 const by_model_max = 16;
 
 gpa: std.mem.Allocator,
 io: std.Io,
-/// The active account's transport, or null while signed out (no account has a
-/// usable credential). `run` requires a client; the app refuses to start a turn
-/// while signed out, so the internal uses assume one.
+/// The active account's transport, or null while signed out. The app refuses to
+/// start a turn while signed out, so the internal uses assume one.
 client: ?provider.Client,
 model: models.Model,
 system: []const u8,
@@ -43,16 +37,14 @@ stats: Stats,
 /// Steering messages the user submitted mid-turn, drained into the running turn
 /// at each round boundary. Thread-safe: the UI thread pushes, the worker takes.
 steering: Steering,
-/// A stable per-session key sent to providers that route prompt-cache lookups by
-/// it (OpenAI); generated once at init so every turn in the session shares it.
+/// Stable per-session prompt-cache routing key (used by OpenAI); generated once
+/// at init so every turn shares it.
 cache_key: [32]u8,
 
-/// Cumulative dollar cost and cache savings over the session, plus the most
-/// recent message's usage for the cache-hit and context-window gauges. Each
-/// message is priced against the model that produced it, so the running totals —
-/// and the per-model breakdown — stay correct across a mid-session `/model`
-/// switch. A plain value type: the fixed `by_model` array copies cleanly across
-/// the UI channel with the rest of the struct.
+/// Cumulative session cost and cache savings, plus the last message's usage for
+/// the gauges. Each message is priced against the model that produced it, so the
+/// totals stay correct across a mid-session `/model` switch. A plain value type:
+/// it copies whole across the UI channel.
 pub const Stats = struct {
     cost: f64 = 0,
     saved: f64 = 0,
@@ -60,8 +52,8 @@ pub const Stats = struct {
     by_model: [by_model_max]ByModel = [_]ByModel{.{}} ** by_model_max,
     model_count: usize = 0,
 
-    /// Cost, cache savings, and accumulated tokens billed to one model this
-    /// session. `name` points into the compiled model table (static lifetime).
+    /// One model's session totals; `name` points into the compiled model table
+    /// (static lifetime).
     pub const ByModel = struct {
         name: []const u8 = "",
         cost: f64 = 0,
@@ -69,9 +61,7 @@ pub const Stats = struct {
         usage: llm.Usage = .{},
     };
 
-    /// Attribute one message's cost, savings, and usage to `name`, opening a
-    /// bucket the first time a model appears. Past `by_model_max` distinct models
-    /// the per-model detail is dropped; the cumulative totals stay complete.
+    /// Attribute one message to `name`, opening a bucket on first appearance.
     fn attribute(self: *Stats, name: []const u8, cost: f64, saved: f64, usage: llm.Usage) void {
         const entry = self.entryFor(name) orelse return;
         entry.cost += cost;
@@ -91,9 +81,8 @@ pub const Stats = struct {
     }
 };
 
-/// One scheduled tool call: the reply it answers and the slot its task fills.
-/// The concurrent runner reads `name`/`input_json` and writes `result`; the
-/// collector reads the rest once the task has finished.
+/// One scheduled tool call: the concurrent runner writes `result`; the collector
+/// reads it once the task has finished.
 const Call = struct {
     id: []const u8,
     name: []const u8,
@@ -130,19 +119,17 @@ pub fn deinit(self: *Agent) void {
     self.steering.deinit();
 }
 
-/// Switch the active account and model together; takes effect on the next turn.
-/// The client carries both the provider transport and the account whose reasoning
-/// blobs replay, so an account change and a model change are one atomic step — a
-/// model can never be paired with a foreign vendor's client. History is untouched:
-/// the new account reads the same conversation, dropping any reasoning it did not
-/// itself produce.
+/// Switch account and model together, effective next turn. The client carries
+/// both the transport and the reasoning-replay account, so the pair is one
+/// atomic step — a model is never paired with a foreign vendor's client.
+/// History is untouched; the new account drops reasoning it did not produce.
 pub fn switchTo(self: *Agent, client: provider.Client, model: models.Model) void {
     self.client = client;
     self.model = model;
 }
 
-/// Drop the active account, leaving the agent signed out. `model` is kept as the
-/// last-shown value; a later `switchTo` restores a client before the next turn.
+/// Drop the active account, leaving the agent signed out; `model` is kept as
+/// the last-shown value.
 pub fn signOut(self: *Agent) void {
     self.client = null;
 }
@@ -159,9 +146,8 @@ pub fn run(self: *Agent, user_text: []const u8, handler: anytype) !void {
     return self.runWith(&fetch, user_text, handler);
 }
 
-/// The production fetch: `provider.Client.send` on the active account. `runWith`
-/// takes a fetch pointer like `runToolsWith` takes `Dispatch`, so tests can
-/// script whole turns through this same loop.
+/// The production fetch: `provider.Client.send` on the active account. A seam
+/// like `runToolsWith`'s `Dispatch`, so tests can script whole turns.
 const ClientFetch = struct {
     client: *provider.Client,
 
@@ -180,18 +166,16 @@ fn runWith(self: *Agent, fetch: anytype, user_text: []const u8, handler: anytype
     while (round < rounds_max) : (round += 1) {
         const reply = (try self.fetchReply(fetch, handler, base)) orelse return;
         const ran_tools = try self.runTools(reply, handler);
-        // Fold any mid-turn steering into this turn before the next round; when
-        // the model asked for no tools, a steering message keeps the turn going
-        // rather than ending it, so the message still lands mid-turn.
+        // Fold mid-turn steering in before the next round; with no tools asked,
+        // a steering message keeps the turn going rather than ending it.
         const steered = try self.drainSteering(handler);
         if (!ran_tools and !steered) return;
     }
     return error.TooManyToolRounds;
 }
 
-/// Deliver every queued steering message into the running turn: combine them
-/// into one user message (blank-line separated), append it to history, and
-/// report it. Returns whether anything was delivered.
+/// Deliver every queued steering message as one combined user message, appended
+/// to history and reported. Returns whether anything was delivered.
 fn drainSteering(self: *Agent, handler: anytype) !bool {
     const pending = try self.steering.take();
     defer {
@@ -199,8 +183,8 @@ fn drainSteering(self: *Agent, handler: anytype) !bool {
         self.gpa.free(pending);
     }
     if (pending.len == 0) return false;
-    // A failure mid-delivery (a cancel included) rolls the turn back, so return
-    // the taken batch to the queue for the cancel path to hand back to the editor.
+    // A failure mid-delivery (a cancel included) returns the taken batch to the
+    // queue, for the cancel path to hand back to the editor.
     errdefer for (pending) |message| self.steering.push(message) catch break;
     const combined = try Steering.join(self.gpa, pending);
     defer self.gpa.free(combined);
@@ -209,13 +193,11 @@ fn drainSteering(self: *Agent, handler: anytype) !bool {
     return true;
 }
 
-/// Stream one assistant reply, retrying the whole request on a transient failure
-/// (timeout, premature stream end, network fault, or retryable status). Only whole
+/// Stream one assistant reply, retrying on transient failures. Only whole
 /// requests are safe to retry, so a failed attempt's partial reply is discarded
-/// here (history is
-/// left untouched) and `handler.onStreamReset` clears any partial output before
-/// the next attempt. Returns the reply's items (already appended to history), or
-/// null when a non-retryable error was reported and the turn ends.
+/// (history untouched) and `handler.onStreamReset` clears partial output first.
+/// Returns the reply's items (already appended to history), or null when a
+/// non-retryable error was reported and the turn ends.
 fn fetchReply(self: *Agent, fetch: anytype, handler: anytype, base: usize) !?[]const llm.Item {
     const model = self.model;
     const request: llm.Request = .{
@@ -266,17 +248,16 @@ fn fetchReply(self: *Agent, fetch: anytype, handler: anytype, base: usize) !?[]c
     }
 }
 
-/// Wait before the retry following a failed `attempt`: the server's `retry-after`
-/// when it gave one (capped at the local maximum backoff), else an exponential
-/// backoff. A cancel during the wait aborts the turn.
+/// Wait before the retry after a failed `attempt`: the server's `retry-after`
+/// (capped) or exponential backoff. A cancel during the wait aborts the turn.
 fn backoff(self: *Agent, attempt: u32, suggested_ms: u64) !void {
     const delay_ms = self.retry.backoffMs(attempt, suggested_ms);
     const bounded: u64 = @min(delay_ms, std.math.maxInt(i64));
     try self.io.sleep(.fromMilliseconds(@intCast(bounded)), .awake);
 }
 
-/// Whether a transport error is worth retrying: a timeout, premature stream end,
-/// or transient network fault. A user cancel or channel close is never retried.
+/// Transient transport faults worth retrying; a user cancel or channel close
+/// never is.
 fn retryableError(err: anyerror) bool {
     return switch (err) {
         error.Timeout,
@@ -296,23 +277,20 @@ fn retryableError(err: anyerror) bool {
     };
 }
 
-/// Surface a failed turn to the handler and free its items so the history is
-/// restored to the turn's start for the next turn.
+/// Surface a failed turn to the handler, restoring history to the turn's start.
 fn reportAndReset(self: *Agent, handler: anytype, text: []const u8, base: usize) !void {
     self.rollback(base);
     try handler.onError(text);
 }
 
-/// Free and drop every history item from `base` on, restoring the list to that
-/// length. Retained capacity is kept so a rolled-back turn does not thrash the
-/// list backing.
+/// Free and drop every history item from `base` on; capacity is retained so a
+/// rolled-back turn does not thrash the list backing.
 fn rollback(self: *Agent, base: usize) void {
     for (self.items.items[base..]) |item| freeItem(self.gpa, item);
     self.items.shrinkRetainingCapacity(base);
 }
 
-/// Free the owned strings of one history item. An empty string (a redacted
-/// reasoning's visible text) frees as a no-op.
+/// Free one history item's owned strings; an empty string frees as a no-op.
 fn freeItem(gpa: std.mem.Allocator, item: llm.Item) void {
     switch (item) {
         .message => |message| gpa.free(message.text),
@@ -339,9 +317,8 @@ fn appendUser(self: *Agent, text: []const u8) !void {
     try self.items.append(self.gpa, .{ .message = .{ .role = .user, .text = owned } });
 }
 
-/// Fold one assistant message's usage into the session totals, priced with
-/// `model` — the model that produced the message, threaded from the request so
-/// billing can't drift when a later `/model` switch changes `self.model`.
+/// Fold one message's usage into the totals, priced with `model` — threaded from
+/// the request so billing can't drift when `/model` changes `self.model`.
 fn recordUsage(self: *Agent, model: *const models.Model, usage: llm.Usage) void {
     const cost = model.cost(&usage);
     const saved = model.savings(&usage);
@@ -352,13 +329,11 @@ fn recordUsage(self: *Agent, model: *const models.Model, usage: llm.Usage) void 
 }
 
 /// Read one streamed assistant message to completion, recording usage and
-/// appending its items to history; returns that run of items. The reply is built
-/// in a local list and committed to history only once complete, so a stream or
-/// API error frees the partial work and leaves history (and the in-flight
-/// request's view of it) untouched, and the whole request can be retried without
-/// a duplicated or partial message. The returned slice views the committed tail
-/// of `self.items`; it stays valid until the next append to that list, which
-/// `runTools` performs only after reading the reply.
+/// appending its items to history. The reply is built locally and committed only
+/// once complete, so a stream or API error leaves history untouched and the
+/// whole request can be retried without a duplicated or partial message. The
+/// returned slice views the committed tail of `self.items`; it stays valid until
+/// the next append (which `runTools` performs only after reading the reply).
 fn readReply(
     self: *Agent,
     model: *const models.Model,
@@ -366,8 +341,8 @@ fn readReply(
     handler: anytype,
 ) ![]const llm.Item {
     const gpa = self.gpa;
-    // Tag reasoning with the account that produced it, so a serializer replays
-    // its blobs only for the exact same account and drops any other whole.
+    // Tag reasoning with the producing account, so a serializer replays blobs
+    // only for that exact account.
     const origin = self.client.?.account();
     // The defer frees the buffer backings; the errdefer frees the finished items
     // only on failure, since a successful commit hands them to `self.items`.
@@ -378,8 +353,8 @@ fn readReply(
 
     while (try stream.next()) |event| switch (event) {
         .thinking => |chunk| {
-            // A run whose blob already arrived is finished, as is one whose
-            // item id differs: commit it so adjacent runs stay separate items.
+            // A run with its blob, or a differing item id, is finished: commit
+            // it so adjacent runs stay separate items.
             if (state.blob.items.len != 0 or newRunId(state.reasoning_id.items, chunk.id))
                 try state.flushThinking(gpa, origin);
             if (!state.in_thinking) try state.flushBeforeRun(gpa);
@@ -388,8 +363,7 @@ fn readReply(
             try state.thinking.appendSlice(gpa, chunk.text);
             try handler.onThinking(chunk.text);
         },
-        // The blob closes the reasoning run; mark it open so a run that carried
-        // only a blob (omitted reasoning) still round-trips.
+        // The blob closes the run; mark it open so a blob-only run round-trips.
         .thinking_blob => |chunk| {
             if (newRunId(state.reasoning_id.items, chunk.id))
                 try state.flushThinking(gpa, origin);
@@ -401,7 +375,6 @@ fn readReply(
         .thinking_redacted => |chunk| {
             try state.flushThinking(gpa, origin);
             try state.appendRedacted(gpa, chunk, origin);
-            // The payload is encrypted, so stand a placeholder in for the display.
             try handler.onThinking(redacted_notice);
         },
         .text => |delta| {
@@ -432,8 +405,8 @@ fn readReply(
     return self.items.items[start..];
 }
 
-/// The concurrent read-only task body, one monomorphization per `Dispatch` type
-/// so the real turn loop keeps a direct call rather than an indirect one.
+/// The concurrent read-only task body, monomorphized per `Dispatch` so the real
+/// turn loop keeps a direct call.
 fn Runner(comptime Dispatch: type) type {
     return struct {
         fn run(call: *Call, context: *const tool.Context) void {
@@ -447,19 +420,15 @@ fn runTools(self: *Agent, reply: []const llm.Item, handler: anytype) !bool {
     return self.runToolsWith(tool, reply, handler);
 }
 
-/// Run every tool the assistant asked for, then queue the results in call order so
-/// each `tool_result` maps back to its `tool_call` by `call_id`. `Dispatch` names
-/// the tool source (`mutates` and `run`); the turn loop passes the real registry,
-/// and tests inject controllable tools into this same scheduling path.
+/// Run every tool the assistant asked for, queuing results in call order so each
+/// `tool_result` maps back to its `tool_call`. `Dispatch` names the tool source
+/// (`mutates` and `run`); tests inject controllable tools into this same path.
 ///
-/// Each contiguous run of read-only calls runs concurrently through the group. A
-/// mutating call is a barrier: it awaits every earlier read, runs alone, and
-/// completes before any later call starts, so no mutation overlaps a read or
-/// another mutation and call order gives a coherent filesystem view. Returns
-/// false when the reply asked for no tools. A failing mutation (a mid-turn cancel
-/// included) aborts the turn at once, before any later call runs; a cancel
-/// observed while awaiting read-only calls aborts the same way. On every early
-/// exit the errdefer reaps the group's in-flight tasks first.
+/// Contiguous read-only calls run concurrently; a mutating call is a barrier —
+/// it awaits every earlier read and runs alone, so no mutation overlaps a read
+/// or another mutation and call order gives a coherent filesystem view. Any
+/// failure (a mid-turn cancel included) aborts before any later call runs; the
+/// errdefer reaps in-flight tasks first. Returns false when no tools were asked.
 fn runToolsWith(
     self: *Agent,
     comptime Dispatch: type,
@@ -496,8 +465,8 @@ fn runToolsWith(
     for (calls) |*call| {
         try handler.onToolStart(call.name, call.input_json);
         if (Dispatch.mutates(call.name)) {
-            // Drain earlier reads so the mutation can't race a concurrent read,
-            // then reuse the emptied group for the reads that follow.
+            // Drain earlier reads so the mutation can't race one; the emptied
+            // group is reused for the reads that follow.
             try group.await(self.io);
             group = .init;
             call.result = try Dispatch.run(&context, call.name, call.input_json);
@@ -531,8 +500,7 @@ fn runToolsWith(
     return true;
 }
 
-/// Replace `buffer`'s contents with `bytes`, retaining its capacity. Used for the
-/// open reasoning run's item id and the pending tool call's id and name.
+/// Replace `buffer`'s contents with `bytes`, retaining its capacity.
 fn setBuffer(gpa: std.mem.Allocator, buffer: *std.ArrayList(u8), bytes: []const u8) !void {
     buffer.clearRetainingCapacity();
     try buffer.appendSlice(gpa, bytes);
@@ -545,9 +513,9 @@ fn newRunId(current: []const u8, incoming: []const u8) bool {
 }
 
 /// One streamed reply under assembly: the committed items plus the open answer,
-/// reasoning-run, and tool-call buffers. Flush methods commit a buffer as one
-/// item, duping each string before the append and freeing every dupe if a later
-/// step fails, so a failure leaves no orphaned allocation.
+/// reasoning-run, and tool-call buffers. Flush methods dupe each string before
+/// the append and free every dupe if a later step fails, so a failure leaves no
+/// orphaned allocation.
 const Pending = struct {
     items: std.ArrayList(llm.Item) = .empty,
     text: std.ArrayList(u8) = .empty,
@@ -567,17 +535,16 @@ const Pending = struct {
         }
     }
 
-    /// Commit the pending tool call and buffered answer text ahead of a fresh
-    /// reasoning run, so the committed items keep the stream order.
+    /// Commit the pending tool call and answer text ahead of a fresh reasoning
+    /// run, keeping stream order.
     fn flushBeforeRun(self: *Pending, gpa: std.mem.Allocator) !void {
         if (self.in_tool) try self.flushTool(gpa);
         try self.flushText(gpa);
     }
 
     /// Commit everything buffered in stream order — the pending tool first, then
-    /// the reasoning/answer that streamed after it — so the stored run keeps the
-    /// order the model produced (reasoning at the head, which the provider
-    /// requires; tool and text calls interleaved as sent).
+    /// the reasoning/answer that streamed after it — keeping the order the model
+    /// produced, reasoning at the head as the provider requires.
     fn flushAll(self: *Pending, gpa: std.mem.Allocator, origin: llm.Account) !void {
         if (self.in_tool) try self.flushTool(gpa);
         try self.flushThinking(gpa, origin);
@@ -592,9 +559,8 @@ const Pending = struct {
         self.text.clearRetainingCapacity();
     }
 
-    /// Commit the open reasoning run as one reasoning item (text plus its
-    /// verbatim blob and item id), preserving the head-of-message order the
-    /// provider validates. A no-op when no run is open.
+    /// Commit the open reasoning run as one item (text plus its verbatim blob
+    /// and item id); a no-op when no run is open.
     fn flushThinking(self: *Pending, gpa: std.mem.Allocator, origin: llm.Account) !void {
         if (!self.in_thinking) return;
         const text_copy = try gpa.dupe(u8, self.thinking.items);
@@ -615,8 +581,8 @@ const Pending = struct {
         self.in_thinking = false;
     }
 
-    /// Commit one complete redacted reasoning block: its encrypted blob and item
-    /// id with empty visible text.
+    /// Commit one redacted reasoning block: its encrypted blob and item id,
+    /// with empty visible text.
     fn appendRedacted(self: *Pending, gpa: std.mem.Allocator, chunk: llm.Event.Blob, origin: llm.Account) !void {
         const blob_copy = try gpa.dupe(u8, chunk.blob);
         errdefer gpa.free(blob_copy);
@@ -672,14 +638,14 @@ test "usage is attributed to the model that produced it across a switch" {
 
     const one_million: llm.Usage = .{ .input = 1_000_000 };
 
-    // `self.model` is opus, but this message was produced by sonnet. Pricing must
-    // follow the passed model ($3, sonnet), not `self.model` ($5, opus).
+    // Produced by sonnet while `self.model` is opus: pricing must follow the
+    // passed model ($3, sonnet), not `self.model` ($5, opus).
     agent.switchTo(client, opus);
     agent.recordUsage(&sonnet, one_million);
     try std.testing.expectApproxEqAbs(@as(f64, 3), agent.stats.cost, 1e-9);
     try std.testing.expectApproxEqAbs(@as(f64, 3), agent.stats.by_model[0].cost, 1e-9);
 
-    // An opus turn. Cumulative now blends both rates: sonnet $3 + opus $5.
+    // An opus turn blends both rates: sonnet $3 + opus $5.
     agent.recordUsage(&opus, one_million);
     try std.testing.expectApproxEqAbs(@as(f64, 8), agent.stats.cost, 1e-9);
     try std.testing.expectEqual(@as(usize, 2), agent.stats.model_count);
@@ -698,8 +664,8 @@ test "cumulative totals stay exact past the per-model bound" {
     var agent = scriptedAgent(std.testing.allocator);
     defer agent.deinit();
 
-    // 17 distinct models at $5 per message: the 17th opens no bucket, yet the
-    // session totals and the last-usage gauge still include it.
+    // The 17th model opens no bucket, yet the totals and last-usage gauge
+    // still include it.
     const opus = models.get(.anthropic, "claude-opus-4-8").?;
     inline for (0..by_model_max + 1) |index| {
         var model = opus;
@@ -826,7 +792,6 @@ test "steering is delivered as one combined user message" {
     try std.testing.expectEqualStrings("a\n\nb", handler.text.items);
     try std.testing.expectEqual(@as(usize, 2), handler.count);
 
-    // An empty queue delivers nothing.
     try std.testing.expect(!try agent.drainSteering(&handler));
 }
 
@@ -837,9 +802,8 @@ test "steering appends a separate user item, leaving grouping to the serializer"
     var handler: SteerHandler = .{ .gpa = gpa };
     defer handler.deinit();
 
-    // A trailing user item, as a round's tool results would leave it. The Agent
-    // appends a separate user item; the Anthropic serializer merges the run into
-    // one message envelope.
+    // A trailing user item, as a round's tool results leave it: the Agent
+    // appends a separate item; the Anthropic serializer merges the run.
     try agent.appendUser("tool results");
     try agent.steering.push("steer");
     try std.testing.expect(try agent.drainSteering(&handler));
@@ -856,8 +820,8 @@ test "a cancel during steering delivery returns the taken batch to the queue" {
     var agent = scriptedAgent(gpa);
     defer agent.deinit();
 
-    // A handler cancelled while reporting the drained batch, as a mid-turn Esc
-    // racing the round-boundary drain leaves it.
+    // A handler cancelled while reporting the batch: a mid-turn Esc racing the
+    // round-boundary drain.
     const CancelHandler = struct {
         fn onSteering(self: *@This(), text: []const u8, count: usize) !void {
             _ = self;
@@ -1034,9 +998,8 @@ test "a failed reply attempt reclaims its transient allocations" {
     var handler: CaptureHandler = .{ .gpa = gpa };
     defer handler.deinit();
 
-    // A large text chunk then a tool call forces the reply builder to commit an
-    // assistant message and the tool identity before the stream ends without a
-    // stop event, so each attempt allocates item memory and then fails.
+    // A large text chunk then a tool call, ending without a stop event: each
+    // attempt allocates item memory and then fails.
     const big = "x" ** 4096;
     const events = [_]llm.Event{
         .{ .text = big },
@@ -1059,9 +1022,8 @@ test "a failed reply attempt reclaims its transient allocations" {
         try std.testing.expectEqual(@as(usize, 0), agent.items.items.len);
     }
 
-    // History returned to empty every time, so retained bytes must not scale with
-    // attempts. A session-lifetime arena keeps each attempt's items, adding at
-    // least `big` per attempt; bounded ownership frees them on rollback.
+    // Retained bytes must not scale with attempts — a session-lifetime arena
+    // would keep each attempt's items, adding at least `big` per attempt.
     const grew = (failing.allocated_bytes - failing.freed_bytes) - settled;
     try std.testing.expect(grew < big.len);
 }
@@ -1076,8 +1038,7 @@ test "rollback frees every item appended since the base" {
     try agent.appendUser("keep me");
     const base = agent.items.items.len;
 
-    // Commit a full multi-string reply past the base: a reasoning run, an answer,
-    // and a tool call, each holding several owned strings.
+    // A multi-string reply past the base: reasoning run, answer, and tool call.
     const events = [_]llm.Event{
         .{ .thinking = .{ .id = "rs_1", .text = "weigh it" } },
         .{ .thinking_blob = .{ .id = "rs_1", .blob = "sig" } },
@@ -1091,8 +1052,8 @@ test "rollback frees every item appended since the base" {
     try std.testing.expectEqual(@as(usize, 3), reply.len);
     try std.testing.expect(agent.items.items.len > base);
 
-    // Rolling back to the base frees every appended item exactly once (the
-    // leak-checking allocator proves it) and leaves the user message intact.
+    // Each appended item is freed exactly once (the leak-checking allocator
+    // proves it); the user message stays.
     agent.rollback(base);
     try std.testing.expectEqual(base, agent.items.items.len);
     try std.testing.expectEqualStrings("keep me", agent.items.items[base - 1].message.text);
@@ -1104,8 +1065,7 @@ fn readReplyUnderOom(allocator: std.mem.Allocator) !void {
     var handler: CaptureHandler = .{ .gpa = allocator };
     defer handler.deinit();
 
-    // Exercise every multi-string item builder in one reply: a reasoning run, a
-    // redacted block, an answer, a tool call, and trailing text.
+    // One reply exercising every multi-string item builder.
     const events = [_]llm.Event{
         .{ .thinking = .{ .id = "rs_1", .text = "weigh it" } },
         .{ .thinking_blob = .{ .id = "rs_1", .blob = "sig" } },
@@ -1349,9 +1309,8 @@ test "readReply keeps adjacent reasoning runs as separate items in stream order"
     var handler: CaptureHandler = .{ .gpa = gpa };
     defer handler.deinit();
 
-    // Two back-to-back runs, then answer text, then a third run: each run keeps
-    // its own blob and id, and the text stays between the runs it streamed
-    // between rather than sinking below them.
+    // Each run keeps its own blob and id, and the text stays between the runs
+    // it streamed between rather than sinking below them.
     const events = [_]llm.Event{
         .{ .thinking = .{ .id = "rs_a", .text = "A" } },
         .{ .thinking_blob = .{ .id = "rs_a", .blob = "encA" } },
@@ -1383,9 +1342,8 @@ test "readReply keeps adjacent reasoning runs as separate items in stream order"
 
 test "readReply tags reasoning with the active provider as origin, threading its id" {
     const gpa = std.testing.allocator;
-    // An openai-backed agent must stamp its reasoning items with its own account,
-    // not an Anthropic one, or the openai serializer would drop them as foreign;
-    // the server-assigned reasoning id must ride along for replay.
+    // An openai-backed agent must stamp reasoning with its own account or the
+    // serializer drops it as foreign; the reasoning id rides along for replay.
     var agent = openaiScriptedAgent(gpa);
     defer agent.deinit();
     var handler: CaptureHandler = .{ .gpa = gpa };
@@ -1407,12 +1365,10 @@ test "readReply tags reasoning with the active provider as origin, threading its
     try std.testing.expectEqualStrings("done", reply[1].message.text);
 }
 
-// A scheduling seam that wraps a real threaded executor to observe tool ordering.
-// It counts read-only tasks launched into the group but not yet awaited
-// (`outstanding`), records their peak, and flags whether a mutation ran while any
-// read was still outstanding. `groupConcurrent`, the inline mutation (through
-// `probe.run`), and `groupAwait` all execute on the thread driving
-// `runToolsWith`, so these counters carry no data race.
+// A scheduling seam wrapping a real threaded executor: counts read-only tasks
+// launched but not yet awaited, records their peak, and flags a mutation running
+// while a read was outstanding. Every hook executes on the thread driving
+// `runToolsWith`, so the counters carry no data race.
 const ScheduleLog = struct {
     backend: std.Io,
     vtable: std.Io.VTable,
@@ -1479,9 +1435,8 @@ const ScheduleLog = struct {
     }
 };
 
-// A controllable tool source for `runToolsWith`: "write" mutates, everything else
-// is read-only. A mutation notes any scheduling overlap through the wrapped io;
-// every call returns a trivial owned result.
+// A controllable tool source for `runToolsWith`: "write" mutates, everything
+// else is read-only; a mutation notes any scheduling overlap.
 const probe = struct {
     fn mutates(name: []const u8) bool {
         return std.mem.eql(u8, name, "write");
@@ -1509,9 +1464,8 @@ test "a mutating call is a barrier between the reads around it" {
     var handler: CaptureHandler = .{ .gpa = gpa };
     defer handler.deinit();
 
-    // Two reads, then a mutation, then a read: the leading reads run concurrently,
-    // the mutation must drain them before it runs, and the trailing read starts
-    // only after the mutation completes.
+    // Two reads, a mutation, a read: the leading reads run concurrently, the
+    // mutation drains them first, the trailing read starts only after it.
     const reply = [_]llm.Item{
         .{ .tool_call = .{ .call_id = "r1", .name = "read", .arguments_json = "{}" } },
         .{ .tool_call = .{ .call_id = "r2", .name = "read", .arguments_json = "{}" } },
@@ -1553,11 +1507,9 @@ test "a cancel at the barrier reaps launched reads and starts nothing after it" 
         .{ .tool_call = .{ .call_id = "w1", .name = "write", .arguments_json = "{}" } },
         .{ .tool_call = .{ .call_id = "r3", .name = "read", .arguments_json = "{}" } },
     };
-    // Inject cancellation at the barrier await (without draining) to force the
-    // errdefer's live-task reap path -- the path a real mid-batch early exit takes
-    // while a read is still in flight: the launched read is reaped and its result
-    // freed exactly once (the leak-checking allocator proves it), the mutation
-    // never runs, and the trailing read never starts.
+    // Cancel at the barrier await without draining, forcing the errdefer's
+    // live-task reap: the launched read's result is freed exactly once, the
+    // mutation never runs, and the trailing read never starts.
     try std.testing.expectError(
         error.Canceled,
         agent.runToolsWith(probe, &reply, &handler),
@@ -1580,9 +1532,8 @@ fn runToolsUnderOom(allocator: std.mem.Allocator) !void {
     var handler: CaptureHandler = .{ .gpa = allocator };
     defer handler.deinit();
 
-    // All-mutation calls run inline (no concurrent task spawn), so this sweeps the
-    // tool-result builder and its history commit deterministically under every
-    // injected allocation failure.
+    // All-mutation calls run inline (no task spawn), so the sweep of the
+    // tool-result builder is deterministic under every injected failure.
     const reply = [_]llm.Item{
         .{ .tool_call = .{ .call_id = "w1", .name = "write", .arguments_json = "{}" } },
         .{ .tool_call = .{ .call_id = "w2", .name = "write", .arguments_json = "{}" } },

@@ -1,28 +1,23 @@
 //! The provider-shared SSE pull-stream engine: the Deadline+Budget-bounded
-//! line reader, the `data:`-prefix frame filter whose filler draws the idle
-//! window down, retryable-status classification, the `retry-after` parse, and
-//! the connect tail every provider request shares. `Engine` generates the
-//! methods over a provider's own stream struct — its frame vocabulary
-//! (`decode`), request building, and identity stay provider-side, and
-//! `provider.zig` unions the stream types.
+//! line reader (recognized frames restart the idle window, filler draws it
+//! down), retry classification, and the connect tail. `Engine` generates the
+//! methods over a provider's own stream struct; the frame vocabulary
+//! (`decode`), request building, and identity stay provider-side.
 
 const std = @import("std");
 
 const llm = @import("llm.zig");
 const net = @import("net.zig");
 
-/// The outcome of decoding one SSE `data:` line. Only a recognized frame is
-/// progress against the idle window, so a stream of only filler still trips
-/// the timeout.
+/// The outcome of decoding one SSE `data:` line. Only a recognized frame
+/// (`event`/`progress`) restarts the idle window; filler (`ignored`) draws it
+/// down, so a stream of only filler still trips the timeout.
 pub const Decoded = union(enum) {
     /// An event to hand back to the caller.
     event: llm.Event,
-    /// A recognized frame with no event for the caller (usage, block
-    /// boundaries) — real progress against the idle window.
+    /// A recognized frame with no event for the caller (usage, block boundaries).
     progress,
-    /// Filler (a keepalive ping, or a frame the protocol does not define):
-    /// ignored, and never counted as progress, so filler cannot hold the idle
-    /// window open.
+    /// Filler: a keepalive ping, or a frame the protocol does not define.
     ignored,
     /// A sentinel that ends the byte stream (OpenAI's `[DONE]`).
     done,
@@ -132,33 +127,28 @@ pub fn Engine(comptime S: type) type {
             stream.established = true;
         }
 
-        /// Next decoded event, or null at end of stream.
+        /// Next decoded event, or null at end of stream. One shared `Deadline`
+        /// spans the read of each event, so filler draws the window down while
+        /// every recognized frame restarts it — only a genuine stall surfaces
+        /// `error.Timeout`.
         pub fn next(stream: *S) !?llm.Event {
             // Drop the parses backing the previous event before reading on.
             stream.reset();
-            // One growable buffer holds the current line, reused across the
-            // filler lines this call skips and freed when it returns; the event
-            // handed back borrows `parsed`, not this buffer.
+            // Reused across skipped filler lines; the event handed back borrows
+            // `parsed`, not this buffer.
             var line_buffer: std.Io.Writer.Allocating = .init(stream.gpa);
             defer line_buffer.deinit();
-            // One idle window spans the read of each event. A shared `Deadline`
-            // (rather than a fresh per-read timeout) lets keepalive pings and
-            // other filler draw the window down while every recognized frame
-            // restarts it, so only a genuine stall surfaces `error.Timeout`.
             var deadline = net.Deadline.start(stream.io, stream.idle_ms);
             while (true) {
                 const line = (try takeLine(stream, deadline, &line_buffer)) orelse return null;
-                // Charge every line against the whole-stream budget, so a peer
-                // that makes frequent valid progress (each frame restarting the
-                // idle window) still hits an aggregate ceiling. Counting here,
-                // after a clean read, also bounds an eventless-`.progress`
-                // flood that never returns an event to the caller.
+                // Charge every line against the whole-stream budget: a peer that
+                // makes frequent valid progress still hits an aggregate ceiling,
+                // including an eventless-`.progress` flood that never returns.
                 try stream.budget.take(line.len + 1);
                 const trimmed = std.mem.trimEnd(u8, line, "\r");
                 if (!std.mem.startsWith(u8, trimmed, "data:")) {
-                    // A non-`data:` line (comment, `event:` field, blank) is
-                    // not progress; check the window so buffered filler that
-                    // never blocks a read cannot spin here forever.
+                    // Not progress; check the window explicitly so buffered
+                    // filler that never blocks a read cannot spin here forever.
                     if (deadline.expired(stream.io)) return error.Timeout;
                     continue;
                 }
@@ -166,19 +156,15 @@ pub fn Engine(comptime S: type) type {
                 switch (try stream.decode(payload)) {
                     .event => |event| return event,
                     .progress => deadline = net.Deadline.start(stream.io, stream.idle_ms),
-                    // Filler never restarts the window, so a stream of only
-                    // filler trips the timeout even when its bytes arrive
-                    // buffered and no read ever blocks on `deadline.call`.
+                    // Same buffered-filler guard as the non-`data:` arm above.
                     .ignored => if (deadline.expired(stream.io)) return error.Timeout,
                     .done => return null,
                 }
             }
         }
 
-        /// The next SSE line. A line already buffered is returned without a
-        /// timed read; a read that must wait on the socket is bounded by the
-        /// time left in the idle window, so a stalled stream surfaces
-        /// `error.Timeout` for the retry path.
+        /// The next SSE line: returned directly when already buffered, else
+        /// read bounded by the time left in the idle window.
         fn takeLine(stream: *S, deadline: net.Deadline, buffer: *std.Io.Writer.Allocating) !?[]const u8 {
             if (std.mem.indexOfScalar(u8, stream.body.buffered(), '\n') != null) return readLine(stream, buffer);
             return deadline.call(stream.io, readLine, .{ stream, buffer });
@@ -186,16 +172,14 @@ pub fn Engine(comptime S: type) type {
 
         /// Take one delimited line into the reused line buffer, mapping a
         /// canceled read to `error.Canceled` (a turn cancel, or the idle timer
-        /// reaping this task) and leaving every other failure on the
-        /// network-error path. The line streams into a growable buffer bounded
-        /// by what the whole-stream budget may still deliver, so a single frame
-        /// larger than that is rejected before it is fully buffered rather than
-        /// after. One `data:` line is one event — no multi-line frame is
+        /// reaping this task). The line grows bounded by what the budget may
+        /// still deliver, so an oversized frame is rejected before it is fully
+        /// buffered; one `data:` line is one event — no multi-line frame is
         /// assembled — so this bounds the assembled frame too.
         fn readLine(stream: *S, buffer: *std.Io.Writer.Allocating) anyerror!?[]const u8 {
             buffer.clearRetainingCapacity();
-            // A spent budget makes the read below fail `StreamResponseTooLarge`
-            // before it can reach end of stream — the right verdict at the ceiling.
+            // A spent budget fails the read as `StreamResponseTooLarge` before
+            // it can reach end of stream — the right verdict at the ceiling.
             const cap: std.Io.Limit = .limited(stream.budget.remaining());
             _ = stream.body.streamDelimiterLimit(&buffer.writer, '\n', cap) catch |err| switch (err) {
                 error.StreamTooLong => return error.StreamResponseTooLarge,
@@ -246,13 +230,11 @@ fn retryAfter(head: std.http.Client.Response.Head) ?u64 {
     return null;
 }
 
-/// A logical clock over a real backend, for the transports' idle-window tests:
-/// `now` returns the current tick and then advances by a fixed step, so a
-/// bounded run of non-progress reads drives the idle window to expiry
-/// deterministically without real time passing. Only `now` is overridden, so
-/// the callers must never reach another vtable entry with this wrapper's
-/// userdata: the tests feed a fully buffered `.fixed` reader whose lines are
-/// always available, so `takeLine` returns them directly and never reaches
+/// A logical clock over a real backend for the idle-window tests: `now`
+/// returns the current tick and advances by a fixed step, driving the window
+/// to expiry without real time passing. Only `now` is overridden, so callers
+/// must never reach another vtable entry with this userdata — the tests feed
+/// fully buffered `.fixed` readers, so `takeLine` never reaches
 /// `deadline.call` (the sole path to a backend-owned timed operation).
 pub const TickingIo = struct {
     backend: std.Io,

@@ -1,7 +1,5 @@
-//! The tools the model may call. Each tool is a module exposing a neutral
-//! `spec` (the schema advertised to the provider) and a `run` handler; the
-//! registry pairs them, so a tool is added by writing its module and
-//! registering it below.
+//! The tools the model may call: each module exposes a `spec` and a `run`;
+//! the registry pairs them.
 
 const std = @import("std");
 
@@ -19,9 +17,6 @@ const grep = @import("grep.zig");
 const Entry = struct {
     tool: llm.Tool,
     run: *const fn (*const Context, []const u8) anyerror!Result,
-    /// Whether the tool writes to the filesystem. The agent runs a mutating call
-    /// as a barrier -- after all earlier reads finish and before any later call --
-    /// so it can't race a concurrent read or another mutation within one turn.
     mutates: bool,
 };
 
@@ -40,8 +35,8 @@ pub const specs = blk: {
     break :blk list;
 };
 
-/// Whether tool `name` writes to the filesystem, so the agent knows to run it as
-/// a barrier. An unknown tool touches nothing, so it runs concurrently and just
+/// Whether tool `name` writes to the filesystem, so the agent runs it as a
+/// barrier. An unknown tool touches nothing, so it runs concurrently and just
 /// reports the unknown-tool error.
 pub fn mutates(name: []const u8) bool {
     for (registry) |entry| {

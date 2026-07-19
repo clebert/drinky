@@ -1,21 +1,7 @@
-//! Networking policy shared across the provider seam: the request timeout and
-//! retry knobs (defaults live here, so the config file only patches them) and
-//! `withTimeout`, the primitive that bounds a blocking operation.
-//!
-//! Zig's `std.http` has no request deadline and owns its own socket reads, so a
-//! timeout cannot be attached to an operation directly. `withTimeout` instead
-//! races the operation against a timer as two concurrent tasks and cancels the
-//! loser: the operation wins with its result, or the timer wins and the still
-//! blocked operation is cancelled and reaped, surfacing `error.Timeout`. A cancel
-//! of the *caller* (a user aborting the turn) propagates through as
-//! `error.Canceled`, distinct from a timeout.
-//!
-//! `Deadline` layers on top: it fixes one instant and bounds a run of reads by
-//! the time left until it, so activity that makes no progress (an Anthropic
-//! stream sending only keepalive pings) cannot hold the window open the way a
-//! fresh per-read timeout would. `Budget` is the volume counterpart: it caps one
-//! stream's total bytes, so a peer that keeps making progress — never letting
-//! `Deadline` trip — still hits an aggregate ceiling.
+//! Networking policy shared across the provider seam: the timeout and retry
+//! knobs (defaults live here, so the config file only patches them) and three
+//! bounds — `withTimeout` bounds one blocking operation, `Deadline` bounds a
+//! run of reads by one fixed instant, `Budget` caps a stream's total bytes.
 
 const std = @import("std");
 
@@ -25,10 +11,8 @@ pub const Timeouts = struct {
     /// Time to the response head: DNS, connect, TLS, request send, and first
     /// byte. Bounds `Transport.send`.
     connect_ms: u64 = 30_000,
-    /// Longest gap tolerated between real streamed events. Anthropic sends
-    /// periodic keepalive pings, so a healthy stream never idles this long — and,
-    /// because pings do not count as progress, a stream that only pings still
-    /// trips it. Bounds the read of each event.
+    /// Longest gap tolerated between real streamed events; keepalive pings do
+    /// not count as progress. Bounds the read of each event.
     idle_ms: u64 = 60_000,
 };
 
@@ -65,11 +49,11 @@ fn Timed(comptime Function: type) type {
 /// first). A cancel of the calling task propagates as `error.Canceled`. A
 /// `timeout_ms` of 0, or an io without concurrency, runs the operation unbounded.
 ///
-/// The bound is a race, so an operation that finishes right at the deadline can
-/// still surface `error.Timeout` (the timer's result was dequeued first, and the
-/// reaped operation result is discarded here). A caller whose operation acquires
-/// resources must be able to reclaim them on `error.Timeout` — e.g. a flag the
-/// operation sets last, checked on the error path.
+/// Zig's `std.http` offers no request deadline, so the bound is a race of two
+/// concurrent tasks — an operation that finishes right at the deadline can still
+/// surface `error.Timeout` (its reaped result is discarded here). A caller whose
+/// operation acquires resources must be able to reclaim them on `error.Timeout`
+/// — e.g. a flag the operation sets last, checked on the error path.
 pub fn withTimeout(
     io: std.Io,
     timeout_ms: u64,
@@ -114,12 +98,10 @@ fn sleep(io: std.Io, milliseconds: u64) std.Io.Cancelable!void {
     return io.sleep(.fromMilliseconds(@intCast(@min(milliseconds, std.math.maxInt(i64)))), .awake);
 }
 
-/// An idle window shared across a run of timed reads. Where `withTimeout` starts
-/// a fresh window on every call — so a stream of quick reads never expires — a
-/// `Deadline` fixes one instant and bounds each read by the time left until it.
-/// A read that returns without making progress draws the window down instead of
-/// resetting it, so a source that stays busy without progress (an Anthropic
-/// stream sending only keepalive pings) still trips the timeout.
+/// An idle window shared across a run of timed reads: one fixed instant bounds
+/// each read by the time left until it. A read that makes no progress draws the
+/// window down instead of resetting it, so a source that stays busy without
+/// progress (an Anthropic stream sending only keepalive pings) still trips.
 pub const Deadline = struct {
     /// Monotonic instant the window closes, or null when unbounded.
     at: ?std.Io.Timestamp,
@@ -132,8 +114,8 @@ pub const Deadline = struct {
     }
 
     /// Whether the window has already closed; an unbounded deadline never has.
-    /// Lets a caller time out a source that stays busy without blocking a read
-    /// (a stream flooding pings), which the read-bounding `call` never reaches.
+    /// Lets a caller time out a source that stays busy without blocking a read,
+    /// which the read-bounding `call` never reaches.
     pub fn expired(self: Deadline, io: std.Io) bool {
         const at = self.at orelse return false;
         return std.Io.Clock.awake.now(io).durationTo(at).nanoseconds <= 0;
@@ -175,11 +157,9 @@ pub fn decompressBuffer(gpa: std.mem.Allocator, encoding: std.http.ContentEncodi
 /// token-response cap.
 pub const stream_response_bytes_max = 64 << 20;
 
-/// A running byte budget for one streamed response, shared across its reads.
-/// Where `Deadline` bounds how long a single read may block, `Budget` bounds a
-/// whole stream's volume, so a peer that makes frequent valid progress —
-/// restarting the idle window on every frame, so `Deadline` never trips — still
-/// hits an aggregate ceiling. Bytes are charged after decompression, the
+/// A running byte budget for one streamed response, shared across its reads: the
+/// volume counterpart to `Deadline`, so a peer that keeps making valid progress
+/// still hits an aggregate ceiling. Bytes are charged after decompression, the
 /// memory-relevant quantity.
 pub const Budget = struct {
     /// Bytes charged so far.

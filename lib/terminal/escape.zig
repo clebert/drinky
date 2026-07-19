@@ -1,3 +1,6 @@
+//! The ANSI escape sequences the renderer trusts: mode set/reset pairs, screen
+//! clears, and bounded cursor motion. Nothing here carries runtime content.
+
 const std = @import("std");
 
 /// Begin/end a synchronized-output burst so a multi-line repaint lands atomically.

@@ -1,13 +1,7 @@
-//! A thread-safe queue of steering messages: text the user submits while a turn
-//! is already running, handed from the UI thread to the turn worker so the
-//! running `Agent` can fold it into the current turn at a round boundary.
-//!
-//! `push` and `take` are the whole contract, both guarded by the mutex; the
-//! queue owns each message until it is taken. The UI thread pushes; either thread
-//! takes — the worker drains it into the turn, while the UI thread also takes to
-//! recall the queue (Alt+Up) or on cancel, so two takes can contend and the
-//! mutex guards take against take, not just against push. Display of the queue
-//! lives with the consumer — this is only the crossing channel.
+//! A thread-safe queue of steering messages: text the user submits mid-turn,
+//! handed from the UI thread to the turn worker. The queue owns each message
+//! until taken. The UI thread pushes; either thread takes (drain into the turn,
+//! recall, or cancel), so the mutex guards take against take, not just push.
 
 const std = @import("std");
 
@@ -72,7 +66,6 @@ test "push then take drains the queue in order" {
     try std.testing.expectEqualStrings("foo", taken[0]);
     try std.testing.expectEqualStrings("qux", taken[1]);
 
-    // A second take sees an empty queue.
     const empty = try steering.take();
     defer gpa.free(empty);
     try std.testing.expectEqual(@as(usize, 0), empty.len);
@@ -101,8 +94,8 @@ test "push and take survive concurrent contention" {
         const Task = struct { producer: usize, count: usize };
         const Located = struct { producer: usize, seq: usize };
 
-        // One producer, mirroring the UI thread: push `count` uniquely tagged
-        // messages so the consumer can prove none are lost, duplicated, or torn.
+        // Push uniquely tagged messages so the consumer can prove none are
+        // lost, duplicated, or torn.
         fn produce(steering: *Steering, task: Task) error{OutOfMemory}!void {
             var buffer: [32]u8 = undefined;
             var seq: usize = 0;
@@ -129,17 +122,16 @@ test "push and take survive concurrent contention" {
     var steering = Steering.init(gpa, io);
     defer steering.deinit();
 
-    // Force the mutex slow path deterministically. Hold the lock, spawn every
-    // producer so each `push` parks in `futexWait` (leaving the state
-    // `.contended`), observe that state, then unlock so the wakeup runs
-    // `futexWake` — the contended path the single-threaded tests never reach.
+    // Force the mutex slow path: hold the lock until every producer parks
+    // (state `.contended`), then unlock to run the wakeup — the contended path
+    // the single-threaded tests never reach.
     steering.mutex.lockUncancelable(io);
     var futures: [producer_count]std.Io.Future(error{OutOfMemory}!void) = undefined;
     for (&futures, 0..) |*future, index| {
         future.* = try io.concurrent(work.produce, .{ &steering, work.Task{ .producer = index, .count = per_producer } });
     }
-    // Reap producers before `steering.deinit`, so an early failure never frees the
-    // queue while a producer is mid-push.
+    // Reap producers before `steering.deinit`, so an early failure never frees
+    // the queue mid-push.
     defer for (&futures) |*future| {
         _ = future.await(io) catch {};
     };
@@ -156,10 +148,9 @@ test "push and take survive concurrent contention" {
     steering.mutex.unlock(io);
     try std.testing.expect(forced_contended);
 
-    // Drain concurrently with the producers, accounting for every message exactly
-    // once: `seen` catches loss (a slot never set) and duplication (set twice);
-    // `parse` catches corruption. The empty-spin is capped, so a lost message ends
-    // the drain and fails the count rather than hanging.
+    // Drain concurrently with the producers: `seen` catches loss and duplication,
+    // `parse` corruption; the capped empty-spin fails a lost message rather than
+    // hanging.
     const seen = try gpa.alloc(bool, total);
     defer gpa.free(seen);
     @memset(seen, false);

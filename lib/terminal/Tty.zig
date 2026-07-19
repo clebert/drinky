@@ -9,12 +9,9 @@ const escape = @import("escape.zig");
 
 const Tty = @This();
 
-// The read path (`in_handle`) and the write path (`out_handle`, `out_stream`,
-// `out_buffer`) share no mutable field, so an input-reader task blocked in `read`
-// and a render consumer writing through `writer` can run concurrently without a
-// lock. `original` and `raw_state` belong to the setup/teardown path alone and are
-// never touched while a reader runs. Preserve that split: do not add a field both
-// the read and write paths touch.
+// The read path (`in_handle`) and the write path (`out_*`) share no mutable
+// field, so a blocked reader and a writer run concurrently without a lock;
+// `original`/`raw_state` are setup/teardown-only. Preserve that split.
 io: std.Io,
 in_handle: std.posix.fd_t,
 out_handle: std.posix.fd_t,
@@ -91,10 +88,9 @@ pub fn enterRaw(self: *Tty) !void {
     try enterWith(&self.raw_state, &self.out_stream.interface, &control);
 }
 
-/// Restore the terminal's original cooked state, then reverse the escape modes, so
-/// plain output is readable. Restoring first keeps a blocking or failing escape
-/// write from stranding raw mode. Used at shutdown (`deinit`) and to suspend the
-/// interface for a mid-session login flow; pair with `enterRaw` to resume.
+/// Restore the original cooked state first — a blocking or failing escape write
+/// must not strand raw mode — then reverse the escape modes. Used at shutdown and
+/// to suspend for a mid-session login flow; pair with `enterRaw` to resume.
 pub fn leaveRaw(self: *Tty) void {
     // `raw` is unused on the restore path.
     var control: PosixSetup = .{
@@ -124,11 +120,10 @@ pub fn read(self: *Tty, buffer: []u8, timeout: std.Io.Timeout) !?usize {
     return try result.file_read_streaming;
 }
 
-/// Current window size, or null when the terminal cannot report one. The
-/// `TIOCGWINSZ` ioctl is an instantaneous kernel query with nothing to block or
-/// cancel on, so it goes straight to the syscall rather than through `io` — which
-/// also sidesteps a `std.Io.Threaded` device-control path that returns spurious
-/// `ENOTTY` on a valid tty under ReleaseSafe on aarch64-macOS
+/// Window size, or null when the terminal cannot report one. `TIOCGWINSZ` is an
+/// instantaneous kernel query with nothing to block or cancel on, so it bypasses
+/// `io` — also sidestepping a `std.Io.Threaded` device-control path that returns
+/// spurious `ENOTTY` on a valid tty under ReleaseSafe on aarch64-macOS
 /// (codeberg.org/ziglang/zig/issues/36218).
 pub fn size(self: *Tty) ?Size {
     var window: std.posix.winsize = .{ .row = 0, .col = 0, .xpixel = 0, .ypixel = 0 };
@@ -487,7 +482,5 @@ test "shutdown restores cooked mode even when presentation output fails" {
     try std.testing.expect(!control.raw);
     try std.testing.expectEqual(@as(usize, 1), control.restore_count);
     try std.testing.expectEqual(RawState{}, state);
-    // Restoration precedes any presentation write, so a failing (or blocking) write
-    // cannot strand the terminal in raw mode.
     try std.testing.expectEqual(TestWriter.Operation.restore, output.operations[4]);
 }

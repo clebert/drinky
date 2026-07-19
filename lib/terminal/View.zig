@@ -1,47 +1,21 @@
 //! Reconciling renderer for an inline (non-alternate-screen) frame.
 //!
-//! The view draws a bounded **window** — the last `pages` pages (a page is the
-//! terminal height) of the newest content — into the terminal's normal buffer.
-//! It never lays out the whole model: the caller composes complete, pre-fitted
-//! physical rows directly into the view's own buffer through a `Sink`, so memory
-//! stays bounded however far the content grows.
+//! The caller composes complete, pre-fitted physical rows — the last `pages`
+//! pages of the newest content, never the whole model — through the `Sink` from
+//! `beginFrame`; `render` diffs against the frame on screen and repaints the
+//! smallest correct region. The two frames ping-pong with retained capacity, so
+//! after warmup no frame allocates.
 //!
-//! Each frame is composed through `beginFrame`, which resets the back frame and
-//! hands back a `Sink` bound to it. The caller emits one row at a time through
-//! separate inert-text and trusted-SGR operations, fitted to at most `columns`
-//! display width and carrying an opaque `Anchor` (stable cross-frame identity)
-//! and optional caret column, then calls `render` to diff and repaint. The view
-//! keeps two frames and ping-pongs them — this frame in one, last frame in the
-//! other — resetting the older with retained capacity each frame, so after
-//! warmup no frame allocates.
-//!
-//! Reconciliation is by anchor, not screen position, so a sliding window does
-//! not force a reset on every append:
-//!
-//! - **Forward slide** (the shared top row scrolled down, e.g. an append that
-//!   evicted rows off the top): repaint incrementally from the first changed
-//!   row down, but no lower than the previous frame's last on-screen row, so the
-//!   append scrolls the terminal by `\r\n` rather than moving the cursor below
-//!   the bottom margin (where it would clamp, not scroll). Evicted rows scroll
-//!   into native scrollback for free. The stored cursor row was measured from
-//!   the old window top, which slid down, so it is rebased by Δ (how far the
-//!   window slid) before the move.
-//! - **Backward slide** (older rows re-entered above the shared row, because
-//!   the footer or tail shrank): the re-entered top rows are new this frame, so
-//!   the first changed row is `0`. The terminal cannot un-scroll its
-//!   scrollback, so this is never incremental above the viewport — it resets,
-//!   or reprints from row `0` when the window is a single page. A tail that
-//!   shrinks while the shared top row stays put counts here too when rows have
-//!   scrolled off: the shorter frame lifts its footer, so the last page must
-//!   reveal rows now in scrollback, and only a reset can.
-//! - **A change above the viewport, a resize, a page-count change, or no shared
-//!   anchor** clears the screen and scrollback and reprints the whole window.
-//!
-//! Every line is exactly one physical row, so all cursor motion is a plain row
-//! count. Every repaint is wrapped in a synchronized-output burst so it lands
-//! without flicker. The active input caret is given as a column on one line;
-//! after painting the view moves the hardware cursor there and shows it, or
-//! hides it when there is no caret or it fell above the viewport.
+//! Reconciliation is by row **anchor** (stable cross-frame identity), not screen
+//! position, so a sliding window does not force a reset on every append. A
+//! forward slide repaints incrementally, but no lower than the previous frame's
+//! last row: the append scrolls the terminal by `\r\n` rather than moving below
+//! the bottom margin (where the cursor would clamp, not scroll), and the stored
+//! cursor row is rebased by Δ, how far the window slid. A backward slide is
+//! never incremental above the viewport — a terminal cannot un-scroll its
+//! scrollback — so it resets, or reprints from row `0` when the whole window
+//! shows. Every line is exactly one physical row, so all cursor motion is a
+//! plain row count; each repaint is one synchronized-output burst.
 
 const std = @import("std");
 
@@ -63,29 +37,25 @@ pages: usize,
 /// it has scrolled into native scrollback and can no longer be addressed.
 viewport_top: usize,
 /// Physical row the hardware cursor sits on, window-relative to the frame last
-/// painted. One line is one physical row, so this is a plain row index.
+/// painted.
 cursor_row: usize,
-/// Tracks the terminal's cursor visibility so show/hide is emitted only on a
-/// change. The owning `Tty` hides the cursor at startup, matching the initial
-/// value here.
+/// Terminal cursor visibility, so show/hide is emitted only on a change. The
+/// owning `Tty` hides the cursor at startup, matching the initial value here.
 cursor_visible: bool,
 /// The sink handed out by `beginFrame`, composing into the back frame until the
 /// paired `render`.
 sink: Sink,
-/// Set by `beginFrame` when the columns, rows, or page count changed since the
-/// last frame, forcing `render` to repaint the whole window.
+/// Set by `beginFrame` when the columns, rows, or page count changed, forcing
+/// `render` to repaint the whole window.
 structural_change: bool,
-/// Set by `invalidate` when external output has scrolled the terminal out from
-/// under the view, forcing the next `render` to clear the screen and reprint
-/// rather than diff against a screen that no longer matches.
+/// Set by `invalidate`: the screen no longer matches the last painted frame.
 force_reset: bool,
 
 pub const Size = struct { columns: usize, rows: usize };
 
 /// Stable identity of one physical row's content, so the diff survives a
-/// sliding window. Opaque to the view, which only compares anchors for
-/// equality; ids come from disjoint namespaces so they never alias as the model
-/// grows.
+/// sliding window. Opaque to the view (compared only for equality); ids come
+/// from disjoint namespaces so they never alias as the model grows.
 pub const Anchor = struct {
     id: usize,
     line: usize,
@@ -100,10 +70,9 @@ pub const Anchor = struct {
 /// reallocate, which would dangle a slice; an offset survives.
 const Row = struct { offset: usize, len: usize, anchor: Anchor };
 
-/// Hardware cursor position after a repaint: a display `column` on `row`. The
-/// view resolves `row` to a window-relative index; a producing component
-/// reports it relative to its own rows for the assembler to rebase. Absent when
-/// no input is focused.
+/// Hardware cursor position after a repaint: a display `column` on window-relative
+/// `row` (a producer reports it relative to its own rows; the assembler rebases).
+/// Absent when no input is focused.
 pub const Caret = struct { row: usize, column: usize };
 
 /// Composes rows directly into the back frame's `blob`. The caller opens a row
@@ -118,8 +87,7 @@ pub const Sink = struct {
     columns_written: usize,
     has_text: bool,
 
-    /// Open a row and capture the current `blob` end. The bytes may move as
-    /// `blob` grows, so the row is recorded by offset, not slice.
+    /// Open a row and capture the current `blob` end.
     pub fn begin(self: *Sink) void {
         self.offset = self.frame.blob.writer.end;
         self.columns_written = 0;
@@ -241,11 +209,9 @@ pub fn deinit(self: *View) void {
     for (&self.frames) |*frame| frame.deinit(self.gpa);
 }
 
-/// Discard the view's belief about what is on screen: force the next `render` to
-/// clear the screen and scrollback and reprint the whole window. Used after
-/// external output (an OAuth login flow) has scrolled the terminal, so the diff
-/// against the last painted frame no longer holds. The caller has re-hidden the
-/// cursor, so tracking is reset to match.
+/// Force the next `render` to clear the screen and scrollback and reprint: used
+/// after external output (an OAuth login flow) has scrolled the terminal out from
+/// under the diff. The caller has re-hidden the cursor, so tracking resets to match.
 pub fn invalidate(self: *View) void {
     self.force_reset = true;
     self.cursor_visible = false;
@@ -562,9 +528,7 @@ test "a sliding-window append repaints incrementally and keeps the caret synced"
     };
     try h.render(&second, .{ .columns = 10, .rows = 3 }, 2);
     try h.emulator.expectVisible(&.{ "b", "c", "d", "e", "f", "g" });
-    // The evicted top row scrolls into scrollback and none of the on-screen rows
-    // are lost: the append reprints from the old last row and scrolls by \r\n,
-    // and the Δ rebase keeps the caret on the true last row.
+    // No reset: the append reprinted from the old last row; Δ rebase keeps the caret synced.
     try h.emulator.expectCaret(6, 5, 1);
     try std.testing.expect(std.mem.indexOf(u8, h.lastBytes(), escape.screen_reset) == null);
 }

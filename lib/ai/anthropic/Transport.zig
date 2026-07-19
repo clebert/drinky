@@ -1,9 +1,7 @@
 //! The Messages API transport: sends a serialized request and exposes the
 //! response as a pull stream of decoded SSE events on the shared `sse` engine.
 //! Knows nothing about conversation state or tools — it turns bytes into
-//! `Event`s. The identity it sends forks by `Identity`: the subscription path
-//! carries the OAuth Bearer token and the Claude Code headers; the API-key
-//! path carries only `x-api-key`.
+//! `Event`s; the request identity forks by `Identity`.
 
 const std = @import("std");
 
@@ -19,10 +17,10 @@ const anthropic_version = "2023-06-01";
 const beta = "claude-code-20250219,oauth-2025-04-20";
 const user_agent = "claude-cli/2.1.75";
 
-/// How a request authenticates and identifies itself. Subscription OAuth sends a
-/// `Bearer` access token plus the Claude Code identity headers (`anthropic-beta`,
-/// the `claude-cli` user agent, `x-app`); the API key sends only `x-api-key` with
-/// the caller's own system prompt and no identity headers.
+/// How a request authenticates and identifies itself: subscription OAuth sends
+/// a `Bearer` access token plus the Claude Code identity headers
+/// (`anthropic-beta`, the `claude-cli` user agent, `x-app`); the API key sends
+/// only `x-api-key`.
 pub const Identity = union(enum) {
     subscription: []const u8,
     api_key: []const u8,
@@ -39,10 +37,8 @@ identity: Identity,
 /// reader borrows this struct's buffers.
 pub const Stream = struct {
     gpa: std.mem.Allocator,
-    /// Whether `connect` ran to completion, so this stream owns resources
-    /// `deinit` must free. Set last by a successful connect; the timeout error
-    /// path reads it to tell a fully-built stream from a cancelled or partial
-    /// one.
+    /// Set last by a full connect; `sse.Engine.open`'s timeout path frees only
+    /// an established stream.
     established: bool,
     client: std.http.Client,
     request: std.http.Client.Request,
@@ -85,9 +81,7 @@ pub const Stream = struct {
         self.parsed = null;
     }
 
-    /// Decode one Messages `data:` payload. A keepalive `ping` decodes as
-    /// filler (`.ignored`), so a stream of only pings draws the idle window
-    /// down.
+    /// Decode one Messages `data:` payload; a keepalive `ping` is filler.
     pub fn decode(self: *Stream, payload: []const u8) !sse.Decoded {
         // A malformed payload is filler, not progress; a truncated tail then
         // surfaces as an incomplete reply at end of stream, which is retried.
@@ -114,10 +108,6 @@ pub const Stream = struct {
             return error.ApiError;
         }
 
-        // Usage arrives split across the stream: the prompt and cache counts in
-        // `message_start`, the final output count in `message_delta`. The latter
-        // also carries the stop reason, but only the following `message_stop` is
-        // terminal.
         if (std.mem.eql(u8, kind, "message_delta")) {
             if (json.object(object.get("usage"))) |usage| mergeUsage(&self.usage, usage);
             self.terminal = messageDeltaStopReason(object) != null;
@@ -150,10 +140,9 @@ pub const Stream = struct {
             self.parsed = parsed;
             return .{ .event = event };
         }
-        // A recognized `content_block_*` frame with no event (a block boundary, or
-        // a delta subtype not surfaced) is still progress; any other `type` is
-        // filler that must not hold the idle window open. Read `kind` (which
-        // borrows `parsed`) before freeing it.
+        // A recognized `content_block_*` frame with no event is still progress;
+        // any other `type` is filler. Read `kind` (which borrows `parsed`)
+        // before freeing it.
         const recognized = std.mem.startsWith(u8, kind, "content_block_");
         parsed.deinit();
         return if (recognized) .progress else .ignored;
@@ -173,8 +162,8 @@ fn connect(self: *Transport, out: *Stream, body: []const u8) anyerror!void {
     errdefer out.client.deinit();
     out.terminal = false;
 
-    // The Bearer header outlives the send below (which happens after the request
-    // is built), so allocate it at connect scope; the API-key path needs none.
+    // The Bearer header must outlive the send below, so allocate it at connect
+    // scope; the API-key path needs none.
     const authorization: ?[]u8 = switch (self.identity) {
         .subscription => |token| try std.fmt.allocPrint(self.gpa, "Bearer {s}", .{token}),
         .api_key => null,
@@ -186,18 +175,14 @@ fn connect(self: *Transport, out: *Stream, body: []const u8) anyerror!void {
     out.request = try out.client.request(.POST, uri, requestOptions(self.identity, authorization, &extra));
     errdefer out.request.deinit();
 
-    // A cancel during `finish` lands before Agent.run arms its
-    // `defer stream.deinit()`, so teardown falls to the errdefers above (client
-    // and request); that unwinds cleanly. This corner is untested.
+    // A cancel during `finish` lands before Agent.run arms its deinit, so
+    // teardown falls to the errdefers above. This corner is untested.
     try engine.finish(out, body);
 }
 
-/// The built request's identity fork: the subscription path authorizes with the
-/// OAuth Bearer token and carries the Claude Code identity headers; the API-key
-/// path sends only `x-api-key`. Both request an unencoded response — SSE is
-/// consumed one line at a time as chunks arrive, so a verbatim body keeps event
-/// delivery independent of any decompressor's own buffering. `extra` backs the
-/// returned options and must outlive the request send.
+/// The built request's `Identity` fork. Both paths request an unencoded
+/// response, keeping event delivery independent of any decompressor's own
+/// buffering. `extra` backs the returned options and must outlive the send.
 fn requestOptions(
     identity: Identity,
     authorization: ?[]const u8,
@@ -369,7 +354,6 @@ test "next walks SSE data lines and ends at stream end" {
     try std.testing.expectEqual(@as(u64, 42), stop.stop.usage.output);
     try std.testing.expectEqual(@as(u64, 90), stop.stop.usage.cache_read);
     try std.testing.expectEqual(@as(u64, 5), stop.stop.usage.cache_write);
-    // The same totals are visible mid-stream through `usageSoFar`.
     try std.testing.expectEqual(@as(u64, 10), stream.usageSoFar().input);
     try std.testing.expectEqual(@as(u64, 42), stream.usageSoFar().output);
     try std.testing.expectEqual(@as(?llm.Event, null), try stream.next());
@@ -379,7 +363,6 @@ test "decode separates pings from progress and events" {
     var stream = testStream(undefined, undefined, 0, 0);
     defer stream.reset();
 
-    // A keepalive ping is filler: ignored, deliberately never progress.
     try std.testing.expectEqual(@as(sse.Decoded, .ignored), try stream.decode(
         \\{"type":"ping"}
     ));
@@ -434,8 +417,7 @@ test "an unrecognized frame after the terminal delta stays ignored" {
     try std.testing.expectEqual(@as(sse.Decoded, .progress), try stream.decode(
         \\{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}
     ));
-    // Filler between the terminal delta and `message_stop` must not turn a
-    // complete reply into an incomplete one.
+    // Filler here must not turn a complete reply into an incomplete one.
     try std.testing.expectEqual(@as(sse.Decoded, .ignored), try stream.decode(
         \\{"type":"surprise_new_event"}
     ));
@@ -449,8 +431,6 @@ test "decode ignores unrecognized frames instead of counting them as progress" {
     var stream = testStream(undefined, undefined, 0, 0);
     defer stream.reset();
 
-    // An unknown top-level type, a payload with no type, and a non-object payload
-    // are all filler the protocol does not define: ignored, never progress.
     try std.testing.expectEqual(@as(sse.Decoded, .ignored), try stream.decode(
         \\{"type":"surprise_new_event"}
     ));
@@ -470,8 +450,6 @@ test "decode ignores a malformed data line instead of failing the turn" {
     var stream = testStream(undefined, undefined, 0, 0);
     defer stream.reset();
 
-    // A truncated frame (a connection cut mid-line) and a corrupt one are both
-    // filler: ignored, never progress, never a non-retryable parse error.
     try std.testing.expectEqual(@as(sse.Decoded, .ignored), try stream.decode(
         \\{"type":"content_block_delta","del
     ));
@@ -504,9 +482,8 @@ test "decode surfaces a streamed error frame" {
 }
 
 test "next times out on buffered filler that makes no progress" {
-    // A comment line and unrecognized `data:` frames carry no protocol progress,
-    // so a stream of only filler must trip the idle window even though every line
-    // is buffered and no read ever blocks on the deadline.
+    // Only filler: the idle window must trip even though every line is
+    // buffered and no read ever blocks on the deadline.
     const body =
         ": keepalive comment\n" ++
         "data: {\"type\":\"surprise_new_event\"}\n" ++
@@ -521,16 +498,15 @@ test "next times out on buffered filler that makes no progress" {
     var stream = testStream(clock.io(), &reader, 100, net.stream_response_bytes_max);
     defer stream.reset();
 
-    // The window is 100 ms and the logical clock advances 40 ms per reading, so it
-    // closes after a few filler lines — before the trailing real event or EOF.
+    // The 100 ms window loses 40 ms per reading, so it closes after a few
+    // filler lines — before the trailing real event or EOF.
     try std.testing.expectError(error.Timeout, stream.next());
 }
 
 test "next stops a stream once its aggregate byte budget is spent" {
-    // Each frame is a valid text delta — real progress that restarts the idle
-    // window — so only the aggregate byte budget, not the idle deadline, ends the
-    // flood. The budget spans two frames, so it trips on their sum rather than any
-    // single line, whose own read is separately bounded.
+    // Each frame is real progress that restarts the idle window, so only the
+    // aggregate byte budget ends the flood. It spans two frames, tripping on
+    // their sum rather than any single line.
     const frame =
         "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"chunk\"}}\n";
     const body = frame ** 5;
@@ -540,18 +516,15 @@ test "next stops a stream once its aggregate byte budget is spent" {
     var stream = testStream(threaded.io(), &reader, 60_000, frame.len * 2);
     defer stream.reset();
 
-    // Each read charges the line plus its newline. Two frames land inside the
-    // budget; the third carries the running total past it, before EOF.
     try std.testing.expectEqualStrings("chunk", (try stream.next()).?.text);
     try std.testing.expectEqualStrings("chunk", (try stream.next()).?.text);
     try std.testing.expectError(error.StreamResponseTooLarge, stream.next());
 }
 
 test "next bounds a flood of eventless progress frames" {
-    // A `content_block_stop` is recognized progress with no event, so it loops
-    // inside `next`, restarting the idle window and never returning to the
-    // caller. The aggregate budget must still stop the flood — which an
-    // Agent-level counter, fed only returned events, could not.
+    // Every frame is `.progress`, so `next` loops without returning an event;
+    // the aggregate budget must still stop the flood — which an Agent-level
+    // counter, fed only returned events, could not.
     const frame = "data: {\"type\":\"content_block_stop\",\"index\":0}\n";
     const body = frame ** 100;
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
@@ -560,17 +533,13 @@ test "next bounds a flood of eventless progress frames" {
     var stream = testStream(threaded.io(), &reader, 60_000, frame.len * 3);
     defer stream.reset();
 
-    // A single `next` never returns an event (every frame is `.progress`); it
-    // consumes lines until the running total passes the ceiling.
     try std.testing.expectError(error.StreamResponseTooLarge, stream.next());
 }
 
 test "next reads a data frame larger than the reader buffer" {
-    // A `text_delta` whose text far exceeds the reader buffer. Production reads
-    // through a 16 KiB `transfer_buffer`, so a longer line must stream into the
-    // growable line buffer rather than fit the reader buffer; the chunked test
-    // reader serves at most 64 bytes per fill, so one line spans several fills
-    // and decodes intact rather than failing `StreamTooLong`.
+    // Production reads through a 16 KiB `transfer_buffer`, so a longer line
+    // must stream into the growable line buffer; the chunked reader serves at
+    // most 64 bytes per fill, so one line spans several fills.
     const text = "A" ** 4000;
     const body = "data: {\"type\":\"content_block_delta\",\"delta\":" ++
         "{\"type\":\"text_delta\",\"text\":\"" ++ text ++ "\"}}\n";
@@ -587,9 +556,8 @@ test "next reads a data frame larger than the reader buffer" {
 }
 
 test "next rejects a single frame larger than the stream budget" {
-    // The budget is smaller than one frame, so the line's own read trips the
-    // ceiling before the frame is buffered — the per-frame bound, distinct from
-    // the cumulative flood the budget also stops.
+    // One frame exceeds the whole budget, so its own read trips the ceiling
+    // before the frame is buffered — the per-frame bound.
     const body = "data: {\"type\":\"content_block_delta\",\"delta\":" ++
         "{\"type\":\"text_delta\",\"text\":\"chunk\"}}\n";
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
@@ -602,8 +570,7 @@ test "next rejects a single frame larger than the stream budget" {
 }
 
 test "next surfaces a stream truncated mid data-line as a retryable premature end" {
-    // The final chunk ends inside a `data:` frame; the truncated line must take
-    // the retryable premature-stream-end path, never be decoded as a frame.
+    // A truncated final line must never be decoded as a frame.
     const body = "data: {\"type\":\"content_block";
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();
@@ -631,8 +598,8 @@ test "a canceled read surfaces as a clean abort, not a network error" {
         .seek = 0,
         .end = 0,
     };
-    // The connection records why the read failed: a cancel refines to a clean
-    // abort, any other cause stays on the network-error path.
+    // The connection's recorded read error decides: cancel refines to a clean
+    // abort, anything else stays on the network-error path.
     var connection: std.http.Client.Connection = undefined;
     connection.protocol = .plain;
     connection.stream_reader.err = error.Canceled;
@@ -647,9 +614,9 @@ test "a canceled read surfaces as a clean abort, not a network error" {
 test "send leaves the caller owning nothing when connect fails partway" {
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();
-    // Fail connect's first allocation (the Bearer header), after the client is
-    // already set up: the error surfaces with `established` still false, so
-    // `send` frees nothing the connect errdefers already unwound.
+    // Connect's first allocation fails after the client is set up: the error
+    // surfaces with `established` still false, so `send` frees nothing the
+    // connect errdefers already unwound.
     var failing: std.testing.FailingAllocator = .init(std.testing.allocator, .{ .fail_index = 0 });
     var transport: Transport = .{
         .gpa = failing.allocator(),

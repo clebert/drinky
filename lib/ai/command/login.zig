@@ -1,12 +1,6 @@
-//! `/login`: open a picker over every account, so the same picker serves a
-//! mid-session login, the first-run bootstrap, and the fall-through after logging
-//! out the last account. An unauthenticated subscription runs its OAuth flow on
-//! select (a `login` outcome the app executes, suspending the tty around the
-//! browser callback); an environment API account, which cannot be logged in
-//! interactively, reports how to set its key and restart; an authenticated but
-//! inactive account switches the session to it; the already-active account is
-//! marked and does nothing. `run` and `select` index the same account list (enum
-//! order), so a row resolves identically. Any argument is ignored.
+//! `/login`: picker over every account (also the first-run bootstrap and the
+//! fall-through after the last logout). `run` and `select` index the same
+//! enum-order account list; any argument is ignored.
 
 const std = @import("std");
 
@@ -38,8 +32,8 @@ pub fn select(context: *Context, index: usize) !Outcome {
     const account = accounts[index];
     if (isActive(context, account)) return Outcome.report(gpa, .ok, "{s} is already active", .{account.label()});
     if (context.accounts.isAuthenticated(account)) {
-        // Already authenticated: switch without a login (mirroring /model), on
-        // the account's first listed model.
+        // Authenticated but inactive: switch without a login, onto the account's
+        // first listed model.
         var vendor_models: std.ArrayList(models.Model) = .empty;
         defer vendor_models.deinit(gpa);
         try context.accounts.listModels(account, &vendor_models, gpa);
@@ -48,7 +42,6 @@ pub fn select(context: *Context, index: usize) !Outcome {
         return Outcome.report(gpa, .ok, "switched to {s} ({s})", .{ model.name, account.label() });
     }
     if (account.isSubscription()) return .{ .login = account };
-    // An API account has no interactive login: its key comes from the environment.
     return Outcome.report(
         gpa,
         .ok,
@@ -57,17 +50,13 @@ pub fn select(context: *Context, index: usize) !Outcome {
     );
 }
 
-/// The suffix marking an account's state in the picker: the active account reads
-/// as active, an authenticated but inactive subscription as logged in, an
-/// inactive API account with its key as set, and anything unauthenticated has
-/// none.
+/// The account's state suffix in the picker; empty when unauthenticated.
 fn marker(context: *const Context, account: llm.Account) []const u8 {
     if (isActive(context, account)) return " (active)";
     if (!context.accounts.isAuthenticated(account)) return "";
     return if (account.isSubscription()) " (logged in)" else " (key set)";
 }
 
-/// Whether `account` is the session's active account (the agent's client).
 fn isActive(context: *const Context, account: llm.Account) bool {
     const client = context.agent.client orelse return false;
     return client.account() == account;
@@ -75,8 +64,6 @@ fn isActive(context: *const Context, account: llm.Account) bool {
 
 test "the picker lists every account, marking the active and authenticated ones" {
     const gpa = std.testing.allocator;
-    // An anthropic subscription logged in and an anthropic API key set (the
-    // active account); both openai accounts unauthenticated.
     var accounts = testing.accounts(.{ .anthropic = "sk-ant" }, true, false);
     var agent = testing.agent(gpa, .{ .anthropic_api = "sk-ant" });
     defer agent.deinit();
@@ -106,20 +93,12 @@ test "select logs in a subscription, instructs an API account, and no-ops the ac
     defer agent.deinit();
     var context: Context = .{ .gpa = gpa, .agent = &agent, .accounts = &accounts };
 
-    // An unauthenticated subscription hands the app a login to run.
     switch (try select(&context, 2)) {
         .login => |account| try std.testing.expectEqual(llm.Account.openai_subscription, account),
         else => return error.ExpectedLogin,
     }
-
-    // An unauthenticated API account explains how to set its key rather than
-    // attempting a login.
     try Outcome.expectFeedbackContaining(try select(&context, 3), .ok, "OPENAI_API_KEY");
-
-    // The active account (the env API key) does nothing but say so.
     try Outcome.expectFeedbackContaining(try select(&context, 1), .ok, "already active");
-
-    // An out-of-range index is reported.
     try Outcome.expectFeedback(try select(&context, 99), .err);
 }
 

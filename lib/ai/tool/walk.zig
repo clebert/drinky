@@ -8,10 +8,8 @@ const glob = @import("glob.zig");
 
 const noise_dirs = [_][]const u8{ ".git", ".zig-cache", "zig-cache", "zig-out" };
 
-/// Hard cap on directory entries examined in one walk, so an adversarial or
-/// accidentally huge tree cannot make traversal run unbounded. High enough that
-/// real repositories never reach it (noise directories are skipped), and each
-/// visit is cheap, so erring high only risks time, never correctness.
+/// Hard cap on entries examined per walk, so a huge tree cannot make traversal
+/// run unbounded; real repositories never reach it.
 pub const entries_visited_max = 1_000_000;
 
 /// The matches a walk retained, owned by the caller's `gpa`.
@@ -35,20 +33,11 @@ pub const Match = struct {
 };
 
 /// The lexicographically-smallest matches under `options.base` whose
-/// base-relative path matches `options.pattern`, each relative to the working
-/// directory. Memory is bounded: only the smallest `options.retain` matches are
-/// retained (via a max-heap that evicts and frees larger paths), while the
-/// total is merely counted, so a caller needing only a few results never
-/// retains the whole tree. Time is bounded by `options.entries_max`. When the
-/// tree is fully traversed the result is byte-identical to sorting every match;
-/// when the entry cap stops it first, the result is flagged `capped`.
-///
-/// An unreadable directory is skipped and the walk keeps going; cancellation
-/// stops it at once, because Zig cancellation is one-shot, so resuming the walk
-/// would perform real traversal I/O the aborted turn no longer wants. Every
-/// exit — success, cancellation, or error — releases the walker's open
-/// directory handles (its `deinit` does not close them) and frees any retained
-/// paths.
+/// base-relative path matches `options.pattern`, sorted, each relative to the
+/// working directory. Memory is bounded by `options.retain` (the total is
+/// merely counted) and time by `options.entries_max`. Unreadable directories
+/// are skipped; cancellation stops the walk at once; every exit releases every
+/// directory handle and retained path.
 pub fn collect(
     io: std.Io,
     gpa: std.mem.Allocator,
@@ -182,12 +171,9 @@ fn lessThan(_: void, a: []const u8, b: []const u8) bool {
     return std.mem.lessThan(u8, a, b);
 }
 
-// Wraps a real io, failing one directory syscall with an injected error to model
-// a failure mid-walk, then counting the traversal opens and reads that follow
-// it. Zig cancellation is one-shot: the injected error is delivered once, so a
-// walk that keeps traversing afterward does real I/O the counter catches.
-// Directory closes are cleanup and never counted, and the open/close balance
-// proves every opened handle was released.
+// Wraps a real io, failing one directory syscall once (cancellation is
+// one-shot), then counting the traversal opens and reads that follow; the
+// open/close balance proves every opened handle was released.
 const FaultyIo = struct {
     backend: std.Io,
     vtable: std.Io.VTable,
@@ -279,8 +265,6 @@ const FaultyIo = struct {
 test "collect stops walking when an entered directory is cancelled" {
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();
-    // The base opens first; failing the second open cancels the first entered
-    // subdirectory (the `enter` site) while its siblings still await traversal.
     var faulty: FaultyIo = .init(threaded.io(), .{
         .trigger = .{ .open_call = 2 },
         .inject = error.Canceled,
@@ -300,8 +284,6 @@ test "collect stops walking when an entered directory is cancelled" {
 test "collect stops walking when a subdirectory read is cancelled" {
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();
-    // Cancel a read taken with the base and one subdirectory open (the `next`
-    // site), so an ancestor and unvisited siblings remain.
     var faulty: FaultyIo = .init(threaded.io(), .{
         .trigger = .{ .subdir_read = 2 },
         .inject = error.Canceled,
@@ -330,8 +312,6 @@ test "collect skips an unreadable directory and keeps walking" {
         .{ .base = "lib", .pattern = "**/*.zig", .retain = 1000 },
     );
     defer matches.deinit(std.testing.allocator);
-    // An ordinary error is not an abort: the walk skips the subtree, traverses
-    // its siblings, and still returns their files with every handle released.
     try std.testing.expect(matches.paths.len > 0);
     try std.testing.expect(faulty.traversal_after_inject > 0);
     try std.testing.expectEqual(@as(usize, 0), faulty.open_handles);
@@ -364,8 +344,6 @@ test "collect retains only the smallest matches and counts the rest" {
     var matches = try collect(io, std.testing.allocator, .{ .base = base, .pattern = "**", .retain = 5 });
     defer matches.deinit(std.testing.allocator);
 
-    // 200 files match, but memory holds only the 5 lexicographically smallest;
-    // the whole tree is never retained.
     try std.testing.expectEqual(@as(usize, 200), matches.matched);
     try std.testing.expectEqual(@as(usize, 5), matches.paths.len);
     try std.testing.expect(!matches.capped);
@@ -391,7 +369,6 @@ test "collect stops at the entry-visit work cap" {
     });
     defer matches.deinit(std.testing.allocator);
 
-    // The cap halts traversal long before the 220-entry tree is exhausted.
     try std.testing.expect(matches.capped);
     try std.testing.expect(matches.matched < 200);
     try std.testing.expect(matches.paths.len <= 10);

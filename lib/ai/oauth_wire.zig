@@ -9,8 +9,8 @@ const net = @import("net.zig");
 
 const base64url = std.base64.url_safe_no_pad.Encoder;
 
-/// Hard cap on a token response body: a larger response fails before it can
-/// allocate without bound. Well above any real exchange or refresh payload.
+/// Hard cap on a token response body, well above any real exchange or refresh
+/// payload.
 const token_response_bytes_max = 256 * 1024;
 
 const verifier_len = base64url.calcSize(32);
@@ -105,8 +105,8 @@ fn fetchInto(
     out.* = try readBody(gpa, reader);
 }
 
-/// The response body, capped at `token_response_bytes_max`: a larger body fails
-/// with `error.TokenResponseTooLarge` rather than allocating without bound.
+/// The response body: a body over `token_response_bytes_max` fails with
+/// `error.TokenResponseTooLarge` rather than allocating without bound.
 fn readBody(gpa: std.mem.Allocator, reader: *std.Io.Reader) ![]u8 {
     return reader.allocRemaining(gpa, .limited(token_response_bytes_max)) catch |err| switch (err) {
         error.StreamTooLong => error.TokenResponseTooLarge,

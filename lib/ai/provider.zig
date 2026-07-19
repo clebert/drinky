@@ -49,7 +49,7 @@ pub const Client = struct {
     /// The vendor backing this client, keying the model table and the wire
     /// serializer both accounts of a vendor share.
     pub fn provider(self: *const Client) llm.Provider {
-        return llm.provider(self.account());
+        return self.account().provider();
     }
 
     /// Open a streaming request for `request`, filling `out` in place. On

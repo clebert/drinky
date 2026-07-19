@@ -34,9 +34,8 @@ account_id: []const u8,
 /// borrows this struct's buffers.
 pub const Stream = struct {
     gpa: std.mem.Allocator,
-    /// Whether `connect` ran to completion, so this stream owns resources
-    /// `deinit` must free. Set last by a successful connect; the timeout error
-    /// path reads it.
+    /// Set last by a full connect; `sse.Engine.open`'s timeout path frees only
+    /// an established stream.
     established: bool,
     client: std.http.Client,
     request: std.http.Client.Request,
@@ -53,9 +52,8 @@ pub const Stream = struct {
     usage: llm.Usage,
     decompress: std.http.Decompress,
     decompress_buffer: []u8,
-    /// Backing store for the request's runtime headers; the request keeps a slice
-    /// of it, so it must outlive the send phase (hence a stream field, not a
-    /// `connect` local).
+    /// Backs the request's runtime headers, which must outlive the send phase
+    /// (hence a stream field, not a `connect` local).
     header_buffer: [3]std.http.Header,
     error_buffer: [512]u8,
     redirect_buffer: [4096]u8,
@@ -243,12 +241,10 @@ fn errorMessage(object: std.json.ObjectMap) ?[]const u8 {
     return null;
 }
 
-/// Fold a `response.usage` object into the running total. `input_tokens` is the
-/// whole prompt, partitioned into three disjoint buckets: cache reads, cache
-/// writes, and the uncached remainder. The gpt-5.6 family bills a cache write at
-/// a premium over uncached input (unlike earlier models, where writes were
-/// free), so each bucket is tracked separately and priced at its own rate.
-/// `output_tokens` already counts reasoning tokens (billed as output).
+/// Fold a `response.usage` object into the running total. `input_tokens`
+/// partitions into three disjoint buckets — cache reads, cache writes, and the
+/// uncached remainder — each priced at its own rate (the gpt-5.6 family bills
+/// cache writes at a premium). `output_tokens` already counts reasoning tokens.
 fn mergeUsage(usage: *llm.Usage, object: std.json.ObjectMap) void {
     const total_input = json.unsigned(object.get("input_tokens")) orelse 0;
     var cached: u64 = 0;
@@ -361,7 +357,6 @@ test "next walks response.* SSE lines and maps usage on completion" {
     const text = (try stream.next()).?;
     try std.testing.expectEqualStrings("done", text.text);
     const stop = (try stream.next()).?;
-    // input = input_tokens - cached; cache_read = cached; output as-is; no write.
     try std.testing.expectEqual(@as(u64, 10), stop.stop.usage.input);
     try std.testing.expectEqual(@as(u64, 90), stop.stop.usage.cache_read);
     try std.testing.expectEqual(@as(u64, 42), stop.stop.usage.output);
@@ -386,10 +381,8 @@ test "decode maps response.incomplete to a stop carrying its usage" {
     var stream = testStream(undefined, undefined, 0, 0);
     defer stream.reset();
 
-    // A truncated turn is not an error: it stops with the reason and the usage
-    // the response reports, so cost accounting stays correct.
-    // The three input buckets are disjoint and sum to input_tokens: uncached =
-    // 50 - cached 10 - written 5 = 35, each priced at its own rate downstream.
+    // A truncated turn is not an error: it stops with the usage the response
+    // reports (uncached = 50 - cached 10 - written 5), so accounting stays correct.
     const decoded = try stream.decode(
         \\{"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":50,"input_tokens_details":{"cached_tokens":10,"cache_write_tokens":5},"output_tokens":128000}}}
     );
@@ -418,9 +411,6 @@ test "decode ignores unrecognized frames instead of counting them as progress" {
     var stream = testStream(undefined, undefined, 0, 0);
     defer stream.reset();
 
-    // A type outside the `response.*` namespace, a payload with no type, and a
-    // non-object payload are all filler the protocol does not define: ignored,
-    // never progress.
     try std.testing.expectEqual(@as(sse.Decoded, .ignored), try stream.decode(
         \\{"type":"surprise.new.event"}
     ));
@@ -430,17 +420,15 @@ test "decode ignores unrecognized frames instead of counting them as progress" {
     try std.testing.expectEqual(@as(sse.Decoded, .ignored), try stream.decode(
         \\42
     ));
-    // A recognized structural `response.*` frame that carries no event is still
-    // progress.
+    // A recognized structural `response.*` frame with no event is still progress.
     try std.testing.expectEqual(@as(sse.Decoded, .progress), try stream.decode(
         \\{"type":"response.in_progress","response":{}}
     ));
 }
 
 test "next times out on buffered filler that makes no progress" {
-    // A comment line and unrecognized `data:` frames carry no protocol progress,
-    // so a stream of only filler must trip the idle window even though every line
-    // is buffered and no read ever blocks on the deadline.
+    // Only filler: the idle window must trip even though every line is
+    // buffered and no read ever blocks on the deadline.
     const body =
         ": keepalive comment\n" ++
         "data: {\"type\":\"surprise.new.event\"}\n" ++
@@ -455,16 +443,15 @@ test "next times out on buffered filler that makes no progress" {
     var stream = testStream(clock.io(), &reader, 100, net.stream_response_bytes_max);
     defer stream.reset();
 
-    // The window is 100 ms and the logical clock advances 40 ms per reading, so it
-    // closes after a few filler lines — before the trailing real event or EOF.
+    // The 100 ms window loses 40 ms per reading, so it closes after a few
+    // filler lines — before the trailing real event or EOF.
     try std.testing.expectError(error.Timeout, stream.next());
 }
 
 test "next stops a stream once its aggregate byte budget is spent" {
-    // Each frame is a valid text delta — real progress that restarts the idle
-    // window — so only the aggregate byte budget, not the idle deadline, ends the
-    // flood. The budget spans two frames, so it trips on their sum rather than any
-    // single line, whose own read is separately bounded.
+    // Each frame is real progress that restarts the idle window, so only the
+    // aggregate byte budget ends the flood. It spans two frames, tripping on
+    // their sum rather than any single line.
     const frame =
         "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"m1\",\"delta\":\"chunk\"}\n";
     const body = frame ** 5;
@@ -474,18 +461,15 @@ test "next stops a stream once its aggregate byte budget is spent" {
     var stream = testStream(threaded.io(), &reader, 60_000, frame.len * 2);
     defer stream.reset();
 
-    // Each read charges the line plus its newline. Two frames land inside the
-    // budget; the third carries the running total past it, before EOF.
     try std.testing.expectEqualStrings("chunk", (try stream.next()).?.text);
     try std.testing.expectEqualStrings("chunk", (try stream.next()).?.text);
     try std.testing.expectError(error.StreamResponseTooLarge, stream.next());
 }
 
 test "next bounds a flood of eventless progress frames" {
-    // A `response.in_progress` is recognized progress with no event, so it loops
-    // inside `next`, restarting the idle window and never returning to the
-    // caller. The aggregate budget must still stop the flood — which an
-    // Agent-level counter, fed only returned events, could not.
+    // Every frame is `.progress`, so `next` loops without returning an event;
+    // the aggregate budget must still stop the flood — which an Agent-level
+    // counter, fed only returned events, could not.
     const frame = "data: {\"type\":\"response.in_progress\"}\n";
     const body = frame ** 100;
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
@@ -494,18 +478,14 @@ test "next bounds a flood of eventless progress frames" {
     var stream = testStream(threaded.io(), &reader, 60_000, frame.len * 3);
     defer stream.reset();
 
-    // A single `next` never returns an event (every frame is `.progress`); it
-    // consumes lines until the running total passes the ceiling.
     try std.testing.expectError(error.StreamResponseTooLarge, stream.next());
 }
 
 test "next reads a data frame larger than the reader buffer" {
-    // A reasoning item's `encrypted_content` far exceeds the reader buffer — the
-    // real oversized-frame case for this provider. Production reads through a
-    // 16 KiB `transfer_buffer`, so a longer line must stream into the growable
-    // line buffer rather than fit the reader buffer; the chunked test reader
-    // serves at most 64 bytes per fill, so one line spans several fills and
-    // decodes intact rather than failing `StreamTooLong`.
+    // A reasoning item's `encrypted_content` — this provider's real oversized
+    // frame — exceeds the 16 KiB production `transfer_buffer`, so the line must
+    // stream into the growable line buffer; the chunked reader serves at most
+    // 64 bytes per fill, so one line spans several fills.
     const blob = "A" ** 4000;
     const body = "data: {\"type\":\"response.output_item.done\",\"item\":" ++
         "{\"type\":\"reasoning\",\"id\":\"rs_1\",\"encrypted_content\":\"" ++ blob ++ "\"}}\n";
@@ -524,9 +504,8 @@ test "next reads a data frame larger than the reader buffer" {
 }
 
 test "next rejects a single frame larger than the stream budget" {
-    // The budget is smaller than one frame, so the line's own read trips the
-    // ceiling before the frame is buffered — the per-frame bound, distinct from
-    // the cumulative flood the budget also stops.
+    // One frame exceeds the whole budget, so its own read trips the ceiling
+    // before the frame is buffered — the per-frame bound.
     const body = "data: {\"type\":\"response.output_text.delta\"," ++
         "\"item_id\":\"msg_1\",\"delta\":\"chunk\"}\n";
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
@@ -539,8 +518,8 @@ test "next rejects a single frame larger than the stream budget" {
 }
 
 test "next ends the byte stream at a [DONE] sentinel" {
-    // The sentinel only ends the byte stream: whatever trails it is never
-    // decoded, so a deployment closing with [DONE] cannot fail the turn.
+    // Whatever trails the sentinel is never decoded, so a deployment closing
+    // with [DONE] cannot fail the turn.
     const body =
         "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"m1\",\"delta\":\"hi\"}\n" ++
         "data: [DONE]\n" ++
@@ -608,8 +587,7 @@ test "send tears down a request that times out awaiting the response head" {
 }
 
 test "next surfaces a stream truncated mid data-line as a retryable premature end" {
-    // The final chunk ends inside a `data:` frame; the truncated JSON must take
-    // the retryable premature-stream-end path, not a fatal parse error.
+    // A truncated final line must never be decoded as a frame.
     const body = "data: {\"type\":\"response.out";
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();

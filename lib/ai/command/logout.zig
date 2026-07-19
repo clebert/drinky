@@ -1,9 +1,6 @@
-//! `/logout`: open a picker over the logged-in subscription accounts (API-key
-//! accounts are environment-sourced and cannot be logged out). Selecting one
-//! hands the app a `logout` outcome, which drops that account's stored
-//! credentials; logging out the active account hands the session to the next
-//! authenticated account, or forces a login when none remains. There is no typed
-//! form — any argument is ignored and the picker opens regardless.
+//! `/logout`: picker over the logged-in subscription accounts (API-key accounts
+//! are environment-sourced and cannot be logged out); selecting one hands the
+//! app a `logout` outcome. Any argument is ignored.
 
 const std = @import("std");
 
@@ -41,8 +38,7 @@ pub fn select(context: *Context, index: usize) !Outcome {
 
 const account_count = std.enums.values(llm.Account).len;
 
-/// The logged-in subscription accounts, in enum order — the picker's rows,
-/// re-derived identically by `run` (to list) and `select` (to resolve an index).
+/// The picker's rows in enum order, re-derived identically by `run` and `select`.
 fn loggedIn(accounts: *const Accounts, buffer: []llm.Account) []llm.Account {
     var count: usize = 0;
     for (std.enums.values(llm.Account)) |account| {
@@ -64,7 +60,6 @@ test "the picker lists only logged-in subscriptions; none reports an error" {
                 for (pick.options) |option| gpa.free(option);
                 gpa.free(pick.options);
             }
-            // The env API key is not loggable-out, so only the openai subscription shows.
             try std.testing.expectEqual(@as(usize, 1), pick.options.len);
             try std.testing.expectEqualStrings("openai subscription", pick.options[0]);
         },

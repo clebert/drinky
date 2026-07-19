@@ -1,9 +1,7 @@
 //! Translates a neutral `llm.Request` into an OpenAI Responses API JSON body.
-//! Shared by the API-key (`openai_api`) and ChatGPT-subscription
-//! (`openai_subscription`) accounts — they differ only in transport base and
-//! auth, never wire shape. Holds no state and does no I/O: callers own the
-//! request and its backing memory; `Transport` sends the bytes this module
-//! produces.
+//! Shared by the API-key and ChatGPT-subscription accounts, which differ only
+//! in transport base and auth, never wire shape. Holds no state and does no
+//! I/O; `Transport` sends the bytes this module produces.
 
 const std = @import("std");
 
@@ -12,9 +10,8 @@ const models = @import("../models.zig");
 const writeParametersSchema = @import("../json.zig").writeParametersSchema;
 
 /// Serialize `request` into an owned JSON body; caller frees the result.
-/// `account` is the active openai account: it keys the per-model effort lookup
-/// (through its vendor) and guards which stored reasoning items are replayed —
-/// only blobs the exact same account produced, never a foreign one.
+/// `account` keys the per-model effort lookup and guards which stored
+/// reasoning items are replayed (see `writeItem`).
 pub fn serialize(gpa: std.mem.Allocator, request: llm.Request, account: llm.Account) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
@@ -29,20 +26,17 @@ pub fn serialize(gpa: std.mem.Allocator, request: llm.Request, account: llm.Acco
     try json.objectField("instructions");
     try json.write(request.system);
 
-    // OpenAI prompt caching is automatic and server-side (no per-block markers,
-    // unlike Anthropic): a prefix of >=1024 tokens is cached on its own. The key
-    // only steers routing — it is combined with the prompt-prefix hash so a
-    // session's growing requests land on the same cache — and the gpt-5.6 family
-    // needs it set for the more reliable matching. Omitted when the caller sends
-    // no key.
+    // OpenAI prompt caching is automatic and server-side (a >=1024-token prefix
+    // caches on its own). The key only steers routing — combined with the
+    // prompt-prefix hash so a session's growing requests land on the same
+    // cache — and the gpt-5.6 family needs it set for reliable matching.
     if (request.cache_key.len > 0) {
         try json.objectField("prompt_cache_key");
         try json.write(request.cache_key);
     }
 
-    // Reasoning-only models: steer depth with the named effort (resolved through
-    // the per-model map; the none level floors on the API's `none`) and ask for
-    // a readable summary. A null result — an unknown model — omits the config.
+    // Steer reasoning depth with the named effort; a null resolution (an
+    // unknown model) omits the config.
     if (effortName(request, account)) |effort| {
         try json.objectField("reasoning");
         try json.write(Reasoning{ .effort = effort });
@@ -72,9 +66,8 @@ pub fn serialize(gpa: std.mem.Allocator, request: llm.Request, account: llm.Acco
     try json.write("reasoning.encrypted_content");
     try json.endArray();
 
-    // Near pass-through: one input item per history item, in list order. OpenAI
-    // needs no envelope merging — assistant reasoning, text, and tool calls each
-    // stand as their own item — so unlike Anthropic there is nothing to group.
+    // Near pass-through: one input item per history item, in list order —
+    // unlike Anthropic, OpenAI needs no envelope merging.
     try json.objectField("input");
     try json.beginArray();
     for (request.items) |item| try writeItem(&json, gpa, item, account);
@@ -92,7 +85,7 @@ pub fn serialize(gpa: std.mem.Allocator, request: llm.Request, account: llm.Acco
 /// to null; every known openai model floors the none level on `none`, so it
 /// never does.
 fn effortName(request: llm.Request, account: llm.Account) ?[]const u8 {
-    const model = models.get(llm.provider(account), request.model) orelse return null;
+    const model = models.get(account.provider(), request.model) orelse return null;
     return model.effort.resolve(request.effort);
 }
 
@@ -281,8 +274,6 @@ test "prompt_cache_key is sent when set and omitted when empty" {
         try std.testing.expectEqualStrings("session-abc", parsed.value.object.get("prompt_cache_key").?.string);
     }
 
-    // The default empty key omits the field; OpenAI still caches automatically
-    // server-side.
     const no_key = try serialize(std.testing.allocator, .{
         .model = "gpt-5.6-sol",
         .tokens_max = 8,
@@ -318,7 +309,6 @@ test "tool_call arguments serialize as a JSON string, error output is prefixed" 
     defer parsed.deinit();
     const input = parsed.value.object.get("input").?.array.items;
 
-    // arguments is a JSON *string*, so it parses back as a string carrying JSON.
     try std.testing.expectEqualStrings("function_call", input[0].object.get("type").?.string);
     try std.testing.expectEqualStrings("{\"path\":\"a.zig\"}", input[0].object.get("arguments").?.string);
     try std.testing.expectEqualStrings("{}", input[1].object.get("arguments").?.string);
@@ -347,9 +337,7 @@ test "reasoning replays only the active account's blobs, dropping foreign and bl
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
     defer parsed.deinit();
     const input = parsed.value.object.get("input").?.array.items;
-    // Only the first reasoning item (this account's origin, has a blob) and the
-    // message survive; a different account's item and the blobless one are
-    // dropped — replay is an exact account match, even within the same vendor.
+    // Only this account's blob-carrying reasoning item and the message survive.
     try std.testing.expectEqual(@as(usize, 2), input.len);
     try std.testing.expectEqualStrings("reasoning", input[0].object.get("type").?.string);
     try std.testing.expectEqualStrings("rs_1", input[0].object.get("id").?.string);
@@ -383,11 +371,8 @@ test "assistant text uses output_text, unknown model omits reasoning" {
     try std.testing.expectEqualStrings("output_text", content.get("type").?.string);
 }
 
-// A representative multi-round conversation exercising every serializer path:
-// interleaved reasoning/tool_call/text, a redacted-style blob-only reasoning
-// item, an error tool result, an assistant turn, and a foreign reasoning item
-// that must be dropped. Byte-identity guards the wire shape against drift the
-// structural tests above would miss.
+// A multi-round conversation exercising every serializer path. Byte-identity
+// guards the wire shape against drift the structural tests above would miss.
 const golden_items = [_]llm.Item{
     .{ .message = .{ .role = .user, .text = "first" } },
     .{ .reasoning = .{ .text = "think", .blob = "enc1", .id = "rs_1", .origin = .openai_api } },

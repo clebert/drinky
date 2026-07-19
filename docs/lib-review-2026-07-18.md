@@ -135,35 +135,35 @@ duplication claims double-count somewhat (realistic net win ≈ 1,500 lines).
 
 ## Comments
 
-- [ ] `lib/ai/Agent.zig:1` — Verbose comments throughout Agent.zig (~55 lines)
-- [ ] `lib/ai/Steering.zig:1` — Steering header and test narration are 2-3x terse length (~12 lines)
-- [ ] `lib/ai/anthropic/Transport.zig:37` — Idle-window/filler rationale restated 4+ times in multi-line paragraphs (~40 lines)
-- [ ] `lib/ai/anthropic/wire.zig:70` — Serializer comments restate the same rules two or three times each (~18 lines)
-- [ ] `lib/ai/auth_store.zig:82` — The never-wipe-siblings rationale is stated six times (~8 lines)
-- [ ] `lib/ai/command/Context.zig:1` — Header speculates about future growth; accounts field doc restates the Accounts type (~5 lines)
-- [ ] `lib/ai/command/login.zig:1` — 8-line //! header restates the FEATURES.md /login entry; verbose narration below (~16 lines)
-- [ ] `lib/ai/command/logout.zig:1` — 6-line //! header restates the FEATURES.md /logout entry (~7 lines)
-- [ ] `lib/ai/command/model.zig:1` — //! header duplicates the FEATURES.md /model entry; collect doc and test comments over-explain (~8 lines)
-- [ ] `lib/ai/command/outcome.zig:1` — Multi-sentence ownership paragraphs where one terse line each suffices (~8 lines)
-- [ ] `lib/ai/command/root.zig:1` — Doc comments restate signatures: find, run, and half the header (~7 lines)
-- [ ] `lib/ai/models.zig:31` — EffortMap's three awkward-ends cases are narrated three times over (~8 lines)
-- [ ] `lib/ai/net.zig:1` — Module header and decl docs restate the same rationale up to four times (~15 lines)
-- [ ] `lib/ai/openai/wire.zig:32` — Five-line rationale blocks and test comments restating asserts (~12 lines)
-- [ ] `lib/ai/tool/root.zig:22` — Barrier rationale stated twice; //! header over-explains the registry (~6 lines)
-- [ ] `lib/ai/tool/walk.zig:37` — Verbose doc paragraphs and test narration restate FEATURES.md and the asserts (~26 lines)
-- [ ] `lib/terminal/Tty.zig:12` — Multi-sentence comments where one terse WHY sentence carries it (~8 lines)
-- [ ] `lib/terminal/View.zig:1` — 44-line module header and multi-sentence field/test comments restate FEATURES.md and the function docs (~40 lines)
-- [ ] `lib/terminal/escape.zig:1` — Four files lack the //! module header every other file carries
-- [ ] `lib/terminal/width.zig:120` — Verbose doc paragraphs and assert-narrating test comments in width.zig (~13 lines)
+- [x] `lib/ai/Agent.zig:1` — Verbose comments throughout Agent.zig (~55 lines)
+- [x] `lib/ai/Steering.zig:1` — Steering header and test narration are 2-3x terse length (~12 lines)
+- [x] `lib/ai/anthropic/Transport.zig:37` — Idle-window/filler rationale restated 4+ times in multi-line paragraphs (~40 lines)
+- [x] `lib/ai/anthropic/wire.zig:70` — Serializer comments restate the same rules two or three times each (~18 lines)
+- [x] `lib/ai/auth_store.zig:82` — The never-wipe-siblings rationale is stated six times (~8 lines)
+- [x] `lib/ai/command/Context.zig:1` — Header speculates about future growth; accounts field doc restates the Accounts type (~5 lines)
+- [x] `lib/ai/command/login.zig:1` — 8-line //! header restates the FEATURES.md /login entry; verbose narration below (~16 lines)
+- [x] `lib/ai/command/logout.zig:1` — 6-line //! header restates the FEATURES.md /logout entry (~7 lines)
+- [x] `lib/ai/command/model.zig:1` — //! header duplicates the FEATURES.md /model entry; collect doc and test comments over-explain (~8 lines)
+- [x] `lib/ai/command/outcome.zig:1` — Multi-sentence ownership paragraphs where one terse line each suffices (~8 lines)
+- [x] `lib/ai/command/root.zig:1` — Doc comments restate signatures: find, run, and half the header (~7 lines)
+- [x] `lib/ai/models.zig:31` — EffortMap's three awkward-ends cases are narrated three times over (~8 lines)
+- [x] `lib/ai/net.zig:1` — Module header and decl docs restate the same rationale up to four times (~15 lines)
+- [x] `lib/ai/openai/wire.zig:32` — Five-line rationale blocks and test comments restating asserts (~12 lines)
+- [x] `lib/ai/tool/root.zig:22` — Barrier rationale stated twice; //! header over-explains the registry (~6 lines)
+- [x] `lib/ai/tool/walk.zig:37` — Verbose doc paragraphs and test narration restate FEATURES.md and the asserts (~26 lines)
+- [x] `lib/terminal/Tty.zig:12` — Multi-sentence comments where one terse WHY sentence carries it (~8 lines)
+- [x] `lib/terminal/View.zig:1` — 44-line module header and multi-sentence field/test comments restate FEATURES.md and the function docs (~40 lines)
+- [x] `lib/terminal/escape.zig:1` — Four files lack the //! module header every other file carries
+- [x] `lib/terminal/width.zig:120` — Verbose doc paragraphs and assert-narrating test comments in width.zig (~13 lines)
 
 ## Style & spec drift
 
-- [ ] `FEATURES.md:244` **medium** — OpenAI transport section omits the implemented subscription (Codex) request fork
-- [ ] `FEATURES.md:59` **low** — Reset-trigger list omits the external-output invalidation reset
-- [ ] `FEATURES.md:133` **low** — Undocumented: effort none drops stored reasoning from Anthropic requests
-- [ ] `FEATURES.md:234` **low** — OpenAI decode entry omits streamed API-error surfacing
-- [ ] `lib/ai/command/outcome.zig:22` **low** — Same ok/err report enum named Status in commands but Outcome in tools
-- [ ] `lib/ai/llm.zig:64` **low** — Account's vendor lookup is a free function while its siblings are methods
+- [x] `FEATURES.md:244` **medium** — OpenAI transport section omits the implemented subscription (Codex) request fork
+- [x] `FEATURES.md:59` **low** — Reset-trigger list omits the external-output invalidation reset
+- [x] `FEATURES.md:133` **low** — Undocumented: effort none drops stored reasoning from Anthropic requests
+- [x] `FEATURES.md:234` **low** — OpenAI decode entry omits streamed API-error surfacing
+- [x] `lib/ai/command/outcome.zig:22` **low** — Same ok/err report enum named Status in commands but Outcome in tools
+- [x] `lib/ai/llm.zig:64` **low** — Account's vendor lookup is a free function while its siblings are methods
 - [x] `lib/terminal/width.zig:49` **low** — Allocator/io parameter position drifts from the dominant gpa-first order
 
 ## Notes
@@ -190,6 +190,6 @@ Follow-ups surfaced while fixing:
   dropped app-side; the Agent-side errdefer re-push is fixed, the App path is not verified.
 - [ ] `lib/terminal/Input.zig` — a CSI whose final byte never arrives still buffers unboundedly
   (same family as the fixed paste bound; needs an adversarial byte-stream bound).
-- [ ] The two transports' `retryable()` now differ in idiom (`@intFromEnum/100 == 5` vs
+- [x] The two transports' `retryable()` now differ in idiom (`@intFromEnum/100 == 5` vs
   `.class() == .server_error`; `.class()` maps out-of-range statuses to server_error) — unify
   when the SSE engine dedups in phase 3.

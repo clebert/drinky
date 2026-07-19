@@ -58,7 +58,7 @@ commit history, `BACKLOG.md` (planned work), and `docs/`.
   native scrollback.
 - Falls back to a single-page reprint or a full reset (clear screen and scrollback) when an
   incremental repaint cannot express the change: a change above the viewport, a resize, a page-count
-  change, a shrunk tail, or no shared anchor.
+  change, a shrunk tail, an external-output invalidation, or no shared anchor.
 - Repaints only the caret when rows are unchanged, and emits cursor show/hide only when visibility
   changes.
 - Steady-state repaints allocate nothing.
@@ -213,7 +213,8 @@ commit history, `BACKLOG.md` (planned work), and `docs/`.
   supplies its cumulative usage and a stop reason gating termination.
 - When reasoning is enabled, requests adaptive, summarized extended thinking at the resolved effort
   level so the model sizes its own budget while the output ceiling stays fixed; omitted when effort
-  is none, the model has no reasoning, or the model is unknown.
+  is none (which also drops stored reasoning from the request), the model has no reasoning, or the
+  model is unknown.
 - Forks by account: the subscription path adds the Claude Code identity (a leading system block and
   OAuth identity headers) and authorizes with a Bearer token; the API-key path omits both and
   authorizes with `x-api-key`. Both request an unencoded response so SSE frames arrive verbatim.
@@ -232,10 +233,10 @@ commit history, `BACKLOG.md` (planned work), and `docs/`.
 - Builds each request for the Responses API from the same conversation items, sending each item as
   its own input entry (never merged), with the system prompt as instructions and the tools as
   function tools.
-- Streams responses over SSE, decoding them into the neutral reply events plus usage;
-  `response.completed` and `response.incomplete` are authoritative terminal events, usage is
-  folded when their response object supplies it, and an optional `[DONE]` compatibility sentinel
-  only ends the byte stream.
+- Streams responses over SSE, decoding them into the neutral reply events plus usage and API
+  errors; `response.completed` and `response.incomplete` are authoritative terminal events, usage
+  is folded when their response object supplies it, and an optional `[DONE]` compatibility
+  sentinel only ends the byte stream.
 - When reasoning is enabled, requests a summarized reasoning stream at the resolved effort level and
   round-trips each reasoning item's encrypted payload and id verbatim so later turns replay it; no
   server-side conversation state is retained between requests.
@@ -243,7 +244,9 @@ commit history, `BACKLOG.md` (planned work), and `docs/`.
   stable per-conversation cache key so a session's growing requests route to one cache.
 - Partitions the prompt token count into cache-read, cache-write, and uncached buckets, so each
   token is billed once at its bucket's rate.
-- Authorized with a platform API key (Bearer).
+- Forks by account: the subscription path targets the ChatGPT (Codex) backend and adds the client
+  and account identity headers; the API-key path targets the platform API without them. Both
+  authorize with a Bearer token.
 
 ### Authentication
 
