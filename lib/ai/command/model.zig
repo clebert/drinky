@@ -39,7 +39,7 @@ pub fn run(context: *Context) !Outcome {
         }
     }
     return .{ .pick = .{
-        .command = name,
+        .select = select,
         .title = "Select a model",
         .options = try options.toOwnedSlice(),
         .current = current,

@@ -17,7 +17,7 @@ pub fn run(context: *Context) !Outcome {
     for (std.enums.values(llm.Account)) |account|
         try options.print("{s}{s}", .{ account.label(), marker(context, account) });
     return .{ .pick = .{
-        .command = name,
+        .select = select,
         .title = "Log in to an account",
         .options = try options.toOwnedSlice(),
         .current = null,

@@ -827,7 +827,7 @@ fn handlePickerKey(self: *App, event: terminal.Input.Key) !void {
 fn confirmPicker(self: *App) !void {
     const picking = &self.session.mode.picking;
     var context: ai.command.Context = .{ .gpa = self.gpa, .agent = &self.agent, .accounts = &self.accounts };
-    const outcome = try ai.command.select(&context, picking.command, picking.picker.selectedIndex());
+    const outcome = try picking.select(&context, picking.picker.selectedIndex());
     self.session.closePicker();
     try self.applyOutcome(outcome);
 }
@@ -1262,12 +1262,15 @@ test "esc, ctrl+c, and ctrl+d each dismiss the picker as cancelled" {
     for (keys, 0..) |key, index| {
         const options = try gpa.alloc([]const u8, 1);
         options[0] = try gpa.dupe(u8, "alpha");
-        try app.session.applyOutcome(.{ .pick = .{
-            .command = "/login",
-            .title = "Log in",
-            .options = options,
-            .current = null,
-        } });
+        try app.session.applyOutcome(.{
+            .pick = .{
+                // Never called: every key under test cancels.
+                .select = undefined,
+                .title = "Log in",
+                .options = options,
+                .current = null,
+            },
+        });
         try app.handlePickerKey(key);
         try std.testing.expect(app.session.mode == .prompt);
         const feedback = app.session.transcript.blocks()[index].feedback;

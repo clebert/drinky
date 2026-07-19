@@ -22,7 +22,7 @@ pub fn run(context: *Context) !Outcome {
     errdefer options.deinit();
     for (accounts) |account| try options.print("{s}", .{account.label()});
     return .{ .pick = .{
-        .command = name,
+        .select = select,
         .title = "Log out of an account",
         .options = try options.toOwnedSlice(),
         .current = null,

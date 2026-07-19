@@ -4,6 +4,7 @@
 const std = @import("std");
 
 const llm = @import("../llm.zig");
+const Context = @import("Context.zig");
 
 pub const Outcome = union(enum) {
     feedback: Feedback,
@@ -26,11 +27,11 @@ pub const Outcome = union(enum) {
         is_error: bool,
     };
 
-    /// A request to open a picker; a selection routes back via `command.select`.
+    /// A request to open a picker; a selection routes straight to `select`.
     /// `options` (each row and the slice) transfers to the app, freed when the
     /// picker closes; `current`, if set, is the row to mark and preselect.
     pub const Pick = struct {
-        command: []const u8,
+        select: *const fn (*Context, usize) anyerror!Outcome,
         title: []const u8,
         options: []const []const u8,
         current: ?usize,

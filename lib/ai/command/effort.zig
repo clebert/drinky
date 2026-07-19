@@ -21,7 +21,7 @@ pub fn run(context: *Context) !Outcome {
         if (level == context.agent.effort) current = index;
     }
     return .{ .pick = .{
-        .command = name,
+        .select = select,
         .title = "Select reasoning effort",
         .options = try options.toOwnedSlice(),
         .current = current,
@@ -49,7 +49,7 @@ test "the picker lists every level, preselecting the current one" {
                 for (pick.options) |option| gpa.free(option);
                 gpa.free(pick.options);
             }
-            try std.testing.expectEqualStrings("effort", pick.command);
+            try std.testing.expect(pick.select == &select);
             try std.testing.expectEqual(levels.len, pick.options.len);
             try std.testing.expectEqualStrings("high", pick.options[pick.current.?]);
         },

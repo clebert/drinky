@@ -1,12 +1,11 @@
 //! Slash-command registry, mirroring the tool registry: each command module
-//! exposes `name`/`run`/`select` and is registered below.
+//! exposes `name`/`run` and is registered below.
 
 const std = @import("std");
 
 pub const Context = @import("Context.zig");
 pub const Outcome = @import("outcome.zig").Outcome;
 
-const llm = @import("../llm.zig");
 const testing = @import("testing.zig");
 
 const effort = @import("effort.zig");
@@ -17,14 +16,13 @@ const model = @import("model.zig");
 const Entry = struct {
     name: []const u8,
     run: *const fn (*Context) anyerror!Outcome,
-    select: *const fn (*Context, usize) anyerror!Outcome,
 };
 
 const registry = [_]Entry{
-    .{ .name = model.name, .run = model.run, .select = model.select },
-    .{ .name = effort.name, .run = effort.run, .select = effort.select },
-    .{ .name = login.name, .run = login.run, .select = login.select },
-    .{ .name = logout.name, .run = logout.run, .select = logout.select },
+    .{ .name = model.name, .run = model.run },
+    .{ .name = effort.name, .run = effort.run },
+    .{ .name = login.name, .run = login.run },
+    .{ .name = logout.name, .run = logout.run },
 };
 
 /// Dispatch a `/`-prefixed input line to its command; an unknown command is an error.
@@ -32,24 +30,10 @@ pub fn run(context: *Context, line: []const u8) !Outcome {
     const body = line[1..];
     // Editor input can carry interior newlines (Shift+Enter, paste).
     const name = body[0 .. std.mem.indexOfAny(u8, body, " \t\r\n") orelse body.len];
-    const entry = find(name) orelse
-        return Outcome.report(context.gpa, .err, "unknown command: /{s}", .{name});
-    return entry.run(context);
-}
-
-/// Apply the picker choice at row `index`: the command `name` re-derives its
-/// option list, so a selection never routes through a typed argument.
-pub fn select(context: *Context, name: []const u8, index: usize) !Outcome {
-    const entry = find(name) orelse
-        return Outcome.report(context.gpa, .err, "unknown command: /{s}", .{name});
-    return entry.select(context, index);
-}
-
-fn find(name: []const u8) ?*const Entry {
     for (&registry) |*entry| {
-        if (std.mem.eql(u8, name, entry.name)) return entry;
+        if (std.mem.eql(u8, name, entry.name)) return entry.run(context);
     }
-    return null;
+    return Outcome.report(context.gpa, .err, "unknown command: /{s}", .{name});
 }
 
 test "unknown command is reported" {
@@ -69,21 +53,10 @@ test "run routes a known command, ignoring the argument tail" {
                 for (pick.options) |option| gpa.free(option);
                 gpa.free(pick.options);
             }
-            try std.testing.expectEqualStrings("effort", pick.command);
+            try std.testing.expect(pick.select == &effort.select);
         },
         else => return error.ExpectedPick,
     }
-}
-
-test "select reaches the named command's entry, reporting an unknown name" {
-    const gpa = std.testing.allocator;
-    var agent = testing.agent(gpa, .{ .anthropic_subscription = undefined });
-    defer agent.deinit();
-    var context: Context = .{ .gpa = gpa, .agent = &agent, .accounts = undefined };
-
-    try Outcome.expectFeedback(try select(&context, "effort", 4), .ok);
-    try std.testing.expectEqual(llm.Effort.xhigh, agent.effort);
-    try Outcome.expectFeedback(try select(&context, "nope", 0), .err);
 }
 
 test "a newline delimits the command name like a space" {

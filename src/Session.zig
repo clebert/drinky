@@ -78,8 +78,8 @@ const ActiveTool = struct { name: []const u8, input_json: []const u8, box: []con
 
 const Picking = struct {
     picker: ui.Picker,
-    /// Command re-run with the chosen option when the picker is confirmed.
-    command: []const u8,
+    /// Selection handler called with the chosen row when the picker is confirmed.
+    select: *const fn (*ai.command.Context, usize) anyerror!ai.command.Outcome,
 };
 
 /// A turn worker's message to the render consumer, tagged with the generation it
@@ -252,7 +252,7 @@ fn openPicker(self: *Session, pick: ai.command.Outcome.Pick) !void {
     // held before replacing it, so opening a picker over a live turn or picker
     // cannot leak.
     self.deinitMode();
-    self.mode = .{ .picking = .{ .picker = picker, .command = pick.command } };
+    self.mode = .{ .picking = .{ .picker = picker, .select = pick.select } };
 }
 
 /// Leave picker mode, freeing the picker; a no-op in any other mode.
