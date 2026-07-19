@@ -18,13 +18,13 @@ const ai = @import("ai");
 
 const Config = @This();
 
-timeouts: ai.net.Timeouts,
-retry: ai.net.Retry,
-default_models: DefaultModels,
+timeouts: ai.net.Timeouts = .{},
+retry: ai.net.Retry = .{},
+default_models: DefaultModels = .{},
 /// Configured default-model names that did not resolve (unknown, or a model of
 /// the wrong vendor for their account), kept so the app can tell the user their
 /// line was ignored. Empty on the built-in default. Owned; freed by `deinit`.
-dropped_defaults: []const DroppedDefault,
+dropped_defaults: []const DroppedDefault = &.{},
 
 /// The configured default model per account, resolved against the compiled model
 /// table (an unset or unknown name is null, so the caller falls back to a
@@ -38,10 +38,7 @@ pub const DefaultModels = struct {
 
     pub fn get(self: *const DefaultModels, account: ai.llm.Account) ?ai.models.Model {
         return switch (account) {
-            .anthropic_api => self.anthropic_api,
-            .anthropic_subscription => self.anthropic_subscription,
-            .openai_api => self.openai_api,
-            .openai_subscription => self.openai_subscription,
+            inline else => |tag| @field(self, @tagName(tag)),
         };
     }
 };
@@ -55,12 +52,6 @@ pub const DroppedDefault = struct {
 
 const timeouts_default: ai.net.Timeouts = .{};
 const retry_default: ai.net.Retry = .{};
-const default: Config = .{
-    .timeouts = timeouts_default,
-    .retry = retry_default,
-    .default_models = .{},
-    .dropped_defaults = &.{},
-};
 
 /// Free the owned dropped-default names. A no-op on the built-in default (its
 /// slice is empty).
@@ -96,7 +87,7 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, home: []const u8) !Config {
     const path = try std.fs.path.join(gpa, &.{ home, ".pith", "config.json" });
     defer gpa.free(path);
     const data = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .unlimited) catch |err| switch (err) {
-        error.FileNotFound => return default,
+        error.FileNotFound => return .{},
         else => return err,
     };
     defer gpa.free(data);

@@ -4,7 +4,7 @@
 //! area as the editor, so it sits where the editor would. It owns its option
 //! strings and the composed `content` buffer (freed on `deinit`) and borrows the
 //! title. Navigation moves the selection; `reflow` windows a tall list to keep
-//! it in view. The caller reads `selectedIndex` and acts on the selected row.
+//! it in view. The caller reads `cursor` and acts on the selected row.
 
 const std = @import("std");
 
@@ -81,11 +81,6 @@ pub fn moveDown(self: *Picker) !void {
     try self.compose();
 }
 
-/// The selected row's index, applied by the command that opened the picker.
-pub fn selectedIndex(self: *const Picker) usize {
-    return self.cursor;
-}
-
 /// Re-clamp the scroll offset so the highlighted option's wrapped row stays
 /// inside the visible window. Call once per repaint, passing the same `columns`
 /// and `viewport_rows` that `render` and `rows` will use, so all three agree.
@@ -119,7 +114,7 @@ pub fn render(self: *const Picker, placement: *const paint.Placement, viewport_r
         .hidden_above = self.scroll,
         .shown = visible,
         .hidden_below = total_body - self.scroll - visible,
-        .maybe_line_styles = self.line_styles.items,
+        .line_styles = self.line_styles.items,
     });
 }
 
@@ -183,11 +178,11 @@ test "navigation stays in bounds and the cursor tracks the selection" {
     defer picker.deinit();
 
     try picker.moveUp();
-    try std.testing.expectEqual(@as(usize, 0), picker.selectedIndex());
+    try std.testing.expectEqual(@as(usize, 0), picker.cursor);
     try picker.moveDown();
-    try std.testing.expectEqual(@as(usize, 1), picker.selectedIndex());
+    try std.testing.expectEqual(@as(usize, 1), picker.cursor);
     try picker.moveDown();
-    try std.testing.expectEqual(@as(usize, 1), picker.selectedIndex());
+    try std.testing.expectEqual(@as(usize, 1), picker.cursor);
 }
 
 test "compose lays out the title, hint, options, and the current marker" {

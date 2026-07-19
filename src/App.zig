@@ -6,13 +6,8 @@
 //! Network and stream I/O run off the UI thread. Four `io.concurrent` producers
 //! feed one `std.Io.Queue(Session.UiEvent)`: a long-lived input reader
 //! (stdin → `.keys`), the current turn worker (`agent.run` → generation-tagged
-//! `.turn` events), a one-shot frame timer
-//! (sleep → `.tick`), and a SIGWINCH watcher (self-pipe → `.resize`). The
-//! consumer blocks on the channel, drains a coalesced batch, applies each event
-//! to the `Session` (marking it dirty, never painting), and paints only when it
-//! drains a `.tick`. A tick is armed whenever the session is dirty or a turn
-//! animates and none is pending, so a clean idle interface arms no tick and stays
-//! inert until a key, a stream event, or a `.resize` marks it dirty again.
+//! `.turn` events), a one-shot frame timer (sleep → `.tick`), and a SIGWINCH
+//! watcher (self-pipe → `.resize`).
 //!
 //! The consumer-owned model and rendering — transcript, live tail, editor, view,
 //! stats/model snapshots, and the `applyTurnEvent`/`paint` seam — live in
@@ -258,7 +253,7 @@ pub fn run(self: *App, gpa: std.mem.Allocator, io: std.Io, home: []const u8, api
     // the user chooses how to sign in.
     if (!self.signedIn()) {
         try self.report(.ok, "no account is signed in — choose one to log in", .{});
-        try self.openLoginPicker();
+        try self.runCommand("/login");
     }
     try self.refresh();
     self.last_paint_ms = self.nowMs();
@@ -275,23 +270,27 @@ pub fn run(self: *App, gpa: std.mem.Allocator, io: std.Io, home: []const u8, api
 /// buffered. Runs before `tty.deinit`, so the reader has stopped touching stdin
 /// before termios is restored.
 fn shutdownTasks(self: *App) void {
-    if (self.turn_future) |*future| {
-        future.cancel(self.io);
-        self.turn_future = null;
-    }
-    if (self.input_future) |*future| {
-        future.cancel(self.io);
-        self.input_future = null;
-    }
-    if (self.resize_future) |*future| {
-        future.cancel(self.io);
-        self.resize_future = null;
-    }
-    if (self.tick_future) |*future| {
-        future.cancel(self.io);
-        self.tick_future = null;
-    }
+    self.cancelFuture(&self.turn_future);
+    self.cancelFuture(&self.input_future);
+    self.cancelFuture(&self.resize_future);
+    self.cancelFuture(&self.tick_future);
     self.drainQueue();
+}
+
+/// Cancel and reap `maybe_future`'s task, clearing the handle; a no-op when null.
+fn cancelFuture(self: *App, maybe_future: *?std.Io.Future(void)) void {
+    if (maybe_future.*) |*future| {
+        future.cancel(self.io);
+        maybe_future.* = null;
+    }
+}
+
+/// Reap `maybe_future`'s finished task, clearing the handle; a no-op when null.
+fn awaitFuture(self: *App, maybe_future: *?std.Io.Future(void)) void {
+    if (maybe_future.*) |*future| {
+        future.await(self.io);
+        maybe_future.* = null;
+    }
 }
 
 /// Free every event still buffered on the channel. Only safe once the producers
@@ -317,23 +316,17 @@ fn runLoop(self: *App) !void {
         };
         const ticked = try self.applyBatch(batch[0..count]);
         if (!self.session.animating()) {
-            if (self.turn_future) |*future| {
-                future.await(self.io);
-                self.turn_future = null;
-            }
+            self.awaitFuture(&self.turn_future);
             // A steering message that landed too late to fold into the turn just
             // ended opens the next turn on its own. Gating on the display mirror is
             // safe: `.steering_consumed` precedes `.turn_ended` in the channel, so
             // the mirror and the queue are in sync once the mode flips to prompt.
-            if (self.session.mode == .prompt and !self.session.steeringEmpty())
+            if (self.session.mode == .prompt and self.session.steering.items.len > 0)
                 try self.startSteeringTurn();
         }
         if (ticked) {
             self.tick_pending = false;
-            if (self.tick_future) |*future| {
-                future.await(self.io);
-                self.tick_future = null;
-            }
+            self.awaitFuture(&self.tick_future);
             if (self.session.advanceFrame()) {
                 try self.refresh();
                 self.session.dirty = false;
@@ -452,18 +445,13 @@ fn signedIn(self: *const App) bool {
     return self.agent.client != null;
 }
 
-/// The compiled fallback model for `account`'s vendor.
-fn compiledDefault(account: ai.llm.Account) ai.models.Model {
-    return switch (account.provider()) {
-        .anthropic => anthropic_default,
-        .openai => openai_default,
-    };
-}
-
 /// The model to start `account` on: the configured default, else the compiled
 /// per-vendor fallback.
 fn defaultModel(self: *const App, account: ai.llm.Account) ai.models.Model {
-    const base = self.default_models.get(account) orelse compiledDefault(account);
+    const base = self.default_models.get(account) orelse switch (account.provider()) {
+        .anthropic => anthropic_default,
+        .openai => openai_default,
+    };
     return self.accounts.resolveModel(account, base);
 }
 
@@ -486,7 +474,7 @@ fn handleKey(self: *App, event: terminal.Input.Key) !void {
         .ctrl => |letter| switch (letter) {
             'c' => {
                 self.clearOrQuit();
-                if (self.running) self.session.markDirty();
+                if (self.running) self.session.dirty = true;
             },
             'd' => if (self.session.editor.content().len == 0) {
                 self.running = false;
@@ -519,7 +507,7 @@ fn editKey(self: *App, event: terminal.Input.Key) !bool {
         },
         else => return false,
     }
-    self.session.markDirty();
+    self.session.dirty = true;
     return true;
 }
 
@@ -553,7 +541,7 @@ fn submitSteering(self: *App) !void {
     try self.agent.steering.push(text);
     try self.session.queueSteering(text);
     self.session.editor.clear();
-    self.session.markDirty();
+    self.session.dirty = true;
 }
 
 /// Alt+Up during a turn: pull the whole steering queue back into the editor to
@@ -562,7 +550,7 @@ fn pullSteering(self: *App) !void {
     const joined = (try self.takeSteering()) orelse return;
     defer self.gpa.free(joined);
     try self.appendToEditor(joined);
-    self.session.markDirty();
+    self.session.dirty = true;
 }
 
 /// Take every not-yet-delivered steering message as one blank-line-joined
@@ -596,7 +584,7 @@ fn startSteeringTurn(self: *App) !void {
     const joined = (try self.takeSteering()) orelse return;
     defer self.gpa.free(joined);
     try self.session.transcript.append(.user, false, joined);
-    self.session.markDirty();
+    self.session.dirty = true;
     try self.runTurn(joined);
 }
 
@@ -605,10 +593,7 @@ fn startSteeringTurn(self: *App) !void {
 /// queued retain its generation and cannot affect a successor.
 fn cancelTurn(self: *App) !void {
     // Cancel first (which joins the worker), so nothing below races a drain.
-    if (self.turn_future) |*future| {
-        future.cancel(self.io);
-        self.turn_future = null;
-    }
+    self.cancelFuture(&self.turn_future);
     // Restore pending steering from the display mirror, not the channel: a
     // message the worker folded right before the cancel is rolled back
     // agent-side and its `.steering_consumed` dies at the generation gate, so
@@ -661,7 +646,7 @@ fn submit(self: *App) !void {
     const text = try self.gpa.dupe(u8, trimmed);
     defer self.gpa.free(text);
     self.session.editor.clear();
-    self.session.markDirty();
+    self.session.dirty = true;
 
     if (std.mem.startsWith(u8, text, "/")) {
         try self.runCommand(text);
@@ -679,10 +664,7 @@ fn runTurn(self: *App, text: []const u8) !void {
     // A worker that finished earlier in this same batch (its `.turn_ended` already
     // flipped the mode back to prompt) is not reaped until after the batch, so
     // reap it here before its handle is overwritten.
-    if (self.turn_future) |*future| {
-        future.await(self.io);
-        self.turn_future = null;
-    }
+    self.awaitFuture(&self.turn_future);
     const generation = try self.reserveTurnGeneration();
     const owned = try self.gpa.dupe(u8, text);
     errdefer self.gpa.free(owned);
@@ -721,13 +703,6 @@ fn applyOutcome(self: *App, outcome: ai.command.Outcome) !void {
     self.session.signed_in = self.signedIn();
 }
 
-/// Open the login picker — the same picker `/login` opens — so the user chooses
-/// how to sign in. Used at startup and after logging out the last account.
-fn openLoginPicker(self: *App) !void {
-    var context: ai.command.Context = .{ .gpa = self.gpa, .agent = &self.agent, .accounts = &self.accounts };
-    try self.session.applyOutcome(try ai.command.run(&context, "/login"));
-}
-
 /// Log in to a subscription `account`, then switch to it on its default model.
 /// A failed login leaves the current account untouched.
 fn loginAccount(self: *App, account: ai.llm.Account) !void {
@@ -735,24 +710,15 @@ fn loginAccount(self: *App, account: ai.llm.Account) !void {
 }
 
 fn finishLogin(self: *App, account: ai.llm.Account, result: anyerror!void) !void {
-    result catch |err| switch (err) {
-        error.Canceled => return error.Canceled,
-        error.CallbackTimeout => return self.report(
-            .err,
-            "login timed out waiting for the browser callback",
-            .{},
-        ),
-        error.CallbackRequestTooLarge => return self.report(
-            .err,
-            "login failed: browser callback request was too large",
-            .{},
-        ),
-        error.CallbackTimeoutUnavailable => return self.report(
-            .err,
-            "login failed: browser callback deadline was unavailable",
-            .{},
-        ),
-        else => return self.report(.err, "login failed: {s}", .{@errorName(err)}),
+    result catch |err| {
+        const message = switch (err) {
+            error.Canceled => return error.Canceled,
+            error.CallbackTimeout => "login timed out waiting for the browser callback",
+            error.CallbackRequestTooLarge => "login failed: browser callback request was too large",
+            error.CallbackTimeoutUnavailable => "login failed: browser callback deadline was unavailable",
+            else => return self.report(.err, "login failed: {s}", .{@errorName(err)}),
+        };
+        return self.report(.err, "{s}", .{message});
     };
     self.adopt(account);
     try self.report(.ok, "logged in to {s}; using {s}", .{ account.label(), self.agent.model.name });
@@ -778,7 +744,10 @@ fn logoutAccount(self: *App, account: ai.llm.Account) !void {
     // no forced browser, no loop.
     self.agent.signOut();
     try self.report(.ok, "logged out of {s}; no account is signed in — choose one to log in", .{account.label()});
-    try self.openLoginPicker();
+    // Through the session, not `runCommand`: routing back through `applyOutcome`
+    // would cycle the inferred error sets (runCommand → applyOutcome → here).
+    var context: ai.command.Context = .{ .gpa = self.gpa, .agent = &self.agent, .accounts = &self.accounts };
+    try self.session.applyOutcome(try ai.command.run(&context, "/login"));
 }
 
 /// Run an account's interactive OAuth flow, suspending the raw-mode interface
@@ -790,7 +759,7 @@ fn runOauth(self: *App, account: ai.llm.Account) !void {
     defer {
         self.tty.enterRaw() catch {};
         self.session.view.invalidate();
-        self.session.markDirty();
+        self.session.dirty = true;
     }
     var prompt: OauthPrompt = .{ .writer = self.tty.writer() };
     try self.accounts.login(account, &prompt);
@@ -820,14 +789,14 @@ fn handlePickerKey(self: *App, event: terminal.Input.Key) !void {
         },
         else => return,
     }
-    self.session.markDirty();
+    self.session.dirty = true;
 }
 
 /// Apply the highlighted picker row through its command's selection handler.
 fn confirmPicker(self: *App) !void {
     const picking = &self.session.mode.picking;
     var context: ai.command.Context = .{ .gpa = self.gpa, .agent = &self.agent, .accounts = &self.accounts };
-    const outcome = try picking.select(&context, picking.picker.selectedIndex());
+    const outcome = try picking.select(&context, picking.picker.cursor);
     self.session.closePicker();
     try self.applyOutcome(outcome);
 }
@@ -876,29 +845,18 @@ test "OAuth callback bounds have friendly failure feedback" {
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
     defer app.session.deinit();
 
-    try app.finishLogin(.anthropic_subscription, error.CallbackTimeout);
-    const timeout = app.session.transcript.blocks()[0].feedback;
-    try std.testing.expect(timeout.is_error);
-    try std.testing.expectEqualStrings(
-        "login timed out waiting for the browser callback",
-        timeout.text.items,
-    );
-
-    try app.finishLogin(.openai_subscription, error.CallbackRequestTooLarge);
-    const oversized = app.session.transcript.blocks()[1].feedback;
-    try std.testing.expect(oversized.is_error);
-    try std.testing.expectEqualStrings(
-        "login failed: browser callback request was too large",
-        oversized.text.items,
-    );
-
-    try app.finishLogin(.anthropic_subscription, error.CallbackTimeoutUnavailable);
-    const unavailable = app.session.transcript.blocks()[2].feedback;
-    try std.testing.expect(unavailable.is_error);
-    try std.testing.expectEqualStrings(
-        "login failed: browser callback deadline was unavailable",
-        unavailable.text.items,
-    );
+    const cases = [_]struct { anyerror, []const u8 }{
+        .{ error.CallbackTimeout, "login timed out waiting for the browser callback" },
+        .{ error.CallbackRequestTooLarge, "login failed: browser callback request was too large" },
+        .{ error.CallbackTimeoutUnavailable, "login failed: browser callback deadline was unavailable" },
+    };
+    for (cases, 0..) |case, index| {
+        const failure, const message = case;
+        try app.finishLogin(.anthropic_subscription, failure);
+        const feedback = app.session.transcript.blocks()[index].feedback;
+        try std.testing.expect(feedback.is_error);
+        try std.testing.expectEqualStrings(message, feedback.text.items);
+    }
 }
 
 test "turn producers keep their captured generation" {
@@ -1023,7 +981,7 @@ test "cancelling a turn restores in-flight steering and resyncs usage" {
 
     try app.cancelTurn();
     try std.testing.expectEqualStrings("do X\n\nand Y", app.session.editor.content());
-    try std.testing.expect(app.session.steeringEmpty());
+    try std.testing.expectEqual(@as(usize, 0), app.session.steering.items.len);
     try std.testing.expectEqual(@as(f64, 1.5), app.session.stats_shown.cost);
     try std.testing.expect(app.session.mode == .prompt);
 }
@@ -1055,7 +1013,7 @@ test "alt+up recalls the steering queue after in-progress editor text" {
 
     try app.pullSteering();
     try std.testing.expectEqualStrings("draft\n\nfix it\n\nand test", app.session.editor.content());
-    try std.testing.expect(app.session.steeringEmpty());
+    try std.testing.expectEqual(@as(usize, 0), app.session.steering.items.len);
 }
 
 // A slash command can't run mid-turn, so Enter must leave it in the editor to
@@ -1088,7 +1046,7 @@ test "a mid-turn slash command or blank line is never queued as steering" {
     try app.submitSteering();
     try std.testing.expectEqualStrings("   ", app.session.editor.content());
 
-    try std.testing.expect(app.session.steeringEmpty());
+    try std.testing.expectEqual(@as(usize, 0), app.session.steering.items.len);
     const taken = try app.agent.steering.take();
     defer gpa.free(taken);
     try std.testing.expectEqual(@as(usize, 0), taken.len);

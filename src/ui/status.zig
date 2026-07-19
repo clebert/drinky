@@ -69,7 +69,8 @@ fn writeStats(out: *std.Io.Writer, info: *const Info) !void {
     // Context now: the last request's whole prompt plus its output, against the
     // model's window. The one "now" number; the rest is session-cumulative.
     // Saturating: the counts arrive from the provider stream unchecked.
-    const context = info.last.input +| info.last.cache_read +| info.last.cache_write +| info.last.output;
+    const last_prompt = info.last.input +| info.last.cache_read +| info.last.cache_write;
+    const context = last_prompt +| info.last.output;
     const percent = if (info.context_window > 0)
         asFloat(context) / asFloat(info.context_window) * 100.0
     else
@@ -83,7 +84,6 @@ fn writeStats(out: *std.Io.Writer, info: *const Info) !void {
     // Last request's cache hit rate over the whole prompt: another "now" number.
     // Zero on a cold start, model switch, or cache expiry, making a miss visible
     // where the cumulative "saved" figure cannot.
-    const last_prompt = info.last.input +| info.last.cache_read +| info.last.cache_write;
     if (last_prompt > 0) {
         const hit = asFloat(info.last.cache_read) / asFloat(last_prompt) * 100.0;
         try out.print(" · cache {d:.0}%", .{hit});

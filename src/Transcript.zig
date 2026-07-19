@@ -12,19 +12,16 @@ const Transcript = @This();
 
 gpa: std.mem.Allocator,
 entries: std.ArrayList(ui.block.Entry),
-/// Index of the model-text block for the current run, so streamed deltas keep
-/// appending to it; null when no run is open.
-current_model: ?usize,
-/// Index of the thinking block for the current run, so streamed reasoning keeps
-/// appending to it; null when no run is open.
-current_thinking: ?usize,
+/// Index and kind of the current run's streamed block, so deltas of that kind
+/// keep appending to it; null when no run is open.
+current: ?struct { index: usize, kind: ui.block.Entry.Kind },
 /// Index of the first block streamed for the current assistant message
 /// (reasoning or answer), so a retry can drop the whole partial message; null
 /// when none is streaming.
 message_start: ?usize,
 
 pub fn init(gpa: std.mem.Allocator) Transcript {
-    return .{ .gpa = gpa, .entries = .empty, .current_model = null, .current_thinking = null, .message_start = null };
+    return .{ .gpa = gpa, .entries = .empty, .current = null, .message_start = null };
 }
 
 pub fn deinit(self: *Transcript) void {
@@ -41,21 +38,16 @@ pub fn append(self: *Transcript, kind: ui.block.Entry.Kind, is_error: bool, text
     try self.entries.append(self.gpa, entry);
 }
 
-/// Append streamed answer text, opening a model block on demand so a run of
-/// deltas collects into one block; ends any open reasoning run, since the answer
-/// follows the reasoning.
-pub fn appendModelText(self: *Transcript, delta: []const u8) !void {
-    self.current_thinking = null;
-    if (self.current_model == null) self.current_model = try self.openRun(.model);
-    try self.entries.items[self.current_model.?].model.appendSlice(self.gpa, delta);
-}
-
-/// Append streamed reasoning text, opening a thinking block on demand so a run
-/// of deltas collects into one block until the run ends.
-pub fn appendThinkingText(self: *Transcript, delta: []const u8) !void {
-    self.current_model = null;
-    if (self.current_thinking == null) self.current_thinking = try self.openRun(.thinking);
-    try self.entries.items[self.current_thinking.?].thinking.appendSlice(self.gpa, delta);
+/// Append streamed text of `kind` (`.thinking` reasoning or `.model` answer),
+/// opening a block of that kind on demand so a run of deltas collects into one
+/// block; a kind change ends the previous run.
+pub fn appendStream(self: *Transcript, kind: ui.block.Entry.Kind, delta: []const u8) !void {
+    if (self.current == null or self.current.?.kind != kind)
+        self.current = .{ .index = try self.openRun(kind), .kind = kind };
+    switch (self.entries.items[self.current.?.index]) {
+        .model, .thinking => |*list| try list.appendSlice(self.gpa, delta),
+        else => unreachable,
+    }
 }
 
 /// Open a streamed block of `kind` at the tail, recording it as the message's
@@ -71,8 +63,7 @@ fn openRun(self: *Transcript, kind: ui.block.Entry.Kind) !usize {
 
 /// End the current message's streamed runs so the next delta opens a new block.
 pub fn endMessage(self: *Transcript) void {
-    self.current_model = null;
-    self.current_thinking = null;
+    self.current = null;
     self.message_start = null;
 }
 
@@ -83,8 +74,7 @@ pub fn endMessage(self: *Transcript) void {
 pub fn discardMessage(self: *Transcript) void {
     const start = self.message_start orelse return;
     self.endMessage();
-    var index = self.entries.items.len;
-    while (index > start) : (index -= 1) self.entries.items[index - 1].deinit(self.gpa);
+    for (self.entries.items[start..]) |*entry| entry.deinit(self.gpa);
     self.entries.shrinkRetainingCapacity(start);
 }
 
@@ -98,13 +88,13 @@ test "streamed deltas collect into one block until a discrete block ends the run
     var transcript = Transcript.init(gpa);
     defer transcript.deinit();
 
-    try transcript.appendModelText("hel");
-    try transcript.appendModelText("lo");
+    try transcript.appendStream(.model, "hel");
+    try transcript.appendStream(.model, "lo");
     try std.testing.expectEqual(@as(usize, 1), transcript.entries.items.len);
     try std.testing.expectEqualStrings("hello", transcript.entries.items[0].model.items);
 
     try transcript.append(.user, false, "hi");
-    try transcript.appendModelText("more");
+    try transcript.appendStream(.model, "more");
     try std.testing.expectEqual(@as(usize, 3), transcript.entries.items.len);
     try std.testing.expectEqualStrings("more", transcript.entries.items[2].model.items);
 }
@@ -114,9 +104,9 @@ test "endMessage forces the next delta into a new block" {
     var transcript = Transcript.init(gpa);
     defer transcript.deinit();
 
-    try transcript.appendModelText("a");
+    try transcript.appendStream(.model, "a");
     transcript.endMessage();
-    try transcript.appendModelText("b");
+    try transcript.appendStream(.model, "b");
     try std.testing.expectEqual(@as(usize, 2), transcript.entries.items.len);
 }
 
@@ -126,13 +116,13 @@ test "discardMessage drops the open run so a retry starts clean" {
     defer transcript.deinit();
 
     try transcript.append(.user, false, "hi");
-    try transcript.appendModelText("partial");
+    try transcript.appendStream(.model, "partial");
     try std.testing.expectEqual(@as(usize, 2), transcript.entries.items.len);
 
     transcript.discardMessage();
     try std.testing.expectEqual(@as(usize, 1), transcript.entries.items.len);
 
-    try transcript.appendModelText("fresh");
+    try transcript.appendStream(.model, "fresh");
     try std.testing.expectEqual(@as(usize, 2), transcript.entries.items.len);
     try std.testing.expectEqualStrings("fresh", transcript.entries.items[1].model.items);
 
@@ -147,9 +137,9 @@ test "reasoning collects into a thinking block that the answer run does not exte
     var transcript = Transcript.init(gpa);
     defer transcript.deinit();
 
-    try transcript.appendThinkingText("weigh ");
-    try transcript.appendThinkingText("it");
-    try transcript.appendModelText("answer");
+    try transcript.appendStream(.thinking, "weigh ");
+    try transcript.appendStream(.thinking, "it");
+    try transcript.appendStream(.model, "answer");
     try std.testing.expectEqual(@as(usize, 2), transcript.entries.items.len);
     try std.testing.expectEqualStrings("weigh it", transcript.entries.items[0].thinking.items);
     try std.testing.expectEqualStrings("answer", transcript.entries.items[1].model.items);
@@ -161,14 +151,14 @@ test "discard drops a partial message's reasoning and answer together" {
     defer transcript.deinit();
 
     try transcript.append(.user, false, "hi");
-    try transcript.appendThinkingText("thinking");
-    try transcript.appendModelText("partial");
+    try transcript.appendStream(.thinking, "thinking");
+    try transcript.appendStream(.model, "partial");
     try std.testing.expectEqual(@as(usize, 3), transcript.entries.items.len);
 
     transcript.discardMessage();
     try std.testing.expectEqual(@as(usize, 1), transcript.entries.items.len);
 
-    try transcript.appendThinkingText("fresh");
+    try transcript.appendStream(.thinking, "fresh");
     try std.testing.expectEqual(@as(usize, 2), transcript.entries.items.len);
     try std.testing.expectEqualStrings("fresh", transcript.entries.items[1].thinking.items);
 }

@@ -81,16 +81,8 @@ pub fn notice(placement: *const Placement, look: *const Notice, text: []const u8
 /// stream.
 pub fn wrapped(placement: *const Placement, maybe_style: ?color.Style, text: []const u8) !void {
     var iterator = terminal.width.wrapper(text, @max(placement.columns, 1));
-    var index: usize = 0;
-    while (iterator.next()) |content| : (index += 1) {
-        const line = placement.base + index;
-        if (line < placement.skip) continue;
-        placement.sink.begin();
-        if (maybe_style) |style| try color.apply(placement.sink, style);
-        try placement.sink.text(content);
-        if (maybe_style != null) try color.apply(placement.sink, .reset);
-        placement.sink.end(.{ .id = placement.id, .line = line });
-    }
+    var line = placement.base;
+    while (iterator.next()) |content| try framedRow(placement, null, &line, content, maybe_style);
 }
 
 /// A padded background box: a blank padding row, `text` wrapped to the inner
@@ -164,9 +156,9 @@ pub const Framing = struct {
     /// a full-width final line wraps onto, which the wrap itself never yields. It
     /// is the last body row, so it shows only when the window reaches it.
     trailing_row: bool = false,
-    /// Optional style for each logical `\n`-delimited body line. Wrapped
-    /// continuations retain their source line's style.
-    maybe_line_styles: ?[]const ?color.Style = null,
+    /// Style per logical `\n`-delimited body line (lines past the end are plain).
+    /// Wrapped continuations retain their source line's style.
+    line_styles: []const ?color.Style = &.{},
 };
 
 /// Stream the framed area described by `framing`: the top rule (labelled with the
@@ -187,25 +179,23 @@ pub fn framed(placement: *const Placement, framing: *const Framing) !void {
         source_offset = content_offset;
         if (index < framing.hidden_above) continue;
         if (index >= window_end) break;
-        const maybe_style = if (framing.maybe_line_styles) |line_styles|
-            if (source_line < line_styles.len) line_styles[source_line] else null
-        else
-            null;
-        try framedRow(placement, framing, &line, content, maybe_style);
+        const styles = framing.line_styles;
+        const maybe_style = if (source_line < styles.len) styles[source_line] else null;
+        try framedRow(placement, framing.caret, &line, content, maybe_style);
     }
     // The wrapper exhausts at `index == wrapped rows`, the trailing row's index;
     // emit it when the window reaches it (a `break` above leaves it out of view).
     if (framing.trailing_row and index >= framing.hidden_above and index < window_end) {
-        try framedRow(placement, framing, &line, "", null);
+        try framedRow(placement, framing.caret, &line, "", null);
     }
     try ruleRow(placement, &line, "↓", framing.hidden_below);
 }
 
-/// One windowed body row of a framed area: the row's `content`, then the caret
-/// when it names this row. Advances `line` and drops the row in the clipped top.
+/// One wrapped body row: the styled `content`, then the caret when it names this
+/// row. Advances `line` and drops the row in the clipped top.
 fn framedRow(
     placement: *const Placement,
-    framing: *const Framing,
+    maybe_caret: ?terminal.View.Caret,
     line: *usize,
     content: []const u8,
     maybe_style: ?color.Style,
@@ -216,7 +206,7 @@ fn framedRow(
     if (maybe_style) |style| try color.apply(placement.sink, style);
     try placement.sink.text(content);
     if (maybe_style != null) try color.apply(placement.sink, .reset);
-    if (framing.caret) |caret| if (placement.base + caret.row == line.*) placement.sink.setCaret(caret.column);
+    if (maybe_caret) |caret| if (placement.base + caret.row == line.*) placement.sink.setCaret(caret.column);
     placement.sink.end(.{ .id = placement.id, .line = line.* });
 }
 
@@ -305,13 +295,10 @@ pub fn steering(placement: *const Placement, messages: []const []const u8) !void
         try color.apply(placement.sink, .reset);
         placement.sink.end(.{ .id = placement.id, .line = line });
     }
-    if (line < placement.skip) return;
-    const hint = terminal.width.truncate("\u{21B3} Alt+Up to edit all queued messages", placement.columns);
-    placement.sink.begin();
-    try color.apply(placement.sink, .dim);
-    try placement.sink.text(hint);
-    try color.apply(placement.sink, .reset);
-    placement.sink.end(.{ .id = placement.id, .line = line });
+    var hint_placement = placement.*;
+    hint_placement.base = line;
+    const hint = "\u{21B3} Alt+Up to edit all queued messages";
+    try notice(&hint_placement, &.{ .style = .dim, .prefix = "" }, hint);
 }
 
 test "the body limit tracks a quarter of the viewport, clamped to five and fifteen" {

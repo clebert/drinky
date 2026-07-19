@@ -28,6 +28,8 @@ mode: Mode,
 columns: usize,
 rows: usize,
 /// The model changed since the last paint; the next tick repaints and clears it.
+/// The event-appliers and lifecycle methods self-mark; `App` sets it directly
+/// after mutating a widget (the editor, the picker).
 dirty: bool,
 /// Consumer-owned copy of the agent's usage/cost, updated by `.usage` events so
 /// the status gauge never reads `agent.stats` across the worker thread.
@@ -190,8 +192,8 @@ pub fn applyTurnEvent(self: *Session, event: TurnEvent) !void {
     if (event.generation != turn.generation) return;
     self.dirty = true;
     switch (event.payload) {
-        .text => |delta| try self.transcript.appendModelText(delta),
-        .thinking => |delta| try self.transcript.appendThinkingText(delta),
+        .text => |delta| try self.transcript.appendStream(.model, delta),
+        .thinking => |delta| try self.transcript.appendStream(.thinking, delta),
         .tool_start => |tool| {
             self.transcript.endMessage();
             try pushTool(turn, self.gpa, tool.name, tool.input_json);
@@ -273,13 +275,6 @@ pub fn cancelPicker(self: *Session) !void {
     try self.transcript.append(.feedback, false, "cancelled");
 }
 
-/// Mark the model changed since the last paint. The event-appliers and lifecycle
-/// methods self-mark; call this after `App` mutates a widget (the editor, the
-/// picker) directly.
-pub fn markDirty(self: *Session) void {
-    self.dirty = true;
-}
-
 /// Queue a steering message for display while a turn runs. `App` pushes the same
 /// text onto the agent's channel so the worker can take it.
 pub fn queueSteering(self: *Session, text: []const u8) !void {
@@ -287,11 +282,6 @@ pub fn queueSteering(self: *Session, text: []const u8) !void {
     errdefer self.gpa.free(copy);
     try self.steering.append(self.gpa, copy);
     self.dirty = true;
-}
-
-/// Whether the steering queue is empty.
-pub fn steeringEmpty(self: *const Session) bool {
-    return self.steering.items.len == 0;
 }
 
 /// Drop every queued steering message.
@@ -318,7 +308,6 @@ pub fn beginTurn(self: *Session, generation: u64) void {
 /// chrome, and record the cancellation. The io-side worker teardown is the
 /// caller's.
 pub fn abortTurn(self: *Session) !void {
-    self.transcript.endMessage();
     self.endTurn();
     try self.transcript.append(.feedback, false, "cancelled");
     self.dirty = true;
@@ -377,17 +366,8 @@ pub fn paint(self: *Session, size: terminal.View.Size) !void {
 /// steps the spinner every frame without marking the model dirty, so a tick
 /// repaints on new model content or ongoing animation.
 pub fn advanceFrame(self: *Session) bool {
-    if (self.animating()) self.advanceSpinner();
+    if (self.activeTurn()) |turn| turn.spinner_frame = ui.paint.spinnerStep(turn.spinner_frame);
     return self.dirty or self.animating();
-}
-
-/// Advance the spinner one frame. Driven by the frame timer while a turn runs, so
-/// it animates independently of stream events.
-fn advanceSpinner(self: *Session) void {
-    switch (self.mode) {
-        .turn => |*turn| turn.spinner_frame = ui.paint.spinnerStep(turn.spinner_frame),
-        else => {},
-    }
 }
 
 /// Whether a component wants continuous frames: today, a streaming turn's spinner.
@@ -470,7 +450,7 @@ test "a read chunk drives the editor and paints the result" {
     };
     const sink = try view.beginFrame(.{ .columns = 80, .rows = 24 }, 4);
     const placement: ui.paint.Placement = .{ .sink = sink, .id = 0, .columns = 80, .base = 0, .skip = 0 };
-    try editor.render(&placement, 24, true);
+    try editor.render(&placement, 24);
     try view.render();
 
     try std.testing.expectEqualStrings("hllo", editor.content());
@@ -500,7 +480,7 @@ test "a bracketed paste cannot emit terminal controls" {
     }
     const sink = try view.beginFrame(.{ .columns = 120, .rows = 24 }, 4);
     const placement: ui.paint.Placement = .{ .sink = sink, .id = 0, .columns = 120, .base = 0, .skip = 0 };
-    try editor.render(&placement, 24, true);
+    try editor.render(&placement, 24);
     try view.render();
 
     const painted = out.written();
@@ -620,7 +600,7 @@ test "stream events are dropped once the turn is over" {
 
 // Cancellation, resubmission, and these delayed events can all be entries in one
 // batch that App already drained from the shared queue.
-test "a cancelled turn's stale output and normal completion cannot affect its successor" {
+test "a cancelled turn's stale output and completion cannot affect its successor" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
@@ -633,37 +613,15 @@ test "a cancelled turn's stale output and normal completion cannot affect its su
     session.beginTurn(2);
 
     try session.applyTurnEvent(turnEvent(1, .{ .text = try gpa.dupe(u8, "stale A") }));
-    try session.applyTurnEvent(turnEvent(1, .{ .turn_ended = null }));
+    try session.applyTurnEvent(turnEvent(1, .{ .turn_ended = try gpa.dupe(u8, "turn A failed") }));
     try std.testing.expect(session.animating());
 
     try session.applyTurnEvent(turnEvent(2, .{ .text = try gpa.dupe(u8, "turn B") }));
     try session.applyTurnEvent(turnEvent(2, .{ .turn_ended = null }));
     try std.testing.expect(!session.animating());
+    // Three blocks: the stale error appended no feedback block either.
     try std.testing.expectEqual(@as(usize, 3), session.transcript.blocks().len);
     try std.testing.expectEqualStrings("turn B", session.transcript.blocks()[2].model.items);
-}
-
-test "a cancelled turn's stale error completion cannot affect its successor" {
-    const gpa = std.testing.allocator;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
-    defer session.deinit();
-
-    session.beginTurn(1);
-    try session.abortTurn();
-    session.beginTurn(2);
-
-    try session.applyTurnEvent(turnEvent(1, .{
-        .turn_ended = try gpa.dupe(u8, "turn A failed"),
-    }));
-    try std.testing.expect(session.animating());
-
-    try session.applyTurnEvent(turnEvent(2, .{ .text = try gpa.dupe(u8, "turn B") }));
-    try session.applyTurnEvent(turnEvent(2, .{ .turn_ended = null }));
-    try std.testing.expect(!session.animating());
-    try std.testing.expectEqual(@as(usize, 2), session.transcript.blocks().len);
-    try std.testing.expectEqualStrings("turn B", session.transcript.blocks()[1].model.items);
 }
 
 // Queued steering shows in the tail; a consumed event moves the combined text
@@ -678,7 +636,6 @@ test "steering queues, then a consumed event shows it and clears the queue" {
 
     try session.queueSteering("fix it");
     try session.queueSteering("and test");
-    try std.testing.expect(!session.steeringEmpty());
     try std.testing.expectEqual(@as(usize, 2), session.steering.items.len);
     try std.testing.expectEqualStrings("fix it", session.steering.items[0]);
 
@@ -686,7 +643,7 @@ test "steering queues, then a consumed event shows it and clears the queue" {
         .text = try gpa.dupe(u8, "fix it\n\nand test"),
         .count = 2,
     } }));
-    try std.testing.expect(session.steeringEmpty());
+    try std.testing.expectEqual(@as(usize, 0), session.steering.items.len);
     try std.testing.expectEqual(@as(usize, 1), session.transcript.blocks().len);
     try std.testing.expectEqualStrings("fix it\n\nand test", session.transcript.blocks()[0].user.items);
 }

@@ -38,11 +38,6 @@ fn idTool(index: usize) usize {
     return id_reserved - 1 - index;
 }
 
-const tool_box_style: ui.paint.BoxStyle = .{
-    .background = .tool_pending_background,
-    .foreground = .tool_foreground,
-};
-
 /// Everything one frame draws: the transcript blocks and the live tail below them.
 pub const Scene = struct {
     transcript: []const ui.block.Entry,
@@ -77,11 +72,9 @@ const Component = union(enum) {
     tool_box: []const u8,
     spinner: usize,
     steering: []const []const u8,
-    editor: Prompt,
+    editor: *const ui.Editor,
     picker: *const ui.Picker,
     status: *const ui.status.Info,
-
-    const Prompt = struct { editor: *const ui.Editor, focused: bool };
 
     /// The physical rows this component occupies, its leading separator excluded.
     /// Must equal exactly what `render` emits — the parity the diff and window
@@ -92,7 +85,7 @@ const Component = union(enum) {
             .tool_box => |text| ui.paint.boxRows(text, columns),
             .spinner, .status => 1,
             .steering => |messages| ui.paint.steeringRows(messages),
-            .editor => |prompt| prompt.editor.rows(columns, viewport_rows),
+            .editor => |editor| editor.rows(columns, viewport_rows),
             .picker => |picker| picker.rows(columns, viewport_rows),
         };
     }
@@ -102,11 +95,14 @@ const Component = union(enum) {
     fn render(self: Component, placement: *const ui.paint.Placement, viewport_rows: usize) !void {
         switch (self) {
             .entry => |entry| try entry.render(placement),
-            .tool_box => |text| try ui.paint.box(placement, &tool_box_style, text),
+            .tool_box => |text| try ui.paint.box(placement, &.{
+                .background = .tool_pending_background,
+                .foreground = .tool_foreground,
+            }, text),
             .spinner => |frame| try ui.paint.spinner(placement, frame),
             .steering => |messages| try ui.paint.steering(placement, messages),
             .status => |info| try ui.status.render(placement, info),
-            .editor => |prompt| try prompt.editor.render(placement, viewport_rows, prompt.focused),
+            .editor => |editor| try editor.render(placement, viewport_rows),
             .picker => |picker| try picker.render(placement, viewport_rows),
         }
     }
@@ -124,11 +120,9 @@ pub fn project(view: *terminal.View, size: terminal.View.Size, scene: *const Sce
 
     var rows: usize = 0;
     var shown: usize = 0;
-    while (shown < total) {
+    while (shown < total and rows < capacity) : (shown += 1) {
         const slot = slotAt(scene, total - 1 - shown);
-        rows += slotRows(&slot, size.columns, size.rows);
-        shown += 1;
-        if (rows >= capacity) break;
+        rows += @intFromBool(slot.leading_blank) + slot.component.measure(size.columns, size.rows);
     }
     const skip = if (rows > capacity) rows - capacity else 0;
 
@@ -141,10 +135,15 @@ pub fn project(view: *terminal.View, size: terminal.View.Size, scene: *const Sce
             .sink = sink,
             .id = slot.id,
             .columns = size.columns,
-            .base = if (slot.leading_blank) 1 else 0,
+            .base = @intFromBool(slot.leading_blank),
             .skip = if (index == start) skip else 0,
         };
-        try paintSlot(&slot, &placement, size.rows);
+        // The leading separator (when present and not clipped) is the slot's line 0.
+        if (slot.leading_blank and placement.skip == 0) {
+            sink.begin();
+            sink.end(.{ .id = slot.id, .line = 0 });
+        }
+        try slot.component.render(&placement, size.rows);
     }
     try view.render();
 }
@@ -175,7 +174,7 @@ fn slotAt(scene: *const Scene, index: usize) Slot {
 /// editor; otherwise the sole input.
 fn tailSlot(tail: *const Tail, offset: usize) Slot {
     switch (tail.*) {
-        .prompt => |editor| return editorSlot(editor, true),
+        .prompt => |editor| return editorSlot(editor),
         .picking => |picker| return .{ .component = .{ .picker = picker }, .id = id_input, .leading_blank = true },
         .turn => |turn| {
             if (offset < turn.tools.len) return .{
@@ -193,39 +192,13 @@ fn tailSlot(tail: *const Tail, offset: usize) Slot {
                 .id = id_steering,
                 .leading_blank = true,
             };
-            return editorSlot(turn.editor, true);
+            return editorSlot(turn.editor);
         },
     }
 }
 
-fn editorSlot(editor: *const ui.Editor, focused: bool) Slot {
-    return .{
-        .component = .{ .editor = .{ .editor = editor, .focused = focused } },
-        .id = id_input,
-        .leading_blank = true,
-    };
-}
-
-/// The physical rows `slot` occupies, its leading separator included.
-fn slotRows(slot: *const Slot, columns: usize, viewport_rows: usize) usize {
-    const lead: usize = if (slot.leading_blank) 1 else 0;
-    return lead + slot.component.measure(columns, viewport_rows);
-}
-
-/// Compose `slot`'s rows through `placement`, its leading separator (when present
-/// and not clipped) as line 0.
-fn paintSlot(slot: *const Slot, placement: *const ui.paint.Placement, viewport_rows: usize) !void {
-    if (slot.leading_blank and placement.skip == 0) {
-        placement.sink.begin();
-        placement.sink.end(.{ .id = placement.id, .line = 0 });
-    }
-    try slot.component.render(placement, viewport_rows);
-}
-
-// Physical rows in a fresh paint: the view joins its inert rows with `\r\n`,
-// and row text cannot emit those separators, so they count physical rows.
-fn paintedRows(bytes: []const u8) usize {
-    return std.mem.count(u8, bytes, "\r\n") + 1;
+fn editorSlot(editor: *const ui.Editor) Slot {
+    return .{ .component = .{ .editor = editor }, .id = id_input, .leading_blank = true };
 }
 
 const test_status: ui.status.Info = .{
@@ -238,16 +211,23 @@ const test_status: ui.status.Info = .{
     .signed_in = true,
 };
 
+// Projects `scene` into a fresh view at `size` and returns the frame's bytes,
+// caller-owned.
+fn projected(gpa: std.mem.Allocator, size: terminal.View.Size, scene: *const Scene) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var view = terminal.View.init(gpa, &out.writer);
+    defer view.deinit();
+    try project(&view, size, scene);
+    return gpa.dupe(u8, out.written());
+}
+
 // The whole projection end to end: a transcript plus the tail (the prompt editor
 // and the status line) composed through a real view. Exercises the backward
 // measure walk and the two-pass compose across transcript and tail together,
 // screen order newest at the bottom.
 test "projection stacks the transcript above the tail, newest at the bottom" {
     const gpa = std.testing.allocator;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var view = terminal.View.init(gpa, &out.writer);
-    defer view.deinit();
     var editor = ui.Editor.init(gpa);
     defer editor.deinit();
 
@@ -265,9 +245,9 @@ test "projection stacks the transcript above the tail, newest at the bottom" {
         .tail = .{ .prompt = &editor },
         .status = &test_status,
     };
-    try project(&view, .{ .columns = 40, .rows = 24 }, &scene);
+    const painted = try projected(gpa, .{ .columns = 40, .rows = 24 }, &scene);
+    defer gpa.free(painted);
 
-    const painted = out.written();
     const intro = std.mem.indexOf(u8, painted, "introxx").?;
     const user = std.mem.indexOf(u8, painted, "useryy").?;
     const reply = std.mem.indexOf(u8, painted, "replyzz").?;
@@ -277,17 +257,13 @@ test "projection stacks the transcript above the tail, newest at the bottom" {
     try std.testing.expect(user < reply);
     try std.testing.expect(reply < footer);
     // A small model in a tall window clips nothing, so the frame fits one page.
-    try std.testing.expect(paintedRows(painted) < 24);
+    try std.testing.expect(ui.block.paintedRows(painted) < 24);
 }
 
 // A streaming turn stacks its tool boxes above the spinner and the editor,
 // then the status line — several tool boxes at once, not just one.
 test "a turn tail stacks the tool boxes, spinner, and editor" {
     const gpa = std.testing.allocator;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var view = terminal.View.init(gpa, &out.writer);
-    defer view.deinit();
     var editor = ui.Editor.init(gpa);
     defer editor.deinit();
 
@@ -297,9 +273,9 @@ test "a turn tail stacks the tool boxes, spinner, and editor" {
         .tail = .{ .turn = .{ .tools = &tools, .spinner = 0, .steering = &.{}, .editor = &editor } },
         .status = &test_status,
     };
-    try project(&view, .{ .columns = 40, .rows = 24 }, &scene);
+    const painted = try projected(gpa, .{ .columns = 40, .rows = 24 }, &scene);
+    defer gpa.free(painted);
 
-    const painted = out.written();
     const first = std.mem.indexOf(u8, painted, "readbox").?;
     const second = std.mem.indexOf(u8, painted, "grepbox").?;
     const spin = std.mem.indexOf(u8, painted, "Working…").?;
@@ -313,10 +289,6 @@ test "a turn tail stacks the tool boxes, spinner, and editor" {
 // past maxInt(usize); the ids must stay unique and in range.
 test "a turn with 253 tool boxes keeps its anchor ids from wrapping" {
     const gpa = std.testing.allocator;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var view = terminal.View.init(gpa, &out.writer);
-    defer view.deinit();
     var editor = ui.Editor.init(gpa);
     defer editor.deinit();
 
@@ -326,7 +298,7 @@ test "a turn with 253 tool boxes keeps its anchor ids from wrapping" {
         .tail = .{ .turn = .{ .tools = &tools, .spinner = 0, .steering = &.{}, .editor = &editor } },
         .status = &test_status,
     };
-    try project(&view, .{ .columns = 40, .rows = 24 }, &scene);
+    gpa.free(try projected(gpa, .{ .columns = 40, .rows = 24 }, &scene));
 
     try std.testing.expect(idTool(252) < id_reserved);
 }
@@ -336,10 +308,6 @@ test "a turn with 253 tool boxes keeps its anchor ids from wrapping" {
 // the editor.
 test "a turn tail shows the steering queue above the editor" {
     const gpa = std.testing.allocator;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var view = terminal.View.init(gpa, &out.writer);
-    defer view.deinit();
     var editor = ui.Editor.init(gpa);
     defer editor.deinit();
 
@@ -349,9 +317,9 @@ test "a turn tail shows the steering queue above the editor" {
         .tail = .{ .turn = .{ .tools = &.{}, .spinner = 0, .steering = &queue, .editor = &editor } },
         .status = &test_status,
     };
-    try project(&view, .{ .columns = 40, .rows = 24 }, &scene);
+    const painted = try projected(gpa, .{ .columns = 40, .rows = 24 }, &scene);
+    defer gpa.free(painted);
 
-    const painted = out.written();
     const first = std.mem.indexOf(u8, painted, "fix the bug").?;
     const second = std.mem.indexOf(u8, painted, "then add a test").?;
     const hint = std.mem.indexOf(u8, painted, "Alt+Up").?;
@@ -366,10 +334,6 @@ test "a turn tail shows the steering queue above the editor" {
 // wider than the width — the sink asserts every row fits.
 test "a narrow window clips the steering rows to width" {
     const gpa = std.testing.allocator;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var view = terminal.View.init(gpa, &out.writer);
-    defer view.deinit();
     var editor = ui.Editor.init(gpa);
     defer editor.deinit();
 
@@ -379,7 +343,7 @@ test "a narrow window clips the steering rows to width" {
         .tail = .{ .turn = .{ .tools = &.{}, .spinner = 0, .steering = &queue, .editor = &editor } },
         .status = &test_status,
     };
-    try project(&view, .{ .columns = 8, .rows = 24 }, &scene);
+    gpa.free(try projected(gpa, .{ .columns = 8, .rows = 24 }, &scene));
 }
 
 // When the transcript overflows the window, the oldest visible block is clipped
@@ -387,20 +351,11 @@ test "a narrow window clips the steering rows to width" {
 // rows dropped while its newest content and the tail below still show.
 test "projection clips the oldest block to fill the window exactly" {
     const gpa = std.testing.allocator;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var view = terminal.View.init(gpa, &out.writer);
-    defer view.deinit();
     var editor = ui.Editor.init(gpa);
     defer editor.deinit();
 
-    var text: std.ArrayList(u8) = .empty;
+    var text = try ui.block.numberedLines(gpa, 60);
     defer text.deinit(gpa);
-    for (0..60) |i| {
-        if (i > 0) try text.append(gpa, '\n');
-        var buffer: [8]u8 = undefined;
-        try text.appendSlice(gpa, std.fmt.bufPrint(&buffer, "L{d}", .{i}) catch unreachable);
-    }
     var entries: std.ArrayList(ui.block.Entry) = .empty;
     defer {
         for (entries.items) |*entry| entry.deinit(gpa);
@@ -414,10 +369,10 @@ test "projection clips the oldest block to fill the window exactly" {
         .status = &test_status,
     };
     const rows: usize = 4;
-    try project(&view, .{ .columns = 40, .rows = rows }, &scene);
+    const painted = try projected(gpa, .{ .columns = 40, .rows = rows }, &scene);
+    defer gpa.free(painted);
 
-    const painted = out.written();
-    try std.testing.expectEqual(rows * window_pages, paintedRows(painted));
+    try std.testing.expectEqual(rows * window_pages, ui.block.paintedRows(painted));
     // The clip drops its top rows: its last line shows, its first does not, and
     // the tail still sits at the bottom.
     try std.testing.expect(std.mem.indexOf(u8, painted, "L59") != null);

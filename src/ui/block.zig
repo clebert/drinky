@@ -28,12 +28,9 @@ pub const Entry = union(enum) {
         errdefer list.deinit(gpa);
         try list.appendSlice(gpa, text);
         return switch (kind) {
-            .intro => .{ .intro = list },
-            .user => .{ .user = list },
-            .thinking => .{ .thinking = list },
-            .model => .{ .model = list },
             .tool_result => .{ .tool_result = .{ .text = list, .is_error = is_error } },
             .feedback => .{ .feedback = .{ .text = list, .is_error = is_error } },
+            inline else => |tag| @unionInit(Entry, @tagName(tag), list),
         };
     }
 
@@ -80,10 +77,23 @@ pub const Entry = union(enum) {
     }
 };
 
-// Physical rows in a fresh paint: the view joins its inert rows with `\r\n`,
-// and row text cannot emit those separators, so they count physical rows.
-fn paintedRows(bytes: []const u8) usize {
+/// Physical rows in a fresh paint: the view joins its inert rows with `\r\n`,
+/// and row text cannot emit those separators, so they count physical rows.
+pub fn paintedRows(bytes: []const u8) usize {
     return std.mem.count(u8, bytes, "\r\n") + 1;
+}
+
+/// A `\n`-joined `L0`..`L<count-1>` test fixture, tall enough to overflow a
+/// window so clipping tests can pin which numbered rows survive.
+pub fn numberedLines(gpa: std.mem.Allocator, count: usize) !std.ArrayList(u8) {
+    var text: std.ArrayList(u8) = .empty;
+    errdefer text.deinit(gpa);
+    for (0..count) |i| {
+        if (i > 0) try text.append(gpa, '\n');
+        var buffer: [8]u8 = undefined;
+        try text.appendSlice(gpa, std.fmt.bufPrint(&buffer, "L{d}", .{i}) catch unreachable);
+    }
+    return text;
 }
 
 // Rows `entry` paints into a fresh view, dropping its top `skip`. Fresh so the
@@ -130,13 +140,8 @@ test "each entry variant renders exactly the rows it counts" {
 // The clip drops its top `skip` rows and shows the rest.
 test "a clipped block shows its bottom rows" {
     const gpa = std.testing.allocator;
-    var text: std.ArrayList(u8) = .empty;
+    var text = try numberedLines(gpa, 40);
     defer text.deinit(gpa);
-    for (0..40) |i| {
-        if (i > 0) try text.append(gpa, '\n');
-        var buffer: [8]u8 = undefined;
-        try text.appendSlice(gpa, std.fmt.bufPrint(&buffer, "L{d}", .{i}) catch unreachable);
-    }
     const entry: Entry = .{ .model = text };
     const columns = 20;
     try std.testing.expectEqual(@as(usize, 40), entry.rows(columns));
@@ -179,13 +184,8 @@ test "a clipped block streams into a warmed frame without allocating" {
     var view = terminal.View.init(gpa, &out.writer);
     defer view.deinit();
 
-    var text: std.ArrayList(u8) = .empty;
+    var text = try numberedLines(std.testing.allocator, 60);
     defer text.deinit(std.testing.allocator);
-    for (0..60) |i| {
-        if (i > 0) try text.append(std.testing.allocator, '\n');
-        var buffer: [8]u8 = undefined;
-        try text.appendSlice(std.testing.allocator, std.fmt.bufPrint(&buffer, "L{d}", .{i}) catch unreachable);
-    }
     const entry: Entry = .{ .model = text };
     const columns = 20;
 
