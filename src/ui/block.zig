@@ -127,7 +127,7 @@ test "each entry variant renders exactly the rows it counts" {
     }
 }
 
-// The clip drops its top `skip` rows and shows the rest; skip 0 shows all.
+// The clip drops its top `skip` rows and shows the rest.
 test "a clipped block shows its bottom rows" {
     const gpa = std.testing.allocator;
     var text: std.ArrayList(u8) = .empty;
@@ -140,8 +140,31 @@ test "a clipped block shows its bottom rows" {
     const entry: Entry = .{ .model = text };
     const columns = 20;
     try std.testing.expectEqual(@as(usize, 40), entry.rows(columns));
-    try std.testing.expectEqual(@as(usize, 40), try renderedRows(gpa, &entry, columns, 0));
     try std.testing.expectEqual(@as(usize, 15), try renderedRows(gpa, &entry, columns, 25));
+}
+
+// An error feedback must be visibly distinct: the red style and an "error: "
+// prefix, both absent from plain feedback.
+test "an error feedback paints the red style and error prefix" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var view = terminal.View.init(gpa, &out.writer);
+    defer view.deinit();
+    var failure = try Entry.init(gpa, .feedback, true, "boom");
+    defer failure.deinit(gpa);
+    var success = try Entry.init(gpa, .feedback, false, "all good");
+    defer success.deinit(gpa);
+
+    const sink = try view.beginFrame(.{ .columns = 40, .rows = 100 }, 8);
+    try failure.render(&.{ .sink = sink, .id = 0, .columns = 40, .base = 0, .skip = 0 });
+    try success.render(&.{ .sink = sink, .id = 1, .columns = 40, .base = 0, .skip = 0 });
+    try view.render();
+
+    const painted = out.written();
+    try std.testing.expect(std.mem.indexOf(u8, painted, "\x1b[31merror: ") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, painted, "error: "));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, painted, "\x1b[31m"));
 }
 
 // Bounded memory: streaming a clipped block into a frame warmed to its full

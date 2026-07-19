@@ -179,4 +179,6 @@ test "a signed-out status shows the indicator in place of the model" {
     const painted = out.written();
     try std.testing.expect(std.mem.indexOf(u8, painted, "not signed in") != null);
     try std.testing.expect(std.mem.indexOf(u8, painted, "claude-opus-4-8") == null);
+    // No prompt tokens sent yet: the cache figure is absent, never a 0/0 rate.
+    try std.testing.expect(std.mem.indexOf(u8, painted, "cache") == null);
 }

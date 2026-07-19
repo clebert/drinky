@@ -331,8 +331,9 @@ test "a turn with 253 tool boxes keeps its anchor ids from wrapping" {
     try std.testing.expect(idTool(252) < id_reserved);
 }
 
-// A turn tail with queued steering shows each "Steering:" row and the recall
-// hint between the spinner and the editor.
+// A turn tail with queued steering shows each "Steering:" row — a multi-line
+// message cut to its first line — and the recall hint between the spinner and
+// the editor.
 test "a turn tail shows the steering queue above the editor" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -342,7 +343,7 @@ test "a turn tail shows the steering queue above the editor" {
     var editor = ui.Editor.init(gpa);
     defer editor.deinit();
 
-    const queue = [_][]const u8{ "fix the bug", "then add a test" };
+    const queue = [_][]const u8{ "fix the bug", "then add a test\nnot this row" };
     const scene: Scene = .{
         .transcript = &[_]ui.block.Entry{},
         .tail = .{ .turn = .{ .tools = &.{}, .spinner = 0, .steering = &queue, .editor = &editor } },
@@ -355,6 +356,7 @@ test "a turn tail shows the steering queue above the editor" {
     const second = std.mem.indexOf(u8, painted, "then add a test").?;
     const hint = std.mem.indexOf(u8, painted, "Alt+Up").?;
     const footer = std.mem.indexOf(u8, painted, "footerqq").?;
+    try std.testing.expect(std.mem.indexOf(u8, painted, "not this row") == null);
     try std.testing.expect(first < second);
     try std.testing.expect(second < hint);
     try std.testing.expect(hint < footer);

@@ -1028,6 +1028,72 @@ test "cancelling a turn restores in-flight steering and resyncs usage" {
     try std.testing.expect(app.session.mode == .prompt);
 }
 
+test "alt+up recalls the steering queue after in-progress editor text" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.gpa = gpa;
+    app.io = io;
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = anthropic_default,
+        .system = "",
+        .retry = .{},
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+    app.session.beginTurn(1);
+
+    try app.session.editor.insert("draft");
+    try app.agent.steering.push("fix it");
+    try app.session.queueSteering("fix it");
+    try app.agent.steering.push("and test");
+    try app.session.queueSteering("and test");
+
+    try app.pullSteering();
+    try std.testing.expectEqualStrings("draft\n\nfix it\n\nand test", app.session.editor.content());
+    try std.testing.expect(app.session.steeringEmpty());
+}
+
+// A slash command can't run mid-turn, so Enter must leave it in the editor to
+// send once the turn ends, never queue it as prompt text for the model.
+test "a mid-turn slash command or blank line is never queued as steering" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.gpa = gpa;
+    app.io = io;
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = anthropic_default,
+        .system = "",
+        .retry = .{},
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+    app.session.beginTurn(1);
+
+    try app.session.editor.insert("/model");
+    try app.submitSteering();
+    try std.testing.expectEqualStrings("/model", app.session.editor.content());
+
+    app.session.editor.clear();
+    try app.session.editor.insert("   ");
+    try app.submitSteering();
+    try std.testing.expectEqualStrings("   ", app.session.editor.content());
+
+    try std.testing.expect(app.session.steeringEmpty());
+    const taken = try app.agent.steering.take();
+    defer gpa.free(taken);
+    try std.testing.expectEqual(@as(usize, 0), taken.len);
+}
+
 // The lifecycle calls model cancellation and resubmission key entries from a
 // batch App already drained; the remaining entries use the real outer queue union
 // and batch dispatcher.
@@ -1073,6 +1139,22 @@ test "a drained batch routes only the active turn generation" {
     try std.testing.expectEqualStrings("turn B", app.session.transcript.blocks()[2].model.items);
 }
 
+// A resize marks the model dirty without ticking, so even an idle interface
+// reflows on the next frame.
+test "a resize event marks an idle interface dirty" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.gpa = gpa;
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+
+    try std.testing.expect(!try app.applyBatch(&[_]Session.UiEvent{.resize}));
+    try std.testing.expect(app.session.dirty);
+}
+
 test "a failed batch frees its unprocessed turn events" {
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
     const gpa = failing.allocator();
@@ -1106,4 +1188,90 @@ test "turn generations cannot wrap or be reused" {
 
     try std.testing.expectError(error.TurnGenerationExhausted, app.reserveTurnGeneration());
     try std.testing.expectEqual(std.math.maxInt(u64), app.turn_generation);
+}
+
+test "ctrl+c clears then quits within the window and ctrl+d quits only when empty" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.gpa = gpa;
+    app.io = std.testing.io;
+    app.last_ctrl_c = -ctrl_c_window_ms;
+    app.running = true;
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+
+    try app.session.editor.insert("draft");
+    try app.handleKey(.{ .ctrl = 'd' });
+    try std.testing.expect(app.running);
+
+    try app.handleKey(.{ .ctrl = 'c' });
+    try std.testing.expectEqualStrings("", app.session.editor.content());
+    try std.testing.expect(app.running);
+    try app.handleKey(.{ .ctrl = 'c' });
+    try std.testing.expect(!app.running);
+
+    app.running = true;
+    try app.handleKey(.{ .ctrl = 'd' });
+    try std.testing.expect(!app.running);
+}
+
+// Signed out, a normal message must be refused with a /login prompt rather
+// than spawn a turn against no client.
+test "a signed-out submit is refused with a login prompt" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.gpa = gpa;
+    app.io = io;
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = anthropic_default,
+        .system = "",
+        .retry = .{},
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+
+    try app.session.editor.insert("hello");
+    try app.submit();
+
+    try std.testing.expect(app.session.mode == .prompt);
+    const blocks = app.session.transcript.blocks();
+    try std.testing.expectEqual(@as(usize, 1), blocks.len);
+    try std.testing.expect(blocks[0].feedback.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, blocks[0].feedback.text.items, "/login") != null);
+}
+
+test "esc, ctrl+c, and ctrl+d each dismiss the picker as cancelled" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.gpa = gpa;
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+
+    const keys = [_]terminal.Input.Key{ .escape, .{ .ctrl = 'c' }, .{ .ctrl = 'd' } };
+    for (keys, 0..) |key, index| {
+        const options = try gpa.alloc([]const u8, 1);
+        options[0] = try gpa.dupe(u8, "alpha");
+        try app.session.applyOutcome(.{ .pick = .{
+            .command = "/login",
+            .title = "Log in",
+            .options = options,
+            .current = null,
+        } });
+        try app.handlePickerKey(key);
+        try std.testing.expect(app.session.mode == .prompt);
+        const feedback = app.session.transcript.blocks()[index].feedback;
+        try std.testing.expect(!feedback.is_error);
+        try std.testing.expectEqualStrings("cancelled", feedback.text.items);
+    }
 }

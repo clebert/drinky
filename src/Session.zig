@@ -536,6 +536,8 @@ test "scripted stream events drive the model and one coalesced paint" {
         .content = try gpa.dupe(u8, "first line\nsecond"),
         .is_error = false,
     } }));
+    // The result replaces its running box at once, not at turn end.
+    try std.testing.expectEqual(@as(usize, 0), session.mode.turn.tools.items.len);
     try session.applyTurnEvent(turnEvent(1, .{ .usage = .{
         .cost = 1.5,
         .saved = 0.25,
