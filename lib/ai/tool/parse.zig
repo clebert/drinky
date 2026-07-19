@@ -9,8 +9,17 @@ const llm = @import("../llm.zig");
 /// Parse `input_json` into `Args`. Any malformed or mistyped input becomes
 /// `error.InvalidArguments`, which the dispatcher renders into a tool-error
 /// result; `error.OutOfMemory` propagates.
-pub fn input(comptime Args: type, gpa: std.mem.Allocator, input_json: []const u8) !std.json.Parsed(Args) {
-    return std.json.parseFromSlice(Args, gpa, input_json, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+pub fn input(
+    comptime Args: type,
+    gpa: std.mem.Allocator,
+    input_json: []const u8,
+) !std.json.Parsed(Args) {
+    return std.json.parseFromSlice(
+        Args,
+        gpa,
+        input_json,
+        .{ .ignore_unknown_fields = true },
+    ) catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         else => error.InvalidArguments,
     };
@@ -25,7 +34,8 @@ pub fn check(comptime Args: type, comptime parameters: []const llm.Parameter) vo
             for (parameters) |parameter| {
                 if (!std.mem.eql(u8, field.name, parameter.name)) continue;
                 if ((field.default_value_ptr == null) != parameter.required) {
-                    @compileError("field '" ++ field.name ++ "' required-ness disagrees with its parameter");
+                    @compileError("field '" ++ field.name ++
+                        "' required-ness disagrees with its parameter");
                 }
                 if (!typeMatches(field.type, parameter.type)) {
                     @compileError("field '" ++ field.name ++ "' type disagrees with its parameter");

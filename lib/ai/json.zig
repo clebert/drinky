@@ -42,7 +42,10 @@ pub fn unsigned(value: ?std.json.Value) ?u64 {
 
 /// The `{"type":"object","properties":…,"required":…}` schema for a tool's
 /// parameters.
-pub fn writeParametersSchema(stringify: *std.json.Stringify, parameters: []const llm.Parameter) !void {
+pub fn writeParametersSchema(
+    stringify: *std.json.Stringify,
+    parameters: []const llm.Parameter,
+) !void {
     try stringify.beginObject();
     try stringify.objectField("type");
     try stringify.write("object");

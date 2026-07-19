@@ -4,61 +4,62 @@
 
 const std = @import("std");
 
+const json = @import("../json.zig");
 const llm = @import("../llm.zig");
 const models = @import("../models.zig");
-const writeParametersSchema = @import("../json.zig").writeParametersSchema;
 
 /// Required first system block on the subscription OAuth path (the Claude Code
 /// identity). The API-key path omits it and sends only the user's own prompt.
-pub const system_header = "You are Claude Code, Anthropic's official CLI for Claude.";
+const system_header = "You are Claude Code, Anthropic's official CLI for Claude.";
 
 /// Serialize `request` into an owned JSON body; caller frees the result.
 /// `account` decides whether the Claude Code `system_header` is prepended
 /// (subscription only) and which stored reasoning replays (see `emitsBlock`).
-pub fn serialize(gpa: std.mem.Allocator, request: llm.Request, account: llm.Account) ![]u8 {
+pub fn serialize(gpa: std.mem.Allocator, request: *const llm.Request, account: llm.Account) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var json: std.json.Stringify = .{
+    var stringify: std.json.Stringify = .{
         .writer = &out.writer,
         .options = .{ .emit_null_optional_fields = false },
     };
 
-    try json.beginObject();
-    try json.objectField("model");
-    try json.write(request.model);
-    try json.objectField("max_tokens");
-    try json.write(request.tokens_max);
-    try json.objectField("stream");
-    try json.write(true);
+    try stringify.beginObject();
+    try stringify.objectField("model");
+    try stringify.write(request.model);
+    try stringify.objectField("max_tokens");
+    try stringify.write(request.tokens_max);
+    try stringify.objectField("stream");
+    try stringify.write(true);
 
     // Reasoning: adaptive thinking plus a named effort, rather than a
     // client-side token budget. A null resolution omits the config entirely
     // and drops the stored thinking blocks from the history below.
     const reasoning = effortName(request);
     if (reasoning) |effort| {
-        try json.objectField("thinking");
-        try json.write(AdaptiveThinking{});
-        try json.objectField("output_config");
-        try json.write(OutputConfig{ .effort = effort });
+        try stringify.objectField("thinking");
+        try stringify.write(AdaptiveThinking{});
+        try stringify.objectField("output_config");
+        try stringify.write(OutputConfig{ .effort = effort });
     }
 
     // Prompt-cache breakpoints, model-independent: Anthropic caches the prefix
     // (tools, then system, then messages) up to each marked block, applying its
     // per-model minimum server side. Mark the last system block, the last tool,
     // and the last block of the last message — three of the four allowed.
-    try json.objectField("system");
-    try json.beginArray();
-    if (account == .anthropic_subscription) try json.write(TextBlock{ .text = system_header });
-    try json.write(TextBlock{ .text = request.system, .cache_control = .{} });
-    try json.endArray();
+    try stringify.objectField("system");
+    try stringify.beginArray();
+    if (account == .anthropic_subscription)
+        try stringify.write(TextBlock{ .text = system_header });
+    try stringify.write(TextBlock{ .text = request.system, .cache_control = .{} });
+    try stringify.endArray();
 
     if (request.tools.len > 0) {
-        try json.objectField("tools");
-        try json.beginArray();
-        for (request.tools, 0..) |tool, index| {
-            try writeTool(&json, tool, index == request.tools.len - 1);
+        try stringify.objectField("tools");
+        try stringify.beginArray();
+        for (request.tools, 0..) |*tool, index| {
+            try writeTool(&stringify, tool, index == request.tools.len - 1);
         }
-        try json.endArray();
+        try stringify.endArray();
     }
 
     // One envelope per run of consecutive same-role items, one block per item
@@ -67,27 +68,27 @@ pub fn serialize(gpa: std.mem.Allocator, request: llm.Request, account: llm.Acco
     // reasoning-only assistant run would serialize as empty `content`, which
     // Anthropic rejects with a 400; user runs left adjacent by such a skip
     // merge. The last emitted block carries the history cache breakpoint.
-    try json.objectField("messages");
-    try json.beginArray();
+    try stringify.objectField("messages");
+    try stringify.beginArray();
     const last_block = lastBlockIndex(request.items, reasoning != null, account);
     var open_role: ?llm.Role = null;
-    for (request.items, 0..) |item, index| {
-        if (!emitsBlock(item, reasoning != null, account)) continue;
-        const role = itemRole(item);
+    for (request.items, 0..) |*item, index| {
+        if (!emitsBlock(item.*, reasoning != null, account)) continue;
+        const role = itemRole(item.*);
         if (open_role == null or open_role.? != role) {
-            if (open_role != null) try endMessage(&json);
-            try json.beginObject();
-            try json.objectField("role");
-            try json.write(@tagName(role));
-            try json.objectField("content");
-            try json.beginArray();
+            if (open_role != null) try endMessage(&stringify);
+            try stringify.beginObject();
+            try stringify.objectField("role");
+            try stringify.write(@tagName(role));
+            try stringify.objectField("content");
+            try stringify.beginArray();
             open_role = role;
         }
-        try writeItem(&json, item, index == last_block);
+        try writeItem(&stringify, item, index == last_block);
     }
-    if (open_role != null) try endMessage(&json);
-    try json.endArray();
-    try json.endObject();
+    if (open_role != null) try endMessage(&stringify);
+    try stringify.endArray();
+    try stringify.endObject();
 
     return out.toOwnedSlice();
 }
@@ -95,7 +96,7 @@ pub fn serialize(gpa: std.mem.Allocator, request: llm.Request, account: llm.Acco
 /// The Anthropic effort name for the request's level, resolved through the
 /// model's effort map, or null to omit the reasoning config. The none level, an
 /// unknown model, and any level a model disables all resolve to null.
-fn effortName(request: llm.Request) ?[]const u8 {
+fn effortName(request: *const llm.Request) ?[]const u8 {
     const model = models.get(.anthropic, request.model) orelse return null;
     return model.effort.resolve(request.effort);
 }
@@ -105,10 +106,10 @@ fn effortName(request: llm.Request) ?[]const u8 {
 const RawJson = struct {
     bytes: []const u8,
 
-    pub fn jsonStringify(self: @This(), json: anytype) !void {
-        try json.beginWriteRaw();
-        try json.writer.writeAll(self.bytes);
-        json.endWriteRaw();
+    pub fn jsonStringify(self: @This(), stringify: anytype) !void {
+        try stringify.beginWriteRaw();
+        try stringify.writer.writeAll(self.bytes);
+        stringify.endWriteRaw();
     }
 };
 
@@ -159,19 +160,19 @@ const ToolResultBlock = struct {
     cache_control: ?CacheControl = null,
 };
 
-fn writeTool(json: *std.json.Stringify, tool: llm.Tool, cache: bool) !void {
-    try json.beginObject();
-    try json.objectField("name");
-    try json.write(tool.name);
-    try json.objectField("description");
-    try json.write(tool.description);
-    try json.objectField("input_schema");
-    try writeParametersSchema(json, tool.parameters);
+fn writeTool(stringify: *std.json.Stringify, tool: *const llm.Tool, cache: bool) !void {
+    try stringify.beginObject();
+    try stringify.objectField("name");
+    try stringify.write(tool.name);
+    try stringify.objectField("description");
+    try stringify.write(tool.description);
+    try stringify.objectField("input_schema");
+    try json.writeParametersSchema(stringify, tool.parameters);
     if (cache) {
-        try json.objectField("cache_control");
-        try json.write(CacheControl{});
+        try stringify.objectField("cache_control");
+        try stringify.write(CacheControl{});
     }
-    try json.endObject();
+    try stringify.endObject();
 }
 
 /// Whether an item serializes to a content block. Every item does except a
@@ -204,26 +205,29 @@ fn itemRole(item: llm.Item) llm.Role {
     };
 }
 
-fn endMessage(json: *std.json.Stringify) !void {
-    try json.endArray();
-    try json.endObject();
+fn endMessage(stringify: *std.json.Stringify) !void {
+    try stringify.endArray();
+    try stringify.endObject();
 }
 
-fn writeItem(json: *std.json.Stringify, item: llm.Item, cache: bool) !void {
+fn writeItem(stringify: *std.json.Stringify, item: *const llm.Item, cache: bool) !void {
     const control: ?CacheControl = if (cache) .{} else null;
-    switch (item) {
-        .message => |message| try json.write(TextBlock{ .text = message.text, .cache_control = control }),
+    switch (item.*) {
+        .message => |message| try stringify.write(TextBlock{
+            .text = message.text,
+            .cache_control = control,
+        }),
         // Reasoning sits at the head of an assistant message, never as the
         // cached last block, so it carries no cache breakpoint.
-        .reasoning => |reasoning| try writeThinking(json, reasoning),
+        .reasoning => |*reasoning| try writeThinking(stringify, reasoning),
         // The model emits tool arguments as JSON already, so embed them verbatim.
-        .tool_call => |call| try json.write(ToolUseBlock{
+        .tool_call => |call| try stringify.write(ToolUseBlock{
             .id = call.call_id,
             .name = call.name,
             .input = .{ .bytes = if (call.arguments_json.len == 0) "{}" else call.arguments_json },
             .cache_control = control,
         }),
-        .tool_result => |result| try json.write(ToolResultBlock{
+        .tool_result => |result| try stringify.write(ToolResultBlock{
             .tool_use_id = result.call_id,
             .is_error = result.is_error,
             .content = result.content,
@@ -234,11 +238,14 @@ fn writeItem(json: *std.json.Stringify, item: llm.Item, cache: bool) !void {
 
 /// Serialize a stored reasoning item: a normal block with its verbatim
 /// signature, or a redacted block carrying its encrypted payload.
-fn writeThinking(json: *std.json.Stringify, reasoning: llm.Item.Reasoning) !void {
+fn writeThinking(stringify: *std.json.Stringify, reasoning: *const llm.Item.Reasoning) !void {
     if (reasoning.redacted)
-        try json.write(RedactedThinkingBlock{ .data = reasoning.blob })
+        try stringify.write(RedactedThinkingBlock{ .data = reasoning.blob })
     else
-        try json.write(ThinkingBlock{ .thinking = reasoning.text, .signature = reasoning.blob });
+        try stringify.write(ThinkingBlock{
+            .thinking = reasoning.text,
+            .signature = reasoning.blob,
+        });
 }
 
 test serialize {
@@ -250,7 +257,7 @@ test serialize {
             .{ .name = "path", .type = .string, .required = true, .description = "the file path" },
         } },
     };
-    const body = try serialize(std.testing.allocator, .{
+    const body = try serialize(std.testing.allocator, &.{
         .model = "claude-sonnet-4-6",
         .tokens_max = 1024,
         .system = "be terse",
@@ -271,7 +278,8 @@ test serialize {
     );
     try std.testing.expectEqualStrings(
         "hi \"there\"",
-        root.get("messages").?.array.items[0].object.get("content").?.array.items[0].object.get("text").?.string,
+        root.get("messages").?.array.items[0].object
+            .get("content").?.array.items[0].object.get("text").?.string,
     );
     const input_schema = root.get("tools").?.array.items[0].object.get("input_schema").?.object;
     try std.testing.expectEqualStrings("object", input_schema.get("type").?.string);
@@ -279,16 +287,23 @@ test serialize {
         "string",
         input_schema.get("properties").?.object.get("path").?.object.get("type").?.string,
     );
-    try std.testing.expectEqualStrings("path", input_schema.get("required").?.array.items[0].string);
+    try std.testing.expectEqualStrings(
+        "path",
+        input_schema.get("required").?.array.items[0].string,
+    );
 }
 
 test "tool_call arguments pass through raw, empty becomes an empty object" {
     const items = [_]llm.Item{
-        .{ .tool_call = .{ .call_id = "t1", .name = "read", .arguments_json = "{\"path\":\"a.zig\"}" } },
+        .{ .tool_call = .{
+            .call_id = "t1",
+            .name = "read",
+            .arguments_json = "{\"path\":\"a.zig\"}",
+        } },
         .{ .tool_call = .{ .call_id = "t2", .name = "list", .arguments_json = "" } },
         .{ .tool_result = .{ .call_id = "t1", .content = "ok", .is_error = true } },
     };
-    const body = try serialize(std.testing.allocator, .{
+    const body = try serialize(std.testing.allocator, &.{
         .model = "m",
         .tokens_max = 8,
         .system = "s",
@@ -302,8 +317,14 @@ test "tool_call arguments pass through raw, empty becomes an empty object" {
     const messages = parsed.value.object.get("messages").?.array.items;
     const calls_content = messages[0].object.get("content").?.array.items;
     try std.testing.expectEqualStrings("tool_use", calls_content[0].object.get("type").?.string);
-    try std.testing.expectEqualStrings("a.zig", calls_content[0].object.get("input").?.object.get("path").?.string);
-    try std.testing.expectEqual(@as(usize, 0), calls_content[1].object.get("input").?.object.count());
+    try std.testing.expectEqualStrings(
+        "a.zig",
+        calls_content[0].object.get("input").?.object.get("path").?.string,
+    );
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        calls_content[1].object.get("input").?.object.count(),
+    );
 
     const result = messages[1].object.get("content").?.array.items[0].object;
     try std.testing.expectEqualStrings("tool_result", result.get("type").?.string);
@@ -322,7 +343,7 @@ test "cache_control marks the system prompt, last tool, and last message block" 
         .{ .message = .{ .role = .assistant, .text = "a" } },
         .{ .message = .{ .role = .assistant, .text = "b" } },
     };
-    const body = try serialize(std.testing.allocator, .{
+    const body = try serialize(std.testing.allocator, &.{
         .model = "any-model-x",
         .tokens_max = 8,
         .system = "sys",
@@ -355,7 +376,7 @@ test "cache_control marks the system prompt, last tool, and last message block" 
 test "effort is dropped for a model with no table entry" {
     // Proof the level is resolved through the per-model table, not from @tagName.
     const items = [_]llm.Item{.{ .message = .{ .role = .user, .text = "hi" } }};
-    const body = try serialize(std.testing.allocator, .{
+    const body = try serialize(std.testing.allocator, &.{
         .model = "unlisted-model",
         .tokens_max = 8192,
         .system = "s",
@@ -375,7 +396,7 @@ test "an effort level a model lacks folds to one it accepts" {
     // Sonnet 4.6 has no xhigh: its map folds xhigh onto high, so the default
     // effort works without the user knowing.
     const items = [_]llm.Item{.{ .message = .{ .role = .user, .text = "hi" } }};
-    const body = try serialize(std.testing.allocator, .{
+    const body = try serialize(std.testing.allocator, &.{
         .model = "claude-sonnet-4-6",
         .tokens_max = 128_000,
         .system = "s",
@@ -395,7 +416,7 @@ test "an effort level a model lacks folds to one it accepts" {
 
 test "no thinking or output_config when effort is none" {
     const items = [_]llm.Item{.{ .message = .{ .role = .user, .text = "hi" } }};
-    const body = try serialize(std.testing.allocator, .{
+    const body = try serialize(std.testing.allocator, &.{
         .model = "claude-opus-4-8",
         .tokens_max = 8192,
         .system = "s",
@@ -418,8 +439,17 @@ const golden_items = [_]llm.Item{
     .{ .message = .{ .role = .user, .text = "first" } },
     .{ .message = .{ .role = .user, .text = "second" } },
     .{ .reasoning = .{ .text = "weigh it", .blob = "sig", .origin = .anthropic_subscription } },
-    .{ .reasoning = .{ .text = "", .blob = "secret", .redacted = true, .origin = .anthropic_subscription } },
-    .{ .tool_call = .{ .call_id = "t1", .name = "read", .arguments_json = "{\"path\":\"a.zig\"}" } },
+    .{ .reasoning = .{
+        .text = "",
+        .blob = "secret",
+        .redacted = true,
+        .origin = .anthropic_subscription,
+    } },
+    .{ .tool_call = .{
+        .call_id = "t1",
+        .name = "read",
+        .arguments_json = "{\"path\":\"a.zig\"}",
+    } },
     .{ .message = .{ .role = .assistant, .text = "checking" } },
     .{ .tool_result = .{ .call_id = "t1", .content = "contents", .is_error = false } },
     .{ .reasoning = .{ .text = "more", .blob = "sig2", .origin = .anthropic_subscription } },
@@ -441,7 +471,7 @@ const golden_none =
 // Reasoning on vs. effort none proves the none level drops the thinking
 // blocks and the reasoning config with no other byte change.
 test "golden bytes keep the serialized prefix stable" {
-    const on = try serialize(std.testing.allocator, .{
+    const on = try serialize(std.testing.allocator, &.{
         .model = "claude-opus-4-8",
         .tokens_max = 8192,
         .system = "be terse",
@@ -452,7 +482,7 @@ test "golden bytes keep the serialized prefix stable" {
     defer std.testing.allocator.free(on);
     try std.testing.expectEqualStrings(golden_on, on);
 
-    const none = try serialize(std.testing.allocator, .{
+    const none = try serialize(std.testing.allocator, &.{
         .model = "claude-opus-4-8",
         .tokens_max = 8192,
         .system = "be terse",
@@ -469,7 +499,11 @@ test "golden bytes keep the serialized prefix stable" {
 const golden_items_api = [_]llm.Item{
     .{ .message = .{ .role = .user, .text = "first" } },
     .{ .reasoning = .{ .text = "weigh it", .blob = "sig", .origin = .anthropic_api } },
-    .{ .tool_call = .{ .call_id = "t1", .name = "read", .arguments_json = "{\"path\":\"a.zig\"}" } },
+    .{ .tool_call = .{
+        .call_id = "t1",
+        .name = "read",
+        .arguments_json = "{\"path\":\"a.zig\"}",
+    } },
     .{ .message = .{ .role = .assistant, .text = "all set" } },
 };
 
@@ -478,7 +512,7 @@ const golden_api =
 ;
 
 test "the api-key account omits the system header and keeps every other block" {
-    const body = try serialize(std.testing.allocator, .{
+    const body = try serialize(std.testing.allocator, &.{
         .model = "claude-opus-4-8",
         .tokens_max = 8192,
         .system = "be terse",
@@ -499,7 +533,7 @@ test "a reasoning-only run dropped by an account switch emits no empty envelope"
         .{ .reasoning = .{ .text = "weigh it", .blob = "sig", .origin = .anthropic_subscription } },
         .{ .message = .{ .role = .user, .text = "again" } },
     };
-    const body = try serialize(std.testing.allocator, .{
+    const body = try serialize(std.testing.allocator, &.{
         .model = "claude-opus-4-8",
         .tokens_max = 8192,
         .system = "s",
@@ -527,7 +561,7 @@ test "reasoning is dropped when its origin account differs, even within the vend
         .{ .reasoning = .{ .text = "weigh it", .blob = "sig", .origin = .anthropic_subscription } },
         .{ .message = .{ .role = .assistant, .text = "answer" } },
     };
-    const body = try serialize(std.testing.allocator, .{
+    const body = try serialize(std.testing.allocator, &.{
         .model = "claude-opus-4-8",
         .tokens_max = 8192,
         .system = "s",
@@ -539,7 +573,8 @@ test "reasoning is dropped when its origin account differs, even within the vend
 
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
     defer parsed.deinit();
-    const content = parsed.value.object.get("messages").?.array.items[0].object.get("content").?.array.items;
+    const content =
+        parsed.value.object.get("messages").?.array.items[0].object.get("content").?.array.items;
     try std.testing.expectEqual(@as(usize, 1), content.len);
     try std.testing.expectEqualStrings("text", content[0].object.get("type").?.string);
     try std.testing.expectEqualStrings("answer", content[0].object.get("text").?.string);

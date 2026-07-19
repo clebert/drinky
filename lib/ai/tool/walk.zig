@@ -10,7 +10,7 @@ const noise_dirs = [_][]const u8{ ".git", ".zig-cache", "zig-cache", "zig-out" }
 
 /// Hard cap on entries examined per walk, so a huge tree cannot make traversal
 /// run unbounded; real repositories never reach it.
-pub const entries_visited_max = 1_000_000;
+const entries_visited_max = 1_000_000;
 
 /// The matches a walk retained, owned by the caller's `gpa`.
 pub const Match = struct {
@@ -232,7 +232,8 @@ const FaultyIo = struct {
             },
             .subdir_read => {},
         }
-        const result = try self.backend.vtable.dirOpenDir(self.backend.userdata, dir, path, options);
+        const result =
+            try self.backend.vtable.dirOpenDir(self.backend.userdata, dir, path, options);
         self.open_handles += 1;
         return result;
     }
@@ -317,13 +318,13 @@ test "collect skips an unreadable directory and keeps walking" {
     try std.testing.expectEqual(@as(usize, 0), faulty.open_handles);
 }
 
-fn makeTree(io: std.Io, dir: std.Io.Dir, dirs: usize, files: usize) !void {
-    for (0..dirs) |d| {
+fn makeTree(io: std.Io, dir: std.Io.Dir, counts: struct { dirs: usize, files: usize }) !void {
+    for (0..counts.dirs) |d| {
         var name_buf: [16]u8 = undefined;
         const name = try std.fmt.bufPrint(&name_buf, "d{d:0>3}", .{d});
         var sub = try dir.createDirPathOpen(io, name, .{});
         defer sub.close(io);
-        for (0..files) |f| {
+        for (0..counts.files) |f| {
             var file_buf: [16]u8 = undefined;
             const file = try std.fmt.bufPrint(&file_buf, "f{d:0>3}.txt", .{f});
             try sub.writeFile(io, .{ .sub_path = file, .data = "hit\n" });
@@ -337,11 +338,15 @@ test "collect retains only the smallest matches and counts the rest" {
     const io = threaded.io();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try makeTree(io, tmp.dir, 20, 10);
+    try makeTree(io, tmp.dir, .{ .dirs = 20, .files = 10 });
     var base_buf: [128]u8 = undefined;
     const base = try std.fmt.bufPrint(&base_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
 
-    var matches = try collect(io, std.testing.allocator, .{ .base = base, .pattern = "**", .retain = 5 });
+    var matches = try collect(io, std.testing.allocator, .{
+        .base = base,
+        .pattern = "**",
+        .retain = 5,
+    });
     defer matches.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(usize, 200), matches.matched);
@@ -357,7 +362,7 @@ test "collect stops at the entry-visit work cap" {
     const io = threaded.io();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try makeTree(io, tmp.dir, 20, 10);
+    try makeTree(io, tmp.dir, .{ .dirs = 20, .files = 10 });
     var base_buf: [128]u8 = undefined;
     const base = try std.fmt.bufPrint(&base_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
 

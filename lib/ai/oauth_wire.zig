@@ -7,13 +7,11 @@ const std = @import("std");
 
 const net = @import("net.zig");
 
-const base64url = std.base64.url_safe_no_pad.Encoder;
-
 /// Hard cap on a token response body, well above any real exchange or refresh
 /// payload.
 const token_response_bytes_max = 256 * 1024;
 
-const verifier_len = base64url.calcSize(32);
+const verifier_len = std.base64.url_safe_no_pad.Encoder.calcSize(32);
 
 pub const Pkce = struct {
     verifier: [verifier_len]u8,
@@ -25,10 +23,10 @@ pub fn pkce(io: std.Io) Pkce {
     var seed: [32]u8 = undefined;
     io.random(&seed);
     var result: Pkce = undefined;
-    _ = base64url.encode(&result.verifier, &seed);
+    _ = std.base64.url_safe_no_pad.Encoder.encode(&result.verifier, &seed);
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(&result.verifier, &digest, .{});
-    _ = base64url.encode(&result.challenge, &digest);
+    _ = std.base64.url_safe_no_pad.Encoder.encode(&result.challenge, &digest);
     return result;
 }
 
@@ -119,7 +117,7 @@ test pkce {
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(&code.verifier, &digest, .{});
     var expected: [verifier_len]u8 = undefined;
-    _ = base64url.encode(&expected, &digest);
+    _ = std.base64.url_safe_no_pad.Encoder.encode(&expected, &digest);
     try std.testing.expectEqualStrings(&expected, &code.challenge);
 }
 

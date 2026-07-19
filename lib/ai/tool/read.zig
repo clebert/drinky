@@ -15,10 +15,21 @@ const file_bytes_max = 16 << 20;
 
 pub const spec: llm.Tool = .{
     .name = "read",
-    .description = "Read a UTF-8 text file. Output is truncated to 2000 lines or 50KB, whichever comes first; use offset and limit to page through large files (the output notes the next offset to continue from).",
+    .description = "Read a UTF-8 text file. Output is truncated to 2000 lines or 50KB, " ++
+        "whichever comes first; use offset and limit to page through large files " ++
+        "(the output notes the next offset to continue from).",
     .parameters = &.{
-        .{ .name = "path", .type = .string, .required = true, .description = "Path to the file (relative or absolute)" },
-        .{ .name = "offset", .type = .integer, .description = "1-indexed line to start reading from (default: 1)" },
+        .{
+            .name = "path",
+            .type = .string,
+            .required = true,
+            .description = "Path to the file (relative or absolute)",
+        },
+        .{
+            .name = "offset",
+            .type = .integer,
+            .description = "1-indexed line to start reading from (default: 1)",
+        },
         .{ .name = "limit", .type = .integer, .description = "Maximum number of lines to read" },
     },
 };
@@ -41,8 +52,18 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
     const offset = parsed.value.offset;
     const limit = parsed.value.limit;
 
-    const data = std.Io.Dir.cwd().readFileAlloc(context.io, path, gpa, .limited(file_bytes_max)) catch |err| switch (err) {
-        error.StreamTooLong => return Result.report(gpa, .err, "{s} is larger than {d} bytes; read it another way", .{ path, file_bytes_max }),
+    const data = std.Io.Dir.cwd().readFileAlloc(
+        context.io,
+        path,
+        gpa,
+        .limited(file_bytes_max),
+    ) catch |err| switch (err) {
+        error.StreamTooLong => return Result.report(
+            gpa,
+            .err,
+            "{s} is larger than {d} bytes; read it another way",
+            .{ path, file_bytes_max },
+        ),
         else => return Result.cannot(gpa, err, "read", path),
     };
     defer gpa.free(data);
@@ -54,7 +75,11 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
     const total = std.mem.count(u8, data, "\n") + 1;
     const start = if (offset > 0) offset - 1 else 0;
     if (start >= total) {
-        return Result.report(gpa, .err, "offset {d} is past the end of {s} ({d} lines)", .{ offset, path, total });
+        return Result.report(gpa, .err, "offset {d} is past the end of {s} ({d} lines)", .{
+            offset,
+            path,
+            total,
+        });
     }
     const shown_max = @min(limit orelse lines_max, lines_max);
     if (shown_max == 0) return Result.report(gpa, .err, "limit must be at least 1", .{});
@@ -87,10 +112,16 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
         shown += 1;
     }
     if (truncated) {
-        try out.writer.print("\n\n[line {d} exceeds {d} bytes and was truncated]", .{ last + 1, bytes_max });
+        try out.writer.print(
+            "\n\n[line {d} exceeds {d} bytes and was truncated]",
+            .{ last + 1, bytes_max },
+        );
     }
     if (last + 1 < total) {
-        try out.writer.print("\n\n[showing lines {d}-{d} of {d}; use offset={d} to continue]", .{ start + 1, last + 1, total, last + 2 });
+        try out.writer.print(
+            "\n\n[showing lines {d}-{d} of {d}; use offset={d} to continue]",
+            .{ start + 1, last + 1, total, last + 2 },
+        );
     }
     return .{ .content = try out.toOwnedSlice(), .is_error = false };
 }
@@ -179,7 +210,9 @@ test "read rejects a binary or non-UTF-8 file" {
         const result = try run(&context, input);
         defer gpa.free(result.content);
         try std.testing.expect(result.is_error);
-        try std.testing.expect(std.mem.indexOf(u8, result.content, "not a UTF-8 text file") != null);
+        try std.testing.expect(
+            std.mem.indexOf(u8, result.content, "not a UTF-8 text file") != null,
+        );
     }
 }
 
@@ -220,7 +253,9 @@ test "read stops at the byte cap with a next-offset hint" {
     defer gpa.free(result.content);
     try std.testing.expect(!result.is_error);
     try std.testing.expect(result.content.len <= bytes_max + 128);
-    try std.testing.expect(std.mem.indexOf(u8, result.content, "use offset=51 to continue") != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, result.content, "use offset=51 to continue") != null,
+    );
 }
 
 test "read truncates to the line cap by default" {
@@ -242,7 +277,9 @@ test "read truncates to the line cap by default" {
     const result = try run(&context, input);
     defer gpa.free(result.content);
     try std.testing.expect(!result.is_error);
-    try std.testing.expect(std.mem.indexOf(u8, result.content, "use offset=2001 to continue") != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, result.content, "use offset=2001 to continue") != null,
+    );
 }
 
 test "read cancelled while opening propagates" {
@@ -298,5 +335,7 @@ test "read clamps an explicit limit to the line cap" {
     const result = try run(&context, input);
     defer gpa.free(result.content);
     try std.testing.expect(!result.is_error);
-    try std.testing.expect(std.mem.indexOf(u8, result.content, "use offset=2001 to continue") != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, result.content, "use offset=2001 to continue") != null,
+    );
 }

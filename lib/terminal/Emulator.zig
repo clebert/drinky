@@ -72,33 +72,42 @@ fn control(self: *Emulator, sequence: []const u8) !usize {
 
 fn csi(self: *Emulator, sequence: []const u8) !usize {
     var index: usize = 2;
-    while (index < sequence.len and (sequence[index] < 0x40 or sequence[index] > 0x7e)) : (index += 1) {}
+    while (index < sequence.len and (sequence[index] < 0x40 or sequence[index] > 0x7e)) {
+        index += 1;
+    }
     if (index >= sequence.len) return sequence.len;
-    const params = sequence[2..index];
+    const parameters = sequence[2..index];
     switch (sequence[index]) {
         // A real terminal treats an explicit 0 count as 1, so an emitted `\x1b[0A`
         // moves here too instead of masking a missing zero guard in `escape`.
         'A' => {
             std.debug.assert(self.cursor_row >= self.screen_top);
-            self.cursor_row -= @min(@max(csiValue(params, 1), 1), self.cursor_row - self.screen_top);
+            const count = @max(csiValue(parameters, 1), 1);
+            self.cursor_row -= @min(count, self.cursor_row - self.screen_top);
         },
         // CUD clamps at the bottom row; it never scrolls or grows the document.
-        'B' => self.cursor_row = @min(self.cursor_row + @max(csiValue(params, 1), 1), self.document.items.len - 1),
+        'B' => {
+            const count = @max(csiValue(parameters, 1), 1);
+            self.cursor_row = @min(self.cursor_row + count, self.document.items.len - 1);
+        },
         // CUF clamps at the right margin; it cannot reach a pending-wrap cell.
-        'C' => self.cursor_column = @min(self.cursor_column + @max(csiValue(params, 1), 1), self.columns - 1),
+        'C' => {
+            const count = @max(csiValue(parameters, 1), 1);
+            self.cursor_column = @min(self.cursor_column + count, self.columns - 1);
+        },
         'H' => {
             self.cursor_row = self.screen_top;
             self.cursor_column = 0;
         },
-        'J' => switch (csiValue(params, 0)) {
+        'J' => switch (csiValue(parameters, 0)) {
             2 => try self.clearScreen(),
             0 => try self.clearBelow(),
             else => {},
         },
-        'h' => if (std.mem.eql(u8, params, "?25")) {
+        'h' => if (std.mem.eql(u8, parameters, "?25")) {
             self.cursor_visible = true;
         },
-        'l' => if (std.mem.eql(u8, params, "?25")) {
+        'l' => if (std.mem.eql(u8, parameters, "?25")) {
             self.cursor_visible = false;
         },
         else => {},
@@ -146,8 +155,8 @@ fn put(self: *Emulator, bytes: []const u8, columns: usize) !void {
     self.cursor_column += columns;
 }
 
-fn csiValue(params: []const u8, default: usize) usize {
-    return std.fmt.parseInt(usize, params, 10) catch default;
+fn csiValue(parameters: []const u8, default: usize) usize {
+    return std.fmt.parseInt(usize, parameters, 10) catch default;
 }
 
 // The current frame occupies the last `frame.len` rows of the document; the
@@ -160,10 +169,14 @@ pub fn expectVisible(self: *Emulator, frame: []const []const u8) !void {
     }
 }
 
-pub fn expectCaret(self: *Emulator, frame_len: usize, row: usize, column: usize) !void {
+pub fn expectCaret(
+    self: *Emulator,
+    expected: struct { frame_len: usize, row: usize, column: usize },
+) !void {
     try std.testing.expect(self.cursor_visible);
-    try std.testing.expectEqual(self.document.items.len - frame_len + row, self.cursor_row);
-    try std.testing.expectEqual(column, self.cursor_column);
+    const row = self.document.items.len - expected.frame_len + expected.row;
+    try std.testing.expectEqual(row, self.cursor_row);
+    try std.testing.expectEqual(expected.column, self.cursor_column);
 }
 
 // The physical screen: the `rows` rows at and below the scroll top. Rows that

@@ -8,7 +8,10 @@ const Agent = @import("../Agent.zig");
 const models = @import("../models.zig");
 const provider = @import("../provider.zig");
 
-pub fn accounts(keys: Accounts.ApiKeys, anthropic_ready: bool, openai_ready: bool) Accounts {
+pub fn accounts(
+    keys: Accounts.ApiKeys,
+    ready: struct { anthropic: bool = false, openai: bool = false },
+) Accounts {
     return .{
         .gpa = std.testing.allocator,
         .io = std.testing.io,
@@ -16,8 +19,8 @@ pub fn accounts(keys: Accounts.ApiKeys, anthropic_ready: bool, openai_ready: boo
         .anthropic_auth = undefined,
         .openai_auth = undefined,
         .keys = keys,
-        .anthropic_subscription_ready = anthropic_ready,
-        .openai_subscription_ready = openai_ready,
+        .anthropic_subscription_ready = ready.anthropic,
+        .openai_subscription_ready = ready.openai,
         .openai_subscription_context_windows = .empty,
     };
 }

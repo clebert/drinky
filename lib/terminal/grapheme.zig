@@ -52,9 +52,11 @@ const Decoded = struct { codepoint: u21, bytes: usize };
 fn decode(text: []const u8) Decoded {
     const lead = text[0];
     if (lead < 0x80) return .{ .codepoint = lead, .bytes = 1 };
-    const length = std.unicode.utf8ByteSequenceLength(lead) catch return .{ .codepoint = replacement, .bytes = 1 };
+    const length = std.unicode.utf8ByteSequenceLength(lead) catch
+        return .{ .codepoint = replacement, .bytes = 1 };
     if (text.len < length) return .{ .codepoint = replacement, .bytes = text.len };
-    const codepoint = std.unicode.utf8Decode(text[0..length]) catch return .{ .codepoint = replacement, .bytes = length };
+    const codepoint = std.unicode.utf8Decode(text[0..length]) catch
+        return .{ .codepoint = replacement, .bytes = length };
     return .{ .codepoint = codepoint, .bytes = length };
 }
 
@@ -65,7 +67,8 @@ fn cellWidth(codepoint: u21) usize {
     if (codepoint < 0x20 or codepoint == 0x7f) return 0;
     if (codepoint == 0xFE0F) return 2;
     if (codepoint < unicode_data.width_ranges[0].first) return 1;
-    const range = search(unicode_data.WidthRange, &unicode_data.width_ranges, codepoint) orelse return 1;
+    const range = search(unicode_data.WidthRange, &unicode_data.width_ranges, codepoint) orelse
+        return 1;
     return range.columns;
 }
 
@@ -76,7 +79,8 @@ fn classOf(codepoint: u21) unicode_data.Class {
     // The C0 controls and DEL sit below and above this range, so they still fall
     // through to the table.
     if (codepoint >= 0x20 and codepoint < 0x7f) return .other;
-    const range = search(unicode_data.ClassRange, &unicode_data.class_ranges, codepoint) orelse return .other;
+    const range = search(unicode_data.ClassRange, &unicode_data.class_ranges, codepoint) orelse
+        return .other;
     return range.class;
 }
 
@@ -117,7 +121,8 @@ const State = struct {
 
     /// Fold a code point that joined the cluster into the running state.
     fn advance(self: *State, class: unicode_data.Class) void {
-        self.regional_indicators = if (class == .regional_indicator) self.regional_indicators + 1 else 0;
+        self.regional_indicators =
+            if (class == .regional_indicator) self.regional_indicators + 1 else 0;
         switch (class) {
             .consonant => {
                 self.indic_armed = true;
@@ -159,7 +164,8 @@ const State = struct {
         if (previous == .control or previous == .cr or previous == .lf) return true;
         if (next == .control or next == .cr or next == .lf) return true;
         // GB6/GB7/GB8: Hangul syllable composition.
-        if (previous == .l and (next == .l or next == .v or next == .lv or next == .lvt)) return false;
+        if (previous == .l and (next == .l or next == .v or next == .lv or next == .lvt))
+            return false;
         if ((previous == .lv or previous == .v) and (next == .v or next == .t)) return false;
         if ((previous == .lvt or previous == .t) and next == .t) return false;
         // GB9/GB9a/GB9b: extending marks, spacing marks, prepend.
@@ -171,7 +177,8 @@ const State = struct {
         // GB11: emoji ZWJ sequence.
         if (self.pictographic_zwj and next == .extended_pictographic) return false;
         // GB12/GB13: keep Regional_Indicator pairs together.
-        if (previous == .regional_indicator and next == .regional_indicator and (self.regional_indicators & 1) == 1) return false;
+        if (previous == .regional_indicator and next == .regional_indicator and
+            (self.regional_indicators & 1) == 1) return false;
         // GB999.
         return true;
     }
@@ -198,7 +205,8 @@ test "stepAt folds a multi-code-point cluster into one cell" {
     // Thumbs-up plus skin tone: eight bytes, one two-column glyph.
     try std.testing.expectEqual(Step{ .bytes = 8, .columns = 2 }, stepAt("👍\u{1F3FD}"));
     // A four-emoji ZWJ family folds into one cluster.
-    try std.testing.expectEqual(@as(usize, 2), stepAt("👨\u{200D}👩\u{200D}👧\u{200D}👦").columns);
+    const family = stepAt("👨\u{200D}👩\u{200D}👧\u{200D}👦");
+    try std.testing.expectEqual(@as(usize, 2), family.columns);
     // GB11's ZWJ must sit right after the pictographic run: a doubled joiner
     // breaks, so only the first emoji and the two joiners form the cluster.
     try std.testing.expectEqual(@as(usize, 10), stepAt("😀\u{200D}\u{200D}😀").bytes);
@@ -258,7 +266,11 @@ test "UAX #29 grapheme cluster boundaries match the conformance corpus" {
             produced_len += 1;
         }
 
-        std.testing.expectEqualSlices(usize, expected[0..expected_len], produced[0..produced_len]) catch |err| {
+        std.testing.expectEqualSlices(
+            usize,
+            expected[0..expected_len],
+            produced[0..produced_len],
+        ) catch |err| {
             std.debug.print("grapheme corpus line {d}: {s}\n", .{ line_number, line });
             return err;
         };

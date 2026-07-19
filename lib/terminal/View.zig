@@ -129,7 +129,8 @@ pub const Sink = struct {
     /// syntax is accepted; cursor, screen, and string controls remain private to
     /// the renderer.
     pub fn sgr(self: *Sink, comptime sequence: []const u8) !void {
-        comptime if (!validSgr(sequence)) @compileError("trusted style must be one complete SGR sequence");
+        comptime if (!validSgr(sequence))
+            @compileError("trusted style must be one complete SGR sequence");
         try self.frame.blob.writer.writeAll(sequence);
     }
 
@@ -137,7 +138,9 @@ pub const Sink = struct {
     pub fn end(self: *Sink, anchor: Anchor) void {
         std.debug.assert(self.columns_written <= self.columns);
         const len = self.frame.blob.writer.end - self.offset;
-        self.frame.rows.appendAssumeCapacity(.{ .offset = self.offset, .len = len, .anchor = anchor });
+        self.frame.rows.appendAssumeCapacity(
+            .{ .offset = self.offset, .len = len, .anchor = anchor },
+        );
     }
 
     /// Place the caret on the row currently being composed — the one opened by
@@ -254,9 +257,9 @@ pub fn render(self: *View) !void {
     if (back.rows.items.len == 0) {
         try self.paintEmpty(prev_empty and !self.force_reset);
     } else if (self.force_reset) {
-        try self.paint(.reset, 0, back, 0);
+        try self.paint(.reset, back, .{});
     } else if (prev_empty or self.structural_change) {
-        try self.paint(if (prev_empty) .fresh else .reset, 0, back, 0);
+        try self.paint(if (prev_empty) .fresh else .reset, back, .{});
     } else if (findAlignment(prev, back)) |alignment| {
         if (alignment.back_index == 0) {
             // Forward slide: the new top row is shared; rows above it scrolled away.
@@ -266,55 +269,65 @@ pub fn render(self: *View) !void {
                 // A shrunk tail must reveal scrolled-off rows: a backward slide in disguise.
                 const shrank = back.rows.items.len + delta < prev.rows.items.len;
                 if (changed + delta < self.viewport_top or (shrank and self.viewport_top > 0)) {
-                    try self.paint(.reset, 0, back, 0);
+                    try self.paint(.reset, back, .{});
                 } else {
                     // Reprint no lower than the previous last row, so the append scrolls by \r\n.
-                    try self.paint(.incremental, @min(changed, deepest), back, self.cursor_row -| delta);
+                    try self.paint(.incremental, back, .{
+                        .anchor = @min(changed, deepest),
+                        .cursor_from = self.cursor_row -| delta,
+                    });
                 }
             } else if (delta == 0) {
                 // Content unchanged, so no slide happened: `cursor_row` is still valid.
                 try self.paintCaretOnly(back);
             } else if (self.viewport_top > 0) {
-                try self.paint(.reset, 0, back, 0);
+                try self.paint(.reset, back, .{});
             } else {
                 // A pure top-trim keeps the tail bytes but slides the window, so rebase.
-                try self.paint(.incremental, deepest, back, self.cursor_row -| delta);
+                try self.paint(.incremental, back, .{
+                    .anchor = deepest,
+                    .cursor_from = self.cursor_row -| delta,
+                });
             }
         } else if (self.viewport_top == 0) {
             // Backward slide: row 0 changed, reachable only when the whole window shows.
-            try self.paint(.incremental, 0, back, self.cursor_row);
+            try self.paint(.incremental, back, .{ .cursor_from = self.cursor_row });
         } else {
-            try self.paint(.reset, 0, back, 0);
+            try self.paint(.reset, back, .{});
         }
     } else {
-        try self.paint(.reset, 0, back, 0);
+        try self.paint(.reset, back, .{});
     }
     self.force_reset = false;
     self.front ^= 1;
 }
 
-/// Reprint `frame` from `anchor` down, positioning the cursor per `mode`. In
-/// `incremental` mode the move starts from `cursor_from`, the current cursor row
-/// expressed in this frame's coordinates. All motion counts physical rows.
-fn paint(self: *View, mode: Mode, anchor: usize, frame: *const Frame, cursor_from: usize) !void {
+/// Reprint `frame` from `rows.anchor` down, positioning the cursor per `mode`.
+/// In `incremental` mode the move starts from `rows.cursor_from`, the current
+/// cursor row expressed in this frame's coordinates. All motion counts physical
+/// rows.
+fn paint(self: *View, mode: Mode, frame: *const Frame, rows: struct {
+    anchor: usize = 0,
+    cursor_from: usize = 0,
+}) !void {
     const writer = self.writer;
     try writer.writeAll(escape.sync_set);
     switch (mode) {
         .fresh => {},
         .reset => try writer.writeAll(escape.screen_reset),
         .incremental => {
-            if (cursor_from >= anchor) {
-                try escape.cursorMove(writer, 'A', cursor_from - anchor);
+            if (rows.cursor_from >= rows.anchor) {
+                try escape.cursorMove(writer, 'A', rows.cursor_from - rows.anchor);
             } else {
-                try escape.cursorMove(writer, 'B', anchor - cursor_from);
+                try escape.cursorMove(writer, 'B', rows.anchor - rows.cursor_from);
             }
             try writer.writeAll("\r");
             try writer.writeAll(escape.screen_clear_below);
         },
     }
     const items = frame.rows.items;
-    for (items[anchor..], anchor..) |row, index| {
-        if (index > anchor) try writer.writeAll("\r\n");
+    for (items[rows.anchor..], rows.anchor..) |row, index| {
+        if (index > rows.anchor) try writer.writeAll("\r\n");
         try writer.writeAll(frame.bytes(row));
     }
     // The last `rows` physical rows are visible; everything above is scrollback.
@@ -404,7 +417,8 @@ fn firstChange(prev: *const Frame, prev_start: usize, back: *const Frame) ?usize
         const back_present = index < back_rows.len;
         const prev_present = prev_start + index < prev_rows.len;
         if (!back_present or !prev_present) return index;
-        if (!std.mem.eql(u8, back.bytes(back_rows[index]), prev.bytes(prev_rows[prev_start + index]))) {
+        const back_bytes = back.bytes(back_rows[index]);
+        if (!std.mem.eql(u8, back_bytes, prev.bytes(prev_rows[prev_start + index]))) {
             return index;
         }
     }
@@ -412,7 +426,9 @@ fn firstChange(prev: *const Frame, prev_start: usize, back: *const Frame) ?usize
 }
 
 fn validSgr(comptime sequence: []const u8) bool {
-    if (sequence.len < 3 or sequence[0] != 0x1b or sequence[1] != '[' or sequence[sequence.len - 1] != 'm') {
+    if (sequence.len < 3 or sequence[0] != 0x1b or sequence[1] != '[' or
+        sequence[sequence.len - 1] != 'm')
+    {
         return false;
     }
     for (sequence[2 .. sequence.len - 1]) |byte| {
@@ -461,7 +477,7 @@ const Harness = struct {
     }
 };
 
-fn harness(gpa: std.mem.Allocator, columns: usize) !*Harness {
+fn makeHarness(gpa: std.mem.Allocator, columns: usize) !*Harness {
     const self = try gpa.create(Harness);
     self.* = .{
         .out = .init(gpa),
@@ -486,35 +502,39 @@ fn boldLine(bytes: []const u8, id: usize) Line {
     return .{ .bytes = bytes, .anchor = .{ .id = id, .line = 0 }, .bold = true };
 }
 
-fn caretLine(bytes: []const u8, id: usize, column: usize) Line {
-    return .{ .bytes = bytes, .anchor = .{ .id = id, .line = 0 }, .caret = column };
+fn caretLine(bytes: []const u8, options: struct { id: usize, column: usize }) Line {
+    return .{
+        .bytes = bytes,
+        .anchor = .{ .id = options.id, .line = 0 },
+        .caret = options.column,
+    };
 }
 
 test "paints a fresh frame row for row" {
     const gpa = std.testing.allocator;
-    const h = try harness(gpa, 80);
+    const harness = try makeHarness(gpa, 80);
     defer {
-        h.deinit();
-        gpa.destroy(h);
+        harness.deinit();
+        gpa.destroy(harness);
     }
     const frame = [_]Line{ line("hello", 0), line("world", 1) };
-    try h.render(&frame, .{ .columns = 80, .rows = 24 }, 4);
-    try h.emulator.expectVisible(&.{ "hello", "world" });
-    try std.testing.expect(!h.emulator.cursor_visible);
+    try harness.render(&frame, .{ .columns = 80, .rows = 24 }, 4);
+    try harness.emulator.expectVisible(&.{ "hello", "world" });
+    try std.testing.expect(!harness.emulator.cursor_visible);
 }
 
 test "a sliding-window append repaints incrementally and keeps the caret synced" {
     const gpa = std.testing.allocator;
-    const h = try harness(gpa, 10);
+    const harness = try makeHarness(gpa, 10);
     defer {
-        h.deinit();
-        gpa.destroy(h);
+        harness.deinit();
+        gpa.destroy(harness);
     }
     // Two pages of three rows: the window holds six rows before it slides.
-    const first = [_]Line{ line("a", 0), line("b", 1), caretLine("c", 2, 1) };
-    try h.render(&first, .{ .columns = 10, .rows = 3 }, 2);
-    try h.emulator.expectVisible(&.{ "a", "b", "c" });
-    try h.emulator.expectCaret(3, 2, 1);
+    const first = [_]Line{ line("a", 0), line("b", 1), caretLine("c", .{ .id = 2, .column = 1 }) };
+    try harness.render(&first, .{ .columns = 10, .rows = 3 }, 2);
+    try harness.emulator.expectVisible(&.{ "a", "b", "c" });
+    try harness.emulator.expectCaret(.{ .frame_len = 3, .row = 2, .column = 1 });
 
     // Append four rows so the top row is evicted and the window slides by one.
     const second = [_]Line{
@@ -524,41 +544,44 @@ test "a sliding-window append repaints incrementally and keeps the caret synced"
         line("d", 3),
         line("e", 4),
         line("f", 5),
-        caretLine("g", 6, 1),
+        caretLine("g", .{ .id = 6, .column = 1 }),
     };
-    try h.render(&second, .{ .columns = 10, .rows = 3 }, 2);
-    try h.emulator.expectVisible(&.{ "b", "c", "d", "e", "f", "g" });
+    try harness.render(&second, .{ .columns = 10, .rows = 3 }, 2);
+    try harness.emulator.expectVisible(&.{ "b", "c", "d", "e", "f", "g" });
     // No reset: the append reprinted from the old last row; Δ rebase keeps the caret synced.
-    try h.emulator.expectCaret(6, 5, 1);
-    try std.testing.expect(std.mem.indexOf(u8, h.lastBytes(), escape.screen_reset) == null);
+    try harness.emulator.expectCaret(.{ .frame_len = 6, .row = 5, .column = 1 });
+    try std.testing.expect(std.mem.indexOf(u8, harness.lastBytes(), escape.screen_reset) == null);
 }
 
 test "a backward slide past one page resets" {
     const gpa = std.testing.allocator;
-    const h = try harness(gpa, 10);
+    const harness = try makeHarness(gpa, 10);
     defer {
-        h.deinit();
-        gpa.destroy(h);
+        harness.deinit();
+        gpa.destroy(harness);
     }
     // Window of four rows (two pages of two); the last four of six show.
-    const tall = [_]Line{ line("r0", 0), line("r1", 1), line("r2", 2), line("r3", 3), line("r4", 4), line("r5", 5) };
-    try h.render(&tall, .{ .columns = 10, .rows = 2 }, 2);
-    try h.emulator.expectVisible(&.{ "r2", "r3", "r4", "r5" });
+    const tall = [_]Line{
+        line("r0", 0), line("r1", 1), line("r2", 2),
+        line("r3", 3), line("r4", 4), line("r5", 5),
+    };
+    try harness.render(&tall, .{ .columns = 10, .rows = 2 }, 2);
+    try harness.emulator.expectVisible(&.{ "r2", "r3", "r4", "r5" });
 
     // The tail shrinks by two rows, pulling older rows back in above the shared
     // anchor: the first changed row is 0, which sits in scrollback -> reset.
     const short = [_]Line{ line("r0", 0), line("r1", 1), line("r2", 2), line("r3", 3) };
-    try h.render(&short, .{ .columns = 10, .rows = 2 }, 2);
-    try h.emulator.expectVisible(&.{ "r0", "r1", "r2", "r3" });
-    try std.testing.expect(std.mem.indexOf(u8, h.lastBytes(), escape.screen_reset) != null);
+    try harness.render(&short, .{ .columns = 10, .rows = 2 }, 2);
+    try harness.emulator.expectVisible(&.{ "r0", "r1", "r2", "r3" });
+    try std.testing.expect(std.mem.indexOf(u8, harness.lastBytes(), escape.screen_reset) != null);
 }
 
 test "a shrink while scrolled resets so the top of the frame returns" {
     const gpa = std.testing.allocator;
-    const h = try harness(gpa, 10);
+    const harness = try makeHarness(gpa, 10);
     defer {
-        h.deinit();
-        gpa.destroy(h);
+        harness.deinit();
+        gpa.destroy(harness);
     }
     // Eight rows in a four-row screen: r0..r3 scroll off, r4..r7 show. The frame
     // stays whole (well under the page budget), so its top anchor is always
@@ -567,8 +590,8 @@ test "a shrink while scrolled resets so the top of the frame returns" {
         line("r0", 0), line("r1", 1), line("r2", 2), line("r3", 3),
         line("r4", 4), line("r5", 5), line("r6", 6), line("r7", 7),
     };
-    try h.render(&tall, .{ .columns = 10, .rows = 4 }, 8);
-    try h.emulator.expectScreen(&.{ "r4", "r5", "r6", "r7" });
+    try harness.render(&tall, .{ .columns = 10, .rows = 4 }, 8);
+    try harness.emulator.expectScreen(&.{ "r4", "r5", "r6", "r7" });
 
     // Drop a row from the tail. The last page must now show r3, which had
     // scrolled off the top — reachable only by clearing and reprinting, since an
@@ -577,119 +600,122 @@ test "a shrink while scrolled resets so the top of the frame returns" {
         line("r0", 0), line("r1", 1), line("r2", 2), line("r3", 3),
         line("r4", 4), line("r5", 5), line("r7", 7),
     };
-    try h.render(&short, .{ .columns = 10, .rows = 4 }, 8);
-    try h.emulator.expectScreen(&.{ "r3", "r4", "r5", "r7" });
-    try std.testing.expect(std.mem.indexOf(u8, h.lastBytes(), escape.screen_reset) != null);
+    try harness.render(&short, .{ .columns = 10, .rows = 4 }, 8);
+    try harness.emulator.expectScreen(&.{ "r3", "r4", "r5", "r7" });
+    try std.testing.expect(std.mem.indexOf(u8, harness.lastBytes(), escape.screen_reset) != null);
 }
 
 test "a backward slide within one page reprints from row zero" {
     const gpa = std.testing.allocator;
-    const h = try harness(gpa, 10);
+    const harness = try makeHarness(gpa, 10);
     defer {
-        h.deinit();
-        gpa.destroy(h);
+        harness.deinit();
+        gpa.destroy(harness);
     }
     // Single-page window of three rows; the last three of five show.
-    const tall = [_]Line{ line("r0", 0), line("r1", 1), line("r2", 2), line("r3", 3), line("r4", 4) };
-    try h.render(&tall, .{ .columns = 10, .rows = 3 }, 1);
-    try h.emulator.expectVisible(&.{ "r2", "r3", "r4" });
+    const tall = [_]Line{
+        line("r0", 0), line("r1", 1), line("r2", 2), line("r3", 3), line("r4", 4),
+    };
+    try harness.render(&tall, .{ .columns = 10, .rows = 3 }, 1);
+    try harness.emulator.expectVisible(&.{ "r2", "r3", "r4" });
 
     const short = [_]Line{ line("r0", 0), line("r1", 1), line("r2", 2) };
-    try h.render(&short, .{ .columns = 10, .rows = 3 }, 1);
-    try h.emulator.expectVisible(&.{ "r0", "r1", "r2" });
+    try harness.render(&short, .{ .columns = 10, .rows = 3 }, 1);
+    try harness.emulator.expectVisible(&.{ "r0", "r1", "r2" });
     // Reprint from row 0, not a full reset: no scrollback clear, but a clear-below.
-    try std.testing.expect(std.mem.indexOf(u8, h.lastBytes(), escape.screen_reset) == null);
-    try std.testing.expect(std.mem.indexOf(u8, h.lastBytes(), escape.screen_clear_below) != null);
+    const last = harness.lastBytes();
+    try std.testing.expect(std.mem.indexOf(u8, last, escape.screen_reset) == null);
+    try std.testing.expect(std.mem.indexOf(u8, last, escape.screen_clear_below) != null);
 }
 
 test "a change above the viewport resets" {
     const gpa = std.testing.allocator;
-    const h = try harness(gpa, 10);
+    const harness = try makeHarness(gpa, 10);
     defer {
-        h.deinit();
-        gpa.destroy(h);
+        harness.deinit();
+        gpa.destroy(harness);
     }
     // Four rows over two pages of two: rows 0 and 1 sit in scrollback.
     const first = [_]Line{ line("r0", 0), line("r1", 1), line("r2", 2), line("r3", 3) };
-    try h.render(&first, .{ .columns = 10, .rows = 2 }, 2);
-    try h.emulator.expectVisible(&.{ "r0", "r1", "r2", "r3" });
+    try harness.render(&first, .{ .columns = 10, .rows = 2 }, 2);
+    try harness.emulator.expectVisible(&.{ "r0", "r1", "r2", "r3" });
 
     // Change the top row (its anchor is stable) — it is above the viewport.
     const second = [_]Line{ line("R0", 0), line("r1", 1), line("r2", 2), line("r3", 3) };
-    try h.render(&second, .{ .columns = 10, .rows = 2 }, 2);
-    try h.emulator.expectVisible(&.{ "R0", "r1", "r2", "r3" });
-    try std.testing.expect(std.mem.indexOf(u8, h.lastBytes(), escape.screen_reset) != null);
+    try harness.render(&second, .{ .columns = 10, .rows = 2 }, 2);
+    try harness.emulator.expectVisible(&.{ "R0", "r1", "r2", "r3" });
+    try std.testing.expect(std.mem.indexOf(u8, harness.lastBytes(), escape.screen_reset) != null);
 }
 
 test "a page-count change resets" {
     const gpa = std.testing.allocator;
-    const h = try harness(gpa, 10);
+    const harness = try makeHarness(gpa, 10);
     defer {
-        h.deinit();
-        gpa.destroy(h);
+        harness.deinit();
+        gpa.destroy(harness);
     }
     const frame = [_]Line{ line("a", 0), line("b", 1) };
-    try h.render(&frame, .{ .columns = 10, .rows = 4 }, 2);
-    try h.render(&frame, .{ .columns = 10, .rows = 4 }, 3);
-    try h.emulator.expectVisible(&.{ "a", "b" });
-    try std.testing.expect(std.mem.indexOf(u8, h.lastBytes(), escape.screen_reset) != null);
+    try harness.render(&frame, .{ .columns = 10, .rows = 4 }, 2);
+    try harness.render(&frame, .{ .columns = 10, .rows = 4 }, 3);
+    try harness.emulator.expectVisible(&.{ "a", "b" });
+    try std.testing.expect(std.mem.indexOf(u8, harness.lastBytes(), escape.screen_reset) != null);
 }
 
 test "a resize resets" {
     const gpa = std.testing.allocator;
-    const h = try harness(gpa, 10);
+    const harness = try makeHarness(gpa, 10);
     defer {
-        h.deinit();
-        gpa.destroy(h);
+        harness.deinit();
+        gpa.destroy(harness);
     }
     const frame = [_]Line{ line("a", 0), line("b", 1) };
-    try h.render(&frame, .{ .columns = 10, .rows = 4 }, 2);
-    try h.render(&frame, .{ .columns = 8, .rows = 4 }, 2);
-    try h.emulator.expectVisible(&.{ "a", "b" });
-    try std.testing.expect(std.mem.indexOf(u8, h.lastBytes(), escape.screen_reset) != null);
-    try h.render(&frame, .{ .columns = 8, .rows = 3 }, 2);
-    try h.emulator.expectVisible(&.{ "a", "b" });
-    try std.testing.expect(std.mem.indexOf(u8, h.lastBytes(), escape.screen_reset) != null);
+    try harness.render(&frame, .{ .columns = 10, .rows = 4 }, 2);
+    try harness.render(&frame, .{ .columns = 8, .rows = 4 }, 2);
+    try harness.emulator.expectVisible(&.{ "a", "b" });
+    try std.testing.expect(std.mem.indexOf(u8, harness.lastBytes(), escape.screen_reset) != null);
+    try harness.render(&frame, .{ .columns = 8, .rows = 3 }, 2);
+    try harness.emulator.expectVisible(&.{ "a", "b" });
+    try std.testing.expect(std.mem.indexOf(u8, harness.lastBytes(), escape.screen_reset) != null);
 }
 
 test "a jump with no shared anchor resets" {
     const gpa = std.testing.allocator;
-    const h = try harness(gpa, 10);
+    const harness = try makeHarness(gpa, 10);
     defer {
-        h.deinit();
-        gpa.destroy(h);
+        harness.deinit();
+        gpa.destroy(harness);
     }
     const first = [_]Line{ line("a", 0), line("b", 1) };
-    try h.render(&first, .{ .columns = 10, .rows = 4 }, 2);
+    try harness.render(&first, .{ .columns = 10, .rows = 4 }, 2);
     const second = [_]Line{ line("c", 100), line("d", 101) };
-    try h.render(&second, .{ .columns = 10, .rows = 4 }, 2);
-    try h.emulator.expectVisible(&.{ "c", "d" });
-    try std.testing.expect(std.mem.indexOf(u8, h.lastBytes(), escape.screen_reset) != null);
+    try harness.render(&second, .{ .columns = 10, .rows = 4 }, 2);
+    try harness.emulator.expectVisible(&.{ "c", "d" });
+    try std.testing.expect(std.mem.indexOf(u8, harness.lastBytes(), escape.screen_reset) != null);
 }
 
 test "a full-width row places the caret at the pending-wrap margin" {
     const gpa = std.testing.allocator;
-    const h = try harness(gpa, 3);
+    const harness = try makeHarness(gpa, 3);
     defer {
-        h.deinit();
-        gpa.destroy(h);
+        harness.deinit();
+        gpa.destroy(harness);
     }
     // "abc" is exactly three columns, leaving the terminal pending-wrap; the
     // `\r` before caret placement resolves it and CUF clamps at the last cell.
-    const frame = [_]Line{caretLine("abc", 0, 3)};
-    try h.render(&frame, .{ .columns = 3, .rows = 3 }, 1);
-    try h.emulator.expectVisible(&.{"abc"});
-    try h.emulator.expectCaret(1, 0, 2);
+    const frame = [_]Line{caretLine("abc", .{ .id = 0, .column = 3 })};
+    try harness.render(&frame, .{ .columns = 3, .rows = 3 }, 1);
+    try harness.emulator.expectVisible(&.{"abc"});
+    try harness.emulator.expectCaret(.{ .frame_len = 1, .row = 0, .column = 2 });
 }
 
 test "an over-wide row clips at the margin and keeps the cursor synced" {
     const gpa = std.testing.allocator;
-    const h = try harness(gpa, 3);
+    const harness = try makeHarness(gpa, 3);
     defer {
-        h.deinit();
-        gpa.destroy(h);
+        harness.deinit();
+        gpa.destroy(harness);
     }
-    const sink = try h.view.beginFrame(.{ .columns = 3, .rows = 4 }, 1);
+    const sink = try harness.view.beginFrame(.{ .columns = 3, .rows = 4 }, 1);
     sink.begin();
     try sink.text("abcdef");
     // A second fragment after the budget is spent adds no columns.
@@ -699,137 +725,145 @@ test "an over-wide row clips at the margin and keeps the cursor synced" {
     try sink.text("z");
     sink.setCaret(1);
     sink.end(.{ .id = 1, .line = 0 });
-    try h.view.render();
-    h.emulator.rows = 4;
-    try h.emulator.feed(h.out.written());
+    try harness.view.render();
+    harness.emulator.rows = 4;
+    try harness.emulator.feed(harness.out.written());
     // The over-wide row never wraps, so the frame stays two physical rows.
-    try std.testing.expectEqual(@as(usize, 2), h.emulator.document.items.len);
-    try std.testing.expect(std.mem.indexOf(u8, h.emulator.document.items[0].items, "abc") != null);
-    try std.testing.expect(std.mem.indexOfAny(u8, h.emulator.document.items[0].items, "defgh") == null);
-    try h.emulator.expectCaret(2, 1, 1);
+    try std.testing.expectEqual(@as(usize, 2), harness.emulator.document.items.len);
+    const top_row = harness.emulator.document.items[0].items;
+    try std.testing.expect(std.mem.indexOf(u8, top_row, "abc") != null);
+    try std.testing.expect(std.mem.indexOfAny(u8, top_row, "defgh") == null);
+    try harness.emulator.expectCaret(.{ .frame_len = 2, .row = 1, .column = 1 });
 }
 
 test "the caret is hidden with no caret and when above the viewport" {
     const gpa = std.testing.allocator;
-    const h = try harness(gpa, 5);
+    const harness = try makeHarness(gpa, 5);
     defer {
-        h.deinit();
-        gpa.destroy(h);
+        harness.deinit();
+        gpa.destroy(harness);
     }
     const none = [_]Line{ line("a", 0), line("b", 1) };
-    try h.render(&none, .{ .columns = 5, .rows = 2 }, 2);
-    try std.testing.expect(!h.emulator.cursor_visible);
+    try harness.render(&none, .{ .columns = 5, .rows = 2 }, 2);
+    try std.testing.expect(!harness.emulator.cursor_visible);
     // The cursor is already hidden, so a caret-less frame emits no redundant hide.
-    try h.render(&none, .{ .columns = 5, .rows = 2 }, 2);
-    try std.testing.expect(std.mem.indexOf(u8, h.lastBytes(), escape.cursor_hide) == null);
+    try harness.render(&none, .{ .columns = 5, .rows = 2 }, 2);
+    try std.testing.expect(std.mem.indexOf(u8, harness.lastBytes(), escape.cursor_hide) == null);
 
     // A caret on the top row of a four-row window whose viewport is two rows:
     // it is above the viewport and must stay hidden.
-    const above = [_]Line{ caretLine("a", 0, 1), line("b", 1), line("c", 2), line("d", 3) };
-    try h.render(&above, .{ .columns = 5, .rows = 2 }, 2);
-    try std.testing.expect(!h.emulator.cursor_visible);
+    const above = [_]Line{
+        caretLine("a", .{ .id = 0, .column = 1 }), line("b", 1), line("c", 2), line("d", 3),
+    };
+    try harness.render(&above, .{ .columns = 5, .rows = 2 }, 2);
+    try std.testing.expect(!harness.emulator.cursor_visible);
 }
 
 test "an empty frame wipes the region and hides the cursor" {
     const gpa = std.testing.allocator;
-    const h = try harness(gpa, 10);
+    const harness = try makeHarness(gpa, 10);
     defer {
-        h.deinit();
-        gpa.destroy(h);
+        harness.deinit();
+        gpa.destroy(harness);
     }
-    const frame = [_]Line{caretLine("x", 0, 1)};
-    try h.render(&frame, .{ .columns = 10, .rows = 4 }, 2);
-    try std.testing.expect(h.emulator.cursor_visible);
+    const frame = [_]Line{caretLine("x", .{ .id = 0, .column = 1 })};
+    try harness.render(&frame, .{ .columns = 10, .rows = 4 }, 2);
+    try std.testing.expect(harness.emulator.cursor_visible);
 
-    try h.render(&.{}, .{ .columns = 10, .rows = 4 }, 2);
-    try std.testing.expect(!h.emulator.cursor_visible);
-    try std.testing.expect(std.mem.indexOf(u8, h.lastBytes(), escape.screen_reset) != null);
+    try harness.render(&.{}, .{ .columns = 10, .rows = 4 }, 2);
+    try std.testing.expect(!harness.emulator.cursor_visible);
+    try std.testing.expect(std.mem.indexOf(u8, harness.lastBytes(), escape.screen_reset) != null);
 }
 
 test "an unchanged frame emits only caret motion" {
     const gpa = std.testing.allocator;
-    const h = try harness(gpa, 10);
+    const harness = try makeHarness(gpa, 10);
     defer {
-        h.deinit();
-        gpa.destroy(h);
+        harness.deinit();
+        gpa.destroy(harness);
     }
-    const first = [_]Line{caretLine("ab", 0, 2)};
-    try h.render(&first, .{ .columns = 10, .rows = 4 }, 2);
-    try h.emulator.expectCaret(1, 0, 2);
+    const first = [_]Line{caretLine("ab", .{ .id = 0, .column = 2 })};
+    try harness.render(&first, .{ .columns = 10, .rows = 4 }, 2);
+    try harness.emulator.expectCaret(.{ .frame_len = 1, .row = 0, .column = 2 });
 
     // Same bytes, caret moved left: no reprint, just a cursor move.
-    const moved = [_]Line{caretLine("ab", 0, 1)};
-    try h.render(&moved, .{ .columns = 10, .rows = 4 }, 2);
-    try h.emulator.expectCaret(1, 0, 1);
-    try std.testing.expect(std.mem.indexOf(u8, h.lastBytes(), escape.screen_reset) == null);
-    try std.testing.expect(std.mem.indexOf(u8, h.lastBytes(), escape.screen_clear_below) == null);
-    try std.testing.expect(std.mem.indexOf(u8, h.lastBytes(), "ab") == null);
+    const moved = [_]Line{caretLine("ab", .{ .id = 0, .column = 1 })};
+    try harness.render(&moved, .{ .columns = 10, .rows = 4 }, 2);
+    try harness.emulator.expectCaret(.{ .frame_len = 1, .row = 0, .column = 1 });
+    const last = harness.lastBytes();
+    try std.testing.expect(std.mem.indexOf(u8, last, escape.screen_reset) == null);
+    try std.testing.expect(std.mem.indexOf(u8, last, escape.screen_clear_below) == null);
+    try std.testing.expect(std.mem.indexOf(u8, last, "ab") == null);
     // The caret was already visible, so no redundant show is emitted.
-    try std.testing.expect(std.mem.indexOf(u8, h.lastBytes(), escape.cursor_show) == null);
+    try std.testing.expect(std.mem.indexOf(u8, last, escape.cursor_show) == null);
 }
 
 test "a pure top-trim repaints the identical tail and rebases the caret" {
     const gpa = std.testing.allocator;
-    const h = try harness(gpa, 10);
+    const harness = try makeHarness(gpa, 10);
     defer {
-        h.deinit();
-        gpa.destroy(h);
+        harness.deinit();
+        gpa.destroy(harness);
     }
-    const first = [_]Line{ line("a", 0), line("b", 1), caretLine("c", 2, 1) };
-    try h.render(&first, .{ .columns = 10, .rows = 3 }, 1);
-    try h.emulator.expectCaret(3, 2, 1);
+    const first = [_]Line{ line("a", 0), line("b", 1), caretLine("c", .{ .id = 2, .column = 1 }) };
+    try harness.render(&first, .{ .columns = 10, .rows = 3 }, 1);
+    try harness.emulator.expectCaret(.{ .frame_len = 3, .row = 2, .column = 1 });
 
     // The top row is trimmed and the remaining rows are byte-identical: the
     // window still slid, so a caret-only paint would desync `cursor_row`.
-    const second = [_]Line{ line("b", 1), caretLine("c", 2, 1) };
-    try h.render(&second, .{ .columns = 10, .rows = 3 }, 1);
-    try h.emulator.expectCaret(2, 1, 1);
-    try std.testing.expect(std.mem.indexOf(u8, h.lastBytes(), escape.screen_reset) == null);
+    const second = [_]Line{ line("b", 1), caretLine("c", .{ .id = 2, .column = 1 }) };
+    try harness.render(&second, .{ .columns = 10, .rows = 3 }, 1);
+    try harness.emulator.expectCaret(.{ .frame_len = 2, .row = 1, .column = 1 });
+    try std.testing.expect(std.mem.indexOf(u8, harness.lastBytes(), escape.screen_reset) == null);
 
-    const third = [_]Line{ line("b", 1), line("c", 2), caretLine("d", 3, 1) };
-    try h.render(&third, .{ .columns = 10, .rows = 3 }, 1);
-    try h.emulator.expectScreen(&.{ "b", "c", "d" });
-    try h.emulator.expectCaret(3, 2, 1);
+    const third = [_]Line{ line("b", 1), line("c", 2), caretLine("d", .{ .id = 3, .column = 1 }) };
+    try harness.render(&third, .{ .columns = 10, .rows = 3 }, 1);
+    try harness.emulator.expectScreen(&.{ "b", "c", "d" });
+    try harness.emulator.expectCaret(.{ .frame_len = 3, .row = 2, .column = 1 });
 }
 
 test "a pure top-trim with rows scrolled off resets" {
     const gpa = std.testing.allocator;
-    const h = try harness(gpa, 10);
+    const harness = try makeHarness(gpa, 10);
     defer {
-        h.deinit();
-        gpa.destroy(h);
+        harness.deinit();
+        gpa.destroy(harness);
     }
     // Four rows over two pages of two: rows 0 and 1 sit in scrollback.
-    const first = [_]Line{ line("r0", 0), line("r1", 1), line("r2", 2), caretLine("r3", 3, 1) };
-    try h.render(&first, .{ .columns = 10, .rows = 2 }, 2);
-    try h.emulator.expectScreen(&.{ "r2", "r3" });
+    const first = [_]Line{
+        line("r0", 0), line("r1", 1), line("r2", 2), caretLine("r3", .{ .id = 3, .column = 1 }),
+    };
+    try harness.render(&first, .{ .columns = 10, .rows = 2 }, 2);
+    try harness.emulator.expectScreen(&.{ "r2", "r3" });
 
     // Trim the top row with the tail byte-identical: the slid window cannot be
     // reconciled incrementally against a partly scrolled-off screen.
-    const second = [_]Line{ line("r1", 1), line("r2", 2), caretLine("r3", 3, 1) };
-    try h.render(&second, .{ .columns = 10, .rows = 2 }, 2);
-    try h.emulator.expectScreen(&.{ "r2", "r3" });
-    try h.emulator.expectCaret(3, 2, 1);
-    try std.testing.expect(std.mem.indexOf(u8, h.lastBytes(), escape.screen_reset) != null);
+    const second = [_]Line{
+        line("r1", 1), line("r2", 2), caretLine("r3", .{ .id = 3, .column = 1 }),
+    };
+    try harness.render(&second, .{ .columns = 10, .rows = 2 }, 2);
+    try harness.emulator.expectScreen(&.{ "r2", "r3" });
+    try harness.emulator.expectCaret(.{ .frame_len = 3, .row = 2, .column = 1 });
+    try std.testing.expect(std.mem.indexOf(u8, harness.lastBytes(), escape.screen_reset) != null);
 }
 
 test "invalidate forces a full reset even when content is unchanged" {
     const gpa = std.testing.allocator;
-    const h = try harness(gpa, 10);
+    const harness = try makeHarness(gpa, 10);
     defer {
-        h.deinit();
-        gpa.destroy(h);
+        harness.deinit();
+        gpa.destroy(harness);
     }
     const frame = [_]Line{ line("hello", 0), line("world", 1) };
-    try h.render(&frame, .{ .columns = 10, .rows = 4 }, 2);
-    try h.emulator.expectVisible(&.{ "hello", "world" });
+    try harness.render(&frame, .{ .columns = 10, .rows = 4 }, 2);
+    try harness.emulator.expectVisible(&.{ "hello", "world" });
 
     // External output scrolled the terminal; the same content must reprint from a
     // full clear rather than diff to a caret-only paint.
-    h.view.invalidate();
-    try h.render(&frame, .{ .columns = 10, .rows = 4 }, 2);
-    try h.emulator.expectVisible(&.{ "hello", "world" });
-    try std.testing.expect(std.mem.indexOf(u8, h.lastBytes(), escape.screen_reset) != null);
+    harness.view.invalidate();
+    try harness.render(&frame, .{ .columns = 10, .rows = 4 }, 2);
+    try harness.emulator.expectVisible(&.{ "hello", "world" });
+    try std.testing.expect(std.mem.indexOf(u8, harness.lastBytes(), escape.screen_reset) != null);
 }
 
 test "canonical text boundaries survive separate sink writes" {
@@ -851,12 +885,14 @@ test "canonical text boundaries survive separate sink writes" {
     try sink.text("👩");
     try sink.spaces(2);
     sink.end(.{ .id = 0, .line = 0 });
-    try std.testing.expectEqual(sink.columns_written, width.ofText(sink.frame.bytes(sink.frame.rows.items[0])));
+    const first_row = sink.frame.bytes(sink.frame.rows.items[0]);
+    try std.testing.expectEqual(sink.columns_written, width.ofText(first_row));
     sink.begin();
     try sink.spaces(1);
     try sink.text("\u{FE0F}");
     sink.end(.{ .id = 1, .line = 0 });
-    try std.testing.expectEqual(sink.columns_written, width.ofText(sink.frame.bytes(sink.frame.rows.items[1])));
+    const other_row = sink.frame.bytes(sink.frame.rows.items[1]);
+    try std.testing.expectEqual(sink.columns_written, width.ofText(other_row));
     try view.render();
 
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "\u{200D}👩") == null);
@@ -865,19 +901,19 @@ test "canonical text boundaries survive separate sink writes" {
 
 test "a styled row reprinted from its own start carries its escapes" {
     const gpa = std.testing.allocator;
-    const h = try harness(gpa, 20);
+    const harness = try makeHarness(gpa, 20);
     defer {
-        h.deinit();
-        gpa.destroy(h);
+        harness.deinit();
+        gpa.destroy(harness);
     }
     const styled = "\x1b[1mBOLD\x1b[0m";
     const first = [_]Line{ line("a", 0), line("b", 1) };
-    try h.render(&first, .{ .columns = 20, .rows = 4 }, 2);
+    try harness.render(&first, .{ .columns = 20, .rows = 4 }, 2);
 
     // Only the second row changes, so the incremental repaint begins at it.
     const second = [_]Line{ line("a", 0), boldLine("BOLD", 1) };
-    try h.render(&second, .{ .columns = 20, .rows = 4 }, 2);
-    try h.emulator.expectVisible(&.{ "a", "BOLD" });
+    try harness.render(&second, .{ .columns = 20, .rows = 4 }, 2);
+    try harness.emulator.expectVisible(&.{ "a", "BOLD" });
     // The row re-opens and closes its own SGR, relying on no state from above.
-    try std.testing.expect(std.mem.indexOf(u8, h.lastBytes(), styled) != null);
+    try std.testing.expect(std.mem.indexOf(u8, harness.lastBytes(), styled) != null);
 }

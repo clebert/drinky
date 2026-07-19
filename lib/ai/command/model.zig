@@ -8,7 +8,6 @@ const Accounts = @import("../Accounts.zig");
 const llm = @import("../llm.zig");
 const models = @import("../models.zig");
 const Context = @import("Context.zig");
-const Outcome = @import("outcome.zig").Outcome;
 const testing = @import("testing.zig");
 
 pub const name = "model";
@@ -16,19 +15,20 @@ pub const name = "model";
 /// One selectable list row: a model bound to the account it runs under.
 const Combo = struct { account: llm.Account, model: models.Model };
 
-pub fn run(context: *Context) !Outcome {
+pub fn run(context: *Context) !Context.Outcome {
     const gpa = context.gpa;
 
     var combos: std.ArrayList(Combo) = .empty;
     defer combos.deinit(gpa);
     try collect(context.accounts, &combos, gpa);
     if (combos.items.len == 0)
-        return Outcome.report(gpa, .err, "no authenticated accounts", .{});
+        return Context.Outcome.report(gpa, .err, "no authenticated accounts", .{});
 
-    const active_account: ?llm.Account = if (context.agent.client) |client| client.account() else null;
+    const active_account: ?llm.Account =
+        if (context.agent.client) |client| client.account() else null;
     const active_model = context.agent.model.name;
 
-    var options: Outcome.Options = .{ .gpa = gpa };
+    var options: Context.Outcome.Options = .{ .gpa = gpa };
     errdefer options.deinit();
     var current: ?usize = null;
     for (combos.items, 0..) |combo, index| {
@@ -46,17 +46,20 @@ pub fn run(context: *Context) !Outcome {
     } };
 }
 
-pub fn select(context: *Context, index: usize) !Outcome {
+pub fn select(context: *Context, index: usize) !Context.Outcome {
     const gpa = context.gpa;
     var combos: std.ArrayList(Combo) = .empty;
     defer combos.deinit(gpa);
     try collect(context.accounts, &combos, gpa);
     if (index >= combos.items.len)
-        return Outcome.report(gpa, .err, "invalid selection", .{});
+        return Context.Outcome.report(gpa, .err, "invalid selection", .{});
 
     const combo = combos.items[index];
     context.agent.switchTo(context.accounts.client(combo.account).?, combo.model);
-    return Outcome.report(gpa, .ok, "switched to {s} ({s})", .{ combo.model.name, combo.account.label() });
+    return Context.Outcome.report(gpa, .ok, "switched to {s} ({s})", .{
+        combo.model.name,
+        combo.account.label(),
+    });
 }
 
 /// The picker's rows in account-enum then table order, re-derived identically by
@@ -74,7 +77,7 @@ fn collect(accounts: *const Accounts, out: *std.ArrayList(Combo), gpa: std.mem.A
 
 test "the picker lists every authenticated account's models, marking the active one" {
     const gpa = std.testing.allocator;
-    var accounts = testing.accounts(.{ .anthropic = "sk-ant", .openai = "sk-openai" }, false, false);
+    var accounts = testing.accounts(.{ .anthropic = "sk-ant", .openai = "sk-openai" }, .{});
     var agent = testing.agent(gpa, .{ .anthropic_api = "sk-ant" });
     defer agent.deinit();
     var context: Context = .{ .gpa = gpa, .agent = &agent, .accounts = &accounts };
@@ -89,7 +92,10 @@ test "the picker lists every authenticated account's models, marking the active 
             try std.testing.expectEqual(@as(usize, 6), pick.options.len);
             try std.testing.expectEqualStrings("claude-opus-4-8 (anthropic api)", pick.options[0]);
             try std.testing.expectEqualStrings("gpt-5.6-sol (openai api)", pick.options[3]);
-            try std.testing.expectEqualStrings("claude-sonnet-4-6 (anthropic api)", pick.options[pick.current.?]);
+            try std.testing.expectEqualStrings(
+                "claude-sonnet-4-6 (anthropic api)",
+                pick.options[pick.current.?],
+            );
         },
         else => return error.ExpectedPick,
     }
@@ -97,33 +103,33 @@ test "the picker lists every authenticated account's models, marking the active 
 
 test "select switches to the chosen account and model" {
     const gpa = std.testing.allocator;
-    var accounts = testing.accounts(.{ .anthropic = "sk-ant", .openai = "sk-openai" }, false, false);
+    var accounts = testing.accounts(.{ .anthropic = "sk-ant", .openai = "sk-openai" }, .{});
     var agent = testing.agent(gpa, .{ .anthropic_api = "sk-ant" });
     defer agent.deinit();
     var context: Context = .{ .gpa = gpa, .agent = &agent, .accounts = &accounts };
 
     // Row 3 is the first openai model, so selecting it crosses vendors.
-    try Outcome.expectFeedback(try select(&context, 3), .ok);
+    try Context.Outcome.expectFeedback(try select(&context, 3), .ok);
     try std.testing.expectEqualStrings("gpt-5.6-sol", agent.model.name);
     try std.testing.expectEqual(llm.Account.openai_api, agent.client.?.account());
 
-    try Outcome.expectFeedback(try select(&context, 99), .err);
+    try Context.Outcome.expectFeedback(try select(&context, 99), .err);
     try std.testing.expectEqualStrings("gpt-5.6-sol", agent.model.name);
 }
 
 test "no authenticated accounts reports an error instead of a picker" {
     const gpa = std.testing.allocator;
-    var accounts = testing.accounts(.{}, false, false);
+    var accounts = testing.accounts(.{}, .{});
     var context: Context = .{ .gpa = gpa, .agent = undefined, .accounts = &accounts };
 
-    try Outcome.expectFeedback(try run(&context), .err);
+    try Context.Outcome.expectFeedback(try run(&context), .err);
 }
 
 test "the active mark matches the account, not just the model name" {
     const gpa = std.testing.allocator;
     // Both anthropic accounts are authenticated, so every model name appears
     // twice; the mark must land on the active subscription's row.
-    var accounts = testing.accounts(.{ .anthropic = "sk-ant" }, true, false);
+    var accounts = testing.accounts(.{ .anthropic = "sk-ant" }, .{ .anthropic = true });
     var agent = testing.agent(gpa, .{ .anthropic_subscription = undefined });
     defer agent.deinit();
     var context: Context = .{ .gpa = gpa, .agent = &agent, .accounts = &accounts };
@@ -134,14 +140,17 @@ test "the active mark matches the account, not just the model name" {
                 for (pick.options) |option| gpa.free(option);
                 gpa.free(pick.options);
             }
-            try std.testing.expectEqualStrings("claude-sonnet-4-6 (anthropic subscription)", pick.options[pick.current.?]);
+            try std.testing.expectEqualStrings(
+                "claude-sonnet-4-6 (anthropic subscription)",
+                pick.options[pick.current.?],
+            );
         },
         else => return error.ExpectedPick,
     }
 }
 
 fn runUnderOom(gpa: std.mem.Allocator) !void {
-    var accounts = testing.accounts(.{ .anthropic = "sk-ant", .openai = "sk-openai" }, false, false);
+    var accounts = testing.accounts(.{ .anthropic = "sk-ant", .openai = "sk-openai" }, .{});
     var agent = testing.agent(gpa, .{ .anthropic_api = "sk-ant" });
     defer agent.deinit();
     var context: Context = .{ .gpa = gpa, .agent = &agent, .accounts = &accounts };

@@ -58,7 +58,10 @@ pub const Entry = union(enum) {
     /// rows (nonzero only for the clip).
     pub fn render(self: *const Entry, placement: *const paint.Placement) !void {
         switch (self.*) {
-            .intro => |text| try paint.notice(placement, &.{ .style = .dim, .prefix = "" }, text.items),
+            .intro => |text| try paint.notice(placement, &.{
+                .style = .dim,
+                .prefix = "",
+            }, text.items),
             .feedback => |flagged| try paint.notice(placement, &.{
                 .style = if (flagged.is_error) .red else .dim,
                 .prefix = if (flagged.is_error) "error: " else "",
@@ -68,7 +71,10 @@ pub const Entry = union(enum) {
                 .foreground = .user_foreground,
             }, text.items),
             .tool_result => |flagged| try paint.box(placement, &.{
-                .background = if (flagged.is_error) .tool_error_background else .tool_success_background,
+                .background = if (flagged.is_error)
+                    .tool_error_background
+                else
+                    .tool_success_background,
                 .foreground = .tool_foreground,
             }, flagged.text.items),
             .thinking => |text| try paint.wrapped(placement, .dim, text.items),
@@ -105,7 +111,8 @@ fn renderedRows(gpa: std.mem.Allocator, entry: *const Entry, columns: usize, ski
     var view = terminal.View.init(gpa, &out.writer);
     defer view.deinit();
     const sink = try view.beginFrame(.{ .columns = columns, .rows = 100 }, 8);
-    const placement: paint.Placement = .{ .sink = sink, .id = 0, .columns = columns, .base = 0, .skip = skip };
+    const placement: paint.Placement =
+        .{ .sink = sink, .id = 0, .columns = columns, .base = 0, .skip = skip };
     try entry.render(&placement);
     try view.render();
     return paintedRows(out.written());
@@ -119,9 +126,12 @@ test "each entry variant renders exactly the rows it counts" {
         .{ .kind = .intro, .is_error = false, .text = "a single intro line" },
         .{ .kind = .feedback, .is_error = false, .text = "first\nsecond\nthird" },
         .{ .kind = .feedback, .is_error = true, .text = "boom" },
-        .{ .kind = .user, .is_error = false, .text = "a user message long enough to wrap across the narrow test width more than once" },
-        .{ .kind = .model, .is_error = false, .text = "model reply\nwith a blank\n\nthen a long paragraph that must wrap several rows" },
-        .{ .kind = .thinking, .is_error = false, .text = "reasoning that runs on\n\nlong enough to wrap across the narrow test width more than once" },
+        .{ .kind = .user, .is_error = false, .text = "a user message long enough to wrap " ++
+            "across the narrow test width more than once" },
+        .{ .kind = .model, .is_error = false, .text = "model reply\nwith a blank\n\n" ++
+            "then a long paragraph that must wrap several rows" },
+        .{ .kind = .thinking, .is_error = false, .text = "reasoning that runs on\n\n" ++
+            "long enough to wrap across the narrow test width more than once" },
         .{ .kind = .tool_result, .is_error = true, .text = "read foo.zig\n→ no such file" },
         // A wide-glyph box, to exercise the narrow-width row cap.
         .{ .kind = .user, .is_error = false, .text = "你好世界" },
@@ -132,8 +142,10 @@ test "each entry variant renders exactly the rows it counts" {
     for (cases) |case| {
         var entry = try Entry.init(gpa, case.kind, case.is_error, case.text);
         defer entry.deinit(gpa);
-        for (widths) |columns|
-            try std.testing.expectEqual(entry.rows(columns), try renderedRows(gpa, &entry, columns, 0));
+        for (widths) |columns| {
+            const painted = try renderedRows(gpa, &entry, columns, 0);
+            try std.testing.expectEqual(entry.rows(columns), painted);
+        }
     }
 }
 
@@ -192,7 +204,8 @@ test "a clipped block streams into a warmed frame without allocating" {
     // Warm both frames and the output at the block's full size.
     for (0..2) |_| {
         const sink = try view.beginFrame(.{ .columns = columns, .rows = 100 }, 8);
-        const placement: paint.Placement = .{ .sink = sink, .id = 0, .columns = columns, .base = 0, .skip = 0 };
+        const placement: paint.Placement =
+            .{ .sink = sink, .id = 0, .columns = columns, .base = 0, .skip = 0 };
         try entry.render(&placement);
         try view.render();
     }
@@ -202,7 +215,8 @@ test "a clipped block streams into a warmed frame without allocating" {
     failing.resize_fail_index = failing.resize_index;
 
     const sink = try view.beginFrame(.{ .columns = columns, .rows = 100 }, 8);
-    const placement: paint.Placement = .{ .sink = sink, .id = 0, .columns = columns, .base = 0, .skip = 30 };
+    const placement: paint.Placement =
+        .{ .sink = sink, .id = 0, .columns = columns, .base = 0, .skip = 30 };
     try entry.render(&placement);
     try view.render();
 }

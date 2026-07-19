@@ -82,12 +82,12 @@ pub fn moveDown(self: *Picker) !void {
 }
 
 /// Re-clamp the scroll offset so the highlighted option's wrapped row stays
-/// inside the visible window. Call once per repaint, passing the same `columns`
-/// and `viewport_rows` that `render` and `rows` will use, so all three agree.
-pub fn reflow(self: *Picker, columns: usize, viewport_rows: usize) void {
-    const columns_max = @max(columns, 1);
+/// inside the visible window. Call once per repaint, passing the same `size`
+/// whose columns and rows `render` and `rows` will use, so all three agree.
+pub fn reflow(self: *Picker, size: terminal.View.Size) void {
+    const columns_max = @max(size.columns, 1);
     const total_body = terminal.width.rows(self.content.items, columns_max);
-    const visible = @min(total_body, paint.bodyLimit(viewport_rows));
+    const visible = @min(total_body, paint.bodyLimit(size.rows));
     const prefix = self.content.items[0..self.cursor_offset];
     const cursor_row = terminal.width.caret(prefix, columns_max).rows_before;
     if (cursor_row < self.scroll) self.scroll = cursor_row;
@@ -96,10 +96,10 @@ pub fn reflow(self: *Picker, columns: usize, viewport_rows: usize) void {
 }
 
 /// Physical rows the picker occupies: the two framing rules plus the wrapped
-/// body, the body capped to its scroll limit for `viewport_rows`.
-pub fn rows(self: *const Picker, columns: usize, viewport_rows: usize) usize {
-    const total_body = terminal.width.rows(self.content.items, @max(columns, 1));
-    return paint.framedRows(@min(total_body, paint.bodyLimit(viewport_rows)));
+/// body, the body capped to its scroll limit for `size.rows`.
+pub fn rows(self: *const Picker, size: terminal.View.Size) usize {
+    const total_body = terminal.width.rows(self.content.items, @max(size.columns, 1));
+    return paint.framedRows(@min(total_body, paint.bodyLimit(size.rows)));
 }
 
 /// Stream the framed picker — the rules and the wrapped body, windowed to its
@@ -191,7 +191,7 @@ test "compose lays out the title, hint, options, and the current marker" {
     defer picker.deinit();
 
     // Two rules, a blank, title, hint, two options, a blank: eight rows.
-    try std.testing.expectEqual(@as(usize, 8), picker.rows(80, 24));
+    try std.testing.expectEqual(@as(usize, 8), picker.rows(.{ .columns = 80, .rows = 24 }));
     try std.testing.expect(std.mem.indexOf(u8, picker.content.items, "Pick") != null);
     try std.testing.expect(std.mem.indexOf(u8, picker.content.items, "esc cancel") != null);
     try std.testing.expect(std.mem.indexOf(u8, picker.content.items, "alpha (current)") != null);
@@ -211,13 +211,13 @@ test "a tall option list scrolls the window to keep the selection in view" {
 
     // A 20-row viewport caps the body at six rows; with the selection on the
     // first option the window sits at the top and nothing scrolls.
-    picker.reflow(80, 20);
+    picker.reflow(.{ .columns = 80, .rows = 20 });
     try std.testing.expectEqual(@as(usize, 0), picker.scroll);
-    try std.testing.expectEqual(@as(usize, 8), picker.rows(80, 20));
+    try std.testing.expectEqual(@as(usize, 8), picker.rows(.{ .columns = 80, .rows = 20 }));
 
     // Walking the selection to the last option drags the window down after it.
     for (0..19) |_| try picker.moveDown();
-    picker.reflow(80, 20);
+    picker.reflow(.{ .columns = 80, .rows = 20 });
     try std.testing.expectEqual(@as(usize, 17), picker.scroll);
 
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -225,7 +225,8 @@ test "a tall option list scrolls the window to keep the selection in view" {
     var view = terminal.View.init(gpa, &out.writer);
     defer view.deinit();
     const sink = try view.beginFrame(.{ .columns = 80, .rows = 20 }, 4);
-    const placement: paint.Placement = .{ .sink = sink, .id = 0, .columns = 80, .base = 0, .skip = 0 };
+    const placement: paint.Placement =
+        .{ .sink = sink, .id = 0, .columns = 80, .base = 0, .skip = 0 };
     try picker.render(&placement, 20);
     try view.render();
     const painted = out.written();

@@ -92,15 +92,19 @@ test "push and take survive concurrent contention" {
 
     const work = struct {
         const Task = struct { producer: usize, count: usize };
-        const Located = struct { producer: usize, seq: usize };
+        const Located = struct { producer: usize, sequence: usize };
 
         // Push uniquely tagged messages so the consumer can prove none are
         // lost, duplicated, or torn.
         fn produce(steering: *Steering, task: Task) error{OutOfMemory}!void {
             var buffer: [32]u8 = undefined;
-            var seq: usize = 0;
-            while (seq < task.count) : (seq += 1) {
-                const text = std.fmt.bufPrint(&buffer, "steer p{d} #{d}", .{ task.producer, seq }) catch unreachable;
+            var sequence: usize = 0;
+            while (sequence < task.count) : (sequence += 1) {
+                const text = std.fmt.bufPrint(
+                    &buffer,
+                    "steer p{d} #{d}",
+                    .{ task.producer, sequence },
+                ) catch unreachable;
                 try steering.push(text);
             }
         }
@@ -114,7 +118,7 @@ test "push and take survive concurrent contention" {
             if (!std.mem.startsWith(u8, tail, "#")) return error.Corrupt;
             return .{
                 .producer = std.fmt.parseInt(usize, rest[0..gap], 10) catch return error.Corrupt,
-                .seq = std.fmt.parseInt(usize, tail[1..], 10) catch return error.Corrupt,
+                .sequence = std.fmt.parseInt(usize, tail[1..], 10) catch return error.Corrupt,
             };
         }
     };
@@ -128,7 +132,10 @@ test "push and take survive concurrent contention" {
     steering.mutex.lockUncancelable(io);
     var futures: [producer_count]std.Io.Future(error{OutOfMemory}!void) = undefined;
     for (&futures, 0..) |*future, index| {
-        future.* = try io.concurrent(work.produce, .{ &steering, work.Task{ .producer = index, .count = per_producer } });
+        future.* = try io.concurrent(
+            work.produce,
+            .{ &steering, work.Task{ .producer = index, .count = per_producer } },
+        );
     }
     // Reap producers before `steering.deinit`, so an early failure never frees
     // the queue mid-push.
@@ -174,8 +181,8 @@ test "push and take survive concurrent contention" {
         for (batch) |message| {
             const located = try work.parse(message);
             try std.testing.expect(located.producer < producer_count);
-            try std.testing.expect(located.seq < per_producer);
-            const slot = located.producer * per_producer + located.seq;
+            try std.testing.expect(located.sequence < per_producer);
+            const slot = located.producer * per_producer + located.sequence;
             try std.testing.expect(!seen[slot]);
             seen[slot] = true;
             collected += 1;

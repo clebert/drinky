@@ -5,15 +5,14 @@ const std = @import("std");
 
 const llm = @import("../llm.zig");
 const Context = @import("Context.zig");
-const Outcome = @import("outcome.zig").Outcome;
 const testing = @import("testing.zig");
 
 pub const name = "effort";
 
 const levels = std.enums.values(llm.Effort);
 
-pub fn run(context: *Context) !Outcome {
-    var options: Outcome.Options = .{ .gpa = context.gpa };
+pub fn run(context: *Context) !Context.Outcome {
+    var options: Context.Outcome.Options = .{ .gpa = context.gpa };
     errdefer options.deinit();
     var current: ?usize = null;
     for (levels, 0..) |level, index| {
@@ -28,12 +27,12 @@ pub fn run(context: *Context) !Outcome {
     } };
 }
 
-pub fn select(context: *Context, index: usize) !Outcome {
+pub fn select(context: *Context, index: usize) !Context.Outcome {
     const gpa = context.gpa;
-    if (index >= levels.len) return Outcome.report(gpa, .err, "invalid selection", .{});
+    if (index >= levels.len) return Context.Outcome.report(gpa, .err, "invalid selection", .{});
     const level = levels[index];
     context.agent.setEffort(level);
-    return Outcome.report(gpa, .ok, "effort set to {s}", .{@tagName(level)});
+    return Context.Outcome.report(gpa, .ok, "effort set to {s}", .{@tagName(level)});
 }
 
 test "the picker lists every level, preselecting the current one" {
@@ -64,9 +63,9 @@ test "select applies the level at a row index, rejecting out of range" {
     var context: Context = .{ .gpa = gpa, .agent = &agent, .accounts = undefined };
 
     // Levels are declared none, low, medium, high, xhigh, max — index 4 is xhigh.
-    try Outcome.expectFeedback(try select(&context, 4), .ok);
+    try Context.Outcome.expectFeedback(try select(&context, 4), .ok);
     try std.testing.expectEqual(llm.Effort.xhigh, agent.effort);
 
-    try Outcome.expectFeedback(try select(&context, 99), .err);
+    try Context.Outcome.expectFeedback(try select(&context, 99), .err);
     try std.testing.expectEqual(llm.Effort.xhigh, agent.effort);
 }

@@ -46,7 +46,8 @@ pub fn init(self: *Resize) !void {
     }
 
     const nonblock: u32 = @bitCast(std.posix.O{ .NONBLOCK = true });
-    switch (std.posix.errno(std.posix.system.fcntl(self.write_handle, std.posix.F.SETFL, nonblock))) {
+    const result = std.posix.system.fcntl(self.write_handle, std.posix.F.SETFL, nonblock);
+    switch (std.posix.errno(result)) {
         .SUCCESS => {},
         else => |err| return std.posix.unexpectedErrno(err),
     }

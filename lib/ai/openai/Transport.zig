@@ -85,10 +85,11 @@ pub const Stream = struct {
         if (std.mem.eql(u8, payload, "[DONE]")) return .done;
         // A malformed payload is filler, not progress; a truncated tail then
         // surfaces as an incomplete reply at end of stream, which is retried.
-        const parsed = std.json.parseFromSlice(std.json.Value, self.gpa, payload, .{}) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => return .ignored,
-        };
+        const parsed = std.json.parseFromSlice(std.json.Value, self.gpa, payload, .{}) catch |err|
+            switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return .ignored,
+            };
         const object = json.object(parsed.value) orelse {
             parsed.deinit();
             return .ignored;
@@ -128,16 +129,19 @@ pub const Stream = struct {
     }
 };
 
+/// One request's confusable string pair, named so body and token cannot swap.
+pub const Payload = struct { body: []const u8, access_token: []const u8 };
+
 /// Open a streaming Responses request bounded by the connect timeout; on any
 /// failure `out` is torn down, so a caller that sees an error owns nothing
 /// (see `sse.Engine.open`).
-pub fn send(self: *Transport, out: *Stream, body: []const u8, access_token: []const u8) !void {
-    return sse.Engine(Stream).open(out, self.io, self.timeouts, connect, .{ self, out, body, access_token });
+pub fn send(self: *Transport, out: *Stream, payload: Payload) !void {
+    return sse.Engine(Stream).open(out, self.io, self.timeouts, connect, .{ self, out, payload });
 }
 
-fn connect(self: *Transport, out: *Stream, body: []const u8, access_token: []const u8) anyerror!void {
+fn connect(self: *Transport, out: *Stream, payload: Payload) anyerror!void {
     // Credentials become header values; reject ones that would split the head.
-    if (!net.validHeaderValue(access_token) or
+    if (!net.validHeaderValue(payload.access_token) or
         (self.account_id.len != 0 and !net.validHeaderValue(self.account_id)))
     {
         return error.BadCredentials;
@@ -146,7 +150,7 @@ fn connect(self: *Transport, out: *Stream, body: []const u8, access_token: []con
     engine.begin(out, self.gpa, self.io);
     errdefer out.client.deinit();
 
-    const authorization = try std.fmt.allocPrint(self.gpa, "Bearer {s}", .{access_token});
+    const authorization = try std.fmt.allocPrint(self.gpa, "Bearer {s}", .{payload.access_token});
     defer self.gpa.free(authorization);
 
     // Subscription mode adds the account and originator identity; API-key mode
@@ -175,7 +179,7 @@ fn connect(self: *Transport, out: *Stream, body: []const u8, access_token: []con
     });
     errdefer out.request.deinit();
 
-    try engine.finish(out, body);
+    try engine.finish(out, payload.body);
 }
 
 /// Map one Responses SSE frame to a neutral event, or null for a frame the
@@ -196,7 +200,8 @@ fn classify(object: std.json.ObjectMap, kind: []const u8) ?llm.Event {
         // Only a function call opens a tool use here; its arguments stream as
         // `function_call_arguments.delta`. Message and reasoning items yield no
         // start event (their content arrives as deltas / on done).
-        if (!std.mem.eql(u8, json.string(item.get("type")) orelse return null, "function_call")) return null;
+        if (!std.mem.eql(u8, json.string(item.get("type")) orelse return null, "function_call"))
+            return null;
         return .{ .tool_use = .{
             .call_id = json.string(item.get("call_id")) orelse return null,
             .name = json.string(item.get("name")) orelse return null,
@@ -206,7 +211,8 @@ fn classify(object: std.json.ObjectMap, kind: []const u8) ?llm.Event {
         const item = json.object(object.get("item")) orelse return null;
         // The reasoning item's encrypted token arrives complete here, closing the
         // reasoning run; other items' content already streamed as deltas.
-        if (!std.mem.eql(u8, json.string(item.get("type")) orelse return null, "reasoning")) return null;
+        if (!std.mem.eql(u8, json.string(item.get("type")) orelse return null, "reasoning"))
+            return null;
         return .{ .thinking_blob = .{
             .id = json.string(item.get("id")) orelse "",
             .blob = json.string(item.get("encrypted_content")) orelse return null,
@@ -281,21 +287,27 @@ test classify {
     ;
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, text, .{});
     defer parsed.deinit();
-    try std.testing.expectEqualStrings("hello", classify(parsed.value.object, "response.output_text.delta").?.text);
+    try std.testing.expectEqualStrings(
+        "hello",
+        classify(parsed.value.object, "response.output_text.delta").?.text,
+    );
 
     const summary =
         \\{"type":"response.reasoning_summary_text.delta","item_id":"rs_1","delta":"hmm"}
     ;
-    const parsed_summary = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, summary, .{});
+    const parsed_summary =
+        try std.json.parseFromSlice(std.json.Value, std.testing.allocator, summary, .{});
     defer parsed_summary.deinit();
-    const thinking = classify(parsed_summary.value.object, "response.reasoning_summary_text.delta").?.thinking;
+    const thinking =
+        classify(parsed_summary.value.object, "response.reasoning_summary_text.delta").?.thinking;
     try std.testing.expectEqualStrings("rs_1", thinking.id);
     try std.testing.expectEqualStrings("hmm", thinking.text);
 
     const added =
         \\{"type":"response.output_item.added","item":{"type":"function_call","call_id":"call_1","name":"read"}}
     ;
-    const parsed_added = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, added, .{});
+    const parsed_added =
+        try std.json.parseFromSlice(std.json.Value, std.testing.allocator, added, .{});
     defer parsed_added.deinit();
     const use = classify(parsed_added.value.object, "response.output_item.added").?.tool_use;
     try std.testing.expectEqualStrings("call_1", use.call_id);
@@ -304,7 +316,8 @@ test classify {
     const done =
         \\{"type":"response.output_item.done","item":{"type":"reasoning","id":"rs_1","encrypted_content":"enc"}}
     ;
-    const parsed_done = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, done, .{});
+    const parsed_done =
+        try std.json.parseFromSlice(std.json.Value, std.testing.allocator, done, .{});
     defer parsed_done.deinit();
     const blob = classify(parsed_done.value.object, "response.output_item.done").?.thinking_blob;
     try std.testing.expectEqualStrings("rs_1", blob.id);
@@ -314,31 +327,42 @@ test classify {
     const message_done =
         \\{"type":"response.output_item.done","item":{"type":"message","id":"msg_1"}}
     ;
-    const parsed_message_done = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, message_done, .{});
+    const parsed_message_done =
+        try std.json.parseFromSlice(std.json.Value, std.testing.allocator, message_done, .{});
     defer parsed_message_done.deinit();
-    try std.testing.expectEqual(@as(?llm.Event, null), classify(parsed_message_done.value.object, "response.output_item.done"));
+    try std.testing.expectEqual(
+        @as(?llm.Event, null),
+        classify(parsed_message_done.value.object, "response.output_item.done"),
+    );
 }
 
 test "next walks response.* SSE lines and maps usage on completion" {
     const body =
         "event: response.reasoning_summary_text.delta\n" ++
-        "data: {\"type\":\"response.reasoning_summary_text.delta\",\"item_id\":\"rs_1\",\"delta\":\"weigh\"}\n" ++
+        "data: {\"type\":\"response.reasoning_summary_text.delta\"," ++
+        "\"item_id\":\"rs_1\",\"delta\":\"weigh\"}\n" ++
         "\n" ++
         "event: response.output_item.done\n" ++
-        "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\",\"encrypted_content\":\"enc\"}}\n" ++
+        "data: {\"type\":\"response.output_item.done\",\"item\":" ++
+        "{\"type\":\"reasoning\",\"id\":\"rs_1\",\"encrypted_content\":\"enc\"}}\n" ++
         "\n" ++
         "event: response.output_item.added\n" ++
-        "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"read\"}}\n" ++
+        "data: {\"type\":\"response.output_item.added\",\"item\":" ++
+        "{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"read\"}}\n" ++
         "\n" ++
         "event: response.function_call_arguments.delta\n" ++
-        "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_1\",\"delta\":\"{}\"}\n" ++
+        "data: {\"type\":\"response.function_call_arguments.delta\"," ++
+        "\"item_id\":\"fc_1\",\"delta\":\"{}\"}\n" ++
         "\n" ++
         "event: response.output_text.delta\n" ++
-        "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_1\",\"delta\":\"done\"}\n" ++
+        "data: {\"type\":\"response.output_text.delta\"," ++
+        "\"item_id\":\"msg_1\",\"delta\":\"done\"}\n" ++
         "\n" ++
         "event: response.completed\n" ++
-        "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":" ++
-        "{\"input_tokens\":100,\"input_tokens_details\":{\"cached_tokens\":90},\"output_tokens\":42," ++
+        "data: {\"type\":\"response.completed\"," ++
+        "\"response\":{\"status\":\"completed\",\"usage\":" ++
+        "{\"input_tokens\":100,\"input_tokens_details\":{\"cached_tokens\":90}," ++
+        "\"output_tokens\":42," ++
         "\"output_tokens_details\":{\"reasoning_tokens\":20}}}}\n" ++
         "\n";
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
@@ -507,7 +531,8 @@ test "next reads a data frame larger than the reader buffer" {
     chunked.artificial_limit = .limited(64);
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();
-    var stream = testStream(threaded.io(), &chunked.interface, 60_000, net.stream_response_bytes_max);
+    var stream =
+        testStream(threaded.io(), &chunked.interface, 60_000, net.stream_response_bytes_max);
     defer stream.reset();
 
     const event = (try stream.next()).?;
@@ -596,7 +621,10 @@ test "send tears down a request that times out awaiting the response head" {
         .account_id = "",
     };
     var stream: Stream = undefined;
-    try std.testing.expectError(error.Timeout, transport.send(&stream, "{}", "token"));
+    try std.testing.expectError(
+        error.Timeout,
+        transport.send(&stream, .{ .body = "{}", .access_token = "token" }),
+    );
 }
 
 test "next surfaces a stream truncated mid data-line as a retryable premature end" {
@@ -620,7 +648,13 @@ test "connect rejects credentials that would split the request head" {
         .account_id = "",
     };
     var stream: Stream = undefined;
-    try std.testing.expectError(error.BadCredentials, connect(&transport, &stream, "{}", "token\r\nleaked: value"));
+    try std.testing.expectError(
+        error.BadCredentials,
+        connect(&transport, &stream, .{ .body = "{}", .access_token = "token\r\nleaked: value" }),
+    );
     transport.account_id = "account\ninjected: value";
-    try std.testing.expectError(error.BadCredentials, connect(&transport, &stream, "{}", "token"));
+    try std.testing.expectError(
+        error.BadCredentials,
+        connect(&transport, &stream, .{ .body = "{}", .access_token = "token" }),
+    );
 }

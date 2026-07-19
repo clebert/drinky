@@ -79,21 +79,25 @@ const Component = union(enum) {
     /// The physical rows this component occupies, its leading separator excluded.
     /// Must equal exactly what `render` emits — the parity the diff and window
     /// math rely on.
-    fn measure(self: Component, columns: usize, viewport_rows: usize) usize {
-        return switch (self) {
-            .entry => |entry| entry.rows(columns),
-            .tool_box => |text| ui.paint.boxRows(text, columns),
+    fn measure(self: *const Component, size: terminal.View.Size) usize {
+        return switch (self.*) {
+            .entry => |entry| entry.rows(size.columns),
+            .tool_box => |text| ui.paint.boxRows(text, size.columns),
             .spinner, .status => 1,
             .steering => |messages| ui.paint.steeringRows(messages),
-            .editor => |editor| editor.rows(columns, viewport_rows),
-            .picker => |picker| picker.rows(columns, viewport_rows),
+            .editor => |editor| editor.rows(size),
+            .picker => |picker| picker.rows(size),
         };
     }
 
     /// Compose this component's rows through `placement`, dropping its top `skip`
     /// rows (nonzero only for the clip).
-    fn render(self: Component, placement: *const ui.paint.Placement, viewport_rows: usize) !void {
-        switch (self) {
+    fn render(
+        self: *const Component,
+        placement: *const ui.paint.Placement,
+        viewport_rows: usize,
+    ) !void {
+        switch (self.*) {
             .entry => |entry| try entry.render(placement),
             .tool_box => |text| try ui.paint.box(placement, &.{
                 .background = .tool_pending_background,
@@ -122,7 +126,7 @@ pub fn project(view: *terminal.View, size: terminal.View.Size, scene: *const Sce
     var shown: usize = 0;
     while (shown < total and rows < capacity) : (shown += 1) {
         const slot = slotAt(scene, total - 1 - shown);
-        rows += @intFromBool(slot.leading_blank) + slot.component.measure(size.columns, size.rows);
+        rows += @intFromBool(slot.leading_blank) + slot.component.measure(size);
     }
     const skip = if (rows > capacity) rows - capacity else 0;
 
@@ -175,7 +179,11 @@ fn slotAt(scene: *const Scene, index: usize) Slot {
 fn tailSlot(tail: *const Tail, offset: usize) Slot {
     switch (tail.*) {
         .prompt => |editor| return editorSlot(editor),
-        .picking => |picker| return .{ .component = .{ .picker = picker }, .id = id_input, .leading_blank = true },
+        .picking => |picker| return .{
+            .component = .{ .picker = picker },
+            .id = id_input,
+            .leading_blank = true,
+        },
         .turn => |turn| {
             if (offset < turn.tools.len) return .{
                 .component = .{ .tool_box = turn.tools[offset] },
@@ -270,7 +278,9 @@ test "a turn tail stacks the tool boxes, spinner, and editor" {
     const tools = [_][]const u8{ "readbox", "grepbox" };
     const scene: Scene = .{
         .transcript = &[_]ui.block.Entry{},
-        .tail = .{ .turn = .{ .tools = &tools, .spinner = 0, .steering = &.{}, .editor = &editor } },
+        .tail = .{
+            .turn = .{ .tools = &tools, .spinner = 0, .steering = &.{}, .editor = &editor },
+        },
         .status = &test_status,
     };
     const painted = try projected(gpa, .{ .columns = 40, .rows = 24 }, &scene);
@@ -278,11 +288,11 @@ test "a turn tail stacks the tool boxes, spinner, and editor" {
 
     const first = std.mem.indexOf(u8, painted, "readbox").?;
     const second = std.mem.indexOf(u8, painted, "grepbox").?;
-    const spin = std.mem.indexOf(u8, painted, "Working…").?;
+    const spinner = std.mem.indexOf(u8, painted, "Working…").?;
     const footer = std.mem.indexOf(u8, painted, "footerqq").?;
     try std.testing.expect(first < second);
-    try std.testing.expect(second < spin);
-    try std.testing.expect(spin < footer);
+    try std.testing.expect(second < spinner);
+    try std.testing.expect(spinner < footer);
 }
 
 // Regression: 253 concurrent tool boxes used to wrap the anchor-id arithmetic
@@ -295,7 +305,9 @@ test "a turn with 253 tool boxes keeps its anchor ids from wrapping" {
     const tools = [_][]const u8{"toolbox"} ** 253;
     const scene: Scene = .{
         .transcript = &[_]ui.block.Entry{},
-        .tail = .{ .turn = .{ .tools = &tools, .spinner = 0, .steering = &.{}, .editor = &editor } },
+        .tail = .{
+            .turn = .{ .tools = &tools, .spinner = 0, .steering = &.{}, .editor = &editor },
+        },
         .status = &test_status,
     };
     gpa.free(try projected(gpa, .{ .columns = 40, .rows = 24 }, &scene));
@@ -314,7 +326,9 @@ test "a turn tail shows the steering queue above the editor" {
     const queue = [_][]const u8{ "fix the bug", "then add a test\nnot this row" };
     const scene: Scene = .{
         .transcript = &[_]ui.block.Entry{},
-        .tail = .{ .turn = .{ .tools = &.{}, .spinner = 0, .steering = &queue, .editor = &editor } },
+        .tail = .{
+            .turn = .{ .tools = &.{}, .spinner = 0, .steering = &queue, .editor = &editor },
+        },
         .status = &test_status,
     };
     const painted = try projected(gpa, .{ .columns = 40, .rows = 24 }, &scene);
@@ -340,7 +354,9 @@ test "a narrow window clips the steering rows to width" {
     const queue = [_][]const u8{"a steering message wider than the window"};
     const scene: Scene = .{
         .transcript = &[_]ui.block.Entry{},
-        .tail = .{ .turn = .{ .tools = &.{}, .spinner = 0, .steering = &queue, .editor = &editor } },
+        .tail = .{
+            .turn = .{ .tools = &.{}, .spinner = 0, .steering = &queue, .editor = &editor },
+        },
         .status = &test_status,
     };
     gpa.free(try projected(gpa, .{ .columns = 8, .rows = 24 }, &scene));

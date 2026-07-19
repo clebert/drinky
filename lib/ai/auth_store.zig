@@ -27,10 +27,11 @@ pub const File = struct {
 /// file that is not a JSON object is `error.BadCredentials`. Caller frees a
 /// non-null result with `File.deinit`.
 pub fn open(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !?File {
-    const data = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .unlimited) catch |err| switch (err) {
-        error.FileNotFound => return null,
-        else => return err,
-    };
+    const data = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .unlimited) catch |err|
+        switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
     defer gpa.free(data);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, gpa, data, .{});
@@ -71,12 +72,19 @@ pub fn remove(
 
 /// Load-merge-write: read the current file, re-serialize it with `key` rewritten
 /// (or dropped, for a null `entry`), and replace the file atomically.
-fn rewrite(gpa: std.mem.Allocator, io: std.Io, path: []const u8, key: []const u8, entry: anytype) !void {
-    const existing: ?[]u8 = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .unlimited) catch |err| switch (err) {
-        // A save starts from a fresh object; a removal has nothing to drop.
-        error.FileNotFound => if (@TypeOf(entry) == @TypeOf(null)) return else null,
-        else => return err,
-    };
+fn rewrite(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    key: []const u8,
+    entry: anytype,
+) !void {
+    const existing: ?[]u8 = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .unlimited) catch |err|
+        switch (err) {
+            // A save starts from a fresh object; a removal has nothing to drop.
+            error.FileNotFound => if (@TypeOf(entry) == @TypeOf(null)) return else null,
+            else => return err,
+        };
     defer if (existing) |data| gpa.free(data);
 
     const body = try serialize(gpa, existing, key, entry);
@@ -116,10 +124,11 @@ fn serialize(
 
     try stringify.beginObject();
     if (existing) |data| {
-        const parsed = std.json.parseFromSlice(std.json.Value, gpa, data, .{}) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => return error.BadCredentials,
-        };
+        const parsed = std.json.parseFromSlice(std.json.Value, gpa, data, .{}) catch |err|
+            switch (err) {
+                error.OutOfMemory => return err,
+                else => return error.BadCredentials,
+            };
         defer parsed.deinit();
         if (parsed.value != .object) return error.BadCredentials;
         var entries = parsed.value.object.iterator();
@@ -149,11 +158,19 @@ test "File reads keyed entries" {
     const gpa = std.testing.allocator;
 
     var keyed: File = .{
-        .parsed = try std.json.parseFromSlice(std.json.Value, gpa, "{\"openai_subscription\":{\"access\":\"x\"}}", .{}),
+        .parsed = try std.json.parseFromSlice(
+            std.json.Value,
+            gpa,
+            "{\"openai_subscription\":{\"access\":\"x\"}}",
+            .{},
+        ),
     };
     defer keyed.deinit();
     try std.testing.expect(keyed.entry("absent") == null);
-    try std.testing.expectEqualStrings("x", keyed.entry("openai_subscription").?.get("access").?.string);
+    try std.testing.expectEqualStrings(
+        "x",
+        keyed.entry("openai_subscription").?.get("access").?.string,
+    );
 }
 
 test "serialize adds an entry, preserving other accounts" {
@@ -170,7 +187,10 @@ test "serialize adds an entry, preserving other accounts" {
     const parsed = try std.json.parseFromSlice(std.json.Value, gpa, merged, .{});
     defer parsed.deinit();
     const root = parsed.value.object;
-    try std.testing.expectEqualStrings("keep", root.get("openai_subscription").?.object.get("access").?.string);
+    try std.testing.expectEqualStrings(
+        "keep",
+        root.get("openai_subscription").?.object.get("access").?.string,
+    );
     const added = root.get("anthropic_subscription").?.object;
     try std.testing.expectEqualStrings("at", added.get("access").?.string);
     try std.testing.expectEqual(@as(i64, 1234), added.get("expires_ms").?.integer);
@@ -185,20 +205,30 @@ test "serialize from nothing writes just the entry, and replaces its own" {
     var parsed = try std.json.parseFromSlice(std.json.Value, gpa, fresh, .{});
     defer parsed.deinit();
     try std.testing.expectEqual(@as(usize, 1), parsed.value.object.count());
-    try std.testing.expectEqualStrings("new", parsed.value.object.get("openai_subscription").?.object.get("access").?.string);
+    try std.testing.expectEqualStrings(
+        "new",
+        parsed.value.object.get("openai_subscription").?.object.get("access").?.string,
+    );
 
     // An existing entry under the same key is replaced, a sibling kept.
     const replaced = try serialize(
         gpa,
-        "{\"anthropic_subscription\":{\"access\":\"keep\"},\"openai_subscription\":{\"access\":\"old\"}}",
+        "{\"anthropic_subscription\":{\"access\":\"keep\"}," ++
+            "\"openai_subscription\":{\"access\":\"old\"}}",
         "openai_subscription",
         entry,
     );
     defer gpa.free(replaced);
     const parsed_replaced = try std.json.parseFromSlice(std.json.Value, gpa, replaced, .{});
     defer parsed_replaced.deinit();
-    try std.testing.expectEqualStrings("keep", parsed_replaced.value.object.get("anthropic_subscription").?.object.get("access").?.string);
-    try std.testing.expectEqualStrings("new", parsed_replaced.value.object.get("openai_subscription").?.object.get("access").?.string);
+    try std.testing.expectEqualStrings(
+        "keep",
+        parsed_replaced.value.object.get("anthropic_subscription").?.object.get("access").?.string,
+    );
+    try std.testing.expectEqualStrings(
+        "new",
+        parsed_replaced.value.object.get("openai_subscription").?.object.get("access").?.string,
+    );
 }
 
 test "serialize errors on an unparseable or non-object existing file" {
@@ -219,7 +249,8 @@ test "serialize drops a key, preserving other accounts" {
     const gpa = std.testing.allocator;
     const merged = try serialize(
         gpa,
-        "{\"anthropic_subscription\":{\"access\":\"a\"},\"openai_subscription\":{\"access\":\"o\"}}",
+        "{\"anthropic_subscription\":{\"access\":\"a\"}," ++
+            "\"openai_subscription\":{\"access\":\"o\"}}",
         "openai_subscription",
         null,
     );
@@ -228,7 +259,10 @@ test "serialize drops a key, preserving other accounts" {
     defer parsed.deinit();
     const root = parsed.value.object;
     try std.testing.expect(root.get("openai_subscription") == null);
-    try std.testing.expectEqualStrings("a", root.get("anthropic_subscription").?.object.get("access").?.string);
+    try std.testing.expectEqualStrings(
+        "a",
+        root.get("anthropic_subscription").?.object.get("access").?.string,
+    );
 
     // Removing the last account leaves a valid empty object, not a wipe error.
     const emptied = try serialize(gpa, merged, "anthropic_subscription", null);
@@ -251,7 +285,10 @@ test "save replaces the file atomically at owner-only permissions" {
 
     try save(gpa, io, path, "openai_subscription", entry);
     const before = try tmp.dir.statFile(io, "auth.json", .{});
-    try std.testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(@intFromEnum(before.permissions))) & 0o777);
+    try std.testing.expectEqual(
+        @as(u32, 0o600),
+        @as(u32, @intCast(@intFromEnum(before.permissions))) & 0o777,
+    );
 
     // A rewrite lands on a fresh inode — renamed over, never truncated in place.
     try save(gpa, io, path, "anthropic_subscription", entry);
@@ -260,8 +297,14 @@ test "save replaces the file atomically at owner-only permissions" {
 
     var file = (try open(gpa, io, path)).?;
     defer file.deinit();
-    try std.testing.expectEqualStrings("at", file.entry("openai_subscription").?.get("access").?.string);
-    try std.testing.expectEqualStrings("at", file.entry("anthropic_subscription").?.get("access").?.string);
+    try std.testing.expectEqualStrings(
+        "at",
+        file.entry("openai_subscription").?.get("access").?.string,
+    );
+    try std.testing.expectEqualStrings(
+        "at",
+        file.entry("anthropic_subscription").?.get("access").?.string,
+    );
 }
 
 test "remove drops only its key on disk, and a missing file opens as null" {
@@ -284,7 +327,10 @@ test "remove drops only its key on disk, and a missing file opens as null" {
     var file = (try open(gpa, io, path)).?;
     defer file.deinit();
     try std.testing.expect(file.entry("openai_subscription") == null);
-    try std.testing.expectEqualStrings("at", file.entry("anthropic_subscription").?.get("access").?.string);
+    try std.testing.expectEqualStrings(
+        "at",
+        file.entry("anthropic_subscription").?.get("access").?.string,
+    );
 }
 
 test "save and remove refuse a corrupt file, leaving it intact on disk" {
@@ -299,7 +345,10 @@ test "save and remove refuse a corrupt file, leaving it intact on disk" {
     const entry: TestEntry = .{ .access = "at", .refresh = "rt", .expires_ms = 1 };
 
     try tmp.dir.writeFile(io, .{ .sub_path = "auth.json", .data = "{ not json" });
-    try std.testing.expectError(error.BadCredentials, save(gpa, io, path, "openai_subscription", entry));
+    try std.testing.expectError(
+        error.BadCredentials,
+        save(gpa, io, path, "openai_subscription", entry),
+    );
     try std.testing.expectError(error.BadCredentials, remove(gpa, io, path, "openai_subscription"));
 
     const data = try tmp.dir.readFileAlloc(io, "auth.json", gpa, .unlimited);

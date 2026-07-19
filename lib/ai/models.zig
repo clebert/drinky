@@ -179,7 +179,8 @@ const table = [_]Entry{
 /// The model `name` offered by `provider`, or null when it is not in the table.
 pub fn get(provider: llm.Provider, name: []const u8) ?Model {
     for (table) |entry| {
-        if (entry.provider == provider and std.mem.eql(u8, entry.model.name, name)) return entry.model;
+        if (entry.provider == provider and std.mem.eql(u8, entry.model.name, name))
+            return entry.model;
     }
     return null;
 }
@@ -196,7 +197,10 @@ fn asFloat(count: u64) f64 {
 }
 
 test get {
-    try std.testing.expectEqual(@as(u64, 1_000_000), get(.anthropic, "claude-sonnet-4-6").?.context_window);
+    try std.testing.expectEqual(
+        @as(u64, 1_000_000),
+        get(.anthropic, "claude-sonnet-4-6").?.context_window,
+    );
     try std.testing.expectEqual(@as(u32, 128_000), get(.anthropic, "claude-opus-4-8").?.tokens_max);
     try std.testing.expectEqual(@as(?Model, null), get(.anthropic, "does-not-exist"));
 
@@ -234,10 +238,28 @@ test "EffortMap.resolve maps every level, none included, to the model's outcome"
     try std.testing.expectEqual(@as(?[]const u8, null), no_reasoning.resolve(.max));
 
     // The shipped maps.
-    try std.testing.expectEqual(@as(?[]const u8, null), get(.anthropic, "claude-opus-4-8").?.effort.resolve(.none));
-    try std.testing.expectEqualStrings("xhigh", get(.anthropic, "claude-opus-4-8").?.effort.resolve(.xhigh).?);
-    try std.testing.expectEqualStrings("xhigh", get(.anthropic, "claude-sonnet-5").?.effort.resolve(.xhigh).?);
-    try std.testing.expectEqualStrings("high", get(.anthropic, "claude-sonnet-4-6").?.effort.resolve(.xhigh).?);
-    try std.testing.expectEqualStrings("max", get(.anthropic, "claude-sonnet-4-6").?.effort.resolve(.max).?);
-    try std.testing.expectEqualStrings("none", get(.openai, "gpt-5.6-sol").?.effort.resolve(.none).?);
+    try std.testing.expectEqual(
+        @as(?[]const u8, null),
+        get(.anthropic, "claude-opus-4-8").?.effort.resolve(.none),
+    );
+    try std.testing.expectEqualStrings(
+        "xhigh",
+        get(.anthropic, "claude-opus-4-8").?.effort.resolve(.xhigh).?,
+    );
+    try std.testing.expectEqualStrings(
+        "xhigh",
+        get(.anthropic, "claude-sonnet-5").?.effort.resolve(.xhigh).?,
+    );
+    try std.testing.expectEqualStrings(
+        "high",
+        get(.anthropic, "claude-sonnet-4-6").?.effort.resolve(.xhigh).?,
+    );
+    try std.testing.expectEqualStrings(
+        "max",
+        get(.anthropic, "claude-sonnet-4-6").?.effort.resolve(.max).?,
+    );
+    try std.testing.expectEqualStrings(
+        "none",
+        get(.openai, "gpt-5.6-sol").?.effort.resolve(.none).?,
+    );
 }

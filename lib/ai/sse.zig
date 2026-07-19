@@ -53,8 +53,9 @@ pub fn Engine(comptime S: type) type {
         /// timeout, rate limiting, or any 5xx server fault (Anthropic's 529
         /// included).
         pub fn retryable(stream: *const S) bool {
-            if (stream.status == .request_timeout or stream.status == .too_many_requests) return true;
-            return @intFromEnum(stream.status) / 100 == 5;
+            if (stream.status == .request_timeout or stream.status == .too_many_requests)
+                return true;
+            return @divFloor(@intFromEnum(stream.status), 100) == 5;
         }
 
         /// The `retry-after` the head asked for, in milliseconds, or null.
@@ -120,8 +121,15 @@ pub fn Engine(comptime S: type) type {
             stream.status = stream.response.head.status;
             // Read the head's headers now: creating the body reader invalidates them.
             stream.retry_after_ms = retryAfter(stream.response.head);
-            stream.decompress_buffer = try net.decompressBuffer(stream.gpa, stream.response.head.content_encoding);
-            stream.body = stream.response.readerDecompressing(&stream.transfer_buffer, &stream.decompress, stream.decompress_buffer);
+            stream.decompress_buffer = try net.decompressBuffer(
+                stream.gpa,
+                stream.response.head.content_encoding,
+            );
+            stream.body = stream.response.readerDecompressing(
+                &stream.transfer_buffer,
+                &stream.decompress,
+                stream.decompress_buffer,
+            );
             if (stream.status != .ok)
                 stream.error_length = stream.body.readSliceShort(&stream.error_buffer) catch 0;
             stream.established = true;
@@ -165,8 +173,13 @@ pub fn Engine(comptime S: type) type {
 
         /// The next SSE line: returned directly when already buffered, else
         /// read bounded by the time left in the idle window.
-        fn takeLine(stream: *S, deadline: net.Deadline, buffer: *std.Io.Writer.Allocating) !?[]const u8 {
-            if (std.mem.indexOfScalar(u8, stream.body.buffered(), '\n') != null) return readLine(stream, buffer);
+        fn takeLine(
+            stream: *S,
+            deadline: net.Deadline,
+            buffer: *std.Io.Writer.Allocating,
+        ) !?[]const u8 {
+            if (std.mem.indexOfScalar(u8, stream.body.buffered(), '\n') != null)
+                return readLine(stream, buffer);
             return deadline.call(stream.io, readLine, .{ stream, buffer });
         }
 
@@ -181,17 +194,21 @@ pub fn Engine(comptime S: type) type {
             // A spent budget fails the read as `StreamResponseTooLarge` before
             // it can reach end of stream — the right verdict at the ceiling.
             const cap: std.Io.Limit = .limited(stream.budget.remaining());
-            _ = stream.body.streamDelimiterLimit(&buffer.writer, '\n', cap) catch |err| switch (err) {
-                error.StreamTooLong => return error.StreamResponseTooLarge,
-                error.WriteFailed => return error.OutOfMemory,
-                error.ReadFailed => return readFailed(stream),
-            };
+            _ = stream.body.streamDelimiterLimit(&buffer.writer, '\n', cap) catch |err|
+                switch (err) {
+                    error.StreamTooLong => return error.StreamResponseTooLarge,
+                    error.WriteFailed => return error.OutOfMemory,
+                    error.ReadFailed => return readFailed(stream),
+                };
             // The delimiter, if any, is left buffered: a '\n' closes this line;
             // end of stream with nothing buffered ends the reply, and a
             // non-empty final line with no newline is a truncated frame —
             // retryable, never decoded.
             const pending = stream.body.peekByte() catch |err| switch (err) {
-                error.EndOfStream => return if (buffer.written().len == 0) null else error.IncompleteReply,
+                error.EndOfStream => return if (buffer.written().len == 0)
+                    null
+                else
+                    error.IncompleteReply,
                 error.ReadFailed => return readFailed(stream),
             };
             std.debug.assert(pending == '\n');
@@ -224,7 +241,8 @@ fn retryAfter(head: std.http.Client.Response.Head) ?u64 {
     var headers = head.iterateHeaders();
     while (headers.next()) |header| {
         if (!std.ascii.eqlIgnoreCase(header.name, "retry-after")) continue;
-        const seconds = std.fmt.parseInt(u64, std.mem.trim(u8, header.value, " \t"), 10) catch return null;
+        const seconds = std.fmt.parseInt(u64, std.mem.trim(u8, header.value, " \t"), 10) catch
+            return null;
         return seconds *| 1000;
     }
     return null;
@@ -267,15 +285,26 @@ test retryAfter {
     try std.testing.expectEqual(@as(?u64, 7000), retryAfter(head));
 
     const without = "HTTP/1.1 503 Service Unavailable\r\ncontent-length:0\r\n\r\n";
-    try std.testing.expectEqual(@as(?u64, null), retryAfter(try std.http.Client.Response.Head.parse(without)));
+    try std.testing.expectEqual(
+        @as(?u64, null),
+        retryAfter(try std.http.Client.Response.Head.parse(without)),
+    );
 
     // An HTTP-date form is unsupported and falls back to the computed backoff.
-    const dated = "HTTP/1.1 503 Service Unavailable\r\nretry-after: Wed, 21 Oct 2015 07:28:00 GMT\r\ncontent-length:0\r\n\r\n";
-    try std.testing.expectEqual(@as(?u64, null), retryAfter(try std.http.Client.Response.Head.parse(dated)));
+    const dated = "HTTP/1.1 503 Service Unavailable\r\n" ++
+        "retry-after: Wed, 21 Oct 2015 07:28:00 GMT\r\ncontent-length:0\r\n\r\n";
+    try std.testing.expectEqual(
+        @as(?u64, null),
+        retryAfter(try std.http.Client.Response.Head.parse(dated)),
+    );
 
     // A huge value saturates rather than wrapping, so the backoff cap still bounds it.
-    const huge = "HTTP/1.1 429 Too Many Requests\r\nretry-after: 99999999999999999\r\ncontent-length:0\r\n\r\n";
-    try std.testing.expectEqual(@as(?u64, std.math.maxInt(u64)), retryAfter(try std.http.Client.Response.Head.parse(huge)));
+    const huge = "HTTP/1.1 429 Too Many Requests\r\n" ++
+        "retry-after: 99999999999999999\r\ncontent-length:0\r\n\r\n";
+    try std.testing.expectEqual(
+        @as(?u64, std.math.maxInt(u64)),
+        retryAfter(try std.http.Client.Response.Head.parse(huge)),
+    );
 }
 
 test "retryable classifies the head status" {

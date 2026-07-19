@@ -243,14 +243,20 @@ test "isAuthenticated and firstAuthenticated read keys and readiness, subscripti
     try std.testing.expect(!accounts.isAuthenticated(.openai_subscription));
     // Both anthropic credentials are present; the subscription precedes its API
     // key in enum order, so it is the active account.
-    try std.testing.expectEqual(llm.Account.anthropic_subscription, accounts.firstAuthenticated().?);
+    try std.testing.expectEqual(
+        llm.Account.anthropic_subscription,
+        accounts.firstAuthenticated().?,
+    );
 
     // With only API keys, the first authenticated in enum order (anthropic) wins.
     var api_only = testAccounts(.{ .anthropic = "sk-ant", .openai = "sk-openai" }, false, false);
     try std.testing.expectEqual(llm.Account.anthropic_api, api_only.firstAuthenticated().?);
 
     var cross_vendor = testAccounts(.{ .anthropic = "sk-ant" }, false, true);
-    try std.testing.expectEqual(llm.Account.openai_subscription, cross_vendor.firstAuthenticated().?);
+    try std.testing.expectEqual(
+        llm.Account.openai_subscription,
+        cross_vendor.firstAuthenticated().?,
+    );
 
     var none = testAccounts(.{}, false, false);
     try std.testing.expect(none.firstAuthenticated() == null);
@@ -264,7 +270,10 @@ test "logout rejects api accounts, which are env-sourced" {
 
 test "client selects the arm for an authenticated account, null otherwise" {
     var accounts = testAccounts(.{ .anthropic = "sk-ant", .openai = null }, false, false);
-    try std.testing.expectEqual(llm.Account.anthropic_api, accounts.client(.anthropic_api).?.account());
+    try std.testing.expectEqual(
+        llm.Account.anthropic_api,
+        accounts.client(.anthropic_api).?.account(),
+    );
     try std.testing.expect(accounts.client(.openai_api) == null);
     try std.testing.expect(accounts.client(.anthropic_subscription) == null);
 }

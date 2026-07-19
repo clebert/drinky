@@ -31,7 +31,12 @@ pub fn deinit(self: *Transcript) void {
 
 /// Append a discrete block copying `text`; this ends any open streamed run, so
 /// the next streamed delta opens a fresh block.
-pub fn append(self: *Transcript, kind: ui.block.Entry.Kind, is_error: bool, text: []const u8) !void {
+pub fn append(
+    self: *Transcript,
+    kind: ui.block.Entry.Kind,
+    is_error: bool,
+    text: []const u8,
+) !void {
     self.endMessage();
     var entry = try ui.block.Entry.init(self.gpa, kind, is_error, text);
     errdefer entry.deinit(self.gpa);

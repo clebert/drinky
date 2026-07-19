@@ -9,7 +9,7 @@ const callback_timeout_ms = 5 * std.time.ms_per_min;
 const request_bytes_max = 8 * 1024;
 const response_page = "pith authorized \xe2\x80\x94 you can close this tab.";
 
-pub const Callback = struct {
+pub const Redirect = struct {
     code: []const u8,
     state: []const u8,
 };
@@ -18,13 +18,13 @@ pub fn receive(
     gpa: std.mem.Allocator,
     io: std.Io,
     server: *std.Io.net.Server,
-) !Callback {
+) !Redirect {
     var source: ServerSource = .{ .io = io, .server = server };
     var bound: TimeoutBound = .{ .io = io, .timeout_ms = callback_timeout_ms };
     return receiveWith(gpa, &bound, &source);
 }
 
-fn receiveWith(gpa: std.mem.Allocator, bound: anytype, source: anytype) !Callback {
+fn receiveWith(gpa: std.mem.Allocator, bound: anytype, source: anytype) !Redirect {
     var request_buffer: [request_bytes_max]u8 = undefined;
     var output: Output = .{};
     errdefer output.deinit(gpa);
@@ -72,13 +72,15 @@ fn Wire(comptime Source: type) type {
                         error.EndOfStream, error.ReadFailed => continue,
                         else => return err,
                     };
-                output.code = queryParameter(gpa, request_line, "code=") catch |err| switch (err) {
-                    error.MissingCallbackParam => if (std.mem.indexOf(u8, request_line, "error=") == null)
-                        continue
-                    else
-                        return err,
-                    else => return err,
-                };
+                output.code = queryParameter(gpa, request_line, "code=") catch |err|
+                    switch (err) {
+                        error.MissingCallbackParam => if (std.mem.indexOf(
+                            u8,
+                            request_line,
+                            "error=",
+                        ) == null) continue else return err,
+                        else => return err,
+                    };
                 output.state = try queryParameter(gpa, request_line, "state=");
                 try connection.respondAuthorized();
                 return;
@@ -116,7 +118,8 @@ const Connection = struct {
         var write_buffer: [512]u8 = undefined;
         var writer = self.stream.writer(self.io, &write_buffer);
         try writer.interface.print(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\n" ++
+                "Content-Length: {d}\r\nConnection: close\r\n\r\n{s}",
             .{ response_page.len, response_page },
         );
         try writer.interface.flush();
@@ -262,7 +265,7 @@ const Fake = struct {
     };
 };
 
-fn receiveFake(fake: *Fake) !Callback {
+fn receiveFake(fake: *Fake) !Redirect {
     var bound: Fake.Bound = .{ .fake = fake };
     return receiveWith(
         std.testing.allocator,

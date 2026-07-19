@@ -23,14 +23,17 @@ pub const Retry = struct {
     backoff_ms_initial: u64 = 500,
     backoff_ms_max: u64 = 16_000,
 
-    /// Wait before the retry following a failed `attempt` (1-based): the initial
-    /// delay doubled once per prior attempt, capped at `backoff_ms_max`. A server
-    /// `retry-after` hint (`suggested_ms`, 0 when absent) takes precedence over the
-    /// computed backoff but is capped too, so a server cannot make a turn wait
-    /// longer than local policy allows.
-    pub fn backoffMs(self: Retry, attempt: u32, suggested_ms: u64) u64 {
-        if (suggested_ms > 0) return @min(suggested_ms, self.backoff_ms_max);
-        const steps: u6 = @intCast(@min(attempt -| 1, 20));
+    /// One failed try: which `attempt` failed (1-based) and the server's
+    /// `retry-after` hint in milliseconds, 0 when it gave none.
+    pub const Failure = struct { attempt: u32, suggested_ms: u64 = 0 };
+
+    /// Wait before the retry following `failure`: the initial delay doubled once
+    /// per prior attempt, capped at `backoff_ms_max`. A server hint takes
+    /// precedence over the computed backoff but is capped too, so a server cannot
+    /// make a turn wait longer than local policy allows.
+    pub fn backoffMs(self: Retry, failure: Failure) u64 {
+        if (failure.suggested_ms > 0) return @min(failure.suggested_ms, self.backoff_ms_max);
+        const steps: u6 = @intCast(@min(failure.attempt -| 1, 20));
         return @min(self.backoff_ms_initial *| (@as(u64, 1) << steps), self.backoff_ms_max);
     }
 };
@@ -221,25 +224,40 @@ test "Budget reports the bytes remaining before its ceiling" {
 
 test "backoffMs without a hint doubles per attempt and caps" {
     const retry: Retry = .{ .backoff_ms_initial = 500, .backoff_ms_max = 16_000 };
-    try std.testing.expectEqual(@as(u64, 500), retry.backoffMs(1, 0));
-    try std.testing.expectEqual(@as(u64, 1000), retry.backoffMs(2, 0));
-    try std.testing.expectEqual(@as(u64, 2000), retry.backoffMs(3, 0));
-    try std.testing.expectEqual(@as(u64, 16_000), retry.backoffMs(10, 0));
+    try std.testing.expectEqual(@as(u64, 500), retry.backoffMs(.{ .attempt = 1 }));
+    try std.testing.expectEqual(@as(u64, 1000), retry.backoffMs(.{ .attempt = 2 }));
+    try std.testing.expectEqual(@as(u64, 2000), retry.backoffMs(.{ .attempt = 3 }));
+    try std.testing.expectEqual(@as(u64, 16_000), retry.backoffMs(.{ .attempt = 10 }));
 }
 
 test "backoffMs caps a server hint at the max backoff" {
     const retry: Retry = .{ .backoff_ms_initial = 500, .backoff_ms_max = 16_000 };
     // A hint longer than local policy is capped, so a turn never waits longer than
     // the computed backoff's ceiling; a saturated hint cannot wrap past it either.
-    try std.testing.expectEqual(@as(u64, 16_000), retry.backoffMs(1, 3_600_000));
-    try std.testing.expectEqual(@as(u64, 16_000), retry.backoffMs(1, 16_000));
-    try std.testing.expectEqual(@as(u64, 16_000), retry.backoffMs(1, std.math.maxInt(u64)));
+    try std.testing.expectEqual(
+        @as(u64, 16_000),
+        retry.backoffMs(.{ .attempt = 1, .suggested_ms = 3_600_000 }),
+    );
+    try std.testing.expectEqual(
+        @as(u64, 16_000),
+        retry.backoffMs(.{ .attempt = 1, .suggested_ms = 16_000 }),
+    );
+    try std.testing.expectEqual(
+        @as(u64, 16_000),
+        retry.backoffMs(.{ .attempt = 1, .suggested_ms = std.math.maxInt(u64) }),
+    );
     // A hint at or below the cap takes precedence over the computed backoff, whether
     // it is longer or shorter than that backoff would be.
-    try std.testing.expectEqual(@as(u64, 5000), retry.backoffMs(1, 5000));
-    try std.testing.expectEqual(@as(u64, 200), retry.backoffMs(3, 200));
+    try std.testing.expectEqual(
+        @as(u64, 5000),
+        retry.backoffMs(.{ .attempt = 1, .suggested_ms = 5000 }),
+    );
+    try std.testing.expectEqual(
+        @as(u64, 200),
+        retry.backoffMs(.{ .attempt = 3, .suggested_ms = 200 }),
+    );
     // No hint falls back to the exponential backoff.
-    try std.testing.expectEqual(@as(u64, 1000), retry.backoffMs(2, 0));
+    try std.testing.expectEqual(@as(u64, 1000), retry.backoffMs(.{ .attempt = 2 }));
 }
 
 fn fastWork(io: std.Io) anyerror!u64 {

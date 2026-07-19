@@ -12,11 +12,23 @@ const limit_default = 1000;
 
 pub const spec: llm.Tool = .{
     .name = "find",
-    .description = "Find files by glob pattern. Returns paths relative to the working directory, one per line. The pattern matches the whole path and * and ? never cross '/', so use a '**/' prefix to recurse. Ignores .git, zig-out, and build cache directories.",
+    .description = "Find files by glob pattern. Returns paths relative to the working " ++
+        "directory, one per line. The pattern matches the whole path and * and ? never " ++
+        "cross '/', so use a '**/' prefix to recurse. Ignores .git, zig-out, and build " ++
+        "cache directories.",
     .parameters = &.{
-        .{ .name = "pattern", .type = .string, .required = true, .description = "Glob pattern, e.g. '**/*.zig' or 'src/**/*.zig'" },
+        .{
+            .name = "pattern",
+            .type = .string,
+            .required = true,
+            .description = "Glob pattern, e.g. '**/*.zig' or 'src/**/*.zig'",
+        },
         .{ .name = "path", .type = .string, .description = "Directory to search (default: '.')" },
-        .{ .name = "limit", .type = .integer, .description = "Maximum number of results (default: 1000)" },
+        .{
+            .name = "limit",
+            .type = .integer,
+            .description = "Maximum number of results (default: 1000)",
+        },
     },
 };
 
@@ -38,11 +50,21 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
     const base = parsed.value.path;
     const limit = parsed.value.limit;
 
-    var matches = walk.collect(context.io, gpa, .{ .base = base, .pattern = pattern, .retain = limit }) catch |err|
+    var matches = walk.collect(context.io, gpa, .{
+        .base = base,
+        .pattern = pattern,
+        .retain = limit,
+    }) catch |err|
         return Result.cannot(gpa, err, "search", base);
     defer matches.deinit(gpa);
     if (matches.matched == 0) {
-        if (matches.capped) return Result.report(gpa, .ok, "no files match {s} in the portion searched; the tree is too large to scan fully — narrow the path or pattern", .{pattern});
+        if (matches.capped) return Result.report(
+            gpa,
+            .ok,
+            "no files match {s} in the portion searched; " ++
+                "the tree is too large to scan fully — narrow the path or pattern",
+            .{pattern},
+        );
         return Result.report(gpa, .ok, "no files match {s}", .{pattern});
     }
 
@@ -55,7 +77,8 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
     }
     if (matches.capped) {
         if (shown > 0) try out.writer.writeAll("\n");
-        try out.writer.print("... search stopped: the tree is too large to scan fully; showing the {d} smallest matches — narrow the path or pattern", .{shown});
+        try out.writer.print("... search stopped: the tree is too large to scan fully; " ++
+            "showing the {d} smallest matches — narrow the path or pattern", .{shown});
     } else if (matches.matched > shown) {
         if (shown > 0) try out.writer.writeAll("\n");
         try out.writer.print("... {d} more (raise limit to see them)", .{matches.matched - shown});
@@ -78,7 +101,8 @@ test "find matches files by glob under a directory" {
     defer gpa.free(result.content);
     try std.testing.expect(!result.is_error);
     var expected_buf: [128]u8 = undefined;
-    const expected = try std.fmt.bufPrint(&expected_buf, ".zig-cache/tmp/{s}/a.zig", .{tmp.sub_path});
+    const expected =
+        try std.fmt.bufPrint(&expected_buf, ".zig-cache/tmp/{s}/a.zig", .{tmp.sub_path});
     try std.testing.expectEqualStrings(expected, result.content);
 }
 
@@ -98,7 +122,11 @@ test "find reports how many more matched beyond the limit" {
     defer gpa.free(result.content);
     try std.testing.expect(!result.is_error);
     var expected_buf: [128]u8 = undefined;
-    const expected = try std.fmt.bufPrint(&expected_buf, ".zig-cache/tmp/{s}/a.txt\n... 2 more (raise limit to see them)", .{tmp.sub_path});
+    const expected = try std.fmt.bufPrint(
+        &expected_buf,
+        ".zig-cache/tmp/{s}/a.txt\n... 2 more (raise limit to see them)",
+        .{tmp.sub_path},
+    );
     try std.testing.expectEqualStrings(expected, result.content);
 }
 

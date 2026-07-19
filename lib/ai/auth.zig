@@ -11,6 +11,7 @@ const std = @import("std");
 const auth_store = @import("auth_store.zig");
 const oauth_callback = @import("oauth_callback.zig");
 const oauth_login = @import("oauth_login.zig");
+const oauth_wire = @import("oauth_wire.zig");
 
 /// Load stored tokens, reading each `Tokens` field from the entry by name.
 /// Returns false when the file is absent or holds no `account_key` entry (the
@@ -50,7 +51,11 @@ pub fn load(auth: anytype, comptime account_key: []const u8) !bool {
 /// so tests pin the credential lifecycle without the network. Refresh before
 /// touching the stored tokens: a failed refresh leaves the stored credential
 /// intact.
-pub fn accessToken(auth: anytype, comptime account_key: []const u8, comptime refreshFn: anytype) ![]const u8 {
+pub fn accessToken(
+    auth: anytype,
+    comptime account_key: []const u8,
+    comptime refreshFn: anytype,
+) ![]const u8 {
     const tokens = auth.tokens orelse return error.NotAuthenticated;
     const now_ms = std.Io.Timestamp.now(auth.io, .real).toMilliseconds();
     if (now_ms >= tokens.expires_ms) {
@@ -63,32 +68,33 @@ pub fn accessToken(auth: anytype, comptime account_key: []const u8, comptime ref
 }
 
 /// Run the interactive OAuth login, reporting runtime text through the caller's
-/// presentation boundary. `oauth` is the provider protocol module (PKCE, the
-/// authorize URL, the callback port); `exchangeFn(auth, callback, pair)` trades
-/// the received callback for tokens, applying any provider-specific checks first.
+/// presentation boundary. `oauth` is the provider protocol module (the
+/// authorize URL and the callback port); `exchangeFn(auth, redirect, pair)`
+/// trades the received redirect for tokens, applying any provider-specific
+/// checks first.
 pub fn login(
     auth: anytype,
     comptime account_key: []const u8,
     comptime oauth: type,
-    comptime exchangeFn: anytype,
     prompt: anytype,
+    comptime exchangeFn: anytype,
 ) !void {
-    const pair = oauth.pkce(auth.io);
+    const pair = oauth_wire.pkce(auth.io);
     const url = try oauth.authorizeUrl(auth.gpa, &pair);
     defer auth.gpa.free(url);
 
-    const callback = try oauth_login.receive(oauth_callback.Callback, &.{
+    const redirect = try oauth_login.receive(oauth_callback.Redirect, &.{
         .url = url,
         .prompt = prompt,
         .browser = oauth_login.Browser{ .io = auth.io },
         .callback = CallbackSource{ .gpa = auth.gpa, .io = auth.io, .port = oauth.callback_port },
     });
     defer {
-        auth.gpa.free(callback.code);
-        auth.gpa.free(callback.state);
+        auth.gpa.free(redirect.code);
+        auth.gpa.free(redirect.state);
     }
 
-    const tokens = try exchangeFn(auth, callback, &pair);
+    const tokens = try exchangeFn(auth, redirect, &pair);
     if (auth.tokens) |old| old.deinit(auth.gpa);
     auth.tokens = tokens;
     try save(auth, account_key);
@@ -138,7 +144,7 @@ const CallbackListener = struct {
         self.server.deinit(self.io);
     }
 
-    pub fn receive(self: *CallbackListener) !oauth_callback.Callback {
+    pub fn receive(self: *CallbackListener) !oauth_callback.Redirect {
         return oauth_callback.receive(self.gpa, self.io, &self.server);
     }
 };

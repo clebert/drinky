@@ -12,11 +12,22 @@ const file_bytes_max = 16 << 20;
 
 pub const spec: llm.Tool = .{
     .name = "edit",
-    .description = "Replace an exact, unique span of text in an existing file. old_text must occur exactly once; include enough surrounding context to make it unique.",
+    .description = "Replace an exact, unique span of text in an existing file. old_text " ++
+        "must occur exactly once; include enough surrounding context to make it unique.",
     .parameters = &.{
         .{ .name = "path", .type = .string, .required = true, .description = "Path to the file" },
-        .{ .name = "old_text", .type = .string, .required = true, .description = "Exact text to replace; must occur exactly once" },
-        .{ .name = "new_text", .type = .string, .required = true, .description = "Replacement text" },
+        .{
+            .name = "old_text",
+            .type = .string,
+            .required = true,
+            .description = "Exact text to replace; must occur exactly once",
+        },
+        .{
+            .name = "new_text",
+            .type = .string,
+            .required = true,
+            .description = "Replacement text",
+        },
     },
 };
 
@@ -38,18 +49,39 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
     const old = parsed.value.old_text;
     const new = parsed.value.new_text;
 
-    const data = std.Io.Dir.cwd().readFileAlloc(context.io, path, gpa, .limited(file_bytes_max)) catch |err| switch (err) {
-        error.StreamTooLong => return Result.report(gpa, .err, "{s} is larger than {d} bytes; edit it another way", .{ path, file_bytes_max }),
+    const data = std.Io.Dir.cwd().readFileAlloc(
+        context.io,
+        path,
+        gpa,
+        .limited(file_bytes_max),
+    ) catch |err| switch (err) {
+        error.StreamTooLong => return Result.report(
+            gpa,
+            .err,
+            "{s} is larger than {d} bytes; edit it another way",
+            .{ path, file_bytes_max },
+        ),
         else => return Result.cannot(gpa, err, "read", path),
     };
     defer gpa.free(data);
 
-    const updated = applyEdit(gpa, .{ .data = data, .old = old, .new = new }) catch |err| switch (err) {
-        error.EmptyOldText => return Result.report(gpa, .err, "old_text must not be empty", .{}),
-        error.NotFound => return Result.report(gpa, .err, "old_text not found in {s}", .{path}),
-        error.NotUnique => return Result.report(gpa, .err, "old_text is not unique in {s}; include more surrounding context", .{path}),
-        else => return err,
-    };
+    const updated = applyEdit(gpa, .{ .data = data, .old = old, .new = new }) catch |err|
+        switch (err) {
+            error.EmptyOldText => return Result.report(
+                gpa,
+                .err,
+                "old_text must not be empty",
+                .{},
+            ),
+            error.NotFound => return Result.report(gpa, .err, "old_text not found in {s}", .{path}),
+            error.NotUnique => return Result.report(
+                gpa,
+                .err,
+                "old_text is not unique in {s}; include more surrounding context",
+                .{path},
+            ),
+            else => return err,
+        };
     defer gpa.free(updated);
 
     fs.writeFile(context.io, std.Io.Dir.cwd(), .{ .sub_path = path, .data = updated }) catch |err|
@@ -68,7 +100,11 @@ fn applyEdit(
     if (edit.old.len == 0) return error.EmptyOldText;
     const index = std.mem.indexOf(u8, edit.data, edit.old) orelse return error.NotFound;
     if (std.mem.indexOfPos(u8, edit.data, index + 1, edit.old) != null) return error.NotUnique;
-    return std.fmt.allocPrint(gpa, "{s}{s}{s}", .{ edit.data[0..index], edit.new, edit.data[index + edit.old.len ..] });
+    return std.fmt.allocPrint(gpa, "{s}{s}{s}", .{
+        edit.data[0..index],
+        edit.new,
+        edit.data[index + edit.old.len ..],
+    });
 }
 
 test applyEdit {
@@ -78,10 +114,22 @@ test applyEdit {
     defer gpa.free(updated);
     try std.testing.expectEqualStrings("one 2 three", updated);
 
-    try std.testing.expectError(error.NotFound, applyEdit(gpa, .{ .data = "abc", .old = "z", .new = "y" }));
-    try std.testing.expectError(error.NotUnique, applyEdit(gpa, .{ .data = "a a a", .old = "a", .new = "b" }));
-    try std.testing.expectError(error.NotUnique, applyEdit(gpa, .{ .data = "aaa", .old = "aa", .new = "b" }));
-    try std.testing.expectError(error.EmptyOldText, applyEdit(gpa, .{ .data = "abc", .old = "", .new = "y" }));
+    try std.testing.expectError(
+        error.NotFound,
+        applyEdit(gpa, .{ .data = "abc", .old = "z", .new = "y" }),
+    );
+    try std.testing.expectError(
+        error.NotUnique,
+        applyEdit(gpa, .{ .data = "a a a", .old = "a", .new = "b" }),
+    );
+    try std.testing.expectError(
+        error.NotUnique,
+        applyEdit(gpa, .{ .data = "aaa", .old = "aa", .new = "b" }),
+    );
+    try std.testing.expectError(
+        error.EmptyOldText,
+        applyEdit(gpa, .{ .data = "abc", .old = "", .new = "y" }),
+    );
 }
 
 test "edit rewrites the file on disk" {

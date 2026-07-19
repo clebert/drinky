@@ -16,9 +16,9 @@ const oauth_wire = @import("../oauth_wire.zig");
 const base64url = std.base64.url_safe_no_pad.Encoder;
 const base64url_decoder = std.base64.url_safe_no_pad.Decoder;
 
-pub const client_id = "app_EMoamEEZ73f0CkXaXp7hrann";
-pub const authorize_url = "https://auth.openai.com/oauth/authorize";
-pub const token_url = "https://auth.openai.com/oauth/token";
+const client_id = "app_EMoamEEZ73f0CkXaXp7hrann";
+const authorize_url = "https://auth.openai.com/oauth/authorize";
+const token_url = "https://auth.openai.com/oauth/token";
 pub const callback_port = 1455;
 
 const redirect_encoded = "http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback";
@@ -28,11 +28,6 @@ const refresh_margin_ms = 5 * 60 * 1000;
 
 /// The JWT claim namespace OpenAI nests the ChatGPT identity under.
 const auth_claim = "https://api.openai.com/auth";
-
-pub const Pkce = oauth_wire.Pkce;
-
-/// A fresh PKCE verifier/challenge pair drawn from the Io's CSPRNG.
-pub const pkce = oauth_wire.pkce;
 
 pub const Tokens = struct {
     access: []const u8,
@@ -53,7 +48,7 @@ pub const Tokens = struct {
 
 /// The browser authorize URL for `code`. Caller frees the result. The verifier
 /// doubles as the CSRF `state`, so the callback's state is checked against it.
-pub fn authorizeUrl(gpa: std.mem.Allocator, code: *const Pkce) ![]u8 {
+pub fn authorizeUrl(gpa: std.mem.Allocator, code: *const oauth_wire.Pkce) ![]u8 {
     return std.fmt.allocPrint(
         gpa,
         authorize_url ++ "?response_type=code&client_id=" ++ client_id ++
@@ -65,24 +60,28 @@ pub fn authorizeUrl(gpa: std.mem.Allocator, code: *const Pkce) ![]u8 {
     );
 }
 
-/// Exchange an authorization `code` for tokens (form-urlencoded body). Caller
-/// frees the result. `code` is left as received from the callback — not
-/// re-encoded — so it is not double-escaped into the form body.
-pub fn exchange(
-    gpa: std.mem.Allocator,
-    io: std.Io,
-    timeouts: net.Timeouts,
+/// The authorization grant traded for tokens: the callback's `code` and the
+/// local PKCE `verifier`.
+pub const Grant = struct {
     code: []const u8,
     verifier: []const u8,
-) !Tokens {
+};
+
+/// Exchange an authorization grant for tokens (form-urlencoded body). Caller
+/// frees the result. `code` is left as received from the callback — not
+/// re-encoded — so it is not double-escaped into the form body.
+pub fn exchange(gpa: std.mem.Allocator, io: std.Io, timeouts: net.Timeouts, grant: Grant) !Tokens {
     const body = try std.fmt.allocPrint(
         gpa,
         "grant_type=authorization_code&client_id=" ++ client_id ++
             "&code={s}&code_verifier={s}&redirect_uri=" ++ redirect_encoded,
-        .{ code, verifier },
+        .{ grant.code, grant.verifier },
     );
     defer gpa.free(body);
-    return post(gpa, io, timeouts, body, "application/x-www-form-urlencoded", .{});
+    return post(gpa, io, timeouts, .{
+        .body = body,
+        .content_type = "application/x-www-form-urlencoded",
+    }, .{});
 }
 
 /// Trade a refresh token for fresh tokens (JSON body). A refresh response may
@@ -92,7 +91,7 @@ pub fn exchange(
 pub fn refresh(gpa: std.mem.Allocator, io: std.Io, timeouts: net.Timeouts, tokens: Tokens) !Tokens {
     const body = try refreshBody(gpa, tokens.refresh);
     defer gpa.free(body);
-    return post(gpa, io, timeouts, body, "application/json", .{
+    return post(gpa, io, timeouts, .{ .body = body, .content_type = "application/json" }, .{
         .refresh = tokens.refresh,
         .account_id = tokens.account_id,
     });
@@ -110,17 +109,19 @@ fn refreshBody(gpa: std.mem.Allocator, refresh_token: []const u8) error{OutOfMem
 
 const Fallback = struct { refresh: []const u8 = "", account_id: []const u8 = "" };
 
+const Payload = struct { body: []const u8, content_type: []const u8 };
+
 fn post(
     gpa: std.mem.Allocator,
     io: std.Io,
     timeouts: net.Timeouts,
-    body: []const u8,
-    content_type: []const u8,
+    payload: Payload,
     fallback: Fallback,
 ) !Tokens {
-    const payload = try oauth_wire.post(gpa, io, timeouts, token_url, content_type, body);
-    defer gpa.free(payload);
-    return parseTokens(gpa, payload, fallback);
+    const response =
+        try oauth_wire.post(gpa, io, timeouts, token_url, payload.content_type, payload.body);
+    defer gpa.free(response);
+    return parseTokens(gpa, response, fallback);
 }
 
 fn parseTokens(gpa: std.mem.Allocator, body: []const u8, fallback: Fallback) !Tokens {
@@ -128,26 +129,26 @@ fn parseTokens(gpa: std.mem.Allocator, body: []const u8, fallback: Fallback) !To
     defer parsed.deinit();
     const object = json.object(parsed.value) orelse return error.BadTokenResponse;
 
-    const access_str = json.string(object.get("access_token")) orelse return error.MissingAccessToken;
-    const id_token = json.string(object.get("id_token"));
+    const access = json.string(object.get("access_token")) orelse return error.MissingAccessToken;
+    const maybe_id_token = json.string(object.get("id_token"));
     // A refresh may reissue neither the refresh token nor the id token; carry the
     // current values over when the response omits them.
-    const refresh_str = json.string(object.get("refresh_token")) orelse fallback.refresh;
-    if (refresh_str.len == 0) return error.MissingRefreshToken;
+    const refresh_token = json.string(object.get("refresh_token")) orelse fallback.refresh;
+    if (refresh_token.len == 0) return error.MissingRefreshToken;
 
-    const expires_ms = (try jwtExpiryMs(gpa, access_str)) orelse return error.MissingExpiry;
+    const expires_ms = (try jwtExpiryMs(gpa, access)) orelse return error.MissingExpiry;
 
     // The account id lives in the id-token JWT, but the same claim rides on the
     // access token, so try both before falling back to the stored id.
-    const account_owned = try accountId(gpa, id_token, access_str, fallback.account_id);
+    const account_owned = try accountId(gpa, maybe_id_token, access, fallback.account_id);
     errdefer gpa.free(account_owned);
 
-    const access = try gpa.dupe(u8, access_str);
-    errdefer gpa.free(access);
-    const refresh_owned = try gpa.dupe(u8, refresh_str);
+    const access_owned = try gpa.dupe(u8, access);
+    errdefer gpa.free(access_owned);
+    const refresh_owned = try gpa.dupe(u8, refresh_token);
 
     return .{
-        .access = access,
+        .access = access_owned,
         .refresh = refresh_owned,
         .expires_ms = expires_ms,
         .account_id = account_owned,
@@ -159,12 +160,12 @@ fn parseTokens(gpa: std.mem.Allocator, body: []const u8, fallback: Fallback) !To
 /// malformed or claimless token is skipped cleanly.
 fn accountId(
     gpa: std.mem.Allocator,
-    id_token: ?[]const u8,
+    maybe_id_token: ?[]const u8,
     access_token: []const u8,
     fallback: []const u8,
 ) error{ OutOfMemory, MissingAccountId }![]const u8 {
-    if (id_token) |token| {
-        if (try claimAccountId(gpa, token)) |found| return found;
+    if (maybe_id_token) |id_token| {
+        if (try claimAccountId(gpa, id_token)) |found| return found;
     }
     if (try claimAccountId(gpa, access_token)) |found| return found;
     if (fallback.len != 0) return gpa.dupe(u8, fallback);
@@ -198,7 +199,10 @@ fn jwtExpiryMs(gpa: std.mem.Allocator, token: []const u8) error{OutOfMemory}!?i6
 /// Decode a JWT's payload (the middle of three dot-separated segments) and parse
 /// it as JSON. Null — never an error — on fewer than three segments or bad
 /// base64; we only read our own token, so no signature is verified.
-fn decodePayload(gpa: std.mem.Allocator, token: []const u8) error{OutOfMemory}!?std.json.Parsed(std.json.Value) {
+fn decodePayload(
+    gpa: std.mem.Allocator,
+    token: []const u8,
+) error{OutOfMemory}!?std.json.Parsed(std.json.Value) {
     var segments = std.mem.splitScalar(u8, token, '.');
     _ = segments.next() orelse return null;
     const payload = segments.next() orelse return null;
@@ -215,7 +219,7 @@ fn decodePayload(gpa: std.mem.Allocator, token: []const u8) error{OutOfMemory}!?
 }
 
 test authorizeUrl {
-    var code: Pkce = undefined;
+    var code: oauth_wire.Pkce = undefined;
     @memset(&code.verifier, 'v');
     @memset(&code.challenge, 'c');
     const url = try authorizeUrl(std.testing.allocator, &code);
@@ -246,7 +250,10 @@ test parseTokens {
     // Expiry rides on the access token; the account id on the id token.
     const access = try makeJwt(gpa, "{\"exp\":2000000000}");
     defer gpa.free(access);
-    const id = try makeJwt(gpa, "{\"https://api.openai.com/auth\":{\"chatgpt_account_id\":\"acct_123\"}}");
+    const id = try makeJwt(
+        gpa,
+        "{\"https://api.openai.com/auth\":{\"chatgpt_account_id\":\"acct_123\"}}",
+    );
     defer gpa.free(id);
     const body = try std.fmt.allocPrint(
         gpa,
@@ -280,7 +287,11 @@ test "parseTokens fails cleanly when the account id cannot be found" {
     const gpa = std.testing.allocator;
     const access = try makeJwt(gpa, "{\"exp\":2000000000}");
     defer gpa.free(access);
-    const body = try std.fmt.allocPrint(gpa, "{{\"access_token\":\"{s}\",\"refresh_token\":\"rt\"}}", .{access});
+    const body = try std.fmt.allocPrint(
+        gpa,
+        "{{\"access_token\":\"{s}\",\"refresh_token\":\"rt\"}}",
+        .{access},
+    );
     defer gpa.free(body);
     try std.testing.expectError(error.MissingAccountId, parseTokens(gpa, body, .{}));
 }
@@ -289,7 +300,11 @@ test "parseTokens rejects a token whose JWT has no expiry" {
     const gpa = std.testing.allocator;
     const access = try makeJwt(gpa, "{\"sub\":\"x\"}");
     defer gpa.free(access);
-    const body = try std.fmt.allocPrint(gpa, "{{\"access_token\":\"{s}\",\"refresh_token\":\"rt\"}}", .{access});
+    const body = try std.fmt.allocPrint(
+        gpa,
+        "{{\"access_token\":\"{s}\",\"refresh_token\":\"rt\"}}",
+        .{access},
+    );
     defer gpa.free(body);
     try std.testing.expectError(error.MissingExpiry, parseTokens(gpa, body, .{}));
 }
@@ -300,7 +315,11 @@ test "parseTokens skips a crafted expiry that would overflow" {
     // converting to milliseconds.
     const access = try makeJwt(gpa, "{\"exp\":9223372036854775807}");
     defer gpa.free(access);
-    const body = try std.fmt.allocPrint(gpa, "{{\"access_token\":\"{s}\",\"refresh_token\":\"rt\"}}", .{access});
+    const body = try std.fmt.allocPrint(
+        gpa,
+        "{{\"access_token\":\"{s}\",\"refresh_token\":\"rt\"}}",
+        .{access},
+    );
     defer gpa.free(body);
     try std.testing.expectError(error.MissingExpiry, parseTokens(gpa, body, .{}));
 }

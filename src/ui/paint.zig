@@ -11,7 +11,8 @@ const terminal = @import("terminal");
 const color = @import("color.zig");
 
 /// Braille frames for the "Working…" spinner, advanced one step per frame tick.
-const spinner_frames = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };
+const spinner_frames =
+    [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };
 
 /// Display width of the full `⠋ Working…` spinner: glyph, space, and message.
 const spinner_columns = 10;
@@ -111,7 +112,12 @@ fn boxPad(placement: *const Placement, line: *usize, background: color.Style) !v
 /// A box's content row: a one-space left pad, `content`, then the background
 /// filled to full width. `content` is capped to leave room for the pad, so a
 /// window too narrow for the wrap width still yields one physical row.
-fn boxLine(placement: *const Placement, line: *usize, style: *const BoxStyle, content: []const u8) !void {
+fn boxLine(
+    placement: *const Placement,
+    line: *usize,
+    style: *const BoxStyle,
+    content: []const u8,
+) !void {
     defer line.* += 1;
     if (line.* < placement.skip) return;
     const shown = terminal.width.truncate(content, placement.columns -| 1);
@@ -206,7 +212,8 @@ fn framedRow(
     if (maybe_style) |style| try color.apply(placement.sink, style);
     try placement.sink.text(content);
     if (maybe_style != null) try color.apply(placement.sink, .reset);
-    if (maybe_caret) |caret| if (placement.base + caret.row == line.*) placement.sink.setCaret(caret.column);
+    if (maybe_caret) |caret|
+        if (placement.base + caret.row == line.*) placement.sink.setCaret(caret.column);
     placement.sink.end(.{ .id = placement.id, .line = line.* });
 }
 
@@ -285,7 +292,8 @@ pub fn steering(placement: *const Placement, messages: []const []const u8) !void
         // so a window narrower than the label can never overflow the row.
         const label = terminal.width.truncate("Steering: ", placement.columns);
         const first = message[0 .. std.mem.indexOfScalar(u8, message, '\n') orelse message.len];
-        const shown = terminal.width.truncate(first, placement.columns -| terminal.width.ofText(label));
+        const room = placement.columns -| terminal.width.ofText(label);
+        const shown = terminal.width.truncate(first, room);
         placement.sink.begin();
         try color.apply(placement.sink, .accent_foreground);
         try placement.sink.text(label);

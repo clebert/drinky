@@ -4,7 +4,7 @@
 const std = @import("std");
 
 pub const Context = @import("Context.zig");
-pub const Outcome = @import("outcome.zig").Outcome;
+pub const Outcome = Context.Outcome;
 
 const testing = @import("testing.zig");
 
@@ -37,7 +37,11 @@ pub fn run(context: *Context, line: []const u8) !Outcome {
 }
 
 test "unknown command is reported" {
-    var context: Context = .{ .gpa = std.testing.allocator, .agent = undefined, .accounts = undefined };
+    var context: Context = .{
+        .gpa = std.testing.allocator,
+        .agent = undefined,
+        .accounts = undefined,
+    };
     try Outcome.expectFeedback(try run(&context, "/nope"), .err);
 }
 

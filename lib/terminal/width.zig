@@ -134,22 +134,18 @@ pub fn offsetAt(text: []const u8, columns_max: usize, target: Caret) usize {
     while (iterator.next()) |line| : (row += 1) {
         if (row != target.rows_before) continue;
         const start = @intFromPtr(line.ptr) - @intFromPtr(text.ptr);
-        return start + offsetAtColumn(line, columns_max, target.column);
+        var columns: usize = 0;
+        var index: usize = 0;
+        while (index < line.len) {
+            const unit = displayUnit(line[index..]);
+            const unit_columns = fittedColumns(&unit, columns_max);
+            if (columns + unit_columns > target.column) break;
+            columns += unit_columns;
+            index += unit.bytes;
+        }
+        return start + index;
     }
     return text.len;
-}
-
-fn offsetAtColumn(line: []const u8, columns_max: usize, target_column: usize) usize {
-    var columns: usize = 0;
-    var index: usize = 0;
-    while (index < line.len) {
-        const unit = displayUnit(line[index..]);
-        const unit_columns = fittedColumns(&unit, columns_max);
-        if (columns + unit_columns > target_column) break;
-        columns += unit_columns;
-        index += unit.bytes;
-    }
-    return index;
 }
 
 /// Byte offset immediately after the canonical display unit at `offset`.
@@ -267,7 +263,8 @@ fn writeCanonical(writer: *std.Io.Writer, text: []const u8, columns_max: usize) 
             } else if (unit_columns > 0) {
                 try writer.writeAll(replacement);
             },
-            .space => if (unit_columns > 0) try writer.writeAll(grapheme_boundary ++ " " ++ grapheme_boundary),
+            .space => if (unit_columns > 0)
+                try writer.writeAll(grapheme_boundary ++ " " ++ grapheme_boundary),
             .replacement => if (unit_columns > 0) try writer.writeAll(replacement),
             .line_break => try writer.writeAll(grapheme_boundary),
         }
@@ -314,8 +311,9 @@ test writeText {
     const input = "a\t\x07\x1b\xc2\x9b\x7f\xff\xf0\x9f\nb";
     const columns = try writeText(&out.writer, input);
     try std.testing.expectEqualStrings(
-        "a" ++ grapheme_boundary ++ " " ++ grapheme_boundary ++ replacement ++ replacement ++ replacement ++ replacement ++
-            replacement ++ replacement ++ replacement ++ grapheme_boundary ++ "b",
+        "a" ++ grapheme_boundary ++ " " ++ grapheme_boundary ++ replacement ++ replacement ++
+            replacement ++ replacement ++ replacement ++ replacement ++ replacement ++
+            grapheme_boundary ++ "b",
         out.written(),
     );
     try std.testing.expectEqual(@as(usize, 10), columns);
@@ -333,7 +331,10 @@ test writeText {
 
     out.clearRetainingCapacity();
     const tab_columns = try writeText(&out.writer, "\t\u{FE0F}");
-    try std.testing.expectEqualStrings(grapheme_boundary ++ " " ++ grapheme_boundary ++ "\u{FE0F}", out.written());
+    try std.testing.expectEqualStrings(
+        grapheme_boundary ++ " " ++ grapheme_boundary ++ "\u{FE0F}",
+        out.written(),
+    );
     try std.testing.expectEqual(@as(usize, 3), tab_columns);
     try std.testing.expectEqual(tab_columns, ofText(out.written()));
 
@@ -438,25 +439,29 @@ test "canonical display boundaries follow rendered replacement units" {
     try std.testing.expectEqual(@as(usize, 3), boundaryAtOrAfter("e\u{0301}", 1));
 }
 
+fn expectOffsetAt(expected: usize, text: []const u8, columns_max: usize, target: Caret) !void {
+    try std.testing.expectEqual(expected, offsetAt(text, columns_max, target));
+}
+
 test offsetAt {
     // The inverse of caret on a plain single row.
-    try std.testing.expectEqual(@as(usize, 2), offsetAt("hello", 10, .{ .rows_before = 0, .column = 2 }));
+    try expectOffsetAt(2, "hello", 10, .{ .rows_before = 0, .column = 2 });
     // A newline-delimited second row, column within it.
-    try std.testing.expectEqual(@as(usize, 9), offsetAt("hello\nworld", 10, .{ .rows_before = 1, .column = 3 }));
+    try expectOffsetAt(9, "hello\nworld", 10, .{ .rows_before = 1, .column = 3 });
     // A width-wrapped continuation row.
-    try std.testing.expectEqual(@as(usize, 4), offsetAt("abcdef", 3, .{ .rows_before = 1, .column = 1 }));
+    try expectOffsetAt(4, "abcdef", 3, .{ .rows_before = 1, .column = 1 });
     // A column past the row's content clamps to the row's end.
-    try std.testing.expectEqual(@as(usize, 9), offsetAt("abcdef\nxy", 10, .{ .rows_before = 1, .column = 9 }));
+    try expectOffsetAt(9, "abcdef\nxy", 10, .{ .rows_before = 1, .column = 9 });
     // A row past the last wrapped row clamps to the end of text.
-    try std.testing.expectEqual(@as(usize, 11), offsetAt("hello\nworld", 10, .{ .rows_before = 5, .column = 0 }));
+    try expectOffsetAt(11, "hello\nworld", 10, .{ .rows_before = 5, .column = 0 });
     // A column inside a two-cell cluster lands on the boundary before it.
-    try std.testing.expectEqual(@as(usize, 0), offsetAt("你好世", 10, .{ .rows_before = 0, .column = 1 }));
-    try std.testing.expectEqual(@as(usize, 3), offsetAt("你好世", 10, .{ .rows_before = 0, .column = 3 }));
+    try expectOffsetAt(0, "你好世", 10, .{ .rows_before = 0, .column = 1 });
+    try expectOffsetAt(3, "你好世", 10, .{ .rows_before = 0, .column = 3 });
     // The inverse of the full-width-margin caret: the next row's first column
     // maps back to the end of the filled row.
-    try std.testing.expectEqual(@as(usize, 3), offsetAt("hel", 3, .{ .rows_before = 1, .column = 0 }));
+    try expectOffsetAt(3, "hel", 3, .{ .rows_before = 1, .column = 0 });
     // Column 0 of a blank row between two newlines.
-    try std.testing.expectEqual(@as(usize, 2), offsetAt("a\n\nb", 10, .{ .rows_before = 1, .column = 0 }));
+    try expectOffsetAt(2, "a\n\nb", 10, .{ .rows_before = 1, .column = 0 });
 }
 
 test caret {

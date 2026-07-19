@@ -171,7 +171,7 @@ pub const Usage = struct {
     cache_write: u64 = 0,
 
     /// Field-wise sum, for accumulating several messages' usage.
-    pub fn plus(self: Usage, other: Usage) Usage {
+    pub fn plus(self: *const Usage, other: *const Usage) Usage {
         return .{
             .input = self.input + other.input,
             .output = self.output + other.output,

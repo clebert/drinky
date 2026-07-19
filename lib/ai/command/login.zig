@@ -6,13 +6,12 @@ const std = @import("std");
 
 const llm = @import("../llm.zig");
 const Context = @import("Context.zig");
-const Outcome = @import("outcome.zig").Outcome;
 const testing = @import("testing.zig");
 
 pub const name = "login";
 
-pub fn run(context: *Context) !Outcome {
-    var options: Outcome.Options = .{ .gpa = context.gpa };
+pub fn run(context: *Context) !Context.Outcome {
+    var options: Context.Outcome.Options = .{ .gpa = context.gpa };
     errdefer options.deinit();
     for (std.enums.values(llm.Account)) |account|
         try options.print("{s}{s}", .{ account.label(), marker(context, account) });
@@ -24,17 +23,18 @@ pub fn run(context: *Context) !Outcome {
     } };
 }
 
-pub fn select(context: *Context, index: usize) !Outcome {
+pub fn select(context: *Context, index: usize) !Context.Outcome {
     const gpa = context.gpa;
     const accounts = std.enums.values(llm.Account);
-    if (index >= accounts.len) return Outcome.report(gpa, .err, "invalid selection", .{});
+    if (index >= accounts.len) return Context.Outcome.report(gpa, .err, "invalid selection", .{});
     const account = accounts[index];
-    if (isActive(context, account)) return Outcome.report(gpa, .ok, "{s} is already active", .{account.label()});
+    if (isActive(context, account))
+        return Context.Outcome.report(gpa, .ok, "{s} is already active", .{account.label()});
     // Authenticated but inactive: the app performs the switch so the configured
     // default model applies, exactly as a startup on this account would.
     if (context.accounts.isAuthenticated(account)) return .{ .switch_account = account };
     if (account.isSubscription()) return .{ .login = account };
-    return Outcome.report(
+    return Context.Outcome.report(
         gpa,
         .ok,
         "{s} uses an API key: set {s} in the environment and restart pith",
@@ -56,7 +56,7 @@ fn isActive(context: *const Context, account: llm.Account) bool {
 
 test "the picker lists every account, marking the active and authenticated ones" {
     const gpa = std.testing.allocator;
-    var accounts = testing.accounts(.{ .anthropic = "sk-ant" }, true, false);
+    var accounts = testing.accounts(.{ .anthropic = "sk-ant" }, .{ .anthropic = true });
     var agent = testing.agent(gpa, .{ .anthropic_api = "sk-ant" });
     defer agent.deinit();
     var context: Context = .{ .gpa = gpa, .agent = &agent, .accounts = &accounts };
@@ -68,7 +68,10 @@ test "the picker lists every account, marking the active and authenticated ones"
                 gpa.free(pick.options);
             }
             try std.testing.expectEqual(@as(usize, 4), pick.options.len);
-            try std.testing.expectEqualStrings("anthropic subscription (logged in)", pick.options[0]);
+            try std.testing.expectEqualStrings(
+                "anthropic subscription (logged in)",
+                pick.options[0],
+            );
             try std.testing.expectEqualStrings("anthropic api (active)", pick.options[1]);
             try std.testing.expectEqualStrings("openai subscription", pick.options[2]);
             try std.testing.expectEqualStrings("openai api", pick.options[3]);
@@ -80,7 +83,7 @@ test "the picker lists every account, marking the active and authenticated ones"
 
 test "select logs in a subscription, instructs an API account, and no-ops the active one" {
     const gpa = std.testing.allocator;
-    var accounts = testing.accounts(.{ .anthropic = "sk-ant" }, false, false);
+    var accounts = testing.accounts(.{ .anthropic = "sk-ant" }, .{});
     var agent = testing.agent(gpa, .{ .anthropic_api = "sk-ant" });
     defer agent.deinit();
     var context: Context = .{ .gpa = gpa, .agent = &agent, .accounts = &accounts };
@@ -89,31 +92,34 @@ test "select logs in a subscription, instructs an API account, and no-ops the ac
         .login => |account| try std.testing.expectEqual(llm.Account.openai_subscription, account),
         else => return error.ExpectedLogin,
     }
-    try Outcome.expectFeedbackContaining(try select(&context, 3), .ok, "OPENAI_API_KEY");
-    try Outcome.expectFeedbackContaining(try select(&context, 1), .ok, "already active");
-    try Outcome.expectFeedback(try select(&context, 99), .err);
+    try Context.Outcome.expectFeedbackContaining(try select(&context, 3), .ok, "OPENAI_API_KEY");
+    try Context.Outcome.expectFeedbackContaining(try select(&context, 1), .ok, "already active");
+    try Context.Outcome.expectFeedback(try select(&context, 99), .err);
 }
 
 test "select never re-runs the login for the active subscription" {
     const gpa = std.testing.allocator;
-    var accounts = testing.accounts(.{}, true, false);
+    var accounts = testing.accounts(.{}, .{ .anthropic = true });
     var agent = testing.agent(gpa, .{ .anthropic_subscription = undefined });
     defer agent.deinit();
     var context: Context = .{ .gpa = gpa, .agent = &agent, .accounts = &accounts };
 
-    try Outcome.expectFeedbackContaining(try select(&context, 0), .ok, "already active");
+    try Context.Outcome.expectFeedbackContaining(try select(&context, 0), .ok, "already active");
     try std.testing.expectEqual(llm.Account.anthropic_subscription, agent.client.?.account());
 }
 
 test "select hands an authenticated but inactive account to the app to switch" {
     const gpa = std.testing.allocator;
-    var accounts = testing.accounts(.{ .anthropic = "sk-ant" }, true, false);
+    var accounts = testing.accounts(.{ .anthropic = "sk-ant" }, .{ .anthropic = true });
     var agent = testing.agent(gpa, .{ .anthropic_api = "sk-ant" });
     defer agent.deinit();
     var context: Context = .{ .gpa = gpa, .agent = &agent, .accounts = &accounts };
 
     switch (try select(&context, 0)) {
-        .switch_account => |account| try std.testing.expectEqual(llm.Account.anthropic_subscription, account),
+        .switch_account => |account| try std.testing.expectEqual(
+            llm.Account.anthropic_subscription,
+            account,
+        ),
         else => return error.ExpectedSwitch,
     }
 }

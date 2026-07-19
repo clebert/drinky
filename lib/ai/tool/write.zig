@@ -13,7 +13,12 @@ pub const spec: llm.Tool = .{
     .description = "Create or overwrite a UTF-8 text file with the given contents.",
     .parameters = &.{
         .{ .name = "path", .type = .string, .required = true, .description = "Path to the file" },
-        .{ .name = "content", .type = .string, .required = true, .description = "Full file contents; replaces the file entirely" },
+        .{
+            .name = "content",
+            .type = .string,
+            .required = true,
+            .description = "Full file contents; replaces the file entirely",
+        },
     },
 };
 

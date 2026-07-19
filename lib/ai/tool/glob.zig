@@ -14,9 +14,15 @@ pub fn match(query: struct { pattern: []const u8, path: []const u8 }) bool {
             return std.mem.eql(u8, segmentAt(self.pattern, index), "**");
         }
         fn eql(self: @This(), pattern_index: usize, path_index: usize) bool {
-            return matchSegment(segmentAt(self.pattern, pattern_index), segmentAt(self.path, path_index));
+            return matchSegment(
+                segmentAt(self.pattern, pattern_index),
+                segmentAt(self.path, path_index),
+            );
         }
-    }{ .pattern = query.pattern, .path = query.path }, segmentCount(query.pattern), segmentCount(query.path));
+    }{
+        .pattern = query.pattern,
+        .path = query.path,
+    }, segmentCount(query.pattern), segmentCount(query.path));
 }
 
 /// Match one segment: `*` spans any run, `?` one character, neither has `/`.
@@ -28,7 +34,8 @@ fn matchSegment(pattern: []const u8, name: []const u8) bool {
             return self.pattern[index] == '*';
         }
         fn eql(self: @This(), pattern_index: usize, path_index: usize) bool {
-            return self.pattern[pattern_index] == '?' or self.pattern[pattern_index] == self.path[path_index];
+            return self.pattern[pattern_index] == '?' or
+                self.pattern[pattern_index] == self.path[path_index];
         }
     }{ .pattern = pattern, .path = name }, pattern.len, name.len);
 }

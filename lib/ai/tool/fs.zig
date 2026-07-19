@@ -39,11 +39,19 @@ pub const CancelIo = struct {
         return .{ .userdata = std.testing.io.userdata, .vtable = &self.vtable };
     }
 
-    fn openFile(_: ?*anyopaque, _: std.Io.Dir, _: []const u8, _: std.Io.Dir.OpenFileOptions) std.Io.File.OpenError!std.Io.File {
+    fn openFile(
+        _: ?*anyopaque,
+        _: std.Io.Dir,
+        _: []const u8,
+        _: std.Io.Dir.OpenFileOptions,
+    ) std.Io.File.OpenError!std.Io.File {
         return error.Canceled;
     }
 
-    fn operate(userdata: ?*anyopaque, operation: std.Io.Operation) std.Io.Cancelable!std.Io.Operation.Result {
+    fn operate(
+        userdata: ?*anyopaque,
+        operation: std.Io.Operation,
+    ) std.Io.Cancelable!std.Io.Operation.Result {
         if (operation == .file_write_streaming) return error.Canceled;
         return std.testing.io.vtable.operate(userdata, operation);
     }

@@ -8,6 +8,7 @@ const auth = @import("../auth.zig");
 const auth_store = @import("../auth_store.zig");
 const net = @import("../net.zig");
 const oauth_callback = @import("../oauth_callback.zig");
+const oauth_wire = @import("../oauth_wire.zig");
 const oauth = @import("oauth.zig");
 
 const Auth = @This();
@@ -43,20 +44,33 @@ pub fn accessToken(self: *Auth) ![]const u8 {
 }
 
 /// `oauth.refresh` in the shared lifecycle's shape (which passes whole tokens).
-fn refreshTokens(gpa: std.mem.Allocator, io: std.Io, timeouts: net.Timeouts, tokens: oauth.Tokens) !oauth.Tokens {
+fn refreshTokens(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    timeouts: net.Timeouts,
+    tokens: oauth.Tokens,
+) !oauth.Tokens {
     return oauth.refresh(gpa, io, timeouts, tokens.refresh);
 }
 
 /// Run the interactive OAuth login, reporting runtime text through the caller's
 /// presentation boundary.
 pub fn login(self: *Auth, prompt: anytype) !void {
-    return auth.login(self, account_key, oauth, exchangeCallback, prompt);
+    return auth.login(self, account_key, oauth, prompt, exchangeRedirect);
 }
 
-/// `oauth.exchange` over the received callback: the code, its `state`, and the
+/// `oauth.exchange` over the received redirect: the code, its `state`, and the
 /// PKCE verifier all go into the token request.
-fn exchangeCallback(self: *Auth, callback: oauth_callback.Callback, pair: *const oauth.Pkce) !oauth.Tokens {
-    return oauth.exchange(self.gpa, self.io, self.timeouts, callback.code, callback.state, &pair.verifier);
+fn exchangeRedirect(
+    self: *Auth,
+    redirect: oauth_callback.Redirect,
+    pair: *const oauth_wire.Pkce,
+) !oauth.Tokens {
+    return oauth.exchange(self.gpa, self.io, self.timeouts, .{
+        .code = redirect.code,
+        .state = redirect.state,
+        .verifier = &pair.verifier,
+    });
 }
 
 /// Drop this account's credentials: clear the in-memory tokens and remove its
@@ -65,11 +79,21 @@ pub fn logout(self: *Auth) !void {
     return auth.logout(self, account_key);
 }
 
-fn refuseRefresh(_: std.mem.Allocator, _: std.Io, _: net.Timeouts, _: oauth.Tokens) anyerror!oauth.Tokens {
+fn refuseRefresh(
+    _: std.mem.Allocator,
+    _: std.Io,
+    _: net.Timeouts,
+    _: oauth.Tokens,
+) anyerror!oauth.Tokens {
     return error.TokenRequestFailed;
 }
 
-fn grantRefresh(gpa: std.mem.Allocator, _: std.Io, _: net.Timeouts, _: oauth.Tokens) anyerror!oauth.Tokens {
+fn grantRefresh(
+    gpa: std.mem.Allocator,
+    _: std.Io,
+    _: net.Timeouts,
+    _: oauth.Tokens,
+) anyerror!oauth.Tokens {
     return .{
         .access = try gpa.dupe(u8, "fresh"),
         .refresh = try gpa.dupe(u8, "next"),
@@ -85,7 +109,10 @@ test "a live access token is returned without a refresh" {
         .path = "",
         .tokens = .{ .access = "live", .refresh = "keep", .expires_ms = std.math.maxInt(i64) },
     };
-    try std.testing.expectEqualStrings("live", try auth.accessToken(&subject, account_key, refuseRefresh));
+    try std.testing.expectEqualStrings(
+        "live",
+        try auth.accessToken(&subject, account_key, refuseRefresh),
+    );
 }
 
 test "a failed refresh leaves the stored credential intact" {
@@ -96,7 +123,10 @@ test "a failed refresh leaves the stored credential intact" {
         .path = "",
         .tokens = .{ .access = "stale", .refresh = "keep", .expires_ms = 0 },
     };
-    try std.testing.expectError(error.TokenRequestFailed, auth.accessToken(&subject, account_key, refuseRefresh));
+    try std.testing.expectError(
+        error.TokenRequestFailed,
+        auth.accessToken(&subject, account_key, refuseRefresh),
+    );
     try std.testing.expectEqualStrings("stale", subject.tokens.?.access);
     try std.testing.expectEqualStrings("keep", subject.tokens.?.refresh);
 }
@@ -120,7 +150,10 @@ test "an expired access token is refreshed and re-persisted" {
     };
     defer subject.tokens.?.deinit(gpa);
 
-    try std.testing.expectEqualStrings("fresh", try auth.accessToken(&subject, account_key, grantRefresh));
+    try std.testing.expectEqualStrings(
+        "fresh",
+        try auth.accessToken(&subject, account_key, grantRefresh),
+    );
     try std.testing.expectEqualStrings("next", subject.tokens.?.refresh);
 
     var file = (try auth_store.open(gpa, std.testing.io, path)).?;

@@ -62,7 +62,13 @@ pub const Stats = struct {
     };
 
     /// Attribute one message to `name`, opening a bucket on first appearance.
-    fn attribute(self: *Stats, name: []const u8, cost: f64, saved: f64, usage: llm.Usage) void {
+    fn attribute(
+        self: *Stats,
+        name: []const u8,
+        cost: f64,
+        saved: f64,
+        usage: *const llm.Usage,
+    ) void {
         const entry = self.entryFor(name) orelse return;
         entry.cost += cost;
         entry.saved += saved;
@@ -90,11 +96,134 @@ const Call = struct {
     result: anyerror!tool.Result = undefined,
 };
 
+/// The production fetch: `provider.Client.send` on the active account. A seam
+/// like `runToolsWith`'s `Dispatch`, so tests can script whole turns.
+const ClientFetch = struct {
+    client: *provider.Client,
+
+    const Stream = provider.Stream;
+
+    fn send(self: *ClientFetch, stream: *provider.Stream, request: *const llm.Request) !void {
+        return self.client.send(stream, request);
+    }
+};
+
+/// One streamed reply under assembly: the committed items plus the open answer,
+/// reasoning-run, and tool-call buffers. Flush methods dupe each string before
+/// the append and free every dupe if a later step fails, so a failure leaves no
+/// orphaned allocation.
+const Pending = struct {
+    items: std.ArrayList(llm.Item) = .empty,
+    text: std.ArrayList(u8) = .empty,
+    thinking: std.ArrayList(u8) = .empty,
+    blob: std.ArrayList(u8) = .empty,
+    reasoning_id: std.ArrayList(u8) = .empty,
+    in_thinking: bool = false,
+    tool_id: std.ArrayList(u8) = .empty,
+    tool_name: std.ArrayList(u8) = .empty,
+    input: std.ArrayList(u8) = .empty,
+    in_tool: bool = false,
+
+    /// Frees the list backings only; the finished items belong to the caller.
+    fn deinit(self: *Pending, gpa: std.mem.Allocator) void {
+        inline for (@typeInfo(Pending).@"struct".fields) |field| {
+            if (field.type != bool) @field(self, field.name).deinit(gpa);
+        }
+    }
+
+    /// Commit the pending tool call and answer text ahead of a fresh reasoning
+    /// run, keeping stream order.
+    fn flushBeforeRun(self: *Pending, gpa: std.mem.Allocator) !void {
+        if (self.in_tool) try self.flushTool(gpa);
+        try self.flushText(gpa);
+    }
+
+    /// Commit everything buffered in stream order — the pending tool first, then
+    /// the reasoning/answer that streamed after it — keeping the order the model
+    /// produced, reasoning at the head as the provider requires.
+    fn flushAll(self: *Pending, gpa: std.mem.Allocator, origin: llm.Account) !void {
+        if (self.in_tool) try self.flushTool(gpa);
+        try self.flushThinking(gpa, origin);
+        try self.flushText(gpa);
+    }
+
+    fn flushText(self: *Pending, gpa: std.mem.Allocator) !void {
+        if (self.text.items.len == 0) return;
+        const text_copy = try gpa.dupe(u8, self.text.items);
+        errdefer gpa.free(text_copy);
+        try self.items.append(gpa, .{ .message = .{ .role = .assistant, .text = text_copy } });
+        self.text.clearRetainingCapacity();
+    }
+
+    /// Commit the open reasoning run as one item (text plus its verbatim blob
+    /// and item id); a no-op when no run is open.
+    fn flushThinking(self: *Pending, gpa: std.mem.Allocator, origin: llm.Account) !void {
+        if (!self.in_thinking) return;
+        const text_copy = try gpa.dupe(u8, self.thinking.items);
+        errdefer gpa.free(text_copy);
+        const blob_copy = try gpa.dupe(u8, self.blob.items);
+        errdefer gpa.free(blob_copy);
+        const id_copy = try gpa.dupe(u8, self.reasoning_id.items);
+        errdefer gpa.free(id_copy);
+        try self.items.append(gpa, .{ .reasoning = .{
+            .text = text_copy,
+            .blob = blob_copy,
+            .id = id_copy,
+            .origin = origin,
+        } });
+        self.thinking.clearRetainingCapacity();
+        self.blob.clearRetainingCapacity();
+        self.reasoning_id.clearRetainingCapacity();
+        self.in_thinking = false;
+    }
+
+    /// Commit one redacted reasoning block: its encrypted blob and item id,
+    /// with empty visible text.
+    fn appendRedacted(
+        self: *Pending,
+        gpa: std.mem.Allocator,
+        chunk: llm.Event.Blob,
+        origin: llm.Account,
+    ) !void {
+        const blob_copy = try gpa.dupe(u8, chunk.blob);
+        errdefer gpa.free(blob_copy);
+        const id_copy = try gpa.dupe(u8, chunk.id);
+        errdefer gpa.free(id_copy);
+        try self.items.append(gpa, .{ .reasoning = .{
+            .text = "",
+            .blob = blob_copy,
+            .redacted = true,
+            .id = id_copy,
+            .origin = origin,
+        } });
+    }
+
+    fn flushTool(self: *Pending, gpa: std.mem.Allocator) !void {
+        const id_copy = try gpa.dupe(u8, self.tool_id.items);
+        errdefer gpa.free(id_copy);
+        const name_copy = try gpa.dupe(u8, self.tool_name.items);
+        errdefer gpa.free(name_copy);
+        const json_copy = try gpa.dupe(u8, self.input.items);
+        errdefer gpa.free(json_copy);
+        try self.items.append(gpa, .{ .tool_call = .{
+            .call_id = id_copy,
+            .name = name_copy,
+            .arguments_json = json_copy,
+        } });
+        self.in_tool = false;
+    }
+};
+
 pub fn init(
     gpa: std.mem.Allocator,
     io: std.Io,
     client: ?provider.Client,
-    options: struct { model: models.Model, system: []const u8, retry: net.Retry, effort: llm.Effort = .none },
+    options: struct {
+        model: models.Model,
+        system: []const u8,
+        retry: net.Retry,
+        effort: llm.Effort = .none,
+    },
 ) Agent {
     var seed: [16]u8 = undefined;
     io.random(&seed);
@@ -145,18 +274,6 @@ pub fn run(self: *Agent, user_text: []const u8, handler: anytype) !void {
     var fetch: ClientFetch = .{ .client = &self.client.? };
     return self.runWith(&fetch, user_text, handler);
 }
-
-/// The production fetch: `provider.Client.send` on the active account. A seam
-/// like `runToolsWith`'s `Dispatch`, so tests can script whole turns.
-const ClientFetch = struct {
-    client: *provider.Client,
-
-    const Stream = provider.Stream;
-
-    fn send(self: *ClientFetch, stream: *provider.Stream, request: llm.Request) !void {
-        return self.client.send(stream, request);
-    }
-};
 
 fn runWith(self: *Agent, fetch: anytype, user_text: []const u8, handler: anytype) !void {
     const base = self.items.items.len;
@@ -213,9 +330,9 @@ fn fetchReply(self: *Agent, fetch: anytype, handler: anytype, base: usize) !?[]c
     while (true) : (attempt += 1) {
         if (attempt > 1) try handler.onStreamReset();
         var stream: @TypeOf(fetch.*).Stream = undefined;
-        fetch.send(&stream, request) catch |err| {
+        fetch.send(&stream, &request) catch |err| {
             if (retryableError(err) and attempt < self.retry.attempts_max) {
-                try self.backoff(attempt, 0);
+                try self.backoff(.{ .attempt = attempt });
                 continue;
             }
             return err;
@@ -224,7 +341,10 @@ fn fetchReply(self: *Agent, fetch: anytype, handler: anytype, base: usize) !?[]c
 
         if (!stream.ok()) {
             if (stream.retryable() and attempt < self.retry.attempts_max) {
-                try self.backoff(attempt, stream.retryAfterMs() orelse 0);
+                try self.backoff(.{
+                    .attempt = attempt,
+                    .suggested_ms = stream.retryAfterMs() orelse 0,
+                });
                 continue;
             }
             try self.reportAndReset(handler, stream.errorText(), base);
@@ -238,7 +358,7 @@ fn fetchReply(self: *Agent, fetch: anytype, handler: anytype, base: usize) !?[]c
             error.Canceled, error.Closed => return err,
             else => {
                 if (retryableError(err) and attempt < self.retry.attempts_max) {
-                    try self.backoff(attempt, 0);
+                    try self.backoff(.{ .attempt = attempt });
                     continue;
                 }
                 return err;
@@ -248,10 +368,10 @@ fn fetchReply(self: *Agent, fetch: anytype, handler: anytype, base: usize) !?[]c
     }
 }
 
-/// Wait before the retry after a failed `attempt`: the server's `retry-after`
+/// Wait before the retry after a failed attempt: the server's `retry-after`
 /// (capped) or exponential backoff. A cancel during the wait aborts the turn.
-fn backoff(self: *Agent, attempt: u32, suggested_ms: u64) !void {
-    const delay_ms = self.retry.backoffMs(attempt, suggested_ms);
+fn backoff(self: *Agent, failure: net.Retry.Failure) !void {
+    const delay_ms = self.retry.backoffMs(failure);
     const bounded: u64 = @min(delay_ms, std.math.maxInt(i64));
     try self.io.sleep(.fromMilliseconds(@intCast(bounded)), .awake);
 }
@@ -319,12 +439,12 @@ fn appendUser(self: *Agent, text: []const u8) !void {
 
 /// Fold one message's usage into the totals, priced with `model` — threaded from
 /// the request so billing can't drift when `/model` changes `self.model`.
-fn recordUsage(self: *Agent, model: *const models.Model, usage: llm.Usage) void {
-    const cost = model.cost(&usage);
-    const saved = model.savings(&usage);
+fn recordUsage(self: *Agent, model: *const models.Model, usage: *const llm.Usage) void {
+    const cost = model.cost(usage);
+    const saved = model.savings(usage);
     self.stats.cost += cost;
     self.stats.saved += saved;
-    self.stats.last = usage;
+    self.stats.last = usage.*;
     self.stats.attribute(model.name, cost, saved, usage);
 }
 
@@ -396,7 +516,7 @@ fn readReply(
         },
     };
     const usage = maybe_usage orelse return error.IncompleteReply;
-    self.recordUsage(model, usage);
+    self.recordUsage(model, &usage);
     try handler.onUsage(self.stats);
     try state.flushAll(gpa, origin);
 
@@ -512,107 +632,6 @@ fn newRunId(current: []const u8, incoming: []const u8) bool {
     return current.len != 0 and incoming.len != 0 and !std.mem.eql(u8, current, incoming);
 }
 
-/// One streamed reply under assembly: the committed items plus the open answer,
-/// reasoning-run, and tool-call buffers. Flush methods dupe each string before
-/// the append and free every dupe if a later step fails, so a failure leaves no
-/// orphaned allocation.
-const Pending = struct {
-    items: std.ArrayList(llm.Item) = .empty,
-    text: std.ArrayList(u8) = .empty,
-    thinking: std.ArrayList(u8) = .empty,
-    blob: std.ArrayList(u8) = .empty,
-    reasoning_id: std.ArrayList(u8) = .empty,
-    in_thinking: bool = false,
-    tool_id: std.ArrayList(u8) = .empty,
-    tool_name: std.ArrayList(u8) = .empty,
-    input: std.ArrayList(u8) = .empty,
-    in_tool: bool = false,
-
-    /// Frees the list backings only; the finished items belong to the caller.
-    fn deinit(self: *Pending, gpa: std.mem.Allocator) void {
-        inline for (@typeInfo(Pending).@"struct".fields) |field| {
-            if (field.type != bool) @field(self, field.name).deinit(gpa);
-        }
-    }
-
-    /// Commit the pending tool call and answer text ahead of a fresh reasoning
-    /// run, keeping stream order.
-    fn flushBeforeRun(self: *Pending, gpa: std.mem.Allocator) !void {
-        if (self.in_tool) try self.flushTool(gpa);
-        try self.flushText(gpa);
-    }
-
-    /// Commit everything buffered in stream order — the pending tool first, then
-    /// the reasoning/answer that streamed after it — keeping the order the model
-    /// produced, reasoning at the head as the provider requires.
-    fn flushAll(self: *Pending, gpa: std.mem.Allocator, origin: llm.Account) !void {
-        if (self.in_tool) try self.flushTool(gpa);
-        try self.flushThinking(gpa, origin);
-        try self.flushText(gpa);
-    }
-
-    fn flushText(self: *Pending, gpa: std.mem.Allocator) !void {
-        if (self.text.items.len == 0) return;
-        const text_copy = try gpa.dupe(u8, self.text.items);
-        errdefer gpa.free(text_copy);
-        try self.items.append(gpa, .{ .message = .{ .role = .assistant, .text = text_copy } });
-        self.text.clearRetainingCapacity();
-    }
-
-    /// Commit the open reasoning run as one item (text plus its verbatim blob
-    /// and item id); a no-op when no run is open.
-    fn flushThinking(self: *Pending, gpa: std.mem.Allocator, origin: llm.Account) !void {
-        if (!self.in_thinking) return;
-        const text_copy = try gpa.dupe(u8, self.thinking.items);
-        errdefer gpa.free(text_copy);
-        const blob_copy = try gpa.dupe(u8, self.blob.items);
-        errdefer gpa.free(blob_copy);
-        const id_copy = try gpa.dupe(u8, self.reasoning_id.items);
-        errdefer gpa.free(id_copy);
-        try self.items.append(gpa, .{ .reasoning = .{
-            .text = text_copy,
-            .blob = blob_copy,
-            .id = id_copy,
-            .origin = origin,
-        } });
-        self.thinking.clearRetainingCapacity();
-        self.blob.clearRetainingCapacity();
-        self.reasoning_id.clearRetainingCapacity();
-        self.in_thinking = false;
-    }
-
-    /// Commit one redacted reasoning block: its encrypted blob and item id,
-    /// with empty visible text.
-    fn appendRedacted(self: *Pending, gpa: std.mem.Allocator, chunk: llm.Event.Blob, origin: llm.Account) !void {
-        const blob_copy = try gpa.dupe(u8, chunk.blob);
-        errdefer gpa.free(blob_copy);
-        const id_copy = try gpa.dupe(u8, chunk.id);
-        errdefer gpa.free(id_copy);
-        try self.items.append(gpa, .{ .reasoning = .{
-            .text = "",
-            .blob = blob_copy,
-            .redacted = true,
-            .id = id_copy,
-            .origin = origin,
-        } });
-    }
-
-    fn flushTool(self: *Pending, gpa: std.mem.Allocator) !void {
-        const id_copy = try gpa.dupe(u8, self.tool_id.items);
-        errdefer gpa.free(id_copy);
-        const name_copy = try gpa.dupe(u8, self.tool_name.items);
-        errdefer gpa.free(name_copy);
-        const json_copy = try gpa.dupe(u8, self.input.items);
-        errdefer gpa.free(json_copy);
-        try self.items.append(gpa, .{ .tool_call = .{
-            .call_id = id_copy,
-            .name = name_copy,
-            .arguments_json = json_copy,
-        } });
-        self.in_tool = false;
-    }
-};
-
 test retryableError {
     try std.testing.expect(retryableError(error.Timeout));
     try std.testing.expect(retryableError(error.IncompleteReply));
@@ -628,7 +647,12 @@ test "usage is attributed to the model that produced it across a switch" {
     const gpa = std.testing.allocator;
     const sonnet = models.get(.anthropic, "claude-sonnet-4-6").?;
     const opus = models.get(.anthropic, "claude-opus-4-8").?;
-    const client = provider.Client.init(gpa, std.testing.io, .{ .anthropic_subscription = undefined }, .{});
+    const client = provider.Client.init(
+        gpa,
+        std.testing.io,
+        .{ .anthropic_subscription = undefined },
+        .{},
+    );
     var agent = Agent.init(gpa, std.testing.io, client, .{
         .model = sonnet,
         .system = "",
@@ -641,12 +665,12 @@ test "usage is attributed to the model that produced it across a switch" {
     // Produced by sonnet while `self.model` is opus: pricing must follow the
     // passed model ($3, sonnet), not `self.model` ($5, opus).
     agent.switchTo(client, opus);
-    agent.recordUsage(&sonnet, one_million);
+    agent.recordUsage(&sonnet, &one_million);
     try std.testing.expectApproxEqAbs(@as(f64, 3), agent.stats.cost, 1e-9);
     try std.testing.expectApproxEqAbs(@as(f64, 3), agent.stats.by_model[0].cost, 1e-9);
 
     // An opus turn blends both rates: sonnet $3 + opus $5.
-    agent.recordUsage(&opus, one_million);
+    agent.recordUsage(&opus, &one_million);
     try std.testing.expectApproxEqAbs(@as(f64, 8), agent.stats.cost, 1e-9);
     try std.testing.expectEqual(@as(usize, 2), agent.stats.model_count);
     try std.testing.expectEqualStrings("claude-sonnet-4-6", agent.stats.by_model[0].name);
@@ -654,7 +678,7 @@ test "usage is attributed to the model that produced it across a switch" {
     try std.testing.expectApproxEqAbs(@as(f64, 5), agent.stats.by_model[1].cost, 1e-9);
 
     // A second sonnet turn folds into the existing bucket, not a third one.
-    agent.recordUsage(&sonnet, one_million);
+    agent.recordUsage(&sonnet, &one_million);
     try std.testing.expectEqual(@as(usize, 2), agent.stats.model_count);
     try std.testing.expectApproxEqAbs(@as(f64, 6), agent.stats.by_model[0].cost, 1e-9);
     try std.testing.expectEqual(@as(u64, 2_000_000), agent.stats.by_model[0].usage.input);
@@ -670,7 +694,7 @@ test "cumulative totals stay exact past the per-model bound" {
     inline for (0..by_model_max + 1) |index| {
         var model = opus;
         model.name = std.fmt.comptimePrint("m{d}", .{index});
-        agent.recordUsage(&model, .{ .input = 1_000_000 });
+        agent.recordUsage(&model, &.{ .input = 1_000_000 });
     }
     try std.testing.expectEqual(@as(usize, by_model_max), agent.stats.model_count);
     try std.testing.expectEqualStrings("m15", agent.stats.by_model[by_model_max - 1].name);
@@ -726,7 +750,7 @@ const ScriptedFetch = struct {
     const Attempt = union(enum) { fail: anyerror, stream: ScriptedStream };
     const Stream = ScriptedStream;
 
-    fn send(self: *ScriptedFetch, stream: *ScriptedStream, request: llm.Request) !void {
+    fn send(self: *ScriptedFetch, stream: *ScriptedStream, request: *const llm.Request) !void {
         _ = request;
         defer self.sends += 1;
         switch (self.attempts[@min(self.sends, self.attempts.len - 1)]) {
@@ -1018,7 +1042,10 @@ test "a failed reply attempt reclaims its transient allocations" {
     for (0..attempts) |_| {
         handler.text.clearRetainingCapacity();
         var stream: ScriptedStream = .{ .events = &events, .terminal_error = error.Timeout };
-        try std.testing.expectError(error.Timeout, agent.readReply(&agent.model, &stream, &handler));
+        try std.testing.expectError(
+            error.Timeout,
+            agent.readReply(&agent.model, &stream, &handler),
+        );
         try std.testing.expectEqual(@as(usize, 0), agent.items.items.len);
     }
 
@@ -1565,7 +1592,9 @@ test "run fails cleanly on round-bound overrun with the turn rolled back" {
 
     // A model that asks for a tool every round overruns the bound after exactly
     // `rounds_max` rounds; the whole turn (user message included) is dropped.
-    var fetch: ScriptedFetch = .{ .attempts = &.{.{ .stream = .{ .events = &tool_round_events } }} };
+    var fetch: ScriptedFetch = .{
+        .attempts = &.{.{ .stream = .{ .events = &tool_round_events } }},
+    };
     try std.testing.expectError(error.TooManyToolRounds, agent.runWith(&fetch, "go", &handler));
     try std.testing.expectEqual(@as(usize, rounds_max), fetch.sends);
     try std.testing.expectEqual(@as(usize, rounds_max), handler.tool_result_count);
@@ -1638,7 +1667,12 @@ test "a retryable head's retry-after hint reaches backoff" {
 
     // Without the hint the first backoff would be backoff_ms_initial (500ms).
     var fetch: ScriptedFetch = .{ .attempts = &.{
-        .{ .stream = .{ .events = &.{}, .head_ok = false, .head_retryable = true, .retry_after_ms = 5000 } },
+        .{ .stream = .{
+            .events = &.{},
+            .head_ok = false,
+            .head_retryable = true,
+            .retry_after_ms = 5000,
+        } },
         .{ .stream = .{ .events = &end_turn_events } },
     } };
     try agent.runWith(&fetch, "go", &handler);
@@ -1682,7 +1716,9 @@ test "an API error reports onError, rolls the turn back, and ends it cleanly" {
 
     // A failed non-retryable head takes the same clean-abort path.
     var head_fetch: ScriptedFetch = .{
-        .attempts = &.{.{ .stream = .{ .events = &.{}, .head_ok = false, .error_text = "denied" } }},
+        .attempts = &.{
+            .{ .stream = .{ .events = &.{}, .head_ok = false, .error_text = "denied" } },
+        },
     };
     try agent.runWith(&head_fetch, "go", &handler);
     try std.testing.expectEqual(@as(usize, 1), head_fetch.sends);

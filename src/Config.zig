@@ -50,16 +50,6 @@ pub const DroppedDefault = struct {
     name: []const u8,
 };
 
-const timeouts_default: ai.net.Timeouts = .{};
-const retry_default: ai.net.Retry = .{};
-
-/// Free the owned dropped-default names. A no-op on the built-in default (its
-/// slice is empty).
-pub fn deinit(self: *const Config, gpa: std.mem.Allocator) void {
-    for (self.dropped_defaults) |dropped| gpa.free(dropped.name);
-    gpa.free(self.dropped_defaults);
-}
-
 /// The on-disk shape. Each field defaults to the built-in, so any subset parses.
 const File = struct {
     request: Request = .{},
@@ -82,11 +72,22 @@ const File = struct {
     };
 };
 
+const timeouts_default: ai.net.Timeouts = .{};
+const retry_default: ai.net.Retry = .{};
+
+/// Free the owned dropped-default names. A no-op on the built-in default (its
+/// slice is empty).
+pub fn deinit(self: *const Config, gpa: std.mem.Allocator) void {
+    for (self.dropped_defaults) |dropped| gpa.free(dropped.name);
+    gpa.free(self.dropped_defaults);
+}
+
 /// Load `<home>/.pith/config.json`, or the built-in defaults when it is absent.
 pub fn load(gpa: std.mem.Allocator, io: std.Io, home: []const u8) !Config {
     const path = try std.fs.path.join(gpa, &.{ home, ".pith", "config.json" });
     defer gpa.free(path);
-    const data = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .unlimited) catch |err| switch (err) {
+    const cwd = std.Io.Dir.cwd();
+    const data = cwd.readFileAlloc(io, path, gpa, .unlimited) catch |err| switch (err) {
         error.FileNotFound => return .{},
         else => return err,
     };
@@ -108,12 +109,25 @@ fn parse(gpa: std.mem.Allocator, data: []const u8) !Config {
     }
     const default_models: DefaultModels = .{
         .anthropic_api = try resolveModel(gpa, &dropped, .anthropic_api, names.anthropic_api),
-        .anthropic_subscription = try resolveModel(gpa, &dropped, .anthropic_subscription, names.anthropic_subscription),
+        .anthropic_subscription = try resolveModel(
+            gpa,
+            &dropped,
+            .anthropic_subscription,
+            names.anthropic_subscription,
+        ),
         .openai_api = try resolveModel(gpa, &dropped, .openai_api, names.openai_api),
-        .openai_subscription = try resolveModel(gpa, &dropped, .openai_subscription, names.openai_subscription),
+        .openai_subscription = try resolveModel(
+            gpa,
+            &dropped,
+            .openai_subscription,
+            names.openai_subscription,
+        ),
     };
     return .{
-        .timeouts = .{ .connect_ms = request.connect_timeout_ms, .idle_ms = request.idle_timeout_ms },
+        .timeouts = .{
+            .connect_ms = request.connect_timeout_ms,
+            .idle_ms = request.idle_timeout_ms,
+        },
         .retry = .{
             .attempts_max = request.attempts_max,
             .backoff_ms_initial = request.backoff_ms_initial,
@@ -176,7 +190,10 @@ test "parse resolves default_models to compiled models, dropping unknown names" 
         \\  "anthropic_api": "gpt-5.6-sol", "openai_api": "nope" } }
     );
     defer config.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("claude-sonnet-5", config.default_models.get(.anthropic_subscription).?.name);
+    try std.testing.expectEqualStrings(
+        "claude-sonnet-5",
+        config.default_models.get(.anthropic_subscription).?.name,
+    );
     // A wrong-vendor name (an openai model under an anthropic account) does not
     // resolve, so it falls back to null.
     try std.testing.expect(config.default_models.get(.anthropic_api) == null);

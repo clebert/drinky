@@ -50,7 +50,12 @@ pub fn run(context: *const Context, name: []const u8, input_json: []const u8) !R
     for (registry) |entry| {
         if (!std.mem.eql(u8, name, entry.tool.name)) continue;
         return entry.run(context, input_json) catch |err| switch (err) {
-            error.InvalidArguments => try Result.report(context.gpa, .err, "invalid arguments for {s}", .{name}),
+            error.InvalidArguments => try Result.report(
+                context.gpa,
+                .err,
+                "invalid arguments for {s}",
+                .{name},
+            ),
             else => return err,
         };
     }

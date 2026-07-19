@@ -8,6 +8,7 @@ const auth = @import("../auth.zig");
 const auth_store = @import("../auth_store.zig");
 const net = @import("../net.zig");
 const oauth_callback = @import("../oauth_callback.zig");
+const oauth_wire = @import("../oauth_wire.zig");
 const oauth = @import("oauth.zig");
 
 const Auth = @This();
@@ -51,14 +52,21 @@ pub fn accountId(self: *const Auth) []const u8 {
 /// Run the interactive OAuth login, reporting runtime text through the caller's
 /// presentation boundary.
 pub fn login(self: *Auth, prompt: anytype) !void {
-    return auth.login(self, account_key, oauth, exchangeCallback, prompt);
+    return auth.login(self, account_key, oauth, prompt, exchangeRedirect);
 }
 
-/// `oauth.exchange` over the received callback. The verifier doubles as
-/// `state`; a mismatch means the callback is not ours.
-fn exchangeCallback(self: *Auth, callback: oauth_callback.Callback, pair: *const oauth.Pkce) !oauth.Tokens {
-    if (!std.mem.eql(u8, callback.state, &pair.verifier)) return error.StateMismatch;
-    return oauth.exchange(self.gpa, self.io, self.timeouts, callback.code, &pair.verifier);
+/// `oauth.exchange` over the received redirect. The verifier doubles as
+/// `state`; a mismatch means the redirect is not ours.
+fn exchangeRedirect(
+    self: *Auth,
+    redirect: oauth_callback.Redirect,
+    pair: *const oauth_wire.Pkce,
+) !oauth.Tokens {
+    if (!std.mem.eql(u8, redirect.state, &pair.verifier)) return error.StateMismatch;
+    return oauth.exchange(self.gpa, self.io, self.timeouts, .{
+        .code = redirect.code,
+        .verifier = &pair.verifier,
+    });
 }
 
 /// Drop this account's credentials: clear the in-memory tokens and remove its

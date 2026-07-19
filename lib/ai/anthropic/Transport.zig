@@ -17,6 +17,11 @@ const anthropic_version = "2023-06-01";
 const beta = "claude-code-20250219,oauth-2025-04-20";
 const user_agent = "claude-cli/2.1.75";
 
+gpa: std.mem.Allocator,
+io: std.Io,
+timeouts: net.Timeouts,
+identity: Identity,
+
 /// How a request authenticates and identifies itself: subscription OAuth sends
 /// a `Bearer` access token plus the Claude Code identity headers
 /// (`anthropic-beta`, the `claude-cli` user agent, `x-app`); the API key sends
@@ -25,11 +30,6 @@ pub const Identity = union(enum) {
     subscription: []const u8,
     api_key: []const u8,
 };
-
-gpa: std.mem.Allocator,
-io: std.Io,
-timeouts: net.Timeouts,
-identity: Identity,
 
 /// A single Messages request in flight on the shared SSE engine, which supplies
 /// the reading half; this struct keeps the Messages frame vocabulary (`decode`)
@@ -85,10 +85,11 @@ pub const Stream = struct {
     pub fn decode(self: *Stream, payload: []const u8) !sse.Decoded {
         // A malformed payload is filler, not progress; a truncated tail then
         // surfaces as an incomplete reply at end of stream, which is retried.
-        const parsed = std.json.parseFromSlice(std.json.Value, self.gpa, payload, .{}) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => return .ignored,
-        };
+        const parsed = std.json.parseFromSlice(std.json.Value, self.gpa, payload, .{}) catch |err|
+            switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return .ignored,
+            };
         const object = json.object(parsed.value) orelse {
             parsed.deinit();
             return .ignored;
@@ -170,15 +171,19 @@ fn connect(self: *Transport, out: *Stream, body: []const u8) anyerror!void {
 
     // The Bearer header must outlive the send below, so allocate it at connect
     // scope; the API-key path needs none.
-    const authorization: ?[]u8 = switch (self.identity) {
+    const maybe_authorization: ?[]u8 = switch (self.identity) {
         .subscription => |token| try std.fmt.allocPrint(self.gpa, "Bearer {s}", .{token}),
         .api_key => null,
     };
-    defer if (authorization) |value| self.gpa.free(value);
+    defer if (maybe_authorization) |authorization| self.gpa.free(authorization);
 
     const uri = try std.Uri.parse(messages_url);
     var extra: [3]std.http.Header = undefined;
-    out.request = try out.client.request(.POST, uri, requestOptions(self.identity, authorization, &extra));
+    out.request = try out.client.request(
+        .POST,
+        uri,
+        requestOptions(self.identity, maybe_authorization, &extra),
+    );
     errdefer out.request.deinit();
 
     // A cancel during `finish` lands before Agent.run arms its deinit, so
@@ -233,17 +238,20 @@ fn classify(object: std.json.ObjectMap, kind: []const u8) ?llm.Event {
             return .{ .text = json.string(delta.get("text")) orelse return null };
         if (std.mem.eql(u8, delta_kind, "input_json_delta"))
             return .{ .input_json = json.string(delta.get("partial_json")) orelse return null };
-        if (std.mem.eql(u8, delta_kind, "thinking_delta"))
-            return .{ .thinking = .{ .text = json.string(delta.get("thinking")) orelse return null } };
-        if (std.mem.eql(u8, delta_kind, "signature_delta"))
-            return .{ .thinking_blob = .{ .blob = json.string(delta.get("signature")) orelse return null } };
+        if (std.mem.eql(u8, delta_kind, "thinking_delta")) return .{
+            .thinking = .{ .text = json.string(delta.get("thinking")) orelse return null },
+        };
+        if (std.mem.eql(u8, delta_kind, "signature_delta")) return .{
+            .thinking_blob = .{ .blob = json.string(delta.get("signature")) orelse return null },
+        };
         return null;
     }
     if (std.mem.eql(u8, kind, "content_block_start")) {
         const block = json.object(object.get("content_block")) orelse return null;
         const block_kind = json.string(block.get("type")) orelse return null;
-        if (std.mem.eql(u8, block_kind, "redacted_thinking"))
-            return .{ .thinking_redacted = .{ .blob = json.string(block.get("data")) orelse return null } };
+        if (std.mem.eql(u8, block_kind, "redacted_thinking")) return .{
+            .thinking_redacted = .{ .blob = json.string(block.get("data")) orelse return null },
+        };
         // A `thinking` start carries only empty seeds — its content arrives as
         // deltas — so it, like any other non-tool block, yields no start event.
         if (!std.mem.eql(u8, block_kind, "tool_use")) return null;
@@ -302,7 +310,8 @@ test classify {
     const start =
         \\{"type":"content_block_start","content_block":{"type":"tool_use","id":"t1","name":"read"}}
     ;
-    const parsed_start = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, start, .{});
+    const parsed_start =
+        try std.json.parseFromSlice(std.json.Value, std.testing.allocator, start, .{});
     defer parsed_start.deinit();
     const start_event = classify(parsed_start.value.object, "content_block_start").?;
     try std.testing.expectEqualStrings("read", start_event.tool_use.name);
@@ -310,39 +319,54 @@ test classify {
     const thinking =
         \\{"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"hmm"}}
     ;
-    const parsed_thinking = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, thinking, .{});
+    const parsed_thinking =
+        try std.json.parseFromSlice(std.json.Value, std.testing.allocator, thinking, .{});
     defer parsed_thinking.deinit();
-    try std.testing.expectEqualStrings("hmm", classify(parsed_thinking.value.object, "content_block_delta").?.thinking.text);
+    try std.testing.expectEqualStrings(
+        "hmm",
+        classify(parsed_thinking.value.object, "content_block_delta").?.thinking.text,
+    );
 
     const signature =
         \\{"type":"content_block_delta","delta":{"type":"signature_delta","signature":"sig"}}
     ;
-    const parsed_signature = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, signature, .{});
+    const parsed_signature =
+        try std.json.parseFromSlice(std.json.Value, std.testing.allocator, signature, .{});
     defer parsed_signature.deinit();
-    try std.testing.expectEqualStrings("sig", classify(parsed_signature.value.object, "content_block_delta").?.thinking_blob.blob);
+    try std.testing.expectEqualStrings(
+        "sig",
+        classify(parsed_signature.value.object, "content_block_delta").?.thinking_blob.blob,
+    );
 
     const redacted =
         \\{"type":"content_block_start","content_block":{"type":"redacted_thinking","data":"enc"}}
     ;
-    const parsed_redacted = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, redacted, .{});
+    const parsed_redacted =
+        try std.json.parseFromSlice(std.json.Value, std.testing.allocator, redacted, .{});
     defer parsed_redacted.deinit();
-    try std.testing.expectEqualStrings("enc", classify(parsed_redacted.value.object, "content_block_start").?.thinking_redacted.blob);
+    try std.testing.expectEqualStrings(
+        "enc",
+        classify(parsed_redacted.value.object, "content_block_start").?.thinking_redacted.blob,
+    );
 }
 
 test "next walks SSE data lines and ends at stream end" {
     const body =
         "event: message_start\r\n" ++
         "data: {\"type\":\"message_start\",\"message\":{\"usage\":" ++
-        "{\"input_tokens\":10,\"cache_read_input_tokens\":90,\"cache_creation_input_tokens\":5,\"output_tokens\":1}}}\r\n" ++
+        "{\"input_tokens\":10,\"cache_read_input_tokens\":90," ++
+        "\"cache_creation_input_tokens\":5,\"output_tokens\":1}}}\r\n" ++
         "\r\n" ++
         "event: ping\r\n" ++
         "data: {\"type\":\"ping\"}\r\n" ++
         "\r\n" ++
         "event: content_block_delta\r\n" ++
-        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\r\n" ++
+        "data: {\"type\":\"content_block_delta\"," ++
+        "\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\r\n" ++
         "\r\n" ++
         "event: message_delta\r\n" ++
-        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":42}}\r\n" ++
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}," ++
+        "\"usage\":{\"output_tokens\":42}}\r\n" ++
         "\r\n" ++
         "event: message_stop\r\n" ++
         "data: {\"type\":\"message_stop\"}\r\n" ++
@@ -496,7 +520,8 @@ test "next times out on buffered filler that makes no progress" {
         "data: {\"type\":\"surprise_new_event\"}\n" ++
         "data: {\"type\":\"surprise_new_event\"}\n" ++
         "data: {\"type\":\"surprise_new_event\"}\n" ++
-        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"late\"}}\n";
+        "data: {\"type\":\"content_block_delta\"," ++
+        "\"delta\":{\"type\":\"text_delta\",\"text\":\"late\"}}\n";
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();
     var clock: sse.TickingIo = .init(threaded.io(), 40 * std.time.ns_per_ms);
@@ -514,7 +539,8 @@ test "next stops a stream once its aggregate byte budget is spent" {
     // aggregate byte budget ends the flood. It spans two frames, tripping on
     // their sum rather than any single line.
     const frame =
-        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"chunk\"}}\n";
+        "data: {\"type\":\"content_block_delta\"," ++
+        "\"delta\":{\"type\":\"text_delta\",\"text\":\"chunk\"}}\n";
     const body = frame ** 5;
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();
@@ -554,7 +580,8 @@ test "next reads a data frame larger than the reader buffer" {
     chunked.artificial_limit = .limited(64);
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();
-    var stream = testStream(threaded.io(), &chunked.interface, 60_000, net.stream_response_bytes_max);
+    var stream =
+        testStream(threaded.io(), &chunked.interface, 60_000, net.stream_response_bytes_max);
     defer stream.reset();
 
     try std.testing.expectEqualStrings(text, (try stream.next()).?.text);
@@ -587,7 +614,11 @@ test "next surfaces a stream truncated mid data-line as a retryable premature en
     try std.testing.expectError(error.IncompleteReply, stream.next());
 }
 
-fn failedRead(reader: *std.Io.Reader, writer: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+fn failedRead(
+    reader: *std.Io.Reader,
+    writer: *std.Io.Writer,
+    limit: std.Io.Limit,
+) std.Io.Reader.StreamError!usize {
     _ = reader;
     _ = writer;
     _ = limit;

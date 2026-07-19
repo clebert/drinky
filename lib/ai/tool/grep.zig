@@ -21,13 +21,33 @@ const bytes_read_max = 256 << 20;
 
 pub const spec: llm.Tool = .{
     .name = "grep",
-    .description = "Search file contents for a literal substring (not a regex). Returns matching lines as 'path:line:text', with paths relative to the working directory. Ignores .git, zig-out, and build cache directories.",
+    .description = "Search file contents for a literal substring (not a regex). " ++
+        "Returns matching lines as 'path:line:text', with paths relative to the working " ++
+        "directory. Ignores .git, zig-out, and build cache directories.",
     .parameters = &.{
-        .{ .name = "pattern", .type = .string, .required = true, .description = "Literal substring to search for" },
+        .{
+            .name = "pattern",
+            .type = .string,
+            .required = true,
+            .description = "Literal substring to search for",
+        },
         .{ .name = "path", .type = .string, .description = "Directory to search (default: '.')" },
-        .{ .name = "glob", .type = .string, .description = "Only search files whose path matches this glob; * and ? do not cross '/', so use a '**/' prefix to recurse (default: all files)" },
-        .{ .name = "ignore_case", .type = .boolean, .description = "Case-insensitive search (default: false)" },
-        .{ .name = "limit", .type = .integer, .description = "Maximum number of matching lines (default: 100)" },
+        .{
+            .name = "glob",
+            .type = .string,
+            .description = "Only search files whose path matches this glob; * and ? do not " ++
+                "cross '/', so use a '**/' prefix to recurse (default: all files)",
+        },
+        .{
+            .name = "ignore_case",
+            .type = .boolean,
+            .description = "Case-insensitive search (default: false)",
+        },
+        .{
+            .name = "limit",
+            .type = .integer,
+            .description = "Maximum number of matching lines (default: 100)",
+        },
     },
 };
 
@@ -54,7 +74,11 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
     const ignore_case = parsed.value.ignore_case;
     const limit = parsed.value.limit;
 
-    var matches = walk.collect(context.io, gpa, .{ .base = base, .pattern = file_glob, .retain = files_max }) catch |err|
+    var matches = walk.collect(context.io, gpa, .{
+        .base = base,
+        .pattern = file_glob,
+        .retain = files_max,
+    }) catch |err|
         return Result.cannot(gpa, err, "search", base);
     defer matches.deinit(gpa);
     // Fewer candidates retained than found, or a capped walk, means some files
@@ -72,7 +96,12 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
             bytes_capped = true;
             break :search;
         }
-        const data = std.Io.Dir.cwd().readFileAlloc(context.io, path, gpa, .limited(file_bytes_max)) catch |err| switch (err) {
+        const data = std.Io.Dir.cwd().readFileAlloc(
+            context.io,
+            path,
+            gpa,
+            .limited(file_bytes_max),
+        ) catch |err| switch (err) {
             error.Canceled, error.OutOfMemory => return err,
             // An oversized file streams the full limit off disk before failing.
             error.StreamTooLong => {
@@ -89,7 +118,10 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
         var lines = std.mem.splitScalar(u8, data, '\n');
         while (lines.next()) |line| {
             line_number += 1;
-            const hit = if (ignore_case) std.ascii.findIgnoreCase(line, pattern) else std.mem.indexOf(u8, line, pattern);
+            const hit = if (ignore_case)
+                std.ascii.findIgnoreCase(line, pattern)
+            else
+                std.mem.indexOf(u8, line, pattern);
             if (hit == null) continue;
             if (count == limit) {
                 line_capped = true;
@@ -98,23 +130,35 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
             const shown = line[0..utf8FloorLength(line, line_bytes_max)];
             if (count > 0) try out.writer.writeAll("\n");
             // U+FFFD-substitute invalid bytes so the result serializes as a JSON string.
-            try out.writer.print("{f}:{d}:{f}", .{ std.unicode.fmtUtf8(path), line_number, std.unicode.fmtUtf8(shown) });
+            try out.writer.print("{f}:{d}:{f}", .{
+                std.unicode.fmtUtf8(path),
+                line_number,
+                std.unicode.fmtUtf8(shown),
+            });
             count += 1;
         }
     }
     if (count == 0) {
         if (line_capped or bytes_capped or files_incomplete)
-            return Result.report(gpa, .ok, "no matches for {s} in the portion searched; the search was incomplete — narrow the path or glob", .{pattern});
+            return Result.report(gpa, .ok, "no matches for {s} in the portion searched; " ++
+                "the search was incomplete — narrow the path or glob", .{pattern});
         return Result.report(gpa, .ok, "no matches for {s}", .{pattern});
     }
     // Report the reason the result may be incomplete, most specific first: a hit
     // result budget, then the I/O budget, then unsearched files.
     if (line_capped) {
-        try out.writer.print("\n... stopped at the limit of {d} matches; refine the search or raise limit", .{limit});
+        try out.writer.print(
+            "\n... stopped at the limit of {d} matches; refine the search or raise limit",
+            .{limit},
+        );
     } else if (bytes_capped) {
-        try out.writer.print("\n... stopped after reading {d} MB; refine the search or narrow the path or glob", .{bytes_read_max >> 20});
+        try out.writer.print(
+            "\n... stopped after reading {d} MB; refine the search or narrow the path or glob",
+            .{bytes_read_max >> 20},
+        );
     } else if (files_incomplete) {
-        try out.writer.writeAll("\n... search incomplete: the tree is too large to scan fully; some files were not searched");
+        try out.writer.writeAll("\n... search incomplete: " ++
+            "the tree is too large to scan fully; some files were not searched");
     }
     return .{ .content = try out.toOwnedSlice(), .is_error = false };
 }
@@ -149,7 +193,11 @@ test "grep finds a literal substring with a glob filter" {
     defer gpa.free(result.content);
     try std.testing.expect(!result.is_error);
     var expected_buf: [128]u8 = undefined;
-    const expected = try std.fmt.bufPrint(&expected_buf, ".zig-cache/tmp/{s}/a.zig:2:needle here", .{tmp.sub_path});
+    const expected = try std.fmt.bufPrint(
+        &expected_buf,
+        ".zig-cache/tmp/{s}/a.zig:2:needle here",
+        .{tmp.sub_path},
+    );
     try std.testing.expectEqualStrings(expected, result.content);
 }
 
@@ -168,7 +216,9 @@ test "grep replaces invalid UTF-8 in matched lines" {
     defer std.testing.allocator.free(result.content);
     try std.testing.expect(!result.is_error);
     try std.testing.expect(std.unicode.utf8ValidateSlice(result.content));
-    try std.testing.expect(std.mem.indexOf(u8, result.content, "latin1.txt:1:caf\u{FFFD} latte") != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, result.content, "latin1.txt:1:caf\u{FFFD} latte") != null,
+    );
 }
 
 test "grep is case-insensitive when asked" {
@@ -192,7 +242,10 @@ test "grep stops at the result limit and reports it" {
     const context: Context = .{ .gpa = gpa, .io = std.testing.io };
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "f.txt", .data = "hit one\nhit two\nhit three\n" });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "f.txt",
+        .data = "hit one\nhit two\nhit three\n",
+    });
     var input_buf: [128]u8 = undefined;
     const input = try std.fmt.bufPrint(&input_buf,
         \\{{"pattern":"hit","path":".zig-cache/tmp/{s}","limit":2}}
@@ -203,7 +256,8 @@ test "grep stops at the result limit and reports it" {
     var expected_buf: [256]u8 = undefined;
     const expected = try std.fmt.bufPrint(
         &expected_buf,
-        ".zig-cache/tmp/{s}/f.txt:1:hit one\n.zig-cache/tmp/{s}/f.txt:2:hit two\n... stopped at the limit of 2 matches; refine the search or raise limit",
+        ".zig-cache/tmp/{s}/f.txt:1:hit one\n.zig-cache/tmp/{s}/f.txt:2:hit two\n" ++
+            "... stopped at the limit of 2 matches; refine the search or raise limit",
         .{ tmp.sub_path, tmp.sub_path },
     );
     try std.testing.expectEqualStrings(expected, result.content);
@@ -229,7 +283,11 @@ test "grep skips binary and oversized files" {
     defer gpa.free(result.content);
     try std.testing.expect(!result.is_error);
     var expected_buf: [128]u8 = undefined;
-    const expected = try std.fmt.bufPrint(&expected_buf, ".zig-cache/tmp/{s}/small.txt:1:hit", .{tmp.sub_path});
+    const expected = try std.fmt.bufPrint(
+        &expected_buf,
+        ".zig-cache/tmp/{s}/small.txt:1:hit",
+        .{tmp.sub_path},
+    );
     try std.testing.expectEqualStrings(expected, result.content);
 }
 
@@ -248,7 +306,11 @@ test "grep caps the reported line length" {
     defer gpa.free(result.content);
     try std.testing.expect(!result.is_error);
     var expected_buf: [512]u8 = undefined;
-    const expected = try std.fmt.bufPrint(&expected_buf, ".zig-cache/tmp/{s}/long.txt:1:{s}", .{ tmp.sub_path, line[0..line_bytes_max] });
+    const expected = try std.fmt.bufPrint(
+        &expected_buf,
+        ".zig-cache/tmp/{s}/long.txt:1:{s}",
+        .{ tmp.sub_path, line[0..line_bytes_max] },
+    );
     try std.testing.expectEqualStrings(expected, result.content);
 }
 
@@ -265,7 +327,9 @@ test "grep reports an incomplete search when nothing was shown" {
     const result = try run(&context, input);
     defer gpa.free(result.content);
     try std.testing.expect(!result.is_error);
-    try std.testing.expect(std.mem.indexOf(u8, result.content, "the search was incomplete") != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, result.content, "the search was incomplete") != null,
+    );
 }
 
 test "grep cancelled while reading a file propagates" {

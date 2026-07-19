@@ -46,15 +46,9 @@ pub const Client = struct {
         return std.meta.activeTag(self.credentials);
     }
 
-    /// The vendor backing this client, keying the model table and the wire
-    /// serializer both accounts of a vendor share.
-    pub fn provider(self: *const Client) llm.Provider {
-        return self.account().provider();
-    }
-
     /// Open a streaming request for `request`, filling `out` in place. On
     /// success the caller owns `out` and must `deinit` it.
-    pub fn send(self: *Client, out: *Stream, request: llm.Request) !void {
+    pub fn send(self: *Client, out: *Stream, request: *const llm.Request) !void {
         switch (self.credentials) {
             inline .anthropic_subscription, .anthropic_api => |credential, tag| {
                 const identity: anthropic.Transport.Identity = if (tag == .anthropic_subscription)
@@ -85,7 +79,10 @@ pub const Client = struct {
                     .endpoint = if (subscription) codex_url else openai_url,
                     .account_id = if (subscription) credential.accountId() else "",
                 };
-                try transport.send(&@field(out.*, @tagName(tag)), body, token);
+                try transport.send(&@field(out.*, @tagName(tag)), .{
+                    .body = body,
+                    .access_token = token,
+                });
             },
         }
     }
@@ -153,20 +150,21 @@ pub const Stream = union(llm.Account) {
     }
 };
 
-test "init selects the arm matching the credentials, with the right vendor" {
+test "init selects the arm matching the credentials" {
     const gpa = std.testing.allocator;
-    const subscription = Client.init(gpa, std.testing.io, .{ .anthropic_subscription = undefined }, .{});
+    const subscription = Client.init(
+        gpa,
+        std.testing.io,
+        .{ .anthropic_subscription = undefined },
+        .{},
+    );
     try std.testing.expectEqual(llm.Account.anthropic_subscription, subscription.account());
-    try std.testing.expectEqual(llm.Provider.anthropic, subscription.provider());
     const anthropic_key = Client.init(gpa, std.testing.io, .{ .anthropic_api = "sk-ant" }, .{});
     try std.testing.expectEqual(llm.Account.anthropic_api, anthropic_key.account());
-    try std.testing.expectEqual(llm.Provider.anthropic, anthropic_key.provider());
     const openai_key = Client.init(gpa, std.testing.io, .{ .openai_api = "sk-test" }, .{});
     try std.testing.expectEqual(llm.Account.openai_api, openai_key.account());
-    try std.testing.expectEqual(llm.Provider.openai, openai_key.provider());
     const codex = Client.init(gpa, std.testing.io, .{ .openai_subscription = undefined }, .{});
     try std.testing.expectEqual(llm.Account.openai_subscription, codex.account());
-    try std.testing.expectEqual(llm.Provider.openai, codex.provider());
 }
 
 test "usageSoFar reads accumulated usage through the stream seam" {

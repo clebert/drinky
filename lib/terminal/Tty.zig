@@ -325,7 +325,8 @@ test "read maps a timeout to null and a closed input to end of stream" {
     defer _ = std.posix.system.close(fds[0]);
     tty.in_handle = fds[0];
     var buffer: [8]u8 = undefined;
-    const timeout: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(5), .clock = .awake } };
+    const timeout: std.Io.Timeout =
+        .{ .duration = .{ .raw = .fromMilliseconds(5), .clock = .awake } };
     try std.testing.expectEqual(@as(?usize, null), try tty.read(&buffer, timeout));
     _ = std.posix.system.write(fds[1], "x", 1);
     try std.testing.expectEqual(@as(?usize, 1), try tty.read(&buffer, .none));

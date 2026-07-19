@@ -97,7 +97,10 @@ fn decode(data: []const u8) ?Decoded {
         escape_start => return decodeEscape(data),
         '\r' => return .{ .key = .enter, .consumed = 1 },
         0x08, 0x7f => return .{ .key = .backspace, .consumed = 1 },
-        0x01...0x07, 0x09...0x0c, 0x0e...0x1a => return .{ .key = .{ .ctrl = byte + 0x60 }, .consumed = 1 },
+        0x01...0x07, 0x09...0x0c, 0x0e...0x1a => return .{
+            .key = .{ .ctrl = byte + 0x60 },
+            .consumed = 1,
+        },
         0x00, 0x1c...0x1f => return .{ .key = .unknown, .consumed = 1 },
         else => {
             if (byte < 0x80) return .{ .key = .{ .char = byte }, .consumed = 1 };
@@ -157,7 +160,11 @@ fn decodePasteBody(body: []const u8) ?Decoded {
     if (body.len < paste_flush_len) return null;
     // Hold back a partial terminator so a marker split across reads still ends the paste.
     const kept = escape.paste_end.len - 1;
-    return .{ .key = .{ .paste = body[0 .. body.len - kept] }, .consumed = body.len - kept, .in_paste = true };
+    return .{
+        .key = .{ .paste = body[0 .. body.len - kept] },
+        .consumed = body.len - kept,
+        .in_paste = true,
+    };
 }
 
 fn mapControlSequence(parameters: []const u8, final: u8) Key {

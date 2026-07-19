@@ -42,7 +42,8 @@ pub fn render(placement: *const paint.Placement, info: *const Info) !void {
     const line = stats.buffered();
     const stats_columns = terminal.width.ofText(line);
     const right_columns = if (info.signed_in)
-        terminal.width.ofText(info.model) + terminal.width.ofText(separator) + terminal.width.ofText(info.effort)
+        terminal.width.ofText(info.model) + terminal.width.ofText(separator) +
+            terminal.width.ofText(info.effort)
     else
         terminal.width.ofText(signed_out_label);
 
@@ -142,7 +143,8 @@ test render {
     };
 
     const sink = try view.beginFrame(.{ .columns = 120, .rows = 24 }, 4);
-    const placement: paint.Placement = .{ .sink = sink, .id = 0, .columns = 120, .base = 0, .skip = 0 };
+    const placement: paint.Placement =
+        .{ .sink = sink, .id = 0, .columns = 120, .base = 0, .skip = 0 };
     try render(&placement, &info);
     try view.render();
 
@@ -151,8 +153,8 @@ test render {
     try std.testing.expect(std.mem.indexOf(u8, painted, "cache 87%") != null);
     try std.testing.expect(std.mem.indexOf(u8, painted, "$0.39 saved $0.82") != null);
     // The model and effort are right-aligned, so they land after the stats.
-    try std.testing.expect(std.mem.indexOf(u8, painted, "claude-opus-4-8\u{200B} • \u{200B}xhigh").? >
-        std.mem.indexOf(u8, painted, "ctx 21%").?);
+    const right = std.mem.indexOf(u8, painted, "claude-opus-4-8\u{200B} • \u{200B}xhigh").?;
+    try std.testing.expect(right > std.mem.indexOf(u8, painted, "ctx 21%").?);
 }
 
 test "a signed-out status shows the indicator in place of the model" {
@@ -172,7 +174,8 @@ test "a signed-out status shows the indicator in place of the model" {
     };
 
     const sink = try view.beginFrame(.{ .columns = 120, .rows = 24 }, 4);
-    const placement: paint.Placement = .{ .sink = sink, .id = 0, .columns = 120, .base = 0, .skip = 0 };
+    const placement: paint.Placement =
+        .{ .sink = sink, .id = 0, .columns = 120, .base = 0, .skip = 0 };
     try render(&placement, &info);
     try view.render();
 

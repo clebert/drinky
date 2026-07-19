@@ -34,11 +34,12 @@ const openai_default = ai.models.get(.openai, "gpt-5.6-sol") orelse
 const effort: ai.llm.Effort = .xhigh;
 const system_prompt =
     "You are pith, a small coding assistant running in a terminal. Be concise. " ++
-    "Explore the working directory with find (by name) and grep (literal text in file contents), read files " ++
-    "with read, create or overwrite them with write, and change existing files with edit " ++
-    "(give old_text that occurs exactly once).";
+    "Explore the working directory with find (by name) and grep (literal text in " ++
+    "file contents), read files with read, create or overwrite them with write, " ++
+    "and change existing files with edit (give old_text that occurs exactly once).";
 
-const intro_text = "pith — enter: send · shift+enter: newline · esc: cancel · ctrl+c: clear (twice: quit) · ctrl+d: quit";
+const intro_text = "pith — enter: send · shift+enter: newline · esc: cancel · " ++
+    "ctrl+c: clear (twice: quit) · ctrl+d: quit";
 
 /// Two Ctrl+C presses within this window quit; a lone press clears the editor.
 const ctrl_c_window_ms = 500;
@@ -66,7 +67,7 @@ session: Session,
 /// Decodes stdin chunks into key events for the consumer's key handling.
 input: terminal.Input,
 running: bool,
-last_ctrl_c: i64,
+ctrl_c_ms_last: i64,
 /// The one cross-thread channel: producer tasks push `UiEvent`s, the consumer
 /// drains and applies them. Backed by `queue_buffer`, so pin the `App`.
 queue: std.Io.Queue(Session.UiEvent),
@@ -86,7 +87,7 @@ tick_future: ?std.Io.Future(void),
 /// A frame timer is armed and its `.tick` has not been drained yet.
 tick_pending: bool,
 /// Monotonic time of the last paint, so the next tick lands one interval later.
-last_paint_ms: i64,
+paint_ms_last: i64,
 
 /// The turn worker's presentation handler: instead of mutating the transcript, it
 /// enqueues owned `UiEvent`s for the consumer. Lives on the worker thread, so it
@@ -119,7 +120,12 @@ const TurnHandler = struct {
         try self.enqueue(.{ .tool_start = .{ .name = name_copy, .input_json = json_copy } });
     }
 
-    pub fn onToolResult(self: *TurnHandler, name: []const u8, content: []const u8, is_error: bool) !void {
+    pub fn onToolResult(
+        self: *TurnHandler,
+        name: []const u8,
+        content: []const u8,
+        is_error: bool,
+    ) !void {
         const name_copy = try self.app.gpa.dupe(u8, name);
         errdefer self.app.gpa.free(name_copy);
         const content_copy = try self.app.gpa.dupe(u8, content);
@@ -200,14 +206,20 @@ const OauthPrompt = struct {
 /// user quits or stdin closes. When no account is authenticated the session
 /// starts signed out and the login picker opens so the user signs in. Pin the
 /// value: streams and the channel borrow its buffers.
-pub fn run(self: *App, gpa: std.mem.Allocator, io: std.Io, home: []const u8, api_keys: ai.Accounts.ApiKeys) !void {
+pub fn run(
+    self: *App,
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    home: []const u8,
+    api_keys: ai.Accounts.ApiKeys,
+) !void {
     self.gpa = gpa;
     self.io = io;
     // The monotonic clock can start near zero; a boot press must never read as
     // the second of a pair.
-    self.last_ctrl_c = -ctrl_c_window_ms;
+    self.ctrl_c_ms_last = -ctrl_c_window_ms;
     self.tick_pending = false;
-    self.last_paint_ms = 0;
+    self.paint_ms_last = 0;
     self.input_future = null;
     self.resize_future = null;
     self.turn_future = null;
@@ -229,7 +241,12 @@ pub fn run(self: *App, gpa: std.mem.Allocator, io: std.Io, home: []const u8, api
     const active = self.accounts.firstAuthenticated();
     const start_account = active orelse .anthropic_subscription;
     const start_client = if (active) |account| self.accounts.client(account) else null;
-    self.agent = ai.Agent.init(gpa, io, start_client, .{ .model = self.defaultModel(start_account), .system = system_prompt, .retry = config.retry, .effort = effort });
+    self.agent = ai.Agent.init(gpa, io, start_client, .{
+        .model = self.defaultModel(start_account),
+        .system = system_prompt,
+        .retry = config.retry,
+        .effort = effort,
+    });
     defer self.agent.deinit();
 
     try self.tty.init(io);
@@ -247,8 +264,11 @@ pub fn run(self: *App, gpa: std.mem.Allocator, io: std.Io, home: []const u8, api
     try self.session.transcript.append(.intro, false, intro_text);
     // Surface any configured default-model name that did not resolve, so a typo or
     // wrong-vendor entry is not silently ignored.
-    for (config.dropped_defaults) |dropped|
-        try self.report(.err, "config: default model \"{s}\" is not a valid model for {s}; using {s}", .{ dropped.name, dropped.account.label(), self.defaultModel(dropped.account).name });
+    for (config.dropped_defaults) |dropped| try self.report(
+        .err,
+        "config: default model \"{s}\" is not a valid model for {s}; using {s}",
+        .{ dropped.name, dropped.account.label(), self.defaultModel(dropped.account).name },
+    );
     // No account signed in: open the login picker (the same one /login opens) so
     // the user chooses how to sign in.
     if (!self.signedIn()) {
@@ -256,7 +276,7 @@ pub fn run(self: *App, gpa: std.mem.Allocator, io: std.Io, home: []const u8, api
         try self.runCommand("/login");
     }
     try self.refresh();
-    self.last_paint_ms = self.nowMs();
+    self.paint_ms_last = self.nowMs();
 
     self.running = true;
     defer self.shutdownTasks();
@@ -330,7 +350,7 @@ fn runLoop(self: *App) !void {
             if (self.session.advanceFrame()) {
                 try self.refresh();
                 self.session.dirty = false;
-                self.last_paint_ms = self.nowMs();
+                self.paint_ms_last = self.nowMs();
             }
         }
         if ((self.session.dirty or self.session.animating()) and !self.tick_pending) self.armTick();
@@ -345,16 +365,16 @@ fn applyBatch(self: *App, events: []const Session.UiEvent) !bool {
     errdefer for (events[applied_count..]) |event| event.deinit(self.gpa);
 
     var ticked = false;
-    for (events) |event| {
+    for (events) |*event| {
         applied_count += 1;
-        switch (event) {
+        switch (event.*) {
             .tick => ticked = true,
             .resize => self.session.dirty = true,
             .keys => |bytes| {
                 defer self.gpa.free(bytes);
                 try self.handleKeys(bytes);
             },
-            .turn => |turn_event| try self.session.applyTurnEvent(turn_event),
+            .turn => |*turn_event| try self.session.applyTurnEvent(turn_event),
         }
     }
     return ticked;
@@ -363,12 +383,12 @@ fn applyBatch(self: *App, events: []const Session.UiEvent) !bool {
 /// Arm the next frame: a one-shot timer that fires at `last_paint + interval`. On
 /// the impossible failure to spawn it, paint inline so the frame is not lost.
 fn armTick(self: *App) void {
-    const elapsed = self.nowMs() - self.last_paint_ms;
+    const elapsed = self.nowMs() - self.paint_ms_last;
     const delay_ms: i64 = if (elapsed >= frame_interval_ms) 0 else frame_interval_ms - elapsed;
     self.tick_future = self.io.concurrent(frameTimer, .{ self, delay_ms }) catch {
         self.refresh() catch {};
         self.session.dirty = false;
-        self.last_paint_ms = self.nowMs();
+        self.paint_ms_last = self.nowMs();
         return;
     };
     self.tick_pending = true;
@@ -421,7 +441,7 @@ fn readInput(self: *App) void {
 /// `.turn_ended` (carrying any error text). Cancellation suppresses that final
 /// event; any output queued before cancellation remains consumer-owned and tagged
 /// with this worker's generation. `agent.run` rolls its items back on error.
-fn runTurnWorker(self: *App, text: []u8, generation: u64) void {
+fn runTurnWorker(self: *App, text: []const u8, generation: u64) void {
     defer self.gpa.free(text);
     var handler: TurnHandler = .{ .app = self, .generation = generation };
     self.agent.run(text, &handler) catch |err| switch (err) {
@@ -459,17 +479,17 @@ fn defaultModel(self: *const App, account: ai.llm.Account) ai.models.Model {
 /// a submitted line spawns a turn worker and ctrl-c cancels a running one.
 fn handleKeys(self: *App, bytes: []const u8) !void {
     try self.input.feed(bytes);
-    while (self.input.next()) |event| try self.handleKey(event);
+    while (self.input.next()) |event| try self.handleKey(&event);
 }
 
-fn handleKey(self: *App, event: terminal.Input.Key) !void {
+fn handleKey(self: *App, event: *const terminal.Input.Key) !void {
     switch (self.session.mode) {
         .picking => return self.handlePickerKey(event),
         .turn => return self.handleTurnKey(event),
         .prompt => {},
     }
     if (try self.editKey(event)) return;
-    switch (event) {
+    switch (event.*) {
         .enter => try self.submit(),
         .ctrl => |letter| switch (letter) {
             'c' => {
@@ -488,9 +508,9 @@ fn handleKey(self: *App, event: terminal.Input.Key) !void {
 /// Apply an editing key to the live editor, marking the session dirty; returns
 /// whether `event` was an editing key. Shared by the prompt and by a running
 /// turn, where the editor stays live so the user can steer.
-fn editKey(self: *App, event: terminal.Input.Key) !bool {
+fn editKey(self: *App, event: *const terminal.Input.Key) !bool {
     const editor = &self.session.editor;
-    switch (event) {
+    switch (event.*) {
         .char => |codepoint| try editor.insertCodepoint(codepoint),
         .paste => |text| try editor.insert(text),
         .backspace => editor.backspace(),
@@ -514,9 +534,9 @@ fn editKey(self: *App, event: terminal.Input.Key) !bool {
 /// Keys during a streaming turn: the editor stays live for steering — typing and
 /// editing work, Enter queues a steering message, Alt+Up recalls the queue into
 /// the editor — while Esc or Ctrl+C cancels the turn.
-fn handleTurnKey(self: *App, event: terminal.Input.Key) !void {
+fn handleTurnKey(self: *App, event: *const terminal.Input.Key) !void {
     if (try self.editKey(event)) return;
-    switch (event) {
+    switch (event.*) {
         .enter => try self.submitSteering(),
         .alt_up => try self.pullSteering(),
         .escape => try self.cancelTurn(),
@@ -615,11 +635,11 @@ fn cancelTurn(self: *App) !void {
 /// the double press.
 fn clearOrQuit(self: *App) void {
     const now = self.nowMs();
-    if (now - self.last_ctrl_c < ctrl_c_window_ms) {
+    if (now - self.ctrl_c_ms_last < ctrl_c_window_ms) {
         self.running = false;
     } else {
         self.session.editor.clear();
-        self.last_ctrl_c = now;
+        self.ctrl_c_ms_last = now;
     }
 }
 
@@ -682,7 +702,8 @@ fn reserveTurnGeneration(self: *App) !u64 {
 
 /// Handle a slash command locally, applying its outcome.
 fn runCommand(self: *App, line: []const u8) !void {
-    var context: ai.command.Context = .{ .gpa = self.gpa, .agent = &self.agent, .accounts = &self.accounts };
+    var context: ai.command.Context =
+        .{ .gpa = self.gpa, .agent = &self.agent, .accounts = &self.accounts };
     try self.applyOutcome(try ai.command.run(&context, line));
 }
 
@@ -694,7 +715,10 @@ fn applyOutcome(self: *App, outcome: ai.command.Outcome) !void {
         .logout => |account| try self.logoutAccount(account),
         .switch_account => |account| {
             self.adopt(account);
-            try self.report(.ok, "switched to {s} ({s})", .{ self.agent.model.name, account.label() });
+            try self.report(.ok, "switched to {s} ({s})", .{
+                self.agent.model.name,
+                account.label(),
+            });
         },
         else => try self.session.applyOutcome(outcome),
     }
@@ -715,13 +739,17 @@ fn finishLogin(self: *App, account: ai.llm.Account, result: anyerror!void) !void
             error.Canceled => return error.Canceled,
             error.CallbackTimeout => "login timed out waiting for the browser callback",
             error.CallbackRequestTooLarge => "login failed: browser callback request was too large",
-            error.CallbackTimeoutUnavailable => "login failed: browser callback deadline was unavailable",
+            error.CallbackTimeoutUnavailable => "login failed: browser callback deadline " ++
+                "was unavailable",
             else => return self.report(.err, "login failed: {s}", .{@errorName(err)}),
         };
         return self.report(.err, "{s}", .{message});
     };
     self.adopt(account);
-    try self.report(.ok, "logged in to {s}; using {s}", .{ account.label(), self.agent.model.name });
+    try self.report(.ok, "logged in to {s}; using {s}", .{
+        account.label(),
+        self.agent.model.name,
+    });
 }
 
 /// Drop a subscription `account`'s credentials. Logging out the active account
@@ -738,15 +766,22 @@ fn logoutAccount(self: *App, account: ai.llm.Account) !void {
         return self.report(.ok, "logged out of {s}", .{account.label()});
     if (self.accounts.firstAuthenticated()) |next| {
         self.adopt(next);
-        return self.report(.ok, "logged out of {s}; switched to {s} ({s})", .{ account.label(), self.agent.model.name, next.label() });
+        return self.report(.ok, "logged out of {s}; switched to {s} ({s})", .{
+            account.label(),
+            self.agent.model.name,
+            next.label(),
+        });
     }
     // No account remains: sign out and let the user choose from the login picker —
     // no forced browser, no loop.
     self.agent.signOut();
-    try self.report(.ok, "logged out of {s}; no account is signed in — choose one to log in", .{account.label()});
+    try self.report(.ok, "logged out of {s}; no account is signed in — choose one to log in", .{
+        account.label(),
+    });
     // Through the session, not `runCommand`: routing back through `applyOutcome`
     // would cycle the inferred error sets (runCommand → applyOutcome → here).
-    var context: ai.command.Context = .{ .gpa = self.gpa, .agent = &self.agent, .accounts = &self.accounts };
+    var context: ai.command.Context =
+        .{ .gpa = self.gpa, .agent = &self.agent, .accounts = &self.accounts };
     try self.session.applyOutcome(try ai.command.run(&context, "/login"));
 }
 
@@ -772,13 +807,18 @@ fn adopt(self: *App, account: ai.llm.Account) void {
 }
 
 /// Show one feedback line in the transcript.
-fn report(self: *App, status: ai.command.Outcome.Status, comptime format: []const u8, args: anytype) !void {
+fn report(
+    self: *App,
+    status: ai.command.Outcome.Status,
+    comptime format: []const u8,
+    args: anytype,
+) !void {
     try self.session.applyOutcome(try ai.command.Outcome.report(self.gpa, status, format, args));
 }
 
-fn handlePickerKey(self: *App, event: terminal.Input.Key) !void {
+fn handlePickerKey(self: *App, event: *const terminal.Input.Key) !void {
     const picker = &self.session.mode.picking.picker;
-    switch (event) {
+    switch (event.*) {
         .up => try picker.moveUp(),
         .down => try picker.moveDown(),
         .enter => return self.confirmPicker(),
@@ -795,7 +835,8 @@ fn handlePickerKey(self: *App, event: terminal.Input.Key) !void {
 /// Apply the highlighted picker row through its command's selection handler.
 fn confirmPicker(self: *App) !void {
     const picking = &self.session.mode.picking;
-    var context: ai.command.Context = .{ .gpa = self.gpa, .agent = &self.agent, .accounts = &self.accounts };
+    var context: ai.command.Context =
+        .{ .gpa = self.gpa, .agent = &self.agent, .accounts = &self.accounts };
     const outcome = try picking.select(&context, picking.picker.cursor);
     self.session.closePicker();
     try self.applyOutcome(outcome);
@@ -811,10 +852,12 @@ test "OAuth prompts render runtime fields as inert text" {
     try prompt.showAuthorized("/home/\x1b[2J/.pith/auth.json");
 
     const written = out.written();
+    const url_inert = "https://example.test/\u{200B}�\u{200B}]52;c;b3duZWQ=\u{200B}�\u{200B}";
     try std.testing.expect(std.mem.indexOf(u8, written, "\x1b]52;c;b3duZWQ=\x07") == null);
     try std.testing.expect(std.mem.indexOf(u8, written, "\x1b[2J") == null);
-    try std.testing.expect(std.mem.indexOf(u8, written, "https://example.test/\u{200B}�\u{200B}]52;c;b3duZWQ=\u{200B}�\u{200B}") != null);
-    try std.testing.expect(std.mem.indexOf(u8, written, "/home/\u{200B}�\u{200B}[2J/.pith/auth.json") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, url_inert) != null);
+    const path_inert = "/home/\u{200B}�\u{200B}[2J/.pith/auth.json";
+    try std.testing.expect(std.mem.indexOf(u8, written, path_inert) != null);
 }
 
 test "OAuth login cancellation escapes without failure feedback" {
@@ -848,7 +891,10 @@ test "OAuth callback bounds have friendly failure feedback" {
     const cases = [_]struct { anyerror, []const u8 }{
         .{ error.CallbackTimeout, "login timed out waiting for the browser callback" },
         .{ error.CallbackRequestTooLarge, "login failed: browser callback request was too large" },
-        .{ error.CallbackTimeoutUnavailable, "login failed: browser callback deadline was unavailable" },
+        .{
+            error.CallbackTimeoutUnavailable,
+            "login failed: browser callback deadline was unavailable",
+        },
     };
     for (cases, 0..) |case, index| {
         const failure, const message = case;
@@ -1156,23 +1202,23 @@ test "ctrl+c clears then quits within the window and ctrl+d quits only when empt
     var app: App = undefined;
     app.gpa = gpa;
     app.io = std.testing.io;
-    app.last_ctrl_c = -ctrl_c_window_ms;
+    app.ctrl_c_ms_last = -ctrl_c_window_ms;
     app.running = true;
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
     defer app.session.deinit();
 
     try app.session.editor.insert("draft");
-    try app.handleKey(.{ .ctrl = 'd' });
+    try app.handleKey(&.{ .ctrl = 'd' });
     try std.testing.expect(app.running);
 
-    try app.handleKey(.{ .ctrl = 'c' });
+    try app.handleKey(&.{ .ctrl = 'c' });
     try std.testing.expectEqualStrings("", app.session.editor.content());
     try std.testing.expect(app.running);
-    try app.handleKey(.{ .ctrl = 'c' });
+    try app.handleKey(&.{ .ctrl = 'c' });
     try std.testing.expect(!app.running);
 
     app.running = true;
-    try app.handleKey(.{ .ctrl = 'd' });
+    try app.handleKey(&.{ .ctrl = 'd' });
     try std.testing.expect(!app.running);
 }
 
@@ -1229,7 +1275,7 @@ test "esc, ctrl+c, and ctrl+d each dismiss the picker as cancelled" {
                 .current = null,
             },
         });
-        try app.handlePickerKey(key);
+        try app.handlePickerKey(&key);
         try std.testing.expect(app.session.mode == .prompt);
         const feedback = app.session.transcript.blocks()[index].feedback;
         try std.testing.expect(!feedback.is_error);
