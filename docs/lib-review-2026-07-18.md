@@ -186,10 +186,15 @@ Test gaps deliberately left open (each needs a seam or infrastructure not worth 
 
 Follow-ups surfaced while fixing:
 
-- [ ] `src/App.zig` — a `.steering_consumed` event enqueued just before a cancel may still be
+- [x] `src/App.zig` — a `.steering_consumed` event enqueued just before a cancel may still be
   dropped app-side; the Agent-side errdefer re-push is fixed, the App path is not verified.
-- [ ] `lib/terminal/Input.zig` — a CSI whose final byte never arrives still buffers unboundedly
+  _Confirmed real and fixed: cancel restores steering from the display mirror (a superset of the
+  channel) and resyncs `stats_shown` from the joined worker, so the same gate can no longer drop a
+  queued `.usage` either._
+- [x] `lib/terminal/Input.zig` — a CSI whose final byte never arrives still buffers unboundedly
   (same family as the fixed paste bound; needs an adversarial byte-stream bound).
+  _Confirmed (memory DoS plus O(n²) rescans, wedging all input) and fixed with a 64-byte
+  `sequence_flush_len` mirroring the paste bound._
 - [x] The two transports' `retryable()` now differ in idiom (`@intFromEnum/100 == 5` vs
   `.class() == .server_error`; `.class()` maps out-of-range statuses to server_error) — unify
   when the SSE engine dedups in phase 3.

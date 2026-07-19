@@ -208,7 +208,9 @@ const OauthPrompt = struct {
 pub fn run(self: *App, gpa: std.mem.Allocator, io: std.Io, home: []const u8, api_keys: ai.Accounts.ApiKeys) !void {
     self.gpa = gpa;
     self.io = io;
-    self.last_ctrl_c = 0;
+    // The monotonic clock can start near zero; a boot press must never read as
+    // the second of a pair.
+    self.last_ctrl_c = -ctrl_c_window_ms;
     self.tick_pending = false;
     self.last_paint_ms = 0;
     self.input_future = null;
@@ -602,23 +604,32 @@ fn startSteeringTurn(self: *App) !void {
 /// network read), then drop the turn's model state. Events the worker already
 /// queued retain its generation and cannot affect a successor.
 fn cancelTurn(self: *App) !void {
-    // Cancel first (which joins the worker), so taking the queue can't race an
-    // in-flight drain; nothing queued is lost — pending steering returns to the
-    // editor.
+    // Cancel first (which joins the worker), so nothing below races a drain.
     if (self.turn_future) |*future| {
         future.cancel(self.io);
         self.turn_future = null;
     }
-    if (try self.takeSteering()) |joined| {
+    // Restore pending steering from the display mirror, not the channel: a
+    // message the worker folded right before the cancel is rolled back
+    // agent-side and its `.steering_consumed` dies at the generation gate, so
+    // only the mirror still holds it. The channel holds copies of mirror rows.
+    if (self.session.steering.items.len > 0) {
+        const joined = try ai.Steering.join(self.gpa, self.session.steering.items);
         defer self.gpa.free(joined);
         try self.appendToEditor(joined);
     }
+    if (try self.takeSteering()) |copies| self.gpa.free(copies);
+    // A final `.usage` still queued dies at the same gate; the worker is joined,
+    // so the cumulative stats are safe to read and resync here.
+    self.session.stats_shown = self.agent.stats;
     try self.session.abortTurn();
 }
 
 /// Ctrl+C: clear the editor, or quit when pressed twice inside the window.
+/// Measured on the monotonic clock — a wall-clock step must not fake or break
+/// the double press.
 fn clearOrQuit(self: *App) void {
-    const now = std.Io.Timestamp.now(self.io, .real).toMilliseconds();
+    const now = self.nowMs();
     if (now - self.last_ctrl_c < ctrl_c_window_ms) {
         self.running = false;
     } else {
@@ -699,6 +710,10 @@ fn applyOutcome(self: *App, outcome: ai.command.Outcome) !void {
     switch (outcome) {
         .login => |account| try self.loginAccount(account),
         .logout => |account| try self.logoutAccount(account),
+        .switch_account => |account| {
+            self.adopt(account);
+            try self.report(.ok, "switched to {s} ({s})", .{ self.agent.model.name, account.label() });
+        },
         else => try self.session.applyOutcome(outcome),
     }
     self.session.model_shown = self.agent.model;
@@ -974,6 +989,42 @@ test "cancelling a turn joins and clears its active worker" {
     try app.cancelTurn();
     try std.testing.expect(app.turn_future == null);
     try std.testing.expect(stopped.load(.acquire));
+    try std.testing.expect(app.session.mode == .prompt);
+}
+
+// The race a cancel must survive: the worker folded "do X" (channel entry taken,
+// `.steering_consumed` still queued, so only the mirror holds it) while "and Y"
+// is still pending in both. Everything returns to the editor exactly once, and
+// the cumulative usage the queued `.usage` event would have carried is resynced.
+test "cancelling a turn restores in-flight steering and resyncs usage" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.gpa = gpa;
+    app.io = io;
+    app.turn_future = null;
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = anthropic_default,
+        .system = "",
+        .retry = .{},
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+    app.session.beginTurn(1);
+
+    try app.session.queueSteering("do X");
+    try app.agent.steering.push("and Y");
+    try app.session.queueSteering("and Y");
+    app.agent.stats.cost = 1.5;
+
+    try app.cancelTurn();
+    try std.testing.expectEqualStrings("do X\n\nand Y", app.session.editor.content());
+    try std.testing.expect(app.session.steeringEmpty());
+    try std.testing.expectEqual(@as(f64, 1.5), app.session.stats_shown.cost);
     try std.testing.expect(app.session.mode == .prompt);
 }
 

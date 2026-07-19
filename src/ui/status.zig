@@ -68,7 +68,8 @@ pub fn render(placement: *const paint.Placement, info: *const Info) !void {
 fn writeStats(out: *std.Io.Writer, info: *const Info) !void {
     // Context now: the last request's whole prompt plus its output, against the
     // model's window. The one "now" number; the rest is session-cumulative.
-    const context = info.last.input + info.last.cache_read + info.last.cache_write + info.last.output;
+    // Saturating: the counts arrive from the provider stream unchecked.
+    const context = info.last.input +| info.last.cache_read +| info.last.cache_write +| info.last.output;
     const percent = if (info.context_window > 0)
         asFloat(context) / asFloat(info.context_window) * 100.0
     else
@@ -82,7 +83,7 @@ fn writeStats(out: *std.Io.Writer, info: *const Info) !void {
     // Last request's cache hit rate over the whole prompt: another "now" number.
     // Zero on a cold start, model switch, or cache expiry, making a miss visible
     // where the cumulative "saved" figure cannot.
-    const last_prompt = info.last.input + info.last.cache_read + info.last.cache_write;
+    const last_prompt = info.last.input +| info.last.cache_read +| info.last.cache_write;
     if (last_prompt > 0) {
         const hit = asFloat(info.last.cache_read) / asFloat(last_prompt) * 100.0;
         try out.print(" · cache {d:.0}%", .{hit});
@@ -101,9 +102,9 @@ fn writeTokens(out: *std.Io.Writer, count: u64) !void {
     const million = 1000 * thousand;
     if (count < thousand) return out.print("{d}", .{count});
     if (count < 10 * thousand) return out.print("{d:.1}k", .{asFloat(count) / 1000.0});
-    if (count < million) return out.print("{d}k", .{@divFloor(count + 500, thousand)});
+    if (count < million) return out.print("{d}k", .{@divFloor(count +| 500, thousand)});
     if (count < 10 * million) return out.print("{d:.1}M", .{asFloat(count) / 1_000_000.0});
-    return out.print("{d}M", .{@divFloor(count + 500 * thousand, million)});
+    return out.print("{d}M", .{@divFloor(count +| 500 * thousand, million)});
 }
 
 fn asFloat(count: u64) f64 {

@@ -49,6 +49,10 @@ const Decoded = struct { key: Key, consumed: usize, in_paste: bool = false };
 /// payload, so a missing terminator cannot buffer unboundedly or wedge input.
 const paste_flush_len = 1 << 20;
 
+/// Retained bytes at which an unterminated control sequence is abandoned, so a
+/// missing final byte cannot buffer unboundedly or wedge input.
+const sequence_flush_len = 64;
+
 const escape_start = 0x1b;
 const enter_key = 13;
 const escape_key = 27;
@@ -139,7 +143,8 @@ fn decodeControlSequence(data: []const u8) ?Decoded {
             return .{ .key = mapControlSequence(parameters, final), .consumed = index + 1 };
         }
     }
-    return null;
+    if (data.len < sequence_flush_len) return null;
+    return .{ .key = .unknown, .consumed = data.len };
 }
 
 /// A paste body whose begin marker is already consumed: complete once the
@@ -293,6 +298,16 @@ test "an unterminated paste past the limit flushes and stays a paste" {
     try input.feed(escape.paste_end ++ "c");
     try std.testing.expectEqualDeep(Key{ .paste = "xxxxx\rab" }, input.next().?);
     try std.testing.expectEqualDeep(Key{ .char = 'c' }, input.next().?);
+    try std.testing.expectEqual(@as(?Key, null), input.next());
+}
+
+test "an unterminated csi past the limit is abandoned as unknown" {
+    var input = Input.init(std.testing.allocator);
+    defer input.deinit();
+    try input.feed("\x1b[" ++ ";" ** sequence_flush_len);
+    try std.testing.expectEqualDeep(Key.unknown, input.next().?);
+    try input.feed("a");
+    try std.testing.expectEqualDeep(Key{ .char = 'a' }, input.next().?);
     try std.testing.expectEqual(@as(?Key, null), input.next());
 }
 

@@ -83,7 +83,12 @@ pub const Stream = struct {
         // sentinel. It ends the byte stream; the Agent separately requires a
         // preceding Responses terminal event before committing the reply.
         if (std.mem.eql(u8, payload, "[DONE]")) return .done;
-        const parsed = try std.json.parseFromSlice(std.json.Value, self.gpa, payload, .{});
+        // A malformed payload is filler, not progress; a truncated tail then
+        // surfaces as an incomplete reply at end of stream, which is retried.
+        const parsed = std.json.parseFromSlice(std.json.Value, self.gpa, payload, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return .ignored,
+        };
         const object = json.object(parsed.value) orelse {
             parsed.deinit();
             return .ignored;
@@ -132,8 +137,8 @@ pub fn send(self: *Transport, out: *Stream, body: []const u8, access_token: []co
 
 fn connect(self: *Transport, out: *Stream, body: []const u8, access_token: []const u8) anyerror!void {
     // Credentials become header values; reject ones that would split the head.
-    if (!validHeaderValue(access_token) or
-        (self.account_id.len != 0 and !validHeaderValue(self.account_id)))
+    if (!net.validHeaderValue(access_token) or
+        (self.account_id.len != 0 and !net.validHeaderValue(self.account_id)))
     {
         return error.BadCredentials;
     }
@@ -171,10 +176,6 @@ fn connect(self: *Transport, out: *Stream, body: []const u8, access_token: []con
     errdefer out.request.deinit();
 
     try engine.finish(out, body);
-}
-
-fn validHeaderValue(value: []const u8) bool {
-    return value.len != 0 and std.mem.indexOfAny(u8, value, "\r\n") == null;
 }
 
 /// Map one Responses SSE frame to a neutral event, or null for a frame the
@@ -405,6 +406,18 @@ test "decode surfaces a streamed error frame" {
         \\{"type":"response.failed","response":{"error":{"message":"bad request"}}}
     ));
     try std.testing.expectEqualStrings("bad request", stream.errorText());
+}
+
+test "decode ignores a malformed data line instead of failing the turn" {
+    var stream = testStream(undefined, undefined, 0, 0);
+    defer stream.reset();
+
+    try std.testing.expectEqual(@as(sse.Decoded, .ignored), try stream.decode(
+        \\{"type":"response.output_text.del
+    ));
+    try std.testing.expectEqual(@as(sse.Decoded, .ignored), try stream.decode(
+        \\not json at all
+    ));
 }
 
 test "decode ignores unrecognized frames instead of counting them as progress" {

@@ -5,7 +5,6 @@
 const std = @import("std");
 
 const llm = @import("../llm.zig");
-const models = @import("../models.zig");
 const Context = @import("Context.zig");
 const Outcome = @import("outcome.zig").Outcome;
 const testing = @import("testing.zig");
@@ -31,16 +30,9 @@ pub fn select(context: *Context, index: usize) !Outcome {
     if (index >= accounts.len) return Outcome.report(gpa, .err, "invalid selection", .{});
     const account = accounts[index];
     if (isActive(context, account)) return Outcome.report(gpa, .ok, "{s} is already active", .{account.label()});
-    if (context.accounts.isAuthenticated(account)) {
-        // Authenticated but inactive: switch without a login, onto the account's
-        // first listed model.
-        var vendor_models: std.ArrayList(models.Model) = .empty;
-        defer vendor_models.deinit(gpa);
-        try context.accounts.listModels(account, &vendor_models, gpa);
-        const model = vendor_models.items[0];
-        context.agent.switchTo(context.accounts.client(account).?, model);
-        return Outcome.report(gpa, .ok, "switched to {s} ({s})", .{ model.name, account.label() });
-    }
+    // Authenticated but inactive: the app performs the switch so the configured
+    // default model applies, exactly as a startup on this account would.
+    if (context.accounts.isAuthenticated(account)) return .{ .switch_account = account };
     if (account.isSubscription()) return .{ .login = account };
     return Outcome.report(
         gpa,
@@ -113,14 +105,15 @@ test "select never re-runs the login for the active subscription" {
     try std.testing.expectEqual(llm.Account.anthropic_subscription, agent.client.?.account());
 }
 
-test "select switches to an authenticated but inactive subscription without a login" {
+test "select hands an authenticated but inactive account to the app to switch" {
     const gpa = std.testing.allocator;
     var accounts = testing.accounts(.{ .anthropic = "sk-ant" }, true, false);
     var agent = testing.agent(gpa, .{ .anthropic_api = "sk-ant" });
     defer agent.deinit();
     var context: Context = .{ .gpa = gpa, .agent = &agent, .accounts = &accounts };
 
-    try Outcome.expectFeedbackContaining(try select(&context, 0), .ok, "switched to");
-    try std.testing.expectEqual(llm.Account.anthropic_subscription, agent.client.?.account());
-    try std.testing.expectEqualStrings("claude-opus-4-8", agent.model.name);
+    switch (try select(&context, 0)) {
+        .switch_account => |account| try std.testing.expectEqual(llm.Account.anthropic_subscription, account),
+        else => return error.ExpectedSwitch,
+    }
 }

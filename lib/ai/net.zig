@@ -150,6 +150,12 @@ pub fn decompressBuffer(gpa: std.mem.Allocator, encoding: std.http.ContentEncodi
     };
 }
 
+/// Whether a runtime string is safe as an HTTP header value: non-empty and free
+/// of CR/LF, so a hostile credential cannot split the request head.
+pub fn validHeaderValue(value: []const u8) bool {
+    return value.len != 0 and std.mem.indexOfAny(u8, value, "\r\n") == null;
+}
+
 /// A hard ceiling on the total wire bytes one streamed response body may deliver.
 /// Every model tops out at 128k output tokens (~14 MB of framed SSE at one token
 /// per frame), so this clears any real reply several times over while bounding a
@@ -182,6 +188,12 @@ pub const Budget = struct {
         return self.max -| self.used;
     }
 };
+
+test "credential header values cannot inject another header" {
+    try std.testing.expect(validHeaderValue("token.account"));
+    try std.testing.expect(!validHeaderValue(""));
+    try std.testing.expect(!validHeaderValue("token\r\nleaked: value"));
+}
 
 test "Budget charges until the running total passes its ceiling" {
     var budget: Budget = .{ .max = 10 };

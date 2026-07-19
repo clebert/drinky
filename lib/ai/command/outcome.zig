@@ -14,6 +14,9 @@ pub const Outcome = union(enum) {
     /// Drop this subscription account's stored credentials. Logging out the active
     /// account hands the session to the next authenticated one, or forces a login.
     logout: llm.Account,
+    /// Switch to this already-authenticated account. The app owns the switch so
+    /// its configured per-account default model applies.
+    switch_account: llm.Account,
 
     pub const Status = enum { ok, err };
 

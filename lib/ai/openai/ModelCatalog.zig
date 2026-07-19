@@ -67,7 +67,7 @@ fn request(
     access_token: []const u8,
     account_id: []const u8,
 ) !ModelCatalog {
-    if (!validHeaderValue(access_token) or !validHeaderValue(account_id))
+    if (!net.validHeaderValue(access_token) or !net.validHeaderValue(account_id))
         return error.BadModelCatalogCredentials;
 
     const authorization = try std.fmt.allocPrint(gpa, "Bearer {s}", .{access_token});
@@ -107,10 +107,6 @@ fn request(
     defer gpa.free(body);
 
     return parse(gpa, body);
-}
-
-fn validHeaderValue(value: []const u8) bool {
-    return value.len != 0 and std.mem.indexOfAny(u8, value, "\r\n") == null;
 }
 
 /// Decode a complete catalog response. Individual malformed entries remain
@@ -169,12 +165,6 @@ fn positiveInt(value: ?std.json.Value) ?u64 {
 fn percent(value: std.json.Value) ?u8 {
     const found = json.integer(value) orelse return null;
     return if (found > 0 and found <= 100) @intCast(found) else null;
-}
-
-test "credential header values cannot inject another header" {
-    try std.testing.expect(validHeaderValue("token.account"));
-    try std.testing.expect(!validHeaderValue(""));
-    try std.testing.expect(!validHeaderValue("token\r\nleaked: value"));
 }
 
 test "parse decodes raw, maximum, and effective context metadata" {

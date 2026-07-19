@@ -236,7 +236,7 @@ pub fn applyOutcome(self: *Session, outcome: ai.command.Outcome) !void {
         .pick => |pick| try self.openPicker(pick),
         // The app intercepts account actions (they need the tty and the agent);
         // they never reach the io-free session.
-        .login, .logout => unreachable,
+        .login, .logout, .switch_account => unreachable,
     }
     self.dirty = true;
 }

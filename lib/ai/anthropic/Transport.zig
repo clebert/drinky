@@ -157,6 +157,12 @@ pub fn send(self: *Transport, out: *Stream, body: []const u8) !void {
 }
 
 fn connect(self: *Transport, out: *Stream, body: []const u8) anyerror!void {
+    // Credentials become header values; reject ones that would split the head.
+    const credential = switch (self.identity) {
+        .subscription => |token| token,
+        .api_key => |key| key,
+    };
+    if (!net.validHeaderValue(credential)) return error.BadCredentials;
     const engine = sse.Engine(Stream);
     engine.begin(out, self.gpa, self.io);
     errdefer out.client.deinit();
@@ -627,6 +633,19 @@ test "send leaves the caller owning nothing when connect fails partway" {
     var stream: Stream = undefined;
     try std.testing.expectError(error.OutOfMemory, transport.send(&stream, "{}"));
     try std.testing.expect(!stream.established);
+}
+
+test "connect rejects credentials that would split the request head" {
+    var transport: Transport = .{
+        .gpa = std.testing.allocator,
+        .io = undefined,
+        .timeouts = .{},
+        .identity = .{ .subscription = "token\r\nleaked: value" },
+    };
+    var stream: Stream = undefined;
+    try std.testing.expectError(error.BadCredentials, connect(&transport, &stream, "{}"));
+    transport.identity = .{ .api_key = "key\ninjected: value" };
+    try std.testing.expectError(error.BadCredentials, connect(&transport, &stream, "{}"));
 }
 
 test "requestOptions forks the identity headers by account" {

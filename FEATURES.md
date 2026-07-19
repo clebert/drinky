@@ -76,7 +76,8 @@ commit history, `BACKLOG.md` (planned work), and `docs/`.
 - Decodes printable characters, ctrl-letters, Enter, Shift+Enter (newline), Escape, Backspace,
   arrows, Home, End, and bracketed-paste payloads. An unterminated paste flushes as bounded
   partial paste payloads (1 MiB) instead of buffering without bound, and later bytes stay paste
-  payload until the terminator arrives.
+  payload until the terminator arrives. An escape sequence whose final byte never arrives is
+  likewise abandoned as unhandled after 64 retained bytes, so it cannot wedge input.
 - Decodes both encodings the terminal produces: the keys the Kitty protocol reports as unambiguous
   escape sequences (Escape, Shift+Enter, and ctrl-combinations, with modifiers), and the traditional
   encoding used for the rest — control bytes (carriage return as Enter, delete/backspace as
@@ -310,7 +311,8 @@ commit history, `BACKLOG.md` (planned work), and `docs/`.
 - **/effort** — open a picker over the reasoning-effort levels with the active one marked.
 - **/login** — open a picker over all accounts: an unauthenticated subscription runs its OAuth login
   and switches to it on its default model; an environment API account reports which variable to set
-  and to restart; an authenticated but inactive account switches to it without a login; the active
+  and to restart; an authenticated but inactive account switches to it on its default model without
+  a login; the active
   account is marked and does nothing. The same picker opens at startup and after logging out the
   last account.
 - **/logout** — open a picker over the logged-in subscription accounts and drop the chosen one's
@@ -345,7 +347,7 @@ commit history, `BACKLOG.md` (planned work), and `docs/`.
 - Ctrl+C clears the editor, or quits on a second press in quick succession; Ctrl+D quits when the
   editor is empty.
 - During a turn, Esc or Ctrl+C cancels it and drops the partial turn, returning any pending steering
-  to the editor.
+  to the editor — including a message the turn consumed so late that the cancel rolled it back.
 - The editor stays live during a turn: Enter queues a steering message, Alt+Up recalls the whole
   queue into the editor (blank-line-joined, after any in-progress text), and any steering still
   queued when a turn ends starts the next turn. Slash commands are disabled during a turn.
