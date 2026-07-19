@@ -58,6 +58,9 @@ pub const Stream = struct {
     usage: llm.Usage,
     decompress: std.http.Decompress,
     decompress_buffer: []u8,
+    /// Backs the request's runtime headers, which must outlive the send phase
+    /// (hence a stream field, not a `connect` local).
+    header_buffer: [3]std.http.Header,
     error_buffer: [512]u8,
     redirect_buffer: [4096]u8,
     transfer_buffer: [16384]u8,
@@ -178,11 +181,10 @@ fn connect(self: *Transport, out: *Stream, body: []const u8) anyerror!void {
     defer if (maybe_authorization) |authorization| self.gpa.free(authorization);
 
     const uri = try std.Uri.parse(messages_url);
-    var extra: [3]std.http.Header = undefined;
     out.request = try out.client.request(
         .POST,
         uri,
-        requestOptions(self.identity, maybe_authorization, &extra),
+        requestOptions(self.identity, maybe_authorization, &out.header_buffer),
     );
     errdefer out.request.deinit();
 
