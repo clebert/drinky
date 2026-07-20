@@ -83,6 +83,7 @@ pub const Caret = struct { row: usize, column: usize };
 pub const Sink = struct {
     frame: *Frame,
     columns: usize,
+    rows_max: usize,
     offset: usize,
     columns_written: usize,
     has_text: bool,
@@ -138,6 +139,11 @@ pub const Sink = struct {
     pub fn end(self: *Sink, anchor: Anchor) void {
         std.debug.assert(self.columns_written <= self.columns);
         const len = self.frame.blob.writer.end - self.offset;
+        // A measure/render parity slip overflowing `beginFrame`'s row reservation
+        // is loud in safe builds and a dropped row — a visible glitch, not an
+        // out-of-bounds write — in unsafe builds.
+        std.debug.assert(self.frame.rows.items.len < self.rows_max);
+        if (self.frame.rows.items.len == self.rows_max) return;
         self.frame.rows.appendAssumeCapacity(
             .{ .offset = self.offset, .len = len, .anchor = anchor },
         );
@@ -239,6 +245,7 @@ pub fn beginFrame(self: *View, size: Size, pages: usize) !*Sink {
     self.sink = .{
         .frame = back,
         .columns = size.columns,
+        .rows_max = capacity,
         .offset = 0,
         .columns_written = 0,
         .has_text = false,
