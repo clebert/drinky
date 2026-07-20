@@ -1169,6 +1169,42 @@ test "readReply accepts OpenAI completion without consuming its done sentinel" {
     try std.testing.expect(std.mem.indexOf(u8, reader.buffered(), "[DONE]") != null);
 }
 
+test "readReply separates OpenAI reasoning summary parts with a blank line" {
+    // Two summary parts share one reasoning item and arrive with no text between
+    // them; the rising summary_index on the second part.added is the only seam,
+    // so both the committed reply and the streamed handler must read "a\n\nb".
+    const body =
+        "data: {\"type\":\"response.reasoning_summary_part.added\"," ++
+        "\"item_id\":\"rs_1\",\"summary_index\":0,\"part\":{\"type\":\"summary_text\",\"text\":\"\"}}\n\n" ++
+        "data: {\"type\":\"response.reasoning_summary_text.delta\"," ++
+        "\"item_id\":\"rs_1\",\"delta\":\"a\"}\n\n" ++
+        "data: {\"type\":\"response.reasoning_summary_part.added\"," ++
+        "\"item_id\":\"rs_1\",\"summary_index\":1,\"part\":{\"type\":\"summary_text\",\"text\":\"\"}}\n\n" ++
+        "data: {\"type\":\"response.reasoning_summary_text.delta\"," ++
+        "\"item_id\":\"rs_1\",\"delta\":\"b\"}\n\n" ++
+        "data: {\"type\":\"response.output_item.done\"," ++
+        "\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\",\"encrypted_content\":\"enc\"}}\n\n" ++
+        "data: {\"type\":\"response.completed\"," ++
+        "\"response\":{\"status\":\"completed\",\"usage\":" ++
+        "{\"input_tokens\":1,\"output_tokens\":1}}}\n\n";
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var reader: std.Io.Reader = .fixed(body);
+    var stream = openaiStream(threaded.io(), &reader);
+    defer if (stream.openai_api.parsed) |parsed| parsed.deinit();
+    var agent = openaiScriptedAgent(std.testing.allocator);
+    defer agent.deinit();
+    var handler: CaptureHandler = .{ .gpa = std.testing.allocator };
+    defer handler.deinit();
+
+    const reply = try agent.readReply(&agent.model, &stream, &handler);
+    try std.testing.expectEqual(@as(usize, 1), reply.len);
+    try std.testing.expectEqualStrings("a\n\nb", reply[0].reasoning.text);
+    try std.testing.expectEqualStrings("enc", reply[0].reasoning.blob);
+    try std.testing.expectEqualStrings("rs_1", reply[0].reasoning.id);
+    try std.testing.expectEqualStrings("a\n\nb", handler.thinking.items);
+}
+
 test "readReply rejects provider EOF before text completion" {
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();

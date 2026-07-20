@@ -202,6 +202,17 @@ fn classify(object: std.json.ObjectMap, kind: []const u8) ?llm.Event {
             .id = json.string(object.get("item_id")) orelse "",
             .text = json.string(object.get("delta")) orelse return null,
         } };
+    // Consecutive summary parts (the `**...**` blocks) share one reasoning item
+    // and carry no text between them; only this frame's rising `summary_index`
+    // marks the seam. Emit the blank line the delta stream omits, skipping the
+    // first part so a run gains no leading separator.
+    if (std.mem.eql(u8, kind, "response.reasoning_summary_part.added")) {
+        if ((json.unsigned(object.get("summary_index")) orelse 0) == 0) return null;
+        return .{ .thinking = .{
+            .id = json.string(object.get("item_id")) orelse "",
+            .text = "\n\n",
+        } };
+    }
     if (std.mem.eql(u8, kind, "response.function_call_arguments.delta"))
         return .{ .input_json = json.string(object.get("delta")) orelse return null };
     if (std.mem.eql(u8, kind, "response.output_item.added")) {
@@ -311,6 +322,30 @@ test classify {
         classify(parsed_summary.value.object, "response.reasoning_summary_text.delta").?.thinking;
     try std.testing.expectEqualStrings("rs_1", thinking.id);
     try std.testing.expectEqualStrings("hmm", thinking.text);
+
+    // The first summary part opens no separator; a later part injects the blank
+    // line the delta stream leaves out between the `**...**` blocks.
+    const part_first =
+        \\{"type":"response.reasoning_summary_part.added","item_id":"rs_1","summary_index":0,"part":{"type":"summary_text","text":""}}
+    ;
+    const parsed_part_first =
+        try std.json.parseFromSlice(std.json.Value, std.testing.allocator, part_first, .{});
+    defer parsed_part_first.deinit();
+    try std.testing.expectEqual(
+        @as(?llm.Event, null),
+        classify(parsed_part_first.value.object, "response.reasoning_summary_part.added"),
+    );
+
+    const part_next =
+        \\{"type":"response.reasoning_summary_part.added","item_id":"rs_1","summary_index":1,"part":{"type":"summary_text","text":""}}
+    ;
+    const parsed_part_next =
+        try std.json.parseFromSlice(std.json.Value, std.testing.allocator, part_next, .{});
+    defer parsed_part_next.deinit();
+    const separator =
+        classify(parsed_part_next.value.object, "response.reasoning_summary_part.added").?.thinking;
+    try std.testing.expectEqualStrings("rs_1", separator.id);
+    try std.testing.expectEqualStrings("\n\n", separator.text);
 
     const added =
         \\{"type":"response.output_item.added","item":{"type":"function_call","call_id":"call_1","name":"read"}}
