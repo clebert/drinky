@@ -153,13 +153,22 @@ fn connect(self: *Transport, out: *Stream, payload: Payload) anyerror!void {
     const authorization = try std.fmt.allocPrint(self.gpa, "Bearer {s}", .{payload.access_token});
     defer self.gpa.free(authorization);
 
+    // Duped at connect scope like the Bearer value above, so no header borrows
+    // Auth-owned storage for the stream's lifetime — backing a token refresh
+    // could free out from under a live stream.
+    const maybe_account_id: ?[]u8 = if (self.account_id.len != 0)
+        try self.gpa.dupe(u8, self.account_id)
+    else
+        null;
+    defer if (maybe_account_id) |account_id| self.gpa.free(account_id);
+
     // Subscription mode adds the account and originator identity; API-key mode
     // sends neither. `accept` requests the event stream in both.
     var extra_len: usize = 0;
     out.header_buffer[extra_len] = .{ .name = "accept", .value = "text/event-stream" };
     extra_len += 1;
-    if (self.account_id.len != 0) {
-        out.header_buffer[extra_len] = .{ .name = "chatgpt-account-id", .value = self.account_id };
+    if (maybe_account_id) |account_id| {
+        out.header_buffer[extra_len] = .{ .name = "chatgpt-account-id", .value = account_id };
         extra_len += 1;
         out.header_buffer[extra_len] = .{ .name = "originator", .value = originator };
         extra_len += 1;
