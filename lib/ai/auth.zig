@@ -60,6 +60,12 @@ pub fn accessToken(
     const now_ms = std.Io.Timestamp.now(auth.io, .real).toMilliseconds();
     if (now_ms >= tokens.expires_ms) {
         const fresh = try refreshFn(auth.gpa, auth.io, auth.timeouts, tokens);
+        // The refresh consumed the stored (single-use) refresh token server-side,
+        // so `fresh` is now the only usable credential: block cancellation until
+        // it is committed and persisted, or a cancel landing at the save (the
+        // catalog fetch runs `accessToken` under a timeout) would lose it.
+        const protection = auth.io.swapCancelProtection(.blocked);
+        defer _ = auth.io.swapCancelProtection(protection);
         tokens.deinit(auth.gpa);
         auth.tokens = fresh;
         try save(auth, account_key);
@@ -94,11 +100,17 @@ pub fn login(
         auth.gpa.free(redirect.state);
     }
 
-    const tokens = try exchangeFn(auth, redirect, &pair);
+    try commit(auth, account_key, try exchangeFn(auth, redirect, &pair), prompt);
+}
+
+/// Install exchanged tokens, persist them, and report. Installed tokens complete
+/// the login — the session is signed in with or without persistence — so a failed
+/// save warns (`showSaveFailed`: signed in until exit) instead of failing a login
+/// whose credential is usable now.
+fn commit(auth: anytype, comptime account_key: []const u8, tokens: anytype, prompt: anytype) !void {
     if (auth.tokens) |old| old.deinit(auth.gpa);
     auth.tokens = tokens;
-    try save(auth, account_key);
-
+    save(auth, account_key) catch |err| return prompt.showSaveFailed(auth.path, @errorName(err));
     try prompt.showAuthorized(auth.path);
 }
 
@@ -148,3 +160,65 @@ const CallbackListener = struct {
         return oauth_callback.receive(self.gpa, self.io, &self.server);
     }
 };
+
+test "a failed persist warns and keeps the login usable" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const Tokens = struct {
+        access: []const u8,
+        expires_ms: i64,
+
+        fn deinit(self: @This(), allocator: std.mem.Allocator) void {
+            allocator.free(self.access);
+        }
+    };
+    const Prompt = struct {
+        warned: usize = 0,
+        authorized: usize = 0,
+
+        fn showSaveFailed(self: *@This(), _: []const u8, _: []const u8) anyerror!void {
+            self.warned += 1;
+        }
+        fn showAuthorized(self: *@This(), _: []const u8) anyerror!void {
+            self.authorized += 1;
+        }
+    };
+    var subject: struct {
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        path: []const u8,
+        tokens: ?Tokens,
+    } = .{ .gpa = gpa, .io = io, .path = undefined, .tokens = null };
+    var prompt: Prompt = .{};
+
+    // A corrupt store refuses the rewrite: the tokens stay installed (the
+    // session is signed in), and the failure surfaces as the warning.
+    try tmp.dir.writeFile(io, .{ .sub_path = "auth.json", .data = "not json" });
+    var bad_buf: [160]u8 = undefined;
+    subject.path = try std.fmt.bufPrint(&bad_buf, ".zig-cache/tmp/{s}/auth.json", .{tmp.sub_path});
+    try commit(&subject, "test_account", Tokens{
+        .access = try gpa.dupe(u8, "at"),
+        .expires_ms = 1,
+    }, &prompt);
+    defer subject.tokens.?.deinit(gpa);
+    try std.testing.expectEqualStrings("at", subject.tokens.?.access);
+    try std.testing.expectEqual(@as(usize, 1), prompt.warned);
+    try std.testing.expectEqual(@as(usize, 0), prompt.authorized);
+
+    // A writable path persists (creating its parent) and reports authorized.
+    var ok_buf: [160]u8 = undefined;
+    subject.path =
+        try std.fmt.bufPrint(&ok_buf, ".zig-cache/tmp/{s}/ok/auth.json", .{tmp.sub_path});
+    try commit(&subject, "test_account", Tokens{
+        .access = try gpa.dupe(u8, "at2"),
+        .expires_ms = 2,
+    }, &prompt);
+    try std.testing.expectEqualStrings("at2", subject.tokens.?.access);
+    try std.testing.expectEqual(@as(usize, 1), prompt.authorized);
+    var file = (try auth_store.open(gpa, io, subject.path)).?;
+    defer file.deinit();
+    try std.testing.expect(file.entry("test_account") != null);
+}

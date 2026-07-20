@@ -101,6 +101,24 @@ fn grantRefresh(
     };
 }
 
+fn grantRefreshAfterCancel(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    timeouts: net.Timeouts,
+    tokens: oauth.Tokens,
+) anyerror!oauth.Tokens {
+    // Park until the test's cancel request lands, then re-arm it: the next
+    // cancelation point — without protection, the save — sees the cancel exactly
+    // as if it arrived while the refresh response was in flight.
+    io.sleep(.fromSeconds(60), .awake) catch io.recancel();
+    return grantRefresh(gpa, io, timeouts, tokens);
+}
+
+fn refreshUnderCancel(subject: *Auth) anyerror!void {
+    const access = try auth.accessToken(subject, account_key, grantRefreshAfterCancel);
+    try std.testing.expectEqualStrings("fresh", access);
+}
+
 test "a live access token is returned without a refresh" {
     var subject: Auth = .{
         .gpa = std.testing.allocator,
@@ -157,6 +175,39 @@ test "an expired access token is refreshed and re-persisted" {
     try std.testing.expectEqualStrings("next", subject.tokens.?.refresh);
 
     var file = (try auth_store.open(gpa, std.testing.io, path)).?;
+    defer file.deinit();
+    try std.testing.expectEqualStrings("next", file.entry(account_key).?.get("refresh").?.string);
+}
+
+// The rotation-durability race: the server has already consumed the old refresh
+// token when a cancel (the catalog fetch's timeout, a turn cancel) lands at the
+// save. The commit+save runs cancel-protected, so the rotated credential still
+// reaches memory and disk; the cancel fires at the caller's next cancelation point.
+test "a cancel landing at the save cannot lose the rotated credential" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/auth.json", .{tmp.sub_path});
+    var subject: Auth = .{
+        .gpa = gpa,
+        .io = io,
+        .timeouts = .{},
+        .path = path,
+        .tokens = .{
+            .access = try gpa.dupe(u8, "stale"),
+            .refresh = try gpa.dupe(u8, "old"),
+            .expires_ms = 0,
+        },
+    };
+    defer subject.tokens.?.deinit(gpa);
+
+    var future = try io.concurrent(refreshUnderCancel, .{&subject});
+    try future.cancel(io);
+
+    try std.testing.expectEqualStrings("next", subject.tokens.?.refresh);
+    var file = (try auth_store.open(gpa, io, path)).?;
     defer file.deinit();
     try std.testing.expectEqualStrings("next", file.entry(account_key).?.get("refresh").?.string);
 }

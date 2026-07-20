@@ -191,6 +191,13 @@ const OauthPrompt = struct {
         try self.writer.flush();
     }
 
+    pub fn showSaveFailed(self: *OauthPrompt, path: []const u8, error_name: []const u8) !void {
+        try self.writer.writeAll("Authorized, but saving credentials to ");
+        try self.writeText(path);
+        try self.writer.print(" failed ({s}); signed in until pith exits.\n", .{error_name});
+        try self.writer.flush();
+    }
+
     fn writeText(self: *OauthPrompt, text: []const u8) !void {
         var lines = std.mem.splitScalar(u8, text, '\n');
         var first = true;
@@ -850,6 +857,7 @@ test "OAuth prompts render runtime fields as inert text" {
     try prompt.showAuthorization("https://example.test/\x1b]52;c;b3duZWQ=\x07");
     try prompt.showBrowserLaunchFailed();
     try prompt.showAuthorized("/home/\x1b[2J/.pith/auth.json");
+    try prompt.showSaveFailed("/home/\x1b[2J/.pith/auth.json", "AccessDenied");
 
     const written = out.written();
     const url_inert = "https://example.test/\u{200B}�\u{200B}]52;c;b3duZWQ=\u{200B}�\u{200B}";
