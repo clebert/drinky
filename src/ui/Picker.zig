@@ -125,6 +125,9 @@ pub fn render(self: *const Picker, placement: *const paint.Placement, viewport_r
 fn compose(self: *Picker) !void {
     self.content.clearRetainingCapacity();
     self.line_styles.clearRetainingCapacity();
+    // Reset with the buffers it indexes into: a failure below must not leave the
+    // offset pointing past the shorter rebuilt content for `reflow` to slice.
+    self.cursor_offset = 0;
 
     try self.startLine(null);
     try self.startLine(.dim);
