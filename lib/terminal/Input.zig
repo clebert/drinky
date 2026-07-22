@@ -24,7 +24,9 @@ pub const Key = union(enum) {
     /// A control combination, carrying the lowercase letter (`0x03` -> `'c'`).
     ctrl: u8,
     /// Bracketed-paste payload, borrowed from the parser's buffer for the call.
-    paste: []const u8,
+    /// `final` is true when this event completes the paste and false for a
+    /// mid-paste flush of an over-long unterminated body.
+    paste: struct { bytes: []const u8, final: bool },
     enter,
     /// Shift+Enter (Kitty protocol): a literal newline that does not submit.
     newline,
@@ -80,8 +82,8 @@ pub fn feed(self: *Input, bytes: []const u8) !void {
 }
 
 /// Next decoded event, or null when the remaining bytes are empty or form an
-/// incomplete sequence awaiting more input. A returned `.paste` slice borrows
-/// the internal buffer and is valid only until the next `feed`.
+/// incomplete sequence awaiting more input. A returned `.paste` event's `bytes`
+/// borrow the internal buffer and are valid only until the next `feed`.
 pub fn next(self: *Input) ?Key {
     const data = self.pending.items[self.start..];
     if (data.len == 0) return null;
@@ -150,18 +152,21 @@ fn decodeControlSequence(data: []const u8) ?Decoded {
     return .{ .key = .unknown, .consumed = data.len };
 }
 
-/// A paste body whose begin marker is already consumed: complete once the
-/// terminator arrives, otherwise flushed as a bounded partial payload
-/// (`in_paste` set) once it reaches `paste_flush_len`.
+/// A paste body whose begin marker is already consumed. The terminator ends the
+/// logical paste with `final` set; otherwise a body reaching `paste_flush_len`
+/// flushes as a bounded, non-`final` continuation (`in_paste` set), holding back
+/// a partial terminator so a marker split across reads still ends the paste.
 fn decodePasteBody(body: []const u8) ?Decoded {
     if (std.mem.indexOf(u8, body, escape.paste_end)) |end| {
-        return .{ .key = .{ .paste = body[0..end] }, .consumed = end + escape.paste_end.len };
+        return .{
+            .key = .{ .paste = .{ .bytes = body[0..end], .final = true } },
+            .consumed = end + escape.paste_end.len,
+        };
     }
     if (body.len < paste_flush_len) return null;
-    // Hold back a partial terminator so a marker split across reads still ends the paste.
     const kept = escape.paste_end.len - 1;
     return .{
-        .key = .{ .paste = body[0 .. body.len - kept] },
+        .key = .{ .paste = .{ .bytes = body[0 .. body.len - kept], .final = false } },
         .consumed = body.len - kept,
         .in_paste = true,
     };
@@ -284,11 +289,55 @@ test "alt+up decodes apart from a bare or otherwise-modified up" {
     try expectKeys("\x1b[1;3B", &.{.down});
 }
 
-test "bracketed paste" {
-    try expectKeys("\x1b[200~ab\ncd\x1b[201~", &.{.{ .paste = "ab\ncd" }});
+test "a complete paste is one final event" {
+    try expectKeys(
+        escape.paste_begin ++ escape.paste_end,
+        &.{.{ .paste = .{ .bytes = "", .final = true } }},
+    );
+    // The first key after the end marker decodes normally.
+    try expectKeys(
+        escape.paste_begin ++ "ab\ncd" ++ escape.paste_end ++ "Z",
+        &.{ .{ .paste = .{ .bytes = "ab\ncd", .final = true } }, .{ .char = 'Z' } },
+    );
 }
 
-test "an unterminated paste past the limit flushes and stays a paste" {
+test "a complete large paste in one feed is not capped" {
+    const gpa = std.testing.allocator;
+    var input = Input.init(gpa);
+    defer input.deinit();
+    const body = try gpa.alloc(u8, paste_flush_len + 100);
+    defer gpa.free(body);
+    @memset(body, 'x');
+    // The terminator is buffered before any flush, so the whole paste emits once.
+    try input.feed(escape.paste_begin);
+    try input.feed(body);
+    try input.feed(escape.paste_end);
+    const key = input.next() orelse return error.MissingKey;
+    try std.testing.expect(key.paste.final);
+    try std.testing.expectEqual(body.len, key.paste.bytes.len);
+    try std.testing.expectEqual(@as(?Key, null), input.next());
+}
+
+test "begin and end markers split at every byte boundary" {
+    const gpa = std.testing.allocator;
+    const full = escape.paste_begin ++ "ab\ncd" ++ escape.paste_end;
+    var split: usize = 0;
+    while (split <= full.len) : (split += 1) {
+        var input = Input.init(gpa);
+        defer input.deinit();
+        try input.feed(full[0..split]);
+        // A partial prefix must not emit the paste before its terminator arrives.
+        if (split < full.len) try std.testing.expectEqual(@as(?Key, null), input.next());
+        try input.feed(full[split..]);
+        try std.testing.expectEqualDeep(
+            Key{ .paste = .{ .bytes = "ab\ncd", .final = true } },
+            input.next().?,
+        );
+        try std.testing.expectEqual(@as(?Key, null), input.next());
+    }
+}
+
+test "an unterminated paste flushes as a non-final continuation then terminates" {
     const gpa = std.testing.allocator;
     var input = Input.init(gpa);
     defer input.deinit();
@@ -298,14 +347,86 @@ test "an unterminated paste past the limit flushes and stays a paste" {
     try input.feed(escape.paste_begin);
     try input.feed(body);
     const flushed = input.next() orelse return error.MissingKey;
-    try std.testing.expectEqual(paste_flush_len - escape.paste_end.len + 1, flushed.paste.len);
+    try std.testing.expectEqual(false, flushed.paste.final);
+    try std.testing.expectEqual(
+        paste_flush_len - escape.paste_end.len + 1,
+        flushed.paste.bytes.len,
+    );
     // Later bytes stay paste payload — not keystrokes — until the terminator.
     try input.feed("\rab");
     try std.testing.expectEqual(@as(?Key, null), input.next());
     try input.feed(escape.paste_end ++ "c");
-    try std.testing.expectEqualDeep(Key{ .paste = "xxxxx\rab" }, input.next().?);
+    try std.testing.expectEqualDeep(
+        Key{ .paste = .{ .bytes = "xxxxx\rab", .final = true } },
+        input.next().?,
+    );
     try std.testing.expectEqualDeep(Key{ .char = 'c' }, input.next().?);
     try std.testing.expectEqual(@as(?Key, null), input.next());
+}
+
+test "a payload over multiple caps yields continuations then one final" {
+    const gpa = std.testing.allocator;
+    var input = Input.init(gpa);
+    defer input.deinit();
+    const kept = escape.paste_end.len - 1;
+    const body = try gpa.alloc(u8, paste_flush_len);
+    defer gpa.free(body);
+    @memset(body, 'x');
+    var total: usize = 0;
+
+    try input.feed(escape.paste_begin);
+    try input.feed(body);
+    const first = input.next() orelse return error.MissingKey;
+    try std.testing.expectEqual(false, first.paste.final);
+    try std.testing.expectEqual(paste_flush_len - kept, first.paste.bytes.len);
+    total += first.paste.bytes.len;
+
+    try input.feed(body);
+    const second = input.next() orelse return error.MissingKey;
+    try std.testing.expectEqual(false, second.paste.final);
+    try std.testing.expectEqual(paste_flush_len, second.paste.bytes.len);
+    total += second.paste.bytes.len;
+
+    try input.feed(escape.paste_end);
+    const last = input.next() orelse return error.MissingKey;
+    try std.testing.expect(last.paste.final);
+    total += last.paste.bytes.len;
+
+    // Every fed payload byte is delivered exactly once across the chunks.
+    try std.testing.expectEqual(2 * paste_flush_len, total);
+    try std.testing.expectEqual(@as(?Key, null), input.next());
+}
+
+test "an exact-cap flush leaves an empty final chunk before the terminator" {
+    const gpa = std.testing.allocator;
+    var input = Input.init(gpa);
+    defer input.deinit();
+    const kept = escape.paste_end.len - 1;
+    const body = try gpa.alloc(u8, paste_flush_len);
+    defer gpa.free(body);
+    @memset(body, 'x');
+    // End the body with a partial terminator so the flush holds it back.
+    @memcpy(body[body.len - kept ..], escape.paste_end[0..kept]);
+    try input.feed(escape.paste_begin);
+    try input.feed(body);
+    const flushed = input.next() orelse return error.MissingKey;
+    try std.testing.expectEqual(false, flushed.paste.final);
+    try std.testing.expectEqual(paste_flush_len - kept, flushed.paste.bytes.len);
+    try std.testing.expectEqual(@as(?Key, null), input.next());
+    // The retained partial terminator completes with no more payload.
+    try input.feed(escape.paste_end[kept..]);
+    const final = input.next() orelse return error.MissingKey;
+    try std.testing.expect(final.paste.final);
+    try std.testing.expectEqual(@as(usize, 0), final.paste.bytes.len);
+    try std.testing.expectEqual(@as(?Key, null), input.next());
+}
+
+test "controls, cr, and escape inside a paste stay payload" {
+    const payload = "a\r\nb\x1b[Ac\x03";
+    try expectKeys(
+        escape.paste_begin ++ payload ++ escape.paste_end,
+        &.{.{ .paste = .{ .bytes = payload, .final = true } }},
+    );
 }
 
 test "an unterminated csi past the limit is abandoned as unknown" {

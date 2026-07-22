@@ -464,7 +464,7 @@ test "a read chunk drives the editor and paints the result" {
     try editor.render(&placement, 24);
     try view.render();
 
-    try std.testing.expectEqualStrings("hllo", editor.content());
+    try std.testing.expectEqualStrings("hllo", editor.visible());
     const painted = out.written();
     try std.testing.expect(std.mem.indexOf(u8, painted, "hllo") != null);
     try std.testing.expect(std.mem.indexOf(u8, painted, terminal.escape.sync_set) != null);
@@ -486,7 +486,7 @@ test "a bracketed paste cannot emit terminal controls" {
     try input.feed(terminal.escape.paste_begin ++ payload ++ terminal.escape.paste_end);
     const event = input.next().?;
     switch (event) {
-        .paste => |text| try editor.insert(text),
+        .paste => |paste| try editor.paste(paste.bytes, paste.final),
         else => return error.UnexpectedInput,
     }
     const sink = try view.beginFrame(.{ .columns = 120, .rows = 24 }, 4);
@@ -505,6 +505,42 @@ test "a bracketed paste cannot emit terminal controls" {
     for ([_][]const u8{ "\x1b[9A", "\x1b]52;c;cGFzdGU=\x07", "\x1bPdata\x1b\\" }) |control| {
         try std.testing.expect(std.mem.indexOf(u8, painted, control) == null);
     }
+}
+
+// A large paste travels the real Input -> editor -> render pipeline: it collapses
+// to a compact marker on screen yet expands to its exact bytes for a send.
+test "a large bracketed paste collapses to a marker through the real pipeline" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var input = terminal.Input.init(gpa);
+    defer input.deinit();
+    var editor = ui.Editor.init(gpa);
+    defer editor.deinit();
+    var view = terminal.View.init(gpa, &out.writer);
+    defer view.deinit();
+
+    const payload = "a\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk"; // 11 logical lines
+    try input.feed(terminal.escape.paste_begin ++ payload ++ terminal.escape.paste_end);
+    while (input.next()) |event| switch (event) {
+        .paste => |paste| try editor.paste(paste.bytes, paste.final),
+        else => return error.UnexpectedInput,
+    };
+    // The editor shows the compact marker, not the payload.
+    try std.testing.expectEqualStrings("\u{200B}[paste #1 +11 lines]\u{200B}", editor.visible());
+
+    const sink = try view.beginFrame(.{ .columns = 80, .rows = 24 }, 4);
+    const placement: ui.paint.Placement =
+        .{ .sink = sink, .id = 0, .columns = 80, .base = 0, .skip = 0 };
+    try editor.render(&placement, 24);
+    try view.render();
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "[paste #1 +11 lines]") != null);
+
+    // It expands back to the exact bytes for a send boundary.
+    const expanded = try editor.expanded(.whole_prompt);
+    defer gpa.free(expanded);
+    try std.testing.expectEqualStrings(payload, expanded);
 }
 
 // The consumer seam without real io: a scripted turn's worker events drive the

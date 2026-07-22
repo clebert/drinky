@@ -503,7 +503,7 @@ fn handleKey(self: *App, event: *const terminal.Input.Key) !void {
                 self.clearOrQuit();
                 if (self.running) self.session.dirty = true;
             },
-            'd' => if (self.session.editor.content().len == 0) {
+            'd' => if (self.session.editor.visible().len == 0) {
                 self.running = false;
             },
             else => {},
@@ -519,7 +519,7 @@ fn editKey(self: *App, event: *const terminal.Input.Key) !bool {
     const editor = &self.session.editor;
     switch (event.*) {
         .char => |codepoint| try editor.insertCodepoint(codepoint),
-        .paste => |text| try editor.insert(text),
+        .paste => |paste| try editor.paste(paste.bytes, paste.final),
         .backspace => editor.backspace(),
         .left => editor.moveLeft(),
         .right => editor.moveRight(),
@@ -560,10 +560,10 @@ fn handleTurnKey(self: *App, event: *const terminal.Input.Key) !void {
 /// mid-turn (it may open a picker, which a turn can't host), so it stays in the
 /// editor to send once the turn ends.
 fn submitSteering(self: *App) !void {
-    const trimmed = std.mem.trim(u8, self.session.editor.content(), " \t\r\n");
-    if (trimmed.len == 0 or std.mem.startsWith(u8, trimmed, "/")) return;
-    const text = try self.gpa.dupe(u8, trimmed);
+    if (self.session.editor.blank()) return;
+    const text = try self.session.editor.expanded(.whole_prompt);
     defer self.gpa.free(text);
+    if (std.mem.startsWith(u8, text, "/")) return;
     // Channel first (the worker's source of truth), then the display mirror.
     try self.agent.steering.push(text);
     try self.session.queueSteering(text);
@@ -601,7 +601,7 @@ fn takeSteering(self: *App) !?[]u8 {
 fn appendToEditor(self: *App, text: []const u8) !void {
     const editor = &self.session.editor;
     editor.moveEnd();
-    if (editor.content().len > 0) try editor.insert("\n\n");
+    if (editor.visible().len > 0) try editor.insert("\n\n");
     try editor.insert(text);
 }
 
@@ -668,9 +668,8 @@ fn nowMs(self: *App) i64 {
 }
 
 fn submit(self: *App) !void {
-    const trimmed = std.mem.trim(u8, self.session.editor.content(), " \t\r\n");
-    if (trimmed.len == 0) return;
-    const text = try self.gpa.dupe(u8, trimmed);
+    if (self.session.editor.blank()) return;
+    const text = try self.session.editor.expanded(.whole_prompt);
     defer self.gpa.free(text);
     self.session.editor.clear();
     self.session.dirty = true;
@@ -1034,7 +1033,7 @@ test "cancelling a turn restores in-flight steering and resyncs usage" {
     app.agent.stats.cost = 1.5;
 
     try app.cancelTurn();
-    try std.testing.expectEqualStrings("do X\n\nand Y", app.session.editor.content());
+    try std.testing.expectEqualStrings("do X\n\nand Y", app.session.editor.visible());
     try std.testing.expectEqual(@as(usize, 0), app.session.steering.items.len);
     try std.testing.expectEqual(@as(f64, 1.5), app.session.stats_shown.cost);
     try std.testing.expect(app.session.mode == .prompt);
@@ -1066,7 +1065,7 @@ test "alt+up recalls the steering queue after in-progress editor text" {
     try app.session.queueSteering("and test");
 
     try app.pullSteering();
-    try std.testing.expectEqualStrings("draft\n\nfix it\n\nand test", app.session.editor.content());
+    try std.testing.expectEqualStrings("draft\n\nfix it\n\nand test", app.session.editor.visible());
     try std.testing.expectEqual(@as(usize, 0), app.session.steering.items.len);
 }
 
@@ -1093,12 +1092,12 @@ test "a mid-turn slash command or blank line is never queued as steering" {
 
     try app.session.editor.insert("/model");
     try app.submitSteering();
-    try std.testing.expectEqualStrings("/model", app.session.editor.content());
+    try std.testing.expectEqualStrings("/model", app.session.editor.visible());
 
     app.session.editor.clear();
     try app.session.editor.insert("   ");
     try app.submitSteering();
-    try std.testing.expectEqualStrings("   ", app.session.editor.content());
+    try std.testing.expectEqualStrings("   ", app.session.editor.visible());
 
     try std.testing.expectEqual(@as(usize, 0), app.session.steering.items.len);
     const taken = try app.agent.steering.take();
@@ -1220,7 +1219,7 @@ test "ctrl+c clears then quits within the window and ctrl+d quits only when empt
     try std.testing.expect(app.running);
 
     try app.handleKey(&.{ .ctrl = 'c' });
-    try std.testing.expectEqualStrings("", app.session.editor.content());
+    try std.testing.expectEqualStrings("", app.session.editor.visible());
     try std.testing.expect(app.running);
     try app.handleKey(&.{ .ctrl = 'c' });
     try std.testing.expect(!app.running);
@@ -1258,6 +1257,42 @@ test "a signed-out submit is refused with a login prompt" {
     try std.testing.expectEqual(@as(usize, 1), blocks.len);
     try std.testing.expect(blocks[0].feedback.is_error);
     try std.testing.expect(std.mem.indexOf(u8, blocks[0].feedback.text.items, "/login") != null);
+}
+
+// A large paste that expands to a slash command is classified from its expanded
+// text, never its marker label, and the label never reaches command dispatch.
+test "a large pasted slash command is classified from expanded text" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.gpa = gpa;
+    app.io = io;
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = anthropic_default,
+        .system = "",
+        .retry = .{},
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+
+    // Twelve lines beginning with "/nope": large enough to collapse to a marker.
+    try app.session.editor.paste("/nope\n" ** 11 ++ "/nope", true);
+    try std.testing.expectEqual(@as(usize, 1), app.session.editor.draft.atoms.items.len);
+
+    try app.submit();
+
+    // The command ran off the expanded "/nope", not the "[paste …]" label.
+    const blocks = app.session.transcript.blocks();
+    try std.testing.expectEqual(@as(usize, 1), blocks.len);
+    try std.testing.expect(blocks[0].feedback.is_error);
+    const feedback = blocks[0].feedback.text.items;
+    try std.testing.expect(std.mem.indexOf(u8, feedback, "unknown command: /nope") != null);
+    try std.testing.expect(std.mem.indexOf(u8, feedback, "paste") == null);
+    try std.testing.expectEqualStrings("", app.session.editor.visible());
 }
 
 test "esc, ctrl+c, and ctrl+d each dismiss the picker as cancelled" {
