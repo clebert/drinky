@@ -24,9 +24,11 @@ caret: usize,
 /// window scrolls to keep the caret in view. `reflow` maintains it and `clear`
 /// resets it; the rows above it show as an "N more" label on the top rule.
 scroll: usize,
-/// Desired display column for vertical movement, remembered across consecutive
-/// `moveUp`/`moveDown` so a step through a shorter row does not forget it. Null
-/// until a vertical step captures the caret's column; a horizontal move, an
+/// Desired logical column for vertical movement, remembered across consecutive
+/// `moveUp`/`moveDown` so a step through a shorter row does not forget it. It is
+/// logical, not display: a paste atom counts as one cell however wide its label
+/// renders (see `logicalColumn`), so a marker never traps the caret at its edge.
+/// Null until a vertical step captures the caret's column; a horizontal move, an
 /// edit, or a vertical move off the top or bottom row clears it back to null.
 goal_column: ?usize,
 /// Next paste-atom ID to assign; the first real atom is 1. Monotonic for the
@@ -144,6 +146,10 @@ const byte_count_max = 1000;
 /// Zero-width guard bracketing a marker span. U+200B is zero columns and, being
 /// grapheme-break Control, forces a cluster break on each side, so a marker edge
 /// is always a display boundary and cannot fuse with adjacent combining text.
+/// The guards pin only the edges: the label between them is ordinary text that
+/// wraps grapheme-by-grapheme like any other, so a marker is one atom for editing
+/// (crossed and deleted whole) but not one unit for wrapping — a marker wider
+/// than the terminal breaks across rows while staying a single atom.
 const marker_guard = "\u{200B}";
 /// Widest a marker span can be: two guards, the fixed label text, and two u64s in
 /// decimal (the line form `[paste #{d} +{d} lines]` is the longer of the two).
@@ -372,80 +378,124 @@ pub fn moveEnd(self: *Editor) void {
     self.caret = self.draft.visible.items.len;
 }
 
-/// Move the caret one wrapped row up, targeting the sticky goal column (the
-/// column a run of vertical moves began at). On the top row it falls back to
-/// `moveHome`. A target that lands inside a marker snaps to the nearer edge.
+/// Move the caret one wrapped row up, keeping the sticky logical goal column. On
+/// the top row it falls back to `moveHome`. The column is logical, so a marker
+/// counts as one cell and never traps the caret at its edge (see `logicalColumn`
+/// and `logicalOffset`).
 pub fn moveUp(self: *Editor, columns: usize) void {
     const columns_max = @max(columns, 1);
     const text = self.draft.visible.items;
-    const position = terminal.width.caret(text[0..self.caret], columns_max);
-    if (position.rows_before == 0) {
+    const row = terminal.width.caret(text[0..self.caret], columns_max).rows_before;
+    if (row == 0) {
         self.moveHome();
         return;
     }
-    const goal = self.goal_column orelse position.column;
+    const goal = self.goal_column orelse self.logicalColumn(columns_max, row);
     self.goal_column = goal;
-    const target: terminal.width.Caret = .{
-        .rows_before = position.rows_before - 1,
-        .column = goal,
-    };
-    const offset = terminal.width.offsetAt(text, columns_max, target);
-    self.caret = self.snapOutOfAtom(offset, target, columns_max);
+    var result = self.logicalOffset(columns_max, .{ .row = row - 1, .column = goal });
+    // A marker wider than the terminal has no caret on its interior rows, and
+    // `logicalOffset` only escapes such a row forward, to the after-edge. When
+    // that leaves the caret at or below where it started, climb to the marker's
+    // before-edge instead so a step up always makes upward progress.
+    if (result >= self.caret) {
+        if (self.atomEndingAt(self.caret)) |atom| result = atom.start;
+    }
+    self.caret = result;
+    std.debug.assert(self.legalCaret(self.caret));
 }
 
-/// Move the caret one wrapped row down, targeting the sticky goal column; on the
-/// bottom row it falls back to `moveEnd`. See `moveUp`.
+/// Move the caret one wrapped row down, keeping the sticky logical goal column;
+/// on the bottom row it falls back to `moveEnd`. See `moveUp`.
 pub fn moveDown(self: *Editor, columns: usize) void {
     const columns_max = @max(columns, 1);
     const text = self.draft.visible.items;
-    const position = terminal.width.caret(text[0..self.caret], columns_max);
-    if (position.rows_before + 1 >= terminal.width.rows(text, columns_max)) {
+    const row = terminal.width.caret(text[0..self.caret], columns_max).rows_before;
+    if (row + 1 >= terminal.width.rows(text, columns_max)) {
         self.moveEnd();
         return;
     }
-    const goal = self.goal_column orelse position.column;
+    const goal = self.goal_column orelse self.logicalColumn(columns_max, row);
     self.goal_column = goal;
-    const target: terminal.width.Caret = .{
-        .rows_before = position.rows_before + 1,
-        .column = goal,
-    };
-    const offset = terminal.width.offsetAt(text, columns_max, target);
-    self.caret = self.snapOutOfAtom(offset, target, columns_max);
+    self.caret = self.logicalOffset(columns_max, .{ .row = row + 1, .column = goal });
+    std.debug.assert(self.legalCaret(self.caret));
 }
 
-/// If a vertical-move `offset` lands strictly inside a marker, snap it to the
-/// nearer atom edge by wrapped-cell distance — the after-edge on a tie, and the
-/// opposite edge when the nearer one is the current caret, so repeated steps
-/// always cross a marker that spans several rows. Otherwise `offset` is returned.
-fn snapOutOfAtom(
-    self: *const Editor,
-    offset: usize,
-    target: terminal.width.Caret,
-    columns_max: usize,
-) usize {
-    const text = self.draft.visible.items;
-    var result = offset;
-    for (self.draft.atoms.items) |atom| {
-        if (offset <= atom.start or atom.end <= offset) continue;
-        const goal = target.rows_before *| columns_max +| target.column;
-        const nearer_end =
-            cellDistance(text, atom.end, columns_max, goal) <=
-            cellDistance(text, atom.start, columns_max, goal);
-        var chosen = if (nearer_end) atom.end else atom.start;
-        if (chosen == self.caret) chosen = if (nearer_end) atom.start else atom.end;
-        result = chosen;
-        break;
+/// A position in the logical column model: a display row and the logical column
+/// within it (each atom one cell, each grapheme its display width).
+const LogicalCaret = struct { row: usize, column: usize };
+
+/// The slice of the visible buffer display `row` wraps to, or null when `row` is
+/// past the last wrapped row. Both vertical-movement walks take their row start
+/// from this line, so they measure the same wrapped geometry the renderer does.
+fn wrappedLine(self: *const Editor, columns_max: usize, row: usize) ?[]const u8 {
+    var iterator = terminal.width.wrapper(self.draft.visible.items, columns_max);
+    var current: usize = 0;
+    while (iterator.next()) |line| : (current += 1) {
+        if (current == row) return line;
     }
-    std.debug.assert(self.legalCaret(result));
-    return result;
+    return null;
 }
 
-/// Absolute wrapped-cell distance from the caret at `offset` to scalar cell
-/// `goal` (`row * columns_max + column`), with saturating coordinate arithmetic.
-fn cellDistance(text: []const u8, offset: usize, columns_max: usize, goal: usize) usize {
-    const position = terminal.width.caret(text[0..offset], columns_max);
-    const cell = position.rows_before *| columns_max +| position.column;
-    return @max(cell, goal) - @min(cell, goal);
+/// The caret's logical column within display `row`: each literal grapheme counts
+/// its display width, but every paste atom counts as a single cell. The walk
+/// starts at the row's first legal caret boundary, so a marker that wrapped onto
+/// this row is skipped to its end while a marker that begins the row is counted
+/// as its single cell.
+fn logicalColumn(self: *const Editor, columns_max: usize, row: usize) usize {
+    const text = self.draft.visible.items;
+    const line = self.wrappedLine(columns_max, row) orelse return 0;
+    const line_start = @intFromPtr(line.ptr) - @intFromPtr(text.ptr);
+    var column: usize = 0;
+    var index = self.legalAtOrAfter(line_start);
+    while (index < self.caret) {
+        if (self.atomStartingAt(index)) |atom| {
+            column += 1;
+            index = atom.end;
+        } else {
+            const next = terminal.width.boundaryAfter(text, index);
+            column += terminal.width.ofText(text[index..next]);
+            index = next;
+        }
+    }
+    return column;
+}
+
+/// Byte offset at `target`'s logical column on its display row — the inverse of
+/// `logicalColumn`, clamped to the row's last legal boundary; a row past the last
+/// wrapped row yields the buffer end. Atoms are always crossed whole, so the
+/// result is a legal caret boundary and never lands strictly inside a marker,
+/// even when the marker wraps across rows.
+fn logicalOffset(self: *const Editor, columns_max: usize, target: LogicalCaret) usize {
+    const text = self.draft.visible.items;
+    const line = self.wrappedLine(columns_max, target.row) orelse return text.len;
+    const line_start = @intFromPtr(line.ptr) - @intFromPtr(text.ptr);
+    const line_end = line_start + line.len;
+    var index = self.legalAtOrAfter(line_start);
+    var logical: usize = 0;
+    while (index < line_end and logical < target.column) {
+        if (self.atomStartingAt(index)) |atom| {
+            logical += 1;
+            index = atom.end;
+        } else {
+            const next = terminal.width.boundaryAfter(text, index);
+            const unit = terminal.width.ofText(text[index..next]);
+            // Stop before a wide grapheme the goal column falls inside rather
+            // than overshooting past it.
+            if (logical + unit > target.column) break;
+            logical += unit;
+            index = next;
+        }
+    }
+    return index;
+}
+
+/// The first legal caret boundary at or after `offset`: the enclosing atom's end
+/// when `offset` falls strictly inside a marker, otherwise `offset` unchanged.
+fn legalAtOrAfter(self: *const Editor, offset: usize) usize {
+    for (self.draft.atoms.items) |atom| {
+        if (atom.start < offset and offset < atom.end) return atom.end;
+    }
+    return offset;
 }
 
 /// Whether `offset` is a legal caret: a display boundary in the visible buffer
@@ -936,28 +986,90 @@ test "marker guards keep both edges legal between combining marks" {
     try expectExpanded(&editor, .none, "\u{0301}" ++ eleven_lines ++ "\u{0301}");
 }
 
-test "vertical movement snaps out of a marker and never lands inside it" {
+test "vertical movement counts a marker as one logical column" {
     var editor = Editor.init(std.testing.allocator);
     defer editor.deinit();
-    // "abc" then a marker on its own logical line then "def".
+    // "abc" then a marker alone on its own row then "def".
     try editor.insert("abc\n");
     try pasteWhole(&editor, eleven_lines);
     try editor.insert("\ndef");
     const atom = editor.draft.atoms.items[0];
 
-    // From the first row, down targets a column inside the marker's row; snap.
-    editor.caret = 2; // Row 0, column 2.
+    // The marker's row holds a single logical cell, so goal column 2 clamps past
+    // it to the after-edge rather than snapping back to the marker's start.
+    editor.caret = 2; // Row 0, column 2 within "abc".
     editor.moveDown(80);
-    try std.testing.expect(editor.caret == atom.start or editor.caret == atom.end);
-    try std.testing.expect(editor.caret <= atom.start or editor.caret >= atom.end);
+    try std.testing.expectEqual(atom.end, editor.caret);
     try std.testing.expectEqual(@as(?usize, 2), editor.goal_column);
 
-    // From the last row, up snaps the same way.
-    editor.moveEnd();
+    // The same from below: up lands on the after-edge, never inside the marker.
     editor.caret = editor.visible().len - 1; // Row 2, column 2 within "def".
     editor.goal_column = null;
     editor.moveUp(80);
-    try std.testing.expect(editor.caret == atom.start or editor.caret == atom.end);
+    try std.testing.expectEqual(atom.end, editor.caret);
+}
+
+test "vertical movement lands in the text after a leading marker" {
+    var editor = Editor.init(std.testing.allocator);
+    defer editor.deinit();
+    // Row 0 "This"; row 1 is a marker at the line start followed by " foo".
+    try editor.insert("This\n");
+    try pasteWhole(&editor, eleven_lines);
+    try editor.insert(" foo");
+    const atom = editor.draft.atoms.items[0];
+
+    editor.caret = 4; // Row 0, column 4 (after "This").
+    editor.moveDown(80);
+    // The marker is one column, so column 4 falls between the two o's of "foo":
+    // marker(1) + space(1) + "fo"(2).
+    try std.testing.expectEqual(atom.end + 3, editor.caret);
+    try std.testing.expectEqualStrings(" fo", editor.visible()[atom.end .. atom.end + 3]);
+}
+
+test "vertical movement departs a row-leading marker as one column" {
+    var editor = Editor.init(std.testing.allocator);
+    defer editor.deinit();
+    // Row 0 "ab"; row 1 begins with a marker, then "cd".
+    try editor.insert("ab\n");
+    try pasteWhole(&editor, eleven_lines);
+    try editor.insert("cd");
+    const atom = editor.draft.atoms.items[0];
+
+    // The caret right after the marker is logical column 1 (the marker is the one
+    // cell at column 0), so a first step up lands at column 1 of "ab".
+    editor.caret = atom.end;
+    editor.goal_column = null;
+    editor.moveUp(80);
+    try std.testing.expectEqual(@as(usize, 1), editor.caret);
+
+    // Symmetric: from row 0 column 1, a step down returns to just after the marker
+    // — past its one cell and no further, i.e. the after-edge.
+    editor.caret = 1;
+    editor.goal_column = null;
+    editor.moveDown(80);
+    try std.testing.expectEqual(atom.end, editor.caret);
+}
+
+test "vertical movement treats a mid-line marker as one column" {
+    var editor = Editor.init(std.testing.allocator);
+    defer editor.deinit();
+    // Row 0 is wide padding; row 1 is "ab" + marker + "cd".
+    try editor.insert("xxxxxxxx\nab");
+    try pasteWhole(&editor, eleven_lines);
+    try editor.insert("cd");
+    const atom = editor.draft.atoms.items[0];
+
+    // Row 1 columns: a(0..1) b(1..2) marker(2..3) c(3..4) d(4..5). Goal column 3
+    // lands on the after-edge; goal column 4 one cell into the trailing "cd".
+    editor.caret = 3; // Row 0, column 3.
+    editor.moveDown(80);
+    try std.testing.expectEqual(atom.end, editor.caret);
+
+    editor.moveHome();
+    editor.caret = 4; // Row 0, column 4.
+    editor.goal_column = null;
+    editor.moveDown(80);
+    try std.testing.expectEqual(atom.end + 1, editor.caret);
 }
 
 test "repeated vertical steps cross a marker wider than the terminal" {
@@ -978,6 +1090,38 @@ test "repeated vertical steps cross a marker wider than the terminal" {
         if (editor.caret == atom.end) reached_end = true;
     }
     try std.testing.expect(reached_end);
+}
+
+test "repeated vertical steps climb above a marker wider than the terminal" {
+    var editor = Editor.init(std.testing.allocator);
+    defer editor.deinit();
+    try editor.insert("ab\n");
+    try pasteWhole(&editor, eleven_lines); // 21-column label wraps at width 5.
+    try editor.insert("\ncd");
+    const atom = editor.draft.atoms.items[0];
+
+    editor.moveEnd(); // In "cd", below the wrapped marker.
+    // Step up repeatedly; the caret must never land strictly inside the marker
+    // and must climb past its near edge rather than sticking at the far edge.
+    var reached_start = false;
+    for (0..8) |_| {
+        editor.moveUp(5);
+        try std.testing.expect(editor.caret <= atom.start or editor.caret >= atom.end);
+        if (editor.caret == atom.start) reached_start = true;
+    }
+    try std.testing.expect(reached_start);
+}
+
+test "vertical movement clamps before a wide grapheme as display columns did" {
+    var editor = Editor.init(std.testing.allocator);
+    defer editor.deinit();
+    // Row 1 opens with a two-column grapheme; no atoms are involved.
+    try editor.insert("ab\n\u{4F60}c"); // U+4F60 spans columns 0..2.
+    editor.caret = 1; // Row 0, column 1 (after "a").
+    editor.moveDown(80);
+    // Goal column 1 falls inside the wide grapheme; clamp to the row start,
+    // the boundary before it, never past it.
+    try std.testing.expectEqual(@as(usize, 3), editor.caret);
 }
 
 test "a marker wider than the terminal wraps but stays one atom" {

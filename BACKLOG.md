@@ -362,11 +362,10 @@ Extension seams referenced here:
       bytes into valid UTF-8 cannot leave the caret inside a rendered unit.
 
 - [x] **Sticky goal column for vertical caret movement.** `Editor` carries an optional
-      `goal_column`: the first `moveUp`/`moveDown` of a run captures the caret's display column into
-      it, and every subsequent vertical step targets that column via `terminal.width.offsetAt`
-      instead of the live one. A row shorter than the goal clamps the caret for display without
-      overwriting the goal, so a later step onto a wider row restores the column — the way most
-      editors behave. Any horizontal move or edit (`moveLeft`/`moveRight`/`moveHome`/`moveEnd`/
+      `goal_column`: the first `moveUp`/`moveDown` of a run captures the caret's logical column into
+      it, and every subsequent vertical step targets that column instead of the live one. A row
+      shorter than the goal clamps the caret for display without overwriting the goal, so a later
+      step onto a wider row restores the column — the way most editors behave. Any horizontal move or edit (`moveLeft`/`moveRight`/`moveHome`/`moveEnd`/
       `insert`/`backspace`/`clear`) resets the goal to null so the next vertical run recaptures it.
       A vertical move off the top or bottom row falls back to `moveHome`/`moveEnd`, so pressing up
       on the first row jumps to the start and down on the last row jumps to the end.

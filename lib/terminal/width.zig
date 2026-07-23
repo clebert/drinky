@@ -123,31 +123,6 @@ pub fn caret(text: []const u8, columns_max: usize) Caret {
     return result;
 }
 
-/// Byte offset into `text` whose prefix `caret` maps to `target` once `text` is
-/// wrapped to `columns_max` — the inverse of `caret`. A target row past the last
-/// wrapped row clamps to the end of `text`; a target column past its row's
-/// content clamps to the row's end, landing on the last display boundary that
-/// does not overshoot the column.
-pub fn offsetAt(text: []const u8, columns_max: usize, target: Caret) usize {
-    var iterator = wrapper(text, columns_max);
-    var row: usize = 0;
-    while (iterator.next()) |line| : (row += 1) {
-        if (row != target.rows_before) continue;
-        const start = @intFromPtr(line.ptr) - @intFromPtr(text.ptr);
-        var columns: usize = 0;
-        var index: usize = 0;
-        while (index < line.len) {
-            const unit = displayUnit(line[index..]);
-            const unit_columns = fittedColumns(&unit, columns_max);
-            if (columns + unit_columns > target.column) break;
-            columns += unit_columns;
-            index += unit.bytes;
-        }
-        return start + index;
-    }
-    return text.len;
-}
-
 /// Byte offset immediately after the canonical display unit at `offset`.
 pub fn boundaryAfter(text: []const u8, offset: usize) usize {
     if (offset >= text.len) return text.len;
@@ -437,31 +412,6 @@ test "canonical display boundaries follow rendered replacement units" {
     try std.testing.expectEqual(@as(usize, 1), boundaryBefore("\r\n", 2));
     try std.testing.expectEqual(@as(usize, 2), boundaryAfter("\xc2\x9b", 0));
     try std.testing.expectEqual(@as(usize, 3), boundaryAtOrAfter("e\u{0301}", 1));
-}
-
-fn expectOffsetAt(expected: usize, text: []const u8, columns_max: usize, target: Caret) !void {
-    try std.testing.expectEqual(expected, offsetAt(text, columns_max, target));
-}
-
-test offsetAt {
-    // The inverse of caret on a plain single row.
-    try expectOffsetAt(2, "hello", 10, .{ .rows_before = 0, .column = 2 });
-    // A newline-delimited second row, column within it.
-    try expectOffsetAt(9, "hello\nworld", 10, .{ .rows_before = 1, .column = 3 });
-    // A width-wrapped continuation row.
-    try expectOffsetAt(4, "abcdef", 3, .{ .rows_before = 1, .column = 1 });
-    // A column past the row's content clamps to the row's end.
-    try expectOffsetAt(9, "abcdef\nxy", 10, .{ .rows_before = 1, .column = 9 });
-    // A row past the last wrapped row clamps to the end of text.
-    try expectOffsetAt(11, "hello\nworld", 10, .{ .rows_before = 5, .column = 0 });
-    // A column inside a two-cell cluster lands on the boundary before it.
-    try expectOffsetAt(0, "你好世", 10, .{ .rows_before = 0, .column = 1 });
-    try expectOffsetAt(3, "你好世", 10, .{ .rows_before = 0, .column = 3 });
-    // The inverse of the full-width-margin caret: the next row's first column
-    // maps back to the end of the filled row.
-    try expectOffsetAt(3, "hel", 3, .{ .rows_before = 1, .column = 0 });
-    // Column 0 of a blank row between two newlines.
-    try expectOffsetAt(2, "a\n\nb", 10, .{ .rows_before = 1, .column = 0 });
 }
 
 test caret {
