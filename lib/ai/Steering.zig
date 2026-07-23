@@ -1,7 +1,8 @@
 //! A thread-safe queue of steering messages: text the user submits mid-turn,
 //! handed from the UI thread to the turn worker. The queue owns each message
-//! until taken. The UI thread pushes; either thread takes (drain into the turn,
-//! recall, or cancel), so the mutex guards take against take, not just push.
+//! until taken. The UI thread pushes or recalls; the worker takes for delivery.
+//! A failed delivery restores its whole batch as a queue prefix without allocating,
+//! ahead of messages submitted since the take.
 
 const std = @import("std");
 
@@ -10,15 +11,39 @@ const Steering = @This();
 gpa: std.mem.Allocator,
 io: std.Io,
 mutex: std.Io.Mutex,
+/// A restored batch ahead of `messages`, retaining its original outer allocation.
+/// At most one exists because restoration ends the operation that took it.
+restored_prefix: std.ArrayList([]u8),
 messages: std.ArrayList([]u8),
 
 pub fn init(gpa: std.mem.Allocator, io: std.Io) Steering {
-    return .{ .gpa = gpa, .io = io, .mutex = .init, .messages = .empty };
+    return .{
+        .gpa = gpa,
+        .io = io,
+        .mutex = .init,
+        .restored_prefix = .empty,
+        .messages = .empty,
+    };
 }
 
 pub fn deinit(self: *Steering) void {
-    for (self.messages.items) |message| self.gpa.free(message);
-    self.messages.deinit(self.gpa);
+    freeMessages(self.gpa, &self.restored_prefix);
+    freeMessages(self.gpa, &self.messages);
+}
+
+/// Atomically discard every queued message without allocating. Messages pushed
+/// after the swap remain queued; callers still synchronize with any producer
+/// whose earlier push must also be discarded.
+pub fn clear(self: *Steering) void {
+    self.mutex.lockUncancelable(self.io);
+    var restored_prefix = self.restored_prefix;
+    self.restored_prefix = .empty;
+    var messages = self.messages;
+    self.messages = .empty;
+    self.mutex.unlock(self.io);
+
+    freeMessages(self.gpa, &restored_prefix);
+    freeMessages(self.gpa, &messages);
 }
 
 /// Queue a copy of `text`. Duplicated before the lock so only the append is held.
@@ -30,12 +55,49 @@ pub fn push(self: *Steering, text: []const u8) !void {
     try self.messages.append(self.gpa, copy);
 }
 
-/// Take every queued message, transferring ownership to the caller (free each
-/// message and the returned slice with the same gpa) and emptying the queue.
+/// Take every queued message in logical order, transferring ownership to the
+/// caller and emptying both the restored prefix and ordinary queue.
 pub fn take(self: *Steering) ![][]u8 {
     self.mutex.lockUncancelable(self.io);
     defer self.mutex.unlock(self.io);
-    return self.messages.toOwnedSlice(self.gpa);
+    return self.takeLocked();
+}
+
+/// Restore a previously taken batch as the queue prefix. Moving the original
+/// outer allocation makes the whole batch visible at once, ahead of messages
+/// queued since the take, and leaves the source empty.
+pub fn restoreTaken(self: *Steering, messages: *[][]u8) void {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    std.debug.assert(self.restored_prefix.items.len == 0);
+    self.restored_prefix = .fromOwnedSlice(messages.*);
+    messages.* = &.{};
+}
+
+/// Drain the restored prefix followed by ordinary messages. No ownership changes
+/// until allocation succeeds, so an OOM leaves both queue segments intact.
+fn takeLocked(self: *Steering) ![][]u8 {
+    if (self.restored_prefix.items.len == 0) return self.messages.toOwnedSlice(self.gpa);
+    if (self.messages.items.len == 0) return self.restored_prefix.toOwnedSlice(self.gpa);
+
+    const length = try std.math.add(
+        usize,
+        self.restored_prefix.items.len,
+        self.messages.items.len,
+    );
+    const combined = try self.gpa.alloc([]u8, length);
+    @memcpy(combined[0..self.restored_prefix.items.len], self.restored_prefix.items);
+    @memcpy(combined[self.restored_prefix.items.len..], self.messages.items);
+    self.restored_prefix.deinit(self.gpa);
+    self.restored_prefix = .empty;
+    self.messages.deinit(self.gpa);
+    self.messages = .empty;
+    return combined;
+}
+
+fn freeMessages(gpa: std.mem.Allocator, messages: *std.ArrayList([]u8)) void {
+    for (messages.items) |message| gpa.free(message);
+    messages.deinit(gpa);
 }
 
 /// Combine `messages` into one string, blank-line separated — the single form
@@ -48,6 +110,20 @@ pub fn join(gpa: std.mem.Allocator, messages: []const []const u8) ![]u8 {
         try buffer.appendSlice(gpa, message);
     }
     return buffer.toOwnedSlice(gpa);
+}
+
+test "clear discards the queued messages" {
+    const gpa = std.testing.allocator;
+    var steering = Steering.init(gpa, std.testing.io);
+    defer steering.deinit();
+
+    try steering.push("foo");
+    try steering.push("bar");
+    steering.clear();
+
+    const taken = try steering.take();
+    defer gpa.free(taken);
+    try std.testing.expectEqual(@as(usize, 0), taken.len);
 }
 
 test "push then take drains the queue in order" {
@@ -69,6 +145,125 @@ test "push then take drains the queue in order" {
     const empty = try steering.take();
     defer gpa.free(empty);
     try std.testing.expectEqual(@as(usize, 0), empty.len);
+}
+
+test "a failed delivery restores ahead of messages queued after its take" {
+    const gpa = std.testing.allocator;
+    var steering = Steering.init(gpa, std.testing.io);
+    defer steering.deinit();
+
+    try steering.push("a");
+    try steering.push("b");
+    var delivery = try steering.take();
+    defer {
+        for (delivery) |message| gpa.free(message);
+        gpa.free(delivery);
+    }
+    try steering.push("c");
+    steering.restoreTaken(&delivery);
+    try std.testing.expectEqual(@as(usize, 0), delivery.len);
+
+    const taken = try steering.take();
+    defer {
+        for (taken) |message| gpa.free(message);
+        gpa.free(taken);
+    }
+    try std.testing.expectEqual(@as(usize, 3), taken.len);
+    try std.testing.expectEqualStrings("a", taken[0]);
+    try std.testing.expectEqualStrings("b", taken[1]);
+    try std.testing.expectEqualStrings("c", taken[2]);
+}
+
+test "a failed delivery becomes a prefix after an intervening recall" {
+    const gpa = std.testing.allocator;
+    var steering = Steering.init(gpa, std.testing.io);
+    defer steering.deinit();
+
+    try steering.push("a");
+    try steering.push("b");
+    var delivery = try steering.take();
+    defer {
+        for (delivery) |message| gpa.free(message);
+        gpa.free(delivery);
+    }
+    try steering.push("c");
+
+    const recalled = try steering.take();
+    defer {
+        for (recalled) |message| gpa.free(message);
+        gpa.free(recalled);
+    }
+    try std.testing.expectEqual(@as(usize, 1), recalled.len);
+    try std.testing.expectEqualStrings("c", recalled[0]);
+
+    steering.restoreTaken(&delivery);
+    try std.testing.expectEqual(@as(usize, 0), delivery.len);
+    const restored = try steering.take();
+    defer {
+        for (restored) |message| gpa.free(message);
+        gpa.free(restored);
+    }
+    try std.testing.expectEqual(@as(usize, 2), restored.len);
+    try std.testing.expectEqualStrings("a", restored[0]);
+    try std.testing.expectEqualStrings("b", restored[1]);
+}
+
+test "a failed combined take leaves restored and newer messages queued" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const gpa = failing.allocator();
+    var steering = Steering.init(gpa, std.testing.io);
+    defer steering.deinit();
+
+    try steering.push("a");
+    try steering.push("b");
+    var delivery = try steering.take();
+    defer {
+        for (delivery) |message| gpa.free(message);
+        gpa.free(delivery);
+    }
+    try steering.push("c");
+    steering.restoreTaken(&delivery);
+
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+    try std.testing.expectError(error.OutOfMemory, steering.take());
+
+    failing.fail_index = std.math.maxInt(usize);
+    failing.resize_fail_index = std.math.maxInt(usize);
+    const taken = try steering.take();
+    defer {
+        for (taken) |message| gpa.free(message);
+        gpa.free(taken);
+    }
+    try std.testing.expectEqual(@as(usize, 3), taken.len);
+    try std.testing.expectEqualStrings("a", taken[0]);
+    try std.testing.expectEqualStrings("b", taken[1]);
+    try std.testing.expectEqualStrings("c", taken[2]);
+}
+
+test "a taken delivery can be restored without allocation" {
+    const gpa = std.testing.allocator;
+    var steering = Steering.init(gpa, std.testing.io);
+    defer steering.deinit();
+
+    try steering.push("a");
+    try steering.push("b");
+    var delivery = try steering.take();
+    defer {
+        for (delivery) |message| gpa.free(message);
+        gpa.free(delivery);
+    }
+    steering.restoreTaken(&delivery);
+    try std.testing.expectEqual(@as(usize, 0), delivery.len);
+
+    const taken = try steering.take();
+    defer {
+        for (taken) |message| gpa.free(message);
+        gpa.free(taken);
+    }
+    try std.testing.expectEqual(@as(usize, 2), taken.len);
+    try std.testing.expectEqualStrings("a", taken[0]);
+    try std.testing.expectEqualStrings("b", taken[1]);
 }
 
 test "join separates messages with a blank line" {

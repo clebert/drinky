@@ -298,7 +298,10 @@ Extension seams referenced here:
       worker before teardown) should be the single source of truth that both this commit and the
       transcript rewind derive from — a parallel UI-side heuristic would let the two disagree and
       reintroduce the divergence **Show only committed content in the transcript** exists to kill.
-      Pairs with that item (the still-uncommitted tail is what gets rewound) and ties into the
+      The join must also expose the worker's disposition before cancellation restores the rich
+      steering mirror: a worker can commit before its queued completion reaches the UI, and that
+      completed turn must not be treated as a rollback or have its steering restored. Pairs with
+      that item (the still-uncommitted tail is what gets rewound) and ties into the
       **Permission model** and **Bash tool**. Landing it needs test infrastructure that does not
       exist yet — a scripted stream that can raise the cancel at a chosen event, and a way to drive
       the tool-round loop against fake tools in isolation (today's tests exercise reply parsing
@@ -404,19 +407,21 @@ Extension seams referenced here:
 - [x] **Steering.** The user types and submits while a turn runs, queuing messages the pi way. The
       editor stays live during a turn (it was inert by policy, not by blocking — the off-thread
       networking work had already unfrozen the read loop): `App.editKey` drives the editor in both
-      prompt and turn modes, Enter queues a steering message, and Alt+Up recalls the whole queue
-      into the editor. A queued message rides two representations — `Session.steering` (the
-      UI-thread `Steering:` display rows) and `ai.Steering`, a thread-safe (`std.Io.Mutex`) FIFO the
-      turn worker takes from — fed together on submit. `Agent.run` drains the channel at each round
-      boundary (and when the model would otherwise end the turn, so a message still lands mid-turn),
-      combines the pending messages into one blank-line-joined user message folded into the trailing
-      user turn (keeping the user/assistant alternation valid), and reports it via
-      `handler.onSteering`; the consumer shows it as one normal user block and drops those queue
-      rows. A message that lands after the final drain starts the next turn on its own. Alt+Up and
-      cancel recall pending steering from the channel (so a message already folded into the turn is
-      not also handed back — it shows as sent instead), blank-line-joined, into the editor. Slash
-      commands can't run mid-turn (a picker can't coexist with a turn), so a `/`-line stays in the
-      editor to send once the turn ends.
+      prompt and turn modes, Enter queues a steering message, and Alt+Up recalls pending messages
+      into the editor. A queued message rides two representations fed together on submit:
+      `Session.steering` is the UI-thread rich-draft mirror behind the collapsed `Steering:` rows,
+      while `ai.Steering` is a thread-safe (`std.Io.Mutex`) FIFO of canonical expanded plain text
+      that the turn worker takes. `Agent.run` drains the channel at each round boundary (and when the
+      model would otherwise end the turn, so a message still lands mid-turn), combines the pending
+      messages into one blank-line-joined user message folded into the trailing user turn (keeping
+      the user/assistant alternation valid), and reports it via `handler.onSteering`; the consumer
+      shows it as one normal user block and drops those queue rows. A failed delivery restores its
+      whole taken batch atomically ahead of newer queued messages. A message that lands after the
+      final drain starts the next turn on its own. Alt+Up takes the pending count from the shared
+      queue and restores content from the rich mirror, preserving live paste placeholders without
+      recalling a message already folded into the turn; cancellation restores the same mirror after
+      joining the worker. Slash commands can't run mid-turn (a picker can't coexist with a turn), so
+      a `/`-line stays in the editor to send once the turn ends.
 - [x] **Smooth spinner animation.** The `⠋ Working…` spinner is driven by the frame timer: while a
       turn animates the consumer re-arms a tick each frame and `advanceFrame` steps the spinner even
       when the model is clean, so it animates independently of stream events and no longer freezes
@@ -498,15 +503,16 @@ Extension seams referenced here:
       path ignores — capture it at cancel and fold it into `Agent.Stats` so the gauge reflects money
       actually spent.
 - [ ] **Define editor composition on cancel.** After a cancel the editor can receive up to four
-      writers: text the user was already typing, pending steering that `cancelTurn` recalls today,
-      the original prompt returned by **Show only committed content in the transcript**, and the
-      partial-reasoning citation from **Offer partial reasoning/text as a citation on cancel**.
-      `appendToEditor` blank-line-joins in call order, and nothing defines which leads or how they
-      separate — but they are not interchangeable: the returned prompt should precede recalled
-      steering, the citation is the model's words (not the user's) and wants its own quoted framing,
-      and in-progress typing must not be clobbered. Define the composition — order, separators, and
-      framing per source — as one model rather than letting each feature append blindly. This is the
-      underspecified linchpin of the cancel cluster.
+      writers: text the user was already typing, the atom-carrying rich steering drafts that
+      `cancelTurn` recalls today, the original prompt returned by **Show only committed content in
+      the transcript**, and the partial-reasoning citation from **Offer partial reasoning/text as a
+      citation on cancel**. Treat the rich steering mirror as one composition source; flattening it
+      would destroy live paste placeholders. Draft appends blank-line-join in call order, and nothing
+      defines which source leads or how they separate — but they are not interchangeable: the
+      returned prompt should precede recalled steering, the citation is the model's words (not the
+      user's) and wants its own quoted framing, and in-progress typing must not be clobbered. Define
+      the composition — order, separators, and framing per source — as one model rather than letting
+      each feature append blindly. This is the underspecified linchpin of the cancel cluster.
 - [ ] **Configurable transcript window.** The live view retains a compiled-in 8 pages (terminal
       heights) of the newest content (`window_pages` in `src/layout.zig`): the frame keeps
       `rows * window_pages` rows measured newest-first and clips the rest at the top. Expose it via

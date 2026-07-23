@@ -345,10 +345,10 @@ fn runLoop(self: *App) !void {
         if (!self.session.animating()) {
             self.awaitFuture(&self.turn_future);
             // A steering message that landed too late to fold into the turn just
-            // ended opens the next turn on its own. Gating on the display mirror is
-            // safe: `.steering_consumed` precedes `.turn_ended` in the channel, so
-            // the mirror and the queue are in sync once the mode flips to prompt.
-            if (self.session.mode == .prompt and self.session.steering.items.len > 0)
+            // ended opens the next turn on its own. Consumed events precede
+            // `.turn_ended`, while failed delivery restores its plain queue prefix
+            // before the worker ends; the matching rich drafts remain retained.
+            if (self.session.mode == .prompt and self.session.hasSteering())
                 try self.startSteeringTurn();
         }
         if (ticked) {
@@ -381,7 +381,13 @@ fn applyBatch(self: *App, events: []const Session.UiEvent) !bool {
                 defer self.gpa.free(bytes);
                 try self.handleKeys(bytes);
             },
-            .turn => |*turn_event| try self.session.applyTurnEvent(turn_event),
+            .turn => |*turn_event| {
+                try self.session.applyTurnEvent(turn_event);
+                // Start late steering at the turn boundary before a later key in
+                // this same drained batch can submit a newer prompt first.
+                if (self.session.mode == .prompt and self.session.hasSteering())
+                    try self.startSteeringTurn();
+            },
         }
     }
     return ticked;
@@ -564,76 +570,81 @@ fn submitSteering(self: *App) !void {
     const text = try self.session.editor.expanded(.whole_prompt);
     defer self.gpa.free(text);
     if (std.mem.startsWith(u8, text, "/")) return;
-    // Channel first (the worker's source of truth), then the display mirror.
+    // Reserve the mirror slot before the channel push, so the push is the only
+    // fallible step before the draft moves in: if it fails the editor is
+    // untouched, and once it succeeds the literal-edge-trimmed draft moves into
+    // the mirror without allocating. The channel copy is whole-prompt trimmed; the
+    // recovery draft keeps its atoms and their exact payloads.
+    try self.session.reserveSteering();
     try self.agent.steering.push(text);
-    try self.session.queueSteering(text);
-    self.session.editor.clear();
+    var draft = self.session.editor.detachTrimmed();
+    self.session.commitSteeringDraft(&draft);
     self.session.dirty = true;
 }
 
-/// Alt+Up during a turn: pull the whole steering queue back into the editor to
-/// edit, appended after any in-progress line.
+/// Alt+Up during a turn: pull the pending steering back into the editor as live
+/// placeholder drafts, after any in-progress line. Content comes from the mirror
+/// (so a paste returns as its marker, not expanded text); the channel gives only
+/// the count selecting the mirror's pending suffix. The remaining prefix stays
+/// retained until consumed or made recallable by failed delivery.
 fn pullSteering(self: *App) !void {
-    const joined = (try self.takeSteering()) orelse return;
-    defer self.gpa.free(joined);
-    try self.appendToEditor(joined);
-    self.session.dirty = true;
-}
-
-/// Take every not-yet-delivered steering message as one blank-line-joined
-/// string, clearing the display mirror and the channel. Sourced from the channel
-/// so a message the worker already folded into the running turn is not handed
-/// back to the editor too (it will appear as a sent message instead). Null when
-/// nothing is queued.
-fn takeSteering(self: *App) !?[]u8 {
-    self.session.clearSteering();
+    // Reserve every possible draft move so no fallible work follows the channel
+    // take.
+    try self.session.reserveSteeringRecall();
     const taken = try self.agent.steering.take();
     defer {
         for (taken) |message| self.gpa.free(message);
         self.gpa.free(taken);
     }
-    if (taken.len == 0) return null;
-    return try ai.Steering.join(self.gpa, taken);
-}
-
-/// Append `text` to the editor, after a blank-line separator when it already
-/// holds an in-progress line.
-fn appendToEditor(self: *App, text: []const u8) !void {
-    const editor = &self.session.editor;
-    editor.moveEnd();
-    if (editor.visible().len > 0) try editor.insert("\n\n");
-    try editor.insert(text);
+    // The count identifies the rich-record suffix currently owned by the queue;
+    // a batch already owned by the worker remains retained.
+    self.session.recallSteering(taken.len);
 }
 
 /// Start a turn from steering the worker never took because the previous turn
-/// ended first: show it as a user message and run it.
+/// ended first. Keep both plain and rich forms recoverable until the transcript
+/// block and worker have committed; this path intentionally flattens atoms.
 fn startSteeringTurn(self: *App) !void {
-    const joined = (try self.takeSteering()) orelse return;
+    var taken = try self.agent.steering.take();
+    defer {
+        for (taken) |message| self.gpa.free(message);
+        self.gpa.free(taken);
+    }
+    errdefer self.agent.steering.restoreTaken(&taken);
+    if (taken.len == 0) {
+        self.session.clearSteering();
+        return;
+    }
+
+    const joined = try ai.Steering.join(self.gpa, taken);
     defer self.gpa.free(joined);
+    const transcript_count = self.session.transcript.blocks().len;
+    errdefer self.session.transcript.truncate(transcript_count);
     try self.session.transcript.append(.user, false, joined);
     self.session.dirty = true;
     try self.runTurn(joined);
+    self.session.clearSteering();
 }
 
 /// Abort the running turn: cancel and reap the worker (interrupting its blocked
 /// network read), then drop the turn's model state. Events the worker already
 /// queued retain its generation and cannot affect a successor.
 fn cancelTurn(self: *App) !void {
-    // Cancel first (which joins the worker), so nothing below races a drain.
+    // Preflight the only allocation needed for restoration while the worker and
+    // turn are still untouched. The mirror is consumer-owned and stable here.
+    try self.session.reserveSteeringRestore();
     self.cancelFuture(&self.turn_future);
-    // Restore pending steering from the display mirror, not the channel: a
-    // message the worker folded right before the cancel is rolled back
-    // agent-side and its `.steering_consumed` dies at the generation gate, so
-    // only the mirror still holds it. The channel holds copies of mirror rows.
-    if (self.session.steering.items.len > 0) {
-        const joined = try ai.Steering.join(self.gpa, self.session.steering.items);
-        defer self.gpa.free(joined);
-        try self.appendToEditor(joined);
-    }
-    if (try self.takeSteering()) |copies| self.gpa.free(copies);
-    // A final `.usage` still queued dies at the same gate; the worker is joined,
-    // so the cumulative stats are safe to read and resync here.
+    // A final `.usage` still queued dies at the generation gate; the worker is
+    // joined, so the cumulative stats are safe to read and resync here.
     self.session.stats_shown = self.agent.stats;
+    // Restore rich drafts before any further fallible work. A message folded just
+    // before cancel is rolled back agent-side while its consumed event becomes
+    // stale, so only these records can recover it.
+    self.session.restoreSteering();
+    // The worker is joined, so allocation-free clearing cannot race a re-push.
+    self.agent.steering.clear();
+    // This may fail while allocating the feedback block, but cancellation and
+    // steering restoration are already complete and internally consistent.
     try self.session.abortTurn();
 }
 
@@ -953,6 +964,52 @@ test "turn producers keep their captured generation" {
     }
 }
 
+// Queue a plain-text (atom-free) steering draft directly on the mirror, standing
+// in for a message the worker already folded (so the channel no longer holds it).
+// Built through the real editor detach path the app uses.
+fn seedSteering(app: *App, text: []const u8) !void {
+    try app.session.editor.insert(text);
+    try app.session.reserveSteering();
+    var draft = app.session.editor.detachTrimmed();
+    app.session.commitSteeringDraft(&draft);
+}
+
+test "a failed late-steering turn start restores queue, mirror, and transcript" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.gpa = gpa;
+    app.io = io;
+    app.turn_future = null;
+    app.turn_generation = std.math.maxInt(u64);
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = anthropic_default,
+        .system = "",
+        .retry = .{},
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+
+    try app.agent.steering.push("late");
+    try seedSteering(&app, "late");
+    try std.testing.expectError(error.TurnGenerationExhausted, app.startSteeringTurn());
+    try std.testing.expect(app.session.mode == .prompt);
+    try std.testing.expect(app.session.hasSteering());
+    try std.testing.expectEqual(@as(usize, 0), app.session.transcript.blocks().len);
+
+    const restored = try app.agent.steering.take();
+    defer {
+        for (restored) |message| gpa.free(message);
+        gpa.free(restored);
+    }
+    try std.testing.expectEqual(@as(usize, 1), restored.len);
+    try std.testing.expectEqualStrings("late", restored[0]);
+}
+
 test "cancelling a turn joins and clears its active worker" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -1003,10 +1060,10 @@ test "cancelling a turn joins and clears its active worker" {
     try std.testing.expect(app.session.mode == .prompt);
 }
 
-// The race a cancel must survive: the worker folded "do X" (channel entry taken,
-// `.steering_consumed` still queued, so only the mirror holds it) while "and Y"
-// is still pending in both. Everything returns to the editor exactly once, and
-// the cumulative usage the queued `.usage` event would have carried is resynced.
+// The race a cancel must survive: the worker folded a pasted message (channel
+// entry taken, `.steering_consumed` still queued, so only the mirror holds it)
+// while a newer message is pending in both. Everything returns to the editor
+// exactly once, and queued usage is resynced from the joined agent.
 test "cancelling a turn restores in-flight steering and resyncs usage" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -1027,16 +1084,102 @@ test "cancelling a turn restores in-flight steering and resyncs usage" {
     defer app.session.deinit();
     app.session.beginTurn(1);
 
-    try app.session.queueSteering("do X");
-    try app.agent.steering.push("and Y");
-    try app.session.queueSteering("and Y");
+    const payload = "line\n" ** 10 ++ "line";
+    try app.session.editor.paste(payload, true);
+    try app.submitSteering();
+    const folded = try app.agent.steering.take();
+    for (folded) |message| gpa.free(message);
+    gpa.free(folded);
+
+    try app.session.editor.insert("and Y");
+    try app.submitSteering();
     app.agent.stats.cost = 1.5;
 
     try app.cancelTurn();
-    try std.testing.expectEqualStrings("do X\n\nand Y", app.session.editor.visible());
+    try std.testing.expectEqual(@as(usize, 1), app.session.editor.draft.atoms.items.len);
+    const expanded = try app.session.editor.expanded(.none);
+    defer gpa.free(expanded);
+    try std.testing.expectEqualStrings(payload ++ "\n\nand Y", expanded);
     try std.testing.expectEqual(@as(usize, 0), app.session.steering.items.len);
     try std.testing.expectEqual(@as(f64, 1.5), app.session.stats_shown.cost);
     try std.testing.expect(app.session.mode == .prompt);
+}
+
+test "cancel preflight failure leaves the turn and steering untouched" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const gpa = failing.allocator();
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.gpa = gpa;
+    app.io = io;
+    app.turn_future = null;
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = anthropic_default,
+        .system = "",
+        .retry = .{},
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+    app.session.beginTurn(1);
+
+    try app.session.editor.insert("restore me");
+    try app.submitSteering();
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+
+    try std.testing.expectError(error.OutOfMemory, app.cancelTurn());
+    try std.testing.expect(app.session.mode == .turn);
+    try std.testing.expectEqual(@as(usize, 1), app.session.steering.items.len);
+    try std.testing.expectEqualStrings("", app.session.editor.visible());
+
+    failing.fail_index = std.math.maxInt(usize);
+    failing.resize_fail_index = std.math.maxInt(usize);
+    try app.cancelTurn();
+    try std.testing.expect(app.session.mode == .prompt);
+    try std.testing.expectEqualStrings("restore me", app.session.editor.visible());
+}
+
+test "cancel restores steering before feedback allocation failure" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const gpa = failing.allocator();
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.gpa = gpa;
+    app.io = io;
+    app.turn_future = null;
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = anthropic_default,
+        .system = "",
+        .retry = .{},
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+    app.session.beginTurn(1);
+
+    try app.session.editor.insert("restore me");
+    try app.submitSteering();
+    try app.session.editor.reserveDrafts(app.session.steering.items);
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+
+    try std.testing.expectError(error.OutOfMemory, app.cancelTurn());
+    try std.testing.expect(app.session.mode == .prompt);
+    try std.testing.expectEqualStrings("restore me", app.session.editor.visible());
+    try std.testing.expectEqual(@as(usize, 0), app.session.steering.items.len);
+
+    failing.fail_index = std.math.maxInt(usize);
+    failing.resize_fail_index = std.math.maxInt(usize);
+    const taken = try app.agent.steering.take();
+    defer gpa.free(taken);
+    try std.testing.expectEqual(@as(usize, 0), taken.len);
 }
 
 test "alt+up recalls the steering queue after in-progress editor text" {
@@ -1058,15 +1201,331 @@ test "alt+up recalls the steering queue after in-progress editor text" {
     defer app.session.deinit();
     app.session.beginTurn(1);
 
+    try app.session.editor.insert("fix it");
+    try app.submitSteering();
+    try app.session.editor.insert("and test");
+    try app.submitSteering();
     try app.session.editor.insert("draft");
-    try app.agent.steering.push("fix it");
-    try app.session.queueSteering("fix it");
-    try app.agent.steering.push("and test");
-    try app.session.queueSteering("and test");
 
     try app.pullSteering();
     try std.testing.expectEqualStrings("draft\n\nfix it\n\nand test", app.session.editor.visible());
     try std.testing.expectEqual(@as(usize, 0), app.session.steering.items.len);
+}
+
+test "alt+up restores a steered paste as a live placeholder atom" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.gpa = gpa;
+    app.io = io;
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = anthropic_default,
+        .system = "",
+        .retry = .{},
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+    app.session.beginTurn(1);
+
+    const payload = "line\n" ** 15; // 16 logical lines: collapses to a marker
+    try app.session.editor.paste(payload, true);
+    try app.submitSteering();
+    try std.testing.expectEqual(@as(usize, 1), app.session.steering.items.len);
+    try std.testing.expectEqualStrings("", app.session.editor.visible());
+
+    try app.pullSteering();
+    try std.testing.expectEqual(@as(usize, 1), app.session.editor.draft.atoms.items.len);
+    try std.testing.expectEqual(@as(u64, 1), app.session.editor.draft.atoms.items[0].id);
+    try std.testing.expect(
+        std.mem.indexOf(u8, app.session.editor.visible(), "[paste #1 +16 lines]") != null,
+    );
+    const expanded = try app.session.editor.expanded(.none);
+    defer gpa.free(expanded);
+    try std.testing.expectEqualStrings(payload, expanded);
+}
+
+// Cancel restores a worker-owned paste whose consumed event is still pending.
+// A later stale event cannot remove the restored atom, and payload-edge
+// whitespace survives because the draft is only literal-edge trimmed.
+test "cancel restores an in-flight steered paste as a live placeholder atom" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.gpa = gpa;
+    app.io = io;
+    app.turn_future = null;
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = anthropic_default,
+        .system = "",
+        .retry = .{},
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+    app.session.beginTurn(1);
+
+    const payload = "line\n" ** 15;
+    const delivered = std.mem.trim(u8, payload, " \t\r\n");
+    try app.session.editor.paste(payload, true);
+    try app.submitSteering();
+    try std.testing.expectEqualStrings("", app.session.editor.visible());
+    const folded = try app.agent.steering.take();
+    try std.testing.expectEqual(@as(usize, 1), folded.len);
+    try std.testing.expectEqualStrings(delivered, folded[0]);
+    for (folded) |message| gpa.free(message);
+    gpa.free(folded);
+
+    try app.cancelTurn();
+    try std.testing.expectEqual(@as(usize, 1), app.session.editor.draft.atoms.items.len);
+    try std.testing.expectEqual(@as(usize, 0), app.session.steering.items.len);
+    try std.testing.expect(app.session.mode == .prompt);
+    try app.session.applyTurnEvent(&.{
+        .generation = 1,
+        .payload = .{ .steering_consumed = .{
+            .text = try gpa.dupe(u8, delivered),
+            .count = 1,
+        } },
+    });
+    try std.testing.expectEqual(@as(usize, 1), app.session.editor.draft.atoms.items.len);
+    const expanded = try app.session.editor.expanded(.none);
+    defer gpa.free(expanded);
+    try std.testing.expectEqualStrings(payload, expanded);
+}
+
+test "cancel does not restore a steered paste after its consumed event applied" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.gpa = gpa;
+    app.io = io;
+    app.turn_future = null;
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = anthropic_default,
+        .system = "",
+        .retry = .{},
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+    app.session.beginTurn(1);
+
+    const payload = "line\n" ** 15;
+    const delivered = std.mem.trim(u8, payload, " \t\r\n");
+    try app.session.editor.paste(payload, true);
+    try app.submitSteering();
+    const folded = try app.agent.steering.take();
+    try std.testing.expectEqual(@as(usize, 1), folded.len);
+    try std.testing.expectEqualStrings(delivered, folded[0]);
+    for (folded) |message| gpa.free(message);
+    gpa.free(folded);
+    try app.session.applyTurnEvent(&.{
+        .generation = 1,
+        .payload = .{ .steering_consumed = .{
+            .text = try gpa.dupe(u8, delivered),
+            .count = 1,
+        } },
+    });
+
+    try std.testing.expectEqual(@as(usize, 0), app.session.steering.items.len);
+    try app.cancelTurn();
+    try std.testing.expectEqualStrings("", app.session.editor.visible());
+    try std.testing.expectEqualStrings(delivered, app.session.transcript.blocks()[0].user.items);
+}
+
+// Alt+Up recalls only the pending suffix; the already folded prefix stays rich
+// but hidden until its consumed event applies or failed delivery requeues it.
+test "alt+up recalls the pending suffix and retains the in-flight prefix" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.gpa = gpa;
+    app.io = io;
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = anthropic_default,
+        .system = "",
+        .retry = .{},
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+    app.session.beginTurn(1);
+
+    // "folded": the worker took it, so only the mirror holds it (in-flight prefix).
+    try seedSteering(&app, "folded");
+    // "pending": still queued in both the channel and the mirror.
+    try app.session.editor.insert("pending");
+    try app.submitSteering();
+    try std.testing.expectEqual(@as(usize, 2), app.session.steering.items.len);
+
+    try app.pullSteering();
+    try std.testing.expectEqualStrings("pending", app.session.editor.visible());
+    try std.testing.expectEqual(@as(usize, 1), app.session.steering.items.len);
+    try std.testing.expectEqual(@as(usize, 1), app.session.steering_retained_count);
+}
+
+test "cancel restores an in-flight prefix retained by alt+up" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.gpa = gpa;
+    app.io = io;
+    app.turn_future = null;
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = anthropic_default,
+        .system = "",
+        .retry = .{},
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+    app.session.beginTurn(1);
+
+    try seedSteering(&app, "folded");
+    try app.pullSteering();
+    try std.testing.expectEqual(@as(usize, 1), app.session.steering.items.len);
+    try std.testing.expectEqual(@as(usize, 1), app.session.steering_retained_count);
+
+    try app.cancelTurn();
+    try std.testing.expectEqualStrings("folded", app.session.editor.visible());
+    try std.testing.expectEqual(@as(usize, 0), app.session.steering.items.len);
+    try std.testing.expectEqual(@as(usize, 0), app.session.steering_retained_count);
+    try std.testing.expect(app.session.mode == .prompt);
+}
+
+test "a delayed consumed event after alt+up cannot remove newer steering" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.gpa = gpa;
+    app.io = io;
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = anthropic_default,
+        .system = "",
+        .retry = .{},
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+    app.session.beginTurn(1);
+
+    try app.session.editor.insert("old");
+    try app.submitSteering();
+    const folded = try app.agent.steering.take();
+    for (folded) |message| gpa.free(message);
+    gpa.free(folded);
+
+    // The worker owns "old", but its consumed event has not reached the UI.
+    try app.pullSteering();
+    try std.testing.expectEqual(@as(usize, 1), app.session.steering.items.len);
+    try std.testing.expectEqual(@as(usize, 1), app.session.steering_retained_count);
+    try app.session.editor.insert("new");
+    try app.submitSteering();
+
+    try app.session.applyTurnEvent(&.{
+        .generation = 1,
+        .payload = .{ .steering_consumed = .{
+            .text = try gpa.dupe(u8, "old"),
+            .count = 1,
+        } },
+    });
+    try std.testing.expectEqual(@as(usize, 0), app.session.steering_retained_count);
+    try std.testing.expectEqual(@as(usize, 1), app.session.steering.items.len);
+    try std.testing.expectEqualStrings("new", app.session.steering.items[0].visible.items);
+
+    try app.pullSteering();
+    try std.testing.expectEqualStrings("new", app.session.editor.visible());
+}
+
+test "a delivery restored after alt+up recalls its retained rich drafts" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.gpa = gpa;
+    app.io = io;
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = anthropic_default,
+        .system = "",
+        .retry = .{},
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+    app.session.beginTurn(1);
+
+    try app.session.editor.insert("a");
+    try app.submitSteering();
+    try app.session.editor.insert("b");
+    try app.submitSteering();
+    var delivery = try app.agent.steering.take();
+    defer {
+        for (delivery) |message| gpa.free(message);
+        gpa.free(delivery);
+    }
+
+    // The first recall sees the batch as in flight and retains its rich drafts.
+    try app.pullSteering();
+    try std.testing.expectEqual(@as(usize, 2), app.session.steering.items.len);
+    try std.testing.expectEqual(@as(usize, 2), app.session.steering_retained_count);
+    try std.testing.expectEqualStrings("", app.session.editor.visible());
+
+    // Failed delivery returns the plain batch. A later recall selects the
+    // matching retained suffix and moves it back live.
+    app.agent.steering.restoreTaken(&delivery);
+    try app.pullSteering();
+    try std.testing.expectEqual(@as(usize, 0), app.session.steering.items.len);
+    try std.testing.expectEqual(@as(usize, 0), app.session.steering_retained_count);
+    try std.testing.expectEqualStrings("a\n\nb", app.session.editor.visible());
+}
+
+// Literal-edge canonicalization: separately submitted " a " and " b " recall and
+// rejoin as "a\n\nb", never reviving the trimmed edge spaces.
+test "recall of literal-edge-trimmed steering rejoins without edge spaces" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.gpa = gpa;
+    app.io = io;
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = anthropic_default,
+        .system = "",
+        .retry = .{},
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+    app.session.beginTurn(1);
+
+    try app.session.editor.insert(" a ");
+    try app.submitSteering();
+    try app.session.editor.insert(" b ");
+    try app.submitSteering();
+    try app.pullSteering();
+    try std.testing.expectEqualStrings("a\n\nb", app.session.editor.visible());
 }
 
 // A slash command can't run mid-turn, so Enter must leave it in the editor to
@@ -1103,6 +1562,47 @@ test "a mid-turn slash command or blank line is never queued as steering" {
     const taken = try app.agent.steering.take();
     defer gpa.free(taken);
     try std.testing.expectEqual(@as(usize, 0), taken.len);
+}
+
+test "late placeholder steering flattens before a newer key in the same batch" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.gpa = gpa;
+    app.io = io;
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = anthropic_default,
+        .system = "",
+        .retry = .{},
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+    app.input = terminal.Input.init(gpa);
+    defer app.input.deinit();
+    app.queue = std.Io.Queue(Session.UiEvent).init(&app.queue_buffer);
+    defer app.drainQueue();
+    app.turn_future = null;
+    defer app.cancelFuture(&app.turn_future);
+    app.turn_generation = 1;
+    app.session.beginTurn(1);
+
+    const payload = "line\n" ** 10 ++ "line";
+    try app.session.editor.paste(payload, true);
+    try app.submitSteering();
+    const events = [_]Session.UiEvent{
+        .{ .turn = .{ .generation = 1, .payload = .{ .turn_ended = null } } },
+        .{ .keys = try gpa.dupe(u8, "new\r") },
+    };
+    try std.testing.expect(!try app.applyBatch(&events));
+
+    try std.testing.expect(app.session.mode == .turn);
+    try std.testing.expectEqualStrings(payload, app.session.transcript.blocks()[0].user.items);
+    try std.testing.expectEqual(@as(usize, 1), app.session.steering.items.len);
+    try std.testing.expectEqualStrings("new", app.session.steering.items[0].visible.items);
 }
 
 // The lifecycle calls model cancellation and resubmission key entries from a

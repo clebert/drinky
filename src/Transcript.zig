@@ -83,6 +83,15 @@ pub fn discardMessage(self: *Transcript) void {
     self.entries.shrinkRetainingCapacity(start);
 }
 
+/// Drop every block from `entry_count` onward. Used to roll back an optimistic
+/// discrete append when the operation it represents fails to start.
+pub fn truncate(self: *Transcript, entry_count: usize) void {
+    std.debug.assert(entry_count <= self.entries.items.len);
+    self.endMessage();
+    for (self.entries.items[entry_count..]) |*entry| entry.deinit(self.gpa);
+    self.entries.shrinkRetainingCapacity(entry_count);
+}
+
 /// The blocks above the live tail, oldest first, for projection.
 pub fn blocks(self: *const Transcript) []const ui.block.Entry {
     return self.entries.items;
@@ -135,6 +144,18 @@ test "discardMessage drops the open run so a retry starts clean" {
     transcript.endMessage();
     transcript.discardMessage();
     try std.testing.expectEqual(@as(usize, 2), transcript.entries.items.len);
+}
+
+test "truncate removes optimistic tail blocks" {
+    const gpa = std.testing.allocator;
+    var transcript = Transcript.init(gpa);
+    defer transcript.deinit();
+
+    try transcript.append(.user, false, "keep");
+    try transcript.append(.user, false, "rollback");
+    transcript.truncate(1);
+    try std.testing.expectEqual(@as(usize, 1), transcript.blocks().len);
+    try std.testing.expectEqualStrings("keep", transcript.blocks()[0].user.items);
 }
 
 test "reasoning collects into a thinking block that the answer run does not extend" {

@@ -296,15 +296,15 @@ fn runWith(self: *Agent, fetch: anytype, user_text: []const u8, handler: anytype
 /// Deliver every queued steering message as one combined user message, appended
 /// to history and reported. Returns whether anything was delivered.
 fn drainSteering(self: *Agent, handler: anytype) !bool {
-    const pending = try self.steering.take();
+    var pending = try self.steering.take();
     defer {
         for (pending) |message| self.gpa.free(message);
         self.gpa.free(pending);
     }
     if (pending.len == 0) return false;
-    // A failure mid-delivery (a cancel included) returns the taken batch to the
-    // queue, for the cancel path to hand back to the editor.
-    errdefer for (pending) |message| self.steering.push(message) catch break;
+    // A failed delivery restores the whole batch ahead of messages submitted
+    // since the take, without allocating or exposing a partial batch.
+    errdefer self.steering.restoreTaken(&pending);
     const combined = try Steering.join(self.gpa, pending);
     defer self.gpa.free(combined);
     try self.appendUser(combined);
@@ -871,6 +871,45 @@ test "a cancel during steering delivery returns the taken batch to the queue" {
     try std.testing.expectEqual(@as(usize, 2), taken.len);
     try std.testing.expectEqualStrings("a", taken[0]);
     try std.testing.expectEqualStrings("b", taken[1]);
+}
+
+test "a callback failure after recall restores the batch as a queue prefix" {
+    const gpa = std.testing.allocator;
+    var agent = scriptedAgent(gpa);
+    defer agent.deinit();
+
+    const RecallCancelHandler = struct {
+        gpa: std.mem.Allocator,
+        steering: *Steering,
+
+        fn onSteering(self: *@This(), text: []const u8, count: usize) !void {
+            _ = text;
+            _ = count;
+            try self.steering.push("newer");
+            const recalled = try self.steering.take();
+            defer {
+                for (recalled) |message| self.gpa.free(message);
+                self.gpa.free(recalled);
+            }
+            try std.testing.expectEqual(@as(usize, 1), recalled.len);
+            try std.testing.expectEqualStrings("newer", recalled[0]);
+            return error.Canceled;
+        }
+    };
+    var handler: RecallCancelHandler = .{ .gpa = gpa, .steering = &agent.steering };
+
+    try agent.steering.push("a");
+    try agent.steering.push("b");
+    try std.testing.expectError(error.Canceled, agent.drainSteering(&handler));
+
+    const restored = try agent.steering.take();
+    defer {
+        for (restored) |message| gpa.free(message);
+        gpa.free(restored);
+    }
+    try std.testing.expectEqual(@as(usize, 2), restored.len);
+    try std.testing.expectEqualStrings("a", restored[0]);
+    try std.testing.expectEqualStrings("b", restored[1]);
 }
 
 const CaptureHandler = struct {

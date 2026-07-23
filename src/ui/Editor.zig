@@ -126,17 +126,15 @@ pub const Draft = struct {
 pub const Trim = enum { none, whole_prompt };
 
 /// One atom-aware text mutation, the sole path that edits the visible buffer.
-/// Replaces `[from, to)` with `bytes`; when `new_atom` is set, the inserted bytes
-/// are that atom's marker span and it takes ownership of the payload on success.
-/// (Phase 3's draft append will generalize `new_atom` to a run of atoms inserted
-/// under one reservation so it stays the only mutation primitive.)
+/// Replaces `[from, to)` with `bytes`. `new_atoms` are the atoms the inserted
+/// `bytes` carry, their ranges relative to `bytes`; each takes ownership of its
+/// payload on success. A collapsed paste passes one; appending a detached draft
+/// passes its whole run under a single reservation.
 const Splice = struct {
     from: usize,
     to: usize,
     bytes: []const u8 = "",
-    new_atom: ?NewAtom = null,
-
-    const NewAtom = struct { id: u64, payload: []u8 };
+    new_atoms: []const Draft.Atom = &.{},
 };
 
 /// A paste is large past either threshold: more than `line_count_max` logical
@@ -156,6 +154,9 @@ const marker_guard = "\u{200B}";
 const label_len_max =
     2 * marker_guard.len + "[paste #".len + 20 + " +".len + 20 + " lines]".len;
 const whitespace = " \t\r\n";
+/// Blank-line separator inserted before each draft `appendDraft` joins onto a
+/// non-empty draft, matching the queue's `join` and the whole-prompt convention.
+const draft_separator = "\n\n";
 
 pub fn init(gpa: std.mem.Allocator) Editor {
     return .{
@@ -200,6 +201,63 @@ pub fn clear(self: *Editor) void {
     self.goal_column = null;
 }
 
+/// Trim the draft's literal edges, then move it out and leave an empty draft. The
+/// trim strips whole-prompt whitespace outside every atom, so a paste payload and
+/// its label stay byte-exact and keep their ID. The paste-ID counter is preserved,
+/// so a later atom cannot reuse an ID still live in the detached draft. Caller
+/// owns the returned draft. Allocation-free, so it cannot fail.
+pub fn detachTrimmed(self: *Editor) Draft {
+    // Whole-prompt whitespace never includes a marker guard or label byte, so
+    // trimming the visible buffer stops at any edge atom and never splits one.
+    const items = self.draft.visible.items;
+    const trimmed = std.mem.trim(u8, items, whitespace);
+    const lead = @intFromPtr(trimmed.ptr) - @intFromPtr(items.ptr);
+    const trail = items.len - lead - trimmed.len;
+    self.splice(.{ .from = items.len - trail, .to = items.len }) catch unreachable;
+    self.splice(.{ .from = 0, .to = lead }) catch unreachable;
+    const draft = self.draft;
+    self.draft = .empty;
+    self.caret = 0;
+    self.scroll = 0;
+    self.goal_column = null;
+    return draft;
+}
+
+/// Reserve visible-buffer and atom-list capacity to append every draft in
+/// `drafts`, each after a blank-line separator, so a following `appendDraft` per
+/// entry cannot fail. Checked additions guard the totals.
+pub fn reserveDrafts(self: *Editor, drafts: []const Draft) !void {
+    var visible_extra: usize = 0;
+    var atoms_extra: usize = 0;
+    for (drafts) |draft| {
+        visible_extra = try std.math.add(usize, visible_extra, draft.visible.items.len);
+        visible_extra = try std.math.add(usize, visible_extra, draft_separator.len);
+        atoms_extra = try std.math.add(usize, atoms_extra, draft.atoms.items.len);
+    }
+    try self.draft.visible.ensureUnusedCapacity(self.gpa, visible_extra);
+    try self.draft.atoms.ensureUnusedCapacity(self.gpa, atoms_extra);
+}
+
+/// Move `source`'s content to the end of the draft — after a blank-line separator
+/// when the draft is already non-empty — preserving its atoms and their stable
+/// IDs (payloads move by pointer), and leave `source` empty. Infallible once
+/// `reserveDrafts` has covered it, so recall after a reservation cannot
+/// half-complete.
+pub fn appendDraft(self: *Editor, source: *Draft) void {
+    self.moveEnd();
+    if (self.draft.visible.items.len > 0) self.insert(draft_separator) catch unreachable;
+    self.splice(.{
+        .from = self.caret,
+        .to = self.caret,
+        .bytes = source.visible.items,
+        .new_atoms = source.atoms.items,
+    }) catch unreachable;
+    // The atoms' payloads moved into this draft; free only `source`'s buffers.
+    source.atoms.deinit(self.gpa);
+    source.visible.deinit(self.gpa);
+    source.* = .empty;
+}
+
 /// Accept one bracketed-paste chunk, accumulating it; on the `final` chunk,
 /// classify the whole paste and commit one operation — a small paste inserts its
 /// exact bytes as ordinary text, a large one collapses to a marker atom. An empty
@@ -237,7 +295,7 @@ fn finalizePaste(self: *Editor) !void {
         .from = self.caret,
         .to = self.caret,
         .bytes = span,
-        .new_atom = .{ .id = id, .payload = payload },
+        .new_atoms = &.{.{ .start = 0, .end = span.len, .id = id, .payload = payload }},
     });
     self.paste_id_next += 1;
 }
@@ -287,7 +345,7 @@ fn splice(self: *Editor, op: Splice) !void {
     const removed = op.to - op.from;
     const shifted_len = try std.math.add(usize, visible_list.items.len - removed, op.bytes.len);
     try visible_list.ensureTotalCapacity(self.gpa, shifted_len);
-    if (op.new_atom != null) try atoms.ensureUnusedCapacity(self.gpa, 1);
+    try atoms.ensureUnusedCapacity(self.gpa, op.new_atoms.len);
 
     // Commit; every step below is infallible.
     for (atoms.items[remove_from..remove_to]) |atom| self.gpa.free(atom.payload);
@@ -299,12 +357,16 @@ fn splice(self: *Editor, op: Splice) !void {
             atom.end = atom.end - removed + op.bytes.len;
         }
     }
-    if (op.new_atom) |new_atom| atoms.insertAssumeCapacity(atomIndexAfter(atoms.items, op.from), .{
-        .start = op.from,
-        .end = op.from + op.bytes.len,
-        .id = new_atom.id,
-        .payload = new_atom.payload,
-    });
+    var insert_index = atomIndexAfter(atoms.items, op.from);
+    for (op.new_atoms) |atom| {
+        atoms.insertAssumeCapacity(insert_index, .{
+            .start = op.from + atom.start,
+            .end = op.from + atom.end,
+            .id = atom.id,
+            .payload = atom.payload,
+        });
+        insert_index += 1;
+    }
     self.goal_column = null;
     if (self.caret >= op.to) {
         self.caret = self.caret - removed + op.bytes.len;
@@ -1231,6 +1293,146 @@ test "large-paste allocation failures leave the editor usable and leak nothing" 
         };
         try std.testing.expectEqual(@as(usize, 1), editor.draft.atoms.items.len);
     }
+}
+
+test "detachTrimmed strips literal edges but keeps a paste payload byte-exact" {
+    const gpa = std.testing.allocator;
+    var editor = Editor.init(gpa);
+    defer editor.deinit();
+    try editor.insert("  ");
+    try pasteWhole(&editor, "  " ++ eleven_lines ++ "  ");
+    try editor.insert("  ");
+    var draft = editor.detachTrimmed();
+    defer draft.deinit(gpa);
+
+    try std.testing.expectEqualStrings("", editor.visible());
+    try std.testing.expectEqual(@as(u64, 2), editor.paste_id_next);
+    try std.testing.expectEqual(@as(usize, 1), draft.atoms.items.len);
+    try std.testing.expectEqualStrings("\u{200B}[paste #1 +11 lines]\u{200B}", draft.visible.items);
+    const payload = try draft.expanded(gpa, .none);
+    defer gpa.free(payload);
+    try std.testing.expectEqualStrings("  " ++ eleven_lines ++ "  ", payload);
+}
+
+test "detachTrimmed on literal text trims like the whole-prompt rule" {
+    const gpa = std.testing.allocator;
+    var editor = Editor.init(gpa);
+    defer editor.deinit();
+    try editor.insert("  hello world  ");
+    var draft = editor.detachTrimmed();
+    defer draft.deinit(gpa);
+    try std.testing.expectEqualStrings("hello world", draft.visible.items);
+    try std.testing.expectEqualStrings("", editor.visible());
+}
+
+test "appendDraft joins a detached draft after in-progress text, atom live" {
+    const gpa = std.testing.allocator;
+    var editor = Editor.init(gpa);
+    defer editor.deinit();
+    try pasteWhole(&editor, eleven_lines); // #1
+    var recalled = editor.detachTrimmed();
+    defer recalled.deinit(gpa);
+
+    try editor.insert("draft");
+    try editor.reserveDrafts(&.{recalled});
+    editor.appendDraft(&recalled);
+    try std.testing.expectEqualStrings(
+        "draft\n\n\u{200B}[paste #1 +11 lines]\u{200B}",
+        editor.visible(),
+    );
+    try std.testing.expectEqual(@as(usize, 1), editor.draft.atoms.items.len);
+    try std.testing.expectEqual(@as(u64, 1), editor.draft.atoms.items[0].id);
+    try expectExpanded(&editor, .none, "draft\n\n" ++ eleven_lines);
+}
+
+test "appendDraft onto an empty draft adds no separator" {
+    const gpa = std.testing.allocator;
+    var editor = Editor.init(gpa);
+    defer editor.deinit();
+    try pasteWhole(&editor, eleven_lines);
+    var recalled = editor.detachTrimmed();
+    defer recalled.deinit(gpa);
+
+    try editor.reserveDrafts(&.{recalled});
+    editor.appendDraft(&recalled);
+    try std.testing.expectEqualStrings("\u{200B}[paste #1 +11 lines]\u{200B}", editor.visible());
+}
+
+test "paste IDs stay unique across detach and append with no reuse" {
+    const gpa = std.testing.allocator;
+    var editor = Editor.init(gpa);
+    defer editor.deinit();
+    try pasteWhole(&editor, eleven_lines);
+    var first = editor.detachTrimmed();
+    defer first.deinit(gpa);
+    try editor.paste("z" ** 1001, true);
+    var second = editor.detachTrimmed();
+    defer second.deinit(gpa);
+
+    try editor.reserveDrafts(&.{ first, second });
+    editor.appendDraft(&first);
+    editor.appendDraft(&second);
+    try std.testing.expectEqual(@as(u64, 1), editor.draft.atoms.items[0].id);
+    try std.testing.expectEqual(@as(u64, 2), editor.draft.atoms.items[1].id);
+    try pasteWhole(&editor, eleven_lines);
+    try std.testing.expectEqual(@as(usize, 3), editor.draft.atoms.items.len);
+    try std.testing.expectEqual(@as(u64, 3), editor.draft.atoms.items[2].id);
+}
+
+test "reserveDrafts covers appendDraft against allocation failure and leaks nothing" {
+    var fail_index: usize = 0;
+    while (fail_index < 30) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(
+            std.testing.allocator,
+            .{ .fail_index = fail_index },
+        );
+        const gpa = failing.allocator();
+        var editor = Editor.init(gpa);
+        defer editor.deinit();
+        editor.insert("keep") catch continue;
+
+        var source = Editor.init(gpa);
+        source.paste(eleven_lines, true) catch {
+            source.deinit();
+            continue;
+        };
+        var recalled = source.detachTrimmed();
+        source.deinit();
+
+        editor.reserveDrafts(&.{recalled}) catch {
+            recalled.deinit(gpa);
+            // A failed reservation leaves the prior draft intact.
+            try std.testing.expectEqualStrings("keep", editor.visible());
+            continue;
+        };
+        // Reserved, so the move cannot fail (an internal allocation would panic).
+        editor.appendDraft(&recalled);
+        try std.testing.expectEqual(@as(usize, 1), editor.draft.atoms.items.len);
+    }
+}
+
+test "reserveDrafts covers several drafts" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const gpa = failing.allocator();
+    var editor = Editor.init(gpa);
+    defer editor.deinit();
+    try editor.insert("keep");
+
+    var source = Editor.init(gpa);
+    defer source.deinit();
+    try source.paste(eleven_lines, true);
+    var first = source.detachTrimmed();
+    defer first.deinit(gpa);
+    try source.paste(eleven_lines, true);
+    var second = source.detachTrimmed();
+    defer second.deinit(gpa);
+
+    try editor.reserveDrafts(&.{ first, second });
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+    editor.appendDraft(&first);
+    editor.appendDraft(&second);
+    try std.testing.expectEqual(@as(usize, 2), editor.draft.atoms.items.len);
 }
 
 test render {

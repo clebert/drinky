@@ -44,11 +44,18 @@ effort_shown: ai.llm.Effort,
 /// When false the status line shows a signed-out indicator and the model/effort
 /// snapshots are stale placeholders.
 signed_in: bool,
-/// Steering messages queued while a turn runs, shown as the `Steering:` tail
-/// rows. The display mirror of the agent's channel: `App` adds here and to the
-/// channel together, and a `.steering_consumed` event drops the front as the
-/// worker takes them. Each string owned.
-steering: std.ArrayList([]u8),
+/// Steering submitted during a turn, in chronological order, as detached editor
+/// drafts so recall can restore live placeholder markers. The plain queue is a
+/// suffix of this list; a consumed event drops from the front. Each draft owned.
+steering: std.ArrayList(ui.Editor.Draft),
+/// Prefix known to be in flight because an Alt+Up queue take did not return it.
+/// Hidden from the compact queue view, but retained for consumption, failed
+/// delivery, and cancellation. Always at most `steering.items.len`.
+steering_retained_count: usize,
+/// Borrowed compact `Steering:` rows — each non-retained draft's collapsed
+/// visible text — rebuilt each paint so the tail gets a `[]const []const u8`
+/// without a per-repaint allocation.
+steering_view: std.ArrayList([]const u8),
 
 const Mode = union(enum) {
     prompt,
@@ -167,6 +174,8 @@ pub fn init(
         .effort_shown = effort,
         .signed_in = true,
         .steering = .empty,
+        .steering_retained_count = 0,
+        .steering_view = .empty,
     };
 }
 
@@ -174,6 +183,7 @@ pub fn deinit(self: *Session) void {
     self.deinitMode();
     self.clearSteering();
     self.steering.deinit(self.gpa);
+    self.steering_view.deinit(self.gpa);
     self.transcript.deinit();
     self.view.deinit();
     self.editor.deinit();
@@ -208,10 +218,12 @@ pub fn applyTurnEvent(self: *Session, event: *const TurnEvent) !void {
         .stream_reset => self.transcript.discardMessage(),
         .steering_consumed => |consumed| {
             try self.transcript.append(.user, false, consumed.text);
-            var removed: usize = 0;
-            while (removed < consumed.count and self.steering.items.len > 0) : (removed += 1) {
-                self.gpa.free(self.steering.orderedRemove(0));
+            var removed_count: usize = 0;
+            while (removed_count < consumed.count and self.steering.items.len > 0) : (removed_count += 1) {
+                var draft = self.steering.orderedRemove(0);
+                draft.deinit(self.gpa);
             }
+            self.steering_retained_count = self.steering_retained_count -| removed_count;
         },
         .turn_ended => |maybe_text| {
             if (maybe_text) |text| try self.transcript.append(.feedback, true, text);
@@ -285,20 +297,76 @@ pub fn cancelPicker(self: *Session) !void {
     try self.transcript.append(.feedback, false, "cancelled");
 }
 
-/// Queue a steering message for display while a turn runs. `App` pushes the same
-/// text onto the agent's channel so the worker can take it.
-pub fn queueSteering(self: *Session, text: []const u8) !void {
-    const copy = try self.gpa.dupe(u8, text);
-    errdefer self.gpa.free(copy);
-    try self.steering.append(self.gpa, copy);
+/// Reserve capacity for one more queued steering draft, so `App.submitSteering`'s
+/// channel push becomes the only fallible step before the draft moves in — once
+/// reserved, `commitSteeringDraft` cannot fail, so the worker never owns a message
+/// the mirror lacks a recovery draft for.
+pub fn reserveSteering(self: *Session) !void {
+    try self.steering.ensureUnusedCapacity(self.gpa, 1);
+}
+
+/// Move a detached steering draft into the mirror; infallible after
+/// `reserveSteering`. Takes ownership and leaves `draft` empty.
+pub fn commitSteeringDraft(self: *Session, draft: *ui.Editor.Draft) void {
+    self.steering.appendAssumeCapacity(draft.*);
+    draft.* = .empty;
     self.dirty = true;
 }
 
-/// Drop every queued steering message.
-pub fn clearSteering(self: *Session) void {
-    for (self.steering.items) |message| self.gpa.free(message);
-    self.steering.clearRetainingCapacity();
+/// Preflight enough editor capacity to recall any queue suffix. The mirror is
+/// consumer-owned and remains stable until `recallSteering`.
+pub fn reserveSteeringRecall(self: *Session) !void {
+    try self.editor.reserveDrafts(self.steering.items);
+}
+
+/// Recall the queue-length suffix into the editor in submission order. The
+/// remaining prefix is in flight and stays hidden until consumed or restored.
+/// Infallible after `reserveSteeringRecall`.
+pub fn recallSteering(self: *Session, pending_count: usize) void {
+    std.debug.assert(pending_count <= self.steering.items.len);
+    const pending_start = self.steering.items.len - pending_count;
+    for (self.steering.items[pending_start..]) |*draft| self.editor.appendDraft(draft);
+    self.steering.shrinkRetainingCapacity(pending_start);
+    self.steering_retained_count = self.steering.items.len;
     self.dirty = true;
+}
+
+/// Preflight restoring every steering draft during cancellation.
+pub fn reserveSteeringRestore(self: *Session) !void {
+    try self.editor.reserveDrafts(self.steering.items);
+}
+
+/// Restore every steering draft in submission order. Infallible after
+/// `reserveSteeringRestore`.
+pub fn restoreSteering(self: *Session) void {
+    for (self.steering.items) |*draft| self.editor.appendDraft(draft);
+    self.steering.clearRetainingCapacity();
+    self.steering_retained_count = 0;
+    self.dirty = true;
+}
+
+/// Whether any rich steering record remains live or retained in flight.
+pub fn hasSteering(self: *const Session) bool {
+    return self.steering.items.len > 0;
+}
+
+/// Drop every steering draft, freeing its atoms.
+pub fn clearSteering(self: *Session) void {
+    for (self.steering.items) |*draft| draft.deinit(self.gpa);
+    self.steering.clearRetainingCapacity();
+    self.steering_retained_count = 0;
+    self.dirty = true;
+}
+
+/// Borrowed compact `Steering:` rows: each non-retained draft's collapsed visible
+/// text, rebuilt each paint without a per-frame allocation. Borrows stay valid
+/// only until the mirror next mutates.
+fn steeringView(self: *Session) ![]const []const u8 {
+    std.debug.assert(self.steering_retained_count <= self.steering.items.len);
+    self.steering_view.clearRetainingCapacity();
+    for (self.steering.items[self.steering_retained_count..]) |draft|
+        try self.steering_view.append(self.gpa, draft.visible.items);
+    return self.steering_view.items;
 }
 
 /// Close any open model run, then enter turn mode with a fresh spinner and no
@@ -319,8 +387,8 @@ pub fn beginTurn(self: *Session, generation: u64) void {
 /// caller's.
 pub fn abortTurn(self: *Session) !void {
     self.endTurn();
-    try self.transcript.append(.feedback, false, "cancelled");
     self.dirty = true;
+    try self.transcript.append(.feedback, false, "cancelled");
 }
 
 /// Free the finished turn's tool state and return to waiting for input.
@@ -355,7 +423,7 @@ pub fn paint(self: *Session, size: terminal.View.Size) !void {
             break :turn .{ .turn = .{
                 .tools = try turn.boxes(self.gpa),
                 .spinner = turn.spinner_frame,
-                .steering = self.steering.items,
+                .steering = try self.steeringView(),
                 .editor = &self.editor,
             } };
         },
@@ -436,6 +504,16 @@ const test_model = ai.models.get(.anthropic, "claude-sonnet-4-6") orelse
 
 fn applyEvent(session: *Session, generation: u64, payload: TurnEvent.Payload) !void {
     return session.applyTurnEvent(&.{ .generation = generation, .payload = payload });
+}
+
+// Queue a plain-text (atom-free) steering draft, as a submitted literal line does.
+fn queueSteeringText(session: *Session, text: []const u8) !void {
+    var editor = ui.Editor.init(session.gpa);
+    defer editor.deinit();
+    try editor.insert(text);
+    try session.reserveSteering();
+    var draft = editor.detachTrimmed();
+    session.commitSteeringDraft(&draft);
 }
 
 // Mirrors the read loop's inner pipeline without a tty: one read chunk carries
@@ -676,6 +754,26 @@ test "a cancelled turn's stale output and completion cannot affect its successor
     try std.testing.expectEqualStrings("turn B", session.transcript.blocks()[2].model.items);
 }
 
+test "committing a steering draft empties the source" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    defer session.deinit();
+
+    var editor = ui.Editor.init(gpa);
+    defer editor.deinit();
+    try editor.insert("move me");
+    var draft = editor.detachTrimmed();
+    defer draft.deinit(gpa);
+
+    try session.reserveSteering();
+    session.commitSteeringDraft(&draft);
+    try std.testing.expectEqual(@as(usize, 0), draft.visible.items.len);
+    try std.testing.expectEqual(@as(usize, 0), draft.atoms.items.len);
+    try std.testing.expectEqualStrings("move me", session.steering.items[0].visible.items);
+}
+
 // Queued steering shows in the tail; a consumed event moves the combined text
 // into the transcript as one user block and drops the queued rows.
 test "steering queues, then a consumed event shows it and clears the queue" {
@@ -686,10 +784,10 @@ test "steering queues, then a consumed event shows it and clears the queue" {
     defer session.deinit();
     session.beginTurn(1);
 
-    try session.queueSteering("fix it");
-    try session.queueSteering("and test");
+    try queueSteeringText(&session, "fix it");
+    try queueSteeringText(&session, "and test");
     try std.testing.expectEqual(@as(usize, 2), session.steering.items.len);
-    try std.testing.expectEqualStrings("fix it", session.steering.items[0]);
+    try std.testing.expectEqualStrings("fix it", session.steering.items[0].visible.items);
 
     try applyEvent(&session, 1, .{ .steering_consumed = .{
         .text = try gpa.dupe(u8, "fix it\n\nand test"),
@@ -701,6 +799,28 @@ test "steering queues, then a consumed event shows it and clears the queue" {
         "fix it\n\nand test",
         session.transcript.blocks()[0].user.items,
     );
+}
+
+// A steered large paste shows as its collapsed marker in the compact queue view,
+// never its payload; the payload rides along in the rich draft for recall.
+test "the steering view shows a paste collapsed, not its payload" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    defer session.deinit();
+    session.beginTurn(1);
+
+    const payload = "secret line\n" ** 15; // 16 logical lines: collapses to a marker
+    try session.editor.paste(payload, true);
+    try session.reserveSteering();
+    var draft = session.editor.detachTrimmed();
+    session.commitSteeringDraft(&draft);
+
+    try session.paint(.{ .columns = 80, .rows = 24 });
+    const painted = out.written();
+    try std.testing.expect(std.mem.indexOf(u8, painted, "[paste #1 +16 lines]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "secret line") == null);
 }
 
 // Regression: while a turn animates, a tick must repaint even when the model is

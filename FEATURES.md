@@ -352,10 +352,12 @@ commit history, `BACKLOG.md` (planned work), and `docs/`.
 - Ctrl+C clears the editor, or quits on a second press in quick succession; Ctrl+D quits when the
   editor is empty.
 - During a turn, Esc or Ctrl+C cancels it and drops the partial turn, returning any pending steering
-  to the editor — including a message the turn consumed so late that the cancel rolled it back.
-- The editor stays live during a turn: Enter queues a steering message, Alt+Up recalls the whole
-  queue into the editor (blank-line-joined, after any in-progress text), and any steering still
-  queued when a turn ends starts the next turn. Slash commands are disabled during a turn.
+  to the editor as live placeholder drafts — a steered paste comes back as its collapsed marker, not
+  expanded text — including a message the turn consumed so late that the cancel rolled it back.
+- The editor stays live during a turn: Enter queues a steering message, Alt+Up recalls the pending
+  queue into the editor as live drafts (blank-line-joined after any in-progress text, each queued
+  paste restored as its placeholder marker with its exact payload), and any steering still queued
+  when a turn ends starts the next turn. Slash commands are disabled during a turn.
 - Graceful shutdown cancels all background work and drains buffered events before restoring the
   terminal.
 
@@ -391,18 +393,21 @@ commit history, `BACKLOG.md` (planned work), and `docs/`.
   the last cell.
 - Internally scrolled and windowed to keep the caret in view, with "↑ N more" / "↓ N more"
   hidden-row labels.
-- A bracketed paste of more than ten logical lines or more than a thousand bytes collapses to a
-  compact `[paste #N +L lines]` (or `[paste #N B bytes]`) marker; a smaller paste inserts literally.
-  The exact payload bytes are kept verbatim with no newline, tab, or control normalization, and
-  paste IDs are monotonic and never reused for the editor's lifetime.
+- A bracketed paste of more than ten LF-delimited logical lines (one plus its LF-byte count) or more
+  than a thousand raw bytes collapses to a compact `[paste #N +L lines]` or `[paste #N B bytes]`
+  marker; the line form wins when both thresholds are crossed, while a smaller paste inserts
+  literally. The exact payload bytes are kept verbatim with no newline, tab, or control
+  normalization, and paste IDs are monotonic and never reused for the editor's lifetime.
 - Each marker is one atomic editing unit: left/right cross it in a single step, backspace deletes
   the whole marker, and zero-width guards keep both edges on grapheme boundaries so adjacent
-  combining text cannot fuse into it.
+  combining text cannot fuse into it. Marker-looking text typed by the user remains ordinary text.
 - A marker label wider than the terminal wraps across rows like ordinary text — unlike a grapheme
   cluster, which never splits — while remaining a single atom for movement and deletion.
-- Separate visible and expanded views: rendering and compact rows show the marker labels, while
-  submission expands every marker to its exact payload, so a marker label or edge guard never
-  reaches a command, the transcript, or a provider request.
+- Separate visible and expanded views: rendering and compact rows show marker labels, while every
+  semantic submission expands markers before whole-prompt trimming, so a label or edge guard never
+  reaches blank checks, commands, the transcript, history, or a provider request. Steering delivers
+  that expanded-and-trimmed text, while its rich recall draft trims only surrounding literal text
+  and retains whitespace inside an edge paste.
 
 ### Picker
 
