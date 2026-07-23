@@ -74,9 +74,12 @@ commit history, `BACKLOG.md` (planned work), and `docs/`.
 - Incremental parsing that retains unconsumed bytes across reads, so a key sequence split across
   chunks still decodes.
 - Decodes printable characters, ctrl-letters, Enter, Shift+Enter (newline), Escape, Backspace,
-  arrows, Home, End, and bracketed-paste payloads. An unterminated paste flushes as bounded
-  partial paste payloads (1 MiB) instead of buffering without bound, and later bytes stay paste
-  payload until the terminator arrives. An escape sequence whose final byte never arrives is
+  arrows, Home, End, and bracketed-paste payloads. Each paste chunk is marked with whether it
+  completes the bracketed paste, so one logical paste stays a single unit even when split across
+  reads or a flush. An unterminated paste flushes as bounded partial paste payloads (1 MiB) instead
+  of buffering without bound — retaining any partial terminator so it never splits across chunks —
+  and later bytes stay paste payload until the terminator arrives. An escape sequence whose final
+  byte never arrives is
   likewise abandoned as unhandled after 64 retained bytes, so it cannot wedge input.
 - Decodes both encodings the terminal produces: the keys the Kitty protocol reports as unambiguous
   escape sequences (Escape, Shift+Enter, and ctrl-combinations, with modifiers), and the traditional
@@ -380,12 +383,26 @@ commit history, `BACKLOG.md` (planned work), and `docs/`.
   those boundaries.
 - Horizontal movement by cluster (left/right) and to line start/end (home/end).
 - Vertical movement (up/down) by wrapped row with a sticky goal column preserved across shorter rows
-  and reset on any horizontal move or edit.
+  and reset on any horizontal move or edit. The goal column is logical: a paste marker counts as one
+  cell however wide its label renders, so up/down never enter a marker and a marker at a line start
+  never traps the caret at column zero.
 - Up on the first row jumps to the start, down on the last row jumps to the end.
 - A caret at the end of a full-width line wraps onto an empty trailing row rather than clamping onto
   the last cell.
 - Internally scrolled and windowed to keep the caret in view, with "↑ N more" / "↓ N more"
   hidden-row labels.
+- A bracketed paste of more than ten logical lines or more than a thousand bytes collapses to a
+  compact `[paste #N +L lines]` (or `[paste #N B bytes]`) marker; a smaller paste inserts literally.
+  The exact payload bytes are kept verbatim with no newline, tab, or control normalization, and
+  paste IDs are monotonic and never reused for the editor's lifetime.
+- Each marker is one atomic editing unit: left/right cross it in a single step, backspace deletes
+  the whole marker, and zero-width guards keep both edges on grapheme boundaries so adjacent
+  combining text cannot fuse into it.
+- A marker label wider than the terminal wraps across rows like ordinary text — unlike a grapheme
+  cluster, which never splits — while remaining a single atom for movement and deletion.
+- Separate visible and expanded views: rendering and compact rows show the marker labels, while
+  submission expands every marker to its exact payload, so a marker label or edge guard never
+  reaches a command, the transcript, or a provider request.
 
 ### Picker
 
