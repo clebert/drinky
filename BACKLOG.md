@@ -167,7 +167,10 @@ Extension seams referenced here:
       history, and restore it verbatim so resuming soon enough with the same OpenAI account and
       unchanged prefix can reuse the provider's cache. Rotate it only when intentionally starting a
       fresh conversation (including `/handoff`); an older save with no key gets a newly generated
-      one. A saved provider/billing-product enum is not sufficient provenance for opaque reasoning:
+      one. The per-turn cost ledger (**Per-turn / `/session` breakdown**) is likewise
+      conversation-owned metadata that must be persisted, or a resumed conversation resets its cost
+      gauge to zero: history items carry no token or cost data and cannot reconstruct it. A saved
+      provider/billing-product enum is not sufficient provenance for opaque reasoning:
       persist a durable, non-secret provider-principal identity and replay such blocks only when it
       matches, otherwise drop them. This is separate from the machine-local last-account/model
       preference above. Before implementation, define checkpoint timing, the storage location and
@@ -191,9 +194,22 @@ Extension seams referenced here:
       bounded per-model breakdown (cost, savings, tokens per model) — a plain value type that still
       copies cleanly across the UI channel. The status line is unchanged; the breakdown backs the
       `/session` summary below.
-- [ ] **Per-turn / `/session` breakdown.** Accounting is cumulative plus last-request only. Keep a
-      per-turn record and add a `/session` summary (tokens, cost, cache savings, split by model).
-      Re-adds the cumulative token totals recently trimmed from `Agent.Stats`.
+- [ ] **Per-turn / `/session` breakdown.** Accounting is cumulative plus last-request only
+      (`Agent.Stats`). Add a per-turn ledger — one record per request carrying its model, usage,
+      cost, cache savings, disposition (completed/cancelled/failed), and the history span it
+      produced (`history_base`/`history_end`, already on the turn `Receipt`) — and a `/session`
+      summary (tokens, cost, cache savings, split by model) that folds over it. Re-adds the
+      cumulative token totals recently trimmed from `Agent.Stats`, and keeps that running
+      accumulator as an O(1) cache over the ledger. The ledger, not the replay `llm.Item`s, is the
+      home for cost: billing is per-request (one terminal usage covers a whole reply's several
+      items, dominated by re-sending the growing prefix each turn), history items are pure wire
+      content that must serialize byte-stably for prompt-cache hits, and a cancelled turn's partial
+      reply is rolled back out of history — so a per-item cost would be an arbitrary split and a
+      cancelled-turn accounting item would be non-replayable. Keyed by the receipt, the ledger
+      records cancelled and failed turns (with the partial usage the cancel fold books into
+      `Agent.Stats`) as their own entries, so cost stays auditable and re-summable after `/handoff`
+      compaction trims history. This per-turn record is also the persistence unit for **Save and
+      resume conversations** below — history alone cannot reconstruct cost.
 - [ ] **Runtime model catalog.** `models.zig` is a compiled-in table namespaced by provider
       (`get(kind, name)`) carrying price, context window, max output tokens, and a reasoning-effort
       map per model, with no fallback — an unknown model is unsupported. Load an optional
@@ -500,15 +516,16 @@ Extension seams referenced here:
       and it belongs here: it is the same question as which tail to rewind, and doing it without the
       rewind would only display more content the rewind then removes. Composes with **Define editor
       composition on cancel** (where the returned prompt goes).
-- [ ] **Account cancelled turns' token cost.** `recordUsage` fires only on the stream's `.stop`
-      event, which a mid-stream cancel never reaches, so a cancelled turn's tokens go unrecorded in
-      `Agent.Stats` — yet the provider still bills the full input prompt (and the output streamed so
-      far). The session cost gauge therefore under-counts exactly the turns a user cancels most, and
-      committing the partial to history (see **Commit partial turns to history on cancel**) without
-      its cost widens that gap. Completed rounds are fine (they hit `.stop`); the hole is the
-      in-flight request. `message_start`/`message_delta` already carry incremental usage the retry
-      path ignores — capture it at cancel and fold it into `Agent.Stats` so the gauge reflects money
-      actually spent.
+- [x] **Account cancelled turns' token cost.** A mid-stream cancel never reaches the terminal
+      `.stop` that records usage, so a cancelled turn's tokens once went uncounted even though the
+      provider still bills the input prompt and the output streamed so far. `Agent.fetchReply` folds
+      the interrupted stream's usage-so-far (accumulated from `message_start`/`message_delta`,
+      exposed by each transport's `usageSoFar`) into `Agent.Stats` on the cancel exit, priced
+      against the request's model like any terminal attempt — so the session cost gauge counts money
+      actually spent and no longer under-counts the turns users cancel most. A cancel before the
+      stream reports any usage records nothing, leaving the last-request gauge intact. Completed
+      rounds are unaffected (they hit `.stop`); a transport loss that is retried stays excluded,
+      since the retry re-bills and re-records at its own terminal event.
 - [ ] **Define editor composition on cancel.** After a cancel the editor can receive up to four
       writers: text the user was already typing, the atom-carrying rich steering drafts that
       `cancelTurn` recalls today, the original prompt returned by **Show only committed content in

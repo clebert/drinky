@@ -506,12 +506,31 @@ fn fetchReply(
             try presentation(&turn.presentation_closed, handler.onError(stream.errorText()));
             return error.ApiError;
         }
-        const reply = self.readReplyWith(&model, &stream, turn, handler) catch |err| switch (err) {
+        var usage_recorded = false;
+        const reply = self.readReplyWith(
+            &model,
+            &stream,
+            turn,
+            &usage_recorded,
+            handler,
+        ) catch |err| switch (err) {
             error.ApiError => {
                 try presentation(&turn.presentation_closed, handler.onError(stream.errorText()));
                 return error.ApiError;
             },
-            error.Canceled => return err,
+            error.Canceled => {
+                // A cancel that interrupts the read before its terminal `.stop`
+                // leaves the streamed usage unbooked, yet the provider still billed
+                // the prompt and the output so far. Fold it in — unless the stop
+                // usage was already recorded (a cancel during the usage callback),
+                // which would double-count — so the cost gauge stays honest.
+                if (!usage_recorded) {
+                    const usage = stream.usageSoFar();
+                    if (!std.meta.eql(usage, llm.Usage{}))
+                        self.recordUsage(&model, &usage);
+                }
+                return err;
+            },
             else => {
                 if (retryableError(err) and attempt < self.retry.attempts_max) {
                     try self.backoff(.{ .attempt = attempt });
@@ -608,7 +627,8 @@ fn readReply(
     handler: anytype,
 ) ![]const llm.Item {
     var turn: TurnState = .{ .base = self.items.items.len, .checkpoint = self.items.items.len };
-    return self.readReplyWith(model, stream, &turn, handler);
+    var usage_recorded = false;
+    return self.readReplyWith(model, stream, &turn, &usage_recorded, handler);
 }
 
 fn readReplyWith(
@@ -616,6 +636,7 @@ fn readReplyWith(
     model: *const models.Model,
     stream: anytype,
     turn: *TurnState,
+    usage_recorded: *bool,
     handler: anytype,
 ) ![]const llm.Item {
     const gpa = self.gpa;
@@ -648,6 +669,7 @@ fn readReplyWith(
     // Terminal usage is billable even when replay validation rejects the reply
     // and the request is retried.
     self.recordUsage(model, &stop.usage);
+    usage_recorded.* = true;
     try presentation(presentation_closed, handler.onUsage(self.stats));
 
     if (stop.rejection) |rejection| return switch (rejection) {
@@ -982,6 +1004,7 @@ const ScriptedStream = struct {
     events: []const llm.Event,
     index: usize = 0,
     terminal_error: ?anyerror = null,
+    usage_so_far: llm.Usage = .{},
     head_ok: bool = true,
     head_retryable: bool = false,
     retry_after_ms: ?u64 = null,
@@ -1014,6 +1037,10 @@ const ScriptedStream = struct {
 
     fn errorText(self: *const ScriptedStream) []const u8 {
         return self.error_text;
+    }
+
+    fn usageSoFar(self: *const ScriptedStream) llm.Usage {
+        return self.usage_so_far;
     }
 };
 
@@ -1206,6 +1233,7 @@ const CaptureHandler = struct {
     tool_result_count: usize = 0,
     stream_reset_count: usize = 0,
     steer_count: usize = 0,
+    fail_usage: bool = false,
 
     fn deinit(self: *CaptureHandler) void {
         self.thinking.deinit(self.gpa);
@@ -1237,6 +1265,7 @@ const CaptureHandler = struct {
     fn onUsage(self: *CaptureHandler, stats: Stats) !void {
         _ = stats;
         self.usage_count += 1;
+        if (self.fail_usage) return error.Canceled;
     }
 
     fn onToolStart(self: *CaptureHandler, name: []const u8, input_json: []const u8) !void {
@@ -3001,6 +3030,72 @@ test "cancellation before the first reply returns exactly to the turn base" {
     try std.testing.expect(std.meta.activeTag(outcome.disposition) == .canceled);
     try std.testing.expectEqual(@as(usize, 0), agent.items.items.len);
     try std.testing.expectEqual(outcome.receipt.history_base, outcome.receipt.history_end);
+}
+
+test "a cancelled request's partial usage is folded into the cost stats" {
+    const gpa = std.testing.allocator;
+    var agent = scriptedAgent(gpa);
+    defer agent.deinit();
+    var handler: CaptureHandler = .{ .gpa = gpa };
+    defer handler.deinit();
+
+    // The read is cancelled before any terminal `.stop`, but the stream had
+    // already accumulated the prompt's usage — which the provider bills.
+    var fetch: ScriptedFetch = .{ .attempts = &.{.{ .stream = .{
+        .events = &.{},
+        .terminal_error = error.Canceled,
+        .usage_so_far = .{ .input = 1_000_000, .cache_read = 200_000 },
+    } }} };
+    const outcome = agent.runTurnWith(&fetch, fake_tools, "go", &handler);
+    try std.testing.expect(std.meta.activeTag(outcome.disposition) == .canceled);
+    // The billed prompt is recorded, and the last-request gauge reflects it.
+    try std.testing.expect(agent.stats.cost > 0);
+    try std.testing.expectEqual(@as(u64, 1_000_000), agent.stats.last.input);
+    try std.testing.expectEqual(@as(u64, 200_000), agent.stats.last.cache_read);
+}
+
+test "a cancel before any usage frame leaves the last-request gauge intact" {
+    const gpa = std.testing.allocator;
+    var agent = scriptedAgent(gpa);
+    defer agent.deinit();
+    var handler: CaptureHandler = .{ .gpa = gpa };
+    defer handler.deinit();
+
+    // A prior request's usage backs the last-request gauge.
+    agent.stats.last = .{ .input = 42 };
+    // A cancel before the stream reports any usage must not fold a zero reading
+    // in and reset that gauge.
+    var fetch: ScriptedFetch = .{
+        .attempts = &.{.{ .stream = .{ .events = &.{}, .terminal_error = error.Canceled } }},
+    };
+    const outcome = agent.runTurnWith(&fetch, fake_tools, "go", &handler);
+    try std.testing.expect(std.meta.activeTag(outcome.disposition) == .canceled);
+    try std.testing.expectEqual(@as(u64, 42), agent.stats.last.input);
+}
+
+test "a cancel during the post-stop usage callback books terminal usage only once" {
+    const gpa = std.testing.allocator;
+    var agent = scriptedAgent(gpa);
+    defer agent.deinit();
+    var handler: CaptureHandler = .{ .gpa = gpa, .fail_usage = true };
+    defer handler.deinit();
+
+    // The stream reaches its terminal `.stop` — booking usage once — but the
+    // cancel lands during the usage callback that follows it. The partial fold
+    // must not re-book the same usage, even though usage-so-far now equals it.
+    const events = [_]llm.Event{
+        .{ .item = .{ .message = "hi" } },
+        .{ .stop = .{ .usage = .{ .input = 1000 } } },
+    };
+    var fetch: ScriptedFetch = .{ .attempts = &.{.{ .stream = .{
+        .events = &events,
+        .usage_so_far = .{ .input = 1000 },
+    } }} };
+    const outcome = agent.runTurnWith(&fetch, fake_tools, "go", &handler);
+    try std.testing.expect(std.meta.activeTag(outcome.disposition) == .canceled);
+    // Recorded exactly once: opus prices 1M input at $5, so 1000 input is $0.005.
+    try std.testing.expectApproxEqAbs(@as(f64, 0.005), agent.stats.cost, 1e-9);
+    try std.testing.expectEqual(@as(u64, 1000), agent.stats.last.input);
 }
 
 test "a no-tool reply is retained when a later steered reply is cancelled" {

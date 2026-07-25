@@ -185,8 +185,11 @@ commit history, `BACKLOG.md` (planned work), and `docs/`.
 - Accumulates cost and cache savings, including terminal usage from billed attempts whose reply is
   rejected by replay validation; prices each terminal attempt against the model that produced it so
   a mid-session model switch stays correctly priced, keeps a bounded per-model breakdown (cumulative
-  totals stay exact past the bound), and records the last terminal attempt's usage. Usage reported
-  only before cancellation or transport loss reaches a terminal event is excluded from accounting.
+  totals stay exact past the bound), and records the last request's usage. A user cancel folds in
+  the interrupted request's usage so far — the prompt and any output the provider already billed —
+  so cancelling a turn still counts its cost and updates the last-request gauge, unless the request
+  was cancelled before reporting any usage. Usage from a transport loss that never reaches a terminal
+  event and is retried is excluded from accounting.
 
 ### Conversation model
 
