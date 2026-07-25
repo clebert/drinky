@@ -468,22 +468,6 @@ Extension seams referenced here:
       **Commit partial turns to history on cancel** lands, cancelled turns consume context where
       they previously vanished, so pressure builds faster than the old drop-on-cancel behavior
       implied.
-- [ ] **Offer partial reasoning/text as a citation on cancel.** A common workflow is to watch the
-      model's streamed reasoning, spot a misunderstanding early, and cancel to correct it — often
-      _instead_ of steering, precisely to cut off a long inner monologue once the user sees they can
-      help. But a cancel mid-stream lands before `readReply` appends the assistant message, so the
-      reasoning the user just read is never in history and the model can't see its own aborted train
-      of thought. When a turn is cancelled while the model was mid-generation (partial thinking or
-      text streamed but no `stop`), detect it and offer to fold that partial output into the next
-      prompt as a quoted citation, so the user can hand the model back its own reasoning and comment
-      on it ("you were about to X, but …"). The partial text already lives in the display transcript
-      (streamed via `onThinking`/`onText`) and a cancel keeps it there today (`abortTurn` ends the
-      run via `endMessage` without discarding it — unlike the retry path's `discardMessage`). So the
-      capture is only needed once **Show only committed content in the transcript** starts rewinding
-      that tail: snapshot the partial there before removing it, and present a prompt-line option to
-      include it. Open questions: the affordance (a prompt on cancel, a key, or a command), how much
-      to include (thinking vs. answer, truncation), and a citation format that reads well back to
-      the model.
 - [ ] **Show only committed content in the transcript.** `App.submit` appends the user's message to
       the display transcript immediately and synchronously, and the streamed reply renders into it
       as it arrives. History is now honest on its own: `Agent.runTurn` retains every completed round
@@ -526,17 +510,20 @@ Extension seams referenced here:
       stream reports any usage records nothing, leaving the last-request gauge intact. Completed
       rounds are unaffected (they hit `.stop`); a transport loss that is retried stays excluded,
       since the retry re-bills and re-records at its own terminal event.
-- [ ] **Define editor composition on cancel.** After a cancel the editor can receive up to four
-      writers: text the user was already typing, the atom-carrying rich steering drafts that
-      `cancelTurn` recalls today, the original prompt returned by **Show only committed content in
-      the transcript**, and the partial-reasoning citation from **Offer partial reasoning/text as a
-      citation on cancel**. Treat the rich steering mirror as one composition source; flattening it
-      would destroy live paste placeholders. Draft appends blank-line-join in call order, and nothing
-      defines which source leads or how they separate — but they are not interchangeable: the
-      returned prompt should precede recalled steering, the citation is the model's words (not the
-      user's) and wants its own quoted framing, and in-progress typing must not be clobbered. Define
-      the composition — order, separators, and framing per source — as one model rather than letting
-      each feature append blindly. This is the underspecified linchpin of the cancel cluster.
+- [ ] **Define editor composition on cancel.** After a cancel the editor can receive three writers:
+      the text the user was already typing, the atom-carrying rich steering drafts that `cancelTurn`
+      recalls today, and the original prompt returned by **Show only committed content in the
+      transcript**. Compose them as one model in a fixed order, top to bottom — the returned prompt,
+      then the recalled steering, then the in-progress typing (chronological authorship order) —
+      with one blank line between present sources and the caret at the end, so the user keeps
+      composing where they left off. This reorders today's behavior, where `cancelReceipt` appends
+      recalled steering _after_ the in-progress text; the recalled steering now sits above it. Treat
+      the rich steering mirror as one composition source; flattening it would destroy live paste
+      placeholders. The returned prompt should likewise come back as a rich draft preserving its
+      paste placeholders (consistent with steering), which needs **Show only committed content in
+      the transcript** to retain the submitted prompt's rich draft until the turn commits rather
+      than returning the expanded text. Realized alongside that item, which introduces the
+      returned-prompt source.
 - [ ] **Configurable transcript window.** The live view retains a compiled-in 8 pages (terminal
       heights) of the newest content (`window_pages` in `src/layout.zig`): the frame keeps
       `rows * window_pages` rows measured newest-first and clips the rest at the top. Expose it via
