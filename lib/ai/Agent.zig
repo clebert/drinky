@@ -397,7 +397,10 @@ fn runRounds(
         const ran_tools = try self.runToolsWith(Dispatch, reply, turn, handler);
         // A no-tool reply commits here; a tool-calling reply committed itself
         // together with its reserved results before dispatch.
-        if (!ran_tools) self.advanceCheckpoint(turn);
+        if (!ran_tools) {
+            self.advanceCheckpoint(turn);
+            notifyCheckpoint(handler);
+        }
         // Fold mid-turn steering in before the next round; with no tools asked,
         // a steering message keeps the turn going rather than ending it.
         const steered = try self.drainSteering(turn, handler);
@@ -426,6 +429,13 @@ fn advanceCheckpoint(self: *Agent, turn: *TurnState) void {
         freeSteeringBatch(self.gpa, batch);
         turn.pending_steering = null;
     }
+}
+
+/// Tell presentation handlers that every event they accepted so far now belongs
+/// to committed history. Most agent tests use partial handlers and do not need
+/// this UI-specific frontier.
+fn notifyCheckpoint(handler: anytype) void {
+    if (comptime @hasDecl(@TypeOf(handler.*), "onCheckpoint")) handler.onCheckpoint();
 }
 
 fn freeSteeringBatch(gpa: std.mem.Allocator, batch: [][]u8) void {
@@ -769,6 +779,7 @@ fn runToolsWith(
     // announces and dispatches nothing; the turn rolls back the reply.
     try self.reserveResults(calls);
     self.advanceCheckpoint(turn);
+    notifyCheckpoint(handler);
 
     const context: tool.Context = .{ .gpa = self.gpa, .io = self.io };
     var group: std.Io.Group = .init;
@@ -1233,6 +1244,7 @@ const CaptureHandler = struct {
     tool_result_count: usize = 0,
     stream_reset_count: usize = 0,
     steer_count: usize = 0,
+    checkpoint_count: usize = 0,
     fail_usage: bool = false,
 
     fn deinit(self: *CaptureHandler) void {
@@ -1252,6 +1264,10 @@ const CaptureHandler = struct {
     fn onSteering(self: *CaptureHandler, text: []const u8, count: usize) !void {
         _ = text;
         self.steer_count += count;
+    }
+
+    fn onCheckpoint(self: *CaptureHandler) void {
+        self.checkpoint_count += 1;
     }
 
     fn onThinking(self: *CaptureHandler, delta: []const u8) !void {
@@ -2589,6 +2605,7 @@ test "the round cap retains the completed rounds and fails the turn" {
     try std.testing.expectError(error.TooManyToolRounds, agent.runWith(&fetch, "go", &handler));
     try std.testing.expectEqual(@as(usize, rounds_max), fetch.sends);
     try std.testing.expectEqual(@as(usize, rounds_max), handler.tool_result_count);
+    try std.testing.expectEqual(@as(usize, rounds_max), handler.checkpoint_count);
     // Prompt plus one tool_call/tool_result pair per completed round.
     try std.testing.expectEqual(@as(usize, 1 + 2 * rounds_max), agent.items.items.len);
 }
@@ -2607,6 +2624,7 @@ test "run commits a no-tool reply and ends the turn" {
     try std.testing.expectEqualStrings("go", agent.items.items[0].message.text);
     try std.testing.expectEqualStrings("hi", agent.items.items[1].message.text);
     try std.testing.expectEqual(llm.Role.assistant, agent.items.items[1].message.role);
+    try std.testing.expectEqual(@as(usize, 1), handler.checkpoint_count);
 }
 
 test "a committed truncation is reported in the receipt; a resampled one is not" {

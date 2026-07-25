@@ -312,10 +312,9 @@ Extension seams referenced here:
       its following reply commits: a normal exit returns it to the queue, a genuine cancel returns
       its rich drafts to the editor. Full-turn tests drive the round loop against a fake tool
       dispatch and a scripted stream that can raise a cancel at a chosen event. Transcript rewind
-      stays separate (**Show only committed content in the transcript**), so the displayed
-      transcript is an optimistic event log, not an exact mirror of model history; a synthesized
-      unresolved result may exist in history without a transcript block, and `/handoff` compaction
-      must summarize cancelled turns and their synthesized results.
+      (**Show only committed content in the transcript**) now mirrors committed history on cancel,
+      but a synthesized unresolved result may still exist in history without a transcript block, and
+      `/handoff` compaction must summarize cancelled turns and their synthesized results.
 - [ ] **Configurable tool-round cap.** The per-turn tool-round loop is bounded by a compiled-in 50
       rounds (`rounds_max` in `lib/ai/Agent.zig`), failing cleanly on overrun. Expose it via
       `config.json` (folded through `src/Config.zig` like the `request` section) with 50 as the
@@ -468,38 +467,22 @@ Extension seams referenced here:
       **Commit partial turns to history on cancel** lands, cancelled turns consume context where
       they previously vanished, so pressure builds faster than the old drop-on-cancel behavior
       implied.
-- [ ] **Show only committed content in the transcript.** `App.submit` appends the user's message to
-      the display transcript immediately and synchronously, and the streamed reply renders into it
-      as it arrives. History is now honest on its own: `Agent.runTurn` retains every completed round
-      and rolls only the in-flight tail back to the latest checkpoint (**Commit partial turns to
-      history on cancel**). The transcript is not yet rewound to match — on a cancel,
-      `Session.abortTurn` only appends a "cancelled" feedback block, so the partial reply that
-      streamed past the checkpoint stays on screen, and when nothing committed the user prompt stays
-      too, showing a prompt the model never kept. The principle: the transcript should mirror
-      committed state. Optimistic display _during_ a turn is fine, but once a cancel means the tail
-      will not commit, un-persist it: remove the still-uncommitted **tail** — the user prompt _and_
-      the partial reply that streamed under it — from the transcript and return the prompt text to
-      the editor (as cancellation already returns uncommitted steering to the editor), so the user
-      can edit and resend. `discardMessage` already drops the streamed assistant tail (from
-      `message_start`) but is wired only to the retry path, and the user block index is not tracked,
-      so rewinding the prompt needs a new bit of transcript state. The rewind boundary must derive
-      from the turn's authoritative `Agent.Outcome.receipt` (`history_base`/`history_end`) — the
-      purpose-built source the checkpoint work exposes — never a parallel UI-side "did any response
-      complete" heuristic, which would let transcript and history disagree. Seams: `App.submit` (the
-      optimistic append) and `App.cancelTurn`/`Session.abortTurn` (the teardown that appends
-      "cancelled" rather than rewinding). The checkpointed turn also leaves the opposite divergence
-      to reconcile — history ahead of the transcript — in two ways. A synthesized unresolved
-      `tool_result` sits in history with no transcript result line. And, more routinely, a genuine
-      cancel ends the turn synchronously: `cancelTurn` joins the worker and calls `abortTurn`
-      immediately, so every event the worker had already queued but the consumer had not yet applied
-      (streamed text, tool results, a `steering_consumed` batch) dies at the generation gate — even
-      though the checkpoint committed those rounds. The completed-worker race got a fence for
-      exactly this reason (**Commit partial turns to history on cancel**); the cancel path has no
-      fence because the editor restore and `cancelled` feedback must land before the user's next
-      keystroke. Draining the queued prefix _before_ ending a cancelled turn is the symmetric fix,
-      and it belongs here: it is the same question as which tail to rewind, and doing it without the
-      rewind would only display more content the rewind then removes. Composes with **Define editor
-      composition on cancel** (where the returned prompt goes).
+- [x] **Show only committed content in the transcript.** Optimistic display during a turn is
+      rewound to an authoritative presentation frontier on cancel. `TurnHandler` sequences every
+      queued progress event; `Agent` advances the handler's committed sequence at each history
+      checkpoint, while successfully published tool results advance it immediately because their
+      slots were committed before dispatch. Each later event carries the preceding frontier, and the
+      joined worker result carries the final one, so `Session` records the matching transcript block
+      count even when no later event follows. Cancellation truncates to that count rather than
+      guessing from whether a streamed message is open: committed replies and tool results stay,
+      while later discrete steering and partial replies disappear. The receipt still decides whether
+      history committed anything; when it did not, the retained rich prompt returns to the editor.
+      Queued progress is applied before reconciliation when possible. Non-turn events removed by that
+      bounded drain move to a consumer-owned prefix processed before newer queue data, never back into
+      the concurrently refilled queue. Progress already held in the current consumer batch, and a
+      synthesized unresolved `tool_result` with no presentation event, can remain cosmetic
+      scrollback gaps that `/handoff` compaction summarizes. Realizes **Define editor composition on
+      cancel** alongside.
 - [x] **Account cancelled turns' token cost.** A mid-stream cancel never reaches the terminal
       `.stop` that records usage, so a cancelled turn's tokens once went uncounted even though the
       provider still bills the input prompt and the output streamed so far. `Agent.fetchReply` folds
@@ -510,20 +493,14 @@ Extension seams referenced here:
       stream reports any usage records nothing, leaving the last-request gauge intact. Completed
       rounds are unaffected (they hit `.stop`); a transport loss that is retried stays excluded,
       since the retry re-bills and re-records at its own terminal event.
-- [ ] **Define editor composition on cancel.** After a cancel the editor can receive three writers:
-      the text the user was already typing, the atom-carrying rich steering drafts that `cancelTurn`
-      recalls today, and the original prompt returned by **Show only committed content in the
-      transcript**. Compose them as one model in a fixed order, top to bottom — the returned prompt,
-      then the recalled steering, then the in-progress typing (chronological authorship order) —
-      with one blank line between present sources and the caret at the end, so the user keeps
-      composing where they left off. This reorders today's behavior, where `cancelReceipt` appends
-      recalled steering _after_ the in-progress text; the recalled steering now sits above it. Treat
-      the rich steering mirror as one composition source; flattening it would destroy live paste
-      placeholders. The returned prompt should likewise come back as a rich draft preserving its
-      paste placeholders (consistent with steering), which needs **Show only committed content in
-      the transcript** to retain the submitted prompt's rich draft until the turn commits rather
-      than returning the expanded text. Realized alongside that item, which introduces the
-      returned-prompt source.
+- [x] **Define editor composition on cancel.** A cancel composes the returned prompt (only when the
+      turn committed nothing), recalled uncommitted steering, and in-progress typing in chronological
+      authorship order, with one blank line between present sources and the caret after the final
+      text. `Editor.prependComposition` performs the reserved move in one infallible pass. Rich
+      steering and submitted-prompt drafts retain live paste placeholders; when late steering is
+      promoted into a successor turn, `Draft.fromDrafts` deep-copies its atoms into the retained
+      prompt so that path preserves them too. Realized with **Show only committed content in the
+      transcript**.
 - [ ] **Configurable transcript window.** The live view retains a compiled-in 8 pages (terminal
       heights) of the newest content (`window_pages` in `src/layout.zig`): the frame keeps
       `rows * window_pages` rows measured newest-first and clips the rest at the top. Expose it via

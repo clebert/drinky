@@ -410,13 +410,19 @@ commit history, `BACKLOG.md` (planned work), and `docs/`.
   result moves to one pending App slot, while the queue carries only a payload-free generation
   fence. App retains that result until the fence has preserved all earlier progress, and if the
   worker's enqueue was interrupted App appends a replacement fence behind the queued prefix. A
-  genuine cancel returns uncommitted plain/rich steering to the editor as live placeholder drafts;
-  already-committed steering stays in history. It also ends the turn at once, so presentation events
-  the worker had queued but the consumer had not yet applied are dropped at the generation gate: a
-  round the checkpoint kept can therefore be in history without appearing in the transcript, which
-  stays an optimistic event log until transcript rewind lands. A channel that closes under the worker
-  ends the turn on the same receipt but reports nothing: teardown is neither a failure nor a
-  cancellation to restore from.
+  channel that closes under the worker ends the turn on the same receipt but reports nothing:
+  teardown is neither a failure nor a cancellation to restore from.
+- A cancel rewinds the transcript to the worker's committed presentation frontier. Progress events
+  are sequenced; agent checkpoints and published tool results advance the committed sequence, and
+  Session records the corresponding transcript block count. This keeps committed streamed replies
+  while removing later partial replies and discrete consumed-steering blocks. With nothing committed
+  the user prompt also rewinds and returns to the editor; otherwise a `cancelled` line marks the stop.
+  The editor composes the returned prompt, recalled uncommitted steering, and in-progress typing in
+  chronological order, blank-line separated with the caret after the last, preserving live paste
+  placeholders even when late steering was promoted into a successor turn. Queued worker progress is
+  drained before reconciliation; non-turn events taken with it move to a consumer-owned prefix ahead
+  of newer queue data, so cancellation cannot reorder or drop input, resize, or tick events. Progress
+  already held in the current consumer batch can still leave a cosmetic transcript gap.
 - A turn the agent itself failed — a refusal or unrecognized provider outcome, an empty reply, a
   reply that never arrived complete, or the tool-round cap — is reported as a sentence, so ordinary
   model behavior never reads as an internal fault. A provider or API failure keeps the server's own

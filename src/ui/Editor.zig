@@ -76,6 +76,49 @@ pub const Draft = struct {
         self.visible.clearRetainingCapacity();
     }
 
+    /// Build a plain draft holding a copy of `text` with no atoms. Caller owns
+    /// the result.
+    pub fn fromText(gpa: std.mem.Allocator, text: []const u8) !Draft {
+        var buffer: std.ArrayList(u8) = .empty;
+        errdefer buffer.deinit(gpa);
+        try buffer.appendSlice(gpa, text);
+        return .{ .visible = buffer, .atoms = .empty };
+    }
+
+    /// Deep-copy drafts into one blank-line-separated draft, preserving every
+    /// paste atom. The sources remain untouched so callers can prepare a joined
+    /// prompt before the operation that transfers their ownership commits.
+    pub fn fromDrafts(gpa: std.mem.Allocator, drafts: []const Draft) !Draft {
+        var visible_len: usize = 0;
+        var atom_count: usize = 0;
+        for (drafts, 0..) |draft, index| {
+            if (index > 0)
+                visible_len = try std.math.add(usize, visible_len, draft_separator.len);
+            visible_len = try std.math.add(usize, visible_len, draft.visible.items.len);
+            atom_count = try std.math.add(usize, atom_count, draft.atoms.items.len);
+        }
+
+        var joined: Draft = .empty;
+        errdefer joined.deinit(gpa);
+        try joined.visible.ensureTotalCapacityPrecise(gpa, visible_len);
+        try joined.atoms.ensureTotalCapacityPrecise(gpa, atom_count);
+        for (drafts, 0..) |draft, index| {
+            if (index > 0) joined.visible.appendSliceAssumeCapacity(draft_separator);
+            const base = joined.visible.items.len;
+            joined.visible.appendSliceAssumeCapacity(draft.visible.items);
+            for (draft.atoms.items) |atom| {
+                const payload = try gpa.dupe(u8, atom.payload);
+                joined.atoms.appendAssumeCapacity(.{
+                    .start = base + atom.start,
+                    .end = base + atom.end,
+                    .id = atom.id,
+                    .payload = payload,
+                });
+            }
+        }
+        return joined;
+    }
+
     /// Allocate the expanded text — literal bytes with each atom's exact payload
     /// spliced in for its marker span, in document order — optionally stripped of
     /// leading and trailing whole-prompt whitespace. Caller owns the result.
@@ -227,8 +270,21 @@ pub fn detachTrimmed(self: *Editor) Draft {
 /// `drafts`, each after a blank-line separator, so a following `appendDraft` per
 /// entry cannot fail. Checked additions guard the totals.
 pub fn reserveDrafts(self: *Editor, drafts: []const Draft) !void {
+    return self.reserveComposition(null, drafts);
+}
+
+/// Reserve capacity to insert `lead` (when present) and every draft in `drafts`,
+/// each after a blank-line separator, in one batch — the cancel composition
+/// reserves the returned prompt and the recalled steering together so the later
+/// `prependComposition` cannot half-complete. Checked additions guard the totals.
+pub fn reserveComposition(self: *Editor, lead: ?*const Draft, drafts: []const Draft) !void {
     var visible_extra: usize = 0;
     var atoms_extra: usize = 0;
+    if (lead) |source| {
+        visible_extra = try std.math.add(usize, visible_extra, source.visible.items.len);
+        visible_extra = try std.math.add(usize, visible_extra, draft_separator.len);
+        atoms_extra = try std.math.add(usize, atoms_extra, source.atoms.items.len);
+    }
     for (drafts) |draft| {
         visible_extra = try std.math.add(usize, visible_extra, draft.visible.items.len);
         visible_extra = try std.math.add(usize, visible_extra, draft_separator.len);
@@ -256,6 +312,56 @@ pub fn appendDraft(self: *Editor, source: *Draft) void {
     source.atoms.deinit(self.gpa);
     source.visible.deinit(self.gpa);
     source.* = .empty;
+}
+
+/// Insert `lead` (when present) then every draft in `drafts`, in order and
+/// blank-line separated, above the current content — with a blank line before
+/// that content when it is non-empty — and leave the caret at the end (after the
+/// existing line). Each source is consumed (its atoms' payloads move by pointer)
+/// and left empty. Infallible once `reserveComposition` has covered it, so the
+/// cancel composition cannot half-complete after the worker is already cancelled.
+pub fn prependComposition(self: *Editor, lead: ?*Draft, drafts: []Draft) void {
+    const had_content = self.draft.visible.items.len > 0;
+    var offset: usize = 0;
+    var wrote = false;
+    if (lead) |source| {
+        offset = self.spliceDraftAt(offset, source, false);
+        wrote = true;
+    }
+    for (drafts) |*source| {
+        offset = self.spliceDraftAt(offset, source, wrote);
+        wrote = true;
+    }
+    if (wrote and had_content)
+        self.splice(.{ .from = offset, .to = offset, .bytes = draft_separator }) catch unreachable;
+    self.moveEnd();
+}
+
+/// Splice `source`'s content into the draft at `offset` (after a blank-line
+/// separator when `separate`), move its atoms in, empty `source`, and return the
+/// position just past the inserted content. Infallible once `reserveComposition`
+/// has covered the batch.
+fn spliceDraftAt(self: *Editor, offset: usize, source: *Draft, separate: bool) usize {
+    var position = offset;
+    if (separate) {
+        self.splice(.{
+            .from = position,
+            .to = position,
+            .bytes = draft_separator,
+        }) catch unreachable;
+        position += draft_separator.len;
+    }
+    self.splice(.{
+        .from = position,
+        .to = position,
+        .bytes = source.visible.items,
+        .new_atoms = source.atoms.items,
+    }) catch unreachable;
+    position += source.visible.items.len;
+    source.atoms.deinit(self.gpa);
+    source.visible.deinit(self.gpa);
+    source.* = .empty;
+    return position;
 }
 
 /// Accept one bracketed-paste chunk, accumulating it; on the `final` chunk,
@@ -1674,4 +1780,43 @@ test "the framing rules report the rows scrolled out of view" {
     try std.testing.expect(std.mem.indexOf(u8, painted, "l6") != null);
     try std.testing.expect(std.mem.indexOf(u8, painted, "l0") == null);
     try std.testing.expect(std.mem.indexOf(u8, painted, "l9") == null);
+}
+
+// The cancel composition: a lead prompt and recalled steering drafts prepend above
+// the in-progress line, blank-line separated, with the caret left at the end and
+// every paste atom preserved for an exact expansion.
+test "prependComposition composes lead, drafts, then the current line" {
+    const gpa = std.testing.allocator;
+    var editor = Editor.init(gpa);
+    defer editor.deinit();
+    try editor.insert("typing");
+
+    // The lead carries a collapsed paste, so its atom must survive the prepend.
+    var builder = Editor.init(gpa);
+    defer builder.deinit();
+    const payload = "line\n" ** 15;
+    try builder.paste(payload, true);
+    var lead = builder.detachTrimmed();
+    defer lead.deinit(gpa);
+
+    var drafts = [_]Draft{
+        try Draft.fromText(gpa, "steer one"),
+        try Draft.fromText(gpa, "steer two"),
+    };
+    defer for (&drafts) |*draft| draft.deinit(gpa);
+
+    try editor.reserveComposition(&lead, &drafts);
+    editor.prependComposition(&lead, &drafts);
+
+    const shown = editor.visible();
+    try std.testing.expect(std.mem.indexOf(u8, shown, "[paste #1 +16 lines]") != null);
+    try std.testing.expect(std.mem.endsWith(u8, shown, "\n\nsteer one\n\nsteer two\n\ntyping"));
+    // The caret rests after the in-progress line so typing resumes there.
+    try std.testing.expectEqual(shown.len, editor.caret);
+    // The lead's paste atom survives and expands to its exact bytes.
+    try std.testing.expectEqual(@as(usize, 1), editor.draft.atoms.items.len);
+    const text = try editor.expanded(.none);
+    defer gpa.free(text);
+    try std.testing.expect(std.mem.startsWith(u8, text, payload));
+    try std.testing.expect(std.mem.endsWith(u8, text, "\n\nsteer one\n\nsteer two\n\ntyping"));
 }
