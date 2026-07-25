@@ -53,9 +53,9 @@ fn refreshTokens(
     return oauth.refresh(gpa, io, timeouts, tokens.refresh);
 }
 
-/// Run the interactive OAuth login, reporting runtime text through the caller's
-/// presentation boundary.
-pub fn login(self: *Auth, prompt: anytype) !void {
+/// Run the interactive OAuth login and return the committed credential's
+/// persistence outcome for the caller to present.
+pub fn login(self: *Auth, prompt: anytype) !auth.Login {
     return auth.login(self, account_key, oauth, prompt, exchangeRedirect);
 }
 

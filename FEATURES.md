@@ -128,16 +128,18 @@ commit history, `BACKLOG.md` (planned work), and `docs/`.
   executes in parallel, while a mutating call (write, edit) is a barrier -- it waits for all earlier
   reads to finish, runs alone, and completes before any later call begins -- so no mutation overlaps
   a read or another mutation and call order gives a coherent filesystem view. Results are collected
-  in call order so each maps back to its call, and a mid-turn cancel propagates to running tools.
+  in call order so each maps back to its call, and a mid-turn cancel propagates to running tools. A
+  barrier drains and presents the reads before it ahead of announcing itself, so presentation never
+  runs backwards in call order and a mutation cancelled at the barrier is never shown as started.
 - Bounded tool-round loop (at most 50 rounds), failing cleanly on overrun.
 - Holds the conversation history and reaches the model through a provider-neutral interface, so
   neither the loop nor its tools depend on a specific provider.
 - Emits presentation events (text, reasoning, tool start, tool result, usage, error) for the
   presentation layer to render.
-- Coalesces each streamed reasoning run into one entry — its text plus a verbatim opaque token, or a
-  redacted payload — kept in stream order ahead of the text and tool calls that followed it, so a
-  turn preserves reasoning interleaved with its tool calls; each entry is replayed unchanged in
-  every later request so the provider still accepts those tool calls.
+- Commits each transport-normalized reasoning completion as one entry — visible text plus a
+  replay-proof union for an Anthropic signature/redacted payload or an OpenAI id/encrypted payload —
+  kept in stream order ahead of the text and tool calls that followed it. The union is tagged with
+  the exact producing account and replayed unchanged only to that account.
 - Switches the active account, model, and reasoning-effort level mid-session; the change takes effect
   on the next turn and leaves history untouched.
 - Messages queued during a turn are drained at each tool-round boundary (and when the model would
@@ -149,28 +151,58 @@ commit history, `BACKLOG.md` (planned work), and `docs/`.
   commits only at its provider's terminal event; a failed attempt's partial text and tool calls
   are discarded, the presentation layer clears partial text before retrying, and tools execute
   only after a committed reply.
-- On a stream failure or API error, discards the turn's items so history returns to where the turn
-  began, freeing their memory at once rather than at session end; each history item owns its memory,
-  so repeated failed, retried, or cancelled turns keep retained memory bounded to the surviving
+- A reply enters history only after a provider terminal event and validation that it is replayable.
+  Transports own their native block/item lifecycles and emit only completed assistant messages,
+  reasoning proofs, and tool calls; display deltas never become conversation state. The Agent binds
+  each proof to the exact producing account, rejects empty or duplicate call ids, and requires final
+  arguments to be empty (an empty object) or a valid top-level JSON object. Call ids need only be
+  unique within one reply, which is what makes a reply answerable; a later round may reuse one,
+  since it is already paired with its own result. A terminal response is complete or truncated: a
+  truncated tool-free reply is retained as an authoritative answer whose cutoff the turn reports, so
+  a partial answer never reads as a whole one, while truncation with a tool call and malformed,
+  resumable, refused, or unrecognized outcomes reject. A terminal reply carrying no assistant item at
+  all is rejected under its own name, so resampling stays worthwhile while the report says the model
+  returned nothing rather than blaming the stream. Rejections detected before termination drain the
+  bounded stream without retaining further content so terminal usage is counted; retryable cases
+  resample within bounded retries, while unsupported outcomes fail the turn without spending retries,
+  since resampling cannot turn an unretainable outcome into a retainable one.
+- A tool-calling reply commits together with one reserved conservative error result per call before
+  any tool is announced or dispatched, so a mutating tool can never change the world with no result
+  recorded. Real results replace the reserved slots as calls finish; a cancelled or failed round
+  keeps the honest reserved result — flagged as an error and noting side effects may have occurred —
+  for any call that produced none.
+- A turn is a checkpointed transaction, not one atomic unit: it maintains a replay-valid history
+  checkpoint throughout, and every abnormal exit — user cancel, channel close, API error, exhausted
+  retries, out-of-memory, an escaping tool error, or the tool-round cap — rolls history back to the
+  latest checkpoint, retaining every completed round and its tool results rather than the whole
+  turn. Only the in-flight tail beyond the checkpoint is dropped, so a mid-turn cancel is a clean
+  abort that keeps the honest record of work already done. Each history item owns its memory, so
+  repeated failed, retried, or cancelled turns keep retained memory bounded to the surviving
   history.
-- A mid-turn cancel surfaces as a clean abort (the partial assistant message is dropped), not a
-  network error.
-- Accumulates cost and cache savings, pricing each message against the model that produced it so a
-  mid-session model switch stays correctly priced; keeps a bounded per-model breakdown (cumulative
-  totals stay exact past the bound) and the last request's usage.
+- Each turn yields a receipt — the committed history span, how far steering commitment advanced, and
+  whether a committed reply was cut short — and a disposition (completed, cancelled, closed, or
+  failed), so a caller resolves cancellation from the joined worker state rather than event timing.
+- Accumulates cost and cache savings, including terminal usage from billed attempts whose reply is
+  rejected by replay validation; prices each terminal attempt against the model that produced it so
+  a mid-session model switch stays correctly priced, keeps a bounded per-model breakdown (cumulative
+  totals stay exact past the bound), and records the last terminal attempt's usage. Usage reported
+  only before cancellation or transport loss reaches a terminal event is excluded from accounting.
 
 ### Conversation model
 
 - The conversation is a flat, ordered sequence of items: user and assistant messages, reasoning
   runs, tool calls, and tool results.
-- A reasoning run records the account that produced its opaque token; only that exact account
-  replays it, so any account switch — even between two billing products of one vendor — drops the
-  reasoning it did not itself produce, and an assistant turn left with nothing replayable is omitted
-  rather than sent as an empty message.
-- A provider-neutral interface every provider implements, producing a common stream of reply events
-  (text, reasoning and its opaque token, redacted reasoning, tool-call starts, tool-argument chunks,
-  completion) with usage-so-far readable mid-stream; each provider translates the item sequence to
-  and from its own wire format, so nothing above depends on a specific provider.
+- A reasoning run's replay proof is a union tagged by the exact account slot that produced it; any
+  account switch drops foreign reasoning, even between billing products of one vendor. Successful
+  OAuth credential replacement or logout purges that slot's old proofs before another
+  history-bearing request or fallible final presentation, and an assistant turn left with nothing
+  replayable is omitted rather than sent empty.
+- A provider-neutral interface every provider implements, producing a common stream of display-only
+  text/reasoning deltas, completed assistant items in wire order, and a terminal event carrying
+  usage, complete-or-truncated status, and any provider-detected invalid/unsupported rejection.
+  Usage so far remains readable mid-stream. Provider-native correlation and assembly stay inside
+  each transport; the Agent sees only completed messages, proofs, and tool calls and translates them
+  into the shared history model.
 - Implemented providers: Anthropic and OpenAI.
 
 ### Model catalog & reasoning effort
@@ -205,6 +237,9 @@ commit history, `BACKLOG.md` (planned work), and `docs/`.
   fully buffered — while a legitimately large single frame (a terminal frame carrying the entire
   response, or a large reasoning blob) is read intact rather than being capped to a fixed reader
   buffer.
+- JSON for each SSE frame is parsed in one reusable frame arena reset before the next frame,
+  including eventless progress/filler consumed within one read. State that must cross frames remains
+  explicitly stream-owned; allocation failure is propagated and leak-checked.
 
 ### Anthropic transport
 
@@ -212,9 +247,17 @@ commit history, `BACKLOG.md` (planned work), and `docs/`.
   consecutive same-role items merge into one message (a tool result counts as user), each item maps
   to one content block in order, and reasoning stays first, never reordered or merged — so the
   serialized prefix stays byte-stable and server-side prompt-cache hits persist.
-- Streams responses over SSE, decoding them into the neutral reply events plus usage and API
-  errors; only the final `message_stop` completes a reply, after the preceding `message_delta`
-  supplies its cumulative usage and a stop reason gating termination.
+- Streams responses over SSE, decoding them into the neutral reply events plus usage and API errors;
+  only the final `message_stop` completes a reply, after the preceding `message_delta` supplies its
+  cumulative usage and a stop reason (latched, last non-null writer wins) gating termination. The
+  stop reason folds to a complete or truncated status — `end_turn`, `tool_use`, and `stop_sequence`
+  complete, while `max_tokens` and `model_context_window_exceeded` truncate — or marks a
+  `pause_turn`, `refusal`, or unrecognized outcome unsupported on the terminal event so its usage is
+  still counted. One tagged open-block state correlates strictly nonnegative indexes and accumulates
+  text, thinking signatures, redacted proofs, or tool arguments across frame resets. Text/thinking
+  deltas remain display-only; a matching block stop emits one completed message, replay proof, or
+  tool call, while a stop that closes no open block is invalid. Unknown native block types latch
+  unsupported through their matching stop instead of silently omitting part of a response.
 - When reasoning is enabled, requests adaptive, summarized extended thinking at the resolved effort
   level so the model sizes its own budget while the output ceiling stays fixed; omitted when effort
   is none (which also drops stored reasoning from the request), the model has no reasoning, or the
@@ -237,15 +280,19 @@ commit history, `BACKLOG.md` (planned work), and `docs/`.
 - Builds each request for the Responses API from the same conversation items, sending each item as
   its own input entry (never merged), with the system prompt as instructions and the tools as
   function tools.
-- Streams responses over SSE, decoding them into the neutral reply events plus usage and API
-  errors; `response.completed` and `response.incomplete` are authoritative terminal events, usage
-  is folded when their response object supplies it, and an optional `[DONE]` compatibility
-  sentinel only ends the byte stream.
-- When reasoning is enabled, requests a summarized reasoning stream at the resolved effort level and
-  round-trips each reasoning item's encrypted payload and id verbatim so later turns replay it; no
-  server-side conversation state is retained between requests. Consecutive summary parts within one
-  reasoning item — which the stream separates only by a rising summary index, emitting no text
-  between them — are joined with a blank line so the `**...**` blocks stay distinct.
+- Streams responses over SSE, decoding display deltas separately from authoritative
+  `response.output_item.done` payloads. Done messages, encrypted reasoning proofs, and function
+  calls emit completed neutral items; function-argument deltas are progress only. Duplicate done ids
+  are invalid, unknown completed item/content types and refusals are unsupported, and a terminal
+  `response.output` snapshot — when present — must match the complete done-id set. One native
+  message's ordered `output_text` parts join without a separator; separate message items stay
+  separate. `response.completed` and `response.incomplete` map to complete/truncated stops, while
+  `[DONE]` only closes the byte stream. An incomplete message survives only an incomplete terminal
+  response; incomplete reasoning and function calls reject.
+- When reasoning is enabled, requests a summarized reasoning stream at the resolved effort level.
+  Summary deltas are display-only; the done item supplies the complete summary, required native id,
+  and encrypted payload. Summary parts join with a blank line, and the id/payload round-trip
+  verbatim on later turns without server-side conversation state.
 - Relies on OpenAI's automatic server-side prompt caching (no per-block cache markers) and sends a
   stable per-conversation cache key so a session's growing requests route to one cache.
 - Partitions the prompt token count into cache-read, cache-write, and uncached buckets, so each
@@ -262,7 +309,9 @@ commit history, `BACKLOG.md` (planned work), and `docs/`.
 - Subscription credentials stored at `~/.pith/auth.json` with owner-only permissions, keyed by
   account so several coexist in one file; a token refresh rewrites only its own account's entry, and
   a save aborts rather than discarding the file's other accounts when it cannot be read back. Saves
-  replace the file atomically, so an interrupted save leaves the previous contents intact.
+  replace the file atomically, so an interrupted save leaves the previous contents intact. A login
+  whose save fails remains authenticated for the process and reports that memory-only outcome only
+  after account readiness and replay-proof invalidation are settled.
 - OAuth login: PKCE (S256), a loopback callback listener ready before browser launch, and a
   best-effort launcher whose lifetime never blocks the callback; unavailable launchers warn while
   the printed URL remains usable for manual authorization. Callback acceptance and its first HTTP
@@ -351,9 +400,24 @@ commit history, `BACKLOG.md` (planned work), and `docs/`.
   signs in through the same interactive picker as a mid-session `/login`.
 - Ctrl+C clears the editor, or quits on a second press in quick succession; Ctrl+D quits when the
   editor is empty.
-- During a turn, Esc or Ctrl+C cancels it and drops the partial turn, returning any pending steering
-  to the editor as live placeholder drafts — a steered paste comes back as its collapsed marker, not
-  expanded text — including a message the turn consumed so late that the cancel rolled it back.
+- During a turn, Esc or Ctrl+C cancels it, keeping every completed round at the latest checkpoint
+  and dropping only the in-flight tail. Cancellation is resolved from the joined worker state, not
+  event timing: a worker that already finished is presented as its completion, never a false
+  cancellation. The joined future is the sole source of terminal data; after a late cancel its
+  result moves to one pending App slot, while the queue carries only a payload-free generation
+  fence. App retains that result until the fence has preserved all earlier progress, and if the
+  worker's enqueue was interrupted App appends a replacement fence behind the queued prefix. A
+  genuine cancel returns uncommitted plain/rich steering to the editor as live placeholder drafts;
+  already-committed steering stays in history. It also ends the turn at once, so presentation events
+  the worker had queued but the consumer had not yet applied are dropped at the generation gate: a
+  round the checkpoint kept can therefore be in history without appearing in the transcript, which
+  stays an optimistic event log until transcript rewind lands. A channel that closes under the worker
+  ends the turn on the same receipt but reports nothing: teardown is neither a failure nor a
+  cancellation to restore from.
+- A turn the agent itself failed — a refusal or unrecognized provider outcome, an empty reply, a
+  reply that never arrived complete, or the tool-round cap — is reported as a sentence, so ordinary
+  model behavior never reads as an internal fault. A provider or API failure keeps the server's own
+  message instead, and an unmapped failure still names itself rather than going silent.
 - The editor stays live during a turn: Enter queues a steering message, Alt+Up recalls the pending
   queue into the editor as live drafts (blank-line-joined after any in-progress text, each queued
   paste restored as its placeholder marker with its exact payload), and any steering still queued

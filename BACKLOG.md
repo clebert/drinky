@@ -209,8 +209,8 @@ Extension seams referenced here:
       `OPENAI_API_KEY`, Bearer, `api.openai.com`) and `openai_subscription` (Codex OAuth), the
       latter reachable through the `/login` picker.
 - [x] **Account switch: empty assistant content (Anthropic 400).** The Anthropic serializer skips an
-      assistant envelope that would emit zero blocks — a reasoning-only run whose reasoning is
-      dropped by exact-account replay (`origin != account`) or by disabled reasoning — instead of sending
+      assistant envelope that would emit zero blocks — a reasoning-only run whose replay-union tag
+      differs from the active account, or whose reasoning is disabled — instead of sending
       `"content":[]`, which Anthropic rejects with a 400. Two user runs left adjacent by such a skip
       merge into one envelope, and the history cache breakpoint moves to the last block actually
       emitted. Covered by a switch that drops a reasoning-only run.
@@ -261,51 +261,45 @@ Extension seams referenced here:
       consumer.
 - [x] **Streaming cancellation.** Ctrl-c/esc mid-turn cancels the turn worker's `Future`; the cancel
       interrupts the blocking read, `Transport.next` maps it to `error.Canceled` via
-      `connection.getReadError()`, and `Agent.run`'s `errdefer` shrinks `messages` back to the
-      turn's base — dropping the partial assistant message and leaving a valid alternation. Tools
-      propagate `error.Canceled` too, and mutating tools write atomically so a cancelled write can't
-      truncate the target.
-- [ ] **Commit partial turns to history on cancel.** Today `Agent.run` treats a turn as atomic: an
-      `errdefer self.messages.shrinkRetainingCapacity(base)` rolls the whole message list back to
-      the pre-turn length on any early exit, so a mid-turn cancel drops everything the turn produced
-      — the user prompt, a completed assistant reply (thinking + text), the `tool_use` blocks, and
-      the `tool_result`s already appended by `readReply`/`runTools`. When the model has already
-      emitted completed request/response pairs or run tools, forgetting them is wrong on two counts.
-      First, the work is real: a completed assistant turn is a valid history entry, and re-deriving
-      it costs tokens. Second, and more seriously, mutating tools have side effects the rollback
-      cannot undo — an edit/write has already hit disk, and a bash command (once the **Bash tool**
-      lands) may have done anything at all. edit/write we could in principle reverse; arbitrary bash
-      we cannot. So the only way to keep history honest with the world is to _keep the events_, not
-      to unwind them: after a cancel, `messages` should retain every completed assistant message and
-      its tool results (a valid user/assistant alternation) so the next turn's model knows what it
-      already thought and did. The commit boundary should be the **last complete round** — only
-      fully-drained `readReply` output is provider-valid. An in-flight partial cannot be committed
-      as-is: a thinking block cancelled before its `thinking_signature` has an empty signature
-      (Anthropic rejects that on replay with tool use), and a `tool_use` cancelled mid-`input_json`
-      carries truncated JSON. So the boundary is the last `.stop`-terminated reply, not the byte the
-      cancel landed on. This is an `error.Canceled`-only behavior: `run`'s single errdefer and
-      `runTurnWorker` today treat user-cancel and `error.Closed`/shutdown identically, but "keep the
-      events" applies only to a user cancel — shutdown is moot, and genuine errors already discard
-      cleanly via `reportAndReset`, so the commit logic is an error-kind split, not a blanket
-      errdefer change. It is also distinct from the retry path, which deliberately _discards_
-      partials (`onStreamReset` → `discardMessage`; a failed attempt will re-run): a failed attempt
-      discards, a user cancel keeps. Open questions remain: how to close a dangling `tool_use` whose
-      result never came back (a synthesized "cancelled" `tool_result` keeps the alternation valid —
-      note this history marker for the model is separate from the "cancelled" _feedback block_ the
-      transcript shows the user). Landing this reverses the invariant stated in the DONE **Streaming
-      cancellation** entry ("dropping the partial assistant message"), so update that entry and
-      `FEATURES.md` when it ships. The joined `agent.messages` (`cancelTurn` already joins the
-      worker before teardown) should be the single source of truth that both this commit and the
-      transcript rewind derive from — a parallel UI-side heuristic would let the two disagree and
-      reintroduce the divergence **Show only committed content in the transcript** exists to kill.
-      The join must also expose the worker's disposition before cancellation restores the rich
-      steering mirror: a worker can commit before its queued completion reaches the UI, and that
-      completed turn must not be treated as a rollback or have its steering restored. Pairs with
-      that item (the still-uncommitted tail is what gets rewound) and ties into the
-      **Permission model** and **Bash tool**. Landing it needs test infrastructure that does not
-      exist yet — a scripted stream that can raise the cancel at a chosen event, and a way to drive
-      the tool-round loop against fake tools in isolation (today's tests exercise reply parsing
-      directly, never the full turn loop) — so build those first and size the work to include them.
+      `connection.getReadError()`. The turn is a checkpointed transaction: `Agent.runTurn` rolls
+      history back to the latest replay-valid checkpoint — retaining every completed round and its
+      tool results — rather than to the turn's base, so a cancel keeps the honest record of work
+      already done instead of dropping the whole turn (see **Commit partial turns to history on
+      cancel** for the full invariant). Tools propagate `error.Canceled` too, and mutating tools
+      write atomically so a cancelled write can't truncate the target.
+- [x] **Commit partial turns to history on cancel.** A turn is a checkpointed transaction rather
+      than one atomic unit. `Agent.runTurn` maintains a replay-valid history checkpoint throughout,
+      and every abnormal exit — user cancel, channel close, API error, exhausted retries, OOM, a
+      tool error that escapes without a result, and the round cap — rolls history back to the latest
+      checkpoint, retaining every completed round and its tool results rather than unwinding the
+      whole turn (revising the earlier cancellation-only, drop-to-base plan: an OOM or API error
+      after a mutating round leaves the same world/history divergence). A reply is eligible for
+      history only after a provider terminal event. Each transport owns its native lifecycle and
+      emits only completed messages, replay proofs, and tool calls; display deltas never become
+      history. The Agent binds proofs to the producing account, rejects empty ids and ids repeated
+      within one reply (later rounds may reuse one — it is already paired with its own result, so
+      rejecting it would fail a turn over a harmless provider quirk), and requires final tool
+      arguments to be a valid top-level JSON object (empty means `{}`). A truncated tool-free reply
+      is retained as authoritative and its cutoff reported on the receipt, so a partial answer is
+      never presented as a whole one, while truncation with a tool call, malformed native output, or
+      a `pause_turn`/`refusal`/unknown outcome rejects. A tool-calling reply commits together with
+      one preallocated conservative error result per call before any `onToolStart` or dispatch, so a
+      mutation can never change the world with no result recorded; real results replace those slots
+      allocation-free, and a cancelled or failed round keeps the honest synthetic result for any
+      call that did not return one. The turn future returns the sole terminal result (receipt,
+      disposition, and optional error text), while the UI queue carries only a payload-free
+      generation fence. A user cancel that races a completed worker retains the joined result until
+      all FIFO progress before that fence has applied; if the worker's fence enqueue was
+      interrupted, App appends a replacement behind the queued prefix. This presents completion
+      without false restoration or `cancelled` feedback and without a second terminal-payload owner.
+      Consumed-but-uncommitted steering — plain queue and rich draft alike — stays recoverable until
+      its following reply commits: a normal exit returns it to the queue, a genuine cancel returns
+      its rich drafts to the editor. Full-turn tests drive the round loop against a fake tool
+      dispatch and a scripted stream that can raise a cancel at a chosen event. Transcript rewind
+      stays separate (**Show only committed content in the transcript**), so the displayed
+      transcript is an optimistic event log, not an exact mirror of model history; a synthesized
+      unresolved result may exist in history without a transcript block, and `/handoff` compaction
+      must summarize cancelled turns and their synthesized results.
 - [ ] **Configurable tool-round cap.** The per-turn tool-round loop is bounded by a compiled-in 50
       rounds (`rounds_max` in `lib/ai/Agent.zig`), failing cleanly on overrun. Expose it via
       `config.json` (folded through `src/Config.zig` like the `request` section) with 50 as the
@@ -397,13 +391,12 @@ Extension seams referenced here:
       region, reusable by any command that returns a `pick` outcome.
 - [x] **Display model thinking.** The model's reasoning streams into the transcript dimmed, separate
       from the answer. `anthropic/wire.zig` sends adaptive thinking
-      (`thinking:{type:adaptive,     display:summarized}`) and `Transport` decodes thinking deltas,
-      signatures, and redacted reasoning; `llm.Block` and `llm.Event` gained a `thinking` variant;
-      `Agent` buffers a reasoning run into a `thinking` block (carried back verbatim so the provider
-      accepts the tool calls that followed) and reports it via `handler.onThinking`; `Transcript`
-      collects a run into one growing dimmed `thinking` block that the answer run does not extend,
-      painted by `ui/block`. Adaptive thinking lets the model size its own budget, so no client-side
-      budget is set; `/effort` steers its depth.
+      (`thinking:{type:adaptive,display:summarized}`); each transport reports display-only deltas
+      while correlating and accumulating the native run, then emits one complete replay-proof union
+      item at provider closure. `Agent` binds that proof to the exact account and reports deltas via
+      `handler.onThinking`; `Transcript` collects a run into one growing dimmed `thinking` block
+      that the answer run does not extend, painted by `ui/block`. Adaptive thinking lets the model
+      size its own budget, so no client-side budget is set; `/effort` steers its depth.
 - [x] **Steering.** The user types and submits while a turn runs, queuing messages the pi way. The
       editor stays live during a turn (it was inert by policy, not by blocking — the off-thread
       networking work had already unfrozen the read loop): `App.editKey` drives the editor in both
@@ -419,9 +412,11 @@ Extension seams referenced here:
       whole taken batch atomically ahead of newer queued messages. A message that lands after the
       final drain starts the next turn on its own. Alt+Up takes the pending count from the shared
       queue and restores content from the rich mirror, preserving live paste placeholders without
-      recalling a message already folded into the turn; cancellation restores the same mirror after
-      joining the worker. Slash commands can't run mid-turn (a picker can't coexist with a turn), so
-      a `/`-line stays in the editor to send once the turn ends.
+      recalling a message already folded into the turn; cancellation resolves the mirror from the
+      joined turn receipt (**Commit partial turns to history on cancel**), dropping drafts already
+      committed to history and returning only the uncommitted ones to the editor. Slash commands
+      can't run mid-turn (a picker can't coexist with a turn), so a `/`-line stays in the editor to
+      send once the turn ends.
 - [x] **Smooth spinner animation.** The `⠋ Working…` spinner is driven by the frame timer: while a
       turn animates the consumer re-arms a tick each frame and `advanceFrame` steps the spinner even
       when the model is clean, so it animates independently of stream events and no longer freezes
@@ -475,24 +470,36 @@ Extension seams referenced here:
       the model.
 - [ ] **Show only committed content in the transcript.** `App.submit` appends the user's message to
       the display transcript immediately and synchronously, and the streamed reply renders into it
-      as it arrives — but on a cancel before the turn commits anything (no completed assistant
-      response), that content is left on screen even though history never kept it (`Agent.run`'s
-      errdefer rolled `messages` back). The transcript then shows a prompt the model never answered
-      and never will, diverging from what the model actually knows. The principle: the transcript
-      should mirror committed state. Optimistic display _during_ a turn is fine — showing the prompt
-      and the streaming reply while we assume they will commit — but once a cancel means they will
-      not, un-persist them: remove the uncommitted **tail** — the user prompt _and_ the partial
-      reply that streamed under it — from the transcript and return the prompt text to the editor
-      (mirroring how `cancelTurn` already recalls pending steering into the editor, though the
-      original prompt today is not), so the user can edit and resend. `discardMessage` already drops
-      the streamed assistant tail (from `message_start`), but the user block index is not tracked,
-      so rewinding the prompt needs a new bit of transcript state. Seams: `App.submit` (the
-      optimistic append), `App.cancelTurn`/`Session.abortTurn` (the teardown that today appends a
-      "cancelled" feedback block rather than rewinding), and the rewind-vs-keep decision, which
-      should derive from the joined `agent.messages` (see **Commit partial turns to history on
-      cancel**) rather than a parallel UI-side "at least one completed response" test, so the
-      transcript and history can't disagree. Interacts with that item: once completed rounds are
-      committed, only the still-uncommitted tail is rewound.
+      as it arrives. History is now honest on its own: `Agent.runTurn` retains every completed round
+      and rolls only the in-flight tail back to the latest checkpoint (**Commit partial turns to
+      history on cancel**). The transcript is not yet rewound to match — on a cancel,
+      `Session.abortTurn` only appends a "cancelled" feedback block, so the partial reply that
+      streamed past the checkpoint stays on screen, and when nothing committed the user prompt stays
+      too, showing a prompt the model never kept. The principle: the transcript should mirror
+      committed state. Optimistic display _during_ a turn is fine, but once a cancel means the tail
+      will not commit, un-persist it: remove the still-uncommitted **tail** — the user prompt _and_
+      the partial reply that streamed under it — from the transcript and return the prompt text to
+      the editor (as cancellation already returns uncommitted steering to the editor), so the user
+      can edit and resend. `discardMessage` already drops the streamed assistant tail (from
+      `message_start`) but is wired only to the retry path, and the user block index is not tracked,
+      so rewinding the prompt needs a new bit of transcript state. The rewind boundary must derive
+      from the turn's authoritative `Agent.Outcome.receipt` (`history_base`/`history_end`) — the
+      purpose-built source the checkpoint work exposes — never a parallel UI-side "did any response
+      complete" heuristic, which would let transcript and history disagree. Seams: `App.submit` (the
+      optimistic append) and `App.cancelTurn`/`Session.abortTurn` (the teardown that appends
+      "cancelled" rather than rewinding). The checkpointed turn also leaves the opposite divergence
+      to reconcile — history ahead of the transcript — in two ways. A synthesized unresolved
+      `tool_result` sits in history with no transcript result line. And, more routinely, a genuine
+      cancel ends the turn synchronously: `cancelTurn` joins the worker and calls `abortTurn`
+      immediately, so every event the worker had already queued but the consumer had not yet applied
+      (streamed text, tool results, a `steering_consumed` batch) dies at the generation gate — even
+      though the checkpoint committed those rounds. The completed-worker race got a fence for
+      exactly this reason (**Commit partial turns to history on cancel**); the cancel path has no
+      fence because the editor restore and `cancelled` feedback must land before the user's next
+      keystroke. Draining the queued prefix _before_ ending a cancelled turn is the symmetric fix,
+      and it belongs here: it is the same question as which tail to rewind, and doing it without the
+      rewind would only display more content the rewind then removes. Composes with **Define editor
+      composition on cancel** (where the returned prompt goes).
 - [ ] **Account cancelled turns' token cost.** `recordUsage` fires only on the stream's `.stop`
       event, which a mid-stream cancel never reaches, so a cancelled turn's tokens go unrecorded in
       `Agent.Stats` — yet the provider still bills the full input prompt (and the output streamed so

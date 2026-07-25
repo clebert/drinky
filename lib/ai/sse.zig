@@ -26,13 +26,15 @@ pub const Decoded = union(enum) {
 /// The engine methods over a provider stream struct `S`, which declares the
 /// connection fields these methods use (`gpa`, `established`, `client`,
 /// `request`, `response`, `body`, `io`, `idle_ms`, `budget`, `status`,
-/// `error_length`, `retry_after_ms`, `parsed`, `usage`, `decompress`,
+/// `error_length`, `retry_after_ms`, `frame_arena`, `usage`, `decompress`,
 /// `decompress_buffer`, `error_buffer`, `redirect_buffer`, `transfer_buffer`)
-/// plus `reset()` freeing its retained parses and `decode(payload) !Decoded`.
+/// plus `deinitDecode()` for stream-lifetime decode state and
+/// `decode(payload) !Decoded`. The engine resets `frame_arena` before each SSE
+/// frame, so returned events may borrow a parse until the next read.
 pub fn Engine(comptime S: type) type {
     return struct {
         pub fn deinit(stream: *S) void {
-            stream.reset();
+            stream.deinitDecode();
             if (stream.decompress_buffer.len != 0) stream.gpa.free(stream.decompress_buffer);
             stream.request.deinit();
             stream.client.deinit();
@@ -100,7 +102,7 @@ pub fn Engine(comptime S: type) type {
         pub fn begin(stream: *S, gpa: std.mem.Allocator, io: std.Io) void {
             stream.gpa = gpa;
             stream.client = .{ .allocator = gpa, .io = io };
-            stream.parsed = null;
+            stream.frame_arena = .init(gpa);
             stream.usage = .{};
             stream.error_length = 0;
             stream.retry_after_ms = null;
@@ -140,14 +142,16 @@ pub fn Engine(comptime S: type) type {
         /// every recognized frame restarts it — only a genuine stall surfaces
         /// `error.Timeout`.
         pub fn next(stream: *S) !?llm.Event {
-            // Drop the parses backing the previous event before reading on.
-            stream.reset();
             // Reused across skipped filler lines; the event handed back borrows
-            // `parsed`, not this buffer.
+            // the frame arena, not this buffer.
             var line_buffer: std.Io.Writer.Allocating = .init(stream.gpa);
             defer line_buffer.deinit();
             var deadline = net.Deadline.start(stream.io, stream.idle_ms);
             while (true) {
+                // Drop the previous returned event or skipped frame before
+                // reading another. Reset inside the loop so a progress flood
+                // cannot retain every parse consumed by one `next` call.
+                _ = stream.frame_arena.reset(.retain_capacity);
                 const line = (try takeLine(stream, deadline, &line_buffer)) orelse return null;
                 // Charge every line against the whole-stream budget: a peer that
                 // makes frequent valid progress still hits an aggregate ceiling,

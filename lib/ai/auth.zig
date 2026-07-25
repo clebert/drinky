@@ -13,6 +13,16 @@ const oauth_callback = @import("oauth_callback.zig");
 const oauth_login = @import("oauth_login.zig");
 const oauth_wire = @import("oauth_wire.zig");
 
+/// A committed login's persistence outcome. The credential is live in both
+/// cases; `memory_only` carries the save failure for the caller to present.
+pub const Login = union(enum) {
+    saved: []const u8,
+    memory_only: struct {
+        path: []const u8,
+        save_error: anyerror,
+    },
+};
+
 /// Load stored tokens, reading each `Tokens` field from the entry by name.
 /// Returns false when the file is absent or holds no `account_key` entry (the
 /// account is simply signed out).
@@ -73,18 +83,19 @@ pub fn accessToken(
     return auth.tokens.?.access;
 }
 
-/// Run the interactive OAuth login, reporting runtime text through the caller's
-/// presentation boundary. `oauth` is the provider protocol module (the
-/// authorize URL and the callback port); `exchangeFn(auth, redirect, pair)`
-/// trades the received redirect for tokens, applying any provider-specific
-/// checks first.
+/// Run the interactive OAuth login, reporting pre-commit runtime text through
+/// the caller's presentation boundary. `oauth` is the provider protocol module
+/// (the authorize URL and callback port); `exchangeFn(auth, redirect, pair)`
+/// trades the redirect for tokens, applying provider-specific checks first.
+/// Once tokens are installed, the function returns a non-error persistence
+/// outcome so callers cannot mistake presentation failure for login failure.
 pub fn login(
     auth: anytype,
     comptime account_key: []const u8,
     comptime oauth: type,
     prompt: anytype,
     comptime exchangeFn: anytype,
-) !void {
+) !Login {
     const pair = oauth_wire.pkce(auth.io);
     const url = try oauth.authorizeUrl(auth.gpa, &pair);
     defer auth.gpa.free(url);
@@ -100,18 +111,19 @@ pub fn login(
         auth.gpa.free(redirect.state);
     }
 
-    try commit(auth, account_key, try exchangeFn(auth, redirect, &pair), prompt);
+    return commit(auth, account_key, try exchangeFn(auth, redirect, &pair));
 }
 
-/// Install exchanged tokens, persist them, and report. Installed tokens complete
-/// the login — the session is signed in with or without persistence — so a failed
-/// save warns (`showSaveFailed`: signed in until exit) instead of failing a login
-/// whose credential is usable now.
-fn commit(auth: anytype, comptime account_key: []const u8, tokens: anytype, prompt: anytype) !void {
+/// Install exchanged tokens and report whether they reached disk. Installation
+/// completes the login, so no fallible work follows the credential mutation.
+fn commit(auth: anytype, comptime account_key: []const u8, tokens: anytype) Login {
     if (auth.tokens) |old| old.deinit(auth.gpa);
     auth.tokens = tokens;
-    save(auth, account_key) catch |err| return prompt.showSaveFailed(auth.path, @errorName(err));
-    try prompt.showAuthorized(auth.path);
+    save(auth, account_key) catch |save_error| return .{ .memory_only = .{
+        .path = auth.path,
+        .save_error = save_error,
+    } };
+    return .{ .saved = auth.path };
 }
 
 /// Drop this account's credentials: clear the in-memory tokens and remove its
@@ -161,7 +173,7 @@ const CallbackListener = struct {
     }
 };
 
-test "a failed persist warns and keeps the login usable" {
+test "a failed persist returns memory-only login and keeps credentials usable" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -175,49 +187,45 @@ test "a failed persist warns and keeps the login usable" {
             allocator.free(self.access);
         }
     };
-    const Prompt = struct {
-        warned: usize = 0,
-        authorized: usize = 0,
-
-        fn showSaveFailed(self: *@This(), _: []const u8, _: []const u8) anyerror!void {
-            self.warned += 1;
-        }
-        fn showAuthorized(self: *@This(), _: []const u8) anyerror!void {
-            self.authorized += 1;
-        }
-    };
     var subject: struct {
         gpa: std.mem.Allocator,
         io: std.Io,
         path: []const u8,
         tokens: ?Tokens,
     } = .{ .gpa = gpa, .io = io, .path = undefined, .tokens = null };
-    var prompt: Prompt = .{};
 
-    // A corrupt store refuses the rewrite: the tokens stay installed (the
-    // session is signed in), and the failure surfaces as the warning.
+    // A corrupt store refuses the rewrite: the replacement remains installed,
+    // and the caller receives a committed memory-only outcome to present.
     try tmp.dir.writeFile(io, .{ .sub_path = "auth.json", .data = "not json" });
     var bad_buf: [160]u8 = undefined;
     subject.path = try std.fmt.bufPrint(&bad_buf, ".zig-cache/tmp/{s}/auth.json", .{tmp.sub_path});
-    try commit(&subject, "test_account", Tokens{
+    const memory_only = commit(&subject, "test_account", Tokens{
         .access = try gpa.dupe(u8, "at"),
         .expires_ms = 1,
-    }, &prompt);
+    });
     defer subject.tokens.?.deinit(gpa);
     try std.testing.expectEqualStrings("at", subject.tokens.?.access);
-    try std.testing.expectEqual(@as(usize, 1), prompt.warned);
-    try std.testing.expectEqual(@as(usize, 0), prompt.authorized);
+    switch (memory_only) {
+        .memory_only => |failure| {
+            try std.testing.expectEqualStrings(subject.path, failure.path);
+            try std.testing.expect(@errorName(failure.save_error).len != 0);
+        },
+        .saved => return error.UnexpectedLoginPersistence,
+    }
 
-    // A writable path persists (creating its parent) and reports authorized.
+    // A writable path persists (creating its parent) and returns its path.
     var ok_buf: [160]u8 = undefined;
     subject.path =
         try std.fmt.bufPrint(&ok_buf, ".zig-cache/tmp/{s}/ok/auth.json", .{tmp.sub_path});
-    try commit(&subject, "test_account", Tokens{
+    const saved = commit(&subject, "test_account", Tokens{
         .access = try gpa.dupe(u8, "at2"),
         .expires_ms = 2,
-    }, &prompt);
+    });
     try std.testing.expectEqualStrings("at2", subject.tokens.?.access);
-    try std.testing.expectEqual(@as(usize, 1), prompt.authorized);
+    switch (saved) {
+        .saved => |path| try std.testing.expectEqualStrings(subject.path, path),
+        .memory_only => return error.UnexpectedLoginPersistence,
+    }
     var file = (try auth_store.open(gpa, io, subject.path)).?;
     defer file.deinit();
     try std.testing.expect(file.entry("test_account") != null);

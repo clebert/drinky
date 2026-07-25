@@ -19,6 +19,14 @@ const rounds_max = 50;
 /// Placeholder shown for a redacted reasoning block (its content is encrypted).
 const redacted_notice = "[redacted thinking]";
 
+/// Conservative content for a reserved tool-result slot whose real result never
+/// arrived. It does not claim the call never started: one wording covers a call
+/// that was not started, was interrupted, raised without returning a result, or
+/// changed the world before failing to record one. Stored without an `Error:`
+/// prefix, which the OpenAI serializer adds for error results.
+const synthetic_result =
+    "Tool execution ended before a result was recorded; side effects may have occurred.";
+
 /// Distinct models one session breaks its cost down by; an overflow drops only
 /// the per-model detail, never the cumulative totals.
 const by_model_max = 16;
@@ -87,15 +95,64 @@ pub const Stats = struct {
     }
 };
 
+/// The receipt of one turn: the history span it produced, how far steering
+/// commitment advanced, and whether a committed reply was cut short. Owns no
+/// memory and stays valid only until another turn mutates agent history.
+pub const Receipt = struct {
+    history_base: usize,
+    history_end: usize,
+    steering_committed_count: usize,
+    /// A reply this turn committed stopped at the provider's output or context
+    /// limit: the answer stands as authoritative but is incomplete, so the
+    /// presentation layer says so rather than passing it off as a full reply.
+    truncated: bool = false,
+};
+
+/// A turn's outcome: its receipt, always present so a receipt is never lost
+/// through an error union, plus how the turn ended.
+pub const Outcome = struct {
+    receipt: Receipt,
+    disposition: Disposition,
+
+    pub const Disposition = union(enum) {
+        completed,
+        canceled,
+        /// The presentation callback's event channel closed during the turn.
+        closed,
+        failed: anyerror,
+    };
+};
+
+/// The turn transaction's private bookkeeping: the pre-turn history length, the
+/// latest replay-valid checkpoint an abnormal exit rolls back to, the counts and
+/// flags surfaced in the receipt, and a consumed-but-uncommitted steering batch
+/// retained (and owned here) until its following reply commits.
+const TurnState = struct {
+    base: usize,
+    checkpoint: usize,
+    steering_committed_count: usize = 0,
+    truncated: bool = false,
+    pending_steering: ?[][]u8 = null,
+    presentation_closed: bool = false,
+};
+
 /// One scheduled tool call: the concurrent runner writes `result`; the collector
-/// reads it once the task has finished.
+/// moves it into the reserved history slot once the task has finished.
 const Call = struct {
     id: []const u8,
     name: []const u8,
     input_json: []const u8,
-    // A never-started task keeps this sentinel, so the errdefer's `catch
-    // continue` skips it instead of reading an uninitialized result.
-    result: anyerror!tool.Result = error.NotRun,
+    /// Index in `Agent.items` of this call's reserved `tool_result` slot.
+    result_index: usize = 0,
+    result: State = .pending,
+    /// Whether the real result has replaced the reserved slot's synthetic
+    /// content, so a later harvest or collection does not move it twice.
+    moved: bool = false,
+
+    const State = union(enum) {
+        pending,
+        finished: anyerror!tool.Result,
+    };
 };
 
 /// The production fetch: `provider.Client.send` on the active account. A seam
@@ -110,111 +167,57 @@ const ClientFetch = struct {
     }
 };
 
-/// One streamed reply under assembly: the committed items plus the open answer,
-/// reasoning-run, and tool-call buffers. Flush methods dupe each string before
-/// the append and free every dupe if a later step fails, so a failure leaves no
-/// orphaned allocation.
-const Pending = struct {
-    items: std.ArrayList(llm.Item) = .empty,
-    text: std.ArrayList(u8) = .empty,
-    thinking: std.ArrayList(u8) = .empty,
-    blob: std.ArrayList(u8) = .empty,
-    reasoning_id: std.ArrayList(u8) = .empty,
-    in_thinking: bool = false,
-    tool_id: std.ArrayList(u8) = .empty,
-    tool_name: std.ArrayList(u8) = .empty,
-    input: std.ArrayList(u8) = .empty,
-    in_tool: bool = false,
+/// Duplicate one complete borrowed assistant output into the history shape,
+/// binding a reasoning proof to the exact producing account. This is the sole
+/// ownership boundary for provider output strings.
+fn dupeOutput(
+    gpa: std.mem.Allocator,
+    account: llm.Account,
+    output: *const llm.Event.Output,
+    prior: []const llm.Item,
+) !llm.Item {
+    return switch (output.*) {
+        .message => |text| message: {
+            if (text.len == 0) return error.IncompleteReply;
+            break :message .{ .message = .{
+                .role = .assistant,
+                .text = try gpa.dupe(u8, text),
+            } };
+        },
+        .reasoning => |*reasoning| reasoning: {
+            const replay = reasoning.replay(account) orelse return error.IncompleteReply;
+            break :reasoning .{ .reasoning = .{ .replay = try replay.dupe(gpa) } };
+        },
+        .tool_call => |call| tool_call: {
+            if (call.call_id.len == 0 or duplicateCallId(prior, call.call_id))
+                return error.IncompleteReply;
+            const arguments = if (call.arguments_json.len == 0) "{}" else call.arguments_json;
+            if (!try objectJsonValid(gpa, arguments)) return error.IncompleteReply;
+            const id_copy = try gpa.dupe(u8, call.call_id);
+            errdefer gpa.free(id_copy);
+            const name_copy = try gpa.dupe(u8, call.name);
+            errdefer gpa.free(name_copy);
+            const arguments_copy = try gpa.dupe(u8, arguments);
+            break :tool_call .{ .tool_call = .{
+                .call_id = id_copy,
+                .name = name_copy,
+                .arguments_json = arguments_copy,
+            } };
+        },
+    };
+}
 
-    /// Frees the list backings only; the finished items belong to the caller.
-    fn deinit(self: *Pending, gpa: std.mem.Allocator) void {
-        inline for (@typeInfo(Pending).@"struct".fields) |field| {
-            if (field.type != bool) @field(self, field.name).deinit(gpa);
-        }
-    }
-
-    /// Commit the pending tool call and answer text ahead of a fresh reasoning
-    /// run, keeping stream order.
-    fn flushBeforeRun(self: *Pending, gpa: std.mem.Allocator) !void {
-        if (self.in_tool) try self.flushTool(gpa);
-        try self.flushText(gpa);
-    }
-
-    /// Commit everything buffered in stream order — the pending tool first, then
-    /// the reasoning/answer that streamed after it — keeping the order the model
-    /// produced, reasoning at the head as the provider requires.
-    fn flushAll(self: *Pending, gpa: std.mem.Allocator, origin: llm.Account) !void {
-        if (self.in_tool) try self.flushTool(gpa);
-        try self.flushThinking(gpa, origin);
-        try self.flushText(gpa);
-    }
-
-    fn flushText(self: *Pending, gpa: std.mem.Allocator) !void {
-        if (self.text.items.len == 0) return;
-        const text_copy = try gpa.dupe(u8, self.text.items);
-        errdefer gpa.free(text_copy);
-        try self.items.append(gpa, .{ .message = .{ .role = .assistant, .text = text_copy } });
-        self.text.clearRetainingCapacity();
-    }
-
-    /// Commit the open reasoning run as one item (text plus its verbatim blob
-    /// and item id); a no-op when no run is open.
-    fn flushThinking(self: *Pending, gpa: std.mem.Allocator, origin: llm.Account) !void {
-        if (!self.in_thinking) return;
-        const text_copy = try gpa.dupe(u8, self.thinking.items);
-        errdefer gpa.free(text_copy);
-        const blob_copy = try gpa.dupe(u8, self.blob.items);
-        errdefer gpa.free(blob_copy);
-        const id_copy = try gpa.dupe(u8, self.reasoning_id.items);
-        errdefer gpa.free(id_copy);
-        try self.items.append(gpa, .{ .reasoning = .{
-            .text = text_copy,
-            .blob = blob_copy,
-            .id = id_copy,
-            .origin = origin,
-        } });
-        self.thinking.clearRetainingCapacity();
-        self.blob.clearRetainingCapacity();
-        self.reasoning_id.clearRetainingCapacity();
-        self.in_thinking = false;
-    }
-
-    /// Commit one redacted reasoning block: its encrypted blob and item id,
-    /// with empty visible text.
-    fn appendRedacted(
-        self: *Pending,
-        gpa: std.mem.Allocator,
-        chunk: llm.Event.Blob,
-        origin: llm.Account,
-    ) !void {
-        const blob_copy = try gpa.dupe(u8, chunk.blob);
-        errdefer gpa.free(blob_copy);
-        const id_copy = try gpa.dupe(u8, chunk.id);
-        errdefer gpa.free(id_copy);
-        try self.items.append(gpa, .{ .reasoning = .{
-            .text = "",
-            .blob = blob_copy,
-            .redacted = true,
-            .id = id_copy,
-            .origin = origin,
-        } });
-    }
-
-    fn flushTool(self: *Pending, gpa: std.mem.Allocator) !void {
-        const id_copy = try gpa.dupe(u8, self.tool_id.items);
-        errdefer gpa.free(id_copy);
-        const name_copy = try gpa.dupe(u8, self.tool_name.items);
-        errdefer gpa.free(name_copy);
-        const json_copy = try gpa.dupe(u8, self.input.items);
-        errdefer gpa.free(json_copy);
-        try self.items.append(gpa, .{ .tool_call = .{
-            .call_id = id_copy,
-            .name = name_copy,
-            .arguments_json = json_copy,
-        } });
-        self.in_tool = false;
-    }
-};
+/// Whether `bytes` is a valid top-level JSON object. A parse failure is not
+/// valid; only an allocation failure propagates.
+fn objectJsonValid(gpa: std.mem.Allocator, bytes: []const u8) !bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, gpa, bytes, .{}) catch |err|
+        switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return false,
+        };
+    defer parsed.deinit();
+    return parsed.value == .object;
+}
 
 pub fn init(
     gpa: std.mem.Allocator,
@@ -265,59 +268,209 @@ pub fn signOut(self: *Agent) void {
     self.client = null;
 }
 
+/// Remove replay proofs produced by one account slot. A successful credential
+/// replacement calls this before that slot can represent another principal.
+pub fn dropReasoning(self: *Agent, account: llm.Account) void {
+    var retained_count: usize = 0;
+    for (self.items.items) |item| {
+        const drop = switch (item) {
+            .reasoning => |reasoning| std.meta.activeTag(reasoning.replay) == account,
+            else => false,
+        };
+        if (drop) {
+            freeItem(self.gpa, item);
+            continue;
+        }
+        self.items.items[retained_count] = item;
+        retained_count += 1;
+    }
+    self.items.shrinkRetainingCapacity(retained_count);
+}
+
 /// Switch the reasoning-effort level; takes effect on the next turn.
 pub fn setEffort(self: *Agent, effort: llm.Effort) void {
     self.effort = effort;
 }
 
-/// Run one user turn, streaming output through `handler`.
-pub fn run(self: *Agent, user_text: []const u8, handler: anytype) !void {
-    if (self.client == null) return error.SignedOut;
+/// Run one user turn as a checkpointed transaction, streaming output through
+/// `handler`, and return its outcome. Never returns an error: every exit yields
+/// a receipt, so a receipt is never lost through an error union. Signed out (a
+/// state the app refuses to start a turn in) yields a failed disposition.
+pub fn run(self: *Agent, user_text: []const u8, handler: anytype) Outcome {
+    const base = self.items.items.len;
+    if (self.client == null) return .{
+        .receipt = .{
+            .history_base = base,
+            .history_end = base,
+            .steering_committed_count = 0,
+        },
+        .disposition = .{ .failed = error.SignedOut },
+    };
     var fetch: ClientFetch = .{ .client = &self.client.? };
-    return self.runWith(&fetch, user_text, handler);
+    return self.runTurn(&fetch, user_text, handler);
 }
 
+/// The error-returning seam for the reply/round-loop tests.
 fn runWith(self: *Agent, fetch: anytype, user_text: []const u8, handler: anytype) !void {
-    const base = self.items.items.len;
-    errdefer self.rollback(base);
+    return dispositionError(self.runTurn(fetch, user_text, handler).disposition);
+}
+
+fn dispositionError(disposition: Outcome.Disposition) !void {
+    return switch (disposition) {
+        .completed => {},
+        .canceled => error.Canceled,
+        .closed => error.Closed,
+        .failed => |err| err,
+    };
+}
+
+/// Run one user turn as a checkpointed transaction and return its outcome. Every
+/// exit — completion, cancellation, channel close, or failure — yields a
+/// receipt: an abnormal exit rolls history back to the latest valid checkpoint
+/// (retaining every completed round and its tool results) and returns any
+/// consumed-but-uncommitted steering to the queue, rather than unwinding the
+/// whole turn.
+fn runTurn(self: *Agent, fetch: anytype, user_text: []const u8, handler: anytype) Outcome {
+    return self.runTurnWith(fetch, tool, user_text, handler);
+}
+
+/// `runTurn` with an injectable tool dispatch, so a test can drive the whole
+/// round loop against controllable fake tools rather than the real registry.
+fn runTurnWith(
+    self: *Agent,
+    fetch: anytype,
+    comptime Dispatch: type,
+    user_text: []const u8,
+    handler: anytype,
+) Outcome {
+    var turn: TurnState = .{ .base = self.items.items.len, .checkpoint = self.items.items.len };
+    const disposition: Outcome.Disposition =
+        if (self.runRounds(Dispatch, fetch, &turn, user_text, handler)) |_|
+            .completed
+        else |err|
+            classifyDisposition(&turn, err);
+    switch (disposition) {
+        .completed => {},
+        else => self.rollbackTurn(&turn),
+    }
+    return .{
+        .receipt = .{
+            .history_base = turn.base,
+            .history_end = self.items.items.len,
+            .steering_committed_count = turn.steering_committed_count,
+            .truncated = turn.truncated,
+        },
+        .disposition = disposition,
+    };
+}
+
+fn classifyDisposition(turn: *const TurnState, err: anyerror) Outcome.Disposition {
+    if (turn.presentation_closed) return .closed;
+    return switch (err) {
+        error.Canceled => .canceled,
+        else => .{ .failed = err },
+    };
+}
+
+/// Preserve callback error provenance in turn state: only a presentation
+/// callback's channel closure is teardown; the same error from a tool or
+/// transport remains an ordinary failure.
+fn presentation(closed: *bool, result: anyerror!void) !void {
+    result catch |err| {
+        if (err == error.Closed) closed.* = true;
+        return err;
+    };
+}
+
+fn runRounds(
+    self: *Agent,
+    comptime Dispatch: type,
+    fetch: anytype,
+    turn: *TurnState,
+    user_text: []const u8,
+    handler: anytype,
+) !void {
     try self.appendUser(user_text);
     var round: usize = 0;
     while (round < rounds_max) : (round += 1) {
-        const reply = (try self.fetchReply(fetch, handler, base)) orelse return;
-        const ran_tools = try self.runTools(reply, handler);
+        const reply = try self.fetchReply(fetch, turn, handler);
+        const ran_tools = try self.runToolsWith(Dispatch, reply, turn, handler);
+        // A no-tool reply commits here; a tool-calling reply committed itself
+        // together with its reserved results before dispatch.
+        if (!ran_tools) self.advanceCheckpoint(turn);
         // Fold mid-turn steering in before the next round; with no tools asked,
         // a steering message keeps the turn going rather than ending it.
-        const steered = try self.drainSteering(handler);
+        const steered = try self.drainSteering(turn, handler);
         if (!ran_tools and !steered) return;
     }
     return error.TooManyToolRounds;
 }
 
-/// Deliver every queued steering message as one combined user message, appended
-/// to history and reported. Returns whether anything was delivered.
-fn drainSteering(self: *Agent, handler: anytype) !bool {
-    var pending = try self.steering.take();
-    defer {
-        for (pending) |message| self.gpa.free(message);
-        self.gpa.free(pending);
+/// Roll an abnormally-ended turn back to its latest valid checkpoint and return
+/// the consumed-but-uncommitted steering batch to the queue. Allocation-free.
+fn rollbackTurn(self: *Agent, turn: *TurnState) void {
+    self.rollback(turn.checkpoint);
+    if (turn.pending_steering) |steering| {
+        var batch = steering;
+        self.steering.restoreTaken(&batch);
+        turn.pending_steering = null;
     }
-    if (pending.len == 0) return false;
+}
+
+/// Commit the latest reply (and any reserved tool-result slots) by advancing the
+/// checkpoint, which simultaneously commits the steering batch that preceded it.
+fn advanceCheckpoint(self: *Agent, turn: *TurnState) void {
+    turn.checkpoint = self.items.items.len;
+    if (turn.pending_steering) |batch| {
+        turn.steering_committed_count += batch.len;
+        freeSteeringBatch(self.gpa, batch);
+        turn.pending_steering = null;
+    }
+}
+
+fn freeSteeringBatch(gpa: std.mem.Allocator, batch: [][]u8) void {
+    for (batch) |message| gpa.free(message);
+    gpa.free(batch);
+}
+
+/// Deliver every queued steering message as one combined user message, appended
+/// to history and reported. On success the taken batch is retained in turn state
+/// until its following reply commits, so an abnormal exit before then can return
+/// it to the queue; a failed delivery returns it at once. Returns whether
+/// anything was delivered.
+fn drainSteering(self: *Agent, turn: *TurnState, handler: anytype) !bool {
+    var pending = try self.steering.take();
+    if (pending.len == 0) {
+        self.gpa.free(pending);
+        return false;
+    }
     // A failed delivery restores the whole batch ahead of messages submitted
-    // since the take, without allocating or exposing a partial batch.
-    errdefer self.steering.restoreTaken(&pending);
+    // since the take, without allocating or exposing a partial batch. Guarded by
+    // the move below: once turn state owns the batch, `rollbackTurn` restores it,
+    // and restoring twice would hand the queue one batch under two owners.
+    errdefer if (turn.pending_steering == null) self.steering.restoreTaken(&pending);
     const combined = try Steering.join(self.gpa, pending);
     defer self.gpa.free(combined);
     try self.appendUser(combined);
-    try handler.onSteering(combined, pending.len);
+    try presentation(&turn.presentation_closed, handler.onSteering(combined, pending.len));
+    std.debug.assert(turn.pending_steering == null);
+    turn.pending_steering = pending;
     return true;
 }
 
 /// Stream one assistant reply, retrying on transient failures. Only whole
 /// requests are safe to retry, so a failed attempt's partial reply is discarded
 /// (history untouched) and `handler.onStreamReset` clears partial output first.
-/// Returns the reply's items (already appended to history), or null when a
-/// non-retryable error was reported and the turn ends.
-fn fetchReply(self: *Agent, fetch: anytype, handler: anytype, base: usize) !?[]const llm.Item {
+/// Returns the reply's items (already appended to history). A provider/API error
+/// is reported through `handler.onError` and surfaced as `error.ApiError`, which
+/// the turn transaction classifies as a failed disposition and rolls back to the
+/// latest checkpoint — retaining every round completed before it.
+fn fetchReply(
+    self: *Agent,
+    fetch: anytype,
+    turn: *TurnState,
+    handler: anytype,
+) ![]const llm.Item {
     const model = self.model;
     const request: llm.Request = .{
         .model = model.name,
@@ -330,7 +483,8 @@ fn fetchReply(self: *Agent, fetch: anytype, handler: anytype, base: usize) !?[]c
     };
     var attempt: u32 = 1;
     while (true) : (attempt += 1) {
-        if (attempt > 1) try handler.onStreamReset();
+        if (attempt > 1)
+            try presentation(&turn.presentation_closed, handler.onStreamReset());
         var stream: @TypeOf(fetch.*).Stream = undefined;
         fetch.send(&stream, &request) catch |err| {
             if (retryableError(err) and attempt < self.retry.attempts_max) {
@@ -349,15 +503,15 @@ fn fetchReply(self: *Agent, fetch: anytype, handler: anytype, base: usize) !?[]c
                 });
                 continue;
             }
-            try self.reportAndReset(handler, stream.errorText(), base);
-            return null;
+            try presentation(&turn.presentation_closed, handler.onError(stream.errorText()));
+            return error.ApiError;
         }
-        const reply = self.readReply(&model, &stream, handler) catch |err| switch (err) {
+        const reply = self.readReplyWith(&model, &stream, turn, handler) catch |err| switch (err) {
             error.ApiError => {
-                try self.reportAndReset(handler, stream.errorText(), base);
-                return null;
+                try presentation(&turn.presentation_closed, handler.onError(stream.errorText()));
+                return error.ApiError;
             },
-            error.Canceled, error.Closed => return err,
+            error.Canceled => return err,
             else => {
                 if (retryableError(err) and attempt < self.retry.attempts_max) {
                     try self.backoff(.{ .attempt = attempt });
@@ -384,6 +538,7 @@ fn retryableError(err: anyerror) bool {
     return switch (err) {
         error.Timeout,
         error.IncompleteReply,
+        error.EmptyReply,
         error.ReadFailed,
         error.WriteFailed,
         error.EndOfStream,
@@ -399,12 +554,6 @@ fn retryableError(err: anyerror) bool {
     };
 }
 
-/// Surface a failed turn to the handler, restoring history to the turn's start.
-fn reportAndReset(self: *Agent, handler: anytype, text: []const u8, base: usize) !void {
-    self.rollback(base);
-    try handler.onError(text);
-}
-
 /// Free and drop every history item from `base` on; capacity is retained so a
 /// rolled-back turn does not thrash the list backing.
 fn rollback(self: *Agent, base: usize) void {
@@ -416,11 +565,7 @@ fn rollback(self: *Agent, base: usize) void {
 fn freeItem(gpa: std.mem.Allocator, item: llm.Item) void {
     switch (item) {
         .message => |message| gpa.free(message.text),
-        .reasoning => |reasoning| {
-            gpa.free(reasoning.text);
-            gpa.free(reasoning.blob);
-            gpa.free(reasoning.id);
-        },
+        .reasoning => |reasoning| reasoning.replay.deinit(gpa),
         .tool_call => |call| {
             gpa.free(call.call_id);
             gpa.free(call.name);
@@ -462,69 +607,89 @@ fn readReply(
     stream: anytype,
     handler: anytype,
 ) ![]const llm.Item {
-    const gpa = self.gpa;
-    // Tag reasoning with the producing account, so a serializer replays blobs
-    // only for that exact account.
-    const origin = self.client.?.account();
-    // The defer frees the buffer backings; the errdefer frees the finished items
-    // only on failure, since a successful commit hands them to `self.items`.
-    var state: Pending = .{};
-    defer state.deinit(gpa);
-    errdefer for (state.items.items) |item| freeItem(gpa, item);
-    var maybe_usage: ?llm.Usage = null;
+    var turn: TurnState = .{ .base = self.items.items.len, .checkpoint = self.items.items.len };
+    return self.readReplyWith(model, stream, &turn, handler);
+}
 
-    while (try stream.next()) |event| switch (event) {
-        .thinking => |chunk| {
-            // A run with its blob, or a differing item id, is finished: commit
-            // it so adjacent runs stay separate items.
-            if (state.blob.items.len != 0 or newRunId(state.reasoning_id.items, chunk.id))
-                try state.flushThinking(gpa, origin);
-            if (!state.in_thinking) try state.flushBeforeRun(gpa);
-            state.in_thinking = true;
-            if (chunk.id.len != 0) try setBuffer(gpa, &state.reasoning_id, chunk.id);
-            try state.thinking.appendSlice(gpa, chunk.text);
-            try handler.onThinking(chunk.text);
-        },
-        // The blob closes the run; mark it open so a blob-only run round-trips.
-        .thinking_blob => |chunk| {
-            if (newRunId(state.reasoning_id.items, chunk.id))
-                try state.flushThinking(gpa, origin);
-            if (!state.in_thinking) try state.flushBeforeRun(gpa);
-            state.in_thinking = true;
-            if (chunk.id.len != 0) try setBuffer(gpa, &state.reasoning_id, chunk.id);
-            try state.blob.appendSlice(gpa, chunk.blob);
-        },
-        .thinking_redacted => |chunk| {
-            try state.flushThinking(gpa, origin);
-            try state.appendRedacted(gpa, chunk, origin);
-            try handler.onThinking(redacted_notice);
-        },
-        .text => |delta| {
-            try state.flushThinking(gpa, origin);
-            try state.text.appendSlice(gpa, delta);
-            try handler.onText(delta);
-        },
-        .tool_use => |use| {
-            try state.flushAll(gpa, origin);
-            try setBuffer(gpa, &state.tool_id, use.call_id);
-            try setBuffer(gpa, &state.tool_name, use.name);
-            state.input.clearRetainingCapacity();
-            state.in_tool = true;
-        },
-        .input_json => |chunk| try state.input.appendSlice(gpa, chunk),
-        .stop => |stop| {
-            maybe_usage = stop.usage;
+fn readReplyWith(
+    self: *Agent,
+    model: *const models.Model,
+    stream: anytype,
+    turn: *TurnState,
+    handler: anytype,
+) ![]const llm.Item {
+    const gpa = self.gpa;
+    const presentation_closed = &turn.presentation_closed;
+    const account = self.client.?.account();
+    var reply_items: std.ArrayList(llm.Item) = .empty;
+    defer reply_items.deinit(gpa);
+    errdefer for (reply_items.items) |item| freeItem(gpa, item);
+    var reply_invalid = false;
+    var maybe_stop: ?llm.Event.Stop = null;
+
+    while (try stream.next()) |event| {
+        if (event == .stop) {
+            maybe_stop = event.stop;
             break;
-        },
+        }
+        if (reply_invalid) continue;
+        self.appendReplyEvent(
+            &reply_items,
+            account,
+            &event,
+            presentation_closed,
+            handler,
+        ) catch |err| switch (err) {
+            error.IncompleteReply => reply_invalid = true,
+            else => return err,
+        };
+    }
+    const stop = maybe_stop orelse return error.IncompleteReply;
+    // Terminal usage is billable even when replay validation rejects the reply
+    // and the request is retried.
+    self.recordUsage(model, &stop.usage);
+    try presentation(presentation_closed, handler.onUsage(self.stats));
+
+    if (stop.rejection) |rejection| return switch (rejection) {
+        .invalid => error.IncompleteReply,
+        .unsupported => error.UnsupportedReply,
     };
-    const usage = maybe_usage orelse return error.IncompleteReply;
-    self.recordUsage(model, &usage);
-    try handler.onUsage(self.stats);
-    try state.flushAll(gpa, origin);
+    if (reply_invalid) return error.IncompleteReply;
+    if (stop.status == .truncated and replyHasToolCall(reply_items.items))
+        return error.IncompleteReply;
+    // A terminal reply that produced no assistant item at all is distinct from a
+    // cut-short one: resampling is still worth a retry, but the exhausted-retry
+    // report should say the model returned nothing rather than blame the stream.
+    if (reply_items.items.len == 0) return error.EmptyReply;
 
     const start = self.items.items.len;
-    try self.items.appendSlice(gpa, state.items.items);
+    try self.items.appendSlice(gpa, reply_items.items);
+    // Only a committed reply's cutoff is worth reporting: a rejected truncation
+    // is retried, and a resampled attempt may well finish.
+    if (stop.status == .truncated) turn.truncated = true;
     return self.items.items[start..];
+}
+
+fn appendReplyEvent(
+    self: *Agent,
+    reply_items: *std.ArrayList(llm.Item),
+    account: llm.Account,
+    event: *const llm.Event,
+    presentation_closed: *bool,
+    handler: anytype,
+) !void {
+    switch (event.*) {
+        .text => |delta| try presentation(presentation_closed, handler.onText(delta)),
+        .thinking => |delta| try presentation(presentation_closed, handler.onThinking(delta)),
+        .item => |*output| {
+            const item = try dupeOutput(self.gpa, account, output, reply_items.items);
+            errdefer freeItem(self.gpa, item);
+            if (output.* == .reasoning and output.reasoning.isRedacted())
+                try presentation(presentation_closed, handler.onThinking(redacted_notice));
+            try reply_items.append(self.gpa, item);
+        },
+        .stop => unreachable,
+    }
 }
 
 /// The concurrent read-only task body, monomorphized per `Dispatch` so the real
@@ -532,33 +697,41 @@ fn readReply(
 fn Runner(comptime Dispatch: type) type {
     return struct {
         fn run(call: *Call, context: *const tool.Context) void {
-            call.result = Dispatch.run(context, call.name, call.input_json);
+            call.result = .{ .finished = Dispatch.run(context, call.name, call.input_json) };
         }
     };
 }
 
 /// Run the assistant's tool calls through the real tool registry.
-fn runTools(self: *Agent, reply: []const llm.Item, handler: anytype) !bool {
-    return self.runToolsWith(tool, reply, handler);
+fn runTools(self: *Agent, reply: []const llm.Item, turn: *TurnState, handler: anytype) !bool {
+    return self.runToolsWith(tool, reply, turn, handler);
 }
 
-/// Run every tool the assistant asked for, queuing results in call order so each
-/// `tool_result` maps back to its `tool_call`. `Dispatch` names the tool source
-/// (`mutates` and `run`); tests inject controllable tools into this same path.
+/// Run every tool the assistant asked for, its result committed in call order so
+/// each `tool_result` maps back to its `tool_call`. `Dispatch` names the tool
+/// source (`mutates` and `run`); tests inject controllable tools into this path.
 ///
+/// A conservative error result is reserved in history for every call and the
+/// round is committed (checkpoint advanced) before anything is announced or
+/// dispatched, so no mutation can change the world with no result recorded.
 /// Contiguous read-only calls run concurrently; a mutating call is a barrier —
-/// it awaits every earlier read and runs alone, so no mutation overlaps a read
-/// or another mutation and call order gives a coherent filesystem view. Any
-/// failure (a mid-turn cancel included) aborts before any later call runs; the
-/// errdefer reaps in-flight tasks first. Returns false when no tools were asked.
+/// it awaits, transfers, and presents every earlier read before announcing
+/// itself, then runs alone. Any failure (a
+/// mid-turn cancel included) reaps in-flight tasks and harvests their finished
+/// results into the reserved slots, leaving the committed round replay-valid.
+/// Returns false when no tools were asked.
 fn runToolsWith(
     self: *Agent,
     comptime Dispatch: type,
     reply: []const llm.Item,
+    turn: *TurnState,
     handler: anytype,
 ) !bool {
     var call_list: std.ArrayList(Call) = .empty;
     defer call_list.deinit(self.gpa);
+    // Collect the calls before reserving results: the reservation append can move
+    // the items backing array, invalidating `reply`, but the borrowed id, name,
+    // and argument strings are separate heap allocations that stay valid.
     for (reply) |item| switch (item) {
         .tool_call => |call| try call_list.append(
             self.gpa,
@@ -566,72 +739,173 @@ fn runToolsWith(
         ),
         else => {},
     };
-    // Stable from here on: nothing appends once the tasks hold pointers.
     const calls = call_list.items;
     if (calls.len == 0) return false;
 
+    // Reserve one synthetic error result per call and commit the whole round
+    // (reply + results) before any side effect can occur. A preparation failure
+    // announces and dispatches nothing; the turn rolls back the reply.
+    try self.reserveResults(calls);
+    self.advanceCheckpoint(turn);
+
     const context: tool.Context = .{ .gpa = self.gpa, .io = self.io };
     var group: std.Io.Group = .init;
-    var dispatched: usize = 0;
-    var collected: usize = 0;
-    // On any early exit, cancel and reap the group (interrupting running tools),
-    // then free the results of every finished-but-uncollected call.
+    // On any early exit, reap in-flight tasks, then move every successful,
+    // not-yet-moved result into its reserved slot; errored or never-run calls
+    // keep the conservative synthetic result. This allocates nothing.
     errdefer {
         group.cancel(self.io);
-        for (calls[collected..dispatched]) |call| {
-            const result = call.result catch continue;
-            self.gpa.free(result.content);
-        }
+        self.harvestResults(calls);
     }
 
     for (calls) |*call| {
-        try handler.onToolStart(call.name, call.input_json);
-        if (Dispatch.mutates(call.name)) {
-            // Drain earlier reads so the mutation can't race one; the emptied
-            // group is reused for the reads that follow.
+        const mutates = Dispatch.mutates(call.name);
+        if (mutates) {
+            // Drain earlier reads so the mutation can't race one, transferring
+            // and presenting them in call order; the emptied group is reused.
+            // Both happen before the announce, so presentation never shows a
+            // later call starting above an earlier call's result, and a cancel
+            // at the barrier never announces a mutation that did not run.
             try group.await(self.io);
             group = .init;
-            call.result = try Dispatch.run(&context, call.name, call.input_json);
+            try self.presentReady(calls, turn, handler);
+        }
+        try presentation(
+            &turn.presentation_closed,
+            handler.onToolStart(call.name, call.input_json),
+        );
+        if (mutates) {
+            call.result = .{ .finished = Dispatch.run(&context, call.name, call.input_json) };
+            try self.presentResult(call, turn, handler);
         } else {
             try group.concurrent(self.io, Runner(Dispatch).run, .{ call, &context });
         }
-        dispatched += 1;
     }
     try group.await(self.io);
-
-    const results = try self.gpa.alloc(llm.Item, calls.len);
-    defer self.gpa.free(results);
-    errdefer for (results[0..collected]) |item| freeItem(self.gpa, item);
-    while (collected < calls.len) : (collected += 1) {
-        const call = &calls[collected];
-        const result = try call.result;
-        try handler.onToolResult(call.name, result.content, result.is_error);
-        const call_id = try self.gpa.dupe(u8, call.id);
-        errdefer self.gpa.free(call_id);
-        const content = try self.gpa.dupe(u8, result.content);
-        errdefer self.gpa.free(content);
-        results[collected] = .{ .tool_result = .{
-            .call_id = call_id,
-            .content = content,
-            .is_error = result.is_error,
-        } };
-        self.gpa.free(result.content);
-    }
-
-    try self.items.appendSlice(self.gpa, results);
+    try self.presentReady(calls, turn, handler);
     return true;
 }
 
-/// Replace `buffer`'s contents with `bytes`, retaining its capacity.
-fn setBuffer(gpa: std.mem.Allocator, buffer: *std.ArrayList(u8), bytes: []const u8) !void {
-    buffer.clearRetainingCapacity();
-    try buffer.appendSlice(gpa, bytes);
+/// Append one synthetic error `tool_result` per call, recording each slot's
+/// index on its `Call`. Capacity is reserved up front so the appends cannot fail
+/// after the first; on a mid-run failure this frees the current call's partial
+/// dupes while the turn rollback frees the slots already committed.
+fn reserveResults(self: *Agent, calls: []Call) !void {
+    try self.items.ensureUnusedCapacity(self.gpa, calls.len);
+    const base = self.items.items.len;
+    for (calls, 0..) |*call, index| {
+        const id_copy = try self.gpa.dupe(u8, call.id);
+        errdefer self.gpa.free(id_copy);
+        const content_copy = try self.gpa.dupe(u8, synthetic_result);
+        errdefer self.gpa.free(content_copy);
+        self.items.appendAssumeCapacity(.{ .tool_result = .{
+            .call_id = id_copy,
+            .content = content_copy,
+            .is_error = true,
+        } });
+        call.result_index = base + index;
+    }
 }
 
-/// Whether an incoming chunk's item id names a different reasoning item than
-/// the open run's, marking a run boundary. An empty id (Anthropic) never does.
-fn newRunId(current: []const u8, incoming: []const u8) bool {
-    return current.len != 0 and incoming.len != 0 and !std.mem.eql(u8, current, incoming);
+/// Present every completed, not-yet-moved call in call order, moving each result
+/// into its slot before its callback. Stops at the first call whose result is
+/// not yet available (a barrier awaits only the reads dispatched before it).
+fn presentReady(
+    self: *Agent,
+    calls: []Call,
+    turn: *TurnState,
+    handler: anytype,
+) !void {
+    for (calls) |*call| {
+        if (call.moved) continue;
+        switch (call.result) {
+            .pending => break,
+            .finished => try self.presentResult(call, turn, handler),
+        }
+    }
+}
+
+/// Move a completed call's owned result content into its reserved slot (freeing
+/// the synthetic content it replaces) and then present it. The move is
+/// allocation-free and precedes the fallible callback, so a callback failure
+/// leaves provider-visible history honest. A call that raised instead of
+/// returning a result propagates its error, leaving the synthetic result intact.
+fn presentResult(self: *Agent, call: *Call, turn: *TurnState, handler: anytype) !void {
+    const result = switch (call.result) {
+        .pending => unreachable,
+        .finished => |finished| try finished,
+    };
+    self.transferResult(call, result);
+    const slot = self.items.items[call.result_index].tool_result;
+    try presentation(
+        &turn.presentation_closed,
+        handler.onToolResult(call.name, slot.content, slot.is_error),
+    );
+}
+
+/// After reaping tasks, move every successful, not-yet-moved result into its
+/// slot; an errored or never-run call keeps its synthetic result. No allocation.
+fn harvestResults(self: *Agent, calls: []Call) void {
+    for (calls) |*call| {
+        if (call.moved) continue;
+        const finished = switch (call.result) {
+            .pending => continue,
+            .finished => |result| result,
+        };
+        const result = finished catch continue;
+        self.transferResult(call, result);
+    }
+}
+
+/// Move a completed result's owned content into its reserved slot, replacing and
+/// freeing the synthetic content it held. Allocation-free.
+fn transferResult(self: *Agent, call: *Call, result: tool.Result) void {
+    const slot = &self.items.items[call.result_index].tool_result;
+    self.gpa.free(slot.content);
+    slot.content = result.content;
+    slot.is_error = result.is_error;
+    call.moved = true;
+}
+
+fn replyHasToolCall(items: []const llm.Item) bool {
+    for (items) |item| if (item == .tool_call) return true;
+    return false;
+}
+
+/// Whether a call already committed in *this reply* carries `id`, so a repeated
+/// identifier is rejected before it enters history. Uniqueness is deliberately
+/// scoped to one reply: that is what the wire format requires (a second call
+/// sharing an id inside one response is unanswerable — one result cannot address
+/// both), while an id reappearing in a later round is already paired with its own
+/// result and replays unambiguously, so rejecting it would fail a turn over a
+/// harmless provider quirk.
+fn duplicateCallId(items: []const llm.Item, id: []const u8) bool {
+    for (items) |item| switch (item) {
+        .tool_call => |call| if (std.mem.eql(u8, call.call_id, id)) return true,
+        else => {},
+    };
+    return false;
+}
+
+test "only presentation callback closure maps to a closed disposition" {
+    var presentation_turn: TurnState = .{ .base = 0, .checkpoint = 0 };
+    try std.testing.expectError(
+        error.Closed,
+        presentation(&presentation_turn.presentation_closed, error.Closed),
+    );
+    try std.testing.expect(std.meta.activeTag(
+        classifyDisposition(&presentation_turn, error.Closed),
+    ) == .closed);
+
+    var tool_turn: TurnState = .{ .base = 0, .checkpoint = 0 };
+    switch (classifyDisposition(&tool_turn, error.Closed)) {
+        .failed => |err| try std.testing.expect(err == error.Closed),
+        else => return error.UnexpectedDisposition,
+    }
+    switch (classifyDisposition(&tool_turn, error.PresentationChannelClosed)) {
+        .failed => |err| try std.testing.expect(err == error.PresentationChannelClosed),
+        else => return error.UnexpectedDisposition,
+    }
 }
 
 test retryableError {
@@ -808,17 +1082,22 @@ test "steering is delivered as one combined user message" {
     var handler: SteerHandler = .{ .gpa = gpa };
     defer handler.deinit();
 
+    var turn: TurnState = .{ .base = 0, .checkpoint = 0 };
+    defer if (turn.pending_steering) |batch| freeSteeringBatch(gpa, batch);
     try agent.steering.push("a");
     try agent.steering.push("b");
-    try std.testing.expect(try agent.drainSteering(&handler));
+    try std.testing.expect(try agent.drainSteering(&turn, &handler));
 
     try std.testing.expectEqual(@as(usize, 1), agent.items.items.len);
     try std.testing.expectEqual(llm.Role.user, agent.items.items[0].message.role);
     try std.testing.expectEqualStrings("a\n\nb", agent.items.items[0].message.text);
     try std.testing.expectEqualStrings("a\n\nb", handler.text.items);
     try std.testing.expectEqual(@as(usize, 2), handler.count);
+    // The delivered batch is consumed but retained until its following reply.
+    try std.testing.expect(turn.pending_steering != null);
+    try std.testing.expectEqual(@as(usize, 0), turn.steering_committed_count);
 
-    try std.testing.expect(!try agent.drainSteering(&handler));
+    try std.testing.expect(!try agent.drainSteering(&turn, &handler));
 }
 
 test "steering appends a separate user item, leaving grouping to the serializer" {
@@ -830,9 +1109,11 @@ test "steering appends a separate user item, leaving grouping to the serializer"
 
     // A trailing user item, as a round's tool results leave it: the Agent
     // appends a separate item; the Anthropic serializer merges the run.
+    var turn: TurnState = .{ .base = 0, .checkpoint = 0 };
+    defer if (turn.pending_steering) |batch| freeSteeringBatch(gpa, batch);
     try agent.appendUser("tool results");
     try agent.steering.push("steer");
-    try std.testing.expect(try agent.drainSteering(&handler));
+    try std.testing.expect(try agent.drainSteering(&turn, &handler));
 
     try std.testing.expectEqual(@as(usize, 2), agent.items.items.len);
     try std.testing.expectEqual(llm.Role.user, agent.items.items[0].message.role);
@@ -858,9 +1139,11 @@ test "a cancel during steering delivery returns the taken batch to the queue" {
     };
     var handler: CancelHandler = .{};
 
+    var turn: TurnState = .{ .base = 0, .checkpoint = 0 };
     try agent.steering.push("a");
     try agent.steering.push("b");
-    try std.testing.expectError(error.Canceled, agent.drainSteering(&handler));
+    try std.testing.expectError(error.Canceled, agent.drainSteering(&turn, &handler));
+    try std.testing.expect(turn.pending_steering == null);
 
     // The batch is back in the queue, in order, for cancel to return to the editor.
     const taken = try agent.steering.take();
@@ -898,9 +1181,10 @@ test "a callback failure after recall restores the batch as a queue prefix" {
     };
     var handler: RecallCancelHandler = .{ .gpa = gpa, .steering = &agent.steering };
 
+    var turn: TurnState = .{ .base = 0, .checkpoint = 0 };
     try agent.steering.push("a");
     try agent.steering.push("b");
-    try std.testing.expectError(error.Canceled, agent.drainSteering(&handler));
+    try std.testing.expectError(error.Canceled, agent.drainSteering(&turn, &handler));
 
     const restored = try agent.steering.take();
     defer {
@@ -1002,8 +1286,14 @@ fn anthropicStream(io: std.Io, reader: *std.Io.Reader, idle_ms: u64) provider.St
     stream.anthropic_subscription.idle_ms = idle_ms;
     stream.anthropic_subscription.budget = .{ .max = net.stream_response_bytes_max };
     stream.anthropic_subscription.body = reader;
-    stream.anthropic_subscription.parsed = null;
-    stream.anthropic_subscription.terminal = false;
+    stream.anthropic_subscription.frame_arena = .init(std.testing.allocator);
+    stream.anthropic_subscription.stop_reason = .none;
+    stream.anthropic_subscription.terminal_rejection = null;
+    stream.anthropic_subscription.open_block = null;
+    stream.anthropic_subscription.block_text = .empty;
+    stream.anthropic_subscription.block_proof = .empty;
+    stream.anthropic_subscription.tool_call_id = .empty;
+    stream.anthropic_subscription.tool_name = .empty;
     stream.anthropic_subscription.usage = .{};
     return stream;
 }
@@ -1015,7 +1305,10 @@ fn openaiStream(io: std.Io, reader: *std.Io.Reader) provider.Stream {
     stream.openai_api.idle_ms = 60_000;
     stream.openai_api.budget = .{ .max = net.stream_response_bytes_max };
     stream.openai_api.body = reader;
-    stream.openai_api.parsed = null;
+    stream.openai_api.frame_arena = .init(std.testing.allocator);
+    stream.openai_api.terminal_rejection = null;
+    stream.openai_api.incomplete_message = false;
+    stream.openai_api.completed_item_ids = .empty;
     stream.openai_api.usage = .{};
     return stream;
 }
@@ -1030,7 +1323,8 @@ fn expectIncompleteToolStream(
             error.IncompleteReply => null,
             else => return err,
         };
-    if (maybe_reply) |reply| _ = try agent.runTools(reply, handler);
+    var turn: TurnState = .{ .base = agent.items.items.len, .checkpoint = agent.items.items.len };
+    if (maybe_reply) |reply| _ = try agent.runTools(reply, &turn, handler);
 
     try std.testing.expect(maybe_reply == null);
     try std.testing.expectEqual(@as(usize, 0), handler.tool_start_count);
@@ -1041,6 +1335,7 @@ fn expectIncompleteToolStream(
 test "readReply stops before a post-completion timeout" {
     const events = [_]llm.Event{
         .{ .text = "done" },
+        .{ .item = .{ .message = "done" } },
         .{ .stop = .{ .usage = .{ .output = 4 } } },
     };
     var stream: ScriptedStream = .{ .events = &events, .terminal_error = error.Timeout };
@@ -1055,6 +1350,97 @@ test "readReply stops before a post-completion timeout" {
     try std.testing.expectEqual(@as(usize, 1), handler.usage_count);
 }
 
+test "readReply records terminal usage before rejecting an invalid reply" {
+    const gpa = std.testing.allocator;
+    // A terminal truncated tool reply is rejected, but its billed usage remains.
+    {
+        var agent = scriptedAgent(gpa);
+        defer agent.deinit();
+        var handler: CaptureHandler = .{ .gpa = gpa };
+        defer handler.deinit();
+        const events = [_]llm.Event{
+            .{ .item = .{ .tool_call = .{
+                .call_id = "t1",
+                .name = "read",
+                .arguments_json = "{}",
+            } } },
+            .{ .stop = .{ .usage = .{ .input = 17 }, .status = .truncated } },
+        };
+        var stream: ScriptedStream = .{ .events = &events };
+        try std.testing.expectError(
+            error.IncompleteReply,
+            agent.readReply(&agent.model, &stream, &handler),
+        );
+        try std.testing.expectEqual(@as(u64, 17), agent.stats.last.input);
+        try std.testing.expectEqual(@as(usize, 1), handler.usage_count);
+        try std.testing.expectEqual(@as(usize, 0), agent.items.items.len);
+    }
+    // An empty completed reply preserves the same accounting behavior.
+    {
+        var agent = scriptedAgent(gpa);
+        defer agent.deinit();
+        var handler: CaptureHandler = .{ .gpa = gpa };
+        defer handler.deinit();
+        const events = [_]llm.Event{
+            .{ .thinking = "unfinished" },
+            .{ .stop = .{ .usage = .{ .output = 23 } } },
+        };
+        var stream: ScriptedStream = .{ .events = &events };
+        try std.testing.expectError(
+            error.EmptyReply,
+            agent.readReply(&agent.model, &stream, &handler),
+        );
+        try std.testing.expectEqual(@as(u64, 23), agent.stats.last.output);
+        try std.testing.expectEqual(@as(usize, 1), handler.usage_count);
+    }
+    // Invalid completed item data is latched; remaining display content is
+    // ignored while the stream drains through terminal usage.
+    {
+        var agent = scriptedAgent(gpa);
+        defer agent.deinit();
+        var handler: CaptureHandler = .{ .gpa = gpa };
+        defer handler.deinit();
+        const events = [_]llm.Event{
+            .{ .item = .{ .tool_call = .{
+                .call_id = "t1",
+                .name = "read",
+                .arguments_json = "not json",
+            } } },
+            .{ .text = "ignored" },
+            .{ .stop = .{ .usage = .{ .cache_read = 29 } } },
+        };
+        var stream: ScriptedStream = .{ .events = &events };
+        try std.testing.expectError(
+            error.IncompleteReply,
+            agent.readReply(&agent.model, &stream, &handler),
+        );
+        try std.testing.expectEqual(events.len, stream.index);
+        try std.testing.expectEqual(@as(u64, 29), agent.stats.last.cache_read);
+        try std.testing.expectEqual(@as(usize, 1), handler.usage_count);
+        try std.testing.expectEqualStrings("", handler.text.items);
+    }
+}
+
+test "readReply rejects a terminal response with no assistant items" {
+    const gpa = std.testing.allocator;
+    var agent = scriptedAgent(gpa);
+    defer agent.deinit();
+    var handler: CaptureHandler = .{ .gpa = gpa };
+    defer handler.deinit();
+    const events = [_]llm.Event{
+        .{ .stop = .{ .usage = .{ .output = 3 } } },
+    };
+    var stream: ScriptedStream = .{ .events = &events };
+
+    try std.testing.expectError(
+        error.EmptyReply,
+        agent.readReply(&agent.model, &stream, &handler),
+    );
+    try std.testing.expectEqual(@as(u64, 3), agent.stats.last.output);
+    try std.testing.expectEqual(@as(usize, 1), handler.usage_count);
+    try std.testing.expectEqual(@as(usize, 0), agent.items.items.len);
+}
+
 test "a failed reply attempt reclaims its transient allocations" {
     var failing: std.testing.FailingAllocator = .init(std.testing.allocator, .{});
     const gpa = failing.allocator();
@@ -1063,12 +1449,17 @@ test "a failed reply attempt reclaims its transient allocations" {
     var handler: CaptureHandler = .{ .gpa = gpa };
     defer handler.deinit();
 
-    // A large text chunk then a tool call, ending without a stop event: each
+    // A large message then a tool call, ending without a stop event: each
     // attempt allocates item memory and then fails.
     const big = "x" ** 4096;
     const events = [_]llm.Event{
         .{ .text = big },
-        .{ .tool_use = .{ .call_id = "t1", .name = "read" } },
+        .{ .item = .{ .message = big } },
+        .{ .item = .{ .tool_call = .{
+            .call_id = "t1",
+            .name = "read",
+            .arguments_json = "{}",
+        } } },
     };
 
     // One warm-up attempt settles the reusable capacities (the item list, the
@@ -1108,11 +1499,17 @@ test "rollback frees every item appended since the base" {
 
     // A multi-string reply past the base: reasoning run, answer, and tool call.
     const events = [_]llm.Event{
-        .{ .thinking = .{ .id = "rs_1", .text = "weigh it" } },
-        .{ .thinking_blob = .{ .id = "rs_1", .blob = "sig" } },
+        .{ .thinking = "weigh it" },
+        .{ .item = .{ .reasoning = .{
+            .signature = .{ .text = "weigh it", .signature = "sig" },
+        } } },
         .{ .text = "answer" },
-        .{ .tool_use = .{ .call_id = "t1", .name = "read" } },
-        .{ .input_json = "{}" },
+        .{ .item = .{ .message = "answer" } },
+        .{ .item = .{ .tool_call = .{
+            .call_id = "t1",
+            .name = "read",
+            .arguments_json = "{}",
+        } } },
         .{ .stop = .{ .usage = .{} } },
     };
     var stream: ScriptedStream = .{ .events = &events };
@@ -1135,14 +1532,39 @@ fn readReplyUnderOom(allocator: std.mem.Allocator) !void {
 
     // One reply exercising every multi-string item builder.
     const events = [_]llm.Event{
-        .{ .thinking = .{ .id = "rs_1", .text = "weigh it" } },
-        .{ .thinking_blob = .{ .id = "rs_1", .blob = "sig" } },
-        .{ .thinking_redacted = .{ .id = "rs_2", .blob = "enc" } },
+        .{ .thinking = "weigh it" },
+        .{ .item = .{ .reasoning = .{
+            .signature = .{ .text = "weigh it", .signature = "sig" },
+        } } },
+        .{ .item = .{ .reasoning = .{ .redacted = "enc" } } },
         .{ .text = "answer" },
-        .{ .tool_use = .{ .call_id = "t1", .name = "read" } },
-        .{ .input_json = "{\"path\":\"a\"}" },
+        .{ .item = .{ .message = "answer" } },
+        .{ .item = .{ .tool_call = .{
+            .call_id = "t1",
+            .name = "read",
+            .arguments_json = "{\"path\":\"a\"}",
+        } } },
         .{ .text = "trailing" },
+        .{ .item = .{ .message = "trailing" } },
         .{ .stop = .{ .usage = .{ .output = 5 } } },
+    };
+    var stream: ScriptedStream = .{ .events = &events };
+    _ = try agent.readReply(&agent.model, &stream, &handler);
+}
+
+fn readOpenAiReasoningUnderOom(allocator: std.mem.Allocator) !void {
+    var agent = openaiScriptedAgent(allocator);
+    defer agent.deinit();
+    var handler: CaptureHandler = .{ .gpa = allocator };
+    defer handler.deinit();
+    const events = [_]llm.Event{
+        .{ .thinking = "encrypted" },
+        .{ .item = .{ .reasoning = .{ .encrypted = .{
+            .text = "encrypted",
+            .id = "rs_1",
+            .encrypted_content = "ciphertext",
+        } } } },
+        .{ .stop = .{ .usage = .{} } },
     };
     var stream: ScriptedStream = .{ .events = &events };
     _ = try agent.readReply(&agent.model, &stream, &handler);
@@ -1150,13 +1572,21 @@ fn readReplyUnderOom(allocator: std.mem.Allocator) !void {
 
 test "readReply frees partial work at every allocation-failure point" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, readReplyUnderOom, .{});
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        readOpenAiReasoningUnderOom,
+        .{},
+    );
 }
 
 test "readReply accepts Anthropic message_stop without waiting for later traffic" {
     const body =
         "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10}}}\n\n" ++
-        "data: {\"type\":\"content_block_delta\"," ++
+        "data: {\"type\":\"content_block_start\",\"index\":0," ++
+        "\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" ++
+        "data: {\"type\":\"content_block_delta\",\"index\":0," ++
         "\"delta\":{\"type\":\"text_delta\",\"text\":\"done\"}}\n\n" ++
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
         "data: {\"type\":\"message_delta\"," ++
         "\"delta\":{\"stop_reason\":\"end_turn\"}," ++
         "\"usage\":{\"output_tokens\":4}}\n\n" ++
@@ -1166,7 +1596,7 @@ test "readReply accepts Anthropic message_stop without waiting for later traffic
     defer threaded.deinit();
     var reader: std.Io.Reader = .fixed(body);
     var stream = anthropicStream(threaded.io(), &reader, 0);
-    defer if (stream.anthropic_subscription.parsed) |parsed| parsed.deinit();
+    defer stream.anthropic_subscription.deinitDecode();
     var agent = scriptedAgent(std.testing.allocator);
     defer agent.deinit();
     var handler: CaptureHandler = .{ .gpa = std.testing.allocator };
@@ -1185,6 +1615,9 @@ test "readReply accepts Anthropic message_stop without waiting for later traffic
 test "readReply accepts OpenAI completion without consuming its done sentinel" {
     const body =
         "data: {\"type\":\"response.output_text.delta\",\"delta\":\"done\"}\n\n" ++
+        "data: {\"type\":\"response.output_item.done\",\"item\":{" ++
+        "\"type\":\"message\",\"id\":\"msg_1\",\"role\":\"assistant\",\"content\":[" ++
+        "{\"type\":\"output_text\",\"text\":\"done\"}]}}\n\n" ++
         "data: {\"type\":\"response.completed\"," ++
         "\"response\":{\"status\":\"completed\",\"usage\":" ++
         "{\"input_tokens\":10,\"output_tokens\":4}}}\n\n" ++
@@ -1193,7 +1626,7 @@ test "readReply accepts OpenAI completion without consuming its done sentinel" {
     defer threaded.deinit();
     var reader: std.Io.Reader = .fixed(body);
     var stream = openaiStream(threaded.io(), &reader);
-    defer if (stream.openai_api.parsed) |parsed| parsed.deinit();
+    defer stream.openai_api.deinitDecode();
     var agent = openaiScriptedAgent(std.testing.allocator);
     defer agent.deinit();
     var handler: CaptureHandler = .{ .gpa = std.testing.allocator };
@@ -1208,6 +1641,88 @@ test "readReply accepts OpenAI completion without consuming its done sentinel" {
     try std.testing.expect(std.mem.indexOf(u8, reader.buffered(), "[DONE]") != null);
 }
 
+test "provider rejections retain terminal usage before failing the reply" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+
+    // Anthropic reports usage before message_stop resolves refusal as unsupported.
+    {
+        const body =
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":11}}}\n\n" ++
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\"}," ++
+            "\"usage\":{\"output_tokens\":7}}\n\n" ++
+            "data: {\"type\":\"message_stop\"}\n\n";
+        var reader: std.Io.Reader = .fixed(body);
+        var stream = anthropicStream(threaded.io(), &reader, 60_000);
+        defer stream.anthropic_subscription.deinitDecode();
+        var agent = scriptedAgent(gpa);
+        defer agent.deinit();
+        var handler: CaptureHandler = .{ .gpa = gpa };
+        defer handler.deinit();
+
+        try std.testing.expectError(
+            error.UnsupportedReply,
+            agent.readReply(&agent.model, &stream, &handler),
+        );
+        try std.testing.expectEqual(@as(u64, 11), agent.stats.last.input);
+        try std.testing.expectEqual(@as(u64, 7), agent.stats.last.output);
+        try std.testing.expectEqual(@as(usize, 1), handler.usage_count);
+    }
+    // OpenAI refusal frames drain through response.completed and its usage.
+    {
+        const body =
+            "data: {\"type\":\"response.refusal.delta\",\"delta\":\"no\"}\n\n" ++
+            "data: {\"type\":\"response.refusal.done\",\"refusal\":\"no\"}\n\n" ++
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"," ++
+            "\"usage\":{\"input_tokens\":13,\"output_tokens\":5}}}\n\n";
+        var reader: std.Io.Reader = .fixed(body);
+        var stream = openaiStream(threaded.io(), &reader);
+        defer stream.openai_api.deinitDecode();
+        var agent = openaiScriptedAgent(gpa);
+        defer agent.deinit();
+        var handler: CaptureHandler = .{ .gpa = gpa };
+        defer handler.deinit();
+
+        try std.testing.expectError(
+            error.UnsupportedReply,
+            agent.readReply(&agent.model, &stream, &handler),
+        );
+        try std.testing.expectEqual(@as(u64, 13), agent.stats.last.input);
+        try std.testing.expectEqual(@as(u64, 5), agent.stats.last.output);
+        try std.testing.expectEqual(@as(usize, 1), handler.usage_count);
+    }
+    // An incomplete function item is retryable, but the rejected attempt is
+    // still included in accounting.
+    {
+        const body =
+            "data: {\"type\":\"response.output_item.added\",\"item\":" ++
+            "{\"id\":\"fc_1\",\"type\":\"function_call\",\"call_id\":\"call_1\"," ++
+            "\"name\":\"read\"}}\n\n" ++
+            "data: {\"type\":\"response.output_item.done\",\"item\":" ++
+            "{\"id\":\"fc_1\",\"type\":\"function_call\",\"status\":\"incomplete\"," ++
+            "\"call_id\":\"call_1\",\"arguments\":\"{}\"}}\n\n" ++
+            "data: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\"," ++
+            "\"usage\":{\"input_tokens\":17,\"output_tokens\":3}}}\n\n";
+        var reader: std.Io.Reader = .fixed(body);
+        var stream = openaiStream(threaded.io(), &reader);
+        defer stream.openai_api.deinitDecode();
+        var agent = openaiScriptedAgent(gpa);
+        defer agent.deinit();
+        var handler: CaptureHandler = .{ .gpa = gpa };
+        defer handler.deinit();
+
+        try std.testing.expectError(
+            error.IncompleteReply,
+            agent.readReply(&agent.model, &stream, &handler),
+        );
+        try std.testing.expectEqual(@as(u64, 17), agent.stats.last.input);
+        try std.testing.expectEqual(@as(u64, 3), agent.stats.last.output);
+        try std.testing.expectEqual(@as(usize, 1), handler.usage_count);
+        try std.testing.expectEqual(@as(usize, 0), agent.items.items.len);
+    }
+}
+
 test "readReply separates OpenAI reasoning summary parts with a blank line" {
     // Two summary parts share one reasoning item and arrive with no text between
     // them; the rising summary_index on the second part.added is the only seam,
@@ -1216,13 +1731,15 @@ test "readReply separates OpenAI reasoning summary parts with a blank line" {
         "data: {\"type\":\"response.reasoning_summary_part.added\"," ++
         "\"item_id\":\"rs_1\",\"summary_index\":0,\"part\":{\"type\":\"summary_text\",\"text\":\"\"}}\n\n" ++
         "data: {\"type\":\"response.reasoning_summary_text.delta\"," ++
-        "\"item_id\":\"rs_1\",\"delta\":\"a\"}\n\n" ++
+        "\"item_id\":\"rs_1\",\"summary_index\":0,\"delta\":\"a\"}\n\n" ++
         "data: {\"type\":\"response.reasoning_summary_part.added\"," ++
         "\"item_id\":\"rs_1\",\"summary_index\":1,\"part\":{\"type\":\"summary_text\",\"text\":\"\"}}\n\n" ++
         "data: {\"type\":\"response.reasoning_summary_text.delta\"," ++
-        "\"item_id\":\"rs_1\",\"delta\":\"b\"}\n\n" ++
+        "\"item_id\":\"rs_1\",\"summary_index\":1,\"delta\":\"b\"}\n\n" ++
         "data: {\"type\":\"response.output_item.done\"," ++
-        "\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\",\"encrypted_content\":\"enc\"}}\n\n" ++
+        "\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\",\"summary\":[" ++
+        "{\"type\":\"summary_text\",\"text\":\"a\"},{\"type\":\"summary_text\",\"text\":\"b\"}]," ++
+        "\"encrypted_content\":\"enc\"}}\n\n" ++
         "data: {\"type\":\"response.completed\"," ++
         "\"response\":{\"status\":\"completed\",\"usage\":" ++
         "{\"input_tokens\":1,\"output_tokens\":1}}}\n\n";
@@ -1230,7 +1747,7 @@ test "readReply separates OpenAI reasoning summary parts with a blank line" {
     defer threaded.deinit();
     var reader: std.Io.Reader = .fixed(body);
     var stream = openaiStream(threaded.io(), &reader);
-    defer if (stream.openai_api.parsed) |parsed| parsed.deinit();
+    defer stream.openai_api.deinitDecode();
     var agent = openaiScriptedAgent(std.testing.allocator);
     defer agent.deinit();
     var handler: CaptureHandler = .{ .gpa = std.testing.allocator };
@@ -1238,9 +1755,13 @@ test "readReply separates OpenAI reasoning summary parts with a blank line" {
 
     const reply = try agent.readReply(&agent.model, &stream, &handler);
     try std.testing.expectEqual(@as(usize, 1), reply.len);
-    try std.testing.expectEqualStrings("a\n\nb", reply[0].reasoning.text);
-    try std.testing.expectEqualStrings("enc", reply[0].reasoning.blob);
-    try std.testing.expectEqualStrings("rs_1", reply[0].reasoning.id);
+    try std.testing.expectEqualStrings("a\n\nb", reply[0].reasoning.replay.openai_api.text);
+    try std.testing.expectEqual(
+        llm.Account.openai_api,
+        std.meta.activeTag(reply[0].reasoning.replay),
+    );
+    try std.testing.expectEqualStrings("enc", reply[0].reasoning.replay.openai_api.encrypted_content);
+    try std.testing.expectEqualStrings("rs_1", reply[0].reasoning.replay.openai_api.id);
     try std.testing.expectEqualStrings("a\n\nb", handler.thinking.items);
 }
 
@@ -1254,7 +1775,7 @@ test "readReply rejects provider EOF before text completion" {
             "\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n";
         var reader: std.Io.Reader = .fixed(body);
         var stream = anthropicStream(threaded.io(), &reader, 60_000);
-        defer if (stream.anthropic_subscription.parsed) |parsed| parsed.deinit();
+        defer stream.anthropic_subscription.deinitDecode();
         var agent = scriptedAgent(std.testing.allocator);
         defer agent.deinit();
         var handler: CaptureHandler = .{ .gpa = std.testing.allocator };
@@ -1272,7 +1793,7 @@ test "readReply rejects provider EOF before text completion" {
         const body = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n";
         var reader: std.Io.Reader = .fixed(body);
         var stream = openaiStream(threaded.io(), &reader);
-        defer if (stream.openai_api.parsed) |parsed| parsed.deinit();
+        defer stream.openai_api.deinitDecode();
         var agent = openaiScriptedAgent(std.testing.allocator);
         defer agent.deinit();
         var handler: CaptureHandler = .{ .gpa = std.testing.allocator };
@@ -1299,7 +1820,7 @@ test "incomplete provider tool calls never enter history or execute" {
             "{\"type\":\"input_json_delta\",\"partial_json\":\"{\"}}\n\n";
         var reader: std.Io.Reader = .fixed(body);
         var stream = anthropicStream(threaded.io(), &reader, 60_000);
-        defer if (stream.anthropic_subscription.parsed) |parsed| parsed.deinit();
+        defer stream.anthropic_subscription.deinitDecode();
         var agent = scriptedAgent(std.testing.allocator);
         defer agent.deinit();
         var handler: CaptureHandler = .{ .gpa = std.testing.allocator };
@@ -1316,7 +1837,7 @@ test "incomplete provider tool calls never enter history or execute" {
             "data: {\"type\":\"response.function_call_arguments.delta\",\"delta\":\"{\"}\n\n";
         var reader: std.Io.Reader = .fixed(body);
         var stream = openaiStream(threaded.io(), &reader);
-        defer if (stream.openai_api.parsed) |parsed| parsed.deinit();
+        defer stream.openai_api.deinitDecode();
         var agent = openaiScriptedAgent(std.testing.allocator);
         defer agent.deinit();
         var handler: CaptureHandler = .{ .gpa = std.testing.allocator };
@@ -1334,22 +1855,36 @@ test "readReply assembles a reasoning run, answer, and tool call in stream order
     defer handler.deinit();
 
     const events = [_]llm.Event{
-        .{ .thinking = .{ .text = "weigh " } },
-        .{ .thinking = .{ .text = "it" } },
-        .{ .thinking_blob = .{ .blob = "sig" } },
+        .{ .thinking = "weigh " },
+        .{ .thinking = "it" },
+        .{ .item = .{ .reasoning = .{
+            .signature = .{ .text = "weigh it", .signature = "sig" },
+        } } },
         .{ .text = "answer" },
-        .{ .tool_use = .{ .call_id = "t1", .name = "read" } },
-        .{ .input_json = "{\"path\":\"a\"}" },
+        .{ .item = .{ .message = "answer" } },
+        .{ .item = .{ .tool_call = .{
+            .call_id = "t1",
+            .name = "read",
+            .arguments_json = "{\"path\":\"a\"}",
+        } } },
         .{ .stop = .{ .usage = .{ .output = 5 } } },
     };
     var stream: ScriptedStream = .{ .events = &events };
 
     const reply = try agent.readReply(&agent.model, &stream, &handler);
     try std.testing.expectEqual(@as(usize, 3), reply.len);
-    try std.testing.expectEqualStrings("weigh it", reply[0].reasoning.text);
-    try std.testing.expectEqualStrings("sig", reply[0].reasoning.blob);
-    try std.testing.expect(!reply[0].reasoning.redacted);
-    try std.testing.expectEqual(llm.Account.anthropic_subscription, reply[0].reasoning.origin);
+    try std.testing.expectEqualStrings(
+        "weigh it",
+        reply[0].reasoning.replay.anthropic_subscription.signature.text,
+    );
+    try std.testing.expectEqual(
+        llm.Account.anthropic_subscription,
+        std.meta.activeTag(reply[0].reasoning.replay),
+    );
+    try std.testing.expectEqualStrings(
+        "sig",
+        reply[0].reasoning.replay.anthropic_subscription.signature.signature,
+    );
     try std.testing.expectEqualStrings("answer", reply[1].message.text);
     try std.testing.expectEqualStrings("t1", reply[2].tool_call.call_id);
     try std.testing.expectEqualStrings("read", reply[2].tool_call.name);
@@ -1367,20 +1902,30 @@ test "readReply keeps a redacted block and a signature-only run in order" {
     defer handler.deinit();
 
     const events = [_]llm.Event{
-        .{ .thinking_redacted = .{ .blob = "enc" } },
-        .{ .thinking_blob = .{ .blob = "sigonly" } },
+        .{ .item = .{ .reasoning = .{ .redacted = "enc" } } },
+        .{ .item = .{ .reasoning = .{
+            .signature = .{ .text = "", .signature = "sigonly" },
+        } } },
         .{ .text = "hi" },
+        .{ .item = .{ .message = "hi" } },
         .{ .stop = .{ .usage = .{} } },
     };
     var stream: ScriptedStream = .{ .events = &events };
 
     const reply = try agent.readReply(&agent.model, &stream, &handler);
     try std.testing.expectEqual(@as(usize, 3), reply.len);
-    try std.testing.expect(reply[0].reasoning.redacted);
-    try std.testing.expectEqualStrings("enc", reply[0].reasoning.blob);
-    try std.testing.expect(!reply[1].reasoning.redacted);
-    try std.testing.expectEqualStrings("", reply[1].reasoning.text);
-    try std.testing.expectEqualStrings("sigonly", reply[1].reasoning.blob);
+    try std.testing.expectEqualStrings(
+        "enc",
+        reply[0].reasoning.replay.anthropic_subscription.redacted,
+    );
+    try std.testing.expectEqualStrings(
+        "",
+        reply[1].reasoning.replay.anthropic_subscription.signature.text,
+    );
+    try std.testing.expectEqualStrings(
+        "sigonly",
+        reply[1].reasoning.replay.anthropic_subscription.signature.signature,
+    );
     try std.testing.expectEqualStrings("hi", reply[2].message.text);
     try std.testing.expectEqualStrings(redacted_notice, handler.thinking.items);
 }
@@ -1393,9 +1938,13 @@ test "readReply commits trailing text after the final tool in stream order" {
     defer handler.deinit();
 
     const events = [_]llm.Event{
-        .{ .tool_use = .{ .call_id = "t1", .name = "read" } },
-        .{ .input_json = "{}" },
+        .{ .item = .{ .tool_call = .{
+            .call_id = "t1",
+            .name = "read",
+            .arguments_json = "{}",
+        } } },
         .{ .text = "after" },
+        .{ .item = .{ .message = "after" } },
         .{ .stop = .{ .usage = .{} } },
     };
     var stream: ScriptedStream = .{ .events = &events };
@@ -1408,76 +1957,346 @@ test "readReply commits trailing text after the final tool in stream order" {
 
 test "readReply keeps adjacent reasoning runs as separate items in stream order" {
     const gpa = std.testing.allocator;
-    var agent = scriptedAgent(gpa);
+    var agent = openaiScriptedAgent(gpa);
     defer agent.deinit();
     var handler: CaptureHandler = .{ .gpa = gpa };
     defer handler.deinit();
 
-    // Each run keeps its own blob and id, and the text stays between the runs
-    // it streamed between rather than sinking below them.
+    // Each run keeps its own proof, and text stays between the runs it streamed
+    // between rather than sinking below them.
     const events = [_]llm.Event{
-        .{ .thinking = .{ .id = "rs_a", .text = "A" } },
-        .{ .thinking_blob = .{ .id = "rs_a", .blob = "encA" } },
-        .{ .thinking = .{ .id = "rs_b", .text = "B" } },
-        .{ .thinking_blob = .{ .id = "rs_b", .blob = "encB" } },
+        .{ .thinking = "A" },
+        .{ .item = .{ .reasoning = .{ .encrypted = .{
+            .text = "A",
+            .id = "rs_a",
+            .encrypted_content = "encA",
+        } } } },
+        .{ .thinking = "B" },
+        .{ .item = .{ .reasoning = .{ .encrypted = .{
+            .text = "B",
+            .id = "rs_b",
+            .encrypted_content = "encB",
+        } } } },
         .{ .text = "between" },
-        .{ .thinking = .{ .id = "rs_c", .text = "C" } },
-        .{ .thinking_blob = .{ .id = "rs_c", .blob = "encC" } },
-        .{ .tool_use = .{ .call_id = "t1", .name = "read" } },
-        .{ .input_json = "{}" },
+        .{ .item = .{ .message = "between" } },
+        .{ .thinking = "C" },
+        .{ .item = .{ .reasoning = .{ .encrypted = .{
+            .text = "C",
+            .id = "rs_c",
+            .encrypted_content = "encC",
+        } } } },
+        .{ .item = .{ .tool_call = .{
+            .call_id = "t1",
+            .name = "read",
+            .arguments_json = "{}",
+        } } },
         .{ .stop = .{ .usage = .{} } },
     };
     var stream: ScriptedStream = .{ .events = &events };
 
     const reply = try agent.readReply(&agent.model, &stream, &handler);
     try std.testing.expectEqual(@as(usize, 5), reply.len);
-    try std.testing.expectEqualStrings("A", reply[0].reasoning.text);
-    try std.testing.expectEqualStrings("encA", reply[0].reasoning.blob);
-    try std.testing.expectEqualStrings("rs_a", reply[0].reasoning.id);
-    try std.testing.expectEqualStrings("B", reply[1].reasoning.text);
-    try std.testing.expectEqualStrings("encB", reply[1].reasoning.blob);
-    try std.testing.expectEqualStrings("rs_b", reply[1].reasoning.id);
+    try std.testing.expectEqualStrings("A", reply[0].reasoning.replay.openai_api.text);
+    try std.testing.expectEqualStrings(
+        "encA",
+        reply[0].reasoning.replay.openai_api.encrypted_content,
+    );
+    try std.testing.expectEqualStrings("rs_a", reply[0].reasoning.replay.openai_api.id);
+    try std.testing.expectEqualStrings("B", reply[1].reasoning.replay.openai_api.text);
+    try std.testing.expectEqualStrings(
+        "encB",
+        reply[1].reasoning.replay.openai_api.encrypted_content,
+    );
+    try std.testing.expectEqualStrings("rs_b", reply[1].reasoning.replay.openai_api.id);
     try std.testing.expectEqualStrings("between", reply[2].message.text);
-    try std.testing.expectEqualStrings("C", reply[3].reasoning.text);
-    try std.testing.expectEqualStrings("encC", reply[3].reasoning.blob);
-    try std.testing.expectEqualStrings("rs_c", reply[3].reasoning.id);
+    try std.testing.expectEqualStrings("C", reply[3].reasoning.replay.openai_api.text);
+    try std.testing.expectEqualStrings(
+        "encC",
+        reply[3].reasoning.replay.openai_api.encrypted_content,
+    );
+    try std.testing.expectEqualStrings("rs_c", reply[3].reasoning.replay.openai_api.id);
     try std.testing.expectEqualStrings("t1", reply[4].tool_call.call_id);
 }
 
-test "readReply tags reasoning with the active provider as origin, threading its id" {
+test "readReply binds reasoning proof to the active account" {
     const gpa = std.testing.allocator;
-    // An openai-backed agent must stamp reasoning with its own account or the
-    // serializer drops it as foreign; the reasoning id rides along for replay.
     var agent = openaiScriptedAgent(gpa);
     defer agent.deinit();
     var handler: CaptureHandler = .{ .gpa = gpa };
     defer handler.deinit();
 
     const events = [_]llm.Event{
-        .{ .thinking = .{ .id = "rs_1", .text = "hmm" } },
-        .{ .thinking_blob = .{ .id = "rs_1", .blob = "enc" } },
+        .{ .thinking = "hmm" },
+        .{ .item = .{ .reasoning = .{ .encrypted = .{
+            .text = "hmm",
+            .id = "rs_1",
+            .encrypted_content = "enc",
+        } } } },
         .{ .text = "done" },
+        .{ .item = .{ .message = "done" } },
         .{ .stop = .{ .usage = .{} } },
     };
     var stream: ScriptedStream = .{ .events = &events };
     const reply = try agent.readReply(&agent.model, &stream, &handler);
     try std.testing.expectEqual(@as(usize, 2), reply.len);
-    try std.testing.expectEqual(llm.Account.openai_api, reply[0].reasoning.origin);
-    try std.testing.expectEqualStrings("rs_1", reply[0].reasoning.id);
-    try std.testing.expectEqualStrings("hmm", reply[0].reasoning.text);
-    try std.testing.expectEqualStrings("enc", reply[0].reasoning.blob);
+    try std.testing.expectEqual(
+        llm.Account.openai_api,
+        std.meta.activeTag(reply[0].reasoning.replay),
+    );
+    try std.testing.expectEqualStrings("rs_1", reply[0].reasoning.replay.openai_api.id);
+    try std.testing.expectEqualStrings("hmm", reply[0].reasoning.replay.openai_api.text);
+    try std.testing.expectEqualStrings(
+        "enc",
+        reply[0].reasoning.replay.openai_api.encrypted_content,
+    );
     try std.testing.expectEqualStrings("done", reply[1].message.text);
 }
 
+test "dropReasoning invalidates only the replaced account slot" {
+    const gpa = std.testing.allocator;
+    var agent = scriptedAgent(gpa);
+    defer agent.deinit();
+    var handler: CaptureHandler = .{ .gpa = gpa };
+    defer handler.deinit();
+
+    const anthropic_events = [_]llm.Event{
+        .{ .item = .{ .reasoning = .{
+            .signature = .{ .text = "a", .signature = "sig" },
+        } } },
+        .{ .stop = .{ .usage = .{} } },
+    };
+    var anthropic_stream: ScriptedStream = .{ .events = &anthropic_events };
+    _ = try agent.readReply(&agent.model, &anthropic_stream, &handler);
+
+    const openai_model = models.get(.openai, "gpt-5.6-sol").?;
+    const openai_client = provider.Client.init(
+        gpa,
+        std.testing.io,
+        .{ .openai_api = "sk-test" },
+        .{},
+    );
+    agent.switchTo(openai_client, openai_model);
+    const openai_events = [_]llm.Event{
+        .{ .item = .{ .reasoning = .{ .encrypted = .{
+            .text = "b",
+            .id = "rs_1",
+            .encrypted_content = "enc",
+        } } } },
+        .{ .stop = .{ .usage = .{} } },
+    };
+    var openai_stream: ScriptedStream = .{ .events = &openai_events };
+    _ = try agent.readReply(&agent.model, &openai_stream, &handler);
+
+    try std.testing.expectEqual(@as(usize, 2), agent.items.items.len);
+    agent.dropReasoning(.anthropic_subscription);
+    try std.testing.expectEqual(@as(usize, 1), agent.items.items.len);
+    try std.testing.expectEqual(
+        llm.Account.openai_api,
+        std.meta.activeTag(agent.items.items[0].reasoning.replay),
+    );
+    agent.dropReasoning(.openai_api);
+    try std.testing.expectEqual(@as(usize, 0), agent.items.items.len);
+}
+
+test "readReply retains a truncated tool-free reply but rejects a truncated tool call" {
+    const gpa = std.testing.allocator;
+    // A truncated answer with no tool call is an authoritative reply and commits.
+    {
+        var agent = scriptedAgent(gpa);
+        defer agent.deinit();
+        var handler: CaptureHandler = .{ .gpa = gpa };
+        defer handler.deinit();
+        const events = [_]llm.Event{
+            .{ .text = "half" },
+            .{ .item = .{ .message = "half" } },
+            .{ .stop = .{ .usage = .{}, .status = .truncated } },
+        };
+        var stream: ScriptedStream = .{ .events = &events };
+        const reply = try agent.readReply(&agent.model, &stream, &handler);
+        try std.testing.expectEqual(@as(usize, 1), reply.len);
+        try std.testing.expectEqualStrings("half", reply[0].message.text);
+    }
+    // A truncated reply that still holds a tool call cannot be answered; reject it.
+    {
+        var agent = scriptedAgent(gpa);
+        defer agent.deinit();
+        var handler: CaptureHandler = .{ .gpa = gpa };
+        defer handler.deinit();
+        const events = [_]llm.Event{
+            .{ .item = .{ .tool_call = .{
+                .call_id = "t1",
+                .name = "read",
+                .arguments_json = "{}",
+            } } },
+            .{ .stop = .{ .usage = .{}, .status = .truncated } },
+        };
+        var stream: ScriptedStream = .{ .events = &events };
+        try std.testing.expectError(
+            error.IncompleteReply,
+            agent.readReply(&agent.model, &stream, &handler),
+        );
+        try std.testing.expectEqual(@as(usize, 0), agent.items.items.len);
+    }
+}
+
+test "readReply validates tool arguments: empty is an object, non-object rejects" {
+    const gpa = std.testing.allocator;
+    // Empty closed arguments commit as an empty object.
+    {
+        var agent = scriptedAgent(gpa);
+        defer agent.deinit();
+        var handler: CaptureHandler = .{ .gpa = gpa };
+        defer handler.deinit();
+        const events = [_]llm.Event{
+            .{ .item = .{ .tool_call = .{
+                .call_id = "t1",
+                .name = "read",
+                .arguments_json = "",
+            } } },
+            .{ .stop = .{ .usage = .{} } },
+        };
+        var stream: ScriptedStream = .{ .events = &events };
+        const reply = try agent.readReply(&agent.model, &stream, &handler);
+        try std.testing.expectEqual(@as(usize, 1), reply.len);
+        try std.testing.expectEqualStrings("{}", reply[0].tool_call.arguments_json);
+    }
+    // A non-object final argument is not replayable verbatim; reject it.
+    {
+        var agent = scriptedAgent(gpa);
+        defer agent.deinit();
+        var handler: CaptureHandler = .{ .gpa = gpa };
+        defer handler.deinit();
+        const events = [_]llm.Event{
+            .{ .item = .{ .tool_call = .{
+                .call_id = "t1",
+                .name = "read",
+                .arguments_json = "[1,2]",
+            } } },
+            .{ .stop = .{ .usage = .{} } },
+        };
+        var stream: ScriptedStream = .{ .events = &events };
+        try std.testing.expectError(
+            error.IncompleteReply,
+            agent.readReply(&agent.model, &stream, &handler),
+        );
+        try std.testing.expectEqual(@as(usize, 0), agent.items.items.len);
+    }
+}
+
+test "readReply rejects empty and duplicate call identifiers" {
+    const gpa = std.testing.allocator;
+    const Case = struct { events: []const llm.Event };
+    const empty_id = [_]llm.Event{
+        .{ .item = .{ .tool_call = .{
+            .call_id = "",
+            .name = "read",
+            .arguments_json = "{}",
+        } } },
+        .{ .stop = .{ .usage = .{} } },
+    };
+    const duplicate = [_]llm.Event{
+        .{ .item = .{ .tool_call = .{
+            .call_id = "t1",
+            .name = "read",
+            .arguments_json = "{}",
+        } } },
+        .{ .item = .{ .tool_call = .{
+            .call_id = "t1",
+            .name = "read",
+            .arguments_json = "{}",
+        } } },
+        .{ .stop = .{ .usage = .{} } },
+    };
+    const cases = [_]Case{
+        .{ .events = &empty_id },
+        .{ .events = &duplicate },
+    };
+    for (cases) |case| {
+        var agent = scriptedAgent(gpa);
+        defer agent.deinit();
+        var handler: CaptureHandler = .{ .gpa = gpa };
+        defer handler.deinit();
+        var stream: ScriptedStream = .{ .events = case.events };
+        try std.testing.expectError(
+            error.IncompleteReply,
+            agent.readReply(&agent.model, &stream, &handler),
+        );
+        try std.testing.expectEqual(@as(usize, 0), agent.items.items.len);
+    }
+}
+
+test "readReply rejects incomplete or invalid reasoning proof" {
+    const gpa = std.testing.allocator;
+    // A presented run with no complete reasoning event retains nothing, so the
+    // reply is empty rather than invalid.
+    {
+        var agent = scriptedAgent(gpa);
+        defer agent.deinit();
+        var handler: CaptureHandler = .{ .gpa = gpa };
+        defer handler.deinit();
+        const events = [_]llm.Event{
+            .{ .thinking = "weigh" },
+            .{ .stop = .{ .usage = .{} } },
+        };
+        var stream: ScriptedStream = .{ .events = &events };
+        try std.testing.expectError(
+            error.EmptyReply,
+            agent.readReply(&agent.model, &stream, &handler),
+        );
+        try std.testing.expectEqual(@as(usize, 0), agent.items.items.len);
+    }
+    // A structurally incomplete identified proof cannot bind to the account.
+    {
+        var agent = openaiScriptedAgent(gpa);
+        defer agent.deinit();
+        var handler: CaptureHandler = .{ .gpa = gpa };
+        defer handler.deinit();
+        const events = [_]llm.Event{
+            .{ .thinking = "weigh" },
+            .{ .item = .{ .reasoning = .{ .encrypted = .{
+                .text = "weigh",
+                .id = "",
+                .encrypted_content = "enc",
+            } } } },
+            .{ .stop = .{ .usage = .{} } },
+        };
+        var stream: ScriptedStream = .{ .events = &events };
+        try std.testing.expectError(
+            error.IncompleteReply,
+            agent.readReply(&agent.model, &stream, &handler),
+        );
+        try std.testing.expectEqual(@as(usize, 0), agent.items.items.len);
+    }
+    // Anthropic redacted: an empty encrypted payload is not replayable either.
+    {
+        var agent = scriptedAgent(gpa);
+        defer agent.deinit();
+        var handler: CaptureHandler = .{ .gpa = gpa };
+        defer handler.deinit();
+        const events = [_]llm.Event{
+            .{ .item = .{ .reasoning = .{ .redacted = "" } } },
+            .{ .stop = .{ .usage = .{} } },
+        };
+        var stream: ScriptedStream = .{ .events = &events };
+        try std.testing.expectError(
+            error.IncompleteReply,
+            agent.readReply(&agent.model, &stream, &handler),
+        );
+        try std.testing.expectEqual(@as(usize, 0), agent.items.items.len);
+    }
+}
+
 // A scheduling seam wrapping a real threaded executor: counts read-only tasks
-// launched but not yet awaited, records their peak, and flags a mutation running
-// while a read was outstanding. Every hook executes on the thread driving
-// `runToolsWith`, so the counters carry no data race.
+// dispatched into the current group generation, records their peak, and — via an
+// atomic each read body holds while it runs — flags a mutation that ran while a
+// read was still executing. The launch counter is main-thread only; the executing
+// count is atomic because read bodies run on worker threads.
 const ScheduleLog = struct {
     backend: std.Io,
     vtable: std.Io.VTable,
-    outstanding: usize = 0,
-    outstanding_peak: usize = 0,
+    launched: usize = 0,
+    launched_peak: usize = 0,
+    reads_running: std.atomic.Value(usize) = .init(0),
     mutation_overlap: bool = false,
     // When set, the next group await reports cancellation without draining, so the
     // caller's errdefer must reap the launched reads through `cancelGroup`.
@@ -1496,7 +2315,10 @@ const ScheduleLog = struct {
     }
 
     fn recordMutation(self: *ScheduleLog) void {
-        if (self.outstanding > 0) self.mutation_overlap = true;
+        if (self.reads_running.load(.acquire) != 0) self.mutation_overlap = true;
+        // The barrier already drained earlier reads, so the mutation closes the
+        // launch generation: a later read starts a fresh one, not a peak of three.
+        self.launched = 0;
     }
 
     fn concurrent(
@@ -1514,8 +2336,8 @@ const ScheduleLog = struct {
             context_alignment,
             start,
         );
-        self.outstanding += 1;
-        self.outstanding_peak = @max(self.outstanding_peak, self.outstanding);
+        self.launched += 1;
+        self.launched_peak = @max(self.launched_peak, self.launched);
     }
 
     fn awaitGroup(
@@ -1529,13 +2351,13 @@ const ScheduleLog = struct {
             return error.Canceled;
         }
         try self.backend.vtable.groupAwait(self.backend.userdata, group, token);
-        self.outstanding = 0;
+        self.launched = 0;
     }
 
     fn cancelGroup(userdata: ?*anyopaque, group: *std.Io.Group, token: *anyopaque) void {
         const self: *ScheduleLog = @ptrCast(@alignCast(userdata));
         self.backend.vtable.groupCancel(self.backend.userdata, group, token);
-        self.outstanding = 0;
+        self.launched = 0;
     }
 };
 
@@ -1548,10 +2370,15 @@ const probe = struct {
 
     fn run(context: *const tool.Context, name: []const u8, input_json: []const u8) !tool.Result {
         _ = input_json;
+        const log: *ScheduleLog = @ptrCast(@alignCast(context.io.userdata));
         if (mutates(name)) {
-            const log: *ScheduleLog = @ptrCast(@alignCast(context.io.userdata));
             log.recordMutation();
+            return .{ .content = try context.gpa.dupe(u8, "ok"), .is_error = false };
         }
+        // A read holds the executing count for its whole body, so a mutation that
+        // sees a nonzero count caught a read the barrier failed to drain.
+        _ = log.reads_running.fetchAdd(1, .acq_rel);
+        defer _ = log.reads_running.fetchSub(1, .acq_rel);
         return .{ .content = try context.gpa.dupe(u8, "ok"), .is_error = false };
     }
 };
@@ -1576,12 +2403,13 @@ test "a mutating call is a barrier between the reads around it" {
         .{ .tool_call = .{ .call_id = "w1", .name = "write", .arguments_json = "{}" } },
         .{ .tool_call = .{ .call_id = "r3", .name = "read", .arguments_json = "{}" } },
     };
-    try std.testing.expect(try agent.runToolsWith(probe, &reply, &handler));
+    var turn: TurnState = .{ .base = 0, .checkpoint = 0 };
+    try std.testing.expect(try agent.runToolsWith(probe, &reply, &turn, &handler));
 
-    // The mutation never ran while a read was still outstanding...
+    // The mutation never ran while a read was still executing...
     try std.testing.expect(!log.mutation_overlap);
-    // ...yet the two leading reads were in flight together.
-    try std.testing.expectEqual(@as(usize, 2), log.outstanding_peak);
+    // ...yet the two leading reads were dispatched concurrently.
+    try std.testing.expectEqual(@as(usize, 2), log.launched_peak);
 
     // Results stay in call order, one per call.
     try std.testing.expectEqual(@as(usize, 4), agent.items.items.len);
@@ -1591,6 +2419,47 @@ test "a mutating call is a barrier between the reads around it" {
     try std.testing.expectEqualStrings("r3", agent.items.items[3].tool_result.call_id);
     try std.testing.expectEqual(@as(usize, 4), handler.tool_start_count);
     try std.testing.expectEqual(@as(usize, 4), handler.tool_result_count);
+}
+
+test "a barrier presents the reads before it before announcing its mutation" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var agent = scriptedAgent(gpa);
+    agent.io = threaded.io();
+    defer agent.deinit();
+
+    // Records the presentation sequence itself, since call totals alone cannot
+    // tell a start that precedes an earlier call's result from one that follows.
+    const Handler = struct {
+        gpa: std.mem.Allocator,
+        log: std.ArrayList(u8) = .empty,
+
+        fn note(self: *@This(), mark: []const u8, name: []const u8) !void {
+            try self.log.appendSlice(self.gpa, mark);
+            try self.log.appendSlice(self.gpa, name);
+        }
+        fn onToolStart(self: *@This(), name: []const u8, _: []const u8) !void {
+            try self.note("+", name);
+        }
+        fn onToolResult(self: *@This(), name: []const u8, _: []const u8, _: bool) !void {
+            try self.note("-", name);
+        }
+    };
+    var handler: Handler = .{ .gpa = gpa };
+    defer handler.log.deinit(gpa);
+
+    const reply = [_]llm.Item{
+        .{ .tool_call = .{ .call_id = "r1", .name = "read", .arguments_json = "{}" } },
+        .{ .tool_call = .{ .call_id = "w1", .name = "write", .arguments_json = "{}" } },
+        .{ .tool_call = .{ .call_id = "r2", .name = "read", .arguments_json = "{}" } },
+    };
+    var turn: TurnState = .{ .base = 0, .checkpoint = 0 };
+    try std.testing.expect(try agent.runToolsWith(fake_tools, &reply, &turn, &handler));
+
+    // The read's result lands before the mutation is announced, and the trailing
+    // read's after it, so the presentation never runs backwards in call order.
+    try std.testing.expectEqualStrings("+read-read+write-write+read-read", handler.log.items);
 }
 
 test "a cancel at the barrier reaps launched reads and starts nothing after it" {
@@ -1612,17 +2481,27 @@ test "a cancel at the barrier reaps launched reads and starts nothing after it" 
         .{ .tool_call = .{ .call_id = "r3", .name = "read", .arguments_json = "{}" } },
     };
     // Cancel at the barrier await without draining, forcing the errdefer's
-    // live-task reap: the launched read's result is freed exactly once, the
-    // mutation never runs, and the trailing read never starts.
+    // live-task reap: the launched read's finished result is harvested into its
+    // reserved slot, the mutation never runs, and the trailing read never starts.
+    var turn: TurnState = .{ .base = 0, .checkpoint = 0 };
     try std.testing.expectError(
         error.Canceled,
-        agent.runToolsWith(probe, &reply, &handler),
+        agent.runToolsWith(probe, &reply, &turn, &handler),
     );
     try std.testing.expect(!log.mutation_overlap);
-    // r1 and the w1 barrier were announced; r3, past the cancelled barrier, was not.
-    try std.testing.expectEqual(@as(usize, 2), handler.tool_start_count);
+    // Only r1 was announced: the barrier drains ahead of its own announce, so a
+    // mutation cancelled there is never presented as started, and r3 past it
+    // never begins.
+    try std.testing.expectEqual(@as(usize, 1), handler.tool_start_count);
     try std.testing.expectEqual(@as(usize, 0), handler.tool_result_count);
-    try std.testing.expectEqual(@as(usize, 0), agent.items.items.len);
+    // The whole round's result slots stay committed and replay-valid: one slot
+    // per call, in call order, unresolved ones keeping their synthetic result.
+    try std.testing.expectEqual(@as(usize, 3), agent.items.items.len);
+    try std.testing.expectEqualStrings("r1", agent.items.items[0].tool_result.call_id);
+    try std.testing.expectEqualStrings("w1", agent.items.items[1].tool_result.call_id);
+    try std.testing.expectEqualStrings("r3", agent.items.items[2].tool_result.call_id);
+    try std.testing.expect(agent.items.items[1].tool_result.is_error);
+    try std.testing.expect(agent.items.items[2].tool_result.is_error);
 }
 
 fn runToolsUnderOom(allocator: std.mem.Allocator) !void {
@@ -1642,7 +2521,8 @@ fn runToolsUnderOom(allocator: std.mem.Allocator) !void {
         .{ .tool_call = .{ .call_id = "w1", .name = "write", .arguments_json = "{}" } },
         .{ .tool_call = .{ .call_id = "w2", .name = "write", .arguments_json = "{}" } },
     };
-    _ = try agent.runToolsWith(probe, &reply, &handler);
+    var turn: TurnState = .{ .base = 0, .checkpoint = 0 };
+    _ = try agent.runToolsWith(probe, &reply, &turn, &handler);
 }
 
 test "runTools frees partial work at every allocation-failure point" {
@@ -1650,17 +2530,21 @@ test "runTools frees partial work at every allocation-failure point" {
 }
 
 const tool_round_events = [_]llm.Event{
-    .{ .tool_use = .{ .call_id = "t1", .name = "write" } },
-    .{ .input_json = "{}" },
+    .{ .item = .{ .tool_call = .{
+        .call_id = "t1",
+        .name = "write",
+        .arguments_json = "{}",
+    } } },
     .{ .stop = .{ .usage = .{} } },
 };
 
 const end_turn_events = [_]llm.Event{
     .{ .text = "hi" },
+    .{ .item = .{ .message = "hi" } },
     .{ .stop = .{ .usage = .{} } },
 };
 
-test "run fails cleanly on round-bound overrun with the turn rolled back" {
+test "the round cap retains the completed rounds and fails the turn" {
     const gpa = std.testing.allocator;
     var agent = scriptedAgent(gpa);
     defer agent.deinit();
@@ -1668,14 +2552,16 @@ test "run fails cleanly on round-bound overrun with the turn rolled back" {
     defer handler.deinit();
 
     // A model that asks for a tool every round overruns the bound after exactly
-    // `rounds_max` rounds; the whole turn (user message included) is dropped.
+    // `rounds_max` rounds. Each round's side effects are real, so every
+    // completed round is retained at the latest checkpoint and the turn fails.
     var fetch: ScriptedFetch = .{
         .attempts = &.{.{ .stream = .{ .events = &tool_round_events } }},
     };
     try std.testing.expectError(error.TooManyToolRounds, agent.runWith(&fetch, "go", &handler));
     try std.testing.expectEqual(@as(usize, rounds_max), fetch.sends);
     try std.testing.expectEqual(@as(usize, rounds_max), handler.tool_result_count);
-    try std.testing.expectEqual(@as(usize, 0), agent.items.items.len);
+    // Prompt plus one tool_call/tool_result pair per completed round.
+    try std.testing.expectEqual(@as(usize, 1 + 2 * rounds_max), agent.items.items.len);
 }
 
 test "run commits a no-tool reply and ends the turn" {
@@ -1692,6 +2578,56 @@ test "run commits a no-tool reply and ends the turn" {
     try std.testing.expectEqualStrings("go", agent.items.items[0].message.text);
     try std.testing.expectEqualStrings("hi", agent.items.items[1].message.text);
     try std.testing.expectEqual(llm.Role.assistant, agent.items.items[1].message.role);
+}
+
+test "a committed truncation is reported in the receipt; a resampled one is not" {
+    const gpa = std.testing.allocator;
+    const truncated_events = [_]llm.Event{
+        .{ .text = "half an ans" },
+        .{ .item = .{ .message = "half an ans" } },
+        .{ .stop = .{ .usage = .{}, .status = .truncated } },
+    };
+    // A truncated tool-free answer commits and the turn completes, so the receipt
+    // is the only place the cutoff can still be reported.
+    {
+        var agent = scriptedAgent(gpa);
+        defer agent.deinit();
+        var handler: CaptureHandler = .{ .gpa = gpa };
+        defer handler.deinit();
+        var fetch: ScriptedFetch = .{
+            .attempts = &.{.{ .stream = .{ .events = &truncated_events } }},
+        };
+        const outcome = agent.runTurnWith(&fetch, fake_tools, "go", &handler);
+        try std.testing.expect(std.meta.activeTag(outcome.disposition) == .completed);
+        try std.testing.expectEqualStrings("half an ans", agent.items.items[1].message.text);
+        try std.testing.expect(outcome.receipt.truncated);
+    }
+    // A truncation rejected for holding a tool call resamples; the attempt that
+    // finishes cleanly is the one committed, so nothing is reported as cut short.
+    {
+        var log: SleepLog = .init(std.testing.io);
+        var agent = scriptedAgent(gpa);
+        agent.io = log.io();
+        defer agent.deinit();
+        var handler: CaptureHandler = .{ .gpa = gpa };
+        defer handler.deinit();
+        const truncated_tool_events = [_]llm.Event{
+            .{ .item = .{ .tool_call = .{
+                .call_id = "t1",
+                .name = "read",
+                .arguments_json = "{}",
+            } } },
+            .{ .stop = .{ .usage = .{}, .status = .truncated } },
+        };
+        var fetch: ScriptedFetch = .{ .attempts = &.{
+            .{ .stream = .{ .events = &truncated_tool_events } },
+            .{ .stream = .{ .events = &end_turn_events } },
+        } };
+        const outcome = agent.runTurnWith(&fetch, fake_tools, "go", &handler);
+        try std.testing.expect(std.meta.activeTag(outcome.disposition) == .completed);
+        try std.testing.expectEqualStrings("hi", agent.items.items[1].message.text);
+        try std.testing.expect(!outcome.receipt.truncated);
+    }
 }
 
 test "run retries transient failures, resetting the stream before each reattempt" {
@@ -1775,32 +2711,49 @@ test "a mid-stream cancel propagates without a retry" {
     try std.testing.expectEqual(@as(usize, 0), agent.items.items.len);
 }
 
-test "an API error reports onError, rolls the turn back, and ends it cleanly" {
+test "an API error retains completed rounds, reports, and fails the turn" {
     const gpa = std.testing.allocator;
-    var agent = scriptedAgent(gpa);
-    defer agent.deinit();
-    var handler: CaptureHandler = .{ .gpa = gpa };
-    defer handler.deinit();
-
-    // A committed tool round, then an API error frame: the whole turn unwinds.
-    var fetch: ScriptedFetch = .{ .attempts = &.{
-        .{ .stream = .{ .events = &tool_round_events } },
-        .{ .stream = .{ .events = &.{}, .terminal_error = error.ApiError, .error_text = "boom" } },
-    } };
-    try agent.runWith(&fetch, "go", &handler);
-    try std.testing.expectEqualStrings("boom", handler.errors.items);
-    try std.testing.expectEqual(@as(usize, 0), agent.items.items.len);
-
-    // A failed non-retryable head takes the same clean-abort path.
-    var head_fetch: ScriptedFetch = .{
-        .attempts = &.{
-            .{ .stream = .{ .events = &.{}, .head_ok = false, .error_text = "denied" } },
-        },
-    };
-    try agent.runWith(&head_fetch, "go", &handler);
-    try std.testing.expectEqual(@as(usize, 1), head_fetch.sends);
-    try std.testing.expectEqualStrings("boomdenied", handler.errors.items);
-    try std.testing.expectEqual(@as(usize, 0), agent.items.items.len);
+    // A committed tool round, then an API error in the next request: the round
+    // is retained (its result honest about a side effect that may have happened)
+    // and the error is reported and surfaced as a failed disposition.
+    {
+        var agent = scriptedAgent(gpa);
+        defer agent.deinit();
+        var handler: CaptureHandler = .{ .gpa = gpa };
+        defer handler.deinit();
+        var fetch: ScriptedFetch = .{ .attempts = &.{
+            .{ .stream = .{ .events = &tool_round_events } },
+            .{ .stream = .{
+                .events = &.{},
+                .terminal_error = error.ApiError,
+                .error_text = "boom",
+            } },
+        } };
+        try std.testing.expectError(error.ApiError, agent.runWith(&fetch, "go", &handler));
+        try std.testing.expectEqualStrings("boom", handler.errors.items);
+        // Prompt plus the completed tool_call/tool_result round survive.
+        try std.testing.expectEqual(@as(usize, 3), agent.items.items.len);
+        try std.testing.expectEqualStrings("go", agent.items.items[0].message.text);
+        try std.testing.expectEqualStrings("t1", agent.items.items[1].tool_call.call_id);
+        try std.testing.expectEqualStrings("t1", agent.items.items[2].tool_result.call_id);
+    }
+    // A failed head on the first request commits nothing, so the turn rolls back
+    // to its base and drops the prompt.
+    {
+        var agent = scriptedAgent(gpa);
+        defer agent.deinit();
+        var handler: CaptureHandler = .{ .gpa = gpa };
+        defer handler.deinit();
+        var head_fetch: ScriptedFetch = .{
+            .attempts = &.{
+                .{ .stream = .{ .events = &.{}, .head_ok = false, .error_text = "denied" } },
+            },
+        };
+        try std.testing.expectError(error.ApiError, agent.runWith(&head_fetch, "go", &handler));
+        try std.testing.expectEqual(@as(usize, 1), head_fetch.sends);
+        try std.testing.expectEqualStrings("denied", handler.errors.items);
+        try std.testing.expectEqual(@as(usize, 0), agent.items.items.len);
+    }
 }
 
 test "steering queued when the model would stop keeps the turn alive" {
@@ -1812,6 +2765,7 @@ test "steering queued when the model would stop keeps the turn alive" {
 
     const second_events = [_]llm.Event{
         .{ .text = "more" },
+        .{ .item = .{ .message = "more" } },
         .{ .stop = .{ .usage = .{} } },
     };
     var fetch: ScriptedFetch = .{ .attempts = &.{
@@ -1826,4 +2780,281 @@ test "steering queued when the model would stop keeps the turn alive" {
     try std.testing.expectEqual(llm.Role.user, agent.items.items[2].message.role);
     try std.testing.expectEqualStrings("steer", agent.items.items[2].message.text);
     try std.testing.expectEqualStrings("more", agent.items.items[3].message.text);
+}
+
+// A minimal tool source for whole-turn tests: "write" mutates, everything else
+// reads; every call returns a fixed success result. Unlike `probe` it reads no
+// scheduling log, so it runs under any backing io.
+const fake_tools = struct {
+    fn mutates(name: []const u8) bool {
+        return std.mem.eql(u8, name, "write");
+    }
+
+    fn run(context: *const tool.Context, name: []const u8, input_json: []const u8) !tool.Result {
+        _ = name;
+        _ = input_json;
+        return .{ .content = try context.gpa.dupe(u8, "ok"), .is_error = false };
+    }
+};
+
+// A tool source whose every call is a mutation that raises without returning a
+// result, exercising the conservative synthetic-result retention path.
+const raising_tools = struct {
+    fn mutates(name: []const u8) bool {
+        _ = name;
+        return true;
+    }
+
+    fn run(context: *const tool.Context, name: []const u8, input_json: []const u8) !tool.Result {
+        _ = context;
+        _ = name;
+        _ = input_json;
+        return error.Boom;
+    }
+};
+
+/// A read-only pair proving tool errors and pending scheduling state remain distinct.
+const not_run_tools = struct {
+    fn mutates(name: []const u8) bool {
+        _ = name;
+        return false;
+    }
+
+    fn run(context: *const tool.Context, name: []const u8, input_json: []const u8) !tool.Result {
+        _ = input_json;
+        if (std.mem.eql(u8, name, "fail")) return error.NotRun;
+        return .{ .content = try context.gpa.dupe(u8, "ok"), .is_error = false };
+    }
+};
+
+const closed_tools = struct {
+    fn mutates(name: []const u8) bool {
+        _ = name;
+        return true;
+    }
+
+    fn run(context: *const tool.Context, name: []const u8, input_json: []const u8) !tool.Result {
+        _ = context;
+        _ = name;
+        _ = input_json;
+        return error.PresentationChannelClosed;
+    }
+};
+
+test "a preparation failure dispatches nothing and commits no result slot" {
+    // Failing any allocation before the placeholder run is committed must leave
+    // no tool announced and no slot appended.
+    for ([_]usize{ 0, 1, 2 }) |fail_at| {
+        var failing: std.testing.FailingAllocator =
+            .init(std.testing.allocator, .{ .fail_index = fail_at });
+        const gpa = failing.allocator();
+        var agent = scriptedAgent(gpa);
+        defer agent.deinit();
+        var handler: CaptureHandler = .{ .gpa = gpa };
+        defer handler.deinit();
+
+        const reply = [_]llm.Item{
+            .{ .tool_call = .{ .call_id = "w1", .name = "write", .arguments_json = "{}" } },
+        };
+        var turn: TurnState = .{ .base = 0, .checkpoint = 0 };
+        try std.testing.expectError(
+            error.OutOfMemory,
+            agent.runToolsWith(fake_tools, &reply, &turn, &handler),
+        );
+        try std.testing.expectEqual(@as(usize, 0), handler.tool_start_count);
+        try std.testing.expectEqual(@as(usize, 0), agent.items.items.len);
+    }
+}
+
+test "a completed mutation's real result survives a callback failure" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var agent = scriptedAgent(gpa);
+    agent.io = threaded.io();
+    defer agent.deinit();
+
+    // The result is moved into history before the presentation callback runs,
+    // so a callback failure cannot leave provider-visible history dishonest.
+    const Handler = struct {
+        fn onToolStart(_: *@This(), _: []const u8, _: []const u8) !void {}
+        fn onToolResult(_: *@This(), _: []const u8, _: []const u8, _: bool) !void {
+            return error.Boom;
+        }
+    };
+    var handler: Handler = .{};
+    const reply = [_]llm.Item{
+        .{ .tool_call = .{ .call_id = "w1", .name = "write", .arguments_json = "{}" } },
+    };
+    var turn: TurnState = .{ .base = 0, .checkpoint = 0 };
+    try std.testing.expectError(
+        error.Boom,
+        agent.runToolsWith(fake_tools, &reply, &turn, &handler),
+    );
+    try std.testing.expectEqual(@as(usize, 1), agent.items.items.len);
+    try std.testing.expectEqualStrings("ok", agent.items.items[0].tool_result.content);
+    try std.testing.expect(!agent.items.items[0].tool_result.is_error);
+}
+
+test "a tool error named NotRun propagates and later results are harvested" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var agent = scriptedAgent(gpa);
+    agent.io = threaded.io();
+    defer agent.deinit();
+    var handler: CaptureHandler = .{ .gpa = gpa };
+    defer handler.deinit();
+
+    const reply = [_]llm.Item{
+        .{ .tool_call = .{ .call_id = "t1", .name = "fail", .arguments_json = "{}" } },
+        .{ .tool_call = .{ .call_id = "t2", .name = "succeed", .arguments_json = "{}" } },
+    };
+    var turn: TurnState = .{ .base = 0, .checkpoint = 0 };
+    try std.testing.expectError(
+        error.NotRun,
+        agent.runToolsWith(not_run_tools, &reply, &turn, &handler),
+    );
+    try std.testing.expectEqualStrings(synthetic_result, agent.items.items[0].tool_result.content);
+    try std.testing.expectEqualStrings("ok", agent.items.items[1].tool_result.content);
+    try std.testing.expectEqual(@as(usize, 0), handler.tool_result_count);
+}
+
+test "a mutation that raises retains the conservative synthetic result" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var agent = scriptedAgent(gpa);
+    agent.io = threaded.io();
+    defer agent.deinit();
+    var handler: CaptureHandler = .{ .gpa = gpa };
+    defer handler.deinit();
+
+    const reply = [_]llm.Item{
+        .{ .tool_call = .{ .call_id = "w1", .name = "write", .arguments_json = "{}" } },
+    };
+    var turn: TurnState = .{ .base = 0, .checkpoint = 0 };
+    try std.testing.expectError(
+        error.Boom,
+        agent.runToolsWith(raising_tools, &reply, &turn, &handler),
+    );
+    // The slot stays committed with its honest synthetic result and no callback.
+    try std.testing.expectEqual(@as(usize, 1), agent.items.items.len);
+    try std.testing.expect(agent.items.items[0].tool_result.is_error);
+    try std.testing.expectEqualStrings(synthetic_result, agent.items.items[0].tool_result.content);
+    try std.testing.expectEqual(@as(usize, 0), handler.tool_result_count);
+}
+
+test "a tool error matching the former presentation sentinel remains failed" {
+    const gpa = std.testing.allocator;
+    var agent = scriptedAgent(gpa);
+    defer agent.deinit();
+    var handler: CaptureHandler = .{ .gpa = gpa };
+    defer handler.deinit();
+    var fetch: ScriptedFetch = .{
+        .attempts = &.{.{ .stream = .{ .events = &tool_round_events } }},
+    };
+
+    const outcome = agent.runTurnWith(&fetch, closed_tools, "go", &handler);
+    switch (outcome.disposition) {
+        .failed => |err| try std.testing.expect(err == error.PresentationChannelClosed),
+        else => return error.UnexpectedDisposition,
+    }
+}
+
+test "cancellation after a completed tool round retains it at the checkpoint" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var agent = scriptedAgent(gpa);
+    agent.io = threaded.io();
+    defer agent.deinit();
+    var handler: CaptureHandler = .{ .gpa = gpa };
+    defer handler.deinit();
+
+    // Round 1 runs a tool; round 2's request is cancelled mid-stream.
+    var fetch: ScriptedFetch = .{ .attempts = &.{
+        .{ .stream = .{ .events = &tool_round_events } },
+        .{ .stream = .{ .events = &.{}, .terminal_error = error.Canceled } },
+    } };
+    const outcome = agent.runTurnWith(&fetch, fake_tools, "go", &handler);
+    try std.testing.expect(std.meta.activeTag(outcome.disposition) == .canceled);
+    // Prompt + tool_call + its real result survive at the checkpoint.
+    try std.testing.expectEqual(@as(usize, 3), agent.items.items.len);
+    try std.testing.expectEqual(@as(usize, 0), outcome.receipt.history_base);
+    try std.testing.expectEqual(@as(usize, 3), outcome.receipt.history_end);
+    try std.testing.expectEqualStrings("ok", agent.items.items[2].tool_result.content);
+    try std.testing.expect(!agent.items.items[2].tool_result.is_error);
+}
+
+test "cancellation before the first reply returns exactly to the turn base" {
+    const gpa = std.testing.allocator;
+    var agent = scriptedAgent(gpa);
+    defer agent.deinit();
+    var handler: CaptureHandler = .{ .gpa = gpa };
+    defer handler.deinit();
+
+    var fetch: ScriptedFetch = .{
+        .attempts = &.{.{ .stream = .{ .events = &.{}, .terminal_error = error.Canceled } }},
+    };
+    const outcome = agent.runTurnWith(&fetch, fake_tools, "go", &handler);
+    try std.testing.expect(std.meta.activeTag(outcome.disposition) == .canceled);
+    try std.testing.expectEqual(@as(usize, 0), agent.items.items.len);
+    try std.testing.expectEqual(outcome.receipt.history_base, outcome.receipt.history_end);
+}
+
+test "a no-tool reply is retained when a later steered reply is cancelled" {
+    const gpa = std.testing.allocator;
+    var agent = scriptedAgent(gpa);
+    defer agent.deinit();
+    var handler: CaptureHandler = .{ .gpa = gpa };
+    defer handler.deinit();
+
+    // Round 1 answers with no tools; a steering message keeps the turn alive;
+    // round 2 is cancelled before it commits.
+    try agent.steering.push("steer");
+    var fetch: ScriptedFetch = .{ .attempts = &.{
+        .{ .stream = .{ .events = &end_turn_events } },
+        .{ .stream = .{ .events = &.{}, .terminal_error = error.Canceled } },
+    } };
+    const outcome = agent.runTurnWith(&fetch, fake_tools, "go", &handler);
+    try std.testing.expect(std.meta.activeTag(outcome.disposition) == .canceled);
+    // The completed no-tool reply survives; the cancelled steer round is dropped.
+    try std.testing.expectEqual(@as(usize, 2), agent.items.items.len);
+    try std.testing.expectEqualStrings("go", agent.items.items[0].message.text);
+    try std.testing.expectEqualStrings("hi", agent.items.items[1].message.text);
+    // The steer was consumed but not committed, so it returns to the queue.
+    try std.testing.expectEqual(@as(usize, 0), outcome.receipt.steering_committed_count);
+    const restored = try agent.steering.take();
+    defer {
+        for (restored) |message| gpa.free(message);
+        gpa.free(restored);
+    }
+    try std.testing.expectEqual(@as(usize, 1), restored.len);
+    try std.testing.expectEqualStrings("steer", restored[0]);
+}
+
+test "the receipt reports the committed steering count and history span" {
+    const gpa = std.testing.allocator;
+    var agent = scriptedAgent(gpa);
+    defer agent.deinit();
+    var handler: CaptureHandler = .{ .gpa = gpa };
+    defer handler.deinit();
+
+    const second_events = [_]llm.Event{
+        .{ .text = "more" },
+        .{ .item = .{ .message = "more" } },
+        .{ .stop = .{ .usage = .{} } },
+    };
+    try agent.steering.push("steer");
+    var fetch: ScriptedFetch = .{ .attempts = &.{
+        .{ .stream = .{ .events = &end_turn_events } },
+        .{ .stream = .{ .events = &second_events } },
+    } };
+    const outcome = agent.runTurnWith(&fetch, fake_tools, "go", &handler);
+    try std.testing.expect(std.meta.activeTag(outcome.disposition) == .completed);
+    // The steer batch is consumed in round 1 and committed by round 2's reply.
+    try std.testing.expectEqual(@as(usize, 1), outcome.receipt.steering_committed_count);
+    try std.testing.expectEqual(@as(usize, 4), outcome.receipt.history_end);
+    try std.testing.expect(!outcome.receipt.truncated);
 }

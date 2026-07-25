@@ -104,11 +104,14 @@ fn writeItem(
 ) !void {
     switch (item.*) {
         .message => |*message| try writeMessage(stringify, message),
-        // A reasoning item from any other account is dropped whole (its encrypted
-        // content can't be replayed here); one from this account with no blob is
-        // dropped too, since it can't be round-tripped without that token.
-        .reasoning => |*reasoning| if (reasoning.origin == account and reasoning.blob.len > 0)
-            try writeReasoning(stringify, reasoning),
+        // Only this exact account's complete OpenAI proof can replay here.
+        .reasoning => |*reasoning| switch (reasoning.replay) {
+            inline .openai_subscription, .openai_api => |proof, tag| {
+                if (tag == account and proof.id.len != 0 and proof.encrypted_content.len != 0)
+                    try writeReasoning(stringify, &proof);
+            },
+            .anthropic_subscription, .anthropic_api => {},
+        },
         .tool_call => |*call| try writeToolCall(stringify, call),
         .tool_result => |*result| try writeToolResult(stringify, gpa, result),
     }
@@ -132,27 +135,30 @@ fn writeMessage(stringify: *std.json.Stringify, message: *const llm.Item.Message
     try stringify.endObject();
 }
 
-/// A stored reasoning run: its server-assigned id, an optional summary, and the
-/// verbatim encrypted token the model verifies to accept the calls that followed.
-fn writeReasoning(stringify: *std.json.Stringify, reasoning: *const llm.Item.Reasoning) !void {
+/// A stored reasoning run: its server-assigned id, optional summary, and
+/// verbatim encrypted token.
+fn writeReasoning(
+    stringify: *std.json.Stringify,
+    replay: *const llm.Item.Reasoning.OpenAi,
+) !void {
     try stringify.beginObject();
     try stringify.objectField("type");
     try stringify.write("reasoning");
     try stringify.objectField("id");
-    try stringify.write(reasoning.id);
+    try stringify.write(replay.id);
     try stringify.objectField("summary");
     try stringify.beginArray();
-    if (reasoning.text.len > 0) {
+    if (replay.text.len > 0) {
         try stringify.beginObject();
         try stringify.objectField("type");
         try stringify.write("summary_text");
         try stringify.objectField("text");
-        try stringify.write(reasoning.text);
+        try stringify.write(replay.text);
         try stringify.endObject();
     }
     try stringify.endArray();
     try stringify.objectField("encrypted_content");
-    try stringify.write(reasoning.blob);
+    try stringify.write(replay.encrypted_content);
     try stringify.endObject();
 }
 
@@ -348,20 +354,61 @@ test "tool_call arguments serialize as a JSON string, error output is prefixed" 
     try std.testing.expectEqualStrings("ok", input[3].object.get("output").?.string);
 }
 
-test "reasoning replays only the active account's blobs, dropping foreign and blobless" {
+test "a synthetic error result emits one function_call_output with one Error prefix" {
+    const synthetic =
+        "Tool execution ended before a result was recorded; side effects may have occurred.";
+    const items = [_]llm.Item{
+        .{ .tool_call = .{ .call_id = "call_1", .name = "read", .arguments_json = "{}" } },
+        .{ .tool_result = .{ .call_id = "call_1", .content = synthetic, .is_error = true } },
+    };
+    const body = try serialize(std.testing.allocator, &.{
+        .model = "gpt-5.6-luna",
+        .tokens_max = 8,
+        .system = "s",
+        .items = &items,
+        .tools = &.{},
+    }, .openai_api);
+    defer std.testing.allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+    const input = parsed.value.object.get("input").?.array.items;
+    // One call, one matching output linked by call_id.
+    try std.testing.expectEqual(@as(usize, 2), input.len);
+    try std.testing.expectEqualStrings("function_call_output", input[1].object.get("type").?.string);
+    try std.testing.expectEqualStrings("call_1", input[1].object.get("call_id").?.string);
+    // Exactly one `Error:` prefix — the stored content carries none of its own.
+    const output = input[1].object.get("output").?.string;
+    const expected = "Error: " ++ synthetic;
+    try std.testing.expectEqualStrings(expected, output);
+    try std.testing.expectEqual(
+        @as(?usize, null),
+        std.mem.indexOf(u8, output["Error: ".len..], "Error: "),
+    );
+}
+
+test "reasoning replays only the active account's complete proof" {
     const items = [_]llm.Item{
         .{ .reasoning = .{
-            .text = "weigh it",
-            .blob = "enc",
-            .id = "rs_1",
-            .origin = .openai_subscription,
+            .replay = .{ .openai_subscription = .{
+                .text = "weigh it",
+                .id = "rs_1",
+                .encrypted_content = "enc",
+            } },
         } },
-        .{ .reasoning = .{ .text = "foreign", .blob = "sig", .id = "", .origin = .openai_api } },
         .{ .reasoning = .{
-            .text = "no blob",
-            .blob = "",
-            .id = "rs_2",
-            .origin = .openai_subscription,
+            .replay = .{ .openai_api = .{
+                .text = "foreign",
+                .id = "rs_other",
+                .encrypted_content = "other",
+            } },
+        } },
+        .{ .reasoning = .{
+            .replay = .{ .openai_subscription = .{
+                .text = "no blob",
+                .id = "rs_2",
+                .encrypted_content = "",
+            } },
         } },
         .{ .message = .{ .role = .assistant, .text = "done" } },
     };
@@ -377,7 +424,7 @@ test "reasoning replays only the active account's blobs, dropping foreign and bl
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
     defer parsed.deinit();
     const input = parsed.value.object.get("input").?.array.items;
-    // Only this account's blob-carrying reasoning item and the message survive.
+    // Only this account's complete reasoning item and the message survive.
     try std.testing.expectEqual(@as(usize, 2), input.len);
     try std.testing.expectEqualStrings("reasoning", input[0].object.get("type").?.string);
     try std.testing.expectEqualStrings("rs_1", input[0].object.get("id").?.string);
@@ -416,7 +463,11 @@ test "assistant text uses output_text, unknown model omits reasoning" {
 // guards the wire shape against drift the structural tests above would miss.
 const golden_items = [_]llm.Item{
     .{ .message = .{ .role = .user, .text = "first" } },
-    .{ .reasoning = .{ .text = "think", .blob = "enc1", .id = "rs_1", .origin = .openai_api } },
+    .{ .reasoning = .{ .replay = .{ .openai_api = .{
+        .text = "think",
+        .id = "rs_1",
+        .encrypted_content = "enc1",
+    } } } },
     .{ .tool_call = .{
         .call_id = "call_1",
         .name = "read",
@@ -424,19 +475,22 @@ const golden_items = [_]llm.Item{
     } },
     .{ .message = .{ .role = .assistant, .text = "checking" } },
     .{ .tool_result = .{ .call_id = "call_1", .content = "contents", .is_error = false } },
-    .{ .reasoning = .{ .text = "", .blob = "enc2", .id = "rs_2", .origin = .openai_api } },
+    .{ .reasoning = .{ .replay = .{ .openai_api = .{
+        .text = "",
+        .id = "rs_2",
+        .encrypted_content = "enc2",
+    } } } },
     .{ .tool_call = .{
         .call_id = "call_2",
         .name = "write",
         .arguments_json = "{\"path\":\"b\"}",
     } },
     .{ .tool_result = .{ .call_id = "call_2", .content = "denied", .is_error = true } },
-    .{ .reasoning = .{
+    .{ .reasoning = .{ .replay = .{ .openai_subscription = .{
         .text = "foreign",
-        .blob = "sig",
-        .id = "",
-        .origin = .openai_subscription,
-    } },
+        .id = "rs_3",
+        .encrypted_content = "enc3",
+    } } } },
     .{ .message = .{ .role = .assistant, .text = "all set" } },
 };
 

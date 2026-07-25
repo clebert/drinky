@@ -17,6 +17,10 @@ const ui = @import("ui/root.zig");
 
 const Session = @This();
 
+/// Shown when a turn committed a reply the provider cut short, so a partial
+/// answer is never presented as a complete one.
+const truncated_notice = "response truncated at the model's output or context limit";
+
 gpa: std.mem.Allocator,
 transcript: Transcript,
 editor: ui.Editor,
@@ -46,12 +50,19 @@ effort_shown: ai.llm.Effort,
 signed_in: bool,
 /// Steering submitted during a turn, in chronological order, as detached editor
 /// drafts so recall can restore live placeholder markers. The plain queue is a
-/// suffix of this list; a consumed event drops from the front. Each draft owned.
+/// suffix of this list; consumed drafts remain owned until the terminal receipt
+/// either drops or restores them.
 steering: std.ArrayList(ui.Editor.Draft),
-/// Prefix known to be in flight because an Alt+Up queue take did not return it.
-/// Hidden from the compact queue view, but retained for consumption, failed
-/// delivery, and cancellation. Always at most `steering.items.len`.
+/// Leading drafts hidden from the compact queue view because the worker has
+/// taken them — consumed into the running turn, or in flight after an Alt+Up
+/// take that did not return them. Their rich drafts are never destroyed on
+/// consumption, so a rolled-back batch can be recovered; the terminal receipt
+/// resolves them. Always at most `steering.items.len`.
 steering_retained_count: usize,
+/// Leading drafts the worker has reported consuming (≤ `steering_retained_count`
+/// and the source of it on consumption). Kept as a cumulative count so a delayed
+/// consumed event does not double-count drafts an Alt+Up already hid.
+steering_consumed_count: usize,
 /// Borrowed compact `Steering:` rows — each non-retained draft's collapsed
 /// visible text — rebuilt each paint so the tail gets a `[]const []const u8`
 /// without a per-repaint allocation.
@@ -107,9 +118,12 @@ pub const TurnEvent = struct {
         /// far so the retried attempt starts clean.
         stream_reset,
         /// The worker folded `count` queued steering messages into the running
-        /// turn as one combined message: show it and drop those rows from the queue.
+        /// turn as one combined message: show it and hide those rows from the
+        /// queue view, retaining their rich drafts until the receipt resolves them.
         steering_consumed: SteeringConsumed,
-        turn_ended: ?[]u8,
+        /// Payload-free wakeup indicating that the authoritative worker result
+        /// is ready to join.
+        turn_ended,
 
         pub const Tool = struct { name: []u8, input_json: []u8 };
         pub const ToolResult = struct { name: []u8, content: []u8, is_error: bool };
@@ -128,8 +142,7 @@ pub const TurnEvent = struct {
                 gpa.free(result.content);
             },
             .steering_consumed => |consumed| gpa.free(consumed.text),
-            .turn_ended => |maybe_text| if (maybe_text) |text| gpa.free(text),
-            .usage, .stream_reset => {},
+            .usage, .stream_reset, .turn_ended => {},
         }
     }
 };
@@ -175,6 +188,7 @@ pub fn init(
         .signed_in = true,
         .steering = .empty,
         .steering_retained_count = 0,
+        .steering_consumed_count = 0,
         .steering_view = .empty,
     };
 }
@@ -201,10 +215,10 @@ fn deinitMode(self: *Session) void {
 /// Apply one turn worker event to the model, marking it dirty and freeing the
 /// event's bytes. Applying never paints. An event is dropped unless its captured
 /// generation is still the active turn.
-pub fn applyTurnEvent(self: *Session, event: *const TurnEvent) !void {
+pub fn applyTurnEvent(self: *Session, event: *const TurnEvent) !bool {
     defer event.deinit(self.gpa);
-    const turn = self.activeTurn() orelse return;
-    if (event.generation != turn.generation) return;
+    const turn = self.activeTurn() orelse return false;
+    if (event.generation != turn.generation) return false;
     self.dirty = true;
     switch (event.payload) {
         .text => |delta| try self.transcript.appendStream(.model, delta),
@@ -217,20 +231,21 @@ pub fn applyTurnEvent(self: *Session, event: *const TurnEvent) !void {
         .usage => |stats| self.stats_shown = stats,
         .stream_reset => self.transcript.discardMessage(),
         .steering_consumed => |consumed| {
+            // Show the folded batch and hide its rows from the queue view, but
+            // retain the rich drafts: a consumed batch can still be rolled back
+            // (until its following reply commits), so the receipt — not this
+            // event — decides whether each draft is dropped or recovered.
             try self.transcript.append(.user, false, consumed.text);
-            var removed_count: usize = 0;
-            while (removed_count < consumed.count and self.steering.items.len > 0) : (removed_count += 1) {
-                var draft = self.steering.orderedRemove(0);
-                draft.deinit(self.gpa);
-            }
-            self.steering_retained_count = self.steering_retained_count -| removed_count;
+            // Advance the consumed frontier, then the view frontier to cover it,
+            // without double-counting drafts an earlier Alt+Up already hid.
+            self.steering_consumed_count =
+                @min(self.steering_consumed_count + consumed.count, self.steering.items.len);
+            self.steering_retained_count =
+                @max(self.steering_retained_count, self.steering_consumed_count);
         },
-        .turn_ended => |maybe_text| {
-            if (maybe_text) |text| try self.transcript.append(.feedback, true, text);
-            self.transcript.endMessage();
-            self.endTurn();
-        },
+        .turn_ended => return true,
     }
+    return false;
 }
 
 /// Record a finished tool call in the transcript: its first output line beside the
@@ -328,21 +343,14 @@ pub fn recallSteering(self: *Session, pending_count: usize) void {
     for (self.steering.items[pending_start..]) |*draft| self.editor.appendDraft(draft);
     self.steering.shrinkRetainingCapacity(pending_start);
     self.steering_retained_count = self.steering.items.len;
+    self.steering_consumed_count = @min(self.steering_consumed_count, self.steering.items.len);
     self.dirty = true;
 }
 
-/// Preflight restoring every steering draft during cancellation.
+/// Preflight editor capacity to restore every steering draft on cancellation,
+/// so `cancelReceipt` cannot fail after the worker is already cancelled.
 pub fn reserveSteeringRestore(self: *Session) !void {
     try self.editor.reserveDrafts(self.steering.items);
-}
-
-/// Restore every steering draft in submission order. Infallible after
-/// `reserveSteeringRestore`.
-pub fn restoreSteering(self: *Session) void {
-    for (self.steering.items) |*draft| self.editor.appendDraft(draft);
-    self.steering.clearRetainingCapacity();
-    self.steering_retained_count = 0;
-    self.dirty = true;
 }
 
 /// Whether any rich steering record remains live or retained in flight.
@@ -355,6 +363,7 @@ pub fn clearSteering(self: *Session) void {
     for (self.steering.items) |*draft| draft.deinit(self.gpa);
     self.steering.clearRetainingCapacity();
     self.steering_retained_count = 0;
+    self.steering_consumed_count = 0;
     self.dirty = true;
 }
 
@@ -391,8 +400,58 @@ pub fn abortTurn(self: *Session) !void {
     try self.transcript.append(.feedback, false, "cancelled");
 }
 
+/// Apply a terminal receipt and end the turn on a normal completion or failure:
+/// resolve the committed steering prefix (infallible, so ownership is settled
+/// first) before the fallible feedback appends, in the order the turn produced
+/// them — a cut-off reply, then any failure. Borrows `error_text`; the caller
+/// frees it.
+pub fn endTurnWithReceipt(
+    self: *Session,
+    receipt: *const ai.Agent.Receipt,
+    error_text: ?[]const u8,
+) !void {
+    self.applyReceiptNormal(receipt);
+    if (receipt.truncated) try self.transcript.append(.feedback, false, truncated_notice);
+    if (error_text) |text| try self.transcript.append(.feedback, true, text);
+    self.transcript.endMessage();
+    self.endTurn();
+}
+
+/// Resolve the rich steering mirror on a normal terminal: drop the committed
+/// prefix (now in history) and make every remaining draft pending again, so
+/// late-steering handling can start it as a new turn. Infallible.
+fn applyReceiptNormal(self: *Session, receipt: *const ai.Agent.Receipt) void {
+    self.dropSteeringPrefix(receipt.steering_committed_count);
+    self.steering_retained_count = 0;
+    self.steering_consumed_count = 0;
+    self.dirty = true;
+}
+
+/// Resolve the rich steering mirror on a genuine user cancellation: drop the
+/// committed prefix, then move every remaining draft (uncommitted-consumed and
+/// pending) into the editor in submission order. Infallible after
+/// `reserveSteeringRestore`.
+pub fn cancelReceipt(self: *Session, receipt: *const ai.Agent.Receipt) void {
+    self.dropSteeringPrefix(receipt.steering_committed_count);
+    for (self.steering.items) |*draft| self.editor.appendDraft(draft);
+    self.steering.clearRetainingCapacity();
+    self.steering_retained_count = 0;
+    self.steering_consumed_count = 0;
+    self.dirty = true;
+}
+
+/// Drop and free the leading `count` committed steering drafts. The caller
+/// resets the steering counts to the retention it wants afterward.
+fn dropSteeringPrefix(self: *Session, count: usize) void {
+    var dropped: usize = 0;
+    while (dropped < count and self.steering.items.len > 0) : (dropped += 1) {
+        var draft = self.steering.orderedRemove(0);
+        draft.deinit(self.gpa);
+    }
+}
+
 /// Free the finished turn's tool state and return to waiting for input.
-fn endTurn(self: *Session) void {
+pub fn endTurn(self: *Session) void {
     if (self.activeTurn()) |turn| self.freeTurn(turn);
     self.mode = .prompt;
 }
@@ -503,7 +562,7 @@ const test_model = ai.models.get(.anthropic, "claude-sonnet-4-6") orelse
     @compileError("test model is not in the model table");
 
 fn applyEvent(session: *Session, generation: u64, payload: TurnEvent.Payload) !void {
-    return session.applyTurnEvent(&.{ .generation = generation, .payload = payload });
+    _ = try session.applyTurnEvent(&.{ .generation = generation, .payload = payload });
 }
 
 // Queue a plain-text (atom-free) steering draft, as a submitted literal line does.
@@ -514,6 +573,14 @@ fn queueSteeringText(session: *Session, text: []const u8) !void {
     try session.reserveSteering();
     var draft = editor.detachTrimmed();
     session.commitSteeringDraft(&draft);
+}
+
+fn finishTurn(session: *Session, committed: usize, error_text: ?[]const u8) !void {
+    try session.endTurnWithReceipt(&.{
+        .history_base = 0,
+        .history_end = 0,
+        .steering_committed_count = committed,
+    }, error_text);
 }
 
 // Mirrors the read loop's inner pipeline without a tty: one read chunk carries
@@ -659,7 +726,7 @@ test "scripted stream events drive the model and one coalesced paint" {
     try std.testing.expectEqual(@as(f64, 1.5), session.stats_shown.cost);
 
     // A clean end leaves turn mode.
-    try applyEvent(&session, 1, .{ .turn_ended = null });
+    try finishTurn(&session, 0, null);
     try std.testing.expect(!session.animating());
 
     // One paint renders the coalesced frame: streamed text and the tool result.
@@ -668,6 +735,45 @@ test "scripted stream events drive the model and one coalesced paint" {
     try std.testing.expect(std.mem.indexOf(u8, painted, "hello") != null);
     try std.testing.expect(std.mem.indexOf(u8, painted, "read") != null);
     try std.testing.expect(std.mem.indexOf(u8, painted, "first line") != null);
+}
+
+// A cut-off answer is committed history, so the turn's end says it is partial
+// rather than letting it read as a complete reply.
+test "a truncated receipt appends a notice after the answer" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    defer session.deinit();
+    session.beginTurn(1);
+
+    try applyEvent(&session, 1, .{ .text = try gpa.dupe(u8, "half an ans") });
+    try session.endTurnWithReceipt(&.{
+        .history_base = 0,
+        .history_end = 2,
+        .steering_committed_count = 0,
+        .truncated = true,
+    }, null);
+
+    const blocks = session.transcript.blocks();
+    try std.testing.expectEqual(@as(usize, 2), blocks.len);
+    try std.testing.expectEqualStrings("half an ans", blocks[0].model.items);
+    try std.testing.expect(!blocks[1].feedback.is_error);
+    try std.testing.expectEqualStrings(truncated_notice, blocks[1].feedback.text.items);
+
+    // A turn that both truncated and failed reports the cutoff before the error.
+    session.beginTurn(2);
+    try session.endTurnWithReceipt(&.{
+        .history_base = 2,
+        .history_end = 2,
+        .steering_committed_count = 0,
+        .truncated = true,
+    }, "boom");
+    const after = session.transcript.blocks();
+    try std.testing.expectEqual(@as(usize, 4), after.len);
+    try std.testing.expectEqualStrings(truncated_notice, after[2].feedback.text.items);
+    try std.testing.expect(after[3].feedback.is_error);
+    try std.testing.expectEqualStrings("boom", after[3].feedback.text.items);
 }
 
 test "streamed and tool text cannot emit terminal controls" {
@@ -691,7 +797,7 @@ test "streamed and tool text cannot emit terminal controls" {
         .content = try gpa.dupe(u8, tool),
         .is_error = false,
     } });
-    try applyEvent(&session, 1, .{ .turn_ended = null });
+    try finishTurn(&session, 0, null);
     try session.paint(.{ .columns = 160, .rows = 24 });
 
     const painted = out.written();
@@ -743,11 +849,18 @@ test "a cancelled turn's stale output and completion cannot affect its successor
     session.beginTurn(2);
 
     try applyEvent(&session, 1, .{ .text = try gpa.dupe(u8, "stale A") });
-    try applyEvent(&session, 1, .{ .turn_ended = try gpa.dupe(u8, "turn A failed") });
+    try std.testing.expect(!try session.applyTurnEvent(&.{
+        .generation = 1,
+        .payload = .turn_ended,
+    }));
     try std.testing.expect(session.animating());
 
     try applyEvent(&session, 2, .{ .text = try gpa.dupe(u8, "turn B") });
-    try applyEvent(&session, 2, .{ .turn_ended = null });
+    try std.testing.expect(try session.applyTurnEvent(&.{
+        .generation = 2,
+        .payload = .turn_ended,
+    }));
+    try finishTurn(&session, 0, null);
     try std.testing.expect(!session.animating());
     // Three blocks: the stale error appended no feedback block either.
     try std.testing.expectEqual(@as(usize, 3), session.transcript.blocks().len);
@@ -793,12 +906,56 @@ test "steering queues, then a consumed event shows it and clears the queue" {
         .text = try gpa.dupe(u8, "fix it\n\nand test"),
         .count = 2,
     } });
-    try std.testing.expectEqual(@as(usize, 0), session.steering.items.len);
+    // The combined batch shows as one user block and its compact rows drop from
+    // the view, but the rich drafts are retained (hidden) so a rolled-back batch
+    // can still be recovered until the receipt resolves it.
     try std.testing.expectEqual(@as(usize, 1), session.transcript.blocks().len);
     try std.testing.expectEqualStrings(
         "fix it\n\nand test",
         session.transcript.blocks()[0].user.items,
     );
+    try std.testing.expectEqual(@as(usize, 2), session.steering.items.len);
+    try std.testing.expectEqual(@as(usize, 2), session.steering_retained_count);
+    try std.testing.expectEqual(@as(usize, 0), (try session.steeringView()).len);
+
+    // A normal completion whose receipt committed the batch drops those drafts.
+    try finishTurn(&session, 2, null);
+    try std.testing.expectEqual(@as(usize, 0), session.steering.items.len);
+}
+
+// A genuine user cancel with a committed prefix drops those drafts (they live in
+// history) and restores only the uncommitted suffix to the editor.
+test "cancelReceipt drops the committed prefix and restores the uncommitted suffix" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    defer session.deinit();
+    session.beginTurn(1);
+
+    try queueSteeringText(&session, "committed");
+    try queueSteeringText(&session, "restore me");
+    // The worker consumed both messages, so both drafts are retained in flight.
+    try applyEvent(&session, 1, .{ .steering_consumed = .{
+        .text = try gpa.dupe(u8, "committed\n\nrestore me"),
+        .count = 2,
+    } });
+    try std.testing.expectEqual(@as(usize, 2), session.steering_retained_count);
+
+    // Only the first message committed before the cancel rolled back the rest.
+    try session.reserveSteeringRestore();
+    session.cancelReceipt(&.{
+        .history_base = 0,
+        .history_end = 0,
+        .steering_committed_count = 1,
+    });
+
+    // The committed draft is gone; the uncommitted one returns to the editor and
+    // the counts reset.
+    try std.testing.expectEqual(@as(usize, 0), session.steering.items.len);
+    try std.testing.expectEqual(@as(usize, 0), session.steering_retained_count);
+    try std.testing.expectEqual(@as(usize, 0), session.steering_consumed_count);
+    try std.testing.expectEqualStrings("restore me", session.editor.visible());
 }
 
 // A steered large paste shows as its collapsed marker in the compact queue view,

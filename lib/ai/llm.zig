@@ -80,7 +80,8 @@ pub const Effort = enum { none, low, medium, high, xhigh, max };
 /// items in the exact order the model produced them (reasoning first, then text
 /// and tool calls interleaved as streamed) and a provider serializer replays
 /// them one-item-one-block, sharing a role envelope over a run of same-role
-/// items but never reordering or concatenating.
+/// items but never reordering separate native output items. Content parts inside
+/// one native OpenAI message are canonically joined without a separator.
 pub const Item = union(enum) {
     /// A user or assistant text turn.
     message: Message,
@@ -96,26 +97,89 @@ pub const Item = union(enum) {
         text: []const u8,
     };
 
-    /// A run of model reasoning, carried back verbatim on later turns so the
-    /// provider accepts the tool calls that followed it.
+    /// A complete run of model reasoning, carried back verbatim on later turns.
+    /// The replay union's tag is also the exact account that produced its proof,
+    /// so a serializer cannot mistake foreign reasoning for local history.
     pub const Reasoning = struct {
-        /// Human-visible reasoning/summary; empty when redacted or none.
-        text: []const u8,
-        /// Opaque token round-tripped unchanged so the provider can verify the
-        /// reasoning: Anthropic `signature` / redacted `data`, or OpenAI
-        /// `encrypted_content`. Never cross-fed between providers.
-        blob: []const u8,
-        /// The reasoning was withheld by the provider's safety filter; `text` is
-        /// empty and `blob` holds its encrypted payload.
-        redacted: bool = false,
-        /// OpenAI reasoning-item id, needed to replay the item under
-        /// `store:false`; empty for Anthropic.
-        id: []const u8 = "",
-        /// Which account produced `blob`: a serializer replays a blob only for
-        /// the exact active account and drops any other reasoning item whole,
-        /// since neither a foreign vendor's signature nor another account's token
-        /// can be verified here.
-        origin: Account,
+        replay: Replay,
+
+        pub const Replay = union(Account) {
+            anthropic_subscription: Anthropic,
+            anthropic_api: Anthropic,
+            openai_subscription: OpenAi,
+            openai_api: OpenAi,
+
+            pub fn dupe(
+                self: *const Replay,
+                gpa: std.mem.Allocator,
+            ) !Replay {
+                return switch (self.*) {
+                    inline .anthropic_subscription, .anthropic_api => |proof, tag| switch (proof) {
+                        .signature => |signature| signature: {
+                            const text_copy = try gpa.dupe(u8, signature.text);
+                            errdefer gpa.free(text_copy);
+                            const proof_copy = try gpa.dupe(u8, signature.signature);
+                            break :signature @unionInit(Replay, @tagName(tag), .{
+                                .signature = .{
+                                    .text = text_copy,
+                                    .signature = proof_copy,
+                                },
+                            });
+                        },
+                        .redacted => |data| @unionInit(
+                            Replay,
+                            @tagName(tag),
+                            .{ .redacted = try gpa.dupe(u8, data) },
+                        ),
+                    },
+                    inline .openai_subscription, .openai_api => |proof, tag| openai: {
+                        const text_copy = try gpa.dupe(u8, proof.text);
+                        errdefer gpa.free(text_copy);
+                        const id_copy = try gpa.dupe(u8, proof.id);
+                        errdefer gpa.free(id_copy);
+                        const content_copy = try gpa.dupe(u8, proof.encrypted_content);
+                        break :openai @unionInit(Replay, @tagName(tag), .{
+                            .text = text_copy,
+                            .id = id_copy,
+                            .encrypted_content = content_copy,
+                        });
+                    },
+                };
+            }
+
+            pub fn deinit(self: *const Replay, gpa: std.mem.Allocator) void {
+                switch (self.*) {
+                    inline .anthropic_subscription, .anthropic_api => |proof| switch (proof) {
+                        .signature => |signature| {
+                            gpa.free(signature.text);
+                            gpa.free(signature.signature);
+                        },
+                        .redacted => |data| gpa.free(data),
+                    },
+                    inline .openai_subscription, .openai_api => |proof| {
+                        gpa.free(proof.text);
+                        gpa.free(proof.id);
+                        gpa.free(proof.encrypted_content);
+                    },
+                }
+            }
+        };
+
+        pub const Anthropic = union(enum) {
+            signature: Signature,
+            redacted: []const u8,
+        };
+
+        pub const Signature = struct {
+            text: []const u8,
+            signature: []const u8,
+        };
+
+        pub const OpenAi = struct {
+            text: []const u8,
+            id: []const u8,
+            encrypted_content: []const u8,
+        };
     };
 
     pub const ToolCall = struct {
@@ -181,38 +245,127 @@ pub const Usage = struct {
     }
 };
 
-/// A decoded fragment of a streamed assistant reply.
+/// A decoded part of a streamed assistant reply. Display deltas are kept
+/// separate from completed conversation items: transports own their native
+/// block/item lifecycles and emit an `item` only after the wire closes it.
 pub const Event = union(enum) {
+    /// Display-only streamed answer text.
     text: []const u8,
-    /// A chunk of streamed reasoning text.
-    thinking: Thinking,
-    /// The opaque blob closing the current reasoning run, carried back verbatim.
-    thinking_blob: Blob,
-    /// A complete redacted reasoning block: its opaque encrypted payload.
-    thinking_redacted: Blob,
-    tool_use: struct { call_id: []const u8, name: []const u8 },
-    input_json: []const u8,
+    /// Display-only streamed reasoning text.
+    thinking: []const u8,
+    /// One complete native assistant output item in wire order. Its slices borrow
+    /// the stream and remain valid until the next read or stream teardown. OpenAI
+    /// message content parts are canonically joined without a separator.
+    item: Output,
     stop: Stop,
 
-    /// A reasoning text delta tagged with its reasoning-item id (empty for
-    /// Anthropic; OpenAI's server-assigned `reasoning.id`).
-    pub const Thinking = struct {
-        id: []const u8 = "",
-        text: []const u8,
+    /// A completed assistant-only item before history ownership and exact-account
+    /// reasoning provenance are attached by the Agent.
+    pub const Output = union(enum) {
+        message: []const u8,
+        reasoning: Reasoning,
+        tool_call: Item.ToolCall,
     };
 
-    /// An opaque reasoning blob (signature, redacted payload, or encrypted
-    /// content) tagged with its reasoning-item id (empty for Anthropic).
-    pub const Blob = struct {
-        id: []const u8 = "",
-        blob: []const u8,
+    /// A complete reasoning run before exact-account provenance is attached by
+    /// the Agent. The union makes redacted text and provider-proof mixtures
+    /// unrepresentable.
+    pub const Reasoning = union(enum) {
+        signature: Item.Reasoning.Signature,
+        redacted: []const u8,
+        encrypted: Item.Reasoning.OpenAi,
+
+        pub fn replay(
+            self: *const Reasoning,
+            account: Account,
+        ) ?Item.Reasoning.Replay {
+            return switch (account) {
+                inline .anthropic_subscription, .anthropic_api => |tag| switch (self.*) {
+                    .signature => |signature| if (signature.signature.len != 0)
+                        @unionInit(
+                            Item.Reasoning.Replay,
+                            @tagName(tag),
+                            .{ .signature = signature },
+                        )
+                    else
+                        null,
+                    .redacted => |data| if (data.len != 0)
+                        @unionInit(
+                            Item.Reasoning.Replay,
+                            @tagName(tag),
+                            .{ .redacted = data },
+                        )
+                    else
+                        null,
+                    .encrypted => null,
+                },
+                inline .openai_subscription, .openai_api => |tag| switch (self.*) {
+                    .encrypted => |encrypted| if (encrypted.id.len != 0 and
+                        encrypted.encrypted_content.len != 0)
+                        @unionInit(Item.Reasoning.Replay, @tagName(tag), encrypted)
+                    else
+                        null,
+                    .signature, .redacted => null,
+                },
+            };
+        }
+
+        pub fn isRedacted(self: *const Reasoning) bool {
+            return self.* == .redacted;
+        }
     };
 
-    /// Authoritative end of an assistant message, carrying its cumulative usage.
+    /// Authoritative end of an assistant message, carrying its cumulative usage,
+    /// whether the provider completed or truncated the response, and any wire
+    /// outcome that makes the reply locally unretainable.
     pub const Stop = struct {
         usage: Usage,
+        status: Status = .complete,
+        rejection: ?Rejection = null,
+
+        pub const Rejection = enum {
+            /// Malformed or incomplete output that a whole-request retry may fix.
+            invalid,
+            /// A valid provider outcome the neutral conversation model cannot retain.
+            unsupported,
+        };
     };
+
+    /// A terminal response's completeness. `complete` is a clean finish;
+    /// `truncated` is a token or context cutoff whose reply so far still stands
+    /// but is retainable only when it holds no tool call. Resumable or refused
+    /// outcomes ride `Stop.rejection` as unsupported instead.
+    pub const Status = enum { complete, truncated };
 };
+
+test "reasoning proofs bind only to compatible exact accounts" {
+    const signature: Event.Reasoning = .{ .signature = .{
+        .text = "hmm",
+        .signature = "sig",
+    } };
+    const anthropic_replay = signature.replay(.anthropic_api).?;
+    try std.testing.expectEqual(Account.anthropic_api, std.meta.activeTag(anthropic_replay));
+    try std.testing.expectEqualStrings("hmm", anthropic_replay.anthropic_api.signature.text);
+    try std.testing.expectEqualStrings("sig", anthropic_replay.anthropic_api.signature.signature);
+    try std.testing.expect(signature.replay(.openai_api) == null);
+
+    const encrypted: Event.Reasoning = .{ .encrypted = .{
+        .text = "hmm",
+        .id = "rs_1",
+        .encrypted_content = "enc",
+    } };
+    const openai_replay = encrypted.replay(.openai_subscription).?;
+    try std.testing.expectEqual(Account.openai_subscription, std.meta.activeTag(openai_replay));
+    try std.testing.expectEqualStrings("rs_1", openai_replay.openai_subscription.id);
+    try std.testing.expectEqualStrings("hmm", openai_replay.openai_subscription.text);
+    try std.testing.expect(encrypted.replay(.anthropic_subscription) == null);
+
+    const redacted: Event.Reasoning = .{ .redacted = "secret" };
+    try std.testing.expectEqualStrings(
+        "secret",
+        redacted.replay(.anthropic_subscription).?.anthropic_subscription.redacted,
+    );
+}
 
 test "Account.provider maps each account to its vendor" {
     try std.testing.expectEqual(Provider.anthropic, Account.anthropic_api.provider());

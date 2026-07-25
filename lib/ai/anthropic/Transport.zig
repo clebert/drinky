@@ -50,11 +50,22 @@ pub const Stream = struct {
     status: std.http.Status,
     error_length: usize,
     retry_after_ms: ?u64,
-    /// Backs the event handed to the caller; freed by the next read.
-    parsed: ?std.json.Parsed(std.json.Value),
-    /// A `message_delta` carrying a stop reason arrived; only then may the
-    /// following `message_stop` close the reply.
-    terminal: bool,
+    /// Scratch for one decoded frame. Events may borrow it until the next read.
+    frame_arena: std.heap.ArenaAllocator,
+    /// The terminal outcome latched from the last non-null `message_delta` stop
+    /// reason; applied at `message_stop`. `none` until a stop reason
+    /// arrives, so a `message_stop` without one is an incomplete reply.
+    stop_reason: Terminal,
+    /// Malformed content observed after a terminal reason. Latched while the
+    /// bounded stream drains so message_stop can carry final usage and reject.
+    terminal_rejection: ?llm.Event.Stop.Rejection,
+    /// The one native content block currently open. Its retained buffers survive
+    /// frame resets and are emitted only when the matching block closes.
+    open_block: ?OpenBlock,
+    block_text: std.ArrayList(u8),
+    block_proof: std.ArrayList(u8),
+    tool_call_id: std.ArrayList(u8),
+    tool_name: std.ArrayList(u8),
     usage: llm.Usage,
     decompress: std.http.Decompress,
     decompress_buffer: []u8,
@@ -65,6 +76,19 @@ pub const Stream = struct {
     redirect_buffer: [4096]u8,
     transfer_buffer: [16384]u8,
 
+    const OpenBlock = union(enum) {
+        text: u64,
+        thinking: u64,
+        redacted: u64,
+        tool: u64,
+        unsupported: u64,
+
+        fn index(self: OpenBlock) u64 {
+            return switch (self) {
+                inline else => |block_index| block_index,
+            };
+        }
+    };
     const engine = sse.Engine(Stream);
     pub const deinit = engine.deinit;
     pub const ok = engine.ok;
@@ -77,81 +101,207 @@ pub const Stream = struct {
     pub const usageSoFar = engine.usageSoFar;
     pub const next = engine.next;
 
-    /// Drop the parses backing the previous event; the engine calls this
-    /// before each read and on deinit.
-    pub fn reset(self: *Stream) void {
-        if (self.parsed) |parsed| parsed.deinit();
-        self.parsed = null;
+    pub fn deinitDecode(self: *Stream) void {
+        self.frame_arena.deinit();
+        self.block_text.deinit(self.gpa);
+        self.block_proof.deinit(self.gpa);
+        self.tool_call_id.deinit(self.gpa);
+        self.tool_name.deinit(self.gpa);
+    }
+
+    /// Latch a rejection, `unsupported` winning over `invalid` however they
+    /// interleave: resampling cannot turn an outcome this design cannot retain
+    /// into one it can, so spending the retry budget on it only delays the same
+    /// failure.
+    fn markRejection(self: *Stream, rejection: llm.Event.Stop.Rejection) void {
+        if (self.terminal_rejection == null or rejection == .unsupported)
+            self.terminal_rejection = rejection;
+    }
+
+    fn invalid(self: *Stream) sse.Decoded {
+        self.markRejection(.invalid);
+        return .progress;
+    }
+
+    fn startBlock(self: *Stream, object: *const std.json.ObjectMap) !sse.Decoded {
+        const block = json.object(object.get("content_block")) orelse return self.invalid();
+        const kind = json.string(block.get("type")) orelse return self.invalid();
+        if (self.open_block != null) return self.invalid();
+        const index = contentBlockIndex(object) orelse return self.invalid();
+
+        self.block_text.clearRetainingCapacity();
+        self.block_proof.clearRetainingCapacity();
+        self.tool_call_id.clearRetainingCapacity();
+        self.tool_name.clearRetainingCapacity();
+        if (std.mem.eql(u8, kind, "text")) {
+            self.open_block = .{ .text = index };
+        } else if (std.mem.eql(u8, kind, "thinking")) {
+            self.open_block = .{ .thinking = index };
+        } else if (std.mem.eql(u8, kind, "redacted_thinking")) {
+            const data = json.string(block.get("data")) orelse return self.invalid();
+            if (data.len == 0) return self.invalid();
+            try self.block_proof.appendSlice(self.gpa, data);
+            self.open_block = .{ .redacted = index };
+        } else if (std.mem.eql(u8, kind, "tool_use")) {
+            const call_id = json.string(block.get("id")) orelse return self.invalid();
+            const name = json.string(block.get("name")) orelse return self.invalid();
+            if (call_id.len == 0) return self.invalid();
+            try self.tool_call_id.appendSlice(self.gpa, call_id);
+            try self.tool_name.appendSlice(self.gpa, name);
+            self.open_block = .{ .tool = index };
+        } else {
+            self.markRejection(.unsupported);
+            self.open_block = .{ .unsupported = index };
+        }
+        return .progress;
+    }
+
+    fn appendBlockDelta(self: *Stream, object: *const std.json.ObjectMap) !sse.Decoded {
+        const open_block = self.open_block orelse return self.invalid();
+        if (contentBlockIndex(object) != open_block.index()) return self.invalid();
+        const delta = json.object(object.get("delta")) orelse return self.invalid();
+        const kind = json.string(delta.get("type")) orelse return self.invalid();
+        return switch (open_block) {
+            .text => if (std.mem.eql(u8, kind, "text_delta")) text: {
+                const text = json.string(delta.get("text")) orelse return self.invalid();
+                try self.block_text.appendSlice(self.gpa, text);
+                break :text .{ .event = .{ .text = text } };
+            } else self.invalid(),
+            .thinking => if (std.mem.eql(u8, kind, "thinking_delta")) thinking: {
+                if (self.block_proof.items.len != 0) return self.invalid();
+                const text = json.string(delta.get("thinking")) orelse return self.invalid();
+                try self.block_text.appendSlice(self.gpa, text);
+                break :thinking .{ .event = .{ .thinking = text } };
+            } else if (std.mem.eql(u8, kind, "signature_delta")) signature: {
+                const proof = json.string(delta.get("signature")) orelse return self.invalid();
+                try self.block_proof.appendSlice(self.gpa, proof);
+                break :signature .progress;
+            } else self.invalid(),
+            .redacted => self.invalid(),
+            .tool => if (std.mem.eql(u8, kind, "input_json_delta")) arguments: {
+                const chunk = json.string(delta.get("partial_json")) orelse
+                    return self.invalid();
+                try self.block_text.appendSlice(self.gpa, chunk);
+                break :arguments .progress;
+            } else self.invalid(),
+            .unsupported => .progress,
+        };
+    }
+
+    fn stopBlock(self: *Stream, object: *const std.json.ObjectMap) sse.Decoded {
+        // A stop that closes nothing means the block sequence is malformed, so it
+        // latches like every other correlation failure rather than passing for
+        // harmless filler.
+        const open_block = self.open_block orelse return self.invalid();
+        if (contentBlockIndex(object) != open_block.index()) return self.invalid();
+        self.open_block = null;
+        return switch (open_block) {
+            .text => if (self.block_text.items.len == 0)
+                .progress
+            else
+                .{ .event = .{ .item = .{ .message = self.block_text.items } } },
+            .thinking => if (self.block_proof.items.len == 0)
+                self.invalid()
+            else
+                .{ .event = .{ .item = .{ .reasoning = .{ .signature = .{
+                    .text = self.block_text.items,
+                    .signature = self.block_proof.items,
+                } } } } },
+            .redacted => .{ .event = .{ .item = .{
+                .reasoning = .{ .redacted = self.block_proof.items },
+            } } },
+            .tool => .{ .event = .{ .item = .{ .tool_call = .{
+                .call_id = self.tool_call_id.items,
+                .name = self.tool_name.items,
+                .arguments_json = self.block_text.items,
+            } } } },
+            .unsupported => .progress,
+        };
     }
 
     /// Decode one Messages `data:` payload; a keepalive `ping` is filler.
     pub fn decode(self: *Stream, payload: []const u8) !sse.Decoded {
         // A malformed payload is filler, not progress; a truncated tail then
         // surfaces as an incomplete reply at end of stream, which is retried.
-        const parsed = std.json.parseFromSlice(std.json.Value, self.gpa, payload, .{}) catch |err|
-            switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => return .ignored,
-            };
-        const object = json.object(parsed.value) orelse {
-            parsed.deinit();
-            return .ignored;
+        const value = std.json.parseFromSliceLeaky(
+            std.json.Value,
+            self.frame_arena.allocator(),
+            payload,
+            .{},
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return .ignored,
         };
-        const kind = json.string(object.get("type")) orelse {
-            parsed.deinit();
-            return .ignored;
-        };
+        const object = json.object(value) orelse return .ignored;
+        const kind = json.string(object.get("type")) orelse return .ignored;
 
-        if (std.mem.eql(u8, kind, "ping")) {
-            parsed.deinit();
-            return .ignored;
-        }
+        if (std.mem.eql(u8, kind, "ping")) return .ignored;
         if (std.mem.eql(u8, kind, "error")) {
             engine.recordError(self, errorMessage(object) orelse kind);
-            parsed.deinit();
             return error.ApiError;
         }
-
         if (std.mem.eql(u8, kind, "message_delta")) {
             if (json.object(object.get("usage"))) |usage| mergeUsage(&self.usage, usage);
-            self.terminal = messageDeltaStopReason(object) != null;
-            parsed.deinit();
+            if (messageDeltaStopReason(object)) |reason| self.stop_reason = foldStop(reason);
             return .progress;
         }
         if (std.mem.eql(u8, kind, "message_stop")) {
-            parsed.deinit();
-            if (!self.terminal) return error.IncompleteReply;
-            return .{ .event = .{ .stop = .{ .usage = self.usage } } };
+            if (self.open_block != null) self.markRejection(.invalid);
+            return switch (self.stop_reason) {
+                .none => .{ .event = .{ .stop = .{
+                    .usage = self.usage,
+                    .rejection = .invalid,
+                } } },
+                .unsupported => .{ .event = .{ .stop = .{
+                    .usage = self.usage,
+                    .rejection = .unsupported,
+                } } },
+                .complete => .{ .event = .{ .stop = .{
+                    .usage = self.usage,
+                    .status = .complete,
+                    .rejection = self.terminal_rejection,
+                } } },
+                .truncated => .{ .event = .{ .stop = .{
+                    .usage = self.usage,
+                    .status = .truncated,
+                    .rejection = self.terminal_rejection,
+                } } },
+            };
         }
-        // Only recognized content past the terminal delta breaks the reply;
-        // an unrecognized frame there is still ignored filler.
+
         const content = std.mem.eql(u8, kind, "message_start") or
             std.mem.startsWith(u8, kind, "content_block_");
-        if (content and self.terminal) {
-            self.terminal = false;
-            parsed.deinit();
-            return error.IncompleteReply;
-        }
+        if (content and self.stop_reason != .none) return self.invalid();
         if (std.mem.eql(u8, kind, "message_start")) {
             if (json.object(object.get("message"))) |message| {
                 if (json.object(message.get("usage"))) |usage| mergeUsage(&self.usage, usage);
             }
-            parsed.deinit();
             return .progress;
         }
-
-        if (classify(object, kind)) |event| {
-            self.parsed = parsed;
-            return .{ .event = event };
-        }
-        // A recognized `content_block_*` frame with no event is still progress;
-        // any other `type` is filler. Read `kind` (which borrows `parsed`)
-        // before freeing it.
-        const recognized = std.mem.startsWith(u8, kind, "content_block_");
-        parsed.deinit();
-        return if (recognized) .progress else .ignored;
+        if (std.mem.eql(u8, kind, "content_block_start"))
+            return self.startBlock(&object);
+        if (std.mem.eql(u8, kind, "content_block_delta"))
+            return self.appendBlockDelta(&object);
+        if (std.mem.eql(u8, kind, "content_block_stop"))
+            return self.stopBlock(&object);
+        return if (std.mem.startsWith(u8, kind, "content_block_")) .progress else .ignored;
     }
 };
+
+/// The terminal outcome a `stop_reason` folds to. `end_turn`, `tool_use`, and
+/// `stop_sequence` are complete; output-token and context-window exhaustion are
+/// truncated. `pause_turn`, `refusal`, and any unrecognized reason are unsupported
+/// terminal outcomes this design cannot retain, so they reject the reply.
+const Terminal = enum { none, complete, truncated, unsupported };
+
+fn foldStop(reason: []const u8) Terminal {
+    if (std.mem.eql(u8, reason, "end_turn") or
+        std.mem.eql(u8, reason, "tool_use") or
+        std.mem.eql(u8, reason, "stop_sequence")) return .complete;
+    if (std.mem.eql(u8, reason, "max_tokens") or
+        std.mem.eql(u8, reason, "model_context_window_exceeded")) return .truncated;
+    return .unsupported;
+}
 
 /// Open a streaming Messages request bounded by the connect timeout; on any
 /// failure `out` is torn down, so a caller that sees an error owns nothing
@@ -170,7 +320,14 @@ fn connect(self: *Transport, out: *Stream, body: []const u8) anyerror!void {
     const engine = sse.Engine(Stream);
     engine.begin(out, self.gpa, self.io);
     errdefer out.client.deinit();
-    out.terminal = false;
+    errdefer out.frame_arena.deinit();
+    out.stop_reason = .none;
+    out.terminal_rejection = null;
+    out.open_block = null;
+    out.block_text = .empty;
+    out.block_proof = .empty;
+    out.tool_call_id = .empty;
+    out.tool_name = .empty;
 
     // The Bearer header must outlive the send below, so allocate it at connect
     // scope; the API-key path needs none.
@@ -232,37 +389,10 @@ fn requestOptions(
     }
 }
 
-fn classify(object: std.json.ObjectMap, kind: []const u8) ?llm.Event {
-    if (std.mem.eql(u8, kind, "content_block_delta")) {
-        const delta = json.object(object.get("delta")) orelse return null;
-        const delta_kind = json.string(delta.get("type")) orelse return null;
-        if (std.mem.eql(u8, delta_kind, "text_delta"))
-            return .{ .text = json.string(delta.get("text")) orelse return null };
-        if (std.mem.eql(u8, delta_kind, "input_json_delta"))
-            return .{ .input_json = json.string(delta.get("partial_json")) orelse return null };
-        if (std.mem.eql(u8, delta_kind, "thinking_delta")) return .{
-            .thinking = .{ .text = json.string(delta.get("thinking")) orelse return null },
-        };
-        if (std.mem.eql(u8, delta_kind, "signature_delta")) return .{
-            .thinking_blob = .{ .blob = json.string(delta.get("signature")) orelse return null },
-        };
-        return null;
-    }
-    if (std.mem.eql(u8, kind, "content_block_start")) {
-        const block = json.object(object.get("content_block")) orelse return null;
-        const block_kind = json.string(block.get("type")) orelse return null;
-        if (std.mem.eql(u8, block_kind, "redacted_thinking")) return .{
-            .thinking_redacted = .{ .blob = json.string(block.get("data")) orelse return null },
-        };
-        // A `thinking` start carries only empty seeds — its content arrives as
-        // deltas — so it, like any other non-tool block, yields no start event.
-        if (!std.mem.eql(u8, block_kind, "tool_use")) return null;
-        return .{ .tool_use = .{
-            .call_id = json.string(block.get("id")) orelse return null,
-            .name = json.string(block.get("name")) orelse return null,
-        } };
-    }
-    return null;
+fn contentBlockIndex(object: *const std.json.ObjectMap) ?u64 {
+    const index = json.integer(object.get("index")) orelse return null;
+    if (index < 0) return null;
+    return @intCast(index);
 }
 
 fn messageDeltaStopReason(object: std.json.ObjectMap) ?[]const u8 {
@@ -286,69 +416,189 @@ fn mergeUsage(usage: *llm.Usage, object: std.json.ObjectMap) void {
 
 /// A stream over `body` for the tests: test allocator, fresh decode state, and
 /// the given window and budget; the connection fields stay undefined. Pair with
-/// `defer stream.reset()` to free whatever decoding retains.
+/// `defer stream.deinitDecode()` to free whatever decoding retains.
 fn testStream(io: std.Io, body: *std.Io.Reader, idle_ms: u64, budget_max: usize) Stream {
+    return testStreamWithAllocator(std.testing.allocator, io, body, idle_ms, budget_max);
+}
+
+fn testStreamWithAllocator(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    body: *std.Io.Reader,
+    idle_ms: u64,
+    budget_max: usize,
+) Stream {
     var stream: Stream = undefined;
-    stream.gpa = std.testing.allocator;
+    stream.gpa = gpa;
     stream.io = io;
     stream.idle_ms = idle_ms;
     stream.budget = .{ .max = budget_max };
     stream.body = body;
-    stream.parsed = null;
-    stream.terminal = false;
+    stream.frame_arena = .init(gpa);
+    stream.stop_reason = .none;
+    stream.terminal_rejection = null;
+    stream.open_block = null;
+    stream.block_text = .empty;
+    stream.block_proof = .empty;
+    stream.tool_call_id = .empty;
+    stream.tool_name = .empty;
     stream.usage = .{};
     return stream;
 }
 
-test classify {
-    const payload =
-        \\{"type":"content_block_delta","delta":{"type":"text_delta","text":"hello"}}
-    ;
-    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
-    defer parsed.deinit();
-    const event = classify(parsed.value.object, "content_block_delta").?;
-    try std.testing.expectEqualStrings("hello", event.text);
+fn decodeTestFrame(stream: *Stream, payload: []const u8) !void {
+    _ = stream.frame_arena.reset(.retain_capacity);
+    _ = try stream.decode(payload);
+}
 
-    const start =
-        \\{"type":"content_block_start","content_block":{"type":"tool_use","id":"t1","name":"read"}}
-    ;
-    const parsed_start =
-        try std.json.parseFromSlice(std.json.Value, std.testing.allocator, start, .{});
-    defer parsed_start.deinit();
-    const start_event = classify(parsed_start.value.object, "content_block_start").?;
-    try std.testing.expectEqualStrings("read", start_event.tool_use.name);
+fn decodeBlocksUnderOom(gpa: std.mem.Allocator) !void {
+    var stream = testStreamWithAllocator(gpa, undefined, undefined, 0, 0);
+    defer stream.deinitDecode();
 
-    const thinking =
-        \\{"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"hmm"}}
-    ;
-    const parsed_thinking =
-        try std.json.parseFromSlice(std.json.Value, std.testing.allocator, thinking, .{});
-    defer parsed_thinking.deinit();
-    try std.testing.expectEqualStrings(
-        "hmm",
-        classify(parsed_thinking.value.object, "content_block_delta").?.thinking.text,
+    try decodeTestFrame(&stream,
+        \\{"type":"content_block_start","index":0,"content_block":{"type":"text"}}
     );
-
-    const signature =
-        \\{"type":"content_block_delta","delta":{"type":"signature_delta","signature":"sig"}}
-    ;
-    const parsed_signature =
-        try std.json.parseFromSlice(std.json.Value, std.testing.allocator, signature, .{});
-    defer parsed_signature.deinit();
-    try std.testing.expectEqualStrings(
-        "sig",
-        classify(parsed_signature.value.object, "content_block_delta").?.thinking_blob.blob,
+    try decodeTestFrame(&stream,
+        \\{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello"}}
     );
+    try decodeTestFrame(&stream,
+        \\{"type":"content_block_stop","index":0}
+    );
+    try decodeTestFrame(&stream,
+        \\{"type":"content_block_start","index":1,"content_block":{"type":"thinking"}}
+    );
+    try decodeTestFrame(&stream,
+        \\{"type":"content_block_delta","index":1,"delta":{"type":"thinking_delta","thinking":"hmm"}}
+    );
+    try decodeTestFrame(&stream,
+        \\{"type":"content_block_delta","index":1,"delta":{"type":"signature_delta","signature":"sig"}}
+    );
+    try decodeTestFrame(&stream,
+        \\{"type":"content_block_stop","index":1}
+    );
+    try decodeTestFrame(&stream,
+        \\{"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"tool_1","name":"read"}}
+    );
+    try decodeTestFrame(&stream,
+        \\{"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{}"}}
+    );
+    try decodeTestFrame(&stream,
+        \\{"type":"content_block_stop","index":2}
+    );
+}
 
-    const redacted =
-        \\{"type":"content_block_start","content_block":{"type":"redacted_thinking","data":"enc"}}
-    ;
-    const parsed_redacted =
-        try std.json.parseFromSlice(std.json.Value, std.testing.allocator, redacted, .{});
-    defer parsed_redacted.deinit();
-    try std.testing.expectEqualStrings(
-        "enc",
-        classify(parsed_redacted.value.object, "content_block_start").?.thinking_redacted.blob,
+test "completed block decoding frees state at every allocation-failure point" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        decodeBlocksUnderOom,
+        .{},
+    );
+}
+
+test "reasoning blocks emit display deltas and one complete proof" {
+    var stream = testStream(undefined, undefined, 0, 0);
+    defer stream.deinitDecode();
+
+    try std.testing.expectEqual(@as(sse.Decoded, .progress), try stream.decode(
+        \\{"type":"content_block_start","index":0,"content_block":{"type":"thinking"}}
+    ));
+    const thinking = try stream.decode(
+        \\{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"hmm"}}
+    );
+    try std.testing.expectEqualStrings("hmm", thinking.event.thinking);
+    _ = stream.frame_arena.reset(.retain_capacity);
+    try std.testing.expectEqual(@as(sse.Decoded, .progress), try stream.decode(
+        \\{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"si"}}
+    ));
+    try std.testing.expectEqual(@as(sse.Decoded, .progress), try stream.decode(
+        \\{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"g"}}
+    ));
+    const complete = try stream.decode(
+        \\{"type":"content_block_stop","index":0}
+    );
+    try std.testing.expectEqualStrings("hmm", complete.event.item.reasoning.signature.text);
+    try std.testing.expectEqualStrings("sig", complete.event.item.reasoning.signature.signature);
+
+    try std.testing.expectEqual(@as(sse.Decoded, .progress), try stream.decode(
+        \\{"type":"content_block_start","index":1,"content_block":{"type":"redacted_thinking","data":"enc"}}
+    ));
+    const redacted = try stream.decode(
+        \\{"type":"content_block_stop","index":1}
+    );
+    try std.testing.expectEqualStrings("enc", redacted.event.item.reasoning.redacted);
+}
+
+test "invalid reasoning blocks latch through terminal usage" {
+    const Case = struct { frames: []const []const u8 };
+    const missing_signature = [_][]const u8{
+        \\{"type":"content_block_start","index":0,"content_block":{"type":"thinking"}}
+        ,
+        \\{"type":"content_block_stop","index":0}
+        ,
+    };
+    const mismatched_index = [_][]const u8{
+        \\{"type":"content_block_start","index":0,"content_block":{"type":"thinking"}}
+        ,
+        \\{"type":"content_block_delta","index":1,"delta":{"type":"signature_delta","signature":"sig"}}
+        ,
+    };
+    const empty_redacted = [_][]const u8{
+        \\{"type":"content_block_start","index":0,"content_block":{"type":"redacted_thinking","data":""}}
+    };
+    const unclosed_redacted = [_][]const u8{
+        \\{"type":"content_block_start","index":0,"content_block":{"type":"redacted_thinking","data":"enc"}}
+    };
+    const mismatched_redacted_close = [_][]const u8{
+        \\{"type":"content_block_start","index":0,"content_block":{"type":"redacted_thinking","data":"enc"}}
+        ,
+        \\{"type":"content_block_stop","index":1}
+        ,
+    };
+    const interleaved_text = [_][]const u8{
+        \\{"type":"content_block_start","index":0,"content_block":{"type":"thinking"}}
+        ,
+        \\{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"wrong"}}
+        ,
+    };
+    const cases = [_]Case{
+        .{ .frames = &missing_signature },
+        .{ .frames = &mismatched_index },
+        .{ .frames = &empty_redacted },
+        .{ .frames = &unclosed_redacted },
+        .{ .frames = &mismatched_redacted_close },
+        .{ .frames = &interleaved_text },
+    };
+
+    for (cases) |case| {
+        var stream = testStream(undefined, undefined, 0, 0);
+        defer stream.deinitDecode();
+        for (case.frames) |frame| _ = try stream.decode(frame);
+        _ = try stream.decode(
+            \\{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}
+        );
+        const terminal = try stream.decode(
+            \\{"type":"message_stop"}
+        );
+        try std.testing.expectEqual(
+            llm.Event.Stop.Rejection.invalid,
+            terminal.event.stop.rejection.?,
+        );
+        try std.testing.expectEqual(@as(u64, 5), terminal.event.stop.usage.output);
+    }
+}
+
+test "negative block indexes never correlate with block zero" {
+    var stream = testStream(undefined, undefined, 0, 0);
+    defer stream.deinitDecode();
+    _ = try stream.decode(
+        \\{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t1","name":"read"}}
+    );
+    try std.testing.expectEqual(@as(sse.Decoded, .progress), try stream.decode(
+        \\{"type":"content_block_delta","index":-1,"delta":{"type":"input_json_delta","partial_json":"{}"}}
+    ));
+    try std.testing.expectEqual(
+        llm.Event.Stop.Rejection.invalid,
+        stream.terminal_rejection.?,
     );
 }
 
@@ -362,9 +612,16 @@ test "next walks SSE data lines and ends at stream end" {
         "event: ping\r\n" ++
         "data: {\"type\":\"ping\"}\r\n" ++
         "\r\n" ++
+        "event: content_block_start\r\n" ++
+        "data: {\"type\":\"content_block_start\",\"index\":0," ++
+        "\"content_block\":{\"type\":\"text\"}}\r\n" ++
+        "\r\n" ++
         "event: content_block_delta\r\n" ++
-        "data: {\"type\":\"content_block_delta\"," ++
+        "data: {\"type\":\"content_block_delta\",\"index\":0," ++
         "\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\r\n" ++
+        "\r\n" ++
+        "event: content_block_stop\r\n" ++
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\r\n" ++
         "\r\n" ++
         "event: message_delta\r\n" ++
         "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}," ++
@@ -377,10 +634,10 @@ test "next walks SSE data lines and ends at stream end" {
     defer threaded.deinit();
     var reader: std.Io.Reader = .fixed(body);
     var stream = testStream(threaded.io(), &reader, 60_000, net.stream_response_bytes_max);
-    defer stream.reset();
+    defer stream.deinitDecode();
 
-    const text = (try stream.next()).?;
-    try std.testing.expectEqualStrings("Hi", text.text);
+    try std.testing.expectEqualStrings("Hi", (try stream.next()).?.text);
+    try std.testing.expectEqualStrings("Hi", (try stream.next()).?.item.message);
     const stop = (try stream.next()).?;
     try std.testing.expectEqual(@as(u64, 10), stop.stop.usage.input);
     try std.testing.expectEqual(@as(u64, 42), stop.stop.usage.output);
@@ -393,7 +650,7 @@ test "next walks SSE data lines and ends at stream end" {
 
 test "decode separates pings from progress and events" {
     var stream = testStream(undefined, undefined, 0, 0);
-    defer stream.reset();
+    defer stream.deinitDecode();
 
     try std.testing.expectEqual(@as(sse.Decoded, .ignored), try stream.decode(
         \\{"type":"ping"}
@@ -402,49 +659,199 @@ test "decode separates pings from progress and events" {
         \\{"type":"message_start","message":{"usage":{"input_tokens":3}}}
     ));
     try std.testing.expectEqual(@as(u64, 3), stream.usage.input);
+    try std.testing.expectEqual(@as(sse.Decoded, .progress), try stream.decode(
+        \\{"type":"content_block_start","index":0,"content_block":{"type":"text"}}
+    ));
     const delta = try stream.decode(
-        \\{"type":"content_block_delta","delta":{"type":"text_delta","text":"hi"}}
+        \\{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}
     );
     try std.testing.expectEqualStrings("hi", delta.event.text);
 }
 
-test "message_stop requires a final delta with a stop reason" {
+test "message_stop carries usage when its reason or tail is invalid" {
     var stream = testStream(undefined, undefined, 0, 0);
-    defer stream.reset();
+    defer stream.deinitDecode();
 
-    try std.testing.expectError(error.IncompleteReply, stream.decode(
+    const missing = try stream.decode(
         \\{"type":"message_stop"}
-    ));
+    );
+    try std.testing.expectEqual(
+        llm.Event.Stop.Rejection.invalid,
+        missing.event.stop.rejection.?,
+    );
     try std.testing.expectEqual(@as(sse.Decoded, .progress), try stream.decode(
         \\{"type":"message_delta","delta":{"stop_reason":null},"usage":{"output_tokens":1}}
     ));
-    try std.testing.expectError(error.IncompleteReply, stream.decode(
+    const missing_after_usage = try stream.decode(
         \\{"type":"message_stop"}
-    ));
+    );
+    try std.testing.expectEqual(
+        llm.Event.Stop.Rejection.invalid,
+        missing_after_usage.event.stop.rejection.?,
+    );
+    try std.testing.expectEqual(@as(u64, 1), missing_after_usage.event.stop.usage.output);
 
     try std.testing.expectEqual(@as(sse.Decoded, .progress), try stream.decode(
         \\{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}
     ));
-    try std.testing.expectError(error.IncompleteReply, stream.decode(
+    try std.testing.expectEqual(@as(sse.Decoded, .progress), try stream.decode(
         \\{"type":"content_block_delta","delta":{"type":"text_delta","text":"late"}}
     ));
-    try std.testing.expect(!stream.terminal);
+    try std.testing.expect(stream.stop_reason == .complete);
+    const malformed_tail = try stream.decode(
+        \\{"type":"message_stop"}
+    );
+    try std.testing.expectEqual(
+        llm.Event.Stop.Rejection.invalid,
+        malformed_tail.event.stop.rejection.?,
+    );
+    try std.testing.expectEqual(@as(u64, 2), malformed_tail.event.stop.usage.output);
+}
+
+test "stop_reason folds to a terminal status; the last non-null delta wins" {
+    var stream = testStream(undefined, undefined, 0, 0);
+    defer stream.deinitDecode();
+
+    // max_tokens truncates; the reply so far still stands.
+    try std.testing.expectEqual(@as(sse.Decoded, .progress), try stream.decode(
+        \\{"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{}}
+    ));
+    // A later delta that omits the reason updates usage without erasing it.
+    try std.testing.expectEqual(@as(sse.Decoded, .progress), try stream.decode(
+        \\{"type":"message_delta","delta":{},"usage":{"output_tokens":1}}
+    ));
+    try std.testing.expectEqual(
+        llm.Event.Status.truncated,
+        (try stream.decode(
+            \\{"type":"message_stop"}
+        )).event.stop.status,
+    );
 
     try std.testing.expectEqual(@as(sse.Decoded, .progress), try stream.decode(
-        \\{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":3}}
+        \\{"type":"message_delta","delta":{"stop_reason":"model_context_window_exceeded"},"usage":{}}
+    ));
+    try std.testing.expectEqual(
+        llm.Event.Status.truncated,
+        (try stream.decode(
+            \\{"type":"message_stop"}
+        )).event.stop.status,
+    );
+
+    // end_turn, tool_use, and stop_sequence complete; a later delta overrides.
+    try std.testing.expectEqual(@as(sse.Decoded, .progress), try stream.decode(
+        \\{"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{}}
     ));
     try std.testing.expectEqual(@as(sse.Decoded, .progress), try stream.decode(
-        \\{"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":4}}
+        \\{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{}}
     ));
+    try std.testing.expectEqual(
+        llm.Event.Status.complete,
+        (try stream.decode(
+            \\{"type":"message_stop"}
+        )).event.stop.status,
+    );
+}
+
+test "pause_turn, refusal, and unknown stop reasons carry usage as unsupported" {
+    var stream = testStream(undefined, undefined, 0, 0);
+    defer stream.deinitDecode();
+
+    for ([_][]const u8{ "pause_turn", "refusal", "surprise_reason" }) |reason| {
+        const delta = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "{{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"{s}\"}}," ++
+                "\"usage\":{{\"output_tokens\":7}}}}",
+            .{reason},
+        );
+        defer std.testing.allocator.free(delta);
+        try std.testing.expectEqual(@as(sse.Decoded, .progress), try stream.decode(delta));
+        const stop = try stream.decode(
+            \\{"type":"message_stop"}
+        );
+        try std.testing.expectEqual(
+            llm.Event.Stop.Rejection.unsupported,
+            stop.event.stop.rejection.?,
+        );
+        try std.testing.expectEqual(@as(u64, 7), stop.event.stop.usage.output);
+    }
+}
+
+test "unsupported content blocks latch through terminal usage" {
+    var stream = testStream(undefined, undefined, 0, 0);
+    defer stream.deinitDecode();
+
+    try std.testing.expectEqual(@as(sse.Decoded, .progress), try stream.decode(
+        \\{"type":"content_block_start","index":0,"content_block":{"type":"server_tool_use","id":"tool_1"}}
+    ));
+    try std.testing.expect(stream.open_block.? == .unsupported);
+    try std.testing.expectEqual(@as(sse.Decoded, .progress), try stream.decode(
+        \\{"type":"content_block_delta","index":0,"delta":{"type":"server_tool_delta"}}
+    ));
+    try std.testing.expectEqual(@as(sse.Decoded, .progress), try stream.decode(
+        \\{"type":"content_block_stop","index":0}
+    ));
+    try std.testing.expect(stream.open_block == null);
+    _ = try stream.decode(
+        \\{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":6}}
+    );
     const stop = try stream.decode(
         \\{"type":"message_stop"}
     );
-    try std.testing.expectEqual(@as(u64, 4), stop.event.stop.usage.output);
+    try std.testing.expectEqual(llm.Event.Stop.Rejection.unsupported, stop.event.stop.rejection.?);
+    try std.testing.expectEqual(@as(u64, 6), stop.event.stop.usage.output);
+}
+
+test "a tool block emits one completed item when it closes" {
+    var stream = testStream(undefined, undefined, 0, 0);
+    defer stream.deinitDecode();
+
+    try std.testing.expectEqual(@as(sse.Decoded, .progress), try stream.decode(
+        \\{"type":"content_block_start","index":0,"content_block":{"type":"text"}}
+    ));
+    try std.testing.expectEqual(@as(sse.Decoded, .progress), try stream.decode(
+        \\{"type":"content_block_stop","index":0}
+    ));
+
+    try std.testing.expectEqual(@as(sse.Decoded, .progress), try stream.decode(
+        \\{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"t1","name":"read"}}
+    ));
+    const complete = try stream.decode(
+        \\{"type":"content_block_stop","index":1}
+    );
+    try std.testing.expectEqualStrings("t1", complete.event.item.tool_call.call_id);
+    try std.testing.expectEqualStrings("read", complete.event.item.tool_call.name);
+    try std.testing.expectEqualStrings("", complete.event.item.tool_call.arguments_json);
+}
+
+test "correlation state survives per-frame resets across a multi-delta tool call" {
+    const body =
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":" ++
+        "{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"read\"}}\n\n" ++
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":" ++
+        "{\"type\":\"input_json_delta\",\"partial_json\":\"{\"}}\n\n" ++
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":" ++
+        "{\"type\":\"input_json_delta\",\"partial_json\":\"}\"}}\n\n" ++
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}," ++
+        "\"usage\":{\"output_tokens\":3}}\n\n" ++
+        "data: {\"type\":\"message_stop\"}\n\n";
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var reader: std.Io.Reader = .fixed(body);
+    var stream = testStream(threaded.io(), &reader, 60_000, net.stream_response_bytes_max);
+    defer stream.deinitDecode();
+
+    const item = (try stream.next()).?.item.tool_call;
+    try std.testing.expectEqualStrings("t1", item.call_id);
+    try std.testing.expectEqualStrings("read", item.name);
+    try std.testing.expectEqualStrings("{}", item.arguments_json);
+    try std.testing.expectEqual(llm.Event.Status.complete, (try stream.next()).?.stop.status);
+    try std.testing.expect((try stream.next()) == null);
 }
 
 test "an unrecognized frame after the terminal delta stays ignored" {
     var stream = testStream(undefined, undefined, 0, 0);
-    defer stream.reset();
+    defer stream.deinitDecode();
 
     try std.testing.expectEqual(@as(sse.Decoded, .progress), try stream.decode(
         \\{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}
@@ -461,7 +868,7 @@ test "an unrecognized frame after the terminal delta stays ignored" {
 
 test "decode ignores unrecognized frames instead of counting them as progress" {
     var stream = testStream(undefined, undefined, 0, 0);
-    defer stream.reset();
+    defer stream.deinitDecode();
 
     try std.testing.expectEqual(@as(sse.Decoded, .ignored), try stream.decode(
         \\{"type":"surprise_new_event"}
@@ -474,13 +881,34 @@ test "decode ignores unrecognized frames instead of counting them as progress" {
     ));
     // A recognized block boundary that carries no event is still progress.
     try std.testing.expectEqual(@as(sse.Decoded, .progress), try stream.decode(
+        \\{"type":"content_block_start","index":0,"content_block":{"type":"text"}}
+    ));
+    try std.testing.expect(stream.terminal_rejection == null);
+}
+
+test "a block stop that closes nothing is invalid, not silent filler" {
+    var stream = testStream(undefined, undefined, 0, 0);
+    defer stream.deinitDecode();
+
+    // No block is open, so this stop cannot be part of a well-formed response;
+    // latching keeps it from quietly dropping content the peer thought it sent.
+    try std.testing.expectEqual(@as(sse.Decoded, .progress), try stream.decode(
         \\{"type":"content_block_stop","index":0}
     ));
+    try std.testing.expectEqual(llm.Event.Stop.Rejection.invalid, stream.terminal_rejection.?);
+    _ = try stream.decode(
+        \\{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":3}}
+    );
+    const stop = try stream.decode(
+        \\{"type":"message_stop"}
+    );
+    try std.testing.expectEqual(llm.Event.Stop.Rejection.invalid, stop.event.stop.rejection.?);
+    try std.testing.expectEqual(@as(u64, 3), stop.event.stop.usage.output);
 }
 
 test "decode ignores a malformed data line instead of failing the turn" {
     var stream = testStream(undefined, undefined, 0, 0);
-    defer stream.reset();
+    defer stream.deinitDecode();
 
     try std.testing.expectEqual(@as(sse.Decoded, .ignored), try stream.decode(
         \\{"type":"content_block_delta","del
@@ -492,7 +920,7 @@ test "decode ignores a malformed data line instead of failing the turn" {
 
 test "decode surfaces a streamed error frame" {
     var stream = testStream(undefined, undefined, 0, 0);
-    defer stream.reset();
+    defer stream.deinitDecode();
 
     try std.testing.expectError(error.ApiError, stream.decode(
         \\{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}
@@ -529,7 +957,7 @@ test "next times out on buffered filler that makes no progress" {
     var clock: sse.TickingIo = .init(threaded.io(), 40 * std.time.ns_per_ms);
     var reader: std.Io.Reader = .fixed(body);
     var stream = testStream(clock.io(), &reader, 100, net.stream_response_bytes_max);
-    defer stream.reset();
+    defer stream.deinitDecode();
 
     // The 100 ms window loses 40 ms per reading, so it closes after a few
     // filler lines — before the trailing real event or EOF.
@@ -541,14 +969,15 @@ test "next stops a stream once its aggregate byte budget is spent" {
     // aggregate byte budget ends the flood. It spans two frames, tripping on
     // their sum rather than any single line.
     const frame =
-        "data: {\"type\":\"content_block_delta\"," ++
+        "data: {\"type\":\"content_block_delta\",\"index\":0," ++
         "\"delta\":{\"type\":\"text_delta\",\"text\":\"chunk\"}}\n";
     const body = frame ** 5;
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();
     var reader: std.Io.Reader = .fixed(body);
     var stream = testStream(threaded.io(), &reader, 60_000, frame.len * 2);
-    defer stream.reset();
+    defer stream.deinitDecode();
+    stream.open_block = .{ .text = 0 };
 
     try std.testing.expectEqualStrings("chunk", (try stream.next()).?.text);
     try std.testing.expectEqualStrings("chunk", (try stream.next()).?.text);
@@ -565,7 +994,7 @@ test "next bounds a flood of eventless progress frames" {
     defer threaded.deinit();
     var reader: std.Io.Reader = .fixed(body);
     var stream = testStream(threaded.io(), &reader, 60_000, frame.len * 3);
-    defer stream.reset();
+    defer stream.deinitDecode();
 
     try std.testing.expectError(error.StreamResponseTooLarge, stream.next());
 }
@@ -575,7 +1004,7 @@ test "next reads a data frame larger than the reader buffer" {
     // must stream into the growable line buffer; the chunked reader serves at
     // most 64 bytes per fill, so one line spans several fills.
     const text = "A" ** 4000;
-    const body = "data: {\"type\":\"content_block_delta\",\"delta\":" ++
+    const body = "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":" ++
         "{\"type\":\"text_delta\",\"text\":\"" ++ text ++ "\"}}\n";
     var buffer: [256]u8 = undefined;
     var chunked: std.testing.Reader = .init(&buffer, &.{.{ .buffer = body }});
@@ -584,7 +1013,8 @@ test "next reads a data frame larger than the reader buffer" {
     defer threaded.deinit();
     var stream =
         testStream(threaded.io(), &chunked.interface, 60_000, net.stream_response_bytes_max);
-    defer stream.reset();
+    defer stream.deinitDecode();
+    stream.open_block = .{ .text = 0 };
 
     try std.testing.expectEqualStrings(text, (try stream.next()).?.text);
     try std.testing.expect((try stream.next()) == null);
@@ -599,7 +1029,7 @@ test "next rejects a single frame larger than the stream budget" {
     defer threaded.deinit();
     var reader: std.Io.Reader = .fixed(body);
     var stream = testStream(threaded.io(), &reader, 60_000, 32);
-    defer stream.reset();
+    defer stream.deinitDecode();
 
     try std.testing.expectError(error.StreamResponseTooLarge, stream.next());
 }
@@ -611,7 +1041,7 @@ test "next surfaces a stream truncated mid data-line as a retryable premature en
     defer threaded.deinit();
     var reader: std.Io.Reader = .fixed(body);
     var stream = testStream(threaded.io(), &reader, 60_000, net.stream_response_bytes_max);
-    defer stream.reset();
+    defer stream.deinitDecode();
 
     try std.testing.expectError(error.IncompleteReply, stream.next());
 }

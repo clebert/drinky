@@ -47,8 +47,18 @@ pub const Stream = struct {
     status: std.http.Status,
     error_length: usize,
     retry_after_ms: ?u64,
-    /// Backs the event handed to the caller; freed by the next read.
-    parsed: ?std.json.Parsed(std.json.Value),
+    /// Scratch for one decoded frame. Events may borrow it until the next read.
+    frame_arena: std.heap.ArenaAllocator,
+    /// A wire outcome already known to make this reply unretainable. Latched
+    /// until the terminal response supplies usage; unsupported overrides invalid.
+    terminal_rejection: ?llm.Event.Stop.Rejection,
+    /// An incomplete message item is retainable only if the response itself
+    /// terminates as incomplete.
+    incomplete_message: bool,
+    /// Completed native item ids already emitted. `output_item.done` is
+    /// independently authoritative, but duplicate done frames must not duplicate
+    /// neutral history.
+    completed_item_ids: std.StringHashMapUnmanaged(void),
     usage: llm.Usage,
     decompress: std.http.Decompress,
     decompress_buffer: []u8,
@@ -59,6 +69,14 @@ pub const Stream = struct {
     redirect_buffer: [4096]u8,
     transfer_buffer: [16384]u8,
 
+    const ItemStatus = enum { completed, incomplete };
+    const OutputItem = union(enum) {
+        other,
+        progress,
+        invalid,
+        unsupported,
+        event: llm.Event,
+    };
     const engine = sse.Engine(Stream);
     pub const deinit = engine.deinit;
     pub const ok = engine.ok;
@@ -70,62 +88,264 @@ pub const Stream = struct {
     pub const usageSoFar = engine.usageSoFar;
     pub const next = engine.next;
 
-    /// Drop the parse backing the previous event; the engine calls this before
-    /// each read and on deinit.
-    pub fn reset(self: *Stream) void {
-        if (self.parsed) |parsed| parsed.deinit();
-        self.parsed = null;
+    pub fn deinitDecode(self: *Stream) void {
+        self.frame_arena.deinit();
+        var ids = self.completed_item_ids.keyIterator();
+        while (ids.next()) |id| self.gpa.free(id.*);
+        self.completed_item_ids.deinit(self.gpa);
+    }
+
+    /// Latch a rejection, `unsupported` winning over `invalid` however they
+    /// interleave: resampling cannot turn an outcome this design cannot retain
+    /// into one it can, so spending the retry budget on it only delays the same
+    /// failure.
+    fn markRejection(self: *Stream, rejection: llm.Event.Stop.Rejection) void {
+        if (self.terminal_rejection == null or rejection == .unsupported)
+            self.terminal_rejection = rejection;
+    }
+
+    fn itemStatus(item: *const std.json.ObjectMap) ?ItemStatus {
+        const status_value = item.get("status") orelse return .completed;
+        const status = json.string(status_value) orelse return null;
+        if (std.mem.eql(u8, status, "completed")) return .completed;
+        if (std.mem.eql(u8, status, "incomplete")) return .incomplete;
+        return null;
+    }
+
+    fn recordCompletedItem(self: *Stream, id: []const u8) !bool {
+        if (id.len == 0) return false;
+        const result = try self.completed_item_ids.getOrPut(self.gpa, id);
+        if (result.found_existing) return false;
+        errdefer _ = self.completed_item_ids.remove(id);
+        result.key_ptr.* = try self.gpa.dupe(u8, id);
+        return true;
+    }
+
+    /// Latch any rejection a terminal snapshot item's own shape reveals. The done
+    /// frame is what supplies payloads, so nothing here is retained; a snapshot
+    /// that disagrees with it only rejects the reply.
+    fn markTerminalItemRejection(self: *Stream, item: *const std.json.ObjectMap) void {
+        const kind = json.string(item.get("type")) orelse return self.markRejection(.invalid);
+        if (std.mem.eql(u8, kind, "reasoning") or
+            std.mem.eql(u8, kind, "function_call")) return;
+        if (!std.mem.eql(u8, kind, "message")) return self.markRejection(.unsupported);
+        const content = json.array(item.get("content")) orelse
+            return self.markRejection(.invalid);
+        for (content.items) |value| {
+            const part = json.object(value) orelse return self.markRejection(.invalid);
+            const part_kind = json.string(part.get("type")) orelse
+                return self.markRejection(.invalid);
+            if (!std.mem.eql(u8, part_kind, "output_text"))
+                return self.markRejection(.unsupported);
+        }
+    }
+
+    /// When a terminal response includes its output snapshot, use it only to
+    /// prove the independently authoritative done-item set is complete. Payloads
+    /// still come exclusively from `output_item.done`.
+    fn reconcileTerminalOutput(
+        self: *Stream,
+        response: *const std.json.ObjectMap,
+    ) !void {
+        const output_value = response.get("output") orelse return;
+        const output = json.array(output_value) orelse {
+            self.markRejection(.invalid);
+            return;
+        };
+        var terminal_ids: std.StringHashMapUnmanaged(void) = .empty;
+        for (output.items) |value| {
+            const item = json.object(value) orelse {
+                self.markRejection(.invalid);
+                continue;
+            };
+            self.markTerminalItemRejection(&item);
+            const id = json.string(item.get("id")) orelse {
+                self.markRejection(.invalid);
+                continue;
+            };
+            const result = try terminal_ids.getOrPut(self.frame_arena.allocator(), id);
+            if (result.found_existing) {
+                self.markRejection(.invalid);
+                continue;
+            }
+            if (!self.completed_item_ids.contains(id)) self.markRejection(.invalid);
+        }
+        if (terminal_ids.count() != self.completed_item_ids.count())
+            self.markRejection(.invalid);
+    }
+
+    fn joinedSummary(self: *Stream, item: *const std.json.ObjectMap) !?[]const u8 {
+        const summary = json.array(item.get("summary")) orelse return null;
+        var text: std.ArrayList(u8) = .empty;
+        for (summary.items, 0..) |value, index| {
+            const part = json.object(value) orelse return null;
+            const kind = json.string(part.get("type")) orelse return null;
+            if (!std.mem.eql(u8, kind, "summary_text")) return null;
+            const part_text = json.string(part.get("text")) orelse return null;
+            if (index != 0) try text.appendSlice(self.frame_arena.allocator(), "\n\n");
+            try text.appendSlice(self.frame_arena.allocator(), part_text);
+        }
+        return text.items;
+    }
+
+    fn outputItem(self: *Stream, object: *const std.json.ObjectMap, kind: []const u8) !OutputItem {
+        if (!std.mem.eql(u8, kind, "response.output_item.done")) return .other;
+        const item = json.object(object.get("item")) orelse return .invalid;
+        const item_kind = json.string(item.get("type")) orelse return .invalid;
+        const id = json.string(item.get("id")) orelse return .invalid;
+        const status = itemStatus(&item) orelse return .invalid;
+        if (!try self.recordCompletedItem(id)) return .invalid;
+
+        if (std.mem.eql(u8, item_kind, "message")) {
+            if (item.get("role")) |role_value| {
+                const role = json.string(role_value) orelse return .invalid;
+                if (!std.mem.eql(u8, role, "assistant")) return .invalid;
+            }
+            const content = json.array(item.get("content")) orelse return .invalid;
+            var text: std.ArrayList(u8) = .empty;
+            for (content.items) |value| {
+                const part = json.object(value) orelse return .invalid;
+                const part_kind = json.string(part.get("type")) orelse return .invalid;
+                if (!std.mem.eql(u8, part_kind, "output_text")) return .unsupported;
+                const part_text = json.string(part.get("text")) orelse return .invalid;
+                try text.appendSlice(self.frame_arena.allocator(), part_text);
+            }
+            if (text.items.len == 0) return .invalid;
+            if (status == .incomplete) self.incomplete_message = true;
+            return .{ .event = .{ .item = .{ .message = text.items } } };
+        }
+        if (std.mem.eql(u8, item_kind, "reasoning")) {
+            if (status != .completed) return .invalid;
+            const encrypted_content = json.string(item.get("encrypted_content")) orelse
+                return .invalid;
+            if (id.len == 0 or encrypted_content.len == 0) return .invalid;
+            const text = try self.joinedSummary(&item) orelse return .invalid;
+            return .{ .event = .{ .item = .{ .reasoning = .{ .encrypted = .{
+                .text = text,
+                .id = id,
+                .encrypted_content = encrypted_content,
+            } } } } };
+        }
+        if (std.mem.eql(u8, item_kind, "function_call")) {
+            if (status != .completed) return .invalid;
+            const call_id = json.string(item.get("call_id")) orelse return .invalid;
+            const name = json.string(item.get("name")) orelse return .invalid;
+            const arguments = json.string(item.get("arguments")) orelse return .invalid;
+            if (call_id.len == 0) return .invalid;
+            return .{ .event = .{ .item = .{ .tool_call = .{
+                .call_id = call_id,
+                .name = name,
+                .arguments_json = arguments,
+            } } } };
+        }
+        return .unsupported;
+    }
+
+    fn reasoningPartAdded(
+        self: *Stream,
+        object: *const std.json.ObjectMap,
+    ) !OutputItem {
+        const index = json.integer(object.get("summary_index")) orelse return .progress;
+        if (index < 0) return .progress;
+        const part = json.object(object.get("part")) orelse return .progress;
+        const kind = json.string(part.get("type")) orelse return .progress;
+        if (!std.mem.eql(u8, kind, "summary_text")) return .progress;
+        const text = json.string(part.get("text")) orelse return .progress;
+        if (index == 0) return if (text.len == 0)
+            .progress
+        else
+            .{ .event = .{ .thinking = text } };
+        var display: std.ArrayList(u8) = .empty;
+        try display.appendSlice(self.frame_arena.allocator(), "\n\n");
+        try display.appendSlice(self.frame_arena.allocator(), text);
+        return .{ .event = .{ .thinking = display.items } };
     }
 
     /// Decode one Responses `data:` payload.
     pub fn decode(self: *Stream, payload: []const u8) !sse.Decoded {
         // Some deployments close the stream with a Chat-Completions-style
-        // sentinel. It ends the byte stream; the Agent separately requires a
-        // preceding Responses terminal event before committing the reply.
+        // sentinel. The Agent still requires a preceding terminal event.
         if (std.mem.eql(u8, payload, "[DONE]")) return .done;
-        // A malformed payload is filler, not progress; a truncated tail then
-        // surfaces as an incomplete reply at end of stream, which is retried.
-        const parsed = std.json.parseFromSlice(std.json.Value, self.gpa, payload, .{}) catch |err|
-            switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => return .ignored,
-            };
-        const object = json.object(parsed.value) orelse {
-            parsed.deinit();
-            return .ignored;
+        const value = std.json.parseFromSliceLeaky(
+            std.json.Value,
+            self.frame_arena.allocator(),
+            payload,
+            .{},
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return .ignored,
         };
-        const kind = json.string(object.get("type")) orelse {
-            parsed.deinit();
-            return .ignored;
-        };
+        const object = json.object(value) orelse return .ignored;
+        const kind = json.string(object.get("type")) orelse return .ignored;
 
         if (std.mem.eql(u8, kind, "error") or std.mem.eql(u8, kind, "response.failed")) {
             engine.recordError(self, errorMessage(object) orelse kind);
-            parsed.deinit();
             return error.ApiError;
         }
-
-        const event = classify(object, kind) orelse {
-            // A recognized `response.*` frame that surfaces no event is progress;
-            // any other `type` is filler that must not hold the idle window open.
-            // Read `kind` (which borrows `parsed`) before freeing it.
-            const recognized = std.mem.startsWith(u8, kind, "response.");
-            parsed.deinit();
-            return if (recognized) .progress else .ignored;
-        };
-        switch (event) {
-            // Usage rides on the completed response; fold it in and hand back the
-            // running total with the stop event.
-            .stop => {
-                if (completedUsage(object)) |usage| mergeUsage(&self.usage, usage);
-                self.parsed = parsed;
-                return .{ .event = .{ .stop = .{ .usage = self.usage } } };
-            },
-            else => {
-                self.parsed = parsed;
-                return .{ .event = event };
-            },
+        if (std.mem.eql(u8, kind, "response.refusal.delta") or
+            std.mem.eql(u8, kind, "response.refusal.done"))
+        {
+            self.markRejection(.unsupported);
+            return .progress;
         }
+        if (std.mem.eql(u8, kind, "response.output_text.delta")) {
+            const delta = json.string(object.get("delta")) orelse return .progress;
+            return .{ .event = .{ .text = delta } };
+        }
+        if (std.mem.eql(u8, kind, "response.reasoning_summary_text.delta")) {
+            const delta = json.string(object.get("delta")) orelse return .progress;
+            return .{ .event = .{ .thinking = delta } };
+        }
+        if (std.mem.eql(u8, kind, "response.reasoning_summary_part.added")) {
+            return switch (try self.reasoningPartAdded(&object)) {
+                .event => |event| .{ .event = event },
+                else => .progress,
+            };
+        }
+        if (std.mem.eql(u8, kind, "response.reasoning_summary_text.done") or
+            std.mem.eql(u8, kind, "response.reasoning_summary_part.done") or
+            std.mem.eql(u8, kind, "response.function_call_arguments.delta") or
+            std.mem.eql(u8, kind, "response.function_call_arguments.done"))
+        {
+            return .progress;
+        }
+
+        switch (try self.outputItem(&object, kind)) {
+            .other => {},
+            .progress => return .progress,
+            .invalid => {
+                self.markRejection(.invalid);
+                return .progress;
+            },
+            .unsupported => {
+                self.markRejection(.unsupported);
+                return .progress;
+            },
+            .event => |event| return .{ .event = event },
+        }
+
+        const status: ?llm.Event.Status = if (std.mem.eql(u8, kind, "response.completed"))
+            .complete
+        else if (std.mem.eql(u8, kind, "response.incomplete"))
+            .truncated
+        else
+            null;
+        if (status) |terminal_status| {
+            if (json.object(object.get("response"))) |response| {
+                try self.reconcileTerminalOutput(&response);
+            } else {
+                self.markRejection(.invalid);
+            }
+            if (terminal_status == .complete and self.incomplete_message)
+                self.markRejection(.invalid);
+            if (completedUsage(object)) |usage| mergeUsage(&self.usage, usage);
+            return .{ .event = .{ .stop = .{
+                .usage = self.usage,
+                .status = terminal_status,
+                .rejection = self.terminal_rejection,
+            } } };
+        }
+        return if (std.mem.startsWith(u8, kind, "response.")) .progress else .ignored;
     }
 };
 
@@ -149,6 +369,10 @@ fn connect(self: *Transport, out: *Stream, payload: Payload) anyerror!void {
     const engine = sse.Engine(Stream);
     engine.begin(out, self.gpa, self.io);
     errdefer out.client.deinit();
+    errdefer out.frame_arena.deinit();
+    out.terminal_rejection = null;
+    out.incomplete_message = false;
+    out.completed_item_ids = .empty;
 
     const authorization = try std.fmt.allocPrint(self.gpa, "Bearer {s}", .{payload.access_token});
     defer self.gpa.free(authorization);
@@ -191,66 +415,6 @@ fn connect(self: *Transport, out: *Stream, payload: Payload) anyerror!void {
     try engine.finish(out, payload.body);
 }
 
-/// Map one Responses SSE frame to a neutral event, or null for a frame the
-/// caller need not see (created/in_progress markers, non-reasoning item
-/// boundaries, argument-less item bookkeeping).
-fn classify(object: std.json.ObjectMap, kind: []const u8) ?llm.Event {
-    if (std.mem.eql(u8, kind, "response.output_text.delta"))
-        return .{ .text = json.string(object.get("delta")) orelse return null };
-    if (std.mem.eql(u8, kind, "response.reasoning_summary_text.delta"))
-        return .{ .thinking = .{
-            .id = json.string(object.get("item_id")) orelse "",
-            .text = json.string(object.get("delta")) orelse return null,
-        } };
-    // Consecutive summary parts (the `**...**` blocks) share one reasoning item
-    // and carry no text between them; only this frame's rising `summary_index`
-    // marks the seam. Emit the blank line the delta stream omits, skipping the
-    // first part so a run gains no leading separator.
-    if (std.mem.eql(u8, kind, "response.reasoning_summary_part.added")) {
-        if ((json.unsigned(object.get("summary_index")) orelse 0) == 0) return null;
-        return .{ .thinking = .{
-            .id = json.string(object.get("item_id")) orelse "",
-            .text = "\n\n",
-        } };
-    }
-    if (std.mem.eql(u8, kind, "response.function_call_arguments.delta"))
-        return .{ .input_json = json.string(object.get("delta")) orelse return null };
-    if (std.mem.eql(u8, kind, "response.output_item.added")) {
-        const item = json.object(object.get("item")) orelse return null;
-        // Only a function call opens a tool use here; its arguments stream as
-        // `function_call_arguments.delta`. Message and reasoning items yield no
-        // start event (their content arrives as deltas / on done).
-        if (!std.mem.eql(u8, json.string(item.get("type")) orelse return null, "function_call"))
-            return null;
-        return .{ .tool_use = .{
-            .call_id = json.string(item.get("call_id")) orelse return null,
-            .name = json.string(item.get("name")) orelse return null,
-        } };
-    }
-    if (std.mem.eql(u8, kind, "response.output_item.done")) {
-        const item = json.object(object.get("item")) orelse return null;
-        // The reasoning item's encrypted token arrives complete here, closing the
-        // reasoning run; other items' content already streamed as deltas.
-        if (!std.mem.eql(u8, json.string(item.get("type")) orelse return null, "reasoning"))
-            return null;
-        return .{ .thinking_blob = .{
-            .id = json.string(item.get("id")) orelse "",
-            .blob = json.string(item.get("encrypted_content")) orelse return null,
-        } };
-    }
-    // Both terminal frames carry a response object; `completed` is a clean
-    // finish, `incomplete` a truncation (output cap or content filter). Neither
-    // is an error — the reply so far still stands — so both close the stream
-    // with a stop event. Usage is optional within the response.
-    if (std.mem.eql(u8, kind, "response.completed") or
-        std.mem.eql(u8, kind, "response.incomplete"))
-    {
-        _ = json.object(object.get("response")) orelse return null;
-        return .{ .stop = .{ .usage = .{} } };
-    }
-    return null;
-}
-
 /// The optional `usage` object nested under a terminal frame's response.
 fn completedUsage(object: std.json.ObjectMap) ?std.json.ObjectMap {
     const response = json.object(object.get("response")) orelse return null;
@@ -288,119 +452,323 @@ fn mergeUsage(usage: *llm.Usage, object: std.json.ObjectMap) void {
 
 /// A stream over `body` for the tests: test allocator, fresh decode state, and
 /// the given window and budget; the connection fields stay undefined. Pair with
-/// `defer stream.reset()` to free whatever decoding retains.
+/// `defer stream.deinitDecode()` to free whatever decoding retains.
 fn testStream(io: std.Io, body: *std.Io.Reader, idle_ms: u64, budget_max: usize) Stream {
+    return testStreamWithAllocator(std.testing.allocator, io, body, idle_ms, budget_max);
+}
+
+fn testStreamWithAllocator(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    body: *std.Io.Reader,
+    idle_ms: u64,
+    budget_max: usize,
+) Stream {
     var stream: Stream = undefined;
-    stream.gpa = std.testing.allocator;
+    stream.gpa = gpa;
     stream.io = io;
     stream.idle_ms = idle_ms;
     stream.budget = .{ .max = budget_max };
     stream.body = body;
-    stream.parsed = null;
+    stream.frame_arena = .init(gpa);
+    stream.terminal_rejection = null;
+    stream.incomplete_message = false;
+    stream.completed_item_ids = .empty;
     stream.usage = .{};
     return stream;
 }
 
-test classify {
-    const text =
+test "display deltas and completed messages stay separate" {
+    var stream = testStream(undefined, undefined, 0, 0);
+    defer stream.deinitDecode();
+    const display = try stream.decode(
         \\{"type":"response.output_text.delta","item_id":"msg_1","delta":"hello"}
-    ;
-    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, text, .{});
-    defer parsed.deinit();
-    try std.testing.expectEqualStrings(
-        "hello",
-        classify(parsed.value.object, "response.output_text.delta").?.text,
     );
+    try std.testing.expectEqualStrings("hello", display.event.text);
+    _ = stream.frame_arena.reset(.retain_capacity);
+    const complete = try stream.decode(
+        \\{"type":"response.output_item.done","item":{"type":"message","id":"msg_1","role":"assistant","status":"completed","content":[{"type":"output_text","text":"hello"}]}}
+    );
+    try std.testing.expectEqualStrings("hello", complete.event.item.message);
+}
 
-    const summary =
-        \\{"type":"response.reasoning_summary_text.delta","item_id":"rs_1","delta":"hmm"}
-    ;
-    const parsed_summary =
-        try std.json.parseFromSlice(std.json.Value, std.testing.allocator, summary, .{});
-    defer parsed_summary.deinit();
-    const thinking =
-        classify(parsed_summary.value.object, "response.reasoning_summary_text.delta").?.thinking;
-    try std.testing.expectEqualStrings("rs_1", thinking.id);
-    try std.testing.expectEqualStrings("hmm", thinking.text);
+test "one native message canonically joins its output text parts" {
+    var stream = testStream(undefined, undefined, 0, 0);
+    defer stream.deinitDecode();
 
-    // The first summary part opens no separator; a later part injects the blank
-    // line the delta stream leaves out between the `**...**` blocks.
-    const part_first =
-        \\{"type":"response.reasoning_summary_part.added","item_id":"rs_1","summary_index":0,"part":{"type":"summary_text","text":""}}
-    ;
-    const parsed_part_first =
-        try std.json.parseFromSlice(std.json.Value, std.testing.allocator, part_first, .{});
-    defer parsed_part_first.deinit();
+    const complete = try stream.decode(
+        \\{"type":"response.output_item.done","item":{"type":"message","id":"msg_1","role":"assistant","status":"completed","content":[{"type":"output_text","text":"hello "},{"type":"output_text","text":"world"}]}}
+    );
+    try std.testing.expectEqualStrings("hello world", complete.event.item.message);
+}
+
+test "incomplete messages survive only an incomplete terminal response" {
+    var truncated = testStream(undefined, undefined, 0, 0);
+    defer truncated.deinitDecode();
+
+    const message = try truncated.decode(
+        \\{"type":"response.output_item.done","item":{"type":"message","id":"msg_1","role":"assistant","status":"incomplete","content":[{"type":"output_text","text":"partial"}]}}
+    );
+    try std.testing.expectEqualStrings("partial", message.event.item.message);
+    _ = truncated.frame_arena.reset(.retain_capacity);
+    const incomplete = try truncated.decode(
+        \\{"type":"response.incomplete","response":{"status":"incomplete"}}
+    );
+    try std.testing.expectEqual(llm.Event.Status.truncated, incomplete.event.stop.status);
+    try std.testing.expect(incomplete.event.stop.rejection == null);
+
+    var completed = testStream(undefined, undefined, 0, 0);
+    defer completed.deinitDecode();
+    _ = try completed.decode(
+        \\{"type":"response.output_item.done","item":{"type":"message","id":"msg_2","role":"assistant","status":"incomplete","content":[{"type":"output_text","text":"partial"}]}}
+    );
+    _ = completed.frame_arena.reset(.retain_capacity);
+    const invalid = try completed.decode(
+        \\{"type":"response.completed","response":{"status":"completed"}}
+    );
+    try std.testing.expectEqual(llm.Event.Stop.Rejection.invalid, invalid.event.stop.rejection.?);
+}
+
+test "done items are authoritative without added lifecycle state" {
+    var stream = testStream(undefined, undefined, 0, 0);
+    defer stream.deinitDecode();
+
+    try std.testing.expectEqual(@as(sse.Decoded, .progress), try stream.decode(
+        \\{"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"provisional"}}
+    ));
+    _ = stream.frame_arena.reset(.retain_capacity);
+    const complete = try stream.decode(
+        \\{"type":"response.output_item.done","output_index":1,"item":{"type":"message","id":"authoritative","role":"assistant","status":"completed","content":[{"type":"output_text","text":"done"}]}}
+    );
+    try std.testing.expectEqualStrings("done", complete.event.item.message);
+}
+
+test "duplicate completed item ids latch invalid" {
+    var stream = testStream(undefined, undefined, 0, 0);
+    defer stream.deinitDecode();
+
+    _ = try stream.decode(
+        \\{"type":"response.output_item.done","item":{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"output_text","text":"once"}]}}
+    );
+    _ = stream.frame_arena.reset(.retain_capacity);
+    try std.testing.expectEqual(@as(sse.Decoded, .progress), try stream.decode(
+        \\{"type":"response.output_item.done","item":{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"output_text","text":"twice"}]}}
+    ));
+    _ = stream.frame_arena.reset(.retain_capacity);
+    const stop = try stream.decode(
+        \\{"type":"response.completed","response":{"status":"completed"}}
+    );
+    try std.testing.expectEqual(llm.Event.Stop.Rejection.invalid, stop.event.stop.rejection.?);
+}
+
+test "unsupported completed items reject the whole response" {
+    var stream = testStream(undefined, undefined, 0, 0);
+    defer stream.deinitDecode();
+
+    _ = try stream.decode(
+        \\{"type":"response.output_item.done","item":{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"output_text","text":"recognized"}]}}
+    );
+    _ = stream.frame_arena.reset(.retain_capacity);
+    try std.testing.expectEqual(@as(sse.Decoded, .progress), try stream.decode(
+        \\{"type":"response.output_item.done","item":{"type":"web_search_call","id":"search_1","status":"completed"}}
+    ));
+    _ = stream.frame_arena.reset(.retain_capacity);
+    const stop = try stream.decode(
+        \\{"type":"response.completed","response":{"status":"completed","usage":{"output_tokens":4}}}
+    );
+    try std.testing.expectEqual(llm.Event.Stop.Rejection.unsupported, stop.event.stop.rejection.?);
+    try std.testing.expectEqual(@as(u64, 4), stop.event.stop.usage.output);
+}
+
+test "terminal output validates the complete done-item set" {
+    var missing = testStream(undefined, undefined, 0, 0);
+    defer missing.deinitDecode();
+
+    _ = try missing.decode(
+        \\{"type":"response.output_item.done","item":{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"output_text","text":"one"}]}}
+    );
+    _ = missing.frame_arena.reset(.retain_capacity);
+    const incomplete_set = try missing.decode(
+        \\{"type":"response.completed","response":{"status":"completed","output":[{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"output_text","text":"one"}]},{"type":"message","id":"msg_2","role":"assistant","content":[{"type":"output_text","text":"two"}]}]}}
+    );
     try std.testing.expectEqual(
-        @as(?llm.Event, null),
-        classify(parsed_part_first.value.object, "response.reasoning_summary_part.added"),
+        llm.Event.Stop.Rejection.invalid,
+        incomplete_set.event.stop.rejection.?,
     );
 
-    const part_next =
-        \\{"type":"response.reasoning_summary_part.added","item_id":"rs_1","summary_index":1,"part":{"type":"summary_text","text":""}}
-    ;
-    const parsed_part_next =
-        try std.json.parseFromSlice(std.json.Value, std.testing.allocator, part_next, .{});
-    defer parsed_part_next.deinit();
-    const separator =
-        classify(parsed_part_next.value.object, "response.reasoning_summary_part.added").?.thinking;
-    try std.testing.expectEqualStrings("rs_1", separator.id);
-    try std.testing.expectEqualStrings("\n\n", separator.text);
-
-    const added =
-        \\{"type":"response.output_item.added","item":{"type":"function_call","call_id":"call_1","name":"read"}}
-    ;
-    const parsed_added =
-        try std.json.parseFromSlice(std.json.Value, std.testing.allocator, added, .{});
-    defer parsed_added.deinit();
-    const use = classify(parsed_added.value.object, "response.output_item.added").?.tool_use;
-    try std.testing.expectEqualStrings("call_1", use.call_id);
-    try std.testing.expectEqualStrings("read", use.name);
-
-    const done =
-        \\{"type":"response.output_item.done","item":{"type":"reasoning","id":"rs_1","encrypted_content":"enc"}}
-    ;
-    const parsed_done =
-        try std.json.parseFromSlice(std.json.Value, std.testing.allocator, done, .{});
-    defer parsed_done.deinit();
-    const blob = classify(parsed_done.value.object, "response.output_item.done").?.thinking_blob;
-    try std.testing.expectEqualStrings("rs_1", blob.id);
-    try std.testing.expectEqualStrings("enc", blob.blob);
-
-    // A non-reasoning item done carries no event.
-    const message_done =
-        \\{"type":"response.output_item.done","item":{"type":"message","id":"msg_1"}}
-    ;
-    const parsed_message_done =
-        try std.json.parseFromSlice(std.json.Value, std.testing.allocator, message_done, .{});
-    defer parsed_message_done.deinit();
+    var unsupported = testStream(undefined, undefined, 0, 0);
+    defer unsupported.deinitDecode();
+    const unsupported_output = try unsupported.decode(
+        \\{"type":"response.completed","response":{"status":"completed","output":[{"type":"web_search_call","id":"search_1","status":"completed"}]}}
+    );
     try std.testing.expectEqual(
-        @as(?llm.Event, null),
-        classify(parsed_message_done.value.object, "response.output_item.done"),
+        llm.Event.Stop.Rejection.unsupported,
+        unsupported_output.event.stop.rejection.?,
     );
+}
+
+test "reasoning deltas are display-only and done items are authoritative" {
+    var stream = testStream(undefined, undefined, 0, 0);
+    defer stream.deinitDecode();
+
+    try std.testing.expectEqualStrings("a", (try stream.decode(
+        \\{"type":"response.reasoning_summary_text.delta","item_id":"display_only","summary_index":0,"delta":"a"}
+    )).event.thinking);
+    _ = stream.frame_arena.reset(.retain_capacity);
+    try std.testing.expectEqualStrings("\n\n", (try stream.decode(
+        \\{"type":"response.reasoning_summary_part.added","item_id":"display_only","summary_index":1,"part":{"type":"summary_text","text":""}}
+    )).event.thinking);
+    _ = stream.frame_arena.reset(.retain_capacity);
+    const reasoning = (try stream.decode(
+        \\{"type":"response.output_item.done","item":{"type":"reasoning","id":"rs_1","status":"completed","summary":[{"type":"summary_text","text":"final a"},{"type":"summary_text","text":"final b"}],"encrypted_content":"enc"}}
+    )).event.item.reasoning.encrypted;
+    try std.testing.expectEqualStrings("final a\n\nfinal b", reasoning.text);
+    try std.testing.expectEqualStrings("rs_1", reasoning.id);
+    try std.testing.expectEqualStrings("enc", reasoning.encrypted_content);
+}
+
+test "invalid completed reasoning items latch through terminal usage" {
+    const invalid = [_][]const u8{
+        \\{"type":"response.output_item.done","item":{"type":"reasoning","summary":[],"encrypted_content":"enc"}}
+        ,
+        \\{"type":"response.output_item.done","item":{"type":"reasoning","id":"rs_1","summary":[]}}
+        ,
+        \\{"type":"response.output_item.done","item":{"type":"reasoning","id":"rs_1","status":"incomplete","summary":[],"encrypted_content":"enc"}}
+        ,
+        \\{"type":"response.output_item.done","item":{"type":"reasoning","id":"rs_1","summary":[{"type":"other","text":"hmm"}],"encrypted_content":"enc"}}
+        ,
+    };
+    for (invalid) |payload| {
+        var stream = testStream(undefined, undefined, 0, 0);
+        defer stream.deinitDecode();
+        try std.testing.expectEqual(@as(sse.Decoded, .progress), try stream.decode(payload));
+        _ = stream.frame_arena.reset(.retain_capacity);
+        const terminal = try stream.decode(
+            \\{"type":"response.completed","response":{"usage":{"input_tokens":7,"output_tokens":3}}}
+        );
+        try std.testing.expectEqual(
+            llm.Event.Stop.Rejection.invalid,
+            terminal.event.stop.rejection.?,
+        );
+        try std.testing.expectEqual(@as(u64, 7), terminal.event.stop.usage.input);
+        try std.testing.expectEqual(@as(u64, 3), terminal.event.stop.usage.output);
+    }
+}
+
+fn decodeReasoningUnderOom(gpa: std.mem.Allocator) !void {
+    var stream = testStreamWithAllocator(gpa, undefined, undefined, 0, 0);
+    defer stream.deinitDecode();
+    _ = try stream.decode(
+        \\{"type":"response.output_item.done","item":{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"hmm"}],"encrypted_content":"enc"}}
+    );
+}
+
+fn reconcileTerminalOutputUnderOom(gpa: std.mem.Allocator) !void {
+    var stream = testStreamWithAllocator(gpa, undefined, undefined, 0, 0);
+    defer stream.deinitDecode();
+    _ = try stream.decode(
+        \\{"type":"response.output_item.done","item":{"type":"message","id":"msg_1","content":[{"type":"output_text","text":"one"}]}}
+    );
+    _ = stream.frame_arena.reset(.retain_capacity);
+    _ = try stream.decode(
+        \\{"type":"response.output_item.done","item":{"type":"message","id":"msg_2","content":[{"type":"output_text","text":"two"}]}}
+    );
+    _ = stream.frame_arena.reset(.retain_capacity);
+    _ = try stream.decode(
+        \\{"type":"response.completed","response":{"output":[{"type":"message","id":"msg_1","content":[{"type":"output_text","text":"one"}]},{"type":"message","id":"msg_2","content":[{"type":"output_text","text":"two"}]}]}}
+    );
+}
+
+test "completed item decoding frees state at every allocation-failure point" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        decodeReasoningUnderOom,
+        .{},
+    );
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        reconcileTerminalOutputUnderOom,
+        .{},
+    );
+}
+
+test "refusal events latch until terminal usage" {
+    const body =
+        "data: {\"type\":\"response.refusal.delta\",\"delta\":\"cannot help\"}\n\n" ++
+        "data: {\"type\":\"response.refusal.done\",\"refusal\":\"cannot help\"}\n\n" ++
+        "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"," ++
+        "\"usage\":{\"input_tokens\":9,\"output_tokens\":4}}}\n\n";
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var reader: std.Io.Reader = .fixed(body);
+    var stream = testStream(threaded.io(), &reader, 60_000, net.stream_response_bytes_max);
+    defer stream.deinitDecode();
+
+    const stop = (try stream.next()).?.stop;
+    try std.testing.expectEqual(llm.Event.Stop.Rejection.unsupported, stop.rejection.?);
+    try std.testing.expectEqual(@as(u64, 9), stop.usage.input);
+    try std.testing.expectEqual(@as(u64, 4), stop.usage.output);
+}
+
+test "invalid function call done latches until terminal usage" {
+    var stream = testStream(undefined, undefined, 0, 0);
+    defer stream.deinitDecode();
+
+    const invalid = [_][]const u8{
+        \\{"type":"response.output_item.done","item":{"type":"function_call","id":"fc_1","status":"incomplete","call_id":"call_1","name":"read","arguments":"{}"}}
+        ,
+        \\{"type":"response.output_item.done","item":{"type":"function_call","id":"fc_2","status":"completed","call_id":"call_1","name":"read"}}
+        ,
+        \\{"type":"response.output_item.done","item":{"type":"function_call","id":"fc_3","status":"completed","call_id":"","name":"read","arguments":"{}"}}
+        ,
+        \\{"type":"response.output_item.done","item":{"type":"function_call","id":"fc_4","status":"completed","call_id":"call_1","arguments":"{}"}}
+        ,
+    };
+    for (invalid) |payload| {
+        try std.testing.expectEqual(@as(sse.Decoded, .progress), try stream.decode(payload));
+    }
+    const terminal = try stream.decode(
+        \\{"type":"response.incomplete","response":{"status":"incomplete","usage":{"input_tokens":8,"output_tokens":2}}}
+    );
+    try std.testing.expectEqual(
+        llm.Event.Stop.Rejection.invalid,
+        terminal.event.stop.rejection.?,
+    );
+    try std.testing.expectEqual(@as(u64, 8), terminal.event.stop.usage.input);
+    try std.testing.expectEqual(@as(u64, 2), terminal.event.stop.usage.output);
 }
 
 test "next walks response.* SSE lines and maps usage on completion" {
     const body =
         "event: response.reasoning_summary_text.delta\n" ++
         "data: {\"type\":\"response.reasoning_summary_text.delta\"," ++
-        "\"item_id\":\"rs_1\",\"delta\":\"weigh\"}\n" ++
+        "\"item_id\":\"rs_1\",\"summary_index\":0,\"delta\":\"weigh\"}\n" ++
         "\n" ++
         "event: response.output_item.done\n" ++
         "data: {\"type\":\"response.output_item.done\",\"item\":" ++
-        "{\"type\":\"reasoning\",\"id\":\"rs_1\",\"encrypted_content\":\"enc\"}}\n" ++
+        "{\"type\":\"reasoning\",\"id\":\"rs_1\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"weigh\"}],\"encrypted_content\":\"enc\"}}\n" ++
         "\n" ++
         "event: response.output_item.added\n" ++
         "data: {\"type\":\"response.output_item.added\",\"item\":" ++
-        "{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"read\"}}\n" ++
+        "{\"id\":\"fc_1\",\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"read\"}}\n" ++
         "\n" ++
         "event: response.function_call_arguments.delta\n" ++
         "data: {\"type\":\"response.function_call_arguments.delta\"," ++
         "\"item_id\":\"fc_1\",\"delta\":\"{}\"}\n" ++
         "\n" ++
+        "event: response.output_item.done\n" ++
+        "data: {\"type\":\"response.output_item.done\",\"item\":{" ++
+        "\"id\":\"fc_1\",\"type\":\"function_call\",\"status\":\"completed\"," ++
+        "\"call_id\":\"call_1\",\"name\":\"read\",\"arguments\":\"{}\"}}\n" ++
+        "\n" ++
         "event: response.output_text.delta\n" ++
         "data: {\"type\":\"response.output_text.delta\"," ++
         "\"item_id\":\"msg_1\",\"delta\":\"done\"}\n" ++
+        "\n" ++
+        "event: response.output_item.done\n" ++
+        "data: {\"type\":\"response.output_item.done\",\"item\":{" ++
+        "\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\"," ++
+        "\"content\":[{\"type\":\"output_text\",\"text\":\"done\"}]}}\n" ++
         "\n" ++
         "event: response.completed\n" ++
         "data: {\"type\":\"response.completed\"," ++
@@ -413,18 +781,19 @@ test "next walks response.* SSE lines and maps usage on completion" {
     defer threaded.deinit();
     var reader: std.Io.Reader = .fixed(body);
     var stream = testStream(threaded.io(), &reader, 60_000, net.stream_response_bytes_max);
-    defer stream.reset();
+    defer stream.deinitDecode();
 
     const thinking = (try stream.next()).?;
-    try std.testing.expectEqualStrings("weigh", thinking.thinking.text);
-    const blob = (try stream.next()).?;
-    try std.testing.expectEqualStrings("enc", blob.thinking_blob.blob);
-    const use = (try stream.next()).?;
-    try std.testing.expectEqualStrings("read", use.tool_use.name);
-    const args = (try stream.next()).?;
-    try std.testing.expectEqualStrings("{}", args.input_json);
-    const text = (try stream.next()).?;
-    try std.testing.expectEqualStrings("done", text.text);
+    try std.testing.expectEqualStrings("weigh", thinking.thinking);
+    const reasoning = (try stream.next()).?.item.reasoning.encrypted;
+    try std.testing.expectEqualStrings("weigh", reasoning.text);
+    try std.testing.expectEqualStrings("enc", reasoning.encrypted_content);
+    const call = (try stream.next()).?.item.tool_call;
+    try std.testing.expectEqualStrings("read", call.name);
+    try std.testing.expectEqualStrings("call_1", call.call_id);
+    try std.testing.expectEqualStrings("{}", call.arguments_json);
+    try std.testing.expectEqualStrings("done", (try stream.next()).?.text);
+    try std.testing.expectEqualStrings("done", (try stream.next()).?.item.message);
     const stop = (try stream.next()).?;
     try std.testing.expectEqual(@as(u64, 10), stop.stop.usage.input);
     try std.testing.expectEqual(@as(u64, 90), stop.stop.usage.cache_read);
@@ -433,22 +802,51 @@ test "next walks response.* SSE lines and maps usage on completion" {
     try std.testing.expectEqual(@as(?llm.Event, null), try stream.next());
 }
 
+test "a streamed function call emits only its authoritative done item" {
+    const body =
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":" ++
+        "{\"id\":\"fc_1\",\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"read\"}}\n\n" ++
+        "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_1\",\"delta\":\"{}\"}\n\n" ++
+        "data: {\"type\":\"response.function_call_arguments.done\",\"item_id\":\"fc_1\",\"arguments\":\"{}\"}\n\n" ++
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":" ++
+        "{\"id\":\"fc_1\",\"type\":\"function_call\",\"call_id\":\"call_1\"," ++
+        "\"name\":\"read\",\"arguments\":\"{}\"}}\n\n" ++
+        "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n";
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var reader: std.Io.Reader = .fixed(body);
+    var stream = testStream(threaded.io(), &reader, 60_000, net.stream_response_bytes_max);
+    defer stream.deinitDecode();
+
+    const call = (try stream.next()).?.item.tool_call;
+    try std.testing.expectEqualStrings("call_1", call.call_id);
+    try std.testing.expectEqualStrings("read", call.name);
+    try std.testing.expectEqualStrings("{}", call.arguments_json);
+    try std.testing.expectEqual(llm.Event.Status.complete, (try stream.next()).?.stop.status);
+    try std.testing.expect((try stream.next()) == null);
+}
+
 test "terminal events require a response object" {
     var stream = testStream(undefined, undefined, 0, 0);
-    defer stream.reset();
+    defer stream.deinitDecode();
 
-    try std.testing.expectEqual(@as(sse.Decoded, .progress), try stream.decode(
+    const malformed = try stream.decode(
         \\{"type":"response.completed"}
-    ));
+    );
+    try std.testing.expectEqual(
+        llm.Event.Stop.Rejection.invalid,
+        malformed.event.stop.rejection.?,
+    );
     const decoded = try stream.decode(
         \\{"type":"response.incomplete","response":{}}
     );
     try std.testing.expectEqual(@as(llm.Usage, .{}), decoded.event.stop.usage);
+    try std.testing.expectEqual(llm.Event.Status.truncated, decoded.event.stop.status);
 }
 
 test "decode maps response.incomplete to a stop carrying its usage" {
     var stream = testStream(undefined, undefined, 0, 0);
-    defer stream.reset();
+    defer stream.deinitDecode();
 
     // A truncated turn is not an error: it stops with the usage the response
     // reports (uncached = 50 - cached 10 - written 5), so accounting stays correct.
@@ -463,7 +861,7 @@ test "decode maps response.incomplete to a stop carrying its usage" {
 
 test "decode surfaces a streamed error frame" {
     var stream = testStream(undefined, undefined, 0, 0);
-    defer stream.reset();
+    defer stream.deinitDecode();
 
     try std.testing.expectError(error.ApiError, stream.decode(
         \\{"type":"error","message":"rate limit"}
@@ -478,7 +876,7 @@ test "decode surfaces a streamed error frame" {
 
 test "decode ignores a malformed data line instead of failing the turn" {
     var stream = testStream(undefined, undefined, 0, 0);
-    defer stream.reset();
+    defer stream.deinitDecode();
 
     try std.testing.expectEqual(@as(sse.Decoded, .ignored), try stream.decode(
         \\{"type":"response.output_text.del
@@ -490,7 +888,7 @@ test "decode ignores a malformed data line instead of failing the turn" {
 
 test "decode ignores unrecognized frames instead of counting them as progress" {
     var stream = testStream(undefined, undefined, 0, 0);
-    defer stream.reset();
+    defer stream.deinitDecode();
 
     try std.testing.expectEqual(@as(sse.Decoded, .ignored), try stream.decode(
         \\{"type":"surprise.new.event"}
@@ -522,7 +920,7 @@ test "next times out on buffered filler that makes no progress" {
     var clock: sse.TickingIo = .init(threaded.io(), 40 * std.time.ns_per_ms);
     var reader: std.Io.Reader = .fixed(body);
     var stream = testStream(clock.io(), &reader, 100, net.stream_response_bytes_max);
-    defer stream.reset();
+    defer stream.deinitDecode();
 
     // The 100 ms window loses 40 ms per reading, so it closes after a few
     // filler lines — before the trailing real event or EOF.
@@ -540,7 +938,7 @@ test "next stops a stream once its aggregate byte budget is spent" {
     defer threaded.deinit();
     var reader: std.Io.Reader = .fixed(body);
     var stream = testStream(threaded.io(), &reader, 60_000, frame.len * 2);
-    defer stream.reset();
+    defer stream.deinitDecode();
 
     try std.testing.expectEqualStrings("chunk", (try stream.next()).?.text);
     try std.testing.expectEqualStrings("chunk", (try stream.next()).?.text);
@@ -557,7 +955,7 @@ test "next bounds a flood of eventless progress frames" {
     defer threaded.deinit();
     var reader: std.Io.Reader = .fixed(body);
     var stream = testStream(threaded.io(), &reader, 60_000, frame.len * 3);
-    defer stream.reset();
+    defer stream.deinitDecode();
 
     try std.testing.expectError(error.StreamResponseTooLarge, stream.next());
 }
@@ -569,7 +967,7 @@ test "next reads a data frame larger than the reader buffer" {
     // 64 bytes per fill, so one line spans several fills.
     const blob = "A" ** 4000;
     const body = "data: {\"type\":\"response.output_item.done\",\"item\":" ++
-        "{\"type\":\"reasoning\",\"id\":\"rs_1\",\"encrypted_content\":\"" ++ blob ++ "\"}}\n";
+        "{\"type\":\"reasoning\",\"id\":\"rs_1\",\"summary\":[],\"encrypted_content\":\"" ++ blob ++ "\"}}\n";
     var buffer: [256]u8 = undefined;
     var chunked: std.testing.Reader = .init(&buffer, &.{.{ .buffer = body }});
     chunked.artificial_limit = .limited(64);
@@ -577,11 +975,11 @@ test "next reads a data frame larger than the reader buffer" {
     defer threaded.deinit();
     var stream =
         testStream(threaded.io(), &chunked.interface, 60_000, net.stream_response_bytes_max);
-    defer stream.reset();
+    defer stream.deinitDecode();
 
-    const event = (try stream.next()).?;
-    try std.testing.expectEqualStrings("rs_1", event.thinking_blob.id);
-    try std.testing.expectEqualStrings(blob, event.thinking_blob.blob);
+    const reasoning = (try stream.next()).?.item.reasoning.encrypted;
+    try std.testing.expectEqualStrings("rs_1", reasoning.id);
+    try std.testing.expectEqualStrings(blob, reasoning.encrypted_content);
     try std.testing.expect((try stream.next()) == null);
 }
 
@@ -594,7 +992,7 @@ test "next rejects a single frame larger than the stream budget" {
     defer threaded.deinit();
     var reader: std.Io.Reader = .fixed(body);
     var stream = testStream(threaded.io(), &reader, 60_000, 32);
-    defer stream.reset();
+    defer stream.deinitDecode();
 
     try std.testing.expectError(error.StreamResponseTooLarge, stream.next());
 }
@@ -610,7 +1008,7 @@ test "next ends the byte stream at a [DONE] sentinel" {
     defer threaded.deinit();
     var reader: std.Io.Reader = .fixed(body);
     var stream = testStream(threaded.io(), &reader, 60_000, net.stream_response_bytes_max);
-    defer stream.reset();
+    defer stream.deinitDecode();
 
     try std.testing.expectEqualStrings("hi", (try stream.next()).?.text);
     try std.testing.expectEqual(@as(?llm.Event, null), try stream.next());
@@ -678,7 +1076,7 @@ test "next surfaces a stream truncated mid data-line as a retryable premature en
     defer threaded.deinit();
     var reader: std.Io.Reader = .fixed(body);
     var stream = testStream(threaded.io(), &reader, 60_000, net.stream_response_bytes_max);
-    defer stream.reset();
+    defer stream.deinitDecode();
 
     try std.testing.expectError(error.IncompleteReply, stream.next());
 }

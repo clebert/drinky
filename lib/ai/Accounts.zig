@@ -10,6 +10,7 @@
 const std = @import("std");
 
 const anthropic = @import("anthropic/root.zig");
+const auth = @import("auth.zig");
 const llm = @import("llm.zig");
 const models = @import("models.zig");
 const net = @import("net.zig");
@@ -42,6 +43,16 @@ const ContextWindow = struct {
 pub const ApiKeys = struct {
     anthropic: ?[]const u8 = null,
     openai: ?[]const u8 = null,
+};
+
+/// A committed subscription login's persistence outcome. Both variants mean
+/// the replacement credential is live; the caller owns final presentation.
+pub const Login = union(enum) {
+    saved: []const u8,
+    memory_only: struct {
+        path: []const u8,
+        save_error: anyerror,
+    },
 };
 
 /// Open both subscription stores (loading any stored credential) and take the
@@ -152,22 +163,32 @@ pub fn listModels(
     for (out.items[start..]) |*model| model.* = self.resolveModel(account, model.*);
 }
 
-/// Run the interactive OAuth login for a subscription `account`, marking it
-/// authenticated on success. An API account has no login (its key comes from the
-/// environment), so it is an error.
-pub fn login(self: *Accounts, account: llm.Account, prompt: anytype) !void {
-    switch (account) {
-        .anthropic_subscription => {
-            try self.anthropic_auth.login(prompt);
+/// Run the interactive OAuth login for a subscription `account`, mark its
+/// committed replacement authenticated, and return its persistence outcome. An
+/// API account has no login (its key comes from the environment), so it is an
+/// error. No error is returned after the credential has been replaced.
+pub fn login(self: *Accounts, account: llm.Account, prompt: anytype) !Login {
+    const provider_login: auth.Login = switch (account) {
+        .anthropic_subscription => committed: {
+            const committed_login = try self.anthropic_auth.login(prompt);
             self.anthropic_subscription_ready = true;
+            break :committed committed_login;
         },
-        .openai_subscription => {
-            try self.openai_auth.login(prompt);
+        .openai_subscription => committed: {
+            const committed_login = try self.openai_auth.login(prompt);
             self.openai_subscription_ready = true;
             self.refreshOpenaiSubscriptionModels();
+            break :committed committed_login;
         },
         .anthropic_api, .openai_api => return error.ApiAccountHasNoLogin,
-    }
+    };
+    return switch (provider_login) {
+        .saved => |path| .{ .saved = path },
+        .memory_only => |failure| .{ .memory_only = .{
+            .path = failure.path,
+            .save_error = failure.save_error,
+        } },
+    };
 }
 
 /// Drop a subscription `account`'s stored credentials, marking it no longer

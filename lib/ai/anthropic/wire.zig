@@ -175,12 +175,23 @@ fn writeTool(stringify: *std.json.Stringify, tool: *const llm.Tool, cache: bool)
     try stringify.endObject();
 }
 
-/// Whether an item serializes to a content block. Every item does except a
-/// reasoning item that is dropped — reasoning disabled, or a blob from a different
-/// account, neither of which this serializer can replay.
+/// Whether an item serializes to a content block. Reasoning is dropped when it
+/// is disabled, belongs to another account, or carries a different provider's
+/// replay proof.
 fn emitsBlock(item: llm.Item, emit_thinking: bool, account: llm.Account) bool {
     return switch (item) {
-        .reasoning => |reasoning| emit_thinking and reasoning.origin == account,
+        .reasoning => |reasoning| if (!emit_thinking)
+            false
+        else switch (reasoning.replay) {
+            inline .anthropic_subscription, .anthropic_api => |proof, tag| proof: {
+                if (tag != account) break :proof false;
+                break :proof switch (proof) {
+                    .signature => |signature| signature.signature.len != 0,
+                    .redacted => |data| data.len != 0,
+                };
+            },
+            .openai_subscription, .openai_api => false,
+        },
         else => true,
     };
 }
@@ -236,16 +247,18 @@ fn writeItem(stringify: *std.json.Stringify, item: *const llm.Item, cache: bool)
     }
 }
 
-/// Serialize a stored reasoning item: a normal block with its verbatim
-/// signature, or a redacted block carrying its encrypted payload.
+/// Serialize a stored Anthropic replay proof as normal or redacted thinking.
 fn writeThinking(stringify: *std.json.Stringify, reasoning: *const llm.Item.Reasoning) !void {
-    if (reasoning.redacted)
-        try stringify.write(RedactedThinkingBlock{ .data = reasoning.blob })
-    else
-        try stringify.write(ThinkingBlock{
-            .thinking = reasoning.text,
-            .signature = reasoning.blob,
-        });
+    switch (reasoning.replay) {
+        inline .anthropic_subscription, .anthropic_api => |proof| switch (proof) {
+            .signature => |signature| try stringify.write(ThinkingBlock{
+                .thinking = signature.text,
+                .signature = signature.signature,
+            }),
+            .redacted => |data| try stringify.write(RedactedThinkingBlock{ .data = data }),
+        },
+        .openai_subscription, .openai_api => unreachable,
+    }
 }
 
 test serialize {
@@ -330,6 +343,45 @@ test "tool_call arguments pass through raw, empty becomes an empty object" {
     try std.testing.expectEqualStrings("tool_result", result.get("type").?.string);
     try std.testing.expectEqual(true, result.get("is_error").?.bool);
     try std.testing.expectEqualStrings("ok", result.get("content").?.string);
+}
+
+test "synthetic error results group in one user envelope before steering text" {
+    const synthetic =
+        "Tool execution ended before a result was recorded; side effects may have occurred.";
+    const items = [_]llm.Item{
+        .{ .tool_call = .{ .call_id = "t1", .name = "read", .arguments_json = "{}" } },
+        .{ .tool_call = .{ .call_id = "t2", .name = "read", .arguments_json = "{}" } },
+        .{ .tool_result = .{ .call_id = "t1", .content = synthetic, .is_error = true } },
+        .{ .tool_result = .{ .call_id = "t2", .content = synthetic, .is_error = true } },
+        .{ .message = .{ .role = .user, .text = "steer" } },
+    };
+    const body = try serialize(std.testing.allocator, &.{
+        .model = "m",
+        .tokens_max = 8,
+        .system = "s",
+        .items = &items,
+        .tools = &.{},
+    }, .anthropic_subscription);
+    defer std.testing.allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+    const messages = parsed.value.object.get("messages").?.array.items;
+    // One assistant envelope for the calls, then one user envelope grouping both
+    // immediate error results ahead of the steering text.
+    try std.testing.expectEqual(@as(usize, 2), messages.len);
+    const content = messages[1].object.get("content").?.array.items;
+    try std.testing.expectEqual(@as(usize, 3), content.len);
+    try std.testing.expectEqualStrings("tool_result", content[0].object.get("type").?.string);
+    try std.testing.expectEqual(true, content[0].object.get("is_error").?.bool);
+    try std.testing.expectEqualStrings("t1", content[0].object.get("tool_use_id").?.string);
+    // Stored verbatim with no `Error:` prefix.
+    try std.testing.expectEqualStrings(synthetic, content[0].object.get("content").?.string);
+    try std.testing.expectEqualStrings("tool_result", content[1].object.get("type").?.string);
+    try std.testing.expectEqualStrings("t2", content[1].object.get("tool_use_id").?.string);
+    // Steering text follows the results in the same user envelope.
+    try std.testing.expectEqualStrings("text", content[2].object.get("type").?.string);
+    try std.testing.expectEqualStrings("steer", content[2].object.get("text").?.string);
 }
 
 // The model string is arbitrary: breakpoints are placed the same way for every model.
@@ -438,12 +490,12 @@ test "no thinking or output_config when effort is none" {
 const golden_items = [_]llm.Item{
     .{ .message = .{ .role = .user, .text = "first" } },
     .{ .message = .{ .role = .user, .text = "second" } },
-    .{ .reasoning = .{ .text = "weigh it", .blob = "sig", .origin = .anthropic_subscription } },
+    .{ .reasoning = .{ .replay = .{ .anthropic_subscription = .{ .signature = .{
+        .text = "weigh it",
+        .signature = "sig",
+    } } } } },
     .{ .reasoning = .{
-        .text = "",
-        .blob = "secret",
-        .redacted = true,
-        .origin = .anthropic_subscription,
+        .replay = .{ .anthropic_subscription = .{ .redacted = "secret" } },
     } },
     .{ .tool_call = .{
         .call_id = "t1",
@@ -452,7 +504,10 @@ const golden_items = [_]llm.Item{
     } },
     .{ .message = .{ .role = .assistant, .text = "checking" } },
     .{ .tool_result = .{ .call_id = "t1", .content = "contents", .is_error = false } },
-    .{ .reasoning = .{ .text = "more", .blob = "sig2", .origin = .anthropic_subscription } },
+    .{ .reasoning = .{ .replay = .{ .anthropic_subscription = .{ .signature = .{
+        .text = "more",
+        .signature = "sig2",
+    } } } } },
     .{ .tool_call = .{ .call_id = "t2", .name = "write", .arguments_json = "{\"path\":\"b\"}" } },
     .{ .tool_result = .{ .call_id = "t2", .content = "done", .is_error = true } },
     .{ .message = .{ .role = .assistant, .text = "all set" } },
@@ -498,7 +553,10 @@ test "golden bytes keep the serialized prefix stable" {
 // reasoning, with every other block byte-identical to the subscription path.
 const golden_items_api = [_]llm.Item{
     .{ .message = .{ .role = .user, .text = "first" } },
-    .{ .reasoning = .{ .text = "weigh it", .blob = "sig", .origin = .anthropic_api } },
+    .{ .reasoning = .{ .replay = .{ .anthropic_api = .{ .signature = .{
+        .text = "weigh it",
+        .signature = "sig",
+    } } } } },
     .{ .tool_call = .{
         .call_id = "t1",
         .name = "read",
@@ -530,7 +588,10 @@ test "a reasoning-only run dropped by an account switch emits no empty envelope"
     // user turns then share one envelope.
     const items = [_]llm.Item{
         .{ .message = .{ .role = .user, .text = "hi" } },
-        .{ .reasoning = .{ .text = "weigh it", .blob = "sig", .origin = .anthropic_subscription } },
+        .{ .reasoning = .{ .replay = .{ .anthropic_subscription = .{ .signature = .{
+            .text = "weigh it",
+            .signature = "sig",
+        } } } } },
         .{ .message = .{ .role = .user, .text = "again" } },
     };
     const body = try serialize(std.testing.allocator, &.{
@@ -555,10 +616,13 @@ test "a reasoning-only run dropped by an account switch emits no empty envelope"
     try std.testing.expect(content[1].object.get("cache_control") != null);
 }
 
-test "reasoning is dropped when its origin account differs, even within the vendor" {
+test "reasoning is dropped when its replay account differs within the vendor" {
     // Replay is an exact account match, so it drops though both are Anthropic.
     const items = [_]llm.Item{
-        .{ .reasoning = .{ .text = "weigh it", .blob = "sig", .origin = .anthropic_subscription } },
+        .{ .reasoning = .{ .replay = .{ .anthropic_subscription = .{ .signature = .{
+            .text = "weigh it",
+            .signature = "sig",
+        } } } } },
         .{ .message = .{ .role = .assistant, .text = "answer" } },
     };
     const body = try serialize(std.testing.allocator, &.{
