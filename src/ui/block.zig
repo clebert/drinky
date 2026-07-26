@@ -184,9 +184,9 @@ test "an error feedback paints the red style and error prefix" {
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, painted, "\x1b[31m"));
 }
 
-// Bounded memory: streaming a clipped block into a frame warmed to its full
-// size neither allocates nor grows a buffer — the clip's hidden top is never
-// materialized.
+// Bounded memory: a clipped block composes only its visible rows into a frame
+// warmed to the block's full size, so the smaller clip reuses the warmed buffers
+// without allocating and never materializes its hidden top.
 test "a clipped block streams into a warmed frame without allocating" {
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
     const gpa = failing.allocator();
@@ -209,6 +209,9 @@ test "a clipped block streams into a warmed frame without allocating" {
         try entry.render(&placement);
         try view.render();
     }
+    // Drop the accumulated output so the arm measures only the clipped render,
+    // whose bytes fit the buffer the full-size warm already grew.
+    out.clearRetainingCapacity();
 
     // Arm: any further allocation or growth now fails.
     failing.fail_index = failing.alloc_index;
@@ -219,4 +222,11 @@ test "a clipped block streams into a warmed frame without allocating" {
         .{ .sink = sink, .id = 0, .columns = columns, .base = 0, .skip = 30 };
     try entry.render(&placement);
     try view.render();
+
+    // Only the visible rows are emitted; the clipped top is never materialized.
+    const painted = out.written();
+    try std.testing.expect(std.mem.indexOf(u8, painted, "L30") != null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "L59") != null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "L0") == null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "L29") == null);
 }

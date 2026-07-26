@@ -976,10 +976,14 @@ fn runCommand(self: *App, line: []const u8) !void {
     try self.applyOutcome(try ai.command.run(&context, line));
 }
 
-/// Apply a command outcome: account actions (`/login`, `/logout`) need the tty
-/// and the agent, so the app runs them; everything else the session shows.
+/// Apply a command outcome: account and conversation actions need the agent,
+/// so the app runs them; everything else the session shows.
 fn applyOutcome(self: *App, outcome: ai.command.Outcome) !void {
     switch (outcome) {
+        .new_conversation => {
+            self.agent.resetConversation();
+            self.session.resetConversation();
+        },
         .login => |account| try self.loginAccount(account),
         .logout => |account| try self.logoutAccount(account),
         .switch_account => |account| {
@@ -2631,6 +2635,55 @@ test "ctrl+c clears then quits within the window and ctrl+d quits only when empt
     app.running = true;
     try app.handleKey(&.{ .ctrl = 'd' });
     try std.testing.expect(!app.running);
+}
+
+test "/new clears conversation state without changing the active configuration" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.gpa = gpa;
+    app.io = io;
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = anthropic_default,
+        .system = "test system",
+        .retry = .{},
+        .effort = .high,
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .high);
+    defer app.session.deinit();
+
+    const cache_key = app.agent.cache_key;
+    try app.agent.items.append(gpa, .{ .message = .{
+        .role = .user,
+        .text = try gpa.dupe(u8, "old prompt"),
+    } });
+    var seeded: ai.Agent.Stats = .{ .cost = 2.5, .last = .{ .input = 10 }, .model_count = 1 };
+    seeded.by_model[0] = .{ .name = anthropic_default.name, .cost = 2.5, .usage = .{ .input = 10 } };
+    app.agent.stats = seeded;
+    try app.agent.steering.push("old steering");
+    try app.session.transcript.append(.user, false, "old prompt");
+    app.session.stats_shown = seeded;
+    try seedSteering(&app, "old steering");
+
+    try app.session.editor.insert("/new trailing");
+    try app.submit();
+
+    try std.testing.expectEqual(@as(usize, 0), app.agent.items.items.len);
+    try std.testing.expect(std.meta.eql(ai.Agent.Stats{}, app.agent.stats));
+    try std.testing.expect(!std.mem.eql(u8, &cache_key, &app.agent.cache_key));
+    const steering = try app.agent.steering.take();
+    defer gpa.free(steering);
+    try std.testing.expectEqual(@as(usize, 0), steering.len);
+    try std.testing.expectEqual(@as(usize, 0), app.session.transcript.blocks().len);
+    try std.testing.expect(std.meta.eql(ai.Agent.Stats{}, app.session.stats_shown));
+    try std.testing.expect(!app.session.hasSteering());
+    try std.testing.expectEqualStrings("", app.session.editor.visible());
+    try std.testing.expectEqualStrings(anthropic_default.name, app.agent.model.name);
+    try std.testing.expectEqual(ai.llm.Effort.high, app.agent.effort);
 }
 
 // Signed out, a normal message must be refused with a /login prompt rather

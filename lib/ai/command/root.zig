@@ -12,6 +12,7 @@ const effort = @import("effort.zig");
 const login = @import("login.zig");
 const logout = @import("logout.zig");
 const model = @import("model.zig");
+const new = @import("new.zig");
 
 const Entry = struct {
     name: []const u8,
@@ -23,6 +24,7 @@ const registry = [_]Entry{
     .{ .name = effort.name, .run = effort.run },
     .{ .name = login.name, .run = login.run },
     .{ .name = logout.name, .run = logout.run },
+    .{ .name = new.name, .run = new.run },
 };
 
 /// Dispatch a `/`-prefixed input line to its command; an unknown command is an error.

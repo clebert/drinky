@@ -15,7 +15,7 @@ agent: *Agent,
 accounts: *Accounts,
 
 /// A slash command's result. Feedback content and Pick options transfer to the
-/// caller; login/logout name an account for the app to act on.
+/// caller; account and conversation actions are owned by the app.
 pub const Outcome = union(enum) {
     feedback: Feedback,
     pick: Pick,
@@ -28,6 +28,8 @@ pub const Outcome = union(enum) {
     /// Switch to this already-authenticated account. The app owns the switch so
     /// its configured per-account default model applies.
     switch_account: llm.Account,
+    /// Clear conversation and presentation state while preserving configuration.
+    new_conversation,
 
     pub const Status = enum { ok, err };
 

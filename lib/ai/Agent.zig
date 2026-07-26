@@ -47,8 +47,8 @@ stats: Stats,
 /// Steering messages the user submitted mid-turn, drained into the running turn
 /// at each round boundary. Thread-safe: the UI thread pushes, the worker takes.
 steering: Steering,
-/// Stable per-session prompt-cache routing key (used by OpenAI); generated once
-/// at init so every turn shares it.
+/// Stable per-conversation prompt-cache routing key (used by OpenAI); every
+/// turn shares it until a deliberate reset rotates it.
 cache_key: [32]u8,
 
 /// Cumulative session cost and cache savings, plus the last message's usage for
@@ -233,8 +233,6 @@ pub fn init(
         bash: tool.Context.Bash = .{},
     },
 ) Agent {
-    var seed: [16]u8 = undefined;
-    io.random(&seed);
     return .{
         .gpa = gpa,
         .io = io,
@@ -247,7 +245,7 @@ pub fn init(
         .items = .empty,
         .stats = .{},
         .steering = Steering.init(gpa, io),
-        .cache_key = std.fmt.bytesToHex(seed, .lower),
+        .cache_key = generateCacheKey(io),
     };
 }
 
@@ -255,6 +253,15 @@ pub fn deinit(self: *Agent) void {
     for (self.items.items) |item| freeItem(self.gpa, item);
     self.items.deinit(self.gpa);
     self.steering.deinit();
+}
+
+/// Start a fresh conversation without changing its account, model, or configuration.
+/// Safe only between turns, when no worker can own history or steering.
+pub fn resetConversation(self: *Agent) void {
+    self.rollback(0);
+    self.stats = .{};
+    self.steering.clear();
+    self.cache_key = generateCacheKey(self.io);
 }
 
 /// Switch account and model together, effective next turn. The client carries
@@ -585,6 +592,12 @@ fn retryableError(err: anyerror) bool {
         => true,
         else => false,
     };
+}
+
+fn generateCacheKey(io: std.Io) [32]u8 {
+    var seed: [16]u8 = undefined;
+    io.random(&seed);
+    return std.fmt.bytesToHex(seed, .lower);
 }
 
 /// Free and drop every history item from `base` on; capacity is retained so a
@@ -954,6 +967,36 @@ test retryableError {
     try std.testing.expect(!retryableError(error.OutOfMemory));
     // An oversize stream reproduces on the same request, so it is not retried.
     try std.testing.expect(!retryableError(error.StreamResponseTooLarge));
+}
+
+test "resetConversation clears conversation state and preserves configuration" {
+    const gpa = std.testing.allocator;
+    var agent = scriptedAgent(gpa);
+    defer agent.deinit();
+
+    const account = agent.client.?.account();
+    const model = agent.model;
+    const cache_key = agent.cache_key;
+    agent.effort = .high;
+    try agent.appendUser("old prompt");
+    const usage: llm.Usage = .{ .input = 1000, .output = 200 };
+    agent.recordUsage(&agent.model, &usage);
+    try std.testing.expect(agent.stats.model_count == 1);
+    try agent.steering.push("old steering");
+
+    agent.resetConversation();
+
+    try std.testing.expectEqual(@as(usize, 0), agent.items.items.len);
+    // Compares the whole struct, so the per-model buckets and their count must
+    // also be back to default — not just the cumulative totals.
+    try std.testing.expect(std.meta.eql(Stats{}, agent.stats));
+    const steering = try agent.steering.take();
+    defer gpa.free(steering);
+    try std.testing.expectEqual(@as(usize, 0), steering.len);
+    try std.testing.expect(!std.mem.eql(u8, &cache_key, &agent.cache_key));
+    try std.testing.expectEqual(account, agent.client.?.account());
+    try std.testing.expectEqualStrings(model.name, agent.model.name);
+    try std.testing.expectEqual(llm.Effort.high, agent.effort);
 }
 
 test "usage is attributed to the model that produced it across a switch" {

@@ -224,6 +224,15 @@ pub fn deinit(self: *Session) void {
     self.editor.deinit();
 }
 
+/// Clear the visible conversation and its usage and steering snapshots.
+/// Commands run only in prompt mode, so no live turn state can be discarded.
+pub fn resetConversation(self: *Session) void {
+    std.debug.assert(self.mode == .prompt);
+    self.transcript.truncate(0);
+    self.stats_shown = .{};
+    self.clearSteering();
+}
+
 /// Free whatever the current mode owns.
 fn deinitMode(self: *Session) void {
     switch (self.mode) {
@@ -332,7 +341,7 @@ pub fn applyOutcome(self: *Session, outcome: ai.command.Outcome) !void {
         .pick => |pick| try self.openPicker(pick),
         // The app intercepts account actions (they need the tty and the agent);
         // they never reach the io-free session.
-        .login, .logout, .switch_account => unreachable,
+        .login, .logout, .switch_account, .new_conversation => unreachable,
     }
     self.dirty = true;
 }

@@ -1,7 +1,7 @@
 # FEATURES.md
 
-What pith does, one short sentence per capability. It is an overview, not a specification: the
-_why_ and _how_ live in commit history, `BACKLOG.md` (planned work), and `docs/`.
+What pith does, one short sentence per capability. It is an overview, not a specification: the _why_
+and _how_ live in commit history, `BACKLOG.md` (planned work), and `docs/`.
 
 pith is a terminal coding agent. You type a prompt; the model reads, searches, writes, and edits
 files in the working directory while the conversation streams inline into your scrollback. It talks
@@ -22,8 +22,8 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
   silently.
 - Timeouts and transient failures retry the whole request, clearing the partial reply first.
 - A reply cut short by the output cap is kept, and reported as cut short.
-- Model-side failures — a refusal, an empty reply, the round cap — read as a plain sentence
-  rather than an internal error.
+- Model-side failures — a refusal, an empty reply, the round cap — read as a plain sentence rather
+  than an internal error.
 - Reasoning streams into its own dimmed block; encrypted reasoning shows as `[redacted thinking]`.
 
 ## Tools
@@ -79,7 +79,9 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - **/effort** — set the reasoning-effort level, from the next turn on.
 - **/login** — sign in, switch to an account already signed in, or name the API key to set.
 - **/logout** — drop a subscription's credentials and hand the session to another account.
-- Each command answers with a line in the transcript, and an unknown one never reaches the model.
+- **/new** — clear the conversation, usage stats, and steering without changing its configuration.
+- Every other command answers with a line in the transcript, and an unknown one never reaches the
+  model.
 - A command typed during a turn stays in the editor until the turn ends.
 
 ## Providers
@@ -113,10 +115,10 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - Queued steering shows as `Steering:` rows, and becomes one user message once consumed.
 - The bottom line shows context fill, session cost, cache savings, and the last request's cache-hit
   rate, with `model · effort` right-aligned.
-- A picker is a single-choice list tagging the current value; Enter confirms, Esc, Ctrl+C, or
-  Ctrl+D cancels.
-- The input frame grows to about a quarter of the screen and labels hidden rows "↑ N more" and
-  "↓ N more".
+- A picker is a single-choice list tagging the current value; Enter confirms, Esc, Ctrl+C, or Ctrl+D
+  cancels.
+- The input frame grows to about a quarter of the screen and labels hidden rows "↑ N more" and "↓ N
+  more".
 - Model, tool, and user text can never emit escapes: controls and malformed UTF-8 render as
   replacement characters.
 
@@ -150,7 +152,7 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 
 ## Keeping this file true
 
-One short sentence per capability, at the concept level — what a user gets, not how the code
-spells it. When a capability lands, add its line and tick the matching `BACKLOG.md` item; when one
-goes away, delete the line. Prefer merging a fact into a neighbouring line over adding a new one,
-and if a section passes roughly a dozen lines it is either two sections or too much detail.
+One short sentence per capability, at the concept level — what a user gets, not how the code spells
+it. When a capability lands, add its line and tick the matching `BACKLOG.md` item; when one goes
+away, delete the line. Prefer merging a fact into a neighbouring line over adding a new one, and if
+a section passes roughly a dozen lines it is either two sections or too much detail.

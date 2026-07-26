@@ -14,8 +14,11 @@
 //! cursor row is rebased by Δ, how far the window slid. A backward slide is
 //! never incremental above the viewport — a terminal cannot un-scroll its
 //! scrollback — so it resets, or reprints from row `0` when the whole window
-//! shows. Every line is exactly one physical row, so all cursor motion is a
-//! plain row count; each repaint is one synchronized-output burst.
+//! shows. Removing the top rows without an append to scroll them off — an
+//! on-screen shrink, or a cleared transcript — reprints from row `0` to erase
+//! them, or resets when they reach into scrollback. Every line is exactly one
+//! physical row, so all cursor motion is a plain row count; each repaint is one
+//! synchronized-output burst.
 
 const std = @import("std");
 
@@ -269,10 +272,24 @@ pub fn render(self: *View) !void {
         try self.paint(if (prev_empty) .fresh else .reset, back, .{});
     } else if (findAlignment(prev, back)) |alignment| {
         if (alignment.back_index == 0) {
-            // Forward slide: the new top row is shared; rows above it scrolled away.
+            // The new top row is shared with the previous frame at index `delta`.
             const delta = alignment.prev_index;
             const deepest = @min(prev.rows.items.len - 1 - delta, back.rows.items.len - 1);
-            if (firstChange(prev, delta, back)) |changed| {
+            // A forward slide reaches past the previous last row, appending rows at
+            // the bottom; that scroll is what carried the `delta` top rows into
+            // scrollback and lets the cursor rebase by `delta`. Without it, the top
+            // rows were removed on screen (a shrink or a `/new`-style clear), the
+            // cursor never rose, and a rebased incremental would strand them.
+            const scrolled = back.rows.items.len + delta > prev.rows.items.len;
+            if (delta > 0 and !scrolled) {
+                if (self.viewport_top > 0) {
+                    // The removed rows expose scrollback an inline terminal cannot reach.
+                    try self.paint(.reset, back, .{});
+                } else {
+                    // Reprint from row zero to erase the rows still on screen above.
+                    try self.paint(.incremental, back, .{ .cursor_from = self.cursor_row });
+                }
+            } else if (firstChange(prev, delta, back)) |changed| {
                 // A shrunk tail must reveal scrolled-off rows: a backward slide in disguise.
                 const shrank = back.rows.items.len + delta < prev.rows.items.len;
                 if (changed + delta < self.viewport_top or (shrank and self.viewport_top > 0)) {
@@ -284,17 +301,11 @@ pub fn render(self: *View) !void {
                         .cursor_from = self.cursor_row -| delta,
                     });
                 }
-            } else if (delta == 0) {
-                // Content unchanged, so no slide happened: `cursor_row` is still valid.
-                try self.paintCaretOnly(back);
-            } else if (self.viewport_top > 0) {
-                try self.paint(.reset, back, .{});
             } else {
-                // A pure top-trim keeps the tail bytes but slides the window, so rebase.
-                try self.paint(.incremental, back, .{
-                    .anchor = deepest,
-                    .cursor_from = self.cursor_row -| delta,
-                });
+                // A byte-identical, equal-length overlap forces `delta == 0` (a
+                // `delta > 0` trim took the shrink branch): nothing slid, so
+                // `cursor_row` is still valid.
+                try self.paintCaretOnly(back);
             }
         } else if (self.viewport_top == 0) {
             // Backward slide: row 0 changed, reachable only when the whole window shows.
@@ -516,6 +527,37 @@ fn caretLine(bytes: []const u8, options: struct { id: usize, column: usize }) Li
         .anchor = .{ .id = options.id, .line = 0 },
         .caret = options.column,
     };
+}
+
+// Regression: clearing the transcript (a `/new`) removes the rows above the
+// shared editor and status anchors while nothing has scrolled off. Those rows
+// sit on screen, so the frame must reprint from row zero and erase them rather
+// than treat the removal as a forward slide and strand them above the tail.
+test "a shrink to the tail with nothing scrolled off erases the rows above" {
+    const gpa = std.testing.allocator;
+    const harness = try makeHarness(gpa, 20);
+    defer {
+        harness.deinit();
+        gpa.destroy(harness);
+    }
+    const full = [_]Line{
+        line("m0", 0),
+        line("m1", 1),
+        line("m2", 2),
+        caretLine("prompt", .{ .id = 1000, .column = 6 }),
+        line("status", 1001),
+    };
+    try harness.render(&full, .{ .columns = 20, .rows = 24 }, 8);
+    try harness.emulator.expectScreen(&.{ "m0", "m1", "m2", "prompt", "status" });
+
+    const cleared = [_]Line{
+        caretLine("P", .{ .id = 1000, .column = 1 }),
+        line("status", 1001),
+    };
+    try harness.render(&cleared, .{ .columns = 20, .rows = 24 }, 8);
+    try harness.emulator.expectScreen(&.{ "P", "status" });
+    try std.testing.expect(harness.emulator.document.items.len == 2);
+    try std.testing.expect(std.mem.indexOf(u8, harness.lastBytes(), escape.screen_reset) == null);
 }
 
 test "paints a fresh frame row for row" {
@@ -806,7 +848,7 @@ test "an unchanged frame emits only caret motion" {
     try std.testing.expect(std.mem.indexOf(u8, last, escape.cursor_show) == null);
 }
 
-test "a pure top-trim repaints the identical tail and rebases the caret" {
+test "a top-trim with nothing scrolled off reprints from row zero" {
     const gpa = std.testing.allocator;
     const harness = try makeHarness(gpa, 10);
     defer {
@@ -817,10 +859,11 @@ test "a pure top-trim repaints the identical tail and rebases the caret" {
     try harness.render(&first, .{ .columns = 10, .rows = 3 }, 1);
     try harness.emulator.expectCaret(.{ .frame_len = 3, .row = 2, .column = 1 });
 
-    // The top row is trimmed and the remaining rows are byte-identical: the
-    // window still slid, so a caret-only paint would desync `cursor_row`.
+    // The top row is removed on screen (nothing scrolled off) and the remaining
+    // rows are byte-identical: reprint from row zero to erase it, no full reset.
     const second = [_]Line{ line("b", 1), caretLine("c", .{ .id = 2, .column = 1 }) };
     try harness.render(&second, .{ .columns = 10, .rows = 3 }, 1);
+    try harness.emulator.expectScreen(&.{ "b", "c" });
     try harness.emulator.expectCaret(.{ .frame_len = 2, .row = 1, .column = 1 });
     try std.testing.expect(std.mem.indexOf(u8, harness.lastBytes(), escape.screen_reset) == null);
 
