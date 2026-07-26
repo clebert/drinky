@@ -24,11 +24,10 @@ CI when the number of tests that ran differs from the number declared in source.
 
 ## Features
 
-`FEATURES.md` is the inventory of what pith supports — one line per capability, grouped by module.
-Keep it current: when you land a new capability, add an entry (and mark the matching `BACKLOG.md`
-item done, if one exists); when you refactor, treat the relevant group as the checklist that must not
-regress. It
-records *what exists* — the *why*/*how* lives in commits, `BACKLOG.md`, and `docs/`.
+`FEATURES.md` is a human-readable overview of what pith supports — one short sentence per
+capability. Keep it current: when you land a capability, add its line (and mark the matching
+`BACKLOG.md` item done, if one exists); when one goes away, delete the line. Keep it short — it is
+an orientation document, not a spec, and the tests are what guard against regressions.
 
 ## CI
 
