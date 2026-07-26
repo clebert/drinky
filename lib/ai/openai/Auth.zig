@@ -119,6 +119,8 @@ test "save and load round-trip credentials an unexpired token serves unchanged" 
     var loaded = try init(gpa, io, home, .{});
     defer loaded.deinit();
     try std.testing.expect(try loaded.load());
+    // Loading again replaces the installed tokens rather than leaking them.
+    try std.testing.expect(try loaded.load());
     try std.testing.expectEqualStrings("at", try loaded.accessToken());
     try std.testing.expectEqualStrings("acct", loaded.accountId());
 }

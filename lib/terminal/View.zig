@@ -486,6 +486,7 @@ const Harness = struct {
 
 fn makeHarness(gpa: std.mem.Allocator, columns: usize) !*Harness {
     const self = try gpa.create(Harness);
+    errdefer gpa.destroy(self);
     self.* = .{
         .out = .init(gpa),
         .view = undefined,

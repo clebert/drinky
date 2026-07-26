@@ -52,6 +52,8 @@ pub fn load(auth: anytype, comptime account_key: []const u8) !bool {
         };
         filled = i + 1;
     }
+    // Install last, so a rejected entry leaves any current credential intact.
+    if (auth.tokens) |old| old.deinit(auth.gpa);
     auth.tokens = tokens;
     return true;
 }
