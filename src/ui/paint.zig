@@ -64,7 +64,10 @@ pub fn notice(placement: *const Placement, look: *const Notice, text: []const u8
         const line = placement.base + index;
         if (line < placement.skip) continue;
         const shown_prefix = terminal.width.truncate(look.prefix, placement.columns);
-        const available = placement.columns - terminal.width.ofText(shown_prefix);
+        // Saturating: a cluster wider than the whole budget survives `truncate` as
+        // a one-column replacement but measures its true width here, so a prefix
+        // opening on one can report more columns than the row has.
+        const available = placement.columns -| terminal.width.ofText(shown_prefix);
         const clipped = terminal.width.truncate(piece, available);
         placement.sink.begin();
         try color.apply(placement.sink, look.style);
@@ -307,6 +310,21 @@ pub fn steering(placement: *const Placement, messages: []const []const u8) !void
     hint_placement.base = line;
     const hint = "\u{21B3} Alt+Up to edit all queued messages";
     try notice(&hint_placement, &.{ .style = .dim, .prefix = "" }, hint);
+}
+
+test "a wide notice prefix fits in a one-column row" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var view = terminal.View.init(std.testing.allocator, &output.writer);
+    defer view.deinit();
+
+    const sink = try view.beginFrame(.{ .columns = 1, .rows = 1 }, 1);
+    const placement: Placement =
+        .{ .sink = sink, .id = 0, .columns = 1, .base = 0, .skip = 0 };
+    try notice(&placement, &.{ .style = .dim, .prefix = "你" }, "hidden");
+    try std.testing.expectEqual(@as(usize, 1), sink.columns_written);
+    try view.render();
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "hidden") == null);
 }
 
 test "the body limit tracks a quarter of the viewport, clamped to five and fifteen" {

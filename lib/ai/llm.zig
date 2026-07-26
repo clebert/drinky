@@ -234,16 +234,36 @@ pub const Usage = struct {
     cache_read: u64 = 0,
     cache_write: u64 = 0,
 
-    /// Field-wise sum, for accumulating several messages' usage.
+    /// Field-wise sum, for accumulating several messages' usage. Saturating: the
+    /// counts arrive from the provider stream unchecked, so a hostile or buggy
+    /// response must skew a gauge, never overflow a total.
     pub fn plus(self: *const Usage, other: *const Usage) Usage {
         return .{
-            .input = self.input + other.input,
-            .output = self.output + other.output,
-            .cache_read = self.cache_read + other.cache_read,
-            .cache_write = self.cache_write + other.cache_write,
+            .input = self.input +| other.input,
+            .output = self.output +| other.output,
+            .cache_read = self.cache_read +| other.cache_read,
+            .cache_write = self.cache_write +| other.cache_write,
         };
     }
 };
+
+test "accumulated usage saturates rather than overflowing on absurd counts" {
+    // A provider reports counts as JSON integers, so one message can claim up to
+    // maxInt(i64) per field: three of them must not wrap the per-model total.
+    const absurd: Usage = .{
+        .input = std.math.maxInt(i64),
+        .output = std.math.maxInt(i64),
+        .cache_read = std.math.maxInt(i64),
+        .cache_write = std.math.maxInt(i64),
+    };
+    var total: Usage = .{};
+    for (0..3) |_| total = total.plus(&absurd);
+    const ceiling = std.math.maxInt(u64);
+    try std.testing.expectEqual(ceiling, total.input);
+    try std.testing.expectEqual(ceiling, total.output);
+    try std.testing.expectEqual(ceiling, total.cache_read);
+    try std.testing.expectEqual(ceiling, total.cache_write);
+}
 
 /// A decoded part of a streamed assistant reply. Display deltas are kept
 /// separate from completed conversation items: transports own their native
