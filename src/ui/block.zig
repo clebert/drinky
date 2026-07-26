@@ -2,12 +2,13 @@
 //! block's data: the plain blocks a byte buffer, the flagged ones a buffer plus
 //! an error flag. It owns its bytes (`init`/`deinit`), measures itself (`rows`),
 //! and paints itself (`render`) with the shared `paint` primitives. The model
-//! block grows in place as its reply streams.
+//! block grows in place as its reply streams, its markdown rendered as it goes.
 
 const std = @import("std");
 
 const terminal = @import("terminal");
 
+const markdown = @import("markdown.zig");
 const paint = @import("paint.zig");
 
 pub const Entry = union(enum) {
@@ -50,7 +51,7 @@ pub const Entry = union(enum) {
             .feedback => |flagged| std.mem.count(u8, flagged.text.items, "\n") + 1,
             .user => |text| paint.boxRows(text.items, columns),
             .tool_result => |flagged| paint.boxRows(flagged.text.items, columns),
-            .thinking, .model => |text| terminal.width.rows(text.items, @max(columns, 1)),
+            .thinking, .model => |text| markdown.rows(text.items, columns),
         };
     }
 
@@ -77,8 +78,8 @@ pub const Entry = union(enum) {
                     .tool_success_background,
                 .foreground = .tool_foreground,
             }, flagged.text.items),
-            .thinking => |text| try paint.wrapped(placement, .dim, text.items),
-            .model => |text| try paint.wrapped(placement, null, text.items),
+            .thinking => |text| try markdown.render(placement, .muted_foreground, text.items),
+            .model => |text| try markdown.render(placement, null, text.items),
         }
     }
 };
@@ -101,6 +102,22 @@ pub fn numberedLines(gpa: std.mem.Allocator, count: usize) !std.ArrayList(u8) {
     }
     return text;
 }
+
+// A reply carrying the markdown shapes that reflow — a heading, a fenced block,
+// a nested list, a quote, and inline emphasis.
+const markdown_reply =
+    \\## Findings
+    \\- one bullet with words enough to wrap
+    \\  - a nested bullet
+    \\
+    \\> quoted
+    \\
+    \\```zig
+    \\const answer = 42;
+    \\```
+    \\
+    \\That is **it**.
+;
 
 // Rows `entry` paints into a fresh view, dropping its top `skip`. Fresh so the
 // paint is a full reprint whose rows `paintedRows` can count. The window is tall
@@ -132,6 +149,9 @@ test "each entry variant renders exactly the rows it counts" {
             "then a long paragraph that must wrap several rows" },
         .{ .kind = .thinking, .is_error = false, .text = "reasoning that runs on\n\n" ++
             "long enough to wrap across the narrow test width more than once" },
+        // Markdown, whose prefixes and indents can outgrow the narrow widths.
+        .{ .kind = .model, .is_error = false, .text = markdown_reply },
+        .{ .kind = .thinking, .is_error = false, .text = markdown_reply },
         .{ .kind = .tool_result, .is_error = true, .text = "read foo.zig\n→ no such file" },
         // A wide-glyph box, to exercise the narrow-width row cap.
         .{ .kind = .user, .is_error = false, .text = "你好世界" },
@@ -186,7 +206,8 @@ test "an error feedback paints the red style and error prefix" {
 
 // Bounded memory: a clipped block composes only its visible rows into a frame
 // warmed to the block's full size, so the smaller clip reuses the warmed buffers
-// without allocating and never materializes its hidden top.
+// without allocating and never materializes its hidden top. The visible rows
+// carry markdown, so the renderer's own paths run under the armed allocator too.
 test "a clipped block streams into a warmed frame without allocating" {
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
     const gpa = failing.allocator();
@@ -198,6 +219,8 @@ test "a clipped block streams into a warmed frame without allocating" {
 
     var text = try numberedLines(std.testing.allocator, 60);
     defer text.deinit(std.testing.allocator);
+    try text.append(std.testing.allocator, '\n');
+    try text.appendSlice(std.testing.allocator, markdown_reply);
     const entry: Entry = .{ .model = text };
     const columns = 20;
 
@@ -227,6 +250,7 @@ test "a clipped block streams into a warmed frame without allocating" {
     const painted = out.written();
     try std.testing.expect(std.mem.indexOf(u8, painted, "L30") != null);
     try std.testing.expect(std.mem.indexOf(u8, painted, "L59") != null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "const answer = 42;") != null);
     try std.testing.expect(std.mem.indexOf(u8, painted, "L0") == null);
     try std.testing.expect(std.mem.indexOf(u8, painted, "L29") == null);
 }

@@ -111,21 +111,13 @@ on another item. Module layout and extension seams live in `AGENTS.md`.
       limit. Quality degradation has no evidence-based number, so keep it a soft warning._
 - [ ] **Richer UI components** — composable tool-call panels, streaming status, and a command
       palette, beyond today's log plus editor. _Keep the line/string render model._
-- [ ] **Markdown rendering** — streamed answers and reasoning render their markdown: headings,
-      lists, blockquotes, code blocks, rules, and inline emphasis, reasoning tinted grey and italic.
-      _Design and settled scope live in `docs/markdown-rendering.md`. Hand-rolled, no lexer
-      dependency; every style is a compile-time `color.Style` SGR because the sink rejects runtime
-      escapes, and the renderer must hold measure/render row parity with no allocation on the model
-      path. Ship in two phases: block-level structure first, inline spans second. Answers and
-      reasoning share one renderer, differing only by a tint. Tables and clickable links are the
-      deferred item below._
 - [ ] **Markdown tables and clickable links** — markdown tables render as box-drawing grids, and
-      links become clickable terminal hyperlinks. _Deferred from Markdown rendering. A table needs
-      per-column width sizing and wrapping that still satisfies row parity at every width, down to
-      the two-column edge; until it lands a table falls through to plain paragraph text and a link
-      shows as styled text with the URL appended. OSC-8 hyperlinks are a string control, not an SGR,
-      so a clickable runtime URL means opening a trusted path through the sink's SGR-only control
-      boundary. Depends on Markdown rendering._
+      links become clickable terminal hyperlinks. _Both were deferred out of the markdown renderer.
+      A table needs per-column width sizing and wrapping that still satisfies row parity at every
+      width, down to the two-column edge; today a table falls through to plain paragraph text and a
+      link shows as styled text with the URL appended. OSC-8 hyperlinks are a string control, not an
+      SGR, so a clickable runtime URL means opening a trusted path through the sink's SGR-only
+      control boundary._
 
 ## Configuration
 

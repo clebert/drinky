@@ -78,17 +78,6 @@ pub fn notice(placement: *const Placement, look: *const Notice, text: []const u8
     }
 }
 
-/// `text` wrapped to the terminal width, streamed a row at a time so the clip
-/// never materializes its whole body. Each row borrows `text`, so nothing is
-/// copied but the emitted bytes; `maybe_style` (null for the plain model reply)
-/// opens every row and is reset after it, for a dimmed run like the thinking
-/// stream.
-pub fn wrapped(placement: *const Placement, maybe_style: ?color.Style, text: []const u8) !void {
-    var iterator = terminal.width.wrapper(text, @max(placement.columns, 1));
-    var line = placement.base;
-    while (iterator.next()) |content| try framedRow(placement, null, &line, content, maybe_style);
-}
-
 /// A padded background box: a blank padding row, `text` wrapped to the inner
 /// width with a one-space left pad and the background filled to full width, then
 /// a blank padding row. Streamed a row at a time, self-separating inside the

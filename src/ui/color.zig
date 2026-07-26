@@ -7,6 +7,10 @@ const terminal = @import("terminal");
 pub const Style = enum {
     reset,
     dim,
+    bold,
+    italic,
+    underline,
+    strikethrough,
     red,
     highlight,
     rule,
@@ -18,6 +22,9 @@ pub const Style = enum {
     tool_error_background,
     accent_foreground,
     muted_foreground,
+    heading,
+    code_block,
+    link,
 };
 
 /// Apply one palette entry through the sink's compile-time-validated SGR path.
@@ -25,6 +32,10 @@ pub fn apply(sink: *terminal.View.Sink, style: Style) !void {
     switch (style) {
         .reset => try sink.sgr("\x1b[0m"),
         .dim => try sink.sgr("\x1b[2m"),
+        .bold => try sink.sgr("\x1b[1m"),
+        .italic => try sink.sgr("\x1b[3m"),
+        .underline => try sink.sgr("\x1b[4m"),
+        .strikethrough => try sink.sgr("\x1b[9m"),
         .red => try sink.sgr("\x1b[31m"),
         .highlight => try sink.sgr("\x1b[7m"),
         .rule => try sink.sgr("\x1b[38;2;209;131;232m"),
@@ -35,5 +46,8 @@ pub fn apply(sink: *terminal.View.Sink, style: Style) !void {
         .tool_error_background => try sink.sgr("\x1b[48;2;60;40;40m"),
         .accent_foreground => try sink.sgr("\x1b[38;2;138;190;183m"),
         .muted_foreground => try sink.sgr("\x1b[38;2;128;128;128m"),
+        .heading => try sink.sgr("\x1b[38;2;240;198;116m"),
+        .code_block => try sink.sgr("\x1b[38;2;181;189;104m"),
+        .link => try sink.sgr("\x1b[38;2;129;162;190m"),
     }
 }

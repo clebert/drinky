@@ -24,7 +24,7 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - A reply cut short by the output cap is kept, and reported as cut short.
 - Model-side failures — a refusal, an empty reply, the round cap — read as a plain sentence rather
   than an internal error.
-- Reasoning streams into its own dimmed block; encrypted reasoning shows as `[redacted thinking]`.
+- Reasoning streams into its own block; encrypted reasoning shows as `[redacted thinking]`.
 
 ## Tools
 
@@ -108,7 +108,9 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - Typing, streaming output, and resizes are handled concurrently, so the interface never freezes
   mid-turn.
 - Repaints are frame-limited and scheduled only while something is dirty or animating.
-- Answer text grows as one block, with reasoning collected into a separate dimmed one.
+- Answer text grows as one block, with reasoning collected into a separate one tinted grey and
+  italic; both render their markdown: headings, lists, blockquotes, code blocks, rules, and inline
+  emphasis.
 - A running tool shows a blue box with its name and arguments, then turns green or red with the
   first line of its output.
 - A Braille "Working…" spinner runs while a turn is in flight.
