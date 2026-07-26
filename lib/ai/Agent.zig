@@ -40,6 +40,8 @@ model: models.Model,
 system: []const u8,
 effort: llm.Effort,
 retry: net.Retry,
+/// Bounds the bash tool's output window and runtime, handed to every tool call.
+bash: tool.Context.Bash,
 items: std.ArrayList(llm.Item),
 stats: Stats,
 /// Steering messages the user submitted mid-turn, drained into the running turn
@@ -228,6 +230,7 @@ pub fn init(
         system: []const u8,
         retry: net.Retry,
         effort: llm.Effort = .none,
+        bash: tool.Context.Bash = .{},
     },
 ) Agent {
     var seed: [16]u8 = undefined;
@@ -240,6 +243,7 @@ pub fn init(
         .system = options.system,
         .effort = options.effort,
         .retry = options.retry,
+        .bash = options.bash,
         .items = .empty,
         .stats = .{},
         .steering = Steering.init(gpa, io),
@@ -781,7 +785,7 @@ fn runToolsWith(
     self.advanceCheckpoint(turn);
     notifyCheckpoint(handler);
 
-    const context: tool.Context = .{ .gpa = self.gpa, .io = self.io };
+    const context: tool.Context = .{ .gpa = self.gpa, .io = self.io, .bash = self.bash };
     var group: std.Io.Group = .init;
     // On any early exit, reap in-flight tasks, then move every successful,
     // not-yet-moved result into its reserved slot; errored or never-run calls

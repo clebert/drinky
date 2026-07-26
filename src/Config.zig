@@ -1,16 +1,9 @@
 //! Global configuration loaded from `<home>/.pith/config.json`. The file is
 //! optional and may be partial: a missing file, a missing section, or a missing
 //! field falls back to a built-in default, and unknown keys are ignored so an
-//! older binary still reads a newer file. It configures request networking
-//! (timeouts and retries) and a default model per account; more sections join as
-//! the harness grows. It carries no secrets — API keys come from the environment.
-//!
-//! Example:
-//!   { "request": { "connect_timeout_ms": 30000, "idle_timeout_ms": 60000,
-//!                  "attempts_max": 3, "backoff_ms_initial": 500,
-//!                  "backoff_ms_max": 16000 },
-//!     "default_models": { "anthropic_subscription": "claude-opus-4-8",
-//!                         "openai_api": "gpt-5.6-sol" } }
+//! older binary still reads a newer file. The `File` struct below is the
+//! authoritative shape and default for every key; more sections join it as the
+//! harness grows. It carries no secrets — API keys come from the environment.
 
 const std = @import("std");
 
@@ -20,6 +13,7 @@ const Config = @This();
 
 timeouts: ai.net.Timeouts = .{},
 retry: ai.net.Retry = .{},
+bash: ai.tool.Context.Bash = .{},
 default_models: DefaultModels = .{},
 /// Configured default-model names that did not resolve (unknown, or a model of
 /// the wrong vendor for their account), kept so the app can tell the user their
@@ -53,6 +47,7 @@ pub const DroppedDefault = struct {
 /// The on-disk shape. Each field defaults to the built-in, so any subset parses.
 const File = struct {
     request: Request = .{},
+    bash: Bash = .{},
     default_models: DefaultModelsFile = .{},
 
     const Request = struct {
@@ -61,6 +56,12 @@ const File = struct {
         attempts_max: u32 = retry_default.attempts_max,
         backoff_ms_initial: u64 = retry_default.backoff_ms_initial,
         backoff_ms_max: u64 = retry_default.backoff_ms_max,
+    };
+
+    const Bash = struct {
+        output_lines_max: usize = bash_default.lines_max,
+        output_bytes_max: usize = bash_default.bytes_max,
+        timeout_ms: u64 = bash_default.timeout_ms,
     };
 
     /// Model names keyed by account tag; each resolved to a compiled model.
@@ -74,6 +75,7 @@ const File = struct {
 
 const timeouts_default: ai.net.Timeouts = .{};
 const retry_default: ai.net.Retry = .{};
+const bash_default: ai.tool.Context.Bash = .{};
 
 /// Free the owned dropped-default names. A no-op on the built-in default (its
 /// slice is empty).
@@ -100,6 +102,7 @@ fn parse(gpa: std.mem.Allocator, data: []const u8) !Config {
     const parsed = try std.json.parseFromSlice(File, gpa, data, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
     const request = parsed.value.request;
+    const bash = parsed.value.bash;
     const names = parsed.value.default_models;
 
     var dropped: std.ArrayList(DroppedDefault) = .empty;
@@ -132,6 +135,11 @@ fn parse(gpa: std.mem.Allocator, data: []const u8) !Config {
             .attempts_max = request.attempts_max,
             .backoff_ms_initial = request.backoff_ms_initial,
             .backoff_ms_max = request.backoff_ms_max,
+        },
+        .bash = .{
+            .lines_max = bash.output_lines_max,
+            .bytes_max = bash.output_bytes_max,
+            .timeout_ms = bash.timeout_ms,
         },
         .default_models = default_models,
         .dropped_defaults = try dropped.toOwnedSlice(gpa),
@@ -169,6 +177,17 @@ test "parse reads the request section" {
     try std.testing.expectEqual(@as(u64, 900), config.retry.backoff_ms_max);
 }
 
+test "parse reads the bash section" {
+    const config = try parse(std.testing.allocator,
+        \\{ "bash": { "output_lines_max": 17, "output_bytes_max": 4096,
+        \\  "timeout_ms": 1500 } }
+    );
+    defer config.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 17), config.bash.lines_max);
+    try std.testing.expectEqual(@as(usize, 4096), config.bash.bytes_max);
+    try std.testing.expectEqual(@as(u64, 1500), config.bash.timeout_ms);
+}
+
 test "parse fills missing fields and sections from defaults" {
     const partial = try parse(std.testing.allocator,
         \\{ "request": { "attempts_max": 7 } }
@@ -177,6 +196,9 @@ test "parse fills missing fields and sections from defaults" {
     try std.testing.expectEqual(@as(u32, 7), partial.retry.attempts_max);
     try std.testing.expectEqual(timeouts_default.connect_ms, partial.timeouts.connect_ms);
     try std.testing.expectEqual(retry_default.backoff_ms_initial, partial.retry.backoff_ms_initial);
+    try std.testing.expectEqual(bash_default.lines_max, partial.bash.lines_max);
+    try std.testing.expectEqual(bash_default.bytes_max, partial.bash.bytes_max);
+    try std.testing.expectEqual(bash_default.timeout_ms, partial.bash.timeout_ms);
 
     const empty = try parse(std.testing.allocator, "{}");
     defer empty.deinit(std.testing.allocator);

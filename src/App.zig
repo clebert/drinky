@@ -37,7 +37,8 @@ const system_prompt =
     "You are pith, a small coding assistant running in a terminal. Be concise. " ++
     "Explore the working directory with find (by name) and grep (literal text in " ++
     "file contents), read files with read, create or overwrite them with write, " ++
-    "and change existing files with edit (give old_text that occurs exactly once).";
+    "change existing files with edit (give old_text that occurs exactly once), and run shell " ++
+    "commands with bash.";
 
 const intro_text = "pith — enter: send · shift+enter: newline · esc: cancel · " ++
     "ctrl+c: clear (twice: quit) · ctrl+d: quit";
@@ -300,6 +301,7 @@ pub fn run(
         .system = system_prompt,
         .retry = config.retry,
         .effort = effort,
+        .bash = config.bash,
     });
     defer self.agent.deinit();
 

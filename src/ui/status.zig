@@ -26,10 +26,10 @@ pub const Info = struct {
 const signed_out_label = "not signed in";
 
 /// Separates the model name from its effort level on the right of the line.
-const separator = " • ";
+const separator = " · ";
 
 /// Stream the status line through `placement`: session stats on the left, the
-/// `model • effort` indicator right-aligned to the terminal width. When they
+/// `model · effort` indicator right-aligned to the terminal width. When they
 /// cannot both fit, the stats alone, truncated.
 pub fn render(placement: *const paint.Placement, info: *const Info) !void {
     if (placement.base < placement.skip) return;
@@ -153,7 +153,7 @@ test render {
     try std.testing.expect(std.mem.indexOf(u8, painted, "cache 87%") != null);
     try std.testing.expect(std.mem.indexOf(u8, painted, "$0.39 saved $0.82") != null);
     // The model and effort are right-aligned, so they land after the stats.
-    const right = std.mem.indexOf(u8, painted, "claude-opus-4-8\u{200B} • \u{200B}xhigh").?;
+    const right = std.mem.indexOf(u8, painted, "claude-opus-4-8\u{200B} · \u{200B}xhigh").?;
     try std.testing.expect(right > std.mem.indexOf(u8, painted, "ctx 21%").?);
 }
 

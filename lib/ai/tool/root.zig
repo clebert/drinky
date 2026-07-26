@@ -13,6 +13,7 @@ const write = @import("write.zig");
 const edit = @import("edit.zig");
 const find = @import("find.zig");
 const grep = @import("grep.zig");
+const bash = @import("bash.zig");
 
 const Entry = struct {
     tool: llm.Tool,
@@ -26,6 +27,7 @@ const registry = [_]Entry{
     .{ .tool = edit.spec, .run = edit.run, .mutates = true },
     .{ .tool = find.spec, .run = find.run, .mutates = false },
     .{ .tool = grep.spec, .run = grep.run, .mutates = false },
+    .{ .tool = bash.spec, .run = bash.run, .mutates = true },
 };
 
 /// The schemas of every tool, for advertising to the provider in a request.
@@ -35,9 +37,9 @@ pub const specs = blk: {
     break :blk list;
 };
 
-/// Whether tool `name` writes to the filesystem, so the agent runs it as a
-/// barrier. An unknown tool touches nothing, so it runs concurrently and just
-/// reports the unknown-tool error.
+/// Whether tool `name` may have side effects, so the agent runs it as a barrier.
+/// An unknown tool touches nothing, so it runs concurrently and just reports
+/// the unknown-tool error.
 pub fn mutates(name: []const u8) bool {
     for (registry) |entry| {
         if (std.mem.eql(u8, name, entry.tool.name)) return entry.mutates;
@@ -65,6 +67,7 @@ pub fn run(context: *const Context, name: []const u8, input_json: []const u8) !R
 test "mutating tools are marked, read-only tools are not" {
     try std.testing.expect(mutates("write"));
     try std.testing.expect(mutates("edit"));
+    try std.testing.expect(mutates("bash"));
     try std.testing.expect(!mutates("read"));
     try std.testing.expect(!mutates("grep"));
     try std.testing.expect(!mutates("nope"));

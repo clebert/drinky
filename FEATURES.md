@@ -11,7 +11,8 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 
 - A prompt runs a turn to completion: stream a reply, run its tools, feed the results back, repeat.
 - At most 50 tool rounds per turn.
-- Read-only tool calls in one reply run in parallel; a write or edit runs alone, in call order.
+- Read-only tool calls in one reply run in parallel; a mutating call — write, edit, or bash — runs
+  alone, in call order.
 - Enter during a turn queues a steering message that folds into the run at the next tool round.
 - Alt+Up pulls messages the turn has not picked up yet back into the editor to keep editing.
 - Steering left in the queue when a turn ends starts the next turn on its own.
@@ -27,7 +28,7 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 
 ## Tools
 
-- The model gets five tools: `read`, `write`, `edit`, `find`, and `grep`.
+- The model gets six tools: `read`, `write`, `edit`, `find`, `grep`, and `bash`.
 - **read** — page a UTF-8 file from a 1-indexed line offset, 2000 lines or 50 KiB per call, with a
   next-offset hint.
 - **write** — create or overwrite a file atomically.
@@ -35,6 +36,9 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - **find** — glob search under a directory, sorted by path, 1000 hits by default.
 - **grep** — literal search printing `path:line:text`, with glob and case filters, 100 hits by
   default.
+- **bash** — run a shell command in the working directory, preserving combined stdout and stderr
+  order and returning a bounded tail; a non-zero exit is reported, and output caps and the timeout
+  are configurable, the timeout also settable per call.
 - Globs use `*` and `?` within a path segment and `**` across segments.
 - Searches skip version-control and build directories.
 - Binary files are skipped, oversized files are refused, and every result says when a limit cut it
@@ -108,7 +112,7 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - A Braille "Working…" spinner runs while a turn is in flight.
 - Queued steering shows as `Steering:` rows, and becomes one user message once consumed.
 - The bottom line shows context fill, session cost, cache savings, and the last request's cache-hit
-  rate, with `model • effort` right-aligned.
+  rate, with `model · effort` right-aligned.
 - A picker is a single-choice list tagging the current value; Enter confirms, Esc, Ctrl+C, or
   Ctrl+D cancels.
 - The input frame grows to about a quarter of the screen and labels hidden rows "↑ N more" and
@@ -138,8 +142,8 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 
 ## Files & configuration
 
-- `~/.pith/config.json` is optional: request timeouts, retry policy, and a default model per
-  account.
+- `~/.pith/config.json` is optional: request timeouts, retry policy, the bash output caps and
+  timeout, and a default model per account.
 - It holds no secrets — API keys come from `ANTHROPIC_API_KEY` and `OPENAI_API_KEY`.
 - A configured model that is not valid for its account is reported, and the compiled default used.
 - `HOME` must be set, since both config and credentials live under `~/.pith`.
