@@ -176,8 +176,9 @@ fn stopAndReap(
     child.kill(io);
 }
 
-/// Rewrite output into valid UTF-8: newlines and tabs pass, carriage returns and
-/// other control bytes drop, and malformed bytes become replacement characters.
+/// Rewrite output into valid UTF-8: complete CSI terminal control sequences and
+/// other control bytes drop, newlines and tabs pass, and malformed bytes become
+/// replacement characters.
 fn sanitize(gpa: std.mem.Allocator, input: []const u8) ![]u8 {
     var output_writer: std.Io.Writer.Allocating = .init(gpa);
     errdefer output_writer.deinit();
@@ -187,6 +188,8 @@ fn sanitize(gpa: std.mem.Allocator, input: []const u8) ![]u8 {
         if (byte == '\n' or byte == '\t') {
             try output_writer.writer.writeByte(byte);
             index += 1;
+        } else if (byte == 0x1b) {
+            index = controlSequenceEnd(input, index) orelse index + 1;
         } else if (byte < 0x20 or byte == 0x7f) {
             index += 1;
         } else if (byte < 0x80) {
@@ -201,6 +204,25 @@ fn sanitize(gpa: std.mem.Allocator, input: []const u8) ![]u8 {
         }
     }
     return output_writer.toOwnedSlice();
+}
+
+/// Offset after a complete ESC-[ control sequence, or null when the bytes at
+/// `start` are another escape form, malformed, or incomplete.
+fn controlSequenceEnd(input: []const u8, start: usize) ?usize {
+    std.debug.assert(start < input.len and input[start] == 0x1b);
+    if (input.len - start < 3 or input[start + 1] != '[') return null;
+
+    var index = start + 2;
+    while (index < input.len and input[index] >= 0x30 and input[index] <= 0x3f) {
+        index += 1;
+    }
+    while (index < input.len and input[index] >= 0x20 and input[index] <= 0x2f) {
+        index += 1;
+    }
+    if (index < input.len and input[index] >= 0x40 and input[index] <= 0x7e) {
+        return index + 1;
+    }
+    return null;
 }
 
 /// The byte length of the valid UTF-8 sequence starting at `index`, or null when
@@ -431,6 +453,22 @@ test "sanitize keeps text, drops controls, and replaces invalid bytes" {
     const clean = try sanitize(gpa, &input);
     defer gpa.free(clean);
     try std.testing.expectEqualStrings("a\tb\n" ++ replacement ++ "!", clean);
+}
+
+test "sanitize strips complete terminal control sequences" {
+    const gpa = std.testing.allocator;
+    const input = "\x1b[1mBACKLOG.md:1:1: \x1b[31merror:\x1b[0m " ++
+        "\x1b[?25lhidden cursor\x1b[2 q";
+    const clean = try sanitize(gpa, input);
+    defer gpa.free(clean);
+    try std.testing.expectEqualStrings("BACKLOG.md:1:1: error: hidden cursor", clean);
+}
+
+test "sanitize preserves malformed terminal control sequence tails" {
+    const gpa = std.testing.allocator;
+    const clean = try sanitize(gpa, "\x1b[ 3m\n\x1b[31");
+    defer gpa.free(clean);
+    try std.testing.expectEqualStrings("[ 3m\n[31", clean);
 }
 
 test "tailStart keeps the last lines within the line budget" {
