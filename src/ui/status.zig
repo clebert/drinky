@@ -20,6 +20,10 @@ pub const Info = struct {
     /// Whether an account is active. When false the right side reads "not signed
     /// in" instead of the model and effort, which are then unusable.
     signed_in: bool,
+    /// A subscription's remaining allowance, or null when the active provider
+    /// reports none (an API key, or a non-subscription turn). Each window whose
+    /// duration identifies it shows on the left as `<label> N% left`.
+    quota: ?ai.llm.Quota,
 };
 
 /// The right-side indicator shown while no account is active.
@@ -34,8 +38,8 @@ const separator = " · ";
 pub fn render(placement: *const paint.Placement, info: *const Info) !void {
     if (placement.base < placement.skip) return;
 
-    // Sized so `catch unreachable` is sound: the percent, token, and cost formats
-    // produce at most a few dozen characters for any input.
+    // Sized so `catch unreachable` is sound: the percent, token, cost, and quota
+    // formats produce at most a few dozen characters for any input.
     var scratch: [512]u8 = undefined;
     var stats: std.Io.Writer = .fixed(&scratch);
     writeStats(&stats, info) catch unreachable;
@@ -95,6 +99,39 @@ fn writeStats(out: *std.Io.Writer, info: *const Info) !void {
     // reveal billing). Shown once a cache read has actually paid off.
     try out.print(" · ${d:.2}", .{info.cost});
     if (info.saved > 0) try out.print(" saved ${d:.2}", .{info.saved});
+
+    // A subscription's remaining allowance, one segment per window identified
+    // by its length, as the share left rather than used.
+    if (info.quota) |quota| {
+        try writeQuotaWindow(out, quota.primary);
+        try writeQuotaWindow(out, quota.secondary);
+    }
+}
+
+/// Append one identified quota window as ` · <label> N% left`, or nothing when
+/// absent or when its duration does not identify it.
+fn writeQuotaWindow(out: *std.Io.Writer, maybe_window: ?ai.llm.Quota.Window) !void {
+    const window = maybe_window orelse return;
+    const label = quotaLabel(window.window_minutes) orelse return;
+    const remaining = @max(0.0, @min(100.0, 100.0 - window.used_percent));
+    try out.print(" · {s} {d:.0}% left", .{ label, remaining });
+}
+
+/// A human label for a rolling window, keyed off its length in minutes; the
+/// ChatGPT plans use 5h and weekly windows. Unrecognized or absent lengths stay
+/// hidden rather than being presented as an allowance we cannot identify.
+fn quotaLabel(maybe_minutes: ?u32) ?[]const u8 {
+    const minutes = maybe_minutes orelse return null;
+    if (approxWindow(minutes, 300)) return "5h";
+    if (approxWindow(minutes, 10080)) return "weekly";
+    return null;
+}
+
+/// Whether `minutes` falls within 5% of `target`, matching how the backend's
+/// window lengths drift slightly around their nominal values.
+fn approxWindow(minutes: u32, target: u32) bool {
+    const tolerance = @divFloor(target, 20);
+    return minutes >= target - tolerance and minutes <= target + tolerance;
 }
 
 /// `count` in `k`/`M` shorthand, matching pi's footer thresholds.
@@ -140,6 +177,7 @@ test render {
         .model = "claude-opus-4-8",
         .effort = "xhigh",
         .signed_in = true,
+        .quota = null,
     };
 
     const sink = try view.beginFrame(.{ .columns = 120, .rows = 24 }, 4);
@@ -171,6 +209,7 @@ test "a signed-out status shows the indicator in place of the model" {
         .model = "claude-opus-4-8",
         .effort = "xhigh",
         .signed_in = false,
+        .quota = null,
     };
 
     const sink = try view.beginFrame(.{ .columns = 120, .rows = 24 }, 4);
@@ -184,4 +223,89 @@ test "a signed-out status shows the indicator in place of the model" {
     try std.testing.expect(std.mem.indexOf(u8, painted, "claude-opus-4-8") == null);
     // No prompt tokens sent yet: the cache figure is absent, never a 0/0 rate.
     try std.testing.expect(std.mem.indexOf(u8, painted, "cache") == null);
+}
+
+test "quota windows show the remaining allowance, labeled by length" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var view = terminal.View.init(gpa, &out.writer);
+    defer view.deinit();
+    const info: Info = .{
+        .last = .{},
+        .cost = 0,
+        .saved = 0,
+        .context_window = 400_000,
+        .model = "gpt-5.6-sol",
+        .effort = "medium",
+        .signed_in = true,
+        .quota = .{
+            .primary = .{ .used_percent = 11.6, .window_minutes = 300 },
+            .secondary = .{ .used_percent = 73.6, .window_minutes = 10080 },
+        },
+    };
+
+    const sink = try view.beginFrame(.{ .columns = 160, .rows = 24 }, 4);
+    const placement: paint.Placement =
+        .{ .sink = sink, .id = 0, .columns = 160, .base = 0, .skip = 0 };
+    try render(&placement, &info);
+    try view.render();
+
+    const painted = out.written();
+    try std.testing.expect(std.mem.indexOf(u8, painted, "5h 88% left") != null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "weekly 26% left") != null);
+}
+
+test "a quota with a single window omits the absent one" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var view = terminal.View.init(gpa, &out.writer);
+    defer view.deinit();
+    const info: Info = .{
+        .last = .{},
+        .cost = 0,
+        .saved = 0,
+        .context_window = 400_000,
+        .model = "gpt-5.6-sol",
+        .effort = "medium",
+        .signed_in = true,
+        .quota = .{ .secondary = .{ .used_percent = 73.6, .window_minutes = 10080 } },
+    };
+
+    const sink = try view.beginFrame(.{ .columns = 160, .rows = 24 }, 4);
+    const placement: paint.Placement =
+        .{ .sink = sink, .id = 0, .columns = 160, .base = 0, .skip = 0 };
+    try render(&placement, &info);
+    try view.render();
+
+    const painted = out.written();
+    try std.testing.expect(std.mem.indexOf(u8, painted, "weekly 26% left") != null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "5h") == null);
+}
+
+test "unidentified quota windows stay hidden beside a known window" {
+    var buffer: [256]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&buffer);
+    const info: Info = .{
+        .last = .{},
+        .cost = 0,
+        .saved = 0,
+        .context_window = 400_000,
+        .model = "gpt-5.6-sol",
+        .effort = "medium",
+        .signed_in = true,
+        .quota = .{
+            .primary = .{ .used_percent = 77, .window_minutes = 10080 },
+            .secondary = .{ .used_percent = 0 },
+        },
+    };
+
+    try writeStats(&out, &info);
+    const written = out.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "weekly 23% left") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "100% left") == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "quota") == null);
+    try std.testing.expect(quotaLabel(null) == null);
+    try std.testing.expect(quotaLabel(600) == null);
 }

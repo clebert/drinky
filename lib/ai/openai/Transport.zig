@@ -60,6 +60,9 @@ pub const Stream = struct {
     /// neutral history.
     completed_item_ids: std.StringHashMapUnmanaged(void),
     usage: llm.Usage,
+    /// Subscription allowance from the response head, or null when the backend
+    /// sent no quota headers (API-key mode, or none present).
+    quota: ?llm.Quota,
     decompress: std.http.Decompress,
     decompress_buffer: []u8,
     /// Backs the request's runtime headers, which must outlive the send phase
@@ -93,6 +96,19 @@ pub const Stream = struct {
         var ids = self.completed_item_ids.keyIterator();
         while (ids.next()) |id| self.gpa.free(id.*);
         self.completed_item_ids.deinit(self.gpa);
+    }
+
+    /// Capture the subscription allowance from the response head, called by the
+    /// engine while the head is still valid. Null on any backend that omits the
+    /// Codex quota headers.
+    pub fn captureHead(self: *Stream, head: *const std.http.Client.Response.Head) void {
+        self.quota = parseQuota(head);
+    }
+
+    /// The subscription allowance captured from the response head (see
+    /// `captureHead`), or null on an API-key stream or a head that sent none.
+    pub fn quotaSoFar(self: *const Stream) ?llm.Quota {
+        return self.quota;
     }
 
     /// Latch a rejection, `unsupported` winning over `invalid` however they
@@ -152,6 +168,11 @@ pub const Stream = struct {
             self.markRejection(.invalid);
             return;
         };
+        // The Codex subscription backend closes with an empty output snapshot
+        // under store:false rather than echoing the streamed items. Done frames
+        // are independently authoritative, so an empty snapshot is no
+        // disagreement — only a populated one is worth cross-checking.
+        if (output.items.len == 0) return;
         var terminal_ids: std.StringHashMapUnmanaged(void) = .empty;
         for (output.items) |value| {
             const item = json.object(value) orelse {
@@ -373,6 +394,7 @@ fn connect(self: *Transport, out: *Stream, payload: Payload) anyerror!void {
     out.terminal_rejection = null;
     out.incomplete_message = false;
     out.completed_item_ids = .empty;
+    out.quota = null;
 
     const authorization = try std.fmt.allocPrint(self.gpa, "Bearer {s}", .{payload.access_token});
     defer self.gpa.free(authorization);
@@ -450,6 +472,49 @@ fn mergeUsage(usage: *llm.Usage, object: std.json.ObjectMap) void {
     if (json.unsigned(object.get("output_tokens"))) |value| usage.output = value;
 }
 
+/// Parse the Codex subscription allowance from the response head. A window is
+/// present only when its `used-percent` header is; it may carry no
+/// `window-minutes`. Null when the head has no quota headers at all — an API-key
+/// response, or a backend that sends none.
+fn parseQuota(head: *const std.http.Client.Response.Head) ?llm.Quota {
+    var primary_used: ?f64 = null;
+    var primary_minutes: ?u32 = null;
+    var secondary_used: ?f64 = null;
+    var secondary_minutes: ?u32 = null;
+    var headers = head.iterateHeaders();
+    while (headers.next()) |header| {
+        const value = std.mem.trim(u8, header.value, " \t");
+        if (std.ascii.eqlIgnoreCase(header.name, "x-codex-primary-used-percent")) {
+            primary_used = parseQuotaPercent(value);
+        } else if (std.ascii.eqlIgnoreCase(header.name, "x-codex-primary-window-minutes")) {
+            primary_minutes = std.fmt.parseInt(u32, value, 10) catch null;
+        } else if (std.ascii.eqlIgnoreCase(header.name, "x-codex-secondary-used-percent")) {
+            secondary_used = parseQuotaPercent(value);
+        } else if (std.ascii.eqlIgnoreCase(header.name, "x-codex-secondary-window-minutes")) {
+            secondary_minutes = std.fmt.parseInt(u32, value, 10) catch null;
+        }
+    }
+    const primary: ?llm.Quota.Window = if (primary_used) |used|
+        .{ .used_percent = used, .window_minutes = primary_minutes }
+    else
+        null;
+    const secondary: ?llm.Quota.Window = if (secondary_used) |used|
+        .{ .used_percent = used, .window_minutes = secondary_minutes }
+    else
+        null;
+    if (primary == null and secondary == null) return null;
+    return .{ .primary = primary, .secondary = secondary };
+}
+
+/// Decode a percentage only inside its finite semantic range. `parseFloat`
+/// accepts NaN and infinities, which must not turn malformed provider data into
+/// a plausible remaining-allowance gauge.
+fn parseQuotaPercent(value: []const u8) ?f64 {
+    const percent = std.fmt.parseFloat(f64, value) catch return null;
+    if (!std.math.isFinite(percent) or percent < 0 or percent > 100) return null;
+    return percent;
+}
+
 /// A stream over `body` for the tests: test allocator, fresh decode state, and
 /// the given window and budget; the connection fields stay undefined. Pair with
 /// `defer stream.deinitDecode()` to free whatever decoding retains.
@@ -475,7 +540,77 @@ fn testStreamWithAllocator(
     stream.incomplete_message = false;
     stream.completed_item_ids = .empty;
     stream.usage = .{};
+    stream.quota = null;
     return stream;
+}
+
+test parseQuota {
+    const both = "HTTP/1.1 200 OK\r\n" ++
+        "x-codex-primary-used-percent: 11.5\r\n" ++
+        "x-codex-primary-window-minutes: 300\r\n" ++
+        "x-codex-secondary-used-percent: 74\r\n" ++
+        "x-codex-secondary-window-minutes: 10080\r\n" ++
+        "content-length:0\r\n\r\n";
+    const both_head = try std.http.Client.Response.Head.parse(both);
+    const quota = parseQuota(&both_head).?;
+    try std.testing.expectEqual(@as(f64, 11.5), quota.primary.?.used_percent);
+    try std.testing.expectEqual(@as(?u32, 300), quota.primary.?.window_minutes);
+    try std.testing.expectEqual(@as(f64, 74), quota.secondary.?.used_percent);
+    try std.testing.expectEqual(@as(?u32, 10080), quota.secondary.?.window_minutes);
+
+    // A $20 plan reports only the weekly window: the other slot stays null.
+    const weekly = "HTTP/1.1 200 OK\r\n" ++
+        "x-codex-secondary-used-percent: 74\r\n" ++
+        "x-codex-secondary-window-minutes: 10080\r\n" ++
+        "content-length:0\r\n\r\n";
+    const weekly_head = try std.http.Client.Response.Head.parse(weekly);
+    const weekly_quota = parseQuota(&weekly_head).?;
+    try std.testing.expect(weekly_quota.primary == null);
+    try std.testing.expectEqual(@as(f64, 74), weekly_quota.secondary.?.used_percent);
+
+    // A used-percent with no window-minutes is retained but cannot be labeled.
+    const no_minutes = "HTTP/1.1 200 OK\r\n" ++
+        "x-codex-primary-used-percent: 5\r\n" ++
+        "content-length:0\r\n\r\n";
+    const no_minutes_head = try std.http.Client.Response.Head.parse(no_minutes);
+    const partial = parseQuota(&no_minutes_head).?;
+    try std.testing.expectEqual(@as(f64, 5), partial.primary.?.used_percent);
+    try std.testing.expectEqual(@as(?u32, null), partial.primary.?.window_minutes);
+
+    // No quota headers: null, so a non-subscription response shows nothing.
+    const none_head = try std.http.Client.Response.Head.parse(
+        "HTTP/1.1 200 OK\r\ncontent-length:0\r\n\r\n",
+    );
+    try std.testing.expect(parseQuota(&none_head) == null);
+}
+
+test "quota percentages reject non-finite and out-of-range values" {
+    try std.testing.expectEqual(@as(?f64, 0), parseQuotaPercent("0"));
+    try std.testing.expectEqual(@as(?f64, 100), parseQuotaPercent("100"));
+    try std.testing.expect(parseQuotaPercent("nan") == null);
+    try std.testing.expect(parseQuotaPercent("inf") == null);
+    try std.testing.expect(parseQuotaPercent("-inf") == null);
+    try std.testing.expect(parseQuotaPercent("-0.1") == null);
+    try std.testing.expect(parseQuotaPercent("100.1") == null);
+    try std.testing.expect(parseQuotaPercent("not-a-number") == null);
+}
+
+test "an empty terminal output snapshot does not reject the streamed reply" {
+    var stream = testStream(undefined, undefined, 0, 0);
+    defer stream.deinitDecode();
+    // The message arrives as its own authoritative done frame.
+    const message = try stream.decode(
+        \\{"type":"response.output_item.done","item":{"id":"msg_1","type":"message","status":"completed","content":[{"type":"output_text","text":"Hello!"}],"role":"assistant"}}
+    );
+    try std.testing.expectEqualStrings("Hello!", message.event.item.message);
+    _ = stream.frame_arena.reset(.retain_capacity);
+    // The Codex subscription backend closes with an empty output snapshot under
+    // store:false; the reply still stands rather than being rejected as invalid.
+    const stop = try stream.decode(
+        \\{"type":"response.completed","response":{"status":"completed","output":[],"usage":{"input_tokens":5,"output_tokens":2}}}
+    );
+    try std.testing.expectEqual(llm.Event.Status.complete, stop.event.stop.status);
+    try std.testing.expect(stop.event.stop.rejection == null);
 }
 
 test "display deltas and completed messages stay separate" {

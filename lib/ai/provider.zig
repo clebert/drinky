@@ -148,6 +148,15 @@ pub const Stream = union(llm.Account) {
             inline else => |*stream| stream.usageSoFar(),
         };
     }
+
+    /// The subscription allowance the response head reported, or null when the
+    /// account or backend sends none. Valid as soon as the head is read, so it
+    /// outlives a stream that errors or is cancelled before its stop event.
+    pub fn quotaSoFar(self: *const Stream) ?llm.Quota {
+        return switch (self.*) {
+            inline else => |*stream| stream.quotaSoFar(),
+        };
+    }
 };
 
 test "init selects the arm matching the credentials" {
@@ -173,4 +182,14 @@ test "usageSoFar reads accumulated usage through the stream seam" {
     try std.testing.expectEqual(@as(u64, 7), stream.usageSoFar().input);
     try std.testing.expectEqual(@as(u64, 3), stream.usageSoFar().output);
     try std.testing.expectEqual(@as(u64, 90), stream.usageSoFar().cache_read);
+}
+
+test "quotaSoFar reads the head allowance through the stream seam" {
+    var codex: Stream = .{ .openai_subscription = undefined };
+    codex.openai_subscription.quota = .{ .primary = .{ .used_percent = 40, .window_minutes = 300 } };
+    try std.testing.expectEqual(@as(f64, 40), codex.quotaSoFar().?.primary.?.used_percent);
+
+    // Anthropic surfaces no subscription allowance through the seam.
+    const claude: Stream = .{ .anthropic_subscription = undefined };
+    try std.testing.expect(claude.quotaSoFar() == null);
 }

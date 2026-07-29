@@ -217,6 +217,7 @@ const test_status: ui.status.Info = .{
     .model = "footerqq",
     .effort = "high",
     .signed_in = true,
+    .quota = null,
 };
 
 // Projects `scene` into a fresh view at `size` and returns the frame's bytes,

@@ -115,8 +115,8 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
   first line of its output.
 - A Braille "Working…" spinner runs while a turn is in flight.
 - Queued steering shows as `Steering:` rows, and becomes one user message once consumed.
-- The bottom line shows context fill, session cost, cache savings, and the last request's cache-hit
-  rate, with `model · effort` right-aligned.
+- The bottom line shows context fill, session cost, cache savings, the last request's cache-hit
+  rate, and any OpenAI-subscription quota remaining, with `model · effort` right-aligned.
 - A picker is a single-choice list tagging the current value; Enter confirms, Esc, Ctrl+C, or Ctrl+D
   cancels.
 - The input frame grows to about a quarter of the screen and labels hidden rows "↑ N more" and "↓ N

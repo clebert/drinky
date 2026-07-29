@@ -265,6 +265,21 @@ test "accumulated usage saturates rather than overflowing on absurd counts" {
     try std.testing.expectEqual(ceiling, total.cache_write);
 }
 
+/// A subscription account's remaining allowance, read from the provider's
+/// response head. Each window is optional and independent; classify one by its
+/// length (`window_minutes` ≈ 300 → a 5h window, ≈ 10080 → weekly). Absent for
+/// API-key accounts and any provider that reports no quota. `used_percent` runs
+/// 0–100, so the remaining share is `100 - used_percent`.
+pub const Quota = struct {
+    primary: ?Window = null,
+    secondary: ?Window = null,
+
+    pub const Window = struct {
+        used_percent: f64,
+        window_minutes: ?u32 = null,
+    };
+};
+
 /// A decoded part of a streamed assistant reply. Display deltas are kept
 /// separate from completed conversation items: transports own their native
 /// block/item lifecycles and emit an `item` only after the wire closes it.

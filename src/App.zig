@@ -995,6 +995,10 @@ fn applyOutcome(self: *App, outcome: ai.command.Outcome) !void {
         },
         else => try self.session.applyOutcome(outcome),
     }
+    // Commands can switch or drop the active account. Mirror the authoritative
+    // agent snapshot so an allowance cleared by that transition disappears at
+    // the same time as the account changes.
+    self.session.stats_shown = self.agent.stats;
     self.session.model_shown = self.agent.model;
     self.session.effort_shown = self.agent.effort;
     self.session.signed_in = self.signedIn();
@@ -2684,6 +2688,43 @@ test "/new clears conversation state without changing the active configuration" 
     try std.testing.expectEqualStrings("", app.session.editor.visible());
     try std.testing.expectEqualStrings(anthropic_default.name, app.agent.model.name);
     try std.testing.expectEqual(ai.llm.Effort.high, app.agent.effort);
+}
+
+test "an account-switch command clears the session's quota snapshot" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    const anthropic_client = ai.provider.Client.init(
+        gpa,
+        io,
+        .{ .anthropic_subscription = undefined },
+        .{},
+    );
+    var app: App = undefined;
+    app.gpa = gpa;
+    app.agent = ai.Agent.init(gpa, io, anthropic_client, .{
+        .model = anthropic_default,
+        .system = "",
+        .retry = .{},
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+
+    app.agent.stats.quota = .{
+        .secondary = .{ .used_percent = 77, .window_minutes = 10080 },
+    };
+    app.session.stats_shown = app.agent.stats;
+
+    const openai_client = ai.provider.Client.init(gpa, io, .{ .openai_api = "sk-test" }, .{});
+    app.agent.switchTo(openai_client, openai_default);
+    try app.applyOutcome(try ai.command.Outcome.report(gpa, .ok, "switched", .{}));
+
+    try std.testing.expect(app.agent.stats.quota == null);
+    try std.testing.expect(app.session.stats_shown.quota == null);
+    try std.testing.expectEqualStrings(openai_default.name, app.session.model_shown.name);
 }
 
 // Signed out, a normal message must be refused with a /login prompt rather

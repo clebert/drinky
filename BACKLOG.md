@@ -87,9 +87,8 @@ on another item. Module layout and extension seams live in `AGENTS.md`.
       per request, history must stay byte-stable for cache hits, and a cancelled turn's reply is
       rolled back out of history. Cancelled and failed turns get their own entries, so cost survives
       `/handoff` compaction._
-- [ ] **Remaining subscription quota** — the status line shows how much of an OpenAI subscription's
-      allowance is left. _Nothing reads rate-limit or quota data today, so this starts by finding
-      out what the Codex backend actually returns._
+- [x] **Remaining subscription quota** — the status line shows how much of an OpenAI subscription's
+      allowance is left.
 - [ ] **Runtime model catalog** — an optional `~/.pith/models.json` overrides or extends the
       compiled model table without a rebuild. _Compiled defaults stay authoritative, so a known
       model always has a known context window; the file only patches or adds._

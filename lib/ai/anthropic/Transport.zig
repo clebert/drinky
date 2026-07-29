@@ -101,6 +101,11 @@ pub const Stream = struct {
     pub const usageSoFar = engine.usageSoFar;
     pub const next = engine.next;
 
+    /// Anthropic surfaces no subscription allowance, so the seam reports none.
+    pub fn quotaSoFar(_: *const Stream) ?llm.Quota {
+        return null;
+    }
+
     pub fn deinitDecode(self: *Stream) void {
         self.frame_arena.deinit();
         self.block_text.deinit(self.gpa);

@@ -591,6 +591,7 @@ pub fn paint(self: *Session, size: terminal.View.Size) !void {
         .model = self.model_shown.name,
         .effort = @tagName(self.effort_shown),
         .signed_in = self.signed_in,
+        .quota = self.stats_shown.quota,
     };
 
     const tail: layout.Tail = switch (self.mode) {

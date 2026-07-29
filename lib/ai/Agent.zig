@@ -51,14 +51,21 @@ steering: Steering,
 /// turn shares it until a deliberate reset rotates it.
 cache_key: [32]u8,
 
-/// Cumulative session cost and cache savings, plus the last message's usage for
-/// the gauges. Each message is priced against the model that produced it, so the
-/// totals stay correct across a mid-session `/model` switch. A plain value type:
-/// it copies whole across the UI channel.
+/// Cumulative session cost and cache savings, plus the last message's usage and
+/// the latest subscription allowance for the gauges. Each message is priced
+/// against the model that produced it, so the totals stay correct across a
+/// mid-session `/model` switch. A plain value type: it copies whole across the
+/// UI channel.
 pub const Stats = struct {
     cost: f64 = 0,
     saved: f64 = 0,
     last: llm.Usage = .{},
+    /// The active subscription account's remaining allowance, adopted from each
+    /// response head that carries one — even a head whose stream then errors or
+    /// is cancelled, so an exhausted 429 still updates it. A head that omits one
+    /// leaves it unchanged; null until a head reports one, and cleared on an
+    /// account switch. API-key accounts report none.
+    quota: ?llm.Quota = null,
     by_model: [by_model_max]ByModel = [_]ByModel{.{}} ** by_model_max,
     model_count: usize = 0,
 
@@ -269,14 +276,22 @@ pub fn resetConversation(self: *Agent) void {
 /// atomic step — a model is never paired with a foreign vendor's client.
 /// History is untouched; the new account drops reasoning it did not produce.
 pub fn switchTo(self: *Agent, client: provider.Client, model: models.Model) void {
+    const account_changed = if (self.client) |active|
+        active.account() != client.account()
+    else
+        true;
     self.client = client;
     self.model = model;
+    // An allowance belongs to the account whose response reported it. Session
+    // totals span account switches, but this point-in-time gauge must not.
+    if (account_changed) self.stats.quota = null;
 }
 
 /// Drop the active account, leaving the agent signed out; `model` is kept as
-/// the last-shown value.
+/// the last-shown value and account-specific allowance is forgotten.
 pub fn signOut(self: *Agent) void {
     self.client = null;
+    self.stats.quota = null;
 }
 
 /// Remove replay proofs produced by one account slot. A successful credential
@@ -515,6 +530,12 @@ fn fetchReply(
             return err;
         };
         defer stream.deinit();
+        // The response head carries the subscription allowance before any events,
+        // so adopt it as soon as the stream is established: a stream that then
+        // errors, is cancelled, or never reaches its terminal `.stop` still
+        // updates the gauge — most visibly an exhausted 429 reporting a spent
+        // account. A head that reports none leaves the last-known allowance.
+        if (stream.quotaSoFar()) |quota| self.stats.quota = quota;
 
         if (!stream.ok()) {
             if (stream.retryable() and attempt < self.retry.attempts_max) {
@@ -999,6 +1020,35 @@ test "resetConversation clears conversation state and preserves configuration" {
     try std.testing.expectEqual(llm.Effort.high, agent.effort);
 }
 
+test "an account change or sign-out clears the previous account's quota" {
+    const gpa = std.testing.allocator;
+    var agent = scriptedAgent(gpa);
+    defer agent.deinit();
+
+    const same_account = agent.client.?;
+    const sonnet = models.get(.anthropic, "claude-sonnet-4-6").?;
+    agent.stats.quota = .{ .primary = .{ .used_percent = 25, .window_minutes = 300 } };
+
+    // A model change within one account keeps that account's latest allowance.
+    agent.switchTo(same_account, sonnet);
+    try std.testing.expect(agent.stats.quota != null);
+
+    // Crossing accounts must not present the old account's allowance as current.
+    const openai_client = provider.Client.init(
+        gpa,
+        std.testing.io,
+        .{ .openai_api = "sk-test" },
+        .{},
+    );
+    const openai_model = models.get(.openai, "gpt-5.6-sol").?;
+    agent.switchTo(openai_client, openai_model);
+    try std.testing.expect(agent.stats.quota == null);
+
+    agent.stats.quota = .{ .secondary = .{ .used_percent = 75, .window_minutes = 10080 } };
+    agent.signOut();
+    try std.testing.expect(agent.stats.quota == null);
+}
+
 test "usage is attributed to the model that produced it across a switch" {
     const gpa = std.testing.allocator;
     const sonnet = models.get(.anthropic, "claude-sonnet-4-6").?;
@@ -1063,6 +1113,7 @@ const ScriptedStream = struct {
     index: usize = 0,
     terminal_error: ?anyerror = null,
     usage_so_far: llm.Usage = .{},
+    quota: ?llm.Quota = null,
     head_ok: bool = true,
     head_retryable: bool = false,
     retry_after_ms: ?u64 = null,
@@ -1099,6 +1150,10 @@ const ScriptedStream = struct {
 
     fn usageSoFar(self: *const ScriptedStream) llm.Usage {
         return self.usage_so_far;
+    }
+
+    fn quotaSoFar(self: *const ScriptedStream) ?llm.Quota {
+        return self.quota;
     }
 };
 
@@ -1402,6 +1457,7 @@ fn openaiStream(io: std.Io, reader: *std.Io.Reader) provider.Stream {
     stream.openai_api.incomplete_message = false;
     stream.openai_api.completed_item_ids = .empty;
     stream.openai_api.usage = .{};
+    stream.openai_api.quota = null;
     return stream;
 }
 
@@ -2847,6 +2903,39 @@ test "an API error retains completed rounds, reports, and fails the turn" {
         try std.testing.expectEqual(@as(usize, 1), head_fetch.sends);
         try std.testing.expectEqualStrings("denied", handler.errors.items);
         try std.testing.expectEqual(@as(usize, 0), agent.items.items.len);
+    }
+}
+
+test "a failed or cancelled attempt still adopts the head's allowance" {
+    const gpa = std.testing.allocator;
+    const exhausted: llm.Quota = .{ .primary = .{ .used_percent = 100, .window_minutes = 300 } };
+
+    // An exhausted 429 emits no stop event, but its head reported the spent
+    // account: the gauge must show that, not the previous allowance.
+    {
+        var agent = scriptedAgent(gpa);
+        defer agent.deinit();
+        var handler: CaptureHandler = .{ .gpa = gpa };
+        defer handler.deinit();
+        var fetch: ScriptedFetch = .{ .attempts = &.{
+            .{ .stream = .{ .events = &.{}, .head_ok = false, .quota = exhausted } },
+        } };
+        try std.testing.expectError(error.ApiError, agent.runWith(&fetch, "go", &handler));
+        try std.testing.expectEqual(@as(f64, 100), agent.stats.quota.?.primary.?.used_percent);
+    }
+
+    // A cancel interrupts the read before its stop, yet the head's allowance was
+    // already captured.
+    {
+        var agent = scriptedAgent(gpa);
+        defer agent.deinit();
+        var handler: CaptureHandler = .{ .gpa = gpa };
+        defer handler.deinit();
+        var fetch: ScriptedFetch = .{ .attempts = &.{
+            .{ .stream = .{ .events = &.{}, .terminal_error = error.Canceled, .quota = exhausted } },
+        } };
+        try std.testing.expectError(error.Canceled, agent.runWith(&fetch, "go", &handler));
+        try std.testing.expectEqual(@as(f64, 100), agent.stats.quota.?.primary.?.used_percent);
     }
 }
 

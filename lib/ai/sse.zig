@@ -29,8 +29,10 @@ pub const Decoded = union(enum) {
 /// `error_length`, `retry_after_ms`, `frame_arena`, `usage`, `decompress`,
 /// `decompress_buffer`, `error_buffer`, `redirect_buffer`, `transfer_buffer`)
 /// plus `deinitDecode()` for stream-lifetime decode state and
-/// `decode(payload) !Decoded`. The engine resets `frame_arena` before each SSE
-/// frame, so returned events may borrow a parse until the next read.
+/// `decode(payload) !Decoded`, and an optional `captureHead(*const Head)` hook
+/// the engine calls while the response head is still valid, for provider-specific
+/// header capture. The engine resets `frame_arena` before each SSE frame, so
+/// returned events may borrow a parse until the next read.
 pub fn Engine(comptime S: type) type {
     return struct {
         pub fn deinit(stream: *S) void {
@@ -123,6 +125,7 @@ pub fn Engine(comptime S: type) type {
             stream.status = stream.response.head.status;
             // Read the head's headers now: creating the body reader invalidates them.
             stream.retry_after_ms = retryAfter(stream.response.head);
+            if (@hasDecl(S, "captureHead")) stream.captureHead(&stream.response.head);
             stream.decompress_buffer = try net.decompressBuffer(
                 stream.gpa,
                 stream.response.head.content_encoding,
