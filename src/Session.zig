@@ -67,9 +67,9 @@ steering_consumed_count: usize,
 /// visible text — rebuilt each paint so the tail gets a `[]const []const u8`
 /// without a per-repaint allocation.
 steering_view: std.ArrayList([]const u8),
-/// The submitted prompt's rich draft, retained while a turn is live. A cancel
-/// that committed nothing returns it to the editor; every other exit frees it
-/// because the prompt remains visible as history or alongside failure feedback.
+/// The submitted prompt's rich draft, retained while a turn is live. A failed
+/// or cancelled turn that committed nothing returns it to the editor; every
+/// other terminal frees it because the prompt belongs to committed history.
 turn_origin: ?TurnOrigin,
 
 const Mode = union(enum) {
@@ -414,7 +414,7 @@ pub fn recallSteering(self: *Session, pending_count: usize) void {
 }
 
 /// Retain the submitted prompt's rich draft and set the turn's initial transcript
-/// checkpoint, so a cancel that commits nothing can rewind and return the prompt.
+/// checkpoint, so an abnormal exit that commits nothing can return the prompt.
 /// Takes ownership of `prompt`, leaving it empty.
 pub fn retainTurnPrompt(self: *Session, prompt: *ui.Editor.Draft, transcript_base: usize) void {
     std.debug.assert(self.turn_origin == null);
@@ -425,9 +425,8 @@ pub fn retainTurnPrompt(self: *Session, prompt: *ui.Editor.Draft, transcript_bas
     prompt.* = .empty;
 }
 
-/// Drop the live turn's rewind anchor, freeing the retained prompt draft. Used on
-/// every exit that keeps the prompt on screen — a normal completion (committed
-/// history), a reported failure, or a cancel that committed rounds.
+/// Drop the live turn's rewind anchor, freeing the retained prompt draft after
+/// it has either entered committed history or moved back into the editor.
 fn dropTurnOrigin(self: *Session) void {
     if (self.turn_origin) |*origin| {
         origin.prompt.deinit(self.gpa);
@@ -436,13 +435,25 @@ fn dropTurnOrigin(self: *Session) void {
 }
 
 /// Preflight editor capacity to put the returned prompt and every uncommitted
-/// steering draft above the in-progress line, so `cancelReceipt` cannot fail after
-/// the worker is already canceled. The prompt is reserved before the receipt says
-/// whether it will return, so a partial commit intentionally over-reserves.
+/// steering draft above the in-progress line, so abnormal receipt reconciliation
+/// cannot fail. The prompt is reserved before the receipt says whether it will
+/// return, so a partial commit intentionally over-reserves.
 pub fn reserveSteeringRestore(self: *Session) !void {
     const lead: ?*const ui.Editor.Draft =
         if (self.turn_origin) |*origin| &origin.prompt else null;
     try self.editor.reserveComposition(lead, self.steering.items);
+}
+
+/// Preflight only the drafts a known failed receipt will restore, avoiding
+/// capacity for an origin or steering prefix already committed to history.
+pub fn reserveFailureRestore(self: *Session, receipt: *const ai.Agent.Receipt) !void {
+    const committed = receipt.history_end != receipt.history_base;
+    var lead: ?*const ui.Editor.Draft = null;
+    if (!committed) {
+        if (self.turn_origin) |*origin| lead = &origin.prompt;
+    }
+    const steering_start = @min(receipt.steering_committed_count, self.steering.items.len);
+    try self.editor.reserveComposition(lead, self.steering.items[steering_start..]);
 }
 
 /// Whether any rich steering record remains live or retained in flight.
@@ -495,25 +506,32 @@ pub fn abortTurn(self: *Session) !void {
     try self.transcript.append(.feedback, false, "cancelled");
 }
 
-/// Apply a terminal receipt and end the turn on a normal completion or failure:
-/// resolve the committed steering prefix (infallible, so ownership is settled
-/// first) before the fallible feedback appends, in the order the turn produced
-/// them — a cut-off reply, then any failure. Borrows `error_text`; the caller
-/// frees it.
-pub fn endTurnWithReceipt(
+/// Apply a completed turn's receipt, append any cutoff notice, and end it. Late
+/// steering remains pending so the app can promote it into a successor turn.
+pub fn endTurnWithReceipt(self: *Session, receipt: *const ai.Agent.Receipt) !void {
+    self.applyReceiptNormal(receipt);
+    self.dropTurnOrigin();
+    if (receipt.truncated) try self.transcript.append(.feedback, false, truncated_notice);
+    self.transcript.endMessage();
+    self.endTurn();
+}
+
+/// Rewind a failed turn to committed history, return every uncommitted draft,
+/// append its feedback, and end it. Infallible after `reserveFailureRestore`
+/// until the feedback append. Borrows `error_text`; the caller frees it.
+pub fn failTurnWithReceipt(
     self: *Session,
     receipt: *const ai.Agent.Receipt,
     error_text: ?[]const u8,
 ) !void {
-    self.applyReceiptNormal(receipt);
-    self.dropTurnOrigin();
+    self.reconcileAbnormalReceipt(receipt);
     if (receipt.truncated) try self.transcript.append(.feedback, false, truncated_notice);
     if (error_text) |text| try self.transcript.append(.feedback, true, text);
     self.transcript.endMessage();
     self.endTurn();
 }
 
-/// Resolve the rich steering mirror on a normal terminal: drop the committed
+/// Resolve the rich steering mirror on a completed terminal: drop the committed
 /// prefix (now in history) and make every remaining draft pending again, so
 /// late-steering handling can start it as a new turn. Infallible.
 fn applyReceiptNormal(self: *Session, receipt: *const ai.Agent.Receipt) void {
@@ -524,15 +542,13 @@ fn applyReceiptNormal(self: *Session, receipt: *const ai.Agent.Receipt) void {
 }
 
 /// Resolve a genuine user cancellation against its receipt and the worker's
-/// presentation commit frontier, then compose the editor from the returned prompt
-/// (when history committed nothing), uncommitted steering, and in-progress text.
+/// presentation commit frontier, then reconcile it to committed history.
 /// Infallible after `reserveSteeringRestore`.
 pub fn cancelReceipt(
     self: *Session,
     receipt: *const ai.Agent.Receipt,
     progress_sequence_committed: u64,
 ) void {
-    self.dropSteeringPrefix(receipt.steering_committed_count);
     const turn = self.activeTurn() orelse unreachable;
     if (progress_sequence_committed > turn.progress_sequence_checkpoint and
         progress_sequence_committed == turn.progress_sequence_applied)
@@ -545,6 +561,14 @@ pub fn cancelReceipt(
         turn.transcript_checkpoint = self.transcript.blocks().len;
         turn.progress_sequence_checkpoint = progress_sequence_committed;
     }
+    self.reconcileAbnormalReceipt(receipt);
+}
+
+/// Rewind presentation to the latest agent checkpoint and compose the editor
+/// from the uncommitted origin, steering, and in-progress text.
+fn reconcileAbnormalReceipt(self: *Session, receipt: *const ai.Agent.Receipt) void {
+    self.dropSteeringPrefix(receipt.steering_committed_count);
+    const turn = self.activeTurn() orelse unreachable;
     self.transcript.truncate(turn.transcript_checkpoint);
 
     const committed = receipt.history_end != receipt.history_base;
@@ -697,12 +721,12 @@ fn queueSteeringText(session: *Session, text: []const u8) !void {
     session.commitSteeringDraft(&draft);
 }
 
-fn finishTurn(session: *Session, committed: usize, error_text: ?[]const u8) !void {
+fn finishTurn(session: *Session, committed: usize) !void {
     try session.endTurnWithReceipt(&.{
         .history_base = 0,
         .history_end = 0,
         .steering_committed_count = committed,
-    }, error_text);
+    });
 }
 
 // Mirrors the read loop's inner pipeline without a tty: one read chunk carries
@@ -848,7 +872,7 @@ test "scripted stream events drive the model and one coalesced paint" {
     try std.testing.expectEqual(@as(f64, 1.5), session.stats_shown.cost);
 
     // A clean end leaves turn mode.
-    try finishTurn(&session, 0, null);
+    try finishTurn(&session, 0);
     try std.testing.expect(!session.animating());
 
     // One paint renders the coalesced frame: streamed text and the tool result.
@@ -875,7 +899,7 @@ test "a truncated receipt appends a notice after the answer" {
         .history_end = 2,
         .steering_committed_count = 0,
         .truncated = true,
-    }, null);
+    });
 
     const blocks = session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 2), blocks.len);
@@ -885,12 +909,14 @@ test "a truncated receipt appends a notice after the answer" {
 
     // A turn that both truncated and failed reports the cutoff before the error.
     session.beginTurn(2);
-    try session.endTurnWithReceipt(&.{
+    const receipt: ai.Agent.Receipt = .{
         .history_base = 2,
         .history_end = 2,
         .steering_committed_count = 0,
         .truncated = true,
-    }, "boom");
+    };
+    try session.reserveFailureRestore(&receipt);
+    try session.failTurnWithReceipt(&receipt, "boom");
     const after = session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 4), after.len);
     try std.testing.expectEqualStrings(truncated_notice, after[2].feedback.text.items);
@@ -919,7 +945,7 @@ test "streamed and tool text cannot emit terminal controls" {
         .content = try gpa.dupe(u8, tool),
         .is_error = false,
     } });
-    try finishTurn(&session, 0, null);
+    try finishTurn(&session, 0);
     try session.paint(.{ .columns = 160, .rows = 24 });
 
     const painted = out.written();
@@ -982,7 +1008,7 @@ test "a cancelled turn's stale output and completion cannot affect its successor
         .generation = 2,
         .payload = .turn_ended,
     }));
-    try finishTurn(&session, 0, null);
+    try finishTurn(&session, 0);
     try std.testing.expect(!session.animating());
     // Three blocks: the stale error appended no feedback block either.
     try std.testing.expectEqual(@as(usize, 3), session.transcript.blocks().len);
@@ -1041,7 +1067,7 @@ test "steering queues, then a consumed event shows it and clears the queue" {
     try std.testing.expectEqual(@as(usize, 0), (try session.steeringView()).len);
 
     // A normal completion whose receipt committed the batch drops those drafts.
-    try finishTurn(&session, 2, null);
+    try finishTurn(&session, 2);
     try std.testing.expectEqual(@as(usize, 0), session.steering.items.len);
 }
 
@@ -1156,6 +1182,94 @@ test "a tick repaints and steps the spinner while a turn animates" {
     // New model content repaints even without animation.
     session.dirty = true;
     try std.testing.expect(session.advanceFrame());
+}
+
+test "a failure with nothing committed rewinds the tail and returns the prompt" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    defer session.deinit();
+    session.beginTurn(1);
+
+    try session.transcript.append(.feedback, false, "earlier");
+    const base = session.transcript.blocks().len;
+    try session.transcript.append(.user, false, "my prompt");
+    try session.transcript.appendStream(.model, "partial reply");
+    var prompt = try ui.Editor.Draft.fromText(gpa, "my prompt");
+    session.retainTurnPrompt(&prompt, base);
+    try queueSteeringText(&session, "steer");
+    try session.editor.insert("typing");
+
+    const receipt: ai.Agent.Receipt = .{
+        .history_base = 0,
+        .history_end = 0,
+        .steering_committed_count = 0,
+    };
+    try session.reserveFailureRestore(&receipt);
+    try session.failTurnWithReceipt(&receipt, "Overloaded");
+
+    const blocks = session.transcript.blocks();
+    try std.testing.expectEqual(@as(usize, 2), blocks.len);
+    try std.testing.expectEqualStrings("earlier", blocks[0].feedback.text.items);
+    try std.testing.expect(blocks[1].feedback.is_error);
+    try std.testing.expectEqualStrings("Overloaded", blocks[1].feedback.text.items);
+    try std.testing.expectEqualStrings("my prompt\n\nsteer\n\ntyping", session.editor.visible());
+    try std.testing.expect(session.turn_origin == null);
+    try std.testing.expect(!session.hasSteering());
+}
+
+test "a failure after a committed round keeps it and restores only steering" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    defer session.deinit();
+    session.beginTurn(1);
+
+    const base = session.transcript.blocks().len;
+    try session.transcript.append(.user, false, "prompt");
+    var prompt = try ui.Editor.Draft.fromText(gpa, "prompt");
+    session.retainTurnPrompt(&prompt, base);
+    _ = try session.applyTurnEvent(&.{
+        .generation = 1,
+        .progress_sequence = 1,
+        .payload = .{ .text = try gpa.dupe(u8, "round one") },
+    });
+    _ = try session.applyTurnEvent(&.{
+        .generation = 1,
+        .progress_sequence = 2,
+        .progress_sequence_committed = 1,
+        .payload = .{ .tool_start = .{
+            .name = try gpa.dupe(u8, "read"),
+            .input_json = try gpa.dupe(u8, "{}"),
+        } },
+    });
+    _ = try session.applyTurnEvent(&.{
+        .generation = 1,
+        .progress_sequence = 3,
+        .progress_sequence_committed = 1,
+        .payload = .{ .text = try gpa.dupe(u8, "round two partial") },
+    });
+    try queueSteeringText(&session, "restore me");
+
+    const receipt: ai.Agent.Receipt = .{
+        .history_base = 0,
+        .history_end = 2,
+        .steering_committed_count = 0,
+    };
+    try session.reserveFailureRestore(&receipt);
+    try session.failTurnWithReceipt(&receipt, "boom");
+
+    const blocks = session.transcript.blocks();
+    try std.testing.expectEqual(@as(usize, 3), blocks.len);
+    try std.testing.expectEqualStrings("prompt", blocks[0].user.items);
+    try std.testing.expectEqualStrings("round one", blocks[1].model.items);
+    try std.testing.expect(blocks[2].feedback.is_error);
+    try std.testing.expectEqualStrings("boom", blocks[2].feedback.text.items);
+    try std.testing.expectEqualStrings("restore me", session.editor.visible());
+    try std.testing.expect(session.turn_origin == null);
+    try std.testing.expect(!session.hasSteering());
 }
 
 // With nothing committed, the whole optimistic tail rewinds to the turn base and
@@ -1350,6 +1464,6 @@ test "a normal completion frees the retained prompt" {
     var prompt = session.editor.detachTrimmed();
     session.retainTurnPrompt(&prompt, 0);
 
-    try finishTurn(&session, 0, null);
+    try finishTurn(&session, 0);
     try std.testing.expect(session.turn_origin == null);
 }

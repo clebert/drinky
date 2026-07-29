@@ -26,8 +26,9 @@ pub const Decoded = union(enum) {
 /// The engine methods over a provider stream struct `S`, which declares the
 /// connection fields these methods use (`gpa`, `established`, `client`,
 /// `request`, `response`, `body`, `io`, `idle_ms`, `budget`, `status`,
-/// `error_length`, `retry_after_ms`, `frame_arena`, `usage`, `decompress`,
-/// `decompress_buffer`, `error_buffer`, `redirect_buffer`, `transfer_buffer`)
+/// `error_length`, `error_retryable`, `retry_after_ms`, `frame_arena`, `usage`,
+/// `decompress`, `decompress_buffer`, `error_buffer`, `redirect_buffer`,
+/// `transfer_buffer`)
 /// plus `deinitDecode()` for stream-lifetime decode state and
 /// `decode(payload) !Decoded`, and an optional `captureHead(*const Head)` hook
 /// the engine calls while the response head is still valid, for provider-specific
@@ -53,10 +54,11 @@ pub fn Engine(comptime S: type) type {
             return stream.error_buffer[0..stream.error_length];
         }
 
-        /// Whether a failed head carries a status worth retrying: request
-        /// timeout, rate limiting, or any 5xx server fault (Anthropic's 529
-        /// included).
+        /// Whether the current API failure is worth retrying: a streamed error
+        /// marked transient by its provider, or a failed head carrying request
+        /// timeout, rate limiting, or any 5xx server fault.
         pub fn retryable(stream: *const S) bool {
+            if (stream.error_retryable) return true;
             if (stream.status == .request_timeout or stream.status == .too_many_requests)
                 return true;
             return @divFloor(@intFromEnum(stream.status), 100) == 5;
@@ -107,6 +109,7 @@ pub fn Engine(comptime S: type) type {
             stream.frame_arena = .init(gpa);
             stream.usage = .{};
             stream.error_length = 0;
+            stream.error_retryable = false;
             stream.retry_after_ms = null;
         }
 
@@ -233,10 +236,11 @@ pub fn Engine(comptime S: type) type {
             return error.ReadFailed;
         }
 
-        /// Record a streamed error frame's message for `errorText`; called by
-        /// the provider's `decode`.
-        pub fn recordError(stream: *S, message: []const u8) void {
+        /// Record a streamed error frame for `errorText` and retry
+        /// classification; called by the provider's `decode`.
+        pub fn recordError(stream: *S, message: []const u8, error_retryable: bool) void {
             stream.error_length = @min(message.len, stream.error_buffer.len);
+            stream.error_retryable = error_retryable;
             @memcpy(stream.error_buffer[0..stream.error_length], message[0..stream.error_length]);
         }
     };
@@ -314,8 +318,11 @@ test retryAfter {
     );
 }
 
-test "retryable classifies the head status" {
-    const Stub = struct { status: std.http.Status };
+test "retryable classifies streamed errors and head statuses" {
+    const Stub = struct {
+        status: std.http.Status,
+        error_retryable: bool = false,
+    };
     const engine = Engine(Stub);
     var stream: Stub = .{ .status = .request_timeout };
     try std.testing.expect(engine.retryable(&stream));
@@ -331,6 +338,9 @@ test "retryable classifies the head status" {
     try std.testing.expect(!engine.retryable(&stream));
     stream.status = .bad_request;
     try std.testing.expect(!engine.retryable(&stream));
+    stream.error_retryable = true;
+    try std.testing.expect(engine.retryable(&stream));
+    stream.error_retryable = false;
     // Only a literal 5xx counts: `Status.class` maps every out-of-range status
     // to `server_error`, which must not make a nonsense status retryable.
     stream.status = @enumFromInt(999);

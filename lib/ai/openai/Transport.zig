@@ -46,6 +46,7 @@ pub const Stream = struct {
     budget: net.Budget,
     status: std.http.Status,
     error_length: usize,
+    error_retryable: bool,
     retry_after_ms: ?u64,
     /// Scratch for one decoded frame. Events may borrow it until the next read.
     frame_arena: std.heap.ArenaAllocator,
@@ -300,7 +301,11 @@ pub const Stream = struct {
         const kind = json.string(object.get("type")) orelse return .ignored;
 
         if (std.mem.eql(u8, kind, "error") or std.mem.eql(u8, kind, "response.failed")) {
-            engine.recordError(self, errorMessage(object) orelse kind);
+            engine.recordError(
+                self,
+                errorMessage(object) orelse kind,
+                errorRetryable(&object),
+            );
             return error.ApiError;
         }
         if (std.mem.eql(u8, kind, "response.refusal.delta") or
@@ -454,6 +459,23 @@ fn errorMessage(object: std.json.ObjectMap) ?[]const u8 {
     return null;
 }
 
+fn errorRetryable(object: *const std.json.ObjectMap) bool {
+    const code = errorCode(object) orelse return false;
+    return std.mem.eql(u8, code, "server_error") or
+        std.mem.eql(u8, code, "rate_limit_exceeded");
+}
+
+fn errorCode(object: *const std.json.ObjectMap) ?[]const u8 {
+    if (json.string(object.get("code"))) |code| return code;
+    if (json.object(object.get("error"))) |detail| {
+        if (json.string(detail.get("code"))) |code| return code;
+    }
+    if (json.object(object.get("response"))) |response| {
+        if (json.object(response.get("error"))) |detail| return json.string(detail.get("code"));
+    }
+    return null;
+}
+
 /// Fold a `response.usage` object into the running total. `input_tokens`
 /// partitions into three disjoint buckets — cache reads, cache writes, and the
 /// uncached remainder — each priced at its own rate (the gpt-5.6 family bills
@@ -535,6 +557,9 @@ fn testStreamWithAllocator(
     stream.idle_ms = idle_ms;
     stream.budget = .{ .max = budget_max };
     stream.body = body;
+    stream.status = .ok;
+    stream.error_length = 0;
+    stream.error_retryable = false;
     stream.frame_arena = .init(gpa);
     stream.terminal_rejection = null;
     stream.incomplete_message = false;
@@ -1002,11 +1027,26 @@ test "decode surfaces a streamed error frame" {
         \\{"type":"error","message":"rate limit"}
     ));
     try std.testing.expectEqualStrings("rate limit", stream.errorText());
+    try std.testing.expect(!stream.retryable());
 
     try std.testing.expectError(error.ApiError, stream.decode(
-        \\{"type":"response.failed","response":{"error":{"message":"bad request"}}}
+        \\{"type":"error","code":"server_error","message":"server failed"}
+    ));
+    try std.testing.expect(stream.retryable());
+
+    try std.testing.expectError(error.ApiError, stream.decode(
+        "{\"type\":\"response.failed\",\"response\":{\"error\":" ++
+            "{\"code\":\"rate_limit_exceeded\",\"message\":\"rate limited\"}}}",
+    ));
+    try std.testing.expectEqualStrings("rate limited", stream.errorText());
+    try std.testing.expect(stream.retryable());
+
+    try std.testing.expectError(error.ApiError, stream.decode(
+        "{\"type\":\"response.failed\",\"response\":{\"error\":" ++
+            "{\"code\":\"invalid_prompt\",\"message\":\"bad request\"}}}",
     ));
     try std.testing.expectEqualStrings("bad request", stream.errorText());
+    try std.testing.expect(!stream.retryable());
 }
 
 test "decode ignores a malformed data line instead of failing the turn" {

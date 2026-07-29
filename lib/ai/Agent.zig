@@ -497,10 +497,10 @@ fn drainSteering(self: *Agent, turn: *TurnState, handler: anytype) !bool {
 /// Stream one assistant reply, retrying on transient failures. Only whole
 /// requests are safe to retry, so a failed attempt's partial reply is discarded
 /// (history untouched) and `handler.onStreamReset` clears partial output first.
-/// Returns the reply's items (already appended to history). A provider/API error
-/// is reported through `handler.onError` and surfaced as `error.ApiError`, which
-/// the turn transaction classifies as a failed disposition and rolls back to the
-/// latest checkpoint — retaining every round completed before it.
+/// Returns the reply's items (already appended to history). An API error is
+/// retried when its head or streamed event marks it transient; an exhausted or
+/// permanent one is reported through `handler.onError` and surfaced as
+/// `error.ApiError`, which rolls the turn back to its latest checkpoint.
 fn fetchReply(
     self: *Agent,
     fetch: anytype,
@@ -557,23 +557,25 @@ fn fetchReply(
             handler,
         ) catch |err| switch (err) {
             error.ApiError => {
+                self.recordUsageSoFar(&model, &stream, &usage_recorded);
+                if (stream.retryable() and attempt < self.retry.attempts_max) {
+                    try self.backoff(.{
+                        .attempt = attempt,
+                        .suggested_ms = stream.retryAfterMs() orelse 0,
+                    });
+                    continue;
+                }
                 try presentation(&turn.presentation_closed, handler.onError(stream.errorText()));
                 return error.ApiError;
             },
             error.Canceled => {
                 // A cancel that interrupts the read before its terminal `.stop`
-                // leaves the streamed usage unbooked, yet the provider still billed
-                // the prompt and the output so far. Fold it in — unless the stop
-                // usage was already recorded (a cancel during the usage callback),
-                // which would double-count — so the cost gauge stays honest.
-                if (!usage_recorded) {
-                    const usage = stream.usageSoFar();
-                    if (!std.meta.eql(usage, llm.Usage{}))
-                        self.recordUsage(&model, &usage);
-                }
+                // still records whatever usage the provider delivered so far.
+                self.recordUsageSoFar(&model, &stream, &usage_recorded);
                 return err;
             },
             else => {
+                self.recordUsageSoFar(&model, &stream, &usage_recorded);
                 if (retryableError(err) and attempt < self.retry.attempts_max) {
                     try self.backoff(.{ .attempt = attempt });
                     continue;
@@ -660,6 +662,20 @@ fn recordUsage(self: *Agent, model: *const models.Model, usage: *const llm.Usage
     self.stats.saved += saved;
     self.stats.last = usage.*;
     self.stats.attribute(model.name, cost, saved, usage);
+}
+
+/// Record a stream's nonzero running usage unless its terminal event already did.
+fn recordUsageSoFar(
+    self: *Agent,
+    model: *const models.Model,
+    stream: anytype,
+    usage_recorded: *bool,
+) void {
+    if (usage_recorded.*) return;
+    const usage = stream.usageSoFar();
+    if (std.meta.eql(usage, llm.Usage{})) return;
+    self.recordUsage(model, &usage);
+    usage_recorded.* = true;
 }
 
 /// Read one streamed assistant message to completion, recording usage and
@@ -1116,6 +1132,7 @@ const ScriptedStream = struct {
     quota: ?llm.Quota = null,
     head_ok: bool = true,
     head_retryable: bool = false,
+    stream_error_retryable: bool = false,
     retry_after_ms: ?u64 = null,
     error_text: []const u8 = "",
 
@@ -1137,7 +1154,7 @@ const ScriptedStream = struct {
     }
 
     fn retryable(self: *const ScriptedStream) bool {
-        return self.head_retryable;
+        return if (self.head_ok) self.stream_error_retryable else self.head_retryable;
     }
 
     fn retryAfterMs(self: *const ScriptedStream) ?u64 {
@@ -2801,6 +2818,36 @@ test "run retries transient failures, resetting the stream before each reattempt
     try std.testing.expectEqual(@as(usize, 2), agent.items.items.len);
     try std.testing.expectEqualStrings("hi", agent.items.items[1].message.text);
     try std.testing.expectEqualStrings("hi", handler.text.items);
+}
+
+test "run retries a streamed transient API error" {
+    const gpa = std.testing.allocator;
+    var log: SleepLog = .init(std.testing.io);
+    var agent = scriptedAgent(gpa);
+    agent.io = log.io();
+    defer agent.deinit();
+    var handler: CaptureHandler = .{ .gpa = gpa };
+    defer handler.deinit();
+
+    var fetch: ScriptedFetch = .{ .attempts = &.{
+        .{ .stream = .{
+            .events = &.{},
+            .terminal_error = error.ApiError,
+            .usage_so_far = .{ .input = 7 },
+            .stream_error_retryable = true,
+            .retry_after_ms = 5000,
+            .error_text = "Overloaded",
+        } },
+        .{ .stream = .{ .events = &end_turn_events } },
+    } };
+    try agent.runWith(&fetch, "go", &handler);
+    try std.testing.expectEqual(@as(usize, 2), fetch.sends);
+    try std.testing.expectEqual(@as(usize, 1), handler.stream_reset_count);
+    try std.testing.expectEqual(@as(usize, 0), handler.errors.items.len);
+    try std.testing.expectEqual(@as(usize, 1), log.count);
+    try std.testing.expectEqual(@as(u64, 5000), log.slept_ms[0]);
+    try std.testing.expectEqual(@as(usize, 2), agent.items.items.len);
+    try std.testing.expectEqual(@as(u64, 7), agent.stats.by_model[0].usage.input);
 }
 
 test "run surfaces the failure once the attempt bound is exhausted" {

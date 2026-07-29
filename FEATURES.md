@@ -15,9 +15,9 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
   alone, in call order.
 - Enter during a turn queues a steering message that folds into the run at the next tool round.
 - Alt+Up pulls messages the turn has not picked up yet back into the editor to keep editing.
-- Steering left in the queue when a turn ends starts the next turn on its own.
-- Esc or Ctrl+C cancels a turn: finished rounds and their results stay, the in-flight tail is
-  dropped, and unsent text returns to the editor.
+- Steering left in the queue when a turn completes starts the next turn on its own.
+- Esc or Ctrl+C cancels a turn; cancelled or failed turns keep finished rounds, drop the in-flight
+  tail, and return uncommitted text to the editor.
 - A tool call left unfinished is recorded as an error, so a cancelled mutation is never lost
   silently.
 - Timeouts and transient failures retry the whole request, clearing the partial reply first.

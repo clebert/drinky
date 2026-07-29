@@ -118,8 +118,8 @@ pub const Stream = union(llm.Account) {
         };
     }
 
-    /// Whether a failed head (see `ok`) is worth retrying — a rate-limit or a
-    /// transient server status the provider marks retryable.
+    /// Whether the current failure is worth retrying — a transient streamed
+    /// error, rate limit, or server status the provider marks retryable.
     pub fn retryable(self: *const Stream) bool {
         return switch (self.*) {
             inline else => |*stream| stream.retryable(),

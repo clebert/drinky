@@ -49,6 +49,7 @@ pub const Stream = struct {
     budget: net.Budget,
     status: std.http.Status,
     error_length: usize,
+    error_retryable: bool,
     retry_after_ms: ?u64,
     /// Scratch for one decoded frame. Events may borrow it until the next read.
     frame_arena: std.heap.ArenaAllocator,
@@ -242,7 +243,11 @@ pub const Stream = struct {
 
         if (std.mem.eql(u8, kind, "ping")) return .ignored;
         if (std.mem.eql(u8, kind, "error")) {
-            engine.recordError(self, errorMessage(object) orelse kind);
+            engine.recordError(
+                self,
+                errorMessage(object) orelse kind,
+                errorRetryable(&object),
+            );
             return error.ApiError;
         }
         if (std.mem.eql(u8, kind, "message_delta")) {
@@ -410,6 +415,14 @@ fn errorMessage(object: std.json.ObjectMap) ?[]const u8 {
     return json.string(detail.get("message"));
 }
 
+fn errorRetryable(object: *const std.json.ObjectMap) bool {
+    const detail = json.object(object.get("error")) orelse return false;
+    const kind = json.string(detail.get("type")) orelse return false;
+    return std.mem.eql(u8, kind, "overloaded_error") or
+        std.mem.eql(u8, kind, "rate_limit_error") or
+        std.mem.eql(u8, kind, "api_error");
+}
+
 /// Overwrite each field present in `object`. Anthropic reports usage as
 /// cumulative message totals, so last-writer-per-field is the running total.
 fn mergeUsage(usage: *llm.Usage, object: std.json.ObjectMap) void {
@@ -439,6 +452,9 @@ fn testStreamWithAllocator(
     stream.idle_ms = idle_ms;
     stream.budget = .{ .max = budget_max };
     stream.body = body;
+    stream.status = .ok;
+    stream.error_length = 0;
+    stream.error_retryable = false;
     stream.frame_arena = .init(gpa);
     stream.stop_reason = .none;
     stream.terminal_rejection = null;
@@ -931,12 +947,23 @@ test "decode surfaces a streamed error frame" {
         \\{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}
     ));
     try std.testing.expectEqualStrings("Overloaded", stream.errorText());
+    try std.testing.expect(stream.retryable());
+
+    try std.testing.expectError(error.ApiError, stream.decode(
+        \\{"type":"error","error":{"type":"rate_limit_error","message":"Rate limited"}}
+    ));
+    try std.testing.expect(stream.retryable());
+    try std.testing.expectError(error.ApiError, stream.decode(
+        \\{"type":"error","error":{"type":"api_error","message":"Server error"}}
+    ));
+    try std.testing.expect(stream.retryable());
 
     // A frame without a message falls back to reporting its kind.
     try std.testing.expectError(error.ApiError, stream.decode(
         \\{"type":"error","error":{}}
     ));
     try std.testing.expectEqualStrings("error", stream.errorText());
+    try std.testing.expect(!stream.retryable());
 
     // A message longer than the error buffer is truncated, never out of bounds.
     const long = "x" ** 600;

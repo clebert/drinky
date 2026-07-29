@@ -421,18 +421,22 @@ fn freeWorkerResult(self: *App, result: *const WorkerResult) void {
     if (result.error_text) |text| self.gpa.free(text);
 }
 
-/// Apply a completed or failed joined result through the one authoritative
-/// terminal path, then start steering that arrived too late for the old turn.
+/// Reconcile a completed or failed joined result, then promote late steering
+/// only after a completion; a failure returns uncommitted drafts to the editor.
 fn finishWorkerResult(self: *App, result: *const WorkerResult) !void {
     self.session.stats_shown = self.agent.stats;
     switch (result.outcome.disposition) {
-        .completed, .failed => try self.session.endTurnWithReceipt(
-            &result.outcome.receipt,
-            result.error_text,
-        ),
+        .completed => {
+            try self.session.endTurnWithReceipt(&result.outcome.receipt);
+            if (self.session.hasSteering()) try self.startSteeringTurn();
+        },
+        .failed => {
+            try self.session.reserveFailureRestore(&result.outcome.receipt);
+            defer self.agent.steering.clear();
+            try self.session.failTurnWithReceipt(&result.outcome.receipt, result.error_text);
+        },
         .canceled, .closed => return error.UnexpectedTurnDisposition,
     }
-    if (self.session.hasSteering()) try self.startSteeringTurn();
 }
 
 /// Cancel and reap `maybe_future`'s task, clearing the handle; a no-op when null.
@@ -851,7 +855,7 @@ fn cancelTurn(self: *App) !void {
         // not a failure worth reporting or a cancellation to restore from.
         .closed => {
             defer self.freeWorkerResult(&result);
-            try self.session.endTurnWithReceipt(&result.outcome.receipt, null);
+            try self.session.endTurnWithReceipt(&result.outcome.receipt);
         },
     }
 }
@@ -939,8 +943,8 @@ fn submit(self: *App) !void {
         errdefer self.session.transcript.truncate(base);
         try self.runTurn(text);
         // The turn is live and owns its own copy; retain the prompt's rich draft
-        // so a cancel that commits nothing can return it, and leave the editor
-        // empty for in-progress text. Both steps are infallible, so the
+        // so an abnormal exit that commits nothing can return it, and leave the
+        // editor empty for in-progress text. Both steps are infallible, so the
         // rollback above stays correct.
         var prompt = self.session.editor.detachTrimmed();
         self.session.retainTurnPrompt(&prompt, base);
@@ -2176,6 +2180,11 @@ test "a cancel that loses the race applies the failed joined result" {
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
     defer app.session.deinit();
     app.session.beginTurn(3);
+    try app.session.transcript.append(.user, false, "prompt");
+    var prompt = try ui.Editor.Draft.fromText(gpa, "prompt");
+    app.session.retainTurnPrompt(&prompt, 0);
+    try seedSteering(&app, "steer");
+    try app.agent.steering.push("steer");
 
     const worker_result: WorkerResult = .{
         .outcome = .{ .receipt = zero_receipt, .disposition = .{ .failed = error.Boom } },
@@ -2191,9 +2200,19 @@ test "a cancel that loses the race applies the failed joined result" {
     try std.testing.expectEqual(events.len, count);
     try std.testing.expect(!try app.applyBatch(events[0..count]));
 
-    // The joined failure ended at its replacement fence and its error feedback
-    // shows. The owned text is freed exactly once (leak-checked).
+    // The joined failure rewinds the optimistic prompt, restores all authored
+    // text, and clears the agent's plain steering copy before ending.
     try std.testing.expect(app.session.mode == .prompt);
+    try std.testing.expectEqualStrings("prompt\n\nsteer", app.session.editor.visible());
+    const remaining_steering = try app.agent.steering.take();
+    defer {
+        for (remaining_steering) |message| gpa.free(message);
+        gpa.free(remaining_steering);
+    }
+    try std.testing.expectEqual(@as(usize, 0), remaining_steering.len);
+    const blocks = app.session.transcript.blocks();
+    try std.testing.expectEqual(@as(usize, 1), blocks.len);
+    try std.testing.expectEqualStrings("boom", blocks[0].feedback.text.items);
     try app.session.paint(.{ .columns = 80, .rows = 24 });
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "boom") != null);
 }
