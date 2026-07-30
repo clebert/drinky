@@ -37,10 +37,14 @@ on another item. Module layout and extension seams live in `AGENTS.md`.
 
 ## Instructions & subagents
 
-- [ ] **Custom system prompt** — the system prompt is loaded from a file instead of compiled in, and
-      can be overridden.
-- [ ] **Project instructions** — `AGENTS.md` and `CLAUDE.md` from the working directory and its
-      parents are prepended to the system prompt.
+- [ ] **Custom system prompt** — the authored core can be replaced or extended from explicitly
+      configured files. _Generated environment, project-instruction, and skill sections remain._
+- [ ] **Project instructions** — applicable `AGENTS.md` files are included in the system prompt.
+      _At startup, load exact-case files from the nearest Git root through the working directory,
+      broad-to-specific; outside Git inspect only the working directory. No global file or
+      `CLAUDE.md` fallback; warn when `CLAUDE.md` or likely-misspelled `AGENT.md` would otherwise be
+      silently ignored. Discovery, bounds, ordering, and diagnostics follow
+      `docs/project-instructions.md`._
 - [ ] **Custom prompts** — user-maintained prompt templates, invoked as slash commands with argument
       substitution.
 - [x] **Skills** — on-demand instruction files: names and descriptions are advertised to the model,
