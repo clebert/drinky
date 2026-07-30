@@ -9,9 +9,9 @@ const escape = @import("escape.zig");
 
 const Tty = @This();
 
-// The read path (`in_handle`) and the write path (`out_*`) share no mutable
-// field, so a blocked reader and a writer run concurrently without a lock;
-// `original`/`raw_state` are setup/teardown-only. Preserve that split.
+// The read path (`in_handle`) and the write path (`out_*` plus `raw_state`) share
+// no mutable field, so a blocked reader and the consumer's renderer can run
+// concurrently without a lock. Preserve that split.
 io: std.Io,
 in_handle: std.posix.fd_t,
 out_handle: std.posix.fd_t,
@@ -27,6 +27,8 @@ const RawState = struct {
     paste_reset_pending: bool = false,
     keyboard_reset_pending: bool = false,
     cursor_show_pending: bool = false,
+    screen_alternate_reset_pending: bool = false,
+    screen_alternate_keyboard_reset_pending: bool = false,
     setup_complete: bool = false,
 };
 
@@ -105,6 +107,11 @@ pub fn writer(self: *Tty) *std.Io.Writer {
     return &self.out_stream.interface;
 }
 
+/// Enter or leave the alternate screen. Repeated requests are no-ops.
+pub fn setAlternateScreen(self: *Tty, enabled: bool) !void {
+    try setAlternateScreenWith(&self.raw_state, &self.out_stream.interface, enabled);
+}
+
 /// Read available input into `buffer`, blocking until some arrives or `timeout`
 /// elapses — in which case it returns null, so an idle caller can react to a
 /// resize between keystrokes. A closed input surfaces as `error.EndOfStream`.
@@ -147,6 +154,28 @@ fn enterWith(state: *RawState, output: *std.Io.Writer, control: anytype) !void {
     state.setup_complete = true;
 }
 
+fn setAlternateScreenWith(state: *RawState, output: *std.Io.Writer, enabled: bool) !void {
+    if (enabled) {
+        if (state.screen_alternate_reset_pending) return;
+        state.screen_alternate_reset_pending = true;
+        try output.writeAll(escape.screen_alternate_set);
+        state.screen_alternate_keyboard_reset_pending = true;
+        try output.writeAll(escape.keyboard_set);
+        try output.writeAll(escape.cursor_hide);
+        try output.flush();
+        return;
+    }
+    if (!state.screen_alternate_reset_pending) return;
+    if (state.screen_alternate_keyboard_reset_pending) {
+        try output.writeAll(escape.keyboard_reset);
+        state.screen_alternate_keyboard_reset_pending = false;
+    }
+    try output.writeAll(escape.screen_alternate_reset);
+    try output.writeAll(escape.cursor_show);
+    try output.flush();
+    state.screen_alternate_reset_pending = false;
+}
+
 fn cleanupWith(
     state: *RawState,
     output: *std.Io.Writer,
@@ -162,6 +191,16 @@ fn cleanupWith(
         state.raw_owned = false;
     }
     var flush_needed = false;
+    if (state.screen_alternate_keyboard_reset_pending) {
+        state.screen_alternate_keyboard_reset_pending = false;
+        flush_needed = true;
+        output.writeAll(escape.keyboard_reset) catch {};
+    }
+    if (state.screen_alternate_reset_pending) {
+        state.screen_alternate_reset_pending = false;
+        flush_needed = true;
+        output.writeAll(escape.screen_alternate_reset) catch {};
+    }
     if (state.cursor_show_pending) {
         state.cursor_show_pending = false;
         flush_needed = true;
@@ -226,6 +265,8 @@ const TestWriter = struct {
         keyboard_set,
         cursor_hide,
         cursor_show,
+        screen_alternate_set,
+        screen_alternate_reset,
         keyboard_reset,
         paste_reset,
         newline,
@@ -272,6 +313,8 @@ const TestWriter = struct {
         if (std.mem.eql(u8, bytes, escape.keyboard_set)) return .keyboard_set;
         if (std.mem.eql(u8, bytes, escape.cursor_hide)) return .cursor_hide;
         if (std.mem.eql(u8, bytes, escape.cursor_show)) return .cursor_show;
+        if (std.mem.eql(u8, bytes, escape.screen_alternate_set)) return .screen_alternate_set;
+        if (std.mem.eql(u8, bytes, escape.screen_alternate_reset)) return .screen_alternate_reset;
         if (std.mem.eql(u8, bytes, escape.keyboard_reset)) return .keyboard_reset;
         if (std.mem.eql(u8, bytes, escape.paste_reset)) return .paste_reset;
         if (std.mem.eql(u8, bytes, "\r\n")) return .newline;
@@ -342,6 +385,87 @@ test "size reports absence on a handle that is not a terminal" {
     var tty: Tty = undefined;
     tty.out_handle = fds[1];
     try std.testing.expectEqual(@as(?Size, null), tty.size());
+}
+
+test "alternate screen transitions pair their independent keyboard mode" {
+    {
+        var output: TestWriter = .{};
+        var state: RawState = .{};
+        try setAlternateScreenWith(&state, &output.interface, true);
+        try setAlternateScreenWith(&state, &output.interface, true);
+        try setAlternateScreenWith(&state, &output.interface, false);
+        try setAlternateScreenWith(&state, &output.interface, false);
+        try std.testing.expectEqual(RawState{}, state);
+        try std.testing.expectEqualSlices(
+            TestWriter.Operation,
+            &.{
+                .screen_alternate_set,
+                .keyboard_set,
+                .cursor_hide,
+                .flush,
+                .keyboard_reset,
+                .screen_alternate_reset,
+                .cursor_show,
+                .flush,
+            },
+            output.operations[0..output.operations_len],
+        );
+    }
+    {
+        var output: TestWriter = .{};
+        var control: TestControl = .{};
+        var state: RawState = .{
+            .keyboard_reset_pending = true,
+            .cursor_show_pending = true,
+        };
+        try setAlternateScreenWith(&state, &output.interface, true);
+        cleanupWith(&state, &output.interface, &control, false);
+        cleanupWith(&state, &output.interface, &control, false);
+        try std.testing.expectEqual(RawState{}, state);
+        try std.testing.expectEqualSlices(
+            TestWriter.Operation,
+            &.{
+                .screen_alternate_set,
+                .keyboard_set,
+                .cursor_hide,
+                .flush,
+                .keyboard_reset,
+                .screen_alternate_reset,
+                .cursor_show,
+                .keyboard_reset,
+                .flush,
+            },
+            output.operations[0..output.operations_len],
+        );
+    }
+    {
+        var output: TestWriter = .{ .drain_fail_at = 2 };
+        var control: TestControl = .{};
+        var state: RawState = .{
+            .keyboard_reset_pending = true,
+            .cursor_show_pending = true,
+        };
+        try std.testing.expectError(
+            error.WriteFailed,
+            setAlternateScreenWith(&state, &output.interface, true),
+        );
+        cleanupWith(&state, &output.interface, &control, false);
+        cleanupWith(&state, &output.interface, &control, false);
+        try std.testing.expectEqual(RawState{}, state);
+        try std.testing.expectEqualSlices(
+            TestWriter.Operation,
+            &.{
+                .screen_alternate_set,
+                .keyboard_set,
+                .keyboard_reset,
+                .screen_alternate_reset,
+                .cursor_show,
+                .keyboard_reset,
+                .flush,
+            },
+            output.operations[0..output.operations_len],
+        );
+    }
 }
 
 test "setup failure restores cooked mode and only reverses attempted terminal modes" {

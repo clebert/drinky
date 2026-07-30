@@ -1,16 +1,12 @@
-//! Projection: fold the transcript and the live tail of one `Scene` onto the
-//! bounded window and hand it to the `terminal.View`. Components stack in screen
-//! order — the transcript blocks oldest first, then the tail (a running turn's
-//! tool boxes, or a picker, then the input area and the status line).
+//! Projection of either the conversation interface or a temporary full-window
+//! page onto the bounded terminal `View`. Conversation components stack in
+//! screen order — transcript blocks oldest first, then the live tail and status.
+//! A page is exclusive and emits only its fixed header and visible body window.
 //!
-//! The tail is a tagged union, so exactly one input is ever live: the editor
-//! while waiting or streaming, or a picker. Two passes: pass one measures newest
-//! → oldest until the window is full, finding the topmost visible component (the
-//! clip) and how many of its rows fall above the window; pass two composes clip →
-//! newest into the view's sink, the clip alone dropping those top rows. Nothing
-//! is cached between frames: layout is recomputed from the scene each time,
-//! bounded to the window. A single blank line separates adjacent components;
-//! boxes carry their own colored padding.
+//! Conversation layout uses two passes: measure newest → oldest to find the
+//! bounded clip, then compose clip → newest. Nothing is cached between frames;
+//! the scene is projected again at each size. A single blank line separates
+//! adjacent conversation components; boxes carry their own colored padding.
 
 const std = @import("std");
 
@@ -29,6 +25,7 @@ const id_reserved = std.math.maxInt(usize) - 255;
 const id_status = id_reserved;
 const id_input = id_reserved + 1;
 const id_steering = id_reserved + 2;
+const id_page = id_reserved + 3;
 
 /// The anchor id of the tool box at `index` in the running turn. Grows downward
 /// from just below the fixed ids, so it never wraps past `maxInt` however many
@@ -37,11 +34,16 @@ fn idTool(index: usize) usize {
     return id_reserved - 1 - index;
 }
 
-/// Everything one frame draws: the transcript blocks and the live tail below them.
-pub const Scene = struct {
-    transcript: []const ui.block.Entry,
-    tail: Tail,
-    status: *const ui.status.Info,
+/// Everything one frame draws: either the conversation or an exclusive page.
+pub const Scene = union(enum) {
+    conversation: Conversation,
+    page: *const ui.Page,
+
+    pub const Conversation = struct {
+        transcript: []const ui.block.Entry,
+        tail: Tail,
+        status: *const ui.status.Info,
+    };
 };
 
 /// The live region below the transcript. A tagged union so exactly one input is
@@ -120,9 +122,33 @@ const Component = union(enum) {
 /// carry, and whether a blank separator row precedes it as its line 0.
 const Slot = struct { component: Component, id: usize, leading_blank: bool };
 
-/// Project `scene` onto the window at `size` and hand it to `view`. See the file
-/// comment for the two-pass measure/clip/compose.
+/// Project `scene` onto the window at `size` and hand it to `view`.
 pub fn project(view: *terminal.View, size: terminal.View.Size, scene: *const Scene) !void {
+    switch (scene.*) {
+        .conversation => try projectConversation(view, size, &scene.conversation),
+        .page => |page| try projectPage(view, size, page),
+    }
+}
+
+fn projectPage(view: *terminal.View, size: terminal.View.Size, page: *const ui.Page) !void {
+    const sink = try view.beginFrame(.{ .columns = size.columns, .rows = size.rows }, 1);
+    const placement: ui.paint.Placement = .{
+        .sink = sink,
+        .id = id_page,
+        .columns = size.columns,
+        .base = 0,
+        .skip = 0,
+    };
+    try page.render(&placement, size);
+    try view.render();
+}
+
+/// Fold one conversation onto the retained multi-page window.
+fn projectConversation(
+    view: *terminal.View,
+    size: terminal.View.Size,
+    scene: *const Scene.Conversation,
+) !void {
     const total = scene.transcript.len + tailCount(&scene.tail) + 1;
     const capacity = @max(size.rows, 1) * window_pages;
 
@@ -166,7 +192,7 @@ fn tailCount(tail: *const Tail) usize {
 
 /// The component at screen index `index`: the transcript oldest first, then the
 /// tail, then the status line.
-fn slotAt(scene: *const Scene, index: usize) Slot {
+fn slotAt(scene: *const Scene.Conversation, index: usize) Slot {
     if (index < scene.transcript.len) return .{
         .component = .{ .entry = &scene.transcript[index] },
         .id = index,
@@ -251,11 +277,11 @@ test "projection stacks the transcript above the tail, newest at the bottom" {
     try entries.append(gpa, try ui.block.Entry.init(gpa, .user, false, "useryy"));
     try entries.append(gpa, try ui.block.Entry.init(gpa, .model, false, "replyzz"));
 
-    const scene: Scene = .{
+    const scene: Scene = .{ .conversation = .{
         .transcript = entries.items,
         .tail = .{ .prompt = &editor },
         .status = &test_status,
-    };
+    } };
     const painted = try projected(gpa, .{ .columns = 40, .rows = 24 }, &scene);
     defer gpa.free(painted);
 
@@ -279,7 +305,7 @@ test "a turn tail stacks tool boxes above the active editor" {
     defer editor.deinit();
 
     const tools = [_][]const u8{ "readbox", "grepbox" };
-    const scene: Scene = .{
+    const scene: Scene = .{ .conversation = .{
         .transcript = &[_]ui.block.Entry{},
         .tail = .{ .turn = .{
             .tools = &tools,
@@ -288,7 +314,7 @@ test "a turn tail stacks tool boxes above the active editor" {
             .editor = &editor,
         } },
         .status = &test_status,
-    };
+    } };
     const painted = try projected(gpa, .{ .columns = 40, .rows = 24 }, &scene);
     defer gpa.free(painted);
 
@@ -307,12 +333,12 @@ test "border activity does not change the input tail height" {
     var editor = ui.Editor.init(gpa);
     defer editor.deinit();
 
-    const prompt: Scene = .{
+    const prompt: Scene = .{ .conversation = .{
         .transcript = &.{},
         .tail = .{ .prompt = &editor },
         .status = &test_status,
-    };
-    const turn: Scene = .{
+    } };
+    const turn: Scene = .{ .conversation = .{
         .transcript = &.{},
         .tail = .{ .turn = .{
             .tools = &.{},
@@ -321,7 +347,7 @@ test "border activity does not change the input tail height" {
             .editor = &editor,
         } },
         .status = &test_status,
-    };
+    } };
     const prompt_painted = try projected(gpa, .{ .columns = 40, .rows = 24 }, &prompt);
     defer gpa.free(prompt_painted);
     const turn_painted = try projected(gpa, .{ .columns = 40, .rows = 24 }, &turn);
@@ -341,7 +367,7 @@ test "a turn with 253 tool boxes keeps its anchor ids from wrapping" {
     defer editor.deinit();
 
     const tools = [_][]const u8{"toolbox"} ** 253;
-    const scene: Scene = .{
+    const scene: Scene = .{ .conversation = .{
         .transcript = &[_]ui.block.Entry{},
         .tail = .{ .turn = .{
             .tools = &tools,
@@ -350,7 +376,7 @@ test "a turn with 253 tool boxes keeps its anchor ids from wrapping" {
             .editor = &editor,
         } },
         .status = &test_status,
-    };
+    } };
     gpa.free(try projected(gpa, .{ .columns = 40, .rows = 24 }, &scene));
 
     try std.testing.expect(idTool(252) < id_reserved);
@@ -364,7 +390,7 @@ test "a turn tail shows the steering queue above the editor" {
     defer editor.deinit();
 
     const queue = [_][]const u8{ "fix the bug", "then add a test\nnot this row" };
-    const scene: Scene = .{
+    const scene: Scene = .{ .conversation = .{
         .transcript = &[_]ui.block.Entry{},
         .tail = .{ .turn = .{
             .tools = &.{},
@@ -373,7 +399,7 @@ test "a turn tail shows the steering queue above the editor" {
             .editor = &editor,
         } },
         .status = &test_status,
-    };
+    } };
     const painted = try projected(gpa, .{ .columns = 40, .rows = 24 }, &scene);
     defer gpa.free(painted);
 
@@ -395,7 +421,7 @@ test "a narrow window clips the steering rows to width" {
     defer editor.deinit();
 
     const queue = [_][]const u8{"a steering message wider than the window"};
-    const scene: Scene = .{
+    const scene: Scene = .{ .conversation = .{
         .transcript = &[_]ui.block.Entry{},
         .tail = .{ .turn = .{
             .tools = &.{},
@@ -404,7 +430,7 @@ test "a narrow window clips the steering rows to width" {
             .editor = &editor,
         } },
         .status = &test_status,
-    };
+    } };
     gpa.free(try projected(gpa, .{ .columns = 8, .rows = 24 }, &scene));
 }
 
@@ -425,11 +451,11 @@ test "projection clips the oldest block to fill the window exactly" {
     }
     try entries.append(gpa, try ui.block.Entry.init(gpa, .model, false, text.items));
 
-    const scene: Scene = .{
+    const scene: Scene = .{ .conversation = .{
         .transcript = entries.items,
         .tail = .{ .prompt = &editor },
         .status = &test_status,
-    };
+    } };
     const rows: usize = 4;
     const painted = try projected(gpa, .{ .columns = 40, .rows = rows }, &scene);
     defer gpa.free(painted);

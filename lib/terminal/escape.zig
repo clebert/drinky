@@ -26,12 +26,18 @@ pub const keyboard_reset = "\x1b[<u";
 pub const cursor_hide = "\x1b[?25l";
 pub const cursor_show = "\x1b[?25h";
 
+/// Enter/leave the alternate screen, preserving the primary screen and its scrollback.
+pub const screen_alternate_set = "\x1b[?1049h";
+pub const screen_alternate_reset = "\x1b[?1049l";
+
 /// Erase from the cursor to the end of the screen.
 pub const screen_clear_below = "\x1b[0J";
+/// Clear the visible screen and home the cursor without touching scrollback.
+pub const screen_repaint = "\x1b[2J\x1b[H";
 /// Clear the whole screen, home the cursor, then drop the scrollback: the full
 /// reset used when a change lands above the viewport and the buffer must be
 /// reprinted from scratch.
-pub const screen_reset = "\x1b[2J\x1b[H\x1b[3J";
+pub const screen_reset = screen_repaint ++ "\x1b[3J";
 
 /// Move the cursor `count` steps: up (`'A'`), down (`'B'`), or right (`'C'`).
 /// No-op at zero, so the sequence is never emitted with an implicit argument.

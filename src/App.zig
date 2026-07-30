@@ -724,6 +724,7 @@ fn handleKeys(self: *App, bytes: []const u8) !void {
 fn handleKey(self: *App, event: *const terminal.Input.Key) !void {
     switch (self.session.mode) {
         .picking => return self.handlePickerKey(event),
+        .viewing => return self.handlePageKey(event),
         .turn => return self.handleTurnKey(event),
         .prompt => {},
     }
@@ -971,6 +972,7 @@ fn refresh(self: *App) !void {
         .{ .columns = window.columns, .rows = window.rows }
     else
         .{ .columns = self.session.columns, .rows = self.session.rows };
+    try self.tty.setAlternateScreen(self.session.mode == .viewing);
     try self.session.paint(size);
 }
 
@@ -1090,6 +1092,10 @@ fn runCommand(self: *App, line: []const u8) !void {
 /// app or agent; presentation-only outcomes go to the session.
 fn applyOutcome(self: *App, outcome: ai.command.Outcome) !void {
     switch (outcome) {
+        .show_system_prompt => try self.session.openPage(&.{
+            .title = "System prompt",
+            .content = self.prompt,
+        }),
         .new_conversation => {
             self.agent.resetConversation();
             self.session.resetConversation();
@@ -1215,6 +1221,29 @@ fn report(
     args: anytype,
 ) !void {
     try self.session.applyOutcome(try ai.command.Outcome.report(self.gpa, status, format, args));
+}
+
+fn handlePageKey(self: *App, event: *const terminal.Input.Key) !void {
+    const page = &self.session.mode.viewing;
+    const size: terminal.View.Size = .{
+        .columns = self.session.columns,
+        .rows = self.session.rows,
+    };
+    switch (event.*) {
+        .escape => return self.session.closePage(),
+        .up => page.moveUp(size),
+        .down => page.moveDown(size),
+        .page_up => page.pageUp(size),
+        .page_down => page.pageDown(size),
+        .home => page.moveHome(),
+        .end => page.moveEnd(size),
+        .char => |codepoint| switch (codepoint) {
+            'm', 'M' => page.toggleSource(size),
+            else => return,
+        },
+        else => return,
+    }
+    self.session.dirty = true;
 }
 
 fn handlePickerKey(self: *App, event: *const terminal.Input.Key) !void {
@@ -2838,6 +2867,89 @@ test "/new clears conversation state without changing the active configuration" 
     try std.testing.expectEqualStrings("", app.session.editor.visible());
     try std.testing.expectEqualStrings(anthropic_default.name, app.agent.model.name);
     try std.testing.expectEqual(ai.llm.Effort.high, app.agent.effort);
+}
+
+test "/system opens the composed prompt alone and escape restores the conversation" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    const full_prompt = "# Core\n\n" ++ "system row\n" ** 30;
+    var app: App = undefined;
+    app.gpa = gpa;
+    app.io = io;
+    app.prompt = full_prompt;
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = anthropic_default,
+        .system = full_prompt,
+        .retry = .{},
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+
+    try app.session.transcript.append(.feedback, false, "history marker");
+    try app.session.editor.insert("/system trailing");
+    try app.submit();
+
+    try std.testing.expect(app.session.mode == .viewing);
+    try std.testing.expectEqualStrings(full_prompt, app.session.mode.viewing.content);
+    try std.testing.expectEqualStrings("", app.session.editor.visible());
+    try std.testing.expectEqual(@as(usize, 1), app.session.transcript.blocks().len);
+    const page_start = out.written().len;
+    try app.session.paint(.{ .columns = 80, .rows = 6 });
+    const page_bytes = out.written()[page_start..];
+    try std.testing.expect(std.mem.indexOf(u8, page_bytes, "System prompt · Esc close") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page_bytes, "M source") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page_bytes, "Core") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page_bytes, "# Core") == null);
+    try std.testing.expect(std.mem.indexOf(u8, page_bytes, "history marker") == null);
+    try std.testing.expect(std.mem.indexOf(u8, page_bytes, anthropic_default.name) == null);
+
+    try app.handleKey(&.{ .char = 'm' });
+    try std.testing.expect(app.session.mode.viewing.presentation == .source);
+    const source_start = out.written().len;
+    try app.session.paint(.{ .columns = 80, .rows = 6 });
+    const source_bytes = out.written()[source_start..];
+    try std.testing.expect(std.mem.indexOf(u8, source_bytes, "M render") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source_bytes, "# Core") != null);
+    try app.handleKey(&.{ .char = 'M' });
+    try std.testing.expect(app.session.mode.viewing.presentation == .markdown);
+
+    const resize_start = out.written().len;
+    try app.session.paint(.{ .columns = 40, .rows = 5 });
+    const resize_bytes = out.written()[resize_start..];
+    try std.testing.expect(std.mem.indexOf(u8, resize_bytes, terminal.escape.screen_repaint) != null);
+    try std.testing.expect(std.mem.indexOf(u8, resize_bytes, "\x1b[3J") == null);
+
+    try app.handleKey(&.{ .ctrl = 'c' });
+    try std.testing.expect(app.session.mode == .viewing);
+    try app.handleKey(&.page_down);
+    try std.testing.expect(app.session.mode.viewing.scroll > 0);
+    try app.handleKey(&.escape);
+    try std.testing.expect(app.session.mode == .prompt);
+    try std.testing.expectEqual(@as(usize, 1), app.session.transcript.blocks().len);
+
+    // Reopen before a refresh can leave the old alternate screen. The new page
+    // must still clear and home that screen before painting.
+    try app.session.editor.insert("/system");
+    try app.submit();
+    const reopen_start = out.written().len;
+    try app.session.paint(.{ .columns = 40, .rows = 5 });
+    const reopen_bytes = out.written()[reopen_start..];
+    try std.testing.expect(std.mem.indexOf(u8, reopen_bytes, terminal.escape.screen_repaint) != null);
+    try std.testing.expect(std.mem.indexOf(u8, reopen_bytes, "M source") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reopen_bytes, "Core") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reopen_bytes, "# Core") == null);
+    try app.handleKey(&.escape);
+    try std.testing.expect(app.session.mode == .prompt);
+
+    const conversation_start = out.written().len;
+    try app.session.paint(.{ .columns = 80, .rows = 6 });
+    const conversation_bytes = out.written()[conversation_start..];
+    try std.testing.expect(std.mem.indexOf(u8, conversation_bytes, "history marker") != null);
+    try std.testing.expect(std.mem.indexOf(u8, conversation_bytes, "System prompt") == null);
 }
 
 test "an account-switch command clears the session's quota snapshot" {

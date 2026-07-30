@@ -14,6 +14,7 @@ const login = @import("login.zig");
 const logout = @import("logout.zig");
 const model = @import("model.zig");
 const new = @import("new.zig");
+const system = @import("system.zig");
 
 const Entry = struct {
     name: []const u8,
@@ -26,6 +27,7 @@ const commands = [_]Entry{
     .{ .name = login.name, .run = login.run },
     .{ .name = logout.name, .run = logout.run },
     .{ .name = new.name, .run = new.run },
+    .{ .name = system.name, .run = system.run },
 };
 
 /// Dispatch a `/`-prefixed input line to its command; an unknown command is an error.
@@ -95,6 +97,16 @@ test "run routes a known command, ignoring the argument tail" {
         },
         else => return error.ExpectedPick,
     }
+}
+
+test "run routes system while ignoring its argument tail" {
+    var context: Context = .{
+        .gpa = undefined,
+        .io = undefined,
+        .agent = undefined,
+        .accounts = undefined,
+    };
+    try std.testing.expect((try run(&context, "/system trailing")) == .show_system_prompt);
 }
 
 test "a newline delimits the command name like a space" {

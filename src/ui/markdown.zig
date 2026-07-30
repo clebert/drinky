@@ -1,8 +1,7 @@
-//! Markdown rendering for the model-authored transcript blocks. `rows` and
-//! `render` run one `walk` over the source, parameterized on a comptime emitter,
-//! so measure and paint break rows in exactly the same places — the parity the
-//! window math asserts. Nothing allocates: every span is a slice of the source
-//! or a static literal, streamed straight into the sink a row at a time.
+//! Markdown rendering for transcript blocks and read-only pages. Measurement,
+//! painting, and source mapping run one `walk` over the source, parameterized on
+//! a comptime emitter, so they break rows in exactly the same places. Nothing
+//! allocates: every span is a source slice or static literal streamed to the sink.
 
 const std = @import("std");
 
@@ -45,6 +44,30 @@ pub fn rows(text: []const u8, columns: usize) usize {
     return counter.count;
 }
 
+pub const RowOptions = struct {
+    columns: usize,
+    row: usize,
+};
+
+pub const SourceOptions = struct {
+    columns: usize,
+    source_offset: usize,
+};
+
+/// Source logical-line offset associated with one rendered physical row.
+pub fn sourceAtRow(text: []const u8, options: *const RowOptions) usize {
+    var locator: SourceAtRow = .{ .target = options.row };
+    walk(SourceAtRow, &locator, text, @max(options.columns, 1)) catch unreachable;
+    return locator.result;
+}
+
+/// First rendered row associated with the logical line containing a source offset.
+pub fn rowAtSource(text: []const u8, options: *const SourceOptions) usize {
+    var locator: RowAtSource = .{ .target = @min(options.source_offset, text.len) };
+    walk(RowAtSource, &locator, text, @max(options.columns, 1)) catch unreachable;
+    return locator.result;
+}
+
 /// Compose the markdown in `text` through `placement`. `tint` — set for
 /// reasoning — replaces every span's foreground and italicizes the whole block,
 /// so the structure still reads while the color stays uniformly muted.
@@ -53,14 +76,69 @@ pub fn render(placement: *const paint.Placement, tint: ?color.Style, text: []con
     try walk(Painter, &painter, text, @max(placement.columns, 1));
 }
 
+pub const WindowOptions = struct {
+    tint: ?color.Style = null,
+    rows_max: usize,
+};
+
+/// Compose a bounded row window after `placement.skip`.
+pub fn renderWindow(
+    placement: *const paint.Placement,
+    text: []const u8,
+    options: *const WindowOptions,
+) !void {
+    var painter: Painter = .{
+        .placement = placement,
+        .tint = options.tint,
+        .line = placement.base,
+        .line_end = placement.skip +| options.rows_max,
+    };
+    try walk(Painter, &painter, text, @max(placement.columns, 1));
+}
+
 /// Tallies rows for `rows`. It holds no sink, so nothing it does can fail.
 const Counter = struct {
     count: usize = 0,
 
+    fn source(_: *Counter, _: usize) void {}
     fn begin(_: *Counter) void {}
     fn span(_: *Counter, _: Look, _: []const u8) !void {}
     fn end(self: *Counter) void {
         self.count += 1;
+    }
+};
+
+const SourceAtRow = struct {
+    target: usize,
+    source_offset: usize = 0,
+    row: usize = 0,
+    result: usize = 0,
+
+    fn source(self: *SourceAtRow, source_offset: usize) void {
+        self.source_offset = source_offset;
+    }
+
+    fn begin(_: *SourceAtRow) void {}
+    fn span(_: *SourceAtRow, _: Look, _: []const u8) !void {}
+    fn end(self: *SourceAtRow) void {
+        if (self.row <= self.target) self.result = self.source_offset;
+        self.row += 1;
+    }
+};
+
+const RowAtSource = struct {
+    target: usize,
+    row: usize = 0,
+    result: usize = 0,
+
+    fn source(self: *RowAtSource, source_offset: usize) void {
+        if (source_offset <= self.target) self.result = self.row;
+    }
+
+    fn begin(_: *RowAtSource) void {}
+    fn span(_: *RowAtSource, _: Look, _: []const u8) !void {}
+    fn end(self: *RowAtSource) void {
+        self.row += 1;
     }
 };
 
@@ -70,10 +148,13 @@ const Painter = struct {
     placement: *const paint.Placement,
     tint: ?color.Style,
     line: usize,
+    line_end: usize = std.math.maxInt(usize),
     hidden: bool = false,
 
+    fn source(_: *Painter, _: usize) void {}
+
     fn begin(self: *Painter) void {
-        self.hidden = self.line < self.placement.skip;
+        self.hidden = self.line < self.placement.skip or self.line >= self.line_end;
         if (!self.hidden) self.placement.sink.begin();
     }
 
@@ -132,6 +213,8 @@ fn walk(comptime Emitter: type, emitter: *Emitter, text: []const u8, columns: us
     var lines = std.mem.splitScalar(u8, text, '\n');
     var maybe_fence: ?Fence = null;
     while (lines.next()) |line| {
+        const source_offset = @intFromPtr(line.ptr) - @intFromPtr(text.ptr);
+        emitter.source(source_offset);
         const indentation = leading(line);
         const rest = line[indentation..];
         const maybe_open_fence = if (indentation <= 3) Fence.open(rest) else null;
@@ -598,8 +681,49 @@ fn painted(
     return gpa.dupe(u8, out.written());
 }
 
+const PaintedWindowOptions = struct {
+    columns: usize,
+    skip: usize,
+    rows_max: usize,
+};
+
+fn paintedWindow(
+    gpa: std.mem.Allocator,
+    text: []const u8,
+    tint: ?color.Style,
+    options: *const PaintedWindowOptions,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var view = terminal.View.init(gpa, &out.writer);
+    defer view.deinit();
+    const sink = try view.beginFrame(.{
+        .columns = options.columns,
+        .rows = options.rows_max,
+    }, 1);
+    const placement: paint.Placement = .{
+        .sink = sink,
+        .id = 0,
+        .columns = options.columns,
+        .base = 0,
+        .skip = options.skip,
+    };
+    try renderWindow(&placement, text, &.{
+        .tint = tint,
+        .rows_max = options.rows_max,
+    });
+    try view.render();
+    return gpa.dupe(u8, out.written());
+}
+
 fn paintedRows(bytes: []const u8) usize {
     return std.mem.count(u8, bytes, "\r\n") + 1;
+}
+
+fn frameBody(bytes: []const u8) []const u8 {
+    std.debug.assert(std.mem.startsWith(u8, bytes, terminal.escape.sync_set));
+    std.debug.assert(std.mem.endsWith(u8, bytes, terminal.escape.sync_reset));
+    return bytes[terminal.escape.sync_set.len .. bytes.len - terminal.escape.sync_reset.len];
 }
 
 // The parity contract: what `rows` counts is exactly what `render` emits, at
@@ -621,6 +745,57 @@ test "markdown renders exactly the rows it counts" {
                 defer gpa.free(bytes);
                 try std.testing.expectEqual(rows(text, columns), paintedRows(bytes));
             }
+        }
+    }
+}
+
+test "markdown windows emit exactly their bounded row slice" {
+    const gpa = std.testing.allocator;
+    for ([_]usize{ 40, 1 }) |columns| {
+        const total = rows(sample, columns);
+        const full = try painted(gpa, sample, columns, null, 0);
+        defer gpa.free(full);
+        for ([_]usize{ 0, 1, @divFloor(total, 2) }) |skip| {
+            if (skip >= total) continue;
+            for ([_]usize{ 1, 3 }) |rows_max| {
+                const bytes = try paintedWindow(gpa, sample, null, &.{
+                    .columns = columns,
+                    .skip = skip,
+                    .rows_max = rows_max,
+                });
+                defer gpa.free(bytes);
+                const expected_count = @min(rows_max, total - skip);
+                try std.testing.expectEqual(expected_count, paintedRows(bytes));
+
+                var expected = std.mem.splitSequence(u8, frameBody(full), "\r\n");
+                for (0..skip) |_| _ = expected.next().?;
+                var actual = std.mem.splitSequence(u8, frameBody(bytes), "\r\n");
+                for (0..expected_count) |_| {
+                    try std.testing.expectEqualStrings(expected.next().?, actual.next().?);
+                }
+                try std.testing.expect(actual.next() == null);
+            }
+        }
+    }
+}
+
+test "rendered rows map back to their source logical line" {
+    for ([_]usize{ 40, 7, 1 }) |columns| {
+        const total = rows(sample, columns);
+        for (0..total) |row| {
+            const source_offset = sourceAtRow(sample, &.{
+                .columns = columns,
+                .row = row,
+            });
+            const first = rowAtSource(sample, &.{
+                .columns = columns,
+                .source_offset = source_offset,
+            });
+            try std.testing.expect(first <= row);
+            try std.testing.expectEqual(source_offset, sourceAtRow(sample, &.{
+                .columns = columns,
+                .row = first,
+            }));
         }
     }
 }

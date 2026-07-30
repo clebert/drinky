@@ -38,6 +38,8 @@ pub const Outcome = union(enum) {
     switch_account: llm.Account,
     /// Clear conversation and presentation state while preserving configuration.
     new_conversation,
+    /// Show the complete provider-neutral system prompt assembled by the app.
+    show_system_prompt,
 
     pub const Status = enum { ok, err };
 

@@ -1,4 +1,4 @@
-//! Reconciling renderer for an inline (non-alternate-screen) frame.
+//! Reconciling renderer for a frame on the primary or alternate terminal screen.
 //!
 //! The caller composes complete, pre-fitted physical rows — the last `pages`
 //! pages of the newest content, never the whole model — through the `Sink` from
@@ -18,7 +18,8 @@
 //! on-screen shrink, or a cleared transcript — reprints from row `0` to erase
 //! them, or resets when they reach into scrollback. Every line is exactly one
 //! physical row, so all cursor motion is a plain row count; each repaint is one
-//! synchronized-output burst.
+//! synchronized-output burst. Primary-screen resets clear inaccessible
+//! scrollback by default; an alternate-screen view can preserve it.
 
 const std = @import("std");
 
@@ -53,6 +54,8 @@ sink: Sink,
 structural_change: bool,
 /// Set by `invalidate`: the screen no longer matches the last painted frame.
 force_reset: bool,
+/// Full resets leave native scrollback intact, for a view on an alternate screen.
+preserve_scrollback: bool,
 
 pub const Size = struct { columns: usize, rows: usize };
 
@@ -197,7 +200,7 @@ const Frame = struct {
 const Mode = enum {
     /// First frame: print from the current cursor, no clear.
     fresh,
-    /// Wipe screen and scrollback, then reprint the whole window from row zero.
+    /// Clear the screen under the configured scrollback policy, then reprint.
     reset,
     /// Move to the anchor row, clear below, and reprint the changed suffix.
     incremental,
@@ -220,6 +223,7 @@ pub fn init(gpa: std.mem.Allocator, writer: *std.Io.Writer) View {
         .sink = undefined,
         .structural_change = false,
         .force_reset = false,
+        .preserve_scrollback = false,
     };
 }
 
@@ -227,12 +231,32 @@ pub fn deinit(self: *View) void {
     for (&self.frames) |*frame| frame.deinit(self.gpa);
 }
 
-/// Force the next `render` to clear the screen and scrollback and reprint: used
-/// after external output (an OAuth login flow) has scrolled the terminal out from
-/// under the diff. The caller has re-hidden the cursor, so tracking resets to match.
+/// Force the next `render` to clear and reprint under the configured scrollback
+/// policy. Used after external output has moved the terminal out from under the
+/// diff; the caller has re-hidden the cursor, so tracking resets to match.
 pub fn invalidate(self: *View) void {
     self.force_reset = true;
     self.cursor_visible = false;
+}
+
+/// Keep visible-screen resets from clearing native scrollback.
+pub fn preserveScrollback(self: *View) void {
+    self.preserve_scrollback = true;
+}
+
+/// Forget both retained frames without writing to the terminal. The caller has
+/// switched to a fresh screen before the next render.
+pub fn forget(self: *View) void {
+    for (&self.frames) |*frame| frame.reset();
+    self.front = 0;
+    self.columns = 0;
+    self.rows = 0;
+    self.pages = 0;
+    self.viewport_top = 0;
+    self.cursor_row = 0;
+    self.cursor_visible = false;
+    self.structural_change = false;
+    self.force_reset = false;
 }
 
 /// Begin composing the next frame at `size` and `pages`: reset the back frame
@@ -338,7 +362,7 @@ fn paint(self: *View, mode: Mode, frame: *const Frame, rows: struct {
     try writer.writeAll(escape.sync_set);
     switch (mode) {
         .fresh => {},
-        .reset => try writer.writeAll(escape.screen_reset),
+        .reset => try writer.writeAll(self.resetSequence()),
         .incremental => {
             if (rows.cursor_from >= rows.anchor) {
                 try escape.cursorMove(writer, 'A', rows.cursor_from - rows.anchor);
@@ -376,7 +400,7 @@ fn paintCaretOnly(self: *View, frame: *const Frame) !void {
 fn paintEmpty(self: *View, prev_empty: bool) !void {
     const writer = self.writer;
     try writer.writeAll(escape.sync_set);
-    if (!prev_empty) try writer.writeAll(escape.screen_reset);
+    if (!prev_empty) try writer.writeAll(self.resetSequence());
     if (self.cursor_visible) {
         try writer.writeAll(escape.cursor_hide);
         self.cursor_visible = false;
@@ -385,6 +409,10 @@ fn paintEmpty(self: *View, prev_empty: bool) !void {
     try writer.flush();
     self.viewport_top = 0;
     self.cursor_row = 0;
+}
+
+fn resetSequence(self: *const View) []const u8 {
+    return if (self.preserve_scrollback) escape.screen_repaint else escape.screen_reset;
 }
 
 /// Move the hardware cursor from `from_row` to `frame`'s caret and show it, or

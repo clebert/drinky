@@ -37,6 +37,8 @@ pub const Key = union(enum) {
     right,
     up,
     down,
+    page_up,
+    page_down,
     home,
     end,
     /// Alt+Up (Kitty legacy-modified arrow), decoded distinctly from a bare Up.
@@ -176,6 +178,8 @@ fn mapControlSequence(parameters: []const u8, final: u8) Key {
     if (final == '~') {
         if (std.mem.eql(u8, parameters, "1") or std.mem.eql(u8, parameters, "7")) return .home;
         if (std.mem.eql(u8, parameters, "4") or std.mem.eql(u8, parameters, "8")) return .end;
+        if (std.mem.eql(u8, parameters, "5")) return .page_up;
+        if (std.mem.eql(u8, parameters, "6")) return .page_down;
         return .unknown;
     }
     if (final == 'u') return mapCsiU(parameters);
@@ -279,6 +283,7 @@ test "arrows and navigation" {
     try expectKeys("\x1b[A\x1b[D", &.{ .up, .left });
     try expectKeys("\x1bOC", &.{.right});
     try expectKeys("\x1b[H\x1b[4~", &.{ .home, .end });
+    try expectKeys("\x1b[5~\x1b[6~", &.{ .page_up, .page_down });
 }
 
 test "alt+up decodes apart from a bare or otherwise-modified up" {

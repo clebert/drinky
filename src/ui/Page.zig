@@ -1,0 +1,400 @@
+//! A temporary full-window, read-only page: one muted title and key-hint row
+//! above a bounded body. Pages own their source and can show rendered Markdown
+//! or the exact wrapped source, preserving a source location across reflow.
+
+const std = @import("std");
+
+const terminal = @import("terminal");
+
+const color = @import("color.zig");
+const markdown = @import("markdown.zig");
+const paint = @import("paint.zig");
+
+const Page = @This();
+
+const hint = "↑/↓ scroll · PgUp/PgDn page · Home/End";
+
+gpa: std.mem.Allocator,
+header_markdown: []const u8,
+header_source: []const u8,
+content: []const u8,
+/// First rendered body row visible below the fixed header.
+scroll: usize,
+/// Source location retained when width or presentation changes.
+source_offset: usize,
+presentation: Presentation,
+layout_columns: usize,
+layout_presentation: Presentation,
+
+pub const Presentation = enum { markdown, source };
+
+pub const Options = struct {
+    title: []const u8,
+    content: []const u8,
+    presentation: Presentation = .markdown,
+};
+
+/// Copy the title and content into a page owned by `gpa`.
+pub fn init(gpa: std.mem.Allocator, options: *const Options) !Page {
+    const header_markdown = try std.fmt.allocPrint(gpa, "{s} · Esc close · M source · {s}", .{
+        options.title,
+        hint,
+    });
+    errdefer gpa.free(header_markdown);
+    const header_source = try std.fmt.allocPrint(gpa, "{s} · Esc close · M render · {s}", .{
+        options.title,
+        hint,
+    });
+    errdefer gpa.free(header_source);
+    const content = try gpa.dupe(u8, options.content);
+    return .{
+        .gpa = gpa,
+        .header_markdown = header_markdown,
+        .header_source = header_source,
+        .content = content,
+        .scroll = 0,
+        .source_offset = 0,
+        .presentation = options.presentation,
+        .layout_columns = 0,
+        .layout_presentation = options.presentation,
+    };
+}
+
+pub fn deinit(self: *Page) void {
+    self.gpa.free(self.header_markdown);
+    self.gpa.free(self.header_source);
+    self.gpa.free(self.content);
+}
+
+/// Preserve the current source location across width and presentation changes,
+/// and clamp the window after height changes.
+pub fn reflow(self: *Page, size: terminal.View.Size) void {
+    const columns = @max(size.columns, 1);
+    const layout_changed = columns != self.layout_columns or
+        self.presentation != self.layout_presentation;
+    if (layout_changed) {
+        self.scroll = self.rowAtSource(size, self.source_offset);
+        self.layout_columns = columns;
+        self.layout_presentation = self.presentation;
+    }
+
+    const scroll_max = self.scrollMax(size);
+    if (self.scroll > scroll_max) {
+        self.scroll = scroll_max;
+        self.source_offset = self.sourceAtRow(size, self.scroll);
+    }
+}
+
+pub fn moveUp(self: *Page, size: terminal.View.Size) void {
+    self.reflow(size);
+    self.setScroll(size, self.scroll -| 1);
+}
+
+pub fn moveDown(self: *Page, size: terminal.View.Size) void {
+    self.reflow(size);
+    self.setScroll(size, self.scroll +| 1);
+}
+
+pub fn pageUp(self: *Page, size: terminal.View.Size) void {
+    self.reflow(size);
+    self.setScroll(size, self.scroll -| @max(bodyRows(size), 1));
+}
+
+pub fn pageDown(self: *Page, size: terminal.View.Size) void {
+    self.reflow(size);
+    self.setScroll(size, self.scroll +| @max(bodyRows(size), 1));
+}
+
+pub fn moveHome(self: *Page) void {
+    self.scroll = 0;
+    self.source_offset = 0;
+}
+
+pub fn moveEnd(self: *Page, size: terminal.View.Size) void {
+    self.reflow(size);
+    self.setScroll(size, self.scrollMax(size));
+}
+
+/// Toggle between rendered Markdown and exact source around the same source line.
+pub fn toggleSource(self: *Page, size: terminal.View.Size) void {
+    self.reflow(size);
+    self.source_offset = self.sourceAtRow(size, self.scroll);
+    self.presentation = switch (self.presentation) {
+        .markdown => .source,
+        .source => .markdown,
+    };
+    self.reflow(size);
+}
+
+/// Render the fixed header and the active presentation's bounded body window.
+pub fn render(
+    self: *const Page,
+    placement: *const paint.Placement,
+    size: terminal.View.Size,
+) !void {
+    try self.renderHeader(placement);
+    switch (self.presentation) {
+        .markdown => try self.renderMarkdown(placement, size),
+        .source => try self.renderSource(placement, size),
+    }
+}
+
+fn renderHeader(self: *const Page, placement: *const paint.Placement) !void {
+    if (placement.base < placement.skip) return;
+    const header = switch (self.presentation) {
+        .markdown => self.header_markdown,
+        .source => self.header_source,
+    };
+    placement.sink.begin();
+    try color.apply(placement.sink, .muted_foreground);
+    try placement.sink.text(header);
+    try color.apply(placement.sink, .reset);
+    placement.sink.end(.{ .id = placement.id, .line = placement.base });
+}
+
+fn renderMarkdown(
+    self: *const Page,
+    placement: *const paint.Placement,
+    size: terminal.View.Size,
+) !void {
+    const body_base = placement.base + 1;
+    const body_placement: paint.Placement = .{
+        .sink = placement.sink,
+        .id = placement.id,
+        .columns = placement.columns,
+        .base = body_base,
+        .skip = body_base + self.scroll,
+    };
+    try markdown.renderWindow(&body_placement, self.content, &.{
+        .rows_max = bodyRows(size),
+    });
+}
+
+fn renderSource(
+    self: *const Page,
+    placement: *const paint.Placement,
+    size: terminal.View.Size,
+) !void {
+    const visible_rows = bodyRows(size);
+    const columns_max = @max(size.columns, 1);
+    var iterator = terminal.width.wrapper(self.content, columns_max);
+    var source_index: usize = 0;
+    var shown: usize = 0;
+    while (iterator.next()) |row| : (source_index += 1) {
+        if (source_index < self.scroll) continue;
+        if (shown >= visible_rows) break;
+        const local_line = 1 + shown;
+        shown += 1;
+        if (placement.base + local_line < placement.skip) continue;
+        placement.sink.begin();
+        try placement.sink.text(row);
+        placement.sink.end(.{
+            .id = placement.id,
+            .line = placement.base + 1 + source_index,
+        });
+    }
+}
+
+fn bodyRows(size: terminal.View.Size) usize {
+    return @max(size.rows, 1) - 1;
+}
+
+fn totalRows(self: *const Page, size: terminal.View.Size) usize {
+    return switch (self.presentation) {
+        .markdown => markdown.rows(self.content, size.columns),
+        .source => terminal.width.rows(self.content, @max(size.columns, 1)),
+    };
+}
+
+fn scrollMax(self: *const Page, size: terminal.View.Size) usize {
+    return self.totalRows(size) -| bodyRows(size);
+}
+
+fn setScroll(self: *Page, size: terminal.View.Size, row: usize) void {
+    self.scroll = @min(row, self.scrollMax(size));
+    self.source_offset = self.sourceAtRow(size, self.scroll);
+}
+
+fn sourceAtRow(self: *const Page, size: terminal.View.Size, row: usize) usize {
+    return switch (self.presentation) {
+        .markdown => markdown.sourceAtRow(self.content, &.{
+            .columns = size.columns,
+            .row = row,
+        }),
+        .source => self.sourceOffsetAtRow(size, row),
+    };
+}
+
+fn rowAtSource(self: *const Page, size: terminal.View.Size, source_offset: usize) usize {
+    return switch (self.presentation) {
+        .markdown => markdown.rowAtSource(self.content, &.{
+            .columns = size.columns,
+            .source_offset = source_offset,
+        }),
+        .source => self.sourceRowAtOffset(size, source_offset),
+    };
+}
+
+fn sourceRowAtOffset(self: *const Page, size: terminal.View.Size, source_offset: usize) usize {
+    const target = @min(source_offset, self.content.len);
+    var iterator = terminal.width.wrapper(self.content, @max(size.columns, 1));
+    var result: usize = 0;
+    var index: usize = 0;
+    while (iterator.next()) |row| : (index += 1) {
+        const offset = @intFromPtr(row.ptr) - @intFromPtr(self.content.ptr);
+        if (offset > target) break;
+        result = index;
+    }
+    return result;
+}
+
+fn sourceOffsetAtRow(self: *const Page, size: terminal.View.Size, target: usize) usize {
+    var iterator = terminal.width.wrapper(self.content, @max(size.columns, 1));
+    var index: usize = 0;
+    while (iterator.next()) |row| : (index += 1) {
+        if (index == target) return @intFromPtr(row.ptr) - @intFromPtr(self.content.ptr);
+    }
+    return self.content.len;
+}
+
+fn renderForTest(page: *const Page, size: terminal.View.Size) ![]u8 {
+    const gpa = std.testing.allocator;
+    var output: std.Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    var view = terminal.View.init(gpa, &output.writer);
+    defer view.deinit();
+    const sink = try view.beginFrame(size, 1);
+    const placement: paint.Placement = .{
+        .sink = sink,
+        .id = 1,
+        .columns = size.columns,
+        .base = 0,
+        .skip = 0,
+    };
+    try page.render(&placement, size);
+    try view.render();
+    return gpa.dupe(u8, output.written());
+}
+
+test "source navigation scrolls by wrapped body rows and clamps at both ends" {
+    const gpa = std.testing.allocator;
+    var page = try Page.init(gpa, &.{
+        .title = "Title",
+        .content = "L0\nL1\nL2\nL3",
+        .presentation = .source,
+    });
+    defer page.deinit();
+    const size: terminal.View.Size = .{ .columns = 80, .rows = 3 };
+
+    page.moveUp(size);
+    try std.testing.expectEqual(@as(usize, 0), page.scroll);
+    page.moveDown(size);
+    try std.testing.expectEqual(@as(usize, 1), page.scroll);
+    page.pageDown(size);
+    try std.testing.expectEqual(@as(usize, 2), page.scroll);
+    page.moveDown(size);
+    try std.testing.expectEqual(@as(usize, 2), page.scroll);
+    page.pageUp(size);
+    try std.testing.expectEqual(@as(usize, 0), page.scroll);
+    page.moveEnd(size);
+    try std.testing.expectEqual(@as(usize, 2), page.scroll);
+    page.moveHome();
+    try std.testing.expectEqual(@as(usize, 0), page.scroll);
+
+    page.moveEnd(size);
+    page.reflow(.{ .columns = 80, .rows = 5 });
+    try std.testing.expectEqual(@as(usize, 0), page.scroll);
+}
+
+test "source reflow preserves the byte location across width changes" {
+    const gpa = std.testing.allocator;
+    var page = try Page.init(gpa, &.{
+        .title = "Title",
+        .content = "abcdefghij\nlast",
+        .presentation = .source,
+    });
+    defer page.deinit();
+    const narrow: terminal.View.Size = .{ .columns = 5, .rows = 2 };
+
+    page.moveDown(narrow);
+    try std.testing.expectEqual(@as(usize, 1), page.scroll);
+    try std.testing.expectEqual(@as(usize, 5), page.source_offset);
+    page.reflow(.{ .columns = 10, .rows = 2 });
+    try std.testing.expectEqual(@as(usize, 0), page.scroll);
+    try std.testing.expectEqual(@as(usize, 5), page.source_offset);
+    page.reflow(narrow);
+    try std.testing.expectEqual(@as(usize, 1), page.scroll);
+    try std.testing.expectEqual(@as(usize, 5), page.source_offset);
+}
+
+test "markdown is default and source toggles around the same logical line" {
+    const gpa = std.testing.allocator;
+    var page = try Page.init(gpa, &.{
+        .title = "System prompt",
+        .content = "# Heading\n\n- item with **bold** text\nplain 1\nplain 2\nplain 3\nplain 4",
+    });
+    defer page.deinit();
+    const size: terminal.View.Size = .{ .columns = 80, .rows = 6 };
+    page.reflow(size);
+
+    const rendered = try renderForTest(&page, size);
+    defer gpa.free(rendered);
+    try std.testing.expect(page.presentation == .markdown);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "M source") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "# Heading") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "Heading") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "**bold**") == null);
+
+    page.moveEnd(size);
+    const source_offset = page.source_offset;
+    try std.testing.expect(source_offset > 0);
+    page.toggleSource(size);
+    try std.testing.expect(page.presentation == .source);
+    try std.testing.expectEqual(source_offset, page.source_offset);
+    const source = try renderForTest(&page, size);
+    defer gpa.free(source);
+    try std.testing.expect(std.mem.indexOf(u8, source, "M render") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "**bold**") != null);
+
+    const narrow: terminal.View.Size = .{ .columns = 20, .rows = 6 };
+    page.reflow(narrow);
+    try std.testing.expectEqual(source_offset, page.source_offset);
+    page.toggleSource(narrow);
+    try std.testing.expect(page.presentation == .markdown);
+    try std.testing.expectEqual(source_offset, page.source_offset);
+    page.reflow(size);
+    try std.testing.expectEqual(source_offset, page.source_offset);
+}
+
+test "source rendering is bounded and sanitizes terminal controls" {
+    const gpa = std.testing.allocator;
+    var page = try Page.init(gpa, &.{
+        .title = "System prompt",
+        .content = "first\nsecond\x1b[2J\nthird",
+        .presentation = .source,
+    });
+    defer page.deinit();
+    const size: terminal.View.Size = .{ .columns = 80, .rows = 3 };
+    page.pageDown(size);
+
+    const painted = try renderForTest(&page, size);
+    defer gpa.free(painted);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "System prompt · Esc close") != null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "first") == null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "second") != null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "third") != null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "\x1b[2J") == null);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, painted, "\r\n"));
+}
+
+test "a one-row page renders only its header" {
+    const gpa = std.testing.allocator;
+    var page = try Page.init(gpa, &.{ .title = "Title", .content = "# Hidden" });
+    defer page.deinit();
+    const painted = try renderForTest(&page, .{ .columns = 80, .rows = 1 });
+    defer gpa.free(painted);
+
+    try std.testing.expect(std.mem.indexOf(u8, painted, "Title · Esc close") != null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "Hidden") == null);
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, painted, "\r\n"));
+}

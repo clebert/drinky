@@ -1,10 +1,10 @@
 //! The render consumer: the durable model the interface projects and the code
-//! that applies events to it and paints. Owns the `Transcript`, the live-tail
-//! `mode` (prompt / streaming turn / picker), the `editor`, the reconciling
-//! `view`, the last laid-out dimensions, and consumer-side snapshots of usage and
-//! the active model. Everything here is io-, tty-, and agent-free: producers hand
-//! it `UiEvent`s and `App` drives its mutations, so the render loop can be tested
-//! from a scripted event sequence without real io.
+//! that applies events to it and paints. Owns the `Transcript`, the interaction
+//! `mode` (prompt / streaming turn / picker / read-only page), the `editor`, the
+//! reconciling `view`, the last laid-out dimensions, and consumer-side snapshots
+//! of usage and the active model. Everything here is io-, tty-, and agent-free:
+//! producers hand it `UiEvent`s and `App` drives its mutations, so the render
+//! loop can be tested from a scripted event sequence without real io.
 
 const std = @import("std");
 
@@ -24,10 +24,12 @@ const truncated_notice = "response truncated at the model's output or context li
 gpa: std.mem.Allocator,
 transcript: Transcript,
 editor: ui.Editor,
+/// The primary-screen conversation renderer remains untouched while a page is open.
 view: terminal.View,
-/// The current interaction. Exactly one input is live: the editor while waiting
-/// (`prompt`) or streaming a turn (`turn`, where it stays live for steering), or
-/// a `picker`.
+/// A separate renderer for temporary content on the alternate screen.
+page_view: terminal.View,
+/// The current interaction. The editor is live while waiting or streaming; a
+/// picker or full-window page replaces it.
 mode: Mode,
 columns: usize,
 rows: usize,
@@ -76,6 +78,7 @@ const Mode = union(enum) {
     prompt,
     turn: Turn,
     picking: Picking,
+    viewing: ui.Page,
 };
 
 /// A streaming turn: the input-border activity tick and the tool calls currently
@@ -208,11 +211,12 @@ pub fn init(
     model: ai.models.Model,
     effort: ai.llm.Effort,
 ) Session {
-    return .{
+    var self: Session = .{
         .gpa = gpa,
         .transcript = Transcript.init(gpa),
         .editor = ui.Editor.init(gpa),
         .view = terminal.View.init(gpa, writer),
+        .page_view = terminal.View.init(gpa, writer),
         .mode = .prompt,
         .columns = 80,
         .rows = 24,
@@ -227,6 +231,8 @@ pub fn init(
         .steering_view = .empty,
         .turn_origin = null,
     };
+    self.page_view.preserveScrollback();
+    return self;
 }
 
 pub fn deinit(self: *Session) void {
@@ -235,6 +241,7 @@ pub fn deinit(self: *Session) void {
     self.steering.deinit(self.gpa);
     self.steering_view.deinit(self.gpa);
     self.transcript.deinit();
+    self.page_view.deinit();
     self.view.deinit();
     self.editor.deinit();
 }
@@ -257,6 +264,7 @@ fn deinitMode(self: *Session) void {
             self.dropTurnOrigin();
         },
         .picking => |*picking| picking.picker.deinit(),
+        .viewing => |*page| page.deinit(),
     }
 }
 
@@ -357,9 +365,15 @@ pub fn applyOutcome(self: *Session, outcome: ai.command.Outcome) !void {
             try self.transcript.append(.feedback, feedback.is_error, feedback.content);
         },
         .pick => |pick| try self.openPicker(pick),
-        // The app intercepts prompt, account, and conversation actions (they
-        // need I/O, the tty, or the agent); they never reach the io-free session.
-        .prompt, .login, .logout, .switch_account, .new_conversation => unreachable,
+        // The app intercepts prompt, account, conversation, and inspection
+        // actions; they never reach the io-free session.
+        .prompt,
+        .login,
+        .logout,
+        .switch_account,
+        .new_conversation,
+        .show_system_prompt,
+        => unreachable,
     }
     self.dirty = true;
 }
@@ -394,6 +408,29 @@ pub fn closePicker(self: *Session) void {
 pub fn cancelPicker(self: *Session) !void {
     self.closePicker();
     try self.transcript.append(.feedback, false, "cancelled");
+}
+
+/// Open an owned read-only page over an idle conversation.
+pub fn openPage(self: *Session, options: *const ui.Page.Options) !void {
+    std.debug.assert(self.mode == .prompt);
+    var page = try ui.Page.init(self.gpa, options);
+    page.reflow(.{ .columns = self.columns, .rows = self.rows });
+    self.page_view.forget();
+    self.page_view.invalidate();
+    self.mode = .{ .viewing = page };
+    self.dirty = true;
+}
+
+/// Close a page silently and request a non-destructive conversation repaint.
+pub fn closePage(self: *Session) void {
+    switch (self.mode) {
+        .viewing => |*page| {
+            page.deinit();
+            self.mode = .prompt;
+            self.dirty = true;
+        },
+        else => {},
+    }
 }
 
 /// Reserve capacity for one more queued steering draft, so `App.submitSteering`'s
@@ -626,6 +663,16 @@ pub fn endTurn(self: *Session) void {
 pub fn paint(self: *Session, size: terminal.View.Size) !void {
     self.columns = size.columns;
     self.rows = size.rows;
+    switch (self.mode) {
+        .viewing => |*page| {
+            page.reflow(size);
+            const scene: layout.Scene = .{ .page = page };
+            try layout.project(&self.page_view, size, &scene);
+            return;
+        },
+        else => {},
+    }
+
     const status: ui.status.Info = .{
         .last = self.stats_shown.last,
         .cost = self.stats_shown.cost,
@@ -655,12 +702,13 @@ pub fn paint(self: *Session, size: terminal.View.Size) !void {
             picking.picker.reflow(size);
             break :picking .{ .picking = &picking.picker };
         },
+        .viewing => unreachable,
     };
-    const scene: layout.Scene = .{
+    const scene: layout.Scene = .{ .conversation = .{
         .transcript = self.transcript.blocks(),
         .tail = tail,
         .status = &status,
-    };
+    } };
     try layout.project(&self.view, size, &scene);
 }
 

@@ -80,6 +80,8 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - **/login** — sign in, switch to an account already signed in, or name the API key to set.
 - **/logout** — drop a subscription's credentials and hand the session to another account.
 - **/new** — clear the conversation, usage stats, and steering without changing its configuration.
+- **/system** — inspect the complete provider-neutral system prompt as rendered Markdown in a
+  scrollable full-window page, with `M` toggling its exact source.
 - **/skill:name** — load a discovered skill explicitly, recording a compact `[skill]` marker and
   appending any trailing text as its task.
 - Every other command answers with a line in the transcript, and an unknown one never reaches the
@@ -102,8 +104,8 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 
 ## The interface
 
-- Renders inline into the normal screen buffer: settled rows scroll into your real scrollback, never
-  an alternate screen.
+- The conversation renders inline into the normal screen buffer and real scrollback; temporary
+  full-window pages use the alternate screen and restore the conversation on close.
 - Repaints only the rows that changed, atomically; a resize or a change above the viewport reprints
   the window.
 - Restores the terminal on exit, on a failed start, and around an interactive OAuth login.
