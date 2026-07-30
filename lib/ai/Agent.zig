@@ -162,6 +162,15 @@ const Call = struct {
         pending,
         finished: anyerror!tool.Result,
     };
+
+    fn takeFinished(self: *Call) anyerror!tool.Result {
+        const finished = switch (self.result) {
+            .pending => unreachable,
+            .finished => |result| result,
+        };
+        self.result = .pending;
+        return finished;
+    }
 };
 
 /// The production fetch: `provider.Client.send` on the active account. A seam
@@ -918,15 +927,13 @@ fn presentReady(
 /// leaves provider-visible history honest. A call that raised instead of
 /// returning a result propagates its error, leaving the synthetic result intact.
 fn presentResult(self: *Agent, call: *Call, turn: *TurnState, handler: anytype) !void {
-    const result = switch (call.result) {
-        .pending => unreachable,
-        .finished => |finished| try finished,
-    };
-    self.transferResult(call, result);
+    var result = try call.takeFinished();
+    defer result.deinit(self.gpa);
+    self.transferResult(call, &result);
     const slot = self.items.items[call.result_index].tool_result;
     try presentation(
         &turn.presentation_closed,
-        handler.onToolResult(call.name, slot.content, slot.is_error),
+        handler.onToolResult(call.name, slot.content, result.summary, slot.is_error),
     );
 }
 
@@ -935,21 +942,20 @@ fn presentResult(self: *Agent, call: *Call, turn: *TurnState, handler: anytype) 
 fn harvestResults(self: *Agent, calls: []Call) void {
     for (calls) |*call| {
         if (call.moved) continue;
-        const finished = switch (call.result) {
-            .pending => continue,
-            .finished => |result| result,
-        };
-        const result = finished catch continue;
-        self.transferResult(call, result);
+        if (call.result == .pending) continue;
+        var result = call.takeFinished() catch continue;
+        defer result.deinit(self.gpa);
+        self.transferResult(call, &result);
     }
 }
 
 /// Move a completed result's owned content into its reserved slot, replacing and
-/// freeing the synthetic content it held. Allocation-free.
-fn transferResult(self: *Agent, call: *Call, result: tool.Result) void {
+/// freeing the synthetic content it held. The result retains every other owned
+/// field for its deferred `deinit`.
+fn transferResult(self: *Agent, call: *Call, result: *tool.Result) void {
     const slot = &self.items.items[call.result_index].tool_result;
     self.gpa.free(slot.content);
-    slot.content = result.content;
+    slot.content = result.takeContent();
     slot.is_error = result.is_error;
     call.moved = true;
 }
@@ -1361,6 +1367,7 @@ const CaptureHandler = struct {
     usage_count: usize = 0,
     tool_start_count: usize = 0,
     tool_result_count: usize = 0,
+    tool_summary_count: usize = 0,
     stream_reset_count: usize = 0,
     steer_count: usize = 0,
     checkpoint_count: usize = 0,
@@ -1413,12 +1420,14 @@ const CaptureHandler = struct {
         self: *CaptureHandler,
         name: []const u8,
         content: []const u8,
+        maybe_summary: ?[]const u8,
         is_error: bool,
     ) !void {
         _ = name;
         _ = content;
         _ = is_error;
         self.tool_result_count += 1;
+        if (maybe_summary != null) self.tool_summary_count += 1;
     }
 };
 
@@ -2607,7 +2616,13 @@ test "a barrier presents the reads before it before announcing its mutation" {
         fn onToolStart(self: *@This(), name: []const u8, _: []const u8) !void {
             try self.note("+", name);
         }
-        fn onToolResult(self: *@This(), name: []const u8, _: []const u8, _: bool) !void {
+        fn onToolResult(
+            self: *@This(),
+            name: []const u8,
+            _: []const u8,
+            _: ?[]const u8,
+            _: bool,
+        ) !void {
             try self.note("-", name);
         }
     };
@@ -3023,7 +3038,13 @@ const fake_tools = struct {
     fn run(context: *const tool.Context, name: []const u8, input_json: []const u8) !tool.Result {
         _ = name;
         _ = input_json;
-        return .{ .content = try context.gpa.dupe(u8, "ok"), .is_error = false };
+        const content = try context.gpa.dupe(u8, "ok");
+        errdefer context.gpa.free(content);
+        return .{
+            .content = content,
+            .summary = try context.gpa.dupe(u8, "summary"),
+            .is_error = false,
+        };
     }
 };
 
@@ -3053,7 +3074,13 @@ const not_run_tools = struct {
     fn run(context: *const tool.Context, name: []const u8, input_json: []const u8) !tool.Result {
         _ = input_json;
         if (std.mem.eql(u8, name, "fail")) return error.NotRun;
-        return .{ .content = try context.gpa.dupe(u8, "ok"), .is_error = false };
+        const content = try context.gpa.dupe(u8, "ok");
+        errdefer context.gpa.free(content);
+        return .{
+            .content = content,
+            .summary = try context.gpa.dupe(u8, "summary"),
+            .is_error = false,
+        };
     }
 };
 
@@ -3108,7 +3135,15 @@ test "a completed mutation's real result survives a callback failure" {
     // so a callback failure cannot leave provider-visible history dishonest.
     const Handler = struct {
         fn onToolStart(_: *@This(), _: []const u8, _: []const u8) !void {}
-        fn onToolResult(_: *@This(), _: []const u8, _: []const u8, _: bool) !void {
+        fn onToolResult(
+            _: *@This(),
+            _: []const u8,
+            _: []const u8,
+            maybe_summary: ?[]const u8,
+            _: bool,
+        ) !void {
+            const summary = maybe_summary orelse return error.NoSummary;
+            try std.testing.expectEqualStrings("summary", summary);
             return error.Boom;
         }
     };
@@ -3215,6 +3250,7 @@ test "cancellation after a completed tool round retains it at the checkpoint" {
     try std.testing.expectEqual(@as(usize, 3), outcome.receipt.history_end);
     try std.testing.expectEqualStrings("ok", agent.items.items[2].tool_result.content);
     try std.testing.expect(!agent.items.items[2].tool_result.is_error);
+    try std.testing.expectEqual(@as(usize, 1), handler.tool_summary_count);
 }
 
 test "cancellation before the first reply returns exactly to the turn base" {

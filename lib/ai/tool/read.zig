@@ -72,9 +72,9 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
         return Result.report(gpa, .err, "{s} is not a UTF-8 text file", .{path});
     }
 
-    const total = std.mem.count(u8, data, "\n") + 1;
+    const total = lineCount(data);
     const start = if (offset > 0) offset - 1 else 0;
-    if (start >= total) {
+    if (start >= total and !(total == 0 and start == 0)) {
         return Result.report(gpa, .err, "offset {d} is past the end of {s} ({d} lines)", .{
             offset,
             path,
@@ -83,6 +83,15 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
     }
     const shown_max = @min(limit orelse lines_max, lines_max);
     if (shown_max == 0) return Result.report(gpa, .err, "limit must be at least 1", .{});
+    if (total == 0) {
+        const content = try gpa.dupe(u8, "");
+        errdefer gpa.free(content);
+        return .{
+            .content = content,
+            .summary = try gpa.dupe(u8, "0 lines · 0 B"),
+            .is_error = false,
+        };
+    }
 
     var out: std.Io.Writer.Allocating = .init(gpa);
     errdefer out.deinit();
@@ -93,6 +102,7 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
     var truncated = false;
     var lines = std.mem.splitScalar(u8, data, '\n');
     while (lines.next()) |line| : (index += 1) {
+        if (index >= total) break;
         if (index < start) continue;
         if (shown >= shown_max) break;
         if (shown > 0 and bytes + line.len > bytes_max) break;
@@ -111,19 +121,48 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
         last = index;
         shown += 1;
     }
+    if (!truncated and (last + 1 < total or data[data.len - 1] == '\n'))
+        try out.writer.writeAll("\n");
+    const body_bytes = out.written().len;
     if (truncated) {
+        const written = out.written();
+        const separator =
+            if (written.len > 0 and written[written.len - 1] == '\n') "\n" else "\n\n";
         try out.writer.print(
-            "\n\n[line {d} exceeds {d} bytes and was truncated]",
-            .{ last + 1, bytes_max },
+            "{s}[line {d} exceeds {d} bytes and was truncated]",
+            .{ separator, last + 1, bytes_max },
         );
     }
     if (last + 1 < total) {
+        const written = out.written();
+        const separator =
+            if (written.len > 0 and written[written.len - 1] == '\n') "\n" else "\n\n";
         try out.writer.print(
-            "\n\n[showing lines {d}-{d} of {d}; use offset={d} to continue]",
-            .{ start + 1, last + 1, total, last + 2 },
+            "{s}[showing lines {d}-{d} of {d}; use offset={d} to continue]",
+            .{ separator, start + 1, last + 1, total, last + 2 },
         );
     }
-    return .{ .content = try out.toOwnedSlice(), .is_error = false };
+
+    var size_buffer: [16]u8 = undefined;
+    const size = humanBytes(&size_buffer, body_bytes);
+    const remaining = total - (last + 1);
+    const plural_suffix: []const u8 = if (shown == 1) "" else "s";
+    const truncation_suffix = if (truncated) " · line truncated" else "";
+    const summary = if (start == 0 and remaining == 0)
+        try std.fmt.allocPrint(gpa, "{d} line{s} · {s}{s}", .{
+            shown, plural_suffix, size, truncation_suffix,
+        })
+    else if (remaining == 0)
+        try std.fmt.allocPrint(gpa, "lines {d}–{d} of {d} · {s}{s}", .{
+            start + 1, last + 1, total, size, truncation_suffix,
+        })
+    else
+        try std.fmt.allocPrint(gpa, "lines {d}–{d} of {d} · {s} · {d} more{s}", .{
+            start + 1, last + 1, total, size, remaining, truncation_suffix,
+        });
+    errdefer gpa.free(summary);
+    const content = try out.toOwnedSlice();
+    return .{ .content = content, .summary = summary, .is_error = false };
 }
 
 /// Largest length no greater than `max` that does not split a UTF-8 codepoint,
@@ -132,6 +171,31 @@ fn utf8FloorLength(bytes: []const u8, max: usize) usize {
     var end = @min(bytes.len, max);
     while (end > 0 and end < bytes.len and bytes[end] & 0xC0 == 0x80) end -= 1;
     return end;
+}
+
+/// The number of lines in `text`, excluding the empty segment after a trailing
+/// newline; empty text has no lines.
+fn lineCount(text: []const u8) usize {
+    if (text.len == 0) return 0;
+    const newlines = std.mem.count(u8, text, "\n");
+    return if (text[text.len - 1] == '\n') newlines else newlines + 1;
+}
+
+/// A compact byte size for the box summary: bytes under 1 KB, else KB or MB to
+/// one decimal. Integer math throughout; `buffer` needs only a dozen bytes and a
+/// read window is far too small to overflow the tenths scaling.
+fn humanBytes(buffer: []u8, bytes: usize) []const u8 {
+    if (bytes < 1024) return std.fmt.bufPrint(buffer, "{d} B", .{bytes}) catch unreachable;
+    const tenths_kb = @divFloor(bytes * 10, 1024);
+    if (tenths_kb < 10 * 1024) return std.fmt.bufPrint(buffer, "{d}.{d} KB", .{
+        @divFloor(tenths_kb, 10),
+        @mod(tenths_kb, 10),
+    }) catch unreachable;
+    const tenths_mb = @divFloor(bytes * 10, 1024 * 1024);
+    return std.fmt.bufPrint(buffer, "{d}.{d} MB", .{
+        @divFloor(tenths_mb, 10),
+        @mod(tenths_mb, 10),
+    }) catch unreachable;
 }
 
 test "read rejects invalid input" {
@@ -144,7 +208,7 @@ test "read of missing file reports an error" {
     const result = try run(&context,
         \\{"path":"/definitely/not/here.txt"}
     );
-    defer std.testing.allocator.free(result.content);
+    defer result.deinit(std.testing.allocator);
     try std.testing.expect(result.is_error);
 }
 
@@ -159,10 +223,60 @@ test "read paginates and points at the next offset" {
         \\{{"path":".zig-cache/tmp/{s}/f.txt","limit":1}}
     , .{tmp.sub_path});
     const result = try run(&context, input);
-    defer gpa.free(result.content);
+    defer result.deinit(gpa);
     try std.testing.expect(!result.is_error);
     try std.testing.expect(std.mem.startsWith(u8, result.content, "one\n"));
     try std.testing.expect(std.mem.indexOf(u8, result.content, "use offset=2 to continue") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.summary.?, "lines 1–1 of 3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.summary.?, "2 more") != null);
+}
+
+test "read summarizes a fully shown file" {
+    const gpa = std.testing.allocator;
+    const context: Context = .{ .gpa = gpa, .io = std.testing.io };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "f.txt", .data = "one\ntwo\nthree" });
+    var input_buf: [128]u8 = undefined;
+    const input = try std.fmt.bufPrint(&input_buf,
+        \\{{"path":".zig-cache/tmp/{s}/f.txt"}}
+    , .{tmp.sub_path});
+    const result = try run(&context, input);
+    defer result.deinit(gpa);
+    try std.testing.expect(!result.is_error);
+    try std.testing.expectEqualStrings("3 lines · 13 B", result.summary.?);
+}
+
+test "read does not count a trailing newline as an empty line" {
+    const gpa = std.testing.allocator;
+    const context: Context = .{ .gpa = gpa, .io = std.testing.io };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "f.txt", .data = "one\n" });
+    var input_buf: [128]u8 = undefined;
+    const input = try std.fmt.bufPrint(&input_buf,
+        \\{{"path":".zig-cache/tmp/{s}/f.txt"}}
+    , .{tmp.sub_path});
+    const result = try run(&context, input);
+    defer result.deinit(gpa);
+    try std.testing.expectEqualStrings("one\n", result.content);
+    try std.testing.expectEqualStrings("1 line · 4 B", result.summary.?);
+}
+
+test "read summarizes an empty file as zero lines" {
+    const gpa = std.testing.allocator;
+    const context: Context = .{ .gpa = gpa, .io = std.testing.io };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "f.txt", .data = "" });
+    var input_buf: [128]u8 = undefined;
+    const input = try std.fmt.bufPrint(&input_buf,
+        \\{{"path":".zig-cache/tmp/{s}/f.txt"}}
+    , .{tmp.sub_path});
+    const result = try run(&context, input);
+    defer result.deinit(gpa);
+    try std.testing.expectEqualStrings("", result.content);
+    try std.testing.expectEqualStrings("0 lines · 0 B", result.summary.?);
 }
 
 test "read rejects an offset past the end of the file" {
@@ -176,7 +290,7 @@ test "read rejects an offset past the end of the file" {
         \\{{"path":".zig-cache/tmp/{s}/f.txt","offset":100000}}
     , .{tmp.sub_path});
     const result = try run(&context, input);
-    defer gpa.free(result.content);
+    defer result.deinit(gpa);
     try std.testing.expect(result.is_error);
 }
 
@@ -191,7 +305,7 @@ test "read rejects a zero limit" {
         \\{{"path":".zig-cache/tmp/{s}/f.txt","limit":0}}
     , .{tmp.sub_path});
     const result = try run(&context, input);
-    defer gpa.free(result.content);
+    defer result.deinit(gpa);
     try std.testing.expect(result.is_error);
 }
 
@@ -208,7 +322,7 @@ test "read rejects a binary or non-UTF-8 file" {
             \\{{"path":".zig-cache/tmp/{s}/{s}"}}
         , .{ tmp.sub_path, name });
         const result = try run(&context, input);
-        defer gpa.free(result.content);
+        defer result.deinit(gpa);
         try std.testing.expect(result.is_error);
         try std.testing.expect(
             std.mem.indexOf(u8, result.content, "not a UTF-8 text file") != null,
@@ -230,7 +344,7 @@ test "read rejects an oversized file" {
         \\{{"path":".zig-cache/tmp/{s}/big.txt"}}
     , .{tmp.sub_path});
     const result = try run(&context, input);
-    defer gpa.free(result.content);
+    defer result.deinit(gpa);
     try std.testing.expect(result.is_error);
     try std.testing.expect(std.mem.indexOf(u8, result.content, "larger than") != null);
 }
@@ -250,7 +364,7 @@ test "read stops at the byte cap with a next-offset hint" {
         \\{{"path":".zig-cache/tmp/{s}/wide.txt"}}
     , .{tmp.sub_path});
     const result = try run(&context, input);
-    defer gpa.free(result.content);
+    defer result.deinit(gpa);
     try std.testing.expect(!result.is_error);
     try std.testing.expect(result.content.len <= bytes_max + 128);
     try std.testing.expect(
@@ -275,7 +389,7 @@ test "read truncates to the line cap by default" {
         \\{{"path":".zig-cache/tmp/{s}/many.txt"}}
     , .{tmp.sub_path});
     const result = try run(&context, input);
-    defer gpa.free(result.content);
+    defer result.deinit(gpa);
     try std.testing.expect(!result.is_error);
     try std.testing.expect(
         std.mem.indexOf(u8, result.content, "use offset=2001 to continue") != null,
@@ -310,10 +424,11 @@ test "read truncates a single line longer than the byte cap" {
         \\{{"path":".zig-cache/tmp/{s}/long.txt"}}
     , .{tmp.sub_path});
     const result = try run(&context, input);
-    defer gpa.free(result.content);
+    defer result.deinit(gpa);
     try std.testing.expect(!result.is_error);
     try std.testing.expect(result.content.len < bytes_max + 100);
     try std.testing.expect(std.mem.indexOf(u8, result.content, "truncated") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.summary.?, "line truncated") != null);
 }
 
 test "read clamps an explicit limit to the line cap" {
@@ -333,7 +448,7 @@ test "read clamps an explicit limit to the line cap" {
         \\{{"path":".zig-cache/tmp/{s}/many.txt","limit":100000}}
     , .{tmp.sub_path});
     const result = try run(&context, input);
-    defer gpa.free(result.content);
+    defer result.deinit(gpa);
     try std.testing.expect(!result.is_error);
     try std.testing.expect(
         std.mem.indexOf(u8, result.content, "use offset=2001 to continue") != null,

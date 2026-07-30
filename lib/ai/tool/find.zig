@@ -83,7 +83,20 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
         if (shown > 0) try out.writer.writeAll("\n");
         try out.writer.print("... {d} more (raise limit to see them)", .{matches.matched - shown});
     }
-    return .{ .content = try out.toOwnedSlice(), .is_error = false };
+
+    var summary_output: std.Io.Writer.Allocating = .init(gpa);
+    errdefer summary_output.deinit();
+    const plural_suffix: []const u8 = if (shown == 1) "" else "s";
+    try summary_output.writer.print("{d} file{s}", .{ shown, plural_suffix });
+    if (matches.capped) {
+        try summary_output.writer.writeAll(" · search incomplete");
+    } else if (matches.matched > shown) {
+        try summary_output.writer.print(" · {d} more", .{matches.matched - shown});
+    }
+    const summary = try summary_output.toOwnedSlice();
+    errdefer gpa.free(summary);
+    const content = try out.toOwnedSlice();
+    return .{ .content = content, .summary = summary, .is_error = false };
 }
 
 test "find matches files by glob under a directory" {
@@ -98,12 +111,13 @@ test "find matches files by glob under a directory" {
         \\{{"pattern":"**/*.zig","path":".zig-cache/tmp/{s}"}}
     , .{tmp.sub_path});
     const result = try run(&context, input);
-    defer gpa.free(result.content);
+    defer result.deinit(gpa);
     try std.testing.expect(!result.is_error);
     var expected_buf: [128]u8 = undefined;
     const expected =
         try std.fmt.bufPrint(&expected_buf, ".zig-cache/tmp/{s}/a.zig", .{tmp.sub_path});
     try std.testing.expectEqualStrings(expected, result.content);
+    try std.testing.expectEqualStrings("1 file", result.summary.?);
 }
 
 test "find reports how many more matched beyond the limit" {
@@ -119,7 +133,7 @@ test "find reports how many more matched beyond the limit" {
         \\{{"pattern":"*.txt","path":".zig-cache/tmp/{s}","limit":1}}
     , .{tmp.sub_path});
     const result = try run(&context, input);
-    defer gpa.free(result.content);
+    defer result.deinit(gpa);
     try std.testing.expect(!result.is_error);
     var expected_buf: [128]u8 = undefined;
     const expected = try std.fmt.bufPrint(
@@ -128,6 +142,7 @@ test "find reports how many more matched beyond the limit" {
         .{tmp.sub_path},
     );
     try std.testing.expectEqualStrings(expected, result.content);
+    try std.testing.expectEqualStrings("1 file · 2 more", result.summary.?);
 }
 
 test "find reports when no files match" {
@@ -141,7 +156,7 @@ test "find reports when no files match" {
         \\{{"pattern":"*.md","path":".zig-cache/tmp/{s}"}}
     , .{tmp.sub_path});
     const result = try run(&context, input);
-    defer gpa.free(result.content);
+    defer result.deinit(gpa);
     try std.testing.expect(!result.is_error);
     try std.testing.expectEqualStrings("no files match *.md", result.content);
 }

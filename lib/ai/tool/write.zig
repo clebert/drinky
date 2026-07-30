@@ -54,7 +54,7 @@ test "write creates a file with the given contents" {
         \\{{"path":".zig-cache/tmp/{s}/new.txt","content":"hello\nworld\n"}}
     , .{tmp.sub_path});
     const result = try run(&context, input);
-    defer gpa.free(result.content);
+    defer result.deinit(gpa);
     try std.testing.expect(!result.is_error);
     try std.testing.expect(std.mem.indexOf(u8, result.content, "wrote 12 bytes") != null);
     const data = try tmp.dir.readFileAlloc(io, "new.txt", gpa, .limited(64));
@@ -74,7 +74,7 @@ test "write overwrites an existing file entirely" {
         \\{{"path":".zig-cache/tmp/{s}/f.txt","content":"new"}}
     , .{tmp.sub_path});
     const result = try run(&context, input);
-    defer gpa.free(result.content);
+    defer result.deinit(gpa);
     try std.testing.expect(!result.is_error);
     const data = try tmp.dir.readFileAlloc(io, "f.txt", gpa, .limited(64));
     defer gpa.free(data);
@@ -91,7 +91,7 @@ test "write to a missing directory reports an error" {
         \\{{"path":".zig-cache/tmp/{s}/missing/f.txt","content":"x"}}
     , .{tmp.sub_path});
     const result = try run(&context, input);
-    defer gpa.free(result.content);
+    defer result.deinit(gpa);
     try std.testing.expect(result.is_error);
     try std.testing.expect(std.mem.indexOf(u8, result.content, "cannot write") != null);
 }

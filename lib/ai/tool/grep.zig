@@ -109,6 +109,7 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
     errdefer out.deinit();
     var count: usize = 0;
     var line_capped = false;
+    var lines_truncated = false;
     var bytes_read: usize = 0;
     var bytes_capped = false;
     search: for (paths) |path| {
@@ -148,6 +149,7 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
                 break :search;
             }
             const shown = line[0..utf8FloorLength(line, line_bytes_max)];
+            if (shown.len < line.len) lines_truncated = true;
             if (count > 0) try out.writer.writeAll("\n");
             // U+FFFD-substitute invalid bytes so the result serializes as a JSON string.
             try out.writer.print("{f}:{d}:{f}", .{
@@ -180,7 +182,23 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
         try out.writer.writeAll("\n... search incomplete: " ++
             "the tree is too large to scan fully; some files were not searched");
     }
-    return .{ .content = try out.toOwnedSlice(), .is_error = false };
+
+    var summary_output: std.Io.Writer.Allocating = .init(gpa);
+    errdefer summary_output.deinit();
+    const plural_suffix: []const u8 = if (count == 1) "" else "es";
+    try summary_output.writer.print("{d} match{s}", .{ count, plural_suffix });
+    if (line_capped) {
+        try summary_output.writer.writeAll(" · limit reached");
+    } else if (bytes_capped) {
+        try summary_output.writer.print(" · stopped at {d} MB", .{bytes_read_max >> 20});
+    } else if (files_incomplete) {
+        try summary_output.writer.writeAll(" · search incomplete");
+    }
+    if (lines_truncated) try summary_output.writer.writeAll(" · lines truncated");
+    const summary = try summary_output.toOwnedSlice();
+    errdefer gpa.free(summary);
+    const content = try out.toOwnedSlice();
+    return .{ .content = content, .summary = summary, .is_error = false };
 }
 
 /// Largest length no greater than `max` that does not split a UTF-8 codepoint,
@@ -210,7 +228,7 @@ test "grep finds a literal substring with a glob filter" {
         \\{{"pattern":"needle","path":".zig-cache/tmp/{s}","glob":"**/*.zig"}}
     , .{tmp.sub_path});
     const result = try run(&context, input);
-    defer gpa.free(result.content);
+    defer result.deinit(gpa);
     try std.testing.expect(!result.is_error);
     var expected_buf: [128]u8 = undefined;
     const expected = try std.fmt.bufPrint(
@@ -219,6 +237,7 @@ test "grep finds a literal substring with a glob filter" {
         .{tmp.sub_path},
     );
     try std.testing.expectEqualStrings(expected, result.content);
+    try std.testing.expectEqualStrings("1 match", result.summary.?);
 }
 
 test "grep searches a single file given as the path" {
@@ -232,7 +251,7 @@ test "grep searches a single file given as the path" {
         \\{{"pattern":"needle","path":".zig-cache/tmp/{s}/a.zig"}}
     , .{tmp.sub_path});
     const result = try run(&context, input);
-    defer gpa.free(result.content);
+    defer result.deinit(gpa);
     try std.testing.expect(!result.is_error);
     var expected_buf: [128]u8 = undefined;
     const expected = try std.fmt.bufPrint(
@@ -254,7 +273,7 @@ test "grep ignores the glob when the path is a single file" {
         \\{{"pattern":"needle","path":".zig-cache/tmp/{s}/a.zig","glob":"**/*.txt"}}
     , .{tmp.sub_path});
     const result = try run(&context, input);
-    defer gpa.free(result.content);
+    defer result.deinit(gpa);
     try std.testing.expect(!result.is_error);
     var expected_buf: [128]u8 = undefined;
     const expected = try std.fmt.bufPrint(
@@ -277,7 +296,7 @@ test "grep replaces invalid UTF-8 in matched lines" {
 
     const context: Context = .{ .gpa = std.testing.allocator, .io = io };
     const result = try run(&context, input);
-    defer std.testing.allocator.free(result.content);
+    defer result.deinit(std.testing.allocator);
     try std.testing.expect(!result.is_error);
     try std.testing.expect(std.unicode.utf8ValidateSlice(result.content));
     try std.testing.expect(
@@ -296,7 +315,7 @@ test "grep is case-insensitive when asked" {
         \\{{"pattern":"NEEDLE","path":".zig-cache/tmp/{s}","ignore_case":true}}
     , .{tmp.sub_path});
     const result = try run(&context, input);
-    defer gpa.free(result.content);
+    defer result.deinit(gpa);
     try std.testing.expect(!result.is_error);
     try std.testing.expect(std.mem.indexOf(u8, result.content, "a.txt:1:Needle Here") != null);
 }
@@ -315,7 +334,7 @@ test "grep stops at the result limit and reports it" {
         \\{{"pattern":"hit","path":".zig-cache/tmp/{s}","limit":2}}
     , .{tmp.sub_path});
     const result = try run(&context, input);
-    defer gpa.free(result.content);
+    defer result.deinit(gpa);
     try std.testing.expect(!result.is_error);
     var expected_buf: [256]u8 = undefined;
     const expected = try std.fmt.bufPrint(
@@ -325,6 +344,7 @@ test "grep stops at the result limit and reports it" {
         .{ tmp.sub_path, tmp.sub_path },
     );
     try std.testing.expectEqualStrings(expected, result.content);
+    try std.testing.expectEqualStrings("2 matches · limit reached", result.summary.?);
 }
 
 test "grep skips binary and oversized files" {
@@ -344,7 +364,7 @@ test "grep skips binary and oversized files" {
         \\{{"pattern":"hit","path":".zig-cache/tmp/{s}"}}
     , .{tmp.sub_path});
     const result = try run(&context, input);
-    defer gpa.free(result.content);
+    defer result.deinit(gpa);
     try std.testing.expect(!result.is_error);
     var expected_buf: [128]u8 = undefined;
     const expected = try std.fmt.bufPrint(
@@ -367,7 +387,7 @@ test "grep caps the reported line length" {
         \\{{"pattern":"hit","path":".zig-cache/tmp/{s}"}}
     , .{tmp.sub_path});
     const result = try run(&context, input);
-    defer gpa.free(result.content);
+    defer result.deinit(gpa);
     try std.testing.expect(!result.is_error);
     var expected_buf: [512]u8 = undefined;
     const expected = try std.fmt.bufPrint(
@@ -376,6 +396,7 @@ test "grep caps the reported line length" {
         .{ tmp.sub_path, line[0..line_bytes_max] },
     );
     try std.testing.expectEqualStrings(expected, result.content);
+    try std.testing.expectEqualStrings("1 match · lines truncated", result.summary.?);
 }
 
 test "grep reports an incomplete search when nothing was shown" {
@@ -389,7 +410,7 @@ test "grep reports an incomplete search when nothing was shown" {
         \\{{"pattern":"hit","path":".zig-cache/tmp/{s}","limit":0}}
     , .{tmp.sub_path});
     const result = try run(&context, input);
-    defer gpa.free(result.content);
+    defer result.deinit(gpa);
     try std.testing.expect(!result.is_error);
     try std.testing.expect(
         std.mem.indexOf(u8, result.content, "the search was incomplete") != null,

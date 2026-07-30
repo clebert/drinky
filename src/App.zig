@@ -143,15 +143,22 @@ const TurnHandler = struct {
         self: *TurnHandler,
         name: []const u8,
         content: []const u8,
+        maybe_summary: ?[]const u8,
         is_error: bool,
     ) !void {
         const name_copy = try self.app.gpa.dupe(u8, name);
         errdefer self.app.gpa.free(name_copy);
         const content_copy = try self.app.gpa.dupe(u8, content);
         errdefer self.app.gpa.free(content_copy);
+        const maybe_summary_copy = if (maybe_summary) |summary|
+            try self.app.gpa.dupe(u8, summary)
+        else
+            null;
+        errdefer if (maybe_summary_copy) |summary_copy| self.app.gpa.free(summary_copy);
         try self.enqueue(.{ .tool_result = .{
             .name = name_copy,
             .content = content_copy,
+            .summary = maybe_summary_copy,
             .is_error = is_error,
         } });
         // Tool-result slots are inside the checkpoint established before tool
@@ -1311,7 +1318,11 @@ test "turn producers keep their captured generation" {
     try handler.onThinking("thinking");
     handler.onCheckpoint();
     try handler.onToolStart("read", "{}");
-    try handler.onToolResult("read", "result", false);
+    {
+        const summary = try gpa.dupe(u8, "summary");
+        defer gpa.free(summary);
+        try handler.onToolResult("read", "result", summary, false);
+    }
     try handler.onUsage(.{});
     try handler.onStreamReset();
     try handler.onSteering("steer", 1);
@@ -1332,6 +1343,8 @@ test "turn producers keep their captured generation" {
         else => return error.UnexpectedEvent,
     };
     try std.testing.expectEqual(@as(u64, 2), events[2].turn.progress_sequence_committed);
+    const tool_result = events[3].turn.payload.tool_result;
+    try std.testing.expectEqualStrings("summary", tool_result.summary.?);
     try std.testing.expectEqual(@as(u64, 4), events[4].turn.progress_sequence_committed);
     try std.testing.expect(events[events.len - 1].turn.payload == .turn_ended);
 }

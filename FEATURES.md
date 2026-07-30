@@ -113,8 +113,9 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - Answer text grows as one block, with reasoning collected into a separate one tinted grey and
   italic; both render their markdown: headings, lists, blockquotes, code blocks, rules, and inline
   emphasis.
-- A running tool shows a blue box with its name and arguments, then turns green or red with the
-  first line of its output.
+- A running tool shows a blue box with its name and arguments, then turns green or red with a
+  one-line stat summary (lines read, matches found, exit status), or its first output line when the
+  tool gives no summary.
 - A Braille "Working…" spinner runs while a turn is in flight.
 - Queued steering shows as `Steering:` rows, and becomes one user message once consumed.
 - The bottom line shows context fill, session cost, cache savings, the last request's cache-hit

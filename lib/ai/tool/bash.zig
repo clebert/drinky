@@ -275,7 +275,22 @@ fn render(
             else => try result_writer.writer.writeAll("[command terminated abnormally]"),
         }
     }
-    return .{ .content = try result_writer.toOwnedSlice(), .is_error = failed };
+    var summary_output: std.Io.Writer.Allocating = .init(gpa);
+    errdefer summary_output.deinit();
+    switch (term) {
+        .exited => |code| try summary_output.writer.print("exit {d}", .{code}),
+        else => try summary_output.writer.writeAll("terminated"),
+    }
+    const lines = lineCount(output);
+    if (lines > 0) {
+        const plural_suffix: []const u8 = if (lines == 1) "" else "s";
+        try summary_output.writer.print(" · {d} line{s}", .{ lines, plural_suffix });
+    }
+    if (start > 0) try summary_output.writer.writeAll(" · output truncated");
+    const summary = try summary_output.toOwnedSlice();
+    errdefer gpa.free(summary);
+    const content = try result_writer.toOwnedSlice();
+    return .{ .content = content, .summary = summary, .is_error = failed };
 }
 
 /// The offset of the largest tail within both configured limits. Prefer whole
@@ -321,7 +336,7 @@ test "bash runs a command and returns its output" {
     const result = try run(&context,
         \\{"command":"echo hello"}
     );
-    defer gpa.free(result.content);
+    defer result.deinit(gpa);
     try std.testing.expect(!result.is_error);
     try std.testing.expectEqualStrings("hello\n", result.content);
 }
@@ -332,7 +347,7 @@ test "bash preserves stdout and stderr order" {
     const result = try run(&context,
         \\{"command":"printf out1; printf err1 >&2; printf out2; printf err2 >&2"}
     );
-    defer gpa.free(result.content);
+    defer result.deinit(gpa);
     try std.testing.expect(!result.is_error);
     try std.testing.expectEqualStrings("out1err1out2err2", result.content);
 }
@@ -343,10 +358,11 @@ test "bash reports a non-zero exit as an error" {
     const result = try run(&context,
         \\{"command":"echo boom; exit 3"}
     );
-    defer gpa.free(result.content);
+    defer result.deinit(gpa);
     try std.testing.expect(result.is_error);
     try std.testing.expect(std.mem.indexOf(u8, result.content, "boom") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.content, "status 3") != null);
+    try std.testing.expectEqualStrings("exit 3 · 1 line", result.summary.?);
 }
 
 test "bash reports empty successful output" {
@@ -355,9 +371,10 @@ test "bash reports empty successful output" {
     const result = try run(&context,
         \\{"command":"true"}
     );
-    defer gpa.free(result.content);
+    defer result.deinit(gpa);
     try std.testing.expect(!result.is_error);
     try std.testing.expectEqualStrings("(no output)", result.content);
+    try std.testing.expectEqualStrings("exit 0", result.summary.?);
 }
 
 test "bash honors a per-call timeout" {
@@ -366,7 +383,7 @@ test "bash honors a per-call timeout" {
     const result = try run(&context,
         \\{"command":"sleep 5","timeout_seconds":1}
     );
-    defer gpa.free(result.content);
+    defer result.deinit(gpa);
     try std.testing.expect(result.is_error);
     try std.testing.expect(std.mem.indexOf(u8, result.content, "timed out after 1000ms") != null);
 }
@@ -381,7 +398,7 @@ test "bash timeout is absolute while output arrives" {
     const result = try run(&context,
         \\{"command":"for i in {1..10}; do echo tick; sleep 0.05; done"}
     );
-    defer gpa.free(result.content);
+    defer result.deinit(gpa);
     try std.testing.expect(result.is_error);
     try std.testing.expect(std.mem.indexOf(u8, result.content, "timed out after 100ms") != null);
 }
@@ -403,7 +420,7 @@ test "bash timeout reaps a command after output closes" {
         .bash = .{ .timeout_ms = 100 },
     };
     const result = try run(&context, input);
-    defer gpa.free(result.content);
+    defer result.deinit(gpa);
     try std.testing.expect(result.is_error);
     try std.testing.expect(std.mem.indexOf(u8, result.content, "timed out after 100ms") != null);
 
@@ -436,7 +453,7 @@ test "bash timeout kills descendant processes" {
         .bash = .{ .timeout_ms = 100 },
     };
     const result = try run(&context, input);
-    defer gpa.free(result.content);
+    defer result.deinit(gpa);
     try std.testing.expect(result.is_error);
     try io.sleep(.fromMilliseconds(400), .awake);
     try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "marker", .{}));
@@ -469,6 +486,28 @@ test "sanitize preserves malformed terminal control sequence tails" {
     const clean = try sanitize(gpa, "\x1b[ 3m\n\x1b[31");
     defer gpa.free(clean);
     try std.testing.expectEqualStrings("[ 3m\n[31", clean);
+}
+
+test "render summary discloses line and byte truncation" {
+    const gpa = std.testing.allocator;
+    {
+        const limits: Context.Bash = .{ .lines_max = 2 };
+        const result = try render(gpa, "a\nb\nc\n", &limits, .{ .exited = 0 }, false);
+        defer result.deinit(gpa);
+        try std.testing.expectEqualStrings(
+            "exit 0 · 3 lines · output truncated",
+            result.summary.?,
+        );
+    }
+    {
+        const limits: Context.Bash = .{ .lines_max = 1000, .bytes_max = 4 };
+        const result = try render(gpa, "abcdef\n", &limits, .{ .exited = 0 }, false);
+        defer result.deinit(gpa);
+        try std.testing.expectEqualStrings(
+            "exit 0 · 1 line · output truncated",
+            result.summary.?,
+        );
+    }
 }
 
 test "tailStart keeps the last lines within the line budget" {

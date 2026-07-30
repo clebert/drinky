@@ -146,7 +146,12 @@ pub const TurnEvent = struct {
         turn_ended,
 
         pub const Tool = struct { name: []u8, input_json: []u8 };
-        pub const ToolResult = struct { name: []u8, content: []u8, is_error: bool };
+        pub const ToolResult = struct {
+            name: []u8,
+            content: []u8,
+            summary: ?[]u8 = null,
+            is_error: bool,
+        };
         pub const SteeringConsumed = struct { text: []u8, count: usize };
     };
 
@@ -160,6 +165,7 @@ pub const TurnEvent = struct {
             .tool_result => |result| {
                 gpa.free(result.name);
                 gpa.free(result.content);
+                if (result.summary) |summary| gpa.free(summary);
             },
             .steering_consumed => |consumed| gpa.free(consumed.text),
             .usage, .stream_reset, .turn_ended => {},
@@ -314,18 +320,20 @@ pub fn applyCanceledTurnEvent(self: *Session, event: *const TurnEvent) !void {
     _ = try self.applyTurnEvent(event);
 }
 
-/// Record a finished tool call in the transcript: its first output line beside the
-/// box it closes, then free that box.
+/// Record a finished tool call in the transcript: the tool's summary (or its first
+/// output line, when it gave none) beside the box it closes, then free that box.
 fn applyToolResult(self: *Session, result: TurnEvent.Payload.ToolResult) !void {
-    const line_end = std.mem.indexOfScalar(u8, result.content, '\n') orelse result.content.len;
-    const first = result.content[0..line_end];
+    const detail = result.summary orelse first: {
+        const line_end = std.mem.indexOfScalar(u8, result.content, '\n') orelse result.content.len;
+        break :first result.content[0..line_end];
+    };
     const finished = if (self.activeTurn()) |turn| takeTool(turn, result.name) else null;
     defer if (finished) |*tool| self.freeTool(tool);
     const arguments = if (finished) |tool| tool.input_json else "";
     const text = try std.fmt.allocPrint(self.gpa, "{s} {s}\n→ {s}", .{
         result.name,
         arguments,
-        first,
+        detail,
     });
     defer self.gpa.free(text);
     try self.transcript.append(.tool_result, result.is_error, text);
@@ -881,6 +889,32 @@ test "scripted stream events drive the model and one coalesced paint" {
     try std.testing.expect(std.mem.indexOf(u8, painted, "hello") != null);
     try std.testing.expect(std.mem.indexOf(u8, painted, "read") != null);
     try std.testing.expect(std.mem.indexOf(u8, painted, "first line") != null);
+}
+
+test "a tool result box shows the summary instead of the output" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    defer session.deinit();
+    session.beginTurn(1);
+
+    try applyEvent(&session, 1, .{ .tool_start = .{
+        .name = try gpa.dupe(u8, "read"),
+        .input_json = try gpa.dupe(u8, "{\"path\":\"x\"}"),
+    } });
+    try applyEvent(&session, 1, .{ .tool_result = .{
+        .name = try gpa.dupe(u8, "read"),
+        .content = try gpa.dupe(u8, "line one\nline two\nline three"),
+        .summary = try gpa.dupe(u8, "3 lines · 27 B"),
+        .is_error = false,
+    } });
+    try finishTurn(&session, 0);
+    try session.paint(.{ .columns = 80, .rows = 24 });
+
+    const painted = out.written();
+    try std.testing.expect(std.mem.indexOf(u8, painted, "3 lines · 27 B") != null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "line one") == null);
 }
 
 // A cut-off answer is committed history, so the turn's end says it is partial

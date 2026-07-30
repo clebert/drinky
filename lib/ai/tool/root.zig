@@ -47,7 +47,8 @@ pub fn mutates(name: []const u8) bool {
     return false;
 }
 
-/// Execute tool `name` with `input_json`. Caller frees `Result.content`.
+/// Execute tool `name` with `input_json`. Caller owns the result and frees it
+/// with `Result.deinit`.
 pub fn run(context: *const Context, name: []const u8, input_json: []const u8) !Result {
     for (registry) |entry| {
         if (!std.mem.eql(u8, name, entry.tool.name)) continue;
@@ -76,13 +77,13 @@ test "mutating tools are marked, read-only tools are not" {
 test "unknown tool is an error" {
     const context: Context = .{ .gpa = std.testing.allocator, .io = std.testing.io };
     const result = try run(&context, "nope", "{}");
-    defer std.testing.allocator.free(result.content);
+    defer result.deinit(std.testing.allocator);
     try std.testing.expect(result.is_error);
 }
 
 test "invalid arguments are reported, not raised" {
     const context: Context = .{ .gpa = std.testing.allocator, .io = std.testing.io };
     const result = try run(&context, "read", "{}");
-    defer std.testing.allocator.free(result.content);
+    defer result.deinit(std.testing.allocator);
     try std.testing.expect(result.is_error);
 }

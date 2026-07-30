@@ -144,7 +144,7 @@ test "edit rewrites the file on disk" {
         \\{{"path":".zig-cache/tmp/{s}/f.txt","old_text":"two","new_text":"2"}}
     , .{tmp.sub_path});
     const result = try run(&context, input);
-    defer gpa.free(result.content);
+    defer result.deinit(gpa);
     try std.testing.expect(!result.is_error);
     try std.testing.expect(std.mem.indexOf(u8, result.content, "edited") != null);
     const data = try tmp.dir.readFileAlloc(io, "f.txt", gpa, .limited(64));
@@ -198,7 +198,7 @@ test "edit rejects an oversized file" {
         \\{{"path":".zig-cache/tmp/{s}/big.txt","old_text":"a","new_text":"b"}}
     , .{tmp.sub_path});
     const result = try run(&context, input);
-    defer gpa.free(result.content);
+    defer result.deinit(gpa);
     try std.testing.expect(result.is_error);
     try std.testing.expect(std.mem.indexOf(u8, result.content, "larger than") != null);
 }
