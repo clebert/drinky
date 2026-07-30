@@ -4,21 +4,29 @@
 const std = @import("std");
 
 const llm = @import("../llm.zig");
+const skills = @import("../skills.zig");
 const Accounts = @import("../Accounts.zig");
 const Agent = @import("../Agent.zig");
 
 const Context = @This();
 
 gpa: std.mem.Allocator,
+/// Filesystem I/O for commands that load runtime-discovered content.
+io: std.Io,
 agent: *Agent,
 /// For account-qualified model selection.
 accounts: *Accounts,
+/// Runtime-discovered skills; null in command tests that do not need them.
+skill_registry: ?*const skills.Registry = null,
 
-/// A slash command's result. Feedback content and Pick options transfer to the
-/// caller; account and conversation actions are owned by the app.
+/// A slash command's result. Feedback, picker, and prompt allocations transfer
+/// to the caller; account and conversation actions are owned by the app.
 pub const Outcome = union(enum) {
     feedback: Feedback,
     pick: Pick,
+    /// Submit an expanded skill instruction as a user turn. The app records the
+    /// skill marker and optional task while sending `content` to the model.
+    prompt: Prompt,
     /// Authenticate this subscription account, then switch to it. The app owns
     /// the flow (it must suspend the tty around the OAuth browser callback).
     login: llm.Account,
@@ -37,6 +45,18 @@ pub const Outcome = union(enum) {
         /// Owned by the caller's allocator.
         content: []const u8,
         is_error: bool,
+    };
+
+    pub const Prompt = struct {
+        name: []const u8,
+        arguments: []const u8,
+        content: []const u8,
+
+        pub fn deinit(self: *const Prompt, gpa: std.mem.Allocator) void {
+            gpa.free(self.name);
+            gpa.free(self.arguments);
+            gpa.free(self.content);
+        }
     };
 
     /// A request to open a picker; a selection routes straight to `select`.

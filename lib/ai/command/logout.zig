@@ -57,7 +57,7 @@ test "the picker lists only logged-in subscriptions; none reports an error" {
     const gpa = std.testing.allocator;
 
     var some = testing.accounts(.{ .anthropic = "sk-ant" }, .{ .openai = true });
-    var context: Context = .{ .gpa = gpa, .agent = undefined, .accounts = &some };
+    var context: Context = .{ .gpa = gpa, .io = undefined, .agent = undefined, .accounts = &some };
     switch (try run(&context)) {
         .pick => |pick| {
             defer {
@@ -78,7 +78,12 @@ test "the picker lists only logged-in subscriptions; none reports an error" {
 test "select names the chosen logged-in account, rejecting out of range" {
     const gpa = std.testing.allocator;
     var accounts = testing.accounts(.{ .anthropic = "sk-ant" }, .{ .anthropic = true });
-    var context: Context = .{ .gpa = gpa, .agent = undefined, .accounts = &accounts };
+    var context: Context = .{
+        .gpa = gpa,
+        .io = undefined,
+        .agent = undefined,
+        .accounts = &accounts,
+    };
 
     switch (try select(&context, 0)) {
         .logout => |account| try std.testing.expectEqual(

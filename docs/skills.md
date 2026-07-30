@@ -1,8 +1,8 @@
 # Skills
 
-Research notes for adding skill support to pith: what a skill is, where to look for skills on disk,
-how they reach the model, and the moving parts pith must build. This surveys the ecosystem and
-recommends a concrete shape for pith; it is not yet a committed design.
+Design notes for pith's skill support: what a skill is, where skills are found on disk, how they
+reach the model, and how the implementation fits the module boundaries. The implemented first
+version follows the concrete shape described here.
 
 A **skill** is an on-demand instruction file. Its name and one-line description are always in front
 of the model; the full body loads only when a task matches. This is _progressive disclosure_: a
@@ -107,39 +107,41 @@ Progressive disclosure has three tiers:
 
 pith already has the pieces for tiers 2 and 3: the model pulls a body with the existing `read` tool
 using the path from the catalog, and runs a bundled script with `bash`, so no new tool is strictly
-required. Models do not always take the hint, so pith should also offer explicit invocation —
-`/skill:name`, matching pi — which loads the body into the conversation on demand and appends any
-trailing arguments. This is not a plain command-registry entry: the registry matches the first token
-exactly, so runtime-discovered skill names need _prefix dispatch_ — a `skill:` handler that reads
-the remainder as the skill name and looks it up in the registry. A dedicated "load skill" tool is a
-possible refinement but not needed for a first version.
+required. Models do not always take the hint, so pith also offers explicit invocation — `/skill:name`,
+matching pi — which loads the body into the conversation on demand and appends any trailing
+arguments. The transcript records a compact `[skill] name` marker, followed by the trailing task as
+a user block when present; the full body stays in model history without filling the display. This is
+not a plain command-registry entry: the registry matches the first token exactly, so
+runtime-discovered skill names need _prefix dispatch_ — a `skill:` handler that reads the remainder
+as the skill name and looks it up in the registry. A dedicated "load skill" tool is a possible
+refinement but not needed for a first version.
 
-## What pith must implement
+## Implementation shape
 
 Mapped onto the existing architecture and its one-way module boundary (`lib/ai` and `lib/terminal`
 never import each other or `src/`):
 
 - **A skills module in `lib/ai`** (provider-neutral), re-exported from `lib/ai/root.zig` so its
   tests are wired for `test-audit.sh`. It owns:
-  - **Frontmatter parsing.** pith has no YAML dependency and should not add one. The used subset is
-    flat scalar keys (`name`, `description`, …), so a hand-rolled splitter — take the block between
-    the leading `---` fences, read `key: value` lines, treat the rest as the body — is enough.
-    Reject nothing the standard tolerates.
-  - **Validation, lenient.** Warn on an over-long or malformed `name`, a name that differs from its
-    directory, or an over-long `description`, but still load the skill. An absent or invalid `name`
-    falls back to the parent directory name, so the registry key is always derivable. The one hard
-    failure is a missing or empty `description`: without it tier-1 disclosure is meaningless, so
-    skip the skill.
+  - **Frontmatter parsing.** pith has no YAML dependency and adds none. A hand-rolled parser reads
+    the flat scalar keys (`name`, `description`, …) between the leading `---` fences, including
+    quoted descriptions (with the standard escapes, `\uXXXX` among them) and block scalars (`>`/`|`,
+    with their indentation and chomping indicators).
+  - **Validation, lenient.** An over-long or malformed `name`, a name that differs from its
+    directory, or an over-long `description` produces a warning but still loads the skill (the
+    catalog truncates that description to the standard limit). An absent or invalid `name` falls
+    back to the parent directory name. A skill is skipped only when it could neither be disclosed
+    nor invoked: a missing or empty `description`, or a fallback directory name that is itself not a
+    valid skill name.
   - **A registry** keyed by `name`, holding at least `name`, `description`, and the absolute
     `SKILL.md` path; the body is read lazily at activation.
 - **Discovery and wiring in `src`.** Only the app knows `$HOME` and the working directory and owns
   the `Agent`, so `App` resolves the scan set, invokes the loader, and builds the tier-1 XML block.
-  The base system prompt is currently a compiled-in constant handed to the agent as a _borrowed_
-  string; injecting skill descriptions means `App` must build and **own** the combined prompt for
-  the agent's lifetime.
-- **Invocation surface.** Add prefix dispatch for `skill:` — not a static registry entry, since
-  skill names are discovered at runtime — that loads a skill body on request; rely on the existing
-  `read`/`bash` tools for model-driven activation and for tier-3 resources.
+  The base system prompt remains a compiled-in constant; `App` builds and **owns** the combined
+  prompt for the agent's lifetime because the agent borrows it.
+- **Invocation surface.** Prefix dispatch for `skill:` — not a static registry entry, since skill
+  names are discovered at runtime — loads a skill body on request. The existing `read`/`bash` tools
+  handle model-driven activation and tier-3 resources.
 
 ## Scope
 

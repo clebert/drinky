@@ -80,6 +80,8 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - **/login** — sign in, switch to an account already signed in, or name the API key to set.
 - **/logout** — drop a subscription's credentials and hand the session to another account.
 - **/new** — clear the conversation, usage stats, and steering without changing its configuration.
+- **/skill:name** — load a discovered skill explicitly, recording a compact `[skill]` marker and
+  appending any trailing text as its task.
 - Every other command answers with a line in the transcript, and an unknown one never reaches the
   model.
 - A command typed during a turn stays in the editor until the turn ends.
@@ -146,6 +148,9 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 
 ## Files & configuration
 
+- Skills are discovered recursively from `~/.agents/skills/` and project `.agents/skills/`
+  directories, following directory symlinks; their names and descriptions are advertised while their
+  instructions load on demand.
 - `~/.pith/config.json` is optional: request timeouts, retry policy, the bash output caps and
   timeout, and a default model per account.
 - It holds no secrets — API keys come from `ANTHROPIC_API_KEY` and `OPENAI_API_KEY`.

@@ -80,7 +80,7 @@ test "the picker lists every authenticated account's models, marking the active 
     var accounts = testing.accounts(.{ .anthropic = "sk-ant", .openai = "sk-openai" }, .{});
     var agent = testing.agent(gpa, .{ .anthropic_api = "sk-ant" });
     defer agent.deinit();
-    var context: Context = .{ .gpa = gpa, .agent = &agent, .accounts = &accounts };
+    var context: Context = .{ .gpa = gpa, .io = undefined, .agent = &agent, .accounts = &accounts };
 
     switch (try run(&context)) {
         .pick => |pick| {
@@ -106,7 +106,7 @@ test "select switches to the chosen account and model" {
     var accounts = testing.accounts(.{ .anthropic = "sk-ant", .openai = "sk-openai" }, .{});
     var agent = testing.agent(gpa, .{ .anthropic_api = "sk-ant" });
     defer agent.deinit();
-    var context: Context = .{ .gpa = gpa, .agent = &agent, .accounts = &accounts };
+    var context: Context = .{ .gpa = gpa, .io = undefined, .agent = &agent, .accounts = &accounts };
 
     // Row 3 is the first openai model, so selecting it crosses vendors.
     try Context.Outcome.expectFeedback(try select(&context, 3), .ok);
@@ -120,7 +120,12 @@ test "select switches to the chosen account and model" {
 test "no authenticated accounts reports an error instead of a picker" {
     const gpa = std.testing.allocator;
     var accounts = testing.accounts(.{}, .{});
-    var context: Context = .{ .gpa = gpa, .agent = undefined, .accounts = &accounts };
+    var context: Context = .{
+        .gpa = gpa,
+        .io = undefined,
+        .agent = undefined,
+        .accounts = &accounts,
+    };
 
     try Context.Outcome.expectFeedback(try run(&context), .err);
 }
@@ -132,7 +137,7 @@ test "the active mark matches the account, not just the model name" {
     var accounts = testing.accounts(.{ .anthropic = "sk-ant" }, .{ .anthropic = true });
     var agent = testing.agent(gpa, .{ .anthropic_subscription = undefined });
     defer agent.deinit();
-    var context: Context = .{ .gpa = gpa, .agent = &agent, .accounts = &accounts };
+    var context: Context = .{ .gpa = gpa, .io = undefined, .agent = &agent, .accounts = &accounts };
 
     switch (try run(&context)) {
         .pick => |pick| {
@@ -153,7 +158,7 @@ fn runUnderOom(gpa: std.mem.Allocator) !void {
     var accounts = testing.accounts(.{ .anthropic = "sk-ant", .openai = "sk-openai" }, .{});
     var agent = testing.agent(gpa, .{ .anthropic_api = "sk-ant" });
     defer agent.deinit();
-    var context: Context = .{ .gpa = gpa, .agent = &agent, .accounts = &accounts };
+    var context: Context = .{ .gpa = gpa, .io = undefined, .agent = &agent, .accounts = &accounts };
 
     switch (try run(&context)) {
         .pick => |pick| {

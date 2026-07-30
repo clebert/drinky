@@ -14,6 +14,7 @@ const paint = @import("paint.zig");
 pub const Entry = union(enum) {
     intro: std.ArrayList(u8),
     user: std.ArrayList(u8),
+    skill: std.ArrayList(u8),
     thinking: std.ArrayList(u8),
     model: std.ArrayList(u8),
     tool_result: Flagged,
@@ -37,7 +38,7 @@ pub const Entry = union(enum) {
 
     pub fn deinit(self: *Entry, gpa: std.mem.Allocator) void {
         switch (self.*) {
-            .intro, .user, .thinking, .model => |*text| text.deinit(gpa),
+            .intro, .user, .skill, .thinking, .model => |*text| text.deinit(gpa),
             .tool_result, .feedback => |*flagged| flagged.text.deinit(gpa),
         }
     }
@@ -47,7 +48,7 @@ pub const Entry = union(enum) {
     /// and window math rely on.
     pub fn rows(self: *const Entry, columns: usize) usize {
         return switch (self.*) {
-            .intro => |text| std.mem.count(u8, text.items, "\n") + 1,
+            .intro, .skill => |text| std.mem.count(u8, text.items, "\n") + 1,
             .feedback => |flagged| std.mem.count(u8, flagged.text.items, "\n") + 1,
             .user => |text| paint.boxRows(text.items, columns),
             .tool_result => |flagged| paint.boxRows(flagged.text.items, columns),
@@ -70,6 +71,10 @@ pub const Entry = union(enum) {
             .user => |text| try paint.box(placement, &.{
                 .background = .user_background,
                 .foreground = .user_foreground,
+            }, text.items),
+            .skill => |text| try paint.notice(placement, &.{
+                .style = .accent_foreground,
+                .prefix = "[skill] ",
             }, text.items),
             .tool_result => |flagged| try paint.box(placement, &.{
                 .background = if (flagged.is_error)
@@ -145,6 +150,7 @@ test "each entry variant renders exactly the rows it counts" {
         .{ .kind = .feedback, .is_error = true, .text = "boom" },
         .{ .kind = .user, .is_error = false, .text = "a user message long enough to wrap " ++
             "across the narrow test width more than once" },
+        .{ .kind = .skill, .is_error = false, .text = "zig-style" },
         .{ .kind = .model, .is_error = false, .text = "model reply\nwith a blank\n\n" ++
             "then a long paragraph that must wrap several rows" },
         .{ .kind = .thinking, .is_error = false, .text = "reasoning that runs on\n\n" ++
@@ -167,6 +173,25 @@ test "each entry variant renders exactly the rows it counts" {
             try std.testing.expectEqual(entry.rows(columns), painted);
         }
     }
+}
+
+test "a skill entry renders as one compact loaded marker" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var view = terminal.View.init(gpa, &out.writer);
+    defer view.deinit();
+    var entry = try Entry.init(gpa, .skill, false, "zig-style");
+    defer entry.deinit(gpa);
+
+    const sink = try view.beginFrame(.{ .columns = 40, .rows = 24 }, 8);
+    try entry.render(&.{ .sink = sink, .id = 0, .columns = 40, .base = 0, .skip = 0 });
+    try view.render();
+
+    try std.testing.expectEqual(@as(usize, 1), entry.rows(40));
+    try std.testing.expect(
+        std.mem.indexOf(u8, out.written(), "[skill] \u{200B}zig-style") != null,
+    );
 }
 
 // The clip drops its top `skip` rows and shows the rest.

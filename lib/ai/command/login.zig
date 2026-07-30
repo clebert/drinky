@@ -59,7 +59,7 @@ test "the picker lists every account, marking the active and authenticated ones"
     var accounts = testing.accounts(.{ .anthropic = "sk-ant" }, .{ .anthropic = true });
     var agent = testing.agent(gpa, .{ .anthropic_api = "sk-ant" });
     defer agent.deinit();
-    var context: Context = .{ .gpa = gpa, .agent = &agent, .accounts = &accounts };
+    var context: Context = .{ .gpa = gpa, .io = undefined, .agent = &agent, .accounts = &accounts };
 
     switch (try run(&context)) {
         .pick => |pick| {
@@ -86,7 +86,7 @@ test "select logs in a subscription, instructs an API account, and no-ops the ac
     var accounts = testing.accounts(.{ .anthropic = "sk-ant" }, .{});
     var agent = testing.agent(gpa, .{ .anthropic_api = "sk-ant" });
     defer agent.deinit();
-    var context: Context = .{ .gpa = gpa, .agent = &agent, .accounts = &accounts };
+    var context: Context = .{ .gpa = gpa, .io = undefined, .agent = &agent, .accounts = &accounts };
 
     switch (try select(&context, 2)) {
         .login => |account| try std.testing.expectEqual(llm.Account.openai_subscription, account),
@@ -102,7 +102,7 @@ test "select never re-runs the login for the active subscription" {
     var accounts = testing.accounts(.{}, .{ .anthropic = true });
     var agent = testing.agent(gpa, .{ .anthropic_subscription = undefined });
     defer agent.deinit();
-    var context: Context = .{ .gpa = gpa, .agent = &agent, .accounts = &accounts };
+    var context: Context = .{ .gpa = gpa, .io = undefined, .agent = &agent, .accounts = &accounts };
 
     try Context.Outcome.expectFeedbackContaining(try select(&context, 0), .ok, "already active");
     try std.testing.expectEqual(llm.Account.anthropic_subscription, agent.client.?.account());
@@ -113,7 +113,7 @@ test "select hands an authenticated but inactive account to the app to switch" {
     var accounts = testing.accounts(.{ .anthropic = "sk-ant" }, .{ .anthropic = true });
     var agent = testing.agent(gpa, .{ .anthropic_api = "sk-ant" });
     defer agent.deinit();
-    var context: Context = .{ .gpa = gpa, .agent = &agent, .accounts = &accounts };
+    var context: Context = .{ .gpa = gpa, .io = undefined, .agent = &agent, .accounts = &accounts };
 
     switch (try select(&context, 0)) {
         .switch_account => |account| try std.testing.expectEqual(

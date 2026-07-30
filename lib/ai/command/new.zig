@@ -15,6 +15,7 @@ pub fn run(context: *Context) !Context.Outcome {
 test "run requests a new conversation" {
     var context: Context = .{
         .gpa = undefined,
+        .io = undefined,
         .agent = undefined,
         .accounts = undefined,
     };

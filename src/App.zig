@@ -33,7 +33,7 @@ const anthropic_default = ai.models.get(.anthropic, "claude-opus-4-8") orelse
 const openai_default = ai.models.get(.openai, "gpt-5.6-sol") orelse
     @compileError("default openai model is not in the model table");
 const effort: ai.llm.Effort = .xhigh;
-const system_prompt =
+const system_prompt_base =
     "You are pith, a small coding assistant running in a terminal. Be concise. " ++
     "Explore the working directory with find (by name) and grep (literal text in " ++
     "file contents), read files with read, create or overwrite them with write, " ++
@@ -63,6 +63,10 @@ accounts: ai.Accounts,
 /// The configured default model per account, so switching accounts mid-session
 /// (a `/model`, `/login`, or `/logout`) resolves the same model startup would.
 default_models: Config.DefaultModels,
+/// Runtime skill metadata and the combined prompt that advertises it. Both
+/// outlive the agent, which borrows `system_prompt`.
+skills: ai.skills.Registry,
+system_prompt: []const u8,
 agent: ai.Agent,
 /// The consumer-owned model and rendering, driven by the loop.
 session: Session,
@@ -289,6 +293,18 @@ pub fn run(
     defer self.accounts.deinit();
     self.default_models = config.default_models;
 
+    const cwd = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cwd);
+    const user_skills = try std.fs.path.resolve(gpa, &.{ cwd, home, ".agents", "skills" });
+    defer gpa.free(user_skills);
+    self.skills = try ai.skills.discover(gpa, io, &.{
+        .user_root = user_skills,
+        .project_start = cwd,
+    });
+    defer self.skills.deinit();
+    self.system_prompt = try self.skills.systemPrompt(system_prompt_base);
+    defer gpa.free(self.system_prompt);
+
     // Start on the first authenticated account, or signed out (no client) when
     // none is — the login picker opens below to sign in. The model is resolved
     // for the chosen or placeholder account either way, so the status line has one
@@ -298,7 +314,7 @@ pub fn run(
     const start_client = if (active) |account| self.accounts.client(account) else null;
     self.agent = ai.Agent.init(gpa, io, start_client, .{
         .model = self.defaultModel(start_account),
-        .system = system_prompt,
+        .system = self.system_prompt,
         .retry = config.retry,
         .effort = effort,
         .bash = config.bash,
@@ -325,6 +341,7 @@ pub fn run(
         "config: default model \"{s}\" is not a valid model for {s}; using {s}",
         .{ dropped.name, dropped.account.label(), self.defaultModel(dropped.account).name },
     );
+    for (self.skills.warnings()) |warning| try self.report(.err, "skill: {s}", .{warning});
     // No account signed in: open the login picker (the same one /login opens) so
     // the user chooses how to sign in.
     if (!self.signedIn()) {
@@ -932,16 +949,29 @@ fn submit(self: *App) !void {
     self.session.dirty = true;
 
     if (std.mem.startsWith(u8, text, "/")) {
-        self.session.editor.clear();
-        try self.runCommand(text);
+        const outcome = try self.dispatchCommand(text);
+        switch (outcome) {
+            .prompt => |prompt| {
+                defer prompt.deinit(self.gpa);
+                if (!self.signedIn()) {
+                    self.session.editor.clear();
+                    try self.report(.err, "not signed in — use /login to sign in", .{});
+                } else {
+                    const base = try self.startSkillTurn(&prompt);
+                    var draft = self.session.editor.detachTrimmed();
+                    self.session.retainTurnPrompt(&draft, base);
+                }
+            },
+            else => {
+                self.session.editor.clear();
+                try self.applyOutcome(outcome);
+            },
+        }
     } else if (!self.signedIn()) {
         self.session.editor.clear();
         try self.report(.err, "not signed in — use /login to sign in", .{});
     } else {
-        const base = self.session.transcript.blocks().len;
-        try self.session.transcript.append(.user, false, text);
-        errdefer self.session.transcript.truncate(base);
-        try self.runTurn(text);
+        const base = try self.startUserTurn(text);
         // The turn is live and owns its own copy; retain the prompt's rich draft
         // so an abnormal exit that commits nothing can return it, and leave the
         // editor empty for in-progress text. Both steps are infallible, so the
@@ -949,6 +979,36 @@ fn submit(self: *App) !void {
         var prompt = self.session.editor.detachTrimmed();
         self.session.retainTurnPrompt(&prompt, base);
     }
+}
+
+/// Record a compact skill marker and its optional user task, then spawn the turn
+/// over the expanded skill content. Returns the rich draft's rewind checkpoint.
+fn startSkillTurn(self: *App, prompt: *const ai.command.Outcome.Prompt) !usize {
+    const base = try self.appendSkillPrompt(prompt);
+    errdefer self.session.transcript.truncate(base);
+    try self.runTurn(prompt.content);
+    self.session.dirty = true;
+    return base;
+}
+
+fn appendSkillPrompt(self: *App, prompt: *const ai.command.Outcome.Prompt) !usize {
+    const base = self.session.transcript.blocks().len;
+    errdefer self.session.transcript.truncate(base);
+    try self.session.transcript.append(.skill, false, prompt.name);
+    if (prompt.arguments.len > 0)
+        try self.session.transcript.append(.user, false, prompt.arguments);
+    return base;
+}
+
+/// Record a plain user message and spawn its turn. Returns the rich draft's
+/// rewind checkpoint.
+fn startUserTurn(self: *App, text: []const u8) !usize {
+    const base = self.session.transcript.blocks().len;
+    try self.session.transcript.append(.user, false, text);
+    errdefer self.session.transcript.truncate(base);
+    try self.runTurn(text);
+    self.session.dirty = true;
+    return base;
 }
 
 /// Spawn a turn worker over `text` and enter turn mode. The worker owns its own
@@ -973,21 +1033,34 @@ fn reserveTurnGeneration(self: *App) !u64 {
     return self.turn_generation;
 }
 
-/// Handle a slash command locally, applying its outcome.
-fn runCommand(self: *App, line: []const u8) !void {
-    var context: ai.command.Context =
-        .{ .gpa = self.gpa, .agent = &self.agent, .accounts = &self.accounts };
-    try self.applyOutcome(try ai.command.run(&context, line));
+fn dispatchCommand(self: *App, line: []const u8) !ai.command.Outcome {
+    var context: ai.command.Context = .{
+        .gpa = self.gpa,
+        .io = self.io,
+        .agent = &self.agent,
+        .accounts = &self.accounts,
+        .skill_registry = &self.skills,
+    };
+    return ai.command.run(&context, line);
 }
 
-/// Apply a command outcome: account and conversation actions need the agent,
-/// so the app runs them; everything else the session shows.
+/// Handle a slash command locally, applying its outcome.
+fn runCommand(self: *App, line: []const u8) !void {
+    try self.applyOutcome(try self.dispatchCommand(line));
+}
+
+/// Apply a command outcome: prompt, account, and conversation actions need the
+/// app or agent; presentation-only outcomes go to the session.
 fn applyOutcome(self: *App, outcome: ai.command.Outcome) !void {
     switch (outcome) {
         .new_conversation => {
             self.agent.resetConversation();
             self.session.resetConversation();
         },
+        // Only `submit` produces a prompt outcome (from a typed `/skill:` line),
+        // and it starts that turn itself, so a prompt never reaches this shared
+        // path — routing one here would skip the editor's rich draft.
+        .prompt => unreachable,
         .login => |account| try self.loginAccount(account),
         .logout => |account| try self.logoutAccount(account),
         .switch_account => |account| {
@@ -1045,7 +1118,8 @@ fn reportLoginFailure(self: *App, login_error: anyerror) !void {
         error.Canceled => return error.Canceled,
         error.CallbackTimeout => "login timed out waiting for the browser callback",
         error.CallbackRequestTooLarge => "login failed: browser callback request was too large",
-        error.CallbackTimeoutUnavailable => "login failed: browser callback deadline was unavailable",
+        error.CallbackTimeoutUnavailable => "login failed: browser callback deadline " ++
+            "was unavailable",
         else => return self.report(.err, "login failed: {s}", .{@errorName(login_error)}),
     };
     return self.report(.err, "{s}", .{message});
@@ -1080,8 +1154,13 @@ fn logoutAccount(self: *App, account: ai.llm.Account) !void {
     });
     // Through the session, not `runCommand`: routing back through `applyOutcome`
     // would cycle the inferred error sets (runCommand → applyOutcome → here).
-    var context: ai.command.Context =
-        .{ .gpa = self.gpa, .agent = &self.agent, .accounts = &self.accounts };
+    var context: ai.command.Context = .{
+        .gpa = self.gpa,
+        .io = self.io,
+        .agent = &self.agent,
+        .accounts = &self.accounts,
+        .skill_registry = &self.skills,
+    };
     try self.session.applyOutcome(try ai.command.run(&context, "/login"));
 }
 
@@ -1120,8 +1199,13 @@ fn handlePickerKey(self: *App, event: *const terminal.Input.Key) !void {
 /// Apply the highlighted picker row through its command's selection handler.
 fn confirmPicker(self: *App) !void {
     const picking = &self.session.mode.picking;
-    var context: ai.command.Context =
-        .{ .gpa = self.gpa, .agent = &self.agent, .accounts = &self.accounts };
+    var context: ai.command.Context = .{
+        .gpa = self.gpa,
+        .io = self.io,
+        .agent = &self.agent,
+        .accounts = &self.accounts,
+        .skill_registry = &self.skills,
+    };
     const outcome = try picking.select(&context, picking.picker.cursor);
     self.session.closePicker();
     try self.applyOutcome(outcome);
@@ -2685,7 +2769,11 @@ test "/new clears conversation state without changing the active configuration" 
         .text = try gpa.dupe(u8, "old prompt"),
     } });
     var seeded: ai.Agent.Stats = .{ .cost = 2.5, .last = .{ .input = 10 }, .model_count = 1 };
-    seeded.by_model[0] = .{ .name = anthropic_default.name, .cost = 2.5, .usage = .{ .input = 10 } };
+    seeded.by_model[0] = .{
+        .name = anthropic_default.name,
+        .cost = 2.5,
+        .usage = .{ .input = 10 },
+    };
     app.agent.stats = seeded;
     try app.agent.steering.push("old steering");
     try app.session.transcript.append(.user, false, "old prompt");
@@ -2744,6 +2832,41 @@ test "an account-switch command clears the session's quota snapshot" {
     try std.testing.expect(app.agent.stats.quota == null);
     try std.testing.expect(app.session.stats_shown.quota == null);
     try std.testing.expectEqualStrings(openai_default.name, app.session.model_shown.name);
+}
+
+test "an invoked skill records a compact marker and keeps its task visible" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.gpa = gpa;
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+
+    const prompt: ai.command.Outcome.Prompt = .{
+        .name = "zig-style",
+        .arguments = "review this file",
+        .content = "complete hidden skill instructions",
+    };
+    try std.testing.expectEqual(@as(usize, 0), try app.appendSkillPrompt(&prompt));
+
+    const blocks = app.session.transcript.blocks();
+    try std.testing.expectEqual(@as(usize, 2), blocks.len);
+    switch (blocks[0]) {
+        .skill => |name| try std.testing.expectEqualStrings("zig-style", name.items),
+        else => return error.ExpectedSkill,
+    }
+    switch (blocks[1]) {
+        .user => |task| try std.testing.expectEqualStrings("review this file", task.items),
+        else => return error.ExpectedUser,
+    }
+
+    try app.session.paint(.{ .columns = 80, .rows = 24 });
+    try std.testing.expect(
+        std.mem.indexOf(u8, out.written(), "[skill] \u{200B}zig-style") != null,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), prompt.content) == null);
 }
 
 // Signed out, a normal message must be refused with a /login prompt rather

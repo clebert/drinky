@@ -339,9 +339,9 @@ pub fn applyOutcome(self: *Session, outcome: ai.command.Outcome) !void {
             try self.transcript.append(.feedback, feedback.is_error, feedback.content);
         },
         .pick => |pick| try self.openPicker(pick),
-        // The app intercepts account actions (they need the tty and the agent);
-        // they never reach the io-free session.
-        .login, .logout, .switch_account, .new_conversation => unreachable,
+        // The app intercepts prompt, account, and conversation actions (they
+        // need I/O, the tty, or the agent); they never reach the io-free session.
+        .prompt, .login, .logout, .switch_account, .new_conversation => unreachable,
     }
     self.dirty = true;
 }

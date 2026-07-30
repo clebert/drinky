@@ -1,0 +1,814 @@
+//! Agent Skills discovery and progressive disclosure. A registry owns only skill
+//! metadata and absolute `SKILL.md` paths; instruction bodies remain on disk
+//! until the model reads one or the user invokes it explicitly.
+
+const std = @import("std");
+
+const skill_header = @import("skill_header.zig");
+
+const entries_visited_max = 100_000;
+const candidates_retained_max = 1024;
+const skills_max = 1024;
+const warnings_max = 1024;
+const skill_file_bytes_max = 16 << 20;
+
+const catalog_intro =
+    "\n\nThe following skills provide specialized instructions. When a task matches a " ++
+    "skill's description, read its SKILL.md at the listed location before proceeding.\n" ++
+    "<available_skills>\n";
+const catalog_close = "</available_skills>";
+const skill_open = "  <skill>\n    <name>";
+const description_open = "</name>\n    <description>";
+const location_open = "</description>\n    <location>";
+const skill_close = "</location>\n  </skill>\n";
+
+pub const Skill = struct {
+    name: []const u8,
+    description: []const u8,
+    description_truncated: bool,
+    path: []const u8,
+    model_invocation_disabled: bool,
+    scope: Scope,
+
+    pub const Scope = enum { user, project };
+
+    fn deinit(self: *Skill, gpa: std.mem.Allocator) void {
+        gpa.free(self.name);
+        gpa.free(self.description);
+        gpa.free(self.path);
+        self.* = undefined;
+    }
+
+    /// Load this skill's complete `SKILL.md`, identify its base directory for
+    /// relative resources, and append explicit invocation arguments. The
+    /// returned prompt is owned by `gpa`.
+    pub fn invoke(
+        self: *const Skill,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        arguments: []const u8,
+    ) ![]u8 {
+        const data = try std.Io.Dir.cwd().readFileAlloc(
+            io,
+            self.path,
+            gpa,
+            .limited(skill_file_bytes_max),
+        );
+        defer gpa.free(data);
+        if (data.len == 0 or std.mem.indexOfScalar(u8, data, 0) != null or
+            !std.unicode.utf8ValidateSlice(data))
+        {
+            return error.InvalidSkillText;
+        }
+        const directory = std.fs.path.dirname(self.path) orelse return error.InvalidSkillPath;
+
+        var output: std.Io.Writer.Allocating = .init(gpa);
+        errdefer output.deinit();
+        try output.writer.print(
+            "Skill location: {s}\nResolve relative paths in this skill against: {s}\n\n",
+            .{ self.path, directory },
+        );
+        try output.writer.writeAll(data);
+        if (arguments.len > 0) {
+            if (!std.mem.endsWith(u8, data, "\n")) try output.writer.writeByte('\n');
+            try output.writer.writeByte('\n');
+            try output.writer.writeAll(arguments);
+        }
+        return output.toOwnedSlice();
+    }
+};
+
+pub const Registry = struct {
+    gpa: std.mem.Allocator,
+    skill_items: std.ArrayList(Skill) = .empty,
+    warning_items: std.ArrayList([]const u8) = .empty,
+    skills_capped: bool = false,
+    warnings_capped: bool = false,
+
+    pub fn init(gpa: std.mem.Allocator) Registry {
+        return .{ .gpa = gpa };
+    }
+
+    pub fn deinit(self: *Registry) void {
+        for (self.skill_items.items) |*skill| skill.deinit(self.gpa);
+        self.skill_items.deinit(self.gpa);
+        for (self.warning_items.items) |warning| self.gpa.free(warning);
+        self.warning_items.deinit(self.gpa);
+        self.* = undefined;
+    }
+
+    fn skills(self: *const Registry) []const Skill {
+        return self.skill_items.items;
+    }
+
+    pub fn warnings(self: *const Registry) []const []const u8 {
+        return self.warning_items.items;
+    }
+
+    pub fn get(self: *const Registry, name: []const u8) ?*const Skill {
+        for (self.skill_items.items) |*skill| {
+            if (std.mem.eql(u8, skill.name, name)) return skill;
+        }
+        return null;
+    }
+
+    /// The compiled base prompt followed by the tier-1 skill catalog. With no
+    /// model-invocable skills, the owned result equals `base` byte for byte.
+    pub fn systemPrompt(self: *const Registry, base: []const u8) ![]u8 {
+        var visible_count: usize = 0;
+        for (self.skill_items.items) |*skill| {
+            if (!skill.model_invocation_disabled) visible_count += 1;
+        }
+        if (visible_count == 0) return self.gpa.dupe(u8, base);
+
+        var output: std.Io.Writer.Allocating = .init(self.gpa);
+        errdefer output.deinit();
+        try output.writer.writeAll(base);
+        try output.writer.writeAll(catalog_intro);
+        for (self.skill_items.items) |*skill| {
+            if (skill.model_invocation_disabled) continue;
+            try output.writer.writeAll(skill_open);
+            try writeEscaped(&output.writer, skill.name);
+            try output.writer.writeAll(description_open);
+            try writeEscaped(&output.writer, skill.description);
+            if (skill.description_truncated) try output.writer.writeAll("…");
+            try output.writer.writeAll(location_open);
+            try writeEscaped(&output.writer, skill.path);
+            try output.writer.writeAll(skill_close);
+        }
+        try output.writer.writeAll(catalog_close);
+        return output.toOwnedSlice();
+    }
+
+    fn scanRoot(self: *Registry, io: std.Io, root: []const u8, scope: Skill.Scope) !void {
+        var dir = std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true }) catch |err| {
+            if (err == error.FileNotFound) return;
+            if (err == error.Canceled or err == error.OutOfMemory) return err;
+            try self.warn("{s}: cannot scan skills ({s})", .{ root, @errorName(err) });
+            return;
+        };
+        defer dir.close(io);
+
+        var walker = try dir.walkSelectively(self.gpa);
+        defer walker.deinit();
+        defer while (walker.stack.items.len > 0) walker.leave(io);
+
+        var paths: PathKeeper = .{};
+        defer paths.deinit(self.gpa);
+
+        // Canonical directories already entered, so a symlink pointing at the
+        // root or another followed directory is not walked twice. Seeded with
+        // the root; the traversal cap backstops any residual cycle.
+        var visited: std.StringHashMapUnmanaged(void) = .empty;
+        defer {
+            var keys = visited.keyIterator();
+            while (keys.next()) |key| self.gpa.free(key.*);
+            visited.deinit(self.gpa);
+        }
+        if (try canonicalPath(self.gpa, io, root)) |canonical| {
+            defer self.gpa.free(canonical);
+            const owned = try self.gpa.dupe(u8, canonical);
+            visited.put(self.gpa, owned, {}) catch |err| {
+                self.gpa.free(owned);
+                return err;
+            };
+        }
+
+        var traversal_capped = false;
+        for (0..entries_visited_max + 1) |attempt| {
+            const maybe_entry = walker.next(io) catch |err| {
+                if (err == error.Canceled or err == error.OutOfMemory) return err;
+                if (attempt == entries_visited_max) traversal_capped = true;
+                try self.warn("{s}: skill traversal skipped an entry ({s})", .{
+                    root,
+                    @errorName(err),
+                });
+                continue;
+            };
+            const entry = maybe_entry orelse break;
+            if (attempt == entries_visited_max) {
+                traversal_capped = true;
+                break;
+            }
+            switch (entry.kind) {
+                .directory => walker.enter(io, entry) catch |err| {
+                    if (err == error.Canceled or err == error.OutOfMemory) return err;
+                    try self.warn("{s}/{s}: cannot scan directory ({s})", .{
+                        root,
+                        entry.path,
+                        @errorName(err),
+                    });
+                },
+                .file => {
+                    if (!std.mem.eql(u8, entry.basename, "SKILL.md")) continue;
+                    const path = try std.fs.path.join(self.gpa, &.{ root, entry.path });
+                    defer self.gpa.free(path);
+                    try paths.offer(self.gpa, path);
+                },
+                .sym_link => try self.followLink(io, root, &entry, &walker, &paths, &visited),
+                else => {},
+            }
+        }
+        if (traversal_capped) try self.warn(
+            "{s}: skill traversal stopped after {d} entries",
+            .{ root, entries_visited_max },
+        );
+        if (paths.matched > candidates_retained_max) try self.warn(
+            "{s}: only the first {d} SKILL.md paths were considered",
+            .{ root, candidates_retained_max },
+        );
+
+        std.mem.sort([]const u8, paths.heap.items, {}, pathLessThan);
+        for (paths.heap.items) |path| try self.loadPath(io, path, scope);
+    }
+
+    /// Follow a symlink entry: enter a linked directory (deduped by canonical
+    /// path so cycles and diamonds are walked once) or offer a linked
+    /// `SKILL.md`. Dangling and unreadable links are skipped.
+    fn followLink(
+        self: *Registry,
+        io: std.Io,
+        root: []const u8,
+        entry: *const std.Io.Dir.Walker.Entry,
+        walker: *std.Io.Dir.SelectiveWalker,
+        paths: *PathKeeper,
+        visited: *std.StringHashMapUnmanaged(void),
+    ) !void {
+        const stat = entry.dir.statFile(io, entry.basename, .{}) catch |err| {
+            if (err == error.Canceled or err == error.OutOfMemory) return err;
+            if (err != error.FileNotFound) try self.warn(
+                "{s}/{s}: cannot resolve symlink ({s})",
+                .{ root, entry.path, @errorName(err) },
+            );
+            return;
+        };
+        switch (stat.kind) {
+            .file => {
+                if (!std.mem.eql(u8, entry.basename, "SKILL.md")) return;
+                const path = try std.fs.path.join(self.gpa, &.{ root, entry.path });
+                defer self.gpa.free(path);
+                try paths.offer(self.gpa, path);
+            },
+            .directory => {
+                const joined = try std.fs.path.join(self.gpa, &.{ root, entry.path });
+                defer self.gpa.free(joined);
+                if (try canonicalPath(self.gpa, io, joined)) |canonical| {
+                    defer self.gpa.free(canonical);
+                    if (visited.contains(canonical)) return;
+                    const owned = try self.gpa.dupe(u8, canonical);
+                    visited.put(self.gpa, owned, {}) catch |err| {
+                        self.gpa.free(owned);
+                        return err;
+                    };
+                }
+                var link = entry.*;
+                link.kind = .directory;
+                walker.enter(io, link) catch |err| {
+                    if (err == error.Canceled or err == error.OutOfMemory) return err;
+                    try self.warn("{s}/{s}: cannot follow symlink ({s})", .{
+                        root,
+                        entry.path,
+                        @errorName(err),
+                    });
+                };
+            },
+            else => {},
+        }
+    }
+
+    fn loadPath(self: *Registry, io: std.Io, path: []const u8, scope: Skill.Scope) !void {
+        if (!std.unicode.utf8ValidateSlice(path)) {
+            const safe = try diagnostic(self.gpa, path);
+            defer self.gpa.free(safe);
+            try self.warn("{s}: skill path is not valid UTF-8; skipped", .{safe});
+            return;
+        }
+        const data = std.Io.Dir.cwd().readFileAlloc(
+            io,
+            path,
+            self.gpa,
+            .limited(skill_file_bytes_max),
+        ) catch |err| {
+            if (err == error.Canceled or err == error.OutOfMemory) return err;
+            try self.warn("{s}: cannot read skill ({s}); skipped", .{ path, @errorName(err) });
+            return;
+        };
+        defer self.gpa.free(data);
+        if (std.mem.indexOfScalar(u8, data, 0) != null or !std.unicode.utf8ValidateSlice(data)) {
+            try self.warn("{s}: skill is not UTF-8 text; skipped", .{path});
+            return;
+        }
+
+        var frontmatter = skill_header.parse(self.gpa, data) catch |err| switch (err) {
+            error.MissingFrontmatter => {
+                try self.warn("{s}: missing YAML frontmatter; skipped", .{path});
+                return;
+            },
+            error.UnclosedFrontmatter => {
+                try self.warn("{s}: unclosed YAML frontmatter; skipped", .{path});
+                return;
+            },
+            else => return err,
+        };
+        defer frontmatter.deinit(self.gpa);
+
+        const description_raw = frontmatter.description orelse {
+            try self.warn("{s}: missing or empty description; skipped", .{path});
+            return;
+        };
+        const description = std.mem.trim(u8, description_raw, " \t\r\n");
+        if (description.len == 0) {
+            try self.warn("{s}: missing or empty description; skipped", .{path});
+            return;
+        }
+        // Raw NUL is rejected above; an escape that decodes to one still must not
+        // reach the catalog, keeping the advertised text NUL-free end to end.
+        if (std.mem.indexOfScalar(u8, description, 0) != null) {
+            try self.warn("{s}: description decodes to a NUL byte; skipped", .{path});
+            return;
+        }
+
+        const directory_path = std.fs.path.dirname(path) orelse return error.InvalidSkillPath;
+        const directory_name = std.fs.path.basename(directory_path);
+        const name_source = if (frontmatter.name) |declared| name: {
+            if (nameValid(declared)) break :name declared;
+            const safe = try diagnostic(self.gpa, declared);
+            defer self.gpa.free(safe);
+            try self.warn(
+                "{s}: invalid skill name \"{s}\"; using directory name",
+                .{ path, safe },
+            );
+            break :name directory_name;
+        } else name: {
+            try self.warn("{s}: missing skill name; using directory name", .{path});
+            break :name directory_name;
+        };
+        if (!nameValid(name_source)) {
+            try self.warn(
+                "{s}: directory name \"{s}\" is not a valid skill name; skipped",
+                .{ path, directory_name },
+            );
+            return;
+        }
+        if (!std.mem.eql(u8, name_source, directory_name)) try self.warn(
+            "{s}: skill name \"{s}\" differs from directory \"{s}\"",
+            .{ path, name_source, directory_name },
+        );
+        const description_length = std.unicode.utf8CountCodepoints(description) catch unreachable;
+        if (description_length > 1024) try self.warn(
+            "{s}: skill description exceeds 1024 characters; catalog entry truncated",
+            .{path},
+        );
+
+        var skill: Skill = .{
+            .name = try self.gpa.dupe(u8, name_source),
+            .description = undefined,
+            .description_truncated = description_length > 1024,
+            .path = undefined,
+            .model_invocation_disabled = frontmatter.model_invocation_disabled,
+            .scope = scope,
+        };
+        errdefer self.gpa.free(skill.name);
+        skill.description = try self.gpa.dupe(u8, descriptionPrefix(description));
+        errdefer self.gpa.free(skill.description);
+        skill.path = try self.gpa.dupe(u8, path);
+        errdefer self.gpa.free(skill.path);
+        try self.insert(&skill);
+    }
+
+    /// Takes `incoming` on success; leaves it untouched on error.
+    fn insert(self: *Registry, incoming: *Skill) !void {
+        for (self.skill_items.items) |*existing| {
+            if (!std.mem.eql(u8, existing.name, incoming.name)) continue;
+            if (incoming.scope == .project and existing.scope == .user) {
+                try self.warn("project skill \"{s}\" at {s} shadows user skill at {s}", .{
+                    incoming.name,
+                    incoming.path,
+                    existing.path,
+                });
+                existing.deinit(self.gpa);
+                existing.* = incoming.*;
+                incoming.* = undefined;
+                return;
+            }
+            try self.warn("skill \"{s}\" at {s} is shadowed by {s}", .{
+                incoming.name,
+                incoming.path,
+                existing.path,
+            });
+            incoming.deinit(self.gpa);
+            return;
+        }
+
+        if (self.skill_items.items.len == skills_max) {
+            if (!self.skills_capped) {
+                try self.warn("only the first {d} distinct skills were loaded", .{skills_max});
+                self.skills_capped = true;
+            }
+            incoming.deinit(self.gpa);
+            return;
+        }
+        try self.skill_items.append(self.gpa, incoming.*);
+        incoming.* = undefined;
+    }
+
+    fn gitMarker(self: *Registry, io: std.Io, directory: []const u8) !bool {
+        const path = try std.fs.path.join(self.gpa, &.{ directory, ".git" });
+        defer self.gpa.free(path);
+        _ = std.Io.Dir.cwd().statFile(io, path, .{}) catch |err| {
+            if (err == error.FileNotFound) return false;
+            if (err == error.Canceled or err == error.OutOfMemory) return err;
+            try self.warn("{s}: cannot inspect repository marker ({s})", .{
+                path,
+                @errorName(err),
+            });
+            // Crossing a repository boundary is worse than missing skills below
+            // an unreadable marker, so stop the ancestor search conservatively.
+            return true;
+        };
+        return true;
+    }
+
+    fn warn(
+        self: *Registry,
+        comptime format: []const u8,
+        args: anytype,
+    ) !void {
+        if (self.warnings_capped) return;
+        if (self.warning_items.items.len == warnings_max - 1) {
+            const notice = try self.gpa.dupe(u8, "additional skill warnings omitted");
+            errdefer self.gpa.free(notice);
+            try self.warning_items.append(self.gpa, notice);
+            self.warnings_capped = true;
+            return;
+        }
+        const content = try std.fmt.allocPrint(self.gpa, format, args);
+        errdefer self.gpa.free(content);
+        try self.warning_items.append(self.gpa, content);
+    }
+};
+
+pub const DiscoverOptions = struct {
+    /// Absolute `~/.agents/skills` path.
+    user_root: []const u8,
+    /// Absolute working directory from which project ancestors are searched.
+    project_start: []const u8,
+};
+
+const PathKeeper = struct {
+    heap: std.PriorityQueue([]const u8, void, pathGreaterThan) = .empty,
+    matched: usize = 0,
+
+    fn deinit(self: *PathKeeper, gpa: std.mem.Allocator) void {
+        for (self.heap.items) |path| gpa.free(path);
+        self.heap.deinit(gpa);
+    }
+
+    fn offer(self: *PathKeeper, gpa: std.mem.Allocator, path: []const u8) !void {
+        self.matched += 1;
+        if (self.heap.count() < candidates_retained_max) {
+            const owned = try gpa.dupe(u8, path);
+            errdefer gpa.free(owned);
+            try self.heap.push(gpa, owned);
+        } else if (std.mem.lessThan(u8, path, self.heap.peek().?)) {
+            const owned = try gpa.dupe(u8, path);
+            errdefer gpa.free(owned);
+            gpa.free(self.heap.pop().?);
+            try self.heap.push(gpa, owned);
+        }
+    }
+};
+
+/// Discover user skills, then project skills from `project_start` upward. The
+/// nearest project root wins; a `.git` file or directory ends the ancestor scan.
+pub fn discover(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    options: *const DiscoverOptions,
+) !Registry {
+    if (!std.fs.path.isAbsolute(options.user_root) or
+        !std.fs.path.isAbsolute(options.project_start))
+    {
+        return error.SkillPathNotAbsolute;
+    }
+
+    var registry = Registry.init(gpa);
+    errdefer registry.deinit();
+    try registry.scanRoot(io, options.user_root, .user);
+    const user_root_canonical = try canonicalPath(gpa, io, options.user_root);
+    defer if (user_root_canonical) |path| gpa.free(path);
+
+    var current = options.project_start;
+    for (0..std.fs.max_path_bytes) |_| {
+        const root = try std.fs.path.join(gpa, &.{ current, ".agents", "skills" });
+        defer gpa.free(root);
+        // At the home directory the user and project conventions can resolve to
+        // the same path; do not rediscover every file as its own shadow.
+        var matches_user_root = std.mem.eql(u8, root, options.user_root);
+        if (!matches_user_root and user_root_canonical != null) {
+            const project_root_canonical = try canonicalPath(gpa, io, root);
+            defer if (project_root_canonical) |path| gpa.free(path);
+            matches_user_root = if (project_root_canonical) |path|
+                std.mem.eql(u8, path, user_root_canonical.?)
+            else
+                false;
+        }
+        if (!matches_user_root) try registry.scanRoot(io, root, .project);
+        if (try registry.gitMarker(io, current)) break;
+        const parent = std.fs.path.dirname(current) orelse break;
+        if (std.mem.eql(u8, parent, current)) break;
+        current = parent;
+    }
+    return registry;
+}
+
+fn canonicalPath(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+) !?[:0]u8 {
+    return std.Io.Dir.realPathFileAbsoluteAlloc(io, path, gpa) catch |err| {
+        if (err == error.Canceled or err == error.OutOfMemory) return err;
+        return null;
+    };
+}
+
+fn nameValid(name: []const u8) bool {
+    if (name.len == 0 or name.len > 64 or name[0] == '-' or name[name.len - 1] == '-') return false;
+    var previous_hyphen = false;
+    for (name) |byte| {
+        const valid = std.ascii.isLower(byte) or std.ascii.isDigit(byte) or byte == '-';
+        if (!valid or (byte == '-' and previous_hyphen)) return false;
+        previous_hyphen = byte == '-';
+    }
+    return true;
+}
+
+fn descriptionPrefix(description: []const u8) []const u8 {
+    var end: usize = 0;
+    for (0..1024) |_| {
+        if (end == description.len) return description;
+        end += std.unicode.utf8ByteSequenceLength(description[end]) catch unreachable;
+    }
+    return description[0..end];
+}
+
+/// A bounded, transcript-safe rendering of an untrusted value for a warning:
+/// caps the source length, escapes control and non-UTF-8 bytes as `\xNN`, and
+/// passes valid UTF-8 through so paths and names stay legible.
+fn diagnostic(gpa: std.mem.Allocator, text: []const u8) ![]u8 {
+    const source_bytes_max = 96;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    errdefer out.deinit();
+    var index: usize = 0;
+    while (index < text.len and index < source_bytes_max) {
+        const length = std.unicode.utf8ByteSequenceLength(text[index]) catch 0;
+        const printable = length > 1 or (text[index] >= 0x20 and text[index] != 0x7f);
+        if (length >= 1 and index + length <= text.len and printable and
+            std.unicode.utf8ValidateSlice(text[index..][0..length]))
+        {
+            try out.writer.writeAll(text[index..][0..length]);
+            index += length;
+        } else {
+            try out.writer.print("\\x{x:0>2}", .{text[index]});
+            index += 1;
+        }
+    }
+    if (index < text.len) try out.writer.writeAll("…");
+    return out.toOwnedSlice();
+}
+
+fn writeEscaped(writer: *std.Io.Writer, text: []const u8) !void {
+    for (text) |byte| switch (byte) {
+        '&' => try writer.writeAll("&amp;"),
+        '<' => try writer.writeAll("&lt;"),
+        '>' => try writer.writeAll("&gt;"),
+        '"' => try writer.writeAll("&quot;"),
+        '\'' => try writer.writeAll("&apos;"),
+        else => try writer.writeByte(byte),
+    };
+}
+
+fn pathGreaterThan(_: void, a: []const u8, b: []const u8) std.math.Order {
+    return std.mem.order(u8, b, a);
+}
+
+fn pathLessThan(_: void, a: []const u8, b: []const u8) bool {
+    return std.mem.lessThan(u8, a, b);
+}
+
+fn tmpPath(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    tmp: *const std.testing.TmpDir,
+    suffix: []const u8,
+) ![]u8 {
+    const cwd = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cwd);
+    return std.fs.path.join(gpa, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, suffix });
+}
+
+fn writeTestSkill(io: std.Io, dir: std.Io.Dir, path: []const u8, data: []const u8) !void {
+    const parent = std.fs.path.dirname(path).?;
+    var skill_dir = try dir.createDirPathOpen(io, parent, .{});
+    skill_dir.close(io);
+    try dir.writeFile(io, .{ .sub_path = path, .data = data });
+}
+
+test "an empty registry preserves the base system prompt" {
+    const gpa = std.testing.allocator;
+    var registry = Registry.init(gpa);
+    defer registry.deinit();
+    const prompt = try registry.systemPrompt("base prompt");
+    defer gpa.free(prompt);
+    try std.testing.expectEqualStrings("base prompt", prompt);
+}
+
+test "a failed insert leaves the complete skill with its caller" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 3 });
+    const gpa = failing.allocator();
+    var registry = Registry.init(gpa);
+    var skill: Skill = .{
+        .name = try gpa.dupe(u8, "demo"),
+        .description = try gpa.dupe(u8, "test skill"),
+        .description_truncated = false,
+        .path = try gpa.dupe(u8, "/tmp/demo/SKILL.md"),
+        .model_invocation_disabled = false,
+        .scope = .user,
+    };
+
+    try std.testing.expectError(error.OutOfMemory, registry.insert(&skill));
+    try std.testing.expectEqualStrings("/tmp/demo/SKILL.md", skill.path);
+    skill.deinit(gpa);
+    registry.deinit();
+    try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+}
+
+test "discovery is recursive and project skills shadow user and ancestor skills" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeTestSkill(io, tmp.dir, "user/shared/SKILL.md", "---\n" ++
+        "name: shared\ndescription: user copy\n---\nuser\n");
+    try writeTestSkill(io, tmp.dir, "repo/.agents/skills/shared/SKILL.md", "---\n" ++
+        "name: shared\ndescription: ancestor copy\n---\nancestor\n");
+    try writeTestSkill(io, tmp.dir, "repo/work/.agents/skills/nested/shared/SKILL.md", "---\n" ++
+        "name: shared\ndescription: nearest copy\n---\nnearest\n");
+    try writeTestSkill(io, tmp.dir, "repo/work/.agents/skills/nested/other/SKILL.md", "---\n" ++
+        "name: other\ndescription: nested copy\n---\nother\n");
+    try writeTestSkill(io, tmp.dir, ".agents/skills/outside/SKILL.md", "---\n" ++
+        "name: outside\ndescription: outside repo\n---\noutside\n");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "repo/work/.agents/skills/loose.md",
+        .data = "ignored",
+    });
+    var git = try tmp.dir.createDirPathOpen(io, "repo/.git", .{});
+    git.close(io);
+
+    const user_root = try tmpPath(gpa, io, &tmp, "user");
+    defer gpa.free(user_root);
+    const project_start = try tmpPath(gpa, io, &tmp, "repo/work");
+    defer gpa.free(project_start);
+    var registry = try discover(gpa, io, &.{
+        .user_root = user_root,
+        .project_start = project_start,
+    });
+    defer registry.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), registry.skills().len);
+    try std.testing.expectEqualStrings("nearest copy", registry.get("shared").?.description);
+    try std.testing.expect(registry.get("other") != null);
+    try std.testing.expect(registry.get("outside") == null);
+    try std.testing.expect(registry.warnings().len >= 2);
+}
+
+test "invalid names fall back, empty descriptions skip, and catalogs escape XML" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeTestSkill(io, tmp.dir, "user/fallback/SKILL.md", "---\n" ++
+        "name: Bad_Name\ndescription: use <this> & that\n---\nbody\n");
+    try writeTestSkill(io, tmp.dir, "user/empty/SKILL.md", "---\n" ++
+        "name: empty\ndescription: \"   \"\n---\nbody\n");
+    try writeTestSkill(io, tmp.dir, "user/manual/SKILL.md", "---\nname: manual\n" ++
+        "description: hidden from the model\n" ++
+        "disable-model-invocation: true\n---\nbody\n");
+    try writeTestSkill(io, tmp.dir, "user/long/SKILL.md", "---\nname: long\ndescription: " ++
+        "x" ** 1025 ++ "\n---\nbody\n");
+    try writeTestSkill(io, tmp.dir, "user/Bad Name/SKILL.md", "---\n" ++
+        "description: a directory name that is not a valid skill name\n---\nbody\n");
+    var git = try tmp.dir.createDirPathOpen(io, "repo/.git", .{});
+    git.close(io);
+
+    const user_root = try tmpPath(gpa, io, &tmp, "user");
+    defer gpa.free(user_root);
+    const project_start = try tmpPath(gpa, io, &tmp, "repo");
+    defer gpa.free(project_start);
+    var registry = try discover(gpa, io, &.{
+        .user_root = user_root,
+        .project_start = project_start,
+    });
+    defer registry.deinit();
+
+    try std.testing.expect(registry.get("fallback") != null);
+    try std.testing.expect(registry.get("empty") == null);
+    try std.testing.expect(registry.get("Bad Name") == null);
+    try std.testing.expect(registry.get("manual") != null);
+    try std.testing.expectEqual(@as(usize, 1024), registry.get("long").?.description.len);
+    try std.testing.expect(registry.get("long").?.description_truncated);
+    const prompt = try registry.systemPrompt("base");
+    defer gpa.free(prompt);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "use &lt;this&gt; &amp; that") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "<name>manual</name>") == null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "<name>fallback</name>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "…") != null);
+
+    const manual = registry.get("manual").?;
+    const explicit = try manual.invoke(gpa, io, "");
+    defer gpa.free(explicit);
+    try std.testing.expect(std.mem.indexOf(u8, explicit, manual.path) != null);
+    try std.testing.expect(std.mem.indexOf(u8, explicit, "body") != null);
+}
+
+test "explicit invocation loads the full file and appends arguments" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const source = "---\nname: invoke\ndescription: invocation test\n---\n# Instructions\nDo it.\n";
+    try writeTestSkill(io, tmp.dir, "user/invoke/SKILL.md", source);
+    var git = try tmp.dir.createDirPathOpen(io, "repo/.git", .{});
+    git.close(io);
+
+    const user_root = try tmpPath(gpa, io, &tmp, "user");
+    defer gpa.free(user_root);
+    const project_start = try tmpPath(gpa, io, &tmp, "repo");
+    defer gpa.free(project_start);
+    var registry = try discover(gpa, io, &.{
+        .user_root = user_root,
+        .project_start = project_start,
+    });
+    defer registry.deinit();
+
+    const skill = registry.get("invoke").?;
+    const prompt = try skill.invoke(gpa, io, "apply it to report.pdf");
+    defer gpa.free(prompt);
+    try std.testing.expect(std.mem.startsWith(u8, prompt, "Skill location: "));
+    try std.testing.expect(std.mem.indexOf(u8, prompt, skill.path) != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, source) != null);
+    try std.testing.expect(std.mem.endsWith(u8, prompt, "\napply it to report.pdf"));
+}
+
+test "discovery follows directory symlinks once and skips cycles" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // A skill body living outside the skills root, linked in as a directory.
+    try writeTestSkill(io, tmp.dir, "external/pdf-tools/SKILL.md", "---\n" ++
+        "name: pdf-tools\ndescription: linked skill\n---\nbody\n");
+    var user_dir = try tmp.dir.createDirPathOpen(io, "user", .{});
+    user_dir.close(io);
+    var git = try tmp.dir.createDirPathOpen(io, "repo/.git", .{});
+    git.close(io);
+
+    const external = try tmpPath(gpa, io, &tmp, "external/pdf-tools");
+    defer gpa.free(external);
+    const user_root = try tmpPath(gpa, io, &tmp, "user");
+    defer gpa.free(user_root);
+    try tmp.dir.symLink(io, external, "user/pdf-tools", .{});
+    // A symlink back to the skills root must not be walked a second time.
+    try tmp.dir.symLink(io, user_root, "user/loop", .{});
+
+    const project_start = try tmpPath(gpa, io, &tmp, "repo");
+    defer gpa.free(project_start);
+    var registry = try discover(gpa, io, &.{
+        .user_root = user_root,
+        .project_start = project_start,
+    });
+    defer registry.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), registry.skills().len);
+    try std.testing.expect(registry.get("pdf-tools") != null);
+}
+
+test "a skill whose path is not valid UTF-8 is skipped with a safe warning" {
+    const gpa = std.testing.allocator;
+    // Host filesystems reject non-UTF-8 names, so exercise the guard directly:
+    // loadPath validates the path before any I/O and so never touches `io`.
+    var registry = Registry.init(gpa);
+    defer registry.deinit();
+    try registry.loadPath(undefined, "user/\xff\xfe/SKILL.md", .user);
+
+    try std.testing.expectEqual(@as(usize, 0), registry.skills().len);
+    try std.testing.expectEqual(@as(usize, 1), registry.warnings().len);
+    const warning = registry.warnings()[0];
+    try std.testing.expect(std.mem.indexOf(u8, warning, "not valid UTF-8") != null);
+    // The raw bytes must not reach the transcript verbatim.
+    try std.testing.expect(std.mem.indexOf(u8, warning, "\\xff") != null);
+}

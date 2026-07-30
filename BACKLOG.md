@@ -43,7 +43,7 @@ on another item. Module layout and extension seams live in `AGENTS.md`.
       parents are prepended to the system prompt.
 - [ ] **Custom prompts** — user-maintained prompt templates, invoked as slash commands with argument
       substitution.
-- [ ] **Skills** — on-demand instruction files: names and descriptions are advertised to the model,
+- [x] **Skills** — on-demand instruction files: names and descriptions are advertised to the model,
       and a body loads when triggered. _Resolved from both a user-level and a project directory._
 - [ ] **Subagents** — user-defined agents, each with its own prompt and allowed tools, dispatched
       from a tool or command. _One nesting level only, driven by a non-recursive scheduler rather

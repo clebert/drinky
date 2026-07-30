@@ -1,7 +1,7 @@
 //! The provider-neutral agent core: the `Agent` turn loop, the neutral `llm`
 //! wire types, the `models` table, the `provider` client, the `command`
-//! registry, the `tool` registry, and the `anthropic` and `openai` provider
-//! transports.
+//! registry, Agent Skills discovery, the `tool` registry, and the `anthropic`
+//! and `openai` provider transports.
 
 const std = @import("std");
 
@@ -18,6 +18,7 @@ pub const models = @import("models.zig");
 pub const net = @import("net.zig");
 pub const openai = @import("openai/root.zig");
 pub const provider = @import("provider.zig");
+pub const skills = @import("skills.zig");
 pub const Steering = @import("Steering.zig");
 pub const tool = @import("tool/root.zig");
 

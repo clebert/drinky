@@ -40,7 +40,7 @@ test "the picker lists every level, preselecting the current one" {
     var agent = testing.agent(gpa, .{ .anthropic_subscription = undefined });
     defer agent.deinit();
     agent.setEffort(.high);
-    var context: Context = .{ .gpa = gpa, .agent = &agent, .accounts = undefined };
+    var context: Context = .{ .gpa = gpa, .io = undefined, .agent = &agent, .accounts = undefined };
 
     switch (try run(&context)) {
         .pick => |pick| {
@@ -60,7 +60,7 @@ test "select applies the level at a row index, rejecting out of range" {
     const gpa = std.testing.allocator;
     var agent = testing.agent(gpa, .{ .anthropic_subscription = undefined });
     defer agent.deinit();
-    var context: Context = .{ .gpa = gpa, .agent = &agent, .accounts = undefined };
+    var context: Context = .{ .gpa = gpa, .io = undefined, .agent = &agent, .accounts = undefined };
 
     // Levels are declared none, low, medium, high, xhigh, max — index 4 is xhigh.
     try Context.Outcome.expectFeedback(try select(&context, 4), .ok);
