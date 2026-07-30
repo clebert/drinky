@@ -78,8 +78,8 @@ const Mode = union(enum) {
     picking: Picking,
 };
 
-/// A streaming turn: the spinner frame and the tool calls currently running,
-/// each shown as its own box in the live tail.
+/// A streaming turn: the input-border activity tick and the tool calls currently
+/// running, each shown as its own box in the live tail.
 const Turn = struct {
     generation: u64,
     /// Last worker progress event applied for this generation.
@@ -88,7 +88,7 @@ const Turn = struct {
     progress_sequence_checkpoint: u64,
     /// Transcript length after the newest applied event known to be committed.
     transcript_checkpoint: usize,
-    spinner_frame: usize,
+    activity_tick: u64,
     tools: std.ArrayList(ActiveTool),
     /// `tools`' box text, rebuilt each frame so the tail gets a
     /// `[]const []const u8` without a fresh allocation per repaint.
@@ -489,8 +489,8 @@ fn steeringView(self: *Session) ![]const []const u8 {
     return self.steering_view.items;
 }
 
-/// Close any open model run, then enter turn mode with a fresh spinner and no
-/// active tools.
+/// Close any open model run, then enter turn mode with fresh border activity and
+/// no active tools.
 pub fn beginTurn(self: *Session, generation: u64) void {
     self.transcript.endMessage();
     self.mode = .{ .turn = .{
@@ -498,7 +498,7 @@ pub fn beginTurn(self: *Session, generation: u64) void {
         .progress_sequence_applied = 0,
         .progress_sequence_checkpoint = 0,
         .transcript_checkpoint = self.transcript.blocks().len,
-        .spinner_frame = 0,
+        .activity_tick = 0,
         .tools = .empty,
         .box_view = .empty,
     } };
@@ -635,7 +635,7 @@ pub fn paint(self: *Session, size: terminal.View.Size) !void {
             self.editor.reflow(size);
             break :turn .{ .turn = .{
                 .tools = try turn.boxes(self.gpa),
-                .spinner = turn.spinner_frame,
+                .activity_tick = turn.activity_tick,
                 .steering = try self.steeringView(),
                 .editor = &self.editor,
             } };
@@ -653,15 +653,24 @@ pub fn paint(self: *Session, size: terminal.View.Size) !void {
     try layout.project(&self.view, size, &scene);
 }
 
-/// Advance one animation frame and report whether this tick repaints. A turn
-/// steps the spinner every frame without marking the model dirty, so a tick
-/// repaints on new model content or ongoing animation.
+/// Advance the activity clock and report whether this tick repaints. A turn
+/// advances without marking the model dirty, so motion continues between model
+/// events.
 pub fn advanceFrame(self: *Session) bool {
-    if (self.activeTurn()) |turn| turn.spinner_frame = ui.paint.spinnerStep(turn.spinner_frame);
-    return self.dirty or self.animating();
+    var activity_changed = false;
+    if (self.activeTurn()) |turn| {
+        turn.activity_tick +%= 1;
+        const size: terminal.View.Size = .{ .columns = self.columns, .rows = self.rows };
+        const body_rows = self.editor.rows(size) - ui.paint.frame_border_rows;
+        activity_changed = ui.paint.activityChanged(turn.activity_tick, &.{
+            .columns = size.columns,
+            .body_rows = body_rows,
+        });
+    }
+    return self.dirty or activity_changed;
 }
 
-/// Whether a component wants continuous frames: today, a streaming turn's spinner.
+/// Whether a component wants continuous frames: the active turn's border.
 pub fn animating(self: *const Session) bool {
     return switch (self.mode) {
         .turn => true,
@@ -760,7 +769,7 @@ test "a read chunk drives the editor and paints the result" {
     const sink = try view.beginFrame(.{ .columns = 80, .rows = 24 }, 4);
     const placement: ui.paint.Placement =
         .{ .sink = sink, .id = 0, .columns = 80, .base = 0, .skip = 0 };
-    try editor.render(&placement, 24);
+    try editor.render(&placement, &.{ .viewport_rows = 24 });
     try view.render();
 
     try std.testing.expectEqualStrings("hllo", editor.visible());
@@ -791,7 +800,7 @@ test "a bracketed paste cannot emit terminal controls" {
     const sink = try view.beginFrame(.{ .columns = 120, .rows = 24 }, 4);
     const placement: ui.paint.Placement =
         .{ .sink = sink, .id = 0, .columns = 120, .base = 0, .skip = 0 };
-    try editor.render(&placement, 24);
+    try editor.render(&placement, &.{ .viewport_rows = 24 });
     try view.render();
 
     const painted = out.written();
@@ -832,7 +841,7 @@ test "a large bracketed paste collapses to a marker through the real pipeline" {
     const sink = try view.beginFrame(.{ .columns = 80, .rows = 24 }, 4);
     const placement: ui.paint.Placement =
         .{ .sink = sink, .id = 0, .columns = 80, .base = 0, .skip = 0 };
-    try editor.render(&placement, 24);
+    try editor.render(&placement, &.{ .viewport_rows = 24 });
     try view.render();
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "[paste #1 +11 lines]") != null);
 
@@ -1191,21 +1200,26 @@ test "opening a picker over a turn releases its retained prompt" {
     try std.testing.expect(session.turn_origin == null);
 }
 
-// Regression: while a turn animates, a tick must repaint even when the model is
-// clean, or the spinner freezes between stream events. `advanceFrame` also steps
-// the spinner, and reports no repaint when idle.
-test "a tick repaints and steps the spinner while a turn animates" {
+// The activity clock keeps advancing between stream events, but a corner or
+// vertical cell dwells for an extra tick without repainting.
+test "activity ticks use aspect-aware repaint timing" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
     var session: Session = Session.init(gpa, &out.writer, test_model, .none);
     defer session.deinit();
 
-    // Animating and clean still repaints, and the spinner advances one frame.
     session.beginTurn(1);
     session.dirty = false;
+    session.mode.turn.activity_tick = 38;
     try std.testing.expect(session.advanceFrame());
-    try std.testing.expectEqual(@as(usize, 1), session.mode.turn.spinner_frame);
+    try std.testing.expectEqual(@as(u64, 39), session.mode.turn.activity_tick);
+    try std.testing.expect(!session.advanceFrame());
+    try std.testing.expect(session.advanceFrame());
+    try std.testing.expectEqual(@as(u64, 41), session.mode.turn.activity_tick);
+    session.mode.turn.activity_tick = std.math.maxInt(u64);
+    try std.testing.expect(session.advanceFrame());
+    try std.testing.expectEqual(@as(u64, 0), session.mode.turn.activity_tick);
     session.deinitMode();
 
     // Idle — clean and not animating — repaints nothing.

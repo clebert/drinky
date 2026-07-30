@@ -1,7 +1,7 @@
 //! Projection: fold the transcript and the live tail of one `Scene` onto the
 //! bounded window and hand it to the `terminal.View`. Components stack in screen
 //! order — the transcript blocks oldest first, then the tail (a running turn's
-//! tool boxes and spinner, or a picker, then the input area and the status line).
+//! tool boxes, or a picker, then the input area and the status line).
 //!
 //! The tail is a tagged union, so exactly one input is ever live: the editor
 //! while waiting or streaming, or a picker. Two passes: pass one measures newest
@@ -28,8 +28,7 @@ const window_pages = 8;
 const id_reserved = std.math.maxInt(usize) - 255;
 const id_status = id_reserved;
 const id_input = id_reserved + 1;
-const id_spinner = id_reserved + 2;
-const id_steering = id_reserved + 3;
+const id_steering = id_reserved + 2;
 
 /// The anchor id of the tool box at `index` in the running turn. Grows downward
 /// from just below the fixed ids, so it never wraps past `maxInt` however many
@@ -54,15 +53,19 @@ pub const Tail = union(enum) {
     turn: Turn,
     picking: *const ui.Picker,
 
-    /// A streaming turn: the running tool calls, each shown as its own box, the
-    /// spinner, the steering queue (empty when nothing is queued), then the
-    /// editor, kept live so the user can steer.
+    /// A streaming turn: the running tool calls, the steering queue (empty when
+    /// nothing is queued), then the editor with activity travelling in its border.
     pub const Turn = struct {
         tools: []const []const u8,
-        spinner: usize,
+        activity_tick: u64,
         steering: []const []const u8,
         editor: *const ui.Editor,
     };
+};
+
+const EditorPresentation = struct {
+    editor: *const ui.Editor,
+    activity_tick: ?u64,
 };
 
 /// One screen component: a transcript block or a piece of the tail. Each variant
@@ -70,9 +73,8 @@ pub const Tail = union(enum) {
 const Component = union(enum) {
     entry: *const ui.block.Entry,
     tool_box: []const u8,
-    spinner: usize,
     steering: []const []const u8,
-    editor: *const ui.Editor,
+    editor: EditorPresentation,
     picker: *const ui.Picker,
     status: *const ui.status.Info,
 
@@ -83,9 +85,9 @@ const Component = union(enum) {
         return switch (self.*) {
             .entry => |entry| entry.rows(size.columns),
             .tool_box => |text| ui.paint.boxRows(text, size.columns),
-            .spinner, .status => 1,
             .steering => |messages| ui.paint.steeringRows(messages),
-            .editor => |editor| editor.rows(size),
+            .editor => |presentation| presentation.editor.rows(size),
+            .status => 1,
             .picker => |picker| picker.rows(size),
         };
     }
@@ -103,10 +105,12 @@ const Component = union(enum) {
                 .background = .tool_pending_background,
                 .foreground = .tool_foreground,
             }, text),
-            .spinner => |frame| try ui.paint.spinner(placement, frame),
             .steering => |messages| try ui.paint.steering(placement, messages),
             .status => |info| try ui.status.render(placement, info),
-            .editor => |editor| try editor.render(placement, viewport_rows),
+            .editor => |presentation| try presentation.editor.render(placement, &.{
+                .viewport_rows = viewport_rows,
+                .activity_tick = presentation.activity_tick,
+            }),
             .picker => |picker| try picker.render(placement, viewport_rows),
         }
     }
@@ -156,7 +160,7 @@ pub fn project(view: *terminal.View, size: terminal.View.Size, scene: *const Sce
 fn tailCount(tail: *const Tail) usize {
     return switch (tail.*) {
         .prompt, .picking => 1,
-        .turn => |turn| turn.tools.len + 2 + @intFromBool(turn.steering.len > 0),
+        .turn => |turn| turn.tools.len + 1 + @intFromBool(turn.steering.len > 0),
     };
 }
 
@@ -174,11 +178,11 @@ fn slotAt(scene: *const Scene, index: usize) Slot {
 }
 
 /// The tail component at `offset`, in screen order: for a turn the tool boxes,
-/// then the spinner, then the steering queue (when non-empty), then the live
-/// editor; otherwise the sole input.
+/// then the steering queue (when non-empty), then the live editor; otherwise the
+/// sole input.
 fn tailSlot(tail: *const Tail, offset: usize) Slot {
     switch (tail.*) {
-        .prompt => |editor| return editorSlot(editor),
+        .prompt => |editor| return editorSlot(&.{ .editor = editor, .activity_tick = null }),
         .picking => |picker| return .{
             .component = .{ .picker = picker },
             .id = id_input,
@@ -190,23 +194,21 @@ fn tailSlot(tail: *const Tail, offset: usize) Slot {
                 .id = idTool(offset),
                 .leading_blank = true,
             };
-            if (offset == turn.tools.len) return .{
-                .component = .{ .spinner = turn.spinner },
-                .id = id_spinner,
-                .leading_blank = true,
-            };
-            if (turn.steering.len > 0 and offset == turn.tools.len + 1) return .{
+            if (turn.steering.len > 0 and offset == turn.tools.len) return .{
                 .component = .{ .steering = turn.steering },
                 .id = id_steering,
                 .leading_blank = true,
             };
-            return editorSlot(turn.editor);
+            return editorSlot(&.{
+                .editor = turn.editor,
+                .activity_tick = turn.activity_tick,
+            });
         },
     }
 }
 
-fn editorSlot(editor: *const ui.Editor) Slot {
-    return .{ .component = .{ .editor = editor }, .id = id_input, .leading_blank = true };
+fn editorSlot(presentation: *const EditorPresentation) Slot {
+    return .{ .component = .{ .editor = presentation.* }, .id = id_input, .leading_blank = true };
 }
 
 const test_status: ui.status.Info = .{
@@ -269,9 +271,9 @@ test "projection stacks the transcript above the tail, newest at the bottom" {
     try std.testing.expect(ui.block.paintedRows(painted) < 24);
 }
 
-// A streaming turn stacks its tool boxes above the spinner and the editor,
-// then the status line — several tool boxes at once, not just one.
-test "a turn tail stacks the tool boxes, spinner, and editor" {
+// A streaming turn stacks its tool boxes above the active editor and then the
+// status line — several tool boxes at once, not just one.
+test "a turn tail stacks tool boxes above the active editor" {
     const gpa = std.testing.allocator;
     var editor = ui.Editor.init(gpa);
     defer editor.deinit();
@@ -279,9 +281,12 @@ test "a turn tail stacks the tool boxes, spinner, and editor" {
     const tools = [_][]const u8{ "readbox", "grepbox" };
     const scene: Scene = .{
         .transcript = &[_]ui.block.Entry{},
-        .tail = .{
-            .turn = .{ .tools = &tools, .spinner = 0, .steering = &.{}, .editor = &editor },
-        },
+        .tail = .{ .turn = .{
+            .tools = &tools,
+            .activity_tick = 0,
+            .steering = &.{},
+            .editor = &editor,
+        } },
         .status = &test_status,
     };
     const painted = try projected(gpa, .{ .columns = 40, .rows = 24 }, &scene);
@@ -289,11 +294,43 @@ test "a turn tail stacks the tool boxes, spinner, and editor" {
 
     const first = std.mem.indexOf(u8, painted, "readbox").?;
     const second = std.mem.indexOf(u8, painted, "grepbox").?;
-    const spinner = std.mem.indexOf(u8, painted, "Working…").?;
+    const activity = std.mem.indexOf(u8, painted, "━").?;
     const footer = std.mem.indexOf(u8, painted, "footerqq").?;
     try std.testing.expect(first < second);
-    try std.testing.expect(second < spinner);
-    try std.testing.expect(spinner < footer);
+    try std.testing.expect(second < activity);
+    try std.testing.expect(activity < footer);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "Working…") == null);
+}
+
+test "border activity does not change the input tail height" {
+    const gpa = std.testing.allocator;
+    var editor = ui.Editor.init(gpa);
+    defer editor.deinit();
+
+    const prompt: Scene = .{
+        .transcript = &.{},
+        .tail = .{ .prompt = &editor },
+        .status = &test_status,
+    };
+    const turn: Scene = .{
+        .transcript = &.{},
+        .tail = .{ .turn = .{
+            .tools = &.{},
+            .activity_tick = 0,
+            .steering = &.{},
+            .editor = &editor,
+        } },
+        .status = &test_status,
+    };
+    const prompt_painted = try projected(gpa, .{ .columns = 40, .rows = 24 }, &prompt);
+    defer gpa.free(prompt_painted);
+    const turn_painted = try projected(gpa, .{ .columns = 40, .rows = 24 }, &turn);
+    defer gpa.free(turn_painted);
+
+    try std.testing.expectEqual(
+        ui.block.paintedRows(prompt_painted),
+        ui.block.paintedRows(turn_painted),
+    );
 }
 
 // Regression: 253 concurrent tool boxes used to wrap the anchor-id arithmetic
@@ -306,9 +343,12 @@ test "a turn with 253 tool boxes keeps its anchor ids from wrapping" {
     const tools = [_][]const u8{"toolbox"} ** 253;
     const scene: Scene = .{
         .transcript = &[_]ui.block.Entry{},
-        .tail = .{
-            .turn = .{ .tools = &tools, .spinner = 0, .steering = &.{}, .editor = &editor },
-        },
+        .tail = .{ .turn = .{
+            .tools = &tools,
+            .activity_tick = 0,
+            .steering = &.{},
+            .editor = &editor,
+        } },
         .status = &test_status,
     };
     gpa.free(try projected(gpa, .{ .columns = 40, .rows = 24 }, &scene));
@@ -317,8 +357,7 @@ test "a turn with 253 tool boxes keeps its anchor ids from wrapping" {
 }
 
 // A turn tail with queued steering shows each "Steering:" row — a multi-line
-// message cut to its first line — and the recall hint between the spinner and
-// the editor.
+// message cut to its first line — and the recall hint above the editor.
 test "a turn tail shows the steering queue above the editor" {
     const gpa = std.testing.allocator;
     var editor = ui.Editor.init(gpa);
@@ -327,9 +366,12 @@ test "a turn tail shows the steering queue above the editor" {
     const queue = [_][]const u8{ "fix the bug", "then add a test\nnot this row" };
     const scene: Scene = .{
         .transcript = &[_]ui.block.Entry{},
-        .tail = .{
-            .turn = .{ .tools = &.{}, .spinner = 0, .steering = &queue, .editor = &editor },
-        },
+        .tail = .{ .turn = .{
+            .tools = &.{},
+            .activity_tick = 0,
+            .steering = &queue,
+            .editor = &editor,
+        } },
         .status = &test_status,
     };
     const painted = try projected(gpa, .{ .columns = 40, .rows = 24 }, &scene);
@@ -355,9 +397,12 @@ test "a narrow window clips the steering rows to width" {
     const queue = [_][]const u8{"a steering message wider than the window"};
     const scene: Scene = .{
         .transcript = &[_]ui.block.Entry{},
-        .tail = .{
-            .turn = .{ .tools = &.{}, .spinner = 0, .steering = &queue, .editor = &editor },
-        },
+        .tail = .{ .turn = .{
+            .tools = &.{},
+            .activity_tick = 0,
+            .steering = &queue,
+            .editor = &editor,
+        } },
         .status = &test_status,
     };
     gpa.free(try projected(gpa, .{ .columns = 8, .rows = 24 }, &scene));

@@ -101,8 +101,9 @@ turn_generation: u64,
 tick_future: ?std.Io.Future(void),
 /// A frame timer is armed and its `.tick` has not been drained yet.
 tick_pending: bool,
-/// Monotonic time of the last paint, so the next tick lands one interval later.
-paint_ms_last: i64,
+/// Monotonic time of the last frame opportunity, so the next tick lands one
+/// interval later even when a quantized animation step did not repaint.
+frame_ms_last: i64,
 
 /// The turn worker's presentation handler: instead of mutating the transcript, it
 /// enqueues owned `UiEvent`s for the consumer. Lives on the worker thread, so it
@@ -284,7 +285,7 @@ pub fn run(
     // the second of a pair.
     self.ctrl_c_ms_last = -ctrl_c_window_ms;
     self.tick_pending = false;
-    self.paint_ms_last = 0;
+    self.frame_ms_last = 0;
     self.input_future = null;
     self.resize_future = null;
     self.turn_future = null;
@@ -356,7 +357,7 @@ pub fn run(
         try self.runCommand("/login");
     }
     try self.refresh();
-    self.paint_ms_last = self.nowMs();
+    self.frame_ms_last = self.nowMs();
 
     self.running = true;
     defer self.shutdownTasks();
@@ -521,8 +522,8 @@ fn runLoop(self: *App) !void {
             if (self.session.advanceFrame()) {
                 try self.refresh();
                 self.session.dirty = false;
-                self.paint_ms_last = self.nowMs();
             }
+            self.frame_ms_last = self.nowMs();
         }
         if ((self.session.dirty or self.session.animating()) and !self.tick_pending) self.armTick();
     }
@@ -558,15 +559,15 @@ fn applyBatch(self: *App, events: []const Session.UiEvent) !bool {
     return ticked;
 }
 
-/// Arm the next frame: a one-shot timer that fires at `last_paint + interval`. On
-/// the impossible failure to spawn it, paint inline so the frame is not lost.
+/// Arm the next frame: a one-shot timer that fires one interval after the last
+/// opportunity. On the impossible failure to spawn it, paint inline.
 fn armTick(self: *App) void {
-    const elapsed = self.nowMs() - self.paint_ms_last;
+    const elapsed = self.nowMs() - self.frame_ms_last;
     const delay_ms: i64 = if (elapsed >= frame_interval_ms) 0 else frame_interval_ms - elapsed;
     self.tick_future = self.io.concurrent(frameTimer, .{ self, delay_ms }) catch {
         self.refresh() catch {};
         self.session.dirty = false;
-        self.paint_ms_last = self.nowMs();
+        self.frame_ms_last = self.nowMs();
         return;
     };
     self.tick_pending = true;

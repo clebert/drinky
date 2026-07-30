@@ -103,9 +103,15 @@ pub const Sink = struct {
     /// A zero-width break between calls prevents separately measured fragments
     /// from fusing into a different terminal grapheme.
     pub fn text(self: *Sink, bytes: []const u8) !void {
+        return self.textFitted(bytes, self.columns -| self.columns_written);
+    }
+
+    /// Append inert display text fitted to both `columns_max` and the row's
+    /// remaining capacity. This lets a caller reserve trailing decoration.
+    pub fn textFitted(self: *Sink, bytes: []const u8, columns_max: usize) !void {
         if (bytes.len == 0) return;
         if (self.has_text) try self.frame.blob.writer.writeAll("\u{200B}");
-        const available = self.columns -| self.columns_written;
+        const available = @min(columns_max, self.columns -| self.columns_written);
         self.columns_written += try width.writeFitted(&self.frame.blob.writer, bytes, available);
         self.has_text = true;
     }
@@ -784,6 +790,25 @@ test "an over-wide row clips at the margin and keeps the cursor synced" {
     try std.testing.expect(std.mem.indexOf(u8, top_row, "abc") != null);
     try std.testing.expect(std.mem.indexOfAny(u8, top_row, "defgh") == null);
     try harness.emulator.expectCaret(.{ .frame_len = 2, .row = 1, .column = 1 });
+}
+
+test "a fitted fragment preserves room for trailing cells" {
+    const gpa = std.testing.allocator;
+    const harness = try makeHarness(gpa, 3);
+    defer {
+        harness.deinit();
+        gpa.destroy(harness);
+    }
+    const sink = try harness.view.beginFrame(.{ .columns = 3, .rows = 1 }, 1);
+    sink.begin();
+    try sink.textFitted("你", 1);
+    try sink.text("|");
+    sink.end(.{ .id = 0, .line = 0 });
+    try harness.view.render();
+    harness.emulator.rows = 1;
+    try harness.emulator.feed(harness.out.written());
+    try std.testing.expectEqual(@as(usize, 2), sink.columns_written);
+    try harness.emulator.expectVisible(&.{"\u{200B}�\u{200B}\u{200B}|"});
 }
 
 test "the caret is hidden with no caret and when above the viewport" {

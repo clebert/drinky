@@ -85,7 +85,7 @@ pub fn moveDown(self: *Picker) !void {
 /// inside the visible window. Call once per repaint, passing the same `size`
 /// whose columns and rows `render` and `rows` will use, so all three agree.
 pub fn reflow(self: *Picker, size: terminal.View.Size) void {
-    const columns_max = @max(size.columns, 1);
+    const columns_max = paint.frameGeometry(size.columns).content_columns;
     const total_body = terminal.width.rows(self.content.items, columns_max);
     const visible = @min(total_body, paint.bodyLimit(size.rows));
     const prefix = self.content.items[0..self.cursor_offset];
@@ -98,7 +98,8 @@ pub fn reflow(self: *Picker, size: terminal.View.Size) void {
 /// Physical rows the picker occupies: the two framing rules plus the wrapped
 /// body, the body capped to its scroll limit for `size.rows`.
 pub fn rows(self: *const Picker, size: terminal.View.Size) usize {
-    const total_body = terminal.width.rows(self.content.items, @max(size.columns, 1));
+    const columns_max = paint.frameGeometry(size.columns).content_columns;
+    const total_body = terminal.width.rows(self.content.items, columns_max);
     return paint.framedRows(@min(total_body, paint.bodyLimit(size.rows)));
 }
 
@@ -106,14 +107,14 @@ pub fn rows(self: *const Picker, size: terminal.View.Size) usize {
 /// scroll limit for `viewport_rows` — through `placement`. Assumes `reflow` set
 /// the scroll.
 pub fn render(self: *const Picker, placement: *const paint.Placement, viewport_rows: usize) !void {
-    const columns_max = @max(placement.columns, 1);
+    const columns_max = paint.frameGeometry(placement.columns).content_columns;
     const total_body = terminal.width.rows(self.content.items, columns_max);
-    const visible = @min(total_body, paint.bodyLimit(viewport_rows));
+    const visible_rows = @min(total_body, paint.bodyLimit(viewport_rows));
     try paint.framed(placement, &.{
         .body = self.content.items,
+        .body_rows = visible_rows,
         .hidden_above = self.scroll,
-        .shown = visible,
-        .hidden_below = total_body - self.scroll - visible,
+        .hidden_below = total_body - self.scroll - visible_rows,
         .line_styles = self.line_styles.items,
     });
 }
@@ -236,7 +237,9 @@ test "a tall option list scrolls the window to keep the selection in view" {
     // The selected tail option shows, the scrolled-off head does not, and the
     // top rule reports the rows hidden above the window.
     try std.testing.expect(std.mem.indexOf(u8, painted, "row19") != null);
-    try std.testing.expect(std.mem.indexOf(u8, painted, "\x1b[7m > row19\x1b[0m") != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, painted, "\x1b[7m\u{200B} > row19\x1b[0m") != null,
+    );
     try std.testing.expect(std.mem.indexOf(u8, painted, "row00") == null);
     try std.testing.expect(std.mem.indexOf(u8, painted, "↑ 17 more") != null);
 }

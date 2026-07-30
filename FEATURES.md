@@ -116,14 +116,15 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - A running tool shows a blue box with its name and arguments, then turns green or red with a
   one-line stat summary (lines read, matches found, exit status), or its first output line when the
   tool gives no summary.
-- A Braille "Working…" spinner runs while a turn is in flight.
+- A heavy accent segment orbits the input border while a turn is in flight, without adding a
+  layout row.
 - Queued steering shows as `Steering:` rows, and becomes one user message once consumed.
 - The bottom line shows context fill, session cost, cache savings, the last request's cache-hit
   rate, and any OpenAI-subscription quota remaining, with `model · effort` right-aligned.
 - A picker is a single-choice list tagging the current value; Enter confirms, Esc, Ctrl+C, or Ctrl+D
   cancels.
-- The input frame grows to about a quarter of the screen and labels hidden rows "↑ N more" and "↓ N
-  more".
+- The closed input frame grows to about a quarter of the screen and labels hidden rows "↑ N more"
+  and "↓ N more".
 - Model, tool, and user text can never emit escapes: controls and malformed UTF-8 render as
   replacement characters.
 
