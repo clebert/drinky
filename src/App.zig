@@ -22,6 +22,7 @@ const terminal = @import("terminal");
 
 const Config = @import("Config.zig");
 const Session = @import("Session.zig");
+const system_prompt = @import("system_prompt.zig");
 const ui = @import("ui/root.zig");
 
 const App = @This();
@@ -33,12 +34,6 @@ const anthropic_default = ai.models.get(.anthropic, "claude-opus-4-8") orelse
 const openai_default = ai.models.get(.openai, "gpt-5.6-sol") orelse
     @compileError("default openai model is not in the model table");
 const effort: ai.llm.Effort = .xhigh;
-const system_prompt_base =
-    "You are pith, a small coding assistant running in a terminal. Be concise. " ++
-    "Explore the working directory with find (by name) and grep (literal text in " ++
-    "file contents), read files with read, create or overwrite them with write, " ++
-    "change existing files with edit (give old_text that occurs exactly once), and run shell " ++
-    "commands with bash.";
 
 const intro_text = "pith — enter: send · shift+enter: newline · esc: cancel · " ++
     "ctrl+c: clear (twice: quit) · ctrl+d: quit";
@@ -63,10 +58,11 @@ accounts: ai.Accounts,
 /// The configured default model per account, so switching accounts mid-session
 /// (a `/model`, `/login`, or `/logout`) resolves the same model startup would.
 default_models: Config.DefaultModels,
-/// Runtime skill metadata and the combined prompt that advertises it. Both
-/// outlive the agent, which borrows `system_prompt`.
+/// Repository instructions, runtime skill metadata, and their combined prompt.
+/// All outlive the agent, which borrows `prompt`.
+instructions: ai.instructions.Result,
 skills: ai.skills.Registry,
-system_prompt: []const u8,
+prompt: []const u8,
 agent: ai.Agent,
 /// The consumer-owned model and rendering, driven by the loop.
 session: Session,
@@ -268,6 +264,14 @@ const OauthPrompt = struct {
     }
 };
 
+fn validateWorkingDirectory(gpa: std.mem.Allocator, path: []const u8) !void {
+    if (std.unicode.utf8ValidateSlice(path)) return;
+    const safe_path = try ai.instructions.diagnosticAlloc(gpa, path);
+    defer gpa.free(safe_path);
+    std.debug.print("pith: working directory is not valid UTF-8: {s}\n", .{safe_path});
+    return error.WorkingDirectoryNotUtf8;
+}
+
 /// Wire up the tty, agent, and session, then run the interactive loop until the
 /// user quits or stdin closes. When no account is authenticated the session
 /// starts signed out and the login picker opens so the user signs in. Pin the
@@ -294,6 +298,12 @@ pub fn run(
     self.tick_future = null;
     self.initEventQueue();
 
+    const cwd_source = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cwd_source);
+    const cwd = try std.Io.Dir.realPathFileAbsoluteAlloc(io, cwd_source, gpa);
+    defer gpa.free(cwd);
+    try validateWorkingDirectory(gpa, cwd);
+
     const config = try Config.load(gpa, io, home);
     defer config.deinit(gpa);
 
@@ -301,8 +311,8 @@ pub fn run(
     defer self.accounts.deinit();
     self.default_models = config.default_models;
 
-    const cwd = try std.process.currentPathAlloc(io, gpa);
-    defer gpa.free(cwd);
+    self.instructions = try ai.instructions.discover(gpa, io, cwd);
+    defer self.instructions.deinit();
     const user_skills = try std.fs.path.resolve(gpa, &.{ cwd, home, ".agents", "skills" });
     defer gpa.free(user_skills);
     self.skills = try ai.skills.discover(gpa, io, &.{
@@ -310,8 +320,13 @@ pub fn run(
         .project_start = cwd,
     });
     defer self.skills.deinit();
-    self.system_prompt = try self.skills.systemPrompt(system_prompt_base);
-    defer gpa.free(self.system_prompt);
+    self.prompt = try system_prompt.compose(gpa, &.{
+        .core = system_prompt.default_core,
+        .working_directory = cwd,
+        .instructions = &self.instructions,
+        .skills = self.skills.catalog(),
+    });
+    defer gpa.free(self.prompt);
 
     // Start on the first authenticated account, or signed out (no client) when
     // none is — the login picker opens below to sign in. The model is resolved
@@ -322,7 +337,7 @@ pub fn run(
     const start_client = if (active) |account| self.accounts.client(account) else null;
     self.agent = ai.Agent.init(gpa, io, start_client, .{
         .model = self.defaultModel(start_account),
-        .system = self.system_prompt,
+        .system = self.prompt,
         .retry = config.retry,
         .effort = effort,
         .bash = config.bash,
@@ -349,7 +364,21 @@ pub fn run(
         "config: default model \"{s}\" is not a valid model for {s}; using {s}",
         .{ dropped.name, dropped.account.label(), self.defaultModel(dropped.account).name },
     );
-    for (self.skills.warnings()) |warning| try self.report(.err, "skill: {s}", .{warning});
+    for (self.instructions.entries()) |entry| {
+        const safe_path = try ai.instructions.displayAlloc(gpa, entry.path);
+        defer gpa.free(safe_path);
+        try self.report(.ok, "instructions: loaded {s}", .{safe_path});
+    }
+    for (self.instructions.warnings()) |warning| {
+        const safe_warning = try ai.instructions.displayAlloc(gpa, warning);
+        defer gpa.free(safe_warning);
+        try self.report(.err, "instructions: {s}", .{safe_warning});
+    }
+    for (self.skills.warnings()) |warning| {
+        const safe_warning = try ai.instructions.displayAlloc(gpa, warning);
+        defer gpa.free(safe_warning);
+        try self.report(.err, "skill: {s}", .{safe_warning});
+    }
     // No account signed in: open the login picker (the same one /login opens) so
     // the user chooses how to sign in.
     if (!self.signedIn()) {

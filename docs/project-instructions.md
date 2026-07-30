@@ -19,8 +19,8 @@ project convention without inventing a pith-specific global convention.
   additions, generated environment data, repository-controlled project instructions, and the skill
   catalog. Project instructions should not be prepended ahead of the harness core.
 - Use Markdown for authored instructions and XML-style elements only as generated delimiters around
-  dynamic data. Escape both paths and file contents. XML improves structure; it is not a security
-  boundary.
+  dynamic data. Safely render and XML-escape generated paths, but preserve instruction bodies
+  verbatim. XML improves structure; it is not a security boundary.
 - Do not auto-discover pi-style `SYSTEM.md` or `APPEND_SYSTEM.md` files. When custom-system support
   lands, expose replacement and append **paths explicitly in `~/.pith/config.json`**. This gives
   personal customization without presenting a pith-only filename as a portable standard.
@@ -124,8 +124,9 @@ hiding the limitation.
 Project instructions must be bounded and inspectable. Initial pith limits should be:
 
 - 32 KiB per file;
-- 64 KiB total source content; and
-- 32 loaded files.
+- 64 KiB total source content;
+- 32 loaded files; and
+- 1,024 startup warnings, including the final omission notice.
 
 These are pith limits, not part of the convention. Never cut a file in the middle. Collect and budget
 candidates nearest-first so the most specific whole files survive an aggregate overflow, then render
@@ -152,8 +153,9 @@ already present in the provider-supplied tool schemas (`find` uses globs, `grep`
 
 - tool behavior has a single authoritative description in each tool schema and should not drift in a
   second hand-maintained list; and
-- the Anthropic subscription transport must prepend its provider-required Claude Code identity, so
-  “operating inside pith” avoids competing identity claims better than “You are pith.”
+- the Anthropic subscription compatibility transport prepends the exact Claude Code identity its
+  routing expects, so “operating inside pith” avoids competing identity claims better than “You are
+  pith.”
 
 A sufficient default core is:
 
@@ -184,9 +186,9 @@ prompt is nevertheless immutable during a session, which preserves normal turn-t
 provider blocks solely for cross-project cache reuse is outside this feature.
 
 The Environment section is always present. When no Git root was detected, emit an empty
-`<repository_root />` element; `working_directory` always contains the XML-escaped absolute cwd.
-Omit the Project instructions and Skills headings and elements when those sections are empty; the
-default core must remain the exact prefix of the composed prompt.
+`<repository_root />` element; `working_directory` always contains the safely rendered and
+XML-escaped absolute cwd. Omit the Project instructions and Skills headings and elements when those
+sections are empty; the default core must remain the exact prefix of the composed prompt.
 
 ### Markdown plus XML-style delimiters
 
@@ -244,14 +246,16 @@ before proceeding.
 </available_skills>
 ```
 
-All generated values must be XML-escaped, including the full Markdown content inside each
-`<project_instructions>` element. Preserve line breaks and other whitespace. Escaping prevents file
-content such as `</project_instructions>` from forging the generated structure; CDATA and Markdown
-fences merely replace that problem with their own closable delimiter. Models understand the escaped
-entities, while the wrappers remain unambiguous.
+Generated path values are rendered onto one logical line before XML escaping: controls, malformed
+bytes, Unicode format controls, and line separators become visible `\xNN` sequences. The Markdown
+inside each `<project_instructions>` element is written verbatim, with only a framing newline added
+when the source lacks one. This preserves code fences, inline code, shell operators such as `&&`, and
+literal XML examples rather than turning them into entities inside code.
 
-Do not over-tag the authored prose and do not treat tags as authority. Natural-language prompt
-injection remains natural language after XML escaping.
+A repository can include the generated closing-tag text in its instructions and visually disrupt the
+wrapper. CDATA and Markdown fences only substitute another closable delimiter, and the repository
+text already has the same model-instruction authority as its wrapper. Do not treat tags as a security
+boundary; tool permissions must remain enforced in code.
 
 ## AGENTS.md versus custom system files
 
@@ -343,8 +347,8 @@ Keep filesystem policy provider-neutral and prompt wording application-owned:
   root, project instruction entries (`path`, containing directory/scope, and content), limits, and
   diagnostics. Re-export it from `lib/ai/root.zig` so its tests are reachable by `test-audit.sh`.
 - **`src/system_prompt.zig`** is the pure composer for the pith-owned string. It receives the core,
-  cwd, discovery result, and raw visible skill metadata; it alone owns section ordering and all XML
-  escaping.
+  cwd, discovery result, and raw visible skill metadata; it owns section ordering, generated-value
+  escaping, and verbatim instruction insertion.
 - **`lib/ai/skills.zig`** should expose raw visible metadata rather than own global composition
   through `Registry.systemPrompt(base)`.
 - **`src/App.zig`** remains the composition root: resolve cwd, discover skills and instructions,
@@ -368,7 +372,7 @@ Important tests include:
 - deeper-file precedence and nearest-first retention under the aggregate cap;
 - whole-file size, count, UTF-8, NUL, empty-file, unreadable-file, invalid-path, and deterministic
   symlink behavior;
-- absolute source paths and XML escaping of paths and contents;
+- absolute source paths, safe generated-path escaping, and verbatim Markdown contents;
 - exact prompt ordering with every combination of empty project and skill sections; and
 - the byte-for-byte default core as the composed prompt's prefix.
 
@@ -395,6 +399,7 @@ Sources checked 2026-07-30:
 - OpenAI, _Prompt engineering: message formatting with Markdown and XML_ —
   <https://developers.openai.com/api/docs/guides/prompt-engineering#message-formatting-with-markdown-and-xml>
 - Anthropic, _Prompting best practices_ —
-  <https://platform.claude.com/docs/en/build-with-claude/prompt-engineering/system-prompts>
+  <https://platform.claude.com/docs/en/build-with-claude/prompt-engineering/claude-prompting-best-practices>
+- CommonMark, _Fenced code blocks_ — <https://spec.commonmark.org/0.31.2/#fenced-code-blocks>
 - OpenAI, _Safety in building agents_ —
   <https://developers.openai.com/api/docs/guides/agent-builder-safety>

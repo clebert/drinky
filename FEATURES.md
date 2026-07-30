@@ -150,6 +150,8 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 
 ## Files & configuration
 
+- Exact-case `AGENTS.md` files load from the nearest Git root through the working directory,
+  broad-to-specific, with bounded startup diagnostics.
 - Skills are discovered recursively from `~/.agents/skills/` and project `.agents/skills/`
   directories, following directory symlinks; their names and descriptions are advertised while their
   instructions load on demand.

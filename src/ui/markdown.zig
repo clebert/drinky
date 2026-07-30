@@ -99,20 +99,53 @@ const Painter = struct {
     }
 };
 
+const Fence = struct {
+    marker: u8,
+    length: usize,
+
+    fn open(line: []const u8) ?Fence {
+        if (line.len < 3) return null;
+        const marker = line[0];
+        if (marker != '`' and marker != '~') return null;
+        const length = markerLength(line, marker);
+        if (length < 3) return null;
+        if (marker == '`' and std.mem.indexOfScalar(u8, line[length..], '`') != null) return null;
+        return .{ .marker = marker, .length = length };
+    }
+
+    fn closes(self: Fence, line: []const u8) bool {
+        if (line.len < self.length or line[0] != self.marker) return false;
+        const length = markerLength(line, self.marker);
+        return length >= self.length and isBlank(line[length..]);
+    }
+
+    fn markerLength(line: []const u8, marker: u8) usize {
+        var length: usize = 0;
+        while (length < line.len and line[length] == marker) length += 1;
+        return length;
+    }
+};
+
 /// Emit `text` one physical row at a time. Every row break is decided here and
 /// the emitter merely follows, so the count and the paint cannot diverge.
 fn walk(comptime Emitter: type, emitter: *Emitter, text: []const u8, columns: usize) !void {
     var lines = std.mem.splitScalar(u8, text, '\n');
-    var fenced = false;
+    var maybe_fence: ?Fence = null;
     while (lines.next()) |line| {
-        const rest = line[leading(line)..];
-        if (std.mem.startsWith(u8, rest, "```")) {
-            // A fence toggles the mode; an unclosed one just runs to the end.
-            fenced = !fenced;
+        const indentation = leading(line);
+        const rest = line[indentation..];
+        const maybe_open_fence = if (indentation <= 3) Fence.open(rest) else null;
+        if (maybe_fence) |fence| {
+            if (indentation <= 3 and fence.closes(rest)) {
+                maybe_fence = null;
+                try plainRow(Emitter, emitter, columns, "", muted_look, line);
+            } else {
+                // Code keeps its alignment: indent and truncate, never re-wrap.
+                try plainRow(Emitter, emitter, columns, blank(2), code_look, line);
+            }
+        } else if (maybe_open_fence) |fence| {
+            maybe_fence = fence;
             try plainRow(Emitter, emitter, columns, "", muted_look, line);
-        } else if (fenced) {
-            // Code keeps its alignment: indent and truncate, never re-wrap.
-            try plainRow(Emitter, emitter, columns, blank(2), code_look, line);
         } else if (isBlank(rest)) {
             emitter.begin();
             emitter.end();
@@ -523,6 +556,27 @@ const partial =
     \\an unclosed fence runs to the end of the block
 ;
 
+const literal_fences =
+    \\````markdown
+    \\```zig
+    \\const nested = "**literal backticks**";
+    \\```
+    \\````
+    \\~~~text
+    \\```literal inside tildes
+    \\~~~
+    \\after **bold**
+;
+
+const indented_fences =
+    \\   ```zig
+    \\**three-space literal**
+    \\   ```
+    \\    ```zig
+    \\after **four-space bold**
+    \\    ```
+;
+
 // Rows `text` paints into a fresh view, dropping its top `skip`; the caller owns
 // the returned bytes. Fresh so the paint is a full reprint whose rows count.
 fn painted(
@@ -553,7 +607,14 @@ fn paintedRows(bytes: []const u8) usize {
 // already fills the row.
 test "markdown renders exactly the rows it counts" {
     const gpa = std.testing.allocator;
-    for ([_][]const u8{ sample, partial, "", "\n\n" }) |text| {
+    for ([_][]const u8{
+        sample,
+        partial,
+        literal_fences,
+        indented_fences,
+        "",
+        "\n\n",
+    }) |text| {
         for ([_]usize{ 72, 40, 16, 3, 2, 1 }) |columns| {
             for ([_]?color.Style{ null, .muted_foreground }) |tint| {
                 const bytes = try painted(gpa, text, columns, tint, 0);
@@ -562,6 +623,42 @@ test "markdown renders exactly the rows it counts" {
             }
         }
     }
+}
+
+test "fences close only with the same marker and enough characters" {
+    const backticks = Fence.open("````markdown").?;
+    try std.testing.expect(!backticks.closes("```"));
+    try std.testing.expect(backticks.closes("````"));
+    try std.testing.expect(backticks.closes("`````  "));
+    try std.testing.expect(!backticks.closes("````tail"));
+    try std.testing.expect(!backticks.closes("~~~~"));
+    try std.testing.expect(Fence.open("```lang`") == null);
+
+    const tildes = Fence.open("~~~text").?;
+    try std.testing.expect(tildes.closes("~~~~"));
+    try std.testing.expect(!tildes.closes("```"));
+}
+
+test "longer and alternate fences retain inner backticks as code" {
+    const gpa = std.testing.allocator;
+    const bytes = try painted(gpa, literal_fences, 72, null, 0);
+    defer gpa.free(bytes);
+
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "**literal backticks**") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "```literal inside tildes") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "after **bold**") == null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "after ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\x1b[1m\u{200b}bold") != null);
+}
+
+test "fences accept at most three leading spaces" {
+    const gpa = std.testing.allocator;
+    const bytes = try painted(gpa, indented_fences, 72, null, 0);
+    defer gpa.free(bytes);
+
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "**three-space literal**") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "after **four-space bold**") == null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\x1b[1m\u{200b}four-space bold") != null);
 }
 
 // Each element carries its own look, and the markers that produced it are gone.

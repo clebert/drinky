@@ -17,6 +17,12 @@ zig build test     # run all tests
 
 Requires Zig 0.16.0.
 
+## Trust
+
+Project `AGENTS.md` files and skills are repository-controlled model instructions. Open untrusted
+repositories only inside an external container or sandbox; pith does not yet provide either a
+permission gate or a sandbox.
+
 ## Roadmap
 
 Planned features and where they hook into the current architecture live in

@@ -12,16 +12,6 @@ const skills_max = 1024;
 const warnings_max = 1024;
 const skill_file_bytes_max = 16 << 20;
 
-const catalog_intro =
-    "\n\nThe following skills provide specialized instructions. When a task matches a " ++
-    "skill's description, read its SKILL.md at the listed location before proceeding.\n" ++
-    "<available_skills>\n";
-const catalog_close = "</available_skills>";
-const skill_open = "  <skill>\n    <name>";
-const description_open = "</name>\n    <description>";
-const location_open = "</description>\n    <location>";
-const skill_close = "</location>\n  </skill>\n";
-
 pub const Skill = struct {
     name: []const u8,
     description: []const u8,
@@ -78,6 +68,50 @@ pub const Skill = struct {
     }
 };
 
+/// Read-only metadata for the skills advertised to the model. Skills disabled
+/// for model invocation remain in the registry but never appear in this view.
+pub const Catalog = struct {
+    skill_items: []const Skill,
+    visible_count: usize,
+
+    pub const Iterator = struct {
+        skill_items: []const Skill,
+        index: usize = 0,
+
+        pub fn next(self: *Iterator) ?*const Skill {
+            for (self.skill_items[self.index..]) |*skill| {
+                self.index += 1;
+                if (!skill.model_invocation_disabled) return skill;
+            }
+            return null;
+        }
+    };
+
+    pub fn init(skill_items: []const Skill) !Catalog {
+        if (skill_items.len > skills_max) return error.TooManySkills;
+        return initBounded(skill_items);
+    }
+
+    fn initBounded(skill_items: []const Skill) Catalog {
+        var visible_count: usize = 0;
+        for (skill_items) |skill| {
+            if (!skill.model_invocation_disabled) visible_count += 1;
+        }
+        return .{
+            .skill_items = skill_items,
+            .visible_count = visible_count,
+        };
+    }
+
+    pub fn count(self: *const Catalog) usize {
+        return self.visible_count;
+    }
+
+    pub fn iterator(self: *const Catalog) Iterator {
+        return .{ .skill_items = self.skill_items };
+    }
+};
+
 pub const Registry = struct {
     gpa: std.mem.Allocator,
     skill_items: std.ArrayList(Skill) = .empty,
@@ -97,8 +131,12 @@ pub const Registry = struct {
         self.* = undefined;
     }
 
-    fn skills(self: *const Registry) []const Skill {
+    fn items(self: *const Registry) []const Skill {
         return self.skill_items.items;
+    }
+
+    pub fn catalog(self: *const Registry) Catalog {
+        return Catalog.initBounded(self.skill_items.items);
     }
 
     pub fn warnings(self: *const Registry) []const []const u8 {
@@ -110,34 +148,6 @@ pub const Registry = struct {
             if (std.mem.eql(u8, skill.name, name)) return skill;
         }
         return null;
-    }
-
-    /// The compiled base prompt followed by the tier-1 skill catalog. With no
-    /// model-invocable skills, the owned result equals `base` byte for byte.
-    pub fn systemPrompt(self: *const Registry, base: []const u8) ![]u8 {
-        var visible_count: usize = 0;
-        for (self.skill_items.items) |*skill| {
-            if (!skill.model_invocation_disabled) visible_count += 1;
-        }
-        if (visible_count == 0) return self.gpa.dupe(u8, base);
-
-        var output: std.Io.Writer.Allocating = .init(self.gpa);
-        errdefer output.deinit();
-        try output.writer.writeAll(base);
-        try output.writer.writeAll(catalog_intro);
-        for (self.skill_items.items) |*skill| {
-            if (skill.model_invocation_disabled) continue;
-            try output.writer.writeAll(skill_open);
-            try writeEscaped(&output.writer, skill.name);
-            try output.writer.writeAll(description_open);
-            try writeEscaped(&output.writer, skill.description);
-            if (skill.description_truncated) try output.writer.writeAll("…");
-            try output.writer.writeAll(location_open);
-            try writeEscaped(&output.writer, skill.path);
-            try output.writer.writeAll(skill_close);
-        }
-        try output.writer.writeAll(catalog_close);
-        return output.toOwnedSlice();
     }
 
     fn scanRoot(self: *Registry, io: std.Io, root: []const u8, scope: Skill.Scope) !void {
@@ -578,17 +588,6 @@ fn diagnostic(gpa: std.mem.Allocator, text: []const u8) ![]u8 {
     return out.toOwnedSlice();
 }
 
-fn writeEscaped(writer: *std.Io.Writer, text: []const u8) !void {
-    for (text) |byte| switch (byte) {
-        '&' => try writer.writeAll("&amp;"),
-        '<' => try writer.writeAll("&lt;"),
-        '>' => try writer.writeAll("&gt;"),
-        '"' => try writer.writeAll("&quot;"),
-        '\'' => try writer.writeAll("&apos;"),
-        else => try writer.writeByte(byte),
-    };
-}
-
 fn pathGreaterThan(_: void, a: []const u8, b: []const u8) std.math.Order {
     return std.mem.order(u8, b, a);
 }
@@ -615,13 +614,17 @@ fn writeTestSkill(io: std.Io, dir: std.Io.Dir, path: []const u8, data: []const u
     try dir.writeFile(io, .{ .sub_path = path, .data = data });
 }
 
-test "an empty registry preserves the base system prompt" {
+test "an empty registry has an empty model catalog" {
     const gpa = std.testing.allocator;
     var registry = Registry.init(gpa);
     defer registry.deinit();
-    const prompt = try registry.systemPrompt("base prompt");
-    defer gpa.free(prompt);
-    try std.testing.expectEqualStrings("base prompt", prompt);
+    const catalog = registry.catalog();
+    try std.testing.expectEqual(@as(usize, 0), catalog.count());
+    var iterator = catalog.iterator();
+    try std.testing.expect(iterator.next() == null);
+
+    var too_many: [skills_max + 1]Skill = undefined;
+    try std.testing.expectError(error.TooManySkills, Catalog.init(&too_many));
 }
 
 test "a failed insert leaves the complete skill with its caller" {
@@ -677,14 +680,14 @@ test "discovery is recursive and project skills shadow user and ancestor skills"
     });
     defer registry.deinit();
 
-    try std.testing.expectEqual(@as(usize, 2), registry.skills().len);
+    try std.testing.expectEqual(@as(usize, 2), registry.items().len);
     try std.testing.expectEqualStrings("nearest copy", registry.get("shared").?.description);
     try std.testing.expect(registry.get("other") != null);
     try std.testing.expect(registry.get("outside") == null);
     try std.testing.expect(registry.warnings().len >= 2);
 }
 
-test "invalid names fall back, empty descriptions skip, and catalogs escape XML" {
+test "invalid names fall back, empty descriptions skip, and hidden skills stay out of catalog" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -720,12 +723,14 @@ test "invalid names fall back, empty descriptions skip, and catalogs escape XML"
     try std.testing.expect(registry.get("manual") != null);
     try std.testing.expectEqual(@as(usize, 1024), registry.get("long").?.description.len);
     try std.testing.expect(registry.get("long").?.description_truncated);
-    const prompt = try registry.systemPrompt("base");
-    defer gpa.free(prompt);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "use &lt;this&gt; &amp; that") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "<name>manual</name>") == null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "<name>fallback</name>") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "…") != null);
+    const catalog = registry.catalog();
+    try std.testing.expectEqual(@as(usize, 2), catalog.count());
+    var iterator = catalog.iterator();
+    for (0..skills_max) |_| {
+        const maybe_skill = iterator.next();
+        if (maybe_skill == null) break;
+        try std.testing.expect(!std.mem.eql(u8, maybe_skill.?.name, "manual"));
+    }
 
     const manual = registry.get("manual").?;
     const explicit = try manual.invoke(gpa, io, "");
@@ -793,7 +798,7 @@ test "discovery follows directory symlinks once and skips cycles" {
     });
     defer registry.deinit();
 
-    try std.testing.expectEqual(@as(usize, 1), registry.skills().len);
+    try std.testing.expectEqual(@as(usize, 1), registry.items().len);
     try std.testing.expect(registry.get("pdf-tools") != null);
 }
 
@@ -805,7 +810,7 @@ test "a skill whose path is not valid UTF-8 is skipped with a safe warning" {
     defer registry.deinit();
     try registry.loadPath(undefined, "user/\xff\xfe/SKILL.md", .user);
 
-    try std.testing.expectEqual(@as(usize, 0), registry.skills().len);
+    try std.testing.expectEqual(@as(usize, 0), registry.items().len);
     try std.testing.expectEqual(@as(usize, 1), registry.warnings().len);
     const warning = registry.warnings()[0];
     try std.testing.expect(std.mem.indexOf(u8, warning, "not valid UTF-8") != null);

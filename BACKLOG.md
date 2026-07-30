@@ -39,7 +39,7 @@ on another item. Module layout and extension seams live in `AGENTS.md`.
 
 - [ ] **Custom system prompt** — the authored core can be replaced or extended from explicitly
       configured files. _Generated environment, project-instruction, and skill sections remain._
-- [ ] **Project instructions** — applicable `AGENTS.md` files are included in the system prompt.
+- [x] **Project instructions** — applicable `AGENTS.md` files are included in the system prompt.
       _At startup, load exact-case files from the nearest Git root through the working directory,
       broad-to-specific; outside Git inspect only the working directory. No global file or
       `CLAUDE.md` fallback; warn when `CLAUDE.md` or likely-misspelled `AGENT.md` would otherwise be

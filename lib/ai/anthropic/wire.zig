@@ -8,8 +8,8 @@ const json = @import("../json.zig");
 const llm = @import("../llm.zig");
 const models = @import("../models.zig");
 
-/// Required first system block on the subscription OAuth path (the Claude Code
-/// identity). The API-key path omits it and sends only the user's own prompt.
+/// Exact leading identity expected by the Claude subscription compatibility path.
+/// The API-key path omits it and sends only the user's own prompt.
 const system_header = "You are Claude Code, Anthropic's official CLI for Claude.";
 
 /// Serialize `request` into an owned JSON body; caller frees the result.

@@ -13,6 +13,7 @@ pub const Agent = @import("Agent.zig");
 pub const anthropic = @import("anthropic/root.zig");
 pub const auth_store = @import("auth_store.zig");
 pub const command = @import("command/root.zig");
+pub const instructions = @import("instructions.zig");
 pub const llm = @import("llm.zig");
 pub const models = @import("models.zig");
 pub const net = @import("net.zig");
