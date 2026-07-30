@@ -31,12 +31,18 @@ pub const spec: llm.Tool = .{
             .required = true,
             .description = "Literal substring to search for",
         },
-        .{ .name = "path", .type = .string, .description = "Directory to search (default: '.')" },
+        .{
+            .name = "path",
+            .type = .string,
+            .description = "Directory to search, or a single file to search directly " ++
+                "(default: '.')",
+        },
         .{
             .name = "glob",
             .type = .string,
             .description = "Only search files whose path matches this glob; * and ? do not " ++
-                "cross '/', so use a '**/' prefix to recurse (default: all files)",
+                "cross '/', so use a '**/' prefix to recurse; has no effect when path names " ++
+                "a single file (default: all files)",
         },
         .{
             .name = "ignore_case",
@@ -74,16 +80,30 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
     const ignore_case = parsed.value.ignore_case;
     const limit = parsed.value.limit;
 
-    var matches = walk.collect(context.io, gpa, .{
+    // A directory is walked for its files; a path that names a single file is
+    // searched directly, ignoring the glob — the glob only filters a traversal,
+    // and a named file needs none. `maybe_match` owns the walked paths; the file
+    // case borrows `base`, which outlives the search.
+    const single_file: [1][]const u8 = .{base};
+    var paths: []const []const u8 = &single_file;
+    var files_incomplete = false;
+    var maybe_match: ?walk.Match = null;
+    defer if (maybe_match) |*match| match.deinit(gpa);
+    if (walk.collect(context.io, gpa, .{
         .base = base,
         .pattern = file_glob,
         .retain = files_max,
-    }) catch |err|
-        return Result.cannot(gpa, err, "search", base);
-    defer matches.deinit(gpa);
-    // Fewer candidates retained than found, or a capped walk, means some files
-    // were never searched.
-    const files_incomplete = matches.capped or matches.matched > matches.paths.len;
+    })) |match| {
+        maybe_match = match;
+        paths = match.paths;
+        // Fewer candidates retained than found, or a capped walk, leaves some
+        // files unsearched.
+        files_incomplete = match.capped or match.matched > match.paths.len;
+    } else |err| switch (err) {
+        // Not a directory: `base` names a file, so search that one path.
+        error.NotDir => {},
+        else => return Result.cannot(gpa, err, "search", base),
+    }
 
     var out: std.Io.Writer.Allocating = .init(gpa);
     errdefer out.deinit();
@@ -91,7 +111,7 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
     var line_capped = false;
     var bytes_read: usize = 0;
     var bytes_capped = false;
-    search: for (matches.paths) |path| {
+    search: for (paths) |path| {
         if (bytes_read >= bytes_read_max) {
             bytes_capped = true;
             break :search;
@@ -196,6 +216,50 @@ test "grep finds a literal substring with a glob filter" {
     const expected = try std.fmt.bufPrint(
         &expected_buf,
         ".zig-cache/tmp/{s}/a.zig:2:needle here",
+        .{tmp.sub_path},
+    );
+    try std.testing.expectEqualStrings(expected, result.content);
+}
+
+test "grep searches a single file given as the path" {
+    const gpa = std.testing.allocator;
+    const context: Context = .{ .gpa = gpa, .io = std.testing.io };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "a.zig", .data = "nope\nneedle here\n" });
+    var input_buf: [160]u8 = undefined;
+    const input = try std.fmt.bufPrint(&input_buf,
+        \\{{"pattern":"needle","path":".zig-cache/tmp/{s}/a.zig"}}
+    , .{tmp.sub_path});
+    const result = try run(&context, input);
+    defer gpa.free(result.content);
+    try std.testing.expect(!result.is_error);
+    var expected_buf: [128]u8 = undefined;
+    const expected = try std.fmt.bufPrint(
+        &expected_buf,
+        ".zig-cache/tmp/{s}/a.zig:2:needle here",
+        .{tmp.sub_path},
+    );
+    try std.testing.expectEqualStrings(expected, result.content);
+}
+
+test "grep ignores the glob when the path is a single file" {
+    const gpa = std.testing.allocator;
+    const context: Context = .{ .gpa = gpa, .io = std.testing.io };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "a.zig", .data = "needle here\n" });
+    var input_buf: [192]u8 = undefined;
+    const input = try std.fmt.bufPrint(&input_buf,
+        \\{{"pattern":"needle","path":".zig-cache/tmp/{s}/a.zig","glob":"**/*.txt"}}
+    , .{tmp.sub_path});
+    const result = try run(&context, input);
+    defer gpa.free(result.content);
+    try std.testing.expect(!result.is_error);
+    var expected_buf: [128]u8 = undefined;
+    const expected = try std.fmt.bufPrint(
+        &expected_buf,
+        ".zig-cache/tmp/{s}/a.zig:1:needle here",
         .{tmp.sub_path},
     );
     try std.testing.expectEqualStrings(expected, result.content);

@@ -34,8 +34,8 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - **write** — create or overwrite a file atomically.
 - **edit** — replace one exact span, which must occur exactly once.
 - **find** — glob search under a directory, sorted by path, 1000 hits by default.
-- **grep** — literal search printing `path:line:text`, with glob and case filters, 100 hits by
-  default.
+- **grep** — literal search printing `path:line:text` under a directory or in a single named file,
+  with glob and case filters, 100 hits by default.
 - **bash** — run a shell command in the working directory, preserving combined stdout and stderr
   order and returning a bounded tail; a non-zero exit is reported, and output caps and the timeout
   are configurable, the timeout also settable per call.
