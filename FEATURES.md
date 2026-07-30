@@ -116,8 +116,8 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - A running tool shows a blue box with its name and arguments, then turns green or red with a
   one-line stat summary (lines read, matches found, exit status), or its first output line when the
   tool gives no summary.
-- A heavy accent segment orbits the input border while a turn is in flight, without adding a
-  layout row.
+- A heavy accent segment orbits the input border while a turn is in flight, growing as progress
+  goes quiet without adding a layout row.
 - Queued steering shows as `Steering:` rows, and becomes one user message once consumed.
 - The bottom line shows context fill, session cost, cache savings, the last request's cache-hit
   rate, and any OpenAI-subscription quota remaining, with `model · effort` right-aligned.

@@ -10,9 +10,11 @@ const terminal = @import("terminal");
 
 const color = @import("color.zig");
 
-const activity_breath_ticks: u64 = 18;
+const activity_length_default: usize = 6;
+// At the 16 ms frame target, wait about 500 ms, then add one cell about every 100 ms.
+const activity_growth_delay_ticks: u64 = 31;
+const activity_growth_interval_ticks: u64 = 6;
 const activity_vertical_ticks: usize = 2;
-const activity_lengths = [_]usize{ 6, 7, 8, 9, 10, 11, 10, 9, 8, 7 };
 
 pub const BoxStyle = struct { background: color.Style, foreground: color.Style };
 
@@ -48,19 +50,28 @@ pub const FrameGeometry = struct {
     closed: bool,
 };
 
+pub const Activity = struct {
+    motion_tick: u64,
+    progress_age_ticks: u64,
+};
+
 pub const ActivityGeometry = struct {
     columns: usize,
     body_rows: usize,
 };
 
-/// Whether `activity_tick` changes the segment at this frame geometry.
-pub fn activityChanged(activity_tick: u64, geometry: *const ActivityGeometry) bool {
+/// Whether `activity` changes the segment at this frame geometry.
+pub fn activityChanged(activity: *const Activity, geometry: *const ActivityGeometry) bool {
     if (geometry.columns < 3) return false;
-    if (activity_tick == 0) return true;
-    const previous_tick = activity_tick - 1;
-    if (activityHead(activity_tick, geometry) != activityHead(previous_tick, geometry)) return true;
+    const previous: Activity = .{
+        .motion_tick = activity.motion_tick -% 1,
+        .progress_age_ticks = activity.progress_age_ticks -| 1,
+    };
+    if (activityHead(activity.motion_tick, geometry) !=
+        activityHead(previous.motion_tick, geometry)) return true;
     const perimeter = activityPerimeter(geometry);
-    return activityLength(activity_tick, perimeter) != activityLength(previous_tick, perimeter);
+    return activityLength(activity.progress_age_ticks, perimeter) !=
+        activityLength(previous.progress_age_ticks, perimeter);
 }
 
 pub fn frameGeometry(columns: usize) FrameGeometry {
@@ -174,7 +185,8 @@ pub fn bodyLimit(viewport_rows: usize) usize {
 }
 
 /// A closed input area containing a window of `body`'s wrapped rows. While
-/// `activity_tick` is set, a breathing heavy segment travels around its border.
+/// `activity` is set, a heavy segment travels around its border and grows as
+/// progress goes quiet.
 pub const Framing = struct {
     body: []const u8,
     body_rows: usize,
@@ -192,7 +204,7 @@ pub const Framing = struct {
     /// Style per logical `\n`-delimited body line (lines past the end are plain).
     /// Wrapped continuations retain their source line's style.
     line_styles: []const ?color.Style = &.{},
-    activity_tick: ?u64 = null,
+    activity: ?Activity = null,
 };
 
 const Rule = enum { top, bottom };
@@ -238,7 +250,7 @@ const BorderGlyph = enum {
 const Border = struct {
     columns: usize,
     body_rows: usize,
-    activity_tick: ?u64,
+    activity: ?Activity,
 
     fn perimeter(self: *const Border) usize {
         return 2 * self.columns + 2 * self.body_rows;
@@ -263,7 +275,7 @@ pub fn framed(placement: *const Placement, framing: *const Framing) !void {
     const border: Border = .{
         .columns = placement.columns,
         .body_rows = framing.body_rows,
-        .activity_tick = if (geometry.closed) framing.activity_tick else null,
+        .activity = if (geometry.closed) framing.activity else null,
     };
     var line = placement.base;
     try ruleRow(placement, &border, &line, .top, "↑", framing.hidden_above);
@@ -487,20 +499,20 @@ fn borderCell(border: *const Border, position: usize, shape: BorderShape) Border
 }
 
 fn activityAt(border: *const Border, position: usize) bool {
-    const maybe_activity_tick = border.activity_tick;
-    if (maybe_activity_tick) |activity_tick| {
+    const maybe_activity = border.activity;
+    if (maybe_activity) |activity| {
         const geometry: ActivityGeometry = .{
             .columns = border.columns,
             .body_rows = border.body_rows,
         };
         const perimeter = activityPerimeter(&geometry);
         std.debug.assert(perimeter >= 8 and position < perimeter);
-        const head = activityHead(activity_tick, &geometry);
+        const head = activityHead(activity.motion_tick, &geometry);
         const distance = if (head >= position)
             head - position
         else
             perimeter - (position - head);
-        return distance < activityLength(activity_tick, perimeter);
+        return distance < activityLength(activity.progress_age_ticks, perimeter);
     }
     return false;
 }
@@ -511,12 +523,12 @@ fn activityPerimeter(geometry: *const ActivityGeometry) usize {
 
 /// Horizontal cells consume one tick; vertical cells and corners consume two,
 /// compensating for a terminal cell's greater physical height.
-fn activityHead(activity_tick: u64, geometry: *const ActivityGeometry) usize {
+fn activityHead(motion_tick: u64, geometry: *const ActivityGeometry) usize {
     std.debug.assert(geometry.columns >= 3 and geometry.body_rows >= 1);
     const cycle_ticks = activityCycleTicks(geometry);
     const cycle_ticks_u64: u64 = @intCast(cycle_ticks);
     const offset = @divFloor(geometry.columns, 2) + 1;
-    const phase_tick: usize = @intCast(activity_tick % cycle_ticks_u64);
+    const phase_tick: usize = @intCast(motion_tick % cycle_ticks_u64);
     const phase = (phase_tick + offset) % cycle_ticks;
     return activityPosition(phase, geometry);
 }
@@ -552,10 +564,18 @@ fn activityPosition(phase: usize, geometry: *const ActivityGeometry) usize {
         @divFloor(remaining, activity_vertical_ticks);
 }
 
-fn activityLength(activity_tick: u64, perimeter: usize) usize {
-    const breath = @divFloor(activity_tick, activity_breath_ticks);
-    const index: usize = @intCast(breath % activity_lengths.len);
-    return @min(activity_lengths[index], perimeter - 2);
+fn activityLength(progress_age_ticks: u64, perimeter: usize) usize {
+    const length_max = @divFloor(perimeter, 2);
+    const length_base = @min(activity_length_default, length_max);
+    const growth_max: u64 = @intCast(length_max - length_base);
+    const growth_steps: u64 = if (progress_age_ticks < activity_growth_delay_ticks)
+        0
+    else
+        1 + @divFloor(
+            progress_age_ticks - activity_growth_delay_ticks,
+            activity_growth_interval_ticks,
+        );
+    return length_base + @as(usize, @intCast(@min(growth_steps, growth_max)));
 }
 
 fn borderGlyph(shape: BorderShape, weights: PathWeights) BorderGlyph {
@@ -716,18 +736,26 @@ test "frame geometry preserves content before decoration in narrow windows" {
 }
 
 test "activity segment blends into straight rails and corners" {
-    const idle: Border = .{ .columns = 20, .body_rows = 3, .activity_tick = null };
+    const idle: Border = .{ .columns = 20, .body_rows = 3, .activity = null };
     try std.testing.expectEqual(.top_left_light, borderCell(&idle, 0, .top_left).glyph);
     try std.testing.expectEqual(.horizontal_light, borderCell(&idle, 1, .top).glyph);
 
     // Tick 9 reaches the top-right corner; entering the side makes the corner
     // fully heavy and tapers the head into the right rail.
-    const corner_head: Border = .{ .columns = 20, .body_rows = 3, .activity_tick = 9 };
+    const corner_head: Border = .{
+        .columns = 20,
+        .body_rows = 3,
+        .activity = .{ .motion_tick = 9, .progress_age_ticks = 0 },
+    };
     const corner = borderCell(&corner_head, 19, .top_right);
     try std.testing.expect(corner.accent);
     try std.testing.expectEqual(.top_right_down_light_left_heavy, corner.glyph);
 
-    const side_head: Border = .{ .columns = 20, .body_rows = 3, .activity_tick = 11 };
+    const side_head: Border = .{
+        .columns = 20,
+        .body_rows = 3,
+        .activity = .{ .motion_tick = 11, .progress_age_ticks = 0 },
+    };
     try std.testing.expectEqual(.top_right_heavy, borderCell(&side_head, 19, .top_right).glyph);
     try std.testing.expectEqual(
         .vertical_up_heavy_down_light,
@@ -743,10 +771,31 @@ test "activity timing compensates for taller vertical cells" {
     try std.testing.expectEqual(@as(usize, 19), activityHead(10, &geometry));
     try std.testing.expectEqual(@as(usize, 20), activityHead(11, &geometry));
     try std.testing.expectEqual(@as(usize, 20), activityHead(12, &geometry));
-    try std.testing.expect(activityChanged(9, &geometry));
-    try std.testing.expect(!activityChanged(10, &geometry));
-    try std.testing.expect(activityChanged(11, &geometry));
-    try std.testing.expect(!activityChanged(12, &geometry));
+    try std.testing.expect(activityChanged(
+        &.{ .motion_tick = 9, .progress_age_ticks = 0 },
+        &geometry,
+    ));
+    try std.testing.expect(!activityChanged(
+        &.{ .motion_tick = 10, .progress_age_ticks = 0 },
+        &geometry,
+    ));
+    try std.testing.expect(activityChanged(
+        &.{ .motion_tick = 66, .progress_age_ticks = 31 },
+        &geometry,
+    ));
+    // Tick 346 is the same vertical dwell after the segment has reached its cap.
+    try std.testing.expect(!activityChanged(
+        &.{ .motion_tick = 346, .progress_age_ticks = 290 },
+        &geometry,
+    ));
+    try std.testing.expect(activityChanged(
+        &.{ .motion_tick = 11, .progress_age_ticks = 0 },
+        &geometry,
+    ));
+    try std.testing.expect(!activityChanged(
+        &.{ .motion_tick = 12, .progress_age_ticks = 0 },
+        &geometry,
+    ));
 }
 
 test "aspect-aware timing covers the complete perimeter" {
@@ -760,12 +809,17 @@ test "aspect-aware timing covers the complete perimeter" {
         try std.testing.expectEqual(position, activityPosition(phase, &geometry));
 }
 
-test "activity segment breathes without consuming the whole perimeter" {
+test "activity segment grows after a quiet grace period up to half the perimeter" {
     try std.testing.expectEqual(@as(usize, 6), activityLength(0, 100));
-    try std.testing.expectEqual(@as(usize, 7), activityLength(18, 100));
-    try std.testing.expectEqual(@as(usize, 11), activityLength(90, 100));
-    try std.testing.expectEqual(@as(usize, 6), activityLength(180, 100));
-    try std.testing.expectEqual(@as(usize, 6), activityLength(90, 8));
+    try std.testing.expectEqual(@as(usize, 6), activityLength(30, 100));
+    try std.testing.expectEqual(@as(usize, 7), activityLength(31, 100));
+    try std.testing.expectEqual(@as(usize, 7), activityLength(36, 100));
+    try std.testing.expectEqual(@as(usize, 8), activityLength(37, 100));
+    try std.testing.expectEqual(@as(usize, 11), activityLength(55, 100));
+    try std.testing.expectEqual(@as(usize, 49), activityLength(288, 100));
+    try std.testing.expectEqual(@as(usize, 50), activityLength(289, 100));
+    try std.testing.expectEqual(@as(usize, 50), activityLength(290, 100));
+    try std.testing.expectEqual(@as(usize, 4), activityLength(0, 8));
 }
 
 test "overflow labels compact before disappearing" {

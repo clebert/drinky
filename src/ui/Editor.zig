@@ -170,7 +170,7 @@ pub const Trim = enum { none, whole_prompt };
 
 pub const RenderOptions = struct {
     viewport_rows: usize,
-    activity_tick: ?u64 = null,
+    activity: ?paint.Activity = null,
 };
 
 /// One atom-aware text mutation, the sole path that edits the visible buffer.
@@ -733,7 +733,7 @@ pub fn render(
         .hidden_above = self.scroll,
         .hidden_below = total_body - self.scroll - visible_rows,
         .trailing_row = total_body > terminal.width.rows(text, geometry.content_columns),
-        .activity_tick = options.activity_tick,
+        .activity = options.activity,
     });
 }
 
@@ -1634,12 +1634,12 @@ test "activity moves in the border without changing the editor height" {
 
     const first = try renderedWithOptions(gpa, &editor, size, &.{
         .viewport_rows = size.rows,
-        .activity_tick = 0,
+        .activity = .{ .motion_tick = 0, .progress_age_ticks = 0 },
     });
     defer gpa.free(first);
     const second = try renderedWithOptions(gpa, &editor, size, &.{
         .viewport_rows = size.rows,
-        .activity_tick = 3,
+        .activity = .{ .motion_tick = 3, .progress_age_ticks = 0 },
     });
     defer gpa.free(second);
 

@@ -89,10 +89,19 @@ const Turn = struct {
     /// Transcript length after the newest applied event known to be committed.
     transcript_checkpoint: usize,
     activity_tick: u64,
+    /// Motion tick observed at the latest accepted progress event.
+    progress_tick_last: u64,
     tools: std.ArrayList(ActiveTool),
     /// `tools`' box text, rebuilt each frame so the tail gets a
     /// `[]const []const u8` without a fresh allocation per repaint.
     box_view: std.ArrayList([]const u8),
+
+    fn activity(self: *const Turn) ui.paint.Activity {
+        return .{
+            .motion_tick = self.activity_tick,
+            .progress_age_ticks = self.activity_tick -% self.progress_tick_last,
+        };
+    }
 
     fn boxes(self: *Turn, gpa: std.mem.Allocator) ![]const []const u8 {
         self.box_view.clearRetainingCapacity();
@@ -296,6 +305,7 @@ pub fn applyTurnEvent(self: *Session, event: *const TurnEvent) !bool {
             return true;
         },
     }
+    turn.progress_tick_last = turn.activity_tick;
     if (event.progress_sequence != 0)
         turn.progress_sequence_applied = event.progress_sequence;
     return false;
@@ -499,6 +509,7 @@ pub fn beginTurn(self: *Session, generation: u64) void {
         .progress_sequence_checkpoint = 0,
         .transcript_checkpoint = self.transcript.blocks().len,
         .activity_tick = 0,
+        .progress_tick_last = 0,
         .tools = .empty,
         .box_view = .empty,
     } };
@@ -635,7 +646,7 @@ pub fn paint(self: *Session, size: terminal.View.Size) !void {
             self.editor.reflow(size);
             break :turn .{ .turn = .{
                 .tools = try turn.boxes(self.gpa),
-                .activity_tick = turn.activity_tick,
+                .activity = turn.activity(),
                 .steering = try self.steeringView(),
                 .editor = &self.editor,
             } };
@@ -662,7 +673,8 @@ pub fn advanceFrame(self: *Session) bool {
         turn.activity_tick +%= 1;
         const size: terminal.View.Size = .{ .columns = self.columns, .rows = self.rows };
         const body_rows = self.editor.rows(size) - ui.paint.frame_border_rows;
-        activity_changed = ui.paint.activityChanged(turn.activity_tick, &.{
+        const activity = turn.activity();
+        activity_changed = ui.paint.activityChanged(&activity, &.{
             .columns = size.columns,
             .body_rows = body_rows,
         });
@@ -1230,6 +1242,26 @@ test "activity ticks use aspect-aware repaint timing" {
     // New model content repaints even without animation.
     session.dirty = true;
     try std.testing.expect(session.advanceFrame());
+}
+
+test "accepted turn progress restarts border growth without resetting motion" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    defer session.deinit();
+
+    session.beginTurn(7);
+    session.mode.turn.activity_tick = 125;
+    session.mode.turn.progress_tick_last = 5;
+
+    try applyEvent(&session, 6, .{ .usage = .{} });
+    try std.testing.expectEqual(@as(u64, 5), session.mode.turn.progress_tick_last);
+
+    try applyEvent(&session, 7, .{ .usage = .{} });
+    const activity = session.mode.turn.activity();
+    try std.testing.expectEqual(@as(u64, 125), activity.motion_tick);
+    try std.testing.expectEqual(@as(u64, 0), activity.progress_age_ticks);
 }
 
 test "a failure with nothing committed rewinds the tail and returns the prompt" {

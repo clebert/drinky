@@ -57,7 +57,7 @@ pub const Tail = union(enum) {
     /// nothing is queued), then the editor with activity travelling in its border.
     pub const Turn = struct {
         tools: []const []const u8,
-        activity_tick: u64,
+        activity: ui.paint.Activity,
         steering: []const []const u8,
         editor: *const ui.Editor,
     };
@@ -65,7 +65,7 @@ pub const Tail = union(enum) {
 
 const EditorPresentation = struct {
     editor: *const ui.Editor,
-    activity_tick: ?u64,
+    activity: ?ui.paint.Activity,
 };
 
 /// One screen component: a transcript block or a piece of the tail. Each variant
@@ -109,7 +109,7 @@ const Component = union(enum) {
             .status => |info| try ui.status.render(placement, info),
             .editor => |presentation| try presentation.editor.render(placement, &.{
                 .viewport_rows = viewport_rows,
-                .activity_tick = presentation.activity_tick,
+                .activity = presentation.activity,
             }),
             .picker => |picker| try picker.render(placement, viewport_rows),
         }
@@ -182,7 +182,7 @@ fn slotAt(scene: *const Scene, index: usize) Slot {
 /// sole input.
 fn tailSlot(tail: *const Tail, offset: usize) Slot {
     switch (tail.*) {
-        .prompt => |editor| return editorSlot(&.{ .editor = editor, .activity_tick = null }),
+        .prompt => |editor| return editorSlot(&.{ .editor = editor, .activity = null }),
         .picking => |picker| return .{
             .component = .{ .picker = picker },
             .id = id_input,
@@ -201,7 +201,7 @@ fn tailSlot(tail: *const Tail, offset: usize) Slot {
             };
             return editorSlot(&.{
                 .editor = turn.editor,
-                .activity_tick = turn.activity_tick,
+                .activity = turn.activity,
             });
         },
     }
@@ -283,7 +283,7 @@ test "a turn tail stacks tool boxes above the active editor" {
         .transcript = &[_]ui.block.Entry{},
         .tail = .{ .turn = .{
             .tools = &tools,
-            .activity_tick = 0,
+            .activity = .{ .motion_tick = 0, .progress_age_ticks = 0 },
             .steering = &.{},
             .editor = &editor,
         } },
@@ -316,7 +316,7 @@ test "border activity does not change the input tail height" {
         .transcript = &.{},
         .tail = .{ .turn = .{
             .tools = &.{},
-            .activity_tick = 0,
+            .activity = .{ .motion_tick = 0, .progress_age_ticks = 0 },
             .steering = &.{},
             .editor = &editor,
         } },
@@ -345,7 +345,7 @@ test "a turn with 253 tool boxes keeps its anchor ids from wrapping" {
         .transcript = &[_]ui.block.Entry{},
         .tail = .{ .turn = .{
             .tools = &tools,
-            .activity_tick = 0,
+            .activity = .{ .motion_tick = 0, .progress_age_ticks = 0 },
             .steering = &.{},
             .editor = &editor,
         } },
@@ -368,7 +368,7 @@ test "a turn tail shows the steering queue above the editor" {
         .transcript = &[_]ui.block.Entry{},
         .tail = .{ .turn = .{
             .tools = &.{},
-            .activity_tick = 0,
+            .activity = .{ .motion_tick = 0, .progress_age_ticks = 0 },
             .steering = &queue,
             .editor = &editor,
         } },
@@ -399,7 +399,7 @@ test "a narrow window clips the steering rows to width" {
         .transcript = &[_]ui.block.Entry{},
         .tail = .{ .turn = .{
             .tools = &.{},
-            .activity_tick = 0,
+            .activity = .{ .motion_tick = 0, .progress_age_ticks = 0 },
             .steering = &queue,
             .editor = &editor,
         } },
