@@ -1,4 +1,4 @@
-//! Searches file contents for a literal substring, returning matches as
+//! Searches file contents for a literal substring and returns matches as
 //! 'path:line:text'.
 
 const std = @import("std");
@@ -13,9 +13,9 @@ const walk = @import("walk.zig");
 const limit_default = 100;
 const file_bytes_max = 4 << 20;
 const line_bytes_max = 300;
-// Retained candidate paths (bounds the path-list memory) and the running total
-// of bytes read across searched files (bounds the actual I/O work, which a bare
-// `files_max * file_bytes_max` ceiling would leave at hundreds of gigabytes).
+// The retained candidate paths bound the path-list memory. The running total of
+// bytes read across searched files bounds the actual I/O work. A bare
+// `files_max * file_bytes_max` ceiling leaves the I/O work at hundreds of gigabytes.
 const files_max = 100_000;
 const bytes_read_max = 256 << 20;
 
@@ -74,16 +74,17 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
     const parsed = try parse.input(Input, gpa, input_json);
     defer parsed.deinit();
     const pattern = parsed.value.pattern;
-    if (pattern.len == 0) return Result.report(gpa, .err, "pattern must not be empty", .{});
+    if (pattern.len == 0)
+        return Result.report(gpa, .err, "Enter a nonempty pattern.", .{});
     const base = parsed.value.path;
     const file_glob = parsed.value.glob;
     const ignore_case = parsed.value.ignore_case;
     const limit = parsed.value.limit;
 
-    // A directory is walked for its files; a path that names a single file is
-    // searched directly, ignoring the glob — the glob only filters a traversal,
-    // and a named file needs none. `maybe_match` owns the walked paths; the file
-    // case borrows `base`, which outlives the search.
+    // Pith walks a directory for its files. Pith searches a path that names a
+    // single file directly and ignores the glob. The glob only filters a
+    // traversal, and a named file needs none. `maybe_match` owns the walked
+    // paths. The file case borrows `base`, which outlives the search.
     const single_file: [1][]const u8 = .{base};
     var paths: []const []const u8 = &single_file;
     var files_incomplete = false;
@@ -96,8 +97,8 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
     })) |match| {
         maybe_match = match;
         paths = match.paths;
-        // Fewer candidates retained than found, or a capped walk, leaves some
-        // files unsearched.
+        // A walk that retains fewer candidates than it found, or a capped walk,
+        // leaves some files unsearched.
         files_incomplete = match.capped or match.matched > match.paths.len;
     } else |err| switch (err) {
         // Not a directory: `base` names a file, so search that one path.
@@ -124,7 +125,7 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
             .limited(file_bytes_max),
         ) catch |err| switch (err) {
             error.Canceled, error.OutOfMemory => return err,
-            // An oversized file streams the full limit off disk before failing.
+            // An oversized file streams the full limit off disk before it fails.
             error.StreamTooLong => {
                 bytes_read += file_bytes_max;
                 continue;
@@ -151,7 +152,7 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
             const shown = line[0..utf8FloorLength(line, line_bytes_max)];
             if (shown.len < line.len) lines_truncated = true;
             if (count > 0) try out.writer.writeAll("\n");
-            // U+FFFD-substitute invalid bytes so the result serializes as a JSON string.
+            // Substitute U+FFFD for invalid bytes so the result serializes as a JSON string.
             try out.writer.print("{f}:{d}:{f}", .{
                 std.unicode.fmtUtf8(path),
                 line_number,
@@ -162,47 +163,53 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
     }
     if (count == 0) {
         if (line_capped or bytes_capped or files_incomplete)
-            return Result.report(gpa, .ok, "no matches for {s} in the portion searched; " ++
-                "the search was incomplete — narrow the path or glob", .{pattern});
-        return Result.report(gpa, .ok, "no matches for {s}", .{pattern});
+            return Result.report(
+                gpa,
+                .ok,
+                "Pith found no matches for {s} in the part that Pith searched. " ++
+                    "Use a narrower path or glob because the search was incomplete.",
+                .{pattern},
+            );
+        return Result.report(gpa, .ok, "Pith found no matches for {s}.", .{pattern});
     }
-    // Report the reason the result may be incomplete, most specific first: a hit
+    // Report the reason the result can be incomplete, most specific first: a hit
     // result budget, then the I/O budget, then unsearched files.
     if (line_capped) {
         try out.writer.print(
-            "\n... stopped at the limit of {d} matches; refine the search or raise limit",
+            "\n[Pith stopped after {d} matches. Refine the search or increase limit.]",
             .{limit},
         );
     } else if (bytes_capped) {
         try out.writer.print(
-            "\n... stopped after reading {d} MB; refine the search or narrow the path or glob",
+            "\n[Pith stopped after Pith read {d} MB. Refine the search or use a narrower " ++
+                "path or glob.]",
             .{bytes_read_max >> 20},
         );
     } else if (files_incomplete) {
-        try out.writer.writeAll("\n... search incomplete: " ++
-            "the tree is too large to scan fully; some files were not searched");
+        try out.writer.writeAll(
+            "\n[Pith could not scan the full file tree. Pith did not search some files.]",
+        );
     }
 
     var summary_output: std.Io.Writer.Allocating = .init(gpa);
     errdefer summary_output.deinit();
-    const plural_suffix: []const u8 = if (count == 1) "" else "es";
-    try summary_output.writer.print("{d} match{s}", .{ count, plural_suffix });
+    try summary_output.writer.print("Matches: {d}", .{count});
     if (line_capped) {
-        try summary_output.writer.writeAll(" · limit reached");
+        try summary_output.writer.writeAll(" · Limit: Reached");
     } else if (bytes_capped) {
-        try summary_output.writer.print(" · stopped at {d} MB", .{bytes_read_max >> 20});
+        try summary_output.writer.print(" · Stopped at: {d} MB", .{bytes_read_max >> 20});
     } else if (files_incomplete) {
-        try summary_output.writer.writeAll(" · search incomplete");
+        try summary_output.writer.writeAll(" · Search: Incomplete");
     }
-    if (lines_truncated) try summary_output.writer.writeAll(" · lines truncated");
+    if (lines_truncated) try summary_output.writer.writeAll(" · Lines: Truncated");
     const summary = try summary_output.toOwnedSlice();
     errdefer gpa.free(summary);
     const content = try out.toOwnedSlice();
     return .{ .content = content, .summary = summary, .is_error = false };
 }
 
-/// Largest length no greater than `max` that does not split a UTF-8 codepoint,
-/// so a truncated line stays valid UTF-8 for JSON serialization.
+/// The largest length no greater than `max` that does not split a UTF-8
+/// codepoint, so a truncated line stays valid UTF-8 for JSON serialization.
 fn utf8FloorLength(bytes: []const u8, max: usize) usize {
     var end = @min(bytes.len, max);
     while (end > 0 and end < bytes.len and bytes[end] & 0xC0 == 0x80) end -= 1;
@@ -237,7 +244,7 @@ test "grep finds a literal substring with a glob filter" {
         .{tmp.sub_path},
     );
     try std.testing.expectEqualStrings(expected, result.content);
-    try std.testing.expectEqualStrings("1 match", result.summary.?);
+    try std.testing.expectEqualStrings("Matches: 1", result.summary.?);
 }
 
 test "grep searches a single file given as the path" {
@@ -340,11 +347,11 @@ test "grep stops at the result limit and reports it" {
     const expected = try std.fmt.bufPrint(
         &expected_buf,
         ".zig-cache/tmp/{s}/f.txt:1:hit one\n.zig-cache/tmp/{s}/f.txt:2:hit two\n" ++
-            "... stopped at the limit of 2 matches; refine the search or raise limit",
+            "[Pith stopped after 2 matches. Refine the search or increase limit.]",
         .{ tmp.sub_path, tmp.sub_path },
     );
     try std.testing.expectEqualStrings(expected, result.content);
-    try std.testing.expectEqualStrings("2 matches · limit reached", result.summary.?);
+    try std.testing.expectEqualStrings("Matches: 2 · Limit: Reached", result.summary.?);
 }
 
 test "grep skips binary and oversized files" {
@@ -396,7 +403,7 @@ test "grep caps the reported line length" {
         .{ tmp.sub_path, line[0..line_bytes_max] },
     );
     try std.testing.expectEqualStrings(expected, result.content);
-    try std.testing.expectEqualStrings("1 match · lines truncated", result.summary.?);
+    try std.testing.expectEqualStrings("Matches: 1 · Lines: Truncated", result.summary.?);
 }
 
 test "grep reports an incomplete search when nothing was shown" {

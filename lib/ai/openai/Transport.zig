@@ -1,8 +1,8 @@
-//! The Responses API transport: sends a serialized request to a configured
-//! endpoint with the right auth identity, and exposes the response as a pull
+//! The Responses API transport. It sends a serialized request to a configured
+//! endpoint with the correct auth identity. It exposes the response as a pull
 //! stream of decoded SSE `response.*` events on the shared `sse` engine.
-//! Shared by the API-key and ChatGPT-subscription providers, which differ only
-//! in `endpoint` and whether `account_id` is set. Knows nothing about
+//! The API-key and ChatGPT-subscription providers share it and differ only
+//! in `endpoint` and whether `account_id` is set. It knows nothing about
 //! conversation state or tools.
 
 const std = @import("std");
@@ -14,28 +14,28 @@ const sse = @import("../sse.zig");
 
 const Transport = @This();
 
-/// Header value identifying this client on the ChatGPT-subscription backend.
+/// The header value that identifies this client on the ChatGPT-subscription backend.
 const originator = "pith";
 
 gpa: std.mem.Allocator,
 io: std.Io,
 timeouts: net.Timeouts,
-/// Full request URL: `https://api.openai.com/v1/responses` for API-key mode, the
-/// Codex backend for subscription mode.
+/// The full request URL: `https://api.openai.com/v1/responses` for API-key
+/// mode, the Codex backend for subscription mode.
 endpoint: []const u8,
-/// ChatGPT account id sent as `chatgpt-account-id`; empty in API-key mode, where
-/// no account or originator header is sent.
+/// The ChatGPT account id, sent as `chatgpt-account-id`. It is empty in
+/// API-key mode, which sends no account or originator header.
 account_id: []const u8,
 
-/// A single Responses request in flight on the shared SSE engine, which
-/// supplies the reading half; this struct keeps the Responses frame vocabulary
-/// (`decode`). Responses sends no keepalive pings; only `response.*` frames are
-/// progress. Pin it: the HTTP response borrows the request and the SSE reader
-/// borrows this struct's buffers.
+/// A single Responses request in flight on the shared SSE engine. The engine
+/// supplies the reading half. This struct keeps the Responses frame vocabulary
+/// (`decode`). Responses sends no keepalive pings, so only `response.*` frames
+/// are progress. Pin it: the HTTP response borrows the request and the SSE
+/// reader borrows this struct's buffers.
 pub const Stream = struct {
     gpa: std.mem.Allocator,
-    /// Set last by a full connect; `sse.Engine.open`'s timeout path frees only
-    /// an established stream.
+    /// Set last by a full connect. The timeout path of `sse.Engine.open` frees
+    /// only an established stream.
     established: bool,
     client: std.http.Client,
     request: std.http.Client.Request,
@@ -48,10 +48,11 @@ pub const Stream = struct {
     error_length: usize,
     error_retryable: bool,
     retry_after_ms: ?u64,
-    /// Scratch for one decoded frame. Events may borrow it until the next read.
+    /// Scratch for one decoded frame. Events can borrow it until the next read.
     frame_arena: std.heap.ArenaAllocator,
-    /// A wire outcome already known to make this reply unretainable. Latched
-    /// until the terminal response supplies usage; unsupported overrides invalid.
+    /// A wire outcome already known to make this reply unretainable. It stays
+    /// latched until the terminal response supplies usage. Unsupported overrides
+    /// invalid.
     terminal_rejection: ?llm.Event.Stop.Rejection,
     /// An incomplete message item is retainable only if the response itself
     /// terminates as incomplete.
@@ -61,13 +62,13 @@ pub const Stream = struct {
     /// neutral history.
     completed_item_ids: std.StringHashMapUnmanaged(void),
     usage: llm.Usage,
-    /// Subscription allowance from the response head, or null when the backend
-    /// sent no quota headers (API-key mode, or none present).
+    /// The subscription allowance from the response head, or null when the
+    /// backend sent no quota headers (API-key mode, or none present).
     quota: ?llm.Quota,
     decompress: std.http.Decompress,
     decompress_buffer: []u8,
-    /// Backs the request's runtime headers, which must outlive the send phase
-    /// (hence a stream field, not a `connect` local).
+    /// This buffer backs the request's runtime headers, which must outlive the
+    /// send phase (so it is a stream field, not a `connect` local).
     header_buffer: [3]std.http.Header,
     error_buffer: [512]u8,
     redirect_buffer: [4096]u8,
@@ -87,7 +88,7 @@ pub const Stream = struct {
     pub const errorText = engine.errorText;
     pub const retryable = engine.retryable;
     pub const retryAfterMs = engine.retryAfterMs;
-    /// Usage accumulated so far. Responses may deliver full counts on a
+    /// The usage accumulated so far. Responses can deliver full counts on a
     /// terminal response event, so this is zero until then or when omitted.
     pub const usageSoFar = engine.usageSoFar;
     pub const next = engine.next;
@@ -99,9 +100,9 @@ pub const Stream = struct {
         self.completed_item_ids.deinit(self.gpa);
     }
 
-    /// Capture the subscription allowance from the response head, called by the
-    /// engine while the head is still valid. Null on any backend that omits the
-    /// Codex quota headers.
+    /// Capture the subscription allowance from the response head. The engine
+    /// calls this while the head is still valid. Null on any backend that omits
+    /// the Codex quota headers.
     pub fn captureHead(self: *Stream, head: *const std.http.Client.Response.Head) void {
         self.quota = parseQuota(head);
     }
@@ -112,9 +113,9 @@ pub const Stream = struct {
         return self.quota;
     }
 
-    /// Latch a rejection, `unsupported` winning over `invalid` however they
+    /// Latch a rejection. `unsupported` wins over `invalid` however they
     /// interleave: resampling cannot turn an outcome this design cannot retain
-    /// into one it can, so spending the retry budget on it only delays the same
+    /// into one it can, so the retry budget spent on it only delays the same
     /// failure.
     fn markRejection(self: *Stream, rejection: llm.Event.Stop.Rejection) void {
         if (self.terminal_rejection == null or rejection == .unsupported)
@@ -139,7 +140,7 @@ pub const Stream = struct {
     }
 
     /// Latch any rejection a terminal snapshot item's own shape reveals. The done
-    /// frame is what supplies payloads, so nothing here is retained; a snapshot
+    /// frame alone supplies payloads, so nothing here is retained. A snapshot
     /// that disagrees with it only rejects the reply.
     fn markTerminalItemRejection(self: *Stream, item: *const std.json.ObjectMap) void {
         const kind = json.string(item.get("type")) orelse return self.markRejection(.invalid);
@@ -170,9 +171,9 @@ pub const Stream = struct {
             return;
         };
         // The Codex subscription backend closes with an empty output snapshot
-        // under store:false rather than echoing the streamed items. Done frames
+        // under store:false and does not echo the streamed items. Done frames
         // are independently authoritative, so an empty snapshot is no
-        // disagreement — only a populated one is worth cross-checking.
+        // disagreement. Only a populated snapshot is worth a cross-check.
         if (output.items.len == 0) return;
         var terminal_ids: std.StringHashMapUnmanaged(void) = .empty;
         for (output.items) |value| {
@@ -378,15 +379,15 @@ pub const Stream = struct {
 /// One request's confusable string pair, named so body and token cannot swap.
 pub const Payload = struct { body: []const u8, access_token: []const u8 };
 
-/// Open a streaming Responses request bounded by the connect timeout; on any
-/// failure `out` is torn down, so a caller that sees an error owns nothing
-/// (see `sse.Engine.open`).
+/// Open a streaming Responses request bounded by the connect timeout. On any
+/// failure this call tears down `out`, so a caller that sees an error owns
+/// nothing (see `sse.Engine.open`).
 pub fn send(self: *Transport, out: *Stream, payload: Payload) !void {
     return sse.Engine(Stream).open(out, self.io, self.timeouts, connect, .{ self, out, payload });
 }
 
 fn connect(self: *Transport, out: *Stream, payload: Payload) anyerror!void {
-    // Credentials become header values; reject ones that would split the head.
+    // Credentials become header values. Reject values that can split the head.
     if (!net.validHeaderValue(payload.access_token) or
         (self.account_id.len != 0 and !net.validHeaderValue(self.account_id)))
     {
@@ -405,15 +406,15 @@ fn connect(self: *Transport, out: *Stream, payload: Payload) anyerror!void {
     defer self.gpa.free(authorization);
 
     // Duped at connect scope like the Bearer value above, so no header borrows
-    // Auth-owned storage for the stream's lifetime — backing a token refresh
-    // could free out from under a live stream.
+    // Auth-owned storage for the stream's lifetime. A token refresh could free
+    // that storage out from under a live stream.
     const maybe_account_id: ?[]u8 = if (self.account_id.len != 0)
         try self.gpa.dupe(u8, self.account_id)
     else
         null;
     defer if (maybe_account_id) |account_id| self.gpa.free(account_id);
 
-    // Subscription mode adds the account and originator identity; API-key mode
+    // Subscription mode adds the account and originator identity. API-key mode
     // sends neither. `accept` requests the event stream in both.
     var extra_len: usize = 0;
     out.header_buffer[extra_len] = .{ .name = "accept", .value = "text/event-stream" };
@@ -477,8 +478,8 @@ fn errorCode(object: *const std.json.ObjectMap) ?[]const u8 {
 }
 
 /// Fold a `response.usage` object into the running total. `input_tokens`
-/// partitions into three disjoint buckets — cache reads, cache writes, and the
-/// uncached remainder — each priced at its own rate (the gpt-5.6 family bills
+/// partitions into three disjoint buckets: cache reads, cache writes, and the
+/// uncached remainder. Each bucket has its own rate (the gpt-5.6 family bills
 /// cache writes at a premium). `output_tokens` already counts reasoning tokens.
 fn mergeUsage(usage: *llm.Usage, object: std.json.ObjectMap) void {
     const total_input = json.unsigned(object.get("input_tokens")) orelse 0;
@@ -495,8 +496,8 @@ fn mergeUsage(usage: *llm.Usage, object: std.json.ObjectMap) void {
 }
 
 /// Parse the Codex subscription allowance from the response head. A window is
-/// present only when its `used-percent` header is; it may carry no
-/// `window-minutes`. Null when the head has no quota headers at all — an API-key
+/// present only when its `used-percent` header is. Its `window-minutes` can be
+/// absent. Null when the head has no quota headers at all: an API-key
 /// response, or a backend that sends none.
 fn parseQuota(head: *const std.http.Client.Response.Head) ?llm.Quota {
     var primary_used: ?f64 = null;
@@ -538,7 +539,7 @@ fn parseQuotaPercent(value: []const u8) ?f64 {
 }
 
 /// A stream over `body` for the tests: test allocator, fresh decode state, and
-/// the given window and budget; the connection fields stay undefined. Pair with
+/// the given window and budget. The connection fields stay undefined. Pair with
 /// `defer stream.deinitDecode()` to free whatever decoding retains.
 fn testStream(io: std.Io, body: *std.Io.Reader, idle_ms: u64, budget_max: usize) Stream {
     return testStreamWithAllocator(std.testing.allocator, io, body, idle_ms, budget_max);
@@ -630,7 +631,7 @@ test "an empty terminal output snapshot does not reject the streamed reply" {
     try std.testing.expectEqualStrings("Hello!", message.event.item.message);
     _ = stream.frame_arena.reset(.retain_capacity);
     // The Codex subscription backend closes with an empty output snapshot under
-    // store:false; the reply still stands rather than being rejected as invalid.
+    // store:false. The reply still stands and is not rejected as invalid.
     const stop = try stream.decode(
         \\{"type":"response.completed","response":{"status":"completed","output":[],"usage":{"input_tokens":5,"output_tokens":2}}}
     );
@@ -1104,7 +1105,7 @@ test "next times out on buffered filler that makes no progress" {
 
 test "next stops a stream once its aggregate byte budget is spent" {
     // Each frame is real progress that restarts the idle window, so only the
-    // aggregate byte budget ends the flood. It spans two frames, tripping on
+    // aggregate byte budget ends the flood. It spans two frames and trips on
     // their sum rather than any single line.
     const frame =
         "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"m1\",\"delta\":\"chunk\"}\n";
@@ -1121,9 +1122,9 @@ test "next stops a stream once its aggregate byte budget is spent" {
 }
 
 test "next bounds a flood of eventless progress frames" {
-    // Every frame is `.progress`, so `next` loops without returning an event;
-    // the aggregate budget must still stop the flood — which an Agent-level
-    // counter, fed only returned events, could not.
+    // Every frame is `.progress`, so `next` loops and returns no event. The
+    // aggregate budget must still stop the flood. An Agent-level counter, fed
+    // only returned events, could not.
     const frame = "data: {\"type\":\"response.in_progress\"}\n";
     const body = frame ** 100;
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
@@ -1138,7 +1139,7 @@ test "next bounds a flood of eventless progress frames" {
 test "next reads a data frame larger than the reader buffer" {
     // A reasoning item's `encrypted_content` — this provider's real oversized
     // frame — exceeds the 16 KiB production `transfer_buffer`, so the line must
-    // stream into the growable line buffer; the chunked reader serves at most
+    // stream into the growable line buffer. The chunked reader serves at most
     // 64 bytes per fill, so one line spans several fills.
     const blob = "A" ** 4000;
     const body = "data: {\"type\":\"response.output_item.done\",\"item\":" ++
@@ -1173,8 +1174,8 @@ test "next rejects a single frame larger than the stream budget" {
 }
 
 test "next ends the byte stream at a [DONE] sentinel" {
-    // Whatever trails the sentinel is never decoded, so a deployment closing
-    // with [DONE] cannot fail the turn.
+    // The stream never decodes whatever trails the sentinel, so a deployment
+    // that closes with [DONE] cannot fail the turn.
     const body =
         "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"m1\",\"delta\":\"hi\"}\n" ++
         "data: [DONE]\n" ++
@@ -1194,7 +1195,7 @@ fn failRead(_: *std.Io.Reader, _: *std.Io.Writer, _: std.Io.Limit) std.Io.Reader
 }
 
 test "next refines a canceled connection read into a clean abort" {
-    // The reply reader fails at the wire; the connection's recorded read error
+    // The reply reader fails at the wire. The connection's recorded read error
     // decides whether that is a user cancel or a genuine network fault.
     var buffer: [16]u8 = undefined;
     var reader: std.Io.Reader = .{
@@ -1245,7 +1246,7 @@ test "send tears down a request that times out awaiting the response head" {
 }
 
 test "next surfaces a stream truncated mid data-line as a retryable premature end" {
-    // A truncated final line must never be decoded as a frame.
+    // The stream must never decode a truncated final line as a frame.
     const body = "data: {\"type\":\"response.out";
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();

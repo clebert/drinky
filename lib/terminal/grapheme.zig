@@ -1,15 +1,16 @@
 //! UAX #29 extended grapheme cluster segmentation and display width.
 //!
 //! A terminal with DECSET mode 2027 advances its cursor one grapheme cluster at
-//! a time, so display width must be summed per cluster, not per code point. This
-//! module segments UTF-8 text into clusters — the full Unicode Text Segmentation
-//! rules GB1–GB13, including Indic conjunct breaks (GB9c) and emoji ZWJ sequences
-//! (GB11) — and measures each cluster's column width.
+//! a time. Display width must thus be summed per cluster, not per code point.
+//! This module segments UTF-8 text into clusters and measures each cluster's
+//! column width. It applies the full Unicode Text Segmentation rules GB1–GB13,
+//! including Indic conjunct breaks (GB9c) and emoji ZWJ sequences (GB11).
 //!
-//! Only length is offered: `stepAt` returns the next cluster's byte length and
-//! column width. Terminal escape syntax is not this module's concern. Because
+//! The module offers only length: `stepAt` returns the next cluster's byte
+//! length and column width. Terminal escape syntax is not this module's concern.
 //! CR, LF, and the C0/C1 controls are their own `Control` clusters under the
-//! rules, display policy can classify them before handing printable runs here.
+//! rules. Display policy can thus classify them before it hands printable runs
+//! here.
 
 const std = @import("std");
 
@@ -19,10 +20,10 @@ pub const Step = struct { bytes: usize, columns: usize };
 
 /// The next grapheme cluster at the start of `text`, which must be non-empty:
 /// its byte length and its display width in terminal columns. Width is the
-/// widest cell among the cluster's code points, so a multi-code-point glyph —
-/// skin-tone, ZWJ join, flag, keycap — measures as the one cell a mode-2027
-/// terminal renders, never the sum. Malformed or truncated UTF-8 yields a
-/// one-column replacement step so callers always advance.
+/// widest cell among the cluster's code points. A multi-code-point glyph —
+/// skin-tone, ZWJ join, flag, keycap — thus measures as the one cell a
+/// mode-2027 terminal renders, never the sum. Malformed or truncated UTF-8
+/// yields a one-column replacement step so callers always advance.
 pub fn stepAt(text: []const u8) Step {
     const first = decode(text);
     var columns = cellWidth(first.codepoint);
@@ -47,8 +48,9 @@ const replacement = 0xFFFD;
 const Decoded = struct { codepoint: u21, bytes: usize };
 
 /// The code point at the start of `text` and its byte length. A bad lead byte,
-/// a sequence truncated by the buffer end, or an invalid encoding decodes to the
-/// replacement character, advancing at least one byte so callers never stall.
+/// a sequence truncated by the buffer end, or an invalid encoding decodes to
+/// the replacement character. The decode still advances at least one byte, so
+/// callers never stall.
 fn decode(text: []const u8) Decoded {
     const lead = text[0];
     if (lead < 0x80) return .{ .codepoint = lead, .bytes = 1 };
@@ -62,7 +64,7 @@ fn decode(text: []const u8) Decoded {
 
 /// Terminal cell width of one code point: zero for C0/C1 controls and DEL, two
 /// for East Asian wide/fullwidth and default-emoji code points, one otherwise.
-/// U+FE0F is forced to two because it promotes its cluster to emoji width.
+/// The module forces U+FE0F to two because it promotes its cluster to emoji width.
 fn cellWidth(codepoint: u21) usize {
     if (codepoint < 0x20 or codepoint == 0x7f) return 0;
     if (codepoint == 0xFE0F) return 2;
@@ -75,7 +77,7 @@ fn cellWidth(codepoint: u21) usize {
 /// Grapheme_Cluster_Break class of `codepoint`, or `.other` when it is in no
 /// range of the generated table.
 fn classOf(codepoint: u21) unicode_data.Class {
-    // Printable ASCII carries no break class; skip the search on the hot path.
+    // Printable ASCII carries no break class. Skip the search on the hot path.
     // The C0 controls and DEL sit below and above this range, so they still fall
     // through to the table.
     if (codepoint >= 0x20 and codepoint < 0x7f) return .other;
@@ -104,8 +106,8 @@ fn isExtend(class: unicode_data.Class) bool {
 /// The running state the stateful break rules need across a cluster: the length
 /// of the trailing Regional_Indicator run (GB12/13), whether the tail is an
 /// armed Indic conjunct with its Linker seen (GB9c), and the two stages of an
-/// emoji sequence (GB11) — a tail matching `Extended_Pictographic Extend*`, and
-/// one matching that followed by a single pivoting `ZWJ`.
+/// emoji sequence (GB11). The stages are a tail that matches
+/// `Extended_Pictographic Extend*`, and that tail with one pivot `ZWJ` after it.
 const State = struct {
     regional_indicators: usize = 0,
     indic_armed: bool = false,
@@ -131,16 +133,16 @@ const State = struct {
             .linker => if (self.indic_armed) {
                 self.indic_linker = true;
             },
-            // InCB=Extend and ZWJ may sit inside a conjunct without ending it.
+            // InCB=Extend and ZWJ can sit inside a conjunct and do not end it.
             .extend_incb, .zwj => {},
             else => {
                 self.indic_armed = false;
                 self.indic_linker = false;
             },
         }
-        // GB11's ZWJ must be immediately preceded by `Extended_Pictographic
-        // Extend*`, so only a ZWJ folded while `pictographic` holds pivots; a
-        // second ZWJ (or anything else) clears the pivot.
+        // `Extended_Pictographic Extend*` must immediately precede GB11's ZWJ,
+        // so only a ZWJ folded while `pictographic` holds pivots. A second ZWJ
+        // (or anything else) clears the pivot.
         if (class == .extended_pictographic) {
             self.pictographic = true;
             self.pictographic_zwj = false;
@@ -155,8 +157,8 @@ const State = struct {
         }
     }
 
-    /// Whether UAX #29 places a cluster boundary between `previous` and `next`,
-    /// with `self` describing the cluster up to and including `previous`.
+    /// Whether UAX #29 places a cluster boundary between `previous` and `next`.
+    /// `self` describes the cluster up to and including `previous`.
     fn breaks(self: State, previous: unicode_data.Class, next: unicode_data.Class) bool {
         // GB3: CR × LF.
         if (previous == .cr and next == .lf) return false;
@@ -197,10 +199,10 @@ test "stepAt measures single code points" {
 test "stepAt folds a multi-code-point cluster into one cell" {
     // Base plus combining mark: one column.
     try std.testing.expectEqual(Step{ .bytes = 3, .columns = 1 }, stepAt("e\u{0301}"));
-    // Heart plus VS16 promotes to a two-cell emoji; VS15 keeps it at one.
+    // Heart plus VS16 promotes to a two-cell emoji. VS15 keeps it at one.
     try std.testing.expectEqual(Step{ .bytes = 6, .columns = 2 }, stepAt("❤\u{FE0F}"));
     try std.testing.expectEqual(Step{ .bytes = 6, .columns = 1 }, stepAt("❤\u{FE0E}"));
-    // Keycap: digit, VS16, enclosing keycap — one two-column cluster.
+    // A keycap — digit, VS16, enclosing keycap — is one two-column cluster.
     try std.testing.expectEqual(Step{ .bytes = 7, .columns = 2 }, stepAt("1\u{FE0F}\u{20E3}"));
     // Thumbs-up plus skin tone: eight bytes, one two-column glyph.
     try std.testing.expectEqual(Step{ .bytes = 8, .columns = 2 }, stepAt("👍\u{1F3FD}"));
@@ -248,7 +250,7 @@ test "UAX #29 grapheme cluster boundaries match the conformance corpus" {
                 expected[expected_len] = length;
                 expected_len += 1;
             } else if (std.mem.eql(u8, tok, "×")) {
-                // No boundary here; the code points stay in one cluster.
+                // No boundary here. The code points stay in one cluster.
             } else {
                 const codepoint = try std.fmt.parseInt(u21, tok, 16);
                 length += try std.unicode.utf8Encode(codepoint, text[length..]);
@@ -276,6 +278,6 @@ test "UAX #29 grapheme cluster boundaries match the conformance corpus" {
         };
         checked += 1;
     }
-    // Guard against a truncated or all-comment corpus passing vacuously.
+    // Guard against a vacuous pass on a truncated or all-comment corpus.
     try std.testing.expect(checked > 400);
 }

@@ -1,6 +1,6 @@
-//! Translates a neutral `llm.Request` into an Anthropic Messages API JSON body.
-//! Holds no state and does no I/O — callers own the request and its backing
-//! memory; `Transport` sends the bytes this module produces.
+//! This module translates a neutral `llm.Request` into an Anthropic Messages
+//! API JSON body. It holds no state and does no I/O. Callers own the request
+//! and its backing memory. `Transport` sends the bytes this module produces.
 
 const std = @import("std");
 
@@ -8,12 +8,12 @@ const json = @import("../json.zig");
 const llm = @import("../llm.zig");
 const models = @import("../models.zig");
 
-/// Exact leading identity expected by the Claude subscription compatibility path.
+/// The exact leading identity the Claude subscription compatibility path expects.
 /// The API-key path omits it and sends only the user's own prompt.
 const system_header = "You are Claude Code, Anthropic's official CLI for Claude.";
 
-/// Serialize `request` into an owned JSON body; caller frees the result.
-/// `account` decides whether the Claude Code `system_header` is prepended
+/// Serialize `request` into an owned JSON body. The caller frees the result.
+/// `account` decides whether to prepend the Claude Code `system_header`
 /// (subscription only) and which stored reasoning replays (see `emitsBlock`).
 pub fn serialize(gpa: std.mem.Allocator, request: *const llm.Request, account: llm.Account) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -43,9 +43,9 @@ pub fn serialize(gpa: std.mem.Allocator, request: *const llm.Request, account: l
     }
 
     // Prompt-cache breakpoints, model-independent: Anthropic caches the prefix
-    // (tools, then system, then messages) up to each marked block, applying its
-    // per-model minimum server side. Mark the last system block, the last tool,
-    // and the last block of the last message — three of the four allowed.
+    // (tools, then system, then messages) up to each marked block and applies
+    // its per-model minimum server side. Mark the last system block, the last
+    // tool, and the last block of the last message — three of the four allowed.
     try stringify.objectField("system");
     try stringify.beginArray();
     if (account == .anthropic_subscription)
@@ -62,12 +62,13 @@ pub fn serialize(gpa: std.mem.Allocator, request: *const llm.Request, account: l
         try stringify.endArray();
     }
 
-    // One envelope per run of consecutive same-role items, one block per item
-    // in list order — never reordering or concatenating adjacent text. An item
-    // that emits no block (dropped reasoning) must not open an envelope: a
-    // reasoning-only assistant run would serialize as empty `content`, which
-    // Anthropic rejects with a 400; user runs left adjacent by such a skip
-    // merge. The last emitted block carries the history cache breakpoint.
+    // The loop writes one envelope per run of consecutive same-role items and
+    // one block per item in list order. It never reorders or concatenates
+    // adjacent text. An item that emits no block (dropped reasoning) must not
+    // open an envelope: a reasoning-only assistant run then serializes as empty
+    // `content`, which Anthropic rejects with a 400. User runs left adjacent by
+    // such a skip merge. The last emitted block carries the history cache
+    // breakpoint.
     try stringify.objectField("messages");
     try stringify.beginArray();
     const last_block = lastBlockIndex(request.items, reasoning != null, account);
@@ -113,18 +114,18 @@ const RawJson = struct {
     }
 };
 
-/// A prompt-cache breakpoint: the request prefix up to and including the block
-/// carrying it is cached (5-minute ephemeral).
+/// A prompt-cache breakpoint: Anthropic caches the request prefix up to and
+/// including the block that carries it (5-minute ephemeral).
 const CacheControl = struct { type: []const u8 = "ephemeral" };
 
-/// Adaptive extended-thinking switch: the model sizes its own budget, and
-/// `summarized` reasoning is returned so it can be shown.
+/// The adaptive extended-thinking switch: the model sizes its own budget, and
+/// the API returns `summarized` reasoning for display.
 const AdaptiveThinking = struct {
     type: []const u8 = "adaptive",
     display: []const u8 = "summarized",
 };
 
-/// The named effort level steering reasoning depth (and answer effort).
+/// The named effort level that steers reasoning depth (and answer effort).
 const OutputConfig = struct { effort: []const u8 };
 
 const ThinkingBlock = struct {
@@ -175,7 +176,7 @@ fn writeTool(stringify: *std.json.Stringify, tool: *const llm.Tool, cache: bool)
     try stringify.endObject();
 }
 
-/// Whether an item serializes to a content block. Reasoning is dropped when it
+/// Whether an item serializes to a content block. Reasoning drops when it
 /// is disabled, belongs to another account, or carries a different provider's
 /// replay proof.
 fn emitsBlock(item: llm.Item, emit_thinking: bool, account: llm.Account) bool {
@@ -196,8 +197,8 @@ fn emitsBlock(item: llm.Item, emit_thinking: bool, account: llm.Account) bool {
     };
 }
 
-/// Index of the last item that emits a block, or null when none do — the block
-/// that carries the history cache breakpoint.
+/// The index of the last item that emits a block, or null when none do — the
+/// block that carries the history cache breakpoint.
 fn lastBlockIndex(items: []const llm.Item, emit_thinking: bool, account: llm.Account) ?usize {
     var last: ?usize = null;
     for (items, 0..) |item, index| {
@@ -207,7 +208,7 @@ fn lastBlockIndex(items: []const llm.Item, emit_thinking: bool, account: llm.Acc
 }
 
 /// The Anthropic message role an item belongs to: reasoning and tool calls are
-/// assistant output; a tool result is fed back as a user item.
+/// assistant output. A tool result feeds back as a user item.
 fn itemRole(item: llm.Item) llm.Role {
     return switch (item) {
         .message => |message| message.role,
@@ -347,7 +348,7 @@ test "tool_call arguments pass through raw, empty becomes an empty object" {
 
 test "synthetic error results group in one user envelope before steering text" {
     const synthetic =
-        "Tool execution ended before a result was recorded; side effects may have occurred.";
+        "The tool stopped before Pith recorded a result. It may have changed the system.";
     const items = [_]llm.Item{
         .{ .tool_call = .{ .call_id = "t1", .name = "read", .arguments_json = "{}" } },
         .{ .tool_call = .{ .call_id = "t2", .name = "read", .arguments_json = "{}" } },
@@ -367,8 +368,8 @@ test "synthetic error results group in one user envelope before steering text" {
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
     defer parsed.deinit();
     const messages = parsed.value.object.get("messages").?.array.items;
-    // One assistant envelope for the calls, then one user envelope grouping both
-    // immediate error results ahead of the steering text.
+    // One assistant envelope for the calls, then one user envelope that groups
+    // both immediate error results ahead of the steering text.
     try std.testing.expectEqual(@as(usize, 2), messages.len);
     const content = messages[1].object.get("content").?.array.items;
     try std.testing.expectEqual(@as(usize, 3), content.len);
@@ -379,12 +380,12 @@ test "synthetic error results group in one user envelope before steering text" {
     try std.testing.expectEqualStrings(synthetic, content[0].object.get("content").?.string);
     try std.testing.expectEqualStrings("tool_result", content[1].object.get("type").?.string);
     try std.testing.expectEqualStrings("t2", content[1].object.get("tool_use_id").?.string);
-    // Steering text follows the results in the same user envelope.
+    // The steering text follows the results in the same user envelope.
     try std.testing.expectEqualStrings("text", content[2].object.get("type").?.string);
     try std.testing.expectEqualStrings("steer", content[2].object.get("text").?.string);
 }
 
-// The model string is arbitrary: breakpoints are placed the same way for every model.
+// The model string is arbitrary: the serializer places breakpoints the same way for every model.
 test "cache_control marks the system prompt, last tool, and last message block" {
     const tools = [_]llm.Tool{
         .{ .name = "read", .description = "d", .parameters = &.{} },
@@ -426,7 +427,7 @@ test "cache_control marks the system prompt, last tool, and last message block" 
 }
 
 test "effort is dropped for a model with no table entry" {
-    // Proof the level is resolved through the per-model table, not from @tagName.
+    // This proves the level resolves through the per-model table, not from @tagName.
     const items = [_]llm.Item{.{ .message = .{ .role = .user, .text = "hi" } }};
     const body = try serialize(std.testing.allocator, &.{
         .model = "unlisted-model",
@@ -446,7 +447,7 @@ test "effort is dropped for a model with no table entry" {
 
 test "an effort level a model lacks folds to one it accepts" {
     // Sonnet 4.6 has no xhigh: its map folds xhigh onto high, so the default
-    // effort works without the user knowing.
+    // effort works without the user's knowledge.
     const items = [_]llm.Item{.{ .message = .{ .role = .user, .text = "hi" } }};
     const body = try serialize(std.testing.allocator, &.{
         .model = "claude-sonnet-4-6",
@@ -484,9 +485,10 @@ test "no thinking or output_config when effort is none" {
     try std.testing.expectEqual(@as(i64, 8192), parsed.value.object.get("max_tokens").?.integer);
 }
 
-// A multi-round conversation exercising every byte-affecting serializer path:
-// a two-text-block user turn, normal and redacted reasoning at an assistant
-// head, [tool_call, text] interleaving, both is_error values, role transitions.
+// A multi-round conversation that exercises every byte-affecting serializer
+// path: a two-text-block user turn, normal and redacted reasoning at an
+// assistant head, [tool_call, text] interleaving, both is_error values, role
+// transitions.
 const golden_items = [_]llm.Item{
     .{ .message = .{ .role = .user, .text = "first" } },
     .{ .message = .{ .role = .user, .text = "second" } },
@@ -584,8 +586,8 @@ test "the api-key account omits the system header and keeps every other block" {
 
 test "a reasoning-only run dropped by an account switch emits no empty envelope" {
     // Exact-account replay drops the reasoning-only assistant run between two
-    // user turns; it must be skipped, not written as `"content":[]`, and the
-    // user turns then share one envelope.
+    // user turns. The serializer must skip it, not write `"content":[]`, and
+    // the user turns then share one envelope.
     const items = [_]llm.Item{
         .{ .message = .{ .role = .user, .text = "hi" } },
         .{ .reasoning = .{ .replay = .{ .anthropic_subscription = .{ .signature = .{

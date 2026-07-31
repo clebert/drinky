@@ -1,6 +1,6 @@
-//! `/login`: picker over every account (also the first-run bootstrap and the
+//! `/login`: a picker over every account (also the first-run bootstrap and the
 //! fall-through after the last logout). `run` and `select` index the same
-//! enum-order account list; any argument is ignored.
+//! enum-order account list. The command ignores any argument.
 
 const std = @import("std");
 
@@ -17,7 +17,8 @@ pub fn run(context: *Context) !Context.Outcome {
         try options.print("{s}{s}", .{ account.label(), marker(context, account) });
     return .{ .pick = .{
         .select = select,
-        .title = "Log in to an account",
+        .title = "Select an account to sign in",
+        .cancellation_message = "You canceled the sign-in selection.",
         .options = try options.toOwnedSlice(),
         .current = null,
     } };
@@ -26,27 +27,33 @@ pub fn run(context: *Context) !Context.Outcome {
 pub fn select(context: *Context, index: usize) !Context.Outcome {
     const gpa = context.gpa;
     const accounts = std.enums.values(llm.Account);
-    if (index >= accounts.len) return Context.Outcome.report(gpa, .err, "invalid selection", .{});
+    if (index >= accounts.len)
+        return Context.Outcome.reportNotice(gpa, .failure, "Select a valid account.", .{});
     const account = accounts[index];
     if (isActive(context, account))
-        return Context.Outcome.report(gpa, .ok, "{s} is already active", .{account.label()});
+        return Context.Outcome.reportNotice(
+            gpa,
+            .information,
+            "{s} is already the active account.",
+            .{account.label()},
+        );
     // Authenticated but inactive: the app performs the switch so the configured
-    // default model applies, exactly as a startup on this account would.
+    // default model applies, exactly as in a startup on this account.
     if (context.accounts.isAuthenticated(account)) return .{ .switch_account = account };
     if (account.isSubscription()) return .{ .login = account };
-    return Context.Outcome.report(
+    return Context.Outcome.reportNotice(
         gpa,
-        .ok,
-        "{s} uses an API key: set {s} in the environment and restart pith",
-        .{ account.label(), account.apiKeyEnv().? },
+        .information,
+        "Set {s} in the environment. Restart Pith to use {s}.",
+        .{ account.apiKeyEnv().?, account.label() },
     );
 }
 
-/// The account's state suffix in the picker; empty when unauthenticated.
+/// The account's state suffix in the picker. Empty when unauthenticated.
 fn marker(context: *const Context, account: llm.Account) []const u8 {
-    if (isActive(context, account)) return " (active)";
+    if (isActive(context, account)) return " (Active)";
     if (!context.accounts.isAuthenticated(account)) return "";
-    return if (account.isSubscription()) " (logged in)" else " (key set)";
+    return if (account.isSubscription()) " (Signed in)" else " (API key set)";
 }
 
 fn isActive(context: *const Context, account: llm.Account) bool {
@@ -69,12 +76,12 @@ test "the picker lists every account, marking the active and authenticated ones"
             }
             try std.testing.expectEqual(@as(usize, 4), pick.options.len);
             try std.testing.expectEqualStrings(
-                "anthropic subscription (logged in)",
+                "Anthropic subscription (Signed in)",
                 pick.options[0],
             );
-            try std.testing.expectEqualStrings("anthropic api (active)", pick.options[1]);
-            try std.testing.expectEqualStrings("openai subscription", pick.options[2]);
-            try std.testing.expectEqualStrings("openai api", pick.options[3]);
+            try std.testing.expectEqualStrings("Anthropic API (Active)", pick.options[1]);
+            try std.testing.expectEqualStrings("OpenAI subscription", pick.options[2]);
+            try std.testing.expectEqualStrings("OpenAI API", pick.options[3]);
             try std.testing.expect(pick.current == null);
         },
         else => return error.ExpectedPick,
@@ -92,9 +99,17 @@ test "select logs in a subscription, instructs an API account, and no-ops the ac
         .login => |account| try std.testing.expectEqual(llm.Account.openai_subscription, account),
         else => return error.ExpectedLogin,
     }
-    try Context.Outcome.expectFeedbackContaining(try select(&context, 3), .ok, "OPENAI_API_KEY");
-    try Context.Outcome.expectFeedbackContaining(try select(&context, 1), .ok, "already active");
-    try Context.Outcome.expectFeedback(try select(&context, 99), .err);
+    try Context.Outcome.expectNoticeContaining(
+        try select(&context, 3),
+        .information,
+        "OPENAI_API_KEY",
+    );
+    try Context.Outcome.expectNoticeContaining(
+        try select(&context, 1),
+        .information,
+        "active account",
+    );
+    try Context.Outcome.expectNotice(try select(&context, 99), .failure);
 }
 
 test "select never re-runs the login for the active subscription" {
@@ -104,7 +119,11 @@ test "select never re-runs the login for the active subscription" {
     defer agent.deinit();
     var context: Context = .{ .gpa = gpa, .io = undefined, .agent = &agent, .accounts = &accounts };
 
-    try Context.Outcome.expectFeedbackContaining(try select(&context, 0), .ok, "already active");
+    try Context.Outcome.expectNoticeContaining(
+        try select(&context, 0),
+        .information,
+        "active account",
+    );
     try std.testing.expectEqual(llm.Account.anthropic_subscription, agent.client.?.account());
 }
 

@@ -1,6 +1,6 @@
-//! Walks a directory tree collecting the regular files whose base-relative path
-//! matches a glob, skipping version-control and build-cache directories. Shared
-//! by the `find` and `grep` tools.
+//! Walks a directory tree and collects the regular files whose base-relative
+//! path matches a glob. Skips version-control and build-cache directories.
+//! Shared by the `find` and `grep` tools.
 
 const std = @import("std");
 
@@ -8,21 +8,22 @@ const glob = @import("glob.zig");
 
 const noise_dirs = [_][]const u8{ ".git", ".zig-cache", "zig-cache", "zig-out" };
 
-/// Hard cap on entries examined per walk, so a huge tree cannot make traversal
-/// run unbounded; real repositories never reach it.
+/// The hard cap on entries examined per walk, so a huge tree cannot make
+/// traversal run unbounded. Real repositories never reach it.
 const entries_visited_max = 1_000_000;
 
-/// The matches a walk retained, owned by the caller's `gpa`.
+/// The matches a walk retained. The caller's `gpa` owns them.
 pub const Match = struct {
     /// The lexicographically-smallest matches, sorted ascending, at most
     /// `retain` of them.
     paths: [][]const u8,
-    /// Total matches seen — a lower bound when `capped`, since the walk stopped
-    /// early. `matched > paths.len` means matches were found but not retained.
+    /// The total matches seen. This is a lower bound when `capped`, since the
+    /// walk stopped early. `matched > paths.len` means the walk found matches
+    /// that it did not retain.
     matched: usize,
     /// Whether the walk stopped at its entry-visit cap (`entries_max`) before
-    /// exhausting the tree, so `paths` depends on filesystem enumeration order
-    /// and is incomplete.
+    /// it exhausted the tree, so `paths` depends on filesystem enumeration
+    /// order and is incomplete.
     capped: bool,
 
     pub fn deinit(self: *Match, gpa: std.mem.Allocator) void {
@@ -34,9 +35,9 @@ pub const Match = struct {
 
 /// The lexicographically-smallest matches under `options.base` whose
 /// base-relative path matches `options.pattern`, sorted, each relative to the
-/// working directory. Memory is bounded by `options.retain` (the total is
-/// merely counted) and time by `options.entries_max`. Unreadable directories
-/// are skipped; cancellation stops the walk at once; every exit releases every
+/// working directory. `options.retain` bounds memory (the walk merely counts
+/// the total), and `options.entries_max` bounds time. The walk skips unreadable
+/// directories. Cancellation stops the walk at once. Every exit releases every
 /// directory handle and retained path.
 pub fn collect(
     io: std.Io,
@@ -53,9 +54,9 @@ pub fn collect(
 
     var walker = try dir.walkSelectively(gpa);
     defer walker.deinit();
-    // Release directory handles still open on the walker stack on every exit:
-    // `deinit` frees its memory but not its handles, and `leave` never closes
-    // the base directory, which `dir` closes on return.
+    // Release directory handles still open on the walker stack on every exit.
+    // `deinit` frees its memory but not its handles. `leave` never closes the
+    // base directory, which `dir` closes on return.
     defer while (walker.stack.items.len > 0) walker.leave(io);
 
     var keeper: Keeper = .{ .retain = options.retain };
@@ -69,15 +70,16 @@ pub fn collect(
     var capped = false;
     while (true) {
         const entry = (walker.next(io) catch |err| switch (err) {
-            // Cancellation aborts the turn, so stop the walk at once: it is
-            // one-shot, and resuming would do real traversal I/O. Any other
+            // Cancellation aborts the turn, so stop the walk at once. The walk
+            // is one-shot, and a resume does real traversal I/O. Any other
             // iteration error skips the bad directory (the walker has already
             // closed it) and keeps the walk resilient.
             error.Canceled => return err,
             else => continue,
         }) orelse break;
-        // Stop only once a further entry proves the tree is not exhausted, so a
-        // tree with exactly `entries_max` entries is not falsely flagged.
+        // Stop only once a further entry proves the tree is not exhausted. The
+        // walk then does not falsely flag a tree with exactly `entries_max`
+        // entries.
         if (visited >= options.entries_max) {
             capped = true;
             break;
@@ -111,17 +113,17 @@ pub fn collect(
     };
 }
 
-/// Retains the lexicographically-smallest `retain` paths offered to it, freeing
-/// larger ones as they are evicted, and counts every path offered. Grows lazily
-/// to at most `retain` entries, so the caller's result size, not the tree size,
-/// bounds memory.
+/// Retains the lexicographically-smallest `retain` paths offered to it and
+/// counts every path offered. Frees larger paths as it evicts them. Grows
+/// lazily to at most `retain` entries, so the caller's result size, not the
+/// tree size, bounds memory.
 const Keeper = struct {
     heap: Heap = .empty,
     retain: usize,
     matched: usize = 0,
 
-    // Max-heap keyed on the path, so the root is the largest retained path — the
-    // eviction candidate when a smaller match arrives.
+    // A max-heap keyed on the path, so the root is the largest retained path.
+    // The root is the eviction candidate when a smaller match arrives.
     const Heap = std.PriorityQueue([]const u8, void, greater);
 
     fn greater(_: void, a: []const u8, b: []const u8) std.math.Order {
@@ -171,9 +173,9 @@ fn lessThan(_: void, a: []const u8, b: []const u8) bool {
     return std.mem.lessThan(u8, a, b);
 }
 
-// Wraps a real io, failing one directory syscall once (cancellation is
-// one-shot), then counting the traversal opens and reads that follow; the
-// open/close balance proves every opened handle was released.
+// Wraps a real io. It fails one directory syscall once (cancellation is
+// one-shot), then counts the traversal opens and reads that follow. The
+// open/close balance proves the walk released every opened handle.
 const FaultyIo = struct {
     backend: std.Io,
     vtable: std.Io.VTable,
@@ -184,14 +186,14 @@ const FaultyIo = struct {
     traversal_after_inject: usize = 0,
     open_handles: usize = 0,
 
-    // Which syscall to fail, exercising each production cancellation site: the
-    // `enter` open and the `next` read.
+    // Which syscall to fail. This exercises each production cancellation site:
+    // the `enter` open and the `next` read.
     const Trigger = union(enum) {
-        // Fail the Nth `dirOpenDir` (1-based); the base opens first, so 2 is the
-        // first entered subdirectory.
+        // Fail the Nth `dirOpenDir` (1-based). The base opens first, so 2 is
+        // the first entered subdirectory.
         open_call: usize,
-        // Fail the first `dirRead` taken once at least this many directories are
-        // open, i.e. while reading inside an entered subdirectory.
+        // Fail the first `dirRead` taken once at least this many directories
+        // are open, that is, a read inside an entered subdirectory.
         subdir_read: usize,
     };
 

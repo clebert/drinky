@@ -1,11 +1,11 @@
 //! Per-model economics and limits, namespaced by provider so the same model
-//! name can carry different prices and windows across providers. Base prices are
-//! USD per million tokens; cache read/write rates are stored absolute rather
-//! than derived, so a provider with different cache economics slots in as new
-//! entries. An unknown model has no entry — without a known context window it
-//! cannot be sized, so it is unsupported rather than given a guessed fallback.
-//! The table is compiled in. Account-aware metadata may overlay a copied model
-//! at runtime without mutating these provider-wide defaults.
+//! name can carry different prices and windows across providers. Base prices
+//! are USD per million tokens. Cache read/write rates are stored absolute
+//! rather than derived, so a provider with different cache economics slots in
+//! as new entries. An unknown model has no entry. Without a known context
+//! window it cannot be sized, so it is unsupported rather than given a guessed
+//! fallback. The table is compiled in. Account-aware metadata can overlay a
+//! copied model at runtime and does not mutate these provider-wide defaults.
 
 const std = @import("std");
 
@@ -20,19 +20,19 @@ pub const Model = struct {
     cache_read: f64,
     cache_write: f64,
     context_window: u64,
-    /// The model's maximum output tokens, sent verbatim as `max_tokens`; the
+    /// The model's maximum output tokens, sent verbatim as `max_tokens`. The
     /// effort level governs how much of it the model actually spends.
     tokens_max: u32,
     effort: EffortMap,
 
     /// The provider outcome for each of our effort levels on this model: a
-    /// provider effort name to send, or null to send no reasoning at all. Total
-    /// over every level, none included, so each model states exactly what it does
-    /// with each choice — including the awkward ends:
-    ///   - a model missing a level folds it onto the nearest it has (Sonnet 4.6
-    ///     has no xhigh, so xhigh maps to high);
-    ///   - a model with no reasoning maps every level, none included, to null;
-    ///   - a model that cannot disable reasoning maps none up to a floor level.
+    /// provider effort name to send, or null to send no reasoning. The map is
+    /// total over every level, none included, so each model states exactly what
+    /// it does with each choice. This includes the awkward ends:
+    ///   - A model without a level folds it onto the nearest it has (Sonnet 4.6
+    ///     has no xhigh, so xhigh maps to high).
+    ///   - A model with no reasoning maps every level, none included, to null.
+    ///   - A model that cannot disable reasoning maps none up to a floor level.
     pub const EffortMap = struct {
         none: ?[]const u8,
         low: ?[]const u8,
@@ -50,7 +50,7 @@ pub const Model = struct {
         }
     };
 
-    /// Dollar cost of `usage` at these per-million rates.
+    /// The dollar cost of `usage` at these per-million rates.
     pub fn cost(self: *const Model, usage: *const llm.Usage) f64 {
         return (self.input * asFloat(usage.input) +
             self.output * asFloat(usage.output) +
@@ -58,9 +58,10 @@ pub const Model = struct {
             self.cache_write * asFloat(usage.cache_write)) / million;
     }
 
-    /// Dollars caching saved on `usage`: the gap between the cache rates and
-    /// billing every cached token at the base input rate. Negative when writes
-    /// outweigh reads (a fresh write recovered by no read yet).
+    /// The dollars that caching saved on `usage`: the gap between the cache
+    /// rates and the base input rate applied to every cached token. The result
+    /// is negative when writes outweigh reads (a fresh write recovered by no
+    /// read yet).
     pub fn savings(self: *const Model, usage: *const llm.Usage) f64 {
         return ((self.input - self.cache_read) * asFloat(usage.cache_read) +
             (self.input - self.cache_write) * asFloat(usage.cache_write)) / million;
@@ -72,7 +73,8 @@ const Entry = struct {
     model: Model,
 };
 
-// Full Anthropic ladder: none sends no reasoning config, each level its own name.
+// The full Anthropic ladder: none sends no reasoning config, and each level
+// sends its own name.
 const anthropic_effort: Model.EffortMap = .{
     .none = null,
     .low = "low",
@@ -82,7 +84,7 @@ const anthropic_effort: Model.EffortMap = .{
     .max = "max",
 };
 
-// Sonnet 4.6 has no xhigh; it folds onto high.
+// Sonnet 4.6 has no xhigh. It folds onto high.
 const anthropic_effort_no_xhigh: Model.EffortMap = .{
     .none = null,
     .low = "low",
@@ -92,8 +94,8 @@ const anthropic_effort_no_xhigh: Model.EffortMap = .{
     .max = "max",
 };
 
-// Reasoning-only models: none floors on the API's minimal `none` — omitting the
-// reasoning config would default the model to medium.
+// Reasoning-only models: none floors on the API's minimal `none`. An omitted
+// reasoning config defaults the model to medium.
 const openai_effort: Model.EffortMap = .{
     .none = "none",
     .low = "low",
@@ -105,7 +107,7 @@ const openai_effort: Model.EffortMap = .{
 
 // Anthropic cache rates follow fixed multipliers of the base input price: 0.1x
 // for a read, 1.25x for a 5-minute write. Each model states its real context
-// window and maximum output; nothing is defaulted.
+// window and maximum output. Nothing is defaulted.
 const table = [_]Entry{
     .{ .provider = .anthropic, .model = .{
         .name = "claude-opus-4-8",
@@ -117,8 +119,8 @@ const table = [_]Entry{
         .tokens_max = 128_000,
         .effort = anthropic_effort,
     } },
-    // Sonnet 5 standard rates; the launch introductory pricing ($2/$10 in/out) is
-    // not modeled.
+    // Sonnet 5 standard rates. The launch introductory pricing ($2/$10 in/out)
+    // is not modeled.
     .{ .provider = .anthropic, .model = .{
         .name = "claude-sonnet-5",
         .input = 3,
@@ -140,10 +142,10 @@ const table = [_]Entry{
         .effort = anthropic_effort_no_xhigh,
     } },
     // The gpt-5.6 family reaches the same models over the API-key and the
-    // ChatGPT-subscription (Codex) backends, so one openai vendor row supplies
-    // prices and fallback limits to both accounts. Subscription discovery may
+    // ChatGPT-subscription (Codex) backends. One openai vendor row supplies
+    // prices and fallback limits to both accounts. Subscription discovery can
     // overlay its context windows per account. Standard-tier pricing, per
-    // million tokens; 1.05M fallback context, 128K max output.
+    // million tokens. Fallback context: 1.05M. Max output: 128K.
     .{ .provider = .openai, .model = .{
         .name = "gpt-5.6-sol",
         .input = 5,
@@ -212,7 +214,7 @@ test get {
     };
     // 3.0 (input) + 0.3 (read) + 3.75 (write).
     try std.testing.expectApproxEqAbs(@as(f64, 7.05), model.cost(&usage), 1e-9);
-    // Read saves 2.7 (3.0 - 0.3), write costs 0.75 extra (3.75 - 3.0).
+    // The read saves 2.7 (3.0 - 0.3). The write costs 0.75 extra (3.75 - 3.0).
     try std.testing.expectApproxEqAbs(@as(f64, 1.95), model.savings(&usage), 1e-9);
 }
 

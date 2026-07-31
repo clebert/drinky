@@ -1,6 +1,6 @@
-//! The Anthropic provider: credential lifecycle (`Auth`), the OAuth PKCE flow
-//! (`oauth`) it drives, the Messages API transport (`Transport`), and request
-//! serialization (`wire`).
+//! The Anthropic provider: the credential lifecycle (`Auth`), the OAuth PKCE
+//! flow (`oauth`) it drives, the Messages API transport (`Transport`), and
+//! request serialization (`wire`).
 
 const std = @import("std");
 

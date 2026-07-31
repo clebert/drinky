@@ -1,8 +1,8 @@
-//! The permanent blocks above the live tail, oldest first, plus the "model run"
+//! The permanent blocks above the live tail, oldest first. The "model run"
 //! invariant: a run of streamed reasoning collects into one growing thinking
-//! block, then a run of streamed answer text into one growing model block, until
-//! a tool call, a turn boundary, or any other block ends the message. Owns its
-//! blocks' bytes (freed on `deinit`).
+//! block. Then a run of streamed answer text collects into one growing model
+//! block. A tool call, a turn boundary, or any other block ends the message.
+//! Owns its blocks' bytes (freed on `deinit`).
 
 const std = @import("std");
 
@@ -12,11 +12,11 @@ const Transcript = @This();
 
 gpa: std.mem.Allocator,
 entries: std.ArrayList(ui.block.Entry),
-/// Index and kind of the current run's streamed block, so deltas of that kind
-/// keep appending to it; null when no run is open.
+/// The index and kind of the current run's streamed block, so deltas of that
+/// kind append to it. Null when no run is open.
 current: ?struct { index: usize, kind: ui.block.Entry.Kind },
-/// Index of the first block streamed for the current assistant message
-/// (reasoning or answer), so a retry can drop the whole partial message; null
+/// The index of the first block streamed for the current assistant message
+/// (reasoning or answer), so a retry can drop the whole partial message. Null
 /// when none is streaming.
 message_start: ?usize,
 
@@ -29,8 +29,8 @@ pub fn deinit(self: *Transcript) void {
     self.entries.deinit(self.gpa);
 }
 
-/// Append a discrete block copying `text`; this ends any open streamed run, so
-/// the next streamed delta opens a fresh block.
+/// Append a discrete block that copies `text`. This ends any open streamed run,
+/// so the next streamed delta opens a fresh block.
 pub fn append(
     self: *Transcript,
     kind: ui.block.Entry.Kind,
@@ -43,9 +43,9 @@ pub fn append(
     try self.entries.append(self.gpa, entry);
 }
 
-/// Append streamed text of `kind` (`.thinking` reasoning or `.model` answer),
-/// opening a block of that kind on demand so a run of deltas collects into one
-/// block; a kind change ends the previous run.
+/// Append streamed text of `kind` (`.thinking` reasoning or `.model` answer).
+/// Open a block of that kind on demand so a run of deltas collects into one
+/// block. A kind change ends the previous run.
 pub fn appendStream(self: *Transcript, kind: ui.block.Entry.Kind, delta: []const u8) !void {
     if (self.current == null or self.current.?.kind != kind)
         self.current = .{ .index = try self.openRun(kind), .kind = kind };
@@ -55,8 +55,8 @@ pub fn appendStream(self: *Transcript, kind: ui.block.Entry.Kind, delta: []const
     }
 }
 
-/// Open a streamed block of `kind` at the tail, recording it as the message's
-/// first block when none has opened yet, and return its index.
+/// Open a streamed block of `kind` at the tail and return its index. Record it
+/// as the message's first block when none has opened yet.
 fn openRun(self: *Transcript, kind: ui.block.Entry.Kind) !usize {
     var entry = try ui.block.Entry.init(self.gpa, kind, false, "");
     errdefer entry.deinit(self.gpa);
@@ -73,8 +73,8 @@ pub fn endMessage(self: *Transcript) void {
 }
 
 /// Drop the open message's streamed blocks (reasoning and answer alike) so a
-/// reply being retried leaves nothing partial behind. A no-op when none is
-/// streaming. The blocks are the contiguous tail from `message_start`, since
+/// retried reply leaves nothing partial behind. A no-op when none is
+/// streaming. The blocks are the contiguous tail from `message_start`, because
 /// nothing discrete has ended the message.
 pub fn discardMessage(self: *Transcript) void {
     const start = self.message_start orelse return;
@@ -83,7 +83,7 @@ pub fn discardMessage(self: *Transcript) void {
     self.entries.shrinkRetainingCapacity(start);
 }
 
-/// Drop every block from `entry_count` onward. Used to roll back an optimistic
+/// Drop every block from `entry_count` onward. This rolls back an optimistic
 /// discrete append when the operation it represents fails to start.
 pub fn truncate(self: *Transcript, entry_count: usize) void {
     std.debug.assert(entry_count <= self.entries.items.len);

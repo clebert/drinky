@@ -1,7 +1,8 @@
-//! Drives one user turn to completion: append the message, stream the reply,
-//! run the tools it calls, feed the results back, and repeat until the model
-//! stops asking for tools. Owns the conversation history; talks to the model
-//! through a neutral `provider.Client` and delegates presentation to a handler.
+//! Drives one user turn to completion. It appends the message, streams the
+//! reply, runs the requested tools, and feeds the results back. It repeats
+//! until the model asks for no more tools. Owns the conversation history.
+//! Talks to the model through a neutral `provider.Client` and delegates
+//! presentation to a handler.
 
 const std = @import("std");
 
@@ -16,19 +17,19 @@ const Agent = @This();
 
 const rounds_max = 50;
 
-/// Placeholder shown for a redacted reasoning block (its content is encrypted).
+/// The placeholder shown for a redacted reasoning block (its content is encrypted).
 const redacted_notice = "[redacted thinking]";
 
-/// Conservative content for a reserved tool-result slot whose real result never
-/// arrived. It does not claim the call never started: one wording covers a call
-/// that was not started, was interrupted, raised without returning a result, or
-/// changed the world before failing to record one. Stored without an `Error:`
+/// The conservative content for a reserved tool-result slot whose real result
+/// never arrived. It does not claim the call never started. One wording covers a
+/// call that was not started, was interrupted, raised without a result, or
+/// changed the world and then recorded no result. Stored without an `Error:`
 /// prefix, which the OpenAI serializer adds for error results.
 const synthetic_result =
-    "Tool execution ended before a result was recorded; side effects may have occurred.";
+    "The tool stopped before Pith recorded a result. It may have changed the system.";
 
-/// Distinct models one session breaks its cost down by; an overflow drops only
-/// the per-model detail, never the cumulative totals.
+/// The distinct models one session breaks its cost down by. An overflow drops
+/// only the per-model detail, never the cumulative totals.
 const by_model_max = 16;
 
 gpa: std.mem.Allocator,
@@ -45,14 +46,14 @@ bash: tool.Context.Bash,
 items: std.ArrayList(llm.Item),
 stats: Stats,
 /// Steering messages the user submitted mid-turn, drained into the running turn
-/// at each round boundary. Thread-safe: the UI thread pushes, the worker takes.
+/// at each round boundary. Thread-safe: the UI thread pushes, and the worker takes.
 steering: Steering,
-/// Stable per-conversation prompt-cache routing key (used by OpenAI); every
+/// The stable per-conversation prompt-cache routing key (used by OpenAI). Every
 /// turn shares it until a deliberate reset rotates it.
 cache_key: [32]u8,
 
-/// Cumulative session cost and cache savings, plus the last message's usage and
-/// the latest subscription allowance for the gauges. Each message is priced
+/// The cumulative session cost and cache savings, plus the last message's usage
+/// and the latest subscription allowance for the gauges. Each message is priced
 /// against the model that produced it, so the totals stay correct across a
 /// mid-session `/model` switch. A plain value type: it copies whole across the
 /// UI channel.
@@ -61,15 +62,15 @@ pub const Stats = struct {
     saved: f64 = 0,
     last: llm.Usage = .{},
     /// The active subscription account's remaining allowance, adopted from each
-    /// response head that carries one — even a head whose stream then errors or
-    /// is cancelled, so an exhausted 429 still updates it. A head that omits one
-    /// leaves it unchanged; null until a head reports one, and cleared on an
-    /// account switch. API-key accounts report none.
+    /// response head that carries one. This includes a head whose stream then
+    /// errors or is cancelled, so an exhausted 429 still updates it. A head that
+    /// omits one leaves it unchanged. The value is null until a head reports one.
+    /// An account switch clears it. API-key accounts report none.
     quota: ?llm.Quota = null,
     by_model: [by_model_max]ByModel = [_]ByModel{.{}} ** by_model_max,
     model_count: usize = 0,
 
-    /// One model's session totals; `name` points into the compiled model table
+    /// One model's session totals. `name` points into the compiled model table
     /// (static lifetime).
     pub const ByModel = struct {
         name: []const u8 = "",
@@ -78,7 +79,7 @@ pub const Stats = struct {
         usage: llm.Usage = .{},
     };
 
-    /// Attribute one message to `name`, opening a bucket on first appearance.
+    /// Attribute one message to `name` and open a bucket on first appearance.
     fn attribute(
         self: *Stats,
         name: []const u8,
@@ -106,19 +107,19 @@ pub const Stats = struct {
 
 /// The receipt of one turn: the history span it produced, how far steering
 /// commitment advanced, and whether a committed reply was cut short. Owns no
-/// memory and stays valid only until another turn mutates agent history.
+/// memory and stays valid only until another turn mutates the agent history.
 pub const Receipt = struct {
     history_base: usize,
     history_end: usize,
     steering_committed_count: usize,
     /// A reply this turn committed stopped at the provider's output or context
-    /// limit: the answer stands as authoritative but is incomplete, so the
-    /// presentation layer says so rather than passing it off as a full reply.
+    /// limit. The answer stands as authoritative but is incomplete. The
+    /// presentation layer says so and does not pass it off as a full reply.
     truncated: bool = false,
 };
 
-/// A turn's outcome: its receipt, always present so a receipt is never lost
-/// through an error union, plus how the turn ended.
+/// A turn's outcome: its receipt plus how the turn ended. The receipt is always
+/// present, so a receipt is never lost through an error union.
 pub const Outcome = struct {
     receipt: Receipt,
     disposition: Disposition,
@@ -132,10 +133,10 @@ pub const Outcome = struct {
     };
 };
 
-/// The turn transaction's private bookkeeping: the pre-turn history length, the
-/// latest replay-valid checkpoint an abnormal exit rolls back to, the counts and
-/// flags surfaced in the receipt, and a consumed-but-uncommitted steering batch
-/// retained (and owned here) until its following reply commits.
+/// The turn transaction's private bookkeeping. It holds the pre-turn history
+/// length, the latest replay-valid checkpoint an abnormal exit rolls back to,
+/// and the counts and flags surfaced in the receipt. It also retains (and owns)
+/// a consumed-but-uncommitted steering batch until its following reply commits.
 const TurnState = struct {
     base: usize,
     checkpoint: usize,
@@ -145,13 +146,13 @@ const TurnState = struct {
     presentation_closed: bool = false,
 };
 
-/// One scheduled tool call: the concurrent runner writes `result`; the collector
+/// One scheduled tool call. The concurrent runner writes `result`. The collector
 /// moves it into the reserved history slot once the task has finished.
 const Call = struct {
     id: []const u8,
     name: []const u8,
     input_json: []const u8,
-    /// Index in `Agent.items` of this call's reserved `tool_result` slot.
+    /// The index in `Agent.items` of this call's reserved `tool_result` slot.
     result_index: usize = 0,
     result: State = .pending,
     /// Whether the real result has replaced the reserved slot's synthetic
@@ -185,8 +186,8 @@ const ClientFetch = struct {
     }
 };
 
-/// Duplicate one complete borrowed assistant output into the history shape,
-/// binding a reasoning proof to the exact producing account. This is the sole
+/// Duplicate one complete borrowed assistant output into the history shape and
+/// bind a reasoning proof to the exact producing account. This is the sole
 /// ownership boundary for provider output strings.
 fn dupeOutput(
     gpa: std.mem.Allocator,
@@ -226,7 +227,7 @@ fn dupeOutput(
 }
 
 /// Whether `bytes` is a valid top-level JSON object. A parse failure is not
-/// valid; only an allocation failure propagates.
+/// valid. Only an allocation failure propagates.
 fn objectJsonValid(gpa: std.mem.Allocator, bytes: []const u8) !bool {
     var parsed = std.json.parseFromSlice(std.json.Value, gpa, bytes, .{}) catch |err|
         switch (err) {
@@ -271,8 +272,8 @@ pub fn deinit(self: *Agent) void {
     self.steering.deinit();
 }
 
-/// Start a fresh conversation without changing its account, model, or configuration.
-/// Safe only between turns, when no worker can own history or steering.
+/// Start a fresh conversation and keep its account, model, and configuration.
+/// Call this only between turns, when no worker can own history or steering.
 pub fn resetConversation(self: *Agent) void {
     self.rollback(0);
     self.stats = .{};
@@ -280,10 +281,11 @@ pub fn resetConversation(self: *Agent) void {
     self.cache_key = generateCacheKey(self.io);
 }
 
-/// Switch account and model together, effective next turn. The client carries
-/// both the transport and the reasoning-replay account, so the pair is one
-/// atomic step — a model is never paired with a foreign vendor's client.
-/// History is untouched; the new account drops reasoning it did not produce.
+/// Switch the account and the model together, effective on the next turn. The
+/// client carries both the transport and the reasoning-replay account, so the
+/// pair is one atomic step. A model is never paired with a foreign vendor's
+/// client. History is untouched. The new account drops reasoning it did not
+/// produce.
 pub fn switchTo(self: *Agent, client: provider.Client, model: models.Model) void {
     const account_changed = if (self.client) |active|
         active.account() != client.account()
@@ -296,8 +298,8 @@ pub fn switchTo(self: *Agent, client: provider.Client, model: models.Model) void
     if (account_changed) self.stats.quota = null;
 }
 
-/// Drop the active account, leaving the agent signed out; `model` is kept as
-/// the last-shown value and account-specific allowance is forgotten.
+/// Drop the active account and leave the agent signed out. `model` is kept as
+/// the last-shown value. The account-specific allowance is forgotten.
 pub fn signOut(self: *Agent) void {
     self.client = null;
     self.stats.quota = null;
@@ -322,12 +324,12 @@ pub fn dropReasoning(self: *Agent, account: llm.Account) void {
     self.items.shrinkRetainingCapacity(retained_count);
 }
 
-/// Switch the reasoning-effort level; takes effect on the next turn.
+/// Switch the reasoning-effort level. It takes effect on the next turn.
 pub fn setEffort(self: *Agent, effort: llm.Effort) void {
     self.effort = effort;
 }
 
-/// Run one user turn as a checkpointed transaction, streaming output through
+/// Run one user turn as a checkpointed transaction, stream output through
 /// `handler`, and return its outcome. Never returns an error: every exit yields
 /// a receipt, so a receipt is never lost through an error union. Signed out (a
 /// state the app refuses to start a turn in) yields a failed disposition.
@@ -361,10 +363,10 @@ fn dispositionError(disposition: Outcome.Disposition) !void {
 
 /// Run one user turn as a checkpointed transaction and return its outcome. Every
 /// exit — completion, cancellation, channel close, or failure — yields a
-/// receipt: an abnormal exit rolls history back to the latest valid checkpoint
-/// (retaining every completed round and its tool results) and returns any
-/// consumed-but-uncommitted steering to the queue, rather than unwinding the
-/// whole turn.
+/// receipt. An abnormal exit does not unwind the whole turn. It rolls history
+/// back to the latest valid checkpoint and returns any consumed-but-uncommitted
+/// steering to the queue. The checkpoint retains every completed round and its
+/// tool results.
 fn runTurn(self: *Agent, fetch: anytype, user_text: []const u8, handler: anytype) Outcome {
     return self.runTurnWith(fetch, tool, user_text, handler);
 }
@@ -407,8 +409,8 @@ fn classifyDisposition(turn: *const TurnState, err: anyerror) Outcome.Dispositio
     };
 }
 
-/// Preserve callback error provenance in turn state: only a presentation
-/// callback's channel closure is teardown; the same error from a tool or
+/// Preserve callback error provenance in turn state. Only a presentation
+/// callback's channel closure is teardown. The same error from a tool or
 /// transport remains an ordinary failure.
 fn presentation(closed: *bool, result: anyerror!void) !void {
     result catch |err| {
@@ -430,14 +432,14 @@ fn runRounds(
     while (round < rounds_max) : (round += 1) {
         const reply = try self.fetchReply(fetch, turn, handler);
         const ran_tools = try self.runToolsWith(Dispatch, reply, turn, handler);
-        // A no-tool reply commits here; a tool-calling reply committed itself
+        // A no-tool reply commits here. A tool-calling reply committed itself
         // together with its reserved results before dispatch.
         if (!ran_tools) {
             self.advanceCheckpoint(turn);
             notifyCheckpoint(handler);
         }
-        // Fold mid-turn steering in before the next round; with no tools asked,
-        // a steering message keeps the turn going rather than ending it.
+        // Fold mid-turn steering in before the next round. With no tools asked,
+        // a steering message keeps the turn alive and does not end it.
         const steered = try self.drainSteering(turn, handler);
         if (!ran_tools and !steered) return;
     }
@@ -455,8 +457,8 @@ fn rollbackTurn(self: *Agent, turn: *TurnState) void {
     }
 }
 
-/// Commit the latest reply (and any reserved tool-result slots) by advancing the
-/// checkpoint, which simultaneously commits the steering batch that preceded it.
+/// Advance the checkpoint to commit the latest reply (and any reserved
+/// tool-result slots). The same advance commits the steering batch that preceded it.
 fn advanceCheckpoint(self: *Agent, turn: *TurnState) void {
     turn.checkpoint = self.items.items.len;
     if (turn.pending_steering) |batch| {
@@ -480,8 +482,8 @@ fn freeSteeringBatch(gpa: std.mem.Allocator, batch: [][]u8) void {
 
 /// Deliver every queued steering message as one combined user message, appended
 /// to history and reported. On success the taken batch is retained in turn state
-/// until its following reply commits, so an abnormal exit before then can return
-/// it to the queue; a failed delivery returns it at once. Returns whether
+/// until its following reply commits. This lets an abnormal exit before then
+/// return it to the queue. A failed delivery returns it at once. Returns whether
 /// anything was delivered.
 fn drainSteering(self: *Agent, turn: *TurnState, handler: anytype) !bool {
     var pending = try self.steering.take();
@@ -490,9 +492,9 @@ fn drainSteering(self: *Agent, turn: *TurnState, handler: anytype) !bool {
         return false;
     }
     // A failed delivery restores the whole batch ahead of messages submitted
-    // since the take, without allocating or exposing a partial batch. Guarded by
-    // the move below: once turn state owns the batch, `rollbackTurn` restores it,
-    // and restoring twice would hand the queue one batch under two owners.
+    // since the take. It does not allocate or expose a partial batch. The move
+    // below guards this: once turn state owns the batch, `rollbackTurn` restores
+    // it. A second restore hands the queue one batch under two owners.
     errdefer if (turn.pending_steering == null) self.steering.restoreTaken(&pending);
     const combined = try Steering.join(self.gpa, pending);
     defer self.gpa.free(combined);
@@ -503,11 +505,11 @@ fn drainSteering(self: *Agent, turn: *TurnState, handler: anytype) !bool {
     return true;
 }
 
-/// Stream one assistant reply, retrying on transient failures. Only whole
+/// Stream one assistant reply and retry transient failures. Only whole
 /// requests are safe to retry, so a failed attempt's partial reply is discarded
-/// (history untouched) and `handler.onStreamReset` clears partial output first.
+/// (history untouched). `handler.onStreamReset` clears partial output first.
 /// Returns the reply's items (already appended to history). An API error is
-/// retried when its head or streamed event marks it transient; an exhausted or
+/// retried when its head or streamed event marks it transient. An exhausted or
 /// permanent one is reported through `handler.onError` and surfaced as
 /// `error.ApiError`, which rolls the turn back to its latest checkpoint.
 fn fetchReply(
@@ -540,10 +542,11 @@ fn fetchReply(
         };
         defer stream.deinit();
         // The response head carries the subscription allowance before any events,
-        // so adopt it as soon as the stream is established: a stream that then
+        // so adopt it as soon as the stream is established. A stream that then
         // errors, is cancelled, or never reaches its terminal `.stop` still
-        // updates the gauge — most visibly an exhausted 429 reporting a spent
-        // account. A head that reports none leaves the last-known allowance.
+        // updates the gauge. The most visible case is an exhausted 429 that
+        // reports a spent account. A head that reports none leaves the last-known
+        // allowance.
         if (stream.quotaSoFar()) |quota| self.stats.quota = quota;
 
         if (!stream.ok()) {
@@ -604,7 +607,7 @@ fn backoff(self: *Agent, failure: net.Retry.Failure) !void {
     try self.io.sleep(.fromMilliseconds(@intCast(bounded)), .awake);
 }
 
-/// Transient transport faults worth retrying; a user cancel or channel close
+/// Transient transport faults worth a retry. A user cancel or channel close
 /// never is.
 fn retryableError(err: anyerror) bool {
     return switch (err) {
@@ -632,14 +635,14 @@ fn generateCacheKey(io: std.Io) [32]u8 {
     return std.fmt.bytesToHex(seed, .lower);
 }
 
-/// Free and drop every history item from `base` on; capacity is retained so a
+/// Free and drop every history item from `base` on. Capacity is retained so a
 /// rolled-back turn does not thrash the list backing.
 fn rollback(self: *Agent, base: usize) void {
     for (self.items.items[base..]) |item| freeItem(self.gpa, item);
     self.items.shrinkRetainingCapacity(base);
 }
 
-/// Free one history item's owned strings; an empty string frees as a no-op.
+/// Free one history item's owned strings. An empty string frees as a no-op.
 fn freeItem(gpa: std.mem.Allocator, item: llm.Item) void {
     switch (item) {
         .message => |message| gpa.free(message.text),
@@ -662,8 +665,9 @@ fn appendUser(self: *Agent, text: []const u8) !void {
     try self.items.append(self.gpa, .{ .message = .{ .role = .user, .text = owned } });
 }
 
-/// Fold one message's usage into the totals, priced with `model` — threaded from
-/// the request so billing can't drift when `/model` changes `self.model`.
+/// Fold one message's usage into the totals, priced with `model`. The model is
+/// threaded from the request so billing cannot drift when `/model` changes
+/// `self.model`.
 fn recordUsage(self: *Agent, model: *const models.Model, usage: *const llm.Usage) void {
     const cost = model.cost(usage);
     const saved = model.savings(usage);
@@ -687,12 +691,12 @@ fn recordUsageSoFar(
     usage_recorded.* = true;
 }
 
-/// Read one streamed assistant message to completion, recording usage and
-/// appending its items to history. The reply is built locally and committed only
-/// once complete, so a stream or API error leaves history untouched and the
-/// whole request can be retried without a duplicated or partial message. The
-/// returned slice views the committed tail of `self.items`; it stays valid until
-/// the next append (which `runTools` performs only after reading the reply).
+/// Read one streamed assistant message to completion, record usage, and append
+/// its items to history. The reply is built locally and committed only once
+/// complete, so a stream or API error leaves history untouched. The whole
+/// request can then be retried without a duplicated or partial message. The
+/// returned slice views the committed tail of `self.items`. It stays valid until
+/// the next append (which `runTools` performs only after the reply is read).
 fn readReply(
     self: *Agent,
     model: *const models.Model,
@@ -753,14 +757,14 @@ fn readReplyWith(
     if (stop.status == .truncated and replyHasToolCall(reply_items.items))
         return error.IncompleteReply;
     // A terminal reply that produced no assistant item at all is distinct from a
-    // cut-short one: resampling is still worth a retry, but the exhausted-retry
-    // report should say the model returned nothing rather than blame the stream.
+    // cut-short one. A resample is still worth a retry, but the exhausted-retry
+    // report must say the model returned nothing rather than blame the stream.
     if (reply_items.items.len == 0) return error.EmptyReply;
 
     const start = self.items.items.len;
     try self.items.appendSlice(gpa, reply_items.items);
-    // Only a committed reply's cutoff is worth reporting: a rejected truncation
-    // is retried, and a resampled attempt may well finish.
+    // Only a committed reply's cutoff is worth a report: a rejected truncation
+    // is retried, and a resampled attempt can finish.
     if (stop.status == .truncated) turn.truncated = true;
     return self.items.items[start..];
 }
@@ -802,19 +806,20 @@ fn runTools(self: *Agent, reply: []const llm.Item, turn: *TurnState, handler: an
     return self.runToolsWith(tool, reply, turn, handler);
 }
 
-/// Run every tool the assistant asked for, its result committed in call order so
-/// each `tool_result` maps back to its `tool_call`. `Dispatch` names the tool
-/// source (`mutates` and `run`); tests inject controllable tools into this path.
+/// Run every tool the assistant asked for. Each result is committed in call
+/// order so each `tool_result` maps back to its `tool_call`. `Dispatch` names
+/// the tool source (`mutates` and `run`). Tests inject controllable tools into
+/// this path.
 ///
-/// A conservative error result is reserved in history for every call and the
+/// A conservative error result is reserved in history for every call. The
 /// round is committed (checkpoint advanced) before anything is announced or
-/// dispatched, so no mutation can change the world with no result recorded.
-/// Contiguous read-only calls run concurrently; a mutating call is a barrier —
-/// it awaits, transfers, and presents every earlier read before announcing
-/// itself, then runs alone. Any failure (a
-/// mid-turn cancel included) reaps in-flight tasks and harvests their finished
-/// results into the reserved slots, leaving the committed round replay-valid.
-/// Returns false when no tools were asked.
+/// dispatched. So no mutation can change the world with no result recorded.
+/// Contiguous read-only calls run concurrently. A mutating call is a barrier.
+/// It awaits, transfers, and presents every earlier read before it announces
+/// itself, and then runs alone. Any failure (a mid-turn cancel included) reaps
+/// in-flight tasks and harvests their finished results into the reserved slots.
+/// This leaves the committed round replay-valid. Returns false when no tools
+/// were asked.
 fn runToolsWith(
     self: *Agent,
     comptime Dispatch: type,
@@ -824,9 +829,9 @@ fn runToolsWith(
 ) !bool {
     var call_list: std.ArrayList(Call) = .empty;
     defer call_list.deinit(self.gpa);
-    // Collect the calls before reserving results: the reservation append can move
-    // the items backing array, invalidating `reply`, but the borrowed id, name,
-    // and argument strings are separate heap allocations that stay valid.
+    // Collect the calls before the results are reserved. The reservation append
+    // can move the items backing array and invalidate `reply`. But the borrowed
+    // id, name, and argument strings are separate heap allocations that stay valid.
     for (reply) |item| switch (item) {
         .tool_call => |call| try call_list.append(
             self.gpa,
@@ -839,7 +844,7 @@ fn runToolsWith(
 
     // Reserve one synthetic error result per call and commit the whole round
     // (reply + results) before any side effect can occur. A preparation failure
-    // announces and dispatches nothing; the turn rolls back the reply.
+    // announces and dispatches nothing. The turn rolls back the reply.
     try self.reserveResults(calls);
     self.advanceCheckpoint(turn);
     notifyCheckpoint(handler);
@@ -847,7 +852,7 @@ fn runToolsWith(
     const context: tool.Context = .{ .gpa = self.gpa, .io = self.io, .bash = self.bash };
     var group: std.Io.Group = .init;
     // On any early exit, reap in-flight tasks, then move every successful,
-    // not-yet-moved result into its reserved slot; errored or never-run calls
+    // not-yet-moved result into its reserved slot. Errored or never-run calls
     // keep the conservative synthetic result. This allocates nothing.
     errdefer {
         group.cancel(self.io);
@@ -857,11 +862,11 @@ fn runToolsWith(
     for (calls) |*call| {
         const mutates = Dispatch.mutates(call.name);
         if (mutates) {
-            // Drain earlier reads so the mutation can't race one, transferring
-            // and presenting them in call order; the emptied group is reused.
-            // Both happen before the announce, so presentation never shows a
-            // later call starting above an earlier call's result, and a cancel
-            // at the barrier never announces a mutation that did not run.
+            // Drain earlier reads so the mutation cannot race one, and transfer
+            // and present them in call order. The emptied group is reused. Both
+            // happen before the announce, so presentation never shows a later
+            // call start above an earlier call's result. A cancel at the barrier
+            // never announces a mutation that did not run.
             try group.await(self.io);
             group = .init;
             try self.presentReady(calls, turn, handler);
@@ -882,9 +887,9 @@ fn runToolsWith(
     return true;
 }
 
-/// Append one synthetic error `tool_result` per call, recording each slot's
+/// Append one synthetic error `tool_result` per call and record each slot's
 /// index on its `Call`. Capacity is reserved up front so the appends cannot fail
-/// after the first; on a mid-run failure this frees the current call's partial
+/// after the first. On a mid-run failure this frees the current call's partial
 /// dupes while the turn rollback frees the slots already committed.
 fn reserveResults(self: *Agent, calls: []Call) !void {
     try self.items.ensureUnusedCapacity(self.gpa, calls.len);
@@ -903,7 +908,7 @@ fn reserveResults(self: *Agent, calls: []Call) !void {
     }
 }
 
-/// Present every completed, not-yet-moved call in call order, moving each result
+/// Present every completed, not-yet-moved call in call order and move each result
 /// into its slot before its callback. Stops at the first call whose result is
 /// not yet available (a barrier awaits only the reads dispatched before it).
 fn presentReady(
@@ -921,11 +926,11 @@ fn presentReady(
     }
 }
 
-/// Move a completed call's owned result content into its reserved slot (freeing
-/// the synthetic content it replaces) and then present it. The move is
+/// Move a completed call's owned result content into its reserved slot and then
+/// present it. The move frees the synthetic content it replaces. It is
 /// allocation-free and precedes the fallible callback, so a callback failure
-/// leaves provider-visible history honest. A call that raised instead of
-/// returning a result propagates its error, leaving the synthetic result intact.
+/// leaves provider-visible history honest. A call that raised and returned no
+/// result propagates its error and leaves the synthetic result intact.
 fn presentResult(self: *Agent, call: *Call, turn: *TurnState, handler: anytype) !void {
     var result = try call.takeFinished();
     defer result.deinit(self.gpa);
@@ -937,8 +942,8 @@ fn presentResult(self: *Agent, call: *Call, turn: *TurnState, handler: anytype) 
     );
 }
 
-/// After reaping tasks, move every successful, not-yet-moved result into its
-/// slot; an errored or never-run call keeps its synthetic result. No allocation.
+/// After tasks are reaped, move every successful, not-yet-moved result into its
+/// slot. An errored or never-run call keeps its synthetic result. No allocation.
 fn harvestResults(self: *Agent, calls: []Call) void {
     for (calls) |*call| {
         if (call.moved) continue;
@@ -949,9 +954,9 @@ fn harvestResults(self: *Agent, calls: []Call) void {
     }
 }
 
-/// Move a completed result's owned content into its reserved slot, replacing and
-/// freeing the synthetic content it held. The result retains every other owned
-/// field for its deferred `deinit`.
+/// Move a completed result's owned content into its reserved slot. This replaces
+/// and frees the synthetic content the slot held. The result retains every other
+/// owned field for its deferred `deinit`.
 fn transferResult(self: *Agent, call: *Call, result: *tool.Result) void {
     const slot = &self.items.items[call.result_index].tool_result;
     self.gpa.free(slot.content);
@@ -967,11 +972,11 @@ fn replyHasToolCall(items: []const llm.Item) bool {
 
 /// Whether a call already committed in *this reply* carries `id`, so a repeated
 /// identifier is rejected before it enters history. Uniqueness is deliberately
-/// scoped to one reply: that is what the wire format requires (a second call
-/// sharing an id inside one response is unanswerable — one result cannot address
-/// both), while an id reappearing in a later round is already paired with its own
-/// result and replays unambiguously, so rejecting it would fail a turn over a
-/// harmless provider quirk.
+/// scoped to one reply. That is what the wire format requires: a second call
+/// that shares an id inside one response is unanswerable (one result cannot
+/// address both). An id that reappears in a later round is already paired with
+/// its own result and replays unambiguously. A rejection there fails a turn over
+/// a harmless provider quirk.
 fn duplicateCallId(items: []const llm.Item, id: []const u8) bool {
     for (items) |item| switch (item) {
         .tool_call => |call| if (std.mem.eql(u8, call.call_id, id)) return true,
@@ -1031,7 +1036,7 @@ test "resetConversation clears conversation state and preserves configuration" {
 
     try std.testing.expectEqual(@as(usize, 0), agent.items.items.len);
     // Compares the whole struct, so the per-model buckets and their count must
-    // also be back to default — not just the cumulative totals.
+    // also be back to default, not just the cumulative totals.
     try std.testing.expect(std.meta.eql(Stats{}, agent.stats));
     const steering = try agent.steering.take();
     defer gpa.free(steering);
@@ -1055,7 +1060,7 @@ test "an account change or sign-out clears the previous account's quota" {
     agent.switchTo(same_account, sonnet);
     try std.testing.expect(agent.stats.quota != null);
 
-    // Crossing accounts must not present the old account's allowance as current.
+    // A switch across accounts must not present the old account's allowance as current.
     const openai_client = provider.Client.init(
         gpa,
         std.testing.io,
@@ -1180,8 +1185,8 @@ const ScriptedStream = struct {
     }
 };
 
-// A scripted fetch for `runWith`: each send consumes the next attempt (the last
-// repeats), either failing outright or handing out a fresh copy of its stream.
+// A scripted fetch for `runWith`. Each send consumes the next attempt (the last
+// repeats) and either fails outright or hands out a fresh copy of its stream.
 const ScriptedFetch = struct {
     attempts: []const Attempt,
     sends: usize = 0,
@@ -1200,7 +1205,7 @@ const ScriptedFetch = struct {
 };
 
 // An io seam that records each requested sleep in milliseconds and returns at
-// once, so retry backoffs are observable without waiting them out.
+// once, so retry backoffs are observable with no real wait.
 const SleepLog = struct {
     vtable: std.Io.VTable,
     slept_ms: [8]u64 = undefined,
@@ -1271,7 +1276,7 @@ test "steering appends a separate user item, leaving grouping to the serializer"
     defer handler.deinit();
 
     // A trailing user item, as a round's tool results leave it: the Agent
-    // appends a separate item; the Anthropic serializer merges the run.
+    // appends a separate item, and the Anthropic serializer merges the run.
     var turn: TurnState = .{ .base = 0, .checkpoint = 0 };
     defer if (turn.pending_steering) |batch| freeSteeringBatch(gpa, batch);
     try agent.appendUser("tool results");
@@ -1290,8 +1295,8 @@ test "a cancel during steering delivery returns the taken batch to the queue" {
     var agent = scriptedAgent(gpa);
     defer agent.deinit();
 
-    // A handler cancelled while reporting the batch: a mid-turn Esc racing the
-    // round-boundary drain.
+    // A handler cancelled while it reports the batch: a mid-turn Esc that races
+    // the round-boundary drain.
     const CancelHandler = struct {
         fn onSteering(self: *@This(), text: []const u8, count: usize) !void {
             _ = self;
@@ -1567,7 +1572,7 @@ test "readReply records terminal usage before rejecting an invalid reply" {
         try std.testing.expectEqual(@as(u64, 23), agent.stats.last.output);
         try std.testing.expectEqual(@as(usize, 1), handler.usage_count);
     }
-    // Invalid completed item data is latched; remaining display content is
+    // Invalid completed item data is latched. Remaining display content is
     // ignored while the stream drains through terminal usage.
     {
         var agent = scriptedAgent(gpa);
@@ -1623,8 +1628,8 @@ test "a failed reply attempt reclaims its transient allocations" {
     var handler: CaptureHandler = .{ .gpa = gpa };
     defer handler.deinit();
 
-    // A large message then a tool call, ending without a stop event: each
-    // attempt allocates item memory and then fails.
+    // A large message then a tool call, and no stop event: each attempt
+    // allocates item memory and then fails.
     const big = "x" ** 4096;
     const events = [_]llm.Event{
         .{ .text = big },
@@ -1655,8 +1660,8 @@ test "a failed reply attempt reclaims its transient allocations" {
         try std.testing.expectEqual(@as(usize, 0), agent.items.items.len);
     }
 
-    // Retained bytes must not scale with attempts — a session-lifetime arena
-    // would keep each attempt's items, adding at least `big` per attempt.
+    // Retained bytes must not scale with attempts. A session-lifetime arena
+    // keeps each attempt's items and adds at least `big` per attempt.
     const grew = (failing.allocated_bytes - failing.freed_bytes) - settled;
     try std.testing.expect(grew < big.len);
 }
@@ -1692,7 +1697,7 @@ test "rollback frees every item appended since the base" {
     try std.testing.expect(agent.items.items.len > base);
 
     // Each appended item is freed exactly once (the leak-checking allocator
-    // proves it); the user message stays.
+    // proves it). The user message stays.
     agent.rollback(base);
     try std.testing.expectEqual(base, agent.items.items.len);
     try std.testing.expectEqualStrings("keep me", agent.items.items[base - 1].message.text);
@@ -1704,7 +1709,7 @@ fn readReplyUnderOom(allocator: std.mem.Allocator) !void {
     var handler: CaptureHandler = .{ .gpa = allocator };
     defer handler.deinit();
 
-    // One reply exercising every multi-string item builder.
+    // One reply that exercises every multi-string item builder.
     const events = [_]llm.Event{
         .{ .thinking = "weigh it" },
         .{ .item = .{ .reasoning = .{
@@ -1899,7 +1904,7 @@ test "provider rejections retain terminal usage before failing the reply" {
 
 test "readReply separates OpenAI reasoning summary parts with a blank line" {
     // Two summary parts share one reasoning item and arrive with no text between
-    // them; the rising summary_index on the second part.added is the only seam,
+    // them. The rising summary_index on the second part.added is the only seam,
     // so both the committed reply and the streamed handler must read "a\n\nb".
     const body =
         "data: {\"type\":\"response.reasoning_summary_part.added\"," ++
@@ -2136,8 +2141,8 @@ test "readReply keeps adjacent reasoning runs as separate items in stream order"
     var handler: CaptureHandler = .{ .gpa = gpa };
     defer handler.deinit();
 
-    // Each run keeps its own proof, and text stays between the runs it streamed
-    // between rather than sinking below them.
+    // Each run keeps its own proof. Text stays between the runs it streamed
+    // between and does not sink below them.
     const events = [_]llm.Event{
         .{ .thinking = "A" },
         .{ .item = .{ .reasoning = .{ .encrypted = .{
@@ -2290,7 +2295,7 @@ test "readReply retains a truncated tool-free reply but rejects a truncated tool
         try std.testing.expectEqual(@as(usize, 1), reply.len);
         try std.testing.expectEqualStrings("half", reply[0].message.text);
     }
-    // A truncated reply that still holds a tool call cannot be answered; reject it.
+    // A truncated reply that still holds a tool call cannot be answered. Reject it.
     {
         var agent = scriptedAgent(gpa);
         defer agent.deinit();
@@ -2334,7 +2339,7 @@ test "readReply validates tool arguments: empty is an object, non-object rejects
         try std.testing.expectEqual(@as(usize, 1), reply.len);
         try std.testing.expectEqualStrings("{}", reply[0].tool_call.arguments_json);
     }
-    // A non-object final argument is not replayable verbatim; reject it.
+    // A non-object final argument is not replayable verbatim. Reject it.
     {
         var agent = scriptedAgent(gpa);
         defer agent.deinit();
@@ -2460,11 +2465,11 @@ test "readReply rejects incomplete or invalid reasoning proof" {
     }
 }
 
-// A scheduling seam wrapping a real threaded executor: counts read-only tasks
-// dispatched into the current group generation, records their peak, and — via an
-// atomic each read body holds while it runs — flags a mutation that ran while a
-// read was still executing. The launch counter is main-thread only; the executing
-// count is atomic because read bodies run on worker threads.
+// A scheduling seam that wraps a real threaded executor. It counts read-only
+// tasks dispatched into the current group generation and records their peak.
+// Via an atomic that each read body holds while it runs, it flags a mutation
+// that ran while a read was still active. The launch counter is main-thread
+// only. The executing count is atomic because read bodies run on worker threads.
 const ScheduleLog = struct {
     backend: std.Io,
     vtable: std.Io.VTable,
@@ -2472,8 +2477,8 @@ const ScheduleLog = struct {
     launched_peak: usize = 0,
     reads_running: std.atomic.Value(usize) = .init(0),
     mutation_overlap: bool = false,
-    // When set, the next group await reports cancellation without draining, so the
-    // caller's errdefer must reap the launched reads through `cancelGroup`.
+    // When set, the next group await reports cancellation and does not drain, so
+    // the caller's errdefer must reap the launched reads through `cancelGroup`.
     cancel_at_await: bool = false,
 
     fn init(backend: std.Io) ScheduleLog {
@@ -2535,8 +2540,8 @@ const ScheduleLog = struct {
     }
 };
 
-// A controllable tool source for `runToolsWith`: "write" mutates, everything
-// else is read-only; a mutation notes any scheduling overlap.
+// A controllable tool source for `runToolsWith`: "write" mutates, and everything
+// else is read-only. A mutation notes any scheduling overlap.
 const probe = struct {
     fn mutates(name: []const u8) bool {
         return std.mem.eql(u8, name, "write");
@@ -2570,7 +2575,7 @@ test "a mutating call is a barrier between the reads around it" {
     defer handler.deinit();
 
     // Two reads, a mutation, a read: the leading reads run concurrently, the
-    // mutation drains them first, the trailing read starts only after it.
+    // mutation drains them first, and the trailing read starts only after it.
     const reply = [_]llm.Item{
         .{ .tool_call = .{ .call_id = "r1", .name = "read", .arguments_json = "{}" } },
         .{ .tool_call = .{ .call_id = "r2", .name = "read", .arguments_json = "{}" } },
@@ -2580,7 +2585,7 @@ test "a mutating call is a barrier between the reads around it" {
     var turn: TurnState = .{ .base = 0, .checkpoint = 0 };
     try std.testing.expect(try agent.runToolsWith(probe, &reply, &turn, &handler));
 
-    // The mutation never ran while a read was still executing...
+    // The mutation never ran while a read was still active...
     try std.testing.expect(!log.mutation_overlap);
     // ...yet the two leading reads were dispatched concurrently.
     try std.testing.expectEqual(@as(usize, 2), log.launched_peak);
@@ -2660,8 +2665,8 @@ test "a cancel at the barrier reaps launched reads and starts nothing after it" 
         .{ .tool_call = .{ .call_id = "w1", .name = "write", .arguments_json = "{}" } },
         .{ .tool_call = .{ .call_id = "r3", .name = "read", .arguments_json = "{}" } },
     };
-    // Cancel at the barrier await without draining, forcing the errdefer's
-    // live-task reap: the launched read's finished result is harvested into its
+    // Cancel at the barrier await with no drain. This forces the errdefer's
+    // live-task reap. The launched read's finished result is harvested into its
     // reserved slot, the mutation never runs, and the trailing read never starts.
     var turn: TurnState = .{ .base = 0, .checkpoint = 0 };
     try std.testing.expectError(
@@ -2669,13 +2674,13 @@ test "a cancel at the barrier reaps launched reads and starts nothing after it" 
         agent.runToolsWith(probe, &reply, &turn, &handler),
     );
     try std.testing.expect(!log.mutation_overlap);
-    // Only r1 was announced: the barrier drains ahead of its own announce, so a
+    // Only r1 was announced. The barrier drains ahead of its own announce, so a
     // mutation cancelled there is never presented as started, and r3 past it
     // never begins.
     try std.testing.expectEqual(@as(usize, 1), handler.tool_start_count);
     try std.testing.expectEqual(@as(usize, 0), handler.tool_result_count);
     // The whole round's result slots stay committed and replay-valid: one slot
-    // per call, in call order, unresolved ones keeping their synthetic result.
+    // per call, in call order, and unresolved ones keep their synthetic result.
     try std.testing.expectEqual(@as(usize, 3), agent.items.items.len);
     try std.testing.expectEqualStrings("r1", agent.items.items[0].tool_result.call_id);
     try std.testing.expectEqualStrings("w1", agent.items.items[1].tool_result.call_id);
@@ -2784,8 +2789,8 @@ test "a committed truncation is reported in the receipt; a resampled one is not"
         try std.testing.expectEqualStrings("half an ans", agent.items.items[1].message.text);
         try std.testing.expect(outcome.receipt.truncated);
     }
-    // A truncation rejected for holding a tool call resamples; the attempt that
-    // finishes cleanly is the one committed, so nothing is reported as cut short.
+    // A truncation rejected because it holds a tool call resamples. The attempt
+    // that finishes cleanly is the one committed, so nothing is reported as cut short.
     {
         var log: SleepLog = .init(std.testing.io);
         var agent = scriptedAgent(gpa);
@@ -2890,7 +2895,7 @@ test "a retryable head's retry-after hint reaches backoff" {
     var handler: CaptureHandler = .{ .gpa = gpa };
     defer handler.deinit();
 
-    // Without the hint the first backoff would be backoff_ms_initial (500ms).
+    // Without the hint the first backoff is backoff_ms_initial (500ms).
     var fetch: ScriptedFetch = .{ .attempts = &.{
         .{ .stream = .{
             .events = &.{},
@@ -2926,8 +2931,8 @@ test "a mid-stream cancel propagates without a retry" {
 test "an API error retains completed rounds, reports, and fails the turn" {
     const gpa = std.testing.allocator;
     // A committed tool round, then an API error in the next request: the round
-    // is retained (its result honest about a side effect that may have happened)
-    // and the error is reported and surfaced as a failed disposition.
+    // is retained (its result honest about a possible side effect). The error is
+    // reported and surfaced as a failed disposition.
     {
         var agent = scriptedAgent(gpa);
         defer agent.deinit();
@@ -3028,8 +3033,8 @@ test "steering queued when the model would stop keeps the turn alive" {
 }
 
 // A minimal tool source for whole-turn tests: "write" mutates, everything else
-// reads; every call returns a fixed success result. Unlike `probe` it reads no
-// scheduling log, so it runs under any backing io.
+// reads, and every call returns a fixed success result. Unlike `probe` it reads
+// no scheduling log, so it runs under any backing io.
 const fake_tools = struct {
     fn mutates(name: []const u8) bool {
         return std.mem.eql(u8, name, "write");
@@ -3048,8 +3053,8 @@ const fake_tools = struct {
     }
 };
 
-// A tool source whose every call is a mutation that raises without returning a
-// result, exercising the conservative synthetic-result retention path.
+// A tool source whose every call is a mutation that raises and returns no
+// result. It exercises the conservative synthetic-result retention path.
 const raising_tools = struct {
     fn mutates(name: []const u8) bool {
         _ = name;
@@ -3064,7 +3069,7 @@ const raising_tools = struct {
     }
 };
 
-/// A read-only pair proving tool errors and pending scheduling state remain distinct.
+/// A read-only pair that proves tool errors and pending scheduling state remain distinct.
 const not_run_tools = struct {
     fn mutates(name: []const u8) bool {
         _ = name;
@@ -3099,7 +3104,7 @@ const closed_tools = struct {
 };
 
 test "a preparation failure dispatches nothing and commits no result slot" {
-    // Failing any allocation before the placeholder run is committed must leave
+    // A failed allocation before the placeholder run is committed must leave
     // no tool announced and no slot appended.
     for ([_]usize{ 0, 1, 2 }) |fail_at| {
         var failing: std.testing.FailingAllocator =
@@ -3237,7 +3242,7 @@ test "cancellation after a completed tool round retains it at the checkpoint" {
     var handler: CaptureHandler = .{ .gpa = gpa };
     defer handler.deinit();
 
-    // Round 1 runs a tool; round 2's request is cancelled mid-stream.
+    // Round 1 runs a tool. Round 2's request is cancelled mid-stream.
     var fetch: ScriptedFetch = .{ .attempts = &.{
         .{ .stream = .{ .events = &tool_round_events } },
         .{ .stream = .{ .events = &.{}, .terminal_error = error.Canceled } },
@@ -3277,7 +3282,7 @@ test "a cancelled request's partial usage is folded into the cost stats" {
     defer handler.deinit();
 
     // The read is cancelled before any terminal `.stop`, but the stream had
-    // already accumulated the prompt's usage — which the provider bills.
+    // already accumulated the prompt's usage, which the provider bills.
     var fetch: ScriptedFetch = .{ .attempts = &.{.{ .stream = .{
         .events = &.{},
         .terminal_error = error.Canceled,
@@ -3317,7 +3322,7 @@ test "a cancel during the post-stop usage callback books terminal usage only onc
     var handler: CaptureHandler = .{ .gpa = gpa, .fail_usage = true };
     defer handler.deinit();
 
-    // The stream reaches its terminal `.stop` — booking usage once — but the
+    // The stream reaches its terminal `.stop` and books usage once, but the
     // cancel lands during the usage callback that follows it. The partial fold
     // must not re-book the same usage, even though usage-so-far now equals it.
     const events = [_]llm.Event{
@@ -3342,8 +3347,8 @@ test "a no-tool reply is retained when a later steered reply is cancelled" {
     var handler: CaptureHandler = .{ .gpa = gpa };
     defer handler.deinit();
 
-    // Round 1 answers with no tools; a steering message keeps the turn alive;
-    // round 2 is cancelled before it commits.
+    // Round 1 answers with no tools. A steering message keeps the turn alive.
+    // Round 2 is cancelled before it commits.
     try agent.steering.push("steer");
     var fetch: ScriptedFetch = .{ .attempts = &.{
         .{ .stream = .{ .events = &end_turn_events } },
@@ -3351,7 +3356,7 @@ test "a no-tool reply is retained when a later steered reply is cancelled" {
     } };
     const outcome = agent.runTurnWith(&fetch, fake_tools, "go", &handler);
     try std.testing.expect(std.meta.activeTag(outcome.disposition) == .canceled);
-    // The completed no-tool reply survives; the cancelled steer round is dropped.
+    // The completed no-tool reply survives. The cancelled steer round is dropped.
     try std.testing.expectEqual(@as(usize, 2), agent.items.items.len);
     try std.testing.expectEqualStrings("go", agent.items.items[0].message.text);
     try std.testing.expectEqualStrings("hi", agent.items.items[1].message.text);

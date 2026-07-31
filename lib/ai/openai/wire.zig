@@ -1,7 +1,7 @@
 //! Translates a neutral `llm.Request` into an OpenAI Responses API JSON body.
-//! Shared by the API-key and ChatGPT-subscription accounts, which differ only
-//! in transport base and auth, never wire shape. Holds no state and does no
-//! I/O; `Transport` sends the bytes this module produces.
+//! The API-key and ChatGPT-subscription accounts share this module and differ
+//! only in transport base and auth, never wire shape. It holds no state and
+//! does no I/O. `Transport` sends the bytes this module produces.
 
 const std = @import("std");
 
@@ -9,7 +9,7 @@ const json = @import("../json.zig");
 const llm = @import("../llm.zig");
 const models = @import("../models.zig");
 
-/// Serialize `request` into an owned JSON body; caller frees the result.
+/// Serialize `request` into an owned JSON body. Caller frees the result.
 /// `account` keys the per-model effort lookup and guards which stored
 /// reasoning items are replayed (see `writeItem`).
 pub fn serialize(gpa: std.mem.Allocator, request: *const llm.Request, account: llm.Account) ![]u8 {
@@ -27,15 +27,15 @@ pub fn serialize(gpa: std.mem.Allocator, request: *const llm.Request, account: l
     try stringify.write(request.system);
 
     // OpenAI prompt caching is automatic and server-side (a >=1024-token prefix
-    // caches on its own). The key only steers routing — combined with the
-    // prompt-prefix hash so a session's growing requests land on the same
-    // cache — and the gpt-5.6 family needs it set for reliable matching.
+    // caches on its own). The key only steers routing: the backend combines it
+    // with the prompt-prefix hash so a session's growing requests land on the
+    // same cache. The gpt-5.6 family needs it set for reliable matching.
     if (request.cache_key.len > 0) {
         try stringify.objectField("prompt_cache_key");
         try stringify.write(request.cache_key);
     }
 
-    // Steer reasoning depth with the named effort; a null resolution (an
+    // Steer reasoning depth with the named effort. A null resolution (an
     // unknown model) omits the config.
     if (effortName(request, account)) |effort| {
         try stringify.objectField("reasoning");
@@ -43,7 +43,7 @@ pub fn serialize(gpa: std.mem.Allocator, request: *const llm.Request, account: l
     }
 
     // `request.tokens_max` is deliberately not sent as `max_output_tokens`: these
-    // are reasoning models, so a client-imposed output cap risks truncating the
+    // are reasoning models, so a client-imposed output cap can truncate the
     // reasoning pass mid-turn. The model's own default budget governs instead.
     if (request.tools.len > 0) {
         try stringify.objectField("tools");
@@ -66,8 +66,8 @@ pub fn serialize(gpa: std.mem.Allocator, request: *const llm.Request, account: l
     try stringify.write("reasoning.encrypted_content");
     try stringify.endArray();
 
-    // Near pass-through: one input item per history item, in list order —
-    // unlike Anthropic, OpenAI needs no envelope merging.
+    // Near pass-through: one input item per history item, in list order.
+    // Unlike Anthropic, OpenAI needs no envelope merging.
     try stringify.objectField("input");
     try stringify.beginArray();
     for (request.items) |*item| try writeItem(&stringify, gpa, item, account);
@@ -82,7 +82,7 @@ pub fn serialize(gpa: std.mem.Allocator, request: *const llm.Request, account: l
 
 /// The OpenAI effort name for the request's level, resolved through the model's
 /// effort map, or null to omit the reasoning config. An unknown model resolves
-/// to null; every known openai model floors the none level on `none`, so it
+/// to null. Every known openai model floors the none level on `none`, so it
 /// never does.
 fn effortName(request: *const llm.Request, account: llm.Account) ?[]const u8 {
     const model = models.get(account.provider(), request.model) orelse return null;
@@ -171,14 +171,14 @@ fn writeToolCall(stringify: *std.json.Stringify, call: *const llm.Item.ToolCall)
     try stringify.objectField("name");
     try stringify.write(call.name);
     // Responses wants the arguments as a JSON string, not an embedded object, so
-    // write the raw JSON escaped as a string value; empty means an empty object.
+    // write the raw JSON escaped as a string value. Empty means an empty object.
     try stringify.objectField("arguments");
     try stringify.write(if (call.arguments_json.len == 0) "{}" else call.arguments_json);
     try stringify.endObject();
 }
 
-/// A tool outcome fed back to the model. Responses has no error flag, so an
-/// error is surfaced by prefixing the output text.
+/// A tool outcome fed back to the model. Responses has no error flag, so a
+/// prefix on the output text marks an error.
 fn writeToolResult(
     stringify: *std.json.Stringify,
     gpa: std.mem.Allocator,
@@ -356,7 +356,7 @@ test "tool_call arguments serialize as a JSON string, error output is prefixed" 
 
 test "a synthetic error result emits one function_call_output with one Error prefix" {
     const synthetic =
-        "Tool execution ended before a result was recorded; side effects may have occurred.";
+        "The tool stopped before Pith recorded a result. It may have changed the system.";
     const items = [_]llm.Item{
         .{ .tool_call = .{ .call_id = "call_1", .name = "read", .arguments_json = "{}" } },
         .{ .tool_result = .{ .call_id = "call_1", .content = synthetic, .is_error = true } },
@@ -377,7 +377,7 @@ test "a synthetic error result emits one function_call_output with one Error pre
     try std.testing.expectEqual(@as(usize, 2), input.len);
     try std.testing.expectEqualStrings("function_call_output", input[1].object.get("type").?.string);
     try std.testing.expectEqualStrings("call_1", input[1].object.get("call_id").?.string);
-    // Exactly one `Error:` prefix — the stored content carries none of its own.
+    // Exactly one `Error:` prefix. The stored content carries none of its own.
     const output = input[1].object.get("output").?.string;
     const expected = "Error: " ++ synthetic;
     try std.testing.expectEqualStrings(expected, output);
@@ -459,8 +459,9 @@ test "assistant text uses output_text, unknown model omits reasoning" {
     try std.testing.expectEqualStrings("output_text", content.get("type").?.string);
 }
 
-// A multi-round conversation exercising every serializer path. Byte-identity
-// guards the wire shape against drift the structural tests above would miss.
+// A multi-round conversation that exercises every serializer path.
+// Byte-identity guards the wire shape against drift the structural tests
+// above can miss.
 const golden_items = [_]llm.Item{
     .{ .message = .{ .role = .user, .text = "first" } },
     .{ .reasoning = .{ .replay = .{ .openai_api = .{

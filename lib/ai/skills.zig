@@ -1,5 +1,5 @@
 //! Agent Skills discovery and progressive disclosure. A registry owns only skill
-//! metadata and absolute `SKILL.md` paths; instruction bodies remain on disk
+//! metadata and absolute `SKILL.md` paths. Instruction bodies remain on disk
 //! until the model reads one or the user invokes it explicitly.
 
 const std = @import("std");
@@ -29,9 +29,9 @@ pub const Skill = struct {
         self.* = undefined;
     }
 
-    /// Load this skill's complete `SKILL.md`, identify its base directory for
-    /// relative resources, and append explicit invocation arguments. The
-    /// returned prompt is owned by `gpa`.
+    /// Load this skill's complete `SKILL.md`. Identify its base directory for
+    /// relative resources. Append explicit invocation arguments. `gpa` owns
+    /// the returned prompt.
     pub fn invoke(
         self: *const Skill,
         gpa: std.mem.Allocator,
@@ -154,7 +154,10 @@ pub const Registry = struct {
         var dir = std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true }) catch |err| {
             if (err == error.FileNotFound) return;
             if (err == error.Canceled or err == error.OutOfMemory) return err;
-            try self.warn("{s}: cannot scan skills ({s})", .{ root, @errorName(err) });
+            try self.warn(
+                "Pith could not scan the skill directory {s} because of technical error {s}.",
+                .{ root, @errorName(err) },
+            );
             return;
         };
         defer dir.close(io);
@@ -166,9 +169,9 @@ pub const Registry = struct {
         var paths: PathKeeper = .{};
         defer paths.deinit(self.gpa);
 
-        // Canonical directories already entered, so a symlink pointing at the
-        // root or another followed directory is not walked twice. Seeded with
-        // the root; the traversal cap backstops any residual cycle.
+        // Canonical directories already entered. The walk does not follow a
+        // symlink to the root or to another followed directory twice. The
+        // root seeds the set. The traversal cap backstops any residual cycle.
         var visited: std.StringHashMapUnmanaged(void) = .empty;
         defer {
             var keys = visited.keyIterator();
@@ -189,10 +192,10 @@ pub const Registry = struct {
             const maybe_entry = walker.next(io) catch |err| {
                 if (err == error.Canceled or err == error.OutOfMemory) return err;
                 if (attempt == entries_visited_max) traversal_capped = true;
-                try self.warn("{s}: skill traversal skipped an entry ({s})", .{
-                    root,
-                    @errorName(err),
-                });
+                try self.warn(
+                    "Pith skipped one entry in {s} because of technical error {s}.",
+                    .{ root, @errorName(err) },
+                );
                 continue;
             };
             const entry = maybe_entry orelse break;
@@ -203,11 +206,11 @@ pub const Registry = struct {
             switch (entry.kind) {
                 .directory => walker.enter(io, entry) catch |err| {
                     if (err == error.Canceled or err == error.OutOfMemory) return err;
-                    try self.warn("{s}/{s}: cannot scan directory ({s})", .{
-                        root,
-                        entry.path,
-                        @errorName(err),
-                    });
+                    try self.warn(
+                        "Pith could not scan the skill directory {s}/{s} because of " ++
+                            "technical error {s}.",
+                        .{ root, entry.path, @errorName(err) },
+                    );
                 },
                 .file => {
                     if (!std.mem.eql(u8, entry.basename, "SKILL.md")) continue;
@@ -220,21 +223,22 @@ pub const Registry = struct {
             }
         }
         if (traversal_capped) try self.warn(
-            "{s}: skill traversal stopped after {d} entries",
+            "Pith stopped the skill scan in {s} after {d} entries.",
             .{ root, entries_visited_max },
         );
         if (paths.matched > candidates_retained_max) try self.warn(
-            "{s}: only the first {d} SKILL.md paths were considered",
-            .{ root, candidates_retained_max },
+            "Pith used only the first {d} SKILL.md paths in {s}.",
+            .{ candidates_retained_max, root },
         );
 
         std.mem.sort([]const u8, paths.heap.items, {}, pathLessThan);
         for (paths.heap.items) |path| try self.loadPath(io, path, scope);
     }
 
-    /// Follow a symlink entry: enter a linked directory (deduped by canonical
-    /// path so cycles and diamonds are walked once) or offer a linked
-    /// `SKILL.md`. Dangling and unreadable links are skipped.
+    /// Follow a symlink entry: enter a linked directory or offer a linked
+    /// `SKILL.md`. Canonical paths dedupe linked directories, so the walk
+    /// enters cycles and diamonds once. The walk skips dangling and
+    /// unreadable links.
     fn followLink(
         self: *Registry,
         io: std.Io,
@@ -247,7 +251,7 @@ pub const Registry = struct {
         const stat = entry.dir.statFile(io, entry.basename, .{}) catch |err| {
             if (err == error.Canceled or err == error.OutOfMemory) return err;
             if (err != error.FileNotFound) try self.warn(
-                "{s}/{s}: cannot resolve symlink ({s})",
+                "Pith could not resolve the symbolic link {s}/{s} because of technical error {s}.",
                 .{ root, entry.path, @errorName(err) },
             );
             return;
@@ -275,11 +279,11 @@ pub const Registry = struct {
                 link.kind = .directory;
                 walker.enter(io, link) catch |err| {
                     if (err == error.Canceled or err == error.OutOfMemory) return err;
-                    try self.warn("{s}/{s}: cannot follow symlink ({s})", .{
-                        root,
-                        entry.path,
-                        @errorName(err),
-                    });
+                    try self.warn(
+                        "Pith could not follow the symbolic link {s}/{s} because of " ++
+                            "technical error {s}.",
+                        .{ root, entry.path, @errorName(err) },
+                    );
                 };
             },
             else => {},
@@ -290,7 +294,10 @@ pub const Registry = struct {
         if (!std.unicode.utf8ValidateSlice(path)) {
             const safe = try diagnostic(self.gpa, path);
             defer self.gpa.free(safe);
-            try self.warn("{s}: skill path is not valid UTF-8; skipped", .{safe});
+            try self.warn(
+                "Pith skipped the skill path {s} because it is not valid UTF-8.",
+                .{safe},
+            );
             return;
         }
         const data = std.Io.Dir.cwd().readFileAlloc(
@@ -300,22 +307,34 @@ pub const Registry = struct {
             .limited(skill_file_bytes_max),
         ) catch |err| {
             if (err == error.Canceled or err == error.OutOfMemory) return err;
-            try self.warn("{s}: cannot read skill ({s}); skipped", .{ path, @errorName(err) });
+            try self.warn(
+                "Pith could not read the skill file {s} because of technical error {s}.",
+                .{ path, @errorName(err) },
+            );
             return;
         };
         defer self.gpa.free(data);
         if (std.mem.indexOfScalar(u8, data, 0) != null or !std.unicode.utf8ValidateSlice(data)) {
-            try self.warn("{s}: skill is not UTF-8 text; skipped", .{path});
+            try self.warn(
+                "Pith skipped {s} because the skill file is not UTF-8 text.",
+                .{path},
+            );
             return;
         }
 
         var frontmatter = skill_header.parse(self.gpa, data) catch |err| switch (err) {
             error.MissingFrontmatter => {
-                try self.warn("{s}: missing YAML frontmatter; skipped", .{path});
+                try self.warn(
+                    "Pith skipped {s} because the YAML front matter is missing.",
+                    .{path},
+                );
                 return;
             },
             error.UnclosedFrontmatter => {
-                try self.warn("{s}: unclosed YAML frontmatter; skipped", .{path});
+                try self.warn(
+                    "Pith skipped {s} because the YAML front matter is not closed.",
+                    .{path},
+                );
                 return;
             },
             else => return err,
@@ -323,18 +342,28 @@ pub const Registry = struct {
         defer frontmatter.deinit(self.gpa);
 
         const description_raw = frontmatter.description orelse {
-            try self.warn("{s}: missing or empty description; skipped", .{path});
+            try self.warn(
+                "Pith skipped {s} because the skill description is missing or empty.",
+                .{path},
+            );
             return;
         };
         const description = std.mem.trim(u8, description_raw, " \t\r\n");
         if (description.len == 0) {
-            try self.warn("{s}: missing or empty description; skipped", .{path});
+            try self.warn(
+                "Pith skipped {s} because the skill description is missing or empty.",
+                .{path},
+            );
             return;
         }
-        // Raw NUL is rejected above; an escape that decodes to one still must not
-        // reach the catalog, keeping the advertised text NUL-free end to end.
+        // The check above rejects a raw NUL. An escape that decodes to one
+        // still must not reach the catalog. This keeps the advertised text
+        // NUL-free end to end.
         if (std.mem.indexOfScalar(u8, description, 0) != null) {
-            try self.warn("{s}: description decodes to a NUL byte; skipped", .{path});
+            try self.warn(
+                "Pith skipped {s} because the skill description contains a NUL byte.",
+                .{path},
+            );
             return;
         }
 
@@ -345,28 +374,32 @@ pub const Registry = struct {
             const safe = try diagnostic(self.gpa, declared);
             defer self.gpa.free(safe);
             try self.warn(
-                "{s}: invalid skill name \"{s}\"; using directory name",
+                "Pith used the directory name for {s} because the skill name \"{s}\" is not valid.",
                 .{ path, safe },
             );
             break :name directory_name;
         } else name: {
-            try self.warn("{s}: missing skill name; using directory name", .{path});
+            try self.warn(
+                "Pith used the directory name for {s} because the skill name is missing.",
+                .{path},
+            );
             break :name directory_name;
         };
         if (!nameValid(name_source)) {
             try self.warn(
-                "{s}: directory name \"{s}\" is not a valid skill name; skipped",
+                "Pith skipped {s} because the directory name \"{s}\" is not a valid skill name.",
                 .{ path, directory_name },
             );
             return;
         }
         if (!std.mem.eql(u8, name_source, directory_name)) try self.warn(
-            "{s}: skill name \"{s}\" differs from directory \"{s}\"",
-            .{ path, name_source, directory_name },
+            "The skill name \"{s}\" in {s} differs from the directory name \"{s}\".",
+            .{ name_source, path, directory_name },
         );
         const description_length = std.unicode.utf8CountCodepoints(description) catch unreachable;
         if (description_length > 1024) try self.warn(
-            "{s}: skill description exceeds 1024 characters; catalog entry truncated",
+            "Pith shortened the catalog description for {s} because it has more than " ++
+                "1024 characters.",
             .{path},
         );
 
@@ -386,33 +419,31 @@ pub const Registry = struct {
         try self.insert(&skill);
     }
 
-    /// Takes `incoming` on success; leaves it untouched on error.
+    /// Takes `incoming` on success. Leaves it untouched on error.
     fn insert(self: *Registry, incoming: *Skill) !void {
         for (self.skill_items.items) |*existing| {
             if (!std.mem.eql(u8, existing.name, incoming.name)) continue;
             if (incoming.scope == .project and existing.scope == .user) {
-                try self.warn("project skill \"{s}\" at {s} shadows user skill at {s}", .{
-                    incoming.name,
-                    incoming.path,
-                    existing.path,
-                });
+                try self.warn(
+                    "The project skill \"{s}\" at {s} replaces the user skill at {s}.",
+                    .{ incoming.name, incoming.path, existing.path },
+                );
                 existing.deinit(self.gpa);
                 existing.* = incoming.*;
                 incoming.* = undefined;
                 return;
             }
-            try self.warn("skill \"{s}\" at {s} is shadowed by {s}", .{
-                incoming.name,
-                incoming.path,
-                existing.path,
-            });
+            try self.warn(
+                "Pith ignored the skill \"{s}\" at {s} because {s} has priority.",
+                .{ incoming.name, incoming.path, existing.path },
+            );
             incoming.deinit(self.gpa);
             return;
         }
 
         if (self.skill_items.items.len == skills_max) {
             if (!self.skills_capped) {
-                try self.warn("only the first {d} distinct skills were loaded", .{skills_max});
+                try self.warn("Pith loaded only the first {d} distinct skills.", .{skills_max});
                 self.skills_capped = true;
             }
             incoming.deinit(self.gpa);
@@ -428,12 +459,12 @@ pub const Registry = struct {
         _ = std.Io.Dir.cwd().statFile(io, path, .{}) catch |err| {
             if (err == error.FileNotFound) return false;
             if (err == error.Canceled or err == error.OutOfMemory) return err;
-            try self.warn("{s}: cannot inspect repository marker ({s})", .{
-                path,
-                @errorName(err),
-            });
-            // Crossing a repository boundary is worse than missing skills below
-            // an unreadable marker, so stop the ancestor search conservatively.
+            try self.warn(
+                "Pith could not inspect the repository marker {s} because of technical error {s}.",
+                .{ path, @errorName(err) },
+            );
+            // To cross a repository boundary is worse than to miss skills below
+            // an unreadable marker. Stop the ancestor search conservatively.
             return true;
         };
         return true;
@@ -446,7 +477,7 @@ pub const Registry = struct {
     ) !void {
         if (self.warnings_capped) return;
         if (self.warning_items.items.len == warnings_max - 1) {
-            const notice = try self.gpa.dupe(u8, "additional skill warnings omitted");
+            const notice = try self.gpa.dupe(u8, "Pith omitted more skill warnings.");
             errdefer self.gpa.free(notice);
             try self.warning_items.append(self.gpa, notice);
             self.warnings_capped = true;
@@ -461,7 +492,7 @@ pub const Registry = struct {
 pub const DiscoverOptions = struct {
     /// Absolute `~/.agents/skills` path.
     user_root: []const u8,
-    /// Absolute working directory from which project ancestors are searched.
+    /// Absolute working directory where the project ancestor scan starts.
     project_start: []const u8,
 };
 
@@ -490,7 +521,7 @@ const PathKeeper = struct {
 };
 
 /// Discover user skills, then project skills from `project_start` upward. The
-/// nearest project root wins; a `.git` file or directory ends the ancestor scan.
+/// nearest project root wins. A `.git` file or directory ends the ancestor scan.
 pub fn discover(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -513,7 +544,7 @@ pub fn discover(
         const root = try std.fs.path.join(gpa, &.{ current, ".agents", "skills" });
         defer gpa.free(root);
         // At the home directory the user and project conventions can resolve to
-        // the same path; do not rediscover every file as its own shadow.
+        // the same path. Do not rediscover every file as its own shadow.
         var matches_user_root = std.mem.eql(u8, root, options.user_root);
         if (!matches_user_root and user_root_canonical != null) {
             const project_root_canonical = try canonicalPath(gpa, io, root);
@@ -563,9 +594,9 @@ fn descriptionPrefix(description: []const u8) []const u8 {
     return description[0..end];
 }
 
-/// A bounded, transcript-safe rendering of an untrusted value for a warning:
-/// caps the source length, escapes control and non-UTF-8 bytes as `\xNN`, and
-/// passes valid UTF-8 through so paths and names stay legible.
+/// A bounded, transcript-safe rendering of an untrusted value for a warning.
+/// It caps the source length and escapes control and non-UTF-8 bytes as
+/// `\xNN`. Valid UTF-8 passes through so paths and names stay legible.
 fn diagnostic(gpa: std.mem.Allocator, text: []const u8) ![]u8 {
     const source_bytes_max = 96;
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -774,7 +805,7 @@ test "discovery follows directory symlinks once and skips cycles" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // A skill body living outside the skills root, linked in as a directory.
+    // A skill body outside the skills root, linked in as a directory.
     try writeTestSkill(io, tmp.dir, "external/pdf-tools/SKILL.md", "---\n" ++
         "name: pdf-tools\ndescription: linked skill\n---\nbody\n");
     var user_dir = try tmp.dir.createDirPathOpen(io, "user", .{});
@@ -787,7 +818,7 @@ test "discovery follows directory symlinks once and skips cycles" {
     const user_root = try tmpPath(gpa, io, &tmp, "user");
     defer gpa.free(user_root);
     try tmp.dir.symLink(io, external, "user/pdf-tools", .{});
-    // A symlink back to the skills root must not be walked a second time.
+    // The walk must not follow a symlink back to the skills root a second time.
     try tmp.dir.symLink(io, user_root, "user/loop", .{});
 
     const project_start = try tmpPath(gpa, io, &tmp, "repo");
@@ -804,7 +835,7 @@ test "discovery follows directory symlinks once and skips cycles" {
 
 test "a skill whose path is not valid UTF-8 is skipped with a safe warning" {
     const gpa = std.testing.allocator;
-    // Host filesystems reject non-UTF-8 names, so exercise the guard directly:
+    // Host filesystems reject non-UTF-8 names, so exercise the guard directly.
     // loadPath validates the path before any I/O and so never touches `io`.
     var registry = Registry.init(gpa);
     defer registry.deinit();

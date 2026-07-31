@@ -5,18 +5,18 @@ const std = @import("std");
 
 const grapheme = @import("grapheme.zig");
 
-/// Display width of inert `text` in terminal columns after canonicalizing it for
-/// safe terminal output. Text is measured per UAX #29 grapheme cluster (via
-/// `grapheme`), matching a terminal with DECSET mode 2027. LF is a logical row
-/// break and adds no columns, TAB is one space, and every other C0/C1 control,
-/// DEL, or malformed UTF-8 unit is one replacement-character column.
+/// Display width of inert `text` in terminal columns after canonicalization for
+/// safe terminal output. The measure is per UAX #29 grapheme cluster (via
+/// `grapheme`) and matches a terminal with DECSET mode 2027. LF is a logical row
+/// break and adds no columns. TAB is one space. Every other C0/C1 control, DEL,
+/// or malformed UTF-8 unit is one replacement-character column.
 pub fn ofText(text: []const u8) usize {
     return fittedWidth(text, std.math.maxInt(usize));
 }
 
 /// Longest single-line prefix of `text` whose canonical display width is at
-/// most `columns_max`. A grapheme cluster that would straddle the budget is
-/// dropped whole.
+/// most `columns_max`. A grapheme cluster that straddles the budget is dropped
+/// whole.
 pub fn truncate(text: []const u8, columns_max: usize) []const u8 {
     var columns: usize = 0;
     var index: usize = 0;
@@ -31,24 +31,25 @@ pub fn truncate(text: []const u8, columns_max: usize) []const u8 {
     return text[0..index];
 }
 
-/// Write the canonical, inert representation of `text`, returning its display
-/// width. A logical LF emits only a zero-width grapheme boundary; callers that
-/// accept multiline text split it with `wrapper` before composing physical rows.
+/// Write the canonical, inert representation of `text` and return its display
+/// width. A logical LF emits only a zero-width grapheme boundary. Callers that
+/// accept multiline text split it with `wrapper` before they compose physical rows.
 pub fn writeText(writer: *std.Io.Writer, text: []const u8) !usize {
     return writeCanonical(writer, text, std.math.maxInt(usize));
 }
 
 /// Write one physical row fitted to `columns_max`. A printable grapheme wider
-/// than the row is represented by the same one-column replacement used for
-/// controls, so even a one-column terminal remains synchronized.
+/// than the row becomes the same one-column replacement used for controls, so
+/// even a one-column terminal remains synchronized.
 pub fn writeFitted(writer: *std.Io.Writer, text: []const u8, columns_max: usize) !usize {
     return writeCanonical(writer, text, columns_max);
 }
 
-/// Streaming hard-wrap: `next` yields each line (a slice into `text`) of at most
-/// `columns_max` display columns, then null, so a caller can drop the rows above
-/// a window without materializing the list. Breaks strictly on width, never
-/// inside a grapheme cluster; an explicit `\n` starts a new line and is not emitted.
+/// A streamed hard-wrap: `next` yields each line (a slice into `text`) of at
+/// most `columns_max` display columns, then null. A caller can thus drop the
+/// rows above a window and never materialize the list. The wrap breaks strictly
+/// on width, never inside a grapheme cluster. An explicit `\n` starts a new line
+/// and never reaches the output.
 pub const Wrapper = struct {
     text: []const u8,
     columns_max: usize,
@@ -82,15 +83,15 @@ pub const Wrapper = struct {
     }
 };
 
-/// Wrap `text` to at most `columns_max` display columns — the form `rows` and
-/// `caret` are built on, so they stay in lockstep by construction.
+/// Wrap `text` to at most `columns_max` display columns. `rows` and `caret`
+/// build on this form, so they stay in lockstep by construction.
 pub fn wrapper(text: []const u8, columns_max: usize) Wrapper {
     return .{ .text = text, .columns_max = columns_max, .line_start = 0, .done = false };
 }
 
-/// Physical rows `text` occupies once hard-wrapped to `columns_max` — the count
-/// of lines `wrapper` yields, always at least one. A wide cluster that would
-/// straddle the margin breaks to the next row, so this is not `ceil(width / columns)`.
+/// Physical rows `text` occupies once hard-wrapped to `columns_max`: the count
+/// of lines `wrapper` yields, always at least one. A wide cluster that straddles
+/// the margin breaks to the next row, so this is not `ceil(width / columns)`.
 pub fn rows(text: []const u8, columns_max: usize) usize {
     var iterator = wrapper(text, columns_max);
     var count: usize = 0;
@@ -101,11 +102,12 @@ pub fn rows(text: []const u8, columns_max: usize) usize {
 pub const Caret = struct { rows_before: usize, column: usize };
 
 /// Physical position of a caret at the end of `text` once wrapped to
-/// `columns_max`: how many row breaks precede it and its column within that row.
-/// Pass the prefix before the caret — a greedy width wrap never lets later
+/// `columns_max`. The result is how many row breaks precede it and its column
+/// within that row.
+/// Pass the prefix before the caret. A greedy width wrap never lets later
 /// content move an earlier break, so the suffix cannot change the answer. A
 /// prefix that fills a row exactly wraps the caret onto the next row's first
-/// column, since no cell exists at the margin. `text` must end on a canonical
+/// column, because no cell exists at the margin. `text` must end on a canonical
 /// display boundary.
 pub fn caret(text: []const u8, columns_max: usize) Caret {
     var iterator = wrapper(text, columns_max);
@@ -130,7 +132,7 @@ pub fn boundaryAfter(text: []const u8, offset: usize) usize {
 }
 
 /// Byte offset of the canonical display-unit boundary immediately before
-/// `offset`, which must itself be a boundary; an offset past the end clamps to
+/// `offset`, which must itself be a boundary. An offset past the end clamps to
 /// the end first.
 pub fn boundaryBefore(text: []const u8, offset: usize) usize {
     const target = @min(offset, text.len);
@@ -339,10 +341,10 @@ test "a grapheme wider than one column has a fitted replacement" {
 }
 
 test "grapheme clusters measure as one terminal cell" {
-    // Each renders as a single glyph and is measured as the cell a mode-2027
+    // Each renders as a single glyph and measures as the cell a mode-2027
     // terminal draws, not the sum of its code points.
 
-    // Heart plus VS16 promotes to a two-cell emoji; VS15 keeps it at one.
+    // Heart plus VS16 promotes to a two-cell emoji. VS15 keeps it at one.
     try std.testing.expectEqual(@as(usize, 2), ofText("❤\u{FE0F}"));
     try std.testing.expectEqual(@as(usize, 1), ofText("❤\u{FE0E}"));
     // A keycap sequence — digit, selector, enclosing keycap — is two columns.
@@ -351,7 +353,7 @@ test "grapheme clusters measure as one terminal cell" {
     try std.testing.expectEqual(@as(usize, 2), ofText("👍\u{1F3FD}"));
     // ZWJ family: four emoji joined into one two-column glyph.
     try std.testing.expectEqual(@as(usize, 2), ofText("👨\u{200D}👩\u{200D}👧\u{200D}👦"));
-    // A regional-indicator flag is one two-column glyph; two flags are four.
+    // A regional-indicator flag is one two-column glyph. Two flags are four.
     try std.testing.expectEqual(@as(usize, 2), ofText("🇯🇵"));
     try std.testing.expectEqual(@as(usize, 4), ofText("🇯🇵🇺🇸"));
 }

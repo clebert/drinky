@@ -1,5 +1,5 @@
-//! Turns a tool's raw `tool_use` input JSON into its typed argument struct, and
-//! guards at compile time that the struct and the tool's advertised parameters
+//! Turns a tool's raw `tool_use` input JSON into its typed argument struct.
+//! Guards at compile time that the struct and the tool's advertised parameters
 //! describe the same arguments.
 
 const std = @import("std");
@@ -8,7 +8,7 @@ const llm = @import("../llm.zig");
 
 /// Parse `input_json` into `Args`. Any malformed or mistyped input becomes
 /// `error.InvalidArguments`, which the dispatcher renders into a tool-error
-/// result; `error.OutOfMemory` propagates.
+/// result. `error.OutOfMemory` propagates.
 pub fn input(
     comptime Args: type,
     gpa: std.mem.Allocator,
@@ -25,9 +25,9 @@ pub fn input(
     };
 }
 
-/// Compile-time guard that every `Args` field is an advertised parameter and
-/// vice versa, that a field is required exactly when it has no default, and that
-/// each field's type matches its parameter's advertised type.
+/// A compile-time guard. Every `Args` field must be an advertised parameter and
+/// vice versa. A field must be required exactly when it has no default. Each
+/// field's type must match its parameter's advertised type.
 pub fn check(comptime Args: type, comptime parameters: []const llm.Parameter) void {
     comptime {
         for (@typeInfo(Args).@"struct".fields) |field| {
@@ -51,7 +51,7 @@ pub fn check(comptime Args: type, comptime parameters: []const llm.Parameter) vo
     }
 }
 
-/// Whether a field of type `Field` can hold a `parameter_type` value, looking
+/// Whether a field of type `Field` can hold a `parameter_type` value. It looks
 /// through an optional so `?usize` still matches an integer parameter.
 fn typeMatches(comptime Field: type, comptime parameter_type: llm.Parameter.Type) bool {
     const Value = switch (@typeInfo(Field)) {

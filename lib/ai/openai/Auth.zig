@@ -1,4 +1,4 @@
-//! Credential lifecycle for the ChatGPT-subscription (Codex) account: the
+//! The credential lifecycle for the ChatGPT-subscription (Codex) account: the
 //! shared `auth` lifecycle instantiated over `oauth`'s protocol for the
 //! `"openai_subscription"` entry in `<home>/.pith/auth.json`.
 
@@ -13,7 +13,7 @@ const oauth = @import("oauth.zig");
 
 const Auth = @This();
 
-/// Top-level key this account's credentials live under in `auth.json`.
+/// The top-level key this account's credentials live under in `auth.json`.
 const account_key = "openai_subscription";
 
 gpa: std.mem.Allocator,
@@ -38,12 +38,12 @@ pub fn load(self: *Auth) !bool {
     return auth.load(self, account_key);
 }
 
-/// A valid access token, refreshing and persisting it first if it has expired.
+/// A valid access token, refreshed and persisted first if it has expired.
 pub fn accessToken(self: *Auth) ![]const u8 {
     return auth.accessToken(self, account_key, oauth.refresh);
 }
 
-/// The ChatGPT account id sent with each request; empty when not authenticated.
+/// The ChatGPT account id sent with each request. Empty when not authenticated.
 pub fn accountId(self: *const Auth) []const u8 {
     const tokens = self.tokens orelse return "";
     return tokens.account_id;
@@ -56,7 +56,7 @@ pub fn login(self: *Auth, prompt: anytype) !auth.Login {
 }
 
 /// `oauth.exchange` over the received redirect. The verifier doubles as
-/// `state`; a mismatch means the redirect is not ours.
+/// `state`. A mismatch means the redirect is not ours.
 fn exchangeRedirect(
     self: *Auth,
     redirect: oauth_callback.Redirect,
@@ -69,8 +69,8 @@ fn exchangeRedirect(
     });
 }
 
-/// Drop this account's credentials: clear the in-memory tokens and remove its
-/// entry from `auth.json`, preserving every other account's entry.
+/// Drop this account's credentials: clear the in-memory tokens, remove its
+/// entry from `auth.json`, and keep every other account's entry.
 pub fn logout(self: *Auth) !void {
     return auth.logout(self, account_key);
 }
@@ -87,8 +87,9 @@ test "load distinguishes signed out from corrupt credentials" {
 
     var subject = try init(gpa, io, home, .{});
     defer subject.deinit();
-    // An absent file and a file holding only a sibling account's entry are both
-    // simply signed out; an own entry missing a field is corrupt, not ignored.
+    // An absent file and a file that holds only a sibling account's entry are
+    // both simply signed out. An own entry that lacks a field is corrupt, not
+    // ignored.
     try std.testing.expect(!try subject.load());
     try auth_store.save(gpa, io, subject.path, "anthropic_subscription", .{ .access = "a" });
     try std.testing.expect(!try subject.load());
@@ -119,7 +120,7 @@ test "save and load round-trip credentials an unexpired token serves unchanged" 
     var loaded = try init(gpa, io, home, .{});
     defer loaded.deinit();
     try std.testing.expect(try loaded.load());
-    // Loading again replaces the installed tokens rather than leaking them.
+    // A second load replaces the installed tokens and does not leak them.
     try std.testing.expect(try loaded.load());
     try std.testing.expectEqualStrings("at", try loaded.accessToken());
     try std.testing.expectEqualStrings("acct", loaded.accountId());

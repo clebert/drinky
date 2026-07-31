@@ -1,7 +1,7 @@
-//! Owns the controlling terminal for the session: enters raw mode on `init`,
-//! restores it on `deinit`, exposes the window size, reads stdin with a timeout,
-//! and hands out a buffered stdout stream. Pin the value (it is self-referential
-//! through the output buffer) and call `init` on the pointer.
+//! Owns the controlling terminal for the session. It enters raw mode on `init`
+//! and restores it on `deinit`. It exposes the window size, reads stdin with a
+//! timeout, and hands out a buffered stdout stream. Pin the value (it is
+//! self-referential through the output buffer) and call `init` on the pointer.
 
 const std = @import("std");
 
@@ -9,8 +9,8 @@ const escape = @import("escape.zig");
 
 const Tty = @This();
 
-// The read path (`in_handle`) and the write path (`out_*` plus `raw_state`) share
-// no mutable field, so a blocked reader and the consumer's renderer can run
+// The read path (`in_handle`) and the write path (`out_*` plus `raw_state`)
+// share no mutable field. A blocked reader and the consumer's renderer can run
 // concurrently without a lock. Preserve that split.
 io: std.Io,
 in_handle: std.posix.fd_t,
@@ -38,9 +38,9 @@ const PosixSetup = struct {
     original: *const std.posix.termios,
 
     // Entry flushes pending input (`.FLUSH`) for a clean raw-mode slate. Restore
-    // uses `.NOW` so it applies immediately: `.FLUSH`/`.DRAIN` block until the
-    // terminal's output queue transmits, which a wedged or flow-controlled
-    // terminal never does, and that would strand the terminal in raw mode.
+    // uses `.NOW` so it applies immediately. `.FLUSH` and `.DRAIN` block until
+    // the terminal's output queue transmits. A wedged or flow-controlled
+    // terminal never transmits, and that block strands the terminal in raw mode.
     fn setRaw(self: *const PosixSetup) !void {
         try std.posix.tcsetattr(self.in_handle, .FLUSH, self.raw.*);
     }
@@ -90,9 +90,10 @@ pub fn enterRaw(self: *Tty) !void {
     try enterWith(&self.raw_state, &self.out_stream.interface, &control);
 }
 
-/// Restore the original cooked state first — a blocking or failing escape write
-/// must not strand raw mode — then reverse the escape modes. Used at shutdown and
-/// to suspend for a mid-session login flow; pair with `enterRaw` to resume.
+/// Restore the original cooked state first, because an escape write that blocks
+/// or fails must not strand raw mode. Then reverse the escape modes. Used at
+/// shutdown and to suspend for a mid-session login flow. Pair with `enterRaw`
+/// to resume.
 pub fn leaveRaw(self: *Tty) void {
     // `raw` is unused on the restore path.
     var control: PosixSetup = .{
@@ -112,8 +113,8 @@ pub fn setAlternateScreen(self: *Tty, enabled: bool) !void {
     try setAlternateScreenWith(&self.raw_state, &self.out_stream.interface, enabled);
 }
 
-/// Read available input into `buffer`, blocking until some arrives or `timeout`
-/// elapses — in which case it returns null, so an idle caller can react to a
+/// Read available input into `buffer`, and block until some arrives or
+/// `timeout` elapses. A timeout returns null, so an idle caller can react to a
 /// resize between keystrokes. A closed input surfaces as `error.EndOfStream`.
 pub fn read(self: *Tty, buffer: []u8, timeout: std.Io.Timeout) !?usize {
     var chunk: [1][]u8 = .{buffer};
@@ -127,11 +128,11 @@ pub fn read(self: *Tty, buffer: []u8, timeout: std.Io.Timeout) !?usize {
     return try result.file_read_streaming;
 }
 
-/// Window size, or null when the terminal cannot report one. `TIOCGWINSZ` is an
-/// instantaneous kernel query with nothing to block or cancel on, so it bypasses
-/// `io` — also sidestepping a `std.Io.Threaded` device-control path that returns
-/// spurious `ENOTTY` on a valid tty under ReleaseSafe on aarch64-macOS
-/// (codeberg.org/ziglang/zig/issues/36218).
+/// The window size, or null when the terminal cannot report one. `TIOCGWINSZ`
+/// is an instantaneous kernel query with nothing to block or cancel on, so it
+/// bypasses `io`. The bypass also sidesteps a `std.Io.Threaded` device-control
+/// path that returns spurious `ENOTTY` on a valid tty under ReleaseSafe on
+/// aarch64-macOS (codeberg.org/ziglang/zig/issues/36218).
 pub fn size(self: *Tty) ?Size {
     var window: std.posix.winsize = .{ .row = 0, .col = 0, .xpixel = 0, .ypixel = 0 };
     const rc = std.posix.system.ioctl(self.out_handle, std.posix.T.IOCGWINSZ, @intFromPtr(&window));
@@ -182,10 +183,11 @@ fn cleanupWith(
     control: anytype,
     write_newline: bool,
 ) void {
-    // Restore the OS terminal mode before any presentation output, so a write or
-    // flush that blocks on a wedged or flow-controlled terminal cannot postpone it.
-    // On restore failure keep raw ownership and every pending reset flag so a later
-    // cleanup retries the restore, then writes the resets, exactly once.
+    // Restore the OS terminal mode before any presentation output. A write or
+    // flush that blocks on a wedged or flow-controlled terminal then cannot
+    // postpone it. On restore failure, keep raw ownership and every pending
+    // reset flag. A later cleanup retries the restore, then writes the resets,
+    // exactly once.
     if (state.raw_owned) {
         control.restore() catch return;
         state.raw_owned = false;

@@ -1,11 +1,11 @@
 //! The set of configured accounts and their live credentials: the two OAuth
-//! subscription stores and the two environment-sourced API keys. Owns what a
-//! `provider.Client` points into — the `Auth` structs and (by borrow) the key
-//! bytes — so a client built here stays valid for the whole session. Reports
-//! which accounts are authenticated and builds a client for one on demand;
+//! subscription stores and the two environment-sourced API keys. It owns what
+//! a `provider.Client` points into: the `Auth` structs and (by borrow) the key
+//! bytes. A client built here stays valid for the whole session. It reports
+//! which accounts are authenticated and builds a client for one on demand. The
 //! selection is always an explicit account, never inferred from a precedence.
-//! Also owns best-effort account-specific model limits so the provider-wide
-//! compiled catalog remains immutable.
+//! It also owns best-effort account-specific model limits, so the
+//! provider-wide compiled catalog remains immutable.
 
 const std = @import("std");
 
@@ -38,15 +38,15 @@ const ContextWindow = struct {
 };
 
 /// The per-vendor API keys, each null when its environment variable is unset.
-/// Borrowed for the process lifetime (they point into the environment), so they
-/// are never freed here.
+/// The keys are borrowed for the process lifetime (they point into the
+/// environment), so they are never freed here.
 pub const ApiKeys = struct {
     anthropic: ?[]const u8 = null,
     openai: ?[]const u8 = null,
 };
 
 /// A committed subscription login's persistence outcome. Both variants mean
-/// the replacement credential is live; the caller owns final presentation.
+/// the replacement credential is live. The caller owns the final presentation.
 pub const Login = union(enum) {
     saved: []const u8,
     memory_only: struct {
@@ -55,8 +55,8 @@ pub const Login = union(enum) {
     },
 };
 
-/// Open both subscription stores (loading any stored credential) and take the
-/// environment API keys. A malformed `auth.json` surfaces here rather than being
+/// Open both subscription stores, load any stored credential, and take the
+/// environment API keys. A malformed `auth.json` surfaces here and is not
 /// silently ignored.
 pub fn init(
     gpa: std.mem.Allocator,
@@ -94,8 +94,8 @@ pub fn deinit(self: *Accounts) void {
     self.openai_auth.deinit();
 }
 
-/// Whether `account` has a usable credential: an env key for an API account, a
-/// loaded subscription token for a subscription account.
+/// Whether `account` has a usable credential: an env key for an API account,
+/// or a loaded subscription token for a subscription account.
 pub fn isAuthenticated(self: *const Accounts, account: llm.Account) bool {
     return switch (account) {
         .anthropic_api => self.keys.anthropic != null,
@@ -105,10 +105,10 @@ pub fn isAuthenticated(self: *const Accounts, account: llm.Account) bool {
     };
 }
 
-/// The first authenticated account, or null when none is — the session's active
+/// The first authenticated account, or null when none is. The session's active
 /// account is chosen this way at startup (there is no configured active
 /// account). A stored subscription is preferred over a paid API key, across
-/// vendors; within a tier, enum declaration order decides.
+/// vendors. Within a tier, enum declaration order decides.
 pub fn firstAuthenticated(self: *const Accounts) ?llm.Account {
     for (std.enums.values(llm.Account)) |account| {
         if (account.isSubscription() and self.isAuthenticated(account)) return account;
@@ -119,8 +119,8 @@ pub fn firstAuthenticated(self: *const Accounts) ?llm.Account {
     return null;
 }
 
-/// A client for `account`, pointing into this registry's owned credentials, or
-/// null when the account is not authenticated.
+/// A client for `account` that points into this registry's owned credentials,
+/// or null when the account is not authenticated.
 pub fn client(self: *Accounts, account: llm.Account) ?provider.Client {
     const credentials: provider.Credentials = switch (account) {
         .anthropic_api => .{ .anthropic_api = self.keys.anthropic orelse return null },
@@ -150,7 +150,7 @@ pub fn resolveModel(self: *const Accounts, account: llm.Account, base: models.Mo
     return resolved;
 }
 
-/// Append every compiled model offered to `account`, applying only that
+/// Append every compiled model offered to `account` and apply only that
 /// account's valid metadata overlays.
 pub fn listModels(
     self: *const Accounts,
@@ -191,7 +191,7 @@ pub fn login(self: *Accounts, account: llm.Account, prompt: anytype) !Login {
     };
 }
 
-/// Drop a subscription `account`'s stored credentials, marking it no longer
+/// Drop a subscription `account`'s stored credentials and mark it no longer
 /// authenticated. An API account has no login to drop (its key comes from the
 /// environment), so it is an error.
 pub fn logout(self: *Accounts, account: llm.Account) !void {
@@ -209,8 +209,9 @@ pub fn logout(self: *Accounts, account: llm.Account) !void {
     }
 }
 
-/// Replace this account's discovered limits. Any fetch, envelope, or allocation
-/// failure leaves the override set empty, restoring every compiled fallback.
+/// Replace this account's discovered limits. Any fetch, envelope, or
+/// allocation failure leaves the override set empty and restores every
+/// compiled fallback.
 fn refreshOpenaiSubscriptionModels(self: *Accounts) void {
     self.replaceOpenaiSubscriptionCatalog(openai.ModelCatalog.fetch(
         self.gpa,
@@ -262,7 +263,7 @@ test "isAuthenticated and firstAuthenticated read keys and readiness, subscripti
     try std.testing.expect(accounts.isAuthenticated(.anthropic_api));
     try std.testing.expect(accounts.isAuthenticated(.openai_api));
     try std.testing.expect(!accounts.isAuthenticated(.openai_subscription));
-    // Both anthropic credentials are present; the subscription precedes its API
+    // Both anthropic credentials are present. The subscription precedes its API
     // key in enum order, so it is the active account.
     try std.testing.expectEqual(
         llm.Account.anthropic_subscription,

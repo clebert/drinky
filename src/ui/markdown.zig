@@ -1,7 +1,7 @@
 //! Markdown rendering for transcript blocks and read-only pages. Measurement,
-//! painting, and source mapping run one `walk` over the source, parameterized on
-//! a comptime emitter, so they break rows in exactly the same places. Nothing
-//! allocates: every span is a source slice or static literal streamed to the sink.
+//! painting, and source mapping run one `walk` over the source with a comptime
+//! emitter, so they break rows in exactly the same places. Nothing allocates:
+//! every span is a source slice or a static literal that streams to the sink.
 
 const std = @import("std");
 
@@ -10,13 +10,13 @@ const terminal = @import("terminal");
 const color = @import("color.zig");
 const paint = @import("paint.zig");
 
-/// Blanks to slice indents and marker-width continuations from; its length caps
+/// Blanks to slice indents and marker-width continuations from. Its length caps
 /// how far a nested list can push its body.
 const blanks = " " ** 32;
 
 const rule_cell = "─";
 
-/// How wide a horizontal rule is drawn at most, however wide the terminal is.
+/// A horizontal rule draws at most this wide, however wide the terminal is.
 const rule_columns = 80;
 
 const rule_cells = rule_cell ** rule_columns;
@@ -61,16 +61,16 @@ pub fn sourceAtRow(text: []const u8, options: *const RowOptions) usize {
     return locator.result;
 }
 
-/// First rendered row associated with the logical line containing a source offset.
+/// First rendered row associated with the logical line that contains a source offset.
 pub fn rowAtSource(text: []const u8, options: *const SourceOptions) usize {
     var locator: RowAtSource = .{ .target = @min(options.source_offset, text.len) };
     walk(RowAtSource, &locator, text, @max(options.columns, 1)) catch unreachable;
     return locator.result;
 }
 
-/// Compose the markdown in `text` through `placement`. `tint` — set for
-/// reasoning — replaces every span's foreground and italicizes the whole block,
-/// so the structure still reads while the color stays uniformly muted.
+/// Compose the markdown in `text` through `placement`. `tint` (set for
+/// reasoning) replaces every span's foreground and italicizes the whole block.
+/// The structure still reads while the color stays uniformly muted.
 pub fn render(placement: *const paint.Placement, tint: ?color.Style, text: []const u8) !void {
     var painter: Painter = .{ .placement = placement, .tint = tint, .line = placement.base };
     try walk(Painter, &painter, text, @max(placement.columns, 1));
@@ -142,8 +142,8 @@ const RowAtSource = struct {
     }
 };
 
-/// Paints rows for `render`, dropping those in the clipped top the way
-/// `paint.framedRow` does: the row is never opened, only counted past.
+/// Paints rows for `render`. It drops rows in the clipped top the way
+/// `paint.framedRow` does: it never opens the row, only counts past it.
 const Painter = struct {
     placement: *const paint.Placement,
     tint: ?color.Style,
@@ -207,8 +207,8 @@ const Fence = struct {
     }
 };
 
-/// Emit `text` one physical row at a time. Every row break is decided here and
-/// the emitter merely follows, so the count and the paint cannot diverge.
+/// Emit `text` one physical row at a time. This function decides every row break
+/// and the emitter merely follows, so the count and the paint cannot diverge.
 fn walk(comptime Emitter: type, emitter: *Emitter, text: []const u8, columns: usize) !void {
     var lines = std.mem.splitScalar(u8, text, '\n');
     var maybe_fence: ?Fence = null;
@@ -236,7 +236,7 @@ fn walk(comptime Emitter: type, emitter: *Emitter, text: []const u8, columns: us
             const cells = rule_cells[0 .. rule_cell.len * @min(columns, rule_columns)];
             try plainRow(Emitter, emitter, columns, "", muted_look, cells);
         } else if (headingLevel(rest)) |level| {
-            // H1 and H2 shed their marker; deeper ones keep it, as pi does.
+            // H1 and H2 shed their marker. Deeper headings keep it, as pi does.
             const body = if (level > 2) rest else std.mem.trimStart(u8, rest[level..], " ");
             var flow = Flow(Emitter).init(emitter, columns, .{});
             try inlines(Emitter, &flow, .{
@@ -265,7 +265,7 @@ fn walk(comptime Emitter: type, emitter: *Emitter, text: []const u8, columns: us
             try inlines(Emitter, &flow, quote_look, body);
             try flow.finish();
         } else if (listMarker(rest)) |marker| {
-            // Sources nest a list two spaces a level; pi indents four.
+            // Sources nest a list two spaces a level. Pi indents four.
             const depth: usize = @min(@divFloor(leading(line), 2), 4);
             var flow = Flow(Emitter).init(emitter, columns, .{
                 .indent = blank(depth * 4),
@@ -280,7 +280,7 @@ fn walk(comptime Emitter: type, emitter: *Emitter, text: []const u8, columns: us
             try inlines(Emitter, &flow, .{}, body);
             try flow.finish();
         } else {
-            // A paragraph keeps its own indentation; only markers are stripped.
+            // A paragraph keeps its own indentation. The walk strips only markers.
             var flow = Flow(Emitter).init(emitter, columns, .{});
             try inlines(Emitter, &flow, .{}, line);
             try flow.finish();
@@ -289,8 +289,8 @@ fn walk(comptime Emitter: type, emitter: *Emitter, text: []const u8, columns: us
 }
 
 /// The prefix every physical row of one logical line carries: `indent` blank
-/// columns, then `marker` — drawn on the first row, on every row for a
-/// blockquote's border (`repeat`), and replaced by blanks under a list bullet.
+/// columns, then `marker`. The marker draws on the first row, and on every row
+/// for a blockquote's border (`repeat`). Blanks replace it under a list bullet.
 const Prefix = struct {
     indent: []const u8 = "",
     marker: []const u8 = "",
@@ -300,12 +300,12 @@ const Prefix = struct {
 
 /// Streams one logical line's spans into physical rows: opens a row with the
 /// prefix, fills the width left over, and reopens on the next row when a span
-/// runs past it, carrying its style along.
+/// runs past it. The span keeps its style across the break.
 fn Flow(comptime Emitter: type) type {
     return struct {
         emitter: *Emitter,
-        /// The prefix as it is actually drawn — cut to `prefixRoom` up front, so
-        /// the columns the body budget gives up are columns the sink shows.
+        /// The prefix as drawn, cut to `prefixRoom` up front. The columns the
+        /// body budget gives up are columns the sink shows.
         prefix: Prefix,
         budget: usize,
         used: usize = 0,
@@ -317,8 +317,8 @@ fn Flow(comptime Emitter: type) type {
             shown.marker = terminal.width.truncate(prefix.marker, prefixRoom(columns));
             const left = prefixRoom(columns) -| terminal.width.ofText(shown.marker);
             shown.indent = terminal.width.truncate(prefix.indent, left);
-            // A prefix that still outgrew the window would leave no budget and
-            // stall the wrap; one column always carries the row forward.
+            // A prefix that still outgrows the window leaves no budget and
+            // stalls the wrap. One column always carries the row forward.
             return .{
                 .emitter = emitter,
                 .prefix = shown,
@@ -326,9 +326,9 @@ fn Flow(comptime Emitter: type) type {
             };
         }
 
-        /// Place `bytes` under `look`, continuing on the next row when the width
-        /// runs out. `truncate` always yields at least one cluster against a
-        /// budget of one, so a row can never fail to advance.
+        /// Place `bytes` under `look` and continue on the next row when the
+        /// width runs out. `truncate` always yields at least one cluster against
+        /// a budget of one, so a row can never fail to advance.
         fn write(self: *@This(), look: Look, bytes: []const u8) !void {
             var rest = bytes;
             while (true) {
@@ -338,7 +338,7 @@ fn Flow(comptime Emitter: type) type {
                 const shown_columns = terminal.width.ofText(shown);
                 // Saturating: a cluster wider than `room` survives `truncate` as
                 // a one-column replacement. Give it the next row whole first, as
-                // the plain wrap does, and settle for the replacement only once a
+                // the plain wrap does. Settle for the replacement only when a
                 // row of its own is still too narrow.
                 if (shown_columns > room and self.used > 0) {
                     self.closeRow();
@@ -354,7 +354,7 @@ fn Flow(comptime Emitter: type) type {
             }
         }
 
-        /// Close the last row; a line with no content still occupies one.
+        /// Close the last row. A line with no content still occupies one.
         fn finish(self: *@This()) !void {
             try self.openRow();
             self.closeRow();
@@ -381,10 +381,10 @@ fn Flow(comptime Emitter: type) type {
     };
 }
 
-/// Columns a row's prefix may take: never more than half of them, so the body it
+/// Columns a row's prefix can take: never more than half of them, so the body it
 /// pushes right keeps room the sink will actually show. Uncapped, a marker or
-/// border as wide as a narrow window would swallow the text behind it — the
-/// source would advance while the sink clipped every byte of it.
+/// border as wide as a narrow window swallows the text behind it. The source
+/// advances while the sink clips every byte of it.
 fn prefixRoom(columns: usize) usize {
     return columns -| @max(@divFloor(columns, 2), 1);
 }
@@ -423,12 +423,12 @@ const marks = [_]struct { mark: []const u8, look: Look }{
     .{ .mark = "_", .look = .{ .italic = true } },
 };
 
-/// A memoized forward scan for one closing byte. Openers are visited in source
-/// order, so the closer found for one still answers the next, and a scan that
-/// found nothing can never succeed later. Without the memo a line of unmatched
-/// `[` rescans its tail once per bracket, and a long one costs quadratic time
-/// every frame. Only a link needs this: a marker that closes on the bytes it
-/// opens with runs out of openers as soon as one scan fails.
+/// A memoized forward scan for one closing byte. The scan visits openers in
+/// source order, so the closer found for one still answers the next. A scan
+/// that found nothing can never succeed later. Without the memo a line of
+/// unmatched `[` rescans its tail once per bracket, and a long line costs
+/// quadratic time every frame. Only a link needs this: a marker that closes on
+/// the bytes it opens with runs out of openers as soon as one scan fails.
 const Closer = struct {
     byte: u8,
     at: ?usize = null,
@@ -444,11 +444,11 @@ const Closer = struct {
     }
 };
 
-/// The two closers a `[label](url)` is scanned for, memoized across one line.
+/// The two closers a `[label](url)` scan needs, memoized across one line.
 const Link = struct { label: Closer = .{ .byte = ']' }, url: Closer = .{ .byte = ')' } };
 
-/// Place `text`'s inline runs into `flow` under `base`, slicing the markers away.
-/// A marker whose closer has not streamed in yet stays literal.
+/// Place `text`'s inline runs into `flow` under `base` and slice the markers
+/// away. A marker whose closer has not streamed in yet stays literal.
 fn inlines(comptime Emitter: type, flow: *Flow(Emitter), base: Look, text: []const u8) !void {
     var start: usize = 0;
     var index: usize = 0;
@@ -456,7 +456,7 @@ fn inlines(comptime Emitter: type, flow: *Flow(Emitter), base: Look, text: []con
     while (index < text.len) : (index += 1) {
         const run = runAt(text, index, &link) orelse {
             // A doubled marker with no closer stays literal whole: its second
-            // byte must not reopen as a single one and split `**bold` into a
+            // byte must not reopen as a single marker and split `**bold` into a
             // stray asterisk and an italic run mid-stream.
             if (doubled(text, index)) index += 1;
             continue;
@@ -475,7 +475,7 @@ fn inlines(comptime Emitter: type, flow: *Flow(Emitter), base: Look, text: []con
     try flow.write(base, text[start..]);
 }
 
-/// The inline run opening at `index`, or null when none does.
+/// The inline run that opens at `index`, or null when none does.
 fn runAt(text: []const u8, index: usize, link: *Link) ?Run {
     const rest = text[index..];
     if (rest[0] == '`') {
@@ -501,8 +501,8 @@ fn runAt(text: []const u8, index: usize, link: *Link) ?Run {
     return null;
 }
 
-/// A doubled marker opening at `index`, whose second byte must not be re-read as
-/// a single-byte opener.
+/// A doubled marker that opens at `index`. The scan must not re-read its second
+/// byte as a single-byte opener.
 fn doubled(text: []const u8, index: usize) bool {
     for (marks) |entry| {
         if (entry.mark.len == 2 and std.mem.startsWith(u8, text[index..], entry.mark)) return true;
@@ -520,13 +520,13 @@ fn linkAt(text: []const u8, index: usize, link: *Link) ?Run {
     return .{
         .look = link_look,
         .content = if (label.len > 0) label else url,
-        // The URL is worth appending only when the label is not already it.
+        // Append the URL only when the label is not already the URL.
         .url = if (label.len == 0 or std.mem.eql(u8, label, url)) "" else url,
         .end = end + 1,
     };
 }
 
-/// An element style over its context: the inner foreground wins, attributes add up.
+/// An element style over its context: the inner foreground wins and attributes add up.
 fn merged(base: Look, over: Look) Look {
     return .{
         .foreground = over.foreground orelse base.foreground,
@@ -538,8 +538,8 @@ fn merged(base: Look, over: Look) Look {
 }
 
 /// The list marker at the head of `rest`: the bytes it spans in the source and
-/// what to draw — a normalized `- ` for a bullet, the source digits for an
-/// ordered item, so a list numbered from anything but one keeps its numbering.
+/// what to draw. A bullet draws a normalized `- `. An ordered item draws the
+/// source digits, so a list numbered from anything but one keeps its numbering.
 const Marker = struct { source: usize, shown: []const u8 };
 
 fn listMarker(rest: []const u8) ?Marker {
@@ -557,7 +557,7 @@ fn listMarker(rest: []const u8) ?Marker {
     return .{ .source = source, .shown = rest[0..source] };
 }
 
-/// The `[ ] ` or `[x] ` checkbox opening a task item's body.
+/// The `[ ] ` or `[x] ` checkbox that opens a task item's body.
 fn taskBox(body: []const u8) ?[]const u8 {
     if (body.len < 3 or body[0] != '[' or body[2] != ']') return null;
     if (body[1] != ' ' and body[1] != 'x' and body[1] != 'X') return null;
@@ -602,8 +602,8 @@ fn blank(count: usize) []const u8 {
     return blanks[0..@min(count, blanks.len)];
 }
 
-// Every element of the supported subset, ending on a heading no newline has
-// followed yet — what a stream shows the instant the model writes one.
+// Every element of the supported subset. It ends on a heading no newline has
+// followed yet: what a stream shows the instant the model writes one.
 const sample =
     \\# Heading one
     \\Plain **bold**, *italic*, ~~struck~~, and `inline code` in a paragraph that
@@ -660,8 +660,9 @@ const indented_fences =
     \\    ```
 ;
 
-// Rows `text` paints into a fresh view, dropping its top `skip`; the caller owns
-// the returned bytes. Fresh so the paint is a full reprint whose rows count.
+// Rows `text` paints into a fresh view. The paint drops its top `skip`. The
+// caller owns the returned bytes. Fresh so the paint is a full reprint whose
+// rows count.
 fn painted(
     gpa: std.mem.Allocator,
     text: []const u8,
@@ -727,8 +728,8 @@ fn frameBody(bytes: []const u8) []const u8 {
 }
 
 // The parity contract: what `rows` counts is exactly what `render` emits, at
-// widths down to one column — where a list marker or a quote border alone
-// already fills the row.
+// widths down to one column. At one column a list marker or a quote border
+// alone already fills the row.
 test "markdown renders exactly the rows it counts" {
     const gpa = std.testing.allocator;
     for ([_][]const u8{
@@ -842,16 +843,16 @@ test "markdown paints each element in its own style" {
     const bytes = try painted(gpa, sample, 72, null, 0);
     defer gpa.free(bytes);
 
-    // H1 is a bold, underlined heading color with its marker gone; H3 keeps it.
+    // H1 is a bold, underlined heading color with its marker gone. H3 keeps it.
     try std.testing.expect(std.mem.indexOf(u8, bytes, "\x1b[38;2;240;198;116m\x1b[1m\x1b[4m") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "Heading one") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "# Heading one") == null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "### Heading three") != null);
-    // A heading's emphasis is a span of its own — the sink's boundary marks the
-    // split — and the heading's own look still carries it.
+    // A heading's emphasis is a span of its own, and the heading's own look
+    // still carries it. The sink's boundary marks the split.
     const emphasis = "\x1b[38;2;240;198;116m\x1b[1m\u{200b}two";
     try std.testing.expect(std.mem.indexOf(u8, bytes, emphasis) != null);
-    // Code keeps its two-space indent and its own color; the fence stays muted.
+    // Code keeps its two-space indent and its own color. The fence stays muted.
     try std.testing.expect(std.mem.indexOf(u8, bytes, "\x1b[38;2;181;189;104m") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "  \x1b[38;2;181;189;104m") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "const answer = 42;") != null);
@@ -863,11 +864,11 @@ test "markdown paints each element in its own style" {
     // An ordered list keeps the number it started from, and a task its box.
     try std.testing.expect(std.mem.indexOf(u8, bytes, "3. ") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "[ ] ") != null);
-    // A link is underlined in blue and appends the URL its label hides.
+    // A link renders underlined in blue and appends the URL its label hides.
     try std.testing.expect(std.mem.indexOf(u8, bytes, "\x1b[38;2;129;162;190m\x1b[4m") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "https://example.com") != null);
-    // Inline markers are sliced away — in a heading as much as a paragraph —
-    // while `_` inside a word is not emphasis at all.
+    // The render slices inline markers away, in a heading as much as a
+    // paragraph. A `_` inside a word is not emphasis at all.
     const literal = [_][]const u8{ "**", "~~", "*italic*", "`inline code`", "[labelled]" };
     for (literal) |mark| try std.testing.expect(std.mem.indexOf(u8, bytes, mark) == null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "\x1b[1m\u{200b}bold") != null);
@@ -875,8 +876,8 @@ test "markdown paints each element in its own style" {
 }
 
 // A prefix never crowds the body out of the row: at two columns a bullet and a
-// quote border give a column back, so the text still shows instead of the
-// source advancing behind a sink that clips every byte of it.
+// quote border give a column back, so the text still shows. The source does not
+// advance behind a sink that clips every byte of it.
 test "a prefix leaves room for the body it pushes right" {
     const gpa = std.testing.allocator;
     for ([_][]const u8{ "- abc", "> abc", "    - abc" }) |text| {
@@ -894,7 +895,7 @@ test "a prefix leaves room for the body it pushes right" {
 
 // A wide cluster that will not fit the columns left takes the next row whole,
 // as the plain wrap does, rather than the one-column replacement a fitted write
-// would leave in its place.
+// leaves in its place.
 test "a styled wide glyph wraps rather than degrading" {
     const gpa = std.testing.allocator;
     const bytes = try painted(gpa, "abc**你**", 4, null, 0);
@@ -916,12 +917,12 @@ test "an unclosed bold marker stays literal" {
     try std.testing.expect(std.mem.indexOf(u8, bytes, "\x1b[3m") == null);
 }
 
-// Adversarial: every `[` scans for a closer, so unmatched brackets once rescanned
-// the tail one time each — quadratic in both passes, on every frame. The memo is
-// what makes the scan linear, so pin it directly: a second call is answered from
-// the memo even when the text it is handed would say otherwise. The long line
-// then renders as a canary — a rescan turns this test from milliseconds to
-// minutes.
+// Adversarial: every `[` scans for a closer, so unmatched brackets once
+// rescanned the tail one time each. That was quadratic in both passes, on every
+// frame. The memo is what makes the scan linear, so pin it directly: a second
+// call answers from the memo even when the text it receives says otherwise. The
+// long line then renders as a canary. A rescan turns this test from
+// milliseconds to minutes.
 test "a line of unmatched brackets scans its tail once" {
     var missing: Closer = .{ .byte = ']' };
     try std.testing.expect(missing.find("[[[", 1) == null);
@@ -958,13 +959,13 @@ test "a tinted block renders grey and italic throughout" {
     try std.testing.expect(std.mem.indexOf(u8, bytes, "- ") != null);
 }
 
-// Parity again, over markers stitched together at random — the half-formed
+// Parity again, over markers stitched together at random: the half-formed
 // shapes a stream produces that a fixture never thinks to spell out. A row the
 // count did not predict trips the sink's own assertions, so this pins the
 // renderer against the input it cannot enumerate.
 test "markdown holds row parity over arbitrary marker soup" {
     const gpa = std.testing.allocator;
-    // Block markers, inline markers, and the text they wrap; the clusters wider
+    // Block markers, inline markers, and the text they wrap. The clusters wider
     // than one column are what a width budget has to saturate against.
     const tokens = [_][]const u8{
         "#",   "##",     "###### ", "- ",   "* ", "1. ", "12) ", ">",           ">> ", "---",
@@ -989,7 +990,7 @@ test "markdown holds row parity over arbitrary marker soup" {
     }
 }
 
-// The clip drops its top `skip` rows without materializing them.
+// The clip drops its top `skip` rows and never materializes them.
 test "a clipped markdown block shows its bottom rows" {
     const gpa = std.testing.allocator;
     const columns = 40;

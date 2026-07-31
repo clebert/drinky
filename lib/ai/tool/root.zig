@@ -1,5 +1,5 @@
-//! The tools the model may call: each module exposes a `spec` and a `run`;
-//! the registry pairs them.
+//! The tools the model can call. Each module exposes a `spec` and a `run`.
+//! The registry pairs them.
 
 const std = @import("std");
 
@@ -30,14 +30,14 @@ const registry = [_]Entry{
     .{ .tool = bash.spec, .run = bash.run, .mutates = true },
 };
 
-/// The schemas of every tool, for advertising to the provider in a request.
+/// The schemas of every tool, advertised to the provider in a request.
 pub const specs = blk: {
     var list: [registry.len]llm.Tool = undefined;
     for (registry, 0..) |entry, index| list[index] = entry.tool;
     break :blk list;
 };
 
-/// Whether tool `name` may have side effects, so the agent runs it as a barrier.
+/// Whether tool `name` can have side effects, so the agent runs it as a barrier.
 /// An unknown tool touches nothing, so it runs concurrently and just reports
 /// the unknown-tool error.
 pub fn mutates(name: []const u8) bool {
@@ -47,8 +47,8 @@ pub fn mutates(name: []const u8) bool {
     return false;
 }
 
-/// Execute tool `name` with `input_json`. Caller owns the result and frees it
-/// with `Result.deinit`.
+/// Execute tool `name` with `input_json`. The caller owns the result and frees
+/// it with `Result.deinit`.
 pub fn run(context: *const Context, name: []const u8, input_json: []const u8) !Result {
     for (registry) |entry| {
         if (!std.mem.eql(u8, name, entry.tool.name)) continue;
@@ -56,13 +56,18 @@ pub fn run(context: *const Context, name: []const u8, input_json: []const u8) !R
             error.InvalidArguments => try Result.report(
                 context.gpa,
                 .err,
-                "invalid arguments for {s}",
+                "Pith received invalid arguments for the {s} tool.",
                 .{name},
             ),
             else => return err,
         };
     }
-    return Result.report(context.gpa, .err, "unknown tool: {s}", .{name});
+    return Result.report(
+        context.gpa,
+        .err,
+        "Pith does not recognize the tool {s}.",
+        .{name},
+    );
 }
 
 test "mutating tools are marked, read-only tools are not" {

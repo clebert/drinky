@@ -1,8 +1,9 @@
-//! The transcript-block model. `Entry` is a tagged union carrying exactly each
-//! block's data: the plain blocks a byte buffer, the flagged ones a buffer plus
-//! an error flag. It owns its bytes (`init`/`deinit`), measures itself (`rows`),
-//! and paints itself (`render`) with the shared `paint` primitives. The model
-//! block grows in place as its reply streams, its markdown rendered as it goes.
+//! The transcript-block model. `Entry` is a tagged union that carries exactly
+//! each block's data: the plain blocks a byte buffer, the flagged ones a buffer
+//! plus an error flag. It owns its bytes (`init`/`deinit`), measures itself
+//! (`rows`), and paints itself (`render`) with the shared `paint` primitives.
+//! The model block grows in place as its reply streams, and its markdown
+//! renders as it goes.
 
 const std = @import("std");
 
@@ -18,20 +19,20 @@ pub const Entry = union(enum) {
     thinking: std.ArrayList(u8),
     model: std.ArrayList(u8),
     tool_result: Flagged,
-    feedback: Flagged,
+    event: Flagged,
 
     pub const Flagged = struct { text: std.ArrayList(u8), is_error: bool };
     pub const Kind = std.meta.Tag(Entry);
 
-    /// A new block owning a copy of `text`; `is_error` is ignored by the plain
-    /// variants.
+    /// A new block that owns a copy of `text`. The plain variants ignore
+    /// `is_error`.
     pub fn init(gpa: std.mem.Allocator, kind: Kind, is_error: bool, text: []const u8) !Entry {
         var list: std.ArrayList(u8) = .empty;
         errdefer list.deinit(gpa);
         try list.appendSlice(gpa, text);
         return switch (kind) {
             .tool_result => .{ .tool_result = .{ .text = list, .is_error = is_error } },
-            .feedback => .{ .feedback = .{ .text = list, .is_error = is_error } },
+            .event => .{ .event = .{ .text = list, .is_error = is_error } },
             inline else => |tag| @unionInit(Entry, @tagName(tag), list),
         };
     }
@@ -39,24 +40,24 @@ pub const Entry = union(enum) {
     pub fn deinit(self: *Entry, gpa: std.mem.Allocator) void {
         switch (self.*) {
             .intro, .user, .skill, .thinking, .model => |*text| text.deinit(gpa),
-            .tool_result, .feedback => |*flagged| flagged.text.deinit(gpa),
+            .tool_result, .event => |*flagged| flagged.text.deinit(gpa),
         }
     }
 
     /// The physical rows this block wraps to at `columns`, its leading separator
-    /// excluded. Must equal exactly what `render` emits — the parity the diff
+    /// excluded. Must equal exactly what `render` emits: the parity the diff
     /// and window math rely on.
     pub fn rows(self: *const Entry, columns: usize) usize {
         return switch (self.*) {
             .intro, .skill => |text| std.mem.count(u8, text.items, "\n") + 1,
-            .feedback => |flagged| std.mem.count(u8, flagged.text.items, "\n") + 1,
+            .event => |flagged| std.mem.count(u8, flagged.text.items, "\n") + 1,
             .user => |text| paint.boxRows(text.items, columns),
             .tool_result => |flagged| paint.boxRows(flagged.text.items, columns),
             .thinking, .model => |text| markdown.rows(text.items, columns),
         };
     }
 
-    /// Compose this block's rows through `placement`, dropping its top `skip`
+    /// Compose this block's rows through `placement` and drop its top `skip`
     /// rows (nonzero only for the clip).
     pub fn render(self: *const Entry, placement: *const paint.Placement) !void {
         switch (self.*) {
@@ -64,9 +65,9 @@ pub const Entry = union(enum) {
                 .style = .dim,
                 .prefix = "",
             }, text.items),
-            .feedback => |flagged| try paint.notice(placement, &.{
+            .event => |flagged| try paint.notice(placement, &.{
                 .style = if (flagged.is_error) .red else .dim,
-                .prefix = if (flagged.is_error) "error: " else "",
+                .prefix = if (flagged.is_error) "Error: " else "",
             }, flagged.text.items),
             .user => |text| try paint.box(placement, &.{
                 .background = .user_background,
@@ -74,7 +75,7 @@ pub const Entry = union(enum) {
             }, text.items),
             .skill => |text| try paint.notice(placement, &.{
                 .style = .accent_foreground,
-                .prefix = "[skill] ",
+                .prefix = "Skill: ",
             }, text.items),
             .tool_result => |flagged| try paint.box(placement, &.{
                 .background = if (flagged.is_error)
@@ -108,8 +109,8 @@ pub fn numberedLines(gpa: std.mem.Allocator, count: usize) !std.ArrayList(u8) {
     return text;
 }
 
-// A reply carrying the markdown shapes that reflow — a heading, a fenced block,
-// a nested list, a quote, and inline emphasis.
+// A reply that carries the markdown shapes that reflow: a heading, a fenced
+// block, a nested list, a quote, and inline emphasis.
 const markdown_reply =
     \\## Findings
     \\- one bullet with words enough to wrap
@@ -124,9 +125,9 @@ const markdown_reply =
     \\That is **it**.
 ;
 
-// Rows `entry` paints into a fresh view, dropping its top `skip`. Fresh so the
-// paint is a full reprint whose rows `paintedRows` can count. The window is tall
-// enough that only `skip` clips.
+// Rows `entry` paints into a fresh view. The paint drops its top `skip`. Fresh
+// so the paint is a full reprint whose rows `paintedRows` can count. The window
+// is tall enough that only `skip` clips.
 fn renderedRows(gpa: std.mem.Allocator, entry: *const Entry, columns: usize, skip: usize) !usize {
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
@@ -146,8 +147,8 @@ test "each entry variant renders exactly the rows it counts" {
     const gpa = std.testing.allocator;
     const cases = [_]struct { kind: Entry.Kind, is_error: bool, text: []const u8 }{
         .{ .kind = .intro, .is_error = false, .text = "a single intro line" },
-        .{ .kind = .feedback, .is_error = false, .text = "first\nsecond\nthird" },
-        .{ .kind = .feedback, .is_error = true, .text = "boom" },
+        .{ .kind = .event, .is_error = false, .text = "first\nsecond\nthird" },
+        .{ .kind = .event, .is_error = true, .text = "boom" },
         .{ .kind = .user, .is_error = false, .text = "a user message long enough to wrap " ++
             "across the narrow test width more than once" },
         .{ .kind = .skill, .is_error = false, .text = "zig-style" },
@@ -190,7 +191,7 @@ test "a skill entry renders as one compact loaded marker" {
 
     try std.testing.expectEqual(@as(usize, 1), entry.rows(40));
     try std.testing.expect(
-        std.mem.indexOf(u8, out.written(), "[skill] \u{200B}zig-style") != null,
+        std.mem.indexOf(u8, out.written(), "Skill: \u{200B}zig-style") != null,
     );
 }
 
@@ -205,17 +206,17 @@ test "a clipped block shows its bottom rows" {
     try std.testing.expectEqual(@as(usize, 15), try renderedRows(gpa, &entry, columns, 25));
 }
 
-// An error feedback must be visibly distinct: the red style and an "error: "
-// prefix, both absent from plain feedback.
-test "an error feedback paints the red style and error prefix" {
+// An error event must be visibly distinct: the red style and an "Error: "
+// prefix, both absent from an informational event.
+test "an error event paints the red style and error prefix" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
     var view = terminal.View.init(gpa, &out.writer);
     defer view.deinit();
-    var failure = try Entry.init(gpa, .feedback, true, "boom");
+    var failure = try Entry.init(gpa, .event, true, "boom");
     defer failure.deinit(gpa);
-    var success = try Entry.init(gpa, .feedback, false, "all good");
+    var success = try Entry.init(gpa, .event, false, "all good");
     defer success.deinit(gpa);
 
     const sink = try view.beginFrame(.{ .columns = 40, .rows = 100 }, 8);
@@ -224,14 +225,14 @@ test "an error feedback paints the red style and error prefix" {
     try view.render();
 
     const painted = out.written();
-    try std.testing.expect(std.mem.indexOf(u8, painted, "\x1b[31merror: ") != null);
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, painted, "error: "));
+    try std.testing.expect(std.mem.indexOf(u8, painted, "\x1b[31mError: ") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, painted, "Error: "));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, painted, "\x1b[31m"));
 }
 
 // Bounded memory: a clipped block composes only its visible rows into a frame
-// warmed to the block's full size, so the smaller clip reuses the warmed buffers
-// without allocating and never materializes its hidden top. The visible rows
+// warmed to the block's full size. The smaller clip reuses the warmed buffers
+// with no allocation and never materializes its hidden top. The visible rows
 // carry markdown, so the renderer's own paths run under the armed allocator too.
 test "a clipped block streams into a warmed frame without allocating" {
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
@@ -257,8 +258,8 @@ test "a clipped block streams into a warmed frame without allocating" {
         try entry.render(&placement);
         try view.render();
     }
-    // Drop the accumulated output so the arm measures only the clipped render,
-    // whose bytes fit the buffer the full-size warm already grew.
+    // Drop the accumulated output so the arm measures only the clipped render.
+    // Its bytes fit the buffer the full-size warm already grew.
     out.clearRetainingCapacity();
 
     // Arm: any further allocation or growth now fails.
@@ -271,7 +272,7 @@ test "a clipped block streams into a warmed frame without allocating" {
     try entry.render(&placement);
     try view.render();
 
-    // Only the visible rows are emitted; the clipped top is never materialized.
+    // The paint emits only the visible rows. The clipped top never materializes.
     const painted = out.written();
     try std.testing.expect(std.mem.indexOf(u8, painted, "L30") != null);
     try std.testing.expect(std.mem.indexOf(u8, painted, "L59") != null);

@@ -1,42 +1,42 @@
 # Rendering Model
 
-How an inline terminal interface projects a larger, durable application state onto a bounded window.
-This defines what the renderer must do and the guarantees it makes; it prescribes no data structures
-or algorithms.
+This document describes how an inline terminal interface projects a larger, durable application
+state onto a bounded window. It defines what the renderer must do and the guarantees it makes. It
+prescribes no data structures or algorithms.
 
 ## Model and view
 
 State is split into two layers.
 
 - The **model** is the durable source of truth: the full content history and all components. It
-  changes only in response to application events and is never mutated by rendering.
-- The **view** projects the model onto the terminal. It holds no authoritative state — only what is
-  needed to draw a frame and to diff it against the previous one.
+  changes only in response to application events. Rendering never mutates it.
+- The **view** projects the model onto the terminal. It holds no authoritative state. It holds only
+  what is needed to draw a frame and to diff it against the previous one.
 
-A **component** is a stateful element with its own lifecycle, and may represent ongoing work that
+A **component** is a stateful element with its own lifecycle. It can represent ongoing work that
 completes asynchronously. A component's existence and progress belong to the model, not the view.
-Whether a component is currently drawn has no bearing on whether it is alive: content outside the
-drawn region keeps running and keeps updating its state.
+Whether a component is currently drawn has no bearing on whether it is alive. Content outside the
+drawn region still runs and still updates its state.
 
 ## The window
 
 The view maintains a bounded **window**: the most recent content, sized in **pages**, where one page
 is the current terminal height. The window is the renderer's working set — what it tracks and can
 redraw — so it bounds repaint cost and memory however far the content grows. Only the window's last
-page occupies the viewport; its earlier pages sit above it, in the terminal's scrollback. The
-window's page count is configurable and may change on request; a terminal resize instead redefines
-the page, changing the window's height in rows.
+page occupies the viewport. Its earlier pages sit above it, in the terminal's scrollback. The
+window's page count is configurable and can change on request. A terminal resize instead redefines
+the page, which changes the window's height in rows.
 
-The window bounds what the renderer redraws, not how far the terminal can scroll: content that
-scrolls out is left in the terminal's own scrollback rather than erased, so reachable history is at
-least the window and may be more. A reset trims it back to the window; as long as nothing forces one
-— no change outside the viewport, no resize, no change to its page count — scrollback grows as far
-as the terminal allows.
+The window bounds what the renderer redraws, not how far the terminal can scroll. Content that
+scrolls out is left in the terminal's own scrollback rather than erased. Reachable history is
+therefore at least the window and can be more. A reset trims it back to the window. A change
+outside the viewport, a resize, or a change to the window's page count forces a reset. Until a
+reset occurs, scrollback grows as far as the terminal allows.
 
 Rendering is **inline**: the window is drawn into the terminal's normal buffer, and the terminal
 scrolls through the drawn content. The view is always anchored to the newest content and keeps no
 scroll position of its own. Because of that anchoring, any repaint returns the terminal to the
-newest content: a user who has scrolled up is snapped back the next time the interface updates,
+newest content. A user who has scrolled up is snapped back the next time the interface updates,
 wherever the change occurred.
 
 Projection from model to window is a pure function of the model, the terminal dimensions, and the
@@ -47,50 +47,50 @@ at any time without side effects.
 
 Given a new window, the renderer applies the smallest correct update.
 
-- **Incremental** — when every changed line is within the viewport, appending new content being the
-  common case: reposition there and reprint from the first changed line down.
-- **Reset** — when any changed line falls above the viewport, or the terminal or the window's page
-  count changed: clear the terminal, including its scrollback, and reprint the whole window.
+- **Incremental**: when every changed line is within the viewport. Appended new content is the
+  common case. Reposition to the first changed line and reprint from there down.
+- **Reset**: when any changed line falls above the viewport, or the terminal or the window's page
+  count changed. Clear the terminal, including its scrollback, and reprint the whole window.
 
 Every repaint is emitted atomically, so no partial frame is ever visible. Layout is display-width
-aware: a glyph may occupy more than one column, a line wider than the terminal wraps onto several
-physical rows, and all cursor motion is counted in physical rows so wrapping never desynchronizes
-the cursor.
+aware. A glyph can occupy more than one column. A line wider than the terminal wraps onto several
+physical rows. All cursor motion is counted in physical rows, so wrapping never desynchronizes the
+cursor.
 
-The interface may hold one active text-input caret. After every repaint the hardware cursor is
-restored to that caret, so typing is unaffected by updates elsewhere on screen; when no input is
+The interface can hold one active text-input caret. After every repaint the hardware cursor is
+restored to that caret, so typing is unaffected by updates elsewhere on screen. When no input is
 focused, the cursor is hidden.
 
 ## Frames
 
-The view repaints on a **tick**: a frame produced on demand, rate-limited to a target frame rate. An
-event schedules the next tick; every event arriving before it fires coalesces into that one frame;
-when no event occurs, no tick fires and the renderer stays idle. Keyboard input is one such event,
-so the frame rate is also the input echo rate: the delay between a keystroke and its character
-appearing is at most one frame interval, and the rate must be high enough that typing stays fluid
-even under sustained fast input. Animation is no exception: a self-animating element schedules its
-own periodic events, each rendered through the same path and active only while it animates — so even
-animation leaves an idle interface inert.
+The view repaints on a **tick**: a frame produced on demand, rate-limited to a target frame rate.
+An event schedules the next tick. Every event that arrives before it fires coalesces into that one
+frame. When no event occurs, no tick fires and the renderer stays idle. Keyboard input is one such
+event, so the frame rate is also the input echo rate. The delay between a keystroke and its echoed
+character is at most one frame interval. The rate must be high enough that typing stays fluid even
+under sustained fast input. Animation is no exception. A self-animating element schedules its own
+periodic events, each rendered through the same path and active only while it animates. Even
+animation therefore leaves an idle interface inert.
 
 ## Working memory
 
-The view's working memory — the buffers it composes and diffs frames in — is bounded to the window
-and reused across frames rather than rebuilt each time. It grows only to fit: a terminal resize, a
-change to the window's page count, or the largest frame it has had to lay out. It is not released
-between frames, so a steady interface settles at a bounded footprint that does not grow with the
-model.
+The view's working memory consists of the buffers where it composes and diffs frames. It is bounded
+to the window and reused across frames rather than rebuilt each time. It grows only to fit: a
+terminal resize, a change to the window's page count, or the largest frame it has had to lay out. It
+is not released between frames, so a steady interface settles at a bounded footprint that does not
+grow with the model.
 
 ## Invariants
 
 - Rendering never mutates the model.
 - Projection from model to window is pure and can be recomputed at any time.
 - A component's lifecycle is independent of whether it is drawn.
-- The renderer's working set is bounded to the window; repaint cost and memory are bounded
+- The renderer's working set is bounded to the window. Repaint cost and memory are bounded
   regardless of model size.
 - The view is always anchored to the newest content and holds no scroll position of its own.
 - The view's working memory is reused across frames rather than rebuilt each time.
-- Frames are rate-limited, event-driven, and coalesced; an idle interface is inert, and input echoes
+- Frames are rate-limited, event-driven, and coalesced. An idle interface is inert. Input echoes
   within one frame interval.
-- No partial frame is ever visible, and wrapping never desynchronizes the cursor.
-- After every repaint the cursor is restored to the active input caret, or hidden when none is
-  focused.
+- No partial frame is ever visible. Wrapping never desynchronizes the cursor.
+- After every repaint the cursor is restored to the active input caret. When no input is focused,
+  the cursor is hidden.

@@ -1,5 +1,6 @@
-//! `/effort`: picker over the reasoning-effort levels, preselecting the current
-//! one; selecting one switches it from the next turn. Any argument is ignored.
+//! `/effort`: a picker over the reasoning-effort levels. The picker preselects
+//! the current one. A selection switches the level from the next turn. The
+//! command ignores any argument.
 
 const std = @import("std");
 
@@ -21,7 +22,8 @@ pub fn run(context: *Context) !Context.Outcome {
     }
     return .{ .pick = .{
         .select = select,
-        .title = "Select reasoning effort",
+        .title = "Select an effort level",
+        .cancellation_message = "You canceled the effort selection.",
         .options = try options.toOwnedSlice(),
         .current = current,
     } };
@@ -29,10 +31,23 @@ pub fn run(context: *Context) !Context.Outcome {
 
 pub fn select(context: *Context, index: usize) !Context.Outcome {
     const gpa = context.gpa;
-    if (index >= levels.len) return Context.Outcome.report(gpa, .err, "invalid selection", .{});
+    if (index >= levels.len)
+        return Context.Outcome.reportNotice(gpa, .failure, "Select a valid effort level.", .{});
     const level = levels[index];
+    if (context.agent.effort == level)
+        return Context.Outcome.reportNotice(
+            gpa,
+            .information,
+            "The effort level is already {s}.",
+            .{@tagName(level)},
+        );
     context.agent.setEffort(level);
-    return Context.Outcome.report(gpa, .ok, "effort set to {s}", .{@tagName(level)});
+    return Context.Outcome.reportEvent(
+        gpa,
+        .information,
+        "Pith set the effort level to {s}.",
+        .{@tagName(level)},
+    );
 }
 
 test "the picker lists every level, preselecting the current one" {
@@ -62,10 +77,11 @@ test "select applies the level at a row index, rejecting out of range" {
     defer agent.deinit();
     var context: Context = .{ .gpa = gpa, .io = undefined, .agent = &agent, .accounts = undefined };
 
-    // Levels are declared none, low, medium, high, xhigh, max — index 4 is xhigh.
-    try Context.Outcome.expectFeedback(try select(&context, 4), .ok);
+    // The levels in declaration order: none, low, medium, high, xhigh, max. Index 4 is xhigh.
+    try Context.Outcome.expectEvent(try select(&context, 4), .information);
     try std.testing.expectEqual(llm.Effort.xhigh, agent.effort);
 
-    try Context.Outcome.expectFeedback(try select(&context, 99), .err);
+    try Context.Outcome.expectNotice(try select(&context, 4), .information);
+    try Context.Outcome.expectNotice(try select(&context, 99), .failure);
     try std.testing.expectEqual(llm.Effort.xhigh, agent.effort);
 }

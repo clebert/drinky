@@ -1,8 +1,8 @@
 //! Row painters: the primitives that stream one styled row at a time straight
-//! into the view's `Sink` through a `Placement`, dropping the clip's hidden top
-//! rows so a clipped component never materializes its whole body. Shared by the
-//! transcript `block`s and the chrome (the tool box, the input frame, the status
-//! line) alike.
+//! into the view's `Sink` through a `Placement`. They drop the clip's hidden top
+//! rows, so a clipped component never materializes its whole body. The
+//! transcript `block`s and the chrome (the tool box, the input frame, the
+//! status line) share them.
 
 const std = @import("std");
 
@@ -18,8 +18,8 @@ const activity_vertical_ticks: usize = 2;
 
 pub const BoxStyle = struct { background: color.Style, foreground: color.Style };
 
-/// A notice's look: the SGR style opening every line and a prefix (an error tag,
-/// or empty) printed before each line's text.
+/// A notice's look: the SGR style that opens every line and a prefix (an error
+/// tag, or empty) that prints before each line's text.
 const Notice = struct { style: color.Style, prefix: []const u8 };
 
 /// Where a component composes its rows: the sink to write into, the anchor `id`
@@ -42,7 +42,7 @@ pub fn boxRows(text: []const u8, columns: usize) usize {
 
 /// Width and inset of framed content. Normal windows get a side, a one-cell
 /// pad, content, another pad, and a side. Three- and four-column windows keep
-/// their sides but shed the pads; narrower windows fall back to open rows.
+/// their sides but shed the pads. Narrower windows fall back to open rows.
 pub const FrameGeometry = struct {
     content_columns: usize,
     content_offset: usize,
@@ -110,9 +110,9 @@ pub fn notice(placement: *const Placement, look: *const Notice, text: []const u8
         const line = placement.base + index;
         if (line < placement.skip) continue;
         const shown_prefix = terminal.width.truncate(look.prefix, placement.columns);
-        // Saturating: a cluster wider than the whole budget survives `truncate` as
-        // a one-column replacement but measures its true width here, so a prefix
-        // opening on one can report more columns than the row has.
+        // Saturating: a cluster wider than the whole budget survives `truncate`
+        // as a one-column replacement but measures its true width here. A prefix
+        // that opens on one can then report more columns than the row has.
         const available = placement.columns -| terminal.width.ofText(shown_prefix);
         const clipped = terminal.width.truncate(piece, available);
         placement.sink.begin();
@@ -126,7 +126,7 @@ pub fn notice(placement: *const Placement, look: *const Notice, text: []const u8
 
 /// A padded background box: a blank padding row, `text` wrapped to the inner
 /// width with a one-space left pad and the background filled to full width, then
-/// a blank padding row. Streamed a row at a time, self-separating inside the
+/// a blank padding row. It streams a row at a time and self-separates inside the
 /// block gap around it.
 pub fn box(placement: *const Placement, style: *const BoxStyle, text: []const u8) !void {
     var line = placement.base;
@@ -148,7 +148,7 @@ fn boxPad(placement: *const Placement, line: *usize, background: color.Style) !v
 }
 
 /// A box's content row: a one-space left pad, `content`, then the background
-/// filled to full width. `content` is capped to leave room for the pad, so a
+/// filled to full width. A cap on `content` leaves room for the pad, so a
 /// window too narrow for the wrap width still yields one physical row.
 fn boxLine(
     placement: *const Placement,
@@ -176,29 +176,30 @@ pub fn framedRows(body_rows: usize) usize {
     return frame_border_rows + body_rows;
 }
 
-/// The tallest a framed body may grow before it scrolls within its frame: about
-/// a quarter of the viewport, never fewer than five rows nor more than fifteen,
-/// so the live input stays usable without crowding out the transcript. Shared by
-/// the editor and the picker so both window to the same limit.
+/// The tallest a framed body can grow before it scrolls within its frame: about
+/// a quarter of the viewport, never fewer than five rows nor more than fifteen.
+/// The live input stays usable and does not crowd out the transcript. The
+/// editor and the picker share it, so both window to the same limit.
 pub fn bodyLimit(viewport_rows: usize) usize {
     return @min(@max(@divFloor(viewport_rows, 4) + 1, 5), 15);
 }
 
-/// A closed input area containing a window of `body`'s wrapped rows. While
+/// A closed input area that contains a window of `body`'s wrapped rows. While
 /// `activity` is set, a heavy segment travels around its border and grows as
 /// progress goes quiet.
 pub const Framing = struct {
     body: []const u8,
     body_rows: usize,
     /// When set, places the terminal caret on the body row it names
-    /// (component-local row 0 is the top rule), reported relative to the window.
+    /// (component-local row 0 is the top rule). The row counts relative to the
+    /// window.
     caret: ?terminal.View.Caret = null,
-    /// Body rows dropped above the window; also the top rule's "N more" count.
+    /// Body rows dropped above the window, and the top rule's "N more" count.
     hidden_above: usize = 0,
-    /// Body rows dropped below the window; also the bottom rule's "N more" count.
+    /// Body rows dropped below the window, and the bottom rule's "N more" count.
     hidden_below: usize = 0,
-    /// An extra empty body row after the wrapped body — the row a caret sitting at
-    /// a full-width final line wraps onto, which the wrap itself never yields. It
+    /// An extra empty body row after the wrapped body: the row a caret at a
+    /// full-width final line wraps onto, which the wrap itself never yields. It
     /// is the last body row, so it shows only when the window reaches it.
     trailing_row: bool = false,
     /// Style per logical `\n`-delimited body line (lines past the end are plain).
@@ -268,8 +269,8 @@ const BottomLeftWeights = struct { up: bool, right: bool };
 const RuleRange = struct { rule: Rule, start: usize, end: usize };
 const LabelOptions = struct { arrow: []const u8, more: usize, track_columns: usize };
 
-/// Stream the framed area described by `framing`: the labelled top border, its
-/// windowed body rows, and the labelled bottom border.
+/// Stream the framed area that `framing` describes: the labelled top border,
+/// its windowed body rows, and the labelled bottom border.
 pub fn framed(placement: *const Placement, framing: *const Framing) !void {
     const geometry = frameGeometry(placement.columns);
     const border: Border = .{
@@ -305,8 +306,8 @@ pub fn framed(placement: *const Placement, framing: *const Framing) !void {
         );
         body_index += 1;
     }
-    // The wrapper exhausts at `index == wrapped rows`, the trailing row's index;
-    // emit it when the window reaches it (a `break` above leaves it out of view).
+    // The wrapper exhausts at `index == wrapped rows`, the trailing row's index.
+    // Emit it when the window reaches it (a `break` above leaves it out of view).
     if (framing.trailing_row and index >= framing.hidden_above and index < window_end) {
         try framedRow(
             placement,
@@ -360,8 +361,9 @@ fn framedRow(
     placement.sink.end(.{ .id = placement.id, .line = line.* });
 }
 
-/// One labelled horizontal border. A label masks the moving segment rather than
-/// being overwritten by it; narrow labels compact to `↑N` or `↓N` before hiding.
+/// One labelled horizontal border. A label masks the moving segment, and the
+/// segment never overwrites it. Narrow labels compact to `↑N` or `↓N` before
+/// they hide.
 fn ruleRow(
     placement: *const Placement,
     border: *const Border,
@@ -414,7 +416,7 @@ fn ruleRow(
 
 fn moreLabel(buffer: *[32]u8, options: *const LabelOptions) ?[]const u8 {
     if (options.more == 0) return null;
-    const full = std.fmt.bufPrint(buffer, "{s} {d} more", .{
+    const full = std.fmt.bufPrint(buffer, "{s} Hidden: {d}", .{
         options.arrow,
         options.more,
     }) catch return null;
@@ -521,8 +523,8 @@ fn activityPerimeter(geometry: *const ActivityGeometry) usize {
     return 2 * geometry.columns + 2 * geometry.body_rows;
 }
 
-/// Horizontal cells consume one tick; vertical cells and corners consume two,
-/// compensating for a terminal cell's greater physical height.
+/// Horizontal cells consume one tick. Vertical cells and corners consume two to
+/// compensate for a terminal cell's greater physical height.
 fn activityHead(motion_tick: u64, geometry: *const ActivityGeometry) usize {
     std.debug.assert(geometry.columns >= 3 and geometry.body_rows >= 1);
     const cycle_ticks = activityCycleTicks(geometry);
@@ -680,16 +682,16 @@ pub fn steeringRows(messages: []const []const u8) usize {
     return messages.len + 1;
 }
 
-/// The steering queue: a `Steering: <message>` row per queued message (each cut
-/// to its first line and the window width), then a dim hint row.
+/// The steering queue: a `Queued message: <message>` row per queued message
+/// (each cut to its first line and the window width), then a dim hint row.
 pub fn steering(placement: *const Placement, messages: []const []const u8) !void {
     var line = placement.base;
     for (messages) |message| {
         defer line += 1;
         if (line < placement.skip) continue;
-        // Truncate the label first, then give the message whatever width is left,
-        // so a window narrower than the label can never overflow the row.
-        const label = terminal.width.truncate("Steering: ", placement.columns);
+        // Truncate the label first, then give the message whatever width is left.
+        // A window narrower than the label can then never overflow the row.
+        const label = terminal.width.truncate("Queued message: ", placement.columns);
         const first = message[0 .. std.mem.indexOfScalar(u8, message, '\n') orelse message.len];
         const room = placement.columns -| terminal.width.ofText(label);
         const shown = terminal.width.truncate(first, room);
@@ -704,7 +706,7 @@ pub fn steering(placement: *const Placement, messages: []const []const u8) !void
     }
     var hint_placement = placement.*;
     hint_placement.base = line;
-    const hint = "\u{21B3} Alt+Up to edit all queued messages";
+    const hint = "\u{21B3} Alt+Up: Edit all queued messages";
     try notice(&hint_placement, &.{ .style = .dim, .prefix = "" }, hint);
 }
 
@@ -740,7 +742,7 @@ test "activity segment blends into straight rails and corners" {
     try std.testing.expectEqual(.top_left_light, borderCell(&idle, 0, .top_left).glyph);
     try std.testing.expectEqual(.horizontal_light, borderCell(&idle, 1, .top).glyph);
 
-    // Tick 9 reaches the top-right corner; entering the side makes the corner
+    // Tick 9 reaches the top-right corner. Entry into the side makes the corner
     // fully heavy and tapers the head into the right rail.
     const corner_head: Border = .{
         .columns = 20,
@@ -824,10 +826,10 @@ test "activity segment grows after a quiet grace period up to half the perimeter
 
 test "overflow labels compact before disappearing" {
     var buffer: [32]u8 = undefined;
-    try std.testing.expectEqualStrings("↑ 17 more", moreLabel(&buffer, &.{
+    try std.testing.expectEqualStrings("↑ Hidden: 17", moreLabel(&buffer, &.{
         .arrow = "↑",
         .more = 17,
-        .track_columns = 14,
+        .track_columns = 17,
     }).?);
     try std.testing.expectEqualStrings("↑17", moreLabel(&buffer, &.{
         .arrow = "↑",

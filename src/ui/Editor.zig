@@ -1,12 +1,12 @@
 //! The input-line editing model: a text buffer whose caret follows rendered
-//! units — grapheme clusters for valid UTF-8, one unit per canonical replacement
-//! for malformed or control input, and one atomic unit per collapsed large paste.
+//! units. A unit is a grapheme cluster for valid UTF-8, one canonical replacement
+//! for malformed or control input, or one atom for a collapsed large paste.
 //!
-//! A large bracketed paste collapses to a `[paste #N …]` marker that behaves as
+//! A large bracketed paste collapses to a `[Paste #N: …]` marker that behaves as
 //! one editing unit and expands to its exact bytes on submit. The draft keeps two
 //! named views: `visible` (literal text plus marker labels, for rendering) and
 //! `expanded` (literal text plus paste payloads, for every send boundary). It owns
-//! editing state only; submitting, quitting, and drawing are the caller's job.
+//! editing state only. The caller submits, quits, and draws.
 
 const std = @import("std");
 
@@ -17,34 +17,35 @@ const Editor = @This();
 
 gpa: std.mem.Allocator,
 draft: Draft,
-/// Byte offset into the draft's visible buffer. Always a canonical display
+/// The byte offset into the draft's visible buffer. Always a canonical display
 /// boundary and never strictly inside a marker span.
 caret: usize,
-/// The first wrapped body row shown when the body is taller than its slot; the
+/// The first wrapped body row shown when the body is taller than its slot. The
 /// window scrolls to keep the caret in view. `reflow` maintains it and `clear`
-/// resets it; the rows above it show as an "N more" label on the top rule.
+/// resets it. The rows above it show as an "N more" label on the top rule.
 scroll: usize,
-/// Desired logical column for vertical movement, remembered across consecutive
+/// The desired logical column for vertical movement, remembered across consecutive
 /// `moveUp`/`moveDown` so a step through a shorter row does not forget it. It is
 /// logical, not display: a paste atom counts as one cell however wide its label
-/// renders (see `logicalColumn`), so a marker never traps the caret at its edge.
-/// Null until a vertical step captures the caret's column; a horizontal move, an
-/// edit, or a vertical move off the top or bottom row clears it back to null.
+/// renders (see `logicalColumn`). So a marker never traps the caret at its edge.
+/// It is null until a vertical step captures the caret's column. A horizontal
+/// move, an edit, or a vertical move off the top or bottom row clears it back to
+/// null.
 goal_column: ?usize,
-/// Next paste-atom ID to assign; the first real atom is 1. Monotonic for the
-/// editor's lifetime — `clear`, submit, and deletion never reset or decrement it,
-/// so no two atoms ever share an ID.
+/// The next paste-atom ID to assign. The first real atom is 1. It is monotonic
+/// for the editor's lifetime. `clear`, submit, and deletion never reset or
+/// decrement it, so no two atoms ever share an ID.
 paste_id_next: u64,
 /// Accumulates one in-progress bracketed paste across `Input` chunks until its
-/// final chunk arrives. Reused across pastes; a large paste moves its bytes out.
+/// final chunk arrives. Reused across pastes. A large paste moves its bytes out.
 capture: std.ArrayList(u8),
 
 /// An atom-aware editor draft: the visible byte buffer and the paste atoms
 /// collapsed within it. Owned by an `Editor` while live, and detachable so a
-/// consumer can retain it (steering recovery) — hence its own lifecycle.
+/// consumer can retain it (steering recovery). Hence it has its own lifecycle.
 pub const Draft = struct {
     /// Literal text interleaved with generated marker spans. Rendered and
-    /// measured directly; a marker span is a leading guard, the label, a
+    /// measured directly. A marker span is a leading guard, the label, and a
     /// trailing guard (see `marker_guard`).
     visible: std.ArrayList(u8),
     /// Paste atoms, sorted by `start`, non-overlapping, each within `visible`.
@@ -52,10 +53,10 @@ pub const Draft = struct {
 
     pub const empty: Draft = .{ .visible = .empty, .atoms = .empty };
 
-    /// One collapsed large paste: its half-open visible range `[start, end)` —
-    /// exactly the generated marker span — its stable ID, and the owned exact
-    /// pasted bytes (no guards or label). Literal text is never inferred to be
-    /// an atom from its bytes.
+    /// One collapsed large paste: its half-open visible range `[start, end)`, its
+    /// stable ID, and the owned exact pasted bytes (no guards or label). The range
+    /// is exactly the generated marker span. The editor never infers an atom from
+    /// the bytes of literal text.
     pub const Atom = struct {
         start: usize,
         end: usize,
@@ -69,15 +70,15 @@ pub const Draft = struct {
         self.visible.deinit(gpa);
     }
 
-    /// Free every payload and empty the draft, keeping the buffers' capacity.
+    /// Free every payload and empty the draft. The buffers keep their capacity.
     pub fn clear(self: *Draft, gpa: std.mem.Allocator) void {
         for (self.atoms.items) |atom| gpa.free(atom.payload);
         self.atoms.clearRetainingCapacity();
         self.visible.clearRetainingCapacity();
     }
 
-    /// Build a plain draft holding a copy of `text` with no atoms. Caller owns
-    /// the result.
+    /// Build a plain draft that holds a copy of `text` with no atoms. The caller
+    /// owns the result.
     pub fn fromText(gpa: std.mem.Allocator, text: []const u8) !Draft {
         var buffer: std.ArrayList(u8) = .empty;
         errdefer buffer.deinit(gpa);
@@ -85,7 +86,7 @@ pub const Draft = struct {
         return .{ .visible = buffer, .atoms = .empty };
     }
 
-    /// Deep-copy drafts into one blank-line-separated draft, preserving every
+    /// Deep-copy drafts into one blank-line-separated draft and preserve every
     /// paste atom. The sources remain untouched so callers can prepare a joined
     /// prompt before the operation that transfers their ownership commits.
     pub fn fromDrafts(gpa: std.mem.Allocator, drafts: []const Draft) !Draft {
@@ -119,9 +120,9 @@ pub const Draft = struct {
         return joined;
     }
 
-    /// Allocate the expanded text — literal bytes with each atom's exact payload
-    /// spliced in for its marker span, in document order — optionally stripped of
-    /// leading and trailing whole-prompt whitespace. Caller owns the result.
+    /// Allocate the expanded text: literal bytes with each atom's exact payload
+    /// spliced in for its marker span, in document order. `trim` can strip the
+    /// leading and trailing whole-prompt whitespace. The caller owns the result.
     pub fn expanded(self: *const Draft, gpa: std.mem.Allocator, trim: Trim) ![]u8 {
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(gpa);
@@ -153,7 +154,7 @@ pub const Draft = struct {
         return !hasContent(self.visible.items[pos..]);
     }
 
-    /// Expanded byte length, via checked additions on the visible length with
+    /// The expanded byte length, via checked additions on the visible length with
     /// each atom's marker span replaced by its payload.
     fn expandedLen(self: *const Draft) !usize {
         var total: usize = self.visible.items.len;
@@ -165,7 +166,7 @@ pub const Draft = struct {
     }
 };
 
-/// Which whitespace trimming `expanded` applies.
+/// The whitespace trim that `expanded` applies.
 pub const Trim = enum { none, whole_prompt };
 
 pub const RenderOptions = struct {
@@ -175,9 +176,9 @@ pub const RenderOptions = struct {
 
 /// One atom-aware text mutation, the sole path that edits the visible buffer.
 /// Replaces `[from, to)` with `bytes`. `new_atoms` are the atoms the inserted
-/// `bytes` carry, their ranges relative to `bytes`; each takes ownership of its
-/// payload on success. A collapsed paste passes one; appending a detached draft
-/// passes its whole run under a single reservation.
+/// `bytes` carry, with their ranges relative to `bytes`. Each takes ownership of
+/// its payload on success. A collapsed paste passes one. An append of a detached
+/// draft passes its whole run under a single reservation.
 const Splice = struct {
     from: usize,
     to: usize,
@@ -189,21 +190,23 @@ const Splice = struct {
 /// (LF-delimited) lines or more than `byte_count_max` bytes.
 const line_count_max = 10;
 const byte_count_max = 1000;
-/// Zero-width guard bracketing a marker span. U+200B is zero columns and, being
-/// grapheme-break Control, forces a cluster break on each side, so a marker edge
-/// is always a display boundary and cannot fuse with adjacent combining text.
-/// The guards pin only the edges: the label between them is ordinary text that
-/// wraps grapheme-by-grapheme like any other, so a marker is one atom for editing
-/// (crossed and deleted whole) but not one unit for wrapping — a marker wider
-/// than the terminal breaks across rows while staying a single atom.
+/// The zero-width guard that brackets a marker span. U+200B is zero columns. It is
+/// grapheme-break Control, so it forces a cluster break on each side. Thus a
+/// marker edge is always a display boundary and cannot fuse with adjacent
+/// combining text. The guards pin only the edges. The label between them is
+/// ordinary text that wraps grapheme-by-grapheme like any other. So a marker is
+/// one atom for editing (crossed and deleted whole) but not one unit for wrapping.
+/// A marker wider than the terminal breaks across rows but stays a single atom.
 const marker_guard = "\u{200B}";
-/// Widest a marker span can be: two guards, the fixed label text, and two u64s in
-/// decimal (the line form `[paste #{d} +{d} lines]` is the longer of the two).
+/// The widest a marker span can be: two guards, the fixed label text, and two
+/// u64s in decimal. The line form `[Paste #{d}: {d} lines]` and the byte form
+/// have equal length.
 const label_len_max =
-    2 * marker_guard.len + "[paste #".len + 20 + " +".len + 20 + " lines]".len;
+    2 * marker_guard.len + "[Paste #".len + 20 + ": ".len + 20 + " lines]".len;
 const whitespace = " \t\r\n";
-/// Blank-line separator inserted before each draft `appendDraft` joins onto a
-/// non-empty draft, matching the queue's `join` and the whole-prompt convention.
+/// The blank-line separator inserted before each draft that `appendDraft` joins
+/// onto a non-empty draft. It matches the queue's `join` and the whole-prompt
+/// convention.
 const draft_separator = "\n\n";
 
 pub fn init(gpa: std.mem.Allocator) Editor {
@@ -229,12 +232,12 @@ pub fn visible(self: *const Editor) []const u8 {
     return self.draft.visible.items;
 }
 
-/// The expanded text for a send boundary; see `Draft.expanded`. Caller owns it.
+/// The expanded text for a send boundary (see `Draft.expanded`). The caller owns it.
 pub fn expanded(self: *const Editor, trim: Trim) ![]u8 {
     return self.draft.expanded(self.gpa, trim);
 }
 
-/// Whether the expanded-and-trimmed prompt is empty; see `Draft.blank`.
+/// Whether the expanded-and-trimmed prompt is empty (see `Draft.blank`).
 pub fn blank(self: *const Editor) bool {
     return self.draft.blank();
 }
@@ -251,12 +254,12 @@ pub fn clear(self: *Editor) void {
 
 /// Trim the draft's literal edges, then move it out and leave an empty draft. The
 /// trim strips whole-prompt whitespace outside every atom, so a paste payload and
-/// its label stay byte-exact and keep their ID. The paste-ID counter is preserved,
-/// so a later atom cannot reuse an ID still live in the detached draft. Caller
-/// owns the returned draft. Allocation-free, so it cannot fail.
+/// its label stay byte-exact and keep their ID. The paste-ID counter does not
+/// reset, so a later atom cannot reuse an ID still live in the detached draft.
+/// The caller owns the returned draft. Allocation-free, so it cannot fail.
 pub fn detachTrimmed(self: *Editor) Draft {
-    // Whole-prompt whitespace never includes a marker guard or label byte, so
-    // trimming the visible buffer stops at any edge atom and never splits one.
+    // Whole-prompt whitespace never includes a marker guard or label byte. So a
+    // trim of the visible buffer stops at any edge atom and never splits one.
     const items = self.draft.visible.items;
     const trimmed = std.mem.trim(u8, items, whitespace);
     const lead = @intFromPtr(trimmed.ptr) - @intFromPtr(items.ptr);
@@ -279,7 +282,7 @@ pub fn reserveDrafts(self: *Editor, drafts: []const Draft) !void {
 }
 
 /// Reserve capacity to insert `lead` (when present) and every draft in `drafts`,
-/// each after a blank-line separator, in one batch — the cancel composition
+/// each after a blank-line separator, in one batch. The cancel composition
 /// reserves the returned prompt and the recalled steering together so the later
 /// `prependComposition` cannot half-complete. Checked additions guard the totals.
 pub fn reserveComposition(self: *Editor, lead: ?*const Draft, drafts: []const Draft) !void {
@@ -299,10 +302,10 @@ pub fn reserveComposition(self: *Editor, lead: ?*const Draft, drafts: []const Dr
     try self.draft.atoms.ensureUnusedCapacity(self.gpa, atoms_extra);
 }
 
-/// Move `source`'s content to the end of the draft — after a blank-line separator
-/// when the draft is already non-empty — preserving its atoms and their stable
-/// IDs (payloads move by pointer), and leave `source` empty. Infallible once
-/// `reserveDrafts` has covered it, so recall after a reservation cannot
+/// Move `source`'s content to the end of the draft and leave `source` empty. A
+/// blank-line separator comes first when the draft is already non-empty. The move
+/// preserves the atoms and their stable IDs (payloads move by pointer). Infallible
+/// once `reserveDrafts` has covered it, so recall after a reservation cannot
 /// half-complete.
 pub fn appendDraft(self: *Editor, source: *Draft) void {
     self.moveEnd();
@@ -313,18 +316,19 @@ pub fn appendDraft(self: *Editor, source: *Draft) void {
         .bytes = source.visible.items,
         .new_atoms = source.atoms.items,
     }) catch unreachable;
-    // The atoms' payloads moved into this draft; free only `source`'s buffers.
+    // The atoms' payloads moved into this draft. Free only `source`'s buffers.
     source.atoms.deinit(self.gpa);
     source.visible.deinit(self.gpa);
     source.* = .empty;
 }
 
 /// Insert `lead` (when present) then every draft in `drafts`, in order and
-/// blank-line separated, above the current content — with a blank line before
-/// that content when it is non-empty — and leave the caret at the end (after the
-/// existing line). Each source is consumed (its atoms' payloads move by pointer)
-/// and left empty. Infallible once `reserveComposition` has covered it, so the
-/// cancel composition cannot half-complete after the worker is already cancelled.
+/// blank-line separated, above the current content. A blank line comes before
+/// that content when it is non-empty. Leave the caret at the end (after the
+/// existing line). The insert consumes each source (its atoms' payloads move by
+/// pointer) and leaves it empty. Infallible once `reserveComposition` has covered
+/// it, so the cancel composition cannot half-complete after the worker is already
+/// cancelled.
 pub fn prependComposition(self: *Editor, lead: ?*Draft, drafts: []Draft) void {
     const had_content = self.draft.visible.items.len > 0;
     var offset: usize = 0;
@@ -343,7 +347,7 @@ pub fn prependComposition(self: *Editor, lead: ?*Draft, drafts: []Draft) void {
 }
 
 /// Splice `source`'s content into the draft at `offset` (after a blank-line
-/// separator when `separate`), move its atoms in, empty `source`, and return the
+/// separator when `separate`). Move its atoms in and empty `source`. Return the
 /// position just past the inserted content. Infallible once `reserveComposition`
 /// has covered the batch.
 fn spliceDraftAt(self: *Editor, offset: usize, source: *Draft, separate: bool) usize {
@@ -369,13 +373,13 @@ fn spliceDraftAt(self: *Editor, offset: usize, source: *Draft, separate: bool) u
     return position;
 }
 
-/// Accept one bracketed-paste chunk, accumulating it; on the `final` chunk,
-/// classify the whole paste and commit one operation — a small paste inserts its
-/// exact bytes as ordinary text, a large one collapses to a marker atom. An empty
-/// paste is a no-op. Byte-for-byte; no newline, tab, or control normalization.
+/// Accept and accumulate one bracketed-paste chunk. On the `final` chunk,
+/// classify the whole paste and commit one operation. A small paste inserts its
+/// exact bytes as ordinary text. A large one collapses to a marker atom. An empty
+/// paste is a no-op. Byte-for-byte: no newline, tab, or control normalization.
 pub fn paste(self: *Editor, bytes: []const u8, final: bool) !void {
     // Any failure discards the partial capture so a later paste cannot merge
-    // stale bytes; a successful non-final chunk keeps it for the next chunk.
+    // stale bytes. A successful non-final chunk keeps it for the next chunk.
     errdefer self.capture.clearRetainingCapacity();
     try self.capture.appendSlice(self.gpa, bytes);
     if (!final) return;
@@ -391,7 +395,7 @@ fn finalizePaste(self: *Editor) !void {
         try self.splice(.{ .from = self.caret, .to = self.caret, .bytes = bytes });
         return;
     }
-    // Reserve the ID, marker, and buffer capacity before moving the payload out,
+    // Reserve the ID, marker, and buffer capacity before the payload moves out,
     // so a failure leaves the capture, draft, and counter unchanged. The splice
     // re-checks that capacity, so the move is the last step that can fail.
     if (self.paste_id_next == std.math.maxInt(u64)) return error.PasteIdExhausted;
@@ -412,14 +416,14 @@ fn finalizePaste(self: *Editor) !void {
 }
 
 /// Write a marker span — guard, label, guard — into `buffer` and return it. The
-/// line form wins when both thresholds are crossed; the byte form's label says
-/// `bytes`, not `chars`, to stay honest about arbitrary input.
+/// line form wins when a paste crosses both thresholds. The byte form's label
+/// says `bytes`, not `chars`, to stay honest about arbitrary input.
 fn markerSpan(buffer: []u8, id: u64, line_count: usize, byte_count: usize) []const u8 {
     if (line_count > line_count_max) {
-        const form = marker_guard ++ "[paste #{d} +{d} lines]" ++ marker_guard;
+        const form = marker_guard ++ "[Paste #{d}: {d} lines]" ++ marker_guard;
         return std.fmt.bufPrint(buffer, form, .{ id, line_count }) catch unreachable;
     }
-    const form = marker_guard ++ "[paste #{d} {d} bytes]" ++ marker_guard;
+    const form = marker_guard ++ "[Paste #{d}: {d} bytes]" ++ marker_guard;
     return std.fmt.bufPrint(buffer, form, .{ id, byte_count }) catch unreachable;
 }
 
@@ -439,7 +443,7 @@ fn splice(self: *Editor, op: Splice) !void {
     std.debug.assert(op.from <= op.to);
     std.debug.assert(op.to <= visible_list.items.len);
 
-    // Reject a range that cuts through an atom; find the contiguous run it covers.
+    // Reject a range that cuts through an atom. Find the contiguous run it covers.
     var remove_from: usize = atoms.items.len;
     var remove_to: usize = atoms.items.len;
     for (atoms.items, 0..) |atom, index| {
@@ -449,16 +453,16 @@ fn splice(self: *Editor, op: Splice) !void {
         remove_to = index + 1;
     }
 
-    // Reserve first; a failure here leaves the draft untouched. The checked
-    // resulting length also proves the commit's range shifts cannot overflow:
-    // every shifted offset is at most `shifted_len`, and each `start - removed`
+    // Reserve first. A failure here leaves the draft untouched. The checked
+    // resulting length also proves the commit's range shifts cannot overflow.
+    // Every shifted offset is at most `shifted_len`, and each `start - removed`
     // stays nonnegative because a shifted atom has `start >= op.to >= removed`.
     const removed = op.to - op.from;
     const shifted_len = try std.math.add(usize, visible_list.items.len - removed, op.bytes.len);
     try visible_list.ensureTotalCapacity(self.gpa, shifted_len);
     try atoms.ensureUnusedCapacity(self.gpa, op.new_atoms.len);
 
-    // Commit; every step below is infallible.
+    // Commit. Every step below is infallible.
     for (atoms.items[remove_from..remove_to]) |atom| self.gpa.free(atom.payload);
     atoms.replaceRangeAssumeCapacity(remove_from, remove_to - remove_from, &.{});
     visible_list.replaceRangeAssumeCapacity(op.from, op.to - op.from, op.bytes);
@@ -484,7 +488,7 @@ fn splice(self: *Editor, op: Splice) !void {
     } else if (self.caret > op.from) {
         self.caret = op.from + op.bytes.len;
     }
-    // Adjacent literal text can fuse into one grapheme after the edit; re-clamp
+    // Adjacent literal text can fuse into one grapheme after the edit. Re-clamp
     // the caret to the resulting display boundary.
     self.caret = terminal.width.boundaryAtOrAfter(visible_list.items, self.caret);
 }
@@ -501,8 +505,8 @@ fn atomEndingAt(self: *const Editor, offset: usize) ?Draft.Atom {
     return null;
 }
 
-/// Index of the first atom lying wholly at or after `offset` — the slot a new
-/// atom starting there takes.
+/// The index of the first atom that lies wholly at or after `offset`. A new atom
+/// that starts there takes this slot.
 fn atomIndexAfter(atoms: []const Draft.Atom, offset: usize) usize {
     var index: usize = 0;
     while (index < atoms.len and atoms[index].end <= offset) index += 1;
@@ -551,7 +555,7 @@ pub fn moveEnd(self: *Editor) void {
     self.caret = self.draft.visible.items.len;
 }
 
-/// Move the caret one wrapped row up, keeping the sticky logical goal column. On
+/// Move the caret one wrapped row up and keep the sticky logical goal column. On
 /// the top row it falls back to `moveHome`. The column is logical, so a marker
 /// counts as one cell and never traps the caret at its edge (see `logicalColumn`
 /// and `logicalOffset`).
@@ -569,7 +573,7 @@ pub fn moveUp(self: *Editor, columns: usize) void {
     // A marker wider than the terminal has no caret on its interior rows, and
     // `logicalOffset` only escapes such a row forward, to the after-edge. When
     // that leaves the caret at or below where it started, climb to the marker's
-    // before-edge instead so a step up always makes upward progress.
+    // before-edge instead. A step up then always makes upward progress.
     if (result >= self.caret) {
         if (self.atomEndingAt(self.caret)) |atom| result = atom.start;
     }
@@ -577,8 +581,8 @@ pub fn moveUp(self: *Editor, columns: usize) void {
     std.debug.assert(self.legalCaret(self.caret));
 }
 
-/// Move the caret one wrapped row down, keeping the sticky logical goal column;
-/// on the bottom row it falls back to `moveEnd`. See `moveUp`.
+/// Move the caret one wrapped row down and keep the sticky logical goal column.
+/// On the bottom row it falls back to `moveEnd`. See `moveUp`.
 pub fn moveDown(self: *Editor, columns: usize) void {
     const columns_max = paint.frameGeometry(columns).content_columns;
     const text = self.draft.visible.items;
@@ -597,8 +601,8 @@ pub fn moveDown(self: *Editor, columns: usize) void {
 /// within it (each atom one cell, each grapheme its display width).
 const LogicalCaret = struct { row: usize, column: usize };
 
-/// The slice of the visible buffer display `row` wraps to, or null when `row` is
-/// past the last wrapped row. Both vertical-movement walks take their row start
+/// The slice of the visible buffer that display `row` wraps to, or null when `row`
+/// is past the last wrapped row. Both vertical-movement walks take their row start
 /// from this line, so they measure the same wrapped geometry the renderer does.
 fn wrappedLine(self: *const Editor, columns_max: usize, row: usize) ?[]const u8 {
     var iterator = terminal.width.wrapper(self.draft.visible.items, columns_max);
@@ -611,9 +615,9 @@ fn wrappedLine(self: *const Editor, columns_max: usize, row: usize) ?[]const u8 
 
 /// The caret's logical column within display `row`: each literal grapheme counts
 /// its display width, but every paste atom counts as a single cell. The walk
-/// starts at the row's first legal caret boundary, so a marker that wrapped onto
-/// this row is skipped to its end while a marker that begins the row is counted
-/// as its single cell.
+/// starts at the row's first legal caret boundary. It skips a marker that wrapped
+/// onto this row to its end. It counts a marker that begins the row as its single
+/// cell.
 fn logicalColumn(self: *const Editor, columns_max: usize, row: usize) usize {
     const text = self.draft.visible.items;
     const line = self.wrappedLine(columns_max, row) orelse return 0;
@@ -633,10 +637,10 @@ fn logicalColumn(self: *const Editor, columns_max: usize, row: usize) usize {
     return column;
 }
 
-/// Byte offset at `target`'s logical column on its display row — the inverse of
-/// `logicalColumn`, clamped to the row's last legal boundary; a row past the last
-/// wrapped row yields the buffer end. Atoms are always crossed whole, so the
-/// result is a legal caret boundary and never lands strictly inside a marker,
+/// The byte offset at `target`'s logical column on its display row: the inverse
+/// of `logicalColumn`, clamped to the row's last legal boundary. A row past the
+/// last wrapped row yields the buffer end. The walk always crosses atoms whole, so
+/// the result is a legal caret boundary. It never lands strictly inside a marker,
 /// even when the marker wraps across rows.
 fn logicalOffset(self: *const Editor, columns_max: usize, target: LogicalCaret) usize {
     const text = self.draft.visible.items;
@@ -652,8 +656,8 @@ fn logicalOffset(self: *const Editor, columns_max: usize, target: LogicalCaret) 
         } else {
             const next = terminal.width.boundaryAfter(text, index);
             const unit = terminal.width.ofText(text[index..next]);
-            // Stop before a wide grapheme the goal column falls inside rather
-            // than overshooting past it.
+            // Stop before a wide grapheme the goal column falls inside. Do not
+            // overshoot past it.
             if (logical + unit > target.column) break;
             logical += unit;
             index = next;
@@ -683,7 +687,7 @@ fn legalCaret(self: *const Editor, offset: usize) bool {
 }
 
 /// Re-clamp the scroll offset so the caret's wrapped row stays inside the visible
-/// window. Call once per repaint, passing the same `size` whose columns and rows
+/// window. Call once per repaint. Pass the same `size` whose columns and rows
 /// `render` and `rows` will use, so all three agree on the window.
 pub fn reflow(self: *Editor, size: terminal.View.Size) void {
     const columns_max = paint.frameGeometry(size.columns).content_columns;
@@ -696,7 +700,7 @@ pub fn reflow(self: *Editor, size: terminal.View.Size) void {
     self.scroll = @min(self.scroll, total_body - visible_rows);
 }
 
-/// Physical rows the editor occupies: the two framing rules plus the wrapped
+/// The physical rows the editor occupies: the two framing rules plus the wrapped
 /// body, the body capped to its scroll limit for `size.rows`.
 pub fn rows(self: *const Editor, size: terminal.View.Size) usize {
     const columns_max = paint.frameGeometry(size.columns).content_columns;
@@ -704,9 +708,9 @@ pub fn rows(self: *const Editor, size: terminal.View.Size) usize {
     return paint.framedRows(@min(total_body, paint.bodyLimit(size.rows)));
 }
 
-/// Body rows the editor lays out: the wrapped text plus, when the caret has
-/// wrapped past a full-width final line, the empty trailing row it sits on — a
-/// row the wrap itself never yields (see `caretPosition`).
+/// The body rows the editor lays out: the wrapped text, plus the empty trailing
+/// row for a caret wrapped past a full-width final line. The wrap itself never
+/// yields that row (see `caretPosition`).
 fn bodyRows(self: *const Editor, columns_max: usize) usize {
     const text = self.draft.visible.items;
     const wrapped = terminal.width.rows(text, columns_max);
@@ -714,9 +718,9 @@ fn bodyRows(self: *const Editor, columns_max: usize) usize {
     return wrapped + @intFromBool(caret_row == wrapped);
 }
 
-/// Stream the closed input frame and wrapped visible text through `placement`,
-/// placing the terminal caret inside its left wall. Assumes `reflow` set the
-/// scroll from the same viewport dimensions.
+/// Stream the closed input frame and wrapped visible text through `placement` and
+/// place the terminal caret inside its left wall. Assumes `reflow` set the scroll
+/// from the same viewport dimensions.
 pub fn render(
     self: *const Editor,
     placement: *const paint.Placement,
@@ -809,11 +813,11 @@ test "malformed bytes and controls move by displayed units" {
 test "backspace deletes a whole grapheme cluster" {
     var editor = Editor.init(std.testing.allocator);
     defer editor.deinit();
-    // Base emoji plus skin-tone modifier is one cluster.
+    // A base emoji plus a skin-tone modifier is one cluster.
     try editor.insert("👍\u{1F3FD}");
     editor.backspace();
     try std.testing.expectEqualStrings("", editor.visible());
-    // Base letter plus a combining mark.
+    // A base letter plus a combining mark.
     try editor.insert("e\u{0301}");
     editor.backspace();
     try std.testing.expectEqualStrings("", editor.visible());
@@ -842,7 +846,7 @@ test "backspace peels one cluster at a time and leaves neighbours intact" {
 test "insert keeps the caret on a cluster boundary when text fuses" {
     var editor = Editor.init(std.testing.allocator);
     defer editor.deinit();
-    // Typing a base letter before a dangling combining mark lands the caret
+    // A base letter typed before a dangling combining mark lands the caret
     // after the completed cluster, not inside it.
     try editor.insert("\u{0301}");
     editor.moveHome();
@@ -851,7 +855,7 @@ test "insert keeps the caret on a cluster boundary when text fuses" {
     try std.testing.expectEqual(@as(usize, 3), editor.caret);
     editor.backspace();
     try std.testing.expectEqualStrings("", editor.visible());
-    // Typing one regional indicator before another completes a flag; the caret
+    // One regional indicator typed before another completes a flag. The caret
     // sits after the whole two-column glyph.
     try editor.insert("🇵");
     editor.moveHome();
@@ -892,7 +896,7 @@ fn expectExpanded(editor: *const Editor, trim: Trim, expected: []const u8) !void
     try std.testing.expectEqualStrings(expected, text);
 }
 
-// Eleven logical lines: ten LFs joining eleven single-letter lines.
+// Eleven logical lines: ten LFs that join eleven single-letter lines.
 const eleven_lines = "a\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk";
 // Ten logical lines: nine LFs.
 const ten_lines = "a\nb\nc\nd\ne\nf\ng\nh\ni\nj";
@@ -905,18 +909,18 @@ test "the line threshold collapses more than ten logical lines" {
     try std.testing.expectEqual(@as(usize, 0), editor.draft.atoms.items.len);
     try std.testing.expectEqualStrings(ten_lines, editor.visible());
 
-    // Eleven lines collapse; the label counts the empty trailing line too.
+    // Eleven lines collapse. The label counts the empty trailing line too.
     editor.clear();
     try pasteWhole(&editor, eleven_lines);
     try std.testing.expectEqual(@as(usize, 1), editor.draft.atoms.items.len);
-    try std.testing.expectEqualStrings("\u{200B}[paste #1 +11 lines]\u{200B}", editor.visible());
+    try std.testing.expectEqualStrings("\u{200B}[Paste #1: 11 lines]\u{200B}", editor.visible());
     try expectExpanded(&editor, .none, eleven_lines);
 
     // A trailing LF contributes the eleventh line.
     editor.clear();
     try pasteWhole(&editor, "a\nb\nc\nd\ne\nf\ng\nh\ni\nj\n");
     try std.testing.expectEqual(@as(usize, 1), editor.draft.atoms.items.len);
-    try std.testing.expectEqualStrings("\u{200B}[paste #2 +11 lines]\u{200B}", editor.visible());
+    try std.testing.expectEqualStrings("\u{200B}[Paste #2: 11 lines]\u{200B}", editor.visible());
 }
 
 test "the byte threshold collapses more than a thousand bytes" {
@@ -930,7 +934,7 @@ test "the byte threshold collapses more than a thousand bytes" {
     editor.clear();
     const longer = "x" ** 1001;
     try pasteWhole(&editor, longer);
-    try std.testing.expectEqualStrings("\u{200B}[paste #1 1001 bytes]\u{200B}", editor.visible());
+    try std.testing.expectEqualStrings("\u{200B}[Paste #1: 1001 bytes]\u{200B}", editor.visible());
     try expectExpanded(&editor, .none, longer);
 }
 
@@ -940,31 +944,31 @@ test "the byte threshold counts bytes, not characters" {
     // 501 two-byte codepoints on one line: 1002 bytes, far fewer characters.
     const multibyte = "é" ** 501;
     try pasteWhole(&editor, multibyte);
-    try std.testing.expectEqualStrings("\u{200B}[paste #1 1002 bytes]\u{200B}", editor.visible());
+    try std.testing.expectEqualStrings("\u{200B}[Paste #1: 1002 bytes]\u{200B}", editor.visible());
     try expectExpanded(&editor, .none, multibyte);
 
     // 1001 malformed bytes on one line collapse the same way and round-trip.
     editor.clear();
     const malformed = "\xff" ** 1001;
     try pasteWhole(&editor, malformed);
-    try std.testing.expectEqualStrings("\u{200B}[paste #2 1001 bytes]\u{200B}", editor.visible());
+    try std.testing.expectEqualStrings("\u{200B}[Paste #2: 1001 bytes]\u{200B}", editor.visible());
     try expectExpanded(&editor, .none, malformed);
 }
 
 test "a lone CR is payload, and CRLF counts one line" {
     var editor = Editor.init(std.testing.allocator);
     defer editor.deinit();
-    // Eleven CR-terminated fragments have no LF, so one logical line; short, so
-    // it stays literal.
+    // Eleven CR-terminated fragments have no LF, so one logical line. It is
+    // short, so it stays literal.
     try pasteWhole(&editor, "x\r" ** 11);
     try std.testing.expectEqual(@as(usize, 0), editor.draft.atoms.items.len);
 
-    // Eleven CRLF-terminated fragments are eleven logical lines and collapse; the
+    // Eleven CRLF-terminated fragments are eleven logical lines and collapse. The
     // lone CRs survive in the payload.
     editor.clear();
     const crlf = "x\r\n" ** 11;
     try pasteWhole(&editor, crlf);
-    try std.testing.expectEqualStrings("\u{200B}[paste #1 +12 lines]\u{200B}", editor.visible());
+    try std.testing.expectEqualStrings("\u{200B}[Paste #1: 12 lines]\u{200B}", editor.visible());
     try expectExpanded(&editor, .none, crlf);
 }
 
@@ -974,7 +978,7 @@ test "the line form wins when both thresholds are crossed" {
     // Eleven lines of a hundred columns each: over both thresholds.
     const big = ("x" ** 100 ++ "\n") ** 10 ++ "x" ** 100;
     try pasteWhole(&editor, big);
-    try std.testing.expectEqualStrings("\u{200B}[paste #1 +11 lines]\u{200B}", editor.visible());
+    try std.testing.expectEqualStrings("\u{200B}[Paste #1: 11 lines]\u{200B}", editor.visible());
     try expectExpanded(&editor, .none, big);
 }
 
@@ -995,7 +999,7 @@ test "a paste split across chunks collapses to one atom" {
     try editor.paste("g\nh\ni\n", false);
     try editor.paste("j\nk", true);
     try std.testing.expectEqual(@as(usize, 1), editor.draft.atoms.items.len);
-    try std.testing.expectEqualStrings("\u{200B}[paste #1 +11 lines]\u{200B}", editor.visible());
+    try std.testing.expectEqualStrings("\u{200B}[Paste #1: 11 lines]\u{200B}", editor.visible());
     try expectExpanded(&editor, .none, eleven_lines);
 }
 
@@ -1009,7 +1013,7 @@ test "multiple atoms mixed with ordinary text expand in document order" {
     try editor.insert("C");
     try std.testing.expectEqual(@as(usize, 2), editor.draft.atoms.items.len);
     try std.testing.expectEqualStrings(
-        "A\u{200B}[paste #1 +11 lines]\u{200B}B\u{200B}[paste #2 1001 bytes]\u{200B}C",
+        "A\u{200B}[Paste #1: 11 lines]\u{200B}B\u{200B}[Paste #2: 1001 bytes]\u{200B}C",
         editor.visible(),
     );
     try expectExpanded(&editor, .none, "A" ++ eleven_lines ++ "B" ++ "z" ** 1001 ++ "C");
@@ -1050,14 +1054,14 @@ test "paste IDs are stable across deletion and never reused" {
     try std.testing.expectEqual(@as(u64, 1), editor.draft.atoms.items[0].id);
     try std.testing.expectEqual(@as(u64, 2), editor.draft.atoms.items[1].id);
 
-    // Delete the first atom; the second keeps its ID and label.
+    // Delete the first atom. The second keeps its ID and label.
     editor.moveHome();
     editor.moveRight(); // Across atom #1 to its after-edge.
     editor.backspace(); // Removes atom #1.
     try std.testing.expectEqual(@as(usize, 1), editor.draft.atoms.items.len);
     try std.testing.expectEqual(@as(u64, 2), editor.draft.atoms.items[0].id);
 
-    // A later paste is #3, never reusing 1, and sorts after #2.
+    // A later paste is #3 and sorts after #2. It never reuses 1.
     editor.moveEnd();
     try pasteWhole(&editor, eleven_lines);
     try std.testing.expectEqual(@as(u64, 2), editor.draft.atoms.items[0].id);
@@ -1105,7 +1109,7 @@ test "backspace deletes a whole marker and leaves neighbours intact" {
     try editor.insert("ab");
     try pasteWhole(&editor, eleven_lines);
     try editor.insert("cd");
-    // Caret sits after "cd"; step left across "d", "c" to the marker's after-edge.
+    // The caret sits after "cd". Step left across "d", "c" to the marker's after-edge.
     editor.moveLeft();
     editor.moveLeft();
     try std.testing.expectEqual(editor.draft.atoms.items[0].end, editor.caret);
@@ -1145,7 +1149,7 @@ test "deleting a marker between combining text re-clamps the boundary" {
     editor.moveLeft();
     try std.testing.expectEqual(editor.draft.atoms.items[0].end, editor.caret);
     editor.backspace();
-    // "e" and the combining mark fuse; the caret clamps past the whole cluster.
+    // "e" and the combining mark fuse. The caret clamps past the whole cluster.
     try std.testing.expectEqualStrings("e\u{0301}", editor.visible());
     try std.testing.expectEqual(editor.visible().len, editor.caret);
     try expectExpanded(&editor, .none, "e\u{0301}");
@@ -1162,7 +1166,7 @@ test "marker guards keep both edges legal between combining marks" {
     try editor.insert("\u{0301}");
     const atom = editor.draft.atoms.items[0];
     // From the end, one left step stops at the after-edge (past the trailing
-    // mark), the next crosses the whole marker to the before-edge.
+    // mark). The next crosses the whole marker to the before-edge.
     editor.moveLeft();
     try std.testing.expectEqual(atom.end, editor.caret);
     editor.moveLeft();
@@ -1180,8 +1184,8 @@ test "vertical movement counts a marker as one logical column" {
     try editor.insert("\ndef");
     const atom = editor.draft.atoms.items[0];
 
-    // The marker's row holds a single logical cell, so goal column 2 clamps past
-    // it to the after-edge rather than snapping back to the marker's start.
+    // The marker's row holds a single logical cell. Goal column 2 clamps past it
+    // to the after-edge and does not snap back to the marker's start.
     editor.caret = 2; // Row 0, column 2 within "abc".
     editor.moveDown(80);
     try std.testing.expectEqual(atom.end, editor.caret);
@@ -1197,7 +1201,7 @@ test "vertical movement counts a marker as one logical column" {
 test "vertical movement lands in the text after a leading marker" {
     var editor = Editor.init(std.testing.allocator);
     defer editor.deinit();
-    // Row 0 "This"; row 1 is a marker at the line start followed by " foo".
+    // Row 0 is "This". Row 1 is a marker at the line start followed by " foo".
     try editor.insert("This\n");
     try pasteWhole(&editor, eleven_lines);
     try editor.insert(" foo");
@@ -1214,21 +1218,21 @@ test "vertical movement lands in the text after a leading marker" {
 test "vertical movement departs a row-leading marker as one column" {
     var editor = Editor.init(std.testing.allocator);
     defer editor.deinit();
-    // Row 0 "ab"; row 1 begins with a marker, then "cd".
+    // Row 0 is "ab". Row 1 begins with a marker, then "cd".
     try editor.insert("ab\n");
     try pasteWhole(&editor, eleven_lines);
     try editor.insert("cd");
     const atom = editor.draft.atoms.items[0];
 
     // The caret right after the marker is logical column 1 (the marker is the one
-    // cell at column 0), so a first step up lands at column 1 of "ab".
+    // cell at column 0). So a first step up lands at column 1 of "ab".
     editor.caret = atom.end;
     editor.goal_column = null;
     editor.moveUp(80);
     try std.testing.expectEqual(@as(usize, 1), editor.caret);
 
-    // Symmetric: from row 0 column 1, a step down returns to just after the marker
-    // — past its one cell and no further, i.e. the after-edge.
+    // Symmetric: from row 0 column 1, a step down returns to just after the
+    // marker. It stops past the one cell and no further, at the after-edge.
     editor.caret = 1;
     editor.goal_column = null;
     editor.moveDown(80);
@@ -1238,14 +1242,14 @@ test "vertical movement departs a row-leading marker as one column" {
 test "vertical movement treats a mid-line marker as one column" {
     var editor = Editor.init(std.testing.allocator);
     defer editor.deinit();
-    // Row 0 is wide padding; row 1 is "ab" + marker + "cd".
+    // Row 0 is wide padding. Row 1 is "ab" + marker + "cd".
     try editor.insert("xxxxxxxx\nab");
     try pasteWhole(&editor, eleven_lines);
     try editor.insert("cd");
     const atom = editor.draft.atoms.items[0];
 
     // Row 1 columns: a(0..1) b(1..2) marker(2..3) c(3..4) d(4..5). Goal column 3
-    // lands on the after-edge; goal column 4 one cell into the trailing "cd".
+    // lands on the after-edge. Goal column 4 lands one cell into the trailing "cd".
     editor.caret = 3; // Row 0, column 3.
     editor.moveDown(80);
     try std.testing.expectEqual(atom.end, editor.caret);
@@ -1261,12 +1265,12 @@ test "repeated vertical steps cross a marker wider than the terminal" {
     var editor = Editor.init(std.testing.allocator);
     defer editor.deinit();
     try editor.insert("ab\n");
-    try pasteWhole(&editor, eleven_lines); // 21-column label wraps at width 5.
+    try pasteWhole(&editor, eleven_lines); // The 21-column label wraps at width 5.
     try editor.insert("\ncd");
     const atom = editor.draft.atoms.items[0];
 
     editor.caret = 1; // Row 0 of "ab".
-    // Step down repeatedly; the caret must never land strictly inside the marker
+    // Step down repeatedly. The caret must never land strictly inside the marker
     // and must eventually reach its far edge.
     var reached_end = false;
     for (0..8) |_| {
@@ -1281,13 +1285,13 @@ test "repeated vertical steps climb above a marker wider than the terminal" {
     var editor = Editor.init(std.testing.allocator);
     defer editor.deinit();
     try editor.insert("ab\n");
-    try pasteWhole(&editor, eleven_lines); // 21-column label wraps at width 5.
+    try pasteWhole(&editor, eleven_lines); // The 21-column label wraps at width 5.
     try editor.insert("\ncd");
     const atom = editor.draft.atoms.items[0];
 
     editor.moveEnd(); // In "cd", below the wrapped marker.
-    // Step up repeatedly; the caret must never land strictly inside the marker
-    // and must climb past its near edge rather than sticking at the far edge.
+    // Step up repeatedly. The caret must never land strictly inside the marker
+    // and must climb past its near edge, not stick at the far edge.
     var reached_start = false;
     for (0..8) |_| {
         editor.moveUp(5);
@@ -1300,11 +1304,11 @@ test "repeated vertical steps climb above a marker wider than the terminal" {
 test "vertical movement clamps before a wide grapheme as display columns did" {
     var editor = Editor.init(std.testing.allocator);
     defer editor.deinit();
-    // Row 1 opens with a two-column grapheme; no atoms are involved.
+    // Row 1 opens with a two-column grapheme. The test involves no atoms.
     try editor.insert("ab\n\u{4F60}c"); // U+4F60 spans columns 0..2.
     editor.caret = 1; // Row 0, column 1 (after "a").
     editor.moveDown(80);
-    // Goal column 1 falls inside the wide grapheme; clamp to the row start,
+    // Goal column 1 falls inside the wide grapheme. Clamp to the row start,
     // the boundary before it, never past it.
     try std.testing.expectEqual(@as(usize, 3), editor.caret);
 }
@@ -1344,7 +1348,7 @@ test "marker guards are zero-column and absent from expanded output" {
     var editor = Editor.init(std.testing.allocator);
     defer editor.deinit();
     try pasteWhole(&editor, eleven_lines);
-    // The visible label measures exactly its printable width; the guards add none.
+    // The visible label measures exactly its printable width. The guards add none.
     try std.testing.expectEqual(@as(usize, 20), terminal.width.ofText(editor.visible()));
     // Neither guard survives expansion.
     const text = try editor.expanded(.none);
@@ -1360,7 +1364,7 @@ test "expanded whole-prompt trimming matches literal trimming, guards aside" {
     try editor.insert("  ");
     try pasteWhole(&editor, "  " ++ "y" ** 1001 ++ "  ");
     try editor.insert("  ");
-    // Expansion happens before trimming, so edge whitespace trims like literal.
+    // Expansion happens before the trim, so edge whitespace trims like literal.
     try expectExpanded(&editor, .whole_prompt, "y" ** 1001);
     try std.testing.expect(!editor.blank());
 }
@@ -1390,7 +1394,7 @@ test "an expanded send copy is independent of clearing the editor" {
     try editor.insert("B");
     const text = try editor.expanded(.whole_prompt);
     defer std.testing.allocator.free(text);
-    // Clearing frees the atom payloads; the already-taken copy is unaffected, so
+    // A clear frees the atom payloads. The already-taken copy is unaffected, so
     // a submit that expands then clears keeps a valid prompt copy for the worker.
     editor.clear();
     try std.testing.expectEqual(@as(usize, 0), editor.draft.atoms.items.len);
@@ -1431,7 +1435,7 @@ test "detachTrimmed strips literal edges but keeps a paste payload byte-exact" {
     try std.testing.expectEqualStrings("", editor.visible());
     try std.testing.expectEqual(@as(u64, 2), editor.paste_id_next);
     try std.testing.expectEqual(@as(usize, 1), draft.atoms.items.len);
-    try std.testing.expectEqualStrings("\u{200B}[paste #1 +11 lines]\u{200B}", draft.visible.items);
+    try std.testing.expectEqualStrings("\u{200B}[Paste #1: 11 lines]\u{200B}", draft.visible.items);
     const payload = try draft.expanded(gpa, .none);
     defer gpa.free(payload);
     try std.testing.expectEqualStrings("  " ++ eleven_lines ++ "  ", payload);
@@ -1460,7 +1464,7 @@ test "appendDraft joins a detached draft after in-progress text, atom live" {
     try editor.reserveDrafts(&.{recalled});
     editor.appendDraft(&recalled);
     try std.testing.expectEqualStrings(
-        "draft\n\n\u{200B}[paste #1 +11 lines]\u{200B}",
+        "draft\n\n\u{200B}[Paste #1: 11 lines]\u{200B}",
         editor.visible(),
     );
     try std.testing.expectEqual(@as(usize, 1), editor.draft.atoms.items.len);
@@ -1478,7 +1482,7 @@ test "appendDraft onto an empty draft adds no separator" {
 
     try editor.reserveDrafts(&.{recalled});
     editor.appendDraft(&recalled);
-    try std.testing.expectEqualStrings("\u{200B}[paste #1 +11 lines]\u{200B}", editor.visible());
+    try std.testing.expectEqualStrings("\u{200B}[Paste #1: 11 lines]\u{200B}", editor.visible());
 }
 
 test "paste IDs stay unique across detach and append with no reuse" {
@@ -1528,7 +1532,7 @@ test "reserveDrafts covers appendDraft against allocation failure and leaks noth
             try std.testing.expectEqualStrings("keep", editor.visible());
             continue;
         };
-        // Reserved, so the move cannot fail (an internal allocation would panic).
+        // Reserved, so the move cannot fail (any internal allocation panics).
         editor.appendDraft(&recalled);
         try std.testing.expectEqual(@as(usize, 1), editor.draft.atoms.items.len);
     }
@@ -1585,7 +1589,7 @@ test "a marker renders its label into the frame" {
     try pasteWhole(&editor, eleven_lines);
     const painted = try rendered(gpa, &editor, .{ .columns = 80, .rows = 24 });
     defer gpa.free(painted);
-    try std.testing.expect(std.mem.indexOf(u8, painted, "[paste #1 +11 lines]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "[Paste #1: 11 lines]") != null);
 }
 
 test "a full-width line reserves an empty trailing row for the wrapped caret" {
@@ -1600,7 +1604,7 @@ test "a full-width line reserves an empty trailing row for the wrapped caret" {
     try expectCaretAt(&editor, 7, .{ .row = 2, .column = 2 });
     try std.testing.expectEqual(@as(usize, 4), try renderedRows(gpa, &editor, 7));
 
-    // Backing the caret off the margin drops the trailing row again.
+    // A caret move back off the margin drops the trailing row again.
     editor.moveLeft();
     editor.reflow(.{ .columns = 7, .rows = 24 });
     try std.testing.expectEqual(@as(usize, 3), editor.rows(.{ .columns = 7, .rows = 24 }));
@@ -1785,7 +1789,7 @@ test "a horizontal move resets the vertical goal column" {
     try editor.insert("abcdef\nxy\nghijkl");
     editor.caret = 5; // Row 0, column 5.
     editor.moveDown(80); // Clamps to column 2 at the end of "xy".
-    editor.moveLeft(); // Column 1, and the old goal is forgotten.
+    editor.moveLeft(); // Column 1. The move forgets the old goal.
     editor.moveDown(80);
     // The recaptured goal is column 1, not the original 5.
     try std.testing.expectEqual(@as(usize, 11), editor.caret);
@@ -1797,7 +1801,7 @@ test "an edit resets the vertical goal column" {
     try editor.insert("abcdef\nxy\nghijkl");
     editor.caret = 5; // Row 0, column 5.
     editor.moveDown(80); // Clamps to column 2 at the end of "xy".
-    try editor.insert("z"); // "xyz"; the edit forgets the old goal.
+    try editor.insert("z"); // "xyz". The edit forgets the old goal.
     editor.moveDown(80);
     // The recaptured goal is column 3, after "xyz", not the original 5.
     try std.testing.expectEqual(@as(usize, 14), editor.caret);
@@ -1818,7 +1822,7 @@ test "moving right across blank lines does not skip rows" {
 test "a tall body caps its rows and scrolls the window to keep the caret in view" {
     var editor = Editor.init(std.testing.allocator);
     defer editor.deinit();
-    // Ten single-column rows; a 20-row viewport caps the body at six.
+    // Ten single-column rows. A 20-row viewport caps the body at six.
     try editor.insert("l0\nl1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9");
     editor.reflow(.{ .columns = 80, .rows = 20 });
     // Two rules plus the six shown body rows, not the whole ten-row body.
@@ -1828,7 +1832,7 @@ test "a tall body caps its rows and scrolls the window to keep the caret in view
     // Window-relative: below the top rule and the five earlier shown rows.
     try std.testing.expectEqual(@as(usize, 6), editor.caretPosition(80).row);
 
-    // Climbing to the top drags the window back up with the caret.
+    // A climb to the top drags the window back up with the caret.
     for (0..9) |_| editor.moveUp(80);
     editor.reflow(.{ .columns = 80, .rows = 20 });
     try std.testing.expectEqual(@as(usize, 0), editor.scroll);
@@ -1847,17 +1851,17 @@ test "the framing rules report the rows scrolled out of view" {
 
     const painted = try rendered(gpa, &editor, .{ .columns = 40, .rows = 20 });
     defer gpa.free(painted);
-    try std.testing.expect(std.mem.indexOf(u8, painted, "↑ 1 more") != null);
-    try std.testing.expect(std.mem.indexOf(u8, painted, "↓ 3 more") != null);
-    // The shown window carries its rows; the scrolled-off ones do not.
+    try std.testing.expect(std.mem.indexOf(u8, painted, "↑ Hidden: 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "↓ Hidden: 3") != null);
+    // The shown window carries its rows. The scrolled-off ones do not.
     try std.testing.expect(std.mem.indexOf(u8, painted, "l6") != null);
     try std.testing.expect(std.mem.indexOf(u8, painted, "l0") == null);
     try std.testing.expect(std.mem.indexOf(u8, painted, "l9") == null);
 }
 
 // The cancel composition: a lead prompt and recalled steering drafts prepend above
-// the in-progress line, blank-line separated, with the caret left at the end and
-// every paste atom preserved for an exact expansion.
+// the in-progress line, blank-line separated. The caret rests at the end, and
+// every paste atom survives for an exact expansion.
 test "prependComposition composes lead, drafts, then the current line" {
     const gpa = std.testing.allocator;
     var editor = Editor.init(gpa);
@@ -1882,7 +1886,7 @@ test "prependComposition composes lead, drafts, then the current line" {
     editor.prependComposition(&lead, &drafts);
 
     const shown = editor.visible();
-    try std.testing.expect(std.mem.indexOf(u8, shown, "[paste #1 +16 lines]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, shown, "[Paste #1: 16 lines]") != null);
     try std.testing.expect(std.mem.endsWith(u8, shown, "\n\nsteer one\n\nsteer two\n\ntyping"));
     // The caret rests after the in-progress line so typing resumes there.
     try std.testing.expectEqual(shown.len, editor.caret);

@@ -1,6 +1,6 @@
 //! Runs a shell command in the working directory and returns its combined
-//! stdout and stderr, bounded to a tail window and a wall-clock timeout. Output
-//! is sanitized to valid UTF-8 so it can serialize as a JSON tool result.
+//! stdout and stderr, bounded to a tail window and a wall-clock timeout.
+//! Sanitizes the output to valid UTF-8 so it can serialize as a JSON tool result.
 
 const builtin = @import("builtin");
 const std = @import("std");
@@ -11,8 +11,9 @@ const Context = @import("Context.zig");
 const Result = @import("Result.zig");
 const parse = @import("parse.zig");
 
-/// Hard cap on captured output. Beyond this the command is stopped rather than
-/// buffering without bound; the configured window keeps only the tail below it.
+/// The hard cap on captured output. Beyond this, Pith stops the command and
+/// does not buffer without bound. The configured window keeps only the tail
+/// below it.
 const capture_bytes_max = 8 << 20;
 
 /// The UTF-8 replacement character, substituted for malformed input bytes.
@@ -83,16 +84,22 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
         error.Timeout => return Result.report(
             gpa,
             .err,
-            "command timed out after {d}ms",
+            "The command timed out after {d} ms.",
             .{timeout_ms},
         ),
         error.StreamTooLong => return Result.report(
             gpa,
             .err,
-            "command produced over {d} bytes of output and was stopped; narrow it or redirect to a file",
+            "The command produced more than {d} bytes of output and stopped. " ++
+                "Reduce the output or redirect it to a file.",
             .{capture_bytes_max},
         ),
-        else => return Result.report(gpa, .err, "cannot run command: {s}", .{@errorName(err)}),
+        else => return Result.report(
+            gpa,
+            .err,
+            "Pith could not run the command because of technical error {s}.",
+            .{@errorName(err)},
+        ),
     };
     defer gpa.free(completed.output);
 
@@ -170,14 +177,14 @@ fn stopAndReap(
     process_group: std.posix.pid_t,
 ) void {
     std.posix.kill(-process_group, .KILL) catch {};
-    // A canceled `Child.wait` clears the id without reaping; restore the saved
-    // group leader so the uncancelable kill path waits for it.
+    // A canceled `Child.wait` clears the id but does not reap. Restore the
+    // saved group leader so the uncancelable kill path waits for it.
     if (child.id == null) child.id = process_group;
     child.kill(io);
 }
 
-/// Rewrite output into valid UTF-8: complete CSI terminal control sequences and
-/// other control bytes drop, newlines and tabs pass, and malformed bytes become
+/// Rewrite the output into valid UTF-8. Complete CSI terminal control sequences
+/// and other control bytes drop. Newlines and tabs pass. Malformed bytes become
 /// replacement characters.
 fn sanitize(gpa: std.mem.Allocator, input: []const u8) ![]u8 {
     var output_writer: std.Io.Writer.Allocating = .init(gpa);
@@ -206,8 +213,8 @@ fn sanitize(gpa: std.mem.Allocator, input: []const u8) ![]u8 {
     return output_writer.toOwnedSlice();
 }
 
-/// Offset after a complete ESC-[ control sequence, or null when the bytes at
-/// `start` are another escape form, malformed, or incomplete.
+/// The offset after a complete ESC-[ control sequence, or null when the bytes
+/// at `start` are another escape form, malformed, or incomplete.
 fn controlSequenceEnd(input: []const u8, start: usize) ?usize {
     std.debug.assert(start < input.len and input[start] == 0x1b);
     if (input.len - start < 3 or input[start + 1] != '[') return null;
@@ -225,8 +232,8 @@ fn controlSequenceEnd(input: []const u8, start: usize) ?usize {
     return null;
 }
 
-/// The byte length of the valid UTF-8 sequence starting at `index`, or null when
-/// the bytes there are not a complete, valid sequence.
+/// The byte length of the valid UTF-8 sequence that starts at `index`, or null
+/// when the bytes there are not a complete, valid sequence.
 fn decodeAt(bytes: []const u8, index: usize) ?usize {
     const length = std.unicode.utf8ByteSequenceLength(bytes[index]) catch return null;
     if (index + length > bytes.len) return null;
@@ -252,41 +259,38 @@ fn render(
     if (start > 0) {
         if (output[start - 1] == '\n') {
             try result_writer.writer.print(
-                "[earlier output truncated; showing the last {d} of {d} lines]\n",
+                "[Pith omitted earlier output. Pith shows the last {d} of {d} lines.]\n",
                 .{ lineCount(window), lineCount(output) },
             );
         } else {
             try result_writer.writer.print(
-                "[earlier output truncated; showing the last {d} bytes]\n",
+                "[Pith omitted earlier output. Pith shows the last {d} bytes.]\n",
                 .{window.len},
             );
         }
     }
     try result_writer.writer.writeAll(window);
     if (window.len == 0 and start == 0 and !failed)
-        try result_writer.writer.writeAll("(no output)");
+        try result_writer.writer.writeAll("(No output)");
     if (failed) {
         if (result_writer.writer.buffered().len > 0) try result_writer.writer.writeAll("\n\n");
         switch (term) {
             .exited => |code| try result_writer.writer.print(
-                "[command exited with status {d}]",
+                "[The command exited with status {d}.]",
                 .{code},
             ),
-            else => try result_writer.writer.writeAll("[command terminated abnormally]"),
+            else => try result_writer.writer.writeAll("[The command stopped before it completed.]"),
         }
     }
     var summary_output: std.Io.Writer.Allocating = .init(gpa);
     errdefer summary_output.deinit();
     switch (term) {
-        .exited => |code| try summary_output.writer.print("exit {d}", .{code}),
-        else => try summary_output.writer.writeAll("terminated"),
+        .exited => |code| try summary_output.writer.print("Exit status: {d}", .{code}),
+        else => try summary_output.writer.writeAll("Status: Terminated"),
     }
     const lines = lineCount(output);
-    if (lines > 0) {
-        const plural_suffix: []const u8 = if (lines == 1) "" else "s";
-        try summary_output.writer.print(" · {d} line{s}", .{ lines, plural_suffix });
-    }
-    if (start > 0) try summary_output.writer.writeAll(" · output truncated");
+    if (lines > 0) try summary_output.writer.print(" · Lines: {d}", .{lines});
+    if (start > 0) try summary_output.writer.writeAll(" · Output: Truncated");
     const summary = try summary_output.toOwnedSlice();
     errdefer gpa.free(summary);
     const content = try result_writer.toOwnedSlice();
@@ -294,7 +298,7 @@ fn render(
 }
 
 /// The offset of the largest tail within both configured limits. Prefer whole
-/// lines; when no whole trailing line fits, retain a UTF-8-safe byte tail.
+/// lines. When no whole trailing line fits, retain a UTF-8-safe byte tail.
 fn tailStart(text: []const u8, limits: *const Context.Bash) usize {
     if (text.len == 0) return 0;
     if (limits.lines_max == 0 or limits.bytes_max == 0) return text.len;
@@ -322,8 +326,8 @@ fn tailStart(text: []const u8, limits: *const Context.Bash) usize {
     return start;
 }
 
-/// The number of lines in `text`, counting a final line with no trailing
-/// newline; empty text is zero lines.
+/// The number of lines in `text`. A final line with no trailing newline counts.
+/// Empty text is zero lines.
 fn lineCount(text: []const u8) usize {
     if (text.len == 0) return 0;
     const newlines = std.mem.count(u8, text, "\n");
@@ -362,7 +366,7 @@ test "bash reports a non-zero exit as an error" {
     try std.testing.expect(result.is_error);
     try std.testing.expect(std.mem.indexOf(u8, result.content, "boom") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.content, "status 3") != null);
-    try std.testing.expectEqualStrings("exit 3 · 1 line", result.summary.?);
+    try std.testing.expectEqualStrings("Exit status: 3 · Lines: 1", result.summary.?);
 }
 
 test "bash reports empty successful output" {
@@ -373,8 +377,8 @@ test "bash reports empty successful output" {
     );
     defer result.deinit(gpa);
     try std.testing.expect(!result.is_error);
-    try std.testing.expectEqualStrings("(no output)", result.content);
-    try std.testing.expectEqualStrings("exit 0", result.summary.?);
+    try std.testing.expectEqualStrings("(No output)", result.content);
+    try std.testing.expectEqualStrings("Exit status: 0", result.summary.?);
 }
 
 test "bash honors a per-call timeout" {
@@ -385,7 +389,7 @@ test "bash honors a per-call timeout" {
     );
     defer result.deinit(gpa);
     try std.testing.expect(result.is_error);
-    try std.testing.expect(std.mem.indexOf(u8, result.content, "timed out after 1000ms") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "timed out after 1000 ms") != null);
 }
 
 test "bash timeout is absolute while output arrives" {
@@ -400,7 +404,7 @@ test "bash timeout is absolute while output arrives" {
     );
     defer result.deinit(gpa);
     try std.testing.expect(result.is_error);
-    try std.testing.expect(std.mem.indexOf(u8, result.content, "timed out after 100ms") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "timed out after 100 ms") != null);
 }
 
 test "bash timeout reaps a command after output closes" {
@@ -422,7 +426,7 @@ test "bash timeout reaps a command after output closes" {
     const result = try run(&context, input);
     defer result.deinit(gpa);
     try std.testing.expect(result.is_error);
-    try std.testing.expect(std.mem.indexOf(u8, result.content, "timed out after 100ms") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "timed out after 100 ms") != null);
 
     const pid_text = try tmp.dir.readFileAlloc(io, "pid", gpa, .limited(64));
     defer gpa.free(pid_text);
@@ -495,7 +499,7 @@ test "render summary discloses line and byte truncation" {
         const result = try render(gpa, "a\nb\nc\n", &limits, .{ .exited = 0 }, false);
         defer result.deinit(gpa);
         try std.testing.expectEqualStrings(
-            "exit 0 · 3 lines · output truncated",
+            "Exit status: 0 · Lines: 3 · Output: Truncated",
             result.summary.?,
         );
     }
@@ -504,7 +508,7 @@ test "render summary discloses line and byte truncation" {
         const result = try render(gpa, "abcdef\n", &limits, .{ .exited = 0 }, false);
         defer result.deinit(gpa);
         try std.testing.expectEqualStrings(
-            "exit 0 · 1 line · output truncated",
+            "Exit status: 0 · Lines: 1 · Output: Truncated",
             result.summary.?,
         );
     }

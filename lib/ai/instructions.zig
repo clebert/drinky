@@ -58,7 +58,10 @@ pub const Result = struct {
     fn warn(self: *Result, comptime format: []const u8, args: anytype) !void {
         if (self.warnings_capped) return;
         if (self.warning_items.items.len == warnings_max - 1) {
-            const notice = try self.gpa.dupe(u8, "additional instruction warnings omitted");
+            const notice = try self.gpa.dupe(
+                u8,
+                "Pith omitted more warnings about project instructions.",
+            );
             errdefer self.gpa.free(notice);
             try self.warning_items.append(self.gpa, notice);
             self.warnings_capped = true;
@@ -146,10 +149,11 @@ const Discovery = struct {
                     continue;
                 }
                 if (err == error.Canceled or err == error.OutOfMemory) return err;
-                try self.result.warn("{s}: cannot inspect repository marker ({s})", .{
-                    marker_path,
-                    @errorName(err),
-                });
+                try self.result.warn(
+                    "Pith could not inspect the repository marker {s} because of " ++
+                        "technical error {s}.",
+                    .{ marker_path, @errorName(err) },
+                );
                 return .{ .path = current, .has_project_root = false };
             };
             if (stat.kind == .directory or stat.kind == .file) {
@@ -169,10 +173,10 @@ const Discovery = struct {
             .{ .iterate = true },
         ) catch |err| {
             if (err == error.Canceled or err == error.OutOfMemory) return err;
-            try self.result.warn("{s}: cannot scan for AGENTS.md ({s})", .{
-                options.directory,
-                @errorName(err),
-            });
+            try self.result.warn(
+                "Pith could not scan {s} for AGENTS.md because of technical error {s}.",
+                .{ options.directory, @errorName(err) },
+            );
             return;
         };
         defer dir.close(self.io);
@@ -185,10 +189,10 @@ const Discovery = struct {
         for (0..directory_entries_max + 1) |attempt| {
             const maybe_entry = iterator.next(self.io) catch |err| {
                 if (err == error.Canceled or err == error.OutOfMemory) return err;
-                try self.result.warn("{s}: cannot finish scanning for AGENTS.md ({s})", .{
-                    options.directory,
-                    @errorName(err),
-                });
+                try self.result.warn(
+                    "Pith stopped the scan of {s} for AGENTS.md because of technical error {s}.",
+                    .{ options.directory, @errorName(err) },
+                );
                 break;
             };
             const entry = maybe_entry orelse {
@@ -197,7 +201,7 @@ const Discovery = struct {
             };
             if (attempt == directory_entries_max) {
                 try self.result.warn(
-                    "{s}: stopped scanning for AGENTS.md after {d} entries",
+                    "Pith stopped the scan of {s} for AGENTS.md after {d} entries.",
                     .{ options.directory, directory_entries_max },
                 );
                 break;
@@ -226,7 +230,7 @@ const Discovery = struct {
             const path = try std.fs.path.join(self.gpa, &.{ options.directory, "CLAUDE.md" });
             defer self.gpa.free(path);
             if (try self.isRegularFile(path)) try self.result.warn(
-                "{s} is ignored; pith loads AGENTS.md (add or link one here)",
+                "Pith ignored {s}. Add or link an AGENTS.md file in the same directory.",
                 .{path},
             );
         }
@@ -234,7 +238,8 @@ const Discovery = struct {
             const path = try std.fs.path.join(self.gpa, &.{ options.directory, "AGENT.md" });
             defer self.gpa.free(path);
             if (try self.isRegularFile(path)) try self.result.warn(
-                "{s} is ignored; did you mean AGENTS.md?",
+                "Pith ignored {s}. Rename the file to AGENTS.md if it contains project " ++
+                    "instructions.",
                 .{path},
             );
         }
@@ -252,7 +257,10 @@ const Discovery = struct {
         if (!std.unicode.utf8ValidateSlice(options.source_path)) {
             const safe_path = try diagnosticAlloc(self.gpa, options.source_path);
             defer self.gpa.free(safe_path);
-            try self.result.warn("{s}: instruction path is not valid UTF-8; skipped", .{safe_path});
+            try self.result.warn(
+                "Pith skipped the instruction path {s} because it is not valid UTF-8.",
+                .{safe_path},
+            );
             return;
         }
         const stat = std.Io.Dir.cwd().statFile(
@@ -261,10 +269,10 @@ const Discovery = struct {
             .{ .follow_symlinks = false },
         ) catch |err| {
             if (err == error.Canceled or err == error.OutOfMemory) return err;
-            try self.result.warn("{s}: cannot inspect AGENTS.md ({s}); skipped", .{
-                options.source_path,
-                @errorName(err),
-            });
+            try self.result.warn(
+                "Pith could not inspect {s} because of technical error {s}.",
+                .{ options.source_path, @errorName(err) },
+            );
             return;
         };
         switch (stat.kind) {
@@ -283,12 +291,13 @@ const Discovery = struct {
                     if (err == error.Canceled or err == error.OutOfMemory) return err;
                     if (err == error.FileNotFound) {
                         try self.result.warn(
-                            "{s}: AGENTS.md symlink is dangling; skipped",
+                            "Pith skipped the symbolic link {s} because its target does not exist.",
                             .{options.source_path},
                         );
                     } else {
                         try self.result.warn(
-                            "{s}: cannot inspect AGENTS.md symlink target ({s}); skipped",
+                            "Pith could not inspect the target of {s} because of " ++
+                                "technical error {s}.",
                             .{ options.source_path, @errorName(err) },
                         );
                     }
@@ -296,7 +305,7 @@ const Discovery = struct {
                 };
                 if (target_stat.kind != .file) {
                     try self.result.warn(
-                        "{s}: AGENTS.md symlink target is not a regular file; skipped",
+                        "Pith skipped {s} because the symbolic-link target is not a regular file.",
                         .{options.source_path},
                     );
                     return;
@@ -308,9 +317,10 @@ const Discovery = struct {
                     .was_symlink = true,
                 });
             },
-            else => try self.result.warn("{s}: AGENTS.md is not a regular file; skipped", .{
-                options.source_path,
-            }),
+            else => try self.result.warn(
+                "Pith skipped {s} because it is not a regular file.",
+                .{options.source_path},
+            ),
         }
     }
 
@@ -322,14 +332,14 @@ const Discovery = struct {
             if (err == error.Canceled or err == error.OutOfMemory) return err;
             if (options.was_symlink and err == error.FileNotFound) {
                 try self.result.warn(
-                    "{s}: AGENTS.md symlink is dangling; skipped",
+                    "Pith skipped the symbolic link {s} because its target does not exist.",
                     .{options.source_path},
                 );
             } else {
-                try self.result.warn("{s}: cannot open AGENTS.md ({s}); skipped", .{
-                    options.source_path,
-                    @errorName(err),
-                });
+                try self.result.warn(
+                    "Pith could not open {s} because of technical error {s}.",
+                    .{ options.source_path, @errorName(err) },
+                );
             }
             return;
         };
@@ -337,26 +347,27 @@ const Discovery = struct {
 
         const stat = file.stat(self.io) catch |err| {
             if (err == error.Canceled or err == error.OutOfMemory) return err;
-            try self.result.warn("{s}: cannot inspect open AGENTS.md ({s}); skipped", .{
-                options.source_path,
-                @errorName(err),
-            });
+            try self.result.warn(
+                "Pith could not inspect the open file {s} because of technical error {s}.",
+                .{ options.source_path, @errorName(err) },
+            );
             return;
         };
         if (stat.kind != .file) {
-            try self.result.warn("{s}: AGENTS.md is not a regular file; skipped", .{
-                options.source_path,
-            });
+            try self.result.warn(
+                "Pith skipped {s} because it is not a regular file.",
+                .{options.source_path},
+            );
             return;
         }
 
         var target_buffer: [std.fs.max_path_bytes]u8 = undefined;
         const target_length = file.realPath(self.io, &target_buffer) catch |err| {
             if (err == error.Canceled or err == error.OutOfMemory) return err;
-            try self.result.warn("{s}: cannot resolve open AGENTS.md ({s}); skipped", .{
-                options.source_path,
-                @errorName(err),
-            });
+            try self.result.warn(
+                "Pith could not resolve {s} because of technical error {s}.",
+                .{ options.source_path, @errorName(err) },
+            );
             return;
         };
         if (!pathWithin(&.{
@@ -364,7 +375,7 @@ const Discovery = struct {
             .target = target_buffer[0..target_length],
         })) {
             try self.result.warn(
-                "{s}: AGENTS.md resolves outside the project boundary; skipped",
+                "Pith skipped {s} because it resolves outside the project boundary.",
                 .{options.source_path},
             );
             return;
@@ -381,16 +392,16 @@ const Discovery = struct {
             switch (err) {
                 error.OutOfMemory => return err,
                 error.StreamTooLong => try self.result.warn(
-                    "{s}: AGENTS.md exceeds 32 KiB; skipped",
+                    "Pith skipped {s} because it is larger than 32 KiB.",
                     .{options.source_path},
                 ),
                 error.ReadFailed => {
                     const read_error = file_reader.err.?;
                     if (read_error == error.Canceled) return read_error;
-                    try self.result.warn("{s}: cannot read AGENTS.md ({s}); skipped", .{
-                        options.source_path,
-                        @errorName(read_error),
-                    });
+                    try self.result.warn(
+                        "Pith could not read {s} because of technical error {s}.",
+                        .{ options.source_path, @errorName(read_error) },
+                    );
                 },
             }
             return;
@@ -401,37 +412,42 @@ const Discovery = struct {
             return;
         }
         if (content.len > file_bytes_max) {
-            try self.result.warn("{s}: AGENTS.md exceeds 32 KiB; skipped", .{
-                options.source_path,
-            });
+            try self.result.warn(
+                "Pith skipped {s} because it is larger than 32 KiB.",
+                .{options.source_path},
+            );
             self.gpa.free(content);
             return;
         }
         if (std.mem.indexOfScalar(u8, content, 0) != null) {
-            try self.result.warn("{s}: AGENTS.md contains a NUL byte; skipped", .{
-                options.source_path,
-            });
+            try self.result.warn(
+                "Pith skipped {s} because it contains a NUL byte.",
+                .{options.source_path},
+            );
             self.gpa.free(content);
             return;
         }
         if (!std.unicode.utf8ValidateSlice(content)) {
-            try self.result.warn("{s}: AGENTS.md is not valid UTF-8; skipped", .{
-                options.source_path,
-            });
+            try self.result.warn(
+                "Pith skipped {s} because it is not valid UTF-8.",
+                .{options.source_path},
+            );
             self.gpa.free(content);
             return;
         }
         if (self.result.entry_items.items.len == entries_max) {
-            try self.result.warn("{s}: the 32-file instruction limit was reached; skipped", .{
-                options.source_path,
-            });
+            try self.result.warn(
+                "Pith skipped {s} because Pith already loaded 32 project instruction files.",
+                .{options.source_path},
+            );
             self.gpa.free(content);
             return;
         }
         if (content.len > source_bytes_max - self.source_bytes_total) {
-            try self.result.warn("{s}: the 64 KiB instruction limit was reached; skipped", .{
-                options.source_path,
-            });
+            try self.result.warn(
+                "Pith skipped {s} to keep the project instructions at or below 64 KiB.",
+                .{options.source_path},
+            );
             self.gpa.free(content);
             return;
         }
@@ -478,7 +494,7 @@ pub fn diagnosticAlloc(gpa: std.mem.Allocator, text: []const u8) ![]u8 {
     return escapedAlloc(gpa, text, 96);
 }
 
-/// Escape control and format characters, truncating oversized startup messages safely.
+/// Escape control and format characters. Truncate oversized startup messages safely.
 pub fn displayAlloc(gpa: std.mem.Allocator, text: []const u8) ![]u8 {
     return escapedAlloc(gpa, text, display_bytes_max);
 }
@@ -695,7 +711,7 @@ test "invalid and oversized files are skipped while empty files are silent" {
     try std.testing.expectEqual(@as(usize, 1), result.entries().len);
     try std.testing.expectEqual(@as(usize, file_bytes_max), result.entries()[0].content.len);
     try std.testing.expectEqual(@as(usize, 3), result.warnings().len);
-    try std.testing.expect(std.mem.indexOf(u8, result.warnings()[0], "exceeds 32 KiB") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.warnings()[0], "larger than 32 KiB") != null);
 }
 
 test "instruction warnings are bounded" {
@@ -707,7 +723,7 @@ test "instruction warnings are bounded" {
 
     try std.testing.expectEqual(@as(usize, warnings_max), result.warnings().len);
     try std.testing.expectEqualStrings(
-        "additional instruction warnings omitted",
+        "Pith omitted more warnings about project instructions.",
         result.warnings()[warnings_max - 1],
     );
 }
@@ -846,7 +862,7 @@ test "unreadable instruction files warn and do not load" {
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 0), result.entries().len);
     try std.testing.expectEqual(@as(usize, 1), result.warnings().len);
-    try std.testing.expect(std.mem.indexOf(u8, result.warnings()[0], "cannot open") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.warnings()[0], "could not open") != null);
 }
 
 test "repository marker inspection errors stop ancestor traversal conservatively" {
@@ -883,7 +899,7 @@ test "repository marker inspection errors stop ancestor traversal conservatively
     try std.testing.expect(std.mem.indexOf(
         u8,
         result.warnings()[0],
-        "cannot inspect repository marker",
+        "could not inspect the repository marker",
     ) != null);
 }
 

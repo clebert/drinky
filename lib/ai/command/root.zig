@@ -1,5 +1,5 @@
-//! Slash-command registry, mirroring the tool registry: each command module
-//! exposes `name`/`run` and is registered below.
+//! Slash-command registry that mirrors the tool registry. Each command module
+//! exposes `name`/`run` and appears in the list below.
 
 const std = @import("std");
 
@@ -30,7 +30,7 @@ const commands = [_]Entry{
     .{ .name = system.name, .run = system.run },
 };
 
-/// Dispatch a `/`-prefixed input line to its command; an unknown command is an error.
+/// Dispatch a `/`-prefixed input line to its command. An unknown command returns a notice.
 pub fn run(context: *Context, line: []const u8) !Outcome {
     const body = line[1..];
     // Editor input can carry interior newlines (Shift+Enter, paste).
@@ -39,25 +39,47 @@ pub fn run(context: *Context, line: []const u8) !Outcome {
     for (&commands) |*entry| {
         if (std.mem.eql(u8, name, entry.name)) return entry.run(context);
     }
-    return Outcome.report(context.gpa, .err, "unknown command: /{s}", .{name});
+    return Outcome.reportNotice(
+        context.gpa,
+        .failure,
+        "Pith does not recognize the command /{s}.",
+        .{name},
+    );
 }
 
 fn runSkill(context: *Context, line: []const u8, command_name: []const u8) !Outcome {
     const name = command_name["skill:".len..];
     if (name.len == 0)
-        return Outcome.report(context.gpa, .err, "skill name is required", .{});
+        return Outcome.reportNotice(
+            context.gpa,
+            .failure,
+            "Enter a skill name after /skill:.",
+            .{},
+        );
     const registry = context.skill_registry orelse
-        return Outcome.report(context.gpa, .err, "unknown skill: {s}", .{name});
+        return Outcome.reportNotice(
+            context.gpa,
+            .failure,
+            "Pith does not recognize the skill {s}.",
+            .{name},
+        );
     const skill = registry.get(name) orelse
-        return Outcome.report(context.gpa, .err, "unknown skill: {s}", .{name});
+        return Outcome.reportNotice(
+            context.gpa,
+            .failure,
+            "Pith does not recognize the skill {s}.",
+            .{name},
+        );
     const body = line[1..];
     const arguments = std.mem.trim(u8, body[command_name.len..], " \t\r\n");
     const content = skill.invoke(context.gpa, context.io, arguments) catch |err| {
         if (err == error.Canceled or err == error.OutOfMemory) return err;
-        return Outcome.report(context.gpa, .err, "cannot load skill {s}: {s}", .{
-            name,
-            @errorName(err),
-        });
+        return Outcome.reportNotice(
+            context.gpa,
+            .failure,
+            "Pith could not load the skill {s} because of technical error {s}.",
+            .{ name, @errorName(err) },
+        );
     };
     errdefer context.gpa.free(content);
     const name_copy = try context.gpa.dupe(u8, name);
@@ -78,7 +100,7 @@ test "unknown command is reported" {
         .agent = undefined,
         .accounts = undefined,
     };
-    try Outcome.expectFeedback(try run(&context, "/nope"), .err);
+    try Outcome.expectNotice(try run(&context, "/nope"), .failure);
 }
 
 test "run routes a known command, ignoring the argument tail" {
@@ -119,11 +141,14 @@ test "a newline delimits the command name like a space" {
     };
     const outcome = try run(&context, "/nope\nfoo");
     switch (outcome) {
-        .feedback => |feedback| {
-            defer gpa.free(feedback.content);
-            try std.testing.expectEqualStrings("unknown command: /nope", feedback.content);
+        .notice => |notice| {
+            defer gpa.free(notice.content);
+            try std.testing.expectEqualStrings(
+                "Pith does not recognize the command /nope.",
+                notice.content,
+            );
         },
-        else => return error.ExpectedFeedback,
+        else => return error.ExpectedNotice,
     }
 }
 
@@ -181,6 +206,10 @@ test "skill prefix reports missing and unknown names" {
         .agent = undefined,
         .accounts = undefined,
     };
-    try Outcome.expectFeedbackContaining(try run(&context, "/skill:"), .err, "required");
-    try Outcome.expectFeedbackContaining(try run(&context, "/skill:nope"), .err, "unknown skill");
+    try Outcome.expectNoticeContaining(try run(&context, "/skill:"), .failure, "skill name");
+    try Outcome.expectNoticeContaining(
+        try run(&context, "/skill:nope"),
+        .failure,
+        "does not recognize the skill",
+    );
 }

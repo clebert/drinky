@@ -7,8 +7,8 @@ const std = @import("std");
 
 const net = @import("net.zig");
 
-/// Hard cap on a token response body, well above any real exchange or refresh
-/// payload.
+/// The hard cap on a token response body, well above any real exchange or
+/// refresh payload.
 const token_response_bytes_max = 256 * 1024;
 
 const verifier_len = std.base64.url_safe_no_pad.Encoder.calcSize(32);
@@ -30,8 +30,8 @@ pub fn pkce(io: std.Io) Pkce {
     return result;
 }
 
-/// POST `body` to `url` and return the owned response body; caller frees. The
-/// request is bounded by the connect timeout: the whole connect, send,
+/// POST `body` to `url` and return the owned response body. The caller frees
+/// it. The request is bounded by the connect timeout: the whole connect, send,
 /// receive-head, and body read must finish within it, or it is cancelled and
 /// reaped as `error.Timeout`.
 pub fn post(
@@ -50,8 +50,8 @@ pub fn post(
 
 /// Run `work` (which writes its result into `out`) bounded by `timeout_ms`. The
 /// timeout races the request, so one that finished right at the deadline can
-/// still surface as an error with its result discarded; reclaim anything left in
-/// `out` on any error so a completed-at-the-deadline request cannot leak.
+/// still surface as an error with its result discarded. Reclaim anything left
+/// in `out` on any error so a completed-at-the-deadline request cannot leak.
 fn awaitBody(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -104,7 +104,7 @@ fn fetchInto(
 }
 
 /// The response body: a body over `token_response_bytes_max` fails with
-/// `error.TokenResponseTooLarge` rather than allocating without bound.
+/// `error.TokenResponseTooLarge` and does not allocate without bound.
 fn readBody(gpa: std.mem.Allocator, reader: *std.Io.Reader) ![]u8 {
     return reader.allocRemaining(gpa, .limited(token_response_bytes_max)) catch |err| switch (err) {
         error.StreamTooLong => error.TokenResponseTooLarge,

@@ -1,9 +1,9 @@
-//! Global configuration loaded from `<home>/.pith/config.json`. The file is
-//! optional and may be partial: a missing file, a missing section, or a missing
-//! field falls back to a built-in default, and unknown keys are ignored so an
+//! The global configuration loaded from `<home>/.pith/config.json`. The file is
+//! optional and can be partial. A missing file, a missing section, or a missing
+//! field falls back to a built-in default. Pith ignores unknown keys so an
 //! older binary still reads a newer file. The `File` struct below is the
-//! authoritative shape and default for every key; more sections join it as the
-//! harness grows. It carries no secrets — API keys come from the environment.
+//! authoritative shape and default for every key. More sections join it as the
+//! harness grows. It carries no secrets. API keys come from the environment.
 
 const std = @import("std");
 
@@ -15,14 +15,15 @@ timeouts: ai.net.Timeouts = .{},
 retry: ai.net.Retry = .{},
 bash: ai.tool.Context.Bash = .{},
 default_models: DefaultModels = .{},
-/// Configured default-model names that did not resolve (unknown, or a model of
-/// the wrong vendor for their account), kept so the app can tell the user their
-/// line was ignored. Empty on the built-in default. Owned; freed by `deinit`.
+/// The configured default-model names that did not resolve (unknown, or a model
+/// of the wrong vendor for their account). The config keeps them so the app can
+/// tell the user Pith ignored their line. Empty on the built-in default. Owned.
+/// `deinit` frees them.
 dropped_defaults: []const DroppedDefault = &.{},
 
 /// The configured default model per account, resolved against the compiled model
-/// table (an unset or unknown name is null, so the caller falls back to a
-/// compiled default). A resolved model's name points into the static table, so
+/// table. An unset or unknown name is null, so the caller falls back to a
+/// compiled default. A resolved model's name points into the static table, so
 /// this outlives the parse with no owned memory.
 pub const DefaultModels = struct {
     anthropic_api: ?ai.models.Model = null,
@@ -37,8 +38,8 @@ pub const DefaultModels = struct {
     }
 };
 
-/// A configured default-model name that did not resolve, with the account it was
-/// written under. Owns `name` (duped out of the parsed file).
+/// A configured default-model name that did not resolve, with the account the
+/// user wrote it under. Owns `name` (duped out of the parsed file).
 pub const DroppedDefault = struct {
     account: ai.llm.Account,
     name: []const u8,
@@ -64,7 +65,7 @@ const File = struct {
         timeout_ms: u64 = bash_default.timeout_ms,
     };
 
-    /// Model names keyed by account tag; each resolved to a compiled model.
+    /// Model names keyed by account tag. Each resolves to a compiled model.
     const DefaultModelsFile = struct {
         anthropic_api: ?[]const u8 = null,
         anthropic_subscription: ?[]const u8 = null,
@@ -97,7 +98,7 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, home: []const u8) !Config {
     return parse(gpa, data);
 }
 
-/// Parse config JSON, folding each section into the neutral option structs.
+/// Parse config JSON and fold each section into the neutral option structs.
 fn parse(gpa: std.mem.Allocator, data: []const u8) !Config {
     const parsed = try std.json.parseFromSlice(File, gpa, data, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
@@ -148,8 +149,8 @@ fn parse(gpa: std.mem.Allocator, data: []const u8) !Config {
 
 /// Resolve a configured model name for `account` against the compiled table for
 /// that account's vendor. A name that is unknown or belongs to another vendor
-/// resolves to null and is recorded in `dropped` so the app can surface it; an
-/// unset name is just null.
+/// resolves to null. The function also records it in `dropped` so the app can
+/// surface it. An unset name is just null.
 fn resolveModel(
     gpa: std.mem.Allocator,
     dropped: *std.ArrayList(DroppedDefault),
@@ -223,8 +224,8 @@ test "parse resolves default_models to compiled models, dropping unknown names" 
     try std.testing.expect(config.default_models.get(.openai_api) == null);
     try std.testing.expect(config.default_models.get(.openai_subscription) == null);
 
-    // The two present-but-unresolved names are recorded for the app to surface;
-    // the valid one and the unset ones are not.
+    // The parse records the two present-but-unresolved names for the app to
+    // surface. It does not record the valid one or the unset ones.
     try std.testing.expectEqual(@as(usize, 2), config.dropped_defaults.len);
     try std.testing.expectEqual(ai.llm.Account.anthropic_api, config.dropped_defaults[0].account);
     try std.testing.expectEqualStrings("gpt-5.6-sol", config.dropped_defaults[0].name);

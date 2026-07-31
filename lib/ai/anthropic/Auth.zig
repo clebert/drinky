@@ -1,4 +1,4 @@
-//! Credential lifecycle for subscription OAuth: the shared `auth` lifecycle
+//! The credential lifecycle for subscription OAuth: the shared `auth` lifecycle
 //! instantiated over `oauth`'s protocol for the `"anthropic_subscription"`
 //! entry in `<home>/.pith/auth.json`.
 
@@ -13,7 +13,7 @@ const oauth = @import("oauth.zig");
 
 const Auth = @This();
 
-/// Top-level key this account's credentials live under in `auth.json`.
+/// The top-level key this account's credentials live under in `auth.json`.
 const account_key = "anthropic_subscription";
 
 gpa: std.mem.Allocator,
@@ -32,13 +32,14 @@ pub fn deinit(self: *Auth) void {
     self.gpa.free(self.path);
 }
 
-/// Load stored tokens. Returns false when the file is absent or holds no
-/// Anthropic subscription credential.
+/// Load stored tokens. The call returns false when the file is absent or holds
+/// no Anthropic subscription credential.
 pub fn load(self: *Auth) !bool {
     return auth.load(self, account_key);
 }
 
-/// A valid access token, refreshing and persisting it first if it has expired.
+/// A valid access token. If the stored token has expired, this call refreshes
+/// and persists it first.
 pub fn accessToken(self: *Auth) ![]const u8 {
     return auth.accessToken(self, account_key, refreshTokens);
 }
@@ -74,7 +75,7 @@ fn exchangeRedirect(
 }
 
 /// Drop this account's credentials: clear the in-memory tokens and remove its
-/// entry from `auth.json`, preserving every other account's entry.
+/// entry from `auth.json`. The removal preserves every other account's entry.
 pub fn logout(self: *Auth) !void {
     return auth.logout(self, account_key);
 }
@@ -182,7 +183,8 @@ test "an expired access token is refreshed and re-persisted" {
 // The rotation-durability race: the server has already consumed the old refresh
 // token when a cancel (the catalog fetch's timeout, a turn cancel) lands at the
 // save. The commit+save runs cancel-protected, so the rotated credential still
-// reaches memory and disk; the cancel fires at the caller's next cancelation point.
+// reaches memory and disk. The cancel fires at the caller's next cancelation
+// point.
 test "a cancel landing at the save cannot lose the rotated credential" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;

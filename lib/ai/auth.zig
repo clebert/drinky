@@ -1,10 +1,11 @@
-//! The credential lifecycle both subscription OAuth accounts share: load and
-//! persist a provider's tokens under its `account_key` in the keyed `auth.json`
-//! store, refresh a stale access token on demand, and run the interactive login
-//! (browser + loopback callback). Generic over each provider's `Auth` file
-//! struct (`gpa`/`io`/`timeouts`/`path`/`tokens` fields): the on-disk entry
-//! mirrors the provider's `Tokens` fields, and every save is a load-merge-write
-//! through `auth_store` that never clobbers another account's entry.
+//! The credential lifecycle that both subscription OAuth accounts share. Load
+//! and persist a provider's tokens under its `account_key` in the keyed
+//! `auth.json` store. Refresh a stale access token on demand. Run the
+//! interactive login (browser + loopback callback). Generic over each
+//! provider's `Auth` file struct (`gpa`/`io`/`timeouts`/`path`/`tokens`
+//! fields): the on-disk entry mirrors the provider's `Tokens` fields. Every
+//! save is a load-merge-write through `auth_store` that never clobbers another
+//! account's entry.
 
 const std = @import("std");
 
@@ -14,7 +15,7 @@ const oauth_login = @import("oauth_login.zig");
 const oauth_wire = @import("oauth_wire.zig");
 
 /// A committed login's persistence outcome. The credential is live in both
-/// cases; `memory_only` carries the save failure for the caller to present.
+/// cases. `memory_only` carries the save failure for the caller to present.
 pub const Login = union(enum) {
     saved: []const u8,
     memory_only: struct {
@@ -23,7 +24,7 @@ pub const Login = union(enum) {
     },
 };
 
-/// Load stored tokens, reading each `Tokens` field from the entry by name.
+/// Load stored tokens. Read each `Tokens` field from the entry by name.
 /// Returns false when the file is absent or holds no `account_key` entry (the
 /// account is simply signed out).
 pub fn load(auth: anytype, comptime account_key: []const u8) !bool {
@@ -58,11 +59,11 @@ pub fn load(auth: anytype, comptime account_key: []const u8) !bool {
     return true;
 }
 
-/// A valid access token, refreshing and persisting it first if it has expired.
-/// `refreshFn` has the provider refresher's `(gpa, io, timeouts, tokens)` shape,
-/// so tests pin the credential lifecycle without the network. Refresh before
-/// touching the stored tokens: a failed refresh leaves the stored credential
-/// intact.
+/// A valid access token. If the token has expired, refresh and persist it
+/// first. `refreshFn` has the provider refresher's `(gpa, io, timeouts,
+/// tokens)` shape, so tests pin the credential lifecycle without the network.
+/// The refresh runs before any change to the stored tokens: a failed refresh
+/// leaves the stored credential intact.
 pub fn accessToken(
     auth: anytype,
     comptime account_key: []const u8,
@@ -73,9 +74,10 @@ pub fn accessToken(
     if (now_ms >= tokens.expires_ms) {
         const fresh = try refreshFn(auth.gpa, auth.io, auth.timeouts, tokens);
         // The refresh consumed the stored (single-use) refresh token server-side,
-        // so `fresh` is now the only usable credential: block cancellation until
-        // it is committed and persisted, or a cancel landing at the save (the
-        // catalog fetch runs `accessToken` under a timeout) would lose it.
+        // so `fresh` is now the only usable credential. Block cancellation until
+        // it is committed and persisted. Without the block, a cancel that lands
+        // at the save (the catalog fetch runs `accessToken` under a timeout)
+        // loses the credential.
         const protection = auth.io.swapCancelProtection(.blocked);
         defer _ = auth.io.swapCancelProtection(protection);
         tokens.deinit(auth.gpa);
@@ -85,10 +87,10 @@ pub fn accessToken(
     return auth.tokens.?.access;
 }
 
-/// Run the interactive OAuth login, reporting pre-commit runtime text through
+/// Run the interactive OAuth login and report pre-commit runtime text through
 /// the caller's presentation boundary. `oauth` is the provider protocol module
-/// (the authorize URL and callback port); `exchangeFn(auth, redirect, pair)`
-/// trades the redirect for tokens, applying provider-specific checks first.
+/// (the authorize URL and callback port). `exchangeFn(auth, redirect, pair)`
+/// applies provider-specific checks first, then trades the redirect for tokens.
 /// Once tokens are installed, the function returns a non-error persistence
 /// outcome so callers cannot mistake presentation failure for login failure.
 pub fn login(
@@ -129,17 +131,17 @@ fn commit(auth: anytype, comptime account_key: []const u8, tokens: anytype) Logi
 }
 
 /// Drop this account's credentials: clear the in-memory tokens and remove its
-/// entry from `auth.json`, preserving every other account's entry.
+/// entry from `auth.json`. Every other account's entry stays intact.
 pub fn logout(auth: anytype, comptime account_key: []const u8) !void {
     // Remove the on-disk entry first: a failed remove then leaves the credentials
-    // fully intact (in memory and the caller's readiness flag), so logout is
-    // atomic rather than leaving a token-less account still marked authenticated.
+    // fully intact (in memory and the caller's readiness flag). Logout is atomic
+    // and cannot leave a token-less account still marked authenticated.
     try auth_store.remove(auth.gpa, auth.io, auth.path, account_key);
     if (auth.tokens) |tokens| tokens.deinit(auth.gpa);
     auth.tokens = null;
 }
 
-/// Persist the current tokens under `account_key`; the on-disk entry is the
+/// Persist the current tokens under `account_key`. The on-disk entry is the
 /// `Tokens` fields verbatim.
 pub fn save(auth: anytype, comptime account_key: []const u8) !void {
     const tokens = auth.tokens orelse return error.NotAuthenticated;
@@ -215,7 +217,7 @@ test "a failed persist returns memory-only login and keeps credentials usable" {
         .saved => return error.UnexpectedLoginPersistence,
     }
 
-    // A writable path persists (creating its parent) and returns its path.
+    // A writable path persists (the save creates its parent) and returns its path.
     var ok_buf: [160]u8 = undefined;
     subject.path =
         try std.fmt.bufPrint(&ok_buf, ".zig-cache/tmp/{s}/ok/auth.json", .{tmp.sub_path});

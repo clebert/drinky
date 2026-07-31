@@ -1,8 +1,8 @@
 //! A thread-safe queue of steering messages: text the user submits mid-turn,
 //! handed from the UI thread to the turn worker. The queue owns each message
-//! until taken. The UI thread pushes or recalls; the worker takes for delivery.
-//! A failed delivery restores its whole batch as a queue prefix without allocating,
-//! ahead of messages submitted since the take.
+//! until taken. The UI thread pushes or recalls. The worker takes for delivery.
+//! A failed delivery restores its whole batch as a queue prefix without an
+//! allocation, ahead of messages submitted since the take.
 
 const std = @import("std");
 
@@ -11,8 +11,9 @@ const Steering = @This();
 gpa: std.mem.Allocator,
 io: std.Io,
 mutex: std.Io.Mutex,
-/// A restored batch ahead of `messages`, retaining its original outer allocation.
-/// At most one exists because restoration ends the operation that took it.
+/// A restored batch ahead of `messages` that retains its original outer
+/// allocation. At most one exists because restoration ends the operation that
+/// took it.
 restored_prefix: std.ArrayList([]u8),
 messages: std.ArrayList([]u8),
 
@@ -31,9 +32,9 @@ pub fn deinit(self: *Steering) void {
     freeMessages(self.gpa, &self.messages);
 }
 
-/// Atomically discard every queued message without allocating. Messages pushed
-/// after the swap remain queued; callers still synchronize with any producer
-/// whose earlier push must also be discarded.
+/// Atomically discard every queued message without an allocation. Messages
+/// pushed after the swap remain queued. Callers still synchronize with any
+/// producer whose earlier push must also be discarded.
 pub fn clear(self: *Steering) void {
     self.mutex.lockUncancelable(self.io);
     var restored_prefix = self.restored_prefix;
@@ -46,7 +47,8 @@ pub fn clear(self: *Steering) void {
     freeMessages(self.gpa, &messages);
 }
 
-/// Queue a copy of `text`. Duplicated before the lock so only the append is held.
+/// Queue a copy of `text`. The duplication runs before the lock, so only the
+/// append is held.
 pub fn push(self: *Steering, text: []const u8) !void {
     const copy = try self.gpa.dupe(u8, text);
     errdefer self.gpa.free(copy);
@@ -55,17 +57,17 @@ pub fn push(self: *Steering, text: []const u8) !void {
     try self.messages.append(self.gpa, copy);
 }
 
-/// Take every queued message in logical order, transferring ownership to the
-/// caller and emptying both the restored prefix and ordinary queue.
+/// Take every queued message in logical order. The take transfers ownership to
+/// the caller and empties both the restored prefix and ordinary queue.
 pub fn take(self: *Steering) ![][]u8 {
     self.mutex.lockUncancelable(self.io);
     defer self.mutex.unlock(self.io);
     return self.takeLocked();
 }
 
-/// Restore a previously taken batch as the queue prefix. Moving the original
-/// outer allocation makes the whole batch visible at once, ahead of messages
-/// queued since the take, and leaves the source empty.
+/// Restore a previously taken batch as the queue prefix. The move of the
+/// original outer allocation makes the whole batch visible at once, ahead of
+/// messages queued since the take. The move leaves the source empty.
 pub fn restoreTaken(self: *Steering, messages: *[][]u8) void {
     self.mutex.lockUncancelable(self.io);
     defer self.mutex.unlock(self.io);
@@ -100,8 +102,9 @@ fn freeMessages(gpa: std.mem.Allocator, messages: *std.ArrayList([]u8)) void {
     messages.deinit(gpa);
 }
 
-/// Combine `messages` into one string, blank-line separated — the single form
-/// the queue is delivered, edited, and re-sent in. Caller owns the result.
+/// Combine `messages` into one string, blank-line separated. This is the
+/// single form the queue is delivered, edited, and re-sent in. The caller owns
+/// the result.
 pub fn join(gpa: std.mem.Allocator, messages: []const []const u8) ![]u8 {
     var buffer: std.ArrayList(u8) = .empty;
     errdefer buffer.deinit(gpa);
@@ -322,8 +325,8 @@ test "push and take survive concurrent contention" {
     defer steering.deinit();
 
     // Force the mutex slow path: hold the lock until every producer parks
-    // (state `.contended`), then unlock to run the wakeup — the contended path
-    // the single-threaded tests never reach.
+    // (state `.contended`), then unlock to run the wakeup. This is the
+    // contended path the single-threaded tests never reach.
     steering.mutex.lockUncancelable(io);
     var futures: [producer_count]std.Io.Future(error{OutOfMemory}!void) = undefined;
     for (&futures, 0..) |*future, index| {
@@ -350,9 +353,9 @@ test "push and take survive concurrent contention" {
     steering.mutex.unlock(io);
     try std.testing.expect(forced_contended);
 
-    // Drain concurrently with the producers: `seen` catches loss and duplication,
-    // `parse` corruption; the capped empty-spin fails a lost message rather than
-    // hanging.
+    // Drain concurrently with the producers: `seen` catches loss and
+    // duplication, and `parse` catches corruption. The capped empty-spin fails
+    // a lost message rather than hangs.
     const seen = try gpa.alloc(bool, total);
     defer gpa.free(seen);
     @memset(seen, false);

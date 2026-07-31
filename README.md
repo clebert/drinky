@@ -1,9 +1,9 @@
 # pith
 
 A minimal, dependency-free coding-agent harness in Zig, inspired by
-[pi](https://github.com/earendil-works/pi-mono). Writing the agent loop is the easy part; the hard
-part is the terminal UI. The goal here is a tiny hand-rolled TUI renderer that targets only modern
-terminals (Ghostty, kitty, WezTerm) and keeps the line count as low as possible.
+[pi](https://github.com/earendil-works/pi-mono). The agent loop is the easy part. The terminal UI
+is the hard part. The goal here is a tiny hand-rolled TUI renderer that targets only modern
+terminals (Ghostty, kitty, WezTerm). It keeps the line count as low as possible.
 
 The name is a placeholder.
 
@@ -15,13 +15,13 @@ zig build run      # run
 zig build test     # run all tests
 ```
 
-Requires Zig 0.16.0.
+Pith requires Zig 0.16.0.
 
 ## Trust
 
 Project `AGENTS.md` files and skills are repository-controlled model instructions. Open untrusted
-repositories only inside an external container or sandbox; pith does not yet provide either a
-permission gate or a sandbox.
+repositories only inside an external container or sandbox. Pith does not yet provide a permission
+gate or a sandbox.
 
 ## Roadmap
 

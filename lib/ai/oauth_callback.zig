@@ -7,7 +7,7 @@ const net = @import("net.zig");
 
 const callback_timeout_ms = 5 * std.time.ms_per_min;
 const request_bytes_max = 8 * 1024;
-const response_page = "pith authorized \xe2\x80\x94 you can close this tab.";
+const response_page = "Pith received authorization. Close this tab.";
 
 pub const Redirect = struct {
     code: []const u8,
@@ -60,9 +60,9 @@ fn Wire(comptime Source: type) type {
             output: *Output,
         ) !void {
             // A stray connection (probe, prefetch, favicon) must not consume the
-            // only accept: ignore it and keep listening until the deadline. A
-            // request carrying `code=` or `error=` is the provider redirect and
-            // still fails fast when malformed or denied.
+            // only accept: ignore it and continue to listen until the deadline. A
+            // request that carries `code=` or `error=` is the provider redirect
+            // and still fails fast when malformed or denied.
             while (true) {
                 var connection = try source.accept();
                 defer connection.close();
@@ -426,7 +426,8 @@ test "callback provider error redirects close without success response" {
 
 test "callback error after a partial parse frees the acquired parameter" {
     // `code` present but `state` absent leaves `output.code` allocated when the
-    // state lookup fails; the leak-detecting allocator proves the error path frees it.
+    // state lookup fails. The leak-detecting allocator proves the error path
+    // frees it.
     var fake: Fake = .{ .request = "GET /callback?code=code HTTP/1.1\r\n" };
     try std.testing.expectError(error.MissingCallbackParam, receiveFake(&fake));
     try std.testing.expectEqual(@as(usize, 1), fake.close_count);

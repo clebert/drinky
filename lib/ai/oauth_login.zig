@@ -1,5 +1,5 @@
-//! The interactive login choreography: listener ready before the best-effort
-//! browser launch, whose lifetime never blocks the callback.
+//! The interactive login choreography: the listener is ready before the
+//! best-effort browser launch, whose lifetime never blocks the callback.
 
 const std = @import("std");
 

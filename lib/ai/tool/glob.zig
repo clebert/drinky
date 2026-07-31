@@ -1,5 +1,5 @@
 //! Glob matching for `/`-separated paths. Within a segment `*` matches any run
-//! of characters and `?` matches a single character; neither crosses `/`. A
+//! of characters and `?` matches a single character. Neither crosses `/`. A
 //! whole segment of `**` matches zero or more path segments. Matching is
 //! iterative with single-slot backtracking at both the segment and byte level.
 
@@ -25,7 +25,7 @@ pub fn match(query: struct { pattern: []const u8, path: []const u8 }) bool {
     }, segmentCount(query.pattern), segmentCount(query.path));
 }
 
-/// Match one segment: `*` spans any run, `?` one character, neither has `/`.
+/// Match one segment: `*` spans any run, `?` matches one character, and neither has `/`.
 fn matchSegment(pattern: []const u8, name: []const u8) bool {
     return backtrack(struct {
         pattern: []const u8,

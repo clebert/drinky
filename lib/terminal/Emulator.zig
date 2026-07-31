@@ -1,7 +1,7 @@
-//! A model terminal for the `View` tests: it applies exactly the escapes `View`
+//! A model terminal for the `View` tests. It applies exactly the escapes `View`
 //! emits — cursor motion, clears, and auto-wrapping text — and reconstructs what
-//! the screen shows. Cursor position is physical and scrolled-off rows are
-//! unaddressable, so a miscounted row or a move past a margin corrupts the
+//! the screen shows. The cursor position is physical, and scrolled-off rows are
+//! unaddressable. A miscounted row or a move past a margin then corrupts the
 //! reconstruction instead of silently "working".
 
 const std = @import("std");
@@ -14,7 +14,7 @@ gpa: std.mem.Allocator,
 columns: usize,
 rows: usize,
 document: std.ArrayList(std.ArrayList(u8)),
-// Document index of the screen's top row; the rows above it are scrollback.
+// The document index of the screen's top row. The rows above it are scrollback.
 screen_top: usize,
 cursor_row: usize,
 cursor_column: usize,
@@ -78,19 +78,19 @@ fn csi(self: *Emulator, sequence: []const u8) !usize {
     if (index >= sequence.len) return sequence.len;
     const parameters = sequence[2..index];
     switch (sequence[index]) {
-        // A real terminal treats an explicit 0 count as 1, so an emitted `\x1b[0A`
-        // moves here too instead of masking a missing zero guard in `escape`.
+        // A real terminal treats an explicit 0 count as 1. An emitted `\x1b[0A`
+        // therefore moves here too and does not mask a missing zero guard in `escape`.
         'A' => {
             std.debug.assert(self.cursor_row >= self.screen_top);
             const count = @max(csiValue(parameters, 1), 1);
             self.cursor_row -= @min(count, self.cursor_row - self.screen_top);
         },
-        // CUD clamps at the bottom row; it never scrolls or grows the document.
+        // CUD clamps at the bottom row. It never scrolls or grows the document.
         'B' => {
             const count = @max(csiValue(parameters, 1), 1);
             self.cursor_row = @min(self.cursor_row + count, self.document.items.len - 1);
         },
-        // CUF clamps at the right margin; it cannot reach a pending-wrap cell.
+        // CUF clamps at the right margin. It cannot reach a pending-wrap cell.
         'C' => {
             const count = @max(csiValue(parameters, 1), 1);
             self.cursor_column = @min(self.cursor_column + count, self.columns - 1);
@@ -124,9 +124,9 @@ fn clearScreen(self: *Emulator) !void {
     self.screen_top = 0;
 }
 
-// Advance the cursor one physical row, scrolling the screen's top row into
-// scrollback when the cursor is already on the bottom row — a terminal's
-// auto-scroll, which is what makes evicted rows unaddressable.
+// Advance the cursor one physical row. When the cursor is already on the
+// bottom row, scroll the screen's top row into scrollback. This is a
+// terminal's auto-scroll, which makes evicted rows unaddressable.
 fn lineFeed(self: *Emulator) !void {
     if (self.rows > 0 and self.cursor_row + 1 >= self.screen_top + self.rows) self.screen_top += 1;
     self.cursor_row += 1;
@@ -159,7 +159,7 @@ fn csiValue(parameters: []const u8, default: usize) usize {
     return std.fmt.parseInt(usize, parameters, 10) catch default;
 }
 
-// The current frame occupies the last `frame.len` rows of the document; the
+// The current frame occupies the last `frame.len` rows of the document. The
 // rows above are scrollback from earlier paints.
 pub fn expectVisible(self: *Emulator, frame: []const []const u8) !void {
     try std.testing.expect(self.document.items.len >= frame.len);
@@ -179,9 +179,9 @@ pub fn expectCaret(
     try std.testing.expectEqual(expected.column, self.cursor_column);
 }
 
-// The physical screen: the `rows` rows at and below the scroll top. Rows that
-// scrolled past the top are excluded, so a repaint that leaves stale content on
-// screen or fails to reveal a row it moved into view is caught.
+// The physical screen: the `rows` rows at and below the screen top. Rows that
+// scrolled past the top are excluded. The check then catches a repaint that
+// leaves stale content on screen or fails to reveal a row it moved into view.
 pub fn expectScreen(self: *Emulator, screen: []const []const u8) !void {
     for (screen, 0..) |row, index| {
         const at = self.screen_top + index;

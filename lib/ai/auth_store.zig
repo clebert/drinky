@@ -1,14 +1,14 @@
-//! The provider-keyed `auth.json` both credential stores share: a top-level
-//! object mapping each account key to that account's token entry. Owns the file
-//! shape only — each provider owns its entry fields (passed as `anytype`);
-//! nothing here knows a token shape.
+//! The provider-keyed `auth.json` that both credential stores share: a
+//! top-level object that maps each account key to that account's token entry.
+//! Owns the file shape only. Each provider owns its entry fields (passed as
+//! `anytype`). Nothing here knows a token shape.
 
 const std = @import("std");
 
 const json = @import("json.zig");
 
-/// A parsed `auth.json`, owning its backing memory, that answers entry lookups.
-/// Open with `open`; free with `deinit`.
+/// A parsed `auth.json` that owns its backing memory and answers entry lookups.
+/// Open with `open`. Free with `deinit`.
 pub const File = struct {
     parsed: std.json.Parsed(std.json.Value),
 
@@ -40,9 +40,9 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !?File {
     return .{ .parsed = parsed };
 }
 
-/// Persist `entry` under `key` in the `auth.json` at `path` (creating its parent
-/// directory), preserving every other top-level key already present. Written at
-/// owner-only permissions.
+/// Persist `entry` under `key` in the `auth.json` at `path`. The save creates
+/// the parent directory and preserves every other top-level key already
+/// present. The write uses owner-only permissions.
 pub fn save(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -59,7 +59,7 @@ pub fn save(
     try rewrite(gpa, io, path, key, entry);
 }
 
-/// Remove `key` from the `auth.json` at `path`, rewriting every other entry
+/// Remove `key` from the `auth.json` at `path` and rewrite every other entry
 /// verbatim. A missing file is a no-op — nothing to remove.
 pub fn remove(
     gpa: std.mem.Allocator,
@@ -81,7 +81,7 @@ fn rewrite(
 ) !void {
     const existing: ?[]u8 = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .unlimited) catch |err|
         switch (err) {
-            // A save starts from a fresh object; a removal has nothing to drop.
+            // A save starts from a fresh object. A removal has nothing to drop.
             error.FileNotFound => if (@TypeOf(entry) == @TypeOf(null)) return else null,
             else => return err,
         };
@@ -93,9 +93,9 @@ fn rewrite(
 }
 
 /// Atomically replace the file at `path` with `body` at owner-only
-/// permissions: a temp file in the same directory renamed over the
-/// destination, so a crash or cancellation mid-save leaves the old file
-/// intact rather than truncated.
+/// permissions: rename a temp file in the same directory over the destination.
+/// A crash or cancellation mid-save leaves the old file intact rather than
+/// truncated.
 fn replaceFile(io: std.Io, path: []const u8, body: []const u8) !void {
     var atomic = try std.Io.Dir.cwd().createFileAtomic(io, path, .{
         .permissions = @enumFromInt(0o600),
@@ -107,11 +107,11 @@ fn replaceFile(io: std.Io, path: []const u8, body: []const u8) !void {
 }
 
 /// The whole `auth.json` with `key` set to `entry` — or dropped, for a null
-/// `entry` — re-emitting every other top-level key verbatim. An absent
-/// `existing` starts from a fresh object, but an unparseable or non-object one
-/// is `error.BadCredentials` rather than a fresh start, so no rewrite can wipe
-/// a sibling account by starting over on a file it could not read. Caller frees
-/// the result.
+/// `entry` — and every other top-level key verbatim. An absent `existing`
+/// starts from a fresh object. An unparseable or non-object one is
+/// `error.BadCredentials` rather than a fresh start: no rewrite can wipe a
+/// sibling account with a fresh start on a file it could not read. The caller
+/// frees the result.
 fn serialize(
     gpa: std.mem.Allocator,
     existing: ?[]const u8,
@@ -210,7 +210,7 @@ test "serialize from nothing writes just the entry, and replaces its own" {
         parsed.value.object.get("openai_subscription").?.object.get("access").?.string,
     );
 
-    // An existing entry under the same key is replaced, a sibling kept.
+    // `serialize` replaces an existing entry under the same key and keeps a sibling.
     const replaced = try serialize(
         gpa,
         "{\"anthropic_subscription\":{\"access\":\"keep\"}," ++
@@ -264,7 +264,7 @@ test "serialize drops a key, preserving other accounts" {
         root.get("anthropic_subscription").?.object.get("access").?.string,
     );
 
-    // Removing the last account leaves a valid empty object, not a wipe error.
+    // The removal of the last account leaves a valid empty object, not a wipe error.
     const emptied = try serialize(gpa, merged, "anthropic_subscription", null);
     defer gpa.free(emptied);
     var parsed_empty = try std.json.parseFromSlice(std.json.Value, gpa, emptied, .{});

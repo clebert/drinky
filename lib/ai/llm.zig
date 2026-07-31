@@ -1,16 +1,16 @@
 //! The provider-neutral conversation model. Every provider translates its wire
-//! format to and from these types, so the agent loop and tools depend only on
-//! this module — never on a specific provider. Pure data: no state, no I/O.
+//! format to and from these types. The agent loop and tools depend only on
+//! this module, never on a specific provider. Pure data: no state, no I/O.
 
 const std = @import("std");
 
 /// A configured account: a vendor crossed with the billing product that
 /// authorizes its requests. The auth *mechanism* — an API key or an OAuth
 /// subscription — is data held by `provider.Credentials`, not part of the
-/// identity. This is the tag `provider.Client`/`Stream` key on, and the origin
-/// stamped on stored reasoning so only the exact account that produced a blob
-/// replays it. At startup any subscription is preferred over any paid API key,
-/// across vendors; within a tier, declaration order decides.
+/// identity. This is the tag `provider.Client`/`Stream` key on. It is also the
+/// origin stamped on stored reasoning, so only the exact account that produced
+/// a blob replays it. At startup any subscription is preferred over any paid
+/// API key, across vendors. Within a tier, declaration order decides.
 pub const Account = enum {
     /// Claude Pro/Max subscription OAuth, authorized with a `Bearer` token and
     /// the Claude Code identity headers.
@@ -23,8 +23,8 @@ pub const Account = enum {
     openai_api,
 
     /// Whether this account authenticates with an interactive OAuth subscription
-    /// login (as opposed to an environment API key), so it can be logged in and
-    /// out mid-session.
+    /// login (as opposed to an environment API key). Such an account can be
+    /// logged in and out mid-session.
     pub fn isSubscription(self: Account) bool {
         return switch (self) {
             .anthropic_subscription, .openai_subscription => true,
@@ -32,13 +32,13 @@ pub const Account = enum {
         };
     }
 
-    /// The human-readable label, e.g. "anthropic subscription".
+    /// The human-readable label, e.g. "Anthropic subscription".
     pub fn label(self: Account) []const u8 {
         return switch (self) {
-            .anthropic_subscription => "anthropic subscription",
-            .anthropic_api => "anthropic api",
-            .openai_subscription => "openai subscription",
-            .openai_api => "openai api",
+            .anthropic_subscription => "Anthropic subscription",
+            .anthropic_api => "Anthropic API",
+            .openai_subscription => "OpenAI subscription",
+            .openai_api => "OpenAI API",
         };
     }
 
@@ -63,31 +63,32 @@ pub const Account = enum {
 };
 
 /// The vendor axis: whose wire protocol and model table an account uses. Both
-/// accounts of a vendor share one serializer and one set of models, so the model
+/// accounts of a vendor share one serializer and one set of models. The model
 /// table and the serializers key on this rather than on the full account.
 pub const Provider = enum { anthropic, openai };
 
 pub const Role = enum { user, assistant };
 
 /// A named reasoning-effort level passed through to the provider, which picks
-/// the actual thinking depth itself (Anthropic maps it to `output_config.effort`
-/// under adaptive thinking; OpenAI to its reasoning-effort control). `none`
-/// disables reasoning; the rest match Anthropic's effort ladder.
+/// the actual thinking depth itself. Anthropic maps it to
+/// `output_config.effort` under adaptive thinking. OpenAI maps it to its
+/// reasoning-effort control. `none` disables reasoning. The rest match
+/// Anthropic's effort ladder.
 pub const Effort = enum { none, low, medium, high, xhigh, max };
 
 /// One entry in the flat, ordered conversation history. Every provider
-/// translates its wire format to and from this list; the agent loop appends
-/// items in the exact order the model produced them (reasoning first, then text
-/// and tool calls interleaved as streamed) and a provider serializer replays
-/// them one-item-one-block, sharing a role envelope over a run of same-role
-/// items but never reordering separate native output items. Content parts inside
+/// translates its wire format to and from this list. The agent loop appends
+/// items in the exact order the model produced them (reasoning first, then
+/// text and tool calls interleaved as streamed). A provider serializer replays
+/// them one-item-one-block. It shares a role envelope over a run of same-role
+/// items but never reorders separate native output items. Content parts inside
 /// one native OpenAI message are canonically joined without a separator.
 pub const Item = union(enum) {
     /// A user or assistant text turn.
     message: Message,
     /// One run of model reasoning (assistant-only).
     reasoning: Reasoning,
-    /// The model asking to call a tool (assistant-only).
+    /// The model's request to call a tool (assistant-only).
     tool_call: ToolCall,
     /// The outcome of a tool call, fed back on the input side.
     tool_result: ToolResult,
@@ -186,7 +187,7 @@ pub const Item = union(enum) {
         /// Unified call key: Anthropic `tool_use.id` == OpenAI `call_id`.
         call_id: []const u8,
         name: []const u8,
-        /// Raw JSON object for the arguments; empty means an empty object.
+        /// The raw JSON object for the arguments. Empty means an empty object.
         arguments_json: []const u8,
     };
 
@@ -219,24 +220,24 @@ pub const Request = struct {
     items: []const Item,
     tools: []const Tool,
     effort: Effort = .none,
-    /// A stable per-conversation key a provider may use to improve prompt-cache
-    /// routing; empty to send none. OpenAI combines it with the prompt-prefix
-    /// hash to keep a session's growing requests on one cache; Anthropic ignores
-    /// it (its caching is driven by explicit breakpoints).
+    /// A stable per-conversation key a provider can use to improve prompt-cache
+    /// routing. Empty sends none. OpenAI combines it with the prompt-prefix
+    /// hash to keep a session's growing requests on one cache. Anthropic
+    /// ignores it (its caching is driven by explicit breakpoints).
     cache_key: []const u8 = "",
 };
 
-/// Token counts for one assistant message. `input` is uncached prompt tokens;
-/// the full billed prompt is `input + cache_read + cache_write`.
+/// Token counts for one assistant message. `input` is uncached prompt tokens.
+/// The full billed prompt is `input + cache_read + cache_write`.
 pub const Usage = struct {
     input: u64 = 0,
     output: u64 = 0,
     cache_read: u64 = 0,
     cache_write: u64 = 0,
 
-    /// Field-wise sum, for accumulating several messages' usage. Saturating: the
-    /// counts arrive from the provider stream unchecked, so a hostile or buggy
-    /// response must skew a gauge, never overflow a total.
+    /// The field-wise sum, to accumulate several messages' usage. The sum
+    /// saturates. The counts arrive from the provider stream unchecked, so a
+    /// hostile or buggy response must skew a gauge, never overflow a total.
     pub fn plus(self: *const Usage, other: *const Usage) Usage {
         return .{
             .input = self.input +| other.input,
@@ -248,8 +249,9 @@ pub const Usage = struct {
 };
 
 test "accumulated usage saturates rather than overflowing on absurd counts" {
-    // A provider reports counts as JSON integers, so one message can claim up to
-    // maxInt(i64) per field: three of them must not wrap the per-model total.
+    // A provider reports counts as JSON integers, so one message can claim up
+    // to maxInt(i64) per field. Three of them must not wrap the per-model
+    // total.
     const absurd: Usage = .{
         .input = std.math.maxInt(i64),
         .output = std.math.maxInt(i64),
@@ -266,10 +268,10 @@ test "accumulated usage saturates rather than overflowing on absurd counts" {
 }
 
 /// A subscription account's remaining allowance, read from the provider's
-/// response head. Each window is optional and independent; classify one by its
-/// length (`window_minutes` ≈ 300 → a 5h window, ≈ 10080 → weekly). Absent for
-/// API-key accounts and any provider that reports no quota. `used_percent` runs
-/// 0–100, so the remaining share is `100 - used_percent`.
+/// response head. Each window is optional and independent. Classify one by its
+/// length (`window_minutes` ≈ 300 → a 5h window, ≈ 10080 → weekly). The quota
+/// is absent for API-key accounts and any provider that reports no quota.
+/// `used_percent` runs 0–100, so the remaining share is `100 - used_percent`.
 pub const Quota = struct {
     primary: ?Window = null,
     secondary: ?Window = null,
@@ -281,7 +283,7 @@ pub const Quota = struct {
 };
 
 /// A decoded part of a streamed assistant reply. Display deltas are kept
-/// separate from completed conversation items: transports own their native
+/// separate from completed conversation items. Transports own their native
 /// block/item lifecycles and emit an `item` only after the wire closes it.
 pub const Event = union(enum) {
     /// Display-only streamed answer text.
@@ -294,16 +296,16 @@ pub const Event = union(enum) {
     item: Output,
     stop: Stop,
 
-    /// A completed assistant-only item before history ownership and exact-account
-    /// reasoning provenance are attached by the Agent.
+    /// A completed assistant-only item before the Agent attaches history
+    /// ownership and exact-account reasoning provenance.
     pub const Output = union(enum) {
         message: []const u8,
         reasoning: Reasoning,
         tool_call: Item.ToolCall,
     };
 
-    /// A complete reasoning run before exact-account provenance is attached by
-    /// the Agent. The union makes redacted text and provider-proof mixtures
+    /// A complete reasoning run before the Agent attaches exact-account
+    /// provenance. The union makes redacted text and provider-proof mixtures
     /// unrepresentable.
     pub const Reasoning = union(enum) {
         signature: Item.Reasoning.Signature,
@@ -350,23 +352,23 @@ pub const Event = union(enum) {
         }
     };
 
-    /// Authoritative end of an assistant message, carrying its cumulative usage,
-    /// whether the provider completed or truncated the response, and any wire
-    /// outcome that makes the reply locally unretainable.
+    /// The authoritative end of an assistant message. It carries its cumulative
+    /// usage, whether the provider completed or truncated the response, and any
+    /// wire outcome that makes the reply locally unretainable.
     pub const Stop = struct {
         usage: Usage,
         status: Status = .complete,
         rejection: ?Rejection = null,
 
         pub const Rejection = enum {
-            /// Malformed or incomplete output that a whole-request retry may fix.
+            /// Malformed or incomplete output that a whole-request retry can fix.
             invalid,
             /// A valid provider outcome the neutral conversation model cannot retain.
             unsupported,
         };
     };
 
-    /// A terminal response's completeness. `complete` is a clean finish;
+    /// A terminal response's completeness. `complete` is a clean finish.
     /// `truncated` is a token or context cutoff whose reply so far still stands
     /// but is retainable only when it holds no tool call. Resumable or refused
     /// outcomes ride `Stop.rejection` as unsupported instead.
@@ -414,8 +416,8 @@ test "account subscription flag and label" {
     try std.testing.expect(Account.openai_subscription.isSubscription());
     try std.testing.expect(!Account.anthropic_api.isSubscription());
     try std.testing.expect(!Account.openai_api.isSubscription());
-    try std.testing.expectEqualStrings("openai subscription", Account.openai_subscription.label());
-    try std.testing.expectEqualStrings("anthropic api", Account.anthropic_api.label());
+    try std.testing.expectEqualStrings("OpenAI subscription", Account.openai_subscription.label());
+    try std.testing.expectEqualStrings("Anthropic API", Account.anthropic_api.label());
     try std.testing.expectEqualStrings("ANTHROPIC_API_KEY", Account.anthropic_api.apiKeyEnv().?);
     try std.testing.expectEqualStrings("OPENAI_API_KEY", Account.openai_api.apiKeyEnv().?);
     try std.testing.expect(Account.anthropic_subscription.apiKeyEnv() == null);

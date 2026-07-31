@@ -1,6 +1,7 @@
 //! Account-aware model limits from the ChatGPT Codex catalog. The catalog is a
-//! best-effort supplement to pith's compiled model table: this module fetches and
-//! decodes it, while the account registry decides which known models to overlay.
+//! best-effort supplement to pith's compiled model table. This module fetches
+//! and decodes it, while the account registry decides which known models to
+//! overlay.
 
 const std = @import("std");
 
@@ -8,7 +9,7 @@ const Auth = @import("Auth.zig");
 const json = @import("../json.zig");
 const net = @import("../net.zig");
 
-/// Numeric semantic version used by the Codex catalog for client filtering.
+/// The numeric semantic version the Codex catalog uses for client filtering.
 const client_version = "0.0.0";
 
 const endpoint = "https://chatgpt.com/backend-api/codex/models?client_version=" ++ client_version;
@@ -31,7 +32,7 @@ pub fn deinit(self: *ModelCatalog) void {
     self.parsed.deinit();
 }
 
-/// Fetch and decode the catalog using the current OAuth token and account id.
+/// Fetch and decode the catalog with the current OAuth token and account id.
 /// Errors contain no server body, token, or account identifier.
 pub fn fetch(
     gpa: std.mem.Allocator,
@@ -113,7 +114,7 @@ fn request(gpa: std.mem.Allocator, io: std.Io, credentials: Credentials) !ModelC
 }
 
 /// Decode a complete catalog response. Individual malformed entries remain
-/// ignorable; a malformed envelope rejects the catalog as a whole.
+/// ignorable. A malformed envelope rejects the catalog as a whole.
 pub fn parse(gpa: std.mem.Allocator, body: []const u8) !ModelCatalog {
     var parsed = try std.json.parseFromSlice(std.json.Value, gpa, body, .{});
     errdefer parsed.deinit();
@@ -125,9 +126,9 @@ pub fn parse(gpa: std.mem.Allocator, body: []const u8) !ModelCatalog {
     return .{ .parsed = parsed };
 }
 
-/// The raw context window for `slug`, preferring `context_window` and falling
-/// back to `max_context_window` exactly when the former is absent. Null means the
-/// entry is absent or its selected value is invalid.
+/// The raw context window for `slug`. The lookup prefers `context_window` and
+/// falls back to `max_context_window` exactly when `context_window` is absent.
+/// Null means the entry is absent or its selected value is invalid.
 pub fn contextWindow(self: *const ModelCatalog, slug: []const u8) ?u64 {
     const decoded = self.metadata(slug) orelse return null;
     return decoded.context_window;

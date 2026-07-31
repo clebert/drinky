@@ -1,6 +1,7 @@
-//! The bottom status line: a context-window gauge, session cost, and cache
-//! savings on the left, the model and reasoning effort right-aligned. A pure
-//! renderer — it holds no state and streams from a caller-built `Info` snapshot.
+//! The bottom status line: normally a context-window gauge, session cost, and
+//! cache savings on the left with the model and effort right-aligned.
+//! Temporarily the line shows one notice instead. A pure renderer over a
+//! caller-built `Info` snapshot.
 
 const std = @import("std");
 
@@ -17,26 +18,41 @@ pub const Info = struct {
     context_window: u64,
     model: []const u8,
     effort: []const u8,
-    /// Whether an account is active. When false the right side reads "not signed
-    /// in" instead of the model and effort, which are then unusable.
+    /// Whether an account is active. When false the right side reads "Account:
+    /// Signed out" instead of the model and effort, which are then unusable.
     signed_in: bool,
     /// A subscription's remaining allowance, or null when the active provider
     /// reports none (an API key, or a non-subscription turn). Each window whose
-    /// duration identifies it shows on the left as `<label> N% left`.
+    /// duration identifies it shows on the left as `<label>: N% remaining`.
     quota: ?ai.llm.Quota,
+    /// A temporary notice replaces this footer until the next user action.
+    notice: ?Notice = null,
+
+    pub const Notice = struct {
+        text: []const u8,
+        is_error: bool,
+    };
 };
 
 /// The right-side indicator shown while no account is active.
-const signed_out_label = "not signed in";
+const signed_out_label = "Account: Signed out";
 
 /// Separates the model name from its effort level on the right of the line.
 const separator = " · ";
 
 /// Stream the status line through `placement`: session stats on the left, the
 /// `model · effort` indicator right-aligned to the terminal width. When they
-/// cannot both fit, the stats alone, truncated.
+/// cannot both fit, show the right indicator alone. If that does not fit, show
+/// the truncated stats.
 pub fn render(placement: *const paint.Placement, info: *const Info) !void {
     if (placement.base < placement.skip) return;
+    if (info.notice) |notice| {
+        const line_end = std.mem.indexOfScalar(u8, notice.text, '\n') orelse notice.text.len;
+        return paint.notice(placement, &.{
+            .style = if (notice.is_error) .red else .dim,
+            .prefix = if (notice.is_error) "Error: " else "",
+        }, notice.text[0..line_end]);
+    }
 
     // Sized so `catch unreachable` is sound: the percent, token, cost, and quota
     // formats produce at most a few dozen characters for any input.
@@ -56,13 +72,10 @@ pub fn render(placement: *const paint.Placement, info: *const Info) !void {
     if (stats_columns + right_columns + 1 <= placement.columns) {
         try placement.sink.text(line);
         try placement.sink.spaces(placement.columns - stats_columns - right_columns);
-        if (info.signed_in) {
-            try placement.sink.text(info.model);
-            try placement.sink.text(separator);
-            try placement.sink.text(info.effort);
-        } else {
-            try placement.sink.text(signed_out_label);
-        }
+        try writeRight(placement.sink, info);
+    } else if (right_columns <= placement.columns) {
+        try placement.sink.spaces(placement.columns - right_columns);
+        try writeRight(placement.sink, info);
     } else {
         try placement.sink.text(terminal.width.truncate(line, placement.columns));
     }
@@ -70,9 +83,19 @@ pub fn render(placement: *const paint.Placement, info: *const Info) !void {
     placement.sink.end(.{ .id = placement.id, .line = placement.base });
 }
 
+fn writeRight(sink: *terminal.View.Sink, info: *const Info) !void {
+    if (info.signed_in) {
+        try sink.text(info.model);
+        try sink.text(separator);
+        try sink.text(info.effort);
+    } else {
+        try sink.text(signed_out_label);
+    }
+}
+
 fn writeStats(out: *std.Io.Writer, info: *const Info) !void {
     // Context now: the last request's whole prompt plus its output, against the
-    // model's window. The one "now" number; the rest is session-cumulative.
+    // model's window. The one "now" number. The rest is session-cumulative.
     // Saturating: the counts arrive from the provider stream unchecked.
     const last_prompt = info.last.input +| info.last.cache_read +| info.last.cache_write;
     const context = last_prompt +| info.last.output;
@@ -80,25 +103,26 @@ fn writeStats(out: *std.Io.Writer, info: *const Info) !void {
         asFloat(context) / asFloat(info.context_window) * 100.0
     else
         0.0;
-    try out.print("ctx {d:.0}% (", .{percent});
+    try out.print("Context: {d:.0}% (", .{percent});
     try writeTokens(out, context);
     try out.writeByte('/');
     try writeTokens(out, info.context_window);
     try out.writeByte(')');
 
     // Last request's cache hit rate over the whole prompt: another "now" number.
-    // Zero on a cold start, model switch, or cache expiry, making a miss visible
-    // where the cumulative "saved" figure cannot.
+    // Zero on a cold start, model switch, or cache expiry. This makes a miss
+    // visible where the cumulative "saved" figure cannot.
     if (last_prompt > 0) {
         const hit = asFloat(info.last.cache_read) / asFloat(last_prompt) * 100.0;
-        try out.print(" · cache {d:.0}%", .{hit});
+        try out.print(" · Cache: {d:.0}%", .{hit});
     }
 
-    // Session cost, then the dollars caching saved versus sending the same tokens
+    // Session cost, then the dollars the cache saved versus the same tokens sent
     // uncached. Both use public API rates (an estimate: login type does not
-    // reveal billing). Shown once a cache read has actually paid off.
-    try out.print(" · ${d:.2}", .{info.cost});
-    if (info.saved > 0) try out.print(" saved ${d:.2}", .{info.saved});
+    // reveal billing). The saved figure shows once a cache read has actually
+    // paid off.
+    try out.print(" · Cost: ${d:.2}", .{info.cost});
+    if (info.saved > 0) try out.print(" · Saved: ${d:.2}", .{info.saved});
 
     // A subscription's remaining allowance, one segment per window identified
     // by its length, as the share left rather than used.
@@ -108,33 +132,33 @@ fn writeStats(out: *std.Io.Writer, info: *const Info) !void {
     }
 }
 
-/// Append one identified quota window as ` · <label> N% left`, or nothing when
+/// Append one identified quota window as ` · <label>: N% remaining`, or nothing when
 /// absent or when its duration does not identify it.
 fn writeQuotaWindow(out: *std.Io.Writer, maybe_window: ?ai.llm.Quota.Window) !void {
     const window = maybe_window orelse return;
     const label = quotaLabel(window.window_minutes) orelse return;
     const remaining = @max(0.0, @min(100.0, 100.0 - window.used_percent));
-    try out.print(" · {s} {d:.0}% left", .{ label, remaining });
+    try out.print(" · {s}: {d:.0}% remaining", .{ label, remaining });
 }
 
-/// A human label for a rolling window, keyed off its length in minutes; the
+/// A human label for a rolling window, keyed off its length in minutes. The
 /// ChatGPT plans use 5h and weekly windows. Unrecognized or absent lengths stay
-/// hidden rather than being presented as an allowance we cannot identify.
+/// hidden rather than show as an allowance we cannot identify.
 fn quotaLabel(maybe_minutes: ?u32) ?[]const u8 {
     const minutes = maybe_minutes orelse return null;
-    if (approxWindow(minutes, 300)) return "5h";
-    if (approxWindow(minutes, 10080)) return "weekly";
+    if (approxWindow(minutes, 300)) return "5h quota";
+    if (approxWindow(minutes, 10080)) return "Weekly quota";
     return null;
 }
 
-/// Whether `minutes` falls within 5% of `target`, matching how the backend's
-/// window lengths drift slightly around their nominal values.
+/// Whether `minutes` falls within 5% of `target`. This matches how the
+/// backend's window lengths drift slightly around their nominal values.
 fn approxWindow(minutes: u32, target: u32) bool {
     const tolerance = @divFloor(target, 20);
     return minutes >= target - tolerance and minutes <= target + tolerance;
 }
 
-/// `count` in `k`/`M` shorthand, matching pi's footer thresholds.
+/// `count` in `k`/`M` shorthand. The thresholds match pi's footer.
 fn writeTokens(out: *std.Io.Writer, count: u64) !void {
     const thousand = 1000;
     const million = 1000 * thousand;
@@ -187,12 +211,46 @@ test render {
     try view.render();
 
     const painted = out.written();
-    try std.testing.expect(std.mem.indexOf(u8, painted, "ctx 21% (206k/1.0M)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, painted, "cache 87%") != null);
-    try std.testing.expect(std.mem.indexOf(u8, painted, "$0.39 saved $0.82") != null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "Context: 21% (206k/1.0M)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "Cache: 87%") != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, painted, "Cost: $0.39 · Saved: $0.82") != null,
+    );
     // The model and effort are right-aligned, so they land after the stats.
     const right = std.mem.indexOf(u8, painted, "claude-opus-4-8\u{200B} · \u{200B}xhigh").?;
-    try std.testing.expect(right > std.mem.indexOf(u8, painted, "ctx 21%").?);
+    try std.testing.expect(right > std.mem.indexOf(u8, painted, "Context: 21%").?);
+}
+
+test "a notice replaces the status for exactly one row" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var view = terminal.View.init(gpa, &out.writer);
+    defer view.deinit();
+    const info: Info = .{
+        .last = .{},
+        .cost = 0,
+        .saved = 0,
+        .context_window = 200_000,
+        .model = "hidden-model",
+        .effort = "high",
+        .signed_in = true,
+        .quota = null,
+        .notice = .{ .text = "boom\nnot another row", .is_error = true },
+    };
+
+    const sink = try view.beginFrame(.{ .columns = 40, .rows = 24 }, 4);
+    const placement: paint.Placement =
+        .{ .sink = sink, .id = 0, .columns = 40, .base = 0, .skip = 0 };
+    try render(&placement, &info);
+    try view.render();
+
+    const painted = out.written();
+    try std.testing.expect(std.mem.indexOf(u8, painted, "Error: ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "boom") != null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "not another row") == null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "hidden-model") == null);
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, painted, "\r\n"));
 }
 
 test "a signed-out status shows the indicator in place of the model" {
@@ -219,10 +277,10 @@ test "a signed-out status shows the indicator in place of the model" {
     try view.render();
 
     const painted = out.written();
-    try std.testing.expect(std.mem.indexOf(u8, painted, "not signed in") != null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "Account: Signed out") != null);
     try std.testing.expect(std.mem.indexOf(u8, painted, "claude-opus-4-8") == null);
     // No prompt tokens sent yet: the cache figure is absent, never a 0/0 rate.
-    try std.testing.expect(std.mem.indexOf(u8, painted, "cache") == null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "Cache") == null);
 }
 
 test "quota windows show the remaining allowance, labeled by length" {
@@ -252,8 +310,8 @@ test "quota windows show the remaining allowance, labeled by length" {
     try view.render();
 
     const painted = out.written();
-    try std.testing.expect(std.mem.indexOf(u8, painted, "5h 88% left") != null);
-    try std.testing.expect(std.mem.indexOf(u8, painted, "weekly 26% left") != null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "5h quota: 88% remaining") != null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "Weekly quota: 26% remaining") != null);
 }
 
 test "a quota with a single window omits the absent one" {
@@ -280,8 +338,8 @@ test "a quota with a single window omits the absent one" {
     try view.render();
 
     const painted = out.written();
-    try std.testing.expect(std.mem.indexOf(u8, painted, "weekly 26% left") != null);
-    try std.testing.expect(std.mem.indexOf(u8, painted, "5h") == null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "Weekly quota: 26% remaining") != null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "5h quota") == null);
 }
 
 test "unidentified quota windows stay hidden beside a known window" {
@@ -303,9 +361,8 @@ test "unidentified quota windows stay hidden beside a known window" {
 
     try writeStats(&out, &info);
     const written = out.buffered();
-    try std.testing.expect(std.mem.indexOf(u8, written, "weekly 23% left") != null);
-    try std.testing.expect(std.mem.indexOf(u8, written, "100% left") == null);
-    try std.testing.expect(std.mem.indexOf(u8, written, "quota") == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "Weekly quota: 23% remaining") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "100% remaining") == null);
     try std.testing.expect(quotaLabel(null) == null);
     try std.testing.expect(quotaLabel(600) == null);
 }

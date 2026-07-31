@@ -1,15 +1,15 @@
 //! Regenerates lib/terminal/unicode_data.zig from the Unicode Character Database.
 //!
 //! Fetches a pinned Unicode version's UCD files and emits two sorted, disjoint
-//! interval tables. The width table maps code point ranges to a display width of
-//! zero or two (a code point in no range is one column): width zero is
+//! interval tables. The width table maps code point ranges to a display width
+//! of zero or two (a code point in no range is one column). Width zero is
 //! General_Category Mn, Me, or Cf (minus U+00AD, plus U+1160..U+11FF and
-//! U+200B); width two is East_Asian_Width Wide or Fullwidth plus
+//! U+200B). Width two is East_Asian_Width Wide or Fullwidth plus
 //! Emoji_Presentation, minus the width-zero set. The grapheme-break table maps
-//! code point ranges to their UAX #29 Grapheme_Cluster_Break class, refined with
-//! Indic_Conjunct_Break (for rule GB9c) and Extended_Pictographic (for GB11) so
-//! `grapheme` can segment clusters. Also vendors the GraphemeBreakTest.txt
-//! conformance corpus. Run with `zig build unicode`.
+//! code point ranges to their UAX #29 Grapheme_Cluster_Break class, refined
+//! with Indic_Conjunct_Break (for rule GB9c) and Extended_Pictographic (for
+//! GB11). With this table, `grapheme` can segment clusters. Also vendors the
+//! GraphemeBreakTest.txt conformance corpus. Run with `zig build unicode`.
 
 const std = @import("std");
 
@@ -103,7 +103,7 @@ pub fn main() !void {
     std.debug.print("wrote {s}\n", .{test_output_path});
 }
 
-/// Body of `base ++ path`, or an error when the server does not answer with 200.
+/// The body of `base ++ path`, or an error when the server does not answer with 200.
 fn fetch(arena: std.mem.Allocator, client: *std.http.Client, path: []const u8) ![]const u8 {
     const url = try std.fmt.allocPrint(arena, "{s}{s}", .{ base, path });
     var response: std.Io.Writer.Allocating = .init(arena);
@@ -136,8 +136,8 @@ fn mark(text: []const u8, wanted: []const []const u8, flags: []bool) void {
     }
 }
 
-/// Sorted, non-overlapping ranges of the code points that are not one
-/// column, merging adjacent code points of the same width.
+/// Sorted, non-overlapping ranges of the code points that are not one column.
+/// Adjacent code points of the same width merge into one range.
 fn coalesce(arena: std.mem.Allocator, zero: []const bool, wide: []const bool) ![]WidthRange {
     var width_ranges: std.ArrayList(WidthRange) = .empty;
     var open: ?WidthRange = null;
@@ -200,9 +200,9 @@ fn graphemeBreakClass(value: []const u8) ?Class {
     return null;
 }
 
-/// Refines Extend and Other code points with their Indic_Conjunct_Break value so
-/// `grapheme` can apply rule GB9c: `linker` is the virama, `extend_incb` the
-/// marks that may sit inside a conjunct, and `consonant` the conjunct bases.
+/// Refines Extend and Other code points with their Indic_Conjunct_Break value
+/// so `grapheme` can apply rule GB9c. `linker` is the virama, `extend_incb` the
+/// marks that can sit inside a conjunct, and `consonant` the conjunct bases.
 fn assignIndicConjunct(text: []const u8, classes: []Class) void {
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |raw| {
@@ -229,7 +229,8 @@ fn assignIndicConjunct(text: []const u8, classes: []Class) void {
 }
 
 /// Sorted, non-overlapping ranges of the code points with a non-`other`
-/// grapheme-break class, merging adjacent code points of the same class.
+/// grapheme-break class. Adjacent code points of the same class merge into one
+/// range.
 fn coalesceClasses(arena: std.mem.Allocator, classes: []const Class) ![]ClassRange {
     var ranges: std.ArrayList(ClassRange) = .empty;
     var open: ?ClassRange = null;

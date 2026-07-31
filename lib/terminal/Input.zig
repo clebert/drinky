@@ -1,8 +1,8 @@
 //! Incremental terminal-input parser: raw bytes in, `Key` events out.
 //!
-//! Bytes are fed in whatever chunks `read` returns; a single key or paste may
-//! span several chunks. Unconsumed bytes are retained so a sequence split
-//! across reads is decoded once the rest arrives.
+//! Bytes arrive in whatever chunks `read` returns. A single key or paste can
+//! span several chunks. The parser retains unconsumed bytes, so a sequence
+//! split across reads decodes once the rest arrives.
 
 const std = @import("std");
 
@@ -13,15 +13,15 @@ const Input = @This();
 gpa: std.mem.Allocator,
 pending: std.ArrayList(u8),
 start: usize,
-/// Set while an over-limit paste is being flushed in chunks: its begin marker
-/// is consumed, but its terminator has not arrived yet.
+/// Set while the parser flushes an over-limit paste in chunks. The begin marker
+/// is consumed, but the terminator has not arrived yet.
 in_paste: bool,
 
 /// A single decoded input event from the terminal.
 pub const Key = union(enum) {
     /// A printable Unicode codepoint the user typed.
     char: u21,
-    /// A control combination, carrying the lowercase letter (`0x03` -> `'c'`).
+    /// A control combination with the lowercase letter (`0x03` -> `'c'`).
     ctrl: u8,
     /// Bracketed-paste payload, borrowed from the parser's buffer for the call.
     /// `final` is true when this event completes the paste and false for a
@@ -43,18 +43,19 @@ pub const Key = union(enum) {
     end,
     /// Alt+Up (Kitty legacy-modified arrow), decoded distinctly from a bare Up.
     alt_up,
-    /// A recognized-but-unhandled sequence; callers ignore it.
+    /// A recognized-but-unhandled sequence. Callers ignore it.
     unknown,
 };
 
 const Decoded = struct { key: Key, consumed: usize, in_paste: bool = false };
 
-/// Retained bytes at which an unterminated paste is flushed as a partial
-/// payload, so a missing terminator cannot buffer unboundedly or wedge input.
+/// The retained bytes at which the parser flushes an unterminated paste as a
+/// partial payload, so a missing terminator cannot buffer unboundedly or wedge
+/// input.
 const paste_flush_len = 1 << 20;
 
-/// Retained bytes at which an unterminated control sequence is abandoned, so a
-/// missing final byte cannot buffer unboundedly or wedge input.
+/// The retained bytes at which the parser abandons an unterminated control
+/// sequence, so a missing final byte cannot buffer unboundedly or wedge input.
 const sequence_flush_len = 64;
 
 const escape_start = 0x1b;
@@ -72,7 +73,7 @@ pub fn deinit(self: *Input) void {
     self.pending.deinit(self.gpa);
 }
 
-/// Append freshly read bytes, first dropping the consumed prefix.
+/// Drop the consumed prefix, then append the freshly read bytes.
 pub fn feed(self: *Input, bytes: []const u8) !void {
     if (self.start > 0) {
         const kept = self.pending.items.len - self.start;
@@ -83,9 +84,9 @@ pub fn feed(self: *Input, bytes: []const u8) !void {
     try self.pending.appendSlice(self.gpa, bytes);
 }
 
-/// Next decoded event, or null when the remaining bytes are empty or form an
-/// incomplete sequence awaiting more input. A returned `.paste` event's `bytes`
-/// borrow the internal buffer and are valid only until the next `feed`.
+/// The next decoded event, or null when the remaining bytes are empty or form
+/// an incomplete sequence that awaits more input. A returned `.paste` event's
+/// `bytes` borrow the internal buffer and are valid only until the next `feed`.
 pub fn next(self: *Input) ?Key {
     const data = self.pending.items[self.start..];
     if (data.len == 0) return null;
@@ -155,9 +156,9 @@ fn decodeControlSequence(data: []const u8) ?Decoded {
 }
 
 /// A paste body whose begin marker is already consumed. The terminator ends the
-/// logical paste with `final` set; otherwise a body reaching `paste_flush_len`
-/// flushes as a bounded, non-`final` continuation (`in_paste` set), holding back
-/// a partial terminator so a marker split across reads still ends the paste.
+/// logical paste with `final` set. Otherwise a body that reaches `paste_flush_len`
+/// flushes as a bounded, non-`final` continuation (`in_paste` set). The flush holds
+/// back a partial terminator, so a marker split across reads still ends the paste.
 fn decodePasteBody(body: []const u8) ?Decoded {
     if (std.mem.indexOf(u8, body, escape.paste_end)) |end| {
         return .{
@@ -184,8 +185,8 @@ fn mapControlSequence(parameters: []const u8, final: u8) Key {
     }
     if (final == 'u') return mapCsiU(parameters);
     // A modified arrow arrives as `CSI 1 ; modifiers <final>` (Kitty leaves
-    // these in the legacy encoding). Only plain Alt+Up is distinguished; any
-    // other modifier combination decodes as the bare key.
+    // these in the legacy encoding). The parser distinguishes only plain
+    // Alt+Up. Any other modifier combination decodes as the bare key.
     if (final == 'A' and modifiersOf(parameters) == alt_bit) return .alt_up;
     return mapFinal(final);
 }
@@ -196,8 +197,8 @@ fn modifiersOf(parameters: []const u8) u21 {
     return (std.fmt.parseInt(u21, parameters[semicolon + 1 ..], 10) catch 1) -| 1;
 }
 
-/// Decode a Kitty-protocol `CSI codepoint;modifiers u` key. Only the events the
-/// UI acts on are recognized; anything else is `.unknown`.
+/// Decode a Kitty-protocol `CSI codepoint;modifiers u` key. The parser
+/// recognizes only the events the UI acts on. Anything else is `.unknown`.
 fn mapCsiU(parameters: []const u8) Key {
     var codepoint_field = parameters;
     var modifier_field: []const u8 = "1";
@@ -290,7 +291,7 @@ test "alt+up decodes apart from a bare or otherwise-modified up" {
     try expectKeys("\x1b[1;3A", &.{.alt_up});
     // Other modifiers on Up (here Shift) fall back to the bare key.
     try expectKeys("\x1b[1;2A", &.{.up});
-    // Alt on another arrow is not acted on.
+    // The parser does not act on Alt on another arrow.
     try expectKeys("\x1b[1;3B", &.{.down});
 }
 
@@ -313,7 +314,7 @@ test "a complete large paste in one feed is not capped" {
     const body = try gpa.alloc(u8, paste_flush_len + 100);
     defer gpa.free(body);
     @memset(body, 'x');
-    // The terminator is buffered before any flush, so the whole paste emits once.
+    // The parser buffers the terminator before any flush, so the whole paste emits once.
     try input.feed(escape.paste_begin);
     try input.feed(body);
     try input.feed(escape.paste_end);
@@ -397,7 +398,7 @@ test "a payload over multiple caps yields continuations then one final" {
     try std.testing.expect(last.paste.final);
     total += last.paste.bytes.len;
 
-    // Every fed payload byte is delivered exactly once across the chunks.
+    // The parser delivers every fed payload byte exactly once across the chunks.
     try std.testing.expectEqual(2 * paste_flush_len, total);
     try std.testing.expectEqual(@as(?Key, null), input.next());
 }

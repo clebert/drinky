@@ -1,4 +1,4 @@
-//! Finds files by glob pattern, returning matching paths one per line.
+//! Finds files by glob pattern and returns the matching paths one per line.
 
 const std = @import("std");
 
@@ -61,11 +61,11 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
         if (matches.capped) return Result.report(
             gpa,
             .ok,
-            "no files match {s} in the portion searched; " ++
-                "the tree is too large to scan fully — narrow the path or pattern",
+            "No files match {s} in the part that Pith searched. Use a narrower path or " ++
+                "pattern because Pith could not scan the full file tree.",
             .{pattern},
         );
-        return Result.report(gpa, .ok, "no files match {s}", .{pattern});
+        return Result.report(gpa, .ok, "No files match {s}.", .{pattern});
     }
 
     const shown = matches.paths.len;
@@ -77,21 +77,26 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
     }
     if (matches.capped) {
         if (shown > 0) try out.writer.writeAll("\n");
-        try out.writer.print("... search stopped: the tree is too large to scan fully; " ++
-            "showing the {d} smallest matches — narrow the path or pattern", .{shown});
+        try out.writer.print(
+            "[Pith stopped the search because the file tree is too large. " ++
+                "Pith shows the {d} smallest matches. Use a narrower path or pattern.]",
+            .{shown},
+        );
     } else if (matches.matched > shown) {
         if (shown > 0) try out.writer.writeAll("\n");
-        try out.writer.print("... {d} more (raise limit to see them)", .{matches.matched - shown});
+        try out.writer.print(
+            "[Pith omitted {d} matches. Increase limit to see them.]",
+            .{matches.matched - shown},
+        );
     }
 
     var summary_output: std.Io.Writer.Allocating = .init(gpa);
     errdefer summary_output.deinit();
-    const plural_suffix: []const u8 = if (shown == 1) "" else "s";
-    try summary_output.writer.print("{d} file{s}", .{ shown, plural_suffix });
+    try summary_output.writer.print("Matches: {d}", .{shown});
     if (matches.capped) {
-        try summary_output.writer.writeAll(" · search incomplete");
+        try summary_output.writer.writeAll(" · Search: Incomplete");
     } else if (matches.matched > shown) {
-        try summary_output.writer.print(" · {d} more", .{matches.matched - shown});
+        try summary_output.writer.print(" · Omitted matches: {d}", .{matches.matched - shown});
     }
     const summary = try summary_output.toOwnedSlice();
     errdefer gpa.free(summary);
@@ -117,7 +122,7 @@ test "find matches files by glob under a directory" {
     const expected =
         try std.fmt.bufPrint(&expected_buf, ".zig-cache/tmp/{s}/a.zig", .{tmp.sub_path});
     try std.testing.expectEqualStrings(expected, result.content);
-    try std.testing.expectEqualStrings("1 file", result.summary.?);
+    try std.testing.expectEqualStrings("Matches: 1", result.summary.?);
 }
 
 test "find reports how many more matched beyond the limit" {
@@ -138,11 +143,11 @@ test "find reports how many more matched beyond the limit" {
     var expected_buf: [128]u8 = undefined;
     const expected = try std.fmt.bufPrint(
         &expected_buf,
-        ".zig-cache/tmp/{s}/a.txt\n... 2 more (raise limit to see them)",
+        ".zig-cache/tmp/{s}/a.txt\n[Pith omitted 2 matches. Increase limit to see them.]",
         .{tmp.sub_path},
     );
     try std.testing.expectEqualStrings(expected, result.content);
-    try std.testing.expectEqualStrings("1 file · 2 more", result.summary.?);
+    try std.testing.expectEqualStrings("Matches: 1 · Omitted matches: 2", result.summary.?);
 }
 
 test "find reports when no files match" {
@@ -158,5 +163,5 @@ test "find reports when no files match" {
     const result = try run(&context, input);
     defer result.deinit(gpa);
     try std.testing.expect(!result.is_error);
-    try std.testing.expectEqualStrings("no files match *.md", result.content);
+    try std.testing.expectEqualStrings("No files match *.md.", result.content);
 }

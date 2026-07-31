@@ -1,9 +1,9 @@
 //! The seam between the neutral agent loop and concrete model providers. A
-//! `Client` is a live connection to whichever provider the session selected; it
-//! serializes a neutral `llm.Request`, sends it, and hands back a `Stream` of
-//! neutral `llm.Event`s. Each provider account is a `Credentials`/`Stream` union
-//! arm, so adding one is a new arm plus its module — the loop and tools never
-//! change.
+//! `Client` is a live connection to whichever provider the session selected.
+//! It serializes a neutral `llm.Request`, sends it, and hands back a `Stream`
+//! of neutral `llm.Event`s. Each provider account is a `Credentials`/`Stream`
+//! union arm, so a new account is a new arm plus its module. The loop and
+//! tools never change.
 
 const std = @import("std");
 
@@ -17,7 +17,7 @@ const codex_url = "https://chatgpt.com/backend-api/codex/responses";
 
 /// What a client needs to authenticate, tagged by the account it belongs to. A
 /// subscription account holds an OAuth `Auth` (owned by the caller, refreshed on
-/// demand); an API account holds a bare key (owned by the caller). The active tag
+/// demand). An API account holds a bare key (owned by the caller). The active tag
 /// picks the account, so `Client.init` needs no separate selector.
 pub const Credentials = union(llm.Account) {
     anthropic_subscription: *anthropic.Auth,
@@ -41,12 +41,12 @@ pub const Client = struct {
         return .{ .gpa = gpa, .io = io, .credentials = credentials, .timeouts = timeouts };
     }
 
-    /// The account backing this client — vendor and billing product.
+    /// The account that backs this client — vendor and billing product.
     pub fn account(self: *const Client) llm.Account {
         return std.meta.activeTag(self.credentials);
     }
 
-    /// Open a streaming request for `request`, filling `out` in place. On
+    /// Open a streaming request for `request` and fill `out` in place. On
     /// success the caller owns `out` and must `deinit` it.
     pub fn send(self: *Client, out: *Stream, request: *const llm.Request) !void {
         switch (self.credentials) {
@@ -88,9 +88,9 @@ pub const Client = struct {
     }
 };
 
-/// A single request in flight, decoding to neutral `llm.Event`s. Both accounts of
-/// a vendor share that vendor's transport stream — they differ only in how the
-/// request was sent, not in how the response decodes.
+/// A single request in flight that decodes to neutral `llm.Event`s. Both
+/// accounts of a vendor share that vendor's transport stream. They differ only
+/// in how the request was sent, not in how the response decodes.
 pub const Stream = union(llm.Account) {
     anthropic_subscription: anthropic.Transport.Stream,
     anthropic_api: anthropic.Transport.Stream,
@@ -104,21 +104,21 @@ pub const Stream = union(llm.Account) {
     }
 
     /// Whether the request head reported success. A false result means the
-    /// stream carries an error body, not events; read it with `errorText`.
+    /// stream carries an error body, not events. Read it with `errorText`.
     pub fn ok(self: *const Stream) bool {
         return switch (self.*) {
             inline else => |*stream| stream.ok(),
         };
     }
 
-    /// Error body text when the request failed; empty otherwise.
+    /// The error body text when the request failed, or empty otherwise.
     pub fn errorText(self: *const Stream) []const u8 {
         return switch (self.*) {
             inline else => |*stream| stream.errorText(),
         };
     }
 
-    /// Whether the current failure is worth retrying — a transient streamed
+    /// Whether the current failure is worth a retry — a transient streamed
     /// error, rate limit, or server status the provider marks retryable.
     pub fn retryable(self: *const Stream) bool {
         return switch (self.*) {
@@ -134,14 +134,14 @@ pub const Stream = union(llm.Account) {
         };
     }
 
-    /// Next decoded event, or null at end of stream.
+    /// The next decoded event, or null at the end of the stream.
     pub fn next(self: *Stream) !?llm.Event {
         return switch (self.*) {
             inline else => |*stream| stream.next(),
         };
     }
 
-    /// Usage accumulated over this stream so far, before its stop event; whatever
+    /// Usage accumulated over this stream so far, before its stop event: whatever
     /// counts the provider has delivered up to now.
     pub fn usageSoFar(self: *const Stream) llm.Usage {
         return switch (self.*) {
@@ -150,8 +150,9 @@ pub const Stream = union(llm.Account) {
     }
 
     /// The subscription allowance the response head reported, or null when the
-    /// account or backend sends none. Valid as soon as the head is read, so it
-    /// outlives a stream that errors or is cancelled before its stop event.
+    /// account or backend sends none. It is valid as soon as the head is read,
+    /// so it outlives a stream that errors or is cancelled before its stop
+    /// event.
     pub fn quotaSoFar(self: *const Stream) ?llm.Quota {
         return switch (self.*) {
             inline else => |*stream| stream.quotaSoFar(),

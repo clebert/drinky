@@ -1,10 +1,11 @@
 //! The render consumer: the durable model the interface projects and the code
-//! that applies events to it and paints. Owns the `Transcript`, the interaction
-//! `mode` (prompt / streaming turn / picker / read-only page), the `editor`, the
-//! reconciling `view`, the last laid-out dimensions, and consumer-side snapshots
-//! of usage and the active model. Everything here is io-, tty-, and agent-free:
-//! producers hand it `UiEvent`s and `App` drives its mutations, so the render
-//! loop can be tested from a scripted event sequence without real io.
+//! that applies events to it and paints. It owns the `Transcript`, the sole
+//! transient notice, the interaction `mode` (prompt / streaming turn / picker /
+//! read-only page), and the `editor`. It also owns the reconciling `view`, the
+//! last laid-out dimensions, and consumer-side snapshots of usage and the
+//! active model. Everything here is io-, tty-, and agent-free. Producers hand
+//! it `UiEvent`s and `App` drives its mutations. Tests can then drive the
+//! render loop from a scripted event sequence without real io.
 
 const std = @import("std");
 
@@ -17,60 +18,63 @@ const ui = @import("ui/root.zig");
 
 const Session = @This();
 
-/// Shown when a turn committed a reply the provider cut short, so a partial
-/// answer is never presented as a complete one.
-const truncated_notice = "response truncated at the model's output or context limit";
+/// The transcript shows this event when a turn committed a reply the provider
+/// cut short, so a partial answer never reads as a complete one.
+const truncated_event =
+    "The response is incomplete. The model reached an output or context limit.";
 
 gpa: std.mem.Allocator,
 transcript: Transcript,
+/// The sole transient notice. Its owned content never enters the transcript.
+notice: ?ai.command.Outcome.Message,
 editor: ui.Editor,
 /// The primary-screen conversation renderer remains untouched while a page is open.
 view: terminal.View,
 /// A separate renderer for temporary content on the alternate screen.
 page_view: terminal.View,
-/// The current interaction. The editor is live while waiting or streaming; a
-/// picker or full-window page replaces it.
+/// The current interaction. The editor is live while the session waits or
+/// streams. A picker or full-window page replaces it.
 mode: Mode,
 columns: usize,
 rows: usize,
-/// The model changed since the last paint; the next tick repaints and clears it.
-/// The event-appliers and lifecycle methods self-mark; `App` sets it directly
-/// after mutating a widget (the editor, the picker).
+/// The model changed since the last paint. The next tick repaints and clears it.
+/// The event-appliers and lifecycle methods self-mark. `App` sets it directly
+/// after it mutates a widget (the editor, the picker).
 dirty: bool,
-/// Consumer-owned copy of the agent's usage/cost, updated by `.usage` events so
-/// the status gauge never reads `agent.stats` across the worker thread.
+/// The consumer-owned copy of the agent's usage/cost. `.usage` events update
+/// it, so the status gauge never reads `agent.stats` across the worker thread.
 stats_shown: ai.Agent.Stats,
-/// Consumer-owned copy of the active model, updated after a command runs, so
-/// `paint` needs no agent for the context-window and model-name gauges.
+/// The consumer-owned copy of the active model. It updates after a command
+/// runs, so `paint` needs no agent for the context-window and model-name gauges.
 model_shown: ai.models.Model,
-/// Consumer-owned copy of the reasoning-effort level, updated after a command
-/// runs, for the status-line indicator.
+/// The consumer-owned copy of the reasoning-effort level for the status-line
+/// indicator. It updates after a command runs.
 effort_shown: ai.llm.Effort,
-/// Whether an account is active, mirrored from the agent after a command runs.
-/// When false the status line shows a signed-out indicator and the model/effort
-/// snapshots are stale placeholders.
+/// Whether an account is active. It mirrors the agent after a command runs.
+/// When false, the status line shows a signed-out indicator. The model/effort
+/// snapshots are then stale placeholders.
 signed_in: bool,
 /// Steering submitted during a turn, in chronological order, as detached editor
-/// drafts so recall can restore live placeholder markers. The plain queue is a
-/// suffix of this list; consumed drafts remain owned until the terminal receipt
-/// either drops or restores them.
+/// drafts. Recall can then restore live placeholder markers. The plain queue is
+/// a suffix of this list. Consumed drafts remain owned until the terminal
+/// receipt either drops or restores them.
 steering: std.ArrayList(ui.Editor.Draft),
 /// Leading drafts hidden from the compact queue view because the worker has
-/// taken them — consumed into the running turn, or in flight after an Alt+Up
-/// take that did not return them. Their rich drafts are never destroyed on
-/// consumption, so a rolled-back batch can be recovered; the terminal receipt
-/// resolves them. Always at most `steering.items.len`.
+/// taken them. A taken draft is consumed into the running turn, or in flight
+/// after an Alt+Up take that did not return it. Consumption never destroys
+/// their rich drafts, so a rolled-back batch remains recoverable. The terminal
+/// receipt resolves them. Always at most `steering.items.len`.
 steering_retained_count: usize,
-/// Leading drafts the worker has reported consuming (≤ `steering_retained_count`
-/// and the source of it on consumption). Kept as a cumulative count so a delayed
+/// Leading drafts the worker has reported as consumed (≤ `steering_retained_count`
+/// and the source of it on consumption). The count is cumulative, so a delayed
 /// consumed event does not double-count drafts an Alt+Up already hid.
 steering_consumed_count: usize,
-/// Borrowed compact `Steering:` rows — each non-retained draft's collapsed
-/// visible text — rebuilt each paint so the tail gets a `[]const []const u8`
-/// without a per-repaint allocation.
+/// Borrowed compact `Queued message:` rows: each non-retained draft's collapsed
+/// visible text. Each paint rebuilds them, so the tail gets a
+/// `[]const []const u8` without a per-repaint allocation.
 steering_view: std.ArrayList([]const u8),
 /// The submitted prompt's rich draft, retained while a turn is live. A failed
-/// or cancelled turn that committed nothing returns it to the editor; every
+/// or cancelled turn that committed nothing returns it to the editor. Every
 /// other terminal frees it because the prompt belongs to committed history.
 turn_origin: ?TurnOrigin,
 
@@ -81,21 +85,21 @@ const Mode = union(enum) {
     viewing: ui.Page,
 };
 
-/// A streaming turn: the input-border activity tick and the tool calls currently
-/// running, each shown as its own box in the live tail.
+/// A streaming turn: the input-border activity tick and the running tool calls,
+/// each shown as its own box in the live tail.
 const Turn = struct {
     generation: u64,
-    /// Last worker progress event applied for this generation.
+    /// The last worker progress event applied for this generation.
     progress_sequence_applied: u64,
-    /// Worker progress frontier mirrored by `transcript_checkpoint`.
+    /// The worker progress frontier that `transcript_checkpoint` mirrors.
     progress_sequence_checkpoint: u64,
-    /// Transcript length after the newest applied event known to be committed.
+    /// The transcript length after the newest applied event known to be committed.
     transcript_checkpoint: usize,
     activity_tick: u64,
-    /// Motion tick observed at the latest accepted progress event.
+    /// The motion tick observed at the latest accepted progress event.
     progress_tick_last: u64,
     tools: std.ArrayList(ActiveTool),
-    /// `tools`' box text, rebuilt each frame so the tail gets a
+    /// `tools`' box text. Each frame rebuilds it, so the tail gets a
     /// `[]const []const u8` without a fresh allocation per repaint.
     box_view: std.ArrayList([]const u8),
 
@@ -113,15 +117,17 @@ const Turn = struct {
     }
 };
 
-/// One running tool call: its blue box shows in the live tail; `name` matches the
-/// result to it and `input_json` labels that result. `box` is the box text
+/// One running tool call: its blue box shows in the live tail. `name` matches
+/// the result to it. `input_json` labels that result. `box` is the box text
 /// (`name input_json`). All owned, freed on completion.
 const ActiveTool = struct { name: []const u8, input_json: []const u8, box: []const u8 };
 
 const Picking = struct {
     picker: ui.Picker,
-    /// Selection handler called with the chosen row when the picker is confirmed.
+    /// The selection handler. Picker confirmation calls it with the chosen row.
     select: *const fn (*ai.command.Context, usize) anyerror!ai.command.Outcome,
+    /// The borrowed sentence that identifies the canceled selection.
+    cancellation_message: []const u8,
 };
 
 /// The retained prompt draft for a live turn.
@@ -133,10 +139,10 @@ const TurnOrigin = struct {
 /// belongs to. Every payload owns its bytes until the consumer frees it.
 pub const TurnEvent = struct {
     generation: u64,
-    /// Monotonic within one worker. Zero is reserved for direct model tests that
-    /// do not exercise the cross-thread commit frontier.
+    /// Monotonic within one worker. Only direct model tests that do not
+    /// exercise the cross-thread commit frontier use zero.
     progress_sequence: u64 = 0,
-    /// Events through this sequence were committed before this event was sent.
+    /// The worker committed events through this sequence before it sent this event.
     progress_sequence_committed: u64 = 0,
     payload: Payload,
 
@@ -150,11 +156,10 @@ pub const TurnEvent = struct {
         /// far so the retried attempt starts clean.
         stream_reset,
         /// The worker folded `count` queued steering messages into the running
-        /// turn as one combined message: show it and hide those rows from the
-        /// queue view, retaining their rich drafts until the receipt resolves them.
+        /// turn as one combined message: show it, hide those rows from the queue
+        /// view, and retain their rich drafts until the receipt resolves them.
         steering_consumed: SteeringConsumed,
-        /// Payload-free wakeup indicating that the authoritative worker result
-        /// is ready to join.
+        /// Payload-free wakeup: the authoritative worker result is ready to join.
         turn_ended,
 
         pub const Tool = struct { name: []u8, input_json: []u8 };
@@ -186,7 +191,7 @@ pub const TurnEvent = struct {
 };
 
 /// A message from any producer task to the render consumer. Turn-owned events
-/// carry a generation; input and presentation-control events do not.
+/// carry a generation. Input and presentation-control events do not.
 pub const UiEvent = union(enum) {
     keys: []u8,
     turn: TurnEvent,
@@ -202,9 +207,9 @@ pub const UiEvent = union(enum) {
     }
 };
 
-/// Build an empty session at the default terminal size, painting through `writer`
-/// and showing `model` and `effort` until a command changes them. Infallible: the
-/// components own no resources until used.
+/// Build an empty session at the default terminal size. It paints through
+/// `writer` and shows `model` and `effort` until a command changes them.
+/// Infallible: the components own no resources until used.
 pub fn init(
     gpa: std.mem.Allocator,
     writer: *std.Io.Writer,
@@ -214,6 +219,7 @@ pub fn init(
     var self: Session = .{
         .gpa = gpa,
         .transcript = Transcript.init(gpa),
+        .notice = null,
         .editor = ui.Editor.init(gpa),
         .view = terminal.View.init(gpa, writer),
         .page_view = terminal.View.init(gpa, writer),
@@ -237,6 +243,7 @@ pub fn init(
 
 pub fn deinit(self: *Session) void {
     self.deinitMode();
+    self.clearNotice();
     self.clearSteering();
     self.steering.deinit(self.gpa);
     self.steering_view.deinit(self.gpa);
@@ -247,12 +254,38 @@ pub fn deinit(self: *Session) void {
 }
 
 /// Clear the visible conversation and its usage and steering snapshots.
-/// Commands run only in prompt mode, so no live turn state can be discarded.
+/// Commands run only in prompt mode, so the reset cannot discard live turn state.
 pub fn resetConversation(self: *Session) void {
     std.debug.assert(self.mode == .prompt);
     self.transcript.truncate(0);
+    self.clearNotice();
     self.stats_shown = .{};
     self.clearSteering();
+}
+
+/// Clear the transient notice. The regular footer returns on the next frame.
+pub fn clearNotice(self: *Session) void {
+    if (self.notice) |notice| {
+        self.gpa.free(notice.content);
+        self.notice = null;
+        self.dirty = true;
+    }
+}
+
+/// Replace the transient notice and take ownership of `notice.content`.
+fn setNotice(self: *Session, notice: ai.command.Outcome.Message) void {
+    self.clearNotice();
+    self.notice = notice;
+    self.dirty = true;
+}
+
+/// Copy and show a transient notice produced directly by the session.
+fn showNotice(
+    self: *Session,
+    severity: ai.command.Outcome.Severity,
+    text: []const u8,
+) !void {
+    self.setNotice(.{ .content = try self.gpa.dupe(u8, text), .severity = severity });
 }
 
 /// Free whatever the current mode owns.
@@ -268,9 +301,9 @@ fn deinitMode(self: *Session) void {
     }
 }
 
-/// Apply one turn worker event to the model, marking it dirty and freeing the
-/// event's bytes. Applying never paints. An event is dropped unless its captured
-/// generation is still the active turn.
+/// Apply one turn worker event to the model, mark it dirty, and free the
+/// event's bytes. This function never paints. It drops an event unless its
+/// captured generation is still the active turn.
 pub fn applyTurnEvent(self: *Session, event: *const TurnEvent) !bool {
     defer event.deinit(self.gpa);
     const turn = self.activeTurn() orelse return false;
@@ -297,9 +330,9 @@ pub fn applyTurnEvent(self: *Session, event: *const TurnEvent) !bool {
         .stream_reset => self.transcript.discardMessage(),
         .steering_consumed => |consumed| {
             // Show the folded batch and hide its rows from the queue view, but
-            // retain the rich drafts: a consumed batch can still be rolled back
-            // (until its following reply commits), so the receipt — not this
-            // event — decides whether each draft is dropped or recovered.
+            // retain the rich drafts: a consumed batch can still roll back
+            // (until its following reply commits). The receipt — not this
+            // event — decides whether to drop or recover each draft.
             try self.transcript.append(.user, false, consumed.text);
             // Advance the consumed frontier, then the view frontier to cover it,
             // without double-counting drafts an earlier Alt+Up already hid.
@@ -321,8 +354,8 @@ pub fn applyTurnEvent(self: *Session, event: *const TurnEvent) !bool {
 
 /// Apply progress taken directly from the shared queue after its worker has been
 /// joined for cancellation. An earlier event can already belong to the consumer's
-/// current batch, so a sequence gap is an allowed presentation gap: discard this
-/// and every later queued event rather than applying progress out of order.
+/// current batch, so a sequence gap is an allowed presentation gap. Discard this
+/// and every later queued event rather than apply progress out of order.
 pub fn applyCanceledTurnEvent(self: *Session, event: *const TurnEvent) !void {
     const turn = self.activeTurn() orelse {
         event.deinit(self.gpa);
@@ -338,8 +371,9 @@ pub fn applyCanceledTurnEvent(self: *Session, event: *const TurnEvent) !void {
     _ = try self.applyTurnEvent(event);
 }
 
-/// Record a finished tool call in the transcript: the tool's summary (or its first
-/// output line, when it gave none) beside the box it closes, then free that box.
+/// Record a finished tool call in the transcript: the tool's summary (or its
+/// first output line, when it gave none) beside the box it closes. Then free
+/// that box.
 fn applyToolResult(self: *Session, result: TurnEvent.Payload.ToolResult) !void {
     const detail = result.summary orelse first: {
         const line_end = std.mem.indexOfScalar(u8, result.content, '\n') orelse result.content.len;
@@ -348,25 +382,28 @@ fn applyToolResult(self: *Session, result: TurnEvent.Payload.ToolResult) !void {
     const finished = if (self.activeTurn()) |turn| takeTool(turn, result.name) else null;
     defer if (finished) |*tool| self.freeTool(tool);
     const arguments = if (finished) |tool| tool.input_json else "";
-    const text = try std.fmt.allocPrint(self.gpa, "{s} {s}\n→ {s}", .{
+    const text = try std.fmt.allocPrint(self.gpa, "Tool: {s} {s}\n{s}: {s}", .{
         result.name,
         arguments,
+        if (result.is_error) "Error" else "Result",
         detail,
     });
     defer self.gpa.free(text);
     try self.transcript.append(.tool_result, result.is_error, text);
 }
 
-/// Apply a command outcome to the model: show its feedback or open its picker.
+/// Apply a command outcome to the model: replace its notice, record its event,
+/// or open its picker.
 pub fn applyOutcome(self: *Session, outcome: ai.command.Outcome) !void {
     switch (outcome) {
-        .feedback => |feedback| {
-            defer self.gpa.free(feedback.content);
-            try self.transcript.append(.feedback, feedback.is_error, feedback.content);
+        .notice => |notice| self.setNotice(notice),
+        .event => |event| {
+            defer self.gpa.free(event.content);
+            try self.transcript.append(.event, event.severity == .failure, event.content);
         },
         .pick => |pick| try self.openPicker(pick),
         // The app intercepts prompt, account, conversation, and inspection
-        // actions; they never reach the io-free session.
+        // actions. They never reach the io-free session.
         .prompt,
         .login,
         .logout,
@@ -385,14 +422,18 @@ fn openPicker(self: *Session, pick: ai.command.Outcome.Pick) !void {
         self.gpa.free(pick.options);
     }
     const picker = try ui.Picker.init(self.gpa, pick.title, pick.options, pick.current);
-    // Init succeeded and now owns the options; drop whatever the previous mode
-    // held before replacing it, so opening a picker over a live turn or picker
-    // cannot leak.
+    // Init succeeded and now owns the options. Drop whatever the previous mode
+    // held before the replacement, so a picker opened over a live turn or
+    // picker cannot leak.
     self.deinitMode();
-    self.mode = .{ .picking = .{ .picker = picker, .select = pick.select } };
+    self.mode = .{ .picking = .{
+        .picker = picker,
+        .select = pick.select,
+        .cancellation_message = pick.cancellation_message,
+    } };
 }
 
-/// Leave picker mode, freeing the picker; a no-op in any other mode.
+/// Leave picker mode and free the picker. A no-op in any other mode.
 pub fn closePicker(self: *Session) void {
     switch (self.mode) {
         .picking => |*picking| {
@@ -404,10 +445,14 @@ pub fn closePicker(self: *Session) void {
     }
 }
 
-/// Close the picker and record the cancellation.
+/// Close the picker and show its cancellation until the next user action.
 pub fn cancelPicker(self: *Session) !void {
+    const cancellation_message = switch (self.mode) {
+        .picking => |picking| picking.cancellation_message,
+        else => return,
+    };
     self.closePicker();
-    try self.transcript.append(.feedback, false, "cancelled");
+    try self.showNotice(.information, cancellation_message);
 }
 
 /// Open an owned read-only page over an idle conversation.
@@ -433,15 +478,15 @@ pub fn closePage(self: *Session) void {
     }
 }
 
-/// Reserve capacity for one more queued steering draft, so `App.submitSteering`'s
-/// channel push becomes the only fallible step before the draft moves in — once
-/// reserved, `commitSteeringDraft` cannot fail, so the worker never owns a message
-/// the mirror lacks a recovery draft for.
+/// Reserve capacity for one more queued steering draft. `App.submitSteering`'s
+/// channel push then becomes the only fallible step before the draft moves in.
+/// Once reserved, `commitSteeringDraft` cannot fail, so the worker never owns a
+/// message the mirror lacks a recovery draft for.
 pub fn reserveSteering(self: *Session) !void {
     try self.steering.ensureUnusedCapacity(self.gpa, 1);
 }
 
-/// Move a detached steering draft into the mirror; infallible after
+/// Move a detached steering draft into the mirror. Infallible after
 /// `reserveSteering`. Takes ownership and leaves `draft` empty.
 pub fn commitSteeringDraft(self: *Session, draft: *ui.Editor.Draft) void {
     self.steering.appendAssumeCapacity(draft.*);
@@ -469,8 +514,8 @@ pub fn recallSteering(self: *Session, pending_count: usize) void {
 }
 
 /// Retain the submitted prompt's rich draft and set the turn's initial transcript
-/// checkpoint, so an abnormal exit that commits nothing can return the prompt.
-/// Takes ownership of `prompt`, leaving it empty.
+/// checkpoint. An abnormal exit that commits nothing can then return the prompt.
+/// Takes ownership of `prompt` and leaves it empty.
 pub fn retainTurnPrompt(self: *Session, prompt: *ui.Editor.Draft, transcript_base: usize) void {
     std.debug.assert(self.turn_origin == null);
     const turn = self.activeTurn() orelse unreachable;
@@ -480,8 +525,8 @@ pub fn retainTurnPrompt(self: *Session, prompt: *ui.Editor.Draft, transcript_bas
     prompt.* = .empty;
 }
 
-/// Drop the live turn's rewind anchor, freeing the retained prompt draft after
-/// it has either entered committed history or moved back into the editor.
+/// Drop the live turn's rewind anchor and free the retained prompt draft. By
+/// then it has either entered committed history or moved back into the editor.
 fn dropTurnOrigin(self: *Session) void {
     if (self.turn_origin) |*origin| {
         origin.prompt.deinit(self.gpa);
@@ -490,16 +535,16 @@ fn dropTurnOrigin(self: *Session) void {
 }
 
 /// Preflight editor capacity to put the returned prompt and every uncommitted
-/// steering draft above the in-progress line, so abnormal receipt reconciliation
-/// cannot fail. The prompt is reserved before the receipt says whether it will
-/// return, so a partial commit intentionally over-reserves.
+/// steering draft above the in-progress line. Abnormal receipt reconciliation
+/// then cannot fail. This reserves the prompt before the receipt says whether
+/// it returns, so a partial commit intentionally over-reserves.
 pub fn reserveSteeringRestore(self: *Session) !void {
     const lead: ?*const ui.Editor.Draft =
         if (self.turn_origin) |*origin| &origin.prompt else null;
     try self.editor.reserveComposition(lead, self.steering.items);
 }
 
-/// Preflight only the drafts a known failed receipt will restore, avoiding
+/// Preflight only the drafts a known failed receipt will restore. This avoids
 /// capacity for an origin or steering prefix already committed to history.
 pub fn reserveFailureRestore(self: *Session, receipt: *const ai.Agent.Receipt) !void {
     const committed = receipt.history_end != receipt.history_base;
@@ -516,7 +561,7 @@ pub fn hasSteering(self: *const Session) bool {
     return self.steering.items.len > 0;
 }
 
-/// Drop every steering draft, freeing its atoms.
+/// Drop every steering draft and free its atoms.
 pub fn clearSteering(self: *Session) void {
     for (self.steering.items) |*draft| draft.deinit(self.gpa);
     self.steering.clearRetainingCapacity();
@@ -525,9 +570,9 @@ pub fn clearSteering(self: *Session) void {
     self.dirty = true;
 }
 
-/// Borrowed compact `Steering:` rows: each non-retained draft's collapsed visible
-/// text, rebuilt each paint without a per-frame allocation. Borrows stay valid
-/// only until the mirror next mutates.
+/// Borrowed compact `Queued message:` rows: each non-retained draft's collapsed
+/// visible text. Each paint rebuilds them without a per-frame allocation.
+/// Borrows stay valid only until the mirror next mutates.
 fn steeringView(self: *Session) ![]const []const u8 {
     std.debug.assert(self.steering_retained_count <= self.steering.items.len);
     self.steering_view.clearRetainingCapacity();
@@ -559,37 +604,37 @@ pub fn beginTurn(self: *Session, generation: u64) void {
 pub fn abortTurn(self: *Session) !void {
     self.endTurn();
     self.dirty = true;
-    try self.transcript.append(.feedback, false, "cancelled");
+    try self.transcript.append(.event, false, "You canceled the turn.");
 }
 
-/// Apply a completed turn's receipt, append any cutoff notice, and end it. Late
+/// Apply a completed turn's receipt, append any cutoff event, and end it. Late
 /// steering remains pending so the app can promote it into a successor turn.
 pub fn endTurnWithReceipt(self: *Session, receipt: *const ai.Agent.Receipt) !void {
     self.applyReceiptNormal(receipt);
     self.dropTurnOrigin();
-    if (receipt.truncated) try self.transcript.append(.feedback, false, truncated_notice);
+    if (receipt.truncated) try self.transcript.append(.event, false, truncated_event);
     self.transcript.endMessage();
     self.endTurn();
 }
 
 /// Rewind a failed turn to committed history, return every uncommitted draft,
-/// append its feedback, and end it. Infallible after `reserveFailureRestore`
-/// until the feedback append. Borrows `error_text`; the caller frees it.
+/// append its event, and end it. Infallible after `reserveFailureRestore` until
+/// the event append. Borrows `error_text`. The caller frees it.
 pub fn failTurnWithReceipt(
     self: *Session,
     receipt: *const ai.Agent.Receipt,
     error_text: ?[]const u8,
 ) !void {
     self.reconcileAbnormalReceipt(receipt);
-    if (receipt.truncated) try self.transcript.append(.feedback, false, truncated_notice);
-    if (error_text) |text| try self.transcript.append(.feedback, true, text);
+    if (receipt.truncated) try self.transcript.append(.event, false, truncated_event);
+    if (error_text) |text| try self.transcript.append(.event, true, text);
     self.transcript.endMessage();
     self.endTurn();
 }
 
 /// Resolve the rich steering mirror on a completed terminal: drop the committed
-/// prefix (now in history) and make every remaining draft pending again, so
-/// late-steering handling can start it as a new turn. Infallible.
+/// prefix (now in history) and make every remaining draft pending again.
+/// Late-steering handling can then start it as a new turn. Infallible.
 fn applyReceiptNormal(self: *Session, receipt: *const ai.Agent.Receipt) void {
     self.dropSteeringPrefix(receipt.steering_committed_count);
     self.steering_retained_count = 0;
@@ -609,10 +654,10 @@ pub fn cancelReceipt(
     if (progress_sequence_committed > turn.progress_sequence_checkpoint and
         progress_sequence_committed == turn.progress_sequence_applied)
     {
-        // No later event carried the final frontier, but every event through it
-        // was applied. When committed progress is missing, keep the older
-        // checkpoint: the gap could contain a stream reset that invalidates the
-        // currently displayed attempt.
+        // No later event carried the final frontier, but the consumer applied
+        // every event through it. When committed progress is missing, keep the
+        // older checkpoint: the gap can contain a stream reset that invalidates
+        // the currently displayed attempt.
         self.transcript.endMessage();
         turn.transcript_checkpoint = self.transcript.blocks().len;
         turn.progress_sequence_checkpoint = progress_sequence_committed;
@@ -650,16 +695,16 @@ fn dropSteeringPrefix(self: *Session, count: usize) void {
     }
 }
 
-/// Free the finished turn's tool state and return to waiting for input.
+/// Free the finished turn's tool state and return to prompt mode.
 pub fn endTurn(self: *Session) void {
     if (self.activeTurn()) |turn| self.freeTurn(turn);
     self.dropTurnOrigin();
     self.mode = .prompt;
 }
 
-/// Assemble the visible scene from the model and project it at `size`, recording
-/// it as the last laid-out dimensions. No tty or agent, so the consumer can be
-/// driven from a scripted event sequence in tests.
+/// Assemble the visible scene from the model, project it at `size`, and record
+/// the size as the last laid-out dimensions. No tty or agent, so tests can
+/// drive the consumer from a scripted event sequence.
 pub fn paint(self: *Session, size: terminal.View.Size) !void {
     self.columns = size.columns;
     self.rows = size.rows;
@@ -682,6 +727,10 @@ pub fn paint(self: *Session, size: terminal.View.Size) !void {
         .effort = @tagName(self.effort_shown),
         .signed_in = self.signed_in,
         .quota = self.stats_shown.quota,
+        .notice = if (self.notice) |notice| .{
+            .text = notice.content,
+            .is_error = notice.severity == .failure,
+        } else null,
     };
 
     const tail: layout.Tail = switch (self.mode) {
@@ -748,9 +797,12 @@ fn activeTurn(self: *Session) ?*Turn {
 
 /// Allocate a running tool call's owned strings and record it on `turn`. Ends at
 /// a committed append so a later fallible repaint can never orphan or double-free
-/// the strings; on any failure here nothing is retained.
+/// the strings. A failure here retains nothing.
 fn pushTool(turn: *Turn, gpa: std.mem.Allocator, tool: *const TurnEvent.Payload.Tool) !void {
-    const box = try std.fmt.allocPrint(gpa, "{s} {s}", .{ tool.name, tool.input_json });
+    const box = try std.fmt.allocPrint(gpa, "Tool: {s} {s}", .{
+        tool.name,
+        tool.input_json,
+    });
     errdefer gpa.free(box);
     const name_copy = try gpa.dupe(u8, tool.name);
     errdefer gpa.free(name_copy);
@@ -896,14 +948,14 @@ test "a large bracketed paste collapses to a marker through the real pipeline" {
         else => return error.UnexpectedInput,
     };
     // The editor shows the compact marker, not the payload.
-    try std.testing.expectEqualStrings("\u{200B}[paste #1 +11 lines]\u{200B}", editor.visible());
+    try std.testing.expectEqualStrings("\u{200B}[Paste #1: 11 lines]\u{200B}", editor.visible());
 
     const sink = try view.beginFrame(.{ .columns = 80, .rows = 24 }, 4);
     const placement: ui.paint.Placement =
         .{ .sink = sink, .id = 0, .columns = 80, .base = 0, .skip = 0 };
     try editor.render(&placement, &.{ .viewport_rows = 24 });
     try view.render();
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "[paste #1 +11 lines]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "[Paste #1: 11 lines]") != null);
 
     // It expands back to the exact bytes for a send boundary.
     const expanded = try editor.expanded(.whole_prompt);
@@ -911,9 +963,80 @@ test "a large bracketed paste collapses to a marker through the real pipeline" {
     try std.testing.expectEqualStrings(payload, expanded);
 }
 
+test "a notice replaces its predecessor without entering the transcript" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    defer session.deinit();
+
+    try session.applyOutcome(
+        try ai.command.Outcome.reportNotice(gpa, .information, "First notice.", .{}),
+    );
+    try session.applyOutcome(
+        try ai.command.Outcome.reportNotice(gpa, .failure, "Second notice.", .{}),
+    );
+
+    try std.testing.expectEqual(@as(usize, 0), session.transcript.blocks().len);
+    try std.testing.expectEqualStrings("Second notice.", session.notice.?.content);
+    try std.testing.expectEqual(ai.command.Outcome.Severity.failure, session.notice.?.severity);
+    session.clearNotice();
+    try std.testing.expect(session.notice == null);
+}
+
+test "a notice replaces the footer and clearing restores the status" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    defer session.deinit();
+
+    try session.paint(.{ .columns = 80, .rows = 24 });
+    const notice_start = out.written().len;
+    try session.applyOutcome(
+        try ai.command.Outcome.reportNotice(gpa, .failure, "Temporary notice.", .{}),
+    );
+    try session.paint(.{ .columns = 80, .rows = 24 });
+    const notice_frame = out.written()[notice_start..];
+    try std.testing.expect(std.mem.indexOf(u8, notice_frame, "Error: ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, notice_frame, "Temporary notice.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, notice_frame, test_model.name) == null);
+
+    const status_start = out.written().len;
+    session.clearNotice();
+    try session.paint(.{ .columns = 80, .rows = 24 });
+    const status_frame = out.written()[status_start..];
+    try std.testing.expect(std.mem.indexOf(u8, status_frame, test_model.name) != null);
+}
+
+test "an event survives notice clearing until the conversation resets" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    defer session.deinit();
+
+    try session.applyOutcome(
+        try ai.command.Outcome.reportEvent(gpa, .information, "Pith changed the model.", .{}),
+    );
+    try session.applyOutcome(
+        try ai.command.Outcome.reportNotice(gpa, .failure, "Temporary notice.", .{}),
+    );
+    session.clearNotice();
+
+    try std.testing.expectEqual(@as(usize, 1), session.transcript.blocks().len);
+    try std.testing.expectEqualStrings(
+        "Pith changed the model.",
+        session.transcript.blocks()[0].event.text.items,
+    );
+    session.resetConversation();
+    try std.testing.expectEqual(@as(usize, 0), session.transcript.blocks().len);
+    try std.testing.expect(session.notice == null);
+}
+
 // The consumer seam without real io: a scripted turn's worker events drive the
-// transcript, usage, and turn teardown; applying marks dirty but never paints;
-// one paint then renders the coalesced frame.
+// transcript, usage, and turn teardown. The events mark the model dirty but
+// never paint. One paint then renders the coalesced frame.
 test "scripted stream events drive the model and one coalesced paint" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -923,7 +1046,7 @@ test "scripted stream events drive the model and one coalesced paint" {
     defer session.deinit();
     session.beginTurn(1);
 
-    // Owned payloads, exactly as a producer task would allocate them.
+    // Owned payloads, exactly as a producer task allocates them.
     try applyEvent(&session, 1, .{ .text = try gpa.dupe(u8, "he") });
     try applyEvent(&session, 1, .{ .text = try gpa.dupe(u8, "llo") });
     try applyEvent(&session, 1, .{ .tool_start = .{
@@ -943,7 +1066,7 @@ test "scripted stream events drive the model and one coalesced paint" {
         .last = .{ .input = 10, .output = 20 },
     } });
 
-    // Applying marks the model dirty but paints nothing.
+    // The applied events mark the model dirty but paint nothing.
     try std.testing.expect(session.dirty);
     try std.testing.expectEqual(@as(usize, 0), out.written().len);
     try std.testing.expectEqual(@as(f64, 1.5), session.stats_shown.cost);
@@ -975,20 +1098,20 @@ test "a tool result box shows the summary instead of the output" {
     try applyEvent(&session, 1, .{ .tool_result = .{
         .name = try gpa.dupe(u8, "read"),
         .content = try gpa.dupe(u8, "line one\nline two\nline three"),
-        .summary = try gpa.dupe(u8, "3 lines · 27 B"),
+        .summary = try gpa.dupe(u8, "Lines: 3 · Size: 27 B"),
         .is_error = false,
     } });
     try finishTurn(&session, 0);
     try session.paint(.{ .columns = 80, .rows = 24 });
 
     const painted = out.written();
-    try std.testing.expect(std.mem.indexOf(u8, painted, "3 lines · 27 B") != null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "Lines: 3 · Size: 27 B") != null);
     try std.testing.expect(std.mem.indexOf(u8, painted, "line one") == null);
 }
 
 // A cut-off answer is committed history, so the turn's end says it is partial
 // rather than letting it read as a complete reply.
-test "a truncated receipt appends a notice after the answer" {
+test "a truncated receipt appends an event after the answer" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
@@ -1007,8 +1130,8 @@ test "a truncated receipt appends a notice after the answer" {
     const blocks = session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 2), blocks.len);
     try std.testing.expectEqualStrings("half an ans", blocks[0].model.items);
-    try std.testing.expect(!blocks[1].feedback.is_error);
-    try std.testing.expectEqualStrings(truncated_notice, blocks[1].feedback.text.items);
+    try std.testing.expect(!blocks[1].event.is_error);
+    try std.testing.expectEqualStrings(truncated_event, blocks[1].event.text.items);
 
     // A turn that both truncated and failed reports the cutoff before the error.
     session.beginTurn(2);
@@ -1022,9 +1145,9 @@ test "a truncated receipt appends a notice after the answer" {
     try session.failTurnWithReceipt(&receipt, "boom");
     const after = session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 4), after.len);
-    try std.testing.expectEqualStrings(truncated_notice, after[2].feedback.text.items);
-    try std.testing.expect(after[3].feedback.is_error);
-    try std.testing.expectEqualStrings("boom", after[3].feedback.text.items);
+    try std.testing.expectEqualStrings(truncated_event, after[2].event.text.items);
+    try std.testing.expect(after[3].event.is_error);
+    try std.testing.expectEqualStrings("boom", after[3].event.text.items);
 }
 
 test "streamed and tool text cannot emit terminal controls" {
@@ -1071,8 +1194,8 @@ test "streamed and tool text cannot emit terminal controls" {
     }
 }
 
-// A worker event arriving after the turn ends (a straggler from a cancelled turn)
-// is freed and dropped, not appended.
+// A worker event can arrive after the turn ends (a straggler from a cancelled
+// turn). The consumer frees and drops it rather than append it.
 test "stream events are dropped once the turn is over" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -1113,7 +1236,7 @@ test "a cancelled turn's stale output and completion cannot affect its successor
     }));
     try finishTurn(&session, 0);
     try std.testing.expect(!session.animating());
-    // Three blocks: the stale error appended no feedback block either.
+    // Three blocks: the stale error appended no event block either.
     try std.testing.expectEqual(@as(usize, 3), session.transcript.blocks().len);
     try std.testing.expectEqualStrings("turn B", session.transcript.blocks()[2].model.items);
 }
@@ -1138,7 +1261,7 @@ test "committing a steering draft empties the source" {
     try std.testing.expectEqualStrings("move me", session.steering.items[0].visible.items);
 }
 
-// Queued steering shows in the tail; a consumed event moves the combined text
+// Queued steering shows in the tail. A consumed event moves the combined text
 // into the transcript as one user block and drops the queued rows.
 test "steering queues, then a consumed event shows it and clears the queue" {
     const gpa = std.testing.allocator;
@@ -1157,9 +1280,9 @@ test "steering queues, then a consumed event shows it and clears the queue" {
         .text = try gpa.dupe(u8, "fix it\n\nand test"),
         .count = 2,
     } });
-    // The combined batch shows as one user block and its compact rows drop from
-    // the view, but the rich drafts are retained (hidden) so a rolled-back batch
-    // can still be recovered until the receipt resolves it.
+    // The combined batch shows as one user block. Its compact rows drop from
+    // the view. The session retains the rich drafts (hidden), so a rolled-back
+    // batch stays recoverable until the receipt resolves it.
     try std.testing.expectEqual(@as(usize, 1), session.transcript.blocks().len);
     try std.testing.expectEqualStrings(
         "fix it\n\nand test",
@@ -1201,8 +1324,8 @@ test "cancelReceipt drops the committed prefix and restores the uncommitted suff
         .steering_committed_count = 1,
     }, 0);
 
-    // The committed draft is gone; the uncommitted one returns to the editor and
-    // the counts reset.
+    // The committed draft is gone. The uncommitted one returns to the editor.
+    // The counts reset.
     try std.testing.expectEqual(@as(usize, 0), session.steering.items.len);
     try std.testing.expectEqual(@as(usize, 0), session.steering_retained_count);
     try std.testing.expectEqual(@as(usize, 0), session.steering_consumed_count);
@@ -1210,7 +1333,7 @@ test "cancelReceipt drops the committed prefix and restores the uncommitted suff
 }
 
 // A steered large paste shows as its collapsed marker in the compact queue view,
-// never its payload; the payload rides along in the rich draft for recall.
+// never its payload. The payload rides along in the rich draft for recall.
 test "the steering view shows a paste collapsed, not its payload" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -1227,7 +1350,7 @@ test "the steering view shows a paste collapsed, not its payload" {
 
     try session.paint(.{ .columns = 80, .rows = 24 });
     const painted = out.written();
-    try std.testing.expect(std.mem.indexOf(u8, painted, "[paste #1 +16 lines]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "[Paste #1: 16 lines]") != null);
     try std.testing.expect(std.mem.indexOf(u8, painted, "secret line") == null);
 }
 
@@ -1245,7 +1368,8 @@ test "opening a picker over a turn releases its retained prompt" {
     options[0] = try gpa.dupe(u8, "choice");
     try session.applyOutcome(.{ .pick = .{
         .select = undefined,
-        .title = "Pick",
+        .title = "Select an option",
+        .cancellation_message = "You canceled the option selection.",
         .options = options,
         .current = null,
     } });
@@ -1260,8 +1384,8 @@ test "opening a picker over a turn releases its retained prompt" {
     try std.testing.expect(session.turn_origin == null);
 }
 
-// The activity clock keeps advancing between stream events, but a corner or
-// vertical cell dwells for an extra tick without repainting.
+// The activity clock advances between stream events, but a corner or vertical
+// cell dwells for an extra tick without a repaint.
 test "activity ticks use aspect-aware repaint timing" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -1320,7 +1444,7 @@ test "a failure with nothing committed rewinds the tail and returns the prompt" 
     defer session.deinit();
     session.beginTurn(1);
 
-    try session.transcript.append(.feedback, false, "earlier");
+    try session.transcript.append(.event, false, "earlier");
     const base = session.transcript.blocks().len;
     try session.transcript.append(.user, false, "my prompt");
     try session.transcript.appendStream(.model, "partial reply");
@@ -1339,9 +1463,9 @@ test "a failure with nothing committed rewinds the tail and returns the prompt" 
 
     const blocks = session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 2), blocks.len);
-    try std.testing.expectEqualStrings("earlier", blocks[0].feedback.text.items);
-    try std.testing.expect(blocks[1].feedback.is_error);
-    try std.testing.expectEqualStrings("Overloaded", blocks[1].feedback.text.items);
+    try std.testing.expectEqualStrings("earlier", blocks[0].event.text.items);
+    try std.testing.expect(blocks[1].event.is_error);
+    try std.testing.expectEqualStrings("Overloaded", blocks[1].event.text.items);
     try std.testing.expectEqualStrings("my prompt\n\nsteer\n\ntyping", session.editor.visible());
     try std.testing.expect(session.turn_origin == null);
     try std.testing.expect(!session.hasSteering());
@@ -1393,15 +1517,15 @@ test "a failure after a committed round keeps it and restores only steering" {
     try std.testing.expectEqual(@as(usize, 3), blocks.len);
     try std.testing.expectEqualStrings("prompt", blocks[0].user.items);
     try std.testing.expectEqualStrings("round one", blocks[1].model.items);
-    try std.testing.expect(blocks[2].feedback.is_error);
-    try std.testing.expectEqualStrings("boom", blocks[2].feedback.text.items);
+    try std.testing.expect(blocks[2].event.is_error);
+    try std.testing.expectEqualStrings("boom", blocks[2].event.text.items);
     try std.testing.expectEqualStrings("restore me", session.editor.visible());
     try std.testing.expect(session.turn_origin == null);
     try std.testing.expect(!session.hasSteering());
 }
 
-// With nothing committed, the whole optimistic tail rewinds to the turn base and
-// the editor puts the returned prompt above recalled steering and in-progress text.
+// With nothing committed, the whole optimistic tail rewinds to the turn base.
+// The editor puts the returned prompt above recalled steering and in-progress text.
 test "a cancel with nothing committed rewinds the tail and returns the prompt" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -1410,8 +1534,8 @@ test "a cancel with nothing committed rewinds the tail and returns the prompt" {
     defer session.deinit();
     session.beginTurn(1);
 
-    // Prior committed content stays; the turn's tail begins at `base`.
-    try session.transcript.append(.feedback, false, "earlier");
+    // Prior committed content stays. The turn's tail begins at `base`.
+    try session.transcript.append(.event, false, "earlier");
     const base = session.transcript.blocks().len;
     try session.transcript.append(.user, false, "my prompt");
     try session.transcript.appendStream(.model, "partial reply");
@@ -1431,14 +1555,14 @@ test "a cancel with nothing committed rewinds the tail and returns the prompt" {
     // Only the prior block survives the rewind.
     const blocks = session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 1), blocks.len);
-    try std.testing.expectEqualStrings("earlier", blocks[0].feedback.text.items);
+    try std.testing.expectEqualStrings("earlier", blocks[0].event.text.items);
     // The editor preserves chronological authorship order.
     try std.testing.expectEqualStrings("my prompt\n\nsteer\n\ntyping", session.editor.visible());
     try std.testing.expect(session.turn_origin == null);
 }
 
 // A cancel whose turn committed a round keeps that round and drops only the
-// in-flight streamed tail; the prompt is committed history, so no C returns.
+// in-flight streamed tail. The prompt is committed history, so no C returns.
 test "a cancel with a committed round keeps it and drops the in-flight tail" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -1457,7 +1581,7 @@ test "a cancel with a committed round keeps it and drops the in-flight tail" {
         .progress_sequence = 1,
         .payload = .{ .text = try gpa.dupe(u8, "round one") },
     });
-    // The next event carries the checkpoint that committed round one, then the
+    // The next event carries the checkpoint that committed round one. The
     // following streamed message remains outside it.
     _ = try session.applyTurnEvent(&.{
         .generation = 1,
@@ -1482,7 +1606,7 @@ test "a cancel with a committed round keeps it and drops the in-flight tail" {
         .steering_committed_count = 0,
     }, 1);
 
-    // The committed prompt and round stay; the in-flight message is gone.
+    // The committed prompt and round stay. The in-flight message is gone.
     const blocks = session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 2), blocks.len);
     try std.testing.expectEqualStrings("prompt", blocks[0].user.items);

@@ -1,6 +1,6 @@
-//! Anthropic subscription OAuth protocol: PKCE generation, the authorize URL,
-//! and the token exchange/refresh HTTP calls. Credential storage and the login
-//! orchestration live in `Auth`; this module only speaks the protocol.
+//! The Anthropic subscription OAuth protocol: PKCE generation, the authorize
+//! URL, and the token exchange/refresh HTTP calls. Credential storage and the
+//! login orchestration live in `Auth`. This module only speaks the protocol.
 
 const std = @import("std");
 
@@ -22,7 +22,7 @@ const refresh_margin_ms = 5 * 60 * 1000;
 pub const Tokens = struct {
     access: []const u8,
     refresh: []const u8,
-    /// Absolute epoch milliseconds at which `access` should be considered stale.
+    /// The absolute epoch milliseconds at which `access` counts as stale.
     expires_ms: i64,
 
     pub fn deinit(self: Tokens, gpa: std.mem.Allocator) void {
@@ -31,7 +31,7 @@ pub const Tokens = struct {
     }
 };
 
-/// The browser authorize URL for `code`. Caller frees the result.
+/// The browser authorize URL for `code`. The caller frees the result.
 pub fn authorizeUrl(gpa: std.mem.Allocator, code: *const oauth_wire.Pkce) ![]u8 {
     return std.fmt.allocPrint(
         gpa,
@@ -51,7 +51,7 @@ pub const Grant = struct {
     verifier: []const u8,
 };
 
-/// Exchange an authorization grant for tokens. Caller frees the result.
+/// Exchange an authorization grant for tokens. The caller frees the result.
 pub fn exchange(gpa: std.mem.Allocator, io: std.Io, timeouts: net.Timeouts, grant: Grant) !Tokens {
     const body = try exchangeBody(gpa, grant);
     defer gpa.free(body);
@@ -59,7 +59,7 @@ pub fn exchange(gpa: std.mem.Allocator, io: std.Io, timeouts: net.Timeouts, gran
 }
 
 /// The exchange body via the JSON serializer, so hostile callback bytes cannot
-/// inject members into the token request. Caller frees the result.
+/// inject members into the token request. The caller frees the result.
 fn exchangeBody(gpa: std.mem.Allocator, grant: Grant) error{OutOfMemory}![]u8 {
     return std.json.Stringify.valueAlloc(gpa, .{
         .grant_type = "authorization_code",
@@ -71,7 +71,7 @@ fn exchangeBody(gpa: std.mem.Allocator, grant: Grant) error{OutOfMemory}![]u8 {
     }, .{});
 }
 
-/// Trade a refresh token for a fresh access token. Caller frees the result.
+/// Trade a refresh token for a fresh access token. The caller frees the result.
 pub fn refresh(
     gpa: std.mem.Allocator,
     io: std.Io,

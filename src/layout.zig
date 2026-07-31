@@ -1,12 +1,13 @@
 //! Projection of either the conversation interface or a temporary full-window
 //! page onto the bounded terminal `View`. Conversation components stack in
-//! screen order — transcript blocks oldest first, then the live tail and status.
+//! screen order: transcript blocks oldest first, then the live tail and status.
 //! A page is exclusive and emits only its fixed header and visible body window.
 //!
 //! Conversation layout uses two passes: measure newest → oldest to find the
-//! bounded clip, then compose clip → newest. Nothing is cached between frames;
-//! the scene is projected again at each size. A single blank line separates
-//! adjacent conversation components; boxes carry their own colored padding.
+//! bounded clip, then compose clip → newest. The layout caches nothing between
+//! frames and projects the scene again at each size. A single blank line
+//! separates adjacent conversation components. Boxes carry their own colored
+//! padding.
 
 const std = @import("std");
 
@@ -17,10 +18,10 @@ const ui = @import("ui/root.zig");
 /// The view retains this many pages (terminal heights) of the newest content.
 const window_pages = 8;
 
-/// Anchor ids for the tail rows, from a reserved high range a growing transcript
-/// index (a block's id) can never reach, so anchors never alias as the model
-/// grows. The editor and picker share `id_input`: they occupy the same region,
-/// so the diff repaints it in place when one replaces the other.
+/// Anchor ids for the tail rows. They come from a reserved high range a growing
+/// transcript index (a block's id) can never reach, so anchors never alias as
+/// the model grows. The editor and picker share `id_input`: they occupy the same
+/// region, so the diff repaints it in place when one replaces the other.
 const id_reserved = std.math.maxInt(usize) - 255;
 const id_status = id_reserved;
 const id_input = id_reserved + 1;
@@ -47,7 +48,7 @@ pub const Scene = union(enum) {
 };
 
 /// The live region below the transcript. A tagged union so exactly one input is
-/// ever present and focused: the editor while `prompt`ing, the same editor kept
+/// ever present and focused: the editor during a `prompt`, the same editor kept
 /// live under a streaming `turn`'s chrome (for steering), or a `picker` that owns
 /// the region.
 pub const Tail = union(enum) {
@@ -81,8 +82,8 @@ const Component = union(enum) {
     status: *const ui.status.Info,
 
     /// The physical rows this component occupies, its leading separator excluded.
-    /// Must equal exactly what `render` emits — the parity the diff and window
-    /// math rely on.
+    /// Must equal exactly what `render` emits. The diff and window math rely on
+    /// this parity.
     fn measure(self: *const Component, size: terminal.View.Size) usize {
         return switch (self.*) {
             .entry => |entry| entry.rows(size.columns),
@@ -94,7 +95,7 @@ const Component = union(enum) {
         };
     }
 
-    /// Compose this component's rows through `placement`, dropping its top `skip`
+    /// Compose this component's rows through `placement` and drop its top `skip`
     /// rows (nonzero only for the clip).
     fn render(
         self: *const Component,
@@ -204,7 +205,7 @@ fn slotAt(scene: *const Scene.Conversation, index: usize) Slot {
 }
 
 /// The tail component at `offset`, in screen order: for a turn the tool boxes,
-/// then the steering queue (when non-empty), then the live editor; otherwise the
+/// then the steering queue (when non-empty), then the live editor. Otherwise the
 /// sole input.
 fn tailSlot(tail: *const Tail, offset: usize) Slot {
     switch (tail.*) {
@@ -261,8 +262,8 @@ fn projected(gpa: std.mem.Allocator, size: terminal.View.Size, scene: *const Sce
 
 // The whole projection end to end: a transcript plus the tail (the prompt editor
 // and the status line) composed through a real view. Exercises the backward
-// measure walk and the two-pass compose across transcript and tail together,
-// screen order newest at the bottom.
+// measure walk and the two-pass compose across the transcript and the tail
+// together. Screen order: newest at the bottom.
 test "projection stacks the transcript above the tail, newest at the bottom" {
     const gpa = std.testing.allocator;
     var editor = ui.Editor.init(gpa);
@@ -298,7 +299,7 @@ test "projection stacks the transcript above the tail, newest at the bottom" {
 }
 
 // A streaming turn stacks its tool boxes above the active editor and then the
-// status line — several tool boxes at once, not just one.
+// status line. Several tool boxes show at once, not just one.
 test "a turn tail stacks tool boxes above the active editor" {
     const gpa = std.testing.allocator;
     var editor = ui.Editor.init(gpa);
@@ -360,7 +361,7 @@ test "border activity does not change the input tail height" {
 }
 
 // Regression: 253 concurrent tool boxes used to wrap the anchor-id arithmetic
-// past maxInt(usize); the ids must stay unique and in range.
+// past maxInt(usize). The ids must stay unique and in range.
 test "a turn with 253 tool boxes keeps its anchor ids from wrapping" {
     const gpa = std.testing.allocator;
     var editor = ui.Editor.init(gpa);
@@ -382,8 +383,8 @@ test "a turn with 253 tool boxes keeps its anchor ids from wrapping" {
     try std.testing.expect(idTool(252) < id_reserved);
 }
 
-// A turn tail with queued steering shows each "Steering:" row — a multi-line
-// message cut to its first line — and the recall hint above the editor.
+// A turn tail with queued steering shows each "Queued message:" row and the
+// recall hint above the editor. A multi-line message shows only its first line.
 test "a turn tail shows the steering queue above the editor" {
     const gpa = std.testing.allocator;
     var editor = ui.Editor.init(gpa);
@@ -413,8 +414,8 @@ test "a turn tail shows the steering queue above the editor" {
     try std.testing.expect(hint < footer);
 }
 
-// Regression: a window narrower than the "Steering: " label must not emit a row
-// wider than the width — the sink asserts every row fits.
+// Regression: a window narrower than the "Queued message: " label must not emit
+// a row wider than the width. The sink asserts every row fits.
 test "a narrow window clips the steering rows to width" {
     const gpa = std.testing.allocator;
     var editor = ui.Editor.init(gpa);
@@ -434,9 +435,10 @@ test "a narrow window clips the steering rows to width" {
     gpa.free(try projected(gpa, .{ .columns = 8, .rows = 24 }, &scene));
 }
 
-// When the transcript overflows the window, the oldest visible block is clipped
-// to fill it exactly: the frame is `rows * window_pages` rows, that block's top
-// rows dropped while its newest content and the tail below still show.
+// When the transcript overflows the window, the projection clips the oldest
+// visible block to fill it exactly. The frame is `rows * window_pages` rows.
+// The clip drops that block's top rows while its newest content and the tail
+// below still show.
 test "projection clips the oldest block to fill the window exactly" {
     const gpa = std.testing.allocator;
     var editor = ui.Editor.init(gpa);

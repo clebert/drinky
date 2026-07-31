@@ -1,6 +1,6 @@
 //! The app's SGR palette: the colors and attributes the widgets and transcript
-//! blocks draw with, in one place so the `paint` primitives, the `Picker`, and
-//! the status line share one definition instead of each redefining their own.
+//! blocks draw with, in one place. The `paint` primitives, the `Picker`, and
+//! the status line share one definition, and none redefines its own.
 
 const terminal = @import("terminal");
 

@@ -7,40 +7,41 @@ const std = @import("std");
 pub const sync_set = "\x1b[?2026h";
 pub const sync_reset = "\x1b[?2026l";
 
-/// Enable/disable bracketed paste, so pasted text arrives framed and is not
-/// mistaken for typed control sequences.
+/// Enable/disable bracketed paste, so pasted text arrives framed and the parser
+/// does not mistake it for typed control sequences.
 pub const paste_set = "\x1b[?2004h";
 pub const paste_reset = "\x1b[?2004l";
 
-/// Framing a terminal wraps around pasted text once bracketed paste is enabled.
+/// The framing a terminal wraps around pasted text once bracketed paste is enabled.
 pub const paste_begin = "\x1b[200~";
 pub const paste_end = "\x1b[201~";
 
 /// Push/pop the Kitty keyboard protocol with the disambiguate flag. It leaves
 /// plain Enter, Backspace, and printable keys as their legacy bytes but reports
 /// Shift+Enter, Escape, and Ctrl combinations as distinct `CSI ... u` sequences.
-/// Popping restores whatever mode was active before.
+/// The pop restores whatever mode was active before.
 pub const keyboard_set = "\x1b[>1u";
 pub const keyboard_reset = "\x1b[<u";
 
 pub const cursor_hide = "\x1b[?25l";
 pub const cursor_show = "\x1b[?25h";
 
-/// Enter/leave the alternate screen, preserving the primary screen and its scrollback.
+/// Enter/leave the alternate screen. This preserves the primary screen and its scrollback.
 pub const screen_alternate_set = "\x1b[?1049h";
 pub const screen_alternate_reset = "\x1b[?1049l";
 
 /// Erase from the cursor to the end of the screen.
 pub const screen_clear_below = "\x1b[0J";
-/// Clear the visible screen and home the cursor without touching scrollback.
+/// Clear the visible screen and home the cursor. The scrollback stays untouched.
 pub const screen_repaint = "\x1b[2J\x1b[H";
-/// Clear the whole screen, home the cursor, then drop the scrollback: the full
-/// reset used when a change lands above the viewport and the buffer must be
-/// reprinted from scratch.
+/// Clear the whole screen, home the cursor, then drop the scrollback. This is
+/// the full reset for a change that lands above the viewport, where the buffer
+/// must be reprinted from scratch.
 pub const screen_reset = screen_repaint ++ "\x1b[3J";
 
 /// Move the cursor `count` steps: up (`'A'`), down (`'B'`), or right (`'C'`).
-/// No-op at zero, so the sequence is never emitted with an implicit argument.
+/// A zero count is a no-op, so the sequence is never emitted with an implicit
+/// argument.
 pub fn cursorMove(writer: *std.Io.Writer, comptime final: u8, count: usize) !void {
     if (count == 0) return;
     try writer.print("\x1b[{d}{c}", .{ count, final });

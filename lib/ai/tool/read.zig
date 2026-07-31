@@ -1,4 +1,4 @@
-//! Reads a UTF-8 text file, paginated by line so a large file returns a bounded
+//! Reads a UTF-8 text file, paginated by line. A large file returns a bounded
 //! window that points at the next offset to continue from.
 
 const std = @import("std");
@@ -61,7 +61,7 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
         error.StreamTooLong => return Result.report(
             gpa,
             .err,
-            "{s} is larger than {d} bytes; read it another way",
+            "Pith cannot read {s} because it is larger than {d} bytes.",
             .{ path, file_bytes_max },
         ),
         else => return Result.cannot(gpa, err, "read", path),
@@ -69,26 +69,33 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
     defer gpa.free(data);
 
     if (std.mem.indexOfScalar(u8, data, 0) != null or !std.unicode.utf8ValidateSlice(data)) {
-        return Result.report(gpa, .err, "{s} is not a UTF-8 text file", .{path});
+        return Result.report(
+            gpa,
+            .err,
+            "Pith cannot read {s} because it is not a UTF-8 text file.",
+            .{path},
+        );
     }
 
     const total = lineCount(data);
     const start = if (offset > 0) offset - 1 else 0;
     if (start >= total and !(total == 0 and start == 0)) {
-        return Result.report(gpa, .err, "offset {d} is past the end of {s} ({d} lines)", .{
-            offset,
-            path,
-            total,
-        });
+        return Result.report(
+            gpa,
+            .err,
+            "Line offset {d} is after the last line in {s}. The file has {d} lines.",
+            .{ offset, path, total },
+        );
     }
     const shown_max = @min(limit orelse lines_max, lines_max);
-    if (shown_max == 0) return Result.report(gpa, .err, "limit must be at least 1", .{});
+    if (shown_max == 0)
+        return Result.report(gpa, .err, "Set limit to 1 or more.", .{});
     if (total == 0) {
         const content = try gpa.dupe(u8, "");
         errdefer gpa.free(content);
         return .{
             .content = content,
-            .summary = try gpa.dupe(u8, "0 lines · 0 B"),
+            .summary = try gpa.dupe(u8, "Lines: 0 · Size: 0 B"),
             .is_error = false,
         };
     }
@@ -107,7 +114,7 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
         if (shown >= shown_max) break;
         if (shown > 0 and bytes + line.len > bytes_max) break;
         // The first line is exempt from the byte budget so a page always makes
-        // progress, but it must not carry the whole cap away on its own.
+        // progress. It must not carry the whole cap away on its own.
         if (shown == 0 and line.len > bytes_max) {
             try out.writer.writeAll(line[0..utf8FloorLength(line, bytes_max)]);
             last = index;
@@ -129,7 +136,7 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
         const separator =
             if (written.len > 0 and written[written.len - 1] == '\n') "\n" else "\n\n";
         try out.writer.print(
-            "{s}[line {d} exceeds {d} bytes and was truncated]",
+            "{s}[Line {d} is longer than {d} bytes. Pith truncated it.]",
             .{ separator, last + 1, bytes_max },
         );
     }
@@ -138,7 +145,7 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
         const separator =
             if (written.len > 0 and written[written.len - 1] == '\n') "\n" else "\n\n";
         try out.writer.print(
-            "{s}[showing lines {d}-{d} of {d}; use offset={d} to continue]",
+            "{s}[Pith shows lines {d}–{d} of {d}. Use offset={d} to continue.]",
             .{ separator, start + 1, last + 1, total, last + 2 },
         );
     }
@@ -146,35 +153,36 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
     var size_buffer: [16]u8 = undefined;
     const size = humanBytes(&size_buffer, body_bytes);
     const remaining = total - (last + 1);
-    const plural_suffix: []const u8 = if (shown == 1) "" else "s";
-    const truncation_suffix = if (truncated) " · line truncated" else "";
+    const truncation_suffix = if (truncated) " · Line: Truncated" else "";
     const summary = if (start == 0 and remaining == 0)
-        try std.fmt.allocPrint(gpa, "{d} line{s} · {s}{s}", .{
-            shown, plural_suffix, size, truncation_suffix,
+        try std.fmt.allocPrint(gpa, "Lines: {d} · Size: {s}{s}", .{
+            shown, size, truncation_suffix,
         })
     else if (remaining == 0)
-        try std.fmt.allocPrint(gpa, "lines {d}–{d} of {d} · {s}{s}", .{
+        try std.fmt.allocPrint(gpa, "Lines: {d}–{d} of {d} · Size: {s}{s}", .{
             start + 1, last + 1, total, size, truncation_suffix,
         })
     else
-        try std.fmt.allocPrint(gpa, "lines {d}–{d} of {d} · {s} · {d} more{s}", .{
-            start + 1, last + 1, total, size, remaining, truncation_suffix,
-        });
+        try std.fmt.allocPrint(
+            gpa,
+            "Lines: {d}–{d} of {d} · Size: {s} · Remaining lines: {d}{s}",
+            .{ start + 1, last + 1, total, size, remaining, truncation_suffix },
+        );
     errdefer gpa.free(summary);
     const content = try out.toOwnedSlice();
     return .{ .content = content, .summary = summary, .is_error = false };
 }
 
-/// Largest length no greater than `max` that does not split a UTF-8 codepoint,
-/// so a truncated line stays valid UTF-8 for JSON serialization.
+/// The largest length no greater than `max` that does not split a UTF-8
+/// codepoint, so a truncated line stays valid UTF-8 for JSON serialization.
 fn utf8FloorLength(bytes: []const u8, max: usize) usize {
     var end = @min(bytes.len, max);
     while (end > 0 and end < bytes.len and bytes[end] & 0xC0 == 0x80) end -= 1;
     return end;
 }
 
-/// The number of lines in `text`, excluding the empty segment after a trailing
-/// newline; empty text has no lines.
+/// The number of lines in `text`. The empty segment after a trailing newline
+/// does not count. Empty text has no lines.
 fn lineCount(text: []const u8) usize {
     if (text.len == 0) return 0;
     const newlines = std.mem.count(u8, text, "\n");
@@ -182,8 +190,8 @@ fn lineCount(text: []const u8) usize {
 }
 
 /// A compact byte size for the box summary: bytes under 1 KB, else KB or MB to
-/// one decimal. Integer math throughout; `buffer` needs only a dozen bytes and a
-/// read window is far too small to overflow the tenths scaling.
+/// one decimal. Integer math throughout. `buffer` needs only a dozen bytes, and
+/// a read window is far too small to overflow the tenths scaling.
 fn humanBytes(buffer: []u8, bytes: usize) []const u8 {
     if (bytes < 1024) return std.fmt.bufPrint(buffer, "{d} B", .{bytes}) catch unreachable;
     const tenths_kb = @divFloor(bytes * 10, 1024);
@@ -226,9 +234,9 @@ test "read paginates and points at the next offset" {
     defer result.deinit(gpa);
     try std.testing.expect(!result.is_error);
     try std.testing.expect(std.mem.startsWith(u8, result.content, "one\n"));
-    try std.testing.expect(std.mem.indexOf(u8, result.content, "use offset=2 to continue") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result.summary.?, "lines 1–1 of 3") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result.summary.?, "2 more") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "Use offset=2 to continue") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.summary.?, "Lines: 1–1 of 3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.summary.?, "Remaining lines: 2") != null);
 }
 
 test "read summarizes a fully shown file" {
@@ -244,7 +252,7 @@ test "read summarizes a fully shown file" {
     const result = try run(&context, input);
     defer result.deinit(gpa);
     try std.testing.expect(!result.is_error);
-    try std.testing.expectEqualStrings("3 lines · 13 B", result.summary.?);
+    try std.testing.expectEqualStrings("Lines: 3 · Size: 13 B", result.summary.?);
 }
 
 test "read does not count a trailing newline as an empty line" {
@@ -260,7 +268,7 @@ test "read does not count a trailing newline as an empty line" {
     const result = try run(&context, input);
     defer result.deinit(gpa);
     try std.testing.expectEqualStrings("one\n", result.content);
-    try std.testing.expectEqualStrings("1 line · 4 B", result.summary.?);
+    try std.testing.expectEqualStrings("Lines: 1 · Size: 4 B", result.summary.?);
 }
 
 test "read summarizes an empty file as zero lines" {
@@ -276,7 +284,7 @@ test "read summarizes an empty file as zero lines" {
     const result = try run(&context, input);
     defer result.deinit(gpa);
     try std.testing.expectEqualStrings("", result.content);
-    try std.testing.expectEqualStrings("0 lines · 0 B", result.summary.?);
+    try std.testing.expectEqualStrings("Lines: 0 · Size: 0 B", result.summary.?);
 }
 
 test "read rejects an offset past the end of the file" {
@@ -368,7 +376,7 @@ test "read stops at the byte cap with a next-offset hint" {
     try std.testing.expect(!result.is_error);
     try std.testing.expect(result.content.len <= bytes_max + 128);
     try std.testing.expect(
-        std.mem.indexOf(u8, result.content, "use offset=51 to continue") != null,
+        std.mem.indexOf(u8, result.content, "Use offset=51 to continue") != null,
     );
 }
 
@@ -392,7 +400,7 @@ test "read truncates to the line cap by default" {
     defer result.deinit(gpa);
     try std.testing.expect(!result.is_error);
     try std.testing.expect(
-        std.mem.indexOf(u8, result.content, "use offset=2001 to continue") != null,
+        std.mem.indexOf(u8, result.content, "Use offset=2001 to continue") != null,
     );
 }
 
@@ -428,7 +436,7 @@ test "read truncates a single line longer than the byte cap" {
     try std.testing.expect(!result.is_error);
     try std.testing.expect(result.content.len < bytes_max + 100);
     try std.testing.expect(std.mem.indexOf(u8, result.content, "truncated") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result.summary.?, "line truncated") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.summary.?, "Line: Truncated") != null);
 }
 
 test "read clamps an explicit limit to the line cap" {
@@ -451,6 +459,6 @@ test "read clamps an explicit limit to the line cap" {
     defer result.deinit(gpa);
     try std.testing.expect(!result.is_error);
     try std.testing.expect(
-        std.mem.indexOf(u8, result.content, "use offset=2001 to continue") != null,
+        std.mem.indexOf(u8, result.content, "Use offset=2001 to continue") != null,
     );
 }

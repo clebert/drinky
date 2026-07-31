@@ -40,7 +40,7 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
 
     fs.writeFile(context.io, std.Io.Dir.cwd(), .{ .sub_path = path, .data = contents }) catch |err|
         return Result.cannot(gpa, err, "write", path);
-    return Result.report(gpa, .ok, "wrote {d} bytes to {s}", .{ contents.len, path });
+    return Result.report(gpa, .ok, "Pith wrote {d} bytes to {s}.", .{ contents.len, path });
 }
 
 test "write creates a file with the given contents" {
@@ -93,7 +93,7 @@ test "write to a missing directory reports an error" {
     const result = try run(&context, input);
     defer result.deinit(gpa);
     try std.testing.expect(result.is_error);
-    try std.testing.expect(std.mem.indexOf(u8, result.content, "cannot write") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "could not write") != null);
 }
 
 test "write cancelled mid-write propagates and leaves the file untouched" {

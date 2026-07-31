@@ -1,34 +1,34 @@
-//! A SIGWINCH watcher built on the self-pipe trick: a POSIX signal handler is
-//! async-signal-safe only and cannot enqueue onto a locked channel, so the
-//! handler just writes one byte to a pipe and `wait` blocks reading the other
-//! end — turning a resize signal into an ordinary awaitable fd event a producer
-//! task can relay as a `UiEvent`. The read end is blocking (so `wait` parks on it
-//! through `io.operateTimeout(.none)`, whose single-fd path is a direct read) and
-//! the write end is non-blocking (so a full pipe drops the redundant wake instead
-//! of stalling the handler). Signals are process-wide, so at most one watcher is
-//! live at a time, and the self-pipe is opened once and kept for the process
-//! lifetime — never closed, so a handler preempted mid-write can never resume onto
-//! a closed and possibly reused descriptor.
+//! A SIGWINCH watcher built on the self-pipe trick. A POSIX signal handler is
+//! async-signal-safe only and cannot enqueue onto a locked channel. Thus the
+//! handler just writes one byte to a pipe, and `wait` blocks on a read of the
+//! other end. This turns a resize signal into an ordinary awaitable fd event
+//! that a producer task can relay as a `UiEvent`. The read end is blocking, so
+//! `wait` parks on it through `io.operateTimeout(.none)`, whose single-fd path is
+//! a direct read. The write end is non-blocking, so a full pipe drops the
+//! redundant wake and does not stall the handler. Signals are process-wide, so at
+//! most one watcher is live at a time. The self-pipe is opened once, kept for the
+//! process lifetime, and never closed. A handler preempted mid-write can thus
+//! never resume onto a closed and possibly reused descriptor.
 //!
-//! Everything here stays portable and libc-free where the platform allows it by
-//! going through `std.Io.Threaded.pipe2` and `std.posix.system` rather than a
-//! per-OS syscall layer; on macOS those route through libc, which Zig requires
+//! Everything here stays portable and libc-free where the platform allows it. The
+//! module goes through `std.Io.Threaded.pipe2` and `std.posix.system` rather than
+//! a per-OS syscall layer. On macOS those route through libc, which Zig requires
 //! there regardless.
 
 const std = @import("std");
 
 const Resize = @This();
 
-/// The write end, reached only by the signal handler, which takes no context
-/// argument — hence a process-global. Holds the write fd while a watcher is
-/// installed, `-1` otherwise.
+/// The write end, reached only by the signal handler. The handler takes no
+/// context argument, so this is a process-global. Holds the write fd while a
+/// watcher is installed, `-1` otherwise.
 var handler_pipe: std.atomic.Value(std.posix.fd_t) = .init(-1);
 
-/// The process-lifetime self-pipe, opened once by `ensurePipe` and never closed:
-/// leaving it open is what keeps a preempted handler's write off a closed—and
-/// possibly reused—descriptor. Signals are process-wide (at most one watcher at a
-/// time), so one shared pipe serves every watcher; only the serial control thread
-/// that drives init/deinit touches it.
+/// The process-lifetime self-pipe, opened once by `ensurePipe` and never closed.
+/// The open pipe keeps a preempted handler's write off a closed and possibly
+/// reused descriptor. Signals are process-wide (at most one watcher at a time),
+/// so one shared pipe serves every watcher. Only the serial control thread that
+/// drives init/deinit touches it.
 var shared_pipe: ?Pipe = null;
 
 const Pipe = struct {
@@ -40,7 +40,7 @@ read_handle: std.posix.fd_t,
 previous: std.posix.Sigaction,
 
 /// The one async-signal-safe action: write a byte to wake `wait`. A dropped write
-/// (pipe full, or no watcher) is fine — a pending wake already covers the resize.
+/// (pipe full, or no watcher) is fine. A pending wake already covers the resize.
 fn handleWinch(_: std.posix.SIG) callconv(.c) void {
     const handle = handler_pipe.load(.seq_cst);
     if (handle < 0) return;
@@ -48,10 +48,10 @@ fn handleWinch(_: std.posix.SIG) callconv(.c) void {
     _ = std.posix.system.write(handle, &byte, byte.len);
 }
 
-/// Return the process-lifetime self-pipe, opening it on first use: a CLOEXEC pipe
-/// with a non-blocking write end (a full pipe drops the redundant wake instead of
-/// stalling the handler). Never closed thereafter, so the handler's target fd is
-/// always valid.
+/// Return the process-lifetime self-pipe and open it on first use. The pipe is
+/// CLOEXEC with a non-blocking write end, so a full pipe drops the redundant wake
+/// and does not stall the handler. The pipe is never closed thereafter, so the
+/// handler's target fd is always valid.
 fn ensurePipe() !Pipe {
     if (shared_pipe) |pipe| return pipe;
     const fds = try std.Io.Threaded.pipe2(.{ .CLOEXEC = true });
@@ -70,8 +70,8 @@ fn ensurePipe() !Pipe {
     return pipe;
 }
 
-/// Point the handler at the shared self-pipe and install the SIGWINCH handler,
-/// saving the prior disposition for `deinit`.
+/// Point the handler at the shared self-pipe and install the SIGWINCH handler.
+/// Save the prior disposition for `deinit`.
 pub fn init(self: *Resize) !void {
     const pipe = try ensurePipe();
     self.read_handle = pipe.read;
@@ -84,16 +84,16 @@ pub fn init(self: *Resize) !void {
 }
 
 /// Restore the previous SIGWINCH disposition and disarm the handler. The self-pipe
-/// is left open (it is process-lifetime), so a handler that already loaded the write
-/// fd and is preempted here resumes into a still-valid pipe rather than a closed—and
-/// possibly reused—descriptor. Call once the `wait` task is reaped, so nothing is
+/// stays open (it is process-lifetime). A handler that already loaded the write fd
+/// and is preempted here thus resumes into a still-valid pipe, not a closed and
+/// possibly reused descriptor. Call once the `wait` task is reaped, so nothing is
 /// left blocked on the pipe.
 pub fn deinit(self: *Resize) void {
     std.posix.sigaction(.WINCH, &self.previous, null);
     handler_pipe.store(-1, .seq_cst);
 }
 
-/// Block until the next resize, draining the coalesced wake bytes. Surfaces
+/// Block until the next resize and drain the coalesced wake bytes. Surfaces
 /// `error.Canceled` when the awaiting task is cancelled at shutdown.
 pub fn wait(self: *Resize, io: std.Io) !void {
     var buffer: [64]u8 = undefined;
@@ -124,12 +124,12 @@ test "a sigwinch wakes wait and deinit restores the prior disposition" {
 }
 
 test "deinit keeps both self-pipe endpoints alive and reuses them" {
-    // Keeping both self-pipe endpoints open for the process lifetime defuses both
-    // teardown-race failure modes: an open write fd is never reused under a stale
-    // handler write, and an open read end keeps that write off a reader-less pipe
-    // (SIGPIPE). deinit must also disarm the handler (-1), and a later watcher must
-    // reuse the one shared pipe rather than open another. F_GETFD reports EBADF on a
-    // closed fd.
+    // Both self-pipe endpoints stay open for the process lifetime, which defuses
+    // both teardown-race failure modes. An open write fd is never reused under a
+    // stale handler write. An open read end keeps that write off a reader-less pipe
+    // (SIGPIPE). deinit must also disarm the handler (-1). A later watcher must
+    // reuse the one shared pipe rather than open another. F_GETFD reports EBADF on
+    // a closed fd.
     var resize: Resize = undefined;
     try resize.init();
     const read_handle = resize.read_handle;

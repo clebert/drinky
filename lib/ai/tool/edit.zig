@@ -58,7 +58,7 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
         error.StreamTooLong => return Result.report(
             gpa,
             .err,
-            "{s} is larger than {d} bytes; edit it another way",
+            "Pith cannot edit {s} because it is larger than {d} bytes.",
             .{ path, file_bytes_max },
         ),
         else => return Result.cannot(gpa, err, "read", path),
@@ -70,14 +70,20 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
             error.EmptyOldText => return Result.report(
                 gpa,
                 .err,
-                "old_text must not be empty",
+                "Set old_text to a nonempty value.",
                 .{},
             ),
-            error.NotFound => return Result.report(gpa, .err, "old_text not found in {s}", .{path}),
+            error.NotFound => return Result.report(
+                gpa,
+                .err,
+                "Pith did not find old_text in {s}.",
+                .{path},
+            ),
             error.NotUnique => return Result.report(
                 gpa,
                 .err,
-                "old_text is not unique in {s}; include more surrounding context",
+                "Pith found old_text more than once in {s}. Add more text before and " ++
+                    "after old_text.",
                 .{path},
             ),
             else => return err,
@@ -86,12 +92,12 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
 
     fs.writeFile(context.io, std.Io.Dir.cwd(), .{ .sub_path = path, .data = updated }) catch |err|
         return Result.cannot(gpa, err, "write", path);
-    return Result.report(gpa, .ok, "edited {s}", .{path});
+    return Result.report(gpa, .ok, "Pith edited {s}.", .{path});
 }
 
 /// Replace the single occurrence of `edit.old` in `edit.data` with `edit.new`.
 /// Errors when the match is absent or ambiguous so the caller never edits the
-/// wrong span. A second match starting anywhere past the first — including an
+/// wrong span. A second match that starts anywhere past the first — even an
 /// overlapping one like "aa" in "aaa" — counts as ambiguous.
 fn applyEdit(
     gpa: std.mem.Allocator,
