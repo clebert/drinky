@@ -108,10 +108,10 @@ test "the picker lists every authenticated account's models, marking the active 
                 for (pick.options) |option| gpa.free(option);
                 gpa.free(pick.options);
             }
-            // Three anthropic models plus three openai models, both keys present.
-            try std.testing.expectEqual(@as(usize, 6), pick.options.len);
-            try std.testing.expectEqualStrings("claude-opus-4-8 (Anthropic API)", pick.options[0]);
-            try std.testing.expectEqualStrings("gpt-5.6-sol (OpenAI API)", pick.options[3]);
+            try std.testing.expectEqual(@as(usize, 8), pick.options.len);
+            try std.testing.expectEqualStrings("claude-fable-5 (Anthropic API)", pick.options[0]);
+            try std.testing.expectEqualStrings("claude-opus-5 (Anthropic API)", pick.options[1]);
+            try std.testing.expectEqualStrings("gpt-5.6-sol (OpenAI API)", pick.options[5]);
             try std.testing.expectEqualStrings(
                 "claude-sonnet-4-6 (Anthropic API)",
                 pick.options[pick.current.?],
@@ -128,12 +128,12 @@ test "select switches to the chosen account and model" {
     defer agent.deinit();
     var context: Context = .{ .gpa = gpa, .io = undefined, .agent = &agent, .accounts = &accounts };
 
-    // Row 3 is the first openai model, so its selection crosses vendors.
-    try Context.Outcome.expectEvent(try select(&context, 3), .information);
+    // Row 5 is the first OpenAI model, so its selection crosses vendors.
+    try Context.Outcome.expectEvent(try select(&context, 5), .information);
     try std.testing.expectEqualStrings("gpt-5.6-sol", agent.model.name);
     try std.testing.expectEqual(llm.Account.openai_api, agent.client.?.account());
 
-    try Context.Outcome.expectNotice(try select(&context, 3), .information);
+    try Context.Outcome.expectNotice(try select(&context, 5), .information);
     try Context.Outcome.expectNotice(try select(&context, 99), .failure);
     try std.testing.expectEqualStrings("gpt-5.6-sol", agent.model.name);
 }

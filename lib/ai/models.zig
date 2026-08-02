@@ -25,25 +25,23 @@ pub const Model = struct {
     tokens_max: u32,
     effort: EffortMap,
 
-    /// The provider outcome for each of our effort levels on this model: a
-    /// provider effort name to send, or null to send no reasoning. The map is
-    /// total over every level, none included, so each model states exactly what
-    /// it does with each choice. This includes the awkward ends:
-    ///   - A model without a level folds it onto the nearest it has (Sonnet 4.6
-    ///     has no xhigh, so xhigh maps to high).
-    ///   - A model with no reasoning maps every level, none included, to null.
-    ///   - A model that cannot disable reasoning maps none up to a floor level.
+    /// The provider outcome for each effort level. The map includes `none` and
+    /// folds an unavailable level onto the nearest supported level.
     pub const EffortMap = struct {
-        none: ?[]const u8,
-        low: ?[]const u8,
-        medium: ?[]const u8,
-        high: ?[]const u8,
-        xhigh: ?[]const u8,
-        max: ?[]const u8,
+        none: Resolution,
+        low: Resolution,
+        medium: Resolution,
+        high: Resolution,
+        xhigh: Resolution,
+        max: Resolution,
 
-        /// The provider effort name to send for `effort`, or null to send no
-        /// reasoning config.
-        pub fn resolve(self: *const EffortMap, effort: llm.Effort) ?[]const u8 {
+        pub const Resolution = union(enum) {
+            omitted,
+            disabled,
+            named: []const u8,
+        };
+
+        pub fn resolve(self: *const EffortMap, effort: llm.Effort) Resolution {
             return switch (effort) {
                 inline else => |level| @field(self, @tagName(level)),
             };
@@ -73,42 +71,80 @@ const Entry = struct {
     model: Model,
 };
 
-// The full Anthropic ladder: none sends no reasoning config, and each level
-// sends its own name.
-const anthropic_effort: Model.EffortMap = .{
-    .none = null,
-    .low = "low",
-    .medium = "medium",
-    .high = "high",
-    .xhigh = "xhigh",
-    .max = "max",
+// Anthropic models that default to no thinking can omit the config for `none`.
+const anthropic_effort_default_off: Model.EffortMap = .{
+    .none = .omitted,
+    .low = .{ .named = "low" },
+    .medium = .{ .named = "medium" },
+    .high = .{ .named = "high" },
+    .xhigh = .{ .named = "xhigh" },
+    .max = .{ .named = "max" },
 };
 
-// Sonnet 4.6 has no xhigh. It folds onto high.
+// Anthropic models that default to thinking need the explicit off control.
+const anthropic_effort_default_on: Model.EffortMap = .{
+    .none = .disabled,
+    .low = .{ .named = "low" },
+    .medium = .{ .named = "medium" },
+    .high = .{ .named = "high" },
+    .xhigh = .{ .named = "xhigh" },
+    .max = .{ .named = "max" },
+};
+
+// Fable 5 cannot disable thinking, so `none` folds onto `low`.
+const anthropic_effort_always_on: Model.EffortMap = .{
+    .none = .{ .named = "low" },
+    .low = .{ .named = "low" },
+    .medium = .{ .named = "medium" },
+    .high = .{ .named = "high" },
+    .xhigh = .{ .named = "xhigh" },
+    .max = .{ .named = "max" },
+};
+
+// Sonnet 4.6 has no `xhigh`, so it folds that level onto `high`.
 const anthropic_effort_no_xhigh: Model.EffortMap = .{
-    .none = null,
-    .low = "low",
-    .medium = "medium",
-    .high = "high",
-    .xhigh = "high",
-    .max = "max",
+    .none = .omitted,
+    .low = .{ .named = "low" },
+    .medium = .{ .named = "medium" },
+    .high = .{ .named = "high" },
+    .xhigh = .{ .named = "high" },
+    .max = .{ .named = "max" },
 };
 
-// Reasoning-only models: none floors on the API's minimal `none`. An omitted
-// reasoning config defaults the model to medium.
+// OpenAI reasoning models use the provider's named `none` level.
 const openai_effort: Model.EffortMap = .{
-    .none = "none",
-    .low = "low",
-    .medium = "medium",
-    .high = "high",
-    .xhigh = "xhigh",
-    .max = "max",
+    .none = .{ .named = "none" },
+    .low = .{ .named = "low" },
+    .medium = .{ .named = "medium" },
+    .high = .{ .named = "high" },
+    .xhigh = .{ .named = "xhigh" },
+    .max = .{ .named = "max" },
 };
 
 // Anthropic cache rates follow fixed multipliers of the base input price: 0.1x
 // for a read, 1.25x for a 5-minute write. Each model states its real context
 // window and maximum output. Nothing is defaulted.
 const table = [_]Entry{
+    .{ .provider = .anthropic, .model = .{
+        .name = "claude-fable-5",
+        .input = 10,
+        .output = 50,
+        .cache_read = 1,
+        .cache_write = 12.5,
+        .context_window = 1_000_000,
+        .tokens_max = 128_000,
+        .effort = anthropic_effort_always_on,
+    } },
+    .{ .provider = .anthropic, .model = .{
+        .name = "claude-opus-5",
+        .input = 5,
+        .output = 25,
+        .cache_read = 0.5,
+        .cache_write = 6.25,
+        .context_window = 1_000_000,
+        .tokens_max = 128_000,
+        .effort = anthropic_effort_default_on,
+    } },
     .{ .provider = .anthropic, .model = .{
         .name = "claude-opus-4-8",
         .input = 5,
@@ -117,7 +153,7 @@ const table = [_]Entry{
         .cache_write = 6.25,
         .context_window = 1_000_000,
         .tokens_max = 128_000,
-        .effort = anthropic_effort,
+        .effort = anthropic_effort_default_off,
     } },
     // Sonnet 5 standard rates. The launch introductory pricing ($2/$10 in/out)
     // is not modeled.
@@ -129,7 +165,7 @@ const table = [_]Entry{
         .cache_write = 3.75,
         .context_window = 1_000_000,
         .tokens_max = 128_000,
-        .effort = anthropic_effort,
+        .effort = anthropic_effort_default_on,
     } },
     .{ .provider = .anthropic, .model = .{
         .name = "claude-sonnet-4-6",
@@ -218,50 +254,53 @@ test get {
     try std.testing.expectApproxEqAbs(@as(f64, 1.95), model.savings(&usage), 1e-9);
 }
 
-test "EffortMap.resolve maps every level, none included, to the model's outcome" {
-    const floored: Model.EffortMap = .{
-        .none = "low",
-        .low = "low",
-        .medium = "medium",
-        .high = "high",
-        .xhigh = "xhigh",
-        .max = "max",
-    };
-    try std.testing.expectEqualStrings("low", floored.resolve(.none).?);
+test "new Anthropic models have current prices and limits" {
+    const fable = get(.anthropic, "claude-fable-5").?;
+    try std.testing.expectEqual(@as(f64, 10), fable.input);
+    try std.testing.expectEqual(@as(f64, 50), fable.output);
+    try std.testing.expectEqual(@as(f64, 1), fable.cache_read);
+    try std.testing.expectEqual(@as(f64, 12.5), fable.cache_write);
+    try std.testing.expectEqual(@as(u64, 1_000_000), fable.context_window);
+    try std.testing.expectEqual(@as(u32, 128_000), fable.tokens_max);
 
-    const no_reasoning: Model.EffortMap = .{
-        .none = null,
-        .low = null,
-        .medium = null,
-        .high = null,
-        .xhigh = null,
-        .max = null,
-    };
-    try std.testing.expectEqual(@as(?[]const u8, null), no_reasoning.resolve(.max));
+    const opus = get(.anthropic, "claude-opus-5").?;
+    try std.testing.expectEqual(@as(f64, 5), opus.input);
+    try std.testing.expectEqual(@as(f64, 25), opus.output);
+    try std.testing.expectEqual(@as(f64, 0.5), opus.cache_read);
+    try std.testing.expectEqual(@as(f64, 6.25), opus.cache_write);
+    try std.testing.expectEqual(@as(u64, 1_000_000), opus.context_window);
+    try std.testing.expectEqual(@as(u32, 128_000), opus.tokens_max);
+}
 
-    // The shipped maps.
-    try std.testing.expectEqual(
-        @as(?[]const u8, null),
-        get(.anthropic, "claude-opus-4-8").?.effort.resolve(.none),
+test "effort maps resolve each model's supported levels" {
+    const levels = std.enums.values(llm.Effort);
+    const fable_names = [_][]const u8{ "low", "low", "medium", "high", "xhigh", "max" };
+    const fable = get(.anthropic, "claude-fable-5").?;
+    for (levels, fable_names) |level, expected| switch (fable.effort.resolve(level)) {
+        .named => |actual| try std.testing.expectEqualStrings(expected, actual),
+        else => return error.ExpectedNamedEffort,
+    };
+
+    const opus = get(.anthropic, "claude-opus-5").?;
+    try std.testing.expect(std.meta.activeTag(opus.effort.resolve(.none)) == .disabled);
+    const opus_names = [_][]const u8{ "low", "medium", "high", "xhigh", "max" };
+    for (levels[1..], opus_names) |level, expected| switch (opus.effort.resolve(level)) {
+        .named => |actual| try std.testing.expectEqualStrings(expected, actual),
+        else => return error.ExpectedNamedEffort,
+    };
+
+    try std.testing.expect(
+        std.meta.activeTag(get(.anthropic, "claude-opus-4-8").?.effort.resolve(.none)) == .omitted,
     );
-    try std.testing.expectEqualStrings(
-        "xhigh",
-        get(.anthropic, "claude-opus-4-8").?.effort.resolve(.xhigh).?,
+    try std.testing.expect(
+        std.meta.activeTag(get(.anthropic, "claude-sonnet-5").?.effort.resolve(.none)) == .disabled,
     );
-    try std.testing.expectEqualStrings(
-        "xhigh",
-        get(.anthropic, "claude-sonnet-5").?.effort.resolve(.xhigh).?,
-    );
-    try std.testing.expectEqualStrings(
-        "high",
-        get(.anthropic, "claude-sonnet-4-6").?.effort.resolve(.xhigh).?,
-    );
-    try std.testing.expectEqualStrings(
-        "max",
-        get(.anthropic, "claude-sonnet-4-6").?.effort.resolve(.max).?,
-    );
-    try std.testing.expectEqualStrings(
-        "none",
-        get(.openai, "gpt-5.6-sol").?.effort.resolve(.none).?,
-    );
+    switch (get(.anthropic, "claude-sonnet-4-6").?.effort.resolve(.xhigh)) {
+        .named => |actual| try std.testing.expectEqualStrings("high", actual),
+        else => return error.ExpectedNamedEffort,
+    }
+    switch (get(.openai, "gpt-5.6-sol").?.effort.resolve(.none)) {
+        .named => |actual| try std.testing.expectEqualStrings("none", actual),
+        else => return error.ExpectedNamedEffort,
+    }
 }

@@ -64,7 +64,7 @@ a few new tokens before the breakpoint are written to the cache.
 
 | minimum tokens | models (subset)                                                        |
 | -------------- | ---------------------------------------------------------------------- |
-| 512            | Fable 5, Mythos 5                                                      |
+| 512            | Fable 5, Opus 5, Mythos 5                                              |
 | 1,024          | Opus 4.8, Sonnet 5, Sonnet 4.6, Sonnet 4.5, Opus 4.1, Opus 4, Sonnet 4 |
 | 2,048          | Mythos Preview, Opus 4.7, Haiku 3.5                                    |
 | 4,096          | Opus 4.6, Opus 4.5, Haiku 4.5                                          |
@@ -157,6 +157,6 @@ models tokenize differently and have different minimums. The switch has these ef
 
 - Anthropic prompt caching documentation:
   <https://docs.claude.com/en/docs/build-with-claude/prompt-caching> (`docs.anthropic.com` redirects
-  to the same page). Model lists and per-model minimums reflect the page as of 2026-07-10 and change
+  to the same page). Model lists and per-model minimums reflect the page as of 2026-08-02 and change
   as models are added or retired. The multipliers (1.25× / 2× / 0.1×) and the usage-field
   definitions are the stable, authoritative parts.

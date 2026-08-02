@@ -44,15 +44,25 @@ pub fn serialize(gpa: std.mem.Allocator, request: *const llm.Request, account: l
     try stringify.objectField("stream");
     try stringify.write(true);
 
-    // Reasoning: adaptive thinking plus a named effort, rather than a
-    // client-side token budget. A null resolution omits the config entirely
-    // and drops the stored thinking blocks from the history below.
-    const reasoning = effortName(request);
-    if (reasoning) |effort| {
-        try stringify.objectField("thinking");
-        try stringify.write(AdaptiveThinking{});
-        try stringify.objectField("output_config");
-        try stringify.write(OutputConfig{ .effort = effort });
+    // The model map selects no control, an explicit off control, or adaptive
+    // thinking with a named effort.
+    const effort = effortResolution(request);
+    const emit_thinking = switch (effort) {
+        .named => true,
+        .omitted, .disabled => false,
+    };
+    switch (effort) {
+        .omitted => {},
+        .disabled => {
+            try stringify.objectField("thinking");
+            try stringify.write(DisabledThinking{});
+        },
+        .named => |name| {
+            try stringify.objectField("thinking");
+            try stringify.write(AdaptiveThinking{});
+            try stringify.objectField("output_config");
+            try stringify.write(OutputConfig{ .effort = name });
+        },
     }
 
     // Prompt-cache breakpoints, model-independent: Anthropic caches the prefix
@@ -84,10 +94,10 @@ pub fn serialize(gpa: std.mem.Allocator, request: *const llm.Request, account: l
     // breakpoint.
     try stringify.objectField("messages");
     try stringify.beginArray();
-    const last_block = lastBlockIndex(request.items, reasoning != null, account);
+    const last_block = lastBlockIndex(request.items, emit_thinking, account);
     var open_role: ?llm.Role = null;
     for (request.items, 0..) |*item, index| {
-        if (!emitsBlock(item.*, reasoning != null, account)) continue;
+        if (!emitsBlock(item.*, emit_thinking, account)) continue;
         const role = itemRole(item.*);
         if (open_role == null or open_role.? != role) {
             if (open_role != null) try endMessage(&stringify);
@@ -107,11 +117,10 @@ pub fn serialize(gpa: std.mem.Allocator, request: *const llm.Request, account: l
     return out.toOwnedSlice();
 }
 
-/// The Anthropic effort name for the request's level, resolved through the
-/// model's effort map, or null to omit the reasoning config. The none level, an
-/// unknown model, and any level a model disables all resolve to null.
-fn effortName(request: *const llm.Request) ?[]const u8 {
-    const model = models.get(.anthropic, request.model) orelse return null;
+/// Resolve the request through the model's effort map. An unknown model omits
+/// the reasoning control.
+fn effortResolution(request: *const llm.Request) models.Model.EffortMap.Resolution {
+    const model = models.get(.anthropic, request.model) orelse return .omitted;
     return model.effort.resolve(request.effort);
 }
 
@@ -137,6 +146,8 @@ const AdaptiveThinking = struct {
     type: []const u8 = "adaptive",
     display: []const u8 = "summarized",
 };
+
+const DisabledThinking = struct { type: []const u8 = "disabled" };
 
 /// The named effort level that steers reasoning depth (and answer effort).
 const OutputConfig = struct { effort: []const u8 };
@@ -502,6 +513,73 @@ test "no thinking or output_config when effort is none" {
     try std.testing.expect(parsed.value.object.get("thinking") == null);
     try std.testing.expect(parsed.value.object.get("output_config") == null);
     try std.testing.expectEqual(@as(i64, 8192), parsed.value.object.get("max_tokens").?.integer);
+}
+
+test "Opus 5 disables default thinking for effort none" {
+    const items = [_]llm.Item{
+        .{ .message = .{ .role = .user, .text = "hi" } },
+        .{ .reasoning = .{ .replay = .{ .anthropic_subscription = .{ .signature = .{
+            .text = "think",
+            .signature = "sig",
+        } } } } },
+        .{ .message = .{ .role = .assistant, .text = "answer" } },
+    };
+    const body = try serialize(std.testing.allocator, &.{
+        .model = "claude-opus-5",
+        .tokens_max = 128_000,
+        .system = "s",
+        .items = &items,
+        .tools = &.{},
+        .effort = .none,
+    }, .anthropic_subscription);
+    defer std.testing.allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    try std.testing.expectEqualStrings(
+        "disabled",
+        root.get("thinking").?.object.get("type").?.string,
+    );
+    try std.testing.expect(root.get("output_config") == null);
+    const assistant = root.get("messages").?.array.items[1].object.get("content").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), assistant.len);
+    try std.testing.expectEqualStrings("text", assistant[0].object.get("type").?.string);
+}
+
+test "Fable 5 floors effort none onto low thinking" {
+    const items = [_]llm.Item{
+        .{ .message = .{ .role = .user, .text = "hi" } },
+        .{ .reasoning = .{ .replay = .{ .anthropic_subscription = .{ .signature = .{
+            .text = "think",
+            .signature = "sig",
+        } } } } },
+        .{ .message = .{ .role = .assistant, .text = "answer" } },
+    };
+    const body = try serialize(std.testing.allocator, &.{
+        .model = "claude-fable-5",
+        .tokens_max = 128_000,
+        .system = "s",
+        .items = &items,
+        .tools = &.{},
+        .effort = .none,
+    }, .anthropic_subscription);
+    defer std.testing.allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    try std.testing.expectEqualStrings(
+        "adaptive",
+        root.get("thinking").?.object.get("type").?.string,
+    );
+    try std.testing.expectEqualStrings(
+        "low",
+        root.get("output_config").?.object.get("effort").?.string,
+    );
+    const assistant = root.get("messages").?.array.items[1].object.get("content").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), assistant.len);
+    try std.testing.expectEqualStrings("thinking", assistant[0].object.get("type").?.string);
 }
 
 // A multi-round conversation that exercises every byte-affecting serializer

@@ -47,7 +47,8 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 
 ## Models & reasoning effort
 
-- Anthropic `claude-opus-4-8`, `claude-sonnet-5`, and `claude-sonnet-4-6`, at 1M tokens of context.
+- Anthropic supports `claude-fable-5`, `claude-opus-5`, `claude-opus-4-8`, `claude-sonnet-5`, and
+  `claude-sonnet-4-6` with 1M tokens of context.
 - OpenAI `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna`, at 1.05M tokens of context.
 - Output caps at 128k tokens per turn.
 - A ChatGPT subscription learns its real context windows after login.

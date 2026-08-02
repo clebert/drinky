@@ -78,8 +78,8 @@ pub const Role = enum { user, assistant };
 /// A named reasoning-effort level passed through to the provider, which picks
 /// the actual thinking depth itself. Anthropic maps it to
 /// `output_config.effort` under adaptive thinking. OpenAI maps it to its
-/// reasoning-effort control. `none` disables reasoning. The rest match
-/// Anthropic's effort ladder.
+/// reasoning-effort control. `none` disables reasoning when the model permits
+/// it. Otherwise, the model map folds `none` onto the minimum level.
 pub const Effort = enum { none, low, medium, high, xhigh, max };
 
 /// One entry in the flat, ordered conversation history. Every provider

@@ -80,13 +80,15 @@ pub fn serialize(gpa: std.mem.Allocator, request: *const llm.Request, account: l
     return out.toOwnedSlice();
 }
 
-/// The OpenAI effort name for the request's level, resolved through the model's
-/// effort map, or null to omit the reasoning config. An unknown model resolves
-/// to null. Every known openai model floors the none level on `none`, so it
-/// never does.
+/// Resolve the request through the model's effort map. An unknown model omits
+/// the reasoning control.
 fn effortName(request: *const llm.Request, account: llm.Account) ?[]const u8 {
     const model = models.get(account.provider(), request.model) orelse return null;
-    return model.effort.resolve(request.effort);
+    return switch (model.effort.resolve(request.effort)) {
+        .omitted => null,
+        .disabled => "none",
+        .named => |name| name,
+    };
 }
 
 /// Adaptive reasoning control: the named effort steers depth, and a summary is
@@ -274,6 +276,26 @@ test serialize {
         schema.get("properties").?.object.get("path").?.object.get("type").?.string,
     );
     try std.testing.expectEqualStrings("path", schema.get("required").?.array.items[0].string);
+}
+
+test "effort none uses the provider's named off level" {
+    const items = [_]llm.Item{.{ .message = .{ .role = .user, .text = "hi" } }};
+    const body = try serialize(std.testing.allocator, &.{
+        .model = "gpt-5.6-sol",
+        .tokens_max = 128_000,
+        .system = "s",
+        .items = &items,
+        .tools = &.{},
+        .effort = .none,
+    }, .openai_api);
+    defer std.testing.allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(
+        "none",
+        parsed.value.object.get("reasoning").?.object.get("effort").?.string,
+    );
 }
 
 test "prompt_cache_key is sent when set and omitted when empty" {
