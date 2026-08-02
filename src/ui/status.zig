@@ -1,7 +1,6 @@
-//! The bottom status line: normally a context-window gauge, session cost, and
-//! cache savings on the left with the model, account, and effort right-aligned.
-//! Temporarily the line shows one notice instead. A pure renderer over a
-//! caller-built `Info` snapshot.
+//! The bottom status line shows context fill, cache-hit rate, session cost, and quota on the left.
+//! It shows the model, account, and effort on the right. A notice temporarily replaces the line.
+//! The renderer uses a caller-built `Info` snapshot.
 
 const std = @import("std");
 
@@ -14,7 +13,6 @@ const paint = @import("paint.zig");
 pub const Info = struct {
     last: ai.llm.Usage,
     cost: f64,
-    saved: f64,
     context_window: u64,
     model: []const u8,
     effort: []const u8,
@@ -115,20 +113,16 @@ fn writeStats(out: *std.Io.Writer, info: *const Info) !void {
     try writeTokens(out, info.context_window);
     try out.writeByte(')');
 
-    // Last request's cache hit rate over the whole prompt: another "now" number.
-    // Zero on a cold start, model switch, or cache expiry. This makes a miss
-    // visible where the cumulative "saved" figure cannot.
+    // Last request's cache hit rate over the whole prompt. The value is zero
+    // after a cold start, model switch, or cache expiry.
     if (last_prompt > 0) {
         const hit = asFloat(info.last.cache_read) / asFloat(last_prompt) * 100.0;
         try out.print(" · Cache: {d:.0}%", .{hit});
     }
 
-    // Session cost, then the dollars the cache saved versus the same tokens sent
-    // uncached. Both use public API rates (an estimate: login type does not
-    // reveal billing). The saved figure shows once a cache read has actually
-    // paid off.
+    // Session cost uses public API rates. It is an estimate because the login
+    // type does not reveal billing.
     try out.print(" · Cost: ${d:.2}", .{info.cost});
-    if (info.saved > 0) try out.print(" · Saved: ${d:.2}", .{info.saved});
 
     // A subscription's remaining allowance, one segment per window identified
     // by its length, as the share left rather than used.
@@ -202,7 +196,6 @@ test render {
     const info: Info = .{
         .last = .{ .input = 22, .output = 23_000, .cache_read = 160_000, .cache_write = 23_000 },
         .cost = 0.393,
-        .saved = 0.82,
         .context_window = 1_000_000,
         .model = "claude-opus-4-8",
         .effort = "xhigh",
@@ -219,9 +212,8 @@ test render {
     const painted = out.written();
     try std.testing.expect(std.mem.indexOf(u8, painted, "Context: 21% (206k/1.0M)") != null);
     try std.testing.expect(std.mem.indexOf(u8, painted, "Cache: 87%") != null);
-    try std.testing.expect(
-        std.mem.indexOf(u8, painted, "Cost: $0.39 · Saved: $0.82") != null,
-    );
+    try std.testing.expect(std.mem.indexOf(u8, painted, "Cost: $0.39") != null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "Saved:") == null);
     const right = std.mem.indexOf(
         u8,
         painted,
@@ -240,7 +232,6 @@ test "the account indicator replaces stats when both do not fit" {
     const info: Info = .{
         .last = .{},
         .cost = 0,
-        .saved = 0,
         .context_window = 200_000,
         .model = "claude-opus-4-8",
         .effort = "xhigh",
@@ -269,7 +260,6 @@ test "a narrow status shows truncated stats when the account does not fit" {
     const info: Info = .{
         .last = .{},
         .cost = 0,
-        .saved = 0,
         .context_window = 200_000,
         .model = "claude-opus-4-8",
         .effort = "xhigh",
@@ -298,7 +288,6 @@ test "a notice replaces the status for exactly one row" {
     const info: Info = .{
         .last = .{},
         .cost = 0,
-        .saved = 0,
         .context_window = 200_000,
         .model = "hidden-model",
         .effort = "high",
@@ -330,7 +319,6 @@ test "a signed-out status shows the indicator in place of the model" {
     const info: Info = .{
         .last = .{},
         .cost = 0,
-        .saved = 0,
         .context_window = 200_000,
         .model = "claude-opus-4-8",
         .effort = "xhigh",
@@ -360,7 +348,6 @@ test "quota windows show the remaining allowance, labeled by length" {
     const info: Info = .{
         .last = .{},
         .cost = 0,
-        .saved = 0,
         .context_window = 400_000,
         .model = "gpt-5.6-sol",
         .effort = "medium",
@@ -391,7 +378,6 @@ test "a quota with a single window omits the absent one" {
     const info: Info = .{
         .last = .{},
         .cost = 0,
-        .saved = 0,
         .context_window = 400_000,
         .model = "gpt-5.6-sol",
         .effort = "medium",
@@ -416,7 +402,6 @@ test "unidentified quota windows stay hidden beside a known window" {
     const info: Info = .{
         .last = .{},
         .cost = 0,
-        .saved = 0,
         .context_window = 400_000,
         .model = "gpt-5.6-sol",
         .effort = "medium",

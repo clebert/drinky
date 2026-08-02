@@ -396,6 +396,7 @@ pub fn run(
         );
         try self.runCommand("/login");
     }
+    defer self.prepareTerminalExit();
     try self.refresh();
     self.frame_ms_last = self.nowMs();
 
@@ -410,6 +411,13 @@ pub fn run(
 fn initEventQueue(self: *App) void {
     self.queue = std.Io.Queue(Session.UiEvent).init(&self.queue_buffer);
     self.deferred_event_count = 0;
+}
+
+/// Leave the alternate screen and park the primary cursor before terminal teardown.
+/// An output failure does not stop terminal teardown.
+fn prepareTerminalExit(self: *App) void {
+    self.tty.setAlternateScreen(false) catch return;
+    self.session.parkCursor() catch {};
 }
 
 /// Cancel and reap every producer task, then drain and free any events they left

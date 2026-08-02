@@ -720,7 +720,6 @@ pub fn paint(self: *Session, size: terminal.View.Size) !void {
     const status: ui.status.Info = .{
         .last = self.stats_shown.last,
         .cost = self.stats_shown.cost,
-        .saved = self.stats_shown.saved,
         .context_window = self.model_shown.context_window,
         .model = self.model_shown.name,
         .effort = @tagName(self.effort_shown),
@@ -758,6 +757,12 @@ pub fn paint(self: *Session, size: terminal.View.Size) !void {
         .status = &status,
     } };
     try layout.project(&self.view, size, &scene);
+}
+
+/// Move the terminal cursor below the interface. Call once at shutdown, so the
+/// shell prompt after exit does not overwrite the input box and status line.
+pub fn parkCursor(self: *Session) !void {
+    try self.view.parkCursor();
 }
 
 /// Advance the activity clock and report whether this tick repaints. A turn

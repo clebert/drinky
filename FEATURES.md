@@ -113,6 +113,7 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - Repaints only the rows that changed, atomically. A resize or a change above the viewport reprints
   the window.
 - Restores the terminal on exit, on a failed start, and around an interactive OAuth login.
+- Parks the cursor below the interface on exit, so the shell prompt does not overwrite the last frame.
 - Handles typing, streaming output, and resizes concurrently, so the interface never freezes
   mid-turn.
 - Repaints are frame-limited and scheduled only while something is dirty or animating.
@@ -125,8 +126,8 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - A heavy accent segment orbits the input border while a turn is in flight. It grows as progress
   goes quiet without adding a layout row.
 - Queued steering shows as `Queued message:` rows, and becomes one user message once consumed.
-- The bottom line shows context fill, cost, cache savings, cache-hit rate, quota, and
-  `model (account) · effort`. At most one temporary notice replaces it until the next user action.
+- The bottom line shows context fill, cost, cache-hit rate, quota, and `model (account) · effort`.
+  At most one temporary notice replaces it until the next user action.
 - A picker is a single-choice list that tags the current value. Enter confirms, and Esc, Ctrl+C, or
   Ctrl+D cancels.
 - The closed input frame grows to about a quarter of the screen and labels hidden rows "↑ Hidden: N"

@@ -241,7 +241,6 @@ fn editorSlot(presentation: *const EditorPresentation) Slot {
 const test_status: ui.status.Info = .{
     .last = .{},
     .cost = 0,
-    .saved = 0,
     .context_window = 1000,
     .model = "footerqq",
     .effort = "high",

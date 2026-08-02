@@ -350,6 +350,26 @@ pub fn render(self: *View) !void {
     self.front ^= 1;
 }
 
+/// Move the hardware cursor to the last row on screen and show it. Call this at
+/// shutdown, so external output after exit (the shell prompt) continues below the
+/// whole interface. Without it the cursor stays under the caret, and the shell
+/// prompt overwrites the rows below. A no-op when the frame on screen has no rows.
+pub fn parkCursor(self: *View) !void {
+    const frame = &self.frames[self.front];
+    const count = frame.rows.items.len;
+    if (count == 0) return;
+    const writer = self.writer;
+    const last = count - 1;
+    if (last > self.cursor_row) try escape.cursorMove(writer, 'B', last - self.cursor_row);
+    try writer.writeAll("\r");
+    if (!self.cursor_visible) {
+        try writer.writeAll(escape.cursor_show);
+        self.cursor_visible = true;
+    }
+    self.cursor_row = last;
+    try writer.flush();
+}
+
 /// Reprint `frame` from `rows.anchor` down and position the cursor per `mode`.
 /// In `incremental` mode the move starts from `rows.cursor_from`, the current
 /// cursor row expressed in this frame's coordinates. All motion counts physical
@@ -861,6 +881,47 @@ test "the caret is hidden with no caret and when above the viewport" {
     };
     try harness.render(&above, .{ .columns = 5, .rows = 2 }, 2);
     try std.testing.expect(!harness.emulator.cursor_visible);
+}
+
+test "parkCursor moves the cursor to the last row below the caret" {
+    const gpa = std.testing.allocator;
+    const harness = try makeHarness(gpa, 10);
+    defer {
+        harness.deinit();
+        gpa.destroy(harness);
+    }
+    // The caret sits on the editor row, one row above the status line.
+    const frame = [_]Line{
+        line("body", 0),
+        caretLine("prompt", .{ .id = 1, .column = 6 }),
+        line("status", 2),
+    };
+    try harness.render(&frame, .{ .columns = 10, .rows = 24 }, 1);
+    try harness.emulator.expectCaret(.{ .frame_len = 3, .row = 1, .column = 6 });
+
+    try harness.view.parkCursor();
+    const bytes = harness.out.written();
+    try harness.emulator.feed(bytes[harness.consumed..]);
+    harness.consumed = bytes.len;
+
+    // The cursor now sits on the last row (the status line), at column zero, so
+    // the shell prompt after exit prints below the whole interface.
+    try std.testing.expectEqual(
+        harness.emulator.document.items.len - 1,
+        harness.emulator.cursor_row,
+    );
+    try std.testing.expectEqual(@as(usize, 0), harness.emulator.cursor_column);
+    try std.testing.expect(harness.emulator.cursor_visible);
+}
+
+test "parkCursor writes nothing for an empty frame" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var view = View.init(gpa, &out.writer);
+    defer view.deinit();
+    try view.parkCursor();
+    try std.testing.expectEqual(@as(usize, 0), out.written().len);
 }
 
 test "an empty frame wipes the region and hides the cursor" {
