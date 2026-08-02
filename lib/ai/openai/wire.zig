@@ -110,7 +110,7 @@ fn writeItem(
                 if (tag == account and proof.id.len != 0 and proof.encrypted_content.len != 0)
                     try writeReasoning(stringify, &proof);
             },
-            .anthropic_subscription, .anthropic_api => {},
+            .anthropic_subscription, .anthropic_api, .anthropic_console => {},
         },
         .tool_call => |*call| try writeToolCall(stringify, call),
         .tool_result => |*result| try writeToolResult(stringify, gpa, result),

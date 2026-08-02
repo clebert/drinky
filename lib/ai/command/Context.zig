@@ -29,10 +29,10 @@ pub const Outcome = union(enum) {
     /// Submit an expanded skill instruction as a user turn. The app records the
     /// skill marker and optional task when it sends `content` to the model.
     prompt: Prompt,
-    /// Authenticate this subscription account, then switch to it. The app owns
-    /// the flow (it must suspend the tty around the OAuth browser callback).
+    /// Authenticate this account, then switch to it. The app owns the flow. It
+    /// must suspend the tty around the OAuth browser callback.
     login: llm.Account,
-    /// Drop this subscription account's stored credentials. A logout of the
+    /// Drop this account's stored credentials. A logout of the
     /// active account hands the session to the next authenticated one, or
     /// forces a login.
     logout: llm.Account,

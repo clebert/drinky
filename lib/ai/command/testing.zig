@@ -10,17 +10,23 @@ const provider = @import("../provider.zig");
 
 pub fn accounts(
     keys: Accounts.ApiKeys,
-    ready: struct { anthropic: bool = false, openai: bool = false },
+    ready: struct {
+        anthropic: bool = false,
+        openai: bool = false,
+        anthropic_console: bool = false,
+    },
 ) Accounts {
     return .{
         .gpa = std.testing.allocator,
         .io = std.testing.io,
         .timeouts = .{},
         .anthropic_auth = undefined,
+        .anthropic_console_auth = undefined,
         .openai_auth = undefined,
         .keys = keys,
         .anthropic_subscription_ready = ready.anthropic,
         .openai_subscription_ready = ready.openai,
+        .anthropic_console_ready = ready.anthropic_console,
         .openai_subscription_context_windows = .empty,
     };
 }

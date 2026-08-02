@@ -18,6 +18,11 @@ pub const Pkce = struct {
     challenge: [verifier_len]u8,
 };
 
+pub const BearerOptions = struct {
+    url: []const u8,
+    authorization: []const u8,
+};
+
 /// A fresh PKCE verifier/challenge pair drawn from the Io's CSPRNG.
 pub fn pkce(io: std.Io) Pkce {
     var seed: [32]u8 = undefined;
@@ -42,10 +47,35 @@ pub fn post(
     content_type: []const u8,
     body: []const u8,
 ) ![]u8 {
+    const fetch: Fetch = .{ .url = url, .content_type = content_type, .body = body };
+    return send(gpa, io, timeouts, &fetch);
+}
+
+/// POST an empty body under a `Bearer` `authorization` and return the owned
+/// response body. The caller frees it. Same connect-timeout bound as `post`.
+pub fn postBearer(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    timeouts: net.Timeouts,
+    options: *const BearerOptions,
+) ![]u8 {
+    if (!net.validHeaderValue(options.authorization)) return error.BadCredentials;
+    const fetch: Fetch = .{ .url = options.url, .authorization = options.authorization };
+    return send(gpa, io, timeouts, &fetch);
+}
+
+/// One POST: its target and the optional content-type, body, and authorization
+/// each path installs.
+const Fetch = struct {
+    url: []const u8,
+    content_type: ?[]const u8 = null,
+    body: []const u8 = "",
+    authorization: ?[]const u8 = null,
+};
+
+fn send(gpa: std.mem.Allocator, io: std.Io, timeouts: net.Timeouts, fetch: *const Fetch) ![]u8 {
     var out: ?[]u8 = null;
-    return awaitBody(gpa, io, timeouts.connect_ms, &out, fetchInto, .{
-        gpa, io, url, content_type, body, &out,
-    });
+    return awaitBody(gpa, io, timeouts.connect_ms, &out, fetchInto, .{ gpa, io, fetch, &out });
 }
 
 /// Run `work` (which writes its result into `out`) bounded by `timeout_ms`. The
@@ -67,27 +97,29 @@ fn awaitBody(
     return out.* orelse error.TokenRequestFailed;
 }
 
-fn fetchInto(
-    gpa: std.mem.Allocator,
-    io: std.Io,
-    url: []const u8,
-    content_type: []const u8,
-    body: []const u8,
-    out: *?[]u8,
-) !void {
-    const uri = try std.Uri.parse(url);
+fn fetchInto(gpa: std.mem.Allocator, io: std.Io, fetch: *const Fetch, out: *?[]u8) !void {
+    const uri = try std.Uri.parse(fetch.url);
     var client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer client.deinit();
 
     var request = try client.request(.POST, uri, .{
-        .headers = .{ .content_type = .{ .override = content_type } },
+        .headers = .{
+            .content_type = if (fetch.content_type) |content_type|
+                .{ .override = content_type }
+            else
+                .default,
+            .authorization = if (fetch.authorization) |authorization|
+                .{ .override = authorization }
+            else
+                .default,
+        },
     });
     defer request.deinit();
 
-    request.transfer_encoding = .{ .content_length = body.len };
-    var send = try request.sendBodyUnflushed(&.{});
-    try send.writer.writeAll(body);
-    try send.end();
+    request.transfer_encoding = .{ .content_length = fetch.body.len };
+    var send_body = try request.sendBodyUnflushed(&.{});
+    try send_body.writer.writeAll(fetch.body);
+    try send_body.end();
     try request.connection.?.flush();
 
     var redirect_buffer: [2048]u8 = undefined;
@@ -119,6 +151,16 @@ test pkce {
     var expected: [verifier_len]u8 = undefined;
     _ = std.base64.url_safe_no_pad.Encoder.encode(&expected, &digest);
     try std.testing.expectEqualStrings(&expected, &code.challenge);
+}
+
+test "postBearer rejects an authorization value that can split the request head" {
+    try std.testing.expectError(
+        error.BadCredentials,
+        postBearer(std.testing.allocator, undefined, .{}, &.{
+            .url = "https://example.test/mint",
+            .authorization = "Bearer token\r\nleaked: value",
+        }),
+    );
 }
 
 test "readBody rejects an oversized token response" {

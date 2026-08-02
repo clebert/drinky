@@ -58,7 +58,8 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 ## Accounts
 
 - Anthropic and OpenAI, each reachable as a subscription account or a platform API-key account.
-- Startup takes the first authenticated account and prefers a subscription over an API key.
+- The Anthropic Console account adds an OAuth login that mints and stores a platform key.
+- Startup takes the first authenticated account and prefers a signed-in login over an API key.
 - With no account at all, the login picker opens by itself.
 - While signed out, pith refuses a message with a prompt to `/login`.
 - Reasoning replays only to the account that produced it. A login or logout discards the rest.
@@ -66,10 +67,11 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 ## Signing in
 
 - OAuth login uses PKCE (S256) with a loopback callback, and opens the system browser.
+- The Anthropic Console login trades its grant for a minted platform key, stored like a token.
 - When no browser opens, the printed URL still works, and the callback waits five minutes.
 - The browser lands on a plain "Pith received authorization. Close this tab." page.
-- Subscription tokens live in `~/.pith/auth.json`, owner-only, one entry per account, saved
-  atomically.
+- Subscription tokens and the Console key live in `~/.pith/auth.json`, owner-only, one entry per
+  account, saved atomically.
 - Expired access tokens refresh and re-save automatically.
 - A login whose save fails stays signed in until pith exits, and says so.
 
@@ -78,12 +80,12 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - **/model** — switch account and model together, from the next turn on.
 - **/effort** — set the reasoning-effort level, from the next turn on.
 - **/login** — sign in, switch to an account already signed in, or name the API key to set.
-- **/logout** — drop a subscription's credentials and hand the session to another account.
+- **/logout** — drop a signed-in account's credentials and hand the session to another account.
 - **/new** — clear the conversation, usage stats, and steering without changing its configuration.
 - **/system** — inspect the complete provider-neutral system prompt as rendered Markdown in a
   scrollable full-window page. `M` toggles its exact source.
-- **/skill:name** — load a discovered skill explicitly, record a compact `Skill:` marker, and
-  append any trailing text as its task.
+- **/skill:name** — load a discovered skill explicitly, record a compact `Skill:` marker, and append
+  any trailing text as its task.
 - Successful model, effort, login, logout, and account changes are recorded as transcript events.
 - Unknown commands and other local command failures temporarily replace the footer until the next
   user action, and never reach the model.
@@ -96,8 +98,8 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - Prompt caching is always on: explicit breakpoints for Anthropic, the automatic per-session cache
   for OpenAI.
 - Reasoning is requested summarized at the resolved effort, and replayed verbatim on later turns.
-- Subscription requests carry the vendor's first-party client identity. API keys go straight to the
-  platform API.
+- Anthropic Subscription and Anthropic Console requests carry the Claude Code client identity.
+  A plain API key goes straight to the platform API.
 - Requests time out after 30 s to the response head and 60 s between streamed events. Keepalive
   filler does not count as progress.
 - A failed request retries up to 3 times with 500 ms–16 s backoff and honors a server's retry-after
@@ -123,11 +125,11 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
   goes quiet without adding a layout row.
 - Queued steering shows as `Queued message:` rows, and becomes one user message once consumed.
 - The bottom line shows context fill, cost, cache savings, cache-hit rate, quota, and
-  `model · effort`. At most one temporary notice replaces it until the next user action.
+  `model (account) · effort`. At most one temporary notice replaces it until the next user action.
 - A picker is a single-choice list that tags the current value. Enter confirms, and Esc, Ctrl+C, or
   Ctrl+D cancels.
-- The closed input frame grows to about a quarter of the screen and labels hidden rows
-  "↑ Hidden: N" and "↓ Hidden: N".
+- The closed input frame grows to about a quarter of the screen and labels hidden rows "↑ Hidden: N"
+  and "↓ Hidden: N".
 - Model, tool, and user text can never emit escapes: controls and malformed UTF-8 render as
   replacement characters.
 
@@ -168,5 +170,5 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 
 One short sentence per capability, at the concept level: what a user gets, not how the code spells
 it. When a capability lands, add its line and tick the matching `BACKLOG.md` item. When one goes
-away, delete the line. Merge a fact into a neighbouring line rather than add a new one. If a
-section passes roughly a dozen lines, it is either two sections or too much detail.
+away, delete the line. Merge a fact into a neighbouring line rather than add a new one. If a section
+passes roughly a dozen lines, it is either two sections or too much detail.

@@ -1,5 +1,5 @@
-//! `/logout`: a picker over the logged-in subscription accounts (API-key
-//! accounts are environment-sourced and have no logout). A selection hands the
+//! `/logout`: a picker over the signed-in accounts. API-key accounts are
+//! environment-sourced and have no logout. A selection hands the
 //! app a `logout` outcome. The command ignores any argument.
 
 const std = @import("std");
@@ -17,7 +17,7 @@ pub fn run(context: *Context) !Context.Outcome {
     if (accounts.len == 0) return Context.Outcome.reportNotice(
         context.gpa,
         .failure,
-        "No subscription accounts are signed in.",
+        "No accounts are signed in.",
         .{},
     );
 
@@ -52,14 +52,14 @@ const account_count = std.enums.values(llm.Account).len;
 fn loggedIn(accounts: *const Accounts, buffer: []llm.Account) []llm.Account {
     var count: usize = 0;
     for (std.enums.values(llm.Account)) |account| {
-        if (!account.isSubscription() or !accounts.isAuthenticated(account)) continue;
+        if (!account.hasLogin() or !accounts.isAuthenticated(account)) continue;
         buffer[count] = account;
         count += 1;
     }
     return buffer[0..count];
 }
 
-test "the picker lists only signed-in subscriptions, and none reports an error" {
+test "the picker lists only signed-in accounts, and none reports an error" {
     const gpa = std.testing.allocator;
 
     var some = testing.accounts(.{ .anthropic = "sk-ant" }, .{ .openai = true });
@@ -71,7 +71,7 @@ test "the picker lists only signed-in subscriptions, and none reports an error" 
                 gpa.free(pick.options);
             }
             try std.testing.expectEqual(@as(usize, 1), pick.options.len);
-            try std.testing.expectEqualStrings("OpenAI subscription", pick.options[0]);
+            try std.testing.expectEqualStrings("OpenAI Subscription", pick.options[0]);
         },
         else => return error.ExpectedPick,
     }

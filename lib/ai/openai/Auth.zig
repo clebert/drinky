@@ -59,7 +59,7 @@ pub fn login(self: *Auth, prompt: anytype) !auth.Login {
 /// `state`. A mismatch means the redirect is not ours.
 fn exchangeRedirect(
     self: *Auth,
-    redirect: oauth_callback.Redirect,
+    redirect: *const oauth_callback.Redirect,
     pair: *const oauth_wire.Pkce,
 ) !oauth.Tokens {
     if (!std.mem.eql(u8, redirect.state, &pair.verifier)) return error.StateMismatch;

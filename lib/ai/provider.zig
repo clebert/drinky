@@ -21,6 +21,7 @@ const codex_url = "https://chatgpt.com/backend-api/codex/responses";
 /// picks the account, so `Client.init` needs no separate selector.
 pub const Credentials = union(llm.Account) {
     anthropic_subscription: *anthropic.Auth,
+    anthropic_console: []const u8,
     anthropic_api: []const u8,
     openai_subscription: *openai.Auth,
     openai_api: []const u8,
@@ -50,7 +51,10 @@ pub const Client = struct {
     /// success the caller owns `out` and must `deinit` it.
     pub fn send(self: *Client, out: *Stream, request: *const llm.Request) !void {
         switch (self.credentials) {
-            inline .anthropic_subscription, .anthropic_api => |credential, tag| {
+            inline .anthropic_subscription,
+            .anthropic_api,
+            .anthropic_console,
+            => |credential, tag| {
                 const identity: anthropic.Transport.Identity = if (tag == .anthropic_subscription)
                     .{ .subscription = try credential.accessToken() }
                 else
@@ -93,6 +97,7 @@ pub const Client = struct {
 /// in how the request was sent, not in how the response decodes.
 pub const Stream = union(llm.Account) {
     anthropic_subscription: anthropic.Transport.Stream,
+    anthropic_console: anthropic.Transport.Stream,
     anthropic_api: anthropic.Transport.Stream,
     openai_subscription: openai.Transport.Stream,
     openai_api: openai.Transport.Stream,
@@ -171,6 +176,8 @@ test "init selects the arm matching the credentials" {
     try std.testing.expectEqual(llm.Account.anthropic_subscription, subscription.account());
     const anthropic_key = Client.init(gpa, std.testing.io, .{ .anthropic_api = "sk-ant" }, .{});
     try std.testing.expectEqual(llm.Account.anthropic_api, anthropic_key.account());
+    const console = Client.init(gpa, std.testing.io, .{ .anthropic_console = "sk-ant-api03" }, .{});
+    try std.testing.expectEqual(llm.Account.anthropic_console, console.account());
     const openai_key = Client.init(gpa, std.testing.io, .{ .openai_api = "sk-test" }, .{});
     try std.testing.expectEqual(llm.Account.openai_api, openai_key.account());
     const codex = Client.init(gpa, std.testing.io, .{ .openai_subscription = undefined }, .{});

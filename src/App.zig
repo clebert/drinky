@@ -359,7 +359,7 @@ pub fn run(
 
     self.session = Session.init(gpa, self.tty.writer(), self.agent.model, self.agent.effort);
     defer self.session.deinit();
-    self.session.signed_in = self.signedIn();
+    self.session.account_shown = active;
     self.input = terminal.Input.init(gpa);
     defer self.input.deinit();
 
@@ -716,10 +716,15 @@ fn runTurnWorker(self: *App, text: []const u8, generation: u64) WorkerResult {
     };
 }
 
-/// Whether an account is active (the agent has a client). False leaves the
-/// session signed out. Pith refuses normal messages until a login.
+/// The active account, or null when the agent is signed out.
+fn activeAccount(self: *const App) ?ai.llm.Account {
+    const client = self.agent.client orelse return null;
+    return client.account();
+}
+
+/// Whether an account is active. Pith refuses normal messages until a login.
 fn signedIn(self: *const App) bool {
-    return self.agent.client != null;
+    return self.activeAccount() != null;
 }
 
 /// The model to start `account` on: the configured default, else the compiled
@@ -1150,10 +1155,10 @@ fn applyOutcome(self: *App, outcome: ai.command.Outcome) !void {
     self.session.stats_shown = self.agent.stats;
     self.session.model_shown = self.agent.model;
     self.session.effort_shown = self.agent.effort;
-    self.session.signed_in = self.signedIn();
+    self.session.account_shown = self.activeAccount();
 }
 
-/// Log in to a subscription `account`, then switch to it on its default model.
+/// Log in to `account`, then switch to it on its default model.
 /// A pre-commit failure leaves the current account untouched. After the
 /// credential replacement, account readiness and replay invalidation complete
 /// before any fallible final presentation.
@@ -1213,7 +1218,7 @@ fn reportLoginFailure(self: *App, login_error: anyerror) !void {
     return self.reportNotice(.failure, "{s}", .{message});
 }
 
-/// Drop a subscription `account`'s credentials. A logout of the active account
+/// Drop `account`'s credentials. A logout of the active account
 /// hands the session to the next authenticated account (its default model). When
 /// none remains, it drops to a signed-out state and opens the login picker so the
 /// user chooses how to sign back in. Commands cannot run mid-turn, so this never
@@ -3064,6 +3069,7 @@ test "an account-switch command clears the session's quota snapshot" {
     try std.testing.expect(app.agent.stats.quota == null);
     try std.testing.expect(app.session.stats_shown.quota == null);
     try std.testing.expectEqualStrings(openai_default.name, app.session.model_shown.name);
+    try std.testing.expectEqual(ai.llm.Account.openai_api, app.session.account_shown.?);
 }
 
 test "an invoked skill records a compact marker and keeps its task visible" {

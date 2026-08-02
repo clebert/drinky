@@ -245,7 +245,7 @@ const test_status: ui.status.Info = .{
     .context_window = 1000,
     .model = "footerqq",
     .effort = "high",
-    .signed_in = true,
+    .account = .anthropic_subscription,
     .quota = null,
 };
 

@@ -64,7 +64,7 @@ pub fn login(self: *Auth, prompt: anytype) !auth.Login {
 /// PKCE verifier all go into the token request.
 fn exchangeRedirect(
     self: *Auth,
-    redirect: oauth_callback.Redirect,
+    redirect: *const oauth_callback.Redirect,
     pair: *const oauth_wire.Pkce,
 ) !oauth.Tokens {
     return oauth.exchange(self.gpa, self.io, self.timeouts, .{

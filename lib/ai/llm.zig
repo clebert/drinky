@@ -9,12 +9,16 @@ const std = @import("std");
 /// subscription — is data held by `provider.Credentials`, not part of the
 /// identity. This is the tag `provider.Client`/`Stream` key on. It is also the
 /// origin stamped on stored reasoning, so only the exact account that produced
-/// a blob replays it. At startup any subscription is preferred over any paid
-/// API key, across vendors. Within a tier, declaration order decides.
+/// a blob replays it. At startup any account with a login is preferred over an
+/// environment API key, across vendors. Within a tier, declaration order decides.
 pub const Account = enum {
     /// Claude Pro/Max subscription OAuth, authorized with a `Bearer` token and
     /// the Claude Code identity headers.
     anthropic_subscription,
+    /// Anthropic Console (Developer Platform), authorized with an `x-api-key`
+    /// key that an OAuth login mints and stores. It sends the Claude Code system
+    /// prompt like the subscription, so it reaches every model.
+    anthropic_console,
     /// Per-token platform API, authorized with `x-api-key`.
     anthropic_api,
     /// ChatGPT (Codex) subscription OAuth.
@@ -22,22 +26,24 @@ pub const Account = enum {
     /// Per-token platform API, authorized with a `Bearer` key.
     openai_api,
 
-    /// Whether this account authenticates with an interactive OAuth subscription
-    /// login (as opposed to an environment API key). Such an account can be
-    /// logged in and out mid-session.
-    pub fn isSubscription(self: Account) bool {
+    /// Whether this account signs in through an interactive OAuth login (as
+    /// opposed to an environment API key). Such an account can be logged in and
+    /// out mid-session. The Console account signs in this way even though it
+    /// then authorizes with a minted `x-api-key` key.
+    pub fn hasLogin(self: Account) bool {
         return switch (self) {
-            .anthropic_subscription, .openai_subscription => true,
+            .anthropic_subscription, .openai_subscription, .anthropic_console => true,
             .anthropic_api, .openai_api => false,
         };
     }
 
-    /// The human-readable label, e.g. "Anthropic subscription".
+    /// The human-readable label, e.g. "Anthropic Subscription".
     pub fn label(self: Account) []const u8 {
         return switch (self) {
-            .anthropic_subscription => "Anthropic subscription",
+            .anthropic_subscription => "Anthropic Subscription",
+            .anthropic_console => "Anthropic Console",
             .anthropic_api => "Anthropic API",
-            .openai_subscription => "OpenAI subscription",
+            .openai_subscription => "OpenAI Subscription",
             .openai_api => "OpenAI API",
         };
     }
@@ -49,14 +55,14 @@ pub const Account = enum {
         return switch (self) {
             .anthropic_api => "ANTHROPIC_API_KEY",
             .openai_api => "OPENAI_API_KEY",
-            .anthropic_subscription, .openai_subscription => null,
+            .anthropic_subscription, .openai_subscription, .anthropic_console => null,
         };
     }
 
     /// The vendor this account belongs to.
     pub fn provider(self: Account) Provider {
         return switch (self) {
-            .anthropic_api, .anthropic_subscription => .anthropic,
+            .anthropic_api, .anthropic_subscription, .anthropic_console => .anthropic,
             .openai_api, .openai_subscription => .openai,
         };
     }
@@ -106,6 +112,7 @@ pub const Item = union(enum) {
 
         pub const Replay = union(Account) {
             anthropic_subscription: Anthropic,
+            anthropic_console: Anthropic,
             anthropic_api: Anthropic,
             openai_subscription: OpenAi,
             openai_api: OpenAi,
@@ -115,7 +122,10 @@ pub const Item = union(enum) {
                 gpa: std.mem.Allocator,
             ) !Replay {
                 return switch (self.*) {
-                    inline .anthropic_subscription, .anthropic_api => |proof, tag| switch (proof) {
+                    inline .anthropic_subscription,
+                    .anthropic_api,
+                    .anthropic_console,
+                    => |proof, tag| switch (proof) {
                         .signature => |signature| signature: {
                             const text_copy = try gpa.dupe(u8, signature.text);
                             errdefer gpa.free(text_copy);
@@ -150,7 +160,10 @@ pub const Item = union(enum) {
 
             pub fn deinit(self: *const Replay, gpa: std.mem.Allocator) void {
                 switch (self.*) {
-                    inline .anthropic_subscription, .anthropic_api => |proof| switch (proof) {
+                    inline .anthropic_subscription,
+                    .anthropic_api,
+                    .anthropic_console,
+                    => |proof| switch (proof) {
                         .signature => |signature| {
                             gpa.free(signature.text);
                             gpa.free(signature.signature);
@@ -317,7 +330,10 @@ pub const Event = union(enum) {
             account: Account,
         ) ?Item.Reasoning.Replay {
             return switch (account) {
-                inline .anthropic_subscription, .anthropic_api => |tag| switch (self.*) {
+                inline .anthropic_subscription,
+                .anthropic_api,
+                .anthropic_console,
+                => |tag| switch (self.*) {
                     .signature => |signature| if (signature.signature.len != 0)
                         @unionInit(
                             Item.Reasoning.Replay,
@@ -409,16 +425,23 @@ test "Account.provider maps each account to its vendor" {
     try std.testing.expectEqual(Provider.anthropic, Account.anthropic_subscription.provider());
     try std.testing.expectEqual(Provider.openai, Account.openai_api.provider());
     try std.testing.expectEqual(Provider.openai, Account.openai_subscription.provider());
+    try std.testing.expectEqual(Provider.anthropic, Account.anthropic_console.provider());
 }
 
-test "account subscription flag and label" {
-    try std.testing.expect(Account.anthropic_subscription.isSubscription());
-    try std.testing.expect(Account.openai_subscription.isSubscription());
-    try std.testing.expect(!Account.anthropic_api.isSubscription());
-    try std.testing.expect(!Account.openai_api.isSubscription());
-    try std.testing.expectEqualStrings("OpenAI subscription", Account.openai_subscription.label());
+test "account login flag and label" {
+    try std.testing.expect(Account.anthropic_subscription.hasLogin());
+    try std.testing.expect(Account.openai_subscription.hasLogin());
+    try std.testing.expect(Account.anthropic_console.hasLogin());
+    try std.testing.expect(!Account.anthropic_api.hasLogin());
+    try std.testing.expect(!Account.openai_api.hasLogin());
+    try std.testing.expectEqualStrings(
+        "Anthropic Subscription",
+        Account.anthropic_subscription.label(),
+    );
+    try std.testing.expectEqualStrings("Anthropic Console", Account.anthropic_console.label());
     try std.testing.expectEqualStrings("Anthropic API", Account.anthropic_api.label());
+    try std.testing.expectEqualStrings("OpenAI Subscription", Account.openai_subscription.label());
     try std.testing.expectEqualStrings("ANTHROPIC_API_KEY", Account.anthropic_api.apiKeyEnv().?);
     try std.testing.expectEqualStrings("OPENAI_API_KEY", Account.openai_api.apiKeyEnv().?);
-    try std.testing.expect(Account.anthropic_subscription.apiKeyEnv() == null);
+    try std.testing.expect(Account.anthropic_console.apiKeyEnv() == null);
 }

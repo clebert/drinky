@@ -89,7 +89,7 @@ pub fn accessToken(
 
 /// Run the interactive OAuth login and report pre-commit runtime text through
 /// the caller's presentation boundary. `oauth` is the provider protocol module
-/// (the authorize URL and callback port). `exchangeFn(auth, redirect, pair)`
+/// (the authorize URL and callback port). `exchangeFn(auth, &redirect, pair)`
 /// applies provider-specific checks first, then trades the redirect for tokens.
 /// Once tokens are installed, the function returns a non-error persistence
 /// outcome so callers cannot mistake presentation failure for login failure.
@@ -115,7 +115,7 @@ pub fn login(
         auth.gpa.free(redirect.state);
     }
 
-    return commit(auth, account_key, try exchangeFn(auth, redirect, &pair));
+    return commit(auth, account_key, try exchangeFn(auth, &redirect, &pair));
 }
 
 /// Install exchanged tokens and report whether they reached disk. Installation

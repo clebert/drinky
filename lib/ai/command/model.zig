@@ -167,7 +167,7 @@ test "the active mark matches the account, not just the model name" {
                 gpa.free(pick.options);
             }
             try std.testing.expectEqualStrings(
-                "claude-sonnet-4-6 (Anthropic subscription)",
+                "claude-sonnet-4-6 (Anthropic Subscription)",
                 pick.options[pick.current.?],
             );
         },

@@ -40,7 +40,7 @@ pub fn select(context: *Context, index: usize) !Context.Outcome {
     // Authenticated but inactive: the app performs the switch so the configured
     // default model applies, exactly as in a startup on this account.
     if (context.accounts.isAuthenticated(account)) return .{ .switch_account = account };
-    if (account.isSubscription()) return .{ .login = account };
+    if (account.hasLogin()) return .{ .login = account };
     return Context.Outcome.reportNotice(
         gpa,
         .information,
@@ -53,7 +53,7 @@ pub fn select(context: *Context, index: usize) !Context.Outcome {
 fn marker(context: *const Context, account: llm.Account) []const u8 {
     if (isActive(context, account)) return " (Active)";
     if (!context.accounts.isAuthenticated(account)) return "";
-    return if (account.isSubscription()) " (Signed in)" else " (API key set)";
+    return if (account.hasLogin()) " (Signed in)" else " (API key set)";
 }
 
 fn isActive(context: *const Context, account: llm.Account) bool {
@@ -74,38 +74,43 @@ test "the picker lists every account, marking the active and authenticated ones"
                 for (pick.options) |option| gpa.free(option);
                 gpa.free(pick.options);
             }
-            try std.testing.expectEqual(@as(usize, 4), pick.options.len);
+            try std.testing.expectEqual(@as(usize, 5), pick.options.len);
             try std.testing.expectEqualStrings(
-                "Anthropic subscription (Signed in)",
+                "Anthropic Subscription (Signed in)",
                 pick.options[0],
             );
-            try std.testing.expectEqualStrings("Anthropic API (Active)", pick.options[1]);
-            try std.testing.expectEqualStrings("OpenAI subscription", pick.options[2]);
-            try std.testing.expectEqualStrings("OpenAI API", pick.options[3]);
+            try std.testing.expectEqualStrings("Anthropic Console", pick.options[1]);
+            try std.testing.expectEqualStrings("Anthropic API (Active)", pick.options[2]);
+            try std.testing.expectEqualStrings("OpenAI Subscription", pick.options[3]);
+            try std.testing.expectEqualStrings("OpenAI API", pick.options[4]);
             try std.testing.expect(pick.current == null);
         },
         else => return error.ExpectedPick,
     }
 }
 
-test "select logs in a subscription, instructs an API account, and no-ops the active one" {
+test "select starts login, instructs an API account, and no-ops the active one" {
     const gpa = std.testing.allocator;
     var accounts = testing.accounts(.{ .anthropic = "sk-ant" }, .{});
     var agent = testing.agent(gpa, .{ .anthropic_api = "sk-ant" });
     defer agent.deinit();
     var context: Context = .{ .gpa = gpa, .io = undefined, .agent = &agent, .accounts = &accounts };
 
-    switch (try select(&context, 2)) {
+    switch (try select(&context, 1)) {
+        .login => |account| try std.testing.expectEqual(llm.Account.anthropic_console, account),
+        else => return error.ExpectedLogin,
+    }
+    switch (try select(&context, 3)) {
         .login => |account| try std.testing.expectEqual(llm.Account.openai_subscription, account),
         else => return error.ExpectedLogin,
     }
     try Context.Outcome.expectNoticeContaining(
-        try select(&context, 3),
+        try select(&context, 4),
         .information,
         "OPENAI_API_KEY",
     );
     try Context.Outcome.expectNoticeContaining(
-        try select(&context, 1),
+        try select(&context, 2),
         .information,
         "active account",
     );

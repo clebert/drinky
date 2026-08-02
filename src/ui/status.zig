@@ -1,5 +1,5 @@
 //! The bottom status line: normally a context-window gauge, session cost, and
-//! cache savings on the left with the model and effort right-aligned.
+//! cache savings on the left with the model, account, and effort right-aligned.
 //! Temporarily the line shows one notice instead. A pure renderer over a
 //! caller-built `Info` snapshot.
 
@@ -18,9 +18,9 @@ pub const Info = struct {
     context_window: u64,
     model: []const u8,
     effort: []const u8,
-    /// Whether an account is active. When false the right side reads "Account:
-    /// Signed out" instead of the model and effort, which are then unusable.
-    signed_in: bool,
+    /// The active account. Null shows "Account: Signed out" instead of the
+    /// model, account, and effort.
+    account: ?ai.llm.Account,
     /// A subscription's remaining allowance, or null when the active provider
     /// reports none (an API key, or a non-subscription turn). Each window whose
     /// duration identifies it shows on the left as `<label>: N% remaining`.
@@ -37,13 +37,15 @@ pub const Info = struct {
 /// The right-side indicator shown while no account is active.
 const signed_out_label = "Account: Signed out";
 
-/// Separates the model name from its effort level on the right of the line.
+const account_open = " (";
+const account_close = ")";
+
+/// Separates the account from its effort level on the right of the line.
 const separator = " · ";
 
-/// Stream the status line through `placement`: session stats on the left, the
-/// `model · effort` indicator right-aligned to the terminal width. When they
-/// cannot both fit, show the right indicator alone. If that does not fit, show
-/// the truncated stats.
+/// Stream the status line through `placement`. Put session stats on the left.
+/// Put `model (account) · effort` on the right. When both do not fit, show only
+/// the right indicator. If that does not fit, show the truncated stats.
 pub fn render(placement: *const paint.Placement, info: *const Info) !void {
     if (placement.base < placement.skip) return;
     if (info.notice) |notice| {
@@ -61,9 +63,10 @@ pub fn render(placement: *const paint.Placement, info: *const Info) !void {
     writeStats(&stats, info) catch unreachable;
     const line = stats.buffered();
     const stats_columns = terminal.width.ofText(line);
-    const right_columns = if (info.signed_in)
-        terminal.width.ofText(info.model) + terminal.width.ofText(separator) +
-            terminal.width.ofText(info.effort)
+    const right_columns = if (info.account) |account|
+        terminal.width.ofText(info.model) + terminal.width.ofText(account_open) +
+            terminal.width.ofText(account.label()) + terminal.width.ofText(account_close) +
+            terminal.width.ofText(separator) + terminal.width.ofText(info.effort)
     else
         terminal.width.ofText(signed_out_label);
 
@@ -84,8 +87,11 @@ pub fn render(placement: *const paint.Placement, info: *const Info) !void {
 }
 
 fn writeRight(sink: *terminal.View.Sink, info: *const Info) !void {
-    if (info.signed_in) {
+    if (info.account) |account| {
         try sink.text(info.model);
+        try sink.text(account_open);
+        try sink.text(account.label());
+        try sink.text(account_close);
         try sink.text(separator);
         try sink.text(info.effort);
     } else {
@@ -200,13 +206,13 @@ test render {
         .context_window = 1_000_000,
         .model = "claude-opus-4-8",
         .effort = "xhigh",
-        .signed_in = true,
+        .account = .anthropic_subscription,
         .quota = null,
     };
 
-    const sink = try view.beginFrame(.{ .columns = 120, .rows = 24 }, 4);
+    const sink = try view.beginFrame(.{ .columns = 160, .rows = 24 }, 4);
     const placement: paint.Placement =
-        .{ .sink = sink, .id = 0, .columns = 120, .base = 0, .skip = 0 };
+        .{ .sink = sink, .id = 0, .columns = 160, .base = 0, .skip = 0 };
     try render(&placement, &info);
     try view.render();
 
@@ -216,9 +222,71 @@ test render {
     try std.testing.expect(
         std.mem.indexOf(u8, painted, "Cost: $0.39 · Saved: $0.82") != null,
     );
-    // The model and effort are right-aligned, so they land after the stats.
-    const right = std.mem.indexOf(u8, painted, "claude-opus-4-8\u{200B} · \u{200B}xhigh").?;
+    const right = std.mem.indexOf(
+        u8,
+        painted,
+        "claude-opus-4-8\u{200B} (\u{200B}Anthropic Subscription\u{200B})" ++
+            "\u{200B} · \u{200B}xhigh",
+    ).?;
     try std.testing.expect(right > std.mem.indexOf(u8, painted, "Context: 21%").?);
+}
+
+test "the account indicator replaces stats when both do not fit" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var view = terminal.View.init(gpa, &out.writer);
+    defer view.deinit();
+    const info: Info = .{
+        .last = .{},
+        .cost = 0,
+        .saved = 0,
+        .context_window = 200_000,
+        .model = "claude-opus-4-8",
+        .effort = "xhigh",
+        .account = .anthropic_subscription,
+        .quota = null,
+    };
+
+    const sink = try view.beginFrame(.{ .columns = 80, .rows = 24 }, 4);
+    const placement: paint.Placement =
+        .{ .sink = sink, .id = 0, .columns = 80, .base = 0, .skip = 0 };
+    try render(&placement, &info);
+    try view.render();
+
+    const painted = out.written();
+    try std.testing.expect(std.mem.indexOf(u8, painted, "claude-opus-4-8") != null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "Anthropic Subscription") != null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "Context:") == null);
+}
+
+test "a narrow status shows truncated stats when the account does not fit" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var view = terminal.View.init(gpa, &out.writer);
+    defer view.deinit();
+    const info: Info = .{
+        .last = .{},
+        .cost = 0,
+        .saved = 0,
+        .context_window = 200_000,
+        .model = "claude-opus-4-8",
+        .effort = "xhigh",
+        .account = .anthropic_subscription,
+        .quota = null,
+    };
+
+    const sink = try view.beginFrame(.{ .columns = 32, .rows = 24 }, 4);
+    const placement: paint.Placement =
+        .{ .sink = sink, .id = 0, .columns = 32, .base = 0, .skip = 0 };
+    try render(&placement, &info);
+    try view.render();
+
+    const painted = out.written();
+    try std.testing.expect(std.mem.indexOf(u8, painted, "Context:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "claude-opus-4-8") == null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "Anthropic Subscription") == null);
 }
 
 test "a notice replaces the status for exactly one row" {
@@ -234,7 +302,7 @@ test "a notice replaces the status for exactly one row" {
         .context_window = 200_000,
         .model = "hidden-model",
         .effort = "high",
-        .signed_in = true,
+        .account = .anthropic_subscription,
         .quota = null,
         .notice = .{ .text = "boom\nnot another row", .is_error = true },
     };
@@ -266,7 +334,7 @@ test "a signed-out status shows the indicator in place of the model" {
         .context_window = 200_000,
         .model = "claude-opus-4-8",
         .effort = "xhigh",
-        .signed_in = false,
+        .account = null,
         .quota = null,
     };
 
@@ -296,7 +364,7 @@ test "quota windows show the remaining allowance, labeled by length" {
         .context_window = 400_000,
         .model = "gpt-5.6-sol",
         .effort = "medium",
-        .signed_in = true,
+        .account = .openai_subscription,
         .quota = .{
             .primary = .{ .used_percent = 11.6, .window_minutes = 300 },
             .secondary = .{ .used_percent = 73.6, .window_minutes = 10080 },
@@ -327,7 +395,7 @@ test "a quota with a single window omits the absent one" {
         .context_window = 400_000,
         .model = "gpt-5.6-sol",
         .effort = "medium",
-        .signed_in = true,
+        .account = .openai_subscription,
         .quota = .{ .secondary = .{ .used_percent = 73.6, .window_minutes = 10080 } },
     };
 
@@ -352,7 +420,7 @@ test "unidentified quota windows stay hidden beside a known window" {
         .context_window = 400_000,
         .model = "gpt-5.6-sol",
         .effort = "medium",
-        .signed_in = true,
+        .account = .openai_subscription,
         .quota = .{
             .primary = .{ .used_percent = 77, .window_minutes = 10080 },
             .secondary = .{ .used_percent = 0 },

@@ -2,8 +2,8 @@
 //! that applies events to it and paints. It owns the `Transcript`, the sole
 //! transient notice, the interaction `mode` (prompt / streaming turn / picker /
 //! read-only page), and the `editor`. It also owns the reconciling `view`, the
-//! last laid-out dimensions, and consumer-side snapshots of usage and the
-//! active model. Everything here is io-, tty-, and agent-free. Producers hand
+//! last laid-out dimensions, and consumer-side snapshots of usage, model, and
+//! account. Everything here is io-, tty-, and agent-free. Producers hand
 //! it `UiEvent`s and `App` drives its mutations. Tests can then drive the
 //! render loop from a scripted event sequence without real io.
 
@@ -50,10 +50,9 @@ model_shown: ai.models.Model,
 /// The consumer-owned copy of the reasoning-effort level for the status-line
 /// indicator. It updates after a command runs.
 effort_shown: ai.llm.Effort,
-/// Whether an account is active. It mirrors the agent after a command runs.
-/// When false, the status line shows a signed-out indicator. The model/effort
-/// snapshots are then stale placeholders.
-signed_in: bool,
+/// The active account. It mirrors the agent after a command runs. Null shows a
+/// signed-out indicator. The model and effort are then stale placeholders.
+account_shown: ?ai.llm.Account,
 /// Steering submitted during a turn, in chronological order, as detached editor
 /// drafts. Recall can then restore live placeholder markers. The plain queue is
 /// a suffix of this list. Consumed drafts remain owned until the terminal
@@ -230,7 +229,7 @@ pub fn init(
         .stats_shown = .{},
         .model_shown = model,
         .effort_shown = effort,
-        .signed_in = true,
+        .account_shown = .anthropic_subscription,
         .steering = .empty,
         .steering_retained_count = 0,
         .steering_consumed_count = 0,
@@ -725,7 +724,7 @@ pub fn paint(self: *Session, size: terminal.View.Size) !void {
         .context_window = self.model_shown.context_window,
         .model = self.model_shown.name,
         .effort = @tagName(self.effort_shown),
-        .signed_in = self.signed_in,
+        .account = self.account_shown,
         .quota = self.stats_shown.quota,
         .notice = if (self.notice) |notice| .{
             .text = notice.content,

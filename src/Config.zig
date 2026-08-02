@@ -30,6 +30,7 @@ pub const DefaultModels = struct {
     anthropic_subscription: ?ai.models.Model = null,
     openai_api: ?ai.models.Model = null,
     openai_subscription: ?ai.models.Model = null,
+    anthropic_console: ?ai.models.Model = null,
 
     pub fn get(self: *const DefaultModels, account: ai.llm.Account) ?ai.models.Model {
         return switch (account) {
@@ -71,6 +72,7 @@ const File = struct {
         anthropic_subscription: ?[]const u8 = null,
         openai_api: ?[]const u8 = null,
         openai_subscription: ?[]const u8 = null,
+        anthropic_console: ?[]const u8 = null,
     };
 };
 
@@ -125,6 +127,12 @@ fn parse(gpa: std.mem.Allocator, data: []const u8) !Config {
             &dropped,
             .openai_subscription,
             names.openai_subscription,
+        ),
+        .anthropic_console = try resolveModel(
+            gpa,
+            &dropped,
+            .anthropic_console,
+            names.anthropic_console,
         ),
     };
     return .{

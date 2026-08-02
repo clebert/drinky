@@ -8,13 +8,26 @@ const json = @import("../json.zig");
 const llm = @import("../llm.zig");
 const models = @import("../models.zig");
 
-/// The exact leading identity the Claude subscription compatibility path expects.
-/// The API-key path omits it and sends only the user's own prompt.
+/// The exact leading identity the Claude Code compatibility path expects. Both
+/// the subscription and the Console account send it, so the Console key reaches
+/// every model. The plain API-key path omits it and sends only the user's own
+/// prompt.
 const system_header = "You are Claude Code, Anthropic's official CLI for Claude.";
 
+/// Whether `account` leads its system prompt with the Claude Code identity
+/// header. The subscription and Console accounts send it, so their keys reach
+/// every model. A plain API key omits it. A new account must decide here.
+fn sendsSystemHeader(account: llm.Account) bool {
+    return switch (account) {
+        .anthropic_subscription, .anthropic_console => true,
+        .anthropic_api, .openai_subscription, .openai_api => false,
+    };
+}
+
 /// Serialize `request` into an owned JSON body. The caller frees the result.
-/// `account` decides whether to prepend the Claude Code `system_header`
-/// (subscription only) and which stored reasoning replays (see `emitsBlock`).
+/// `account` decides whether to prepend the Claude Code `system_header` (the
+/// subscription and Console accounts) and which stored reasoning replays (see
+/// `emitsBlock`).
 pub fn serialize(gpa: std.mem.Allocator, request: *const llm.Request, account: llm.Account) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
@@ -48,7 +61,7 @@ pub fn serialize(gpa: std.mem.Allocator, request: *const llm.Request, account: l
     // tool, and the last block of the last message — three of the four allowed.
     try stringify.objectField("system");
     try stringify.beginArray();
-    if (account == .anthropic_subscription)
+    if (sendsSystemHeader(account))
         try stringify.write(TextBlock{ .text = system_header });
     try stringify.write(TextBlock{ .text = request.system, .cache_control = .{} });
     try stringify.endArray();
@@ -184,7 +197,10 @@ fn emitsBlock(item: llm.Item, emit_thinking: bool, account: llm.Account) bool {
         .reasoning => |reasoning| if (!emit_thinking)
             false
         else switch (reasoning.replay) {
-            inline .anthropic_subscription, .anthropic_api => |proof, tag| proof: {
+            inline .anthropic_subscription,
+            .anthropic_api,
+            .anthropic_console,
+            => |proof, tag| proof: {
                 if (tag != account) break :proof false;
                 break :proof switch (proof) {
                     .signature => |signature| signature.signature.len != 0,
@@ -251,7 +267,10 @@ fn writeItem(stringify: *std.json.Stringify, item: *const llm.Item, cache: bool)
 /// Serialize a stored Anthropic replay proof as normal or redacted thinking.
 fn writeThinking(stringify: *std.json.Stringify, reasoning: *const llm.Item.Reasoning) !void {
     switch (reasoning.replay) {
-        inline .anthropic_subscription, .anthropic_api => |proof| switch (proof) {
+        inline .anthropic_subscription,
+        .anthropic_api,
+        .anthropic_console,
+        => |proof| switch (proof) {
             .signature => |signature| try stringify.write(ThinkingBlock{
                 .thinking = signature.text,
                 .signature = signature.signature,
@@ -582,6 +601,36 @@ test "the api-key account omits the system header and keeps every other block" {
     }, .anthropic_api);
     defer std.testing.allocator.free(body);
     try std.testing.expectEqualStrings(golden_api, body);
+}
+
+test "the console account prepends the Claude Code header and replays its own reasoning" {
+    const items = [_]llm.Item{
+        .{ .message = .{ .role = .user, .text = "first" } },
+        .{ .reasoning = .{ .replay = .{ .anthropic_console = .{ .signature = .{
+            .text = "weigh it",
+            .signature = "sig",
+        } } } } },
+        .{ .message = .{ .role = .assistant, .text = "all set" } },
+    };
+    const body = try serialize(std.testing.allocator, &.{
+        .model = "claude-opus-4-8",
+        .tokens_max = 8192,
+        .system = "be terse",
+        .items = &items,
+        .tools = &.{},
+        .effort = .xhigh,
+    }, .anthropic_console);
+    defer std.testing.allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    const system = root.get("system").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), system.len);
+    try std.testing.expectEqualStrings(system_header, system[0].object.get("text").?.string);
+    const assistant = root.get("messages").?.array.items[1].object.get("content").?.array.items;
+    try std.testing.expectEqualStrings("thinking", assistant[0].object.get("type").?.string);
+    try std.testing.expectEqualStrings("weigh it", assistant[0].object.get("thinking").?.string);
 }
 
 test "a reasoning-only run dropped by an account switch emits no empty envelope" {

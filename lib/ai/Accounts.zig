@@ -1,5 +1,5 @@
-//! The set of configured accounts and their live credentials: the two OAuth
-//! subscription stores and the two environment-sourced API keys. It owns what
+//! The set of configured accounts and their live credentials: the OAuth login
+//! stores and the two environment-sourced API keys. It owns what
 //! a `provider.Client` points into: the `Auth` structs and (by borrow) the key
 //! bytes. A client built here stays valid for the whole session. It reports
 //! which accounts are authenticated and builds a client for one on demand. The
@@ -23,11 +23,14 @@ gpa: std.mem.Allocator,
 io: std.Io,
 timeouts: net.Timeouts,
 anthropic_auth: anthropic.Auth,
+anthropic_console_auth: anthropic.ConsoleAuth,
 openai_auth: openai.Auth,
 keys: ApiKeys,
 /// Whether each subscription store loaded a credential from `auth.json`.
 anthropic_subscription_ready: bool,
 openai_subscription_ready: bool,
+/// Whether the Console store loaded a minted key from `auth.json`.
+anthropic_console_ready: bool,
 /// Valid account-specific context windows discovered for known OpenAI models.
 /// Empty means every subscription model uses its compiled fallback.
 openai_subscription_context_windows: std.ArrayList(ContextWindow),
@@ -55,7 +58,7 @@ pub const Login = union(enum) {
     },
 };
 
-/// Open both subscription stores, load any stored credential, and take the
+/// Open the OAuth login stores, load any stored credential, and take the
 /// environment API keys. A malformed `auth.json` surfaces here and is not
 /// silently ignored.
 pub fn init(
@@ -67,10 +70,13 @@ pub fn init(
 ) !Accounts {
     var anthropic_auth = try anthropic.Auth.init(gpa, io, home, timeouts);
     errdefer anthropic_auth.deinit();
+    var anthropic_console_auth = try anthropic.ConsoleAuth.init(gpa, io, home, timeouts);
+    errdefer anthropic_console_auth.deinit();
     var openai_auth = try openai.Auth.init(gpa, io, home, timeouts);
     errdefer openai_auth.deinit();
 
     const anthropic_ready = try anthropic_auth.load();
+    const anthropic_console_ready = try anthropic_console_auth.load();
     const openai_ready = try openai_auth.load();
 
     var accounts: Accounts = .{
@@ -78,10 +84,12 @@ pub fn init(
         .io = io,
         .timeouts = timeouts,
         .anthropic_auth = anthropic_auth,
+        .anthropic_console_auth = anthropic_console_auth,
         .openai_auth = openai_auth,
         .keys = keys,
         .anthropic_subscription_ready = anthropic_ready,
         .openai_subscription_ready = openai_ready,
+        .anthropic_console_ready = anthropic_console_ready,
         .openai_subscription_context_windows = .empty,
     };
     if (openai_ready) accounts.refreshOpenaiSubscriptionModels();
@@ -91,27 +99,29 @@ pub fn init(
 pub fn deinit(self: *Accounts) void {
     self.openai_subscription_context_windows.deinit(self.gpa);
     self.anthropic_auth.deinit();
+    self.anthropic_console_auth.deinit();
     self.openai_auth.deinit();
 }
 
 /// Whether `account` has a usable credential: an env key for an API account,
-/// or a loaded subscription token for a subscription account.
+/// or a loaded credential for a login account.
 pub fn isAuthenticated(self: *const Accounts, account: llm.Account) bool {
     return switch (account) {
         .anthropic_api => self.keys.anthropic != null,
         .anthropic_subscription => self.anthropic_subscription_ready,
         .openai_api => self.keys.openai != null,
         .openai_subscription => self.openai_subscription_ready,
+        .anthropic_console => self.anthropic_console_ready,
     };
 }
 
 /// The first authenticated account, or null when none is. The session's active
 /// account is chosen this way at startup (there is no configured active
-/// account). A stored subscription is preferred over a paid API key, across
+/// account). A signed-in login is preferred over an environment API key, across
 /// vendors. Within a tier, enum declaration order decides.
 pub fn firstAuthenticated(self: *const Accounts) ?llm.Account {
     for (std.enums.values(llm.Account)) |account| {
-        if (account.isSubscription() and self.isAuthenticated(account)) return account;
+        if (account.hasLogin() and self.isAuthenticated(account)) return account;
     }
     for (std.enums.values(llm.Account)) |account| {
         if (self.isAuthenticated(account)) return account;
@@ -131,6 +141,10 @@ pub fn client(self: *Accounts, account: llm.Account) ?provider.Client {
         .openai_api => .{ .openai_api = self.keys.openai orelse return null },
         .openai_subscription => if (self.openai_subscription_ready)
             .{ .openai_subscription = &self.openai_auth }
+        else
+            return null,
+        .anthropic_console => if (self.anthropic_console_ready)
+            .{ .anthropic_console = self.anthropic_console_auth.apiKey() orelse return null }
         else
             return null,
     };
@@ -163,8 +177,8 @@ pub fn listModels(
     for (out.items[start..]) |*model| model.* = self.resolveModel(account, model.*);
 }
 
-/// Run the interactive OAuth login for a subscription `account`, mark its
-/// committed replacement authenticated, and return its persistence outcome. An
+/// Run the interactive OAuth login for `account`, mark its committed
+/// replacement authenticated, and return its persistence outcome. An
 /// API account has no login (its key comes from the environment), so it is an
 /// error. No error is returned after the credential has been replaced.
 pub fn login(self: *Accounts, account: llm.Account, prompt: anytype) !Login {
@@ -180,6 +194,11 @@ pub fn login(self: *Accounts, account: llm.Account, prompt: anytype) !Login {
             self.refreshOpenaiSubscriptionModels();
             break :committed committed_login;
         },
+        .anthropic_console => committed: {
+            const committed_login = try self.anthropic_console_auth.login(prompt);
+            self.anthropic_console_ready = true;
+            break :committed committed_login;
+        },
         .anthropic_api, .openai_api => return error.ApiAccountHasNoLogin,
     };
     return switch (provider_login) {
@@ -191,7 +210,7 @@ pub fn login(self: *Accounts, account: llm.Account, prompt: anytype) !Login {
     };
 }
 
-/// Drop a subscription `account`'s stored credentials and mark it no longer
+/// Drop a login `account`'s stored credentials and mark it no longer
 /// authenticated. An API account has no login to drop (its key comes from the
 /// environment), so it is an error.
 pub fn logout(self: *Accounts, account: llm.Account) !void {
@@ -204,6 +223,10 @@ pub fn logout(self: *Accounts, account: llm.Account) !void {
             try self.openai_auth.logout();
             self.openai_subscription_ready = false;
             self.openai_subscription_context_windows.clearAndFree(self.gpa);
+        },
+        .anthropic_console => {
+            try self.anthropic_console_auth.logout();
+            self.anthropic_console_ready = false;
         },
         .anthropic_api, .openai_api => return error.ApiAccountHasNoLogout,
     }
@@ -249,10 +272,12 @@ fn testAccounts(keys: ApiKeys, anthropic_ready: bool, openai_ready: bool) Accoun
         .io = std.testing.io,
         .timeouts = .{},
         .anthropic_auth = undefined,
+        .anthropic_console_auth = undefined,
         .openai_auth = undefined,
         .keys = keys,
         .anthropic_subscription_ready = anthropic_ready,
         .openai_subscription_ready = openai_ready,
+        .anthropic_console_ready = false,
         .openai_subscription_context_windows = .empty,
     };
 }
@@ -279,6 +304,10 @@ test "isAuthenticated and firstAuthenticated read keys and readiness, subscripti
         llm.Account.openai_subscription,
         cross_vendor.firstAuthenticated().?,
     );
+
+    var console_first = testAccounts(.{}, false, true);
+    console_first.anthropic_console_ready = true;
+    try std.testing.expectEqual(llm.Account.anthropic_console, console_first.firstAuthenticated().?);
 
     var none = testAccounts(.{}, false, false);
     try std.testing.expect(none.firstAuthenticated() == null);
