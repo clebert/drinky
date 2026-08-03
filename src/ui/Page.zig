@@ -20,11 +20,19 @@ header_source: []const u8,
 content: []const u8,
 /// First rendered body row visible below the fixed header.
 scroll: usize,
-/// Source location retained when width or presentation changes.
-source_offset: usize,
+/// Source location of the top body row, retained across a width or presentation
+/// change. Null after a scroll, which leaves the location unmapped: the map
+/// costs one pass over the content, and only a reflow needs it.
+source_offset: ?usize,
 presentation: Presentation,
+/// The width the cached row math below is laid out for. Zero before the first
+/// reflow.
 layout_columns: usize,
+/// The presentation the cached row math below is laid out for.
 layout_presentation: Presentation,
+/// Body rows the content occupies in the laid-out width and presentation. It
+/// costs one pass over the content, so a scroll step reads it from here.
+layout_rows: usize,
 
 pub const Presentation = enum { markdown, source };
 
@@ -57,6 +65,7 @@ pub fn init(gpa: std.mem.Allocator, options: *const Options) !Page {
         .presentation = options.presentation,
         .layout_columns = 0,
         .layout_presentation = options.presentation,
+        .layout_rows = 0,
     };
 }
 
@@ -67,21 +76,28 @@ pub fn deinit(self: *Page) void {
 }
 
 /// Preserve the current source location across width and presentation changes,
-/// and clamp the window after height changes.
+/// and clamp the window after height changes. Only a layout change passes over
+/// the content, so one scroll step costs no pass. A fast scroll delivers many
+/// steps per frame, and each one must stay cheap.
 pub fn reflow(self: *Page, size: terminal.View.Size) void {
     const columns = @max(size.columns, 1);
     const layout_changed = columns != self.layout_columns or
         self.presentation != self.layout_presentation;
     if (layout_changed) {
-        self.scroll = self.rowAtSource(size, self.source_offset);
+        // Map the top row to a source location in the old layout, then find that
+        // location again in the new one.
+        const source_offset = self.sourceOffset();
         self.layout_columns = columns;
         self.layout_presentation = self.presentation;
+        self.layout_rows = self.totalRows();
+        self.scroll = self.rowAtSource(source_offset);
+        self.source_offset = source_offset;
     }
 
     const scroll_max = self.scrollMax(size);
     if (self.scroll > scroll_max) {
         self.scroll = scroll_max;
-        self.source_offset = self.sourceAtRow(size, self.scroll);
+        self.source_offset = null;
     }
 }
 
@@ -118,7 +134,6 @@ pub fn moveEnd(self: *Page, size: terminal.View.Size) void {
 /// Toggle between rendered Markdown and exact source around the same source line.
 pub fn toggleSource(self: *Page, size: terminal.View.Size) void {
     self.reflow(size);
-    self.source_offset = self.sourceAtRow(size, self.scroll);
     self.presentation = switch (self.presentation) {
         .markdown => .source,
         .source => .markdown,
@@ -199,45 +214,56 @@ fn bodyRows(size: terminal.View.Size) usize {
     return @max(size.rows, 1) - 1;
 }
 
-fn totalRows(self: *const Page, size: terminal.View.Size) usize {
-    return switch (self.presentation) {
-        .markdown => markdown.rows(self.content, size.columns),
-        .source => terminal.width.rows(self.content, @max(size.columns, 1)),
+/// Body rows the content occupies in the laid-out width and presentation.
+fn totalRows(self: *const Page) usize {
+    const columns = @max(self.layout_columns, 1);
+    return switch (self.layout_presentation) {
+        .markdown => markdown.rows(self.content, columns),
+        .source => terminal.width.rows(self.content, columns),
     };
 }
 
 fn scrollMax(self: *const Page, size: terminal.View.Size) usize {
-    return self.totalRows(size) -| bodyRows(size);
+    std.debug.assert(self.layout_columns == @max(size.columns, 1));
+    return self.layout_rows -| bodyRows(size);
 }
 
 fn setScroll(self: *Page, size: terminal.View.Size, row: usize) void {
-    self.scroll = @min(row, self.scrollMax(size));
-    self.source_offset = self.sourceAtRow(size, self.scroll);
+    const scroll = @min(row, self.scrollMax(size));
+    if (scroll == self.scroll) return;
+    self.scroll = scroll;
+    self.source_offset = null;
 }
 
-fn sourceAtRow(self: *const Page, size: terminal.View.Size, row: usize) usize {
-    return switch (self.presentation) {
+/// The source location of the top body row in the laid-out width and
+/// presentation. A scroll leaves the location unmapped, so this maps it.
+fn sourceOffset(self: *const Page) usize {
+    return self.source_offset orelse self.sourceAtRow(self.scroll);
+}
+
+fn sourceAtRow(self: *const Page, row: usize) usize {
+    return switch (self.layout_presentation) {
         .markdown => markdown.sourceAtRow(self.content, &.{
-            .columns = size.columns,
+            .columns = self.layout_columns,
             .row = row,
         }),
-        .source => self.sourceOffsetAtRow(size, row),
+        .source => self.sourceOffsetAtRow(row),
     };
 }
 
-fn rowAtSource(self: *const Page, size: terminal.View.Size, source_offset: usize) usize {
-    return switch (self.presentation) {
+fn rowAtSource(self: *const Page, source_offset: usize) usize {
+    return switch (self.layout_presentation) {
         .markdown => markdown.rowAtSource(self.content, &.{
-            .columns = size.columns,
+            .columns = self.layout_columns,
             .source_offset = source_offset,
         }),
-        .source => self.sourceRowAtOffset(size, source_offset),
+        .source => self.sourceRowAtOffset(source_offset),
     };
 }
 
-fn sourceRowAtOffset(self: *const Page, size: terminal.View.Size, source_offset: usize) usize {
+fn sourceRowAtOffset(self: *const Page, source_offset: usize) usize {
     const target = @min(source_offset, self.content.len);
-    var iterator = terminal.width.wrapper(self.content, @max(size.columns, 1));
+    var iterator = terminal.width.wrapper(self.content, @max(self.layout_columns, 1));
     var result: usize = 0;
     var index: usize = 0;
     while (iterator.next()) |row| : (index += 1) {
@@ -248,8 +274,8 @@ fn sourceRowAtOffset(self: *const Page, size: terminal.View.Size, source_offset:
     return result;
 }
 
-fn sourceOffsetAtRow(self: *const Page, size: terminal.View.Size, target: usize) usize {
-    var iterator = terminal.width.wrapper(self.content, @max(size.columns, 1));
+fn sourceOffsetAtRow(self: *const Page, target: usize) usize {
+    var iterator = terminal.width.wrapper(self.content, @max(self.layout_columns, 1));
     var index: usize = 0;
     while (iterator.next()) |row| : (index += 1) {
         if (index == target) return @intFromPtr(row.ptr) - @intFromPtr(self.content.ptr);
@@ -316,15 +342,17 @@ test "source reflow preserves the byte location across width changes" {
     defer page.deinit();
     const narrow: terminal.View.Size = .{ .columns = 5, .rows = 2 };
 
+    // A scroll leaves the location unmapped, and the reflow into the new width
+    // maps it back.
     page.moveDown(narrow);
     try std.testing.expectEqual(@as(usize, 1), page.scroll);
-    try std.testing.expectEqual(@as(usize, 5), page.source_offset);
+    try std.testing.expectEqual(@as(?usize, null), page.source_offset);
     page.reflow(.{ .columns = 10, .rows = 2 });
     try std.testing.expectEqual(@as(usize, 0), page.scroll);
-    try std.testing.expectEqual(@as(usize, 5), page.source_offset);
+    try std.testing.expectEqual(@as(?usize, 5), page.source_offset);
     page.reflow(narrow);
     try std.testing.expectEqual(@as(usize, 1), page.scroll);
-    try std.testing.expectEqual(@as(usize, 5), page.source_offset);
+    try std.testing.expectEqual(@as(?usize, 5), page.source_offset);
 }
 
 test "markdown is default and source toggles around the same logical line" {
@@ -346,11 +374,11 @@ test "markdown is default and source toggles around the same logical line" {
     try std.testing.expect(std.mem.indexOf(u8, rendered, "**bold**") == null);
 
     page.moveEnd(size);
-    const source_offset = page.source_offset;
+    const source_offset = page.sourceOffset();
     try std.testing.expect(source_offset > 0);
     page.toggleSource(size);
     try std.testing.expect(page.presentation == .source);
-    try std.testing.expectEqual(source_offset, page.source_offset);
+    try std.testing.expectEqual(@as(?usize, source_offset), page.source_offset);
     const source = try renderForTest(&page, size);
     defer gpa.free(source);
     try std.testing.expect(std.mem.indexOf(u8, source, "M: Render") != null);
@@ -358,12 +386,12 @@ test "markdown is default and source toggles around the same logical line" {
 
     const narrow: terminal.View.Size = .{ .columns = 20, .rows = 6 };
     page.reflow(narrow);
-    try std.testing.expectEqual(source_offset, page.source_offset);
+    try std.testing.expectEqual(@as(?usize, source_offset), page.source_offset);
     page.toggleSource(narrow);
     try std.testing.expect(page.presentation == .markdown);
-    try std.testing.expectEqual(source_offset, page.source_offset);
+    try std.testing.expectEqual(@as(?usize, source_offset), page.source_offset);
     page.reflow(size);
-    try std.testing.expectEqual(source_offset, page.source_offset);
+    try std.testing.expectEqual(@as(?usize, source_offset), page.source_offset);
 }
 
 test "source rendering is bounded and sanitizes terminal controls" {
