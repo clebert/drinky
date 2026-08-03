@@ -15,7 +15,10 @@ const tool = @import("tool/root.zig");
 
 const Agent = @This();
 
-const rounds_max = 50;
+/// The per-turn bound on tool rounds. It is a guard against a runaway loop, not
+/// a budget. A long task must never reach it. The user cancels a turn with Esc,
+/// and a real loop grows the prompt until it hits the context limit first.
+const rounds_max = 1000;
 
 /// The placeholder shown for a redacted reasoning block (its content is encrypted).
 const redacted_notice = "[redacted thinking]";

@@ -10,7 +10,7 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 ## Talking to it
 
 - A prompt runs a turn to completion: stream a reply, run its tools, feed the results back, repeat.
-- At most 50 tool rounds per turn.
+- At most 1000 tool rounds per turn, as a guard against a runaway loop.
 - Read-only tool calls in one reply run in parallel. A mutating call — write, edit, or bash — runs
   alone, in call order.
 - Enter during a turn queues a steering message that folds into the run at the next tool round.

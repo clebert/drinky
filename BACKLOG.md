@@ -131,8 +131,6 @@ dependency on another item. Module layout and extension seams live in `AGENTS.md
 
 ## Configuration
 
-- [ ] **Configurable tool-round cap** — the 50-round per-turn cap moves into `config.json`. _Clamp
-      to at least one round._
 - [ ] **Configurable transcript window** — the 8-page transcript window moves into `config.json` and
       trades scrollback retention against per-frame redraw cost. _Clamp to at least one page._
 - [ ] **Fold new settings into `config.json`** — the skill, agent, and prompt directories join it
