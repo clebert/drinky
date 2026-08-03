@@ -268,6 +268,14 @@ const OauthPrompt = struct {
     }
 };
 
+/// The guidance sources of one startup report. Both instruction results have the
+/// same type, so the field names keep the two apart at the call site.
+const Sources = struct {
+    user_instructions: *const ai.instructions.Result,
+    project_instructions: *const ai.instructions.Result,
+    skills: *const ai.skills.Registry,
+};
+
 fn validateWorkingDirectory(gpa: std.mem.Allocator, path: []const u8) !void {
     if (std.unicode.utf8ValidateSlice(path)) return;
     const safe_path = try ai.instructions.diagnosticAlloc(gpa, path);
@@ -374,9 +382,11 @@ pub fn run(
             "the {s} account. Pith uses the model \"{s}\" for this account.",
         .{ dropped.name, dropped.account.label(), self.defaultModel(dropped.account).name },
     );
-    try self.reportInstructions(&config.user_instructions);
-    try self.reportInstructions(&self.project_instructions);
-    try self.reportNotices(self.skills.notices());
+    try self.reportSources(&.{
+        .user_instructions = &config.user_instructions,
+        .project_instructions = &self.project_instructions,
+        .skills = &self.skills,
+    });
     // No account signed in: open the login picker (the same one /login opens) so
     // the user chooses how to sign in.
     if (!self.signedIn()) {
@@ -1280,16 +1290,49 @@ fn reportNotice(
     );
 }
 
-/// Report what one instruction source loaded, then what it skipped, so both
-/// sources keep one shape in the startup report.
-fn reportInstructions(self: *App, result: *const ai.instructions.Result) !void {
-    const noun = result.source.noun();
-    for (result.files()) |file| {
-        const safe_path = try ai.instructions.displayAlloc(self.gpa, file.path);
-        defer self.gpa.free(safe_path);
-        try self.recordEvent(.information, "Pith loaded the {s} file {s}.", .{ noun, safe_path });
+/// Report one count line for the guidance that pith holds, then what each source
+/// skipped. The counts keep the startup report short, because a normal load has
+/// nothing the user must act on. `/system` shows the path of every counted file.
+/// A count of zero stays out of the line, so a run with no guidance and no
+/// skipped file reports nothing.
+fn reportSources(self: *App, sources: *const Sources) !void {
+    var line: std.Io.Writer.Allocating = .init(self.gpa);
+    defer line.deinit();
+    const user_count = sources.user_instructions.files().len;
+    const project_count = sources.project_instructions.files().len;
+    if (user_count > 0 or project_count > 0) {
+        try line.writer.writeAll("Pith loaded");
+        if (user_count > 0) try line.writer.print(
+            " {d} user instruction file{s}",
+            .{ user_count, pluralSuffix(user_count) },
+        );
+        if (user_count > 0 and project_count > 0) try line.writer.writeAll(" and");
+        if (project_count > 0) try line.writer.print(
+            " {d} project instruction file{s}",
+            .{ project_count, pluralSuffix(project_count) },
+        );
+        try line.writer.writeByte('.');
     }
-    try self.reportNotices(result.notices());
+    // The catalog counts the skills the model can see, which is what `/system`
+    // shows. Pith only finds a skill here and advertises its name and its
+    // description. The instructions stay on disk until the skill runs.
+    const skill_count = sources.skills.catalog().count();
+    if (skill_count > 0) {
+        if (line.written().len > 0) try line.writer.writeByte(' ');
+        try line.writer.print(
+            "Pith found {d} skill{s}.",
+            .{ skill_count, pluralSuffix(skill_count) },
+        );
+    }
+    if (line.written().len > 0) try self.recordEvent(.information, "{s}", .{line.written()});
+    try self.reportNotices(sources.user_instructions.notices());
+    try self.reportNotices(sources.project_instructions.notices());
+    try self.reportNotices(sources.skills.notices());
+}
+
+/// The English plural suffix that agrees with `count`.
+fn pluralSuffix(count: usize) []const u8 {
+    return if (count == 1) "" else "s";
 }
 
 /// Report the startup messages of one instruction source. The instruction files
@@ -3277,6 +3320,130 @@ test "a transcript event survives later typing" {
     try std.testing.expectEqual(@as(usize, 1), blocks.len);
     try std.testing.expect(blocks[0].event.is_error);
     try std.testing.expectEqualStrings("backend failed", blocks[0].event.text.items);
+}
+
+/// The absolute path of `suffix` inside a test temporary directory.
+fn tmpPath(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    tmp: *const std.testing.TmpDir,
+    suffix: []const u8,
+) ![]u8 {
+    const cwd = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cwd);
+    return std.fs.path.join(gpa, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, suffix });
+}
+
+test "the startup report counts the sources in one line and keeps a skip verbose" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // The `.git` marker bounds both ancestor scans, so the enclosing repository
+    // cannot add its own instruction files or skills to the counts.
+    var git = try tmp.dir.createDirPathOpen(io, ".git", .{});
+    git.close(io);
+    try tmp.dir.writeFile(io, .{ .sub_path = "AGENTS.md", .data = "Project.\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "first.md", .data = "First.\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "second.md", .data = "Second.\n" });
+    var skill = try tmp.dir.createDirPathOpen(io, ".agents/skills/demo", .{});
+    skill.close(io);
+    try tmp.dir.writeFile(io, .{
+        .sub_path = ".agents/skills/demo/SKILL.md",
+        .data = "---\nname: demo\ndescription: a test skill\n---\nbody\n",
+    });
+    var hidden = try tmp.dir.createDirPathOpen(io, ".agents/skills/hidden", .{});
+    hidden.close(io);
+    try tmp.dir.writeFile(io, .{
+        .sub_path = ".agents/skills/hidden/SKILL.md",
+        .data = "---\nname: hidden\ndescription: a manual skill\n" ++
+            "disable-model-invocation: true\n---\nbody\n",
+    });
+    const root = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(root);
+    const user_skills = try std.fs.path.join(gpa, &.{ root, "home", ".agents", "skills" });
+    defer gpa.free(user_skills);
+
+    var app: App = undefined;
+    app.gpa = gpa;
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+    var user_instructions = try ai.instructions.load(gpa, io, &.{
+        .directory = root,
+        .paths = &.{ "first.md", "second.md", "missing.md" },
+    });
+    defer user_instructions.deinit();
+    app.project_instructions = try ai.instructions.discover(gpa, io, root);
+    defer app.project_instructions.deinit();
+    app.skills = try ai.skills.discover(gpa, io, &.{
+        .user_root = user_skills,
+        .project_start = root,
+    });
+    defer app.skills.deinit();
+
+    try app.reportSources(&.{
+        .user_instructions = &user_instructions,
+        .project_instructions = &app.project_instructions,
+        .skills = &app.skills,
+    });
+
+    const blocks = app.session.transcript.blocks();
+    try std.testing.expectEqual(@as(usize, 2), blocks.len);
+    try std.testing.expect(!blocks[0].event.is_error);
+    // The count covers the two skills the scan kept, minus the one that disabled
+    // model invocation, because `/system` never shows that one.
+    try std.testing.expectEqualStrings(
+        "Pith loaded 2 user instruction files and 1 project instruction file. " ++
+            "Pith found 1 skill.",
+        blocks[0].event.text.items,
+    );
+    // A source that skipped something stays verbose, because the user must fix it.
+    try std.testing.expect(blocks[1].event.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, blocks[1].event.text.items, "missing.md") != null);
+}
+
+test "a startup with no guidance and no skipped file reports nothing" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var git = try tmp.dir.createDirPathOpen(io, ".git", .{});
+    git.close(io);
+    const root = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(root);
+    const user_skills = try std.fs.path.join(gpa, &.{ root, "home", ".agents", "skills" });
+    defer gpa.free(user_skills);
+
+    var app: App = undefined;
+    app.gpa = gpa;
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+    var user_instructions = try ai.instructions.load(gpa, io, &.{
+        .directory = root,
+        .paths = &.{},
+    });
+    defer user_instructions.deinit();
+    app.project_instructions = try ai.instructions.discover(gpa, io, root);
+    defer app.project_instructions.deinit();
+    app.skills = try ai.skills.discover(gpa, io, &.{
+        .user_root = user_skills,
+        .project_start = root,
+    });
+    defer app.skills.deinit();
+
+    try app.reportSources(&.{
+        .user_instructions = &user_instructions,
+        .project_instructions = &app.project_instructions,
+        .skills = &app.skills,
+    });
+
+    try std.testing.expectEqual(@as(usize, 0), app.session.transcript.blocks().len);
 }
 
 test "cancel draining preserves non-turn events ahead of newer queue data" {

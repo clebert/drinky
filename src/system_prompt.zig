@@ -106,12 +106,12 @@ fn writeInstructions(
 ) !void {
     try writer.print("\n\n## {s}\n\n<{s}>\n", .{ options.title, options.tag });
     for (options.files) |file| {
-        try writer.writeAll("  <instructions_file path=\"");
+        try writer.writeAll("  <instruction_file path=\"");
         try writePath(gpa, writer, file.path);
         try writer.writeAll("\">\n");
         try writer.writeAll(file.content);
         if (!std.mem.endsWith(u8, file.content, "\n")) try writer.writeByte('\n');
-        try writer.writeAll("  </instructions_file>\n");
+        try writer.writeAll("  </instruction_file>\n");
     }
     try writer.print("</{s}>", .{options.tag});
 }
@@ -404,12 +404,12 @@ test "composition orders sections and preserves instruction Markdown" {
         prompt,
         "## Project instructions\n\n" ++
             "<project_instructions>\n" ++
-            "  <instructions_file path=\"",
+            "  <instruction_file path=\"",
     ) != null);
     try std.testing.expect(std.mem.indexOf(
         u8,
         prompt,
-        "  </instructions_file>\n</project_instructions>\n\n## Skills",
+        "  </instruction_file>\n</project_instructions>\n\n## Skills",
     ) != null);
     const broad_index = std.mem.indexOf(u8, prompt, "# Broad").?;
     const specific_index = std.mem.indexOf(u8, prompt, "\">\nspecific\n").?;
@@ -460,12 +460,12 @@ test "configured user instructions have their own section" {
             "sources.\n\n" ++
             "## User instructions\n\n" ++
             "<user_instructions>\n" ++
-            "  <instructions_file path=\"/home/a&amp;b/first.md\">\n" ++
+            "  <instruction_file path=\"/home/a&amp;b/first.md\">\n" ++
             "# Tone\n\nKeep <xml> && shell operators.\n" ++
-            "  </instructions_file>\n" ++
-            "  <instructions_file path=\"/home/second.md\">\n" ++
+            "  </instruction_file>\n" ++
+            "  <instruction_file path=\"/home/second.md\">\n" ++
             "Use direct language.\n" ++
-            "  </instructions_file>\n" ++
+            "  </instruction_file>\n" ++
             "</user_instructions>",
         prompt,
     );

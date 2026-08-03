@@ -38,14 +38,14 @@ dependency on another item. Module layout and extension seams live in `AGENTS.md
 
 ## Instructions & subagents
 
-- [x] **User instructions** — pith loads the configured files in order and reports each file it
-      loaded or skipped. _Set `user_instructions` to an ordered array in `~/.pith/config.json`. Each
-      item has one `path`. Resolve relative paths from `~/.pith/`. Each path must obey the same
-      policy as a project instruction file: a regular UTF-8 file, with content, no NUL byte, and at
-      most 32 KiB, inside a source total of 32 files and 64 KiB. pith reports the file it skips and
-      the reason. pith inspects at most 32 entries and reports the rest. A repeated file loads once,
-      because the canonical path is its identity. A bad entry never stops pith. The core always
-      comes from the binary._
+- [x] **User instructions** — pith loads the configured files in order, counts them at startup, and
+      reports each file it skipped. _Set `user_instructions` to an ordered array in
+      `~/.pith/config.json`. Each item has one `path`. Resolve relative paths from `~/.pith/`. Each
+      path must obey the same policy as a project instruction file: a regular UTF-8 file, with
+      content, no NUL byte, and at most 32 KiB, inside a source total of 32 files and 64 KiB. pith
+      reports the file it skips and the reason. pith inspects at most 32 entries and reports the
+      rest. A repeated file loads once, because the canonical path is its identity. A bad entry
+      never stops pith. The core always comes from the binary._
 - [x] **Project instructions** — the system prompt includes the applicable `AGENTS.md` files. _At
       startup, load exact-case files from the nearest Git root through the working directory in
       path order. Outside Git, inspect only the working directory. There is no global file or

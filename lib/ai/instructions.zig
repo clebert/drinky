@@ -27,7 +27,7 @@ pub const Source = enum {
     user,
     project,
 
-    pub fn noun(self: Source) []const u8 {
+    fn noun(self: Source) []const u8 {
         return switch (self) {
             .user => "user instruction",
             .project => "project instruction",

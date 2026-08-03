@@ -160,11 +160,14 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - The compiled core is minimal and mechanical, so the user owns the guidance that steers a turn.
 - The system prompt adds the startup UTC date, the working directory, and the repository root. It
   also ranks the instruction sources it carries, so the model knows which one wins on a conflict.
-- pith loads exact-case `AGENTS.md` files in path order and reports each file it loaded or skipped.
+- pith loads exact-case `AGENTS.md` files in path order.
 - pith discovers skills recursively from `~/.agents/skills/` and project `.agents/skills/`
   directories and follows directory symlinks. Their names and descriptions are advertised while
   their instructions load on demand.
-- pith loads the user instruction files that `config.json` names, in order, and reports each one.
+- pith loads the user instruction files that `config.json` names, in order.
+- One startup line counts the instruction files that pith loaded and the skills that it found. A
+  count of zero stays out of the line. Only a skipped file gets its own line, and `/system` shows
+  every counted path.
 - User and project instructions obey one policy: a regular UTF-8 file, with content, no NUL byte,
   and at most 32 KiB. Each source loads at most 32 files and 64 KiB, and one file loads once even
   when two paths or a symbolic link reach it. pith reports what it skips.
