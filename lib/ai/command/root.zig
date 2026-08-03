@@ -3,11 +3,10 @@
 
 const std = @import("std");
 
+const skills = @import("../skills.zig");
+
 pub const Context = @import("Context.zig");
 pub const Outcome = Context.Outcome;
-
-const skills = @import("../skills.zig");
-const testing = @import("testing.zig");
 
 const effort = @import("effort.zig");
 const login = @import("login.zig");
@@ -15,6 +14,7 @@ const logout = @import("logout.zig");
 const model = @import("model.zig");
 const new = @import("new.zig");
 const system = @import("system.zig");
+const testing = @import("testing.zig");
 
 const Entry = struct {
     name: []const u8,
@@ -77,7 +77,7 @@ fn runSkill(context: *Context, line: []const u8, command_name: []const u8) !Outc
         return Outcome.reportNotice(
             context.gpa,
             .failure,
-            "Pith could not load the skill {s} because of technical error {s}.",
+            "Pith could not load the skill {s} because of error {s}.",
             .{ name, @errorName(err) },
         );
     };

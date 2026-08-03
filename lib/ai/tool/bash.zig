@@ -2,14 +2,14 @@
 //! stdout and stderr, bounded to a tail window and a wall-clock timeout.
 //! Sanitizes the output to valid UTF-8 so it can serialize as a JSON tool result.
 
-const builtin = @import("builtin");
 const std = @import("std");
+const builtin = @import("builtin");
 
 const llm = @import("../llm.zig");
 const net = @import("../net.zig");
 const Context = @import("Context.zig");
-const Result = @import("Result.zig");
 const parse = @import("parse.zig");
+const Result = @import("Result.zig");
 
 /// The hard cap on captured output. Beyond this, Pith stops the command and
 /// does not buffer without bound. The configured window keeps only the tail
@@ -97,7 +97,7 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
         else => return Result.report(
             gpa,
             .err,
-            "Pith could not run the command because of technical error {s}.",
+            "Pith could not run the command because of error {s}.",
             .{@errorName(err)},
         ),
     };

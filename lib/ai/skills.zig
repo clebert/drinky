@@ -4,12 +4,13 @@
 
 const std = @import("std");
 
+const instructions = @import("instructions.zig");
 const skill_header = @import("skill_header.zig");
 
 const entries_visited_max = 100_000;
 const candidates_retained_max = 1024;
 const skills_max = 1024;
-const warnings_max = 1024;
+const notices_max = 1024;
 const skill_file_bytes_max = 16 << 20;
 
 pub const Skill = struct {
@@ -115,9 +116,11 @@ pub const Catalog = struct {
 pub const Registry = struct {
     gpa: std.mem.Allocator,
     skill_items: std.ArrayList(Skill) = .empty,
-    warning_items: std.ArrayList([]const u8) = .empty,
+    /// The startup messages of the scan, in the shape every instruction source
+    /// reports, so the app has one way to show them all.
+    notice_items: std.ArrayList(instructions.Notice) = .empty,
     skills_capped: bool = false,
-    warnings_capped: bool = false,
+    notices_capped: bool = false,
 
     pub fn init(gpa: std.mem.Allocator) Registry {
         return .{ .gpa = gpa };
@@ -126,8 +129,8 @@ pub const Registry = struct {
     pub fn deinit(self: *Registry) void {
         for (self.skill_items.items) |*skill| skill.deinit(self.gpa);
         self.skill_items.deinit(self.gpa);
-        for (self.warning_items.items) |warning| self.gpa.free(warning);
-        self.warning_items.deinit(self.gpa);
+        for (self.notice_items.items) |notice| self.gpa.free(notice.text);
+        self.notice_items.deinit(self.gpa);
         self.* = undefined;
     }
 
@@ -139,8 +142,8 @@ pub const Registry = struct {
         return Catalog.initBounded(self.skill_items.items);
     }
 
-    pub fn warnings(self: *const Registry) []const []const u8 {
-        return self.warning_items.items;
+    pub fn notices(self: *const Registry) []const instructions.Notice {
+        return self.notice_items.items;
     }
 
     pub fn get(self: *const Registry, name: []const u8) ?*const Skill {
@@ -155,7 +158,7 @@ pub const Registry = struct {
             if (err == error.FileNotFound) return;
             if (err == error.Canceled or err == error.OutOfMemory) return err;
             try self.warn(
-                "Pith could not scan the skill directory {s} because of technical error {s}.",
+                "Pith could not scan the skill directory {s} because of error {s}.",
                 .{ root, @errorName(err) },
             );
             return;
@@ -193,7 +196,7 @@ pub const Registry = struct {
                 if (err == error.Canceled or err == error.OutOfMemory) return err;
                 if (attempt == entries_visited_max) traversal_capped = true;
                 try self.warn(
-                    "Pith skipped one entry in {s} because of technical error {s}.",
+                    "Pith skipped one entry in {s} because of error {s}.",
                     .{ root, @errorName(err) },
                 );
                 continue;
@@ -207,8 +210,7 @@ pub const Registry = struct {
                 .directory => walker.enter(io, entry) catch |err| {
                     if (err == error.Canceled or err == error.OutOfMemory) return err;
                     try self.warn(
-                        "Pith could not scan the skill directory {s}/{s} because of " ++
-                            "technical error {s}.",
+                        "Pith could not scan the skill directory {s}/{s} because of error {s}.",
                         .{ root, entry.path, @errorName(err) },
                     );
                 },
@@ -251,7 +253,7 @@ pub const Registry = struct {
         const stat = entry.dir.statFile(io, entry.basename, .{}) catch |err| {
             if (err == error.Canceled or err == error.OutOfMemory) return err;
             if (err != error.FileNotFound) try self.warn(
-                "Pith could not resolve the symbolic link {s}/{s} because of technical error {s}.",
+                "Pith could not resolve the symbolic link {s}/{s} because of error {s}.",
                 .{ root, entry.path, @errorName(err) },
             );
             return;
@@ -280,8 +282,7 @@ pub const Registry = struct {
                 walker.enter(io, link) catch |err| {
                     if (err == error.Canceled or err == error.OutOfMemory) return err;
                     try self.warn(
-                        "Pith could not follow the symbolic link {s}/{s} because of " ++
-                            "technical error {s}.",
+                        "Pith could not follow the symbolic link {s}/{s} because of error {s}.",
                         .{ root, entry.path, @errorName(err) },
                     );
                 };
@@ -308,7 +309,7 @@ pub const Registry = struct {
         ) catch |err| {
             if (err == error.Canceled or err == error.OutOfMemory) return err;
             try self.warn(
-                "Pith could not read the skill file {s} because of technical error {s}.",
+                "Pith could not read the skill file {s} because of error {s}.",
                 .{ path, @errorName(err) },
             );
             return;
@@ -460,7 +461,7 @@ pub const Registry = struct {
             if (err == error.FileNotFound) return false;
             if (err == error.Canceled or err == error.OutOfMemory) return err;
             try self.warn(
-                "Pith could not inspect the repository marker {s} because of technical error {s}.",
+                "Pith could not inspect the repository marker {s} because of error {s}.",
                 .{ path, @errorName(err) },
             );
             // To cross a repository boundary is worse than to miss skills below
@@ -470,22 +471,25 @@ pub const Registry = struct {
         return true;
     }
 
+    /// Record one message about the scan. Every one of them reports something
+    /// the user must fix, so they all carry `.failure`.
     fn warn(
         self: *Registry,
         comptime format: []const u8,
         args: anytype,
     ) !void {
-        if (self.warnings_capped) return;
-        if (self.warning_items.items.len == warnings_max - 1) {
-            const notice = try self.gpa.dupe(u8, "Pith omitted more skill warnings.");
-            errdefer self.gpa.free(notice);
-            try self.warning_items.append(self.gpa, notice);
-            self.warnings_capped = true;
+        if (self.notices_capped) return;
+        if (self.notice_items.items.len == notices_max - 1) {
+            const text = try self.gpa.dupe(u8, "Pith omitted the remaining messages about the " ++
+                "skill files.");
+            errdefer self.gpa.free(text);
+            try self.notice_items.append(self.gpa, .{ .severity = .failure, .text = text });
+            self.notices_capped = true;
             return;
         }
-        const content = try std.fmt.allocPrint(self.gpa, format, args);
-        errdefer self.gpa.free(content);
-        try self.warning_items.append(self.gpa, content);
+        const text = try std.fmt.allocPrint(self.gpa, format, args);
+        errdefer self.gpa.free(text);
+        try self.notice_items.append(self.gpa, .{ .severity = .failure, .text = text });
     }
 };
 
@@ -715,7 +719,7 @@ test "discovery is recursive and project skills shadow user and ancestor skills"
     try std.testing.expectEqualStrings("nearest copy", registry.get("shared").?.description);
     try std.testing.expect(registry.get("other") != null);
     try std.testing.expect(registry.get("outside") == null);
-    try std.testing.expect(registry.warnings().len >= 2);
+    try std.testing.expect(registry.notices().len >= 2);
 }
 
 test "invalid names fall back, empty descriptions skip, and hidden skills stay out of catalog" {
@@ -842,9 +846,10 @@ test "a skill whose path is not valid UTF-8 is skipped with a safe warning" {
     try registry.loadPath(undefined, "user/\xff\xfe/SKILL.md", .user);
 
     try std.testing.expectEqual(@as(usize, 0), registry.items().len);
-    try std.testing.expectEqual(@as(usize, 1), registry.warnings().len);
-    const warning = registry.warnings()[0];
-    try std.testing.expect(std.mem.indexOf(u8, warning, "not valid UTF-8") != null);
+    try std.testing.expectEqual(@as(usize, 1), registry.notices().len);
+    const notice = registry.notices()[0];
+    try std.testing.expectEqual(instructions.Notice.Severity.failure, notice.severity);
+    try std.testing.expect(std.mem.indexOf(u8, notice.text, "not valid UTF-8") != null);
     // The raw bytes must not reach the transcript verbatim.
-    try std.testing.expect(std.mem.indexOf(u8, warning, "\\xff") != null);
+    try std.testing.expect(std.mem.indexOf(u8, notice.text, "\\xff") != null);
 }

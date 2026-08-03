@@ -1,17 +1,15 @@
-# AGENTS.md
-
 Pith is a minimal, dependency-free coding-agent harness in Zig, inspired by pi. Its focus is a
 hand-rolled terminal UI renderer for modern terminals such as Ghostty.
 
-## Layout
+### Layout
 
 The project has three modules, wired in `build.zig`. Imports flow one way: `pith` depends on both
 libs, and the libs never import each other or the app. The module boundary makes a back-edge a
 compile error:
 
 - `lib/terminal/`: the reusable terminal rendering engine (`Tty`, `escape`, the reconciling `View`
-  renderer, `Input`, the UAX #29 `grapheme` segmenter, and the display-`width` math built on it).
-  It knows nothing about the app or the agent.
+  renderer, `Input`, the UAX #29 `grapheme` segmenter, and the display-`width` math built on it). It
+  knows nothing about the app or the agent.
 - `lib/ai/`: the provider-neutral agent core (`Agent`, `llm`, `models`, `provider`, `command`,
   `tool`, `anthropic`).
 - `src/`: the `pith` app. It contains `main`, `App` (the composition root and event loop), the
@@ -24,14 +22,14 @@ place where re-exports are allowed. A test only runs if its file is reachable fr
 Because of this, `test-audit.sh` fails CI when the number of tests that ran differs from the number
 declared in source.
 
-## Features
+### Features
 
 `FEATURES.md` is a human-readable overview of what pith supports, with one short sentence per
 capability. Keep it current. When you land a capability, add its line and mark the matching
 `BACKLOG.md` item done, if one exists. When a capability goes away, delete its line. Keep the file
 short. It is an orientation document, not a spec. The tests are what guard against regressions.
 
-## Writing style
+### Writing style
 
 Write all human-readable prose in ASD-STE100 Simplified Technical English. This covers all Markdown
 files, the code comments, and every pith-generated user-facing string. Apply these practical rules:
@@ -48,13 +46,13 @@ files, the code comments, and every pith-generated user-facing string. Apply the
   case with end punctuation. A label, metric, or control hint can stay a fragment. Give a fragment
   clear casing and a colon between its key or action and its value (`Context: 42%`, `Esc: Cancel`).
 - Wrap a dynamic error name in a complete sentence:
-  `Pith could not open {path} because of technical error {name}.`
+  `Pith could not open {path} because of error {name}.`
 
 The rules do not cover provider, model, user, or shell output. They also do not cover literal
 technical identifiers (command names, flags, JSON keys, tool argument schemas). Preserve the meaning
 and the terminal-width limits when you reword a string.
 
-## CI
+### CI
 
 After code changes, always run:
 

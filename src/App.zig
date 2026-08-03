@@ -36,7 +36,7 @@ const openai_default = ai.models.get(.openai, "gpt-5.6-sol") orelse
     @compileError("default openai model is not in the model table");
 const effort: ai.llm.Effort = .xhigh;
 
-const intro_text = "Pith — Enter: Send · Shift+Enter: New line · Esc: Cancel · " ++
+const intro_text = "Enter: Send · Shift+Enter: New line · Esc: Cancel · " ++
     "Ctrl+C: Clear · Ctrl+C twice: Quit · Ctrl+D: Quit";
 
 /// Two Ctrl+C presses within this window quit. A lone press clears the editor.
@@ -59,9 +59,9 @@ accounts: ai.Accounts,
 /// The configured default model per account, so an account switch mid-session
 /// (a `/model`, `/login`, or `/logout`) resolves the same model as startup.
 default_models: Config.DefaultModels,
-/// Repository instructions, runtime skill metadata, and their combined prompt.
-/// All outlive the agent, which borrows `prompt`.
-instructions: ai.instructions.Result,
+/// Project instructions, skill metadata, and the composed prompt. All outlive
+/// the agent, which borrows `prompt`.
+project_instructions: ai.instructions.Result,
 skills: ai.skills.Registry,
 prompt: []const u8,
 agent: ai.Agent,
@@ -251,7 +251,7 @@ const OauthPrompt = struct {
         );
         try self.writeText(path);
         try self.writer.print(
-            " because of technical error {s}. The sign-in stays active until Pith exits.\n",
+            " because of error {s}. The sign-in stays active until Pith exits.\n",
             .{error_name},
         );
         try self.writer.flush();
@@ -311,15 +311,15 @@ pub fn run(
     defer gpa.free(cwd);
     try validateWorkingDirectory(gpa, cwd);
 
-    const config = try Config.load(gpa, io, home);
+    var config = try Config.load(gpa, io, &.{ .working_directory = cwd, .home = home });
     defer config.deinit(gpa);
 
     self.accounts = try ai.Accounts.init(gpa, io, home, config.timeouts, api_keys);
     defer self.accounts.deinit();
     self.default_models = config.default_models;
 
-    self.instructions = try ai.instructions.discover(gpa, io, cwd);
-    defer self.instructions.deinit();
+    self.project_instructions = try ai.instructions.discover(gpa, io, cwd);
+    defer self.project_instructions.deinit();
     const user_skills = try std.fs.path.resolve(gpa, &.{ cwd, home, ".agents", "skills" });
     defer gpa.free(user_skills);
     self.skills = try ai.skills.discover(gpa, io, &.{
@@ -329,8 +329,10 @@ pub fn run(
     defer self.skills.deinit();
     self.prompt = try system_prompt.compose(gpa, &.{
         .core = system_prompt.default_core,
+        .current_time = std.Io.Clock.real.now(io),
         .working_directory = cwd,
-        .instructions = &self.instructions,
+        .user_instructions = config.user_instructions.files(),
+        .project_instructions = &self.project_instructions,
         .skills = self.skills.catalog(),
     });
     defer gpa.free(self.prompt);
@@ -368,24 +370,13 @@ pub fn run(
     // a wrong-vendor entry does not disappear silently.
     for (config.dropped_defaults) |dropped| try self.recordEvent(
         .failure,
-        "The default model \"{s}\" is not valid for {s}. Pith uses {s}.",
+        "Pith ignored the configured default model \"{s}\" because the model is not valid for " ++
+            "the {s} account. Pith uses the model \"{s}\" for this account.",
         .{ dropped.name, dropped.account.label(), self.defaultModel(dropped.account).name },
     );
-    for (self.instructions.entries()) |entry| {
-        const safe_path = try ai.instructions.displayAlloc(gpa, entry.path);
-        defer gpa.free(safe_path);
-        try self.recordEvent(.information, "Pith loaded the instructions from {s}.", .{safe_path});
-    }
-    for (self.instructions.warnings()) |warning| {
-        const safe_warning = try ai.instructions.displayAlloc(gpa, warning);
-        defer gpa.free(safe_warning);
-        try self.recordEvent(.failure, "{s}", .{safe_warning});
-    }
-    for (self.skills.warnings()) |warning| {
-        const safe_warning = try ai.instructions.displayAlloc(gpa, warning);
-        defer gpa.free(safe_warning);
-        try self.recordEvent(.failure, "{s}", .{safe_warning});
-    }
+    try self.reportInstructions(&config.user_instructions);
+    try self.reportInstructions(&self.project_instructions);
+    try self.reportNotices(self.skills.notices());
     // No account signed in: open the login picker (the same one /login opens) so
     // the user chooses how to sign in.
     if (!self.signedIn()) {
@@ -705,7 +696,7 @@ fn runTurnWorker(self: *App, text: []const u8, generation: u64) WorkerResult {
                 else
                     std.fmt.allocPrint(
                         self.gpa,
-                        "Pith could not complete the turn because of technical error {s}.",
+                        "Pith could not complete the turn because of error {s}.",
                         .{@errorName(err)},
                     ) catch null;
         },
@@ -1201,7 +1192,7 @@ fn loginAccount(self: *App, account: ai.llm.Account) !void {
         .saved => {},
         .memory_only => |failure| try self.recordEvent(
             .failure,
-            "Pith could not save the credentials for {s} to {s} because of technical error {s}. " ++
+            "Pith could not save the credentials for {s} to {s} because of error {s}. " ++
                 "The sign-in stays active until Pith exits.",
             .{ account.label(), failure.path, @errorName(failure.save_error) },
         ),
@@ -1219,7 +1210,7 @@ fn reportLoginFailure(self: *App, login_error: anyerror) !void {
             "set a browser time limit.",
         else => return self.reportNotice(
             .failure,
-            "Pith could not sign in because of technical error {s}.",
+            "Pith could not sign in because of error {s}.",
             .{@errorName(login_error)},
         ),
     };
@@ -1236,7 +1227,7 @@ fn logoutAccount(self: *App, account: ai.llm.Account) !void {
     self.accounts.logout(account) catch |err| {
         return self.reportNotice(
             .failure,
-            "Pith could not sign out because of technical error {s}.",
+            "Pith could not sign out because of error {s}.",
             .{@errorName(err)},
         );
     };
@@ -1287,6 +1278,33 @@ fn reportNotice(
     try self.session.applyOutcome(
         try ai.command.Outcome.reportNotice(self.gpa, severity, format, args),
     );
+}
+
+/// Report what one instruction source loaded, then what it skipped, so both
+/// sources keep one shape in the startup report.
+fn reportInstructions(self: *App, result: *const ai.instructions.Result) !void {
+    const noun = result.source.noun();
+    for (result.files()) |file| {
+        const safe_path = try ai.instructions.displayAlloc(self.gpa, file.path);
+        defer self.gpa.free(safe_path);
+        try self.recordEvent(.information, "Pith loaded the {s} file {s}.", .{ noun, safe_path });
+    }
+    try self.reportNotices(result.notices());
+}
+
+/// Report the startup messages of one instruction source. The instruction files
+/// and the skill files both report through here. An empty file is housekeeping,
+/// so its message reads as information rather than as a failure.
+fn reportNotices(self: *App, notices: []const ai.instructions.Notice) !void {
+    for (notices) |notice| {
+        const safe_text = try ai.instructions.displayAlloc(self.gpa, notice.text);
+        defer self.gpa.free(safe_text);
+        const severity: ai.command.Outcome.Severity = switch (notice.severity) {
+            .information => .information,
+            .failure => .failure,
+        };
+        try self.recordEvent(severity, "{s}", .{safe_text});
+    }
 }
 
 /// Record one durable event in the transcript.
@@ -1477,7 +1495,7 @@ test "turn producers keep their captured generation" {
     try std.testing.expectEqual(generation, result.generation);
     try std.testing.expect(result.terminal_queued);
     try std.testing.expectEqualStrings(
-        "Pith could not complete the turn because of technical error SignedOut.",
+        "Pith could not complete the turn because of error SignedOut.",
         result.error_text.?,
     );
 

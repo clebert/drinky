@@ -41,8 +41,8 @@ pub fn report(
     return .{ .content = try std.fmt.allocPrint(gpa, format, args), .is_error = status == .err };
 }
 
-/// Report an I/O failure as a complete sentence with the operation, path, and
-/// technical error. Cancellation propagates so the aborted turn stops at once.
+/// Report an I/O failure as a complete sentence with the operation, path,
+/// and error. Cancellation propagates so the aborted turn stops at once.
 pub fn cannot(
     gpa: std.mem.Allocator,
     err: anyerror,
@@ -53,7 +53,7 @@ pub fn cannot(
     return report(
         gpa,
         .err,
-        "Pith could not " ++ verb ++ " {s} because of technical error {s}.",
+        "Pith could not " ++ verb ++ " {s} because of error {s}.",
         .{ path, @errorName(err) },
     );
 }

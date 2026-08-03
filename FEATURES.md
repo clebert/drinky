@@ -157,13 +157,19 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 
 ## Files & configuration
 
-- Exact-case `AGENTS.md` files load from the nearest Git root through the working directory,
-  broad-to-specific, with bounded startup diagnostics.
+- The compiled core is minimal and mechanical, so the user owns the guidance that steers a turn.
+- The system prompt adds the startup UTC date, the working directory, and the repository root. It
+  also ranks the instruction sources it carries, so the model knows which one wins on a conflict.
+- pith loads exact-case `AGENTS.md` files in path order and reports each file it loaded or skipped.
 - pith discovers skills recursively from `~/.agents/skills/` and project `.agents/skills/`
   directories and follows directory symlinks. Their names and descriptions are advertised while
   their instructions load on demand.
-- `~/.pith/config.json` is optional: request timeouts, retry policy, the bash output caps and
-  timeout, and a default model per account.
+- pith loads the user instruction files that `config.json` names, in order, and reports each one.
+- User and project instructions obey one policy: a regular UTF-8 file, with content, no NUL byte,
+  and at most 32 KiB. Each source loads at most 32 files and 64 KiB, and one file loads once even
+  when two paths or a symbolic link reach it. pith reports what it skips.
+- `~/.pith/config.json` is optional: paths for user instructions, request and bash limits, and a
+  default model per account.
 - It holds no secrets. API keys come from `ANTHROPIC_API_KEY` and `OPENAI_API_KEY`.
 - A configured model that is not valid for its account is reported, and the compiled default used.
 - `HOME` must be set, since both config and credentials live under `~/.pith`.

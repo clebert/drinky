@@ -38,14 +38,19 @@ dependency on another item. Module layout and extension seams live in `AGENTS.md
 
 ## Instructions & subagents
 
-- [ ] **Custom system prompt** — explicitly configured files can replace or extend the authored
-      core. _Generated environment, project-instruction, and skill sections remain._
+- [x] **User instructions** — pith loads the configured files in order and reports each file it
+      loaded or skipped. _Set `user_instructions` to an ordered array in `~/.pith/config.json`. Each
+      item has one `path`. Resolve relative paths from `~/.pith/`. Each path must obey the same
+      policy as a project instruction file: a regular UTF-8 file, with content, no NUL byte, and at
+      most 32 KiB, inside a source total of 32 files and 64 KiB. pith reports the file it skips and
+      the reason. pith inspects at most 32 entries and reports the rest. A repeated file loads once,
+      because the canonical path is its identity. A bad entry never stops pith. The core always
+      comes from the binary._
 - [x] **Project instructions** — the system prompt includes the applicable `AGENTS.md` files. _At
-      startup, load exact-case files from the nearest Git root through the working directory,
-      broad-to-specific. Outside Git, inspect only the working directory. There is no global file or
-      `CLAUDE.md` fallback. Warn when pith finds and ignores `CLAUDE.md` or a likely-misspelled
-      `AGENT.md`. Discovery, bounds, ordering, and diagnostics follow
-      `docs/project-instructions.md`._
+      startup, load exact-case files from the nearest Git root through the working directory in
+      path order. Outside Git, inspect only the working directory. There is no global file or
+      `CLAUDE.md` fallback. Report the file that is not valid. Report an ignored `CLAUDE.md` or a
+      likely-misspelled `AGENT.md`._
 - [ ] **Custom prompts** — user-maintained prompt templates run as slash commands with argument
       substitution.
 - [x] **Skills** — on-demand instruction files: pith advertises the names and descriptions to the
@@ -130,6 +135,5 @@ dependency on another item. Module layout and extension seams live in `AGENTS.md
       to at least one round._
 - [ ] **Configurable transcript window** — the 8-page transcript window moves into `config.json` and
       trades scrollback retention against per-frame redraw cost. _Clamp to at least one page._
-- [ ] **Fold new settings into `config.json`** — the system prompt path and the skill, agent, and
-      prompt directories join it as they land. _API keys stay env-only. No secrets go into a
-      shareable file._
+- [ ] **Fold new settings into `config.json`** — the skill, agent, and prompt directories join it
+      as they land. _API keys stay env-only. No secrets go into a shareable file._
