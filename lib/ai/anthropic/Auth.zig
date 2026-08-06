@@ -5,7 +5,7 @@
 const std = @import("std");
 
 const auth = @import("../auth.zig");
-const auth_store = @import("../auth_store.zig");
+const json_store = @import("../json_store.zig");
 const net = @import("../net.zig");
 const oauth_callback = @import("../oauth_callback.zig");
 const oauth_wire = @import("../oauth_wire.zig");
@@ -175,7 +175,7 @@ test "an expired access token is refreshed and re-persisted" {
     );
     try std.testing.expectEqualStrings("next", subject.tokens.?.refresh);
 
-    var file = (try auth_store.open(gpa, std.testing.io, path)).?;
+    var file = (try json_store.open(gpa, std.testing.io, path)).?;
     defer file.deinit();
     try std.testing.expectEqualStrings("next", file.entry(account_key).?.get("refresh").?.string);
 }
@@ -209,7 +209,7 @@ test "a cancel landing at the save cannot lose the rotated credential" {
     try future.cancel(io);
 
     try std.testing.expectEqualStrings("next", subject.tokens.?.refresh);
-    var file = (try auth_store.open(gpa, io, path)).?;
+    var file = (try json_store.open(gpa, io, path)).?;
     defer file.deinit();
     try std.testing.expectEqualStrings("next", file.entry(account_key).?.get("refresh").?.string);
 }

@@ -1,6 +1,10 @@
 //! `/effort`: a picker over the reasoning-effort levels. The picker preselects
 //! the current one. A selection switches the level from the next turn. The
 //! command ignores any argument.
+//!
+//! The level belongs to the active account, and the status line hides it while
+//! no account is active. A signed-out `/effort` therefore refuses, the same way
+//! `/model` does, rather than change a level the user cannot see.
 
 const std = @import("std");
 
@@ -13,6 +17,13 @@ pub const name = "effort";
 const levels = std.enums.values(llm.Effort);
 
 pub fn run(context: *Context) !Context.Outcome {
+    if (context.agent.client == null)
+        return Context.Outcome.reportNotice(
+            context.gpa,
+            .failure,
+            "Sign in to an account before you select an effort level.",
+            .{},
+        );
     var options: Context.Outcome.Options = .{ .gpa = context.gpa };
     errdefer options.deinit();
     var current: ?usize = null;
@@ -69,6 +80,20 @@ test "the picker lists every level, preselecting the current one" {
         },
         else => return error.ExpectedPick,
     }
+}
+
+test "the picker refuses while no account is active" {
+    const gpa = std.testing.allocator;
+    var agent = testing.agent(gpa, .{ .anthropic_subscription = undefined });
+    defer agent.deinit();
+    agent.setEffort(.high);
+    agent.signOut();
+    var context: Context = .{ .gpa = gpa, .io = undefined, .agent = &agent, .accounts = undefined };
+
+    // The status line hides the level while signed out, so a change here would
+    // be invisible and would never reach the machine-local state.
+    try Context.Outcome.expectNotice(try run(&context), .failure);
+    try std.testing.expectEqual(llm.Effort.high, agent.effort);
 }
 
 test "select applies the level at a row index, rejecting out of range" {

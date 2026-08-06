@@ -4,12 +4,13 @@
 //! interactive login (browser + loopback callback). Generic over each
 //! provider's `Auth` file struct (`gpa`/`io`/`timeouts`/`path`/`tokens`
 //! fields): the on-disk entry mirrors the provider's `Tokens` fields. Every
-//! save is a load-merge-write through `auth_store` that never clobbers another
-//! account's entry.
+//! save is a load-merge-write through `json_store` that never clobbers another
+//! account's entry. A store file Pith cannot parse is a bad credential file, so
+//! every call translates that failure into `error.BadCredentials`.
 
 const std = @import("std");
 
-const auth_store = @import("auth_store.zig");
+const json_store = @import("json_store.zig");
 const oauth_callback = @import("oauth_callback.zig");
 const oauth_login = @import("oauth_login.zig");
 const oauth_wire = @import("oauth_wire.zig");
@@ -28,7 +29,10 @@ pub const Login = union(enum) {
 /// Returns false when the file is absent or holds no `account_key` entry (the
 /// account is simply signed out).
 pub fn load(auth: anytype, comptime account_key: []const u8) !bool {
-    var file = (try auth_store.open(auth.gpa, auth.io, auth.path)) orelse return false;
+    var file = (json_store.open(auth.gpa, auth.io, auth.path) catch |err| switch (err) {
+        error.CorruptStore => return error.BadCredentials,
+        else => return err,
+    }) orelse return false;
     defer file.deinit();
     const entry = file.entry(account_key) orelse return false;
 
@@ -136,7 +140,10 @@ pub fn logout(auth: anytype, comptime account_key: []const u8) !void {
     // Remove the on-disk entry first: a failed remove then leaves the credentials
     // fully intact (in memory and the caller's readiness flag). Logout is atomic
     // and cannot leave a token-less account still marked authenticated.
-    try auth_store.remove(auth.gpa, auth.io, auth.path, account_key);
+    json_store.remove(auth.gpa, auth.io, auth.path, account_key) catch |err| switch (err) {
+        error.CorruptStore => return error.BadCredentials,
+        else => return err,
+    };
     if (auth.tokens) |tokens| tokens.deinit(auth.gpa);
     auth.tokens = null;
 }
@@ -145,7 +152,11 @@ pub fn logout(auth: anytype, comptime account_key: []const u8) !void {
 /// `Tokens` fields verbatim.
 pub fn save(auth: anytype, comptime account_key: []const u8) !void {
     const tokens = auth.tokens orelse return error.NotAuthenticated;
-    try auth_store.save(auth.gpa, auth.io, auth.path, account_key, tokens);
+    json_store.save(auth.gpa, auth.io, auth.path, account_key, tokens, .{}) catch |err|
+        switch (err) {
+            error.CorruptStore => return error.BadCredentials,
+            else => return err,
+        };
 }
 
 const CallbackSource = struct {
@@ -230,7 +241,7 @@ test "a failed persist returns memory-only login and keeps credentials usable" {
         .saved => |path| try std.testing.expectEqualStrings(subject.path, path),
         .memory_only => return error.UnexpectedLoginPersistence,
     }
-    var file = (try auth_store.open(gpa, io, subject.path)).?;
+    var file = (try json_store.open(gpa, io, subject.path)).?;
     defer file.deinit();
     try std.testing.expect(file.entry("test_account") != null);
 }

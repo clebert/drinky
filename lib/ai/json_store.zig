@@ -1,13 +1,18 @@
-//! The provider-keyed `auth.json` that both credential stores share: a
-//! top-level object that maps each account key to that account's token entry.
-//! Owns the file shape only. Each provider owns its entry fields (passed as
-//! `anytype`). Nothing here knows a token shape.
+//! A keyed JSON object file: one top-level object that maps each key to that
+//! key's entry. The credential store uses the account as the key. The app state
+//! store uses the project. This module owns the file shape only. The caller owns
+//! its entry fields (passed as `anytype`), so nothing here knows an entry shape.
+//!
+//! Every write is a load-merge-write that preserves every other key and lands
+//! through an atomic rename at owner-only permissions. A file it cannot parse is
+//! `error.CorruptStore` rather than a fresh start, so no write can wipe a key it
+//! could not read.
 
 const std = @import("std");
 
 const json = @import("json.zig");
 
-/// A parsed `auth.json` that owns its backing memory and answers entry lookups.
+/// A parsed store file that owns its backing memory and answers entry lookups.
 /// Open with `open`. Free with `deinit`.
 pub const File = struct {
     parsed: std.json.Parsed(std.json.Value),
@@ -23,8 +28,17 @@ pub const File = struct {
     }
 };
 
-/// Open the `auth.json` at `path`, or null when it does not exist. A present
-/// file that is not a JSON object is `error.BadCredentials`. Caller frees a
+/// How many keys a save can leave in the file.
+pub const SaveOptions = struct {
+    /// The number of top-level keys the file can hold after the save. The
+    /// rewrite drops the oldest keys first, in the order the file holds them. A
+    /// save appends its own key last, so the file order is the write order.
+    /// Null keeps every key.
+    keys_max: ?usize = null,
+};
+
+/// Open the store file at `path`, or null when it does not exist. A present
+/// file that is not a JSON object is `error.CorruptStore`. Caller frees a
 /// non-null result with `File.deinit`.
 pub fn open(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !?File {
     const data = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .unlimited) catch |err|
@@ -36,19 +50,20 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !?File {
 
     const parsed = try std.json.parseFromSlice(std.json.Value, gpa, data, .{});
     errdefer parsed.deinit();
-    if (parsed.value != .object) return error.BadCredentials;
+    if (parsed.value != .object) return error.CorruptStore;
     return .{ .parsed = parsed };
 }
 
-/// Persist `entry` under `key` in the `auth.json` at `path`. The save creates
+/// Persist `entry` under `key` in the store file at `path`. The save creates
 /// the parent directory and preserves every other top-level key already
-/// present. The write uses owner-only permissions.
+/// present, up to `options.keys_max`. The write uses owner-only permissions.
 pub fn save(
     gpa: std.mem.Allocator,
     io: std.Io,
     path: []const u8,
     key: []const u8,
     entry: anytype,
+    options: SaveOptions,
 ) !void {
     if (std.fs.path.dirname(path)) |dir| {
         std.Io.Dir.cwd().createDirPath(io, dir) catch |err| switch (err) {
@@ -56,10 +71,10 @@ pub fn save(
             else => return err,
         };
     }
-    try rewrite(gpa, io, path, key, entry);
+    try rewrite(gpa, io, path, key, entry, options);
 }
 
-/// Remove `key` from the `auth.json` at `path` and rewrite every other entry
+/// Remove `key` from the store file at `path` and rewrite every other entry
 /// verbatim. A missing file is a no-op — nothing to remove.
 pub fn remove(
     gpa: std.mem.Allocator,
@@ -67,7 +82,7 @@ pub fn remove(
     path: []const u8,
     key: []const u8,
 ) !void {
-    try rewrite(gpa, io, path, key, null);
+    try rewrite(gpa, io, path, key, null, .{});
 }
 
 /// Load-merge-write: read the current file, re-serialize it with `key` rewritten
@@ -78,6 +93,7 @@ fn rewrite(
     path: []const u8,
     key: []const u8,
     entry: anytype,
+    options: SaveOptions,
 ) !void {
     const existing: ?[]u8 = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .unlimited) catch |err|
         switch (err) {
@@ -87,7 +103,7 @@ fn rewrite(
         };
     defer if (existing) |data| gpa.free(data);
 
-    const body = try serialize(gpa, existing, key, entry);
+    const body = try serialize(gpa, existing, key, entry, options);
     defer gpa.free(body);
     try replaceFile(io, path, body);
 }
@@ -106,18 +122,23 @@ fn replaceFile(io: std.Io, path: []const u8, body: []const u8) !void {
     try atomic.replace(io);
 }
 
-/// The whole `auth.json` with `key` set to `entry` — or dropped, for a null
+/// The whole store file with `key` set to `entry` — or dropped, for a null
 /// `entry` — and every other top-level key verbatim. An absent `existing`
 /// starts from a fresh object. An unparseable or non-object one is
-/// `error.BadCredentials` rather than a fresh start: no rewrite can wipe a
-/// sibling account with a fresh start on a file it could not read. The caller
-/// frees the result.
+/// `error.CorruptStore` rather than a fresh start: no rewrite can wipe a
+/// sibling key with a fresh start on a file it could not read. A `keys_max`
+/// drops the oldest keys, which are the ones the file holds first. The saved
+/// key always survives. The caller frees the result.
 fn serialize(
     gpa: std.mem.Allocator,
     existing: ?[]const u8,
     key: []const u8,
     entry: anytype,
+    options: SaveOptions,
 ) ![]u8 {
+    // True for a save, false for a removal. Comptime, because a null `entry` is
+    // the null type rather than a runtime value.
+    const writes_key = @TypeOf(entry) != @TypeOf(null);
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
     var stringify: std.json.Stringify = .{ .writer = &out.writer };
@@ -127,25 +148,47 @@ fn serialize(
         const parsed = std.json.parseFromSlice(std.json.Value, gpa, data, .{}) catch |err|
             switch (err) {
                 error.OutOfMemory => return err,
-                else => return error.BadCredentials,
+                else => return error.CorruptStore,
             };
         defer parsed.deinit();
-        if (parsed.value != .object) return error.BadCredentials;
+        if (parsed.value != .object) return error.CorruptStore;
+        var dropped = dropCount(&parsed.value.object, key, writes_key, options);
         var entries = parsed.value.object.iterator();
         while (entries.next()) |field| {
             // Skip our own entry (rewritten fresh below, or dropped).
             if (std.mem.eql(u8, field.key_ptr.*, key)) continue;
+            // Skip the oldest entries the cap has no room for.
+            if (dropped > 0) {
+                dropped -= 1;
+                continue;
+            }
             try stringify.objectField(field.key_ptr.*);
             try stringify.write(field.value_ptr.*);
         }
     }
-    if (@TypeOf(entry) != @TypeOf(null)) {
+    if (writes_key) {
         try stringify.objectField(key);
         try stringify.write(entry);
     }
     try stringify.endObject();
 
     return out.toOwnedSlice();
+}
+
+/// How many of the keys already in `object` the cap leaves no room for. Set
+/// `writes_key` for a save and clear it for a removal, because a written key
+/// takes one of the slots. Both subtractions saturate: an over-full file and a
+/// cap below one slot are both normal.
+fn dropCount(
+    object: *const std.json.ObjectMap,
+    key: []const u8,
+    writes_key: bool,
+    options: SaveOptions,
+) usize {
+    const keys_max = options.keys_max orelse return 0;
+    const kept = object.count() - @intFromBool(object.contains(key));
+    const room = keys_max -| @intFromBool(writes_key);
+    return kept -| room;
 }
 
 const TestEntry = struct {
@@ -173,7 +216,7 @@ test "File reads keyed entries" {
     );
 }
 
-test "serialize adds an entry, preserving other accounts" {
+test "serialize adds an entry, preserving other keys" {
     const gpa = std.testing.allocator;
     const entry: TestEntry = .{ .access = "at", .refresh = "rt", .expires_ms = 1234 };
 
@@ -182,6 +225,7 @@ test "serialize adds an entry, preserving other accounts" {
         "{\"openai_subscription\":{\"access\":\"keep\"}}",
         "anthropic_subscription",
         entry,
+        .{},
     );
     defer gpa.free(merged);
     const parsed = try std.json.parseFromSlice(std.json.Value, gpa, merged, .{});
@@ -200,7 +244,7 @@ test "serialize from nothing writes just the entry, and replaces its own" {
     const gpa = std.testing.allocator;
     const entry: TestEntry = .{ .access = "new", .refresh = "rt", .expires_ms = 1 };
 
-    const fresh = try serialize(gpa, null, "openai_subscription", entry);
+    const fresh = try serialize(gpa, null, "openai_subscription", entry, .{});
     defer gpa.free(fresh);
     var parsed = try std.json.parseFromSlice(std.json.Value, gpa, fresh, .{});
     defer parsed.deinit();
@@ -217,6 +261,7 @@ test "serialize from nothing writes just the entry, and replaces its own" {
             "\"openai_subscription\":{\"access\":\"old\"}}",
         "openai_subscription",
         entry,
+        .{},
     );
     defer gpa.free(replaced);
     const parsed_replaced = try std.json.parseFromSlice(std.json.Value, gpa, replaced, .{});
@@ -236,16 +281,16 @@ test "serialize errors on an unparseable or non-object existing file" {
     const entry: TestEntry = .{ .access = "at", .refresh = "rt", .expires_ms = 1 };
 
     try std.testing.expectError(
-        error.BadCredentials,
-        serialize(gpa, "{ not valid json", "openai_subscription", entry),
+        error.CorruptStore,
+        serialize(gpa, "{ not valid json", "openai_subscription", entry, .{}),
     );
     try std.testing.expectError(
-        error.BadCredentials,
-        serialize(gpa, "[1,2,3]", "openai_subscription", entry),
+        error.CorruptStore,
+        serialize(gpa, "[1,2,3]", "openai_subscription", entry, .{}),
     );
 }
 
-test "serialize drops a key, preserving other accounts" {
+test "serialize drops a key, preserving other keys" {
     const gpa = std.testing.allocator;
     const merged = try serialize(
         gpa,
@@ -253,6 +298,7 @@ test "serialize drops a key, preserving other accounts" {
             "\"openai_subscription\":{\"access\":\"o\"}}",
         "openai_subscription",
         null,
+        .{},
     );
     defer gpa.free(merged);
     var parsed = try std.json.parseFromSlice(std.json.Value, gpa, merged, .{});
@@ -264,12 +310,53 @@ test "serialize drops a key, preserving other accounts" {
         root.get("anthropic_subscription").?.object.get("access").?.string,
     );
 
-    // The removal of the last account leaves a valid empty object, not a wipe error.
-    const emptied = try serialize(gpa, merged, "anthropic_subscription", null);
+    // The removal of the last key leaves a valid empty object, not a wipe error.
+    const emptied = try serialize(gpa, merged, "anthropic_subscription", null, .{});
     defer gpa.free(emptied);
     var parsed_empty = try std.json.parseFromSlice(std.json.Value, gpa, emptied, .{});
     defer parsed_empty.deinit();
     try std.testing.expectEqual(@as(usize, 0), parsed_empty.value.object.count());
+}
+
+test "a key cap drops the oldest keys and keeps the saved one" {
+    const gpa = std.testing.allocator;
+
+    // Three keys, a cap of two: the oldest key goes and the saved key lands last.
+    const capped = try serialize(
+        gpa,
+        "{\"first\":1,\"second\":2,\"third\":3}",
+        "fourth",
+        4,
+        .{ .keys_max = 2 },
+    );
+    defer gpa.free(capped);
+    var parsed = try std.json.parseFromSlice(std.json.Value, gpa, capped, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 2), parsed.value.object.count());
+    try std.testing.expectEqualStrings("third", parsed.value.object.keys()[0]);
+    try std.testing.expectEqualStrings("fourth", parsed.value.object.keys()[1]);
+
+    // A rewrite of a key already present frees its own slot, so nothing drops.
+    const rewritten = try serialize(
+        gpa,
+        "{\"first\":1,\"second\":2}",
+        "first",
+        9,
+        .{ .keys_max = 2 },
+    );
+    defer gpa.free(rewritten);
+    var parsed_rewritten = try std.json.parseFromSlice(std.json.Value, gpa, rewritten, .{});
+    defer parsed_rewritten.deinit();
+    try std.testing.expectEqual(@as(usize, 2), parsed_rewritten.value.object.count());
+    try std.testing.expectEqual(@as(i64, 9), parsed_rewritten.value.object.get("first").?.integer);
+
+    // The saved key survives a cap with no room at all.
+    const only = try serialize(gpa, "{\"first\":1}", "second", 2, .{ .keys_max = 0 });
+    defer gpa.free(only);
+    var parsed_only = try std.json.parseFromSlice(std.json.Value, gpa, only, .{});
+    defer parsed_only.deinit();
+    try std.testing.expectEqual(@as(usize, 1), parsed_only.value.object.count());
+    try std.testing.expectEqualStrings("second", parsed_only.value.object.keys()[0]);
 }
 
 test "save replaces the file atomically at owner-only permissions" {
@@ -283,7 +370,7 @@ test "save replaces the file atomically at owner-only permissions" {
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/auth.json", .{tmp.sub_path});
     const entry: TestEntry = .{ .access = "at", .refresh = "rt", .expires_ms = 1 };
 
-    try save(gpa, io, path, "openai_subscription", entry);
+    try save(gpa, io, path, "openai_subscription", entry, .{});
     const before = try tmp.dir.statFile(io, "auth.json", .{});
     try std.testing.expectEqual(
         @as(u32, 0o600),
@@ -291,7 +378,7 @@ test "save replaces the file atomically at owner-only permissions" {
     );
 
     // A rewrite lands on a fresh inode — renamed over, never truncated in place.
-    try save(gpa, io, path, "anthropic_subscription", entry);
+    try save(gpa, io, path, "anthropic_subscription", entry, .{});
     const after = try tmp.dir.statFile(io, "auth.json", .{});
     try std.testing.expect(before.inode != after.inode);
 
@@ -320,8 +407,8 @@ test "remove drops only its key on disk, and a missing file opens as null" {
 
     try std.testing.expect((try open(gpa, io, path)) == null);
 
-    try save(gpa, io, path, "openai_subscription", entry);
-    try save(gpa, io, path, "anthropic_subscription", entry);
+    try save(gpa, io, path, "openai_subscription", entry, .{});
+    try save(gpa, io, path, "anthropic_subscription", entry, .{});
     try remove(gpa, io, path, "openai_subscription");
 
     var file = (try open(gpa, io, path)).?;
@@ -346,10 +433,10 @@ test "save and remove refuse a corrupt file, leaving it intact on disk" {
 
     try tmp.dir.writeFile(io, .{ .sub_path = "auth.json", .data = "{ not json" });
     try std.testing.expectError(
-        error.BadCredentials,
-        save(gpa, io, path, "openai_subscription", entry),
+        error.CorruptStore,
+        save(gpa, io, path, "openai_subscription", entry, .{}),
     );
-    try std.testing.expectError(error.BadCredentials, remove(gpa, io, path, "openai_subscription"));
+    try std.testing.expectError(error.CorruptStore, remove(gpa, io, path, "openai_subscription"));
 
     const data = try tmp.dir.readFileAlloc(io, "auth.json", gpa, .unlimited);
     defer gpa.free(data);
@@ -360,7 +447,7 @@ test "serialize errors on a corrupt file" {
     const gpa = std.testing.allocator;
 
     try std.testing.expectError(
-        error.BadCredentials,
-        serialize(gpa, "{ not json", "openai_subscription", null),
+        error.CorruptStore,
+        serialize(gpa, "{ not json", "openai_subscription", null, .{}),
     );
 }

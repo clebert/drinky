@@ -23,6 +23,7 @@ const terminal = @import("terminal");
 
 const Config = @import("Config.zig");
 const Session = @import("Session.zig");
+const State = @import("State.zig");
 const system_prompt = @import("system_prompt.zig");
 const ui = @import("ui/root.zig");
 
@@ -30,11 +31,11 @@ const App = @This();
 
 // The compiled fallback model per vendor, used when config names none for the
 // active account. Resolved at compile time so a bad name is a build error.
-const anthropic_default = ai.models.get(.anthropic, "claude-opus-4-8") orelse
+const anthropic_default = ai.models.get(.anthropic, "claude-opus-5") orelse
     @compileError("default anthropic model is not in the model table");
 const openai_default = ai.models.get(.openai, "gpt-5.6-sol") orelse
     @compileError("default openai model is not in the model table");
-const effort: ai.llm.Effort = .xhigh;
+const effort_default: ai.llm.Effort = .xhigh;
 
 const intro_text = "Enter: Send · Shift+Enter: New line · Esc: Cancel · " ++
     "Ctrl+C: Clear · Ctrl+C twice: Quit · Ctrl+D: Quit";
@@ -55,6 +56,9 @@ accounts: ai.Accounts,
 /// The configured default model per account, so an account switch mid-session
 /// (a `/model`, `/login`, or `/logout`) resolves the same model as startup.
 default_models: Config.DefaultModels,
+/// The machine-local choices of this project: read once at startup, written
+/// whenever the account, the model, or the effort level changes.
+state: State,
 /// Project instructions, skill metadata, and the composed prompt. All outlive
 /// the agent, which borrows `prompt`.
 project_instructions: ai.instructions.Result,
@@ -352,6 +356,15 @@ pub fn run(
 
     self.project_instructions = try ai.instructions.discover(gpa, io, cwd);
     defer self.project_instructions.deinit();
+    // One repository keeps one remembered choice, so the key is its root. Outside
+    // a repository the working directory is the project.
+    self.state = try State.open(gpa, io, &.{
+        .working_directory = cwd,
+        .home = home,
+        .project = self.project_instructions.projectRoot() orelse cwd,
+    });
+    defer self.state.deinit();
+
     const user_skills = try std.fs.path.resolve(gpa, &.{ cwd, home, ".agents", "skills" });
     defer gpa.free(user_skills);
     self.skills = try ai.skills.discover(gpa, io, &.{
@@ -369,21 +382,27 @@ pub fn run(
     });
     defer gpa.free(self.prompt);
 
-    // Start on the first authenticated account, or signed out (no client) when
-    // none is. The login picker opens below to sign in. Pith resolves the model
-    // for the chosen or placeholder account either way, so the status line has one
-    // to show.
-    const active = self.accounts.firstAuthenticated();
+    // Start on the account this project used last, then on the first
+    // authenticated account, or signed out (no client) when none is. The login
+    // picker opens below to sign in. Pith resolves the model for the chosen or
+    // placeholder account either way, so the status line has one to show.
+    const active = self.startAccount();
     const start_account = active orelse .anthropic_subscription;
     const start_client = if (active) |account| self.accounts.client(account) else null;
+    const start_model = self.startModel(start_account);
+    const start_effort = self.startEffort(config.default_effort);
     self.agent = ai.Agent.init(gpa, io, start_client, .{
-        .model = self.defaultModel(start_account),
+        .model = start_model,
         .system = self.prompt,
         .retry = config.retry,
-        .effort = effort,
+        .effort = start_effort,
         .bash = config.bash,
     });
     defer self.agent.deinit();
+    // Startup applies the remembered or the default choices, so it saves nothing.
+    // Only a later change writes the file. A signed-out start has no account to
+    // remember, so the first login records one.
+    if (active) |account| try self.state.seed(account, &start_model, start_effort);
 
     try self.tty.init(io);
     defer self.tty.deinit();
@@ -400,11 +419,17 @@ pub fn run(
     try self.session.transcript.append(.intro, false, intro_text);
     // Surface any configured default-model name that did not resolve, so a typo or
     // a wrong-vendor entry does not disappear silently.
-    for (config.dropped_defaults) |dropped| try self.recordEvent(
+    for (config.dropped_models) |dropped| try self.recordEvent(
         .failure,
         "Pith ignored the configured default model \"{s}\" because the model is not valid for " ++
             "the {s} account. Pith uses the model \"{s}\" for this account.",
         .{ dropped.name, dropped.account.label(), self.defaultModel(dropped.account).name },
+    );
+    if (config.dropped_effort) |dropped| try self.recordEvent(
+        .failure,
+        "Pith ignored the configured default effort level \"{s}\" because Pith does not know " ++
+            "that level. Pith uses the effort level \"{s}\".",
+        .{ dropped, @tagName(self.agent.effort) },
     );
     try self.reportSources(&.{
         .user_instructions = &config.user_instructions,
@@ -769,6 +794,32 @@ fn activeAccount(self: *const App) ?ai.llm.Account {
 /// Whether an account is active. Pith refuses normal messages until a login.
 fn signedIn(self: *const App) bool {
     return self.activeAccount() != null;
+}
+
+/// The account to start on: the one this project used last, when it is still
+/// authenticated, else the first authenticated account. Null when no account is
+/// authenticated.
+fn startAccount(self: *const App) ?ai.llm.Account {
+    if (self.state.start.choice) |choice| {
+        if (self.accounts.isAuthenticated(choice.account)) return choice.account;
+    }
+    return self.accounts.firstAuthenticated();
+}
+
+/// The model `account` resumes on: the one this project used last with this
+/// account, else the account's default model. A remembered model applies only to
+/// the account that ran it, so another account starts on its own default.
+fn startModel(self: *const App, account: ai.llm.Account) ai.models.Model {
+    if (self.state.start.choice) |choice| {
+        if (choice.account == account) return self.accounts.resolveModel(account, choice.model);
+    }
+    return self.defaultModel(account);
+}
+
+/// The effort level to start on: the one this project used last, else the
+/// `configured` default, else the compiled fallback.
+fn startEffort(self: *const App, configured: ?ai.llm.Effort) ai.llm.Effort {
+    return self.state.start.effort orelse configured orelse effort_default;
 }
 
 /// The model to start `account` on: the configured default, else the compiled
@@ -1202,6 +1253,32 @@ fn applyOutcome(self: *App, outcome: ai.command.Outcome) !void {
     self.session.model_shown = self.agent.model;
     self.session.effort_shown = self.agent.effort;
     self.session.account_shown = self.activeAccount();
+    try self.recordState();
+}
+
+/// Remember the account, model, and effort level this project now uses, so the
+/// next start resumes on them. Only a change writes the file. A failed write
+/// never stops the session, because this state is a convenience. The state stops
+/// saving after a failure, so each report lands once and names the way out.
+///
+/// A signed-out session records nothing, because the entry names an account.
+/// This drops no user choice: `/model` and `/effort` both refuse while no
+/// account is active, so the only signed-out change is the sign-in itself.
+fn recordState(self: *App) !void {
+    const account = self.activeAccount() orelse return;
+    self.state.record(account, &self.agent.model, self.agent.effort) catch |err| switch (err) {
+        error.CorruptStore => try self.recordEvent(
+            .failure,
+            "Pith stopped saving the choices of this project because Pith cannot read the " ++
+                "file {s} as a JSON object. Delete that file to let Pith save again.",
+            .{self.state.path},
+        ),
+        else => try self.recordEvent(
+            .failure,
+            "Pith stopped saving the choices of this project to {s} because of error {s}.",
+            .{ self.state.path, @errorName(err) },
+        ),
+    };
 }
 
 /// Log in to `account`, then switch to it on its default model.
@@ -1770,14 +1847,14 @@ test "canceling a turn joins and clears its active worker" {
     var started: std.atomic.Value(bool) = .init(false);
     var stopped: std.atomic.Value(bool) = .init(false);
     const work = struct {
-        const State = struct {
+        const Signals = struct {
             ready: *std.atomic.Value(bool),
             done: *std.atomic.Value(bool),
         };
 
-        fn wait(worker_io: std.Io, state: State) WorkerResult {
-            state.ready.store(true, .release);
-            defer state.done.store(true, .release);
+        fn wait(worker_io: std.Io, signals: Signals) WorkerResult {
+            signals.ready.store(true, .release);
+            defer signals.done.store(true, .release);
             worker_io.sleep(.fromSeconds(60), .awake) catch {};
             return .{
                 .outcome = .{ .receipt = zero_receipt, .disposition = .canceled },
@@ -1785,7 +1862,7 @@ test "canceling a turn joins and clears its active worker" {
             };
         }
     };
-    app.turn_future = try io.concurrent(work.wait, .{ io, work.State{
+    app.turn_future = try io.concurrent(work.wait, .{ io, work.Signals{
         .ready = &started,
         .done = &stopped,
     } });
@@ -3018,6 +3095,8 @@ test "/new clears conversation state without changing the active configuration" 
         .effort = .high,
     });
     defer app.agent.deinit();
+    // A submitted command records the project. This test saves no choice.
+    app.state = .inert(gpa, io);
     app.session = Session.init(gpa, &out.writer, anthropic_default, .high);
     defer app.session.deinit();
 
@@ -3072,6 +3151,8 @@ test "/system opens the composed prompt alone and escape restores the conversati
         .retry = .{},
     });
     defer app.agent.deinit();
+    // A submitted command records the project. This test saves no choice.
+    app.state = .inert(gpa, io);
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
     defer app.session.deinit();
 
@@ -3138,11 +3219,15 @@ test "/system opens the composed prompt alone and escape restores the conversati
     try std.testing.expect(std.mem.indexOf(u8, conversation_bytes, "System prompt") == null);
 }
 
-test "an account-switch command clears the session's quota snapshot" {
+test "an account-switch command clears the quota snapshot and records the project" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(home);
 
     const anthropic_client = ai.provider.Client.init(
         gpa,
@@ -3152,6 +3237,7 @@ test "an account-switch command clears the session's quota snapshot" {
     );
     var app: App = undefined;
     app.gpa = gpa;
+    app.io = io;
     app.agent = ai.Agent.init(gpa, io, anthropic_client, .{
         .model = anthropic_default,
         .system = "",
@@ -3160,6 +3246,13 @@ test "an account-switch command clears the session's quota snapshot" {
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
     defer app.session.deinit();
+    app.state = try State.open(gpa, io, &.{
+        .working_directory = home,
+        .home = home,
+        .project = "/work",
+    });
+    defer app.state.deinit();
+    try app.state.seed(.anthropic_subscription, &anthropic_default, .none);
 
     app.agent.stats.quota = .{
         .secondary = .{ .used_percent = 77, .window_minutes = 10080 },
@@ -3176,6 +3269,112 @@ test "an account-switch command clears the session's quota snapshot" {
     try std.testing.expect(app.session.stats_shown.quota == null);
     try std.testing.expectEqualStrings(openai_default.name, app.session.model_shown.name);
     try std.testing.expectEqual(ai.llm.Account.openai_api, app.session.account_shown.?);
+
+    // The switch also lands in `state.json`, so the next start resumes on it.
+    var file = (try ai.json_store.open(gpa, io, app.state.path)).?;
+    defer file.deinit();
+    const entry = file.entry("/work").?;
+    try std.testing.expectEqualStrings("openai_api", entry.get("account").?.string);
+    try std.testing.expectEqualStrings(openai_default.name, entry.get("model").?.string);
+    try std.testing.expectEqualStrings("none", entry.get("effort").?.string);
+}
+
+test "startup resumes on the account, model, and effort level this project used last" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(home);
+    try State.writeForTest(io, &tmp,
+        \\{ "/work": { "account": "openai_api", "model": "gpt-5.6-luna", "effort": "low" } }
+    );
+
+    var app: App = undefined;
+    app.default_models = .{};
+    app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{
+        .anthropic = "sk-anthropic",
+        .openai = "sk-openai",
+    });
+    defer app.accounts.deinit();
+    app.state = try State.open(gpa, io, &.{
+        .working_directory = home,
+        .home = home,
+        .project = "/work",
+    });
+    defer app.state.deinit();
+
+    // The remembered account wins over the first authenticated one, which is the
+    // Anthropic key here.
+    try std.testing.expectEqual(ai.llm.Account.openai_api, app.startAccount().?);
+    try std.testing.expectEqualStrings("gpt-5.6-luna", app.startModel(.openai_api).name);
+    // A remembered model belongs to the account that ran it. Any other account
+    // starts on its own default.
+    try std.testing.expectEqualStrings(
+        anthropic_default.name,
+        app.startModel(.anthropic_api).name,
+    );
+    // The remembered effort level outranks a configured default.
+    try std.testing.expectEqual(ai.llm.Effort.low, app.startEffort(.max));
+}
+
+test "a signed-out remembered account falls back and the defaults fill the rest" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(home);
+    // The file names an account with no credentials and no effort level.
+    try State.writeForTest(io, &tmp,
+        \\{ "/work": { "account": "openai_api", "model": "gpt-5.6-luna" } }
+    );
+
+    var app: App = undefined;
+    app.default_models = .{};
+    app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{ .anthropic = "sk-anthropic" });
+    defer app.accounts.deinit();
+    app.state = try State.open(gpa, io, &.{
+        .working_directory = home,
+        .home = home,
+        .project = "/work",
+    });
+    defer app.state.deinit();
+
+    try std.testing.expectEqual(ai.llm.Account.anthropic_api, app.startAccount().?);
+    try std.testing.expectEqualStrings(
+        anthropic_default.name,
+        app.startModel(.anthropic_api).name,
+    );
+    // With nothing remembered, the configured default wins, else the compiled one.
+    try std.testing.expectEqual(ai.llm.Effort.medium, app.startEffort(.medium));
+    try std.testing.expectEqual(effort_default, app.startEffort(null));
+}
+
+test "a remembered account does not resume when no account is authenticated" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(home);
+    try State.writeForTest(io, &tmp,
+        \\{ "/work": { "account": "openai_api", "model": "gpt-5.6-luna" } }
+    );
+
+    var app: App = undefined;
+    app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
+    defer app.accounts.deinit();
+    app.state = try State.open(gpa, io, &.{
+        .working_directory = home,
+        .home = home,
+        .project = "/work",
+    });
+    defer app.state.deinit();
+
+    // Startup then runs signed out and opens the login picker.
+    try std.testing.expect(app.state.start.choice != null);
+    try std.testing.expect(app.startAccount() == null);
 }
 
 test "an invoked skill records a compact marker and keeps its task visible" {
@@ -3230,6 +3429,8 @@ test "a signed-out submit is refused with a login prompt" {
         .retry = .{},
     });
     defer app.agent.deinit();
+    // A submitted command records the project. This test saves no choice.
+    app.state = .inert(gpa, io);
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
     defer app.session.deinit();
 
@@ -3260,6 +3461,8 @@ test "a large pasted slash command is classified from expanded text" {
         .retry = .{},
     });
     defer app.agent.deinit();
+    // A submitted command records the project. This test saves no choice.
+    app.state = .inert(gpa, io);
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
     defer app.session.deinit();
 

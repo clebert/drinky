@@ -18,6 +18,9 @@ timeouts: ai.net.Timeouts = .{},
 retry: ai.net.Retry = .{},
 bash: ai.tool.Context.Bash = .{},
 default_models: DefaultModels = .{},
+/// The configured default reasoning-effort level, or null when the file names
+/// none or names an unknown level. The caller falls back to a compiled default.
+default_effort: ?ai.llm.Effort = null,
 /// The user instruction files that `config.json` names, in the configured order,
 /// with the messages the load produced. Owned.
 user_instructions: ai.instructions.Result,
@@ -25,7 +28,11 @@ user_instructions: ai.instructions.Result,
 /// of the wrong vendor for their account). The config keeps them so the app can
 /// tell the user Pith ignored their line. Empty on the built-in default. Owned.
 /// `deinit` frees them.
-dropped_defaults: []const DroppedDefault = &.{},
+dropped_models: []const DroppedModel = &.{},
+/// The configured default effort level that did not resolve. The config keeps it
+/// so the app can tell the user Pith ignored their line. Owned. `deinit` frees
+/// it.
+dropped_effort: ?[]const u8 = null,
 
 /// The configured default model per account, resolved against the compiled model
 /// table. An unset or unknown name is null, so the caller falls back to a
@@ -47,7 +54,7 @@ pub const DefaultModels = struct {
 
 /// A configured default-model name that did not resolve, with the account the
 /// user wrote it under. Owns `name` (duped out of the parsed file).
-pub const DroppedDefault = struct {
+pub const DroppedModel = struct {
     account: ai.llm.Account,
     name: []const u8,
 };
@@ -58,6 +65,7 @@ const File = struct {
     request: Request = .{},
     bash: Bash = .{},
     default_models: DefaultModelsFile = .{},
+    default_effort: ?JsonString = null,
 
     /// A JSON value that must be a string. The default parser for `[]const u8`
     /// also accepts an array of numbers, which turns a mistyped path into bytes
@@ -139,8 +147,9 @@ const bash_default: ai.tool.Context.Bash = .{};
 /// names.
 pub fn deinit(self: *Config, gpa: std.mem.Allocator) void {
     self.user_instructions.deinit();
-    for (self.dropped_defaults) |dropped| gpa.free(dropped.name);
-    gpa.free(self.dropped_defaults);
+    for (self.dropped_models) |dropped| gpa.free(dropped.name);
+    gpa.free(self.dropped_models);
+    if (self.dropped_effort) |name| gpa.free(name);
 }
 
 /// Load `<home>/.pith/config.json`, or the built-in defaults when it is absent.
@@ -194,7 +203,7 @@ fn loadFromData(gpa: std.mem.Allocator, io: std.Io, options: *const DataOptions)
     });
     errdefer user_instructions.deinit();
 
-    var dropped: std.ArrayList(DroppedDefault) = .empty;
+    var dropped: std.ArrayList(DroppedModel) = .empty;
     errdefer {
         for (dropped.items) |item| gpa.free(item.name);
         dropped.deinit(gpa);
@@ -231,6 +240,13 @@ fn loadFromData(gpa: std.mem.Allocator, io: std.Io, options: *const DataOptions)
             File.JsonString.get(names.anthropic_console),
         ),
     };
+    var dropped_effort: ?[]const u8 = null;
+    errdefer if (dropped_effort) |name| gpa.free(name);
+    const default_effort = try resolveEffort(
+        gpa,
+        &dropped_effort,
+        File.JsonString.get(parsed.value.default_effort),
+    );
     return .{
         .timeouts = .{
             .connect_ms = request.connect_timeout_ms,
@@ -247,9 +263,25 @@ fn loadFromData(gpa: std.mem.Allocator, io: std.Io, options: *const DataOptions)
             .timeout_ms = bash.timeout_ms,
         },
         .default_models = default_models,
+        .default_effort = default_effort,
         .user_instructions = user_instructions,
-        .dropped_defaults = try dropped.toOwnedSlice(gpa),
+        .dropped_models = try dropped.toOwnedSlice(gpa),
+        .dropped_effort = dropped_effort,
     };
+}
+
+/// Resolve the configured default effort level. An unknown name resolves to
+/// null. The function also records it in `dropped` so the app can surface it. An
+/// unset name is just null.
+fn resolveEffort(
+    gpa: std.mem.Allocator,
+    dropped: *?[]const u8,
+    name: ?[]const u8,
+) !?ai.llm.Effort {
+    const level = name orelse return null;
+    if (std.meta.stringToEnum(ai.llm.Effort, level)) |resolved| return resolved;
+    dropped.* = try gpa.dupe(u8, level);
+    return null;
 }
 
 /// Resolve a configured model name for `account` against the compiled table for
@@ -258,7 +290,7 @@ fn loadFromData(gpa: std.mem.Allocator, io: std.Io, options: *const DataOptions)
 /// surface it. An unset name is just null.
 fn resolveModel(
     gpa: std.mem.Allocator,
-    dropped: *std.ArrayList(DroppedDefault),
+    dropped: *std.ArrayList(DroppedModel),
     account: ai.llm.Account,
     name: ?[]const u8,
 ) !?ai.models.Model {
@@ -358,11 +390,33 @@ test "load resolves default_models to compiled models, dropping unknown names" {
 
     // The parse records the two present-but-unresolved names for the app to
     // surface. It does not record the valid one or the unset ones.
-    try std.testing.expectEqual(@as(usize, 2), config.dropped_defaults.len);
-    try std.testing.expectEqual(ai.llm.Account.anthropic_api, config.dropped_defaults[0].account);
-    try std.testing.expectEqualStrings("gpt-5.6-sol", config.dropped_defaults[0].name);
-    try std.testing.expectEqual(ai.llm.Account.openai_api, config.dropped_defaults[1].account);
-    try std.testing.expectEqualStrings("nope", config.dropped_defaults[1].name);
+    try std.testing.expectEqual(@as(usize, 2), config.dropped_models.len);
+    try std.testing.expectEqual(ai.llm.Account.anthropic_api, config.dropped_models[0].account);
+    try std.testing.expectEqualStrings("gpt-5.6-sol", config.dropped_models[0].name);
+    try std.testing.expectEqual(ai.llm.Account.openai_api, config.dropped_models[1].account);
+    try std.testing.expectEqualStrings("nope", config.dropped_models[1].name);
+}
+
+test "load resolves default_effort, dropping an unknown level" {
+    var config = try loadDataForTest(
+        \\{ "default_effort": "max" }
+    );
+    defer config.deinit(std.testing.allocator);
+    try std.testing.expectEqual(ai.llm.Effort.max, config.default_effort.?);
+    try std.testing.expect(config.dropped_effort == null);
+
+    var dropped = try loadDataForTest(
+        \\{ "default_effort": "enormous" }
+    );
+    defer dropped.deinit(std.testing.allocator);
+    try std.testing.expect(dropped.default_effort == null);
+    try std.testing.expectEqualStrings("enormous", dropped.dropped_effort.?);
+
+    // An unset level is null, with nothing dropped.
+    var empty = try loadDataForTest("{}");
+    defer empty.deinit(std.testing.allocator);
+    try std.testing.expect(empty.default_effort == null);
+    try std.testing.expect(empty.dropped_effort == null);
 }
 
 test "a configured name must be a JSON string" {
@@ -497,7 +551,7 @@ test "an absent config file loads the built-in defaults" {
     try std.testing.expectEqual(timeouts_default.connect_ms, config.timeouts.connect_ms);
     try std.testing.expectEqual(@as(usize, 0), config.user_instructions.files().len);
     try std.testing.expectEqual(@as(usize, 0), config.user_instructions.notices().len);
-    try std.testing.expectEqual(@as(usize, 0), config.dropped_defaults.len);
+    try std.testing.expectEqual(@as(usize, 0), config.dropped_models.len);
 }
 
 fn checkLoadAllocationFailure(gpa: std.mem.Allocator, io: std.Io, home: []const u8) !void {
@@ -505,7 +559,8 @@ fn checkLoadAllocationFailure(gpa: std.mem.Allocator, io: std.Io, home: []const 
     defer config.deinit(gpa);
     try std.testing.expectEqual(@as(usize, 1), config.user_instructions.files().len);
     try std.testing.expectEqual(@as(usize, 1), config.user_instructions.notices().len);
-    try std.testing.expectEqual(@as(usize, 1), config.dropped_defaults.len);
+    try std.testing.expectEqual(@as(usize, 1), config.dropped_models.len);
+    try std.testing.expect(config.dropped_effort != null);
 }
 
 test "the config load frees every partial allocation" {
@@ -521,7 +576,7 @@ test "the config load frees every partial allocation" {
         .sub_path = "config.json",
         .data =
         \\{ "user_instructions": [{ "path": "first.md" }, { "path": "missing.md" }],
-        \\  "default_models": { "openai_api": "nope" } }
+        \\  "default_models": { "openai_api": "nope" }, "default_effort": "nope" }
         ,
     });
     const home = try tmpPath(gpa, io, &tmp, "");

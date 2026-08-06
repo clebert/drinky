@@ -54,13 +54,16 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - A ChatGPT subscription learns its real context windows after login.
 - Reasoning effort runs `none`, `low`, `medium`, `high`, `xhigh`, `max`, folded to what the model
   supports.
+- A restart resumes on the account, model, and effort level this project used last.
+- `/model` and `/effort` both refuse while signed out, since the status line hides both values then.
 - Session cost and cache savings accumulate per model and count a canceled turn's billed usage.
 
 ## Accounts
 
 - Anthropic and OpenAI, each reachable as a subscription account or a platform API-key account.
 - The Anthropic Console account adds an OAuth login that mints and stores a platform key.
-- Startup takes the first authenticated account and prefers a signed-in login over an API key.
+- Startup resumes on the account this project used last, else takes the first authenticated one
+  and prefers a signed-in login over an API key.
 - With no account at all, the login picker opens by itself.
 - While signed out, pith refuses a message with a prompt to `/login`.
 - Reasoning replays only to the account that produced it. A login or logout discards the rest.
@@ -173,11 +176,17 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - User and project instructions obey one policy: a regular UTF-8 file, with content, no NUL byte,
   and at most 32 KiB. Each source loads at most 32 files and 64 KiB, and one file loads once even
   when two paths or a symbolic link reach it. pith reports what it skips.
-- `~/.pith/config.json` is optional: paths for user instructions, request and bash limits, and a
-  default model per account.
+- `~/.pith/config.json` is optional: paths for user instructions, request and bash limits, a
+  default model per account, and a default effort level.
 - It holds no secrets. API keys come from `ANTHROPIC_API_KEY` and `OPENAI_API_KEY`.
 - A configured model that is not valid for its account is reported, and the compiled default used.
-- `HOME` must be set, since both config and credentials live under `~/.pith`.
+  An unknown effort level is reported the same way.
+- `~/.pith/state.json` remembers per project which account, model, and effort level pith used last.
+  It is machine-local, owner-only, and keeps the 1000 most recently changed projects. A repository
+  is one project, keyed by its Git root.
+- pith reads that file only at startup, so a change in one instance reaches only the next start.
+  A file pith cannot save to is reported once and never stops the session.
+- `HOME` must be set, since the config, the credentials, and the state all live under `~/.pith`.
 
 ## Keeping this file true
 

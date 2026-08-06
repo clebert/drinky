@@ -5,7 +5,7 @@
 const std = @import("std");
 
 const auth = @import("../auth.zig");
-const auth_store = @import("../auth_store.zig");
+const json_store = @import("../json_store.zig");
 const net = @import("../net.zig");
 const oauth_callback = @import("../oauth_callback.zig");
 const oauth_wire = @import("../oauth_wire.zig");
@@ -91,9 +91,16 @@ test "load distinguishes signed out from corrupt credentials" {
     // both simply signed out. An own entry that lacks a field is corrupt, not
     // ignored.
     try std.testing.expect(!try subject.load());
-    try auth_store.save(gpa, io, subject.path, "anthropic_subscription", .{ .access = "a" });
+    try json_store.save(gpa, io, subject.path, "anthropic_subscription", .{ .access = "a" }, .{});
     try std.testing.expect(!try subject.load());
-    try auth_store.save(gpa, io, subject.path, account_key, .{ .access = "at", .refresh = "rt" });
+    try json_store.save(
+        gpa,
+        io,
+        subject.path,
+        account_key,
+        .{ .access = "at", .refresh = "rt" },
+        .{},
+    );
     try std.testing.expectError(error.BadCredentials, subject.load());
 }
 

@@ -72,10 +72,10 @@ dependency on another item. Module layout and extension seams live in `AGENTS.md
 
 ## Sessions & persistence
 
-- [ ] **Remember the active account and model** — a restart resumes on the last-used account and
-      model rather than the first authenticated one. _This is mutable machine-local state, so it
-      belongs in a separate local file, not the shareable `config.json`. The split wants a
-      deliberate naming choice._
+- [x] **Remember the active account and model** — a restart resumes on the account, model, and
+      effort level this project used last, rather than the first authenticated one. _This is mutable
+      machine-local state, so it lives in `~/.pith/state.json`, not the shareable `config.json`. The
+      key is the project: the Git root, or the working directory outside a repository._
 - [ ] **Save and resume conversations** — a conversation reopens after a restart and does not start
       empty. _The per-turn cost ledger must persist with it, since history items carry no cost.
       Generate the OpenAI cache key once per conversation and restore it verbatim. Rotate it only on
