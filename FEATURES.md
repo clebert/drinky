@@ -55,8 +55,8 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - Reasoning effort runs `none`, `low`, `medium`, `high`, `xhigh`, `max`, folded to what the model
   supports.
 - A restart resumes on the account, model, and effort level this project used last.
-- A model belongs to its account. A login to the remembered account restores its model, and a
-  switch back returns an account to the model it ran in this session.
+- Each account keeps the model it ran in this project. A switch, a login, and a restart all return
+  to it.
 - `/model` and `/effort` both refuse while signed out, since the status line hides both values then.
 - Session cost and cache savings accumulate per model and count a canceled turn's billed usage.
 
@@ -183,9 +183,9 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - It holds no secrets. API keys come from `ANTHROPIC_API_KEY` and `OPENAI_API_KEY`.
 - A configured model that is not valid for its account is reported, and the compiled default used.
   An unknown effort level is reported the same way.
-- `~/.pith/state.json` remembers per project which account, model, and effort level pith used last.
-  It is machine-local, owner-only, and keeps the 1000 most recently changed projects. A repository
-  is one project, keyed by its Git root.
+- `~/.pith/state.json` remembers per project which account and effort level pith used last, and the
+  model of each account. It is machine-local, owner-only, and keeps the 1000 most recently changed
+  projects. A repository is one project, keyed by its Git root.
 - pith reads that file only at startup, so a change in one instance reaches only the next start.
   A file pith cannot save to is reported once and never stops the session.
 - `HOME` must be set, since the config, the credentials, and the state all live under `~/.pith`.

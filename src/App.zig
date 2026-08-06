@@ -59,12 +59,6 @@ default_models: Config.DefaultModels,
 /// The machine-local choices of this project: read once at startup, written
 /// whenever the account, the model, or the effort level changes.
 state: State,
-/// The model each account ran last in this project, held as the name that keys
-/// the compiled table. It starts from what `state` remembered, so a login to the
-/// remembered account restores its model and does not reset to the default. A
-/// model belongs to the account that ran it, so an account with no entry here
-/// still starts on its own default.
-account_models: std.EnumArray(ai.llm.Account, ?[]const u8),
 /// Project instructions, skill metadata, and the composed prompt. All outlive
 /// the agent, which borrows `prompt`.
 project_instructions: ai.instructions.Result,
@@ -370,7 +364,6 @@ pub fn run(
         .project = self.project_instructions.projectRoot() orelse cwd,
     });
     defer self.state.deinit();
-    self.seedAccountModels();
 
     const user_skills = try std.fs.path.resolve(gpa, &.{ cwd, home, ".agents", "skills" });
     defer gpa.free(user_skills);
@@ -807,33 +800,22 @@ fn signedIn(self: *const App) bool {
 /// authenticated, else the first authenticated account. Null when no account is
 /// authenticated.
 fn startAccount(self: *const App) ?ai.llm.Account {
-    if (self.state.start.choice) |choice| {
-        if (self.accounts.isAuthenticated(choice.account)) return choice.account;
+    if (self.state.start.account) |account| {
+        if (self.accounts.isAuthenticated(account)) return account;
     }
     return self.accounts.firstAuthenticated();
 }
 
-/// Seed the per-account models from what the file remembered. Startup and every
-/// later switch then read one memory. A login to the remembered account
-/// therefore restores its model and does not reset to the account's default.
-fn seedAccountModels(self: *App) void {
-    self.account_models = .initFill(null);
-    const choice = self.state.start.choice orelse return;
-    self.account_models.set(choice.account, choice.model.name);
-}
-
 /// The model `account` runs: the one it ran last in this project, else the
 /// account's default model. A model belongs to the account that ran it, so
-/// another account gets its own default.
+/// another account gets its own default. Startup, a switch, and a login all read
+/// this one rule.
 ///
-/// The lookup holds a name, not a whole model, and resolves it on every read.
-/// The account overlays therefore reach the model in use. An OpenAI
-/// subscription learns its real context windows at login. A model resolved
-/// before that login keeps a stale window. A name the compiled table does not
-/// offer falls back to the default model.
+/// `state` holds the compiled table's own entry, so the account overlay applies
+/// here on every read. An OpenAI subscription learns its real context windows at
+/// login. A model resolved before that login keeps a stale window.
 fn accountModel(self: *const App, account: ai.llm.Account) ai.models.Model {
-    const name = self.account_models.get(account) orelse return self.defaultModel(account);
-    const base = ai.models.get(account.provider(), name) orelse return self.defaultModel(account);
+    const base = self.state.models.get(account) orelse return self.defaultModel(account);
     return self.accounts.resolveModel(account, base);
 }
 
@@ -1278,8 +1260,9 @@ fn applyOutcome(self: *App, outcome: ai.command.Outcome) !void {
 }
 
 /// Remember the account, model, and effort level this project now uses, so the
-/// next start resumes on them. Only a change writes the file. A failed write
-/// never stops the session, because this state is a convenience. The state stops
+/// next start resumes on them. The model stays with the account that ran it, so
+/// a switch away keeps it. Only a change writes the file. A failed write never
+/// stops the session, because this state is a convenience. The state stops
 /// saving after a failure, so each report lands once and names the way out.
 ///
 /// A signed-out session records nothing, because the entry names an account.
@@ -1287,10 +1270,6 @@ fn applyOutcome(self: *App, outcome: ai.command.Outcome) !void {
 /// account is active, so the only signed-out change is the sign-in itself.
 fn recordState(self: *App) !void {
     const account = self.activeAccount() orelse return;
-    // A model belongs to its account. The file holds one account, so this memory
-    // carries the rest for as long as the session runs. A switch away and back
-    // therefore returns to the model that account ran, not to its default.
-    self.account_models.set(account, self.agent.model.name);
     self.state.record(account, &self.agent.model, self.agent.effort) catch |err| switch (err) {
         error.CorruptStore => try self.recordEvent(
             .failure,
@@ -1306,7 +1285,8 @@ fn recordState(self: *App) !void {
     };
 }
 
-/// Log in to `account`, then switch to it on its default model.
+/// Log in to `account`, then switch to it on the model it ran last here, else on
+/// its default model.
 /// A pre-commit failure leaves the current account untouched. After the
 /// credential replacement, account readiness and replay invalidation complete
 /// before any fallible final presentation.
@@ -1366,11 +1346,11 @@ fn reportLoginFailure(self: *App, login_error: anyerror) !void {
     return self.reportNotice(.failure, "{s}", .{message});
 }
 
-/// Drop `account`'s credentials. A logout of the active account
-/// hands the session to the next authenticated account (its default model). When
-/// none remains, it drops to a signed-out state and opens the login picker so the
-/// user chooses how to sign back in. Commands cannot run mid-turn, so this never
-/// races a turn.
+/// Drop `account`'s credentials. A logout of the active account hands the
+/// session to the next authenticated account. That account starts on the model
+/// it ran last here, else on its default model. When none remains, it drops to a
+/// signed-out state and opens the login picker so the user chooses how to sign
+/// back in. Commands cannot run mid-turn, so this never races a turn.
 fn logoutAccount(self: *App, account: ai.llm.Account) !void {
     const was_active = if (self.agent.client) |client| client.account() == account else false;
     self.accounts.logout(account) catch |err| {
@@ -3301,8 +3281,15 @@ test "an account-switch command clears the quota snapshot and records the projec
     defer file.deinit();
     const entry = file.entry("/work").?;
     try std.testing.expectEqualStrings("openai_api", entry.get("account").?.string);
-    try std.testing.expectEqualStrings(openai_default.name, entry.get("model").?.string);
     try std.testing.expectEqualStrings("none", entry.get("effort").?.string);
+    const listed = entry.get("models").?.object;
+    try std.testing.expectEqualStrings(openai_default.name, listed.get("openai_api").?.string);
+    // The account left behind keeps the model it ran, so a switch back returns
+    // to it even after a restart.
+    try std.testing.expectEqualStrings(
+        anthropic_default.name,
+        listed.get("anthropic_subscription").?.string,
+    );
 }
 
 test "startup resumes on the account, model, and effort level this project used last" {
@@ -3313,7 +3300,8 @@ test "startup resumes on the account, model, and effort level this project used 
     const home = try tmpPath(gpa, io, &tmp, "");
     defer gpa.free(home);
     try State.writeForTest(io, &tmp,
-        \\{ "/work": { "account": "openai_api", "model": "gpt-5.6-luna", "effort": "low" } }
+        \\{ "/work": { "account": "openai_api", "effort": "low",
+        \\    "models": { "openai_api": "gpt-5.6-luna" } } }
     );
 
     var app: App = undefined;
@@ -3329,7 +3317,6 @@ test "startup resumes on the account, model, and effort level this project used 
         .project = "/work",
     });
     defer app.state.deinit();
-    app.seedAccountModels();
 
     // The remembered account wins over the first authenticated one, which is the
     // Anthropic key here.
@@ -3354,7 +3341,7 @@ test "a signed-out remembered account falls back and the defaults fill the rest"
     defer gpa.free(home);
     // The file names an account with no credentials and no effort level.
     try State.writeForTest(io, &tmp,
-        \\{ "/work": { "account": "openai_api", "model": "gpt-5.6-luna" } }
+        \\{ "/work": { "account": "openai_api", "models": { "openai_api": "gpt-5.6-luna" } } }
     );
 
     var app: App = undefined;
@@ -3367,16 +3354,15 @@ test "a signed-out remembered account falls back and the defaults fill the rest"
         .project = "/work",
     });
     defer app.state.deinit();
-    app.seedAccountModels();
 
     try std.testing.expectEqual(ai.llm.Account.anthropic_api, app.startAccount().?);
     try std.testing.expectEqualStrings(
         anthropic_default.name,
         app.accountModel(.anthropic_api).name,
     );
-    // The memory survives for the account that ran it, even while that account
-    // holds no credentials. A later login therefore restores the model rather
-    // than resetting to the account's default.
+    // The memory holds for the account that ran the model, even while that
+    // account has no credentials. A later login therefore restores the model and
+    // does not reset to the account's default.
     try std.testing.expectEqualStrings("gpt-5.6-luna", app.accountModel(.openai_api).name);
     // With nothing remembered, the configured default wins, else the compiled one.
     try std.testing.expectEqual(ai.llm.Effort.medium, app.startEffort(.medium));
@@ -3394,7 +3380,8 @@ test "a switch back to an account restores the model that account ran" {
     defer gpa.free(home);
     // The project last ran an Anthropic model that is not the compiled default.
     try State.writeForTest(io, &tmp,
-        \\{ "/work": { "account": "anthropic_api", "model": "claude-sonnet-5", "effort": "none" } }
+        \\{ "/work": { "account": "anthropic_api", "effort": "none",
+        \\    "models": { "anthropic_api": "claude-sonnet-5" } } }
     );
 
     var app: App = undefined;
@@ -3412,7 +3399,6 @@ test "a switch back to an account restores the model that account ran" {
         .project = "/work",
     });
     defer app.state.deinit();
-    app.seedAccountModels();
 
     const start_model = app.accountModel(.anthropic_api);
     try std.testing.expectEqualStrings("claude-sonnet-5", start_model.name);
@@ -3436,13 +3422,14 @@ test "a switch back to an account restores the model that account ran" {
     try app.applyOutcome(.{ .switch_account = .anthropic_api });
     try std.testing.expectEqualStrings("claude-sonnet-5", app.agent.model.name);
 
-    // A switch that lands on the remembered pair writes it back unchanged, so a
-    // restart resumes on it too.
+    // Both models reach the file, so the next start knows them both.
     var file = (try ai.json_store.open(gpa, io, app.state.path)).?;
     defer file.deinit();
     const entry = file.entry("/work").?;
     try std.testing.expectEqualStrings("anthropic_api", entry.get("account").?.string);
-    try std.testing.expectEqualStrings("claude-sonnet-5", entry.get("model").?.string);
+    const listed = entry.get("models").?.object;
+    try std.testing.expectEqualStrings("claude-sonnet-5", listed.get("anthropic_api").?.string);
+    try std.testing.expectEqualStrings(openai_default.name, listed.get("openai_api").?.string);
 }
 
 test "a remembered account does not resume when no account is authenticated" {
@@ -3453,7 +3440,7 @@ test "a remembered account does not resume when no account is authenticated" {
     const home = try tmpPath(gpa, io, &tmp, "");
     defer gpa.free(home);
     try State.writeForTest(io, &tmp,
-        \\{ "/work": { "account": "openai_api", "model": "gpt-5.6-luna" } }
+        \\{ "/work": { "account": "openai_api", "models": { "openai_api": "gpt-5.6-luna" } } }
     );
 
     var app: App = undefined;
@@ -3467,7 +3454,7 @@ test "a remembered account does not resume when no account is authenticated" {
     defer app.state.deinit();
 
     // Startup then runs signed out and opens the login picker.
-    try std.testing.expect(app.state.start.choice != null);
+    try std.testing.expect(app.state.start.account != null);
     try std.testing.expect(app.startAccount() == null);
 }
 
