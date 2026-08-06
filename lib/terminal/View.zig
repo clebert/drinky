@@ -6,20 +6,26 @@
 //! correct region. The two frames ping-pong with retained capacity, so after
 //! warmup no frame allocates.
 //!
-//! Reconciliation is by row **anchor** (stable cross-frame identity), not screen
-//! position, so a sliding window does not force a reset on every append. A
-//! forward slide repaints incrementally, but no lower than the previous frame's
-//! last row. The append scrolls the terminal by `\r\n` and does not move below
-//! the bottom margin, where the cursor clamps and does not scroll. The view
-//! rebases the stored cursor row by Δ, how far the window slid. A backward slide
-//! is never incremental above the viewport, because a terminal cannot un-scroll
-//! its scrollback. It resets, or reprints from row `0` when the whole window
-//! shows. An on-screen shrink or a cleared transcript removes the top rows
-//! without an append to scroll them off. The view then reprints from row `0` to
-//! erase them, or resets when they reach into scrollback. Every line is exactly
-//! one physical row, so all cursor motion is a plain row count. Each repaint is
-//! one synchronized-output burst. Primary-screen resets clear inaccessible
-//! scrollback by default. An alternate-screen view can preserve it.
+//! Reconciliation uses row **anchors**, not screen positions. A sliding window
+//! can then append without a reset. The repaint starts no lower than the previous
+//! last row. Its `\r\n` sequences scroll at the bottom margin.
+//!
+//! The view tracks screen lines for the frame, the screen top, and the cursor.
+//! These lines increase until a reset starts a new epoch. A shrink can therefore
+//! end above the bottom and leave blank rows.
+//!
+//! A fresh inline frame starts at the shell cursor. Tracked line zero need not be
+//! physical row zero. This offset does not change cursor distances or when tracked
+//! rows enter scrollback.
+//!
+//! The view never pulls inaccessible scrollback back onto the screen. When a
+//! bounded frame adds an older prefix, the view discards that prefix and keeps
+//! its printed top. It can reprint a backward slide when the previous top remains
+//! on screen.
+//!
+//! Every frame line is one physical row. Each repaint is one synchronized-output
+//! burst. Primary-screen resets clear inaccessible scrollback. An alternate-screen
+//! view can preserve it.
 
 const std = @import("std");
 
@@ -37,12 +43,11 @@ front: u1,
 columns: usize,
 rows: usize,
 pages: usize,
-/// Window-relative index of the topmost row still on screen. Everything above
-/// it has scrolled into native scrollback and is no longer addressable.
-viewport_top: usize,
-/// Physical row the hardware cursor sits on, window-relative to the frame last
-/// painted.
-cursor_row: usize,
+/// First tracked line that remains on screen in this reset epoch. Smaller tracked
+/// lines are native scrollback.
+screen_top_line: usize,
+/// Line of the hardware cursor in the current reset epoch.
+cursor_line: usize,
 /// Terminal cursor visibility, so the view emits show/hide only on a change. The
 /// owning `Tty` hides the cursor at startup, which matches the initial value here.
 cursor_visible: bool,
@@ -168,16 +173,17 @@ pub const Sink = struct {
     }
 };
 
-/// A frame's two reused buffers plus the caret it resolved. `blob` holds all row
-/// bytes concatenated in screen order and grows to a high-water mark. `rows`
-/// indexes them in screen order with fixed capacity.
+/// A frame's two reused buffers, caret, and printed top line. `blob` holds all
+/// row bytes in screen order. `rows` indexes them with fixed capacity.
 const Frame = struct {
     blob: std.Io.Writer.Allocating,
     rows: std.ArrayList(Row),
     caret: ?Caret,
+    /// Screen line that contains row zero in the current reset epoch.
+    top_line: usize,
 
     fn init(gpa: std.mem.Allocator) Frame {
-        return .{ .blob = .init(gpa), .rows = .empty, .caret = null };
+        return .{ .blob = .init(gpa), .rows = .empty, .caret = null, .top_line = 0 };
     }
 
     fn deinit(self: *Frame, gpa: std.mem.Allocator) void {
@@ -189,6 +195,21 @@ const Frame = struct {
         self.blob.clearRetainingCapacity();
         self.rows.clearRetainingCapacity();
         self.caret = null;
+        self.top_line = 0;
+    }
+
+    fn dropLeadingRows(self: *Frame, count: usize) void {
+        std.debug.assert(count <= self.rows.items.len);
+        const kept = self.rows.items.len - count;
+        std.mem.copyForwards(Row, self.rows.items[0..kept], self.rows.items[count..]);
+        self.rows.shrinkRetainingCapacity(kept);
+        if (self.caret) |*caret| {
+            if (caret.row < count) {
+                self.caret = null;
+            } else {
+                caret.row -= count;
+            }
+        }
     }
 
     fn bytes(self: *const Frame, row: Row) []const u8 {
@@ -217,8 +238,8 @@ pub fn init(gpa: std.mem.Allocator, writer: *std.Io.Writer) View {
         .columns = 0,
         .rows = 0,
         .pages = 0,
-        .viewport_top = 0,
-        .cursor_row = 0,
+        .screen_top_line = 0,
+        .cursor_line = 0,
         .cursor_visible = false,
         .sink = undefined,
         .structural_change = false,
@@ -252,8 +273,8 @@ pub fn forget(self: *View) void {
     self.columns = 0;
     self.rows = 0;
     self.pages = 0;
-    self.viewport_top = 0;
-    self.cursor_row = 0;
+    self.screen_top_line = 0;
+    self.cursor_line = 0;
     self.cursor_visible = false;
     self.structural_change = false;
     self.force_reset = false;
@@ -273,7 +294,7 @@ pub fn beginFrame(self: *View, size: Size, pages: usize) !*Sink {
 
     const back = &self.frames[self.front ^ 1];
     back.reset();
-    const capacity = @max(self.rows, 1) * @max(self.pages, 1);
+    const capacity = self.screenHeight() * @max(self.pages, 1);
     try back.rows.ensureTotalCapacity(self.gpa, capacity);
     self.sink = .{
         .frame = back,
@@ -302,44 +323,16 @@ pub fn render(self: *View) !void {
         try self.paint(if (prev_empty) .fresh else .reset, back, .{});
     } else if (findAlignment(prev, back)) |alignment| {
         if (alignment.back_index == 0) {
-            // The new top row also appears in the previous frame at index `delta`.
-            const delta = alignment.prev_index;
-            const deepest = @min(prev.rows.items.len - 1 - delta, back.rows.items.len - 1);
-            // A forward slide reaches past the previous last row and appends rows
-            // at the bottom. That scroll carried the `delta` top rows into
-            // scrollback and lets the cursor rebase by `delta`. Without it, the top
-            // rows were removed on screen (a shrink or a `/new`-style clear), the
-            // cursor never rose, and a rebased incremental strands them.
-            const scrolled = back.rows.items.len + delta > prev.rows.items.len;
-            if (delta > 0 and !scrolled) {
-                if (self.viewport_top > 0) {
-                    // The removed rows expose scrollback an inline terminal cannot reach.
-                    try self.paint(.reset, back, .{});
-                } else {
-                    // Reprint from row zero to erase the rows still on screen above.
-                    try self.paint(.incremental, back, .{ .cursor_from = self.cursor_row });
-                }
-            } else if (firstChange(prev, delta, back)) |changed| {
-                // A shrunk tail must reveal scrolled-off rows: a backward slide in disguise.
-                const shrank = back.rows.items.len + delta < prev.rows.items.len;
-                if (changed + delta < self.viewport_top or (shrank and self.viewport_top > 0)) {
-                    try self.paint(.reset, back, .{});
-                } else {
-                    // Reprint no lower than the previous last row, so the append scrolls by \r\n.
-                    try self.paint(.incremental, back, .{
-                        .anchor = @min(changed, deepest),
-                        .cursor_from = self.cursor_row -| delta,
-                    });
-                }
-            } else {
-                // A byte-identical, equal-length overlap forces `delta == 0` (a
-                // `delta > 0` trim took the shrink branch): nothing slid, so
-                // `cursor_row` is still valid.
-                try self.paintCaretOnly(back);
-            }
-        } else if (self.viewport_top == 0) {
-            // Backward slide: row 0 changed, reachable only when the whole window shows.
-            try self.paint(.incremental, back, .{ .cursor_from = self.cursor_row });
+            try self.paintAligned(prev, back, alignment.prev_index);
+        } else if (self.lineVisible(prev.top_line)) {
+            // The previous top is still addressable. Reprint the backward slide there.
+            back.top_line = prev.top_line;
+            try self.paint(.incremental, back, .{ .line = prev.top_line });
+        } else if (alignment.prev_index == 0) {
+            // The producer pulled inaccessible history into the bounded frame.
+            // Keep the printed top and discard that backward prefix.
+            back.dropLeadingRows(alignment.back_index);
+            try self.paintDroppedPrefix(prev, back);
         } else {
             try self.paint(.reset, back, .{});
         }
@@ -350,67 +343,152 @@ pub fn render(self: *View) !void {
     self.front ^= 1;
 }
 
-/// Move the hardware cursor to the last row on screen and show it. Call this at
-/// shutdown, so external output after exit (the shell prompt) continues below the
-/// whole interface. Without it the cursor stays under the caret, and the shell
-/// prompt overwrites the rows below. A no-op when the frame on screen has no rows.
+/// Move the hardware cursor to the last frame row and show it. Call this at
+/// shutdown, so the shell prompt continues below the interface. This is a no-op
+/// when the frame has no addressable row.
 pub fn parkCursor(self: *View) !void {
     const frame = &self.frames[self.front];
     const count = frame.rows.items.len;
     if (count == 0) return;
+    const last_line = frame.top_line + count - 1;
+    if (!self.lineVisible(last_line)) return;
+    try self.moveCursor(last_line);
     const writer = self.writer;
-    const last = count - 1;
-    if (last > self.cursor_row) try escape.cursorMove(writer, 'B', last - self.cursor_row);
     try writer.writeAll("\r");
     if (!self.cursor_visible) {
         try writer.writeAll(escape.cursor_show);
         self.cursor_visible = true;
     }
-    self.cursor_row = last;
     try writer.flush();
 }
 
-/// Reprint `frame` from `rows.anchor` down and position the cursor per `mode`.
-/// In `incremental` mode the move starts from `rows.cursor_from`, the current
-/// cursor row expressed in this frame's coordinates. All motion counts physical
-/// rows.
-fn paint(self: *View, mode: Mode, frame: *const Frame, rows: struct {
+/// Reconcile frames that share the new top row. `delta` locates that row in
+/// `prev`.
+fn paintAligned(self: *View, prev: *const Frame, back: *Frame, delta: usize) !void {
+    const scrolled = back.rows.items.len + delta > prev.rows.items.len;
+    if (delta > 0 and !scrolled) {
+        if (!self.lineVisible(prev.top_line)) {
+            try self.paint(.reset, back, .{});
+        } else {
+            // The producer removed rows on screen. Move the remaining frame to the old top.
+            back.top_line = prev.top_line;
+            try self.paint(.incremental, back, .{ .line = prev.top_line });
+        }
+        return;
+    }
+
+    back.top_line = prev.top_line + delta;
+    const maybe_changed = firstChangeFrom(prev, back, .{
+        .prev_start = delta,
+        .back_start = 0,
+    });
+    if (maybe_changed) |changed| {
+        try self.paintChangedSuffix(prev, back, .{ .changed = changed, .prev_start = delta });
+    } else {
+        try self.paintCaretOnly(back);
+    }
+}
+
+/// Reconcile a frame after the view discards its inaccessible backward prefix.
+fn paintDroppedPrefix(self: *View, prev: *const Frame, back: *Frame) !void {
+    back.top_line = prev.top_line;
+    const visible_start = self.screen_top_line -| back.top_line;
+    const maybe_changed = firstChangeFrom(prev, back, .{
+        .prev_start = 0,
+        .back_start = visible_start,
+    });
+    if (maybe_changed) |changed| {
+        // The visible scan can start after a frame that ends in scrollback.
+        if (changed >= back.rows.items.len) {
+            // Keep the cleared rows blank instead of resurrecting scrollback with a reset.
+            const screen_line = @max(back.top_line + changed, self.screen_top_line);
+            std.debug.assert(self.lineVisible(screen_line));
+            try self.paint(.incremental, back, .{
+                .anchor = back.rows.items.len,
+                .line = screen_line,
+            });
+            return;
+        }
+
+        try self.paintChangedSuffix(prev, back, .{ .changed = changed, .prev_start = 0 });
+    } else {
+        try self.paintCaretOnly(back);
+    }
+}
+
+/// Repaint a changed suffix. Start at the previous last row when output must scroll.
+fn paintChangedSuffix(
+    self: *View,
+    prev: *const Frame,
+    back: *Frame,
+    options: struct { changed: usize, prev_start: usize },
+) !void {
+    std.debug.assert(options.changed <= back.rows.items.len);
+    const deepest = @min(
+        prev.rows.items.len - 1 - options.prev_start,
+        back.rows.items.len - 1,
+    );
+    var anchor = @min(options.changed, deepest);
+    var screen_line = back.top_line + anchor;
+    if (!self.lineVisible(screen_line)) {
+        // The previous last row entered scrollback. Start at the first changed row.
+        // Every skipped row is then above the screen.
+        anchor = options.changed;
+        screen_line = back.top_line + anchor;
+        if (!self.lineVisible(screen_line)) {
+            // The changed suffix remains inaccessible. Reset so its new rows can appear.
+            try self.paint(.reset, back, .{});
+            return;
+        }
+    }
+    try self.paint(.incremental, back, .{ .anchor = anchor, .line = screen_line });
+}
+
+/// Reprint `frame` from `options.anchor`. An incremental paint starts on
+/// `options.line`. The caller sets `frame.top_line` only for incremental mode.
+fn paint(self: *View, mode: Mode, frame: *Frame, options: struct {
     anchor: usize = 0,
-    cursor_from: usize = 0,
+    line: usize = 0,
 }) !void {
     const writer = self.writer;
     try writer.writeAll(escape.sync_set);
     switch (mode) {
-        .fresh => {},
-        .reset => try writer.writeAll(self.resetSequence()),
+        .fresh => frame.top_line = self.cursor_line,
+        .reset => {
+            try writer.writeAll(self.resetSequence());
+            self.applyReset();
+            frame.top_line = self.cursor_line;
+        },
         .incremental => {
-            if (rows.cursor_from >= rows.anchor) {
-                try escape.cursorMove(writer, 'A', rows.cursor_from - rows.anchor);
-            } else {
-                try escape.cursorMove(writer, 'B', rows.anchor - rows.cursor_from);
-            }
+            std.debug.assert(options.anchor <= frame.rows.items.len);
+            std.debug.assert(self.lineVisible(options.line));
+            try self.moveCursor(options.line);
             try writer.writeAll("\r");
             try writer.writeAll(escape.screen_clear_below);
         },
     }
+
     const items = frame.rows.items;
-    for (items[rows.anchor..], rows.anchor..) |row, index| {
-        if (index > rows.anchor) try writer.writeAll("\r\n");
-        try writer.writeAll(frame.bytes(row));
+    if (options.anchor < items.len) {
+        std.debug.assert(self.cursor_line == frame.top_line + options.anchor);
+        for (items[options.anchor..], options.anchor..) |row, index| {
+            if (index > options.anchor) {
+                try writer.writeAll("\r\n");
+                self.advanceLine();
+            }
+            try writer.writeAll(frame.bytes(row));
+        }
     }
-    // The last `rows` physical rows are visible. Everything above is scrollback.
-    self.viewport_top = frame.rows.items.len -| @max(self.rows, 1);
-    try self.restoreCursor(items.len - 1, frame);
+    try self.restoreCursor(frame);
     try writer.writeAll(escape.sync_reset);
     try writer.flush();
 }
 
-/// The rows are unchanged. Only the caret or its visibility can differ, so emit
-/// nothing but the cursor move.
+/// The rows are unchanged. Only the caret or its visibility can differ.
 fn paintCaretOnly(self: *View, frame: *const Frame) !void {
     const writer = self.writer;
     try writer.writeAll(escape.sync_set);
-    try self.restoreCursor(self.cursor_row, frame);
+    try self.restoreCursor(frame);
     try writer.writeAll(escape.sync_reset);
     try writer.flush();
 }
@@ -420,40 +498,71 @@ fn paintCaretOnly(self: *View, frame: *const Frame) !void {
 fn paintEmpty(self: *View, prev_empty: bool) !void {
     const writer = self.writer;
     try writer.writeAll(escape.sync_set);
-    if (!prev_empty) try writer.writeAll(self.resetSequence());
+    if (!prev_empty) {
+        try writer.writeAll(self.resetSequence());
+        self.applyReset();
+    }
     if (self.cursor_visible) {
         try writer.writeAll(escape.cursor_hide);
         self.cursor_visible = false;
     }
     try writer.writeAll(escape.sync_reset);
     try writer.flush();
-    self.viewport_top = 0;
-    self.cursor_row = 0;
 }
 
 fn resetSequence(self: *const View) []const u8 {
     return if (self.preserve_scrollback) escape.screen_repaint else escape.screen_reset;
 }
 
-/// Move the hardware cursor from `from_row` to `frame`'s caret and show it.
-/// Hide it when there is no caret or it sits above the viewport (scrolled off
-/// the top, so unaddressable).
-fn restoreCursor(self: *View, from_row: usize, frame: *const Frame) !void {
+fn applyReset(self: *View) void {
+    if (self.preserve_scrollback) {
+        self.cursor_line = self.screen_top_line;
+    } else {
+        self.screen_top_line = 0;
+        self.cursor_line = 0;
+    }
+}
+
+fn screenHeight(self: *const View) usize {
+    return @max(self.rows, 1);
+}
+
+fn advanceLine(self: *View) void {
+    const screen_bottom = self.screen_top_line + self.screenHeight() - 1;
+    if (self.cursor_line >= screen_bottom) self.screen_top_line += 1;
+    self.cursor_line += 1;
+}
+
+fn lineVisible(self: *const View, screen_line: usize) bool {
+    return screen_line >= self.screen_top_line and
+        screen_line - self.screen_top_line < self.screenHeight();
+}
+
+fn moveCursor(self: *View, screen_line: usize) !void {
+    std.debug.assert(self.lineVisible(self.cursor_line));
+    std.debug.assert(self.lineVisible(screen_line));
+    if (self.cursor_line >= screen_line) {
+        try escape.cursorMove(self.writer, 'A', self.cursor_line - screen_line);
+    } else {
+        try escape.cursorMove(self.writer, 'B', screen_line - self.cursor_line);
+    }
+    self.cursor_line = screen_line;
+}
+
+/// Move the hardware cursor to the frame caret and show it. Hide it when the
+/// caret is outside the screen.
+fn restoreCursor(self: *View, frame: *const Frame) !void {
     const writer = self.writer;
     if (frame.caret) |caret| {
-        if (caret.row >= self.viewport_top) {
-            if (from_row >= caret.row) {
-                try escape.cursorMove(writer, 'A', from_row - caret.row);
-            } else {
-                try escape.cursorMove(writer, 'B', caret.row - from_row);
-            }
+        const screen_line = frame.top_line + caret.row;
+        if (self.lineVisible(screen_line)) {
+            try self.moveCursor(screen_line);
             try writer.writeAll("\r");
             try escape.cursorMove(writer, 'C', caret.column);
             if (!self.cursor_visible) {
                 try writer.writeAll(escape.cursor_show);
                 self.cursor_visible = true;
             }
-            self.cursor_row = caret.row;
             return;
         }
     }
@@ -461,7 +570,6 @@ fn restoreCursor(self: *View, from_row: usize, frame: *const Frame) !void {
         try writer.writeAll(escape.cursor_hide);
         self.cursor_visible = false;
     }
-    self.cursor_row = from_row;
 }
 
 /// The first anchor `back` shares with `prev`: its index in `back` and its index
@@ -477,20 +585,23 @@ fn findAlignment(prev: *const Frame, back: *const Frame) ?Alignment {
     return null;
 }
 
-/// Scan down from the aligned rows (`back[0]` against `prev[prev_start]`) and
-/// return the first index at which they differ. A missing row on either side
-/// counts as a difference. Null when the overlap is byte-for-byte identical and
-/// equal in length.
-fn firstChange(prev: *const Frame, prev_start: usize, back: *const Frame) ?usize {
+/// Scan from `back_start` and compare `back[index]` with `prev[prev_start + index]`.
+/// Return the first difference. A missing row counts as a difference. Return null
+/// when both remaining suffixes are equal.
+fn firstChangeFrom(
+    prev: *const Frame,
+    back: *const Frame,
+    options: struct { prev_start: usize, back_start: usize },
+) ?usize {
     const back_rows = back.rows.items;
     const prev_rows = prev.rows.items;
-    var index: usize = 0;
-    while (index < back_rows.len or prev_start + index < prev_rows.len) : (index += 1) {
+    var index = options.back_start;
+    while (index < back_rows.len or options.prev_start + index < prev_rows.len) : (index += 1) {
         const back_present = index < back_rows.len;
-        const prev_present = prev_start + index < prev_rows.len;
+        const prev_present = options.prev_start + index < prev_rows.len;
         if (!back_present or !prev_present) return index;
         const back_bytes = back.bytes(back_rows[index]);
-        if (!std.mem.eql(u8, back_bytes, prev.bytes(prev_rows[prev_start + index]))) {
+        if (!std.mem.eql(u8, back_bytes, prev.bytes(prev_rows[options.prev_start + index]))) {
             return index;
         }
     }
@@ -541,6 +652,8 @@ const Harness = struct {
         self.emulator.rows = size.rows;
         try self.emulator.feed(bytes[self.consumed..]);
         self.consumed = bytes.len;
+        try std.testing.expectEqual(self.view.screen_top_line, self.emulator.screen_top);
+        try std.testing.expectEqual(self.view.cursor_line, self.emulator.cursor_row);
     }
 
     // Bytes emitted by the most recent `render`, to assert the repaint shape.
@@ -658,7 +771,7 @@ test "a sliding-window append repaints incrementally and keeps the caret synced"
     try std.testing.expect(std.mem.indexOf(u8, harness.lastBytes(), escape.screen_reset) == null);
 }
 
-test "a backward slide past one page resets" {
+test "a clipped backward slide preserves the printed top" {
     const gpa = std.testing.allocator;
     const harness = try makeHarness(gpa, 10);
     defer {
@@ -672,16 +785,156 @@ test "a backward slide past one page resets" {
     };
     try harness.render(&tall, .{ .columns = 10, .rows = 2 }, 2);
     try harness.emulator.expectVisible(&.{ "r2", "r3", "r4", "r5" });
+    const screen_top = harness.emulator.screen_top;
 
-    // The tail shrinks by two rows and pulls older rows back in above the shared
-    // anchor. The first changed row is 0, which sits in scrollback, so the view resets.
-    const short = [_]Line{ line("r0", 0), line("r1", 1), line("r2", 2), line("r3", 3) };
+    // The shrink pulls r0 and r1 into the bounded frame. They cannot re-enter
+    // the screen, so the view discards them and clears the removed visible tail.
+    const short = [_]Line{ line("r0", 0), line("r1", 1), line("r2", 2) };
     try harness.render(&short, .{ .columns = 10, .rows = 2 }, 2);
-    try harness.emulator.expectVisible(&.{ "r0", "r1", "r2", "r3" });
+    try harness.emulator.expectScreen(&.{ "", "" });
+    try std.testing.expectEqual(screen_top, harness.emulator.screen_top);
+    try std.testing.expectEqualStrings("r2", harness.emulator.document.items[0].items);
+    try std.testing.expectEqualStrings("r3", harness.emulator.document.items[1].items);
+    try std.testing.expect(std.mem.indexOf(u8, harness.lastBytes(), escape.screen_reset) == null);
+
+    // Growth skips inaccessible new rows and starts at the first visible line.
+    const grown = [_]Line{
+        line("r0", 0), line("r1", 1), line("r2", 2), line("r3", 3), line("r4", 4),
+    };
+    try harness.render(&grown, .{ .columns = 10, .rows = 2 }, 2);
+    try harness.emulator.expectScreen(&.{ "r4", "" });
+    try std.testing.expectEqual(screen_top, harness.emulator.screen_top);
+    try std.testing.expect(std.mem.indexOf(u8, harness.lastBytes(), escape.screen_reset) == null);
+}
+
+test "an unchanged backward prefix drops its caret" {
+    const gpa = std.testing.allocator;
+    const harness = try makeHarness(gpa, 10);
+    defer {
+        harness.deinit();
+        gpa.destroy(harness);
+    }
+    const first = [_]Line{
+        line("b", 1),
+        line("c", 2),
+        caretLine("d", .{ .id = 3, .column = 1 }),
+        line("e", 4),
+    };
+    try harness.render(&first, .{ .columns = 10, .rows = 2 }, 3);
+    try harness.emulator.expectScreen(&.{ "d", "e" });
+    try std.testing.expect(harness.emulator.cursor_visible);
+
+    const prefixed = [_]Line{
+        caretLine("a", .{ .id = 0, .column = 1 }),
+        line("b", 1),
+        line("c", 2),
+        line("d", 3),
+        line("e", 4),
+    };
+    try harness.render(&prefixed, .{ .columns = 10, .rows = 2 }, 3);
+    try harness.emulator.expectScreen(&.{ "d", "e" });
+    try std.testing.expect(!harness.emulator.cursor_visible);
+    try std.testing.expect(harness.view.frames[harness.view.front].caret == null);
+    const last = harness.lastBytes();
+    try std.testing.expect(std.mem.indexOf(u8, last, escape.cursor_hide) != null);
+    try std.testing.expect(std.mem.indexOf(u8, last, escape.screen_clear_below) == null);
+    try std.testing.expect(std.mem.indexOf(u8, last, escape.screen_reset) == null);
+    try std.testing.expect(std.mem.indexOf(u8, last, "a") == null);
+}
+
+test "a mixed backward jump resets" {
+    const gpa = std.testing.allocator;
+    const harness = try makeHarness(gpa, 10);
+    defer {
+        harness.deinit();
+        gpa.destroy(harness);
+    }
+    const first = [_]Line{ line("a", 0), line("b", 1), line("c", 2), line("d", 3) };
+    try harness.render(&first, .{ .columns = 10, .rows = 2 }, 3);
+    try harness.emulator.expectScreen(&.{ "c", "d" });
+
+    // The prefix starts before a shared inner row, not before the previous top.
+    const mixed = [_]Line{ line("x", 10), line("c", 2), line("d", 3) };
+    try harness.render(&mixed, .{ .columns = 10, .rows = 2 }, 3);
+    try harness.emulator.expectScreen(&.{ "c", "d" });
     try std.testing.expect(std.mem.indexOf(u8, harness.lastBytes(), escape.screen_reset) != null);
 }
 
-test "a shrink while scrolled resets so the top of the frame returns" {
+test "a one-row editor shrink preserves clipped session scrollback" {
+    const gpa = std.testing.allocator;
+    const harness = try makeHarness(gpa, 20);
+    defer {
+        harness.deinit();
+        gpa.destroy(harness);
+    }
+    const before_clip = [_]Line{
+        line("history 0", 0),
+        line("history 1", 1),
+        line("body 0", 2),
+        caretLine("edit", .{ .id = 4, .column = 4 }),
+        line("wrap", 5),
+        line("status", 6),
+    };
+    try harness.render(&before_clip, .{ .columns = 20, .rows = 3 }, 2);
+    try harness.emulator.expectScreen(&.{ "edit", "wrap", "status" });
+
+    // The next transcript row clips history 0 from the retained frame. Its
+    // existing terminal row remains at the start of native scrollback.
+    const expanded = [_]Line{
+        line("history 0", 0),
+        line("history 1", 1),
+        line("body 0", 2),
+        line("body 1", 3),
+        caretLine("edit", .{ .id = 4, .column = 4 }),
+        line("wrap", 5),
+        line("status", 6),
+    };
+    try harness.render(&expanded, .{ .columns = 20, .rows = 3 }, 2);
+    try harness.emulator.expectScreen(&.{ "edit", "wrap", "status" });
+    const screen_top = harness.emulator.screen_top;
+    try std.testing.expectEqualStrings("history 0", harness.emulator.document.items[0].items);
+
+    // The bounded projection pulls history 0 into the frame when the editor
+    // loses one row. The view discards that prefix and keeps history 1 intact.
+    const shrunk = [_]Line{
+        line("history 0", 0),
+        line("history 1", 1),
+        line("body 0", 2),
+        line("body 1", 3),
+        caretLine("edit", .{ .id = 4, .column = 4 }),
+        line("status", 6),
+    };
+    try harness.render(&shrunk, .{ .columns = 20, .rows = 3 }, 2);
+    try harness.emulator.expectScreen(&.{ "edit", "status", "" });
+    try harness.emulator.expectCaret(.{ .frame_len = 5, .row = 3, .column = 4 });
+    try std.testing.expectEqual(screen_top, harness.emulator.screen_top);
+    const document_shrunk = [_][]const u8{
+        "history 0", "history 1", "body 0", "body 1", "edit", "status",
+    };
+    try std.testing.expectEqual(document_shrunk.len, harness.emulator.document.items.len);
+    for (document_shrunk, harness.emulator.document.items) |expected, actual| {
+        try std.testing.expectEqualStrings(expected, actual.items);
+    }
+    const shrink_bytes = harness.lastBytes();
+    try std.testing.expect(std.mem.indexOf(u8, shrink_bytes, escape.screen_repaint) == null);
+    try std.testing.expect(std.mem.indexOf(u8, shrink_bytes, "\x1b[3J") == null);
+    try std.testing.expect(std.mem.indexOf(u8, shrink_bytes, escape.screen_clear_below) != null);
+
+    // Growth consumes the blank row without a reset or a forward scroll.
+    try harness.render(&expanded, .{ .columns = 20, .rows = 3 }, 2);
+    try harness.emulator.expectScreen(&.{ "edit", "wrap", "status" });
+    try std.testing.expectEqual(screen_top, harness.emulator.screen_top);
+    const document_expanded = [_][]const u8{
+        "history 0", "history 1", "body 0", "body 1", "edit", "wrap", "status",
+    };
+    try std.testing.expectEqual(document_expanded.len, harness.emulator.document.items.len);
+    for (document_expanded, harness.emulator.document.items) |expected, actual| {
+        try std.testing.expectEqualStrings(expected, actual.items);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, harness.lastBytes(), escape.screen_reset) == null);
+}
+
+test "repeated shrinks accumulate blank rows below" {
     const gpa = std.testing.allocator;
     const harness = try makeHarness(gpa, 10);
     defer {
@@ -698,16 +951,36 @@ test "a shrink while scrolled resets so the top of the frame returns" {
     try harness.render(&tall, .{ .columns = 10, .rows = 4 }, 8);
     try harness.emulator.expectScreen(&.{ "r4", "r5", "r6", "r7" });
 
-    // Drop a row from the tail. The last page must now show r3, which had
-    // scrolled off the top. Only a clear and reprint can reach it, because an
-    // inline terminal cannot reveal its scrollback.
+    // Drop a row from the tail. The view keeps r3 in scrollback and moves the
+    // shorter tail up. The terminal leaves the row below it blank.
+    const screen_top = harness.emulator.screen_top;
     const short = [_]Line{
         line("r0", 0), line("r1", 1), line("r2", 2), line("r3", 3),
         line("r4", 4), line("r5", 5), line("r7", 7),
     };
     try harness.render(&short, .{ .columns = 10, .rows = 4 }, 8);
-    try harness.emulator.expectScreen(&.{ "r3", "r4", "r5", "r7" });
-    try std.testing.expect(std.mem.indexOf(u8, harness.lastBytes(), escape.screen_reset) != null);
+    try harness.emulator.expectScreen(&.{ "r4", "r5", "r7", "" });
+    try std.testing.expectEqual(screen_top, harness.emulator.screen_top);
+    try std.testing.expectEqualStrings("r3", harness.emulator.document.items[3].items);
+    try std.testing.expect(std.mem.indexOf(u8, harness.lastBytes(), escape.screen_reset) == null);
+
+    // Each additional shrink moves the tail up and adds another blank row.
+    const shorter = [_]Line{
+        line("r0", 0), line("r1", 1), line("r2", 2),
+        line("r3", 3), line("r4", 4), line("r7", 7),
+    };
+    try harness.render(&shorter, .{ .columns = 10, .rows = 4 }, 8);
+    try harness.emulator.expectScreen(&.{ "r4", "r7", "", "" });
+    try std.testing.expectEqual(screen_top, harness.emulator.screen_top);
+    try std.testing.expect(std.mem.indexOf(u8, harness.lastBytes(), escape.screen_reset) == null);
+
+    const shortest = [_]Line{
+        line("r0", 0), line("r1", 1), line("r2", 2), line("r3", 3), line("r7", 7),
+    };
+    try harness.render(&shortest, .{ .columns = 10, .rows = 4 }, 8);
+    try harness.emulator.expectScreen(&.{ "r7", "", "", "" });
+    try std.testing.expectEqual(screen_top, harness.emulator.screen_top);
+    try std.testing.expect(std.mem.indexOf(u8, harness.lastBytes(), escape.screen_reset) == null);
 }
 
 test "a backward slide within one page reprints from row zero" {

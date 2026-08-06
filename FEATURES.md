@@ -115,8 +115,8 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 
 - The conversation renders inline into the normal screen buffer and real scrollback. Temporary
   full-window pages use the alternate screen and restore the conversation on close.
-- Repaints only the rows that changed, atomically. A resize or a change above the viewport reprints
-  the window.
+- Repaints only the rows that changed, atomically. A shrink keeps native scrollback intact and can
+  leave blank rows below the interface. A resize or a change above the viewport reprints the window.
 - Restores the terminal on exit, on a failed start, and around an interactive OAuth login.
 - Parks the cursor below the interface on exit, so the shell prompt does not overwrite the last
   frame.

@@ -85,10 +85,12 @@ fn csi(self: *Emulator, sequence: []const u8) !usize {
             const count = @max(csiValue(parameters, 1), 1);
             self.cursor_row -= @min(count, self.cursor_row - self.screen_top);
         },
-        // CUD clamps at the bottom row. It never scrolls or grows the document.
+        // CUD clamps at the bottom row. It never scrolls the screen.
         'B' => {
             const count = @max(csiValue(parameters, 1), 1);
-            self.cursor_row = @min(self.cursor_row + count, self.document.items.len - 1);
+            const screen_bottom = self.screen_top + @max(self.rows, 1) - 1;
+            self.cursor_row = @min(self.cursor_row + count, screen_bottom);
+            try self.ensureRow(self.cursor_row);
         },
         // CUF clamps at the right margin. It cannot reach a pending-wrap cell.
         'C' => {
@@ -98,10 +100,12 @@ fn csi(self: *Emulator, sequence: []const u8) !usize {
         'H' => {
             self.cursor_row = self.screen_top;
             self.cursor_column = 0;
+            self.trimBlankTail();
         },
         'J' => switch (csiValue(parameters, 0)) {
-            2 => try self.clearScreen(),
             0 => try self.clearBelow(),
+            2 => self.clearScreen(),
+            3 => self.clearScrollback(),
             else => {},
         },
         'h' => if (std.mem.eql(u8, parameters, "?25")) {
@@ -115,13 +119,43 @@ fn csi(self: *Emulator, sequence: []const u8) !usize {
     return index + 1;
 }
 
-fn clearScreen(self: *Emulator) !void {
-    for (self.document.items) |*row| row.deinit(self.gpa);
-    self.document.clearRetainingCapacity();
-    try self.document.append(self.gpa, .empty);
-    self.cursor_row = 0;
-    self.cursor_column = 0;
+// Erase the visible rows. ED 2 does not move the cursor or erase scrollback.
+fn clearScreen(self: *Emulator) void {
+    const screen_end = @min(
+        self.document.items.len,
+        self.screen_top + @max(self.rows, 1),
+    );
+    for (self.document.items[self.screen_top..screen_end]) |*row| {
+        row.clearRetainingCapacity();
+    }
+}
+
+// Erase only the rows above the screen. ED 3 keeps the visible rows and cursor.
+fn clearScrollback(self: *Emulator) void {
+    std.debug.assert(self.cursor_row >= self.screen_top);
+    const dropped = self.screen_top;
+    if (dropped == 0) return;
+    for (self.document.items[0..dropped]) |*row| row.deinit(self.gpa);
+    const kept = self.document.items.len - dropped;
+    std.mem.copyForwards(
+        std.ArrayList(u8),
+        self.document.items[0..kept],
+        self.document.items[dropped..],
+    );
+    self.document.shrinkRetainingCapacity(kept);
+    self.cursor_row -= dropped;
     self.screen_top = 0;
+}
+
+// The view emits H only after ED 2. The sparse document can omit the trailing
+// rows because ED 2 made them blank.
+fn trimBlankTail(self: *Emulator) void {
+    while (self.document.items.len > self.cursor_row + 1 and
+        self.document.items[self.document.items.len - 1].items.len == 0)
+    {
+        var row = self.document.pop().?;
+        row.deinit(self.gpa);
+    }
 }
 
 // Advance the cursor one physical row. When the cursor is already on the
@@ -188,4 +222,32 @@ pub fn expectScreen(self: *Emulator, screen: []const []const u8) !void {
         const actual = if (at < self.document.items.len) self.document.items[at].items else "";
         try std.testing.expectEqualStrings(row, actual);
     }
+}
+
+test "ED 2 preserves scrollback and ED 3 removes it" {
+    const gpa = std.testing.allocator;
+    var emulator = try Emulator.init(gpa, 20);
+    defer emulator.deinit();
+    emulator.rows = 2;
+
+    try emulator.feed("old\r\none\r\ntwo");
+    try std.testing.expectEqual(@as(usize, 1), emulator.screen_top);
+    try std.testing.expectEqualStrings("old", emulator.document.items[0].items);
+
+    try emulator.feed("\x1b[2J");
+    try std.testing.expectEqual(@as(usize, 1), emulator.screen_top);
+    try std.testing.expectEqual(@as(usize, 2), emulator.cursor_row);
+    try std.testing.expectEqual(@as(usize, 3), emulator.cursor_column);
+    try std.testing.expectEqualStrings("old", emulator.document.items[0].items);
+    try emulator.expectScreen(&.{ "", "" });
+
+    try emulator.feed("\x1b[Hone\r\ntwo");
+    try std.testing.expectEqualStrings("old", emulator.document.items[0].items);
+    try emulator.expectScreen(&.{ "one", "two" });
+
+    try emulator.feed("\x1b[3J");
+    try std.testing.expectEqual(@as(usize, 0), emulator.screen_top);
+    try std.testing.expectEqual(@as(usize, 1), emulator.cursor_row);
+    try std.testing.expectEqual(@as(usize, 2), emulator.document.items.len);
+    try emulator.expectScreen(&.{ "one", "two" });
 }
