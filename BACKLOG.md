@@ -19,7 +19,7 @@ dependency on another item. Module layout and extension seams live in `AGENTS.md
 - [ ] **Tab completion** — Tab completes a partial slash command and lists the candidates when
       several match. _Tab currently decodes as ctrl-i._
 - [ ] **`/handoff`** — compact the conversation into a summary and continue with the reclaimed
-      context. _The command must also summarize cancelled turns and the synthesized tool results
+      context. _The command must also summarize canceled turns and the synthesized tool results
       they leave behind._
 - [ ] **`/stage`** — stage everything in git, so the agent's next diff shows only its own edits.
       _During a turn this is a steering message. When idle, the command prefills the editor and does
@@ -94,8 +94,8 @@ dependency on another item. Module layout and extension seams live in `AGENTS.md
       folding into the trailing user turn stays as the fallback._
 - [ ] **`/session` breakdown** — a per-turn ledger backs a session summary of tokens, cost, and
       cache savings, split by model. _Cost belongs in the ledger, not in history items. Billing is
-      per request. History must stay byte-stable for cache hits. A cancelled turn's reply rolls back
-      out of history. Cancelled and failed turns get their own entries, so cost survives `/handoff`
+      per request. History must stay byte-stable for cache hits. A canceled turn's reply rolls back
+      out of history. Canceled and failed turns get their own entries, so cost survives `/handoff`
       compaction._
 - [x] **Remaining subscription quota** — the status line shows how much of an OpenAI subscription's
       allowance remains.

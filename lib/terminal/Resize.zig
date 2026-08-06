@@ -94,7 +94,7 @@ pub fn deinit(self: *Resize) void {
 }
 
 /// Block until the next resize and drain the coalesced wake bytes. Surfaces
-/// `error.Canceled` when the awaiting task is cancelled at shutdown.
+/// `error.Canceled` when the awaiting task is canceled at shutdown.
 pub fn wait(self: *Resize, io: std.Io) !void {
     var buffer: [64]u8 = undefined;
     var chunk: [1][]u8 = .{buffer[0..]};

@@ -37,7 +37,7 @@ pub fn pkce(io: std.Io) Pkce {
 
 /// POST `body` to `url` and return the owned response body. The caller frees
 /// it. The request is bounded by the connect timeout: the whole connect, send,
-/// receive-head, and body read must finish within it, or it is cancelled and
+/// receive-head, and body read must finish within it, or it is canceled and
 /// reaped as `error.Timeout`.
 pub fn post(
     gpa: std.mem.Allocator,

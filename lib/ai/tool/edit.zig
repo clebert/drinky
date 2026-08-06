@@ -158,7 +158,7 @@ test "edit rewrites the file on disk" {
     try std.testing.expectEqualStrings("one 2 three", data);
 }
 
-test "edit cancelled while reading propagates" {
+test "edit canceled while reading propagates" {
     const gpa = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -172,7 +172,7 @@ test "edit cancelled while reading propagates" {
     try std.testing.expectError(error.Canceled, run(&context, input));
 }
 
-test "edit cancelled mid-write propagates and leaves the file untouched" {
+test "edit canceled mid-write propagates and leaves the file untouched" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});

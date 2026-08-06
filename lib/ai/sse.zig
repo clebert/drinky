@@ -94,7 +94,7 @@ pub fn Engine(comptime S: type) type {
                 // The timeout races connect, so a connect that finished right
                 // at the deadline can still surface as `error.Timeout`.
                 // `established` (set last by a full connect) marks that
-                // fully-built stream apart from a cancelled or partial connect,
+                // fully-built stream apart from a canceled or partial connect,
                 // whose own errdefers already ran. Free only the established
                 // stream here.
                 if (stream.established) deinit(stream);

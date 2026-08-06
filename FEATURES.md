@@ -16,9 +16,9 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - Enter during a turn queues a steering message that folds into the run at the next tool round.
 - Alt+Up pulls messages the turn has not picked up yet back into the editor to keep editing.
 - Steering left in the queue when a turn completes starts the next turn on its own.
-- Esc or Ctrl+C cancels a turn. Cancelled or failed turns keep finished rounds, drop the in-flight
+- Esc or Ctrl+C cancels a turn. Canceled or failed turns keep finished rounds, drop the in-flight
   tail, and return uncommitted text to the editor.
-- A tool call left unfinished is recorded as an error, so a cancelled mutation is never lost
+- A tool call left unfinished is recorded as an error, so a canceled mutation is never lost
   silently.
 - Timeouts and transient failures retry the whole request and clear the partial reply first.
 - A reply cut short by the output cap is kept, and reported as cut short.
@@ -54,7 +54,7 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - A ChatGPT subscription learns its real context windows after login.
 - Reasoning effort runs `none`, `low`, `medium`, `high`, `xhigh`, `max`, folded to what the model
   supports.
-- Session cost and cache savings accumulate per model and count a cancelled turn's billed usage.
+- Session cost and cache savings accumulate per model and count a canceled turn's billed usage.
 
 ## Accounts
 

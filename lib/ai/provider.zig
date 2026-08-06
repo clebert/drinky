@@ -156,7 +156,7 @@ pub const Stream = union(llm.Account) {
 
     /// The subscription allowance the response head reported, or null when the
     /// account or backend sends none. It is valid as soon as the head is read,
-    /// so it outlives a stream that errors or is cancelled before its stop
+    /// so it outlives a stream that errors or is canceled before its stop
     /// event.
     pub fn quotaSoFar(self: *const Stream) ?llm.Quota {
         return switch (self.*) {

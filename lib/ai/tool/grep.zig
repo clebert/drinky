@@ -424,7 +424,7 @@ test "grep reports an incomplete search when nothing was shown" {
     );
 }
 
-test "grep cancelled while reading a file propagates" {
+test "grep canceled while reading a file propagates" {
     const gpa = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

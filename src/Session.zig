@@ -73,7 +73,7 @@ steering_consumed_count: usize,
 /// `[]const []const u8` without a per-repaint allocation.
 steering_view: std.ArrayList([]const u8),
 /// The submitted prompt's rich draft, retained while a turn is live. A failed
-/// or cancelled turn that committed nothing returns it to the editor. Every
+/// or canceled turn that committed nothing returns it to the editor. Every
 /// other terminal frees it because the prompt belongs to committed history.
 turn_origin: ?TurnOrigin,
 
@@ -1198,7 +1198,7 @@ test "streamed and tool text cannot emit terminal controls" {
     }
 }
 
-// A worker event can arrive after the turn ends (a straggler from a cancelled
+// A worker event can arrive after the turn ends (a straggler from a canceled
 // turn). The consumer frees and drops it rather than append it.
 test "stream events are dropped once the turn is over" {
     const gpa = std.testing.allocator;
@@ -1214,7 +1214,7 @@ test "stream events are dropped once the turn is over" {
 
 // Cancellation, resubmission, and these delayed events can all be entries in one
 // batch that App already drained from the shared queue.
-test "a cancelled turn's stale output and completion cannot affect its successor" {
+test "a canceled turn's stale output and completion cannot affect its successor" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();

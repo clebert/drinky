@@ -265,7 +265,7 @@ const FaultyIo = struct {
     }
 };
 
-test "collect stops walking when an entered directory is cancelled" {
+test "collect stops walking when an entered directory is canceled" {
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();
     var faulty: FaultyIo = .init(threaded.io(), .{
@@ -284,7 +284,7 @@ test "collect stops walking when an entered directory is cancelled" {
     try std.testing.expectEqual(@as(usize, 0), faulty.open_handles);
 }
 
-test "collect stops walking when a subdirectory read is cancelled" {
+test "collect stops walking when a subdirectory read is canceled" {
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();
     var faulty: FaultyIo = .init(threaded.io(), .{

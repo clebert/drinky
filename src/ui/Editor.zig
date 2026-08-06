@@ -328,7 +328,7 @@ pub fn appendDraft(self: *Editor, source: *Draft) void {
 /// existing line). The insert consumes each source (its atoms' payloads move by
 /// pointer) and leaves it empty. Infallible once `reserveComposition` has covered
 /// it, so the cancel composition cannot half-complete after the worker is already
-/// cancelled.
+/// canceled.
 pub fn prependComposition(self: *Editor, lead: ?*Draft, drafts: []Draft) void {
     const had_content = self.draft.visible.items.len > 0;
     var offset: usize = 0;

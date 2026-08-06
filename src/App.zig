@@ -622,7 +622,7 @@ fn armTick(self: *App) void {
     self.tick_pending = true;
 }
 
-/// Frame timer task: sleep until the deadline, then push one `.tick`. Cancelled at
+/// Frame timer task: sleep until the deadline, then push one `.tick`. Canceled at
 /// shutdown or when its frame is superseded. A cancel just drops the tick.
 fn frameTimer(self: *App, delay_ms: i64) void {
     if (delay_ms > 0) self.io.sleep(.fromMilliseconds(delay_ms), .awake) catch return;
@@ -899,7 +899,7 @@ fn startSteeringTurn(self: *App) !void {
 /// a successor.
 fn cancelTurn(self: *App) !void {
     // Preflight editor capacity to restore every rich draft before the join. An
-    // OOM then cannot leave an already-cancelled worker's drafts unrecoverable.
+    // OOM then cannot leave an already-canceled worker's drafts unrecoverable.
     // The mirror is consumer-owned and stable here.
     try self.session.reserveSteeringRestore();
     const result = self.cancelTurnFuture() orelse return;
@@ -1587,7 +1587,7 @@ fn canceledWorker() WorkerResult {
 }
 
 // A canceled worker whose turn committed a round, so the cancel path keeps the
-// committed transcript, shows the `cancelled` line, and drops no returned prompt.
+// committed transcript, shows the `canceled` line, and drops no returned prompt.
 fn committedCanceledWorker() WorkerResult {
     return .{
         .outcome = .{ .receipt = .{
@@ -1610,7 +1610,7 @@ fn spawnCanceledTurn(app: *App) !void {
 }
 
 // Spawn a canceled worker whose turn committed a round, so the cancel path keeps
-// the committed transcript and shows the `cancelled` line. Reaped by `cancelTurn`.
+// the committed transcript and shows the `canceled` line. Reaped by `cancelTurn`.
 fn spawnCommittedCanceledTurn(app: *App) !void {
     app.turn_future = try app.io.concurrent(committedCanceledWorker, .{});
 }
@@ -1710,7 +1710,7 @@ test "canceling a promoted steering turn restores its rich paste draft" {
     try std.testing.expectEqualStrings(payload, restored);
 }
 
-test "cancelling a turn joins and clears its active worker" {
+test "canceling a turn joins and clears its active worker" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -1771,8 +1771,8 @@ test "cancelling a turn joins and clears its active worker" {
 // The race a cancel must survive: the worker folded a pasted message (channel
 // entry taken, `.steering_consumed` still queued, so only the mirror holds it)
 // while a newer message is pending in both. Everything returns to the editor
-// exactly once, and the queued usage resyncs from the joined agent.
-test "cancelling a turn restores in-flight steering and resyncs usage" {
+// exactly once, and the queued usage comes again from the joined agent.
+test "canceling a turn restores in-flight steering and reads the usage again" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -1877,7 +1877,7 @@ test "cancel restores steering before event allocation failure" {
     defer app.session.deinit();
     app.session.beginTurn(1);
 
-    // A committed cancel appends the `cancelled` event. Force the OOM there
+    // A committed cancel appends the `canceled` event. Force the OOM there
     // and confirm the steering is already restored, not lost to the failure.
     try app.session.editor.insert("restore me");
     try app.submitSteering();
@@ -3556,7 +3556,7 @@ test "progress allocation failure still finalizes a canceled turn" {
 
 // A cancel that commits nothing returns the submitted prompt to the editor as a
 // rich draft, its collapsed paste preserved for an exact expansion. It shows no
-// `cancelled` line (the turn simply vanished).
+// `canceled` line (the turn simply vanished).
 test "cancel returns the submitted prompt as a rich draft with its paste placeholder" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -3597,7 +3597,7 @@ test "cancel returns the submitted prompt as a rich draft with its paste placeho
 }
 
 // Committed progress queued but not yet read lands before the rewind, so a
-// partial-commit cancel keeps its presented round and adds `cancelled`.
+// partial-commit cancel keeps its presented round and adds `canceled`.
 test "a committed cancel drains queued progress into the transcript before rewinding" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;

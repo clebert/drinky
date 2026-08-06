@@ -66,7 +66,7 @@ pub const Stats = struct {
     last: llm.Usage = .{},
     /// The active subscription account's remaining allowance, adopted from each
     /// response head that carries one. This includes a head whose stream then
-    /// errors or is cancelled, so an exhausted 429 still updates it. A head that
+    /// errors or is canceled, so an exhausted 429 still updates it. A head that
     /// omits one leaves it unchanged. The value is null until a head reports one.
     /// An account switch clears it. API-key accounts report none.
     quota: ?llm.Quota = null,
@@ -546,7 +546,7 @@ fn fetchReply(
         defer stream.deinit();
         // The response head carries the subscription allowance before any events,
         // so adopt it as soon as the stream is established. A stream that then
-        // errors, is cancelled, or never reaches its terminal `.stop` still
+        // errors, is canceled, or never reaches its terminal `.stop` still
         // updates the gauge. The most visible case is an exhausted 429 that
         // reports a spent account. A head that reports none leaves the last-known
         // allowance.
@@ -1298,7 +1298,7 @@ test "a cancel during steering delivery returns the taken batch to the queue" {
     var agent = scriptedAgent(gpa);
     defer agent.deinit();
 
-    // A handler cancelled while it reports the batch: a mid-turn Esc that races
+    // A handler canceled while it reports the batch: a mid-turn Esc that races
     // the round-boundary drain.
     const CancelHandler = struct {
         fn onSteering(self: *@This(), text: []const u8, count: usize) !void {
@@ -2678,7 +2678,7 @@ test "a cancel at the barrier reaps launched reads and starts nothing after it" 
     );
     try std.testing.expect(!log.mutation_overlap);
     // Only r1 was announced. The barrier drains ahead of its own announce, so a
-    // mutation cancelled there is never presented as started, and r3 past it
+    // mutation canceled there is never presented as started, and r3 past it
     // never begins.
     try std.testing.expectEqual(@as(usize, 1), handler.tool_start_count);
     try std.testing.expectEqual(@as(usize, 0), handler.tool_result_count);
@@ -2976,7 +2976,7 @@ test "an API error retains completed rounds, reports, and fails the turn" {
     }
 }
 
-test "a failed or cancelled attempt still adopts the head's allowance" {
+test "a failed or canceled attempt still adopts the head's allowance" {
     const gpa = std.testing.allocator;
     const exhausted: llm.Quota = .{ .primary = .{ .used_percent = 100, .window_minutes = 300 } };
 
@@ -3245,7 +3245,7 @@ test "cancellation after a completed tool round retains it at the checkpoint" {
     var handler: CaptureHandler = .{ .gpa = gpa };
     defer handler.deinit();
 
-    // Round 1 runs a tool. Round 2's request is cancelled mid-stream.
+    // Round 1 runs a tool. Round 2's request is canceled mid-stream.
     var fetch: ScriptedFetch = .{ .attempts = &.{
         .{ .stream = .{ .events = &tool_round_events } },
         .{ .stream = .{ .events = &.{}, .terminal_error = error.Canceled } },
@@ -3277,14 +3277,14 @@ test "cancellation before the first reply returns exactly to the turn base" {
     try std.testing.expectEqual(outcome.receipt.history_base, outcome.receipt.history_end);
 }
 
-test "a cancelled request's partial usage is folded into the cost stats" {
+test "a canceled request's partial usage is folded into the cost stats" {
     const gpa = std.testing.allocator;
     var agent = scriptedAgent(gpa);
     defer agent.deinit();
     var handler: CaptureHandler = .{ .gpa = gpa };
     defer handler.deinit();
 
-    // The read is cancelled before any terminal `.stop`, but the stream had
+    // The read is canceled before any terminal `.stop`, but the stream had
     // already accumulated the prompt's usage, which the provider bills.
     var fetch: ScriptedFetch = .{ .attempts = &.{.{ .stream = .{
         .events = &.{},
@@ -3343,7 +3343,7 @@ test "a cancel during the post-stop usage callback books terminal usage only onc
     try std.testing.expectEqual(@as(u64, 1000), agent.stats.last.input);
 }
 
-test "a no-tool reply is retained when a later steered reply is cancelled" {
+test "a no-tool reply is retained when a later steered reply is canceled" {
     const gpa = std.testing.allocator;
     var agent = scriptedAgent(gpa);
     defer agent.deinit();
@@ -3351,7 +3351,7 @@ test "a no-tool reply is retained when a later steered reply is cancelled" {
     defer handler.deinit();
 
     // Round 1 answers with no tools. A steering message keeps the turn alive.
-    // Round 2 is cancelled before it commits.
+    // Round 2 is canceled before it commits.
     try agent.steering.push("steer");
     var fetch: ScriptedFetch = .{ .attempts = &.{
         .{ .stream = .{ .events = &end_turn_events } },
@@ -3359,7 +3359,7 @@ test "a no-tool reply is retained when a later steered reply is cancelled" {
     } };
     const outcome = agent.runTurnWith(&fetch, fake_tools, "go", &handler);
     try std.testing.expect(std.meta.activeTag(outcome.disposition) == .canceled);
-    // The completed no-tool reply survives. The cancelled steer round is dropped.
+    // The completed no-tool reply survives. The canceled steer round is dropped.
     try std.testing.expectEqual(@as(usize, 2), agent.items.items.len);
     try std.testing.expectEqualStrings("go", agent.items.items[0].message.text);
     try std.testing.expectEqualStrings("hi", agent.items.items[1].message.text);

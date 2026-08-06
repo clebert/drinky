@@ -50,7 +50,7 @@ fn Timed(comptime Function: type) type {
 
 /// Run `function(args)` bounded by `timeout_ms`. It returns the function's
 /// result if it finishes first, or `error.Timeout` if the timer wins (the
-/// operation is cancelled and reaped first). A cancel of the calling task
+/// operation is canceled and reaped first). A cancel of the calling task
 /// propagates as `error.Canceled`. A `timeout_ms` of 0, or an io without
 /// concurrency, runs the operation unbounded.
 ///

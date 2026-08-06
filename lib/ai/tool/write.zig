@@ -96,7 +96,7 @@ test "write to a missing directory reports an error" {
     try std.testing.expect(std.mem.indexOf(u8, result.content, "could not write") != null);
 }
 
-test "write cancelled mid-write propagates and leaves the file untouched" {
+test "write canceled mid-write propagates and leaves the file untouched" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
