@@ -55,6 +55,8 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - Reasoning effort runs `none`, `low`, `medium`, `high`, `xhigh`, `max`, folded to what the model
   supports.
 - A restart resumes on the account, model, and effort level this project used last.
+- A model belongs to its account. A login to the remembered account restores its model, and a
+  switch back returns an account to the model it ran in this session.
 - `/model` and `/effort` both refuse while signed out, since the status line hides both values then.
 - Session cost and cache savings accumulate per model and count a canceled turn's billed usage.
 

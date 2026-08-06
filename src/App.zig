@@ -59,6 +59,12 @@ default_models: Config.DefaultModels,
 /// The machine-local choices of this project: read once at startup, written
 /// whenever the account, the model, or the effort level changes.
 state: State,
+/// The model each account ran last in this project, held as the name that keys
+/// the compiled table. It starts from what `state` remembered, so a login to the
+/// remembered account restores its model and does not reset to the default. A
+/// model belongs to the account that ran it, so an account with no entry here
+/// still starts on its own default.
+account_models: std.EnumArray(ai.llm.Account, ?[]const u8),
 /// Project instructions, skill metadata, and the composed prompt. All outlive
 /// the agent, which borrows `prompt`.
 project_instructions: ai.instructions.Result,
@@ -364,6 +370,7 @@ pub fn run(
         .project = self.project_instructions.projectRoot() orelse cwd,
     });
     defer self.state.deinit();
+    self.seedAccountModels();
 
     const user_skills = try std.fs.path.resolve(gpa, &.{ cwd, home, ".agents", "skills" });
     defer gpa.free(user_skills);
@@ -389,7 +396,7 @@ pub fn run(
     const active = self.startAccount();
     const start_account = active orelse .anthropic_subscription;
     const start_client = if (active) |account| self.accounts.client(account) else null;
-    const start_model = self.startModel(start_account);
+    const start_model = self.accountModel(start_account);
     const start_effort = self.startEffort(config.default_effort);
     self.agent = ai.Agent.init(gpa, io, start_client, .{
         .model = start_model,
@@ -806,14 +813,28 @@ fn startAccount(self: *const App) ?ai.llm.Account {
     return self.accounts.firstAuthenticated();
 }
 
-/// The model `account` resumes on: the one this project used last with this
-/// account, else the account's default model. A remembered model applies only to
-/// the account that ran it, so another account starts on its own default.
-fn startModel(self: *const App, account: ai.llm.Account) ai.models.Model {
-    if (self.state.start.choice) |choice| {
-        if (choice.account == account) return self.accounts.resolveModel(account, choice.model);
-    }
-    return self.defaultModel(account);
+/// Seed the per-account models from what the file remembered. Startup and every
+/// later switch then read one memory. A login to the remembered account
+/// therefore restores its model and does not reset to the account's default.
+fn seedAccountModels(self: *App) void {
+    self.account_models = .initFill(null);
+    const choice = self.state.start.choice orelse return;
+    self.account_models.set(choice.account, choice.model.name);
+}
+
+/// The model `account` runs: the one it ran last in this project, else the
+/// account's default model. A model belongs to the account that ran it, so
+/// another account gets its own default.
+///
+/// The lookup holds a name, not a whole model, and resolves it on every read.
+/// The account overlays therefore reach the model in use. An OpenAI
+/// subscription learns its real context windows at login. A model resolved
+/// before that login keeps a stale window. A name the compiled table does not
+/// offer falls back to the default model.
+fn accountModel(self: *const App, account: ai.llm.Account) ai.models.Model {
+    const name = self.account_models.get(account) orelse return self.defaultModel(account);
+    const base = ai.models.get(account.provider(), name) orelse return self.defaultModel(account);
+    return self.accounts.resolveModel(account, base);
 }
 
 /// The effort level to start on: the one this project used last, else the
@@ -1266,6 +1287,10 @@ fn applyOutcome(self: *App, outcome: ai.command.Outcome) !void {
 /// account is active, so the only signed-out change is the sign-in itself.
 fn recordState(self: *App) !void {
     const account = self.activeAccount() orelse return;
+    // A model belongs to its account. The file holds one account, so this memory
+    // carries the rest for as long as the session runs. A switch away and back
+    // therefore returns to the model that account ran, not to its default.
+    self.account_models.set(account, self.agent.model.name);
     self.state.record(account, &self.agent.model, self.agent.effort) catch |err| switch (err) {
         error.CorruptStore => try self.recordEvent(
             .failure,
@@ -1386,10 +1411,11 @@ fn logoutAccount(self: *App, account: ai.llm.Account) !void {
     try self.session.applyOutcome(try ai.command.run(&context, "/login"));
 }
 
-/// Switch the agent to `account` on its default model. The client is present
-/// because the caller just authenticated the account or read it from the registry.
+/// Switch the agent to `account` on the model that account ran last, else on its
+/// default model. The client is present because the caller just authenticated the
+/// account or read it from the registry.
 fn adopt(self: *App, account: ai.llm.Account) void {
-    self.agent.switchTo(self.accounts.client(account).?, self.defaultModel(account));
+    self.agent.switchTo(self.accounts.client(account).?, self.accountModel(account));
 }
 
 /// Replace the bottom footer with one transient notice.
@@ -3303,16 +3329,17 @@ test "startup resumes on the account, model, and effort level this project used 
         .project = "/work",
     });
     defer app.state.deinit();
+    app.seedAccountModels();
 
     // The remembered account wins over the first authenticated one, which is the
     // Anthropic key here.
     try std.testing.expectEqual(ai.llm.Account.openai_api, app.startAccount().?);
-    try std.testing.expectEqualStrings("gpt-5.6-luna", app.startModel(.openai_api).name);
+    try std.testing.expectEqualStrings("gpt-5.6-luna", app.accountModel(.openai_api).name);
     // A remembered model belongs to the account that ran it. Any other account
     // starts on its own default.
     try std.testing.expectEqualStrings(
         anthropic_default.name,
-        app.startModel(.anthropic_api).name,
+        app.accountModel(.anthropic_api).name,
     );
     // The remembered effort level outranks a configured default.
     try std.testing.expectEqual(ai.llm.Effort.low, app.startEffort(.max));
@@ -3340,15 +3367,82 @@ test "a signed-out remembered account falls back and the defaults fill the rest"
         .project = "/work",
     });
     defer app.state.deinit();
+    app.seedAccountModels();
 
     try std.testing.expectEqual(ai.llm.Account.anthropic_api, app.startAccount().?);
     try std.testing.expectEqualStrings(
         anthropic_default.name,
-        app.startModel(.anthropic_api).name,
+        app.accountModel(.anthropic_api).name,
     );
+    // The memory survives for the account that ran it, even while that account
+    // holds no credentials. A later login therefore restores the model rather
+    // than resetting to the account's default.
+    try std.testing.expectEqualStrings("gpt-5.6-luna", app.accountModel(.openai_api).name);
     // With nothing remembered, the configured default wins, else the compiled one.
     try std.testing.expectEqual(ai.llm.Effort.medium, app.startEffort(.medium));
     try std.testing.expectEqual(effort_default, app.startEffort(null));
+}
+
+test "a switch back to an account restores the model that account ran" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(home);
+    // The project last ran an Anthropic model that is not the compiled default.
+    try State.writeForTest(io, &tmp,
+        \\{ "/work": { "account": "anthropic_api", "model": "claude-sonnet-5", "effort": "none" } }
+    );
+
+    var app: App = undefined;
+    app.gpa = gpa;
+    app.io = io;
+    app.default_models = .{};
+    app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{
+        .anthropic = "sk-anthropic",
+        .openai = "sk-openai",
+    });
+    defer app.accounts.deinit();
+    app.state = try State.open(gpa, io, &.{
+        .working_directory = home,
+        .home = home,
+        .project = "/work",
+    });
+    defer app.state.deinit();
+    app.seedAccountModels();
+
+    const start_model = app.accountModel(.anthropic_api);
+    try std.testing.expectEqualStrings("claude-sonnet-5", start_model.name);
+    app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_api), .{
+        .model = start_model,
+        .system = "",
+        .retry = .{},
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, start_model, .none);
+    defer app.session.deinit();
+    try app.state.seed(.anthropic_api, &start_model, .none);
+
+    // Away to another account: that account has run nothing here, so it takes
+    // its own default.
+    try app.applyOutcome(.{ .switch_account = .openai_api });
+    try std.testing.expectEqualStrings(openai_default.name, app.agent.model.name);
+
+    // Back again. The model the account ran returns, and the compiled default
+    // never overwrites it.
+    try app.applyOutcome(.{ .switch_account = .anthropic_api });
+    try std.testing.expectEqualStrings("claude-sonnet-5", app.agent.model.name);
+
+    // A switch that lands on the remembered pair writes it back unchanged, so a
+    // restart resumes on it too.
+    var file = (try ai.json_store.open(gpa, io, app.state.path)).?;
+    defer file.deinit();
+    const entry = file.entry("/work").?;
+    try std.testing.expectEqualStrings("anthropic_api", entry.get("account").?.string);
+    try std.testing.expectEqualStrings("claude-sonnet-5", entry.get("model").?.string);
 }
 
 test "a remembered account does not resume when no account is authenticated" {
