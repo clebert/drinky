@@ -99,8 +99,8 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - Prompt caching is always on: explicit breakpoints for Anthropic, the automatic per-session cache
   for OpenAI.
 - Reasoning is requested summarized at the resolved effort, and replayed verbatim on later turns.
-- Anthropic Subscription and Anthropic Console requests carry the Claude Code client identity.
-  A plain API key goes straight to the platform API.
+- Anthropic Subscription and Anthropic Console requests carry the Claude Code client identity. A
+  plain API key goes straight to the platform API.
 - Requests time out after 30 s to the response head and 60 s between streamed events. Keepalive
   filler does not count as progress.
 - A failed request retries up to 3 times with 500 ms–16 s backoff and honors a server's retry-after
@@ -113,10 +113,12 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - Repaints only the rows that changed, atomically. A resize or a change above the viewport reprints
   the window.
 - Restores the terminal on exit, on a failed start, and around an interactive OAuth login.
-- Parks the cursor below the interface on exit, so the shell prompt does not overwrite the last frame.
+- Parks the cursor below the interface on exit, so the shell prompt does not overwrite the last
+  frame.
 - Handles typing, streaming output, and resizes concurrently, so the interface never freezes
   mid-turn.
-- Repaints are frame-limited and scheduled only while something is dirty or animating.
+- Repaints are frame-limited at a fixed rate and scheduled only while something is dirty or
+  animating.
 - Answer text grows as one block, with reasoning collected into a separate one tinted grey and
   italic. Both render their markdown: headings, lists, blockquotes, code blocks, rules, and inline
   emphasis.

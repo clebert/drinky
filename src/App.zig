@@ -42,10 +42,6 @@ const intro_text = "Enter: Send · Shift+Enter: New line · Esc: Cancel · " ++
 /// Two Ctrl+C presses within this window quit. A lone press clears the editor.
 const ctrl_c_window_ms = 500;
 
-/// The target frame interval. The loop paints at most once per this window, so a
-/// keystroke echoes within it and a burst of stream events coalesces into it.
-const frame_interval_ms = 16;
-
 /// Events the channel buffers before a producer blocks in `putOne`. One batched
 /// `get` drains up to this many at once, so a whole burst collapses into a frame.
 const queue_capacity = 256;
@@ -98,9 +94,37 @@ turn_generation: u64,
 tick_future: ?std.Io.Future(void),
 /// A frame timer is armed and its `.tick` has not been drained yet.
 tick_pending: bool,
-/// Monotonic time of the last frame opportunity, so the next tick lands one
-/// interval later even when a quantized animation step did not repaint.
-frame_ms_last: i64,
+/// The frame schedule. Only `armTick` advances it, so no frame can reset it.
+frame_grid: FrameGrid,
+
+/// The frame grid: the deadlines that pace the repaints. Each deadline is one
+/// interval after the previous deadline, not one interval after the previous
+/// frame ended. The work of a frame therefore falls inside its own interval and
+/// does not add to it. A late wake moves the phase of one frame and leaves the
+/// next deadline in place, which matters because macOS has no absolute sleep and
+/// wakes a 16 ms wait about 3 ms late.
+const FrameGrid = struct {
+    /// The deadline of the armed frame timer, on the monotonic clock.
+    deadline_ns: i96,
+
+    /// The interval between two deadlines. The loop paints at most once per this
+    /// window, so a keystroke echoes within it and a burst of stream events
+    /// coalesces into it.
+    const interval_ns = 16 * std.time.ns_per_ms;
+
+    /// Start the grid at `now_ns`. The next deadline lands one interval later.
+    fn reset(now_ns: i96) FrameGrid {
+        return .{ .deadline_ns = now_ns };
+    }
+
+    /// Move to the next deadline. A slot that has already gone yields `now_ns`,
+    /// so the loop never builds a backlog of missed frames, and the first frame
+    /// after an idle wait paints at once.
+    fn advance(self: *FrameGrid, now_ns: i96) void {
+        const next_ns = self.deadline_ns + interval_ns;
+        self.deadline_ns = if (next_ns <= now_ns) now_ns else next_ns;
+    }
+};
 
 /// The turn worker's presentation handler. It does not mutate the transcript and
 /// instead enqueues owned `UiEvent`s for the consumer. It lives on the worker
@@ -304,7 +328,7 @@ pub fn run(
     // the second of a pair.
     self.ctrl_c_ms_last = -ctrl_c_window_ms;
     self.tick_pending = false;
-    self.frame_ms_last = 0;
+    self.frame_grid = .reset(0);
     self.input_future = null;
     self.resize_future = null;
     self.turn_future = null;
@@ -399,7 +423,9 @@ pub fn run(
     }
     defer self.prepareTerminalExit();
     try self.refresh();
-    self.frame_ms_last = self.nowMs();
+    // Start the frame grid at the first painted frame, so the first tick lands
+    // one interval after it rather than at once.
+    self.frame_grid = .reset(self.nowNs());
 
     self.running = true;
     defer self.shutdownTasks();
@@ -572,7 +598,6 @@ fn runLoop(self: *App) !void {
                 try self.refresh();
                 self.session.dirty = false;
             }
-            self.frame_ms_last = self.nowMs();
         }
         if ((self.session.dirty or self.session.animating()) and !self.tick_pending) self.armTick();
     }
@@ -608,24 +633,34 @@ fn applyBatch(self: *App, events: []const Session.UiEvent) !bool {
     return ticked;
 }
 
-/// Arm the next frame: a one-shot timer that fires one interval after the last
-/// opportunity. On the impossible failure to spawn it, paint inline.
+/// Arm the next frame: a one-shot timer for the next deadline on the grid. This
+/// is the only place that advances the grid, so the work of a frame stays inside
+/// its own interval. On the impossible failure to spawn the timer, paint inline
+/// and start the grid again at the painted frame.
 fn armTick(self: *App) void {
-    const elapsed = self.nowMs() - self.frame_ms_last;
-    const delay_ms: i64 = if (elapsed >= frame_interval_ms) 0 else frame_interval_ms - elapsed;
-    self.tick_future = self.io.concurrent(frameTimer, .{ self, delay_ms }) catch {
+    self.frame_grid.advance(self.nowNs());
+    const deadline_ns = self.frame_grid.deadline_ns;
+    self.tick_future = self.io.concurrent(frameTimer, .{ self, deadline_ns }) catch {
         self.refresh() catch {};
         self.session.dirty = false;
-        self.frame_ms_last = self.nowMs();
+        self.frame_grid = .reset(self.nowNs());
         return;
     };
     self.tick_pending = true;
 }
 
-/// Frame timer task: sleep until the deadline, then push one `.tick`. Canceled at
-/// shutdown or when its frame is superseded. A cancel just drops the tick.
-fn frameTimer(self: *App, delay_ms: i64) void {
-    if (delay_ms > 0) self.io.sleep(.fromMilliseconds(delay_ms), .awake) catch return;
+/// Frame timer task: wait for the deadline, then push one `.tick`. It waits on
+/// the deadline itself, not on a duration, so the wait cannot drift with the time
+/// that the arming took. A deadline that has already gone returns at once, which
+/// is what `std.Io.Clock.Timestamp.wait` promises. Canceled at shutdown or when
+/// its frame is superseded. A cancel just drops the tick. It takes the deadline
+/// by value, so it reads no state the consumer can write.
+fn frameTimer(self: *App, deadline_ns: i96) void {
+    const deadline: std.Io.Clock.Timestamp = .{
+        .raw = .fromNanoseconds(deadline_ns),
+        .clock = .awake,
+    };
+    deadline.wait(self.io) catch return;
     self.queue.putOne(self.io, .tick) catch {};
 }
 
@@ -1010,9 +1045,14 @@ fn refresh(self: *App) !void {
     try self.session.paint(size);
 }
 
-/// Milliseconds on the monotonic clock, for frame scheduling.
+/// Milliseconds on the monotonic clock, for the double Ctrl+C window.
 fn nowMs(self: *App) i64 {
     return std.Io.Timestamp.now(self.io, .awake).toMilliseconds();
+}
+
+/// Nanoseconds on the monotonic clock, for frame scheduling.
+fn nowNs(self: *App) i96 {
+    return std.Io.Timestamp.now(self.io, .awake).toNanoseconds();
 }
 
 fn submit(self: *App) !void {
@@ -3683,4 +3723,44 @@ test "a committed cancel drains queued progress into the transcript before rewin
     try std.testing.expect(!blocks[3].event.is_error);
     try std.testing.expectEqualStrings("You canceled the turn.", blocks[3].event.text.items);
     try std.testing.expectEqual(@as(f64, 2.5), app.session.stats_shown.cost);
+}
+
+test "the frame grid holds a fixed period through a late wake and a slow paint" {
+    // Model the consumer loop. The timer wakes late, the frame paints, and the
+    // loop then arms the next one. Every deadline must stay exactly one interval
+    // after the previous one, so the lateness and the paint cost never add to the
+    // period. This is the property a per-frame reset of the grid would destroy.
+    const wake_late_ns: i96 = 3 * std.time.ns_per_ms;
+    const paint_ns: i96 = 5 * std.time.ns_per_ms;
+    var grid: FrameGrid = .reset(1000);
+    var previous_ns = grid.deadline_ns;
+    for (0..60) |_| {
+        const armed_ns = previous_ns + wake_late_ns + paint_ns;
+        grid.advance(armed_ns);
+        try std.testing.expectEqual(previous_ns + FrameGrid.interval_ns, grid.deadline_ns);
+        // Anchored on the wake instead, the period would grow by the lateness and
+        // the paint cost on every frame.
+        try std.testing.expect(grid.deadline_ns != armed_ns + FrameGrid.interval_ns);
+        previous_ns = grid.deadline_ns;
+    }
+    try std.testing.expectEqual(@as(i96, 1000) + 60 * FrameGrid.interval_ns, grid.deadline_ns);
+}
+
+test "the frame grid starts again after an overrun or an idle wait" {
+    // A frame that overran its slot fires at once and starts the grid again, so a
+    // slow frame cannot leave a backlog of missed deadlines behind it.
+    var grid: FrameGrid = .reset(1000);
+    const overrun_ns: i96 = 1000 + 20 * std.time.ns_per_ms;
+    grid.advance(overrun_ns);
+    try std.testing.expectEqual(overrun_ns, grid.deadline_ns);
+
+    // A wake from an idle channel starts the grid again too, so the first frame
+    // after it paints at once instead of after a whole interval.
+    const idle_ns: i96 = 5 * std.time.ns_per_s;
+    grid.advance(idle_ns);
+    try std.testing.expectEqual(idle_ns, grid.deadline_ns);
+
+    // The grid picks the fixed period up again from there.
+    grid.advance(idle_ns);
+    try std.testing.expectEqual(idle_ns + FrameGrid.interval_ns, grid.deadline_ns);
 }

@@ -19,8 +19,8 @@ dependency on another item. Module layout and extension seams live in `AGENTS.md
 - [ ] **Tab completion** — Tab completes a partial slash command and lists the candidates when
       several match. _Tab currently decodes as ctrl-i._
 - [ ] **`/handoff`** — compact the conversation into a summary and continue with the reclaimed
-      context. _The command must also summarize canceled turns and the synthesized tool results
-      they leave behind._
+      context. _The command must also summarize canceled turns and the synthesized tool results they
+      leave behind._
 - [ ] **`/stage`** — stage everything in git, so the agent's next diff shows only its own edits.
       _During a turn this is a steering message. When idle, the command prefills the editor and does
       not send, so the user reviews first._
@@ -47,9 +47,9 @@ dependency on another item. Module layout and extension seams live in `AGENTS.md
       rest. A repeated file loads once, because the canonical path is its identity. A bad entry
       never stops pith. The core always comes from the binary._
 - [x] **Project instructions** — the system prompt includes the applicable `AGENTS.md` files. _At
-      startup, load exact-case files from the nearest Git root through the working directory in
-      path order. Outside Git, inspect only the working directory. There is no global file or
-      `CLAUDE.md` fallback. Report the file that is not valid. Report an ignored `CLAUDE.md` or a
+      startup, load exact-case files from the nearest Git root through the working directory in path
+      order. Outside Git, inspect only the working directory. There is no global file or `CLAUDE.md`
+      fallback. Report the file that is not valid. Report an ignored `CLAUDE.md` or a
       likely-misspelled `AGENT.md`._
 - [ ] **Custom prompts** — user-maintained prompt templates run as slash commands with argument
       substitution.
@@ -133,5 +133,5 @@ dependency on another item. Module layout and extension seams live in `AGENTS.md
 
 - [ ] **Configurable transcript window** — the 8-page transcript window moves into `config.json` and
       trades scrollback retention against per-frame redraw cost. _Clamp to at least one page._
-- [ ] **Fold new settings into `config.json`** — the skill, agent, and prompt directories join it
-      as they land. _API keys stay env-only. No secrets go into a shareable file._
+- [ ] **Fold new settings into `config.json`** — the skill, agent, and prompt directories join it as
+      they land. _API keys stay env-only. No secrets go into a shareable file._

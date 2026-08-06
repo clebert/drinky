@@ -29,9 +29,9 @@ the page, which changes the window's height in rows.
 
 The window bounds what the renderer redraws, not how far the terminal can scroll. Content that
 scrolls out is left in the terminal's own scrollback rather than erased. Reachable history is
-therefore at least the window and can be more. A reset trims it back to the window. A change
-outside the viewport, a resize, or a change to the window's page count forces a reset. Until a
-reset occurs, scrollback grows as far as the terminal allows.
+therefore at least the window and can be more. A reset trims it back to the window. A change outside
+the viewport, a resize, or a change to the window's page count forces a reset. Until a reset occurs,
+scrollback grows as far as the terminal allows.
 
 Rendering is **inline**: the window is drawn into the terminal's normal buffer, and the terminal
 scrolls through the drawn content. The view is always anchored to the newest content and keeps no
@@ -63,14 +63,35 @@ focused, the cursor is hidden.
 
 ## Frames
 
-The view repaints on a **tick**: a frame produced on demand, rate-limited to a target frame rate.
-An event schedules the next tick. Every event that arrives before it fires coalesces into that one
+The view repaints on a **tick**: a frame produced on demand, rate-limited to a target frame rate. An
+event schedules the next tick. Every event that arrives before it fires coalesces into that one
 frame. When no event occurs, no tick fires and the renderer stays idle. Keyboard input is one such
 event, so the frame rate is also the input echo rate. The delay between a keystroke and its echoed
 character is at most one frame interval. The rate must be high enough that typing stays fluid even
 under sustained fast input. Animation is no exception. A self-animating element schedules its own
 periodic events, each rendered through the same path and active only while it animates. Even
 animation therefore leaves an idle interface inert.
+
+Ticks land on a fixed grid. Each deadline is one interval after the previous deadline, not one
+interval after the previous frame ended. The work of a frame therefore falls inside its own interval
+and does not add to it. A frame that keeps to its budget holds the target rate exactly. Two
+conditions set the grid again to the current time: a frame that overruns its slot, and a wake from
+an idle channel. The loop then carries no backlog of missed deadlines, and an idle wait does not
+count as lateness.
+
+The timer waits on the deadline itself, not on a duration. A duration wait starts the clock again at
+the moment the loop arms the timer, so the cost to arm the timer adds to the interval. An operating
+system with an absolute sleep waits once and wakes on the deadline. An operating system without one
+wakes late, and the grid corrects for that. The lateness moves the phase of one frame and leaves the
+next deadline in place.
+
+The correction is large. macOS has no absolute sleep and it coalesces its timers, so a 16 ms wait
+wakes about 3.3 ms late. A loop that measures the next interval from the wake adds that lateness to
+every frame and settles at a 19.5 ms period. The grid shortens the next wait instead, so the period
+holds at 16 ms and only the phase moves.
+
+A tick that finds no change paints nothing. A quantized animation step reaches the same cell on two
+ticks in a row, so a skipped frame is correct and is not a defect.
 
 ## Working memory
 
@@ -91,6 +112,7 @@ grow with the model.
 - The view's working memory is reused across frames rather than rebuilt each time.
 - Frames are rate-limited, event-driven, and coalesced. An idle interface is inert. Input echoes
   within one frame interval.
+- Ticks hold a fixed rate. The cost of a frame falls inside its interval, and does not add to it.
 - No partial frame is ever visible. Wrapping never desynchronizes the cursor.
 - After every repaint the cursor is restored to the active input caret. When no input is focused,
   the cursor is hidden.
