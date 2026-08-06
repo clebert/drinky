@@ -38,8 +38,9 @@ pub const SaveOptions = struct {
 };
 
 /// Open the store file at `path`, or null when it does not exist. A present
-/// file that is not a JSON object is `error.CorruptStore`. Caller frees a
-/// non-null result with `File.deinit`.
+/// file that Pith cannot parse as a JSON object is `error.CorruptStore`, the
+/// same failure a rewrite reports. Caller frees a non-null result with
+/// `File.deinit`.
 pub fn open(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !?File {
     const data = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .unlimited) catch |err|
         switch (err) {
@@ -48,7 +49,11 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !?File {
         };
     defer gpa.free(data);
 
-    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, data, .{});
+    const parsed = std.json.parseFromSlice(std.json.Value, gpa, data, .{}) catch |err|
+        switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.CorruptStore,
+        };
     errdefer parsed.deinit();
     if (parsed.value != .object) return error.CorruptStore;
     return .{ .parsed = parsed };
@@ -177,8 +182,8 @@ fn serialize(
 
 /// How many of the keys already in `object` the cap leaves no room for. Set
 /// `writes_key` for a save and clear it for a removal, because a written key
-/// takes one of the slots. Both subtractions saturate: an over-full file and a
-/// cap below one slot are both normal.
+/// takes one of the slots. The two saturating subtractions accept an over-full
+/// file and a cap below one slot, which are both normal.
 fn dropCount(
     object: *const std.json.ObjectMap,
     key: []const u8,
@@ -186,6 +191,7 @@ fn dropCount(
     options: SaveOptions,
 ) usize {
     const keys_max = options.keys_max orelse return 0;
+    // A contained key counts toward `count`, so this cannot underflow.
     const kept = object.count() - @intFromBool(object.contains(key));
     const room = keys_max -| @intFromBool(writes_key);
     return kept -| room;
@@ -420,7 +426,7 @@ test "remove drops only its key on disk, and a missing file opens as null" {
     );
 }
 
-test "save and remove refuse a corrupt file, leaving it intact on disk" {
+test "open, save, and remove refuse a corrupt file, leaving it intact on disk" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
@@ -432,6 +438,8 @@ test "save and remove refuse a corrupt file, leaving it intact on disk" {
     const entry: TestEntry = .{ .access = "at", .refresh = "rt", .expires_ms = 1 };
 
     try tmp.dir.writeFile(io, .{ .sub_path = "auth.json", .data = "{ not json" });
+    // Every entry point reports the same failure, so a caller translates one name.
+    try std.testing.expectError(error.CorruptStore, open(gpa, io, path));
     try std.testing.expectError(
         error.CorruptStore,
         save(gpa, io, path, "openai_subscription", entry, .{}),

@@ -1274,7 +1274,7 @@ fn recordState(self: *App) !void {
         error.CorruptStore => try self.recordEvent(
             .failure,
             "Pith stopped saving the choices of this project because Pith cannot read the " ++
-                "file {s} as a JSON object. Delete that file to let Pith save again.",
+                "file {s} as a JSON object. Delete that file to let the next start save again.",
             .{self.state.path},
         ),
         else => try self.recordEvent(

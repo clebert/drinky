@@ -10,7 +10,9 @@
 //!
 //! A project runs one account at a time, but it keeps one model per account. A
 //! model belongs to the account that ran it. A switch away and back returns to
-//! that model, and so does the next start.
+//! that model, and so does the next start. The effort level is one per project,
+//! not one per account. Startup applies it to the account it lands on, even
+//! when the remembered account fell back.
 //!
 //! Pith reads the file once, at startup. A change in another instance reaches
 //! only the next start, never a running session. A write happens when the user
@@ -193,8 +195,9 @@ pub fn seed(
 
 /// Save the choices the project now uses. A choice equal to the seeded or last
 /// recorded one writes nothing, so a command that changes neither the account,
-/// the model, nor the effort level never touches the file. A failed write is the
-/// last one this state attempts, so the caller reports it once.
+/// the model, nor the effort level never touches the file. Any failure is the
+/// last write this state attempts, so the caller reports it once and the report
+/// is always true.
 ///
 /// The model of `account` changes first, so the write carries it and a state
 /// that no longer saves still answers the rest of the session.
@@ -207,14 +210,14 @@ pub fn record(
     self.setModel(account, model);
     if (!self.save_enabled) return;
     if (self.unchanged(account, model, effort)) return;
-    ai.json_store.save(self.gpa, self.io, self.path, self.project, Entry{
+    // A failed snapshot also stops the writes: without it, the change check
+    // compares against a stale choice and a later no-op change writes again.
+    errdefer self.save_enabled = false;
+    try ai.json_store.save(self.gpa, self.io, self.path, self.project, Entry{
         .account = @tagName(account),
         .effort = @tagName(effort),
         .models = .{ .table = &self.models },
-    }, .{ .keys_max = projects_max }) catch |err| {
-        self.save_enabled = false;
-        return err;
-    };
+    }, .{ .keys_max = projects_max });
     try self.remember(account, model, effort);
 }
 
