@@ -1134,10 +1134,7 @@ fn runCommand(self: *App, line: []const u8) !void {
 /// app or agent. Presentation-only outcomes go to the session.
 fn applyOutcome(self: *App, outcome: ai.command.Outcome) !void {
     switch (outcome) {
-        .show_system_prompt => try self.session.openPage(&.{
-            .title = "System prompt",
-            .content = self.prompt,
-        }),
+        .show_system_prompt => try self.session.openPage(&.{ .content = self.prompt }),
         .new_conversation => {
             self.agent.resetConversation();
             self.session.resetConversation();
@@ -3049,7 +3046,7 @@ test "/system opens the composed prompt alone and escape restores the conversati
     const page_start = out.written().len;
     try app.session.paint(.{ .columns = 80, .rows = 6 });
     const page_bytes = out.written()[page_start..];
-    try std.testing.expect(std.mem.indexOf(u8, page_bytes, "System prompt · Esc: Close") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page_bytes, "Esc: Close") != null);
     try std.testing.expect(std.mem.indexOf(u8, page_bytes, "M: Source") != null);
     try std.testing.expect(std.mem.indexOf(u8, page_bytes, "Core") != null);
     try std.testing.expect(std.mem.indexOf(u8, page_bytes, "# Core") == null);

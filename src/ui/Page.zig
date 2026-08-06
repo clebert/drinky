@@ -1,6 +1,6 @@
-//! A temporary full-window, read-only page: one muted title and key-hint row
-//! above a bounded body. Pages own their source and can show rendered Markdown
-//! or the exact wrapped source. They preserve a source location across reflow.
+//! A temporary full-window, read-only page: one muted key-hint row above a
+//! bounded body. Pages own their source and can show rendered Markdown or the
+//! exact wrapped source. They preserve a source location across reflow.
 
 const std = @import("std");
 
@@ -13,10 +13,10 @@ const paint = @import("paint.zig");
 const Page = @This();
 
 const hint = "↑/↓: Scroll · PgUp/PgDn: Page · Home/End: Jump";
+const header_markdown = "Esc: Close · M: Source · " ++ hint;
+const header_source = "Esc: Close · M: Render · " ++ hint;
 
 gpa: std.mem.Allocator,
-header_markdown: []const u8,
-header_source: []const u8,
 content: []const u8,
 /// First rendered body row visible below the fixed header.
 scroll: usize,
@@ -37,28 +37,15 @@ layout_rows: usize,
 pub const Presentation = enum { markdown, source };
 
 pub const Options = struct {
-    title: []const u8,
     content: []const u8,
     presentation: Presentation = .markdown,
 };
 
-/// Copy the title and content into a page owned by `gpa`.
+/// Copy the content into a page owned by `gpa`.
 pub fn init(gpa: std.mem.Allocator, options: *const Options) !Page {
-    const header_markdown = try std.fmt.allocPrint(gpa, "{s} · Esc: Close · M: Source · {s}", .{
-        options.title,
-        hint,
-    });
-    errdefer gpa.free(header_markdown);
-    const header_source = try std.fmt.allocPrint(gpa, "{s} · Esc: Close · M: Render · {s}", .{
-        options.title,
-        hint,
-    });
-    errdefer gpa.free(header_source);
     const content = try gpa.dupe(u8, options.content);
     return .{
         .gpa = gpa,
-        .header_markdown = header_markdown,
-        .header_source = header_source,
         .content = content,
         .scroll = 0,
         .source_offset = 0,
@@ -70,8 +57,6 @@ pub fn init(gpa: std.mem.Allocator, options: *const Options) !Page {
 }
 
 pub fn deinit(self: *Page) void {
-    self.gpa.free(self.header_markdown);
-    self.gpa.free(self.header_source);
     self.gpa.free(self.content);
 }
 
@@ -157,8 +142,8 @@ pub fn render(
 fn renderHeader(self: *const Page, placement: *const paint.Placement) !void {
     if (placement.base < placement.skip) return;
     const header = switch (self.presentation) {
-        .markdown => self.header_markdown,
-        .source => self.header_source,
+        .markdown => header_markdown,
+        .source => header_source,
     };
     placement.sink.begin();
     try color.apply(placement.sink, .muted_foreground);
@@ -305,7 +290,6 @@ fn renderForTest(page: *const Page, size: terminal.View.Size) ![]u8 {
 test "source navigation scrolls by wrapped body rows and clamps at both ends" {
     const gpa = std.testing.allocator;
     var page = try Page.init(gpa, &.{
-        .title = "Title",
         .content = "L0\nL1\nL2\nL3",
         .presentation = .source,
     });
@@ -335,7 +319,6 @@ test "source navigation scrolls by wrapped body rows and clamps at both ends" {
 test "source reflow preserves the byte location across width changes" {
     const gpa = std.testing.allocator;
     var page = try Page.init(gpa, &.{
-        .title = "Title",
         .content = "abcdefghij\nlast",
         .presentation = .source,
     });
@@ -358,7 +341,6 @@ test "source reflow preserves the byte location across width changes" {
 test "markdown is default and source toggles around the same logical line" {
     const gpa = std.testing.allocator;
     var page = try Page.init(gpa, &.{
-        .title = "System prompt",
         .content = "# Heading\n\n- item with **bold** text\nplain 1\nplain 2\nplain 3\nplain 4",
     });
     defer page.deinit();
@@ -397,7 +379,6 @@ test "markdown is default and source toggles around the same logical line" {
 test "source rendering is bounded and sanitizes terminal controls" {
     const gpa = std.testing.allocator;
     var page = try Page.init(gpa, &.{
-        .title = "System prompt",
         .content = "first\nsecond\x1b[2J\nthird",
         .presentation = .source,
     });
@@ -407,7 +388,7 @@ test "source rendering is bounded and sanitizes terminal controls" {
 
     const painted = try renderForTest(&page, size);
     defer gpa.free(painted);
-    try std.testing.expect(std.mem.indexOf(u8, painted, "System prompt · Esc: Close") != null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "Esc: Close") != null);
     try std.testing.expect(std.mem.indexOf(u8, painted, "first") == null);
     try std.testing.expect(std.mem.indexOf(u8, painted, "second") != null);
     try std.testing.expect(std.mem.indexOf(u8, painted, "third") != null);
@@ -417,12 +398,12 @@ test "source rendering is bounded and sanitizes terminal controls" {
 
 test "a one-row page renders only its header" {
     const gpa = std.testing.allocator;
-    var page = try Page.init(gpa, &.{ .title = "Title", .content = "# Hidden" });
+    var page = try Page.init(gpa, &.{ .content = "# Hidden" });
     defer page.deinit();
     const painted = try renderForTest(&page, .{ .columns = 80, .rows = 1 });
     defer gpa.free(painted);
 
-    try std.testing.expect(std.mem.indexOf(u8, painted, "Title · Esc: Close") != null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "Esc: Close") != null);
     try std.testing.expect(std.mem.indexOf(u8, painted, "Hidden") == null);
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, painted, "\r\n"));
 }
