@@ -459,7 +459,8 @@ fn settingsDocument(
         \\
         \\The file is optional, so create it when it is absent. Any subset of the keys below is
         \\valid, and an absent key keeps its default. A dot shows a nested JSON object. Empty
-        \\brackets show each array entry. Pith reports an unknown key at the next start.
+        \\brackets show each array entry. Pith ignores a key that it does not know, so a typo has
+        \\no effect. The next start still succeeds and shows a warning that names each ignored key.
         \\The file holds no secret. An API key comes from the ANTHROPIC_API_KEY or the
         \\OPENAI_API_KEY variable.
         \\{s}
@@ -1065,6 +1066,10 @@ test "the settings document names the file and its own example loads clean" {
         "gpt-5.6-sol.") != null);
     try std.testing.expect(std.mem.indexOf(u8, document, "Without the key, Pith uses " ++
         "xhigh.") != null);
+
+    // An unknown key warns at the next start and never fails it. The document
+    // states both facts, so the model does not have to guess which one holds.
+    try std.testing.expect(std.mem.indexOf(u8, document, "still succeeds") != null);
 
     // The remembered per-project choice outranks the file, so the warning sits on
     // every key it governs. A reader that misses it promises an inert change.
