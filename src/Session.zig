@@ -1051,6 +1051,7 @@ test "scripted stream events drive the model and one coalesced paint" {
     session.beginTurn(1);
 
     // Owned payloads, exactly as a producer task allocates them.
+    try applyEvent(&session, 1, .{ .thinking = try gpa.dupe(u8, "reasoning") });
     try applyEvent(&session, 1, .{ .text = try gpa.dupe(u8, "he") });
     try applyEvent(&session, 1, .{ .text = try gpa.dupe(u8, "llo") });
     try applyEvent(&session, 1, .{ .tool_start = .{
@@ -1079,9 +1080,10 @@ test "scripted stream events drive the model and one coalesced paint" {
     try finishTurn(&session, 0);
     try std.testing.expect(!session.animating());
 
-    // One paint renders the coalesced frame: streamed text and the tool result.
+    // One paint renders the coalesced frame: reasoning, answer text, and the tool result.
     try session.paint(.{ .columns = 80, .rows = 24 });
     const painted = out.written();
+    try std.testing.expect(std.mem.indexOf(u8, painted, "reasoning") != null);
     try std.testing.expect(std.mem.indexOf(u8, painted, "hello") != null);
     try std.testing.expect(std.mem.indexOf(u8, painted, "read") != null);
     try std.testing.expect(std.mem.indexOf(u8, painted, "first line") != null);

@@ -45,8 +45,12 @@ pub fn append(
 
 /// Append streamed text of `kind` (`.thinking` reasoning or `.model` answer).
 /// Open a block of that kind on demand so a run of deltas collects into one
-/// block. A kind change ends the previous run.
+/// block. A kind change ends the previous run. A provider can stream a delta
+/// with no bytes. Such a delta opens no block, because an empty block shows as
+/// a blank row and its separator. It also leaves the open run alone, so the
+/// deltas around it still collect into one block.
 pub fn appendStream(self: *Transcript, kind: ui.block.Entry.Kind, delta: []const u8) !void {
+    if (delta.len == 0) return;
     if (self.current == null or self.current.?.kind != kind)
         self.current = .{ .index = try self.openRun(kind), .kind = kind };
     switch (self.entries.items[self.current.?.index]) {
@@ -111,6 +115,25 @@ test "streamed deltas collect into one block until a discrete block ends the run
     try transcript.appendStream(.model, "more");
     try std.testing.expectEqual(@as(usize, 3), transcript.entries.items.len);
     try std.testing.expectEqualStrings("more", transcript.entries.items[2].model.items);
+}
+
+// Regression: a provider can stream a delta with no bytes. It used to open a
+// block, which showed as a blank row and its separator between the blocks
+// around it.
+test "an empty delta opens no block and does not break a run" {
+    const gpa = std.testing.allocator;
+    var transcript = Transcript.init(gpa);
+    defer transcript.deinit();
+
+    try transcript.appendStream(.thinking, "");
+    try transcript.appendStream(.model, "");
+    try std.testing.expectEqual(@as(usize, 0), transcript.entries.items.len);
+
+    try transcript.appendStream(.model, "he");
+    try transcript.appendStream(.model, "");
+    try transcript.appendStream(.model, "llo");
+    try std.testing.expectEqual(@as(usize, 1), transcript.entries.items.len);
+    try std.testing.expectEqualStrings("hello", transcript.entries.items[0].model.items);
 }
 
 test "endMessage forces the next delta into a new block" {
