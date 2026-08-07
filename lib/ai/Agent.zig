@@ -46,6 +46,9 @@ effort: llm.Effort,
 retry: net.Retry,
 /// Bounds the bash tool's output window and runtime, handed to every tool call.
 bash: tool.Context.Bash,
+/// What the `config` tool returns. The host owns the strings and keeps them
+/// alive for the session. An empty document means the host exposes no settings.
+settings: tool.Context.Settings,
 items: std.ArrayList(llm.Item),
 stats: Stats,
 /// Steering messages the user submitted mid-turn, drained into the running turn
@@ -251,6 +254,7 @@ pub fn init(
         retry: net.Retry,
         effort: llm.Effort = .none,
         bash: tool.Context.Bash = .{},
+        settings: tool.Context.Settings = .{},
     },
 ) Agent {
     return .{
@@ -262,6 +266,7 @@ pub fn init(
         .effort = options.effort,
         .retry = options.retry,
         .bash = options.bash,
+        .settings = options.settings,
         .items = .empty,
         .stats = .{},
         .steering = Steering.init(gpa, io),
@@ -852,7 +857,12 @@ fn runToolsWith(
     self.advanceCheckpoint(turn);
     notifyCheckpoint(handler);
 
-    const context: tool.Context = .{ .gpa = self.gpa, .io = self.io, .bash = self.bash };
+    const context: tool.Context = .{
+        .gpa = self.gpa,
+        .io = self.io,
+        .bash = self.bash,
+        .settings = self.settings,
+    };
     var group: std.Io.Group = .init;
     // On any early exit, reap in-flight tasks, then move every successful,
     // not-yet-moved result into its reserved slot. Errored or never-run calls

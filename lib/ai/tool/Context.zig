@@ -11,6 +11,19 @@ io: std.Io,
 /// a command runs before Pith kills it. The defaults hold when no config
 /// overrides them.
 bash: Bash = .{},
+/// What the `config` tool hands back. The host writes both strings and owns
+/// them, so the tool stays free of any app-specific knowledge.
+settings: Settings = .{},
+
+pub const Settings = struct {
+    /// The document that describes every setting. Empty means the host exposes
+    /// no settings, and the tool reports that.
+    document: []const u8 = "",
+    /// The one-line box summary, a `Key: Value` fragment that names what the
+    /// document covers. A multi-line result must carry one, because the box
+    /// otherwise falls back to the first line of the document.
+    summary: []const u8 = "",
+};
 
 pub const Bash = struct {
     /// The whole lines kept from the tail of a command's output.

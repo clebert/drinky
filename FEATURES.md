@@ -28,7 +28,7 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 
 ## Tools
 
-- The model gets six tools: `read`, `write`, `edit`, `find`, `grep`, and `bash`.
+- The model gets seven tools: `read`, `write`, `edit`, `find`, `grep`, `bash`, and `config`.
 - **read** — page a UTF-8 file from a 1-indexed line offset, 2000 lines or 50 KiB per call, with a
   next-offset hint.
 - **write** — create or overwrite a file atomically.
@@ -39,6 +39,9 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - **bash** — run a shell command in the working directory, preserve combined stdout and stderr
   order, and return a bounded tail. A non-zero exit is reported. Output caps and the timeout are
   configurable, and the timeout is also settable per call.
+- **config** — return the settings document, so the model can change `config.json` for the user. It
+  names the file and lists every key with its type, its default, and its meaning, plus the legal
+  model names, the effort levels, the compiled fallbacks, and the memory that outranks the file.
 - Globs use `*` and `?` within a path segment and `**` across segments.
 - Searches skip version-control and build directories.
 - Binary files are skipped, oversized files are refused, and every result says when a limit cut it
@@ -180,10 +183,14 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
   and at most 32 KiB. Each source loads at most 32 files and 64 KiB, and one file loads once even
   when two paths or a symbolic link reach it. pith reports what it skips.
 - `~/.pith/config.json` is optional: paths for user instructions, request and bash limits, a default
-  model per account, and a default effort level.
+  model per account, and a default effort level. pith reads it only at startup, so a change applies
+  at the next start.
 - It holds no secrets. API keys come from `ANTHROPIC_API_KEY` and `OPENAI_API_KEY`.
 - A configured model that is not valid for its account is reported, and the compiled default used.
-  An unknown effort level is reported the same way.
+  An unknown effort level is reported the same way. A key that pith does not know is reported too,
+  so a typo never looks like an applied setting.
+- The settings document is generated from the struct that parses the file, so a new key that carries
+  no description fails the build and the document cannot drift.
 - `~/.pith/state.json` remembers per project which account and effort level pith used last, and the
   model of each account. It is machine-local, owner-only, and keeps the 1000 most recently changed
   projects. A repository is one project, keyed by its Git root.

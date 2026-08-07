@@ -13,9 +13,10 @@ const notices_max = 1024;
 const directory_entries_max = 100_000;
 const display_bytes_max = 4 * std.fs.max_path_bytes + 1024;
 // The same caps in the unit a message uses, so one constant drives both the
-// limit and the sentence that reports it.
-const file_kibibytes_max = @divExact(file_bytes_max, 1024);
-const source_kibibytes_max = @divExact(source_bytes_max, 1024);
+// limit and the sentence that reports it. A host that documents its own
+// configuration reads them too, so its document cannot state a stale cap.
+pub const file_kibibytes_max = @divExact(file_bytes_max, 1024);
+pub const source_kibibytes_max = @divExact(source_bytes_max, 1024);
 
 /// How many files one source can put into the prompt. A caller that builds the
 /// path list can size its own buffer against this cap.

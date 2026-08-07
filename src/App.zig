@@ -64,6 +64,9 @@ state: State,
 project_instructions: ai.instructions.Result,
 skills: ai.skills.Registry,
 prompt: []const u8,
+/// What the `config` tool returns: the document that describes every key of
+/// `config.json`, and its box summary. It outlives the agent, which borrows it.
+settings: ai.tool.Context.Settings,
 agent: ai.Agent,
 /// The consumer-owned model and rendering, driven by the loop.
 session: Session,
@@ -381,6 +384,12 @@ pub fn run(
         .skills = self.skills.catalog(),
     });
     defer gpa.free(self.prompt);
+    self.settings = try config.settings(gpa, &.{
+        .anthropic_model = anthropic_default.name,
+        .openai_model = openai_default.name,
+        .effort = effort_default,
+    });
+    defer Config.freeSettings(gpa, &self.settings);
 
     // Start on the account this project used last, then on the first
     // authenticated account, or signed out (no client) when none is. The login
@@ -397,6 +406,7 @@ pub fn run(
         .retry = config.retry,
         .effort = start_effort,
         .bash = config.bash,
+        .settings = self.settings,
     });
     defer self.agent.deinit();
     // Startup applies the remembered or the default choices, so it saves nothing.
@@ -430,6 +440,18 @@ pub fn run(
         "Pith ignored the configured default effort level \"{s}\" because Pith does not know " ++
             "that level. Pith uses the effort level \"{s}\".",
         .{ dropped, @tagName(self.agent.effort) },
+    );
+    // The parse ignores an unknown key so that an older binary reads a newer
+    // file. Report it, because a typo otherwise looks like an applied setting.
+    for (config.unknown_keys) |key| try self.recordEvent(
+        .failure,
+        "Pith ignored the unknown configuration key \"{s}\" in {s}.",
+        .{ key, config.path },
+    );
+    if (config.unknown_keys_omitted) try self.recordEvent(
+        .failure,
+        "Pith omitted the remaining unknown configuration keys in {s}.",
+        .{config.path},
     );
     try self.reportSources(&.{
         .user_instructions = &config.user_instructions,

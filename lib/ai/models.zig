@@ -223,6 +223,20 @@ pub fn get(provider: llm.Provider, name: []const u8) ?Model {
     return null;
 }
 
+/// Every model name `provider` offers, in table order. The result is
+/// comptime-known, so a caller can fold the list into a compiled document and
+/// keep that document in step with this table.
+pub fn names(comptime provider: llm.Provider) []const []const u8 {
+    comptime {
+        var collected: []const []const u8 = &.{};
+        for (table) |entry| {
+            if (entry.provider == provider)
+                collected = collected ++ [_][]const u8{entry.model.name};
+        }
+        return collected;
+    }
+}
+
 /// Append every model offered by `provider` to `out`, in table order.
 pub fn list(provider: llm.Provider, out: *std.ArrayList(Model), gpa: std.mem.Allocator) !void {
     for (table) |entry| {

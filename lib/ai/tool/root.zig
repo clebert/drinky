@@ -14,6 +14,7 @@ const edit = @import("edit.zig");
 const find = @import("find.zig");
 const grep = @import("grep.zig");
 const bash = @import("bash.zig");
+const config = @import("config.zig");
 
 const Entry = struct {
     tool: llm.Tool,
@@ -28,6 +29,7 @@ const registry = [_]Entry{
     .{ .tool = find.spec, .run = find.run, .mutates = false },
     .{ .tool = grep.spec, .run = grep.run, .mutates = false },
     .{ .tool = bash.spec, .run = bash.run, .mutates = true },
+    .{ .tool = config.spec, .run = config.run, .mutates = false },
 };
 
 /// The schemas of every tool, advertised to the provider in a request.
