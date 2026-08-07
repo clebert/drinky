@@ -129,8 +129,11 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - Repaints are frame-limited at a fixed rate and scheduled only while something is dirty or
   animating.
 - Answer text grows as one block, with reasoning collected into a separate one tinted grey and
-  italic. Both render their markdown: headings, lists, blockquotes, code blocks, rules, and inline
-  emphasis.
+  italic. Both render their markdown: headings, lists, blockquotes, code blocks, rules, tables, and
+  inline emphasis.
+- A pipe table draws as a box grid that fits the window and keeps the indentation of its source. The
+  alignment colons parse but do not align. A long cell truncates to its column. A table stays plain
+  text when the window is narrower than its smallest grid.
 - A running tool shows a blue box with its name and arguments. It then turns green or red with a
   one-line stat summary (lines read, matches found, exit status), or its first output line when the
   tool gives no summary.

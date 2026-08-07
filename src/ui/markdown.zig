@@ -207,6 +207,260 @@ const Fence = struct {
     }
 };
 
+/// A pipe table's grid: the column count its header row sets, the display width
+/// each column gets after the fit to the window, and the blanks that hold the
+/// grid at the indentation of its source. Every row must open with a pipe, an
+/// escaped pipe gets no special treatment, and the alignment colons of the
+/// delimiter row parse but do not align.
+const Table = struct {
+    count: usize,
+    widths: [count_max]usize,
+    indent: []const u8,
+
+    /// Columns a grid can hold. A wider header is no table at all.
+    const count_max = 16;
+
+    /// What `detect` reads: the header line, the source that follows it (the
+    /// delimiter row first), the window, and the spaces the header indents by.
+    const Options = struct {
+        header: []const u8,
+        tail: []const u8,
+        columns: usize,
+        indentation: usize,
+    };
+
+    /// The three glyphs one horizontal border row draws.
+    const Border = struct { left: []const u8, joint: []const u8, right: []const u8 };
+
+    const border_top: Border = .{ .left = "┌", .joint = "┬", .right = "┐" };
+    const border_inner: Border = .{ .left = "├", .joint = "┼", .right = "┤" };
+    const border_bottom: Border = .{ .left = "└", .joint = "┴", .right = "┘" };
+
+    /// One row's cells: the outer pipes stripped and every cell trimmed. The
+    /// measure pass and the paint share it, so their cells cannot diverge.
+    const Cells = struct {
+        rest: []const u8,
+        done: bool = false,
+
+        fn init(row: []const u8) Cells {
+            var body = std.mem.trim(u8, row, " \t\r");
+            if (body.len > 0 and body[0] == '|') body = body[1..];
+            if (body.len > 0 and body[body.len - 1] == '|') body = body[0 .. body.len - 1];
+            return .{ .rest = body };
+        }
+
+        fn next(self: *Cells) ?[]const u8 {
+            if (self.done) return null;
+            const pipe = std.mem.indexOfScalar(u8, self.rest, '|') orelse {
+                self.done = true;
+                return std.mem.trim(u8, self.rest, " \t");
+            };
+            defer self.rest = self.rest[pipe + 1 ..];
+            return std.mem.trim(u8, self.rest[0..pipe], " \t");
+        }
+    };
+
+    /// Truncates one cell's styled spans to the room its column gives. Once a
+    /// span overflows, the cell is full: a later span must not slip into the
+    /// gap a dropped cluster leaves. The room the content does not take stays
+    /// for the pad, so every row of the grid draws to one width.
+    fn Writer(comptime Emitter: type) type {
+        return struct {
+            emitter: *Emitter,
+            room: usize,
+            full: bool = false,
+
+            fn write(self: *@This(), look: Look, bytes: []const u8) !void {
+                if (self.full) return;
+                const shown = terminal.width.truncate(bytes, self.room);
+                const columns = terminal.width.ofText(shown);
+                // Saturating: a cluster wider than the room survives
+                // `truncate` as a one-column replacement. A cell cannot wrap,
+                // so the cluster drops whole and the pad takes its columns.
+                if (columns > self.room) {
+                    self.full = true;
+                    return;
+                }
+                if (shown.len > 0) {
+                    try self.emitter.span(look, shown);
+                    self.room -= columns;
+                }
+                if (shown.len < bytes.len) self.full = true;
+            }
+        };
+    }
+
+    /// Tallies one cell's display columns for the measure pass.
+    const Measure = struct {
+        columns: usize = 0,
+
+        fn write(self: *Measure, _: Look, bytes: []const u8) !void {
+            self.columns += terminal.width.ofText(bytes);
+        }
+    };
+
+    /// The table that opens at `options.header` when the first line after it is
+    /// the delimiter row and the narrowest grid still fits the window. The
+    /// widths come from a measure pass over the whole table before `fit`
+    /// shrinks them. The decision depends only on the text and the width, so
+    /// every emitter reaches the same grid.
+    fn detect(options: *const Options) ?Table {
+        if (options.header[0] != '|') return null;
+        var lines = std.mem.splitScalar(u8, options.tail, '\n');
+        const delimiter = lines.first();
+        if (!isDelimiter(delimiter)) return null;
+        const count = cellCount(options.header);
+        if (count != cellCount(delimiter) or count > count_max) return null;
+        // The grid keeps the indentation of its source, capped like any row
+        // prefix, and fits into the columns that indentation leaves.
+        const indent = terminal.width.truncate(
+            blank(options.indentation),
+            prefixRoom(options.columns),
+        );
+        const columns = options.columns -| terminal.width.ofText(indent);
+        // The floor: every column one cell wide. Below it the table stays prose.
+        if (1 + 4 * count > columns) return null;
+        var table: Table = .{ .count = count, .widths = @splat(1), .indent = indent };
+        table.measureRow(options.header);
+        while (lines.next()) |line| {
+            if (!isRow(line)) break;
+            table.measureRow(line);
+        }
+        table.fit(columns);
+        return table;
+    }
+
+    /// A line whose first byte after the indentation is a pipe.
+    fn isRow(line: []const u8) bool {
+        const body = line[leading(line)..];
+        return body.len > 0 and body[0] == '|';
+    }
+
+    /// The `| --- | :-: |` row under a header: dashes with optional alignment
+    /// colons in every cell.
+    fn isDelimiter(line: []const u8) bool {
+        if (!isRow(line)) return false;
+        var cells = Cells.init(line);
+        while (cells.next()) |cell| {
+            var body = cell;
+            if (body.len > 0 and body[0] == ':') body = body[1..];
+            if (body.len > 0 and body[body.len - 1] == ':') body = body[0 .. body.len - 1];
+            if (body.len == 0) return false;
+            for (body) |byte| if (byte != '-') return false;
+        }
+        return true;
+    }
+
+    fn cellCount(row: []const u8) usize {
+        var cells = Cells.init(row);
+        var count: usize = 0;
+        while (cells.next() != null) count += 1;
+        return count;
+    }
+
+    /// Raise each column to the display width of its cell in `row`, with the
+    /// inline markers already sliced away.
+    fn measureRow(self: *Table, row: []const u8) void {
+        var cells = Cells.init(row);
+        for (self.widths[0..self.count]) |*width| {
+            const cell = cells.next() orelse break;
+            var measure: Measure = .{};
+            inlines(Measure, &measure, .{}, cell) catch unreachable;
+            width.* = @max(width.*, measure.columns);
+        }
+    }
+
+    /// Shrink the columns until the grid fits `columns`. Every column above one
+    /// cap gives its excess up, and the cells the cap leaves over go back from
+    /// the last column down. This is where shrinking the widest column one cell
+    /// at a time settles, and a search over the cap finds it in a bounded number
+    /// of steps. A wide table costs the same as a narrow one, on a path that
+    /// runs for every visible table on every frame.
+    fn fit(self: *Table, columns: usize) void {
+        const room = columns -| (1 + 3 * self.count);
+        // The floor `detect` checked leaves one cell per column, so a cap of one
+        // always fits and the search always ends on a usable grid.
+        var low: usize = 1;
+        var high: usize = @max(room, 1);
+        while (low < high) {
+            const cap = low + @divFloor(high - low + 1, 2);
+            if (self.capped(cap) <= room) low = cap else high = cap - 1;
+        }
+        // The cap is the largest that fits, so fewer cells are left over than
+        // there are columns above it. Every one of them lands.
+        var leftover = room -| self.capped(low);
+        var index = self.count;
+        while (index > 0) {
+            index -= 1;
+            const width = &self.widths[index];
+            const above = width.* > low;
+            width.* = @min(width.*, low);
+            if (above and leftover > 0) {
+                width.* += 1;
+                leftover -= 1;
+            }
+        }
+    }
+
+    /// Display columns the content takes with every column cut to `cap`.
+    fn capped(self: *const Table, cap: usize) usize {
+        var total: usize = 0;
+        for (self.widths[0..self.count]) |width| total += @min(width, cap);
+        return total;
+    }
+
+    /// One border row: a rule segment per column between the `border` glyphs.
+    fn borderRow(
+        self: *const Table,
+        comptime Emitter: type,
+        emitter: *Emitter,
+        border: *const Border,
+    ) !void {
+        emitter.begin();
+        try emitter.span(.{}, self.indent);
+        try emitter.span(muted_look, border.left);
+        for (self.widths[0..self.count], 0..) |width, index| {
+            if (index > 0) try emitter.span(muted_look, border.joint);
+            var remaining = width + 2;
+            while (remaining > 0) {
+                const chunk = @min(remaining, rule_columns);
+                try emitter.span(muted_look, rule_cells[0 .. rule_cell.len * chunk]);
+                remaining -= chunk;
+            }
+        }
+        try emitter.span(muted_look, border.right);
+        emitter.end();
+    }
+
+    /// One content row: every cell under `look`, truncated to its column and
+    /// padded out to it, between pipe borders.
+    fn cellRow(
+        self: *const Table,
+        comptime Emitter: type,
+        emitter: *Emitter,
+        row: []const u8,
+        look: Look,
+    ) !void {
+        emitter.begin();
+        try emitter.span(.{}, self.indent);
+        var cells = Cells.init(row);
+        for (self.widths[0..self.count]) |width| {
+            try emitter.span(muted_look, "│");
+            try emitter.span(.{}, " ");
+            var writer: Writer(Emitter) = .{ .emitter = emitter, .room = width };
+            try inlines(Writer(Emitter), &writer, look, cells.next() orelse "");
+            var remaining = writer.room + 1;
+            while (remaining > 0) {
+                const chunk = @min(remaining, blanks.len);
+                try emitter.span(.{}, blank(chunk));
+                remaining -= chunk;
+            }
+        }
+        try emitter.span(muted_look, "│");
+        emitter.end();
+    }
+};
+
 /// Emit `text` one physical row at a time. This function decides every row break
 /// and the emitter merely follows, so the count and the paint cannot diverge.
 fn walk(comptime Emitter: type, emitter: *Emitter, text: []const u8, columns: usize) !void {
@@ -235,11 +489,34 @@ fn walk(comptime Emitter: type, emitter: *Emitter, text: []const u8, columns: us
         } else if (isRule(rest)) {
             const cells = rule_cells[0 .. rule_cell.len * @min(columns, rule_columns)];
             try plainRow(Emitter, emitter, columns, "", muted_look, cells);
+        } else if (Table.detect(&.{
+            .header = rest,
+            .tail = lines.rest(),
+            .columns = columns,
+            .indentation = indentation,
+        })) |table| {
+            // The header draws under a top border, every row the branch
+            // consumes maps its own source line, and the last row closes the
+            // grid. The delimiter row draws as the border below the header.
+            try table.borderRow(Emitter, emitter, &Table.border_top);
+            try table.cellRow(Emitter, emitter, rest, .{ .bold = true });
+            const delimiter = lines.next().?;
+            emitter.source(@intFromPtr(delimiter.ptr) - @intFromPtr(text.ptr));
+            var more = Table.isRow(lines.peek() orelse "");
+            const middle = if (more) &Table.border_inner else &Table.border_bottom;
+            try table.borderRow(Emitter, emitter, middle);
+            while (more) {
+                const row = lines.next().?;
+                emitter.source(@intFromPtr(row.ptr) - @intFromPtr(text.ptr));
+                try table.cellRow(Emitter, emitter, row, .{});
+                more = Table.isRow(lines.peek() orelse "");
+                if (!more) try table.borderRow(Emitter, emitter, &Table.border_bottom);
+            }
         } else if (headingLevel(rest)) |level| {
             // H1 and H2 shed their marker. Deeper headings keep it, as pi does.
             const body = if (level > 2) rest else std.mem.trimStart(u8, rest[level..], " ");
             var flow = Flow(Emitter).init(emitter, columns, .{});
-            try inlines(Emitter, &flow, .{
+            try inlines(Flow(Emitter), &flow, .{
                 .foreground = .heading,
                 .bold = true,
                 .underline = level == 1,
@@ -262,7 +539,7 @@ fn walk(comptime Emitter: type, emitter: *Emitter, text: []const u8, columns: us
                 .look = muted_look,
                 .repeat = true,
             });
-            try inlines(Emitter, &flow, quote_look, body);
+            try inlines(Flow(Emitter), &flow, quote_look, body);
             try flow.finish();
         } else if (listMarker(rest)) |marker| {
             // Sources nest a list two spaces a level. Pi indents four.
@@ -277,12 +554,12 @@ fn walk(comptime Emitter: type, emitter: *Emitter, text: []const u8, columns: us
                 try flow.write(accent_look, box);
                 body = body[box.len..];
             }
-            try inlines(Emitter, &flow, .{}, body);
+            try inlines(Flow(Emitter), &flow, .{}, body);
             try flow.finish();
         } else {
             // A paragraph keeps its own indentation. The walk strips only markers.
             var flow = Flow(Emitter).init(emitter, columns, .{});
-            try inlines(Emitter, &flow, .{}, line);
+            try inlines(Flow(Emitter), &flow, .{}, line);
             try flow.finish();
         }
     }
@@ -447,9 +724,10 @@ const Closer = struct {
 /// The two closers a `[label](url)` scan needs, memoized across one line.
 const Link = struct { label: Closer = .{ .byte = ']' }, url: Closer = .{ .byte = ')' } };
 
-/// Place `text`'s inline runs into `flow` under `base` and slice the markers
-/// away. A marker whose closer has not streamed in yet stays literal.
-fn inlines(comptime Emitter: type, flow: *Flow(Emitter), base: Look, text: []const u8) !void {
+/// Place `text`'s inline runs into `sink` under `base` and slice the markers
+/// away. A marker whose closer has not streamed in yet stays literal. The sink
+/// is a `Flow` for a wrapped block, or a `Table.Writer` for one table cell.
+fn inlines(comptime Sink: type, sink: *Sink, base: Look, text: []const u8) !void {
     var start: usize = 0;
     var index: usize = 0;
     var link: Link = .{};
@@ -461,18 +739,18 @@ fn inlines(comptime Emitter: type, flow: *Flow(Emitter), base: Look, text: []con
             if (doubled(text, index)) index += 1;
             continue;
         };
-        try flow.write(base, text[start..index]);
-        try flow.write(merged(base, run.look), run.content);
+        try sink.write(base, text[start..index]);
+        try sink.write(merged(base, run.look), run.content);
         if (run.url.len > 0) {
             const trailing = merged(base, muted_look);
-            try flow.write(trailing, " (");
-            try flow.write(trailing, run.url);
-            try flow.write(trailing, ")");
+            try sink.write(trailing, " (");
+            try sink.write(trailing, run.url);
+            try sink.write(trailing, ")");
         }
         index = run.end - 1;
         start = run.end;
     }
-    try flow.write(base, text[start..]);
+    try sink.write(base, text[start..]);
 }
 
 /// The inline run that opens at `index`, or null when none does.
@@ -625,6 +903,11 @@ const sample =
     \\const answer = 42;
     \\```
     \\
+    \\| Name | Value |
+    \\| :--- | ----: |
+    \\| a | one |
+    \\| b | **two** |
+    \\
     \\A [labelled](https://example.com) link and a bare [x](x) one, plus a
     \\snake_case_name that is no emphasis.
     \\
@@ -658,6 +941,41 @@ const indented_fences =
     \\    ```zig
     \\after **four-space bold**
     \\    ```
+;
+
+// A table between paragraphs, with alignment colons and a styled cell.
+const tables =
+    \\Before.
+    \\
+    \\| Name | Value |
+    \\| :--- | ----: |
+    \\| a | one |
+    \\| bb | **two** |
+    \\
+    \\After.
+;
+
+// Cells whose clusters take more than one column, indented under a list item.
+// A narrow window shrinks a column below one cluster, which is where a naive
+// truncation drops a column of the pad or counts more than it has.
+const wide_tables =
+    \\- item
+    \\  | 你 | b |
+    \\  | :-: | - |
+    \\  | a你你 | bbbbbb |
+    \\  | 😀 | 你 |
+;
+
+// Table shapes a stream leaves half-written: a header with no delimiter row
+// yet, a delimiter whose cells do not match, and a head with no body rows.
+const partial_tables =
+    \\| a | b |
+    \\
+    \\| a | b |
+    \\| --
+    \\
+    \\| a | b |
+    \\| - | -
 ;
 
 // Rows `text` paints into a fresh view. The paint drops its top `skip`. The
@@ -727,6 +1045,46 @@ fn frameBody(bytes: []const u8) []const u8 {
     return bytes[terminal.escape.sync_set.len .. bytes.len - terminal.escape.sync_reset.len];
 }
 
+// The frame's visible text: the CSI sequences and the sink's zero-width span
+// boundaries stripped away. The rows keep their `\r\n` separators. The caller
+// owns the returned bytes.
+fn plainBody(gpa: std.mem.Allocator, bytes: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    var index: usize = 0;
+    while (index < bytes.len) {
+        if (bytes[index] == 0x1b and index + 1 < bytes.len and bytes[index + 1] == '[') {
+            index += 2;
+            while (index < bytes.len and (bytes[index] < 0x40 or bytes[index] > 0x7e)) index += 1;
+            if (index < bytes.len) index += 1;
+            continue;
+        }
+        if (std.mem.startsWith(u8, bytes[index..], "\u{200B}")) {
+            index += "\u{200B}".len;
+            continue;
+        }
+        try out.append(gpa, bytes[index]);
+        index += 1;
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+// Paint `text` and compare the visible rows, character for character.
+fn expectPlainRows(
+    gpa: std.mem.Allocator,
+    text: []const u8,
+    columns: usize,
+    expected: []const []const u8,
+) !void {
+    const bytes = try painted(gpa, text, columns, null, 0);
+    defer gpa.free(bytes);
+    const body = try plainBody(gpa, frameBody(bytes));
+    defer gpa.free(body);
+    var actual = std.mem.splitSequence(u8, body, "\r\n");
+    for (expected) |row| try std.testing.expectEqualStrings(row, actual.next() orelse "");
+    try std.testing.expect(actual.next() == null);
+}
+
 // The parity contract: what `rows` counts is exactly what `render` emits, at
 // widths down to one column. At one column a list marker or a quote border
 // alone already fills the row.
@@ -737,10 +1095,13 @@ test "markdown renders exactly the rows it counts" {
         partial,
         literal_fences,
         indented_fences,
+        tables,
+        wide_tables,
+        partial_tables,
         "",
         "\n\n",
     }) |text| {
-        for ([_]usize{ 72, 40, 16, 3, 2, 1 }) |columns| {
+        for ([_]usize{ 72, 40, 16, 10, 9, 3, 2, 1 }) |columns| {
             for ([_]?color.Style{ null, .muted_foreground }) |tint| {
                 const bytes = try painted(gpa, text, columns, tint, 0);
                 defer gpa.free(bytes);
@@ -875,6 +1236,221 @@ test "markdown paints each element in its own style" {
     try std.testing.expect(std.mem.indexOf(u8, bytes, "snake_case_name") != null);
 }
 
+// The grid draws each column at the width of its widest cell, pads every
+// shorter cell out to it, bolds the header, and strips the inline markers and
+// the source pipes away.
+test "a table renders as a box grid with padded cells" {
+    const gpa = std.testing.allocator;
+    try expectPlainRows(gpa, tables, 40, &.{
+        "Before.",
+        "",
+        "┌──────┬───────┐",
+        "│ Name │ Value │",
+        "├──────┼───────┤",
+        "│ a    │ one   │",
+        "│ bb   │ two   │",
+        "└──────┴───────┘",
+        "",
+        "After.",
+    });
+
+    const bytes = try painted(gpa, tables, 40, null, 0);
+    defer gpa.free(bytes);
+    // The header row is bold and the borders take the muted color.
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\x1b[1m\u{200B}Name") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\x1b[38;2;128;128;128m┌") != null);
+}
+
+// A cell wider than the window cannot widen the grid past it: the widest
+// column gives up cells until the grid fits, and its content truncates.
+test "a table shrinks its widest column to fit the window" {
+    const gpa = std.testing.allocator;
+    const text =
+        \\| a | b |
+        \\| - | - |
+        \\| short | this cell is much longer than the window |
+    ;
+    try expectPlainRows(gpa, text, 30, &.{
+        "┌───────┬────────────────────┐",
+        "│ a     │ b                  │",
+        "├───────┼────────────────────┤",
+        "│ short │ this cell is much  │",
+        "└───────┴────────────────────┘",
+    });
+}
+
+// A wide cluster that straddles the column's edge drops whole, and the pad
+// keeps the grid aligned behind it.
+test "a wide glyph in a table cell truncates whole" {
+    const gpa = std.testing.allocator;
+    const text =
+        \\| a | b |
+        \\| - | - |
+        \\| x你x | y |
+    ;
+    try expectPlainRows(gpa, text, 11, &.{
+        "┌─────┬───┐",
+        "│ a   │ b │",
+        "├─────┼───┤",
+        "│ x你 │ y │",
+        "└─────┴───┘",
+    });
+}
+
+// A cluster that is wider than the whole column drops as well. `truncate`
+// keeps such a cluster as a one-column replacement, which a cell must not
+// count as one column and must not draw.
+test "a cluster wider than its column drops from the cell" {
+    const gpa = std.testing.allocator;
+    const text =
+        \\| 你 | b |
+        \\| - | - |
+        \\| c | d |
+    ;
+    try expectPlainRows(gpa, text, 9, &.{
+        "┌───┬───┐",
+        "│   │ b │",
+        "├───┼───┤",
+        "│ c │ d │",
+        "└───┴───┘",
+    });
+}
+
+// Every row of one grid draws to the same width. A cell that truncates gives
+// the columns it does not fill back to the pad, so the right border lines up.
+test "a table draws every grid row to one width" {
+    const gpa = std.testing.allocator;
+    try expectPlainRows(gpa, "| a你你 | bbbbbb |\n| - | - |\n| c | d |", 16, &.{
+        "┌──────┬───────┐",
+        "│ a你  │ bbbbb │",
+        "├──────┼───────┤",
+        "│ c    │ d     │",
+        "└──────┴───────┘",
+    });
+
+    for ([_][]const u8{ tables, wide_tables, partial_tables }) |text| {
+        for ([_]usize{ 72, 40, 24, 16, 13, 11, 10, 9 }) |columns| {
+            const bytes = try painted(gpa, text, columns, null, 0);
+            defer gpa.free(bytes);
+            const body = try plainBody(gpa, frameBody(bytes));
+            defer gpa.free(body);
+            var width: ?usize = null;
+            var painted_rows = std.mem.splitSequence(u8, body, "\r\n");
+            while (painted_rows.next()) |row| {
+                const grid = std.mem.trimStart(u8, row, " ");
+                // A top border opens a grid of its own width.
+                if (std.mem.startsWith(u8, grid, "┌")) width = null;
+                for ([_][]const u8{ "┌", "│", "├", "└" }) |glyph| {
+                    if (!std.mem.startsWith(u8, grid, glyph)) continue;
+                    const row_width = terminal.width.ofText(row);
+                    try std.testing.expect(row_width <= columns);
+                    if (width) |first| try std.testing.expectEqual(first, row_width);
+                    width = row_width;
+                }
+            }
+        }
+    }
+}
+
+// A grid holds the indentation of its source, the way a paragraph does, so a
+// table under a list item lines up with the item text.
+test "a table keeps the indentation of its source" {
+    const gpa = std.testing.allocator;
+    try expectPlainRows(gpa, "  | a | b |\n  | - | - |\n  | c | d |", 12, &.{
+        "  ┌───┬───┐",
+        "  │ a │ b │",
+        "  ├───┼───┤",
+        "  │ c │ d │",
+        "  └───┴───┘",
+    });
+    // The indentation the grid takes is width the columns no longer give it.
+    const bytes = try painted(gpa, "  | a | b |\n  | - | - |\n  | c | d |", 10, null, 0);
+    defer gpa.free(bytes);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "┌") == null);
+}
+
+// Below one cell per column plus its borders, a grid cannot draw: the table
+// falls back to the wrapped paragraph text it was before.
+test "a table below its narrowest grid stays prose" {
+    const gpa = std.testing.allocator;
+    const text = "| a | b |\n| - | - |\n| c | d |";
+    const bytes = try painted(gpa, text, 8, null, 0);
+    defer gpa.free(bytes);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "┌") == null);
+    try std.testing.expect(std.mem.indexOfScalar(u8, bytes, '|') != null);
+}
+
+// Mid-stream, a header without its delimiter row is still prose. A head with
+// no body rows yet closes right under the header, with no inner border.
+test "a table appears only when its delimiter row is complete" {
+    const gpa = std.testing.allocator;
+    for ([_][]const u8{ "| a | b |", "| a | b |\n| --" }) |text| {
+        const bytes = try painted(gpa, text, 40, null, 0);
+        defer gpa.free(bytes);
+        try std.testing.expect(std.mem.indexOf(u8, bytes, "┌") == null);
+    }
+    const bytes = try painted(gpa, "| a | b |\n| - | -", 40, null, 0);
+    defer gpa.free(bytes);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "┌") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "└") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "├") == null);
+}
+
+// The policy the cap search stands for: take one cell from the widest column,
+// the lowest index first, until the grid fits. The search must land where that
+// loop lands, at every shape a window and a measure pass can produce.
+test "the column fit matches a cell-by-cell shrink" {
+    var prng = std.Random.DefaultPrng.init(0x7ab1e5);
+    const random = prng.random();
+    for (0..2000) |_| {
+        const count = random.intRangeAtMost(usize, 1, Table.count_max);
+        var table: Table = .{ .count = count, .widths = @splat(1), .indent = "" };
+        for (table.widths[0..count]) |*width| width.* = random.intRangeAtMost(usize, 1, 40);
+        // Any window at or above the floor `detect` enforces.
+        const floor = 1 + 4 * count;
+        const columns = random.intRangeAtMost(usize, floor, floor + 60);
+
+        var reference = table;
+        var total = 1 + 3 * count;
+        for (reference.widths[0..count]) |width| total += width;
+        while (total > columns) : (total -= 1) {
+            var widest: usize = 0;
+            for (reference.widths[0..count], 0..) |width, index| {
+                if (width > reference.widths[widest]) widest = index;
+            }
+            reference.widths[widest] -= 1;
+        }
+
+        table.fit(columns);
+        try std.testing.expectEqualSlices(
+            usize,
+            reference.widths[0..count],
+            table.widths[0..count],
+        );
+        // The grid fits the window and no column loses its last cell.
+        var fitted = 1 + 3 * count;
+        for (table.widths[0..count]) |width| {
+            try std.testing.expect(width >= 1);
+            fitted += width;
+        }
+        try std.testing.expect(fitted <= columns);
+    }
+}
+
+test "a delimiter row is dashes with optional alignment colons" {
+    try std.testing.expect(Table.isDelimiter("| --- |"));
+    try std.testing.expect(Table.isDelimiter("|-|"));
+    try std.testing.expect(Table.isDelimiter("  | :--- | ---: | :-: |"));
+    try std.testing.expect(!Table.isDelimiter("| --x |"));
+    try std.testing.expect(!Table.isDelimiter("|  |"));
+    try std.testing.expect(!Table.isDelimiter("| :: |"));
+    try std.testing.expect(!Table.isDelimiter("|"));
+    try std.testing.expect(!Table.isDelimiter("---"));
+    try std.testing.expectEqual(@as(usize, 2), Table.cellCount("| a | b |"));
+    try std.testing.expectEqual(@as(usize, 2), Table.cellCount("| a | b"));
+    try std.testing.expectEqual(@as(usize, 1), Table.cellCount("|"));
+}
+
 // A prefix never crowds the body out of the row: at two columns a bullet and a
 // quote border give a column back, so the text still shows. The source does not
 // advance behind a sink that clips every byte of it.
@@ -968,11 +1544,11 @@ test "markdown holds row parity over arbitrary marker soup" {
     // Block markers, inline markers, and the text they wrap. The clusters wider
     // than one column are what a width budget has to saturate against.
     const tokens = [_][]const u8{
-        "#",   "##",     "###### ", "- ",   "* ", "1. ", "12) ", ">",           ">> ", "---",
-        "```", "```zig", "**",      "*",    "_",  "__",  "~~",   "`",           "[",   "]",
-        "(",   ")",      "[x] ",    "[ ] ", "\n", " ",   "  ",   "https://x.y", "a",   "word",
-        "\t",  "\x1b",   "\xff",
-    } ++ [_][]const u8{ "你", "😀", "e\u{0301}" };
+        "#",   "##",     "###### ", "- ",   "* ",  "1. ", "12) ", ">",           ">> ", "---",
+        "```", "```zig", "**",      "*",    "_",   "__",  "~~",   "`",           "[",   "]",
+        "(",   ")",      "[x] ",    "[ ] ", "\n",  " ",   "  ",   "https://x.y", "a",   "word",
+        "\t",  "\x1b",   "\xff",    "|",    "|-|",
+    } ++ [_][]const u8{ "| --- |", "| a | b |", "你", "😀", "e\u{0301}" };
     var prng = std.Random.DefaultPrng.init(0xc0ffee);
     const random = prng.random();
     var text: std.ArrayList(u8) = .empty;

@@ -121,13 +121,14 @@ dependency on another item. Module layout and extension seams live in `AGENTS.md
       warning._
 - [ ] **Richer UI components** — composable tool-call panels, streaming status, and a command
       palette go beyond today's log plus editor. _Keep the line/string render model._
-- [ ] **Markdown tables and clickable links** — markdown tables render as box-drawing grids, and
-      links become clickable terminal hyperlinks. _Both were deferred out of the markdown renderer.
-      A table needs per-column width sizing and wrapping that still satisfies row parity at every
-      width, down to the two-column edge. Today a table falls through to plain paragraph text. A
-      link shows as styled text with the URL appended. OSC-8 hyperlinks are a string control, not an
-      SGR, so a clickable runtime URL needs a trusted path through the sink's SGR-only control
-      boundary._
+- [x] **Markdown tables** — a pipe table renders as a box-drawing grid that sizes each column and
+      fits the window. _A long cell truncates to its column instead of wrapping. A table falls back
+      to plain paragraph text when the window is narrower than its smallest grid. The fallback
+      keeps row parity at every width._
+- [ ] **Clickable links** — links become clickable terminal hyperlinks. _Deferred out of the
+      markdown renderer. Today a link shows as styled text with the URL appended. OSC-8 hyperlinks
+      are a string control, not an SGR, so a clickable runtime URL needs a trusted path through the
+      sink's SGR-only control boundary._
 
 ## Configuration
 
