@@ -64,8 +64,8 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 
 - Anthropic and OpenAI, each reachable as a subscription account or a platform API-key account.
 - The Anthropic Console account adds an OAuth login that mints and stores a platform key.
-- Startup resumes on the account this project used last, else takes the first authenticated one
-  and prefers a signed-in login over an API key.
+- Startup resumes on the account this project used last, else takes the first authenticated one and
+  prefers a signed-in login over an API key.
 - With no account at all, the login picker opens by itself.
 - While signed out, pith refuses a message with a prompt to `/login`.
 - Reasoning replays only to the account that produced it. A login or logout discards the rest.
@@ -115,8 +115,9 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 
 - The conversation renders inline into the normal screen buffer and real scrollback. Temporary
   full-window pages use the alternate screen and restore the conversation on close.
-- Repaints only the rows that changed, atomically. A shrink keeps native scrollback intact and can
-  leave blank rows below the interface. A resize or a change above the viewport reprints the window.
+- Repaints only the rows that changed, atomically. A shrink or height change keeps native scrollback
+  intact and can leave blank rows below the interface. A width change or a change above the viewport
+  reprints the window.
 - Restores the terminal on exit, on a failed start, and around an interactive OAuth login.
 - Parks the cursor below the interface on exit, so the shell prompt does not overwrite the last
   frame.
@@ -178,16 +179,16 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - User and project instructions obey one policy: a regular UTF-8 file, with content, no NUL byte,
   and at most 32 KiB. Each source loads at most 32 files and 64 KiB, and one file loads once even
   when two paths or a symbolic link reach it. pith reports what it skips.
-- `~/.pith/config.json` is optional: paths for user instructions, request and bash limits, a
-  default model per account, and a default effort level.
+- `~/.pith/config.json` is optional: paths for user instructions, request and bash limits, a default
+  model per account, and a default effort level.
 - It holds no secrets. API keys come from `ANTHROPIC_API_KEY` and `OPENAI_API_KEY`.
 - A configured model that is not valid for its account is reported, and the compiled default used.
   An unknown effort level is reported the same way.
 - `~/.pith/state.json` remembers per project which account and effort level pith used last, and the
   model of each account. It is machine-local, owner-only, and keeps the 1000 most recently changed
   projects. A repository is one project, keyed by its Git root.
-- pith reads that file only at startup, so a change in one instance reaches only the next start.
-  A file pith cannot save to is reported once and never stops the session.
+- pith reads that file only at startup, so a change in one instance reaches only the next start. A
+  file pith cannot save to is reported once and never stops the session.
 - `HOME` must be set, since the config, the credentials, and the state all live under `~/.pith`.
 
 ## Keeping this file true

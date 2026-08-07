@@ -40,6 +40,16 @@ pub fn deinit(self: *Emulator) void {
     self.document.deinit(self.gpa);
 }
 
+/// Keep the cursor visible when the screen loses rows. Added rows stay blank below.
+pub fn resize(self: *Emulator, rows: usize) void {
+    const height = @max(rows, 1);
+    if (self.rows > 0 and height < @max(self.rows, 1)) {
+        const cursor_top = self.cursor_row -| (height - 1);
+        self.screen_top = @max(self.screen_top, cursor_top);
+    }
+    self.rows = rows;
+}
+
 pub fn feed(self: *Emulator, bytes: []const u8) !void {
     var index: usize = 0;
     while (index < bytes.len) {

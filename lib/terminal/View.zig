@@ -12,7 +12,8 @@
 //!
 //! The view tracks screen lines for the frame, the screen top, and the cursor.
 //! These lines increase until a reset starts a new epoch. A shrink can therefore
-//! end above the bottom and leave blank rows.
+//! end above the bottom and leave blank rows. A height loss advances the top only
+//! enough to keep the cursor visible. A later height growth can add blank rows below.
 //!
 //! A fresh inline frame starts at the shell cursor. Tracked line zero need not be
 //! physical row zero. This offset does not change cursor distances or when tracked
@@ -54,8 +55,8 @@ cursor_visible: bool,
 /// The sink handed out by `beginFrame`. It composes into the back frame until
 /// the paired `render`.
 sink: Sink,
-/// Set by `beginFrame` when the columns, rows, or page count changed. This
-/// forces `render` to repaint the whole window.
+/// Set by `beginFrame` when the columns or page count changed. This forces
+/// `render` to repaint the whole window. A height change reconciles incrementally.
 structural_change: bool,
 /// Set by `invalidate`: the screen no longer matches the last painted frame.
 force_reset: bool,
@@ -287,7 +288,8 @@ pub fn beginFrame(self: *View, size: Size, pages: usize) !*Sink {
     const width_changed = self.columns != 0 and self.columns != size.columns;
     const height_changed = self.rows != 0 and self.rows != size.rows;
     const pages_changed = self.pages != 0 and self.pages != pages;
-    self.structural_change = width_changed or height_changed or pages_changed;
+    if (height_changed) self.resizeHeight(size.rows);
+    self.structural_change = width_changed or pages_changed;
     self.columns = size.columns;
     self.rows = size.rows;
     self.pages = pages;
@@ -366,18 +368,19 @@ pub fn parkCursor(self: *View) !void {
 /// `prev`.
 fn paintAligned(self: *View, prev: *const Frame, back: *Frame, delta: usize) !void {
     const scrolled = back.rows.items.len + delta > prev.rows.items.len;
+    const aligned_top = prev.top_line + delta;
     if (delta > 0 and !scrolled) {
-        if (!self.lineVisible(prev.top_line)) {
-            try self.paint(.reset, back, .{});
-        } else {
-            // The producer removed rows on screen. Move the remaining frame to the old top.
-            back.top_line = prev.top_line;
-            try self.paint(.incremental, back, .{ .line = prev.top_line });
+        const printed_top = @max(prev.top_line, self.screen_top_line);
+        if (aligned_top > printed_top) {
+            // The producer removed rows that remain on screen. Move the tail to
+            // the first tracked line and erase those rows without a reset.
+            back.top_line = printed_top;
+            try self.paint(.incremental, back, .{ .line = printed_top });
+            return;
         }
-        return;
     }
 
-    back.top_line = prev.top_line + delta;
+    back.top_line = aligned_top;
     const maybe_changed = firstChangeFrom(prev, back, .{
         .prev_start = delta,
         .back_start = 0,
@@ -385,7 +388,7 @@ fn paintAligned(self: *View, prev: *const Frame, back: *Frame, delta: usize) !vo
     if (maybe_changed) |changed| {
         try self.paintChangedSuffix(prev, back, .{ .changed = changed, .prev_start = delta });
     } else {
-        try self.paintCaretOnly(back);
+        try self.paintTailOrCaret(back);
     }
 }
 
@@ -412,8 +415,24 @@ fn paintDroppedPrefix(self: *View, prev: *const Frame, back: *Frame) !void {
 
         try self.paintChangedSuffix(prev, back, .{ .changed = changed, .prev_start = 0 });
     } else {
-        try self.paintCaretOnly(back);
+        try self.paintTailOrCaret(back);
     }
+}
+
+/// Repaint an unchanged tail when a height loss moved it below the screen.
+fn paintTailOrCaret(self: *View, frame: *Frame) !void {
+    const screen_bottom = self.screen_top_line + self.screenHeight() - 1;
+    const last_line = frame.top_line + frame.rows.items.len - 1;
+    if (last_line <= screen_bottom) {
+        try self.paintCaretOnly(frame);
+        return;
+    }
+    if (frame.top_line > screen_bottom) {
+        try self.paint(.reset, frame, .{});
+        return;
+    }
+    const anchor = frame.rows.items.len - 1 - (last_line - screen_bottom);
+    try self.paint(.incremental, frame, .{ .anchor = anchor, .line = screen_bottom });
 }
 
 /// Repaint a changed suffix. Start at the previous last row when output must scroll.
@@ -527,6 +546,15 @@ fn screenHeight(self: *const View) usize {
     return @max(self.rows, 1);
 }
 
+/// Keep the tracked cursor visible when the terminal loses rows. Added rows stay
+/// below the current screen, so a later growth does not pull scrollback down.
+fn resizeHeight(self: *View, rows: usize) void {
+    const height = @max(rows, 1);
+    if (height >= self.screenHeight()) return;
+    const cursor_top = self.cursor_line -| (height - 1);
+    self.screen_top_line = @max(self.screen_top_line, cursor_top);
+}
+
 fn advanceLine(self: *View) void {
     const screen_bottom = self.screen_top_line + self.screenHeight() - 1;
     if (self.cursor_line >= screen_bottom) self.screen_top_line += 1;
@@ -636,6 +664,8 @@ const Harness = struct {
 
     fn render(self: *Harness, lines: []const Line, size: Size, pages: usize) !void {
         self.last_from = self.consumed;
+        self.emulator.columns = size.columns;
+        self.emulator.resize(size.rows);
         const sink = try self.view.beginFrame(size, pages);
         const capacity = @max(size.rows, 1) * @max(pages, 1);
         const start = if (lines.len > capacity) lines.len - capacity else 0;
@@ -649,7 +679,6 @@ const Harness = struct {
         }
         try self.view.render();
         const bytes = self.out.written();
-        self.emulator.rows = size.rows;
         try self.emulator.feed(bytes[self.consumed..]);
         self.consumed = bytes.len;
         try std.testing.expectEqual(self.view.screen_top_line, self.emulator.screen_top);
@@ -1039,7 +1068,7 @@ test "a page-count change resets" {
     try std.testing.expect(std.mem.indexOf(u8, harness.lastBytes(), escape.screen_reset) != null);
 }
 
-test "a resize resets" {
+test "a width resize resets" {
     const gpa = std.testing.allocator;
     const harness = try makeHarness(gpa, 10);
     defer {
@@ -1051,9 +1080,70 @@ test "a resize resets" {
     try harness.render(&frame, .{ .columns = 8, .rows = 4 }, 2);
     try harness.emulator.expectVisible(&.{ "a", "b" });
     try std.testing.expect(std.mem.indexOf(u8, harness.lastBytes(), escape.screen_reset) != null);
-    try harness.render(&frame, .{ .columns = 8, .rows = 3 }, 2);
-    try harness.emulator.expectVisible(&.{ "a", "b" });
-    try std.testing.expect(std.mem.indexOf(u8, harness.lastBytes(), escape.screen_reset) != null);
+}
+
+test "a height resize preserves scrollback and leaves blank rows below" {
+    const gpa = std.testing.allocator;
+    const harness = try makeHarness(gpa, 20);
+    defer {
+        harness.deinit();
+        gpa.destroy(harness);
+    }
+    const first = [_]Line{
+        line("history", 0),
+        line("thinking", 1),
+        line("answer 0", 2),
+        line("answer 1", 3),
+        line("answer 2", 4),
+        line("answer 3", 5),
+        caretLine("editor", .{ .id = 10, .column = 6 }),
+        line("status", 11),
+    };
+    try harness.render(&first, .{ .columns = 20, .rows = 4 }, 2);
+    try harness.emulator.expectScreen(&.{ "answer 2", "answer 3", "editor", "status" });
+
+    // Extend past the retained window. The thinking row now lives only in
+    // native scrollback, so a bounded repaint cannot reconstruct it.
+    const extended = [_]Line{
+        line("history", 0),
+        line("thinking", 1),
+        line("answer 0", 2),
+        line("answer 1", 3),
+        line("answer 2", 4),
+        line("answer 3", 5),
+        line("answer 4", 6),
+        line("answer 5", 7),
+        line("answer 6", 8),
+        line("answer 7", 9),
+        caretLine("editor", .{ .id = 10, .column = 6 }),
+        line("status", 11),
+    };
+    try harness.render(&extended, .{ .columns = 20, .rows = 4 }, 2);
+    try harness.emulator.expectScreen(&.{ "answer 6", "answer 7", "editor", "status" });
+
+    try harness.render(&extended, .{ .columns = 20, .rows = 2 }, 2);
+    try harness.emulator.expectScreen(&.{ "editor", "status" });
+    const screen_top = harness.emulator.screen_top;
+    const shrink = harness.lastBytes();
+    try std.testing.expect(std.mem.indexOf(u8, shrink, escape.screen_repaint) == null);
+    try std.testing.expect(std.mem.indexOf(u8, shrink, "thinking") == null);
+
+    try harness.render(&extended, .{ .columns = 20, .rows = 4 }, 2);
+    try harness.emulator.expectScreen(&.{ "editor", "status", "", "" });
+    try std.testing.expectEqual(screen_top, harness.emulator.screen_top);
+    const expected = [_][]const u8{
+        "history",  "thinking", "answer 0", "answer 1", "answer 2", "answer 3",
+        "answer 4", "answer 5", "answer 6", "answer 7", "editor",   "status",
+    };
+    try std.testing.expectEqual(expected.len, harness.emulator.document.items.len);
+    for (expected, harness.emulator.document.items) |text, row| {
+        try std.testing.expectEqualStrings(text, row.items);
+    }
+    const growth = harness.lastBytes();
+    try std.testing.expect(std.mem.indexOf(u8, growth, escape.screen_repaint) == null);
+    try std.testing.expect(std.mem.indexOf(u8, growth, "thinking") == null);
+    try std.testing.expect(std.mem.indexOf(u8, growth, "editor") == null);
+    try std.testing.expect(std.mem.indexOf(u8, growth, "status") == null);
 }
 
 test "a jump with no shared anchor resets" {
@@ -1262,7 +1352,7 @@ test "a top-trim with nothing scrolled off reprints from row zero" {
     try harness.emulator.expectCaret(.{ .frame_len = 3, .row = 2, .column = 1 });
 }
 
-test "a pure top-trim with rows scrolled off resets" {
+test "a pure top-trim with rows scrolled off preserves the screen" {
     const gpa = std.testing.allocator;
     const harness = try makeHarness(gpa, 10);
     defer {
@@ -1276,15 +1366,16 @@ test "a pure top-trim with rows scrolled off resets" {
     try harness.render(&first, .{ .columns = 10, .rows = 2 }, 2);
     try harness.emulator.expectScreen(&.{ "r2", "r3" });
 
-    // Trim the top row with the tail byte-identical: the view cannot reconcile
-    // the slid window incrementally against a partly scrolled-off screen.
+    // Trim an inaccessible top row. The byte-identical visible tail stays in place.
     const second = [_]Line{
         line("r1", 1), line("r2", 2), caretLine("r3", .{ .id = 3, .column = 1 }),
     };
     try harness.render(&second, .{ .columns = 10, .rows = 2 }, 2);
     try harness.emulator.expectScreen(&.{ "r2", "r3" });
     try harness.emulator.expectCaret(.{ .frame_len = 3, .row = 2, .column = 1 });
-    try std.testing.expect(std.mem.indexOf(u8, harness.lastBytes(), escape.screen_reset) != null);
+    const last = harness.lastBytes();
+    try std.testing.expect(std.mem.indexOf(u8, last, escape.screen_reset) == null);
+    try std.testing.expect(std.mem.indexOf(u8, last, escape.screen_clear_below) == null);
 }
 
 test "invalidate forces a full reset even when content is unchanged" {
