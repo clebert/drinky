@@ -26,6 +26,7 @@ const RawState = struct {
     raw_owned: bool = false,
     paste_reset_pending: bool = false,
     keyboard_reset_pending: bool = false,
+    grapheme_reset_pending: bool = false,
     cursor_show_pending: bool = false,
     screen_alternate_reset_pending: bool = false,
     screen_alternate_keyboard_reset_pending: bool = false,
@@ -149,12 +150,17 @@ fn enterWith(state: *RawState, output: *std.Io.Writer, control: anytype) !void {
     try output.writeAll(escape.paste_set);
     state.keyboard_reset_pending = true;
     try output.writeAll(escape.keyboard_set);
+    state.grapheme_reset_pending = true;
+    try output.writeAll(escape.grapheme_set);
     state.cursor_show_pending = true;
     try output.writeAll(escape.cursor_hide);
     try output.flush();
     state.setup_complete = true;
 }
 
+// The alternate screen carries its own keyboard mode stack and cursor
+// visibility, so this re-sends both. Grapheme cluster processing is one
+// terminal-wide mode, which `enterWith` sets once for both screens.
 fn setAlternateScreenWith(state: *RawState, output: *std.Io.Writer, enabled: bool) !void {
     if (enabled) {
         if (state.screen_alternate_reset_pending) return;
@@ -208,6 +214,11 @@ fn cleanupWith(
         flush_needed = true;
         output.writeAll(escape.cursor_show) catch {};
     }
+    if (state.grapheme_reset_pending) {
+        state.grapheme_reset_pending = false;
+        flush_needed = true;
+        output.writeAll(escape.grapheme_reset) catch {};
+    }
     if (state.keyboard_reset_pending) {
         state.keyboard_reset_pending = false;
         flush_needed = true;
@@ -253,7 +264,7 @@ const TestWriter = struct {
         .vtable = &.{ .drain = drain, .flush = flush },
         .buffer = &.{},
     },
-    operations: [16]Operation = undefined,
+    operations: [32]Operation = undefined,
     operations_len: usize = 0,
     drain_count: usize = 0,
     flush_count: usize = 0,
@@ -265,6 +276,8 @@ const TestWriter = struct {
     const Operation = enum {
         paste_set,
         keyboard_set,
+        grapheme_set,
+        grapheme_reset,
         cursor_hide,
         cursor_show,
         screen_alternate_set,
@@ -277,6 +290,7 @@ const TestWriter = struct {
     };
 
     fn record(self: *TestWriter, item: Operation) void {
+        std.debug.assert(self.operations_len < self.operations.len);
         self.operations[self.operations_len] = item;
         self.operations_len += 1;
     }
@@ -313,6 +327,8 @@ const TestWriter = struct {
     fn operation(bytes: []const u8) Operation {
         if (std.mem.eql(u8, bytes, escape.paste_set)) return .paste_set;
         if (std.mem.eql(u8, bytes, escape.keyboard_set)) return .keyboard_set;
+        if (std.mem.eql(u8, bytes, escape.grapheme_set)) return .grapheme_set;
+        if (std.mem.eql(u8, bytes, escape.grapheme_reset)) return .grapheme_reset;
         if (std.mem.eql(u8, bytes, escape.cursor_hide)) return .cursor_hide;
         if (std.mem.eql(u8, bytes, escape.cursor_show)) return .cursor_show;
         if (std.mem.eql(u8, bytes, escape.screen_alternate_set)) return .screen_alternate_set;
@@ -483,21 +499,37 @@ test "setup failure restores cooked mode and only reverses attempted terminal mo
         &.{
             .paste_set,
             .keyboard_set,
-            .cursor_hide,
-            .cursor_show,
+            .grapheme_set,
+            .grapheme_reset,
             .keyboard_reset,
             .paste_reset,
             .flush,
         },
-        &.{ .drain_at = 3, .drain_again_at = 4, .flush_at = 1 },
+        &.{ .drain_at = 3 },
     );
     try expectSetupFailure(
         &.{
             .paste_set,
             .keyboard_set,
+            .grapheme_set,
+            .cursor_hide,
+            .cursor_show,
+            .grapheme_reset,
+            .keyboard_reset,
+            .paste_reset,
+            .flush,
+        },
+        &.{ .drain_at = 4, .drain_again_at = 5, .flush_at = 1 },
+    );
+    try expectSetupFailure(
+        &.{
+            .paste_set,
+            .keyboard_set,
+            .grapheme_set,
             .cursor_hide,
             .flush,
             .cursor_show,
+            .grapheme_reset,
             .keyboard_reset,
             .paste_reset,
             .flush,
@@ -544,7 +576,7 @@ test "successful setup and repeated cleanup manage every terminal mode once" {
     try std.testing.expectEqual(@as(usize, 0), control.restore_count);
     try std.testing.expectEqualSlices(
         TestWriter.Operation,
-        &.{ .paste_set, .keyboard_set, .cursor_hide, .flush },
+        &.{ .paste_set, .keyboard_set, .grapheme_set, .cursor_hide, .flush },
         output.operations[0..output.operations_len],
     );
 
@@ -558,9 +590,11 @@ test "successful setup and repeated cleanup manage every terminal mode once" {
         &.{
             .paste_set,
             .keyboard_set,
+            .grapheme_set,
             .cursor_hide,
             .flush,
             .cursor_show,
+            .grapheme_reset,
             .keyboard_reset,
             .paste_reset,
             .newline,
@@ -585,10 +619,12 @@ test "shutdown restores cooked mode before the potentially blocking presentation
         &.{
             .paste_set,
             .keyboard_set,
+            .grapheme_set,
             .cursor_hide,
             .flush,
             .restore,
             .cursor_show,
+            .grapheme_reset,
             .keyboard_reset,
             .paste_reset,
             .newline,
@@ -599,7 +635,8 @@ test "shutdown restores cooked mode before the potentially blocking presentation
 }
 
 test "shutdown restores cooked mode even when presentation output fails" {
-    var output: TestWriter = .{ .drain_fail_at = 4, .flush_fail_at = 2 };
+    // The first cleanup write fails: the four setup writes precede it.
+    var output: TestWriter = .{ .drain_fail_at = 5, .flush_fail_at = 2 };
     var control: TestControl = .{ .log = &output };
     var state: RawState = .{};
 
@@ -609,5 +646,9 @@ test "shutdown restores cooked mode even when presentation output fails" {
     try std.testing.expect(!control.raw);
     try std.testing.expectEqual(@as(usize, 1), control.restore_count);
     try std.testing.expectEqual(RawState{}, state);
-    try std.testing.expectEqual(TestWriter.Operation.restore, output.operations[4]);
+    // The restore precedes every cleanup write, whatever the mode count is.
+    const recorded = output.operations[0..output.operations_len];
+    const restore_at = std.mem.indexOfScalar(TestWriter.Operation, recorded, .restore).?;
+    const cursor_at = std.mem.indexOfScalar(TestWriter.Operation, recorded, .cursor_show).?;
+    try std.testing.expect(restore_at < cursor_at);
 }

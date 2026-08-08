@@ -165,6 +165,9 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - A bracketed paste arrives as one unit, with controls and escapes inside kept as literal payload.
 - Unrecognized sequences and stray control bytes are ignored and never leak into the text.
 - Text is segmented per UAX #29, so an emoji family, a flag, or a Hangul syllable stays one glyph.
+- Pith asks the terminal for grapheme cluster processing at startup. The cursor then advances one
+  grapheme cluster at a time, the same as the pith measure of a row. An older terminal ignores the
+  request.
 - A cluster measures 0, 1, or 2 columns, so CJK and emoji wrap, truncate, and place the caret
   correctly.
 - Wrapping and truncation never split a cluster or let a wide one straddle the margin.

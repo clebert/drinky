@@ -23,6 +23,13 @@ pub const paste_end = "\x1b[201~";
 pub const keyboard_set = "\x1b[>1u";
 pub const keyboard_reset = "\x1b[<u";
 
+/// Enable/disable grapheme cluster processing. The terminal then advances the
+/// cursor one grapheme cluster at a time, which is how `width` measures a row.
+/// A terminal ignores a private mode it does not know. `Tty` pairs the set with
+/// the reset, so the mode does not outlive the session.
+pub const grapheme_set = "\x1b[?2027h";
+pub const grapheme_reset = "\x1b[?2027l";
+
 pub const cursor_hide = "\x1b[?25l";
 pub const cursor_show = "\x1b[?25h";
 

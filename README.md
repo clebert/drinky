@@ -7,6 +7,15 @@ terminals (Ghostty, kitty, WezTerm). It keeps the line count as low as possible.
 
 The name is a placeholder.
 
+## Terminal
+
+Pith uses synchronized output, true color, and the Kitty keyboard protocol. At startup it asks for
+grapheme cluster processing (DECSET 2027), because it measures one grapheme cluster per cell step.
+
+Pith does not test the terminal for these capabilities. An older terminal, such as Apple Terminal,
+still shows the interface. In such a terminal an emoji can take the wrong width, a repaint can
+flicker, and a color can be approximate.
+
 ## Build
 
 ```sh
