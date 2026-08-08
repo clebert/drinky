@@ -32,6 +32,7 @@ const std = @import("std");
 
 const Emulator = @import("Emulator.zig");
 const escape = @import("escape.zig");
+const grapheme = @import("grapheme.zig");
 const width = @import("width.zig");
 
 const View = @This();
@@ -99,18 +100,23 @@ pub const Sink = struct {
     offset: usize,
     columns_written: usize,
     has_text: bool,
+    /// Whether the tail of the last fragment written joins whatever follows it,
+    /// such as a Prepend or a ZWJ. The next seam then takes a guard, whatever
+    /// the fragment after it starts with.
+    tail_joining: bool,
 
     /// Open a row and capture the current `blob` end.
     pub fn begin(self: *Sink) void {
         self.offset = self.frame.blob.writer.end;
         self.columns_written = 0;
         self.has_text = false;
+        self.tail_joining = false;
     }
 
     /// Append inert display text. The same scanner used for layout and width
-    /// accounting canonicalizes terminal controls and malformed UTF-8. With a
-    /// zero-width break between calls, separately measured fragments do not
-    /// fuse into a different terminal grapheme.
+    /// accounting canonicalizes terminal controls and malformed UTF-8. A seam
+    /// that can fuse takes a zero-width guard, so separately measured fragments
+    /// do not become one terminal grapheme.
     pub fn text(self: *Sink, bytes: []const u8) !void {
         return self.textFitted(bytes, self.columns -| self.columns_written);
     }
@@ -119,10 +125,11 @@ pub const Sink = struct {
     /// remaining capacity. This lets a caller reserve trailing decoration.
     pub fn textFitted(self: *Sink, bytes: []const u8, columns_max: usize) !void {
         if (bytes.len == 0) return;
-        if (self.has_text) try self.frame.blob.writer.writeAll("\u{200B}");
+        try self.guard(bytes);
         const available = @min(columns_max, self.columns -| self.columns_written);
+        const start = self.frame.blob.writer.end;
         self.columns_written += try width.writeFitted(&self.frame.blob.writer, bytes, available);
-        self.has_text = true;
+        self.trackTail(start);
     }
 
     /// Append up to `count` ordinary spaces and keep the row writer private.
@@ -138,10 +145,11 @@ pub const Sink = struct {
         comptime std.debug.assert(width.ofText(cell) == 1);
         const shown = @min(count, self.columns -| self.columns_written);
         if (shown == 0) return;
-        if (self.has_text) try self.frame.blob.writer.writeAll("\u{200B}");
+        try self.guard(cell);
+        const start = self.frame.blob.writer.end;
         try self.frame.blob.writer.splatBytesAll(cell, shown);
         self.columns_written += shown;
-        self.has_text = true;
+        self.trackTail(start);
     }
 
     /// Append a compile-time-known Select Graphic Rendition sequence. The sink
@@ -171,6 +179,28 @@ pub const Sink = struct {
     /// one opened by the most recent `begin`.
     pub fn setCaret(self: *Sink, column: usize) void {
         self.frame.caret = .{ .row = self.frame.rows.items.len, .column = column };
+    }
+
+    /// Write a zero-width guard before `bytes` when the seam can fuse. A seam
+    /// fuses when the row ends on an open join, or when `bytes` starts with a
+    /// code point that continues the cluster before it. A seam that cannot fuse
+    /// stays bare, so a frame carries almost no guards. A terminal that gives a
+    /// guard a column then does not shift the row. A row with no columns left
+    /// can keep a guard whose fragment wrote nothing. That guard costs nothing.
+    fn guard(self: *Sink, bytes: []const u8) !void {
+        if (!self.has_text) return;
+        if (!self.tail_joining and !grapheme.startsJoining(bytes)) return;
+        try self.frame.blob.writer.writeAll("\u{200B}");
+    }
+
+    /// Classify the tail of the bytes written since `start`, so the next seam
+    /// knows whether it can fuse. A fragment that the column budget dropped
+    /// whole writes nothing and leaves the tail of the row as it was.
+    fn trackTail(self: *Sink, start: usize) void {
+        const written = self.frame.blob.writer.buffered()[start..];
+        if (written.len == 0) return;
+        self.tail_joining = grapheme.endsJoining(written);
+        self.has_text = true;
     }
 };
 
@@ -305,6 +335,7 @@ pub fn beginFrame(self: *View, size: Size, pages: usize) !*Sink {
         .offset = 0,
         .columns_written = 0,
         .has_text = false,
+        .tail_joining = false,
     };
     return &self.sink;
 }
@@ -1220,7 +1251,9 @@ test "a fitted fragment preserves room for trailing cells" {
     harness.emulator.rows = 1;
     try harness.emulator.feed(harness.out.written());
     try std.testing.expectEqual(@as(usize, 2), sink.columns_written);
-    try harness.emulator.expectVisible(&.{"\u{200B}�\u{200B}\u{200B}|"});
+    // The replacement brings its own boundaries and `|` joins nothing, so the
+    // seam between the two fragments stays bare.
+    try harness.emulator.expectVisible(&.{"\u{200B}�\u{200B}|"});
 }
 
 test "the caret is hidden with no caret and when above the viewport" {
@@ -1428,6 +1461,50 @@ test "canonical text boundaries survive separate sink writes" {
 
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "\u{200D}👩") == null);
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "\x1b\u{FE0F}") == null);
+}
+
+test "a seam takes a guard only where the two fragments can fuse" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var view = View.init(gpa, &out.writer);
+    defer view.deinit();
+
+    const sink = try view.beginFrame(.{ .columns = 40, .rows = 4 }, 1);
+    // Ordinary spans, spaces, and a rule cannot fuse, so this row holds no guard.
+    sink.begin();
+    try sink.text("model");
+    try sink.spaces(1);
+    try sink.text("(account)");
+    try sink.repeat("─", 4);
+    sink.end(.{ .id = 0, .line = 0 });
+    const plain = sink.frame.bytes(sink.frame.rows.items[0]);
+    try std.testing.expectEqualStrings("model (account)────", plain);
+    try std.testing.expectEqual(sink.columns_written, width.ofText(plain));
+
+    // A leading combining mark joins the text before it, and a trailing ZWJ
+    // joins the emoji after it. Both seams take the guard.
+    sink.begin();
+    try sink.text("e");
+    try sink.text("\u{0301}");
+    try sink.text("👨\u{200D}");
+    try sink.text("👩");
+    sink.end(.{ .id = 1, .line = 0 });
+    const joined = sink.frame.bytes(sink.frame.rows.items[1]);
+    try std.testing.expectEqualStrings("e\u{200B}\u{0301}👨\u{200D}\u{200B}👩", joined);
+    try std.testing.expectEqual(sink.columns_written, width.ofText(joined));
+
+    // An open tail guards the run that `repeat` writes too, even though a space
+    // and a rule dash join nothing on their own.
+    sink.begin();
+    try sink.text("👨\u{200D}");
+    try sink.spaces(1);
+    try sink.repeat("─", 2);
+    sink.end(.{ .id = 2, .line = 0 });
+    const run = sink.frame.bytes(sink.frame.rows.items[2]);
+    try std.testing.expectEqualStrings("👨\u{200D}\u{200B} ──", run);
+    try std.testing.expectEqual(sink.columns_written, width.ofText(run));
+    try view.render();
 }
 
 test "a styled row reprinted from its own start carries its escapes" {

@@ -214,12 +214,9 @@ test render {
     try std.testing.expect(std.mem.indexOf(u8, painted, "Cache: 87%") != null);
     try std.testing.expect(std.mem.indexOf(u8, painted, "Cost: $0.39") != null);
     try std.testing.expect(std.mem.indexOf(u8, painted, "Saved:") == null);
-    const right = std.mem.indexOf(
-        u8,
-        painted,
-        "claude-opus-4-8\u{200B} (\u{200B}Anthropic Subscription\u{200B})" ++
-            "\u{200B} · \u{200B}xhigh",
-    ).?;
+    // No fragment here can fuse with its neighbor, so the spans meet bare.
+    const right =
+        std.mem.indexOf(u8, painted, "claude-opus-4-8 (Anthropic Subscription) · xhigh").?;
     try std.testing.expect(right > std.mem.indexOf(u8, painted, "Context: 21%").?);
 }
 

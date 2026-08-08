@@ -190,9 +190,7 @@ test "a skill entry renders as one compact loaded marker" {
     try view.render();
 
     try std.testing.expectEqual(@as(usize, 1), entry.rows(40));
-    try std.testing.expect(
-        std.mem.indexOf(u8, out.written(), "Skill: \u{200B}zig-style") != null,
-    );
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "Skill: zig-style") != null);
 }
 
 // The clip drops its top `skip` rows and shows the rest.

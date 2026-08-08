@@ -3509,9 +3509,7 @@ test "an invoked skill records a compact marker and keeps its task visible" {
     }
 
     try app.session.paint(.{ .columns = 80, .rows = 24 });
-    try std.testing.expect(
-        std.mem.indexOf(u8, out.written(), "Skill: \u{200B}zig-style") != null,
-    );
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "Skill: zig-style") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.written(), prompt.content) == null);
 }
 

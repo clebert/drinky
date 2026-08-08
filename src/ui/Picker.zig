@@ -238,9 +238,7 @@ test "a tall option list scrolls the window to keep the selection in view" {
     // The selected tail option shows, the scrolled-off head does not, and the
     // top rule reports the rows hidden above the window.
     try std.testing.expect(std.mem.indexOf(u8, painted, "row19") != null);
-    try std.testing.expect(
-        std.mem.indexOf(u8, painted, "\x1b[7m\u{200B} > row19\x1b[0m") != null,
-    );
+    try std.testing.expect(std.mem.indexOf(u8, painted, "\x1b[7m > row19\x1b[0m") != null);
     try std.testing.expect(std.mem.indexOf(u8, painted, "row00") == null);
     try std.testing.expect(std.mem.indexOf(u8, painted, "↑ Hidden: 17") != null);
 }

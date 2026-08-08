@@ -6,8 +6,10 @@
 //! column width. It applies the full Unicode Text Segmentation rules GB1–GB13,
 //! including Indic conjunct breaks (GB9c) and emoji ZWJ sequences (GB11).
 //!
-//! The module offers only length: `stepAt` returns the next cluster's byte
-//! length and column width. Terminal escape syntax is not this module's concern.
+//! The module measures a cluster and reports the joins at the edges of a text.
+//! `stepAt` returns the next cluster's byte length and column width. A caller
+//! that appends one text to another asks `startsJoining` and `endsJoining`
+//! whether the two can fuse. Terminal escape syntax is not this module's concern.
 //! CR, LF, and the C0/C1 controls are their own `Control` clusters under the
 //! rules. Display policy can thus classify them before it hands printable runs
 //! here.
@@ -43,9 +45,57 @@ pub fn stepAt(text: []const u8) Step {
     return .{ .bytes = offset, .columns = columns };
 }
 
+/// Whether the first code point of `text` can continue a cluster before it. A
+/// rule joins these classes to the text on their left: the extending marks, the
+/// ZWJ, a spacing mark, a regional indicator, and the Hangul V and T jamo. The
+/// answer needs no left context. A caller can thus test a fragment on its own.
+pub fn startsJoining(text: []const u8) bool {
+    if (text.len == 0) return false;
+    return switch (classOf(decode(text).codepoint)) {
+        .extend, .extend_incb, .linker, .zwj, .spacing_mark, .regional_indicator, .v, .t => true,
+        else => false,
+    };
+}
+
+/// Whether the tail of `text` can join the cluster after it under a rule that
+/// `startsJoining` cannot see. A Prepend joins any cluster (GB9b). A ZWJ joins
+/// an emoji (GB11). A linker joins an Indic consonant (GB9c). A Hangul L jamo
+/// joins another lead or a syllable (GB6). The scan steps back over the trailing
+/// conjunct marks, because a linker under them still joins. A caller pairs the
+/// two functions to learn whether two texts can fuse where they meet.
+pub fn endsJoining(text: []const u8) bool {
+    var tail = text;
+    while (decodeLast(tail)) |last| {
+        switch (classOf(last.codepoint)) {
+            .prepend, .zwj, .linker, .l => return true,
+            .extend_incb => tail = tail[0 .. tail.len - last.bytes],
+            else => return false,
+        }
+    }
+    return false;
+}
+
 const replacement = 0xFFFD;
 
 const Decoded = struct { codepoint: u21, bytes: usize };
+
+/// The code point at the end of `text` and its byte length. The result is null
+/// when `text` is empty or does not end with a complete UTF-8 sequence. A
+/// sequence holds at most four bytes, so the scan back to the lead byte is short.
+fn decodeLast(text: []const u8) ?Decoded {
+    const limit = text.len -| 4;
+    var offset = text.len;
+    while (offset > limit) {
+        offset -= 1;
+        const lead = text[offset];
+        if (lead & 0xc0 == 0x80) continue;
+        const length = std.unicode.utf8ByteSequenceLength(lead) catch return null;
+        if (offset + length != text.len) return null;
+        const codepoint = std.unicode.utf8Decode(text[offset..]) catch return null;
+        return .{ .codepoint = codepoint, .bytes = length };
+    }
+    return null;
+}
 
 /// The code point at the start of `text` and its byte length. A bad lead byte,
 /// a sequence truncated by the buffer end, or an invalid encoding decodes to
@@ -227,6 +277,44 @@ test "stepAt survives malformed utf-8 by advancing" {
     try std.testing.expectEqual(Step{ .bytes = 1, .columns = 1 }, stepAt("\xff"));
     try std.testing.expectEqual(Step{ .bytes = 2, .columns = 1 }, stepAt("\xf0\x9f"));
     try std.testing.expectEqual(Step{ .bytes = 2, .columns = 1 }, stepAt("\xe4\xb8"));
+}
+
+test startsJoining {
+    // A mark, a variation selector, a ZWJ, and a spacing mark continue a cluster.
+    // A regional indicator and the Hangul V and T jamo do the same.
+    try std.testing.expect(startsJoining("\u{0301}"));
+    try std.testing.expect(startsJoining("\u{FE0F}"));
+    try std.testing.expect(startsJoining("\u{200D}👩"));
+    try std.testing.expect(startsJoining("\u{0903}"));
+    try std.testing.expect(startsJoining("🇵🇹"));
+    try std.testing.expect(startsJoining("\u{1160}"));
+    try std.testing.expect(startsJoining("\u{11A8}"));
+    // Ordinary text, an emoji, and the zero-width space start their own cluster.
+    try std.testing.expect(!startsJoining(""));
+    try std.testing.expect(!startsJoining("a"));
+    try std.testing.expect(!startsJoining("😀"));
+    try std.testing.expect(!startsJoining("\u{200B}"));
+    try std.testing.expect(!startsJoining("\u{1100}"));
+}
+
+test endsJoining {
+    // A prepend, a ZWJ, an Indic linker, and a Hangul L jamo leave a join open.
+    try std.testing.expect(endsJoining("\u{0D4E}"));
+    try std.testing.expect(endsJoining("👨\u{200D}"));
+    try std.testing.expect(endsJoining("\u{0915}\u{094D}"));
+    try std.testing.expect(endsJoining("\u{1100}"));
+    // A mark over the linker keeps the conjunct open (GB9c).
+    try std.testing.expect(endsJoining("\u{0915}\u{094D}\u{0300}"));
+    // Ordinary text, a whole emoji, and the zero-width space close their cluster.
+    try std.testing.expect(!endsJoining(""));
+    try std.testing.expect(!endsJoining("ab"));
+    try std.testing.expect(!endsJoining("👍\u{1F3FD}"));
+    try std.testing.expect(!endsJoining("\u{200B}"));
+    // A trailing mark or variation selector alone joins nothing after it.
+    try std.testing.expect(!endsJoining("e\u{0301}"));
+    try std.testing.expect(!endsJoining("❤\u{FE0F}"));
+    // A truncated sequence has no last code point, so it reports no join.
+    try std.testing.expect(!endsJoining("\xf0\x9f"));
 }
 
 test "UAX #29 grapheme cluster boundaries match the conformance corpus" {

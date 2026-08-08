@@ -121,6 +121,8 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - Repaints only the rows that changed, atomically. A shrink or height change keeps native scrollback
   intact and can leave blank rows below the interface. A width change or a change above the viewport
   reprints the window.
+- A span seam takes a zero-width guard only where the two fragments can fuse into one grapheme, so
+  almost no seam carries one.
 - Restores the terminal on exit, on a failed start, and around an interactive OAuth login.
 - Parks the cursor below the interface on exit, so the shell prompt does not overwrite the last
   frame.

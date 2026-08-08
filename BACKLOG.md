@@ -121,6 +121,17 @@ dependency on another item. Module layout and extension seams live in `AGENTS.md
       warning._
 - [ ] **Richer UI components** — composable tool-call panels, streaming status, and a command
       palette go beyond today's log plus editor. _Keep the line/string render model._
+- [x] **Emit the grapheme guard only where it can fuse** — `View.Sink` writes a U+200B break at a
+      span seam only where the two fragments can join into one grapheme. _`grapheme` classifies both
+      edges of the seam. The break goes in when the next fragment starts with a joining code point
+      (Extend, ZWJ, SpacingMark, regional indicator, Hangul V or T). One flag adds the break when
+      the row's tail leaves a join open (Prepend, ZWJ, an Indic linker, a Hangul L jamo). Real text
+      carries almost no guard, so every frame shrinks and a terminal that gives U+200B a column,
+      such as Apple Terminal, stops shifting each styled row. Such a terminal still shows wrong
+      emoji widths, flicker, and approximate colors, which is acceptable. A startup guard that
+      refused `TERM_PROGRAM=Apple_Terminal` was written and dropped: it detects almost nothing (a
+      tmux pane, ssh, and every untested terminal pass it) and it blocks a terminal that mostly
+      works._
 - [x] **Markdown tables** — a pipe table renders as a box-drawing grid that sizes each column and
       fits the window. _A long cell truncates to its column instead of wrapping. A table falls back
       to plain paragraph text when the window is narrower than its smallest grid. The fallback

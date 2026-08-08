@@ -1045,9 +1045,9 @@ fn frameBody(bytes: []const u8) []const u8 {
     return bytes[terminal.escape.sync_set.len .. bytes.len - terminal.escape.sync_reset.len];
 }
 
-// The frame's visible text: the CSI sequences and the sink's zero-width span
-// boundaries stripped away. The rows keep their `\r\n` separators. The caller
-// owns the returned bytes.
+// The frame's visible text: the CSI sequences and the sink's zero-width seam
+// guards stripped away. The rows keep their `\r\n` separators. The caller owns
+// the returned bytes.
 fn plainBody(gpa: std.mem.Allocator, bytes: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
@@ -1185,7 +1185,7 @@ test "longer and alternate fences retain inner backticks as code" {
     try std.testing.expect(std.mem.indexOf(u8, bytes, "```literal inside tildes") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "after **bold**") == null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "after ") != null);
-    try std.testing.expect(std.mem.indexOf(u8, bytes, "\x1b[1m\u{200b}bold") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\x1b[1mbold") != null);
 }
 
 test "fences accept at most three leading spaces" {
@@ -1195,7 +1195,7 @@ test "fences accept at most three leading spaces" {
 
     try std.testing.expect(std.mem.indexOf(u8, bytes, "**three-space literal**") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "after **four-space bold**") == null);
-    try std.testing.expect(std.mem.indexOf(u8, bytes, "\x1b[1m\u{200b}four-space bold") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\x1b[1mfour-space bold") != null);
 }
 
 // Each element carries its own look, and the markers that produced it are gone.
@@ -1210,8 +1210,8 @@ test "markdown paints each element in its own style" {
     try std.testing.expect(std.mem.indexOf(u8, bytes, "# Heading one") == null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "### Heading three") != null);
     // A heading's emphasis is a span of its own, and the heading's own look
-    // still carries it. The sink's boundary marks the split.
-    const emphasis = "\x1b[38;2;240;198;116m\x1b[1m\u{200b}two";
+    // still carries it. The re-opened style marks the split.
+    const emphasis = "\x1b[38;2;240;198;116m\x1b[1mtwo";
     try std.testing.expect(std.mem.indexOf(u8, bytes, emphasis) != null);
     // Code keeps its two-space indent and its own color. The fence stays muted.
     try std.testing.expect(std.mem.indexOf(u8, bytes, "\x1b[38;2;181;189;104m") != null);
@@ -1232,7 +1232,7 @@ test "markdown paints each element in its own style" {
     // paragraph. A `_` inside a word is not emphasis at all.
     const literal = [_][]const u8{ "**", "~~", "*italic*", "`inline code`", "[labelled]" };
     for (literal) |mark| try std.testing.expect(std.mem.indexOf(u8, bytes, mark) == null);
-    try std.testing.expect(std.mem.indexOf(u8, bytes, "\x1b[1m\u{200b}bold") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\x1b[1mbold") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "snake_case_name") != null);
 }
 
@@ -1257,7 +1257,7 @@ test "a table renders as a box grid with padded cells" {
     const bytes = try painted(gpa, tables, 40, null, 0);
     defer gpa.free(bytes);
     // The header row is bold and the borders take the muted color.
-    try std.testing.expect(std.mem.indexOf(u8, bytes, "\x1b[1m\u{200B}Name") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\x1b[1mName") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "\x1b[38;2;128;128;128m┌") != null);
 }
 
