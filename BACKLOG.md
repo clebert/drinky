@@ -60,7 +60,13 @@ dependency on another item. Module layout and extension seams live in `AGENTS.md
       allowed tools. _Allow one nesting level only. A non-recursive scheduler drives it, not a child
       agent loop called from parent tool dispatch. Each child's usage folds into the parent exactly
       once. Root and subagent cost stay separable, so status can read `$5.00 (+$2.00)`. Per-agent
-      allowlists can ride mid-conversation tool changes instead of a per-agent `tools` array._
+      allowlists can ride mid-conversation tool changes instead of a per-agent `tools` array. A
+      second concurrent agent also makes `auth.accessToken` unsafe. It returns a slice into the
+      shared `Auth` tokens and frees the old tokens in place. A parallel refresh can then free the
+      token that another task still sends. Guard the expiry check, the refresh, and the install with
+      one lock. Re-check the expiry inside the lock. That also stops the second refresh, which
+      rotates the single-use token again and kills the first task's credential. Today the two
+      callers cannot overlap, because a turn cannot host a slash command._
 
 ## Accounts & signing in
 

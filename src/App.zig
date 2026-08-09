@@ -750,8 +750,10 @@ fn readInput(self: *App) void {
 /// Transcript text for a turn the agent failed without a report through `onError`.
 /// These are the agent's own verdicts on a reply, not server messages, so each
 /// gets a sentence. A refusal or an unrecognized provider outcome is ordinary
-/// model behavior and must not read as an internal fault. Anything unmapped
-/// returns null, and the caller wraps its error name.
+/// model behavior and must not read as an internal fault. A dead credential is
+/// not model behavior, but the user can act on it, so the sentence names the
+/// command to run. Anything unmapped returns null, and the caller wraps its
+/// error name.
 fn turnFailureText(err: anyerror) ?[]const u8 {
     return switch (err) {
         error.UnsupportedReply => "Pith cannot keep the response because the model returned " ++
@@ -759,6 +761,8 @@ fn turnFailureText(err: anyerror) ?[]const u8 {
         error.EmptyReply => "The model returned an empty response.",
         error.IncompleteReply => "Pith did not receive the complete model response.",
         error.TooManyToolRounds => "The turn reached the limit for tool rounds.",
+        error.TokenRequestFailed => "Pith could not refresh the credential of this account. " ++
+            "Sign in again with /login.",
         else => null,
     };
 }
@@ -1585,11 +1589,15 @@ test "a turn failure the agent named itself reads as a sentence, not an error na
         error.EmptyReply,
         error.IncompleteReply,
         error.TooManyToolRounds,
+        error.TokenRequestFailed,
     }) |err| {
         const text = turnFailureText(err).?;
         try std.testing.expect(std.mem.indexOf(u8, text, " ") != null);
         try std.testing.expect(!std.mem.eql(u8, text, @errorName(err)));
     }
+    // A dead credential is the one failure the user can act on: it names /login.
+    const credentials = turnFailureText(error.TokenRequestFailed).?;
+    try std.testing.expect(std.mem.indexOf(u8, credentials, "/login") != null);
     // An unmapped failure returns null, and the caller wraps its error name.
     try std.testing.expectEqual(null, turnFailureText(error.SignedOut));
 }

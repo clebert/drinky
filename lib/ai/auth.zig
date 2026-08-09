@@ -1,6 +1,7 @@
 //! The credential lifecycle that both subscription OAuth accounts share. Load
 //! and persist a provider's tokens under its `account_key` in the keyed
-//! `auth.json` store. Refresh a stale access token on demand. Run the
+//! `auth.json` store. Refresh a stale access token on demand, and reload the
+//! store once when that refresh fails, because the token rotates. Run the
 //! interactive login (browser + loopback callback). Generic over each
 //! provider's `Auth` file struct (`gpa`/`io`/`timeouts`/`path`/`tokens`
 //! fields): the on-disk entry mirrors the provider's `Tokens` fields. Every
@@ -66,8 +67,10 @@ pub fn load(auth: anytype, comptime account_key: []const u8) !bool {
 /// A valid access token. If the token has expired, refresh and persist it
 /// first. `refreshFn` has the provider refresher's `(gpa, io, timeouts,
 /// tokens)` shape, so tests pin the credential lifecycle without the network.
-/// The refresh runs before any change to the stored tokens: a failed refresh
-/// leaves the stored credential intact.
+/// The refresh runs before any change to the tokens on disk: a failed refresh
+/// leaves the credential in `auth.json` intact. A failed refresh also tries the
+/// store once more, because the refresh token rotates. That retry can replace
+/// the tokens in memory with the copy the store holds (see `refreshFromStore`).
 pub fn accessToken(
     auth: anytype,
     comptime account_key: []const u8,
@@ -76,7 +79,8 @@ pub fn accessToken(
     const tokens = auth.tokens orelse return error.NotAuthenticated;
     const now_ms = std.Io.Timestamp.now(auth.io, .real).toMilliseconds();
     if (now_ms >= tokens.expires_ms) {
-        const fresh = try refreshFn(auth.gpa, auth.io, auth.timeouts, tokens);
+        const fresh = refreshFn(auth.gpa, auth.io, auth.timeouts, tokens) catch |first_error|
+            try refreshFromStore(auth, account_key, tokens.refresh, first_error, refreshFn);
         // The refresh consumed the stored (single-use) refresh token server-side,
         // so `fresh` is now the only usable credential. Block cancellation until
         // it is committed and persisted. Without the block, a cancel that lands
@@ -84,11 +88,39 @@ pub fn accessToken(
         // loses the credential.
         const protection = auth.io.swapCancelProtection(.blocked);
         defer _ = auth.io.swapCancelProtection(protection);
-        tokens.deinit(auth.gpa);
+        // Read the installed tokens again: a retry through the store replaced them.
+        auth.tokens.?.deinit(auth.gpa);
         auth.tokens = fresh;
         try save(auth, account_key);
     }
     return auth.tokens.?.access;
+}
+
+/// A second refresh with the refresh token that `auth.json` holds now, after
+/// the cached one failed with `first_error`. The provider rotates the
+/// single-use refresh token on every refresh, so a second Pith process can
+/// advance the store past the cached copy. The reload adopts the stored
+/// credential, which is then the only live one. Pith keeps that credential
+/// even when the second refresh fails. A store that holds the same refresh
+/// token, or that Pith cannot read, reports `first_error`, because then the
+/// refresh failed for a real reason. There is exactly one retry.
+fn refreshFromStore(
+    auth: anytype,
+    comptime account_key: []const u8,
+    refresh_used: []const u8,
+    first_error: anyerror,
+    comptime refreshFn: anytype,
+) anyerror!@typeInfo(@TypeOf(auth.tokens)).optional.child {
+    // The reload frees the tokens it replaces, so copy the refresh token the
+    // failed attempt used before the comparison loses it. An allocation failure
+    // belongs to this process, so it reports itself and not `first_error`.
+    const refresh_used_copy = try auth.gpa.dupe(u8, refresh_used);
+    defer auth.gpa.free(refresh_used_copy);
+    const loaded = load(auth, account_key) catch return first_error;
+    if (!loaded) return first_error;
+    const stored = auth.tokens.?;
+    if (std.mem.eql(u8, stored.refresh, refresh_used_copy)) return first_error;
+    return refreshFn(auth.gpa, auth.io, auth.timeouts, stored);
 }
 
 /// Run the interactive OAuth login and report pre-commit runtime text through

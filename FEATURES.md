@@ -81,7 +81,9 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - The browser lands on a plain "Pith received authorization. Close this tab." page.
 - Subscription tokens and the Console key live in `~/.pith/auth.json`, owner-only, one entry per
   account, saved atomically.
-- Expired access tokens refresh and re-save automatically.
+- Expired access tokens refresh and re-save automatically. After a second pith instance rotates the
+  refresh token, the next refresh reads the new token and recovers without a restart.
+- A refresh that still fails ends the turn with a prompt to `/login`.
 - A login whose save fails stays signed in until pith exits, and says so.
 
 ## Slash commands

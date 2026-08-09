@@ -102,6 +102,18 @@ fn grantRefresh(
     };
 }
 
+/// A server that has already rotated the refresh token: only the token the
+/// store holds now still buys a new credential.
+fn grantRotatedRefresh(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    timeouts: net.Timeouts,
+    tokens: oauth.Tokens,
+) anyerror!oauth.Tokens {
+    if (!std.mem.eql(u8, tokens.refresh, "rotated")) return error.TokenRequestFailed;
+    return grantRefresh(gpa, io, timeouts, tokens);
+}
+
 fn grantRefreshAfterCancel(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -135,19 +147,120 @@ test "a live access token is returned without a refresh" {
 }
 
 test "a failed refresh leaves the stored credential intact" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/auth.json", .{tmp.sub_path});
     var subject: Auth = .{
-        .gpa = std.testing.allocator,
+        .gpa = gpa,
         .io = std.testing.io,
         .timeouts = .{},
-        .path = "",
-        .tokens = .{ .access = "stale", .refresh = "keep", .expires_ms = 0 },
+        .path = path,
+        .tokens = .{
+            .access = try gpa.dupe(u8, "stale"),
+            .refresh = try gpa.dupe(u8, "keep"),
+            .expires_ms = 0,
+        },
     };
+    defer subject.tokens.?.deinit(gpa);
+
+    // There is no store file, so the failure has no second token to try.
     try std.testing.expectError(
         error.TokenRequestFailed,
         auth.accessToken(&subject, account_key, refuseRefresh),
     );
     try std.testing.expectEqualStrings("stale", subject.tokens.?.access);
     try std.testing.expectEqualStrings("keep", subject.tokens.?.refresh);
+
+    // The store holds the same refresh token, so the failure is real and stands.
+    try auth.save(&subject, account_key);
+    try std.testing.expectError(
+        error.TokenRequestFailed,
+        auth.accessToken(&subject, account_key, refuseRefresh),
+    );
+    try std.testing.expectEqualStrings("stale", subject.tokens.?.access);
+    try std.testing.expectEqualStrings("keep", subject.tokens.?.refresh);
+}
+
+// The rotation-staleness bug: the refresh token is single use, so a second Pith
+// instance that refreshes first leaves this process with a dead cached token.
+// Every turn then fails until a restart. A failed refresh must reload the store
+// and try the token it finds there once.
+test "a refresh token rotated by another instance recovers without a restart" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/auth.json", .{tmp.sub_path});
+    try json_store.save(gpa, io, path, account_key, .{
+        .access = "rotated_access",
+        .refresh = "rotated",
+        .expires_ms = 0,
+    }, .{});
+    var subject: Auth = .{
+        .gpa = gpa,
+        .io = io,
+        .timeouts = .{},
+        .path = path,
+        .tokens = .{
+            .access = try gpa.dupe(u8, "stale"),
+            .refresh = try gpa.dupe(u8, "dead"),
+            .expires_ms = 0,
+        },
+    };
+    defer subject.tokens.?.deinit(gpa);
+
+    try std.testing.expectEqualStrings(
+        "fresh",
+        try auth.accessToken(&subject, account_key, grantRotatedRefresh),
+    );
+    try std.testing.expectEqualStrings("next", subject.tokens.?.refresh);
+
+    var file = (try json_store.open(gpa, io, path)).?;
+    defer file.deinit();
+    try std.testing.expectEqualStrings("next", file.entry(account_key).?.get("refresh").?.string);
+}
+
+// The retry is the one path that changes the tokens in memory and still fails.
+// The stored credential is the only one that can still be live, so the reload
+// keeps it. The caller sees the refusal, and the store file stays untouched.
+test "a retry that also fails keeps the credential the store holds" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/auth.json", .{tmp.sub_path});
+    try json_store.save(gpa, io, path, account_key, .{
+        .access = "stored_access",
+        .refresh = "stored",
+        .expires_ms = 0,
+    }, .{});
+    var subject: Auth = .{
+        .gpa = gpa,
+        .io = io,
+        .timeouts = .{},
+        .path = path,
+        .tokens = .{
+            .access = try gpa.dupe(u8, "stale"),
+            .refresh = try gpa.dupe(u8, "dead"),
+            .expires_ms = 0,
+        },
+    };
+    defer subject.tokens.?.deinit(gpa);
+
+    try std.testing.expectError(
+        error.TokenRequestFailed,
+        auth.accessToken(&subject, account_key, refuseRefresh),
+    );
+    try std.testing.expectEqualStrings("stored_access", subject.tokens.?.access);
+    try std.testing.expectEqualStrings("stored", subject.tokens.?.refresh);
+
+    var file = (try json_store.open(gpa, io, path)).?;
+    defer file.deinit();
+    try std.testing.expectEqualStrings("stored", file.entry(account_key).?.get("refresh").?.string);
 }
 
 test "an expired access token is refreshed and re-persisted" {
