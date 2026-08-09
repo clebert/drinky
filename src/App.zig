@@ -3115,7 +3115,7 @@ test "ctrl+c clears then quits within the window and ctrl+d quits only when empt
     try std.testing.expect(!app.running);
 }
 
-test "/new clears conversation state without changing the active configuration" {
+test "/new clears the conversation and the scrollback without a configuration change" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -3152,9 +3152,19 @@ test "/new clears conversation state without changing the active configuration" 
     try app.session.transcript.append(.user, false, "old prompt");
     app.session.stats_shown = seeded;
     try seedSteering(&app, "old steering");
+    // Paint the old conversation first, so its frame holds the screen.
+    try app.session.paint(.{ .columns = 80, .rows = 6 });
 
     try app.session.editor.insert("/new trailing");
     try app.submit();
+
+    // The empty conversation must start on a clean screen. The paint clears the
+    // visible rows and drops the scrollback with them.
+    const clear_start = out.written().len;
+    try app.session.paint(.{ .columns = 80, .rows = 6 });
+    const clear_bytes = out.written()[clear_start..];
+    try std.testing.expect(std.mem.indexOf(u8, clear_bytes, terminal.escape.screen_reset) != null);
+    try std.testing.expect(std.mem.indexOf(u8, clear_bytes, "old prompt") == null);
 
     try std.testing.expectEqual(@as(usize, 0), app.agent.items.items.len);
     try std.testing.expect(std.meta.eql(ai.Agent.Stats{}, app.agent.stats));

@@ -59,7 +59,8 @@ sink: Sink,
 /// Set by `beginFrame` when the columns or page count changed. This forces
 /// `render` to repaint the whole window. A height change reconciles incrementally.
 structural_change: bool,
-/// Set by `invalidate`: the screen no longer matches the last painted frame.
+/// Set by `resetScreen`: the next `render` must clear the screen and reprint the
+/// whole window, whatever the diff finds.
 force_reset: bool,
 /// Full resets leave native scrollback intact, for a view on an alternate screen.
 preserve_scrollback: bool,
@@ -335,10 +336,22 @@ pub fn deinit(self: *View) void {
 }
 
 /// Force the next `render` to clear and reprint under the configured scrollback
-/// policy. Use this after external output has moved the terminal out from under
-/// the diff. The caller has re-hidden the cursor, so tracking resets to match.
-pub fn invalidate(self: *View) void {
+/// policy. A view on the primary screen drops the native scrollback with it, so
+/// no earlier row stays reachable. The reprint holds the window alone, so the
+/// reset also trims reachable history back to the window. A model change must use
+/// this only when the model discards all of its content. A model that discards
+/// part of its content keeps more history through the incremental diff. The reset
+/// does not change the cursor visibility, so the tracked state stays. Call
+/// `invalidate` instead when external output can have moved the cursor.
+pub fn resetScreen(self: *View) void {
     self.force_reset = true;
+}
+
+/// Reset the screen through `resetScreen` and record the cursor as hidden. Use
+/// this after external output has moved the terminal out from under the diff. The
+/// caller has re-hidden the cursor, so tracking resets to match.
+pub fn invalidate(self: *View) void {
+    self.resetScreen();
     self.cursor_visible = false;
 }
 
@@ -808,10 +821,11 @@ fn caretLine(bytes: []const u8, options: struct { id: usize, column: usize }) Li
     };
 }
 
-// Regression: a transcript clear (a `/new`) removes the rows above the shared
-// editor and status anchors while nothing has scrolled off. Those rows sit on
-// screen, so the frame must reprint from row zero and erase them. It must not
-// treat the removal as a forward slide and strand them above the tail.
+// Regression: a canceled turn rewinds the transcript to its checkpoint and
+// removes the rows above the shared editor and status anchors while nothing has
+// scrolled off. Those rows sit on screen, so the frame must reprint from row
+// zero and erase them. It must not treat the removal as a forward slide and
+// strand them above the tail.
 test "a shrink to the tail with nothing scrolled off erases the rows above" {
     const gpa = std.testing.allocator;
     const harness = try makeHarness(gpa, 20);
@@ -829,11 +843,11 @@ test "a shrink to the tail with nothing scrolled off erases the rows above" {
     try harness.render(&full, .{ .columns = 20, .rows = 24 }, 8);
     try harness.emulator.expectScreen(&.{ "m0", "m1", "m2", "prompt", "status" });
 
-    const cleared = [_]Line{
+    const rewound = [_]Line{
         caretLine("P", .{ .id = 1000, .column = 1 }),
         line("status", 1001),
     };
-    try harness.render(&cleared, .{ .columns = 20, .rows = 24 }, 8);
+    try harness.render(&rewound, .{ .columns = 20, .rows = 24 }, 8);
     try harness.emulator.expectScreen(&.{ "P", "status" });
     try std.testing.expect(harness.emulator.document.items.len == 2);
     try std.testing.expect(std.mem.indexOf(u8, harness.lastBytes(), escape.screen_reset) == null);
@@ -1480,6 +1494,48 @@ test "invalidate forces a full reset even when content is unchanged" {
     try harness.render(&frame, .{ .columns = 10, .rows = 4 }, 2);
     try harness.emulator.expectVisible(&.{ "hello", "world" });
     try std.testing.expect(std.mem.indexOf(u8, harness.lastBytes(), escape.screen_reset) != null);
+}
+
+test "a screen reset drops the scrollback and keeps the cursor visible" {
+    const gpa = std.testing.allocator;
+    const harness = try makeHarness(gpa, 10);
+    defer {
+        harness.deinit();
+        gpa.destroy(harness);
+    }
+    // Six rows in a two-row screen: r0 to r3 sit in native scrollback. The caret
+    // and status rows keep their anchors across the clear. The diff alone then
+    // reconciles the tail and leaves r0 to r3 reachable.
+    const tall = [_]Line{
+        line("r0", 0),
+        line("r1", 1),
+        line("r2", 2),
+        line("r3", 3),
+        caretLine("P", .{ .id = 100, .column = 1 }),
+        line("status", 101),
+    };
+    try harness.render(&tall, .{ .columns = 10, .rows = 2 }, 4);
+    try harness.emulator.expectScreen(&.{ "P", "status" });
+    try std.testing.expectEqual(@as(usize, 6), harness.emulator.document.items.len);
+    try std.testing.expect(harness.emulator.cursor_visible);
+
+    // The model discarded its content. The reset must take every earlier row out
+    // of the terminal, not only the rows the new frame replaces.
+    harness.view.resetScreen();
+    const cleared = [_]Line{
+        caretLine("P", .{ .id = 100, .column = 1 }),
+        line("status", 101),
+    };
+    try harness.render(&cleared, .{ .columns = 10, .rows = 2 }, 4);
+    try harness.emulator.expectScreen(&.{ "P", "status" });
+    try std.testing.expectEqual(@as(usize, 0), harness.emulator.screen_top);
+    try std.testing.expectEqual(@as(usize, 2), harness.emulator.document.items.len);
+    const last = harness.lastBytes();
+    try std.testing.expect(std.mem.indexOf(u8, last, escape.screen_reset) != null);
+    try std.testing.expect(std.mem.indexOf(u8, last, "r0") == null);
+    // The caret stayed on screen, so the reset emits no redundant show.
+    try std.testing.expect(harness.emulator.cursor_visible);
+    try std.testing.expect(std.mem.indexOf(u8, last, escape.cursor_show) == null);
 }
 
 test "canonical text boundaries survive separate sink writes" {

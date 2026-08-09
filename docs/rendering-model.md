@@ -30,8 +30,9 @@ the page, which changes the window's height in rows.
 The window bounds what the renderer redraws, not how far the terminal can scroll. Content that
 scrolls out is left in the terminal's own scrollback rather than erased. Reachable history is
 therefore at least the window and can be more. A reset trims it back to the window. A change outside
-the viewport, a resize, or a change to the window's page count forces a reset. Until a reset occurs,
-scrollback grows as far as the terminal allows.
+the viewport, a resize, or a change to the window's page count forces a reset. The application can
+also request a reset when it discards all of its content. The reset then takes that content out of
+the terminal. Until a reset occurs, scrollback grows as far as the terminal allows.
 
 Rendering is **inline**: the window is drawn into the terminal's normal buffer, and the terminal
 scrolls through the drawn content. The view is always anchored to the newest content and keeps no
@@ -49,8 +50,9 @@ Given a new window, the renderer applies the smallest correct update.
 
 - **Incremental**: when every changed line is within the viewport. Appended new content is the
   common case. Reposition to the first changed line and reprint from there down.
-- **Reset**: when any changed line falls above the viewport, or the terminal or the window's page
-  count changed. Clear the terminal, including its scrollback, and reprint the whole window.
+- **Reset**: when any changed line falls above the viewport, when the terminal or the window's page
+  count changed, or on request. Clear the terminal, including its scrollback, and reprint the whole
+  window.
 
 Every repaint is emitted atomically, so no partial frame is ever visible. Layout is display-width
 aware. A glyph can occupy more than one column. A line wider than the terminal wraps onto several

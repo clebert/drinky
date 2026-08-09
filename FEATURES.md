@@ -93,6 +93,7 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - **/login** — sign in, switch to an account already signed in, or name the API key to set.
 - **/logout** — drop a signed-in account's credentials and hand the session to another account.
 - **/new** — clear the conversation, usage stats, and steering without changing its configuration.
+  The next paint drops the terminal scrollback, so the empty conversation starts on a clean screen.
 - **/system** — inspect the complete provider-neutral system prompt as rendered Markdown in a
   scrollable full-window page. `M` toggles its exact source.
 - **/skill:name** — load a discovered skill explicitly, record a compact `Skill:` marker, and append

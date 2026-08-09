@@ -252,14 +252,18 @@ pub fn deinit(self: *Session) void {
     self.editor.deinit();
 }
 
-/// Clear the visible conversation and its usage and steering snapshots.
-/// Commands run only in prompt mode, so the reset cannot discard live turn state.
+/// Clear the visible conversation and its usage and steering snapshots. Commands
+/// run only in prompt mode, so the reset cannot discard live turn state. The next
+/// paint resets the screen, so no row of the cleared conversation stays in the
+/// terminal scrollback.
 pub fn resetConversation(self: *Session) void {
     std.debug.assert(self.mode == .prompt);
     self.transcript.truncate(0);
     self.clearNotice();
     self.stats_shown = .{};
     self.clearSteering();
+    self.view.resetScreen();
+    self.dirty = true;
 }
 
 /// Clear the transient notice. The regular footer returns on the next frame.
@@ -1033,9 +1037,14 @@ test "an event survives notice clearing until the conversation resets" {
         "Pith changed the model.",
         session.transcript.blocks()[0].event.text.items,
     );
+    session.dirty = false;
     session.resetConversation();
     try std.testing.expectEqual(@as(usize, 0), session.transcript.blocks().len);
     try std.testing.expect(session.notice == null);
+    // The post-condition the app depends on: a dirty model and a pending screen
+    // reset. The next paint then runs, and it clears the screen.
+    try std.testing.expect(session.dirty);
+    try std.testing.expect(session.view.force_reset);
 }
 
 // The consumer seam without real io: a scripted turn's worker events drive the
