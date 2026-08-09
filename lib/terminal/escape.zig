@@ -1,5 +1,7 @@
 //! The ANSI escape sequences the renderer trusts: mode set/reset pairs, screen
-//! clears, and bounded cursor motion. Nothing here carries runtime content.
+//! clears, and bounded cursor motion. Only the hyperlink frame encloses runtime
+//! content, and `View.Sink.linkable` clears that content before the sink writes
+//! any.
 
 const std = @import("std");
 
@@ -29,6 +31,17 @@ pub const keyboard_reset = "\x1b[<u";
 /// the reset, so the mode does not outlive the session.
 pub const grapheme_set = "\x1b[?2027h";
 pub const grapheme_reset = "\x1b[?2027l";
+
+/// The String Terminator that ends an OSC string. Both the open and the close
+/// of a hyperlink end with it, so it belongs to no single sequence.
+pub const string_end = "\x1b\\";
+
+/// Open and close an OSC 8 hyperlink over the text between them. The target URL
+/// goes between `link_set` and `string_end`. `link_reset` closes the link, so
+/// the text after it carries no target. A terminal that does not know OSC 8
+/// drops both strings and shows the text alone.
+pub const link_set = "\x1b]8;;";
+pub const link_reset = link_set ++ string_end;
 
 pub const cursor_hide = "\x1b[?25l";
 pub const cursor_show = "\x1b[?25h";

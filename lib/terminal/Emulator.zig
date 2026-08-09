@@ -77,7 +77,23 @@ pub fn feed(self: *Emulator, bytes: []const u8) !void {
 fn control(self: *Emulator, sequence: []const u8) !usize {
     if (sequence.len < 2) return sequence.len;
     if (sequence[1] == '[') return self.csi(sequence);
+    if (sequence[1] == ']') return osc(sequence);
     return 2;
+}
+
+/// Consume one OSC string, such as a hyperlink. It shows nothing and moves
+/// nothing, so the model terminal drops it. A string ends at ST or at BEL. Any
+/// other escape ends it too and stays for the parser, the way a real terminal
+/// leaves a string on the first control it cannot hold.
+fn osc(sequence: []const u8) usize {
+    var index: usize = 2;
+    while (index < sequence.len) : (index += 1) {
+        if (sequence[index] == 0x07) return index + 1;
+        if (sequence[index] != 0x1b) continue;
+        if (index + 1 < sequence.len and sequence[index + 1] == '\\') return index + 2;
+        return index;
+    }
+    return sequence.len;
 }
 
 fn csi(self: *Emulator, sequence: []const u8) !usize {
@@ -260,4 +276,25 @@ test "ED 2 preserves scrollback and ED 3 removes it" {
     try std.testing.expectEqual(@as(usize, 1), emulator.cursor_row);
     try std.testing.expectEqual(@as(usize, 2), emulator.document.items.len);
     try emulator.expectScreen(&.{ "one", "two" });
+}
+
+// An OSC string shows nothing and moves nothing. It ends at ST or at BEL, and
+// any other escape aborts it. The escape that aborts a string must stay for the
+// parser, or an unterminated string swallows the whole repaint behind it.
+test "an OSC string ends at ST, at BEL, or on the escape that aborts it" {
+    const gpa = std.testing.allocator;
+    var emulator = try Emulator.init(gpa, 20);
+    defer emulator.deinit();
+    emulator.rows = 1;
+
+    try emulator.feed("a\x1b]8;;https://x.y\x1b\\b\x1b]0;title\x07c");
+    try emulator.expectVisible(&.{"abc"});
+
+    // The erase behind the aborted string still runs.
+    try emulator.feed("\x1b]8;;https://x.y\x1b[2Jd");
+    try emulator.expectVisible(&.{"d"});
+
+    // A string with no terminator ends at the last byte and shows nothing.
+    try emulator.feed("\x1b]8;;unterminated");
+    try emulator.expectVisible(&.{"d"});
 }

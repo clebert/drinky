@@ -22,9 +22,10 @@ const rule_columns = 80;
 const rule_cells = rule_cell ** rule_columns;
 
 /// One span's look: the element foreground a reasoning tint replaces, plus the
-/// attributes that survive it.
+/// attributes that survive it. `url` makes the span a terminal hyperlink.
 const Look = struct {
     foreground: ?color.Style = null,
+    url: []const u8 = "",
     bold: bool = false,
     italic: bool = false,
     underline: bool = false,
@@ -168,7 +169,11 @@ const Painter = struct {
         if (italic) try color.apply(sink, .italic);
         if (look.underline) try color.apply(sink, .underline);
         if (look.strike) try color.apply(sink, .strikethrough);
+        // The link opens and closes inside this span, so it covers exactly the
+        // text on this row and never leaks into the row under it.
+        try sink.linkSet(look.url);
         try sink.text(bytes);
+        try sink.linkReset();
         if (foreground != null or look.bold or italic or look.underline or look.strike) {
             try color.apply(sink, .reset);
         }
@@ -466,7 +471,12 @@ const Table = struct {
 fn walk(comptime Emitter: type, emitter: *Emitter, text: []const u8, columns: usize) !void {
     var lines = std.mem.splitScalar(u8, text, '\n');
     var maybe_fence: ?Fence = null;
-    while (lines.next()) |line| {
+    while (lines.next()) |raw| {
+        // A CRLF source ends every line with a carriage return. It terminates
+        // the line and is no content, so a row that keeps it paints a
+        // replacement glyph. The trim moves only the end, so the source offset
+        // still points at the line.
+        const line = std.mem.trimEnd(u8, raw, "\r");
         const source_offset = @intFromPtr(line.ptr) - @intFromPtr(text.ptr);
         emitter.source(source_offset);
         const indentation = leading(line);
@@ -513,12 +523,14 @@ fn walk(comptime Emitter: type, emitter: *Emitter, text: []const u8, columns: us
                 if (!more) try table.borderRow(Emitter, emitter, &Table.border_bottom);
             }
         } else if (headingLevel(rest)) |level| {
-            // H1 and H2 shed their marker. Deeper headings keep it, as pi does.
-            const body = if (level > 2) rest else std.mem.trimStart(u8, rest[level..], " ");
+            // Every heading sheds its marker. The level shows in the style: the
+            // first underlines, the second stays bold, and a deeper one keeps
+            // the heading color alone.
+            const body = std.mem.trimStart(u8, rest[level..], " ");
             var flow = Flow(Emitter).init(emitter, columns, .{});
             try inlines(Flow(Emitter), &flow, .{
                 .foreground = .heading,
-                .bold = true,
+                .bold = level <= 2,
                 .underline = level == 1,
             }, body);
             try flow.finish();
@@ -529,16 +541,14 @@ fn walk(comptime Emitter: type, emitter: *Emitter, text: []const u8, columns: us
                 emitter.end();
             }
         } else if (rest[0] == '>') {
+            // A quote sheds its markers and reads by its color alone. A border
+            // glyph on every row rides into every copy of the text.
             var body = rest;
             while (body.len > 0 and body[0] == '>') {
                 body = body[1..];
                 if (body.len > 0 and body[0] == ' ') body = body[1..];
             }
-            var flow = Flow(Emitter).init(emitter, columns, .{
-                .marker = "│ ",
-                .look = muted_look,
-                .repeat = true,
-            });
+            var flow = Flow(Emitter).init(emitter, columns, .{});
             try inlines(Flow(Emitter), &flow, quote_look, body);
             try flow.finish();
         } else if (listMarker(rest)) |marker| {
@@ -566,13 +576,12 @@ fn walk(comptime Emitter: type, emitter: *Emitter, text: []const u8, columns: us
 }
 
 /// The prefix every physical row of one logical line carries: `indent` blank
-/// columns, then `marker`. The marker draws on the first row, and on every row
-/// for a blockquote's border (`repeat`). Blanks replace it under a list bullet.
+/// columns, then `marker`. The marker draws on the first row alone. Blanks
+/// replace it on the rows under it, so a wrapped list item stays aligned.
 const Prefix = struct {
     indent: []const u8 = "",
     marker: []const u8 = "",
     look: Look = .{},
-    repeat: bool = false,
 };
 
 /// Streams one logical line's spans into physical rows: opens a row with the
@@ -643,7 +652,7 @@ fn Flow(comptime Emitter: type) type {
             self.open = true;
             self.used = 0;
             try self.emitter.span(.{}, self.prefix.indent);
-            if (self.first or self.prefix.repeat) {
+            if (self.first) {
                 try self.emitter.span(self.prefix.look, self.prefix.marker);
             } else {
                 try self.emitter.span(.{}, blank(terminal.width.ofText(self.prefix.marker)));
@@ -687,18 +696,41 @@ fn plainRow(
     emitter.end();
 }
 
-/// An inline run: the styled slice its markers enclose, plus the URL a link
-/// appends when its label does not already show it.
-const Run = struct { look: Look, content: []const u8, url: []const u8 = "", end: usize };
+/// An inline run: where its content lies in the source, the look that content
+/// takes, and where the scan continues after it. `nests` marks content that can
+/// carry markers of its own. `url` is the target a link appends as text when the
+/// terminal cannot make the label itself clickable.
+const Run = struct {
+    look: Look,
+    start: usize,
+    end: usize,
+    after: usize,
+    nests: bool,
+    url: []const u8 = "",
+};
 
-/// Inline markers, each doubled form before the single one that prefixes it.
+/// One open run: what the scan restores when that run closes.
+const Scope = struct { look: Look, end: usize, after: usize, url: []const u8 };
+
+/// Levels of nested inline markers the scan follows. A deeper marker stays
+/// literal, which bounds the stack the scan carries.
+const nesting_max = 4;
+
+/// Inline markers, each longer form before the shorter one that prefixes it.
 const marks = [_]struct { mark: []const u8, look: Look }{
+    .{ .mark = "***", .look = .{ .bold = true, .italic = true } },
+    .{ .mark = "___", .look = .{ .bold = true, .italic = true } },
     .{ .mark = "**", .look = .{ .bold = true } },
     .{ .mark = "__", .look = .{ .bold = true } },
     .{ .mark = "~~", .look = .{ .strike = true } },
     .{ .mark = "*", .look = .{ .italic = true } },
     .{ .mark = "_", .look = .{ .italic = true } },
 };
+
+/// Candidate closers one emphasis marker inspects before it gives up. A closer
+/// that hides behind more of them leaves the marker literal, and the scan stays
+/// linear in the length of the line.
+const closers_max = 4;
 
 /// A memoized forward scan for one closing byte. The scan visits openers in
 /// source order, so the closer found for one still answers the next. A scan
@@ -725,32 +757,76 @@ const Closer = struct {
 const Link = struct { label: Closer = .{ .byte = ']' }, url: Closer = .{ .byte = ')' } };
 
 /// Place `text`'s inline runs into `sink` under `base` and slice the markers
-/// away. A marker whose closer has not streamed in yet stays literal. The sink
-/// is a `Flow` for a wrapped block, or a `Table.Writer` for one table cell.
+/// away. A run that holds markers of its own opens a scope, so `**_both_**`
+/// sheds both pairs. A marker whose closer has not streamed in yet stays
+/// literal. The sink is a `Flow` for a wrapped block, or a `Table.Writer` for
+/// one table cell.
 fn inlines(comptime Sink: type, sink: *Sink, base: Look, text: []const u8) !void {
+    var stack: [nesting_max]Scope = undefined;
+    var depth: usize = 0;
+    var look = base;
+    var link: Link = .{};
     var start: usize = 0;
     var index: usize = 0;
-    var link: Link = .{};
-    while (index < text.len) : (index += 1) {
-        const run = runAt(text, index, &link) orelse {
-            // A doubled marker with no closer stays literal whole: its second
-            // byte must not reopen as a single marker and split `**bold` into a
-            // stray asterisk and an italic run mid-stream.
-            if (doubled(text, index)) index += 1;
+    // Bounded: every step raises `index`. A run opens after its own marker, a
+    // closed run resumes past its closer, and any other byte advances by one.
+    // The scan therefore reaches the end of `text` and stops there.
+    while (index < text.len or depth > 0) {
+        if (depth > 0 and index >= stack[depth - 1].end) {
+            const scope = stack[depth - 1];
+            // A closer is never stepped over: no doubled marker can straddle
+            // one, so the scan lands on it exactly.
+            std.debug.assert(index == scope.end);
+            try sink.write(look, text[start..index]);
+            depth -= 1;
+            look = if (depth > 0) stack[depth - 1].look else base;
+            try trailer(Sink, sink, look, scope.url);
+            index = scope.after;
+            start = index;
             continue;
-        };
-        try sink.write(base, text[start..index]);
-        try sink.write(merged(base, run.look), run.content);
-        if (run.url.len > 0) {
-            const trailing = merged(base, muted_look);
-            try sink.write(trailing, " (");
-            try sink.write(trailing, run.url);
-            try sink.write(trailing, ")");
         }
-        index = run.end - 1;
-        start = run.end;
+        // A run must close inside the run that holds it. One that reaches past
+        // it interleaves rather than nests, so its marker stays literal.
+        const limit = if (depth > 0) stack[depth - 1].end else text.len;
+        if (runAt(text, index, &link)) |run| {
+            if (run.after <= limit) {
+                try sink.write(look, text[start..index]);
+                const inner = merged(look, run.look);
+                if (run.nests and depth < nesting_max) {
+                    stack[depth] = .{
+                        .look = inner,
+                        .end = run.end,
+                        .after = run.after,
+                        .url = run.url,
+                    };
+                    depth += 1;
+                    look = inner;
+                    index = run.start;
+                } else {
+                    try sink.write(inner, text[run.start..run.end]);
+                    try trailer(Sink, sink, look, run.url);
+                    index = run.after;
+                }
+                start = index;
+                continue;
+            }
+        }
+        // A marker with no closer stays literal whole: a later byte of it must
+        // not reopen as a shorter marker and split `**bold` into a stray
+        // asterisk and an italic run mid-stream.
+        index += literal(text, index);
     }
-    try sink.write(base, text[start..]);
+    try sink.write(look, text[start..]);
+}
+
+/// Place the URL a link shows as text, in the muted color of the context it
+/// closes into.
+fn trailer(comptime Sink: type, sink: *Sink, look: Look, url: []const u8) !void {
+    if (url.len == 0) return;
+    const shown = merged(look, muted_look);
+    try sink.write(shown, " (");
+    try sink.write(shown, url);
+    try sink.write(shown, ")");
 }
 
 /// The inline run that opens at `index`, or null when none does.
@@ -759,33 +835,76 @@ fn runAt(text: []const u8, index: usize, link: *Link) ?Run {
     if (rest[0] == '`') {
         const close = std.mem.indexOfScalarPos(u8, text, index + 1, '`') orelse return null;
         if (close == index + 1) return null;
-        return .{ .look = accent_look, .content = text[index + 1 .. close], .end = close + 1 };
+        return .{
+            .look = accent_look,
+            .start = index + 1,
+            .end = close,
+            .after = close + 1,
+            .nests = false,
+        };
     }
     if (rest[0] == '[') return linkAt(text, index, link);
+    if (rest[0] == 'h' or rest[0] == 'H') return autolinkAt(text, index);
     for (marks) |entry| {
         if (!std.mem.startsWith(u8, rest, entry.mark)) continue;
+        // A marker is a run of exactly its own length, so `***` opens the
+        // bold-italic pair alone and neither `**` nor `*`. Both edges are one
+        // byte each: a run of thousands must not cost its own length per byte.
+        if (index > 0 and text[index - 1] == entry.mark[0]) continue;
+        const open = index + entry.mark.len;
+        if (open < text.len and text[open] == entry.mark[0]) continue;
         // An underscore inside a word is an identifier, not emphasis.
         if (entry.mark[0] == '_' and index > 0 and isWord(text[index - 1])) return null;
-        const open = index + entry.mark.len;
-        const close = std.mem.indexOfPos(u8, text, open, entry.mark) orelse continue;
-        const content = text[open..close];
-        if (content.len == 0) continue;
-        // Emphasis opens and closes tight, so spaced arithmetic stays literal.
-        if (content[0] == ' ' or content[content.len - 1] == ' ') continue;
-        const after = close + entry.mark.len;
-        if (entry.mark[0] == '_' and after < text.len and isWord(text[after])) continue;
-        return .{ .look = entry.look, .content = content, .end = after };
+        // Emphasis opens tight, so spaced arithmetic stays literal.
+        if (open >= text.len or isSpace(text[open])) continue;
+        const close = closerAt(text, open, entry.mark) orelse continue;
+        return .{
+            .look = entry.look,
+            .start = open,
+            .end = close,
+            .after = close + entry.mark.len,
+            .nests = true,
+        };
     }
     return null;
 }
 
-/// A doubled marker that opens at `index`. The scan must not re-read its second
-/// byte as a single-byte opener.
-fn doubled(text: []const u8, index: usize) bool {
-    for (marks) |entry| {
-        if (entry.mark.len == 2 and std.mem.startsWith(u8, text[index..], entry.mark)) return true;
+/// The closer of the emphasis that opened at `from`, or null when the line holds
+/// none. A closer is a run of exactly the marker's own length that follows
+/// content, so a run behind a blank opens the next emphasis instead of closing
+/// this one. `*a **b** c*` then closes on the last marker, not inside the pair.
+fn closerAt(text: []const u8, from: usize, mark: []const u8) ?usize {
+    var at = from;
+    for (0..closers_max) |_| {
+        const close = std.mem.indexOfPos(u8, text, at, mark) orelse return null;
+        const end = runEnd(text, close, mark[0]);
+        at = end;
+        if (end - close != mark.len) continue;
+        if (isSpace(text[close - 1])) continue;
+        // A closing underscore inside a word is an identifier.
+        if (mark[0] == '_' and end < text.len and isWord(text[end])) continue;
+        return close;
     }
-    return false;
+    return null;
+}
+
+/// The end of the run of `byte` that starts at `at`.
+fn runEnd(text: []const u8, at: usize, byte: u8) usize {
+    var end = at;
+    while (end < text.len and text[end] == byte) end += 1;
+    return end;
+}
+
+/// Bytes the scan steps over when nothing opens at `index`: a whole marker, or
+/// one byte. The marker keeps its bytes together, so the scan cannot re-read a
+/// later byte of it as a shorter opener. It is always at least one byte, which
+/// is what carries the scan forward.
+fn literal(text: []const u8, index: usize) usize {
+    for (marks) |entry| {
+        if (entry.mark.len == 1) continue;
+        if (std.mem.startsWith(u8, text[index..], entry.mark)) return entry.mark.len;
+    }
+    return 1;
 }
 
 /// The `[label](url)` link at `index`, or null when the shape is incomplete.
@@ -795,19 +914,96 @@ fn linkAt(text: []const u8, index: usize, link: *Link) ?Run {
     const end = link.url.find(text, close + 2) orelse return null;
     const label = text[index + 1 .. close];
     const url = text[close + 2 .. end];
+    const look = linkLook(url);
+    // A link with no label shows its own URL, and nothing follows it.
+    if (label.len == 0) {
+        return .{
+            .look = look,
+            .start = close + 2,
+            .end = end,
+            .after = end + 1,
+            .nests = false,
+        };
+    }
     return .{
-        .look = link_look,
-        .content = if (label.len > 0) label else url,
-        // Append the URL only when the label is not already the URL.
-        .url = if (label.len == 0 or std.mem.eql(u8, label, url)) "" else url,
-        .end = end + 1,
+        .look = look,
+        .start = index + 1,
+        .end = close,
+        .after = end + 1,
+        .nests = true,
+        // A clickable label carries the target already. Otherwise the URL
+        // follows the label, unless the label is that URL.
+        .url = if (look.url.len > 0 or std.mem.eql(u8, label, url)) "" else url,
     };
 }
 
-/// An element style over its context: the inner foreground wins and attributes add up.
+/// The bare `https://…` URL at `index`, or null when none starts there. The URL
+/// runs to the first space and sheds the punctuation a sentence puts behind it.
+/// The scheme reads case-insensitively, the same as the sink accepts it.
+fn autolinkAt(text: []const u8, index: usize) ?Run {
+    if (index > 0 and isWord(text[index - 1])) return null;
+    const rest = text[index..];
+    const scheme = for ([_][]const u8{ "https://", "http://" }) |candidate| {
+        if (std.ascii.startsWithIgnoreCase(rest, candidate)) break candidate.len;
+    } else return null;
+    // The run covers the whole word, whatever bytes it holds. A byte the sink
+    // refuses, such as a non-ASCII one, then costs the click alone. A run cut
+    // at that byte instead sends a click to a target the row never showed.
+    var span: usize = 0;
+    while (span < rest.len and rest[span] > ' ') span += 1;
+    const length = urlLength(rest[0..span]);
+    // A scheme with no host behind it is not a URL.
+    if (length <= scheme) return null;
+    return .{
+        .look = linkLook(rest[0..length]),
+        .start = index,
+        .end = index + length,
+        .after = index + length,
+        .nests = false,
+    };
+}
+
+/// The punctuation that ends a sentence rather than a bare URL.
+const url_trailing = ".,:;!?'\"*_~";
+
+/// The length `url` keeps once the trailing sentence punctuation goes. A closing
+/// parenthesis stays only while the URL opens one for it.
+fn urlLength(url: []const u8) usize {
+    var opened: usize = 0;
+    var closed: usize = 0;
+    for (url) |byte| {
+        if (byte == '(') opened += 1;
+        if (byte == ')') closed += 1;
+    }
+    var length = url.len;
+    // Bounded: every step drops one byte from the end.
+    while (length > 0) {
+        const last = url[length - 1];
+        if (last == ')') {
+            if (closed <= opened) break;
+            closed -= 1;
+        } else if (std.mem.indexOfScalar(u8, url_trailing, last) == null) {
+            break;
+        }
+        length -= 1;
+    }
+    return length;
+}
+
+/// The look a link takes. The label itself becomes clickable when the sink
+/// accepts the target. Any other target, such as a relative path, shows as text.
+fn linkLook(url: []const u8) Look {
+    var look = link_look;
+    if (terminal.View.Sink.linkable(url)) look.url = url;
+    return look;
+}
+
+/// An element style over its context: the inner foreground and link target win,
+/// and the attributes add up.
 fn merged(base: Look, over: Look) Look {
     return .{
         .foreground = over.foreground orelse base.foreground,
+        .url = if (over.url.len > 0) over.url else base.url,
         .bold = base.bold or over.bold,
         .italic = base.italic or over.italic,
         .underline = base.underline or over.underline,
@@ -870,6 +1066,10 @@ fn isWord(byte: u8) bool {
     return std.ascii.isAlphanumeric(byte) or byte == '_';
 }
 
+fn isSpace(byte: u8) bool {
+    return byte == ' ' or byte == '\t' or byte == '\r';
+}
+
 fn leading(line: []const u8) usize {
     var index: usize = 0;
     while (index < line.len and line[index] == ' ') index += 1;
@@ -895,7 +1095,7 @@ const sample =
     \\3. numbered from three
     \\4. and on
     \\
-    \\> a quoted line long enough to wrap under its border
+    \\> a quoted line long enough to wrap over two rows
     \\
     \\---
     \\
@@ -910,6 +1110,8 @@ const sample =
     \\
     \\A [labelled](https://example.com) link and a bare [x](x) one, plus a
     \\snake_case_name that is no emphasis.
+    \\
+    \\Nested **bold around _italic_** next to https://example.com/bare itself.
     \\
     \\#### heading with no trailing newline
 ;
@@ -1045,14 +1247,20 @@ fn frameBody(bytes: []const u8) []const u8 {
     return bytes[terminal.escape.sync_set.len .. bytes.len - terminal.escape.sync_reset.len];
 }
 
-// The frame's visible text: the CSI sequences and the sink's zero-width seam
-// guards stripped away. The rows keep their `\r\n` separators. The caller owns
-// the returned bytes.
+// The frame's visible text: the CSI sequences, the hyperlink strings, and the
+// sink's zero-width seam guards stripped away. The rows keep their `\r\n`
+// separators. The caller owns the returned bytes.
 fn plainBody(gpa: std.mem.Allocator, bytes: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
     var index: usize = 0;
     while (index < bytes.len) {
+        if (std.mem.startsWith(u8, bytes[index..], terminal.escape.link_set)) {
+            const rest = bytes[index + terminal.escape.link_set.len ..];
+            const end = std.mem.indexOf(u8, rest, terminal.escape.string_end) orelse rest.len;
+            index = bytes.len - rest.len + end + terminal.escape.string_end.len;
+            continue;
+        }
         if (bytes[index] == 0x1b and index + 1 < bytes.len and bytes[index + 1] == '[') {
             index += 2;
             while (index < bytes.len and (bytes[index] < 0x40 or bytes[index] > 0x7e)) index += 1;
@@ -1204,11 +1412,13 @@ test "markdown paints each element in its own style" {
     const bytes = try painted(gpa, sample, 72, null, 0);
     defer gpa.free(bytes);
 
-    // H1 is a bold, underlined heading color with its marker gone. H3 keeps it.
+    // H1 is a bold, underlined heading color with its marker gone. A deeper
+    // heading sheds its marker too and keeps the heading color alone.
     try std.testing.expect(std.mem.indexOf(u8, bytes, "\x1b[38;2;240;198;116m\x1b[1m\x1b[4m") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "Heading one") != null);
-    try std.testing.expect(std.mem.indexOf(u8, bytes, "# Heading one") == null);
-    try std.testing.expect(std.mem.indexOf(u8, bytes, "### Heading three") != null);
+    try std.testing.expect(std.mem.indexOfScalar(u8, bytes, '#') == null);
+    const deep = "\x1b[38;2;240;198;116mHeading three";
+    try std.testing.expect(std.mem.indexOf(u8, bytes, deep) != null);
     // A heading's emphasis is a span of its own, and the heading's own look
     // still carries it. The re-opened style marks the split.
     const emphasis = "\x1b[38;2;240;198;116m\x1b[1mtwo";
@@ -1218,21 +1428,23 @@ test "markdown paints each element in its own style" {
     try std.testing.expect(std.mem.indexOf(u8, bytes, "  \x1b[38;2;181;189;104m") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "const answer = 42;") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "\x1b[38;2;128;128;128m```zig") != null);
-    // A bullet takes the accent, a quote its border, and a rule its cells.
+    // A bullet takes the accent, a quote the muted italic, and a rule its cells.
     try std.testing.expect(std.mem.indexOf(u8, bytes, "\x1b[38;2;138;190;183m- ") != null);
-    try std.testing.expect(std.mem.indexOf(u8, bytes, "\x1b[38;2;128;128;128m│ ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\x1b[38;2;128;128;128m\x1b[3ma quoted") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "──") != null);
     // An ordered list keeps the number it started from, and a task its box.
     try std.testing.expect(std.mem.indexOf(u8, bytes, "3. ") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "[ ] ") != null);
-    // A link renders underlined in blue and appends the URL its label hides.
+    // A link renders underlined in blue and carries its own target.
     try std.testing.expect(std.mem.indexOf(u8, bytes, "\x1b[38;2;129;162;190m\x1b[4m") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "https://example.com") != null);
     // The render slices inline markers away, in a heading as much as a
-    // paragraph. A `_` inside a word is not emphasis at all.
-    const literal = [_][]const u8{ "**", "~~", "*italic*", "`inline code`", "[labelled]" };
-    for (literal) |mark| try std.testing.expect(std.mem.indexOf(u8, bytes, mark) == null);
+    // paragraph, and a nested pair sheds both. A `_` inside a word is not
+    // emphasis at all.
+    const markers = [_][]const u8{ "**", "~~", "*italic*", "`inline code`", "[labelled]" };
+    for (markers) |mark| try std.testing.expect(std.mem.indexOf(u8, bytes, mark) == null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "\x1b[1mbold") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\x1b[1m\x1b[3mitalic") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "snake_case_name") != null);
 }
 
@@ -1451,12 +1663,12 @@ test "a delimiter row is dashes with optional alignment colons" {
     try std.testing.expectEqual(@as(usize, 1), Table.cellCount("|"));
 }
 
-// A prefix never crowds the body out of the row: at two columns a bullet and a
-// quote border give a column back, so the text still shows. The source does not
-// advance behind a sink that clips every byte of it.
+// A prefix never crowds the body out of the row: at two columns a bullet gives
+// a column back, so the text still shows. The source does not advance behind a
+// sink that clips every byte of it.
 test "a prefix leaves room for the body it pushes right" {
     const gpa = std.testing.allocator;
-    for ([_][]const u8{ "- abc", "> abc", "    - abc" }) |text| {
+    for ([_][]const u8{ "- abc", "    - abc", "12. abc" }) |text| {
         // One column is the floor: the prefix drops away entirely rather than
         // take the only column the body has.
         for ([_]usize{ 1, 2 }) |columns| {
@@ -1480,6 +1692,138 @@ test "a styled wide glyph wraps rather than degrading" {
     try std.testing.expectEqual(@as(usize, 2), paintedRows(bytes));
     try std.testing.expect(std.mem.indexOf(u8, bytes, "你") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "�") == null);
+}
+
+// A CRLF source ends every line with a carriage return. The line sheds it, so
+// no row paints it as a replacement glyph and every block still parses.
+test "a CRLF line sheds its carriage return" {
+    const gpa = std.testing.allocator;
+    try expectPlainRows(gpa, "# Title\r\n\r\n**bold** text\r\n", 20, &.{
+        "Title",
+        "",
+        "bold text",
+        "",
+    });
+
+    const bytes = try painted(gpa, "```zig\r\nconst a = 1;\r\n```\r\n| a |\r\n| - |\r\n", 20, null, 0);
+    defer gpa.free(bytes);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "�") == null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "const a = 1;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "┌") != null);
+}
+
+// A quote reads by its color alone. A border glyph rides into every copy of the
+// text a user takes out of the terminal.
+test "a quote paints with no border glyph" {
+    const gpa = std.testing.allocator;
+    const text = "> **_Note:_** a quoted line\n> and its second line";
+    try expectPlainRows(gpa, text, 30, &.{ "Note: a quoted line", "and its second line" });
+
+    const bytes = try painted(gpa, text, 30, null, 0);
+    defer gpa.free(bytes);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "│") == null);
+    // The quote is muted and italic, and the nested pair adds its bold on top.
+    const nested = "\x1b[38;2;128;128;128m\x1b[1m\x1b[3mNote:";
+    try std.testing.expect(std.mem.indexOf(u8, bytes, nested) != null);
+}
+
+// Markers nest: an inner pair sheds its own markers instead of showing them as
+// literal text. A pair that closes past the run holding it interleaves rather
+// than nests, so it stays literal.
+test "nested inline markers all shed their marks" {
+    const gpa = std.testing.allocator;
+    try expectPlainRows(gpa, "**_both_** and *a **deep** run*", 40, &.{
+        "both and a deep run",
+    });
+    try expectPlainRows(gpa, "***all three*** of them", 40, &.{"all three of them"});
+    try expectPlainRows(gpa, "a **b _c** d_ e", 40, &.{"a b _c d_ e"});
+    // A blank behind a marker opens the next emphasis, a tab as much as a
+    // space. The emphasis reaches the closer behind `c`, and the tab itself
+    // draws as one space.
+    try expectPlainRows(gpa, "a *b\t*c* d", 40, &.{"a b *c d"});
+
+    const bytes = try painted(gpa, "**_both_**", 40, null, 0);
+    defer gpa.free(bytes);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\x1b[1m\x1b[3mboth") != null);
+}
+
+// A target a click can open makes the label itself the link, so no URL text
+// follows it. A bare URL links to itself. Any other target keeps its URL as
+// text, since a click cannot reach it.
+test "a link paints as a terminal hyperlink" {
+    const gpa = std.testing.allocator;
+    const text = "see [docs](https://example.com/a) or https://example.com/b, " ++
+        "[x](./x.md), [j](javascript:x)";
+    try expectPlainRows(gpa, text, 90, &.{
+        "see docs or https://example.com/b, x (./x.md), j (javascript:x)",
+    });
+
+    const bytes = try painted(gpa, text, 90, null, 0);
+    defer gpa.free(bytes);
+    const labelled = "\x1b]8;;https://example.com/a\x1b\\docs\x1b]8;;\x1b\\";
+    try std.testing.expect(std.mem.indexOf(u8, bytes, labelled) != null);
+    // The comma behind a bare URL ends the sentence, not the target.
+    const bare = "\x1b]8;;https://example.com/b\x1b\\https://example.com/b\x1b]8;;\x1b\\";
+    try std.testing.expect(std.mem.indexOf(u8, bytes, bare) != null);
+    // The sink refuses a relative path and a scheme a click must not reach.
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\x1b]8;;./x.md") == null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\x1b]8;;javascript:") == null);
+
+    // The scheme of a bare URL reads case-insensitively, as a click does.
+    const upper = try painted(gpa, "HTTPS://X.Y/a", 40, null, 0);
+    defer gpa.free(upper);
+    try std.testing.expect(std.mem.indexOf(u8, upper, "\x1b]8;;HTTPS://X.Y/a\x1b\\") != null);
+}
+
+// A bare URL the sink refuses keeps every byte the reader reads as the URL and
+// loses the click alone, the way a relative target does. The sink takes
+// printable ASCII, so a non-ASCII byte inside a URL costs its click.
+test "a bare URL the sink refuses keeps its text and its look" {
+    const gpa = std.testing.allocator;
+    const text = "at https://x.y/\u{00e9}rest today";
+    try expectPlainRows(gpa, text, 40, &.{"at https://x.y/érest today"});
+
+    const bytes = try painted(gpa, text, 40, null, 0);
+    defer gpa.free(bytes);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, terminal.escape.link_set) == null);
+    // The whole word still reads as a link, not the ASCII head of it.
+    const styled = "\x1b[38;2;129;162;190m\x1b[4mhttps://x.y/\u{00e9}rest\x1b[0m";
+    try std.testing.expect(std.mem.indexOf(u8, bytes, styled) != null);
+}
+
+// A label that wraps opens and closes its link on every row it covers. An open
+// link makes the rows under it clickable too.
+test "a wrapped link closes on each of its rows" {
+    const gpa = std.testing.allocator;
+    const bytes = try painted(gpa, "[a long clickable label](https://example.com/a)", 10, null, 0);
+    defer gpa.free(bytes);
+
+    const opens = std.mem.count(u8, bytes, "\x1b]8;;https://example.com/a\x1b\\");
+    try std.testing.expectEqual(paintedRows(bytes), opens);
+    try std.testing.expectEqual(opens, std.mem.count(u8, bytes, terminal.escape.link_reset));
+}
+
+// The punctuation a sentence puts behind a bare URL is not part of its target.
+// A closing parenthesis belongs to the URL only while the URL opens one.
+test "a bare URL ends before the punctuation behind it" {
+    try std.testing.expectEqual(@as(usize, 11), urlLength("https://x.y"));
+    try std.testing.expectEqual(@as(usize, 11), urlLength("https://x.y."));
+    try std.testing.expectEqual(@as(usize, 11), urlLength("https://x.y),"));
+    try std.testing.expectEqual(@as(usize, 15), urlLength("https://x.y/(a)"));
+    try std.testing.expectEqual(@as(usize, 15), urlLength("https://x.y/(a))"));
+}
+
+// A heading with no body is an empty heading, not literal text. It sheds its
+// marker like any other and still takes the one row the count gives it.
+test "a heading with no body paints an empty row" {
+    const gpa = std.testing.allocator;
+    // The heading row, the spacer that sets it off, and the paragraph.
+    try expectPlainRows(gpa, "###\ntext", 20, &.{ "", "", "text" });
+
+    const bytes = try painted(gpa, "######", 20, null, 0);
+    defer gpa.free(bytes);
+    try std.testing.expectEqual(@as(usize, 1), paintedRows(bytes));
+    try std.testing.expect(std.mem.indexOfScalar(u8, bytes, '#') == null);
 }
 
 // Mid-stream, `**bold` has not closed yet: it must stay literal whole rather
@@ -1547,7 +1891,7 @@ test "markdown holds row parity over arbitrary marker soup" {
         "#",   "##",     "###### ", "- ",   "* ",  "1. ", "12) ", ">",           ">> ", "---",
         "```", "```zig", "**",      "*",    "_",   "__",  "~~",   "`",           "[",   "]",
         "(",   ")",      "[x] ",    "[ ] ", "\n",  " ",   "  ",   "https://x.y", "a",   "word",
-        "\t",  "\x1b",   "\xff",    "|",    "|-|",
+        "\t",  "\x1b",   "\xff",    "|",    "|-|", "***", "___",  "http://",     "?",   ".",
     } ++ [_][]const u8{ "| --- |", "| a | b |", "你", "😀", "e\u{0301}" };
     var prng = std.Random.DefaultPrng.init(0xc0ffee);
     const random = prng.random();

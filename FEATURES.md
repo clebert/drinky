@@ -132,7 +132,10 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
   animating.
 - Answer text grows as one block, with reasoning collected into a separate one tinted grey and
   italic. Both render their markdown: headings, lists, blockquotes, code blocks, rules, tables, and
-  inline emphasis.
+  nested inline emphasis. A heading, a quote, and an emphasis span shed their markers. A quote has
+  no border glyph, so a copy out of the terminal holds the text alone.
+- A link becomes a clickable terminal hyperlink when a click can open its target, and a bare URL
+  links to itself. Any other target, such as a relative path, shows its URL as text.
 - A pipe table draws as a box grid that fits the window and keeps the indentation of its source. The
   alignment colons parse but do not align. A long cell truncates to its column. A table stays plain
   text when the window is narrower than its smallest grid.

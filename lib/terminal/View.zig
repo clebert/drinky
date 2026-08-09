@@ -91,8 +91,9 @@ pub const Caret = struct { row: usize, column: usize };
 /// Composes rows directly into the back frame's `blob`. The caller opens a row
 /// with `begin` and writes inert display content through `text` and application
 /// styling through `sgr`. An optional `setCaret` marks the caret, and `end`
-/// closes the row. The sink never exposes the underlying writer, so runtime
-/// content cannot enter the trusted terminal-control channel.
+/// closes the row. The sink never exposes the underlying writer. The one piece
+/// of runtime content that reaches the trusted terminal-control channel is the
+/// hyperlink URL, which `linkable` clears before `linkSet` writes any.
 pub const Sink = struct {
     frame: *Frame,
     columns: usize,
@@ -104,6 +105,17 @@ pub const Sink = struct {
     /// such as a Prepend or a ZWJ. The next seam then takes a guard, whatever
     /// the fragment after it starts with.
     tail_joining: bool,
+    /// Whether a hyperlink is open on the row under composition.
+    link_open: bool,
+
+    /// The longest URL a hyperlink carries. Every frame repeats the target of
+    /// every visible link, so the cap keeps one row small.
+    pub const url_bytes_max = 2048;
+
+    /// The schemes a hyperlink can name. A terminal hands the target of a click
+    /// to the system, so a click must not reach a scheme the user does not
+    /// expect. The scheme reads case-insensitively, as a terminal accepts it.
+    const url_schemes = [_][]const u8{ "http://", "https://", "mailto:" };
 
     /// Open a row and capture the current `blob` end.
     pub fn begin(self: *Sink) void {
@@ -111,6 +123,7 @@ pub const Sink = struct {
         self.columns_written = 0;
         self.has_text = false;
         self.tail_joining = false;
+        self.link_open = false;
     }
 
     /// Append inert display text. The same scanner used for layout and width
@@ -161,9 +174,47 @@ pub const Sink = struct {
         try self.frame.blob.writer.writeAll(sequence);
     }
 
+    /// Make the text that follows a hyperlink to `url`, which `linkReset`
+    /// closes again. The sink writes nothing for a URL that `linkable` refuses,
+    /// so an unsupported target still renders as plain text.
+    pub fn linkSet(self: *Sink, url: []const u8) !void {
+        if (!linkable(url)) return;
+        const writer = &self.frame.blob.writer;
+        try writer.writeAll(escape.link_set);
+        try writer.writeAll(url);
+        try writer.writeAll(escape.string_end);
+        self.link_open = true;
+    }
+
+    /// Close the hyperlink that `linkSet` opened. It writes nothing when no link
+    /// is open, so a row that carries none stays free of the string control.
+    pub fn linkReset(self: *Sink) !void {
+        if (!self.link_open) return;
+        self.link_open = false;
+        try self.frame.blob.writer.writeAll(escape.link_reset);
+    }
+
+    /// Whether `linkSet` accepts `url`. The URL is the only runtime content in
+    /// the terminal control channel, so the sink is the one boundary that
+    /// clears it. It must be bounded, hold printable ASCII alone, and name a
+    /// scheme in `url_schemes`. No space, control byte, or string terminator
+    /// can then leave the URL field of the string control, and no click can
+    /// reach an unexpected scheme.
+    pub fn linkable(url: []const u8) bool {
+        if (url.len == 0 or url.len > url_bytes_max) return false;
+        for (url) |byte| if (byte <= ' ' or byte >= 0x7f) return false;
+        for (url_schemes) |scheme| {
+            if (std.ascii.startsWithIgnoreCase(url, scheme)) return true;
+        }
+        return false;
+    }
+
     /// Close the row opened by `begin` and record it under `anchor`.
     pub fn end(self: *Sink, anchor: Anchor) void {
         std.debug.assert(self.columns_written <= self.columns);
+        // A row must close its own hyperlink. An open one makes every row under
+        // it clickable.
+        std.debug.assert(!self.link_open);
         const len = self.frame.blob.writer.end - self.offset;
         // A measure/render parity slip that overflows `beginFrame`'s row
         // reservation is loud in safe builds. In unsafe builds it is a dropped
@@ -336,6 +387,7 @@ pub fn beginFrame(self: *View, size: Size, pages: usize) !*Sink {
         .columns_written = 0,
         .has_text = false,
         .tail_joining = false,
+        .link_open = false,
     };
     return &self.sink;
 }
@@ -1505,6 +1557,48 @@ test "a seam takes a guard only where the two fragments can fuse" {
     try std.testing.expectEqualStrings("👨\u{200D}\u{200B} ──", run);
     try std.testing.expectEqual(sink.columns_written, width.ofText(run));
     try view.render();
+}
+
+// A hyperlink frames its own text and closes inside the row. The target rides
+// in a string control, so the screen shows the text alone. A URL the sink
+// refuses opens no link at all and loses only the target.
+test "a hyperlink frames its text and closes within its row" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var view = View.init(gpa, &out.writer);
+    defer view.deinit();
+    var emulator = try Emulator.init(gpa, 20);
+    defer emulator.deinit();
+    emulator.resize(4);
+
+    const sink = try view.beginFrame(.{ .columns = 20, .rows = 4 }, 1);
+    sink.begin();
+    try sink.linkSet("https://example.com/a");
+    try sink.text("docs");
+    try sink.linkReset();
+    try sink.linkSet("https://example.com/\x1b\\evil");
+    try sink.text("!");
+    try sink.linkReset();
+    sink.end(.{ .id = 0, .line = 0 });
+    try view.render();
+
+    const framed = "\x1b]8;;https://example.com/a\x1b\\docs\x1b]8;;\x1b\\!";
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), framed) != null);
+    try emulator.feed(out.written());
+    try emulator.expectVisible(&.{"docs!"});
+
+    // The URL must be bounded printable ASCII under a scheme a click can open.
+    // The scheme reads case-insensitively, and every other one stays inert.
+    try std.testing.expect(Sink.linkable("mailto:someone@example.com"));
+    try std.testing.expect(Sink.linkable("HTTPS://X.Y/a"));
+    try std.testing.expect(!Sink.linkable(""));
+    try std.testing.expect(!Sink.linkable("https://example.com/a b"));
+    try std.testing.expect(!Sink.linkable("https://example.com/\u{00e9}"));
+    try std.testing.expect(!Sink.linkable("https://x.y/" ++ ("a" ** Sink.url_bytes_max)));
+    try std.testing.expect(!Sink.linkable("javascript:alert(1)"));
+    try std.testing.expect(!Sink.linkable("file:///etc/passwd"));
+    try std.testing.expect(!Sink.linkable("./x.md"));
 }
 
 test "a styled row reprinted from its own start carries its escapes" {

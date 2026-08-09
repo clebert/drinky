@@ -121,6 +121,14 @@ dependency on another item. Module layout and extension seams live in `AGENTS.md
       warning._
 - [ ] **Richer UI components** — composable tool-call panels, streaming status, and a command
       palette go beyond today's log plus editor. _Keep the line/string render model._
+- [ ] **Carriage returns in tool output** — a tool result shows a progress line as its final state,
+      not a replacement glyph for every carriage return. _Real tool output carries one: `curl` and
+      `pip` redraw a line in place. The main seam is `paint.box`, which draws a user message too.
+      In `markdown`, `walk` sheds the carriage return at the end of a CRLF line, so only one inside
+      a line is left there. The sink turns a control byte into U+FFFD to keep its column math, so
+      the text must lose the byte first. Keep only the text after the last carriage return in a
+      line, because a terminal overwrote what came before it. `boxRows` and `box` must share the
+      rule, or the row counts diverge._
 - [x] **Emit the grapheme guard only where it can fuse** — `View.Sink` writes a U+200B break at a
       span seam only where the two fragments can join into one grapheme. _`grapheme` classifies both
       edges of the seam. The break goes in when the next fragment starts with a joining code point
@@ -136,10 +144,12 @@ dependency on another item. Module layout and extension seams live in `AGENTS.md
       fits the window. _A long cell truncates to its column instead of wrapping. A table falls back
       to plain paragraph text when the window is narrower than its smallest grid. The fallback
       keeps row parity at every width._
-- [ ] **Clickable links** — links become clickable terminal hyperlinks. _Deferred out of the
-      markdown renderer. Today a link shows as styled text with the URL appended. OSC-8 hyperlinks
-      are a string control, not an SGR, so a clickable runtime URL needs a trusted path through the
-      sink's SGR-only control boundary._
+- [x] **Clickable links** — links become clickable terminal hyperlinks. _`View.Sink` owns the OSC-8
+      string control, because a URL is the only runtime content in the terminal control channel. The
+      sink is the one boundary that clears it: printable ASCII alone, at most 2048 bytes, and a
+      scheme of `http`, `https`, or `mailto`. Nothing can then leave the URL field, and a click
+      cannot reach a scheme the user does not expect. Any other target keeps its URL as text, and a
+      row always closes its own link._
 
 ## Configuration
 
