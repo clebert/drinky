@@ -1,7 +1,7 @@
 //! A single-choice list for the live region: a title and a key hint above the
 //! options, each option on its own row with the selected one highlighted and any
-//! pre-existing choice tagged "(Current)". It renders in the same framed input
-//! area as the editor, so it sits in the editor's place. It owns its option
+//! pre-existing choice tagged "(Current)". It renders between the same open
+//! separators as the editor, so it sits in the editor's place. It owns its option
 //! strings and the composed `content` buffer (freed on `deinit`) and borrows the
 //! title. Navigation moves the selection. `reflow` windows a tall list to keep
 //! it in view. The caller reads `cursor` and acts on the selected row.
@@ -24,7 +24,7 @@ cursor: usize,
 /// The row to tag "(Current)", if any: a pre-existing choice, distinct from
 /// where the cursor happens to sit.
 marked: ?usize,
-/// The body between the framing rules. A selection move rebuilds it.
+/// The body between the separators. A selection move rebuilds it.
 /// Columns-independent, so `rows` and `render` only wrap it to fit.
 content: std.ArrayList(u8),
 /// Trusted presentation metadata for each logical line in `content`. Style
@@ -86,7 +86,7 @@ pub fn moveDown(self: *Picker) !void {
 /// inside the visible window. Call once per repaint. Pass the same `size` whose
 /// columns and rows `render` and `rows` will use, so all three agree.
 pub fn reflow(self: *Picker, size: terminal.View.Size) void {
-    const columns_max = paint.frameGeometry(size.columns).content_columns;
+    const columns_max = paint.frameColumns(size.columns);
     const total_body = terminal.width.rows(self.content.items, columns_max);
     const visible = @min(total_body, paint.bodyLimit(size.rows));
     const prefix = self.content.items[0..self.cursor_offset];
@@ -96,19 +96,18 @@ pub fn reflow(self: *Picker, size: terminal.View.Size) void {
     self.scroll = @min(self.scroll, total_body - visible);
 }
 
-/// Physical rows the picker occupies: the two framing rules plus the wrapped
-/// body, the body capped to its scroll limit for `size.rows`.
+/// Physical rows the picker occupies: two separators plus the wrapped body.
+/// The body stops at its scroll limit for `size.rows`.
 pub fn rows(self: *const Picker, size: terminal.View.Size) usize {
-    const columns_max = paint.frameGeometry(size.columns).content_columns;
+    const columns_max = paint.frameColumns(size.columns);
     const total_body = terminal.width.rows(self.content.items, columns_max);
     return paint.framedRows(@min(total_body, paint.bodyLimit(size.rows)));
 }
 
-/// Stream the framed picker through `placement`: the rules and the wrapped
-/// body, windowed to its scroll limit for `viewport_rows`. Assumes `reflow` set
-/// the scroll.
+/// Stream the picker between its separators through `placement`. Window the
+/// body to its scroll limit for `viewport_rows`. Assumes `reflow` set the scroll.
 pub fn render(self: *const Picker, placement: *const paint.Placement, viewport_rows: usize) !void {
-    const columns_max = paint.frameGeometry(placement.columns).content_columns;
+    const columns_max = paint.frameColumns(placement.columns);
     const total_body = terminal.width.rows(self.content.items, columns_max);
     const visible_rows = @min(total_body, paint.bodyLimit(viewport_rows));
     try paint.framed(placement, &.{
@@ -195,7 +194,7 @@ test "compose lays out the title, hint, options, and the current marker" {
     var picker = try testPicker(gpa, &.{ "alpha", "beta" }, 1);
     defer picker.deinit();
 
-    // Two rules, a blank, title, hint, two options, a blank: eight rows.
+    // Two separators, a blank, title, hint, two options, and a blank make eight rows.
     try std.testing.expectEqual(@as(usize, 8), picker.rows(.{ .columns = 80, .rows = 24 }));
     try std.testing.expect(std.mem.indexOf(u8, picker.content.items, "Pick") != null);
     try std.testing.expect(std.mem.indexOf(u8, picker.content.items, "Esc: Cancel") != null);
@@ -236,7 +235,7 @@ test "a tall option list scrolls the window to keep the selection in view" {
     try view.render();
     const painted = out.written();
     // The selected tail option shows, the scrolled-off head does not, and the
-    // top rule reports the rows hidden above the window.
+    // top separator reports the rows hidden above the window.
     try std.testing.expect(std.mem.indexOf(u8, painted, "row19") != null);
     try std.testing.expect(std.mem.indexOf(u8, painted, "\x1b[7m > row19\x1b[0m") != null);
     try std.testing.expect(std.mem.indexOf(u8, painted, "row00") == null);

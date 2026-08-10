@@ -22,7 +22,7 @@ draft: Draft,
 caret: usize,
 /// The first wrapped body row shown when the body is taller than its slot. The
 /// window scrolls to keep the caret in view. `reflow` maintains it and `clear`
-/// resets it. The rows above it show as an "N more" label on the top rule.
+/// resets it. The rows above it show as an "N more" label on the top separator.
 scroll: usize,
 /// The desired logical column for vertical movement, remembered across consecutive
 /// `moveUp`/`moveDown` so a step through a shorter row does not forget it. It is
@@ -560,7 +560,7 @@ pub fn moveEnd(self: *Editor) void {
 /// counts as one cell and never traps the caret at its edge (see `logicalColumn`
 /// and `logicalOffset`).
 pub fn moveUp(self: *Editor, columns: usize) void {
-    const columns_max = paint.frameGeometry(columns).content_columns;
+    const columns_max = paint.frameColumns(columns);
     const text = self.draft.visible.items;
     const row = terminal.width.caret(text[0..self.caret], columns_max).rows_before;
     if (row == 0) {
@@ -584,7 +584,7 @@ pub fn moveUp(self: *Editor, columns: usize) void {
 /// Move the caret one wrapped row down and keep the sticky logical goal column.
 /// On the bottom row it falls back to `moveEnd`. See `moveUp`.
 pub fn moveDown(self: *Editor, columns: usize) void {
-    const columns_max = paint.frameGeometry(columns).content_columns;
+    const columns_max = paint.frameColumns(columns);
     const text = self.draft.visible.items;
     const row = terminal.width.caret(text[0..self.caret], columns_max).rows_before;
     if (row + 1 >= terminal.width.rows(text, columns_max)) {
@@ -690,7 +690,7 @@ fn legalCaret(self: *const Editor, offset: usize) bool {
 /// window. Call once per repaint. Pass the same `size` whose columns and rows
 /// `render` and `rows` will use, so all three agree on the window.
 pub fn reflow(self: *Editor, size: terminal.View.Size) void {
-    const columns_max = paint.frameGeometry(size.columns).content_columns;
+    const columns_max = paint.frameColumns(size.columns);
     const text = self.draft.visible.items;
     const total_body = self.bodyRows(columns_max);
     const visible_rows = @min(total_body, paint.bodyLimit(size.rows));
@@ -700,10 +700,10 @@ pub fn reflow(self: *Editor, size: terminal.View.Size) void {
     self.scroll = @min(self.scroll, total_body - visible_rows);
 }
 
-/// The physical rows the editor occupies: the two framing rules plus the wrapped
-/// body, the body capped to its scroll limit for `size.rows`.
+/// The physical rows the editor occupies: two separators plus the wrapped body.
+/// The body stops at its scroll limit for `size.rows`.
 pub fn rows(self: *const Editor, size: terminal.View.Size) usize {
-    const columns_max = paint.frameGeometry(size.columns).content_columns;
+    const columns_max = paint.frameColumns(size.columns);
     const total_body = self.bodyRows(columns_max);
     return paint.framedRows(@min(total_body, paint.bodyLimit(size.rows)));
 }
@@ -718,17 +718,17 @@ fn bodyRows(self: *const Editor, columns_max: usize) usize {
     return wrapped + @intFromBool(caret_row == wrapped);
 }
 
-/// Stream the closed input frame and wrapped visible text through `placement` and
-/// place the terminal caret inside its left wall. Assumes `reflow` set the scroll
-/// from the same viewport dimensions.
+/// Stream the open input area and wrapped visible text through `placement`.
+/// Place the terminal caret with no side decoration. Assumes `reflow` set the
+/// scroll from the same viewport dimensions.
 pub fn render(
     self: *const Editor,
     placement: *const paint.Placement,
     options: *const RenderOptions,
 ) !void {
-    const geometry = paint.frameGeometry(placement.columns);
+    const columns_max = paint.frameColumns(placement.columns);
     const text = self.draft.visible.items;
-    const total_body = self.bodyRows(geometry.content_columns);
+    const total_body = self.bodyRows(columns_max);
     const visible_rows = @min(total_body, paint.bodyLimit(options.viewport_rows));
     try paint.framed(placement, &.{
         .body = text,
@@ -736,23 +736,22 @@ pub fn render(
         .caret = self.caretPosition(placement.columns),
         .hidden_above = self.scroll,
         .hidden_below = total_body - self.scroll - visible_rows,
-        .trailing_row = total_body > terminal.width.rows(text, geometry.content_columns),
+        .trailing_row = total_body > terminal.width.rows(text, columns_max),
         .activity = options.activity,
     });
 }
 
-/// The caret's position within the rendered rows: row 0 is the top border and
-/// the column includes the left wall and padding. A caret at a full-width line's
-/// end reports the empty trailing row `bodyRows` reserves.
+/// The caret's position within the rendered rows. Row 0 is the top separator.
+/// A caret at a full-width line's end reports the empty trailing row that
+/// `bodyRows` reserves.
 fn caretPosition(self: *const Editor, columns: usize) terminal.View.Caret {
-    const geometry = paint.frameGeometry(columns);
     const position = terminal.width.caret(
         self.draft.visible.items[0..self.caret],
-        geometry.content_columns,
+        paint.frameColumns(columns),
     );
     return .{
         .row = 1 + (position.rows_before - self.scroll),
-        .column = geometry.content_offset + position.column,
+        .column = position.column,
     };
 }
 
@@ -1567,22 +1566,23 @@ test render {
     var editor = Editor.init(gpa);
     defer editor.deinit();
     try editor.insert("hi");
-    // Top rule, the body row, bottom rule.
+    // Top separator, the body row, bottom separator.
     try std.testing.expectEqual(@as(usize, 3), editor.rows(.{ .columns = 80, .rows = 24 }));
-    // The caret is on the body row after the left wall, padding, and "hi".
-    try expectCaretAt(&editor, 80, .{ .row = 1, .column = 4 });
+    // The open body puts the caret directly after "hi".
+    try expectCaretAt(&editor, 80, .{ .row = 1, .column = 2 });
 
     const painted = try rendered(gpa, &editor, .{ .columns = 80, .rows = 24 });
     defer gpa.free(painted);
     try std.testing.expect(std.mem.indexOf(u8, painted, "hi") != null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "─") != null);
     for ([_][]const u8{ "┌", "┐", "│", "└", "┘" }) |glyph|
-        try std.testing.expect(std.mem.indexOf(u8, painted, glyph) != null);
+        try std.testing.expect(std.mem.indexOf(u8, painted, glyph) == null);
     try std.testing.expect(std.mem.indexOf(u8, painted, "━") == null);
     // The live input, so the view shows the hardware cursor.
     try std.testing.expect(std.mem.indexOf(u8, painted, terminal.escape.cursor_show) != null);
 }
 
-test "a marker renders its label into the frame" {
+test "a marker renders its label into the input area" {
     const gpa = std.testing.allocator;
     var editor = Editor.init(gpa);
     defer editor.deinit();
@@ -1597,39 +1597,39 @@ test "a full-width line reserves an empty trailing row for the wrapped caret" {
     var editor = Editor.init(gpa);
     defer editor.deinit();
     try editor.insert("abc"); // Fills the three content columns exactly.
-    editor.reflow(.{ .columns = 7, .rows = 24 });
+    editor.reflow(.{ .columns = 3, .rows = 24 });
 
-    // The caret wraps onto an empty trailing row inside the seven-column frame.
-    try std.testing.expectEqual(@as(usize, 4), editor.rows(.{ .columns = 7, .rows = 24 }));
-    try expectCaretAt(&editor, 7, .{ .row = 2, .column = 2 });
-    try std.testing.expectEqual(@as(usize, 4), try renderedRows(gpa, &editor, 7));
+    // The caret wraps onto an empty trailing row between the separators.
+    try std.testing.expectEqual(@as(usize, 4), editor.rows(.{ .columns = 3, .rows = 24 }));
+    try expectCaretAt(&editor, 3, .{ .row = 2, .column = 0 });
+    try std.testing.expectEqual(@as(usize, 4), try renderedRows(gpa, &editor, 3));
 
     // A caret move back off the margin drops the trailing row again.
     editor.moveLeft();
-    editor.reflow(.{ .columns = 7, .rows = 24 });
-    try std.testing.expectEqual(@as(usize, 3), editor.rows(.{ .columns = 7, .rows = 24 }));
-    try expectCaretAt(&editor, 7, .{ .row = 1, .column = 4 });
-    try std.testing.expectEqual(@as(usize, 3), try renderedRows(gpa, &editor, 7));
+    editor.reflow(.{ .columns = 3, .rows = 24 });
+    try std.testing.expectEqual(@as(usize, 3), editor.rows(.{ .columns = 3, .rows = 24 }));
+    try expectCaretAt(&editor, 3, .{ .row = 1, .column = 2 });
+    try std.testing.expectEqual(@as(usize, 3), try renderedRows(gpa, &editor, 3));
 }
 
-test "a narrow frame preserves both walls around a wide grapheme" {
+test "an open input preserves a wide grapheme without side glyphs" {
     const gpa = std.testing.allocator;
     var editor = Editor.init(gpa);
     defer editor.deinit();
     try editor.insert("你");
 
-    for ([_]usize{ 3, 5 }) |columns| {
-        const size: terminal.View.Size = .{ .columns = columns, .rows = 24 };
-        editor.reflow(size);
-        try std.testing.expectEqual(@as(usize, 4), editor.rows(size));
-        const painted = try rendered(gpa, &editor, size);
-        defer gpa.free(painted);
-        try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, painted, "│"));
-        try std.testing.expect(std.mem.indexOf(u8, painted, "�") != null);
-    }
+    const size: terminal.View.Size = .{ .columns = 3, .rows = 24 };
+    editor.reflow(size);
+    try std.testing.expectEqual(@as(usize, 3), editor.rows(size));
+    try expectCaretAt(&editor, size.columns, .{ .row = 1, .column = 2 });
+    const painted = try rendered(gpa, &editor, size);
+    defer gpa.free(painted);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "你") != null);
+    for ([_][]const u8{ "┌", "┐", "│", "└", "┘" }) |glyph|
+        try std.testing.expect(std.mem.indexOf(u8, painted, glyph) == null);
 }
 
-test "activity moves in the border without changing the editor height" {
+test "activity crosses the separators without changing the editor height" {
     const gpa = std.testing.allocator;
     var editor = Editor.init(gpa);
     defer editor.deinit();
@@ -1649,6 +1649,8 @@ test "activity moves in the border without changing the editor height" {
 
     for ([_][]const u8{ "╼", "━", "╾" }) |glyph|
         try std.testing.expect(std.mem.indexOf(u8, first, glyph) != null);
+    for ([_][]const u8{ "┌", "┐", "│", "└", "┘", "┃" }) |glyph|
+        try std.testing.expect(std.mem.indexOf(u8, first, glyph) == null);
     try std.testing.expect(!std.mem.eql(u8, first, second));
     try std.testing.expectEqual(
         std.mem.count(u8, first, "\r\n"),
@@ -1693,9 +1695,9 @@ test "caret sits on the empty row after a trailing newline" {
     var editor = Editor.init(std.testing.allocator);
     defer editor.deinit();
     try editor.insert("a\n");
-    // Borders plus "a" plus the empty new line: four rows.
+    // Separators plus "a" plus the empty new line make four rows.
     try std.testing.expectEqual(@as(usize, 4), editor.rows(.{ .columns = 80, .rows = 24 }));
-    try expectCaretAt(&editor, 80, .{ .row = 2, .column = 2 });
+    try expectCaretAt(&editor, 80, .{ .row = 2, .column = 0 });
 }
 
 test "caret occupies a blank row between two newlines" {
@@ -1706,14 +1708,14 @@ test "caret occupies a blank row between two newlines" {
     editor.moveLeft();
     // The caret now sits just after the first newline, on the blank middle row.
     try std.testing.expectEqual(@as(usize, 5), editor.rows(.{ .columns = 80, .rows = 24 }));
-    try expectCaretAt(&editor, 80, .{ .row = 2, .column = 2 });
+    try expectCaretAt(&editor, 80, .{ .row = 2, .column = 0 });
 }
 
 test "consecutive newlines each add an occupiable row" {
     var editor = Editor.init(std.testing.allocator);
     defer editor.deinit();
     try editor.insert("\n\n");
-    try expectCaretAt(&editor, 80, .{ .row = 3, .column = 2 });
+    try expectCaretAt(&editor, 80, .{ .row = 3, .column = 0 });
 }
 
 test "moveUp and moveDown across newline lines" {
@@ -1732,9 +1734,9 @@ test "moveUp and moveDown across wrapped continuation rows" {
     defer editor.deinit();
     try editor.insert("abcdef");
     editor.caret = 1; // Wrapped at three content columns: row 0, column 1.
-    editor.moveDown(7);
+    editor.moveDown(3);
     try std.testing.expectEqual(@as(usize, 4), editor.caret); // Row 1, column 1.
-    editor.moveUp(7);
+    editor.moveUp(3);
     try std.testing.expectEqual(@as(usize, 1), editor.caret);
 }
 
@@ -1825,11 +1827,11 @@ test "a tall body caps its rows and scrolls the window to keep the caret in view
     // Ten single-column rows. A 20-row viewport caps the body at six.
     try editor.insert("l0\nl1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9");
     editor.reflow(.{ .columns = 80, .rows = 20 });
-    // Two rules plus the six shown body rows, not the whole ten-row body.
+    // Two separators plus the six shown body rows, not the whole ten-row body.
     try std.testing.expectEqual(@as(usize, 8), editor.rows(.{ .columns = 80, .rows = 20 }));
     // The caret ends on the last row, so the window ends there.
     try std.testing.expectEqual(@as(usize, 4), editor.scroll);
-    // Window-relative: below the top rule and the five earlier shown rows.
+    // Window-relative: below the top separator and the five earlier shown rows.
     try std.testing.expectEqual(@as(usize, 6), editor.caretPosition(80).row);
 
     // A climb to the top drags the window back up with the caret.
@@ -1839,7 +1841,7 @@ test "a tall body caps its rows and scrolls the window to keep the caret in view
     try std.testing.expectEqual(@as(usize, 1), editor.caretPosition(80).row);
 }
 
-test "the framing rules report the rows scrolled out of view" {
+test "the separators report the rows scrolled out of view" {
     const gpa = std.testing.allocator;
     var editor = Editor.init(gpa);
     defer editor.deinit();

@@ -56,8 +56,8 @@ pub const Tail = union(enum) {
     turn: Turn,
     picking: *const ui.Picker,
 
-    /// A streaming turn: the running tool calls, the steering queue (empty when
-    /// nothing is queued), then the editor with activity travelling in its border.
+    /// A streaming turn: the running tool calls, the steering queue, then the
+    /// editor with activity that crosses its separators.
     pub const Turn = struct {
         tools: []const []const u8,
         activity: ui.paint.Activity,
@@ -330,7 +330,7 @@ test "a turn tail stacks tool boxes above the active editor" {
     try std.testing.expect(std.mem.indexOf(u8, painted, "Working…") == null);
 }
 
-test "border activity does not change the input tail height" {
+test "separator activity does not change the input tail height" {
     const gpa = std.testing.allocator;
     var editor = ui.Editor.init(gpa);
     defer editor.deinit();

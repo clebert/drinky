@@ -97,8 +97,8 @@ const Mode = union(enum) {
     viewing: ui.Page,
 };
 
-/// A streaming turn: the input-border activity tick and the running tool calls,
-/// each shown as its own box in the live tail.
+/// A streaming turn: the input-separator activity tick and the running tool
+/// calls. Each tool call appears in its own box in the live tail.
 const Turn = struct {
     generation: u64,
     /// The last worker progress event applied for this generation.
@@ -601,8 +601,8 @@ fn steeringView(self: *Session) ![]const []const u8 {
     return self.steering_view.items;
 }
 
-/// Close any open model run, then enter turn mode with fresh border activity and
-/// no active tools.
+/// Close any open model run, then enter turn mode with fresh separator activity
+/// and no active tools.
 pub fn beginTurn(self: *Session, generation: u64) void {
     self.transcript.endMessage();
     self.mode = .{ .turn = .{
@@ -800,7 +800,7 @@ pub fn paint(self: *Session, size: terminal.View.Size) !void {
 }
 
 /// Move the terminal cursor below the interface. Call once at shutdown, so the
-/// shell prompt after exit does not overwrite the input box and status line.
+/// shell prompt does not overwrite the input area and status line after exit.
 pub fn parkCursor(self: *Session) !void {
     try self.view.parkCursor();
 }
@@ -812,18 +812,13 @@ pub fn advanceFrame(self: *Session) bool {
     var activity_changed = false;
     if (self.activeTurn()) |turn| {
         turn.activity_tick +%= 1;
-        const size: terminal.View.Size = .{ .columns = self.columns, .rows = self.rows };
-        const body_rows = self.editor.rows(size) - ui.paint.frame_border_rows;
         const activity = turn.activity();
-        activity_changed = ui.paint.activityChanged(&activity, &.{
-            .columns = size.columns,
-            .body_rows = body_rows,
-        });
+        activity_changed = ui.paint.activityChanged(&activity, self.columns);
     }
     return self.dirty or activity_changed;
 }
 
-/// Whether a component wants continuous frames: the active turn's border.
+/// Whether a component wants continuous frames: the active turn's separators.
 pub fn animating(self: *const Session) bool {
     return switch (self.mode) {
         .turn => true,
@@ -1435,9 +1430,9 @@ test "opening a picker over a turn releases its retained prompt" {
     try std.testing.expect(session.turn_origin == null);
 }
 
-// The activity clock advances between stream events, but a corner or vertical
-// cell dwells for an extra tick without a repaint.
-test "activity ticks use aspect-aware repaint timing" {
+// The activity clock advances between stream events. Each horizontal step
+// repaints the two separator segments.
+test "activity ticks repaint each separator step" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
@@ -1449,9 +1444,8 @@ test "activity ticks use aspect-aware repaint timing" {
     session.mode.turn.activity_tick = 38;
     try std.testing.expect(session.advanceFrame());
     try std.testing.expectEqual(@as(u64, 39), session.mode.turn.activity_tick);
-    try std.testing.expect(!session.advanceFrame());
     try std.testing.expect(session.advanceFrame());
-    try std.testing.expectEqual(@as(u64, 41), session.mode.turn.activity_tick);
+    try std.testing.expectEqual(@as(u64, 40), session.mode.turn.activity_tick);
     session.mode.turn.activity_tick = std.math.maxInt(u64);
     try std.testing.expect(session.advanceFrame());
     try std.testing.expectEqual(@as(u64, 0), session.mode.turn.activity_tick);
@@ -1467,7 +1461,7 @@ test "activity ticks use aspect-aware repaint timing" {
     try std.testing.expect(session.advanceFrame());
 }
 
-test "accepted turn progress restarts border growth without resetting motion" {
+test "accepted turn progress restarts separator growth without resetting motion" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();

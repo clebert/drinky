@@ -148,7 +148,7 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - A running tool shows a blue box with its name and arguments. It then turns green or red with a
   one-line stat summary (lines read, matches found, exit status), or its first output line when the
   tool gives no summary.
-- A heavy accent segment orbits the input border while a turn is in flight. It grows as progress
+- Two heavy accent segments cross the open input separators during a turn. They grow as progress
   goes quiet without adding a layout row.
 - Queued steering shows as `Queued message:` rows, and becomes one user message once consumed.
 - The bottom line shows `directory (branch)`, context fill, cost, quota, and cache-hit rate on the
@@ -160,7 +160,7 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
   it when a turn starts and when one ends.
 - A picker is a single-choice list that tags the current value. Enter confirms, and Esc, Ctrl+C, or
   Ctrl+D cancels.
-- The closed input frame grows to about a quarter of the screen and labels hidden rows "↑ Hidden: N"
+- The open input area grows to about a quarter of the screen and labels hidden rows "↑ Hidden: N"
   and "↓ Hidden: N".
 - Model, tool, and user text can never emit escapes: controls and malformed UTF-8 render as
   replacement characters.
