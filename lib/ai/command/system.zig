@@ -1,5 +1,5 @@
 //! `/system`: ask the app to show its complete provider-neutral system prompt.
-//! Any argument is ignored.
+//! The command takes no argument.
 
 const std = @import("std");
 

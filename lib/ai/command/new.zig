@@ -1,5 +1,5 @@
 //! `/new`: ask the app to start an empty conversation while preserving the
-//! active account, model, and configuration. Any argument is ignored.
+//! active account, model, and configuration. The command takes no argument.
 
 const std = @import("std");
 

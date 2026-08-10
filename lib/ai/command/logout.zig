@@ -1,6 +1,6 @@
 //! `/logout`: a picker over the signed-in accounts. API-key accounts are
 //! environment-sourced and have no logout. A selection hands the
-//! app a `logout` outcome. The command ignores any argument.
+//! app a `logout` outcome. The command takes no argument.
 
 const std = @import("std");
 

@@ -1,6 +1,6 @@
 //! `/login`: a picker over every account (also the first-run bootstrap and the
 //! fall-through after the last logout). `run` and `select` index the same
-//! enum-order account list. The command ignores any argument.
+//! enum-order account list. The command takes no argument.
 
 const std = @import("std");
 

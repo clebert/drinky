@@ -16,7 +16,8 @@ io: std.Io,
 agent: *Agent,
 /// For account-qualified model selection.
 accounts: *Accounts,
-/// Runtime-discovered skills. Null in command tests that do not need them.
+/// Runtime-discovered skills. Null where no skill can run: a dispatch of a fixed
+/// command line, and the command tests that do not need them.
 skill_registry: ?*const skills.Registry = null,
 
 /// A slash command's result. Notice, event, picker, and prompt allocations

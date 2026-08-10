@@ -1,6 +1,6 @@
 //! `/effort`: a picker over the reasoning-effort levels. The picker preselects
 //! the current one. A selection switches the level from the next turn. The
-//! command ignores any argument.
+//! command takes no argument.
 //!
 //! The level belongs to the active account, and the status line hides it while
 //! no account is active. A signed-out `/effort` therefore refuses, the same way

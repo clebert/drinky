@@ -98,6 +98,9 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
   scrollable full-window page. `M` toggles its exact source.
 - **/skill:name** — load a discovered skill explicitly, record a compact `Skill:` marker, and append
   any trailing text as its task.
+- A command runs only when its name fills the whole line. A message such as
+  `/new must clear the scrollback` reaches the model. `/skill:name` is the one exception, because it
+  takes its task as trailing text.
 - Successful model, effort, login, logout, and account changes are recorded as transcript events.
 - Unknown commands and other local command failures temporarily replace the footer until the next
   user action, and never reach the model.

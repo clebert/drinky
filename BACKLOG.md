@@ -52,7 +52,8 @@ dependency on another item. Module layout and extension seams live in `AGENTS.md
       fallback. Report the file that is not valid. Report an ignored `CLAUDE.md` or a
       likely-misspelled `AGENT.md`._
 - [ ] **Custom prompts** — user-maintained prompt templates run as slash commands with argument
-      substitution.
+      substitution. _The whole-line rule special-cases the `skill:` prefix today. A second
+      argument-taking command must move that rule into the registry `Entry`._
 - [x] **Skills** — on-demand instruction files: pith advertises the names and descriptions to the
       model, and a body loads when triggered. _Pith resolves skills from both a user-level and a
       project directory._

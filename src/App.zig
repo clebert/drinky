@@ -945,7 +945,7 @@ fn submitSteering(self: *App) !void {
     if (self.session.editor.blank()) return;
     const text = try self.session.editor.expanded(.whole_prompt);
     defer self.gpa.free(text);
-    if (std.mem.startsWith(u8, text, "/")) return;
+    if (ai.command.parse(text) != null) return;
     // Reserve the mirror slot before the channel push, so the push is the only
     // fallible step before the draft moves in. If the push fails, the editor is
     // untouched. Once it succeeds, the literal-edge-trimmed draft moves into the
@@ -1135,14 +1135,16 @@ fn nowNs(self: *App) i96 {
     return std.Io.Timestamp.now(self.io, .awake).toNanoseconds();
 }
 
+/// Enter while idle: run a command line locally, or start a turn over the prompt.
+/// A command line holds its name alone, so a message that starts with a word like
+/// `/new` still reaches the model.
 fn submit(self: *App) !void {
     if (self.session.editor.blank()) return;
     const text = try self.session.editor.expanded(.whole_prompt);
     defer self.gpa.free(text);
     self.session.dirty = true;
 
-    if (std.mem.startsWith(u8, text, "/")) {
-        const outcome = try self.dispatchCommand(text);
+    if (try self.dispatchCommand(text)) |outcome| {
         switch (outcome) {
             .prompt => |prompt| {
                 defer prompt.deinit(self.gpa);
@@ -1234,7 +1236,8 @@ fn reserveTurnGeneration(self: *App) !u64 {
     return self.turn_generation;
 }
 
-fn dispatchCommand(self: *App, line: []const u8) !ai.command.Outcome {
+/// Run `line` as a command. Null reports that the line is a message.
+fn dispatchCommand(self: *App, line: []const u8) !?ai.command.Outcome {
     var context: ai.command.Context = .{
         .gpa = self.gpa,
         .io = self.io,
@@ -1245,9 +1248,10 @@ fn dispatchCommand(self: *App, line: []const u8) !ai.command.Outcome {
     return ai.command.run(&context, line);
 }
 
-/// Handle a slash command locally and apply its outcome.
+/// Handle a slash command locally and apply its outcome. Every caller passes a
+/// literal command line, so dispatch always returns an outcome.
 fn runCommand(self: *App, line: []const u8) !void {
-    try self.applyOutcome(try self.dispatchCommand(line));
+    if (try self.dispatchCommand(line)) |outcome| try self.applyOutcome(outcome);
 }
 
 /// Apply a command outcome: prompt, account, and conversation actions need the
@@ -1406,15 +1410,16 @@ fn logoutAccount(self: *App, account: ai.llm.Account) !void {
         .{account.label()},
     );
     // Through the session, not `runCommand`: a route back through `applyOutcome`
-    // cycles the inferred error sets (runCommand → applyOutcome → here).
+    // cycles the inferred error sets (runCommand → applyOutcome → here). The line
+    // is a literal `/login`, so this context needs no skill registry.
     var context: ai.command.Context = .{
         .gpa = self.gpa,
         .io = self.io,
         .agent = &self.agent,
         .accounts = &self.accounts,
-        .skill_registry = &self.skills,
     };
-    try self.session.applyOutcome(try ai.command.run(&context, "/login"));
+    if (try ai.command.run(&context, "/login")) |outcome|
+        try self.session.applyOutcome(outcome);
 }
 
 /// Switch the agent to `account` on the model that account ran last, else on its
@@ -2894,8 +2899,9 @@ test "recall of literal-edge-trimmed steering rejoins without edge spaces" {
 }
 
 // A slash command cannot run mid-turn. Enter must leave it in the editor to
-// send once the turn ends and must never queue it as prompt text for the model.
-test "a mid-turn slash command or blank line is never queued as steering" {
+// send once the turn ends and must never queue it as prompt text for the model. A
+// sentence that only starts with a command name is a message and must queue.
+test "mid-turn Enter queues a message but never a command or a blank line" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -2924,9 +2930,22 @@ test "a mid-turn slash command or blank line is never queued as steering" {
     try std.testing.expectEqualStrings("   ", app.session.editor.visible());
 
     try std.testing.expectEqual(@as(usize, 0), app.session.steering.items.len);
+    const blocked = try app.agent.steering.take();
+    defer gpa.free(blocked);
+    try std.testing.expectEqual(@as(usize, 0), blocked.len);
+
+    // A sentence that starts with a command name is a message, not a command.
+    app.session.editor.clear();
+    try app.session.editor.insert("/model names the account too");
+    try app.submitSteering();
+    try std.testing.expectEqualStrings("", app.session.editor.visible());
     const taken = try app.agent.steering.take();
-    defer gpa.free(taken);
-    try std.testing.expectEqual(@as(usize, 0), taken.len);
+    defer {
+        for (taken) |message| gpa.free(message);
+        gpa.free(taken);
+    }
+    try std.testing.expectEqual(@as(usize, 1), taken.len);
+    try std.testing.expectEqualStrings("/model names the account too", taken[0]);
 }
 
 test "late placeholder steering starts before a newer key in the same batch" {
@@ -3155,7 +3174,7 @@ test "/new clears the conversation and the scrollback without a configuration ch
     // Paint the old conversation first, so its frame holds the screen.
     try app.session.paint(.{ .columns = 80, .rows = 6 });
 
-    try app.session.editor.insert("/new trailing");
+    try app.session.editor.insert("/new");
     try app.submit();
 
     // The empty conversation must start on a clean screen. The paint clears the
@@ -3203,7 +3222,7 @@ test "/system opens the composed prompt alone and escape restores the conversati
     defer app.session.deinit();
 
     try app.session.transcript.append(.event, false, "history marker");
-    try app.session.editor.insert("/system trailing");
+    try app.session.editor.insert("/system");
     try app.submit();
 
     try std.testing.expect(app.session.mode == .viewing);
@@ -3498,6 +3517,66 @@ test "a remembered account does not resume when no account is authenticated" {
     try std.testing.expect(app.startAccount() == null);
 }
 
+// The logout of the last account leaves no one to adopt. Pith must sign out and
+// open the login picker itself, so the session never rests signed out with no way
+// back in.
+test "the logout of the last account signs out and opens the login picker" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(home);
+
+    // One signed-in subscription and no environment key: the only account there is.
+    var store = try tmp.dir.createDirPathOpen(io, ".pith", .{});
+    store.close(io);
+    try tmp.dir.writeFile(io, .{
+        .sub_path = ".pith/auth.json",
+        .data =
+        \\{ "anthropic_subscription":
+        \\    { "access": "a", "refresh": "r", "expires_ms": 4102444800000 } }
+        ,
+    });
+
+    var app: App = undefined;
+    app.gpa = gpa;
+    app.io = io;
+    app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
+    defer app.accounts.deinit();
+    try std.testing.expect(app.accounts.isAuthenticated(.anthropic_subscription));
+    app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_subscription), .{
+        .model = anthropic_default,
+        .system = "",
+        .retry = .{},
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+    // A signed-out session records nothing, so this test saves no choice.
+    app.state = .inert(gpa, io);
+
+    try app.applyOutcome(.{ .logout = .anthropic_subscription });
+
+    // The credential is gone and no account remains to adopt.
+    try std.testing.expect(!app.accounts.isAuthenticated(.anthropic_subscription));
+    try std.testing.expect(app.agent.client == null);
+    try std.testing.expect(app.session.account_shown == null);
+
+    // The event names the way back in, and the picker it names is open.
+    try std.testing.expectEqualStrings(
+        "Pith signed out of Anthropic Subscription. Select an account to sign in.",
+        app.session.transcript.blocks()[0].event.text.items,
+    );
+    try std.testing.expect(app.session.mode == .picking);
+    const picker = app.session.mode.picking.picker;
+    try std.testing.expectEqualStrings("Select an account to sign in", picker.title);
+    try std.testing.expectEqual(std.enums.values(ai.llm.Account).len, picker.options.len);
+    try std.testing.expectEqualStrings("Anthropic Subscription", picker.options[0]);
+}
+
 test "an invoked skill records a compact marker and keeps its task visible" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -3563,6 +3642,41 @@ test "a signed-out submit is refused with a login prompt" {
     try std.testing.expect(std.mem.indexOf(u8, notice.content, "/login") != null);
 }
 
+// A sentence that starts with a command name is a message, so an idle Enter takes
+// the message path. Signed out, that path refuses with the login prompt. The
+// command the sentence starts with must leave no trace.
+test "an idle submit of a command-like sentence takes the message path" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.gpa = gpa;
+    app.io = io;
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = anthropic_default,
+        .system = "",
+        .retry = .{},
+    });
+    defer app.agent.deinit();
+    // A submitted command records the project. This test saves no choice.
+    app.state = .inert(gpa, io);
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+    try app.session.transcript.append(.user, false, "history marker");
+
+    try app.session.editor.insert("/new must clear the terminal scrollback");
+    try app.submit();
+
+    // `/new` never ran, so the history stands and no conversation reset happened.
+    try std.testing.expectEqual(@as(usize, 1), app.session.transcript.blocks().len);
+    const notice = app.session.notice.?;
+    try std.testing.expectEqual(ai.command.Outcome.Severity.failure, notice.severity);
+    try std.testing.expect(std.mem.indexOf(u8, notice.content, "/login") != null);
+    try std.testing.expectEqualStrings("", app.session.editor.visible());
+}
+
 // Pith classifies a large paste that expands to a slash command from its expanded
 // text, never its marker label. The label never reaches command dispatch.
 test "a large pasted slash command is classified from expanded text" {
@@ -3585,19 +3699,21 @@ test "a large pasted slash command is classified from expanded text" {
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
     defer app.session.deinit();
 
-    // Twelve lines that begin with "/nope": large enough to collapse to a marker.
-    try app.session.editor.paste("/nope\n" ** 11 ++ "/nope", true);
+    // One command name of more than 1000 bytes: large enough to collapse to a marker.
+    try app.session.editor.paste("/nope" ++ "x" ** 1000, true);
     try std.testing.expectEqual(@as(usize, 1), app.session.editor.draft.atoms.items.len);
 
     try app.submit();
 
-    // The command ran off the expanded "/nope", not the "[paste …]" label.
+    // The command ran off the expanded name, not the "[paste …]" label.
     try std.testing.expectEqual(@as(usize, 0), app.session.transcript.blocks().len);
     const notice = app.session.notice.?;
     try std.testing.expectEqual(ai.command.Outcome.Severity.failure, notice.severity);
+    // The whole expanded name reached dispatch, not just its first bytes.
     try std.testing.expect(
-        std.mem.indexOf(u8, notice.content, "does not recognize the command /nope") != null,
+        std.mem.startsWith(u8, notice.content, "Pith does not recognize the command /nope"),
     );
+    try std.testing.expect(std.mem.endsWith(u8, notice.content, "x" ** 1000 ++ "."));
     try std.testing.expect(std.mem.indexOf(u8, notice.content, "paste") == null);
     try std.testing.expectEqualStrings("", app.session.editor.visible());
 }

@@ -1,6 +1,6 @@
 //! `/model`: a picker over every authenticated account's models. The picker
 //! marks the active one. A selection always chooses a model together with its
-//! account. The command ignores any argument.
+//! account. The command takes no argument.
 
 const std = @import("std");
 
