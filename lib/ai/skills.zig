@@ -5,6 +5,7 @@
 const std = @import("std");
 
 const instructions = @import("instructions.zig");
+const project = @import("project.zig");
 const skill_header = @import("skill_header.zig");
 
 const entries_visited_max = 100_000;
@@ -454,23 +455,6 @@ pub const Registry = struct {
         incoming.* = undefined;
     }
 
-    fn gitMarker(self: *Registry, io: std.Io, directory: []const u8) !bool {
-        const path = try std.fs.path.join(self.gpa, &.{ directory, ".git" });
-        defer self.gpa.free(path);
-        _ = std.Io.Dir.cwd().statFile(io, path, .{}) catch |err| {
-            if (err == error.FileNotFound) return false;
-            if (err == error.Canceled or err == error.OutOfMemory) return err;
-            try self.warn(
-                "Pith could not inspect the repository marker {s} because of error {s}.",
-                .{ path, @errorName(err) },
-            );
-            // To cross a repository boundary is worse than to miss skills below
-            // an unreadable marker. Stop the ancestor search conservatively.
-            return true;
-        };
-        return true;
-    }
-
     /// Record one message about the scan. Every one of them reports something
     /// the user must fix, so they all carry `.failure`.
     fn warn(
@@ -496,8 +480,20 @@ pub const Registry = struct {
 pub const DiscoverOptions = struct {
     /// Absolute `~/.agents/skills` path.
     user_root: []const u8,
-    /// Absolute working directory where the project ancestor scan starts.
+    /// The absolute, canonical working directory where the project ancestor scan
+    /// starts. `instructions.discover` takes the same contract, so both scans
+    /// read one directory the same way.
     project_start: []const u8,
+    /// The highest directory the project scan reaches, which is the Git root that
+    /// `project.findBoundary` reports. It must be absolute and canonical, and
+    /// `project_start` must resolve inside it.
+    ///
+    /// Null means that the caller found no Git root, and then the scan covers
+    /// `project_start` alone. The AGENTS.md scan applies that same rule. A
+    /// caller that could not read a repository marker also passes null, so this
+    /// scan then stops below an ancestor that the AGENTS.md scan still reads.
+    /// That errs toward fewer skills, never toward another repository.
+    project_root: ?[]const u8,
 };
 
 const PathKeeper = struct {
@@ -524,8 +520,11 @@ const PathKeeper = struct {
     }
 };
 
-/// Discover user skills, then project skills from `project_start` upward. The
-/// nearest project root wins. A `.git` file or directory ends the ancestor scan.
+/// Discover user skills, then project skills from `project_start` up to
+/// `project_root`. A project skill replaces a user skill of the same name. Among
+/// the project directories the skill closest to `project_start` wins. A null
+/// `project_root` bounds the scan at `project_start`. See
+/// `DiscoverOptions.project_root`.
 pub fn discover(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -536,6 +535,16 @@ pub fn discover(
     {
         return error.SkillPathNotAbsolute;
     }
+    if (options.project_root) |project_root| {
+        if (!std.fs.path.isAbsolute(project_root)) return error.SkillPathNotAbsolute;
+    }
+    // The repository bounds the ancestor scan. Outside a repository the working
+    // directory is the whole project, so the boundary is the start itself and the
+    // loop stops after one pass.
+    const boundary = options.project_root orelse options.project_start;
+    if (!project.contains(&.{ .boundary = boundary, .target = options.project_start })) {
+        return error.SkillProjectRootNotAncestor;
+    }
 
     var registry = Registry.init(gpa);
     errdefer registry.deinit();
@@ -545,21 +554,23 @@ pub fn discover(
 
     var current = options.project_start;
     for (0..std.fs.max_path_bytes) |_| {
-        const root = try std.fs.path.join(gpa, &.{ current, ".agents", "skills" });
-        defer gpa.free(root);
+        const skills_root = try std.fs.path.join(gpa, &.{ current, ".agents", "skills" });
+        defer gpa.free(skills_root);
         // At the home directory the user and project conventions can resolve to
         // the same path. Do not rediscover every file as its own shadow.
-        var matches_user_root = std.mem.eql(u8, root, options.user_root);
+        var matches_user_root = std.mem.eql(u8, skills_root, options.user_root);
         if (!matches_user_root and user_root_canonical != null) {
-            const project_root_canonical = try canonicalPath(gpa, io, root);
-            defer if (project_root_canonical) |path| gpa.free(path);
-            matches_user_root = if (project_root_canonical) |path|
+            const skills_root_canonical = try canonicalPath(gpa, io, skills_root);
+            defer if (skills_root_canonical) |path| gpa.free(path);
+            matches_user_root = if (skills_root_canonical) |path|
                 std.mem.eql(u8, path, user_root_canonical.?)
             else
                 false;
         }
-        if (!matches_user_root) try registry.scanRoot(io, root, .project);
-        if (try registry.gitMarker(io, current)) break;
+        if (!matches_user_root) try registry.scanRoot(io, skills_root, .project);
+        // `project_start` resolves inside `boundary`, and every step shortens the
+        // path, so the length alone stops the walk at the boundary.
+        if (current.len <= boundary.len) break;
         const parent = std.fs.path.dirname(current) orelse break;
         if (std.mem.eql(u8, parent, current)) break;
         current = parent;
@@ -702,16 +713,17 @@ test "discovery is recursive and project skills shadow user and ancestor skills"
         .sub_path = "repo/work/.agents/skills/loose.md",
         .data = "ignored",
     });
-    var git = try tmp.dir.createDirPathOpen(io, "repo/.git", .{});
-    git.close(io);
 
     const user_root = try tmpPath(gpa, io, &tmp, "user");
     defer gpa.free(user_root);
+    const project_root = try tmpPath(gpa, io, &tmp, "repo");
+    defer gpa.free(project_root);
     const project_start = try tmpPath(gpa, io, &tmp, "repo/work");
     defer gpa.free(project_start);
     var registry = try discover(gpa, io, &.{
         .user_root = user_root,
         .project_start = project_start,
+        .project_root = project_root,
     });
     defer registry.deinit();
 
@@ -720,6 +732,70 @@ test "discovery is recursive and project skills shadow user and ancestor skills"
     try std.testing.expect(registry.get("other") != null);
     try std.testing.expect(registry.get("outside") == null);
     try std.testing.expect(registry.notices().len >= 2);
+}
+
+test "a path that is not absolute and a root that is not an ancestor both fail safely" {
+    const gpa = std.testing.allocator;
+    // Every case fails before the first directory read, so none of them uses io.
+    try std.testing.expectError(error.SkillPathNotAbsolute, discover(gpa, undefined, &.{
+        .user_root = "relative",
+        .project_start = "/work",
+        .project_root = null,
+    }));
+    try std.testing.expectError(error.SkillPathNotAbsolute, discover(gpa, undefined, &.{
+        .user_root = "/home/.agents/skills",
+        .project_start = "relative",
+        .project_root = null,
+    }));
+    try std.testing.expectError(error.SkillPathNotAbsolute, discover(gpa, undefined, &.{
+        .user_root = "/home/.agents/skills",
+        .project_start = "/work",
+        .project_root = "relative",
+    }));
+    // A root the start does not resolve inside would let the walk climb past it.
+    try std.testing.expectError(error.SkillProjectRootNotAncestor, discover(gpa, undefined, &.{
+        .user_root = "/home/.agents/skills",
+        .project_start = "/work",
+        .project_root = "/elsewhere",
+    }));
+    // A shared name prefix is not a directory boundary.
+    try std.testing.expectError(error.SkillProjectRootNotAncestor, discover(gpa, undefined, &.{
+        .user_root = "/home/.agents/skills",
+        .project_start = "/workspace",
+        .project_root = "/work",
+    }));
+}
+
+test "without a Git root the project scan covers only the working directory" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeTestSkill(io, tmp.dir, "user/helper/SKILL.md", "---\n" ++
+        "name: helper\ndescription: user copy\n---\nuser\n");
+    try writeTestSkill(io, tmp.dir, "parent/.agents/skills/ancestor/SKILL.md", "---\n" ++
+        "name: ancestor\ndescription: one directory above\n---\nancestor\n");
+    try writeTestSkill(io, tmp.dir, "parent/work/.agents/skills/local/SKILL.md", "---\n" ++
+        "name: local\ndescription: the working directory\n---\nlocal\n");
+
+    const user_root = try tmpPath(gpa, io, &tmp, "user");
+    defer gpa.free(user_root);
+    const project_start = try tmpPath(gpa, io, &tmp, "parent/work");
+    defer gpa.free(project_start);
+    var registry = try discover(gpa, io, &.{
+        .user_root = user_root,
+        .project_start = project_start,
+        .project_root = null,
+    });
+    defer registry.deinit();
+
+    // The user root still loads. Only the ancestor scan stops, so no directory
+    // above the working directory can add or replace a skill.
+    try std.testing.expectEqual(@as(usize, 2), registry.items().len);
+    try std.testing.expect(registry.get("helper") != null);
+    try std.testing.expect(registry.get("local") != null);
+    try std.testing.expect(registry.get("ancestor") == null);
 }
 
 test "invalid names fall back, empty descriptions skip, and hidden skills stay out of catalog" {
@@ -739,16 +815,18 @@ test "invalid names fall back, empty descriptions skip, and hidden skills stay o
         "x" ** 1025 ++ "\n---\nbody\n");
     try writeTestSkill(io, tmp.dir, "user/Bad Name/SKILL.md", "---\n" ++
         "description: a directory name that is not a valid skill name\n---\nbody\n");
-    var git = try tmp.dir.createDirPathOpen(io, "repo/.git", .{});
-    git.close(io);
+    // The working directory holds no skills, so every skill here is a user one.
+    var work = try tmp.dir.createDirPathOpen(io, "work", .{});
+    work.close(io);
 
     const user_root = try tmpPath(gpa, io, &tmp, "user");
     defer gpa.free(user_root);
-    const project_start = try tmpPath(gpa, io, &tmp, "repo");
+    const project_start = try tmpPath(gpa, io, &tmp, "work");
     defer gpa.free(project_start);
     var registry = try discover(gpa, io, &.{
         .user_root = user_root,
         .project_start = project_start,
+        .project_root = null,
     });
     defer registry.deinit();
 
@@ -781,16 +859,17 @@ test "explicit invocation loads the full file and appends arguments" {
     defer tmp.cleanup();
     const source = "---\nname: invoke\ndescription: invocation test\n---\n# Instructions\nDo it.\n";
     try writeTestSkill(io, tmp.dir, "user/invoke/SKILL.md", source);
-    var git = try tmp.dir.createDirPathOpen(io, "repo/.git", .{});
-    git.close(io);
+    var work = try tmp.dir.createDirPathOpen(io, "work", .{});
+    work.close(io);
 
     const user_root = try tmpPath(gpa, io, &tmp, "user");
     defer gpa.free(user_root);
-    const project_start = try tmpPath(gpa, io, &tmp, "repo");
+    const project_start = try tmpPath(gpa, io, &tmp, "work");
     defer gpa.free(project_start);
     var registry = try discover(gpa, io, &.{
         .user_root = user_root,
         .project_start = project_start,
+        .project_root = null,
     });
     defer registry.deinit();
 
@@ -814,8 +893,8 @@ test "discovery follows directory symlinks once and skips cycles" {
         "name: pdf-tools\ndescription: linked skill\n---\nbody\n");
     var user_dir = try tmp.dir.createDirPathOpen(io, "user", .{});
     user_dir.close(io);
-    var git = try tmp.dir.createDirPathOpen(io, "repo/.git", .{});
-    git.close(io);
+    var work = try tmp.dir.createDirPathOpen(io, "work", .{});
+    work.close(io);
 
     const external = try tmpPath(gpa, io, &tmp, "external/pdf-tools");
     defer gpa.free(external);
@@ -825,11 +904,12 @@ test "discovery follows directory symlinks once and skips cycles" {
     // The walk must not follow a symlink back to the skills root a second time.
     try tmp.dir.symLink(io, user_root, "user/loop", .{});
 
-    const project_start = try tmpPath(gpa, io, &tmp, "repo");
+    const project_start = try tmpPath(gpa, io, &tmp, "work");
     defer gpa.free(project_start);
     var registry = try discover(gpa, io, &.{
         .user_root = user_root,
         .project_start = project_start,
+        .project_root = null,
     });
     defer registry.deinit();
 

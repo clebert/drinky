@@ -202,8 +202,8 @@ test "skill prefix dispatch loads instructions and preserves trailing arguments"
     var demo_dir = try tmp.dir.createDirPathOpen(io, "user/demo", .{});
     demo_dir.close(io);
     try tmp.dir.writeFile(io, .{ .sub_path = "user/demo/SKILL.md", .data = source });
-    var git = try tmp.dir.createDirPathOpen(io, "repo/.git", .{});
-    git.close(io);
+    var work = try tmp.dir.createDirPathOpen(io, "work", .{});
+    work.close(io);
 
     const cwd = try std.process.currentPathAlloc(io, gpa);
     defer gpa.free(cwd);
@@ -211,12 +211,13 @@ test "skill prefix dispatch loads instructions and preserves trailing arguments"
     defer gpa.free(base);
     const user_root = try std.fs.path.join(gpa, &.{ base, "user" });
     defer gpa.free(user_root);
-    const project_start = try std.fs.path.join(gpa, &.{ base, "repo" });
+    const project_start = try std.fs.path.join(gpa, &.{ base, "work" });
     defer gpa.free(project_start);
 
     var registry = try skills.discover(gpa, io, &.{
         .user_root = user_root,
         .project_start = project_start,
+        .project_root = null,
     });
     defer registry.deinit();
 

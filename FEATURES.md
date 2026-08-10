@@ -188,10 +188,14 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - The compiled core is minimal and mechanical, so the user owns the guidance that steers a turn.
 - The system prompt adds the startup UTC date, the working directory, and the repository root. It
   also ranks the instruction sources it carries, so the model knows which one wins on a conflict.
-- pith loads exact-case `AGENTS.md` files in path order.
-- pith discovers skills recursively from `~/.agents/skills/` and project `.agents/skills/`
-  directories and follows directory symlinks. Their names and descriptions are advertised while
-  their instructions load on demand.
+- pith loads exact-case `AGENTS.md` files in path order, from the Git root down to the working
+  directory. Outside a repository it reads that directory alone.
+- pith looks for skills in `~/.agents/skills/`, and in `.agents/skills/` from the Git root down to
+  the working directory. Outside a repository it looks in that directory alone.
+- pith searches each skills directory at any depth for `SKILL.md` and follows directory symlinks. On
+  a name clash a project skill has priority over a user skill, and the closest copy has priority
+  over a copy farther up. pith advertises each skill name and description, and loads the
+  instructions on demand.
 - pith loads the user instruction files that `config.json` names, in order.
 - One startup line counts the instruction files that pith loaded and the skills that it found. A
   count of zero stays out of the line. Only a skipped file gets its own line, and `/system` shows

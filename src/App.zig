@@ -373,6 +373,7 @@ pub fn run(
     self.skills = try ai.skills.discover(gpa, io, &.{
         .user_root = user_skills,
         .project_start = cwd,
+        .project_root = self.project_instructions.projectRoot(),
     });
     defer self.skills.deinit();
     self.prompt = try system_prompt.compose(gpa, &.{
@@ -3857,6 +3858,7 @@ test "the startup report counts the sources in one line and keeps a skip verbose
     app.skills = try ai.skills.discover(gpa, io, &.{
         .user_root = user_skills,
         .project_start = root,
+        .project_root = app.project_instructions.projectRoot(),
     });
     defer app.skills.deinit();
 
@@ -3910,6 +3912,7 @@ test "a startup with no guidance and no skipped file reports nothing" {
     app.skills = try ai.skills.discover(gpa, io, &.{
         .user_root = user_skills,
         .project_start = root,
+        .project_root = app.project_instructions.projectRoot(),
     });
     defer app.skills.deinit();
 

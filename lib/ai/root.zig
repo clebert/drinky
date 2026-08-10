@@ -18,6 +18,7 @@ pub const llm = @import("llm.zig");
 pub const models = @import("models.zig");
 pub const net = @import("net.zig");
 pub const openai = @import("openai/root.zig");
+pub const project = @import("project.zig");
 pub const provider = @import("provider.zig");
 pub const skills = @import("skills.zig");
 pub const Steering = @import("Steering.zig");

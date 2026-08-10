@@ -7,6 +7,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+const project = @import("project.zig");
+
 const file_bytes_max = 32 << 10;
 const source_bytes_max = 64 << 10;
 const notices_max = 1024;
@@ -278,14 +280,15 @@ pub const Result = struct {
 /// The walk from the working directory up to the project boundary. It only ever
 /// runs for the project source, so its messages name that source directly.
 ///
-/// Two boundaries guard the walk, and they differ on purpose. The `source_boundary`
-/// is the top of the walk: the Git root, or the working directory when Pith found
-/// no Git root. A plain instruction file must resolve inside it, so a mount trick
-/// cannot pull content in from outside the repository. The `link_boundary` is the
-/// Git root, or the working directory alone when there is no Git root. A
-/// symbolic-link target must resolve inside it. The two differ when Pith cannot
-/// read a repository marker: the walk then stops at that ancestor and still
-/// scans it, but only the working directory stays trusted for a link target.
+/// `project.findBoundary` gives the top of the walk. Two boundaries then guard the
+/// walk, and they differ on purpose. The `source_boundary` is that top: the Git
+/// root, or the working directory when Pith found no Git root. A plain instruction
+/// file must resolve inside it, so a mount trick cannot pull content in from
+/// outside the repository. The `link_boundary` is the Git root, or the working
+/// directory alone when there is no Git root. A symbolic-link target must resolve
+/// inside it. The two differ when Pith cannot read a repository marker: the walk
+/// then stops at that ancestor and still scans it, but only the working directory
+/// stays trusted for a link target.
 const Discovery = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -295,11 +298,6 @@ const Discovery = struct {
     /// The noun of the only source this walk serves, spliced into every message
     /// at compile time.
     const noun = Source.noun(.project);
-
-    const Boundary = struct {
-        path: []const u8,
-        has_project_root: bool,
-    };
 
     const ScanOptions = struct {
         directory: []const u8,
@@ -327,11 +325,12 @@ const Discovery = struct {
     };
 
     fn run(self: *Discovery) !void {
-        const boundary = try self.findBoundary();
-        if (boundary.has_project_root) {
+        const boundary = try project.findBoundary(self.gpa, self.io, self.working_directory);
+        if (boundary.unreadable_marker) |marker| try self.reportUnreadableMarker(&marker);
+        if (boundary.has_root) {
             self.result.project_root_path = try self.gpa.dupe(u8, boundary.path);
         }
-        const link_boundary = if (boundary.has_project_root)
+        const link_boundary = if (boundary.has_root)
             boundary.path
         else
             self.working_directory;
@@ -349,38 +348,17 @@ const Discovery = struct {
         std.mem.reverse(File, self.result.file_items.items);
     }
 
-    fn findBoundary(self: *Discovery) !Boundary {
-        var current = self.working_directory;
-        for (0..std.fs.max_path_bytes) |_| {
-            const marker_path = try std.fs.path.join(self.gpa, &.{ current, ".git" });
-            defer self.gpa.free(marker_path);
-            const stat = std.Io.Dir.cwd().statFile(
-                self.io,
-                marker_path,
-                .{ .follow_symlinks = false },
-            ) catch |err| {
-                if (err == error.FileNotFound) {
-                    const parent = std.fs.path.dirname(current) orelse
-                        return .{ .path = self.working_directory, .has_project_root = false };
-                    current = parent;
-                    continue;
-                }
-                if (err == error.Canceled or err == error.OutOfMemory) return err;
-                try self.result.report(
-                    .failure,
-                    "Pith could not inspect the repository marker {s} because of error {s}.",
-                    .{ marker_path, @errorName(err) },
-                );
-                return .{ .path = current, .has_project_root = false };
-            };
-            if (stat.kind == .directory or stat.kind == .file) {
-                return .{ .path = current, .has_project_root = true };
-            }
-            const parent = std.fs.path.dirname(current) orelse
-                return .{ .path = self.working_directory, .has_project_root = false };
-            current = parent;
-        }
-        return .{ .path = self.working_directory, .has_project_root = false };
+    fn reportUnreadableMarker(self: *Discovery, marker: *const project.Boundary.Marker) !void {
+        const marker_path = try std.fs.path.join(
+            self.gpa,
+            &.{ marker.directory, project.marker_name },
+        );
+        defer self.gpa.free(marker_path);
+        try self.result.report(
+            .failure,
+            "Pith could not inspect the repository marker {s} because of error {s}.",
+            .{ marker_path, @errorName(marker.err) },
+        );
     }
 
     fn scanDirectory(self: *Discovery, options: *const ScanOptions) !void {
@@ -608,7 +586,7 @@ const Discovery = struct {
             return;
         };
         const target = target_buffer[0..target_length];
-        if (!pathWithin(&.{ .boundary = options.content_boundary, .target = target })) {
+        if (!project.contains(&.{ .boundary = options.content_boundary, .target = target })) {
             try self.result.report(
                 .failure,
                 "Pith skipped the " ++ noun ++ " file {s} because the file resolves outside " ++
@@ -804,22 +782,6 @@ fn codepointPrintable(codepoint: u21) bool {
         => false,
         else => true,
     };
-}
-
-const ContainmentOptions = struct {
-    boundary: []const u8,
-    target: []const u8,
-};
-
-fn pathWithin(options: *const ContainmentOptions) bool {
-    if (std.mem.eql(u8, options.boundary, options.target)) return true;
-    if (!std.mem.startsWith(u8, options.target, options.boundary) or
-        options.target.len <= options.boundary.len)
-    {
-        return false;
-    }
-    if (std.fs.path.isSep(options.boundary[options.boundary.len - 1])) return true;
-    return std.fs.path.isSep(options.target[options.boundary.len]);
 }
 
 fn tmpPath(
@@ -1163,7 +1125,7 @@ test "repository marker inspection errors stop ancestor traversal conservatively
     defer blocked.setPermissions(io, .fromMode(0o700)) catch {};
     const working_directory = try tmpPath(gpa, io, &tmp, "blocked/work");
     defer gpa.free(working_directory);
-    const marker_path = try std.fs.path.join(gpa, &.{ working_directory, ".git" });
+    const marker_path = try std.fs.path.join(gpa, &.{ working_directory, project.marker_name });
     defer gpa.free(marker_path);
     const marker_blocked = inspect: {
         _ = std.Io.Dir.cwd().statFile(io, marker_path, .{}) catch |err| {
@@ -1479,21 +1441,4 @@ test "invalid working directories and source paths fail safely" {
     defer gpa.free(oversized);
     try std.testing.expectEqual(display_bytes_max + "…".len, oversized.len);
     try std.testing.expect(std.mem.endsWith(u8, oversized, "…"));
-}
-
-test pathWithin {
-    try std.testing.expect(pathWithin(&.{ .boundary = "/repo", .target = "/repo" }));
-    try std.testing.expect(pathWithin(&.{ .boundary = "/repo", .target = "/repo/file" }));
-    try std.testing.expect(!pathWithin(&.{ .boundary = "/repo", .target = "/repository/file" }));
-    try std.testing.expect(pathWithin(&.{ .boundary = "/", .target = "/outside" }));
-    if (builtin.os.tag == .windows) {
-        try std.testing.expect(pathWithin(&.{
-            .boundary = "\\\\server\\share",
-            .target = "\\\\server\\share\\file",
-        }));
-        try std.testing.expect(!pathWithin(&.{
-            .boundary = "\\\\server\\share",
-            .target = "\\\\server\\share2\\file",
-        }));
-    }
 }
