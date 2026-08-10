@@ -228,13 +228,13 @@ pub fn Engine(comptime S: type) type {
             return buffer.written();
         }
 
-        /// Refine a reader `ReadFailed` into `error.Canceled` when the
-        /// connection recorded a canceled read, else leave it as
-        /// `error.ReadFailed` for the network-error path.
+        /// Refine a reader `ReadFailed` into `error.Canceled` when the socket
+        /// recorded a canceled read. An HTTP body error can leave both
+        /// connection error slots null, so do not call `Connection.getReadError`.
         fn readFailed(stream: *S) anyerror {
-            if (stream.request.connection.?.getReadError()) |read_error| {
-                if (read_error == error.Canceled) return error.Canceled;
-            }
+            const connection = stream.request.connection orelse return error.ReadFailed;
+            const read_error = connection.stream_reader.err orelse return error.ReadFailed;
+            if (read_error == error.Canceled) return error.Canceled;
             return error.ReadFailed;
         }
 
@@ -318,6 +318,19 @@ test retryAfter {
         @as(?u64, std.math.maxInt(u64)),
         retryAfter(try std.http.Client.Response.Head.parse(huge)),
     );
+}
+
+test "a body read failure without a connection error stays a read failure" {
+    const Stub = struct {
+        request: struct { connection: ?*std.http.Client.Connection },
+    };
+    const engine = Engine(Stub);
+    var connection: std.http.Client.Connection = undefined;
+    connection.protocol = .plain;
+    connection.stream_reader.err = null;
+    var stream: Stub = .{ .request = .{ .connection = &connection } };
+
+    try std.testing.expectEqual(error.ReadFailed, engine.readFailed(&stream));
 }
 
 test "retryable classifies streamed errors and head statuses" {
