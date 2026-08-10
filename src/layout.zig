@@ -239,6 +239,8 @@ fn editorSlot(presentation: *const EditorPresentation) Slot {
 }
 
 const test_status: ui.status.Info = .{
+    .directory = "~/work",
+    .branch = "main",
     .last = .{},
     .cost = 0,
     .context_window = 1000,

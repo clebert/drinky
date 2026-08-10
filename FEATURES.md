@@ -151,8 +151,13 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - A heavy accent segment orbits the input border while a turn is in flight. It grows as progress
   goes quiet without adding a layout row.
 - Queued steering shows as `Queued message:` rows, and becomes one user message once consumed.
-- The bottom line shows context fill, cost, cache-hit rate, quota, and `model (account) · effort`.
-  At most one temporary notice replaces it until the next user action.
+- The bottom line shows `directory (branch)`, context fill, cost, quota, and cache-hit rate on the
+  left, and `model (account) · Effort: level` on the right. At most one temporary notice replaces it
+  until the next user action.
+- A narrow window gives up those parts in one fixed order, least useful first, and each part goes
+  whole with its label. The context gauge never goes.
+- The branch comes from the `HEAD` file of the repository, never from the git command. pith re-reads
+  it when a turn starts and when one ends.
 - A picker is a single-choice list that tags the current value. Enter confirms, and Esc, Ctrl+C, or
   Ctrl+D cancels.
 - The closed input frame grows to about a quarter of the screen and labels hidden rows "↑ Hidden: N"

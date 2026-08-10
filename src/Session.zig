@@ -53,6 +53,19 @@ effort_shown: ai.llm.Effort,
 /// The active account. It mirrors the agent after a command runs. Null shows a
 /// signed-out indicator. The model and effort are then stale placeholders.
 account_shown: ?ai.llm.Account,
+/// The working directory the status line shows, with the home directory
+/// abbreviated. It borrows `App` storage, because the working directory cannot
+/// change while pith runs. Empty hides the whole part.
+directory_shown: []const u8,
+/// The repository root that `App` re-reads the head from, or null outside a
+/// repository. It belongs to the place the status line shows, next to the
+/// directory and the branch it produces.
+branch_root: ?[]const u8,
+/// The branch of the project. `App` refreshes it, and the bytes live here so
+/// that `paint` needs no io. Empty outside a repository, and empty for a head
+/// Pith cannot read.
+branch_buffer: [ai.project.head_name_bytes_max]u8,
+branch_length: usize,
 /// Steering submitted during a turn, in chronological order, as detached editor
 /// drafts. Recall can then restore live placeholder markers. The plain queue is
 /// a suffix of this list. Consumed drafts remain owned until the terminal
@@ -230,6 +243,10 @@ pub fn init(
         .model_shown = model,
         .effort_shown = effort,
         .account_shown = .anthropic_subscription,
+        .directory_shown = "",
+        .branch_root = null,
+        .branch_buffer = undefined,
+        .branch_length = 0,
         .steering = .empty,
         .steering_retained_count = 0,
         .steering_consumed_count = 0,
@@ -698,6 +715,23 @@ fn dropSteeringPrefix(self: *Session, count: usize) void {
     }
 }
 
+/// Show `name` as the branch of the project. An empty name, or one longer than
+/// the buffer, leaves the status line with the directory alone. `App` reads the
+/// name, so the copy keeps `paint` free of io.
+pub fn setBranch(self: *Session, name: []const u8) void {
+    const value = if (name.len > self.branch_buffer.len) "" else name;
+    if (std.mem.eql(u8, self.branch_buffer[0..self.branch_length], value)) return;
+    @memcpy(self.branch_buffer[0..value.len], value);
+    self.branch_length = value.len;
+    self.dirty = true;
+}
+
+/// The branch of the project, or null when Pith found none.
+pub fn branch(self: *const Session) ?[]const u8 {
+    if (self.branch_length == 0) return null;
+    return self.branch_buffer[0..self.branch_length];
+}
+
 /// Free the finished turn's tool state and return to prompt mode.
 pub fn endTurn(self: *Session) void {
     if (self.activeTurn()) |turn| self.freeTurn(turn);
@@ -722,6 +756,8 @@ pub fn paint(self: *Session, size: terminal.View.Size) !void {
     }
 
     const status: ui.status.Info = .{
+        .directory = self.directory_shown,
+        .branch = self.branch(),
         .last = self.stats_shown.last,
         .cost = self.stats_shown.cost,
         .context_window = self.model_shown.context_window,

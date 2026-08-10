@@ -59,6 +59,10 @@ default_models: Config.DefaultModels,
 /// The machine-local choices of this project: read once at startup, written
 /// whenever the account, the model, or the effort level changes.
 state: State,
+/// The working directory the status line shows, with the home directory
+/// abbreviated to `~`. Owned, and fixed for the session, because pith never
+/// changes its working directory.
+directory_label: []const u8,
 /// Project instructions, skill metadata, and the composed prompt. All outlive
 /// the agent, which borrows `prompt`.
 project_instructions: ai.instructions.Result,
@@ -318,6 +322,62 @@ fn validateWorkingDirectory(gpa: std.mem.Allocator, path: []const u8) !void {
     return error.WorkingDirectoryNotUtf8;
 }
 
+/// `directory` with `home` written as `~`, which is what the status line shows.
+/// A directory outside the home directory keeps its own path. The result is
+/// owned.
+fn directoryLabel(
+    gpa: std.mem.Allocator,
+    directory: []const u8,
+    home: []const u8,
+) ![]const u8 {
+    const label = if (ai.project.contains(&.{ .boundary = home, .target = directory })) home: {
+        // A home directory that is a root already ends with the separator, so a
+        // directory below it keeps that separator rather than losing it to the
+        // `~`. The root itself is the whole label, so it keeps nothing.
+        const below_root = directory.len > home.len and std.fs.path.isSep(home[home.len - 1]);
+        const cut = if (below_root) home.len - 1 else home.len;
+        break :home try std.fmt.allocPrint(gpa, "~{s}", .{directory[cut..]});
+    } else try gpa.dupe(u8, directory);
+    if (label.len <= ui.status.directory_bytes_max) return label;
+    defer gpa.free(label);
+    // The status line shows an identity, not a whole path, so a long path keeps
+    // its tail. The start moves onto a display boundary, so the cut never splits
+    // a grapheme cluster.
+    const marker = "…";
+    const budget = ui.status.directory_bytes_max - marker.len;
+    const start = terminal.width.boundaryAtOrAfter(label, label.len - budget);
+    return std.fmt.allocPrint(gpa, "{s}{s}", .{ marker, label[start..] });
+}
+
+/// The canonical home directory. The label compares it with the canonical
+/// working directory, so a symbolic link inside `HOME` must resolve first. A home
+/// directory Pith cannot resolve keeps its lexical path, which then simply does
+/// not match, and the status line shows the whole working directory.
+fn homeDirectory(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    working_directory: []const u8,
+    home: []const u8,
+) ![]u8 {
+    const resolved = try std.fs.path.resolve(gpa, &.{ working_directory, home });
+    errdefer gpa.free(resolved);
+    // The canonical path carries a sentinel, so it becomes a plain copy that the
+    // caller frees like every other path here.
+    const canonical = std.Io.Dir.realPathFileAbsoluteAlloc(io, resolved, gpa) catch return resolved;
+    defer gpa.free(canonical);
+    const owned = try gpa.dupe(u8, canonical);
+    gpa.free(resolved);
+    return owned;
+}
+
+/// Read the branch of the project and show it on the status line. Display only:
+/// a repository whose head Pith cannot read leaves the directory standing alone.
+fn refreshBranch(self: *App) void {
+    const root = self.session.branch_root orelse return self.session.setBranch("");
+    const maybe_head = ai.project.head(self.gpa, self.io, root);
+    if (maybe_head) |value| self.session.setBranch(value.name()) else self.session.setBranch("");
+}
+
 /// Wire up the tty, agent, and session, then run the interactive loop until the
 /// user quits or stdin closes. When no account is authenticated the session
 /// starts signed out and the login picker opens so the user signs in. Pin the
@@ -356,6 +416,11 @@ pub fn run(
     self.accounts = try ai.Accounts.init(gpa, io, home, config.timeouts, api_keys);
     defer self.accounts.deinit();
     self.default_models = config.default_models;
+
+    const home_directory = try homeDirectory(gpa, io, cwd, home);
+    defer gpa.free(home_directory);
+    self.directory_label = try directoryLabel(gpa, cwd, home_directory);
+    defer gpa.free(self.directory_label);
 
     self.project_instructions = try ai.instructions.discover(gpa, io, cwd);
     defer self.project_instructions.deinit();
@@ -424,6 +489,9 @@ pub fn run(
     self.session = Session.init(gpa, self.tty.writer(), self.agent.model, self.agent.effort);
     defer self.session.deinit();
     self.session.account_shown = active;
+    self.session.directory_shown = self.directory_label;
+    self.session.branch_root = self.project_instructions.projectRoot();
+    self.refreshBranch();
     self.input = terminal.Input.init(gpa);
     defer self.input.deinit();
 
@@ -573,6 +641,8 @@ fn freeWorkerResult(self: *App, result: *const WorkerResult) void {
 /// only after a completion. A failure returns uncommitted drafts to the editor.
 fn finishWorkerResult(self: *App, result: *const WorkerResult) !void {
     self.session.stats_shown = self.agent.stats;
+    // A turn can check out another branch, so the status line settles here.
+    self.refreshBranch();
     switch (result.outcome.disposition) {
         .completed => {
             try self.session.endTurnWithReceipt(&result.outcome.receipt);
@@ -1036,6 +1106,8 @@ fn cancelTurn(self: *App) !void {
             // A queued usage snapshot can predate usage recorded while cancellation
             // unwound the provider stream. The joined agent state wins.
             self.session.stats_shown = self.agent.stats;
+            // A canceled turn can leave another branch checked out behind it.
+            self.refreshBranch();
             self.session.cancelReceipt(receipt, result.progress_sequence_committed);
             self.agent.steering.clear();
             if (committed) {
@@ -1222,6 +1294,9 @@ fn runTurn(self: *App, text: []const u8) !void {
     // worker result, so a successor can never overwrite terminal ownership.
     std.debug.assert(self.turn_future == null);
     std.debug.assert(self.pending_turn_result == null);
+    // The user can check out another branch between two turns, so the label is
+    // true at the moment the turn starts.
+    self.refreshBranch();
     const generation = try self.reserveTurnGeneration();
     const owned = try self.gpa.dupe(u8, text);
     errdefer self.gpa.free(owned);
@@ -3881,6 +3956,116 @@ test "the startup report counts the sources in one line and keeps a skip verbose
     // A source that skipped something stays verbose, because the user must fix it.
     try std.testing.expect(blocks[1].event.is_error);
     try std.testing.expect(std.mem.indexOf(u8, blocks[1].event.text.items, "missing.md") != null);
+}
+
+test directoryLabel {
+    const gpa = std.testing.allocator;
+    const home = try directoryLabel(gpa, "/home/clemens", "/home/clemens");
+    defer gpa.free(home);
+    try std.testing.expectEqualStrings("~", home);
+
+    const inside = try directoryLabel(gpa, "/home/clemens/github/pith", "/home/clemens");
+    defer gpa.free(inside);
+    try std.testing.expectEqualStrings("~/github/pith", inside);
+
+    // A sibling that shares a name prefix is not inside the home directory.
+    const outside = try directoryLabel(gpa, "/home/clemens2/work", "/home/clemens");
+    defer gpa.free(outside);
+    try std.testing.expectEqualStrings("/home/clemens2/work", outside);
+
+    // A home directory that is a root already ends with the separator, which the
+    // directory below it keeps and the root itself does not.
+    const below_root = try directoryLabel(gpa, "/work", "/");
+    defer gpa.free(below_root);
+    try std.testing.expectEqualStrings("~/work", below_root);
+
+    const root = try directoryLabel(gpa, "/", "/");
+    defer gpa.free(root);
+    try std.testing.expectEqualStrings("~", root);
+
+    // A long path keeps its tail, and the cut lands on a display boundary.
+    const capped = try directoryLabel(gpa, "/ä" ** 80, "/home");
+    defer gpa.free(capped);
+    try std.testing.expect(capped.len <= ui.status.directory_bytes_max);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(capped));
+    try std.testing.expect(std.mem.startsWith(u8, capped, "…"));
+    try std.testing.expect(std.mem.endsWith(u8, capped, "/ä"));
+
+    // A grapheme cluster survives the cut whole. Each flag is two code points,
+    // and the tail holds only whole flags.
+    const flag = "/🇩🇪";
+    const flags = try directoryLabel(gpa, flag ** 20, "/home");
+    defer gpa.free(flags);
+    try std.testing.expect(flags.len <= ui.status.directory_bytes_max);
+    try std.testing.expect(std.mem.startsWith(u8, flags, "…/🇩🇪"));
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        (flags.len - "…".len) % flag.len,
+    );
+}
+
+test homeDirectory {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const real = try tmpPath(gpa, io, &tmp, "real");
+    defer gpa.free(real);
+    var real_directory = try std.Io.Dir.cwd().createDirPathOpen(io, real, .{});
+    real_directory.close(io);
+    try tmp.dir.symLink(io, real, "link", .{});
+    const link = try tmpPath(gpa, io, &tmp, "link");
+    defer gpa.free(link);
+
+    // A symbolic link in HOME resolves, so the label can compare it with the
+    // canonical working directory.
+    const canonical = try homeDirectory(gpa, io, "/", link);
+    defer gpa.free(canonical);
+    try std.testing.expectEqualStrings(real, canonical);
+
+    // A home directory that does not exist keeps its lexical path.
+    const missing = try homeDirectory(gpa, io, "/work", "../elsewhere");
+    defer gpa.free(missing);
+    try std.testing.expectEqualStrings("/elsewhere", missing);
+}
+
+test refreshBranch {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var marker = try tmp.dir.createDirPathOpen(io, ".git", .{});
+    marker.close(io);
+    try tmp.dir.writeFile(io, .{ .sub_path = ".git/HEAD", .data = "ref: refs/heads/topic\n" });
+    const root = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(root);
+
+    var app: App = undefined;
+    app.gpa = gpa;
+    app.io = io;
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+
+    // Outside a repository the status line shows the directory alone.
+    app.refreshBranch();
+    try std.testing.expect(app.session.branch() == null);
+    try std.testing.expect(!app.session.dirty);
+
+    app.session.branch_root = root;
+    app.refreshBranch();
+    try std.testing.expectEqualStrings("topic", app.session.branch().?);
+    // A changed branch repaints, and an unchanged one does not.
+    try std.testing.expect(app.session.dirty);
+    app.session.dirty = false;
+    app.refreshBranch();
+    try std.testing.expect(!app.session.dirty);
+
+    // A head Pith cannot read leaves the directory standing alone.
+    try tmp.dir.writeFile(io, .{ .sub_path = ".git/HEAD", .data = "garbage\n" });
+    app.refreshBranch();
+    try std.testing.expect(app.session.branch() == null);
 }
 
 test "a startup with no guidance and no skipped file reports nothing" {
