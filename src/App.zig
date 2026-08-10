@@ -921,16 +921,16 @@ fn editKey(self: *App, event: *const terminal.Input.Key) !bool {
 }
 
 /// Keys during a streaming turn. The editor stays live for steering: the user can
-/// type and edit, Enter queues a steering message, and Alt+Up recalls the queue
+/// type and edit, Enter queues a steering message, and Ctrl+P recalls the queue
 /// into the editor. Esc or Ctrl+C cancels the turn.
 fn handleTurnKey(self: *App, event: *const terminal.Input.Key) !void {
     if (try self.editKey(event)) return;
     switch (event.*) {
         .enter => try self.submitSteering(),
-        .alt_up => try self.pullSteering(),
         .escape => try self.cancelTurn(),
         .ctrl => |letter| switch (letter) {
             'c' => try self.cancelTurn(),
+            'p' => try self.pullSteering(),
             else => {},
         },
         else => {},
@@ -958,7 +958,7 @@ fn submitSteering(self: *App) !void {
     self.session.dirty = true;
 }
 
-/// Alt+Up during a turn: pull the pending steering back into the editor as live
+/// Ctrl+P during a turn: pull the pending steering back into the editor as live
 /// placeholder drafts, after any in-progress line. Content comes from the mirror,
 /// so a paste returns as its marker, not expanded text. The channel gives only
 /// the count that selects the mirror's pending suffix. The remaining prefix stays
@@ -2053,7 +2053,7 @@ test "cancel restores steering before event allocation failure" {
     try std.testing.expectEqual(@as(usize, 0), taken.len);
 }
 
-test "alt+up recalls the steering queue after in-progress editor text" {
+test "ctrl+p recalls the steering queue after in-progress editor text" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -2078,12 +2078,13 @@ test "alt+up recalls the steering queue after in-progress editor text" {
     try app.submitSteering();
     try app.session.editor.insert("draft");
 
-    try app.pullSteering();
+    // Through the key binding, so the turn-mode route to the pull stays covered.
+    try app.handleKey(&.{ .ctrl = 'p' });
     try std.testing.expectEqualStrings("draft\n\nfix it\n\nand test", app.session.editor.visible());
     try std.testing.expectEqual(@as(usize, 0), app.session.steering.items.len);
 }
 
-test "alt+up restores a steered paste as a live placeholder atom" {
+test "ctrl+p restores a steered paste as a live placeholder atom" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -2230,9 +2231,9 @@ test "cancel restores a steered paste even after its consumed event applied" {
     try std.testing.expectEqual(@as(usize, 0), app.session.transcript.blocks().len);
 }
 
-// Alt+Up recalls only the pending suffix. The already folded prefix stays rich
+// Ctrl+P recalls only the pending suffix. The already folded prefix stays rich
 // but hidden until its consumed event applies or failed delivery requeues it.
-test "alt+up recalls the pending suffix and retains the in-flight prefix" {
+test "ctrl+p recalls the pending suffix and retains the in-flight prefix" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -2264,7 +2265,7 @@ test "alt+up recalls the pending suffix and retains the in-flight prefix" {
     try std.testing.expectEqual(@as(usize, 1), app.session.steering_retained_count);
 }
 
-test "cancel restores an in-flight prefix retained by alt+up" {
+test "cancel restores an in-flight prefix retained by ctrl+p" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -2773,7 +2774,7 @@ test "shutdown frees the worker result without restoring or recording an event" 
     try std.testing.expect(app.turn_future == null);
 }
 
-test "a delayed consumed event after alt+up cannot remove newer steering" {
+test "a delayed consumed event after ctrl+p cannot remove newer steering" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -2812,7 +2813,7 @@ test "a delayed consumed event after alt+up cannot remove newer steering" {
             .count = 1,
         } },
     });
-    // The delayed consume marks "old" (already hidden by alt+up) consumed. It does
+    // The delayed consume marks "old" (already hidden by ctrl+p) consumed. It does
     // not hide the newer pending "new", which stays visible behind the hidden prefix.
     try std.testing.expectEqual(@as(usize, 1), app.session.steering_retained_count);
     try std.testing.expectEqual(@as(usize, 2), app.session.steering.items.len);
@@ -2825,7 +2826,7 @@ test "a delayed consumed event after alt+up cannot remove newer steering" {
     try std.testing.expectEqualStrings("new", app.session.editor.visible());
 }
 
-test "a delivery restored after alt+up recalls its retained rich drafts" {
+test "a delivery restored after ctrl+p recalls its retained rich drafts" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var out: std.Io.Writer.Allocating = .init(gpa);

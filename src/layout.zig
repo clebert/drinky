@@ -405,7 +405,7 @@ test "a turn tail shows the steering queue above the editor" {
 
     const first = std.mem.indexOf(u8, painted, "fix the bug").?;
     const second = std.mem.indexOf(u8, painted, "then add a test").?;
-    const hint = std.mem.indexOf(u8, painted, "Alt+Up").?;
+    const hint = std.mem.indexOf(u8, painted, "Ctrl+P").?;
     const footer = std.mem.indexOf(u8, painted, "footerqq").?;
     try std.testing.expect(std.mem.indexOf(u8, painted, "not this row") == null);
     try std.testing.expect(first < second);

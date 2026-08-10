@@ -60,13 +60,13 @@ account_shown: ?ai.llm.Account,
 steering: std.ArrayList(ui.Editor.Draft),
 /// Leading drafts hidden from the compact queue view because the worker has
 /// taken them. A taken draft is consumed into the running turn, or in flight
-/// after an Alt+Up take that did not return it. Consumption never destroys
+/// after a Ctrl+P take that did not return it. Consumption never destroys
 /// their rich drafts, so a rolled-back batch remains recoverable. The terminal
 /// receipt resolves them. Always at most `steering.items.len`.
 steering_retained_count: usize,
 /// Leading drafts the worker has reported as consumed (≤ `steering_retained_count`
 /// and the source of it on consumption). The count is cumulative, so a delayed
-/// consumed event does not double-count drafts an Alt+Up already hid.
+/// consumed event does not double-count drafts a Ctrl+P already hid.
 steering_consumed_count: usize,
 /// Borrowed compact `Queued message:` rows: each non-retained draft's collapsed
 /// visible text. Each paint rebuilds them, so the tail gets a
@@ -338,7 +338,7 @@ pub fn applyTurnEvent(self: *Session, event: *const TurnEvent) !bool {
             // event — decides whether to drop or recover each draft.
             try self.transcript.append(.user, false, consumed.text);
             // Advance the consumed frontier, then the view frontier to cover it,
-            // without double-counting drafts an earlier Alt+Up already hid.
+            // without double-counting drafts an earlier Ctrl+P already hid.
             self.steering_consumed_count =
                 @min(self.steering_consumed_count + consumed.count, self.steering.items.len);
             self.steering_retained_count =

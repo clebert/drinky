@@ -706,7 +706,7 @@ pub fn steering(placement: *const Placement, messages: []const []const u8) !void
     }
     var hint_placement = placement.*;
     hint_placement.base = line;
-    const hint = "\u{21B3} Alt+Up: Edit all queued messages";
+    const hint = "\u{21B3} Ctrl+P: Edit all queued messages";
     try notice(&hint_placement, &.{ .style = .dim, .prefix = "" }, hint);
 }
 

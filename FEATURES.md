@@ -14,7 +14,7 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - Read-only tool calls in one reply run in parallel. A mutating call — write, edit, or bash — runs
   alone, in call order.
 - Enter during a turn queues a steering message that folds into the run at the next tool round.
-- Alt+Up pulls messages the turn has not picked up yet back into the editor to keep editing.
+- Ctrl+P pulls messages the turn has not picked up yet back into the editor to keep editing.
 - Steering left in the queue when a turn completes starts the next turn on its own.
 - Esc or Ctrl+C cancels a turn. Canceled or failed turns keep finished rounds, drop the in-flight
   tail, and return uncommitted text to the editor.
