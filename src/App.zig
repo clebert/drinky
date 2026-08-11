@@ -374,8 +374,8 @@ fn homeDirectory(
 /// a repository whose head Pith cannot read leaves the directory standing alone.
 fn refreshBranch(self: *App) void {
     const root = self.session.branch_root orelse return self.session.setBranch("");
-    const maybe_head = ai.project.head(self.gpa, self.io, root);
-    if (maybe_head) |value| self.session.setBranch(value.name()) else self.session.setBranch("");
+    var maybe_head = ai.project.head(self.gpa, self.io, root);
+    if (maybe_head) |*head| self.session.setBranch(head.name()) else self.session.setBranch("");
 }
 
 /// Wire up the tty, agent, and session, then run the interactive loop until the

@@ -73,15 +73,15 @@ pub fn findBoundary(
     return .{ .path = working_directory, .has_root = false };
 }
 
-/// The longest head name Pith shows. A longer name reads as no head at all.
-pub const head_name_bytes_max = 64;
+/// A marker file or a `HEAD` file above this size holds no head Pith can use.
+const head_file_bytes_max = 4096;
+
+/// The longest head name Pith retains. The status line can abbreviate this name.
+pub const head_name_bytes_max = head_file_bytes_max;
 
 /// The number of characters of an object name that a detached head shows. Git
 /// itself prints seven.
 const object_name_columns = 7;
-
-/// A marker file or a `HEAD` file above this size holds no head Pith can use.
-const head_file_bytes_max = 4096;
 
 /// The head of one repository: a branch name, or the short object name of a
 /// detached head. It carries its own bytes, so the caller owns nothing.
@@ -99,7 +99,7 @@ pub const Head = struct {
 /// the branch that a command in this directory would act on.
 ///
 /// Null when `root` holds no repository, when Pith cannot read the head, or when
-/// the head names nothing a row can show. Nothing here is authoritative, so every
+/// the head has no valid display name. Nothing here is authoritative, so every
 /// failure reads as no head at all.
 pub fn head(gpa: std.mem.Allocator, io: std.Io, root: []const u8) ?Head {
     const directory = headDirectory(gpa, io, root) orelse return null;
@@ -173,11 +173,9 @@ fn objectName(text: []const u8) bool {
     return true;
 }
 
-/// `text` as a head name, or null when it holds nothing a row can show. A name
-/// that does not fit reads as no head, rather than as a cut name that would show
-/// a branch which does not exist. This module also has no grapheme table, so it
-/// cannot cut one safely. A control byte or invalid UTF-8 rejects the whole name,
-/// because the head of a repository must read as itself.
+/// `text` as a head name, or null when it has no valid bounded display name.
+/// This layer keeps the complete name. The interface can abbreviate it at a
+/// grapheme boundary. A control byte or invalid UTF-8 rejects the complete name.
 fn headName(text: []const u8) ?Head {
     if (text.len == 0 or text.len > head_name_bytes_max) return null;
     if (!std.unicode.utf8ValidateSlice(text)) return null;
@@ -325,13 +323,14 @@ test headName {
     try std.testing.expect(headName("\xff\xfe") == null);
     try std.testing.expectEqualStrings("wörk", headName("wörk").?.name());
 
-    // A name that fills the buffer exactly still shows.
+    // A name above the old 64-byte display limit stays available to the interface.
+    const long_unicode = "ä" ** 40;
+    try std.testing.expectEqualStrings(long_unicode, headName(long_unicode).?.name());
+
+    // A name that fills the bounded `HEAD` storage exactly still survives.
     const longest = "b" ** head_name_bytes_max;
     try std.testing.expectEqualStrings(longest, headName(longest).?.name());
-    // One byte more reads as no head, because a cut name would show a branch
-    // that does not exist, and a cut can split a grapheme cluster.
     try std.testing.expect(headName(longest ++ "b") == null);
-    try std.testing.expect(headName("ä" ** 40) == null);
 }
 
 test head {

@@ -3,8 +3,8 @@
 //! the right. A notice temporarily replaces the line. The renderer uses a
 //! caller-built `Info` snapshot.
 //!
-//! A narrow window gives up parts in one fixed order, so the same part always
-//! goes first and the layout never reshuffles. The context gauge never goes.
+//! A narrow window first shortens fields in one fixed order. It then removes
+//! complete parts in another fixed order. The context percentage never goes.
 
 const std = @import("std");
 
@@ -20,7 +20,7 @@ pub const Info = struct {
     /// identity and not a whole path. Empty hides the directory and its branch.
     directory: []const u8,
     /// The branch of the repository, or null outside one and for a head that
-    /// Pith could not read.
+    /// Pith could not read. The caller bounds it at `ai.project.head_name_bytes_max`.
     branch: ?[]const u8,
     last: ai.llm.Usage,
     cost: f64,
@@ -56,10 +56,14 @@ const account_close = ")";
 /// Separates one part of the line from the next.
 const separator = " · ";
 
-/// The parts the line shows. `all` is what a wide window gets, and `reductions`
-/// takes them away one at a time.
+/// The compact branch keeps at most this many display columns before its mark.
+const branch_prefix_columns_max = 16;
+
+/// The parts the line shows. `all` is what a wide window gets. Each reduction
+/// selects a shorter form or removes one complete part.
 const Parts = struct {
     place: Place,
+    branch: Branch,
     context: Context,
     cost: bool,
     quota_primary: bool,
@@ -68,8 +72,11 @@ const Parts = struct {
     account: bool,
     effort: bool,
 
-    /// The directory and its branch: whole, its last component alone, or gone.
+    /// The directory: whole, its last component alone, or gone with its branch.
     const Place = enum { full, short, hidden };
+
+    /// The branch: whole, or its first bounded prefix with an ellipsis.
+    const Branch = enum { full, short };
 
     /// The context gauge: with its token counts, or the percentage alone. It has
     /// no hidden form, because the fill of the window drives what the user does
@@ -78,6 +85,7 @@ const Parts = struct {
 
     const all: Parts = .{
         .place = .full,
+        .branch = .full,
         .context = .full,
         .cost = true,
         .quota_primary = true,
@@ -88,43 +96,46 @@ const Parts = struct {
     };
 };
 
-/// The order in which the line gives up its parts, least useful first. The cache
-/// rate is a curiosity, an allowance is a hard stop, and the two identities —
-/// where the work happens, and which model reads it — go last.
+/// Shorten each field before any complete part goes. The cache rate goes first
+/// after that. The cost goes before either quota because an allowance is a hard
+/// stop. The account, place, and effort go after all session numbers.
 const reductions = [_]Reduction{
+    .shorten_directory,
+    .shorten_branch,
+    .shorten_context,
     .drop_cache,
+    .drop_cost,
     .drop_quota_secondary,
     .drop_quota_primary,
-    .shorten_place,
-    .drop_cost,
     .drop_account,
     .drop_place,
-    .shorten_context,
     .drop_effort,
 };
 
 const Reduction = enum {
+    shorten_directory,
+    shorten_branch,
+    shorten_context,
     drop_cache,
+    drop_cost,
     drop_quota_secondary,
     drop_quota_primary,
-    shorten_place,
-    drop_cost,
     drop_account,
     drop_place,
-    shorten_context,
     drop_effort,
 };
 
 fn reduce(parts: *Parts, reduction: Reduction) void {
     switch (reduction) {
+        .shorten_directory => parts.place = .short,
+        .shorten_branch => parts.branch = .short,
+        .shorten_context => parts.context = .short,
         .drop_cache => parts.cache = false,
+        .drop_cost => parts.cost = false,
         .drop_quota_secondary => parts.quota_secondary = false,
         .drop_quota_primary => parts.quota_primary = false,
-        .shorten_place => parts.place = .short,
-        .drop_cost => parts.cost = false,
         .drop_account => parts.account = false,
         .drop_place => parts.place = .hidden,
-        .shorten_context => parts.context = .short,
         .drop_effort => parts.effort = false,
     }
 }
@@ -143,11 +154,10 @@ pub fn render(placement: *const paint.Placement, info: *const Info) !void {
         }, notice.text[0..line_end]);
     }
 
-    // Sized so `catch unreachable` is sound. On the left: `directory_bytes_max`
-    // and a branch of at most 64 bytes, plus the percent, token, cost, and quota
-    // formats, which produce a few dozen characters for any input. On the right:
-    // a model name and an account label, which the compiled tables bound.
-    var left_scratch: [512]u8 = undefined;
+    // Sized so `catch unreachable` is sound. The branch can fill one bounded
+    // `HEAD` file. The remaining space holds the directory and every number.
+    // The compiled tables bound the model name and the account label.
+    var left_scratch: [ai.project.head_name_bytes_max + 512]u8 = undefined;
     var right_scratch: [192]u8 = undefined;
     var parts: Parts = .all;
     var left_line: []const u8 = "";
@@ -202,7 +212,7 @@ fn writeRight(out: *std.Io.Writer, info: *const Info, parts: *const Parts) !void
 /// later part can carry its own leading separator.
 fn writeLeft(out: *std.Io.Writer, info: *const Info, parts: *const Parts) !void {
     if (parts.place != .hidden and info.directory.len > 0) {
-        try writePlace(out, info, parts.place);
+        try writePlace(out, info, parts);
         try out.writeAll(separator);
     }
     try writeContext(out, info, parts.context);
@@ -221,9 +231,13 @@ fn writeLeft(out: *std.Io.Writer, info: *const Info, parts: *const Parts) !void 
 /// The working directory, and the branch that a command here would act on. A
 /// path names itself, so it takes no label. The branch follows it in brackets,
 /// the same shape the agent takes on the right.
-fn writePlace(out: *std.Io.Writer, info: *const Info, place: Parts.Place) !void {
-    try writeDirectory(out, info.directory, place);
-    if (info.branch) |branch| try out.print(" ({s})", .{branch});
+fn writePlace(out: *std.Io.Writer, info: *const Info, parts: *const Parts) !void {
+    try writeDirectory(out, info.directory, parts.place);
+    if (info.branch) |branch| {
+        try out.writeAll(" (");
+        try writeBranch(out, branch, parts.branch);
+        try out.writeByte(')');
+    }
 }
 
 /// The short form keeps the last component alone, behind a `…/` mark and the home
@@ -241,6 +255,21 @@ fn writeDirectory(out: *std.Io.Writer, directory: []const u8, place: Parts.Place
     try out.writeAll(home_prefix);
     try out.writeAll(mark);
     try out.writeAll(base);
+}
+
+/// The short form keeps a bounded prefix and adds an ellipsis. A branch stays
+/// whole when the marked form does not save columns. The prefix ends at a
+/// grapheme boundary.
+fn writeBranch(out: *std.Io.Writer, branch: []const u8, form: Parts.Branch) !void {
+    if (form != .short) return out.writeAll(branch);
+    const prefix = terminal.width.truncate(branch, branch_prefix_columns_max);
+    const mark = "…";
+    const short_columns = terminal.width.ofText(prefix) + terminal.width.ofText(mark);
+    if (prefix.len == branch.len or short_columns >= terminal.width.ofText(branch)) {
+        return out.writeAll(branch);
+    }
+    try out.writeAll(prefix);
+    try out.writeAll(mark);
 }
 
 /// Context now: the last request's whole prompt plus its output, against the
@@ -384,7 +413,7 @@ test render {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    try renderForTest(gpa, &test_info, 160, &out);
+    try renderForTest(gpa, &test_info, 200, &out);
 
     const painted = out.written();
     // The place and the agent read as the same shape: a thing, and the context
@@ -394,10 +423,10 @@ test render {
         "Context: 21% (206k/1.0M)",
         "Cost: $0.39",
         "5h quota: 88% remaining",
+        "Weekly quota: 26% remaining",
+        "Cache: 87%",
         "claude-opus-4-8 (Anthropic Subscription) · Effort: xhigh",
     });
-    // Not even 160 columns hold every part, so the two least useful ones go.
-    try expectHides(painted, &.{ "Cache:", "Weekly quota" });
     // The place anchors the left, and the agent anchors the right.
     const place = std.mem.indexOf(u8, painted, "~/github").?;
     const context = std.mem.indexOf(u8, painted, "Context:").?;
@@ -405,38 +434,60 @@ test render {
     try std.testing.expect(context < std.mem.indexOf(u8, painted, "claude-opus-4-8").?);
 }
 
-test "a narrower window gives up its parts in one fixed order" {
+test "a narrow window shortens fields before it gives up parts" {
     const gpa = std.testing.allocator;
-    // Each step keeps what the wider step kept, minus the next part in the order.
     const steps = [_]struct {
         columns: usize,
         shows: []const []const u8,
         hides: []const []const u8,
     }{
         .{
-            .columns = 140,
-            .shows = &.{ "~/github/clebert/pith (main)", "Context: 21% (206k/1.0M)", "Cost: $" },
-            .hides = &.{ "quota", "Cache:" },
-        },
-        .{
-            .columns = 120,
-            .shows = &.{ "~/…/pith (main)", "Context: 21% (206k/1.0M)", "Cost: $" },
+            // The directory shortens before any complete part goes.
+            .columns = 190,
+            .shows = &.{ "~/…/pith (main)", "Context: 21% (206k/1.0M)", "Cache: 87%" },
             .hides = &.{"~/github"},
         },
         .{
+            // The context gauge shortens before any complete part goes.
+            .columns = 170,
+            .shows = &.{ "Context: 21%", "Cost: $0.39", "Weekly quota", "Cache: 87%" },
+            .hides = &.{"(206k/1.0M)"},
+        },
+        .{
+            .columns = 160,
+            .shows = &.{ "Cost: $0.39", "5h quota", "Weekly quota" },
+            .hides = &.{"Cache:"},
+        },
+        .{
+            // Both quotas outlast the cost.
+            .columns = 150,
+            .shows = &.{ "5h quota", "Weekly quota" },
+            .hides = &.{ "Cost:", "Cache:" },
+        },
+        .{
+            .columns = 140,
+            .shows = &.{ "5h quota", "Anthropic Subscription" },
+            .hides = &.{ "Weekly quota", "Cost:", "Cache:" },
+        },
+        .{
+            .columns = 110,
+            .shows = &.{ "~/…/pith (main)", "Anthropic Subscription", "Effort: xhigh" },
+            .hides = &.{"quota"},
+        },
+        .{
             .columns = 80,
-            .shows = &.{ "~/…/pith (main)", "Context: 21% (206k/1.0M)", "Effort: xhigh" },
-            .hides = &.{ "Cost:", "Anthropic Subscription" },
+            .shows = &.{ "~/…/pith (main)", "claude-opus-4-8", "Effort: xhigh" },
+            .hides = &.{"Anthropic Subscription"},
         },
         .{
             .columns = 60,
-            .shows = &.{ "Context: 21% (206k/1.0M)", "claude-opus-4-8", "Effort: xhigh" },
+            .shows = &.{ "Context: 21%", "claude-opus-4-8", "Effort: xhigh" },
             .hides = &.{"pith"},
         },
         .{
             .columns = 40,
             .shows = &.{ "Context: 21%", "claude-opus-4-8" },
-            .hides = &.{ "(206k/1.0M)", "Effort:" },
+            .hides = &.{ "pith", "Effort:" },
         },
     };
 
@@ -447,8 +498,7 @@ test "a narrower window gives up its parts in one fixed order" {
         const painted = out.written();
         try expectShows(painted, step.shows);
         try expectHides(painted, step.hides);
-        // A part goes away whole. Its label never survives its value, and its
-        // value never survives its label.
+        // A part goes away whole. Its label and value always go together.
         try std.testing.expectEqual(
             std.mem.indexOf(u8, painted, "Effort:") != null,
             std.mem.indexOf(u8, painted, "xhigh") != null,
@@ -470,7 +520,7 @@ test "the context gauge survives every width" {
     }
 }
 
-test "shortening the place never costs columns" {
+test "shortening the directory never costs columns" {
     const gpa = std.testing.allocator;
     var info = test_info;
     // The mark and the home prefix cost more than this path spends on its own
@@ -495,13 +545,35 @@ test "shortening the place never costs columns" {
     try expectHides(plain_out.written(), &.{"…"});
 }
 
+test "a long branch keeps 16 columns and a whole grapheme" {
+    const gpa = std.testing.allocator;
+    var info = test_info;
+    // Eight flags put this valid branch above the old 64-byte limit. Four flags
+    // fill the compact prefix after `feature/` without splitting a flag.
+    info.branch = "feature/" ++ "🇩🇪" ** 8;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try renderForTest(gpa, &info, 195, &out);
+
+    const painted = out.written();
+    try expectShows(painted, &.{
+        "~/…/pith (feature/" ++ "🇩🇪" ** 4 ++ "…)",
+        "Context: 21% (206k/1.0M)",
+        "Cost: $0.39",
+        "5h quota",
+        "Weekly quota",
+        "Cache: 87%",
+    });
+    try expectHides(painted, &.{ "~/github", "🇩🇪" ** 5 });
+}
+
 test "a directory outside a repository shows without a branch" {
     const gpa = std.testing.allocator;
     var info = test_info;
     info.branch = null;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    try renderForTest(gpa, &info, 160, &out);
+    try renderForTest(gpa, &info, 200, &out);
 
     const painted = out.written();
     try expectShows(painted, &.{"~/github/clebert/pith · Context:"});
