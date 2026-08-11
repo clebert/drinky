@@ -373,13 +373,14 @@ fn activityAt(separators: *const Separators, rule: Rule, column: usize) bool {
     return false;
 }
 
-/// Start the segment at the top center. Move it one virtual cell per tick.
+/// Place the initial segment at the start of the top separator. Move its head
+/// one virtual cell per tick.
 fn activityHead(motion_tick: u64, columns: usize) usize {
     std.debug.assert(columns > 0);
     const track_columns = 2 * columns;
     const track_columns_u64: u64 = @intCast(track_columns);
     const phase: usize = @intCast(motion_tick % track_columns_u64);
-    const offset = @divFloor(columns, 2);
+    const offset = @min(activity_length_default, columns) - 1;
     const wrap_at = track_columns - offset;
     return if (phase >= wrap_at) phase - wrap_at else phase + offset;
 }
@@ -462,7 +463,7 @@ test "open separators leave the complete row available to content" {
     try std.testing.expectEqual(@as(usize, 80), frameColumns(80));
 }
 
-test "one activity segment crosses both separator seams without changing length" {
+test "one activity segment starts at the top left and crosses both separator seams" {
     const idle: Separators = .{ .columns = 20, .activity = null };
     try std.testing.expectEqual(.light, separatorCell(&idle, .top, 0).glyph);
 
@@ -470,14 +471,14 @@ test "one activity segment crosses both separator seams without changing length"
         .columns = 20,
         .activity = .{ .motion_tick = 0, .progress_age_ticks = 0 },
     };
-    try std.testing.expectEqual(.left_light_right_heavy, separatorCell(&first, .top, 5).glyph);
-    try std.testing.expectEqual(.heavy, separatorCell(&first, .top, 6).glyph);
-    try std.testing.expectEqual(.left_heavy_right_light, separatorCell(&first, .top, 10).glyph);
+    try std.testing.expectEqual(.left_light_right_heavy, separatorCell(&first, .top, 0).glyph);
+    try std.testing.expectEqual(.heavy, separatorCell(&first, .top, 1).glyph);
+    try std.testing.expectEqual(.left_heavy_right_light, separatorCell(&first, .top, 5).glyph);
     try std.testing.expect(!activityAt(&first, .bottom, 0));
 
     const top_to_bottom: Separators = .{
         .columns = 20,
-        .activity = .{ .motion_tick = 10, .progress_age_ticks = 0 },
+        .activity = .{ .motion_tick = 15, .progress_age_ticks = 0 },
     };
     try std.testing.expect(activityAt(&top_to_bottom, .top, 15));
     try std.testing.expect(activityAt(&top_to_bottom, .top, 19));
@@ -486,7 +487,7 @@ test "one activity segment crosses both separator seams without changing length"
 
     const bottom_to_top: Separators = .{
         .columns = 20,
-        .activity = .{ .motion_tick = 30, .progress_age_ticks = 0 },
+        .activity = .{ .motion_tick = 35, .progress_age_ticks = 0 },
     };
     try std.testing.expect(activityAt(&bottom_to_top, .bottom, 15));
     try std.testing.expect(activityAt(&bottom_to_top, .bottom, 19));
@@ -504,7 +505,7 @@ test "one activity segment crosses both separator seams without changing length"
 }
 
 test "activity moves across the complete virtual line" {
-    const expected = [_]usize{ 2, 3, 4, 5, 6, 7, 8, 9, 0, 1, 2 };
+    const expected = [_]usize{ 4, 5, 6, 7, 8, 9, 0, 1, 2, 3, 4 };
     for (expected, 0..) |column, tick|
         try std.testing.expectEqual(column, activityHead(tick, 5));
 
