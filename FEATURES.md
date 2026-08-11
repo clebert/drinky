@@ -96,6 +96,8 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
   The next paint drops the terminal scrollback, so the empty conversation starts on a clean screen.
 - **/system** — inspect the complete provider-neutral system prompt as rendered Markdown in a
   scrollable full-window page. `M` toggles its exact source.
+- **/colors** — preview ANSI slots 0 to 15, colored backgrounds, default styles, message boxes,
+  text roles, and input frames in a scrollable full-window page.
 - **/skill:name** — load a discovered skill explicitly, record a compact `Skill:` marker, and append
   any trailing text as its task.
 - A command runs only when its name fills the whole line. A message such as
@@ -149,7 +151,7 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
   text when the window is narrower than its smallest grid.
 - A running tool shows a pending box with its name and arguments. It then becomes a success or error
   box with a one-line stat summary. It shows the first output line when the tool gives no summary.
-- One heavy accent segment moves across both open input separators in a loop and grows as progress
+- One heavy activity segment moves across both open input separators in a loop and grows as progress
   goes quiet without adding a layout row.
 - Queued steering shows as `Queued message:` rows, and becomes one user message once consumed.
 - The bottom line shows `directory (branch)`, context fill, cost, quota, and cache-hit rate on the
@@ -163,9 +165,9 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
   Ctrl+D cancels.
 - The open input area grows to about a quarter of the screen and labels hidden rows "↑ Hidden: N"
   and "↓ Hidden: N".
-- Every color comes from the terminal: pith emits the default colors and the ANSI slots 0 to 15
-  alone. A filled box adds reverse video to one color. A label or a glyph marks every state, so
-  color is never the only signal.
+- The terminal supplies every color and the muted intensity. Pith uses the default colors, ANSI
+  slots 0 to 15, faint, and reverse video. A filled box keeps the terminal background for its text.
+  A label or a glyph marks every state, so color is never the only signal.
 - Model, tool, and user text can never emit escapes: controls and malformed UTF-8 render as
   replacement characters.
 

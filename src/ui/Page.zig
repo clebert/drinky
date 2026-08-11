@@ -1,12 +1,14 @@
 //! A temporary full-window, read-only page: one muted key-hint row above a
 //! bounded body. Pages own their source and can show rendered Markdown or the
-//! exact wrapped source. They preserve a source location across reflow.
+//! exact wrapped source. They preserve a source location across reflow. The
+//! colors presentation shows the generated color preview instead of a source.
 
 const std = @import("std");
 
 const terminal = @import("terminal");
 
 const attribute = @import("attribute.zig");
+const colors = @import("colors.zig");
 const markdown = @import("markdown.zig");
 const paint = @import("paint.zig");
 const role = @import("role.zig");
@@ -16,6 +18,7 @@ const Page = @This();
 const hint = "↑/↓: Scroll · PgUp/PgDn: Page · Home/End: Jump";
 const header_markdown = "Esc: Close · M: Source · " ++ hint;
 const header_source = "Esc: Close · M: Render · " ++ hint;
+const header_colors = "Esc: Close · " ++ hint;
 
 gpa: std.mem.Allocator,
 content: []const u8,
@@ -35,9 +38,11 @@ layout_presentation: Presentation,
 /// costs one pass over the content, so a scroll step reads it from here.
 layout_rows: usize,
 
-pub const Presentation = enum { markdown, source };
+pub const Presentation = enum { markdown, source, colors };
 
 pub const Options = struct {
+    /// The page's source. The colors presentation generates its body, so it
+    /// takes an empty content.
     content: []const u8,
     presentation: Presentation = .markdown,
 };
@@ -117,12 +122,14 @@ pub fn moveEnd(self: *Page, size: terminal.View.Size) void {
     self.setScroll(size, self.scrollMax(size));
 }
 
-/// Toggle between rendered Markdown and exact source around the same source line.
+/// Toggle between rendered Markdown and exact source around the same source
+/// line. The colors presentation has no source, so it stays in place.
 pub fn toggleSource(self: *Page, size: terminal.View.Size) void {
     self.reflow(size);
     self.presentation = switch (self.presentation) {
         .markdown => .source,
         .source => .markdown,
+        .colors => return,
     };
     self.reflow(size);
 }
@@ -137,6 +144,7 @@ pub fn render(
     switch (self.presentation) {
         .markdown => try self.renderMarkdown(placement, size),
         .source => try self.renderSource(placement, size),
+        .colors => try self.renderColors(placement, size),
     }
 }
 
@@ -145,6 +153,7 @@ fn renderHeader(self: *const Page, placement: *const paint.Placement) !void {
     const header = switch (self.presentation) {
         .markdown => header_markdown,
         .source => header_source,
+        .colors => header_colors,
     };
     placement.sink.begin();
     try role.apply(placement.sink, .muted);
@@ -166,6 +175,19 @@ fn renderMarkdown(
     try markdown.renderWindow(&body_placement, self.content, &.{
         .rows_max = bodyRows(size),
     });
+}
+
+fn renderColors(
+    self: *const Page,
+    placement: *const paint.Placement,
+    size: terminal.View.Size,
+) !void {
+    const body_base = placement.base + 1;
+    // The derived placement copies its parent. Only the geometry changes.
+    var body_placement = placement.*;
+    body_placement.base = body_base;
+    body_placement.skip = body_base + self.scroll;
+    try colors.renderWindow(&body_placement, bodyRows(size));
 }
 
 fn renderSource(
@@ -203,6 +225,7 @@ fn totalRows(self: *const Page) usize {
     return switch (self.layout_presentation) {
         .markdown => markdown.rows(self.content, columns),
         .source => terminal.width.rows(self.content, columns),
+        .colors => colors.rows(),
     };
 }
 
@@ -231,6 +254,9 @@ fn sourceAtRow(self: *const Page, row: usize) usize {
             .row = row,
         }),
         .source => self.sourceOffsetAtRow(row),
+        // A preview row maps to itself: the row count never depends on the
+        // width, so the identity keeps the exact position across a reflow.
+        .colors => row,
     };
 }
 
@@ -241,6 +267,7 @@ fn rowAtSource(self: *const Page, source_offset: usize) usize {
             .source_offset = source_offset,
         }),
         .source => self.sourceRowAtOffset(source_offset),
+        .colors => @min(source_offset, colors.rows() -| 1),
     };
 }
 
@@ -392,6 +419,40 @@ test "source rendering is bounded and sanitizes terminal controls" {
     try std.testing.expect(std.mem.indexOf(u8, painted, "third") != null);
     try std.testing.expect(std.mem.indexOf(u8, painted, "\x1b[2J") == null);
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, painted, "\r\n"));
+}
+
+test "a colors page scrolls the preview and ignores the source toggle" {
+    const gpa = std.testing.allocator;
+    var page = try Page.init(gpa, &.{ .content = "", .presentation = .colors });
+    defer page.deinit();
+    const size: terminal.View.Size = .{ .columns = 80, .rows = 12 };
+    page.reflow(size);
+
+    const top = try renderForTest(&page, size);
+    defer gpa.free(top);
+    try std.testing.expect(std.mem.indexOf(u8, top, "Esc: Close") != null);
+    try std.testing.expect(std.mem.indexOf(u8, top, "M: Source") == null);
+    try std.testing.expect(std.mem.indexOf(u8, top, "ANSI slots 0 to 15") != null);
+
+    page.toggleSource(size);
+    try std.testing.expect(page.presentation == .colors);
+
+    page.moveEnd(size);
+    try std.testing.expectEqual(colors.rows() - (size.rows - 1), page.scroll);
+    const bottom = try renderForTest(&page, size);
+    defer gpa.free(bottom);
+    try std.testing.expect(std.mem.indexOf(u8, bottom, "(Current)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bottom, "ANSI slots") == null);
+
+    // A narrow reflow keeps the exact row, because the row count is constant.
+    // The narrow window truncates the selected row, so its tail label goes.
+    const scroll = page.scroll;
+    page.reflow(.{ .columns = 24, .rows = 12 });
+    try std.testing.expectEqual(scroll, page.scroll);
+    const narrow = try renderForTest(&page, .{ .columns = 24, .rows = 12 });
+    defer gpa.free(narrow);
+    try std.testing.expect(std.mem.indexOf(u8, narrow, "The selected option") != null);
+    try std.testing.expect(std.mem.indexOf(u8, narrow, "(Current)") == null);
 }
 
 test "a one-row page renders only its header" {

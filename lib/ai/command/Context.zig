@@ -44,6 +44,8 @@ pub const Outcome = union(enum) {
     new_conversation,
     /// Show the complete provider-neutral system prompt assembled by the app.
     show_system_prompt,
+    /// Show the color preview page that samples every color the app can emit.
+    show_colors,
 
     pub const Severity = enum { information, warning, failure };
 

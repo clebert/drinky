@@ -1,22 +1,31 @@
 //! The app's presentation roles: the one seam from a semantic role to the SGR
 //! bytes a row carries. A widget names a role and never writes a color of its
-//! own.
+//! own. The `colors` preview page is the one exception: it samples the raw
+//! ANSI slots so the user can judge the theme of the terminal.
 //!
-//! Pith names no RGB value. It emits the ANSI slots 0 to 15 alone and leaves the
-//! default colors in place, so the theme of the terminal decides every value.
-//! The terminal can select values for a dark or light theme. Pith needs no
-//! palette or color configuration. Plain text writes no bytes, so it keeps the
-//! terminal foreground.
+//! Pith names no RGB value. A role emits the ANSI slots 0 to 7 and the default
+//! colors alone, so the theme of the terminal decides every value. The bright
+//! slots 8 to 15 stay out of the interface, because they do not read well in
+//! every theme. Only the preview page samples them. The terminal can select
+//! values for a dark or light theme. Pith needs no palette or color
+//! configuration. Plain text writes no bytes, so it keeps the terminal
+//! foreground. The muted role uses faint intensity with the default foreground.
+//! The terminal derives this secondary tone from its own theme. A terminal that
+//! ignores faint shows muted text at normal intensity. Underline carries
+//! emphasis because bold and faint share one intensity. Double underline keeps
+//! an existing underline distinct.
 //!
-//! A filled row takes one foreground color plus reverse video. The terminal
-//! swaps that color with its background. The box then keeps the contrast that
-//! the palette slot has against the terminal background. The color and the swap
-//! belong to one role, because either one alone can paint an unreadable row.
+//! A filled message box takes one foreground color plus reverse video. The
+//! terminal swaps that color with its background. The box then keeps the
+//! contrast that the palette slot has against the terminal background. The
+//! color and the swap belong to one role, because either one alone can paint an
+//! unreadable row. The box colors stay in the red-to-cyan slot range, because
+//! black, white, and the bright slots do not read well in every theme.
 //!
-//! Text emphasis is not a role. The `attribute` module owns the bold, italic,
-//! underline, and strikethrough operations, and the `reset` that closes them.
-//! Every widget also carries a text label or a glyph beside a role, so color is
-//! never the only signal of a state.
+//! A picker selection uses reverse video with the default colors. The
+//! `attribute` module owns inline bold, italic, underline, and strikethrough.
+//! Its `reset` closes them. Every widget also carries a text label or a glyph,
+//! so color is never the only signal of a state.
 
 const std = @import("std");
 
@@ -27,10 +36,9 @@ const terminal = @import("terminal");
 pub const Name = enum {
     /// Reply and prompt text, in the terminal foreground.
     text,
-    /// Secondary text, a key hint, a rule, and a separator.
+    /// Secondary text, a key hint, a Markdown rule, and a table border.
     muted,
-    /// A list marker, an inline code span, a skill marker, and the moving
-    /// separator segment.
+    /// A list marker, an inline code span, and a skill marker.
     accent,
     /// A Markdown heading.
     heading,
@@ -44,6 +52,10 @@ pub const Name = enum {
     @"error",
     /// A user message box.
     user,
+    /// The editor and picker frame.
+    input_frame,
+    /// The moving segment on the input frame.
+    activity,
     /// A running tool box.
     tool_pending,
     /// A finished tool box.
@@ -59,7 +71,7 @@ pub const Name = enum {
 pub fn sequence(comptime name: Name) []const u8 {
     return switch (name) {
         .text => "",
-        .muted => "\x1b[90m",
+        .muted => "\x1b[2;39m",
         .accent => "\x1b[36m",
         .heading => "\x1b[33m",
         .code => "\x1b[32m",
@@ -67,7 +79,9 @@ pub fn sequence(comptime name: Name) []const u8 {
         .warning => "\x1b[33m",
         .@"error" => "\x1b[31m",
         .user => "\x1b[35;7m",
-        .tool_pending => "\x1b[34;7m",
+        .input_frame => "\x1b[35m",
+        .activity => "\x1b[36m",
+        .tool_pending => "\x1b[36;7m",
         .tool_success => "\x1b[32;7m",
         .tool_error => "\x1b[31;7m",
         .selection => "\x1b[7m",
@@ -89,12 +103,11 @@ pub fn paints(name: Name) bool {
     return name != .text;
 }
 
-/// The SGR parameters that a role can carry: reverse video, the eight ANSI
-/// foreground slots, the default foreground, and the eight bright slots.
+/// The SGR parameters that a role can carry: faint intensity, reverse video,
+/// the eight ANSI foreground slots, and the default foreground.
 fn legalParameter(parameter: u16) bool {
-    if (parameter == 7) return true;
-    if (parameter >= 30 and parameter <= 39) return true;
-    return parameter >= 90 and parameter <= 97;
+    if (parameter == 2 or parameter == 7) return true;
+    return parameter >= 30 and parameter <= 39;
 }
 
 const Pinned = struct { name: Name, sequence: []const u8 };
@@ -116,24 +129,27 @@ fn expectSequences(pinned: []const Pinned) !void {
 test "the role map pins the SGR sequence for each role" {
     try expectSequences(&.{
         .{ .name = .text, .sequence = "" },
-        .{ .name = .muted, .sequence = "\x1b[90m" },
+        .{ .name = .muted, .sequence = "\x1b[2;39m" },
         .{ .name = .accent, .sequence = "\x1b[36m" },
         .{ .name = .heading, .sequence = "\x1b[33m" },
         .{ .name = .code, .sequence = "\x1b[32m" },
         .{ .name = .link, .sequence = "\x1b[34m" },
         .{ .name = .warning, .sequence = "\x1b[33m" },
         .{ .name = .@"error", .sequence = "\x1b[31m" },
-        // Each filled box pairs its color with the video swap. The fill and its
-        // text keep the palette slot's contrast against the terminal background.
+        // Each message box pairs one palette color with reverse video, so the
+        // fill takes the color and the text keeps the terminal background.
         .{ .name = .user, .sequence = "\x1b[35;7m" },
-        .{ .name = .tool_pending, .sequence = "\x1b[34;7m" },
+        // The input frame uses the user's foreground slot without the swap.
+        .{ .name = .input_frame, .sequence = "\x1b[35m" },
+        .{ .name = .activity, .sequence = "\x1b[36m" },
+        .{ .name = .tool_pending, .sequence = "\x1b[36;7m" },
         .{ .name = .tool_success, .sequence = "\x1b[32;7m" },
         .{ .name = .tool_error, .sequence = "\x1b[31;7m" },
         .{ .name = .selection, .sequence = "\x1b[7m" },
     });
 }
 
-test "every role paints with the ANSI slots and the default colors alone" {
+test "every role uses terminal colors and supported role attributes alone" {
     inline for (std.enums.values(Name)) |name| {
         const bytes = comptime sequence(name);
         try std.testing.expectEqual(paints(name), bytes.len > 0);

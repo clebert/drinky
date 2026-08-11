@@ -1393,6 +1393,10 @@ fn runCommand(self: *App, line: []const u8) !void {
 fn applyOutcome(self: *App, outcome: ai.command.Outcome) !void {
     switch (outcome) {
         .show_system_prompt => try self.session.openPage(&.{ .content = self.prompt }),
+        .show_colors => try self.session.openPage(&.{
+            .content = "",
+            .presentation = .colors,
+        }),
         .new_conversation => {
             self.agent.resetConversation();
             self.session.resetConversation();
@@ -3423,6 +3427,55 @@ test "/system opens the composed prompt alone and escape restores the conversati
     const conversation_bytes = out.written()[conversation_start..];
     try std.testing.expect(std.mem.indexOf(u8, conversation_bytes, "history marker") != null);
     try std.testing.expect(std.mem.indexOf(u8, conversation_bytes, "System prompt") == null);
+}
+
+test "/colors opens the color preview page and escape restores the conversation" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.gpa = gpa;
+    app.io = io;
+    app.prompt = "unused";
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = anthropic_default,
+        .system = "unused",
+        .retry = .{},
+    });
+    defer app.agent.deinit();
+    // A submitted command records the project. This test saves no choice.
+    app.state = .inert(gpa, io);
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+
+    try app.session.transcript.append(.event, false, "history marker");
+    try app.session.editor.insert("/colors");
+    try app.submit();
+
+    try std.testing.expect(app.session.mode == .viewing);
+    try std.testing.expect(app.session.mode.viewing.presentation == .colors);
+    const page_start = out.written().len;
+    try app.session.paint(.{ .columns = 80, .rows = 12 });
+    const page_bytes = out.written()[page_start..];
+    try std.testing.expect(std.mem.indexOf(u8, page_bytes, "Esc: Close") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page_bytes, "M: Source") == null);
+    try std.testing.expect(std.mem.indexOf(u8, page_bytes, "ANSI slots 0 to 15") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page_bytes, "history marker") == null);
+
+    // The M toggle has no source to show, so the presentation stays.
+    try app.handleKey(&.{ .char = 'm' });
+    try std.testing.expect(app.session.mode.viewing.presentation == .colors);
+    try app.handleKey(&.page_down);
+    try std.testing.expect(app.session.mode.viewing.scroll > 0);
+
+    try app.handleKey(&.escape);
+    try std.testing.expect(app.session.mode == .prompt);
+    const conversation_start = out.written().len;
+    try app.session.paint(.{ .columns = 80, .rows = 12 });
+    const conversation_bytes = out.written()[conversation_start..];
+    try std.testing.expect(std.mem.indexOf(u8, conversation_bytes, "history marker") != null);
 }
 
 test "an account-switch command clears the quota snapshot and records the project" {

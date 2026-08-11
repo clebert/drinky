@@ -88,9 +88,9 @@ pub fn notice(placement: *const Placement, look: *const Notice, text: []const u8
 
 /// A filled box in one role: a blank padding row, `text` wrapped to the inner
 /// width with a one-space left pad and the fill carried to full width, then a
-/// blank padding row. A box role reverses the video, so the fill takes the color
-/// of the role and the text keeps the terminal background. It streams a row at a
-/// time and self-separates inside the block gap around it.
+/// blank padding row. A box role reverses the video, so the fill takes the
+/// color of the role and the text keeps the terminal background. It streams one
+/// row at a time and separates itself inside the block gap around it.
 pub fn box(placement: *const Placement, name: role.Name, text: []const u8) !void {
     var line = placement.base;
     try boxPad(placement, &line, name);
@@ -121,14 +121,26 @@ fn boxLine(
 ) !void {
     defer line.* += 1;
     if (line.* < placement.skip) return;
-    const shown = terminal.width.truncate(content, placement.columns -| 1);
     placement.sink.begin();
     try role.apply(placement.sink, name);
-    try placement.sink.text(" ");
-    try placement.sink.text(shown);
-    try placement.sink.spaces(placement.columns -| (1 + terminal.width.ofText(shown)));
+    try boxLineCells(placement.sink, placement.columns, content);
     try attribute.apply(placement.sink, .reset);
     placement.sink.end(.{ .id = placement.id, .line = line.* });
+}
+
+/// The cells of the first box content row, without the row bookkeeping. The
+/// text wraps at the live box width. The caller opens the row, applies the box
+/// color, and closes the style. The color preview page uses this fixed row.
+pub fn boxCells(sink: *terminal.View.Sink, columns: usize, text: []const u8) !void {
+    var iterator = terminal.width.wrapper(text, boxInner(columns));
+    try boxLineCells(sink, columns, iterator.next().?);
+}
+
+fn boxLineCells(sink: *terminal.View.Sink, columns: usize, content: []const u8) !void {
+    const shown = terminal.width.truncate(content, columns -| 1);
+    try sink.text(" ");
+    try sink.text(shown);
+    try sink.spaces(columns -| (1 + terminal.width.ofText(shown)));
 }
 
 const frame_separator_rows = 2;
@@ -184,10 +196,16 @@ const Separators = struct {
     activity: ?Activity,
 };
 
-const SeparatorCell = struct { glyph: SeparatorGlyph, accent: bool };
+const SeparatorCell = struct { glyph: SeparatorGlyph, active: bool };
 const HorizontalWeights = struct { left: bool, right: bool };
 const RuleRange = struct { rule: Rule, start: usize, end: usize };
 const LabelOptions = struct { arrow: []const u8, more: usize, columns: usize };
+
+/// Optional activity and hidden-row label for a top separator.
+pub const SeparatorOptions = struct {
+    activity: ?Activity = null,
+    hidden_above: usize = 0,
+};
 
 /// Stream the input area that `framing` describes. It contains a labelled top
 /// separator, its open body rows, and a labelled bottom separator.
@@ -247,8 +265,9 @@ fn framedRow(
 }
 
 /// One labelled horizontal separator. A label masks the moving segment, and the
-/// segment never overwrites it. Narrow labels compact to `↑N` or `↓N` before
-/// they hide.
+/// segment never overwrites it. The label is secondary text, so it takes the
+/// muted role while the glyphs around it keep the frame color. Narrow labels
+/// compact to `↑N` or `↓N` before they hide.
 fn ruleRow(
     placement: *const Placement,
     separators: *const Separators,
@@ -260,38 +279,50 @@ fn ruleRow(
     defer line.* += 1;
     if (line.* < placement.skip) return;
     placement.sink.begin();
-    try role.apply(placement.sink, .muted);
+    try ruleCells(placement.sink, separators, rule, arrow, more);
+    try attribute.apply(placement.sink, .reset);
+    placement.sink.end(.{ .id = placement.id, .line = line.* });
+}
+
+fn ruleCells(
+    sink: *terminal.View.Sink,
+    separators: *const Separators,
+    rule: Rule,
+    arrow: []const u8,
+    more: usize,
+) !void {
     var buffer: [32]u8 = undefined;
     const maybe_label = moreLabel(&buffer, &.{
         .arrow = arrow,
         .more = more,
-        .columns = placement.columns,
+        .columns = separators.columns,
     });
     if (maybe_label) |label| {
         const label_start = 3;
         const label_end = label_start + 1 + terminal.width.ofText(label) + 1;
-        try drawRuleRange(placement, separators, &.{
+        try drawRuleRange(sink, separators, &.{
             .rule = rule,
             .start = 0,
             .end = label_start,
         });
-        try placement.sink.text(" ");
-        try placement.sink.text(label);
-        try placement.sink.text(" ");
-        try drawRuleRange(placement, separators, &.{
+        try role.apply(sink, .muted);
+        try sink.text(" ");
+        try sink.text(label);
+        try sink.text(" ");
+        // Clear faint before the range applies its first frame or activity role.
+        try attribute.apply(sink, .reset);
+        try drawRuleRange(sink, separators, &.{
             .rule = rule,
             .start = label_end,
-            .end = placement.columns,
+            .end = separators.columns,
         });
     } else {
-        try drawRuleRange(placement, separators, &.{
+        try drawRuleRange(sink, separators, &.{
             .rule = rule,
             .start = 0,
-            .end = placement.columns,
+            .end = separators.columns,
         });
     }
-    try attribute.apply(placement.sink, .reset);
-    placement.sink.end(.{ .id = placement.id, .line = line.* });
 }
 
 fn moreLabel(buffer: *[32]u8, options: *const LabelOptions) ?[]const u8 {
@@ -314,30 +345,42 @@ fn labelFits(columns: usize, label: []const u8) bool {
     return columns > used;
 }
 
+/// One complete top input separator across `columns`. The options can add its
+/// hidden-row label and the moving activity segment. The caller opens the row
+/// and closes the style. The color preview page samples the live painter.
+pub fn separatorCells(
+    sink: *terminal.View.Sink,
+    columns: usize,
+    options: *const SeparatorOptions,
+) !void {
+    const separators: Separators = .{ .columns = columns, .activity = options.activity };
+    try ruleCells(sink, &separators, .top, "↑", options.hidden_above);
+}
+
 fn drawRuleRange(
-    placement: *const Placement,
+    sink: *terminal.View.Sink,
     separators: *const Separators,
     options: *const RuleRange,
 ) !void {
     std.debug.assert(options.start <= options.end and options.end <= separators.columns);
-    const sink = placement.sink;
-    var accent = false;
+    var first = true;
+    var active = false;
     var column = options.start;
     while (column < options.end) {
         const cell = separatorCell(separators, options.rule, column);
-        if (cell.accent != accent) {
-            accent = cell.accent;
-            try role.apply(sink, if (accent) .accent else .muted);
+        if (first or cell.active != active) {
+            first = false;
+            active = cell.active;
+            try role.apply(sink, if (active) .activity else .input_frame);
         }
         var run_end = column + 1;
         while (run_end < options.end) : (run_end += 1) {
             const next = separatorCell(separators, options.rule, run_end);
-            if (next.accent != cell.accent or next.glyph != cell.glyph) break;
+            if (next.active != cell.active or next.glyph != cell.glyph) break;
         }
         try writeSeparatorGlyph(sink, cell.glyph, run_end - column);
         column = run_end;
     }
-    if (accent) try role.apply(sink, .muted);
 }
 
 fn separatorCell(separators: *const Separators, rule: Rule, column: usize) SeparatorCell {
@@ -351,7 +394,7 @@ fn separatorCell(separators: *const Separators, rule: Rule, column: usize) Separ
             activityGlyph(.{ .left = left, .right = right })
         else
             .light,
-        .accent = active,
+        .active = active,
     };
 }
 
@@ -458,11 +501,114 @@ pub fn steering(placement: *const Placement, messages: []const []const u8) !void
     try notice(&hint_placement, &.{ .role = .muted, .prefix = "" }, hint);
 }
 
+test "box preview cells use the live wrap width" {
+    const gpa = std.testing.allocator;
+    var output: std.Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    var view = terminal.View.init(gpa, &output.writer);
+    defer view.deinit();
+
+    const sink = try view.beginFrame(.{ .columns = 10, .rows = 1 }, 1);
+    sink.begin();
+    try boxCells(sink, 10, "abcdefghijk");
+    try std.testing.expectEqual(@as(usize, 10), sink.columns_written);
+    sink.end(.{ .id = 0, .line = 0 });
+    try view.render();
+
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), " abcdefgh ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "abcdefghi") == null);
+}
+
 test "open separators leave the complete row available to content" {
     try std.testing.expectEqual(@as(usize, 1), frameColumns(0));
     try std.testing.expectEqual(@as(usize, 1), frameColumns(1));
     try std.testing.expectEqual(@as(usize, 2), frameColumns(2));
     try std.testing.expectEqual(@as(usize, 80), frameColumns(80));
+}
+
+test "activity at column zero emits no unused frame role" {
+    const gpa = std.testing.allocator;
+    var output: std.Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    var view = terminal.View.init(gpa, &output.writer);
+    defer view.deinit();
+
+    const sink = try view.beginFrame(.{ .columns = 20, .rows = 1 }, 1);
+    const placement: Placement = .{
+        .sink = sink,
+        .id = 0,
+        .columns = 20,
+        .base = 0,
+        .skip = 0,
+    };
+    const separators: Separators = .{
+        .columns = 20,
+        .activity = .{ .motion_tick = 0, .progress_age_ticks = 0 },
+    };
+    var line: usize = 0;
+    try ruleRow(&placement, &separators, &line, .top, "↑", 0);
+    try view.render();
+
+    const segment = comptime role.sequence(.activity) ++ "╼━━━━╾" ++
+        role.sequence(.input_frame) ++ "─";
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), segment) != null);
+    const unused = comptime role.sequence(.input_frame) ++ role.sequence(.activity);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), unused) == null);
+}
+
+test "a separator label reads as muted text between the frame glyphs" {
+    const gpa = std.testing.allocator;
+    var output: std.Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    var view = terminal.View.init(gpa, &output.writer);
+    defer view.deinit();
+
+    const sink = try view.beginFrame(.{ .columns = 20, .rows = 1 }, 1);
+    const placement: Placement = .{
+        .sink = sink,
+        .id = 0,
+        .columns = 20,
+        .base = 0,
+        .skip = 0,
+    };
+    const separators: Separators = .{ .columns = 20, .activity = null };
+    var line: usize = 0;
+    try ruleRow(&placement, &separators, &line, .top, "↑", 3);
+    try view.render();
+
+    // The count is secondary text. The reset clears its faint intensity before
+    // the frame color starts again behind it.
+    const label = comptime role.sequence(.muted) ++ " ↑ Hidden: 3 \x1b[0m" ++
+        role.sequence(.input_frame);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), label) != null);
+}
+
+test "a separator label resets faint before a right activity segment" {
+    const gpa = std.testing.allocator;
+    var output: std.Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    var view = terminal.View.init(gpa, &output.writer);
+    defer view.deinit();
+
+    const sink = try view.beginFrame(.{ .columns = 20, .rows = 1 }, 1);
+    const placement: Placement = .{
+        .sink = sink,
+        .id = 0,
+        .columns = 20,
+        .base = 0,
+        .skip = 0,
+    };
+    const separators: Separators = .{
+        .columns = 20,
+        .activity = .{ .motion_tick = 16, .progress_age_ticks = 0 },
+    };
+    var line: usize = 0;
+    try ruleRow(&placement, &separators, &line, .top, "↑", 3);
+    try view.render();
+
+    const segment = comptime role.sequence(.muted) ++ " ↑ Hidden: 3 \x1b[0m" ++
+        role.sequence(.activity) ++ "╼";
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), segment) != null);
 }
 
 test "one activity segment starts at the top left and crosses both separator seams" {

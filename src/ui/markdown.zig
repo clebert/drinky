@@ -169,18 +169,22 @@ const Painter = struct {
         // role owns. That role keeps the terminal foreground, so a plain
         // paragraph stays free of every escape sequence.
         const name = self.tint orelse look.role orelse .text;
+        const emphasized = look.bold;
+        const emphasis_carries_underline = emphasized and name == .muted and look.underline;
         const italic = look.italic or self.tint != null;
         try role.apply(sink, name);
-        if (look.bold) try attribute.apply(sink, .bold);
+        if (emphasized) try attribute.emphasize(sink, name, look.underline);
         if (italic) try attribute.apply(sink, .italic);
-        if (look.underline) try attribute.apply(sink, .underline);
+        if (look.underline and !emphasis_carries_underline) {
+            try attribute.apply(sink, .underline);
+        }
         if (look.strike) try attribute.apply(sink, .strikethrough);
         // The link opens and closes inside this span, so it covers exactly the
         // text on this row and never leaks into the row under it.
         try sink.linkSet(look.url);
         try sink.text(bytes);
         try sink.linkReset();
-        if (role.paints(name) or look.bold or italic or look.underline or look.strike) {
+        if (role.paints(name) or emphasized or italic or look.underline or look.strike) {
             try attribute.apply(sink, .reset);
         }
     }
@@ -1740,9 +1744,12 @@ test "a quote paints with no border glyph" {
     const bytes = try painted(gpa, text, 30, null, 0);
     defer gpa.free(bytes);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "│") == null);
-    // The quote is muted and italic, and the nested pair adds its bold on top.
-    const nested = comptime role.sequence(.muted) ++ "\x1b[1m\x1b[3mNote:";
+    // The quote is muted and italic. The nested bold pair sheds its marks and
+    // uses underline, so it keeps both its emphasis and the faint tone.
+    const nested = comptime role.sequence(.muted) ++ "\x1b[4m\x1b[3mNote:";
     try std.testing.expect(std.mem.indexOf(u8, bytes, nested) != null);
+    const intensity_clash = comptime role.sequence(.muted) ++ "\x1b[1m";
+    try std.testing.expect(std.mem.indexOf(u8, bytes, intensity_clash) == null);
 }
 
 // Markers nest: an inner pair sheds its own markers instead of showing them as
@@ -1884,7 +1891,8 @@ test "a line of unmatched brackets scans its tail once" {
 }
 
 // Reasoning reads as one muted, italic block: the tint replaces every element
-// role, while the attributes and the structural markers stay.
+// role, while the structural markers stay. Underline carries bold emphasis.
+// Double underline keeps an existing underline distinct.
 test "a tinted block renders muted and italic throughout" {
     const gpa = std.testing.allocator;
     const bytes = try painted(gpa, sample, 72, .muted, 0);
@@ -1893,10 +1901,19 @@ test "a tinted block renders muted and italic throughout" {
     inline for ([_]role.Name{ .heading, .code, .accent, .link }) |name| {
         try std.testing.expect(std.mem.indexOf(u8, bytes, role.sequence(name)) == null);
     }
-    // A heading is still bold, and the bullet is still there — just muted.
-    const muted = comptime role.sequence(.muted) ++ "\x1b[1m\x1b[3m";
+    // Every span carries the muted italic tone, and the bullet is still there.
+    const muted = comptime role.sequence(.muted) ++ "\x1b[3m";
     try std.testing.expect(std.mem.indexOf(u8, bytes, muted) != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "- ") != null);
+    // An H2 uses underline for bold. An H1 uses double underline because its
+    // source look already has underline.
+    const emphasized = comptime role.sequence(.muted) ++ "\x1b[4m\x1b[3mHeading ";
+    const emphasized_underlined =
+        comptime role.sequence(.muted) ++ "\x1b[21m\x1b[3mHeading one";
+    try std.testing.expect(std.mem.indexOf(u8, bytes, emphasized) != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, emphasized_underlined) != null);
+    const intensity_clash = comptime role.sequence(.muted) ++ "\x1b[1m";
+    try std.testing.expect(std.mem.indexOf(u8, bytes, intensity_clash) == null);
 }
 
 // Parity again, over markers stitched together at random: the half-formed

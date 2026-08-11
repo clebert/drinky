@@ -123,9 +123,9 @@ dependency on another item. Module layout and extension seams live in `AGENTS.md
 - [x] **Terminal-owned colors** — the interface emits the default colors and the ANSI slots 0 to 15
       alone, so the theme of the terminal picks every value. _Pith carries no palette, no color
       configuration, and no third-party license. One role map turns a semantic role into its SGR
-      bytes. A filled box takes one foreground color plus reverse video. This keeps the contrast
-      between that palette slot and the terminal background. Every state also carries a text label
-      or a glyph, so color is never the only signal._
+      bytes. Muted text uses faint intensity. A filled box takes one foreground color plus reverse
+      video. This keeps the contrast between that palette slot and the terminal background.
+      Every state also carries a text label or a glyph, so color is never the only signal._
 - [ ] **Context-window pressure signal** — the context gauge warns as it fills, and feeds a
       compaction threshold. _The thresholds are configurable. Fold in two model-specific dimensions:
       tiered pricing above a context threshold, and OpenAI's effective context window (decoded at

@@ -451,6 +451,7 @@ pub fn applyOutcome(self: *Session, outcome: ai.command.Outcome) !void {
         .switch_account,
         .new_conversation,
         .show_system_prompt,
+        .show_colors,
         => unreachable,
     }
     self.dirty = true;

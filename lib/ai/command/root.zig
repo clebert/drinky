@@ -8,6 +8,7 @@ const skills = @import("../skills.zig");
 pub const Context = @import("Context.zig");
 pub const Outcome = Context.Outcome;
 
+const colors = @import("colors.zig");
 const effort = @import("effort.zig");
 const login = @import("login.zig");
 const logout = @import("logout.zig");
@@ -29,6 +30,7 @@ const whitespace = " \t\r\n";
 
 const commands = [_]Entry{
     .{ .name = model.name, .run = model.run },
+    .{ .name = colors.name, .run = colors.run },
     .{ .name = effort.name, .run = effort.run },
     .{ .name = login.name, .run = login.run },
     .{ .name = logout.name, .run = logout.run },
@@ -170,6 +172,16 @@ test "run routes system" {
         .accounts = undefined,
     };
     try std.testing.expect((try run(&context, "/system")).? == .show_system_prompt);
+}
+
+test "run routes colors" {
+    var context: Context = .{
+        .gpa = undefined,
+        .io = undefined,
+        .agent = undefined,
+        .accounts = undefined,
+    };
+    try std.testing.expect((try run(&context, "/colors")).? == .show_colors);
 }
 
 test "trailing whitespace does not hide an unknown command name" {
