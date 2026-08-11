@@ -148,7 +148,7 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - A running tool shows a blue box with its name and arguments. It then turns green or red with a
   one-line stat summary (lines read, matches found, exit status), or its first output line when the
   tool gives no summary.
-- Two heavy accent segments cross the open input separators during a turn. They grow as progress
+- One heavy accent segment moves across both open input separators in a loop and grows as progress
   goes quiet without adding a layout row.
 - Queued steering shows as `Queued message:` rows, and becomes one user message once consumed.
 - The bottom line shows `directory (branch)`, context fill, cost, quota, and cache-hit rate on the

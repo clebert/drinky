@@ -10,10 +10,10 @@ const terminal = @import("terminal");
 
 const color = @import("color.zig");
 
-const activity_length_default: usize = 3;
-// At 16 ms per frame, wait about 500 ms. Then add one cell to both segments every 200 ms.
+const activity_length_default: usize = 6;
+// At 16 ms per frame, wait about 500 ms. Then add one cell every 100 ms.
 const activity_growth_delay_ticks: u64 = 31;
-const activity_growth_interval_ticks: u64 = 12;
+const activity_growth_interval_ticks: u64 = 6;
 
 pub const BoxStyle = struct { background: color.Style, foreground: color.Style };
 
@@ -44,7 +44,7 @@ pub const Activity = struct {
     progress_age_ticks: u64,
 };
 
-/// Whether `activity` moves either separator segment at this width.
+/// Whether `activity` moves the separator segment at this width.
 pub fn activityChanged(activity: *const Activity, columns: usize) bool {
     if (columns == 0) return false;
     return activityHead(activity.motion_tick, columns) !=
@@ -145,9 +145,9 @@ pub fn bodyLimit(viewport_rows: usize) usize {
     return @min(@max(@divFloor(viewport_rows, 4) + 1, 5), 15);
 }
 
-/// An input area between two open separators. While `activity` is set, two
-/// heavy segments cross the separators in opposite directions. They grow when
-/// progress is quiet.
+/// An input area between two open separators. While `activity` is set, one
+/// heavy segment moves across both separators as a loop. It grows when progress
+/// is quiet.
 pub const Framing = struct {
     body: []const u8,
     body_rows: usize,
@@ -353,37 +353,40 @@ fn separatorCell(separators: *const Separators, rule: Rule, column: usize) Separ
     };
 }
 
-/// The top segment moves right. The bottom segment mirrors it and moves left.
+/// Treat the top separator and then the bottom separator as one virtual line.
+/// The segment moves right and crosses between opposite separator ends.
 fn activityAt(separators: *const Separators, rule: Rule, column: usize) bool {
     const maybe_activity = separators.activity;
     if (maybe_activity) |activity| {
         const position = switch (rule) {
             .top => column,
-            .bottom => separators.columns - 1 - column,
+            .bottom => separators.columns + column,
         };
+        const track_columns = 2 * separators.columns;
         const head = activityHead(activity.motion_tick, separators.columns);
         const distance = if (head >= position)
             head - position
         else
-            separators.columns - (position - head);
+            track_columns - (position - head);
         return distance < activityLength(activity.progress_age_ticks, separators.columns);
     }
     return false;
 }
 
-/// Start both segments at the center. Move them one horizontal cell per tick.
+/// Start the segment at the top center. Move it one virtual cell per tick.
 fn activityHead(motion_tick: u64, columns: usize) usize {
     std.debug.assert(columns > 0);
-    const columns_u64: u64 = @intCast(columns);
-    const phase: usize = @intCast(motion_tick % columns_u64);
+    const track_columns = 2 * columns;
+    const track_columns_u64: u64 = @intCast(track_columns);
+    const phase: usize = @intCast(motion_tick % track_columns_u64);
     const offset = @divFloor(columns, 2);
-    const wrap_at = columns - offset;
+    const wrap_at = track_columns - offset;
     return if (phase >= wrap_at) phase - wrap_at else phase + offset;
 }
 
 fn activityLength(progress_age_ticks: u64, columns: usize) usize {
     std.debug.assert(columns > 0);
-    const length_max = @max(@divFloor(columns, 2), 1);
+    const length_max = columns;
     const length_base = @min(activity_length_default, length_max);
     const growth_max: u64 = @intCast(length_max - length_base);
     const growth_steps: u64 = if (progress_age_ticks < activity_growth_delay_ticks)
@@ -459,7 +462,7 @@ test "open separators leave the complete row available to content" {
     try std.testing.expectEqual(@as(usize, 80), frameColumns(80));
 }
 
-test "activity segments taper and cross the separators in opposite directions" {
+test "one activity segment crosses both separator seams without changing length" {
     const idle: Separators = .{ .columns = 20, .activity = null };
     try std.testing.expectEqual(.light, separatorCell(&idle, .top, 0).glyph);
 
@@ -467,30 +470,41 @@ test "activity segments taper and cross the separators in opposite directions" {
         .columns = 20,
         .activity = .{ .motion_tick = 0, .progress_age_ticks = 0 },
     };
-    try std.testing.expectEqual(.left_light_right_heavy, separatorCell(&first, .top, 8).glyph);
-    try std.testing.expectEqual(.heavy, separatorCell(&first, .top, 9).glyph);
+    try std.testing.expectEqual(.left_light_right_heavy, separatorCell(&first, .top, 5).glyph);
+    try std.testing.expectEqual(.heavy, separatorCell(&first, .top, 6).glyph);
     try std.testing.expectEqual(.left_heavy_right_light, separatorCell(&first, .top, 10).glyph);
-    try std.testing.expect(activityAt(&first, .top, 10));
-    try std.testing.expect(activityAt(&first, .bottom, 9));
+    try std.testing.expect(!activityAt(&first, .bottom, 0));
 
-    const second: Separators = .{
-        .columns = 20,
-        .activity = .{ .motion_tick = 1, .progress_age_ticks = 0 },
-    };
-    try std.testing.expect(activityAt(&second, .top, 11));
-    try std.testing.expect(!activityAt(&second, .top, 8));
-    try std.testing.expect(activityAt(&second, .bottom, 8));
-    try std.testing.expect(!activityAt(&second, .bottom, 11));
-
-    const wrapped: Separators = .{
+    const top_to_bottom: Separators = .{
         .columns = 20,
         .activity = .{ .motion_tick = 10, .progress_age_ticks = 0 },
     };
-    try std.testing.expectEqual(.heavy, separatorCell(&wrapped, .top, 0).glyph);
+    try std.testing.expect(activityAt(&top_to_bottom, .top, 15));
+    try std.testing.expect(activityAt(&top_to_bottom, .top, 19));
+    try std.testing.expect(activityAt(&top_to_bottom, .bottom, 0));
+    try std.testing.expect(!activityAt(&top_to_bottom, .bottom, 1));
+
+    const bottom_to_top: Separators = .{
+        .columns = 20,
+        .activity = .{ .motion_tick = 30, .progress_age_ticks = 0 },
+    };
+    try std.testing.expect(activityAt(&bottom_to_top, .bottom, 15));
+    try std.testing.expect(activityAt(&bottom_to_top, .bottom, 19));
+    try std.testing.expect(activityAt(&bottom_to_top, .top, 0));
+    try std.testing.expect(!activityAt(&bottom_to_top, .top, 1));
+
+    for ([_]Separators{ top_to_bottom, bottom_to_top }) |crossing| {
+        var active_count: usize = 0;
+        for (0..20) |column| {
+            active_count += @intFromBool(activityAt(&crossing, .top, column));
+            active_count += @intFromBool(activityAt(&crossing, .bottom, column));
+        }
+        try std.testing.expectEqual(@as(usize, activity_length_default), active_count);
+    }
 }
 
-test "activity moves across the complete separator" {
-    const expected = [_]usize{ 2, 3, 4, 0, 1, 2 };
+test "activity moves across the complete virtual line" {
+    const expected = [_]usize{ 2, 3, 4, 5, 6, 7, 8, 9, 0, 1, 2 };
     for (expected, 0..) |column, tick|
         try std.testing.expectEqual(column, activityHead(tick, 5));
 
@@ -498,7 +512,7 @@ test "activity moves across the complete separator" {
         &.{ .motion_tick = 1, .progress_age_ticks = 0 },
         5,
     ));
-    try std.testing.expect(!activityChanged(
+    try std.testing.expect(activityChanged(
         &.{ .motion_tick = 1, .progress_age_ticks = 31 },
         1,
     ));
@@ -508,16 +522,17 @@ test "activity moves across the complete separator" {
     ));
 }
 
-test "activity segments grow after a quiet grace period up to half each separator" {
-    try std.testing.expectEqual(@as(usize, 3), activityLength(0, 100));
-    try std.testing.expectEqual(@as(usize, 3), activityLength(30, 100));
-    try std.testing.expectEqual(@as(usize, 4), activityLength(31, 100));
-    try std.testing.expectEqual(@as(usize, 4), activityLength(42, 100));
-    try std.testing.expectEqual(@as(usize, 5), activityLength(43, 100));
-    try std.testing.expectEqual(@as(usize, 49), activityLength(582, 100));
-    try std.testing.expectEqual(@as(usize, 50), activityLength(583, 100));
-    try std.testing.expectEqual(@as(usize, 50), activityLength(594, 100));
-    try std.testing.expectEqual(@as(usize, 2), activityLength(0, 4));
+test "activity segment grows after a quiet grace period up to one separator" {
+    try std.testing.expectEqual(@as(usize, 6), activityLength(0, 50));
+    try std.testing.expectEqual(@as(usize, 6), activityLength(30, 50));
+    try std.testing.expectEqual(@as(usize, 7), activityLength(31, 50));
+    try std.testing.expectEqual(@as(usize, 7), activityLength(36, 50));
+    try std.testing.expectEqual(@as(usize, 8), activityLength(37, 50));
+    try std.testing.expectEqual(@as(usize, 49), activityLength(283, 50));
+    try std.testing.expectEqual(@as(usize, 49), activityLength(288, 50));
+    try std.testing.expectEqual(@as(usize, 50), activityLength(289, 50));
+    try std.testing.expectEqual(@as(usize, 50), activityLength(300, 50));
+    try std.testing.expectEqual(@as(usize, 4), activityLength(0, 4));
     try std.testing.expectEqual(@as(usize, 1), activityLength(0, 1));
 }
 
