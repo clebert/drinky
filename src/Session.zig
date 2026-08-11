@@ -27,6 +27,8 @@ gpa: std.mem.Allocator,
 transcript: Transcript,
 /// The sole transient notice. Its owned content never enters the transcript.
 notice: ?ai.command.Outcome.Message,
+/// Whether one unchanged idle Enter can pass the stale-cache warning.
+cache_confirmation: bool,
 editor: ui.Editor,
 /// The primary-screen conversation renderer remains untouched while a page is open.
 view: terminal.View,
@@ -232,6 +234,7 @@ pub fn init(
         .gpa = gpa,
         .transcript = Transcript.init(gpa),
         .notice = null,
+        .cache_confirmation = false,
         .editor = ui.Editor.init(gpa),
         .view = terminal.View.init(gpa, writer),
         .page_view = terminal.View.init(gpa, writer),
@@ -277,6 +280,7 @@ pub fn resetConversation(self: *Session) void {
     std.debug.assert(self.mode == .prompt);
     self.transcript.truncate(0);
     self.clearNotice();
+    self.cache_confirmation = false;
     self.stats_shown = .{};
     self.clearSteering();
     self.view.resetScreen();
@@ -290,6 +294,24 @@ pub fn clearNotice(self: *Session) void {
         self.notice = null;
         self.dirty = true;
     }
+}
+
+/// Let one idle Enter pass a stale-cache warning.
+pub fn armCacheConfirmation(self: *Session) void {
+    std.debug.assert(self.mode == .prompt);
+    self.cache_confirmation = true;
+}
+
+/// Cancel the stale-cache confirmation after any other user action.
+pub fn cancelCacheConfirmation(self: *Session) void {
+    self.cache_confirmation = false;
+}
+
+/// Consume the one-shot stale-cache confirmation.
+pub fn takeCacheConfirmation(self: *Session) bool {
+    const confirmed = self.cache_confirmation;
+    self.cache_confirmation = false;
+    return confirmed;
 }
 
 /// Replace the transient notice and take ownership of `notice.content`.
@@ -605,6 +627,7 @@ fn steeringView(self: *Session) ![]const []const u8 {
 /// and no active tools.
 pub fn beginTurn(self: *Session, generation: u64) void {
     self.transcript.endMessage();
+    self.cache_confirmation = false;
     self.mode = .{ .turn = .{
         .generation = generation,
         .progress_sequence_applied = 0,
@@ -767,7 +790,7 @@ pub fn paint(self: *Session, size: terminal.View.Size) !void {
         .quota = self.stats_shown.quota,
         .notice = if (self.notice) |notice| .{
             .text = notice.content,
-            .is_error = notice.severity == .failure,
+            .severity = notice.severity,
         } else null,
     };
 
@@ -1046,6 +1069,26 @@ test "a notice replaces the footer and clearing restores the status" {
     try session.paint(.{ .columns = 80, .rows = 24 });
     const status_frame = out.written()[status_start..];
     try std.testing.expect(std.mem.indexOf(u8, status_frame, test_model.name) != null);
+}
+
+test "cache confirmation is one-shot and separate from its notice" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    defer session.deinit();
+
+    try session.applyOutcome(
+        try ai.command.Outcome.reportNotice(gpa, .warning, "Cache warning", .{}),
+    );
+    session.armCacheConfirmation();
+    session.clearNotice();
+    try std.testing.expect(session.takeCacheConfirmation());
+    try std.testing.expect(!session.takeCacheConfirmation());
+
+    session.armCacheConfirmation();
+    session.cancelCacheConfirmation();
+    try std.testing.expect(!session.takeCacheConfirmation());
 }
 
 test "an event survives notice clearing until the conversation resets" {

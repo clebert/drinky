@@ -45,7 +45,7 @@ pub const Outcome = union(enum) {
     /// Show the complete provider-neutral system prompt assembled by the app.
     show_system_prompt,
 
-    pub const Severity = enum { information, failure };
+    pub const Severity = enum { information, warning, failure };
 
     pub const Message = struct {
         /// Owned by the caller's allocator.

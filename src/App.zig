@@ -940,6 +940,10 @@ fn handleKeys(self: *App, bytes: []const u8) !void {
 }
 
 fn handleKey(self: *App, event: *const terminal.Input.Key) !void {
+    // Only an idle Enter can confirm the stale-cache warning. Every other user
+    // action clears both the notice and its one-shot confirmation.
+    const confirms_cache = self.session.mode == .prompt and event.* == .enter;
+    if (!confirms_cache) self.session.cancelCacheConfirmation();
     // Clear before the key routes, so a notice produced by this action survives it.
     self.session.clearNotice();
     switch (self.session.mode) {
@@ -1212,7 +1216,18 @@ fn nowNs(self: *App) i96 {
 /// A command line holds its name alone, so a message that starts with a word like
 /// `/new` still reaches the model.
 fn submit(self: *App) !void {
-    if (self.session.editor.blank()) return;
+    if (self.session.editor.blank()) {
+        self.session.cancelCacheConfirmation();
+        return;
+    }
+    const maybe_cache_risk = self.agent.cacheRisk();
+    if (maybe_cache_risk) |*cache_risk| return self.submitWithCacheRisk(cache_risk);
+    return self.submitWithCacheRisk(null);
+}
+
+/// Submit with an injected cache risk. The seam lets tests stop at the warning
+/// without starting a real provider worker.
+fn submitWithCacheRisk(self: *App, maybe_cache_risk: ?*const ai.Agent.CacheRisk) !void {
     const text = try self.session.editor.expanded(.whole_prompt);
     defer self.gpa.free(text);
     self.session.dirty = true;
@@ -1222,31 +1237,34 @@ fn submit(self: *App) !void {
             .prompt => |prompt| {
                 defer prompt.deinit(self.gpa);
                 if (!self.signedIn()) {
+                    self.session.cancelCacheConfirmation();
                     self.session.editor.clear();
                     try self.reportNotice(
                         .failure,
                         "Sign in with /login before you send a message.",
                         .{},
                     );
-                } else {
+                } else if (try self.preflightModelSubmit(maybe_cache_risk)) {
                     const base = try self.startSkillTurn(&prompt);
                     var draft = self.session.editor.detachTrimmed();
                     self.session.retainTurnPrompt(&draft, base);
                 }
             },
             else => {
+                self.session.cancelCacheConfirmation();
                 self.session.editor.clear();
                 try self.applyOutcome(outcome);
             },
         }
     } else if (!self.signedIn()) {
+        self.session.cancelCacheConfirmation();
         self.session.editor.clear();
         try self.reportNotice(
             .failure,
             "Sign in with /login before you send a message.",
             .{},
         );
-    } else {
+    } else if (try self.preflightModelSubmit(maybe_cache_risk)) {
         const base = try self.startUserTurn(text);
         // The turn is live and owns its own copy. Retain the prompt's rich draft
         // so an abnormal exit that commits nothing can return it. Leave the
@@ -1255,6 +1273,46 @@ fn submit(self: *App) !void {
         var prompt = self.session.editor.detachTrimmed();
         self.session.retainTurnPrompt(&prompt, base);
     }
+}
+
+/// Stop the first stale-cache submission and arm one confirmation for the
+/// unchanged prompt.
+fn preflightModelSubmit(
+    self: *App,
+    maybe_cache_risk: ?*const ai.Agent.CacheRisk,
+) !bool {
+    if (self.session.takeCacheConfirmation()) return true;
+    const cache_risk = maybe_cache_risk orelse return true;
+    const hour_ms: u64 = std.time.ms_per_hour;
+    const minute_ms: u64 = std.time.ms_per_min;
+    const retention: struct { count: u64, unit: []const u8 } =
+        if (cache_risk.retention_ms % hour_ms == 0)
+            .{ .count = @divExact(cache_risk.retention_ms, hour_ms), .unit = "h" }
+        else if (cache_risk.retention_ms % minute_ms == 0)
+            .{ .count = @divExact(cache_risk.retention_ms, minute_ms), .unit = "m" }
+        else
+            .{
+                .count = @divFloor(cache_risk.retention_ms, std.time.ms_per_s),
+                .unit = "s",
+            };
+
+    if (cache_risk.cost_extra >= 0.01) {
+        try self.reportNotice(
+            .warning,
+            "Enter: Send anyway · Cache: Probably stale after {d}{s} · " ++
+                "Extra input cost: ~${d:.2}",
+            .{ retention.count, retention.unit, cache_risk.cost_extra },
+        );
+    } else {
+        try self.reportNotice(
+            .warning,
+            "Enter: Send anyway · Cache: Probably stale after {d}{s} · " ++
+                "Extra input cost: ~${d:.4}",
+            .{ retention.count, retention.unit, cache_risk.cost_extra },
+        );
+    }
+    self.session.armCacheConfirmation();
+    return false;
 }
 
 /// Record a compact skill marker and its optional user task, then spawn the turn
@@ -1408,8 +1466,9 @@ fn loginAccount(self: *App, account: ai.llm.Account) !void {
         return self.reportLoginFailure(login_error);
 
     // A fresh login can represent another principal in the same account slot.
-    // Opaque proofs from the previous credential must not cross that boundary.
+    // Opaque proofs and cache evidence must not cross that boundary.
     self.agent.dropReasoning(account);
+    self.agent.dropCacheEvidence(account);
     self.adopt(account);
     switch (login) {
         .saved => |path| try prompt.showAuthorized(path),
@@ -1467,6 +1526,7 @@ fn logoutAccount(self: *App, account: ai.llm.Account) !void {
         );
     };
     self.agent.dropReasoning(account);
+    self.agent.dropCacheEvidence(account);
     if (!was_active)
         return self.recordEvent(.information, "Pith signed out of {s}.", .{account.label()});
     if (self.accounts.firstAuthenticated()) |next| {
@@ -3252,7 +3312,9 @@ test "/new clears the conversation and the scrollback without a configuration ch
     try app.session.paint(.{ .columns = 80, .rows = 6 });
 
     try app.session.editor.insert("/new");
+    app.session.armCacheConfirmation();
     try app.submit();
+    try std.testing.expect(!app.session.takeCacheConfirmation());
 
     // The empty conversation must start on a clean screen. The paint clears the
     // visible rows and drops the scrollback with them.
@@ -3717,6 +3779,61 @@ test "a signed-out submit is refused with a login prompt" {
     const notice = app.session.notice.?;
     try std.testing.expectEqual(ai.command.Outcome.Severity.failure, notice.severity);
     try std.testing.expect(std.mem.indexOf(u8, notice.content, "/login") != null);
+}
+
+test "a stale cache blocks one submit and keeps the prompt unchanged" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(home);
+
+    var app: App = undefined;
+    app.gpa = gpa;
+    app.io = io;
+    app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{ .anthropic = "sk-test" });
+    defer app.accounts.deinit();
+    app.skills = ai.skills.Registry.init(gpa);
+    defer app.skills.deinit();
+    app.state = .inert(gpa, io);
+    app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_api), .{
+        .model = anthropic_default,
+        .system = "",
+        .retry = .{},
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+
+    try app.session.editor.insert("keep this prompt");
+    const risk: ai.Agent.CacheRisk = .{
+        .retention_ms = 5 * std.time.ms_per_min,
+        .cost_extra = 1.15,
+    };
+    try app.submitWithCacheRisk(&risk);
+
+    try std.testing.expect(app.session.mode == .prompt);
+    try std.testing.expectEqualStrings("keep this prompt", app.session.editor.visible());
+    try std.testing.expectEqual(@as(usize, 0), app.session.transcript.blocks().len);
+    try std.testing.expectEqual(ai.command.Outcome.Severity.warning, app.session.notice.?.severity);
+    try std.testing.expect(std.mem.startsWith(
+        u8,
+        app.session.notice.?.content,
+        "Enter: Send anyway · Cache: Probably stale after 5m",
+    ));
+    try std.testing.expect(std.mem.indexOf(u8, app.session.notice.?.content, "$1.15") != null);
+
+    // The next preflight consumes the confirmation instead of warning again.
+    try std.testing.expect(try app.preflightModelSubmit(&risk));
+    try std.testing.expect(!app.session.takeCacheConfirmation());
+
+    // Any other user key cancels a later confirmation.
+    app.session.armCacheConfirmation();
+    try app.handleKey(&.left);
+    try std.testing.expect(!app.session.takeCacheConfirmation());
 }
 
 // A sentence that starts with a command name is a message, so an idle Enter takes

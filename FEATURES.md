@@ -112,6 +112,8 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - A reply enters the conversation only once the provider reports it complete.
 - Prompt caching is always on: explicit breakpoints for Anthropic, the automatic per-session cache
   for OpenAI.
+- A stale prompt cache blocks the first submit, estimates the extra input cost, and lets the next
+  Enter continue.
 - Reasoning is requested summarized at the resolved effort, and replayed verbatim on later turns.
 - Anthropic Subscription and Anthropic Console requests carry the Claude Code client identity. A
   plain API key goes straight to the platform API.

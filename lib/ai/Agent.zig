@@ -57,6 +57,26 @@ steering: Steering,
 /// The stable per-conversation prompt-cache routing key (used by OpenAI). Every
 /// turn shares it until a deliberate reset rotates it.
 cache_key: [32]u8,
+/// The latest request under the active cache setup. The timestamp marks request
+/// dispatch, because cache lookup happens before response generation.
+cache_activity: ?CacheActivity,
+
+const CacheActivity = struct {
+    account: llm.Account,
+    model: []const u8,
+    retention_ms: u64,
+    cache_read: f64,
+    cache_write: f64,
+    request_at: std.Io.Clock.Timestamp,
+    prefix_tokens: u64,
+};
+
+/// The estimated cost effect when the active prompt cache passed its retention
+/// window. The cost covers only the reusable prefix at public API rates.
+pub const CacheRisk = struct {
+    retention_ms: u64,
+    cost_extra: f64,
+};
 
 /// The cumulative session cost and cache savings, plus the last message's usage
 /// and the latest subscription allowance for the gauges. Each message is priced
@@ -271,6 +291,7 @@ pub fn init(
         .stats = .{},
         .steering = Steering.init(gpa, io),
         .cache_key = generateCacheKey(io),
+        .cache_activity = null,
     };
 }
 
@@ -287,6 +308,7 @@ pub fn resetConversation(self: *Agent) void {
     self.stats = .{};
     self.steering.clear();
     self.cache_key = generateCacheKey(self.io);
+    self.cache_activity = null;
 }
 
 /// Switch the account and the model together, effective on the next turn. The
@@ -299,18 +321,35 @@ pub fn switchTo(self: *Agent, client: provider.Client, model: models.Model) void
         active.account() != client.account()
     else
         true;
+    const cache_setup_changed = account_changed or !sameCacheSetup(&self.model, &model);
     self.client = client;
     self.model = model;
     // An allowance belongs to the account whose response reported it. Session
     // totals span account switches, but this point-in-time gauge must not.
     if (account_changed) self.stats.quota = null;
+    if (cache_setup_changed) self.cache_activity = null;
+}
+
+fn sameCacheSetup(source: *const models.Model, target: *const models.Model) bool {
+    return std.mem.eql(u8, source.name, target.name) and
+        source.cache_retention_ms == target.cache_retention_ms and
+        source.cache_read == target.cache_read and source.cache_write == target.cache_write;
 }
 
 /// Drop the active account and leave the agent signed out. `model` is kept as
-/// the last-shown value. The account-specific allowance is forgotten.
+/// the last-shown value. The account-specific allowance and cache evidence are
+/// forgotten.
 pub fn signOut(self: *Agent) void {
     self.client = null;
     self.stats.quota = null;
+    self.cache_activity = null;
+}
+
+/// Drop cache evidence for an account whose credential changed. A credential
+/// can now identify a different provider principal with an isolated cache.
+pub fn dropCacheEvidence(self: *Agent, account: llm.Account) void {
+    const activity = self.cache_activity orelse return;
+    if (activity.account == account) self.cache_activity = null;
 }
 
 /// Remove replay proofs produced by one account slot. A successful credential
@@ -332,9 +371,45 @@ pub fn dropReasoning(self: *Agent, account: llm.Account) void {
     self.items.shrinkRetainingCapacity(retained_count);
 }
 
-/// Switch the reasoning-effort level. It takes effect on the next turn.
+/// Switch the reasoning-effort level. It takes effect on the next turn. A
+/// change drops cache evidence because the serialized request can change.
 pub fn setEffort(self: *Agent, effort: llm.Effort) void {
+    if (self.effort != effort) self.cache_activity = null;
     self.effort = effort;
+}
+
+/// Estimate the cache rewrite risk for an idle submission. Null means there is
+/// no committed context or no matching cache evidence past its retention.
+pub fn cacheRisk(self: *const Agent) ?CacheRisk {
+    const now = std.Io.Clock.Timestamp.now(self.io, .boot);
+    return self.cacheRiskAt(&now);
+}
+
+fn cacheRiskAt(self: *const Agent, now: *const std.Io.Clock.Timestamp) ?CacheRisk {
+    if (self.items.items.len == 0) return null;
+    const client = self.client orelse return null;
+    const activity = self.cache_activity orelse return null;
+    const retention_ms = self.model.cache_retention_ms orelse return null;
+    if (retention_ms == 0 or activity.prefix_tokens == 0) return null;
+    if (activity.account != client.account() or
+        !std.mem.eql(u8, activity.model, self.model.name) or
+        activity.retention_ms != retention_ms or
+        activity.cache_read != self.model.cache_read or
+        activity.cache_write != self.model.cache_write)
+    {
+        return null;
+    }
+    if (activity.request_at.clock != .boot or now.clock != .boot) return null;
+    const elapsed_ns = activity.request_at.durationTo(now.*).raw.toNanoseconds();
+    const retention_ns = @as(i96, @intCast(retention_ms)) * std.time.ns_per_ms;
+    if (elapsed_ns < retention_ns) return null;
+
+    const fresh = self.model.cost(&.{ .cache_read = activity.prefix_tokens });
+    const stale = self.model.cost(&.{ .cache_write = activity.prefix_tokens });
+    return .{
+        .retention_ms = retention_ms,
+        .cost_extra = @max(0, stale - fresh),
+    };
 }
 
 /// Run one user turn as a checkpointed transaction, stream output through
@@ -540,6 +615,7 @@ fn fetchReply(
     while (true) : (attempt += 1) {
         if (attempt > 1)
             try presentation(&turn.presentation_closed, handler.onStreamReset());
+        const request_at = std.Io.Clock.Timestamp.now(self.io, .boot);
         var stream: @TypeOf(fetch.*).Stream = undefined;
         fetch.send(&stream, &request) catch |err| {
             if (retryableError(err) and attempt < self.retry.attempts_max) {
@@ -574,10 +650,11 @@ fn fetchReply(
             &stream,
             turn,
             &usage_recorded,
+            &request_at,
             handler,
         ) catch |err| switch (err) {
             error.ApiError => {
-                self.recordUsageSoFar(&model, &stream, &usage_recorded);
+                self.recordUsageSoFar(&model, &stream, &usage_recorded, &request_at);
                 if (stream.retryable() and attempt < self.retry.attempts_max) {
                     try self.backoff(.{
                         .attempt = attempt,
@@ -591,11 +668,11 @@ fn fetchReply(
             error.Canceled => {
                 // A cancel that interrupts the read before its terminal `.stop`
                 // still records whatever usage the provider delivered so far.
-                self.recordUsageSoFar(&model, &stream, &usage_recorded);
+                self.recordUsageSoFar(&model, &stream, &usage_recorded, &request_at);
                 return err;
             },
             else => {
-                self.recordUsageSoFar(&model, &stream, &usage_recorded);
+                self.recordUsageSoFar(&model, &stream, &usage_recorded, &request_at);
                 if (retryableError(err) and attempt < self.retry.attempts_max) {
                     try self.backoff(.{ .attempt = attempt });
                     continue;
@@ -685,17 +762,49 @@ fn recordUsage(self: *Agent, model: *const models.Model, usage: *const llm.Usage
     self.stats.attribute(model.name, cost, saved, usage);
 }
 
+/// Record billing and the cache prefix from one provider-accepted request.
+/// `request_at` is the dispatch time, not the later response completion.
+fn recordRequestUsage(
+    self: *Agent,
+    model: *const models.Model,
+    usage: *const llm.Usage,
+    request_at: *const std.Io.Clock.Timestamp,
+) void {
+    self.recordUsage(model, usage);
+    const retention_ms = model.cache_retention_ms orelse {
+        self.cache_activity = null;
+        return;
+    };
+    const account = if (self.client) |client| client.account() else {
+        self.cache_activity = null;
+        return;
+    };
+    // Only the cache buckets become a cheap read on the next request. The
+    // uncached input and the output form a new delta regardless of expiry.
+    const prefix_tokens = usage.cache_read +| usage.cache_write;
+    self.cache_activity = .{
+        .account = account,
+        .model = model.name,
+        .retention_ms = retention_ms,
+        .cache_read = model.cache_read,
+        .cache_write = model.cache_write,
+        .request_at = request_at.*,
+        .prefix_tokens = prefix_tokens,
+    };
+}
+
 /// Record a stream's nonzero running usage unless its terminal event already did.
 fn recordUsageSoFar(
     self: *Agent,
     model: *const models.Model,
     stream: anytype,
     usage_recorded: *bool,
+    request_at: *const std.Io.Clock.Timestamp,
 ) void {
     if (usage_recorded.*) return;
     const usage = stream.usageSoFar();
     if (std.meta.eql(usage, llm.Usage{})) return;
-    self.recordUsage(model, &usage);
+    self.recordRequestUsage(model, &usage, request_at);
     usage_recorded.* = true;
 }
 
@@ -713,7 +822,8 @@ fn readReply(
 ) ![]const llm.Item {
     var turn: TurnState = .{ .base = self.items.items.len, .checkpoint = self.items.items.len };
     var usage_recorded = false;
-    return self.readReplyWith(model, stream, &turn, &usage_recorded, handler);
+    const request_at = std.Io.Clock.Timestamp.now(self.io, .boot);
+    return self.readReplyWith(model, stream, &turn, &usage_recorded, &request_at, handler);
 }
 
 fn readReplyWith(
@@ -722,6 +832,7 @@ fn readReplyWith(
     stream: anytype,
     turn: *TurnState,
     usage_recorded: *bool,
+    request_at: *const std.Io.Clock.Timestamp,
     handler: anytype,
 ) ![]const llm.Item {
     const gpa = self.gpa;
@@ -753,7 +864,7 @@ fn readReplyWith(
     const stop = maybe_stop orelse return error.IncompleteReply;
     // Terminal usage is billable even when replay validation rejects the reply
     // and the request is retried.
-    self.recordUsage(model, &stop.usage);
+    self.recordRequestUsage(model, &stop.usage, request_at);
     usage_recorded.* = true;
     try presentation(presentation_closed, handler.onUsage(self.stats));
 
@@ -1040,9 +1151,14 @@ test "resetConversation clears conversation state and preserves configuration" {
     const cache_key = agent.cache_key;
     agent.effort = .high;
     try agent.appendUser("old prompt");
-    const usage: llm.Usage = .{ .input = 1000, .output = 200 };
-    agent.recordUsage(&agent.model, &usage);
+    const usage: llm.Usage = .{ .input = 1000, .output = 200, .cache_write = 500 };
+    const request_at: std.Io.Clock.Timestamp = .{
+        .raw = .fromNanoseconds(std.time.ns_per_ms),
+        .clock = .boot,
+    };
+    agent.recordRequestUsage(&agent.model, &usage, &request_at);
     try std.testing.expect(agent.stats.model_count == 1);
+    try std.testing.expect(agent.cache_activity != null);
     try agent.steering.push("old steering");
 
     agent.resetConversation();
@@ -1055,6 +1171,7 @@ test "resetConversation clears conversation state and preserves configuration" {
     defer gpa.free(steering);
     try std.testing.expectEqual(@as(usize, 0), steering.len);
     try std.testing.expect(!std.mem.eql(u8, &cache_key, &agent.cache_key));
+    try std.testing.expect(agent.cache_activity == null);
     try std.testing.expectEqual(account, agent.client.?.account());
     try std.testing.expectEqualStrings(model.name, agent.model.name);
     try std.testing.expectEqual(llm.Effort.high, agent.effort);
@@ -1087,6 +1204,129 @@ test "an account change or sign-out clears the previous account's quota" {
     agent.stats.quota = .{ .secondary = .{ .used_percent = 75, .window_minutes = 10080 } };
     agent.signOut();
     try std.testing.expect(agent.stats.quota == null);
+}
+
+test "cache risk follows the active provider retention and refresh time" {
+    const gpa = std.testing.allocator;
+    var anthropic_agent = scriptedAgent(gpa);
+    defer anthropic_agent.deinit();
+    try anthropic_agent.appendUser("committed context");
+
+    const start: std.Io.Clock.Timestamp = .{ .raw = .zero, .clock = .boot };
+    const usage: llm.Usage = .{ .cache_read = 160_000, .cache_write = 40_000 };
+    anthropic_agent.recordRequestUsage(&anthropic_agent.model, &usage, &start);
+
+    const before_anthropic: std.Io.Clock.Timestamp = .{
+        .raw = .fromNanoseconds(5 * std.time.ns_per_min - 1),
+        .clock = .boot,
+    };
+    try std.testing.expect(anthropic_agent.cacheRiskAt(&before_anthropic) == null);
+    const at_anthropic: std.Io.Clock.Timestamp = .{
+        .raw = .fromNanoseconds(5 * std.time.ns_per_min),
+        .clock = .boot,
+    };
+    const anthropic_risk = anthropic_agent.cacheRiskAt(&at_anthropic).?;
+    try std.testing.expectEqual(@as(u64, 5 * std.time.ms_per_min), anthropic_risk.retention_ms);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.15), anthropic_risk.cost_extra, 1e-9);
+
+    const refreshed_at: std.Io.Clock.Timestamp = .{
+        .raw = .fromNanoseconds(4 * std.time.ns_per_min),
+        .clock = .boot,
+    };
+    anthropic_agent.recordRequestUsage(&anthropic_agent.model, &usage, &refreshed_at);
+    try std.testing.expect(anthropic_agent.cacheRiskAt(&at_anthropic) == null);
+    const after_refresh: std.Io.Clock.Timestamp = .{
+        .raw = .fromNanoseconds(9 * std.time.ns_per_min),
+        .clock = .boot,
+    };
+    try std.testing.expect(anthropic_agent.cacheRiskAt(&after_refresh) != null);
+
+    var openai_agent = openaiScriptedAgent(gpa);
+    defer openai_agent.deinit();
+    try openai_agent.appendUser("committed context");
+    openai_agent.recordRequestUsage(&openai_agent.model, &usage, &start);
+    try std.testing.expect(openai_agent.cacheRiskAt(&at_anthropic) == null);
+    const at_openai: std.Io.Clock.Timestamp = .{
+        .raw = .fromNanoseconds(30 * std.time.ns_per_min),
+        .clock = .boot,
+    };
+    try std.testing.expect(openai_agent.cacheRiskAt(&at_openai) != null);
+}
+
+test "cache risk needs matching setup, effort, and a reusable prefix" {
+    const gpa = std.testing.allocator;
+    var agent = scriptedAgent(gpa);
+    defer agent.deinit();
+    const start: std.Io.Clock.Timestamp = .{ .raw = .zero, .clock = .boot };
+    const stale_at: std.Io.Clock.Timestamp = .{
+        .raw = .fromNanoseconds(5 * std.time.ns_per_min),
+        .clock = .boot,
+    };
+
+    agent.recordRequestUsage(&agent.model, &.{ .cache_read = 1000 }, &start);
+    try std.testing.expect(agent.cacheRiskAt(&stale_at) == null);
+    try agent.appendUser("committed context");
+    agent.recordRequestUsage(&agent.model, &.{ .input = 1000 }, &start);
+    try std.testing.expect(agent.cacheRiskAt(&stale_at) == null);
+
+    agent.recordRequestUsage(&agent.model, &.{ .cache_read = 1000 }, &start);
+    try std.testing.expect(agent.cacheRiskAt(&stale_at) != null);
+    agent.setEffort(.none);
+    try std.testing.expect(agent.cache_activity != null);
+    agent.setEffort(.high);
+    try std.testing.expect(agent.cache_activity == null);
+
+    agent.recordRequestUsage(&agent.model, &.{ .cache_read = 1000 }, &start);
+    const client = agent.client.?;
+    agent.switchTo(client, models.get(.anthropic, "claude-sonnet-4-6").?);
+    try std.testing.expect(agent.cache_activity == null);
+
+    agent.recordRequestUsage(&agent.model, &.{ .cache_write = 1000 }, &start);
+    agent.dropCacheEvidence(.anthropic_subscription);
+    try std.testing.expect(agent.cache_activity == null);
+
+    agent.recordRequestUsage(&agent.model, &.{ .cache_write = 1000 }, &start);
+    agent.client = null;
+    agent.recordRequestUsage(&agent.model, &.{ .cache_write = 1000 }, &start);
+    try std.testing.expect(agent.cache_activity == null);
+}
+
+/// A cache-only clock over a real vtable. This test calls only `now`, because
+/// each copied backend function expects the backend's original userdata.
+const CacheClock = struct {
+    vtable: std.Io.VTable,
+    now_ns: i96,
+    requested: ?std.Io.Clock = null,
+
+    fn init(backend: std.Io, now_ns: i96) CacheClock {
+        var vtable = backend.vtable.*;
+        vtable.now = now;
+        return .{ .vtable = vtable, .now_ns = now_ns };
+    }
+
+    fn io(self: *CacheClock) std.Io {
+        return .{ .userdata = self, .vtable = &self.vtable };
+    }
+
+    fn now(userdata: ?*anyopaque, clock: std.Io.Clock) std.Io.Timestamp {
+        const self: *CacheClock = @ptrCast(@alignCast(userdata));
+        self.requested = clock;
+        return .fromNanoseconds(self.now_ns);
+    }
+};
+
+test "cache expiry requests the monotonic boot clock" {
+    const gpa = std.testing.allocator;
+    var agent = scriptedAgent(gpa);
+    defer agent.deinit();
+    try agent.appendUser("committed context");
+    const start: std.Io.Clock.Timestamp = .{ .raw = .zero, .clock = .boot };
+    agent.recordRequestUsage(&agent.model, &.{ .cache_read = 1000 }, &start);
+
+    var clock = CacheClock.init(std.testing.io, 5 * std.time.ns_per_min);
+    agent.io = clock.io();
+    try std.testing.expect(agent.cacheRisk() != null);
+    try std.testing.expectEqual(std.Io.Clock.boot, clock.requested.?);
 }
 
 test "usage is attributed to the model that produced it across a switch" {

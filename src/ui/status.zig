@@ -39,7 +39,7 @@ pub const Info = struct {
 
     pub const Notice = struct {
         text: []const u8,
-        is_error: bool,
+        severity: ai.command.Outcome.Severity,
     };
 };
 
@@ -148,10 +148,17 @@ pub fn render(placement: *const paint.Placement, info: *const Info) !void {
     if (placement.base < placement.skip) return;
     if (info.notice) |notice| {
         const line_end = std.mem.indexOfScalar(u8, notice.text, '\n') orelse notice.text.len;
-        return paint.notice(placement, &.{
-            .style = if (notice.is_error) .red else .dim,
-            .prefix = if (notice.is_error) "Error: " else "",
-        }, notice.text[0..line_end]);
+        const style: color.Style = switch (notice.severity) {
+            .information => .dim,
+            .warning => .warning,
+            .failure => .red,
+        };
+        const prefix = if (notice.severity == .failure) "Error: " else "";
+        return paint.notice(
+            placement,
+            &.{ .style = style, .prefix = prefix },
+            notice.text[0..line_end],
+        );
     }
 
     // Sized so `catch unreachable` is sound. The branch can fill one bounded
@@ -584,7 +591,7 @@ test "a notice replaces the status for exactly one row" {
     const gpa = std.testing.allocator;
     var info = test_info;
     info.model = "hidden-model";
-    info.notice = .{ .text = "boom\nnot another row", .is_error = true };
+    info.notice = .{ .text = "boom\nnot another row", .severity = .failure };
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
     try renderForTest(gpa, &info, 40, &out);
@@ -593,6 +600,20 @@ test "a notice replaces the status for exactly one row" {
     try expectShows(painted, &.{ "Error: ", "boom" });
     try expectHides(painted, &.{ "not another row", "hidden-model" });
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, painted, "\r\n"));
+}
+
+test "a warning notice uses the warning color without an error label" {
+    const gpa = std.testing.allocator;
+    var info = test_info;
+    info.notice = .{ .text = "Enter: Send anyway", .severity = .warning };
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try renderForTest(gpa, &info, 40, &out);
+
+    const painted = out.written();
+    try expectShows(painted, &.{"Enter: Send anyway"});
+    try expectHides(painted, &.{"Error:"});
+    try std.testing.expect(std.mem.indexOf(u8, painted, "\x1b[38;2;240;198;116m") != null);
 }
 
 test "a signed-out status shows the indicator in place of the model" {
