@@ -1233,28 +1233,28 @@ fn submitWithCacheRisk(self: *App, maybe_cache_risk: ?*const ai.Agent.CacheRisk)
     self.session.dirty = true;
 
     if (try self.dispatchCommand(text)) |outcome| {
-        switch (outcome) {
-            .prompt => |prompt| {
-                defer prompt.deinit(self.gpa);
-                if (!self.signedIn()) {
-                    self.session.cancelCacheConfirmation();
-                    self.session.editor.clear();
-                    try self.reportNotice(
-                        .failure,
-                        "Sign in with /login before you send a message.",
-                        .{},
-                    );
-                } else if (try self.preflightModelSubmit(maybe_cache_risk)) {
-                    const base = try self.startSkillTurn(&prompt);
-                    var draft = self.session.editor.detachTrimmed();
-                    self.session.retainTurnPrompt(&draft, base);
-                }
-            },
-            else => {
+        // A skill line starts its own turn, so it keeps the editor's rich draft.
+        // Every other command clears the editor first.
+        if (outcome == .prompt) {
+            const prompt = outcome.prompt;
+            defer prompt.deinit(self.gpa);
+            if (!self.signedIn()) {
                 self.session.cancelCacheConfirmation();
                 self.session.editor.clear();
-                try self.applyOutcome(outcome);
-            },
+                try self.reportNotice(
+                    .failure,
+                    "Sign in with /login before you send a message.",
+                    .{},
+                );
+            } else if (try self.preflightModelSubmit(maybe_cache_risk)) {
+                const base = try self.startSkillTurn(&prompt);
+                var draft = self.session.editor.detachTrimmed();
+                self.session.retainTurnPrompt(&draft, base);
+            }
+        } else {
+            self.session.cancelCacheConfirmation();
+            self.session.editor.clear();
+            try self.applyOutcome(outcome);
         }
     } else if (!self.signedIn()) {
         self.session.cancelCacheConfirmation();
@@ -1688,9 +1688,11 @@ fn handlePickerKey(self: *App, event: *const terminal.Input.Key) !void {
     self.session.dirty = true;
 }
 
-/// Apply the highlighted picker row through its command's selection handler.
+/// Apply the highlighted picker row: the command that opened the picker runs its
+/// own handler over the selected row.
 fn confirmPicker(self: *App) !void {
     const picking = &self.session.mode.picking;
+    const cursor = picking.picker.cursor;
     var context: ai.command.Context = .{
         .gpa = self.gpa,
         .io = self.io,
@@ -1698,7 +1700,7 @@ fn confirmPicker(self: *App) !void {
         .accounts = &self.accounts,
         .skill_registry = &self.skills,
     };
-    const outcome = try picking.select(&context, picking.picker.cursor);
+    const outcome = try picking.select(&context, cursor);
     self.session.closePicker();
     try self.applyOutcome(outcome);
 }

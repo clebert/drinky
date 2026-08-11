@@ -7,8 +7,9 @@ const std = @import("std");
 
 const terminal = @import("terminal");
 
-const color = @import("color.zig");
+const attribute = @import("attribute.zig");
 const paint = @import("paint.zig");
+const role = @import("role.zig");
 
 /// Blanks to slice indents and marker-width continuations from. Its length caps
 /// how far a nested list can push its body.
@@ -21,10 +22,11 @@ const rule_columns = 80;
 
 const rule_cells = rule_cell ** rule_columns;
 
-/// One span's look: the element foreground a reasoning tint replaces, plus the
-/// attributes that survive it. `url` makes the span a terminal hyperlink.
+/// One span's look: the element role a reasoning tint replaces, plus the
+/// attributes that survive it. A span with no role of its own takes `text`, the
+/// role of reply text. `url` makes the span a terminal hyperlink.
 const Look = struct {
-    foreground: ?color.Style = null,
+    role: ?role.Name = null,
     url: []const u8 = "",
     bold: bool = false,
     italic: bool = false,
@@ -32,11 +34,12 @@ const Look = struct {
     strike: bool = false,
 };
 
-const accent_look: Look = .{ .foreground = .accent_foreground };
-const code_look: Look = .{ .foreground = .code_block };
-const muted_look: Look = .{ .foreground = .muted_foreground };
-const quote_look: Look = .{ .foreground = .muted_foreground, .italic = true };
-const link_look: Look = .{ .foreground = .link, .underline = true };
+const accent_look: Look = .{ .role = .accent };
+const code_look: Look = .{ .role = .code };
+const heading_look: Look = .{ .role = .heading };
+const muted_look: Look = .{ .role = .muted };
+const quote_look: Look = .{ .role = .muted, .italic = true };
+const link_look: Look = .{ .role = .link, .underline = true };
 
 /// Physical rows the markdown in `text` occupies at `columns`.
 pub fn rows(text: []const u8, columns: usize) usize {
@@ -70,15 +73,15 @@ pub fn rowAtSource(text: []const u8, options: *const SourceOptions) usize {
 }
 
 /// Compose the markdown in `text` through `placement`. `tint` (set for
-/// reasoning) replaces every span's foreground and italicizes the whole block.
-/// The structure still reads while the color stays uniformly muted.
-pub fn render(placement: *const paint.Placement, tint: ?color.Style, text: []const u8) !void {
+/// reasoning) replaces every span's role and italicizes the whole block. The
+/// structure still reads while the color stays uniformly muted.
+pub fn render(placement: *const paint.Placement, tint: ?role.Name, text: []const u8) !void {
     var painter: Painter = .{ .placement = placement, .tint = tint, .line = placement.base };
     try walk(Painter, &painter, text, @max(placement.columns, 1));
 }
 
 pub const WindowOptions = struct {
-    tint: ?color.Style = null,
+    tint: ?role.Name = null,
     rows_max: usize,
 };
 
@@ -147,7 +150,7 @@ const RowAtSource = struct {
 /// `paint.framedRow` does: it never opens the row, only counts past it.
 const Painter = struct {
     placement: *const paint.Placement,
-    tint: ?color.Style,
+    tint: ?role.Name,
     line: usize,
     line_end: usize = std.math.maxInt(usize),
     hidden: bool = false,
@@ -162,20 +165,23 @@ const Painter = struct {
     fn span(self: *Painter, look: Look, bytes: []const u8) !void {
         if (self.hidden or bytes.len == 0) return;
         const sink = self.placement.sink;
-        const foreground = self.tint orelse look.foreground;
+        // A span with no element role of its own is reply text, which the `text`
+        // role owns. That role keeps the terminal foreground, so a plain
+        // paragraph stays free of every escape sequence.
+        const name = self.tint orelse look.role orelse .text;
         const italic = look.italic or self.tint != null;
-        if (foreground) |style| try color.apply(sink, style);
-        if (look.bold) try color.apply(sink, .bold);
-        if (italic) try color.apply(sink, .italic);
-        if (look.underline) try color.apply(sink, .underline);
-        if (look.strike) try color.apply(sink, .strikethrough);
+        try role.apply(sink, name);
+        if (look.bold) try attribute.apply(sink, .bold);
+        if (italic) try attribute.apply(sink, .italic);
+        if (look.underline) try attribute.apply(sink, .underline);
+        if (look.strike) try attribute.apply(sink, .strikethrough);
         // The link opens and closes inside this span, so it covers exactly the
         // text on this row and never leaks into the row under it.
         try sink.linkSet(look.url);
         try sink.text(bytes);
         try sink.linkReset();
-        if (foreground != null or look.bold or italic or look.underline or look.strike) {
-            try color.apply(sink, .reset);
+        if (role.paints(name) or look.bold or italic or look.underline or look.strike) {
+            try attribute.apply(sink, .reset);
         }
     }
 
@@ -523,16 +529,15 @@ fn walk(comptime Emitter: type, emitter: *Emitter, text: []const u8, columns: us
                 if (!more) try table.borderRow(Emitter, emitter, &Table.border_bottom);
             }
         } else if (headingLevel(rest)) |level| {
-            // Every heading sheds its marker. The level shows in the style: the
-            // first underlines, the second stays bold, and a deeper one keeps
-            // the heading color alone.
+            // Every heading sheds its marker. The level changes the attributes:
+            // the first underlines, the second stays bold, and deeper headings
+            // keep the heading role alone.
             const body = std.mem.trimStart(u8, rest[level..], " ");
             var flow = Flow(Emitter).init(emitter, columns, .{});
-            try inlines(Flow(Emitter), &flow, .{
-                .foreground = .heading,
-                .bold = level <= 2,
-                .underline = level == 1,
-            }, body);
+            var look = heading_look;
+            look.bold = level <= 2;
+            look.underline = level == 1;
+            try inlines(Flow(Emitter), &flow, look, body);
             try flow.finish();
             // Set a heading off from what follows, unless a blank already does.
             const parted = if (lines.peek()) |next| isBlank(next) else true;
@@ -998,11 +1003,11 @@ fn linkLook(url: []const u8) Look {
     return look;
 }
 
-/// An element style over its context: the inner foreground and link target win,
-/// and the attributes add up.
+/// An element style over its context: the inner role and link target win, and
+/// the attributes add up.
 fn merged(base: Look, over: Look) Look {
     return .{
-        .foreground = over.foreground orelse base.foreground,
+        .role = over.role orelse base.role,
         .url = if (over.url.len > 0) over.url else base.url,
         .bold = base.bold or over.bold,
         .italic = base.italic or over.italic,
@@ -1187,7 +1192,7 @@ fn painted(
     gpa: std.mem.Allocator,
     text: []const u8,
     columns: usize,
-    tint: ?color.Style,
+    tint: ?role.Name,
     skip: usize,
 ) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -1195,8 +1200,13 @@ fn painted(
     var view = terminal.View.init(gpa, &out.writer);
     defer view.deinit();
     const sink = try view.beginFrame(.{ .columns = columns, .rows = 2000 }, 1);
-    const placement: paint.Placement =
-        .{ .sink = sink, .id = 0, .columns = columns, .base = 0, .skip = skip };
+    const placement: paint.Placement = .{
+        .sink = sink,
+        .id = 0,
+        .columns = columns,
+        .base = 0,
+        .skip = skip,
+    };
     try render(&placement, tint, text);
     try view.render();
     return gpa.dupe(u8, out.written());
@@ -1211,7 +1221,7 @@ const PaintedWindowOptions = struct {
 fn paintedWindow(
     gpa: std.mem.Allocator,
     text: []const u8,
-    tint: ?color.Style,
+    tint: ?role.Name,
     options: *const PaintedWindowOptions,
 ) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -1310,7 +1320,7 @@ test "markdown renders exactly the rows it counts" {
         "\n\n",
     }) |text| {
         for ([_]usize{ 72, 40, 16, 10, 9, 3, 2, 1 }) |columns| {
-            for ([_]?color.Style{ null, .muted_foreground }) |tint| {
+            for ([_]?role.Name{ null, .muted }) |tint| {
                 const bytes = try painted(gpa, text, columns, tint, 0);
                 defer gpa.free(bytes);
                 try std.testing.expectEqual(rows(text, columns), paintedRows(bytes));
@@ -1407,36 +1417,40 @@ test "fences accept at most three leading spaces" {
 }
 
 // Each element carries its own look, and the markers that produced it are gone.
-test "markdown paints each element in its own style" {
+// Each expectation names a role and takes its bytes from the one role map.
+test "markdown paints each element in its own role" {
     const gpa = std.testing.allocator;
     const bytes = try painted(gpa, sample, 72, null, 0);
     defer gpa.free(bytes);
+    const code = comptime role.sequence(.code);
+    const muted = comptime role.sequence(.muted);
+    const accent = comptime role.sequence(.accent);
+    const heading = comptime role.sequence(.heading);
+    const link = comptime role.sequence(.link);
 
-    // H1 is a bold, underlined heading color with its marker gone. A deeper
-    // heading sheds its marker too and keeps the heading color alone.
-    try std.testing.expect(std.mem.indexOf(u8, bytes, "\x1b[38;2;240;198;116m\x1b[1m\x1b[4m") != null);
-    try std.testing.expect(std.mem.indexOf(u8, bytes, "Heading one") != null);
+    // H1 is bold, underlined, and in the heading role. A deeper heading sheds
+    // its marker too and keeps the heading role alone.
+    const first = heading ++ "\x1b[1m\x1b[4mHeading one";
+    try std.testing.expect(std.mem.indexOf(u8, bytes, first) != null);
     try std.testing.expect(std.mem.indexOfScalar(u8, bytes, '#') == null);
-    const deep = "\x1b[38;2;240;198;116mHeading three";
-    try std.testing.expect(std.mem.indexOf(u8, bytes, deep) != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, heading ++ "Heading three") != null);
     // A heading's emphasis is a span of its own, and the heading's own look
     // still carries it. The re-opened style marks the split.
-    const emphasis = "\x1b[38;2;240;198;116m\x1b[1mtwo";
-    try std.testing.expect(std.mem.indexOf(u8, bytes, emphasis) != null);
-    // Code keeps its two-space indent and its own color. The fence stays muted.
-    try std.testing.expect(std.mem.indexOf(u8, bytes, "\x1b[38;2;181;189;104m") != null);
-    try std.testing.expect(std.mem.indexOf(u8, bytes, "  \x1b[38;2;181;189;104m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, heading ++ "\x1b[1mtwo") != null);
+    // Code keeps its two-space indent and its own role. The fence stays muted.
+    try std.testing.expect(std.mem.indexOf(u8, bytes, code) != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "  " ++ code) != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "const answer = 42;") != null);
-    try std.testing.expect(std.mem.indexOf(u8, bytes, "\x1b[38;2;128;128;128m```zig") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, muted ++ "```zig") != null);
     // A bullet takes the accent, a quote the muted italic, and a rule its cells.
-    try std.testing.expect(std.mem.indexOf(u8, bytes, "\x1b[38;2;138;190;183m- ") != null);
-    try std.testing.expect(std.mem.indexOf(u8, bytes, "\x1b[38;2;128;128;128m\x1b[3ma quoted") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, accent ++ "- ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, muted ++ "\x1b[3ma quoted") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "──") != null);
     // An ordered list keeps the number it started from, and a task its box.
     try std.testing.expect(std.mem.indexOf(u8, bytes, "3. ") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "[ ] ") != null);
-    // A link renders underlined in blue and carries its own target.
-    try std.testing.expect(std.mem.indexOf(u8, bytes, "\x1b[38;2;129;162;190m\x1b[4m") != null);
+    // A link renders underlined in its own role and carries its own target.
+    try std.testing.expect(std.mem.indexOf(u8, bytes, link ++ "\x1b[4m") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "https://example.com") != null);
     // The render slices inline markers away, in a heading as much as a
     // paragraph, and a nested pair sheds both. A `_` inside a word is not
@@ -1468,9 +1482,13 @@ test "a table renders as a box grid with padded cells" {
 
     const bytes = try painted(gpa, tables, 40, null, 0);
     defer gpa.free(bytes);
-    // The header row is bold and the borders take the muted color.
+    // The header row is bold and the borders take the muted role.
     try std.testing.expect(std.mem.indexOf(u8, bytes, "\x1b[1mName") != null);
-    try std.testing.expect(std.mem.indexOf(u8, bytes, "\x1b[38;2;128;128;128m┌") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        bytes,
+        comptime role.sequence(.muted) ++ "┌",
+    ) != null);
 }
 
 // A cell wider than the window cannot widen the grid past it: the widest
@@ -1723,7 +1741,7 @@ test "a quote paints with no border glyph" {
     defer gpa.free(bytes);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "│") == null);
     // The quote is muted and italic, and the nested pair adds its bold on top.
-    const nested = "\x1b[38;2;128;128;128m\x1b[1m\x1b[3mNote:";
+    const nested = comptime role.sequence(.muted) ++ "\x1b[1m\x1b[3mNote:";
     try std.testing.expect(std.mem.indexOf(u8, bytes, nested) != null);
 }
 
@@ -1787,7 +1805,8 @@ test "a bare URL the sink refuses keeps its text and its look" {
     defer gpa.free(bytes);
     try std.testing.expect(std.mem.indexOf(u8, bytes, terminal.escape.link_set) == null);
     // The whole word still reads as a link, not the ASCII head of it.
-    const styled = "\x1b[38;2;129;162;190m\x1b[4mhttps://x.y/\u{00e9}rest\x1b[0m";
+    const styled = comptime role.sequence(.link) ++
+        "\x1b[4mhttps://x.y/\u{00e9}rest\x1b[0m";
     try std.testing.expect(std.mem.indexOf(u8, bytes, styled) != null);
 }
 
@@ -1865,17 +1884,18 @@ test "a line of unmatched brackets scans its tail once" {
 }
 
 // Reasoning reads as one muted, italic block: the tint replaces every element
-// color, while the attributes and the structural markers stay.
-test "a tinted block renders grey and italic throughout" {
+// role, while the attributes and the structural markers stay.
+test "a tinted block renders muted and italic throughout" {
     const gpa = std.testing.allocator;
-    const bytes = try painted(gpa, sample, 72, .muted_foreground, 0);
+    const bytes = try painted(gpa, sample, 72, .muted, 0);
     defer gpa.free(bytes);
 
-    try std.testing.expect(std.mem.indexOf(u8, bytes, "\x1b[38;2;240;198;116m") == null);
-    try std.testing.expect(std.mem.indexOf(u8, bytes, "\x1b[38;2;181;189;104m") == null);
-    try std.testing.expect(std.mem.indexOf(u8, bytes, "\x1b[38;2;138;190;183m") == null);
-    // A heading is still bold, and the bullet is still there — just grey.
-    try std.testing.expect(std.mem.indexOf(u8, bytes, "\x1b[38;2;128;128;128m\x1b[1m\x1b[3m") != null);
+    inline for ([_]role.Name{ .heading, .code, .accent, .link }) |name| {
+        try std.testing.expect(std.mem.indexOf(u8, bytes, role.sequence(name)) == null);
+    }
+    // A heading is still bold, and the bullet is still there — just muted.
+    const muted = comptime role.sequence(.muted) ++ "\x1b[1m\x1b[3m";
+    try std.testing.expect(std.mem.indexOf(u8, bytes, muted) != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "- ") != null);
 }
 

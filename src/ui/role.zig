@@ -1,0 +1,176 @@
+//! The app's presentation roles: the one seam from a semantic role to the SGR
+//! bytes a row carries. A widget names a role and never writes a color of its
+//! own.
+//!
+//! Pith names no RGB value. It emits the ANSI slots 0 to 15 alone and leaves the
+//! default colors in place, so the theme of the terminal decides every value.
+//! The terminal can select values for a dark or light theme. Pith needs no
+//! palette or color configuration. Plain text writes no bytes, so it keeps the
+//! terminal foreground.
+//!
+//! A filled row takes one foreground color plus reverse video. The terminal
+//! swaps that color with its background. The box then keeps the contrast that
+//! the palette slot has against the terminal background. The color and the swap
+//! belong to one role, because either one alone can paint an unreadable row.
+//!
+//! Text emphasis is not a role. The `attribute` module owns the bold, italic,
+//! underline, and strikethrough operations, and the `reset` that closes them.
+//! Every widget also carries a text label or a glyph beside a role, so color is
+//! never the only signal of a state.
+
+const std = @import("std");
+
+const terminal = @import("terminal");
+
+/// What a widget asks for. A role names the part of the interface, never a
+/// color. This list is complete.
+pub const Name = enum {
+    /// Reply and prompt text, in the terminal foreground.
+    text,
+    /// Secondary text, a key hint, a rule, and a separator.
+    muted,
+    /// A list marker, an inline code span, a skill marker, and the moving
+    /// separator segment.
+    accent,
+    /// A Markdown heading.
+    heading,
+    /// A fenced code block.
+    code,
+    /// A link. The caller adds the underline attribute.
+    link,
+    /// A warning that the user can still pass.
+    warning,
+    /// A failure.
+    @"error",
+    /// A user message box.
+    user,
+    /// A running tool box.
+    tool_pending,
+    /// A finished tool box.
+    tool_success,
+    /// A failed tool box.
+    tool_error,
+    /// The selected row of a picker.
+    selection,
+};
+
+/// The complete SGR sequence `name` paints, or an empty sequence for the plain
+/// text role. This map is the only place where a role becomes bytes.
+pub fn sequence(comptime name: Name) []const u8 {
+    return switch (name) {
+        .text => "",
+        .muted => "\x1b[90m",
+        .accent => "\x1b[36m",
+        .heading => "\x1b[33m",
+        .code => "\x1b[32m",
+        .link => "\x1b[34m",
+        .warning => "\x1b[33m",
+        .@"error" => "\x1b[31m",
+        .user => "\x1b[35;7m",
+        .tool_pending => "\x1b[34;7m",
+        .tool_success => "\x1b[32;7m",
+        .tool_error => "\x1b[31;7m",
+        .selection => "\x1b[7m",
+    };
+}
+
+/// Apply `name` to `sink` through the compile-time-validated SGR path. The plain
+/// text role writes nothing, so a row that shows it alone stays free of every
+/// escape sequence.
+pub fn apply(sink: *terminal.View.Sink, name: Name) !void {
+    switch (name) {
+        .text => {},
+        inline else => |tag| try sink.sgr(sequence(tag)),
+    }
+}
+
+/// Whether `name` writes any bytes. A row that paints no role needs no reset.
+pub fn paints(name: Name) bool {
+    return name != .text;
+}
+
+/// The SGR parameters that a role can carry: reverse video, the eight ANSI
+/// foreground slots, the default foreground, and the eight bright slots.
+fn legalParameter(parameter: u16) bool {
+    if (parameter == 7) return true;
+    if (parameter >= 30 and parameter <= 39) return true;
+    return parameter >= 90 and parameter <= 97;
+}
+
+const Pinned = struct { name: Name, sequence: []const u8 };
+
+/// Assert the exact bytes of every role. A role the list leaves out fails, so a
+/// new role cannot reach a release unpinned.
+fn expectSequences(pinned: []const Pinned) !void {
+    var seen: std.EnumSet(Name) = .initEmpty();
+    inline for (std.enums.values(Name)) |name| {
+        for (pinned) |entry| {
+            if (entry.name != name) continue;
+            try std.testing.expectEqualStrings(entry.sequence, sequence(name));
+            seen.insert(name);
+        }
+    }
+    try std.testing.expectEqual(std.enums.values(Name).len, seen.count());
+}
+
+test "the role map pins the SGR sequence for each role" {
+    try expectSequences(&.{
+        .{ .name = .text, .sequence = "" },
+        .{ .name = .muted, .sequence = "\x1b[90m" },
+        .{ .name = .accent, .sequence = "\x1b[36m" },
+        .{ .name = .heading, .sequence = "\x1b[33m" },
+        .{ .name = .code, .sequence = "\x1b[32m" },
+        .{ .name = .link, .sequence = "\x1b[34m" },
+        .{ .name = .warning, .sequence = "\x1b[33m" },
+        .{ .name = .@"error", .sequence = "\x1b[31m" },
+        // Each filled box pairs its color with the video swap. The fill and its
+        // text keep the palette slot's contrast against the terminal background.
+        .{ .name = .user, .sequence = "\x1b[35;7m" },
+        .{ .name = .tool_pending, .sequence = "\x1b[34;7m" },
+        .{ .name = .tool_success, .sequence = "\x1b[32;7m" },
+        .{ .name = .tool_error, .sequence = "\x1b[31;7m" },
+        .{ .name = .selection, .sequence = "\x1b[7m" },
+    });
+}
+
+test "every role paints with the ANSI slots and the default colors alone" {
+    inline for (std.enums.values(Name)) |name| {
+        const bytes = comptime sequence(name);
+        try std.testing.expectEqual(paints(name), bytes.len > 0);
+        if (comptime bytes.len > 0) {
+            try std.testing.expect(std.mem.startsWith(u8, bytes, "\x1b["));
+            try std.testing.expect(std.mem.endsWith(u8, bytes, "m"));
+            // No true color (38;2) and no 256-color (38;5) parameter can hide
+            // here, so the terminal theme owns every value the interface shows.
+            var parameters = std.mem.splitScalar(u8, bytes[2 .. bytes.len - 1], ';');
+            while (parameters.next()) |text| {
+                try std.testing.expect(legalParameter(try std.fmt.parseInt(u16, text, 10)));
+            }
+        }
+    }
+}
+
+test "a role reaches the row as one SGR sequence, and the text role as none" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var view = terminal.View.init(gpa, &out.writer);
+    defer view.deinit();
+
+    const sink = try view.beginFrame(.{ .columns = 20, .rows = 2 }, 1);
+    sink.begin();
+    try apply(sink, .user);
+    try sink.text("title");
+    sink.end(.{ .id = 0, .line = 0 });
+    sink.begin();
+    try apply(sink, .text);
+    try sink.text("plain");
+    sink.end(.{ .id = 0, .line = 1 });
+    try view.render();
+
+    const painted = out.written();
+    try std.testing.expect(std.mem.indexOf(u8, painted, "\x1b[35;7mtitle") != null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "\x1b[0mplain") == null);
+    try std.testing.expect(paints(.user));
+    try std.testing.expect(!paints(.text));
+}

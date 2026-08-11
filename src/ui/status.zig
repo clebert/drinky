@@ -11,8 +11,9 @@ const std = @import("std");
 const ai = @import("ai");
 const terminal = @import("terminal");
 
-const color = @import("color.zig");
+const attribute = @import("attribute.zig");
 const paint = @import("paint.zig");
+const role = @import("role.zig");
 
 pub const Info = struct {
     /// The working directory, with the home directory written as `~`. The caller
@@ -148,15 +149,15 @@ pub fn render(placement: *const paint.Placement, info: *const Info) !void {
     if (placement.base < placement.skip) return;
     if (info.notice) |notice| {
         const line_end = std.mem.indexOfScalar(u8, notice.text, '\n') orelse notice.text.len;
-        const style: color.Style = switch (notice.severity) {
-            .information => .dim,
+        const name: role.Name = switch (notice.severity) {
+            .information => .muted,
             .warning => .warning,
-            .failure => .red,
+            .failure => .@"error",
         };
         const prefix = if (notice.severity == .failure) "Error: " else "";
         return paint.notice(
             placement,
-            &.{ .style = style, .prefix = prefix },
+            &.{ .role = name, .prefix = prefix },
             notice.text[0..line_end],
         );
     }
@@ -186,7 +187,7 @@ pub fn render(placement: *const paint.Placement, info: *const Info) !void {
     }
 
     placement.sink.begin();
-    try color.apply(placement.sink, .dim);
+    try role.apply(placement.sink, .muted);
     if (left_columns + right_columns + 1 <= placement.columns) {
         try placement.sink.text(left_line);
         try placement.sink.spaces(placement.columns - left_columns - right_columns);
@@ -194,7 +195,7 @@ pub fn render(placement: *const paint.Placement, info: *const Info) !void {
     } else {
         try placement.sink.text(terminal.width.truncate(left_line, placement.columns));
     }
-    try color.apply(placement.sink, .reset);
+    try attribute.apply(placement.sink, .reset);
     placement.sink.end(.{ .id = placement.id, .line = placement.base });
 }
 
@@ -392,8 +393,13 @@ fn renderForTest(
     var view = terminal.View.init(gpa, &out.writer);
     defer view.deinit();
     const sink = try view.beginFrame(.{ .columns = columns, .rows = 24 }, 4);
-    const placement: paint.Placement =
-        .{ .sink = sink, .id = 0, .columns = columns, .base = 0, .skip = 0 };
+    const placement: paint.Placement = .{
+        .sink = sink,
+        .id = 0,
+        .columns = columns,
+        .base = 0,
+        .skip = 0,
+    };
     try render(&placement, info);
     try view.render();
 }
@@ -602,7 +608,7 @@ test "a notice replaces the status for exactly one row" {
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, painted, "\r\n"));
 }
 
-test "a warning notice uses the warning color without an error label" {
+test "a warning notice uses the warning role without an error label" {
     const gpa = std.testing.allocator;
     var info = test_info;
     info.notice = .{ .text = "Enter: Send anyway", .severity = .warning };
@@ -613,7 +619,11 @@ test "a warning notice uses the warning color without an error label" {
     const painted = out.written();
     try expectShows(painted, &.{"Enter: Send anyway"});
     try expectHides(painted, &.{"Error:"});
-    try std.testing.expect(std.mem.indexOf(u8, painted, "\x1b[38;2;240;198;116m") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        painted,
+        comptime role.sequence(.warning),
+    ) != null);
 }
 
 test "a signed-out status shows the indicator in place of the model" {

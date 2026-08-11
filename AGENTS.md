@@ -14,7 +14,8 @@ compile error:
   `tool`, `anthropic`).
 - `src/`: the `pith` app. It contains `main`, `App` (the composition root and event loop), the
   `Transcript` model, the `layout` projection onto the bounded window, and the `ui/` widgets drawn
-  on the engine (`Editor`, `Picker`, `status`, and the `block`, `color`, and `paint` primitives).
+  on the engine (`Editor`, `Picker`, `status`, and the `block`, `role`, `attribute`, and `paint`
+  primitives).
 
 Each module has its own test artifact. Its `root.zig` owns the public namespace and is the only
 place where re-exports are allowed. A test only runs if its file is reachable from the module

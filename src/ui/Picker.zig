@@ -8,8 +8,8 @@
 
 const std = @import("std");
 
-const color = @import("color.zig");
 const paint = @import("paint.zig");
+const role = @import("role.zig");
 const terminal = @import("terminal");
 
 const Picker = @This();
@@ -27,9 +27,9 @@ marked: ?usize,
 /// The body between the separators. A selection move rebuilds it.
 /// Columns-independent, so `rows` and `render` only wrap it to fit.
 content: std.ArrayList(u8),
-/// Trusted presentation metadata for each logical line in `content`. Style
-/// bytes never share storage with option text.
-line_styles: std.ArrayList(?color.Style),
+/// Trusted presentation metadata for each logical line in `content`. Role names
+/// never share storage with option text.
+line_roles: std.ArrayList(?role.Name),
 /// The first wrapped body row shown when the body is taller than its slot. The
 /// window scrolls to keep the selection in view. `reflow` maintains it.
 scroll: usize,
@@ -53,12 +53,12 @@ pub fn init(
         .cursor = current orelse 0,
         .marked = current,
         .content = .empty,
-        .line_styles = .empty,
+        .line_roles = .empty,
         .scroll = 0,
         .cursor_offset = 0,
     };
     errdefer self.content.deinit(gpa);
-    errdefer self.line_styles.deinit(gpa);
+    errdefer self.line_roles.deinit(gpa);
     try self.compose();
     return self;
 }
@@ -67,7 +67,7 @@ pub fn deinit(self: *Picker) void {
     for (self.options) |option| self.gpa.free(option);
     self.gpa.free(self.options);
     self.content.deinit(self.gpa);
-    self.line_styles.deinit(self.gpa);
+    self.line_roles.deinit(self.gpa);
 }
 
 pub fn moveUp(self: *Picker) !void {
@@ -115,54 +115,55 @@ pub fn render(self: *const Picker, placement: *const paint.Placement, viewport_r
         .body_rows = visible_rows,
         .hidden_above = self.scroll,
         .hidden_below = total_body - self.scroll - visible_rows,
-        .line_styles = self.line_styles.items,
+        .line_roles = self.line_roles.items,
     });
 }
 
-/// Rebuild `content`: a blank padding row, the dimmed title and key hint, one
-/// row per option (the selected one inverse-video, any pre-existing choice
-/// tagged), then a blank padding row. Rows are `\n`-separated and carry a
-/// one-space left pad. Trusted style lives separately in `line_styles`.
+/// Rebuild `content`: a blank padding row, the muted title and key hint, one row
+/// per option (the selected one in the selection role, any pre-existing choice
+/// tagged), then a blank padding row. Reverse video marks the selection with the
+/// terminal foreground and background. Rows are `\n`-separated and carry a
+/// one-space left pad. The trusted role lives separately in `line_roles`.
 fn compose(self: *Picker) !void {
     self.content.clearRetainingCapacity();
-    self.line_styles.clearRetainingCapacity();
+    self.line_roles.clearRetainingCapacity();
     // Reset with the buffers it indexes into: a failure below must not leave the
     // offset past the shorter rebuilt content for `reflow` to slice.
     self.cursor_offset = 0;
 
     try self.startLine(null);
-    try self.startLine(.dim);
+    try self.startLine(.muted);
     try self.content.append(self.gpa, ' ');
-    try self.appendText(self.title, .dim);
-    try self.startLine(.dim);
+    try self.appendText(self.title, .muted);
+    try self.startLine(.muted);
     try self.content.append(self.gpa, ' ');
-    try self.appendText(hint, .dim);
+    try self.appendText(hint, .muted);
 
     for (self.options, 0..) |option, index| {
         const chosen = index == self.cursor;
-        const style: color.Style = if (chosen) .highlight else .dim;
-        try self.startLine(style);
+        const name: role.Name = if (chosen) .selection else .muted;
+        try self.startLine(name);
         if (chosen) self.cursor_offset = self.content.items.len;
         try self.content.appendSlice(self.gpa, if (chosen) " > " else "   ");
-        try self.appendText(option, style);
+        try self.appendText(option, name);
         if (self.marked == index) try self.content.appendSlice(self.gpa, " (Current)");
     }
 
     try self.startLine(null);
 }
 
-fn startLine(self: *Picker, maybe_style: ?color.Style) !void {
-    if (self.line_styles.items.len > 0) try self.content.append(self.gpa, '\n');
-    try self.line_styles.append(self.gpa, maybe_style);
+fn startLine(self: *Picker, maybe_role: ?role.Name) !void {
+    if (self.line_roles.items.len > 0) try self.content.append(self.gpa, '\n');
+    try self.line_roles.append(self.gpa, maybe_role);
 }
 
-/// Append text to the current logical line and extend style metadata when
+/// Append text to the current logical line and extend the role metadata when
 /// untrusted text itself contains a row break.
-fn appendText(self: *Picker, text: []const u8, style: color.Style) !void {
+fn appendText(self: *Picker, text: []const u8, name: role.Name) !void {
     var pieces = std.mem.splitScalar(u8, text, '\n');
     try self.content.appendSlice(self.gpa, pieces.next().?);
     while (pieces.next()) |piece| {
-        try self.startLine(style);
+        try self.startLine(name);
         try self.content.appendSlice(self.gpa, piece);
     }
 }
@@ -200,7 +201,7 @@ test "compose lays out the title, hint, options, and the current marker" {
     try std.testing.expect(std.mem.indexOf(u8, picker.content.items, "Esc: Cancel") != null);
     try std.testing.expect(std.mem.indexOf(u8, picker.content.items, "alpha (Current)") != null);
     try std.testing.expect(std.mem.indexOfScalar(u8, picker.content.items, 0x1b) == null);
-    try std.testing.expectEqual(color.Style.highlight, picker.line_styles.items[4].?);
+    try std.testing.expectEqual(role.Name.selection, picker.line_roles.items[4].?);
 }
 
 test "a tall option list scrolls the window to keep the selection in view" {
@@ -229,15 +230,22 @@ test "a tall option list scrolls the window to keep the selection in view" {
     var view = terminal.View.init(gpa, &out.writer);
     defer view.deinit();
     const sink = try view.beginFrame(.{ .columns = 80, .rows = 20 }, 4);
-    const placement: paint.Placement =
-        .{ .sink = sink, .id = 0, .columns = 80, .base = 0, .skip = 0 };
+    const placement: paint.Placement = .{
+        .sink = sink,
+        .id = 0,
+        .columns = 80,
+        .base = 0,
+        .skip = 0,
+    };
     try picker.render(&placement, 20);
     try view.render();
     const painted = out.written();
-    // The selected tail option shows, the scrolled-off head does not, and the
-    // top separator reports the rows hidden above the window.
+    // The selected tail option shows in the selection role, the scrolled-off
+    // head does not, and the top separator reports the rows hidden above the
+    // window.
+    const selected = comptime role.sequence(.selection) ++ " > row19\x1b[0m";
     try std.testing.expect(std.mem.indexOf(u8, painted, "row19") != null);
-    try std.testing.expect(std.mem.indexOf(u8, painted, "\x1b[7m > row19\x1b[0m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, selected) != null);
     try std.testing.expect(std.mem.indexOf(u8, painted, "row00") == null);
     try std.testing.expect(std.mem.indexOf(u8, painted, "↑ Hidden: 17") != null);
 }

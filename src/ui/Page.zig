@@ -6,9 +6,10 @@ const std = @import("std");
 
 const terminal = @import("terminal");
 
-const color = @import("color.zig");
+const attribute = @import("attribute.zig");
 const markdown = @import("markdown.zig");
 const paint = @import("paint.zig");
+const role = @import("role.zig");
 
 const Page = @This();
 
@@ -146,9 +147,9 @@ fn renderHeader(self: *const Page, placement: *const paint.Placement) !void {
         .source => header_source,
     };
     placement.sink.begin();
-    try color.apply(placement.sink, .muted_foreground);
+    try role.apply(placement.sink, .muted);
     try placement.sink.text(header);
-    try color.apply(placement.sink, .reset);
+    try attribute.apply(placement.sink, .reset);
     placement.sink.end(.{ .id = placement.id, .line = placement.base });
 }
 
@@ -158,13 +159,10 @@ fn renderMarkdown(
     size: terminal.View.Size,
 ) !void {
     const body_base = placement.base + 1;
-    const body_placement: paint.Placement = .{
-        .sink = placement.sink,
-        .id = placement.id,
-        .columns = placement.columns,
-        .base = body_base,
-        .skip = body_base + self.scroll,
-    };
+    // The derived placement copies its parent. Only the geometry changes.
+    var body_placement = placement.*;
+    body_placement.base = body_base;
+    body_placement.skip = body_base + self.scroll;
     try markdown.renderWindow(&body_placement, self.content, &.{
         .rows_max = bodyRows(size),
     });

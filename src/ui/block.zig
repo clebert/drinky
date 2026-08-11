@@ -11,6 +11,7 @@ const terminal = @import("terminal");
 
 const markdown = @import("markdown.zig");
 const paint = @import("paint.zig");
+const role = @import("role.zig");
 
 pub const Entry = union(enum) {
     intro: std.ArrayList(u8),
@@ -62,29 +63,24 @@ pub const Entry = union(enum) {
     pub fn render(self: *const Entry, placement: *const paint.Placement) !void {
         switch (self.*) {
             .intro => |text| try paint.notice(placement, &.{
-                .style = .dim,
+                .role = .muted,
                 .prefix = "",
             }, text.items),
             .event => |flagged| try paint.notice(placement, &.{
-                .style = if (flagged.is_error) .red else .dim,
+                .role = if (flagged.is_error) .@"error" else .muted,
                 .prefix = if (flagged.is_error) "Error: " else "",
             }, flagged.text.items),
-            .user => |text| try paint.box(placement, &.{
-                .background = .user_background,
-                .foreground = .user_foreground,
-            }, text.items),
+            .user => |text| try paint.box(placement, .user, text.items),
             .skill => |text| try paint.notice(placement, &.{
-                .style = .accent_foreground,
+                .role = .accent,
                 .prefix = "Skill: ",
             }, text.items),
-            .tool_result => |flagged| try paint.box(placement, &.{
-                .background = if (flagged.is_error)
-                    .tool_error_background
-                else
-                    .tool_success_background,
-                .foreground = .tool_foreground,
-            }, flagged.text.items),
-            .thinking => |text| try markdown.render(placement, .muted_foreground, text.items),
+            .tool_result => |flagged| try paint.box(
+                placement,
+                if (flagged.is_error) .tool_error else .tool_success,
+                flagged.text.items,
+            ),
+            .thinking => |text| try markdown.render(placement, .muted, text.items),
             .model => |text| try markdown.render(placement, null, text.items),
         }
     }
@@ -134,8 +130,13 @@ fn renderedRows(gpa: std.mem.Allocator, entry: *const Entry, columns: usize, ski
     var view = terminal.View.init(gpa, &out.writer);
     defer view.deinit();
     const sink = try view.beginFrame(.{ .columns = columns, .rows = 100 }, 8);
-    const placement: paint.Placement =
-        .{ .sink = sink, .id = 0, .columns = columns, .base = 0, .skip = skip };
+    const placement: paint.Placement = .{
+        .sink = sink,
+        .id = 0,
+        .columns = columns,
+        .base = 0,
+        .skip = skip,
+    };
     try entry.render(&placement);
     try view.render();
     return paintedRows(out.written());
@@ -186,7 +187,13 @@ test "a skill entry renders as one compact loaded marker" {
     defer entry.deinit(gpa);
 
     const sink = try view.beginFrame(.{ .columns = 40, .rows = 24 }, 8);
-    try entry.render(&.{ .sink = sink, .id = 0, .columns = 40, .base = 0, .skip = 0 });
+    try entry.render(&.{
+        .sink = sink,
+        .id = 0,
+        .columns = 40,
+        .base = 0,
+        .skip = 0,
+    });
     try view.render();
 
     try std.testing.expectEqual(@as(usize, 1), entry.rows(40));
@@ -204,9 +211,9 @@ test "a clipped block shows its bottom rows" {
     try std.testing.expectEqual(@as(usize, 15), try renderedRows(gpa, &entry, columns, 25));
 }
 
-// An error event must be visibly distinct: the red style and an "Error: "
+// An error event must be visibly distinct: the error role and an "Error: "
 // prefix, both absent from an informational event.
-test "an error event paints the red style and error prefix" {
+test "an error event paints the error role and its prefix" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
@@ -218,14 +225,24 @@ test "an error event paints the red style and error prefix" {
     defer success.deinit(gpa);
 
     const sink = try view.beginFrame(.{ .columns = 40, .rows = 100 }, 8);
-    try failure.render(&.{ .sink = sink, .id = 0, .columns = 40, .base = 0, .skip = 0 });
-    try success.render(&.{ .sink = sink, .id = 1, .columns = 40, .base = 0, .skip = 0 });
+    const placement: paint.Placement = .{
+        .sink = sink,
+        .id = 0,
+        .columns = 40,
+        .base = 0,
+        .skip = 0,
+    };
+    var second = placement;
+    second.id = 1;
+    try failure.render(&placement);
+    try success.render(&second);
     try view.render();
 
     const painted = out.written();
-    try std.testing.expect(std.mem.indexOf(u8, painted, "\x1b[31mError: ") != null);
+    const error_sequence = comptime role.sequence(.@"error");
+    try std.testing.expect(std.mem.indexOf(u8, painted, error_sequence ++ "Error: ") != null);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, painted, "Error: "));
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, painted, "\x1b[31m"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, painted, error_sequence));
 }
 
 // Bounded memory: a clipped block composes only its visible rows into a frame
@@ -251,8 +268,13 @@ test "a clipped block streams into a warmed frame without allocating" {
     // Warm both frames and the output at the block's full size.
     for (0..2) |_| {
         const sink = try view.beginFrame(.{ .columns = columns, .rows = 100 }, 8);
-        const placement: paint.Placement =
-            .{ .sink = sink, .id = 0, .columns = columns, .base = 0, .skip = 0 };
+        const placement: paint.Placement = .{
+            .sink = sink,
+            .id = 0,
+            .columns = columns,
+            .base = 0,
+            .skip = 0,
+        };
         try entry.render(&placement);
         try view.render();
     }
@@ -265,8 +287,13 @@ test "a clipped block streams into a warmed frame without allocating" {
     failing.resize_fail_index = failing.resize_index;
 
     const sink = try view.beginFrame(.{ .columns = columns, .rows = 100 }, 8);
-    const placement: paint.Placement =
-        .{ .sink = sink, .id = 0, .columns = columns, .base = 0, .skip = 30 };
+    const placement: paint.Placement = .{
+        .sink = sink,
+        .id = 0,
+        .columns = columns,
+        .base = 0,
+        .skip = 30,
+    };
     try entry.render(&placement);
     try view.render();
 

@@ -1674,8 +1674,13 @@ fn renderedWithOptions(
     var view = terminal.View.init(gpa, &out.writer);
     defer view.deinit();
     const sink = try view.beginFrame(size, 4);
-    const placement: paint.Placement =
-        .{ .sink = sink, .id = 0, .columns = size.columns, .base = 0, .skip = 0 };
+    const placement: paint.Placement = .{
+        .sink = sink,
+        .id = 0,
+        .columns = size.columns,
+        .base = 0,
+        .skip = 0,
+    };
     try editor.render(&placement, options);
     try view.render();
     return gpa.dupe(u8, out.written());

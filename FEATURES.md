@@ -138,18 +138,17 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
   mid-turn.
 - Repaints are frame-limited at a fixed rate and scheduled only while something is dirty or
   animating.
-- Answer text grows as one block, with reasoning collected into a separate one tinted grey and
-  italic. Both render their markdown: headings, lists, blockquotes, code blocks, rules, tables, and
-  nested inline emphasis. A heading, a quote, and an emphasis span shed their markers. A quote has
-  no border glyph, so a copy out of the terminal holds the text alone.
+- Answer text grows as one block. Reasoning grows in a separate muted and italic block. Both render
+  their markdown: headings, lists, blockquotes, code blocks, rules, tables, and nested inline
+  emphasis. A heading, a quote, and an emphasis span shed their markers. A quote has no border
+  glyph, so a terminal copy holds the text alone.
 - A link becomes a clickable terminal hyperlink when a click can open its target, and a bare URL
   links to itself. Any other target, such as a relative path, shows its URL as text.
 - A pipe table draws as a box grid that fits the window and keeps the indentation of its source. The
   alignment colons parse but do not align. A long cell truncates to its column. A table stays plain
   text when the window is narrower than its smallest grid.
-- A running tool shows a blue box with its name and arguments. It then turns green or red with a
-  one-line stat summary (lines read, matches found, exit status), or its first output line when the
-  tool gives no summary.
+- A running tool shows a pending box with its name and arguments. It then becomes a success or error
+  box with a one-line stat summary. It shows the first output line when the tool gives no summary.
 - One heavy accent segment moves across both open input separators in a loop and grows as progress
   goes quiet without adding a layout row.
 - Queued steering shows as `Queued message:` rows, and becomes one user message once consumed.
@@ -164,6 +163,9 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
   Ctrl+D cancels.
 - The open input area grows to about a quarter of the screen and labels hidden rows "↑ Hidden: N"
   and "↓ Hidden: N".
+- Every color comes from the terminal: pith emits the default colors and the ANSI slots 0 to 15
+  alone. A filled box adds reverse video to one color. A label or a glyph marks every state, so
+  color is never the only signal.
 - Model, tool, and user text can never emit escapes: controls and malformed UTF-8 render as
   replacement characters.
 

@@ -3,9 +3,9 @@
 //! transient notice, the interaction `mode` (prompt / streaming turn / picker /
 //! read-only page), and the `editor`. It also owns the reconciling `view`, the
 //! last laid-out dimensions, and consumer-side snapshots of usage, model, and
-//! account. Everything here is io-, tty-, and agent-free. Producers hand
-//! it `UiEvent`s and `App` drives its mutations. Tests can then drive the
-//! render loop from a scripted event sequence without real io.
+//! account. Everything here is io-, tty-, and agent-free.
+//! Producers hand it `UiEvent`s and `App` drives its mutations. Tests can then
+//! drive the render loop from a scripted event sequence without real io.
 
 const std = @import("std");
 
@@ -131,14 +131,14 @@ const Turn = struct {
     }
 };
 
-/// One running tool call: its blue box shows in the live tail. `name` matches
-/// the result to it. `input_json` labels that result. `box` is the box text
-/// (`name input_json`). All owned, freed on completion.
+/// One running tool call: its pending tool box shows in the live tail. `name`
+/// matches the result to it. `input_json` labels that result. `box` is the box
+/// text (`name input_json`). The session owns all fields and frees them on completion.
 const ActiveTool = struct { name: []const u8, input_json: []const u8, box: []const u8 };
 
 const Picking = struct {
     picker: ui.Picker,
-    /// The selection handler. Picker confirmation calls it with the chosen row.
+    /// The command handler a confirmed row goes to.
     select: *const fn (*ai.command.Context, usize) anyerror!ai.command.Outcome,
     /// The borrowed sentence that identifies the canceled selection.
     cancellation_message: []const u8,
@@ -221,9 +221,8 @@ pub const UiEvent = union(enum) {
     }
 };
 
-/// Build an empty session at the default terminal size. It paints through
-/// `writer` and shows `model` and `effort` until a command changes them.
-/// Infallible: the components own no resources until used.
+/// Build an empty session. It paints through `writer` and shows `model` and
+/// `effort` until a command changes them.
 pub fn init(
     gpa: std.mem.Allocator,
     writer: *std.Io.Writer,
@@ -443,7 +442,7 @@ pub fn applyOutcome(self: *Session, outcome: ai.command.Outcome) !void {
             defer self.gpa.free(event.content);
             try self.transcript.append(.event, event.severity == .failure, event.content);
         },
-        .pick => |pick| try self.openPicker(pick),
+        .pick => |*pick| try self.openPicker(pick),
         // The app intercepts prompt, account, conversation, and inspection
         // actions. They never reach the io-free session.
         .prompt,
@@ -457,8 +456,9 @@ pub fn applyOutcome(self: *Session, outcome: ai.command.Outcome) !void {
     self.dirty = true;
 }
 
-/// Enter picker mode over a command's options. Takes ownership of `pick.options`.
-fn openPicker(self: *Session, pick: ai.command.Outcome.Pick) !void {
+/// Enter picker mode over `pick`, whose confirmation goes to `pick.select`. Takes
+/// ownership of `pick.options`.
+fn openPicker(self: *Session, pick: *const ai.command.Outcome.Pick) !void {
     errdefer {
         for (pick.options) |option| self.gpa.free(option);
         self.gpa.free(pick.options);
@@ -941,8 +941,13 @@ test "a read chunk drives the editor and paints the result" {
         else => {},
     };
     const sink = try view.beginFrame(.{ .columns = 80, .rows = 24 }, 4);
-    const placement: ui.paint.Placement =
-        .{ .sink = sink, .id = 0, .columns = 80, .base = 0, .skip = 0 };
+    const placement: ui.paint.Placement = .{
+        .sink = sink,
+        .id = 0,
+        .columns = 80,
+        .base = 0,
+        .skip = 0,
+    };
     try editor.render(&placement, &.{ .viewport_rows = 24 });
     try view.render();
 
@@ -972,8 +977,13 @@ test "a bracketed paste cannot emit terminal controls" {
         else => return error.UnexpectedInput,
     }
     const sink = try view.beginFrame(.{ .columns = 120, .rows = 24 }, 4);
-    const placement: ui.paint.Placement =
-        .{ .sink = sink, .id = 0, .columns = 120, .base = 0, .skip = 0 };
+    const placement: ui.paint.Placement = .{
+        .sink = sink,
+        .id = 0,
+        .columns = 120,
+        .base = 0,
+        .skip = 0,
+    };
     try editor.render(&placement, &.{ .viewport_rows = 24 });
     try view.render();
 
@@ -1013,8 +1023,13 @@ test "a large bracketed paste collapses to a marker through the real pipeline" {
     try std.testing.expectEqualStrings("\u{200B}[Paste #1: 11 lines]\u{200B}", editor.visible());
 
     const sink = try view.beginFrame(.{ .columns = 80, .rows = 24 }, 4);
-    const placement: ui.paint.Placement =
-        .{ .sink = sink, .id = 0, .columns = 80, .base = 0, .skip = 0 };
+    const placement: ui.paint.Placement = .{
+        .sink = sink,
+        .id = 0,
+        .columns = 80,
+        .base = 0,
+        .skip = 0,
+    };
     try editor.render(&placement, &.{ .viewport_rows = 24 });
     try view.render();
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "[Paste #1: 11 lines]") != null);

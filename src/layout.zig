@@ -104,10 +104,7 @@ const Component = union(enum) {
     ) !void {
         switch (self.*) {
             .entry => |entry| try entry.render(placement),
-            .tool_box => |text| try ui.paint.box(placement, &.{
-                .background = .tool_pending_background,
-                .foreground = .tool_foreground,
-            }, text),
+            .tool_box => |text| try ui.paint.box(placement, .tool_pending, text),
             .steering => |messages| try ui.paint.steering(placement, messages),
             .status => |info| try ui.status.render(placement, info),
             .editor => |presentation| try presentation.editor.render(placement, &.{

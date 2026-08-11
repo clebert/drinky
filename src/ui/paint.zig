@@ -2,29 +2,30 @@
 //! into the view's `Sink` through a `Placement`. They drop the clip's hidden top
 //! rows, so a clipped component never materializes its whole body. The
 //! transcript `block`s and the chrome (the tool box, the input area, and the
-//! status line) share them.
+//! status line) share them. Each painter names a `role.Name`, and that role
+//! decides the color, so no painter holds a color value of its own.
 
 const std = @import("std");
 
 const terminal = @import("terminal");
 
-const color = @import("color.zig");
+const attribute = @import("attribute.zig");
+const role = @import("role.zig");
 
 const activity_length_default: usize = 6;
 // At 16 ms per frame, wait about 500 ms. Then add one cell every 100 ms.
 const activity_growth_delay_ticks: u64 = 31;
 const activity_growth_interval_ticks: u64 = 6;
 
-pub const BoxStyle = struct { background: color.Style, foreground: color.Style };
-
-/// A notice's look: the SGR style that opens every line and a prefix (an error
-/// tag, or empty) that prints before each line's text.
-const Notice = struct { style: color.Style, prefix: []const u8 };
+/// A notice's look: the role that colors every line and a prefix (an error tag,
+/// or empty) that prints before each line's text.
+const Notice = struct { role: role.Name, prefix: []const u8 };
 
 /// Where a component composes its rows: the sink to write into, the anchor `id`
 /// its rows carry, the terminal width, the line its content starts at (`base`,
 /// after any leading separator), and how many of its top rows to drop (`skip`,
-/// nonzero only for the clip).
+/// nonzero only for the clip). A renderer that derives a placement copies its
+/// parent and changes the geometry alone.
 pub const Placement = struct {
     sink: *terminal.View.Sink,
     id: usize,
@@ -77,56 +78,56 @@ pub fn notice(placement: *const Placement, look: *const Notice, text: []const u8
         const available = placement.columns -| terminal.width.ofText(shown_prefix);
         const clipped = terminal.width.truncate(piece, available);
         placement.sink.begin();
-        try color.apply(placement.sink, look.style);
+        try role.apply(placement.sink, look.role);
         try placement.sink.text(shown_prefix);
         try placement.sink.text(clipped);
-        try color.apply(placement.sink, .reset);
+        try attribute.apply(placement.sink, .reset);
         placement.sink.end(.{ .id = placement.id, .line = line });
     }
 }
 
-/// A padded background box: a blank padding row, `text` wrapped to the inner
-/// width with a one-space left pad and the background filled to full width, then
-/// a blank padding row. It streams a row at a time and self-separates inside the
-/// block gap around it.
-pub fn box(placement: *const Placement, style: *const BoxStyle, text: []const u8) !void {
+/// A filled box in one role: a blank padding row, `text` wrapped to the inner
+/// width with a one-space left pad and the fill carried to full width, then a
+/// blank padding row. A box role reverses the video, so the fill takes the color
+/// of the role and the text keeps the terminal background. It streams a row at a
+/// time and self-separates inside the block gap around it.
+pub fn box(placement: *const Placement, name: role.Name, text: []const u8) !void {
     var line = placement.base;
-    try boxPad(placement, &line, style.background);
+    try boxPad(placement, &line, name);
     var iterator = terminal.width.wrapper(text, boxInner(placement.columns));
-    while (iterator.next()) |content| try boxLine(placement, &line, style, content);
-    try boxPad(placement, &line, style.background);
+    while (iterator.next()) |content| try boxLine(placement, &line, name, content);
+    try boxPad(placement, &line, name);
 }
 
-/// A box's blank padding row: the background filled to full width.
-fn boxPad(placement: *const Placement, line: *usize, background: color.Style) !void {
+/// A box's blank padding row: the fill carried to full width.
+fn boxPad(placement: *const Placement, line: *usize, name: role.Name) !void {
     defer line.* += 1;
     if (line.* < placement.skip) return;
     placement.sink.begin();
-    try color.apply(placement.sink, background);
+    try role.apply(placement.sink, name);
     try placement.sink.spaces(placement.columns);
-    try color.apply(placement.sink, .reset);
+    try attribute.apply(placement.sink, .reset);
     placement.sink.end(.{ .id = placement.id, .line = line.* });
 }
 
-/// A box's content row: a one-space left pad, `content`, then the background
-/// filled to full width. A cap on `content` leaves room for the pad, so a
-/// window too narrow for the wrap width still yields one physical row.
+/// A box's content row: a one-space left pad, `content`, then the fill carried
+/// to full width. A cap on `content` leaves room for the pad, so a window too
+/// narrow for the wrap width still yields one physical row.
 fn boxLine(
     placement: *const Placement,
     line: *usize,
-    style: *const BoxStyle,
+    name: role.Name,
     content: []const u8,
 ) !void {
     defer line.* += 1;
     if (line.* < placement.skip) return;
     const shown = terminal.width.truncate(content, placement.columns -| 1);
     placement.sink.begin();
-    try color.apply(placement.sink, style.background);
-    try color.apply(placement.sink, style.foreground);
+    try role.apply(placement.sink, name);
     try placement.sink.text(" ");
     try placement.sink.text(shown);
     try placement.sink.spaces(placement.columns -| (1 + terminal.width.ofText(shown)));
-    try color.apply(placement.sink, .reset);
+    try attribute.apply(placement.sink, .reset);
     placement.sink.end(.{ .id = placement.id, .line = line.* });
 }
 
@@ -163,9 +164,9 @@ pub const Framing = struct {
     /// full-width final line wraps onto, which the wrap itself never yields. It
     /// is the last body row, so it shows only when the window reaches it.
     trailing_row: bool = false,
-    /// Style per logical `\n`-delimited body line (lines past the end are plain).
-    /// Wrapped continuations retain their source line's style.
-    line_styles: []const ?color.Style = &.{},
+    /// The role per logical `\n`-delimited body line (lines past the end are
+    /// plain). Wrapped continuations retain their source line's role.
+    line_roles: []const ?role.Name = &.{},
     activity: ?Activity = null,
 };
 
@@ -210,9 +211,9 @@ pub fn framed(placement: *const Placement, framing: *const Framing) !void {
         source_offset = content_offset;
         if (index < framing.hidden_above) continue;
         if (index >= window_end) break;
-        const styles = framing.line_styles;
-        const maybe_style = if (source_line < styles.len) styles[source_line] else null;
-        try framedRow(placement, framing.caret, &line, content, maybe_style);
+        const roles = framing.line_roles;
+        const maybe_role = if (source_line < roles.len) roles[source_line] else null;
+        try framedRow(placement, framing.caret, &line, content, maybe_role);
         body_count += 1;
     }
     // The wrapper exhausts at `index == wrapped rows`, the trailing row's index.
@@ -232,14 +233,14 @@ fn framedRow(
     maybe_caret: ?terminal.View.Caret,
     line: *usize,
     content: []const u8,
-    maybe_style: ?color.Style,
+    maybe_role: ?role.Name,
 ) !void {
     defer line.* += 1;
     if (line.* < placement.skip) return;
     placement.sink.begin();
-    if (maybe_style) |style| try color.apply(placement.sink, style);
+    if (maybe_role) |name| try role.apply(placement.sink, name);
     try placement.sink.text(content);
-    if (maybe_style != null) try color.apply(placement.sink, .reset);
+    if (maybe_role != null) try attribute.apply(placement.sink, .reset);
     if (maybe_caret) |caret|
         if (placement.base + caret.row == line.*) placement.sink.setCaret(caret.column);
     placement.sink.end(.{ .id = placement.id, .line = line.* });
@@ -259,7 +260,7 @@ fn ruleRow(
     defer line.* += 1;
     if (line.* < placement.skip) return;
     placement.sink.begin();
-    try color.apply(placement.sink, .rule);
+    try role.apply(placement.sink, .muted);
     var buffer: [32]u8 = undefined;
     const maybe_label = moreLabel(&buffer, &.{
         .arrow = arrow,
@@ -269,7 +270,7 @@ fn ruleRow(
     if (maybe_label) |label| {
         const label_start = 3;
         const label_end = label_start + 1 + terminal.width.ofText(label) + 1;
-        try drawRuleRange(placement.sink, separators, &.{
+        try drawRuleRange(placement, separators, &.{
             .rule = rule,
             .start = 0,
             .end = label_start,
@@ -277,19 +278,19 @@ fn ruleRow(
         try placement.sink.text(" ");
         try placement.sink.text(label);
         try placement.sink.text(" ");
-        try drawRuleRange(placement.sink, separators, &.{
+        try drawRuleRange(placement, separators, &.{
             .rule = rule,
             .start = label_end,
             .end = placement.columns,
         });
     } else {
-        try drawRuleRange(placement.sink, separators, &.{
+        try drawRuleRange(placement, separators, &.{
             .rule = rule,
             .start = 0,
             .end = placement.columns,
         });
     }
-    try color.apply(placement.sink, .reset);
+    try attribute.apply(placement.sink, .reset);
     placement.sink.end(.{ .id = placement.id, .line = line.* });
 }
 
@@ -314,18 +315,19 @@ fn labelFits(columns: usize, label: []const u8) bool {
 }
 
 fn drawRuleRange(
-    sink: *terminal.View.Sink,
+    placement: *const Placement,
     separators: *const Separators,
     options: *const RuleRange,
 ) !void {
     std.debug.assert(options.start <= options.end and options.end <= separators.columns);
+    const sink = placement.sink;
     var accent = false;
     var column = options.start;
     while (column < options.end) {
         const cell = separatorCell(separators, options.rule, column);
         if (cell.accent != accent) {
             accent = cell.accent;
-            try color.apply(sink, if (accent) .accent_foreground else .rule);
+            try role.apply(sink, if (accent) .accent else .muted);
         }
         var run_end = column + 1;
         while (run_end < options.end) : (run_end += 1) {
@@ -335,7 +337,7 @@ fn drawRuleRange(
         try writeSeparatorGlyph(sink, cell.glyph, run_end - column);
         column = run_end;
     }
-    if (accent) try color.apply(sink, .rule);
+    if (accent) try role.apply(sink, .muted);
 }
 
 fn separatorCell(separators: *const Separators, rule: Rule, column: usize) SeparatorCell {
@@ -429,7 +431,7 @@ pub fn steeringRows(messages: []const []const u8) usize {
 }
 
 /// The steering queue: a `Queued message: <message>` row per queued message
-/// (each cut to its first line and the window width), then a dim hint row.
+/// (each cut to its first line and the window width), then a faint hint row.
 pub fn steering(placement: *const Placement, messages: []const []const u8) !void {
     var line = placement.base;
     for (messages) |message| {
@@ -442,18 +444,18 @@ pub fn steering(placement: *const Placement, messages: []const []const u8) !void
         const room = placement.columns -| terminal.width.ofText(label);
         const shown = terminal.width.truncate(first, room);
         placement.sink.begin();
-        try color.apply(placement.sink, .accent_foreground);
+        try role.apply(placement.sink, .accent);
         try placement.sink.text(label);
-        try color.apply(placement.sink, .reset);
-        try color.apply(placement.sink, .muted_foreground);
+        try attribute.apply(placement.sink, .reset);
+        try role.apply(placement.sink, .muted);
         try placement.sink.text(shown);
-        try color.apply(placement.sink, .reset);
+        try attribute.apply(placement.sink, .reset);
         placement.sink.end(.{ .id = placement.id, .line = line });
     }
     var hint_placement = placement.*;
     hint_placement.base = line;
     const hint = "\u{21B3} Ctrl+P: Edit all queued messages";
-    try notice(&hint_placement, &.{ .style = .dim, .prefix = "" }, hint);
+    try notice(&hint_placement, &.{ .role = .muted, .prefix = "" }, hint);
 }
 
 test "open separators leave the complete row available to content" {
@@ -563,9 +565,14 @@ test "a wide notice prefix fits in a one-column row" {
     defer view.deinit();
 
     const sink = try view.beginFrame(.{ .columns = 1, .rows = 1 }, 1);
-    const placement: Placement =
-        .{ .sink = sink, .id = 0, .columns = 1, .base = 0, .skip = 0 };
-    try notice(&placement, &.{ .style = .dim, .prefix = "你" }, "hidden");
+    const placement: Placement = .{
+        .sink = sink,
+        .id = 0,
+        .columns = 1,
+        .base = 0,
+        .skip = 0,
+    };
+    try notice(&placement, &.{ .role = .muted, .prefix = "你" }, "hidden");
     try std.testing.expectEqual(@as(usize, 1), sink.columns_written);
     try view.render();
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "hidden") == null);
