@@ -240,14 +240,17 @@ pub fn framed(placement: *const Placement, framing: *const Framing) !void {
     var source_line: usize = 0;
     var body_count: usize = 0;
     var index: usize = 0;
-    while (iterator.next()) |content| : (index += 1) {
-        const content_offset = @intFromPtr(content.ptr) - @intFromPtr(framing.body.ptr);
-        source_line += std.mem.count(u8, framing.body[source_offset..content_offset], "\n");
-        source_offset = content_offset;
+    while (iterator.nextSpan()) |span| : (index += 1) {
+        source_line += std.mem.count(u8, framing.body[source_offset..span.start], "\n");
+        source_offset = span.start;
         if (index < framing.hidden_above) continue;
         if (index >= window_end) break;
         const roles = framing.line_roles;
         const maybe_role = if (source_line < roles.len) roles[source_line] else null;
+        // The span carries the bytes the row covers, so the paint takes the cells
+        // out of it. A row that kept the blanks it breaks at would put them in
+        // every copy of the input.
+        const content = terminal.width.rowText(framing.body[span.start..span.end]);
         try framedRow(placement, maybe_caret, &line, content, maybe_role);
         body_count += 1;
     }
@@ -261,8 +264,9 @@ pub fn framed(placement: *const Placement, framing: *const Framing) !void {
     try ruleRow(placement, &separators, &line, .bottom, "↓", framing.hidden_below);
 }
 
-/// One open body row. It adds no side glyphs or padding, so a terminal copy
-/// contains only the body text. The function drops rows in the clipped top.
+/// One open body row. It adds no side glyphs or padding, and it ends on the last
+/// cell it fills, so a terminal copy contains only the body text. The function
+/// drops rows in the clipped top.
 fn framedRow(
     placement: *const Placement,
     maybe_caret: ?terminal.View.Caret,
@@ -546,6 +550,34 @@ test "box preview cells use the live wrap width" {
 
     try std.testing.expect(std.mem.indexOf(u8, output.written(), " abcdefgh ") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "abcdefghi") == null);
+}
+
+// A box wraps its text between words, so a copy of its rows out of the terminal
+// holds whole words.
+test "a box breaks its rows between words" {
+    const gpa = std.testing.allocator;
+    var output: std.Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    var view = terminal.View.init(gpa, &output.writer);
+    defer view.deinit();
+
+    const text = "one two three four five";
+    const columns = 14;
+    const sink = try view.beginFrame(.{ .columns = columns, .rows = 8 }, 1);
+    try box(&.{
+        .sink = sink,
+        .id = 0,
+        .columns = columns,
+        .base = 0,
+        .skip = 0,
+    }, .user, text);
+    try view.render();
+
+    const painted = output.written();
+    try std.testing.expectEqual(@as(usize, 5), boxRows(text, columns));
+    try std.testing.expect(std.mem.indexOf(u8, painted, " one two ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, " three four ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, " five ") != null);
 }
 
 test "open separators leave the complete row available to content" {

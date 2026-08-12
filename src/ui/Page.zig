@@ -276,9 +276,8 @@ fn sourceRowAtOffset(self: *const Page, source_offset: usize) usize {
     var iterator = terminal.width.wrapper(self.content, @max(self.layout_columns, 1));
     var result: usize = 0;
     var index: usize = 0;
-    while (iterator.next()) |row| : (index += 1) {
-        const offset = @intFromPtr(row.ptr) - @intFromPtr(self.content.ptr);
-        if (offset > target) break;
+    while (iterator.nextSpan()) |span| : (index += 1) {
+        if (span.start > target) break;
         result = index;
     }
     return result;
@@ -287,8 +286,8 @@ fn sourceRowAtOffset(self: *const Page, source_offset: usize) usize {
 fn sourceOffsetAtRow(self: *const Page, target: usize) usize {
     var iterator = terminal.width.wrapper(self.content, @max(self.layout_columns, 1));
     var index: usize = 0;
-    while (iterator.next()) |row| : (index += 1) {
-        if (index == target) return @intFromPtr(row.ptr) - @intFromPtr(self.content.ptr);
+    while (iterator.nextSpan()) |span| : (index += 1) {
+        if (index == target) return span.start;
     }
     return self.content.len;
 }

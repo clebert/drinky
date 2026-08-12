@@ -89,8 +89,10 @@ pub fn reflow(self: *Picker, size: terminal.View.Size) void {
     const columns_max = paint.frameColumns(size.columns);
     const total_body = terminal.width.rows(self.content.items, columns_max);
     const visible = @min(total_body, paint.bodyLimit(size.rows));
-    const prefix = self.content.items[0..self.cursor_offset];
-    const cursor_row = terminal.width.caret(prefix, columns_max).rows_before;
+    const cursor_row = terminal.width.caret(self.content.items, .{
+        .offset = self.cursor_offset,
+        .columns_max = columns_max,
+    }).rows_before;
     if (cursor_row < self.scroll) self.scroll = cursor_row;
     if (cursor_row >= self.scroll + visible) self.scroll = cursor_row - visible + 1;
     self.scroll = @min(self.scroll, total_body - visible);

@@ -562,7 +562,10 @@ pub fn moveEnd(self: *Editor) void {
 pub fn moveUp(self: *Editor, columns: usize) void {
     const columns_max = paint.frameColumns(columns);
     const text = self.draft.visible.items;
-    const row = terminal.width.caret(text[0..self.caret], columns_max).rows_before;
+    const row = terminal.width.caret(text, .{
+        .offset = self.caret,
+        .columns_max = columns_max,
+    }).rows_before;
     if (row == 0) {
         self.moveHome();
         return;
@@ -586,7 +589,10 @@ pub fn moveUp(self: *Editor, columns: usize) void {
 pub fn moveDown(self: *Editor, columns: usize) void {
     const columns_max = paint.frameColumns(columns);
     const text = self.draft.visible.items;
-    const row = terminal.width.caret(text[0..self.caret], columns_max).rows_before;
+    const row = terminal.width.caret(text, .{
+        .offset = self.caret,
+        .columns_max = columns_max,
+    }).rows_before;
     if (row + 1 >= terminal.width.rows(text, columns_max)) {
         self.moveEnd();
         return;
@@ -601,14 +607,18 @@ pub fn moveDown(self: *Editor, columns: usize) void {
 /// within it (each atom one cell, each grapheme its display width).
 const LogicalCaret = struct { row: usize, column: usize };
 
-/// The slice of the visible buffer that display `row` wraps to, or null when `row`
-/// is past the last wrapped row. Both vertical-movement walks take their row start
-/// from this line, so they measure the same wrapped geometry the renderer does.
-fn wrappedLine(self: *const Editor, columns_max: usize, row: usize) ?[]const u8 {
+/// The byte span of the visible buffer that display `row` wraps to, or null when
+/// `row` is past the last wrapped row. Both vertical-movement walks take their row
+/// start from this span, so they measure the wrapped geometry the renderer does.
+fn wrappedSpan(
+    self: *const Editor,
+    columns_max: usize,
+    row: usize,
+) ?terminal.width.Wrapper.Span {
     var iterator = terminal.width.wrapper(self.draft.visible.items, columns_max);
     var current: usize = 0;
-    while (iterator.next()) |line| : (current += 1) {
-        if (current == row) return line;
+    while (iterator.nextSpan()) |span| : (current += 1) {
+        if (current == row) return span;
     }
     return null;
 }
@@ -620,10 +630,9 @@ fn wrappedLine(self: *const Editor, columns_max: usize, row: usize) ?[]const u8 
 /// cell.
 fn logicalColumn(self: *const Editor, columns_max: usize, row: usize) usize {
     const text = self.draft.visible.items;
-    const line = self.wrappedLine(columns_max, row) orelse return 0;
-    const line_start = @intFromPtr(line.ptr) - @intFromPtr(text.ptr);
+    const span = self.wrappedSpan(columns_max, row) orelse return 0;
     var column: usize = 0;
-    var index = self.legalAtOrAfter(line_start);
+    var index = self.legalAtOrAfter(span.start);
     while (index < self.caret) {
         if (self.atomStartingAt(index)) |atom| {
             column += 1;
@@ -638,18 +647,20 @@ fn logicalColumn(self: *const Editor, columns_max: usize, row: usize) usize {
 }
 
 /// The byte offset at `target`'s logical column on its display row: the inverse
-/// of `logicalColumn`, clamped to the row's last legal boundary. A row past the
+/// of `logicalColumn`, clamped to the last offset the row keeps. A row past the
 /// last wrapped row yields the buffer end. The walk always crosses atoms whole, so
 /// the result is a legal caret boundary. It never lands strictly inside a marker,
 /// even when the marker wraps across rows.
 fn logicalOffset(self: *const Editor, columns_max: usize, target: LogicalCaret) usize {
     const text = self.draft.visible.items;
-    const line = self.wrappedLine(columns_max, target.row) orelse return text.len;
-    const line_start = @intFromPtr(line.ptr) - @intFromPtr(text.ptr);
-    const line_end = line_start + line.len;
-    var index = self.legalAtOrAfter(line_start);
+    const span = self.wrappedSpan(columns_max, target.row) orelse return text.len;
+    // A word wrap can end a row before the margin, and every offset past that end
+    // belongs to the row under it. The walk stops at the last offset this row
+    // keeps, or a step up lands on the row it started from and stalls there.
+    const end = terminal.width.caretEnd(text, span, columns_max);
+    var index = self.legalAtOrAfter(span.start);
     var logical: usize = 0;
-    while (index < line_end and logical < target.column) {
+    while (index < end and logical < target.column) {
         if (self.atomStartingAt(index)) |atom| {
             logical += 1;
             index = atom.end;
@@ -694,7 +705,10 @@ pub fn reflow(self: *Editor, size: terminal.View.Size) void {
     const text = self.draft.visible.items;
     const total_body = self.bodyRows(columns_max);
     const visible_rows = @min(total_body, paint.bodyLimit(size.rows));
-    const caret_row = terminal.width.caret(text[0..self.caret], columns_max).rows_before;
+    const caret_row = terminal.width.caret(text, .{
+        .offset = self.caret,
+        .columns_max = columns_max,
+    }).rows_before;
     if (caret_row < self.scroll) self.scroll = caret_row;
     if (caret_row >= self.scroll + visible_rows) self.scroll = caret_row - visible_rows + 1;
     self.scroll = @min(self.scroll, total_body - visible_rows);
@@ -714,7 +728,10 @@ pub fn rows(self: *const Editor, size: terminal.View.Size) usize {
 fn bodyRows(self: *const Editor, columns_max: usize) usize {
     const text = self.draft.visible.items;
     const wrapped = terminal.width.rows(text, columns_max);
-    const caret_row = terminal.width.caret(text[0..self.caret], columns_max).rows_before;
+    const caret_row = terminal.width.caret(text, .{
+        .offset = self.caret,
+        .columns_max = columns_max,
+    }).rows_before;
     return wrapped + @intFromBool(caret_row == wrapped);
 }
 
@@ -745,10 +762,10 @@ pub fn render(
 /// A caret at a full-width line's end reports the empty trailing row that
 /// `bodyRows` reserves.
 fn caretPosition(self: *const Editor, columns: usize) terminal.View.Caret {
-    const position = terminal.width.caret(
-        self.draft.visible.items[0..self.caret],
-        paint.frameColumns(columns),
-    );
+    const position = terminal.width.caret(self.draft.visible.items, .{
+        .offset = self.caret,
+        .columns_max = paint.frameColumns(columns),
+    });
     return .{
         .row = 1 + (position.rows_before - self.scroll),
         .column = position.column,
@@ -1336,8 +1353,10 @@ test "scrolling keeps the caret visible with markers above and below" {
     editor.caret = editor.draft.atoms.items[0].end + 4; // Within "middle".
     editor.reflow(.{ .columns = 80, .rows = 20 });
     const columns_max: usize = 80;
-    const prefix = editor.visible()[0..editor.caret];
-    const caret_row = terminal.width.caret(prefix, columns_max).rows_before;
+    const caret_row = terminal.width.caret(editor.visible(), .{
+        .offset = editor.caret,
+        .columns_max = columns_max,
+    }).rows_before;
     const window = @min(editor.bodyRows(columns_max), paint.bodyLimit(20));
     try std.testing.expect(caret_row >= editor.scroll);
     try std.testing.expect(caret_row < editor.scroll + window);
@@ -1629,6 +1648,21 @@ test "an open input preserves a wide grapheme without side glyphs" {
         try std.testing.expect(std.mem.indexOf(u8, painted, glyph) == null);
 }
 
+// A wrapped row ends on the last cell it fills. The blank the wrap breaks at holds
+// no content, so no copy of the input area carries it.
+test "a wrapped input row paints no trailing blank" {
+    const gpa = std.testing.allocator;
+    var editor = Editor.init(gpa);
+    defer editor.deinit();
+    try editor.insert("aaa bbbb");
+
+    const size: terminal.View.Size = .{ .columns = 5, .rows = 24 };
+    editor.reflow(size);
+    const painted = try rendered(gpa, &editor, size);
+    defer gpa.free(painted);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "\r\naaa\r\nbbbb\r\n") != null);
+}
+
 test "activity crosses the separators without changing the editor height" {
     const gpa = std.testing.allocator;
     var editor = Editor.init(gpa);
@@ -1743,6 +1777,49 @@ test "moveUp and moveDown across wrapped continuation rows" {
     try std.testing.expectEqual(@as(usize, 4), editor.caret); // Row 1, column 1.
     editor.moveUp(3);
     try std.testing.expectEqual(@as(usize, 1), editor.caret);
+}
+
+// The input wraps between words like every other block. The caret then reads the
+// row the whole draft gives it, which the text behind the caret can move.
+test "the caret follows a word the wrap moves to the next row" {
+    var editor = Editor.init(std.testing.allocator);
+    defer editor.deinit();
+    try editor.insert("aaa bbbb");
+    const columns = 5;
+    try std.testing.expectEqual(@as(usize, 2), editor.bodyRows(columns));
+
+    // "bbbb" does not fit behind "aaa ", so the whole word sits on row 1.
+    editor.caret = 6; // In "bbbb", after its second byte.
+    const position: terminal.View.Caret = .{ .row = 2, .column = 2 };
+    try std.testing.expectEqual(position, editor.caretPosition(columns));
+    editor.moveUp(columns);
+    try std.testing.expectEqual(@as(usize, 2), editor.caret); // Row 0, column 2.
+    editor.moveDown(columns);
+    try std.testing.expectEqual(@as(usize, 6), editor.caret);
+}
+
+// A word wrap ends a row before the margin, so a goal column can reach past the
+// row above. The step up must still land on that row, or the sticky goal holds the
+// caret where it started and every further step up does nothing.
+test "a step up onto a short wrapped row lands on that row" {
+    var editor = Editor.init(std.testing.allocator);
+    defer editor.deinit();
+    try editor.insert("aaa bbbb");
+    const columns = 5;
+    editor.caret = 8; // End of "bbbb": row 1, column 4.
+    try std.testing.expectEqual(@as(usize, 2), terminal.width.rows(editor.visible(), columns));
+
+    // Row 0 holds "aaa" and the blank it breaks at. Its last caret is column 3.
+    editor.moveUp(columns);
+    try std.testing.expectEqual(@as(usize, 3), editor.caret);
+    try expectCaretAt(&editor, columns, .{ .row = 1, .column = 3 });
+    // The goal survives the clamp, so the way back down keeps the column.
+    editor.moveDown(columns);
+    try std.testing.expectEqual(@as(usize, 8), editor.caret);
+    // A second step up from the top row falls back to the start.
+    editor.moveUp(columns);
+    editor.moveUp(columns);
+    try std.testing.expectEqual(@as(usize, 0), editor.caret);
 }
 
 test "moveUp off the top row jumps to the start and clears the goal" {

@@ -1,4 +1,4 @@
-//! Display-width measurement, canonicalization, and hard-wrapping of text as a
+//! Display-width measurement, canonicalization, and word wrapping of text as a
 //! mode-2027 terminal renders it: one UAX #29 grapheme cluster per cell step.
 
 const std = @import("std");
@@ -45,41 +45,76 @@ pub fn writeFitted(writer: *std.Io.Writer, text: []const u8, columns_max: usize)
     return writeCanonical(writer, text, columns_max);
 }
 
-/// A streamed hard-wrap: `next` yields each line (a slice into `text`) of at
+/// A streamed word wrap: `next` yields each line (a slice into `text`) of at
 /// most `columns_max` display columns, then null. A caller can thus drop the
-/// rows above a window and never materialize the list. The wrap breaks strictly
-/// on width, never inside a grapheme cluster. An explicit `\n` starts a new line
-/// and never reaches the output.
+/// rows above a window and never materialize the list.
+///
+/// A row breaks between two words, so a terminal copy of the rows holds whole
+/// words. A word too long for a row of its own breaks inside itself, which is
+/// also what text with no blank, such as a CJK run, does. No break falls inside
+/// a grapheme cluster. An explicit `\n` starts a new line and never reaches the
+/// output.
+///
+/// `next` yields the cells a row paints, so it drops the blanks the wrap breaks
+/// at (see `rowText`). `nextSpan` yields the bytes a row covers instead: the
+/// spans are contiguous, so they cover `text` apart from the line breaks the
+/// wrap consumes. A caller that maps a row onto its source takes the span, and
+/// applies `rowText` before it paints.
+///
+/// The wrap takes one `nextWord` at a time. A caller that composes a row from
+/// styled pieces places words the same way, so both break a row at one policy.
 pub const Wrapper = struct {
     text: []const u8,
     columns_max: usize,
     line_start: usize,
     done: bool,
 
+    /// One wrapped line as a byte span of `text`. A caller that maps a row back
+    /// onto its source reads the offsets from here.
+    pub const Span = struct { start: usize, end: usize };
+
     pub fn next(self: *Wrapper) ?[]const u8 {
+        const span = self.nextSpan() orelse return null;
+        return rowText(self.text[span.start..span.end]);
+    }
+
+    /// The bytes of each line `next` yields, as spans of `text`.
+    pub fn nextSpan(self: *Wrapper) ?Span {
         if (self.done) return null;
         const text = self.text;
+        const start = self.line_start;
         var columns: usize = 0;
-        var index = self.line_start;
+        var index = start;
         while (index < text.len) {
-            const byte = text[index];
-            if (byte == '\n') {
-                const line = text[self.line_start..index];
+            if (displayUnit(text[index..]).kind == .line_break) {
                 self.line_start = index + 1;
-                return line;
+                return .{ .start = start, .end = index };
             }
-            const unit = displayUnit(text[index..]);
-            const unit_columns = fittedColumns(&unit, self.columns_max);
-            if (columns + unit_columns > self.columns_max and index > self.line_start) {
-                const line = text[self.line_start..index];
-                self.line_start = index;
-                return line;
+            // The blanks behind a word ride with it, so no row opens on a blank.
+            // They never decide a break either: a row ends on them, and `rowText`
+            // drops them from the cells it paints.
+            const word = nextWord(text[index..], self.columns_max);
+            std.debug.assert(word.bytes > 0);
+            if (columns + word.columns > self.columns_max) {
+                if (index > start) {
+                    // The word takes the next row whole.
+                    self.line_start = index;
+                    return .{ .start = start, .end = index };
+                }
+                // A word too long for a row of its own breaks inside itself.
+                // Against a room of one, `truncate` still yields one cluster, so
+                // the row advances. A zero-column room fits no word at all, so
+                // the branch never runs there and the line stays one row.
+                const cut = truncate(text[index..], self.columns_max);
+                std.debug.assert(cut.len > 0);
+                self.line_start = index + cut.len;
+                return .{ .start = start, .end = self.line_start };
             }
-            columns += unit_columns;
-            index += unit.bytes;
+            columns += word.columns + word.blank_columns;
+            index += word.bytes;
         }
         self.done = true;
-        return text[self.line_start..];
+        return .{ .start = start, .end = text.len };
     }
 };
 
@@ -89,9 +124,17 @@ pub fn wrapper(text: []const u8, columns_max: usize) Wrapper {
     return .{ .text = text, .columns_max = columns_max, .line_start = 0, .done = false };
 }
 
-/// Physical rows `text` occupies once hard-wrapped to `columns_max`: the count
-/// of lines `wrapper` yields, always at least one. A wide cluster that straddles
-/// the margin breaks to the next row, so this is not `ceil(width / columns)`.
+/// The cells one wrapped row paints: `text` without the blanks it ends on. A
+/// break moves the word behind those blanks to the next row, so they hold no
+/// content. A row that paints them puts them in every copy of the terminal text,
+/// and the ones at the margin reach no cell at all.
+pub fn rowText(text: []const u8) []const u8 {
+    return std.mem.trimEnd(u8, text, " \t");
+}
+
+/// Physical rows `text` occupies once wrapped to `columns_max`: the count of
+/// lines `wrapper` yields, always at least one. A word and a wide cluster both
+/// move to the next row whole, so this is not `ceil(width / columns)`.
 pub fn rows(text: []const u8, columns_max: usize) usize {
     var iterator = wrapper(text, columns_max);
     var count: usize = 0;
@@ -99,28 +142,103 @@ pub fn rows(text: []const u8, columns_max: usize) usize {
     return count;
 }
 
-pub const Caret = struct { rows_before: usize, column: usize };
+pub const Caret = struct {
+    rows_before: usize,
+    column: usize,
 
-/// Physical position of a caret at the end of `text` once wrapped to
-/// `columns_max`. The result is how many row breaks precede it and its column
-/// within that row.
-/// Pass the prefix before the caret. A greedy width wrap never lets later
-/// content move an earlier break, so the suffix cannot change the answer. A
-/// prefix that fills a row exactly wraps the caret onto the next row's first
-/// column, because no cell exists at the margin. `text` must end on a canonical
-/// display boundary.
-pub fn caret(text: []const u8, columns_max: usize) Caret {
+    /// Which caret `caret` places, and how wide the rows it wraps to are.
+    pub const Options = struct { offset: usize, columns_max: usize };
+};
+
+/// Physical position of the caret at `options.offset` once `text` wraps to
+/// `options.columns_max`. The result is how many row breaks precede the caret and
+/// its column within that row.
+///
+/// A word wrap moves a break with the text behind the caret, so the whole text
+/// decides the answer and the prefix alone cannot. A caret on a row break belongs
+/// to the row under it, at that row's first column. A caret that fills a row
+/// exactly wraps the same way, because no cell exists at the margin. Every offset
+/// in the blanks that pass the margin reports that same first column, because the
+/// terminal holds no cell that separates them. `caretEnd` names the last offset
+/// one row keeps. `options.offset` must be a canonical display boundary.
+pub fn caret(text: []const u8, options: Caret.Options) Caret {
+    const columns_max = options.columns_max;
+    const target = @min(options.offset, text.len);
     var iterator = wrapper(text, columns_max);
     var result: Caret = .{ .rows_before = 0, .column = 0 };
-    var first = true;
-    while (iterator.next()) |line| {
-        if (!first) result.rows_before += 1;
-        first = false;
-        result.column = fittedWidth(line, columns_max);
+    var row: usize = 0;
+    while (iterator.nextSpan()) |span| : (row += 1) {
+        if (span.start > target) break;
+        const line = text[span.start..@min(span.end, target)];
+        // A row's trailing blanks can pass the margin, so the clamp keeps a
+        // caret among them at the last column the terminal shows.
+        result = .{
+            .rows_before = row,
+            .column = @min(fittedWidth(line, columns_max), columns_max),
+        };
     }
     if (columns_max != 0 and result.column == columns_max) {
         result.rows_before += 1;
         result.column = 0;
+    }
+    return result;
+}
+
+/// The last offset of one wrapped row that `caret` still places on that row.
+/// `span` comes from `Wrapper.nextSpan` at the same `columns_max`.
+///
+/// A caret at the margin moves to the row under it, and a wrap break puts
+/// `span.end` there too, so the row holds neither. A caller that maps a column
+/// back onto an offset must stop here, or the offset it returns names a row it
+/// did not aim at.
+pub fn caretEnd(text: []const u8, span: Wrapper.Span, columns_max: usize) usize {
+    // A zero-column window breaks no row, so one logical line is one row and that
+    // row keeps every offset in it.
+    if (columns_max == 0) return span.end;
+    // A wrap break carries its offset onto the next row. A line break and the end
+    // of the text both leave it on this row.
+    const wrapped = span.end < text.len and text[span.end] != '\n';
+    var result = span.start;
+    var index = span.start;
+    var columns: usize = 0;
+    while (index < span.end) {
+        const next = boundaryAfter(text, index);
+        columns += ofText(text[index..next]);
+        if (columns >= columns_max) break;
+        index = next;
+        if (index < span.end or !wrapped) result = index;
+    }
+    return result;
+}
+
+/// One word of `text` and the blanks behind it: `bytes` is what one row consumes,
+/// `columns` measures the word alone, and `blank_columns` the blanks.
+pub const Word = struct { bytes: usize, columns: usize, blank_columns: usize };
+
+/// The next word of `text` on a row `columns_max` columns wide. A word ends at
+/// the first blank or line break behind it, and the blanks that follow it ride
+/// with it. Text that starts with blanks yields those blanks and no word, which
+/// is what a caller sees where it resumes mid-row.
+///
+/// The measures fit `columns_max` the way a row that wide renders the word, so a
+/// cluster wider than the whole row counts as its one-column replacement. A line
+/// break stays in `text` and adds nothing, so the caller decides what it does.
+///
+/// A caller that composes a row from several styled pieces places one word at a
+/// time, so it breaks its rows where `Wrapper` breaks a plain one.
+pub fn nextWord(text: []const u8, columns_max: usize) Word {
+    var result: Word = .{ .bytes = 0, .columns = 0, .blank_columns = 0 };
+    while (result.bytes < text.len) {
+        const unit = displayUnit(text[result.bytes..]);
+        if (unit.kind == .line_break or blankUnit(text[result.bytes..], &unit)) break;
+        result.columns += fittedColumns(&unit, columns_max);
+        result.bytes += unit.bytes;
+    }
+    while (result.bytes < text.len) {
+        const unit = displayUnit(text[result.bytes..]);
+        if (unit.kind == .line_break or !blankUnit(text[result.bytes..], &unit)) break;
+        result.blank_columns += fittedColumns(&unit, columns_max);
+        result.bytes += unit.bytes;
     }
     return result;
 }
@@ -209,6 +327,13 @@ fn printableUnit(text: []const u8) DisplayUnit {
 
 fn replacementUnit() DisplayUnit {
     return .{ .bytes = 1, .columns = 1, .kind = .replacement };
+}
+
+/// Whether the display unit at the head of `text` is a blank: a space or a tab.
+/// A word starts after a run of blanks. Every other unit, a no-break space
+/// included, holds a word together.
+fn blankUnit(text: []const u8, unit: *const DisplayUnit) bool {
+    return unit.bytes == 1 and (text[0] == ' ' or text[0] == '\t');
 }
 
 fn fittedWidth(text: []const u8, columns_max: usize) usize {
@@ -337,7 +462,7 @@ test "a grapheme wider than one column has a fitted replacement" {
     try std.testing.expectEqualStrings(replacement, out.written());
     try std.testing.expectEqual(@as(usize, 1), columns);
     try std.testing.expectEqual(@as(usize, 1), rows("你", 1));
-    try std.testing.expectEqual(Caret{ .rows_before = 1, .column = 0 }, caret("你", 1));
+    try expectCaret(.{ .text = "你", .offset = 3, .columns_max = 1, .rows_before = 1 });
 }
 
 test "grapheme clusters measure as one terminal cell" {
@@ -381,6 +506,11 @@ test wrapper {
     try std.testing.expectEqualStrings("def", basic.next().?);
     try std.testing.expect(basic.next() == null);
 
+    var tabbed = wrapper("ab\tcd", 4);
+    try std.testing.expectEqualStrings("ab", tabbed.next().?);
+    try std.testing.expectEqualStrings("cd", tabbed.next().?);
+    try std.testing.expect(tabbed.next() == null);
+
     var wide = wrapper("你好世", 3);
     try std.testing.expectEqualStrings("你", wide.next().?);
     try std.testing.expectEqualStrings("好", wide.next().?);
@@ -400,11 +530,82 @@ test wrapper {
     try std.testing.expectEqualStrings("ab", newline.next().?);
     try std.testing.expectEqualStrings("cd", newline.next().?);
     try std.testing.expect(newline.next() == null);
+
+    // A zero-column window fits no word, so every logical line stays one row and
+    // the wrap still advances.
+    var narrow = wrapper("ab cd\nef", 0);
+    try std.testing.expectEqualStrings("ab cd", narrow.next().?);
+    try std.testing.expectEqualStrings("ef", narrow.next().?);
+    try std.testing.expect(narrow.next() == null);
+}
+
+test "the wrap breaks between words and keeps each word whole" {
+    var prose = wrapper("one two three", 7);
+    try std.testing.expectEqualStrings("one two", prose.next().?);
+    try std.testing.expectEqualStrings("three", prose.next().?);
+    try std.testing.expect(prose.next() == null);
+
+    // The word moves down whole, however much of the row it leaves empty.
+    var early = wrapper("aaa bbbb", 5);
+    try std.testing.expectEqualStrings("aaa", early.next().?);
+    try std.testing.expectEqualStrings("bbbb", early.next().?);
+    try std.testing.expect(early.next() == null);
+
+    // A word too long for a row of its own breaks inside itself.
+    var long = wrapper("aaa bbbbbbb", 5);
+    try std.testing.expectEqualStrings("aaa", long.next().?);
+    try std.testing.expectEqualStrings("bbbbb", long.next().?);
+    try std.testing.expectEqualStrings("bb", long.next().?);
+    try std.testing.expect(long.next() == null);
+
+    // A row ends on the blanks it breaks at. They hold no content, so the row
+    // covers them and paints none of them.
+    const spaced = "abcde   fgh";
+    var blanks = wrapper(spaced, 5);
+    const first = blanks.nextSpan().?;
+    try std.testing.expectEqual(Wrapper.Span{ .start = 0, .end = 8 }, first);
+    try std.testing.expectEqualStrings("abcde", rowText(spaced[first.start..first.end]));
+    try std.testing.expectEqualStrings("fgh", blanks.next().?);
+    try std.testing.expect(blanks.next() == null);
+
+    // A no-break space holds its word together, so the whole word moves down.
+    var joined = wrapper("ab c\u{00A0}d", 4);
+    try std.testing.expectEqualStrings("ab", joined.next().?);
+    try std.testing.expectEqualStrings("c\u{00A0}d", joined.next().?);
+    try std.testing.expect(joined.next() == null);
+}
+
+test nextWord {
+    const one: Word = .{ .bytes = 4, .columns = 3, .blank_columns = 1 };
+    try std.testing.expectEqual(one, nextWord("one two", 80));
+    const last: Word = .{ .bytes = 3, .columns = 3, .blank_columns = 0 };
+    try std.testing.expectEqual(last, nextWord("two", 80));
+    const blanks: Word = .{ .bytes = 2, .columns = 0, .blank_columns = 2 };
+    try std.testing.expectEqual(blanks, nextWord("  two", 80));
+    const empty: Word = .{ .bytes = 0, .columns = 0, .blank_columns = 0 };
+    try std.testing.expectEqual(empty, nextWord("", 80));
+    const wide: Word = .{ .bytes = 8, .columns = 4, .blank_columns = 2 };
+    try std.testing.expectEqual(wide, nextWord("你好\t x", 80));
+    // A line break ends the word and stays in the text.
+    const line: Word = .{ .bytes = 2, .columns = 2, .blank_columns = 0 };
+    try std.testing.expectEqual(line, nextWord("ab\ncd", 80));
+    const line_blanks: Word = .{ .bytes = 3, .columns = 2, .blank_columns = 1 };
+    try std.testing.expectEqual(line_blanks, nextWord("ab \ncd", 80));
+    const broken: Word = .{ .bytes = 0, .columns = 0, .blank_columns = 0 };
+    try std.testing.expectEqual(broken, nextWord("\nab", 80));
+    // The measures fit the row: a cluster wider than the whole row counts as the
+    // one-column replacement the fitted writer leaves there.
+    const narrow: Word = .{ .bytes = 6, .columns = 2, .blank_columns = 0 };
+    try std.testing.expectEqual(narrow, nextWord("你好", 1));
+    // A zero-column row fits nothing, so every measure is zero.
+    const none: Word = .{ .bytes = 4, .columns = 0, .blank_columns = 0 };
+    try std.testing.expectEqual(none, nextWord("word", 0));
 }
 
 test rows {
     try std.testing.expectEqual(@as(usize, 1), rows("", 3));
     try std.testing.expectEqual(@as(usize, 2), rows("abcd", 3));
+    try std.testing.expectEqual(@as(usize, 2), rows("one two three", 7));
 }
 
 test "canonical display boundaries follow rendered replacement units" {
@@ -416,14 +617,92 @@ test "canonical display boundaries follow rendered replacement units" {
     try std.testing.expectEqual(@as(usize, 3), boundaryAtOrAfter("e\u{0301}", 1));
 }
 
+/// One `caret` case: where the caret sits in `text`, how wide a row is, and the
+/// physical position the wrap must give the caret.
+const CaretCase = struct {
+    text: []const u8,
+    offset: usize,
+    columns_max: usize,
+    rows_before: usize = 0,
+    column: usize = 0,
+};
+
+fn expectCaret(case: CaretCase) !void {
+    errdefer std.debug.print("The caret case is \"{s}\" at offset {d} in {d} columns.\n", .{
+        case.text,
+        case.offset,
+        case.columns_max,
+    });
+    const expected: Caret = .{ .rows_before = case.rows_before, .column = case.column };
+    const options: Caret.Options = .{ .offset = case.offset, .columns_max = case.columns_max };
+    try std.testing.expectEqual(expected, caret(case.text, options));
+}
+
 test caret {
-    try std.testing.expectEqual(Caret{ .rows_before = 0, .column = 0 }, caret("", 3));
-    try std.testing.expectEqual(Caret{ .rows_before = 0, .column = 2 }, caret("he", 3));
-    try std.testing.expectEqual(Caret{ .rows_before = 1, .column = 0 }, caret("hel", 3));
-    try std.testing.expectEqual(Caret{ .rows_before = 1, .column = 0 }, caret("你你", 4));
-    try std.testing.expectEqual(Caret{ .rows_before = 1, .column = 1 }, caret("hell", 3));
-    try std.testing.expectEqual(Caret{ .rows_before = 1, .column = 2 }, caret("你好", 3));
-    try std.testing.expectEqual(Caret{ .rows_before = 1, .column = 1 }, caret("ab\nc", 10));
-    try std.testing.expectEqual(Caret{ .rows_before = 1, .column = 0 }, caret("a\n", 10));
-    try std.testing.expectEqual(Caret{ .rows_before = 2, .column = 0 }, caret("a\n\n", 10));
+    for ([_]CaretCase{
+        .{ .text = "", .offset = 0, .columns_max = 3 },
+        .{ .text = "he", .offset = 2, .columns_max = 3, .column = 2 },
+        .{ .text = "hel", .offset = 3, .columns_max = 3, .rows_before = 1 },
+        .{ .text = "你你", .offset = 6, .columns_max = 4, .rows_before = 1 },
+        .{ .text = "hello", .offset = 4, .columns_max = 3, .rows_before = 1, .column = 1 },
+        .{ .text = "你好", .offset = 6, .columns_max = 3, .rows_before = 1, .column = 2 },
+        .{ .text = "ab\ncd", .offset = 4, .columns_max = 10, .rows_before = 1, .column = 1 },
+        .{ .text = "a\n", .offset = 2, .columns_max = 10, .rows_before = 1 },
+        .{ .text = "a\n\n", .offset = 3, .columns_max = 10, .rows_before = 2 },
+        // An offset in the middle reads the row the whole text wraps it onto.
+        .{ .text = "abcd", .offset = 1, .columns_max = 3, .column = 1 },
+        .{ .text = "abcd", .offset = 3, .columns_max = 3, .rows_before = 1 },
+    }) |case| try expectCaret(case);
+}
+
+test "a caret reads the row the word wrap gives it" {
+    for ([_]CaretCase{
+        // The word moves to the next row, and the caret inside it moves with it.
+        .{ .text = "aaa bbbb", .offset = 6, .columns_max = 5, .rows_before = 1, .column = 2 },
+        // A caret between the blanks and the word sits on the word's first column.
+        .{ .text = "aaa bbbb", .offset = 4, .columns_max = 5, .rows_before = 1 },
+        // The blanks a row ends with pass the margin, so every caret among them
+        // reads the first column of the row under them.
+        .{ .text = "abcde  f", .offset = 6, .columns_max = 5, .rows_before = 1 },
+        .{ .text = "abcde  f", .offset = 7, .columns_max = 5, .rows_before = 1 },
+    }) |case| try expectCaret(case);
+}
+
+test caretEnd {
+    const columns_max = 5;
+    // A wrap break ends the row before the blank it breaks at. The last row keeps
+    // its own end, because no row follows it.
+    const prose = "aaa bbbb";
+    var iterator = wrapper(prose, columns_max);
+    const first = caretEnd(prose, iterator.nextSpan().?, columns_max);
+    try std.testing.expectEqual(@as(usize, 3), first);
+    const second = caretEnd(prose, iterator.nextSpan().?, columns_max);
+    try std.testing.expectEqual(@as(usize, 8), second);
+
+    // Every offset a row keeps reports that row, and the offset after the last one
+    // reports a row below. This is the contract `caret` and `caretEnd` share. A
+    // zero-column window keeps it too, where one logical line is one row.
+    for ([_]usize{ 5, 1, 0 }) |columns| {
+        for ([_][]const u8{ "", "aaa bbbb", "abcde  f", "abc\ndef", "aaa  ", "你好世界" }) |text| {
+            var rows_iterator = wrapper(text, columns);
+            var row: usize = 0;
+            while (rows_iterator.nextSpan()) |span| : (row += 1) {
+                const end = caretEnd(text, span, columns);
+                try std.testing.expect(span.start <= end and end <= span.end);
+                var offset = span.start;
+                while (offset <= end) {
+                    const options: Caret.Options = .{ .offset = offset, .columns_max = columns };
+                    try std.testing.expectEqual(row, caret(text, options).rows_before);
+                    if (offset == text.len) break;
+                    offset = boundaryAfter(text, offset);
+                }
+                if (end == text.len) continue;
+                const after: Caret.Options = .{
+                    .offset = boundaryAfter(text, end),
+                    .columns_max = columns,
+                };
+                try std.testing.expect(caret(text, after).rows_before > row);
+            }
+        }
+    }
 }

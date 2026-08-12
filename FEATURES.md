@@ -193,6 +193,8 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
   request.
 - A cluster measures 0, 1, or 2 columns, so CJK and emoji wrap, truncate, and place the caret
   correctly.
+- A row breaks between two words and paints no blank at the break. A terminal copy of the rows thus
+  holds whole words. Text with no blank, such as a URL or a CJK run, breaks inside itself.
 - Wrapping and truncation never split a cluster or let a wide one straddle the margin.
 - Width and grapheme tables come from Unicode 17.0.0, regenerated with `zig build unicode` and
   checked against the official conformance corpus.

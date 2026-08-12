@@ -604,8 +604,22 @@ fn Flow(comptime Emitter: type) type {
         prefix: Prefix,
         budget: usize,
         used: usize = 0,
+        /// Blank columns the open row owes. The row measures them at once, and
+        /// content later on the row paints them. A row that closes first drops
+        /// them, so no copy of a row ends on a blank.
+        pending: usize = 0,
+        pending_look: Look = .{},
+        /// Whether the open row still owes its prefix. A prefix decorates the cells
+        /// behind it, so the row draws it with the first of those cells. A row that
+        /// gets no cells draws it without its blanks (see `payPrefix`).
+        prefix_owed: bool = false,
         open: bool = false,
         first: bool = true,
+
+        /// How a row draws its prefix. A row that holds content keeps the prefix
+        /// whole. A row that holds the prefix alone drops the blanks the prefix
+        /// ends with, so no copy of the row ends on a blank.
+        const Form = enum { whole, alone };
 
         fn init(emitter: *Emitter, columns: usize, prefix: Prefix) @This() {
             var shown = prefix;
@@ -621,38 +635,95 @@ fn Flow(comptime Emitter: type) type {
             };
         }
 
-        /// Place `bytes` under `look` and continue on the next row when the
-        /// width runs out. `truncate` always yields at least one cluster against
-        /// a budget of one, so a row can never fail to advance.
+        /// Place `bytes` under `look` and continue on the next row when a word
+        /// runs past the width. One row takes as many whole words as it holds and
+        /// draws them in one span.
+        ///
+        /// A word that spans two looks, such as the `ld` of `**bo**ld`, breaks at
+        /// that seam, because the row it opens is already painted.
         fn write(self: *@This(), look: Look, bytes: []const u8) !void {
             var rest = bytes;
-            while (true) {
+            while (rest.len > 0) {
                 try self.openRow();
                 const room = self.budget -| self.used;
-                const shown = terminal.width.truncate(rest, room);
-                const shown_columns = terminal.width.ofText(shown);
-                // Saturating: a cluster wider than `room` survives `truncate` as
-                // a one-column replacement. Give it the next row whole first, as
-                // the plain wrap does. Settle for the replacement only when a
-                // row of its own is still too narrow.
-                if (shown_columns > room and self.used > 0) {
-                    self.closeRow();
+                const run = self.wordRun(rest);
+                if (run == 0) {
+                    // Give the word the next row whole, as the plain wrap does.
+                    if (self.used > 0) {
+                        try self.closeRow();
+                        continue;
+                    }
+                    // A word too long for a row of its own breaks inside itself.
+                    // So does a cluster wider than the whole row, which survives
+                    // `truncate` as its one-column replacement. Against a room of
+                    // one, `truncate` still yields a cluster, so the row advances.
+                    const cut = terminal.width.truncate(rest, room);
+                    std.debug.assert(cut.len > 0);
+                    try self.place(look, cut);
+                    rest = rest[cut.len..];
                     continue;
                 }
-                if (shown.len > 0) {
-                    try self.emitter.span(look, shown);
-                    self.used += shown_columns;
-                    rest = rest[shown.len..];
-                }
-                if (rest.len == 0) return;
-                self.closeRow();
+                // The row shows its words whole and consumes the blanks behind
+                // them too, even the ones past the margin that it leaves out.
+                try self.place(look, terminal.width.truncate(rest[0..run], room));
+                rest = rest[run..];
             }
+        }
+
+        /// Draw `shown` on the open row and charge every column it takes. The
+        /// blanks it ends on wait: content later on the row paints them, and a row
+        /// that closes first drops them. No copy of a row then ends on a blank,
+        /// whatever look the break falls under. The blank columns count at once,
+        /// so a later word cannot slip into the gap they hold.
+        fn place(self: *@This(), look: Look, shown: []const u8) !void {
+            const body = terminal.width.rowText(shown);
+            if (body.len > 0) {
+                try self.payPrefix(.whole);
+                try self.paintPending();
+                try self.emitter.span(look, body);
+            }
+            const trailing = terminal.width.ofText(shown[body.len..]);
+            if (trailing > 0) {
+                self.pending += trailing;
+                self.pending_look = look;
+            }
+            self.used += terminal.width.ofText(body) + trailing;
+        }
+
+        /// Paint the blanks the row owes, ahead of the content that pays them.
+        fn paintPending(self: *@This()) !void {
+            var left = self.pending;
+            self.pending = 0;
+            while (left > 0) {
+                const chunk = @min(left, blanks.len);
+                try self.emitter.span(self.pending_look, blank(chunk));
+                left -= chunk;
+            }
+        }
+
+        /// Bytes of `text` one row takes: as many whole words as the room left on
+        /// the row holds. Zero when the next word needs a row of its own. The
+        /// blanks behind a word ride with it, so no row opens on a blank.
+        fn wordRun(self: *const @This(), text: []const u8) usize {
+            const room = self.budget -| self.used;
+            var bytes: usize = 0;
+            var columns: usize = 0;
+            // A logical line carries no line break, so every word takes at least
+            // one byte and the walk reaches the end of `text`.
+            while (bytes < text.len) {
+                const word = terminal.width.nextWord(text[bytes..], self.budget);
+                std.debug.assert(word.bytes > 0);
+                if (columns + word.columns > room) break;
+                bytes += word.bytes;
+                columns = @min(columns + word.columns + word.blank_columns, room);
+            }
+            return bytes;
         }
 
         /// Close the last row. A line with no content still occupies one.
         fn finish(self: *@This()) !void {
             try self.openRow();
-            self.closeRow();
+            try self.closeRow();
         }
 
         fn openRow(self: *@This()) !void {
@@ -660,16 +731,41 @@ fn Flow(comptime Emitter: type) type {
             self.emitter.begin();
             self.open = true;
             self.used = 0;
-            try self.emitter.span(.{}, self.prefix.indent);
-            if (self.first) {
-                try self.emitter.span(self.prefix.look, self.prefix.marker);
-            } else {
-                try self.emitter.span(.{}, blank(terminal.width.ofText(self.prefix.marker)));
-            }
-            self.first = false;
+            self.prefix_owed = true;
         }
 
-        fn closeRow(self: *@This()) void {
+        /// Draw the prefix the open row owes, ahead of the cells that follow it.
+        /// The `alone` form draws the prefix of a row that holds nothing else, so
+        /// it drops the blanks the prefix ends with. An indent with no marker
+        /// behind it then reaches no cell, and the row draws nothing.
+        fn payPrefix(self: *@This(), form: Form) !void {
+            if (!self.prefix_owed) return;
+            self.prefix_owed = false;
+            // The marker draws on the first row alone. Blanks replace it on the
+            // rows under it, so a wrapped list item stays aligned.
+            const marker = if (self.first)
+                self.prefix.marker
+            else
+                blank(terminal.width.ofText(self.prefix.marker));
+            const look: Look = if (self.first) self.prefix.look else .{};
+            self.first = false;
+            const shown = switch (form) {
+                .whole => marker,
+                .alone => terminal.width.rowText(marker),
+            };
+            // A whole prefix keeps the indent even where the marker is empty,
+            // because the body budget already gave up those columns.
+            if (form == .alone and shown.len == 0) return;
+            try self.emitter.span(.{}, self.prefix.indent);
+            try self.emitter.span(look, shown);
+        }
+
+        fn closeRow(self: *@This()) !void {
+            // A row that closes with the prefix still owed holds nothing else, so
+            // the prefix drops the blanks it ends with. The blanks the row owes
+            // reach no cell either.
+            try self.payPrefix(.alone);
+            self.pending = 0;
             self.emitter.end();
             self.open = false;
         }
@@ -699,9 +795,14 @@ fn plainRow(
 ) !void {
     const shown = terminal.width.truncate(indent, prefixRoom(columns));
     const room = columns -| terminal.width.ofText(shown);
+    const content = terminal.width.truncate(bytes, room);
     emitter.begin();
-    try emitter.span(.{}, shown);
-    try emitter.span(look, terminal.width.truncate(bytes, room));
+    // The indent decorates content. A row with no content drops it, so a copy of
+    // an empty code row carries no blank.
+    if (content.len > 0) {
+        try emitter.span(.{}, shown);
+        try emitter.span(look, content);
+    }
     emitter.end();
 }
 
@@ -1450,9 +1551,10 @@ test "markdown paints each element in its own role" {
     try std.testing.expect(std.mem.indexOf(u8, bytes, accent ++ "- ") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, muted ++ "\x1b[3ma quoted") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "──") != null);
-    // An ordered list keeps the number it started from, and a task its box.
+    // An ordered list keeps the number it started from, and a task its box. The
+    // blank behind the box waits for the label, so it paints under its own span.
     try std.testing.expect(std.mem.indexOf(u8, bytes, "3. ") != null);
-    try std.testing.expect(std.mem.indexOf(u8, bytes, "[ ] ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, accent ++ "[ ]") != null);
     // A link renders underlined in its own role and carries its own target.
     try std.testing.expect(std.mem.indexOf(u8, bytes, link ++ "\x1b[4m") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "https://example.com") != null);
@@ -1703,6 +1805,47 @@ test "a prefix leaves room for the body it pushes right" {
     }
 }
 
+// A row ends between two words, so a copy of the rows out of the terminal holds
+// whole words. The blanks at a break paint no cell and reach no row.
+test "a block breaks its rows between words" {
+    const gpa = std.testing.allocator;
+    try expectPlainRows(gpa, "one two three four", 12, &.{ "one two", "three four" });
+
+    // A list item keeps its marker column and breaks its body the same way.
+    try expectPlainRows(gpa, "- alpha beta gamma", 12, &.{ "- alpha beta", "  gamma" });
+
+    // A word too long for a row of its own still breaks inside itself.
+    try expectPlainRows(gpa, "ab abcdefghijkl", 6, &.{ "ab", "abcdef", "ghijkl" });
+
+    // The break survives the inline markers: emphasis sheds its marks first, so
+    // the row measures the words it shows.
+    try expectPlainRows(gpa, "one **two** three four", 12, &.{ "one two", "three four" });
+}
+
+// No row ends on a blank, so a copy of the rows carries none. A blank inside a
+// row still paints, whatever look holds it and whatever look follows it.
+test "a row never ends on the blank it breaks at" {
+    const gpa = std.testing.allocator;
+    try expectPlainRows(gpa, "aaa **bbbb**", 6, &.{ "aaa", "bbbb" });
+    try expectPlainRows(gpa, "one two `code` three", 6, &.{ "one", "two", "code", "three" });
+    try expectPlainRows(gpa, "- [ ] a task", 20, &.{"- [ ] a task"});
+    try expectPlainRows(gpa, "a **b** c", 20, &.{"a b c"});
+
+    // A row that holds nothing but its marker ends on that marker. An empty code
+    // row drops the indent that a code line carries.
+    try expectPlainRows(gpa, "- ", 20, &.{"-"});
+    try expectPlainRows(gpa, "-   ", 20, &.{"-"});
+    try expectPlainRows(gpa, "  - deep\n  - ", 20, &.{ "    - deep", "    -" });
+    try expectPlainRows(gpa, "```\n\ncode\n\n```", 20, &.{ "```", "", "  code", "", "```" });
+}
+
+// A word that spans two looks breaks at that seam. The row it opens is painted
+// already, so the wrap cannot move the whole word down.
+test "a word that crosses a look seam breaks at the seam" {
+    const gpa = std.testing.allocator;
+    try expectPlainRows(gpa, "aaa **bb**bbbb", 6, &.{ "aaa bb", "bbbb" });
+}
+
 // A wide cluster that will not fit the columns left takes the next row whole,
 // as the plain wrap does, rather than the one-column replacement a fitted write
 // leaves in its place.
@@ -1907,7 +2050,7 @@ test "a tinted block renders muted and italic throughout" {
     try std.testing.expect(std.mem.indexOf(u8, bytes, "- ") != null);
     // An H2 uses underline for bold. An H1 uses double underline because its
     // source look already has underline.
-    const emphasized = comptime role.sequence(.muted) ++ "\x1b[4m\x1b[3mHeading ";
+    const emphasized = comptime role.sequence(.muted) ++ "\x1b[4m\x1b[3mHeading";
     const emphasized_underlined =
         comptime role.sequence(.muted) ++ "\x1b[21m\x1b[3mHeading one";
     try std.testing.expect(std.mem.indexOf(u8, bytes, emphasized) != null);
