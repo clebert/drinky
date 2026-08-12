@@ -991,7 +991,7 @@ fn editKey(self: *App, event: *const terminal.Input.Key) !bool {
         },
         else => return false,
     }
-    self.session.dirty = true;
+    self.session.markEdited();
     return true;
 }
 

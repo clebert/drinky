@@ -153,6 +153,8 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
   box with a one-line stat summary. It shows the first output line when the tool gives no summary.
 - One heavy activity segment moves across both open input separators in a loop and grows as progress
   goes quiet without adding a layout row.
+- Pith blinks the input caret while a turn runs, because a terminal holds its own cursor solid under
+  a continuous repaint. An edit restarts the blink, so the caret stays visible while the user types.
 - Queued steering shows as `Queued message:` rows, and becomes one user message once consumed.
 - The bottom line shows `directory (branch)`, context fill, cost, quota, and cache-hit rate on the
   left, and `model (account) · Effort: level` on the right. At most one temporary notice replaces it

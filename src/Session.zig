@@ -112,6 +112,8 @@ const Turn = struct {
     activity_tick: u64,
     /// The motion tick observed at the latest accepted progress event.
     progress_tick_last: u64,
+    /// The blink clock of the input caret. An edit restarts it at zero.
+    caret_tick: u64,
     tools: std.ArrayList(ActiveTool),
     /// `tools`' box text. Each frame rebuilds it, so the tail gets a
     /// `[]const []const u8` without a fresh allocation per repaint.
@@ -121,6 +123,7 @@ const Turn = struct {
         return .{
             .motion_tick = self.activity_tick,
             .progress_age_ticks = self.activity_tick -% self.progress_tick_last,
+            .caret_tick = self.caret_tick,
         };
     }
 
@@ -534,7 +537,7 @@ pub fn reserveSteering(self: *Session) !void {
 pub fn commitSteeringDraft(self: *Session, draft: *ui.Editor.Draft) void {
     self.steering.appendAssumeCapacity(draft.*);
     draft.* = .empty;
-    self.dirty = true;
+    self.markEdited();
 }
 
 /// Preflight enough editor capacity to recall any queue suffix. The mirror is
@@ -553,7 +556,7 @@ pub fn recallSteering(self: *Session, pending_count: usize) void {
     self.steering.shrinkRetainingCapacity(pending_start);
     self.steering_retained_count = self.steering.items.len;
     self.steering_consumed_count = @min(self.steering_consumed_count, self.steering.items.len);
-    self.dirty = true;
+    self.markEdited();
 }
 
 /// Retain the submitted prompt's rich draft and set the turn's initial transcript
@@ -636,6 +639,7 @@ pub fn beginTurn(self: *Session, generation: u64) void {
         .transcript_checkpoint = self.transcript.blocks().len,
         .activity_tick = 0,
         .progress_tick_last = 0,
+        .caret_tick = 0,
         .tools = .empty,
         .box_view = .empty,
     } };
@@ -829,13 +833,22 @@ pub fn parkCursor(self: *Session) !void {
     try self.view.parkCursor();
 }
 
+/// Record a change of the input: repaint and restart the caret blink. The caret
+/// then stays visible while the user types into a running turn. `App` calls this
+/// after it edits the live editor.
+pub fn markEdited(self: *Session) void {
+    self.dirty = true;
+    if (self.activeTurn()) |turn| turn.caret_tick = 0;
+}
+
 /// Advance the activity clock and report whether this tick repaints. A turn
 /// advances without marking the model dirty, so motion continues between model
-/// events.
+/// events. The caret blink shares the clock, so a blink flip also repaints.
 pub fn advanceFrame(self: *Session) bool {
     var activity_changed = false;
     if (self.activeTurn()) |turn| {
         turn.activity_tick +%= 1;
+        turn.caret_tick +%= 1;
         const activity = turn.activity();
         activity_changed = ui.paint.activityChanged(&activity, self.columns);
     }
@@ -1518,6 +1531,61 @@ test "activity ticks repaint each separator step" {
     // New model content repaints even without animation.
     session.dirty = true;
     try std.testing.expect(session.advanceFrame());
+}
+
+// Pith blinks the caret itself during a turn, because the terminal holds its own
+// cursor solid while pith writes a frame every 16 ms.
+test "an edit restarts the caret blink of a running turn" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    defer session.deinit();
+
+    session.beginTurn(1);
+    _ = session.advanceFrame();
+    _ = session.advanceFrame();
+    try std.testing.expectEqual(@as(u64, 2), session.mode.turn.caret_tick);
+
+    session.dirty = false;
+    session.markEdited();
+    try std.testing.expect(session.dirty);
+    try std.testing.expectEqual(@as(u64, 0), session.mode.turn.caret_tick);
+
+    // An idle input carries no blink clock, because the terminal blinks it.
+    session.deinitMode();
+    session.mode = .prompt;
+    session.dirty = false;
+    session.markEdited();
+    try std.testing.expect(session.dirty);
+}
+
+test "a running turn hides and shows the hardware cursor of the input" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    defer session.deinit();
+
+    session.beginTurn(1);
+    try session.editor.insert("hi");
+
+    var hidden = false;
+    var shown_again = false;
+    // About two blink cycles at 16 ms per frame.
+    for (0..160) |_| {
+        const start = out.written().len;
+        _ = session.advanceFrame();
+        try session.paint(.{ .columns = 40, .rows = 24 });
+        const frame = out.written()[start..];
+        if (!hidden) {
+            hidden = std.mem.indexOf(u8, frame, terminal.escape.cursor_hide) != null;
+        } else if (!shown_again) {
+            shown_again = std.mem.indexOf(u8, frame, terminal.escape.cursor_show) != null;
+        }
+    }
+    try std.testing.expect(hidden);
+    try std.testing.expect(shown_again);
 }
 
 test "accepted turn progress restarts separator growth without resetting motion" {

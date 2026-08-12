@@ -16,6 +16,8 @@ const activity_length_default: usize = 6;
 // At 16 ms per frame, wait about 500 ms. Then add one cell every 100 ms.
 const activity_growth_delay_ticks: u64 = 31;
 const activity_growth_interval_ticks: u64 = 6;
+// At 16 ms per frame, show the caret about 600 ms and hide it about 600 ms.
+const caret_blink_ticks: u64 = 37;
 
 /// A notice's look: the role that colors every line and a prefix (an error tag,
 /// or empty) that prints before each line's text.
@@ -40,13 +42,21 @@ pub fn boxRows(text: []const u8, columns: usize) usize {
     return 2 + terminal.width.rows(text, boxInner(columns));
 }
 
+/// The animation of the live input while a turn runs: the tick that moves the
+/// separator segment, the ticks since the last progress event, and the blink
+/// clock of the caret.
 pub const Activity = struct {
     motion_tick: u64,
     progress_age_ticks: u64,
+    /// The blink clock of the caret. The producer restarts it at zero on each
+    /// edit, so the caret stays visible while the user types.
+    caret_tick: u64 = 0,
 };
 
-/// Whether `activity` moves the separator segment at this width.
+/// Whether `activity` changes the input area at this width: the separator
+/// segment moves, or the caret blink flips.
 pub fn activityChanged(activity: *const Activity, columns: usize) bool {
+    if (caretBlinkChanged(activity.caret_tick)) return true;
     if (columns == 0) return false;
     return activityHead(activity.motion_tick, columns) !=
         activityHead(activity.motion_tick -% 1, columns);
@@ -211,10 +221,17 @@ pub const SeparatorOptions = struct {
 /// separator, its open body rows, and a labelled bottom separator.
 pub fn framed(placement: *const Placement, framing: *const Framing) !void {
     const content_columns = frameColumns(placement.columns);
+    const maybe_activity = framing.activity;
     const separators: Separators = .{
         .columns = placement.columns,
-        .activity = framing.activity,
+        .activity = maybe_activity,
     };
+    // Pith blinks the caret itself while the input animates. A terminal holds
+    // its own cursor solid under a continuous repaint, and an animated input
+    // repaints about every 16 ms. An idle input writes nothing, so the terminal
+    // blinks the caret there.
+    const caret_shown = if (maybe_activity) |activity| caretVisible(activity.caret_tick) else true;
+    const maybe_caret = if (caret_shown) framing.caret else null;
     var line = placement.base;
     try ruleRow(placement, &separators, &line, .top, "↑", framing.hidden_above);
     var iterator = terminal.width.wrapper(framing.body, content_columns);
@@ -231,13 +248,13 @@ pub fn framed(placement: *const Placement, framing: *const Framing) !void {
         if (index >= window_end) break;
         const roles = framing.line_roles;
         const maybe_role = if (source_line < roles.len) roles[source_line] else null;
-        try framedRow(placement, framing.caret, &line, content, maybe_role);
+        try framedRow(placement, maybe_caret, &line, content, maybe_role);
         body_count += 1;
     }
     // The wrapper exhausts at `index == wrapped rows`, the trailing row's index.
     // Emit it when the window reaches it (a `break` above leaves it out of view).
     if (framing.trailing_row and index >= framing.hidden_above and index < window_end) {
-        try framedRow(placement, framing.caret, &line, "", null);
+        try framedRow(placement, maybe_caret, &line, "", null);
         body_count += 1;
     }
     std.debug.assert(body_count == framing.body_rows);
@@ -428,6 +445,18 @@ fn activityHead(motion_tick: u64, columns: usize) usize {
     const offset = @min(activity_length_default, columns) - 1;
     const wrap_at = track_columns - offset;
     return if (phase >= wrap_at) phase - wrap_at else phase + offset;
+}
+
+/// Whether the caret shows on this tick. The caret shows for one blink interval
+/// and hides for the next.
+fn caretVisible(caret_tick: u64) bool {
+    return caret_tick % (2 * caret_blink_ticks) < caret_blink_ticks;
+}
+
+/// Whether the blink flips on this tick. Each half cycle starts on a multiple of
+/// the blink interval, so tick zero shows the caret again after an edit.
+fn caretBlinkChanged(caret_tick: u64) bool {
+    return caret_tick % caret_blink_ticks == 0;
 }
 
 fn activityLength(progress_age_ticks: u64, columns: usize) usize {
@@ -658,17 +687,71 @@ test "activity moves across the complete virtual line" {
         try std.testing.expectEqual(column, activityHead(tick, 5));
 
     try std.testing.expect(activityChanged(
-        &.{ .motion_tick = 1, .progress_age_ticks = 0 },
+        &.{ .motion_tick = 1, .progress_age_ticks = 0, .caret_tick = 1 },
         5,
     ));
     try std.testing.expect(activityChanged(
-        &.{ .motion_tick = 1, .progress_age_ticks = 31 },
+        &.{ .motion_tick = 1, .progress_age_ticks = 31, .caret_tick = 1 },
         1,
     ));
     try std.testing.expect(!activityChanged(
-        &.{ .motion_tick = 1, .progress_age_ticks = 31 },
+        &.{ .motion_tick = 1, .progress_age_ticks = 31, .caret_tick = 1 },
         0,
     ));
+}
+
+test "the caret blinks in equal halves and each flip repaints" {
+    try std.testing.expect(caretVisible(0));
+    try std.testing.expect(caretVisible(caret_blink_ticks - 1));
+    try std.testing.expect(!caretVisible(caret_blink_ticks));
+    try std.testing.expect(!caretVisible(2 * caret_blink_ticks - 1));
+    try std.testing.expect(caretVisible(2 * caret_blink_ticks));
+
+    // A flip repaints even where the separator segment cannot move.
+    try std.testing.expect(activityChanged(
+        &.{ .motion_tick = 1, .progress_age_ticks = 0, .caret_tick = caret_blink_ticks },
+        0,
+    ));
+    try std.testing.expect(!activityChanged(
+        &.{ .motion_tick = 1, .progress_age_ticks = 0, .caret_tick = caret_blink_ticks + 1 },
+        0,
+    ));
+}
+
+test "an animated input places its caret only on the visible half" {
+    const gpa = std.testing.allocator;
+    const samples = [_]struct { caret_tick: u64, shown: bool }{
+        .{ .caret_tick = 0, .shown = true },
+        .{ .caret_tick = caret_blink_ticks, .shown = false },
+    };
+    for (samples) |sample| {
+        var output: std.Io.Writer.Allocating = .init(gpa);
+        defer output.deinit();
+        var view = terminal.View.init(gpa, &output.writer);
+        defer view.deinit();
+
+        const sink = try view.beginFrame(.{ .columns = 20, .rows = 4 }, 1);
+        const placement: Placement = .{
+            .sink = sink,
+            .id = 0,
+            .columns = 20,
+            .base = 0,
+            .skip = 0,
+        };
+        try framed(&placement, &.{
+            .body = "hi",
+            .body_rows = 1,
+            .caret = .{ .row = 1, .column = 2 },
+            .activity = .{
+                .motion_tick = 0,
+                .progress_age_ticks = 0,
+                .caret_tick = sample.caret_tick,
+            },
+        });
+        try view.render();
+        const shown = std.mem.indexOf(u8, output.written(), terminal.escape.cursor_show) != null;
+        try std.testing.expectEqual(sample.shown, shown);
+    }
 }
 
 test "activity segment grows after a quiet grace period up to one separator" {
