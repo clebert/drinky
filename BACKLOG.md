@@ -91,10 +91,10 @@ decision already taken, or a dependency on another entry. Module layout and exte
 
 - **`/review`** — a bounded workflow reviews the pending changes with a fresh reviewer, a persistent
   judge, and a fixer, and it asks the user only about an open product choice. _The plan is
-  `docs/review-mode.md`. It needs an immutable tool allowlist on `Agent` and a project-state entry
-  for the confirmed account-model pair. It is not a subagent system, so one request runs at a time
-  with no nesting. The reviewer and the judge get no `write` or `edit`. Their prompt prohibits a
-  mutating shell command, and only the configurable bash guard can enforce that later._
+  `docs/review-mode.md`. It needs a tool profile on `Agent` and two remembered account-model pairs
+  in the project state. It is not a subagent system, so one request runs at a time with no nesting.
+  The reviewer and the judge get no `write` or `edit`. Their prompt prohibits a mutating shell
+  command, and only the configurable bash guard can enforce that later._
 - **Save and resume conversations** — a conversation reopens after a restart and does not start
   empty. _Persist the per-turn cost ledger with it, since history items carry no cost. Persist the
   prompt-cache write times too, so a resume knows what retention is left. Generate the OpenAI cache

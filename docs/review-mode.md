@@ -5,7 +5,7 @@ Status: Plan.
 ## Scope
 
 `/review` runs a bounded review, judgment, fix, and re-review workflow over pending changes. It asks
-the user only for unresolved product choices.
+the user only for unresolved product choices. The command takes no argument.
 
 This workflow is not a general subagent system. It has no nesting and runs one request at a time.
 
@@ -16,58 +16,75 @@ This workflow is not a general subagent system. It has no nesting and runs one r
 | Judge      | Persistent          | Validates findings, resolves disputes, and settles the review. |
 | Fixer      | Fresh each pass     | Applies the judge report or disputes it with evidence.         |
 
-One selected account-model pair runs the reviewer and fixer. A second pair runs the judge. The same
-account or model can fill both selections.
+One selected account-model pair runs the reviewer and the fixer. A second pair runs the judge. The
+same account or model can fill both selections.
 
 ## Setup
 
 `/review` opens this setup before it sends a request:
 
 ```text
-Review setup
+Select a review setup
 
  > Start review
    Review and fix: claude-opus-5 (Anthropic Subscription)
    Judge: gpt-5.6-sol (OpenAI Subscription)
-   Effort: high
 ```
 
-Selecting a role opens the existing account-model picker and then returns to the setup. Both roles
-use the displayed current effort level.
+The setup is the normal picker, so it keeps the standard key hint. A role row opens the existing
+account-model picker and then returns to the setup. Both roles run at the effort level of the
+session, which the status line already shows.
 
-Pith stores the last confirmed pair per project in `state.json`. The next setup preselects that pair
-and `Start review`. The common path needs one additional Enter press.
+Pith stores the two confirmed pairs per project in `state.json`. The next setup preselects them and
+puts the cursor on `Start review`. The common path needs one additional Enter press.
 
-The first setup selects the active pair for both roles. An unavailable remembered pair disables
-`Start review` until the user replaces it. Pith never selects a fallback silently. Setup never
-changes the active main model.
+The first setup selects the active pair for both roles. `Start review` on an unavailable pair
+reports a notice and starts nothing, so the picker needs no disabled row. Pith never selects a
+fallback silently. Setup never changes the active main account, model, or effort level.
 
 ## Target, context, and tools
 
 The first version requires a Git worktree. Its target is every change from `HEAD`, including staged,
 unstaged, and untracked files. Each reviewer inspects the target after the latest fixer pass.
+Outside a worktree `/review` reports a notice and starts nothing.
+
+Pith computes no diff and runs no Git command of its own. Each role finds the target through its
+tools, and its role prompt names the way: `git status` for the file list, `git diff HEAD` for the
+tracked changes, and a `read` of each untracked file. `git diff HEAD` alone hides an untracked file,
+so the file list must come first.
 
 Pith never stages, commits, restores, or changes the index. Staging has no effect on the target.
 
-Every role receives the normal system prompt, instructions, and skill catalog. The reviewer and
-judge do not receive the main conversation. Workflow user decisions become requirements for every
-later role.
+Every role receives the normal environment, instruction, and skill sections. Only the system core
+differs, so one composition call takes a role core in place of the default core. The precedence
+section of the prompt then stays true, because it ranks the core first. A project instruction can
+never outrank the review policy.
+
+The reviewer core and the judge core carry the review policy of that role. The default core carries
+none of it, because a user who runs no review must not carry review rules.
+
+The fixer takes the main system prompt without a change. Its rules belong in the fix packet, because
+they change with each pass. An identical prompt and tool list can also read the cached prefix of the
+main agent, when the fixer runs on the same account and model.
+
+The reviewer and the judge do not receive the main conversation. Workflow user decisions become
+requirements for every later role.
 
 Review histories, cache keys, context gauges, and usage stay separate from the main agent. A fresh
 fixer therefore works when the main context is full. Review mode does not compact that main context.
 
-A role allowlist gates provider tool schemas and local dispatch. The reviewer and judge do not
-receive `write` or `edit`. They receive `bash` for inspection and tests. Their prompts prohibit
-mutating shell commands. Pith plans no permission model, so only the planned configurable bash guard
-can enforce that restriction.
+A role tool profile gates the provider tool schemas and the local dispatch. The reviewer and the
+judge receive `read`, `find`, `grep`, and `bash`. They receive no `write`, `edit`, or `config`.
+Their role prompt prohibits a mutating shell command. Pith plans no permission model, so only the
+planned configurable bash guard can enforce that restriction.
 
-The fixer receives the normal tools and a compact packet with these items:
+The fixer receives the complete tool registry and a compact packet with these items:
 
 - The judge report, accepted findings, required results, evidence, and affected locations.
 - All workflow user decisions.
 
-The fixer reads the current worktree through tools. It receives no reviewer tool history or judge
-reasoning.
+The fixer reads the current worktree through tools. It receives no reviewer tool history and no
+judge reasoning.
 
 ## Flow
 
@@ -83,8 +100,12 @@ setup
 Pith discards each reviewer and fixer context after its phase. Every fixer pass gets a later fresh
 review. The judge receives each reviewer report, the preceding fixer report, and all user decisions.
 
-The workflow permits at most four reviewer rounds. Pith does not start a fixer when no later review
-round remains. Reaching the limit stops the workflow without settlement.
+The workflow permits at most four reviewer rounds. Only a reviewer phase counts, so a judge phase, a
+fix pass, and a pause add no round. Pith does not start a fixer when no later review round remains.
+Reaching the limit stops the workflow without settlement.
+
+A failed request stops the whole workflow without settlement. This covers a network failure, a dead
+credential, and an exhausted allowance. Pith reports which phase failed.
 
 ## Review policy
 
@@ -95,7 +116,7 @@ objective wording defects are in scope.
 The reviewer excludes unrelated cleanup, speculative improvements, and valid design preferences. It
 reports no findings when none exist. One report contains at most eight findings.
 
-The first judge line must be exactly one of these lines:
+The judge report must carry one decision line. It must be one of these lines:
 
 ```text
 Decision: Fix required.
@@ -103,8 +124,13 @@ Decision: Review settled.
 Decision: User decision required.
 ```
 
-Pith requests one correction after an invalid first line. A second invalid response stops the
-workflow without settlement.
+Pith takes the first line that starts with `Decision:` and classifies it by its keyword. A report
+with no such line stops the workflow without settlement. One tolerant parse rule replaces a
+correction round-trip.
+
+A tool call is the other way to carry a verdict. Pith does not take it. The tool profile can hide a
+`verdict` tool from every other role, but a tool result starts one more request in the same phase,
+and the report must stay visible prose for the fix packet. The parse rule needs neither.
 
 The judge checks the current files and validates each finding. It can reject a finding or add a
 missed finding. Its visible report becomes the next fix packet.
@@ -135,44 +161,50 @@ The judge asks the user only when all these conditions apply:
 The judge resolves naming, internal architecture, test strategy, and clean-code disputes. A user
 question gives the options, consequences, recommendation, and missing requirement.
 
-The workflow pauses after the judge request completes. No request remains active. The editor returns
-with this purpose:
+The workflow pauses after the judge request completes. No request remains active. The normal editor
+returns, and one transcript event states the purpose:
 
 ```text
-Answer the review question
-Enter: Continue · Shift+Enter: New line · Esc: Stop review
+The judge needs one decision. Answer it in the editor. Enter: Continue · Esc: Stop review
 ```
+
+The event is durable, so the hint survives every keystroke. During the pause, Enter sends the answer
+to the workflow instead of the model, and no slash command runs.
 
 Pith records the answer as a workflow user decision. It sends the decision to the fresh fixer, all
 later reviewers, and the persistent judge. The workflow then resumes automatically.
 
 ## Interface and input
 
-Each phase adds a durable transcript marker:
+Each phase adds a durable transcript event:
 
 ```text
-Review round 1 started with claude-opus-5 as the reviewer. Context: Fresh.
-The judge started with gpt-5.6-sol.
-Fix pass 1 started with claude-opus-5. Context: Fresh.
+Review round 1 started. Reviewer: claude-opus-5.
+The judge started. Judge: gpt-5.6-sol.
+Fix pass 1 started. Fixer: claude-opus-5.
 ```
 
-An automatic phase replaces the editor with a progress frame:
+An automatic phase replaces the editor with a progress frame in the same place:
 
 ```text
-Review: Round 1 of 4
-Role: Reviewer
-Esc/Ctrl+C: Stop review
+Review: Round 1 of 4 · Role: Reviewer
+Esc: Stop review
 ```
 
-The footer shows the role, round, account, model, effort, active context fill, and review cost. Main
-and review usage remain separate. A narrow footer keeps the role and round before optional details.
+The frame keeps the separators of the editor, so the activity indicator keeps its normal motion. It
+shows no caret, because the phase accepts no input.
+
+The status line keeps its parts and its narrow-window order. While a review phase runs, it shows the
+account, model, effort, context fill, and cost of the active role. The main numbers return when the
+workflow ends. A subscription allowance belongs to the account, so it carries across in both
+directions.
 
 Reports, reasoning, tool calls, and tool results remain visible. Internal role packets stay hidden.
 
-Reviewer, judge, and fixer phases do not accept steering. Printable input and Enter do nothing.
-Input never routes according to the active model. Esc or Ctrl+C stops the complete workflow.
+A reviewer, judge, or fixer phase accepts no steering. Printable input and Enter do nothing. Esc or
+Ctrl+C stops the whole workflow.
 
-A user-decision pause stops the activity indicator and shows `Review: Paused`. Normal input returns
+A user-decision pause stops the activity indicator, because no request runs. Normal input returns
 after settlement, failure, or cancellation.
 
 A successful workflow adds this event:
@@ -189,26 +221,54 @@ changes remain after every stop.
 Pith gives the main agent one compact note before its next request. The note states the outcome and
 whether a fixer ran. It excludes reports, reasoning, and tool history.
 
-The footer restores the main model, context, usage, and cache state. Existing cache-expiry handling
-still applies. If the main context cannot hold the next request, the user must start a fresh
-conversation.
+The status line restores the main model, context, usage, and cache state. Existing cache-expiry
+handling still applies. If the main context cannot hold the next request, the user must start a
+fresh conversation.
 
 ## Implementation
 
-Add one app-owned `Review` state machine. It owns the phase, selections, counters, judge agent,
-fresh worker agent, pending question, decisions, and review totals.
+Add one app-owned `Review` state machine. It owns the phase, the selections, the counters, the two
+review agents, the pending question, the decisions, and the review totals.
 
-Drive each phase through the existing event loop and one turn future. Do not call an agent loop from
-another agent loop. Sequential requests avoid credential-refresh races and need no subagent
-scheduler.
+`/review` needs an entry in the `ai.command` registry and one new `Outcome` variant, because the
+state machine is app-owned and `lib/ai` cannot reach it.
 
-Tag turn events with their review role and generation. Add setup, automatic review, and
-user-decision session modes. Reuse existing streams, tool boxes, pickers, cancellation, and
-rendering.
+Create both review agents when the user starts the review, and destroy them when the workflow ends:
 
-Give `Agent` an immutable tool allowlist. Keep the complete registry as the fixer default. Extend
-the project state with the confirmed account-model pair.
+- The judge agent keeps its history for the whole workflow.
+- One worker agent runs every reviewer and fixer phase. `Agent.resetConversation` gives the next
+  phase a fresh context and a fresh cache key. It also clears the agent statistics, so `Review` must
+  add the cost of a phase to the review total before each reset.
+
+Compose the reviewer core and the judge core once when the review starts. The worker agent then
+takes the reviewer prompt or the main prompt for its next phase, and it changes the prompt and the
+tool profile together with the reset.
+
+Drive each phase through the existing event loop and the one existing turn future. The turn worker
+takes the agent to run. Do not call an agent loop from another agent loop. Sequential requests avoid
+credential-refresh races and need no subagent scheduler.
+
+Keep `Session.Mode.turn` for every review phase, so the progress sequences, the tool boxes, the
+receipts, and the cancellation path stay as they are. Add one tail variant that puts the progress
+frame where the editor sits, and build it with the existing framed-input primitive. The turn
+generation already identifies the phase, so a turn event needs no role tag. A stop reuses the turn
+cancellation path, so it needs its own event wording in place of the turn sentence.
+
+Reuse the picker mode for the setup. A picker selects a command handler today, so it needs one
+app-owned alternative. Expose the account-model row builder through `ai.command`, so `/model` and
+the setup show identical rows.
+
+Give `Agent` a tool profile: the complete registry, or the inspect profile of the reviewer and the
+judge. Set it between turns like the effort level, and drop the cache evidence with it, because the
+serialized request changes.
+
+Read a report from the joined turn instead of the event stream. The receipt names the history span
+of the turn, and the last assistant message in that span is the report.
+
+Extend the project state with the two confirmed pairs. Keep them out of the per-account model map,
+because that map holds what the main session runs.
 
 Required tests cover setup memory and invalid selections, state transitions, fresh contexts,
-persistent judge history, packet ownership, decision parsing, pause and resume, cancellation, round
-limits, target coverage, tool gating, accounting separation, and each UI state.
+persistent judge history, packet ownership, decision parsing, a report with no decision line, pause
+and resume, cancellation, request failure, round limits, target coverage, tool gating, accounting
+separation, and each UI state.
