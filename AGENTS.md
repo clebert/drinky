@@ -23,12 +23,16 @@ place where re-exports are allowed. A test only runs if its file is reachable fr
 Because of this, `test-audit.sh` fails CI when the number of tests that ran differs from the number
 declared in source.
 
-### Features
+### Features and backlog
 
 `FEATURES.md` is a human-readable overview of what pith supports, with one short sentence per
-capability. Keep it current. When you land a capability, add its line and mark the matching
-`BACKLOG.md` item done, if one exists. When a capability goes away, delete its line. Keep the file
-short. It is an orientation document, not a spec. The tests are what guard against regressions.
+capability. Keep it current. When you land a capability, add its line. When a capability goes away,
+delete its line. Keep the file short. It is an orientation document, not a spec. The tests are what
+guard against regressions.
+
+`BACKLOG.md` holds the planned work in priority order, and `TODO.md` is the loose inbox that feeds
+it. When you land an entry, delete it from `BACKLOG.md`. Read the header of `BACKLOG.md` before you
+change either file.
 
 ### Writing style
 
