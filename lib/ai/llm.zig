@@ -299,9 +299,14 @@ pub const Quota = struct {
 /// separate from completed conversation items. Transports own their native
 /// block/item lifecycles and emit an `item` only after the wire closes it.
 pub const Event = union(enum) {
-    /// Display-only streamed answer text.
+    /// Display-only streamed answer text. A delta with bytes ends the open
+    /// reasoning run (see `thinking`).
     text: []const u8,
-    /// Display-only streamed reasoning text.
+    /// Display-only streamed reasoning text. A consumer collects a run of these
+    /// deltas into one block, and the answer text ends that run. A delta with no
+    /// bytes displays nothing and ends no run. A transport that starts a new
+    /// reasoning part must put a blank line in front of the text of that part.
+    /// Without that line the two parts join into one line.
     thinking: []const u8,
     /// One complete native assistant output item in wire order. Its slices borrow
     /// the stream and remain valid until the next read or stream teardown. OpenAI

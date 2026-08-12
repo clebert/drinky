@@ -24,7 +24,8 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - A reply cut short by the output cap is kept, and reported as cut short.
 - Model-side failures — a refusal, an empty reply, the round cap — read as a plain sentence rather
   than an internal error.
-- Reasoning streams into its own block. Encrypted reasoning shows as `[redacted thinking]`.
+- Reasoning streams into its own block, with a blank line between its parts. Encrypted reasoning
+  shows as `[redacted thinking]`.
 
 ## Tools
 

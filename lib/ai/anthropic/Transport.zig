@@ -64,6 +64,8 @@ pub const Stream = struct {
     /// The one native content block currently open. Its retained buffers survive
     /// frame resets. The stream emits them only when the matching block closes.
     open_block: ?OpenBlock,
+    /// Where the streamed reasoning display stands (see `sse.Reasoning`).
+    reasoning: sse.Reasoning,
     block_text: std.ArrayList(u8),
     block_proof: std.ArrayList(u8),
     tool_call_id: std.ArrayList(u8),
@@ -149,6 +151,11 @@ pub const Stream = struct {
             if (data.len == 0) return self.invalid();
             try self.block_proof.appendSlice(self.gpa, data);
             self.open_block = .{ .redacted = index };
+            // The agent core displays a placeholder for this block when the
+            // block closes. This stream does not write that text, so the frame
+            // that opens the block must carry the seam in front of it.
+            if (self.reasoning.takeSeam())
+                return .{ .event = .{ .thinking = sse.blank_line } };
         } else if (std.mem.eql(u8, kind, "tool_use")) {
             const call_id = json.string(block.get("id")) orelse return self.invalid();
             const name = json.string(block.get("name")) orelse return self.invalid();
@@ -172,13 +179,16 @@ pub const Stream = struct {
             .text => if (std.mem.eql(u8, kind, "text_delta")) text: {
                 const text = json.string(delta.get("text")) orelse return self.invalid();
                 try self.block_text.appendSlice(self.gpa, text);
+                // The answer ends the reasoning display, and a delta with no
+                // bytes displays nothing (see `sse.Reasoning`).
+                if (!self.reasoning.answer(text)) break :text .progress;
                 break :text .{ .event = .{ .text = text } };
             } else self.invalid(),
             .thinking => if (std.mem.eql(u8, kind, "thinking_delta")) thinking: {
                 if (self.block_proof.items.len != 0) return self.invalid();
                 const text = json.string(delta.get("thinking")) orelse return self.invalid();
                 try self.block_text.appendSlice(self.gpa, text);
-                break :thinking .{ .event = .{ .thinking = text } };
+                break :thinking try self.reasoning.display(self.frame_arena.allocator(), text);
             } else if (std.mem.eql(u8, kind, "signature_delta")) signature: {
                 const proof = json.string(delta.get("signature")) orelse return self.invalid();
                 try self.block_proof.appendSlice(self.gpa, proof);
@@ -202,6 +212,13 @@ pub const Stream = struct {
         const open_block = self.open_block orelse return self.invalid();
         if (contentBlockIndex(object) != open_block.index()) return self.invalid();
         self.open_block = null;
+        // A reasoning block ends its display here, whatever the block retains.
+        // The agent core displays the placeholder for a redacted block at this
+        // stop, so that block ends its display here too.
+        switch (open_block) {
+            .thinking, .redacted => self.reasoning.end(),
+            else => {},
+        }
         return switch (open_block) {
             .text => if (self.block_text.items.len == 0)
                 .progress
@@ -336,6 +353,7 @@ fn connect(self: *Transport, out: *Stream, body: []const u8) anyerror!void {
     out.stop_reason = .none;
     out.terminal_rejection = null;
     out.open_block = null;
+    out.reasoning = .none;
     out.block_text = .empty;
     out.block_proof = .empty;
     out.tool_call_id = .empty;
@@ -461,6 +479,7 @@ fn testStreamWithAllocator(
     stream.stop_reason = .none;
     stream.terminal_rejection = null;
     stream.open_block = null;
+    stream.reasoning = .none;
     stream.block_text = .empty;
     stream.block_proof = .empty;
     stream.tool_call_id = .empty;
@@ -542,13 +561,135 @@ test "reasoning blocks emit display deltas and one complete proof" {
     try std.testing.expectEqualStrings("hmm", complete.event.item.reasoning.signature.text);
     try std.testing.expectEqualStrings("sig", complete.event.item.reasoning.signature.signature);
 
-    try std.testing.expectEqual(@as(sse.Decoded, .progress), try stream.decode(
+    // The block before this one displayed reasoning text, so the start frame
+    // carries the seam for the placeholder that the agent core displays.
+    try std.testing.expectEqualStrings("\n\n", (try stream.decode(
         \\{"type":"content_block_start","index":1,"content_block":{"type":"redacted_thinking","data":"enc"}}
-    ));
+    )).event.thinking);
     const redacted = try stream.decode(
         \\{"type":"content_block_stop","index":1}
     );
     try std.testing.expectEqualStrings("enc", redacted.event.item.reasoning.redacted);
+}
+
+test "a new thinking block separates its display from the block before it" {
+    var stream = testStream(undefined, undefined, 0, 0);
+    defer stream.deinitDecode();
+
+    try decodeTestFrame(&stream,
+        \\{"type":"content_block_start","index":0,"content_block":{"type":"thinking"}}
+    );
+    _ = stream.frame_arena.reset(.retain_capacity);
+    try std.testing.expectEqualStrings("**a**", (try stream.decode(
+        \\{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"**a**"}}
+    )).event.thinking);
+    try decodeTestFrame(&stream,
+        \\{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig"}}
+    );
+    try decodeTestFrame(&stream,
+        \\{"type":"content_block_stop","index":0}
+    );
+    try decodeTestFrame(&stream,
+        \\{"type":"content_block_start","index":1,"content_block":{"type":"thinking"}}
+    );
+    // Without the blank line the two blocks join into one line, and the
+    // markdown markers at the seam merge into a literal `****`.
+    _ = stream.frame_arena.reset(.retain_capacity);
+    try std.testing.expectEqualStrings("\n\n**b**", (try stream.decode(
+        \\{"type":"content_block_delta","index":1,"delta":{"type":"thinking_delta","thinking":"**b**"}}
+    )).event.thinking);
+}
+
+test "an empty thinking delta displays nothing and holds the pending seam" {
+    var stream = testStream(undefined, undefined, 0, 0);
+    defer stream.deinitDecode();
+
+    try decodeTestFrame(&stream,
+        \\{"type":"content_block_start","index":0,"content_block":{"type":"thinking"}}
+    );
+    try decodeTestFrame(&stream,
+        \\{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"**a**"}}
+    );
+    try decodeTestFrame(&stream,
+        \\{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig"}}
+    );
+    try decodeTestFrame(&stream,
+        \\{"type":"content_block_stop","index":0}
+    );
+    try decodeTestFrame(&stream,
+        \\{"type":"content_block_start","index":1,"content_block":{"type":"thinking"}}
+    );
+    // An empty delta displays nothing. A blank line on its own would add empty
+    // rows to the block, so the seam must wait for a delta with bytes.
+    _ = stream.frame_arena.reset(.retain_capacity);
+    try std.testing.expectEqual(@as(sse.Decoded, .progress), try stream.decode(
+        \\{"type":"content_block_delta","index":1,"delta":{"type":"thinking_delta","thinking":""}}
+    ));
+    _ = stream.frame_arena.reset(.retain_capacity);
+    try std.testing.expectEqualStrings("\n\n**b**", (try stream.decode(
+        \\{"type":"content_block_delta","index":1,"delta":{"type":"thinking_delta","thinking":"**b**"}}
+    )).event.thinking);
+}
+
+test "answer text ends the thinking display and an empty delta holds the seam" {
+    var stream = testStream(undefined, undefined, 0, 0);
+    defer stream.deinitDecode();
+
+    try decodeTestFrame(&stream,
+        \\{"type":"content_block_start","index":0,"content_block":{"type":"thinking"}}
+    );
+    try decodeTestFrame(&stream,
+        \\{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"a"}}
+    );
+    try decodeTestFrame(&stream,
+        \\{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig"}}
+    );
+    try decodeTestFrame(&stream,
+        \\{"type":"content_block_stop","index":0}
+    );
+    // An empty answer delta displays nothing, so the seam of the next thinking
+    // block survives it.
+    try decodeTestFrame(&stream,
+        \\{"type":"content_block_start","index":1,"content_block":{"type":"text"}}
+    );
+    _ = stream.frame_arena.reset(.retain_capacity);
+    try std.testing.expectEqual(@as(sse.Decoded, .progress), try stream.decode(
+        \\{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":""}}
+    ));
+    try decodeTestFrame(&stream,
+        \\{"type":"content_block_stop","index":1}
+    );
+    try decodeTestFrame(&stream,
+        \\{"type":"content_block_start","index":2,"content_block":{"type":"thinking"}}
+    );
+    _ = stream.frame_arena.reset(.retain_capacity);
+    try std.testing.expectEqualStrings("\n\nb", (try stream.decode(
+        \\{"type":"content_block_delta","index":2,"delta":{"type":"thinking_delta","thinking":"b"}}
+    )).event.thinking);
+    try decodeTestFrame(&stream,
+        \\{"type":"content_block_delta","index":2,"delta":{"type":"signature_delta","signature":"sig"}}
+    );
+    try decodeTestFrame(&stream,
+        \\{"type":"content_block_stop","index":2}
+    );
+    // An answer with bytes ends the display. The thinking that follows it opens
+    // a block of its own, which must not start with a blank line.
+    try decodeTestFrame(&stream,
+        \\{"type":"content_block_start","index":3,"content_block":{"type":"text"}}
+    );
+    try decodeTestFrame(&stream,
+        \\{"type":"content_block_delta","index":3,"delta":{"type":"text_delta","text":"answer"}}
+    );
+    try decodeTestFrame(&stream,
+        \\{"type":"content_block_stop","index":3}
+    );
+    try decodeTestFrame(&stream,
+        \\{"type":"content_block_start","index":4,"content_block":{"type":"thinking"}}
+    );
+    _ = stream.frame_arena.reset(.retain_capacity);
+    try std.testing.expectEqualStrings("c", (try stream.decode(
+        \\{"type":"content_block_delta","index":4,"delta":{"type":"thinking_delta","thinking":"c"}}
+    )).event.thinking);
 }
 
 test "invalid reasoning blocks latch through terminal usage" {

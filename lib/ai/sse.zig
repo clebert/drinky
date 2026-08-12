@@ -23,6 +23,63 @@ pub const Decoded = union(enum) {
     done,
 };
 
+/// The seam that separates the display text of two reasoning runs (see
+/// `Reasoning`).
+pub const blank_line = "\n\n";
+
+/// Where one stream's reasoning display stands, which decides the blank line
+/// between two reasoning runs. It implements the `llm.Event.thinking` contract
+/// for every transport, so the transports cannot drift apart.
+///
+/// `open` means the display shows the text of the current reasoning run.
+/// `closed` means that run ended, so a seam is pending and the next reasoning
+/// text takes a blank line in front of it. `none` means the display shows
+/// something else, so the next reasoning text starts a block of its own.
+///
+/// Only a run with bytes moves the state. An empty frame displays nothing, so
+/// it keeps a pending seam for the run that follows it.
+pub const Reasoning = enum {
+    none,
+    open,
+    closed,
+
+    /// Take the pending seam and open a run. A false result means no seam is
+    /// pending. Use this only for a run whose display text another module
+    /// writes, because the seam then needs an event of its own.
+    pub fn takeSeam(self: *Reasoning) bool {
+        const pending = self.* == .closed;
+        self.* = .open;
+        return pending;
+    }
+
+    /// One run of reasoning display text, with the blank line that a pending
+    /// seam adds in front of it. Without that line the text of two runs joins
+    /// into one line, and the markdown markers at the seam merge into a literal
+    /// `****`. A run with no bytes displays nothing and holds the seam.
+    pub fn display(self: *Reasoning, arena: std.mem.Allocator, text: []const u8) !Decoded {
+        if (text.len == 0) return .progress;
+        if (!self.takeSeam()) return .{ .event = .{ .thinking = text } };
+        return .{ .event = .{
+            .thinking = try std.mem.concat(arena, u8, &.{ blank_line, text }),
+        } };
+    }
+
+    /// The answer display ends every reasoning run, so the next reasoning text
+    /// starts a block of its own. Answer text with no bytes displays nothing and
+    /// holds a pending seam. Returns whether the text displays.
+    pub fn answer(self: *Reasoning, text: []const u8) bool {
+        if (text.len == 0) return false;
+        self.* = .none;
+        return true;
+    }
+
+    /// End the open run, so its seam waits for the next reasoning text. A run
+    /// that displayed nothing keeps the state it had.
+    pub fn end(self: *Reasoning) void {
+        if (self.* == .open) self.* = .closed;
+    }
+};
+
 /// The engine methods over a provider stream struct `S`. `S` declares the
 /// connection fields these methods use (`gpa`, `established`, `client`,
 /// `request`, `response`, `body`, `io`, `idle_ms`, `budget`, `status`,

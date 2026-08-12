@@ -1721,6 +1721,7 @@ fn anthropicStream(io: std.Io, reader: *std.Io.Reader, idle_ms: u64) provider.St
     stream.anthropic_subscription.stop_reason = .none;
     stream.anthropic_subscription.terminal_rejection = null;
     stream.anthropic_subscription.open_block = null;
+    stream.anthropic_subscription.reasoning = .none;
     stream.anthropic_subscription.block_text = .empty;
     stream.anthropic_subscription.block_proof = .empty;
     stream.anthropic_subscription.tool_call_id = .empty;
@@ -1739,6 +1740,8 @@ fn openaiStream(io: std.Io, reader: *std.Io.Reader) provider.Stream {
     stream.openai_api.frame_arena = .init(std.testing.allocator);
     stream.openai_api.terminal_rejection = null;
     stream.openai_api.incomplete_message = false;
+    stream.openai_api.reasoning = .none;
+    stream.openai_api.summary_index = 0;
     stream.openai_api.completed_item_ids = .empty;
     stream.openai_api.usage = .{};
     stream.openai_api.quota = null;
@@ -2195,6 +2198,47 @@ test "readReply separates OpenAI reasoning summary parts with a blank line" {
     try std.testing.expectEqualStrings("enc", reply[0].reasoning.replay.openai_api.encrypted_content);
     try std.testing.expectEqualStrings("rs_1", reply[0].reasoning.replay.openai_api.id);
     try std.testing.expectEqualStrings("a\n\nb", handler.thinking.items);
+}
+
+test "readReply separates a redacted Anthropic block from the reasoning before it" {
+    // This module displays the placeholder for a redacted block, and it cannot
+    // put a blank line in front of that text. The frame that opens the block
+    // carries the seam instead, so the handler must read the two apart.
+    const body =
+        "data: {\"type\":\"content_block_start\",\"index\":0," ++
+        "\"content_block\":{\"type\":\"thinking\"}}\n\n" ++
+        "data: {\"type\":\"content_block_delta\",\"index\":0," ++
+        "\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"weigh it\"}}\n\n" ++
+        "data: {\"type\":\"content_block_delta\",\"index\":0," ++
+        "\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig\"}}\n\n" ++
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+        "data: {\"type\":\"content_block_start\",\"index\":1," ++
+        "\"content_block\":{\"type\":\"redacted_thinking\",\"data\":\"enc\"}}\n\n" ++
+        "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n" ++
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}," ++
+        "\"usage\":{\"output_tokens\":2}}\n\n" ++
+        "data: {\"type\":\"message_stop\"}\n\n";
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var reader: std.Io.Reader = .fixed(body);
+    var stream = anthropicStream(threaded.io(), &reader, 60_000);
+    defer stream.anthropic_subscription.deinitDecode();
+    var agent = scriptedAgent(std.testing.allocator);
+    defer agent.deinit();
+    var handler: CaptureHandler = .{ .gpa = std.testing.allocator };
+    defer handler.deinit();
+
+    const reply = try agent.readReply(&agent.model, &stream, &handler);
+    try std.testing.expectEqual(@as(usize, 2), reply.len);
+    try std.testing.expectEqualStrings(
+        "weigh it",
+        reply[0].reasoning.replay.anthropic_subscription.signature.text,
+    );
+    try std.testing.expectEqualStrings(
+        "enc",
+        reply[1].reasoning.replay.anthropic_subscription.redacted,
+    );
+    try std.testing.expectEqualStrings("weigh it\n\n" ++ redacted_notice, handler.thinking.items);
 }
 
 test "readReply rejects provider EOF before text completion" {

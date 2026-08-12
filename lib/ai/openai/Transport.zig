@@ -57,6 +57,12 @@ pub const Stream = struct {
     /// An incomplete message item is retainable only if the response itself
     /// terminates as incomplete.
     incomplete_message: bool,
+    /// Where the streamed reasoning display stands (see `sse.Reasoning`).
+    reasoning: sse.Reasoning,
+    /// The `summary_index` of the reasoning part now streaming. An index that
+    /// differs from it ends the part before it, so a stream that sends no
+    /// `reasoning_summary_part.added` frame still separates its parts.
+    summary_index: i64,
     /// Completed native item ids already emitted. `output_item.done` is
     /// independently authoritative, but duplicate done frames must not duplicate
     /// neutral history.
@@ -238,6 +244,11 @@ pub const Stream = struct {
             return .{ .event = .{ .item = .{ .message = text.items } } };
         }
         if (std.mem.eql(u8, item_kind, "reasoning")) {
+            // The display of this item ends here, whatever the item retains.
+            // The next reasoning text comes from a new item and needs a seam.
+            // A new item restarts `summary_index`, so the index alone cannot
+            // mark that seam.
+            self.reasoning.end();
             if (status != .completed) return .invalid;
             const encrypted_content = json.string(item.get("encrypted_content")) orelse
                 return .invalid;
@@ -264,24 +275,31 @@ pub const Stream = struct {
         return .unsupported;
     }
 
-    fn reasoningPartAdded(
-        self: *Stream,
-        object: *const std.json.ObjectMap,
-    ) !OutputItem {
-        const index = json.integer(object.get("summary_index")) orelse return .progress;
-        if (index < 0) return .progress;
+    /// One display frame of the reasoning part `index`, either the part itself
+    /// or one of its text deltas. An index that differs from the open one ends
+    /// the part before it. A part frame carries no text of its own in practice,
+    /// so the seam then waits for the deltas that follow it.
+    fn summaryPart(self: *Stream, index: i64, text: []const u8) !sse.Decoded {
+        if (index != self.summary_index) self.reasoning.end();
+        self.summary_index = index;
+        return self.reasoning.display(self.frame_arena.allocator(), text);
+    }
+
+    /// The `summary_index` of one reasoning frame, or null when the frame holds
+    /// no valid index.
+    fn summaryIndex(object: *const std.json.ObjectMap) ?i64 {
+        const index = json.integer(object.get("summary_index")) orelse return null;
+        return if (index < 0) null else index;
+    }
+
+    /// A summary part of the open reasoning item.
+    fn reasoningPartAdded(self: *Stream, object: *const std.json.ObjectMap) !sse.Decoded {
+        const index = summaryIndex(object) orelse return .progress;
         const part = json.object(object.get("part")) orelse return .progress;
         const kind = json.string(part.get("type")) orelse return .progress;
         if (!std.mem.eql(u8, kind, "summary_text")) return .progress;
         const text = json.string(part.get("text")) orelse return .progress;
-        if (index == 0) return if (text.len == 0)
-            .progress
-        else
-            .{ .event = .{ .thinking = text } };
-        var display: std.ArrayList(u8) = .empty;
-        try display.appendSlice(self.frame_arena.allocator(), "\n\n");
-        try display.appendSlice(self.frame_arena.allocator(), text);
-        return .{ .event = .{ .thinking = display.items } };
+        return self.summaryPart(index, text);
     }
 
     /// Decode one Responses `data:` payload.
@@ -317,18 +335,18 @@ pub const Stream = struct {
         }
         if (std.mem.eql(u8, kind, "response.output_text.delta")) {
             const delta = json.string(object.get("delta")) orelse return .progress;
+            // The answer ends the reasoning display, and a delta with no bytes
+            // displays nothing (see `sse.Reasoning`).
+            if (!self.reasoning.answer(delta)) return .progress;
             return .{ .event = .{ .text = delta } };
         }
         if (std.mem.eql(u8, kind, "response.reasoning_summary_text.delta")) {
             const delta = json.string(object.get("delta")) orelse return .progress;
-            return .{ .event = .{ .thinking = delta } };
+            // A frame with no index of its own continues the open part.
+            return self.summaryPart(summaryIndex(&object) orelse self.summary_index, delta);
         }
-        if (std.mem.eql(u8, kind, "response.reasoning_summary_part.added")) {
-            return switch (try self.reasoningPartAdded(&object)) {
-                .event => |event| .{ .event = event },
-                else => .progress,
-            };
-        }
+        if (std.mem.eql(u8, kind, "response.reasoning_summary_part.added"))
+            return self.reasoningPartAdded(&object);
         if (std.mem.eql(u8, kind, "response.reasoning_summary_text.done") or
             std.mem.eql(u8, kind, "response.reasoning_summary_part.done") or
             std.mem.eql(u8, kind, "response.function_call_arguments.delta") or
@@ -399,6 +417,8 @@ fn connect(self: *Transport, out: *Stream, payload: Payload) anyerror!void {
     errdefer out.frame_arena.deinit();
     out.terminal_rejection = null;
     out.incomplete_message = false;
+    out.reasoning = .none;
+    out.summary_index = 0;
     out.completed_item_ids = .empty;
     out.quota = null;
 
@@ -564,6 +584,8 @@ fn testStreamWithAllocator(
     stream.frame_arena = .init(gpa);
     stream.terminal_rejection = null;
     stream.incomplete_message = false;
+    stream.reasoning = .none;
+    stream.summary_index = 0;
     stream.completed_item_ids = .empty;
     stream.usage = .{};
     stream.quota = null;
@@ -776,8 +798,13 @@ test "reasoning deltas are display-only and done items are authoritative" {
         \\{"type":"response.reasoning_summary_text.delta","item_id":"display_only","summary_index":0,"delta":"a"}
     )).event.thinking);
     _ = stream.frame_arena.reset(.retain_capacity);
-    try std.testing.expectEqualStrings("\n\n", (try stream.decode(
+    // A part frame with no text displays nothing. Its seam waits for the delta.
+    try std.testing.expectEqual(@as(sse.Decoded, .progress), try stream.decode(
         \\{"type":"response.reasoning_summary_part.added","item_id":"display_only","summary_index":1,"part":{"type":"summary_text","text":""}}
+    ));
+    _ = stream.frame_arena.reset(.retain_capacity);
+    try std.testing.expectEqualStrings("\n\nb", (try stream.decode(
+        \\{"type":"response.reasoning_summary_text.delta","item_id":"display_only","summary_index":1,"delta":"b"}
     )).event.thinking);
     _ = stream.frame_arena.reset(.retain_capacity);
     const reasoning = (try stream.decode(
@@ -786,6 +813,101 @@ test "reasoning deltas are display-only and done items are authoritative" {
     try std.testing.expectEqualStrings("final a\n\nfinal b", reasoning.text);
     try std.testing.expectEqualStrings("rs_1", reasoning.id);
     try std.testing.expectEqualStrings("enc", reasoning.encrypted_content);
+}
+
+test "a new reasoning item separates its display from the item before it" {
+    var stream = testStream(undefined, undefined, 0, 0);
+    defer stream.deinitDecode();
+
+    try std.testing.expectEqualStrings("**a**", (try stream.decode(
+        \\{"type":"response.reasoning_summary_text.delta","item_id":"rs_1","summary_index":0,"delta":"**a**"}
+    )).event.thinking);
+    _ = stream.frame_arena.reset(.retain_capacity);
+    _ = try stream.decode(
+        \\{"type":"response.output_item.done","item":{"type":"reasoning","id":"rs_1","status":"completed","summary":[{"type":"summary_text","text":"**a**"}],"encrypted_content":"enc"}}
+    );
+    _ = stream.frame_arena.reset(.retain_capacity);
+    // The next item restarts `summary_index` at zero, and its empty first part
+    // displays nothing. The delta that follows it carries the seam.
+    try std.testing.expectEqual(@as(sse.Decoded, .progress), try stream.decode(
+        \\{"type":"response.reasoning_summary_part.added","item_id":"rs_2","summary_index":0,"part":{"type":"summary_text","text":""}}
+    ));
+    _ = stream.frame_arena.reset(.retain_capacity);
+    try std.testing.expectEqualStrings("\n\n**b**", (try stream.decode(
+        \\{"type":"response.reasoning_summary_text.delta","item_id":"rs_2","summary_index":0,"delta":"**b**"}
+    )).event.thinking);
+}
+
+test "a rising summary index separates two parts without a part frame" {
+    var stream = testStream(undefined, undefined, 0, 0);
+    defer stream.deinitDecode();
+
+    try std.testing.expectEqualStrings("**a**", (try stream.decode(
+        \\{"type":"response.reasoning_summary_text.delta","item_id":"rs_1","summary_index":0,"delta":"**a**"}
+    )).event.thinking);
+    _ = stream.frame_arena.reset(.retain_capacity);
+    // A deployment can send no part frame at all. The rising index is then the
+    // only seam between the two parts.
+    try std.testing.expectEqualStrings("\n\n**b**", (try stream.decode(
+        \\{"type":"response.reasoning_summary_text.delta","item_id":"rs_1","summary_index":1,"delta":"**b**"}
+    )).event.thinking);
+    _ = stream.frame_arena.reset(.retain_capacity);
+    // A frame of the same part takes no seam.
+    try std.testing.expectEqualStrings("c", (try stream.decode(
+        \\{"type":"response.reasoning_summary_text.delta","item_id":"rs_1","summary_index":1,"delta":"c"}
+    )).event.thinking);
+}
+
+test "answer text ends the reasoning display and drops the pending seam" {
+    var stream = testStream(undefined, undefined, 0, 0);
+    defer stream.deinitDecode();
+
+    _ = try stream.decode(
+        \\{"type":"response.reasoning_summary_text.delta","item_id":"rs_1","summary_index":0,"delta":"a"}
+    );
+    _ = stream.frame_arena.reset(.retain_capacity);
+    _ = try stream.decode(
+        \\{"type":"response.output_item.done","item":{"type":"reasoning","id":"rs_1","status":"completed","summary":[{"type":"summary_text","text":"a"}],"encrypted_content":"enc"}}
+    );
+    _ = stream.frame_arena.reset(.retain_capacity);
+    try std.testing.expectEqualStrings("answer", (try stream.decode(
+        \\{"type":"response.output_text.delta","item_id":"msg_1","delta":"answer"}
+    )).event.text);
+    _ = stream.frame_arena.reset(.retain_capacity);
+    // The reasoning that follows the answer opens a block of its own, so it
+    // starts on its own text.
+    try std.testing.expectEqualStrings("b", (try stream.decode(
+        \\{"type":"response.reasoning_summary_text.delta","item_id":"rs_2","summary_index":0,"delta":"b"}
+    )).event.thinking);
+}
+
+test "an empty delta displays nothing and holds the pending seam" {
+    var stream = testStream(undefined, undefined, 0, 0);
+    defer stream.deinitDecode();
+
+    _ = try stream.decode(
+        \\{"type":"response.reasoning_summary_text.delta","item_id":"rs_1","summary_index":0,"delta":"**a**"}
+    );
+    _ = stream.frame_arena.reset(.retain_capacity);
+    _ = try stream.decode(
+        \\{"type":"response.output_item.done","item":{"type":"reasoning","id":"rs_1","status":"completed","summary":[{"type":"summary_text","text":"**a**"}],"encrypted_content":"enc"}}
+    );
+    _ = stream.frame_arena.reset(.retain_capacity);
+    // An empty answer delta displays nothing, so it must not end the reasoning
+    // display and drop the seam the next item needs.
+    try std.testing.expectEqual(@as(sse.Decoded, .progress), try stream.decode(
+        \\{"type":"response.output_text.delta","item_id":"msg_1","delta":""}
+    ));
+    _ = stream.frame_arena.reset(.retain_capacity);
+    // An empty reasoning delta displays nothing either. A blank line on its own
+    // would add empty rows to the block.
+    try std.testing.expectEqual(@as(sse.Decoded, .progress), try stream.decode(
+        \\{"type":"response.reasoning_summary_text.delta","item_id":"rs_2","summary_index":0,"delta":""}
+    ));
+    _ = stream.frame_arena.reset(.retain_capacity);
+    try std.testing.expectEqualStrings("\n\n**b**", (try stream.decode(
+        \\{"type":"response.reasoning_summary_text.delta","item_id":"rs_2","summary_index":0,"delta":"**b**"}
+    )).event.thinking);
 }
 
 test "invalid completed reasoning items latch through terminal usage" {
