@@ -28,8 +28,9 @@ decision already taken, or a dependency on another entry. Module layout and exte
   acceptable, but a page that traps the user does not._
 - **A slash line with extra text reaches the model** — a line that starts with a command name plus
   more text goes to the provider. _No line that starts with a slash must reach the model. The
-  whole-line rule went too far, so report the line locally instead. `/skill:name` keeps its trailing
-  task text._
+  whole-line rule went too far, so report the line locally instead. This entry implements the
+  Command refusal prerequisite: keep unavailable command text in the editor and name the active
+  restriction during a turn, retry, or review. `/skill:name` keeps its trailing task text._
 - **Ctrl+C during a turn ignores the editor content** — Ctrl+C cancels the turn even when the editor
   holds text. _Ctrl+C must clear a non-empty editor first and cancel the turn only on an empty one.
   Esc stays the direct cancel. `clearOrQuit` runs in prompt mode alone today._
@@ -89,12 +90,18 @@ decision already taken, or a dependency on another entry. Module layout and exte
 
 ## Features
 
-- **`/review`** — a bounded workflow reviews the pending changes with a fresh reviewer, a persistent
+- **Active context projection** — Pith filters one canonical history for the active account and
+  model, then deeply repaints its transcript.
+- **Failure recovery and retry** — Ctrl+N retries committed work or a generated request without
+  sending editor text, and Enter can add that text to the retry.
+- **Conversation switching** — Pith selects the agent, history, transcript, and status through one
+  shared operation, then applies active context projection.
+- **`/review`** — a bounded workflow reviews pending changes with a fresh reviewer, a persistent
   judge, and a fixer, and it asks the user only about an open product choice. _The plan is
-  `docs/review-mode.md`. It needs a tool profile on `Agent` and two remembered account-model pairs
-  in the project state. It is not a subagent system, so one request runs at a time with no nesting.
-  The reviewer and the judge get no `write` or `edit`. Their prompt prohibits a mutating shell
-  command, and only the configurable bash guard can enforce that later._
+  `docs/review-mode.md`. It depends on the three preceding entries and the slash-line bug. Store
+  three account-model-effort role choices per project. Every role keeps the complete tool registry.
+  The reviewer and judge prompts prohibit mutation, but `bash` remains unrestricted. It is not a
+  subagent system, so one request runs at a time with no nesting._
 - **Save and resume conversations** — a conversation reopens after a restart and does not start
   empty. _Persist the per-turn cost ledger with it, since history items carry no cost. Persist the
   prompt-cache write times too, so a resume knows what retention is left. Generate the OpenAI cache
