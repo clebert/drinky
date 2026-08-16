@@ -483,6 +483,7 @@ pub fn run(
         .effort = start_effort,
         .bash = config.bash,
         .settings = self.settings,
+        .cache = config.cache,
     });
     defer self.agent.deinit();
     // Startup applies the remembered or the default choices, so it saves nothing.
@@ -519,6 +520,12 @@ pub fn run(
         "Pith ignored the configured default effort level \"{s}\" because Pith does not know " ++
             "that level. Pith uses the effort level \"{s}\".",
         .{ dropped, @tagName(self.agent.effort) },
+    );
+    if (config.dropped_cost) |dropped| try self.recordEvent(
+        .failure,
+        "Pith ignored the configured cache warning cost \"{s}\" because the value must be a " ++
+            "finite number of zero or more. Pith warns about every stale prompt cache.",
+        .{dropped},
     );
     // The parse ignores an unknown key so that an older binary reads a newer
     // file. Report it, because a typo otherwise looks like an applied setting.
@@ -1391,18 +1398,7 @@ fn preflightModelSubmit(
 ) !bool {
     if (self.session.takeCacheConfirmation()) return true;
     const cache_risk = maybe_cache_risk orelse return true;
-    const hour_ms: u64 = std.time.ms_per_hour;
-    const minute_ms: u64 = std.time.ms_per_min;
-    const retention: struct { count: u64, unit: []const u8 } =
-        if (cache_risk.retention_ms % hour_ms == 0)
-            .{ .count = @divExact(cache_risk.retention_ms, hour_ms), .unit = "h" }
-        else if (cache_risk.retention_ms % minute_ms == 0)
-            .{ .count = @divExact(cache_risk.retention_ms, minute_ms), .unit = "m" }
-        else
-            .{
-                .count = @divFloor(cache_risk.retention_ms, std.time.ms_per_s),
-                .unit = "s",
-            };
+    const retention = retentionText(cache_risk.retention_ms);
 
     if (cache_risk.cost_extra >= 0.01) {
         try self.reportNotice(
@@ -1421,6 +1417,19 @@ fn preflightModelSubmit(
     }
     self.session.armCacheConfirmation();
     return false;
+}
+
+/// One cache retention as a whole count and its unit. The ladder keeps the
+/// largest unit that divides the value, so a configured retention under one
+/// second reads as milliseconds instead of `0s`.
+fn retentionText(retention_ms: u64) struct { count: u64, unit: []const u8 } {
+    if (retention_ms % std.time.ms_per_hour == 0)
+        return .{ .count = @divExact(retention_ms, std.time.ms_per_hour), .unit = "h" };
+    if (retention_ms % std.time.ms_per_min == 0)
+        return .{ .count = @divExact(retention_ms, std.time.ms_per_min), .unit = "m" };
+    if (retention_ms % std.time.ms_per_s == 0)
+        return .{ .count = @divExact(retention_ms, std.time.ms_per_s), .unit = "s" };
+    return .{ .count = retention_ms, .unit = "ms" };
 }
 
 /// Record a compact skill marker and its optional user task, then spawn the turn
@@ -4743,6 +4752,31 @@ test "a stale cache blocks one submit and keeps the prompt unchanged" {
     try std.testing.expect(!app.session.takeCacheConfirmation());
 }
 
+test "a cache warning names its retention in the largest whole unit" {
+    const hour = retentionText(std.time.ms_per_hour);
+    try std.testing.expectEqual(@as(u64, 1), hour.count);
+    try std.testing.expectEqualStrings("h", hour.unit);
+
+    const minutes = retentionText(30 * std.time.ms_per_min);
+    try std.testing.expectEqual(@as(u64, 30), minutes.count);
+    try std.testing.expectEqualStrings("m", minutes.unit);
+
+    // 90 seconds make no whole minute, so the second carries them.
+    const seconds = retentionText(90 * std.time.ms_per_s);
+    try std.testing.expectEqual(@as(u64, 90), seconds.count);
+    try std.testing.expectEqualStrings("s", seconds.unit);
+
+    // A configured retention under one second keeps its milliseconds. It must
+    // never read as `0s`.
+    const brief = retentionText(500);
+    try std.testing.expectEqual(@as(u64, 500), brief.count);
+    try std.testing.expectEqualStrings("ms", brief.unit);
+
+    const mixed = retentionText(1500);
+    try std.testing.expectEqual(@as(u64, 1500), mixed.count);
+    try std.testing.expectEqualStrings("ms", mixed.unit);
+}
+
 // A sentence that starts with a command name is a message, so an idle Enter takes
 // the message path. Signed out, that path refuses with the login prompt. The
 // command the sentence starts with must leave no trace.
@@ -5380,7 +5414,7 @@ test "the frame grid holds a fixed period through a late wake and a slow paint" 
     // Model the consumer loop. The timer wakes late, the frame paints, and the
     // loop then arms the next one. Every deadline must stay exactly one interval
     // after the previous one, so the lateness and the paint cost never add to the
-    // period. This is the property a per-frame reset of the grid would destroy.
+    // period. A per-frame reset of the grid destroys this property.
     const wake_late_ns: i96 = 3 * std.time.ns_per_ms;
     const paint_ns: i96 = 5 * std.time.ns_per_ms;
     var grid: FrameGrid = .reset(1000);
@@ -5389,8 +5423,8 @@ test "the frame grid holds a fixed period through a late wake and a slow paint" 
         const armed_ns = previous_ns + wake_late_ns + paint_ns;
         grid.advance(armed_ns);
         try std.testing.expectEqual(previous_ns + FrameGrid.interval_ns, grid.deadline_ns);
-        // Anchored on the wake instead, the period would grow by the lateness and
-        // the paint cost on every frame.
+        // Anchored on the wake instead, the period grows by the lateness and the
+        // paint cost on every frame.
         try std.testing.expect(grid.deadline_ns != armed_ns + FrameGrid.interval_ns);
         previous_ns = grid.deadline_ns;
     }

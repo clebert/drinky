@@ -248,8 +248,8 @@ pub fn framed(placement: *const Placement, framing: *const Framing) !void {
         const roles = framing.line_roles;
         const maybe_role = if (source_line < roles.len) roles[source_line] else null;
         // The span carries the bytes the row covers, so the paint takes the cells
-        // out of it. A row that kept the blanks it breaks at would put them in
-        // every copy of the input.
+        // out of it. A row that keeps the blanks it breaks at puts them in every
+        // copy of the input.
         const content = terminal.width.rowText(framing.body[span.start..span.end]);
         try framedRow(placement, maybe_caret, &line, content, maybe_role);
         body_count += 1;

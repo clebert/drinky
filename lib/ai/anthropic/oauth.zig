@@ -297,7 +297,7 @@ test "principal comparison needs both stable markers" {
     try std.testing.expect(!known.samePrincipal(&other));
 }
 
-test "parseTokens rejects an expiry that would overflow" {
+test "parseTokens rejects an expiry that overflows" {
     const body =
         \\{"access_token":"a","refresh_token":"r","expires_in":9223372036854775807}
     ;

@@ -90,8 +90,8 @@ test "the picker refuses while no account is active" {
     agent.signOut();
     var context: Context = .{ .gpa = gpa, .io = undefined, .agent = &agent, .accounts = undefined };
 
-    // The status line hides the level while signed out, so a change here would
-    // be invisible and would never reach the machine-local state.
+    // The status line hides the level while signed out, so a change here stays
+    // invisible and never reaches the machine-local state.
     try Context.Outcome.expectNotice(try run(&context), .failure);
     try std.testing.expectEqual(llm.Effort.high, agent.effort);
 }

@@ -752,7 +752,7 @@ test "a path that is not absolute and a root that is not an ancestor both fail s
         .project_start = "/work",
         .project_root = "relative",
     }));
-    // A root the start does not resolve inside would let the walk climb past it.
+    // A root the start does not resolve inside lets the walk climb past it.
     try std.testing.expectError(error.SkillProjectRootNotAncestor, discover(gpa, undefined, &.{
         .user_root = "/home/.agents/skills",
         .project_start = "/work",

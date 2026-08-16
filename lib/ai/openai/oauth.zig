@@ -322,7 +322,7 @@ test "parseTokens rejects a token whose JWT has no expiry" {
     try std.testing.expectError(error.MissingExpiry, parseTokens(gpa, body, .{}));
 }
 
-test "parseTokens skips a crafted expiry that would overflow" {
+test "parseTokens skips a crafted expiry that overflows" {
     const gpa = std.testing.allocator;
     // An `exp` near maxInt(i64) must fail cleanly like a missing one, not crash
     // in the conversion to milliseconds.

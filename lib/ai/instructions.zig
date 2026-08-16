@@ -1264,7 +1264,7 @@ test "configured files stop at the shared byte budget" {
     const directory = try tmpPath(gpa, io, &tmp, "");
     defer gpa.free(directory);
 
-    // Two 24 KiB files fit. The third would pass 64 KiB, so Pith keeps the
+    // Two 24 KiB files fit. The third goes past 64 KiB, so Pith keeps the
     // earlier files and reports the one it dropped.
     var result = try load(gpa, io, &.{
         .directory = directory,

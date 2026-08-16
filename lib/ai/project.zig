@@ -96,7 +96,7 @@ pub const Head = struct {
 
 /// The head of the repository at `root`, which `findBoundary` reports. Pith never
 /// runs the git binary. It reads the one small `HEAD` file, so a caller can name
-/// the branch that a command in this directory would act on.
+/// the branch that a command in this directory acts on.
 ///
 /// Null when `root` holds no repository, when Pith cannot read the head, or when
 /// the head has no valid display name. Nothing here is authoritative, so every

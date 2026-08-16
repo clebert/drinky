@@ -378,7 +378,8 @@ test "tool_call arguments serialize as a JSON string, error output is prefixed" 
 
 test "a synthetic error result emits one function_call_output with one Error prefix" {
     const synthetic =
-        "The tool stopped before Pith recorded a result. It may have changed the system.";
+        "The tool stopped before Pith recorded a result. " ++
+        "Pith does not know if the tool changed the system.";
     const items = [_]llm.Item{
         .{ .tool_call = .{ .call_id = "call_1", .name = "read", .arguments_json = "{}" } },
         .{ .tool_result = .{ .call_id = "call_1", .content = synthetic, .is_error = true } },

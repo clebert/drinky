@@ -128,6 +128,7 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
   for OpenAI.
 - A stale prompt cache blocks the first submit, estimates the extra input cost, and lets the next
   Enter continue.
+- The assumed cache retention per provider and the cost that arms this warning are configurable.
 - Reasoning is requested summarized at the resolved effort, and replayed verbatim on later turns.
 - Anthropic Subscription and Anthropic Console requests carry the Claude Code client identity. A
   plain API key goes straight to the platform API.
@@ -237,13 +238,13 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - User and project instructions obey one policy: a regular UTF-8 file, with content, no NUL byte,
   and at most 32 KiB. Each source loads at most 32 files and 64 KiB, and one file loads once even
   when two paths or a symbolic link reach it. pith reports what it skips.
-- `~/.pith/config.json` is optional: paths for user instructions, request and bash limits, a default
-  model per account, and a default effort level. pith reads it only at startup, so a change applies
-  at the next start.
+- `~/.pith/config.json` is optional: paths for user instructions, request and bash limits, the
+  prompt-cache warning, a default model per account, and a default effort level. pith reads it only
+  at startup, so a change applies at the next start.
 - It holds no secrets. API keys come from `ANTHROPIC_API_KEY` and `OPENAI_API_KEY`.
 - A configured model that is not valid for its account is reported, and the compiled default used.
-  An unknown effort level is reported the same way. A key that pith does not know is reported too,
-  so a typo never looks like an applied setting.
+  An unknown effort level and a cache warning cost that pith cannot use are reported the same way. A
+  key that pith does not know is reported too, so a typo never looks like an applied setting.
 - The settings document is generated from the struct that parses the file, so a new key that carries
   no description fails the build and the document cannot drift.
 - JSON store writes use owner-only sibling `.lock` files to coordinate pith instances.

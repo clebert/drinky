@@ -619,8 +619,8 @@ test "an empty thinking delta displays nothing and holds the pending seam" {
     try decodeTestFrame(&stream,
         \\{"type":"content_block_start","index":1,"content_block":{"type":"thinking"}}
     );
-    // An empty delta displays nothing. A blank line on its own would add empty
-    // rows to the block, so the seam must wait for a delta with bytes.
+    // An empty delta displays nothing. A blank line on its own adds empty rows
+    // to the block, so the seam must wait for a delta with bytes.
     _ = stream.frame_arena.reset(.retain_capacity);
     try std.testing.expectEqual(@as(sse.Decoded, .progress), try stream.decode(
         \\{"type":"content_block_delta","index":1,"delta":{"type":"thinking_delta","thinking":""}}
@@ -1273,7 +1273,7 @@ test "send leaves the caller owning nothing when connect fails partway" {
     try std.testing.expect(!stream.established);
 }
 
-test "connect rejects credentials that would split the request head" {
+test "connect rejects credentials that split the request head" {
     var transport: Transport = .{
         .gpa = std.testing.allocator,
         .io = undefined,

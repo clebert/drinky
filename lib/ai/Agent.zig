@@ -29,7 +29,8 @@ const redacted_notice = "[redacted thinking]";
 /// changed the world and then recorded no result. Stored without an `Error:`
 /// prefix, which the OpenAI serializer adds for error results.
 const synthetic_result =
-    "The tool stopped before Pith recorded a result. It may have changed the system.";
+    "The tool stopped before Pith recorded a result. " ++
+    "Pith does not know if the tool changed the system.";
 
 /// The distinct models one session breaks its cost down by. An overflow drops
 /// only the per-model detail, never the cumulative totals.
@@ -54,6 +55,8 @@ stats: Stats,
 /// Steering messages the user submitted mid-turn, drained into the running turn
 /// at each round boundary. Thread-safe: the UI thread pushes, and the worker takes.
 steering: Steering,
+/// The local policy for the stale-prompt-cache warning.
+cache: CachePolicy,
 /// The stable per-conversation prompt-cache routing key (used by OpenAI). Every
 /// turn shares it until a deliberate reset rotates it.
 cache_key: [32]u8,
@@ -76,6 +79,34 @@ const CacheActivity = struct {
 pub const CacheRisk = struct {
     retention_ms: u64,
     cost_extra: f64,
+};
+
+/// The local policy for the stale-prompt-cache warning. The host patches it from
+/// its configuration. Nothing here reaches the wire, because the provider owns
+/// the real retention.
+pub const CachePolicy = struct {
+    /// The retention that every Anthropic model uses in place of its compiled
+    /// value. Null keeps the compiled value, and 0 turns the warning off.
+    anthropic_retention_ms: ?u64 = null,
+    /// The same override for every OpenAI model.
+    openai_retention_ms: ?u64 = null,
+    /// The smallest estimated extra cost that arms the warning. A cheaper risk
+    /// starts its turn with no warning. Zero warns about every risk.
+    warning_min_cost: f64 = 0,
+
+    /// The retention this policy applies to `model` under `account`: the
+    /// configured override of that vendor, or the model's compiled value.
+    pub fn retentionMs(
+        self: *const CachePolicy,
+        account: llm.Account,
+        model: *const models.Model,
+    ) ?u64 {
+        const configured = switch (account.provider()) {
+            .anthropic => self.anthropic_retention_ms,
+            .openai => self.openai_retention_ms,
+        };
+        return configured orelse model.cache_retention_ms;
+    }
 };
 
 /// The cumulative session cost and cache savings, plus the last message's usage
@@ -279,6 +310,7 @@ pub fn init(
         effort: llm.Effort = .none,
         bash: tool.Context.Bash = .{},
         settings: tool.Context.Settings = .{},
+        cache: CachePolicy = .{},
     },
 ) Agent {
     return .{
@@ -294,6 +326,7 @@ pub fn init(
         .items = .empty,
         .stats = .{},
         .steering = Steering.init(gpa, io),
+        .cache = options.cache,
         .cache_key = generateCacheKey(io),
         .cache_activity = null,
     };
@@ -397,7 +430,8 @@ pub fn setEffort(self: *Agent, effort: llm.Effort) void {
 }
 
 /// Estimate the cache rewrite risk for an idle submission. Null means there is
-/// no committed context or no matching cache evidence past its retention.
+/// no committed context, no matching cache evidence past its retention, or a
+/// cost under the policy's floor.
 pub fn cacheRisk(self: *const Agent) ?CacheRisk {
     const now = std.Io.Clock.Timestamp.now(self.io, .boot);
     return self.cacheRiskAt(&now);
@@ -407,7 +441,7 @@ fn cacheRiskAt(self: *const Agent, now: *const std.Io.Clock.Timestamp) ?CacheRis
     if (self.items.items.len == 0) return null;
     const client = self.client orelse return null;
     const activity = self.cache_activity orelse return null;
-    const retention_ms = self.model.cache_retention_ms orelse return null;
+    const retention_ms = self.cache.retentionMs(client.account(), &self.model) orelse return null;
     if (retention_ms == 0 or activity.prefix_tokens == 0) return null;
     if (activity.account != client.account() or
         !std.mem.eql(u8, activity.model, self.model.name) or
@@ -424,10 +458,11 @@ fn cacheRiskAt(self: *const Agent, now: *const std.Io.Clock.Timestamp) ?CacheRis
 
     const fresh = self.model.cost(&.{ .cache_read = activity.prefix_tokens });
     const stale = self.model.cost(&.{ .cache_write = activity.prefix_tokens });
-    return .{
-        .retention_ms = retention_ms,
-        .cost_extra = @max(0, stale - fresh),
-    };
+    const cost_extra = @max(0, stale - fresh);
+    // A rewrite under the floor is not worth an interruption, so the turn
+    // starts without one. The default floor of zero warns about every risk.
+    if (cost_extra < self.cache.warning_min_cost) return null;
+    return .{ .retention_ms = retention_ms, .cost_extra = cost_extra };
 }
 
 /// Run one user turn as a checkpointed transaction, stream output through
@@ -794,11 +829,11 @@ fn recordRequestUsage(
     request_at: *const std.Io.Clock.Timestamp,
 ) void {
     self.recordUsage(model, usage);
-    const retention_ms = model.cache_retention_ms orelse {
+    const account = if (self.client) |client| client.account() else {
         self.cache_activity = null;
         return;
     };
-    const account = if (self.client) |client| client.account() else {
+    const retention_ms = self.cache.retentionMs(account, model) orelse {
         self.cache_activity = null;
         return;
     };
@@ -1274,6 +1309,53 @@ test "cache risk follows the active provider retention and refresh time" {
         .clock = .boot,
     };
     try std.testing.expect(openai_agent.cacheRiskAt(&at_openai) != null);
+}
+
+test "the cache policy overrides one vendor's retention and floors the warning" {
+    const gpa = std.testing.allocator;
+    var agent = scriptedAgent(gpa);
+    defer agent.deinit();
+    agent.cache = .{ .anthropic_retention_ms = std.time.ms_per_min };
+    try agent.appendUser("committed context");
+
+    const start: std.Io.Clock.Timestamp = .{ .raw = .zero, .clock = .boot };
+    const usage: llm.Usage = .{ .cache_read = 160_000, .cache_write = 40_000 };
+    const at_minute: std.Io.Clock.Timestamp = .{
+        .raw = .fromNanoseconds(std.time.ns_per_min),
+        .clock = .boot,
+    };
+
+    // The override replaces the compiled 5 minutes of the model, so the same
+    // evidence goes stale four minutes earlier.
+    agent.recordRequestUsage(&agent.model, &usage, &start);
+    const risk = agent.cacheRiskAt(&at_minute).?;
+    try std.testing.expectEqual(@as(u64, std.time.ms_per_min), risk.retention_ms);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.15), risk.cost_extra, 1e-9);
+
+    // An override of the other vendor leaves this model on its compiled value.
+    agent.cache = .{ .openai_retention_ms = std.time.ms_per_min };
+    agent.recordRequestUsage(&agent.model, &usage, &start);
+    try std.testing.expect(agent.cacheRiskAt(&at_minute) == null);
+
+    // A floor above the estimate starts the turn without a warning. The
+    // estimate itself still arms one.
+    agent.cache = .{
+        .anthropic_retention_ms = std.time.ms_per_min,
+        .warning_min_cost = 1.2,
+    };
+    agent.recordRequestUsage(&agent.model, &usage, &start);
+    try std.testing.expect(agent.cacheRiskAt(&at_minute) == null);
+    agent.cache.warning_min_cost = 1.15;
+    try std.testing.expect(agent.cacheRiskAt(&at_minute) != null);
+
+    // A retention of 0 turns the warning off, however long the wait was.
+    agent.cache = .{ .anthropic_retention_ms = 0 };
+    agent.recordRequestUsage(&agent.model, &usage, &start);
+    const at_hour: std.Io.Clock.Timestamp = .{
+        .raw = .fromNanoseconds(std.time.ns_per_hour),
+        .clock = .boot,
+    };
+    try std.testing.expect(agent.cacheRiskAt(&at_hour) == null);
 }
 
 test "cache risk needs matching setup, effort, and a reusable prefix" {
@@ -3391,7 +3473,7 @@ test "a failed or canceled attempt still adopts the head's allowance" {
     }
 }
 
-test "steering queued when the model would stop keeps the turn alive" {
+test "steering queued at the end of a turn keeps that turn alive" {
     const gpa = std.testing.allocator;
     var agent = scriptedAgent(gpa);
     defer agent.deinit();

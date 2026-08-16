@@ -236,7 +236,7 @@ fn writeLeft(out: *std.Io.Writer, info: *const Info, parts: *const Parts) !void 
     if (parts.cache) try writeCache(out, info);
 }
 
-/// The working directory, and the branch that a command here would act on. A
+/// The working directory, and the branch that a command here acts on. A
 /// path names itself, so it takes no label. The branch follows it in brackets,
 /// the same shape the agent takes on the right.
 fn writePlace(out: *std.Io.Writer, info: *const Info, parts: *const Parts) !void {
@@ -249,7 +249,7 @@ fn writePlace(out: *std.Io.Writer, info: *const Info, parts: *const Parts) !void
 }
 
 /// The short form keeps the last component alone, behind a `…/` mark and the home
-/// `~` that the path carries. A path that the mark would not shorten stays whole,
+/// `~` that the path carries. A path that the mark does not shorten stays whole,
 /// so shortening never costs columns.
 fn writeDirectory(out: *std.Io.Writer, directory: []const u8, place: Parts.Place) !void {
     const home_prefix = if (std.mem.startsWith(u8, directory, "~/")) "~/" else "";

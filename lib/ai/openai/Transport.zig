@@ -900,7 +900,7 @@ test "an empty delta displays nothing and holds the pending seam" {
     ));
     _ = stream.frame_arena.reset(.retain_capacity);
     // An empty reasoning delta displays nothing either. A blank line on its own
-    // would add empty rows to the block.
+    // adds empty rows to the block.
     try std.testing.expectEqual(@as(sse.Decoded, .progress), try stream.decode(
         \\{"type":"response.reasoning_summary_text.delta","item_id":"rs_2","summary_index":0,"delta":""}
     ));
@@ -1379,7 +1379,7 @@ test "next surfaces a stream truncated mid data-line as a retryable premature en
     try std.testing.expectError(error.IncompleteReply, stream.next());
 }
 
-test "connect rejects credentials that would split the request head" {
+test "connect rejects credentials that split the request head" {
     var transport: Transport = .{
         .gpa = std.testing.allocator,
         .io = undefined,

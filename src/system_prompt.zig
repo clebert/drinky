@@ -95,7 +95,7 @@ fn writePrecedence(writer: *std.Io.Writer, options: *const Options) !void {
 /// Write one instruction section. The user and the project sections differ only
 /// in their title and their tag, so both stream through here.
 ///
-/// The content goes in as it is, because escaping it would corrupt the Markdown
+/// The content goes in as it is, because escaping it corrupts the Markdown
 /// the user wrote. The tags mark the bounds, so a heading inside a file cannot
 /// end the section. A file that forges a closing tag can still claim a higher
 /// rank, which is why pith trusts only what the user and the repository own.

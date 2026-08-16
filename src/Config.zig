@@ -21,6 +21,7 @@ path: []const u8,
 timeouts: ai.net.Timeouts = .{},
 retry: ai.net.Retry = .{},
 bash: ai.tool.Context.Bash = .{},
+cache: ai.Agent.CachePolicy = .{},
 default_models: DefaultModels = .{},
 /// The configured default reasoning-effort level, or null when the file names
 /// none or names an unknown level. The caller falls back to a compiled default.
@@ -37,6 +38,11 @@ dropped_models: []const DroppedModel = &.{},
 /// so the app can tell the user Pith ignored their line. Owned. `deinit` frees
 /// it.
 dropped_effort: ?[]const u8 = null,
+/// The configured cache warning cost that Pith cannot use, as the user wrote it.
+/// The config keeps it so the app can tell the user Pith ignored their line, and
+/// the policy falls back to the built-in floor. Null on a legal value. Owned.
+/// `deinit` frees it.
+dropped_cost: ?[]const u8 = null,
 /// The keys of `config.json` that no field of `File` matches, as paths in file
 /// order. The parse ignores them, so the app reports them and a typo does not
 /// disappear silently. Owned. `deinit` frees them.
@@ -75,6 +81,7 @@ const File = struct {
     user_instructions: []const File.UserInstruction = &.{},
     request: Request = .{},
     bash: Bash = .{},
+    cache: Cache = .{},
     default_models: DefaultModelsFile = .{},
     default_effort: ?JsonString = null,
 
@@ -122,6 +129,12 @@ const File = struct {
         timeout_ms: u64 = bash_default.timeout_ms,
     };
 
+    const Cache = struct {
+        anthropic_retention_ms: ?u64 = cache_default.anthropic_retention_ms,
+        openai_retention_ms: ?u64 = cache_default.openai_retention_ms,
+        warning_min_cost: f64 = cache_default.warning_min_cost,
+    };
+
     /// Model names keyed by account tag. Each resolves to a compiled model.
     const DefaultModelsFile = struct {
         anthropic_api: ?JsonString = null,
@@ -148,6 +161,7 @@ const DataOptions = struct {
 const timeouts_default: ai.net.Timeouts = .{};
 const retry_default: ai.net.Retry = .{};
 const bash_default: ai.tool.Context.Bash = .{};
+const cache_default: ai.Agent.CachePolicy = .{};
 
 /// A malformed file must not fill the startup transcript with one event per
 /// key. Sixteen paths identify a broad shape mismatch. One final event reports
@@ -222,6 +236,25 @@ const keys = [_]Key{
             "argument overrides it, and 0 means no limit.",
     },
     .{
+        .path = "cache.anthropic_retention_ms",
+        .description = "The prompt-cache retention that Pith assumes for an Anthropic model. " ++
+            "Without the key, each model states its own, today 5 minutes. A value of 0 " ++
+            "turns the stale-cache warning off.",
+    },
+    .{
+        .path = "cache.openai_retention_ms",
+        .description = "The prompt-cache retention that Pith assumes for an OpenAI model. " ++
+            "Without the key, each model states its own, today 30 minutes. A value of 0 " ++
+            "turns the stale-cache warning off.",
+    },
+    .{
+        .path = "cache.warning_min_cost",
+        .description = "The smallest extra input cost, in dollars, that arms the stale-cache " ++
+            "warning. Pith starts a cheaper turn without a warning. The value must be a " ++
+            "finite number of zero or more. A value that is too large for a double is not " ++
+            "finite. Pith reports a value it cannot use and warns about every risk.",
+    },
+    .{
         .path = "default_models.anthropic_api",
         .description = "The model of the Anthropic API account. Use an Anthropic name." ++ new_project_only,
     },
@@ -279,6 +312,7 @@ fn jsonTypeName(comptime T: type) []const u8 {
     const unsupported = "the config field type " ++ @typeName(inner) ++ " has no JSON type";
     return switch (@typeInfo(inner)) {
         .int => "integer",
+        .float => "number",
         .pointer => "array",
         .@"struct" => if (inner == File.JsonString) "string" else @compileError(unsupported),
         else => @compileError(unsupported),
@@ -291,7 +325,7 @@ fn maybeDefaultText(comptime field: std.builtin.Type.StructField) ?[]const u8 {
     const pointer = field.default_value_ptr orelse return null;
     const value = @as(*const field.type, @ptrCast(@alignCast(pointer))).*;
     return switch (@typeInfo(field.type)) {
-        .int => std.fmt.comptimePrint("{d}", .{value}),
+        .int, .float => std.fmt.comptimePrint("{d}", .{value}),
         // "unset", never "none": `none` is itself a legal effort level, so that
         // word reads as a value rather than as the absence of one.
         .optional => if (value == null) "unset" else @compileError("expected a null default"),
@@ -399,6 +433,7 @@ const example =
     \\  "user_instructions": [{ "path": "instructions.md" }],
     \\  "request": { "idle_timeout_ms": 90000 },
     \\  "bash": { "timeout_ms": 300000 },
+    \\  "cache": { "openai_retention_ms": 600000, "warning_min_cost": 0.05 },
     \\  "default_models": { "anthropic_subscription": "claude-opus-5" },
     \\  "default_effort": "high"
     \\}
@@ -500,6 +535,7 @@ pub fn deinit(self: *Config, gpa: std.mem.Allocator) void {
     for (self.dropped_models) |dropped| gpa.free(dropped.name);
     gpa.free(self.dropped_models);
     if (self.dropped_effort) |name| gpa.free(name);
+    if (self.dropped_cost) |text| gpa.free(text);
     for (self.unknown_keys) |key| gpa.free(key);
     gpa.free(self.unknown_keys);
 }
@@ -549,6 +585,7 @@ fn loadFromData(gpa: std.mem.Allocator, io: std.Io, options: *const DataOptions)
     defer parsed.deinit();
     const request = parsed.value.request;
     const bash = parsed.value.bash;
+    const cache = parsed.value.cache;
     const names = parsed.value.default_models;
 
     // The paths borrow the parsed arena, and the loader dupes what it keeps. The
@@ -611,6 +648,14 @@ fn loadFromData(gpa: std.mem.Allocator, io: std.Io, options: *const DataOptions)
         &dropped_effort,
         File.JsonString.get(parsed.value.default_effort),
     );
+    var dropped_cost: ?[]const u8 = null;
+    errdefer if (dropped_cost) |text| gpa.free(text);
+    const warning_min_cost = try resolveCost(
+        gpa,
+        &dropped_cost,
+        &source.value,
+        cache.warning_min_cost,
+    );
     var unknown: std.ArrayList([]const u8) = .empty;
     errdefer {
         for (unknown.items) |key| gpa.free(key);
@@ -643,11 +688,17 @@ fn loadFromData(gpa: std.mem.Allocator, io: std.Io, options: *const DataOptions)
             .bytes_max = bash.output_bytes_max,
             .timeout_ms = bash.timeout_ms,
         },
+        .cache = .{
+            .anthropic_retention_ms = cache.anthropic_retention_ms,
+            .openai_retention_ms = cache.openai_retention_ms,
+            .warning_min_cost = warning_min_cost,
+        },
         .default_models = default_models,
         .default_effort = default_effort,
         .user_instructions = user_instructions,
         .dropped_models = dropped_models,
         .dropped_effort = dropped_effort,
+        .dropped_cost = dropped_cost,
         .unknown_keys = unknown_keys,
         .unknown_keys_omitted = unknown_keys_omitted,
     };
@@ -759,6 +810,44 @@ fn resolveEffort(
     return null;
 }
 
+/// Resolve the configured cache warning cost. A floor below zero states nothing,
+/// and an unbounded one (a literal like 1e400 parses to infinity) silences every
+/// warning. Both fall back to the built-in floor. The function also records the
+/// line in `dropped` so the app can surface it.
+fn resolveCost(
+    gpa: std.mem.Allocator,
+    dropped: *?[]const u8,
+    source: *const std.json.Value,
+    configured: f64,
+) !f64 {
+    if (std.math.isFinite(configured) and configured >= 0) return configured;
+    dropped.* = try dupeConfiguredCost(gpa, source, configured);
+    return cache_default.warning_min_cost;
+}
+
+/// The text of `cache.warning_min_cost` as the user wrote it, duped for the
+/// report. The load keeps every number as text, so the report can quote the line
+/// instead of a value that already rounded to `inf`. A value the walk cannot
+/// find falls back to the parsed number.
+fn dupeConfiguredCost(
+    gpa: std.mem.Allocator,
+    source: *const std.json.Value,
+    configured: f64,
+) ![]const u8 {
+    const maybe_written: ?[]const u8 = written: {
+        if (source.* != .object) break :written null;
+        const section = source.object.get("cache") orelse break :written null;
+        if (section != .object) break :written null;
+        const value = section.object.get("warning_min_cost") orelse break :written null;
+        break :written switch (value) {
+            .number_string => |text| text,
+            else => null,
+        };
+    };
+    if (maybe_written) |written| return gpa.dupe(u8, written);
+    return std.fmt.allocPrint(gpa, "{d}", .{configured});
+}
+
 /// Resolve a configured model name for `account` against the compiled table for
 /// that account's vendor. A name that is unknown or belongs to another vendor
 /// resolves to null. The function also records it in `dropped` so the app can
@@ -843,6 +932,64 @@ test "load reads the bash section" {
     try std.testing.expectEqual(@as(usize, 17), config.bash.lines_max);
     try std.testing.expectEqual(@as(usize, 4096), config.bash.bytes_max);
     try std.testing.expectEqual(@as(u64, 1500), config.bash.timeout_ms);
+}
+
+test "load reads the cache section" {
+    var config = try loadDataForTest(
+        \\{ "cache": { "anthropic_retention_ms": 0, "openai_retention_ms": 600000,
+        \\  "warning_min_cost": 0.05 } }
+    );
+    defer config.deinit(std.testing.allocator);
+    // Zero is a real override that turns the warning off, so it must survive as
+    // a value and not read as an unset key.
+    try std.testing.expectEqual(@as(?u64, 0), config.cache.anthropic_retention_ms);
+    try std.testing.expectEqual(@as(?u64, 600_000), config.cache.openai_retention_ms);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.05), config.cache.warning_min_cost, 1e-9);
+
+    // Without the section, no retention is overridden and every risk warns.
+    var empty = try loadDataForTest("{}");
+    defer empty.deinit(std.testing.allocator);
+    try std.testing.expect(empty.cache.anthropic_retention_ms == null);
+    try std.testing.expect(empty.cache.openai_retention_ms == null);
+    try std.testing.expectEqual(@as(f64, 0), empty.cache.warning_min_cost);
+}
+
+test "a cost floor Pith cannot use falls back to zero and is reported" {
+    // A negative floor states nothing, so the load keeps the line for the report
+    // and warns about every risk again.
+    var negative = try loadDataForTest(
+        \\{ "cache": { "warning_min_cost": -0.5 } }
+    );
+    defer negative.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(f64, 0), negative.cache.warning_min_cost);
+    try std.testing.expectEqualStrings("-0.5", negative.dropped_cost.?);
+
+    // An infinite one suppresses every warning in silence, which is the opposite
+    // of what the key is for. The report quotes the line, not the parsed `inf`.
+    var unbounded = try loadDataForTest(
+        \\{ "cache": { "warning_min_cost": 1e400 } }
+    );
+    defer unbounded.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(f64, 0), unbounded.cache.warning_min_cost);
+    try std.testing.expectEqualStrings("1e400", unbounded.dropped_cost.?);
+
+    // A retention counts milliseconds, so the parse itself refuses a negative
+    // one and one past the counter.
+    try std.testing.expectError(error.Overflow, loadDataForTest(
+        \\{ "cache": { "anthropic_retention_ms": -1 } }
+    ));
+    try std.testing.expectError(error.Overflow, loadDataForTest(
+        \\{ "cache": { "openai_retention_ms": 99999999999999999999 } }
+    ));
+
+    // Zero stays legal on both keys, and it drops nothing.
+    var config = try loadDataForTest(
+        \\{ "cache": { "anthropic_retention_ms": 0, "warning_min_cost": 0 } }
+    );
+    defer config.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(?u64, 0), config.cache.anthropic_retention_ms);
+    try std.testing.expectEqual(@as(f64, 0), config.cache.warning_min_cost);
+    try std.testing.expect(config.dropped_cost == null);
 }
 
 test "load fills missing fields and sections from defaults" {
@@ -1204,6 +1351,7 @@ fn checkLoadAllocationFailure(gpa: std.mem.Allocator, io: std.Io, home: []const 
     try std.testing.expectEqual(@as(usize, 1), config.user_instructions.notices().len);
     try std.testing.expectEqual(@as(usize, 1), config.dropped_models.len);
     try std.testing.expect(config.dropped_effort != null);
+    try std.testing.expect(config.dropped_cost != null);
     try std.testing.expectEqual(@as(usize, 1), config.unknown_keys.len);
     const value = try config.settings(gpa, &settings_options_for_test);
     defer freeSettings(gpa, &value);
@@ -1223,7 +1371,7 @@ test "the config load frees every partial allocation" {
         .data =
         \\{ "user_instructions": [{ "path": "first.md" }, { "path": "missing.md" }],
         \\  "default_models": { "openai_api": "nope" }, "default_effort": "nope",
-        \\  "unknown": 1 }
+        \\  "cache": { "warning_min_cost": -1 }, "unknown": 1 }
         ,
     });
     const home = try tmpPath(gpa, io, &tmp, "");
