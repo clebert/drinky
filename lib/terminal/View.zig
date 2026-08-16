@@ -22,7 +22,9 @@
 //! The view never pulls inaccessible scrollback back onto the screen. When a
 //! bounded frame adds an older prefix, the view discards that prefix and keeps
 //! its printed top. It can reprint a backward slide when the previous top remains
-//! on screen.
+//! on screen. A frame that also replaces a row above the screen top leaves that
+//! row stale, and no incremental repaint reaches it. The view resets for such a
+//! frame, so the newest rows stay on screen.
 //!
 //! Every frame line is one physical row. Each repaint is one synchronized-output
 //! burst. Primary-screen resets clear inaccessible scrollback. An alternate-screen
@@ -426,7 +428,9 @@ pub fn render(self: *View) !void {
             // The previous top is still addressable. Reprint the backward slide there.
             back.top_line = prev.top_line;
             try self.paint(.incremental, back, .{ .line = prev.top_line });
-        } else if (alignment.prev_index == 0) {
+        } else if (alignment.prev_index == 0 and
+            !self.staleAbove(prev, back, alignment.back_index))
+        {
             // The producer pulled inaccessible history into the bounded frame.
             // Keep the printed top and discard that backward prefix.
             back.dropLeadingRows(alignment.back_index);
@@ -489,6 +493,8 @@ fn paintAligned(self: *View, prev: *const Frame, back: *Frame, delta: usize) !vo
 }
 
 /// Reconcile a frame after the view discards its inaccessible backward prefix.
+/// The scan starts at the first visible row. `staleAbove` has already compared
+/// the rows above it, which the terminal cannot address.
 fn paintDroppedPrefix(self: *View, prev: *const Frame, back: *Frame) !void {
     back.top_line = prev.top_line;
     const visible_start = self.screen_top_line -| back.top_line;
@@ -694,6 +700,25 @@ fn restoreCursor(self: *View, frame: *const Frame) !void {
         try writer.writeAll(escape.cursor_hide);
         self.cursor_visible = false;
     }
+}
+
+/// Whether the frames disagree on a row above the screen top. `count` is the
+/// backward prefix of `back` that the drop removes, so `back[count + index]` and
+/// `prev[index]` share one screen line. The terminal cannot address a line above
+/// the screen top, so a replaced row there stays stale. A repaint of the visible
+/// rows then also pushes the rows below that line out of reach. Only a row that
+/// both frames hold counts. A row that one frame lacks says nothing about what
+/// the terminal shows on its line.
+fn staleAbove(self: *const View, prev: *const Frame, back: *const Frame, count: usize) bool {
+    const prev_rows = prev.rows.items;
+    const back_rows = back.rows.items;
+    var index: usize = 0;
+    while (prev.top_line + index < self.screen_top_line) : (index += 1) {
+        if (index >= prev_rows.len or count + index >= back_rows.len) return false;
+        const prev_bytes = prev.bytes(prev_rows[index]);
+        if (!std.mem.eql(u8, prev_bytes, back.bytes(back_rows[count + index]))) return true;
+    }
+    return false;
 }
 
 /// The first anchor `back` shares with `prev`: its index in `back` and its index
@@ -1241,6 +1266,55 @@ test "a height resize preserves scrollback and leaves blank rows below" {
     try std.testing.expect(std.mem.indexOf(u8, growth, "thinking") == null);
     try std.testing.expect(std.mem.indexOf(u8, growth, "editor") == null);
     try std.testing.expect(std.mem.indexOf(u8, growth, "status") == null);
+}
+
+// Regression: a retry drops the partial reply during a turn. The bounded frame
+// then slides back over older rows, and the reply rows it loses sit above the
+// screen top. A comparison of the visible rows alone finds a small change, so
+// the view repainted one row and stranded the editor above the screen. It must
+// reset, so the live tail stays on screen.
+test "a shrink above the screen top keeps the tail on screen" {
+    const gpa = std.testing.allocator;
+    const harness = try makeHarness(gpa, 20);
+    defer {
+        harness.deinit();
+        gpa.destroy(harness);
+    }
+    // A window of eight rows (two pages of four) over a four-row screen.
+    const streaming = [_]Line{
+        line("old 0", 0),
+        line("old 1", 1),
+        line("old 2", 2),
+        line("old 3", 3),
+        line("old 4", 4),
+        line("old 5", 5),
+        line("old 6", 6),
+        line("old 7", 7),
+        line("reply 0", 100),
+        line("reply 1", 101),
+        line("reply 2", 102),
+        caretLine("editor", .{ .id = 200, .column = 6 }),
+        line("status", 201),
+    };
+    try harness.render(&streaming, .{ .columns = 20, .rows = 4 }, 2);
+    try harness.emulator.expectScreen(&.{ "reply 1", "reply 2", "editor", "status" });
+
+    const discarded = [_]Line{
+        line("old 0", 0),
+        line("old 1", 1),
+        line("old 2", 2),
+        line("old 3", 3),
+        line("old 4", 4),
+        line("old 5", 5),
+        line("old 6", 6),
+        line("old 7", 7),
+        caretLine("editor", .{ .id = 200, .column = 6 }),
+        line("status", 201),
+    };
+    try harness.render(&discarded, .{ .columns = 20, .rows = 4 }, 2);
+    try harness.emulator.expectScreen(&.{ "old 6", "old 7", "editor", "status" });
+    try harness.emulator.expectCaret(.{ .frame_len = 8, .row = 6, .column = 6 });
+    try std.testing.expect(std.mem.indexOf(u8, harness.lastBytes(), escape.screen_reset) != null);
 }
 
 test "a jump with no shared anchor resets" {

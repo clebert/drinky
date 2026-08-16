@@ -87,6 +87,12 @@ decision already taken, or a dependency on another entry. Module layout and exte
   match. _Tab currently decodes as ctrl-i._
 - **Configurable transcript window** — the 8-page transcript window moves into `config.json` and
   trades scrollback retention against per-frame redraw cost. _Clamp to at least one page._
+- **A retry is recorded in the transcript** — a transcript event names each retry attempt and its
+  cause, so a restarted reply never reads as a change of mind. _A permanent event block, like the
+  model and login events, not a footer notice. It covers every attempt, including one that fails at
+  the response head and shows nothing. A later refinement can narrow it to an attempt that discards
+  streamed rows. `Agent.fetchReply` retries at four points but reports only `onStreamReset`, which
+  runs on a discarded partial reply alone, so the handler needs one more callback._
 
 ## Features
 
