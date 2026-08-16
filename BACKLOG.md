@@ -31,9 +31,6 @@ decision already taken, or a dependency on another entry. Module layout and exte
   whole-line rule went too far, so report the line locally instead. This entry implements the
   Command refusal prerequisite: keep unavailable command text in the editor and name the active
   restriction during a turn, retry, or review. `/skill:name` keeps its trailing task text._
-- **Ctrl+C during a turn ignores the editor content** — Ctrl+C cancels the turn even when the editor
-  holds text. _Ctrl+C must clear a non-empty editor first and cancel the turn only on an empty one.
-  Esc stays the direct cancel. `clearOrQuit` runs in prompt mode alone today._
 - **The picker cannot scroll up** — the selection does not move back into the rows above the
   viewport.
 - **A picker wastes rows on a short list** — blank rows appear when the list fits the window. The

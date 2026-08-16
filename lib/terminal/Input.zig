@@ -81,6 +81,25 @@ pub fn feed(self: *Input, bytes: []const u8) !void {
     try self.pending.appendSlice(self.gpa, bytes);
 }
 
+/// Whether the retained bytes are one lone Escape byte. A terminal without the
+/// Kitty protocol reports the Escape key this way, and the same byte starts every
+/// longer sequence. Only the bytes after it, or their absence, tell the two apart,
+/// so the caller times the wait and calls `takeEscape`.
+pub fn pendingEscape(self: *const Input) bool {
+    if (self.in_paste) return false;
+    const data = self.pending.items[self.start..];
+    return data.len == 1 and data[0] == escape_start;
+}
+
+/// Consume a lone retained Escape byte, so the caller emits one `.escape` key.
+/// Reports whether the byte was there. The caller calls this after the wait that
+/// proves no sequence follows.
+pub fn takeEscape(self: *Input) bool {
+    if (!self.pendingEscape()) return false;
+    self.start += 1;
+    return true;
+}
+
 /// The next decoded event, or null when the remaining bytes are empty or form
 /// an incomplete sequence that awaits more input. A returned `.paste` event's
 /// `bytes` borrow the internal buffer and are valid only until the next `feed`.
@@ -126,6 +145,10 @@ fn decodeEscape(data: []const u8) ?Decoded {
             if (data.len < 3) return null;
             return .{ .key = mapFinal(data[2]), .consumed = 3 };
         },
+        // No sequence continues with a control byte, so this Escape stands alone.
+        // Consume it alone too, so the control key that follows keeps its own
+        // event. A user who presses Esc and then Ctrl+C needs both.
+        0x00...0x1f => return .{ .key = .escape, .consumed = 1 },
         else => return .{ .key = .unknown, .consumed = 2 },
     }
 }
@@ -431,6 +454,47 @@ test "an unterminated csi past the limit is abandoned as unknown" {
     try input.feed("a");
     try std.testing.expectEqualDeep(Key{ .char = 'a' }, input.next().?);
     try std.testing.expectEqual(@as(?Key, null), input.next());
+}
+
+test "a legacy escape byte waits, then takes effect on its own" {
+    var input = Input.init(std.testing.allocator);
+    defer input.deinit();
+    // A terminal without the Kitty protocol reports Escape as this one byte. The
+    // parser holds it back, because every longer sequence starts the same way.
+    try input.feed("\x1b");
+    try std.testing.expectEqual(@as(?Key, null), input.next());
+    try std.testing.expect(input.pendingEscape());
+
+    // The caller times the wait out and takes the key.
+    try std.testing.expect(input.takeEscape());
+    try std.testing.expect(!input.pendingEscape());
+    try std.testing.expect(!input.takeEscape());
+    try std.testing.expectEqual(@as(?Key, null), input.next());
+
+    // A sequence that completes is not a lone Escape.
+    try input.feed("\x1b");
+    try std.testing.expect(input.pendingEscape());
+    try input.feed("[A");
+    try std.testing.expect(!input.pendingEscape());
+    try std.testing.expectEqualDeep(Key.up, input.next().?);
+}
+
+test "a control byte after a legacy escape keeps both keys" {
+    // Apple Terminal sends Esc as one byte. The control key after it must not
+    // disappear into an unknown two-byte sequence.
+    try expectKeys("\x1b\x03", &.{ .escape, .{ .ctrl = 'c' } });
+    try expectKeys("\x1b\x04", &.{ .escape, .{ .ctrl = 'd' } });
+    // Alt with a printable key stays one unknown event, so no text is inserted.
+    try expectKeys("\x1ba", &.{.unknown});
+
+    // Two Escape bytes give one key each: the first stands alone, and the second
+    // waits like any lone Escape.
+    var input = Input.init(std.testing.allocator);
+    defer input.deinit();
+    try input.feed("\x1b\x1b");
+    try std.testing.expectEqualDeep(Key.escape, input.next().?);
+    try std.testing.expectEqual(@as(?Key, null), input.next());
+    try std.testing.expect(input.takeEscape());
 }
 
 test "split sequence waits for rest" {

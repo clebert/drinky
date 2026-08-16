@@ -16,7 +16,8 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - Enter during a turn queues a steering message that folds into the run at the next tool round.
 - Ctrl+P pulls messages the turn has not picked up yet back into the editor to keep editing.
 - Steering left in the queue when a turn completes starts the next turn on its own.
-- Esc or Ctrl+C cancels a turn. Canceled or failed turns keep finished rounds, drop the in-flight
+- Esc or Ctrl+D cancels a turn and keeps the draft. Ctrl+C clears a draft in the editor first, and
+  cancels only on an empty editor. Canceled or failed turns keep finished rounds, drop the in-flight
   tail, and return uncommitted text to the editor.
 - A tool call left unfinished is recorded as an error, so a canceled mutation is never lost
   silently.
@@ -139,6 +140,8 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 
 - The conversation renders inline into the normal screen buffer and real scrollback. Temporary
   full-window pages use the alternate screen and restore the conversation on close.
+- A full-window page scrolls with the arrow keys, PgUp/PgDn, and Home/End. Esc closes it, and its
+  header says so. Ctrl+C and Ctrl+D close it too, so an exit attempt always works.
 - Repaints only the rows that changed, atomically. A shrink or height change keeps native scrollback
   intact and can leave blank rows below the interface. A width change or a change above the viewport
   reprints the window.
@@ -195,6 +198,11 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - A marker moves, deletes, and counts as one unit, and submits its exact bytes.
 - Decodes the Kitty keyboard protocol and traditional escape sequences, including ones split across
   reads.
+- A terminal without the Kitty protocol reports Escape as one byte. That byte becomes the Escape key
+  after a 50 ms wait, and a control byte right after it stays a key of its own.
+- An exit key that returns the session to the prompt drops the rest of its input chunk. Esc and then
+  Ctrl+D closes the page or cancels the turn, and never quits pith. Enter and typed text keep every
+  key behind them.
 - A bracketed paste arrives as one unit, with controls and escapes inside kept as literal payload.
 - Unrecognized sequences and stray control bytes are ignored and never leak into the text.
 - Text is segmented per UAX #29, so an emoji family, a flag, or a Hangul syllable stays one glyph.

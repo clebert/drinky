@@ -16,6 +16,9 @@ const role = @import("role.zig");
 const Page = @This();
 
 const hint = "↑/↓: Scroll · PgUp/PgDn: Page · Home/End: Jump";
+// Esc is the documented way out. Ctrl+C and Ctrl+D close the page too, but they
+// stay off the header: they are a fallback for a terminal that drops the Esc
+// report, not a second binding to learn.
 const header_markdown = "Esc: Close · M: Source · " ++ hint;
 const header_source = "Esc: Close · M: Render · " ++ hint;
 const header_colors = "Esc: Close · " ++ hint;

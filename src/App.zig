@@ -43,6 +43,12 @@ const intro_text = "Enter: Send · Shift+Enter: New line · Esc: Cancel · " ++
 /// Two Ctrl+C presses within this window quit. A lone press clears the editor.
 const ctrl_c_window_ms = 500;
 
+/// How long a lone Escape byte waits for the rest of a sequence before it becomes
+/// an Escape key. A terminal without the Kitty protocol reports Escape as that one
+/// byte, and every longer sequence starts with it. The wait must stay under human
+/// reaction time and over the gap between two reads of one sequence.
+const escape_wait_ms = 50;
+
 /// Events the channel buffers before a producer blocks in `putOne`. One batched
 /// `get` drains up to this many at once, so a whole burst collapses into a frame.
 const queue_capacity = 256;
@@ -78,6 +84,9 @@ session: Session,
 input: terminal.Input,
 running: bool,
 ctrl_c_ms_last: i64,
+/// When a held Escape byte becomes an Escape key, on the monotonic clock. Null
+/// when the parser holds no lone Escape byte.
+escape_deadline_ms: ?i64,
 /// The one cross-thread channel: producer tasks push `UiEvent`s, and the consumer
 /// drains and applies them. Backed by `queue_buffer`, so pin the `App`.
 queue: std.Io.Queue(Session.UiEvent),
@@ -394,6 +403,7 @@ pub fn run(
     // The monotonic clock can start near zero. A boot press must never read as
     // the second of a pair.
     self.ctrl_c_ms_last = -ctrl_c_window_ms;
+    self.escape_deadline_ms = null;
     self.tick_pending = false;
     self.frame_grid = .reset(0);
     self.input_future = null;
@@ -719,8 +729,9 @@ fn takeDeferredEvents(self: *App, batch: *[queue_capacity]Session.UiEvent) usize
 
 /// The consumer: block on the channel, drain a coalesced batch, apply each event
 /// to the session, and paint only on a `.tick`. The loop arms a tick whenever the
-/// session is dirty or a turn animates and none is pending, so a clean idle
-/// interface stays inert (no tick, blocked on an empty channel).
+/// session is dirty, a turn animates, or a held Escape byte waits, and none is
+/// pending. A clean idle interface stays inert (no tick, blocked on an empty
+/// channel).
 fn runLoop(self: *App) !void {
     var batch: [queue_capacity]Session.UiEvent = undefined;
     while (self.running) {
@@ -732,6 +743,7 @@ fn runLoop(self: *App) !void {
             };
         self.enqueuePendingTurnFence();
         const ticked = try self.applyBatch(batch[0..count]);
+        try self.flushEscape();
         if (ticked) {
             self.tick_pending = false;
             self.awaitFuture(&self.tick_future);
@@ -740,7 +752,12 @@ fn runLoop(self: *App) !void {
                 self.session.dirty = false;
             }
         }
-        if ((self.session.dirty or self.session.animating()) and !self.tick_pending) self.armTick();
+        // A held Escape byte arms a frame too, because its wait ends on a tick and
+        // an idle loop has no other wake.
+        const waiting = self.session.dirty or
+            self.session.animating() or
+            self.escape_deadline_ms != null;
+        if (waiting and !self.tick_pending) self.armTick();
     }
 }
 
@@ -968,9 +985,51 @@ fn defaultModel(self: *const App, account: ai.llm.Account) ai.models.Model {
 
 /// Decode a stdin chunk into key events and apply each. Runs on the consumer, so
 /// a submitted line spawns a turn worker and ctrl-c cancels a running one.
+///
+/// An exit key that returns the session to the prompt — a page close, a picker
+/// cancel, a turn cancel — ends the chunk, and the keys behind it are dropped.
+/// Those keys are the rest of one exit attempt, such as the Esc and Ctrl+D of
+/// `\x1b\x04` from a terminal without the Kitty protocol. The prompt must never
+/// act on them, because Ctrl+D there quits pith and Ctrl+C there clears the draft
+/// the closed layer hid. Only an exit key drains, so a picker confirmation still
+/// keeps the characters typed behind it.
 fn handleKeys(self: *App, bytes: []const u8) !void {
     try self.input.feed(bytes);
-    while (self.input.next()) |event| try self.handleKey(&event);
+    while (self.input.next()) |event| {
+        const at_prompt = self.session.mode == .prompt;
+        try self.handleKey(&event);
+        if (!at_prompt and self.session.mode == .prompt and isExitKey(&event)) {
+            while (self.input.next()) |_| {}
+            break;
+        }
+    }
+    // A held Escape byte starts its wait here. Bytes that complete a sequence
+    // arrive in the next chunk at the latest, so this chunk ends the wait too.
+    self.escape_deadline_ms = if (self.input.pendingEscape())
+        self.nowMs() + escape_wait_ms
+    else
+        null;
+}
+
+/// Whether `event` is one of the keys a user presses to leave the current layer.
+/// Enter is not one, even where it also returns to the prompt.
+fn isExitKey(event: *const terminal.Input.Key) bool {
+    return switch (event.*) {
+        .escape => true,
+        .ctrl => |letter| letter == 'c' or letter == 'd',
+        else => false,
+    };
+}
+
+/// Turn a held Escape byte into an Escape key once its wait passes. A terminal
+/// without the Kitty protocol reports Escape as that one byte, so this is the only
+/// path that closes a page or cancels a turn there.
+fn flushEscape(self: *App) !void {
+    const deadline = self.escape_deadline_ms orelse return;
+    if (self.nowMs() < deadline) return;
+    self.escape_deadline_ms = null;
+    if (!self.input.takeEscape()) return;
+    try self.handleKey(&.escape);
 }
 
 fn handleKey(self: *App, event: *const terminal.Input.Key) !void {
@@ -1031,19 +1090,34 @@ fn editKey(self: *App, event: *const terminal.Input.Key) !bool {
 
 /// Keys during a streaming turn. The editor stays live for steering: the user can
 /// type and edit, Enter queues a steering message, and Ctrl+P recalls the queue
-/// into the editor. Esc or Ctrl+C cancels the turn.
+/// into the editor. Esc and Ctrl+D cancel the turn, which keeps the draft, so
+/// neither key needs the empty-editor guard that protects the quit at the prompt.
+/// Ctrl+C keeps its prompt meaning and clears a draft first.
 fn handleTurnKey(self: *App, event: *const terminal.Input.Key) !void {
     if (try self.editKey(event)) return;
     switch (event.*) {
         .enter => try self.submitSteering(),
         .escape => try self.cancelTurn(),
         .ctrl => |letter| switch (letter) {
-            'c' => try self.cancelTurn(),
+            'c' => try self.clearOrCancel(),
+            'd' => try self.cancelTurn(),
             'p' => try self.pullSteering(),
             else => {},
         },
         else => {},
     }
+}
+
+/// Ctrl+C during a turn: clear a draft, or cancel the turn when the editor is
+/// empty. The editor stays live for steering, so the key that stops the turn must
+/// not drop typed text. Esc is the direct cancel.
+fn clearOrCancel(self: *App) !void {
+    if (self.session.editor.visible().len != 0) {
+        self.session.editor.clear();
+        self.session.markEdited();
+        return;
+    }
+    try self.cancelTurn();
 }
 
 /// Enter during a turn: queue the line as a steering message, shown at once and
@@ -1767,6 +1841,9 @@ fn recordEvent(
     );
 }
 
+/// Keys on a full-window page. Esc is the documented way out. Ctrl+C and Ctrl+D
+/// close it too, so an exit attempt always works in a terminal that drops the Esc
+/// report. A page is read-only, so no key on it quits pith.
 fn handlePageKey(self: *App, event: *const terminal.Input.Key) !void {
     const page = &self.session.mode.viewing;
     const size: terminal.View.Size = .{
@@ -1775,6 +1852,10 @@ fn handlePageKey(self: *App, event: *const terminal.Input.Key) !void {
     };
     switch (event.*) {
         .escape => return self.session.closePage(),
+        .ctrl => |letter| switch (letter) {
+            'c', 'd' => return self.session.closePage(),
+            else => return,
+        },
         .up => page.moveUp(size),
         .down => page.moveDown(size),
         .page_up => page.pageUp(size),
@@ -2198,6 +2279,84 @@ test "canceling a promoted steering turn restores its rich paste draft" {
     const restored = try app.session.editor.expanded(.none);
     defer gpa.free(restored);
     try std.testing.expectEqualStrings(payload, restored);
+}
+
+test "ctrl+c during a turn clears the draft first and cancels only on an empty editor" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.gpa = gpa;
+    app.io = io;
+    app.turn_future = null;
+    app.pending_turn_result = null;
+    app.turn_generation = 0;
+    app.initEventQueue();
+    defer app.drainQueue();
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = anthropic_default,
+        .system = "",
+        .retry = .{},
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+    app.session.beginTurn(1);
+    try spawnCanceledTurn(&app);
+
+    // A draft is steering the user still writes. The first press takes the text
+    // alone, so the turn keeps running.
+    try app.session.editor.insert("keep the turn");
+    try app.handleKey(&.{ .ctrl = 'c' });
+    try std.testing.expectEqualStrings("", app.session.editor.visible());
+    try std.testing.expect(app.session.mode == .turn);
+    try std.testing.expect(app.turn_future != null);
+
+    try app.handleKey(&.{ .ctrl = 'c' });
+    try std.testing.expect(app.session.mode == .prompt);
+    try std.testing.expect(app.turn_future == null);
+}
+
+test "esc and ctrl+d cancel a turn and keep the draft" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.gpa = gpa;
+    app.io = io;
+    app.running = true;
+    app.turn_future = null;
+    app.pending_turn_result = null;
+    app.turn_generation = 0;
+    app.initEventQueue();
+    defer app.drainQueue();
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = anthropic_default,
+        .system = "",
+        .retry = .{},
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+
+    // A cancel backs out of the turn alone: the draft stays, and pith runs on. So
+    // neither key needs the empty-editor guard the quit has at the prompt.
+    for ([_]terminal.Input.Key{ .escape, .{ .ctrl = 'd' } }) |key| {
+        app.session.beginTurn(1);
+        try spawnCanceledTurn(&app);
+        app.session.editor.clear();
+        try app.session.editor.insert("keep the draft");
+
+        try app.handleKey(&key);
+        try std.testing.expect(app.session.mode == .prompt);
+        try std.testing.expect(app.turn_future == null);
+        try std.testing.expectEqualStrings("keep the draft", app.session.editor.visible());
+        try std.testing.expect(app.running);
+    }
 }
 
 test "canceling a turn joins and clears its active worker" {
@@ -3442,6 +3601,163 @@ test "turn generations cannot wrap or be reused" {
     try std.testing.expectEqual(std.math.maxInt(u64), app.turn_generation);
 }
 
+test "a legacy escape byte closes a page after its wait" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.gpa = gpa;
+    app.io = io;
+    app.running = true;
+    app.escape_deadline_ms = null;
+    app.input = terminal.Input.init(gpa);
+    defer app.input.deinit();
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+    try app.session.openPage(&.{ .content = "", .presentation = .colors });
+
+    // A terminal without the Kitty protocol sends this one byte. It can still
+    // start a longer sequence, so the page stays open while the wait runs.
+    try app.handleKeys("\x1b");
+    try std.testing.expect(app.session.mode == .viewing);
+    try std.testing.expect(app.escape_deadline_ms != null);
+    try app.flushEscape();
+    try std.testing.expect(app.session.mode == .viewing);
+
+    // The wait passes with no more bytes, so the byte is the Escape key.
+    app.escape_deadline_ms = app.nowMs() - 1;
+    try app.flushEscape();
+    try std.testing.expect(app.session.mode == .prompt);
+    try std.testing.expect(app.escape_deadline_ms == null);
+    try std.testing.expect(app.running);
+
+    // The bytes of a real sequence end the wait instead.
+    try app.handleKeys("\x1b");
+    try std.testing.expect(app.escape_deadline_ms != null);
+    try app.handleKeys("[A");
+    try std.testing.expect(app.escape_deadline_ms == null);
+    try app.flushEscape();
+}
+
+test "a page close drops the rest of an exit attempt in one chunk" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    // Apple Terminal sends Esc as one byte, so an exit attempt can land as
+    // `\x1b\x03` or `\x1b\x04` in one chunk. The Escape closes the page, and the
+    // control key behind it must not reach the prompt below.
+    for ([_][]const u8{ "\x1b\x03", "\x1b\x04" }) |chunk| {
+        var app: App = undefined;
+        app.gpa = gpa;
+        app.io = io;
+        app.running = true;
+        app.ctrl_c_ms_last = -ctrl_c_window_ms;
+        app.escape_deadline_ms = null;
+        app.input = terminal.Input.init(gpa);
+        defer app.input.deinit();
+        app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+        defer app.session.deinit();
+        try app.session.editor.insert("draft");
+        try app.session.openPage(&.{ .content = "", .presentation = .colors });
+
+        try app.handleKeys(chunk);
+        try std.testing.expect(app.session.mode == .prompt);
+        // Ctrl+D did not quit, Ctrl+C left the draft the page hid, and neither
+        // armed the double-press quit window.
+        try std.testing.expect(app.running);
+        try std.testing.expectEqualStrings("draft", app.session.editor.visible());
+        try std.testing.expectEqual(@as(i64, -ctrl_c_window_ms), app.ctrl_c_ms_last);
+        try std.testing.expect(app.escape_deadline_ms == null);
+    }
+}
+
+test "a picker confirmation keeps the characters typed behind it" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.gpa = gpa;
+    app.io = io;
+    app.escape_deadline_ms = null;
+    app.input = terminal.Input.init(gpa);
+    defer app.input.deinit();
+    // The confirmation mirrors the agent state into the session, so the agent must
+    // be real. A signed-out one records no project state.
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = anthropic_default,
+        .system = "",
+        .retry = .{},
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+
+    const options = try gpa.alloc([]const u8, 1);
+    options[0] = try gpa.dupe(u8, "alpha");
+    try app.session.applyOutcome(.{ .pick = .{
+        .select = struct {
+            fn select(context: *ai.command.Context, _: usize) anyerror!ai.command.Outcome {
+                return ai.command.Outcome.reportNotice(context.gpa, .information, "picked", .{});
+            }
+        }.select,
+        .title = "Sign in",
+        .cancellation_message = "You canceled the sign-in selection.",
+        .options = options,
+        .current = null,
+    } });
+
+    // Enter confirms and returns to the prompt, but it is no exit attempt. The
+    // fast typing behind it must land in the editor, as it does when the terminal
+    // splits the same keystrokes across two reads.
+    try app.handleKeys("\rhi");
+    try std.testing.expect(app.session.mode == .prompt);
+    try std.testing.expectEqualStrings("hi", app.session.editor.visible());
+}
+
+test "a turn cancel drops the rest of an exit attempt in one chunk" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.gpa = gpa;
+    app.io = io;
+    app.running = true;
+    app.ctrl_c_ms_last = -ctrl_c_window_ms;
+    app.escape_deadline_ms = null;
+    app.turn_future = null;
+    app.pending_turn_result = null;
+    app.turn_generation = 0;
+    app.initEventQueue();
+    defer app.drainQueue();
+    app.input = terminal.Input.init(gpa);
+    defer app.input.deinit();
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = anthropic_default,
+        .system = "",
+        .retry = .{},
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+    app.session.beginTurn(1);
+    try spawnCanceledTurn(&app);
+
+    // The Escape cancels the turn. The Ctrl+D behind it must not quit pith at the
+    // prompt the cancel returns to.
+    try app.handleKeys("\x1b\x04");
+    try std.testing.expect(app.session.mode == .prompt);
+    try std.testing.expect(app.turn_future == null);
+    try std.testing.expect(app.running);
+}
+
 test "ctrl+c clears then quits within the window and ctrl+d quits only when empty" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -3593,8 +3909,6 @@ test "/system opens the composed prompt alone and escape restores the conversati
     try std.testing.expect(std.mem.indexOf(u8, resize_bytes, terminal.escape.screen_repaint) != null);
     try std.testing.expect(std.mem.indexOf(u8, resize_bytes, "\x1b[3J") == null);
 
-    try app.handleKey(&.{ .ctrl = 'c' });
-    try std.testing.expect(app.session.mode == .viewing);
     try app.handleKey(&.page_down);
     try std.testing.expect(app.session.mode.viewing.scroll > 0);
     try app.handleKey(&.escape);
@@ -3612,8 +3926,11 @@ test "/system opens the composed prompt alone and escape restores the conversati
     try std.testing.expect(std.mem.indexOf(u8, reopen_bytes, "M: Source") != null);
     try std.testing.expect(std.mem.indexOf(u8, reopen_bytes, "Core") != null);
     try std.testing.expect(std.mem.indexOf(u8, reopen_bytes, "# Core") == null);
-    try app.handleKey(&.escape);
+    // Ctrl+C closes a page and keeps pith running. A page holds no draft to clear.
+    app.running = true;
+    try app.handleKey(&.{ .ctrl = 'c' });
     try std.testing.expect(app.session.mode == .prompt);
+    try std.testing.expect(app.running);
 
     const conversation_start = out.written().len;
     try app.session.paint(.{ .columns = 80, .rows = 6 });
@@ -3622,7 +3939,7 @@ test "/system opens the composed prompt alone and escape restores the conversati
     try std.testing.expect(std.mem.indexOf(u8, conversation_bytes, "System prompt") == null);
 }
 
-test "/colors opens the color preview page and escape restores the conversation" {
+test "/colors opens the color preview page and ctrl+d restores the conversation" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -3663,8 +3980,12 @@ test "/colors opens the color preview page and escape restores the conversation"
     try app.handleKey(&.page_down);
     try std.testing.expect(app.session.mode.viewing.scroll > 0);
 
-    try app.handleKey(&.escape);
+    // Ctrl+D closes the page and keeps pith running, so a terminal that drops the
+    // Esc report still has a way out.
+    app.running = true;
+    try app.handleKey(&.{ .ctrl = 'd' });
     try std.testing.expect(app.session.mode == .prompt);
+    try std.testing.expect(app.running);
     const conversation_start = out.written().len;
     try app.session.paint(.{ .columns = 80, .rows = 12 });
     const conversation_bytes = out.written()[conversation_start..];
