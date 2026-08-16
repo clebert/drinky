@@ -155,6 +155,10 @@ pub const Outcome = struct {
         canceled,
         /// The presentation callback's event channel closed during the turn.
         closed,
+        /// A store reload selected a credential for a different principal.
+        credential_replaced,
+        /// The provider rejected the selected client's refresh credential.
+        credential_rejected,
         failed: anyerror,
     };
 };
@@ -345,16 +349,30 @@ pub fn signOut(self: *Agent) void {
     self.cache_activity = null;
 }
 
+/// Forget everything bound to the provider principal behind `account`: its
+/// replay proofs, its cache evidence, and its allowance gauge. A credential
+/// replacement can put another principal in the same account slot, and none of
+/// this state crosses that boundary. The account itself stays authenticated,
+/// so a caller that drops the account calls `signOut` or `switchTo` as well.
+pub fn dropAccountEvidence(self: *Agent, account: llm.Account) void {
+    self.dropReasoning(account);
+    self.dropCacheEvidence(account);
+    // The gauge holds what the last response of the active account reported,
+    // so only that account can own it.
+    const client = self.client orelse return;
+    if (client.account() == account) self.stats.quota = null;
+}
+
 /// Drop cache evidence for an account whose credential changed. A credential
 /// can now identify a different provider principal with an isolated cache.
-pub fn dropCacheEvidence(self: *Agent, account: llm.Account) void {
+fn dropCacheEvidence(self: *Agent, account: llm.Account) void {
     const activity = self.cache_activity orelse return;
     if (activity.account == account) self.cache_activity = null;
 }
 
 /// Remove replay proofs produced by one account slot. A successful credential
 /// replacement calls this before that slot can represent another principal.
-pub fn dropReasoning(self: *Agent, account: llm.Account) void {
+fn dropReasoning(self: *Agent, account: llm.Account) void {
     var retained_count: usize = 0;
     for (self.items.items) |item| {
         const drop = switch (item) {
@@ -440,6 +458,8 @@ fn dispositionError(disposition: Outcome.Disposition) !void {
         .completed => {},
         .canceled => error.Canceled,
         .closed => error.Closed,
+        .credential_replaced => error.CredentialReplaced,
+        .credential_rejected => error.TokenGrantRejected,
         .failed => |err| err,
     };
 }
@@ -488,6 +508,8 @@ fn classifyDisposition(turn: *const TurnState, err: anyerror) Outcome.Dispositio
     if (turn.presentation_closed) return .closed;
     return switch (err) {
         error.Canceled => .canceled,
+        error.CredentialReplaced => .credential_replaced,
+        error.TokenGrantRejected => .credential_rejected,
         else => .{ .failed = err },
     };
 }
@@ -692,8 +714,9 @@ fn backoff(self: *Agent, failure: net.Retry.Failure) !void {
     try self.io.sleep(.fromMilliseconds(@intCast(bounded)), .awake);
 }
 
-/// Transient transport faults worth a retry. A user cancel or channel close
-/// never is.
+/// Transient request failures worth a retry. A user cancel or channel close
+/// never is. The agent does not retry a token endpoint response because the
+/// token is single-use.
 fn retryableError(err: anyerror) bool {
     return switch (err) {
         error.Timeout,
@@ -2574,6 +2597,40 @@ test "dropReasoning invalidates only the replaced account slot" {
     try std.testing.expectEqual(@as(usize, 0), agent.items.items.len);
 }
 
+test "dropped account evidence takes the allowance of the active account only" {
+    const gpa = std.testing.allocator;
+    var agent = scriptedAgent(gpa);
+    defer agent.deinit();
+    const quota: llm.Quota = .{ .primary = .{ .used_percent = 25, .window_minutes = 300 } };
+
+    // The gauge belongs to the account whose response reported it, so another
+    // account's replaced credential leaves it alone.
+    agent.stats.quota = quota;
+    agent.cache_activity = .{
+        .account = .openai_api,
+        .model = "gpt-5.6-sol",
+        .retention_ms = 300_000,
+        .cache_read = 0.1,
+        .cache_write = 1.25,
+        .request_at = .{ .raw = .zero, .clock = .boot },
+        .prefix_tokens = 1000,
+    };
+    agent.dropAccountEvidence(.openai_api);
+    try std.testing.expect(agent.stats.quota != null);
+    try std.testing.expect(agent.cache_activity == null);
+
+    // A replaced credential of the active account takes it, because the next
+    // principal has its own allowance.
+    agent.dropAccountEvidence(.anthropic_subscription);
+    try std.testing.expect(agent.stats.quota == null);
+
+    // A signed-out agent has no account to compare, and drops nothing.
+    agent.signOut();
+    agent.stats.quota = quota;
+    agent.dropAccountEvidence(.anthropic_subscription);
+    try std.testing.expect(agent.stats.quota != null);
+}
+
 test "readReply retains a truncated tool-free reply but rejects a truncated tool call" {
     const gpa = std.testing.allocator;
     // A truncated answer with no tool call is an authoritative reply and commits.
@@ -3111,6 +3168,37 @@ test "a committed truncation is reported in the receipt; a resampled one is not"
         try std.testing.expect(std.meta.activeTag(outcome.disposition) == .completed);
         try std.testing.expectEqualStrings("hi", agent.items.items[1].message.text);
         try std.testing.expect(!outcome.receipt.truncated);
+    }
+}
+
+test "credential changes and token endpoint errors do not retry a request" {
+    const gpa = std.testing.allocator;
+    var agent = scriptedAgent(gpa);
+    defer agent.deinit();
+    var handler: CaptureHandler = .{ .gpa = gpa };
+    defer handler.deinit();
+
+    for ([_]struct { failure: anyerror, disposition: std.meta.Tag(Outcome.Disposition) }{
+        .{ .failure = error.CredentialReplaced, .disposition = .credential_replaced },
+        .{ .failure = error.TokenGrantRejected, .disposition = .credential_rejected },
+    }) |expected| {
+        var fetch: ScriptedFetch = .{
+            .attempts = &.{.{ .fail = expected.failure }},
+        };
+        const outcome = agent.runTurnWith(&fetch, fake_tools, "go", &handler);
+        try std.testing.expectEqual(
+            expected.disposition,
+            std.meta.activeTag(outcome.disposition),
+        );
+        try std.testing.expectEqual(@as(usize, 1), fetch.sends);
+    }
+    for ([_]anyerror{
+        error.TokenServiceUnavailable,
+        error.TokenRequestFailed,
+    }) |err| {
+        var fetch: ScriptedFetch = .{ .attempts = &.{.{ .fail = err }} };
+        try std.testing.expectError(err, agent.runWith(&fetch, "go", &handler));
+        try std.testing.expectEqual(@as(usize, 1), fetch.sends);
     }
 }
 

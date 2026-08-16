@@ -72,7 +72,8 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
   prefers a signed-in login over an API key.
 - With no account at all, the login picker opens by itself.
 - While signed out, pith refuses a message with a prompt to `/login`.
-- Reasoning replays only to the account that produced it. A login or logout discards the rest.
+- Reasoning replays only to the account that produced it. A login, a logout, or a credential
+  replacement discards that account's reasoning, cache evidence, and allowance.
 
 ## Signing in
 
@@ -80,11 +81,20 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - The Anthropic Console login trades its grant for a minted platform key, stored like a token.
 - When no browser opens, the printed URL still works, and the callback waits five minutes.
 - The browser lands on a plain "Pith received authorization. Close this tab." page.
-- Subscription tokens and the Console key live in `~/.pith/auth.json`, owner-only, one entry per
-  account, saved atomically.
-- Expired access tokens refresh and re-save automatically. After a second pith instance rotates the
-  refresh token, the next refresh reads the new token and recovers without a restart.
-- A refresh that still fails ends the turn with a prompt to `/login`.
+- Subscription tokens and the Console key live in the owner-only `~/.pith/auth.json`, one entry
+  per account, saved atomically.
+- Expired access tokens refresh and re-save automatically.
+- A busy credential store keeps a refreshed token in memory and retries its save before the next
+  provider request.
+- Anthropic subscription logins save stable account and organization IDs from the OAuth profile.
+- If another pith instance saved a token for the same known principal, pith reloads it and retries
+  once. A different or unknown principal stops before the model request.
+- If another pith instance saves a replacement before removal, pith reloads it and keeps the
+  account active.
+- Without a replacement, pith removes the rejected credential and moves the session to another
+  account or the login picker.
+- A token failure that is not a rejection ends the turn, names the reason, and keeps the account
+  signed in.
 - A login whose save fails stays signed in until pith exits, and says so.
 
 ## Slash commands
@@ -228,11 +238,12 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
   so a typo never looks like an applied setting.
 - The settings document is generated from the struct that parses the file, so a new key that carries
   no description fails the build and the document cannot drift.
+- JSON store writes use owner-only sibling `.lock` files to coordinate pith instances.
 - `~/.pith/state.json` remembers per project which account and effort level pith used last, and the
   model of each account. It is machine-local, owner-only, and keeps the 1000 most recently changed
   projects. A repository is one project, keyed by its Git root.
 - pith reads that file only at startup, so a change in one instance reaches only the next start. A
-  file pith cannot save to is reported once and never stops the session.
+  persistent save failure is reported once and never stops the session.
 - `HOME` must be set, since the config, the credentials, and the state all live under `~/.pith`.
 
 ## Keeping this file true

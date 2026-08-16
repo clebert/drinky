@@ -1,7 +1,6 @@
 //! OAuth wire plumbing shared by the provider PKCE flows: verifier/challenge
-//! generation and the connect-timeout-bounded token POST with its response cap
-//! and decompression. Token parsing stays with each provider — the shapes
-//! differ — so `post` returns the raw, size-capped body.
+//! generation and bounded POST requests with decompression. This module reads
+//! the standard OAuth error code. Each provider parses its successful payload.
 
 const std = @import("std");
 
@@ -35,10 +34,9 @@ pub fn pkce(io: std.Io) Pkce {
     return result;
 }
 
-/// POST `body` to `url` and return the owned response body. The caller frees
-/// it. The request is bounded by the connect timeout: the whole connect, send,
-/// receive-head, and body read must finish within it, or it is canceled and
-/// reaped as `error.Timeout`.
+/// POST `body` to an OAuth endpoint and return its owned success body. The
+/// caller frees it. An `invalid_grant` error becomes `TokenGrantRejected`. The
+/// connect timeout bounds the complete request and body read.
 pub fn post(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -47,12 +45,17 @@ pub fn post(
     content_type: []const u8,
     body: []const u8,
 ) ![]u8 {
-    const fetch: Fetch = .{ .url = url, .content_type = content_type, .body = body };
+    const fetch: Fetch = .{
+        .url = url,
+        .content_type = content_type,
+        .body = body,
+        .error_body = .oauth,
+    };
     return send(gpa, io, timeouts, &fetch);
 }
 
-/// POST an empty body under a `Bearer` `authorization` and return the owned
-/// response body. The caller frees it. Same connect-timeout bound as `post`.
+/// POST an empty body under a `Bearer` authorization and return the owned
+/// success body. The caller frees it. This endpoint has no OAuth error body.
 pub fn postBearer(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -71,11 +74,36 @@ const Fetch = struct {
     content_type: ?[]const u8 = null,
     body: []const u8 = "",
     authorization: ?[]const u8 = null,
+    error_body: ErrorBody = .generic,
+
+    const ErrorBody = enum { generic, oauth };
 };
 
 fn send(gpa: std.mem.Allocator, io: std.Io, timeouts: net.Timeouts, fetch: *const Fetch) ![]u8 {
     var out: ?[]u8 = null;
-    return awaitBody(gpa, io, timeouts.connect_ms, &out, fetchInto, .{ gpa, io, fetch, &out });
+    return awaitBody(
+        gpa,
+        io,
+        timeouts.connect_ms,
+        &out,
+        fetchInto,
+        .{ gpa, io, fetch, &out },
+    ) catch |err| return tokenTransportError(err);
+}
+
+/// Keep an ambiguous endpoint failure out of the whole-request retry. A failure
+/// before the connection opens stays retryable because no request byte was sent.
+fn tokenTransportError(err: anyerror) anyerror {
+    return switch (err) {
+        error.Timeout,
+        error.ReadFailed,
+        error.WriteFailed,
+        error.EndOfStream,
+        error.ConnectionResetByPeer,
+        error.TlsConnectionTruncated,
+        => error.TokenServiceUnavailable,
+        else => err,
+    };
 }
 
 /// Run `work` (which writes its result into `out`) bounded by `timeout_ms`. The
@@ -124,7 +152,6 @@ fn fetchInto(gpa: std.mem.Allocator, io: std.Io, fetch: *const Fetch, out: *?[]u
 
     var redirect_buffer: [2048]u8 = undefined;
     var response = try request.receiveHead(&redirect_buffer);
-    if (response.head.status != .ok) return error.TokenRequestFailed;
 
     const decompress_buffer = try net.decompressBuffer(gpa, response.head.content_encoding);
     defer if (decompress_buffer.len != 0) gpa.free(decompress_buffer);
@@ -132,7 +159,10 @@ fn fetchInto(gpa: std.mem.Allocator, io: std.Io, fetch: *const Fetch, out: *?[]u
     var transfer_buffer: [4096]u8 = undefined;
     const reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
 
-    out.* = try readBody(gpa, reader);
+    const body = try readBody(gpa, reader);
+    errdefer gpa.free(body);
+    try checkResponse(gpa, response.head.status, body, fetch.error_body);
+    out.* = body;
 }
 
 /// The response body: a body over `token_response_bytes_max` fails with
@@ -142,6 +172,111 @@ fn readBody(gpa: std.mem.Allocator, reader: *std.Io.Reader) ![]u8 {
         error.StreamTooLong => error.TokenResponseTooLarge,
         else => err,
     };
+}
+
+/// Classify a response after its capped body is available. Only an OAuth
+/// `invalid_grant` proves that the submitted grant is no longer valid.
+fn checkResponse(
+    gpa: std.mem.Allocator,
+    status: std.http.Status,
+    body: []const u8,
+    error_body: Fetch.ErrorBody,
+) !void {
+    if (status == .ok) return;
+    switch (status) {
+        .bad_request, .unauthorized, .forbidden => {
+            if (error_body == .oauth and try isInvalidGrant(gpa, body))
+                return error.TokenGrantRejected;
+        },
+        else => {},
+    }
+    if (status == .too_many_requests or status.class() == .server_error)
+        return error.TokenServiceUnavailable;
+    return error.TokenRequestFailed;
+}
+
+/// Test the standard OAuth error code. A malformed body has no destructive meaning.
+fn isInvalidGrant(gpa: std.mem.Allocator, body: []const u8) !bool {
+    const parsed = std.json.parseFromSlice(std.json.Value, gpa, body, .{}) catch |err|
+        return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => false,
+        };
+    defer parsed.deinit();
+    const object = switch (parsed.value) {
+        .object => |object| object,
+        else => return false,
+    };
+    const code = switch (object.get("error") orelse return false) {
+        .string => |code| code,
+        else => return false,
+    };
+    return std.mem.eql(u8, code, "invalid_grant");
+}
+
+test "an OAuth response reads its error before it classifies the status" {
+    const gpa = std.testing.allocator;
+    try checkResponse(gpa, .ok, "", .oauth);
+    try std.testing.expectError(
+        error.TokenGrantRejected,
+        checkResponse(gpa, .bad_request, "{\"error\":\"invalid_grant\"}", .oauth),
+    );
+    try std.testing.expectError(
+        error.TokenRequestFailed,
+        checkResponse(gpa, .bad_request, "{\"error\":\"invalid_request\"}", .oauth),
+    );
+    try std.testing.expectError(
+        error.TokenRequestFailed,
+        checkResponse(gpa, .bad_request, "{\"error\":\"unsupported_grant_type\"}", .oauth),
+    );
+    try std.testing.expectError(
+        error.TokenRequestFailed,
+        checkResponse(gpa, .unauthorized, "{\"error\":\"invalid_client\"}", .oauth),
+    );
+    try std.testing.expectError(
+        error.TokenRequestFailed,
+        checkResponse(gpa, .forbidden, "not json", .oauth),
+    );
+    try std.testing.expectError(
+        error.TokenServiceUnavailable,
+        checkResponse(gpa, .too_many_requests, "", .oauth),
+    );
+    try std.testing.expectError(
+        error.TokenServiceUnavailable,
+        checkResponse(gpa, .service_unavailable, "", .oauth),
+    );
+}
+
+test "a bearer response does not classify an OAuth grant" {
+    try std.testing.expectError(
+        error.TokenRequestFailed,
+        checkResponse(
+            std.testing.allocator,
+            .bad_request,
+            "{\"error\":\"invalid_grant\"}",
+            .generic,
+        ),
+    );
+}
+
+test "ambiguous endpoint failures become token service failures" {
+    try std.testing.expectEqual(
+        error.TokenServiceUnavailable,
+        tokenTransportError(error.Timeout),
+    );
+    try std.testing.expectEqual(
+        error.TokenServiceUnavailable,
+        tokenTransportError(error.ConnectionResetByPeer),
+    );
+    for ([_]anyerror{
+        error.ConnectionRefused,
+        error.ConnectionTimedOut,
+        error.NetworkUnreachable,
+        error.TemporaryNameServerFailure,
+        error.NameServerFailure,
+        error.Canceled,
+        error.OutOfMemory,
+    }) |err| try std.testing.expectEqual(err, tokenTransportError(err));
 }
 
 test pkce {

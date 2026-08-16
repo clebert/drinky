@@ -37,6 +37,14 @@ pub const Account = enum {
         };
     }
 
+    /// Whether this account uses a refresh credential for provider requests.
+    pub fn hasRefreshCredential(self: Account) bool {
+        return switch (self) {
+            .anthropic_subscription, .openai_subscription => true,
+            .anthropic_console, .anthropic_api, .openai_api => false,
+        };
+    }
+
     /// The human-readable label, e.g. "Anthropic Subscription".
     pub fn label(self: Account) []const u8 {
         return switch (self) {
@@ -433,12 +441,17 @@ test "Account.provider maps each account to its vendor" {
     try std.testing.expectEqual(Provider.anthropic, Account.anthropic_console.provider());
 }
 
-test "account login flag and label" {
+test "account credential flags and label" {
     try std.testing.expect(Account.anthropic_subscription.hasLogin());
     try std.testing.expect(Account.openai_subscription.hasLogin());
     try std.testing.expect(Account.anthropic_console.hasLogin());
     try std.testing.expect(!Account.anthropic_api.hasLogin());
     try std.testing.expect(!Account.openai_api.hasLogin());
+    try std.testing.expect(Account.anthropic_subscription.hasRefreshCredential());
+    try std.testing.expect(Account.openai_subscription.hasRefreshCredential());
+    try std.testing.expect(!Account.anthropic_console.hasRefreshCredential());
+    try std.testing.expect(!Account.anthropic_api.hasRefreshCredential());
+    try std.testing.expect(!Account.openai_api.hasRefreshCredential());
     try std.testing.expectEqualStrings(
         "Anthropic Subscription",
         Account.anthropic_subscription.label(),

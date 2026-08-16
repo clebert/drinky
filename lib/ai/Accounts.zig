@@ -232,6 +232,43 @@ pub fn logout(self: *Accounts, account: llm.Account) !void {
     }
 }
 
+/// Forget a rejected subscription credential. Return true when another
+/// instance replaced the stored token and this account reloaded it. The
+/// discovered limits go in every case, because they belong to the principal
+/// behind the replaced credential. Every model falls back to its compiled
+/// limit until the next login or the next start.
+pub fn invalidate(self: *Accounts, account: llm.Account) !bool {
+    switch (account) {
+        .anthropic_subscription => {
+            const recovered = self.anthropic_auth.invalidate() catch |err| {
+                self.anthropic_subscription_ready = false;
+                return err;
+            };
+            self.anthropic_subscription_ready = recovered;
+            return recovered;
+        },
+        .openai_subscription => {
+            defer self.openai_subscription_context_windows.clearAndFree(self.gpa);
+            const recovered = self.openai_auth.invalidate() catch |err| {
+                self.openai_subscription_ready = false;
+                return err;
+            };
+            self.openai_subscription_ready = recovered;
+            return recovered;
+        },
+        .anthropic_console, .anthropic_api, .openai_api => {
+            return error.AccountHasNoRefreshCredential;
+        },
+    }
+}
+
+/// Drop metadata that belongs to the principal behind a replaced credential.
+/// Anthropic has no discovered metadata. OpenAI returns to compiled limits.
+pub fn dropPrincipalMetadata(self: *Accounts, account: llm.Account) void {
+    if (account == .openai_subscription)
+        self.openai_subscription_context_windows.clearAndFree(self.gpa);
+}
+
 /// Replace this account's discovered limits. Any fetch, envelope, or
 /// allocation failure leaves the override set empty and restores every
 /// compiled fallback.
@@ -319,6 +356,20 @@ test "logout rejects api accounts, which are env-sourced" {
     try std.testing.expectError(error.ApiAccountHasNoLogout, accounts.logout(.openai_api));
 }
 
+test "invalidation rejects accounts without a refresh credential" {
+    var accounts = testAccounts(.{ .anthropic = "a", .openai = "o" }, false, false);
+    for ([_]llm.Account{
+        .anthropic_console,
+        .anthropic_api,
+        .openai_api,
+    }) |account| {
+        try std.testing.expectError(
+            error.AccountHasNoRefreshCredential,
+            accounts.invalidate(account),
+        );
+    }
+}
+
 test "client selects the arm for an authenticated account, null otherwise" {
     var accounts = testAccounts(.{ .anthropic = "sk-ant", .openai = null }, false, false);
     try std.testing.expectEqual(
@@ -327,6 +378,162 @@ test "client selects the arm for an authenticated account, null otherwise" {
     );
     try std.testing.expect(accounts.client(.openai_api) == null);
     try std.testing.expect(accounts.client(.anthropic_subscription) == null);
+}
+
+test "invalidation forgets a rejected credential when store removal fails" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var directory = try tmp.dir.createDirPathOpen(io, ".pith", .{});
+    directory.close(io);
+    try tmp.dir.writeFile(io, .{
+        .sub_path = ".pith/auth.json",
+        .data =
+        \\{ "anthropic_subscription":
+        \\    { "access": "a", "refresh": "r", "expires_ms": 4102444800000 } }
+        ,
+    });
+    var home_buffer: [128]u8 = undefined;
+    const home = try std.fmt.bufPrint(
+        &home_buffer,
+        ".zig-cache/tmp/{s}",
+        .{tmp.sub_path},
+    );
+
+    var accounts = try Accounts.init(gpa, io, home, .{}, .{});
+    defer accounts.deinit();
+    try std.testing.expect(accounts.isAuthenticated(.anthropic_subscription));
+
+    // A corrupt file blocks removal. The rejected token must still leave memory.
+    try tmp.dir.writeFile(io, .{ .sub_path = ".pith/auth.json", .data = "not json" });
+    try std.testing.expectError(
+        error.BadCredentials,
+        accounts.invalidate(.anthropic_subscription),
+    );
+    try std.testing.expect(!accounts.isAuthenticated(.anthropic_subscription));
+    try std.testing.expect(accounts.client(.anthropic_subscription) == null);
+}
+
+test "OpenAI invalidation clears context overrides when store removal fails" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var directory = try tmp.dir.createDirPathOpen(io, ".pith", .{});
+    directory.close(io);
+    try tmp.dir.writeFile(io, .{
+        .sub_path = ".pith/auth.json",
+        .data =
+        \\{ "openai_subscription":
+        \\    { "access": "a", "refresh": "r", "expires_ms": 4102444800000,
+        \\      "account_id": "account" } }
+        ,
+    });
+    var home_buffer: [128]u8 = undefined;
+    const home = try std.fmt.bufPrint(
+        &home_buffer,
+        ".zig-cache/tmp/{s}",
+        .{tmp.sub_path},
+    );
+
+    var accounts = testAccounts(.{}, false, true);
+    defer accounts.openai_subscription_context_windows.deinit(gpa);
+    accounts.openai_auth = try openai.Auth.init(gpa, io, home, .{});
+    defer accounts.openai_auth.deinit();
+    try std.testing.expect(try accounts.openai_auth.load());
+    try accounts.openai_subscription_context_windows.append(gpa, .{
+        .model = "gpt-5.6-sol",
+        .tokens = 372_000,
+    });
+
+    // A failed removal must clear both the credential and its account metadata.
+    try tmp.dir.writeFile(io, .{ .sub_path = ".pith/auth.json", .data = "not json" });
+    try std.testing.expectError(
+        error.BadCredentials,
+        accounts.invalidate(.openai_subscription),
+    );
+    try std.testing.expect(!accounts.isAuthenticated(.openai_subscription));
+    try std.testing.expect(accounts.openai_auth.tokens == null);
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        accounts.openai_subscription_context_windows.items.len,
+    );
+}
+
+test "OpenAI invalidation reloads a replacement without its discovered limits" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var directory = try tmp.dir.createDirPathOpen(io, ".pith", .{});
+    directory.close(io);
+    try tmp.dir.writeFile(io, .{
+        .sub_path = ".pith/auth.json",
+        .data =
+        \\{ "openai_subscription":
+        \\    { "access": "old_access", "refresh": "old_refresh",
+        \\      "expires_ms": 4102444800000, "account_id": "account" } }
+        ,
+    });
+    var home_buffer: [128]u8 = undefined;
+    const home = try std.fmt.bufPrint(
+        &home_buffer,
+        ".zig-cache/tmp/{s}",
+        .{tmp.sub_path},
+    );
+
+    var accounts = testAccounts(.{}, false, true);
+    defer accounts.openai_subscription_context_windows.deinit(gpa);
+    accounts.openai_auth = try openai.Auth.init(gpa, io, home, .{});
+    defer accounts.openai_auth.deinit();
+    try std.testing.expect(try accounts.openai_auth.load());
+    try accounts.openai_subscription_context_windows.append(gpa, .{
+        .model = "gpt-5.6-sol",
+        .tokens = 372_000,
+    });
+
+    // Another instance saved a replacement. The reloaded credential can belong
+    // to another principal, so its discovered limits go with the old one.
+    try tmp.dir.writeFile(io, .{
+        .sub_path = ".pith/auth.json",
+        .data =
+        \\{ "openai_subscription":
+        \\    { "access": "new_access", "refresh": "new_refresh",
+        \\      "expires_ms": 4102444800000, "account_id": "account" } }
+        ,
+    });
+    try std.testing.expect(try accounts.invalidate(.openai_subscription));
+    try std.testing.expect(accounts.isAuthenticated(.openai_subscription));
+    try std.testing.expectEqualStrings(
+        "new_refresh",
+        accounts.openai_auth.tokens.?.refresh,
+    );
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        accounts.openai_subscription_context_windows.items.len,
+    );
+}
+
+test "a principal replacement drops only OpenAI subscription metadata" {
+    const gpa = std.testing.allocator;
+    var accounts = testAccounts(.{}, false, true);
+    defer accounts.openai_subscription_context_windows.deinit(gpa);
+    try accounts.openai_subscription_context_windows.append(gpa, .{
+        .model = "gpt-5.6-sol",
+        .tokens = 372_000,
+    });
+
+    accounts.dropPrincipalMetadata(.anthropic_subscription);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        accounts.openai_subscription_context_windows.items.len,
+    );
+    accounts.dropPrincipalMetadata(.openai_subscription);
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        accounts.openai_subscription_context_windows.items.len,
+    );
 }
 
 test "catalog limits apply to known subscription models only" {

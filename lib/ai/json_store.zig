@@ -3,14 +3,20 @@
 //! store uses the project. This module owns the file shape only. The caller owns
 //! its entry fields (passed as `anytype`), so nothing here knows an entry shape.
 //!
-//! Every write is a load-merge-write that preserves every other key and lands
-//! through an atomic rename at owner-only permissions. A file it cannot parse is
-//! `error.CorruptStore` rather than a fresh start, so no write can wipe a key it
-//! could not read.
+//! Every write holds the owner-only `{path}.lock` sibling across its load,
+//! merge, and atomic rename. Lock contention ends with `error.StoreBusy` after
+//! a bounded wait. A corrupt file is never replaced.
 
 const std = @import("std");
 
 const json = @import("json.zig");
+
+const LockPolicy = struct {
+    /// The maximum number of nonblocking lock attempts.
+    attempts_max: usize = 50,
+    /// The wait between attempts. The default total wait is about 490 ms.
+    wait_ms: u64 = 10,
+};
 
 /// A parsed store file that owns its backing memory and answers entry lookups.
 /// Open with `open`. Free with `deinit`.
@@ -35,6 +41,13 @@ pub const SaveOptions = struct {
     /// save appends its own key last, so the file order is the write order.
     /// Null keeps every key.
     keys_max: ?usize = null,
+};
+
+/// One string field that must still match before its complete entry is removed.
+pub const RemoveCondition = struct {
+    key: []const u8,
+    field: []const u8,
+    expected: []const u8,
 };
 
 /// Open the store file at `path`, or null when it does not exist. A present
@@ -70,17 +83,11 @@ pub fn save(
     entry: anytype,
     options: SaveOptions,
 ) !void {
-    if (std.fs.path.dirname(path)) |dir| {
-        std.Io.Dir.cwd().createDirPath(io, dir) catch |err| switch (err) {
-            error.PathAlreadyExists => {},
-            else => return err,
-        };
-    }
     try rewrite(gpa, io, path, key, entry, options);
 }
 
-/// Remove `key` from the store file at `path` and rewrite every other entry
-/// verbatim. A missing file is a no-op — nothing to remove.
+/// Remove `key` and rewrite every other entry verbatim. A missing store leaves
+/// no data file, but the operation creates its parent directory and lock file.
 pub fn remove(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -90,8 +97,30 @@ pub fn remove(
     try rewrite(gpa, io, path, key, null, .{});
 }
 
-/// Load-merge-write: read the current file, re-serialize it with `key` rewritten
-/// (or dropped, for a null `entry`), and replace the file atomically.
+/// Remove one entry only when its string field still has the expected value.
+/// Return true only when the matching entry was removed. Every Pith writer
+/// holds the same lock across the comparison and rewrite.
+pub fn removeMatchingString(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    condition: *const RemoveCondition,
+) !bool {
+    try ensureParent(io, path);
+    var lock_file = try lockFile(gpa, io, path);
+    defer lock_file.close(io);
+
+    const existing = (try readExisting(gpa, io, path)) orelse return false;
+    defer gpa.free(existing);
+    if (!try stringMatches(gpa, existing, condition)) return false;
+
+    const body = try serialize(gpa, existing, condition.key, null, .{});
+    defer gpa.free(body);
+    try replaceFile(io, path, body);
+    return true;
+}
+
+/// Load, merge, and replace while every Pith writer holds one stable lock file.
 fn rewrite(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -100,17 +129,83 @@ fn rewrite(
     entry: anytype,
     options: SaveOptions,
 ) !void {
-    const existing: ?[]u8 = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .unlimited) catch |err|
-        switch (err) {
-            // A save starts from a fresh object. A removal has nothing to drop.
-            error.FileNotFound => if (@TypeOf(entry) == @TypeOf(null)) return else null,
-            else => return err,
-        };
+    try ensureParent(io, path);
+    var lock_file = try lockFile(gpa, io, path);
+    defer lock_file.close(io);
+
+    const existing = try readExisting(gpa, io, path);
     defer if (existing) |data| gpa.free(data);
+    if (existing == null and @TypeOf(entry) == @TypeOf(null)) return;
 
     const body = try serialize(gpa, existing, key, entry, options);
     defer gpa.free(body);
     try replaceFile(io, path, body);
+}
+
+fn ensureParent(io: std.Io, path: []const u8) !void {
+    if (std.fs.path.dirname(path)) |directory| {
+        std.Io.Dir.cwd().createDirPath(io, directory) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        };
+    }
+}
+
+/// Open the stable sibling lock file and take its exclusive advisory lock.
+fn lockFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !std.Io.File {
+    return lockFileWithPolicy(gpa, io, path, .{});
+}
+
+fn lockFileWithPolicy(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    comptime policy: LockPolicy,
+) !std.Io.File {
+    comptime std.debug.assert(policy.attempts_max > 0);
+    const lock_path = try std.fmt.allocPrint(gpa, "{s}.lock", .{path});
+    defer gpa.free(lock_path);
+    for (0..policy.attempts_max) |attempt| {
+        const file = std.Io.Dir.cwd().createFile(io, lock_path, .{
+            .truncate = false,
+            .lock = .exclusive,
+            .lock_nonblocking = true,
+            .permissions = @enumFromInt(0o600),
+        }) catch |err| switch (err) {
+            error.WouldBlock => {
+                if (attempt + 1 == policy.attempts_max) return error.StoreBusy;
+                try io.sleep(.fromMilliseconds(policy.wait_ms), .awake);
+                continue;
+            },
+            else => return err,
+        };
+        return file;
+    }
+    unreachable;
+}
+
+fn readExisting(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !?[]u8 {
+    return std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .unlimited) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+}
+
+fn stringMatches(
+    gpa: std.mem.Allocator,
+    existing: []const u8,
+    condition: *const RemoveCondition,
+) !bool {
+    const parsed = std.json.parseFromSlice(std.json.Value, gpa, existing, .{}) catch |err|
+        switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.CorruptStore,
+        };
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.CorruptStore;
+    const entry = json.object(parsed.value.object.get(condition.key)) orelse return false;
+    const value = json.string(entry.get(condition.field)) orelse return false;
+    return std.mem.eql(u8, value, condition.expected);
 }
 
 /// Atomically replace the file at `path` with `body` at owner-only
@@ -365,6 +460,27 @@ test "a key cap drops the oldest keys and keeps the saved one" {
     try std.testing.expectEqualStrings("second", parsed_only.value.object.keys()[0]);
 }
 
+test "a busy store lock fails after its bounded retry" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(
+        &path_buffer,
+        ".zig-cache/tmp/{s}/auth.json",
+        .{tmp.sub_path},
+    );
+    try ensureParent(io, path);
+    var held = try lockFile(gpa, io, path);
+    defer held.close(io);
+
+    try std.testing.expectError(
+        error.StoreBusy,
+        lockFileWithPolicy(gpa, io, path, .{ .attempts_max = 2, .wait_ms = 0 }),
+    );
+}
+
 test "save replaces the file atomically at owner-only permissions" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
@@ -424,6 +540,49 @@ test "remove drops only its key on disk, and a missing file opens as null" {
         "at",
         file.entry("anthropic_subscription").?.get("access").?.string,
     );
+}
+
+test "a conditional removal keeps a replacement entry" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(
+        &path_buffer,
+        ".zig-cache/tmp/{s}/auth.json",
+        .{tmp.sub_path},
+    );
+    const original: TestEntry = .{ .access = "a1", .refresh = "r1", .expires_ms = 1 };
+    const replacement: TestEntry = .{ .access = "a2", .refresh = "r2", .expires_ms = 2 };
+
+    try save(gpa, io, path, "anthropic_subscription", original, .{});
+    try save(gpa, io, path, "anthropic_subscription", replacement, .{});
+    const replacement_removed = try removeMatchingString(gpa, io, path, &.{
+        .key = "anthropic_subscription",
+        .field = "refresh",
+        .expected = "r1",
+    });
+    try std.testing.expect(!replacement_removed);
+
+    {
+        var file = (try open(gpa, io, path)).?;
+        defer file.deinit();
+        try std.testing.expectEqualStrings(
+            "r2",
+            file.entry("anthropic_subscription").?.get("refresh").?.string,
+        );
+    }
+
+    const removed = try removeMatchingString(gpa, io, path, &.{
+        .key = "anthropic_subscription",
+        .field = "refresh",
+        .expected = "r2",
+    });
+    try std.testing.expect(removed);
+    var file = (try open(gpa, io, path)).?;
+    defer file.deinit();
+    try std.testing.expect(file.entry("anthropic_subscription") == null);
 }
 
 test "open, save, and remove refuse a corrupt file, leaving it intact on disk" {

@@ -22,6 +22,10 @@ io: std.Io,
 timeouts: net.Timeouts,
 path: []const u8,
 tokens: ?console.Tokens,
+/// Whether a committed credential still needs a store retry. The shared
+/// lifecycle keeps this field for every account. A minted key never refreshes,
+/// so this account reaches no retry and the field stays false.
+save_pending: bool = false,
 
 pub fn init(
     gpa: std.mem.Allocator,

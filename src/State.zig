@@ -23,7 +23,9 @@
 //! Nothing here is authoritative. Every read failure reads as nothing
 //! remembered, and the caller falls back to its configured or compiled default.
 //! A failed write stops every later write, so one broken file reports once
-//! instead of on every change.
+//! instead of on every change. Store contention is the one exception, because
+//! it clears by itself: that snapshot stays pending, and the next write sends
+//! it even when the choices went back to the saved ones.
 
 const std = @import("std");
 
@@ -56,9 +58,10 @@ models: std.EnumArray(ai.llm.Account, ?ai.models.Model),
 /// The choices Pith seeded or recorded last, so an unchanged choice writes
 /// nothing. Null until the first `seed` or `record`.
 saved: ?Saved,
-/// True while Pith still writes the file. A failed write clears it, because a
-/// broken file breaks every later write the same way.
+/// True while Pith still writes the file. A persistent failure clears it.
 save_enabled: bool,
+/// Whether temporary lock contention left a snapshot to save later.
+save_pending: bool,
 
 /// What the file held for the project. Each field is null when the file held no
 /// usable value, so the caller applies its own default. The models the file held
@@ -147,6 +150,7 @@ pub fn inert(gpa: std.mem.Allocator, io: std.Io) State {
         .models = .initFill(null),
         .saved = null,
         .save_enabled = false,
+        .save_pending = false,
     };
 }
 
@@ -174,6 +178,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, options: *const OpenOptions) !St
         .models = .initFill(null),
         .saved = null,
         .save_enabled = true,
+        .save_pending = false,
     };
     state.read();
     return state;
@@ -195,9 +200,8 @@ pub fn seed(
 
 /// Save the choices the project now uses. A choice equal to the seeded or last
 /// recorded one writes nothing, so a command that changes neither the account,
-/// the model, nor the effort level never touches the file. Any failure is the
-/// last write this state attempts, so the caller reports it once and the report
-/// is always true.
+/// the model, nor the effort level never touches the file. A persistent failure
+/// stops later writes. Temporary lock contention leaves saving enabled.
 ///
 /// The model of `account` changes first, so the write carries it and a state
 /// that no longer saves still answers the rest of the session.
@@ -209,16 +213,26 @@ pub fn record(
 ) !void {
     self.setModel(account, model);
     if (!self.save_enabled) return;
-    if (self.unchanged(account, model, effort)) return;
-    // A failed snapshot also stops the writes: without it, the change check
-    // compares against a stale choice and a later no-op change writes again.
-    errdefer self.save_enabled = false;
-    try ai.json_store.save(self.gpa, self.io, self.path, self.project, Entry{
+    if (!self.save_pending and self.unchanged(account, model, effort)) return;
+    // A persistent failure stops later writes. StoreBusy keeps this snapshot
+    // pending, even when the active choices later return to their saved values.
+    ai.json_store.save(self.gpa, self.io, self.path, self.project, Entry{
         .account = @tagName(account),
         .effort = @tagName(effort),
         .models = .{ .table = &self.models },
-    }, .{ .keys_max = projects_max });
-    try self.remember(account, model, effort);
+    }, .{ .keys_max = projects_max }) catch |err| {
+        if (err == error.StoreBusy) {
+            self.save_pending = true;
+        } else {
+            self.save_enabled = false;
+        }
+        return err;
+    };
+    self.remember(account, model, effort) catch |err| {
+        self.save_enabled = false;
+        return err;
+    };
+    self.save_pending = false;
 }
 
 /// Read what the file holds for this project into `start` and `models`. Every
@@ -547,6 +561,50 @@ test "a model the compiled table does not offer clears the memory of its account
     defer restarted.deinit();
     try std.testing.expectEqual(ai.llm.Account.openai_api, restarted.start.account.?);
     for (restarted.models.values) |maybe_model| try std.testing.expect(maybe_model == null);
+}
+
+test "temporary store contention leaves project-state saving enabled" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const openai_model = ai.models.get(.openai, "gpt-5.6-luna").?;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpHome(gpa, io, &tmp);
+    defer gpa.free(home);
+    try writeForTest(io, &tmp, "{}");
+
+    var state = try openForTest(gpa, io, home);
+    defer state.deinit();
+    try state.seed(.anthropic_api, &test_model, .none);
+    const lock_path = try std.fmt.allocPrint(gpa, "{s}.lock", .{state.path});
+    defer gpa.free(lock_path);
+    {
+        var held = try std.Io.Dir.cwd().createFile(io, lock_path, .{
+            .truncate = false,
+            .lock = .exclusive,
+            .permissions = @enumFromInt(0o600),
+        });
+        defer held.close(io);
+        try std.testing.expectError(
+            error.StoreBusy,
+            state.record(.openai_api, &openai_model, .high),
+        );
+        try std.testing.expect(state.save_enabled);
+        try std.testing.expect(state.save_pending);
+    }
+
+    // The choices return to the saved values. The pending snapshot still forces
+    // this retry, so no earlier model-table change can stay only in memory.
+    try state.record(.anthropic_api, &test_model, .none);
+    try std.testing.expect(!state.save_pending);
+    var file = (try ai.json_store.open(gpa, io, state.path)).?;
+    defer file.deinit();
+    const entry = file.entry("/work").?;
+    try std.testing.expectEqualStrings("anthropic_api", entry.get("account").?.string);
+    try std.testing.expectEqualStrings(
+        openai_model.name,
+        entry.get("models").?.object.get("openai_api").?.string,
+    );
 }
 
 test "a corrupt file survives a refused write" {

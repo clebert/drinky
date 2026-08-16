@@ -1,13 +1,16 @@
 //! The credential lifecycle that both subscription OAuth accounts share. Load
 //! and persist a provider's tokens under its `account_key` in the keyed
 //! `auth.json` store. Refresh a stale access token on demand, and reload the
-//! store once when that refresh fails, because the token rotates. Run the
-//! interactive login (browser + loopback callback). Generic over each
-//! provider's `Auth` file struct (`gpa`/`io`/`timeouts`/`path`/`tokens`
-//! fields): the on-disk entry mirrors the provider's `Tokens` fields. Every
-//! save is a load-merge-write through `json_store` that never clobbers another
-//! account's entry. A store file Pith cannot parse is a bad credential file, so
-//! every call translates that failure into `error.BadCredentials`.
+//! store once when that refresh fails, because the token rotates. Retry a save
+//! after temporary store contention. Stop before a model request when the store
+//! holds another principal. Run the interactive login (browser + loopback
+//! callback). Forget a credential the provider rejected, and keep a replacement
+//! another instance saved. Generic over each provider's `Auth` file struct
+//! (`gpa`/`io`/`timeouts`/`path`/`tokens` fields): the on-disk entry mirrors the
+//! provider's `Tokens` fields.
+//! Every save is a load-merge-write through `json_store` that never clobbers
+//! another account's entry. A store file Pith cannot parse is a bad credential
+//! file, so every call translates that failure into `error.BadCredentials`.
 
 const std = @import("std");
 
@@ -26,6 +29,13 @@ pub const Login = union(enum) {
     },
 };
 
+fn isOptionalString(comptime T: type) bool {
+    return switch (@typeInfo(T)) {
+        .optional => |optional| optional.child == []const u8,
+        else => false,
+    };
+}
+
 /// Load stored tokens. Read each `Tokens` field from the entry by name.
 /// Returns false when the file is absent or holds no `account_key` entry (the
 /// account is simply signed out).
@@ -42,25 +52,43 @@ pub fn load(auth: anytype, comptime account_key: []const u8) !bool {
     var filled: usize = 0;
     errdefer {
         inline for (@typeInfo(Tokens).@"struct".fields, 0..) |field, i| {
-            if (comptime field.type == []const u8) {
-                if (i < filled) auth.gpa.free(@field(tokens, field.name));
+            if (i < filled) {
+                if (comptime field.type == []const u8) {
+                    auth.gpa.free(@field(tokens, field.name));
+                } else if (comptime isOptionalString(field.type)) {
+                    if (@field(tokens, field.name)) |string| auth.gpa.free(string);
+                }
             }
         }
     }
     inline for (@typeInfo(Tokens).@"struct".fields, 0..) |field, i| {
-        const value = entry.get(field.name) orelse return error.BadCredentials;
-        @field(tokens, field.name) = if (comptime field.type == []const u8) switch (value) {
-            .string => |string| try auth.gpa.dupe(u8, string),
-            else => return error.BadCredentials,
-        } else switch (value) {
-            .integer => |integer| integer,
-            else => return error.BadCredentials,
+        const maybe_value = entry.get(field.name);
+        @field(tokens, field.name) = if (comptime field.type == []const u8) value: {
+            const value = maybe_value orelse return error.BadCredentials;
+            break :value switch (value) {
+                .string => |string| try auth.gpa.dupe(u8, string),
+                else => return error.BadCredentials,
+            };
+        } else if (comptime isOptionalString(field.type)) value: {
+            const value = maybe_value orelse break :value null;
+            break :value switch (value) {
+                .string => |string| try auth.gpa.dupe(u8, string),
+                .null => null,
+                else => return error.BadCredentials,
+            };
+        } else value: {
+            const value = maybe_value orelse return error.BadCredentials;
+            break :value switch (value) {
+                .integer => |integer| integer,
+                else => return error.BadCredentials,
+            };
         };
         filled = i + 1;
     }
     // Install last, so a rejected entry leaves any current credential intact.
     if (auth.tokens) |old| old.deinit(auth.gpa);
     auth.tokens = tokens;
+    auth.save_pending = false;
     return true;
 }
 
@@ -76,11 +104,18 @@ pub fn accessToken(
     comptime account_key: []const u8,
     comptime refreshFn: anytype,
 ) ![]const u8 {
+    if (auth.save_pending) {
+        // The pending token is the only live credential. Keep cancellation from
+        // dropping its last save attempt before a model request can use it.
+        const protection = auth.io.swapCancelProtection(.blocked);
+        defer _ = auth.io.swapCancelProtection(protection);
+        try save(auth, account_key);
+    }
     const tokens = auth.tokens orelse return error.NotAuthenticated;
     const now_ms = std.Io.Timestamp.now(auth.io, .real).toMilliseconds();
     if (now_ms >= tokens.expires_ms) {
         const fresh = refreshFn(auth.gpa, auth.io, auth.timeouts, tokens) catch |first_error|
-            try refreshFromStore(auth, account_key, tokens.refresh, first_error, refreshFn);
+            try refreshFromStore(auth, account_key, first_error, refreshFn);
         // The refresh consumed the stored (single-use) refresh token server-side,
         // so `fresh` is now the only usable credential. Block cancellation until
         // it is committed and persisted. Without the block, a cancel that lands
@@ -96,31 +131,33 @@ pub fn accessToken(
     return auth.tokens.?.access;
 }
 
-/// A second refresh with the refresh token that `auth.json` holds now, after
-/// the cached one failed with `first_error`. The provider rotates the
-/// single-use refresh token on every refresh, so a second Pith process can
-/// advance the store past the cached copy. The reload adopts the stored
-/// credential, which is then the only live one. Pith keeps that credential
-/// even when the second refresh fails. A store that holds the same refresh
-/// token, or that Pith cannot read, reports `first_error`, because then the
-/// refresh failed for a real reason. There is exactly one retry.
+/// Inspect the credential that `auth.json` holds after a refresh failure. A
+/// different token for the same known principal gets one refresh attempt. A
+/// different or unknown principal is installed but stops before a model request.
+/// The app then drops the old principal evidence before the user retries.
 fn refreshFromStore(
     auth: anytype,
     comptime account_key: []const u8,
-    refresh_used: []const u8,
     first_error: anyerror,
     comptime refreshFn: anytype,
 ) anyerror!@typeInfo(@TypeOf(auth.tokens)).optional.child {
-    // The reload frees the tokens it replaces, so copy the refresh token the
-    // failed attempt used before the comparison loses it. An allocation failure
-    // belongs to this process, so it reports itself and not `first_error`.
-    const refresh_used_copy = try auth.gpa.dupe(u8, refresh_used);
-    defer auth.gpa.free(refresh_used_copy);
-    const loaded = load(auth, account_key) catch return first_error;
+    var stored_auth = auth.*;
+    stored_auth.tokens = null;
+    defer clear(&stored_auth);
+    const loaded = load(&stored_auth, account_key) catch return first_error;
     if (!loaded) return first_error;
-    const stored = auth.tokens.?;
-    if (std.mem.eql(u8, stored.refresh, refresh_used_copy)) return first_error;
-    return refreshFn(auth.gpa, auth.io, auth.timeouts, stored);
+
+    const current = &auth.tokens.?;
+    const stored = &stored_auth.tokens.?;
+    if (std.mem.eql(u8, current.refresh, stored.refresh)) return first_error;
+    const same_principal = current.samePrincipal(stored);
+
+    clear(auth);
+    auth.tokens = stored_auth.tokens;
+    auth.save_pending = stored_auth.save_pending;
+    stored_auth.tokens = null;
+    if (!same_principal) return error.CredentialReplaced;
+    return refreshFn(auth.gpa, auth.io, auth.timeouts, auth.tokens.?);
 }
 
 /// Run the interactive OAuth login and report pre-commit runtime text through
@@ -169,26 +206,65 @@ fn commit(auth: anytype, comptime account_key: []const u8, tokens: anytype) Logi
 /// Drop this account's credentials: clear the in-memory tokens and remove its
 /// entry from `auth.json`. Every other account's entry stays intact.
 pub fn logout(auth: anytype, comptime account_key: []const u8) !void {
-    // Remove the on-disk entry first: a failed remove then leaves the credentials
-    // fully intact (in memory and the caller's readiness flag). Logout is atomic
-    // and cannot leave a token-less account still marked authenticated.
+    // Remove the on-disk entry first. A failed remove leaves the account ready.
+    // Logout cannot leave a token-less account marked as authenticated.
+    try remove(auth, account_key);
+    clear(auth);
+}
+
+/// Forget a credential that the provider rejected. Remove the stored entry only
+/// while it still holds that token. Reload a replacement from another instance.
+pub fn invalidate(auth: anytype, comptime account_key: []const u8) !bool {
+    const tokens = auth.tokens orelse return error.NotAuthenticated;
+    const removed = json_store.removeMatchingString(
+        auth.gpa,
+        auth.io,
+        auth.path,
+        &.{
+            .key = account_key,
+            .field = "refresh",
+            .expected = tokens.refresh,
+        },
+    ) catch |err| {
+        clear(auth);
+        return switch (err) {
+            error.CorruptStore => error.BadCredentials,
+            else => err,
+        };
+    };
+    clear(auth);
+    if (removed) return false;
+    return load(auth, account_key);
+}
+
+fn remove(auth: anytype, comptime account_key: []const u8) !void {
     json_store.remove(auth.gpa, auth.io, auth.path, account_key) catch |err| switch (err) {
         error.CorruptStore => return error.BadCredentials,
         else => return err,
     };
+}
+
+fn clear(auth: anytype) void {
     if (auth.tokens) |tokens| tokens.deinit(auth.gpa);
     auth.tokens = null;
+    auth.save_pending = false;
 }
 
 /// Persist the current tokens under `account_key`. The on-disk entry is the
-/// `Tokens` fields verbatim.
+/// `Tokens` fields verbatim. Lock contention leaves a retry marker in memory.
+/// Every other failure clears that marker, because a store Pith cannot write at
+/// all must not stop every later turn. The credential then lives in memory
+/// until Pith exits, which is what a memory-only login reports.
 pub fn save(auth: anytype, comptime account_key: []const u8) !void {
     const tokens = auth.tokens orelse return error.NotAuthenticated;
-    json_store.save(auth.gpa, auth.io, auth.path, account_key, tokens, .{}) catch |err|
-        switch (err) {
-            error.CorruptStore => return error.BadCredentials,
-            else => return err,
+    json_store.save(auth.gpa, auth.io, auth.path, account_key, tokens, .{}) catch |err| {
+        auth.save_pending = err == error.StoreBusy;
+        return switch (err) {
+            error.CorruptStore => error.BadCredentials,
+            else => err,
         };
+    };
+    auth.save_pending = false;
 }
 
 const CallbackSource = struct {
@@ -239,6 +315,7 @@ test "a failed persist returns memory-only login and keeps credentials usable" {
         io: std.Io,
         path: []const u8,
         tokens: ?Tokens,
+        save_pending: bool = false,
     } = .{ .gpa = gpa, .io = io, .path = undefined, .tokens = null };
 
     // A corrupt store refuses the rewrite: the replacement remains installed,

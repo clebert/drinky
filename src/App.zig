@@ -648,13 +648,36 @@ fn finishWorkerResult(self: *App, result: *const WorkerResult) !void {
             try self.session.endTurnWithReceipt(&result.outcome.receipt);
             if (self.session.hasSteering()) try self.startSteeringTurn();
         },
-        .failed => {
-            try self.session.reserveFailureRestore(&result.outcome.receipt);
-            defer self.agent.steering.clear();
-            try self.session.failTurnWithReceipt(&result.outcome.receipt, result.error_text);
+        .credential_replaced => {
+            const account = self.activeAccount() orelse
+                return error.UnexpectedCredentialReplacement;
+            if (!account.hasRefreshCredential())
+                return error.UnexpectedCredentialReplacement;
+            try self.finishFailedWorker(result, null);
+            try self.acceptCredentialReplacement(account);
         },
+        .credential_rejected => {
+            const account = self.activeAccount() orelse
+                return error.UnexpectedTokenGrantRejection;
+            if (!account.hasRefreshCredential())
+                return error.UnexpectedTokenGrantRejection;
+            try self.finishFailedWorker(result, account);
+        },
+        .failed => try self.finishFailedWorker(result, null),
         .canceled, .closed => return error.UnexpectedTurnDisposition,
     }
+}
+
+/// Apply one failed result, then invalidate its rejected account when present.
+fn finishFailedWorker(
+    self: *App,
+    result: *const WorkerResult,
+    maybe_rejected: ?ai.llm.Account,
+) !void {
+    try self.session.reserveFailureRestore(&result.outcome.receipt);
+    defer self.agent.steering.clear();
+    try self.session.failTurnWithReceipt(&result.outcome.receipt, result.error_text);
+    if (maybe_rejected) |account| try self.rejectCredential(account);
 }
 
 /// Cancel and reap `maybe_future`'s task, then clear the handle. A no-op when null.
@@ -821,10 +844,11 @@ fn readInput(self: *App) void {
 /// Transcript text for a turn the agent failed without a report through `onError`.
 /// These are the agent's own verdicts on a reply, not server messages, so each
 /// gets a sentence. A refusal or an unrecognized provider outcome is ordinary
-/// model behavior and must not read as an internal fault. A dead credential is
-/// not model behavior, but the user can act on it, so the sentence names the
-/// command to run. Anything unmapped returns null, and the caller wraps its
-/// error name.
+/// model behavior and must not read as an internal fault. A rejected credential
+/// reports only the provider result. The app records its account resolution. A
+/// busy credential store keeps the refreshed token in memory. The next turn
+/// retries its save before a provider request. Anything unmapped returns null,
+/// and the caller wraps its error name.
 fn turnFailureText(err: anyerror) ?[]const u8 {
     return switch (err) {
         error.UnsupportedReply => "Pith cannot keep the response because the model returned " ++
@@ -832,8 +856,15 @@ fn turnFailureText(err: anyerror) ?[]const u8 {
         error.EmptyReply => "The model returned an empty response.",
         error.IncompleteReply => "Pith did not receive the complete model response.",
         error.TooManyToolRounds => "The turn reached the limit for tool rounds.",
-        error.TokenRequestFailed => "Pith could not refresh the credential of this account. " ++
-            "Sign in again with /login.",
+        error.CredentialReplaced => "Pith found a replacement credential for this account. " ++
+            "Pith removed the prior account evidence. Try the turn again.",
+        error.TokenGrantRejected => "The provider rejected the refresh credential.",
+        error.TokenRequestFailed => "The provider did not accept the token request. " ++
+            "Pith kept this account signed in.",
+        error.TokenServiceUnavailable => "The provider credential service is not available. " ++
+            "Try the turn again.",
+        error.StoreBusy => "Another Pith instance is writing the credential file. " ++
+            "Try the turn again.",
         else => null,
     };
 }
@@ -846,7 +877,7 @@ fn runTurnWorker(self: *App, text: []const u8, generation: u64) WorkerResult {
     defer self.gpa.free(text);
     var handler: TurnHandler = .{ .app = self, .generation = generation };
     const outcome = self.agent.run(text, &handler);
-    switch (outcome.disposition) {
+    const maybe_failure: ?anyerror = switch (outcome.disposition) {
         .canceled, .closed => return .{
             .outcome = outcome,
             .error_text = handler.error_text,
@@ -855,18 +886,21 @@ fn runTurnWorker(self: *App, text: []const u8, generation: u64) WorkerResult {
             .progress_sequence_committed = handler.progress_sequence_committed,
             .terminal_queued = false,
         },
-        .completed => {},
-        .failed => |err| {
-            if (handler.error_text == null)
-                handler.error_text = if (turnFailureText(err)) |sentence|
-                    self.gpa.dupe(u8, sentence) catch null
-                else
-                    std.fmt.allocPrint(
-                        self.gpa,
-                        "Pith could not complete the turn because of error {s}.",
-                        .{@errorName(err)},
-                    ) catch null;
-        },
+        .completed => null,
+        .credential_replaced => error.CredentialReplaced,
+        .credential_rejected => error.TokenGrantRejected,
+        .failed => |failure| failure,
+    };
+    if (maybe_failure) |failure| {
+        if (handler.error_text == null)
+            handler.error_text = if (turnFailureText(failure)) |sentence|
+                self.gpa.dupe(u8, sentence) catch null
+            else
+                std.fmt.allocPrint(
+                    self.gpa,
+                    "Pith could not complete the turn because of error {s}.",
+                    .{@errorName(failure)},
+                ) catch null;
     }
     const terminal_queued = queued: {
         handler.enqueue(.turn_ended) catch break :queued false;
@@ -1126,7 +1160,7 @@ fn cancelTurn(self: *App) !void {
         // The worker won the race. Retain the joined result until FIFO progress
         // ahead of its terminal fence has applied. After an interrupted worker
         // enqueue, append a replacement fence and do not block the consumer.
-        .completed, .failed => {
+        .completed, .credential_replaced, .credential_rejected, .failed => {
             std.debug.assert(self.pending_turn_result == null);
             self.pending_turn_result = result;
             self.enqueuePendingTurnFence();
@@ -1420,6 +1454,11 @@ fn applyOutcome(self: *App, outcome: ai.command.Outcome) !void {
     // Commands can switch or drop the active account. Mirror the authoritative
     // agent snapshot so an allowance cleared by that transition disappears at
     // the same time as the account changes.
+    try self.mirrorAgentState();
+}
+
+/// Mirror the agent configuration into the session and the project state.
+fn mirrorAgentState(self: *App) !void {
     self.session.stats_shown = self.agent.stats;
     self.session.model_shown = self.agent.model;
     self.session.effort_shown = self.agent.effort;
@@ -1430,8 +1469,8 @@ fn applyOutcome(self: *App, outcome: ai.command.Outcome) !void {
 /// Remember the account, model, and effort level this project now uses, so the
 /// next start resumes on them. The model stays with the account that ran it, so
 /// a switch away keeps it. Only a change writes the file. A failed write never
-/// stops the session, because this state is a convenience. The state stops
-/// saving after a failure, so each report lands once and names the way out.
+/// stops the session, because this state is a convenience. A persistent failure
+/// stops later saves, so its report lands once and names the way out.
 ///
 /// A signed-out session records nothing, because the entry names an account.
 /// This drops no user choice: `/model` and `/effort` both refuse while no
@@ -1439,6 +1478,12 @@ fn applyOutcome(self: *App, outcome: ai.command.Outcome) !void {
 fn recordState(self: *App) !void {
     const account = self.activeAccount() orelse return;
     self.state.record(account, &self.agent.model, self.agent.effort) catch |err| switch (err) {
+        error.StoreBusy => try self.recordEvent(
+            .failure,
+            "Pith could not save the choices of this project because another Pith instance " ++
+                "is writing the state file. Pith tries again at the next save.",
+            .{},
+        ),
         error.CorruptStore => try self.recordEvent(
             .failure,
             "Pith stopped saving the choices of this project because Pith cannot read the " ++
@@ -1470,9 +1515,8 @@ fn loginAccount(self: *App, account: ai.llm.Account) !void {
         return self.reportLoginFailure(login_error);
 
     // A fresh login can represent another principal in the same account slot.
-    // Opaque proofs and cache evidence must not cross that boundary.
-    self.agent.dropReasoning(account);
-    self.agent.dropCacheEvidence(account);
+    // Nothing that principal produced crosses that boundary.
+    self.agent.dropAccountEvidence(account);
     self.adopt(account);
     switch (login) {
         .saved => |path| try prompt.showAuthorized(path),
@@ -1506,6 +1550,11 @@ fn reportLoginFailure(self: *App, login_error: anyerror) !void {
             "response was too large.",
         error.CallbackTimeoutUnavailable => "Pith could not sign in because it could not " ++
             "set a browser time limit.",
+        // The exchange rejects an authorization that expired or was used before.
+        error.TokenGrantRejected => "The provider rejected the authorization. " ++
+            "Start the sign-in again.",
+        error.TokenServiceUnavailable => "The provider credential service is not available. " ++
+            "Try the sign-in again later.",
         else => return self.reportNotice(
             .failure,
             "Pith could not sign in because of error {s}.",
@@ -1513,6 +1562,80 @@ fn reportLoginFailure(self: *App, login_error: anyerror) !void {
         ),
     };
     return self.reportNotice(.failure, "{s}", .{message});
+}
+
+/// Accept a credential that the store identifies as another principal. The
+/// worker stopped before its model request, so drop old evidence and metadata
+/// before this credential can run the restored turn.
+fn acceptCredentialReplacement(self: *App, account: ai.llm.Account) !void {
+    self.accounts.dropPrincipalMetadata(account);
+    self.agent.dropAccountEvidence(account);
+    self.adopt(account);
+    try self.mirrorAgentState();
+}
+
+/// Resolve a rejected refresh credential. Reload a replacement from another
+/// instance. Otherwise, leave the account and select the next account.
+///
+/// Both paths replace the credential of `account`, and a replacement another
+/// instance saved can represent another principal in the same account slot.
+/// Nothing that principal produced crosses that boundary, so the evidence goes
+/// before the two paths divide.
+fn rejectCredential(self: *App, account: ai.llm.Account) !void {
+    var maybe_removal_error: ?anyerror = null;
+    const recovered = self.accounts.invalidate(account) catch |err| failure: {
+        maybe_removal_error = err;
+        break :failure false;
+    };
+    self.agent.dropAccountEvidence(account);
+    if (recovered) {
+        // `invalidate` dropped the limits the replaced credential discovered, so
+        // the model resolves again before the session shows it.
+        self.adopt(account);
+        try self.recordEvent(
+            .information,
+            "Pith reloaded the refresh credential that another Pith instance saved. " ++
+                "Try the turn again.",
+            .{},
+        );
+        return self.mirrorAgentState();
+    }
+
+    const maybe_next = self.accounts.firstAuthenticated();
+    if (maybe_next) |next| self.adopt(next) else self.agent.signOut();
+
+    if (maybe_removal_error) |removal_error| try self.recordEvent(
+        .failure,
+        "Pith could not remove the rejected credential for {s} because of error {s}.",
+        .{ account.label(), @errorName(removal_error) },
+    );
+    if (maybe_next) |next| {
+        try self.recordEvent(
+            .information,
+            "Pith signed out of {s}. Pith now uses {s} with {s}.",
+            .{ account.label(), self.agent.model.name, next.label() },
+        );
+    } else {
+        try self.recordEvent(
+            .information,
+            "Pith signed out of {s}. Select an account to sign in.",
+            .{account.label()},
+        );
+        try self.openLoginPicker();
+    }
+    try self.mirrorAgentState();
+}
+
+/// Open the login picker without routing its outcome back through the app.
+fn openLoginPicker(self: *App) !void {
+    var context: ai.command.Context = .{
+        .gpa = self.gpa,
+        .io = self.io,
+        .agent = &self.agent,
+        .accounts = &self.accounts,
+    };
+    if (try ai.command.run(&context, "/login")) |outcome|
+        try self.session.applyOutcome(outcome);
 }
 
 /// Drop `account`'s credentials. A logout of the active account hands the
@@ -1529,8 +1652,7 @@ fn logoutAccount(self: *App, account: ai.llm.Account) !void {
             .{@errorName(err)},
         );
     };
-    self.agent.dropReasoning(account);
-    self.agent.dropCacheEvidence(account);
+    self.agent.dropAccountEvidence(account);
     if (!was_active)
         return self.recordEvent(.information, "Pith signed out of {s}.", .{account.label()});
     if (self.accounts.firstAuthenticated()) |next| {
@@ -1549,17 +1671,9 @@ fn logoutAccount(self: *App, account: ai.llm.Account) !void {
         "Pith signed out of {s}. Select an account to sign in.",
         .{account.label()},
     );
-    // Through the session, not `runCommand`: a route back through `applyOutcome`
-    // cycles the inferred error sets (runCommand → applyOutcome → here). The line
-    // is a literal `/login`, so this context needs no skill registry.
-    var context: ai.command.Context = .{
-        .gpa = self.gpa,
-        .io = self.io,
-        .agent = &self.agent,
-        .accounts = &self.accounts,
-    };
-    if (try ai.command.run(&context, "/login")) |outcome|
-        try self.session.applyOutcome(outcome);
+    // Route through the session. A route through `applyOutcome` cycles the
+    // inferred error sets from `logoutAccount` back to itself.
+    try self.openLoginPicker();
 }
 
 /// Switch the agent to `account` on the model that account ran last, else on its
@@ -1736,17 +1850,66 @@ test "a turn failure the agent named itself reads as a sentence, not an error na
         error.EmptyReply,
         error.IncompleteReply,
         error.TooManyToolRounds,
+        error.CredentialReplaced,
+        error.TokenGrantRejected,
         error.TokenRequestFailed,
+        error.TokenServiceUnavailable,
+        error.StoreBusy,
     }) |err| {
         const text = turnFailureText(err).?;
         try std.testing.expect(std.mem.indexOf(u8, text, " ") != null);
         try std.testing.expect(!std.mem.eql(u8, text, @errorName(err)));
     }
-    // A dead credential is the one failure the user can act on: it names /login.
-    const credentials = turnFailureText(error.TokenRequestFailed).?;
-    try std.testing.expect(std.mem.indexOf(u8, credentials, "/login") != null);
+    // A credential the turn can still use names the retry, not a sign-in.
+    for ([_]anyerror{
+        error.CredentialReplaced,
+        error.TokenServiceUnavailable,
+        error.StoreBusy,
+    }) |err| {
+        const text = turnFailureText(err).?;
+        try std.testing.expect(std.mem.indexOf(u8, text, "Try the turn again.") != null);
+    }
+    // A rejected credential leaves the account resolution to the app.
+    const credentials = turnFailureText(error.TokenGrantRejected).?;
+    try std.testing.expect(std.mem.indexOf(u8, credentials, "signed out") == null);
+    try std.testing.expect(std.mem.indexOf(u8, credentials, "/login") == null);
     // An unmapped failure returns null, and the caller wraps its error name.
     try std.testing.expectEqual(null, turnFailureText(error.SignedOut));
+}
+
+test "a grant rejection refuses an account without a refresh credential" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    const client = ai.provider.Client.init(gpa, io, .{ .anthropic_api = "key" }, .{});
+    var app: App = undefined;
+    app.gpa = gpa;
+    app.io = io;
+    app.agent = ai.Agent.init(gpa, io, client, .{
+        .model = anthropic_default,
+        .system = "",
+        .retry = .{},
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+    app.session.account_shown = .anthropic_api;
+    app.session.beginTurn(1);
+
+    var result: WorkerResult = .{
+        .outcome = .{
+            .receipt = zero_receipt,
+            .disposition = .credential_rejected,
+        },
+        .error_text = null,
+    };
+    try std.testing.expectError(
+        error.UnexpectedTokenGrantRejection,
+        app.finishWorkerResult(&result),
+    );
+    try std.testing.expectEqual(ai.llm.Account.anthropic_api, app.activeAccount().?);
 }
 
 test "OAuth login cancellation escapes without a failure notice" {
@@ -1762,6 +1925,36 @@ test "OAuth login cancellation escapes without a failure notice" {
     const block_count = app.session.transcript.blocks().len;
     try std.testing.expectError(error.Canceled, app.reportLoginFailure(error.Canceled));
     try std.testing.expectEqual(block_count, app.session.transcript.blocks().len);
+}
+
+test "a login the provider refused reads as a sentence, not an error name" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.gpa = gpa;
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+
+    // A rejection names the one action that helps. An unavailable service does
+    // not, because the same sign-in works later.
+    try app.reportLoginFailure(error.TokenGrantRejected);
+    try std.testing.expectEqualStrings(
+        "The provider rejected the authorization. Start the sign-in again.",
+        app.session.notice.?.content,
+    );
+    try app.reportLoginFailure(error.TokenServiceUnavailable);
+    try std.testing.expectEqualStrings(
+        "The provider credential service is not available. Try the sign-in again later.",
+        app.session.notice.?.content,
+    );
+    // A failure with no single cause still wraps its error name in a sentence.
+    try app.reportLoginFailure(error.TokenRequestFailed);
+    try std.testing.expectEqualStrings(
+        "Pith could not sign in because of error TokenRequestFailed.",
+        app.session.notice.?.content,
+    );
 }
 
 test "OAuth callback bounds have friendly failure notices" {
@@ -3769,6 +3962,344 @@ test "the logout of the last account signs out and opens the login picker" {
     try std.testing.expectEqualStrings("Select an account to sign in", picker.title);
     try std.testing.expectEqual(std.enums.values(ai.llm.Account).len, picker.options.len);
     try std.testing.expectEqualStrings("Anthropic Subscription", picker.options[0]);
+}
+
+test "a principal replacement drops old evidence before the restored turn" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(home);
+
+    var store = try tmp.dir.createDirPathOpen(io, ".pith", .{});
+    store.close(io);
+    try tmp.dir.writeFile(io, .{
+        .sub_path = ".pith/auth.json",
+        .data =
+        \\{ "anthropic_subscription":
+        \\    { "access": "replacement", "refresh": "replacement",
+        \\      "expires_ms": 4102444800000,
+        \\      "account_uuid": "other", "organization_uuid": "other" } }
+        ,
+    });
+
+    var app: App = undefined;
+    app.gpa = gpa;
+    app.io = io;
+    app.default_models = .{};
+    app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
+    defer app.accounts.deinit();
+    app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_subscription), .{
+        .model = anthropic_default,
+        .system = "",
+        .retry = .{},
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+    app.session.account_shown = .anthropic_subscription;
+    app.session.beginTurn(1);
+    app.state = .inert(gpa, io);
+
+    const replay: ai.llm.Item.Reasoning.Replay = .{ .anthropic_subscription = .{
+        .signature = .{ .text = "thought", .signature = "proof" },
+    } };
+    try app.agent.items.append(gpa, .{ .reasoning = .{ .replay = try replay.dupe(gpa) } });
+    app.agent.stats.quota = .{ .primary = .{ .used_percent = 25, .window_minutes = 300 } };
+
+    var result: WorkerResult = .{
+        .outcome = .{
+            .receipt = zero_receipt,
+            .disposition = .credential_replaced,
+        },
+        .error_text = try gpa.dupe(u8, turnFailureText(error.CredentialReplaced).?),
+    };
+    defer app.freeWorkerResult(&result);
+    try app.finishWorkerResult(&result);
+
+    try std.testing.expectEqual(@as(usize, 0), app.agent.items.items.len);
+    try std.testing.expect(app.agent.stats.quota == null);
+    try std.testing.expectEqual(ai.llm.Account.anthropic_subscription, app.activeAccount().?);
+    try std.testing.expectEqual(ai.llm.Account.anthropic_subscription, app.session.account_shown.?);
+    try std.testing.expect(app.session.mode == .prompt);
+    const blocks = app.session.transcript.blocks();
+    try std.testing.expectEqual(@as(usize, 1), blocks.len);
+    try std.testing.expect(blocks[0].event.is_error);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        blocks[0].event.text.items,
+        "Try the turn again.",
+    ) != null);
+}
+
+test "token request failures keep the credential before a grant rejection removes it" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(home);
+
+    var store = try tmp.dir.createDirPathOpen(io, ".pith", .{});
+    store.close(io);
+    try tmp.dir.writeFile(io, .{
+        .sub_path = ".pith/auth.json",
+        .data =
+        \\{ "anthropic_subscription":
+        \\    { "access": "a", "refresh": "r", "expires_ms": 4102444800000 } }
+        ,
+    });
+
+    var app: App = undefined;
+    app.gpa = gpa;
+    app.io = io;
+    app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
+    defer app.accounts.deinit();
+    app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_subscription), .{
+        .model = anthropic_default,
+        .system = "",
+        .retry = .{},
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+    app.session.account_shown = .anthropic_subscription;
+    app.state = .inert(gpa, io);
+
+    for ([_]anyerror{
+        error.TokenRequestFailed,
+        error.TokenServiceUnavailable,
+    }, 1..) |failure, generation| {
+        app.session.beginTurn(@intCast(generation));
+        var result: WorkerResult = .{
+            .outcome = .{
+                .receipt = zero_receipt,
+                .disposition = .{ .failed = failure },
+            },
+            .error_text = try gpa.dupe(u8, turnFailureText(failure).?),
+        };
+        defer app.freeWorkerResult(&result);
+        try app.finishWorkerResult(&result);
+
+        try std.testing.expect(app.accounts.isAuthenticated(.anthropic_subscription));
+        try std.testing.expectEqual(
+            ai.llm.Account.anthropic_subscription,
+            app.activeAccount().?,
+        );
+        try std.testing.expectEqual(
+            ai.llm.Account.anthropic_subscription,
+            app.session.account_shown.?,
+        );
+    }
+    {
+        var file = (try ai.json_store.open(gpa, io, app.accounts.anthropic_auth.path)).?;
+        defer file.deinit();
+        try std.testing.expect(file.entry("anthropic_subscription") != null);
+    }
+    try std.testing.expectEqual(@as(usize, 2), app.session.transcript.blocks().len);
+
+    app.session.beginTurn(3);
+    {
+        var result: WorkerResult = .{
+            .outcome = .{
+                .receipt = zero_receipt,
+                .disposition = .credential_rejected,
+            },
+            .error_text = try gpa.dupe(u8, turnFailureText(error.TokenGrantRejected).?),
+        };
+        defer app.freeWorkerResult(&result);
+        try app.finishWorkerResult(&result);
+    }
+
+    try std.testing.expect(!app.accounts.isAuthenticated(.anthropic_subscription));
+    try std.testing.expect(app.agent.client == null);
+    try std.testing.expect(app.session.account_shown == null);
+    var file = (try ai.json_store.open(gpa, io, app.accounts.anthropic_auth.path)).?;
+    defer file.deinit();
+    try std.testing.expect(file.entry("anthropic_subscription") == null);
+
+    const blocks = app.session.transcript.blocks();
+    try std.testing.expectEqual(@as(usize, 4), blocks.len);
+    try std.testing.expect(blocks[2].event.is_error);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        blocks[2].event.text.items,
+        "provider rejected",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(u8, blocks[2].event.text.items, "/login") == null);
+    try std.testing.expectEqualStrings(
+        "Pith signed out of Anthropic Subscription. Select an account to sign in.",
+        blocks[3].event.text.items,
+    );
+    try std.testing.expect(app.session.mode == .picking);
+    try std.testing.expectEqualStrings(
+        "Anthropic Subscription",
+        app.session.mode.picking.picker.options[0],
+    );
+}
+
+test "a replacement saved before invalidation keeps the account active" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(home);
+
+    var store = try tmp.dir.createDirPathOpen(io, ".pith", .{});
+    store.close(io);
+    try tmp.dir.writeFile(io, .{
+        .sub_path = ".pith/auth.json",
+        .data =
+        \\{ "anthropic_subscription":
+        \\    { "access": "old_access", "refresh": "old_refresh",
+        \\      "expires_ms": 4102444800000 } }
+        ,
+    });
+
+    var app: App = undefined;
+    app.gpa = gpa;
+    app.io = io;
+    app.default_models = .{};
+    app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
+    defer app.accounts.deinit();
+    // A model an account-specific limit resolved. The replaced credential owns
+    // that limit, so the reload must resolve the model again.
+    var discovered = anthropic_default;
+    discovered.context_window = 1;
+    app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_subscription), .{
+        .model = discovered,
+        .system = "",
+        .retry = .{},
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+    app.session.account_shown = .anthropic_subscription;
+    app.session.beginTurn(1);
+    app.state = .inert(gpa, io);
+
+    try ai.json_store.save(gpa, io, app.accounts.anthropic_auth.path, "anthropic_subscription", .{
+        .access = "new_access",
+        .refresh = "new_refresh",
+        .expires_ms = 4102444800000,
+    }, .{});
+
+    // The replacement can belong to another principal, so this proof of the
+    // replaced credential must not survive the reload.
+    const replay: ai.llm.Item.Reasoning.Replay = .{ .anthropic_subscription = .{
+        .signature = .{ .text = "thought", .signature = "proof" },
+    } };
+    try app.agent.items.append(gpa, .{ .reasoning = .{ .replay = try replay.dupe(gpa) } });
+
+    var result: WorkerResult = .{
+        .outcome = .{
+            .receipt = zero_receipt,
+            .disposition = .credential_rejected,
+        },
+        .error_text = try gpa.dupe(u8, turnFailureText(error.TokenGrantRejected).?),
+    };
+    defer app.freeWorkerResult(&result);
+    try app.finishWorkerResult(&result);
+
+    try std.testing.expect(app.accounts.isAuthenticated(.anthropic_subscription));
+    try std.testing.expectEqual(
+        ai.llm.Account.anthropic_subscription,
+        app.activeAccount().?,
+    );
+    try std.testing.expectEqualStrings(
+        "new_refresh",
+        app.accounts.anthropic_auth.tokens.?.refresh,
+    );
+    try std.testing.expectEqual(@as(usize, 0), app.agent.items.items.len);
+    // The limit of the replaced credential is gone from the model the session
+    // shows, exactly as an OpenAI context window discovered for that principal.
+    try std.testing.expectEqual(anthropic_default.context_window, app.agent.model.context_window);
+    try std.testing.expectEqual(
+        anthropic_default.context_window,
+        app.session.model_shown.context_window,
+    );
+    try std.testing.expect(app.session.mode == .prompt);
+
+    const blocks = app.session.transcript.blocks();
+    try std.testing.expectEqual(@as(usize, 2), blocks.len);
+    try std.testing.expect(std.mem.indexOf(u8, blocks[0].event.text.items, "signed out") == null);
+    try std.testing.expectEqualStrings(
+        "Pith reloaded the refresh credential that another Pith instance saved. " ++
+            "Try the turn again.",
+        blocks[1].event.text.items,
+    );
+}
+
+test "a rejected refresh credential hands the session to another account" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(home);
+
+    var store = try tmp.dir.createDirPathOpen(io, ".pith", .{});
+    store.close(io);
+    try tmp.dir.writeFile(io, .{
+        .sub_path = ".pith/auth.json",
+        .data =
+        \\{ "anthropic_subscription":
+        \\    { "access": "a", "refresh": "r", "expires_ms": 4102444800000 } }
+        ,
+    });
+
+    var app: App = undefined;
+    app.gpa = gpa;
+    app.io = io;
+    app.default_models = .{};
+    app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{ .openai = "sk-openai" });
+    defer app.accounts.deinit();
+    app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_subscription), .{
+        .model = anthropic_default,
+        .system = "",
+        .retry = .{},
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+    app.session.account_shown = .anthropic_subscription;
+    app.session.beginTurn(1);
+    app.state = .inert(gpa, io);
+
+    var result: WorkerResult = .{
+        .outcome = .{
+            .receipt = zero_receipt,
+            .disposition = .credential_rejected,
+        },
+        .error_text = try gpa.dupe(u8, turnFailureText(error.TokenGrantRejected).?),
+    };
+    defer app.freeWorkerResult(&result);
+    try app.finishWorkerResult(&result);
+
+    try std.testing.expect(!app.accounts.isAuthenticated(.anthropic_subscription));
+    try std.testing.expectEqual(ai.llm.Account.openai_api, app.activeAccount().?);
+    try std.testing.expectEqual(ai.llm.Account.openai_api, app.session.account_shown.?);
+    try std.testing.expectEqualStrings(openai_default.name, app.agent.model.name);
+    try std.testing.expect(app.session.mode == .prompt);
+
+    const blocks = app.session.transcript.blocks();
+    try std.testing.expectEqual(@as(usize, 2), blocks.len);
+    try std.testing.expect(std.mem.indexOf(u8, blocks[0].event.text.items, "/login") == null);
+    try std.testing.expectEqualStrings(
+        "Pith signed out of Anthropic Subscription. " ++
+            "Pith now uses gpt-5.6-sol with OpenAI API.",
+        blocks[1].event.text.items,
+    );
 }
 
 test "an invoked skill records a compact marker and keeps its task visible" {

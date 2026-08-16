@@ -21,6 +21,8 @@ io: std.Io,
 timeouts: net.Timeouts,
 path: []const u8,
 tokens: ?oauth.Tokens,
+/// Whether a refreshed credential still needs a store retry.
+save_pending: bool = false,
 
 pub fn init(gpa: std.mem.Allocator, io: std.Io, home: []const u8, timeouts: net.Timeouts) !Auth {
     const path = try std.fs.path.join(gpa, &.{ home, ".pith", "auth.json" });
@@ -73,6 +75,11 @@ fn exchangeRedirect(
 /// entry from `auth.json`, and keep every other account's entry.
 pub fn logout(self: *Auth) !void {
     return auth.logout(self, account_key);
+}
+
+/// Forget a rejected refresh credential, or reload its stored replacement.
+pub fn invalidate(self: *Auth) !bool {
+    return auth.invalidate(self, account_key);
 }
 
 test "load distinguishes signed out from corrupt credentials" {

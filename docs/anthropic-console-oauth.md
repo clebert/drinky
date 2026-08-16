@@ -19,6 +19,20 @@ by the authorize host and by what happens after the token exchange.
 pith runs the subscription flow as its subscription account and the Console flow as its
 `anthropic_console` account.
 
+## The subscription profile
+
+Claude Code reads the subscription identity after the token exchange:
+
+```text
+GET https://api.anthropic.com/api/oauth/profile
+Authorization: Bearer <access token>
+```
+
+The response includes `account.uuid` and `organization.uuid`. pith stores these two values with the
+credential. It does not store the profile email. Matching values permit silent token rotation. A
+different or missing value stops the model request before pith discards the old account evidence.
+A profile failure does not fail the login. The credential then uses the safe missing-value rule.
+
 ## The Console flow
 
 1. Open the authorize URL in the browser. The user completes any company SSO on that page. pith
