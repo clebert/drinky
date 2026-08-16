@@ -13,8 +13,8 @@ decision already taken, or a dependency on another entry. Module layout and exte
 - `TODO.md` is the inbox. It is git-ignored, and the user writes loose notes into it.
 - Change this file only when the user asks for it, or to remove an entry that you landed. Never add,
   reorder, or reword an entry as a side task.
-- Interview the user before you write. Ask at most three questions per round, and use as many rounds
-  as you need. Stop when nothing is unclear. Never invent a priority.
+- Interview the user before you write. Use the `interview` skill and its form. Ask one question per
+  message, and ask as many as you need. Stop when nothing is unclear. Never invent a priority.
 - Delete an entry when it lands, and update `FEATURES.md`. Git history keeps the entry.
 - Delete a promoted note from `TODO.md`, so the inbox holds unshaped notes alone.
 - A feature line is the sentence that goes into `FEATURES.md` once it lands.
