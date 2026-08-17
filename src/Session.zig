@@ -29,6 +29,9 @@ transcript: Transcript,
 notice: ?ai.command.Outcome.Message,
 /// Whether one unchanged idle Enter can pass the stale-cache warning.
 cache_confirmation: bool,
+/// Whether one unchanged Enter can send a refused command line to the model as
+/// typed. The prompt sends it as a message, and a turn queues it as steering.
+message_confirmation: bool,
 editor: ui.Editor,
 /// The primary-screen conversation renderer remains untouched while a page is open.
 view: terminal.View,
@@ -237,6 +240,7 @@ pub fn init(
         .transcript = Transcript.init(gpa),
         .notice = null,
         .cache_confirmation = false,
+        .message_confirmation = false,
         .editor = ui.Editor.init(gpa),
         .view = terminal.View.init(gpa, writer),
         .page_view = terminal.View.init(gpa, writer),
@@ -283,6 +287,7 @@ pub fn resetConversation(self: *Session) void {
     self.transcript.truncate(0);
     self.clearNotice();
     self.cache_confirmation = false;
+    self.cancelMessageConfirmation();
     self.stats_shown = .{};
     self.clearSteering();
     self.view.resetScreen();
@@ -316,8 +321,38 @@ pub fn takeCacheConfirmation(self: *Session) bool {
     return confirmed;
 }
 
-/// Replace the transient notice and take ownership of `notice.content`.
+/// Let one Enter send a refused command line to the model as typed. The prompt and
+/// a running turn both offer it, because a slash line can be plain text.
+pub fn armMessageConfirmation(self: *Session) void {
+    std.debug.assert(self.mode == .prompt or self.mode == .turn);
+    self.message_confirmation = true;
+}
+
+/// Cancel the send-as-a-message offer. The row that named it goes at the same time:
+/// a key clears it in the app, a turn end clears it in `endTurn`, and a later notice
+/// drops the offer in `setNotice`. A row that outlives its offer asks for an Enter
+/// that does nothing.
+pub fn cancelMessageConfirmation(self: *Session) void {
+    self.message_confirmation = false;
+}
+
+/// Consume the one-shot send-as-a-message confirmation.
+pub fn takeMessageConfirmation(self: *Session) bool {
+    const confirmed = self.message_confirmation;
+    self.message_confirmation = false;
+    return confirmed;
+}
+
+/// Replace the transient notice and take ownership of `notice.content`. The new row
+/// replaces the row that named a send-as-a-message offer, so the offer goes with it.
+/// Every caller that arms one arms after it reports its row, so this drop never eats
+/// the offer that belongs to the new row.
+///
+/// A notice that a caller raises while a turn runs must name that turn, because
+/// `endTurn` clears the footer. Today only a key raises one there. A writer that
+/// reports from an event instead must first give `endTurn` a rule to keep it.
 fn setNotice(self: *Session, notice: ai.command.Outcome.Message) void {
+    self.cancelMessageConfirmation();
     self.clearNotice();
     self.notice = notice;
     self.dirty = true;
@@ -440,7 +475,9 @@ fn applyToolResult(self: *Session, result: TurnEvent.Payload.ToolResult) !void {
 /// or open its picker.
 pub fn applyOutcome(self: *Session, outcome: ai.command.Outcome) !void {
     switch (outcome) {
-        .notice => |notice| self.setNotice(notice),
+        // A refusal is a notice whose line stays in the editor. The app owns that
+        // rule, because the session never clears the editor for a command.
+        .notice, .refusal => |message| self.setNotice(message),
         .event => |event| {
             defer self.gpa.free(event.content);
             try self.transcript.append(.event, event.severity == .failure, event.content);
@@ -632,6 +669,7 @@ fn steeringView(self: *Session) ![]const []const u8 {
 pub fn beginTurn(self: *Session, generation: u64) void {
     self.transcript.endMessage();
     self.cache_confirmation = false;
+    self.cancelMessageConfirmation();
     self.mode = .{ .turn = .{
         .generation = generation,
         .progress_sequence_applied = 0,
@@ -760,10 +798,19 @@ pub fn branch(self: *const Session) ?[]const u8 {
     return self.branch_buffer[0..self.branch_length];
 }
 
-/// Free the finished turn's tool state and return to prompt mode.
+/// Free the finished turn's tool state and return to prompt mode. The end of a turn
+/// is no key event, so it must clear the footer and the send-as-a-message offer
+/// here. Only a key that arrives during the turn can put a notice on the screen, and
+/// both such notices name that turn: the offer to queue a refused line, and the
+/// restriction on a command that a turn cannot host. Neither one is true afterward.
+///
+/// The refused line stays in the editor. The next Enter reports the state that the
+/// prompt has.
 pub fn endTurn(self: *Session) void {
     if (self.activeTurn()) |turn| self.freeTurn(turn);
     self.dropTurnOrigin();
+    self.clearNotice();
+    self.cancelMessageConfirmation();
     self.mode = .prompt;
 }
 
@@ -1052,6 +1099,70 @@ test "a large bracketed paste collapses to a marker through the real pipeline" {
     const expanded = try editor.expanded(.whole_prompt);
     defer gpa.free(expanded);
     try std.testing.expectEqualStrings(payload, expanded);
+}
+
+// The app cancels a send-as-a-message offer on every key that is not an Enter, but
+// a turn end is no key event. An abnormal end also returns uncommitted drafts to
+// the editor, so an offer that survived would name a line that left the screen.
+// Every turn end runs through `endTurn`, so the drop belongs there. The footer goes
+// with it: a notice that a key raised during the turn describes that turn, so it is
+// no longer true at the prompt.
+test "a turn end drops the send-as-a-message confirmation and the footer" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    defer session.deinit();
+
+    session.beginTurn(1);
+    try session.applyOutcome(try ai.command.Outcome.reportNotice(
+        gpa,
+        .warning,
+        "Enter: Queue as a message · Pith does not recognize the command /nope.",
+        .{},
+    ));
+    session.armMessageConfirmation();
+    try session.abortTurn();
+
+    try std.testing.expect(session.mode == .prompt);
+    try std.testing.expect(!session.takeMessageConfirmation());
+    try std.testing.expect(session.notice == null);
+
+    // The restriction row takes the same path. It armed no offer, and it names the
+    // turn that just ended, so it must not stay on the footer either.
+    session.beginTurn(2);
+    try session.applyOutcome(try ai.command.Outcome.reportNotice(
+        gpa,
+        .warning,
+        "The command /model cannot run while a turn runs.",
+        .{},
+    ));
+    try session.abortTurn();
+    try std.testing.expect(session.notice == null);
+}
+
+// A later row replaces the row that named an offer, so the offer cannot outlive it.
+// Otherwise Enter sends a line that no row on the screen offers.
+test "a new notice drops the send-as-a-message confirmation" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    defer session.deinit();
+
+    session.armMessageConfirmation();
+    try session.applyOutcome(try ai.command.Outcome.reportNotice(
+        gpa,
+        .failure,
+        "Pith could not read the file.",
+        .{},
+    ));
+
+    try std.testing.expect(!session.takeMessageConfirmation());
+    try std.testing.expectEqualStrings(
+        "Pith could not read the file.",
+        session.notice.?.content,
+    );
 }
 
 test "a notice replaces its predecessor without entering the transcript" {

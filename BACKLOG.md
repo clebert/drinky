@@ -22,11 +22,6 @@ decision already taken, or a dependency on another entry. Module layout and exte
 
 ## Bugs
 
-- **A slash line with extra text reaches the model** — a line that starts with a command name plus
-  more text goes to the provider. _No line that starts with a slash must reach the model. The
-  whole-line rule went too far, so report the line locally instead. This entry implements the
-  Command refusal prerequisite: keep unavailable command text in the editor and name the active
-  restriction during a turn, retry, or review. `/skill:name` keeps its trailing task text._
 - **The agent retries a spent usage limit** — a 429 that reports a spent allowance, or asks for a
   wait past the backoff cap, still costs three tries. _Report the failure at once on both signals:
   an OpenAI `usage_limit_reached` body, and a `retry-after` longer than `backoff_ms_max`. No wait
@@ -60,10 +55,7 @@ decision already taken, or a dependency on another entry. Module layout and exte
 - **The same padding everywhere** — the editor and the reasoning block carry the padding of a
   message box, so a copy of the rows matches the boxes at the same window width. _Pith cannot
   intercept a terminal copy, so the painted rows must line up._
-- **A reworked picker** — the picker rolls over from the last row to the first and keeps one clear
-  scroll rule.
-- **An unknown command opens the command picker** — instead of a footer notice alone. _This depends
-  on the slash-line bug, which routes every slash line locally._
+- **A reworked picker** — the picker rolls over from the last row to the first.
 - **Pick the provider first, then the model** — so neither list grows too long. _`/model` and
   `/login` list account and model together today._
 - **A parked message and a message history** — the user parks the editor content to run a command,
@@ -80,8 +72,6 @@ decision already taken, or a dependency on another entry. Module layout and exte
   submitted prompt or the last answer, with no need to cancel. _Pith already retains the submitted
   prompt's rich draft for the whole turn._
 - **A diff view for an edit** — an `edit` result shows what changed instead of a stat line alone.
-- **Tab completion** — Tab completes a partial slash command and lists the candidates when several
-  match. _Tab currently decodes as ctrl-i._
 - **Configurable transcript window** — the 8-page transcript window moves into `config.json` and
   trades scrollback retention against per-frame redraw cost. _Clamp to at least one page._
 - **A retry is recorded in the transcript** — a transcript event names each retry attempt and its
@@ -101,10 +91,10 @@ decision already taken, or a dependency on another entry. Module layout and exte
   shared operation, then applies active context projection.
 - **`/review`** — a bounded workflow reviews pending changes with a fresh reviewer, a persistent
   judge, and a fixer, and it asks the user only about an open product choice. _The plan is
-  `docs/review-mode.md`. It depends on the three preceding entries and the slash-line bug. Store
-  three account-model-effort role choices per project. Every role keeps the complete tool registry.
-  The reviewer and judge prompts prohibit mutation, but `bash` remains unrestricted. It is not a
-  subagent system, so one request runs at a time with no nesting._
+  `docs/review-mode.md`. It depends on the three preceding entries. Store three account-model-effort
+  role choices per project. Every role keeps the complete tool registry. The reviewer and judge
+  prompts prohibit mutation, but `bash` remains unrestricted. It is not a subagent system, so one
+  request runs at a time with no nesting._
 - **Save and resume conversations** — a conversation reopens after a restart and does not start
   empty. _Persist the per-turn cost ledger with it, since history items carry no cost. Persist the
   prompt-cache write times too, so a resume knows what retention is left. Generate the OpenAI cache
@@ -136,9 +126,6 @@ decision already taken, or a dependency on another entry. Module layout and exte
   `/model`. Cache warming is the rival approach: replay the last request with `max_tokens: 1` just
   under the TTL. This buys a near-free read instead of the 1h write premium, and it pays off once
   the main agent sits idle for minutes (cf. claude-thermos)._
-- **Custom prompts** — user-maintained prompt templates run as slash commands with argument
-  substitution. _The whole-line rule special-cases the `skill:` prefix today. A second
-  argument-taking command must move that rule into the registry `Entry`._
 - **Runtime model catalog** — an optional `~/.pith/models.json` extends the compiled model table and
   adds an OpenAI-compatible endpoint, without a rebuild. _Compiled defaults stay authoritative, so a
   known model always has a known context window. The file patches or adds alone. The endpoint form

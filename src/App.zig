@@ -1084,6 +1084,11 @@ fn handleKey(self: *App, event: *const terminal.Input.Key) !void {
     // action clears both the notice and its one-shot confirmation.
     const confirms_cache = self.session.mode == .prompt and event.* == .enter;
     if (!confirms_cache) self.session.cancelCacheConfirmation();
+    // A refused command line goes to the model on the next Enter alone. The prompt
+    // sends it, and a turn queues it, so both modes can confirm.
+    const confirms_message = confirms_cache or
+        (self.session.mode == .turn and event.* == .enter);
+    if (!confirms_message) self.session.cancelMessageConfirmation();
     // Clear before the key routes, so a notice produced by this action survives it.
     self.session.clearNotice();
     switch (self.session.mode) {
@@ -1168,14 +1173,30 @@ fn clearOrCancel(self: *App) !void {
 }
 
 /// Enter during a turn: queue the line as a steering message, shown at once and
-/// carried to the worker to fold into the turn. A slash command cannot run
-/// mid-turn (it can open a picker, which a turn cannot host), so it stays in the
-/// editor to send once the turn ends.
+/// carried to the worker to fold into the turn. A slash line is never steering,
+/// and no command can run mid-turn, because a command can open a picker that a
+/// turn cannot host. Such a line takes the shared refusal path instead.
+///
+/// The registry decides first. A line it cannot run as typed keeps its own
+/// refusal, because an unknown name and an unwanted tail stay unrunnable after the
+/// turn ends. That refusal arms one Enter to queue the line as steering, so plain
+/// text that starts with a slash still reaches the turn. A runnable command has no
+/// such arm, because the next Enter runs it once the turn ends. The check itself
+/// runs no command.
 fn submitSteering(self: *App) !void {
-    if (self.session.editor.blank()) return;
+    if (self.session.editor.blank()) {
+        self.session.cancelMessageConfirmation();
+        return;
+    }
     const text = try self.session.editor.expanded(.whole_prompt);
     defer self.gpa.free(text);
-    if (ai.command.parse(text) != null) return;
+    if (!self.session.takeMessageConfirmation()) {
+        if (ai.command.parse(text)) |name| {
+            if (try self.checkCommand(text)) |refusal|
+                return self.armMessageSend(refusal, "Queue as a message");
+            return self.refuseCommand(name, "while a turn runs");
+        }
+    }
     // Reserve the mirror slot before the channel push, so the push is the only
     // fallible step before the draft moves in. If the push fails, the editor is
     // untouched. Once it succeeds, the literal-edge-trimmed draft moves into the
@@ -1372,11 +1393,13 @@ fn nowNs(self: *App) i96 {
 }
 
 /// Enter while idle: run a command line locally, or start a turn over the prompt.
-/// A command line holds its name alone, so a message that starts with a word like
-/// `/new` still reaches the model.
+/// Every line that starts with a slash is a command line, so Pith reads it locally
+/// first. A line the registry refuses stays in the editor and arms one Enter, which
+/// sends that line to the model as typed.
 fn submit(self: *App) !void {
     if (self.session.editor.blank()) {
         self.session.cancelCacheConfirmation();
+        self.session.cancelMessageConfirmation();
         return;
     }
     const maybe_cache_risk = self.agent.cacheRisk();
@@ -1391,11 +1414,51 @@ fn submitWithCacheRisk(self: *App, maybe_cache_risk: ?*const ai.Agent.CacheRisk)
     defer self.gpa.free(text);
     self.session.dirty = true;
 
-    if (try self.dispatchCommand(text)) |outcome| {
+    // A confirmed line skips the registry and reaches the model as typed. Without
+    // that confirmation, the registry decides first: a line it cannot run keeps its
+    // own refusal and arms the next Enter, so plain text that starts with a slash
+    // still has a way out.
+    const message_confirmed = self.session.takeMessageConfirmation();
+    if (!message_confirmed) {
+        if (try self.checkCommand(text)) |refusal|
+            return self.armMessageSend(refusal, "Send as a message");
+        if (try self.dispatchCommand(text)) |outcome|
+            return self.applySubmittedCommand(outcome, maybe_cache_risk);
+    }
+    if (!self.signedIn()) {
+        self.session.cancelCacheConfirmation();
+        self.session.editor.clear();
+        return self.reportNotice(
+            .failure,
+            "Sign in with /login before you send a message.",
+            .{},
+        );
+    }
+    if (try self.preflightModelSubmit(maybe_cache_risk)) {
+        const base = try self.startUserTurn(text);
+        // The turn is live and owns its own copy. Retain the prompt's rich draft
+        // so an abnormal exit that commits nothing can return it. Leave the
+        // editor empty for in-progress text. Both steps are infallible, so the
+        // rollback above stays correct.
+        var prompt = self.session.editor.detachTrimmed();
+        self.session.retainTurnPrompt(&prompt, base);
+    } else if (message_confirmed) {
+        // The stale-cache warning stopped this send and armed its own Enter. Keep
+        // the message confirmation, or the next Enter falls back into the registry
+        // and both warnings alternate forever.
+        self.session.armMessageConfirmation();
+    }
+}
+
+/// Apply the outcome of a submitted command line.
+fn applySubmittedCommand(
+    self: *App,
+    outcome: ai.command.Outcome,
+    maybe_cache_risk: ?*const ai.Agent.CacheRisk,
+) !void {
+    switch (outcome) {
         // A skill line starts its own turn, so it keeps the editor's rich draft.
-        // Every other command clears the editor first.
-        if (outcome == .prompt) {
-            const prompt = outcome.prompt;
+        .prompt => |prompt| {
             defer prompt.deinit(self.gpa);
             if (!self.signedIn()) {
                 self.session.cancelCacheConfirmation();
@@ -1410,28 +1473,38 @@ fn submitWithCacheRisk(self: *App, maybe_cache_risk: ?*const ai.Agent.CacheRisk)
                 var draft = self.session.editor.detachTrimmed();
                 self.session.retainTurnPrompt(&draft, base);
             }
-        } else {
+        },
+        // The registry accepted the line, so this refusal is a command that broke.
+        // Another try is the way forward, so the line stays in the editor and no
+        // confirmation arms.
+        .refusal => {
+            self.session.cancelCacheConfirmation();
+            try self.applyOutcome(outcome);
+        },
+        // Every other command clears the editor first.
+        else => {
             self.session.cancelCacheConfirmation();
             self.session.editor.clear();
             try self.applyOutcome(outcome);
-        }
-    } else if (!self.signedIn()) {
-        self.session.cancelCacheConfirmation();
-        self.session.editor.clear();
-        try self.reportNotice(
-            .failure,
-            "Sign in with /login before you send a message.",
-            .{},
-        );
-    } else if (try self.preflightModelSubmit(maybe_cache_risk)) {
-        const base = try self.startUserTurn(text);
-        // The turn is live and owns its own copy. Retain the prompt's rich draft
-        // so an abnormal exit that commits nothing can return it. Leave the
-        // editor empty for in-progress text. Both steps are infallible, so the
-        // rollback above stays correct.
-        var prompt = self.session.editor.detachTrimmed();
-        self.session.retainTurnPrompt(&prompt, base);
+        },
     }
+}
+
+/// Report a registry refusal and arm one Enter to send the line to the model as
+/// typed. `action` names what that Enter does, so the row reads as a control hint.
+/// The refusal keeps the line in the editor, which the arm needs, because the
+/// confirmation drops on every other key, at the end of a turn, and under any later
+/// notice that replaces the row.
+fn armMessageSend(
+    self: *App,
+    refusal: ai.command.Outcome.Message,
+    action: []const u8,
+) !void {
+    defer self.gpa.free(refusal.content);
+    self.session.cancelCacheConfirmation();
+    // Arm last, so a failed notice leaves no offer that the row never showed.
+    try self.reportNotice(refusal.severity, "Enter: {s} · {s}", .{ action, refusal.content });
+    self.session.armMessageConfirmation();
 }
 
 /// Stop the first stale-cache submission and arm one confirmation for the
@@ -1531,16 +1604,29 @@ fn reserveTurnGeneration(self: *App) !u64 {
     return self.turn_generation;
 }
 
-/// Run `line` as a command. Null reports that the line is a message.
-fn dispatchCommand(self: *App, line: []const u8) !?ai.command.Outcome {
-    var context: ai.command.Context = .{
+/// The ambient state that every command handler reads.
+fn commandContext(self: *App) ai.command.Context {
+    return .{
         .gpa = self.gpa,
         .io = self.io,
         .agent = &self.agent,
         .accounts = &self.accounts,
         .skill_registry = &self.skills,
     };
+}
+
+/// Run `line` as a command. Null reports that the line is a message.
+fn dispatchCommand(self: *App, line: []const u8) !?ai.command.Outcome {
+    var context = self.commandContext();
     return ai.command.run(&context, line);
+}
+
+/// The registry refusal for `line`, with no command run. Null reports that the
+/// registry can run the line as typed, so an active state restriction owns the
+/// refusal instead.
+fn checkCommand(self: *App, line: []const u8) !?ai.command.Outcome.Message {
+    var context = self.commandContext();
+    return ai.command.check(&context, line);
 }
 
 /// Handle a slash command locally and apply its outcome. Every caller passes a
@@ -1808,6 +1894,15 @@ fn logoutAccount(self: *App, account: ai.llm.Account) !void {
 /// account or read it from the registry.
 fn adopt(self: *App, account: ai.llm.Account) void {
     self.agent.switchTo(self.accounts.client(account).?, self.accountModel(account));
+}
+
+/// The shared refusal path for a command that the active state does not allow.
+/// Pith keeps the command text in the editor, sends nothing to the model, and
+/// opens no picker. The notice names the command and the restriction, and it
+/// warns rather than reports a failure, because a later Enter still runs the line.
+fn refuseCommand(self: *App, name: []const u8, restriction: []const u8) !void {
+    const refusal = try ai.command.refuse(self.gpa, name, restriction);
+    try self.session.applyOutcome(.{ .refusal = refusal });
 }
 
 /// Replace the bottom footer with one transient notice.
@@ -3465,10 +3560,10 @@ test "recall of literal-edge-trimmed steering rejoins without edge spaces" {
     try std.testing.expectEqualStrings("a\n\nb", app.session.editor.visible());
 }
 
-// A slash command cannot run mid-turn. Enter must leave it in the editor to
-// send once the turn ends and must never queue it as prompt text for the model. A
-// sentence that only starts with a command name is a message and must queue.
-test "mid-turn Enter queues a message but never a command or a blank line" {
+// A slash command cannot run mid-turn. Enter must leave the whole line in the
+// editor, report the restriction, and never queue the line as prompt text for the
+// model. A line with no leading slash is a message and must queue.
+test "mid-turn Enter queues a message but refuses a slash line or a blank line" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -3490,20 +3585,63 @@ test "mid-turn Enter queues a message but never a command or a blank line" {
     try app.session.editor.insert("/model");
     try app.submitSteering();
     try std.testing.expectEqualStrings("/model", app.session.editor.visible());
+    // The refusal names the command and the restriction. It warns, because the
+    // line is complete, and the next Enter runs it once the turn ends.
+    try std.testing.expectEqualStrings(
+        "The command /model cannot run while a turn runs.",
+        app.session.notice.?.content,
+    );
+    try std.testing.expectEqual(
+        ai.command.Outcome.Severity.warning,
+        app.session.notice.?.severity,
+    );
 
     app.session.editor.clear();
     try app.session.editor.insert("   ");
     try app.submitSteering();
     try std.testing.expectEqualStrings("   ", app.session.editor.visible());
 
+    // A slash line with a tail is a command line too, so it never becomes steering.
+    // The registry reason wins over the turn, because the tail keeps the line
+    // unrunnable after the turn ends. Such a refusal offers the queue instead.
+    app.session.editor.clear();
+    try app.session.editor.insert("/model names the account too");
+    try app.submitSteering();
+    try std.testing.expectEqualStrings(
+        "/model names the account too",
+        app.session.editor.visible(),
+    );
+    try std.testing.expectEqualStrings(
+        "Enter: Queue as a message · The command /model takes no argument.",
+        app.session.notice.?.content,
+    );
+    try std.testing.expectEqual(
+        ai.command.Outcome.Severity.warning,
+        app.session.notice.?.severity,
+    );
+
+    // An unknown name mid-turn keeps the registry reason too. `handleKey` drops the
+    // arm of the line above on every key that is not an Enter, so drop it here too.
+    app.session.cancelMessageConfirmation();
+    app.session.editor.clear();
+    try app.session.editor.insert("/nope");
+    try app.submitSteering();
+    try std.testing.expectEqualStrings("/nope", app.session.editor.visible());
+    try std.testing.expectEqualStrings(
+        "Enter: Queue as a message · Pith does not recognize the command /nope.",
+        app.session.notice.?.content,
+    );
+
     try std.testing.expectEqual(@as(usize, 0), app.session.steering.items.len);
     const blocked = try app.agent.steering.take();
     defer gpa.free(blocked);
     try std.testing.expectEqual(@as(usize, 0), blocked.len);
+    // The arm is one-shot and belongs to this line alone, so the next key drops it.
+    app.session.cancelMessageConfirmation();
 
-    // A sentence that starts with a command name is a message, not a command.
+    // A message keeps the steering path.
     app.session.editor.clear();
-    try app.session.editor.insert("/model names the account too");
+    try app.session.editor.insert("the account matters too");
     try app.submitSteering();
     try std.testing.expectEqualStrings("", app.session.editor.visible());
     const taken = try app.agent.steering.take();
@@ -3512,7 +3650,7 @@ test "mid-turn Enter queues a message but never a command or a blank line" {
         gpa.free(taken);
     }
     try std.testing.expectEqual(@as(usize, 1), taken.len);
-    try std.testing.expectEqualStrings("/model names the account too", taken[0]);
+    try std.testing.expectEqualStrings("the account matters too", taken[0]);
 }
 
 test "late placeholder steering starts before a newer key in the same batch" {
@@ -4764,6 +4902,173 @@ test "a signed-out submit is refused with a login prompt" {
     try std.testing.expect(std.mem.indexOf(u8, notice.content, "/login") != null);
 }
 
+// A refused slash line is no dead end. One Enter arms the send, and the next Enter
+// puts the line on the model path as typed. Every other key drops the arm, and a
+// turn end drops it too, so the send always belongs to the line on screen. Signed
+// out, the model path stops at the login prompt, which proves the line skipped the
+// registry.
+test "a refused command line reaches the model on the next Enter" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.gpa = gpa;
+    app.io = io;
+    app.running = true;
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = anthropic_default,
+        .system = "",
+        .retry = .{},
+    });
+    defer app.agent.deinit();
+    app.state = .inert(gpa, io);
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+    app.skills = ai.skills.Registry.init(gpa);
+    defer app.skills.deinit();
+
+    try app.session.editor.insert("/nope tell me about this");
+    try app.handleKey(&.enter);
+    try std.testing.expect(app.session.message_confirmation);
+    try std.testing.expectEqualStrings(
+        "Enter: Send as a message · Pith does not recognize the command /nope.",
+        app.session.notice.?.content,
+    );
+    try std.testing.expectEqualStrings("/nope tell me about this", app.session.editor.visible());
+
+    // An edit invalidates the arm, so the line refuses again instead of sending.
+    try app.handleKey(&.{ .char = 'x' });
+    try std.testing.expect(!app.session.message_confirmation);
+    try app.handleKey(&.backspace);
+    try std.testing.expect(!app.session.message_confirmation);
+
+    try app.handleKey(&.enter);
+    try std.testing.expect(app.session.message_confirmation);
+    try app.handleKey(&.enter);
+
+    // The second Enter took the message path: no registry refusal, and the
+    // signed-out guard stopped the turn.
+    try std.testing.expect(!app.session.message_confirmation);
+    try std.testing.expect(app.session.mode == .prompt);
+    try std.testing.expectEqual(@as(usize, 0), app.session.transcript.blocks().len);
+    const notice = app.session.notice.?;
+    try std.testing.expectEqual(ai.command.Outcome.Severity.failure, notice.severity);
+    try std.testing.expect(std.mem.indexOf(u8, notice.content, "/login") != null);
+    try std.testing.expectEqualStrings("", app.session.editor.visible());
+}
+
+// The same confirmation during a turn queues the line as steering, so a slash line
+// can steer a running turn. A runnable command never arms, because the next Enter
+// runs it once the turn ends.
+test "a refused command line queues as steering on the next Enter" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.gpa = gpa;
+    app.io = io;
+    app.running = true;
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = anthropic_default,
+        .system = "",
+        .retry = .{},
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+    app.skills = ai.skills.Registry.init(gpa);
+    defer app.skills.deinit();
+    app.session.beginTurn(1);
+
+    // A runnable command offers no send, so a second Enter refuses again.
+    try app.session.editor.insert("/model");
+    try app.handleKey(&.enter);
+    try std.testing.expect(!app.session.message_confirmation);
+    try app.handleKey(&.enter);
+    try std.testing.expectEqualStrings("/model", app.session.editor.visible());
+
+    app.session.editor.clear();
+    try app.session.editor.insert("/nope steer with this");
+    try app.handleKey(&.enter);
+    try std.testing.expect(app.session.message_confirmation);
+    try std.testing.expectEqualStrings(
+        "Enter: Queue as a message · Pith does not recognize the command /nope.",
+        app.session.notice.?.content,
+    );
+
+    try app.handleKey(&.enter);
+    try std.testing.expectEqualStrings("", app.session.editor.visible());
+    const taken = try app.agent.steering.take();
+    defer {
+        for (taken) |message| gpa.free(message);
+        gpa.free(taken);
+    }
+    try std.testing.expectEqual(@as(usize, 1), taken.len);
+    try std.testing.expectEqualStrings("/nope steer with this", taken[0]);
+}
+
+// The user can read the queue offer while the turn ends under it. The turn end is
+// no key event, so the offer and its row must both go: a row that stays invites an
+// Enter that no longer queues. The line waits in the editor, and the next Enter
+// offers the send that the prompt does.
+test "a turn that ends under the queue offer clears the row too" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.gpa = gpa;
+    app.io = io;
+    app.running = true;
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = anthropic_default,
+        .system = "",
+        .retry = .{},
+    });
+    defer app.agent.deinit();
+    app.state = .inert(gpa, io);
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+    app.skills = ai.skills.Registry.init(gpa);
+    defer app.skills.deinit();
+    app.session.beginTurn(1);
+
+    try app.session.editor.insert("/nope tell me about this");
+    try app.handleKey(&.enter);
+    try std.testing.expectEqualStrings(
+        "Enter: Queue as a message · Pith does not recognize the command /nope.",
+        app.session.notice.?.content,
+    );
+
+    // The turn ends while that row is on screen.
+    try app.session.endTurnWithReceipt(&.{
+        .history_base = 0,
+        .history_end = 0,
+        .steering_committed_count = 0,
+    });
+    try std.testing.expect(app.session.mode == .prompt);
+    try std.testing.expect(!app.session.message_confirmation);
+    try std.testing.expect(app.session.notice == null);
+
+    // The line survived, so one Enter offers the send again and starts no turn.
+    try app.handleKey(&.enter);
+    try std.testing.expectEqualStrings(
+        "/nope tell me about this",
+        app.session.editor.visible(),
+    );
+    try std.testing.expectEqualStrings(
+        "Enter: Send as a message · Pith does not recognize the command /nope.",
+        app.session.notice.?.content,
+    );
+    try std.testing.expect(app.session.message_confirmation);
+    try std.testing.expectEqual(@as(usize, 0), app.session.transcript.blocks().len);
+}
+
 test "a stale cache blocks one submit and keeps the prompt unchanged" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -4819,6 +5124,68 @@ test "a stale cache blocks one submit and keeps the prompt unchanged" {
     try std.testing.expect(!app.session.takeCacheConfirmation());
 }
 
+// Two one-shot confirmations can meet on one line. The stale-cache warning stops
+// the send and consumes the message confirmation, so that confirmation must
+// survive. Otherwise the next Enter falls back into the registry, and both
+// warnings alternate forever with an empty transcript.
+test "a stale cache keeps the send-as-a-message confirmation" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(home);
+
+    var app: App = undefined;
+    app.gpa = gpa;
+    app.io = io;
+    app.running = true;
+    app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{ .anthropic = "sk-test" });
+    defer app.accounts.deinit();
+    app.skills = ai.skills.Registry.init(gpa);
+    defer app.skills.deinit();
+    app.state = .inert(gpa, io);
+    app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_api), .{
+        .model = anthropic_default,
+        .system = "",
+        .retry = .{},
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+
+    const risk: ai.Agent.CacheRisk = .{
+        .retention_ms = 5 * std.time.ms_per_min,
+        .cost_extra = 1.15,
+    };
+    try app.session.editor.insert("/tmp/x.log is empty");
+
+    // Enter 1: the registry refuses the line and offers the send.
+    try app.submitWithCacheRisk(&risk);
+    try std.testing.expect(app.session.message_confirmation);
+    try std.testing.expect(!app.session.cache_confirmation);
+
+    // Enter 2: the send meets the stale-cache warning, which sends nothing.
+    try app.submitWithCacheRisk(&risk);
+    try std.testing.expect(app.session.cache_confirmation);
+    try std.testing.expect(std.mem.startsWith(
+        u8,
+        app.session.notice.?.content,
+        "Enter: Send anyway · Cache: Probably stale after 5m",
+    ));
+    // Both offers stand, so the line is not back at the registry refusal.
+    try std.testing.expect(app.session.message_confirmation);
+    try std.testing.expectEqualStrings("/tmp/x.log is empty", app.session.editor.visible());
+    try std.testing.expectEqual(@as(usize, 0), app.session.transcript.blocks().len);
+
+    // Enter 3 opens both gates, so it starts the turn instead of warning again.
+    // The turn spawn itself stays out of this test.
+    try std.testing.expect(app.session.takeMessageConfirmation());
+    try std.testing.expect(try app.preflightModelSubmit(&risk));
+}
+
 test "a cache warning names its retention in the largest whole unit" {
     const hour = retentionText(std.time.ms_per_hour);
     try std.testing.expectEqual(@as(u64, 1), hour.count);
@@ -4844,10 +5211,10 @@ test "a cache warning names its retention in the largest whole unit" {
     try std.testing.expectEqualStrings("ms", mixed.unit);
 }
 
-// A sentence that starts with a command name is a message, so an idle Enter takes
-// the message path. Signed out, that path refuses with the login prompt. The
-// command the sentence starts with must leave no trace.
-test "an idle submit of a command-like sentence takes the message path" {
+// A sentence that starts with a command name is a command line, so an idle Enter
+// keeps it local. The command never runs, this Enter sends nothing, and the text
+// stays in the editor with one offer to send it.
+test "an idle submit of a slash line with a tail is refused and keeps its text" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -4872,11 +5239,21 @@ test "an idle submit of a command-like sentence takes the message path" {
     try app.submit();
 
     // `/new` never ran, so the history stands and no conversation reset happened.
+    // No turn started either, so the line reached no provider.
     try std.testing.expectEqual(@as(usize, 1), app.session.transcript.blocks().len);
+    try std.testing.expect(app.session.mode == .prompt);
     const notice = app.session.notice.?;
-    try std.testing.expectEqual(ai.command.Outcome.Severity.failure, notice.severity);
-    try std.testing.expect(std.mem.indexOf(u8, notice.content, "/login") != null);
-    try std.testing.expectEqualStrings("", app.session.editor.visible());
+    try std.testing.expectEqual(ai.command.Outcome.Severity.warning, notice.severity);
+    try std.testing.expectEqualStrings(
+        "Enter: Send as a message · The command /new takes no argument.",
+        notice.content,
+    );
+    try std.testing.expectEqualStrings(
+        "/new must clear the terminal scrollback",
+        app.session.editor.visible(),
+    );
+    // The row is a control hint, so the next Enter owns the send.
+    try std.testing.expect(app.session.message_confirmation);
 }
 
 // Pith classifies a large paste that expands to a slash command from its expanded
@@ -4910,14 +5287,17 @@ test "a large pasted slash command is classified from expanded text" {
     // The command ran off the expanded name, not the "[paste …]" label.
     try std.testing.expectEqual(@as(usize, 0), app.session.transcript.blocks().len);
     const notice = app.session.notice.?;
-    try std.testing.expectEqual(ai.command.Outcome.Severity.failure, notice.severity);
+    try std.testing.expectEqual(ai.command.Outcome.Severity.warning, notice.severity);
     // The whole expanded name reached dispatch, not just its first bytes.
-    try std.testing.expect(
-        std.mem.startsWith(u8, notice.content, "Pith does not recognize the command /nope"),
-    );
+    try std.testing.expect(std.mem.startsWith(
+        u8,
+        notice.content,
+        "Enter: Send as a message · Pith does not recognize the command /nope",
+    ));
     try std.testing.expect(std.mem.endsWith(u8, notice.content, "x" ** 1000 ++ "."));
     try std.testing.expect(std.mem.indexOf(u8, notice.content, "paste") == null);
-    try std.testing.expectEqualStrings("", app.session.editor.visible());
+    // The refused line stays in the editor, and its paste keeps its single atom.
+    try std.testing.expectEqual(@as(usize, 1), app.session.editor.draft.atoms.items.len);
 }
 
 test "Esc, Ctrl+C, and Ctrl+D each cancel the picker with context" {

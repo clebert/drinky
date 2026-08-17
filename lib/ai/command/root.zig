@@ -39,71 +39,139 @@ const commands = [_]Entry{
 };
 
 /// The command name in an input line, or null when the line is a plain message.
-/// A command name must fill the whole line, because a message can start with a
-/// word like `/new`. Only a `/skill:` name takes an argument tail.
+/// Every line that starts with a slash is a command line, because the registry must
+/// read it first. The name ends at the first whitespace, and `check` refuses a tail
+/// that the command does not take.
 pub fn parse(line: []const u8) ?[]const u8 {
     if (!std.mem.startsWith(u8, line, "/")) return null;
     const body = line[1..];
     const end = std.mem.indexOfAny(u8, body, whitespace) orelse body.len;
-    const name = body[0..end];
-    if (std.mem.startsWith(u8, name, skill_prefix)) return name;
-    if (std.mem.trim(u8, body[end..], whitespace).len > 0) return null;
-    return name;
+    return body[0..end];
+}
+
+/// The text after the command name, without its edge whitespace. `name` must come
+/// from `parse(line)`, so it starts at the second byte of the line.
+fn tail(line: []const u8, name: []const u8) []const u8 {
+    std.debug.assert(std.mem.startsWith(u8, line[1..], name));
+    return std.mem.trim(u8, line[1 + name.len ..], whitespace);
+}
+
+/// The registry entry with `name`, or null when the registry holds no such command.
+/// A `skill:` name never has an entry, because that prefix takes an argument tail.
+fn lookup(name: []const u8) ?*const Entry {
+    for (&commands) |*entry| {
+        if (std.mem.eql(u8, name, entry.name)) return entry;
+    }
+    return null;
+}
+
+/// The refusal that the registry produces for `line`, or null when the registry
+/// can run the line as typed. `check` runs no command, so a caller that must
+/// refuse a command for a state restriction can name the true reason first: an
+/// unknown name and an unwanted tail never become runnable, but a restriction
+/// ends. A line that is not a command line returns null too.
+///
+/// Every refusal here warns, because a slash line can be plain text. The caller
+/// can offer to send the line to the model as typed.
+pub fn check(context: *Context, line: []const u8) !?Outcome.Message {
+    const name = parse(line) orelse return null;
+    if (std.mem.startsWith(u8, name, skill_prefix)) return try checkSkill(context, name);
+    if (lookup(name) == null) return try unknownCommand(context.gpa, name);
+    if (tail(line, name).len > 0) return try Outcome.Message.print(
+        context.gpa,
+        .warning,
+        "The command /{s} takes no argument.",
+        .{name},
+    );
+    return null;
 }
 
 /// Dispatch an input line to its command. Null reports that the line is not a
-/// command, so the caller sends it to the model. An unknown command returns a
-/// notice.
+/// command, so the caller sends it to the model. A line that the registry cannot
+/// run as typed returns the refusal of `check`, so the line stays local.
 pub fn run(context: *Context, line: []const u8) !?Outcome {
     const name = parse(line) orelse return null;
-    if (std.mem.startsWith(u8, name, skill_prefix)) return try runSkill(context, line, name);
-    for (&commands) |*entry| {
-        if (std.mem.eql(u8, name, entry.name)) return try entry.run(context);
+    if (try check(context, line)) |refusal| return .{ .refusal = refusal };
+    // `check` accepted the line, so every lookup below holds. This is the one place
+    // that resolves a name, so no other function carries that invariant.
+    if (std.mem.startsWith(u8, name, skill_prefix)) {
+        const skill = context.skill_registry.?.get(name[skill_prefix.len..]).?;
+        return try runSkill(context, skill, tail(line, name));
     }
-    return try Outcome.reportNotice(
+    return try lookup(name).?.run(context);
+}
+
+/// Refuse a parsed command that the active state does not allow. The caller keeps
+/// the command text in the editor, sends nothing to the model, and opens no
+/// picker. `restriction` names the active state and completes the sentence
+/// `The command /name cannot run …`, as in `while a turn runs`.
+///
+/// The severity is a warning, not a failure: the line stays complete, and the next
+/// Enter runs it once the restriction ends. A failure carries the red `Error:`
+/// prefix, which reads as a broken turn while a reply streams.
+pub fn refuse(
+    gpa: std.mem.Allocator,
+    name: []const u8,
+    restriction: []const u8,
+) !Outcome.Message {
+    return Outcome.Message.print(
+        gpa,
+        .warning,
+        "The command /{s} cannot run {s}.",
+        .{ name, restriction },
+    );
+}
+
+/// The refusal for a `skill:` name that no discovered skill matches, or null when
+/// the registry holds it. A load failure stays with `runSkill`, because only the
+/// load itself can report one.
+fn checkSkill(context: *Context, command_name: []const u8) !?Outcome.Message {
+    const name = command_name[skill_prefix.len..];
+    if (name.len == 0) return try Outcome.Message.print(
         context.gpa,
-        .failure,
+        .warning,
+        "Pith needs a skill name after /skill:.",
+        .{},
+    );
+    const registry = context.skill_registry orelse return try unknownSkill(context.gpa, name);
+    if (registry.get(name) == null) return try unknownSkill(context.gpa, name);
+    return null;
+}
+
+fn unknownCommand(gpa: std.mem.Allocator, name: []const u8) !Outcome.Message {
+    return Outcome.Message.print(
+        gpa,
+        .warning,
         "Pith does not recognize the command /{s}.",
         .{name},
     );
 }
 
-fn runSkill(context: *Context, line: []const u8, command_name: []const u8) !Outcome {
-    const name = command_name[skill_prefix.len..];
-    if (name.len == 0)
-        return Outcome.reportNotice(
-            context.gpa,
-            .failure,
-            "Enter a skill name after /skill:.",
-            .{},
-        );
-    const registry = context.skill_registry orelse
-        return Outcome.reportNotice(
-            context.gpa,
-            .failure,
-            "Pith does not recognize the skill {s}.",
-            .{name},
-        );
-    const skill = registry.get(name) orelse
-        return Outcome.reportNotice(
-            context.gpa,
-            .failure,
-            "Pith does not recognize the skill {s}.",
-            .{name},
-        );
-    const body = line[1..];
-    const arguments = std.mem.trim(u8, body[command_name.len..], whitespace);
+fn unknownSkill(gpa: std.mem.Allocator, name: []const u8) !Outcome.Message {
+    return Outcome.Message.print(
+        gpa,
+        .warning,
+        "Pith does not recognize the skill {s}.",
+        .{name},
+    );
+}
+
+/// Expand `skill` with its optional task into a user turn. The caller resolved the
+/// skill, so this function holds no name invariant.
+fn runSkill(context: *Context, skill: *const skills.Skill, arguments: []const u8) !Outcome {
     const content = skill.invoke(context.gpa, context.io, arguments) catch |err| {
         if (err == error.Canceled or err == error.OutOfMemory) return err;
-        return Outcome.reportNotice(
+        // A failure, not a warning: the name is right and the load broke, so the
+        // way forward is another try, not a send to the model.
+        return .{ .refusal = try Outcome.Message.print(
             context.gpa,
             .failure,
             "Pith could not load the skill {s} because of error {s}.",
-            .{ name, @errorName(err) },
-        );
+            .{ skill.name, @errorName(err) },
+        ) };
     };
     errdefer context.gpa.free(content);
-    const name_copy = try context.gpa.dupe(u8, name);
+    const name_copy = try context.gpa.dupe(u8, skill.name);
     errdefer context.gpa.free(name_copy);
     const arguments_copy = try context.gpa.dupe(u8, arguments);
     errdefer context.gpa.free(arguments_copy);
@@ -121,27 +189,74 @@ test "unknown command is reported" {
         .agent = undefined,
         .accounts = undefined,
     };
-    try Outcome.expectNotice((try run(&context, "/nope")).?, .failure);
+    try Outcome.expectRefusal((try run(&context, "/nope")).?, .warning);
 }
 
-test "a message that starts like a command is not dispatched" {
+test "a command that takes no argument refuses a tail instead of running" {
+    var context: Context = .{
+        .gpa = std.testing.allocator,
+        .io = undefined,
+        .agent = undefined,
+        .accounts = undefined,
+    };
+    // The registry sends nothing, and `/new` never clears the conversation.
+    try Outcome.expectRefusalContaining(
+        (try run(&context, "/new must clear the scrollback")).?,
+        .warning,
+        "The command /new takes no argument.",
+    );
+    try Outcome.expectRefusalContaining(
+        (try run(&context, "/new\nmust clear the scrollback")).?,
+        .warning,
+        "The command /new takes no argument.",
+    );
+}
+
+// A caller that must refuse a command for its own state restriction asks `check`
+// first, so the reason it reports is the true one. `check` runs no command.
+test "check reports only what keeps a line unrunnable" {
+    const gpa = std.testing.allocator;
+    var agent = testing.agent(gpa, .{ .anthropic_subscription = undefined });
+    defer agent.deinit();
+    agent.setEffort(.high);
+    var context: Context = .{ .gpa = gpa, .io = undefined, .agent = &agent, .accounts = undefined };
+
+    // The registry can run these, so the caller owns the refusal.
+    try std.testing.expect((try check(&context, "/effort")) == null);
+    try std.testing.expect((try check(&context, "not a command")) == null);
+
+    // These never become runnable, whatever the state does.
+    const unknown_name = (try check(&context, "/nope")).?;
+    try unknown_name.expect(.warning, "does not recognize the command");
+    const unwanted_tail = (try check(&context, "/effort high")).?;
+    try unwanted_tail.expect(.warning, "takes no argument");
+    const unknown_skill = (try check(&context, "/skill:nope")).?;
+    try unknown_skill.expect(.warning, "does not recognize the skill");
+
+    // No command ran, so `/effort` opened no picker and changed no level.
+    try std.testing.expect(agent.effort == .high);
+}
+
+test "a line without a leading slash is not dispatched" {
     var context: Context = .{
         .gpa = undefined,
         .io = undefined,
         .agent = undefined,
         .accounts = undefined,
     };
-    try std.testing.expect((try run(&context, "/new must clear the scrollback")) == null);
     try std.testing.expect((try run(&context, "just a message")) == null);
+    // The registry reads the first byte. The app trims the prompt edges before
+    // dispatch, so a leading blank is no user-facing escape from a command line.
+    try std.testing.expect((try run(&context, " /new")) == null);
 }
 
-test "parse accepts a bare command name and rejects an argument tail" {
+test "parse takes the command name from every slash line" {
     try std.testing.expectEqualStrings("effort", parse("/effort").?);
     try std.testing.expectEqualStrings("effort", parse("/effort \n ").?);
     try std.testing.expectEqualStrings("", parse("/").?);
     try std.testing.expectEqualStrings("skill:demo", parse("/skill:demo apply it").?);
-    try std.testing.expect(parse("/new must clear the scrollback") == null);
-    try std.testing.expect(parse("/new\nmust clear the scrollback") == null);
+    try std.testing.expectEqualStrings("new", parse("/new must clear the scrollback").?);
+    try std.testing.expectEqualStrings("new", parse("/new\nmust clear the scrollback").?);
     try std.testing.expect(parse("not a command") == null);
     try std.testing.expect(parse("") == null);
 }
@@ -194,14 +309,14 @@ test "trailing whitespace does not hide an unknown command name" {
     };
     const outcome = (try run(&context, "/nope\n")).?;
     switch (outcome) {
-        .notice => |notice| {
-            defer gpa.free(notice.content);
+        .refusal => |refusal| {
+            defer gpa.free(refusal.content);
             try std.testing.expectEqualStrings(
                 "Pith does not recognize the command /nope.",
-                notice.content,
+                refusal.content,
             );
         },
-        else => return error.ExpectedNotice,
+        else => return error.ExpectedRefusal,
     }
 }
 
@@ -260,10 +375,10 @@ test "skill prefix reports missing and unknown names" {
         .agent = undefined,
         .accounts = undefined,
     };
-    try Outcome.expectNoticeContaining((try run(&context, "/skill:")).?, .failure, "skill name");
-    try Outcome.expectNoticeContaining(
+    try Outcome.expectRefusalContaining((try run(&context, "/skill:")).?, .warning, "skill name");
+    try Outcome.expectRefusalContaining(
         (try run(&context, "/skill:nope")).?,
-        .failure,
+        .warning,
         "does not recognize the skill",
     );
 }

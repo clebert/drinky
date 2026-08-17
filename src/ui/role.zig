@@ -46,7 +46,7 @@ pub const Name = enum {
     code,
     /// A link. The caller adds the underline attribute.
     link,
-    /// A warning that the user can still pass.
+    /// A warning that the user can pass now, or after the named state ends.
     warning,
     /// A failure.
     @"error",

@@ -8,10 +8,11 @@ Land these shared features before review mode:
 
 1. Active context projection.
 2. Failure recovery and retry.
-3. Command refusal.
-4. Conversation switching.
+3. Conversation switching.
 
 Each feature must use the normal app path. Review mode must not implement a private variant.
+
+The command refusal path below already exists. Review mode uses it.
 
 ### Active context projection
 
@@ -116,6 +117,8 @@ duration.
 
 ### Command refusal
 
+Status: Landed.
+
 Pith uses one refusal path when a parsed slash command is unavailable in the active state:
 
 - Keep the command text in the editor.
@@ -124,7 +127,32 @@ Pith uses one refusal path when a parsed slash command is unavailable in the act
 - Show a local notice that names the command and restriction.
 
 This path applies during an active normal turn, during retry restrictions, and throughout review
-mode.
+mode. The restriction text completes the sentence `The command /name cannot run …`. Such a notice
+warns rather than reports a failure, because the line stays complete, and the next Enter runs it
+after the restriction ends. Pith runs no command on its own.
+
+Every line that starts with a slash is a command line. The registry also refuses an unknown name,
+and an argument that the command does not take. Such a line keeps its text and arms one Enter, which
+sends the line to the active role as typed. The row names that action, as in
+`Enter: Send as a message`. Every other key cancels the arm, so the send always belongs to the line
+on screen. The row leaves with the arm, because a row that stays asks for an Enter that does
+nothing. The line itself stays in the editor, and the next Enter arms it again.
+
+A turn end cancels the arm too, and it clears the footer with it. Only a key that arrives during a
+turn can raise a notice there, and every such notice names that turn.
+
+The registry decides first. A caller applies its state restriction only to a line that the registry
+can run as typed.
+
+The severity follows the way out. A refusal that needs another try of the same command reports a
+failure, as a broken skill load does. A refusal that an Enter can pass, or that ends with the active
+state, warns.
+
+Editor retention follows the text at risk. A refusal keeps its line, because that line can hold text
+that the user wrote. A command that ran clears the editor, because the registry refuses every
+argument, so that line held nothing but the command name. A `/skill:` line is the one line that
+takes user text. A failed load is a refusal and keeps that text, and a load that ran moves it into
+the turn as the task.
 
 ### Conversation switching
 

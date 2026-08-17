@@ -25,6 +25,10 @@ skill_registry: ?*const skills.Registry = null,
 /// notice lasts until the next user action. An event belongs in the transcript.
 pub const Outcome = union(enum) {
     notice: Message,
+    /// Pith did not run this slash line. The app shows the message, keeps the line
+    /// in the editor, sends nothing to the model, and opens no picker. The line can
+    /// hold text that the user still needs.
+    refusal: Message,
     event: Message,
     pick: Pick,
     /// Submit an expanded skill instruction as a user turn. The app records the
@@ -53,6 +57,27 @@ pub const Outcome = union(enum) {
         /// Owned by the caller's allocator.
         content: []const u8,
         severity: Severity,
+
+        /// A message whose content is `format` rendered with `args`.
+        pub fn print(
+            gpa: std.mem.Allocator,
+            severity: Severity,
+            comptime format: []const u8,
+            args: anytype,
+        ) !Message {
+            return .{
+                .content = try std.fmt.allocPrint(gpa, format, args),
+                .severity = severity,
+            };
+        }
+
+        /// Test helper: assert the severity and a substring, then free the content
+        /// (testing allocator).
+        pub fn expect(self: *const Message, severity: Severity, needle: []const u8) !void {
+            defer std.testing.allocator.free(self.content);
+            try std.testing.expectEqual(severity, self.severity);
+            try std.testing.expect(std.mem.indexOf(u8, self.content, needle) != null);
+        }
     };
 
     pub const Prompt = struct {
@@ -128,10 +153,7 @@ pub const Outcome = union(enum) {
         comptime format: []const u8,
         args: anytype,
     ) !Outcome {
-        const message: Message = .{
-            .content = try std.fmt.allocPrint(gpa, format, args),
-            .severity = severity,
-        };
+        const message: Message = try Message.print(gpa, severity, format, args);
         return switch (destination) {
             .notice => .{ .notice = message },
             .event => .{ .event = message },
@@ -150,22 +172,33 @@ pub const Outcome = union(enum) {
         needle: []const u8,
     ) !void {
         switch (outcome) {
-            .notice => |notice| try expectMessage(&notice, severity, needle),
+            .notice => |notice| try notice.expect(severity, needle),
             else => return error.ExpectedNotice,
+        }
+    }
+
+    /// Test helper: assert a refusal and free its content (testing allocator).
+    pub fn expectRefusal(outcome: Outcome, severity: Severity) !void {
+        return expectRefusalContaining(outcome, severity, "");
+    }
+
+    /// `expectRefusal` plus a substring check on the content.
+    pub fn expectRefusalContaining(
+        outcome: Outcome,
+        severity: Severity,
+        needle: []const u8,
+    ) !void {
+        switch (outcome) {
+            .refusal => |refusal| try refusal.expect(severity, needle),
+            else => return error.ExpectedRefusal,
         }
     }
 
     /// Test helper: assert an event and free its content (testing allocator).
     pub fn expectEvent(outcome: Outcome, severity: Severity) !void {
         switch (outcome) {
-            .event => |event| try expectMessage(&event, severity, ""),
+            .event => |event| try event.expect(severity, ""),
             else => return error.ExpectedEvent,
         }
-    }
-
-    fn expectMessage(message: *const Message, severity: Severity, needle: []const u8) !void {
-        defer std.testing.allocator.free(message.content);
-        try std.testing.expectEqual(severity, message.severity);
-        try std.testing.expect(std.mem.indexOf(u8, message.content, needle) != null);
     }
 };

@@ -112,13 +112,21 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
   text roles, and input frames in a scrollable full-window page.
 - **/skill:name** — load a discovered skill explicitly, record a compact `Skill:` marker, and append
   any trailing text as its task.
-- A command runs only when its name fills the whole line. A message such as
-  `/new must clear the scrollback` reaches the model. `/skill:name` is the one exception, because it
-  takes its task as trailing text.
+- Every line that starts with a slash is a command line, so Pith reads it locally first and sends it
+  only after a confirmation. A command that takes no argument refuses text after the name, as in
+  `/new must clear the scrollback`. `/skill:name` is the one exception, because it takes its task as
+  trailing text.
+- Pith keeps a refused line in the editor, so its text survives an unknown name or unwanted text
+  after the name. A command that ran clears the editor. Only a `/skill:` line carries user text, and
+  that text moves into the turn as the task.
+- Pith always offers a way out for a refused line: the footer offers `Enter: Send as a message`, and
+  during a turn `Enter: Queue as a message`. The next Enter alone sends the line as typed. Every
+  other key cancels the offer and its row. The end of the turn cancels them too, and the line waits
+  in the editor for a new offer.
 - Successful model, effort, login, logout, and account changes are recorded as transcript events.
-- Unknown commands and other local command failures temporarily replace the footer until the next
-  user action, and never reach the model.
-- A command typed during a turn stays in the editor until the turn ends.
+- A local command failure temporarily replaces the footer until the next user action.
+- A command that can run stays in the editor while a turn runs, and one notice names the command and
+  the restriction. The next Enter runs it after the turn ends.
 
 ## Providers
 
