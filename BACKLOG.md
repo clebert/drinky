@@ -31,6 +31,10 @@ decision already taken, or a dependency on another entry. Module layout and exte
   whole-line rule went too far, so report the line locally instead. This entry implements the
   Command refusal prerequisite: keep unavailable command text in the editor and name the active
   restriction during a turn, retry, or review. `/skill:name` keeps its trailing task text._
+- **The agent retries a spent usage limit** — a 429 that reports a spent allowance, or asks for a
+  wait past the backoff cap, still costs three tries. _Report the failure at once on both signals:
+  an OpenAI `usage_limit_reached` body, and a `retry-after` longer than `backoff_ms_max`. No wait
+  inside that cap can clear either failure._
 - **The picker cannot scroll up** — the selection does not move back into the rows above the
   viewport.
 - **A picker wastes rows on a short list** — blank rows appear when the list fits the window. The

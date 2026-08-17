@@ -119,6 +119,16 @@ pub const Stream = struct {
         return self.quota;
     }
 
+    /// The message a failed head's error body carries (see
+    /// `sse.Engine.refineError`). It reads the same shapes as a streamed error
+    /// frame. Null keeps the raw body, so a truncated body or an HTML page from
+    /// a gateway still reports the sent bytes.
+    pub fn describeError(self: *Stream, body: []const u8) !?[]const u8 {
+        const arena = self.frame_arena.allocator();
+        const object = (try json.parseObject(arena, body)) orelse return null;
+        return errorDescription(arena, object);
+    }
+
     /// Latch a rejection. `unsupported` wins over `invalid` however they
     /// interleave: resampling cannot turn an outcome this design cannot retain
     /// into one it can, so the retry budget spent on it only delays the same
@@ -307,22 +317,14 @@ pub const Stream = struct {
         // Some deployments close the stream with a Chat-Completions-style
         // sentinel. The Agent still requires a preceding terminal event.
         if (std.mem.eql(u8, payload, "[DONE]")) return .done;
-        const value = std.json.parseFromSliceLeaky(
-            std.json.Value,
-            self.frame_arena.allocator(),
-            payload,
-            .{},
-        ) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => return .ignored,
-        };
-        const object = json.object(value) orelse return .ignored;
+        const object = (try json.parseObject(self.frame_arena.allocator(), payload)) orelse
+            return .ignored;
         const kind = json.string(object.get("type")) orelse return .ignored;
 
         if (std.mem.eql(u8, kind, "error") or std.mem.eql(u8, kind, "response.failed")) {
             engine.recordError(
                 self,
-                errorMessage(object) orelse kind,
+                (try errorDescription(self.frame_arena.allocator(), object)) orelse kind,
                 errorRetryable(&object),
             );
             return error.ApiError;
@@ -478,6 +480,82 @@ fn errorMessage(object: std.json.ObjectMap) ?[]const u8 {
         if (json.object(response.get("error"))) |detail| return json.string(detail.get("message"));
     }
     return null;
+}
+
+/// The message that reports an error body or a streamed error frame: the
+/// sentences for a spent plan allowance, or else the plain provider message.
+/// Both paths read it, so a failed head and a streamed frame of the same shape
+/// report the same text.
+fn errorDescription(arena: std.mem.Allocator, object: std.json.ObjectMap) !?[]const u8 {
+    const detail = json.object(object.get("error")) orelse object;
+    if (try usageLimitText(arena, detail)) |text| return text;
+    return errorMessage(object);
+}
+
+/// The sentences that report a spent plan allowance, or null for any other
+/// error. The ChatGPT-subscription backend answers a spent plan with HTTP 429
+/// and this body shape, whose bare message names neither the plan nor the wait.
+fn usageLimitText(arena: std.mem.Allocator, detail: std.json.ObjectMap) !?[]const u8 {
+    const kind = json.string(detail.get("type")) orelse return null;
+    if (!std.mem.eql(u8, kind, "usage_limit_reached")) return null;
+    const plan = json.string(detail.get("plan_type")) orelse "";
+    // The wire value is lowercase (`plus`), and a plan name reads as a proper
+    // noun, so the subject raises the first letter.
+    const subject = if (plan.len == 0)
+        "The subscription"
+    else
+        try std.fmt.allocPrint(arena, "The {c}{s} plan", .{
+            std.ascii.toUpper(plan[0]),
+            plan[1..],
+        });
+    const maybe_seconds = json.unsigned(detail.get("resets_in_seconds"));
+    const reset_text = if (maybe_seconds) |seconds|
+        try std.fmt.allocPrint(arena, " It resets in {s}.", .{try resetText(arena, seconds)})
+    else
+        "";
+    return try std.fmt.allocPrint(
+        arena,
+        "{s} reached its usage limit.{s}",
+        .{ subject, reset_text },
+    );
+}
+
+/// The wait before a limit resets, in at most two units, with the plural `s`
+/// only where a count needs it. Every unit floors, so the reported wait can
+/// fall short of the real one by less than one minor unit.
+fn resetText(arena: std.mem.Allocator, seconds: u64) ![]const u8 {
+    const minutes = @divFloor(seconds, 60);
+    const hours = @divFloor(minutes, 60);
+    const days = @divFloor(hours, 24);
+    if (minutes == 0) return "less than a minute";
+    if (hours == 0) return std.fmt.allocPrint(arena, "{d} minute{s}", .{
+        minutes,
+        pluralSuffix(minutes),
+    });
+    if (days == 0) {
+        const rest_minutes = minutes - hours * 60;
+        if (rest_minutes == 0)
+            return std.fmt.allocPrint(arena, "{d} hour{s}", .{ hours, pluralSuffix(hours) });
+        return std.fmt.allocPrint(arena, "{d} hour{s} {d} minute{s}", .{
+            hours,
+            pluralSuffix(hours),
+            rest_minutes,
+            pluralSuffix(rest_minutes),
+        });
+    }
+    const rest_hours = hours - days * 24;
+    if (rest_hours == 0)
+        return std.fmt.allocPrint(arena, "{d} day{s}", .{ days, pluralSuffix(days) });
+    return std.fmt.allocPrint(arena, "{d} day{s} {d} hour{s}", .{
+        days,
+        pluralSuffix(days),
+        rest_hours,
+        pluralSuffix(rest_hours),
+    });
+}
+
+fn pluralSuffix(count: u64) []const u8 {
+    return if (count == 1) "" else "s";
 }
 
 fn errorRetryable(object: *const std.json.ObjectMap) bool {
@@ -1170,6 +1248,72 @@ test "decode surfaces a streamed error frame" {
     ));
     try std.testing.expectEqualStrings("bad request", stream.errorText());
     try std.testing.expect(!stream.retryable());
+
+    // A spent plan allowance reports the same sentences on either path.
+    try std.testing.expectError(error.ApiError, stream.decode(
+        \\{"type":"error","error":{"type":"usage_limit_reached","plan_type":"pro","resets_in_seconds":600}}
+    ));
+    try std.testing.expectEqualStrings(
+        "The Pro plan reached its usage limit. It resets in 10 minutes.",
+        stream.errorText(),
+    );
+}
+
+test "describeError reduces a failed head's error body to its message" {
+    var stream = testStream(undefined, undefined, 0, 0);
+    defer stream.deinitDecode();
+
+    try std.testing.expectEqualStrings("bad request", (try stream.describeError(
+        \\{"error":{"type":"invalid_request_error","message":"bad request"}}
+    )).?);
+    try std.testing.expectEqualStrings("no account", (try stream.describeError(
+        \\{"message":"no account"}
+    )).?);
+
+    // A truncated capture and a non-JSON page both keep the raw body.
+    try std.testing.expectEqual(@as(?[]const u8, null), try stream.describeError(
+        \\{"error":{"message":"cut off
+    ));
+    try std.testing.expectEqual(
+        @as(?[]const u8, null),
+        try stream.describeError("<html>gateway</html>"),
+    );
+    try std.testing.expectEqual(@as(?[]const u8, null), try stream.describeError("{}"));
+}
+
+test "describeError names the plan and the wait of a spent usage limit" {
+    var stream = testStream(undefined, undefined, 0, 0);
+    defer stream.deinitDecode();
+
+    // The body of a subscription 429. Its own message names neither the plan
+    // nor the wait, so the reported sentences add both.
+    try std.testing.expectEqualStrings(
+        "The Plus plan reached its usage limit. It resets in 3 days 17 hours.",
+        (try stream.describeError(
+            \\{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","plan_type":"plus","resets_at":1787303122,"eligible_promo":null,"resets_in_seconds":321378}}
+        )).?,
+    );
+    try std.testing.expectEqualStrings(
+        "The subscription reached its usage limit.",
+        (try stream.describeError(
+            \\{"error":{"type":"usage_limit_reached"}}
+        )).?,
+    );
+}
+
+test resetText {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    try std.testing.expectEqualStrings("less than a minute", try resetText(allocator, 30));
+    try std.testing.expectEqualStrings("1 minute", try resetText(allocator, 60));
+    try std.testing.expectEqualStrings("59 minutes", try resetText(allocator, 3599));
+    try std.testing.expectEqualStrings("1 hour", try resetText(allocator, 3600));
+    try std.testing.expectEqualStrings("1 hour 1 minute", try resetText(allocator, 3660));
+    try std.testing.expectEqualStrings("2 hours 30 minutes", try resetText(allocator, 9000));
+    try std.testing.expectEqualStrings("1 day", try resetText(allocator, 86400));
+    try std.testing.expectEqualStrings("1 day 1 hour", try resetText(allocator, 90000));
 }
 
 test "decode ignores a malformed data line instead of failing the turn" {

@@ -110,6 +110,16 @@ pub const Stream = struct {
         return null;
     }
 
+    /// The message a failed head's error body carries (see
+    /// `sse.Engine.refineError`). A failed head uses the same
+    /// `{"error":{"message":…}}` shape as a streamed error frame. Null keeps the
+    /// raw body, so a truncated or unexpected shape still reports the sent bytes.
+    pub fn describeError(self: *Stream, body: []const u8) !?[]const u8 {
+        const object = (try json.parseObject(self.frame_arena.allocator(), body)) orelse
+            return null;
+        return errorMessage(object);
+    }
+
     pub fn deinitDecode(self: *Stream) void {
         self.frame_arena.deinit();
         self.block_text.deinit(self.gpa);
@@ -247,16 +257,8 @@ pub const Stream = struct {
     pub fn decode(self: *Stream, payload: []const u8) !sse.Decoded {
         // A malformed payload is filler, not progress. A truncated tail then
         // surfaces as an incomplete reply at end of stream, which is retried.
-        const value = std.json.parseFromSliceLeaky(
-            std.json.Value,
-            self.frame_arena.allocator(),
-            payload,
-            .{},
-        ) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => return .ignored,
-        };
-        const object = json.object(value) orelse return .ignored;
+        const object = (try json.parseObject(self.frame_arena.allocator(), payload)) orelse
+            return .ignored;
         const kind = json.string(object.get("type")) orelse return .ignored;
 
         if (std.mem.eql(u8, kind, "ping")) return .ignored;
@@ -1114,6 +1116,23 @@ test "decode surfaces a streamed error frame" {
         "{\"type\":\"error\",\"error\":{\"message\":\"" ++ long ++ "\"}}",
     ));
     try std.testing.expectEqualStrings(long[0..stream.error_buffer.len], stream.errorText());
+}
+
+test "describeError reduces a failed head's error body to its message" {
+    var stream = testStream(undefined, undefined, 0, 0);
+    defer stream.deinitDecode();
+
+    try std.testing.expectEqualStrings("invalid x-api-key", (try stream.describeError(
+        \\{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}
+    )).?);
+
+    // A truncated capture and a body without a message both keep the raw bytes.
+    try std.testing.expectEqual(@as(?[]const u8, null), try stream.describeError(
+        \\{"type":"error","error":{"message":"cut off
+    ));
+    try std.testing.expectEqual(@as(?[]const u8, null), try stream.describeError(
+        \\{"type":"error","error":{}}
+    ));
 }
 
 test "next times out on buffered filler that makes no progress" {

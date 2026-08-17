@@ -1,10 +1,31 @@
-//! Shared JSON plumbing: lenient `std.json.Value` accessors for the wire
-//! decoders — an absent value or a mismatched type reads as null — and the
-//! tool-parameters JSON-schema writer both provider serializers emit.
+//! Shared JSON plumbing: the lenient body parse and the lenient
+//! `std.json.Value` accessors for the wire decoders — a malformed body, an
+//! absent value, or a mismatched type reads as null — plus the tool-parameters
+//! JSON-schema writer both provider serializers emit.
 
 const std = @import("std");
 
 const llm = @import("llm.zig");
+
+/// The object that `body` parses to, or null when the bytes are not JSON or
+/// carry another kind of value. Only an allocation failure surfaces, so a
+/// malformed body needs no error branch at the call site. The parse leaks into
+/// `arena`, and the returned strings live until that arena resets.
+pub fn parseObject(
+    arena: std.mem.Allocator,
+    body: []const u8,
+) error{OutOfMemory}!?std.json.ObjectMap {
+    const value = std.json.parseFromSliceLeaky(
+        std.json.Value,
+        arena,
+        body,
+        .{},
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    return object(value);
+}
 
 pub fn object(value: ?std.json.Value) ?std.json.ObjectMap {
     return switch (value orelse return null) {

@@ -86,11 +86,13 @@ pub const Reasoning = enum {
 /// `error_length`, `error_retryable`, `retry_after_ms`, `frame_arena`, `usage`,
 /// `decompress`, `decompress_buffer`, `error_buffer`, `redirect_buffer`,
 /// `transfer_buffer`)
-/// plus `deinitDecode()` for stream-lifetime decode state and
-/// `decode(payload) !Decoded`. The engine calls an optional
-/// `captureHead(*const Head)` hook while the response head is still valid, for
-/// provider-specific header capture. The engine resets `frame_arena` before
-/// each SSE frame, so returned events can borrow a parse until the next read.
+/// plus `deinitDecode()` for stream-lifetime decode state,
+/// `decode(payload) !Decoded`, and `describeError(body) !?[]const u8` to read
+/// the message out of a failed head's error body (see `refineError`). The
+/// engine calls an optional `captureHead(*const Head)` hook while the response
+/// head is still valid, for provider-specific header capture. The engine resets
+/// `frame_arena` before each SSE frame, so returned events can borrow a parse
+/// until the next read.
 pub fn Engine(comptime S: type) type {
     return struct {
         pub fn deinit(stream: *S) void {
@@ -197,9 +199,39 @@ pub fn Engine(comptime S: type) type {
                 &stream.decompress,
                 stream.decompress_buffer,
             );
-            if (stream.status != .ok)
+            if (stream.status != .ok) {
                 stream.error_length = stream.body.readSliceShort(&stream.error_buffer) catch 0;
+                refineError(stream);
+            }
             stream.established = true;
+        }
+
+        /// Compose the reported text of a failed head: the response status, then
+        /// the message the provider `describeError` hook reads out of the
+        /// captured error body. A failed head never reaches `decode`, so without
+        /// this step `errorText` reports raw wire JSON and names no status. The
+        /// raw body stays as the detail when the hook finds no message, and an
+        /// empty body reports the status alone.
+        fn refineError(stream: *S) void {
+            const raw = stream.error_buffer[0..stream.error_length];
+            const detail = detail: {
+                const described = stream.describeError(raw) catch break :detail raw;
+                const message = described orelse break :detail raw;
+                break :detail if (message.len == 0) raw else message;
+            };
+            const phrase = stream.status.phrase() orelse "";
+            // The detail can borrow the raw bytes, so compose out of place. The
+            // formatted text is a new allocation and cannot overlap them. A
+            // failed format leaves the captured body as it is.
+            const text = std.fmt.allocPrint(stream.frame_arena.allocator(), "{d}{s}{s}{s}{s}", .{
+                @intFromEnum(stream.status),
+                if (phrase.len == 0) "" else " ",
+                phrase,
+                if (detail.len == 0) "" else ": ",
+                detail,
+            }) catch return;
+            stream.error_length = utf8Length(text, stream.error_buffer.len);
+            @memcpy(stream.error_buffer[0..stream.error_length], text[0..stream.error_length]);
         }
 
         /// The next decoded event, or null at end of stream. One shared
@@ -298,11 +330,25 @@ pub fn Engine(comptime S: type) type {
         /// Record a streamed error frame for `errorText` and retry
         /// classification. The provider's `decode` calls this.
         pub fn recordError(stream: *S, message: []const u8, error_retryable: bool) void {
-            stream.error_length = @min(message.len, stream.error_buffer.len);
+            stream.error_length = utf8Length(message, stream.error_buffer.len);
             stream.error_retryable = error_retryable;
             @memcpy(stream.error_buffer[0..stream.error_length], message[0..stream.error_length]);
         }
     };
+}
+
+/// The length to cut `text` to, so that it fits `length_max` and splits no
+/// UTF-8 sequence. The step back over the continuation bytes at the cut is
+/// bounded by the three bytes a four-byte sequence can hold. A cut inside
+/// invalid bytes keeps the plain length.
+fn utf8Length(text: []const u8, length_max: usize) usize {
+    if (text.len <= length_max) return text.len;
+    var length = length_max;
+    for (0..3) |_| {
+        if (length == 0 or text[length] & 0xc0 != 0x80) return length;
+        length -= 1;
+    }
+    return length_max;
 }
 
 /// Parse the `retry-after` header (whole seconds) into milliseconds. Null when
@@ -388,6 +434,129 @@ test "a body read failure without a connection error stays a read failure" {
     var stream: Stub = .{ .request = .{ .connection = &connection } };
 
     try std.testing.expectEqual(error.ReadFailed, engine.readFailed(&stream));
+}
+
+test "refineError reports the status with the message of a captured error body" {
+    const Described = struct {
+        frame_arena: std.heap.ArenaAllocator,
+        status: std.http.Status,
+        error_length: usize,
+        error_buffer: [64]u8,
+
+        // This message borrows the raw bytes it replaces, which the hook
+        // contract allows. Both real providers return frame-arena memory
+        // instead, because a `std.json.Value` parse copies every string.
+        pub fn describeError(_: *@This(), body: []const u8) !?[]const u8 {
+            const start = std.mem.indexOfScalar(u8, body, '=') orelse return null;
+            return body[start + 1 ..];
+        }
+    };
+    const engine = Engine(Described);
+    var stream: Described = .{
+        .frame_arena = .init(std.testing.allocator),
+        .status = .too_many_requests,
+        .error_length = 0,
+        .error_buffer = undefined,
+    };
+    defer stream.frame_arena.deinit();
+
+    const body = "code=too slow";
+    @memcpy(stream.error_buffer[0..body.len], body);
+    stream.error_length = body.len;
+    engine.refineError(&stream);
+    try std.testing.expectEqualStrings(
+        "429 Too Many Requests: too slow",
+        engine.errorText(&stream),
+    );
+
+    // An unrecognized body stays the detail. An empty body reports the status
+    // alone, which a raw report of no bytes never names.
+    const raw = "not json";
+    @memcpy(stream.error_buffer[0..raw.len], raw);
+    stream.error_length = raw.len;
+    engine.refineError(&stream);
+    try std.testing.expectEqualStrings(
+        "429 Too Many Requests: not json",
+        engine.errorText(&stream),
+    );
+    stream.error_length = 0;
+    engine.refineError(&stream);
+    try std.testing.expectEqualStrings("429 Too Many Requests", engine.errorText(&stream));
+}
+
+test "refineError clamps a composed text longer than the error buffer" {
+    const Long = struct {
+        frame_arena: std.heap.ArenaAllocator,
+        status: std.http.Status,
+        error_length: usize,
+        error_buffer: [24]u8,
+
+        pub fn describeError(self: *@This(), _: []const u8) !?[]const u8 {
+            return try self.frame_arena.allocator().dupe(u8, "abcdef€ and more");
+        }
+    };
+    var long: Long = .{
+        .frame_arena = .init(std.testing.allocator),
+        .status = .bad_request,
+        .error_length = 0,
+        .error_buffer = undefined,
+    };
+    defer long.frame_arena.deinit();
+    Engine(Long).refineError(&long);
+    // The cut falls inside the three bytes of "€", so it steps back to the
+    // start of that sequence.
+    try std.testing.expectEqualStrings("400 Bad Request: abcdef", Engine(Long).errorText(&long));
+}
+
+test "refineError keeps the captured body when the hook or the format fails" {
+    const Failing = struct {
+        frame_arena: std.heap.ArenaAllocator,
+        status: std.http.Status,
+        error_length: usize,
+        error_buffer: [64]u8,
+
+        pub fn describeError(_: *@This(), _: []const u8) !?[]const u8 {
+            return error.OutOfMemory;
+        }
+    };
+    const engine = Engine(Failing);
+    const body = "raw body";
+    var stream: Failing = .{
+        .frame_arena = .init(std.testing.allocator),
+        .status = .internal_server_error,
+        .error_length = body.len,
+        .error_buffer = undefined,
+    };
+    @memcpy(stream.error_buffer[0..body.len], body);
+
+    // A hook that fails keeps the captured body as the detail under the status.
+    engine.refineError(&stream);
+    try std.testing.expectEqualStrings(
+        "500 Internal Server Error: raw body",
+        engine.errorText(&stream),
+    );
+    stream.frame_arena.deinit();
+
+    // A format that cannot allocate leaves the captured body exactly as it is.
+    @memcpy(stream.error_buffer[0..body.len], body);
+    stream.error_length = body.len;
+    stream.frame_arena = .init(std.testing.failing_allocator);
+    defer stream.frame_arena.deinit();
+    engine.refineError(&stream);
+    try std.testing.expectEqualStrings(body, engine.errorText(&stream));
+}
+
+test utf8Length {
+    try std.testing.expectEqual(@as(usize, 3), utf8Length("abc", 8));
+    try std.testing.expectEqual(@as(usize, 2), utf8Length("abc", 2));
+
+    // "€" spans three bytes, so every cut inside it steps back to its start.
+    try std.testing.expectEqual(@as(usize, 1), utf8Length("a€b", 2));
+    try std.testing.expectEqual(@as(usize, 1), utf8Length("a€b", 3));
+    try std.testing.expectEqual(@as(usize, 4), utf8Length("a€b", 4));
+
+    // Continuation bytes without a start byte keep the plain length.
+    try std.testing.expectEqual(@as(usize, 4), utf8Length("\x80\x80\x80\x80\x80", 4));
 }
 
 test "retryable classifies streamed errors and head statuses" {
