@@ -22,10 +22,6 @@ decision already taken, or a dependency on another entry. Module layout and exte
 
 ## Bugs
 
-- **A full-window page cannot close in Apple Terminal** — Esc does not leave `/colors` or `/system`,
-  the trackpad does not scroll, and the page leaves the scrollback in place. _The user must close
-  the terminal to escape the page. Ghostty works. Degraded colors and widths in Apple Terminal stay
-  acceptable, but a page that traps the user does not._
 - **A slash line with extra text reaches the model** — a line that starts with a command name plus
   more text goes to the provider. _No line that starts with a slash must reach the model. The
   whole-line rule went too far, so report the line locally instead. This entry implements the

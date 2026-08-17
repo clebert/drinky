@@ -46,9 +46,29 @@ pub const link_reset = link_set ++ string_end;
 pub const cursor_hide = "\x1b[?25l";
 pub const cursor_show = "\x1b[?25h";
 
-/// Enter/leave the alternate screen. This preserves the primary screen and its scrollback.
+/// Enter or leave the modern alternate screen. This preserves the primary screen and its
+/// scrollback.
 pub const screen_alternate_set = "\x1b[?1049h";
 pub const screen_alternate_reset = "\x1b[?1049l";
+
+/// Save the primary cursor and use the older alternate-screen mode from Apple Terminal's terminfo.
+pub const screen_alternate_legacy_set = "\x1b7\x1b[?47h";
+/// Clear the older alternate screen, return to the primary screen, and restore its cursor.
+pub const screen_alternate_legacy_reset = "\x1b[2J\x1b[?47l\x1b8";
+
+/// Save the alternate-scroll mode, then ask for it. The terminal turns a wheel notch on the
+/// alternate screen into an arrow key. The app needs no mouse report, so the mouse keeps its
+/// normal text selection.
+pub const scroll_alternate_set = "\x1b[?1007s\x1b[?1007h";
+/// Restore the saved alternate-scroll mode. A terminal without the mode stack keeps the mode
+/// enabled, which is the common default. No reset can leave such a terminal worse than it was.
+pub const scroll_alternate_reset = "\x1b[?1007r";
+
+/// Enable normal mouse reports in SGR format, or disable both modes. A terminal that does not
+/// support SGR format can send its legacy mouse report. Only a terminal without the
+/// alternate-scroll mode needs these, because a report also takes over the text selection.
+pub const mouse_report_set = "\x1b[?1006h\x1b[?1000h";
+pub const mouse_report_reset = "\x1b[?1000l\x1b[?1006l";
 
 /// Erase from the cursor to the end of the screen.
 pub const screen_clear_below = "\x1b[0J";

@@ -117,6 +117,21 @@ tick_pending: bool,
 /// The frame schedule. Only `armTick` advances it, so no frame can reset it.
 frame_grid: FrameGrid,
 
+/// The process environment that the app cannot read for itself. `main` owns every
+/// lookup, so a test can run the app with no environment at all.
+pub const Options = struct {
+    /// The provider keys that authenticate an account without a login.
+    api_keys: ai.Accounts.ApiKeys = .{},
+    /// The value of `TERM_PROGRAM`, which names the terminal, or null when it is unset.
+    terminal_program: ?[]const u8 = null,
+    /// The value of `TERM`, which names the terminal type, or null when it is unset.
+    terminal_type: ?[]const u8 = null,
+    /// The value of `TMUX`, which a tmux session sets, or null outside one.
+    tmux_session: ?[]const u8 = null,
+    /// The value of `STY`, which a screen session sets, or null outside one.
+    screen_session: ?[]const u8 = null,
+};
+
 /// The frame grid: the deadlines that pace the repaints. Each deadline is one
 /// interval after the previous deadline, not one interval after the previous
 /// frame ended. The work of a frame therefore falls inside its own interval and
@@ -320,6 +335,28 @@ const Sources = struct {
     skills: *const ai.skills.Registry,
 };
 
+/// Map the terminal that the environment names onto the capabilities of the engine. Apple Terminal
+/// has neither DECSET 1049 nor DECSET 1007, so it takes the older screen and the mouse reports.
+fn terminalOptions(options: *const Options) terminal.Tty.Options {
+    if (appleTerminal(options)) return .{ .screen = .legacy, .wheel = .mouse_report };
+    return .{};
+}
+
+/// Whether the session runs in Apple Terminal itself. The name must match exactly, because a wrong
+/// verdict costs more than a missed one. The legacy screen reprints the window on every page close,
+/// and the mouse reports take a click away from the terminal. A multiplexer inherits `TERM_PROGRAM`
+/// from the terminal that started it. It draws every row itself and supports the modern path, so
+/// its own markers win over that inherited name.
+fn appleTerminal(options: *const Options) bool {
+    if (options.tmux_session != null or options.screen_session != null) return false;
+    if (options.terminal_type) |name| {
+        if (std.mem.startsWith(u8, name, "tmux") or std.mem.startsWith(u8, name, "screen"))
+            return false;
+    }
+    const program = options.terminal_program orelse return false;
+    return std.mem.eql(u8, program, "Apple_Terminal");
+}
+
 fn validateWorkingDirectory(gpa: std.mem.Allocator, path: []const u8) !void {
     if (std.unicode.utf8ValidateSlice(path)) return;
     const safe_path = try ai.instructions.diagnosticAlloc(gpa, path);
@@ -396,7 +433,7 @@ pub fn run(
     gpa: std.mem.Allocator,
     io: std.Io,
     home: []const u8,
-    api_keys: ai.Accounts.ApiKeys,
+    options: *const Options,
 ) !void {
     self.gpa = gpa;
     self.io = io;
@@ -423,7 +460,7 @@ pub fn run(
     var config = try Config.load(gpa, io, &.{ .working_directory = cwd, .home = home });
     defer config.deinit(gpa);
 
-    self.accounts = try ai.Accounts.init(gpa, io, home, config.timeouts, api_keys);
+    self.accounts = try ai.Accounts.init(gpa, io, home, config.timeouts, options.api_keys);
     defer self.accounts.deinit();
     self.default_models = config.default_models;
 
@@ -491,7 +528,7 @@ pub fn run(
     // remember, so the first login records one.
     if (active) |account| try self.state.seed(account, &start_model, start_effort);
 
-    try self.tty.init(io);
+    try self.tty.init(io, terminalOptions(options));
     defer self.tty.deinit();
 
     try self.resize.init();
@@ -576,7 +613,10 @@ fn initEventQueue(self: *App) void {
 /// Leave the alternate screen and park the primary cursor before terminal teardown.
 /// An output failure does not stop terminal teardown.
 fn prepareTerminalExit(self: *App) void {
-    self.tty.setAlternateScreen(false) catch return;
+    // A reported content loss gets no repaint, because the app writes no further frame. An exit
+    // with a page open reaches this only through a failure, because every exit key closes the page
+    // first. A repaint would need the page closed and one more frame at teardown.
+    _ = self.tty.setAlternateScreen(false) catch return;
     self.session.parkCursor() catch {};
 }
 
@@ -1313,7 +1353,11 @@ fn refresh(self: *App) !void {
         .{ .columns = window.columns, .rows = window.rows }
     else
         .{ .columns = self.session.columns, .rows = self.session.rows };
-    try self.tty.setAlternateScreen(self.session.mode == .viewing);
+    // A terminal on the legacy screen puts no primary content back, so the conversation reprints
+    // its window. The rows above it stay in the native scrollback.
+    if (try self.tty.setAlternateScreen(self.session.mode == .viewing)) {
+        self.session.view.invalidateWindow();
+    }
     try self.session.paint(size);
 }
 
@@ -1865,8 +1909,8 @@ fn handlePageKey(self: *App, event: *const terminal.Input.Key) !void {
             'c', 'd' => return self.session.closePage(),
             else => return,
         },
-        .up => page.moveUp(size),
-        .down => page.moveDown(size),
+        .up, .scroll_up => page.moveUp(size),
+        .down, .scroll_down => page.moveDown(size),
         .page_up => page.pageUp(size),
         .page_down => page.pageDown(size),
         .home => page.moveHome(),
@@ -1911,6 +1955,25 @@ fn confirmPicker(self: *App) !void {
     const outcome = try picking.select(&context, cursor);
     self.session.closePicker();
     try self.applyOutcome(outcome);
+}
+
+test "only Apple Terminal without a multiplexer takes the legacy screen and mouse reports" {
+    const modern: terminal.Tty.Options = .{};
+    const apple: terminal.Tty.Options = .{ .screen = .legacy, .wheel = .mouse_report };
+    try std.testing.expectEqual(modern, terminalOptions(&.{}));
+    try std.testing.expectEqual(modern, terminalOptions(&.{ .terminal_program = "ghostty" }));
+    try std.testing.expectEqual(apple, terminalOptions(
+        &.{ .terminal_program = "Apple_Terminal", .terminal_type = "xterm-256color" },
+    ));
+    // A multiplexer inherits the name of the terminal that started it. Every marker of one keeps
+    // the modern path, because the multiplexer draws every row itself.
+    const multiplexed: []const Options = &.{
+        .{ .terminal_program = "Apple_Terminal", .tmux_session = "/tmp/tmux-501/default,1,0" },
+        .{ .terminal_program = "Apple_Terminal", .screen_session = "1234.pts-0.host" },
+        .{ .terminal_program = "Apple_Terminal", .terminal_type = "tmux-256color" },
+        .{ .terminal_program = "Apple_Terminal", .terminal_type = "screen-256color" },
+    };
+    for (multiplexed) |options| try std.testing.expectEqual(modern, terminalOptions(&options));
 }
 
 test "OAuth prompts render runtime fields as inert text" {
@@ -3986,6 +4049,10 @@ test "/colors opens the color preview page and ctrl+d restores the conversation"
     // The M toggle has no source to show, so the presentation stays.
     try app.handleKey(&.{ .char = 'm' });
     try std.testing.expect(app.session.mode.viewing.presentation == .colors);
+    try app.handleKey(&.scroll_down);
+    try std.testing.expectEqual(@as(usize, 1), app.session.mode.viewing.scroll);
+    try app.handleKey(&.scroll_up);
+    try std.testing.expectEqual(@as(usize, 0), app.session.mode.viewing.scroll);
     try app.handleKey(&.page_down);
     try std.testing.expect(app.session.mode.viewing.scroll > 0);
 

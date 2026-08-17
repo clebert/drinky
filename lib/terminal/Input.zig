@@ -39,6 +39,11 @@ pub const Key = union(enum) {
     down,
     page_up,
     page_down,
+    /// A vertical scroll gesture from a mouse wheel or trackpad. Only a terminal
+    /// without the alternate-scroll mode reports one, because that mode sends an
+    /// arrow key for a notch instead.
+    scroll_up,
+    scroll_down,
     home,
     end,
     /// A recognized-but-unhandled sequence. Callers ignore it.
@@ -61,6 +66,10 @@ const enter_key = 13;
 const escape_key = 27;
 const shift_bit = 0b001;
 const ctrl_bit = 0b100;
+const mouse_legacy_prefix = "\x1b[M";
+const mouse_modifier_mask = 0b0001_1100;
+const mouse_wheel_up = 64;
+const mouse_wheel_down = 65;
 
 pub fn init(gpa: std.mem.Allocator) Input {
     return .{ .gpa = gpa, .pending = .empty, .start = 0, .in_paste = false };
@@ -163,6 +172,7 @@ fn decodeControlSequence(data: []const u8) ?Decoded {
             .in_paste = decoded.in_paste,
         };
     }
+    if (std.mem.startsWith(u8, data, mouse_legacy_prefix)) return decodeMouseLegacy(data);
     var index: usize = 2;
     while (index < data.len) : (index += 1) {
         const final = data[index];
@@ -173,6 +183,24 @@ fn decodeControlSequence(data: []const u8) ?Decoded {
     }
     if (data.len < sequence_flush_len) return null;
     return .{ .key = .unknown, .consumed = data.len };
+}
+
+/// Decode the six-byte X10 mouse report that a terminal sends without SGR mouse support.
+/// Every field carries an offset of 32, and a coordinate counts from 1. A coordinate byte
+/// below 33 therefore reports a column or a row that cannot exist. A report of a fixed
+/// length needs no flush cap like the generic sequence path. A truncated one holds at most
+/// two bytes back, because the sixth byte always completes it.
+fn decodeMouseLegacy(data: []const u8) ?Decoded {
+    const report_len = mouse_legacy_prefix.len + 3;
+    if (data.len < report_len) return null;
+    const button = data[mouse_legacy_prefix.len];
+    const column = data[mouse_legacy_prefix.len + 1];
+    const row = data[mouse_legacy_prefix.len + 2];
+    const key = if (button < 32 or column < 33 or row < 33)
+        Key.unknown
+    else
+        mapMouseButton(button - 32);
+    return .{ .key = key, .consumed = report_len };
 }
 
 /// A paste body whose begin marker is already consumed. The terminator ends the
@@ -203,11 +231,36 @@ fn mapControlSequence(parameters: []const u8, final: u8) Key {
         if (std.mem.eql(u8, parameters, "6")) return .page_down;
         return .unknown;
     }
+    if ((final == 'M' or final == 'm') and std.mem.startsWith(u8, parameters, "<"))
+        return mapMouseSgr(parameters[1..]);
     if (final == 'u') return mapCsiU(parameters);
     // A modified arrow arrives as `CSI 1 ; modifiers <final>` (Kitty leaves
     // these in the legacy encoding). The UI binds no modified arrow, so every
     // modifier combination decodes as the bare key.
     return mapFinal(final);
+}
+
+/// Decode `button;column;row` from an SGR mouse report. Pith uses the button alone.
+fn mapMouseSgr(parameters: []const u8) Key {
+    var fields = std.mem.splitScalar(u8, parameters, ';');
+    const button_field = fields.next() orelse return .unknown;
+    const column_field = fields.next() orelse return .unknown;
+    const row_field = fields.next() orelse return .unknown;
+    if (fields.next() != null) return .unknown;
+    const button = std.fmt.parseInt(u16, button_field, 10) catch return .unknown;
+    const column = std.fmt.parseInt(u16, column_field, 10) catch return .unknown;
+    const row = std.fmt.parseInt(u16, row_field, 10) catch return .unknown;
+    if (column == 0 or row == 0) return .unknown;
+    return mapMouseButton(button);
+}
+
+fn mapMouseButton(button: u16) Key {
+    const plain = button & ~@as(u16, mouse_modifier_mask);
+    return switch (plain) {
+        mouse_wheel_up => .scroll_up,
+        mouse_wheel_down => .scroll_down,
+        else => .unknown,
+    };
 }
 
 /// Decode a Kitty-protocol `CSI codepoint;modifiers u` key. The parser
@@ -298,6 +351,31 @@ test "arrows and navigation" {
     try expectKeys("\x1bOC", &.{.right});
     try expectKeys("\x1b[H\x1b[4~", &.{ .home, .end });
     try expectKeys("\x1b[5~\x1b[6~", &.{ .page_up, .page_down });
+}
+
+test "SGR and legacy mouse reports decode vertical scroll input" {
+    try expectKeys(
+        "\x1b[<64;12;4M\x1b[<65;12;4M\x1b[<68;12;4M",
+        &.{ .scroll_up, .scroll_down, .scroll_up },
+    );
+    try expectKeys(
+        "\x1b[M\x60\x21\x21\x1b[M\x61\x21\x21",
+        &.{ .scroll_up, .scroll_down },
+    );
+    // A click remains one ignored event. Its coordinates cannot become text.
+    try expectKeys("\x1b[<0;12;4M\x1b[M\x20\x21\x21", &.{ .unknown, .unknown });
+    // A report that names an impossible column or row is ignored whole.
+    try expectKeys("\x1b[<64;0;4M\x1b[M\x60\x20\x21", &.{ .unknown, .unknown });
+}
+
+test "a legacy mouse report waits for its coordinates" {
+    var input = Input.init(std.testing.allocator);
+    defer input.deinit();
+    try input.feed(mouse_legacy_prefix);
+    try std.testing.expectEqual(@as(?Key, null), input.next());
+    try input.feed("\x60\x21\x21");
+    try std.testing.expectEqualDeep(Key.scroll_up, input.next().?);
+    try std.testing.expectEqual(@as(?Key, null), input.next());
 }
 
 test "a modified arrow decodes as the bare key" {

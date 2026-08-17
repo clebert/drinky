@@ -66,6 +66,9 @@ structural_change: bool,
 force_reset: bool,
 /// Full resets leave native scrollback intact, for a view on an alternate screen.
 preserve_scrollback: bool,
+/// Set by `invalidateWindow`: the next reset alone leaves native scrollback intact, whatever the
+/// policy above is. `render` clears it with `force_reset`.
+preserve_scrollback_once: bool,
 
 pub const Size = struct { columns: usize, rows: usize };
 
@@ -330,6 +333,7 @@ pub fn init(gpa: std.mem.Allocator, writer: *std.Io.Writer) View {
         .structural_change = false,
         .force_reset = false,
         .preserve_scrollback = false,
+        .preserve_scrollback_once = false,
     };
 }
 
@@ -357,6 +361,16 @@ pub fn invalidate(self: *View) void {
     self.cursor_visible = false;
 }
 
+/// Reprint the whole window, and keep the native scrollback for this one reset. Use this when the
+/// terminal came back from an alternate screen that put no primary content back. The window on
+/// screen is gone, but every row above it stays reachable. That leave also showed the cursor, so
+/// the tracked state records it as visible.
+pub fn invalidateWindow(self: *View) void {
+    self.resetScreen();
+    self.cursor_visible = true;
+    self.preserve_scrollback_once = true;
+}
+
 /// Make visible-screen resets leave native scrollback intact.
 pub fn preserveScrollback(self: *View) void {
     self.preserve_scrollback = true;
@@ -375,6 +389,7 @@ pub fn forget(self: *View) void {
     self.cursor_visible = false;
     self.structural_change = false;
     self.force_reset = false;
+    self.preserve_scrollback_once = false;
 }
 
 /// Begin the next frame at `size` and `pages`: reset the back frame and hand
@@ -418,7 +433,11 @@ pub fn render(self: *View) !void {
     if (back.rows.items.len == 0) {
         try self.paintEmpty(prev_empty and !self.force_reset);
     } else if (self.force_reset) {
-        try self.paint(.reset, back, .{});
+        if (self.preserve_scrollback_once) {
+            try self.paintWindow(prev, back);
+        } else {
+            try self.paint(.reset, back, .{});
+        }
     } else if (prev_empty or self.structural_change) {
         try self.paint(if (prev_empty) .fresh else .reset, back, .{});
     } else if (findAlignment(prev, back)) |alignment| {
@@ -442,6 +461,7 @@ pub fn render(self: *View) !void {
         try self.paint(.reset, back, .{});
     }
     self.force_reset = false;
+    self.preserve_scrollback_once = false;
     self.front ^= 1;
 }
 
@@ -490,6 +510,20 @@ fn paintAligned(self: *View, prev: *const Frame, back: *Frame, delta: usize) !vo
     } else {
         try self.paintTailOrCaret(back);
     }
+}
+
+/// Reprint every visible row after the terminal wiped the window under the view. The frame keeps
+/// its printed top, so the reprint starts at the screen top and no row enters the scrollback twice.
+/// A frame that starts on screen has no such prefix and takes the reset, which keeps the scrollback
+/// too while the one-shot flag holds.
+fn paintWindow(self: *View, prev: *const Frame, back: *Frame) !void {
+    back.top_line = prev.top_line;
+    const anchor = self.screen_top_line -| back.top_line;
+    const addressable = anchor > 0 and
+        anchor <= back.rows.items.len and
+        self.lineVisible(self.cursor_line);
+    if (!addressable) return self.paint(.reset, back, .{});
+    try self.paint(.incremental, back, .{ .anchor = anchor, .line = self.screen_top_line });
 }
 
 /// Reconcile a frame after the view discards its inaccessible backward prefix.
@@ -632,11 +666,15 @@ fn paintEmpty(self: *View, prev_empty: bool) !void {
 }
 
 fn resetSequence(self: *const View) []const u8 {
-    return if (self.preserve_scrollback) escape.screen_repaint else escape.screen_reset;
+    return if (self.keepsScrollback()) escape.screen_repaint else escape.screen_reset;
+}
+
+fn keepsScrollback(self: *const View) bool {
+    return self.preserve_scrollback or self.preserve_scrollback_once;
 }
 
 fn applyReset(self: *View) void {
-    if (self.preserve_scrollback) {
+    if (self.keepsScrollback()) {
         self.cursor_line = self.screen_top_line;
     } else {
         self.screen_top_line = 0;
@@ -1568,6 +1606,61 @@ test "invalidate forces a full reset even when content is unchanged" {
     try harness.render(&frame, .{ .columns = 10, .rows = 4 }, 2);
     try harness.emulator.expectVisible(&.{ "hello", "world" });
     try std.testing.expect(std.mem.indexOf(u8, harness.lastBytes(), escape.screen_reset) != null);
+}
+
+test "invalidateWindow reprints the window and keeps the rows above it" {
+    const gpa = std.testing.allocator;
+    const harness = try makeHarness(gpa, 10);
+    defer {
+        harness.deinit();
+        gpa.destroy(harness);
+    }
+    // Four rows in a two-row screen: r0 and r1 sit in native scrollback.
+    const tall = [_]Line{ line("r0", 0), line("r1", 1), line("r2", 2), line("r3", 3) };
+    try harness.render(&tall, .{ .columns = 10, .rows = 2 }, 2);
+    try harness.emulator.expectScreen(&.{ "r2", "r3" });
+    try std.testing.expectEqual(@as(usize, 4), harness.emulator.document.items.len);
+
+    // The terminal came back from an alternate screen with an empty window. The same content must
+    // reprint from the screen top, and no row must enter the scrollback a second time.
+    harness.view.invalidateWindow();
+    try harness.render(&tall, .{ .columns = 10, .rows = 2 }, 2);
+    try harness.emulator.expectScreen(&.{ "r2", "r3" });
+    try std.testing.expectEqual(@as(usize, 4), harness.emulator.document.items.len);
+    const last = harness.lastBytes();
+    try std.testing.expect(std.mem.indexOf(u8, last, escape.screen_clear_below) != null);
+    try std.testing.expect(std.mem.indexOf(u8, last, escape.screen_reset) == null);
+    try std.testing.expect(std.mem.indexOf(u8, last, escape.screen_repaint) == null);
+
+    // The one-shot ended with that render, so the policy of the view returns and a reset drops
+    // every row above the window.
+    harness.view.resetScreen();
+    try harness.render(&tall, .{ .columns = 10, .rows = 2 }, 2);
+    try harness.emulator.expectScreen(&.{ "r2", "r3" });
+    try std.testing.expect(std.mem.indexOf(u8, harness.lastBytes(), escape.screen_reset) != null);
+}
+
+test "invalidateWindow on a frame that fits the screen keeps the scrollback" {
+    const gpa = std.testing.allocator;
+    const harness = try makeHarness(gpa, 10);
+    defer {
+        harness.deinit();
+        gpa.destroy(harness);
+    }
+    // Two rows in a two-row screen: the frame starts at the screen top. It has no prefix in the
+    // scrollback, so the clear can take the whole visible screen.
+    const flat = [_]Line{ caretLine("r0", .{ .id = 0, .column = 1 }), line("r1", 1) };
+    try harness.render(&flat, .{ .columns = 10, .rows = 2 }, 2);
+    harness.view.invalidateWindow();
+    try harness.render(&flat, .{ .columns = 10, .rows = 2 }, 2);
+    try harness.emulator.expectScreen(&.{ "r0", "r1" });
+    try std.testing.expectEqual(@as(usize, 2), harness.emulator.document.items.len);
+    const last = harness.lastBytes();
+    try std.testing.expect(std.mem.indexOf(u8, last, escape.screen_repaint) != null);
+    try std.testing.expect(std.mem.indexOf(u8, last, escape.screen_reset) == null);
+    // The leave of the alternate screen showed the cursor, so the caret needs no second show.
+    try std.testing.expect(harness.emulator.cursor_visible);
+    try std.testing.expect(std.mem.indexOf(u8, last, escape.cursor_show) == null);
 }
 
 test "a screen reset drops the scrollback and keeps the cursor visible" {

@@ -14,9 +14,11 @@ cluster processing (DECSET 2027), because it measures one grapheme cluster per c
 with the default colors and the ANSI slots 0 to 15 alone, so the theme of the terminal owns every
 color.
 
-Pith does not test the terminal for these capabilities. An older terminal, such as Apple Terminal,
-still shows the interface. In such a terminal an emoji can take the wrong width and a repaint can
-flicker.
+Pith does not query the terminal for these capabilities. It reads `TERM_PROGRAM` for one exception.
+Apple Terminal has neither the modern alternate screen nor the alternate-scroll mode, so a
+full-window page there takes the older escapes and the mouse reports. Every other terminal takes the
+modern path, and an older one still shows the interface. In such a terminal an emoji can take the
+wrong width and a repaint can flicker.
 
 ## Build
 

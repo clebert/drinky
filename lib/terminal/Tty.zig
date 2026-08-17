@@ -13,6 +13,7 @@ const Tty = @This();
 // share no mutable field. A blocked reader and the consumer's renderer can run
 // concurrently without a lock. Preserve that split.
 io: std.Io,
+options: Options,
 in_handle: std.posix.fd_t,
 out_handle: std.posix.fd_t,
 original: std.posix.termios,
@@ -22,6 +23,32 @@ out_stream: std.Io.File.Writer,
 
 pub const Size = struct { columns: u16, rows: u16 };
 
+/// The alternate-screen generation that the terminal supports.
+pub const Screen = enum {
+    /// DECSET 1049: one mode that saves the cursor, gives a cleared private buffer, and puts the
+    /// primary screen back on leave.
+    modern,
+    /// DECSET 47 with an explicit cursor save: it clears nothing on entry, and it cannot promise
+    /// the primary content on leave.
+    legacy,
+};
+
+/// How the alternate screen receives a wheel notch.
+pub const Wheel = enum {
+    /// DECSET 1007: the terminal sends an arrow key for a notch, so a click stays with the user.
+    alternate_scroll,
+    /// DECSET 1000 with SGR reports: the parser decodes the notch, and the app takes every click
+    /// away from the terminal.
+    mouse_report,
+};
+
+/// The terminal capabilities that the engine cannot query. The caller maps a product onto them, so
+/// no product name enters the engine.
+pub const Options = struct {
+    screen: Screen = .modern,
+    wheel: Wheel = .alternate_scroll,
+};
+
 const RawState = struct {
     raw_owned: bool = false,
     paste_reset_pending: bool = false,
@@ -29,6 +56,9 @@ const RawState = struct {
     grapheme_reset_pending: bool = false,
     cursor_show_pending: bool = false,
     screen_alternate_reset_pending: bool = false,
+    screen_alternate_legacy_reset_pending: bool = false,
+    screen_alternate_scroll_reset_pending: bool = false,
+    screen_alternate_mouse_reset_pending: bool = false,
     screen_alternate_keyboard_reset_pending: bool = false,
     setup_complete: bool = false,
 };
@@ -51,10 +81,11 @@ const PosixSetup = struct {
     }
 };
 
-pub fn init(self: *Tty, io: std.Io) !void {
+pub fn init(self: *Tty, io: std.Io, options: Options) !void {
     const stdin = std.Io.File.stdin();
     const stdout = std.Io.File.stdout();
     self.io = io;
+    self.options = options;
     self.in_handle = stdin.handle;
     self.out_handle = stdout.handle;
     self.raw_state = .{};
@@ -109,9 +140,11 @@ pub fn writer(self: *Tty) *std.Io.Writer {
     return &self.out_stream.interface;
 }
 
-/// Enter or leave the alternate screen. Repeated requests are no-ops.
-pub fn setAlternateScreen(self: *Tty, enabled: bool) !void {
-    try setAlternateScreenWith(&self.raw_state, &self.out_stream.interface, enabled);
+/// Enter or leave the alternate screen. Repeated requests are no-ops. Reports true when a leave
+/// cannot put the primary screen back, so the caller must reprint its window.
+pub fn setAlternateScreen(self: *Tty, enabled: bool) !bool {
+    const output = &self.out_stream.interface;
+    return setAlternateScreenWith(&self.raw_state, output, self.options, enabled);
 }
 
 /// Read available input into `buffer`, and block until some arrives or
@@ -158,29 +191,63 @@ fn enterWith(state: *RawState, output: *std.Io.Writer, control: anytype) !void {
     state.setup_complete = true;
 }
 
-// The alternate screen carries its own keyboard mode stack and cursor
-// visibility, so this re-sends both. Grapheme cluster processing is one
-// terminal-wide mode, which `enterWith` sets once for both screens.
-fn setAlternateScreenWith(state: *RawState, output: *std.Io.Writer, enabled: bool) !void {
+// The alternate screen carries its own keyboard mode stack and cursor visibility, so this
+// re-sends both. Each screen generation also gives the page the wheel in its own way. A leave of
+// the legacy screen reports that the primary content is gone. DECSET 47 puts back no content, and
+// its reset clears the visible screen.
+fn setAlternateScreenWith(
+    state: *RawState,
+    output: *std.Io.Writer,
+    options: Options,
+    enabled: bool,
+) !bool {
     if (enabled) {
-        if (state.screen_alternate_reset_pending) return;
+        if (state.screen_alternate_reset_pending) return false;
         state.screen_alternate_reset_pending = true;
-        try output.writeAll(escape.screen_alternate_set);
+        state.screen_alternate_legacy_reset_pending = options.screen == .legacy;
+        try output.writeAll(switch (options.screen) {
+            .modern => escape.screen_alternate_set,
+            .legacy => escape.screen_alternate_legacy_set,
+        });
+        switch (options.wheel) {
+            .alternate_scroll => {
+                state.screen_alternate_scroll_reset_pending = true;
+                try output.writeAll(escape.scroll_alternate_set);
+            },
+            .mouse_report => {
+                state.screen_alternate_mouse_reset_pending = true;
+                try output.writeAll(escape.mouse_report_set);
+            },
+        }
         state.screen_alternate_keyboard_reset_pending = true;
         try output.writeAll(escape.keyboard_set);
         try output.writeAll(escape.cursor_hide);
         try output.flush();
-        return;
+        return false;
     }
-    if (!state.screen_alternate_reset_pending) return;
+    if (!state.screen_alternate_reset_pending) return false;
+    const content_lost = state.screen_alternate_legacy_reset_pending;
     if (state.screen_alternate_keyboard_reset_pending) {
         try output.writeAll(escape.keyboard_reset);
         state.screen_alternate_keyboard_reset_pending = false;
     }
-    try output.writeAll(escape.screen_alternate_reset);
+    if (state.screen_alternate_scroll_reset_pending) {
+        try output.writeAll(escape.scroll_alternate_reset);
+        state.screen_alternate_scroll_reset_pending = false;
+    }
+    if (state.screen_alternate_mouse_reset_pending) {
+        try output.writeAll(escape.mouse_report_reset);
+        state.screen_alternate_mouse_reset_pending = false;
+    }
+    try output.writeAll(if (state.screen_alternate_legacy_reset_pending)
+        escape.screen_alternate_legacy_reset
+    else
+        escape.screen_alternate_reset);
     try output.writeAll(escape.cursor_show);
     try output.flush();
     state.screen_alternate_reset_pending = false;
+    state.screen_alternate_legacy_reset_pending = false;
+    return content_lost;
 }
 
 fn cleanupWith(
@@ -204,10 +271,24 @@ fn cleanupWith(
         flush_needed = true;
         output.writeAll(escape.keyboard_reset) catch {};
     }
+    if (state.screen_alternate_scroll_reset_pending) {
+        state.screen_alternate_scroll_reset_pending = false;
+        flush_needed = true;
+        output.writeAll(escape.scroll_alternate_reset) catch {};
+    }
+    if (state.screen_alternate_mouse_reset_pending) {
+        state.screen_alternate_mouse_reset_pending = false;
+        flush_needed = true;
+        output.writeAll(escape.mouse_report_reset) catch {};
+    }
     if (state.screen_alternate_reset_pending) {
         state.screen_alternate_reset_pending = false;
         flush_needed = true;
-        output.writeAll(escape.screen_alternate_reset) catch {};
+        output.writeAll(if (state.screen_alternate_legacy_reset_pending)
+            escape.screen_alternate_legacy_reset
+        else
+            escape.screen_alternate_reset) catch {};
+        state.screen_alternate_legacy_reset_pending = false;
     }
     if (state.cursor_show_pending) {
         state.cursor_show_pending = false;
@@ -282,6 +363,12 @@ const TestWriter = struct {
         cursor_show,
         screen_alternate_set,
         screen_alternate_reset,
+        screen_alternate_legacy_set,
+        screen_alternate_legacy_reset,
+        scroll_alternate_set,
+        scroll_alternate_reset,
+        mouse_report_set,
+        mouse_report_reset,
         keyboard_reset,
         paste_reset,
         newline,
@@ -333,6 +420,14 @@ const TestWriter = struct {
         if (std.mem.eql(u8, bytes, escape.cursor_show)) return .cursor_show;
         if (std.mem.eql(u8, bytes, escape.screen_alternate_set)) return .screen_alternate_set;
         if (std.mem.eql(u8, bytes, escape.screen_alternate_reset)) return .screen_alternate_reset;
+        if (std.mem.eql(u8, bytes, escape.screen_alternate_legacy_set))
+            return .screen_alternate_legacy_set;
+        if (std.mem.eql(u8, bytes, escape.screen_alternate_legacy_reset))
+            return .screen_alternate_legacy_reset;
+        if (std.mem.eql(u8, bytes, escape.scroll_alternate_set)) return .scroll_alternate_set;
+        if (std.mem.eql(u8, bytes, escape.scroll_alternate_reset)) return .scroll_alternate_reset;
+        if (std.mem.eql(u8, bytes, escape.mouse_report_set)) return .mouse_report_set;
+        if (std.mem.eql(u8, bytes, escape.mouse_report_reset)) return .mouse_report_reset;
         if (std.mem.eql(u8, bytes, escape.keyboard_reset)) return .keyboard_reset;
         if (std.mem.eql(u8, bytes, escape.paste_reset)) return .paste_reset;
         if (std.mem.eql(u8, bytes, "\r\n")) return .newline;
@@ -405,24 +500,57 @@ test "size reports absence on a handle that is not a terminal" {
     try std.testing.expectEqual(@as(?Size, null), tty.size());
 }
 
-test "alternate screen transitions pair their independent keyboard mode" {
+test "each alternate screen transition pairs its own keyboard, scroll, and mouse modes" {
+    const legacy: Options = .{ .screen = .legacy, .wheel = .mouse_report };
     {
         var output: TestWriter = .{};
         var state: RawState = .{};
-        try setAlternateScreenWith(&state, &output.interface, true);
-        try setAlternateScreenWith(&state, &output.interface, true);
-        try setAlternateScreenWith(&state, &output.interface, false);
-        try setAlternateScreenWith(&state, &output.interface, false);
+        // The modern screen puts the primary content back, so no leave reports a loss.
+        for ([_]bool{ true, true, false, false }) |enabled| {
+            const lost = try setAlternateScreenWith(&state, &output.interface, .{}, enabled);
+            try std.testing.expect(!lost);
+        }
         try std.testing.expectEqual(RawState{}, state);
         try std.testing.expectEqualSlices(
             TestWriter.Operation,
             &.{
                 .screen_alternate_set,
+                .scroll_alternate_set,
                 .keyboard_set,
                 .cursor_hide,
                 .flush,
                 .keyboard_reset,
+                .scroll_alternate_reset,
                 .screen_alternate_reset,
+                .cursor_show,
+                .flush,
+            },
+            output.operations[0..output.operations_len],
+        );
+    }
+    {
+        var output: TestWriter = .{};
+        var state: RawState = .{};
+        // The everyday legacy close: Esc leaves the page and the app keeps running. Only the
+        // first leave reports the loss, because the second one has nothing to reverse.
+        const entered = try setAlternateScreenWith(&state, &output.interface, legacy, true);
+        try std.testing.expect(!entered);
+        const left = try setAlternateScreenWith(&state, &output.interface, legacy, false);
+        try std.testing.expect(left);
+        const left_again = try setAlternateScreenWith(&state, &output.interface, legacy, false);
+        try std.testing.expect(!left_again);
+        try std.testing.expectEqual(RawState{}, state);
+        try std.testing.expectEqualSlices(
+            TestWriter.Operation,
+            &.{
+                .screen_alternate_legacy_set,
+                .mouse_report_set,
+                .keyboard_set,
+                .cursor_hide,
+                .flush,
+                .keyboard_reset,
+                .mouse_report_reset,
+                .screen_alternate_legacy_reset,
                 .cursor_show,
                 .flush,
             },
@@ -436,7 +564,8 @@ test "alternate screen transitions pair their independent keyboard mode" {
             .keyboard_reset_pending = true,
             .cursor_show_pending = true,
         };
-        try setAlternateScreenWith(&state, &output.interface, true);
+        // A shutdown with the page still open reverses the page modes too.
+        _ = try setAlternateScreenWith(&state, &output.interface, .{}, true);
         cleanupWith(&state, &output.interface, &control, false);
         cleanupWith(&state, &output.interface, &control, false);
         try std.testing.expectEqual(RawState{}, state);
@@ -444,11 +573,42 @@ test "alternate screen transitions pair their independent keyboard mode" {
             TestWriter.Operation,
             &.{
                 .screen_alternate_set,
+                .scroll_alternate_set,
                 .keyboard_set,
                 .cursor_hide,
                 .flush,
                 .keyboard_reset,
+                .scroll_alternate_reset,
                 .screen_alternate_reset,
+                .cursor_show,
+                .keyboard_reset,
+                .flush,
+            },
+            output.operations[0..output.operations_len],
+        );
+    }
+    {
+        var output: TestWriter = .{};
+        var control: TestControl = .{};
+        var state: RawState = .{
+            .keyboard_reset_pending = true,
+            .cursor_show_pending = true,
+        };
+        _ = try setAlternateScreenWith(&state, &output.interface, legacy, true);
+        cleanupWith(&state, &output.interface, &control, false);
+        cleanupWith(&state, &output.interface, &control, false);
+        try std.testing.expectEqual(RawState{}, state);
+        try std.testing.expectEqualSlices(
+            TestWriter.Operation,
+            &.{
+                .screen_alternate_legacy_set,
+                .mouse_report_set,
+                .keyboard_set,
+                .cursor_hide,
+                .flush,
+                .keyboard_reset,
+                .mouse_report_reset,
+                .screen_alternate_legacy_reset,
                 .cursor_show,
                 .keyboard_reset,
                 .flush,
@@ -465,7 +625,7 @@ test "alternate screen transitions pair their independent keyboard mode" {
         };
         try std.testing.expectError(
             error.WriteFailed,
-            setAlternateScreenWith(&state, &output.interface, true),
+            setAlternateScreenWith(&state, &output.interface, legacy, true),
         );
         cleanupWith(&state, &output.interface, &control, false);
         cleanupWith(&state, &output.interface, &control, false);
@@ -473,10 +633,10 @@ test "alternate screen transitions pair their independent keyboard mode" {
         try std.testing.expectEqualSlices(
             TestWriter.Operation,
             &.{
-                .screen_alternate_set,
-                .keyboard_set,
-                .keyboard_reset,
-                .screen_alternate_reset,
+                .screen_alternate_legacy_set,
+                .mouse_report_set,
+                .mouse_report_reset,
+                .screen_alternate_legacy_reset,
                 .cursor_show,
                 .keyboard_reset,
                 .flush,

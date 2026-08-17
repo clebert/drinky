@@ -144,6 +144,11 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 
 - The conversation renders inline into the normal screen buffer and real scrollback. Temporary
   full-window pages use the alternate screen and restore the conversation on close.
+- A page asks the terminal to send an arrow key for a wheel notch. A trackpad then scrolls the page,
+  and a drag still selects text.
+- Apple Terminal has no such mode. A page there takes mouse reports and the legacy alternate screen.
+  A trackpad scrolls it, but a text selection needs the Fn key. The close reprints the conversation
+  window.
 - A full-window page scrolls with the arrow keys, PgUp/PgDn, and Home/End. Esc closes it, and its
   header says so. Ctrl+C and Ctrl+D close it too, so an exit attempt always works.
 - Repaints only the rows that changed, atomically. A shrink or height change keeps native scrollback
