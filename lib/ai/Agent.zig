@@ -27,8 +27,10 @@ const redacted_notice = "[redacted thinking]";
 /// never arrived. It does not claim the call never started. One wording covers a
 /// call that was not started, was interrupted, raised without a result, or
 /// changed the world and then recorded no result. Stored without an `Error:`
-/// prefix, which the OpenAI serializer adds for error results.
-const synthetic_result =
+/// prefix, which the OpenAI serializer adds for error results. The consumer
+/// shows the same wording for the call it fails, so the transcript and the
+/// history cannot drift.
+pub const unfinished_tool_result =
     "The tool stopped before Pith recorded a result. " ++
     "Pith does not know if the tool changed the system.";
 
@@ -216,7 +218,7 @@ const Call = struct {
     /// The index in `Agent.items` of this call's reserved `tool_result` slot.
     result_index: usize = 0,
     result: State = .pending,
-    /// Whether the real result has replaced the reserved slot's synthetic
+    /// Whether the real result has replaced the reserved slot's unfinished-call
     /// content, so a later harvest or collection does not move it twice.
     moved: bool = false,
 
@@ -1024,7 +1026,7 @@ fn runToolsWith(
     const calls = call_list.items;
     if (calls.len == 0) return false;
 
-    // Reserve one synthetic error result per call and commit the whole round
+    // Reserve one unfinished-call error result per call and commit the whole round
     // (reply + results) before any side effect can occur. A preparation failure
     // announces and dispatches nothing. The turn rolls back the reply.
     try self.reserveResults(calls);
@@ -1040,7 +1042,7 @@ fn runToolsWith(
     var group: std.Io.Group = .init;
     // On any early exit, reap in-flight tasks, then move every successful,
     // not-yet-moved result into its reserved slot. Errored or never-run calls
-    // keep the conservative synthetic result. This allocates nothing.
+    // keep the conservative unfinished-call result. This allocates nothing.
     errdefer {
         group.cancel(self.io);
         self.harvestResults(calls);
@@ -1074,7 +1076,7 @@ fn runToolsWith(
     return true;
 }
 
-/// Append one synthetic error `tool_result` per call and record each slot's
+/// Append one unfinished-call error `tool_result` per call and record each slot's
 /// index on its `Call`. Capacity is reserved up front so the appends cannot fail
 /// after the first. On a mid-run failure this frees the current call's partial
 /// dupes while the turn rollback frees the slots already committed.
@@ -1084,7 +1086,7 @@ fn reserveResults(self: *Agent, calls: []Call) !void {
     for (calls, 0..) |*call, index| {
         const id_copy = try self.gpa.dupe(u8, call.id);
         errdefer self.gpa.free(id_copy);
-        const content_copy = try self.gpa.dupe(u8, synthetic_result);
+        const content_copy = try self.gpa.dupe(u8, unfinished_tool_result);
         errdefer self.gpa.free(content_copy);
         self.items.appendAssumeCapacity(.{ .tool_result = .{
             .call_id = id_copy,
@@ -1114,10 +1116,10 @@ fn presentReady(
 }
 
 /// Move a completed call's owned result content into its reserved slot and then
-/// present it. The move frees the synthetic content it replaces. It is
+/// present it. The move frees the unfinished-call content it replaces. It is
 /// allocation-free and precedes the fallible callback, so a callback failure
 /// leaves provider-visible history honest. A call that raised and returned no
-/// result propagates its error and leaves the synthetic result intact.
+/// result propagates its error and leaves the unfinished-call result intact.
 fn presentResult(self: *Agent, call: *Call, turn: *TurnState, handler: anytype) !void {
     var result = try call.takeFinished();
     defer result.deinit(self.gpa);
@@ -1130,7 +1132,7 @@ fn presentResult(self: *Agent, call: *Call, turn: *TurnState, handler: anytype) 
 }
 
 /// After tasks are reaped, move every successful, not-yet-moved result into its
-/// slot. An errored or never-run call keeps its synthetic result. No allocation.
+/// slot. An errored or never-run call keeps its unfinished-call result. No allocation.
 fn harvestResults(self: *Agent, calls: []Call) void {
     for (calls) |*call| {
         if (call.moved) continue;
@@ -1142,7 +1144,7 @@ fn harvestResults(self: *Agent, calls: []Call) void {
 }
 
 /// Move a completed result's owned content into its reserved slot. This replaces
-/// and frees the synthetic content the slot held. The result retains every other
+/// and frees the unfinished-call content the slot held. The result retains every other
 /// owned field for its deferred `deinit`.
 fn transferResult(self: *Agent, call: *Call, result: *tool.Result) void {
     const slot = &self.items.items[call.result_index].tool_result;
@@ -3121,7 +3123,7 @@ test "a cancel at the barrier reaps launched reads and starts nothing after it" 
     try std.testing.expectEqual(@as(usize, 1), handler.tool_start_count);
     try std.testing.expectEqual(@as(usize, 0), handler.tool_result_count);
     // The whole round's result slots stay committed and replay-valid: one slot
-    // per call, in call order, and unresolved ones keep their synthetic result.
+    // per call, in call order, and unresolved ones keep their unfinished-call result.
     try std.testing.expectEqual(@as(usize, 3), agent.items.items.len);
     try std.testing.expectEqualStrings("r1", agent.items.items[0].tool_result.call_id);
     try std.testing.expectEqualStrings("w1", agent.items.items[1].tool_result.call_id);
@@ -3556,7 +3558,7 @@ const fake_tools = struct {
 };
 
 // A tool source whose every call is a mutation that raises and returns no
-// result. It exercises the conservative synthetic-result retention path.
+// result. It exercises the conservative unfinished-call result retention path.
 const raising_tools = struct {
     fn mutates(name: []const u8) bool {
         _ = name;
@@ -3687,12 +3689,15 @@ test "a tool error named NotRun propagates and later results are harvested" {
         error.NotRun,
         agent.runToolsWith(not_run_tools, &reply, &turn, &handler),
     );
-    try std.testing.expectEqualStrings(synthetic_result, agent.items.items[0].tool_result.content);
+    try std.testing.expectEqualStrings(
+        unfinished_tool_result,
+        agent.items.items[0].tool_result.content,
+    );
     try std.testing.expectEqualStrings("ok", agent.items.items[1].tool_result.content);
     try std.testing.expectEqual(@as(usize, 0), handler.tool_result_count);
 }
 
-test "a mutation that raises retains the conservative synthetic result" {
+test "a mutation that raises retains the conservative unfinished-call result" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
@@ -3710,10 +3715,13 @@ test "a mutation that raises retains the conservative synthetic result" {
         error.Boom,
         agent.runToolsWith(raising_tools, &reply, &turn, &handler),
     );
-    // The slot stays committed with its honest synthetic result and no callback.
+    // The slot stays committed with its honest unfinished-call result and no callback.
     try std.testing.expectEqual(@as(usize, 1), agent.items.items.len);
     try std.testing.expect(agent.items.items[0].tool_result.is_error);
-    try std.testing.expectEqualStrings(synthetic_result, agent.items.items[0].tool_result.content);
+    try std.testing.expectEqualStrings(
+        unfinished_tool_result,
+        agent.items.items[0].tool_result.content,
+    );
     try std.testing.expectEqual(@as(usize, 0), handler.tool_result_count);
 }
 

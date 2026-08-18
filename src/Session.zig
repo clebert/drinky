@@ -469,14 +469,29 @@ fn applyToolResult(self: *Session, result: TurnEvent.Payload.ToolResult) !void {
     const finished = if (self.activeTurn()) |turn| takeTool(turn, result.name) else null;
     defer if (finished) |*tool| self.freeTool(tool);
     const arguments = if (finished) |tool| tool.input_json else "";
+    try self.appendToolRow(.{
+        .name = result.name,
+        .input_json = arguments,
+        .is_error = result.is_error,
+        .detail = detail,
+    });
+}
+
+/// Append one permanent tool block: the call above its result detail.
+fn appendToolRow(self: *Session, row: struct {
+    name: []const u8,
+    input_json: []const u8,
+    is_error: bool,
+    detail: []const u8,
+}) !void {
     const text = try std.fmt.allocPrint(self.gpa, "Tool: {s} {s}\n{s}: {s}", .{
-        result.name,
-        arguments,
-        if (result.is_error) "Error" else "Result",
-        detail,
+        row.name,
+        row.input_json,
+        if (row.is_error) "Error" else "Result",
+        row.detail,
     });
     defer self.gpa.free(text);
-    try self.transcript.append(.tool_result, result.is_error, text);
+    try self.transcript.append(.tool_result, row.is_error, text);
 }
 
 /// Apply a command outcome to the model: replace its notice, record its event,
@@ -699,13 +714,41 @@ pub fn beginTurn(self: *Session, generation: u64) void {
     self.dirty = true;
 }
 
-/// Abort the running turn's model state: close the open run, drop the turn's
-/// chrome, and record the cancellation. The io-side worker teardown is the
-/// caller's.
+/// Move every running tool call into the transcript as a failed block, oldest
+/// first, and empty the chrome. The agent commits one error result per call
+/// before it dispatches the call, so a block that never arrives hides work that
+/// the next request carries. Each block takes the wording of that committed
+/// result. A block that cannot allocate loses its call. The flush still covers
+/// the calls after it and returns the first error.
+fn flushRunningTools(self: *Session) ?anyerror {
+    const turn = self.activeTurn() orelse return null;
+    var maybe_error: ?anyerror = null;
+    for (turn.tools.items) |*tool| {
+        self.appendToolRow(.{
+            .name = tool.name,
+            .input_json = tool.input_json,
+            .is_error = true,
+            .detail = ai.Agent.unfinished_tool_result,
+        }) catch |err| {
+            if (maybe_error == null) maybe_error = err;
+        };
+        self.freeTool(tool);
+    }
+    turn.tools.clearRetainingCapacity();
+    return maybe_error;
+}
+
+/// Abort the running turn's model state: close the open run, fail every running
+/// tool call, drop the turn's chrome, and record the cancellation. The io-side
+/// worker teardown is the caller's.
 pub fn abortTurn(self: *Session) !void {
+    // The flush runs before the chrome goes, but a lost block must not hide the
+    // cancellation, so its error waits for the event.
+    const maybe_flush_error = self.flushRunningTools();
     self.endTurn();
     self.dirty = true;
     try self.transcript.append(.event, false, "You canceled the turn.");
+    if (maybe_flush_error) |flush_error| return flush_error;
 }
 
 /// Apply a completed turn's receipt, append any cutoff event, and end it. Late
@@ -719,18 +762,23 @@ pub fn endTurnWithReceipt(self: *Session, receipt: *const ai.Agent.Receipt) !voi
 }
 
 /// Rewind a failed turn to committed history, return every uncommitted draft,
-/// append its event, and end it. Infallible after `reserveFailureRestore` until
-/// the event append. Borrows `error_text`. The caller frees it.
+/// fail every running tool call, append its event, and end it. Infallible after
+/// `reserveFailureRestore` until the tool blocks. Borrows `error_text`. The
+/// caller frees it.
 pub fn failTurnWithReceipt(
     self: *Session,
     receipt: *const ai.Agent.Receipt,
     error_text: ?[]const u8,
 ) !void {
     self.reconcileAbnormalReceipt(receipt);
+    // The flush runs before the chrome goes, but a lost block must not hide the
+    // failure, so its error waits for the event.
+    const maybe_flush_error = self.flushRunningTools();
     if (receipt.truncated) try self.transcript.append(.event, false, truncated_event);
     if (error_text) |text| try self.transcript.append(.event, true, text);
     self.transcript.endMessage();
     self.endTurn();
+    if (maybe_flush_error) |flush_error| return flush_error;
 }
 
 /// Resolve the rich steering mirror on a completed terminal: drop the committed
@@ -979,6 +1027,36 @@ const test_model = ai.models.get(.anthropic, "claude-sonnet-4-6") orelse
 
 fn applyEvent(session: *Session, generation: u64, payload: TurnEvent.Payload) !void {
     _ = try session.applyTurnEvent(&.{ .generation = generation, .payload = payload });
+}
+
+// One committed round: a reply, then a call that reports its real result. The
+// sequence numbers mirror what the app's turn handler produces.
+fn applyFinishedToolRound(session: *Session) !void {
+    const gpa = session.gpa;
+    _ = try session.applyTurnEvent(&.{
+        .generation = 1,
+        .progress_sequence = 1,
+        .payload = .{ .text = try gpa.dupe(u8, "answer") },
+    });
+    _ = try session.applyTurnEvent(&.{
+        .generation = 1,
+        .progress_sequence = 2,
+        .progress_sequence_committed = 1,
+        .payload = .{ .tool_start = .{
+            .name = try gpa.dupe(u8, "bash"),
+            .input_json = try gpa.dupe(u8, "{}"),
+        } },
+    });
+    _ = try session.applyTurnEvent(&.{
+        .generation = 1,
+        .progress_sequence = 3,
+        .progress_sequence_committed = 1,
+        .payload = .{ .tool_result = .{
+            .name = try gpa.dupe(u8, "bash"),
+            .content = try gpa.dupe(u8, "ok"),
+            .is_error = false,
+        } },
+    });
 }
 
 // Queue a plain-text (atom-free) steering draft, as a submitted literal line does.
@@ -1815,11 +1893,17 @@ test "a failure after a committed round keeps it and restores only steering" {
     try session.failTurnWithReceipt(&receipt, "boom");
 
     const blocks = session.transcript.blocks();
-    try std.testing.expectEqual(@as(usize, 3), blocks.len);
+    try std.testing.expectEqual(@as(usize, 4), blocks.len);
     try std.testing.expectEqualStrings("prompt", blocks[0].user.items);
     try std.testing.expectEqualStrings("round one", blocks[1].model.items);
-    try std.testing.expect(blocks[2].event.is_error);
-    try std.testing.expectEqualStrings("boom", blocks[2].event.text.items);
+    // The committed round holds the call, so the unfinished tool shows as failed.
+    try std.testing.expect(blocks[2].tool_result.is_error);
+    try std.testing.expectEqualStrings(
+        "Tool: read {}\nError: " ++ ai.Agent.unfinished_tool_result,
+        blocks[2].tool_result.text.items,
+    );
+    try std.testing.expect(blocks[3].event.is_error);
+    try std.testing.expectEqualStrings("boom", blocks[3].event.text.items);
     try std.testing.expectEqualStrings("restore me", session.editor.visible());
     try std.testing.expect(session.turn_origin == null);
     try std.testing.expect(!session.hasSteering());
@@ -1914,6 +1998,160 @@ test "a cancel with a committed round keeps it and drops the in-flight tail" {
     try std.testing.expectEqualStrings("round one", blocks[1].model.items);
     try std.testing.expectEqualStrings("", session.editor.visible());
     try std.testing.expect(session.turn_origin == null);
+}
+
+// The agent commits the reply and one error result per call before it
+// dispatches a tool. A cancel during the call must show that call as failed,
+// because the next request carries it.
+test "a cancel during a tool call keeps the call and shows it as failed" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    defer session.deinit();
+    session.beginTurn(1);
+
+    const base = session.transcript.blocks().len;
+    try session.transcript.append(.user, false, "prompt");
+    var prompt = try ui.Editor.Draft.fromText(gpa, "prompt");
+    session.retainTurnPrompt(&prompt, base);
+
+    _ = try session.applyTurnEvent(&.{
+        .generation = 1,
+        .progress_sequence = 1,
+        .payload = .{ .thinking = try gpa.dupe(u8, "I run one command.") },
+    });
+    _ = try session.applyTurnEvent(&.{
+        .generation = 1,
+        .progress_sequence = 2,
+        .progress_sequence_committed = 1,
+        .payload = .{ .tool_start = .{
+            .name = try gpa.dupe(u8, "bash"),
+            .input_json = try gpa.dupe(u8, "{\"command\":\"sleep 600\"}"),
+        } },
+    });
+
+    try session.reserveSteeringRestore();
+    session.cancelReceipt(&.{
+        .history_base = 0,
+        .history_end = 3,
+        .steering_committed_count = 0,
+    }, 1);
+    try session.abortTurn();
+
+    const blocks = session.transcript.blocks();
+    try std.testing.expectEqual(@as(usize, 4), blocks.len);
+    try std.testing.expectEqualStrings("prompt", blocks[0].user.items);
+    try std.testing.expectEqualStrings("I run one command.", blocks[1].thinking.items);
+    try std.testing.expect(blocks[2].tool_result.is_error);
+    try std.testing.expectEqualStrings(
+        "Tool: bash {\"command\":\"sleep 600\"}\nError: " ++ ai.Agent.unfinished_tool_result,
+        blocks[2].tool_result.text.items,
+    );
+    try std.testing.expect(!blocks[3].event.is_error);
+    try std.testing.expectEqualStrings("You canceled the turn.", blocks[3].event.text.items);
+    try std.testing.expect(session.mode == .prompt);
+}
+
+// Read-only calls of one reply run in parallel, so a cancel can find several
+// running. Their blocks must keep call order.
+test "running tool calls fail oldest first" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    defer session.deinit();
+    session.beginTurn(1);
+
+    const names = [_][]const u8{ "read", "grep", "read" };
+    for (names, 0..) |name, index| {
+        _ = try session.applyTurnEvent(&.{
+            .generation = 1,
+            .progress_sequence = index + 1,
+            .payload = .{ .tool_start = .{
+                .name = try gpa.dupe(u8, name),
+                .input_json = try std.fmt.allocPrint(gpa, "{{\"index\":{d}}}", .{index}),
+            } },
+        });
+    }
+    try session.abortTurn();
+
+    const blocks = session.transcript.blocks();
+    try std.testing.expectEqual(names.len + 1, blocks.len);
+    for (names, 0..) |name, index| {
+        const head = try std.fmt.allocPrint(gpa, "Tool: {s} {{\"index\":{d}}}\n", .{ name, index });
+        defer gpa.free(head);
+        try std.testing.expect(std.mem.startsWith(u8, blocks[index].tool_result.text.items, head));
+    }
+}
+
+// A tool block of the ending round is committed history, so both abnormal
+// terminals must keep it. The cancel adopts the worker's final frontier, which
+// no event carried, because a canceled worker queues no terminal fence.
+test "a finished tool block survives a cancel in the same round" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    defer session.deinit();
+    session.beginTurn(1);
+
+    const base = session.transcript.blocks().len;
+    try session.transcript.append(.user, false, "prompt");
+    var prompt = try ui.Editor.Draft.fromText(gpa, "prompt");
+    session.retainTurnPrompt(&prompt, base);
+    try applyFinishedToolRound(&session);
+
+    try session.reserveSteeringRestore();
+    // `onToolResult` moved the worker's frontier to the result event.
+    session.cancelReceipt(&.{
+        .history_base = 0,
+        .history_end = 3,
+        .steering_committed_count = 0,
+    }, 3);
+    try session.abortTurn();
+
+    const blocks = session.transcript.blocks();
+    try std.testing.expectEqual(@as(usize, 4), blocks.len);
+    try std.testing.expect(!blocks[2].tool_result.is_error);
+    try std.testing.expect(std.mem.endsWith(u8, blocks[2].tool_result.text.items, "Result: ok"));
+    try std.testing.expectEqualStrings("You canceled the turn.", blocks[3].event.text.items);
+}
+
+// The failure path takes that frontier from the worker's terminal fence instead.
+test "a finished tool block survives a failure in the same round" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    defer session.deinit();
+    session.beginTurn(1);
+
+    const base = session.transcript.blocks().len;
+    try session.transcript.append(.user, false, "prompt");
+    var prompt = try ui.Editor.Draft.fromText(gpa, "prompt");
+    session.retainTurnPrompt(&prompt, base);
+    try applyFinishedToolRound(&session);
+    _ = try session.applyTurnEvent(&.{
+        .generation = 1,
+        .progress_sequence = 4,
+        .progress_sequence_committed = 3,
+        .payload = .turn_ended,
+    });
+
+    const receipt: ai.Agent.Receipt = .{
+        .history_base = 0,
+        .history_end = 3,
+        .steering_committed_count = 0,
+    };
+    try session.reserveFailureRestore(&receipt);
+    try session.failTurnWithReceipt(&receipt, "boom");
+
+    const blocks = session.transcript.blocks();
+    try std.testing.expectEqual(@as(usize, 4), blocks.len);
+    try std.testing.expect(!blocks[2].tool_result.is_error);
+    try std.testing.expect(std.mem.endsWith(u8, blocks[2].tool_result.text.items, "Result: ok"));
+    try std.testing.expectEqualStrings("boom", blocks[3].event.text.items);
 }
 
 test "a final commit frontier keeps an open reply when no later event carries it" {

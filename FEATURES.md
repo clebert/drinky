@@ -19,8 +19,8 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - Esc or Ctrl+D cancels a turn and keeps the draft. Ctrl+C clears a draft in the editor first, and
   cancels only on an empty editor. Canceled or failed turns keep finished rounds, drop the in-flight
   tail, and return uncommitted text to the editor.
-- A tool call left unfinished is recorded as an error, so a canceled mutation is never lost
-  silently.
+- Pith records a tool call left unfinished as an error in the history. The transcript shows it as a
+  failed call, so a canceled mutation is never hidden.
 - Timeouts and transient failures retry the whole request and clear the partial reply first.
 - A failed turn that committed work arms a retry above the editor. Ctrl+N asks the model to
   continue, Enter adds the editor text, and Esc discards the retry.
