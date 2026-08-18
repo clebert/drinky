@@ -48,20 +48,6 @@ decision already taken, or a dependency on another entry. Module layout and exte
   intercept a terminal copy, so the painted rows must line up._
 - **Pick the provider first, then the model** — so neither list grows too long. _`/model` and
   `/login` list account and model together today._
-- **A parked message and a message history** — the user parks the editor content to run a command,
-  and walks earlier messages with the arrow keys. _Ctrl+P already recalls the steering queue._
-- **Context-window pressure signal** — the context gauge warns as it fills, and feeds a compaction
-  threshold. _The thresholds are configurable. Color the gauge as it fills, and consider the same
-  accent for the branch, the model, and the effort level. Fold in two model-specific dimensions:
-  tiered pricing above a context threshold, and OpenAI's effective context window (decoded at login
-  but unused). The effective window must drive the warning while the catalog window stays the
-  displayed limit. Quality degradation has no evidence-based number, so keep it a soft warning._
-- **A two-line status bar** — a narrow window falls back to two rows instead of dropping fields.
-  _Shorter quota text and shorter labels are the cheaper first step._
-- **Read the last prompt and the last answer during a turn** — a full-window page shows the
-  submitted prompt or the last answer, with no need to cancel. _Pith already retains the submitted
-  prompt's rich draft for the whole turn._
-- **A diff view for an edit** — an `edit` result shows what changed instead of a stat line alone.
 - **Configurable transcript window** — the 8-page transcript window moves into `config.json` and
   trades scrollback retention against per-frame redraw cost. _Clamp to at least one page._
 - **A retry is recorded in the transcript** — a transcript event names each retry attempt and its
@@ -70,6 +56,16 @@ decision already taken, or a dependency on another entry. Module layout and exte
   the response head and shows nothing. A later refinement can narrow it to an attempt that discards
   streamed rows. `Agent.fetchReply` retries at four points but reports only `onStreamReset`, which
   runs on a discarded partial reply alone, so the handler needs one more callback._
+- **Context-window pressure signal** — the context gauge warns as it fills, and feeds a compaction
+  threshold. _The thresholds are configurable. Color the gauge as it fills, and consider the same
+  accent for the branch, the model, and the effort level. Fold in two model-specific dimensions:
+  tiered pricing above a context threshold, and OpenAI's effective context window (decoded at login
+  but unused). The effective window must drive the warning while the catalog window stays the
+  displayed limit. Quality degradation has no evidence-based number, so keep it a soft warning._
+- **A two-line status bar** — a narrow window falls back to two rows instead of dropping fields.
+  _Shorter quota text and shorter labels are the cheaper first step._
+- **A parked message and a message history** — the user parks the editor content to run a command,
+  and walks earlier messages with the arrow keys. _Ctrl+P already recalls the steering queue._
 
 ## Features
 
@@ -99,13 +95,15 @@ decision already taken, or a dependency on another entry. Module layout and exte
 - **A configurable bash guard** — `bash` refuses a command that matches a user pattern, and reports
   the refusal. _The user owns the pattern list, and `git add` is one example. There is no permission
   model and no prompt for consent._
+- **Per-model instructions** — pith loads the instruction file that belongs to the active model, so
+  guidance can differ per model. _A model switch reloads the file._
+- **`/handoff`** — compact the conversation into a summary and continue with the reclaimed context.
+  _The command must also summarize canceled turns and the synthesized tool results they leave
+  behind._
 - **`/session` breakdown** — a per-turn ledger backs a session summary of tokens, cost, and cache
   savings, split by model. _Cost belongs in the ledger, not in history items. Billing is per
   request. History must stay byte-stable for cache hits. A canceled turn's reply rolls back out of
   history. Canceled and failed turns get their own entries, so cost survives `/handoff` compaction._
-- **`/handoff`** — compact the conversation into a summary and continue with the reclaimed context.
-  _The command must also summarize canceled turns and the synthesized tool results they leave
-  behind._
 - **`/cache-retention`** — choose the active model's prompt-cache retention where the provider
   offers a real choice. _Anthropic offers 5m and 1h. The 1h write costs 2x base input against 1.25x,
   so pricing needs a per-TTL write rate. One TTL across all breakpoints sidesteps the ordering rule.
@@ -118,8 +116,6 @@ decision already taken, or a dependency on another entry. Module layout and exte
   adds an OpenAI-compatible endpoint, without a rebuild. _Compiled defaults stay authoritative, so a
   known model always has a known context window. The file patches or adds alone. The endpoint form
   opens local and third-party models: ds4, qwen 3.6 27b, qwen 3.8 27b, gemma4, glimmer._
-- **Per-model instructions** — pith loads the instruction file that belongs to the active model, so
-  guidance can differ per model. _A model switch reloads the file._
 
 ## Ideas
 
