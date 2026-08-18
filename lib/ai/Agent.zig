@@ -1814,7 +1814,7 @@ const CaptureHandler = struct {
         self: *CaptureHandler,
         name: []const u8,
         content: []const u8,
-        maybe_summary: ?[]const u8,
+        maybe_summary: ?tool.Result.Summary,
         is_error: bool,
     ) !void {
         _ = name;
@@ -3124,7 +3124,7 @@ test "a barrier presents the reads before it before announcing its mutation" {
             self: *@This(),
             name: []const u8,
             _: []const u8,
-            _: ?[]const u8,
+            _: ?tool.Result.Summary,
             _: bool,
         ) !void {
             try self.note("-", name);
@@ -3607,7 +3607,7 @@ const fake_tools = struct {
         errdefer context.gpa.free(content);
         return .{
             .content = content,
-            .summary = try context.gpa.dupe(u8, "summary"),
+            .summary = .{ .text = try context.gpa.dupe(u8, "summary") },
             .is_error = false,
         };
     }
@@ -3643,7 +3643,7 @@ const not_run_tools = struct {
         errdefer context.gpa.free(content);
         return .{
             .content = content,
-            .summary = try context.gpa.dupe(u8, "summary"),
+            .summary = .{ .text = try context.gpa.dupe(u8, "summary") },
             .is_error = false,
         };
     }
@@ -3704,11 +3704,11 @@ test "a completed mutation's real result survives a callback failure" {
             _: *@This(),
             _: []const u8,
             _: []const u8,
-            maybe_summary: ?[]const u8,
+            maybe_summary: ?tool.Result.Summary,
             _: bool,
         ) !void {
             const summary = maybe_summary orelse return error.NoSummary;
-            try std.testing.expectEqualStrings("summary", summary);
+            try std.testing.expectEqualStrings("summary", summary.text);
             return error.Boom;
         }
     };

@@ -46,14 +46,12 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
         path,
     });
     errdefer result.deinit(gpa);
-    // Every tool that touches a file reports the same two measures in the same
-    // order, so one row reads like the next. The model keeps the exact byte
-    // count in the content above.
-    var scale: [16]u8 = undefined;
-    result.summary = try std.fmt.allocPrint(gpa, "Lines: {d} · Size: {s}", .{
-        format.lines(contents),
-        format.bytes(&scale, contents.len),
-    });
+    // The whole file is what the call produced, so the line counts it. `write`
+    // never reads the file it replaces, so it cannot state a change. The model
+    // keeps the exact byte count in the content above.
+    result.summary = .{
+        .text = try std.fmt.allocPrint(gpa, "Lines: {d}", .{format.lines(contents)}),
+    };
     return result;
 }
 
@@ -128,9 +126,9 @@ test "write canceled mid-write propagates and leaves the file untouched" {
     try std.testing.expectEqualStrings("old", data);
 }
 
-// Every tool that touches a file reports the same two measures under one rule,
-// so a write and a read of the same bytes cannot disagree about them.
-test "the box reports the lines and the size of what was written" {
+// `write` and `read` count lines under one rule, so a write and a read of the
+// same bytes cannot disagree about the number.
+test "the box reports the lines of what was written" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     const context: Context = .{ .gpa = gpa, .io = io };
@@ -145,5 +143,5 @@ test "the box reports the lines and the size of what was written" {
     defer result.deinit(gpa);
     try std.testing.expect(!result.is_error);
     // A closing line break ends the third line, it does not open a fourth.
-    try std.testing.expectEqualStrings("Lines: 3 · Size: 14 B", result.summary.?);
+    try std.testing.expectEqualStrings("Lines: 3", result.summary.?.text);
 }

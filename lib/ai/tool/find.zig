@@ -104,7 +104,7 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
     const summary = try summary_output.toOwnedSlice();
     errdefer gpa.free(summary);
     const content = try out.toOwnedSlice();
-    return .{ .content = content, .summary = summary, .is_error = false };
+    return .{ .content = content, .summary = .{ .text = summary }, .is_error = false };
 }
 
 test "find matches files by glob under a directory" {
@@ -125,7 +125,7 @@ test "find matches files by glob under a directory" {
     const expected =
         try std.fmt.bufPrint(&expected_buf, ".zig-cache/tmp/{s}/a.zig", .{tmp.sub_path});
     try std.testing.expectEqualStrings(expected, result.content);
-    try std.testing.expectEqualStrings("Matches: 1", result.summary.?);
+    try std.testing.expectEqualStrings("Matches: 1", result.summary.?.text);
 }
 
 test "find reports how many more matched beyond the limit" {
@@ -150,7 +150,7 @@ test "find reports how many more matched beyond the limit" {
         .{tmp.sub_path},
     );
     try std.testing.expectEqualStrings(expected, result.content);
-    try std.testing.expectEqualStrings("Matches: 1 · Omitted matches: 2", result.summary.?);
+    try std.testing.expectEqualStrings("Matches: 1 · Omitted matches: 2", result.summary.?.text);
 }
 
 test "find reports when no files match" {
@@ -169,5 +169,5 @@ test "find reports when no files match" {
     try std.testing.expectEqualStrings("No files match *.md.", result.content);
     // An empty search still states its count, so the box reads like every other
     // result of this tool.
-    try std.testing.expectEqualStrings("Matches: 0", result.summary.?);
+    try std.testing.expectEqualStrings("Matches: 0", result.summary.?.text);
 }

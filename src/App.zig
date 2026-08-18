@@ -229,18 +229,19 @@ const TurnHandler = struct {
         self: *TurnHandler,
         name: []const u8,
         content: []const u8,
-        maybe_summary: ?[]const u8,
+        maybe_summary: ?ai.tool.Result.Summary,
         is_error: bool,
     ) !void {
         // The model reads the output, so only the box line reaches the consumer.
         _ = content;
         const name_copy = try self.app.gpa.dupe(u8, name);
         errdefer self.app.gpa.free(name_copy);
-        const maybe_summary_copy = if (maybe_summary) |summary|
-            try self.app.gpa.dupe(u8, summary)
+        // The copy keeps the shape beside the text it belongs to.
+        const maybe_summary_copy: ?ai.tool.Result.Summary = if (maybe_summary) |summary|
+            .{ .text = try self.app.gpa.dupe(u8, summary.text), .kind = summary.kind }
         else
             null;
-        errdefer if (maybe_summary_copy) |summary_copy| self.app.gpa.free(summary_copy);
+        errdefer if (maybe_summary_copy) |summary_copy| self.app.gpa.free(summary_copy.text);
         try self.enqueue(.{ .tool_result = .{
             .name = name_copy,
             .summary = maybe_summary_copy,
@@ -567,7 +568,7 @@ pub fn run(
     self.session.branch_root = self.project_instructions.projectRoot();
     self.refreshBranch();
 
-    try self.session.transcript.append(.intro, false, intro_text);
+    try self.session.transcript.append(.intro, .{}, intro_text);
     // Surface any configured default-model name that did not resolve, so a typo or
     // a wrong-vendor entry does not disappear silently.
     for (config.dropped_models) |dropped| try self.recordEvent(
@@ -1409,7 +1410,7 @@ fn startSteeringTurn(self: *App) !void {
     errdefer prompt.deinit(self.gpa);
     const base = self.session.transcript.blocks().len;
     errdefer self.session.transcript.truncate(base);
-    try self.session.transcript.append(.user, false, joined);
+    try self.session.transcript.append(.user, .{}, joined);
     self.session.dirty = true;
     try self.runTurn(joined);
     self.session.retainTurnPrompt(&prompt, base);
@@ -1746,9 +1747,9 @@ fn appendSkillPrompt(self: *App, prompt: *const ai.command.Outcome.Prompt) !usiz
     errdefer self.session.transcript.truncate(base);
     const marker = try self.skillMarker(prompt);
     defer self.gpa.free(marker);
-    try self.session.transcript.append(.skill, false, marker);
+    try self.session.transcript.append(.skill, .{}, marker);
     if (prompt.arguments.len > 0)
-        try self.session.transcript.append(.user, false, prompt.arguments);
+        try self.session.transcript.append(.user, .{}, prompt.arguments);
     return base;
 }
 
@@ -1776,7 +1777,7 @@ fn displayRoots(self: *const App) ai.format.Roots {
 /// rewind checkpoint.
 fn startUserTurn(self: *App, text: []const u8) !usize {
     const base = self.session.transcript.blocks().len;
-    try self.session.transcript.append(.user, false, text);
+    try self.session.transcript.append(.user, .{}, text);
     errdefer self.session.transcript.truncate(base);
     try self.runTurn(text);
     self.session.dirty = true;
@@ -1831,8 +1832,8 @@ fn startRetryTurn(self: *App, input: []const u8) !usize {
     errdefer self.session.transcript.truncate(base);
     // The complete request stays out of the transcript, as a skill marker keeps
     // its expanded file out of it.
-    try self.session.transcript.append(.event, false, Retry.event_text);
-    if (input.len > 0) try self.session.transcript.append(.user, false, input);
+    try self.session.transcript.append(.event, .{}, Retry.event_text);
+    if (input.len > 0) try self.session.transcript.append(.user, .{}, input);
     try self.runTurn(text);
     // The turn owns the request now, so the hint leaves with the context it named.
     // A failure of this attempt arms the context again from its own error.
@@ -2549,7 +2550,7 @@ test "turn producers keep their captured generation" {
     {
         const summary = try gpa.dupe(u8, "summary");
         defer gpa.free(summary);
-        try handler.onToolResult("read", "result", summary, false);
+        try handler.onToolResult("read", "result", .{ .text = summary }, false);
     }
     try handler.onUsage(.{});
     try handler.onStreamReset();
@@ -2575,7 +2576,7 @@ test "turn producers keep their captured generation" {
     };
     try std.testing.expectEqual(@as(u64, 2), events[2].turn.progress_sequence_committed);
     const tool_result = events[3].turn.payload.tool_result;
-    try std.testing.expectEqualStrings("summary", tool_result.summary.?);
+    try std.testing.expectEqualStrings("summary", tool_result.summary.?.text);
     try std.testing.expectEqual(@as(u64, 4), events[4].turn.progress_sequence_committed);
     try std.testing.expect(events[events.len - 1].turn.payload == .turn_ended);
 }
@@ -3520,7 +3521,7 @@ test "a cancel that loses the race applies the failed joined result" {
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
     defer app.session.deinit();
     app.session.beginTurn(3);
-    try app.session.transcript.append(.user, false, "prompt");
+    try app.session.transcript.append(.user, .{}, "prompt");
     var prompt = try ui.Editor.Draft.fromText(gpa, "prompt");
     app.session.retainTurnPrompt(&prompt, 0);
     try seedSteering(&app, "steer");
@@ -4200,7 +4201,7 @@ test "/new clears the conversation and the scrollback without a configuration ch
     };
     app.agent.stats = seeded;
     try app.agent.steering.push("old steering");
-    try app.session.transcript.append(.user, false, "old prompt");
+    try app.session.transcript.append(.user, .{}, "old prompt");
     app.session.stats_shown = seeded;
     try seedSteering(&app, "old steering");
     // Paint the old conversation first, so its frame holds the screen.
@@ -4252,7 +4253,7 @@ test "/system opens the composed prompt alone and escape restores the conversati
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
     defer app.session.deinit();
 
-    try app.session.transcript.append(.event, false, "history marker");
+    try app.session.transcript.append(.event, .{}, "history marker");
     try app.session.editor.insert("/system");
     try app.submit();
 
@@ -4333,7 +4334,7 @@ test "/colors opens the color preview page and ctrl+d restores the conversation"
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
     defer app.session.deinit();
 
-    try app.session.transcript.append(.event, false, "history marker");
+    try app.session.transcript.append(.event, .{}, "history marker");
     try app.session.editor.insert("/colors");
     try app.submit();
 
@@ -5145,7 +5146,7 @@ test "an uncommitted human failure returns to the editor and arms no retry" {
     defer app.session.deinit();
     defer app.dropRetry();
 
-    try app.session.transcript.append(.user, false, "write the docs");
+    try app.session.transcript.append(.user, .{}, "write the docs");
     app.session.beginTurn(1);
     try app.session.editor.insert("write the docs");
     var prompt = app.session.editor.detachTrimmed();
@@ -5917,7 +5918,7 @@ test "an idle submit of a slash line with a tail is refused and keeps its text" 
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
     defer app.session.deinit();
-    try app.session.transcript.append(.user, false, "history marker");
+    try app.session.transcript.append(.user, .{}, "history marker");
 
     try app.session.editor.insert("/new must clear the terminal scrollback");
     try app.submit();
@@ -6459,7 +6460,7 @@ test "a committed cancel drains queued progress into the transcript before rewin
     app.session.beginTurn(5);
 
     const base = app.session.transcript.blocks().len;
-    try app.session.transcript.append(.user, false, "prompt");
+    try app.session.transcript.append(.user, .{}, "prompt");
     var prompt = try ui.Editor.Draft.fromText(gpa, "prompt");
     app.session.retainTurnPrompt(&prompt, base);
 
@@ -6492,7 +6493,7 @@ test "a committed cancel drains queued progress into the transcript before rewin
             .progress_sequence_committed = 2,
             .payload = .{ .tool_result = .{
                 .name = try gpa.dupe(u8, "read"),
-                .summary = try gpa.dupe(u8, "Lines: 1 · Size: 2 B"),
+                .summary = .{ .text = try gpa.dupe(u8, "Lines: 1") },
                 .is_error = false,
             } },
         } },
@@ -6520,7 +6521,7 @@ test "a committed cancel drains queued progress into the transcript before rewin
     try std.testing.expectEqualStrings("prompt", blocks[0].user.items);
     try std.testing.expectEqualStrings("answer", blocks[1].model.items);
     try std.testing.expectEqualStrings(
-        "Tool: read\nLines: 1 · Size: 2 B",
+        "Tool: read\nLines: 1",
         blocks[2].tool_result.text.items,
     );
     try std.testing.expect(!blocks[3].event.is_error);

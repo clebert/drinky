@@ -96,7 +96,7 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
         errdefer gpa.free(content);
         return .{
             .content = content,
-            .summary = try gpa.dupe(u8, "Lines: 0 · Size: 0 B"),
+            .summary = .{ .text = try gpa.dupe(u8, "Lines: 0") },
             .is_error = false,
         };
     }
@@ -131,7 +131,6 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
     }
     if (!truncated and (last + 1 < total or data[data.len - 1] == '\n'))
         try out.writer.writeAll("\n");
-    const body_bytes = out.written().len;
     if (truncated) {
         const written = out.written();
         const separator =
@@ -151,27 +150,19 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
         );
     }
 
-    var size_buffer: [16]u8 = undefined;
-    const size = format.bytes(&size_buffer, body_bytes);
-    const remaining = total - (last + 1);
     const truncation_suffix = if (truncated) " · Line: Truncated" else "";
-    const summary = if (start == 0 and remaining == 0)
-        try std.fmt.allocPrint(gpa, "Lines: {d} · Size: {s}{s}", .{
-            shown, size, truncation_suffix,
-        })
-    else if (remaining == 0)
-        try std.fmt.allocPrint(gpa, "Lines: {d}–{d} of {d} · Size: {s}{s}", .{
-            start + 1, last + 1, total, size, truncation_suffix,
-        })
+    // A read of the whole file states the one number that matters. A read that
+    // left part of the file out states the range against the total, which says
+    // what stayed out without a count of its own.
+    const summary = if (start == 0 and last + 1 == total)
+        try std.fmt.allocPrint(gpa, "Lines: {d}{s}", .{ shown, truncation_suffix })
     else
-        try std.fmt.allocPrint(
-            gpa,
-            "Lines: {d}–{d} of {d} · Size: {s} · Remaining lines: {d}{s}",
-            .{ start + 1, last + 1, total, size, remaining, truncation_suffix },
-        );
+        try std.fmt.allocPrint(gpa, "Lines: {d}–{d} of {d}{s}", .{
+            start + 1, last + 1, total, truncation_suffix,
+        });
     errdefer gpa.free(summary);
     const content = try out.toOwnedSlice();
-    return .{ .content = content, .summary = summary, .is_error = false };
+    return .{ .content = content, .summary = .{ .text = summary }, .is_error = false };
 }
 
 /// The largest length no greater than `max` that does not split a UTF-8
@@ -211,8 +202,9 @@ test "read paginates and points at the next offset" {
     try std.testing.expect(!result.is_error);
     try std.testing.expect(std.mem.startsWith(u8, result.content, "one\n"));
     try std.testing.expect(std.mem.indexOf(u8, result.content, "Use offset=2 to continue") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result.summary.?, "Lines: 1–1 of 3") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result.summary.?, "Remaining lines: 2") != null);
+    // The range against the total says what stayed out, so no second count
+    // repeats it.
+    try std.testing.expectEqualStrings("Lines: 1–1 of 3", result.summary.?.text);
 }
 
 test "read summarizes a fully shown file" {
@@ -228,7 +220,7 @@ test "read summarizes a fully shown file" {
     const result = try run(&context, input);
     defer result.deinit(gpa);
     try std.testing.expect(!result.is_error);
-    try std.testing.expectEqualStrings("Lines: 3 · Size: 13 B", result.summary.?);
+    try std.testing.expectEqualStrings("Lines: 3", result.summary.?.text);
 }
 
 test "read does not count a trailing newline as an empty line" {
@@ -244,7 +236,7 @@ test "read does not count a trailing newline as an empty line" {
     const result = try run(&context, input);
     defer result.deinit(gpa);
     try std.testing.expectEqualStrings("one\n", result.content);
-    try std.testing.expectEqualStrings("Lines: 1 · Size: 4 B", result.summary.?);
+    try std.testing.expectEqualStrings("Lines: 1", result.summary.?.text);
 }
 
 test "read summarizes an empty file as zero lines" {
@@ -260,7 +252,7 @@ test "read summarizes an empty file as zero lines" {
     const result = try run(&context, input);
     defer result.deinit(gpa);
     try std.testing.expectEqualStrings("", result.content);
-    try std.testing.expectEqualStrings("Lines: 0 · Size: 0 B", result.summary.?);
+    try std.testing.expectEqualStrings("Lines: 0", result.summary.?.text);
 }
 
 test "read rejects an offset past the end of the file" {
@@ -412,7 +404,7 @@ test "read truncates a single line longer than the byte cap" {
     try std.testing.expect(!result.is_error);
     try std.testing.expect(result.content.len < bytes_max + 100);
     try std.testing.expect(std.mem.indexOf(u8, result.content, "truncated") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result.summary.?, "Line: Truncated") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.summary.?.text, "Line: Truncated") != null);
 }
 
 test "read clamps an explicit limit to the line cap" {

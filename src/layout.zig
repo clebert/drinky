@@ -301,9 +301,9 @@ test "projection stacks the transcript above the tail, newest at the bottom" {
         for (entries.items) |*entry| entry.deinit(gpa);
         entries.deinit(gpa);
     }
-    try entries.append(gpa, try ui.block.Entry.init(gpa, .intro, false, "introxx"));
-    try entries.append(gpa, try ui.block.Entry.init(gpa, .user, false, "useryy"));
-    try entries.append(gpa, try ui.block.Entry.init(gpa, .model, false, "replyzz"));
+    try entries.append(gpa, try ui.block.Entry.init(gpa, .intro, .{}, "introxx"));
+    try entries.append(gpa, try ui.block.Entry.init(gpa, .user, .{}, "useryy"));
+    try entries.append(gpa, try ui.block.Entry.init(gpa, .model, .{}, "replyzz"));
 
     const scene: Scene = .{ .conversation = .{
         .transcript = entries.items,
@@ -457,7 +457,10 @@ test "a prompt tail shows its hint row above the editor" {
         for (entries.items) |*entry| entry.deinit(gpa);
         entries.deinit(gpa);
     }
-    try entries.append(gpa, try ui.block.Entry.init(gpa, .event, true, "the turn failed"));
+    try entries.append(
+        gpa,
+        try ui.block.Entry.init(gpa, .event, .{ .is_error = true }, "the turn failed"),
+    );
 
     const scene: Scene = .{ .conversation = .{
         .transcript = entries.items,
@@ -530,7 +533,7 @@ test "projection clips the oldest block to fill the window exactly" {
         for (entries.items) |*entry| entry.deinit(gpa);
         entries.deinit(gpa);
     }
-    try entries.append(gpa, try ui.block.Entry.init(gpa, .model, false, text.items));
+    try entries.append(gpa, try ui.block.Entry.init(gpa, .model, .{}, text.items));
 
     const scene: Scene = .{ .conversation = .{
         .transcript = entries.items,

@@ -34,11 +34,11 @@ pub fn deinit(self: *Transcript) void {
 pub fn append(
     self: *Transcript,
     kind: ui.block.Entry.Kind,
-    is_error: bool,
+    options: ui.block.Entry.Options,
     text: []const u8,
 ) !void {
     self.endMessage();
-    var entry = try ui.block.Entry.init(self.gpa, kind, is_error, text);
+    var entry = try ui.block.Entry.init(self.gpa, kind, options, text);
     errdefer entry.deinit(self.gpa);
     try self.entries.append(self.gpa, entry);
 }
@@ -62,7 +62,7 @@ pub fn appendStream(self: *Transcript, kind: ui.block.Entry.Kind, delta: []const
 /// Open a streamed block of `kind` at the tail and return its index. Record it
 /// as the message's first block when none has opened yet.
 fn openRun(self: *Transcript, kind: ui.block.Entry.Kind) !usize {
-    var entry = try ui.block.Entry.init(self.gpa, kind, false, "");
+    var entry = try ui.block.Entry.init(self.gpa, kind, .{}, "");
     errdefer entry.deinit(self.gpa);
     try self.entries.append(self.gpa, entry);
     const index = self.entries.items.len - 1;
@@ -111,7 +111,7 @@ test "streamed deltas collect into one block until a discrete block ends the run
     try std.testing.expectEqual(@as(usize, 1), transcript.entries.items.len);
     try std.testing.expectEqualStrings("hello", transcript.entries.items[0].model.items);
 
-    try transcript.append(.user, false, "hi");
+    try transcript.append(.user, .{}, "hi");
     try transcript.appendStream(.model, "more");
     try std.testing.expectEqual(@as(usize, 3), transcript.entries.items.len);
     try std.testing.expectEqualStrings("more", transcript.entries.items[2].model.items);
@@ -152,7 +152,7 @@ test "discardMessage drops the open run so a retry starts clean" {
     var transcript = Transcript.init(gpa);
     defer transcript.deinit();
 
-    try transcript.append(.user, false, "hi");
+    try transcript.append(.user, .{}, "hi");
     try transcript.appendStream(.model, "partial");
     try std.testing.expectEqual(@as(usize, 2), transcript.entries.items.len);
 
@@ -174,8 +174,8 @@ test "truncate removes optimistic tail blocks" {
     var transcript = Transcript.init(gpa);
     defer transcript.deinit();
 
-    try transcript.append(.user, false, "keep");
-    try transcript.append(.user, false, "rollback");
+    try transcript.append(.user, .{}, "keep");
+    try transcript.append(.user, .{}, "rollback");
     transcript.truncate(1);
     try std.testing.expectEqual(@as(usize, 1), transcript.blocks().len);
     try std.testing.expectEqualStrings("keep", transcript.blocks()[0].user.items);
@@ -199,7 +199,7 @@ test "discard drops a partial message's reasoning and answer together" {
     var transcript = Transcript.init(gpa);
     defer transcript.deinit();
 
-    try transcript.append(.user, false, "hi");
+    try transcript.append(.user, .{}, "hi");
     try transcript.appendStream(.thinking, "thinking");
     try transcript.appendStream(.model, "partial");
     try std.testing.expectEqual(@as(usize, 3), transcript.entries.items.len);

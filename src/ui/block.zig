@@ -22,18 +22,46 @@ pub const Entry = union(enum) {
     tool_result: Flagged,
     event: Flagged,
 
-    pub const Flagged = struct { text: std.ArrayList(u8), is_error: bool };
+    pub const Flagged = struct {
+        text: std.ArrayList(u8),
+        is_error: bool,
+        /// How a line wider than the window fits. Only a tool box reads it. An
+        /// event renders as a notice, which always cuts.
+        fit: paint.Fit,
+    };
     pub const Kind = std.meta.Tag(Entry);
 
-    /// A new block that owns a copy of `text`. The plain variants ignore
-    /// `is_error`.
-    pub fn init(gpa: std.mem.Allocator, kind: Kind, is_error: bool, text: []const u8) !Entry {
+    /// What a block carries beyond its text. A variant that ignores a field
+    /// takes its default, so a plain block states nothing.
+    pub const Options = struct {
+        /// Whether the block reports a failure. It paints the error role, and
+        /// it gives an event its prefix. The plain variants ignore it.
+        is_error: bool = false,
+        /// How a tool box fits a line that is wider than the window. A call row
+        /// and a measures line cut, because the start of each identifies it. The
+        /// sentence of a failure wraps, because its instruction sits at the end,
+        /// and a cut there takes the half the user needs.
+        fit: paint.Fit = .head,
+    };
+
+    /// A new block that owns a copy of `text`.
+    pub fn init(
+        gpa: std.mem.Allocator,
+        kind: Kind,
+        options: Options,
+        text: []const u8,
+    ) !Entry {
         var list: std.ArrayList(u8) = .empty;
         errdefer list.deinit(gpa);
         try list.appendSlice(gpa, text);
+        const flagged: Flagged = .{
+            .text = list,
+            .is_error = options.is_error,
+            .fit = options.fit,
+        };
         return switch (kind) {
-            .tool_result => .{ .tool_result = .{ .text = list, .is_error = is_error } },
-            .event => .{ .event = .{ .text = list, .is_error = is_error } },
+            .tool_result => .{ .tool_result = flagged },
+            .event => .{ .event = flagged },
             inline else => |tag| @unionInit(Entry, @tagName(tag), list),
         };
     }
@@ -54,7 +82,7 @@ pub const Entry = union(enum) {
             .event => |flagged| std.mem.count(u8, flagged.text.items, "\n") + 1,
             .user => |text| paint.boxRows(&.{ .text = text.items }, columns),
             .tool_result => |flagged| paint.boxRows(
-                &toolBox(flagged.text.items, flagged.is_error),
+                &.{ .text = flagged.text.items, .fit = flagged.fit },
                 columns,
             ),
             .thinking, .model => |text| markdown.rows(text.items, columns),
@@ -84,27 +112,13 @@ pub const Entry = union(enum) {
             .tool_result => |flagged| try paint.box(
                 placement,
                 if (flagged.is_error) .tool_error else .tool_success,
-                &toolBox(flagged.text.items, flagged.is_error),
+                &.{ .text = flagged.text.items, .fit = flagged.fit },
             ),
             .thinking => |text| try markdown.render(placement, .muted, text.items),
             .model => |text| try markdown.render(placement, null, text.items),
         }
     }
 };
-
-/// A finished tool call keeps its call row, and the line the tool decided below
-/// it. A successful call cuts each line at the window, because the start of the
-/// line carries what identifies it: the tool and its subject above, the leading
-/// measures below.
-///
-/// A failed call wraps instead. Its detail is a whole sentence that names what
-/// went wrong and what to do about it, and that instruction sits at the end. A
-/// cut there takes the half the user needs and leaves it nowhere in the
-/// interface. The cost is that a failed call with long arguments takes more
-/// rows, which is the call whose arguments the user wants to read anyway.
-fn toolBox(text: []const u8, is_error: bool) paint.Box {
-    return .{ .text = text, .fit = if (is_error) .wrap else .head };
-}
 
 /// Physical rows in a fresh paint: the view joins its inert rows with `\r\n`,
 /// and row text cannot emit those separators, so they count physical rows.
@@ -166,32 +180,42 @@ fn renderedRows(gpa: std.mem.Allocator, entry: *const Entry, columns: usize, ski
 // per entry variant, with content that wraps and carries blank lines.
 test "each entry variant renders exactly the rows it counts" {
     const gpa = std.testing.allocator;
-    const cases = [_]struct { kind: Entry.Kind, is_error: bool, text: []const u8 }{
-        .{ .kind = .intro, .is_error = false, .text = "a single intro line" },
-        .{ .kind = .event, .is_error = false, .text = "first\nsecond\nthird" },
-        .{ .kind = .event, .is_error = true, .text = "boom" },
-        .{ .kind = .user, .is_error = false, .text = "a user message long enough to wrap " ++
+    const cases = [_]struct { kind: Entry.Kind, options: Entry.Options, text: []const u8 }{
+        .{ .kind = .intro, .options = .{}, .text = "a single intro line" },
+        .{ .kind = .event, .options = .{}, .text = "first\nsecond\nthird" },
+        .{ .kind = .event, .options = .{ .is_error = true }, .text = "boom" },
+        .{ .kind = .user, .options = .{}, .text = "a user message long enough to wrap " ++
             "across the narrow test width more than once" },
-        .{ .kind = .skill, .is_error = false, .text = "zig-style · Size: 3.1 KB\n" ++
+        .{ .kind = .skill, .options = .{}, .text = "zig-style · Size: 3.1 KB\n" ++
             "Source: .agents/skills/zig-style/SKILL.md" },
-        .{ .kind = .model, .is_error = false, .text = "model reply\nwith a blank\n\n" ++
+        .{ .kind = .model, .options = .{}, .text = "model reply\nwith a blank\n\n" ++
             "then a long paragraph that must wrap several rows" },
-        .{ .kind = .thinking, .is_error = false, .text = "reasoning that runs on\n\n" ++
+        .{ .kind = .thinking, .options = .{}, .text = "reasoning that runs on\n\n" ++
             "long enough to wrap across the narrow test width more than once" },
         // Markdown, whose prefixes and indents can outgrow the narrow widths.
-        .{ .kind = .model, .is_error = false, .text = markdown_reply },
-        .{ .kind = .thinking, .is_error = false, .text = markdown_reply },
-        .{ .kind = .tool_result, .is_error = true, .text = "read foo.zig\n→ no such file" },
+        .{ .kind = .model, .options = .{}, .text = markdown_reply },
+        .{ .kind = .thinking, .options = .{}, .text = markdown_reply },
+        .{
+            .kind = .tool_result,
+            .options = .{ .is_error = true, .fit = .wrap },
+            .text = "read foo.zig\n→ no such file",
+        },
+        // A failure that states measures cuts its lines like a success does.
+        .{
+            .kind = .tool_result,
+            .options = .{ .is_error = true },
+            .text = "Tool: bash · Command: ls\nTime: 0.4s · Exit code: 1",
+        },
         // A call whose tool decided no box line is the call row alone.
-        .{ .kind = .tool_result, .is_error = false, .text = "Tool: describe_config" },
+        .{ .kind = .tool_result, .options = .{}, .text = "Tool: describe_config" },
         // A wide-glyph box, to exercise the narrow-width row cap.
-        .{ .kind = .user, .is_error = false, .text = "你好世界" },
+        .{ .kind = .user, .options = .{}, .text = "你好世界" },
     };
     // Includes widths narrower than a box's borders and the error prefix, where
     // `Sink.end`'s one-row assertion pins the renderers' clamps.
     const widths = [_]usize{ 16, 3, 2 };
     for (cases) |case| {
-        var entry = try Entry.init(gpa, case.kind, case.is_error, case.text);
+        var entry = try Entry.init(gpa, case.kind, case.options, case.text);
         defer entry.deinit(gpa);
         for (widths) |columns| {
             const painted = try renderedRows(gpa, &entry, columns, 0);
@@ -211,7 +235,7 @@ test "a skill entry names its head once and indents the rows below it" {
     var entry = try Entry.init(
         gpa,
         .skill,
-        false,
+        .{},
         "zig-style · Size: 3.1 KB\nSource: .agents/skills/zig-style/SKILL.md",
     );
     defer entry.deinit(gpa);
@@ -242,9 +266,9 @@ test "no box carries a pad, so a copy of the rows lines up" {
     var view = terminal.View.init(gpa, &out.writer);
     defer view.deinit();
 
-    var user = try Entry.init(gpa, .user, false, "a user message that wraps over two rows");
+    var user = try Entry.init(gpa, .user, .{}, "a user message that wraps over two rows");
     defer user.deinit(gpa);
-    var thinking = try Entry.init(gpa, .thinking, false, "reasoning that wraps over two rows");
+    var thinking = try Entry.init(gpa, .thinking, .{}, "reasoning that wraps over two rows");
     defer thinking.deinit(gpa);
 
     const columns = 20;
@@ -269,31 +293,32 @@ test "no box carries a pad, so a copy of the rows lines up" {
     try expectRowOpensOnText(painted, "reasoning that wraps");
 }
 
-// A failed call names what went wrong and what to do about it, and the
-// instruction sits at the end of that sentence. A cut there takes the half the
-// user needs, so a failed box wraps while a successful one keeps one row a line.
-test "a failed tool box wraps its detail and a successful one cuts it" {
+// A sentence names what went wrong and what to do about it, and the instruction
+// sits at its end. A cut there takes the half the user needs, so a box that
+// holds a sentence wraps while every other box keeps one row a line. The failure
+// flag decides the color alone, never the fit.
+test "a tool box wraps a sentence and cuts a line of measures" {
     const gpa = std.testing.allocator;
     const columns = 20;
     const head = "Tool: edit · File: a.zig";
     const detail = "Error: Pith found old_text more than once. Add more text around it.";
     const text = head ++ "\n" ++ detail;
 
-    var failed = try Entry.init(gpa, .tool_result, true, text);
-    defer failed.deinit(gpa);
-    var succeeded = try Entry.init(gpa, .tool_result, false, text);
-    defer succeeded.deinit(gpa);
+    var wrapped = try Entry.init(gpa, .tool_result, .{ .is_error = true, .fit = .wrap }, text);
+    defer wrapped.deinit(gpa);
+    var cut = try Entry.init(gpa, .tool_result, .{ .is_error = true }, text);
+    defer cut.deinit(gpa);
 
     // Two padding rows plus one row a line for the cut box.
-    try std.testing.expectEqual(@as(usize, 4), succeeded.rows(columns));
-    try std.testing.expect(failed.rows(columns) > succeeded.rows(columns));
+    try std.testing.expectEqual(@as(usize, 4), cut.rows(columns));
+    try std.testing.expect(wrapped.rows(columns) > cut.rows(columns));
 
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
     var view = terminal.View.init(gpa, &out.writer);
     defer view.deinit();
     const sink = try view.beginFrame(.{ .columns = columns, .rows = 24 }, 8);
-    try failed.render(&.{ .sink = sink, .id = 0, .columns = columns, .base = 0, .skip = 0 });
+    try wrapped.render(&.{ .sink = sink, .id = 0, .columns = columns, .base = 0, .skip = 0 });
     try view.render();
     // The tail of the sentence reaches the interface, and no row cut it.
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "around it.") != null);
@@ -333,9 +358,9 @@ test "an error event paints the error role and its prefix" {
     defer out.deinit();
     var view = terminal.View.init(gpa, &out.writer);
     defer view.deinit();
-    var failure = try Entry.init(gpa, .event, true, "boom");
+    var failure = try Entry.init(gpa, .event, .{ .is_error = true }, "boom");
     defer failure.deinit(gpa);
-    var success = try Entry.init(gpa, .event, false, "all good");
+    var success = try Entry.init(gpa, .event, .{}, "all good");
     defer success.deinit(gpa);
 
     const sink = try view.beginFrame(.{ .columns = 40, .rows = 100 }, 8);

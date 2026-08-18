@@ -1,6 +1,7 @@
 //! What a tool handler returns. The model reads the `content` as the
 //! `tool_result` block. The transcript box shows the optional one-line
-//! `summary` below the call row. A flag reports failure.
+//! `summary` below the call row, in the shape that summary names. A flag reports
+//! failure.
 
 const std = @import("std");
 
@@ -8,20 +9,38 @@ const Result = @This();
 
 /// The caller's allocator owns the content until `takeContent` transfers it.
 content: []const u8,
-/// The second line of the transcript box: a one-line stat — lines read, matches
-/// found — or the sentence of a failure. Null leaves the box with its call row
+/// The second line of the transcript box. Null leaves the box with its call row
 /// alone. The tool decides this line, and Pith never derives it from the
-/// content. The caller's allocator owns it.
-summary: ?[]const u8 = null,
+/// content.
+summary: ?Summary = null,
 is_error: bool,
 content_taken: bool = false,
 
 pub const Status = enum { ok, err };
 
+/// The line below the call row: its text, and the shape that decides how the box
+/// shows it. The two travel together, so no line can reach the box in a shape
+/// that its text does not read in. The caller's allocator owns the text.
+pub const Summary = struct {
+    text: []const u8,
+    kind: Kind = .measures,
+
+    /// The two shapes a summary line can take.
+    ///
+    /// `measures` is a line of keys and values, such as `Exit code: 1`. It names
+    /// its own state, so the box adds no prefix and cuts the line at the window,
+    /// where the keys in front carry what identifies it.
+    ///
+    /// `sentence` is a whole sentence that ends on the instruction the user
+    /// needs. The box wraps it and marks it with `Error: `, so no cut takes the
+    /// half that says what to do.
+    pub const Kind = enum { measures, sentence };
+};
+
 /// Free every allocation the result still owns.
 pub fn deinit(self: *const Result, gpa: std.mem.Allocator) void {
     if (!self.content_taken) gpa.free(self.content);
-    if (self.summary) |summary| gpa.free(summary);
+    if (self.summary) |summary| gpa.free(summary.text);
 }
 
 /// Transfer content ownership. Every presentation-only allocation stays with
@@ -44,10 +63,16 @@ pub fn report(
     comptime format: []const u8,
     args: anytype,
 ) !Result {
+    const failed = status == .err;
     const content = try std.fmt.allocPrint(gpa, format, args);
     errdefer gpa.free(content);
-    const summary = if (status == .err) try gpa.dupe(u8, content) else null;
-    return .{ .content = content, .summary = summary, .is_error = status == .err };
+    // A success states no line of its own. A tool that adds one assigns the
+    // whole summary, so it names the shape of that line in the same statement.
+    const summary: ?Summary = if (failed)
+        .{ .text = try gpa.dupe(u8, content), .kind = .sentence }
+    else
+        null;
+    return .{ .content = content, .summary = summary, .is_error = failed };
 }
 
 /// Report an I/O failure as a complete sentence with the operation, path,
@@ -74,14 +99,15 @@ test "a failure reports its sentence as the box line and a success does not" {
     const failure = try report(gpa, .err, "Pith could not read {s}.", .{"a.zig"});
     defer failure.deinit(gpa);
     try std.testing.expect(failure.is_error);
-    try std.testing.expectEqualStrings("Pith could not read a.zig.", failure.summary.?);
+    try std.testing.expectEqualStrings("Pith could not read a.zig.", failure.summary.?.text);
+    try std.testing.expectEqual(Summary.Kind.sentence, failure.summary.?.kind);
     // The two strings are separate allocations, so `deinit` frees both.
-    try std.testing.expect(failure.content.ptr != failure.summary.?.ptr);
+    try std.testing.expect(failure.content.ptr != failure.summary.?.text.ptr);
 
     const success = try report(gpa, .ok, "Pith wrote {s}.", .{"a.zig"});
     defer success.deinit(gpa);
     try std.testing.expect(!success.is_error);
-    try std.testing.expectEqual(@as(?[]const u8, null), success.summary);
+    try std.testing.expectEqual(@as(?Summary, null), success.summary);
 }
 
 test "takeContent transfers only content ownership" {
@@ -91,7 +117,11 @@ test "takeContent transfers only content ownership" {
         gpa.free(content);
         return err;
     };
-    var result: Result = .{ .content = content, .summary = summary, .is_error = false };
+    var result: Result = .{
+        .content = content,
+        .summary = .{ .text = summary },
+        .is_error = false,
+    };
 
     const taken = result.takeContent();
     defer gpa.free(taken);

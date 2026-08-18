@@ -131,10 +131,10 @@ fn timedOut(gpa: std.mem.Allocator, elapsed_ms: i64, timeout_ms: u64) !Result {
         format.duration(&limit, @intCast(@min(timeout_ms, std.math.maxInt(i64)))),
     });
     errdefer gpa.free(content);
-    const summary = try std.fmt.allocPrint(gpa, "Status: Timed out · Time: {s}", .{
+    const summary = try std.fmt.allocPrint(gpa, "Time: {s} · Status: Timed out", .{
         format.duration(&scale, elapsed_ms),
     });
-    return .{ .content = content, .summary = summary, .is_error = true };
+    return .{ .content = content, .summary = .{ .text = summary }, .is_error = true };
 }
 
 fn execute(context: *const Context, command: []const u8, timeout_ms: u64) !Completed {
@@ -268,6 +268,10 @@ fn decodeAt(bytes: []const u8, index: usize) ?usize {
 
 /// Build the tool result: a truncation note when the tail was cut, the kept
 /// window, and a status line when the command failed.
+///
+/// Every end state reports the same measures, so a command that exited with a
+/// non-zero code reads as a command that ran, not as a broken tool. The failure
+/// flag still reaches the model, and the box still marks it.
 fn render(
     gpa: std.mem.Allocator,
     output: []const u8,
@@ -311,30 +315,26 @@ fn render(
     }
     var summary_output: std.Io.Writer.Allocating = .init(gpa);
     errdefer summary_output.deinit();
+    var scale: [24]u8 = undefined;
+    // The run time comes first, because the row above counted up to it and a
+    // narrow window cuts the tail of this row.
+    try summary_output.writer.print("Time: {s}", .{format.duration(&scale, elapsed_ms)});
     // `code` is the number the command returned. `Status` names a state instead,
     // so a killed command cannot read as one that exited.
     switch (term) {
-        .exited => |code| try summary_output.writer.print("Exit code: {d}", .{code}),
-        else => try summary_output.writer.writeAll("Status: Terminated"),
+        .exited => |code| try summary_output.writer.print(" · Exit code: {d}", .{code}),
+        else => try summary_output.writer.writeAll(" · Status: Terminated"),
     }
-    var scale: [24]u8 = undefined;
-    // The run time comes first among the measures, because the row above counted
-    // up to it and a narrow window cuts the tail of this row.
-    try summary_output.writer.print(" · Time: {s}", .{format.duration(&scale, elapsed_ms)});
-    // The two measures below name the whole output, not the tail the box keeps,
-    // and they read in the same order as every other tool that reports them. A
-    // command that printed nothing reports neither, because a zero pair says
-    // less than its absence.
+    // The line count names the whole output, not the tail the box keeps. A
+    // command that printed nothing reports none, because a zero says less than
+    // its absence. A failed command reports the same fields as one that worked.
     const lines = format.lines(output);
-    if (lines > 0) try summary_output.writer.print(" · Lines: {d} · Size: {s}", .{
-        lines,
-        format.bytes(&scale, output.len),
-    });
+    if (lines > 0) try summary_output.writer.print(" · Lines: {d}", .{lines});
     if (start > 0) try summary_output.writer.writeAll(" · Output: Truncated");
     const summary = try summary_output.toOwnedSlice();
     errdefer gpa.free(summary);
     const content = try result_writer.toOwnedSlice();
-    return .{ .content = content, .summary = summary, .is_error = failed };
+    return .{ .content = content, .summary = .{ .text = summary }, .is_error = failed };
 }
 
 /// The offset of the largest tail within both configured limits. Prefer whole
@@ -399,13 +399,13 @@ test "bash reports a non-zero exit as an error" {
     try std.testing.expect(std.mem.indexOf(u8, result.content, "boom") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.content, "code 3") != null);
     // A real command takes a real, varying time, so the row's shape is what
-    // this pins down.
-    try std.testing.expect(std.mem.startsWith(
-        u8,
-        result.summary.?,
-        "Exit code: 3 · Time: ",
-    ));
-    try std.testing.expect(std.mem.indexOf(u8, result.summary.?, " · Lines: 1 · Size: ") != null);
+    // this pins down. A non-zero exit states the measures a success states, and
+    // the box shows them with no prefix of its own.
+    try std.testing.expect(std.mem.startsWith(u8, result.summary.?.text, "Time: "));
+    try std.testing.expect(
+        std.mem.endsWith(u8, result.summary.?.text, " · Exit code: 3 · Lines: 1"),
+    );
+    try std.testing.expectEqual(Result.Summary.Kind.measures, result.summary.?.kind);
 }
 
 test "bash reports empty successful output" {
@@ -417,7 +417,9 @@ test "bash reports empty successful output" {
     defer result.deinit(gpa);
     try std.testing.expect(!result.is_error);
     try std.testing.expectEqualStrings("(No output)", result.content);
-    try std.testing.expect(std.mem.startsWith(u8, result.summary.?, "Exit code: 0 · Time: "));
+    try std.testing.expect(std.mem.startsWith(u8, result.summary.?.text, "Time: "));
+    // A command that printed nothing reports no line count.
+    try std.testing.expect(std.mem.endsWith(u8, result.summary.?.text, " · Exit code: 0"));
 }
 
 test "bash honors a per-call timeout" {
@@ -430,7 +432,8 @@ test "bash honors a per-call timeout" {
     try std.testing.expect(result.is_error);
     try std.testing.expect(std.mem.indexOf(u8, result.content, "timed out after 1.0s") != null);
     // Every command reports its run time, so a stopped one keeps that row too.
-    try std.testing.expect(std.mem.startsWith(u8, result.summary.?, "Status: Timed out · Time: "));
+    try std.testing.expect(std.mem.startsWith(u8, result.summary.?.text, "Time: "));
+    try std.testing.expect(std.mem.endsWith(u8, result.summary.?.text, " · Status: Timed out"));
 }
 
 test "bash timeout is absolute while output arrives" {
@@ -540,8 +543,8 @@ test "render summary discloses line and byte truncation" {
         const result = try render(gpa, "a\nb\nc\n", &limits, .{ .exited = 0 }, false, 1_500);
         defer result.deinit(gpa);
         try std.testing.expectEqualStrings(
-            "Exit code: 0 · Time: 1.5s · Lines: 3 · Size: 6 B · Output: Truncated",
-            result.summary.?,
+            "Time: 1.5s · Exit code: 0 · Lines: 3 · Output: Truncated",
+            result.summary.?.text,
         );
     }
     {
@@ -549,8 +552,8 @@ test "render summary discloses line and byte truncation" {
         const result = try render(gpa, "abcdef\n", &limits, .{ .exited = 0 }, false, 0);
         defer result.deinit(gpa);
         try std.testing.expectEqualStrings(
-            "Exit code: 0 · Time: 0.0s · Lines: 1 · Size: 7 B · Output: Truncated",
-            result.summary.?,
+            "Time: 0.0s · Exit code: 0 · Lines: 1 · Output: Truncated",
+            result.summary.?.text,
         );
     }
 }

@@ -44,7 +44,7 @@ test "the tool returns the injected document and no box line" {
     defer result.deinit(std.testing.allocator);
     try std.testing.expect(!result.is_error);
     try std.testing.expectEqualStrings("# Pith configuration\n", result.content);
-    try std.testing.expectEqual(@as(?[]const u8, null), result.summary);
+    try std.testing.expectEqual(@as(?Result.Summary, null), result.summary);
 }
 
 test "a host without a document reports an error" {

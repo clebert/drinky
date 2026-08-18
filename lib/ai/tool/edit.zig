@@ -95,13 +95,16 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
         return Result.cannot(gpa, err, "write", path);
     var result = try Result.report(gpa, .ok, "Pith edited {s}.", .{path});
     errdefer result.deinit(gpa);
-    // An edit rewrites the whole file, so both measures describe the file the
-    // edit left, not the span that changed.
-    var scale: [16]u8 = undefined;
-    result.summary = try std.fmt.allocPrint(gpa, "Lines: {d} · Size: {s}", .{
-        format.lines(updated),
-        format.bytes(&scale, updated.len),
-    });
+    // The line counts the lines `old_text` took out against the lines
+    // `new_text` put in, and it borrows the `-` and `+` of a diff to show them.
+    // The two numbers measure the span the call replaced, not the lines that
+    // differ inside it, so an edit that rewrites part of a line reports that
+    // whole line on both sides. The size of the file the edit left says nothing
+    // about what the call did.
+    result.summary = .{ .text = try std.fmt.allocPrint(gpa, "Lines: -{d} +{d}", .{
+        format.lines(old),
+        format.lines(new),
+    }) };
     return result;
 }
 
@@ -166,6 +169,35 @@ test "edit rewrites the file on disk" {
     const data = try tmp.dir.readFileAlloc(io, "f.txt", gpa, .limited(64));
     defer gpa.free(data);
     try std.testing.expectEqualStrings("one 2 three", data);
+}
+
+// The box line counts the span the call replaced, in the `-` and `+` of a diff.
+// A replacement inside one line takes that whole line out and puts one line in.
+// A deletion puts none in.
+test "the box reports the lines the edit took out and put in" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const context: Context = .{ .gpa = gpa, .io = io };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "f.txt", .data = "one\ntwo\nthree\nfour\n" });
+    var input_buf: [192]u8 = undefined;
+    {
+        const input = try std.fmt.bufPrint(&input_buf,
+            \\{{"path":".zig-cache/tmp/{s}/f.txt","old_text":"two\nthree","new_text":"2"}}
+        , .{tmp.sub_path});
+        const result = try run(&context, input);
+        defer result.deinit(gpa);
+        try std.testing.expectEqualStrings("Lines: -2 +1", result.summary.?.text);
+    }
+    {
+        const input = try std.fmt.bufPrint(&input_buf,
+            \\{{"path":".zig-cache/tmp/{s}/f.txt","old_text":"2\n","new_text":""}}
+        , .{tmp.sub_path});
+        const result = try run(&context, input);
+        defer result.deinit(gpa);
+        try std.testing.expectEqualStrings("Lines: -1 +0", result.summary.?.text);
+    }
 }
 
 test "edit canceled while reading propagates" {

@@ -48,8 +48,8 @@ const StreamedTool = struct {
     /// The timed row of `ActiveTool` changes on every frame instead, so that one
     /// is built at paint time.
     ///
-    /// `Received` names the wire, never the file. A finished call reports the
-    /// file as `Size`, so the two counts cannot be read as the same measure.
+    /// `Received` names the wire, never the file. It is the one count in a box
+    /// that reads in bytes, because it measures a transfer in progress.
     box: std.ArrayList(u8),
 
     fn deinit(self: *StreamedTool, gpa: std.mem.Allocator) void {
@@ -310,7 +310,9 @@ pub const TurnEvent = struct {
         /// output, so the event carries the box line alone.
         pub const ToolResult = struct {
             name: []u8,
-            summary: ?[]u8 = null,
+            /// The box line the tool decided, with the shape it decided for it.
+            /// The event owns the text.
+            summary: ?ai.tool.Result.Summary = null,
             is_error: bool,
         };
         pub const SteeringConsumed = struct { text: []u8, count: usize };
@@ -325,7 +327,7 @@ pub const TurnEvent = struct {
             },
             .tool_result => |result| {
                 gpa.free(result.name);
-                if (result.summary) |summary| gpa.free(summary);
+                if (result.summary) |summary| gpa.free(summary.text);
             },
             .steering_consumed => |consumed| gpa.free(consumed.text),
             .usage, .stream_reset, .turn_ended => {},
@@ -556,7 +558,7 @@ pub fn applyTurnEvent(self: *Session, event: *const TurnEvent) !bool {
             // retain the rich drafts: a consumed batch can still roll back
             // (until its following reply commits). The receipt — not this
             // event — decides whether to drop or recover each draft.
-            try self.transcript.append(.user, false, consumed.text);
+            try self.transcript.append(.user, .{}, consumed.text);
             // Advance the consumed frontier, then the view frontier to cover it,
             // without double-counting drafts an earlier Ctrl+P already hid.
             self.steering_consumed_count =
@@ -627,29 +629,39 @@ const ToolBlock = struct {
     /// The call row: the tool and what it acts on. Every block keeps it, so the
     /// history shows that the call happened.
     head: []const u8,
-    /// The result row below it: a stat summary, or a whole sentence. Null when
-    /// the tool decided that the call needs no second row.
-    detail: ?[]const u8,
+    /// The result row below it, with the shape that decides how the box shows
+    /// it. Null when the tool decided that the call needs no second row. The
+    /// text is borrowed.
+    detail: ?ai.tool.Result.Summary,
     is_error: bool,
 };
 
 /// Append one permanent tool block: the call above its result detail. A block
 /// without a detail is the call row alone.
 ///
-/// A successful detail carries its own keys, or reads as a whole sentence, so a
-/// `Result` key in front of it only labels a label and spends columns the row
-/// truncates. A failed one takes `Error`, which names the severity the way
+/// A detail of measures carries its own keys, so a `Result` key in front of it
+/// only labels a label and spends columns the row truncates. A line such as
+/// `Exit code: 1` names its own state too, so a failure that states measures
+/// takes no prefix either.
+///
+/// The sentence of a failure takes `Error`, which names the severity the way
 /// every other failure line in the interface does and survives a terminal copy
-/// after the color of the box is gone.
+/// after the color of the box is gone. That sentence also wraps, because its
+/// instruction sits at the end.
 fn appendToolBlock(self: *Session, block: *const ToolBlock) !void {
     const detail = block.detail orelse
-        return self.transcript.append(.tool_result, block.is_error, block.head);
-    const text = if (block.is_error)
-        try std.fmt.allocPrint(self.gpa, "{s}\nError: {s}", .{ block.head, detail })
+        return self.transcript.append(.tool_result, .{ .is_error = block.is_error }, block.head);
+    const sentence = detail.kind == .sentence;
+    const options: ui.block.Entry.Options = .{
+        .is_error = block.is_error,
+        .fit = if (sentence) .wrap else .head,
+    };
+    const text = if (sentence and block.is_error)
+        try std.fmt.allocPrint(self.gpa, "{s}\nError: {s}", .{ block.head, detail.text })
     else
-        try std.fmt.allocPrint(self.gpa, "{s}\n{s}", .{ block.head, detail });
+        try std.fmt.allocPrint(self.gpa, "{s}\n{s}", .{ block.head, detail.text });
     defer self.gpa.free(text);
-    try self.transcript.append(.tool_result, block.is_error, text);
+    try self.transcript.append(.tool_result, options, text);
 }
 
 /// Apply a command outcome to the model: replace its notice, record its event,
@@ -661,7 +673,11 @@ pub fn applyOutcome(self: *Session, outcome: ai.command.Outcome) !void {
         .notice, .refusal => |message| self.setNotice(message),
         .event => |event| {
             defer self.gpa.free(event.content);
-            try self.transcript.append(.event, event.severity == .failure, event.content);
+            try self.transcript.append(
+                .event,
+                .{ .is_error = event.severity == .failure },
+                event.content,
+            );
         },
         .pick => |*pick| try self.openPicker(pick),
         // The app intercepts prompt, account, conversation, and inspection
@@ -885,7 +901,7 @@ fn flushRunningTools(self: *Session) ?anyerror {
     for (turn.tools.items) |*tool| {
         self.appendToolBlock(&.{
             .head = tool.box,
-            .detail = ai.Agent.unfinished_tool_result,
+            .detail = .{ .text = ai.Agent.unfinished_tool_result, .kind = .sentence },
             .is_error = true,
         }) catch |err| {
             if (maybe_error == null) maybe_error = err;
@@ -905,7 +921,7 @@ pub fn abortTurn(self: *Session) !void {
     const maybe_flush_error = self.flushRunningTools();
     self.endTurn();
     self.dirty = true;
-    try self.transcript.append(.event, false, "You canceled the turn.");
+    try self.transcript.append(.event, .{}, "You canceled the turn.");
     if (maybe_flush_error) |flush_error| return flush_error;
 }
 
@@ -914,7 +930,7 @@ pub fn abortTurn(self: *Session) !void {
 pub fn endTurnWithReceipt(self: *Session, receipt: *const ai.Agent.Receipt) !void {
     self.applyReceiptNormal(receipt);
     self.dropTurnOrigin();
-    if (receipt.truncated) try self.transcript.append(.event, false, truncated_event);
+    if (receipt.truncated) try self.transcript.append(.event, .{}, truncated_event);
     self.transcript.endMessage();
     self.endTurn();
 }
@@ -932,8 +948,8 @@ pub fn failTurnWithReceipt(
     // The flush runs before the chrome goes, but a lost block must not hide the
     // failure, so its error waits for the event.
     const maybe_flush_error = self.flushRunningTools();
-    if (receipt.truncated) try self.transcript.append(.event, false, truncated_event);
-    if (error_text) |text| try self.transcript.append(.event, true, text);
+    if (receipt.truncated) try self.transcript.append(.event, .{}, truncated_event);
+    if (error_text) |text| try self.transcript.append(.event, .{ .is_error = true }, text);
     self.transcript.endMessage();
     self.endTurn();
     if (maybe_flush_error) |flush_error| return flush_error;
@@ -1319,7 +1335,7 @@ fn applyFinishedToolRound(session: *Session) !void {
         .progress_sequence_committed = 1,
         .payload = .{ .tool_result = .{
             .name = try gpa.dupe(u8, "bash"),
-            .summary = try gpa.dupe(u8, "Exit code: 0"),
+            .summary = .{ .text = try gpa.dupe(u8, "Time: 0.0s · Exit code: 0") },
             .is_error = false,
         } },
     });
@@ -1645,7 +1661,7 @@ test "scripted stream events drive the model and one coalesced paint" {
     } });
     try applyEvent(&session, 1, .{ .tool_result = .{
         .name = try gpa.dupe(u8, "read"),
-        .summary = try gpa.dupe(u8, "Lines: 2 · Size: 17 B"),
+        .summary = .{ .text = try gpa.dupe(u8, "Lines: 2") },
         .is_error = false,
     } });
     // The result replaces its running box at once, not at turn end.
@@ -1671,7 +1687,7 @@ test "scripted stream events drive the model and one coalesced paint" {
     try std.testing.expect(std.mem.indexOf(u8, painted, "reasoning") != null);
     try std.testing.expect(std.mem.indexOf(u8, painted, "hello") != null);
     try std.testing.expect(std.mem.indexOf(u8, painted, "read") != null);
-    try std.testing.expect(std.mem.indexOf(u8, painted, "Lines: 2 · Size: 17 B") != null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "Lines: 2") != null);
 }
 
 test "a tool result box shows the line the tool decided" {
@@ -1688,7 +1704,7 @@ test "a tool result box shows the line the tool decided" {
     } });
     try applyEvent(&session, 1, .{ .tool_result = .{
         .name = try gpa.dupe(u8, "read"),
-        .summary = try gpa.dupe(u8, "Lines: 3 · Size: 27 B"),
+        .summary = .{ .text = try gpa.dupe(u8, "Lines: 3") },
         .is_error = false,
     } });
     try finishTurn(&session, 0);
@@ -1696,10 +1712,10 @@ test "a tool result box shows the line the tool decided" {
 
     const painted = out.written();
     try std.testing.expectEqualStrings(
-        "Tool: read · File: x\nLines: 3 · Size: 27 B",
+        "Tool: read · File: x\nLines: 3",
         session.transcript.blocks()[0].tool_result.text.items,
     );
-    try std.testing.expect(std.mem.indexOf(u8, painted, "Lines: 3 · Size: 27 B") != null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "Lines: 3") != null);
 }
 
 // The tool decides the box line. A tool that decides none keeps the call row
@@ -1753,7 +1769,7 @@ test "a failed tool result keeps its sentence below the call row" {
     } });
     try applyEvent(&session, 1, .{ .tool_result = .{
         .name = try gpa.dupe(u8, "read"),
-        .summary = try gpa.dupe(u8, sentence),
+        .summary = .{ .text = try gpa.dupe(u8, sentence), .kind = .sentence },
         .is_error = true,
     } });
     try finishTurn(&session, 0);
@@ -1765,6 +1781,43 @@ test "a failed tool result keeps its sentence below the call row" {
         "Tool: read · File: a.zig\nError: " ++ sentence,
         blocks[0].tool_result.text.items,
     );
+    // The instruction of a sentence sits at its end, so the box wraps it.
+    try std.testing.expectEqual(ui.paint.Fit.wrap, blocks[0].tool_result.fit);
+}
+
+// A failed call that states measures names its own end, so the box adds no
+// prefix and cuts the line the way a successful one does. The failure still
+// reaches the color of the box.
+test "a failed tool result that states measures takes no prefix" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    defer session.deinit();
+    session.beginTurn(1);
+
+    try applyEvent(&session, 1, .{ .tool_start = .{
+        .name = try gpa.dupe(u8, "bash"),
+        .input_json = try gpa.dupe(u8, "{\"command\":\"ls missing\"}"),
+    } });
+    try applyEvent(&session, 1, .{ .tool_result = .{
+        .name = try gpa.dupe(u8, "bash"),
+        .summary = .{
+            .text = try gpa.dupe(u8, "Time: 0.4s · Exit code: 1 · Lines: 1"),
+            .kind = .measures,
+        },
+        .is_error = true,
+    } });
+    try finishTurn(&session, 0);
+
+    const blocks = session.transcript.blocks();
+    try std.testing.expectEqual(@as(usize, 1), blocks.len);
+    try std.testing.expect(blocks[0].tool_result.is_error);
+    try std.testing.expectEqualStrings(
+        "Tool: bash · Command: ls missing\nTime: 0.4s · Exit code: 1 · Lines: 1",
+        blocks[0].tool_result.text.items,
+    );
+    try std.testing.expectEqual(ui.paint.Fit.head, blocks[0].tool_result.fit);
 }
 
 // While the model streams a call, the row counts the argument bytes instead of
@@ -1788,8 +1841,9 @@ test "a streamed tool call counts its bytes until the call commits" {
     try session.paint(size);
     const streaming = out.written();
     try std.testing.expect(std.mem.indexOf(u8, streaming, "Tool: write · Received: 31 B") != null);
-    // `Received` names the wire. The file reports `Size`, so a reader cannot
-    // take the streamed count for the size of what the call wrote.
+    // `Received` names the wire, and it is the only count in a box that reads
+    // in bytes. No finished call reports a size, so no reader can take the
+    // streamed count for the size of what the call wrote.
     try std.testing.expect(std.mem.indexOf(u8, streaming, "Size:") == null);
     // No JSON reaches the row, and nothing is cut, so nothing slides.
     try std.testing.expect(std.mem.indexOf(u8, streaming, "path") == null);
@@ -1950,7 +2004,7 @@ test "streamed and tool text cannot emit terminal controls" {
     // The tool decides the box line, so the hostile bytes ride on that line.
     try applyEvent(&session, 1, .{ .tool_result = .{
         .name = try gpa.dupe(u8, "read"),
-        .summary = try gpa.dupe(u8, tool),
+        .summary = .{ .text = try gpa.dupe(u8, tool) },
         .is_error = false,
     } });
     try finishTurn(&session, 0);
@@ -2280,9 +2334,9 @@ test "a failure with nothing committed rewinds the tail and returns the prompt" 
     defer session.deinit();
     session.beginTurn(1);
 
-    try session.transcript.append(.event, false, "earlier");
+    try session.transcript.append(.event, .{}, "earlier");
     const base = session.transcript.blocks().len;
-    try session.transcript.append(.user, false, "my prompt");
+    try session.transcript.append(.user, .{}, "my prompt");
     try session.transcript.appendStream(.model, "partial reply");
     var prompt = try ui.Editor.Draft.fromText(gpa, "my prompt");
     session.retainTurnPrompt(&prompt, base);
@@ -2316,7 +2370,7 @@ test "a failure after a committed round keeps it and restores only steering" {
     session.beginTurn(1);
 
     const base = session.transcript.blocks().len;
-    try session.transcript.append(.user, false, "prompt");
+    try session.transcript.append(.user, .{}, "prompt");
     var prompt = try ui.Editor.Draft.fromText(gpa, "prompt");
     session.retainTurnPrompt(&prompt, base);
     _ = try session.applyTurnEvent(&.{
@@ -2377,9 +2431,9 @@ test "a cancel with nothing committed rewinds the tail and returns the prompt" {
     session.beginTurn(1);
 
     // Prior committed content stays. The turn's tail begins at `base`.
-    try session.transcript.append(.event, false, "earlier");
+    try session.transcript.append(.event, .{}, "earlier");
     const base = session.transcript.blocks().len;
-    try session.transcript.append(.user, false, "my prompt");
+    try session.transcript.append(.user, .{}, "my prompt");
     try session.transcript.appendStream(.model, "partial reply");
 
     var prompt = try ui.Editor.Draft.fromText(gpa, "my prompt");
@@ -2414,7 +2468,7 @@ test "a cancel with a committed round keeps it and drops the in-flight tail" {
     session.beginTurn(1);
 
     const base = session.transcript.blocks().len;
-    try session.transcript.append(.user, false, "prompt");
+    try session.transcript.append(.user, .{}, "prompt");
     var prompt = try ui.Editor.Draft.fromText(gpa, "prompt");
     session.retainTurnPrompt(&prompt, base);
 
@@ -2469,7 +2523,7 @@ test "a cancel during a tool call keeps the call and shows it as failed" {
     session.beginTurn(1);
 
     const base = session.transcript.blocks().len;
-    try session.transcript.append(.user, false, "prompt");
+    try session.transcript.append(.user, .{}, "prompt");
     var prompt = try ui.Editor.Draft.fromText(gpa, "prompt");
     session.retainTurnPrompt(&prompt, base);
 
@@ -2566,7 +2620,7 @@ test "a finished tool block survives a cancel in the same round" {
     session.beginTurn(1);
 
     const base = session.transcript.blocks().len;
-    try session.transcript.append(.user, false, "prompt");
+    try session.transcript.append(.user, .{}, "prompt");
     var prompt = try ui.Editor.Draft.fromText(gpa, "prompt");
     session.retainTurnPrompt(&prompt, base);
     try applyFinishedToolRound(&session);
@@ -2584,7 +2638,7 @@ test "a finished tool block survives a cancel in the same round" {
     try std.testing.expectEqual(@as(usize, 4), blocks.len);
     try std.testing.expect(!blocks[2].tool_result.is_error);
     try std.testing.expect(
-        std.mem.endsWith(u8, blocks[2].tool_result.text.items, "\nExit code: 0"),
+        std.mem.endsWith(u8, blocks[2].tool_result.text.items, "\nTime: 0.0s · Exit code: 0"),
     );
     try std.testing.expectEqualStrings("You canceled the turn.", blocks[3].event.text.items);
 }
@@ -2599,7 +2653,7 @@ test "a finished tool block survives a failure in the same round" {
     session.beginTurn(1);
 
     const base = session.transcript.blocks().len;
-    try session.transcript.append(.user, false, "prompt");
+    try session.transcript.append(.user, .{}, "prompt");
     var prompt = try ui.Editor.Draft.fromText(gpa, "prompt");
     session.retainTurnPrompt(&prompt, base);
     try applyFinishedToolRound(&session);
@@ -2622,7 +2676,7 @@ test "a finished tool block survives a failure in the same round" {
     try std.testing.expectEqual(@as(usize, 4), blocks.len);
     try std.testing.expect(!blocks[2].tool_result.is_error);
     try std.testing.expect(
-        std.mem.endsWith(u8, blocks[2].tool_result.text.items, "\nExit code: 0"),
+        std.mem.endsWith(u8, blocks[2].tool_result.text.items, "\nTime: 0.0s · Exit code: 0"),
     );
     try std.testing.expectEqualStrings("boom", blocks[3].event.text.items);
 }
@@ -2636,7 +2690,7 @@ test "a final commit frontier keeps an open reply when no later event carries it
     session.beginTurn(1);
 
     const base = session.transcript.blocks().len;
-    try session.transcript.append(.user, false, "prompt");
+    try session.transcript.append(.user, .{}, "prompt");
     var prompt = try ui.Editor.Draft.fromText(gpa, "prompt");
     session.retainTurnPrompt(&prompt, base);
     _ = try session.applyTurnEvent(&.{
@@ -2666,7 +2720,7 @@ test "a partial cancel removes consumed steering beyond the commit frontier" {
     session.beginTurn(1);
 
     const base = session.transcript.blocks().len;
-    try session.transcript.append(.user, false, "prompt");
+    try session.transcript.append(.user, .{}, "prompt");
     var prompt = try ui.Editor.Draft.fromText(gpa, "prompt");
     session.retainTurnPrompt(&prompt, base);
     _ = try session.applyTurnEvent(&.{

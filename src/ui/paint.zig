@@ -101,18 +101,12 @@ pub fn contentColumns(columns: usize) usize {
 /// The one character that marks a line the row cut.
 const ellipsis = "…";
 
-/// The final text of one box line: what follows its last carriage return. A tool
-/// redraws a progress line in place with that byte, and a terminal keeps only
-/// what comes after it. The row shows that final state.
-///
-/// The split that yields `line` breaks on the line feed alone, so a CRLF line
-/// arrives with its carriage return still on the end. That byte belongs to the
-/// break, not to a redraw, so it goes first. Without that step the last
-/// carriage return of the line is its final byte and the row paints nothing.
+/// One box line without the carriage return of a CRLF break. The split that
+/// yields the line breaks on the line feed alone, so that byte stays on the end,
+/// where a row paints it as a replacement glyph. It terminates the line and is
+/// no content, so the row sheds it. A markdown block sheds it the same way.
 fn lineText(line: []const u8) []const u8 {
-    const body = std.mem.trimEnd(u8, line, "\r");
-    const cut = std.mem.lastIndexOfScalar(u8, body, '\r') orelse return body;
-    return body[cut + 1 ..];
+    return std.mem.trimEnd(u8, line, "\r");
 }
 
 /// Each `\n`-separated line of `text`, styled and truncated to one row, with the
@@ -657,13 +651,43 @@ test "every row leaves the complete width to content" {
     try std.testing.expectEqual(@as(usize, 80), contentColumns(80));
 }
 
+// A paste from a CRLF source ends every line with a carriage return. That byte
+// terminates the line and is no content, so the row sheds it instead of painting
+// a replacement glyph at the end of every row.
+test "a box row sheds the carriage return of a CRLF break" {
+    const gpa = std.testing.allocator;
+    var output: std.Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    var view = terminal.View.init(gpa, &output.writer);
+    defer view.deinit();
+
+    const columns = 20;
+    const body: Box = .{ .text = "first line\r\nsecond line" };
+    const sink = try view.beginFrame(.{ .columns = columns, .rows = 8 }, 1);
+    try box(&.{
+        .sink = sink,
+        .id = 0,
+        .columns = columns,
+        .base = 0,
+        .skip = 0,
+    }, .user, &body);
+    try view.render();
+
+    const painted = output.written();
+    // Two padding rows and one row a line: the shed byte adds no row.
+    try std.testing.expectEqual(@as(usize, 4), boxRows(&body, columns));
+    try std.testing.expect(std.mem.indexOf(u8, painted, "first line") != null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "second line") != null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "\u{FFFD}") == null);
+}
+
 // A one-row fit shows the head of a line and marks the cut with one ellipsis.
 // The head of each line identifies it, so the cut falls on the detail behind it.
 // Each logical line keeps its own row.
 test "a fitted box holds one row per line" {
     const gpa = std.testing.allocator;
     const columns = 20;
-    const text = "Tool: write · File: src/App.zig\nLines: 1 · Size: 6 B";
+    const text = "Tool: write · File: src/App.zig\nLines: 1";
     var output: std.Io.Writer.Allocating = .init(gpa);
     defer output.deinit();
     var view = terminal.View.init(gpa, &output.writer);
@@ -684,39 +708,7 @@ test "a fitted box holds one row per line" {
     try std.testing.expectEqual(@as(usize, 4), boxRows(&body, columns));
     try std.testing.expect(std.mem.indexOf(u8, painted, "Tool: write · File:\u{2026}") != null);
     // The summary line keeps its own row and fits whole.
-    try std.testing.expect(std.mem.indexOf(u8, painted, "Lines: 1 · Size: 6 B") != null);
-}
-
-// Real tool output redraws a line in place. The row shows the final state of
-// that line, and the count agrees with the paint.
-test "a box row shows the text after the last carriage return" {
-    const gpa = std.testing.allocator;
-    var output: std.Io.Writer.Allocating = .init(gpa);
-    defer output.deinit();
-    var view = terminal.View.init(gpa, &output.writer);
-    defer view.deinit();
-
-    const columns = 20;
-    // The first line redraws in place and ends on a CRLF break. The carriage
-    // return of that break belongs to the break, so it must not empty the row.
-    const body: Box = .{ .text = "Progress: 10%\r 50%\r100% done\r\nSecond line" };
-    const sink = try view.beginFrame(.{ .columns = columns, .rows = 8 }, 1);
-    try box(&.{
-        .sink = sink,
-        .id = 0,
-        .columns = columns,
-        .base = 0,
-        .skip = 0,
-    }, .tool_success, &body);
-    try view.render();
-
-    const painted = output.written();
-    try std.testing.expectEqual(@as(usize, 4), boxRows(&body, columns));
-    try std.testing.expect(std.mem.indexOf(u8, painted, "100% done") != null);
-    try std.testing.expect(std.mem.indexOf(u8, painted, "50%") == null);
-    try std.testing.expect(std.mem.indexOf(u8, painted, "Result") == null);
-    // The CRLF line keeps its text rather than painting an empty row.
-    try std.testing.expect(std.mem.indexOf(u8, painted, "Second line") != null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "Lines: 1") != null);
 }
 
 test "activity at column zero emits no unused frame role" {

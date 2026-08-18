@@ -86,16 +86,16 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - The Anthropic Console login trades its grant for a minted platform key, stored like a token.
 - When no browser opens, the printed URL still works, and the callback waits five minutes.
 - The browser lands on a plain "Pith received authorization. Close this tab." page.
-- Subscription tokens and the Console key live in the owner-only `~/.pith/auth.json`, one entry
-  per account, saved atomically.
+- Subscription tokens and the Console key live in the owner-only `~/.pith/auth.json`, one entry per
+  account, saved atomically.
 - Expired access tokens refresh and re-save automatically.
 - A busy credential store keeps a refreshed token in memory and retries its save before the next
   provider request.
 - Anthropic subscription logins save stable account and organization IDs from the OAuth profile.
 - If another pith instance saved a token for the same known principal, pith reloads it and retries
   once. A different or unknown principal stops before the model request.
-- If another pith instance saves a replacement before removal, pith reloads it and keeps the
-  account active.
+- If another pith instance saves a replacement before removal, pith reloads it and keeps the account
+  active.
 - Without a replacement, pith removes the rejected credential and moves the session to another
   account or the login picker.
 - A token failure that is not a rejection ends the turn, names the reason, and keeps the account
@@ -112,8 +112,8 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
   The next paint drops the terminal scrollback, so the empty conversation starts on a clean screen.
 - **/system** — inspect the complete provider-neutral system prompt as rendered Markdown in a
   scrollable full-window page. `M` toggles its exact source.
-- **/colors** — preview ANSI slots 0 to 15, colored backgrounds, default styles, message boxes,
-  text roles, and input frames in a scrollable full-window page.
+- **/colors** — preview ANSI slots 0 to 15, colored backgrounds, default styles, message boxes, text
+  roles, and input frames in a scrollable full-window page.
 - **/skill:name** — load a discovered skill explicitly, record a `Skill:` marker with the size and
   the source of the loaded file, and append any trailing text as its task.
 - Every line that starts with a slash is a command line, so Pith reads it locally first and sends it
@@ -188,10 +188,9 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - A pipe table draws as a box grid that fits the window and keeps the indentation of its source. The
   alignment colons parse but do not align. A long cell truncates to its column. A table stays plain
   text when the window is narrower than its smallest grid.
-- No line of a successful tool box wraps. Each line takes one row and marks a cut with one `…`, so
-  the rows a call occupies follow its state and never the length of its arguments. A failed box
-  wraps instead. A box row keeps only the text after its last carriage return, so a progress line
-  reads as its final state.
+- A tool box that states measures wraps no line. Each line takes one row and marks a cut with one
+  `…`, so the rows a call occupies follow its state and never the length of its arguments. A box
+  that holds the sentence of a failure wraps instead.
 - A call names what it acts on as `File:`, `Pattern:`, or `Command:`. A row holds the tool and its
   subject alone, with each run of whitespace collapsed to one space. A tool row shortens a path the
   way `Skill:` does: relative to the working directory below it, `~` for the home directory, and the
@@ -202,8 +201,14 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - A running command adds a row with the time it has run and the timeout it runs under.
   `Timeout: None` names a call that asked for no limit. Every other tool runs under no timeout, so
   its box keeps one row.
-- A finished call keeps its call row and one line below it: a stat summary, or the sentence of a
+- A finished call keeps its call row and one line below it: a line of measures, or the sentence of a
   failure. A call with nothing to state, like `describe_config`, keeps the call row alone.
+- `read` reports `Lines: 42`, or `Lines: 594–648 of 2868` when a window cut the file. `write`
+  reports the lines it wrote, `edit` reports `Lines: -12 +8`, and `find` and `grep` report their
+  matches. Each line adds a qualifier, such as `Output: Truncated`, when a limit cut the result.
+- `bash` reports `Time: 0.4s · Exit code: 1 · Lines: 3`, and it names a timeout or a kill as
+  `Status:` in place of the code. A non-zero exit takes no `Error:` prefix, because the line names
+  its own state. The box still paints the failure, and the model still reads the result as one.
 - Every box row starts at the first column, like an editor row and a reasoning row, so a terminal
   copy of them lines up. An indent appears only where it groups rows under a head, as in a skill
   block or a markdown list.

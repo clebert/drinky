@@ -207,7 +207,7 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
     const summary = try summary_output.toOwnedSlice();
     errdefer gpa.free(summary);
     const content = try out.toOwnedSlice();
-    return .{ .content = content, .summary = summary, .is_error = false };
+    return .{ .content = content, .summary = .{ .text = summary }, .is_error = false };
 }
 
 /// The largest length no greater than `max` that does not split a UTF-8
@@ -246,7 +246,7 @@ test "grep finds a literal substring with a glob filter" {
         .{tmp.sub_path},
     );
     try std.testing.expectEqualStrings(expected, result.content);
-    try std.testing.expectEqualStrings("Matches: 1", result.summary.?);
+    try std.testing.expectEqualStrings("Matches: 1", result.summary.?.text);
 }
 
 test "grep searches a single file given as the path" {
@@ -353,7 +353,7 @@ test "grep stops at the result limit and reports it" {
         .{ tmp.sub_path, tmp.sub_path },
     );
     try std.testing.expectEqualStrings(expected, result.content);
-    try std.testing.expectEqualStrings("Matches: 2 · Limit: Reached", result.summary.?);
+    try std.testing.expectEqualStrings("Matches: 2 · Limit: Reached", result.summary.?.text);
 }
 
 test "grep skips binary and oversized files" {
@@ -405,7 +405,7 @@ test "grep caps the reported line length" {
         .{ tmp.sub_path, line[0..line_bytes_max] },
     );
     try std.testing.expectEqualStrings(expected, result.content);
-    try std.testing.expectEqualStrings("Matches: 1 · Lines: Truncated", result.summary.?);
+    try std.testing.expectEqualStrings("Matches: 1 · Lines: Truncated", result.summary.?.text);
 }
 
 test "grep reports an incomplete search when nothing was shown" {
@@ -424,7 +424,7 @@ test "grep reports an incomplete search when nothing was shown" {
     try std.testing.expect(
         std.mem.indexOf(u8, result.content, "the search was incomplete") != null,
     );
-    try std.testing.expectEqualStrings("Matches: 0 · Limit: Reached", result.summary.?);
+    try std.testing.expectEqualStrings("Matches: 0 · Limit: Reached", result.summary.?.text);
 }
 
 // An empty search still states its count, so the box reads like every other
@@ -443,7 +443,7 @@ test "grep reports no matches of a complete search" {
     defer result.deinit(gpa);
     try std.testing.expect(!result.is_error);
     try std.testing.expectEqualStrings("Pith found no matches for miss.", result.content);
-    try std.testing.expectEqualStrings("Matches: 0", result.summary.?);
+    try std.testing.expectEqualStrings("Matches: 0", result.summary.?.text);
 }
 
 test "grep canceled while reading a file propagates" {
