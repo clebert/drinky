@@ -165,17 +165,13 @@ const items = blk: {
         .{ .framed = .{ .text = "A draft message" } },
         .{ .separator = .plain },
         .blank,
-        .{ .note = "A picker with one selected row:" },
+        .{ .note = "A picker with its caption above the frame and one selected row:" },
+        .blank,
+        .{ .note = "Select a model" },
+        .{ .note = "↑/↓: Move · Enter: Select · Esc: Cancel" },
         .{ .separator = .plain },
-        .{ .framed = .{} },
-        .{ .framed = .{ .name = .muted, .text = " Select a model" } },
-        .{ .framed = .{
-            .name = .muted,
-            .text = " ↑/↓: Move · Enter: Select · Esc: Cancel",
-        } },
         .{ .framed = .{ .name = .muted, .text = "   Another option" } },
         .{ .framed = .{ .name = .selection, .text = " > The selected option (Current)" } },
-        .{ .framed = .{} },
         .{ .separator = .plain },
     };
     break :blk list;

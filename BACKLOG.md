@@ -22,11 +22,6 @@ decision already taken, or a dependency on another entry. Module layout and exte
 
 ## Bugs
 
-- **The picker cannot scroll up** — the selection does not move back into the rows above the
-  viewport.
-- **A picker wastes rows on a short list** — blank rows appear when the list fits the window. The
-  `/colors` page has the same defect.
-
 ## Improvements
 
 - **A tool call holds one row** — the row truncates the arguments with an ellipsis instead of a
@@ -51,7 +46,6 @@ decision already taken, or a dependency on another entry. Module layout and exte
 - **The same padding everywhere** — the editor and the reasoning block carry the padding of a
   message box, so a copy of the rows matches the boxes at the same window width. _Pith cannot
   intercept a terminal copy, so the painted rows must line up._
-- **A reworked picker** — the picker rolls over from the last row to the first.
 - **Pick the provider first, then the model** — so neither list grows too long. _`/model` and
   `/login` list account and model together today._
 - **A parked message and a message history** — the user parks the editor content to run a command,

@@ -197,7 +197,9 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - The branch comes from the `HEAD` file of the repository, never from the git command. pith re-reads
   it when a turn starts and when one ends.
 - A picker is a single-choice list that tags the current value. Enter confirms, and Esc, Ctrl+C, or
-  Ctrl+D cancels.
+  Ctrl+D cancels. The selection rolls over at both ends of the list.
+- A muted caption above the picker frame holds the title and the key hint. It stays outside the
+  scrolled window, so the picker window never scrolls it away.
 - The open input area grows to about a quarter of the screen and labels hidden rows "↑ Hidden: N"
   and "↓ Hidden: N".
 - The terminal supplies every color and the muted intensity. Pith uses the default colors, ANSI

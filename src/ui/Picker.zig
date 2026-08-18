@@ -1,13 +1,21 @@
-//! A single-choice list for the live region: a title and a key hint above the
-//! options, each option on its own row with the selected one highlighted and any
-//! pre-existing choice tagged "(Current)". It renders between the same open
-//! separators as the editor, so it sits in the editor's place. It owns its option
-//! strings and the composed `content` buffer (freed on `deinit`) and borrows the
-//! title. Navigation moves the selection. `reflow` windows a tall list to keep
-//! it in view. The caller reads `cursor` and acts on the selected row.
+//! A single-choice list for the live region: a muted caption, then the options.
+//! The options sit between the same open separators as the editor, so the list
+//! takes the editor's place. Each option holds one row, the selected one is
+//! highlighted, and a pre-existing choice is tagged "(Current)".
+//!
+//! The caption carries the title and the key hint above the frame. It is chrome,
+//! not content. It stays outside the scrolled window, so the picker window never
+//! scrolls it away. The hidden-row labels then count option rows alone. The page
+//! header follows the same pattern.
+//!
+//! The picker owns its option strings and the composed `content` buffer (freed on
+//! `deinit`) and borrows the title. Navigation moves the selection and rolls over
+//! at both ends. `reflow` windows a tall list to keep it in view. The caller
+//! reads `cursor` and acts on the selected row.
 
 const std = @import("std");
 
+const block = @import("block.zig");
 const paint = @import("paint.zig");
 const role = @import("role.zig");
 const terminal = @import("terminal");
@@ -24,8 +32,8 @@ cursor: usize,
 /// The row to tag "(Current)", if any: a pre-existing choice, distinct from
 /// where the cursor happens to sit.
 marked: ?usize,
-/// The body between the separators. A selection move rebuilds it.
-/// Columns-independent, so `rows` and `render` only wrap it to fit.
+/// The option rows between the separators. A selection move rebuilds them.
+/// Columns-independent, so `rows` and `render` only wrap them to fit.
 content: std.ArrayList(u8),
 /// Trusted presentation metadata for each logical line in `content`. Role names
 /// never share storage with option text.
@@ -70,21 +78,26 @@ pub fn deinit(self: *Picker) void {
     self.line_roles.deinit(self.gpa);
 }
 
+/// Move the selection one row up. The first option rolls over to the last one.
 pub fn moveUp(self: *Picker) !void {
-    if (self.cursor == 0) return;
-    self.cursor -= 1;
+    if (self.options.len == 0) return;
+    self.cursor = if (self.cursor == 0) self.options.len - 1 else self.cursor - 1;
     try self.compose();
 }
 
+/// Move the selection one row down. The last option rolls over to the first one.
 pub fn moveDown(self: *Picker) !void {
-    if (self.cursor + 1 >= self.options.len) return;
-    self.cursor += 1;
+    if (self.options.len == 0) return;
+    self.cursor = if (self.cursor + 1 >= self.options.len) 0 else self.cursor + 1;
     try self.compose();
 }
 
 /// Re-clamp the scroll offset so the highlighted option's wrapped row stays
 /// inside the visible window. Call once per repaint. Pass the same `size` whose
 /// columns and rows `render` and `rows` will use, so all three agree.
+///
+/// The window holds option rows alone, so the first option sits at its top and a
+/// step of one row reaches both ends of the list.
 pub fn reflow(self: *Picker, size: terminal.View.Size) void {
     const columns_max = paint.frameColumns(size.columns);
     const total_body = terminal.width.rows(self.content.items, columns_max);
@@ -98,21 +111,26 @@ pub fn reflow(self: *Picker, size: terminal.View.Size) void {
     self.scroll = @min(self.scroll, total_body - visible);
 }
 
-/// Physical rows the picker occupies: two separators plus the wrapped body.
-/// The body stops at its scroll limit for `size.rows`.
+/// Physical rows the picker occupies: the caption, two separators, and the
+/// wrapped option rows. The list stops at its scroll limit for `size.rows`.
 pub fn rows(self: *const Picker, size: terminal.View.Size) usize {
     const columns_max = paint.frameColumns(size.columns);
     const total_body = terminal.width.rows(self.content.items, columns_max);
-    return paint.framedRows(@min(total_body, paint.bodyLimit(size.rows)));
+    return self.captionRows() + paint.framedRows(@min(total_body, paint.bodyLimit(size.rows)));
 }
 
-/// Stream the picker between its separators through `placement`. Window the
-/// body to its scroll limit for `viewport_rows`. Assumes `reflow` set the scroll.
+/// Stream the caption, then the option rows between their separators, through
+/// `placement`. Window the list to its scroll limit for `viewport_rows`. Assumes
+/// `reflow` set the scroll.
 pub fn render(self: *const Picker, placement: *const paint.Placement, viewport_rows: usize) !void {
+    try self.renderCaption(placement);
     const columns_max = paint.frameColumns(placement.columns);
     const total_body = terminal.width.rows(self.content.items, columns_max);
     const visible_rows = @min(total_body, paint.bodyLimit(viewport_rows));
-    try paint.framed(placement, &.{
+    // The derived placement copies its parent. Only the geometry changes.
+    var frame_placement = placement.*;
+    frame_placement.base = placement.base + self.captionRows();
+    try paint.framed(&frame_placement, &.{
         .body = self.content.items,
         .body_rows = visible_rows,
         .hidden_above = self.scroll,
@@ -121,25 +139,38 @@ pub fn render(self: *const Picker, placement: *const paint.Placement, viewport_r
     });
 }
 
-/// Rebuild `content`: a blank padding row, the muted title and key hint, one row
-/// per option (the selected one in the selection role, any pre-existing choice
-/// tagged), then a blank padding row. Reverse video marks the selection with the
-/// terminal foreground and background. Rows are `\n`-separated and carry a
-/// one-space left pad. The trusted role lives separately in `line_roles`.
+/// The muted caption above the frame: the title, then the key hint. Each row
+/// truncates instead of wrapping, so the caption keeps its height at every width.
+fn renderCaption(self: *const Picker, placement: *const paint.Placement) !void {
+    try paint.notice(placement, &.{ .role = .muted, .prefix = "" }, self.title);
+    // The derived placement copies its parent. Only the geometry changes.
+    var hint_placement = placement.*;
+    hint_placement.base = placement.base + titleRows(self.title);
+    try paint.notice(&hint_placement, &.{ .role = .muted, .prefix = "" }, hint);
+}
+
+/// Physical rows of the caption: the title rows and the one key-hint row.
+fn captionRows(self: *const Picker) usize {
+    return titleRows(self.title) + 1;
+}
+
+/// Rows the title holds. A notice truncates each of its lines to one row, so only
+/// a title with a line break takes more than one row.
+fn titleRows(title: []const u8) usize {
+    return 1 + std.mem.count(u8, title, "\n");
+}
+
+/// Rebuild `content`: one row per option, the selected one in the selection role
+/// and any pre-existing choice tagged. Reverse video marks the selection with the
+/// terminal foreground and background. Every row carries text, so the frame holds
+/// no blank row. Rows are `\n`-separated and carry a three-column left pad for
+/// the selection marker. The trusted role lives separately in `line_roles`.
 fn compose(self: *Picker) !void {
     self.content.clearRetainingCapacity();
     self.line_roles.clearRetainingCapacity();
     // Reset with the buffers it indexes into: a failure below must not leave the
     // offset past the shorter rebuilt content for `reflow` to slice.
     self.cursor_offset = 0;
-
-    try self.startLine(null);
-    try self.startLine(.muted);
-    try self.content.append(self.gpa, ' ');
-    try self.appendText(self.title, .muted);
-    try self.startLine(.muted);
-    try self.content.append(self.gpa, ' ');
-    try self.appendText(hint, .muted);
 
     for (self.options, 0..) |option, index| {
         const chosen = index == self.cursor;
@@ -150,13 +181,14 @@ fn compose(self: *Picker) !void {
         try self.appendText(option, name);
         if (self.marked == index) try self.content.appendSlice(self.gpa, " (Current)");
     }
-
-    try self.startLine(null);
 }
 
-fn startLine(self: *Picker, maybe_role: ?role.Name) !void {
+/// Open the next logical body row and record its role. Every option row carries
+/// one, so `line_roles` holds no null. The list keeps an optional role, because
+/// the framed painter takes that form for a body whose rows can go unstyled.
+fn startLine(self: *Picker, name: role.Name) !void {
     if (self.line_roles.items.len > 0) try self.content.append(self.gpa, '\n');
-    try self.line_roles.append(self.gpa, maybe_role);
+    try self.line_roles.append(self.gpa, name);
 }
 
 /// Append text to the current logical line and extend the role metadata when
@@ -179,31 +211,77 @@ fn testPicker(gpa: std.mem.Allocator, labels: []const []const u8, cursor: usize)
     return picker;
 }
 
-test "navigation stays in bounds and the cursor tracks the selection" {
+test "navigation rolls over at both ends and the cursor tracks the selection" {
     const gpa = std.testing.allocator;
     var picker = try testPicker(gpa, &.{ "alpha", "beta" }, 0);
     defer picker.deinit();
 
+    // The first option rolls up to the last one, and the last one rolls down to
+    // the first one again.
     try picker.moveUp();
+    try std.testing.expectEqual(@as(usize, 1), picker.cursor);
+    try picker.moveDown();
     try std.testing.expectEqual(@as(usize, 0), picker.cursor);
     try picker.moveDown();
     try std.testing.expectEqual(@as(usize, 1), picker.cursor);
     try picker.moveDown();
-    try std.testing.expectEqual(@as(usize, 1), picker.cursor);
+    try std.testing.expectEqual(@as(usize, 0), picker.cursor);
 }
 
-test "compose lays out the title, hint, options, and the current marker" {
+test "the frame holds the option rows alone and the caption stays above it" {
     const gpa = std.testing.allocator;
     var picker = try testPicker(gpa, &.{ "alpha", "beta" }, 1);
     defer picker.deinit();
+    const size: terminal.View.Size = .{ .columns = 80, .rows = 24 };
 
-    // Two separators, a blank, title, hint, two options, and a blank make eight rows.
-    try std.testing.expectEqual(@as(usize, 8), picker.rows(.{ .columns = 80, .rows = 24 }));
-    try std.testing.expect(std.mem.indexOf(u8, picker.content.items, "Pick") != null);
-    try std.testing.expect(std.mem.indexOf(u8, picker.content.items, "Esc: Cancel") != null);
+    // A title row, a hint row, two separators, and two option rows make six
+    // rows. A short list wastes no row, so no blank row sits inside the frame.
+    try std.testing.expectEqual(@as(usize, 2), picker.captionRows());
+    try std.testing.expectEqual(@as(usize, 6), picker.rows(size));
+    try std.testing.expect(std.mem.indexOf(u8, picker.content.items, "\n\n") == null);
+    try std.testing.expect(!std.mem.startsWith(u8, picker.content.items, "\n"));
+    try std.testing.expect(!std.mem.endsWith(u8, picker.content.items, "\n"));
+    // The caption is chrome, so neither the title nor the hint is a body row.
+    try std.testing.expect(std.mem.indexOf(u8, picker.content.items, "Pick") == null);
+    try std.testing.expect(std.mem.indexOf(u8, picker.content.items, "Esc: Cancel") == null);
     try std.testing.expect(std.mem.indexOf(u8, picker.content.items, "alpha (Current)") != null);
     try std.testing.expect(std.mem.indexOfScalar(u8, picker.content.items, 0x1b) == null);
-    try std.testing.expectEqual(role.Name.selection, picker.line_roles.items[4].?);
+    try std.testing.expectEqual(role.Name.selection, picker.line_roles.items[1].?);
+
+    // Painted order: the muted caption, then the frame around the options.
+    const painted = try renderForTest(gpa, &picker, size);
+    defer gpa.free(painted);
+    const title = comptime role.sequence(.muted) ++ "Pick\x1b[0m";
+    try std.testing.expect(std.mem.indexOf(u8, painted, title) != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, painted, "Pick").? < std.mem.indexOf(u8, painted, "─").?,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, painted, "Esc: Cancel").? < std.mem.indexOf(u8, painted, "─").?,
+    );
+    try std.testing.expectEqual(@as(usize, 6), block.paintedRows(painted));
+}
+
+fn renderForTest(
+    gpa: std.mem.Allocator,
+    picker: *const Picker,
+    size: terminal.View.Size,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var view = terminal.View.init(gpa, &out.writer);
+    defer view.deinit();
+    const sink = try view.beginFrame(size, 4);
+    const placement: paint.Placement = .{
+        .sink = sink,
+        .id = 0,
+        .columns = size.columns,
+        .base = 0,
+        .skip = 0,
+    };
+    try picker.render(&placement, size.rows);
+    try view.render();
+    return gpa.dupe(u8, out.written());
 }
 
 test "a tall option list scrolls the window to keep the selection in view" {
@@ -215,39 +293,56 @@ test "a tall option list scrolls the window to keep the selection in view" {
     }
     var picker = try testPicker(gpa, &labels, 0);
     defer picker.deinit();
+    const size: terminal.View.Size = .{ .columns = 80, .rows = 20 };
 
-    // A 20-row viewport caps the body at six rows. With the selection on the
-    // first option the window sits at the top and nothing scrolls.
-    picker.reflow(.{ .columns = 80, .rows = 20 });
+    // A 20-row viewport caps the list at six rows. With the selection on the
+    // first option the window sits at the top and nothing scrolls. The caption
+    // and the two separators add four rows above and below it.
+    picker.reflow(size);
     try std.testing.expectEqual(@as(usize, 0), picker.scroll);
-    try std.testing.expectEqual(@as(usize, 8), picker.rows(.{ .columns = 80, .rows = 20 }));
+    try std.testing.expectEqual(@as(usize, 10), picker.rows(size));
 
     // A walk of the selection to the last option drags the window down after it.
-    for (0..19) |_| try picker.moveDown();
-    picker.reflow(.{ .columns = 80, .rows = 20 });
-    try std.testing.expectEqual(@as(usize, 17), picker.scroll);
+    for (0..19) |_| {
+        try picker.moveDown();
+        picker.reflow(size);
+    }
+    try std.testing.expectEqual(@as(usize, 19), picker.cursor);
+    try std.testing.expectEqual(@as(usize, 14), picker.scroll);
 
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var view = terminal.View.init(gpa, &out.writer);
-    defer view.deinit();
-    const sink = try view.beginFrame(.{ .columns = 80, .rows = 20 }, 4);
-    const placement: paint.Placement = .{
-        .sink = sink,
-        .id = 0,
-        .columns = 80,
-        .base = 0,
-        .skip = 0,
-    };
-    try picker.render(&placement, 20);
-    try view.render();
-    const painted = out.written();
+    const bottom = try renderForTest(gpa, &picker, size);
+    defer gpa.free(bottom);
     // The selected tail option shows in the selection role, the scrolled-off
-    // head does not, and the top separator reports the rows hidden above the
-    // window.
+    // head does not, and the top separator reports the options hidden above the
+    // window. The caption stays in view at the bottom of the list.
     const selected = comptime role.sequence(.selection) ++ " > row19\x1b[0m";
-    try std.testing.expect(std.mem.indexOf(u8, painted, "row19") != null);
-    try std.testing.expect(std.mem.indexOf(u8, painted, selected) != null);
-    try std.testing.expect(std.mem.indexOf(u8, painted, "row00") == null);
-    try std.testing.expect(std.mem.indexOf(u8, painted, "↑ Hidden: 17") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bottom, selected) != null);
+    try std.testing.expect(std.mem.indexOf(u8, bottom, "row00") == null);
+    try std.testing.expect(std.mem.indexOf(u8, bottom, "↑ Hidden: 14") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bottom, "Pick") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bottom, "Esc: Cancel") != null);
+
+    // A walk back up drags the window with the selection, and the first option
+    // sits at the top of the list again.
+    for (0..19) |_| {
+        try picker.moveUp();
+        picker.reflow(size);
+    }
+    try std.testing.expectEqual(@as(usize, 0), picker.cursor);
+    try std.testing.expectEqual(@as(usize, 0), picker.scroll);
+
+    const top = try renderForTest(gpa, &picker, size);
+    defer gpa.free(top);
+    try std.testing.expect(std.mem.indexOf(u8, top, "Pick") != null);
+    try std.testing.expect(std.mem.indexOf(u8, top, "Esc: Cancel") != null);
+    try std.testing.expect(std.mem.indexOf(u8, top, "row00") != null);
+    try std.testing.expect(std.mem.indexOf(u8, top, "row19") == null);
+    try std.testing.expect(std.mem.indexOf(u8, top, "↑ Hidden") == null);
+    try std.testing.expect(std.mem.indexOf(u8, top, "↓ Hidden: 14") != null);
+
+    // A roll over off the first option shows the end of the list whole.
+    try picker.moveUp();
+    picker.reflow(size);
+    try std.testing.expectEqual(@as(usize, 19), picker.cursor);
+    try std.testing.expectEqual(@as(usize, 14), picker.scroll);
 }
