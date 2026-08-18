@@ -49,9 +49,9 @@ effort: llm.Effort,
 retry: net.Retry,
 /// Bounds the bash tool's output window and runtime, handed to every tool call.
 bash: tool.Context.Bash,
-/// What the `config` tool returns. The host owns the strings and keeps them
-/// alive for the session. An empty document means the host exposes no settings.
-settings: tool.Context.Settings,
+/// What the `describe_config` tool returns. The host owns the text and keeps it
+/// alive for the session. An empty document means the host exposes no config.
+config_document: []const u8,
 items: std.ArrayList(llm.Item),
 stats: Stats,
 /// Steering messages the user submitted mid-turn, drained into the running turn
@@ -311,7 +311,7 @@ pub fn init(
         retry: net.Retry,
         effort: llm.Effort = .none,
         bash: tool.Context.Bash = .{},
-        settings: tool.Context.Settings = .{},
+        config_document: []const u8 = "",
         cache: CachePolicy = .{},
     },
 ) Agent {
@@ -324,7 +324,7 @@ pub fn init(
         .effort = options.effort,
         .retry = options.retry,
         .bash = options.bash,
-        .settings = options.settings,
+        .config_document = options.config_document,
         .items = .empty,
         .stats = .{},
         .steering = Steering.init(gpa, io),
@@ -936,6 +936,7 @@ fn readReplyWith(
     if (stop.rejection) |rejection| return switch (rejection) {
         .invalid => error.IncompleteReply,
         .unsupported => error.UnsupportedReply,
+        .uncorrelated => error.UncorrelatedReply,
     };
     if (reply_invalid) return error.IncompleteReply;
     if (stop.status == .truncated and replyHasToolCall(reply_items.items))
@@ -964,6 +965,13 @@ fn appendReplyEvent(
     switch (event.*) {
         .text => |delta| try presentation(presentation_closed, handler.onText(delta)),
         .thinking => |delta| try presentation(presentation_closed, handler.onThinking(delta)),
+        // Display only: the call runs from the committed reply, so a half
+        // received argument list never reaches a tool.
+        .tool_name => |name| try presentation(presentation_closed, handler.onToolName(name)),
+        .tool_arguments => |delta| try presentation(
+            presentation_closed,
+            handler.onToolArguments(delta),
+        ),
         .item => |*output| {
             const item = try dupeOutput(self.gpa, account, output, reply_items.items);
             errdefer freeItem(self.gpa, item);
@@ -1037,7 +1045,7 @@ fn runToolsWith(
         .gpa = self.gpa,
         .io = self.io,
         .bash = self.bash,
-        .settings = self.settings,
+        .config_document = self.config_document,
     };
     var group: std.Io.Group = .init;
     // On any early exit, reap in-flight tasks, then move every successful,
@@ -1204,6 +1212,9 @@ test retryableError {
     try std.testing.expect(!retryableError(error.OutOfMemory));
     // An oversize stream reproduces on the same request, so it is not retried.
     try std.testing.expect(!retryableError(error.StreamResponseTooLarge));
+    // A retry meets the same wire order, so a correlation failure fails the turn
+    // at once instead of spending the budget on the same outcome.
+    try std.testing.expect(!retryableError(error.UncorrelatedReply));
 }
 
 test "resetConversation clears conversation state and preserves configuration" {
@@ -1733,6 +1744,8 @@ const CaptureHandler = struct {
     gpa: std.mem.Allocator,
     thinking: std.ArrayList(u8) = .empty,
     text: std.ArrayList(u8) = .empty,
+    /// Every streamed tool call as `name arguments`, one per line.
+    streamed_tools: std.ArrayList(u8) = .empty,
     errors: std.ArrayList(u8) = .empty,
     usage_count: usize = 0,
     tool_start_count: usize = 0,
@@ -1746,6 +1759,7 @@ const CaptureHandler = struct {
     fn deinit(self: *CaptureHandler) void {
         self.thinking.deinit(self.gpa);
         self.text.deinit(self.gpa);
+        self.streamed_tools.deinit(self.gpa);
         self.errors.deinit(self.gpa);
     }
 
@@ -1778,6 +1792,16 @@ const CaptureHandler = struct {
         _ = stats;
         self.usage_count += 1;
         if (self.fail_usage) return error.Canceled;
+    }
+
+    fn onToolName(self: *CaptureHandler, name: []const u8) !void {
+        if (self.streamed_tools.items.len != 0)
+            try self.streamed_tools.append(self.gpa, '\n');
+        try self.streamed_tools.print(self.gpa, "{s} ", .{name});
+    }
+
+    fn onToolArguments(self: *CaptureHandler, delta: []const u8) !void {
+        try self.streamed_tools.appendSlice(self.gpa, delta);
     }
 
     fn onToolStart(self: *CaptureHandler, name: []const u8, input_json: []const u8) !void {
@@ -1855,6 +1879,7 @@ fn openaiStream(io: std.Io, reader: *std.Io.Reader) provider.Stream {
     stream.openai_api.reasoning = .none;
     stream.openai_api.summary_index = 0;
     stream.openai_api.completed_item_ids = .empty;
+    stream.openai_api.call_item_id = .empty;
     stream.openai_api.usage = .{};
     stream.openai_api.quota = null;
     return stream;
@@ -1895,6 +1920,37 @@ test "readReply stops before a post-completion timeout" {
     try std.testing.expectEqual(@as(usize, 1), reply.len);
     try std.testing.expectEqualStrings("done", reply[0].message.text);
     try std.testing.expectEqual(@as(usize, 1), handler.usage_count);
+}
+
+// The name and the argument fragments of a tool call are display only. They
+// reach the handler as they stream, and only the completed item enters history,
+// so no tool ever runs on half-received arguments.
+test "readReply streams a tool call's name and arguments for display alone" {
+    const gpa = std.testing.allocator;
+    var agent = scriptedAgent(gpa);
+    defer agent.deinit();
+    var handler: CaptureHandler = .{ .gpa = gpa };
+    defer handler.deinit();
+
+    const events = [_]llm.Event{
+        .{ .tool_name = "read" },
+        .{ .tool_arguments = "{\"path\":" },
+        .{ .tool_arguments = "\"x\"}" },
+        .{ .item = .{ .tool_call = .{
+            .call_id = "t1",
+            .name = "read",
+            .arguments_json = "{\"path\":\"x\"}",
+        } } },
+        .{ .stop = .{ .usage = .{ .output = 3 } } },
+    };
+    var stream: ScriptedStream = .{ .events = &events };
+    const reply = try agent.readReply(&agent.model, &stream, &handler);
+
+    try std.testing.expectEqualStrings("read {\"path\":\"x\"}", handler.streamed_tools.items);
+    try std.testing.expectEqual(@as(usize, 1), reply.len);
+    try std.testing.expectEqualStrings("t1", reply[0].tool_call.call_id);
+    // The display events retain nothing of their own.
+    try std.testing.expectEqual(@as(usize, 1), agent.items.items.len);
 }
 
 test "readReply records terminal usage before rejecting an invalid reply" {

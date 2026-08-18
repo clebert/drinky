@@ -65,9 +65,13 @@ pub const Tail = union(enum) {
     };
 
     /// A streaming turn: the running tool calls, the steering queue, then the
-    /// editor with activity that crosses its separators.
+    /// editor with activity that crosses its separators. No line of a tool box
+    /// wraps, so a box takes one row per line it holds: a committed call names
+    /// what it acts on, one the model still streams counts the argument bytes
+    /// that have arrived, and a call under a timeout adds the row that reports
+    /// its time.
     pub const Turn = struct {
-        tools: []const []const u8,
+        tools: []const ui.paint.Box,
         activity: ui.paint.Activity,
         steering: []const []const u8,
         editor: *const ui.Editor,
@@ -83,7 +87,7 @@ const EditorPresentation = struct {
 /// carries what `measure` and `render` need.
 const Component = union(enum) {
     entry: *const ui.block.Entry,
-    tool_box: []const u8,
+    tool_box: ui.paint.Box,
     steering: []const []const u8,
     /// A muted control-hint row above the input.
     hint: []const u8,
@@ -97,7 +101,7 @@ const Component = union(enum) {
     fn measure(self: *const Component, size: terminal.View.Size) usize {
         return switch (self.*) {
             .entry => |entry| entry.rows(size.columns),
-            .tool_box => |text| ui.paint.boxRows(text, size.columns),
+            .tool_box => |box| ui.paint.boxRows(&box, size.columns),
             .steering => |messages| ui.paint.steeringRows(messages),
             .hint => |text| std.mem.count(u8, text, "\n") + 1,
             .editor => |presentation| presentation.editor.rows(size),
@@ -115,7 +119,7 @@ const Component = union(enum) {
     ) !void {
         switch (self.*) {
             .entry => |entry| try entry.render(placement),
-            .tool_box => |text| try ui.paint.box(placement, .tool_pending, text),
+            .tool_box => |box| try ui.paint.box(placement, .tool_pending, &box),
             .steering => |messages| try ui.paint.steering(placement, messages),
             .hint => |text| try ui.paint.notice(placement, &.{
                 .role = .muted,
@@ -328,7 +332,10 @@ test "a turn tail stacks tool boxes above the active editor" {
     var editor = ui.Editor.init(gpa);
     defer editor.deinit();
 
-    const tools = [_][]const u8{ "readbox", "grepbox" };
+    const tools = [_]ui.paint.Box{
+        .{ .text = "readbox" },
+        .{ .text = "grepbox", .fit = .head },
+    };
     const scene: Scene = .{ .conversation = .{
         .transcript = &[_]ui.block.Entry{},
         .tail = .{ .turn = .{
@@ -390,7 +397,7 @@ test "a turn with 253 tool boxes keeps its anchor ids from wrapping" {
     var editor = ui.Editor.init(gpa);
     defer editor.deinit();
 
-    const tools = [_][]const u8{"toolbox"} ** 253;
+    const tools = [_]ui.paint.Box{.{ .text = "toolbox" }} ** 253;
     const scene: Scene = .{ .conversation = .{
         .transcript = &[_]ui.block.Entry{},
         .tail = .{ .turn = .{

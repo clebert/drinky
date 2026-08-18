@@ -57,16 +57,6 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
     }) catch |err|
         return Result.cannot(gpa, err, "search", base);
     defer matches.deinit(gpa);
-    if (matches.matched == 0) {
-        if (matches.capped) return Result.report(
-            gpa,
-            .ok,
-            "No files match {s} in the part that Pith searched. Use a narrower path or " ++
-                "pattern because Pith could not scan the full file tree.",
-            .{pattern},
-        );
-        return Result.report(gpa, .ok, "No files match {s}.", .{pattern});
-    }
 
     const shown = matches.paths.len;
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -75,7 +65,20 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
         if (index > 0) try out.writer.writeAll("\n");
         try out.writer.writeAll(path);
     }
-    if (matches.capped) {
+    // An empty search is a whole result, so its sentence is the content and the
+    // count below states it. The paths are empty here, so the sentence opens the
+    // content and takes no separator.
+    if (matches.matched == 0) {
+        if (matches.capped) {
+            try out.writer.print(
+                "No files match {s} in the part that Pith searched. Use a narrower path or " ++
+                    "pattern because Pith could not scan the full file tree.",
+                .{pattern},
+            );
+        } else {
+            try out.writer.print("No files match {s}.", .{pattern});
+        }
+    } else if (matches.capped) {
         if (shown > 0) try out.writer.writeAll("\n");
         try out.writer.print(
             "[Pith stopped the search because the file tree is too large. " ++
@@ -164,4 +167,7 @@ test "find reports when no files match" {
     defer result.deinit(gpa);
     try std.testing.expect(!result.is_error);
     try std.testing.expectEqualStrings("No files match *.md.", result.content);
+    // An empty search still states its count, so the box reads like every other
+    // result of this tool.
+    try std.testing.expectEqualStrings("Matches: 0", result.summary.?);
 }

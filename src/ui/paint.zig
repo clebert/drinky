@@ -43,10 +43,34 @@ pub const Placement = struct {
     skip: usize,
 };
 
-/// The physical rows a box wraps `text` to at `columns`: the two padding rows
-/// around the body plus the wrapped body itself.
-pub fn boxRows(text: []const u8, columns: usize) usize {
-    return 2 + terminal.width.rows(text, boxInner(columns));
+/// How a box fits a logical line that is wider than one row.
+pub const Fit = enum {
+    /// Break the line across as many rows as it needs.
+    wrap,
+    /// Keep one row and show the start of the line. One `…` marks the cut. A
+    /// caller picks this when the start of a line identifies it, so the cut
+    /// falls on the detail behind that.
+    head,
+};
+
+/// The body of one box: its text and how a long line fits. The role that colors
+/// the box is a paint-time choice, so the measure does not take it.
+pub const Box = struct {
+    text: []const u8,
+    fit: Fit = .wrap,
+};
+
+/// The physical rows a box occupies at `columns`: the two padding rows around
+/// the body plus the body itself. A `wrap` body counts its wrapped rows, and a
+/// `head` body counts one row per logical line.
+pub fn boxRows(body: *const Box, columns: usize) usize {
+    var count: usize = 2;
+    var lines = std.mem.splitScalar(u8, body.text, '\n');
+    while (lines.next()) |line| count += switch (body.fit) {
+        .wrap => terminal.width.rows(lineText(line), contentColumns(columns)),
+        .head => 1,
+    };
+    return count;
 }
 
 /// The animation of the live input while a turn runs: the tick that moves the
@@ -69,15 +93,26 @@ pub fn activityChanged(activity: *const Activity, columns: usize) bool {
         activityHead(activity.motion_tick -% 1, columns);
 }
 
-/// The complete row width available to content between the open separators.
-pub fn frameColumns(columns: usize) usize {
+/// The columns one row leaves to content: every column of the row.
+pub fn contentColumns(columns: usize) usize {
     return @max(columns, 1);
 }
 
-/// The wrap width inside a box: two columns narrower than the terminal, one for
-/// the left pad and one to keep the fill off the last cell.
-fn boxInner(columns: usize) usize {
-    return @max(columns -| 2, 1);
+/// The one character that marks a line the row cut.
+const ellipsis = "…";
+
+/// The final text of one box line: what follows its last carriage return. A tool
+/// redraws a progress line in place with that byte, and a terminal keeps only
+/// what comes after it. The row shows that final state.
+///
+/// The split that yields `line` breaks on the line feed alone, so a CRLF line
+/// arrives with its carriage return still on the end. That byte belongs to the
+/// break, not to a redraw, so it goes first. Without that step the last
+/// carriage return of the line is its final byte and the row paints nothing.
+fn lineText(line: []const u8) []const u8 {
+    const body = std.mem.trimEnd(u8, line, "\r");
+    const cut = std.mem.lastIndexOfScalar(u8, body, '\r') orelse return body;
+    return body[cut + 1 ..];
 }
 
 /// Each `\n`-separated line of `text`, styled and truncated to one row, with the
@@ -105,16 +140,25 @@ pub fn notice(placement: *const Placement, look: *const Notice, text: []const u8
     }
 }
 
-/// A filled box in one role: a blank padding row, `text` wrapped to the inner
-/// width with a one-space left pad and the fill carried to full width, then a
-/// blank padding row. A box role reverses the video, so the fill takes the
-/// color of the role and the text keeps the terminal background. It streams one
-/// row at a time and separates itself inside the block gap around it.
-pub fn box(placement: *const Placement, name: role.Name, text: []const u8) !void {
+/// A filled box in one role: a blank padding row, the body fitted to the row
+/// width with the fill carried to full width, then a blank padding row. A box
+/// role reverses the video, so the fill takes the color of the role and the text
+/// keeps the terminal background. It streams one row at a time and separates
+/// itself inside the block gap around it.
+pub fn box(placement: *const Placement, name: role.Name, body: *const Box) !void {
     var line = placement.base;
     try boxPad(placement, &line, name);
-    var iterator = terminal.width.wrapper(text, boxInner(placement.columns));
-    while (iterator.next()) |content| try boxLine(placement, &line, name, content);
+    var lines = std.mem.splitScalar(u8, body.text, '\n');
+    while (lines.next()) |source| {
+        const content = lineText(source);
+        switch (body.fit) {
+            .wrap => {
+                var iterator = terminal.width.wrapper(content, contentColumns(placement.columns));
+                while (iterator.next()) |row| try boxLine(placement, &line, name, .wrap, row);
+            },
+            .head => try boxLine(placement, &line, name, .head, content),
+        }
+    }
     try boxPad(placement, &line, name);
 }
 
@@ -129,20 +173,20 @@ fn boxPad(placement: *const Placement, line: *usize, name: role.Name) !void {
     placement.sink.end(.{ .id = placement.id, .line = line.* });
 }
 
-/// A box's content row: a one-space left pad, `content`, then the fill carried
-/// to full width. A cap on `content` leaves room for the pad, so a window too
-/// narrow for the wrap width still yields one physical row.
+/// A box's content row: `content` from the first column, then the fill carried
+/// to full width.
 fn boxLine(
     placement: *const Placement,
     line: *usize,
     name: role.Name,
+    fit: Fit,
     content: []const u8,
 ) !void {
     defer line.* += 1;
     if (line.* < placement.skip) return;
     placement.sink.begin();
     try role.apply(placement.sink, name);
-    try boxLineCells(placement.sink, placement.columns, content);
+    try boxLineCells(placement.sink, placement.columns, fit, content);
     try attribute.apply(placement.sink, .reset);
     placement.sink.end(.{ .id = placement.id, .line = line.* });
 }
@@ -151,15 +195,31 @@ fn boxLine(
 /// text wraps at the live box width. The caller opens the row, applies the box
 /// color, and closes the style. The color preview page uses this fixed row.
 pub fn boxCells(sink: *terminal.View.Sink, columns: usize, text: []const u8) !void {
-    var iterator = terminal.width.wrapper(text, boxInner(columns));
-    try boxLineCells(sink, columns, iterator.next().?);
+    var iterator = terminal.width.wrapper(text, contentColumns(columns));
+    try boxLineCells(sink, columns, .wrap, iterator.next().?);
 }
 
-fn boxLineCells(sink: *terminal.View.Sink, columns: usize, content: []const u8) !void {
-    const shown = terminal.width.truncate(content, columns -| 1);
-    try sink.text(" ");
-    try sink.text(shown);
-    try sink.spaces(columns -| (1 + terminal.width.ofText(shown)));
+fn boxLineCells(
+    sink: *terminal.View.Sink,
+    columns: usize,
+    fit: Fit,
+    content: []const u8,
+) !void {
+    const room = contentColumns(columns);
+    switch (fit) {
+        // The wrap already cut the row, so it needs no mark of its own.
+        .wrap => try sink.text(terminal.width.truncate(content, room)),
+        .head => {
+            const shown = terminal.width.truncate(content, room);
+            if (shown.len == content.len) {
+                try sink.text(shown);
+            } else {
+                try sink.text(terminal.width.truncate(content, room -| 1));
+                try sink.text(ellipsis);
+            }
+        },
+    }
+    try sink.spaces(columns -| sink.columns_written);
 }
 
 const frame_separator_rows = 2;
@@ -229,7 +289,7 @@ pub const SeparatorOptions = struct {
 /// Stream the input area that `framing` describes. It contains a labelled top
 /// separator, its open body rows, and a labelled bottom separator.
 pub fn framed(placement: *const Placement, framing: *const Framing) !void {
-    const content_columns = frameColumns(placement.columns);
+    const content_columns = contentColumns(placement.columns);
     const maybe_activity = framing.activity;
     const separators: Separators = .{
         .columns = placement.columns,
@@ -557,8 +617,8 @@ test "box preview cells use the live wrap width" {
     sink.end(.{ .id = 0, .line = 0 });
     try view.render();
 
-    try std.testing.expect(std.mem.indexOf(u8, output.written(), " abcdefgh ") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output.written(), "abcdefghi") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "abcdefghij") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "abcdefghijk") == null);
 }
 
 // A box wraps its text between words, so a copy of its rows out of the terminal
@@ -579,21 +639,84 @@ test "a box breaks its rows between words" {
         .columns = columns,
         .base = 0,
         .skip = 0,
-    }, .user, text);
+    }, .user, &.{ .text = text });
     try view.render();
 
     const painted = output.written();
-    try std.testing.expectEqual(@as(usize, 5), boxRows(text, columns));
-    try std.testing.expect(std.mem.indexOf(u8, painted, " one two ") != null);
-    try std.testing.expect(std.mem.indexOf(u8, painted, " three four ") != null);
-    try std.testing.expect(std.mem.indexOf(u8, painted, " five ") != null);
+    try std.testing.expectEqual(@as(usize, 4), boxRows(&.{ .text = text }, columns));
+    try std.testing.expect(std.mem.indexOf(u8, painted, "one two three") != null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "four five") != null);
 }
 
-test "open separators leave the complete row available to content" {
-    try std.testing.expectEqual(@as(usize, 1), frameColumns(0));
-    try std.testing.expectEqual(@as(usize, 1), frameColumns(1));
-    try std.testing.expectEqual(@as(usize, 2), frameColumns(2));
-    try std.testing.expectEqual(@as(usize, 80), frameColumns(80));
+// One rule everywhere: a box adds no pad of its own, so a box row and an input
+// row both take every column and start at the first one.
+test "every row leaves the complete width to content" {
+    try std.testing.expectEqual(@as(usize, 1), contentColumns(0));
+    try std.testing.expectEqual(@as(usize, 1), contentColumns(1));
+    try std.testing.expectEqual(@as(usize, 2), contentColumns(2));
+    try std.testing.expectEqual(@as(usize, 80), contentColumns(80));
+}
+
+// A one-row fit shows the head of a line and marks the cut with one ellipsis.
+// The head of each line identifies it, so the cut falls on the detail behind it.
+// Each logical line keeps its own row.
+test "a fitted box holds one row per line" {
+    const gpa = std.testing.allocator;
+    const columns = 20;
+    const text = "Tool: write · File: src/App.zig\nLines: 1 · Size: 6 B";
+    var output: std.Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    var view = terminal.View.init(gpa, &output.writer);
+    defer view.deinit();
+
+    const body: Box = .{ .text = text, .fit = .head };
+    const sink = try view.beginFrame(.{ .columns = columns, .rows = 8 }, 1);
+    try box(&.{
+        .sink = sink,
+        .id = 0,
+        .columns = columns,
+        .base = 0,
+        .skip = 0,
+    }, .tool_pending, &body);
+    try view.render();
+
+    const painted = output.written();
+    try std.testing.expectEqual(@as(usize, 4), boxRows(&body, columns));
+    try std.testing.expect(std.mem.indexOf(u8, painted, "Tool: write · File:\u{2026}") != null);
+    // The summary line keeps its own row and fits whole.
+    try std.testing.expect(std.mem.indexOf(u8, painted, "Lines: 1 · Size: 6 B") != null);
+}
+
+// Real tool output redraws a line in place. The row shows the final state of
+// that line, and the count agrees with the paint.
+test "a box row shows the text after the last carriage return" {
+    const gpa = std.testing.allocator;
+    var output: std.Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    var view = terminal.View.init(gpa, &output.writer);
+    defer view.deinit();
+
+    const columns = 20;
+    // The first line redraws in place and ends on a CRLF break. The carriage
+    // return of that break belongs to the break, so it must not empty the row.
+    const body: Box = .{ .text = "Progress: 10%\r 50%\r100% done\r\nSecond line" };
+    const sink = try view.beginFrame(.{ .columns = columns, .rows = 8 }, 1);
+    try box(&.{
+        .sink = sink,
+        .id = 0,
+        .columns = columns,
+        .base = 0,
+        .skip = 0,
+    }, .tool_success, &body);
+    try view.render();
+
+    const painted = output.written();
+    try std.testing.expectEqual(@as(usize, 4), boxRows(&body, columns));
+    try std.testing.expect(std.mem.indexOf(u8, painted, "100% done") != null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "50%") == null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "Result") == null);
+    // The CRLF line keeps its text rather than painting an empty row.
+    try std.testing.expect(std.mem.indexOf(u8, painted, "Second line") != null);
 }
 
 test "activity at column zero emits no unused frame role" {

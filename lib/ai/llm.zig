@@ -316,6 +316,15 @@ pub const Event = union(enum) {
     /// reasoning part must put a blank line in front of the text of that part.
     /// Without that line the two parts join into one line.
     thinking: []const u8,
+    /// Display-only name of a tool call the model has started to stream. The
+    /// wire carries the name when the call opens, so the interface can show the
+    /// call while its arguments still stream. The call itself arrives as an
+    /// `item` once it closes.
+    tool_name: []const u8,
+    /// Display-only fragment of the open tool call's arguments, in wire order.
+    /// The fragments of one call concatenate to its arguments, but a fragment on
+    /// its own is not valid JSON.
+    tool_arguments: []const u8,
     /// One complete native assistant output item in wire order. Its slices borrow
     /// the stream and remain valid until the next read or stream teardown. OpenAI
     /// message content parts are canonically joined without a separator.
@@ -394,6 +403,20 @@ pub const Event = union(enum) {
             invalid,
             /// A valid provider outcome the neutral conversation model cannot retain.
             unsupported,
+            /// A frame that names an item or a block other than the open one.
+            /// The wire streams one at a time, so the wire order broke the
+            /// assumption the decoder holds. A retry meets that same order and
+            /// only spends the budget. It is reported apart from the two above,
+            /// because its cause is the stream shape rather than the content of
+            /// the reply, and it needs a different fix.
+            uncorrelated,
+
+            /// Which of two rejections a stream latches. A retry cannot clear
+            /// either `unsupported` or `uncorrelated`, so both outrank the
+            /// retryable `invalid`, and the first of them to latch stays.
+            pub fn outranks(self: Rejection, other: Rejection) bool {
+                return self != .invalid and other == .invalid;
+            }
         };
     };
 
@@ -462,4 +485,19 @@ test "account credential flags and label" {
     try std.testing.expectEqualStrings("ANTHROPIC_API_KEY", Account.anthropic_api.apiKeyEnv().?);
     try std.testing.expectEqualStrings("OPENAI_API_KEY", Account.openai_api.apiKeyEnv().?);
     try std.testing.expect(Account.anthropic_console.apiKeyEnv() == null);
+}
+
+test "a rejection a retry cannot clear outranks one it can" {
+    const Rejection = Event.Stop.Rejection;
+    // Neither of these clears on a resample, so both hold against `invalid`.
+    try std.testing.expect(Rejection.unsupported.outranks(.invalid));
+    try std.testing.expect(Rejection.uncorrelated.outranks(.invalid));
+    // A retryable outcome never displaces a latched terminal one.
+    try std.testing.expect(!Rejection.invalid.outranks(.unsupported));
+    try std.testing.expect(!Rejection.invalid.outranks(.uncorrelated));
+    // Between two terminal outcomes the first to latch stays, so neither
+    // outranks the other and the caller keeps what it has.
+    try std.testing.expect(!Rejection.unsupported.outranks(.uncorrelated));
+    try std.testing.expect(!Rejection.uncorrelated.outranks(.unsupported));
+    try std.testing.expect(!Rejection.invalid.outranks(.invalid));
 }

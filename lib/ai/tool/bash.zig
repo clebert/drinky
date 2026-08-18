@@ -5,6 +5,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+const format = @import("../format.zig");
 const llm = @import("../llm.zig");
 const net = @import("../net.zig");
 const Context = @import("Context.zig");
@@ -79,13 +80,16 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
     else
         limits.timeout_ms;
 
+    const started_ms = std.Io.Timestamp.now(context.io, .awake).toMilliseconds();
     const completed = execute(context, command, timeout_ms) catch |err| switch (err) {
         error.Canceled => return error.Canceled,
-        error.Timeout => return Result.report(
+        // A command that ran out of time reports that time the way a command
+        // that finished does, because the row above it counted up to this
+        // moment and the box must not drop the number the user watched.
+        error.Timeout => return timedOut(
             gpa,
-            .err,
-            "The command timed out after {d} ms.",
-            .{timeout_ms},
+            std.Io.Timestamp.now(context.io, .awake).toMilliseconds() - started_ms,
+            timeout_ms,
         ),
         error.StreamTooLong => return Result.report(
             gpa,
@@ -110,7 +114,27 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
         .exited => |code| code != 0,
         else => true,
     };
-    return render(gpa, output, limits, completed.term, failed);
+    const elapsed_ms = std.Io.Timestamp.now(context.io, .awake).toMilliseconds() - started_ms;
+    return render(gpa, output, limits, completed.term, failed, elapsed_ms);
+}
+
+/// The result of a command the timeout stopped. Both spans read in the units the
+/// interface uses, never in raw milliseconds, and the summary carries the run
+/// time so every command reports one.
+fn timedOut(gpa: std.mem.Allocator, elapsed_ms: i64, timeout_ms: u64) !Result {
+    var limit: [24]u8 = undefined;
+    var scale: [24]u8 = undefined;
+    // Built field by field: the content states the limit to the model, and the
+    // box reports the run time instead. An assignment over a report would leak
+    // the sentence that the report put in the summary.
+    const content = try std.fmt.allocPrint(gpa, "The command timed out after {s}.", .{
+        format.duration(&limit, @intCast(@min(timeout_ms, std.math.maxInt(i64)))),
+    });
+    errdefer gpa.free(content);
+    const summary = try std.fmt.allocPrint(gpa, "Status: Timed out · Time: {s}", .{
+        format.duration(&scale, elapsed_ms),
+    });
+    return .{ .content = content, .summary = summary, .is_error = true };
 }
 
 fn execute(context: *const Context, command: []const u8, timeout_ms: u64) !Completed {
@@ -250,6 +274,9 @@ fn render(
     limits: *const Context.Bash,
     term: std.process.Child.Term,
     failed: bool,
+    /// The wall-clock time the command ran. A long command is the one whose cost
+    /// the user weighs, so the box reports it beside the exit status.
+    elapsed_ms: i64,
 ) !Result {
     const start = tailStart(output, limits);
     const window = output[start..];
@@ -260,7 +287,7 @@ fn render(
         if (output[start - 1] == '\n') {
             try result_writer.writer.print(
                 "[Pith omitted earlier output. Pith shows the last {d} of {d} lines.]\n",
-                .{ lineCount(window), lineCount(output) },
+                .{ format.lines(window), format.lines(output) },
             );
         } else {
             try result_writer.writer.print(
@@ -276,7 +303,7 @@ fn render(
         if (result_writer.writer.buffered().len > 0) try result_writer.writer.writeAll("\n\n");
         switch (term) {
             .exited => |code| try result_writer.writer.print(
-                "[The command exited with status {d}.]",
+                "[The command exited with code {d}.]",
                 .{code},
             ),
             else => try result_writer.writer.writeAll("[The command stopped before it completed.]"),
@@ -284,12 +311,25 @@ fn render(
     }
     var summary_output: std.Io.Writer.Allocating = .init(gpa);
     errdefer summary_output.deinit();
+    // `code` is the number the command returned. `Status` names a state instead,
+    // so a killed command cannot read as one that exited.
     switch (term) {
-        .exited => |code| try summary_output.writer.print("Exit status: {d}", .{code}),
+        .exited => |code| try summary_output.writer.print("Exit code: {d}", .{code}),
         else => try summary_output.writer.writeAll("Status: Terminated"),
     }
-    const lines = lineCount(output);
-    if (lines > 0) try summary_output.writer.print(" · Lines: {d}", .{lines});
+    var scale: [24]u8 = undefined;
+    // The run time comes first among the measures, because the row above counted
+    // up to it and a narrow window cuts the tail of this row.
+    try summary_output.writer.print(" · Time: {s}", .{format.duration(&scale, elapsed_ms)});
+    // The two measures below name the whole output, not the tail the box keeps,
+    // and they read in the same order as every other tool that reports them. A
+    // command that printed nothing reports neither, because a zero pair says
+    // less than its absence.
+    const lines = format.lines(output);
+    if (lines > 0) try summary_output.writer.print(" · Lines: {d} · Size: {s}", .{
+        lines,
+        format.bytes(&scale, output.len),
+    });
     if (start > 0) try summary_output.writer.writeAll(" · Output: Truncated");
     const summary = try summary_output.toOwnedSlice();
     errdefer gpa.free(summary);
@@ -326,14 +366,6 @@ fn tailStart(text: []const u8, limits: *const Context.Bash) usize {
     return start;
 }
 
-/// The number of lines in `text`. A final line with no trailing newline counts.
-/// Empty text is zero lines.
-fn lineCount(text: []const u8) usize {
-    if (text.len == 0) return 0;
-    const newlines = std.mem.count(u8, text, "\n");
-    return if (text[text.len - 1] == '\n') newlines else newlines + 1;
-}
-
 test "bash runs a command and returns its output" {
     const gpa = std.testing.allocator;
     const context: Context = .{ .gpa = gpa, .io = std.testing.io };
@@ -365,8 +397,15 @@ test "bash reports a non-zero exit as an error" {
     defer result.deinit(gpa);
     try std.testing.expect(result.is_error);
     try std.testing.expect(std.mem.indexOf(u8, result.content, "boom") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result.content, "status 3") != null);
-    try std.testing.expectEqualStrings("Exit status: 3 · Lines: 1", result.summary.?);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "code 3") != null);
+    // A real command takes a real, varying time, so the row's shape is what
+    // this pins down.
+    try std.testing.expect(std.mem.startsWith(
+        u8,
+        result.summary.?,
+        "Exit code: 3 · Time: ",
+    ));
+    try std.testing.expect(std.mem.indexOf(u8, result.summary.?, " · Lines: 1 · Size: ") != null);
 }
 
 test "bash reports empty successful output" {
@@ -378,7 +417,7 @@ test "bash reports empty successful output" {
     defer result.deinit(gpa);
     try std.testing.expect(!result.is_error);
     try std.testing.expectEqualStrings("(No output)", result.content);
-    try std.testing.expectEqualStrings("Exit status: 0", result.summary.?);
+    try std.testing.expect(std.mem.startsWith(u8, result.summary.?, "Exit code: 0 · Time: "));
 }
 
 test "bash honors a per-call timeout" {
@@ -389,7 +428,9 @@ test "bash honors a per-call timeout" {
     );
     defer result.deinit(gpa);
     try std.testing.expect(result.is_error);
-    try std.testing.expect(std.mem.indexOf(u8, result.content, "timed out after 1000 ms") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "timed out after 1.0s") != null);
+    // Every command reports its run time, so a stopped one keeps that row too.
+    try std.testing.expect(std.mem.startsWith(u8, result.summary.?, "Status: Timed out · Time: "));
 }
 
 test "bash timeout is absolute while output arrives" {
@@ -404,7 +445,7 @@ test "bash timeout is absolute while output arrives" {
     );
     defer result.deinit(gpa);
     try std.testing.expect(result.is_error);
-    try std.testing.expect(std.mem.indexOf(u8, result.content, "timed out after 100 ms") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "timed out after 0.1s") != null);
 }
 
 test "bash timeout reaps a command after output closes" {
@@ -426,7 +467,7 @@ test "bash timeout reaps a command after output closes" {
     const result = try run(&context, input);
     defer result.deinit(gpa);
     try std.testing.expect(result.is_error);
-    try std.testing.expect(std.mem.indexOf(u8, result.content, "timed out after 100 ms") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "timed out after 0.1s") != null);
 
     const pid_text = try tmp.dir.readFileAlloc(io, "pid", gpa, .limited(64));
     defer gpa.free(pid_text);
@@ -496,19 +537,19 @@ test "render summary discloses line and byte truncation" {
     const gpa = std.testing.allocator;
     {
         const limits: Context.Bash = .{ .lines_max = 2 };
-        const result = try render(gpa, "a\nb\nc\n", &limits, .{ .exited = 0 }, false);
+        const result = try render(gpa, "a\nb\nc\n", &limits, .{ .exited = 0 }, false, 1_500);
         defer result.deinit(gpa);
         try std.testing.expectEqualStrings(
-            "Exit status: 0 · Lines: 3 · Output: Truncated",
+            "Exit code: 0 · Time: 1.5s · Lines: 3 · Size: 6 B · Output: Truncated",
             result.summary.?,
         );
     }
     {
         const limits: Context.Bash = .{ .lines_max = 1000, .bytes_max = 4 };
-        const result = try render(gpa, "abcdef\n", &limits, .{ .exited = 0 }, false);
+        const result = try render(gpa, "abcdef\n", &limits, .{ .exited = 0 }, false, 0);
         defer result.deinit(gpa);
         try std.testing.expectEqualStrings(
-            "Exit status: 0 · Lines: 1 · Output: Truncated",
+            "Exit code: 0 · Time: 0.0s · Lines: 1 · Size: 7 B · Output: Truncated",
             result.summary.?,
         );
     }
@@ -555,10 +596,4 @@ test "tailStart honors zero output limits" {
     const no_bytes: Context.Bash = .{ .bytes_max = 0 };
     try std.testing.expectEqual(text.len, tailStart(text, &no_lines));
     try std.testing.expectEqual(text.len, tailStart(text, &no_bytes));
-}
-
-test "lineCount counts a final unterminated line" {
-    try std.testing.expectEqual(@as(usize, 0), lineCount(""));
-    try std.testing.expectEqual(@as(usize, 2), lineCount("a\nb"));
-    try std.testing.expectEqual(@as(usize, 2), lineCount("a\nb\n"));
 }

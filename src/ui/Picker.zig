@@ -99,7 +99,7 @@ pub fn moveDown(self: *Picker) !void {
 /// The window holds option rows alone, so the first option sits at its top and a
 /// step of one row reaches both ends of the list.
 pub fn reflow(self: *Picker, size: terminal.View.Size) void {
-    const columns_max = paint.frameColumns(size.columns);
+    const columns_max = paint.contentColumns(size.columns);
     const total_body = terminal.width.rows(self.content.items, columns_max);
     const visible = @min(total_body, paint.bodyLimit(size.rows));
     const cursor_row = terminal.width.caret(self.content.items, .{
@@ -114,7 +114,7 @@ pub fn reflow(self: *Picker, size: terminal.View.Size) void {
 /// Physical rows the picker occupies: the caption, two separators, and the
 /// wrapped option rows. The list stops at its scroll limit for `size.rows`.
 pub fn rows(self: *const Picker, size: terminal.View.Size) usize {
-    const columns_max = paint.frameColumns(size.columns);
+    const columns_max = paint.contentColumns(size.columns);
     const total_body = terminal.width.rows(self.content.items, columns_max);
     return self.captionRows() + paint.framedRows(@min(total_body, paint.bodyLimit(size.rows)));
 }
@@ -124,7 +124,7 @@ pub fn rows(self: *const Picker, size: terminal.View.Size) usize {
 /// `reflow` set the scroll.
 pub fn render(self: *const Picker, placement: *const paint.Placement, viewport_rows: usize) !void {
     try self.renderCaption(placement);
-    const columns_max = paint.frameColumns(placement.columns);
+    const columns_max = paint.contentColumns(placement.columns);
     const total_body = terminal.width.rows(self.content.items, columns_max);
     const visible_rows = @min(total_body, paint.bodyLimit(viewport_rows));
     // The derived placement copies its parent. Only the geometry changes.

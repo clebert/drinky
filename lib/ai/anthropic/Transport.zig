@@ -14,7 +14,19 @@ const Transport = @This();
 
 const messages_url = "https://api.anthropic.com/v1/messages";
 const anthropic_version = "2023-06-01";
-const beta = "claude-code-20250219,oauth-2025-04-20";
+/// The beta that streams the input of a tool call as the model writes it.
+/// Without it the API buffers that input and validates it before it sends any
+/// of it, so the fragments arrive late and coarse and the row that counts them
+/// reports little of a long call. Every account sends the beta, so a call reads
+/// the same on each one.
+///
+/// The trade is that the API no longer holds back input it rejects. A call whose
+/// arguments never parse therefore reaches the tool, which reports invalid
+/// arguments to the model rather than the provider refusing the call. That costs
+/// one round, and it buys progress on every call that does parse.
+const streaming_beta = "fine-grained-tool-streaming-2025-05-14";
+/// The betas of the Claude Code identity, plus the one above.
+const beta = "claude-code-20250219,oauth-2025-04-20," ++ streaming_beta;
 const user_agent = "claude-cli/2.1.75";
 
 gpa: std.mem.Allocator,
@@ -128,17 +140,37 @@ pub const Stream = struct {
         self.tool_name.deinit(self.gpa);
     }
 
-    /// Latch a rejection. `unsupported` wins over `invalid` however they
-    /// interleave. A resample cannot turn an outcome this design cannot retain
-    /// into one it can, so a retry spends the budget and only delays the same
-    /// failure.
+    /// Latch a rejection. `unsupported` and `uncorrelated` both win over
+    /// `invalid` however they interleave, and the first of them to latch stays.
+    /// A resample cannot turn an outcome this design cannot retain into one it
+    /// can, and it cannot reorder a stream, so a retry spends the budget and
+    /// only delays the same failure.
     fn markRejection(self: *Stream, rejection: llm.Event.Stop.Rejection) void {
-        if (self.terminal_rejection == null or rejection == .unsupported)
+        const latched = self.terminal_rejection orelse {
             self.terminal_rejection = rejection;
+            return;
+        };
+        if (rejection.outranks(latched)) self.terminal_rejection = rejection;
     }
 
     fn invalid(self: *Stream) sse.Decoded {
         self.markRejection(.invalid);
+        return .progress;
+    }
+
+    /// A block frame that contradicts the open block. The wire streams one
+    /// content block at a time, so a frame that names another index means that
+    /// assumption broke. A retry meets the same order, so it latches apart from
+    /// the resampleable failures above, the way an item id does on the OpenAI
+    /// side. Only the contradicted case matches across the two.
+    ///
+    /// A frame that names no block at all is absent correlation, and it stays
+    /// with `invalid` here while the OpenAI side keeps the reply. The delta of a
+    /// block becomes the committed content, so a delta Pith cannot place leaves
+    /// the reply short. An OpenAI arguments delta only paints a box, and its
+    /// done frame carries the call.
+    fn uncorrelated(self: *Stream) sse.Decoded {
+        self.markRejection(.uncorrelated);
         return .progress;
     }
 
@@ -173,6 +205,9 @@ pub const Stream = struct {
             try self.tool_call_id.appendSlice(self.gpa, call_id);
             try self.tool_name.appendSlice(self.gpa, name);
             self.open_block = .{ .tool = index };
+            // Display only: the interface shows the call while its arguments
+            // stream. The call itself waits for the block to close.
+            return .{ .event = .{ .tool_name = self.tool_name.items } };
         } else {
             self.markRejection(.unsupported);
             self.open_block = .{ .unsupported = index };
@@ -181,8 +216,13 @@ pub const Stream = struct {
     }
 
     fn appendBlockDelta(self: *Stream, object: *const std.json.ObjectMap) !sse.Decoded {
+        // A delta outside any block, and one that carries no usable index, both
+        // leave the reply malformed, and a resample can fix that. A delta that
+        // names another block breaks the one-block-at-a-time assumption instead,
+        // which no resample changes.
         const open_block = self.open_block orelse return self.invalid();
-        if (contentBlockIndex(object) != open_block.index()) return self.invalid();
+        const index = contentBlockIndex(object) orelse return self.invalid();
+        if (index != open_block.index()) return self.uncorrelated();
         const delta = json.object(object.get("delta")) orelse return self.invalid();
         const kind = json.string(delta.get("type")) orelse return self.invalid();
         return switch (open_block) {
@@ -209,18 +249,20 @@ pub const Stream = struct {
                 const chunk = json.string(delta.get("partial_json")) orelse
                     return self.invalid();
                 try self.block_text.appendSlice(self.gpa, chunk);
-                break :arguments .progress;
+                break :arguments .{ .event = .{ .tool_arguments = chunk } };
             } else self.invalid(),
             .unsupported => .progress,
         };
     }
 
     fn stopBlock(self: *Stream, object: *const std.json.ObjectMap) sse.Decoded {
-        // A stop that closes nothing means the block sequence is malformed. It
-        // latches like every other correlation failure and does not pass for
-        // harmless filler.
+        // A stop that closes nothing, and one that carries no usable index, both
+        // mean the block sequence is malformed, so they latch and do not pass for
+        // harmless filler. A stop that names another block is a wire-order
+        // failure instead, which a retry cannot clear.
         const open_block = self.open_block orelse return self.invalid();
-        if (contentBlockIndex(object) != open_block.index()) return self.invalid();
+        const index = contentBlockIndex(object) orelse return self.invalid();
+        if (index != open_block.index()) return self.uncorrelated();
         self.open_block = null;
         // A reasoning block ends its display here, whatever the block retains.
         // The agent core displays the placeholder for a redacted block at this
@@ -410,12 +452,15 @@ fn requestOptions(
         .api_key => |key| {
             extra[0] = .{ .name = "x-api-key", .value = key };
             extra[1] = .{ .name = "anthropic-version", .value = anthropic_version };
+            // The only beta this identity opts into. It carries no Claude Code
+            // header, and tool streaming is not part of that identity.
+            extra[2] = .{ .name = "anthropic-beta", .value = streaming_beta };
             return .{
                 .headers = .{
                     .content_type = .{ .override = "application/json" },
                     .accept_encoding = .{ .override = "identity" },
                 },
-                .extra_headers = extra[0..2],
+                .extra_headers = extra,
             };
         },
     }
@@ -692,8 +737,13 @@ test "answer text ends the thinking display and an empty delta holds the seam" {
     )).event.thinking);
 }
 
-test "invalid reasoning blocks latch through terminal usage" {
-    const Case = struct { frames: []const []const u8 };
+test "a rejected reasoning block latches through terminal usage" {
+    const Case = struct {
+        frames: []const []const u8,
+        /// A malformed block resamples. A frame for another index cannot, because
+        /// a retry meets the same order.
+        rejection: llm.Event.Stop.Rejection = .invalid,
+    };
     const missing_signature = [_][]const u8{
         \\{"type":"content_block_start","index":0,"content_block":{"type":"thinking"}}
         ,
@@ -726,10 +776,10 @@ test "invalid reasoning blocks latch through terminal usage" {
     };
     const cases = [_]Case{
         .{ .frames = &missing_signature },
-        .{ .frames = &mismatched_index },
+        .{ .frames = &mismatched_index, .rejection = .uncorrelated },
         .{ .frames = &empty_redacted },
         .{ .frames = &unclosed_redacted },
-        .{ .frames = &mismatched_redacted_close },
+        .{ .frames = &mismatched_redacted_close, .rejection = .uncorrelated },
         .{ .frames = &interleaved_text },
     };
 
@@ -743,10 +793,7 @@ test "invalid reasoning blocks latch through terminal usage" {
         const terminal = try stream.decode(
             \\{"type":"message_stop"}
         );
-        try std.testing.expectEqual(
-            llm.Event.Stop.Rejection.invalid,
-            terminal.event.stop.rejection.?,
-        );
+        try std.testing.expectEqual(case.rejection, terminal.event.stop.rejection.?);
         try std.testing.expectEqual(@as(u64, 5), terminal.event.stop.usage.output);
     }
 }
@@ -760,6 +807,9 @@ test "negative block indexes never correlate with block zero" {
     try std.testing.expectEqual(@as(sse.Decoded, .progress), try stream.decode(
         \\{"type":"content_block_delta","index":-1,"delta":{"type":"input_json_delta","partial_json":"{}"}}
     ));
+    // A negative index names no block at all, so the frame is malformed rather
+    // than out of order. It must not read as block zero, and it must not spend
+    // the terminal rejection that a real order failure needs.
     try std.testing.expectEqual(
         llm.Event.Stop.Rejection.invalid,
         stream.terminal_rejection.?,
@@ -976,9 +1026,11 @@ test "a tool block emits one completed item when it closes" {
         \\{"type":"content_block_stop","index":0}
     ));
 
-    try std.testing.expectEqual(@as(sse.Decoded, .progress), try stream.decode(
+    // The name shows the call while its arguments still stream.
+    const opened = try stream.decode(
         \\{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"t1","name":"read"}}
-    ));
+    );
+    try std.testing.expectEqualStrings("read", opened.event.tool_name);
     const complete = try stream.decode(
         \\{"type":"content_block_stop","index":1}
     );
@@ -1005,6 +1057,10 @@ test "correlation state survives per-frame resets across a multi-delta tool call
     var stream = testStream(threaded.io(), &reader, 60_000, net.stream_response_bytes_max);
     defer stream.deinitDecode();
 
+    // The display events come first: the name, then each argument fragment.
+    try std.testing.expectEqualStrings("read", (try stream.next()).?.tool_name);
+    try std.testing.expectEqualStrings("{", (try stream.next()).?.tool_arguments);
+    try std.testing.expectEqualStrings("}", (try stream.next()).?.tool_arguments);
     const item = (try stream.next()).?.item.tool_call;
     try std.testing.expectEqualStrings("t1", item.call_id);
     try std.testing.expectEqualStrings("read", item.name);
@@ -1318,8 +1374,31 @@ test "requestOptions forks the identity headers by account" {
     try std.testing.expect(keyed.headers.authorization == .default);
     try std.testing.expect(keyed.headers.user_agent == .default);
     try std.testing.expectEqualStrings("identity", keyed.headers.accept_encoding.override);
-    try std.testing.expectEqual(@as(usize, 2), keyed.extra_headers.len);
+    try std.testing.expectEqual(@as(usize, 3), keyed.extra_headers.len);
     try std.testing.expectEqualStrings("x-api-key", keyed.extra_headers[0].name);
     try std.testing.expectEqualStrings("sk-key", keyed.extra_headers[0].value);
     try std.testing.expectEqualStrings("anthropic-version", keyed.extra_headers[1].name);
+    try std.testing.expectEqualStrings("anthropic-beta", keyed.extra_headers[2].name);
+    try std.testing.expectEqualStrings(streaming_beta, keyed.extra_headers[2].value);
+}
+
+// Every account asks the API to stream a tool input as the model writes it.
+// Without it the API holds each fragment back until the whole input parses, so
+// the row that counts the argument bytes of a long call stands still and then
+// jumps to the total. The beta is the only thing that makes that row climb.
+test "every identity asks for streamed tool input" {
+    var extra: [3]std.http.Header = undefined;
+    const subscription = requestOptions(.{ .subscription = "tok" }, "Bearer tok", &extra);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        subscription.extra_headers[1].value,
+        streaming_beta,
+    ) != null);
+
+    const keyed = requestOptions(.{ .api_key = "sk-key" }, null, &extra);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        keyed.extra_headers[2].value,
+        streaming_beta,
+    ) != null);
 }

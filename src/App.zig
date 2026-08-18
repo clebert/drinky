@@ -85,9 +85,9 @@ home_directory: []const u8,
 project_instructions: ai.instructions.Result,
 skills: ai.skills.Registry,
 prompt: []const u8,
-/// What the `config` tool returns: the document that describes every key of
-/// `config.json`, and its box summary. It outlives the agent, which borrows it.
-settings: ai.tool.Context.Settings,
+/// What the `describe_config` tool returns: the document that describes every
+/// key of `config.json`. It outlives the agent, which borrows it.
+config_document: []const u8,
 agent: ai.Agent,
 /// The consumer-owned model and rendering, driven by the loop.
 session: Session,
@@ -205,6 +205,18 @@ const TurnHandler = struct {
         try self.enqueue(.{ .thinking = copy });
     }
 
+    pub fn onToolName(self: *TurnHandler, name: []const u8) !void {
+        const copy = try self.app.gpa.dupe(u8, name);
+        errdefer self.app.gpa.free(copy);
+        try self.enqueue(.{ .tool_name = copy });
+    }
+
+    pub fn onToolArguments(self: *TurnHandler, delta: []const u8) !void {
+        const copy = try self.app.gpa.dupe(u8, delta);
+        errdefer self.app.gpa.free(copy);
+        try self.enqueue(.{ .tool_arguments = copy });
+    }
+
     pub fn onToolStart(self: *TurnHandler, name: []const u8, input_json: []const u8) !void {
         const name_copy = try self.app.gpa.dupe(u8, name);
         errdefer self.app.gpa.free(name_copy);
@@ -220,10 +232,10 @@ const TurnHandler = struct {
         maybe_summary: ?[]const u8,
         is_error: bool,
     ) !void {
+        // The model reads the output, so only the box line reaches the consumer.
+        _ = content;
         const name_copy = try self.app.gpa.dupe(u8, name);
         errdefer self.app.gpa.free(name_copy);
-        const content_copy = try self.app.gpa.dupe(u8, content);
-        errdefer self.app.gpa.free(content_copy);
         const maybe_summary_copy = if (maybe_summary) |summary|
             try self.app.gpa.dupe(u8, summary)
         else
@@ -231,7 +243,6 @@ const TurnHandler = struct {
         errdefer if (maybe_summary_copy) |summary_copy| self.app.gpa.free(summary_copy);
         try self.enqueue(.{ .tool_result = .{
             .name = name_copy,
-            .content = content_copy,
             .summary = maybe_summary_copy,
             .is_error = is_error,
         } });
@@ -393,7 +404,11 @@ fn directoryLabel(
     directory: []const u8,
     home: []const u8,
 ) ![]const u8 {
-    const label = if (relativeTo(home, directory)) |relative|
+    // The status line names an identity rather than a file, so it never falls
+    // back to a path relative to the working directory the way `format.path`
+    // does. It asks for the home-relative part directly, because the result of
+    // `format.path` cannot say whether a leading `~/` came from home.
+    const label = if (ai.format.relativeTo(&.{ .boundary = home, .target = directory })) |relative|
         try std.fmt.allocPrint(gpa, "~/{s}", .{relative})
     else if (ai.project.contains(&.{ .boundary = home, .target = directory }))
         // The home directory itself is the whole label.
@@ -504,12 +519,12 @@ pub fn run(
         .skills = self.skills.catalog(),
     });
     defer gpa.free(self.prompt);
-    self.settings = try config.settings(gpa, &.{
+    self.config_document = try config.document(gpa, &.{
         .anthropic_model = anthropic_default.name,
         .openai_model = openai_default.name,
         .effort = effort_default,
     });
-    defer Config.freeSettings(gpa, &self.settings);
+    defer gpa.free(self.config_document);
 
     // Start on the account this project used last, then on the first
     // authenticated account, or signed out (no client) when none is. The login
@@ -526,7 +541,7 @@ pub fn run(
         .retry = config.retry,
         .effort = start_effort,
         .bash = config.bash,
-        .settings = self.settings,
+        .config_document = self.config_document,
         .cache = config.cache,
     });
     defer self.agent.deinit();
@@ -544,6 +559,10 @@ pub fn run(
     self.session = Session.init(gpa, self.tty.writer(), self.agent.model, self.agent.effort);
     defer self.session.deinit();
     self.session.account_shown = active;
+    // The session reports how long a call has run against this timeout, so it
+    // must read the same one the tool runs under.
+    self.session.bash_timeout_ms = config.bash.timeout_ms;
+    self.session.display_roots = self.displayRoots();
     self.session.directory_shown = self.directory_label;
     self.session.branch_root = self.project_instructions.projectRoot();
     self.refreshBranch();
@@ -651,7 +670,7 @@ fn initFields(self: *App, gpa: std.mem.Allocator, io: std.Io) void {
         .project_instructions = .init(gpa, .project),
         .skills = .init(gpa),
         .prompt = "",
-        .settings = .{},
+        .config_document = "",
         .input = .init(gpa),
         // The loop is not live yet. `run` arms this before it enters the loop.
         .running = false,
@@ -687,7 +706,7 @@ fn initFields(self: *App, gpa: std.mem.Allocator, io: std.Io) void {
 fn prepareTerminalExit(self: *App) void {
     // A reported content loss gets no repaint, because the app writes no further frame. An exit
     // with a page open reaches this only through a failure, because every exit key closes the page
-    // first. A repaint would need the page closed and one more frame at teardown.
+    // first. A repaint needs the page closed and one more frame at teardown.
     _ = self.tty.setAlternateScreen(false) catch return;
     self.session.parkCursor() catch {};
 }
@@ -1050,6 +1069,8 @@ fn turnFailureText(err: anyerror) ?[]const u8 {
             "a refusal, a pause, or an unsupported result.",
         error.EmptyReply => "The model returned an empty response.",
         error.IncompleteReply => "Pith did not receive the complete model response.",
+        error.UncorrelatedReply => "Pith could not match a streamed part of the response to " ++
+            "the item it belongs to. The provider changed the order of its stream.",
         error.TooManyToolRounds => "The turn reached the limit for tool rounds.",
         error.CredentialReplaced => "Pith found a replacement credential for this account. " ++
             "Pith removed the prior account evidence. Try the turn again.",
@@ -1519,10 +1540,14 @@ fn refresh(self: *App) !void {
     if (try self.tty.setAlternateScreen(self.session.mode == .viewing)) {
         self.session.view.invalidateWindow();
     }
+    // The session does no io, so the driver hands it the clock every frame.
+    self.session.clock_ms = self.nowMs();
     try self.session.paint(size);
 }
 
-/// Milliseconds on the monotonic clock, for the double Ctrl+C window.
+/// Milliseconds on the monotonic clock. It drives every span the interface
+/// measures: the double Ctrl+C window, the escape wait, and the frame clock the
+/// io-free session reads.
 fn nowMs(self: *App) i64 {
     return std.Io.Timestamp.now(self.io, .awake).toMilliseconds();
 }
@@ -1733,7 +1758,7 @@ fn appendSkillPrompt(self: *App, prompt: *const ai.command.Outcome.Prompt) !usiz
 fn skillMarker(self: *App, prompt: *const ai.command.Outcome.Prompt) ![]u8 {
     var size_buffer: [16]u8 = undefined;
     const size = ai.format.bytes(&size_buffer, prompt.source_bytes);
-    const source = try self.displayPath(prompt.source);
+    const source = try ai.format.path(self.gpa, prompt.source, &self.displayRoots());
     defer self.gpa.free(source);
     return std.fmt.allocPrint(self.gpa, "{s} · Size: {s}\nSource: {s}", .{
         prompt.name,
@@ -1742,26 +1767,9 @@ fn skillMarker(self: *App, prompt: *const ai.command.Outcome.Prompt) ![]u8 {
     });
 }
 
-/// `path` as the transcript shows it: relative to the working directory when it
-/// sits below it, else with the home directory as `~`, else the path itself. The
-/// result is owned.
-fn displayPath(self: *App, path: []const u8) ![]u8 {
-    if (relativeTo(self.working_directory, path)) |relative|
-        return self.gpa.dupe(u8, relative);
-    if (relativeTo(self.home_directory, path)) |relative|
-        return std.fmt.allocPrint(self.gpa, "~/{s}", .{relative});
-    return self.gpa.dupe(u8, path);
-}
-
-/// `path` without its `boundary` prefix, or null when the boundary is empty, does
-/// not contain `path`, or is `path` itself.
-fn relativeTo(boundary: []const u8, path: []const u8) ?[]const u8 {
-    if (boundary.len == 0) return null;
-    if (!ai.project.contains(&.{ .boundary = boundary, .target = path })) return null;
-    const separated = std.fs.path.isSep(boundary[boundary.len - 1]);
-    const cut = if (separated) boundary.len else boundary.len + 1;
-    if (cut >= path.len) return null;
-    return path[cut..];
+/// The roots every path in the interface is measured against.
+fn displayRoots(self: *const App) ai.format.Roots {
+    return .{ .working_directory = self.working_directory, .home_directory = self.home_directory };
 }
 
 /// Record a plain user message and spawn its turn. Returns the rich draft's
@@ -2376,6 +2384,7 @@ test "a turn failure the agent named itself reads as a sentence, not an error na
         error.UnsupportedReply,
         error.EmptyReply,
         error.IncompleteReply,
+        error.UncorrelatedReply,
         error.TooManyToolRounds,
         error.CredentialReplaced,
         error.TokenGrantRejected,
@@ -5026,7 +5035,7 @@ test "an invoked skill marks its name, size, and source and keeps its task visib
     try std.testing.expect(std.mem.indexOf(u8, out.written(), prompt.content) == null);
 }
 
-test displayPath {
+test displayRoots {
     const gpa = std.testing.allocator;
     var app: App = undefined;
     app.initForTest(gpa);
@@ -5042,7 +5051,7 @@ test displayPath {
     };
     for (cases) |case| {
         const path, const shown = case;
-        const display = try app.displayPath(path);
+        const display = try ai.format.path(gpa, path, &app.displayRoots());
         defer gpa.free(display);
         try std.testing.expectEqualStrings(shown, display);
     }
@@ -5050,7 +5059,7 @@ test displayPath {
     // Without a resolved session the path stands alone.
     app.working_directory = "";
     app.home_directory = "";
-    const bare = try app.displayPath("/work/.agents/skills/demo/SKILL.md");
+    const bare = try ai.format.path(gpa, "/work/.agents/skills/demo/SKILL.md", &app.displayRoots());
     defer gpa.free(bare);
     try std.testing.expectEqualStrings("/work/.agents/skills/demo/SKILL.md", bare);
 }
@@ -6483,7 +6492,7 @@ test "a committed cancel drains queued progress into the transcript before rewin
             .progress_sequence_committed = 2,
             .payload = .{ .tool_result = .{
                 .name = try gpa.dupe(u8, "read"),
-                .content = try gpa.dupe(u8, "ok"),
+                .summary = try gpa.dupe(u8, "Lines: 1 · Size: 2 B"),
                 .is_error = false,
             } },
         } },
@@ -6506,11 +6515,14 @@ test "a committed cancel drains queued progress into the transcript before rewin
 
     try std.testing.expect(app.session.mode == .prompt);
     const blocks = app.session.transcript.blocks();
-    // [user "prompt", model "answer", tool_result "read → ok", cancellation event]
+    // [user "prompt", model "answer", the read call and its box line, cancellation event]
     try std.testing.expectEqual(@as(usize, 4), blocks.len);
     try std.testing.expectEqualStrings("prompt", blocks[0].user.items);
     try std.testing.expectEqualStrings("answer", blocks[1].model.items);
-    try std.testing.expect(std.mem.indexOf(u8, blocks[2].tool_result.text.items, "ok") != null);
+    try std.testing.expectEqualStrings(
+        "Tool: read\nLines: 1 · Size: 2 B",
+        blocks[2].tool_result.text.items,
+    );
     try std.testing.expect(!blocks[3].event.is_error);
     try std.testing.expectEqualStrings("You canceled the turn.", blocks[3].event.text.items);
     try std.testing.expectEqual(@as(f64, 2.5), app.session.stats_shown.cost);

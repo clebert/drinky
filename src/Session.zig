@@ -27,6 +27,50 @@ const truncated_event =
 /// the retry, because Enter belongs to the editor text.
 const retry_hint = "Ctrl+N: Try again · Esc: Dismiss";
 
+/// One tool call the model is still streaming. The row counts the argument bytes
+/// that arrived instead of showing them, because the arguments are JSON until
+/// the call commits and a row of JSON that slides tells the reader nothing. A
+/// count that climbs reports the progress of a long call, and the row keeps one
+/// shape while it climbs.
+///
+/// The count measures what the model has produced so far, not what a tool has
+/// done. A `write` that has streamed 402 bytes of arguments has written nothing
+/// yet, so the row must not read as a file size.
+const StreamedTool = struct {
+    name: []const u8,
+    bytes: usize,
+    /// Whether the reply that holds this call has committed. The count then
+    /// stands still, so the row names the state it reached instead of a measure
+    /// that stopped meaning progress.
+    queued: bool,
+    /// The row text, rewritten whenever the count or the state changes. This row
+    /// changes only on an event, so it is built there and the frame borrows it.
+    /// The timed row of `ActiveTool` changes on every frame instead, so that one
+    /// is built at paint time.
+    ///
+    /// `Received` names the wire, never the file. A finished call reports the
+    /// file as `Size`, so the two counts cannot be read as the same measure.
+    box: std.ArrayList(u8),
+
+    fn deinit(self: *StreamedTool, gpa: std.mem.Allocator) void {
+        gpa.free(self.name);
+        self.box.deinit(gpa);
+    }
+
+    fn refresh(self: *StreamedTool, gpa: std.mem.Allocator) !void {
+        var scale: [16]u8 = undefined;
+        self.box.clearRetainingCapacity();
+        if (self.queued) {
+            try self.box.print(gpa, "Tool: {s} · Status: Queued", .{self.name});
+            return;
+        }
+        try self.box.print(gpa, "Tool: {s} · Received: {s}", .{
+            self.name,
+            ai.format.bytes(&scale, self.bytes),
+        });
+    }
+};
+
 gpa: std.mem.Allocator,
 transcript: Transcript,
 /// The sole transient notice. Its owned content never enters the transcript.
@@ -101,6 +145,16 @@ turn_origin: ?TurnOrigin,
 /// Whether a retry context waits at the prompt. `App` owns that context and
 /// mirrors this bit, so the hint row above the editor names its controls.
 retry_shown: bool,
+/// Milliseconds on the monotonic clock, written by the driver before each paint.
+/// The session does no io, so it cannot read a clock of its own. It stays zero
+/// until the first paint, which makes every span it reports zero.
+clock_ms: i64,
+/// The wall-clock timeout a `bash` call runs under when the call names none, in
+/// milliseconds. The driver copies it from the configuration.
+bash_timeout_ms: u64,
+/// The roots every path in a tool row is measured against. The driver copies
+/// them from the resolved session. Empty roots leave every path as it is.
+display_roots: ai.format.Roots,
 
 const Mode = union(enum) {
     prompt,
@@ -125,9 +179,13 @@ const Turn = struct {
     /// The blink clock of the input caret. An edit restarts it at zero.
     caret_tick: u64,
     tools: std.ArrayList(ActiveTool),
-    /// `tools`' box text. Each frame rebuilds it, so the tail gets a
-    /// `[]const []const u8` without a fresh allocation per repaint.
-    box_view: std.ArrayList([]const u8),
+    /// The tool calls the model is still streaming, oldest first. Each shows its
+    /// name and the argument bytes received so far. A committed call replaces
+    /// the oldest one, because both sides keep the order of the reply.
+    streamed_tools: std.ArrayList(StreamedTool),
+    /// The box of every tool call above. Each frame rebuilds it, so the tail
+    /// gets a `[]const ui.paint.Box` without a fresh allocation per repaint.
+    box_view: std.ArrayList(ui.paint.Box),
 
     fn activity(self: *const Turn) ui.paint.Activity {
         return .{
@@ -137,17 +195,70 @@ const Turn = struct {
         };
     }
 
-    fn boxes(self: *Turn, gpa: std.mem.Allocator) ![]const []const u8 {
+    fn boxes(self: *Turn, gpa: std.mem.Allocator, now_ms: i64) ![]const ui.paint.Box {
         self.box_view.clearRetainingCapacity();
-        for (self.tools.items) |tool| try self.box_view.append(gpa, tool.box);
+        // Every row holds one call. A committed one names what it acts on, and a
+        // streamed one counts the bytes that have arrived. A call under a
+        // timeout adds the row that reports its time.
+        for (self.tools.items) |*tool|
+            try self.box_view.append(gpa, .{ .text = try tool.text(gpa, now_ms), .fit = .head });
+        for (self.streamed_tools.items) |streamed|
+            try self.box_view.append(gpa, .{ .text = streamed.box.items, .fit = .head });
         return self.box_view.items;
     }
 };
 
-/// One running tool call: its pending tool box shows in the live tail. `name`
-/// matches the result to it. `input_json` labels that result. `box` is the box
-/// text (`name input_json`). The session owns all fields and frees them on completion.
-const ActiveTool = struct { name: []const u8, input_json: []const u8, box: []const u8 };
+/// One committed call that is running now. A call under a wall-clock timeout
+/// keeps a second row that reports how long it has run against how long it can
+/// run, so the user can weigh a cancel. Every other call is its head row alone.
+///
+/// `name` matches the result to the call and `input_json` labels that result.
+/// The session owns every field and frees them on completion.
+const ActiveTool = struct {
+    name: []const u8,
+    input_json: []const u8,
+    /// The head row, `Tool: {name} · {label}: {subject}`, built once when the
+    /// call starts.
+    box: []const u8,
+    started_ms: i64,
+    /// The timeout the call runs under. Null for a tool that runs under none,
+    /// and zero for a call that asked for no limit.
+    timeout_ms: ?u64,
+    /// The head row and the timed row below it, rebuilt on the frames that show
+    /// it. Empty for a tool with no timeout, which paints `box` directly.
+    rows: std.ArrayList(u8),
+
+    fn deinit(self: *ActiveTool, gpa: std.mem.Allocator) void {
+        gpa.free(self.name);
+        gpa.free(self.input_json);
+        gpa.free(self.box);
+        self.rows.deinit(gpa);
+    }
+
+    /// The text of this call's box at `now_ms`. A call under a timeout rebuilds
+    /// its two rows, because the time it has run changes between frames.
+    fn text(self: *ActiveTool, gpa: std.mem.Allocator, now_ms: i64) ![]const u8 {
+        const timeout_ms = self.timeout_ms orelse return self.box;
+        var elapsed: [24]u8 = undefined;
+        var allowed: [24]u8 = undefined;
+        // A call that asked for no limit still reports the time it has run. It
+        // is the call that can run forever, so it is the one whose row the user
+        // reads before a cancel.
+        const limit = if (timeout_ms == 0)
+            "None"
+        else
+            ai.format.duration(&allowed, @intCast(timeout_ms));
+        self.rows.clearRetainingCapacity();
+        // `Time` names the same measure the finished box reports, so a call does
+        // not rename its own run time when it ends.
+        try self.rows.print(gpa, "{s}\nTime: {s} · Timeout: {s}", .{
+            self.box,
+            ai.format.duration(&elapsed, now_ms - self.started_ms),
+            limit,
+        });
+        return self.rows.items;
+    }
+};
 
 const Picking = struct {
     picker: ui.Picker,
@@ -176,6 +287,11 @@ pub const TurnEvent = struct {
     pub const Payload = union(enum) {
         text: []u8,
         thinking: []u8,
+        /// Display only: the model opened a tool call with this name. Its
+        /// arguments follow as `tool_arguments` fragments.
+        tool_name: []u8,
+        /// Display only: one fragment of the open tool call's arguments.
+        tool_arguments: []u8,
         tool_start: Tool,
         tool_result: ToolResult,
         usage: ai.Agent.Stats,
@@ -190,9 +306,10 @@ pub const TurnEvent = struct {
         turn_ended,
 
         pub const Tool = struct { name: []u8, input_json: []u8 };
+        /// One finished call, as the interface shows it. The model reads the
+        /// output, so the event carries the box line alone.
         pub const ToolResult = struct {
             name: []u8,
-            content: []u8,
             summary: ?[]u8 = null,
             is_error: bool,
         };
@@ -201,14 +318,13 @@ pub const TurnEvent = struct {
 
     pub fn deinit(self: *const TurnEvent, gpa: std.mem.Allocator) void {
         switch (self.payload) {
-            .text, .thinking => |bytes| gpa.free(bytes),
+            .text, .thinking, .tool_name, .tool_arguments => |bytes| gpa.free(bytes),
             .tool_start => |tool| {
                 gpa.free(tool.name);
                 gpa.free(tool.input_json);
             },
             .tool_result => |result| {
                 gpa.free(result.name);
-                gpa.free(result.content);
                 if (result.summary) |summary| gpa.free(summary);
             },
             .steering_consumed => |consumed| gpa.free(consumed.text),
@@ -269,6 +385,9 @@ pub fn init(
         .steering_view = .empty,
         .turn_origin = null,
         .retry_shown = false,
+        .clock_ms = 0,
+        .bash_timeout_ms = (ai.tool.Context.Bash{}).timeout_ms,
+        .display_roots = .{},
     };
     self.page_view.preserveScrollback();
     return self;
@@ -406,15 +525,32 @@ pub fn applyTurnEvent(self: *Session, event: *const TurnEvent) !bool {
     }
     self.dirty = true;
     switch (event.payload) {
-        .text => |delta| try self.transcript.appendStream(.model, delta),
-        .thinking => |delta| try self.transcript.appendStream(.thinking, delta),
+        .text => |delta| {
+            self.dropQueuedTools(turn);
+            try self.transcript.appendStream(.model, delta);
+        },
+        .thinking => |delta| {
+            self.dropQueuedTools(turn);
+            try self.transcript.appendStream(.thinking, delta);
+        },
+        .tool_name => |name| {
+            self.dropQueuedTools(turn);
+            try self.openStreamedTool(turn, name);
+        },
+        .tool_arguments => |delta| try self.growStreamedTool(turn, delta),
         .tool_start => |*tool| {
             self.transcript.endMessage();
-            try pushTool(turn, self.gpa, tool);
+            try self.pushTool(turn, tool);
+            // One committed call replaces its own streamed row. A sibling call
+            // of the same reply keeps its row while this one runs.
+            try self.dropStreamedTool(turn, tool.name);
         },
         .tool_result => |result| try self.applyToolResult(result),
         .usage => |stats| self.stats_shown = stats,
-        .stream_reset => self.transcript.discardMessage(),
+        .stream_reset => {
+            self.transcript.discardMessage();
+            self.clearStreamedTools(turn);
+        },
         .steering_consumed => |consumed| {
             // Show the folded batch and hide its rows from the queue view, but
             // retain the rich drafts: a consumed batch can still roll back
@@ -458,40 +594,62 @@ pub fn applyCanceledTurnEvent(self: *Session, event: *const TurnEvent) !void {
     _ = try self.applyTurnEvent(event);
 }
 
-/// Record a finished tool call in the transcript: the tool's summary (or its
-/// first output line, when it gave none) beside the box it closes. Then free
-/// that box.
+/// Record a finished tool call in the transcript: the line the tool decided,
+/// beside the box it closes. Then free that box. The tool owns that decision, so
+/// a result without one leaves the call row alone.
 fn applyToolResult(self: *Session, result: TurnEvent.Payload.ToolResult) !void {
-    const detail = result.summary orelse first: {
-        const line_end = std.mem.indexOfScalar(u8, result.content, '\n') orelse result.content.len;
-        break :first result.content[0..line_end];
-    };
-    const finished = if (self.activeTurn()) |turn| takeTool(turn, result.name) else null;
-    defer if (finished) |*tool| self.freeTool(tool);
-    const arguments = if (finished) |tool| tool.input_json else "";
-    try self.appendToolRow(.{
-        .name = result.name,
-        .input_json = arguments,
+    var finished = if (self.activeTurn()) |turn| takeTool(turn, result.name) else null;
+    defer if (finished) |*tool| tool.deinit(self.gpa);
+    // The running call already built this head row, so the permanent block
+    // borrows it rather than reading the arguments a second time. Only a result
+    // whose call is gone has to build one.
+    if (finished) |tool| return self.appendToolBlock(&.{
+        .head = tool.box,
+        .detail = result.summary,
         .is_error = result.is_error,
-        .detail = detail,
+    });
+    const head = try toolRow(self.gpa, result.name, &.{
+        .label = "",
+        .subject = "",
+        .timeout_ms = null,
+    });
+    defer self.gpa.free(head);
+    try self.appendToolBlock(&.{
+        .head = head,
+        .detail = result.summary,
+        .is_error = result.is_error,
     });
 }
 
-/// Append one permanent tool block: the call above its result detail.
-fn appendToolRow(self: *Session, row: struct {
-    name: []const u8,
-    input_json: []const u8,
+/// One permanent tool block: the call row, and the line below it. Both are
+/// borrowed text, so they take named fields and a call site cannot mix them up.
+const ToolBlock = struct {
+    /// The call row: the tool and what it acts on. Every block keeps it, so the
+    /// history shows that the call happened.
+    head: []const u8,
+    /// The result row below it: a stat summary, or a whole sentence. Null when
+    /// the tool decided that the call needs no second row.
+    detail: ?[]const u8,
     is_error: bool,
-    detail: []const u8,
-}) !void {
-    const text = try std.fmt.allocPrint(self.gpa, "Tool: {s} {s}\n{s}: {s}", .{
-        row.name,
-        row.input_json,
-        if (row.is_error) "Error" else "Result",
-        row.detail,
-    });
+};
+
+/// Append one permanent tool block: the call above its result detail. A block
+/// without a detail is the call row alone.
+///
+/// A successful detail carries its own keys, or reads as a whole sentence, so a
+/// `Result` key in front of it only labels a label and spends columns the row
+/// truncates. A failed one takes `Error`, which names the severity the way
+/// every other failure line in the interface does and survives a terminal copy
+/// after the color of the box is gone.
+fn appendToolBlock(self: *Session, block: *const ToolBlock) !void {
+    const detail = block.detail orelse
+        return self.transcript.append(.tool_result, block.is_error, block.head);
+    const text = if (block.is_error)
+        try std.fmt.allocPrint(self.gpa, "{s}\nError: {s}", .{ block.head, detail })
+    else
+        try std.fmt.allocPrint(self.gpa, "{s}\n{s}", .{ block.head, detail });
     defer self.gpa.free(text);
-    try self.transcript.append(.tool_result, row.is_error, text);
+    try self.transcript.append(.tool_result, block.is_error, text);
 }
 
 /// Apply a command outcome to the model: replace its notice, record its event,
@@ -709,6 +867,7 @@ pub fn beginTurn(self: *Session, generation: u64) void {
         .progress_tick_last = 0,
         .caret_tick = 0,
         .tools = .empty,
+        .streamed_tools = .empty,
         .box_view = .empty,
     } };
     self.dirty = true;
@@ -724,15 +883,14 @@ fn flushRunningTools(self: *Session) ?anyerror {
     const turn = self.activeTurn() orelse return null;
     var maybe_error: ?anyerror = null;
     for (turn.tools.items) |*tool| {
-        self.appendToolRow(.{
-            .name = tool.name,
-            .input_json = tool.input_json,
-            .is_error = true,
+        self.appendToolBlock(&.{
+            .head = tool.box,
             .detail = ai.Agent.unfinished_tool_result,
+            .is_error = true,
         }) catch |err| {
             if (maybe_error == null) maybe_error = err;
         };
-        self.freeTool(tool);
+        tool.deinit(self.gpa);
     }
     turn.tools.clearRetainingCapacity();
     return maybe_error;
@@ -920,7 +1078,7 @@ pub fn paint(self: *Session, size: terminal.View.Size) !void {
         .turn => |*turn| turn: {
             self.editor.reflow(size);
             break :turn .{ .turn = .{
-                .tools = try turn.boxes(self.gpa),
+                .tools = try turn.boxes(self.gpa, self.clock_ms),
                 .activity = turn.activity(),
                 .steering = try self.steeringView(),
                 .editor = &self.editor,
@@ -984,20 +1142,132 @@ fn activeTurn(self: *Session) ?*Turn {
     };
 }
 
+/// The head row of one committed call: the tool and what it acts on, as a key
+/// and a value like every other fragment Pith shows. The key also says which
+/// kind of value follows, because a file and a pattern read alike on their own.
+/// A call with no subject is its name alone, so the row carries no dangling
+/// separator.
+fn toolRow(gpa: std.mem.Allocator, name: []const u8, call: *const ai.tool.Call) ![]u8 {
+    if (call.subject.len == 0) return std.fmt.allocPrint(gpa, "Tool: {s}", .{name});
+    return std.fmt.allocPrint(gpa, "Tool: {s} · {s}: {s}", .{ name, call.label, call.subject });
+}
+
 /// Allocate a running tool call's owned strings and record it on `turn`. Ends at
 /// a committed append so a later fallible repaint can never orphan or double-free
 /// the strings. A failure here retains nothing.
-fn pushTool(turn: *Turn, gpa: std.mem.Allocator, tool: *const TurnEvent.Payload.Tool) !void {
-    const box = try std.fmt.allocPrint(gpa, "Tool: {s} {s}", .{
+fn pushTool(self: *Session, turn: *Turn, tool: *const TurnEvent.Payload.Tool) !void {
+    const gpa = self.gpa;
+    // One read of the arguments serves the row and the timeout below it.
+    const call = try ai.tool.describe(
+        gpa,
         tool.name,
         tool.input_json,
-    });
+        &self.display_roots,
+        self.bash_timeout_ms,
+    );
+    defer call.deinit(gpa);
+    const box = try toolRow(gpa, tool.name, &call);
     errdefer gpa.free(box);
     const name_copy = try gpa.dupe(u8, tool.name);
     errdefer gpa.free(name_copy);
     const arguments = try gpa.dupe(u8, tool.input_json);
     errdefer gpa.free(arguments);
-    try turn.tools.append(gpa, .{ .name = name_copy, .input_json = arguments, .box = box });
+    try turn.tools.append(gpa, .{
+        .name = name_copy,
+        .input_json = arguments,
+        .box = box,
+        // The clock of the last frame, so a call cannot report a start that the
+        // interface has not shown yet.
+        .started_ms = self.clock_ms,
+        .timeout_ms = call.timeout_ms,
+        .rows = .empty,
+    });
+}
+
+/// Open the row of a tool call the model started to stream. It counts from zero,
+/// so a call with no arguments yet still shows that it started.
+fn openStreamedTool(self: *Session, turn: *Turn, name: []const u8) !void {
+    var streamed: StreamedTool = .{
+        .name = try self.gpa.dupe(u8, name),
+        .bytes = 0,
+        // A reply that already committed cannot be streaming a new call, so a
+        // row that opens here always counts.
+        .queued = false,
+        .box = .empty,
+    };
+    errdefer streamed.deinit(self.gpa);
+    try streamed.refresh(self.gpa);
+    try turn.streamed_tools.append(self.gpa, streamed);
+}
+
+/// Count one streamed argument fragment against the call that opened last. A
+/// fragment that arrives before any name has no row to count against, so it
+/// shows nothing.
+fn growStreamedTool(self: *Session, turn: *Turn, delta: []const u8) !void {
+    if (turn.streamed_tools.items.len == 0) return;
+    const streamed = &turn.streamed_tools.items[turn.streamed_tools.items.len - 1];
+    // A stream can open a call without naming it, which opens no row of its own.
+    // The last row is then a queued one left by the reply before it, and it
+    // counts for a call that already streamed. Fresh streamed content drops
+    // every queued row before it opens a new one, so a queued row at the end
+    // means this fragment has no row at all.
+    if (streamed.queued) return;
+    streamed.bytes += delta.len;
+    try streamed.refresh(self.gpa);
+}
+
+/// Drop the streamed row that the call named `name` replaces: the oldest row of
+/// that name, because both sides keep the order of the reply.
+///
+/// A call can reach here with no row of its own, because a stream can open a
+/// call without naming it. Dropping nothing then is what keeps a sibling's row
+/// in place: a positional drop takes the wrong one and the rows desynchronize
+/// for the rest of the reply.
+///
+/// The reverse leaves a row behind: a reply that opens a call and commits a
+/// different one keeps the first row until the turn ends. That row counts bytes
+/// for a call that never starts, which costs one stale line and no wrong text.
+///
+/// Every row that stays is queued. The first committed call proves the reply
+/// closed, and a mutating call waits for the calls before it, so a row that
+/// still counted wire bytes reports progress that stopped.
+fn dropStreamedTool(self: *Session, turn: *Turn, name: []const u8) !void {
+    for (turn.streamed_tools.items, 0..) |streamed, index| {
+        if (!std.mem.eql(u8, streamed.name, name)) continue;
+        var found = turn.streamed_tools.orderedRemove(index);
+        found.deinit(self.gpa);
+        break;
+    }
+    for (turn.streamed_tools.items) |*streamed| {
+        if (streamed.queued) continue;
+        streamed.queued = true;
+        try streamed.refresh(self.gpa);
+    }
+}
+
+/// Drop every queued row when the next reply starts to stream.
+///
+/// A row becomes queued only after a call of its own reply committed, and that
+/// reply streams nothing more. Fresh streamed content therefore belongs to the
+/// next reply, and a row still queued under it names a call that never started.
+/// Without this it sits above every later round of the turn.
+fn dropQueuedTools(self: *Session, turn: *Turn) void {
+    var index: usize = 0;
+    while (index < turn.streamed_tools.items.len) {
+        if (!turn.streamed_tools.items[index].queued) {
+            index += 1;
+            continue;
+        }
+        var stale = turn.streamed_tools.orderedRemove(index);
+        stale.deinit(self.gpa);
+    }
+}
+
+/// Drop every streamed row. A retry re-streams the reply, so the rows of the
+/// attempt it discards go with its text.
+fn clearStreamedTools(self: *Session, turn: *Turn) void {
+    for (turn.streamed_tools.items) |*streamed| streamed.deinit(self.gpa);
+    turn.streamed_tools.clearRetainingCapacity();
 }
 
 /// Remove the running tool matching `name` (or the oldest, if none matches) and
@@ -1010,15 +1280,11 @@ fn takeTool(turn: *Turn, name: []const u8) ?ActiveTool {
     return turn.tools.orderedRemove(0);
 }
 
-fn freeTool(self: *Session, tool: *const ActiveTool) void {
-    self.gpa.free(tool.name);
-    self.gpa.free(tool.input_json);
-    self.gpa.free(tool.box);
-}
-
 fn freeTurn(self: *Session, turn: *Turn) void {
-    for (turn.tools.items) |*tool| self.freeTool(tool);
+    for (turn.tools.items) |*tool| tool.deinit(self.gpa);
     turn.tools.deinit(self.gpa);
+    self.clearStreamedTools(turn);
+    turn.streamed_tools.deinit(self.gpa);
     turn.box_view.deinit(self.gpa);
 }
 
@@ -1053,7 +1319,7 @@ fn applyFinishedToolRound(session: *Session) !void {
         .progress_sequence_committed = 1,
         .payload = .{ .tool_result = .{
             .name = try gpa.dupe(u8, "bash"),
-            .content = try gpa.dupe(u8, "ok"),
+            .summary = try gpa.dupe(u8, "Exit code: 0"),
             .is_error = false,
         } },
     });
@@ -1199,7 +1465,7 @@ test "a large bracketed paste collapses to a marker through the real pipeline" {
 
 // The app cancels a send-as-a-message offer on every key that is not an Enter, but
 // a turn end is no key event. An abnormal end also returns uncommitted drafts to
-// the editor, so an offer that survived would name a line that left the screen.
+// the editor, so an offer that survives names a line that left the screen.
 // Every turn end runs through `endTurn`, so the drop belongs there. The footer goes
 // with it: a notice that a key raised during the turn describes that turn, so it is
 // no longer true at the prompt.
@@ -1379,7 +1645,7 @@ test "scripted stream events drive the model and one coalesced paint" {
     } });
     try applyEvent(&session, 1, .{ .tool_result = .{
         .name = try gpa.dupe(u8, "read"),
-        .content = try gpa.dupe(u8, "first line\nsecond"),
+        .summary = try gpa.dupe(u8, "Lines: 2 · Size: 17 B"),
         .is_error = false,
     } });
     // The result replaces its running box at once, not at turn end.
@@ -1405,10 +1671,10 @@ test "scripted stream events drive the model and one coalesced paint" {
     try std.testing.expect(std.mem.indexOf(u8, painted, "reasoning") != null);
     try std.testing.expect(std.mem.indexOf(u8, painted, "hello") != null);
     try std.testing.expect(std.mem.indexOf(u8, painted, "read") != null);
-    try std.testing.expect(std.mem.indexOf(u8, painted, "first line") != null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "Lines: 2 · Size: 17 B") != null);
 }
 
-test "a tool result box shows the summary instead of the output" {
+test "a tool result box shows the line the tool decided" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
@@ -1422,7 +1688,6 @@ test "a tool result box shows the summary instead of the output" {
     } });
     try applyEvent(&session, 1, .{ .tool_result = .{
         .name = try gpa.dupe(u8, "read"),
-        .content = try gpa.dupe(u8, "line one\nline two\nline three"),
         .summary = try gpa.dupe(u8, "Lines: 3 · Size: 27 B"),
         .is_error = false,
     } });
@@ -1430,8 +1695,199 @@ test "a tool result box shows the summary instead of the output" {
     try session.paint(.{ .columns = 80, .rows = 24 });
 
     const painted = out.written();
+    try std.testing.expectEqualStrings(
+        "Tool: read · File: x\nLines: 3 · Size: 27 B",
+        session.transcript.blocks()[0].tool_result.text.items,
+    );
     try std.testing.expect(std.mem.indexOf(u8, painted, "Lines: 3 · Size: 27 B") != null);
-    try std.testing.expect(std.mem.indexOf(u8, painted, "line one") == null);
+}
+
+// The tool decides the box line. A tool that decides none keeps the call row
+// alone, and the block stays in the history. The box is then one row between its
+// two padding rows.
+test "a tool result without a box line keeps the call row alone" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    defer session.deinit();
+    session.beginTurn(1);
+
+    try applyEvent(&session, 1, .{ .tool_start = .{
+        .name = try gpa.dupe(u8, "describe_config"),
+        .input_json = try gpa.dupe(u8, "{}"),
+    } });
+    try applyEvent(&session, 1, .{ .tool_result = .{
+        .name = try gpa.dupe(u8, "describe_config"),
+        .is_error = false,
+    } });
+    try finishTurn(&session, 0);
+
+    const blocks = session.transcript.blocks();
+    try std.testing.expectEqual(@as(usize, 1), blocks.len);
+    try std.testing.expectEqualStrings(
+        "Tool: describe_config",
+        blocks[0].tool_result.text.items,
+    );
+    try std.testing.expectEqual(@as(usize, 3), blocks[0].rows(80));
+
+    try session.paint(.{ .columns = 80, .rows = 24 });
+    const painted = out.written();
+    try std.testing.expect(std.mem.indexOf(u8, painted, "Tool: describe_config") != null);
+}
+
+// A failure states one sentence, and that sentence is the box line. The block
+// takes the `Error` key, which names the severity after a copy loses the color.
+test "a failed tool result keeps its sentence below the call row" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    defer session.deinit();
+    session.beginTurn(1);
+
+    const sentence = "Pith could not read a.zig because of error FileNotFound.";
+    try applyEvent(&session, 1, .{ .tool_start = .{
+        .name = try gpa.dupe(u8, "read"),
+        .input_json = try gpa.dupe(u8, "{\"path\":\"a.zig\"}"),
+    } });
+    try applyEvent(&session, 1, .{ .tool_result = .{
+        .name = try gpa.dupe(u8, "read"),
+        .summary = try gpa.dupe(u8, sentence),
+        .is_error = true,
+    } });
+    try finishTurn(&session, 0);
+
+    const blocks = session.transcript.blocks();
+    try std.testing.expectEqual(@as(usize, 1), blocks.len);
+    try std.testing.expect(blocks[0].tool_result.is_error);
+    try std.testing.expectEqualStrings(
+        "Tool: read · File: a.zig\nError: " ++ sentence,
+        blocks[0].tool_result.text.items,
+    );
+}
+
+// While the model streams a call, the row counts the argument bytes instead of
+// showing them. The count climbs like a download, so a long call reports its
+// progress, and the row never slides. The committed call then names its subject.
+test "a streamed tool call counts its bytes until the call commits" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    defer session.deinit();
+    session.beginTurn(1);
+
+    try applyEvent(&session, 1, .{ .tool_name = try gpa.dupe(u8, "write") });
+    try applyEvent(&session, 1, .{ .tool_arguments = try gpa.dupe(u8, "{\"path\":\"src/") });
+    try applyEvent(&session, 1, .{ .tool_arguments = try gpa.dupe(u8, "App.zig\",\"content\"") });
+    try std.testing.expectEqual(@as(usize, 1), session.mode.turn.streamed_tools.items.len);
+    try std.testing.expectEqual(@as(usize, 31), session.mode.turn.streamed_tools.items[0].bytes);
+
+    const size: terminal.View.Size = .{ .columns = 40, .rows = 24 };
+    try session.paint(size);
+    const streaming = out.written();
+    try std.testing.expect(std.mem.indexOf(u8, streaming, "Tool: write · Received: 31 B") != null);
+    // `Received` names the wire. The file reports `Size`, so a reader cannot
+    // take the streamed count for the size of what the call wrote.
+    try std.testing.expect(std.mem.indexOf(u8, streaming, "Size:") == null);
+    // No JSON reaches the row, and nothing is cut, so nothing slides.
+    try std.testing.expect(std.mem.indexOf(u8, streaming, "path") == null);
+    try std.testing.expect(std.mem.indexOf(u8, streaming, "\u{2026}") == null);
+
+    out.clearRetainingCapacity();
+    try applyEvent(&session, 1, .{ .tool_start = .{
+        .name = try gpa.dupe(u8, "write"),
+        .input_json = try gpa.dupe(u8, "{\"path\":\"src/App.zig\",\"content\":\"x\"}"),
+    } });
+    // The committed call replaces the streamed row, one for one.
+    try std.testing.expectEqual(@as(usize, 0), session.mode.turn.streamed_tools.items.len);
+    try std.testing.expectEqual(@as(usize, 1), session.mode.turn.tools.items.len);
+    session.view.resetScreen();
+    try session.paint(size);
+    const committed = out.written();
+    // The row names the file, not the argument list around it.
+    try std.testing.expect(std.mem.indexOf(u8, committed, "Tool: write · File: src/App.zig") != null);
+    try std.testing.expect(std.mem.indexOf(u8, committed, "content") == null);
+}
+
+// A reply can ask for two calls. The first to commit must take its own streamed
+// row and leave its sibling's, or the sibling disappears for as long as a
+// mutating call runs.
+test "a committed call replaces its own streamed row and leaves its sibling" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    defer session.deinit();
+    session.beginTurn(1);
+
+    try applyEvent(&session, 1, .{ .tool_name = try gpa.dupe(u8, "write") });
+    try applyEvent(&session, 1, .{ .tool_arguments = try gpa.dupe(u8, "{\"path\":\"a\"}") });
+    try applyEvent(&session, 1, .{ .tool_name = try gpa.dupe(u8, "read") });
+    try applyEvent(&session, 1, .{ .tool_arguments = try gpa.dupe(u8, "{\"path\":\"b\"}") });
+    try std.testing.expectEqual(@as(usize, 2), session.mode.turn.streamed_tools.items.len);
+
+    try applyEvent(&session, 1, .{ .tool_start = .{
+        .name = try gpa.dupe(u8, "write"),
+        .input_json = try gpa.dupe(u8, "{\"path\":\"a\"}"),
+    } });
+    // One row went, and the row that stays belongs to the call still waiting.
+    try std.testing.expectEqual(@as(usize, 1), session.mode.turn.streamed_tools.items.len);
+    try std.testing.expectEqualStrings("read", session.mode.turn.streamed_tools.items[0].name);
+
+    try session.paint(.{ .columns = 40, .rows = 24 });
+    const painted = out.written();
+    try std.testing.expect(std.mem.indexOf(u8, painted, "Tool: write · File: a") != null);
+    // The reply committed, so the sibling waits its turn. Its byte count stopped
+    // climbing, and the row says what it waits for instead.
+    try std.testing.expect(std.mem.indexOf(u8, painted, "Tool: read · Status: Queued") != null);
+}
+
+// A long call must not grow the work of a frame. The row holds a count, so its
+// cost does not follow the size of the arguments.
+test "a streamed row stays one short line however long the arguments run" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    defer session.deinit();
+    session.beginTurn(1);
+
+    try applyEvent(&session, 1, .{ .tool_name = try gpa.dupe(u8, "write") });
+    const chunk = "ä" ** 1024;
+    for (0..8) |_|
+        try applyEvent(&session, 1, .{ .tool_arguments = try gpa.dupe(u8, chunk) });
+
+    const streamed = &session.mode.turn.streamed_tools.items[0];
+    try std.testing.expectEqual(@as(usize, 8 * 2048), streamed.bytes);
+    try std.testing.expectEqualStrings("Tool: write · Received: 16.0 KB", streamed.box.items);
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, streamed.box.items, "\n"));
+}
+
+// A retry re-streams the reply, so the boxes of the discarded attempt go with
+// its text.
+test "a stream reset drops the tool boxes of the discarded attempt" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    defer session.deinit();
+    session.beginTurn(1);
+
+    try applyEvent(&session, 1, .{ .text = try gpa.dupe(u8, "partial") });
+    try applyEvent(&session, 1, .{ .tool_name = try gpa.dupe(u8, "read") });
+    try applyEvent(&session, 1, .{ .tool_arguments = try gpa.dupe(u8, "{\"path\"") });
+    try applyEvent(&session, 1, .stream_reset);
+    try std.testing.expectEqual(@as(usize, 0), session.mode.turn.streamed_tools.items.len);
+    try std.testing.expectEqual(@as(usize, 0), session.transcript.blocks().len);
+
+    // A fragment that arrives with no open call shows nothing and appends
+    // nothing.
+    try applyEvent(&session, 1, .{ .tool_arguments = try gpa.dupe(u8, "orphan") });
+    try std.testing.expectEqual(@as(usize, 0), session.mode.turn.streamed_tools.items.len);
+    try session.paint(.{ .columns = 40, .rows = 24 });
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "orphan") == null);
 }
 
 // A cut-off answer is committed history, so the turn's end says it is partial
@@ -1491,9 +1947,10 @@ test "streamed and tool text cannot emit terminal controls" {
         .name = try gpa.dupe(u8, "read"),
         .input_json = try gpa.dupe(u8, "{}"),
     } });
+    // The tool decides the box line, so the hostile bytes ride on that line.
     try applyEvent(&session, 1, .{ .tool_result = .{
         .name = try gpa.dupe(u8, "read"),
-        .content = try gpa.dupe(u8, tool),
+        .summary = try gpa.dupe(u8, tool),
         .is_error = false,
     } });
     try finishTurn(&session, 0);
@@ -1899,7 +2356,7 @@ test "a failure after a committed round keeps it and restores only steering" {
     // The committed round holds the call, so the unfinished tool shows as failed.
     try std.testing.expect(blocks[2].tool_result.is_error);
     try std.testing.expectEqualStrings(
-        "Tool: read {}\nError: " ++ ai.Agent.unfinished_tool_result,
+        "Tool: read\nError: " ++ ai.Agent.unfinished_tool_result,
         blocks[2].tool_result.text.items,
     );
     try std.testing.expect(blocks[3].event.is_error);
@@ -2045,7 +2502,7 @@ test "a cancel during a tool call keeps the call and shows it as failed" {
     try std.testing.expectEqualStrings("I run one command.", blocks[1].thinking.items);
     try std.testing.expect(blocks[2].tool_result.is_error);
     try std.testing.expectEqualStrings(
-        "Tool: bash {\"command\":\"sleep 600\"}\nError: " ++ ai.Agent.unfinished_tool_result,
+        "Tool: bash · Command: sleep 600\nError: " ++ ai.Agent.unfinished_tool_result,
         blocks[2].tool_result.text.items,
     );
     try std.testing.expect(!blocks[3].event.is_error);
@@ -2063,14 +2520,22 @@ test "running tool calls fail oldest first" {
     defer session.deinit();
     session.beginTurn(1);
 
+    // Each call names a distinct subject, so the rows below stay tellable apart.
+    // The two tools label their subject differently, which the rows must keep.
     const names = [_][]const u8{ "read", "grep", "read" };
-    for (names, 0..) |name, index| {
+    const subjects = [_][]const u8{ "path", "pattern", "path" };
+    const labels = [_][]const u8{ "File", "Pattern", "File" };
+    for (names, subjects, 0..) |name, key, index| {
         _ = try session.applyTurnEvent(&.{
             .generation = 1,
             .progress_sequence = index + 1,
             .payload = .{ .tool_start = .{
                 .name = try gpa.dupe(u8, name),
-                .input_json = try std.fmt.allocPrint(gpa, "{{\"index\":{d}}}", .{index}),
+                .input_json = try std.fmt.allocPrint(
+                    gpa,
+                    "{{\"{s}\":\"item{d}\"}}",
+                    .{ key, index },
+                ),
             } },
         });
     }
@@ -2078,8 +2543,12 @@ test "running tool calls fail oldest first" {
 
     const blocks = session.transcript.blocks();
     try std.testing.expectEqual(names.len + 1, blocks.len);
-    for (names, 0..) |name, index| {
-        const head = try std.fmt.allocPrint(gpa, "Tool: {s} {{\"index\":{d}}}\n", .{ name, index });
+    for (names, labels, 0..) |name, label, index| {
+        const head = try std.fmt.allocPrint(gpa, "Tool: {s} · {s}: item{d}\n", .{
+            name,
+            label,
+            index,
+        });
         defer gpa.free(head);
         try std.testing.expect(std.mem.startsWith(u8, blocks[index].tool_result.text.items, head));
     }
@@ -2114,7 +2583,9 @@ test "a finished tool block survives a cancel in the same round" {
     const blocks = session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 4), blocks.len);
     try std.testing.expect(!blocks[2].tool_result.is_error);
-    try std.testing.expect(std.mem.endsWith(u8, blocks[2].tool_result.text.items, "Result: ok"));
+    try std.testing.expect(
+        std.mem.endsWith(u8, blocks[2].tool_result.text.items, "\nExit code: 0"),
+    );
     try std.testing.expectEqualStrings("You canceled the turn.", blocks[3].event.text.items);
 }
 
@@ -2150,7 +2621,9 @@ test "a finished tool block survives a failure in the same round" {
     const blocks = session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 4), blocks.len);
     try std.testing.expect(!blocks[2].tool_result.is_error);
-    try std.testing.expect(std.mem.endsWith(u8, blocks[2].tool_result.text.items, "Result: ok"));
+    try std.testing.expect(
+        std.mem.endsWith(u8, blocks[2].tool_result.text.items, "\nExit code: 0"),
+    );
     try std.testing.expectEqualStrings("boom", blocks[3].event.text.items);
 }
 
@@ -2257,4 +2730,216 @@ test "a normal completion frees the retained prompt" {
 
     try finishTurn(&session, 0);
     try std.testing.expect(session.turn_origin == null);
+}
+
+// A command can run long enough that the user weighs a cancel. Its row reports
+// how long it has run against how long it can run, so that choice rests on what
+// the interface shows rather than on a guess.
+test "a running command reports its run time against its timeout" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    defer session.deinit();
+    session.bash_timeout_ms = 120_000;
+    session.beginTurn(1);
+
+    session.clock_ms = 1_000;
+    try applyEvent(&session, 1, .{ .tool_start = .{
+        .name = try gpa.dupe(u8, "bash"),
+        .input_json = try gpa.dupe(u8, "{\"command\":\"zig build test\"}"),
+    } });
+
+    session.clock_ms = 13_400;
+    try session.paint(.{ .columns = 60, .rows = 24 });
+    const painted = out.written();
+    try std.testing.expect(std.mem.indexOf(u8, painted, "Tool: bash · Command: zig build test") != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, painted, "Time: 12.4s · Timeout: 2m 0s") != null,
+    );
+}
+
+// A call that names its own timeout reports that one, not the configured
+// default, or the row tells the user to expect the wrong wait.
+test "a command that names its own timeout reports it" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    defer session.deinit();
+    session.bash_timeout_ms = 120_000;
+    session.beginTurn(1);
+
+    try applyEvent(&session, 1, .{ .tool_start = .{
+        .name = try gpa.dupe(u8, "bash"),
+        .input_json = try gpa.dupe(u8, "{\"command\":\"sleep 5\",\"timeout_seconds\":5}"),
+    } });
+    try session.paint(.{ .columns = 60, .rows = 24 });
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "Timeout: 5.0s") != null);
+}
+
+// Every other tool finishes promptly, so its box stays one row and reports no
+// timeout it does not run under.
+test "a tool without a timeout keeps one row" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    defer session.deinit();
+    session.beginTurn(1);
+
+    try applyEvent(&session, 1, .{ .tool_start = .{
+        .name = try gpa.dupe(u8, "read"),
+        .input_json = try gpa.dupe(u8, "{\"path\":\"src/App.zig\"}"),
+    } });
+    try session.paint(.{ .columns = 60, .rows = 24 });
+    const painted = out.written();
+    try std.testing.expect(std.mem.indexOf(u8, painted, "Tool: read · File: src/App.zig") != null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "Timeout:") == null);
+}
+
+// A timeout the model states in absurd numbers must not reach the display as a
+// span that cannot be measured. The row paints instead of aborting the frame.
+test "an absurd timeout still paints its row" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    defer session.deinit();
+    session.beginTurn(1);
+
+    try applyEvent(&session, 1, .{ .tool_start = .{
+        .name = try gpa.dupe(u8, "bash"),
+        .input_json = try gpa.dupe(
+            u8,
+            "{\"command\":\"x\",\"timeout_seconds\":9223372036854775807}",
+        ),
+    } });
+    try session.paint(.{ .columns = 60, .rows = 24 });
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "Time: ") != null);
+}
+
+// Regression: the configured timeout comes from a file the user writes, so it
+// reaches the display without passing the argument parse. An unclamped one used
+// to abort the frame on the cast into a signed span.
+test "an absurd configured timeout still paints its row" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    defer session.deinit();
+    session.bash_timeout_ms = std.math.maxInt(u64);
+    session.beginTurn(1);
+
+    try applyEvent(&session, 1, .{ .tool_start = .{
+        .name = try gpa.dupe(u8, "bash"),
+        .input_json = try gpa.dupe(u8, "{\"command\":\"x\"}"),
+    } });
+    try session.paint(.{ .columns = 60, .rows = 24 });
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "Time: ") != null);
+}
+
+// A command that asked for no limit can run forever, so it is the one whose row
+// the user reads before a cancel. It reports its time and names the missing
+// limit, rather than dropping the row the way a prompt tool does.
+test "a command with no limit still reports the time it has run" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    defer session.deinit();
+    session.beginTurn(1);
+
+    session.clock_ms = 0;
+    try applyEvent(&session, 1, .{ .tool_start = .{
+        .name = try gpa.dupe(u8, "bash"),
+        .input_json = try gpa.dupe(u8, "{\"command\":\"tail -f log\",\"timeout_seconds\":0}"),
+    } });
+    session.clock_ms = 8_000;
+    try session.paint(.{ .columns = 60, .rows = 24 });
+    try std.testing.expect(
+        std.mem.indexOf(u8, out.written(), "Time: 8.0s · Timeout: None") != null,
+    );
+}
+
+// A stream can open a call without naming it, so a fragment can arrive with no
+// row of its own. It must not land on a queued row left by the reply before it:
+// that row counts a call that already streamed, and the bytes vanish into it.
+test "an unnamed fragment does not count against a queued row" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    defer session.deinit();
+    session.beginTurn(1);
+
+    try applyEvent(&session, 1, .{ .tool_name = try gpa.dupe(u8, "read") });
+    try applyEvent(&session, 1, .{ .tool_name = try gpa.dupe(u8, "phantom") });
+    try applyEvent(&session, 1, .{ .tool_start = .{
+        .name = try gpa.dupe(u8, "read"),
+        .input_json = try gpa.dupe(u8, "{\"path\":\"a\"}"),
+    } });
+    const queued = &session.mode.turn.streamed_tools.items[0];
+    try std.testing.expect(queued.queued);
+
+    try applyEvent(&session, 1, .{ .tool_arguments = try gpa.dupe(u8, "{\"path\":\"b\"}") });
+    try std.testing.expectEqual(@as(usize, 0), queued.bytes);
+    try std.testing.expectEqualStrings("Tool: phantom · Status: Queued", queued.box.items);
+}
+
+// A reply that opens one call and commits another leaves a row for a call that
+// never starts. That row must not outlive its reply, or the next round shows a
+// queued call that nothing runs.
+test "a queued row that its reply never committed goes with that reply" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    defer session.deinit();
+    session.beginTurn(1);
+
+    try applyEvent(&session, 1, .{ .tool_name = try gpa.dupe(u8, "read") });
+    try applyEvent(&session, 1, .{ .tool_name = try gpa.dupe(u8, "phantom") });
+    try applyEvent(&session, 1, .{ .tool_start = .{
+        .name = try gpa.dupe(u8, "read"),
+        .input_json = try gpa.dupe(u8, "{\"path\":\"a\"}"),
+    } });
+    // The reply committed, so the row that no call claimed reads as queued.
+    try std.testing.expectEqual(@as(usize, 1), session.mode.turn.streamed_tools.items.len);
+    try std.testing.expect(session.mode.turn.streamed_tools.items[0].queued);
+
+    // The next reply starts to stream, which the committed one cannot do.
+    try applyEvent(&session, 1, .{ .text = try gpa.dupe(u8, "next") });
+    try std.testing.expectEqual(@as(usize, 0), session.mode.turn.streamed_tools.items.len);
+}
+
+// A stream can open a call without naming it, so a committed call can arrive
+// with no streamed row of its own. Dropping a row by position then takes a
+// sibling's row and desynchronizes the rest of the reply.
+test "a committed call with no streamed row leaves its sibling's row alone" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    defer session.deinit();
+    session.beginTurn(1);
+
+    // Only the second call announced its name, so only it has a row.
+    try applyEvent(&session, 1, .{ .tool_name = try gpa.dupe(u8, "grep") });
+    try applyEvent(&session, 1, .{ .tool_arguments = try gpa.dupe(u8, "{\"pattern\":\"x\"}") });
+    try std.testing.expectEqual(@as(usize, 1), session.mode.turn.streamed_tools.items.len);
+
+    try applyEvent(&session, 1, .{ .tool_start = .{
+        .name = try gpa.dupe(u8, "read"),
+        .input_json = try gpa.dupe(u8, "{\"path\":\"a\"}"),
+    } });
+    // The unnamed call took no row, so the row that stays belongs to `grep`.
+    try std.testing.expectEqual(@as(usize, 1), session.mode.turn.streamed_tools.items.len);
+    try std.testing.expectEqualStrings("grep", session.mode.turn.streamed_tools.items[0].name);
+
+    try applyEvent(&session, 1, .{ .tool_start = .{
+        .name = try gpa.dupe(u8, "grep"),
+        .input_json = try gpa.dupe(u8, "{\"pattern\":\"x\"}"),
+    } });
+    try std.testing.expectEqual(@as(usize, 0), session.mode.turn.streamed_tools.items.len);
 }

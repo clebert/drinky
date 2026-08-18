@@ -24,28 +24,6 @@ decision already taken, or a dependency on another entry. Module layout and exte
 
 ## Improvements
 
-- **A tool call holds one row** — the row truncates the arguments with an ellipsis instead of a
-  wrap, and it slides while the arguments stream, so the newest token stays visible. _A finished
-  call keeps two rows: the arguments, then the result. The row snaps back to the start of the
-  arguments once the call commits, because the head names the file or the command. Use one `…`
-  character inside the row width. A user message box keeps its wrap. Today a pending `write` or
-  `edit` box grows its spinner alone, so a long call shows no progress. A streamed token must reset
-  the spinner width too. Both transports already parse the argument fragments and know the tool name
-  at block start, so the missing piece is a display-only delta beside streamed text and reasoning.
-  The tool still runs after the reply commits, so nothing runs on half-received arguments. Drop the
-  provisional box on a retry's stream reset. The diff view for an edit must fit this one-row rule
-  later._
-- **Carriage returns in tool output** — a result row shows a progress line as its final state, not a
-  replacement glyph for every carriage return. _Real tool output carries one: `curl` and `pip`
-  redraw a line in place. Keep only the text after the last carriage return in a line, because a
-  terminal overwrote what came before it. The main seam is `paint.box`, which draws a user message
-  too. In `markdown`, `walk` sheds the carriage return at the end of a CRLF line, so only one inside
-  a line is left there. The sink turns a control byte into U+FFFD to keep its column math, so the
-  text must lose the byte first. `boxRows` and `box` must share the rule, or the row counts
-  diverge._
-- **The same padding everywhere** — the editor and the reasoning block carry the padding of a
-  message box, so a copy of the rows matches the boxes at the same window width. _Pith cannot
-  intercept a terminal copy, so the painted rows must line up._
 - **Pick the provider first, then the model** — so neither list grows too long. _`/model` and
   `/login` list account and model together today._
 - **Configurable transcript window** — the 8-page transcript window moves into `config.json` and

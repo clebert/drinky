@@ -161,20 +161,22 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
             count += 1;
         }
     }
+    // An empty search is a whole result, so its sentence is the content and the
+    // count below states it. No match line precedes it, so it takes no
+    // separator. A result with matches reports the reason it can be incomplete
+    // instead, most specific first: a hit result budget, then the I/O budget,
+    // then unsearched files.
     if (count == 0) {
-        if (line_capped or bytes_capped or files_incomplete)
-            return Result.report(
-                gpa,
-                .ok,
+        if (line_capped or bytes_capped or files_incomplete) {
+            try out.writer.print(
                 "Pith found no matches for {s} in the part that Pith searched. " ++
                     "Use a narrower path or glob because the search was incomplete.",
                 .{pattern},
             );
-        return Result.report(gpa, .ok, "Pith found no matches for {s}.", .{pattern});
-    }
-    // Report the reason the result can be incomplete, most specific first: a hit
-    // result budget, then the I/O budget, then unsearched files.
-    if (line_capped) {
+        } else {
+            try out.writer.print("Pith found no matches for {s}.", .{pattern});
+        }
+    } else if (line_capped) {
         try out.writer.print(
             "\n[Pith stopped after {d} matches. Refine the search or increase limit.]",
             .{limit},
@@ -422,6 +424,26 @@ test "grep reports an incomplete search when nothing was shown" {
     try std.testing.expect(
         std.mem.indexOf(u8, result.content, "the search was incomplete") != null,
     );
+    try std.testing.expectEqualStrings("Matches: 0 · Limit: Reached", result.summary.?);
+}
+
+// An empty search still states its count, so the box reads like every other
+// result of this tool.
+test "grep reports no matches of a complete search" {
+    const gpa = std.testing.allocator;
+    const context: Context = .{ .gpa = gpa, .io = std.testing.io };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "f.txt", .data = "hit\n" });
+    var input_buf: [128]u8 = undefined;
+    const input = try std.fmt.bufPrint(&input_buf,
+        \\{{"pattern":"miss","path":".zig-cache/tmp/{s}"}}
+    , .{tmp.sub_path});
+    const result = try run(&context, input);
+    defer result.deinit(gpa);
+    try std.testing.expect(!result.is_error);
+    try std.testing.expectEqualStrings("Pith found no matches for miss.", result.content);
+    try std.testing.expectEqualStrings("Matches: 0", result.summary.?);
 }
 
 test "grep canceled while reading a file propagates" {

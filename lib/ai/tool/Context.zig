@@ -11,26 +11,18 @@ io: std.Io,
 /// a command runs before Pith kills it. The defaults hold when no config
 /// overrides them.
 bash: Bash = .{},
-/// What the `config` tool hands back. The host writes both strings and owns
-/// them, so the tool stays free of any app-specific knowledge.
-settings: Settings = .{},
-
-pub const Settings = struct {
-    /// The document that describes every setting. Empty means the host exposes
-    /// no settings, and the tool reports that.
-    document: []const u8 = "",
-    /// The one-line box summary, a `Key: Value` fragment that names what the
-    /// document covers. A multi-line result must carry one, because the box
-    /// otherwise falls back to the first line of the document.
-    summary: []const u8 = "",
-};
+/// The document that describes every config key, which the `describe_config`
+/// tool hands back. The host writes it and owns it, so the tool stays free of
+/// any app-specific knowledge. An empty document means the host exposes no
+/// config, and the tool reports that.
+config_document: []const u8 = "",
 
 pub const Bash = struct {
     /// The whole lines kept from the tail of a command's output.
     lines_max: usize = 2000,
     /// The bytes kept from the tail of a command's output.
     bytes_max: usize = 50 * 1024,
-    /// The default wall-clock budget a command runs under, in milliseconds. A
+    /// The default wall-clock timeout a command runs under, in milliseconds. A
     /// per-call `timeout_seconds` overrides it, and 0 means no limit.
     timeout_ms: u64 = 120_000,
 };

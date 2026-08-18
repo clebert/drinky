@@ -15,7 +15,7 @@ const ai = @import("ai");
 const Config = @This();
 
 /// The absolute path of `config.json`, present whether or not the file exists.
-/// The settings document and the notices name it, so the user and the model both
+/// The config document and the notices name it, so the user and the model both
 /// read the same path. Owned. `deinit` frees it.
 path: []const u8,
 timeouts: ai.net.Timeouts = .{},
@@ -377,7 +377,7 @@ const leaves: []const Leaf = blk: {
     break :blk list;
 };
 
-/// The key list of the settings document, rendered from `leaves` and `keys`. A
+/// The key list of the config document, rendered from `leaves` and `keys`. A
 /// leaf with no entry, a duplicate entry, and an entry that names no leaf are
 /// all compile errors.
 const key_lines = blk: {
@@ -387,7 +387,7 @@ const key_lines = blk: {
         var found = false;
         for (&keys, 0..) |key, index| {
             if (!std.mem.eql(u8, key.path, leaf.path)) continue;
-            if (used[index]) @compileError("the settings document repeats the key " ++ key.path);
+            if (used[index]) @compileError("the config document repeats the key " ++ key.path);
             used[index] = true;
             found = true;
             const requirement = if (leaf.default_text) |default|
@@ -398,11 +398,11 @@ const key_lines = blk: {
                 requirement ++ " " ++ key.description ++ "\n";
         }
         if (!found)
-            @compileError("the settings document has no entry for the key " ++ leaf.path);
+            @compileError("the config document has no entry for the key " ++ leaf.path);
     }
     for (used, keys) |matched, key| {
         if (!matched)
-            @compileError("the settings document describes the unknown key " ++ key.path);
+            @compileError("the config document describes the unknown key " ++ key.path);
     }
     break :blk text;
 };
@@ -450,45 +450,27 @@ const openai_names = joinNames(ai.models.names(.openai));
 /// The fallbacks that the app compiles in. A key that names none of them leaves
 /// the value to these, so the document must state them. The app owns them,
 /// because it owns the account and the effort level that a session starts on.
-pub const SettingsOptions = struct {
+pub const DocumentOptions = struct {
     anthropic_model: []const u8,
     openai_model: []const u8,
     effort: ai.llm.Effort,
 };
 
-/// Build what the `config` tool returns. The document names the real file, so
-/// the model edits the path that Pith reads, and the summary names that same
-/// file in the transcript box. The caller owns both strings and frees them with
-/// `freeSettings`.
-pub fn settings(
+/// Build what the `describe_config` tool returns: a compiled key list between a
+/// header and a section that states the fallbacks the app compiles in. The
+/// header names the real file, so the model edits the path that Pith reads. The
+/// caller owns the text.
+///
+/// The tool shows no box line beside the call, so this measures nothing. The
+/// document is the same text at every call, and a measure of it states nothing
+/// that the user can act on.
+pub fn document(
     self: *const Config,
     gpa: std.mem.Allocator,
-    options: *const SettingsOptions,
-) !ai.tool.Context.Settings {
-    const document = try self.settingsDocument(gpa, options);
-    errdefer gpa.free(document);
-    return .{ .document = document, .summary = try std.fmt.allocPrint(
-        gpa,
-        "File: {s}",
-        .{self.path},
-    ) };
-}
-
-/// Free what `settings` returned.
-pub fn freeSettings(gpa: std.mem.Allocator, value: *const ai.tool.Context.Settings) void {
-    gpa.free(value.document);
-    gpa.free(value.summary);
-}
-
-/// Render the settings document: a compiled key list between a header that names
-/// the real file and a section that states the fallbacks the app compiles in.
-fn settingsDocument(
-    self: *const Config,
-    gpa: std.mem.Allocator,
-    options: *const SettingsOptions,
+    options: *const DocumentOptions,
 ) ![]u8 {
     return std.fmt.allocPrint(gpa,
-        \\# Pith settings
+        \\# Pith configuration
         \\
         \\Pith reads {s} once, at startup. A change to that file applies at
         \\the next start of Pith, and never to the session that runs now. Tell the user so.
@@ -554,7 +536,7 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, options: *const LoadOptions) !Co
     const cwd = std.Io.Dir.cwd();
     const data = cwd.readFileAlloc(io, path, gpa, .unlimited) catch |err| switch (err) {
         // An absent file is the built-in default, and it still names its path.
-        // The settings document then tells the model where to create it.
+        // The config document then tells the model where to create it.
         error.FileNotFound => return .{
             .path = try gpa.dupe(u8, path),
             .user_instructions = .init(gpa, .user),
@@ -869,7 +851,7 @@ fn resolveModel(
 
 /// The compiled fallbacks that the app passes in. The values only have to be
 /// legal, because the document quotes them and never resolves them.
-const settings_options_for_test: SettingsOptions = .{
+const document_options_for_test: DocumentOptions = .{
     .anthropic_model = "claude-opus-5",
     .openai_model = "gpt-5.6-sol",
     .effort = .xhigh,
@@ -1155,7 +1137,7 @@ test "the scan reaches an entry past the instruction-file cap" {
     try std.testing.expect(!config.unknown_keys_omitted);
 }
 
-test "the settings document describes every key of the file, and only those" {
+test "the config document describes every key of the file, and only those" {
     // `leaves` walks `File` and `key_lines` pairs each leaf with its prose, so
     // both are compile errors when they disagree. This test proves the walk
     // reached object sections and array entries.
@@ -1176,64 +1158,60 @@ test "the settings document describes every key of the file, and only those" {
     ) != null);
 }
 
-test "the settings document names the file and its own example loads clean" {
+test "the config document names the file and its own example loads clean" {
     const gpa = std.testing.allocator;
     var config = try loadDataForTest("{}");
     defer config.deinit(gpa);
 
-    const value = try config.settings(gpa, &settings_options_for_test);
-    defer freeSettings(gpa, &value);
-    const document = value.document;
-    try std.testing.expect(std.mem.indexOf(u8, document, "/unused/config.json") != null);
-    try std.testing.expect(std.mem.indexOf(u8, document, "`bash.timeout_ms`") != null);
-    // A multi-line document needs a box summary, because the first line of the
-    // document is a heading and says nothing to the user.
-    try std.testing.expectEqualStrings("File: /unused/config.json", value.summary);
+    const text = try config.document(gpa, &document_options_for_test);
+    defer gpa.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "/unused/config.json") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "`bash.timeout_ms`") != null);
     // The compiled model table and effort enum feed the document, so a new model
     // or level cannot go missing from it.
-    try std.testing.expect(std.mem.indexOf(u8, document, "claude-sonnet-4-6") != null);
-    try std.testing.expect(std.mem.indexOf(u8, document, "gpt-5.6-luna") != null);
-    try std.testing.expect(std.mem.indexOf(u8, document, "none, low, medium, high") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "claude-sonnet-4-6") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "gpt-5.6-luna") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "none, low, medium, high") != null);
     try std.testing.expect(std.mem.indexOf(
         u8,
-        document,
+        text,
         "`user_instructions[].path` — string, required.",
     ) != null);
 
     // An unset key reads as "unset", never as "none". The word `none` is itself
     // an effort level, so it reads as a value rather than as no value.
-    try std.testing.expect(std.mem.indexOf(u8, document, "`default_effort` — string, " ++
+    try std.testing.expect(std.mem.indexOf(u8, text, "`default_effort` — string, " ++
         "default: unset.") != null);
-    try std.testing.expect(std.mem.indexOf(u8, document, "default: none") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "default: none") == null);
 
     // The app's compiled fallbacks reach the document, so a key left out never
     // looks like it has no value at all.
-    try std.testing.expect(std.mem.indexOf(u8, document, "Without a key, Pith uses " ++
+    try std.testing.expect(std.mem.indexOf(u8, text, "Without a key, Pith uses " ++
         "claude-opus-5.") != null);
-    try std.testing.expect(std.mem.indexOf(u8, document, "Without a key, Pith uses " ++
+    try std.testing.expect(std.mem.indexOf(u8, text, "Without a key, Pith uses " ++
         "gpt-5.6-sol.") != null);
-    try std.testing.expect(std.mem.indexOf(u8, document, "Without the key, Pith uses " ++
+    try std.testing.expect(std.mem.indexOf(u8, text, "Without the key, Pith uses " ++
         "xhigh.") != null);
 
     // An unknown key warns at the next start and never fails it. The document
     // states both facts, so the model does not have to guess which one holds.
-    try std.testing.expect(std.mem.indexOf(u8, document, "still succeeds") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "still succeeds") != null);
 
     // The remembered per-project choice outranks the file, so the warning sits on
     // every key it governs. A reader that misses it promises an inert change.
-    try std.testing.expect(std.mem.indexOf(u8, document, "outranks this file") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "outranks this file") != null);
     try std.testing.expectEqual(
         @as(usize, 6),
-        std.mem.count(u8, document, new_project_only),
+        std.mem.count(u8, text, new_project_only),
     );
 
     // A description states behavior that the key name does not imply, so a
     // reader never has to derive it and cannot derive it wrong.
-    try std.testing.expect(std.mem.indexOf(u8, document, "retry-after") != null);
-    try std.testing.expect(std.mem.indexOf(u8, document, "keepalive") != null);
-    try std.testing.expect(std.mem.indexOf(u8, document, "folds a level") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "retry-after") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "keepalive") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "folds a level") != null);
     // The instruction caps come from the loader that enforces them.
-    try std.testing.expect(std.mem.indexOf(u8, document, std.fmt.comptimePrint(
+    try std.testing.expect(std.mem.indexOf(u8, text, std.fmt.comptimePrint(
         "at most {d} files",
         .{ai.instructions.files_max},
     )) != null);
@@ -1354,8 +1332,8 @@ fn checkLoadAllocationFailure(gpa: std.mem.Allocator, io: std.Io, home: []const 
     try std.testing.expect(config.dropped_effort != null);
     try std.testing.expect(config.dropped_cost != null);
     try std.testing.expectEqual(@as(usize, 1), config.unknown_keys.len);
-    const value = try config.settings(gpa, &settings_options_for_test);
-    defer freeSettings(gpa, &value);
+    const text = try config.document(gpa, &document_options_for_test);
+    defer gpa.free(text);
 }
 
 test "the config load frees every partial allocation" {

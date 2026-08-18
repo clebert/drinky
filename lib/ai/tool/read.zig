@@ -78,7 +78,7 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
         );
     }
 
-    const total = lineCount(data);
+    const total = format.lines(data);
     const start = if (offset > 0) offset - 1 else 0;
     if (start >= total and !(total == 0 and start == 0)) {
         return Result.report(
@@ -180,14 +180,6 @@ fn utf8FloorLength(bytes: []const u8, max: usize) usize {
     var end = @min(bytes.len, max);
     while (end > 0 and end < bytes.len and bytes[end] & 0xC0 == 0x80) end -= 1;
     return end;
-}
-
-/// The number of lines in `text`. The empty segment after a trailing newline
-/// does not count. Empty text has no lines.
-fn lineCount(text: []const u8) usize {
-    if (text.len == 0) return 0;
-    const newlines = std.mem.count(u8, text, "\n");
-    return if (text[text.len - 1] == '\n') newlines else newlines + 1;
 }
 
 test "read rejects invalid input" {

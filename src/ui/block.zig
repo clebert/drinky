@@ -52,8 +52,11 @@ pub const Entry = union(enum) {
         return switch (self.*) {
             .intro, .skill => |text| std.mem.count(u8, text.items, "\n") + 1,
             .event => |flagged| std.mem.count(u8, flagged.text.items, "\n") + 1,
-            .user => |text| paint.boxRows(text.items, columns),
-            .tool_result => |flagged| paint.boxRows(flagged.text.items, columns),
+            .user => |text| paint.boxRows(&.{ .text = text.items }, columns),
+            .tool_result => |flagged| paint.boxRows(
+                &toolBox(flagged.text.items, flagged.is_error),
+                columns,
+            ),
             .thinking, .model => |text| markdown.rows(text.items, columns),
         };
     }
@@ -70,7 +73,7 @@ pub const Entry = union(enum) {
                 .role = if (flagged.is_error) .@"error" else .muted,
                 .prefix = if (flagged.is_error) "Error: " else "",
             }, flagged.text.items),
-            .user => |text| try paint.box(placement, .user, text.items),
+            .user => |text| try paint.box(placement, .user, &.{ .text = text.items }),
             .skill => |text| try paint.notice(placement, &.{
                 .role = .accent,
                 .prefix = "Skill: ",
@@ -81,13 +84,27 @@ pub const Entry = union(enum) {
             .tool_result => |flagged| try paint.box(
                 placement,
                 if (flagged.is_error) .tool_error else .tool_success,
-                flagged.text.items,
+                &toolBox(flagged.text.items, flagged.is_error),
             ),
             .thinking => |text| try markdown.render(placement, .muted, text.items),
             .model => |text| try markdown.render(placement, null, text.items),
         }
     }
 };
+
+/// A finished tool call keeps its call row, and the line the tool decided below
+/// it. A successful call cuts each line at the window, because the start of the
+/// line carries what identifies it: the tool and its subject above, the leading
+/// measures below.
+///
+/// A failed call wraps instead. Its detail is a whole sentence that names what
+/// went wrong and what to do about it, and that instruction sits at the end. A
+/// cut there takes the half the user needs and leaves it nowhere in the
+/// interface. The cost is that a failed call with long arguments takes more
+/// rows, which is the call whose arguments the user wants to read anyway.
+fn toolBox(text: []const u8, is_error: bool) paint.Box {
+    return .{ .text = text, .fit = if (is_error) .wrap else .head };
+}
 
 /// Physical rows in a fresh paint: the view joins its inert rows with `\r\n`,
 /// and row text cannot emit those separators, so they count physical rows.
@@ -165,6 +182,8 @@ test "each entry variant renders exactly the rows it counts" {
         .{ .kind = .model, .is_error = false, .text = markdown_reply },
         .{ .kind = .thinking, .is_error = false, .text = markdown_reply },
         .{ .kind = .tool_result, .is_error = true, .text = "read foo.zig\n→ no such file" },
+        // A call whose tool decided no box line is the call row alone.
+        .{ .kind = .tool_result, .is_error = false, .text = "Tool: describe_config" },
         // A wide-glyph box, to exercise the narrow-width row cap.
         .{ .kind = .user, .is_error = false, .text = "你好世界" },
     };
@@ -212,6 +231,87 @@ test "a skill entry names its head once and indents the rows below it" {
     try std.testing.expect(std.mem.indexOf(u8, painted, "Skill: zig-style · Size: 3.1 KB") != null);
     try std.testing.expect(std.mem.indexOf(u8, painted, "  Source: .agents/skills") != null);
     try std.testing.expect(std.mem.indexOf(u8, painted, "Skill: Source:") == null);
+}
+
+// The same padding everywhere: a copy of a reasoning row starts at the column a
+// copy of a message box row starts at.
+test "no box carries a pad, so a copy of the rows lines up" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var view = terminal.View.init(gpa, &out.writer);
+    defer view.deinit();
+
+    var user = try Entry.init(gpa, .user, false, "a user message that wraps over two rows");
+    defer user.deinit(gpa);
+    var thinking = try Entry.init(gpa, .thinking, false, "reasoning that wraps over two rows");
+    defer thinking.deinit(gpa);
+
+    const columns = 20;
+    const sink = try view.beginFrame(.{ .columns = columns, .rows = 24 }, 8);
+    const placement: paint.Placement = .{
+        .sink = sink,
+        .id = 0,
+        .columns = columns,
+        .base = 0,
+        .skip = 0,
+    };
+    var second = placement;
+    second.id = 1;
+    second.base = user.rows(columns);
+    try user.render(&placement);
+    try thinking.render(&second);
+    try view.render();
+
+    // Every row opens on its own first character.
+    const painted = out.written();
+    try expectRowOpensOnText(painted, "a user message that");
+    try expectRowOpensOnText(painted, "reasoning that wraps");
+}
+
+// A failed call names what went wrong and what to do about it, and the
+// instruction sits at the end of that sentence. A cut there takes the half the
+// user needs, so a failed box wraps while a successful one keeps one row a line.
+test "a failed tool box wraps its detail and a successful one cuts it" {
+    const gpa = std.testing.allocator;
+    const columns = 20;
+    const head = "Tool: edit · File: a.zig";
+    const detail = "Error: Pith found old_text more than once. Add more text around it.";
+    const text = head ++ "\n" ++ detail;
+
+    var failed = try Entry.init(gpa, .tool_result, true, text);
+    defer failed.deinit(gpa);
+    var succeeded = try Entry.init(gpa, .tool_result, false, text);
+    defer succeeded.deinit(gpa);
+
+    // Two padding rows plus one row a line for the cut box.
+    try std.testing.expectEqual(@as(usize, 4), succeeded.rows(columns));
+    try std.testing.expect(failed.rows(columns) > succeeded.rows(columns));
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var view = terminal.View.init(gpa, &out.writer);
+    defer view.deinit();
+    const sink = try view.beginFrame(.{ .columns = columns, .rows = 24 }, 8);
+    try failed.render(&.{ .sink = sink, .id = 0, .columns = columns, .base = 0, .skip = 0 });
+    try view.render();
+    // The tail of the sentence reaches the interface, and no row cut it.
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "around it.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "\u{2026}") == null);
+}
+
+// A row that starts with a blank puts that blank in every copy of it. The style
+// of the row is the only thing in front of its first character, so no space at
+// all separates the start of the row from its text. Both blocks meeting this
+// start at the same column.
+fn expectRowOpensOnText(painted: []const u8, row: []const u8) !void {
+    const start = std.mem.indexOf(u8, painted, row) orelse return error.TestExpectedRow;
+    const break_end = if (std.mem.lastIndexOf(u8, painted[0..start], "\r\n")) |cut|
+        cut + 2
+    else
+        0;
+    try std.testing.expect(start > break_end);
+    try std.testing.expect(std.mem.indexOfScalar(u8, painted[break_end..start], ' ') == null);
 }
 
 // The clip drops its top `skip` rows and shows the rest.

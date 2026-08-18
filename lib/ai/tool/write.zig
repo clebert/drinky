@@ -2,6 +2,7 @@
 
 const std = @import("std");
 
+const format = @import("../format.zig");
 const llm = @import("../llm.zig");
 const Context = @import("Context.zig");
 const Result = @import("Result.zig");
@@ -40,7 +41,20 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
 
     fs.writeFile(context.io, std.Io.Dir.cwd(), .{ .sub_path = path, .data = contents }) catch |err|
         return Result.cannot(gpa, err, "write", path);
-    return Result.report(gpa, .ok, "Pith wrote {d} bytes to {s}.", .{ contents.len, path });
+    var result = try Result.report(gpa, .ok, "Pith wrote {d} bytes to {s}.", .{
+        contents.len,
+        path,
+    });
+    errdefer result.deinit(gpa);
+    // Every tool that touches a file reports the same two measures in the same
+    // order, so one row reads like the next. The model keeps the exact byte
+    // count in the content above.
+    var scale: [16]u8 = undefined;
+    result.summary = try std.fmt.allocPrint(gpa, "Lines: {d} · Size: {s}", .{
+        format.lines(contents),
+        format.bytes(&scale, contents.len),
+    });
+    return result;
 }
 
 test "write creates a file with the given contents" {
@@ -112,4 +126,24 @@ test "write canceled mid-write propagates and leaves the file untouched" {
     const data = try tmp.dir.readFileAlloc(io, "f.txt", gpa, .limited(64));
     defer gpa.free(data);
     try std.testing.expectEqualStrings("old", data);
+}
+
+// Every tool that touches a file reports the same two measures under one rule,
+// so a write and a read of the same bytes cannot disagree about them.
+test "the box reports the lines and the size of what was written" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const context: Context = .{ .gpa = gpa, .io = io };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var input_buf: [160]u8 = undefined;
+    const input = try std.fmt.bufPrint(&input_buf,
+        \\{{"path":".zig-cache/tmp/{s}/sample.txt","content":"one\ntwo\nthree\n"}}
+    , .{tmp.sub_path});
+
+    const result = try run(&context, input);
+    defer result.deinit(gpa);
+    try std.testing.expect(!result.is_error);
+    // A closing line break ends the third line, it does not open a fourth.
+    try std.testing.expectEqualStrings("Lines: 3 · Size: 14 B", result.summary.?);
 }

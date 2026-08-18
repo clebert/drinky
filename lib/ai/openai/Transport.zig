@@ -67,6 +67,12 @@ pub const Stream = struct {
     /// independently authoritative, but duplicate done frames must not duplicate
     /// neutral history.
     completed_item_ids: std.StringHashMapUnmanaged(void),
+    /// The `item_id` of the function call whose arguments stream now, or empty
+    /// before the first one opens. An argument fragment names the item it
+    /// belongs to, so this correlates the fragment with the call that
+    /// `output_item.added` opened. Owned, because a frame arena reset drops the
+    /// parsed frame the id came from.
+    call_item_id: std.ArrayList(u8),
     usage: llm.Usage,
     /// The subscription allowance from the response head, or null when the
     /// backend sent no quota headers (API-key mode, or none present).
@@ -104,6 +110,7 @@ pub const Stream = struct {
         var ids = self.completed_item_ids.keyIterator();
         while (ids.next()) |id| self.gpa.free(id.*);
         self.completed_item_ids.deinit(self.gpa);
+        self.call_item_id.deinit(self.gpa);
     }
 
     /// Capture the subscription allowance from the response head. The engine
@@ -140,13 +147,17 @@ pub const Stream = struct {
         return errorDescription(arena, object);
     }
 
-    /// Latch a rejection. `unsupported` wins over `invalid` however they
-    /// interleave: resampling cannot turn an outcome this design cannot retain
-    /// into one it can, so the retry budget spent on it only delays the same
-    /// failure.
+    /// Latch a rejection. `unsupported` and `uncorrelated` both win over
+    /// `invalid` however they interleave, and the first of them to latch stays.
+    /// Resampling cannot turn an outcome this design cannot retain into one it
+    /// can, and it cannot reorder a stream, so the retry budget spent on either
+    /// only delays the same failure.
     fn markRejection(self: *Stream, rejection: llm.Event.Stop.Rejection) void {
-        if (self.terminal_rejection == null or rejection == .unsupported)
+        const latched = self.terminal_rejection orelse {
             self.terminal_rejection = rejection;
+            return;
+        };
+        if (rejection.outranks(latched)) self.terminal_rejection = rejection;
     }
 
     fn itemStatus(item: *const std.json.ObjectMap) ?ItemStatus {
@@ -313,6 +324,54 @@ pub const Stream = struct {
         return if (index < 0) null else index;
     }
 
+    /// The head of one added output item. A function call names its tool here,
+    /// so the interface can show the call while its arguments stream. Every
+    /// other added item carries no display text of its own. The item this frame
+    /// opens is provisional, so nothing here is retained beyond the id that
+    /// correlates the argument fragments that follow.
+    fn addedItem(self: *Stream, object: *const std.json.ObjectMap) !sse.Decoded {
+        const item = json.object(object.get("item")) orelse return .progress;
+        const kind = json.string(item.get("type")) orelse return .progress;
+        if (!std.mem.eql(u8, kind, "function_call")) return .progress;
+        const id = json.string(item.get("id")) orelse return .progress;
+        // The id is stored before the name is read. The name only decides
+        // whether this frame displays anything, and a frame that carries no name
+        // must still open the call that the fragments below correlate against.
+        self.call_item_id.clearRetainingCapacity();
+        try self.call_item_id.appendSlice(self.gpa, id);
+        const name = json.string(item.get("name")) orelse return .progress;
+        return .{ .event = .{ .tool_name = name } };
+    }
+
+    /// One display fragment of the open function call's arguments. The call
+    /// itself waits for its done frame, so nothing here is retained.
+    ///
+    /// Absent correlation and contradicted correlation are two different things,
+    /// and this separates them. A frame that carries no id, or one that arrives
+    /// before any call opened, cannot be placed: it displays nothing and the
+    /// reply stands, because a display gap costs the user a box that stops
+    /// growing. A frame whose id contradicts the open call is different: the
+    /// wire streams one function call at a time, so a fragment of another call
+    /// means that assumption broke. It latches as a wire-order failure, the way
+    /// a content block index does on the Anthropic side, rather than painting
+    /// one call's arguments under another call's name.
+    ///
+    /// Only that contradicted case matches across the two transports. Anthropic
+    /// latches `invalid` for a frame it cannot place, because a block delta
+    /// becomes the committed content there and a lost one leaves the reply
+    /// short. Nothing here is retained, so the reply stands.
+    fn callArguments(self: *Stream, object: *const std.json.ObjectMap) sse.Decoded {
+        const open_id = self.call_item_id.items;
+        const item_id = json.string(object.get("item_id")) orelse return .progress;
+        if (open_id.len == 0) return .progress;
+        if (!std.mem.eql(u8, item_id, open_id)) {
+            self.markRejection(.uncorrelated);
+            return .progress;
+        }
+        const delta = json.string(object.get("delta")) orelse return .progress;
+        return .{ .event = .{ .tool_arguments = delta } };
+    }
+
     /// A summary part of the open reasoning item.
     fn reasoningPartAdded(self: *Stream, object: *const std.json.ObjectMap) !sse.Decoded {
         const index = summaryIndex(object) orelse return .progress;
@@ -360,9 +419,12 @@ pub const Stream = struct {
         }
         if (std.mem.eql(u8, kind, "response.reasoning_summary_part.added"))
             return self.reasoningPartAdded(&object);
+        if (std.mem.eql(u8, kind, "response.output_item.added"))
+            return self.addedItem(&object);
+        if (std.mem.eql(u8, kind, "response.function_call_arguments.delta"))
+            return self.callArguments(&object);
         if (std.mem.eql(u8, kind, "response.reasoning_summary_text.done") or
             std.mem.eql(u8, kind, "response.reasoning_summary_part.done") or
-            std.mem.eql(u8, kind, "response.function_call_arguments.delta") or
             std.mem.eql(u8, kind, "response.function_call_arguments.done"))
         {
             return .progress;
@@ -433,6 +495,7 @@ fn connect(self: *Transport, out: *Stream, payload: Payload) anyerror!void {
     out.reasoning = .none;
     out.summary_index = 0;
     out.completed_item_ids = .empty;
+    out.call_item_id = .empty;
     out.quota = null;
 
     const authorization = try std.fmt.allocPrint(self.gpa, "Bearer {s}", .{payload.access_token});
@@ -675,6 +738,7 @@ fn testStreamWithAllocator(
     stream.reasoning = .none;
     stream.summary_index = 0;
     stream.completed_item_ids = .empty;
+    stream.call_item_id = .empty;
     stream.quota = null;
     return stream;
 }
@@ -1158,6 +1222,8 @@ test "next walks response.* SSE lines and maps usage on completion" {
     const reasoning = (try stream.next()).?.item.reasoning.encrypted;
     try std.testing.expectEqualStrings("weigh", reasoning.text);
     try std.testing.expectEqualStrings("enc", reasoning.encrypted_content);
+    try std.testing.expectEqualStrings("read", (try stream.next()).?.tool_name);
+    try std.testing.expectEqualStrings("{}", (try stream.next()).?.tool_arguments);
     const call = (try stream.next()).?.item.tool_call;
     try std.testing.expectEqualStrings("read", call.name);
     try std.testing.expectEqualStrings("call_1", call.call_id);
@@ -1172,7 +1238,7 @@ test "next walks response.* SSE lines and maps usage on completion" {
     try std.testing.expectEqual(@as(?llm.Event, null), try stream.next());
 }
 
-test "a streamed function call emits only its authoritative done item" {
+test "a streamed function call shows its name and arguments before its done item" {
     const body =
         "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":" ++
         "{\"id\":\"fc_1\",\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"read\"}}\n\n" ++
@@ -1188,12 +1254,85 @@ test "a streamed function call emits only its authoritative done item" {
     var stream = testStream(threaded.io(), &reader, 60_000, net.stream_response_bytes_max);
     defer stream.deinitDecode();
 
+    // The display events come first. Only the done frame retains the call.
+    try std.testing.expectEqualStrings("read", (try stream.next()).?.tool_name);
+    try std.testing.expectEqualStrings("{}", (try stream.next()).?.tool_arguments);
     const call = (try stream.next()).?.item.tool_call;
     try std.testing.expectEqualStrings("call_1", call.call_id);
     try std.testing.expectEqualStrings("read", call.name);
     try std.testing.expectEqualStrings("{}", call.arguments_json);
     try std.testing.expectEqual(llm.Event.Status.complete, (try stream.next()).?.stop.status);
     try std.testing.expect((try stream.next()) == null);
+}
+
+// The display fragments of a call correlate by the item they name. Two calls
+// that interleave their fragments otherwise show one call's arguments under
+// the other's name, and nothing on the wire says so. The mismatch
+// latches instead, so the assumption that a call streams alone is checked here
+// rather than trusted.
+test "an argument fragment that names another item rejects the reply" {
+    const body =
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":" ++
+        "{\"id\":\"fc_1\",\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"read\"}}\n\n" ++
+        "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_2\",\"delta\":\"{}\"}\n\n" ++
+        "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n";
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var reader: std.Io.Reader = .fixed(body);
+    var stream = testStream(threaded.io(), &reader, 60_000, net.stream_response_bytes_max);
+    defer stream.deinitDecode();
+
+    try std.testing.expectEqualStrings("read", (try stream.next()).?.tool_name);
+    // The fragment paints nothing, and the reply carries the rejection out. It
+    // names the stream shape rather than the content, so the report the user
+    // reads points at the order of the frames and not at a truncated response.
+    const stop = (try stream.next()).?.stop;
+    try std.testing.expectEqual(llm.Event.Stop.Rejection.uncorrelated, stop.rejection.?);
+}
+
+// A fragment before any call opened has nothing to correlate against, which is
+// missing information rather than a contradiction. It displays nothing and the
+// reply stands, so a stream that omits an added frame costs a box that does not
+// grow, not a failed turn.
+test "an argument fragment before any call displays nothing and keeps the reply" {
+    const body =
+        "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_1\",\"delta\":\"{}\"}\n\n" ++
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":" ++
+        "{\"id\":\"fc_1\",\"type\":\"function_call\",\"call_id\":\"call_1\"," ++
+        "\"name\":\"read\",\"arguments\":\"{}\"}}\n\n" ++
+        "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n";
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var reader: std.Io.Reader = .fixed(body);
+    var stream = testStream(threaded.io(), &reader, 60_000, net.stream_response_bytes_max);
+    defer stream.deinitDecode();
+
+    // The call still commits from its own done frame.
+    const call = (try stream.next()).?.item.tool_call;
+    try std.testing.expectEqualStrings("call_1", call.call_id);
+    const stop = (try stream.next()).?.stop;
+    try std.testing.expectEqual(llm.Event.Status.complete, stop.status);
+    try std.testing.expect(stop.rejection == null);
+}
+
+// An added frame with no name still opens the call for correlation. Otherwise
+// the fragments below it find no open id and the display goes quiet for a call
+// the done frame commits normally.
+test "an added frame without a name still opens the call for its fragments" {
+    const body =
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":" ++
+        "{\"id\":\"fc_1\",\"type\":\"function_call\",\"call_id\":\"call_1\"}}\n\n" ++
+        "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_1\",\"delta\":\"{}\"}\n\n" ++
+        "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n";
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var reader: std.Io.Reader = .fixed(body);
+    var stream = testStream(threaded.io(), &reader, 60_000, net.stream_response_bytes_max);
+    defer stream.deinitDecode();
+
+    // No name event, but the fragment still correlates and shows.
+    try std.testing.expectEqualStrings("{}", (try stream.next()).?.tool_arguments);
+    try std.testing.expect((try stream.next()).?.stop.rejection == null);
 }
 
 test "terminal events require a response object" {

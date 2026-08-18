@@ -2,6 +2,7 @@
 
 const std = @import("std");
 
+const format = @import("../format.zig");
 const llm = @import("../llm.zig");
 const Context = @import("Context.zig");
 const fs = @import("fs.zig");
@@ -92,7 +93,16 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
 
     fs.writeFile(context.io, std.Io.Dir.cwd(), .{ .sub_path = path, .data = updated }) catch |err|
         return Result.cannot(gpa, err, "write", path);
-    return Result.report(gpa, .ok, "Pith edited {s}.", .{path});
+    var result = try Result.report(gpa, .ok, "Pith edited {s}.", .{path});
+    errdefer result.deinit(gpa);
+    // An edit rewrites the whole file, so both measures describe the file the
+    // edit left, not the span that changed.
+    var scale: [16]u8 = undefined;
+    result.summary = try std.fmt.allocPrint(gpa, "Lines: {d} · Size: {s}", .{
+        format.lines(updated),
+        format.bytes(&scale, updated.len),
+    });
+    return result;
 }
 
 /// Replace the single occurrence of `edit.old` in `edit.data` with `edit.new`.

@@ -560,7 +560,7 @@ pub fn moveEnd(self: *Editor) void {
 /// counts as one cell and never traps the caret at its edge (see `logicalColumn`
 /// and `logicalOffset`).
 pub fn moveUp(self: *Editor, columns: usize) void {
-    const columns_max = paint.frameColumns(columns);
+    const columns_max = paint.contentColumns(columns);
     const text = self.draft.visible.items;
     const row = terminal.width.caret(text, .{
         .offset = self.caret,
@@ -587,7 +587,7 @@ pub fn moveUp(self: *Editor, columns: usize) void {
 /// Move the caret one wrapped row down and keep the sticky logical goal column.
 /// On the bottom row it falls back to `moveEnd`. See `moveUp`.
 pub fn moveDown(self: *Editor, columns: usize) void {
-    const columns_max = paint.frameColumns(columns);
+    const columns_max = paint.contentColumns(columns);
     const text = self.draft.visible.items;
     const row = terminal.width.caret(text, .{
         .offset = self.caret,
@@ -701,7 +701,7 @@ fn legalCaret(self: *const Editor, offset: usize) bool {
 /// window. Call once per repaint. Pass the same `size` whose columns and rows
 /// `render` and `rows` will use, so all three agree on the window.
 pub fn reflow(self: *Editor, size: terminal.View.Size) void {
-    const columns_max = paint.frameColumns(size.columns);
+    const columns_max = paint.contentColumns(size.columns);
     const text = self.draft.visible.items;
     const total_body = self.bodyRows(columns_max);
     const visible_rows = @min(total_body, paint.bodyLimit(size.rows));
@@ -717,7 +717,7 @@ pub fn reflow(self: *Editor, size: terminal.View.Size) void {
 /// The physical rows the editor occupies: two separators plus the wrapped body.
 /// The body stops at its scroll limit for `size.rows`.
 pub fn rows(self: *const Editor, size: terminal.View.Size) usize {
-    const columns_max = paint.frameColumns(size.columns);
+    const columns_max = paint.contentColumns(size.columns);
     const total_body = self.bodyRows(columns_max);
     return paint.framedRows(@min(total_body, paint.bodyLimit(size.rows)));
 }
@@ -743,7 +743,7 @@ pub fn render(
     placement: *const paint.Placement,
     options: *const RenderOptions,
 ) !void {
-    const columns_max = paint.frameColumns(placement.columns);
+    const columns_max = paint.contentColumns(placement.columns);
     const text = self.draft.visible.items;
     const total_body = self.bodyRows(columns_max);
     const visible_rows = @min(total_body, paint.bodyLimit(options.viewport_rows));
@@ -764,7 +764,7 @@ pub fn render(
 fn caretPosition(self: *const Editor, columns: usize) terminal.View.Caret {
     const position = terminal.width.caret(self.draft.visible.items, .{
         .offset = self.caret,
-        .columns_max = paint.frameColumns(columns),
+        .columns_max = paint.contentColumns(columns),
     });
     return .{
         .row = 1 + (position.rows_before - self.scroll),

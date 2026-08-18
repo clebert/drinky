@@ -32,7 +32,8 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 
 ## Tools
 
-- The model gets seven tools: `read`, `write`, `edit`, `find`, `grep`, `bash`, and `config`.
+- The model gets seven tools: `read`, `write`, `edit`, `find`, `grep`, `bash`, and
+  `describe_config`.
 - **read** — page a UTF-8 file from a 1-indexed line offset, 2000 lines or 50 KiB per call, with a
   next-offset hint.
 - **write** — create or overwrite a file atomically.
@@ -43,9 +44,10 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - **bash** — run a shell command in the working directory, preserve combined stdout and stderr
   order, and return a bounded tail. A non-zero exit is reported. Output caps and the timeout are
   configurable, and the timeout is also settable per call.
-- **config** — return the settings document, so the model can change `config.json` for the user. It
-  names the file and lists every key with its type, its default, and its meaning, plus the legal
-  model names, the effort levels, the compiled fallbacks, and the memory that outranks the file.
+- **describe_config** — describe `config.json`, so the model can change it for the user. It names
+  the file and lists every key with its type, its default, and its meaning, plus the legal model
+  names, the effort levels, the compiled fallbacks, and the memory that outranks the file. It
+  reports no current value, because it never reads the file.
 - Globs use `*` and `?` within a path segment and `**` across segments.
 - Searches skip version-control and build directories.
 - Binary files are skipped, oversized files are refused, and every result says when a limit cut it
@@ -142,12 +144,14 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - Reasoning is requested summarized at the resolved effort, and replayed verbatim on later turns.
 - Anthropic Subscription and Anthropic Console requests carry the Claude Code client identity. A
   plain API key goes straight to the platform API.
+- Every Anthropic request asks for the input of a tool call as the model writes it.
 - Requests time out after 30 s to the response head and 60 s between streamed events. Keepalive
   filler does not count as progress.
 - A failed request retries up to 3 times with 500 ms–16 s backoff and honors a server's retry-after
   hint.
 - A response that asks for a wait longer than the backoff cap ends the request. A spent OpenAI plan
   states its reset in the error body, so Pith reports it after one try.
+- A stream frame that names a call or a block other than the open one ends the turn without a retry.
 - A failed request reports the message from the provider JSON error body, not the raw bytes. A
   failed response head names its status too. For a spent OpenAI subscription, the message names the
   plan and the wait.
@@ -184,8 +188,25 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - A pipe table draws as a box grid that fits the window and keeps the indentation of its source. The
   alignment colons parse but do not align. A long cell truncates to its column. A table stays plain
   text when the window is narrower than its smallest grid.
-- A running tool shows a pending box with its name and arguments. It then becomes a success or error
-  box with a one-line stat summary. It shows the first output line when the tool gives no summary.
+- No line of a successful tool box wraps. Each line takes one row and marks a cut with one `…`, so
+  the rows a call occupies follow its state and never the length of its arguments. A failed box
+  wraps instead. A box row keeps only the text after its last carriage return, so a progress line
+  reads as its final state.
+- A call names what it acts on as `File:`, `Pattern:`, or `Command:`. A row holds the tool and its
+  subject alone, with each run of whitespace collapsed to one space. A tool row shortens a path the
+  way `Skill:` does: relative to the working directory below it, `~` for the home directory, and the
+  whole path when it sits under neither.
+- While the model streams the arguments, the call reports `Received:` with the bytes that arrived. A
+  call whose reply has committed but that waits for an earlier one reports `Status: Queued`. The
+  count measures the arguments the model has sent.
+- A running command adds a row with the time it has run and the timeout it runs under.
+  `Timeout: None` names a call that asked for no limit. Every other tool runs under no timeout, so
+  its box keeps one row.
+- A finished call keeps its call row and one line below it: a stat summary, or the sentence of a
+  failure. A call with nothing to state, like `describe_config`, keeps the call row alone.
+- Every box row starts at the first column, like an editor row and a reasoning row, so a terminal
+  copy of them lines up. An indent appears only where it groups rows under a head, as in a skill
+  block or a markdown list.
 - One heavy activity segment moves across both open input separators in a loop and grows as progress
   goes quiet without adding a layout row.
 - Pith blinks the input caret while a turn runs, because a terminal holds its own cursor solid under
@@ -267,7 +288,7 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - A configured model that is not valid for its account is reported, and the compiled default used.
   An unknown effort level and a cache warning cost that pith cannot use are reported the same way. A
   key that pith does not know is reported too, so a typo never looks like an applied setting.
-- The settings document is generated from the struct that parses the file, so a new key that carries
+- The config document is generated from the struct that parses the file, so a new key that carries
   no description fails the build and the document cannot drift.
 - JSON store writes use owner-only sibling `.lock` files to coordinate pith instances.
 - `~/.pith/state.json` remembers per project which account and effort level pith used last, and the

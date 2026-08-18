@@ -458,7 +458,7 @@ test "the preview shows the palette, the styles, the boxes, the roles, and the f
     try std.testing.expect(std.mem.indexOf(u8, painted, "\x1b[1;39;100mSample text") != null);
     try std.testing.expect(std.mem.indexOf(u8, painted, "\x1b[7mSample text") != null);
     // The boxes paint through the live role map and name their state inline.
-    const user_row = comptime role.sequence(.user) ++ " user: Your message";
+    const user_row = comptime role.sequence(.user) ++ "user: Your message";
     try std.testing.expect(std.mem.indexOf(u8, painted, user_row) != null);
     try std.testing.expect(
         std.mem.indexOf(u8, painted, "tool_error: A tool call that failed.") != null,
