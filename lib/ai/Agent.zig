@@ -649,9 +649,10 @@ fn drainSteering(self: *Agent, turn: *TurnState, handler: anytype) !bool {
 /// requests are safe to retry, so a failed attempt's partial reply is discarded
 /// (history untouched). `handler.onStreamReset` clears partial output first.
 /// Returns the reply's items (already appended to history). An API error is
-/// retried when its head or streamed event marks it transient. An exhausted or
-/// permanent one is reported through `handler.onError` and surfaced as
-/// `error.ApiError`, which rolls the turn back to its latest checkpoint.
+/// retried when its head or streamed event marks it transient and the retry
+/// policy allows another try (see `net.Retry.allows`). An exhausted or permanent
+/// one is reported through `handler.onError` and surfaced as `error.ApiError`,
+/// which rolls the turn back to its latest checkpoint.
 fn fetchReply(
     self: *Agent,
     fetch: anytype,
@@ -675,8 +676,9 @@ fn fetchReply(
         const request_at = std.Io.Clock.Timestamp.now(self.io, .boot);
         var stream: @TypeOf(fetch.*).Stream = undefined;
         fetch.send(&stream, &request) catch |err| {
-            if (retryableError(err) and attempt < self.retry.attempts_max) {
-                try self.backoff(.{ .attempt = attempt });
+            const failure: net.Retry.Failure = .{ .attempt = attempt };
+            if (retryableError(err) and self.retry.allows(failure)) {
+                try self.backoff(failure);
                 continue;
             }
             return err;
@@ -691,11 +693,12 @@ fn fetchReply(
         if (stream.quotaSoFar()) |quota| self.stats.quota = quota;
 
         if (!stream.ok()) {
-            if (stream.retryable() and attempt < self.retry.attempts_max) {
-                try self.backoff(.{
-                    .attempt = attempt,
-                    .suggested_ms = stream.retryAfterMs() orelse 0,
-                });
+            const failure: net.Retry.Failure = .{
+                .attempt = attempt,
+                .suggested_ms = stream.retryAfterMs() orelse 0,
+            };
+            if (stream.retryable() and self.retry.allows(failure)) {
+                try self.backoff(failure);
                 continue;
             }
             try presentation(&turn.presentation_closed, handler.onError(stream.errorText()));
@@ -712,11 +715,12 @@ fn fetchReply(
         ) catch |err| switch (err) {
             error.ApiError => {
                 self.recordUsageSoFar(&model, &stream, &usage_recorded, &request_at);
-                if (stream.retryable() and attempt < self.retry.attempts_max) {
-                    try self.backoff(.{
-                        .attempt = attempt,
-                        .suggested_ms = stream.retryAfterMs() orelse 0,
-                    });
+                const failure: net.Retry.Failure = .{
+                    .attempt = attempt,
+                    .suggested_ms = stream.retryAfterMs() orelse 0,
+                };
+                if (stream.retryable() and self.retry.allows(failure)) {
+                    try self.backoff(failure);
                     continue;
                 }
                 try presentation(&turn.presentation_closed, handler.onError(stream.errorText()));
@@ -730,8 +734,9 @@ fn fetchReply(
             },
             else => {
                 self.recordUsageSoFar(&model, &stream, &usage_recorded, &request_at);
-                if (retryableError(err) and attempt < self.retry.attempts_max) {
-                    try self.backoff(.{ .attempt = attempt });
+                const failure: net.Retry.Failure = .{ .attempt = attempt };
+                if (retryableError(err) and self.retry.allows(failure)) {
+                    try self.backoff(failure);
                     continue;
                 }
                 return err;
@@ -3377,6 +3382,36 @@ test "a retryable head's retry-after hint reaches backoff" {
     try std.testing.expectEqual(@as(u64, 5000), log.slept_ms[0]);
     try std.testing.expectEqual(@as(usize, 1), handler.stream_reset_count);
     try std.testing.expectEqualStrings("hi", handler.text.items);
+}
+
+test "a retry-after past the backoff cap fails the turn at once" {
+    const gpa = std.testing.allocator;
+    var log: SleepLog = .init(std.testing.io);
+    var agent = scriptedAgent(gpa);
+    agent.io = log.io();
+    defer agent.deinit();
+    var handler: CaptureHandler = .{ .gpa = gpa };
+    defer handler.deinit();
+
+    // The head is retryable, but it asks for a wait the 16 s cap cannot serve.
+    // No wait inside the cap clears the failure, so the turn spends no further
+    // attempt.
+    var fetch: ScriptedFetch = .{ .attempts = &.{
+        .{ .stream = .{
+            .events = &.{},
+            .head_ok = false,
+            .head_retryable = true,
+            .retry_after_ms = 3_600_000,
+            .error_text = "429 Too Many Requests",
+        } },
+        .{ .stream = .{ .events = &end_turn_events } },
+    } };
+    try std.testing.expectError(error.ApiError, agent.runWith(&fetch, "go", &handler));
+    try std.testing.expectEqual(@as(usize, 1), fetch.sends);
+    try std.testing.expectEqual(@as(usize, 0), log.count);
+    try std.testing.expectEqual(@as(usize, 0), handler.stream_reset_count);
+    try std.testing.expectEqualStrings("429 Too Many Requests", handler.errors.items);
+    try std.testing.expectEqual(@as(usize, 0), agent.items.items.len);
 }
 
 test "a mid-stream cancel propagates without a retry" {

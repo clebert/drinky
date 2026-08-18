@@ -144,6 +144,8 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
   filler does not count as progress.
 - A failed request retries up to 3 times with 500 ms–16 s backoff and honors a server's retry-after
   hint.
+- A response that asks for a wait longer than the backoff cap ends the request. A spent OpenAI plan
+  states its reset in the error body, so Pith reports it after one try.
 - A failed request reports the message from the provider JSON error body, not the raw bytes. A
   failed response head names its status too. For a spent OpenAI subscription, the message names the
   plan and the wait.

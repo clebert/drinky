@@ -469,15 +469,14 @@ fn testStreamWithAllocator(
     budget_max: usize,
 ) Stream {
     var stream: Stream = undefined;
-    stream.gpa = gpa;
+    // `begin` owns every engine-shared field, so this helper cannot drift from
+    // the reset that a real connect performs. It sets the decode state after it.
+    sse.Engine(Stream).begin(&stream, gpa, io);
     stream.io = io;
     stream.idle_ms = idle_ms;
     stream.budget = .{ .max = budget_max };
     stream.body = body;
     stream.status = .ok;
-    stream.error_length = 0;
-    stream.error_retryable = false;
-    stream.frame_arena = .init(gpa);
     stream.stop_reason = .none;
     stream.terminal_rejection = null;
     stream.open_block = null;
@@ -486,7 +485,6 @@ fn testStreamWithAllocator(
     stream.block_proof = .empty;
     stream.tool_call_id = .empty;
     stream.tool_name = .empty;
-    stream.usage = .{};
     return stream;
 }
 

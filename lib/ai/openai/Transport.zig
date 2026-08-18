@@ -123,9 +123,20 @@ pub const Stream = struct {
     /// `sse.Engine.refineError`). It reads the same shapes as a streamed error
     /// frame. Null keeps the raw body, so a truncated body or an HTML page from
     /// a gateway still reports the sent bytes.
+    ///
+    /// It also records the reset that the body names as the `retry-after` hint,
+    /// because the subscription backend states the wait in the body and not in a
+    /// header. A wait past the backoff cap then ends the request at once, so a
+    /// spent plan costs one try (see `net.Retry.allows`). A real header wins,
+    /// because it names the wait for this attempt.
     pub fn describeError(self: *Stream, body: []const u8) !?[]const u8 {
         const arena = self.frame_arena.allocator();
         const object = (try json.parseObject(arena, body)) orelse return null;
+        if (self.retry_after_ms == null) {
+            const detail = json.object(object.get("error")) orelse object;
+            if (json.unsigned(detail.get("resets_in_seconds"))) |seconds|
+                self.retry_after_ms = seconds *| 1000;
+        }
         return errorDescription(arena, object);
     }
 
@@ -651,21 +662,19 @@ fn testStreamWithAllocator(
     budget_max: usize,
 ) Stream {
     var stream: Stream = undefined;
-    stream.gpa = gpa;
+    // `begin` owns every engine-shared field, so this helper cannot drift from
+    // the reset that a real connect performs. It sets the decode state after it.
+    sse.Engine(Stream).begin(&stream, gpa, io);
     stream.io = io;
     stream.idle_ms = idle_ms;
     stream.budget = .{ .max = budget_max };
     stream.body = body;
     stream.status = .ok;
-    stream.error_length = 0;
-    stream.error_retryable = false;
-    stream.frame_arena = .init(gpa);
     stream.terminal_rejection = null;
     stream.incomplete_message = false;
     stream.reasoning = .none;
     stream.summary_index = 0;
     stream.completed_item_ids = .empty;
-    stream.usage = .{};
     stream.quota = null;
     return stream;
 }
@@ -1299,6 +1308,28 @@ test "describeError names the plan and the wait of a spent usage limit" {
             \\{"error":{"type":"usage_limit_reached"}}
         )).?,
     );
+
+    // The body states the wait, so the reset becomes the retry-after hint. A
+    // wait past the backoff cap then ends the request after one try.
+    try std.testing.expectEqual(@as(?u64, 321_378_000), stream.retryAfterMs());
+}
+
+test "describeError keeps a head's own retry-after hint" {
+    var stream = testStream(undefined, undefined, 0, 0);
+    defer stream.deinitDecode();
+
+    // A body without a reset leaves the hint alone.
+    _ = try stream.describeError(
+        \\{"error":{"type":"invalid_request_error","message":"bad request"}}
+    );
+    try std.testing.expectEqual(@as(?u64, null), stream.retryAfterMs());
+
+    // The header names the wait for this attempt, so it wins over the body.
+    stream.retry_after_ms = 7000;
+    _ = try stream.describeError(
+        \\{"error":{"type":"usage_limit_reached","resets_in_seconds":600}}
+    );
+    try std.testing.expectEqual(@as(?u64, 7000), stream.retryAfterMs());
 }
 
 test resetText {

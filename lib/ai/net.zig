@@ -28,6 +28,15 @@ pub const Retry = struct {
     /// none.
     pub const Failure = struct { attempt: u32, suggested_ms: u64 = 0 };
 
+    /// Whether the policy allows another try after `failure`. A spent attempt
+    /// bound refuses one. A `retry-after` hint longer than `backoff_ms_max`
+    /// refuses one too: the cap bounds every wait, so no wait this policy can
+    /// serve clears a failure that asks for more.
+    pub fn allows(self: Retry, failure: Failure) bool {
+        if (failure.attempt >= self.attempts_max) return false;
+        return failure.suggested_ms <= self.backoff_ms_max;
+    }
+
     /// The wait before the retry that follows `failure`: the initial delay
     /// doubled once per prior attempt, capped at `backoff_ms_max`. A server hint
     /// takes precedence over the computed backoff but is capped too. A server
@@ -226,6 +235,25 @@ test "Budget reports the bytes remaining before its ceiling" {
     // zero, never wrapped.
     try std.testing.expectError(error.StreamResponseTooLarge, budget.take(5));
     try std.testing.expectEqual(@as(usize, 0), budget.remaining());
+}
+
+test "allows refuses a spent attempt bound and a hint past the cap" {
+    const retry: Retry = .{ .attempts_max = 3, .backoff_ms_max = 16_000 };
+    try std.testing.expect(retry.allows(.{ .attempt = 1 }));
+    try std.testing.expect(retry.allows(.{ .attempt = 2 }));
+    // The third try is the last one, so no retry follows its failure.
+    try std.testing.expect(!retry.allows(.{ .attempt = 3 }));
+    try std.testing.expect(!retry.allows(.{ .attempt = 4 }));
+
+    // A hint the policy can serve keeps the retry. A hint past the cap asks for
+    // a wait no retry here can serve, so no retry follows it.
+    try std.testing.expect(retry.allows(.{ .attempt = 1, .suggested_ms = 16_000 }));
+    try std.testing.expect(!retry.allows(.{ .attempt = 1, .suggested_ms = 16_001 }));
+    try std.testing.expect(!retry.allows(.{ .attempt = 1, .suggested_ms = 3_600_000 }));
+
+    // A policy of one try disables retries.
+    const once: Retry = .{ .attempts_max = 1 };
+    try std.testing.expect(!once.allows(.{ .attempt = 1 }));
 }
 
 test "backoffMs without a hint doubles per attempt and caps" {

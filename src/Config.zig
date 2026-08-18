@@ -220,7 +220,8 @@ const keys = [_]Key{
     .{
         .path = "request.backoff_ms_max",
         .description = "The upper bound on one wait between attempts. It caps the doubling " ++
-            "above, and it caps a longer wait that a server's retry-after header asks for.",
+            "above. Pith does not retry when a retry-after header or an error body asks " ++
+            "for a longer wait.",
     },
     .{
         .path = "bash.output_lines_max",
