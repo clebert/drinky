@@ -1,42 +1,46 @@
 # pith
 
-A minimal, dependency-free coding-agent harness in Zig, inspired by
-[pi](https://github.com/earendil-works/pi-mono). The agent loop is the easy part. The terminal UI
-is the hard part. The goal here is a tiny hand-rolled TUI renderer that targets only modern
-terminals (Ghostty, kitty, WezTerm). It keeps the line count as low as possible.
+Pith is a coding agent for the terminal. You type a prompt. The model reads, searches, writes, and
+edits the files in the working directory, and the reply streams into your scrollback.
 
-The name is a placeholder.
+Pith is written in Zig and has no dependencies. It talks to Anthropic and OpenAI, through a
+subscription login or an API key. The agent loop is the easy part. The terminal UI is the hard part.
+The goal is a small hand-rolled renderer for modern terminals, with the lowest line count possible.
+The project takes its inspiration from [pi](https://github.com/earendil-works/pi-mono).
 
-## Terminal
+Status: early and unreleased. The name is a placeholder. There is no license yet.
 
-Pith uses synchronized output and the Kitty keyboard protocol. At startup it asks for grapheme
-cluster processing (DECSET 2027), because it measures one grapheme cluster per cell step. It paints
-with the default colors and the ANSI slots 0 to 15 alone, so the theme of the terminal owns every
-color.
+## Run
 
-Pith does not query the terminal for these capabilities. It reads `TERM_PROGRAM` for one exception.
-Apple Terminal has neither the modern alternate screen nor the alternate-scroll mode, so a
-full-window page there takes the older escapes and the mouse reports. Every other terminal takes the
-modern path, and an older one still shows the interface. In such a terminal an emoji can take the
-wrong width and a repaint can flicker.
-
-## Build
+Pith needs Zig 0.16.0, a POSIX system, and the `HOME` variable.
 
 ```sh
-zig build          # build + ZLS check
+zig build          # build and ZLS check
 zig build run      # run
 zig build test     # run all tests
 ```
 
-Pith requires Zig 0.16.0.
+Set `ANTHROPIC_API_KEY` or `OPENAI_API_KEY`, or sign in with `/login`. `~/.pith/config.json` is
+optional.
+
+## Terminal
+
+Pith uses synchronized output, the Kitty keyboard protocol, and grapheme cluster processing (DECSET
+2027). It paints with the default colors and the ANSI slots 0 to 15 alone, so the theme of the
+terminal owns every color.
+
+Pith does not query the terminal. It reads `TERM_PROGRAM` for one exception: Apple Terminal has
+neither the modern alternate screen nor the alternate-scroll mode, so it takes the older escapes and
+the mouse reports. Every other terminal takes the modern path. An older terminal still shows the
+interface, but an emoji can take the wrong width and a repaint can flicker.
 
 ## Trust
 
-Project `AGENTS.md` files and skills are repository-controlled model instructions. Open untrusted
-repositories only inside an external container or sandbox. Pith does not yet provide a permission
-gate or a sandbox.
+The `AGENTS.md` files and the skills of a repository are model instructions. Pith has no permission
+gate and no sandbox. Open an untrusted repository in a container.
 
-## Roadmap
+## More
 
-Planned features and where they hook into the current architecture live in
-[`BACKLOG.md`](BACKLOG.md).
+- [`FEATURES.md`](FEATURES.md): every capability, one sentence each.
+- [`BACKLOG.md`](BACKLOG.md): the planned work.
+- [`docs/`](docs): the design notes.
