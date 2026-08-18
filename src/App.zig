@@ -22,6 +22,7 @@ const ai = @import("ai");
 const terminal = @import("terminal");
 
 const Config = @import("Config.zig");
+const Retry = @import("Retry.zig");
 const Session = @import("Session.zig");
 const State = @import("State.zig");
 const system_prompt = @import("system_prompt.zig");
@@ -39,6 +40,11 @@ const effort_default: ai.llm.Effort = .xhigh;
 
 const intro_text = "Enter: Send · Shift+Enter: New line · Esc: Cancel · " ++
     "Ctrl+C: Clear · Ctrl+C twice: Quit · Ctrl+D: Quit";
+
+/// The control hint that opens a stale-cache warning. The key that passes the
+/// warning differs between a submit and a retry, so each one names its own key.
+const cache_hint_submit = "Enter: Send anyway";
+const cache_hint_retry = "Ctrl+N: Try again anyway";
 
 /// Two Ctrl+C presses within this window quit. A lone press clears the editor.
 const ctrl_c_window_ms = 500;
@@ -69,6 +75,11 @@ state: State,
 /// abbreviated to `~`. Owned, and fixed for the session, because pith never
 /// changes its working directory.
 directory_label: []const u8,
+/// The canonical working directory and home directory of this session. Both
+/// borrow `run` storage, and a path that the transcript shows reads against
+/// them. Empty until `run` resolves them, so a path then shows as it is.
+working_directory: []const u8,
+home_directory: []const u8,
 /// Project instructions, skill metadata, and the composed prompt. All outlive
 /// the agent, which borrows `prompt`.
 project_instructions: ai.instructions.Result,
@@ -110,6 +121,12 @@ turn_future: ?std.Io.Future(WorkerResult),
 pending_turn_result: ?WorkerResult,
 /// Last generation reserved for a turn worker. The app never reuses a generation.
 turn_generation: u64,
+/// The retry context of the latest failed turn, or null when none waits. It
+/// lives at the prompt alone, because an attempt takes the context with it.
+retry: ?Retry,
+/// Whether the live turn is a retry attempt. Its failure arms the context again,
+/// because the committed work that it continues from is still in history.
+turn_retry: bool,
 /// The pending frame timer, or null when none is armed (idle or clean).
 tick_future: ?std.Io.Future(void),
 /// A frame timer is armed and its `.tick` has not been drained yet.
@@ -376,14 +393,13 @@ fn directoryLabel(
     directory: []const u8,
     home: []const u8,
 ) ![]const u8 {
-    const label = if (ai.project.contains(&.{ .boundary = home, .target = directory })) home: {
-        // A home directory that is a root already ends with the separator, so a
-        // directory below it keeps that separator rather than losing it to the
-        // `~`. The root itself is the whole label, so it keeps nothing.
-        const below_root = directory.len > home.len and std.fs.path.isSep(home[home.len - 1]);
-        const cut = if (below_root) home.len - 1 else home.len;
-        break :home try std.fmt.allocPrint(gpa, "~{s}", .{directory[cut..]});
-    } else try gpa.dupe(u8, directory);
+    const label = if (relativeTo(home, directory)) |relative|
+        try std.fmt.allocPrint(gpa, "~/{s}", .{relative})
+    else if (ai.project.contains(&.{ .boundary = home, .target = directory }))
+        // The home directory itself is the whole label.
+        try gpa.dupe(u8, "~")
+    else
+        try gpa.dupe(u8, directory);
     if (label.len <= ui.status.directory_bytes_max) return label;
     defer gpa.free(label);
     // The status line shows an identity, not a whole path, so a long path keeps
@@ -455,6 +471,8 @@ pub fn run(
 
     const home_directory = try homeDirectory(gpa, io, cwd, home);
     defer gpa.free(home_directory);
+    self.working_directory = cwd;
+    self.home_directory = home_directory;
     self.directory_label = try directoryLabel(gpa, cwd, home_directory);
     defer gpa.free(self.directory_label);
 
@@ -626,6 +644,8 @@ fn initFields(self: *App, gpa: std.mem.Allocator, io: std.Io) void {
         .default_models = .{},
         .state = .inert(gpa, io),
         .directory_label = "",
+        .working_directory = "",
+        .home_directory = "",
         // The source only names a noun in a report, and nothing reports an empty
         // result, so either tag serves until discovery replaces this.
         .project_instructions = .init(gpa, .project),
@@ -651,6 +671,8 @@ fn initFields(self: *App, gpa: std.mem.Allocator, io: std.Io) void {
         .turn_future = null,
         .pending_turn_result = null,
         .turn_generation = 0,
+        .retry = null,
+        .turn_retry = false,
         .tick_future = null,
         .tick_pending = false,
         .frame_grid = .reset(0),
@@ -676,6 +698,7 @@ fn prepareTerminalExit(self: *App) void {
 fn shutdownTasks(self: *App) void {
     // Shutdown is teardown, not an interactive cancel: free the worker result's
     // owned terminal text and leave the session untouched.
+    self.dropRetry();
     if (self.cancelTurnFuture()) |result| self.freeWorkerResult(&result);
     if (self.pending_turn_result) |result| {
         self.freeWorkerResult(&result);
@@ -752,6 +775,7 @@ fn finishWorkerResult(self: *App, result: *const WorkerResult) !void {
     self.refreshBranch();
     switch (result.outcome.disposition) {
         .completed => {
+            _ = self.takeTurnRetry();
             try self.session.endTurnWithReceipt(&result.outcome.receipt);
             if (self.session.hasSteering()) try self.startSteeringTurn();
         },
@@ -775,16 +799,73 @@ fn finishWorkerResult(self: *App, result: *const WorkerResult) !void {
     }
 }
 
-/// Apply one failed result, then invalidate its rejected account when present.
+/// Apply one failed result, arm its retry, then invalidate its rejected account
+/// when present.
 fn finishFailedWorker(
     self: *App,
     result: *const WorkerResult,
     maybe_rejected: ?ai.llm.Account,
 ) !void {
+    // The turn ends here whatever follows, so its attempt flag resolves first.
+    const attempt = self.takeTurnRetry();
     try self.session.reserveFailureRestore(&result.outcome.receipt);
     defer self.agent.steering.clear();
+    // The reconciliation runs first, because `reserveFailureRestore` makes only
+    // that step infallible. The arm allocates, so it stays outside that window.
     try self.session.failTurnWithReceipt(&result.outcome.receipt, result.error_text);
+    try self.armRetry(result, attempt);
     if (maybe_rejected) |account| try self.rejectCredential(account);
+}
+
+/// Arm one retry context from a failed turn, so Ctrl+N can ask the model to
+/// continue. Only committed work can be continued, so a turn that committed
+/// nothing arms nothing: its request returns to the editor instead. A failed
+/// `attempt` is the exception, because the work that it continues from is already
+/// in history. The latest failure replaces any older context.
+fn armRetry(self: *App, result: *const WorkerResult, attempt: bool) !void {
+    const receipt = &result.outcome.receipt;
+    const committed = receipt.history_end != receipt.history_base;
+    if (!committed and !attempt) return;
+    const failure = try self.gpa.dupe(
+        u8,
+        result.error_text orelse "Pith could not complete the turn.",
+    );
+    self.setRetry(.{ .failure = failure });
+}
+
+/// Replace the retry context and mirror its hint row into the session. This is the
+/// one place that moves both together, so the row can never outlive the context.
+///
+/// The call frees the context that it replaces, so a caller builds `maybe_retry`
+/// and every byte in it first. `armRetry` duplicates the failure sentence before
+/// it arrives here for exactly that reason.
+fn setRetry(self: *App, maybe_retry: ?Retry) void {
+    self.dropRetry();
+    self.retry = maybe_retry;
+    self.session.retry_shown = maybe_retry != null;
+    self.session.dirty = true;
+}
+
+/// Take the attempt flag of the turn that is ending. Only a new attempt sets it
+/// again, so every terminal reads it once.
+fn takeTurnRetry(self: *App) bool {
+    defer self.turn_retry = false;
+    return self.turn_retry;
+}
+
+/// Free the retry context and forget it. Teardown uses this, because it touches
+/// no session state.
+fn dropRetry(self: *App) void {
+    const retry = self.retry orelse return;
+    retry.deinit(self.gpa);
+    self.retry = null;
+}
+
+/// Discard the retry context and its hint row. The editor keeps its text, because
+/// Esc dismisses the retry alone.
+fn clearRetry(self: *App) void {
+    if (self.retry == null) return;
+    self.setRetry(null);
 }
 
 /// Cancel and reap `maybe_future`'s task, then clear the handle. A no-op when null.
@@ -1130,14 +1211,16 @@ fn flushEscape(self: *App) !void {
 }
 
 fn handleKey(self: *App, event: *const terminal.Input.Key) !void {
-    // Only an idle Enter can confirm the stale-cache warning. Every other user
-    // action clears both the notice and its one-shot confirmation.
-    const confirms_cache = self.session.mode == .prompt and event.* == .enter;
+    const at_prompt = self.session.mode == .prompt;
+    // Only an idle Enter or Ctrl+N can confirm the stale-cache warning, because
+    // both send the next request. Every other user action clears the notice and
+    // its one-shot confirmation.
+    const retries = event.* == .ctrl and event.ctrl == 'n';
+    const confirms_cache = at_prompt and (event.* == .enter or retries);
     if (!confirms_cache) self.session.cancelCacheConfirmation();
     // A refused command line goes to the model on the next Enter alone. The prompt
     // sends it, and a turn queues it, so both modes can confirm.
-    const confirms_message = confirms_cache or
-        (self.session.mode == .turn and event.* == .enter);
+    const confirms_message = (at_prompt or self.session.mode == .turn) and event.* == .enter;
     if (!confirms_message) self.session.cancelMessageConfirmation();
     // Clear before the key routes, so a notice produced by this action survives it.
     self.session.clearNotice();
@@ -1150,6 +1233,9 @@ fn handleKey(self: *App, event: *const terminal.Input.Key) !void {
     if (try self.editKey(event)) return;
     switch (event.*) {
         .enter => try self.submit(),
+        // Esc owns the waiting retry alone, and it keeps the editor text. An idle
+        // prompt without a retry has nothing to cancel.
+        .escape => self.clearRetry(),
         .ctrl => |letter| switch (letter) {
             'c' => {
                 self.clearOrQuit();
@@ -1158,6 +1244,7 @@ fn handleKey(self: *App, event: *const terminal.Input.Key) !void {
             'd' => if (self.session.editor.visible().len == 0) {
                 self.running = false;
             },
+            'n' => try self.retryTurn(),
             else => {},
         },
         else => {},
@@ -1327,6 +1414,8 @@ fn cancelTurn(self: *App) !void {
         // to, and show the cancellation.
         .canceled => {
             defer self.freeWorkerResult(&result);
+            // The user stopped this turn, so it arms no retry.
+            _ = self.takeTurnRetry();
             const receipt = &result.outcome.receipt;
             const committed = receipt.history_end != receipt.history_base;
             // The worker is joined, so one bounded queue take owns all progress it
@@ -1362,6 +1451,7 @@ fn cancelTurn(self: *App) !void {
         // not a failure worth a report or a cancellation to restore from.
         .closed => {
             defer self.freeWorkerResult(&result);
+            _ = self.takeTurnRetry();
             try self.session.endTurnWithReceipt(&result.outcome.receipt);
         },
     }
@@ -1472,6 +1562,15 @@ fn submitWithCacheRisk(self: *App, maybe_cache_risk: ?*const ai.Agent.CacheRisk)
     if (!message_confirmed) {
         if (try self.checkCommand(text)) |refusal|
             return self.armMessageSend(refusal, "Send as a message");
+        // A waiting retry owns the next request, so a command that starts a
+        // generated turn of its own must wait for it. The registry decided first,
+        // so this refusal names the one restriction that ends.
+        if (self.retry != null) {
+            if (ai.command.parse(text)) |name| {
+                if (ai.command.loadsSkill(name))
+                    return self.refuseCommand(name, "while a retry waits");
+            }
+        }
         if (try self.dispatchCommand(text)) |outcome|
             return self.applySubmittedCommand(outcome, maybe_cache_risk);
     }
@@ -1484,7 +1583,10 @@ fn submitWithCacheRisk(self: *App, maybe_cache_risk: ?*const ai.Agent.CacheRisk)
             .{},
         );
     }
-    if (try self.preflightModelSubmit(maybe_cache_risk)) {
+    if (try self.preflightModelSubmit(maybe_cache_risk, cache_hint_submit)) {
+        // A waiting retry owns this Enter: the text joins that attempt instead of
+        // starting a turn of its own.
+        if (self.retry != null) return self.submitRetry(text);
         const base = try self.startUserTurn(text);
         // The turn is live and owns its own copy. Retain the prompt's rich draft
         // so an abnormal exit that commits nothing can return it. Leave the
@@ -1518,8 +1620,10 @@ fn applySubmittedCommand(
                     "Sign in with /login before you send a message.",
                     .{},
                 );
-            } else if (try self.preflightModelSubmit(maybe_cache_risk)) {
+            } else if (try self.preflightModelSubmit(maybe_cache_risk, cache_hint_submit)) {
                 const base = try self.startSkillTurn(&prompt);
+                // The line reproduces this request, so a failure that commits
+                // nothing returns it to the editor like any other human request.
                 var draft = self.session.editor.detachTrimmed();
                 self.session.retainTurnPrompt(&draft, base);
             }
@@ -1558,10 +1662,12 @@ fn armMessageSend(
 }
 
 /// Stop the first stale-cache submission and arm one confirmation for the
-/// unchanged prompt.
+/// unchanged prompt. `action` names the key that passes the warning, because the
+/// prompt and a retry send through different keys.
 fn preflightModelSubmit(
     self: *App,
     maybe_cache_risk: ?*const ai.Agent.CacheRisk,
+    action: []const u8,
 ) !bool {
     if (self.session.takeCacheConfirmation()) return true;
     const cache_risk = maybe_cache_risk orelse return true;
@@ -1570,16 +1676,14 @@ fn preflightModelSubmit(
     if (cache_risk.cost_extra >= 0.01) {
         try self.reportNotice(
             .warning,
-            "Enter: Send anyway · Cache: Probably stale after {d}{s} · " ++
-                "Extra input cost: ~${d:.2}",
-            .{ retention.count, retention.unit, cache_risk.cost_extra },
+            "{s} · Cache: Probably stale after {d}{s} · Extra input cost: ~${d:.2}",
+            .{ action, retention.count, retention.unit, cache_risk.cost_extra },
         );
     } else {
         try self.reportNotice(
             .warning,
-            "Enter: Send anyway · Cache: Probably stale after {d}{s} · " ++
-                "Extra input cost: ~${d:.4}",
-            .{ retention.count, retention.unit, cache_risk.cost_extra },
+            "{s} · Cache: Probably stale after {d}{s} · Extra input cost: ~${d:.4}",
+            .{ action, retention.count, retention.unit, cache_risk.cost_extra },
         );
     }
     self.session.armCacheConfirmation();
@@ -1599,8 +1703,8 @@ fn retentionText(retention_ms: u64) struct { count: u64, unit: []const u8 } {
     return .{ .count = retention_ms, .unit = "ms" };
 }
 
-/// Record a compact skill marker and its optional user task, then spawn the turn
-/// over the expanded skill content. Returns the rich draft's rewind checkpoint.
+/// Record the skill marker and its optional user task, then spawn the turn over
+/// the expanded skill content. Returns the rich draft's rewind checkpoint.
 fn startSkillTurn(self: *App, prompt: *const ai.command.Outcome.Prompt) !usize {
     const base = try self.appendSkillPrompt(prompt);
     errdefer self.session.transcript.truncate(base);
@@ -1609,13 +1713,55 @@ fn startSkillTurn(self: *App, prompt: *const ai.command.Outcome.Prompt) !usize {
     return base;
 }
 
+/// Record what one skill invocation sends: the marker that names the skill, its
+/// source, and its size, then the user task under it. The expanded file itself
+/// stays out of the transcript, so the marker is the only sign of its size.
 fn appendSkillPrompt(self: *App, prompt: *const ai.command.Outcome.Prompt) !usize {
     const base = self.session.transcript.blocks().len;
     errdefer self.session.transcript.truncate(base);
-    try self.session.transcript.append(.skill, false, prompt.name);
+    const marker = try self.skillMarker(prompt);
+    defer self.gpa.free(marker);
+    try self.session.transcript.append(.skill, false, marker);
     if (prompt.arguments.len > 0)
         try self.session.transcript.append(.user, false, prompt.arguments);
     return base;
+}
+
+/// The two marker rows of one skill invocation: the name with the size of its
+/// file, then the source of that file. The block paints `Skill: ` before the
+/// first row alone. The result is owned.
+fn skillMarker(self: *App, prompt: *const ai.command.Outcome.Prompt) ![]u8 {
+    var size_buffer: [16]u8 = undefined;
+    const size = ai.format.bytes(&size_buffer, prompt.source_bytes);
+    const source = try self.displayPath(prompt.source);
+    defer self.gpa.free(source);
+    return std.fmt.allocPrint(self.gpa, "{s} · Size: {s}\nSource: {s}", .{
+        prompt.name,
+        size,
+        source,
+    });
+}
+
+/// `path` as the transcript shows it: relative to the working directory when it
+/// sits below it, else with the home directory as `~`, else the path itself. The
+/// result is owned.
+fn displayPath(self: *App, path: []const u8) ![]u8 {
+    if (relativeTo(self.working_directory, path)) |relative|
+        return self.gpa.dupe(u8, relative);
+    if (relativeTo(self.home_directory, path)) |relative|
+        return std.fmt.allocPrint(self.gpa, "~/{s}", .{relative});
+    return self.gpa.dupe(u8, path);
+}
+
+/// `path` without its `boundary` prefix, or null when the boundary is empty, does
+/// not contain `path`, or is `path` itself.
+fn relativeTo(boundary: []const u8, path: []const u8) ?[]const u8 {
+    if (boundary.len == 0) return null;
+    if (!ai.project.contains(&.{ .boundary = boundary, .target = path })) return null;
+    const separated = std.fs.path.isSep(boundary[boundary.len - 1]);
+    const cut = if (separated) boundary.len else boundary.len + 1;
+    if (cut >= path.len) return null;
+    return path[cut..];
 }
 
 /// Record a plain user message and spawn its turn. Returns the rich draft's
@@ -1626,6 +1772,64 @@ fn startUserTurn(self: *App, text: []const u8) !usize {
     errdefer self.session.transcript.truncate(base);
     try self.runTurn(text);
     self.session.dirty = true;
+    return base;
+}
+
+/// Ctrl+N at the prompt: send one retry attempt with no editor text. The editor
+/// keeps whatever it holds, because only Enter adds that text to an attempt. A
+/// prompt with no waiting retry has nothing to send.
+fn retryTurn(self: *App) !void {
+    if (self.retry == null) return;
+    if (!self.signedIn()) return self.reportNotice(
+        .failure,
+        "Sign in with /login before you try the turn again.",
+        .{},
+    );
+    const maybe_cache_risk = self.agent.cacheRisk();
+    if (maybe_cache_risk) |*cache_risk| return self.retryWithCacheRisk(cache_risk);
+    return self.retryWithCacheRisk(null);
+}
+
+/// Retry with an injected cache risk. An attempt rewrites the same prompt cache as
+/// any other request, so it takes the same warning. The seam lets tests stop at
+/// that warning without starting a real provider worker.
+fn retryWithCacheRisk(self: *App, maybe_cache_risk: ?*const ai.Agent.CacheRisk) !void {
+    if (!try self.preflightModelSubmit(maybe_cache_risk, cache_hint_retry)) return;
+    const base = try self.startRetryTurn("");
+    // The editor holds no part of this attempt, so the rewind anchor stands alone.
+    self.session.markTurnBase(base);
+}
+
+/// Enter at the prompt while a retry waits: send the attempt with the editor text
+/// added to it. The text belongs to the user, so a failure that commits nothing
+/// returns it to the editor.
+fn submitRetry(self: *App, text: []const u8) !void {
+    const base = try self.startRetryTurn(text);
+    var prompt = self.session.editor.detachTrimmed();
+    self.session.retainTurnPrompt(&prompt, base);
+}
+
+/// Send one retry attempt: record the event that names it, then spawn its turn
+/// over the generated request. `input` is the editor text to add, and an empty
+/// `input` adds none. The attempt takes the retry context, so the next failure
+/// arms a fresh one that names its own error. Returns the rich draft's rewind
+/// checkpoint.
+fn startRetryTurn(self: *App, input: []const u8) !usize {
+    std.debug.assert(self.retry != null);
+    const retry = &self.retry.?;
+    const text = try retry.compose(self.gpa, input);
+    defer self.gpa.free(text);
+    const base = self.session.transcript.blocks().len;
+    errdefer self.session.transcript.truncate(base);
+    // The complete request stays out of the transcript, as a skill marker keeps
+    // its expanded file out of it.
+    try self.session.transcript.append(.event, false, Retry.event_text);
+    if (input.len > 0) try self.session.transcript.append(.user, false, input);
+    try self.runTurn(text);
+    // The turn owns the request now, so the hint leaves with the context it named.
+    // A failure of this attempt arms the context again from its own error.
+    self.turn_retry = true;
+    self.setRetry(null);
     return base;
 }
 
@@ -1697,6 +1901,8 @@ fn applyOutcome(self: *App, outcome: ai.command.Outcome) !void {
         .new_conversation => {
             self.agent.resetConversation();
             self.session.resetConversation();
+            // The cleared conversation holds no work to continue from.
+            self.clearRetry();
         },
         // Only `submit` produces a prompt outcome (from a typed `/skill:` line),
         // and it starts that turn itself, so a prompt never reaches this shared
@@ -4768,7 +4974,7 @@ test "a rejected refresh credential hands the session to another account" {
     );
 }
 
-test "an invoked skill records a compact marker and keeps its task visible" {
+test "an invoked skill marks its name, size, and source and keeps its task visible" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
@@ -4777,18 +4983,25 @@ test "an invoked skill records a compact marker and keeps its task visible" {
     app.initForTest(gpa);
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
     defer app.session.deinit();
+    app.working_directory = "/work";
+    app.home_directory = "/home/you";
 
     const prompt: ai.command.Outcome.Prompt = .{
         .name = "zig-style",
         .arguments = "review this file",
         .content = "complete hidden skill instructions",
+        .source = "/work/.agents/skills/zig-style/SKILL.md",
+        .source_bytes = 3200,
     };
     try std.testing.expectEqual(@as(usize, 0), try app.appendSkillPrompt(&prompt));
 
     const blocks = app.session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 2), blocks.len);
     switch (blocks[0]) {
-        .skill => |name| try std.testing.expectEqualStrings("zig-style", name.items),
+        .skill => |marker| try std.testing.expectEqualStrings(
+            "zig-style · Size: 3.1 KB\nSource: .agents/skills/zig-style/SKILL.md",
+            marker.items,
+        ),
         else => return error.ExpectedSkill,
     }
     switch (blocks[1]) {
@@ -4796,9 +5009,569 @@ test "an invoked skill records a compact marker and keeps its task visible" {
         else => return error.ExpectedUser,
     }
 
+    // The head names the marker once, and the size and source rows carry the part
+    // that the transcript never shows.
     try app.session.paint(.{ .columns = 80, .rows = 24 });
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "Skill: zig-style") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        out.written(),
+        "Skill: zig-style · Size: 3.1 KB",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        out.written(),
+        "Source: .agents/skills/zig-style/SKILL.md",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "Skill: Source:") == null);
     try std.testing.expect(std.mem.indexOf(u8, out.written(), prompt.content) == null);
+}
+
+test displayPath {
+    const gpa = std.testing.allocator;
+    var app: App = undefined;
+    app.initForTest(gpa);
+    app.working_directory = "/work";
+    app.home_directory = "/home/you";
+
+    // A project skill reads relative to the working directory, a user skill takes
+    // the `~` of the home directory, and any other path stays as it is.
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ "/work/.agents/skills/demo/SKILL.md", ".agents/skills/demo/SKILL.md" },
+        .{ "/home/you/.agents/skills/demo/SKILL.md", "~/.agents/skills/demo/SKILL.md" },
+        .{ "/opt/skills/demo/SKILL.md", "/opt/skills/demo/SKILL.md" },
+    };
+    for (cases) |case| {
+        const path, const shown = case;
+        const display = try app.displayPath(path);
+        defer gpa.free(display);
+        try std.testing.expectEqualStrings(shown, display);
+    }
+
+    // Without a resolved session the path stands alone.
+    app.working_directory = "";
+    app.home_directory = "";
+    const bare = try app.displayPath("/work/.agents/skills/demo/SKILL.md");
+    defer gpa.free(bare);
+    try std.testing.expectEqualStrings("/work/.agents/skills/demo/SKILL.md", bare);
+}
+
+// A failed turn that committed work arms a retry: the hint row appears above the
+// editor, and Esc dismisses that retry alone.
+test "a committed failure arms a retry that Esc dismisses" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = anthropic_default,
+        .system = "",
+        .retry = .{},
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+    defer app.dropRetry();
+    app.session.beginTurn(1);
+
+    var result: WorkerResult = .{
+        .outcome = .{
+            .receipt = .{
+                .history_base = 0,
+                .history_end = 2,
+                .steering_committed_count = 0,
+            },
+            .disposition = .{ .failed = error.ApiError },
+        },
+        .error_text = try gpa.dupe(u8, "The provider is overloaded."),
+    };
+    defer app.freeWorkerResult(&result);
+    try app.finishWorkerResult(&result);
+
+    try std.testing.expect(app.session.mode == .prompt);
+    try std.testing.expectEqualStrings("The provider is overloaded.", app.retry.?.failure);
+    try std.testing.expect(app.session.retry_shown);
+
+    // The hint row names the two keys that own the retry. Enter belongs to the
+    // editor text, so the row leaves it out.
+    try app.session.paint(.{ .columns = 80, .rows = 24 });
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        out.written(),
+        "Ctrl+N: Try again · Esc: Dismiss",
+    ) != null);
+
+    // Esc drops the retry and keeps every byte the editor holds.
+    try app.session.editor.insert("keep this text");
+    try app.handleKey(&.escape);
+    try std.testing.expect(app.retry == null);
+    try std.testing.expect(!app.session.retry_shown);
+    try std.testing.expectEqualStrings("keep this text", app.session.editor.visible());
+
+    // A prompt with no retry leaves Ctrl+N without an attempt to send.
+    try app.handleKey(&.{ .ctrl = 'n' });
+    try std.testing.expect(app.session.mode == .prompt);
+    try std.testing.expect(app.turn_future == null);
+}
+
+// A human request that committed nothing needs no retry: it returns to the editor,
+// and the next Enter sends it as a normal turn.
+test "an uncommitted human failure returns to the editor and arms no retry" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = anthropic_default,
+        .system = "",
+        .retry = .{},
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+    defer app.dropRetry();
+
+    try app.session.transcript.append(.user, false, "write the docs");
+    app.session.beginTurn(1);
+    try app.session.editor.insert("write the docs");
+    var prompt = app.session.editor.detachTrimmed();
+    app.session.retainTurnPrompt(&prompt, 0);
+
+    var result: WorkerResult = .{
+        .outcome = .{
+            .receipt = zero_receipt,
+            .disposition = .{ .failed = error.ApiError },
+        },
+        .error_text = try gpa.dupe(u8, "The provider is overloaded."),
+    };
+    defer app.freeWorkerResult(&result);
+    try app.finishWorkerResult(&result);
+
+    try std.testing.expectEqualStrings("write the docs", app.session.editor.visible());
+    try std.testing.expect(app.retry == null);
+    try std.testing.expect(!app.session.retry_shown);
+    const blocks = app.session.transcript.blocks();
+    try std.testing.expectEqual(@as(usize, 1), blocks.len);
+    try std.testing.expect(blocks[0].event.is_error);
+}
+
+// A skill line reproduces its own request, so an uncommitted failure returns the
+// whole line and arms no retry. Uncommitted steering joins that line, and one
+// Enter sends everything after the name as the task.
+test "an uncommitted skill failure returns its line and arms no retry" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    defer app.drainQueue();
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = anthropic_default,
+        .system = "",
+        .retry = .{},
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+    defer app.dropRetry();
+
+    // The line the user typed, and the request that Pith expanded from it.
+    try app.session.editor.insert("/skill:demo apply it");
+    const prompt: ai.command.Outcome.Prompt = .{
+        .name = "demo",
+        .arguments = "apply it",
+        .content = "SKILL BODY\napply it",
+        .source = "/work/.agents/skills/demo/SKILL.md",
+        .source_bytes = 3200,
+    };
+    const base = try app.startSkillTurn(&prompt);
+    var draft = app.session.editor.detachTrimmed();
+    app.session.retainTurnPrompt(&draft, base);
+    try seedSteering(&app, "and keep the format");
+
+    // The signed-out worker fails before any provider request, so nothing commits.
+    {
+        const result = app.awaitTurnFuture().?;
+        defer app.freeWorkerResult(&result);
+        try app.finishWorkerResult(&result);
+    }
+    try std.testing.expect(app.session.mode == .prompt);
+    try std.testing.expect(app.retry == null);
+    try std.testing.expect(!app.session.retry_shown);
+    try std.testing.expectEqualStrings(
+        "/skill:demo apply it\n\nand keep the format",
+        app.session.editor.visible(),
+    );
+    // The rewind keeps the failure event alone: the marker and the task went with
+    // the request that no history holds.
+    const blocks = app.session.transcript.blocks();
+    try std.testing.expectEqual(@as(usize, 1), blocks.len);
+    try std.testing.expect(blocks[0].event.is_error);
+    // The restored line is still one command line, and its tail is the new task.
+    try std.testing.expectEqualStrings(
+        "skill:demo",
+        ai.command.parse(app.session.editor.visible()).?,
+    );
+}
+
+// Ctrl+N sends the attempt alone: no editor text goes with it, the transcript
+// records one event, and the failure of the attempt arms the retry again.
+test "Ctrl+N sends the attempt and keeps the editor text" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    defer app.drainQueue();
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = anthropic_default,
+        .system = "",
+        .retry = .{},
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+    defer app.dropRetry();
+
+    app.setRetry(.{ .failure = try gpa.dupe(u8, "The provider is overloaded.") });
+    try app.session.editor.insert("a draft that stays");
+
+    try app.retryWithCacheRisk(null);
+
+    try std.testing.expect(app.session.mode == .turn);
+    try std.testing.expect(app.retry == null);
+    try std.testing.expect(!app.session.retry_shown);
+    // The attempt sends and clears nothing of the editor, and it retains no draft,
+    // because the editor holds no part of it.
+    try std.testing.expectEqualStrings("a draft that stays", app.session.editor.visible());
+    try std.testing.expect(app.session.turn_origin == null);
+    {
+        const blocks = app.session.transcript.blocks();
+        try std.testing.expectEqual(@as(usize, 1), blocks.len);
+        try std.testing.expectEqualStrings(Retry.event_text, blocks[0].event.text.items);
+        try std.testing.expect(!blocks[0].event.is_error);
+    }
+
+    {
+        const result = app.awaitTurnFuture().?;
+        defer app.freeWorkerResult(&result);
+        try app.finishWorkerResult(&result);
+    }
+    // The attempt continues committed work, so its own failure arms the context
+    // again. Its event block rewinds, and only the failure event stays.
+    try std.testing.expect(app.session.retry_shown);
+    try std.testing.expect(std.mem.indexOf(u8, app.retry.?.failure, "SignedOut") != null);
+    try std.testing.expectEqualStrings("a draft that stays", app.session.editor.visible());
+    const blocks = app.session.transcript.blocks();
+    try std.testing.expectEqual(@as(usize, 1), blocks.len);
+    try std.testing.expect(blocks[0].event.is_error);
+}
+
+// A retry needs an account, so Ctrl+N names the sign-in and sends nothing. Without
+// a retry the key has no action at all.
+test "a signed-out Ctrl+N names the sign-in and keeps the retry" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = anthropic_default,
+        .system = "",
+        .retry = .{},
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+    defer app.dropRetry();
+
+    try app.handleKey(&.{ .ctrl = 'n' });
+    try std.testing.expect(app.session.notice == null);
+    try std.testing.expect(app.turn_future == null);
+
+    app.setRetry(.{ .failure = try gpa.dupe(u8, "The provider is overloaded.") });
+    try app.handleKey(&.{ .ctrl = 'n' });
+    try std.testing.expect(app.retry != null);
+    try std.testing.expect(app.session.retry_shown);
+    try std.testing.expect(app.turn_future == null);
+    try std.testing.expectEqualStrings(
+        "Sign in with /login before you try the turn again.",
+        app.session.notice.?.content,
+    );
+}
+
+// An attempt rewrites the same prompt cache as any other request, so the first
+// Ctrl+N warns and the second one sends. Every other key drops that offer.
+test "a stale cache stops the first Ctrl+N and the next one sends" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    defer app.drainQueue();
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = anthropic_default,
+        .system = "",
+        .retry = .{},
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+    defer app.dropRetry();
+
+    app.setRetry(.{ .failure = try gpa.dupe(u8, "The provider is overloaded.") });
+    const risk: ai.Agent.CacheRisk = .{
+        .retention_ms = 5 * std.time.ms_per_min,
+        .cost_extra = 1.15,
+    };
+
+    try app.retryWithCacheRisk(&risk);
+    try std.testing.expect(app.session.mode == .prompt);
+    try std.testing.expect(app.retry != null);
+    try std.testing.expect(app.session.cache_confirmation);
+    try std.testing.expect(std.mem.startsWith(
+        u8,
+        app.session.notice.?.content,
+        "Ctrl+N: Try again anyway · Cache: Probably stale after 5m",
+    ));
+
+    // The key that passes the warning keeps its own offer, and any other key drops
+    // it. Signed out, this Ctrl+N stops at the sign-in and sends nothing.
+    try app.handleKey(&.{ .ctrl = 'n' });
+    try std.testing.expect(app.session.cache_confirmation);
+    try app.handleKey(&.left);
+    try std.testing.expect(!app.session.cache_confirmation);
+
+    // Armed again, the next Ctrl+N passes the warning and starts the attempt.
+    try app.retryWithCacheRisk(&risk);
+    try std.testing.expect(app.session.cache_confirmation);
+    try app.retryWithCacheRisk(&risk);
+    try std.testing.expect(app.session.mode == .turn);
+    try std.testing.expect(app.retry == null);
+    const result = app.awaitTurnFuture().?;
+    defer app.freeWorkerResult(&result);
+    try app.finishWorkerResult(&result);
+}
+
+// A non-blank Enter adds the editor text to the attempt. That text is human, so a
+// failure that commits nothing returns it alone and the wrapper stays hidden. The
+// attempt continues committed work, so its own failure arms the retry again.
+test "Enter adds the editor text to a waiting retry" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    defer app.drainQueue();
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = anthropic_default,
+        .system = "",
+        .retry = .{},
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+    defer app.dropRetry();
+
+    app.retry = .{ .failure = try gpa.dupe(u8, "The provider did not respond in time.") };
+    app.session.retry_shown = true;
+
+    try app.session.editor.insert("also check the tests");
+    try app.submitRetry("also check the tests");
+
+    try std.testing.expect(app.session.mode == .turn);
+    try std.testing.expect(app.retry == null);
+    try std.testing.expectEqualStrings("", app.session.editor.visible());
+    {
+        const blocks = app.session.transcript.blocks();
+        try std.testing.expectEqual(@as(usize, 2), blocks.len);
+        try std.testing.expectEqualStrings(
+            "Pith asked the model to continue from the committed work.",
+            blocks[0].event.text.items,
+        );
+        try std.testing.expectEqualStrings("also check the tests", blocks[1].user.items);
+    }
+
+    {
+        const result = app.awaitTurnFuture().?;
+        defer app.freeWorkerResult(&result);
+        try app.finishWorkerResult(&result);
+    }
+    // Only the human text returns. The committed work still waits for an attempt,
+    // and the context now names the newest failure.
+    try std.testing.expectEqualStrings("also check the tests", app.session.editor.visible());
+    try std.testing.expect(app.session.retry_shown);
+    try std.testing.expect(std.mem.indexOf(u8, app.retry.?.failure, "SignedOut") != null);
+    const blocks = app.session.transcript.blocks();
+    try std.testing.expectEqual(@as(usize, 1), blocks.len);
+    try std.testing.expect(blocks[0].event.is_error);
+}
+
+// A cancellation is the user's own stop, so it arms no retry. Esc during an attempt
+// ends the recovery, and the committed work behind it stays in history.
+test "canceling an attempt ends the recovery" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = anthropic_default,
+        .system = "",
+        .retry = .{},
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+    defer app.dropRetry();
+
+    // The state of a live attempt: the turn owns the request, so no context waits.
+    app.session.beginTurn(1);
+    app.turn_retry = true;
+    try spawnCommittedCanceledTurn(&app);
+    try app.cancelTurn();
+
+    try std.testing.expect(app.session.mode == .prompt);
+    try std.testing.expect(app.retry == null);
+    try std.testing.expect(!app.session.retry_shown);
+    try std.testing.expect(!app.turn_retry);
+    const blocks = app.session.transcript.blocks();
+    try std.testing.expectEqual(@as(usize, 1), blocks.len);
+    try std.testing.expectEqualStrings("You canceled the turn.", blocks[0].event.text.items);
+}
+
+// A retry belongs to the conversation, not to one configuration: an account switch
+// keeps it, and Ctrl+N then runs on the account the user chose. `/new` clears the
+// conversation and the retry together.
+test "a retry survives an account switch and Ctrl+N routes to it" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(home);
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{
+        .anthropic = "sk-anthropic",
+        .openai = "sk-openai",
+    });
+    defer app.accounts.deinit();
+    app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_api), .{
+        .model = anthropic_default,
+        .system = "",
+        .retry = .{},
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+    app.session.account_shown = .anthropic_api;
+    defer app.dropRetry();
+
+    app.setRetry(.{ .failure = try gpa.dupe(u8, "The provider is overloaded.") });
+    try app.applyOutcome(.{ .switch_account = .openai_api });
+    try std.testing.expect(app.retry != null);
+    try std.testing.expect(app.session.retry_shown);
+    try std.testing.expectEqualStrings(openai_default.name, app.agent.model.name);
+    try std.testing.expectEqual(@as(usize, 1), app.session.transcript.blocks().len);
+
+    // Ctrl+N reaches the turn start on the chosen account. The exhausted generation
+    // stops it there, and its rollback keeps the retry for another try.
+    app.turn_generation = std.math.maxInt(u64);
+    try std.testing.expectError(
+        error.TurnGenerationExhausted,
+        app.handleKey(&.{ .ctrl = 'n' }),
+    );
+    try std.testing.expect(app.retry != null);
+    try std.testing.expect(app.session.retry_shown);
+    try std.testing.expect(app.session.mode == .prompt);
+    try std.testing.expectEqual(@as(usize, 1), app.session.transcript.blocks().len);
+
+    try app.applyOutcome(.new_conversation);
+    try std.testing.expect(app.retry == null);
+    try std.testing.expect(!app.session.retry_shown);
+    try std.testing.expectEqual(@as(usize, 0), app.session.transcript.blocks().len);
+}
+
+// A retry owns the next request, so a `/skill:` line cannot start a generated turn
+// of its own. The shared refusal keeps the line and sends nothing.
+test "a waiting retry refuses a skill line and keeps it in the editor" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var skill = try tmp.dir.createDirPathOpen(io, ".agents/skills/demo", .{});
+    skill.close(io);
+    try tmp.dir.writeFile(io, .{
+        .sub_path = ".agents/skills/demo/SKILL.md",
+        .data = "---\nname: demo\ndescription: a test skill\n---\nbody\n",
+    });
+    const root = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(root);
+    const user_skills = try std.fs.path.join(gpa, &.{ root, "home", ".agents", "skills" });
+    defer gpa.free(user_skills);
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = anthropic_default,
+        .system = "",
+        .retry = .{},
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+    defer app.dropRetry();
+    app.skills = try ai.skills.discover(gpa, io, &.{
+        .user_root = user_skills,
+        .project_start = root,
+        .project_root = null,
+    });
+    defer app.skills.deinit();
+
+    app.retry = .{ .failure = try gpa.dupe(u8, "The provider is overloaded.") };
+    app.session.retry_shown = true;
+
+    try app.session.editor.insert("/skill:demo apply it");
+    try app.submit();
+
+    // The registry can run the line, so the notice names the one restriction that
+    // ends. It keeps the line, and it loaded no skill.
+    try std.testing.expectEqualStrings("/skill:demo apply it", app.session.editor.visible());
+    try std.testing.expectEqualStrings(
+        "The command /skill:demo cannot run while a retry waits.",
+        app.session.notice.?.content,
+    );
+    try std.testing.expectEqual(
+        ai.command.Outcome.Severity.warning,
+        app.session.notice.?.severity,
+    );
+    try std.testing.expectEqual(@as(usize, 0), app.session.transcript.blocks().len);
+    try std.testing.expect(app.retry != null);
+    try std.testing.expect(app.turn_future == null);
 }
 
 // Signed out, Pith must refuse a normal message with a /login prompt rather
@@ -5025,7 +5798,7 @@ test "a stale cache blocks one submit and keeps the prompt unchanged" {
     try std.testing.expect(std.mem.indexOf(u8, app.session.notice.?.content, "$1.15") != null);
 
     // The next preflight consumes the confirmation instead of warning again.
-    try std.testing.expect(try app.preflightModelSubmit(&risk));
+    try std.testing.expect(try app.preflightModelSubmit(&risk, cache_hint_submit));
     try std.testing.expect(!app.session.takeCacheConfirmation());
 
     // Any other user key cancels a later confirmation.
@@ -5088,7 +5861,7 @@ test "a stale cache keeps the send-as-a-message confirmation" {
     // Enter 3 opens both gates, so it starts the turn instead of warning again.
     // The turn spawn itself stays out of this test.
     try std.testing.expect(app.session.takeMessageConfirmation());
-    try std.testing.expect(try app.preflightModelSubmit(&risk));
+    try std.testing.expect(try app.preflightModelSubmit(&risk, cache_hint_submit));
 }
 
 test "a cache warning names its retention in the largest whole unit" {

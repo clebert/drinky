@@ -31,15 +31,23 @@ pub const Skill = struct {
         self.* = undefined;
     }
 
+    /// One explicit invocation: the expanded request and the size of the file
+    /// that it carries. The transcript marker reports that size, because the
+    /// file itself never reaches the screen.
+    pub const Invocation = struct {
+        content: []u8,
+        file_bytes: usize,
+    };
+
     /// Load this skill's complete `SKILL.md`. Identify its base directory for
     /// relative resources. Append explicit invocation arguments. `gpa` owns
-    /// the returned prompt.
+    /// the returned content.
     pub fn invoke(
         self: *const Skill,
         gpa: std.mem.Allocator,
         io: std.Io,
         arguments: []const u8,
-    ) ![]u8 {
+    ) !Invocation {
         const data = try std.Io.Dir.cwd().readFileAlloc(
             io,
             self.path,
@@ -66,7 +74,7 @@ pub const Skill = struct {
             try output.writer.writeByte('\n');
             try output.writer.writeAll(arguments);
         }
-        return output.toOwnedSlice();
+        return .{ .content = try output.toOwnedSlice(), .file_bytes = data.len };
     }
 };
 
@@ -847,9 +855,9 @@ test "invalid names fall back, empty descriptions skip, and hidden skills stay o
 
     const manual = registry.get("manual").?;
     const explicit = try manual.invoke(gpa, io, "");
-    defer gpa.free(explicit);
-    try std.testing.expect(std.mem.indexOf(u8, explicit, manual.path) != null);
-    try std.testing.expect(std.mem.indexOf(u8, explicit, "body") != null);
+    defer gpa.free(explicit.content);
+    try std.testing.expect(std.mem.indexOf(u8, explicit.content, manual.path) != null);
+    try std.testing.expect(std.mem.indexOf(u8, explicit.content, "body") != null);
 }
 
 test "explicit invocation loads the full file and appends arguments" {
@@ -874,12 +882,17 @@ test "explicit invocation loads the full file and appends arguments" {
     defer registry.deinit();
 
     const skill = registry.get("invoke").?;
-    const prompt = try skill.invoke(gpa, io, "apply it to report.pdf");
-    defer gpa.free(prompt);
+    const invocation = try skill.invoke(gpa, io, "apply it to report.pdf");
+    defer gpa.free(invocation.content);
+    const prompt = invocation.content;
     try std.testing.expect(std.mem.startsWith(u8, prompt, "Skill location: "));
     try std.testing.expect(std.mem.indexOf(u8, prompt, skill.path) != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, source) != null);
     try std.testing.expect(std.mem.endsWith(u8, prompt, "\napply it to report.pdf"));
+    // The reported size is the file alone, without the header and the arguments
+    // that the expansion adds around it.
+    try std.testing.expectEqual(source.len, invocation.file_bytes);
+    try std.testing.expect(invocation.file_bytes < prompt.len);
 }
 
 test "discovery follows directory symlinks once and skips cycles" {

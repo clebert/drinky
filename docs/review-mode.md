@@ -12,7 +12,8 @@ Land these shared features before review mode:
 
 Each feature must use the normal app path. Review mode must not implement a private variant.
 
-The command refusal path below already exists. Review mode uses it.
+The command refusal path below already exists. Review mode uses it. Failure recovery and retry
+landed too, so only active context projection and conversation switching remain.
 
 ### Active context projection
 
@@ -47,6 +48,8 @@ claim to clear provider cache storage.
 
 ### Failure recovery and retry
 
+Status: Landed, except the generated-request row below, which waits for `/review`.
+
 A request enters recovery after its normal transport retries fail. A checkpoint contains committed
 work from the failed turn.
 
@@ -56,6 +59,16 @@ work from the failed turn.
 | Pith-generated request | No         | Restore only human steering.        | Resend the generated request.   | Send the request plus the editor text. |
 | Any request            | Yes        | Restore uncommitted human steering. | Send a generated retry request. | Send a retry request plus editor text. |
 
+A `/skill:` line takes the human row, because that line reproduces its own request. The generated
+row belongs to a request that no editor line holds, and `/review` is the first one.
+
+A failed attempt keeps the retry, because the work that it continues from stays in history. Its own
+failure sentence replaces the sentence before it. A canceled attempt ends the recovery instead,
+because the user stopped that turn and a cancellation arms no retry.
+
+An attempt rewrites the prompt cache like any other request, so it takes the same stale-cache
+warning. The first Ctrl+N reports the extra cost, and the next one sends.
+
 Blank Enter has no action. Ctrl+N never sends the editor text and never clears it.
 
 A non-blank Enter clears the editor only after the turn starts. If that turn fails before a
@@ -63,8 +76,8 @@ checkpoint, Pith restores only its human text. A generated request or retry wrap
 
 If the turn commits a checkpoint, its human text remains in immutable history.
 
-A generated request that has no checkpoint stays outside the editor. This rule applies to review
-requests, `/skill:` prompts, and future generated workflows.
+A generated request that has no checkpoint and no editor line stays outside the editor. This rule
+applies to review requests and future generated workflows.
 
 A committed retry uses this provider `user` message:
 
@@ -84,6 +97,10 @@ older retry request.
 
 Retry never rewrites committed conversation history. Earlier retry requests, tool calls, results,
 reasoning, and human messages remain in order.
+
+Each attempt records one local event that names what it sends. The complete request stays out of the
+transcript, as a `/skill:` line keeps its expanded file out of it. An attempt that commits nothing
+takes its own blocks out again, so the transcript keeps only the failure events.
 
 Failure events are local transcript events. They remain visible after success and across model
 switches. The model sees an error only through a generated retry request.
@@ -107,10 +124,12 @@ Main prompt controls during retry are:
 - Esc: Discard retry context and preserve the editor.
 - `/model`, `/effort`, `/login`, `/logout`, `/colors`, and `/system`: Run and preserve retry.
 - `/new`: Clear the conversation and retry context.
-- `/review` and `/skill:`: Refuse until retry completes or Esc discards it.
+- `/skill:`: Refuse until retry completes or Esc discards it. `/review` takes the same refusal.
+
+A retry needs an active account, so a signed-out Ctrl+N names the sign-in and keeps the context.
 
 Retry context survives an account, model, or effort switch. The next attempt uses the selected
-configuration and the projected history.
+configuration.
 
 Every failed attempt and retry keeps its reported usage and cost. Pith does not track retry
 duration.

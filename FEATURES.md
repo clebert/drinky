@@ -22,6 +22,8 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - A tool call left unfinished is recorded as an error, so a canceled mutation is never lost
   silently.
 - Timeouts and transient failures retry the whole request and clear the partial reply first.
+- A failed turn that committed work arms a retry above the editor. Ctrl+N asks the model to
+  continue, Enter adds the editor text, and Esc discards the retry.
 - A reply cut short by the output cap is kept, and reported as cut short.
 - Model-side failures — a refusal, an empty reply, the round cap — read as a plain sentence rather
   than an internal error.
@@ -110,8 +112,8 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
   scrollable full-window page. `M` toggles its exact source.
 - **/colors** — preview ANSI slots 0 to 15, colored backgrounds, default styles, message boxes,
   text roles, and input frames in a scrollable full-window page.
-- **/skill:name** — load a discovered skill explicitly, record a compact `Skill:` marker, and append
-  any trailing text as its task.
+- **/skill:name** — load a discovered skill explicitly, record a `Skill:` marker with the size and
+  the source of the loaded file, and append any trailing text as its task.
 - Every line that starts with a slash is a command line, so Pith reads it locally first and sends it
   only after a confirmation. A command that takes no argument refuses text after the name, as in
   `/new must clear the scrollback`. `/skill:name` is the one exception, because it takes its task as
@@ -125,8 +127,8 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
   in the editor for a new offer.
 - Successful model, effort, login, logout, and account changes are recorded as transcript events.
 - A local command failure temporarily replaces the footer until the next user action.
-- A command that can run stays in the editor while a turn runs, and one notice names the command and
-  the restriction. The next Enter runs it after the turn ends.
+- A command that can run stays in the editor while a turn runs or a retry waits, and one notice
+  names the command and the restriction. The next Enter runs it once the restriction ends.
 
 ## Providers
 

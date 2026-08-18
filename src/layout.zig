@@ -27,6 +27,7 @@ const id_status = id_reserved;
 const id_input = id_reserved + 1;
 const id_steering = id_reserved + 2;
 const id_page = id_reserved + 3;
+const id_hint = id_reserved + 4;
 
 /// The anchor id of the tool box at `index` in the running turn. Grows downward
 /// from just below the fixed ids, so it never wraps past `maxInt` however many
@@ -52,9 +53,16 @@ pub const Scene = union(enum) {
 /// live under a streaming `turn`'s chrome (for steering), or a `picker` that owns
 /// the region.
 pub const Tail = union(enum) {
-    prompt: *const ui.Editor,
+    prompt: Prompt,
     turn: Turn,
     picking: *const ui.Picker,
+
+    /// An idle prompt: the editor, and above it one optional control hint, such
+    /// as the hint of a waiting retry.
+    pub const Prompt = struct {
+        hint: ?[]const u8,
+        editor: *const ui.Editor,
+    };
 
     /// A streaming turn: the running tool calls, the steering queue, then the
     /// editor with activity that crosses its separators.
@@ -77,6 +85,8 @@ const Component = union(enum) {
     entry: *const ui.block.Entry,
     tool_box: []const u8,
     steering: []const []const u8,
+    /// A muted control-hint row above the input.
+    hint: []const u8,
     editor: EditorPresentation,
     picker: *const ui.Picker,
     status: *const ui.status.Info,
@@ -89,6 +99,7 @@ const Component = union(enum) {
             .entry => |entry| entry.rows(size.columns),
             .tool_box => |text| ui.paint.boxRows(text, size.columns),
             .steering => |messages| ui.paint.steeringRows(messages),
+            .hint => |text| std.mem.count(u8, text, "\n") + 1,
             .editor => |presentation| presentation.editor.rows(size),
             .status => 1,
             .picker => |picker| picker.rows(size),
@@ -106,6 +117,10 @@ const Component = union(enum) {
             .entry => |entry| try entry.render(placement),
             .tool_box => |text| try ui.paint.box(placement, .tool_pending, text),
             .steering => |messages| try ui.paint.steering(placement, messages),
+            .hint => |text| try ui.paint.notice(placement, &.{
+                .role = .muted,
+                .prefix = "",
+            }, text),
             .status => |info| try ui.status.render(placement, info),
             .editor => |presentation| try presentation.editor.render(placement, &.{
                 .viewport_rows = viewport_rows,
@@ -183,7 +198,8 @@ fn projectConversation(
 /// How many components the tail contributes.
 fn tailCount(tail: *const Tail) usize {
     return switch (tail.*) {
-        .prompt, .picking => 1,
+        .prompt => |prompt| 1 + @as(usize, @intFromBool(prompt.hint != null)),
+        .picking => 1,
         .turn => |turn| turn.tools.len + 1 + @intFromBool(turn.steering.len > 0),
     };
 }
@@ -202,11 +218,20 @@ fn slotAt(scene: *const Scene.Conversation, index: usize) Slot {
 }
 
 /// The tail component at `offset`, in screen order: for a turn the tool boxes,
-/// then the steering queue (when non-empty), then the live editor. Otherwise the
-/// sole input.
+/// then the steering queue (when non-empty), then the live editor. For a prompt
+/// its hint row (when present), then the editor. Otherwise the sole input.
 fn tailSlot(tail: *const Tail, offset: usize) Slot {
     switch (tail.*) {
-        .prompt => |editor| return editorSlot(&.{ .editor = editor, .activity = null }),
+        .prompt => |prompt| {
+            if (prompt.hint) |text| {
+                if (offset == 0) return .{
+                    .component = .{ .hint = text },
+                    .id = id_hint,
+                    .leading_blank = true,
+                };
+            }
+            return editorSlot(&.{ .editor = prompt.editor, .activity = null });
+        },
         .picking => |picker| return .{
             .component = .{ .picker = picker },
             .id = id_input,
@@ -278,7 +303,7 @@ test "projection stacks the transcript above the tail, newest at the bottom" {
 
     const scene: Scene = .{ .conversation = .{
         .transcript = entries.items,
-        .tail = .{ .prompt = &editor },
+        .tail = .{ .prompt = .{ .hint = null, .editor = &editor } },
         .status = &test_status,
     } };
     const painted = try projected(gpa, .{ .columns = 40, .rows = 24 }, &scene);
@@ -334,7 +359,7 @@ test "separator activity does not change the input tail height" {
 
     const prompt: Scene = .{ .conversation = .{
         .transcript = &.{},
-        .tail = .{ .prompt = &editor },
+        .tail = .{ .prompt = .{ .hint = null, .editor = &editor } },
         .status = &test_status,
     } };
     const turn: Scene = .{ .conversation = .{
@@ -412,6 +437,55 @@ test "a turn tail shows the steering queue above the editor" {
     try std.testing.expect(hint < footer);
 }
 
+// A prompt tail with a hint shows that one row above the editor frame and keeps
+// the transcript above it. A prompt without a hint contributes the editor alone.
+test "a prompt tail shows its hint row above the editor" {
+    const gpa = std.testing.allocator;
+    var editor = ui.Editor.init(gpa);
+    defer editor.deinit();
+    try editor.insert("draft text");
+
+    var entries: std.ArrayList(ui.block.Entry) = .empty;
+    defer {
+        for (entries.items) |*entry| entry.deinit(gpa);
+        entries.deinit(gpa);
+    }
+    try entries.append(gpa, try ui.block.Entry.init(gpa, .event, true, "the turn failed"));
+
+    const scene: Scene = .{ .conversation = .{
+        .transcript = entries.items,
+        .tail = .{ .prompt = .{
+            .hint = "Ctrl+N: Try again · Esc: Dismiss",
+            .editor = &editor,
+        } },
+        .status = &test_status,
+    } };
+    const painted = try projected(gpa, .{ .columns = 40, .rows = 24 }, &scene);
+    defer gpa.free(painted);
+
+    const failure = std.mem.indexOf(u8, painted, "the turn failed").?;
+    const hint = std.mem.indexOf(u8, painted, "Ctrl+N: Try again").?;
+    const draft = std.mem.indexOf(u8, painted, "draft text").?;
+    const footer = std.mem.indexOf(u8, painted, "footerqq").?;
+    try std.testing.expect(failure < hint);
+    try std.testing.expect(hint < draft);
+    try std.testing.expect(draft < footer);
+
+    const bare: Scene = .{ .conversation = .{
+        .transcript = entries.items,
+        .tail = .{ .prompt = .{ .hint = null, .editor = &editor } },
+        .status = &test_status,
+    } };
+    const without = try projected(gpa, .{ .columns = 40, .rows = 24 }, &bare);
+    defer gpa.free(without);
+    try std.testing.expect(std.mem.indexOf(u8, without, "Ctrl+N") == null);
+    // The hint costs its own row and the blank that separates it.
+    try std.testing.expectEqual(
+        ui.block.paintedRows(painted),
+        ui.block.paintedRows(without) + 2,
+    );
+}
+
 // Regression: a window narrower than the "Queued message: " label must not emit
 // a row wider than the width. The sink asserts every row fits.
 test "a narrow window clips the steering rows to width" {
@@ -453,7 +527,7 @@ test "projection clips the oldest block to fill the window exactly" {
 
     const scene: Scene = .{ .conversation = .{
         .transcript = entries.items,
-        .tail = .{ .prompt = &editor },
+        .tail = .{ .prompt = .{ .hint = null, .editor = &editor } },
         .status = &test_status,
     } };
     const rows: usize = 4;

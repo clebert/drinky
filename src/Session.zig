@@ -23,6 +23,10 @@ const Session = @This();
 const truncated_event =
     "The response is incomplete. The model reached an output or context limit.";
 
+/// The row above the editor while a retry waits. It names the two keys that own
+/// the retry, because Enter belongs to the editor text.
+const retry_hint = "Ctrl+N: Try again · Esc: Dismiss";
+
 gpa: std.mem.Allocator,
 transcript: Transcript,
 /// The sole transient notice. Its owned content never enters the transcript.
@@ -94,6 +98,9 @@ steering_view: std.ArrayList([]const u8),
 /// or canceled turn that committed nothing returns it to the editor. Every
 /// other terminal frees it because the prompt belongs to committed history.
 turn_origin: ?TurnOrigin,
+/// Whether a retry context waits at the prompt. `App` owns that context and
+/// mirrors this bit, so the hint row above the editor names its controls.
+retry_shown: bool,
 
 const Mode = union(enum) {
     prompt,
@@ -261,6 +268,7 @@ pub fn init(
         .steering_consumed_count = 0,
         .steering_view = .empty,
         .turn_origin = null,
+        .retry_shown = false,
     };
     self.page_view.preserveScrollback();
     return self;
@@ -596,14 +604,21 @@ pub fn recallSteering(self: *Session, pending_count: usize) void {
     self.markEdited();
 }
 
+/// Set the live turn's initial transcript checkpoint, so an abnormal exit that
+/// commits nothing removes the blocks that the turn appended. A turn whose request
+/// never sat in the editor, such as a retry that Ctrl+N sent, needs this alone.
+pub fn markTurnBase(self: *Session, transcript_base: usize) void {
+    const turn = self.activeTurn() orelse unreachable;
+    std.debug.assert(transcript_base <= self.transcript.blocks().len);
+    turn.transcript_checkpoint = transcript_base;
+}
+
 /// Retain the submitted prompt's rich draft and set the turn's initial transcript
 /// checkpoint. An abnormal exit that commits nothing can then return the prompt.
 /// Takes ownership of `prompt` and leaves it empty.
 pub fn retainTurnPrompt(self: *Session, prompt: *ui.Editor.Draft, transcript_base: usize) void {
     std.debug.assert(self.turn_origin == null);
-    const turn = self.activeTurn() orelse unreachable;
-    std.debug.assert(transcript_base <= self.transcript.blocks().len);
-    turn.transcript_checkpoint = transcript_base;
+    self.markTurnBase(transcript_base);
     self.turn_origin = .{ .prompt = prompt.* };
     prompt.* = .empty;
 }
@@ -849,7 +864,10 @@ pub fn paint(self: *Session, size: terminal.View.Size) !void {
     const tail: layout.Tail = switch (self.mode) {
         .prompt => prompt: {
             self.editor.reflow(size);
-            break :prompt .{ .prompt = &self.editor };
+            break :prompt .{ .prompt = .{
+                .hint = if (self.retry_shown) retry_hint else null,
+                .editor = &self.editor,
+            } };
         },
         .turn => |*turn| turn: {
             self.editor.reflow(size);

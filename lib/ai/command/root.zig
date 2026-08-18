@@ -49,6 +49,13 @@ pub fn parse(line: []const u8) ?[]const u8 {
     return body[0..end];
 }
 
+/// Whether `name` names the command that expands a skill into a generated request.
+/// A caller that cannot host such a request refuses the line before it runs. `name`
+/// must come from `parse(line)`.
+pub fn loadsSkill(name: []const u8) bool {
+    return std.mem.startsWith(u8, name, skill_prefix);
+}
+
 /// The text after the command name, without its edge whitespace. `name` must come
 /// from `parse(line)`, so it starts at the second byte of the line.
 fn tail(line: []const u8, name: []const u8) []const u8 {
@@ -75,7 +82,7 @@ fn lookup(name: []const u8) ?*const Entry {
 /// can offer to send the line to the model as typed.
 pub fn check(context: *Context, line: []const u8) !?Outcome.Message {
     const name = parse(line) orelse return null;
-    if (std.mem.startsWith(u8, name, skill_prefix)) return try checkSkill(context, name);
+    if (loadsSkill(name)) return try checkSkill(context, name);
     if (lookup(name) == null) return try unknownCommand(context.gpa, name);
     if (tail(line, name).len > 0) return try Outcome.Message.print(
         context.gpa,
@@ -94,7 +101,7 @@ pub fn run(context: *Context, line: []const u8) !?Outcome {
     if (try check(context, line)) |refusal| return .{ .refusal = refusal };
     // `check` accepted the line, so every lookup below holds. This is the one place
     // that resolves a name, so no other function carries that invariant.
-    if (std.mem.startsWith(u8, name, skill_prefix)) {
+    if (loadsSkill(name)) {
         const skill = context.skill_registry.?.get(name[skill_prefix.len..]).?;
         return try runSkill(context, skill, tail(line, name));
     }
@@ -159,7 +166,7 @@ fn unknownSkill(gpa: std.mem.Allocator, name: []const u8) !Outcome.Message {
 /// Expand `skill` with its optional task into a user turn. The caller resolved the
 /// skill, so this function holds no name invariant.
 fn runSkill(context: *Context, skill: *const skills.Skill, arguments: []const u8) !Outcome {
-    const content = skill.invoke(context.gpa, context.io, arguments) catch |err| {
+    const invocation = skill.invoke(context.gpa, context.io, arguments) catch |err| {
         if (err == error.Canceled or err == error.OutOfMemory) return err;
         // A failure, not a warning: the name is right and the load broke, so the
         // way forward is another try, not a send to the model.
@@ -170,15 +177,18 @@ fn runSkill(context: *Context, skill: *const skills.Skill, arguments: []const u8
             .{ skill.name, @errorName(err) },
         ) };
     };
-    errdefer context.gpa.free(content);
+    errdefer context.gpa.free(invocation.content);
     const name_copy = try context.gpa.dupe(u8, skill.name);
     errdefer context.gpa.free(name_copy);
     const arguments_copy = try context.gpa.dupe(u8, arguments);
     errdefer context.gpa.free(arguments_copy);
+    const source_copy = try context.gpa.dupe(u8, skill.path);
     return .{ .prompt = .{
         .name = name_copy,
         .arguments = arguments_copy,
-        .content = content,
+        .content = invocation.content,
+        .source = source_copy,
+        .source_bytes = invocation.file_bytes,
     } };
 }
 

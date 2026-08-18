@@ -84,11 +84,18 @@ pub const Outcome = union(enum) {
         name: []const u8,
         arguments: []const u8,
         content: []const u8,
+        /// The file that Pith expanded into `content`. The transcript marker names
+        /// it, because `content` itself never reaches the screen.
+        source: []const u8,
+        /// The size of that file in bytes, without the header and the arguments
+        /// that `content` adds around it.
+        source_bytes: usize,
 
         pub fn deinit(self: *const Prompt, gpa: std.mem.Allocator) void {
             gpa.free(self.name);
             gpa.free(self.arguments);
             gpa.free(self.content);
+            gpa.free(self.source);
         }
     };
 

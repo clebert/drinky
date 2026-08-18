@@ -74,6 +74,9 @@ pub const Entry = union(enum) {
             .skill => |text| try paint.notice(placement, &.{
                 .role = .accent,
                 .prefix = "Skill: ",
+                // The head names the block once. Its later rows carry the source
+                // and the size, so an indent groups them under that head.
+                .continuation = "  ",
             }, text.items),
             .tool_result => |flagged| try paint.box(
                 placement,
@@ -152,7 +155,8 @@ test "each entry variant renders exactly the rows it counts" {
         .{ .kind = .event, .is_error = true, .text = "boom" },
         .{ .kind = .user, .is_error = false, .text = "a user message long enough to wrap " ++
             "across the narrow test width more than once" },
-        .{ .kind = .skill, .is_error = false, .text = "zig-style" },
+        .{ .kind = .skill, .is_error = false, .text = "zig-style · Size: 3.1 KB\n" ++
+            "Source: .agents/skills/zig-style/SKILL.md" },
         .{ .kind = .model, .is_error = false, .text = "model reply\nwith a blank\n\n" ++
             "then a long paragraph that must wrap several rows" },
         .{ .kind = .thinking, .is_error = false, .text = "reasoning that runs on\n\n" ++
@@ -177,13 +181,20 @@ test "each entry variant renders exactly the rows it counts" {
     }
 }
 
-test "a skill entry renders as one compact loaded marker" {
+// The head names the marker once. The source row below it takes an indent, so no
+// row repeats the tag and the two rows read as one block.
+test "a skill entry names its head once and indents the rows below it" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
     var view = terminal.View.init(gpa, &out.writer);
     defer view.deinit();
-    var entry = try Entry.init(gpa, .skill, false, "zig-style");
+    var entry = try Entry.init(
+        gpa,
+        .skill,
+        false,
+        "zig-style · Size: 3.1 KB\nSource: .agents/skills/zig-style/SKILL.md",
+    );
     defer entry.deinit(gpa);
 
     const sink = try view.beginFrame(.{ .columns = 40, .rows = 24 }, 8);
@@ -196,8 +207,11 @@ test "a skill entry renders as one compact loaded marker" {
     });
     try view.render();
 
-    try std.testing.expectEqual(@as(usize, 1), entry.rows(40));
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "Skill: zig-style") != null);
+    try std.testing.expectEqual(@as(usize, 2), entry.rows(40));
+    const painted = out.written();
+    try std.testing.expect(std.mem.indexOf(u8, painted, "Skill: zig-style · Size: 3.1 KB") != null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "  Source: .agents/skills") != null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "Skill: Source:") == null);
 }
 
 // The clip drops its top `skip` rows and shows the rest.

@@ -3,6 +3,7 @@
 
 const std = @import("std");
 
+const format = @import("../format.zig");
 const llm = @import("../llm.zig");
 const Context = @import("Context.zig");
 const Result = @import("Result.zig");
@@ -151,7 +152,7 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
     }
 
     var size_buffer: [16]u8 = undefined;
-    const size = humanBytes(&size_buffer, body_bytes);
+    const size = format.bytes(&size_buffer, body_bytes);
     const remaining = total - (last + 1);
     const truncation_suffix = if (truncated) " · Line: Truncated" else "";
     const summary = if (start == 0 and remaining == 0)
@@ -187,23 +188,6 @@ fn lineCount(text: []const u8) usize {
     if (text.len == 0) return 0;
     const newlines = std.mem.count(u8, text, "\n");
     return if (text[text.len - 1] == '\n') newlines else newlines + 1;
-}
-
-/// A compact byte size for the box summary: bytes under 1 KB, else KB or MB to
-/// one decimal. Integer math throughout. `buffer` needs only a dozen bytes, and
-/// a read window is far too small to overflow the tenths scaling.
-fn humanBytes(buffer: []u8, bytes: usize) []const u8 {
-    if (bytes < 1024) return std.fmt.bufPrint(buffer, "{d} B", .{bytes}) catch unreachable;
-    const tenths_kb = @divFloor(bytes * 10, 1024);
-    if (tenths_kb < 10 * 1024) return std.fmt.bufPrint(buffer, "{d}.{d} KB", .{
-        @divFloor(tenths_kb, 10),
-        @mod(tenths_kb, 10),
-    }) catch unreachable;
-    const tenths_mb = @divFloor(bytes * 10, 1024 * 1024);
-    return std.fmt.bufPrint(buffer, "{d}.{d} MB", .{
-        @divFloor(tenths_mb, 10),
-        @mod(tenths_mb, 10),
-    }) catch unreachable;
 }
 
 test "read rejects invalid input" {

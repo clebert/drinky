@@ -75,8 +75,6 @@ decision already taken, or a dependency on another entry. Module layout and exte
 
 - **Active context projection** — Pith filters one canonical history for the active account and
   model, then deeply repaints its transcript.
-- **Failure recovery and retry** — Ctrl+N retries committed work or a generated request without
-  sending editor text, and Enter can add that text to the retry.
 - **Conversation switching** — Pith selects the agent, history, transcript, and status through one
   shared operation, then applies active context projection.
 - **`/review`** — a bounded workflow reviews pending changes with a fresh reviewer, a persistent
