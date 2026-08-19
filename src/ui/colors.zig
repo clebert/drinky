@@ -154,7 +154,7 @@ const items = blk: {
             .underline = true,
             .text = "https://example.com",
         } },
-        .{ .sample = .{ .label = "Accent", .name = .accent, .text = "Skill: zig-style" } },
+        .{ .sample = .{ .label = "Accent", .name = .accent, .text = "Queued message:" } },
         .{ .sample = .{ .label = "Warning", .name = .warning, .text = "Enter: Send anyway" } },
         .{ .sample = .{ .label = "Error", .name = .@"error", .text = "Error: the tool failed." } },
         .blank,

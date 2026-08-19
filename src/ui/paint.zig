@@ -19,15 +19,11 @@ const activity_growth_interval_ticks: u64 = 6;
 // At 16 ms per frame, show the caret about 600 ms and hide it about 600 ms.
 const caret_blink_ticks: u64 = 37;
 
-/// A notice's look: the role that colors every line, a prefix (an error tag, or
-/// empty) before the first line, and the prefix of every line after it.
+/// A notice's look: the role that colors every line, and a prefix (an error tag,
+/// or empty) before each line.
 const Notice = struct {
     role: role.Name,
     prefix: []const u8,
-    /// The prefix of every line after the first. Null repeats `prefix`, which is
-    /// what a tag on each line of an error does. A head that names its block once
-    /// gives an indent here instead.
-    continuation: ?[]const u8 = null,
 };
 
 /// Where a component composes its rows: the sink to write into, the anchor `id`
@@ -110,16 +106,14 @@ fn lineText(line: []const u8) []const u8 {
 }
 
 /// Each `\n`-separated line of `text`, styled and truncated to one row, with the
-/// notice's prefix before the first line and its continuation before the rest (a
-/// notice, error, or the intro).
+/// notice's prefix before every line (a notice, error, or the intro).
 pub fn notice(placement: *const Placement, look: *const Notice, text: []const u8) !void {
     var pieces = std.mem.splitScalar(u8, text, '\n');
     var index: usize = 0;
     while (pieces.next()) |piece| : (index += 1) {
         const line = placement.base + index;
         if (line < placement.skip) continue;
-        const prefix = if (index == 0) look.prefix else look.continuation orelse look.prefix;
-        const shown_prefix = terminal.width.truncate(prefix, placement.columns);
+        const shown_prefix = terminal.width.truncate(look.prefix, placement.columns);
         // Saturating: a cluster wider than the whole budget survives `truncate`
         // as a one-column replacement but measures its true width here. A prefix
         // that opens on one can then report more columns than the row has.

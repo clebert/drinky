@@ -16,7 +16,6 @@ const role = @import("role.zig");
 pub const Entry = union(enum) {
     intro: std.ArrayList(u8),
     user: std.ArrayList(u8),
-    skill: std.ArrayList(u8),
     thinking: std.ArrayList(u8),
     model: std.ArrayList(u8),
     tool_result: Flagged,
@@ -68,7 +67,7 @@ pub const Entry = union(enum) {
 
     pub fn deinit(self: *Entry, gpa: std.mem.Allocator) void {
         switch (self.*) {
-            .intro, .user, .skill, .thinking, .model => |*text| text.deinit(gpa),
+            .intro, .user, .thinking, .model => |*text| text.deinit(gpa),
             .tool_result, .event => |*flagged| flagged.text.deinit(gpa),
         }
     }
@@ -78,7 +77,7 @@ pub const Entry = union(enum) {
     /// and window math rely on.
     pub fn rows(self: *const Entry, columns: usize) usize {
         return switch (self.*) {
-            .intro, .skill => |text| std.mem.count(u8, text.items, "\n") + 1,
+            .intro => |text| std.mem.count(u8, text.items, "\n") + 1,
             .event => |flagged| std.mem.count(u8, flagged.text.items, "\n") + 1,
             .user => |text| paint.boxRows(&.{ .text = text.items }, columns),
             .tool_result => |flagged| paint.boxRows(
@@ -102,13 +101,6 @@ pub const Entry = union(enum) {
                 .prefix = if (flagged.is_error) "Error: " else "",
             }, flagged.text.items),
             .user => |text| try paint.box(placement, .user, &.{ .text = text.items }),
-            .skill => |text| try paint.notice(placement, &.{
-                .role = .accent,
-                .prefix = "Skill: ",
-                // The head names the block once. Its later rows carry the source
-                // and the size, so an indent groups them under that head.
-                .continuation = "  ",
-            }, text.items),
             .tool_result => |flagged| try paint.box(
                 placement,
                 if (flagged.is_error) .tool_error else .tool_success,
@@ -186,8 +178,9 @@ test "each entry variant renders exactly the rows it counts" {
         .{ .kind = .event, .options = .{ .is_error = true }, .text = "boom" },
         .{ .kind = .user, .options = .{}, .text = "a user message long enough to wrap " ++
             "across the narrow test width more than once" },
-        .{ .kind = .skill, .options = .{}, .text = "zig-style · Size: 3.1 KB\n" ++
-            "Source: .agents/skills/zig-style/SKILL.md" },
+        // The user box of a skill invocation: a head row, a blank row, the task.
+        .{ .kind = .user, .options = .{}, .text = "Skill: zig-style · File: " ++
+            ".agents/skills/zig-style/SKILL.md\n\nreview this file" },
         .{ .kind = .model, .options = .{}, .text = "model reply\nwith a blank\n\n" ++
             "then a long paragraph that must wrap several rows" },
         .{ .kind = .thinking, .options = .{}, .text = "reasoning that runs on\n\n" ++
@@ -222,39 +215,6 @@ test "each entry variant renders exactly the rows it counts" {
             try std.testing.expectEqual(entry.rows(columns), painted);
         }
     }
-}
-
-// The head names the marker once. The source row below it takes an indent, so no
-// row repeats the tag and the two rows read as one block.
-test "a skill entry names its head once and indents the rows below it" {
-    const gpa = std.testing.allocator;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var view = terminal.View.init(gpa, &out.writer);
-    defer view.deinit();
-    var entry = try Entry.init(
-        gpa,
-        .skill,
-        .{},
-        "zig-style · Size: 3.1 KB\nSource: .agents/skills/zig-style/SKILL.md",
-    );
-    defer entry.deinit(gpa);
-
-    const sink = try view.beginFrame(.{ .columns = 40, .rows = 24 }, 8);
-    try entry.render(&.{
-        .sink = sink,
-        .id = 0,
-        .columns = 40,
-        .base = 0,
-        .skip = 0,
-    });
-    try view.render();
-
-    try std.testing.expectEqual(@as(usize, 2), entry.rows(40));
-    const painted = out.written();
-    try std.testing.expect(std.mem.indexOf(u8, painted, "Skill: zig-style · Size: 3.1 KB") != null);
-    try std.testing.expect(std.mem.indexOf(u8, painted, "  Source: .agents/skills") != null);
-    try std.testing.expect(std.mem.indexOf(u8, painted, "Skill: Source:") == null);
 }
 
 // The same padding everywhere: a copy of a reasoning row starts at the column a

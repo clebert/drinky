@@ -116,8 +116,8 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
   scrollable full-window page. `M` toggles its exact source.
 - **/colors** — preview ANSI slots 0 to 15, colored backgrounds, default styles, message boxes, text
   roles, and input frames in a scrollable full-window page.
-- **/skill:name** — load a discovered skill explicitly, record a `Skill:` marker with the size and
-  the source of the loaded file, and append any trailing text as its task.
+- **/skill:name** — load a discovered skill explicitly, record one user box whose head reads
+  `Skill: name · File: path`, and append any trailing text as its task below that head.
 - Every line that starts with a slash is a command line, so Pith reads it locally first and sends it
   only after a confirmation. A command that takes no argument refuses text after the name, as in
   `/new must clear the scrollback`. `/skill:name` is the one exception, because it takes its task as
@@ -224,8 +224,8 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
   `Status:` in place of the code. A non-zero exit takes no `Error:` prefix, because the line names
   its own state. The box still paints the failure, and the model still reads the result as one.
 - Every box row starts at the first column, like an editor row and a reasoning row, so a terminal
-  copy of them lines up. An indent appears only where it groups rows under a head, as in a skill
-  block or a markdown list.
+  copy of them lines up. An indent appears only where it groups rows under a head, as in a markdown
+  list.
 - One heavy activity segment moves across both open input separators in a loop and grows as progress
   goes quiet without adding a layout row.
 - Pith blinks the input caret while a turn runs, because a terminal holds its own cursor solid under

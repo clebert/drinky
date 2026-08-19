@@ -166,7 +166,7 @@ fn unknownSkill(gpa: std.mem.Allocator, name: []const u8) !Outcome.Message {
 /// Expand `skill` with its optional task into a user turn. The caller resolved the
 /// skill, so this function holds no name invariant.
 fn runSkill(context: *Context, skill: *const skills.Skill, arguments: []const u8) !Outcome {
-    const invocation = skill.invoke(context.gpa, context.io, arguments) catch |err| {
+    const content = skill.invoke(context.gpa, context.io, arguments) catch |err| {
         if (err == error.Canceled or err == error.OutOfMemory) return err;
         // A failure, not a warning: the name is right and the load broke, so the
         // way forward is another try, not a send to the model.
@@ -177,7 +177,7 @@ fn runSkill(context: *Context, skill: *const skills.Skill, arguments: []const u8
             .{ skill.name, @errorName(err) },
         ) };
     };
-    errdefer context.gpa.free(invocation.content);
+    errdefer context.gpa.free(content);
     const name_copy = try context.gpa.dupe(u8, skill.name);
     errdefer context.gpa.free(name_copy);
     const arguments_copy = try context.gpa.dupe(u8, arguments);
@@ -186,9 +186,8 @@ fn runSkill(context: *Context, skill: *const skills.Skill, arguments: []const u8
     return .{ .prompt = .{
         .name = name_copy,
         .arguments = arguments_copy,
-        .content = invocation.content,
+        .content = content,
         .source = source_copy,
-        .source_bytes = invocation.file_bytes,
     } };
 }
 

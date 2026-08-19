@@ -1780,7 +1780,7 @@ fn retentionText(retention_ms: u64) struct { count: u64, unit: []const u8 } {
     return .{ .count = retention_ms, .unit = "ms" };
 }
 
-/// Record the skill marker and its optional user task, then spawn the turn over
+/// Record the user message of one skill invocation, then spawn the turn over
 /// the expanded skill content. Returns the rich draft's rewind checkpoint.
 fn startSkillTurn(self: *App, prompt: *const ai.command.Outcome.Prompt) !usize {
     const base = try self.appendSkillPrompt(prompt);
@@ -1790,33 +1790,31 @@ fn startSkillTurn(self: *App, prompt: *const ai.command.Outcome.Prompt) !usize {
     return base;
 }
 
-/// Record what one skill invocation sends: the marker that names the skill, its
-/// source, and its size, then the user task under it. The expanded file itself
-/// stays out of the transcript, so the marker is the only sign of its size.
+/// Record what one skill invocation sends. The request is one user message, so
+/// the transcript shows one user box: the head that names the skill and its
+/// file, then the optional task below it. The expanded file stays out of the
+/// transcript, because the head reports where it comes from.
 fn appendSkillPrompt(self: *App, prompt: *const ai.command.Outcome.Prompt) !usize {
     const base = self.session.transcript.blocks().len;
     errdefer self.session.transcript.truncate(base);
-    const marker = try self.skillMarker(prompt);
-    defer self.gpa.free(marker);
-    try self.session.transcript.append(.skill, .{}, marker);
-    if (prompt.arguments.len > 0)
-        try self.session.transcript.append(.user, .{}, prompt.arguments);
+    const message = try self.skillMessage(prompt);
+    defer self.gpa.free(message);
+    try self.session.transcript.append(.user, .{}, message);
     return base;
 }
 
-/// The two marker rows of one skill invocation: the name with the size of its
-/// file, then the source of that file. The block paints `Skill: ` before the
-/// first row alone. The result is owned.
-fn skillMarker(self: *App, prompt: *const ai.command.Outcome.Prompt) ![]u8 {
-    var size_buffer: [16]u8 = undefined;
-    const size = ai.format.bytes(&size_buffer, prompt.source_bytes);
+/// The user box of one skill invocation: the head line `Skill: {name} · File:
+/// {path}`, then a blank line and the task when the user typed one. The head
+/// reads like a tool box head. A user box wraps, so a path wider than the window
+/// takes another row instead of a cut. The result is owned.
+fn skillMessage(self: *App, prompt: *const ai.command.Outcome.Prompt) ![]u8 {
     const source = try ai.format.path(self.gpa, prompt.source, &self.displayRoots());
     defer self.gpa.free(source);
-    return std.fmt.allocPrint(self.gpa, "{s} · Size: {s}\nSource: {s}", .{
-        prompt.name,
-        size,
-        source,
-    });
+    var message: std.Io.Writer.Allocating = .init(self.gpa);
+    errdefer message.deinit();
+    try message.writer.print("Skill: {s} · File: {s}", .{ prompt.name, source });
+    if (prompt.arguments.len > 0) try message.writer.print("\n\n{s}", .{prompt.arguments});
+    return message.toOwnedSlice();
 }
 
 /// The roots every path in the interface is measured against.
@@ -1881,8 +1879,8 @@ fn startRetryTurn(self: *App, input: []const u8) !usize {
     defer self.gpa.free(text);
     const base = self.session.transcript.blocks().len;
     errdefer self.session.transcript.truncate(base);
-    // The complete request stays out of the transcript, as a skill marker keeps
-    // its expanded file out of it.
+    // The complete request stays out of the transcript, as a skill box keeps its
+    // expanded file out of it.
     try self.session.transcript.append(.event, .{}, Retry.event_text);
     if (input.len > 0) try self.session.transcript.append(.user, .{}, input);
     try self.runTurn(text);
@@ -5047,7 +5045,7 @@ test "a rejected refresh credential hands the session to another account" {
     );
 }
 
-test "an invoked skill marks its name, size, and source and keeps its task visible" {
+test "an invoked skill sends one user box that names its file and holds its task" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
@@ -5064,39 +5062,64 @@ test "an invoked skill marks its name, size, and source and keeps its task visib
         .arguments = "review this file",
         .content = "complete hidden skill instructions",
         .source = "/work/.agents/skills/zig-style/SKILL.md",
-        .source_bytes = 3200,
     };
     try std.testing.expectEqual(@as(usize, 0), try app.appendSkillPrompt(&prompt));
 
+    // One message on the wire is one box on the screen.
     const blocks = app.session.transcript.blocks();
-    try std.testing.expectEqual(@as(usize, 2), blocks.len);
+    try std.testing.expectEqual(@as(usize, 1), blocks.len);
     switch (blocks[0]) {
-        .skill => |marker| try std.testing.expectEqualStrings(
-            "zig-style · Size: 3.1 KB\nSource: .agents/skills/zig-style/SKILL.md",
-            marker.items,
+        .user => |message| try std.testing.expectEqualStrings(
+            "Skill: zig-style · File: .agents/skills/zig-style/SKILL.md\n\nreview this file",
+            message.items,
         ),
-        else => return error.ExpectedSkill,
-    }
-    switch (blocks[1]) {
-        .user => |task| try std.testing.expectEqualStrings("review this file", task.items),
         else => return error.ExpectedUser,
     }
 
-    // The head names the marker once, and the size and source rows carry the part
-    // that the transcript never shows.
+    // The head names the skill and the file that the transcript never shows.
     try app.session.paint(.{ .columns = 80, .rows = 24 });
     try std.testing.expect(std.mem.indexOf(
         u8,
         out.written(),
-        "Skill: zig-style · Size: 3.1 KB",
+        "Skill: zig-style · File: .agents/skills/zig-style/SKILL.md",
     ) != null);
-    try std.testing.expect(std.mem.indexOf(
-        u8,
-        out.written(),
-        "Source: .agents/skills/zig-style/SKILL.md",
-    ) != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "Skill: Source:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "review this file") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.written(), prompt.content) == null);
+}
+
+// A skill with no task is the head alone. No blank row trails it, so the box
+// keeps one content row.
+test "an invoked skill with no task sends its head alone" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+    app.working_directory = "/work";
+    app.home_directory = "/home/you";
+
+    const prompt: ai.command.Outcome.Prompt = .{
+        .name = "interview",
+        .arguments = "",
+        .content = "complete hidden skill instructions",
+        .source = "/home/you/.agents/skills/interview/SKILL.md",
+    };
+    try std.testing.expectEqual(@as(usize, 0), try app.appendSkillPrompt(&prompt));
+
+    const blocks = app.session.transcript.blocks();
+    try std.testing.expectEqual(@as(usize, 1), blocks.len);
+    switch (blocks[0]) {
+        .user => |message| try std.testing.expectEqualStrings(
+            "Skill: interview · File: ~/.agents/skills/interview/SKILL.md",
+            message.items,
+        ),
+        else => return error.ExpectedUser,
+    }
+    // Two padding rows and the head. No blank row trails the head.
+    try std.testing.expectEqual(@as(usize, 3), blocks[0].rows(80));
 }
 
 test displayRoots {
@@ -5262,7 +5285,6 @@ test "an uncommitted skill failure returns its line and arms no retry" {
         .arguments = "apply it",
         .content = "SKILL BODY\napply it",
         .source = "/work/.agents/skills/demo/SKILL.md",
-        .source_bytes = 3200,
     };
     const base = try app.startSkillTurn(&prompt);
     var draft = app.session.editor.detachTrimmed();
@@ -5282,8 +5304,8 @@ test "an uncommitted skill failure returns its line and arms no retry" {
         "/skill:demo apply it\n\nand keep the format",
         app.session.editor.visible(),
     );
-    // The rewind keeps the failure event alone: the marker and the task went with
-    // the request that no history holds.
+    // The rewind keeps the failure event alone: the skill box went with the
+    // request that no history holds.
     const blocks = app.session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 1), blocks.len);
     try std.testing.expect(blocks[0].event.is_error);

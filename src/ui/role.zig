@@ -38,7 +38,7 @@ pub const Name = enum {
     text,
     /// Secondary text, a key hint, a Markdown rule, and a table border.
     muted,
-    /// A list marker, an inline code span, and a skill marker.
+    /// A list marker, an inline code span, and a queued-message label.
     accent,
     /// A Markdown heading.
     heading,
