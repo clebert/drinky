@@ -24,7 +24,8 @@ pub const spec: llm.Tool = .{
     .name = "bash",
     .description = "Run a bash command in the working directory and return its combined " ++
         "stdout and stderr. Output is truncated to a bounded tail, and a non-zero exit is " ++
-        "reported. Give an optional timeout in seconds; the default comes from configuration.",
+        "reported. Give an optional timeout in seconds; the default comes from configuration. " ++
+        "Pith has no web tool, so a network request also runs through this tool.",
     .parameters = &.{
         .{
             .name = "command",

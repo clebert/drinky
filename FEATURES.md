@@ -44,7 +44,8 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - **bash** — run a shell command in the working directory, preserve combined stdout and stderr
   order, and return a bounded tail. A non-zero exit is reported. Output caps and the timeout are
   configurable, and the timeout is also settable per call. Every command runs under a timeout from
-  1 second to 1 hour, so neither the config nor a call can lift the limit.
+  1 second to 1 hour, so neither the config nor a call can lift the limit. Pith has no web tool, so
+  a network request also runs through bash.
 - **describe_config** — describe `config.json`, so the model can change it for the user. It names
   the file and lists every key with its type, its default, and its meaning, plus the legal model
   names, the effort levels, the compiled fallbacks, and the memory that outranks the file. It
