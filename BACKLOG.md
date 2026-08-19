@@ -24,22 +24,26 @@ decision already taken, or a dependency on another entry. Module layout and exte
 
 ## Improvements
 
-- **Pick the provider first, then the model** — so neither list grows too long. _`/model` and
-  `/login` list account and model together today._
+- **Pick the provider first, then the model** — so neither list grows too long. _`/model` lists one
+  row per account-model pair today, up to 21 rows. `/login` lists accounts alone. A provider step
+  does not name the account, because Anthropic has three, so the steps are provider, account, and
+  model._
 - **Configurable transcript window** — the 8-page transcript window moves into `config.json` and
   trades scrollback retention against per-frame redraw cost. _Clamp to at least one page._
 - **A retry is recorded in the transcript** — a transcript event names each retry attempt and its
   cause, so a restarted reply never reads as a change of mind. _A permanent event block, like the
   model and login events, not a footer notice. It covers every attempt, including one that fails at
   the response head and shows nothing. A later refinement can narrow it to an attempt that discards
-  streamed rows. `Agent.fetchReply` retries at four points but reports only `onStreamReset`, which
-  runs on a discarded partial reply alone, so the handler needs one more callback._
+  streamed rows. `Agent.fetchReply` retries at four points and calls `onStreamReset` on every
+  attempt after the first, so that callback needs a cause payload, not a second callback._
 - **Context-window pressure signal** — the context gauge warns as it fills, and feeds a compaction
   threshold. _The thresholds are configurable. Color the gauge as it fills, and consider the same
   accent for the branch, the model, and the effort level. Fold in two model-specific dimensions:
-  tiered pricing above a context threshold, and OpenAI's effective context window (decoded at login
-  but unused). The effective window must drive the warning while the catalog window stays the
-  displayed limit. Quality degradation has no evidence-based number, so keep it a soft warning._
+  tiered pricing above a context threshold, and OpenAI's effective context window. The window that
+  a ChatGPT login discovers already resolves the displayed limit. The unused parts are
+  `max_context_window` and `effective_context_window_percent`, and that percent of the resolved
+  window must drive the warning. Quality degradation has no evidence-based number, so keep it a soft
+  warning._
 - **A two-line status bar** — a narrow window falls back to two rows instead of dropping fields.
   _Shorter quota text and shorter labels are the cheaper first step._
 - **A parked message and a message history** — the user parks the editor content to run a command,
@@ -47,20 +51,24 @@ decision already taken, or a dependency on another entry. Module layout and exte
 
 ## Features
 
-- **Active context projection** — Pith filters one canonical history for the active account and
-  model, then deeply repaints its transcript.
+- **Active context projection** — Pith filters one canonical history for the active account, then
+  deeply repaints its transcript. _The model is not a dimension. Reasoning provenance is per exact
+  account, and the Anthropic Fable fallback replays mixed-model reasoning in one account. The
+  OpenAI cross-model replay is unconfirmed, but Pith already performs it on every `/model` switch,
+  and a rejection fails loudly._
 - **Conversation switching** — Pith selects the agent, history, transcript, and status through one
   shared operation, then applies active context projection.
 - **`/review`** — a bounded workflow reviews pending changes with a fresh reviewer, a persistent
   judge, and a fixer, and it asks the user only about an open product choice. _The plan is
-  `docs/review-mode.md`. It depends on the three preceding entries. Store three account-model-effort
+  `docs/review-mode.md`. It depends on the two preceding entries. Store three account-model-effort
   role choices per project. Every role keeps the complete tool registry. The reviewer and judge
   prompts prohibit mutation, but `bash` remains unrestricted. It is not a subagent system, so one
   request runs at a time with no nesting._
 - **Save and resume conversations** — a conversation reopens after a restart and does not start
-  empty. _Persist the per-turn cost ledger with it, since history items carry no cost. Persist the
-  prompt-cache write times too, so a resume knows what retention is left. Generate the OpenAI cache
-  key once per conversation and restore it verbatim. Rotate it only on a deliberately fresh start. A
+  empty. _This entry introduces the per-turn cost ledger and persists it, since history items carry
+  no cost. The `/session` breakdown entry then reads that ledger. Persist the prompt-cache write
+  times too, so a resume knows what retention is left. Generate the OpenAI cache key once per
+  conversation and restore it verbatim. Rotate it only on a deliberately fresh start. A
   billing-product enum is not sufficient provenance for opaque reasoning. Persist a durable
   non-secret principal identity and replay only on a match. Versioned, atomic, owner-only._
 - **Headless mode** — pith answers a prompt with no terminal: text in, text out, with a session id
@@ -78,22 +86,17 @@ decision already taken, or a dependency on another entry. Module layout and exte
 - **`/handoff`** — compact the conversation into a summary and continue with the reclaimed context.
   _The command must also summarize canceled turns and the synthesized tool results they leave
   behind._
-- **`/session` breakdown** — a per-turn ledger backs a session summary of tokens, cost, and cache
-  savings, split by model. _Cost belongs in the ledger, not in history items. Billing is per
-  request. History must stay byte-stable for cache hits. A canceled turn's reply rolls back out of
-  history. Canceled and failed turns get their own entries, so cost survives `/handoff` compaction._
-- **`/cache-retention`** — choose the active model's prompt-cache retention where the provider
-  offers a real choice. _Anthropic offers 5m and 1h. The 1h write costs 2x base input against 1.25x,
-  so pricing needs a per-TTL write rate. One TTL across all breakpoints sidesteps the ordering rule.
-  Current OpenAI models expose only 30m, so report it and do not open a picker. Never guess. When
-  the policy is unknown, omit the field and report the provider default. Reset to that default on
-  `/model`. Cache warming is the rival approach: replay the last request with `max_tokens: 1` just
-  under the TTL. This buys a near-free read instead of the 1h write premium, and it pays off once
-  the main agent sits idle for minutes (cf. claude-thermos)._
-- **Runtime model catalog** — an optional `~/.pith/models.json` extends the compiled model table and
-  adds an OpenAI-compatible endpoint, without a rebuild. _Compiled defaults stay authoritative, so a
-  known model always has a known context window. The file patches or adds alone. The endpoint form
-  opens local and third-party models: ds4, qwen 3.6 27b, qwen 3.8 27b, gemma4, glimmer._
+- **`/session` breakdown** — a session summary of tokens, cost, and cache savings, split by model.
+  _It reads the per-turn ledger that the save-and-resume entry introduces. Cost belongs in the
+  ledger, not in history items. Billing is per request. History must stay byte-stable for cache
+  hits. A canceled turn's reply rolls back out of history. Canceled and failed turns get their own
+  entries, so cost survives `/handoff` compaction._
+- **Runtime model overrides** — an optional `~/.pith/models.json` extends the compiled model table
+  and adds an OpenAI-compatible endpoint, without a rebuild. _The noun `model catalog` belongs to
+  the ChatGPT catalog in `lib/ai/openai/ModelCatalog.zig`, so this file is the model override file.
+  Compiled defaults stay authoritative, so a known model always has a known context window. The file
+  patches or adds alone. The endpoint form opens local and third-party models: ds4, qwen 3.6 27b,
+  qwen 3.8 27b, gemma4, glimmer._
 
 ## Ideas
 

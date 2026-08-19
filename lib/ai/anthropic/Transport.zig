@@ -82,6 +82,11 @@ pub const Stream = struct {
     block_proof: std.ArrayList(u8),
     tool_call_id: std.ArrayList(u8),
     tool_name: std.ArrayList(u8),
+    /// The model that `message_start` names as the one that serves the reply.
+    /// Owned, because the frame arena drops the parsed frame it arrives in.
+    /// Empty until that frame arrives, so the stop of a headless stream states
+    /// no model rather than a stale one.
+    served_model: std.ArrayList(u8),
     usage: llm.Usage,
     decompress: std.http.Decompress,
     decompress_buffer: []u8,
@@ -138,6 +143,7 @@ pub const Stream = struct {
         self.block_proof.deinit(self.gpa);
         self.tool_call_id.deinit(self.gpa);
         self.tool_name.deinit(self.gpa);
+        self.served_model.deinit(self.gpa);
     }
 
     /// Latch a rejection. `unsupported` and `uncorrelated` both win over
@@ -323,20 +329,24 @@ pub const Stream = struct {
                 .none => .{ .event = .{ .stop = .{
                     .usage = self.usage,
                     .rejection = .invalid,
+                    .model = self.served_model.items,
                 } } },
                 .unsupported => .{ .event = .{ .stop = .{
                     .usage = self.usage,
                     .rejection = .unsupported,
+                    .model = self.served_model.items,
                 } } },
                 .complete => .{ .event = .{ .stop = .{
                     .usage = self.usage,
                     .status = .complete,
                     .rejection = self.terminal_rejection,
+                    .model = self.served_model.items,
                 } } },
                 .truncated => .{ .event = .{ .stop = .{
                     .usage = self.usage,
                     .status = .truncated,
                     .rejection = self.terminal_rejection,
+                    .model = self.served_model.items,
                 } } },
             };
         }
@@ -347,6 +357,12 @@ pub const Stream = struct {
         if (std.mem.eql(u8, kind, "message_start")) {
             if (json.object(object.get("message"))) |message| {
                 if (json.object(message.get("usage"))) |usage| mergeUsage(&self.usage, usage);
+                // The head names the model that serves the reply, so the stop
+                // can report a switched model. The copy outlives the frame.
+                if (json.string(message.get("model"))) |model_name| {
+                    self.served_model.clearRetainingCapacity();
+                    try self.served_model.appendSlice(self.gpa, model_name);
+                }
             }
             return .progress;
         }
@@ -402,6 +418,7 @@ fn connect(self: *Transport, out: *Stream, body: []const u8) anyerror!void {
     out.block_proof = .empty;
     out.tool_call_id = .empty;
     out.tool_name = .empty;
+    out.served_model = .empty;
 
     // The Bearer header must outlive the send below, so allocate it at connect
     // scope. The API-key path needs none.
@@ -530,6 +547,7 @@ fn testStreamWithAllocator(
     stream.block_proof = .empty;
     stream.tool_call_id = .empty;
     stream.tool_name = .empty;
+    stream.served_model = .empty;
     return stream;
 }
 
@@ -880,6 +898,33 @@ test "decode separates pings from progress and events" {
         \\{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}
     );
     try std.testing.expectEqualStrings("hi", delta.event.text);
+}
+
+// A provider can switch a request to another model. The head names the model
+// that serves the reply, so the stop must carry it past every frame-arena
+// reset. A stream whose head names none states none.
+test "message_stop names the model that served the reply" {
+    var stream = testStream(undefined, undefined, 0, 0);
+    defer stream.deinitDecode();
+
+    try decodeTestFrame(&stream,
+        \\{"type":"message_start","message":{"model":"claude-opus-5","usage":{"input_tokens":3}}}
+    );
+    try decodeTestFrame(&stream,
+        \\{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}
+    );
+    _ = stream.frame_arena.reset(.retain_capacity);
+    const stop = try stream.decode(
+        \\{"type":"message_stop"}
+    );
+    try std.testing.expectEqualStrings("claude-opus-5", stop.event.stop.model);
+
+    var headless = testStream(undefined, undefined, 0, 0);
+    defer headless.deinitDecode();
+    const unnamed_stop = try headless.decode(
+        \\{"type":"message_stop"}
+    );
+    try std.testing.expectEqualStrings("", unnamed_stop.event.stop.model);
 }
 
 test "message_stop carries usage when its reason or tail is invalid" {

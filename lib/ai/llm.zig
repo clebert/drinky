@@ -397,6 +397,11 @@ pub const Event = union(enum) {
         usage: Usage,
         status: Status = .complete,
         rejection: ?Rejection = null,
+        /// The model the response names as the one that served it, or empty when
+        /// the wire states none. A provider can switch a request to another
+        /// model, so the agent compares this against the requested model and
+        /// reports a switch. The slice borrows the stream, like an item slice.
+        model: []const u8 = "",
 
         pub const Rejection = enum {
             /// Malformed or incomplete output that a whole-request retry can fix.

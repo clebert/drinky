@@ -43,7 +43,8 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
   file, with glob and case filters, 100 hits by default.
 - **bash** — run a shell command in the working directory, preserve combined stdout and stderr
   order, and return a bounded tail. A non-zero exit is reported. Output caps and the timeout are
-  configurable, and the timeout is also settable per call.
+  configurable, and the timeout is also settable per call. Every command runs under a timeout from
+  1 second to 1 hour, so neither the config nor a call can lift the limit.
 - **describe_config** — describe `config.json`, so the model can change it for the user. It names
   the file and lists every key with its type, its default, and its meaning, plus the legal model
   names, the effort levels, the compiled fallbacks, and the memory that outranks the file. It
@@ -138,8 +139,8 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - A reply enters the conversation only once the provider reports it complete.
 - Prompt caching is always on: explicit breakpoints for Anthropic, the automatic per-session cache
   for OpenAI.
-- A stale prompt cache blocks the first submit, estimates the extra input cost, and lets the next
-  Enter continue.
+- A stale or cold prompt cache blocks the first submit, estimates the extra input cost, and lets
+  the next Enter continue.
 - The assumed cache retention per provider and the cost that arms this warning are configurable.
 - Reasoning is requested summarized at the resolved effort, and replayed verbatim on later turns.
 - Anthropic Subscription and Anthropic Console requests carry the Claude Code client identity. A
@@ -152,6 +153,17 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - A response that asks for a wait longer than the backoff cap ends the request. A spent OpenAI plan
   states its reset in the error body, so Pith reports it after one try.
 - A stream frame that names a call or a block other than the open one ends the turn without a retry.
+- A reply that names a model other than the requested one records a durable transcript event with
+  both names, so a fallback or a proxy substitution never passes silently. An unchanged fallback
+  reports once per turn.
+- A switched reply is priced at the model that served it, and its usage and cache evidence book
+  under that model. An unknown served model fails the turn with a report that names it.
+- Cache evidence is kept per account, model, and resolved effort, and the warning judges the model
+  expected to serve next. A switch to an unused pairing warns about its cold cache at once, and a
+  switch back within retention stays silent. Effort levels that fold onto one wire form share one
+  cache.
+- Every provider-accepted request refreshes the cache-warning anchor at its dispatch, so a canceled
+  or failed attempt cannot leave a stale anchor and a premature warning.
 - A failed request reports the message from the provider JSON error body, not the raw bytes. A
   failed response head names its status too. For a spent OpenAI subscription, the message names the
   plan and the wait.
@@ -198,9 +210,9 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - While the model streams the arguments, the call reports `Received:` with the bytes that arrived. A
   call whose reply has committed but that waits for an earlier one reports `Status: Queued`. The
   count measures the arguments the model has sent.
-- A running command adds a row with the time it has run and the timeout it runs under.
-  `Timeout: None` names a call that asked for no limit. Every other tool runs under no timeout, so
-  its box keeps one row.
+- A running command adds a row with the time it has run and the timeout it runs under. The row names
+  the clamped limit, so it states the wait the command really takes. Every other tool runs under no
+  timeout, so its box keeps one row.
 - A finished call keeps its call row and one line below it: a line of measures, or the sentence of a
   failure. A call with nothing to state, like `describe_config`, keeps the call row alone.
 - `read` reports `Lines: 42`, or `Lines: 594–648 of 2868` when a window cut the file. `write`

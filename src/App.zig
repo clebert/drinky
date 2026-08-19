@@ -192,6 +192,11 @@ const TurnHandler = struct {
     /// Owned error text captured from `onError`, which the agent calls just before
     /// a failed turn returns. The worker carries it in its joined result.
     error_text: ?[]u8 = null,
+    /// The served model already reported for this turn, so a fallback that holds
+    /// across the turn's requests reports once rather than once per request. The
+    /// buffer bounds the name, and a longer name dedupes on its head.
+    served_model_reported_buffer: [64]u8 = undefined,
+    served_model_reported_length: usize = 0,
 
     pub fn onText(self: *TurnHandler, delta: []const u8) !void {
         const copy = try self.app.gpa.dupe(u8, delta);
@@ -258,6 +263,27 @@ const TurnHandler = struct {
 
     pub fn onStreamReset(self: *TurnHandler) !void {
         try self.enqueue(.stream_reset);
+    }
+
+    /// Report the model that really served a reply. The turn's requests share
+    /// one requested model, so a repeat of the same served model adds nothing
+    /// and stays silent. A served model that changes again reports again.
+    pub fn onModelMismatch(self: *TurnHandler, mismatch: ai.Agent.ModelMismatch) !void {
+        const reported =
+            self.served_model_reported_buffer[0..self.served_model_reported_length];
+        const key_length = @min(mismatch.served.len, self.served_model_reported_buffer.len);
+        const key = mismatch.served[0..key_length];
+        if (std.mem.eql(u8, reported, key)) return;
+        const requested_copy = try self.app.gpa.dupe(u8, mismatch.requested);
+        errdefer self.app.gpa.free(requested_copy);
+        const served_copy = try self.app.gpa.dupe(u8, mismatch.served);
+        errdefer self.app.gpa.free(served_copy);
+        try self.enqueue(.{ .model_mismatch = .{
+            .requested = requested_copy,
+            .served = served_copy,
+        } });
+        @memcpy(self.served_model_reported_buffer[0..key_length], key);
+        self.served_model_reported_length = key_length;
     }
 
     pub fn onSteering(self: *TurnHandler, text: []const u8, count: usize) !void {
@@ -588,6 +614,17 @@ pub fn run(
         "Pith ignored the configured cache warning cost \"{s}\" because the value must be a " ++
             "finite number of zero or more. Pith warns about every stale prompt cache.",
         .{dropped},
+    );
+    if (config.dropped_bash_timeout_ms) |dropped| try self.recordEvent(
+        .failure,
+        "Pith ignored the configured command timeout {d} because the value must be from {d} " ++
+            "to {d} milliseconds. Pith uses the default timeout of {d} milliseconds.",
+        .{
+            dropped,
+            ai.tool.Context.Bash.timeout_ms_min,
+            ai.tool.Context.Bash.timeout_ms_max,
+            config.bash.timeout_ms,
+        },
     );
     // The parse ignores an unknown key so that an older binary reads a newer
     // file. Report it, because a typo otherwise looks like an applied setting.
@@ -1697,19 +1734,33 @@ fn preflightModelSubmit(
 ) !bool {
     if (self.session.takeCacheConfirmation()) return true;
     const cache_risk = maybe_cache_risk orelse return true;
-    const retention = retentionText(cache_risk.retention_ms);
+    // A stale cache names the window it outlived. A cold cache has no window
+    // to name: the active model holds no cache for this conversation, so the
+    // next request processes the history fresh.
+    var state_buffer: [64]u8 = undefined;
+    const state = switch (cache_risk.cause) {
+        .stale => state: {
+            const retention = retentionText(cache_risk.retention_ms);
+            break :state try std.fmt.bufPrint(
+                &state_buffer,
+                "Probably stale after {d}{s}",
+                .{ retention.count, retention.unit },
+            );
+        },
+        .cold => "Cold for this model and effort",
+    };
 
     if (cache_risk.cost_extra >= 0.01) {
         try self.reportNotice(
             .warning,
-            "{s} · Cache: Probably stale after {d}{s} · Extra input cost: ~${d:.2}",
-            .{ action, retention.count, retention.unit, cache_risk.cost_extra },
+            "{s} · Cache: {s} · Extra input cost: ~${d:.2}",
+            .{ action, state, cache_risk.cost_extra },
         );
     } else {
         try self.reportNotice(
             .warning,
-            "{s} · Cache: Probably stale after {d}{s} · Extra input cost: ~${d:.4}",
-            .{ action, retention.count, retention.unit, cache_risk.cost_extra },
+            "{s} · Cache: {s} · Extra input cost: ~${d:.4}",
+            .{ action, state, cache_risk.cost_extra },
         );
     }
     self.session.armCacheConfirmation();
@@ -2555,6 +2606,11 @@ test "turn producers keep their captured generation" {
     try handler.onUsage(.{});
     try handler.onStreamReset();
     try handler.onSteering("steer", 1);
+    try handler.onModelMismatch(.{ .requested = "claude-fable-5", .served = "claude-opus-5" });
+    // The same served model reports once per turn, so the repeat adds no event.
+    try handler.onModelMismatch(.{ .requested = "claude-fable-5", .served = "claude-opus-5" });
+    // A served model that changes again reports again.
+    try handler.onModelMismatch(.{ .requested = "claude-fable-5", .served = "claude-opus-4-8" });
     // Signed out, so the turn fails at once. The wakeup is payload-free and the
     // joined result owns the error text.
     const result = runTurnWorker(&app, try gpa.dupe(u8, "prompt"), generation);
@@ -2566,7 +2622,7 @@ test "turn producers keep their captured generation" {
         result.error_text.?,
     );
 
-    var events: [8]Session.UiEvent = undefined;
+    var events: [10]Session.UiEvent = undefined;
     const count = try app.queue.get(io, &events, events.len);
     defer for (events[0..count]) |event| event.deinit(gpa);
     try std.testing.expectEqual(events.len, count);
@@ -2578,6 +2634,13 @@ test "turn producers keep their captured generation" {
     const tool_result = events[3].turn.payload.tool_result;
     try std.testing.expectEqualStrings("summary", tool_result.summary.?.text);
     try std.testing.expectEqual(@as(u64, 4), events[4].turn.progress_sequence_committed);
+    const mismatch = events[7].turn.payload.model_mismatch;
+    try std.testing.expectEqualStrings("claude-fable-5", mismatch.requested);
+    try std.testing.expectEqualStrings("claude-opus-5", mismatch.served);
+    try std.testing.expectEqualStrings(
+        "claude-opus-4-8",
+        events[8].turn.payload.model_mismatch.served,
+    );
     try std.testing.expect(events[events.len - 1].turn.payload == .turn_ended);
 }
 
@@ -5346,6 +5409,7 @@ test "a stale cache stops the first Ctrl+N and the next one sends" {
     const risk: ai.Agent.CacheRisk = .{
         .retention_ms = 5 * std.time.ms_per_min,
         .cost_extra = 1.15,
+        .cause = .stale,
     };
 
     try app.retryWithCacheRisk(&risk);
@@ -5793,6 +5857,7 @@ test "a stale cache blocks one submit and keeps the prompt unchanged" {
     const risk: ai.Agent.CacheRisk = .{
         .retention_ms = 5 * std.time.ms_per_min,
         .cost_extra = 1.15,
+        .cause = .stale,
     };
     try app.submitWithCacheRisk(&risk);
 
@@ -5847,6 +5912,7 @@ test "a stale cache keeps the send-as-a-message confirmation" {
     const risk: ai.Agent.CacheRisk = .{
         .retention_ms = 5 * std.time.ms_per_min,
         .cost_extra = 1.15,
+        .cause = .stale,
     };
     try app.session.editor.insert("/tmp/x.log is empty");
 

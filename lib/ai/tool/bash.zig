@@ -32,10 +32,19 @@ pub const spec: llm.Tool = .{
             .required = true,
             .description = "The bash command line to run",
         },
+        // Every command runs under a limit, so the bounds belong in the
+        // description: they are what a caller needs to pick a value.
         .{
             .name = "timeout_seconds",
             .type = .integer,
-            .description = "Seconds before the command is killed (default: configured limit)",
+            .description = std.fmt.comptimePrint(
+                "Seconds before the command is killed (default: configured limit). " ++
+                    "Pith holds the value from {d} to {d}.",
+                .{
+                    Context.Bash.timeout_ms_min / std.time.ms_per_s,
+                    Context.Bash.timeout_ms_max / std.time.ms_per_s,
+                },
+            ),
         },
     },
 };
@@ -75,10 +84,13 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
     defer parsed.deinit();
     const command = parsed.value.command;
     const limits = &context.bash;
-    const timeout_ms = if (parsed.value.timeout_seconds) |seconds|
-        seconds *| 1000
+    // Both sources take the same clamp, so a command always runs under a limit
+    // the interface can measure, and neither the model nor the config can lift
+    // it.
+    const timeout_ms = Context.Bash.clampTimeoutMs(if (parsed.value.timeout_seconds) |seconds|
+        seconds *| std.time.ms_per_s
     else
-        limits.timeout_ms;
+        limits.timeout_ms);
 
     const started_ms = std.Io.Timestamp.now(context.io, .awake).toMilliseconds();
     const completed = execute(context, command, timeout_ms) catch |err| switch (err) {
@@ -120,15 +132,16 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
 
 /// The result of a command the timeout stopped. Both spans read in the units the
 /// interface uses, never in raw milliseconds, and the summary carries the run
-/// time so every command reports one.
+/// time so every command reports one. `timeout_ms` arrives clamped, so it always
+/// fits a signed span.
 fn timedOut(gpa: std.mem.Allocator, elapsed_ms: i64, timeout_ms: u64) !Result {
     var limit: [24]u8 = undefined;
     var scale: [24]u8 = undefined;
     // Built field by field: the content states the limit to the model, and the
-    // box reports the run time instead. An assignment over a report would leak
-    // the sentence that the report put in the summary.
+    // box reports the run time instead. An assignment over a report leaks the
+    // sentence that the report put in the summary.
     const content = try std.fmt.allocPrint(gpa, "The command timed out after {s}.", .{
-        format.duration(&limit, @intCast(@min(timeout_ms, std.math.maxInt(i64)))),
+        format.duration(&limit, @intCast(timeout_ms)),
     });
     errdefer gpa.free(content);
     const summary = try std.fmt.allocPrint(gpa, "Time: {s} · Status: Timed out", .{
@@ -138,7 +151,8 @@ fn timedOut(gpa: std.mem.Allocator, elapsed_ms: i64, timeout_ms: u64) !Result {
 }
 
 fn execute(context: *const Context, command: []const u8, timeout_ms: u64) !Completed {
-    if (timeout_ms == 0) return collect(context, command);
+    std.debug.assert(timeout_ms >= Context.Bash.timeout_ms_min);
+    std.debug.assert(timeout_ms <= Context.Bash.timeout_ms_max);
 
     var execution: Execution = .{ .gpa = context.gpa };
     defer execution.deinit();
@@ -436,19 +450,49 @@ test "bash honors a per-call timeout" {
     try std.testing.expect(std.mem.endsWith(u8, result.summary.?.text, " · Status: Timed out"));
 }
 
+// A command that asks for no limit still runs under the smallest legal one, so
+// no call can hold the turn open.
+test "bash holds a per-call timeout inside the legal window" {
+    const gpa = std.testing.allocator;
+    const context: Context = .{ .gpa = gpa, .io = std.testing.io };
+    const result = try run(&context,
+        \\{"command":"sleep 5","timeout_seconds":0}
+    );
+    defer result.deinit(gpa);
+    try std.testing.expect(result.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "timed out after 1.0s") != null);
+}
+
+// A configured value outside the window cannot lift the limit either. Zero used
+// to mean no limit, so this is the path a stale config file takes.
+test "bash holds a configured timeout inside the legal window" {
+    const gpa = std.testing.allocator;
+    const context: Context = .{
+        .gpa = gpa,
+        .io = std.testing.io,
+        .bash = .{ .timeout_ms = 0 },
+    };
+    const result = try run(&context,
+        \\{"command":"sleep 5"}
+    );
+    defer result.deinit(gpa);
+    try std.testing.expect(result.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "timed out after 1.0s") != null);
+}
+
 test "bash timeout is absolute while output arrives" {
     const gpa = std.testing.allocator;
     const context: Context = .{
         .gpa = gpa,
         .io = std.testing.io,
-        .bash = .{ .timeout_ms = 100 },
+        .bash = .{ .timeout_ms = Context.Bash.timeout_ms_min },
     };
     const result = try run(&context,
-        \\{"command":"for i in {1..10}; do echo tick; sleep 0.05; done"}
+        \\{"command":"for i in {1..40}; do echo tick; sleep 0.05; done"}
     );
     defer result.deinit(gpa);
     try std.testing.expect(result.is_error);
-    try std.testing.expect(std.mem.indexOf(u8, result.content, "timed out after 0.1s") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "timed out after 1.0s") != null);
 }
 
 test "bash timeout reaps a command after output closes" {
@@ -458,19 +502,19 @@ test "bash timeout reaps a command after output closes" {
     defer tmp.cleanup();
     const input = try std.fmt.allocPrint(
         gpa,
-        "{{\"command\":\"echo $$ > .zig-cache/tmp/{s}/pid; exec 1>&- 2>&-; sleep 0.5\"}}",
+        "{{\"command\":\"echo $$ > .zig-cache/tmp/{s}/pid; exec 1>&- 2>&-; sleep 5\"}}",
         .{tmp.sub_path},
     );
     defer gpa.free(input);
     const context: Context = .{
         .gpa = gpa,
         .io = io,
-        .bash = .{ .timeout_ms = 100 },
+        .bash = .{ .timeout_ms = Context.Bash.timeout_ms_min },
     };
     const result = try run(&context, input);
     defer result.deinit(gpa);
     try std.testing.expect(result.is_error);
-    try std.testing.expect(std.mem.indexOf(u8, result.content, "timed out after 0.1s") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "timed out after 1.0s") != null);
 
     const pid_text = try tmp.dir.readFileAlloc(io, "pid", gpa, .limited(64));
     defer gpa.free(pid_text);
@@ -491,19 +535,19 @@ test "bash timeout kills descendant processes" {
     defer tmp.cleanup();
     const input = try std.fmt.allocPrint(
         gpa,
-        "{{\"command\":\"(sleep 0.3; touch .zig-cache/tmp/{s}/marker) & wait\"}}",
+        "{{\"command\":\"(sleep 1.5; touch .zig-cache/tmp/{s}/marker) & wait\"}}",
         .{tmp.sub_path},
     );
     defer gpa.free(input);
     const context: Context = .{
         .gpa = gpa,
         .io = io,
-        .bash = .{ .timeout_ms = 100 },
+        .bash = .{ .timeout_ms = Context.Bash.timeout_ms_min },
     };
     const result = try run(&context, input);
     defer result.deinit(gpa);
     try std.testing.expect(result.is_error);
-    try io.sleep(.fromMilliseconds(400), .awake);
+    try io.sleep(.fromMilliseconds(1_000), .awake);
     try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "marker", .{}));
 }
 

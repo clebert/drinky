@@ -62,25 +62,114 @@ cache: CachePolicy,
 /// The stable per-conversation prompt-cache routing key (used by OpenAI). Every
 /// turn shares it until a deliberate reset rotates it.
 cache_key: [32]u8,
-/// The latest request under the active cache setup. The timestamp marks request
-/// dispatch, because cache lookup happens before response generation.
-cache_activity: ?CacheActivity,
+/// The local cache evidence of this conversation, per account-model pair. Each
+/// timestamp marks request dispatch, because the cache lookup happens before
+/// response generation.
+cache_evidence: CacheEvidence,
 
-const CacheActivity = struct {
-    account: llm.Account,
-    model: []const u8,
-    retention_ms: u64,
-    cache_read: f64,
-    cache_write: f64,
-    request_at: std.Io.Clock.Timestamp,
-    prefix_tokens: u64,
+/// The newest possible touch of each cache the conversation used, plus the
+/// model expected to serve the next request. The provider isolates caches per
+/// account, a model change breaks the cache, and the resolved effort renders
+/// into the request bytes, so the account-model-effort triple is the real key.
+/// Bounded like `Stats.by_model`, so recording never allocates. A full table
+/// drops a new triple, which then reads as a cold cache and warns: the cheap
+/// failure direction.
+const CacheEvidence = struct {
+    entries: [entries_max]Entry = undefined,
+    entry_count: usize = 0,
+    /// The model that served the last reply, or empty for the active model. A
+    /// provider-side fallback holds for a conversation, so the last server is
+    /// the best prediction of the next one.
+    expected_model: []const u8 = "",
+
+    const entries_max = 16;
+
+    /// One cache: its newest possible touch and the size of its reusable
+    /// prefix. `model` points into the compiled model table. `effort` is the
+    /// resolved wire form, because two levels that fold onto one named level
+    /// write identical request bytes and share one cache.
+    const Entry = struct {
+        account: llm.Account,
+        model: []const u8,
+        effort: models.Model.EffortMap.Resolution,
+        retention_ms: u64,
+        request_at: std.Io.Clock.Timestamp,
+        prefix_tokens: u64,
+    };
+
+    fn indexOf(
+        self: *const CacheEvidence,
+        account: llm.Account,
+        model_name: []const u8,
+        effort: models.Model.EffortMap.Resolution,
+    ) ?usize {
+        for (self.entries[0..self.entry_count], 0..) |*entry, index| {
+            if (entry.account == account and std.mem.eql(u8, entry.model, model_name) and
+                entry.effort.eql(effort))
+            {
+                return index;
+            }
+        }
+        return null;
+    }
+
+    /// Record or update one triple. A full table drops the new triple.
+    fn touch(self: *CacheEvidence, entry: Entry) void {
+        if (self.indexOf(entry.account, entry.model, entry.effort)) |index| {
+            self.entries[index] = entry;
+            return;
+        }
+        if (self.entry_count == self.entries.len) return;
+        self.entries[self.entry_count] = entry;
+        self.entry_count += 1;
+    }
+
+    /// Drop every entry of one account, for a credential replacement.
+    fn dropAccount(self: *CacheEvidence, account: llm.Account) void {
+        var retained_count: usize = 0;
+        for (self.entries[0..self.entry_count]) |entry| {
+            if (entry.account == account) continue;
+            self.entries[retained_count] = entry;
+            retained_count += 1;
+        }
+        self.entry_count = retained_count;
+    }
+
+    fn clear(self: *CacheEvidence) void {
+        self.entry_count = 0;
+        self.expected_model = "";
+    }
+
+    /// The newest entry of one account. The history is shared across the
+    /// models of a conversation, so any entry's prefix approximates a cold
+    /// model's rewrite size, and the newest is the closest.
+    fn newestOf(self: *const CacheEvidence, account: llm.Account) ?*const Entry {
+        var newest: ?*const Entry = null;
+        for (self.entries[0..self.entry_count]) |*entry| {
+            if (entry.account != account) continue;
+            const current = newest orelse {
+                newest = entry;
+                continue;
+            };
+            if (entry.request_at.raw.toNanoseconds() > current.request_at.raw.toNanoseconds())
+                newest = entry;
+        }
+        return newest;
+    }
 };
 
-/// The estimated cost effect when the active prompt cache passed its retention
-/// window. The cost covers only the reusable prefix at public API rates.
+/// The estimated cost effect when the next request probably reads no cache.
+/// The cost covers only the reusable prefix, priced at the active model's
+/// public API rates, which is the worst case among the candidate servers.
 pub const CacheRisk = struct {
     retention_ms: u64,
     cost_extra: f64,
+    cause: Cause,
+
+    /// Why the next request probably reads no cache: the expected cache passed
+    /// its retention window, or the expected model holds no cache in this
+    /// conversation (after `/model` to a model the conversation has not used).
+    pub const Cause = enum { stale, cold };
 };
 
 /// The local policy for the stale-prompt-cache warning. The host patches it from
@@ -162,6 +251,16 @@ pub const Stats = struct {
         self.model_count += 1;
         return entry;
     }
+};
+
+/// A reply that another model served than the request named. A provider can
+/// switch a flagged request to a fallback model, so the handler reports the
+/// switch instead of passing the reply off as the requested model's. The named
+/// fields keep the two confusable names apart at the call site. Both slices
+/// stay valid only for the duration of the callback.
+pub const ModelMismatch = struct {
+    requested: []const u8,
+    served: []const u8,
 };
 
 /// The receipt of one turn: the history span it produced, how far steering
@@ -330,7 +429,7 @@ pub fn init(
         .steering = Steering.init(gpa, io),
         .cache = options.cache,
         .cache_key = generateCacheKey(io),
-        .cache_activity = null,
+        .cache_evidence = .{},
     };
 }
 
@@ -347,7 +446,7 @@ pub fn resetConversation(self: *Agent) void {
     self.stats = .{};
     self.steering.clear();
     self.cache_key = generateCacheKey(self.io);
-    self.cache_activity = null;
+    self.cache_evidence.clear();
 }
 
 /// Switch the account and the model together, effective on the next turn. The
@@ -360,19 +459,16 @@ pub fn switchTo(self: *Agent, client: provider.Client, model: models.Model) void
         active.account() != client.account()
     else
         true;
-    const cache_setup_changed = account_changed or !sameCacheSetup(&self.model, &model);
     self.client = client;
     self.model = model;
     // An allowance belongs to the account whose response reported it. Session
     // totals span account switches, but this point-in-time gauge must not.
     if (account_changed) self.stats.quota = null;
-    if (cache_setup_changed) self.cache_activity = null;
-}
-
-fn sameCacheSetup(source: *const models.Model, target: *const models.Model) bool {
-    return std.mem.eql(u8, source.name, target.name) and
-        source.cache_retention_ms == target.cache_retention_ms and
-        source.cache_read == target.cache_read and source.cache_write == target.cache_write;
+    // The cache entries stay: they key on the account-model pair, a switch
+    // invalidates none of them on the provider, and a switch back within
+    // retention meets a warm cache. Only the serving expectation resets,
+    // because it belonged to the previous pairing.
+    self.cache_evidence.expected_model = "";
 }
 
 /// Drop the active account and leave the agent signed out. `model` is kept as
@@ -381,7 +477,7 @@ fn sameCacheSetup(source: *const models.Model, target: *const models.Model) bool
 pub fn signOut(self: *Agent) void {
     self.client = null;
     self.stats.quota = null;
-    self.cache_activity = null;
+    self.cache_evidence.clear();
 }
 
 /// Forget everything bound to the provider principal behind `account`: its
@@ -393,16 +489,19 @@ pub fn dropAccountEvidence(self: *Agent, account: llm.Account) void {
     self.dropReasoning(account);
     self.dropCacheEvidence(account);
     // The gauge holds what the last response of the active account reported,
-    // so only that account can own it.
+    // so only that account can own it. The serving expectation came from the
+    // active account's replies too, so a replaced active principal takes it.
     const client = self.client orelse return;
-    if (client.account() == account) self.stats.quota = null;
+    if (client.account() == account) {
+        self.stats.quota = null;
+        self.cache_evidence.expected_model = "";
+    }
 }
 
 /// Drop cache evidence for an account whose credential changed. A credential
 /// can now identify a different provider principal with an isolated cache.
 fn dropCacheEvidence(self: *Agent, account: llm.Account) void {
-    const activity = self.cache_activity orelse return;
-    if (activity.account == account) self.cache_activity = null;
+    self.cache_evidence.dropAccount(account);
 }
 
 /// Remove replay proofs produced by one account slot. A successful credential
@@ -424,10 +523,11 @@ fn dropReasoning(self: *Agent, account: llm.Account) void {
     self.items.shrinkRetainingCapacity(retained_count);
 }
 
-/// Switch the reasoning-effort level. It takes effect on the next turn. A
-/// change drops cache evidence because the serialized request can change.
+/// Switch the reasoning-effort level. It takes effect on the next turn.
 pub fn setEffort(self: *Agent, effort: llm.Effort) void {
-    if (self.effort != effort) self.cache_activity = null;
+    // The entries stay: the resolved effort is part of the cache key, so a
+    // change reads as a cold cache and a change back within retention meets
+    // the old warm one.
     self.effort = effort;
 }
 
@@ -442,29 +542,60 @@ pub fn cacheRisk(self: *const Agent) ?CacheRisk {
 fn cacheRiskAt(self: *const Agent, now: *const std.Io.Clock.Timestamp) ?CacheRisk {
     if (self.items.items.len == 0) return null;
     const client = self.client orelse return null;
-    const activity = self.cache_activity orelse return null;
-    const retention_ms = self.cache.retentionMs(client.account(), &self.model) orelse return null;
-    if (retention_ms == 0 or activity.prefix_tokens == 0) return null;
-    if (activity.account != client.account() or
-        !std.mem.eql(u8, activity.model, self.model.name) or
-        activity.retention_ms != retention_ms or
-        activity.cache_read != self.model.cache_read or
-        activity.cache_write != self.model.cache_write)
-    {
-        return null;
-    }
-    if (activity.request_at.clock != .boot or now.clock != .boot) return null;
-    const elapsed_ns = activity.request_at.durationTo(now.*).raw.toNanoseconds();
-    const retention_ns = @as(i96, @intCast(retention_ms)) * std.time.ns_per_ms;
+    const account = client.account();
+    const expected = self.expectedModel();
+    // The policy can turn the warning off for a vendor, and a model without a
+    // stated retention cannot be judged. The expected model is the one whose
+    // cache the check judges, so it resolves the policy too.
+    const policy_retention_ms = self.cache.retentionMs(account, &expected) orelse return null;
+    if (policy_retention_ms == 0) return null;
+    if (now.clock != .boot) return null;
+    const evidence = &self.cache_evidence;
+    const effort = expected.effort.resolve(self.effort);
+    const index = evidence.indexOf(account, expected.name, effort) orelse {
+        // The expected model holds no cache under the active effort, so the
+        // next request probably rewrites the whole history: the case after
+        // `/model` or `/effort` to a pairing the conversation has not used.
+        // The newest entry of the account sizes the estimate, because the
+        // history is shared. A conversation with no entry at all has no size
+        // and nothing to lose.
+        const newest = evidence.newestOf(account) orelse return null;
+        return self.riskOverPrefix(newest.prefix_tokens, policy_retention_ms, .cold);
+    };
+    const entry = &evidence.entries[index];
+    if (entry.request_at.clock != .boot) return null;
+    const elapsed_ns = entry.request_at.durationTo(now.*).raw.toNanoseconds();
+    const retention_ns = @as(i96, @intCast(entry.retention_ms)) * std.time.ns_per_ms;
     if (elapsed_ns < retention_ns) return null;
+    return self.riskOverPrefix(entry.prefix_tokens, entry.retention_ms, .stale);
+}
 
-    const fresh = self.model.cost(&.{ .cache_read = activity.prefix_tokens });
-    const stale = self.model.cost(&.{ .cache_write = activity.prefix_tokens });
+/// The rewrite risk over one prefix, priced at the active model's rates and
+/// held to the policy floor. Null on an empty prefix or a cost under the floor.
+fn riskOverPrefix(
+    self: *const Agent,
+    prefix_tokens: u64,
+    retention_ms: u64,
+    cause: CacheRisk.Cause,
+) ?CacheRisk {
+    if (prefix_tokens == 0) return null;
+    const fresh = self.model.cost(&.{ .cache_read = prefix_tokens });
+    const stale = self.model.cost(&.{ .cache_write = prefix_tokens });
     const cost_extra = @max(0, stale - fresh);
     // A rewrite under the floor is not worth an interruption, so the turn
     // starts without one. The default floor of zero warns about every risk.
     if (cost_extra < self.cache.warning_min_cost) return null;
-    return .{ .retention_ms = retention_ms, .cost_extra = cost_extra };
+    return .{ .retention_ms = retention_ms, .cost_extra = cost_extra, .cause = cause };
+}
+
+/// The model expected to serve the next request: the one that served the last
+/// reply, or the active model when no reply arrived since the last switch. The
+/// table entry resolves the active effort into the wire form the cache keys on.
+fn expectedModel(self: *const Agent) models.Model {
+    const expected_name = self.cache_evidence.expected_model;
+    if (expected_name.len == 0) return self.model;
+    const client = self.client orelse return self.model;
+    return models.get(client.account().provider(), expected_name) orelse self.model;
 }
 
 /// Run one user turn as a checkpointed transaction, stream output through
@@ -706,6 +837,11 @@ fn fetchReply(
             try presentation(&turn.presentation_closed, handler.onError(stream.errorText()));
             return error.ApiError;
         }
+        // The provider accepted this attempt, so its cache lookup already
+        // refreshed the real retention window. Anchor the evidence now, not at
+        // usage receipt, so a canceled or failed attempt cannot leave a stale
+        // anchor and a premature warning.
+        self.refreshCacheAnchor(&request_at);
         var usage_recorded = false;
         const reply = self.readReplyWith(
             &model,
@@ -828,7 +964,12 @@ fn recordUsage(self: *Agent, model: *const models.Model, usage: *const llm.Usage
 }
 
 /// Record billing and the cache prefix from one provider-accepted request.
-/// `request_at` is the dispatch time, not the later response completion.
+/// `model` is the model that served the reply, or the requested model on the
+/// error paths where no served name arrived. The reply is direct evidence for
+/// the serving model's cache: its cache buckets describe that cache, touched
+/// at this request's dispatch. `request_at` is the dispatch time, not the
+/// later response completion, because the cache lookup happens before response
+/// generation.
 fn recordRequestUsage(
     self: *Agent,
     model: *const models.Model,
@@ -836,26 +977,67 @@ fn recordRequestUsage(
     request_at: *const std.Io.Clock.Timestamp,
 ) void {
     self.recordUsage(model, usage);
-    const account = if (self.client) |client| client.account() else {
-        self.cache_activity = null;
-        return;
-    };
-    const retention_ms = self.cache.retentionMs(account, model) orelse {
-        self.cache_activity = null;
-        return;
-    };
+    const account = if (self.client) |client| client.account() else return;
+    // A model whose retention the policy turns off, or one that states none,
+    // takes no warning, so it needs no entry.
+    const retention_ms = self.cache.retentionMs(account, model) orelse return;
+    if (retention_ms == 0) return;
     // Only the cache buckets become a cheap read on the next request. The
     // uncached input and the output form a new delta regardless of expiry.
     const prefix_tokens = usage.cache_read +| usage.cache_write;
-    self.cache_activity = .{
+    self.cache_evidence.touch(.{
         .account = account,
         .model = model.name,
+        .effort = model.effort.resolve(self.effort),
         .retention_ms = retention_ms,
-        .cache_read = model.cache_read,
-        .cache_write = model.cache_write,
         .request_at = request_at.*,
         .prefix_tokens = prefix_tokens,
-    };
+    });
+}
+
+/// The model that prices one reply: the requested one, or the table entry of
+/// the model the response names as the one that served it. An unknown served
+/// name fails the turn, because a price at rates Pith does not know corrupts
+/// the ledger silently. The failed attempt still bills at the requested rates
+/// through the usage-so-far path, so the spend is kept while the report names
+/// the model Pith cannot price.
+fn pricingModel(
+    self: *Agent,
+    requested: *const models.Model,
+    served_name: []const u8,
+    presentation_closed: *bool,
+    handler: anytype,
+) !models.Model {
+    if (served_name.len == 0 or std.mem.eql(u8, served_name, requested.name))
+        return requested.*;
+    const account = self.client.?.account();
+    if (models.get(account.provider(), served_name)) |served| return served;
+    const text = try std.fmt.allocPrint(
+        self.gpa,
+        "Pith does not know the model \"{s}\" that served this reply, so Pith cannot price " ++
+            "it. Use /model to pick another model.",
+        .{served_name},
+    );
+    defer self.gpa.free(text);
+    try presentation(presentation_closed, handler.onError(text));
+    return error.UnknownServedModel;
+}
+
+/// Refresh the cache anchor of the model expected to serve an attempt the
+/// provider accepted. The cache lookup happens before response generation, so
+/// an accepted attempt refreshes the real retention window even when it later
+/// fails, is canceled, or streams no usage frame. Without this refresh the
+/// anchor goes stale and the next submit warns early. Evidence recorded later
+/// by the same attempt overwrites this with the same timestamp.
+fn refreshCacheAnchor(self: *Agent, request_at: *const std.Io.Clock.Timestamp) void {
+    const client = self.client orelse return;
+    const expected = self.expectedModel();
+    const index = self.cache_evidence.indexOf(
+        client.account(),
+        expected.name,
+        expected.effort.resolve(self.effort),
+    ) orelse return;
+    self.cache_evidence.entries[index].request_at = request_at.*;
 }
 
 /// Record a stream's nonzero running usage unless its terminal event already did.
@@ -927,9 +1109,17 @@ fn readReplyWith(
         };
     }
     const stop = maybe_stop orelse return error.IncompleteReply;
+    // The model that really served the reply prices it, so a provider-side
+    // fallback bills at the fallback's rates. An unknown served model fails the
+    // turn instead of pricing at rates Pith cannot know.
+    const priced_model = try self.pricingModel(model, stop.model, presentation_closed, handler);
     // Terminal usage is billable even when replay validation rejects the reply
     // and the request is retried.
-    self.recordRequestUsage(model, &stop.usage, request_at);
+    self.recordRequestUsage(&priced_model, &stop.usage, request_at);
+    // The server that answered last is the best prediction of the next one,
+    // because a provider-side fallback holds for a conversation. Only a reply
+    // states its server, so the error paths leave the expectation alone.
+    self.cache_evidence.expected_model = priced_model.name;
     usage_recorded.* = true;
     try presentation(presentation_closed, handler.onUsage(self.stats));
 
@@ -945,6 +1135,17 @@ fn readReplyWith(
     // cut-short one. A resample is still worth a retry, but the exhausted-retry
     // report must say the model returned nothing rather than blame the stream.
     if (reply_items.items.len == 0) return error.EmptyReply;
+    // A switch reports only for a committed reply, like the truncation flag: a
+    // durable event block ends the open streamed message, so a report on a
+    // rejected attempt leaves partial text that the retry's stream reset
+    // cannot discard. The attempt that lands reports the switch. It reports
+    // before the commit below, so a closed presentation channel cannot fail
+    // the reply after history already owns its items.
+    if (stop.model.len != 0 and !std.mem.eql(u8, stop.model, model.name))
+        try presentation(presentation_closed, handler.onModelMismatch(.{
+            .requested = model.name,
+            .served = stop.model,
+        }));
 
     const start = self.items.items.len;
     try self.items.appendSlice(gpa, reply_items.items);
@@ -1215,6 +1416,9 @@ test retryableError {
     // A retry meets the same wire order, so a correlation failure fails the turn
     // at once instead of spending the budget on the same outcome.
     try std.testing.expect(!retryableError(error.UncorrelatedReply));
+    // The provider's fallback holds for the conversation, so a retry meets the
+    // same unknown model and only spends the budget.
+    try std.testing.expect(!retryableError(error.UnknownServedModel));
 }
 
 test "resetConversation clears conversation state and preserves configuration" {
@@ -1234,7 +1438,7 @@ test "resetConversation clears conversation state and preserves configuration" {
     };
     agent.recordRequestUsage(&agent.model, &usage, &request_at);
     try std.testing.expect(agent.stats.model_count == 1);
-    try std.testing.expect(agent.cache_activity != null);
+    try std.testing.expectEqual(@as(usize, 1), agent.cache_evidence.entry_count);
     try agent.steering.push("old steering");
 
     agent.resetConversation();
@@ -1247,7 +1451,7 @@ test "resetConversation clears conversation state and preserves configuration" {
     defer gpa.free(steering);
     try std.testing.expectEqual(@as(usize, 0), steering.len);
     try std.testing.expect(!std.mem.eql(u8, &cache_key, &agent.cache_key));
-    try std.testing.expect(agent.cache_activity == null);
+    try std.testing.expectEqual(@as(usize, 0), agent.cache_evidence.entry_count);
     try std.testing.expectEqual(account, agent.client.?.account());
     try std.testing.expectEqualStrings(model.name, agent.model.name);
     try std.testing.expectEqual(llm.Effort.high, agent.effort);
@@ -1394,24 +1598,84 @@ test "cache risk needs matching setup, effort, and a reusable prefix" {
 
     agent.recordRequestUsage(&agent.model, &.{ .cache_read = 1000 }, &start);
     try std.testing.expect(agent.cacheRiskAt(&stale_at) != null);
-    agent.setEffort(.none);
-    try std.testing.expect(agent.cache_activity != null);
+    // The resolved effort is part of the cache key: a change reads as a cold
+    // cache at once, and a change back within retention meets the old warm one.
+    const warm_at: std.Io.Clock.Timestamp = .{
+        .raw = .fromNanoseconds(std.time.ns_per_min),
+        .clock = .boot,
+    };
+    try std.testing.expect(agent.cacheRiskAt(&warm_at) == null);
     agent.setEffort(.high);
-    try std.testing.expect(agent.cache_activity == null);
+    try std.testing.expect(agent.cache_evidence.entry_count != 0);
+    try std.testing.expectEqual(
+        CacheRisk.Cause.cold,
+        agent.cacheRiskAt(&warm_at).?.cause,
+    );
+    agent.setEffort(.none);
+    try std.testing.expect(agent.cacheRiskAt(&warm_at) == null);
 
-    agent.recordRequestUsage(&agent.model, &.{ .cache_read = 1000 }, &start);
     const client = agent.client.?;
     agent.switchTo(client, models.get(.anthropic, "claude-sonnet-4-6").?);
-    try std.testing.expect(agent.cache_activity == null);
+    // A model switch keeps the entries: the new model's cold cache warns at
+    // once, and a switch back can meet the old model's warm cache.
+    try std.testing.expect(agent.cache_evidence.entry_count != 0);
+    try std.testing.expectEqual(
+        CacheRisk.Cause.cold,
+        agent.cacheRiskAt(&stale_at).?.cause,
+    );
 
     agent.recordRequestUsage(&agent.model, &.{ .cache_write = 1000 }, &start);
     agent.dropCacheEvidence(.anthropic_subscription);
-    try std.testing.expect(agent.cache_activity == null);
+    try std.testing.expect(agent.cache_evidence.entry_count == 0);
 
     agent.recordRequestUsage(&agent.model, &.{ .cache_write = 1000 }, &start);
     agent.client = null;
+    // A signed-out record books the money and leaves the evidence alone, and
+    // the consult returns null without a client either way.
     agent.recordRequestUsage(&agent.model, &.{ .cache_write = 1000 }, &start);
-    try std.testing.expect(agent.cache_activity == null);
+    try std.testing.expect(agent.cacheRiskAt(&stale_at) == null);
+}
+
+// A model switch meets per-model reality: the new model holds no cache for
+// this conversation, so the first submit warns at once, and a switch back
+// within retention meets the old model's still-warm cache and stays silent.
+test "a model switch warns on a cold cache and not on a warm one" {
+    const gpa = std.testing.allocator;
+    var agent = scriptedAgent(gpa);
+    defer agent.deinit();
+    try agent.appendUser("committed context");
+    const start: std.Io.Clock.Timestamp = .{ .raw = .zero, .clock = .boot };
+    const usage: llm.Usage = .{ .cache_read = 160_000, .cache_write = 40_000 };
+    agent.recordRequestUsage(&agent.model, &usage, &start);
+
+    // Warm on the same model: silence.
+    const soon: std.Io.Clock.Timestamp = .{
+        .raw = .fromNanoseconds(std.time.ns_per_min),
+        .clock = .boot,
+    };
+    try std.testing.expect(agent.cacheRiskAt(&soon) == null);
+
+    // `/model` to a model this conversation has not used: its cache is cold,
+    // so the warning fires at once, sized by the shared history and priced at
+    // the new model's rates: (3.75 - 0.3) * 0.2 million tokens.
+    const client = agent.client.?;
+    agent.switchTo(client, models.get(.anthropic, "claude-sonnet-4-6").?);
+    const cold_risk = agent.cacheRiskAt(&soon).?;
+    try std.testing.expectEqual(CacheRisk.Cause.cold, cold_risk.cause);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.69), cold_risk.cost_extra, 1e-9);
+
+    // The switch back within retention meets the old model's warm cache.
+    agent.switchTo(client, models.get(.anthropic, "claude-opus-4-8").?);
+    try std.testing.expect(agent.cacheRiskAt(&soon) == null);
+    // Past retention the timing rule warns as always.
+    const late: std.Io.Clock.Timestamp = .{
+        .raw = .fromNanoseconds(10 * std.time.ns_per_min),
+        .clock = .boot,
+    };
+    try std.testing.expectEqual(
+        CacheRisk.Cause.stale,
+        agent.cacheRiskAt(&late).?.cause,
+    );
 }
 
 /// A cache-only clock over a real vtable. This test calls only `now`, because
@@ -1746,6 +2010,8 @@ const CaptureHandler = struct {
     text: std.ArrayList(u8) = .empty,
     /// Every streamed tool call as `name arguments`, one per line.
     streamed_tools: std.ArrayList(u8) = .empty,
+    /// Every reported model switch as `requested served`, one per line.
+    model_mismatches: std.ArrayList(u8) = .empty,
     errors: std.ArrayList(u8) = .empty,
     usage_count: usize = 0,
     tool_start_count: usize = 0,
@@ -1760,6 +2026,7 @@ const CaptureHandler = struct {
         self.thinking.deinit(self.gpa);
         self.text.deinit(self.gpa);
         self.streamed_tools.deinit(self.gpa);
+        self.model_mismatches.deinit(self.gpa);
         self.errors.deinit(self.gpa);
     }
 
@@ -1792,6 +2059,13 @@ const CaptureHandler = struct {
         _ = stats;
         self.usage_count += 1;
         if (self.fail_usage) return error.Canceled;
+    }
+
+    fn onModelMismatch(self: *CaptureHandler, mismatch: ModelMismatch) !void {
+        try self.model_mismatches.print(self.gpa, "{s} {s}\n", .{
+            mismatch.requested,
+            mismatch.served,
+        });
     }
 
     fn onToolName(self: *CaptureHandler, name: []const u8) !void {
@@ -1862,6 +2136,7 @@ fn anthropicStream(io: std.Io, reader: *std.Io.Reader, idle_ms: u64) provider.St
     stream.anthropic_subscription.block_proof = .empty;
     stream.anthropic_subscription.tool_call_id = .empty;
     stream.anthropic_subscription.tool_name = .empty;
+    stream.anthropic_subscription.served_model = .empty;
     stream.anthropic_subscription.usage = .{};
     return stream;
 }
@@ -1880,6 +2155,7 @@ fn openaiStream(io: std.Io, reader: *std.Io.Reader) provider.Stream {
     stream.openai_api.summary_index = 0;
     stream.openai_api.completed_item_ids = .empty;
     stream.openai_api.call_item_id = .empty;
+    stream.openai_api.served_model = .empty;
     stream.openai_api.usage = .{};
     stream.openai_api.quota = null;
     return stream;
@@ -1920,6 +2196,182 @@ test "readReply stops before a post-completion timeout" {
     try std.testing.expectEqual(@as(usize, 1), reply.len);
     try std.testing.expectEqualStrings("done", reply[0].message.text);
     try std.testing.expectEqual(@as(usize, 1), handler.usage_count);
+}
+
+// A provider can switch a flagged request to a fallback model. The stop names
+// the model that served the reply, so the switch reports instead of passing as
+// the requested model. A stop that names the requested model, or none, reports
+// nothing.
+test "readReply reports a reply that another model served" {
+    const gpa = std.testing.allocator;
+    var agent = scriptedAgent(gpa);
+    defer agent.deinit();
+    var handler: CaptureHandler = .{ .gpa = gpa };
+    defer handler.deinit();
+
+    const served_by_fallback = [_]llm.Event{
+        .{ .item = .{ .message = "done" } },
+        .{ .stop = .{ .usage = .{ .output = 1 }, .model = "claude-sonnet-4-6" } },
+    };
+    var fallback_stream: ScriptedStream = .{ .events = &served_by_fallback };
+    _ = try agent.readReply(&agent.model, &fallback_stream, &handler);
+    try std.testing.expectEqualStrings(
+        "claude-opus-4-8 claude-sonnet-4-6\n",
+        handler.model_mismatches.items,
+    );
+
+    const served_as_requested = [_]llm.Event{
+        .{ .item = .{ .message = "done" } },
+        .{ .stop = .{ .usage = .{ .output = 1 }, .model = "claude-opus-4-8" } },
+    };
+    var matching_stream: ScriptedStream = .{ .events = &served_as_requested };
+    _ = try agent.readReply(&agent.model, &matching_stream, &handler);
+    const served_unnamed = [_]llm.Event{
+        .{ .item = .{ .message = "done" } },
+        .{ .stop = .{ .usage = .{ .output = 1 } } },
+    };
+    var unnamed_stream: ScriptedStream = .{ .events = &served_unnamed };
+    _ = try agent.readReply(&agent.model, &unnamed_stream, &handler);
+    try std.testing.expectEqualStrings(
+        "claude-opus-4-8 claude-sonnet-4-6\n",
+        handler.model_mismatches.items,
+    );
+
+    // A rejected attempt reports no switch: a durable event block ends the
+    // open streamed message, the retry's stream reset then cannot discard the
+    // partial text, and the retried reply duplicates it.
+    const served_and_rejected = [_]llm.Event{
+        .{ .text = "partial" },
+        .{ .item = .{ .message = "partial" } },
+        .{ .stop = .{
+            .usage = .{ .output = 1 },
+            .rejection = .invalid,
+            .model = "claude-sonnet-4-6",
+        } },
+    };
+    var rejected_stream: ScriptedStream = .{ .events = &served_and_rejected };
+    try std.testing.expectError(
+        error.IncompleteReply,
+        agent.readReply(&agent.model, &rejected_stream, &handler),
+    );
+    try std.testing.expectEqualStrings(
+        "claude-opus-4-8 claude-sonnet-4-6\n",
+        handler.model_mismatches.items,
+    );
+}
+
+// The provider bills a switched request at the fallback's rates, so the ledger
+// must price the reply at the model that served it and attribute the usage to
+// that model's bucket. The reply is also direct evidence for the serving
+// model's cache, and that model is the expected next server, so the warning
+// stays silent while the fallback's cache is warm and fires past retention.
+test "readReply prices a reply at the model that served it" {
+    const gpa = std.testing.allocator;
+    var agent = scriptedAgent(gpa);
+    defer agent.deinit();
+    var handler: CaptureHandler = .{ .gpa = gpa };
+    defer handler.deinit();
+
+    const usage: llm.Usage = .{ .input = 1_000_000, .output = 10_000, .cache_write = 100 };
+    const events = [_]llm.Event{
+        .{ .item = .{ .message = "done" } },
+        .{ .stop = .{ .usage = usage, .model = "claude-sonnet-4-6" } },
+    };
+    var stream: ScriptedStream = .{ .events = &events };
+    _ = try agent.readReply(&agent.model, &stream, &handler);
+
+    const served = models.get(.anthropic, "claude-sonnet-4-6").?;
+    try std.testing.expectEqual(served.cost(&usage), agent.stats.cost);
+    try std.testing.expectEqual(served.savings(&usage), agent.stats.saved);
+    try std.testing.expectEqualStrings("claude-sonnet-4-6", agent.stats.by_model[0].name);
+    try std.testing.expectEqualStrings("claude-sonnet-4-6", agent.cache_evidence.entries[0].model);
+    try std.testing.expectEqualStrings("claude-sonnet-4-6", agent.cache_evidence.expected_model);
+
+    // The anchor moves to a known time first, because readReply stamped the
+    // real clock.
+    const anchored_at: std.Io.Clock.Timestamp = .{
+        .raw = .fromNanoseconds(std.time.ns_per_ms),
+        .clock = .boot,
+    };
+    agent.refreshCacheAnchor(&anchored_at);
+    // Within retention the sticky fallback keeps its own cache warm: silence.
+    const warm_at: std.Io.Clock.Timestamp = .{
+        .raw = .fromNanoseconds(4 * std.time.ns_per_min),
+        .clock = .boot,
+    };
+    try std.testing.expect(agent.cacheRiskAt(&warm_at) == null);
+    // Past retention every candidate cache is stale, so the warning fires.
+    const probe_at: std.Io.Clock.Timestamp = .{
+        .raw = .fromNanoseconds(10 * std.time.ns_per_min),
+        .clock = .boot,
+    };
+    try std.testing.expectEqual(
+        CacheRisk.Cause.stale,
+        agent.cacheRiskAt(&probe_at).?.cause,
+    );
+}
+
+// The cache lookup happens before response generation, so an attempt the
+// provider accepted refreshes the real retention window at its dispatch even
+// when it streams no usage. The anchor must follow, or the next submit warns
+// about a cache the provider just refreshed.
+test "an accepted attempt refreshes the cache anchor without usage" {
+    const gpa = std.testing.allocator;
+    var agent = scriptedAgent(gpa);
+    defer agent.deinit();
+
+    const first_at: std.Io.Clock.Timestamp = .{
+        .raw = .fromNanoseconds(std.time.ns_per_ms),
+        .clock = .boot,
+    };
+    agent.recordRequestUsage(&agent.model, &.{ .cache_write = 1000 }, &first_at);
+    const later_at: std.Io.Clock.Timestamp = .{
+        .raw = .fromNanoseconds(4 * std.time.ns_per_min),
+        .clock = .boot,
+    };
+    agent.refreshCacheAnchor(&later_at);
+    try std.testing.expectEqual(later_at.raw, agent.cache_evidence.entries[0].request_at.raw);
+    // The refreshed prefix stays warm past the old anchor's expiry.
+    const probe_at: std.Io.Clock.Timestamp = .{
+        .raw = .fromNanoseconds(8 * std.time.ns_per_min),
+        .clock = .boot,
+    };
+    try agent.appendUser("hi");
+    try std.testing.expect(agent.cacheRiskAt(&probe_at) == null);
+
+    // Without evidence there is nothing to anchor, so the refresh is a no-op.
+    agent.cache_evidence.clear();
+    agent.refreshCacheAnchor(&later_at);
+    try std.testing.expectEqual(@as(usize, 0), agent.cache_evidence.entry_count);
+}
+
+// A price at rates Pith does not know corrupts the ledger silently, so an
+// unknown served model fails the turn with a report that names it. The user
+// adds support for the model instead of reading a wrong total.
+test "readReply fails a reply that an unknown model served" {
+    const gpa = std.testing.allocator;
+    var agent = scriptedAgent(gpa);
+    defer agent.deinit();
+    var handler: CaptureHandler = .{ .gpa = gpa };
+    defer handler.deinit();
+
+    const events = [_]llm.Event{
+        .{ .item = .{ .message = "done" } },
+        .{ .stop = .{ .usage = .{ .output = 1 }, .model = "claude-mythos-5" } },
+    };
+    var stream: ScriptedStream = .{ .events = &events };
+    try std.testing.expectError(
+        error.UnknownServedModel,
+        agent.readReply(&agent.model, &stream, &handler),
+    );
+    try std.testing.expectEqualStrings(
+        "Pith does not know the model \"claude-mythos-5\" that served this reply, " ++
+            "so Pith cannot price it. Use /model to pick another model.",
+        handler.errors.items,
+    );
+    // Nothing was priced, so the ledger holds no number the report contradicts.
+    try std.testing.expectEqual(@as(usize, 0), handler.usage_count);
+    try std.testing.expectEqual(@as(f64, 0), agent.stats.cost);
 }
 
 // The name and the argument fragments of a tool call are display only. They
@@ -2751,23 +3203,37 @@ test "dropped account evidence takes the allowance of the active account only" {
     // The gauge belongs to the account whose response reported it, so another
     // account's replaced credential leaves it alone.
     agent.stats.quota = quota;
-    agent.cache_activity = .{
+    agent.cache_evidence.touch(.{
         .account = .openai_api,
         .model = "gpt-5.6-sol",
+        .effort = .{ .named = "xhigh" },
         .retention_ms = 300_000,
-        .cache_read = 0.1,
-        .cache_write = 1.25,
         .request_at = .{ .raw = .zero, .clock = .boot },
         .prefix_tokens = 1000,
-    };
+    });
+    agent.cache_evidence.touch(.{
+        .account = .anthropic_subscription,
+        .model = "claude-opus-4-8",
+        .effort = .omitted,
+        .retention_ms = 300_000,
+        .request_at = .{ .raw = .zero, .clock = .boot },
+        .prefix_tokens = 1000,
+    });
+    agent.cache_evidence.expected_model = "claude-opus-4-8";
     agent.dropAccountEvidence(.openai_api);
     try std.testing.expect(agent.stats.quota != null);
-    try std.testing.expect(agent.cache_activity == null);
+    // Only the replaced account's entries fall. The other account keeps its
+    // evidence and its serving expectation, because its principal did not
+    // change.
+    try std.testing.expectEqual(@as(usize, 1), agent.cache_evidence.entry_count);
+    try std.testing.expectEqualStrings("claude-opus-4-8", agent.cache_evidence.entries[0].model);
+    try std.testing.expectEqualStrings("claude-opus-4-8", agent.cache_evidence.expected_model);
 
     // A replaced credential of the active account takes it, because the next
-    // principal has its own allowance.
+    // principal has its own allowance and its own serving history.
     agent.dropAccountEvidence(.anthropic_subscription);
     try std.testing.expect(agent.stats.quota == null);
+    try std.testing.expectEqualStrings("", agent.cache_evidence.expected_model);
 
     // A signed-out agent has no account to compare, and drops nothing.
     agent.signOut();

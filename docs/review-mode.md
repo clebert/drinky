@@ -17,22 +17,28 @@ landed too, so only active context projection and conversation switching remain.
 
 ### Active context projection
 
-Pith keeps complete provider-neutral history. It projects that history for the active account and
-model.
+Pith keeps complete provider-neutral history. It projects that history for the active account.
 
 - User and assistant messages remain compatible.
-- Opaque reasoning requires the exact account and model that created it.
+- Opaque reasoning requires the exact account that created it.
 - A tool call and its results form one linked group.
 - Pith includes a tool group only when the active provider can represent it correctly.
 - Hidden items stay in canonical history and return after a compatible switch.
 - A credential replacement permanently removes replay proofs from that account slot.
+
+The model is not a projection dimension. Anthropic replays mixed-model reasoning in one account,
+which its Fable fallback shows. Pith records no producing model on a reasoning item, and every
+`/model` switch already replays the previous model's reasoning. Whether OpenAI accepts a
+cross-model replay of encrypted reasoning is unconfirmed. A rejection surfaces as a loud API
+error, so Pith does not filter on a guess.
 
 The visible conversation blocks must match the projected model context. Pith shows no marker for a
 hidden item.
 
 Local event blocks remain visible because they are not model context.
 
-An account, model, or conversation switch performs a deep repaint:
+A model switch within one account hides nothing, so it needs no deep repaint. An account or
+conversation switch performs one:
 
 - Select the canonical history and its local events.
 - Project compatible conversation items.
@@ -622,8 +628,8 @@ A role switch uses the shared conversation-switch operation. It never mixes tran
 The reviewer and fixer reset before each fresh phase. Pith banks their cost, clears their agent
 history, and clears the matching transcript.
 
-The judge keeps its history and transcript until the workflow ends. Account and model switches use
-the shared filtered projection.
+The judge keeps its history and transcript until the workflow ends. An account switch uses the
+shared filtered projection.
 
 Review histories, cache evidence, and usage stay separate from the main agent. Review mode never
 compacts or resets the main conversation.

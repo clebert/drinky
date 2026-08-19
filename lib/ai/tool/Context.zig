@@ -23,6 +23,31 @@ pub const Bash = struct {
     /// The bytes kept from the tail of a command's output.
     bytes_max: usize = 50 * 1024,
     /// The default wall-clock timeout a command runs under, in milliseconds. A
-    /// per-call `timeout_seconds` overrides it, and 0 means no limit.
+    /// per-call `timeout_seconds` overrides it, inside the window below.
     timeout_ms: u64 = 120_000,
+
+    /// The smallest timeout a command can run under. A command that ends at once
+    /// still needs a window that a slow start fits in.
+    pub const timeout_ms_min = 1_000;
+    /// The largest timeout a command can run under. Every command runs under a
+    /// limit, because a command that never ends holds the turn and the user with
+    /// it. One hour covers a long build and still ends by itself.
+    pub const timeout_ms_max = 60 * std.time.ms_per_min;
+
+    /// Hold a timeout inside the legal window. The config and the per-call
+    /// argument both pass through this, so no path can disable the limit or
+    /// state a span the display cannot measure.
+    pub fn clampTimeoutMs(timeout_ms: u64) u64 {
+        return std.math.clamp(timeout_ms, timeout_ms_min, timeout_ms_max);
+    }
 };
+
+test "clampTimeoutMs holds every value inside the legal window" {
+    try std.testing.expectEqual(@as(u64, Bash.timeout_ms_min), Bash.clampTimeoutMs(0));
+    try std.testing.expectEqual(@as(u64, Bash.timeout_ms_min), Bash.clampTimeoutMs(1));
+    try std.testing.expectEqual(@as(u64, 5_000), Bash.clampTimeoutMs(5_000));
+    try std.testing.expectEqual(
+        @as(u64, Bash.timeout_ms_max),
+        Bash.clampTimeoutMs(std.math.maxInt(u64)),
+    );
+}

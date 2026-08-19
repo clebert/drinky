@@ -43,6 +43,10 @@ dropped_effort: ?[]const u8 = null,
 /// the policy falls back to the built-in floor. Null on a legal value. Owned.
 /// `deinit` frees it.
 dropped_cost: ?[]const u8 = null,
+/// The configured command timeout that Pith cannot use, in milliseconds. The
+/// config keeps it so the app can tell the user Pith ignored their line, and the
+/// bash tool falls back to the built-in timeout. Null on a legal value.
+dropped_bash_timeout_ms: ?u64 = null,
 /// The keys of `config.json` that no field of `File` matches, as paths in file
 /// order. The parse ignores them, so the app reports them and a typo does not
 /// disappear silently. Owned. `deinit` frees them.
@@ -233,8 +237,12 @@ const keys = [_]Key{
     },
     .{
         .path = "bash.timeout_ms",
-        .description = "The time that a command runs before Pith stops it. A per-call " ++
-            "argument overrides it, and 0 means no limit.",
+        .description = std.fmt.comptimePrint(
+            "The time that a command runs before Pith stops it. A per-call argument " ++
+                "overrides it. Every command runs under a limit, so the value must be from " ++
+                "{d} to {d}. Pith reports a value it cannot use and keeps the default.",
+            .{ ai.tool.Context.Bash.timeout_ms_min, ai.tool.Context.Bash.timeout_ms_max },
+        ),
     },
     .{
         .path = "cache.anthropic_retention_ms",
@@ -639,6 +647,8 @@ fn loadFromData(gpa: std.mem.Allocator, io: std.Io, options: *const DataOptions)
         &source.value,
         cache.warning_min_cost,
     );
+    var dropped_bash_timeout_ms: ?u64 = null;
+    const bash_timeout_ms = resolveBashTimeout(&dropped_bash_timeout_ms, bash.timeout_ms);
     var unknown: std.ArrayList([]const u8) = .empty;
     errdefer {
         for (unknown.items) |key| gpa.free(key);
@@ -669,7 +679,7 @@ fn loadFromData(gpa: std.mem.Allocator, io: std.Io, options: *const DataOptions)
         .bash = .{
             .lines_max = bash.output_lines_max,
             .bytes_max = bash.output_bytes_max,
-            .timeout_ms = bash.timeout_ms,
+            .timeout_ms = bash_timeout_ms,
         },
         .cache = .{
             .anthropic_retention_ms = cache.anthropic_retention_ms,
@@ -682,6 +692,7 @@ fn loadFromData(gpa: std.mem.Allocator, io: std.Io, options: *const DataOptions)
         .dropped_models = dropped_models,
         .dropped_effort = dropped_effort,
         .dropped_cost = dropped_cost,
+        .dropped_bash_timeout_ms = dropped_bash_timeout_ms,
         .unknown_keys = unknown_keys,
         .unknown_keys_omitted = unknown_keys_omitted,
     };
@@ -808,6 +819,18 @@ fn resolveCost(
     return cache_default.warning_min_cost;
 }
 
+/// Resolve the configured command timeout. Every command runs under a limit, so
+/// a value outside the legal window states a wait that no command can take. Such
+/// a value falls back to the built-in timeout, and the function records it in
+/// `dropped` so the app can surface it.
+fn resolveBashTimeout(dropped: *?u64, configured: u64) u64 {
+    if (configured >= ai.tool.Context.Bash.timeout_ms_min and
+        configured <= ai.tool.Context.Bash.timeout_ms_max)
+        return configured;
+    dropped.* = configured;
+    return bash_default.timeout_ms;
+}
+
 /// The text of `cache.warning_min_cost` as the user wrote it, duped for the
 /// report. The load keeps every number as text, so the report can quote the line
 /// instead of a value that already rounded to `inf`. A value the walk cannot
@@ -915,6 +938,45 @@ test "load reads the bash section" {
     try std.testing.expectEqual(@as(usize, 17), config.bash.lines_max);
     try std.testing.expectEqual(@as(usize, 4096), config.bash.bytes_max);
     try std.testing.expectEqual(@as(u64, 1500), config.bash.timeout_ms);
+    try std.testing.expect(config.dropped_bash_timeout_ms == null);
+}
+
+// Every command runs under a limit. A zero used to mean no limit, so a stale
+// file still names one. The load keeps the line for the report and falls back to
+// the built-in timeout.
+test "a command timeout Pith cannot use falls back to the default and is reported" {
+    const cases = [_]u64{
+        0,
+        ai.tool.Context.Bash.timeout_ms_min - 1,
+        ai.tool.Context.Bash.timeout_ms_max + 1,
+    };
+    for (cases) |configured| {
+        const data = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "{{ \"bash\": {{ \"timeout_ms\": {d} }} }}",
+            .{configured},
+        );
+        defer std.testing.allocator.free(data);
+        var config = try loadDataForTest(data);
+        defer config.deinit(std.testing.allocator);
+        try std.testing.expectEqual(bash_default.timeout_ms, config.bash.timeout_ms);
+        try std.testing.expectEqual(@as(?u64, configured), config.dropped_bash_timeout_ms);
+    }
+
+    // Both edges of the window are legal values, so neither is reported.
+    const edges = [_]u64{ ai.tool.Context.Bash.timeout_ms_min, ai.tool.Context.Bash.timeout_ms_max };
+    for (edges) |configured| {
+        const data = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "{{ \"bash\": {{ \"timeout_ms\": {d} }} }}",
+            .{configured},
+        );
+        defer std.testing.allocator.free(data);
+        var config = try loadDataForTest(data);
+        defer config.deinit(std.testing.allocator);
+        try std.testing.expectEqual(configured, config.bash.timeout_ms);
+        try std.testing.expect(config.dropped_bash_timeout_ms == null);
+    }
 }
 
 test "load reads the cache section" {

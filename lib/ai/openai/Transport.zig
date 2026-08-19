@@ -73,6 +73,11 @@ pub const Stream = struct {
     /// `output_item.added` opened. Owned, because a frame arena reset drops the
     /// parsed frame the id came from.
     call_item_id: std.ArrayList(u8),
+    /// The model that the response names as the one that serves it, captured
+    /// from `response.created` and overwritten by the terminal response. Owned,
+    /// because a frame arena reset drops the frame it arrives in. Empty until a
+    /// frame names one.
+    served_model: std.ArrayList(u8),
     usage: llm.Usage,
     /// The subscription allowance from the response head, or null when the
     /// backend sent no quota headers (API-key mode, or none present).
@@ -111,6 +116,16 @@ pub const Stream = struct {
         while (ids.next()) |id| self.gpa.free(id.*);
         self.completed_item_ids.deinit(self.gpa);
         self.call_item_id.deinit(self.gpa);
+        self.served_model.deinit(self.gpa);
+    }
+
+    /// Keep the model the response object names, so the stop can report a
+    /// switched model. A frame that names none keeps the last one, because the
+    /// terminal frame of some deployments omits fields the head stated.
+    fn captureServedModel(self: *Stream, response: *const std.json.ObjectMap) !void {
+        const model_name = json.string(response.get("model")) orelse return;
+        self.served_model.clearRetainingCapacity();
+        try self.served_model.appendSlice(self.gpa, model_name);
     }
 
     /// Capture the subscription allowance from the response head. The engine
@@ -405,6 +420,14 @@ pub const Stream = struct {
             self.markRejection(.unsupported);
             return .progress;
         }
+        if (std.mem.eql(u8, kind, "response.created")) {
+            // The head names the model that serves the reply. A stream that
+            // fails before its terminal frame still leaves nothing to report,
+            // because only the stop carries the name out.
+            if (json.object(object.get("response"))) |response|
+                try self.captureServedModel(&response);
+            return .progress;
+        }
         if (std.mem.eql(u8, kind, "response.output_text.delta")) {
             const delta = json.string(object.get("delta")) orelse return .progress;
             // The answer ends the reasoning display, and a delta with no bytes
@@ -453,6 +476,9 @@ pub const Stream = struct {
         if (status) |terminal_status| {
             if (json.object(object.get("response"))) |response| {
                 try self.reconcileTerminalOutput(&response);
+                // The terminal response object is authoritative, so a model it
+                // names replaces the one the head named.
+                try self.captureServedModel(&response);
             } else {
                 self.markRejection(.invalid);
             }
@@ -463,6 +489,7 @@ pub const Stream = struct {
                 .usage = self.usage,
                 .status = terminal_status,
                 .rejection = self.terminal_rejection,
+                .model = self.served_model.items,
             } } };
         }
         return if (std.mem.startsWith(u8, kind, "response.")) .progress else .ignored;
@@ -496,6 +523,7 @@ fn connect(self: *Transport, out: *Stream, payload: Payload) anyerror!void {
     out.summary_index = 0;
     out.completed_item_ids = .empty;
     out.call_item_id = .empty;
+    out.served_model = .empty;
     out.quota = null;
 
     const authorization = try std.fmt.allocPrint(self.gpa, "Bearer {s}", .{payload.access_token});
@@ -739,6 +767,7 @@ fn testStreamWithAllocator(
     stream.summary_index = 0;
     stream.completed_item_ids = .empty;
     stream.call_item_id = .empty;
+    stream.served_model = .empty;
     stream.quota = null;
     return stream;
 }
@@ -810,6 +839,42 @@ test "an empty terminal output snapshot does not reject the streamed reply" {
     );
     try std.testing.expectEqual(llm.Event.Status.complete, stop.event.stop.status);
     try std.testing.expect(stop.event.stop.rejection == null);
+}
+
+// A provider can switch a request to another model. `response.created` names
+// the model that serves the reply, the terminal response object overwrites it,
+// and the stop carries the last name out past every frame-arena reset. A stream
+// whose frames name none states none.
+test "the terminal response names the model that served the reply" {
+    var stream = testStream(undefined, undefined, 0, 0);
+    defer stream.deinitDecode();
+
+    try std.testing.expectEqual(@as(sse.Decoded, .progress), try stream.decode(
+        \\{"type":"response.created","response":{"model":"gpt-5.6-luna"}}
+    ));
+    _ = stream.frame_arena.reset(.retain_capacity);
+    const stop = try stream.decode(
+        \\{"type":"response.completed","response":{"status":"completed"}}
+    );
+    try std.testing.expectEqualStrings("gpt-5.6-luna", stop.event.stop.model);
+
+    var renamed = testStream(undefined, undefined, 0, 0);
+    defer renamed.deinitDecode();
+    _ = try renamed.decode(
+        \\{"type":"response.created","response":{"model":"gpt-5.6-sol"}}
+    );
+    _ = renamed.frame_arena.reset(.retain_capacity);
+    const renamed_stop = try renamed.decode(
+        \\{"type":"response.completed","response":{"status":"completed","model":"gpt-5.6-terra"}}
+    );
+    try std.testing.expectEqualStrings("gpt-5.6-terra", renamed_stop.event.stop.model);
+
+    var unnamed = testStream(undefined, undefined, 0, 0);
+    defer unnamed.deinitDecode();
+    const unnamed_stop = try unnamed.decode(
+        \\{"type":"response.completed","response":{"status":"completed"}}
+    );
+    try std.testing.expectEqualStrings("", unnamed_stop.event.stop.model);
 }
 
 test "display deltas and completed messages stay separate" {

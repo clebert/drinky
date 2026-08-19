@@ -221,8 +221,8 @@ const ActiveTool = struct {
     /// call starts.
     box: []const u8,
     started_ms: i64,
-    /// The timeout the call runs under. Null for a tool that runs under none,
-    /// and zero for a call that asked for no limit.
+    /// The timeout the call runs under, clamped into the legal window. Null for
+    /// a tool that runs under none.
     timeout_ms: ?u64,
     /// The head row and the timed row below it, rebuilt on the frames that show
     /// it. Empty for a tool with no timeout, which paints `box` directly.
@@ -241,13 +241,9 @@ const ActiveTool = struct {
         const timeout_ms = self.timeout_ms orelse return self.box;
         var elapsed: [24]u8 = undefined;
         var allowed: [24]u8 = undefined;
-        // A call that asked for no limit still reports the time it has run. It
-        // is the call that can run forever, so it is the one whose row the user
-        // reads before a cancel.
-        const limit = if (timeout_ms == 0)
-            "None"
-        else
-            ai.format.duration(&allowed, @intCast(timeout_ms));
+        // Every timeout arrives clamped, so it always fits a signed span and the
+        // row always names a real wait.
+        const limit = ai.format.duration(&allowed, @intCast(timeout_ms));
         self.rows.clearRetainingCapacity();
         // `Time` names the same measure the finished box reports, so a call does
         // not rename its own run time when it ends.
@@ -298,6 +294,10 @@ pub const TurnEvent = struct {
         /// A retry is about to re-stream the reply: drop the partial text shown so
         /// far so the retried attempt starts clean.
         stream_reset,
+        /// The provider answered with another model than the request named. The
+        /// consumer records a durable event, so the switch stays visible in the
+        /// history instead of passing as the requested model's reply.
+        model_mismatch: ModelMismatch,
         /// The worker folded `count` queued steering messages into the running
         /// turn as one combined message: show it, hide those rows from the queue
         /// view, and retain their rich drafts until the receipt resolves them.
@@ -316,6 +316,9 @@ pub const TurnEvent = struct {
             is_error: bool,
         };
         pub const SteeringConsumed = struct { text: []u8, count: usize };
+        /// The requested and the served model name of one switched reply. The
+        /// event owns both, and the named fields keep the two apart.
+        pub const ModelMismatch = struct { requested: []u8, served: []u8 };
     };
 
     pub fn deinit(self: *const TurnEvent, gpa: std.mem.Allocator) void {
@@ -330,6 +333,10 @@ pub const TurnEvent = struct {
                 if (result.summary) |summary| gpa.free(summary.text);
             },
             .steering_consumed => |consumed| gpa.free(consumed.text),
+            .model_mismatch => |mismatch| {
+                gpa.free(mismatch.requested);
+                gpa.free(mismatch.served);
+            },
             .usage, .stream_reset, .turn_ended => {},
         }
     }
@@ -552,6 +559,21 @@ pub fn applyTurnEvent(self: *Session, event: *const TurnEvent) !bool {
         .stream_reset => {
             self.transcript.discardMessage();
             self.clearStreamedTools(turn);
+        },
+        .model_mismatch => |mismatch| {
+            // A durable event block, so the switch survives in the history the
+            // way a login or a model change does. The append ends the open
+            // streamed message, so a later stream reset could not discard the
+            // partial text. The agent therefore reports a mismatch only for a
+            // committed reply, and no producer can emit one mid-stream.
+            const text = try std.fmt.allocPrint(
+                self.gpa,
+                "The provider answered with the model \"{s}\" instead of the requested " ++
+                    "model \"{s}\".",
+                .{ mismatch.served, mismatch.requested },
+            );
+            defer self.gpa.free(text);
+            try self.transcript.append(.event, .{ .is_error = true }, text);
         },
         .steering_consumed => |consumed| {
             // Show the folded batch and hide its rows from the queue view, but
@@ -1944,6 +1966,34 @@ test "a stream reset drops the tool boxes of the discarded attempt" {
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "orphan") == null);
 }
 
+// A provider can switch a request to another model. The event names both
+// models in a durable block, so the switch survives in the history and the
+// streamed answer around it stays intact.
+test "a model mismatch records a durable event beside the answer" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    defer session.deinit();
+    session.beginTurn(1);
+
+    try applyEvent(&session, 1, .{ .text = try gpa.dupe(u8, "answer") });
+    try applyEvent(&session, 1, .{ .model_mismatch = .{
+        .requested = try gpa.dupe(u8, "claude-fable-5"),
+        .served = try gpa.dupe(u8, "claude-opus-5"),
+    } });
+
+    const blocks = session.transcript.blocks();
+    try std.testing.expectEqual(@as(usize, 2), blocks.len);
+    try std.testing.expectEqualStrings("answer", blocks[0].model.items);
+    try std.testing.expect(blocks[1].event.is_error);
+    try std.testing.expectEqualStrings(
+        "The provider answered with the model \"claude-opus-5\" instead of the " ++
+            "requested model \"claude-fable-5\".",
+        blocks[1].event.text.items,
+    );
+}
+
 // A cut-off answer is committed history, so the turn's end says it is partial
 // rather than letting it read as a complete reply.
 test "a truncated receipt appends an event after the answer" {
@@ -2870,7 +2920,9 @@ test "an absurd timeout still paints its row" {
         ),
     } });
     try session.paint(.{ .columns = 60, .rows = 24 });
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "Time: ") != null);
+    // The clamp holds it at one hour, which is the wait the command really runs
+    // under.
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "Timeout: 60m 0s") != null);
 }
 
 // Regression: the configured timeout comes from a file the user writes, so it
@@ -2890,13 +2942,12 @@ test "an absurd configured timeout still paints its row" {
         .input_json = try gpa.dupe(u8, "{\"command\":\"x\"}"),
     } });
     try session.paint(.{ .columns = 60, .rows = 24 });
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "Time: ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "Timeout: 60m 0s") != null);
 }
 
-// A command that asked for no limit can run forever, so it is the one whose row
-// the user reads before a cancel. It reports its time and names the missing
-// limit, rather than dropping the row the way a prompt tool does.
-test "a command with no limit still reports the time it has run" {
+// No call runs without a limit, so a call that asks for none still names the
+// smallest legal window. The row must never promise an open wait.
+test "a command that asks for no limit reports the smallest one" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
@@ -2909,10 +2960,12 @@ test "a command with no limit still reports the time it has run" {
         .name = try gpa.dupe(u8, "bash"),
         .input_json = try gpa.dupe(u8, "{\"command\":\"tail -f log\",\"timeout_seconds\":0}"),
     } });
-    session.clock_ms = 8_000;
+    // The clock stays inside the window, because the race kills the command at
+    // the timeout, so a row never shows a run time past its limit.
+    session.clock_ms = 500;
     try session.paint(.{ .columns = 60, .rows = 24 });
     try std.testing.expect(
-        std.mem.indexOf(u8, out.written(), "Time: 8.0s · Timeout: None") != null,
+        std.mem.indexOf(u8, out.written(), "Time: 0.5s · Timeout: 1.0s") != null,
     );
 }
 

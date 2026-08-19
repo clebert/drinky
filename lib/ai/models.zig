@@ -42,6 +42,20 @@ pub const Model = struct {
             omitted,
             disabled,
             named: []const u8,
+
+            /// Whether two resolutions produce the same request bytes. Two
+            /// effort levels that fold onto one named level share a prompt
+            /// cache, so a cache key compares resolutions, not levels.
+            pub fn eql(self: Resolution, other: Resolution) bool {
+                return switch (self) {
+                    .omitted => other == .omitted,
+                    .disabled => other == .disabled,
+                    .named => |name| switch (other) {
+                        .named => |other_name| std.mem.eql(u8, name, other_name),
+                        .omitted, .disabled => false,
+                    },
+                };
+            }
         };
 
         pub fn resolve(self: *const EffortMap, effort: llm.Effort) Resolution {
@@ -341,4 +355,17 @@ test "effort maps resolve each model's supported levels" {
         .named => |actual| try std.testing.expectEqualStrings("none", actual),
         else => return error.ExpectedNamedEffort,
     }
+}
+
+test "resolutions compare by the request bytes they produce" {
+    const Resolution = Model.EffortMap.Resolution;
+    try std.testing.expect(Resolution.eql(.omitted, .omitted));
+    try std.testing.expect(Resolution.eql(.disabled, .disabled));
+    try std.testing.expect(!Resolution.eql(.omitted, .disabled));
+    try std.testing.expect(Resolution.eql(.{ .named = "high" }, .{ .named = "high" }));
+    try std.testing.expect(!Resolution.eql(.{ .named = "high" }, .{ .named = "xhigh" }));
+    try std.testing.expect(!Resolution.eql(.{ .named = "high" }, .omitted));
+    // Sonnet 4.6 folds xhigh onto high, so the two levels share one cache.
+    const sonnet = get(.anthropic, "claude-sonnet-4-6").?;
+    try std.testing.expect(sonnet.effort.resolve(.xhigh).eql(sonnet.effort.resolve(.high)));
 }

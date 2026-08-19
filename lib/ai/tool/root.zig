@@ -120,10 +120,9 @@ pub const Call = struct {
     /// acts on.
     subject: []u8,
     /// The wall-clock timeout the call runs under, in milliseconds. Null means
-    /// the tool runs under no timeout at all, so its row reports no time. Zero
-    /// means the call itself asked for no limit, which still reports the time it
-    /// has run, because an unbounded command is the one the user most needs to
-    /// weigh.
+    /// the tool runs under no timeout at all, so its row reports no time. A tool
+    /// with a timeout always states one, because no call can run without a
+    /// limit.
     timeout_ms: ?u64,
 
     pub fn deinit(self: *const Call, gpa: std.mem.Allocator) void {
@@ -148,9 +147,9 @@ pub const Call = struct {
 /// the empty subject, so a caller always has a row to draw.
 ///
 /// A call can override the configured timeout, so this reads that argument and
-/// falls back to `default_timeout_ms`. Every result fits a signed span. An
-/// absurd number from a model or a config file therefore cannot overflow the
-/// display below it.
+/// falls back to `default_timeout_ms`. Both take the clamp the tool applies, so
+/// the row states the limit the command really runs under. An absurd number from
+/// a model or a config file therefore cannot overflow the display below it.
 pub fn describe(
     gpa: std.mem.Allocator,
     name: []const u8,
@@ -215,12 +214,12 @@ fn unnamed(gpa: std.mem.Allocator, timeout_ms: ?u64) !Call {
     return .{ .label = "", .subject = try gpa.dupe(u8, ""), .timeout_ms = timeout_ms };
 }
 
-/// The timeout of a tool whose argument list gave no override, saturated into a
-/// signed span. The configured value comes from a file the user writes, so it
+/// The timeout of a tool whose argument list gave no override, held inside the
+/// legal window. The configured value comes from a file the user writes, so it
 /// takes the same clamp the argument does.
 fn defaultTimeoutMs(entry: *const Entry, default_timeout_ms: u64) ?u64 {
     if (entry.timeout.len == 0) return null;
-    return @min(default_timeout_ms, std.math.maxInt(i64));
+    return Context.Bash.clampTimeoutMs(default_timeout_ms);
 }
 
 fn readTimeoutMs(
@@ -237,7 +236,7 @@ fn readTimeoutMs(
     // starts. The two parses must agree on which values those are, or the row
     // reports no timeout for a call that runs under one.
     const seconds = unsignedSeconds(raw) orelse return null;
-    return @min(seconds *| std.time.ms_per_s, std.math.maxInt(i64));
+    return Context.Bash.clampTimeoutMs(seconds *| std.time.ms_per_s);
 }
 
 /// The seconds a timeout argument states, read the way the typed tool parse
@@ -419,13 +418,12 @@ test "a described call reports the timeout it runs under" {
             .input = "{\"command\":\"true\",\"timeout_seconds\":5}",
             .expected = 5_000,
         },
-        // A call that asks for no limit is distinct from a tool that runs under
-        // no timeout: the first still reports the time it has run, the second
-        // reports nothing at all.
+        // A call cannot ask for no limit. It gets the smallest legal window, so
+        // the row states a real wait rather than an open one.
         .{
             .name = "bash",
             .input = "{\"command\":\"true\",\"timeout_seconds\":0}",
-            .expected = 0,
+            .expected = Context.Bash.timeout_ms_min,
         },
         .{ .name = "read", .input = "{\"path\":\"a\"}", .expected = null },
         .{ .name = "nonesuch", .input = "{}", .expected = null },
@@ -450,12 +448,12 @@ test "a described call reports the timeout it runs under" {
             .input = "{\"command\":\"x\",\"timeout_seconds\":null}",
             .expected = 120_000,
         },
-        // A timeout stated in absurd numbers saturates to a span the display can
-        // still measure, rather than overflowing the signed span below it.
+        // A timeout stated in absurd numbers falls back to the largest legal
+        // window, rather than overflowing the signed span below it.
         .{
             .name = "bash",
             .input = "{\"command\":\"x\",\"timeout_seconds\":9223372036854775807}",
-            .expected = std.math.maxInt(i64),
+            .expected = Context.Bash.timeout_ms_max,
         },
         // Above `maxInt(i64)` the JSON parse keeps the number as a string. The
         // typed parse of the tool still takes it, so the row must report a
@@ -463,7 +461,7 @@ test "a described call reports the timeout it runs under" {
         .{
             .name = "bash",
             .input = "{\"command\":\"x\",\"timeout_seconds\":18446744073709551615}",
-            .expected = std.math.maxInt(i64),
+            .expected = Context.Bash.timeout_ms_max,
         },
         // A fractional value fails both parses, so the call never runs.
         .{
@@ -482,7 +480,7 @@ test "a described call reports the timeout it runs under" {
 // Regression: the configured timeout comes from a file the user writes, so it
 // takes the same clamp the argument does. Without it the display cast below
 // this panics on a number no argument could reach.
-test "an absurd configured timeout saturates on every fallback path" {
+test "an absurd configured timeout clamps on every fallback path" {
     const gpa = std.testing.allocator;
     const inputs = [_][]const u8{
         "{\"command\":\"x\"}",
@@ -492,8 +490,13 @@ test "an absurd configured timeout saturates on every fallback path" {
     for (inputs) |input| {
         const call = try describe(gpa, "bash", input, &.{}, std.math.maxInt(u64));
         defer call.deinit(gpa);
-        try std.testing.expectEqual(@as(?u64, std.math.maxInt(i64)), call.timeout_ms);
+        try std.testing.expectEqual(@as(?u64, Context.Bash.timeout_ms_max), call.timeout_ms);
     }
+    // A configured zero used to mean no limit. It now names the smallest legal
+    // window, so the row cannot promise a wait the command does not take.
+    const call = try describe(gpa, "bash", "{\"command\":\"x\"}", &.{}, 0);
+    defer call.deinit(gpa);
+    try std.testing.expectEqual(@as(?u64, Context.Bash.timeout_ms_min), call.timeout_ms);
 }
 
 // A label without a value, or a value without a label, leaves a row with a
