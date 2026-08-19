@@ -208,9 +208,10 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
   subject alone, with each run of whitespace collapsed to one space. A tool row shortens a path the
   way `Skill:` does: relative to the working directory below it, `~` for the home directory, and the
   whole path when it sits under neither.
-- While the model streams the arguments, the call reports `Received:` with the bytes that arrived. A
-  call whose reply has committed but that waits for an earlier one reports `Status: Queued`. The
-  count measures the arguments the model has sent.
+- While the model streams the arguments, the call reports `Received:` with the bytes that arrived
+  and `Status: Streaming`. The count measures the arguments the model has sent. A call can wait,
+  because a later call streams or an earlier call runs. It then keeps its count and reports
+  `Status: Queued`. A window too narrow for the row cuts the status and keeps the count.
 - A running command adds a row with the time it has run and the timeout it runs under. The row names
   the clamped limit, so it states the wait the command really takes. Every other tool runs under no
   timeout, so its box keeps one row.

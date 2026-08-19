@@ -33,17 +33,18 @@ const retry_hint = "Ctrl+N: Try again · Esc: Dismiss";
 /// count that climbs reports the progress of a long call, and the row keeps one
 /// shape while it climbs.
 ///
+/// The row also names its phase, because a reply streams its calls one after the
+/// other. A row that waits then stands still, and the phase tells the reader
+/// that the call is not stuck.
+///
 /// The count measures what the model has produced so far, not what a tool has
 /// done. A `write` that has streamed 402 bytes of arguments has written nothing
 /// yet, so the row must not read as a file size.
 const StreamedTool = struct {
     name: []const u8,
     bytes: usize,
-    /// Whether the reply that holds this call has committed. The count then
-    /// stands still, so the row names the state it reached instead of a measure
-    /// that stopped meaning progress.
-    queued: bool,
-    /// The row text, rewritten whenever the count or the state changes. This row
+    phase: Phase,
+    /// The row text, rewritten whenever the count or the phase changes. This row
     /// changes only on an event, so it is built there and the frame borrows it.
     /// The timed row of `ActiveTool` changes on every frame instead, so that one
     /// is built at paint time.
@@ -51,6 +52,29 @@ const StreamedTool = struct {
     /// `Received` names the wire, never the file. It is the one count in a box
     /// that reads in bytes, because it measures a transfer in progress.
     box: std.ArrayList(u8),
+
+    /// How far one streamed call has come. Every phase keeps the same row shape,
+    /// with the name, the bytes received so far, and the phase. A count that
+    /// stands still therefore still reports a state, and a reader can tell a
+    /// call that receives its arguments from one that waits.
+    const Phase = enum {
+        /// The arguments of this call arrive now, so the count climbs. Only the
+        /// newest row of a reply that still streams is in this phase.
+        ///
+        /// Only a new call moves a row out of this phase. A reply that streams
+        /// text or thinking after a call keeps the phase until it commits, so
+        /// that row can hold a count that stands still for a short time. Text
+        /// must not move it, because a provider that interleaves text into an
+        /// open call would then lose every fragment that follows: only a row in
+        /// this phase counts.
+        streaming,
+        /// The arguments are complete and the call waits. The reply that holds
+        /// it still streams, so a later call of the same reply can follow.
+        queued,
+        /// The call waits and a call of its reply already started. That reply
+        /// streams nothing more, so the next streamed content drops this row.
+        stale,
+    };
 
     fn deinit(self: *StreamedTool, gpa: std.mem.Allocator) void {
         gpa.free(self.name);
@@ -60,13 +84,20 @@ const StreamedTool = struct {
     fn refresh(self: *StreamedTool, gpa: std.mem.Allocator) !void {
         var scale: [16]u8 = undefined;
         self.box.clearRetainingCapacity();
-        if (self.queued) {
-            try self.box.print(gpa, "Tool: {s} · Status: Queued", .{self.name});
-            return;
-        }
-        try self.box.print(gpa, "Tool: {s} · Received: {s}", .{
+        // The count comes before the phase, because a narrow window cuts the
+        // tail of the row. The count is the field that reports progress, so the
+        // cut must fall on the phase: a row that keeps its count alone still
+        // tells a call that receives from a call that waits, by the motion of
+        // the count.
+        try self.box.print(gpa, "Tool: {s} · Received: {s} · Status: {s}", .{
             self.name,
             ai.format.bytes(&scale, self.bytes),
+            switch (self.phase) {
+                .streaming => "Streaming",
+                // Both waiting phases read the same. They differ in how long the
+                // row lives, not in what the call does.
+                .queued, .stale => "Queued",
+            },
         });
     }
 };
@@ -180,8 +211,8 @@ const Turn = struct {
     caret_tick: u64,
     tools: std.ArrayList(ActiveTool),
     /// The tool calls the model is still streaming, oldest first. Each shows its
-    /// name and the argument bytes received so far. A committed call replaces
-    /// the oldest one, because both sides keep the order of the reply.
+    /// name, the argument bytes received so far, and its phase. A committed call
+    /// replaces the oldest one, because both sides keep the order of the reply.
     streamed_tools: std.ArrayList(StreamedTool),
     /// The box of every tool call above. Each frame rebuilds it, so the tail
     /// gets a `[]const ui.paint.Box` without a fresh allocation per repaint.
@@ -535,15 +566,15 @@ pub fn applyTurnEvent(self: *Session, event: *const TurnEvent) !bool {
     self.dirty = true;
     switch (event.payload) {
         .text => |delta| {
-            self.dropQueuedTools(turn);
+            self.dropStaleTools(turn);
             try self.transcript.appendStream(.model, delta);
         },
         .thinking => |delta| {
-            self.dropQueuedTools(turn);
+            self.dropStaleTools(turn);
             try self.transcript.appendStream(.thinking, delta);
         },
         .tool_name => |name| {
-            self.dropQueuedTools(turn);
+            self.dropStaleTools(turn);
             try self.openStreamedTool(turn, name);
         },
         .tool_arguments => |delta| try self.growStreamedTool(turn, delta),
@@ -1224,13 +1255,23 @@ fn pushTool(self: *Session, turn: *Turn, tool: *const TurnEvent.Payload.Tool) !v
 
 /// Open the row of a tool call the model started to stream. It counts from zero,
 /// so a call with no arguments yet still shows that it started.
+///
+/// A reply streams one call at a time, so the row above stops counting here. It
+/// moves to the queued phase, because the count it holds is now final.
 fn openStreamedTool(self: *Session, turn: *Turn, name: []const u8) !void {
+    if (turn.streamed_tools.items.len > 0) {
+        const last = &turn.streamed_tools.items[turn.streamed_tools.items.len - 1];
+        if (last.phase == .streaming) {
+            last.phase = .queued;
+            try last.refresh(self.gpa);
+        }
+    }
     var streamed: StreamedTool = .{
         .name = try self.gpa.dupe(u8, name),
         .bytes = 0,
         // A reply that already committed cannot be streaming a new call, so a
         // row that opens here always counts.
-        .queued = false,
+        .phase = .streaming,
         .box = .empty,
     };
     errdefer streamed.deinit(self.gpa);
@@ -1245,11 +1286,10 @@ fn growStreamedTool(self: *Session, turn: *Turn, delta: []const u8) !void {
     if (turn.streamed_tools.items.len == 0) return;
     const streamed = &turn.streamed_tools.items[turn.streamed_tools.items.len - 1];
     // A stream can open a call without naming it, which opens no row of its own.
-    // The last row is then a queued one left by the reply before it, and it
-    // counts for a call that already streamed. Fresh streamed content drops
-    // every queued row before it opens a new one, so a queued row at the end
-    // means this fragment has no row at all.
-    if (streamed.queued) return;
+    // The last row is then a waiting one left by an earlier call, and that call
+    // already streamed its arguments. Only the row this reply opened last counts,
+    // so a waiting row at the end means this fragment has no row at all.
+    if (streamed.phase != .streaming) return;
     streamed.bytes += delta.len;
     try streamed.refresh(self.gpa);
 }
@@ -1266,7 +1306,7 @@ fn growStreamedTool(self: *Session, turn: *Turn, delta: []const u8) !void {
 /// different one keeps the first row until the turn ends. That row counts bytes
 /// for a call that never starts, which costs one stale line and no wrong text.
 ///
-/// Every row that stays is queued. The first committed call proves the reply
+/// Every row that stays goes stale. The first committed call proves the reply
 /// closed, and a mutating call waits for the calls before it, so a row that
 /// still counted wire bytes reports progress that stopped.
 fn dropStreamedTool(self: *Session, turn: *Turn, name: []const u8) !void {
@@ -1277,22 +1317,28 @@ fn dropStreamedTool(self: *Session, turn: *Turn, name: []const u8) !void {
         break;
     }
     for (turn.streamed_tools.items) |*streamed| {
-        if (streamed.queued) continue;
-        streamed.queued = true;
+        if (streamed.phase == .stale) continue;
+        // The text of a queued row does not change here. It is rewritten anyway,
+        // because one path that always refreshes is cheaper to trust than a
+        // second condition on the phase it came from.
+        streamed.phase = .stale;
         try streamed.refresh(self.gpa);
     }
 }
 
-/// Drop every queued row when the next reply starts to stream.
+/// Drop every stale row when the next reply starts to stream.
 ///
-/// A row becomes queued only after a call of its own reply committed, and that
-/// reply streams nothing more. Fresh streamed content therefore belongs to the
-/// next reply, and a row still queued under it names a call that never started.
-/// Without this it sits above every later round of the turn.
-fn dropQueuedTools(self: *Session, turn: *Turn) void {
+/// A row goes stale only after a call of its own reply committed, and that reply
+/// streams nothing more. Fresh streamed content therefore belongs to the next
+/// reply, and a stale row under it names a call that never started. Without this
+/// it sits above every later round of the turn.
+///
+/// A queued row of the reply that still streams stays. Its call waits for a name
+/// its own reply has not committed yet.
+fn dropStaleTools(self: *Session, turn: *Turn) void {
     var index: usize = 0;
     while (index < turn.streamed_tools.items.len) {
-        if (!turn.streamed_tools.items[index].queued) {
+        if (turn.streamed_tools.items[index].phase != .stale) {
             index += 1;
             continue;
         }
@@ -1859,10 +1905,14 @@ test "a streamed tool call counts its bytes until the call commits" {
     try std.testing.expectEqual(@as(usize, 1), session.mode.turn.streamed_tools.items.len);
     try std.testing.expectEqual(@as(usize, 31), session.mode.turn.streamed_tools.items[0].bytes);
 
-    const size: terminal.View.Size = .{ .columns = 40, .rows = 24 };
+    const size: terminal.View.Size = .{ .columns = 60, .rows = 24 };
     try session.paint(size);
     const streaming = out.written();
-    try std.testing.expect(std.mem.indexOf(u8, streaming, "Tool: write · Received: 31 B") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        streaming,
+        "Tool: write · Received: 31 B · Status: Streaming",
+    ) != null);
     // `Received` names the wire, and it is the only count in a box that reads
     // in bytes. No finished call reports a size, so no reader can take the
     // streamed count for the size of what the call wrote.
@@ -1912,12 +1962,72 @@ test "a committed call replaces its own streamed row and leaves its sibling" {
     try std.testing.expectEqual(@as(usize, 1), session.mode.turn.streamed_tools.items.len);
     try std.testing.expectEqualStrings("read", session.mode.turn.streamed_tools.items[0].name);
 
-    try session.paint(.{ .columns = 40, .rows = 24 });
+    try session.paint(.{ .columns = 60, .rows = 24 });
     const painted = out.written();
     try std.testing.expect(std.mem.indexOf(u8, painted, "Tool: write · File: a") != null);
-    // The reply committed, so the sibling waits its turn. Its byte count stopped
-    // climbing, and the row says what it waits for instead.
-    try std.testing.expect(std.mem.indexOf(u8, painted, "Tool: read · Status: Queued") != null);
+    // The reply committed, so the sibling waits its turn. Its count stopped
+    // climbing, and the row keeps that count next to the state it reached.
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        painted,
+        "Tool: read · Received: 12 B · Status: Queued",
+    ) != null);
+}
+
+// A reply streams its calls one after the other, so the row above stops counting
+// the moment the next call opens. It must then name the state it reached: a
+// frozen count with no state reads as a call that hangs.
+test "a streamed row that stopped counting reads as queued" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    defer session.deinit();
+    session.beginTurn(1);
+
+    try applyEvent(&session, 1, .{ .tool_name = try gpa.dupe(u8, "write") });
+    try applyEvent(&session, 1, .{ .tool_arguments = try gpa.dupe(u8, "{\"path\":\"a\"}") });
+    try applyEvent(&session, 1, .{ .tool_name = try gpa.dupe(u8, "read") });
+    try applyEvent(&session, 1, .{ .tool_arguments = try gpa.dupe(u8, "{\"path\":\"bb\"}") });
+
+    // The first row keeps the count it reached, and only the newest row counts.
+    const rows = session.mode.turn.streamed_tools.items;
+    try std.testing.expectEqual(@as(usize, 2), rows.len);
+    try std.testing.expectEqualStrings(
+        "Tool: write · Received: 12 B · Status: Queued",
+        rows[0].box.items,
+    );
+    try std.testing.expectEqualStrings(
+        "Tool: read · Received: 13 B · Status: Streaming",
+        rows[1].box.items,
+    );
+
+    // The reply that holds both calls still streams, so text of that reply must
+    // keep the queued row. Only a committed reply leaves a row that goes.
+    try applyEvent(&session, 1, .{ .text = try gpa.dupe(u8, "and") });
+    try std.testing.expectEqual(@as(usize, 2), session.mode.turn.streamed_tools.items.len);
+}
+
+// A narrow window cuts the tail of the row, so the order of the fields decides
+// what a cut row keeps. The count must stay, because it is the field that
+// reports progress. The phase is the field that goes, and the motion of the
+// count still separates a call that receives from a call that waits.
+test "a narrow window cuts the phase of a streamed row and keeps the count" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    defer session.deinit();
+    session.beginTurn(1);
+
+    try applyEvent(&session, 1, .{ .tool_name = try gpa.dupe(u8, "write") });
+    try applyEvent(&session, 1, .{ .tool_arguments = try gpa.dupe(u8, "{\"path\":\"a\"}") });
+
+    try session.paint(.{ .columns = 40, .rows = 24 });
+    const painted = out.written();
+    try std.testing.expect(std.mem.indexOf(u8, painted, "Tool: write · Received: 12 B") != null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "Streaming") == null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "\u{2026}") != null);
 }
 
 // A long call must not grow the work of a frame. The row holds a count, so its
@@ -1937,7 +2047,10 @@ test "a streamed row stays one short line however long the arguments run" {
 
     const streamed = &session.mode.turn.streamed_tools.items[0];
     try std.testing.expectEqual(@as(usize, 8 * 2048), streamed.bytes);
-    try std.testing.expectEqualStrings("Tool: write · Received: 16.0 KB", streamed.box.items);
+    try std.testing.expectEqualStrings(
+        "Tool: write · Received: 16.0 KB · Status: Streaming",
+        streamed.box.items,
+    );
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, streamed.box.items, "\n"));
 }
 
@@ -2970,9 +3083,9 @@ test "a command that asks for no limit reports the smallest one" {
 }
 
 // A stream can open a call without naming it, so a fragment can arrive with no
-// row of its own. It must not land on a queued row left by the reply before it:
+// row of its own. It must not land on a stale row left by the reply before it:
 // that row counts a call that already streamed, and the bytes vanish into it.
-test "an unnamed fragment does not count against a queued row" {
+test "an unnamed fragment does not count against a stale row" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
@@ -2986,18 +3099,21 @@ test "an unnamed fragment does not count against a queued row" {
         .name = try gpa.dupe(u8, "read"),
         .input_json = try gpa.dupe(u8, "{\"path\":\"a\"}"),
     } });
-    const queued = &session.mode.turn.streamed_tools.items[0];
-    try std.testing.expect(queued.queued);
+    const stale = &session.mode.turn.streamed_tools.items[0];
+    try std.testing.expectEqual(StreamedTool.Phase.stale, stale.phase);
 
     try applyEvent(&session, 1, .{ .tool_arguments = try gpa.dupe(u8, "{\"path\":\"b\"}") });
-    try std.testing.expectEqual(@as(usize, 0), queued.bytes);
-    try std.testing.expectEqualStrings("Tool: phantom · Status: Queued", queued.box.items);
+    try std.testing.expectEqual(@as(usize, 0), stale.bytes);
+    try std.testing.expectEqualStrings(
+        "Tool: phantom · Received: 0 B · Status: Queued",
+        stale.box.items,
+    );
 }
 
 // A reply that opens one call and commits another leaves a row for a call that
 // never starts. That row must not outlive its reply, or the next round shows a
-// queued call that nothing runs.
-test "a queued row that its reply never committed goes with that reply" {
+// waiting call that nothing runs.
+test "a stale row that its reply never committed goes with that reply" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
@@ -3011,9 +3127,12 @@ test "a queued row that its reply never committed goes with that reply" {
         .name = try gpa.dupe(u8, "read"),
         .input_json = try gpa.dupe(u8, "{\"path\":\"a\"}"),
     } });
-    // The reply committed, so the row that no call claimed reads as queued.
+    // The reply committed, so the row that no call claimed went stale.
     try std.testing.expectEqual(@as(usize, 1), session.mode.turn.streamed_tools.items.len);
-    try std.testing.expect(session.mode.turn.streamed_tools.items[0].queued);
+    try std.testing.expectEqual(
+        StreamedTool.Phase.stale,
+        session.mode.turn.streamed_tools.items[0].phase,
+    );
 
     // The next reply starts to stream, which the committed one cannot do.
     try applyEvent(&session, 1, .{ .text = try gpa.dupe(u8, "next") });
