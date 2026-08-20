@@ -107,11 +107,9 @@ gpa: std.mem.Allocator,
 transcript: Transcript,
 /// The sole transient notice. Its owned content never enters the transcript.
 notice: ?ai.command.Outcome.Message,
-/// Whether one unchanged idle Enter can pass the stale-cache warning.
-cache_confirmation: bool,
-/// Whether one unchanged Enter can send a refused command line to the model as
-/// typed. The prompt sends it as a message, and a turn queues it as steering.
-message_confirmation: bool,
+/// The armed one-shot confirmations. A warning arms one, the key that raised it
+/// passes it once, and any other user action cancels it.
+confirmations: std.EnumSet(Confirmation),
 editor: ui.Editor,
 /// The primary-screen conversation renderer remains untouched while a page is open.
 view: terminal.View,
@@ -301,6 +299,29 @@ const TurnOrigin = struct {
     prompt: ui.Editor.Draft,
 };
 
+/// The one-shot confirmations. Each names a warning that one repeat of its own
+/// key passes. The guards differ on purpose: a draft signals that the user
+/// types, so a key that a reflex can hit while typing warns first. Ctrl+D means
+/// leave this layer and nothing else, so it warns only where it destroys the
+/// draft, and Ctrl+C clears without a warning because the clear is its purpose.
+pub const Confirmation = enum {
+    /// One unchanged idle Enter passes the stale-cache warning.
+    cache,
+    /// One unchanged Enter sends a refused command line to the model as typed.
+    /// The prompt sends it as a message, and a turn queues it as steering. The
+    /// row that named the offer goes with the confirmation: a key cancels both
+    /// in the app, a turn end in `endTurn`, and a later notice in `setNotice`.
+    /// A row that outlives its offer asks for an Enter that does nothing.
+    message,
+    /// One more Esc cancels the running turn. The first Esc with a draft arms
+    /// it, because a reflex Esc while the user types can mean a dismiss or a
+    /// clear. An Esc over an empty editor is a decision and cancels at once.
+    turn_cancel,
+    /// One more Ctrl+D quits over a draft. The first Ctrl+D with a draft arms
+    /// it, because the quit discards the draft.
+    quit,
+};
+
 /// A turn worker's message to the render consumer, tagged with the generation it
 /// belongs to. Every payload owns its bytes until the consumer frees it.
 pub const TurnEvent = struct {
@@ -403,8 +424,7 @@ pub fn init(
         .gpa = gpa,
         .transcript = Transcript.init(gpa),
         .notice = null,
-        .cache_confirmation = false,
-        .message_confirmation = false,
+        .confirmations = .initEmpty(),
         .editor = ui.Editor.init(gpa),
         .view = terminal.View.init(gpa, writer),
         .page_view = terminal.View.init(gpa, writer),
@@ -454,8 +474,7 @@ pub fn resetConversation(self: *Session) void {
     std.debug.assert(self.mode == .prompt);
     self.transcript.truncate(0);
     self.clearNotice();
-    self.cache_confirmation = false;
-    self.cancelMessageConfirmation();
+    self.confirmations = .initEmpty();
     self.stats_shown = .{};
     self.clearSteering();
     self.view.resetScreen();
@@ -471,43 +490,26 @@ pub fn clearNotice(self: *Session) void {
     }
 }
 
-/// Let one idle Enter pass a stale-cache warning.
-pub fn armCacheConfirmation(self: *Session) void {
-    std.debug.assert(self.mode == .prompt);
-    self.cache_confirmation = true;
+/// Arm `confirmation`, so one repeat of its key passes its warning. The modes
+/// that can arm one are the modes whose key raises its warning.
+pub fn armConfirmation(self: *Session, confirmation: Confirmation) void {
+    switch (confirmation) {
+        .cache, .quit => std.debug.assert(self.mode == .prompt),
+        .message => std.debug.assert(self.mode == .prompt or self.mode == .turn),
+        .turn_cancel => std.debug.assert(self.mode == .turn),
+    }
+    self.confirmations.insert(confirmation);
 }
 
-/// Cancel the stale-cache confirmation after any other user action.
-pub fn cancelCacheConfirmation(self: *Session) void {
-    self.cache_confirmation = false;
+/// Cancel `confirmation` after any user action other than its own key.
+pub fn cancelConfirmation(self: *Session, confirmation: Confirmation) void {
+    self.confirmations.remove(confirmation);
 }
 
-/// Consume the one-shot stale-cache confirmation.
-pub fn takeCacheConfirmation(self: *Session) bool {
-    const confirmed = self.cache_confirmation;
-    self.cache_confirmation = false;
-    return confirmed;
-}
-
-/// Let one Enter send a refused command line to the model as typed. The prompt and
-/// a running turn both offer it, because a slash line can be plain text.
-pub fn armMessageConfirmation(self: *Session) void {
-    std.debug.assert(self.mode == .prompt or self.mode == .turn);
-    self.message_confirmation = true;
-}
-
-/// Cancel the send-as-a-message offer. The row that named it goes at the same time:
-/// a key clears it in the app, a turn end clears it in `endTurn`, and a later notice
-/// drops the offer in `setNotice`. A row that outlives its offer asks for an Enter
-/// that does nothing.
-pub fn cancelMessageConfirmation(self: *Session) void {
-    self.message_confirmation = false;
-}
-
-/// Consume the one-shot send-as-a-message confirmation.
-pub fn takeMessageConfirmation(self: *Session) bool {
-    const confirmed = self.message_confirmation;
-    self.message_confirmation = false;
+/// Consume `confirmation` and return whether it was armed.
+pub fn takeConfirmation(self: *Session, confirmation: Confirmation) bool {
+    const confirmed = self.confirmations.contains(confirmation);
+    self.confirmations.remove(confirmation);
     return confirmed;
 }
 
@@ -520,7 +522,7 @@ pub fn takeMessageConfirmation(self: *Session) bool {
 /// `endTurn` clears the footer. Today only a key raises one there. A writer that
 /// reports from an event instead must first give `endTurn` a rule to keep it.
 fn setNotice(self: *Session, notice: ai.command.Outcome.Message) void {
-    self.cancelMessageConfirmation();
+    self.cancelConfirmation(.message);
     self.clearNotice();
     self.notice = notice;
     self.dirty = true;
@@ -935,8 +937,7 @@ fn steeringView(self: *Session) ![]const []const u8 {
 /// and no active tools.
 pub fn beginTurn(self: *Session, generation: u64) void {
     self.transcript.endMessage();
-    self.cache_confirmation = false;
-    self.cancelMessageConfirmation();
+    self.confirmations = .initEmpty();
     self.mode = .{ .turn = .{
         .generation = generation,
         .progress_sequence_applied = 0,
@@ -1099,10 +1100,11 @@ pub fn branch(self: *const Session) ?[]const u8 {
 }
 
 /// Free the finished turn's tool state and return to prompt mode. The end of a turn
-/// is no key event, so it must clear the footer and the send-as-a-message offer
-/// here. Only a key that arrives during the turn can put a notice on the screen, and
-/// both such notices name that turn: the offer to queue a refused line, and the
-/// restriction on a command that a turn cannot host. Neither one is true afterward.
+/// is no key event, so it must clear the footer and the one-shot offers here. Only
+/// a key that arrives during the turn can put a notice on the screen, and every
+/// such notice names that turn: the offer to queue a refused line, the restriction
+/// on a command that a turn cannot host, and the warning that one more Esc cancels
+/// the turn. None of them is true afterward.
 ///
 /// The refused line stays in the editor. The next Enter reports the state that the
 /// prompt has.
@@ -1110,7 +1112,7 @@ pub fn endTurn(self: *Session) void {
     if (self.activeTurn()) |turn| self.freeTurn(turn);
     self.dropTurnOrigin();
     self.clearNotice();
-    self.cancelMessageConfirmation();
+    self.confirmations = .initEmpty();
     self.mode = .prompt;
 }
 
@@ -1577,11 +1579,11 @@ test "a turn end drops the send-as-a-message confirmation and the footer" {
         "Enter: Queue as a message · Pith does not recognize the command /nope.",
         .{},
     ));
-    session.armMessageConfirmation();
+    session.armConfirmation(.message);
     try session.abortTurn();
 
     try std.testing.expect(session.mode == .prompt);
-    try std.testing.expect(!session.takeMessageConfirmation());
+    try std.testing.expect(!session.takeConfirmation(.message));
     try std.testing.expect(session.notice == null);
 
     // The restriction row takes the same path. It armed no offer, and it names the
@@ -1597,6 +1599,24 @@ test "a turn end drops the send-as-a-message confirmation and the footer" {
     try std.testing.expect(session.notice == null);
 }
 
+// The first Esc of a new turn must warn, never cancel. A turn that ends with
+// leftover steering auto-starts the next turn with no key between them, so only
+// the turn boundaries can drop a confirmation that the ended turn armed.
+test "a turn boundary drops the turn-cancel confirmation" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    defer session.deinit();
+
+    session.beginTurn(1);
+    session.armConfirmation(.turn_cancel);
+    session.endTurn();
+    session.beginTurn(2);
+    try std.testing.expect(!session.takeConfirmation(.turn_cancel));
+    session.endTurn();
+}
+
 // A later row replaces the row that named an offer, so the offer cannot outlive it.
 // Otherwise Enter sends a line that no row on the screen offers.
 test "a new notice drops the send-as-a-message confirmation" {
@@ -1606,7 +1626,7 @@ test "a new notice drops the send-as-a-message confirmation" {
     var session: Session = Session.init(gpa, &out.writer, test_model, .none);
     defer session.deinit();
 
-    session.armMessageConfirmation();
+    session.armConfirmation(.message);
     try session.applyOutcome(try ai.command.Outcome.reportNotice(
         gpa,
         .failure,
@@ -1614,7 +1634,7 @@ test "a new notice drops the send-as-a-message confirmation" {
         .{},
     ));
 
-    try std.testing.expect(!session.takeMessageConfirmation());
+    try std.testing.expect(!session.takeConfirmation(.message));
     try std.testing.expectEqualStrings(
         "Pith could not read the file.",
         session.notice.?.content,
@@ -1677,14 +1697,14 @@ test "cache confirmation is one-shot and separate from its notice" {
     try session.applyOutcome(
         try ai.command.Outcome.reportNotice(gpa, .warning, "Cache warning", .{}),
     );
-    session.armCacheConfirmation();
+    session.armConfirmation(.cache);
     session.clearNotice();
-    try std.testing.expect(session.takeCacheConfirmation());
-    try std.testing.expect(!session.takeCacheConfirmation());
+    try std.testing.expect(session.takeConfirmation(.cache));
+    try std.testing.expect(!session.takeConfirmation(.cache));
 
-    session.armCacheConfirmation();
-    session.cancelCacheConfirmation();
-    try std.testing.expect(!session.takeCacheConfirmation());
+    session.armConfirmation(.cache);
+    session.cancelConfirmation(.cache);
+    try std.testing.expect(!session.takeConfirmation(.cache));
 }
 
 test "an event survives notice clearing until the conversation resets" {

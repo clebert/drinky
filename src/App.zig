@@ -1276,11 +1276,19 @@ fn handleKey(self: *App, event: *const terminal.Input.Key) !void {
     // its one-shot confirmation.
     const retries = event.* == .ctrl and event.ctrl == 'n';
     const confirms_cache = at_prompt and (event.* == .enter or retries);
-    if (!confirms_cache) self.session.cancelCacheConfirmation();
+    if (!confirms_cache) self.session.cancelConfirmation(.cache);
     // A refused command line goes to the model on the next Enter alone. The prompt
     // sends it, and a turn queues it, so both modes can confirm.
     const confirms_message = (at_prompt or self.session.mode == .turn) and event.* == .enter;
-    if (!confirms_message) self.session.cancelMessageConfirmation();
+    if (!confirms_message) self.session.cancelConfirmation(.message);
+    // Only a second Esc during a turn can confirm the turn-cancel warning. Every
+    // other user action clears the warning and its one-shot confirmation.
+    const confirms_turn_cancel = self.session.mode == .turn and event.* == .escape;
+    if (!confirms_turn_cancel) self.session.cancelConfirmation(.turn_cancel);
+    // Only a second Ctrl+D at the prompt can confirm the quit warning. Every
+    // other user action clears the warning and its one-shot confirmation.
+    const confirms_quit = at_prompt and event.* == .ctrl and event.ctrl == 'd';
+    if (!confirms_quit) self.session.cancelConfirmation(.quit);
     // Clear before the key routes, so a notice produced by this action survives it.
     self.session.clearNotice();
     switch (self.session.mode) {
@@ -1300,8 +1308,20 @@ fn handleKey(self: *App, event: *const terminal.Input.Key) !void {
                 self.clearOrQuit();
                 if (self.running) self.session.dirty = true;
             },
-            'd' => if (self.session.editor.visible().len == 0) {
+            // Ctrl+D quits at once on an empty editor. A draft arms a one-shot
+            // confirmation and warns instead, because the quit discards it. The
+            // second Ctrl+D quits anyway.
+            'd' => if (self.session.editor.visible().len == 0 or
+                self.session.takeConfirmation(.quit))
+            {
                 self.running = false;
+            } else {
+                self.session.armConfirmation(.quit);
+                try self.reportNotice(
+                    .warning,
+                    "Press Ctrl+D again to quit. The quit discards the draft.",
+                    .{},
+                );
             },
             'n' => try self.retryTurn(),
             else => {},
@@ -1338,14 +1358,19 @@ fn editKey(self: *App, event: *const terminal.Input.Key) !bool {
 
 /// Keys during a streaming turn. The editor stays live for steering: the user can
 /// type and edit, Enter queues a steering message, and Ctrl+P recalls the queue
-/// into the editor. Esc and Ctrl+D cancel the turn, which keeps the draft, so
-/// neither key needs the empty-editor guard that protects the quit at the prompt.
+/// into the editor. Esc and Ctrl+D cancel the turn, and the cancel keeps the draft.
+///
+/// The two cancel keys differ on purpose. A draft signals that the user types, and
+/// a reflex Esc while typing can mean a dismiss or a clear, so Esc warns first and
+/// cancels on the second press. Ctrl+D means leave this layer and nothing else, so
+/// one press of it is a decision and cancels at once. The one-press Ctrl+D also
+/// keeps the legacy exit attempt Esc+Ctrl+D working while the Esc only warns.
 /// Ctrl+C keeps its prompt meaning and clears a draft first.
 fn handleTurnKey(self: *App, event: *const terminal.Input.Key) !void {
     if (try self.editKey(event)) return;
     switch (event.*) {
         .enter => try self.submitSteering(),
-        .escape => try self.cancelTurn(),
+        .escape => try self.warnOrCancel(),
         .ctrl => |letter| switch (letter) {
             'c' => try self.clearOrCancel(),
             'd' => try self.cancelTurn(),
@@ -1356,9 +1381,20 @@ fn handleTurnKey(self: *App, event: *const terminal.Input.Key) !void {
     }
 }
 
+/// Esc during a turn: cancel at once when the editor is empty, because an Esc
+/// there is a decision. A draft signals that the user types, and a reflex Esc
+/// while typing must not stop the turn, so it arms a one-shot confirmation and
+/// warns instead. The second Esc cancels the turn and keeps the draft.
+fn warnOrCancel(self: *App) !void {
+    if (self.session.editor.visible().len == 0 or self.session.takeConfirmation(.turn_cancel))
+        return self.cancelTurn();
+    self.session.armConfirmation(.turn_cancel);
+    try self.reportNotice(.warning, "Press Esc again to cancel the turn. The draft stays.", .{});
+}
+
 /// Ctrl+C during a turn: clear a draft, or cancel the turn when the editor is
 /// empty. The editor stays live for steering, so the key that stops the turn must
-/// not drop typed text. Esc is the direct cancel.
+/// not drop typed text. Esc cancels and keeps the draft instead.
 fn clearOrCancel(self: *App) !void {
     if (self.session.editor.visible().len != 0) {
         self.session.editor.clear();
@@ -1381,12 +1417,12 @@ fn clearOrCancel(self: *App) !void {
 /// runs no command.
 fn submitSteering(self: *App) !void {
     if (self.session.editor.blank()) {
-        self.session.cancelMessageConfirmation();
+        self.session.cancelConfirmation(.message);
         return;
     }
     const text = try self.session.editor.expanded(.whole_prompt);
     defer self.gpa.free(text);
-    if (!self.session.takeMessageConfirmation()) {
+    if (!self.session.takeConfirmation(.message)) {
         if (ai.command.parse(text)) |name| {
             if (try self.checkCommand(text)) |refusal|
                 return self.armMessageSend(refusal, "Queue as a message");
@@ -1552,8 +1588,9 @@ fn drainCanceledProgress(self: *App, apply_progress: bool) ?anyerror {
 }
 
 /// Ctrl+C: clear the editor, or quit when pressed twice inside the window.
-/// Measured on the monotonic clock. A wall-clock step must not fake or break
-/// the double press.
+/// The clear takes no warning, because the clear is the purpose of the key and
+/// not a side effect. Measured on the monotonic clock. A wall-clock step must
+/// not fake or break the double press.
 fn clearOrQuit(self: *App) void {
     const now = self.nowMs();
     if (now - self.ctrl_c_ms_last < ctrl_c_window_ms) {
@@ -1601,8 +1638,8 @@ fn nowNs(self: *App) i96 {
 /// sends that line to the model as typed.
 fn submit(self: *App) !void {
     if (self.session.editor.blank()) {
-        self.session.cancelCacheConfirmation();
-        self.session.cancelMessageConfirmation();
+        self.session.cancelConfirmation(.cache);
+        self.session.cancelConfirmation(.message);
         return;
     }
     const maybe_cache_risk = self.agent.cacheRisk();
@@ -1621,7 +1658,7 @@ fn submitWithCacheRisk(self: *App, maybe_cache_risk: ?*const ai.Agent.CacheRisk)
     // that confirmation, the registry decides first: a line it cannot run keeps its
     // own refusal and arms the next Enter, so plain text that starts with a slash
     // still has a way out.
-    const message_confirmed = self.session.takeMessageConfirmation();
+    const message_confirmed = self.session.takeConfirmation(.message);
     if (!message_confirmed) {
         if (try self.checkCommand(text)) |refusal|
             return self.armMessageSend(refusal, "Send as a message");
@@ -1629,7 +1666,7 @@ fn submitWithCacheRisk(self: *App, maybe_cache_risk: ?*const ai.Agent.CacheRisk)
             return self.applySubmittedCommand(outcome, maybe_cache_risk);
     }
     if (!self.signedIn()) {
-        self.session.cancelCacheConfirmation();
+        self.session.cancelConfirmation(.cache);
         self.session.editor.clear();
         return self.reportNotice(
             .failure,
@@ -1649,7 +1686,7 @@ fn submitWithCacheRisk(self: *App, maybe_cache_risk: ?*const ai.Agent.CacheRisk)
         // The stale-cache warning stopped this send and armed its own Enter. Keep
         // the message confirmation, or the next Enter falls back into the registry
         // and both warnings alternate forever.
-        self.session.armMessageConfirmation();
+        self.session.armConfirmation(.message);
     }
 }
 
@@ -1664,7 +1701,7 @@ fn applySubmittedCommand(
         .prompt => |prompt| {
             defer prompt.deinit(self.gpa);
             if (!self.signedIn()) {
-                self.session.cancelCacheConfirmation();
+                self.session.cancelConfirmation(.cache);
                 self.session.editor.clear();
                 try self.reportNotice(
                     .failure,
@@ -1683,12 +1720,12 @@ fn applySubmittedCommand(
         // Another try is the way forward, so the line stays in the editor and no
         // confirmation arms.
         .refusal => {
-            self.session.cancelCacheConfirmation();
+            self.session.cancelConfirmation(.cache);
             try self.applyOutcome(outcome);
         },
         // Every other command clears the editor first.
         else => {
-            self.session.cancelCacheConfirmation();
+            self.session.cancelConfirmation(.cache);
             self.session.editor.clear();
             try self.applyOutcome(outcome);
         },
@@ -1706,10 +1743,10 @@ fn armMessageSend(
     action: []const u8,
 ) !void {
     defer self.gpa.free(refusal.content);
-    self.session.cancelCacheConfirmation();
+    self.session.cancelConfirmation(.cache);
     // Arm last, so a failed notice leaves no offer that the row never showed.
     try self.reportNotice(refusal.severity, "Enter: {s} · {s}", .{ action, refusal.content });
-    self.session.armMessageConfirmation();
+    self.session.armConfirmation(.message);
 }
 
 /// Stop the first stale-cache submission and arm one confirmation for the
@@ -1720,7 +1757,7 @@ fn preflightModelSubmit(
     maybe_cache_risk: ?*const ai.Agent.CacheRisk,
     action: []const u8,
 ) !bool {
-    if (self.session.takeCacheConfirmation()) return true;
+    if (self.session.takeConfirmation(.cache)) return true;
     const cache_risk = maybe_cache_risk orelse return true;
     // A stale cache names the window it outlived. A cold cache has no window
     // to name: the active model holds no cache for this conversation, so the
@@ -1751,7 +1788,7 @@ fn preflightModelSubmit(
             .{ action, state, cache_risk.cost_extra },
         );
     }
-    self.session.armCacheConfirmation();
+    self.session.armConfirmation(.cache);
     return false;
 }
 
@@ -2822,8 +2859,9 @@ test "esc and ctrl+d cancel a turn and keep the draft" {
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
     defer app.session.deinit();
 
-    // A cancel backs out of the turn alone: the draft stays, and pith runs on. So
-    // neither key needs the empty-editor guard the quit has at the prompt.
+    // A cancel backs out of the turn alone: the draft stays, and pith runs on, so
+    // no press here can discard text. Esc with a draft warns first, so its cancel
+    // takes a second press. Ctrl+D is a decision and cancels at once.
     for ([_]terminal.Input.Key{ .escape, .{ .ctrl = 'd' } }) |key| {
         app.session.beginTurn(1);
         try spawnCanceledTurn(&app);
@@ -2831,11 +2869,79 @@ test "esc and ctrl+d cancel a turn and keep the draft" {
         try app.session.editor.insert("keep the draft");
 
         try app.handleKey(&key);
+        if (key == .escape) {
+            // The first Esc arms the confirmation and warns. The turn runs on.
+            try std.testing.expect(app.session.mode == .turn);
+            try std.testing.expect(app.session.notice != null);
+            try app.handleKey(&key);
+        }
         try std.testing.expect(app.session.mode == .prompt);
         try std.testing.expect(app.turn_future == null);
         try std.testing.expectEqualStrings("keep the draft", app.session.editor.visible());
         try std.testing.expect(app.running);
     }
+}
+
+test "a key between two esc presses drops the turn-cancel confirmation" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    defer app.drainQueue();
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = anthropic_default,
+        .system = "",
+        .retry = .{},
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+    app.session.beginTurn(1);
+    try spawnCanceledTurn(&app);
+    try app.session.editor.insert("draft");
+
+    try app.handleKey(&.escape);
+    try std.testing.expect(app.session.mode == .turn);
+    try std.testing.expect(app.session.confirmations.contains(.turn_cancel));
+    // The edit clears the warning and its one-shot confirmation, so the next Esc
+    // warns again instead of a cancel.
+    try app.handleKey(&.{ .char = 'x' });
+    try std.testing.expect(app.session.notice == null);
+    try std.testing.expect(!app.session.confirmations.contains(.turn_cancel));
+    try app.handleKey(&.escape);
+    try std.testing.expect(app.session.mode == .turn);
+    try app.handleKey(&.escape);
+    try std.testing.expect(app.session.mode == .prompt);
+    try std.testing.expectEqualStrings("draftx", app.session.editor.visible());
+}
+
+test "a key between two ctrl+d presses drops the quit confirmation" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+    try app.session.editor.insert("draft");
+
+    try app.handleKey(&.{ .ctrl = 'd' });
+    try std.testing.expect(app.running);
+    try std.testing.expect(app.session.confirmations.contains(.quit));
+    // The edit clears the warning and its one-shot confirmation, so the next
+    // Ctrl+D warns again instead of a quit.
+    try app.handleKey(&.{ .char = 'x' });
+    try std.testing.expect(app.session.notice == null);
+    try std.testing.expect(!app.session.confirmations.contains(.quit));
+    try app.handleKey(&.{ .ctrl = 'd' });
+    try std.testing.expect(app.running);
+    try app.handleKey(&.{ .ctrl = 'd' });
+    try std.testing.expect(!app.running);
+    try std.testing.expectEqualStrings("draftx", app.session.editor.visible());
 }
 
 test "canceling a turn joins and clears its active worker" {
@@ -3871,7 +3977,7 @@ test "mid-turn Enter queues a message but refuses a slash line or a blank line" 
 
     // An unknown name mid-turn keeps the registry reason too. `handleKey` drops the
     // arm of the line above on every key that is not an Enter, so drop it here too.
-    app.session.cancelMessageConfirmation();
+    app.session.cancelConfirmation(.message);
     app.session.editor.clear();
     try app.session.editor.insert("/nope");
     try app.submitSteering();
@@ -3886,7 +3992,7 @@ test "mid-turn Enter queues a message but refuses a slash line or a blank line" 
     defer gpa.free(blocked);
     try std.testing.expectEqual(@as(usize, 0), blocked.len);
     // The arm is one-shot and belongs to this line alone, so the next key drops it.
-    app.session.cancelMessageConfirmation();
+    app.session.cancelConfirmation(.message);
 
     // A message keeps the steering path.
     app.session.editor.clear();
@@ -4189,7 +4295,7 @@ test "a turn cancel drops the rest of an exit attempt in one chunk" {
     try std.testing.expect(app.running);
 }
 
-test "ctrl+c clears then quits within the window and ctrl+d quits only when empty" {
+test "ctrl+c clears then quits within the window and a draft makes ctrl+d ask twice" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
@@ -4199,10 +4305,19 @@ test "ctrl+c clears then quits within the window and ctrl+d quits only when empt
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
     defer app.session.deinit();
 
+    // The first Ctrl+D with a draft warns instead of a quit, and the warning
+    // offers the second press. That press quits and keeps nothing waiting.
     try app.session.editor.insert("draft");
     try app.handleKey(&.{ .ctrl = 'd' });
     try std.testing.expect(app.running);
+    const notice = app.session.notice.?;
+    try std.testing.expect(notice.severity == .warning);
+    try std.testing.expect(std.mem.indexOf(u8, notice.content, "Ctrl+D") != null);
+    try app.handleKey(&.{ .ctrl = 'd' });
+    try std.testing.expect(!app.running);
 
+    // Arm again, or the window test below proves nothing.
+    app.running = true;
     try app.handleKey(&.{ .ctrl = 'c' });
     try std.testing.expectEqualStrings("", app.session.editor.visible());
     try std.testing.expect(app.running);
@@ -4253,9 +4368,9 @@ test "/new clears the conversation and the scrollback without a configuration ch
     try app.session.paint(.{ .columns = 80, .rows = 6 });
 
     try app.session.editor.insert("/new");
-    app.session.armCacheConfirmation();
+    app.session.armConfirmation(.cache);
     try app.submit();
-    try std.testing.expect(!app.session.takeCacheConfirmation());
+    try std.testing.expect(!app.session.takeConfirmation(.cache));
 
     // The empty conversation must start on a clean screen. The paint clears the
     // visible rows and drops the scrollback with them.
@@ -5421,7 +5536,7 @@ test "a stale cache stops the first Ctrl+N and the next one sends" {
     try app.retryWithCacheRisk(&risk);
     try std.testing.expect(app.session.mode == .prompt);
     try std.testing.expect(app.retry != null);
-    try std.testing.expect(app.session.cache_confirmation);
+    try std.testing.expect(app.session.confirmations.contains(.cache));
     try std.testing.expect(std.mem.startsWith(
         u8,
         app.session.notice.?.content,
@@ -5431,13 +5546,13 @@ test "a stale cache stops the first Ctrl+N and the next one sends" {
     // The key that passes the warning keeps its own offer, and any other key drops
     // it. Signed out, this Ctrl+N stops at the sign-in and sends nothing.
     try app.handleKey(&.{ .ctrl = 'n' });
-    try std.testing.expect(app.session.cache_confirmation);
+    try std.testing.expect(app.session.confirmations.contains(.cache));
     try app.handleKey(&.left);
-    try std.testing.expect(!app.session.cache_confirmation);
+    try std.testing.expect(!app.session.confirmations.contains(.cache));
 
     // Armed again, the next Ctrl+N passes the warning and starts the attempt.
     try app.retryWithCacheRisk(&risk);
-    try std.testing.expect(app.session.cache_confirmation);
+    try std.testing.expect(app.session.confirmations.contains(.cache));
     try app.retryWithCacheRisk(&risk);
     try std.testing.expect(app.session.mode == .turn);
     try std.testing.expect(app.retry == null);
@@ -5711,7 +5826,7 @@ test "a refused command line reaches the model on the next Enter" {
 
     try app.session.editor.insert("/nope tell me about this");
     try app.handleKey(&.enter);
-    try std.testing.expect(app.session.message_confirmation);
+    try std.testing.expect(app.session.confirmations.contains(.message));
     try std.testing.expectEqualStrings(
         "Enter: Send as a message · Pith does not recognize the command /nope.",
         app.session.notice.?.content,
@@ -5720,17 +5835,17 @@ test "a refused command line reaches the model on the next Enter" {
 
     // An edit invalidates the arm, so the line refuses again instead of sending.
     try app.handleKey(&.{ .char = 'x' });
-    try std.testing.expect(!app.session.message_confirmation);
+    try std.testing.expect(!app.session.confirmations.contains(.message));
     try app.handleKey(&.backspace);
-    try std.testing.expect(!app.session.message_confirmation);
+    try std.testing.expect(!app.session.confirmations.contains(.message));
 
     try app.handleKey(&.enter);
-    try std.testing.expect(app.session.message_confirmation);
+    try std.testing.expect(app.session.confirmations.contains(.message));
     try app.handleKey(&.enter);
 
     // The second Enter took the message path: no registry refusal, and the
     // signed-out guard stopped the turn.
-    try std.testing.expect(!app.session.message_confirmation);
+    try std.testing.expect(!app.session.confirmations.contains(.message));
     try std.testing.expect(app.session.mode == .prompt);
     try std.testing.expectEqual(@as(usize, 0), app.session.transcript.blocks().len);
     const notice = app.session.notice.?;
@@ -5763,14 +5878,14 @@ test "a refused command line queues as steering on the next Enter" {
     // A runnable command offers no send, so a second Enter refuses again.
     try app.session.editor.insert("/model");
     try app.handleKey(&.enter);
-    try std.testing.expect(!app.session.message_confirmation);
+    try std.testing.expect(!app.session.confirmations.contains(.message));
     try app.handleKey(&.enter);
     try std.testing.expectEqualStrings("/model", app.session.editor.visible());
 
     app.session.editor.clear();
     try app.session.editor.insert("/nope steer with this");
     try app.handleKey(&.enter);
-    try std.testing.expect(app.session.message_confirmation);
+    try std.testing.expect(app.session.confirmations.contains(.message));
     try std.testing.expectEqualStrings(
         "Enter: Queue as a message · Pith does not recognize the command /nope.",
         app.session.notice.?.content,
@@ -5823,7 +5938,7 @@ test "a turn that ends under the queue offer clears the row too" {
         .steering_committed_count = 0,
     });
     try std.testing.expect(app.session.mode == .prompt);
-    try std.testing.expect(!app.session.message_confirmation);
+    try std.testing.expect(!app.session.confirmations.contains(.message));
     try std.testing.expect(app.session.notice == null);
 
     // The line survived, so one Enter offers the send again and starts no turn.
@@ -5836,7 +5951,7 @@ test "a turn that ends under the queue offer clears the row too" {
         "Enter: Send as a message · Pith does not recognize the command /nope.",
         app.session.notice.?.content,
     );
-    try std.testing.expect(app.session.message_confirmation);
+    try std.testing.expect(app.session.confirmations.contains(.message));
     try std.testing.expectEqual(@as(usize, 0), app.session.transcript.blocks().len);
 }
 
@@ -5884,12 +5999,12 @@ test "a stale cache blocks one submit and keeps the prompt unchanged" {
 
     // The next preflight consumes the confirmation instead of warning again.
     try std.testing.expect(try app.preflightModelSubmit(&risk, cache_hint_submit));
-    try std.testing.expect(!app.session.takeCacheConfirmation());
+    try std.testing.expect(!app.session.takeConfirmation(.cache));
 
     // Any other user key cancels a later confirmation.
-    app.session.armCacheConfirmation();
+    app.session.armConfirmation(.cache);
     try app.handleKey(&.left);
-    try std.testing.expect(!app.session.takeCacheConfirmation());
+    try std.testing.expect(!app.session.takeConfirmation(.cache));
 }
 
 // Two one-shot confirmations can meet on one line. The stale-cache warning stops
@@ -5928,25 +6043,25 @@ test "a stale cache keeps the send-as-a-message confirmation" {
 
     // Enter 1: the registry refuses the line and offers the send.
     try app.submitWithCacheRisk(&risk);
-    try std.testing.expect(app.session.message_confirmation);
-    try std.testing.expect(!app.session.cache_confirmation);
+    try std.testing.expect(app.session.confirmations.contains(.message));
+    try std.testing.expect(!app.session.confirmations.contains(.cache));
 
     // Enter 2: the send meets the stale-cache warning, which sends nothing.
     try app.submitWithCacheRisk(&risk);
-    try std.testing.expect(app.session.cache_confirmation);
+    try std.testing.expect(app.session.confirmations.contains(.cache));
     try std.testing.expect(std.mem.startsWith(
         u8,
         app.session.notice.?.content,
         "Enter: Send anyway · Cache: Probably stale after 5m",
     ));
     // Both offers stand, so the line is not back at the registry refusal.
-    try std.testing.expect(app.session.message_confirmation);
+    try std.testing.expect(app.session.confirmations.contains(.message));
     try std.testing.expectEqualStrings("/tmp/x.log is empty", app.session.editor.visible());
     try std.testing.expectEqual(@as(usize, 0), app.session.transcript.blocks().len);
 
     // Enter 3 opens both gates, so it starts the turn instead of warning again.
     // The turn spawn itself stays out of this test.
-    try std.testing.expect(app.session.takeMessageConfirmation());
+    try std.testing.expect(app.session.takeConfirmation(.message));
     try std.testing.expect(try app.preflightModelSubmit(&risk, cache_hint_submit));
 }
 
@@ -6014,7 +6129,7 @@ test "an idle submit of a slash line with a tail is refused and keeps its text" 
         app.session.editor.visible(),
     );
     // The row is a control hint, so the next Enter owns the send.
-    try std.testing.expect(app.session.message_confirmation);
+    try std.testing.expect(app.session.confirmations.contains(.message));
 }
 
 // Pith classifies a large paste that expands to a slash command from its expanded

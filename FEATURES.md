@@ -16,9 +16,10 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - Enter during a turn queues a steering message that folds into the run at the next tool round.
 - Ctrl+P pulls messages the turn has not picked up yet back into the editor to keep editing.
 - Steering left in the queue when a turn completes starts the next turn on its own.
-- Esc or Ctrl+D cancels a turn and keeps the draft. Ctrl+C clears a draft in the editor first, and
-  cancels only on an empty editor. Canceled or failed turns keep finished rounds, drop the in-flight
-  tail, and return uncommitted text to the editor.
+- Esc or Ctrl+D cancels a turn and keeps the draft. Esc with a draft warns first and cancels on the
+  second press. Ctrl+C clears a draft in the editor first, and cancels only on an empty editor.
+  Canceled or failed turns keep finished rounds, drop the in-flight tail, and return uncommitted
+  text to the editor.
 - Pith records a tool call left unfinished as an error in the history. The transcript shows it as a
   failed call, so a canceled mutation is never hidden.
 - Timeouts and transient failures retry the whole request and clear the partial reply first.
@@ -267,7 +268,8 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 
 - Enter sends, Shift+Enter or Ctrl+J makes a newline, Esc cancels, Ctrl+C clears, Ctrl+D quits. An
   intro line shows the bindings at launch.
-- A second Ctrl+C within 500 ms quits, as does Ctrl+D on an empty editor or a closed stdin.
+- A second Ctrl+C within 500 ms quits, as does Ctrl+D on an empty editor or a closed stdin. Ctrl+D
+  with a draft warns that the quit discards the draft, and quits on the second press.
 - The caret moves by grapheme cluster, by wrapped row with a sticky column, and to the start or end
   of the input.
 - A paste over 10 lines or 1000 bytes collapses to a `[Paste #N: L lines]` marker.
