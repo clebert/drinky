@@ -13,6 +13,7 @@ const Context = @import("Context.zig");
 const testing = @import("testing.zig");
 
 pub const name = "effort";
+pub const summary = "set the reasoning-effort level";
 
 const levels = std.enums.values(llm.Effort);
 

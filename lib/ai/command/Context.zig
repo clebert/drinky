@@ -34,6 +34,10 @@ pub const Outcome = union(enum) {
     /// Submit an expanded skill instruction as a user turn. The app records the
     /// skill head and the optional task when it sends `content` to the model.
     prompt: Prompt,
+    /// Write this text into the editor in place of the draft. A picked line that
+    /// takes an argument lands here, so the user completes it and sends it. The
+    /// bytes transfer to the caller.
+    editor_text: []const u8,
     /// Authenticate this account, then switch to it. The app owns the flow. It
     /// must suspend the tty around the OAuth browser callback.
     login: llm.Account,

@@ -94,8 +94,12 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - A busy credential store keeps a refreshed token in memory and retries its save before the next
   provider request.
 - Anthropic subscription logins save stable account and organization IDs from the OAuth profile.
-- If another pith instance saved a token for the same known principal, pith reloads it and retries
-  once. A different or unknown principal stops before the model request.
+- If another pith instance saved a token for the same known principal, pith takes that token. The
+  refresh happens only when the stored token has expired too. A different or unknown principal stops
+  before the model request.
+- A request that the provider rejects with 401 renews the credential once and repeats it. The
+  renewal takes the token that another instance saved, or it refreshes the token in memory. An
+  API-key account holds one fixed secret, so a rejected request ends the turn.
 - If another pith instance saves a replacement before removal, pith reloads it and keeps the account
   active.
 - Without a replacement, pith removes the rejected credential and moves the session to another
@@ -106,6 +110,8 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 
 ## Slash commands
 
+- **/help** — pick a command from an alphabetical list. Each row holds the name of one command and a
+  short summary. Enter runs the picked command at once, and a bare `/` opens the same list.
 - **/model** — switch account and model together, from the next turn on.
 - **/effort** — set the reasoning-effort level, from the next turn on.
 - **/login** — sign in, switch to an account already signed in, or name the API key to set.
@@ -116,6 +122,9 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
   scrollable full-window page. `M` toggles its exact source.
 - **/colors** — preview ANSI slots 0 to 15, colored backgrounds, default styles, message boxes, text
   roles, and input frames in a scrollable full-window page.
+- **/skill** — pick one of the discovered skills. Each row holds the first sentence of the skill
+  description. Enter writes its `/skill:name ` line into the editor, so a task can follow. `/skill:`
+  opens the same list.
 - **/skill:name** — load a discovered skill explicitly, record one user box whose head reads
   `Skill: name · File: path`, and append any trailing text as its task below that head.
 - Every line that starts with a slash is a command line, so Pith reads it locally first and sends it
@@ -240,6 +249,9 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
   it when a turn starts and when one ends.
 - A picker is a single-choice list that tags the current value. Enter confirms, and Esc, Ctrl+C, or
   Ctrl+D cancels. The selection rolls over at both ends of the list.
+- Every option holds one row. Pith cuts a row that is too wide for the window and marks the cut with
+  one `…`. The cut takes the option text, so the tag of the row stays. A selection can open a second
+  list. That list replaces the first one, and Esc closes the picker with no step back.
 - A muted caption above the picker frame holds the title and the key hint. It stays outside the
   scrolled window, so the picker window never scrolls it away.
 - The open input area grows to about a quarter of the screen and labels hidden rows "↑ Hidden: N"

@@ -46,6 +46,13 @@ pub fn accessToken(self: *Auth) ![]const u8 {
     return auth.accessToken(self, account_key, refreshTokens);
 }
 
+/// Renew a credential the provider rejected on a request: adopt the token
+/// another instance saved, else refresh this one before it expires. It reports
+/// whether the credential changed.
+pub fn renew(self: *Auth) !bool {
+    return auth.renew(self, account_key, refreshTokens);
+}
+
 /// `oauth.refresh` in the shared lifecycle's shape (which passes whole tokens).
 fn refreshTokens(
     gpa: std.mem.Allocator,
@@ -363,6 +370,31 @@ fn grantRotatedRefresh(
     return grantRefresh(gpa, io, timeouts, tokens);
 }
 
+/// Test scaffolding: the store that `refuseRefreshAfterSave` fills. The refresher
+/// takes no path, so the race the hook plays needs one here. A test that sets it
+/// must clear it again, because the path lives on that test's stack.
+var race_path: []const u8 = "";
+
+/// A refresh that loses a race: another instance saves its own renewal while this
+/// one runs, and the spent token that this one holds is rejected.
+fn refuseRefreshAfterSave(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    _: net.Timeouts,
+    _: oauth.Tokens,
+) anyerror!oauth.Tokens {
+    // A caller that set no path would write through a dead one.
+    std.debug.assert(race_path.len > 0);
+    try json_store.save(gpa, io, race_path, account_key, .{
+        .access = "winner_access",
+        .refresh = "winner",
+        .expires_ms = std.math.maxInt(i64),
+        .account_uuid = "account",
+        .organization_uuid = "organization",
+    }, .{});
+    return error.TokenGrantRejected;
+}
+
 fn grantRefreshAfterCancel(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -478,6 +510,54 @@ test "a refresh token rotated by another instance recovers without a restart" {
     try std.testing.expectEqualStrings("next", file.entry(account_key).?.get("refresh").?.string);
 }
 
+// Every refresh rotates the token that every other instance holds. A live
+// credential from the store is therefore used as it stands, so two instances
+// cannot chase each other through one rotation after another.
+test "a live credential from another instance is used without a refresh" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/auth.json", .{tmp.sub_path});
+    try json_store.save(gpa, io, path, account_key, .{
+        .access = "saved_access",
+        .refresh = "saved",
+        .expires_ms = std.math.maxInt(i64),
+        .account_uuid = "account",
+        .organization_uuid = "organization",
+    }, .{});
+    var subject: Auth = .{
+        .gpa = gpa,
+        .io = io,
+        .timeouts = .{},
+        .path = path,
+        .tokens = .{
+            .access = try gpa.dupe(u8, "stale"),
+            .refresh = try gpa.dupe(u8, "dead"),
+            .expires_ms = 0,
+            .account_uuid = try gpa.dupe(u8, "account"),
+            .organization_uuid = try gpa.dupe(u8, "organization"),
+        },
+    };
+    defer subject.tokens.?.deinit(gpa);
+
+    // `refuseRefresh` fails every refresh, so the token can only come from the
+    // store. The expired credential in memory spends its own refresh once.
+    try std.testing.expectEqualStrings(
+        "saved_access",
+        try auth.accessToken(&subject, account_key, refuseRefresh),
+    );
+    try std.testing.expectEqualStrings("saved", subject.tokens.?.refresh);
+
+    // The store still holds that credential, because no rotation happened.
+    var file = (try json_store.open(gpa, io, path)).?;
+    defer file.deinit();
+    const entry = file.entry(account_key).?;
+    try std.testing.expectEqualStrings("saved", entry.get("refresh").?.string);
+    try std.testing.expectEqualStrings("saved_access", entry.get("access").?.string);
+}
+
 test "a stored credential for another principal stops before a model request" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -561,6 +641,121 @@ test "a retry that also fails keeps the credential the store holds" {
     var file = (try json_store.open(gpa, io, path)).?;
     defer file.deinit();
     try std.testing.expectEqualStrings("stored", file.entry(account_key).?.get("refresh").?.string);
+}
+
+// The revoked-token bug: a refresh in another instance kills the access token
+// this one holds, and that token still reads as live here. The rejected request
+// must take the credential the store holds and repeat, with no restart.
+test "a rejected access token takes the credential another instance saved" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/auth.json", .{tmp.sub_path});
+    try json_store.save(gpa, io, path, account_key, .{
+        .access = "saved_access",
+        .refresh = "saved",
+        .expires_ms = std.math.maxInt(i64),
+        .account_uuid = "account",
+        .organization_uuid = "organization",
+    }, .{});
+    var subject: Auth = .{
+        .gpa = gpa,
+        .io = io,
+        .timeouts = .{},
+        .path = path,
+        .tokens = .{
+            .access = try gpa.dupe(u8, "revoked"),
+            .refresh = try gpa.dupe(u8, "dead"),
+            // The provider revoked this token, but its own clock reads live.
+            .expires_ms = std.math.maxInt(i64),
+            .account_uuid = try gpa.dupe(u8, "account"),
+            .organization_uuid = try gpa.dupe(u8, "organization"),
+        },
+    };
+    defer subject.tokens.?.deinit(gpa);
+
+    // The store answers, so the renewal buys no new credential.
+    try std.testing.expect(try auth.renew(&subject, account_key, refuseRefresh));
+    try std.testing.expectEqualStrings("saved_access", subject.tokens.?.access);
+    try std.testing.expectEqualStrings("saved", subject.tokens.?.refresh);
+    try std.testing.expectEqualStrings(
+        "saved_access",
+        try auth.accessToken(&subject, account_key, refuseRefresh),
+    );
+}
+
+// Two instances can meet the rejection at the same moment. The loser finds an
+// empty store, refreshes into the rejection of a spent token, and must then read
+// the store that the winner filled in the meantime.
+test "a renewal whose refresh fails takes the credential that landed meanwhile" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/auth.json", .{tmp.sub_path});
+    var subject: Auth = .{
+        .gpa = gpa,
+        .io = io,
+        .timeouts = .{},
+        .path = path,
+        .tokens = .{
+            .access = try gpa.dupe(u8, "revoked"),
+            .refresh = try gpa.dupe(u8, "spent"),
+            .expires_ms = std.math.maxInt(i64),
+            .account_uuid = try gpa.dupe(u8, "account"),
+            .organization_uuid = try gpa.dupe(u8, "organization"),
+        },
+    };
+    defer subject.tokens.?.deinit(gpa);
+
+    // The store is empty until the refresh runs, so the renewal adopts nothing
+    // first. The hook then fills the store and rejects the spent token.
+    race_path = path;
+    // The path lives on this stack, so the hook must not keep it.
+    defer race_path = "";
+    try std.testing.expect(try auth.renew(&subject, account_key, refuseRefreshAfterSave));
+    try std.testing.expectEqualStrings("winner_access", subject.tokens.?.access);
+    try std.testing.expectEqualStrings("winner", subject.tokens.?.refresh);
+}
+
+test "a rejected access token refreshes although its own clock reads live" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/auth.json", .{tmp.sub_path});
+    var subject: Auth = .{
+        .gpa = gpa,
+        .io = io,
+        .timeouts = .{},
+        .path = path,
+        .tokens = .{
+            .access = try gpa.dupe(u8, "revoked"),
+            .refresh = try gpa.dupe(u8, "live"),
+            .expires_ms = std.math.maxInt(i64),
+            .account_uuid = try gpa.dupe(u8, "account"),
+            .organization_uuid = try gpa.dupe(u8, "organization"),
+        },
+    };
+    defer subject.tokens.?.deinit(gpa);
+
+    // The store holds nothing newer, so the renewal spends the refresh token.
+    try std.testing.expect(try auth.renew(&subject, account_key, grantRefresh));
+    try std.testing.expectEqualStrings("fresh", subject.tokens.?.access);
+    try std.testing.expectEqualStrings("next", subject.tokens.?.refresh);
+    try std.testing.expectEqualStrings("account", subject.tokens.?.account_uuid.?);
+
+    var file = (try json_store.open(gpa, io, path)).?;
+    defer file.deinit();
+    try std.testing.expectEqualStrings("next", file.entry(account_key).?.get("refresh").?.string);
+
+    // A signed-out account renews nothing, so no caller repeats its request.
+    var empty: Auth = .{ .gpa = gpa, .io = io, .timeouts = .{}, .path = path, .tokens = null };
+    try std.testing.expect(!try auth.renew(&empty, account_key, refuseRefresh));
 }
 
 test "invalidation preserves a newer refresh token from another instance" {

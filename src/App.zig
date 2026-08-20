@@ -1964,7 +1964,9 @@ fn applyOutcome(self: *App, outcome: ai.command.Outcome) !void {
         },
         // Only `submit` produces a prompt outcome (from a typed `/skill:` line),
         // and it starts that turn itself, so a prompt never reaches this shared
-        // path. A prompt routed here skips the editor's rich draft.
+        // path. A prompt routed here skips the editor's rich draft. The command
+        // list runs a registry entry through this path, so no listed command may
+        // return a prompt: the `/skill` row writes an editor line instead.
         .prompt => unreachable,
         .login => |account| try self.loginAccount(account),
         .logout => |account| try self.logoutAccount(account),
@@ -6104,6 +6106,72 @@ test "Esc, Ctrl+C, and Ctrl+D each cancel the picker with context" {
         );
         try std.testing.expectEqual(@as(usize, 0), app.session.transcript.blocks().len);
     }
+}
+
+// The command list is the first picker over a picker. A row that opens a list
+// replaces the layer, and the picked skill line lands in the editor, where the
+// user adds the task.
+test "the command list opens the skill list and writes the picked line" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var demo = try tmp.dir.createDirPathOpen(io, "user/demo", .{});
+    demo.close(io);
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "user/demo/SKILL.md",
+        .data = "---\nname: demo\ndescription: Shape a demo.\n---\nFollow this skill.\n",
+    });
+    var work = try tmp.dir.createDirPathOpen(io, "work", .{});
+    work.close(io);
+    const user_root = try tmpPath(gpa, io, &tmp, "user");
+    defer gpa.free(user_root);
+    const project_start = try tmpPath(gpa, io, &tmp, "work");
+    defer gpa.free(project_start);
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = anthropic_default,
+        .system = "",
+        .retry = .{},
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+    app.skills = try ai.skills.discover(gpa, io, &.{
+        .user_root = user_root,
+        .project_start = project_start,
+        .project_root = null,
+    });
+    defer app.skills.deinit();
+
+    // The bare slash opens the command list and clears the line it ran.
+    try app.session.editor.insert("/");
+    try app.submit();
+    try std.testing.expect(app.session.mode == .picking);
+    try std.testing.expect(app.session.editor.blank());
+
+    // The `/skill` row opens the skill list over the command list.
+    const commands = &app.session.mode.picking.picker;
+    commands.cursor = for (commands.options, 0..) |option, index| {
+        if (std.mem.startsWith(u8, option, "/skill —")) break index;
+    } else return error.MissingSkillRow;
+    const enter: terminal.Input.Key = .enter;
+    try app.handleKey(&enter);
+    try std.testing.expect(app.session.mode == .picking);
+    const listed_skills = &app.session.mode.picking.picker;
+    try std.testing.expectEqualStrings("Select a skill", listed_skills.title);
+    try std.testing.expectEqualStrings("/skill:demo — Shape a demo.", listed_skills.options[0]);
+
+    // The skill row closes the picker and writes its line, with the trailing
+    // blank that marks where the task goes.
+    try app.handleKey(&enter);
+    try std.testing.expect(app.session.mode == .prompt);
+    try std.testing.expectEqualStrings("/skill:demo ", app.session.editor.visible());
 }
 
 test "a user action clears a notice while background events leave it visible" {

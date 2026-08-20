@@ -9,6 +9,7 @@ const Context = @import("Context.zig");
 const testing = @import("testing.zig");
 
 pub const name = "login";
+pub const summary = "sign in or switch the account";
 
 pub fn run(context: *Context) !Context.Outcome {
     var options: Context.Outcome.Options = .{ .gpa = context.gpa };

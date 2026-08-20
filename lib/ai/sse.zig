@@ -113,6 +113,13 @@ pub fn Engine(comptime S: type) type {
             return stream.error_buffer[0..stream.error_length];
         }
 
+        /// Whether the head reported that the provider rejected the credential.
+        /// A token that another Pith instance rotated away reads like this, and
+        /// so does a revoked one.
+        pub fn unauthorized(stream: *const S) bool {
+            return stream.status == .unauthorized;
+        }
+
         /// Whether the current API failure is worth a retry: a streamed error
         /// marked transient by its provider, or a failed head that carries
         /// request timeout, rate limiting, or any 5xx server fault.

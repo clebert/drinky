@@ -47,6 +47,20 @@ pub const Client = struct {
         return std.meta.activeTag(self.credentials);
     }
 
+    /// Renew this client's credential after the provider rejected it, and
+    /// report whether the credential changed. A caller repeats a request only
+    /// on a true result, because an unchanged credential fails the same way.
+    ///
+    /// Only a subscription account can renew itself. An API key comes from the
+    /// environment, and the Console key is minted once at login. Neither one
+    /// rotates, so Pith has nothing to take in their place.
+    pub fn renewCredential(self: *Client) !bool {
+        return switch (self.credentials) {
+            inline .anthropic_subscription, .openai_subscription => |credential| credential.renew(),
+            .anthropic_console, .anthropic_api, .openai_api => false,
+        };
+    }
+
     /// Open a streaming request for `request` and fill `out` in place. On
     /// success the caller owns `out` and must `deinit` it.
     pub fn send(self: *Client, out: *Stream, request: *const llm.Request) !void {
@@ -123,6 +137,14 @@ pub const Stream = union(llm.Account) {
         };
     }
 
+    /// Whether the failed head reported that the provider rejected the
+    /// credential.
+    pub fn unauthorized(self: *const Stream) bool {
+        return switch (self.*) {
+            inline else => |*stream| stream.unauthorized(),
+        };
+    }
+
     /// Whether the current failure is worth a retry — a transient streamed
     /// error, rate limit, or server status the provider marks retryable.
     pub fn retryable(self: *const Stream) bool {
@@ -182,6 +204,31 @@ test "init selects the arm matching the credentials" {
     try std.testing.expectEqual(llm.Account.openai_api, openai_key.account());
     const codex = Client.init(gpa, std.testing.io, .{ .openai_subscription = undefined }, .{});
     try std.testing.expectEqual(llm.Account.openai_subscription, codex.account());
+}
+
+// A key account holds one fixed secret, so a rejected request stands. Only an
+// OAuth account can take another token, and one without a credential takes none.
+test "only an OAuth account renews its credential" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    for ([_]Credentials{
+        .{ .anthropic_api = "sk-ant" },
+        .{ .anthropic_console = "sk-ant-api03" },
+        .{ .openai_api = "sk-test" },
+    }) |credentials| {
+        var client = Client.init(gpa, io, credentials, .{});
+        try std.testing.expect(!try client.renewCredential());
+    }
+
+    var signed_out: anthropic.Auth = .{
+        .gpa = gpa,
+        .io = io,
+        .timeouts = .{},
+        .path = "",
+        .tokens = null,
+    };
+    var client = Client.init(gpa, io, .{ .anthropic_subscription = &signed_out }, .{});
+    try std.testing.expect(!try client.renewCredential());
 }
 
 test "usageSoFar reads accumulated usage through the stream seam" {

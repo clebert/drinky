@@ -718,7 +718,7 @@ fn appendToolBlock(self: *Session, block: *const ToolBlock) !void {
 }
 
 /// Apply a command outcome to the model: replace its notice, record its event,
-/// or open its picker.
+/// open its picker, or write its line into the editor.
 pub fn applyOutcome(self: *Session, outcome: ai.command.Outcome) !void {
     switch (outcome) {
         // A refusal is a notice whose line stays in the editor. The app owns that
@@ -733,6 +733,15 @@ pub fn applyOutcome(self: *Session, outcome: ai.command.Outcome) !void {
             );
         },
         .pick => |*pick| try self.openPicker(pick),
+        // A picked line that takes an argument replaces the draft, so the user
+        // completes it and sends it. The command that opened the picker already
+        // cleared the editor, so nothing of the typed line survives here.
+        .editor_text => |text| {
+            defer self.gpa.free(text);
+            self.editor.clear();
+            try self.editor.insert(text);
+            self.markEdited();
+        },
         // The app intercepts prompt, account, conversation, and inspection
         // actions. They never reach the io-free session.
         .prompt,
@@ -1154,7 +1163,7 @@ pub fn paint(self: *Session, size: terminal.View.Size) !void {
             } };
         },
         .picking => |*picking| picking: {
-            picking.picker.reflow(size);
+            try picking.picker.reflow(size);
             break :picking .{ .picking = &picking.picker };
         },
         .viewing => unreachable,
@@ -2351,6 +2360,24 @@ test "the steering view shows a paste collapsed, not its payload" {
     const painted = out.written();
     try std.testing.expect(std.mem.indexOf(u8, painted, "[Paste #1: 16 lines]") != null);
     try std.testing.expect(std.mem.indexOf(u8, painted, "secret line") == null);
+}
+
+// A picked line that takes an argument lands in the editor, so the user adds the
+// task and sends it. It replaces whatever the editor holds.
+test "a picked line replaces the draft in the editor" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    defer session.deinit();
+
+    try session.editor.insert("stale text");
+    try session.applyOutcome(.{ .editor_text = try gpa.dupe(u8, "/skill:demo ") });
+    try std.testing.expectEqualStrings("/skill:demo ", session.editor.visible());
+    try std.testing.expect(session.mode == .prompt);
+
+    try session.paint(.{ .columns = 80, .rows = 24 });
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "/skill:demo") != null);
 }
 
 test "opening a picker over a turn releases its retained prompt" {

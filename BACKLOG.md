@@ -100,6 +100,7 @@ decision already taken, or a dependency on another entry. Module layout and exte
 
 ## Ideas
 
+- A picker layered over a live turn, so a command list opens mid-turn.
 - Subagents, in some shape: a subshell, or a scheduler inside one process.
 - Restart the same prompt in a new session.
 - Benchmark models inside the pith harness.

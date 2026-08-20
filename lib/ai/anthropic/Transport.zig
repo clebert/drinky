@@ -114,6 +114,7 @@ pub const Stream = struct {
     pub const deinit = engine.deinit;
     pub const ok = engine.ok;
     pub const errorText = engine.errorText;
+    pub const unauthorized = engine.unauthorized;
     pub const retryable = engine.retryable;
     pub const retryAfterMs = engine.retryAfterMs;
     /// Usage accumulated so far. Anthropic splits it across the stream (prompt

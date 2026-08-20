@@ -112,44 +112,127 @@ pub fn accessToken(
         try save(auth, account_key);
     }
     const tokens = auth.tokens orelse return error.NotAuthenticated;
-    const now_ms = std.Io.Timestamp.now(auth.io, .real).toMilliseconds();
-    if (now_ms >= tokens.expires_ms) {
-        const fresh = refreshFn(auth.gpa, auth.io, auth.timeouts, tokens) catch |first_error|
-            try refreshFromStore(auth, account_key, first_error, refreshFn);
-        // The refresh consumed the stored (single-use) refresh token server-side,
-        // so `fresh` is now the only usable credential. Block cancellation until
-        // it is committed and persisted. Without the block, a cancel that lands
-        // at the save (the catalog fetch runs `accessToken` under a timeout)
-        // loses the credential.
-        const protection = auth.io.swapCancelProtection(.blocked);
-        defer _ = auth.io.swapCancelProtection(protection);
-        // Read the installed tokens again: a retry through the store replaced them.
-        auth.tokens.?.deinit(auth.gpa);
-        auth.tokens = fresh;
-        try save(auth, account_key);
+    if (expired(auth)) {
+        const Tokens = @typeInfo(@TypeOf(auth.tokens)).optional.child;
+        const maybe_fresh: ?Tokens = refreshFn(
+            auth.gpa,
+            auth.io,
+            auth.timeouts,
+            tokens,
+        ) catch |first_error| try refreshFromStore(auth, account_key, first_error, refreshFn);
+        // A null result reports that the store held a live credential, which is
+        // installed and needs no save of its own.
+        if (maybe_fresh) |fresh| {
+            // The refresh consumed the stored (single-use) refresh token
+            // server-side, so `fresh` is now the only usable credential. Block
+            // cancellation until it is committed and persisted. Without the
+            // block, a cancel that lands at the save (the catalog fetch runs
+            // `accessToken` under a timeout) loses the credential.
+            const protection = auth.io.swapCancelProtection(.blocked);
+            defer _ = auth.io.swapCancelProtection(protection);
+            // Read the installed tokens again: the store replaced them.
+            auth.tokens.?.deinit(auth.gpa);
+            auth.tokens = fresh;
+            try save(auth, account_key);
+        }
     }
     return auth.tokens.?.access;
 }
 
+/// Whether the installed access token has reached its expiry. Only the clock of
+/// this process answers here, so a token the provider revoked still reads live.
+fn expired(auth: anytype) bool {
+    const now_ms = std.Io.Timestamp.now(auth.io, .real).toMilliseconds();
+    return now_ms >= auth.tokens.?.expires_ms;
+}
+
+/// Renew a credential that the provider rejected on a model request. Take the
+/// token another instance saved when the store holds a newer one, else refresh
+/// the installed one, although it has not expired yet.
+///
+/// A revoked access token reads as fresh here, because only the provider knows
+/// that it died. Two Pith instances hold their own copy of one credential, so a
+/// refresh in one of them revokes the token the other still holds.
+///
+/// The call reports whether the credential changed, so the caller repeats a
+/// request only when the next one carries another token. A store that holds
+/// another principal is installed and reports `error.CredentialReplaced`,
+/// exactly as a failed refresh does.
+///
+/// A refresh that fails reads the store once more, because another instance can
+/// have saved its own renewal while this one ran.
+pub fn renew(
+    auth: anytype,
+    comptime account_key: []const u8,
+    comptime refreshFn: anytype,
+) !bool {
+    if (auth.tokens == null) return false;
+    if (try adoptStored(auth, account_key)) return true;
+    const Tokens = @typeInfo(@TypeOf(auth.tokens)).optional.child;
+    const maybe_fresh: ?Tokens = refreshFn(
+        auth.gpa,
+        auth.io,
+        auth.timeouts,
+        auth.tokens.?,
+    ) catch |first_error| try refreshFromStore(auth, account_key, first_error, refreshFn);
+    // A null result reports that the store held a live credential, which is
+    // installed already.
+    if (maybe_fresh) |fresh| {
+        // The refresh consumed the stored refresh token server-side, so `fresh`
+        // is now the only usable credential. `accessToken` blocks cancellation
+        // for the same reason.
+        const protection = auth.io.swapCancelProtection(.blocked);
+        defer _ = auth.io.swapCancelProtection(protection);
+        auth.tokens.?.deinit(auth.gpa);
+        auth.tokens = fresh;
+        try save(auth, account_key);
+    }
+    return true;
+}
+
 /// Inspect the credential that `auth.json` holds after a refresh failure. A
-/// different token for the same known principal gets one refresh attempt. A
-/// different or unknown principal is installed but stops before a model request.
-/// The app then drops the old principal evidence before the user retries.
+/// different token for the same known principal is installed. A different or
+/// unknown principal is installed too, but stops before a model request. The app
+/// then drops the old principal evidence before the user retries.
+///
+/// A null result reports that the installed credential is live, so the caller
+/// uses it as it stands. Tokens report a credential that the caller must install
+/// and save.
+///
+/// Pith refreshes the adopted credential only when it has expired too. Every
+/// refresh rotates the token that every other Pith instance holds, so a refresh
+/// of a live credential would push the instances into a rotation loop.
 fn refreshFromStore(
     auth: anytype,
     comptime account_key: []const u8,
     first_error: anyerror,
     comptime refreshFn: anytype,
-) anyerror!@typeInfo(@TypeOf(auth.tokens)).optional.child {
+) anyerror!?@typeInfo(@TypeOf(auth.tokens)).optional.child {
+    // A store that holds another principal stops the session, whatever brought
+    // the caller here. Every other failure of the store leaves the credential
+    // in memory, so the caller reports the failure it already has.
+    if (!try adoptStored(auth, account_key)) return first_error;
+    if (!expired(auth)) return null;
+    return try refreshFn(auth.gpa, auth.io, auth.timeouts, auth.tokens.?);
+}
+
+/// Install the credential that `auth.json` holds when another instance replaced
+/// the one in memory. It reports false when the store holds nothing new, and it
+/// treats a store it cannot read as nothing new, because the caller owns the
+/// failure that brought it here.
+///
+/// A store entry of another principal is installed too, and reports
+/// `error.CredentialReplaced`: the session must stop before a model request.
+fn adoptStored(auth: anytype, comptime account_key: []const u8) !bool {
     var stored_auth = auth.*;
     stored_auth.tokens = null;
     defer clear(&stored_auth);
-    const loaded = load(&stored_auth, account_key) catch return first_error;
-    if (!loaded) return first_error;
+    const loaded = load(&stored_auth, account_key) catch return false;
+    if (!loaded) return false;
 
     const current = &auth.tokens.?;
     const stored = &stored_auth.tokens.?;
-    if (std.mem.eql(u8, current.refresh, stored.refresh)) return first_error;
+    if (std.mem.eql(u8, current.refresh, stored.refresh)) return false;
     const same_principal = current.samePrincipal(stored);
 
     clear(auth);
@@ -157,7 +240,7 @@ fn refreshFromStore(
     auth.save_pending = stored_auth.save_pending;
     stored_auth.tokens = null;
     if (!same_principal) return error.CredentialReplaced;
-    return refreshFn(auth.gpa, auth.io, auth.timeouts, auth.tokens.?);
+    return true;
 }
 
 /// Run the interactive OAuth login and report pre-commit runtime text through

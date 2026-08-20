@@ -12,6 +12,10 @@
 //! `deinit`) and borrows the title. Navigation moves the selection and rolls over
 //! at both ends. `reflow` windows a tall list to keep it in view. The caller
 //! reads `cursor` and acts on the selected row.
+//!
+//! Every option holds exactly one row: `compose` cuts a row that the window
+//! cannot hold and marks the cut with one `…`. One row per option keeps the
+//! highlight and the step of the selection the same height for every list.
 
 const std = @import("std");
 
@@ -23,6 +27,11 @@ const terminal = @import("terminal");
 const Picker = @This();
 
 const hint = "↑/↓: Move · Enter: Select · Esc: Cancel";
+/// The tag of the option that holds the value the picker starts on.
+const tag_current = " (Current)";
+/// The width a picker composes its rows for before the first paint measures the
+/// window. No row reaches it, so no row is cut at that point.
+const unbounded = std.math.maxInt(usize);
 
 gpa: std.mem.Allocator,
 title: []const u8,
@@ -45,6 +54,10 @@ scroll: usize,
 /// `compose` sets it. `reflow` maps it to a wrapped row to keep the selection
 /// in view.
 cursor_offset: usize,
+/// The columns the composed rows are cut to. It starts unbounded, because
+/// `init` runs before the first paint. `reflow` sets the live width, so a width
+/// change recomposes the rows.
+columns_max: usize,
 
 /// Take ownership of `options` and compose the initial body. `current`, if set,
 /// is the row to mark and preselect. On failure the caller still owns `options`.
@@ -64,6 +77,7 @@ pub fn init(
         .line_roles = .empty,
         .scroll = 0,
         .cursor_offset = 0,
+        .columns_max = unbounded,
     };
     errdefer self.content.deinit(gpa);
     errdefer self.line_roles.deinit(gpa);
@@ -92,14 +106,19 @@ pub fn moveDown(self: *Picker) !void {
     try self.compose();
 }
 
-/// Re-clamp the scroll offset so the highlighted option's wrapped row stays
-/// inside the visible window. Call once per repaint. Pass the same `size` whose
-/// columns and rows `render` and `rows` will use, so all three agree.
+/// Recompose the rows for the live width, then re-clamp the scroll offset so the
+/// highlighted option's row stays inside the visible window. Call once per
+/// repaint. Pass the same `size` whose columns and rows `render` and `rows` will
+/// use, so all three agree.
 ///
 /// The window holds option rows alone, so the first option sits at its top and a
 /// step of one row reaches both ends of the list.
-pub fn reflow(self: *Picker, size: terminal.View.Size) void {
+pub fn reflow(self: *Picker, size: terminal.View.Size) !void {
     const columns_max = paint.contentColumns(size.columns);
+    if (self.columns_max != columns_max) {
+        self.columns_max = columns_max;
+        try self.compose();
+    }
     const total_body = terminal.width.rows(self.content.items, columns_max);
     const visible = @min(total_body, paint.bodyLimit(size.rows));
     const cursor_row = terminal.width.caret(self.content.items, .{
@@ -177,10 +196,32 @@ fn compose(self: *Picker) !void {
         const name: role.Name = if (chosen) .selection else .muted;
         try self.startLine(name);
         if (chosen) self.cursor_offset = self.content.items.len;
+        const start = self.content.items.len;
+        const tag = if (self.marked == index) tag_current else "";
+        const tag_columns = terminal.width.ofText(tag);
         try self.content.appendSlice(self.gpa, if (chosen) " > " else "   ");
-        try self.appendText(option, name);
-        if (self.marked == index) try self.content.appendSlice(self.gpa, " (Current)");
+        try self.content.appendSlice(self.gpa, option);
+        if (tag_columns < self.columns_max) {
+            // The tag states what the row is, so the cut takes the option text
+            // and leaves the tag. The row then holds the width by construction.
+            try self.cut(start, self.columns_max - tag_columns);
+            try self.content.appendSlice(self.gpa, tag);
+        } else {
+            // The window is narrower than the tag, so one cut takes both.
+            try self.content.appendSlice(self.gpa, tag);
+            try self.cut(start, self.columns_max);
+        }
     }
+}
+
+/// Cut the row that starts at `start` to `columns_max`, and mark the cut with
+/// one `…`. A row that fits keeps every byte. The cut stops at a row break too,
+/// so untrusted text that holds one cannot open a row of its own.
+fn cut(self: *Picker, start: usize, columns_max: usize) !void {
+    const shown = paint.cut(self.content.items[start..], columns_max);
+    if (!shown.marked) return;
+    self.content.shrinkRetainingCapacity(start + shown.kept.len);
+    try self.content.appendSlice(self.gpa, paint.ellipsis);
 }
 
 /// Open the next logical body row and record its role. Every option row carries
@@ -189,17 +230,6 @@ fn compose(self: *Picker) !void {
 fn startLine(self: *Picker, name: role.Name) !void {
     if (self.line_roles.items.len > 0) try self.content.append(self.gpa, '\n');
     try self.line_roles.append(self.gpa, name);
-}
-
-/// Append text to the current logical line and extend the role metadata when
-/// untrusted text itself contains a row break.
-fn appendText(self: *Picker, text: []const u8, name: role.Name) !void {
-    var pieces = std.mem.splitScalar(u8, text, '\n');
-    try self.content.appendSlice(self.gpa, pieces.next().?);
-    while (pieces.next()) |piece| {
-        try self.startLine(name);
-        try self.content.appendSlice(self.gpa, piece);
-    }
 }
 
 fn testPicker(gpa: std.mem.Allocator, labels: []const []const u8, cursor: usize) !Picker {
@@ -284,6 +314,48 @@ fn renderForTest(
     return gpa.dupe(u8, out.written());
 }
 
+// Every option holds one row, whatever the width does. A row too wide for the
+// window loses its tail to one `…`, so the highlight and the step of the
+// selection keep one height.
+test "a row too wide for the window is cut and marked" {
+    const gpa = std.testing.allocator;
+    // A `/model` row, because only a list with a current value carries the tag.
+    var picker = try testPicker(gpa, &.{
+        "claude-sonnet-5 (Anthropic Subscription)",
+        "two\nrows in one option",
+    }, 0);
+    defer picker.deinit();
+    const size: terminal.View.Size = .{ .columns = 24, .rows = 24 };
+
+    try picker.reflow(size);
+    // Two options, so two rows: the caption and the two separators add four.
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, picker.content.items, "\n") + 1);
+    try std.testing.expectEqual(@as(usize, 6), picker.rows(size));
+    try std.testing.expect(std.mem.indexOf(u8, picker.content.items, "…") != null);
+    // The row break inside an option cannot open a row of its own.
+    try std.testing.expect(std.mem.indexOf(u8, picker.content.items, "rows in one option") == null);
+
+    const painted = try renderForTest(gpa, &picker, size);
+    defer gpa.free(painted);
+    // The tag states what the row is, so the cut takes the text it marks and
+    // never the tag itself.
+    try std.testing.expect(std.mem.indexOf(u8, painted, " > claude-son… (Current)") != null);
+    try std.testing.expectEqual(@as(usize, 6), block.paintedRows(painted));
+
+    // Every row holds the width, even a window narrower than the tag.
+    for ([_]usize{ 24, 8, 3, 1 }) |columns| {
+        try picker.reflow(.{ .columns = columns, .rows = 24 });
+        var lines = std.mem.splitScalar(u8, picker.content.items, '\n');
+        while (lines.next()) |line|
+            try std.testing.expect(terminal.width.ofText(line) <= columns);
+    }
+
+    // A wider window recomposes the rows and shows what the cut dropped.
+    try picker.reflow(.{ .columns = 80, .rows = 24 });
+    try std.testing.expect(std.mem.indexOf(u8, picker.content.items, "Subscription") != null);
+    try std.testing.expect(std.mem.indexOf(u8, picker.content.items, "(Current)") != null);
+}
+
 test "a tall option list scrolls the window to keep the selection in view" {
     const gpa = std.testing.allocator;
     var storage: [20][8]u8 = undefined;
@@ -298,14 +370,14 @@ test "a tall option list scrolls the window to keep the selection in view" {
     // A 20-row viewport caps the list at six rows. With the selection on the
     // first option the window sits at the top and nothing scrolls. The caption
     // and the two separators add four rows above and below it.
-    picker.reflow(size);
+    try picker.reflow(size);
     try std.testing.expectEqual(@as(usize, 0), picker.scroll);
     try std.testing.expectEqual(@as(usize, 10), picker.rows(size));
 
     // A walk of the selection to the last option drags the window down after it.
     for (0..19) |_| {
         try picker.moveDown();
-        picker.reflow(size);
+        try picker.reflow(size);
     }
     try std.testing.expectEqual(@as(usize, 19), picker.cursor);
     try std.testing.expectEqual(@as(usize, 14), picker.scroll);
@@ -326,7 +398,7 @@ test "a tall option list scrolls the window to keep the selection in view" {
     // sits at the top of the list again.
     for (0..19) |_| {
         try picker.moveUp();
-        picker.reflow(size);
+        try picker.reflow(size);
     }
     try std.testing.expectEqual(@as(usize, 0), picker.cursor);
     try std.testing.expectEqual(@as(usize, 0), picker.scroll);
@@ -342,7 +414,7 @@ test "a tall option list scrolls the window to keep the selection in view" {
 
     // A roll over off the first option shows the end of the list whole.
     try picker.moveUp();
-    picker.reflow(size);
+    try picker.reflow(size);
     try std.testing.expectEqual(@as(usize, 19), picker.cursor);
     try std.testing.expectEqual(@as(usize, 14), picker.scroll);
 }

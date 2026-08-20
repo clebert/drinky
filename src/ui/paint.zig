@@ -94,8 +94,21 @@ pub fn contentColumns(columns: usize) usize {
     return @max(columns, 1);
 }
 
-/// The one character that marks a line the row cut.
-const ellipsis = "…";
+/// The one character that marks a cut row.
+pub const ellipsis = "…";
+
+/// What a cut leaves of a row: the text that fits, and whether the cut dropped
+/// anything. A caller that keeps `marked` writes `ellipsis` after `kept`.
+pub const Cut = struct { kept: []const u8, marked: bool };
+
+/// `text` cut to `columns_max`. A cut row reserves the one column that the mark
+/// of the cut takes, so the row and its mark together hold the width. Every row
+/// that states a measure or an option takes this rule, so one row stays one row.
+pub fn cut(text: []const u8, columns_max: usize) Cut {
+    const shown = terminal.width.truncate(text, columns_max);
+    if (shown.len == text.len) return .{ .kept = shown, .marked = false };
+    return .{ .kept = terminal.width.truncate(text, columns_max -| 1), .marked = true };
+}
 
 /// One box line without the carriage return of a CRLF break. The split that
 /// yields the line breaks on the line feed alone, so that byte stays on the end,
@@ -198,13 +211,9 @@ fn boxLineCells(
         // The wrap already cut the row, so it needs no mark of its own.
         .wrap => try sink.text(terminal.width.truncate(content, room)),
         .head => {
-            const shown = terminal.width.truncate(content, room);
-            if (shown.len == content.len) {
-                try sink.text(shown);
-            } else {
-                try sink.text(terminal.width.truncate(content, room -| 1));
-                try sink.text(ellipsis);
-            }
+            const shown = cut(content, room);
+            try sink.text(shown.kept);
+            if (shown.marked) try sink.text(ellipsis);
         },
     }
     try sink.spaces(columns -| sink.columns_written);

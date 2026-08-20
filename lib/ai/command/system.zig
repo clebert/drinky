@@ -6,6 +6,7 @@ const std = @import("std");
 const Context = @import("Context.zig");
 
 pub const name = "system";
+pub const summary = "inspect the complete system prompt";
 
 pub fn run(context: *Context) !Context.Outcome {
     _ = context;

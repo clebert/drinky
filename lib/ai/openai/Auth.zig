@@ -45,6 +45,13 @@ pub fn accessToken(self: *Auth) ![]const u8 {
     return auth.accessToken(self, account_key, oauth.refresh);
 }
 
+/// Renew a credential the provider rejected on a request: adopt the token
+/// another instance saved, else refresh this one before it expires. It reports
+/// whether the credential changed.
+pub fn renew(self: *Auth) !bool {
+    return auth.renew(self, account_key, oauth.refresh);
+}
+
 /// The ChatGPT account id sent with each request. Empty when not authenticated.
 pub fn accountId(self: *const Auth) []const u8 {
     const tokens = self.tokens orelse return "";

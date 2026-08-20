@@ -11,6 +11,7 @@ const Context = @import("Context.zig");
 const testing = @import("testing.zig");
 
 pub const name = "model";
+pub const summary = "switch account and model together";
 
 /// One selectable list row: a model bound to the account it runs under.
 const Combo = struct { account: llm.Account, model: models.Model };

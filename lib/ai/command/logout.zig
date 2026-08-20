@@ -10,6 +10,7 @@ const Context = @import("Context.zig");
 const testing = @import("testing.zig");
 
 pub const name = "logout";
+pub const summary = "drop the credentials of an account";
 
 pub fn run(context: *Context) !Context.Outcome {
     var buffer: [account_count]llm.Account = undefined;

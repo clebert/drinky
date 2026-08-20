@@ -6,6 +6,7 @@ const std = @import("std");
 const Context = @import("Context.zig");
 
 pub const name = "colors";
+pub const summary = "preview every color and text style";
 
 pub fn run(context: *Context) !Context.Outcome {
     _ = context;

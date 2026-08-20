@@ -135,7 +135,10 @@ pub const Registry = struct {
         self.* = undefined;
     }
 
-    fn items(self: *const Registry) []const Skill {
+    /// Every discovered skill, in scan order. The skill list of the user holds
+    /// them all, because a skill that disables model invocation still loads by
+    /// hand. The catalog that the model reads leaves that one out.
+    pub fn items(self: *const Registry) []const Skill {
         return self.skill_items.items;
     }
 

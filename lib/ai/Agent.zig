@@ -346,6 +346,10 @@ const ClientFetch = struct {
     fn send(self: *ClientFetch, stream: *provider.Stream, request: *const llm.Request) !void {
         return self.client.send(stream, request);
     }
+
+    fn renewCredential(self: *ClientFetch) !bool {
+        return self.client.renewCredential();
+    }
 };
 
 /// Duplicate one complete borrowed assistant output into the history shape and
@@ -786,6 +790,10 @@ fn drainSteering(self: *Agent, turn: *TurnState, handler: anytype) !bool {
 /// policy allows another try (see `net.Retry.allows`). An exhausted or permanent
 /// one is reported through `handler.onError` and surfaced as `error.ApiError`,
 /// which rolls the turn back to its latest checkpoint.
+///
+/// A head that rejects the credential takes one renewal and one repeat outside
+/// that policy, because another Pith instance can have rotated the token this
+/// one holds. A renewal that changes nothing reports the failure as it stands.
 fn fetchReply(
     self: *Agent,
     fetch: anytype,
@@ -803,6 +811,7 @@ fn fetchReply(
         .cache_key = &self.cache_key,
     };
     var attempt: u32 = 1;
+    var renewed = false;
     while (true) : (attempt += 1) {
         if (attempt > 1)
             try presentation(&turn.presentation_closed, handler.onStreamReset());
@@ -826,6 +835,14 @@ fn fetchReply(
         if (stream.quotaSoFar()) |quota| self.stats.quota = quota;
 
         if (!stream.ok()) {
+            // The provider rejected the credential. Another instance can have
+            // rotated the token this one still holds, so renew it once and
+            // repeat the request. Nothing streamed yet, so the repeat loses no
+            // output.
+            if (!renewed and stream.unauthorized()) {
+                renewed = true;
+                if (try fetch.renewCredential()) continue;
+            }
             const failure: net.Retry.Failure = .{
                 .attempt = attempt,
                 .suggested_ms = stream.retryAfterMs() orelse 0,
@@ -1783,6 +1800,7 @@ const ScriptedStream = struct {
     quota: ?llm.Quota = null,
     head_ok: bool = true,
     head_retryable: bool = false,
+    head_unauthorized: bool = false,
     stream_error_retryable: bool = false,
     retry_after_ms: ?u64 = null,
     error_text: []const u8 = "",
@@ -1808,6 +1826,10 @@ const ScriptedStream = struct {
         return if (self.head_ok) self.stream_error_retryable else self.head_retryable;
     }
 
+    fn unauthorized(self: *const ScriptedStream) bool {
+        return self.head_unauthorized;
+    }
+
     fn retryAfterMs(self: *const ScriptedStream) ?u64 {
         return self.retry_after_ms;
     }
@@ -1830,6 +1852,11 @@ const ScriptedStream = struct {
 const ScriptedFetch = struct {
     attempts: []const Attempt,
     sends: usize = 0,
+    renewals: usize = 0,
+    /// What a renewal reports: a subscription that takes a newer token reports
+    /// true, and an API key reports false.
+    renewal_changes: bool = false,
+    renewal_error: ?anyerror = null,
 
     const Attempt = union(enum) { fail: anyerror, stream: ScriptedStream };
     const Stream = ScriptedStream;
@@ -1841,6 +1868,12 @@ const ScriptedFetch = struct {
             .fail => |err| return err,
             .stream => |scripted| stream.* = scripted,
         }
+    }
+
+    fn renewCredential(self: *ScriptedFetch) !bool {
+        self.renewals += 1;
+        if (self.renewal_error) |err| return err;
+        return self.renewal_changes;
     }
 };
 
@@ -3936,6 +3969,105 @@ test "a retry-after past the backoff cap fails the turn at once" {
     try std.testing.expectEqual(@as(usize, 0), handler.stream_reset_count);
     try std.testing.expectEqualStrings("429 Too Many Requests", handler.errors.items);
     try std.testing.expectEqual(@as(usize, 0), agent.items.items.len);
+}
+
+// Another Pith instance can refresh the credential this one holds, which
+// revokes its access token. The rejected head must renew the credential once
+// and repeat the request, so the turn never sees the failure.
+test "a rejected credential renews once and repeats the request" {
+    const gpa = std.testing.allocator;
+    var log: SleepLog = .init(std.testing.io);
+    var agent = scriptedAgent(gpa);
+    agent.io = log.io();
+    defer agent.deinit();
+    var handler: CaptureHandler = .{ .gpa = gpa };
+    defer handler.deinit();
+
+    var fetch: ScriptedFetch = .{
+        .attempts = &.{
+            .{ .stream = .{
+                .events = &.{},
+                .head_ok = false,
+                .head_unauthorized = true,
+                .error_text = "401 Unauthorized: OAuth access token has been revoked.",
+            } },
+            .{ .stream = .{ .events = &end_turn_events } },
+        },
+        .renewal_changes = true,
+    };
+    try agent.runWith(&fetch, "go", &handler);
+    try std.testing.expectEqual(@as(usize, 2), fetch.sends);
+    try std.testing.expectEqual(@as(usize, 1), fetch.renewals);
+    // The repeat carries the new credential at once, so it waits for nothing.
+    try std.testing.expectEqual(@as(usize, 0), log.count);
+    try std.testing.expectEqualStrings("hi", handler.text.items);
+    try std.testing.expectEqualStrings("", handler.errors.items);
+}
+
+test "a credential that cannot renew reports the rejection at once" {
+    const gpa = std.testing.allocator;
+    var agent = scriptedAgent(gpa);
+    defer agent.deinit();
+    var handler: CaptureHandler = .{ .gpa = gpa };
+    defer handler.deinit();
+
+    // An API key comes from the environment, so no renewal can replace it.
+    var fetch: ScriptedFetch = .{
+        .attempts = &.{
+            .{ .stream = .{
+                .events = &.{},
+                .head_ok = false,
+                .head_unauthorized = true,
+                .error_text = "401 Unauthorized: invalid x-api-key",
+            } },
+            .{ .stream = .{ .events = &end_turn_events } },
+        },
+    };
+    try std.testing.expectError(error.ApiError, agent.runWith(&fetch, "go", &handler));
+    try std.testing.expectEqual(@as(usize, 1), fetch.sends);
+    try std.testing.expectEqual(@as(usize, 1), fetch.renewals);
+    try std.testing.expectEqualStrings("401 Unauthorized: invalid x-api-key", handler.errors.items);
+
+    // A renewal that finds another principal stops the turn with its own error.
+    var replaced: ScriptedFetch = .{
+        .attempts = &.{.{ .stream = .{
+            .events = &.{},
+            .head_ok = false,
+            .head_unauthorized = true,
+        } }},
+        .renewal_error = error.CredentialReplaced,
+    };
+    try std.testing.expectError(
+        error.CredentialReplaced,
+        agent.runWith(&replaced, "go", &handler),
+    );
+}
+
+test "a rejection that outlives its renewal is reported after one repeat" {
+    const gpa = std.testing.allocator;
+    var agent = scriptedAgent(gpa);
+    defer agent.deinit();
+    var handler: CaptureHandler = .{ .gpa = gpa };
+    defer handler.deinit();
+
+    // Every attempt is rejected, so the renewed credential fails too. One
+    // renewal per reply bounds the repeats, whatever the provider answers.
+    var fetch: ScriptedFetch = .{
+        .attempts = &.{.{ .stream = .{
+            .events = &.{},
+            .head_ok = false,
+            .head_unauthorized = true,
+            .error_text = "401 Unauthorized: OAuth access token has been revoked.",
+        } }},
+        .renewal_changes = true,
+    };
+    try std.testing.expectError(error.ApiError, agent.runWith(&fetch, "go", &handler));
+    try std.testing.expectEqual(@as(usize, 2), fetch.sends);
+    try std.testing.expectEqual(@as(usize, 1), fetch.renewals);
+    try std.testing.expectEqualStrings(
+        "401 Unauthorized: OAuth access token has been revoked.",
+        handler.errors.items,
+    );
 }
 
 test "a mid-stream cancel propagates without a retry" {
