@@ -22,8 +22,9 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - Pith records a tool call left unfinished as an error in the history. The transcript shows it as a
   failed call, so a canceled mutation is never hidden.
 - Timeouts and transient failures retry the whole request and clear the partial reply first.
-- A failed turn that committed work arms a retry above the editor. Ctrl+N asks the model to
-  continue, Enter adds the editor text, and Esc discards the retry.
+- A failed turn that committed work arms a retry above the editor. Ctrl+N asks the model to continue
+  and Esc discards the retry. The attempt never takes the editor text, and the start of any turn
+  drops the retry.
 - A reply cut short by the output cap is kept, and reported as cut short.
 - Model-side failures — a refusal, an empty reply, the round cap — read as a plain sentence rather
   than an internal error.
@@ -43,9 +44,9 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
   file, with glob and case filters, 100 hits by default.
 - **bash** — run a shell command in the working directory, preserve combined stdout and stderr
   order, and return a bounded tail. A non-zero exit is reported. Output caps and the timeout are
-  configurable, and the timeout is also settable per call. Every command runs under a timeout from
-  1 second to 1 hour, so neither the config nor a call can lift the limit. Pith has no web tool, so
-  a network request also runs through bash.
+  configurable, and the timeout is also settable per call. Every command runs under a timeout from 1
+  second to 1 hour, so neither the config nor a call can lift the limit. Pith has no web tool, so a
+  network request also runs through bash.
 - **describe_config** — describe `config.json`, so the model can change it for the user. It names
   the file and lists every key with its type, its default, and its meaning, plus the legal model
   names, the effort levels, the compiled fallbacks, and the memory that outranks the file. It
@@ -140,8 +141,8 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
   in the editor for a new offer.
 - Successful model, effort, login, logout, and account changes are recorded as transcript events.
 - A local command failure temporarily replaces the footer until the next user action.
-- A command that can run stays in the editor while a turn runs or a retry waits, and one notice
-  names the command and the restriction. The next Enter runs it once the restriction ends.
+- A command that can run stays in the editor while a turn runs, and one notice names the command and
+  the restriction. The next Enter runs it once the turn ends.
 
 ## Providers
 
@@ -149,8 +150,8 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - A reply enters the conversation only once the provider reports it complete.
 - Prompt caching is always on: explicit breakpoints for Anthropic, the automatic per-session cache
   for OpenAI.
-- A stale or cold prompt cache blocks the first submit, estimates the extra input cost, and lets
-  the next Enter continue.
+- A stale or cold prompt cache blocks the first submit, estimates the extra input cost, and lets the
+  next Enter continue.
 - The assumed cache retention per provider and the cost that arms this warning are configurable.
 - Reasoning is requested summarized at the resolved effort, and replayed verbatim on later turns.
 - Anthropic Subscription and Anthropic Console requests carry the Claude Code client identity. A

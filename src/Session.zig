@@ -24,7 +24,8 @@ const truncated_event =
     "The response is incomplete. The model reached an output or context limit.";
 
 /// The row above the editor while a retry waits. It names the two keys that own
-/// the retry, because Enter belongs to the editor text.
+/// the retry. Enter is not one of them: it sends the editor text as a message of
+/// its own, and that turn drops the retry.
 const retry_hint = "Ctrl+N: Try again · Esc: Dismiss";
 
 /// One tool call the model is still streaming. The row counts the argument bytes

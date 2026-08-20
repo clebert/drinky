@@ -1,7 +1,7 @@
 # Anthropic Prompt Caching
 
-This document explains prompt caching on Anthropic's Messages API. It covers how the API reports
-the numbers and how to interpret them over a whole conversation. It is a reference for the token
+This document explains prompt caching on Anthropic's Messages API. It covers how the API reports the
+numbers and how to interpret them over a whole conversation. It is a reference for the token
 accounting behind our usage and cost figures, not an API integration guide.
 
 ## The three token buckets
@@ -11,11 +11,11 @@ _cache breakpoint_ is a point in the prompt marked with `cache_control`. The API
 up to and including that point. Anthropic splits the prompt's tokens into three non-overlapping
 buckets in the usage report:
 
-| field                         | meaning                                                      | billed        |
-| ----------------------------- | ------------------------------------------------------------ | ------------- |
-| `cache_read_input_tokens`     | prefix that matched an existing cache entry                  | 0.1×          |
-| `cache_creation_input_tokens` | new tokens written to the cache this request                 | 1.25× (5-min) |
-| `input_tokens`                | tokens neither read nor written (after the last breakpoint)  | 1.0×          |
+| field                         | meaning                                                     | billed        |
+| ----------------------------- | ----------------------------------------------------------- | ------------- |
+| `cache_read_input_tokens`     | prefix that matched an existing cache entry                 | 0.1×          |
+| `cache_creation_input_tokens` | new tokens written to the cache this request                | 1.25× (5-min) |
+| `input_tokens`                | tokens neither read nor written (after the last breakpoint) | 1.0×          |
 
 Multipliers are relative to the model's base input-token price. The cache-write figure is the
 5-minute TTL (see Pricing). The three buckets are exactly additive:
@@ -31,8 +31,8 @@ If both cache fields are zero, nothing was cached on that request.
 ## Uncached scraps (`input_tokens`)
 
 `input_tokens` is the most easily misread field. It counts only the tokens that were **neither read
-from nor written to the cache**. Equivalently, these are the tokens that fall **after the last
-cache breakpoint**. It is **not** "what the user typed", and **not** the system prompt or tools.
+from nor written to the cache**. Equivalently, these are the tokens that fall **after the last cache
+breakpoint**. It is **not** "what the user typed", and **not** the system prompt or tools.
 
 When a cache breakpoint sits at the very end of the prompt, `input_tokens` is ≈ 0. Everything up to
 the breakpoint is either a cache read (the matching prefix) or a cache write (the new delta). A
@@ -41,10 +41,10 @@ the newest user message, when the breakpoint sits before it. In that case `input
 tracks the size of that trailing content and is unstable turn to turn. Do not surface it as a
 headline number.
 
-A small new segment appended _before_ the breakpoint does **not** fall through to `input_tokens`.
-If the cumulative prefix at the breakpoint meets the model's minimum, that increment is written to
-the cache (billed as a cache write). This holds even if the increment is only a handful of tokens.
-There is no per-increment minimum.
+A small new segment appended _before_ the breakpoint does **not** fall through to `input_tokens`. If
+the cumulative prefix at the breakpoint meets the model's minimum, that increment is written to the
+cache (billed as a cache write). This holds even if the increment is only a handful of tokens. There
+is no per-increment minimum.
 
 Turn by turn:
 
@@ -59,8 +59,8 @@ Turn by turn:
 
 A prefix is only cached if it reaches a model-dependent minimum token count. Shorter prompts process
 normally without caching and without error. The minimum applies to the **total prefix length** up to
-a breakpoint, not to each incremental addition. Once the cumulative prefix meets the minimum, even
-a few new tokens before the breakpoint are written to the cache.
+a breakpoint, not to each incremental addition. Once the cumulative prefix meets the minimum, even a
+few new tokens before the breakpoint are written to the cache.
 
 | minimum tokens | models (subset)                                                        |
 | -------------- | ---------------------------------------------------------------------- |
@@ -69,9 +69,9 @@ a few new tokens before the breakpoint are written to the cache.
 | 2,048          | Mythos Preview, Opus 4.7, Haiku 3.5                                    |
 | 4,096          | Opus 4.6, Opus 4.5, Haiku 4.5                                          |
 
-The minimums do not follow a simple rule. They are not "Haiku vs the rest" (Haiku 4.5 is 4,096
-while Sonnet 4.6 and Opus 4.8 are 1,024). They do not track version numbers (Opus 4.8 is 1,024
-while the older Opus 4.5 and 4.6 are 4,096). Check the value for the exact model in use.
+The minimums do not follow a simple rule. They are not "Haiku vs the rest" (Haiku 4.5 is 4,096 while
+Sonnet 4.6 and Opus 4.8 are 1,024). They do not track version numbers (Opus 4.8 is 1,024 while the
+older Opus 4.5 and 4.6 are 4,096). Check the value for the exact model in use.
 
 ## Cache lifetime (TTL)
 
@@ -103,8 +103,8 @@ All multipliers are relative to the model's base input-token price:
 
 A cache read saves 90% of the input price for those tokens. A cache write costs an extra 25% up
 front (5-minute TTL). A cache write only pays off if the segment is read back at least once before
-it expires. If a segment is written and then expires before any read, the write is a net loss
-(1.25× paid, never recovered at 0.1×).
+it expires. If a segment is written and then expires before any read, the write is a net loss (1.25×
+paid, never recovered at 0.1×).
 
 Net savings over a session, versus the same tokens sent with no caching:
 

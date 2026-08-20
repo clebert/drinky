@@ -39,8 +39,8 @@ decision already taken, or a dependency on another entry. Module layout and exte
 - **Context-window pressure signal** — the context gauge warns as it fills, and feeds a compaction
   threshold. _The thresholds are configurable. Color the gauge as it fills, and consider the same
   accent for the branch, the model, and the effort level. Fold in two model-specific dimensions:
-  tiered pricing above a context threshold, and OpenAI's effective context window. The window that
-  a ChatGPT login discovers already resolves the displayed limit. The unused parts are
+  tiered pricing above a context threshold, and OpenAI's effective context window. The window that a
+  ChatGPT login discovers already resolves the displayed limit. The unused parts are
   `max_context_window` and `effective_context_window_percent`, and that percent of the resolved
   window must drive the warning. Quality degradation has no evidence-based number, so keep it a soft
   warning._
@@ -53,9 +53,9 @@ decision already taken, or a dependency on another entry. Module layout and exte
 
 - **Active context projection** — Pith filters one canonical history for the active account, then
   deeply repaints its transcript. _The model is not a dimension. Reasoning provenance is per exact
-  account, and the Anthropic Fable fallback replays mixed-model reasoning in one account. The
-  OpenAI cross-model replay is unconfirmed, but Pith already performs it on every `/model` switch,
-  and a rejection fails loudly._
+  account, and the Anthropic Fable fallback replays mixed-model reasoning in one account. The OpenAI
+  cross-model replay is unconfirmed, but Pith already performs it on every `/model` switch, and a
+  rejection fails loudly._
 - **Conversation switching** — Pith selects the agent, history, transcript, and status through one
   shared operation, then applies active context projection.
 - **`/review`** — a bounded workflow reviews pending changes with a fresh reviewer, a persistent

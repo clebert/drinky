@@ -30,8 +30,8 @@ Authorization: Bearer <access token>
 
 The response includes `account.uuid` and `organization.uuid`. pith stores these two values with the
 credential. It does not store the profile email. Matching values permit silent token rotation. A
-different or missing value stops the model request before pith discards the old account evidence.
-A profile failure does not fail the login. The credential then uses the safe missing-value rule.
+different or missing value stops the model request before pith discards the old account evidence. A
+profile failure does not fail the login. The credential then uses the safe missing-value rule.
 
 ## The Console flow
 

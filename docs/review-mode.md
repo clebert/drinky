@@ -28,9 +28,9 @@ Pith keeps complete provider-neutral history. It projects that history for the a
 
 The model is not a projection dimension. Anthropic replays mixed-model reasoning in one account,
 which its Fable fallback shows. Pith records no producing model on a reasoning item, and every
-`/model` switch already replays the previous model's reasoning. Whether OpenAI accepts a
-cross-model replay of encrypted reasoning is unconfirmed. A rejection surfaces as a loud API
-error, so Pith does not filter on a guess.
+`/model` switch already replays the previous model's reasoning. Whether OpenAI accepts a cross-model
+replay of encrypted reasoning is unconfirmed. A rejection surfaces as a loud API error, so Pith does
+not filter on a guess.
 
 The visible conversation blocks must match the projected model context. Pith shows no marker for a
 hidden item.
@@ -59,11 +59,16 @@ Status: Landed, except the generated-request row below, which waits for `/review
 A request enters recovery after its normal transport retries fail. A checkpoint contains committed
 work from the failed turn.
 
-| Failed input           | Checkpoint | Editor recovery                     | Ctrl+N                          | Non-blank Enter                        |
-| ---------------------- | ---------- | ----------------------------------- | ------------------------------- | -------------------------------------- |
-| Human-authored request | No         | Restore the request and steering.   | No action.                      | Send the editor as a normal turn.      |
-| Pith-generated request | No         | Restore only human steering.        | Resend the generated request.   | Send the request plus the editor text. |
-| Any request            | Yes        | Restore uncommitted human steering. | Send a generated retry request. | Send a retry request plus editor text. |
+| Failed input           | Checkpoint | Editor recovery                     | Ctrl+N                          | Non-blank Enter                   |
+| ---------------------- | ---------- | ----------------------------------- | ------------------------------- | --------------------------------- |
+| Human-authored request | No         | Restore the request and steering.   | No action.                      | Send the editor as a normal turn. |
+| Pith-generated request | No         | Restore only human steering.        | Resend the generated request.   | Send the editor as a normal turn. |
+| Any request            | Yes        | Restore uncommitted human steering. | Send a generated retry request. | Send the editor as a normal turn. |
+
+An attempt never carries the editor text. A failure of the network or of the provider is nothing a
+user instruction prevents, so the attempt asks for the committed work alone. Enter therefore keeps
+its normal meaning, and the start of that turn drops the retry context, because the conversation
+moved on. A user who wants both sends the message first, or steers the running attempt.
 
 A `/skill:` line takes the human row, because that line reproduces its own request. The generated
 row belongs to a request that no editor line holds, and `/review` is the first one.
@@ -78,7 +83,7 @@ warning. The first Ctrl+N reports the extra cost, and the next one sends.
 Blank Enter has no action. Ctrl+N never sends the editor text and never clears it.
 
 A non-blank Enter clears the editor only after the turn starts. If that turn fails before a
-checkpoint, Pith restores only its human text. A generated request or retry wrapper stays hidden.
+checkpoint, Pith restores its human text. A generated request stays hidden.
 
 If the turn commits a checkpoint, its human text remains in immutable history.
 
@@ -91,15 +96,11 @@ A committed retry uses this provider `user` message:
 <retry_request>
 The latest complete failure sentence appears here.
 Continue from the last committed checkpoint.
-
-<retry_input>
-The optional editor text appears here.
-</retry_input>
 </retry_request>
 ```
 
-Ctrl+N omits `<retry_input>`. A retry request contains only the latest error and never nests an
-older retry request.
+The tags mark the message as one that Pith wrote, because the user typed none of it. A retry request
+contains only the latest error and never nests an older retry request.
 
 Retry never rewrites committed conversation history. Earlier retry requests, tool calls, results,
 reasoning, and human messages remain in order.
@@ -125,12 +126,12 @@ An uncommitted human request returns to the editor and shows no retry hint.
 
 Main prompt controls during retry are:
 
-- Ctrl+N: Retry without editor text.
-- Enter: Retry with non-blank editor text.
+- Ctrl+N: Retry. The editor keeps its text.
+- Enter: Send the editor text as a normal turn. That start drops the retry context.
 - Esc: Discard retry context and preserve the editor.
 - `/model`, `/effort`, `/login`, `/logout`, `/colors`, and `/system`: Run and preserve retry.
 - `/new`: Clear the conversation and retry context.
-- `/skill:`: Refuse until retry completes or Esc discards it. `/review` takes the same refusal.
+- `/skill:` and `/review`: Run. Each one starts a turn, so that start drops the retry context.
 
 A retry needs an active account, so a signed-out Ctrl+N names the sign-in and keeps the context.
 
@@ -404,8 +405,8 @@ Do not change the public configuration format.
 When the next judge turn starts, Pith moves pending copies into its generated request in user order.
 The normal turn transaction then owns them. `Review` keeps no second copy.
 
-If a retry contains human editor text, only that text can become a workflow message. Pith never
-forwards a generated request or retry wrapper.
+Only human text can become a workflow message. Pith never forwards a generated request or a retry
+request.
 
 Each `Decision: Fix required.` report is a self-contained fixer packet. It includes each finding
 location, required result, user constraint, and required verification.
@@ -494,7 +495,7 @@ remain.
 | User    | A completed phase has text.     | Send to completed role. | Ctrl+N: Continue and preserve text.           |
 | Judge   | The judge needs a decision.     | Answer the judge.       | None.                                         |
 | Limit   | The ceiling blocks progress.    | Ask the judge.          | Ctrl+E: Add one round.                        |
-| Failure | A request failed after retries. | Retry with editor text. | Ctrl+N: Retry when shown. Ctrl+S: Role setup. |
+| Failure | A request failed after retries. | Send the editor text.   | Ctrl+N: Retry when shown. Ctrl+S: Role setup. |
 
 Esc stops a user, judge, or failure hold. Esc finishes a limit hold and claims settlement only when
 the latest judge decision settled the review. These Esc paths restore the main conversation.
@@ -507,6 +508,8 @@ A failure hold uses the shared recovery rules:
 
 - The frame shows Ctrl+N only for a committed checkpoint or an uncommitted generated request.
 - A human request with no checkpoint returns to the editor and has no Ctrl+N action.
+- Enter sends the editor text alone, as at the main prompt. A retry carries no editor text, and the
+  turn that Enter starts drops the retry.
 - Ctrl+S opens only the failed role account, model, and effort picker.
 - A confirmed choice saves immediately and returns to the same failure hold.
 - Picker Esc returns unchanged to the failure hold.

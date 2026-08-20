@@ -122,7 +122,7 @@ pending_turn_result: ?WorkerResult,
 /// Last generation reserved for a turn worker. The app never reuses a generation.
 turn_generation: u64,
 /// The retry context of the latest failed turn, or null when none waits. It
-/// lives at the prompt alone, because an attempt takes the context with it.
+/// lives at the prompt alone, because the start of any turn takes it.
 retry: ?Retry,
 /// Whether the live turn is a retry attempt. Its failure arms the context again,
 /// because the committed work that it continues from is still in history.
@@ -1625,15 +1625,6 @@ fn submitWithCacheRisk(self: *App, maybe_cache_risk: ?*const ai.Agent.CacheRisk)
     if (!message_confirmed) {
         if (try self.checkCommand(text)) |refusal|
             return self.armMessageSend(refusal, "Send as a message");
-        // A waiting retry owns the next request, so a command that starts a
-        // generated turn of its own must wait for it. The registry decided first,
-        // so this refusal names the one restriction that ends.
-        if (self.retry != null) {
-            if (ai.command.parse(text)) |name| {
-                if (ai.command.loadsSkill(name))
-                    return self.refuseCommand(name, "while a retry waits");
-            }
-        }
         if (try self.dispatchCommand(text)) |outcome|
             return self.applySubmittedCommand(outcome, maybe_cache_risk);
     }
@@ -1647,9 +1638,6 @@ fn submitWithCacheRisk(self: *App, maybe_cache_risk: ?*const ai.Agent.CacheRisk)
         );
     }
     if (try self.preflightModelSubmit(maybe_cache_risk, cache_hint_submit)) {
-        // A waiting retry owns this Enter: the text joins that attempt instead of
-        // starting a turn of its own.
-        if (self.retry != null) return self.submitRetry(text);
         const base = try self.startUserTurn(text);
         // The turn is live and owns its own copy. Retain the prompt's rich draft
         // so an abnormal exit that commits nothing can return it. Leave the
@@ -1833,9 +1821,10 @@ fn startUserTurn(self: *App, text: []const u8) !usize {
     return base;
 }
 
-/// Ctrl+N at the prompt: send one retry attempt with no editor text. The editor
-/// keeps whatever it holds, because only Enter adds that text to an attempt. A
-/// prompt with no waiting retry has nothing to send.
+/// Ctrl+N at the prompt: send one retry attempt. The attempt carries the failure
+/// alone, so the editor keeps every byte it holds. A user who wants that text in
+/// the conversation sends it with Enter, before the attempt or as steering during
+/// it. A prompt with no waiting retry has nothing to send.
 fn retryTurn(self: *App) !void {
     if (self.retry == null) return;
     if (!self.signedIn()) return self.reportNotice(
@@ -1853,41 +1842,29 @@ fn retryTurn(self: *App) !void {
 /// that warning without starting a real provider worker.
 fn retryWithCacheRisk(self: *App, maybe_cache_risk: ?*const ai.Agent.CacheRisk) !void {
     if (!try self.preflightModelSubmit(maybe_cache_risk, cache_hint_retry)) return;
-    const base = try self.startRetryTurn("");
+    const base = try self.startRetryTurn();
     // The editor holds no part of this attempt, so the rewind anchor stands alone.
     self.session.markTurnBase(base);
 }
 
-/// Enter at the prompt while a retry waits: send the attempt with the editor text
-/// added to it. The text belongs to the user, so a failure that commits nothing
-/// returns it to the editor.
-fn submitRetry(self: *App, text: []const u8) !void {
-    const base = try self.startRetryTurn(text);
-    var prompt = self.session.editor.detachTrimmed();
-    self.session.retainTurnPrompt(&prompt, base);
-}
-
 /// Send one retry attempt: record the event that names it, then spawn its turn
-/// over the generated request. `input` is the editor text to add, and an empty
-/// `input` adds none. The attempt takes the retry context, so the next failure
-/// arms a fresh one that names its own error. Returns the rich draft's rewind
-/// checkpoint.
-fn startRetryTurn(self: *App, input: []const u8) !usize {
+/// over the generated request. The attempt carries no user text, so its turn
+/// takes the context and the next failure arms a fresh one that names its own
+/// error. Returns the rewind checkpoint of the event.
+fn startRetryTurn(self: *App) !usize {
     std.debug.assert(self.retry != null);
     const retry = &self.retry.?;
-    const text = try retry.compose(self.gpa, input);
+    const text = try retry.compose(self.gpa);
     defer self.gpa.free(text);
     const base = self.session.transcript.blocks().len;
     errdefer self.session.transcript.truncate(base);
     // The complete request stays out of the transcript, as a skill box keeps its
     // expanded file out of it.
     try self.session.transcript.append(.event, .{}, Retry.event_text);
-    if (input.len > 0) try self.session.transcript.append(.user, .{}, input);
+    // The spawn drops the context, so the flag marks the attempt after it.
     try self.runTurn(text);
-    // The turn owns the request now, so the hint leaves with the context it named.
     // A failure of this attempt arms the context again from its own error.
     self.turn_retry = true;
-    self.setRetry(null);
     return base;
 }
 
@@ -1906,6 +1883,11 @@ fn runTurn(self: *App, text: []const u8) !void {
     errdefer self.gpa.free(owned);
     self.turn_future = try self.io.concurrent(runTurnWorker, .{ self, owned, generation });
     self.session.beginTurn(generation);
+    // Every turn start takes the waiting retry, not the attempt alone. A message
+    // that the user sends instead of the attempt moves the conversation on, so the
+    // context it named is stale. The drop runs after the spawn, because a start
+    // that fails must leave the context for another try.
+    self.setRetry(null);
 }
 
 /// Permanently reserve the next turn generation before a worker can observe it.
@@ -5464,10 +5446,10 @@ test "a stale cache stops the first Ctrl+N and the next one sends" {
     try app.finishWorkerResult(&result);
 }
 
-// A non-blank Enter adds the editor text to the attempt. That text is human, so a
-// failure that commits nothing returns it alone and the wrapper stays hidden. The
-// attempt continues committed work, so its own failure arms the retry again.
-test "Enter adds the editor text to a waiting retry" {
+// The attempt never takes the editor text: a network or provider failure is
+// nothing a user instruction prevents. Enter sends that text as a plain message,
+// and the start of that turn drops the context, because the conversation moved on.
+test "Enter sends a plain message and drops the waiting retry" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -5490,19 +5472,24 @@ test "Enter adds the editor text to a waiting retry" {
     app.session.retry_shown = true;
 
     try app.session.editor.insert("also check the tests");
-    try app.submitRetry("also check the tests");
+    // The two steps that `submit` runs once its sign-in gate passes. A test client
+    // is signed out, so the gate would stop the send before any turn.
+    {
+        const base = try app.startUserTurn("also check the tests");
+        var prompt = app.session.editor.detachTrimmed();
+        app.session.retainTurnPrompt(&prompt, base);
+    }
 
+    // The message is the whole request: no event names an attempt, and no wrapper
+    // carries the failure sentence.
     try std.testing.expect(app.session.mode == .turn);
     try std.testing.expect(app.retry == null);
+    try std.testing.expect(!app.session.retry_shown);
     try std.testing.expectEqualStrings("", app.session.editor.visible());
     {
         const blocks = app.session.transcript.blocks();
-        try std.testing.expectEqual(@as(usize, 2), blocks.len);
-        try std.testing.expectEqualStrings(
-            "Pith asked the model to continue from the committed work.",
-            blocks[0].event.text.items,
-        );
-        try std.testing.expectEqualStrings("also check the tests", blocks[1].user.items);
+        try std.testing.expectEqual(@as(usize, 1), blocks.len);
+        try std.testing.expectEqualStrings("also check the tests", blocks[0].user.items);
     }
 
     {
@@ -5510,11 +5497,10 @@ test "Enter adds the editor text to a waiting retry" {
         defer app.freeWorkerResult(&result);
         try app.finishWorkerResult(&result);
     }
-    // Only the human text returns. The committed work still waits for an attempt,
-    // and the context now names the newest failure.
+    // The turn committed nothing, so the human text returns and no context arms.
     try std.testing.expectEqualStrings("also check the tests", app.session.editor.visible());
-    try std.testing.expect(app.session.retry_shown);
-    try std.testing.expect(std.mem.indexOf(u8, app.retry.?.failure, "SignedOut") != null);
+    try std.testing.expect(app.retry == null);
+    try std.testing.expect(!app.session.retry_shown);
     const blocks = app.session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 1), blocks.len);
     try std.testing.expect(blocks[0].event.is_error);
@@ -5611,9 +5597,9 @@ test "a retry survives an account switch and Ctrl+N routes to it" {
     try std.testing.expectEqual(@as(usize, 0), app.session.transcript.blocks().len);
 }
 
-// A retry owns the next request, so a `/skill:` line cannot start a generated turn
-// of its own. The shared refusal keeps the line and sends nothing.
-test "a waiting retry refuses a skill line and keeps it in the editor" {
+// A waiting retry restricts no command, because it owns no key but Ctrl+N. A
+// `/skill:` line starts its own turn, and that start drops the stale context.
+test "a skill line runs while a retry waits and takes the context with it" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -5654,22 +5640,22 @@ test "a waiting retry refuses a skill line and keeps it in the editor" {
     app.session.retry_shown = true;
 
     try app.session.editor.insert("/skill:demo apply it");
-    try app.submit();
+    const prompt = (try app.dispatchCommand("/skill:demo apply it")).?.prompt;
+    defer prompt.deinit(gpa);
+    _ = try app.startSkillTurn(&prompt);
 
-    // The registry can run the line, so the notice names the one restriction that
-    // ends. It keeps the line, and it loaded no skill.
-    try std.testing.expectEqualStrings("/skill:demo apply it", app.session.editor.visible());
-    try std.testing.expectEqualStrings(
-        "The command /skill:demo cannot run while a retry waits.",
-        app.session.notice.?.content,
-    );
-    try std.testing.expectEqual(
-        ai.command.Outcome.Severity.warning,
-        app.session.notice.?.severity,
-    );
-    try std.testing.expectEqual(@as(usize, 0), app.session.transcript.blocks().len);
-    try std.testing.expect(app.retry != null);
-    try std.testing.expect(app.turn_future == null);
+    // The line ran, and its turn took the waiting context with it.
+    try std.testing.expect(app.session.notice == null);
+    try std.testing.expect(app.retry == null);
+    try std.testing.expect(!app.session.retry_shown);
+    try std.testing.expect(app.turn_future != null);
+    const blocks = app.session.transcript.blocks();
+    try std.testing.expectEqual(@as(usize, 1), blocks.len);
+    try std.testing.expect(std.mem.startsWith(u8, blocks[0].user.items, "Skill: demo · File:"));
+
+    const result = app.awaitTurnFuture().?;
+    defer app.freeWorkerResult(&result);
+    try app.finishWorkerResult(&result);
 }
 
 // Signed out, Pith must refuse a normal message with a /login prompt rather
