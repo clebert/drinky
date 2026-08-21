@@ -68,11 +68,17 @@ pub const Stream = struct {
     /// neutral history.
     completed_item_ids: std.StringHashMapUnmanaged(void),
     /// The `item_id` of the function call whose arguments stream now, or empty
-    /// before the first one opens. An argument fragment names the item it
-    /// belongs to, so this correlates the fragment with the call that
-    /// `output_item.added` opened. Owned, because a frame arena reset drops the
-    /// parsed frame the id came from.
+    /// when its added frame supplies none. The call's done item clears it, so a
+    /// later fragment meets no open call. Owned, because a frame arena reset
+    /// drops the parsed frame the id came from.
     call_item_id: std.ArrayList(u8),
+    /// The output index of the same function call, cleared with the id. OpenAI
+    /// makes the item id optional, so the required index is the correlation
+    /// fallback.
+    call_output_index: ?i64,
+    /// Whether the added frame of the open call named its tool, so a display
+    /// row exists that its argument fragments can grow.
+    call_named: bool,
     /// The model that the response names as the one that serves it, captured
     /// from `response.created` and overwritten by the terminal response. Owned,
     /// because a frame arena reset drops the frame it arrives in. Empty until a
@@ -128,6 +134,8 @@ pub const Stream = struct {
         self.summary_index = 0;
         self.completed_item_ids = .empty;
         self.call_item_id = .empty;
+        self.call_output_index = null;
+        self.call_named = false;
         self.served_model = .empty;
         self.quota = null;
         self.authorization = &.{};
@@ -339,6 +347,13 @@ pub const Stream = struct {
             } } } } };
         }
         if (std.mem.eql(u8, item_kind, "function_call")) {
+            // This item closes the open call, so its keys stop correlating
+            // fragments. A fragment of the next call then meets no open call,
+            // paints nothing, and cannot latch a wire-order failure, even when
+            // OpenAI omits that call's added frame.
+            self.call_item_id.clearRetainingCapacity();
+            self.call_output_index = null;
+            self.call_named = false;
             if (status != .completed) return .invalid;
             const call_id = json.string(item.get("call_id")) orelse return .invalid;
             const name = json.string(item.get("name")) orelse return .invalid;
@@ -370,50 +385,79 @@ pub const Stream = struct {
         return if (index < 0) null else index;
     }
 
+    /// The nonnegative output index of one streamed output item, or null when
+    /// the frame omits it or sends an invalid value.
+    fn outputIndex(object: *const std.json.ObjectMap) ?i64 {
+        const index = json.integer(object.get("output_index")) orelse return null;
+        return if (index < 0) null else index;
+    }
+
     /// The head of one added output item. A function call names its tool here,
     /// so the interface can show the call while its arguments stream. Every
     /// other added item carries no display text of its own. The item this frame
-    /// opens is provisional, so nothing here is retained beyond the id that
-    /// correlates the argument fragments that follow.
+    /// opens is provisional, so only its correlation keys survive this frame.
     fn addedItem(self: *Stream, object: *const std.json.ObjectMap) !sse.Decoded {
         const item = json.object(object.get("item")) orelse return .progress;
         const kind = json.string(item.get("type")) orelse return .progress;
         if (!std.mem.eql(u8, kind, "function_call")) return .progress;
-        const id = json.string(item.get("id")) orelse return .progress;
-        // The id is stored before the name is read. The name only decides
-        // whether this frame displays anything, and a frame that carries no name
-        // must still open the call that the fragments below correlate against.
+
+        // An in-progress function call can omit its optional item id. Keep its
+        // required output index as the fallback, and show its name independently
+        // of both keys. A missing id must not hide the whole streamed call.
         self.call_item_id.clearRetainingCapacity();
-        try self.call_item_id.appendSlice(self.gpa, id);
-        const name = json.string(item.get("name")) orelse return .progress;
+        const maybe_id = json.string(item.get("id"));
+        if (maybe_id) |id| try self.call_item_id.appendSlice(self.gpa, id);
+        self.call_output_index = outputIndex(object);
+
+        const name = json.string(item.get("name")) orelse {
+            self.call_named = false;
+            return .progress;
+        };
+        self.call_named = true;
         return .{ .event = .{ .tool_name = name } };
     }
 
     /// One display fragment of the open function call's arguments. The call
     /// itself waits for its done frame, so nothing here is retained.
     ///
-    /// Absent correlation and contradicted correlation are two different things,
-    /// and this separates them. A frame that carries no id, or one that arrives
-    /// before any call opened, cannot be placed: it displays nothing and the
-    /// reply stands, because a display gap costs the user a box that stops
-    /// growing. A frame whose id contradicts the open call is different: the
-    /// wire streams one function call at a time, so a fragment of another call
-    /// means that assumption broke. It latches as a wire-order failure, the way
-    /// a content block index does on the Anthropic side, rather than painting
-    /// one call's arguments under another call's name.
+    /// Each available key must agree, and either the item id or the output index
+    /// must match. OpenAI makes the item id optional but requires the output
+    /// index on both frames. The done item of a call closes both keys, so a
+    /// fragment can contradict them only while an added frame holds a call open.
+    /// That contradiction proves two interleaved calls, which the one-call
+    /// display cannot place, so it latches as a wire-order failure.
     ///
-    /// Only that contradicted case matches across the two transports. Anthropic
-    /// latches `invalid` for a frame it cannot place, because a block delta
-    /// becomes the committed content there and a lost one leaves the reply
-    /// short. Nothing here is retained, so the reply stands.
+    /// Every other fragment paints at most a box, so no absence is worth a
+    /// failed turn. A fragment with no open call, and a matched fragment of an
+    /// unnamed call, both paint nothing and keep the reply: no row owns them,
+    /// and the committed call still reaches the consumer as an item, whose
+    /// interface names the call when its tool starts.
     fn callArguments(self: *Stream, object: *const std.json.ObjectMap) sse.Decoded {
+        var matched = false;
         const open_id = self.call_item_id.items;
-        const item_id = json.string(object.get("item_id")) orelse return .progress;
-        if (open_id.len == 0) return .progress;
-        if (!std.mem.eql(u8, item_id, open_id)) {
-            self.markRejection(.uncorrelated);
-            return .progress;
+        const maybe_item_id = json.string(object.get("item_id"));
+        if (maybe_item_id) |item_id| {
+            if (open_id.len != 0) {
+                if (!std.mem.eql(u8, item_id, open_id)) {
+                    self.markRejection(.uncorrelated);
+                    return .progress;
+                }
+                matched = true;
+            }
         }
+
+        const maybe_index = outputIndex(object);
+        if (maybe_index) |index| {
+            if (self.call_output_index) |open_index| {
+                if (index != open_index) {
+                    self.markRejection(.uncorrelated);
+                    return .progress;
+                }
+                matched = true;
+            }
+        }
+        if (!matched or !self.call_named) return .progress;
+
         const delta = json.string(object.get("delta")) orelse return .progress;
         return .{ .event = .{ .tool_arguments = delta } };
     }
@@ -1345,6 +1389,27 @@ test "a streamed function call shows its name and arguments before its done item
     try std.testing.expect((try stream.next()) == null);
 }
 
+// OpenAI marks the item id as optional on an in-progress function call. The
+// output index still correlates its fragments, and the missing id must not hide
+// either the tool name or its progress.
+test "an id-less function call streams through its output index" {
+    const body =
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":4,\"item\":" ++
+        "{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"write\"}}\n\n" ++
+        "data: {\"type\":\"response.function_call_arguments.delta\"," ++
+        "\"item_id\":\"fc_1\",\"output_index\":4,\"delta\":\"{\"}\n\n" ++
+        "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n";
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var reader: std.Io.Reader = .fixed(body);
+    var stream = testStream(threaded.io(), &reader, 60_000, net.stream_response_bytes_max);
+    defer stream.deinitDecode();
+
+    try std.testing.expectEqualStrings("write", (try stream.next()).?.tool_name);
+    try std.testing.expectEqualStrings("{", (try stream.next()).?.tool_arguments);
+    try std.testing.expect((try stream.next()).?.stop.rejection == null);
+}
+
 // The display fragments of a call correlate by the item they name. Two calls
 // that interleave their fragments otherwise show one call's arguments under
 // the other's name, and nothing on the wire says so. The mismatch
@@ -1395,14 +1460,17 @@ test "an argument fragment before any call displays nothing and keeps the reply"
     try std.testing.expect(stop.rejection == null);
 }
 
-// An added frame with no name still opens the call for correlation. Otherwise
-// the fragments below it find no open id and the display goes quiet for a call
-// the done frame commits normally.
-test "an added frame without a name still opens the call for its fragments" {
+// An added frame with no name opens no display row, so the fragments of that
+// call paint nothing. The keys still open the call, so a contradicting fragment
+// latches, and the done item still commits the whole call.
+test "fragments of an unnamed call paint nothing and the done item commits" {
     const body =
         "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":" ++
         "{\"id\":\"fc_1\",\"type\":\"function_call\",\"call_id\":\"call_1\"}}\n\n" ++
         "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_1\",\"delta\":\"{}\"}\n\n" ++
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":" ++
+        "{\"id\":\"fc_1\",\"type\":\"function_call\",\"call_id\":\"call_1\"," ++
+        "\"name\":\"read\",\"arguments\":\"{}\"}}\n\n" ++
         "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n";
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();
@@ -1410,8 +1478,66 @@ test "an added frame without a name still opens the call for its fragments" {
     var stream = testStream(threaded.io(), &reader, 60_000, net.stream_response_bytes_max);
     defer stream.deinitDecode();
 
-    // No name event, but the fragment still correlates and shows.
+    // The fragment shows nothing, so the first event is the completed call.
+    const call = (try stream.next()).?.item.tool_call;
+    try std.testing.expectEqualStrings("call_1", call.call_id);
+    try std.testing.expectEqualStrings("{}", call.arguments_json);
+    try std.testing.expect((try stream.next()).?.stop.rejection == null);
+}
+
+// An unnamed added frame paints nothing, but its keys still hold the call open.
+// A fragment that names another item therefore proves the same interleaving as
+// on a named call, and it latches instead of passing as a quiet display gap.
+test "fragments of an unnamed call still latch on a contradicting id" {
+    const body =
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":" ++
+        "{\"id\":\"fc_1\",\"type\":\"function_call\",\"call_id\":\"call_1\"}}\n\n" ++
+        "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_2\",\"delta\":\"{}\"}\n\n" ++
+        "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n";
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var reader: std.Io.Reader = .fixed(body);
+    var stream = testStream(threaded.io(), &reader, 60_000, net.stream_response_bytes_max);
+    defer stream.deinitDecode();
+
+    const stop = (try stream.next()).?.stop;
+    try std.testing.expectEqual(llm.Event.Stop.Rejection.uncorrelated, stop.rejection.?);
+}
+
+// OpenAI can omit the added frame of a later call. The done item of the first
+// call closes the correlation keys, so the next call's fragments meet no open
+// call: they paint nothing, the reply stands, and both calls commit. Without
+// the clearing, the stale keys contradict the new fragments and a healthy
+// reply fails the turn without a retry.
+test "a fragment after the open call's done item keeps the reply" {
+    const body =
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":" ++
+        "{\"id\":\"fc_1\",\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"read\"}}\n\n" ++
+        "data: {\"type\":\"response.function_call_arguments.delta\"," ++
+        "\"item_id\":\"fc_1\",\"output_index\":0,\"delta\":\"{}\"}\n\n" ++
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":" ++
+        "{\"id\":\"fc_1\",\"type\":\"function_call\",\"call_id\":\"call_1\"," ++
+        "\"name\":\"read\",\"arguments\":\"{}\"}}\n\n" ++
+        "data: {\"type\":\"response.function_call_arguments.delta\"," ++
+        "\"item_id\":\"fc_2\",\"output_index\":1,\"delta\":\"{\\\"path\\\":\\\"b\\\"}\"}\n\n" ++
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":1,\"item\":" ++
+        "{\"id\":\"fc_2\",\"type\":\"function_call\",\"call_id\":\"call_2\"," ++
+        "\"name\":\"write\",\"arguments\":\"{\\\"path\\\":\\\"b\\\"}\"}}\n\n" ++
+        "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n";
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var reader: std.Io.Reader = .fixed(body);
+    var stream = testStream(threaded.io(), &reader, 60_000, net.stream_response_bytes_max);
+    defer stream.deinitDecode();
+
+    try std.testing.expectEqualStrings("read", (try stream.next()).?.tool_name);
     try std.testing.expectEqualStrings("{}", (try stream.next()).?.tool_arguments);
+    const first = (try stream.next()).?.item.tool_call;
+    try std.testing.expectEqualStrings("call_1", first.call_id);
+    // The second call's fragment paints nothing, so its call comes next.
+    const second = (try stream.next()).?.item.tool_call;
+    try std.testing.expectEqualStrings("call_2", second.call_id);
+    try std.testing.expectEqualStrings("{\"path\":\"b\"}", second.arguments_json);
     try std.testing.expect((try stream.next()).?.stop.rejection == null);
 }
 

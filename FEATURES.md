@@ -167,8 +167,9 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - Anthropic Subscription and Anthropic Console requests carry the Claude Code client identity. A
   plain API key goes straight to the platform API.
 - Every Anthropic request asks for the input of a tool call as the model writes it.
-- Requests time out after 30 s to the response head and 60 s between streamed events. Keepalive
-  filler does not count as progress.
+- Requests time out after 30 s to the response head. A streamed event must arrive within 60 s for
+  Anthropic and 300 s for OpenAI, whose stream is silent while the model reasons. Keepalive filler
+  does not count as progress, and all three windows are configurable.
 - A failed request retries up to 3 times with 500 ms–16 s backoff and honors a server's retry-after
   hint.
 - A response that asks for a wait longer than the backoff cap ends the request. A spent OpenAI plan

@@ -18,7 +18,7 @@ const Config = @This();
 /// The config document and the notices name it, so the user and the model both
 /// read the same path. Owned. `deinit` frees it.
 path: []const u8,
-timeouts: ai.net.Timeouts = .{},
+timeouts: ai.net.ProviderTimeouts = .{},
 retry: ai.net.Retry = .{},
 bash: ai.tool.Context.Bash = .{},
 cache: ai.Agent.CachePolicy = .{},
@@ -145,8 +145,11 @@ const File = struct {
     };
 
     const Request = struct {
-        connect_timeout_ms: u64 = timeouts_default.connect_ms,
-        idle_timeout_ms: u64 = timeouts_default.idle_ms,
+        // The connect timeout depends on the network, not on the provider, so
+        // both providers share it and either default serves.
+        connect_timeout_ms: u64 = timeouts_default.anthropic.connect_ms,
+        anthropic_idle_timeout_ms: u64 = timeouts_default.anthropic.idle_ms,
+        openai_idle_timeout_ms: u64 = timeouts_default.openai.idle_ms,
         attempts_max: u32 = retry_default.attempts_max,
         backoff_ms_initial: u64 = retry_default.backoff_ms_initial,
         backoff_ms_max: u64 = retry_default.backoff_ms_max,
@@ -188,7 +191,7 @@ const DataOptions = struct {
     data: []const u8,
 };
 
-const timeouts_default: ai.net.Timeouts = .{};
+const timeouts_default: ai.net.ProviderTimeouts = .{};
 const retry_default: ai.net.Retry = .{};
 const bash_default: ai.tool.Context.Bash = .{};
 const cache_default: ai.Agent.CachePolicy = .{};
@@ -255,9 +258,15 @@ const keys = [_]Key{
         .description = "The time that Drinky waits for the head of a provider response.",
     },
     .{
-        .path = "request.idle_timeout_ms",
-        .description = "The time that Drinky waits between two streamed events. A keepalive " ++
-            "ping is not an event and does not restart the wait.",
+        .path = "request.anthropic_idle_timeout_ms",
+        .description = "The time that Drinky waits between two streamed Anthropic events. A " ++
+            "keepalive ping is not an event and does not restart the wait.",
+    },
+    .{
+        .path = "request.openai_idle_timeout_ms",
+        .description = "The time that Drinky waits between two streamed OpenAI events. The " ++
+            "stream is silent while the model reasons privately, so the default matches " ++
+            "the wait of the official client.",
     },
     .{
         .path = "request.attempts_max",
@@ -496,7 +505,7 @@ const example =
     \\{
     \\  "user_instructions": [{ "path": "instructions.md" }],
     \\  "required_skills": [{ "glob": "**/*.zig", "skill": "zig-style" }],
-    \\  "request": { "idle_timeout_ms": 90000 },
+    \\  "request": { "anthropic_idle_timeout_ms": 90000 },
     \\  "bash": { "timeout_ms": 300000, "deny": ["git add"] },
     \\  "cache": { "openai_retention_ms": 600000, "warning_min_cost": 0.05 },
     \\  "default_models": { "anthropic_subscription": "claude-opus-5" },
@@ -778,8 +787,14 @@ fn loadFromData(gpa: std.mem.Allocator, io: std.Io, options: *const DataOptions)
     return .{
         .path = owned_path,
         .timeouts = .{
-            .connect_ms = request.connect_timeout_ms,
-            .idle_ms = request.idle_timeout_ms,
+            .anthropic = .{
+                .connect_ms = request.connect_timeout_ms,
+                .idle_ms = request.anthropic_idle_timeout_ms,
+            },
+            .openai = .{
+                .connect_ms = request.connect_timeout_ms,
+                .idle_ms = request.openai_idle_timeout_ms,
+            },
         },
         .retry = .{
             .attempts_max = request.attempts_max,
@@ -1031,12 +1046,16 @@ fn tmpPath(
 
 test "load reads the request section" {
     var config = try loadDataForTest(
-        \\{ "request": { "connect_timeout_ms": 1000, "idle_timeout_ms": 2000,
+        \\{ "request": { "connect_timeout_ms": 1000, "anthropic_idle_timeout_ms": 2000,
+        \\  "openai_idle_timeout_ms": 3000,
         \\  "attempts_max": 5, "backoff_ms_initial": 100, "backoff_ms_max": 900 } }
     );
     defer config.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u64, 1000), config.timeouts.connect_ms);
-    try std.testing.expectEqual(@as(u64, 2000), config.timeouts.idle_ms);
+    // The shared connect bound reaches both providers.
+    try std.testing.expectEqual(@as(u64, 1000), config.timeouts.anthropic.connect_ms);
+    try std.testing.expectEqual(@as(u64, 1000), config.timeouts.openai.connect_ms);
+    try std.testing.expectEqual(@as(u64, 2000), config.timeouts.anthropic.idle_ms);
+    try std.testing.expectEqual(@as(u64, 3000), config.timeouts.openai.idle_ms);
     try std.testing.expectEqual(@as(u32, 5), config.retry.attempts_max);
     try std.testing.expectEqual(@as(u64, 100), config.retry.backoff_ms_initial);
     try std.testing.expectEqual(@as(u64, 900), config.retry.backoff_ms_max);
@@ -1183,7 +1202,10 @@ test "load fills missing fields and sections from defaults" {
     );
     defer partial.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u32, 7), partial.retry.attempts_max);
-    try std.testing.expectEqual(timeouts_default.connect_ms, partial.timeouts.connect_ms);
+    try std.testing.expectEqual(
+        timeouts_default.anthropic.connect_ms,
+        partial.timeouts.anthropic.connect_ms,
+    );
     try std.testing.expectEqual(retry_default.backoff_ms_initial, partial.retry.backoff_ms_initial);
     try std.testing.expectEqual(bash_default.lines_max, partial.bash.lines_max);
     try std.testing.expectEqual(bash_default.bytes_max, partial.bash.bytes_max);
@@ -1191,7 +1213,11 @@ test "load fills missing fields and sections from defaults" {
 
     var empty = try loadDataForTest("{}");
     defer empty.deinit(std.testing.allocator);
-    try std.testing.expectEqual(timeouts_default.idle_ms, empty.timeouts.idle_ms);
+    try std.testing.expectEqual(
+        timeouts_default.anthropic.idle_ms,
+        empty.timeouts.anthropic.idle_ms,
+    );
+    try std.testing.expectEqual(timeouts_default.openai.idle_ms, empty.timeouts.openai.idle_ms);
     try std.testing.expectEqual(retry_default.attempts_max, empty.retry.attempts_max);
     try std.testing.expectEqual(@as(usize, 0), empty.user_instructions.files().len);
 }
@@ -1314,7 +1340,7 @@ test "load applies the known keys and reports the unknown ones" {
     );
     defer config.deinit(std.testing.allocator);
     // An unknown key never stops the load, so every known key still applies.
-    try std.testing.expectEqual(@as(u64, 42), config.timeouts.connect_ms);
+    try std.testing.expectEqual(@as(u64, 42), config.timeouts.anthropic.connect_ms);
     // Misspelled section, entry, and top-level keys all report. An unknown
     // section reports once, not once per nested key.
     try std.testing.expectEqual(@as(usize, 4), config.unknown_keys.len);
@@ -1453,7 +1479,12 @@ test "the config document names the file and its own example loads clean" {
     try std.testing.expectEqual(@as(usize, 0), from_example.dropped_models.len);
     try std.testing.expect(from_example.dropped_effort == null);
     try std.testing.expectEqual(ai.llm.Effort.high, from_example.default_effort.?);
-    try std.testing.expectEqual(@as(u64, 90_000), from_example.timeouts.idle_ms);
+    try std.testing.expectEqual(@as(u64, 90_000), from_example.timeouts.anthropic.idle_ms);
+    // The example touches one idle key, so the other keeps its own default.
+    try std.testing.expectEqual(
+        timeouts_default.openai.idle_ms,
+        from_example.timeouts.openai.idle_ms,
+    );
     try std.testing.expectEqual(@as(u64, 300_000), from_example.bash.timeout_ms);
     try std.testing.expectEqual(@as(usize, 1), from_example.bash.deny.len);
     try std.testing.expectEqualStrings("git add", from_example.bash.deny[0]);
@@ -1549,7 +1580,10 @@ test "an absent config file loads the built-in defaults" {
     defer gpa.free(home);
     var config = try loadForTest(gpa, io, home);
     defer config.deinit(gpa);
-    try std.testing.expectEqual(timeouts_default.connect_ms, config.timeouts.connect_ms);
+    try std.testing.expectEqual(
+        timeouts_default.anthropic.connect_ms,
+        config.timeouts.anthropic.connect_ms,
+    );
     try std.testing.expectEqual(@as(usize, 0), config.user_instructions.files().len);
     try std.testing.expectEqual(@as(usize, 0), config.user_instructions.notices().len);
     try std.testing.expectEqual(@as(usize, 0), config.dropped_models.len);

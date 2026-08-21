@@ -16,6 +16,17 @@ pub const Timeouts = struct {
     idle_ms: u64 = 60_000,
 };
 
+/// The timeout pair of each provider. The idle defaults differ: an Anthropic
+/// stream stays busy with reasoning and argument deltas, so a 60 s gap means a
+/// dead connection. The OpenAI backend sends nothing while the model reasons
+/// privately, and its official client tolerates a 300 s gap, so the OpenAI
+/// window matches that. The connect bound is network-bound, so both providers
+/// share its default.
+pub const ProviderTimeouts = struct {
+    anthropic: Timeouts = .{},
+    openai: Timeouts = .{ .idle_ms = 300_000 },
+};
+
 /// Whole-request retry policy, applied above the transport.
 pub const Retry = struct {
     /// The total tries per request, the initial attempt included. A value of 1 disables retries.
@@ -351,4 +362,13 @@ test "Deadline draws its window down instead of resetting per read" {
     try io.sleep(.fromMilliseconds(150), .awake);
     try std.testing.expect(deadline.expired(io));
     try std.testing.expectError(error.Timeout, deadline.call(io, fastWork, .{io}));
+}
+
+test "the provider timeout defaults differ only in the idle window" {
+    const timeouts: ProviderTimeouts = .{};
+    try std.testing.expectEqual(timeouts.anthropic.connect_ms, timeouts.openai.connect_ms);
+    // The generic pair serves the short OAuth and token requests, so the
+    // Anthropic stream default must stay in step with it.
+    try std.testing.expectEqual(@as(Timeouts, .{}), timeouts.anthropic);
+    try std.testing.expect(timeouts.openai.idle_ms > timeouts.anthropic.idle_ms);
 }

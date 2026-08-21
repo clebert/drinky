@@ -21,7 +21,9 @@ const Accounts = @This();
 
 gpa: std.mem.Allocator,
 io: std.Io,
-timeouts: net.Timeouts,
+/// One timeout pair per provider. Every auth store and every client of a
+/// provider takes that provider's pair.
+timeouts: net.ProviderTimeouts,
 anthropic_auth: anthropic.Auth,
 anthropic_console_auth: anthropic.ConsoleAuth,
 openai_auth: openai.Auth,
@@ -65,14 +67,14 @@ pub fn init(
     gpa: std.mem.Allocator,
     io: std.Io,
     home: []const u8,
-    timeouts: net.Timeouts,
+    timeouts: net.ProviderTimeouts,
     keys: ApiKeys,
 ) !Accounts {
-    var anthropic_auth = try anthropic.Auth.init(gpa, io, home, timeouts);
+    var anthropic_auth = try anthropic.Auth.init(gpa, io, home, timeouts.anthropic);
     errdefer anthropic_auth.deinit();
-    var anthropic_console_auth = try anthropic.ConsoleAuth.init(gpa, io, home, timeouts);
+    var anthropic_console_auth = try anthropic.ConsoleAuth.init(gpa, io, home, timeouts.anthropic);
     errdefer anthropic_console_auth.deinit();
-    var openai_auth = try openai.Auth.init(gpa, io, home, timeouts);
+    var openai_auth = try openai.Auth.init(gpa, io, home, timeouts.openai);
     errdefer openai_auth.deinit();
 
     const anthropic_ready = try anthropic_auth.load();
@@ -148,7 +150,11 @@ pub fn client(self: *Accounts, account: llm.Account) ?provider.Client {
         else
             return null,
     };
-    return provider.Client.init(self.gpa, self.io, credentials, self.timeouts);
+    const timeouts = switch (account.provider()) {
+        .anthropic => self.timeouts.anthropic,
+        .openai => self.timeouts.openai,
+    };
+    return provider.Client.init(self.gpa, self.io, credentials, timeouts);
 }
 
 /// Overlay account-specific metadata onto a compiled or configured model.
@@ -276,7 +282,7 @@ fn refreshOpenaiSubscriptionModels(self: *Accounts) void {
     self.replaceOpenaiSubscriptionCatalog(openai.ModelCatalog.fetch(
         self.gpa,
         self.io,
-        self.timeouts,
+        self.timeouts.openai,
         &self.openai_auth,
     ));
 }
@@ -378,6 +384,22 @@ test "client selects the arm for an authenticated account, null otherwise" {
     );
     try std.testing.expect(accounts.client(.openai_api) == null);
     try std.testing.expect(accounts.client(.anthropic_subscription) == null);
+}
+
+test "a client carries the timeout pair of its provider" {
+    var accounts = testAccounts(.{ .anthropic = "sk-ant", .openai = "sk-openai" }, false, false);
+    accounts.timeouts = .{
+        .anthropic = .{ .idle_ms = 1 },
+        .openai = .{ .idle_ms = 2 },
+    };
+    try std.testing.expectEqual(
+        @as(u64, 1),
+        accounts.client(.anthropic_api).?.timeouts.idle_ms,
+    );
+    try std.testing.expectEqual(
+        @as(u64, 2),
+        accounts.client(.openai_api).?.timeouts.idle_ms,
+    );
 }
 
 test "invalidation forgets a rejected credential when store removal fails" {
