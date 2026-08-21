@@ -84,9 +84,16 @@ pub const Stream = struct {
     quota: ?llm.Quota,
     decompress: std.http.Decompress,
     decompress_buffer: []u8,
-    /// This buffer backs the request's runtime headers, which must outlive the
-    /// send phase (so it is a stream field, not a `connect` local).
+    /// This buffer backs the request's extra headers. The retained request
+    /// points at it until `deinit`, so it is a stream field, not a `connect`
+    /// local.
     header_buffer: [3]std.http.Header,
+    /// The composed Authorization value. The retained request points at it for
+    /// the stream's whole lifetime, so the stream owns the bytes.
+    authorization: []u8,
+    /// The account id behind the `chatgpt-account-id` header, owned like
+    /// `authorization`. Empty on a stream that sends no such header.
+    account_id: []u8,
     error_buffer: [512]u8,
     redirect_buffer: [4096]u8,
     transfer_buffer: [16384]u8,
@@ -111,6 +118,22 @@ pub const Stream = struct {
     pub const usageSoFar = engine.usageSoFar;
     pub const next = engine.next;
 
+    /// Set the decode state and the owned header values to a blank start. The
+    /// engine's `begin` calls it, so every construction site shares one list
+    /// and a new owned field cannot miss a site and free garbage.
+    pub fn beginDecode(self: *Stream) void {
+        self.terminal_rejection = null;
+        self.incomplete_message = false;
+        self.reasoning = .none;
+        self.summary_index = 0;
+        self.completed_item_ids = .empty;
+        self.call_item_id = .empty;
+        self.served_model = .empty;
+        self.quota = null;
+        self.authorization = &.{};
+        self.account_id = &.{};
+    }
+
     pub fn deinitDecode(self: *Stream) void {
         self.frame_arena.deinit();
         var ids = self.completed_item_ids.keyIterator();
@@ -118,6 +141,13 @@ pub const Stream = struct {
         self.completed_item_ids.deinit(self.gpa);
         self.call_item_id.deinit(self.gpa);
         self.served_model.deinit(self.gpa);
+    }
+
+    /// Free the owned header values. The engine calls it after the request
+    /// dies, so the request never points at freed bytes.
+    pub fn deinitHeaders(self: *Stream) void {
+        self.gpa.free(self.authorization);
+        self.gpa.free(self.account_id);
     }
 
     /// Keep the model the response object names, so the stop can report a
@@ -518,34 +548,26 @@ fn connect(self: *Transport, out: *Stream, payload: Payload) anyerror!void {
     engine.begin(out, self.gpa, self.io);
     errdefer out.client.deinit();
     errdefer out.frame_arena.deinit();
-    out.terminal_rejection = null;
-    out.incomplete_message = false;
-    out.reasoning = .none;
-    out.summary_index = 0;
-    out.completed_item_ids = .empty;
-    out.call_item_id = .empty;
-    out.served_model = .empty;
-    out.quota = null;
 
-    const authorization = try std.fmt.allocPrint(self.gpa, "Bearer {s}", .{payload.access_token});
-    defer self.gpa.free(authorization);
+    // The retained request points at every header value until `deinit`, so the
+    // stream owns the composed Authorization bytes (std.http: a header value
+    // must outlive its request).
+    out.authorization = try std.fmt.allocPrint(self.gpa, "Bearer {s}", .{payload.access_token});
+    errdefer self.gpa.free(out.authorization);
 
-    // Duped at connect scope like the Bearer value above, so no header borrows
-    // Auth-owned storage for the stream's lifetime. A token refresh could free
-    // that storage out from under a live stream.
-    const maybe_account_id: ?[]u8 = if (self.account_id.len != 0)
-        try self.gpa.dupe(u8, self.account_id)
-    else
-        null;
-    defer if (maybe_account_id) |account_id| self.gpa.free(account_id);
+    // Owned by the stream for the same reason. The copy also detaches the
+    // header from Auth-owned storage, which a token refresh can free out from
+    // under a live stream. Empty sends no header.
+    if (self.account_id.len != 0) out.account_id = try self.gpa.dupe(u8, self.account_id);
+    errdefer self.gpa.free(out.account_id);
 
     // Subscription mode adds the account and originator identity. API-key mode
     // sends neither. `accept` requests the event stream in both.
     var extra_len: usize = 0;
     out.header_buffer[extra_len] = .{ .name = "accept", .value = "text/event-stream" };
     extra_len += 1;
-    if (maybe_account_id) |account_id| {
-        out.header_buffer[extra_len] = .{ .name = "chatgpt-account-id", .value = account_id };
+    if (out.account_id.len != 0) {
+        out.header_buffer[extra_len] = .{ .name = "chatgpt-account-id", .value = out.account_id };
         extra_len += 1;
         out.header_buffer[extra_len] = .{ .name = "originator", .value = originator };
         extra_len += 1;
@@ -555,7 +577,7 @@ fn connect(self: *Transport, out: *Stream, payload: Payload) anyerror!void {
     out.request = try out.client.request(.POST, uri, .{
         .headers = .{
             .content_type = .{ .override = "application/json" },
-            .authorization = .{ .override = authorization },
+            .authorization = .{ .override = out.authorization },
             .user_agent = .{ .override = originator },
             // Read the event stream uncompressed so event delivery stays
             // independent of any decompressor's own buffering.
@@ -754,22 +776,14 @@ fn testStreamWithAllocator(
     budget_max: usize,
 ) Stream {
     var stream: Stream = undefined;
-    // `begin` owns every engine-shared field, so this helper cannot drift from
-    // the reset that a real connect performs. It sets the decode state after it.
+    // `begin` owns every engine-shared field and blanks the decode state, so
+    // this helper cannot drift from the reset that a real connect performs.
     sse.Engine(Stream).begin(&stream, gpa, io);
     stream.io = io;
     stream.idle_ms = idle_ms;
     stream.budget = .{ .max = budget_max };
     stream.body = body;
     stream.status = .ok;
-    stream.terminal_rejection = null;
-    stream.incomplete_message = false;
-    stream.reasoning = .none;
-    stream.summary_index = 0;
-    stream.completed_item_ids = .empty;
-    stream.call_item_id = .empty;
-    stream.served_model = .empty;
-    stream.quota = null;
     return stream;
 }
 
@@ -1777,4 +1791,91 @@ test "connect rejects credentials that split the request head" {
         error.BadCredentials,
         connect(&transport, &stream, .{ .body = "{}", .access_token = "token" }),
     );
+}
+
+/// One accepted connection for the header-lifetime test: read the whole
+/// request, then answer with a bounded event stream that ends the reply at
+/// once.
+fn serveOneResponse(io: std.Io, server: *std.Io.net.Server) !void {
+    const body = "data: [DONE]\n\n";
+    var connection = try server.accept(io);
+    defer connection.close(io);
+
+    var read_buffer: [4096]u8 = undefined;
+    var reader = connection.reader(io, &read_buffer);
+    var content_length: usize = 0;
+    // The head of one request holds few lines, so the cap only stops a runaway.
+    var lines_left: usize = 64;
+    while (lines_left > 0) : (lines_left -= 1) {
+        const raw = try reader.interface.takeDelimiterInclusive('\n');
+        const line = std.mem.trimEnd(u8, raw, "\r\n");
+        if (line.len == 0) break;
+        const label = "content-length:";
+        if (std.ascii.startsWithIgnoreCase(line, label)) {
+            const value = std.mem.trim(u8, line[label.len..], " \t");
+            content_length = try std.fmt.parseInt(usize, value, 10);
+        }
+    }
+    try reader.interface.discardAll(content_length);
+
+    var write_buffer: [512]u8 = undefined;
+    var writer = connection.writer(io, &write_buffer);
+    try writer.interface.print(
+        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n" ++
+            "content-length: {d}\r\nconnection: close\r\n\r\n{s}",
+        .{ body.len, body },
+    );
+    try writer.interface.flush();
+}
+
+// Regression: `connect` used to free the composed Authorization value and the
+// account-id copy when it returned, while the retained request pointed at both
+// for the stream's whole lifetime. std.http requires a header value to outlive
+// its request, so the stream owns the bytes now, and both values must read
+// back intact after the send.
+test "the stream owns the request header values for its whole lifetime" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var address: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try address.listen(io, .{});
+    defer server.deinit(io);
+    const endpoint = try std.fmt.allocPrint(
+        gpa,
+        "http://127.0.0.1:{d}/v1/responses",
+        .{server.socket.address.getPort()},
+    );
+    defer gpa.free(endpoint);
+
+    var serve = try io.concurrent(serveOneResponse, .{ io, &server });
+    // A send that fails leaves the server blocked in accept, so the exit path
+    // that skipped the await below must cancel and reap the task.
+    var reaped = false;
+    defer if (!reaped) {
+        _ = serve.cancel(io) catch {};
+    };
+
+    var transport: Transport = .{
+        .gpa = gpa,
+        .io = io,
+        .timeouts = .{},
+        .endpoint = endpoint,
+        .account_id = "acct-1234",
+    };
+    var stream: Stream = undefined;
+    try transport.send(&stream, .{ .body = "{}", .access_token = "secret-token" });
+    defer stream.deinit();
+    reaped = true;
+    try serve.await(io);
+
+    try std.testing.expectEqualStrings(
+        "Bearer secret-token",
+        stream.request.headers.authorization.override,
+    );
+    try std.testing.expectEqualStrings("chatgpt-account-id", stream.request.extra_headers[1].name);
+    try std.testing.expectEqualStrings("acct-1234", stream.request.extra_headers[1].value);
+    // The reply ends on the sentinel, so the stream drains cleanly before deinit.
+    try std.testing.expect((try stream.next()) == null);
 }

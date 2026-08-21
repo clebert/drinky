@@ -2218,15 +2218,7 @@ fn anthropicStream(io: std.Io, reader: *std.Io.Reader, idle_ms: u64) provider.St
     stream.anthropic_subscription.budget = .{ .max = net.stream_response_bytes_max };
     stream.anthropic_subscription.body = reader;
     stream.anthropic_subscription.frame_arena = .init(std.testing.allocator);
-    stream.anthropic_subscription.stop_reason = .none;
-    stream.anthropic_subscription.terminal_rejection = null;
-    stream.anthropic_subscription.open_block = null;
-    stream.anthropic_subscription.reasoning = .none;
-    stream.anthropic_subscription.block_text = .empty;
-    stream.anthropic_subscription.block_proof = .empty;
-    stream.anthropic_subscription.tool_call_id = .empty;
-    stream.anthropic_subscription.tool_name = .empty;
-    stream.anthropic_subscription.served_model = .empty;
+    stream.anthropic_subscription.beginDecode();
     stream.anthropic_subscription.usage = .{};
     return stream;
 }
@@ -2239,15 +2231,8 @@ fn openaiStream(io: std.Io, reader: *std.Io.Reader) provider.Stream {
     stream.openai_api.budget = .{ .max = net.stream_response_bytes_max };
     stream.openai_api.body = reader;
     stream.openai_api.frame_arena = .init(std.testing.allocator);
-    stream.openai_api.terminal_rejection = null;
-    stream.openai_api.incomplete_message = false;
-    stream.openai_api.reasoning = .none;
-    stream.openai_api.summary_index = 0;
-    stream.openai_api.completed_item_ids = .empty;
-    stream.openai_api.call_item_id = .empty;
-    stream.openai_api.served_model = .empty;
+    stream.openai_api.beginDecode();
     stream.openai_api.usage = .{};
-    stream.openai_api.quota = null;
     return stream;
 }
 

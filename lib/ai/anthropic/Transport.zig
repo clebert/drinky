@@ -33,6 +33,9 @@ gpa: std.mem.Allocator,
 io: std.Io,
 timeouts: net.Timeouts,
 identity: Identity,
+/// The full request URL. It defaults to the production Messages API. A test
+/// overrides it to reach a loopback server.
+endpoint: []const u8 = messages_url,
 
 /// How a request authenticates and identifies itself. Subscription OAuth sends
 /// a `Bearer` access token plus the Claude Code identity headers
@@ -90,9 +93,14 @@ pub const Stream = struct {
     usage: llm.Usage,
     decompress: std.http.Decompress,
     decompress_buffer: []u8,
-    /// This buffer backs the request's runtime headers, which must outlive the
-    /// send phase (hence a stream field, not a `connect` local).
+    /// This buffer backs the request's extra headers. The retained request
+    /// points at it until `deinit`, so it is a stream field, not a `connect`
+    /// local.
     header_buffer: [3]std.http.Header,
+    /// The composed Authorization value of the subscription identity. The
+    /// retained request points at it for the stream's whole lifetime, so the
+    /// stream owns the bytes. Empty for the API-key identity.
+    authorization: []u8,
     error_buffer: [512]u8,
     redirect_buffer: [4096]u8,
     transfer_buffer: [16384]u8,
@@ -138,6 +146,22 @@ pub const Stream = struct {
         return errorMessage(object);
     }
 
+    /// Set the decode state and the owned header value to a blank start. The
+    /// engine's `begin` calls it, so every construction site shares one list
+    /// and a new owned field cannot miss a site and free garbage.
+    pub fn beginDecode(self: *Stream) void {
+        self.stop_reason = .none;
+        self.terminal_rejection = null;
+        self.open_block = null;
+        self.reasoning = .none;
+        self.block_text = .empty;
+        self.block_proof = .empty;
+        self.tool_call_id = .empty;
+        self.tool_name = .empty;
+        self.served_model = .empty;
+        self.authorization = &.{};
+    }
+
     pub fn deinitDecode(self: *Stream) void {
         self.frame_arena.deinit();
         self.block_text.deinit(self.gpa);
@@ -145,6 +169,12 @@ pub const Stream = struct {
         self.tool_call_id.deinit(self.gpa);
         self.tool_name.deinit(self.gpa);
         self.served_model.deinit(self.gpa);
+    }
+
+    /// Free the owned Authorization value. The engine calls it after the
+    /// request dies, so the request never points at freed bytes.
+    pub fn deinitHeaders(self: *Stream) void {
+        self.gpa.free(self.authorization);
     }
 
     /// Latch a rejection. `unsupported` and `uncorrelated` both win over
@@ -411,29 +441,21 @@ fn connect(self: *Transport, out: *Stream, body: []const u8) anyerror!void {
     engine.begin(out, self.gpa, self.io);
     errdefer out.client.deinit();
     errdefer out.frame_arena.deinit();
-    out.stop_reason = .none;
-    out.terminal_rejection = null;
-    out.open_block = null;
-    out.reasoning = .none;
-    out.block_text = .empty;
-    out.block_proof = .empty;
-    out.tool_call_id = .empty;
-    out.tool_name = .empty;
-    out.served_model = .empty;
 
-    // The Bearer header must outlive the send below, so allocate it at connect
-    // scope. The API-key path needs none.
-    const maybe_authorization: ?[]u8 = switch (self.identity) {
+    // The retained request points at this header value until `deinit`, so the
+    // stream owns the bytes (std.http: a header value must outlive its
+    // request). The API-key identity sends no such header.
+    out.authorization = switch (self.identity) {
         .subscription => |token| try std.fmt.allocPrint(self.gpa, "Bearer {s}", .{token}),
-        .api_key => null,
+        .api_key => &.{},
     };
-    defer if (maybe_authorization) |authorization| self.gpa.free(authorization);
+    errdefer self.gpa.free(out.authorization);
 
-    const uri = try std.Uri.parse(messages_url);
+    const uri = try std.Uri.parse(self.endpoint);
     out.request = try out.client.request(
         .POST,
         uri,
-        requestOptions(self.identity, maybe_authorization, &out.header_buffer),
+        requestOptions(self.identity, out.authorization, &out.header_buffer),
     );
     errdefer out.request.deinit();
 
@@ -444,10 +466,11 @@ fn connect(self: *Transport, out: *Stream, body: []const u8) anyerror!void {
 
 /// The built request's `Identity` fork. Both paths request an unencoded
 /// response, which keeps event delivery independent of any decompressor's own
-/// buffering. `extra` backs the returned options and must outlive the send.
+/// buffering. `extra` and `authorization` back the returned options, and the
+/// retained request points at them until `deinit`, so both must outlive it.
 fn requestOptions(
     identity: Identity,
-    authorization: ?[]const u8,
+    authorization: []const u8,
     extra: *[3]std.http.Header,
 ) std.http.Client.RequestOptions {
     switch (identity) {
@@ -460,7 +483,7 @@ fn requestOptions(
             return .{
                 .headers = .{
                     .content_type = .{ .override = "application/json" },
-                    .authorization = .{ .override = authorization.? },
+                    .authorization = .{ .override = authorization },
                     .user_agent = .{ .override = user_agent },
                     .accept_encoding = .{ .override = "identity" },
                 },
@@ -532,23 +555,14 @@ fn testStreamWithAllocator(
     budget_max: usize,
 ) Stream {
     var stream: Stream = undefined;
-    // `begin` owns every engine-shared field, so this helper cannot drift from
-    // the reset that a real connect performs. It sets the decode state after it.
+    // `begin` owns every engine-shared field and blanks the decode state, so
+    // this helper cannot drift from the reset that a real connect performs.
     sse.Engine(Stream).begin(&stream, gpa, io);
     stream.io = io;
     stream.idle_ms = idle_ms;
     stream.budget = .{ .max = budget_max };
     stream.body = body;
     stream.status = .ok;
-    stream.stop_reason = .none;
-    stream.terminal_rejection = null;
-    stream.open_block = null;
-    stream.reasoning = .none;
-    stream.block_text = .empty;
-    stream.block_proof = .empty;
-    stream.tool_call_id = .empty;
-    stream.tool_name = .empty;
-    stream.served_model = .empty;
     return stream;
 }
 
@@ -1416,7 +1430,7 @@ test "requestOptions forks the identity headers by account" {
     try std.testing.expectEqualStrings(beta, subscription.extra_headers[1].value);
     try std.testing.expectEqualStrings("x-app", subscription.extra_headers[2].name);
 
-    const keyed = requestOptions(.{ .api_key = "sk-key" }, null, &extra);
+    const keyed = requestOptions(.{ .api_key = "sk-key" }, "", &extra);
     try std.testing.expect(keyed.headers.authorization == .default);
     try std.testing.expect(keyed.headers.user_agent == .default);
     try std.testing.expectEqualStrings("identity", keyed.headers.accept_encoding.override);
@@ -1441,10 +1455,95 @@ test "every identity asks for streamed tool input" {
         streaming_beta,
     ) != null);
 
-    const keyed = requestOptions(.{ .api_key = "sk-key" }, null, &extra);
+    const keyed = requestOptions(.{ .api_key = "sk-key" }, "", &extra);
     try std.testing.expect(std.mem.indexOf(
         u8,
         keyed.extra_headers[2].value,
         streaming_beta,
     ) != null);
+}
+
+/// One accepted connection for the header-lifetime test: read the whole
+/// request, then answer with a bounded event stream that ends the reply at
+/// once.
+fn serveOneResponse(io: std.Io, server: *std.Io.net.Server) !void {
+    const body = "data: {\"type\":\"ping\"}\n\n";
+    var connection = try server.accept(io);
+    defer connection.close(io);
+
+    var read_buffer: [4096]u8 = undefined;
+    var reader = connection.reader(io, &read_buffer);
+    var content_length: usize = 0;
+    // The head of one request holds few lines, so the cap only stops a runaway.
+    var lines_left: usize = 64;
+    while (lines_left > 0) : (lines_left -= 1) {
+        const raw = try reader.interface.takeDelimiterInclusive('\n');
+        const line = std.mem.trimEnd(u8, raw, "\r\n");
+        if (line.len == 0) break;
+        const label = "content-length:";
+        if (std.ascii.startsWithIgnoreCase(line, label)) {
+            const value = std.mem.trim(u8, line[label.len..], " \t");
+            content_length = try std.fmt.parseInt(usize, value, 10);
+        }
+    }
+    try reader.interface.discardAll(content_length);
+
+    var write_buffer: [512]u8 = undefined;
+    var writer = connection.writer(io, &write_buffer);
+    try writer.interface.print(
+        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n" ++
+            "content-length: {d}\r\nconnection: close\r\n\r\n{s}",
+        .{ body.len, body },
+    );
+    try writer.interface.flush();
+}
+
+// Regression: `connect` used to free the composed Authorization value when it
+// returned, while the retained request pointed at it for the stream's whole
+// lifetime. std.http requires a header value to outlive its request, so the
+// stream owns the bytes now, and the value must read back intact after the
+// send.
+test "the stream owns the request Authorization value for its whole lifetime" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var address: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try address.listen(io, .{});
+    defer server.deinit(io);
+    const endpoint = try std.fmt.allocPrint(
+        gpa,
+        "http://127.0.0.1:{d}/v1/messages",
+        .{server.socket.address.getPort()},
+    );
+    defer gpa.free(endpoint);
+
+    var serve = try io.concurrent(serveOneResponse, .{ io, &server });
+    // A send that fails leaves the server blocked in accept, so the exit path
+    // that skipped the await below must cancel and reap the task.
+    var reaped = false;
+    defer if (!reaped) {
+        _ = serve.cancel(io) catch {};
+    };
+
+    var transport: Transport = .{
+        .gpa = gpa,
+        .io = io,
+        .timeouts = .{},
+        .identity = .{ .subscription = "secret-token" },
+        .endpoint = endpoint,
+    };
+    var stream: Stream = undefined;
+    try transport.send(&stream, "{}");
+    defer stream.deinit();
+    reaped = true;
+    try serve.await(io);
+
+    try std.testing.expectEqualStrings(
+        "Bearer secret-token",
+        stream.request.headers.authorization.override,
+    );
+    // The ping is the whole reply, so the stream drains cleanly before deinit.
+    try std.testing.expect((try stream.next()) == null);
 }

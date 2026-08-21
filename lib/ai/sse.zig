@@ -86,7 +86,9 @@ pub const Reasoning = enum {
 /// `error_length`, `error_retryable`, `retry_after_ms`, `frame_arena`, `usage`,
 /// `decompress`, `decompress_buffer`, `error_buffer`, `redirect_buffer`,
 /// `transfer_buffer`)
-/// plus `deinitDecode()` for stream-lifetime decode state,
+/// plus `beginDecode()` to blank the decode state and the owned header values
+/// (`begin` calls it), `deinitDecode()` for stream-lifetime decode state,
+/// `deinitHeaders()` to free the owned header values after the request dies,
 /// `decode(payload) !Decoded`, and `describeError(body) !?[]const u8` to read
 /// the message out of a failed head's error body (see `refineError`). The
 /// engine calls an optional `captureHead(*const Head)` hook while the response
@@ -99,6 +101,9 @@ pub fn Engine(comptime S: type) type {
             stream.deinitDecode();
             if (stream.decompress_buffer.len != 0) stream.gpa.free(stream.decompress_buffer);
             stream.request.deinit();
+            // The request points at the owned header values, so free them only
+            // after it dies.
+            stream.deinitHeaders();
             stream.client.deinit();
         }
 
@@ -168,9 +173,9 @@ pub fn Engine(comptime S: type) type {
             };
         }
 
-        /// The first half of a provider `connect`: the client and fresh shared
-        /// state. The provider adds its own decode state and owns the
-        /// errdefers between this and `finish`.
+        /// The first half of a provider `connect`: the client, fresh shared
+        /// state, and the provider's blank decode state via `beginDecode`. The
+        /// provider owns the errdefers between this and `finish`.
         pub fn begin(stream: *S, gpa: std.mem.Allocator, io: std.Io) void {
             stream.gpa = gpa;
             stream.client = .{ .allocator = gpa, .io = io };
@@ -179,6 +184,7 @@ pub fn Engine(comptime S: type) type {
             stream.error_length = 0;
             stream.error_retryable = false;
             stream.retry_after_ms = null;
+            stream.beginDecode();
         }
 
         /// The shared tail of a provider `connect`: send `body` over the built
