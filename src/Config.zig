@@ -52,6 +52,10 @@ dropped_cost: ?[]const u8 = null,
 /// config keeps it so the app can tell the user Pith ignored their line, and the
 /// bash tool falls back to the built-in timeout. Null on a legal value.
 dropped_bash_timeout_ms: ?u64 = null,
+/// Whether the file held an empty bash deny pattern. Pith drops it, because an
+/// empty pattern states no command. The config keeps the fact so the app can
+/// tell the user Pith ignored the entry.
+dropped_deny_empty: bool = false,
 /// The keys of `config.json` that no field of `File` matches, as paths in file
 /// order. The parse ignores them, so the app reports them and a typo does not
 /// disappear silently. Owned. `deinit` frees them.
@@ -152,6 +156,7 @@ const File = struct {
         output_lines_max: usize = bash_default.lines_max,
         output_bytes_max: usize = bash_default.bytes_max,
         timeout_ms: u64 = bash_default.timeout_ms,
+        deny: []const JsonString = &.{},
     };
 
     const Cache = struct {
@@ -284,6 +289,12 @@ const keys = [_]Key{
                 "{d} to {d}. Pith reports a value it cannot use and keeps the default.",
             .{ ai.tool.Context.Bash.timeout_ms_min, ai.tool.Context.Bash.timeout_ms_max },
         ),
+    },
+    .{
+        .path = "bash.deny",
+        .description = "The literal patterns that deny a command. The bash tool refuses a " ++
+            "command that contains one of the entries, and the refusal names that entry. " ++
+            "Pith ignores an empty entry.",
     },
     .{
         .path = "cache.anthropic_retention_ms",
@@ -486,7 +497,7 @@ const example =
     \\  "user_instructions": [{ "path": "instructions.md" }],
     \\  "required_skills": [{ "glob": "**/*.zig", "skill": "zig-style" }],
     \\  "request": { "idle_timeout_ms": 90000 },
-    \\  "bash": { "timeout_ms": 300000 },
+    \\  "bash": { "timeout_ms": 300000, "deny": ["git add"] },
     \\  "cache": { "openai_retention_ms": 600000, "warning_min_cost": 0.05 },
     \\  "default_models": { "anthropic_subscription": "claude-opus-5" },
     \\  "default_effort": "high"
@@ -564,7 +575,8 @@ pub fn document(
 }
 
 /// Free the path, the user instruction files, their messages, the required
-/// skills, the dropped-default names, and the unknown keys.
+/// skills, the bash deny patterns, the dropped-default names, and the unknown
+/// keys.
 pub fn deinit(self: *Config, gpa: std.mem.Allocator) void {
     gpa.free(self.path);
     self.user_instructions.deinit();
@@ -573,6 +585,8 @@ pub fn deinit(self: *Config, gpa: std.mem.Allocator) void {
         gpa.free(required.skill);
     }
     gpa.free(self.required_skills);
+    for (self.bash.deny) |pattern| gpa.free(pattern);
+    gpa.free(self.bash.deny);
     for (self.dropped_models) |dropped| gpa.free(dropped.name);
     gpa.free(self.dropped_models);
     if (self.dropped_effort) |name| gpa.free(name);
@@ -661,6 +675,23 @@ fn loadFromData(gpa: std.mem.Allocator, io: std.Io, options: *const DataOptions)
         try required.append(gpa, .{ .glob = owned_glob, .skill = owned_skill });
     }
 
+    var deny: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (deny.items) |pattern| gpa.free(pattern);
+        deny.deinit(gpa);
+    }
+    var dropped_deny_empty = false;
+    for (bash.deny) |configured| {
+        // An empty pattern states no command, so it cannot deny one.
+        if (configured.value.len == 0) {
+            dropped_deny_empty = true;
+            continue;
+        }
+        const owned = try gpa.dupe(u8, configured.value);
+        errdefer gpa.free(owned);
+        try deny.append(gpa, owned);
+    }
+
     var dropped: std.ArrayList(DroppedModel) = .empty;
     errdefer {
         for (dropped.items) |item| gpa.free(item.name);
@@ -736,6 +767,14 @@ fn loadFromData(gpa: std.mem.Allocator, io: std.Io, options: *const DataOptions)
         gpa.free(dropped_models);
     }
     const required_skills = try required.toOwnedSlice(gpa);
+    errdefer {
+        for (required_skills) |item| {
+            gpa.free(item.glob);
+            gpa.free(item.skill);
+        }
+        gpa.free(required_skills);
+    }
+    const deny_patterns = try deny.toOwnedSlice(gpa);
     return .{
         .path = owned_path,
         .timeouts = .{
@@ -751,6 +790,7 @@ fn loadFromData(gpa: std.mem.Allocator, io: std.Io, options: *const DataOptions)
             .lines_max = bash.output_lines_max,
             .bytes_max = bash.output_bytes_max,
             .timeout_ms = bash_timeout_ms,
+            .deny = deny_patterns,
         },
         .cache = .{
             .anthropic_retention_ms = cache.anthropic_retention_ms,
@@ -765,6 +805,7 @@ fn loadFromData(gpa: std.mem.Allocator, io: std.Io, options: *const DataOptions)
         .dropped_effort = dropped_effort,
         .dropped_cost = dropped_cost,
         .dropped_bash_timeout_ms = dropped_bash_timeout_ms,
+        .dropped_deny_empty = dropped_deny_empty,
         .unknown_keys = unknown_keys,
         .unknown_keys_omitted = unknown_keys_omitted,
     };
@@ -1011,6 +1052,33 @@ test "load reads the bash section" {
     try std.testing.expectEqual(@as(usize, 4096), config.bash.bytes_max);
     try std.testing.expectEqual(@as(u64, 1500), config.bash.timeout_ms);
     try std.testing.expect(config.dropped_bash_timeout_ms == null);
+}
+
+test "load reads the bash deny list and drops an empty pattern" {
+    var config = try loadDataForTest(
+        \\{ "bash": { "deny": ["git add", "", "git push"] } }
+    );
+    defer config.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), config.bash.deny.len);
+    try std.testing.expectEqualStrings("git add", config.bash.deny[0]);
+    try std.testing.expectEqualStrings("git push", config.bash.deny[1]);
+    // The load keeps the fact, so the app can tell the user Pith ignored the
+    // empty entry.
+    try std.testing.expect(config.dropped_deny_empty);
+
+    // A pattern must be a JSON string.
+    try std.testing.expectError(error.UnexpectedToken, loadDataForTest(
+        \\{ "bash": { "deny": [3] } }
+    ));
+    try std.testing.expectError(error.UnexpectedToken, loadDataForTest(
+        \\{ "bash": { "deny": "git add" } }
+    ));
+
+    // Without the key, no pattern denies a command.
+    var empty = try loadDataForTest("{}");
+    defer empty.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), empty.bash.deny.len);
+    try std.testing.expect(!empty.dropped_deny_empty);
 }
 
 // Every command runs under a limit. A zero used to mean no limit, so a stale
@@ -1387,6 +1455,9 @@ test "the config document names the file and its own example loads clean" {
     try std.testing.expectEqual(ai.llm.Effort.high, from_example.default_effort.?);
     try std.testing.expectEqual(@as(u64, 90_000), from_example.timeouts.idle_ms);
     try std.testing.expectEqual(@as(u64, 300_000), from_example.bash.timeout_ms);
+    try std.testing.expectEqual(@as(usize, 1), from_example.bash.deny.len);
+    try std.testing.expectEqualStrings("git add", from_example.bash.deny[0]);
+    try std.testing.expect(!from_example.dropped_deny_empty);
     try std.testing.expectEqualStrings(
         "claude-opus-5",
         from_example.default_models.get(.anthropic_subscription).?.name,
@@ -1492,6 +1563,8 @@ fn checkLoadAllocationFailure(gpa: std.mem.Allocator, io: std.Io, home: []const 
     try std.testing.expectEqual(@as(usize, 1), config.dropped_models.len);
     try std.testing.expect(config.dropped_effort != null);
     try std.testing.expect(config.dropped_cost != null);
+    try std.testing.expectEqual(@as(usize, 1), config.bash.deny.len);
+    try std.testing.expect(config.dropped_deny_empty);
     try std.testing.expectEqual(@as(usize, 1), config.unknown_keys.len);
     const text = try config.document(gpa, &document_options_for_test);
     defer gpa.free(text);
@@ -1511,6 +1584,7 @@ test "the config load frees every partial allocation" {
         .data =
         \\{ "user_instructions": [{ "path": "first.md" }, { "path": "missing.md" }],
         \\  "default_models": { "openai_api": "nope" }, "default_effort": "nope",
+        \\  "bash": { "deny": ["git add", ""] },
         \\  "cache": { "warning_min_cost": -1 }, "unknown": 1 }
         ,
     });

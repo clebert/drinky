@@ -659,6 +659,11 @@ pub fn run(
             config.bash.timeout_ms,
         },
     );
+    if (config.dropped_deny_empty) try self.recordEvent(
+        .failure,
+        "Pith ignored an empty bash deny pattern because the pattern must hold text.",
+        .{},
+    );
     try self.reportNotices(skill_notices.items);
     // The parse ignores an unknown key so that an older binary reads a newer
     // file. Report it, because a typo otherwise looks like an applied setting.

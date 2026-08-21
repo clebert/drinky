@@ -74,9 +74,6 @@ decision already taken, or a dependency on another entry. Module layout and exte
 - **Headless mode** — pith answers a prompt with no terminal: text in, text out, with a session id
   to continue and flags for the model and the effort level. _This is the base for any agent that
   pith drives itself._
-- **A configurable bash guard** — `bash` refuses a command that matches a user pattern, and reports
-  the refusal. _The user owns the pattern list, and `git add` is one example. There is no permission
-  model and no prompt for consent._
 - **Per-model instructions** — pith loads the instruction file that belongs to the active model, so
   guidance can differ per model. _A model switch reloads the file._
 - **`/handoff`** — compact the conversation into a summary and continue with the reclaimed context.

@@ -46,8 +46,9 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - **bash** — run a shell command in the working directory, preserve combined stdout and stderr
   order, and return a bounded tail. A non-zero exit is reported. Output caps and the timeout are
   configurable, and the timeout is also settable per call. Every command runs under a timeout from 1
-  second to 1 hour, so neither the config nor a call can lift the limit. Pith has no web tool, so a
-  network request also runs through bash.
+  second to 1 hour, so neither the config nor a call can lift the limit. A configured deny list
+  refuses a command that contains one of its patterns, and the refusal names the pattern. Pith has
+  no web tool, so a network request also runs through bash.
 - **describe_config** — describe `config.json`, so the model can change it for the user. It names
   the file and lists every key with its type, its default, and its meaning, plus the legal model
   names, the effort levels, the compiled fallbacks, and the memory that outranks the file. It
@@ -326,9 +327,9 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - User and project instructions obey one policy: a regular UTF-8 file, with content, no NUL byte,
   and at most 32 KiB. Each source loads at most 32 files and 64 KiB, and one file loads once even
   when two paths or a symbolic link reach it. pith reports what it skips.
-- `~/.pith/config.json` is optional: paths for user instructions, request and bash limits, the
-  prompt-cache warning, a default model per account, a default effort level, and the skills that a
-  path requires. pith reads it only at startup, so a change applies at the next start.
+- `~/.pith/config.json` is optional: paths for user instructions, request and bash limits, a bash
+  deny list, the prompt-cache warning, a default model per account, a default effort level, and the
+  skills that a path requires. pith reads it only at startup, so a change applies at the next start.
 - It holds no secrets. API keys come from `ANTHROPIC_API_KEY` and `OPENAI_API_KEY`.
 - A configured model that is not valid for its account is reported, and the compiled default used.
   An unknown effort level and a cache warning cost that pith cannot use are reported the same way. A
