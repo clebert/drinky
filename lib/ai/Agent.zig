@@ -31,8 +31,8 @@ const redacted_notice = "[redacted thinking]";
 /// shows the same wording for the call it fails, so the transcript and the
 /// history cannot drift.
 pub const unfinished_tool_result =
-    "The tool stopped before Pith recorded a result. " ++
-    "Pith does not know if the tool changed the system.";
+    "The tool stopped before Drinky recorded a result. " ++
+    "Drinky does not know if the tool changed the system.";
 
 /// The distinct models one session breaks its cost down by. An overflow drops
 /// only the per-model detail, never the cumulative totals.
@@ -836,7 +836,7 @@ fn drainSteering(self: *Agent, turn: *TurnState, handler: anytype) !bool {
 /// which rolls the turn back to its latest checkpoint.
 ///
 /// A head that rejects the credential takes one renewal and one repeat outside
-/// that policy, because another Pith instance can have rotated the token this
+/// that policy, because another Drinky instance can have rotated the token this
 /// one holds. A renewal that changes nothing reports the failure as it stands.
 fn fetchReply(
     self: *Agent,
@@ -1061,10 +1061,10 @@ fn recordRequestUsage(
 
 /// The model that prices one reply: the requested one, or the table entry of
 /// the model the response names as the one that served it. An unknown served
-/// name fails the turn, because a price at rates Pith does not know corrupts
+/// name fails the turn, because a price at rates Drinky does not know corrupts
 /// the ledger silently. The failed attempt still bills at the requested rates
 /// through the usage-so-far path, so the spend is kept while the report names
-/// the model Pith cannot price.
+/// the model Drinky cannot price.
 fn pricingModel(
     self: *Agent,
     requested: *const models.Model,
@@ -1078,7 +1078,7 @@ fn pricingModel(
     if (models.get(account.provider(), served_name)) |served| return served;
     const text = try std.fmt.allocPrint(
         self.gpa,
-        "Pith does not know the model \"{s}\" that served this reply, so Pith cannot price " ++
+        "Drinky does not know the model \"{s}\" that served this reply, so Drinky cannot price " ++
             "it. Use /model to pick another model.",
         .{served_name},
     );
@@ -1175,7 +1175,7 @@ fn readReplyWith(
     const stop = maybe_stop orelse return error.IncompleteReply;
     // The model that really served the reply prices it, so a provider-side
     // fallback bills at the fallback's rates. An unknown served model fails the
-    // turn instead of pricing at rates Pith cannot know.
+    // turn instead of pricing at rates Drinky cannot know.
     const priced_model = try self.pricingModel(model, stop.model, presentation_closed, handler);
     // Terminal usage is billable even when replay validation rejects the reply
     // and the request is retried.
@@ -2420,7 +2420,7 @@ test "an accepted attempt refreshes the cache anchor without usage" {
     try std.testing.expectEqual(@as(usize, 0), agent.cache_evidence.entry_count);
 }
 
-// A price at rates Pith does not know corrupts the ledger silently, so an
+// A price at rates Drinky does not know corrupts the ledger silently, so an
 // unknown served model fails the turn with a report that names it. The user
 // adds support for the model instead of reading a wrong total.
 test "readReply fails a reply that an unknown model served" {
@@ -2440,8 +2440,8 @@ test "readReply fails a reply that an unknown model served" {
         agent.readReply(&agent.model, &stream, &handler),
     );
     try std.testing.expectEqualStrings(
-        "Pith does not know the model \"claude-mythos-5\" that served this reply, " ++
-            "so Pith cannot price it. Use /model to pick another model.",
+        "Drinky does not know the model \"claude-mythos-5\" that served this reply, " ++
+            "so Drinky cannot price it. Use /model to pick another model.",
         handler.errors.items,
     );
     // Nothing was priced, so the ledger holds no number the report contradicts.
@@ -3602,7 +3602,7 @@ const probe = struct {
     }
 };
 
-// A tool that meets a guarded file asks Pith for the skill. The round boundary
+// A tool that meets a guarded file asks Drinky for the skill. The round boundary
 // sends it as one user message, so the model holds the rules for its next act.
 test "a queued skill file joins the conversation at the round boundary" {
     const gpa = std.testing.allocator;
@@ -4118,7 +4118,7 @@ test "a retry-after past the backoff cap fails the turn at once" {
     try std.testing.expectEqual(@as(usize, 0), agent.items.items.len);
 }
 
-// Another Pith instance can refresh the credential this one holds, which
+// Another Drinky instance can refresh the credential this one holds, which
 // revokes its access token. The rejected head must renew the credential once
 // and repeat the request, so the turn never sees the failure.
 test "a rejected credential renews once and repeats the request" {

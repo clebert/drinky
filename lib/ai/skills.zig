@@ -17,7 +17,7 @@ const notices_max = 1024;
 const skill_file_bytes_max = 16 << 20;
 
 /// A skill must fit the window of one `read` call. The model then holds the
-/// whole file after one call, and Pith can prove from the conversation that it
+/// whole file after one call, and Drinky can prove from the conversation that it
 /// loaded the skill. A file above either bound comes back in parts, which
 /// proves nothing, so the scan skips it and says so.
 const skill_lines_max = tool.read_lines_max;
@@ -178,7 +178,7 @@ pub const Registry = struct {
             if (err == error.FileNotFound) return;
             if (err == error.Canceled or err == error.OutOfMemory) return err;
             try self.warn(
-                "Pith could not scan the skill directory {s} because of error {s}.",
+                "Drinky could not scan the skill directory {s} because of error {s}.",
                 .{ root, @errorName(err) },
             );
             return;
@@ -216,7 +216,7 @@ pub const Registry = struct {
                 if (err == error.Canceled or err == error.OutOfMemory) return err;
                 if (attempt == entries_visited_max) traversal_capped = true;
                 try self.warn(
-                    "Pith skipped one entry in {s} because of error {s}.",
+                    "Drinky skipped one entry in {s} because of error {s}.",
                     .{ root, @errorName(err) },
                 );
                 continue;
@@ -230,7 +230,7 @@ pub const Registry = struct {
                 .directory => walker.enter(io, entry) catch |err| {
                     if (err == error.Canceled or err == error.OutOfMemory) return err;
                     try self.warn(
-                        "Pith could not scan the skill directory {s}/{s} because of error {s}.",
+                        "Drinky could not scan the skill directory {s}/{s} because of error {s}.",
                         .{ root, entry.path, @errorName(err) },
                     );
                 },
@@ -245,11 +245,11 @@ pub const Registry = struct {
             }
         }
         if (traversal_capped) try self.warn(
-            "Pith stopped the skill scan in {s} after {d} entries.",
+            "Drinky stopped the skill scan in {s} after {d} entries.",
             .{ root, entries_visited_max },
         );
         if (paths.matched > candidates_retained_max) try self.warn(
-            "Pith used only the first {d} SKILL.md paths in {s}.",
+            "Drinky used only the first {d} SKILL.md paths in {s}.",
             .{ candidates_retained_max, root },
         );
 
@@ -273,7 +273,7 @@ pub const Registry = struct {
         const stat = entry.dir.statFile(io, entry.basename, .{}) catch |err| {
             if (err == error.Canceled or err == error.OutOfMemory) return err;
             if (err != error.FileNotFound) try self.warn(
-                "Pith could not resolve the symbolic link {s}/{s} because of error {s}.",
+                "Drinky could not resolve the symbolic link {s}/{s} because of error {s}.",
                 .{ root, entry.path, @errorName(err) },
             );
             return;
@@ -302,7 +302,7 @@ pub const Registry = struct {
                 walker.enter(io, link) catch |err| {
                     if (err == error.Canceled or err == error.OutOfMemory) return err;
                     try self.warn(
-                        "Pith could not follow the symbolic link {s}/{s} because of error {s}.",
+                        "Drinky could not follow the symbolic link {s}/{s} because of error {s}.",
                         .{ root, entry.path, @errorName(err) },
                     );
                 };
@@ -316,7 +316,7 @@ pub const Registry = struct {
             const safe = try diagnostic(self.gpa, path);
             defer self.gpa.free(safe);
             try self.warn(
-                "Pith skipped the skill path {s} because it is not valid UTF-8.",
+                "Drinky skipped the skill path {s} because it is not valid UTF-8.",
                 .{safe},
             );
             return;
@@ -329,7 +329,7 @@ pub const Registry = struct {
         ) catch |err| {
             if (err == error.Canceled or err == error.OutOfMemory) return err;
             try self.warn(
-                "Pith could not read the skill file {s} because of error {s}.",
+                "Drinky could not read the skill file {s} because of error {s}.",
                 .{ path, @errorName(err) },
             );
             return;
@@ -337,21 +337,21 @@ pub const Registry = struct {
         defer self.gpa.free(data);
         if (std.mem.indexOfScalar(u8, data, 0) != null or !std.unicode.utf8ValidateSlice(data)) {
             try self.warn(
-                "Pith skipped {s} because the skill file is not UTF-8 text.",
+                "Drinky skipped {s} because the skill file is not UTF-8 text.",
                 .{path},
             );
             return;
         }
         if (data.len > skill_bytes_max) {
             try self.warn(
-                "Pith skipped {s} because the skill file is larger than {d} bytes.",
+                "Drinky skipped {s} because the skill file is larger than {d} bytes.",
                 .{ path, skill_bytes_max },
             );
             return;
         }
         if (format.lines(data) > skill_lines_max) {
             try self.warn(
-                "Pith skipped {s} because the skill file has more than {d} lines.",
+                "Drinky skipped {s} because the skill file has more than {d} lines.",
                 .{ path, skill_lines_max },
             );
             return;
@@ -360,14 +360,14 @@ pub const Registry = struct {
         var frontmatter = skill_header.parse(self.gpa, data) catch |err| switch (err) {
             error.MissingFrontmatter => {
                 try self.warn(
-                    "Pith skipped {s} because the YAML front matter is missing.",
+                    "Drinky skipped {s} because the YAML front matter is missing.",
                     .{path},
                 );
                 return;
             },
             error.UnclosedFrontmatter => {
                 try self.warn(
-                    "Pith skipped {s} because the YAML front matter is not closed.",
+                    "Drinky skipped {s} because the YAML front matter is not closed.",
                     .{path},
                 );
                 return;
@@ -378,7 +378,7 @@ pub const Registry = struct {
 
         const description_raw = frontmatter.description orelse {
             try self.warn(
-                "Pith skipped {s} because the skill description is missing or empty.",
+                "Drinky skipped {s} because the skill description is missing or empty.",
                 .{path},
             );
             return;
@@ -386,7 +386,7 @@ pub const Registry = struct {
         const description = std.mem.trim(u8, description_raw, " \t\r\n");
         if (description.len == 0) {
             try self.warn(
-                "Pith skipped {s} because the skill description is missing or empty.",
+                "Drinky skipped {s} because the skill description is missing or empty.",
                 .{path},
             );
             return;
@@ -396,7 +396,7 @@ pub const Registry = struct {
         // NUL-free end to end.
         if (std.mem.indexOfScalar(u8, description, 0) != null) {
             try self.warn(
-                "Pith skipped {s} because the skill description contains a NUL byte.",
+                "Drinky skipped {s} because the skill description contains a NUL byte.",
                 .{path},
             );
             return;
@@ -409,20 +409,21 @@ pub const Registry = struct {
             const safe = try diagnostic(self.gpa, declared);
             defer self.gpa.free(safe);
             try self.warn(
-                "Pith used the directory name for {s} because the skill name \"{s}\" is not valid.",
+                "Drinky used the directory name for {s} because the skill name \"{s}\" is not " ++
+                    "valid.",
                 .{ path, safe },
             );
             break :name directory_name;
         } else name: {
             try self.warn(
-                "Pith used the directory name for {s} because the skill name is missing.",
+                "Drinky used the directory name for {s} because the skill name is missing.",
                 .{path},
             );
             break :name directory_name;
         };
         if (!nameValid(name_source)) {
             try self.warn(
-                "Pith skipped {s} because the directory name \"{s}\" is not a valid skill name.",
+                "Drinky skipped {s} because the directory name \"{s}\" is not a valid skill name.",
                 .{ path, directory_name },
             );
             return;
@@ -433,7 +434,7 @@ pub const Registry = struct {
         );
         const description_length = std.unicode.utf8CountCodepoints(description) catch unreachable;
         if (description_length > 1024) try self.warn(
-            "Pith shortened the catalog description for {s} because it has more than " ++
+            "Drinky shortened the catalog description for {s} because it has more than " ++
                 "1024 characters.",
             .{path},
         );
@@ -466,7 +467,7 @@ pub const Registry = struct {
                 return;
             }
             try self.warn(
-                "Pith ignored the skill \"{s}\" at {s} because {s} has priority.",
+                "Drinky ignored the skill \"{s}\" at {s} because {s} has priority.",
                 .{ incoming.name, incoming.path, existing.path },
             );
             incoming.deinit(self.gpa);
@@ -475,7 +476,7 @@ pub const Registry = struct {
 
         if (self.skill_items.items.len == skills_max) {
             if (!self.skills_capped) {
-                try self.warn("Pith loaded only the first {d} distinct skills.", .{skills_max});
+                try self.warn("Drinky loaded only the first {d} distinct skills.", .{skills_max});
                 self.skills_capped = true;
             }
             incoming.deinit(self.gpa);
@@ -494,7 +495,7 @@ pub const Registry = struct {
     ) !void {
         if (self.notices_capped) return;
         if (self.notice_items.items.len == notices_max - 1) {
-            const text = try self.gpa.dupe(u8, "Pith omitted the remaining messages about the " ++
+            const text = try self.gpa.dupe(u8, "Drinky omitted the remaining messages about the " ++
                 "skill files.");
             errdefer self.gpa.free(text);
             try self.notice_items.append(self.gpa, .{ .severity = .failure, .text = text });

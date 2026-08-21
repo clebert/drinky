@@ -15,7 +15,7 @@ const sse = @import("../sse.zig");
 const Transport = @This();
 
 /// The header value that identifies this client on the ChatGPT-subscription backend.
-const originator = "pith";
+const originator = "drinky";
 
 gpa: std.mem.Allocator,
 io: std.Io,

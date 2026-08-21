@@ -51,12 +51,12 @@ decision already taken, or a dependency on another entry. Module layout and exte
 
 ## Features
 
-- **Active context projection** — Pith filters one canonical history for the active account, then
+- **Active context projection** — Drinky filters one canonical history for the active account, then
   deeply repaints its transcript. _The model is not a dimension. Reasoning provenance is per exact
   account, and the Anthropic Fable fallback replays mixed-model reasoning in one account. The OpenAI
-  cross-model replay is unconfirmed, but Pith already performs it on every `/model` switch, and a
+  cross-model replay is unconfirmed, but Drinky already performs it on every `/model` switch, and a
   rejection fails loudly._
-- **Conversation switching** — Pith selects the agent, history, transcript, and status through one
+- **Conversation switching** — Drinky selects the agent, history, transcript, and status through one
   shared operation, then applies active context projection.
 - **`/review`** — a bounded workflow reviews pending changes with a fresh reviewer, a persistent
   judge, and a fixer, and it asks the user only about an open product choice. _The plan is
@@ -71,11 +71,11 @@ decision already taken, or a dependency on another entry. Module layout and exte
   conversation and restore it verbatim. Rotate it only on a deliberately fresh start. A
   billing-product enum is not sufficient provenance for opaque reasoning. Persist a durable
   non-secret principal identity and replay only on a match. Versioned, atomic, owner-only._
-- **Headless mode** — pith answers a prompt with no terminal: text in, text out, with a session id
+- **Headless mode** — Drinky answers a prompt with no terminal: text in, text out, with a session id
   to continue and flags for the model and the effort level. _This is the base for any agent that
-  pith drives itself._
-- **Per-model instructions** — pith loads the instruction file that belongs to the active model, so
-  guidance can differ per model. _A model switch reloads the file._
+  Drinky drives itself._
+- **Per-model instructions** — Drinky loads the instruction file that belongs to the active model,
+  so guidance can differ per model. _A model switch reloads the file._
 - **`/handoff`** — compact the conversation into a summary and continue with the reclaimed context.
   _The command must also summarize canceled turns and the synthesized tool results they leave
   behind._
@@ -84,7 +84,7 @@ decision already taken, or a dependency on another entry. Module layout and exte
   ledger, not in history items. Billing is per request. History must stay byte-stable for cache
   hits. A canceled turn's reply rolls back out of history. Canceled and failed turns get their own
   entries, so cost survives `/handoff` compaction._
-- **Runtime model overrides** — an optional `~/.pith/models.json` extends the compiled model table
+- **Runtime model overrides** — an optional `~/.drinky/models.json` extends the compiled model table
   and adds an OpenAI-compatible endpoint, without a rebuild. _The noun `model catalog` belongs to
   the ChatGPT catalog in `lib/ai/openai/ModelCatalog.zig`, so this file is the model override file.
   Compiled defaults stay authoritative, so a known model always has a known context window. The file
@@ -96,4 +96,4 @@ decision already taken, or a dependency on another entry. Module layout and exte
 - A picker layered over a live turn, so a command list opens mid-turn.
 - Subagents, in some shape: a subshell, or a scheduler inside one process.
 - Restart the same prompt in a new session.
-- Benchmark models inside the pith harness.
+- Benchmark models inside the Drinky harness.

@@ -27,7 +27,7 @@ pub const Tokens = struct {
     /// The absolute epoch milliseconds at which `access` counts as stale.
     expires_ms: i64,
     /// The stable account and organization markers from the OAuth profile.
-    /// Null keeps credentials from older Pith versions usable.
+    /// Null keeps credentials from older Drinky versions usable.
     account_uuid: ?[]const u8 = null,
     organization_uuid: ?[]const u8 = null,
 

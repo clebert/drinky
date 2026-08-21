@@ -16,7 +16,7 @@ const role = @import("role.zig");
 pub const Entry = union(enum) {
     intro: std.ArrayList(u8),
     user: std.ArrayList(u8),
-    /// What Pith sent for the user, such as the head of a loaded skill. It is
+    /// What Drinky sent for the user, such as the head of a loaded skill. It is
     /// not a box, so a typed message cannot forge it.
     skill: std.ArrayList(u8),
     thinking: std.ArrayList(u8),
@@ -268,7 +268,7 @@ test "a tool box wraps a sentence and cuts a line of measures" {
     const gpa = std.testing.allocator;
     const columns = 20;
     const head = "Tool: edit · File: a.zig";
-    const detail = "Error: Pith found old_text more than once. Add more text around it.";
+    const detail = "Error: Drinky found old_text more than once. Add more text around it.";
     const text = head ++ "\n" ++ detail;
 
     var wrapped = try Entry.init(gpa, .tool_result, .{ .is_error = true, .fit = .wrap }, text);

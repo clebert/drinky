@@ -24,7 +24,7 @@ failure: []const u8,
 
 /// The transcript event that reports one attempt. The request itself stays out
 /// of the transcript, as a skill marker keeps its expanded file out of it.
-pub const event_text = "Pith asked the model to continue from the committed work.";
+pub const event_text = "Drinky asked the model to continue from the committed work.";
 
 /// The line that tells the model where to continue.
 const continuation = "Continue from the last committed checkpoint.";
@@ -36,7 +36,7 @@ pub fn deinit(self: *const Retry, gpa: std.mem.Allocator) void {
 /// The provider `user` message of one attempt. The result is owned.
 ///
 /// The tags are prompt markers, not a parse boundary. They tell the model that
-/// pith wrote this message, because the user typed none of it. Pith inserts the
+/// Drinky wrote this message, because the user typed none of it. Drinky inserts the
 /// failure sentence verbatim, so a sentence that carries a matching tag only
 /// blurs the guidance. Nothing parses this message back.
 pub fn compose(self: *const Retry, gpa: std.mem.Allocator) ![]u8 {

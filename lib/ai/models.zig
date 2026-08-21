@@ -20,7 +20,7 @@ pub const Model = struct {
     cache_read: f64,
     cache_write: f64,
     /// The active cache policy's inactivity window. Null means the provider
-    /// does not expose a duration that Pith can use without a guess.
+    /// does not expose a duration that Drinky can use without a guess.
     cache_retention_ms: ?u64,
     context_window: u64,
     /// The model's maximum output tokens, sent verbatim as `max_tokens`. The

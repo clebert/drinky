@@ -25,7 +25,7 @@ skill_registry: ?*const skills.Registry = null,
 /// notice lasts until the next user action. An event belongs in the transcript.
 pub const Outcome = union(enum) {
     notice: Message,
-    /// Pith did not run this slash line. The app shows the message, keeps the line
+    /// Drinky did not run this slash line. The app shows the message, keeps the line
     /// in the editor, sends nothing to the model, and opens no picker. The line can
     /// hold text that the user still needs.
     refusal: Message,
@@ -88,7 +88,7 @@ pub const Outcome = union(enum) {
         name: []const u8,
         arguments: []const u8,
         content: []const u8,
-        /// The file that Pith expanded into `content`. The transcript box names
+        /// The file that Drinky expanded into `content`. The transcript box names
         /// it, because `content` itself never reaches the screen.
         source: []const u8,
 

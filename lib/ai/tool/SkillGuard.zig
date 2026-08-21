@@ -14,7 +14,7 @@
 //! into a conversation carries the skill file verbatim: `read` returns the bytes
 //! of a file as they are, a `/skill:name` line sends them as a user message, and
 //! so does the delivery above. So the guard reads the skill file and searches
-//! the history for that exact text. A conversation that Pith loads from disk
+//! the history for that exact text. A conversation that Drinky loads from disk
 //! proves itself the same way, and a history that loses the text queues the
 //! skill again.
 //!
@@ -71,7 +71,7 @@ pub const Rule = struct {
 };
 
 /// What one check found: the first rule of the file that the conversation
-/// cannot prove. `failure` names the error that stopped Pith from reading the
+/// cannot prove. `failure` names the error that stopped Drinky from reading the
 /// skill file, and it is null when the skill file waits for delivery instead.
 pub const Demand = struct {
     rule: *const Rule,
@@ -141,14 +141,14 @@ pub fn refusal(self: *SkillGuard, options: *const CheckOptions) !?Result {
     if (unproven.failure) |err| return try Result.report(
         gpa,
         .err,
-        "Pith refused this call because {s} needs the skill {s}, and Pith could not read the " ++
-            "skill file {s} because of error {s}.",
+        "Drinky refused this call because {s} needs the skill {s}, and Drinky could not read " ++
+            "the skill file {s} because of error {s}.",
         .{ options.path, rule.skill, rule.source, @errorName(err) },
     );
     return try Result.report(
         gpa,
         .err,
-        "Pith refused this call because {s} needs the skill {s}. Pith sends you the whole " ++
+        "Drinky refused this call because {s} needs the skill {s}. Drinky sends you the whole " ++
             "skill file next, so read it and call the tool again.",
         .{ options.path, rule.skill },
     );
@@ -196,7 +196,7 @@ fn demand(self: *SkillGuard, options: *const CheckOptions) !?Demand {
 /// reports that nothing waits. A rule whose proof already stands in `history`
 /// leaves the queue without a message, so two rules that share one skill file
 /// deliver it once, and a proof that arrived in the queued round is not sent
-/// again. A skill file that Pith cannot read now also leaves the queue
+/// again. A skill file that Drinky cannot read now also leaves the queue
 /// silently, because only a call that changes a file can report that failure
 /// to the model.
 pub fn takeQueued(
@@ -223,7 +223,7 @@ pub fn takeQueued(
         // The head reads the way a `/skill:name` line reads, and the file goes
         // in as it is, so one search of the history proves either route.
         try text.writer.print(
-            "Pith sends you this skill because the pattern {s} requires it.\n" ++
+            "Drinky sends you this skill because the pattern {s} requires it.\n" ++
                 "Skill location: {s}\nResolve relative paths in this skill against: {s}\n\n",
             .{ rule.glob, rule.source, directory },
         );
@@ -446,7 +446,7 @@ test "two rules that share one skill file deliver it once" {
 }
 
 // A pattern can cover the skill file of its own rule. That file must not
-// require itself, or Pith sends the model a file it holds already.
+// require itself, or Drinky sends the model a file it holds already.
 test "a rule never guards its own skill file" {
     const gpa = std.testing.allocator;
     var fixture = try Fixture.init(gpa);
@@ -484,7 +484,7 @@ test "a rule never guards its own skill file" {
     try std.testing.expect(refused.is_error);
 }
 
-// A queued file that Pith cannot read leaves the queue with no message. Only a
+// A queued file that Drinky cannot read leaves the queue with no message. Only a
 // call that changes a file reports that failure, because only it stops.
 test "a skill file that vanished leaves the queue silently" {
     const gpa = std.testing.allocator;
@@ -543,7 +543,7 @@ test "a partial file, a failed call, and opaque items prove nothing" {
     try std.testing.expect((try fixture.check(gpa, &history)) == null);
 }
 
-test "a skill file Pith cannot read refuses the call and names the error" {
+test "a skill file Drinky cannot read refuses the call and names the error" {
     const gpa = std.testing.allocator;
     var fixture = try Fixture.init(gpa);
     defer fixture.deinit(gpa);

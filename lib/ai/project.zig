@@ -18,10 +18,10 @@ pub const Boundary = struct {
     /// the directory of an unreadable marker when the search stopped there.
     path: []const u8,
     /// Whether `path` holds the repository marker. It is always false when
-    /// `unreadable_marker` is set, because a marker Pith cannot read proves
+    /// `unreadable_marker` is set, because a marker Drinky cannot read proves
     /// nothing about the directory that holds it.
     has_root: bool,
-    /// The marker Pith could not read, if the search met one. The search treats
+    /// The marker Drinky could not read, if the search met one. The search treats
     /// that directory as the top of the walk. It is worse to cross a repository
     /// than to miss a file below an unreadable marker. Only the caller knows
     /// which noun its messages use, so only the caller reports it.
@@ -73,10 +73,10 @@ pub fn findBoundary(
     return .{ .path = working_directory, .has_root = false };
 }
 
-/// A marker file or a `HEAD` file above this size holds no head Pith can use.
+/// A marker file or a `HEAD` file above this size holds no head Drinky can use.
 const head_file_bytes_max = 4096;
 
-/// The longest head name Pith retains. The status line can abbreviate this name.
+/// The longest head name Drinky retains. The status line can abbreviate this name.
 pub const head_name_bytes_max = head_file_bytes_max;
 
 /// The number of characters of an object name that a detached head shows. Git
@@ -94,11 +94,11 @@ pub const Head = struct {
     }
 };
 
-/// The head of the repository at `root`, which `findBoundary` reports. Pith never
+/// The head of the repository at `root`, which `findBoundary` reports. Drinky never
 /// runs the git binary. It reads the one small `HEAD` file, so a caller can name
 /// the branch that a command in this directory acts on.
 ///
-/// Null when `root` holds no repository, when Pith cannot read the head, or when
+/// Null when `root` holds no repository, when Drinky cannot read the head, or when
 /// the head has no valid display name. Nothing here is authoritative, so every
 /// failure reads as no head at all.
 pub fn head(gpa: std.mem.Allocator, io: std.Io, root: []const u8) ?Head {
@@ -251,7 +251,7 @@ test "an unreadable marker stops the walk and travels back as a value" {
     defer tmp.cleanup();
 
     // A symbolic link to itself makes the stat of the marker below it fail for a
-    // reason Pith cannot act on. The walk must stop here and not climb into the
+    // reason Drinky cannot act on. The walk must stop here and not climb into the
     // repository above.
     try tmp.dir.symLink(io, "loop", "loop", .{});
     const working_directory = try tmpPath(gpa, io, &tmp, "loop");
@@ -273,7 +273,7 @@ test "outside a repository the boundary is the working directory" {
     // where no ancestor carries a marker.
     var seed = std.testing.tmpDir(.{});
     defer seed.cleanup();
-    const outside_root = try std.fmt.allocPrint(gpa, "/tmp/pith-project-{s}", .{seed.sub_path});
+    const outside_root = try std.fmt.allocPrint(gpa, "/tmp/drinky-project-{s}", .{seed.sub_path});
     defer gpa.free(outside_root);
     defer std.Io.Dir.cwd().deleteTree(io, outside_root) catch {};
     const created = try std.fs.path.join(gpa, &.{ outside_root, "work" });
@@ -346,7 +346,7 @@ test head {
 
     var marker = try tmp.dir.createDirPathOpen(io, "repo/.git", .{});
     marker.close(io);
-    // A repository whose head Pith cannot read.
+    // A repository whose head Drinky cannot read.
     try std.testing.expect(head(gpa, io, root) == null);
 
     try tmp.dir.writeFile(io, .{

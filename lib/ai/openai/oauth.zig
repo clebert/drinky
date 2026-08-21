@@ -24,7 +24,7 @@ pub const callback_port = 1455;
 
 const redirect_encoded = "http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback";
 const scope_encoded = "openid%20profile%20email%20offline_access";
-const originator = "pith";
+const originator = "drinky";
 const refresh_margin_ms = 5 * 60 * 1000;
 
 /// The JWT claim namespace OpenAI nests the ChatGPT identity under.

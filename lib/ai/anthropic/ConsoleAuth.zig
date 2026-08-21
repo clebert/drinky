@@ -1,6 +1,6 @@
 //! The credential lifecycle for the Anthropic Console account: the shared
 //! `auth` login and store instantiated over `console`'s protocol for the
-//! `"anthropic_console"` entry in `<home>/.pith/auth.json`. The login mints an
+//! `"anthropic_console"` entry in `<home>/.drinky/auth.json`. The login mints an
 //! API key and stores it. The key needs no refresh, so there is no
 //! `accessToken`: `apiKey` returns the stored key for the `x-api-key` header.
 
@@ -33,7 +33,7 @@ pub fn init(
     home: []const u8,
     timeouts: net.Timeouts,
 ) !ConsoleAuth {
-    const path = try std.fs.path.join(gpa, &.{ home, ".pith", "auth.json" });
+    const path = try std.fs.path.join(gpa, &.{ home, ".drinky", "auth.json" });
     return .{ .gpa = gpa, .io = io, .timeouts = timeouts, .path = path, .tokens = null };
 }
 

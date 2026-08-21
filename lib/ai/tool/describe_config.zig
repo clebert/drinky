@@ -38,12 +38,12 @@ test "the tool returns the injected document and no box line" {
     const context: Context = .{
         .gpa = std.testing.allocator,
         .io = std.testing.io,
-        .config_document = "# Pith configuration\n",
+        .config_document = "# Drinky configuration\n",
     };
     const result = try run(&context, "{}");
     defer result.deinit(std.testing.allocator);
     try std.testing.expect(!result.is_error);
-    try std.testing.expectEqualStrings("# Pith configuration\n", result.content);
+    try std.testing.expectEqualStrings("# Drinky configuration\n", result.content);
     try std.testing.expectEqual(@as(?Result.Summary, null), result.summary);
 }
 

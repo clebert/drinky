@@ -1,5 +1,5 @@
 //! Account-aware model limits from the ChatGPT Codex catalog. The catalog is a
-//! best-effort supplement to pith's compiled model table. This module fetches
+//! best-effort supplement to Drinky's compiled model table. This module fetches
 //! and decodes it, while the account registry decides which known models to
 //! overlay.
 
@@ -13,7 +13,7 @@ const net = @import("../net.zig");
 const client_version = "0.0.0";
 
 const endpoint = "https://chatgpt.com/backend-api/codex/models?client_version=" ++ client_version;
-const originator = "pith";
+const originator = "drinky";
 const body_bytes_max = 2 * 1024 * 1024;
 const model_count_max = 1024;
 const effective_context_window_percent_default = 95;

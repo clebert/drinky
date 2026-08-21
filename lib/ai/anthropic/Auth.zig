@@ -1,6 +1,6 @@
 //! The credential lifecycle for subscription OAuth: the shared `auth` lifecycle
 //! instantiated over `oauth`'s protocol for the `"anthropic_subscription"`
-//! entry in `<home>/.pith/auth.json`.
+//! entry in `<home>/.drinky/auth.json`.
 
 const std = @import("std");
 
@@ -25,7 +25,7 @@ tokens: ?oauth.Tokens,
 save_pending: bool = false,
 
 pub fn init(gpa: std.mem.Allocator, io: std.Io, home: []const u8, timeouts: net.Timeouts) !Auth {
-    const path = try std.fs.path.join(gpa, &.{ home, ".pith", "auth.json" });
+    const path = try std.fs.path.join(gpa, &.{ home, ".drinky", "auth.json" });
     return .{ .gpa = gpa, .io = io, .timeouts = timeouts, .path = path, .tokens = null };
 }
 
@@ -464,7 +464,7 @@ test "a failed refresh leaves the stored credential intact" {
     try std.testing.expectEqualStrings("keep", subject.tokens.?.refresh);
 }
 
-// The rotation-staleness bug: the refresh token is single use, so a second Pith
+// The rotation-staleness bug: the refresh token is single use, so a second Drinky
 // instance that refreshes first leaves this process with a dead cached token.
 // Every turn then fails until a restart. A failed refresh must reload the store
 // and try the token it finds there once.

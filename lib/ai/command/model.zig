@@ -69,7 +69,7 @@ pub fn select(context: *Context, index: usize) !Context.Outcome {
             return Context.Outcome.reportNotice(
                 gpa,
                 .information,
-                "Pith already uses {s} with {s}.",
+                "Drinky already uses {s} with {s}.",
                 .{ combo.model.name, combo.account.label() },
             );
         }
@@ -78,7 +78,7 @@ pub fn select(context: *Context, index: usize) !Context.Outcome {
     return Context.Outcome.reportEvent(
         gpa,
         .information,
-        "Pith now uses {s} with {s}.",
+        "Drinky now uses {s} with {s}.",
         .{ combo.model.name, combo.account.label() },
     );
 }

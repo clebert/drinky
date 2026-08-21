@@ -1,6 +1,6 @@
-//! The global configuration loaded from `<home>/.pith/config.json`. The file is
+//! The global configuration loaded from `<home>/.drinky/config.json`. The file is
 //! optional and can be partial. An absent file, section, or field falls back to a
-//! built-in default. Pith ignores unknown keys, so an older binary can read a
+//! built-in default. Drinky ignores unknown keys, so an older binary can read a
 //! newer file. The `File` struct below is the authoritative shape and default for
 //! every key. More sections join it as the harness grows. It carries no secrets.
 //! API keys come from the environment.
@@ -36,25 +36,25 @@ user_instructions: ai.instructions.Result,
 required_skills: []const RequiredSkill = &.{},
 /// The configured default-model names that did not resolve (unknown, or a model
 /// of the wrong vendor for their account). The config keeps them so the app can
-/// tell the user Pith ignored their line. Empty on the built-in default. Owned.
+/// tell the user Drinky ignored their line. Empty on the built-in default. Owned.
 /// `deinit` frees them.
 dropped_models: []const DroppedModel = &.{},
 /// The configured default effort level that did not resolve. The config keeps it
-/// so the app can tell the user Pith ignored their line. Owned. `deinit` frees
+/// so the app can tell the user Drinky ignored their line. Owned. `deinit` frees
 /// it.
 dropped_effort: ?[]const u8 = null,
-/// The configured cache warning cost that Pith cannot use, as the user wrote it.
-/// The config keeps it so the app can tell the user Pith ignored their line, and
+/// The configured cache warning cost that Drinky cannot use, as the user wrote it.
+/// The config keeps it so the app can tell the user Drinky ignored their line, and
 /// the policy falls back to the built-in floor. Null on a legal value. Owned.
 /// `deinit` frees it.
 dropped_cost: ?[]const u8 = null,
-/// The configured command timeout that Pith cannot use, in milliseconds. The
-/// config keeps it so the app can tell the user Pith ignored their line, and the
+/// The configured command timeout that Drinky cannot use, in milliseconds. The
+/// config keeps it so the app can tell the user Drinky ignored their line, and the
 /// bash tool falls back to the built-in timeout. Null on a legal value.
 dropped_bash_timeout_ms: ?u64 = null,
-/// Whether the file held an empty bash deny pattern. Pith drops it, because an
+/// Whether the file held an empty bash deny pattern. Drinky drops it, because an
 /// empty pattern states no command. The config keeps the fact so the app can
-/// tell the user Pith ignored the entry.
+/// tell the user Drinky ignored the entry.
 dropped_deny_empty: bool = false,
 /// The keys of `config.json` that no field of `File` matches, as paths in file
 /// order. The parse ignores them, so the app reports them and a typo does not
@@ -132,7 +132,7 @@ const File = struct {
     };
 
     /// One configured user instruction file. A relative path resolves against
-    /// `<home>/.pith/`.
+    /// `<home>/.drinky/`.
     const UserInstruction = struct {
         path: JsonString,
     };
@@ -216,8 +216,8 @@ const keys = [_]Key{
     .{
         .path = "user_instructions",
         .description = std.fmt.comptimePrint(
-            "The instruction files that Pith loads into every system prompt, in this order. " ++
-                "Pith loads at most {d} files, {d} KiB in total, and {d} KiB from one file.",
+            "The instruction files that Drinky loads into every system prompt, in this order. " ++
+                "Drinky loads at most {d} files, {d} KiB in total, and {d} KiB from one file.",
             .{
                 ai.instructions.files_max,
                 ai.instructions.source_kibibytes_max,
@@ -235,33 +235,33 @@ const keys = [_]Key{
         .description = std.fmt.comptimePrint(
             "The skills that a file requires. Before the write tool or the edit tool " ++
                 "changes a file that an entry matches, the whole skill file of that entry " ++
-                "must be in the conversation. Pith applies at most {d} entries.",
+                "must be in the conversation. Drinky applies at most {d} entries.",
             .{ai.tool.SkillGuard.rules_max},
         ),
     },
     .{
         .path = "required_skills[].glob",
-        .description = "The path pattern of one entry. Pith measures it against the path " ++
+        .description = "The path pattern of one entry. Drinky measures it against the path " ++
             "relative to the working directory, and against the absolute path. A `*` and a " ++
             "`?` match inside one path segment, and a `**` segment matches across segments.",
     },
     .{
         .path = "required_skills[].skill",
-        .description = "The name of the skill that the pattern requires. Pith reports a " ++
+        .description = "The name of the skill that the pattern requires. Drinky reports a " ++
             "name that no discovered skill carries, and applies no rule for it.",
     },
     .{
         .path = "request.connect_timeout_ms",
-        .description = "The time that Pith waits for the head of a provider response.",
+        .description = "The time that Drinky waits for the head of a provider response.",
     },
     .{
         .path = "request.idle_timeout_ms",
-        .description = "The time that Pith waits between two streamed events. A keepalive " ++
+        .description = "The time that Drinky waits between two streamed events. A keepalive " ++
             "ping is not an event and does not restart the wait.",
     },
     .{
         .path = "request.attempts_max",
-        .description = "The number of times that Pith sends one request before it fails.",
+        .description = "The number of times that Drinky sends one request before it fails.",
     },
     .{
         .path = "request.backoff_ms_initial",
@@ -270,23 +270,23 @@ const keys = [_]Key{
     .{
         .path = "request.backoff_ms_max",
         .description = "The upper bound on one wait between attempts. It caps the doubling " ++
-            "above. Pith does not retry when a retry-after header or an error body asks " ++
+            "above. Drinky does not retry when a retry-after header or an error body asks " ++
             "for a longer wait.",
     },
     .{
         .path = "bash.output_lines_max",
-        .description = "The whole lines that Pith keeps from the tail of a command's output.",
+        .description = "The whole lines that Drinky keeps from the tail of a command's output.",
     },
     .{
         .path = "bash.output_bytes_max",
-        .description = "The bytes that Pith keeps from the tail of a command's output.",
+        .description = "The bytes that Drinky keeps from the tail of a command's output.",
     },
     .{
         .path = "bash.timeout_ms",
         .description = std.fmt.comptimePrint(
-            "The time that a command runs before Pith stops it. A per-call argument " ++
+            "The time that a command runs before Drinky stops it. A per-call argument " ++
                 "overrides it. Every command runs under a limit, so the value must be from " ++
-                "{d} to {d}. Pith reports a value it cannot use and keeps the default.",
+                "{d} to {d}. Drinky reports a value it cannot use and keeps the default.",
             .{ ai.tool.Context.Bash.timeout_ms_min, ai.tool.Context.Bash.timeout_ms_max },
         ),
     },
@@ -294,26 +294,26 @@ const keys = [_]Key{
         .path = "bash.deny",
         .description = "The literal patterns that deny a command. The bash tool refuses a " ++
             "command that contains one of the entries, and the refusal names that entry. " ++
-            "Pith ignores an empty entry.",
+            "Drinky ignores an empty entry.",
     },
     .{
         .path = "cache.anthropic_retention_ms",
-        .description = "The prompt-cache retention that Pith assumes for an Anthropic model. " ++
+        .description = "The prompt-cache retention that Drinky assumes for an Anthropic model. " ++
             "Without the key, each model states its own, today 5 minutes. A value of 0 " ++
             "turns the stale-cache warning off.",
     },
     .{
         .path = "cache.openai_retention_ms",
-        .description = "The prompt-cache retention that Pith assumes for an OpenAI model. " ++
+        .description = "The prompt-cache retention that Drinky assumes for an OpenAI model. " ++
             "Without the key, each model states its own, today 30 minutes. A value of 0 " ++
             "turns the stale-cache warning off.",
     },
     .{
         .path = "cache.warning_min_cost",
         .description = "The smallest extra input cost, in dollars, that arms the stale-cache " ++
-            "warning. Pith starts a cheaper turn without a warning. The value must be a " ++
+            "warning. Drinky starts a cheaper turn without a warning. The value must be a " ++
             "finite number of zero or more. A value that is too large for a double is not " ++
-            "finite. Pith reports a value it cannot use and warns about every risk.",
+            "finite. Drinky reports a value it cannot use and warns about every risk.",
     },
     .{
         .path = "default_models.anthropic_api",
@@ -337,7 +337,7 @@ const keys = [_]Key{
     },
     .{
         .path = "default_effort",
-        .description = "The reasoning effort that a session starts on. Pith folds a level " ++
+        .description = "The reasoning effort that a session starts on. Drinky folds a level " ++
             "that the model does not support onto the nearest one it does." ++ new_project_only,
     },
 };
@@ -522,7 +522,7 @@ pub const DocumentOptions = struct {
 
 /// Build what the `describe_config` tool returns: a compiled key list between a
 /// header and a section that states the fallbacks the app compiles in. The
-/// header names the real file, so the model edits the path that Pith reads. The
+/// header names the real file, so the model edits the path that Drinky reads. The
 /// caller owns the text.
 ///
 /// The tool shows no box line beside the call, so this measures nothing. The
@@ -534,26 +534,26 @@ pub fn document(
     options: *const DocumentOptions,
 ) ![]u8 {
     return std.fmt.allocPrint(gpa,
-        \\# Pith configuration
+        \\# Drinky configuration
         \\
-        \\Pith reads {s} once, at startup. A change to that file applies at
-        \\the next start of Pith, and never to the session that runs now. Tell the user so.
+        \\Drinky reads {s} once, at startup. A change to that file applies at
+        \\the next start of Drinky, and never to the session that runs now. Tell the user so.
         \\
         \\The file is optional, so create it when it is absent. Any subset of the keys below is
         \\valid, and an absent key keeps its default. A dot shows a nested JSON object. Empty
-        \\brackets show each array entry. Pith ignores a key that it does not know, so a typo has
+        \\brackets show each array entry. Drinky ignores a key that it does not know, so a typo has
         \\no effect. The next start still succeeds and shows a warning that names each ignored key.
         \\The file holds no secret. An API key comes from the ANTHROPIC_API_KEY or the
         \\OPENAI_API_KEY variable.
         \\{s}
         \\## Models and effort
         \\
-        \\- An Anthropic account takes one of: {s}. Without a key, Pith uses {s}.
-        \\- An OpenAI account takes one of: {s}. Without a key, Pith uses {s}.
-        \\- `default_effort` takes one of: {s}. Without the key, Pith uses {s}.
-        \\- Pith remembers the model and the effort level of each project in a separate state
+        \\- An Anthropic account takes one of: {s}. Without a key, Drinky uses {s}.
+        \\- An OpenAI account takes one of: {s}. Without a key, Drinky uses {s}.
+        \\- `default_effort` takes one of: {s}. Without the key, Drinky uses {s}.
+        \\- Drinky remembers the model and the effort level of each project in a separate state
         \\  file, and that memory outranks this file. Only the /model and the /effort command
-        \\  change a project that Pith already ran in.
+        \\  change a project that Drinky already ran in.
         \\
         \\## Example
         \\
@@ -595,12 +595,12 @@ pub fn deinit(self: *Config, gpa: std.mem.Allocator) void {
     gpa.free(self.unknown_keys);
 }
 
-/// Load `<home>/.pith/config.json`, or the built-in defaults when it is absent.
-/// Every configured user instruction path resolves against `<home>/.pith/`.
+/// Load `<home>/.drinky/config.json`, or the built-in defaults when it is absent.
+/// Every configured user instruction path resolves against `<home>/.drinky/`.
 pub fn load(gpa: std.mem.Allocator, io: std.Io, options: *const LoadOptions) !Config {
     const directory = try std.fs.path.resolve(
         gpa,
-        &.{ options.working_directory, options.home, ".pith" },
+        &.{ options.working_directory, options.home, ".drinky" },
     );
     defer gpa.free(directory);
     const path = try std.fs.path.join(gpa, &.{ directory, "config.json" });
@@ -621,8 +621,8 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, options: *const LoadOptions) !Co
 
 /// Build the config from the bytes of `config.json` and fold each section into
 /// the neutral option structs. This also reads every configured user instruction
-/// file, so it needs `io`. Only a malformed file fails the load. A path Pith
-/// cannot use becomes a message, so a bad entry never stops pith.
+/// file, so it needs `io`. Only a malformed file fails the load. A path Drinky
+/// cannot use becomes a message, so a bad entry never stops Drinky.
 fn loadFromData(gpa: std.mem.Allocator, io: std.Io, options: *const DataOptions) !Config {
     const source = try std.json.parseFromSlice(
         std.json.Value,
@@ -1062,7 +1062,7 @@ test "load reads the bash deny list and drops an empty pattern" {
     try std.testing.expectEqual(@as(usize, 2), config.bash.deny.len);
     try std.testing.expectEqualStrings("git add", config.bash.deny[0]);
     try std.testing.expectEqualStrings("git push", config.bash.deny[1]);
-    // The load keeps the fact, so the app can tell the user Pith ignored the
+    // The load keeps the fact, so the app can tell the user Drinky ignored the
     // empty entry.
     try std.testing.expect(config.dropped_deny_empty);
 
@@ -1084,7 +1084,7 @@ test "load reads the bash deny list and drops an empty pattern" {
 // Every command runs under a limit. A zero used to mean no limit, so a stale
 // file still names one. The load keeps the line for the report and falls back to
 // the built-in timeout.
-test "a command timeout Pith cannot use falls back to the default and is reported" {
+test "a command timeout Drinky cannot use falls back to the default and is reported" {
     const cases = [_]u64{
         0,
         ai.tool.Context.Bash.timeout_ms_min - 1,
@@ -1139,7 +1139,7 @@ test "load reads the cache section" {
     try std.testing.expectEqual(@as(f64, 0), empty.cache.warning_min_cost);
 }
 
-test "a cost floor Pith cannot use falls back to zero and is reported" {
+test "a cost floor Drinky cannot use falls back to zero and is reported" {
     // A negative floor states nothing, so the load keeps the line for the report
     // and warns about every risk again.
     var negative = try loadDataForTest(
@@ -1415,11 +1415,11 @@ test "the config document names the file and its own example loads clean" {
 
     // The app's compiled fallbacks reach the document, so a key left out never
     // looks like it has no value at all.
-    try std.testing.expect(std.mem.indexOf(u8, text, "Without a key, Pith uses " ++
+    try std.testing.expect(std.mem.indexOf(u8, text, "Without a key, Drinky uses " ++
         "claude-opus-5.") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "Without a key, Pith uses " ++
+    try std.testing.expect(std.mem.indexOf(u8, text, "Without a key, Drinky uses " ++
         "gpt-5.6-sol.") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "Without the key, Pith uses " ++
+    try std.testing.expect(std.mem.indexOf(u8, text, "Without the key, Drinky uses " ++
         "xhigh.") != null);
 
     // An unknown key warns at the next start and never fails it. The document
@@ -1470,11 +1470,11 @@ test "load resolves user instruction paths against the config directory in order
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var pith_directory = try tmp.dir.createDirPathOpen(io, ".pith", .{});
-    defer pith_directory.close(io);
+    var drinky_directory = try tmp.dir.createDirPathOpen(io, ".drinky", .{});
+    defer drinky_directory.close(io);
     // The `\u002e` escape is the `.` of `second.md`. It proves that the parsed
     // value and the typed parser preserve a decoded path.
-    try pith_directory.writeFile(io, .{
+    try drinky_directory.writeFile(io, .{
         .sub_path = "config.json",
         .data =
         \\{ "user_instructions": [
@@ -1484,8 +1484,8 @@ test "load resolves user instruction paths against the config directory in order
         \\] }
         ,
     });
-    try pith_directory.writeFile(io, .{ .sub_path = "first.md", .data = "First.\n" });
-    try pith_directory.writeFile(io, .{ .sub_path = "second.md", .data = "Second.\n" });
+    try drinky_directory.writeFile(io, .{ .sub_path = "first.md", .data = "First.\n" });
+    try drinky_directory.writeFile(io, .{ .sub_path = "second.md", .data = "Second.\n" });
     const home = try tmpPath(gpa, io, &tmp, "");
     defer gpa.free(home);
 
@@ -1493,9 +1493,9 @@ test "load resolves user instruction paths against the config directory in order
     defer config.deinit(gpa);
     const files = config.user_instructions.files();
     try std.testing.expectEqual(@as(usize, 2), files.len);
-    const second_path = try std.fs.path.join(gpa, &.{ home, ".pith", "second.md" });
+    const second_path = try std.fs.path.join(gpa, &.{ home, ".drinky", "second.md" });
     defer gpa.free(second_path);
-    const first_path = try std.fs.path.join(gpa, &.{ home, ".pith", "first.md" });
+    const first_path = try std.fs.path.join(gpa, &.{ home, ".drinky", "first.md" });
     defer gpa.free(first_path);
     try std.testing.expectEqualStrings(second_path, files[0].path);
     try std.testing.expectEqualStrings("Second.\n", files[0].content);
@@ -1516,8 +1516,8 @@ test "load accepts an absolute path to user instructions" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var pith_directory = try tmp.dir.createDirPathOpen(io, ".pith", .{});
-    defer pith_directory.close(io);
+    var drinky_directory = try tmp.dir.createDirPathOpen(io, ".drinky", .{});
+    defer drinky_directory.close(io);
     try tmp.dir.writeFile(io, .{
         .sub_path = "instructions.md",
         .data = "Use the configured absolute path.",
@@ -1528,7 +1528,7 @@ test "load accepts an absolute path to user instructions" {
         .user_instructions = &.{.{ .path = instructions_path }},
     }, .{});
     defer gpa.free(config_data);
-    try pith_directory.writeFile(io, .{ .sub_path = "config.json", .data = config_data });
+    try drinky_directory.writeFile(io, .{ .sub_path = "config.json", .data = config_data });
     const home = try tmpPath(gpa, io, &tmp, "");
     defer gpa.free(home);
 
@@ -1576,10 +1576,10 @@ test "the config load frees every partial allocation" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var pith_directory = try tmp.dir.createDirPathOpen(io, ".pith", .{});
-    defer pith_directory.close(io);
-    try pith_directory.writeFile(io, .{ .sub_path = "first.md", .data = "First.\n" });
-    try pith_directory.writeFile(io, .{
+    var drinky_directory = try tmp.dir.createDirPathOpen(io, ".drinky", .{});
+    defer drinky_directory.close(io);
+    try drinky_directory.writeFile(io, .{ .sub_path = "first.md", .data = "First.\n" });
+    try drinky_directory.writeFile(io, .{
         .sub_path = "config.json",
         .data =
         \\{ "user_instructions": [{ "path": "first.md" }, { "path": "missing.md" }],

@@ -17,22 +17,22 @@ landed too, so only active context projection and conversation switching remain.
 
 ### Active context projection
 
-Pith keeps complete provider-neutral history. It projects that history for the active account.
+Drinky keeps complete provider-neutral history. It projects that history for the active account.
 
 - User and assistant messages remain compatible.
 - Opaque reasoning requires the exact account that created it.
 - A tool call and its results form one linked group.
-- Pith includes a tool group only when the active provider can represent it correctly.
+- Drinky includes a tool group only when the active provider can represent it correctly.
 - Hidden items stay in canonical history and return after a compatible switch.
 - A credential replacement permanently removes replay proofs from that account slot.
 
 The model is not a projection dimension. Anthropic replays mixed-model reasoning in one account,
-which its Fable fallback shows. Pith records no producing model on a reasoning item, and every
+which its Fable fallback shows. Drinky records no producing model on a reasoning item, and every
 `/model` switch already replays the previous model's reasoning. Whether OpenAI accepts a cross-model
-replay of encrypted reasoning is unconfirmed. A rejection surfaces as a loud API error, so Pith does
-not filter on a guess.
+replay of encrypted reasoning is unconfirmed. A rejection surfaces as a loud API error, so Drinky
+does not filter on a guess.
 
-The visible conversation blocks must match the projected model context. Pith shows no marker for a
+The visible conversation blocks must match the projected model context. Drinky shows no marker for a
 hidden item.
 
 Local event blocks remain visible because they are not model context.
@@ -59,11 +59,11 @@ Status: Landed, except the generated-request row below, which waits for `/review
 A request enters recovery after its normal transport retries fail. A checkpoint contains committed
 work from the failed turn.
 
-| Failed input           | Checkpoint | Editor recovery                     | Ctrl+N                          | Non-blank Enter                   |
-| ---------------------- | ---------- | ----------------------------------- | ------------------------------- | --------------------------------- |
-| Human-authored request | No         | Restore the request and steering.   | No action.                      | Send the editor as a normal turn. |
-| Pith-generated request | No         | Restore only human steering.        | Resend the generated request.   | Send the editor as a normal turn. |
-| Any request            | Yes        | Restore uncommitted human steering. | Send a generated retry request. | Send the editor as a normal turn. |
+| Failed input             | Checkpoint | Editor recovery                     | Ctrl+N                          | Non-blank Enter                   |
+| ------------------------ | ---------- | ----------------------------------- | ------------------------------- | --------------------------------- |
+| Human-authored request   | No         | Restore the request and steering.   | No action.                      | Send the editor as a normal turn. |
+| Drinky-generated request | No         | Restore only human steering.        | Resend the generated request.   | Send the editor as a normal turn. |
+| Any request              | Yes        | Restore uncommitted human steering. | Send a generated retry request. | Send the editor as a normal turn. |
 
 An attempt never carries the editor text. A failure of the network or of the provider is nothing a
 user instruction prevents, so the attempt asks for the committed work alone. Enter therefore keeps
@@ -83,7 +83,7 @@ warning. The first Ctrl+N reports the extra cost, and the next one sends.
 Blank Enter has no action. Ctrl+N never sends the editor text and never clears it.
 
 A non-blank Enter clears the editor only after the turn starts. If that turn fails before a
-checkpoint, Pith restores its human text. A generated request stays hidden.
+checkpoint, Drinky restores its human text. A generated request stays hidden.
 
 If the turn commits a checkpoint, its human text remains in immutable history.
 
@@ -99,8 +99,8 @@ Continue from the last committed checkpoint.
 </retry_request>
 ```
 
-The tags mark the message as one that Pith wrote, because the user typed none of it. A retry request
-contains only the latest error and never nests an older retry request.
+The tags mark the message as one that Drinky wrote, because the user typed none of it. A retry
+request contains only the latest error and never nests an older retry request.
 
 Retry never rewrites committed conversation history. Earlier retry requests, tool calls, results,
 reasoning, and human messages remain in order.
@@ -138,14 +138,14 @@ A retry needs an active account, so a signed-out Ctrl+N names the sign-in and ke
 Retry context survives an account, model, or effort switch. The next attempt uses the selected
 configuration.
 
-Every failed attempt and retry keeps its reported usage and cost. Pith does not track retry
+Every failed attempt and retry keeps its reported usage and cost. Drinky does not track retry
 duration.
 
 ### Command refusal
 
 Status: Landed.
 
-Pith uses one refusal path when a parsed slash command is unavailable in the active state:
+Drinky uses one refusal path when a parsed slash command is unavailable in the active state:
 
 - Keep the command text in the editor.
 - Send nothing to the model.
@@ -155,7 +155,7 @@ Pith uses one refusal path when a parsed slash command is unavailable in the act
 This path applies during an active normal turn, during retry restrictions, and throughout review
 mode. The restriction text completes the sentence `The command /name cannot run …`. Such a notice
 warns rather than reports a failure, because the line stays complete, and the next Enter runs it
-after the restriction ends. Pith runs no command on its own.
+after the restriction ends. Drinky runs no command on its own.
 
 Every line that starts with a slash is a command line. The registry also refuses an unknown name,
 and an argument that the command does not take. Such a line keeps its text and arms one Enter, which
@@ -228,9 +228,9 @@ Select a review setup                    Select the judge
 - A role row opens its account, model, and effort menus.
 - Esc returns one menu level.
 - The top setup uses `Esc: Cancel`.
-- An unavailable account blocks the start. Pith selects no fallback.
+- An unavailable account blocks the start. Drinky selects no fallback.
 
-Pith saves an explicit role choice when the user confirms it. A project without stored choices
+Drinky saves an explicit role choice when the user confirms it. A project without stored choices
 inherits the active session configuration and saves those choices when review starts.
 
 The global config sets the reviewer-round ceiling:
@@ -243,19 +243,19 @@ The global config sets the reviewer-round ceiling:
 }
 ```
 
-`review.rounds_max` defaults to 4 and must be positive. Pith reports an invalid value and uses the
+`review.rounds_max` defaults to 4 and must be positive. Drinky reports an invalid value and uses the
 default.
 
 Ctrl+E adds one round to the active workflow. It does not change `config.json`.
 
 ## Target and permissions
 
-`/review` requires a Git worktree. Outside one, Pith reports a notice and starts nothing.
+`/review` requires a Git worktree. Outside one, Drinky reports a notice and starts nothing.
 
 The target is every staged, unstaged, and untracked change from `HEAD`. Staging never changes the
 scope.
 
-Pith itself computes no diff and runs no Git command. The reviewer and judge run this path through
+Drinky itself computes no diff and runs no Git command. The reviewer and judge run this path through
 `bash`:
 
 1. Run `git status --short --untracked-files=all`.
@@ -264,14 +264,15 @@ Pith itself computes no diff and runs no Git command. The reviewer and judge run
 4. Read surrounding files when a change needs context.
 
 Plain `git status` can collapse an untracked directory. `git diff HEAD` does not show untracked
-files. If `HEAD` has no commit, the role reports the command failure and Pith adds no special path.
+files. If `HEAD` has no commit, the role reports the command failure and Drinky adds no special
+path.
 
-Pith never stages, commits, restores, or changes the index.
+Drinky never stages, commits, restores, or changes the index.
 
 Every role receives the normal environment, instruction, skill, and tool sections. Every role gets
 the complete tool registry.
 
-A path-triggered skill reaches every role through its reads. Pith sends the skill file when a tool
+A path-triggered skill reaches every role through its reads. Drinky sends the skill file when a tool
 first touches a file that a rule matches, so the reviewer and the judge hold the rules of the code
 they read. Neither role writes, so a refusal never carries those rules to them.
 
@@ -292,11 +293,11 @@ Their nonmutation rules are prompt instructions, not tool restrictions. Every ro
 
 ## Generated requests
 
-Each automatic request is a Pith-generated provider `user` message. The active transcript shows the
-complete request.
+Each automatic request is a Drinky-generated provider `user` message. The active transcript shows
+the complete request.
 
-Pith inserts report and user text verbatim. Tags are prompt markers, not parsed XML. A body can
-contain matching tags, so the prompt boundary is guidance rather than a security boundary. Pith
+Drinky inserts report and user text verbatim. Tags are prompt markers, not parsed XML. A body can
+contain matching tags, so the prompt boundary is guidance rather than a security boundary. Drinky
 controls all attribute values.
 
 ### Reviewer
@@ -333,7 +334,7 @@ The new reviewer report appears here.
 </judge_request>
 ```
 
-Pith omits unused blocks:
+Drinky omits unused blocks:
 
 | Transition                     | Workflow messages | Fixer report | Reviewer report |
 | ------------------------------ | ----------------- | ------------ | --------------- |
@@ -406,10 +407,10 @@ Do not change the public configuration format.
 </user_message>
 ```
 
-When the next judge turn starts, Pith moves pending copies into its generated request in user order.
-The normal turn transaction then owns them. `Review` keeps no second copy.
+When the next judge turn starts, Drinky moves pending copies into its generated request in user
+order. The normal turn transaction then owns them. `Review` keeps no second copy.
 
-Only human text can become a workflow message. Pith never forwards a generated request or a retry
+Only human text can become a workflow message. Drinky never forwards a generated request or a retry
 request.
 
 Each `Decision: Fix required.` report is a self-contained fixer packet. It includes each finding
@@ -437,7 +438,7 @@ failed request -> failure hold
 Only a fresh reviewer starts a round. A retry, successor turn, judge reply, fixer pass, or hold does
 not start one.
 
-Pith starts no fixer unless the ceiling permits a later reviewer round. The judge can settle after
+Drinky starts no fixer unless the ceiling permits a later reviewer round. The judge can settle after
 any fresh review.
 
 A rejected fixer dispute can add one final fixer pass. No automatic path adds another fixer before
@@ -446,8 +447,8 @@ the next reviewer.
 The ceiling bounds unattended progress. The limit hold keeps all live contexts available for
 questions or one more round.
 
-Pith tracks started and completed reviewer rounds separately. A canceled first reviewer reports zero
-completed rounds.
+Drinky tracks started and completed reviewer rounds separately. A canceled first reviewer reports
+zero completed rounds.
 
 ## Editor and controls
 
@@ -462,10 +463,10 @@ Text that parses as a slash command is never steering. During review, Enter uses
 refusal and keeps that text in the editor. Ctrl+C clears the refused command.
 
 Ctrl+C clears a non-empty editor and never releases a hold. On an empty editor, it has the current
-Esc action and never quits Pith directly from review mode.
+Esc action and never quits Drinky directly from review mode.
 
 Ctrl+D has no action with editor text. On an empty editor, it cancels and joins any active request,
-accounts for reported usage and cost, destroys review state, and exits Pith. It writes no main
+accounts for reported usage and cost, destroys review state, and exits Drinky. It writes no main
 completion event.
 
 A return from review mode resets the double-Ctrl+C timer. Normal double-Ctrl+C behavior starts fresh
@@ -480,12 +481,12 @@ at the main prompt.
 | Esc     | Stop review mode.                                             |
 
 The role reads steering at its next tool boundary. If queued steering arrives after the role
-finishes, Pith starts a successor turn in the same context.
+finishes, Drinky starts a successor turn in the same context.
 
-A direct stop cancels and joins the active request. Pith destroys every submitted review message
+A direct stop cancels and joins the active request. Drinky destroys every submitted review message
 with the review context and does not add it to the main editor.
 
-This rule covers steering, hold replies, judge questions, and retry additions. Pith preserves all
+This rule covers steering, hold replies, judge questions, and retry additions. Drinky preserves all
 text already visible in the editor, including text that failure recovery returned there.
 
 Esc still reports a stopped outcome when the worker completed before the join. The active phase does
@@ -506,7 +507,7 @@ the latest judge decision settled the review. These Esc paths restore the main c
 
 Ctrl+N and Ctrl+E preserve editor text. That text applies the normal brake at the next boundary.
 
-Ctrl+P has no hold action. Pith resolves late steering before it enters a hold.
+Ctrl+P has no hold action. Drinky resolves late steering before it enters a hold.
 
 A failure hold uses the shared recovery rules:
 
@@ -591,7 +592,7 @@ Decision: Review settled.
 Decision: User decision required.
 ```
 
-Pith takes the first line that starts with `Decision:`. Markdown decoration and letter case do not
+Drinky takes the first line that starts with `Decision:`. Markdown decoration and letter case do not
 affect classification.
 
 A fixer report starts with exactly one of these lines:
@@ -602,7 +603,7 @@ Applied: partial.
 Applied: none.
 ```
 
-Pith takes the first line that starts with `Applied:`. Markdown decoration and letter case do not
+Drinky takes the first line that starts with `Applied:`. Markdown decoration and letter case do not
 affect classification.
 
 - `Applied: all.`: The fixer applied every accepted finding.
@@ -632,7 +633,7 @@ The workflow has these visible contexts:
 
 A role switch uses the shared conversation-switch operation. It never mixes transcript blocks.
 
-The reviewer and fixer reset before each fresh phase. Pith banks their cost, clears their agent
+The reviewer and fixer reset before each fresh phase. Drinky banks their cost, clears their agent
 history, and clears the matching transcript.
 
 The judge keeps its history and transcript until the workflow ends. An account switch uses the
@@ -663,7 +664,7 @@ Ask about the open finding.
 ```
 
 The review frame has no fixed row budget. A running phase uses three rows and shows the role
-pipeline. A hold uses two rows and omits the pipeline. Pith recalculates the transcript and editor
+pipeline. A hold uses two rows and omits the pipeline. Drinky recalculates the transcript and editor
 layout after the transition.
 
 The status shows the active role account, model, effort, context fill, allowance, and total review
@@ -679,9 +680,9 @@ does not track duration.
 
 After the first reviewer starts, every workflow end that returns to the main prompt restores the
 parked main transcript and preserves the editor exactly. Empty-editor Ctrl+D uses normal app
-teardown instead. Pith starts no main-agent turn and adds no main-model context.
+teardown instead. Drinky starts no main-agent turn and adds no main-model context.
 
-Pith appends one local completion event to the main transcript. It includes:
+Drinky appends one local completion event to the main transcript. It includes:
 
 - The outcome or settlement status.
 - The active role when review stopped.
@@ -690,11 +691,11 @@ Pith appends one local completion event to the main transcript. It includes:
 - Completed fixer passes.
 - Total review cost.
 
-A stopped event counts only phase transitions that Pith applied before the active request. It
+A stopped event counts only phase transitions that Drinky applied before the active request. It
 includes all provider-reported cost and does not report a raced response as completed.
 
 Review agents, reports, role histories, pending workflow messages, and retry state are not copied to
-the main conversation. Pith destroys them after the completion event has the required accounting
+the main conversation. Drinky destroys them after the completion event has the required accounting
 data.
 
 ## Implementation invariants
@@ -714,11 +715,11 @@ data.
 - Committed history is immutable within a live context.
 - Conversation reset and unsafe replay-proof removal are explicit exceptions.
 - A phase can contain successor turns. Its latest complete assistant report controls the transition.
-- Agent reset and transcript reset remain separate operations that Pith calls together.
+- Agent reset and transcript reset remain separate operations that Drinky calls together.
 - `config.json` owns `review.rounds_max`.
 - `state.json` owns reviewer, judge, and fixer choices.
 
-Pith resolves a completed phase in this order:
+Drinky resolves a completed phase in this order:
 
 1. Continue for late steering.
 2. Enter a user hold for editor text.

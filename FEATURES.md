@@ -1,9 +1,9 @@
 # FEATURES.md
 
-What pith does, one short sentence per capability. It is an overview, not a specification: the _why_
-and _how_ live in commit history, `BACKLOG.md` (planned work), and `docs/`.
+What Drinky does, one short sentence per capability. It is an overview, not a specification: the
+_why_ and _how_ live in commit history, `BACKLOG.md` (planned work), and `docs/`.
 
-pith is a terminal coding agent. You type a prompt. The model reads, searches, writes, and edits
+Drinky is a terminal coding agent. You type a prompt. The model reads, searches, writes, and edits
 files in the working directory while the conversation streams inline into your scrollback. It talks
 to Anthropic and OpenAI, through either a subscription login or an API key.
 
@@ -20,8 +20,8 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
   second press. Ctrl+C clears a draft in the editor first, and cancels only on an empty editor.
   Canceled or failed turns keep finished rounds, drop the in-flight tail, and return uncommitted
   text to the editor.
-- Pith records a tool call left unfinished as an error in the history. The transcript shows it as a
-  failed call, so a canceled mutation is never hidden.
+- Drinky records a tool call left unfinished as an error in the history. The transcript shows it as
+  a failed call, so a canceled mutation is never hidden.
 - Timeouts and transient failures retry the whole request and clear the partial reply first.
 - A failed turn that committed work arms a retry above the editor. Ctrl+N asks the model to continue
   and Esc discards the retry. The attempt never takes the editor text, and the start of any turn
@@ -47,13 +47,13 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
   order, and return a bounded tail. A non-zero exit is reported. Output caps and the timeout are
   configurable, and the timeout is also settable per call. Every command runs under a timeout from 1
   second to 1 hour, so neither the config nor a call can lift the limit. A configured deny list
-  refuses a command that contains one of its patterns, and the refusal names the pattern. Pith has
+  refuses a command that contains one of its patterns, and the refusal names the pattern. Drinky has
   no web tool, so a network request also runs through bash.
 - **describe_config** — describe `config.json`, so the model can change it for the user. It names
   the file and lists every key with its type, its default, and its meaning, plus the legal model
   names, the effort levels, the compiled fallbacks, and the memory that outranks the file. It
   reports no current value, because it never reads the file.
-- A configured glob can require a skill. When a tool first touches a matching file, pith sends the
+- A configured glob can require a skill. When a tool first touches a matching file, Drinky sends the
   whole skill file into the turn at the next tool round, and the transcript names it. A read is
   never refused. `write` and `edit` refuse until the whole skill file stands in the conversation,
   word for word, so the next try needs no read of its own.
@@ -87,7 +87,7 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - Startup resumes on the account this project used last, else takes the first authenticated one and
   prefers a signed-in login over an API key.
 - With no account at all, the login picker opens by itself.
-- While signed out, pith refuses a message with a prompt to `/login`.
+- While signed out, Drinky refuses a message with a prompt to `/login`.
 - Reasoning replays only to the account that produced it. A login, a logout, or a credential
   replacement discards that account's reasoning, cache evidence, and allowance.
 
@@ -96,26 +96,26 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - OAuth login uses PKCE (S256) with a loopback callback, and opens the system browser.
 - The Anthropic Console login trades its grant for a minted platform key, stored like a token.
 - When no browser opens, the printed URL still works, and the callback waits five minutes.
-- The browser lands on a plain "Pith received authorization. Close this tab." page.
-- Subscription tokens and the Console key live in the owner-only `~/.pith/auth.json`, one entry per
-  account, saved atomically.
+- The browser lands on a plain "Drinky received authorization. Close this tab." page.
+- Subscription tokens and the Console key live in the owner-only `~/.drinky/auth.json`, one entry
+  per account, saved atomically.
 - Expired access tokens refresh and re-save automatically.
 - A busy credential store keeps a refreshed token in memory and retries its save before the next
   provider request.
 - Anthropic subscription logins save stable account and organization IDs from the OAuth profile.
-- If another pith instance saved a token for the same known principal, pith takes that token. The
-  refresh happens only when the stored token has expired too. A different or unknown principal stops
-  before the model request.
+- If another Drinky instance saved a token for the same known principal, Drinky takes that token.
+  The refresh happens only when the stored token has expired too. A different or unknown principal
+  stops before the model request.
 - A request that the provider rejects with 401 renews the credential once and repeats it. The
   renewal takes the token that another instance saved, or it refreshes the token in memory. An
   API-key account holds one fixed secret, so a rejected request ends the turn.
-- If another pith instance saves a replacement before removal, pith reloads it and keeps the account
-  active.
-- Without a replacement, pith removes the rejected credential and moves the session to another
+- If another Drinky instance saves a replacement before removal, Drinky reloads it and keeps the
+  account active.
+- Without a replacement, Drinky removes the rejected credential and moves the session to another
   account or the login picker.
 - A token failure that is not a rejection ends the turn, names the reason, and keeps the account
   signed in.
-- A login whose save fails stays signed in until pith exits, and says so.
+- A login whose save fails stays signed in until Drinky exits, and says so.
 
 ## Slash commands
 
@@ -137,15 +137,15 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - **/skill:name** — load a discovered skill explicitly, record one head line that reads
   `Skill: name · File: path`, and record any trailing text as its task in a user box below it. The
   head takes the user color and no box, so a typed message cannot forge it.
-- Every line that starts with a slash is a command line, so Pith reads it locally first and sends it
-  only after a confirmation. A command that takes no argument refuses text after the name, as in
+- Every line that starts with a slash is a command line, so Drinky reads it locally first and sends
+  it only after a confirmation. A command that takes no argument refuses text after the name, as in
   `/new must clear the scrollback`. `/skill:name` is the one exception, because it takes its task as
   trailing text.
-- Pith keeps a refused line in the editor, so its text survives an unknown name or unwanted text
+- Drinky keeps a refused line in the editor, so its text survives an unknown name or unwanted text
   after the name. A command that ran clears the editor. Only a `/skill:` line carries user text, and
   that text moves into the turn as the task.
-- Pith always offers a way out for a refused line: the footer offers `Enter: Send as a message`, and
-  during a turn `Enter: Queue as a message`. The next Enter alone sends the line as typed. Every
+- Drinky always offers a way out for a refused line: the footer offers `Enter: Send as a message`,
+  and during a turn `Enter: Queue as a message`. The next Enter alone sends the line as typed. Every
   other key cancels the offer and its row. The end of the turn cancels them too, and the line waits
   in the editor for a new offer.
 - Successful model, effort, login, logout, and account changes are recorded as transcript events.
@@ -171,7 +171,7 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - A failed request retries up to 3 times with 500 ms–16 s backoff and honors a server's retry-after
   hint.
 - A response that asks for a wait longer than the backoff cap ends the request. A spent OpenAI plan
-  states its reset in the error body, so Pith reports it after one try.
+  states its reset in the error body, so Drinky reports it after one try.
 - A stream frame that names a call or a block other than the open one ends the turn without a retry.
 - A reply that names a model other than the requested one records a durable transcript event with
   both names, so a fallback or a proxy substitution never passes silently. An unchanged fallback
@@ -247,26 +247,27 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
   list.
 - One heavy activity segment moves across both open input separators in a loop and grows as progress
   goes quiet without adding a layout row.
-- Pith blinks the input caret while a turn runs, because a terminal holds its own cursor solid under
-  a continuous repaint. An edit restarts the blink, so the caret stays visible while the user types.
+- Drinky blinks the input caret while a turn runs, because a terminal holds its own cursor solid
+  under a continuous repaint. An edit restarts the blink, so the caret stays visible while the user
+  types.
 - Queued steering shows as `Queued message:` rows, and becomes one user message once consumed.
 - The bottom line shows `directory (branch)`, context fill, cost, quota, and cache-hit rate on the
   left, and `model (account) · Effort: level` on the right. At most one temporary notice replaces it
   until the next user action.
 - A narrow window shortens the directory, branch, and context gauge before it removes parts, and it
   always keeps the context percentage.
-- The branch comes from the `HEAD` file of the repository, never from the git command. pith re-reads
-  it when a turn starts and when one ends.
+- The branch comes from the `HEAD` file of the repository, never from the git command. Drinky
+  re-reads it when a turn starts and when one ends.
 - A picker is a single-choice list that tags the current value. Enter confirms, and Esc, Ctrl+C, or
   Ctrl+D cancels. The selection rolls over at both ends of the list.
-- Every option holds one row. Pith cuts a row that is too wide for the window and marks the cut with
-  one `…`. The cut takes the option text, so the tag of the row stays. A selection can open a second
-  list. That list replaces the first one, and Esc closes the picker with no step back.
+- Every option holds one row. Drinky cuts a row that is too wide for the window and marks the cut
+  with one `…`. The cut takes the option text, so the tag of the row stays. A selection can open a
+  second list. That list replaces the first one, and Esc closes the picker with no step back.
 - A muted caption above the picker frame holds the title and the key hint. It stays outside the
   scrolled window, so the picker window never scrolls it away.
 - The open input area grows to about a quarter of the screen and labels hidden rows "↑ Hidden: N"
   and "↓ Hidden: N".
-- The terminal supplies every color and the muted intensity. Pith uses the default colors, ANSI
+- The terminal supplies every color and the muted intensity. Drinky uses the default colors, ANSI
   slots 0 to 15, faint, and reverse video. A filled box keeps the terminal background for its text.
   A label or a glyph marks every state, so color is never the only signal.
 - Model, tool, and user text can never emit escapes: controls and malformed UTF-8 render as
@@ -287,13 +288,13 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - A terminal without the Kitty protocol reports Escape as one byte. That byte becomes the Escape key
   after a 50 ms wait, and a control byte right after it stays a key of its own.
 - An exit key that returns the session to the prompt drops the rest of its input chunk. Esc and then
-  Ctrl+D closes the page or cancels the turn, and never quits pith. Enter and typed text keep every
-  key behind them.
+  Ctrl+D closes the page or cancels the turn, and never quits Drinky. Enter and typed text keep
+  every key behind them.
 - A bracketed paste arrives as one unit, with controls and escapes inside kept as literal payload.
 - Unrecognized sequences and stray control bytes are ignored and never leak into the text.
 - Text is segmented per UAX #29, so an emoji family, a flag, or a Hangul syllable stays one glyph.
-- Pith asks the terminal for grapheme cluster processing at startup. The cursor then advances one
-  grapheme cluster at a time, the same as the pith measure of a row. An older terminal ignores the
+- Drinky asks the terminal for grapheme cluster processing at startup. The cursor then advances one
+  grapheme cluster at a time, the same as the Drinky measure of a row. An older terminal ignores the
   request.
 - A cluster measures 0, 1, or 2 columns, so CJK and emoji wrap, truncate, and place the caret
   correctly.
@@ -309,42 +310,43 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - The system prompt adds the startup UTC date, the working directory, and the repository root. It
   also ranks the instruction sources it carries, so the model knows which one wins on a conflict. It
   names each path pattern that requires a skill, so the model knows the rule before it acts and
-  knows that pith sends the skill file on the first touch.
-- pith loads exact-case `AGENTS.md` files in path order, from the Git root down to the working
+  knows that Drinky sends the skill file on the first touch.
+- Drinky loads exact-case `AGENTS.md` files in path order, from the Git root down to the working
   directory. Outside a repository it reads that directory alone.
-- pith looks for skills in `~/.agents/skills/`, and in `.agents/skills/` from the Git root down to
+- Drinky looks for skills in `~/.agents/skills/`, and in `.agents/skills/` from the Git root down to
   the working directory. Outside a repository it looks in that directory alone.
-- pith searches each skills directory at any depth for `SKILL.md` and follows directory symlinks. On
-  a name clash a project skill has priority over a user skill, and the closest copy has priority
-  over a copy farther up. pith advertises each skill name and description, and loads the
+- Drinky searches each skills directory at any depth for `SKILL.md` and follows directory symlinks.
+  On a name clash a project skill has priority over a user skill, and the closest copy has priority
+  over a copy farther up. Drinky advertises each skill name and description, and loads the
   instructions on demand. A skill file above the window of one `read` call, 2000 lines or 50 KiB, is
   skipped and reported, so one call always shows the model a whole skill.
-- pith loads the user instruction files that `config.json` names, in order.
-- One dense startup line counts the instruction files that pith loaded, the skills that it found,
+- Drinky loads the user instruction files that `config.json` names, in order.
+- One dense startup line counts the instruction files that Drinky loaded, the skills that it found,
   the user skills that a project skill replaced, and the required skills that this project does not
   carry. A count of zero stays out of the line. Only a skipped file gets its own line, and `/system`
   shows every counted path.
 - User and project instructions obey one policy: a regular UTF-8 file, with content, no NUL byte,
   and at most 32 KiB. Each source loads at most 32 files and 64 KiB, and one file loads once even
-  when two paths or a symbolic link reach it. pith reports what it skips.
-- `~/.pith/config.json` is optional: paths for user instructions, request and bash limits, a bash
+  when two paths or a symbolic link reach it. Drinky reports what it skips.
+- `~/.drinky/config.json` is optional: paths for user instructions, request and bash limits, a bash
   deny list, the prompt-cache warning, a default model per account, a default effort level, and the
-  skills that a path requires. pith reads it only at startup, so a change applies at the next start.
+  skills that a path requires. Drinky reads it only at startup, so a change applies at the next
+  start.
 - It holds no secrets. API keys come from `ANTHROPIC_API_KEY` and `OPENAI_API_KEY`.
 - A configured model that is not valid for its account is reported, and the compiled default used.
-  An unknown effort level and a cache warning cost that pith cannot use are reported the same way. A
-  key that pith does not know is reported too, so a typo never looks like an applied setting.
+  An unknown effort level and a cache warning cost that Drinky cannot use are reported the same way.
+  A key that Drinky does not know is reported too, so a typo never looks like an applied setting.
 - A required skill whose name no discovered skill carries guards nothing in that project. The
   startup line counts each such name once, because the global config serves every project.
 - The config document is generated from the struct that parses the file, so a new key that carries
   no description fails the build and the document cannot drift.
-- JSON store writes use owner-only sibling `.lock` files to coordinate pith instances.
-- `~/.pith/state.json` remembers per project which account and effort level pith used last, and the
-  model of each account. It is machine-local, owner-only, and keeps the 1000 most recently changed
-  projects. A repository is one project, keyed by its Git root.
-- pith reads that file only at startup, so a change in one instance reaches only the next start. A
+- JSON store writes use owner-only sibling `.lock` files to coordinate Drinky instances.
+- `~/.drinky/state.json` remembers per project which account and effort level Drinky used last, and
+  the model of each account. It is machine-local, owner-only, and keeps the 1000 most recently
+  changed projects. A repository is one project, keyed by its Git root.
+- Drinky reads that file only at startup, so a change in one instance reaches only the next start. A
   persistent save failure is reported once and never stops the session.
-- `HOME` must be set, since the config, the credentials, and the state all live under `~/.pith`.
+- `HOME` must be set, since the config, the credentials, and the state all live under `~/.drinky`.
 
 ## Keeping this file true
 

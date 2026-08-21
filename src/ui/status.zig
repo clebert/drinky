@@ -21,7 +21,7 @@ pub const Info = struct {
     /// identity and not a whole path. Empty hides the directory and its branch.
     directory: []const u8,
     /// The branch of the repository, or null outside one and for a head that
-    /// Pith could not read. The caller bounds it at `ai.project.head_name_bytes_max`.
+    /// Drinky could not read. The caller bounds it at `ai.project.head_name_bytes_max`.
     branch: ?[]const u8,
     last: ai.llm.Usage,
     cost: f64,
@@ -370,7 +370,7 @@ test writeTokens {
 
 /// The full set of parts, so a test can watch the line give them up.
 const test_info: Info = .{
-    .directory = "~/github/clebert/pith",
+    .directory = "~/github/clebert/drinky",
     .branch = "main",
     .last = .{ .input = 22, .output = 23_000, .cache_read = 160_000, .cache_write = 23_000 },
     .cost = 0.393,
@@ -432,7 +432,7 @@ test render {
     // The place and the agent read as the same shape: a thing, and the context
     // it belongs to.
     try expectShows(painted, &.{
-        "~/github/clebert/pith (main)",
+        "~/github/clebert/drinky (main)",
         "Context: 21% (206k/1.0M)",
         "Cost: $0.39",
         "5h quota: 88% remaining",
@@ -457,12 +457,12 @@ test "a narrow window shortens fields before it gives up parts" {
         .{
             // The directory shortens before any complete part goes.
             .columns = 190,
-            .shows = &.{ "~/…/pith (main)", "Context: 21% (206k/1.0M)", "Cache: 87%" },
+            .shows = &.{ "~/…/drinky (main)", "Context: 21% (206k/1.0M)", "Cache: 87%" },
             .hides = &.{"~/github"},
         },
         .{
             // The context gauge shortens before any complete part goes.
-            .columns = 170,
+            .columns = 175,
             .shows = &.{ "Context: 21%", "Cost: $0.39", "Weekly quota", "Cache: 87%" },
             .hides = &.{"(206k/1.0M)"},
         },
@@ -484,23 +484,23 @@ test "a narrow window shortens fields before it gives up parts" {
         },
         .{
             .columns = 110,
-            .shows = &.{ "~/…/pith (main)", "Anthropic Subscription", "Effort: xhigh" },
+            .shows = &.{ "~/…/drinky (main)", "Anthropic Subscription", "Effort: xhigh" },
             .hides = &.{"quota"},
         },
         .{
             .columns = 80,
-            .shows = &.{ "~/…/pith (main)", "claude-opus-4-8", "Effort: xhigh" },
+            .shows = &.{ "~/…/drinky (main)", "claude-opus-4-8", "Effort: xhigh" },
             .hides = &.{"Anthropic Subscription"},
         },
         .{
             .columns = 60,
             .shows = &.{ "Context: 21%", "claude-opus-4-8", "Effort: xhigh" },
-            .hides = &.{"pith"},
+            .hides = &.{"drinky"},
         },
         .{
             .columns = 40,
             .shows = &.{ "Context: 21%", "claude-opus-4-8" },
-            .hides = &.{ "pith", "Effort:" },
+            .hides = &.{ "drinky", "Effort:" },
         },
     };
 
@@ -566,11 +566,11 @@ test "a long branch keeps 16 columns and a whole grapheme" {
     info.branch = "feature/" ++ "🇩🇪" ** 8;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    try renderForTest(gpa, &info, 195, &out);
+    try renderForTest(gpa, &info, 197, &out);
 
     const painted = out.written();
     try expectShows(painted, &.{
-        "~/…/pith (feature/" ++ "🇩🇪" ** 4 ++ "…)",
+        "~/…/drinky (feature/" ++ "🇩🇪" ** 4 ++ "…)",
         "Context: 21% (206k/1.0M)",
         "Cost: $0.39",
         "5h quota",
@@ -589,7 +589,7 @@ test "a directory outside a repository shows without a branch" {
     try renderForTest(gpa, &info, 200, &out);
 
     const painted = out.written();
-    try expectShows(painted, &.{"~/github/clebert/pith · Context:"});
+    try expectShows(painted, &.{"~/github/clebert/drinky · Context:"});
     try expectHides(painted, &.{"(main)"});
 }
 

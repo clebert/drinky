@@ -10,7 +10,7 @@ const Result = @This();
 /// The caller's allocator owns the content until `takeContent` transfers it.
 content: []const u8,
 /// The second line of the transcript box. Null leaves the box with its call row
-/// alone. The tool decides this line, and Pith never derives it from the
+/// alone. The tool decides this line, and Drinky never derives it from the
 /// content.
 summary: ?Summary = null,
 is_error: bool,
@@ -87,7 +87,7 @@ pub fn cannot(
     return report(
         gpa,
         .err,
-        "Pith could not " ++ verb ++ " {s} because of error {s}.",
+        "Drinky could not " ++ verb ++ " {s} because of error {s}.",
         .{ path, @errorName(err) },
     );
 }
@@ -96,15 +96,15 @@ pub fn cannot(
 // success states its own line, or none at all.
 test "a failure reports its sentence as the box line and a success does not" {
     const gpa = std.testing.allocator;
-    const failure = try report(gpa, .err, "Pith could not read {s}.", .{"a.zig"});
+    const failure = try report(gpa, .err, "Drinky could not read {s}.", .{"a.zig"});
     defer failure.deinit(gpa);
     try std.testing.expect(failure.is_error);
-    try std.testing.expectEqualStrings("Pith could not read a.zig.", failure.summary.?.text);
+    try std.testing.expectEqualStrings("Drinky could not read a.zig.", failure.summary.?.text);
     try std.testing.expectEqual(Summary.Kind.sentence, failure.summary.?.kind);
     // The two strings are separate allocations, so `deinit` frees both.
     try std.testing.expect(failure.content.ptr != failure.summary.?.text.ptr);
 
-    const success = try report(gpa, .ok, "Pith wrote {s}.", .{"a.zig"});
+    const success = try report(gpa, .ok, "Drinky wrote {s}.", .{"a.zig"});
     defer success.deinit(gpa);
     try std.testing.expect(!success.is_error);
     try std.testing.expectEqual(@as(?Summary, null), success.summary);

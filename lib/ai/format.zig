@@ -1,4 +1,4 @@
-//! Shared display formatting for the values that Pith shows to the user. A value
+//! Shared display formatting for the values that Drinky shows to the user. A value
 //! that two callers report must read the same in both places.
 
 const std = @import("std");
@@ -68,7 +68,7 @@ test path {
         // Below the working directory: the part that names the file is enough.
         .{ .target = "/home/you/work/src/App.zig", .expected = "src/App.zig" },
         // Below home but outside the work tree: `~` stands in for home.
-        .{ .target = "/home/you/.pith/config.json", .expected = "~/.pith/config.json" },
+        .{ .target = "/home/you/.drinky/config.json", .expected = "~/.drinky/config.json" },
         // Below neither root: the whole path stays, because that is the reach
         // the user must be able to see.
         .{ .target = "/etc/hosts", .expected = "/etc/hosts" },

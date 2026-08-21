@@ -64,7 +64,7 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
         error.StreamTooLong => return Result.report(
             gpa,
             .err,
-            "Pith cannot read {s} because it is larger than {d} bytes.",
+            "Drinky cannot read {s} because it is larger than {d} bytes.",
             .{ path, file_bytes_max },
         ),
         else => return Result.cannot(gpa, err, "read", path),
@@ -75,13 +75,13 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
         return Result.report(
             gpa,
             .err,
-            "Pith cannot read {s} because it is not a UTF-8 text file.",
+            "Drinky cannot read {s} because it is not a UTF-8 text file.",
             .{path},
         );
     }
 
     // A rule can require a skill for this file. A read is never refused, so it
-    // only asks Pith to send that skill, which reaches the model at the next
+    // only asks Drinky to send that skill, which reaches the model at the next
     // round. A role that reads and never writes still gets the rules.
     if (context.skill_guard) |guard| try guard.require(&.{
         .gpa = gpa,
@@ -148,7 +148,7 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
         const separator =
             if (written.len > 0 and written[written.len - 1] == '\n') "\n" else "\n\n";
         try out.writer.print(
-            "{s}[Line {d} is longer than {d} bytes. Pith truncated it.]",
+            "{s}[Line {d} is longer than {d} bytes. Drinky truncated it.]",
             .{ separator, last + 1, bytes_max },
         );
     }
@@ -157,7 +157,7 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
         const separator =
             if (written.len > 0 and written[written.len - 1] == '\n') "\n" else "\n\n";
         try out.writer.print(
-            "{s}[Pith shows lines {d}–{d} of {d}. Use offset={d} to continue.]",
+            "{s}[Drinky shows lines {d}–{d} of {d}. Use offset={d} to continue.]",
             .{ separator, start + 1, last + 1, total, last + 2 },
         );
     }

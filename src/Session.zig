@@ -138,7 +138,7 @@ effort_shown: ai.llm.Effort,
 account_shown: ?ai.llm.Account,
 /// The working directory the status line shows, with the home directory
 /// abbreviated. It borrows `App` storage, because the working directory cannot
-/// change while pith runs. Empty hides the whole part.
+/// change while Drinky runs. Empty hides the whole part.
 directory_shown: []const u8,
 /// The repository root that `App` re-reads the head from, or null outside a
 /// repository. It belongs to the place the status line shows, next to the
@@ -146,7 +146,7 @@ directory_shown: []const u8,
 branch_root: ?[]const u8,
 /// The branch of the project. `App` refreshes it, and the bytes live here so
 /// that `paint` needs no io. Empty outside a repository, and empty for a head
-/// Pith cannot read.
+/// Drinky cannot read.
 branch_buffer: [ai.project.head_name_bytes_max]u8,
 branch_length: usize,
 /// Steering submitted during a turn, in chronological order, as detached editor
@@ -355,7 +355,7 @@ pub const TurnEvent = struct {
         /// turn as one combined message: show it, hide those rows from the queue
         /// view, and retain their rich drafts until the receipt resolves them.
         steering_consumed: SteeringConsumed,
-        /// Pith sent one skill file into the running turn, because a tool met a
+        /// Drinky sent one skill file into the running turn, because a tool met a
         /// file that a rule guards. It is no message of the user, so it shows as
         /// a head line rather than a user box.
         skill_loaded: SkillLoaded,
@@ -373,7 +373,7 @@ pub const TurnEvent = struct {
             is_error: bool,
         };
         pub const SteeringConsumed = struct { text: []u8, count: usize };
-        /// The name and the file of one skill that Pith sent. The event owns
+        /// The name and the file of one skill that Drinky sent. The event owns
         /// both.
         pub const SkillLoaded = struct { skill: []u8, source: []u8 };
         /// The requested and the served model name of one switched reply. The
@@ -1118,7 +1118,7 @@ pub fn setBranch(self: *Session, name: []const u8) void {
     self.dirty = true;
 }
 
-/// The branch of the project, or null when Pith found none.
+/// The branch of the project, or null when Drinky found none.
 pub fn branch(self: *const Session) ?[]const u8 {
     if (self.branch_length == 0) return null;
     return self.branch_buffer[0..self.branch_length];
@@ -1249,7 +1249,7 @@ fn activeTurn(self: *Session) ?*Turn {
 }
 
 /// The head row of one committed call: the tool and what it acts on, as a key
-/// and a value like every other fragment Pith shows. The key also says which
+/// and a value like every other fragment Drinky shows. The key also says which
 /// kind of value follows, because a file and a pattern read alike on their own.
 /// A call with no subject is its name alone, so the row carries no dangling
 /// separator.
@@ -1601,7 +1601,7 @@ test "a turn end drops the send-as-a-message confirmation and the footer" {
     try session.applyOutcome(try ai.command.Outcome.reportNotice(
         gpa,
         .warning,
-        "Enter: Queue as a message · Pith does not recognize the command /nope.",
+        "Enter: Queue as a message · Drinky does not recognize the command /nope.",
         .{},
     ));
     session.armConfirmation(.message);
@@ -1655,13 +1655,13 @@ test "a new notice drops the send-as-a-message confirmation" {
     try session.applyOutcome(try ai.command.Outcome.reportNotice(
         gpa,
         .failure,
-        "Pith could not read the file.",
+        "Drinky could not read the file.",
         .{},
     ));
 
     try std.testing.expect(!session.takeConfirmation(.message));
     try std.testing.expectEqualStrings(
-        "Pith could not read the file.",
+        "Drinky could not read the file.",
         session.notice.?.content,
     );
 }
@@ -1740,7 +1740,7 @@ test "an event survives notice clearing until the conversation resets" {
     defer session.deinit();
 
     try session.applyOutcome(
-        try ai.command.Outcome.reportEvent(gpa, .information, "Pith changed the model.", .{}),
+        try ai.command.Outcome.reportEvent(gpa, .information, "Drinky changed the model.", .{}),
     );
     try session.applyOutcome(
         try ai.command.Outcome.reportNotice(gpa, .failure, "Temporary notice.", .{}),
@@ -1749,7 +1749,7 @@ test "an event survives notice clearing until the conversation resets" {
 
     try std.testing.expectEqual(@as(usize, 1), session.transcript.blocks().len);
     try std.testing.expectEqualStrings(
-        "Pith changed the model.",
+        "Drinky changed the model.",
         session.transcript.blocks()[0].event.text.items,
     );
     session.dirty = false;
@@ -1885,7 +1885,7 @@ test "a failed tool result keeps its sentence below the call row" {
     defer session.deinit();
     session.beginTurn(1);
 
-    const sentence = "Pith could not read a.zig because of error FileNotFound.";
+    const sentence = "Drinky could not read a.zig because of error FileNotFound.";
     try applyEvent(&session, 1, .{ .tool_start = .{
         .name = try gpa.dupe(u8, "read"),
         .input_json = try gpa.dupe(u8, "{\"path\":\"a.zig\"}"),
@@ -2487,8 +2487,8 @@ test "activity ticks repaint each separator step" {
     try std.testing.expect(session.advanceFrame());
 }
 
-// Pith blinks the caret itself during a turn, because the terminal holds its own
-// cursor solid while pith writes a frame every 16 ms.
+// Drinky blinks the caret itself during a turn, because the terminal holds its own
+// cursor solid while Drinky writes a frame every 16 ms.
 test "an edit restarts the caret blink of a running turn" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -3003,7 +3003,7 @@ test "a partial cancel removes consumed steering beyond the commit frontier" {
     try std.testing.expectEqualStrings("restore me", session.editor.visible());
 }
 
-// A skill that Pith sent is no message of the user, so it must not read like
+// A skill that Drinky sent is no message of the user, so it must not read like
 // one. It takes a head line of its own, and the file it names stays out.
 test "a delivered skill shows as a head line, not as a user box" {
     const gpa = std.testing.allocator;

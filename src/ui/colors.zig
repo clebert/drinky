@@ -1,4 +1,4 @@
-//! The `/colors` preview page body. It shows every color pith can emit: the
+//! The `/colors` preview page body. It shows every color Drinky can emit: the
 //! ANSI slots 0 to 15 as foreground and as reverse-video fills, each in the
 //! faint, normal, and bold intensities, every text color option on each
 //! colored background, the default-color styles, the filled message boxes, the
@@ -137,7 +137,7 @@ const items = blk: {
         .{ .sample = .{
             .label = "Status",
             .name = .muted,
-            .text = "~/pith (main) · Context: 42% · $0.14",
+            .text = "~/drinky (main) · Context: 42% · $0.14",
         } },
         .{ .sample = .{ .label = "Notice", .name = .muted, .text = "Selection canceled." } },
         .{ .sample = .{

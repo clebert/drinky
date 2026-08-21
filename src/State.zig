@@ -1,11 +1,11 @@
-//! The machine-local startup state in `<home>/.pith/state.json`: the account and
+//! The machine-local startup state in `<home>/.drinky/state.json`: the account and
 //! the effort level that each project used last, and the model that each account
 //! ran there. It is mutable state, not configuration. `config.json` stays a
 //! curated file the user can share, and this file holds what the interface
 //! changes as the user works.
 //!
 //! The file is a keyed JSON object. Each key is a project: the Git root, or the
-//! working directory when Pith found no Git root. One project therefore keeps
+//! working directory when Drinky found no Git root. One project therefore keeps
 //! its own entry, and two projects can run different accounts.
 //!
 //! A project runs one account at a time, but it keeps one model per account. A
@@ -14,7 +14,7 @@
 //! not one per account. Startup applies it to the account it lands on, even
 //! when the remembered account fell back.
 //!
-//! Pith reads the file once, at startup. A change in another instance reaches
+//! Drinky reads the file once, at startup. A change in another instance reaches
 //! only the next start, never a running session. A write happens when the user
 //! changes the account, the model, or the effort level. The write goes through
 //! `ai.json_store`, so it is atomic, owner-only, and preserves every other
@@ -55,10 +55,10 @@ start: Start,
 /// An entry also carries no account overlay, because an overlay belongs to the
 /// account that applies it, not to the file.
 models: std.EnumArray(ai.llm.Account, ?ai.models.Model),
-/// The choices Pith seeded or recorded last, so an unchanged choice writes
+/// The choices Drinky seeded or recorded last, so an unchanged choice writes
 /// nothing. Null until the first `seed` or `record`.
 saved: ?Saved,
-/// True while Pith still writes the file. A persistent failure clears it.
+/// True while Drinky still writes the file. A persistent failure clears it.
 save_enabled: bool,
 /// Whether temporary lock contention left a snapshot to save later.
 save_pending: bool,
@@ -73,7 +73,7 @@ pub const Start = struct {
     effort: ?ai.llm.Effort = null,
 };
 
-/// The choices Pith seeded or recorded last. `model` is an owned copy of the
+/// The choices Drinky seeded or recorded last. `model` is an owned copy of the
 /// model name.
 const Saved = struct {
     account: ai.llm.Account,
@@ -112,7 +112,7 @@ const Entry = struct {
 pub const OpenOptions = struct {
     working_directory: []const u8,
     home: []const u8,
-    /// The project key: the Git root, or the working directory when Pith found
+    /// The project key: the Git root, or the working directory when Drinky found
     /// no Git root.
     project: []const u8,
 };
@@ -124,7 +124,7 @@ pub const OpenOptions = struct {
 /// years of directories. It is not a budget, so it sits far above normal use. A
 /// project costs its path plus about 100 bytes, and about 45 more for each
 /// account that ran a model there. That puts the whole file near 350 KB in the
-/// worst case. Pith reads it once and rewrites it only on a change, so that size
+/// worst case. Drinky reads it once and rewrites it only on a change, so that size
 /// costs nothing a user can feel. A cap this loose also keeps the drop rule out
 /// of the way: a project a user opens daily but never reconfigures needs 1000
 /// other projects to change before it falls out.
@@ -158,11 +158,11 @@ pub fn inert(gpa: std.mem.Allocator, io: std.Io) State {
 /// the path allocation can fail the open. The read itself never fails: an
 /// absent, unreadable, or malformed file reads as nothing remembered, and so
 /// does a failed allocation inside the read. Machine-local state never stops
-/// pith.
+/// Drinky.
 pub fn open(gpa: std.mem.Allocator, io: std.Io, options: *const OpenOptions) !State {
     const directory = try std.fs.path.resolve(
         gpa,
-        &.{ options.working_directory, options.home, ".pith" },
+        &.{ options.working_directory, options.home, ".drinky" },
     );
     defer gpa.free(directory);
     const path = try std.fs.path.join(gpa, &.{ directory, "state.json" });
@@ -332,7 +332,7 @@ fn openForTest(gpa: std.mem.Allocator, io: std.Io, home: []const u8) !State {
 /// Write `data` as the `state.json` of a test temporary home directory. The
 /// `App` tests build the same fixture, so this is shared, not private.
 pub fn writeForTest(io: std.Io, tmp: *const std.testing.TmpDir, data: []const u8) !void {
-    var directory = try tmp.dir.createDirPathOpen(io, ".pith", .{});
+    var directory = try tmp.dir.createDirPathOpen(io, ".drinky", .{});
     defer directory.close(io);
     try directory.writeFile(io, .{ .sub_path = "state.json", .data = data });
 }
@@ -350,7 +350,7 @@ test "an absent file remembers nothing" {
     try std.testing.expect(state.start.account == null);
     try std.testing.expect(state.start.effort == null);
     for (state.models.values) |maybe_model| try std.testing.expect(maybe_model == null);
-    try std.testing.expect(std.mem.endsWith(u8, state.path, "/.pith/state.json"));
+    try std.testing.expect(std.mem.endsWith(u8, state.path, "/.drinky/state.json"));
 }
 
 test "a stored entry reads back the account, the effort level, and one model per account" {

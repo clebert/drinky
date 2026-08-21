@@ -1,6 +1,6 @@
 //! The credential lifecycle for the ChatGPT-subscription (Codex) account: the
 //! shared `auth` lifecycle instantiated over `oauth`'s protocol for the
-//! `"openai_subscription"` entry in `<home>/.pith/auth.json`.
+//! `"openai_subscription"` entry in `<home>/.drinky/auth.json`.
 
 const std = @import("std");
 
@@ -25,7 +25,7 @@ tokens: ?oauth.Tokens,
 save_pending: bool = false,
 
 pub fn init(gpa: std.mem.Allocator, io: std.Io, home: []const u8, timeouts: net.Timeouts) !Auth {
-    const path = try std.fs.path.join(gpa, &.{ home, ".pith", "auth.json" });
+    const path = try std.fs.path.join(gpa, &.{ home, ".drinky", "auth.json" });
     return .{ .gpa = gpa, .io = io, .timeouts = timeouts, .path = path, .tokens = null };
 }
 

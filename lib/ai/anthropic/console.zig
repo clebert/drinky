@@ -2,7 +2,7 @@
 //! It uses the subscription PKCE flow on the platform host.
 //! The exchange trades the code for a short-lived access token.
 //! This token then mints a long-lived API key.
-//! Pith stores only the key and sends it as `x-api-key`.
+//! Drinky stores only the key and sends it as `x-api-key`.
 //! The account needs no token refresh.
 //! The key needs the Claude Code system prompt to reach every model.
 

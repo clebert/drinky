@@ -11,7 +11,7 @@ const SkillGuard = @import("SkillGuard.zig");
 gpa: std.mem.Allocator,
 io: std.Io,
 /// Bounds the bash tool: how much of a command's output survives, and how long
-/// a command runs before Pith kills it. The defaults hold when no config
+/// a command runs before Drinky kills it. The defaults hold when no config
 /// overrides them.
 bash: Bash = .{},
 /// The document that describes every config key, which the `describe_config`

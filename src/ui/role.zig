@@ -3,11 +3,11 @@
 //! own. The `colors` preview page is the one exception: it samples the raw
 //! ANSI slots so the user can judge the theme of the terminal.
 //!
-//! Pith names no RGB value. A role emits the ANSI slots 0 to 7 and the default
+//! Drinky names no RGB value. A role emits the ANSI slots 0 to 7 and the default
 //! colors alone, so the theme of the terminal decides every value. The bright
 //! slots 8 to 15 stay out of the interface, because they do not read well in
 //! every theme. Only the preview page samples them. The terminal can select
-//! values for a dark or light theme. Pith needs no palette or color
+//! values for a dark or light theme. Drinky needs no palette or color
 //! configuration. Plain text writes no bytes, so it keeps the terminal
 //! foreground. The muted role uses faint intensity with the default foreground.
 //! The terminal derives this secondary tone from its own theme. A terminal that
@@ -52,7 +52,7 @@ pub const Name = enum {
     @"error",
     /// A user message box.
     user,
-    /// A line that Pith wrote about the conversation of the user, such as the
+    /// A line that Drinky wrote about the conversation of the user, such as the
     /// head of a loaded skill. It takes the color of a user message without the
     /// swap, so no message can look like one.
     user_note,
@@ -144,7 +144,7 @@ test "the role map pins the SGR sequence for each role" {
         // Each message box pairs one palette color with reverse video, so the
         // fill takes the color and the text keeps the terminal background.
         .{ .name = .user, .sequence = "\x1b[35;7m" },
-        // A note of Pith about that conversation keeps the color and drops the
+        // A note of Drinky about that conversation keeps the color and drops the
         // swap, so a message box and a note never read alike.
         .{ .name = .user_note, .sequence = "\x1b[35m" },
         // The input frame uses the user's foreground slot without the swap.

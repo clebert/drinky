@@ -57,7 +57,7 @@ pub fn select(context: *Context, index: usize) !Context.Outcome {
     return Context.Outcome.reportEvent(
         gpa,
         .information,
-        "Pith set the effort level to {s}.",
+        "Drinky set the effort level to {s}.",
         .{@tagName(level)},
     );
 }

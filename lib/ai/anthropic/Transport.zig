@@ -203,7 +203,7 @@ pub const Stream = struct {
     ///
     /// A frame that names no block at all is absent correlation, and it stays
     /// with `invalid` here while the OpenAI side keeps the reply. The delta of a
-    /// block becomes the committed content, so a delta Pith cannot place leaves
+    /// block becomes the committed content, so a delta Drinky cannot place leaves
     /// the reply short. An OpenAI arguments delta only paints a box, and its
     /// done frame carries the call.
     fn uncorrelated(self: *Stream) sse.Decoded {

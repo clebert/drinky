@@ -51,7 +51,7 @@ pub const RemoveCondition = struct {
 };
 
 /// Open the store file at `path`, or null when it does not exist. A present
-/// file that Pith cannot parse as a JSON object is `error.CorruptStore`, the
+/// file that Drinky cannot parse as a JSON object is `error.CorruptStore`, the
 /// same failure a rewrite reports. Caller frees a non-null result with
 /// `File.deinit`.
 pub fn open(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !?File {
@@ -98,7 +98,7 @@ pub fn remove(
 }
 
 /// Remove one entry only when its string field still has the expected value.
-/// Return true only when the matching entry was removed. Every Pith writer
+/// Return true only when the matching entry was removed. Every Drinky writer
 /// holds the same lock across the comparison and rewrite.
 pub fn removeMatchingString(
     gpa: std.mem.Allocator,
@@ -120,7 +120,7 @@ pub fn removeMatchingString(
     return true;
 }
 
-/// Load, merge, and replace while every Pith writer holds one stable lock file.
+/// Load, merge, and replace while every Drinky writer holds one stable lock file.
 fn rewrite(
     gpa: std.mem.Allocator,
     io: std.Io,

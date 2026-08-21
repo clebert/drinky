@@ -45,7 +45,7 @@ pub fn select(context: *Context, index: usize) !Context.Outcome {
     return Context.Outcome.reportNotice(
         gpa,
         .information,
-        "Set {s} in the environment. Restart Pith to use {s}.",
+        "Set {s} in the environment. Restart Drinky to use {s}.",
         .{ account.apiKeyEnv().?, account.label() },
     );
 }

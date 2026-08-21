@@ -72,7 +72,7 @@ default_models: Config.DefaultModels,
 /// whenever the account, the model, or the effort level changes.
 state: State,
 /// The working directory the status line shows, with the home directory
-/// abbreviated to `~`. Owned, and fixed for the session, because pith never
+/// abbreviated to `~`. Owned, and fixed for the session, because Drinky never
 /// changes its working directory.
 directory_label: []const u8,
 /// The canonical working directory and home directory of this session. Both
@@ -290,7 +290,7 @@ const TurnHandler = struct {
         self.served_model_reported_length = key_length;
     }
 
-    /// Report that Pith sent one skill file into the turn. The transcript shows
+    /// Report that Drinky sent one skill file into the turn. The transcript shows
     /// the head alone, so the user sees which skill entered the conversation and
     /// where it comes from.
     pub fn onSkillLoaded(self: *TurnHandler, skill: []const u8, source: []const u8) !void {
@@ -359,19 +359,19 @@ const OauthPrompt = struct {
     writer: *std.Io.Writer,
 
     pub fn showAuthorization(self: *OauthPrompt, url: []const u8) !void {
-        try self.writer.writeAll("Open this URL to authorize Pith:\n\n");
+        try self.writer.writeAll("Open this URL to authorize Drinky:\n\n");
         try self.writeText(url);
-        try self.writer.writeAll("\n\nPith waits for the response from the browser.\n");
+        try self.writer.writeAll("\n\nDrinky waits for the response from the browser.\n");
         try self.writer.flush();
     }
 
     pub fn showBrowserLaunchFailed(self: *OauthPrompt) !void {
-        try self.writer.writeAll("Pith could not open the browser. Open the URL above.\n");
+        try self.writer.writeAll("Drinky could not open the browser. Open the URL above.\n");
         try self.writer.flush();
     }
 
     pub fn showAuthorized(self: *OauthPrompt, path: []const u8) !void {
-        try self.writer.writeAll("Pith received authorization. Pith saved the credentials to ");
+        try self.writer.writeAll("Drinky received authorization. Drinky saved the credentials to ");
         try self.writeText(path);
         try self.writer.writeAll(".\n");
         try self.writer.flush();
@@ -379,11 +379,11 @@ const OauthPrompt = struct {
 
     pub fn showSaveFailed(self: *OauthPrompt, path: []const u8, error_name: []const u8) !void {
         try self.writer.writeAll(
-            "Pith received authorization. Pith could not save the credentials to ",
+            "Drinky received authorization. Drinky could not save the credentials to ",
         );
         try self.writeText(path);
         try self.writer.print(
-            " because of error {s}. The sign-in stays active until Pith exits.\n",
+            " because of error {s}. The sign-in stays active until Drinky exits.\n",
             .{error_name},
         );
         try self.writer.flush();
@@ -438,7 +438,7 @@ fn validateWorkingDirectory(gpa: std.mem.Allocator, path: []const u8) !void {
     const safe_path = try ai.instructions.diagnosticAlloc(gpa, path);
     defer gpa.free(safe_path);
     std.debug.print(
-        "Pith cannot use the working directory {s} because its path is not valid UTF-8.\n",
+        "Drinky cannot use the working directory {s} because its path is not valid UTF-8.\n",
         .{safe_path},
     );
     return error.WorkingDirectoryNotUtf8;
@@ -476,7 +476,7 @@ fn directoryLabel(
 
 /// The canonical home directory. The label compares it with the canonical
 /// working directory, so a symbolic link inside `HOME` must resolve first. A home
-/// directory Pith cannot resolve keeps its lexical path, which then simply does
+/// directory Drinky cannot resolve keeps its lexical path, which then simply does
 /// not match, and the status line shows the whole working directory.
 fn homeDirectory(
     gpa: std.mem.Allocator,
@@ -496,7 +496,7 @@ fn homeDirectory(
 }
 
 /// Read the branch of the project and show it on the status line. Display only:
-/// a repository whose head Pith cannot read leaves the directory standing alone.
+/// a repository whose head Drinky cannot read leaves the directory standing alone.
 fn refreshBranch(self: *App) void {
     const root = self.session.branch_root orelse return self.session.setBranch("");
     var maybe_head = ai.project.head(self.gpa, self.io, root);
@@ -560,7 +560,7 @@ pub fn run(
     defer self.skills.deinit();
     // A configured glob measures against the working directory. The rules must
     // reach the guard before the prompt below names them, so the messages of a
-    // rule that Pith drops wait for the transcript.
+    // rule that Drinky drops wait for the transcript.
     self.skill_guard = .{ .working_directory = cwd };
     var skill_notices: std.ArrayList(ai.instructions.Notice) = .empty;
     defer {
@@ -587,7 +587,7 @@ pub fn run(
 
     // Start on the account this project used last, then on the first
     // authenticated account, or signed out (no client) when none is. The login
-    // picker opens below to sign in. Pith resolves the model for the chosen or
+    // picker opens below to sign in. Drinky resolves the model for the chosen or
     // placeholder account either way, so the status line has one to show.
     const active = self.startAccount();
     const start_account = active orelse .anthropic_subscription;
@@ -632,26 +632,26 @@ pub fn run(
     // a wrong-vendor entry does not disappear silently.
     for (config.dropped_models) |dropped| try self.recordEvent(
         .failure,
-        "Pith ignored the configured default model \"{s}\" because the model is not valid for " ++
-            "the {s} account. Pith uses the model \"{s}\" for this account.",
+        "Drinky ignored the configured default model \"{s}\" because the model is not valid for " ++
+            "the {s} account. Drinky uses the model \"{s}\" for this account.",
         .{ dropped.name, dropped.account.label(), self.defaultModel(dropped.account).name },
     );
     if (config.dropped_effort) |dropped| try self.recordEvent(
         .failure,
-        "Pith ignored the configured default effort level \"{s}\" because Pith does not know " ++
-            "that level. Pith uses the effort level \"{s}\".",
+        "Drinky ignored the configured default effort level \"{s}\" because Drinky does not " ++
+            "know that level. Drinky uses the effort level \"{s}\".",
         .{ dropped, @tagName(self.agent.effort) },
     );
     if (config.dropped_cost) |dropped| try self.recordEvent(
         .failure,
-        "Pith ignored the configured cache warning cost \"{s}\" because the value must be a " ++
-            "finite number of zero or more. Pith warns about every stale prompt cache.",
+        "Drinky ignored the configured cache warning cost \"{s}\" because the value must be a " ++
+            "finite number of zero or more. Drinky warns about every stale prompt cache.",
         .{dropped},
     );
     if (config.dropped_bash_timeout_ms) |dropped| try self.recordEvent(
         .failure,
-        "Pith ignored the configured command timeout {d} because the value must be from {d} " ++
-            "to {d} milliseconds. Pith uses the default timeout of {d} milliseconds.",
+        "Drinky ignored the configured command timeout {d} because the value must be from {d} " ++
+            "to {d} milliseconds. Drinky uses the default timeout of {d} milliseconds.",
         .{
             dropped,
             ai.tool.Context.Bash.timeout_ms_min,
@@ -661,7 +661,7 @@ pub fn run(
     );
     if (config.dropped_deny_empty) try self.recordEvent(
         .failure,
-        "Pith ignored an empty bash deny pattern because the pattern must hold text.",
+        "Drinky ignored an empty bash deny pattern because the pattern must hold text.",
         .{},
     );
     try self.reportNotices(skill_notices.items);
@@ -669,12 +669,12 @@ pub fn run(
     // file. Report it, because a typo otherwise looks like an applied setting.
     for (config.unknown_keys) |key| try self.recordEvent(
         .failure,
-        "Pith ignored the unknown configuration key \"{s}\" in {s}.",
+        "Drinky ignored the unknown configuration key \"{s}\" in {s}.",
         .{ key, config.path },
     );
     if (config.unknown_keys_omitted) try self.recordEvent(
         .failure,
-        "Pith omitted the remaining unknown configuration keys in {s}.",
+        "Drinky omitted the remaining unknown configuration keys in {s}.",
         .{config.path},
     );
     try self.reportSources(&.{
@@ -928,7 +928,7 @@ fn armRetry(self: *App, result: *const WorkerResult, attempt: bool) !void {
     if (!committed and !attempt) return;
     const failure = try self.gpa.dupe(
         u8,
-        result.error_text orelse "Pith could not complete the turn.",
+        result.error_text orelse "Drinky could not complete the turn.",
     );
     self.setRetry(.{ .failure = failure });
 }
@@ -1146,21 +1146,21 @@ fn readInput(self: *App) void {
 /// and the caller wraps its error name.
 fn turnFailureText(err: anyerror) ?[]const u8 {
     return switch (err) {
-        error.UnsupportedReply => "Pith cannot keep the response because the model returned " ++
+        error.UnsupportedReply => "Drinky cannot keep the response because the model returned " ++
             "a refusal, a pause, or an unsupported result.",
         error.EmptyReply => "The model returned an empty response.",
-        error.IncompleteReply => "Pith did not receive the complete model response.",
-        error.UncorrelatedReply => "Pith could not match a streamed part of the response to " ++
+        error.IncompleteReply => "Drinky did not receive the complete model response.",
+        error.UncorrelatedReply => "Drinky could not match a streamed part of the response to " ++
             "the item it belongs to. The provider changed the order of its stream.",
         error.TooManyToolRounds => "The turn reached the limit for tool rounds.",
-        error.CredentialReplaced => "Pith found a replacement credential for this account. " ++
-            "Pith removed the prior account evidence. Try the turn again.",
+        error.CredentialReplaced => "Drinky found a replacement credential for this account. " ++
+            "Drinky removed the prior account evidence. Try the turn again.",
         error.TokenGrantRejected => "The provider rejected the refresh credential.",
         error.TokenRequestFailed => "The provider did not accept the token request. " ++
-            "Pith kept this account signed in.",
+            "Drinky kept this account signed in.",
         error.TokenServiceUnavailable => "The provider credential service is not available. " ++
             "Try the turn again.",
-        error.StoreBusy => "Another Pith instance is writing the credential file. " ++
+        error.StoreBusy => "Another Drinky instance is writing the credential file. " ++
             "Try the turn again.",
         else => null,
     };
@@ -1195,7 +1195,7 @@ fn runTurnWorker(self: *App, text: []const u8, generation: u64) WorkerResult {
             else
                 std.fmt.allocPrint(
                     self.gpa,
-                    "Pith could not complete the turn because of error {s}.",
+                    "Drinky could not complete the turn because of error {s}.",
                     .{@errorName(failure)},
                 ) catch null;
     }
@@ -1219,7 +1219,7 @@ fn activeAccount(self: *const App) ?ai.llm.Account {
     return client.account();
 }
 
-/// Whether an account is active. Pith refuses normal messages until a login.
+/// Whether an account is active. Drinky refuses normal messages until a login.
 fn signedIn(self: *const App) bool {
     return self.activeAccount() != null;
 }
@@ -1270,7 +1270,7 @@ fn defaultModel(self: *const App, account: ai.llm.Account) ai.models.Model {
 /// cancel, a turn cancel — ends the chunk, and the keys behind it are dropped.
 /// Those keys are the rest of one exit attempt, such as the Esc and Ctrl+D of
 /// `\x1b\x04` from a terminal without the Kitty protocol. The prompt must never
-/// act on them, because Ctrl+D there quits pith and Ctrl+C there clears the draft
+/// act on them, because Ctrl+D there quits Drinky and Ctrl+C there clears the draft
 /// the closed layer hid. Only an exit key drains, so a picker confirmation still
 /// keeps the characters typed behind it.
 fn handleKeys(self: *App, bytes: []const u8) !void {
@@ -1676,7 +1676,7 @@ fn nowNs(self: *App) i96 {
 }
 
 /// Enter while idle: run a command line locally, or start a turn over the prompt.
-/// Every line that starts with a slash is a command line, so Pith reads it locally
+/// Every line that starts with a slash is a command line, so Drinky reads it locally
 /// first. A line the registry refuses stays in the editor and arms one Enter, which
 /// sends that line to the model as typed.
 fn submit(self: *App) !void {
@@ -1861,7 +1861,7 @@ fn startSkillTurn(self: *App, prompt: *const ai.command.Outcome.Prompt) !usize {
 }
 
 /// Record what one skill invocation sends. The request is one user message, and
-/// the transcript splits it into what Pith sent and what the user typed: the
+/// the transcript splits it into what Drinky sent and what the user typed: the
 /// head that names the skill and its file, then the task in a user box below
 /// it. The expanded file stays out of the transcript, because the head reports
 /// where it comes from.
@@ -2039,7 +2039,7 @@ fn applyOutcome(self: *App, outcome: ai.command.Outcome) !void {
             self.adopt(account);
             try self.recordEvent(
                 .information,
-                "Pith now uses {s} with {s}.",
+                "Drinky now uses {s} with {s}.",
                 .{ self.agent.model.name, account.label() },
             );
         },
@@ -2074,19 +2074,19 @@ fn recordState(self: *App) !void {
     self.state.record(account, &self.agent.model, self.agent.effort) catch |err| switch (err) {
         error.StoreBusy => try self.recordEvent(
             .failure,
-            "Pith could not save the choices of this project because another Pith instance " ++
-                "is writing the state file. Pith tries again at the next save.",
+            "Drinky could not save the choices of this project because another Drinky instance " ++
+                "is writing the state file. Drinky tries again at the next save.",
             .{},
         ),
         error.CorruptStore => try self.recordEvent(
             .failure,
-            "Pith stopped saving the choices of this project because Pith cannot read the " ++
+            "Drinky stopped saving the choices of this project because Drinky cannot read the " ++
                 "file {s} as a JSON object. Delete that file to let the next start save again.",
             .{self.state.path},
         ),
         else => try self.recordEvent(
             .failure,
-            "Pith stopped saving the choices of this project to {s} because of error {s}.",
+            "Drinky stopped saving the choices of this project to {s} because of error {s}.",
             .{ self.state.path, @errorName(err) },
         ),
     };
@@ -2121,15 +2121,15 @@ fn loginAccount(self: *App, account: ai.llm.Account) !void {
     }
     try self.recordEvent(
         .information,
-        "Pith signed in to {s} and selected {s}.",
+        "Drinky signed in to {s} and selected {s}.",
         .{ account.label(), self.agent.model.name },
     );
     switch (login) {
         .saved => {},
         .memory_only => |failure| try self.recordEvent(
             .failure,
-            "Pith could not save the credentials for {s} to {s} because of error {s}. " ++
-                "The sign-in stays active until Pith exits.",
+            "Drinky could not save the credentials for {s} to {s} because of error {s}. " ++
+                "The sign-in stays active until Drinky exits.",
             .{ account.label(), failure.path, @errorName(failure.save_error) },
         ),
     }
@@ -2138,11 +2138,11 @@ fn loginAccount(self: *App, account: ai.llm.Account) !void {
 fn reportLoginFailure(self: *App, login_error: anyerror) !void {
     const message = switch (login_error) {
         error.Canceled => return error.Canceled,
-        error.CallbackTimeout => "Pith stopped the sign-in because the browser did not " ++
+        error.CallbackTimeout => "Drinky stopped the sign-in because the browser did not " ++
             "respond in time.",
-        error.CallbackRequestTooLarge => "Pith could not sign in because the browser " ++
+        error.CallbackRequestTooLarge => "Drinky could not sign in because the browser " ++
             "response was too large.",
-        error.CallbackTimeoutUnavailable => "Pith could not sign in because it could not " ++
+        error.CallbackTimeoutUnavailable => "Drinky could not sign in because it could not " ++
             "set a browser time limit.",
         // The exchange rejects an authorization that expired or was used before.
         error.TokenGrantRejected => "The provider rejected the authorization. " ++
@@ -2151,7 +2151,7 @@ fn reportLoginFailure(self: *App, login_error: anyerror) !void {
             "Try the sign-in again later.",
         else => return self.reportNotice(
             .failure,
-            "Pith could not sign in because of error {s}.",
+            "Drinky could not sign in because of error {s}.",
             .{@errorName(login_error)},
         ),
     };
@@ -2188,7 +2188,7 @@ fn rejectCredential(self: *App, account: ai.llm.Account) !void {
         self.adopt(account);
         try self.recordEvent(
             .information,
-            "Pith reloaded the refresh credential that another Pith instance saved. " ++
+            "Drinky reloaded the refresh credential that another Drinky instance saved. " ++
                 "Try the turn again.",
             .{},
         );
@@ -2200,19 +2200,19 @@ fn rejectCredential(self: *App, account: ai.llm.Account) !void {
 
     if (maybe_removal_error) |removal_error| try self.recordEvent(
         .failure,
-        "Pith could not remove the rejected credential for {s} because of error {s}.",
+        "Drinky could not remove the rejected credential for {s} because of error {s}.",
         .{ account.label(), @errorName(removal_error) },
     );
     if (maybe_next) |next| {
         try self.recordEvent(
             .information,
-            "Pith signed out of {s}. Pith now uses {s} with {s}.",
+            "Drinky signed out of {s}. Drinky now uses {s} with {s}.",
             .{ account.label(), self.agent.model.name, next.label() },
         );
     } else {
         try self.recordEvent(
             .information,
-            "Pith signed out of {s}. Select an account to sign in.",
+            "Drinky signed out of {s}. Select an account to sign in.",
             .{account.label()},
         );
         try self.openLoginPicker();
@@ -2242,18 +2242,18 @@ fn logoutAccount(self: *App, account: ai.llm.Account) !void {
     self.accounts.logout(account) catch |err| {
         return self.reportNotice(
             .failure,
-            "Pith could not sign out because of error {s}.",
+            "Drinky could not sign out because of error {s}.",
             .{@errorName(err)},
         );
     };
     self.agent.dropAccountEvidence(account);
     if (!was_active)
-        return self.recordEvent(.information, "Pith signed out of {s}.", .{account.label()});
+        return self.recordEvent(.information, "Drinky signed out of {s}.", .{account.label()});
     if (self.accounts.firstAuthenticated()) |next| {
         self.adopt(next);
         return self.recordEvent(
             .information,
-            "Pith signed out of {s}. Pith now uses {s} with {s}.",
+            "Drinky signed out of {s}. Drinky now uses {s} with {s}.",
             .{ account.label(), self.agent.model.name, next.label() },
         );
     }
@@ -2262,7 +2262,7 @@ fn logoutAccount(self: *App, account: ai.llm.Account) !void {
     self.agent.signOut();
     try self.recordEvent(
         .information,
-        "Pith signed out of {s}. Select an account to sign in.",
+        "Drinky signed out of {s}. Select an account to sign in.",
         .{account.label()},
     );
     // Route through the session. A route through `applyOutcome` cycles the
@@ -2278,7 +2278,7 @@ fn adopt(self: *App, account: ai.llm.Account) void {
 }
 
 /// The shared refusal path for a command that the active state does not allow.
-/// Pith keeps the command text in the editor, sends nothing to the model, and
+/// Drinky keeps the command text in the editor, sends nothing to the model, and
 /// opens no picker. The notice names the command and the restriction, and it
 /// warns rather than reports a failure, because a later Enter still runs the line.
 fn refuseCommand(self: *App, name: []const u8, restriction: []const u8) !void {
@@ -2298,7 +2298,7 @@ fn reportNotice(
     );
 }
 
-/// Report one count line for the guidance that pith holds, then what each source
+/// Report one count line for the guidance that Drinky holds, then what each source
 /// skipped. The line uses dense count fragments so it fits a narrow window,
 /// because a normal load has nothing the user must act on. `/system` shows the
 /// path of every counted file. A count of zero stays out of the line, so a run
@@ -2315,7 +2315,7 @@ fn reportSources(self: *App, sources: *const Sources) !void {
         if (project_count > 0) try line.writer.print(" {d} project", .{project_count});
     }
     // The catalog counts the skills the model can see, which is what `/system`
-    // shows. Pith only finds a skill here and advertises its name and its
+    // shows. Drinky only finds a skill here and advertises its name and its
     // description. The instructions stay on disk until the skill runs. A
     // project skill that replaces a user skill of the same name is the
     // documented precedence, and a required skill that this project does not
@@ -2377,7 +2377,7 @@ fn resolveRequiredSkills(
                 try self.appendNotice(
                     notices,
                     .failure,
-                    "Pith used only the first {d} required skills in {s}.",
+                    "Drinky used only the first {d} required skills in {s}.",
                     .{ ai.tool.SkillGuard.rules_max, config.path },
                 );
                 break;
@@ -2429,7 +2429,7 @@ fn recordEvent(
 
 /// Keys on a full-window page. Esc is the documented way out. Ctrl+C and Ctrl+D
 /// close it too, so an exit attempt always works in a terminal that drops the Esc
-/// report. A page is read-only, so no key on it quits pith.
+/// report. A page is read-only, so no key on it quits Drinky.
 fn handlePageKey(self: *App, event: *const terminal.Input.Key) !void {
     const page = &self.session.mode.viewing;
     const size: terminal.View.Size = .{
@@ -2539,21 +2539,21 @@ test "OAuth prompts render runtime fields as inert text" {
 
     try prompt.showAuthorization("https://example.test/\x1b]52;c;b3duZWQ=\x07");
     try prompt.showBrowserLaunchFailed();
-    try prompt.showAuthorized("/home/\x1b[2J/.pith/auth.json");
-    try prompt.showSaveFailed("/home/\x1b[2J/.pith/auth.json", "AccessDenied");
+    try prompt.showAuthorized("/home/\x1b[2J/.drinky/auth.json");
+    try prompt.showSaveFailed("/home/\x1b[2J/.drinky/auth.json", "AccessDenied");
 
     const written = out.written();
     const url_inert = "https://example.test/\u{200B}�\u{200B}]52;c;b3duZWQ=\u{200B}�\u{200B}";
     try std.testing.expect(std.mem.indexOf(u8, written, "\x1b]52;c;b3duZWQ=\x07") == null);
     try std.testing.expect(std.mem.indexOf(u8, written, "\x1b[2J") == null);
     try std.testing.expect(std.mem.indexOf(u8, written, url_inert) != null);
-    const path_inert = "/home/\u{200B}�\u{200B}[2J/.pith/auth.json";
+    const path_inert = "/home/\u{200B}�\u{200B}[2J/.drinky/auth.json";
     try std.testing.expect(std.mem.indexOf(u8, written, path_inert) != null);
 }
 
 test "a turn failure the agent named itself reads as a sentence, not an error name" {
     // A refusal or an unrecognized provider outcome is ordinary model behavior:
-    // Pith must not show the user a bare Zig error name for it.
+    // Drinky must not show the user a bare Zig error name for it.
     for ([_]anyerror{
         error.UnsupportedReply,
         error.EmptyReply,
@@ -2661,7 +2661,7 @@ test "a login the provider refused reads as a sentence, not an error name" {
     // A failure with no single cause still wraps its error name in a sentence.
     try app.reportLoginFailure(error.TokenRequestFailed);
     try std.testing.expectEqualStrings(
-        "Pith could not sign in because of error TokenRequestFailed.",
+        "Drinky could not sign in because of error TokenRequestFailed.",
         app.session.notice.?.content,
     );
 }
@@ -2679,15 +2679,15 @@ test "OAuth callback bounds have friendly failure notices" {
     const cases = [_]struct { anyerror, []const u8 }{
         .{
             error.CallbackTimeout,
-            "Pith stopped the sign-in because the browser did not respond in time.",
+            "Drinky stopped the sign-in because the browser did not respond in time.",
         },
         .{
             error.CallbackRequestTooLarge,
-            "Pith could not sign in because the browser response was too large.",
+            "Drinky could not sign in because the browser response was too large.",
         },
         .{
             error.CallbackTimeoutUnavailable,
-            "Pith could not sign in because it could not set a browser time limit.",
+            "Drinky could not sign in because it could not set a browser time limit.",
         },
     };
     for (cases) |case| {
@@ -2740,7 +2740,7 @@ test "turn producers keep their captured generation" {
     try std.testing.expectEqual(generation, result.generation);
     try std.testing.expect(result.terminal_queued);
     try std.testing.expectEqualStrings(
-        "Pith could not complete the turn because of error SignedOut.",
+        "Drinky could not complete the turn because of error SignedOut.",
         result.error_text.?,
     );
 
@@ -2962,7 +2962,7 @@ test "esc and ctrl+d cancel a turn and keep the draft" {
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
     defer app.session.deinit();
 
-    // A cancel backs out of the turn alone: the draft stays, and pith runs on, so
+    // A cancel backs out of the turn alone: the draft stays, and Drinky runs on, so
     // no press here can discard text. Esc with a draft warns first, so its cancel
     // takes a second press. Ctrl+D is a decision and cancels at once.
     for ([_]terminal.Input.Key{ .escape, .{ .ctrl = 'd' } }) |key| {
@@ -4086,7 +4086,7 @@ test "mid-turn Enter queues a message but refuses a slash line or a blank line" 
     try app.submitSteering();
     try std.testing.expectEqualStrings("/nope", app.session.editor.visible());
     try std.testing.expectEqualStrings(
-        "Enter: Queue as a message · Pith does not recognize the command /nope.",
+        "Enter: Queue as a message · Drinky does not recognize the command /nope.",
         app.session.notice.?.content,
     );
 
@@ -4390,7 +4390,7 @@ test "a turn cancel drops the rest of an exit attempt in one chunk" {
     app.session.beginTurn(1);
     try spawnCanceledTurn(&app);
 
-    // The Escape cancels the turn. The Ctrl+D behind it must not quit pith at the
+    // The Escape cancels the turn. The Ctrl+D behind it must not quit Drinky at the
     // prompt the cancel returns to.
     try app.handleKeys("\x1b\x04");
     try std.testing.expect(app.session.mode == .prompt);
@@ -4567,7 +4567,7 @@ test "/system opens the composed prompt alone and escape restores the conversati
     try std.testing.expect(std.mem.indexOf(u8, reopen_bytes, "M: Source") != null);
     try std.testing.expect(std.mem.indexOf(u8, reopen_bytes, "Core") != null);
     try std.testing.expect(std.mem.indexOf(u8, reopen_bytes, "# Core") == null);
-    // Ctrl+C closes a page and keeps pith running. A page holds no draft to clear.
+    // Ctrl+C closes a page and keeps Drinky running. A page holds no draft to clear.
     try app.handleKey(&.{ .ctrl = 'c' });
     try std.testing.expect(app.session.mode == .prompt);
     try std.testing.expect(app.running);
@@ -4621,7 +4621,7 @@ test "/colors opens the color preview page and ctrl+d restores the conversation"
     try app.handleKey(&.page_down);
     try std.testing.expect(app.session.mode.viewing.scroll > 0);
 
-    // Ctrl+D closes the page and keeps pith running, so a terminal that drops the
+    // Ctrl+D closes the page and keeps Drinky running, so a terminal that drops the
     // Esc report still has a way out.
     try app.handleKey(&.{ .ctrl = 'd' });
     try std.testing.expect(app.session.mode == .prompt);
@@ -4863,7 +4863,7 @@ test "a remembered account does not resume when no account is authenticated" {
     try std.testing.expect(app.startAccount() == null);
 }
 
-// The logout of the last account leaves no one to adopt. Pith must sign out and
+// The logout of the last account leaves no one to adopt. Drinky must sign out and
 // open the login picker itself, so the session never rests signed out with no way
 // back in.
 test "the logout of the last account signs out and opens the login picker" {
@@ -4877,10 +4877,10 @@ test "the logout of the last account signs out and opens the login picker" {
     defer gpa.free(home);
 
     // One signed-in subscription and no environment key: the only account there is.
-    var store = try tmp.dir.createDirPathOpen(io, ".pith", .{});
+    var store = try tmp.dir.createDirPathOpen(io, ".drinky", .{});
     store.close(io);
     try tmp.dir.writeFile(io, .{
-        .sub_path = ".pith/auth.json",
+        .sub_path = ".drinky/auth.json",
         .data =
         \\{ "anthropic_subscription":
         \\    { "access": "a", "refresh": "r", "expires_ms": 4102444800000 } }
@@ -4910,7 +4910,7 @@ test "the logout of the last account signs out and opens the login picker" {
 
     // The event names the way back in, and the picker it names is open.
     try std.testing.expectEqualStrings(
-        "Pith signed out of Anthropic Subscription. Select an account to sign in.",
+        "Drinky signed out of Anthropic Subscription. Select an account to sign in.",
         app.session.transcript.blocks()[0].event.text.items,
     );
     try std.testing.expect(app.session.mode == .picking);
@@ -4930,10 +4930,10 @@ test "a principal replacement drops old evidence before the restored turn" {
     const home = try tmpPath(gpa, io, &tmp, "");
     defer gpa.free(home);
 
-    var store = try tmp.dir.createDirPathOpen(io, ".pith", .{});
+    var store = try tmp.dir.createDirPathOpen(io, ".drinky", .{});
     store.close(io);
     try tmp.dir.writeFile(io, .{
-        .sub_path = ".pith/auth.json",
+        .sub_path = ".drinky/auth.json",
         .data =
         \\{ "anthropic_subscription":
         \\    { "access": "replacement", "refresh": "replacement",
@@ -4998,10 +4998,10 @@ test "token request failures keep the credential before a grant rejection remove
     const home = try tmpPath(gpa, io, &tmp, "");
     defer gpa.free(home);
 
-    var store = try tmp.dir.createDirPathOpen(io, ".pith", .{});
+    var store = try tmp.dir.createDirPathOpen(io, ".drinky", .{});
     store.close(io);
     try tmp.dir.writeFile(io, .{
-        .sub_path = ".pith/auth.json",
+        .sub_path = ".drinky/auth.json",
         .data =
         \\{ "anthropic_subscription":
         \\    { "access": "a", "refresh": "r", "expires_ms": 4102444800000 } }
@@ -5084,7 +5084,7 @@ test "token request failures keep the credential before a grant rejection remove
     ) != null);
     try std.testing.expect(std.mem.indexOf(u8, blocks[2].event.text.items, "/login") == null);
     try std.testing.expectEqualStrings(
-        "Pith signed out of Anthropic Subscription. Select an account to sign in.",
+        "Drinky signed out of Anthropic Subscription. Select an account to sign in.",
         blocks[3].event.text.items,
     );
     try std.testing.expect(app.session.mode == .picking);
@@ -5104,10 +5104,10 @@ test "a replacement saved before invalidation keeps the account active" {
     const home = try tmpPath(gpa, io, &tmp, "");
     defer gpa.free(home);
 
-    var store = try tmp.dir.createDirPathOpen(io, ".pith", .{});
+    var store = try tmp.dir.createDirPathOpen(io, ".drinky", .{});
     store.close(io);
     try tmp.dir.writeFile(io, .{
-        .sub_path = ".pith/auth.json",
+        .sub_path = ".drinky/auth.json",
         .data =
         \\{ "anthropic_subscription":
         \\    { "access": "old_access", "refresh": "old_refresh",
@@ -5180,7 +5180,7 @@ test "a replacement saved before invalidation keeps the account active" {
     try std.testing.expectEqual(@as(usize, 2), blocks.len);
     try std.testing.expect(std.mem.indexOf(u8, blocks[0].event.text.items, "signed out") == null);
     try std.testing.expectEqualStrings(
-        "Pith reloaded the refresh credential that another Pith instance saved. " ++
+        "Drinky reloaded the refresh credential that another Drinky instance saved. " ++
             "Try the turn again.",
         blocks[1].event.text.items,
     );
@@ -5196,10 +5196,10 @@ test "a rejected refresh credential hands the session to another account" {
     const home = try tmpPath(gpa, io, &tmp, "");
     defer gpa.free(home);
 
-    var store = try tmp.dir.createDirPathOpen(io, ".pith", .{});
+    var store = try tmp.dir.createDirPathOpen(io, ".drinky", .{});
     store.close(io);
     try tmp.dir.writeFile(io, .{
-        .sub_path = ".pith/auth.json",
+        .sub_path = ".drinky/auth.json",
         .data =
         \\{ "anthropic_subscription":
         \\    { "access": "a", "refresh": "r", "expires_ms": 4102444800000 } }
@@ -5241,8 +5241,8 @@ test "a rejected refresh credential hands the session to another account" {
     try std.testing.expectEqual(@as(usize, 2), blocks.len);
     try std.testing.expect(std.mem.indexOf(u8, blocks[0].event.text.items, "/login") == null);
     try std.testing.expectEqualStrings(
-        "Pith signed out of Anthropic Subscription. " ++
-            "Pith now uses gpt-5.6-sol with OpenAI API.",
+        "Drinky signed out of Anthropic Subscription. " ++
+            "Drinky now uses gpt-5.6-sol with OpenAI API.",
         blocks[1].event.text.items,
     );
 }
@@ -5267,7 +5267,7 @@ test "an invoked skill sends a head that no box holds, and its task in a box" {
     };
     try std.testing.expectEqual(@as(usize, 0), try app.appendSkillPrompt(&prompt));
 
-    // One message on the wire, two blocks on the screen: what Pith sent, and
+    // One message on the wire, two blocks on the screen: what Drinky sent, and
     // what the user typed. A user message can hold no head, so the head is the
     // one part of the pair that the user cannot forge.
     const blocks = app.session.transcript.blocks();
@@ -5485,7 +5485,7 @@ test "an uncommitted skill failure returns its line and arms no retry" {
     defer app.session.deinit();
     defer app.dropRetry();
 
-    // The line the user typed, and the request that Pith expanded from it.
+    // The line the user typed, and the request that Drinky expanded from it.
     try app.session.editor.insert("/skill:demo apply it");
     const prompt: ai.command.Outcome.Prompt = .{
         .name = "demo",
@@ -5882,7 +5882,7 @@ test "a skill line runs while a retry waits and takes the context with it" {
     try app.finishWorkerResult(&result);
 }
 
-// Signed out, Pith must refuse a normal message with a /login prompt rather
+// Signed out, Drinky must refuse a normal message with a /login prompt rather
 // than spawn a turn against no client.
 test "a signed-out submit is refused with a login prompt" {
     const gpa = std.testing.allocator;
@@ -5937,7 +5937,7 @@ test "a refused command line reaches the model on the next Enter" {
     try app.handleKey(&.enter);
     try std.testing.expect(app.session.confirmations.contains(.message));
     try std.testing.expectEqualStrings(
-        "Enter: Send as a message · Pith does not recognize the command /nope.",
+        "Enter: Send as a message · Drinky does not recognize the command /nope.",
         app.session.notice.?.content,
     );
     try std.testing.expectEqualStrings("/nope tell me about this", app.session.editor.visible());
@@ -5996,7 +5996,7 @@ test "a refused command line queues as steering on the next Enter" {
     try app.handleKey(&.enter);
     try std.testing.expect(app.session.confirmations.contains(.message));
     try std.testing.expectEqualStrings(
-        "Enter: Queue as a message · Pith does not recognize the command /nope.",
+        "Enter: Queue as a message · Drinky does not recognize the command /nope.",
         app.session.notice.?.content,
     );
 
@@ -6036,7 +6036,7 @@ test "a turn that ends under the queue offer clears the row too" {
     try app.session.editor.insert("/nope tell me about this");
     try app.handleKey(&.enter);
     try std.testing.expectEqualStrings(
-        "Enter: Queue as a message · Pith does not recognize the command /nope.",
+        "Enter: Queue as a message · Drinky does not recognize the command /nope.",
         app.session.notice.?.content,
     );
 
@@ -6057,7 +6057,7 @@ test "a turn that ends under the queue offer clears the row too" {
         app.session.editor.visible(),
     );
     try std.testing.expectEqualStrings(
-        "Enter: Send as a message · Pith does not recognize the command /nope.",
+        "Enter: Send as a message · Drinky does not recognize the command /nope.",
         app.session.notice.?.content,
     );
     try std.testing.expect(app.session.confirmations.contains(.message));
@@ -6241,7 +6241,7 @@ test "an idle submit of a slash line with a tail is refused and keeps its text" 
     try std.testing.expect(app.session.confirmations.contains(.message));
 }
 
-// Pith classifies a large paste that expands to a slash command from its expanded
+// Drinky classifies a large paste that expands to a slash command from its expanded
 // text, never its marker label. The label never reaches command dispatch.
 test "a large pasted slash command is classified from expanded text" {
     const gpa = std.testing.allocator;
@@ -6274,7 +6274,7 @@ test "a large pasted slash command is classified from expanded text" {
     try std.testing.expect(std.mem.startsWith(
         u8,
         notice.content,
-        "Enter: Send as a message · Pith does not recognize the command /nope",
+        "Enter: Send as a message · Drinky does not recognize the command /nope",
     ));
     try std.testing.expect(std.mem.endsWith(u8, notice.content, "x" ** 1000 ++ "."));
     try std.testing.expect(std.mem.indexOf(u8, notice.content, "paste") == null);
@@ -6562,7 +6562,7 @@ test "a configured required skill applies, and an unknown name reports" {
         .{ .glob = "**/*.tsx", .skill = "nonesuch" },
     };
     const config: Config = .{
-        .path = "/home/you/.pith/config.json",
+        .path = "/home/you/.drinky/config.json",
         .user_instructions = user_instructions,
         .required_skills = &required,
     };
@@ -6595,7 +6595,7 @@ test "a configured required skill applies, and an unknown name reports" {
         ".agents/skills/demo/SKILL.md",
     ));
 
-    // The pair Pith could not resolve guards nothing and reports itself.
+    // The pair Drinky could not resolve guards nothing and reports itself.
     const typescript = try std.fs.path.join(gpa, &.{ root, "src", "view.ts" });
     defer gpa.free(typescript);
     try std.testing.expect((try app.skill_guard.refusal(&.{
@@ -6630,9 +6630,9 @@ test directoryLabel {
     defer gpa.free(home);
     try std.testing.expectEqualStrings("~", home);
 
-    const inside = try directoryLabel(gpa, "/home/clemens/github/pith", "/home/clemens");
+    const inside = try directoryLabel(gpa, "/home/clemens/github/drinky", "/home/clemens");
     defer gpa.free(inside);
-    try std.testing.expectEqualStrings("~/github/pith", inside);
+    try std.testing.expectEqualStrings("~/github/drinky", inside);
 
     // A sibling that shares a name prefix is not inside the home directory.
     const outside = try directoryLabel(gpa, "/home/clemens2/work", "/home/clemens");
@@ -6727,7 +6727,7 @@ test refreshBranch {
     app.refreshBranch();
     try std.testing.expect(!app.session.dirty);
 
-    // A head Pith cannot read leaves the directory standing alone.
+    // A head Drinky cannot read leaves the directory standing alone.
     try tmp.dir.writeFile(io, .{ .sub_path = ".git/HEAD", .data = "garbage\n" });
     app.refreshBranch();
     try std.testing.expect(app.session.branch() == null);

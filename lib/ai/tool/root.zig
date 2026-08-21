@@ -33,7 +33,7 @@ const Entry = struct {
     /// transcript shows. Empty when a call has nothing to name, so its row is
     /// the tool name alone.
     subject: []const u8 = "",
-    /// What the row calls the subject. Every fragment Pith shows is a key and a
+    /// What the row calls the subject. Every fragment Drinky shows is a key and a
     /// value, so the subject carries its key too. It also says which kind of
     /// value follows, because a pattern and a file read alike on their own.
     subject_label: []const u8 = "",
@@ -267,7 +267,7 @@ pub fn run(context: *const Context, name: []const u8, input_json: []const u8) !R
             error.InvalidArguments => try Result.report(
                 context.gpa,
                 .err,
-                "Pith received invalid arguments for the {s} tool.",
+                "Drinky received invalid arguments for the {s} tool.",
                 .{name},
             ),
             else => return err,
@@ -276,7 +276,7 @@ pub fn run(context: *const Context, name: []const u8, input_json: []const u8) !R
     return Result.report(
         context.gpa,
         .err,
-        "Pith does not recognize the tool {s}.",
+        "Drinky does not recognize the tool {s}.",
         .{name},
     );
 }
@@ -390,8 +390,8 @@ test "a path subject shortens, and a pattern or a command does not" {
         },
         .{
             .name = "write",
-            .input = "{\"path\":\"/home/you/.pith/notes.md\"}",
-            .expected = "~/.pith/notes.md",
+            .input = "{\"path\":\"/home/you/.drinky/notes.md\"}",
+            .expected = "~/.drinky/notes.md",
         },
         // Outside both roots the whole path stays, because that is the reach the
         // user must be able to see.

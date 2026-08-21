@@ -53,7 +53,7 @@ pub const Client = struct {
     ///
     /// Only a subscription account can renew itself. An API key comes from the
     /// environment, and the Console key is minted once at login. Neither one
-    /// rotates, so Pith has nothing to take in their place.
+    /// rotates, so Drinky has nothing to take in their place.
     pub fn renewCredential(self: *Client) !bool {
         return switch (self.credentials) {
             inline .anthropic_subscription, .openai_subscription => |credential| credential.renew(),

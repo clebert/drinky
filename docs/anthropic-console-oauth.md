@@ -1,8 +1,8 @@
 # Anthropic Console OAuth
 
-This document records how the Anthropic Console (Developer Platform) login works, so pith can sign
-in the same way the Claude Code CLI does. Pith derives these facts from the Claude Code client, not
-from public Anthropic documentation. They can change without notice.
+This document records how the Anthropic Console (Developer Platform) login works, so Drinky can sign
+in the same way the Claude Code CLI does. Drinky derives these facts from the Claude Code client,
+not from public Anthropic documentation. They can change without notice.
 
 ## Two OAuth flows, one app
 
@@ -16,7 +16,7 @@ by the authorize host and by what happens after the token exchange.
 | After exchange | keep the OAuth token, send as `Bearer` | mint a platform API key               |
 | Credential     | `sk-ant-oat…` access/refresh token     | `sk-ant-api03…` key                   |
 
-pith runs the subscription flow as its subscription account and the Console flow as its
+Drinky runs the subscription flow as its subscription account and the Console flow as its
 `anthropic_console` account.
 
 ## The subscription profile
@@ -28,14 +28,14 @@ GET https://api.anthropic.com/api/oauth/profile
 Authorization: Bearer <access token>
 ```
 
-The response includes `account.uuid` and `organization.uuid`. pith stores these two values with the
-credential. It does not store the profile email. Matching values permit silent token rotation. A
-different or missing value stops the model request before pith discards the old account evidence. A
-profile failure does not fail the login. The credential then uses the safe missing-value rule.
+The response includes `account.uuid` and `organization.uuid`. Drinky stores these two values with
+the credential. It does not store the profile email. Matching values permit silent token rotation. A
+different or missing value stops the model request before Drinky discards the old account evidence.
+A profile failure does not fail the login. The credential then uses the safe missing-value rule.
 
 ## The Console flow
 
-1. Open the authorize URL in the browser. The user completes any company SSO on that page. pith
+1. Open the authorize URL in the browser. The user completes any company SSO on that page. Drinky
    catches the redirect on a loopback port.
 2. Exchange the code for a short-lived access token at the token endpoint. The body is JSON.
 3. Mint a long-lived API key with that access token.
@@ -78,14 +78,14 @@ The rule is strict:
 - It must be the first block of the `system` array. A later position does not pass.
 - No header, user agent, or beta flag changes the result. Only the system prompt matters.
 
-pith sends this block for the `anthropic_console` account and the subscription account. It omits the
-block for a plain `ANTHROPIC_API_KEY`. So a key set through the environment stays a plain API key. A
-key that pith mints through this login reaches every model.
+Drinky sends this block for the `anthropic_console` account and the subscription account. It omits
+the block for a plain `ANTHROPIC_API_KEY`. So a key set through the environment stays a plain API
+key. A key that Drinky mints through this login reaches every model.
 
 ## Caveats
 
-- Pith derives all of the above from the Claude Code client. Anthropic does not document it and can
-  change an endpoint, the `client_id`, the scopes, or the gate at any time.
+- Drinky derives all of the above from the Claude Code client. Anthropic does not document it and
+  can change an endpoint, the `client_id`, the scopes, or the gate at any time.
 - Use of this OAuth app outside Claude Code is outside Anthropic's intended use.
 - A premium model returns `rate_limit_error` with the message `Error` for a Console key sent without
   the Claude Code system prompt. This is not a real rate limit.

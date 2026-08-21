@@ -1,9 +1,9 @@
-Pith is a minimal, dependency-free coding-agent harness in Zig, inspired by pi. Its focus is a
+Drinky is a minimal, dependency-free coding-agent harness in Zig, inspired by pi. Its focus is a
 hand-rolled terminal UI renderer for modern terminals such as Ghostty.
 
 ### Layout
 
-The project has three modules, wired in `build.zig`. Imports flow one way: `pith` depends on both
+The project has three modules, wired in `build.zig`. Imports flow one way: `drinky` depends on both
 libs, and the libs never import each other or the app. The module boundary makes a back-edge a
 compile error:
 
@@ -12,7 +12,7 @@ compile error:
   knows nothing about the app or the agent.
 - `lib/ai/`: the provider-neutral agent core (`Agent`, `llm`, `models`, `provider`, `command`,
   `tool`, `anthropic`).
-- `src/`: the `pith` app. It contains `main`, `App` (the composition root and event loop), the
+- `src/`: the `drinky` app. It contains `main`, `App` (the composition root and event loop), the
   `Transcript` model, the `layout` projection onto the bounded window, and the `ui/` widgets drawn
   on the engine (`Editor`, `Picker`, `status`, and the `block`, `role`, `attribute`, and `paint`
   primitives).
@@ -25,7 +25,7 @@ declared in source.
 
 ### Features and backlog
 
-`FEATURES.md` is a human-readable overview of what pith supports, with one short sentence per
+`FEATURES.md` is a human-readable overview of what Drinky supports, with one short sentence per
 capability. Keep it current. When you land a capability, add its line. When a capability goes away,
 delete its line. Keep the file short. It is an orientation document, not a spec. The tests are what
 guard against regressions.
@@ -34,10 +34,25 @@ guard against regressions.
 it. When you land an entry, delete it from `BACKLOG.md`. Read the header of `BACKLOG.md` before you
 change either file.
 
+### The name
+
+The project is `drinky`. The two written forms have separate jobs, so do not exchange them.
+
+- Write `drinky` in lowercase for every name that a machine parses. This covers the executable, the
+  Zig module, the `~/.drinky/` directory, the repository, and the `drinky.sh` domain. Put this form
+  in backticks in Markdown.
+- Write `Drinky` with a capital letter for the product as a proper noun in prose. This form covers
+  Markdown sentences, code comments, and every user-facing string. A title takes this form too, so
+  the README heading is `# Drinky`.
+- Never start a sentence with the lowercase form. Write `Drinky`, or rewrite the sentence.
+- `DRINKY` is reserved for an environment variable. Never use that form in prose or in an
+  identifier.
+
 ### Writing style
 
 Write all human-readable prose in ASD-STE100 Simplified Technical English. This covers all Markdown
-files, the code comments, and every pith-generated user-facing string. Apply these practical rules:
+files, the code comments, and every Drinky-generated user-facing string. Apply these practical
+rules:
 
 - Write short sentences in the active voice or the direct imperative. Keep one topic per sentence.
   Use at most 20 words in an instruction and 25 in a description.
@@ -51,7 +66,7 @@ files, the code comments, and every pith-generated user-facing string. Apply the
   case with end punctuation. A label, metric, or control hint can stay a fragment. Give a fragment
   clear casing and a colon between its key or action and its value (`Context: 42%`, `Esc: Cancel`).
 - Wrap a dynamic error name in a complete sentence:
-  `Pith could not open {path} because of error {name}.`
+  `Drinky could not open {path} because of error {name}.`
 
 The rules do not cover provider, model, user, or shell output. They also do not cover literal
 technical identifiers (command names, flags, JSON keys, tool argument schemas). Preserve the meaning

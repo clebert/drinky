@@ -385,10 +385,10 @@ test "invalidation forgets a rejected credential when store removal fails" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var directory = try tmp.dir.createDirPathOpen(io, ".pith", .{});
+    var directory = try tmp.dir.createDirPathOpen(io, ".drinky", .{});
     directory.close(io);
     try tmp.dir.writeFile(io, .{
-        .sub_path = ".pith/auth.json",
+        .sub_path = ".drinky/auth.json",
         .data =
         \\{ "anthropic_subscription":
         \\    { "access": "a", "refresh": "r", "expires_ms": 4102444800000 } }
@@ -406,7 +406,7 @@ test "invalidation forgets a rejected credential when store removal fails" {
     try std.testing.expect(accounts.isAuthenticated(.anthropic_subscription));
 
     // A corrupt file blocks removal. The rejected token must still leave memory.
-    try tmp.dir.writeFile(io, .{ .sub_path = ".pith/auth.json", .data = "not json" });
+    try tmp.dir.writeFile(io, .{ .sub_path = ".drinky/auth.json", .data = "not json" });
     try std.testing.expectError(
         error.BadCredentials,
         accounts.invalidate(.anthropic_subscription),
@@ -420,10 +420,10 @@ test "OpenAI invalidation clears context overrides when store removal fails" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var directory = try tmp.dir.createDirPathOpen(io, ".pith", .{});
+    var directory = try tmp.dir.createDirPathOpen(io, ".drinky", .{});
     directory.close(io);
     try tmp.dir.writeFile(io, .{
-        .sub_path = ".pith/auth.json",
+        .sub_path = ".drinky/auth.json",
         .data =
         \\{ "openai_subscription":
         \\    { "access": "a", "refresh": "r", "expires_ms": 4102444800000,
@@ -448,7 +448,7 @@ test "OpenAI invalidation clears context overrides when store removal fails" {
     });
 
     // A failed removal must clear both the credential and its account metadata.
-    try tmp.dir.writeFile(io, .{ .sub_path = ".pith/auth.json", .data = "not json" });
+    try tmp.dir.writeFile(io, .{ .sub_path = ".drinky/auth.json", .data = "not json" });
     try std.testing.expectError(
         error.BadCredentials,
         accounts.invalidate(.openai_subscription),
@@ -466,10 +466,10 @@ test "OpenAI invalidation reloads a replacement without its discovered limits" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var directory = try tmp.dir.createDirPathOpen(io, ".pith", .{});
+    var directory = try tmp.dir.createDirPathOpen(io, ".drinky", .{});
     directory.close(io);
     try tmp.dir.writeFile(io, .{
-        .sub_path = ".pith/auth.json",
+        .sub_path = ".drinky/auth.json",
         .data =
         \\{ "openai_subscription":
         \\    { "access": "old_access", "refresh": "old_refresh",
@@ -496,7 +496,7 @@ test "OpenAI invalidation reloads a replacement without its discovered limits" {
     // Another instance saved a replacement. The reloaded credential can belong
     // to another principal, so its discovered limits go with the old one.
     try tmp.dir.writeFile(io, .{
-        .sub_path = ".pith/auth.json",
+        .sub_path = ".drinky/auth.json",
         .data =
         \\{ "openai_subscription":
         \\    { "access": "new_access", "refresh": "new_refresh",

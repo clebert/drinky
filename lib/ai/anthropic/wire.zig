@@ -378,8 +378,8 @@ test "tool_call arguments pass through raw, empty becomes an empty object" {
 
 test "synthetic error results group in one user envelope before steering text" {
     const synthetic =
-        "The tool stopped before Pith recorded a result. " ++
-        "Pith does not know if the tool changed the system.";
+        "The tool stopped before Drinky recorded a result. " ++
+        "Drinky does not know if the tool changed the system.";
     const items = [_]llm.Item{
         .{ .tool_call = .{ .call_id = "t1", .name = "read", .arguments_json = "{}" } },
         .{ .tool_call = .{ .call_id = "t2", .name = "read", .arguments_json = "{}" } },

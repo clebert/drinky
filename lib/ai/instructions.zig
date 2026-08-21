@@ -40,11 +40,11 @@ pub const Source = enum {
 
 /// One loaded instruction file. The `Result` that holds it owns every slice.
 pub const File = struct {
-    /// The path Pith read the file through. Messages and the prompt show it.
+    /// The path Drinky read the file through. Messages and the prompt show it.
     path: []const u8,
     content: []const u8,
     /// The canonical path of the file, with every symbolic link resolved. It is
-    /// the identity of the file: Pith compares it to recognize one file that two
+    /// the identity of the file: Drinky compares it to recognize one file that two
     /// paths reach, so the same content cannot enter the prompt twice.
     identity: []const u8,
 
@@ -65,8 +65,8 @@ pub const Notice = struct {
     pub const Severity = enum { information, failure };
 };
 
-/// Why Pith rejects the content of an instruction file. Each value gives the
-/// clause that completes the sentence `Pith skipped ... because {s}.`
+/// Why Drinky rejects the content of an instruction file. Each value gives the
+/// clause that completes the sentence `Drinky skipped ... because {s}.`
 const Problem = enum {
     empty,
     too_large,
@@ -132,7 +132,7 @@ fn readContent(
     return .{ .loaded = content };
 }
 
-/// Apply the shared content policy. Null means Pith accepts the content.
+/// Apply the shared content policy. Null means Drinky accepts the content.
 fn checkContent(content: []const u8) ?Problem {
     if (content.len == 0) return .empty;
     if (content.len > file_bytes_max) return .too_large;
@@ -155,7 +155,7 @@ pub const Result = struct {
     bytes_total: usize = 0,
 
     const TakeOptions = struct {
-        /// The path Pith read the file through.
+        /// The path Drinky read the file through.
         path: []const u8,
         /// The canonical path of `file`.
         identity: []const u8,
@@ -205,7 +205,7 @@ pub const Result = struct {
         if (self.holds(options.identity)) {
             return self.report(
                 .failure,
-                "Pith skipped the {s} file {s} because Pith already loaded the same file.",
+                "Drinky skipped the {s} file {s} because Drinky already loaded the same file.",
                 .{ noun, options.path },
             );
         }
@@ -213,12 +213,12 @@ pub const Result = struct {
             .loaded => |loaded| loaded,
             .rejected => |problem| return self.report(
                 problem.severity(),
-                "Pith skipped the {s} file {s} because {s}.",
+                "Drinky skipped the {s} file {s} because {s}.",
                 .{ noun, options.path, problem.reason() },
             ),
             .failed => |err| return self.report(
                 .failure,
-                "Pith could not read the {s} file {s} because of error {s}.",
+                "Drinky could not read the {s} file {s} because of error {s}.",
                 .{ noun, options.path, @errorName(err) },
             ),
         };
@@ -226,7 +226,7 @@ pub const Result = struct {
         if (self.file_items.items.len == files_max) {
             try self.report(
                 .failure,
-                "Pith skipped the {s} file {s} because Pith already loaded {d} files.",
+                "Drinky skipped the {s} file {s} because Drinky already loaded {d} files.",
                 .{ noun, options.path, files_max },
             );
             self.gpa.free(content);
@@ -236,7 +236,7 @@ pub const Result = struct {
         if (content.len > source_bytes_max - self.bytes_total) {
             try self.report(
                 .failure,
-                "Pith skipped the {s} file {s} to keep the total at or below {d} KiB.",
+                "Drinky skipped the {s} file {s} to keep the total at or below {d} KiB.",
                 .{ noun, options.path, source_kibibytes_max },
             );
             self.gpa.free(content);
@@ -264,7 +264,7 @@ pub const Result = struct {
         if (self.notice_items.items.len == notices_max - 1) {
             const text = try self.gpa.dupe(
                 u8,
-                "Pith omitted the remaining messages about the instruction files.",
+                "Drinky omitted the remaining messages about the instruction files.",
             );
             errdefer self.gpa.free(text);
             try self.notice_items.append(self.gpa, .{ .severity = .failure, .text = text });
@@ -282,11 +282,11 @@ pub const Result = struct {
 ///
 /// `project.findBoundary` gives the top of the walk. Two boundaries then guard the
 /// walk, and they differ on purpose. The `source_boundary` is that top: the Git
-/// root, or the working directory when Pith found no Git root. A plain instruction
+/// root, or the working directory when Drinky found no Git root. A plain instruction
 /// file must resolve inside it, so a mount trick cannot pull content in from
 /// outside the repository. The `link_boundary` is the Git root, or the working
 /// directory alone when there is no Git root. A symbolic-link target must resolve
-/// inside it. The two differ when Pith cannot read a repository marker: the walk
+/// inside it. The two differ when Drinky cannot read a repository marker: the walk
 /// then stops at that ancestor and still scans it, but only the working directory
 /// stays trusted for a link target.
 const Discovery = struct {
@@ -356,7 +356,7 @@ const Discovery = struct {
         defer self.gpa.free(marker_path);
         try self.result.report(
             .failure,
-            "Pith could not inspect the repository marker {s} because of error {s}.",
+            "Drinky could not inspect the repository marker {s} because of error {s}.",
             .{ marker_path, @errorName(marker.err) },
         );
     }
@@ -370,7 +370,7 @@ const Discovery = struct {
             if (err == error.Canceled or err == error.OutOfMemory) return err;
             try self.result.report(
                 .failure,
-                "Pith could not scan the directory {s} for AGENTS.md because of error {s}.",
+                "Drinky could not scan the directory {s} for AGENTS.md because of error {s}.",
                 .{ options.directory, @errorName(err) },
             );
             return;
@@ -387,7 +387,7 @@ const Discovery = struct {
                 if (err == error.Canceled or err == error.OutOfMemory) return err;
                 try self.result.report(
                     .failure,
-                    "Pith stopped the scan for AGENTS.md in {s} because of error {s}.",
+                    "Drinky stopped the scan for AGENTS.md in {s} because of error {s}.",
                     .{ options.directory, @errorName(err) },
                 );
                 break;
@@ -399,7 +399,7 @@ const Discovery = struct {
             if (attempt == directory_entries_max) {
                 try self.result.report(
                     .failure,
-                    "Pith stopped the scan for AGENTS.md in {s} after {d} entries.",
+                    "Drinky stopped the scan for AGENTS.md in {s} after {d} entries.",
                     .{ options.directory, directory_entries_max },
                 );
                 break;
@@ -429,7 +429,7 @@ const Discovery = struct {
             defer self.gpa.free(path);
             if (try self.isRegularFile(path)) try self.result.report(
                 .failure,
-                "Pith ignored the CLAUDE.md file {s}. Add or link a project instruction file " ++
+                "Drinky ignored the CLAUDE.md file {s}. Add or link a project instruction file " ++
                     "named AGENTS.md in the same directory.",
                 .{path},
             );
@@ -439,7 +439,7 @@ const Discovery = struct {
             defer self.gpa.free(path);
             if (try self.isRegularFile(path)) try self.result.report(
                 .failure,
-                "Pith ignored the AGENT.md file {s}. Rename the file to AGENTS.md if the file " ++
+                "Drinky ignored the AGENT.md file {s}. Rename the file to AGENTS.md if the file " ++
                     "contains project instructions.",
                 .{path},
             );
@@ -460,7 +460,7 @@ const Discovery = struct {
             defer self.gpa.free(safe_path);
             try self.result.report(
                 .failure,
-                "Pith skipped the " ++ noun ++ " path {s} because the path is not valid UTF-8.",
+                "Drinky skipped the " ++ noun ++ " path {s} because the path is not valid UTF-8.",
                 .{safe_path},
             );
             return;
@@ -473,7 +473,7 @@ const Discovery = struct {
             if (err == error.Canceled or err == error.OutOfMemory) return err;
             try self.result.report(
                 .failure,
-                "Pith could not inspect the " ++ noun ++ " path {s} because of error {s}.",
+                "Drinky could not inspect the " ++ noun ++ " path {s} because of error {s}.",
                 .{ options.source_path, @errorName(err) },
             );
             return;
@@ -495,14 +495,14 @@ const Discovery = struct {
                     if (err == error.FileNotFound) {
                         try self.result.report(
                             .failure,
-                            "Pith skipped the " ++ noun ++ " file {s} because the symbolic-link " ++
-                                "target does not exist.",
+                            "Drinky skipped the " ++ noun ++ " file {s} because the " ++
+                                "symbolic-link target does not exist.",
                             .{options.source_path},
                         );
                     } else {
                         try self.result.report(
                             .failure,
-                            "Pith could not inspect the symbolic-link target of the " ++ noun ++
+                            "Drinky could not inspect the symbolic-link target of the " ++ noun ++
                                 " file {s} because of error {s}.",
                             .{ options.source_path, @errorName(err) },
                         );
@@ -512,7 +512,7 @@ const Discovery = struct {
                 if (target_stat.kind != .file) {
                     try self.result.report(
                         .failure,
-                        "Pith skipped the " ++ noun ++ " file {s} because the symbolic-link " ++
+                        "Drinky skipped the " ++ noun ++ " file {s} because the symbolic-link " ++
                             "target is not a regular file.",
                         .{options.source_path},
                     );
@@ -527,7 +527,8 @@ const Discovery = struct {
             },
             else => try self.result.report(
                 .failure,
-                "Pith skipped the " ++ noun ++ " path {s} because the path is not a regular file.",
+                "Drinky skipped the " ++ noun ++ " path {s} because the path is not a regular " ++
+                    "file.",
                 .{options.source_path},
             ),
         }
@@ -542,14 +543,14 @@ const Discovery = struct {
             if (options.was_symlink and err == error.FileNotFound) {
                 try self.result.report(
                     .failure,
-                    "Pith skipped the " ++ noun ++ " file {s} because the symbolic-link target " ++
-                        "does not exist.",
+                    "Drinky skipped the " ++ noun ++ " file {s} because the symbolic-link " ++
+                        "target does not exist.",
                     .{options.source_path},
                 );
             } else {
                 try self.result.report(
                     .failure,
-                    "Pith could not open the " ++ noun ++ " file {s} because of error {s}.",
+                    "Drinky could not open the " ++ noun ++ " file {s} because of error {s}.",
                     .{ options.source_path, @errorName(err) },
                 );
             }
@@ -561,7 +562,7 @@ const Discovery = struct {
             if (err == error.Canceled or err == error.OutOfMemory) return err;
             try self.result.report(
                 .failure,
-                "Pith could not inspect the open " ++ noun ++ " file {s} because of error {s}.",
+                "Drinky could not inspect the open " ++ noun ++ " file {s} because of error {s}.",
                 .{ options.source_path, @errorName(err) },
             );
             return;
@@ -569,7 +570,8 @@ const Discovery = struct {
         if (stat.kind != .file) {
             try self.result.report(
                 .failure,
-                "Pith skipped the " ++ noun ++ " path {s} because the path is not a regular file.",
+                "Drinky skipped the " ++ noun ++ " path {s} because the path is not a regular " ++
+                    "file.",
                 .{options.source_path},
             );
             return;
@@ -580,7 +582,7 @@ const Discovery = struct {
             if (err == error.Canceled or err == error.OutOfMemory) return err;
             try self.result.report(
                 .failure,
-                "Pith could not resolve the " ++ noun ++ " file {s} because of error {s}.",
+                "Drinky could not resolve the " ++ noun ++ " file {s} because of error {s}.",
                 .{ options.source_path, @errorName(err) },
             );
             return;
@@ -589,7 +591,7 @@ const Discovery = struct {
         if (!project.contains(&.{ .boundary = options.content_boundary, .target = target })) {
             try self.result.report(
                 .failure,
-                "Pith skipped the " ++ noun ++ " file {s} because the file resolves outside " ++
+                "Drinky skipped the " ++ noun ++ " file {s} because the file resolves outside " ++
                     "the project boundary.",
                 .{options.source_path},
             );
@@ -630,15 +632,15 @@ pub fn discover(
 pub const LoadOptions = struct {
     /// The absolute directory that a relative configured path resolves against.
     directory: []const u8,
-    /// The configured paths, in the order the prompt keeps them. Pith inspects
+    /// The configured paths, in the order the prompt keeps them. Drinky inspects
     /// at most `files_max` of them. One entry past that cap is enough to make
-    /// Pith report the rest, so a caller can cut the list at `files_max + 1`
+    /// Drinky report the rest, so a caller can cut the list at `files_max + 1`
     /// and still lose no message.
     paths: []const []const u8,
 };
 
-/// Load the configured user instruction files. Pith inspects at most `files_max`
-/// entries and reports the rest. A path Pith cannot use becomes a message, so a
+/// Load the configured user instruction files. Drinky inspects at most `files_max`
+/// entries and reports the rest. A path Drinky cannot use becomes a message, so a
 /// bad entry never stops the load. The returned result owns everything it holds.
 pub fn load(gpa: std.mem.Allocator, io: std.Io, options: *const LoadOptions) !Result {
     if (!std.fs.path.isAbsolute(options.directory)) return error.DirectoryNotAbsolute;
@@ -649,14 +651,14 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, options: *const LoadOptions) !Re
         if (index == files_max) {
             try result.report(
                 .failure,
-                "Pith skipped the remaining {s} files because Pith already inspected {d} " ++
+                "Drinky skipped the remaining {s} files because Drinky already inspected {d} " ++
                     "entries.",
                 .{ result.source.noun(), files_max },
             );
             break;
         }
         // A relative path resolves against the configured directory, so
-        // `~/.pith/` holds the common case.
+        // `~/.drinky/` holds the common case.
         const path = try std.fs.path.resolve(gpa, &.{ options.directory, configured });
         defer gpa.free(path);
         try loadPath(&result, io, path);
@@ -675,20 +677,20 @@ fn loadPath(result: *Result, io: std.Io, path: []const u8) !void {
         if (err == error.FileNotFound) {
             return result.report(
                 .failure,
-                "Pith skipped the {s} path {s} because the path does not exist.",
+                "Drinky skipped the {s} path {s} because the path does not exist.",
                 .{ noun, path },
             );
         }
         return result.report(
             .failure,
-            "Pith could not inspect the {s} path {s} because of error {s}.",
+            "Drinky could not inspect the {s} path {s} because of error {s}.",
             .{ noun, path, @errorName(err) },
         );
     };
     if (stat.kind != .file) {
         return result.report(
             .failure,
-            "Pith skipped the {s} path {s} because the path is not a regular file.",
+            "Drinky skipped the {s} path {s} because the path is not a regular file.",
             .{ noun, path },
         );
     }
@@ -696,7 +698,7 @@ fn loadPath(result: *Result, io: std.Io, path: []const u8) !void {
         if (err == error.Canceled or err == error.OutOfMemory) return err;
         return result.report(
             .failure,
-            "Pith could not open the {s} file {s} because of error {s}.",
+            "Drinky could not open the {s} file {s} because of error {s}.",
             .{ noun, path, @errorName(err) },
         );
     };
@@ -708,7 +710,7 @@ fn loadPath(result: *Result, io: std.Io, path: []const u8) !void {
         if (err == error.Canceled or err == error.OutOfMemory) return err;
         return result.report(
             .failure,
-            "Pith could not resolve the {s} file {s} because of error {s}.",
+            "Drinky could not resolve the {s} file {s} because of error {s}.",
             .{ noun, path, @errorName(err) },
         );
     };
@@ -849,7 +851,7 @@ test "outside Git only the working directory is inspected and compatibility file
     var seed = std.testing.tmpDir(.{});
     defer seed.cleanup();
 
-    const outside_root = try std.fmt.allocPrint(gpa, "/tmp/pith-instructions-{s}", .{
+    const outside_root = try std.fmt.allocPrint(gpa, "/tmp/drinky-instructions-{s}", .{
         seed.sub_path,
     });
     defer gpa.free(outside_root);
@@ -958,7 +960,7 @@ test "instruction messages are bounded" {
 
     try std.testing.expectEqual(@as(usize, notices_max), result.notices().len);
     try std.testing.expectEqualStrings(
-        "Pith omitted the remaining messages about the instruction files.",
+        "Drinky omitted the remaining messages about the instruction files.",
         result.notices()[notices_max - 1].text,
     );
 }
@@ -1264,7 +1266,7 @@ test "configured files stop at the shared byte budget" {
     const directory = try tmpPath(gpa, io, &tmp, "");
     defer gpa.free(directory);
 
-    // Two 24 KiB files fit. The third goes past 64 KiB, so Pith keeps the
+    // Two 24 KiB files fit. The third goes past 64 KiB, so Drinky keeps the
     // earlier files and reports the one it dropped.
     var result = try load(gpa, io, &.{
         .directory = directory,

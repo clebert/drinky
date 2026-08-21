@@ -292,7 +292,7 @@ pub fn framed(placement: *const Placement, framing: *const Framing) !void {
         .columns = placement.columns,
         .activity = maybe_activity,
     };
-    // Pith blinks the caret itself while the input animates. A terminal holds
+    // Drinky blinks the caret itself while the input animates. A terminal holds
     // its own cursor solid under a continuous repaint, and an animated input
     // repaints about every 16 ms. An idle input writes nothing, so the terminal
     // blinks the caret there.

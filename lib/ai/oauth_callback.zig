@@ -7,7 +7,7 @@ const net = @import("net.zig");
 
 const callback_timeout_ms = 5 * std.time.ms_per_min;
 const request_bytes_max = 8 * 1024;
-const response_page = "Pith received authorization. Close this tab.";
+const response_page = "Drinky received authorization. Close this tab.";
 
 pub const Redirect = struct {
     code: []const u8,

@@ -9,7 +9,7 @@
 //! (`gpa`/`io`/`timeouts`/`path`/`tokens` fields): the on-disk entry mirrors the
 //! provider's `Tokens` fields.
 //! Every save is a load-merge-write through `json_store` that never clobbers
-//! another account's entry. A store file Pith cannot parse is a bad credential
+//! another account's entry. A store file Drinky cannot parse is a bad credential
 //! file, so every call translates that failure into `error.BadCredentials`.
 
 const std = @import("std");
@@ -151,7 +151,7 @@ fn expired(auth: anytype) bool {
 /// the installed one, although it has not expired yet.
 ///
 /// A revoked access token reads as fresh here, because only the provider knows
-/// that it died. Two Pith instances hold their own copy of one credential, so a
+/// that it died. Two Drinky instances hold their own copy of one credential, so a
 /// refresh in one of them revokes the token the other still holds.
 ///
 /// The call reports whether the credential changed, so the caller repeats a
@@ -199,8 +199,8 @@ pub fn renew(
 /// uses it as it stands. Tokens report a credential that the caller must install
 /// and save.
 ///
-/// Pith refreshes the adopted credential only when it has expired too. Every
-/// refresh rotates the token that every other Pith instance holds, so a refresh
+/// Drinky refreshes the adopted credential only when it has expired too. Every
+/// refresh rotates the token that every other Drinky instance holds, so a refresh
 /// of a live credential would push the instances into a rotation loop.
 fn refreshFromStore(
     auth: anytype,
@@ -335,9 +335,9 @@ fn clear(auth: anytype) void {
 
 /// Persist the current tokens under `account_key`. The on-disk entry is the
 /// `Tokens` fields verbatim. Lock contention leaves a retry marker in memory.
-/// Every other failure clears that marker, because a store Pith cannot write at
+/// Every other failure clears that marker, because a store Drinky cannot write at
 /// all must not stop every later turn. The credential then lives in memory
-/// until Pith exits, which is what a memory-only login reports.
+/// until Drinky exits, which is what a memory-only login reports.
 pub fn save(auth: anytype, comptime account_key: []const u8) !void {
     const tokens = auth.tokens orelse return error.NotAuthenticated;
     json_store.save(auth.gpa, auth.io, auth.path, account_key, tokens, .{}) catch |err| {

@@ -215,7 +215,7 @@ fn unknownCommand(gpa: std.mem.Allocator, name: []const u8) !Outcome.Message {
     return Outcome.Message.print(
         gpa,
         .warning,
-        "Pith does not recognize the command /{s}.",
+        "Drinky does not recognize the command /{s}.",
         .{name},
     );
 }
@@ -224,7 +224,7 @@ fn unknownSkill(gpa: std.mem.Allocator, name: []const u8) !Outcome.Message {
     return Outcome.Message.print(
         gpa,
         .warning,
-        "Pith does not recognize the skill {s}.",
+        "Drinky does not recognize the skill {s}.",
         .{name},
     );
 }
@@ -239,7 +239,7 @@ fn runSkill(context: *Context, target: *const skills.Skill, arguments: []const u
         return .{ .refusal = try Outcome.Message.print(
             context.gpa,
             .failure,
-            "Pith could not load the skill {s} because of error {s}.",
+            "Drinky could not load the skill {s} because of error {s}.",
             .{ target.name, @errorName(err) },
         ) };
     };
@@ -387,7 +387,7 @@ test "trailing whitespace does not hide an unknown command name" {
         .refusal => |refusal| {
             defer gpa.free(refusal.content);
             try std.testing.expectEqualStrings(
-                "Pith does not recognize the command /nope.",
+                "Drinky does not recognize the command /nope.",
                 refusal.content,
             );
         },

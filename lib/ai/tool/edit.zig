@@ -70,7 +70,7 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
         error.StreamTooLong => return Result.report(
             gpa,
             .err,
-            "Pith cannot edit {s} because it is larger than {d} bytes.",
+            "Drinky cannot edit {s} because it is larger than {d} bytes.",
             .{ path, file_bytes_max },
         ),
         else => return Result.cannot(gpa, err, "read", path),
@@ -88,13 +88,13 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
             error.NotFound => return Result.report(
                 gpa,
                 .err,
-                "Pith did not find old_text in {s}.",
+                "Drinky did not find old_text in {s}.",
                 .{path},
             ),
             error.NotUnique => return Result.report(
                 gpa,
                 .err,
-                "Pith found old_text more than once in {s}. Add more text before and " ++
+                "Drinky found old_text more than once in {s}. Add more text before and " ++
                     "after old_text.",
                 .{path},
             ),
@@ -104,7 +104,7 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
 
     fs.writeFile(context.io, std.Io.Dir.cwd(), .{ .sub_path = path, .data = updated }) catch |err|
         return Result.cannot(gpa, err, "write", path);
-    var result = try Result.report(gpa, .ok, "Pith edited {s}.", .{path});
+    var result = try Result.report(gpa, .ok, "Drinky edited {s}.", .{path});
     errdefer result.deinit(gpa);
     // The line counts the lines `old_text` took out against the lines
     // `new_text` put in, and it borrows the `-` and `+` of a diff to show them.

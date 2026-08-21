@@ -81,7 +81,7 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
     const ignore_case = parsed.value.ignore_case;
     const limit = parsed.value.limit;
 
-    // Pith walks a directory for its files. Pith searches a path that names a
+    // Drinky walks a directory for its files. Drinky searches a path that names a
     // single file directly and ignores the glob. The glob only filters a
     // traversal, and a named file needs none. `maybe_match` owns the walked
     // paths. The file case borrows `base`, which outlives the search.
@@ -169,27 +169,27 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
     if (count == 0) {
         if (line_capped or bytes_capped or files_incomplete) {
             try out.writer.print(
-                "Pith found no matches for {s} in the part that Pith searched. " ++
+                "Drinky found no matches for {s} in the part that Drinky searched. " ++
                     "Use a narrower path or glob because the search was incomplete.",
                 .{pattern},
             );
         } else {
-            try out.writer.print("Pith found no matches for {s}.", .{pattern});
+            try out.writer.print("Drinky found no matches for {s}.", .{pattern});
         }
     } else if (line_capped) {
         try out.writer.print(
-            "\n[Pith stopped after {d} matches. Refine the search or increase limit.]",
+            "\n[Drinky stopped after {d} matches. Refine the search or increase limit.]",
             .{limit},
         );
     } else if (bytes_capped) {
         try out.writer.print(
-            "\n[Pith stopped after Pith read {d} MB. Refine the search or use a narrower " ++
+            "\n[Drinky stopped after Drinky read {d} MB. Refine the search or use a narrower " ++
                 "path or glob.]",
             .{bytes_read_max >> 20},
         );
     } else if (files_incomplete) {
         try out.writer.writeAll(
-            "\n[Pith could not scan the full file tree. Pith did not search some files.]",
+            "\n[Drinky could not scan the full file tree. Drinky did not search some files.]",
         );
     }
 
@@ -349,7 +349,7 @@ test "grep stops at the result limit and reports it" {
     const expected = try std.fmt.bufPrint(
         &expected_buf,
         ".zig-cache/tmp/{s}/f.txt:1:hit one\n.zig-cache/tmp/{s}/f.txt:2:hit two\n" ++
-            "[Pith stopped after 2 matches. Refine the search or increase limit.]",
+            "[Drinky stopped after 2 matches. Refine the search or increase limit.]",
         .{ tmp.sub_path, tmp.sub_path },
     );
     try std.testing.expectEqualStrings(expected, result.content);
@@ -442,7 +442,7 @@ test "grep reports no matches of a complete search" {
     const result = try run(&context, input);
     defer result.deinit(gpa);
     try std.testing.expect(!result.is_error);
-    try std.testing.expectEqualStrings("Pith found no matches for miss.", result.content);
+    try std.testing.expectEqualStrings("Drinky found no matches for miss.", result.content);
     try std.testing.expectEqualStrings("Matches: 0", result.summary.?.text);
 }
 

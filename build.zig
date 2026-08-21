@@ -27,7 +27,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const exe = b.addExecutable(.{
-        .name = "pith",
+        .name = "drinky",
         .root_module = root_module,
     });
 
@@ -37,7 +37,7 @@ pub fn build(b: *std.Build) void {
 
     if (b.args) |args| run.addArgs(args);
 
-    const run_step = b.step("run", "Build and run pith");
+    const run_step = b.step("run", "Build and run Drinky");
 
     run_step.dependOn(&run.step);
 

@@ -12,7 +12,7 @@ const Context = @import("Context.zig");
 const parse = @import("parse.zig");
 const Result = @import("Result.zig");
 
-/// The hard cap on captured output. Beyond this, Pith stops the command and
+/// The hard cap on captured output. Beyond this, Drinky stops the command and
 /// does not buffer without bound. The configured window keeps only the tail
 /// below it.
 const capture_bytes_max = 8 << 20;
@@ -25,7 +25,7 @@ pub const spec: llm.Tool = .{
     .description = "Run a bash command in the working directory and return its combined " ++
         "stdout and stderr. Output is truncated to a bounded tail, and a non-zero exit is " ++
         "reported. Give an optional timeout in seconds; the default comes from configuration. " ++
-        "Pith has no web tool, so a network request also runs through this tool.",
+        "Drinky has no web tool, so a network request also runs through this tool.",
     .parameters = &.{
         .{
             .name = "command",
@@ -40,7 +40,7 @@ pub const spec: llm.Tool = .{
             .type = .integer,
             .description = std.fmt.comptimePrint(
                 "Seconds before the command is killed (default: configured limit). " ++
-                    "Pith holds the value from {d} to {d}.",
+                    "Drinky holds the value from {d} to {d}.",
                 .{
                     Context.Bash.timeout_ms_min / std.time.ms_per_s,
                     Context.Bash.timeout_ms_max / std.time.ms_per_s,
@@ -91,7 +91,7 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
     if (limits.denies(command)) |pattern| return Result.report(
         gpa,
         .err,
-        "Pith refused this command because it contains the denied pattern \"{s}\".",
+        "Drinky refused this command because it contains the denied pattern \"{s}\".",
         .{pattern},
     );
     // Both sources take the same clamp, so a command always runs under a limit
@@ -123,7 +123,7 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
         else => return Result.report(
             gpa,
             .err,
-            "Pith could not run the command because of error {s}.",
+            "Drinky could not run the command because of error {s}.",
             .{@errorName(err)},
         ),
     };
@@ -314,12 +314,12 @@ fn render(
     if (start > 0) {
         if (output[start - 1] == '\n') {
             try result_writer.writer.print(
-                "[Pith omitted earlier output. Pith shows the last {d} of {d} lines.]\n",
+                "[Drinky omitted earlier output. Drinky shows the last {d} of {d} lines.]\n",
                 .{ format.lines(window), format.lines(output) },
             );
         } else {
             try result_writer.writer.print(
-                "[Pith omitted earlier output. Pith shows the last {d} bytes.]\n",
+                "[Drinky omitted earlier output. Drinky shows the last {d} bytes.]\n",
                 .{window.len},
             );
         }

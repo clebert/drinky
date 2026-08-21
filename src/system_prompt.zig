@@ -1,21 +1,21 @@
-//! Pure composition of pith's provider-neutral system prompt.
+//! Pure composition of Drinky's provider-neutral system prompt.
 
 const std = @import("std");
 
 const ai = @import("ai");
 
-/// The core that Pith compiles in. It states the mechanical facts of the
+/// The core that Drinky compiles in. It states the mechanical facts of the
 /// harness: the role, the tools, the edit contract, and the medium. Workflow,
 /// tone, and review rules stay out, because the user cannot switch off what the
 /// binary holds. The user instructions, the project instructions, and the skills
 /// carry that guidance, and the user controls all three.
 pub const default_core =
     "# System Prompt\n\n" ++
-    "You are a coding assistant operating inside pith, a terminal coding-agent harness.\n\n" ++
+    "You are a coding assistant operating inside Drinky, a terminal coding-agent harness.\n\n" ++
     "Complete the user's request.\n" ++
     "Use the available tools according to their schemas.\n" ++
     "Read a file before you change it, because an edit must match the current bytes.\n" ++
-    "Pith renders your answer as Markdown in a terminal, so keep it short.";
+    "Drinky renders your answer as Markdown in a terminal, so keep it short.";
 
 /// The final nanosecond of 9999-12-31 UTC.
 const date_timestamp_nanoseconds_max: i96 =
@@ -23,7 +23,7 @@ const date_timestamp_nanoseconds_max: i96 =
 
 pub const Options = struct {
     core: []const u8,
-    /// The wall clock at startup. Pith reads it once, so the prompt stays byte
+    /// The wall clock at startup. Drinky reads it once, so the prompt stays byte
     /// stable for the session and the provider can cache it. A session that runs
     /// past midnight therefore keeps the date it started on.
     current_time: std.Io.Timestamp,
@@ -66,7 +66,7 @@ pub fn compose(gpa: std.mem.Allocator, options: *const Options) ![]u8 {
     return output.toOwnedSlice();
 }
 
-/// Rank the instruction sources for the model. Pith lists only the sources that
+/// Rank the instruction sources for the model. Drinky lists only the sources that
 /// this prompt carries, so the model never reads about a section it cannot see.
 /// A prompt with no source at all gets no ranking.
 fn writePrecedence(writer: *std.Io.Writer, options: *const Options) !void {
@@ -74,7 +74,7 @@ fn writePrecedence(writer: *std.Io.Writer, options: *const Options) !void {
     const has_skills = options.skills.count() > 0;
     if (options.user_instructions.len == 0 and project_files.len == 0 and !has_skills) return;
     try writer.writeAll("\n\n## Instruction precedence\n\n" ++
-        "Pith gives you instructions from the sources below. Where two conflict, obey this " ++
+        "Drinky gives you instructions from the sources below. Where two conflict, obey this " ++
         "order:\n\n" ++
         "1. The system prompt core.\n");
     var rank: usize = 1;
@@ -104,7 +104,7 @@ fn writePrecedence(writer: *std.Io.Writer, options: *const Options) !void {
 /// The content goes in as it is, because escaping it corrupts the Markdown
 /// the user wrote. The tags mark the bounds, so a heading inside a file cannot
 /// end the section. A file that forges a closing tag can still claim a higher
-/// rank, which is why pith trusts only what the user and the repository own.
+/// rank, which is why Drinky trusts only what the user and the repository own.
 fn writeInstructions(
     gpa: std.mem.Allocator,
     writer: *std.Io.Writer,
@@ -123,7 +123,7 @@ fn writeInstructions(
 }
 
 /// Render the UTC date of `timestamp`. Null reports a wall clock outside the
-/// years 1970 through 9999, which must not stop pith from starting.
+/// years 1970 through 9999, which must not stop Drinky from starting.
 fn dateUtc(timestamp: std.Io.Timestamp) ?[10]u8 {
     const timestamp_nanoseconds = timestamp.toNanoseconds();
     if (timestamp_nanoseconds < 0 or
@@ -210,10 +210,10 @@ fn writeRequiredSkills(
     try writer.writeAll("\n\n## Required skills\n\n");
     try writer.writeAll(
         "A rule below pairs a path pattern with a skill file.\n" ++
-            "Pith sends you the whole skill file when a tool first touches a file that the " ++
+            "Drinky sends you the whole skill file when a tool first touches a file that the " ++
             "pattern matches.\n" ++
             "Read that skill file, and follow it for every file of that pattern.\n" ++
-            "Pith refuses a write and an edit until the whole skill file is in this " ++
+            "Drinky refuses a write and an edit until the whole skill file is in this " ++
             "conversation.\n\n" ++
             "<required_skills>\n",
     );
@@ -311,12 +311,12 @@ test "a wall clock outside the supported years empties the date but composes" {
 test "the compiled core is stable" {
     try std.testing.expectEqualStrings(
         "# System Prompt\n\n" ++
-            "You are a coding assistant operating inside pith, a terminal coding-agent " ++
+            "You are a coding assistant operating inside Drinky, a terminal coding-agent " ++
             "harness.\n\n" ++
             "Complete the user's request.\n" ++
             "Use the available tools according to their schemas.\n" ++
             "Read a file before you change it, because an edit must match the current bytes.\n" ++
-            "Pith renders your answer as Markdown in a terminal, so keep it short.",
+            "Drinky renders your answer as Markdown in a terminal, so keep it short.",
         default_core,
     );
 }
@@ -488,8 +488,8 @@ test "configured user instructions have their own section" {
             // The user files are the only source here, so the ranking names
             // them alone and drops the subtree rule of the project files.
             "## Instruction precedence\n\n" ++
-            "Pith gives you instructions from the sources below. Where two conflict, obey this " ++
-            "order:\n\n" ++
+            "Drinky gives you instructions from the sources below. Where two conflict, obey " ++
+            "this order:\n\n" ++
             "1. The system prompt core.\n" ++
             "2. The user instructions.\n\n" ++
             "A request in the conversation wins over a conflicting instruction from these " ++
@@ -547,7 +547,7 @@ test "the required skills section names every rule and stays out without one" {
     try std.testing.expect(std.mem.indexOf(
         u8,
         prompt,
-        "Pith refuses a write and an edit until the whole skill file is in this " ++
+        "Drinky refuses a write and an edit until the whole skill file is in this " ++
             "conversation.\n\n" ++
             "<required_skills>\n" ++
             "  <required_skill pattern=\"**/*.zig\" skill=\"zig-style\" " ++

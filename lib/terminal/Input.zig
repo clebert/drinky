@@ -240,7 +240,7 @@ fn mapControlSequence(parameters: []const u8, final: u8) Key {
     return mapFinal(final);
 }
 
-/// Decode `button;column;row` from an SGR mouse report. Pith uses the button alone.
+/// Decode `button;column;row` from an SGR mouse report. Drinky uses the button alone.
 fn mapMouseSgr(parameters: []const u8) Key {
     var fields = std.mem.splitScalar(u8, parameters, ';');
     const button_field = fields.next() orelse return .unknown;

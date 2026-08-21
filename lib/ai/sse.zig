@@ -119,7 +119,7 @@ pub fn Engine(comptime S: type) type {
         }
 
         /// Whether the head reported that the provider rejected the credential.
-        /// A token that another Pith instance rotated away reads like this, and
+        /// A token that another Drinky instance rotated away reads like this, and
         /// so does a revoked one.
         pub fn unauthorized(stream: *const S) bool {
             return stream.status == .unauthorized;

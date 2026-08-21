@@ -71,8 +71,8 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
     if (matches.matched == 0) {
         if (matches.capped) {
             try out.writer.print(
-                "No files match {s} in the part that Pith searched. Use a narrower path or " ++
-                    "pattern because Pith could not scan the full file tree.",
+                "No files match {s} in the part that Drinky searched. Use a narrower path or " ++
+                    "pattern because Drinky could not scan the full file tree.",
                 .{pattern},
             );
         } else {
@@ -81,14 +81,14 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
     } else if (matches.capped) {
         if (shown > 0) try out.writer.writeAll("\n");
         try out.writer.print(
-            "[Pith stopped the search because the file tree is too large. " ++
-                "Pith shows the {d} smallest matches. Use a narrower path or pattern.]",
+            "[Drinky stopped the search because the file tree is too large. " ++
+                "Drinky shows the {d} smallest matches. Use a narrower path or pattern.]",
             .{shown},
         );
     } else if (matches.matched > shown) {
         if (shown > 0) try out.writer.writeAll("\n");
         try out.writer.print(
-            "[Pith omitted {d} matches. Increase limit to see them.]",
+            "[Drinky omitted {d} matches. Increase limit to see them.]",
             .{matches.matched - shown},
         );
     }
@@ -146,7 +146,7 @@ test "find reports how many more matched beyond the limit" {
     var expected_buf: [128]u8 = undefined;
     const expected = try std.fmt.bufPrint(
         &expected_buf,
-        ".zig-cache/tmp/{s}/a.txt\n[Pith omitted 2 matches. Increase limit to see them.]",
+        ".zig-cache/tmp/{s}/a.txt\n[Drinky omitted 2 matches. Increase limit to see them.]",
         .{tmp.sub_path},
     );
     try std.testing.expectEqualStrings(expected, result.content);

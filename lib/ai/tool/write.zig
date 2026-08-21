@@ -52,7 +52,7 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
 
     fs.writeFile(context.io, std.Io.Dir.cwd(), .{ .sub_path = path, .data = contents }) catch |err|
         return Result.cannot(gpa, err, "write", path);
-    var result = try Result.report(gpa, .ok, "Pith wrote {d} bytes to {s}.", .{
+    var result = try Result.report(gpa, .ok, "Drinky wrote {d} bytes to {s}.", .{
         contents.len,
         path,
     });

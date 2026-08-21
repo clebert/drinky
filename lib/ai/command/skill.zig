@@ -21,7 +21,7 @@ pub fn run(context: *Context) !Context.Outcome {
     const items = try sorted(gpa, context.skill_registry);
     defer gpa.free(items);
     if (items.len == 0)
-        return Context.Outcome.reportNotice(gpa, .warning, "Pith found no skills.", .{});
+        return Context.Outcome.reportNotice(gpa, .warning, "Drinky found no skills.", .{});
     var options: Context.Outcome.Options = .{ .gpa = gpa };
     errdefer options.deinit();
     // The row shows the line it writes, so the user learns the typed form.
