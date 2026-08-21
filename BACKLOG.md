@@ -74,10 +74,6 @@ decision already taken, or a dependency on another entry. Module layout and exte
 - **Headless mode** — pith answers a prompt with no terminal: text in, text out, with a session id
   to continue and flags for the model and the effort level. _This is the base for any agent that
   pith drives itself._
-- **Path-triggered skills** — pith makes sure the model loaded the required skill before a tool
-  writes a matching file. _Config-driven: a glob maps to a skill name in `config.json`. Pith does
-  not know the user's skills or the files the user edits, so nothing is hard-coded. Zig style is
-  only the first case, and TypeScript and others follow._
 - **A configurable bash guard** — `bash` refuses a command that matches a user pattern, and reports
   the refusal. _The user owns the pattern list, and `git add` is one example. There is no permission
   model and no prompt for consent._

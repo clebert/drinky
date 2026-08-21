@@ -8,6 +8,7 @@ const Context = @import("Context.zig");
 const fs = @import("fs.zig");
 const parse = @import("parse.zig");
 const Result = @import("Result.zig");
+const SkillGuard = @import("SkillGuard.zig");
 
 const file_bytes_max = 16 << 20;
 
@@ -49,6 +50,16 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
     const path = parsed.value.path;
     const old = parsed.value.old_text;
     const new = parsed.value.new_text;
+
+    // A rule that guards this file refuses the call before it changes anything.
+    if (context.skill_guard) |guard| {
+        if (try guard.refusal(&.{
+            .gpa = gpa,
+            .io = context.io,
+            .path = path,
+            .history = context.history,
+        })) |refused| return refused;
+    }
 
     const data = std.Io.Dir.cwd().readFileAlloc(
         context.io,
@@ -249,4 +260,54 @@ test "edit rejects an oversized file" {
     defer result.deinit(gpa);
     try std.testing.expect(result.is_error);
     try std.testing.expect(std.mem.indexOf(u8, result.content, "larger than") != null);
+}
+
+// The guard runs before the file is read, so its sentence names the skill the
+// call needs rather than a file that the call never reached.
+test "a required skill refuses the edit before it reads the file" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "f.zig", .data = "const x = 1;\n" });
+    const body = "---\nname: zig-style\n---\nUse four spaces.\n";
+    try tmp.dir.writeFile(io, .{ .sub_path = "SKILL.md", .data = body });
+    const cwd = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cwd);
+    const source = try std.fs.path.join(
+        gpa,
+        &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "SKILL.md" },
+    );
+    defer gpa.free(source);
+    var guard: SkillGuard = .{ .working_directory = cwd };
+    try guard.add(.{ .glob = "**/*.zig", .skill = "zig-style", .source = source });
+
+    var input_buf: [192]u8 = undefined;
+    const input = try std.fmt.bufPrint(&input_buf,
+        \\{{"path":".zig-cache/tmp/{s}/f.zig","old_text":"1","new_text":"2"}}
+    , .{tmp.sub_path});
+    const blocked: Context = .{ .gpa = gpa, .io = io, .skill_guard = &guard };
+    const refused = try run(&blocked, input);
+    defer refused.deinit(gpa);
+    try std.testing.expect(refused.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, refused.content, "zig-style") != null);
+    const kept = try tmp.dir.readFileAlloc(io, "f.zig", gpa, .limited(64));
+    defer gpa.free(kept);
+    try std.testing.expectEqualStrings("const x = 1;\n", kept);
+
+    const history = [_]llm.Item{
+        .{ .message = .{ .role = .user, .text = body } },
+    };
+    const loaded: Context = .{
+        .gpa = gpa,
+        .io = io,
+        .skill_guard = &guard,
+        .history = &history,
+    };
+    const applied = try run(&loaded, input);
+    defer applied.deinit(gpa);
+    try std.testing.expect(!applied.is_error);
+    const data = try tmp.dir.readFileAlloc(io, "f.zig", gpa, .limited(64));
+    defer gpa.free(data);
+    try std.testing.expectEqualStrings("const x = 2;\n", data);
 }

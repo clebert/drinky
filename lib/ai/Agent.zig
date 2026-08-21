@@ -52,6 +52,10 @@ bash: tool.Context.Bash,
 /// What the `describe_config` tool returns. The host owns the text and keeps it
 /// alive for the session. An empty document means the host exposes no config.
 config_document: []const u8,
+/// The path-triggered skill rules, handed to every tool call. The host owns the
+/// guard and keeps it alive for the session. Null means the host applies no
+/// rule. The loaded skills belong to the conversation, so a reset forgets them.
+skill_guard: ?*tool.SkillGuard,
 items: std.ArrayList(llm.Item),
 stats: Stats,
 /// Steering messages the user submitted mid-turn, drained into the running turn
@@ -415,6 +419,7 @@ pub fn init(
         effort: llm.Effort = .none,
         bash: tool.Context.Bash = .{},
         config_document: []const u8 = "",
+        skill_guard: ?*tool.SkillGuard = null,
         cache: CachePolicy = .{},
     },
 ) Agent {
@@ -428,6 +433,7 @@ pub fn init(
         .retry = options.retry,
         .bash = options.bash,
         .config_document = options.config_document,
+        .skill_guard = options.skill_guard,
         .items = .empty,
         .stats = .{},
         .steering = Steering.init(gpa, io),
@@ -715,10 +721,16 @@ fn runRounds(
             self.advanceCheckpoint(turn);
             notifyCheckpoint(handler);
         }
+        // Send every skill file that this round asked for, before the steering
+        // of the user. A tool met a file that a rule guards, so the model needs
+        // the rules of that file for whatever it does next.
+        const loaded = try self.drainSkills(turn, handler);
         // Fold mid-turn steering in before the next round. With no tools asked,
-        // a steering message keeps the turn alive and does not end it.
+        // a steering message keeps the turn alive and does not end it. A skill
+        // file keeps it alive the same way, so the rules reach the model even
+        // when the reply asked for nothing more.
         const steered = try self.drainSteering(turn, handler);
-        if (!ran_tools and !steered) return;
+        if (!ran_tools and !steered and !loaded) return;
     }
     return error.TooManyToolRounds;
 }
@@ -755,6 +767,38 @@ fn notifyCheckpoint(handler: anytype) void {
 fn freeSteeringBatch(gpa: std.mem.Allocator, batch: [][]u8) void {
     for (batch) |message| gpa.free(message);
     gpa.free(batch);
+}
+
+/// Deliver every skill file that the guard queued during this round, each as
+/// one user message. The message carries the whole skill file, so the guard
+/// proves it from the history alone on the next check. A rolled-back turn drops
+/// the message, and the next call that needs the skill queues it again.
+/// Returns whether anything was delivered.
+fn drainSkills(self: *Agent, turn: *TurnState, handler: anytype) !bool {
+    const guard = self.skill_guard orelse return false;
+    var delivered = false;
+    // One pass per rule at most, because a delivery leaves the queue.
+    for (0..tool.SkillGuard.rules_max) |_| {
+        // The current history settles a queued rule whose proof arrived by
+        // another route, an earlier delivery of this pass included.
+        const delivery = (try guard.takeQueued(self.gpa, self.io, self.items.items)) orelse break;
+        defer self.gpa.free(delivery.text);
+        try self.appendUser(delivery.text);
+        try presentation(
+            &turn.presentation_closed,
+            notifySkill(handler, delivery.skill, delivery.source),
+        );
+        delivered = true;
+    }
+    return delivered;
+}
+
+/// Tell a presentation handler that one skill file entered the conversation.
+/// Most agent tests use partial handlers, so a handler without this callback
+/// still drives a turn.
+fn notifySkill(handler: anytype, skill: []const u8, source: []const u8) !void {
+    if (comptime @hasDecl(@TypeOf(handler.*), "onSkillLoaded"))
+        try handler.onSkillLoaded(skill, source);
 }
 
 /// Deliver every queued steering message as one combined user message, appended
@@ -943,6 +987,9 @@ fn generateCacheKey(io: std.Io) [32]u8 {
 fn rollback(self: *Agent, base: usize) void {
     for (self.items.items[base..]) |item| freeItem(self.gpa, item);
     self.items.shrinkRetainingCapacity(base);
+    // A dropped item can carry the proof that a skill is loaded, so the guard
+    // searches the shortened history again.
+    if (self.skill_guard) |guard| guard.forget();
 }
 
 /// Free one history item's owned strings. An empty string frees as a no-op.
@@ -1251,6 +1298,12 @@ fn runToolsWith(
     };
     const calls = call_list.items;
     if (calls.len == 0) return false;
+    // The conversation below this reply, by index: the reservation below can
+    // move the items backing array, but never these items. The subtraction is
+    // only correct because the reply is always the tail of the history, on
+    // every path that reaches this function. The saturation alone bounds the
+    // index and proves nothing more.
+    const history_end = self.items.items.len -| reply.len;
 
     // Reserve one unfinished-call error result per call and commit the whole round
     // (reply + results) before any side effect can occur. A preparation failure
@@ -1264,6 +1317,10 @@ fn runToolsWith(
         .io = self.io,
         .bash = self.bash,
         .config_document = self.config_document,
+        .skill_guard = self.skill_guard,
+        // The reply that asked for these calls stays out, so a skill that this
+        // reply reads cannot license a write that the same reply asked for.
+        .history = self.items.items[0..history_end],
     };
     var group: std.Io.Group = .init;
     // On any early exit, reap in-flight tasks, then move every successful,
@@ -3559,6 +3616,111 @@ const probe = struct {
         return .{ .content = try context.gpa.dupe(u8, "ok"), .is_error = false };
     }
 };
+
+// A tool that meets a guarded file asks Pith for the skill. The round boundary
+// sends it as one user message, so the model holds the rules for its next act.
+test "a queued skill file joins the conversation at the round boundary" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const body = "---\nname: zig-style\n---\nUse four spaces.\n";
+    try tmp.dir.writeFile(io, .{ .sub_path = "SKILL.md", .data = body });
+    const cwd = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cwd);
+    const source = try std.fs.path.join(
+        gpa,
+        &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "SKILL.md" },
+    );
+    defer gpa.free(source);
+
+    var guard: tool.SkillGuard = .{ .working_directory = cwd };
+    try guard.add(.{ .glob = "**/*.zig", .skill = "zig-style", .source = source });
+    var agent = scriptedAgent(gpa);
+    agent.skill_guard = &guard;
+    defer agent.deinit();
+
+    // Records what the handler was told, so the report and the message can be
+    // compared against one delivery.
+    const Handler = struct {
+        skill: []const u8 = "",
+        count: usize = 0,
+
+        fn onSkillLoaded(self: *@This(), skill: []const u8, _: []const u8) !void {
+            self.skill = skill;
+            self.count += 1;
+        }
+    };
+    var handler: Handler = .{};
+    var turn: TurnState = .{ .base = 0, .checkpoint = 0 };
+
+    // Nothing waits, so the boundary sends nothing and the turn can end.
+    try std.testing.expect(!try agent.drainSkills(&turn, &handler));
+
+    try guard.require(&.{ .gpa = gpa, .io = io, .path = "src/App.zig", .history = &.{} });
+    try std.testing.expect(try agent.drainSkills(&turn, &handler));
+    try std.testing.expectEqual(@as(usize, 1), handler.count);
+    try std.testing.expectEqualStrings("zig-style", handler.skill);
+    try std.testing.expectEqual(@as(usize, 1), agent.items.items.len);
+    const message = agent.items.items[0].message;
+    try std.testing.expectEqual(llm.Role.user, message.role);
+    try std.testing.expect(std.mem.endsWith(u8, message.text, body));
+
+    // The message is the proof, so a write of the same file goes ahead now.
+    try std.testing.expect((try guard.refusal(&.{
+        .gpa = gpa,
+        .io = io,
+        .path = "src/App.zig",
+        .history = agent.items.items,
+    })) == null);
+    // One delivery per queued rule: the queue is empty again.
+    try std.testing.expect(!try agent.drainSkills(&turn, &handler));
+}
+
+// The skill guard proves a loaded skill against the conversation the tools
+// receive. That conversation must stop below the reply, or a skill that this
+// reply reads licenses a write that the same reply already asked for.
+test "the tool context carries the history below the reply" {
+    const gpa = std.testing.allocator;
+    var agent = scriptedAgent(gpa);
+    defer agent.deinit();
+    var handler: CaptureHandler = .{ .gpa = gpa };
+    defer handler.deinit();
+
+    // Records what one call saw. A tool reads the context, so only a tool can
+    // report it.
+    const Dispatch = struct {
+        var seen_count: usize = 0;
+        var seen_text: []const u8 = "";
+
+        fn mutates(name: []const u8) bool {
+            return std.mem.eql(u8, name, "write");
+        }
+
+        fn run(context: *const tool.Context, name: []const u8, input_json: []const u8) !tool.Result {
+            _ = name;
+            _ = input_json;
+            seen_count = context.history.len;
+            seen_text = if (context.history.len > 0) context.history[0].message.text else "";
+            return .{ .content = try context.gpa.dupe(u8, "ok"), .is_error = false };
+        }
+    };
+
+    // The history holds one older message and then the reply, the way a real
+    // turn leaves it.
+    try agent.appendUser("the older message");
+    try agent.items.append(gpa, .{ .tool_call = .{
+        .call_id = try gpa.dupe(u8, "w1"),
+        .name = try gpa.dupe(u8, "write"),
+        .arguments_json = try gpa.dupe(u8, "{}"),
+    } });
+    const reply = agent.items.items[1..];
+    var turn: TurnState = .{ .base = 0, .checkpoint = 0 };
+    try std.testing.expect(try agent.runToolsWith(Dispatch, reply, &turn, &handler));
+
+    try std.testing.expectEqual(@as(usize, 1), Dispatch.seen_count);
+    try std.testing.expectEqualStrings("the older message", Dispatch.seen_text);
+}
 
 test "a mutating call is a barrier between the reads around it" {
     const gpa = std.testing.allocator;

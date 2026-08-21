@@ -52,6 +52,12 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
   the file and lists every key with its type, its default, and its meaning, plus the legal model
   names, the effort levels, the compiled fallbacks, and the memory that outranks the file. It
   reports no current value, because it never reads the file.
+- A configured glob can require a skill. When a tool first touches a matching file, pith sends the
+  whole skill file into the turn at the next tool round, and the transcript names it. A read is
+  never refused. `write` and `edit` refuse until the whole skill file stands in the conversation,
+  word for word, so the next try needs no read of its own.
+- That proof is the conversation itself, so a resumed conversation proves itself. A read of its
+  `SKILL.md` and a `/skill:name` line both count as the proof.
 - Globs use `*` and `?` within a path segment and `**` across segments.
 - Searches skip version-control and build directories.
 - Binary files are skipped, oversized files are refused, and every result says when a limit cut it
@@ -127,8 +133,9 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - **/skill** — pick one of the discovered skills. Each row holds the first sentence of the skill
   description. Enter writes its `/skill:name ` line into the editor, so a task can follow. `/skill:`
   opens the same list.
-- **/skill:name** — load a discovered skill explicitly, record one user box whose head reads
-  `Skill: name · File: path`, and append any trailing text as its task below that head.
+- **/skill:name** — load a discovered skill explicitly, record one head line that reads
+  `Skill: name · File: path`, and record any trailing text as its task in a user box below it. The
+  head takes the user color and no box, so a typed message cannot forge it.
 - Every line that starts with a slash is a command line, so Pith reads it locally first and sends it
   only after a confirmation. A command that takes no argument refuses text after the name, as in
   `/new must clear the scrollback`. `/skill:name` is the one exception, because it takes its task as
@@ -299,7 +306,9 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 
 - The compiled core is minimal and mechanical, so the user owns the guidance that steers a turn.
 - The system prompt adds the startup UTC date, the working directory, and the repository root. It
-  also ranks the instruction sources it carries, so the model knows which one wins on a conflict.
+  also ranks the instruction sources it carries, so the model knows which one wins on a conflict. It
+  names each path pattern that requires a skill, so the model knows the rule before it acts and
+  knows that pith sends the skill file on the first touch.
 - pith loads exact-case `AGENTS.md` files in path order, from the Git root down to the working
   directory. Outside a repository it reads that directory alone.
 - pith looks for skills in `~/.agents/skills/`, and in `.agents/skills/` from the Git root down to
@@ -307,21 +316,25 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - pith searches each skills directory at any depth for `SKILL.md` and follows directory symlinks. On
   a name clash a project skill has priority over a user skill, and the closest copy has priority
   over a copy farther up. pith advertises each skill name and description, and loads the
-  instructions on demand.
+  instructions on demand. A skill file above the window of one `read` call, 2000 lines or 50 KiB, is
+  skipped and reported, so one call always shows the model a whole skill.
 - pith loads the user instruction files that `config.json` names, in order.
-- One startup line counts the instruction files that pith loaded and the skills that it found. A
-  count of zero stays out of the line. Only a skipped file gets its own line, and `/system` shows
-  every counted path.
+- One dense startup line counts the instruction files that pith loaded, the skills that it found,
+  the user skills that a project skill replaced, and the required skills that this project does not
+  carry. A count of zero stays out of the line. Only a skipped file gets its own line, and `/system`
+  shows every counted path.
 - User and project instructions obey one policy: a regular UTF-8 file, with content, no NUL byte,
   and at most 32 KiB. Each source loads at most 32 files and 64 KiB, and one file loads once even
   when two paths or a symbolic link reach it. pith reports what it skips.
 - `~/.pith/config.json` is optional: paths for user instructions, request and bash limits, the
-  prompt-cache warning, a default model per account, and a default effort level. pith reads it only
-  at startup, so a change applies at the next start.
+  prompt-cache warning, a default model per account, a default effort level, and the skills that a
+  path requires. pith reads it only at startup, so a change applies at the next start.
 - It holds no secrets. API keys come from `ANTHROPIC_API_KEY` and `OPENAI_API_KEY`.
 - A configured model that is not valid for its account is reported, and the compiled default used.
   An unknown effort level and a cache warning cost that pith cannot use are reported the same way. A
   key that pith does not know is reported too, so a typo never looks like an applied setting.
+- A required skill whose name no discovered skill carries guards nothing in that project. The
+  startup line counts each such name once, because the global config serves every project.
 - The config document is generated from the struct that parses the file, so a new key that carries
   no description fails the build and the document cannot drift.
 - JSON store writes use owner-only sibling `.lock` files to coordinate pith instances.

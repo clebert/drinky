@@ -10,8 +10,10 @@ const Result = @import("Result.zig");
 const fs = @import("fs.zig");
 const parse = @import("parse.zig");
 
-const lines_max = 2000;
-const bytes_max = 50 * 1024;
+/// The window of one call. A file inside it comes back whole, so a caller that
+/// must show the model a whole file keeps that file below both bounds.
+pub const lines_max = 2000;
+pub const bytes_max = 50 * 1024;
 const file_bytes_max = 16 << 20;
 
 pub const spec: llm.Tool = .{
@@ -77,6 +79,16 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
             .{path},
         );
     }
+
+    // A rule can require a skill for this file. A read is never refused, so it
+    // only asks Pith to send that skill, which reaches the model at the next
+    // round. A role that reads and never writes still gets the rules.
+    if (context.skill_guard) |guard| try guard.require(&.{
+        .gpa = gpa,
+        .io = context.io,
+        .path = path,
+        .history = context.history,
+    });
 
     const total = format.lines(data);
     const start = if (offset > 0) offset - 1 else 0;

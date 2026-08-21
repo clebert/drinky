@@ -16,6 +16,9 @@ const role = @import("role.zig");
 pub const Entry = union(enum) {
     intro: std.ArrayList(u8),
     user: std.ArrayList(u8),
+    /// What Pith sent for the user, such as the head of a loaded skill. It is
+    /// not a box, so a typed message cannot forge it.
+    skill: std.ArrayList(u8),
     thinking: std.ArrayList(u8),
     model: std.ArrayList(u8),
     tool_result: Flagged,
@@ -67,7 +70,7 @@ pub const Entry = union(enum) {
 
     pub fn deinit(self: *Entry, gpa: std.mem.Allocator) void {
         switch (self.*) {
-            .intro, .user, .thinking, .model => |*text| text.deinit(gpa),
+            .intro, .user, .skill, .thinking, .model => |*text| text.deinit(gpa),
             .tool_result, .event => |*flagged| flagged.text.deinit(gpa),
         }
     }
@@ -77,7 +80,7 @@ pub const Entry = union(enum) {
     /// and window math rely on.
     pub fn rows(self: *const Entry, columns: usize) usize {
         return switch (self.*) {
-            .intro => |text| std.mem.count(u8, text.items, "\n") + 1,
+            .intro, .skill => |text| std.mem.count(u8, text.items, "\n") + 1,
             .event => |flagged| std.mem.count(u8, flagged.text.items, "\n") + 1,
             .user => |text| paint.boxRows(&.{ .text = text.items }, columns),
             .tool_result => |flagged| paint.boxRows(
@@ -94,6 +97,10 @@ pub const Entry = union(enum) {
         switch (self.*) {
             .intro => |text| try paint.notice(placement, &.{
                 .role = .muted,
+                .prefix = "",
+            }, text.items),
+            .skill => |text| try paint.notice(placement, &.{
+                .role = .user_note,
                 .prefix = "",
             }, text.items),
             .event => |flagged| try paint.notice(placement, &.{
@@ -178,9 +185,9 @@ test "each entry variant renders exactly the rows it counts" {
         .{ .kind = .event, .options = .{ .is_error = true }, .text = "boom" },
         .{ .kind = .user, .options = .{}, .text = "a user message long enough to wrap " ++
             "across the narrow test width more than once" },
-        // The user box of a skill invocation: a head row, a blank row, the task.
-        .{ .kind = .user, .options = .{}, .text = "Skill: zig-style · File: " ++
-            ".agents/skills/zig-style/SKILL.md\n\nreview this file" },
+        // The head of a skill invocation: one line that no box holds.
+        .{ .kind = .skill, .options = .{}, .text = "Skill: zig-style · File: " ++
+            ".agents/skills/zig-style/SKILL.md" },
         .{ .kind = .model, .options = .{}, .text = "model reply\nwith a blank\n\n" ++
             "then a long paragraph that must wrap several rows" },
         .{ .kind = .thinking, .options = .{}, .text = "reasoning that runs on\n\n" ++

@@ -31,6 +31,10 @@ pub const Options = struct {
     user_instructions: []const ai.instructions.File,
     project_instructions: *const ai.instructions.Result,
     skills: ai.skills.Catalog,
+    /// The path-triggered skill rules of the session. Each one already names a
+    /// discovered skill, so a configured rule that resolved to none states
+    /// nothing here. An empty list leaves the section out.
+    required_skills: []const ai.tool.SkillGuard.Rule = &.{},
 };
 
 const InstructionsOptions = struct {
@@ -57,6 +61,8 @@ pub fn compose(gpa: std.mem.Allocator, options: *const Options) ![]u8 {
         .files = project_files,
     });
     if (options.skills.count() > 0) try writeSkills(gpa, &output.writer, &options.skills);
+    if (options.required_skills.len > 0)
+        try writeRequiredSkills(gpa, &output.writer, options.required_skills);
     return output.toOwnedSlice();
 }
 
@@ -191,6 +197,36 @@ fn writeSkills(
         try writer.writeAll("</description>\n  </skill_file>\n");
     }
     try writer.writeAll("</skills>");
+}
+
+/// Name every path-triggered skill rule, so the model reads a skill before a
+/// write rather than after a refusal. The guard stays the backstop: it refuses
+/// the call whatever this section says.
+fn writeRequiredSkills(
+    gpa: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    rules: []const ai.tool.SkillGuard.Rule,
+) !void {
+    try writer.writeAll("\n\n## Required skills\n\n");
+    try writer.writeAll(
+        "A rule below pairs a path pattern with a skill file.\n" ++
+            "Pith sends you the whole skill file when a tool first touches a file that the " ++
+            "pattern matches.\n" ++
+            "Read that skill file, and follow it for every file of that pattern.\n" ++
+            "Pith refuses a write and an edit until the whole skill file is in this " ++
+            "conversation.\n\n" ++
+            "<required_skills>\n",
+    );
+    for (rules) |rule| {
+        try writer.writeAll("  <required_skill pattern=\"");
+        try writeEscaped(writer, rule.glob);
+        try writer.writeAll("\" skill=\"");
+        try writeEscaped(writer, rule.skill);
+        try writer.writeAll("\" path=\"");
+        try writePath(gpa, writer, rule.source);
+        try writer.writeAll("\" />\n");
+    }
+    try writer.writeAll("</required_skills>");
 }
 
 fn writePath(gpa: std.mem.Allocator, writer: *std.Io.Writer, path: []const u8) !void {
@@ -469,6 +505,70 @@ test "configured user instructions have their own section" {
             "</user_instructions>",
         prompt,
     );
+}
+
+// The model reads a required skill before a write, rather than after a
+// refusal, so the prompt must name every rule the guard applies.
+test "the required skills section names every rule and stays out without one" {
+    const gpa = std.testing.allocator;
+    var empty_instructions = ai.instructions.Result.init(gpa, .project);
+    defer empty_instructions.deinit();
+    const skill_items = [_]ai.skills.Skill{.{
+        .name = "zig-style",
+        .description = "Zig conventions.",
+        .description_truncated = false,
+        .path = "/work/.agents/skills/zig-style/SKILL.md",
+        .model_invocation_disabled = false,
+        .scope = .project,
+    }};
+    const rules = [_]ai.tool.SkillGuard.Rule{
+        .{
+            .glob = "**/*.zig",
+            .skill = "zig-style",
+            .source = "/work/.agents/skills/zig-style/SKILL.md",
+        },
+        .{ .glob = "src/<b>/*.ts", .skill = "ts-style", .source = "/work/skills/ts/SKILL.md" },
+    };
+    const prompt = try compose(gpa, &.{
+        .core = "core",
+        .current_time = .zero,
+        .working_directory = "/work",
+        .user_instructions = &.{},
+        .project_instructions = &empty_instructions,
+        .skills = try ai.skills.Catalog.init(&skill_items),
+        .required_skills = &rules,
+    });
+    defer gpa.free(prompt);
+
+    // The rules follow the catalog, because a rule names a skill of it.
+    const skills_index = std.mem.indexOf(u8, prompt, "## Skills").?;
+    const required_index = std.mem.indexOf(u8, prompt, "## Required skills").?;
+    try std.testing.expect(skills_index < required_index);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        prompt,
+        "Pith refuses a write and an edit until the whole skill file is in this " ++
+            "conversation.\n\n" ++
+            "<required_skills>\n" ++
+            "  <required_skill pattern=\"**/*.zig\" skill=\"zig-style\" " ++
+            "path=\"/work/.agents/skills/zig-style/SKILL.md\" />\n" ++
+            "  <required_skill pattern=\"src/&lt;b&gt;/*.ts\" skill=\"ts-style\" " ++
+            "path=\"/work/skills/ts/SKILL.md\" />\n" ++
+            "</required_skills>",
+    ) != null);
+
+    // A session with no rule at all carries no section.
+    const plain = try compose(gpa, &.{
+        .core = "core",
+        .current_time = .zero,
+        .working_directory = "/work",
+        .user_instructions = &.{},
+        .project_instructions = &empty_instructions,
+        .skills = try ai.skills.Catalog.init(&skill_items),
+    });
+    defer gpa.free(plain);
+    try std.testing.expect(std.mem.indexOf(u8, plain, "## Skills") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plain, "## Required skills") == null);
 }
 
 test "generated paths cannot add prompt lines or controls" {

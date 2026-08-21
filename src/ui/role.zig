@@ -52,6 +52,10 @@ pub const Name = enum {
     @"error",
     /// A user message box.
     user,
+    /// A line that Pith wrote about the conversation of the user, such as the
+    /// head of a loaded skill. It takes the color of a user message without the
+    /// swap, so no message can look like one.
+    user_note,
     /// The editor and picker frame.
     input_frame,
     /// The moving segment on the input frame.
@@ -79,6 +83,7 @@ pub fn sequence(comptime name: Name) []const u8 {
         .warning => "\x1b[33m",
         .@"error" => "\x1b[31m",
         .user => "\x1b[35;7m",
+        .user_note => "\x1b[35m",
         .input_frame => "\x1b[35m",
         .activity => "\x1b[36m",
         .tool_pending => "\x1b[36;7m",
@@ -139,6 +144,9 @@ test "the role map pins the SGR sequence for each role" {
         // Each message box pairs one palette color with reverse video, so the
         // fill takes the color and the text keeps the terminal background.
         .{ .name = .user, .sequence = "\x1b[35;7m" },
+        // A note of Pith about that conversation keeps the color and drops the
+        // swap, so a message box and a note never read alike.
+        .{ .name = .user_note, .sequence = "\x1b[35m" },
         // The input frame uses the user's foreground slot without the swap.
         .{ .name = .input_frame, .sequence = "\x1b[35m" },
         .{ .name = .activity, .sequence = "\x1b[36m" },

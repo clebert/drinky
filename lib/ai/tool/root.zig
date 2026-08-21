@@ -9,6 +9,7 @@ const llm = @import("../llm.zig");
 
 pub const Context = @import("Context.zig");
 pub const Result = @import("Result.zig");
+pub const SkillGuard = @import("SkillGuard.zig");
 
 const read = @import("read.zig");
 const write = @import("write.zig");
@@ -17,6 +18,12 @@ const find = @import("find.zig");
 const grep = @import("grep.zig");
 const bash = @import("bash.zig");
 const describe_config = @import("describe_config.zig");
+
+/// The window of one `read` call: a file inside both bounds comes back whole.
+/// The skill scan holds a skill file below it, so one call can put the whole
+/// file in front of the model.
+pub const read_lines_max = read.lines_max;
+pub const read_bytes_max = read.bytes_max;
 
 const Entry = struct {
     tool: llm.Tool,

@@ -29,6 +29,11 @@ default_effort: ?ai.llm.Effort = null,
 /// The user instruction files that `config.json` names, in the configured order,
 /// with the messages the load produced. Owned.
 user_instructions: ai.instructions.Result,
+/// The path-triggered skills that `config.json` names, in the configured order.
+/// The load resolves no name here, because the skill scan runs later. The app
+/// pairs each entry with a discovered skill and reports one it cannot pair.
+/// Owned. `deinit` frees them.
+required_skills: []const RequiredSkill = &.{},
 /// The configured default-model names that did not resolve (unknown, or a model
 /// of the wrong vendor for their account). The config keeps them so the app can
 /// tell the user Pith ignored their line. Empty on the built-in default. Owned.
@@ -80,9 +85,18 @@ pub const DroppedModel = struct {
     name: []const u8,
 };
 
+/// One configured path-triggered skill: the path glob and the name of the skill
+/// that a matching file requires. Owns both strings (duped out of the parsed
+/// file).
+pub const RequiredSkill = struct {
+    glob: []const u8,
+    skill: []const u8,
+};
+
 /// The on-disk shape. Each field defaults to the built-in, so any subset parses.
 const File = struct {
     user_instructions: []const File.UserInstruction = &.{},
+    required_skills: []const File.RequiredSkill = &.{},
     request: Request = .{},
     bash: Bash = .{},
     cache: Cache = .{},
@@ -117,6 +131,13 @@ const File = struct {
     /// `<home>/.pith/`.
     const UserInstruction = struct {
         path: JsonString,
+    };
+
+    /// One configured path-triggered skill. The glob measures against the path
+    /// relative to the working directory.
+    const RequiredSkill = struct {
+        glob: JsonString,
+        skill: JsonString,
     };
 
     const Request = struct {
@@ -203,6 +224,26 @@ const keys = [_]Key{
         .path = "user_instructions[].path",
         .description = "The path of one instruction file. A relative path resolves against " ++
             "the directory of this file.",
+    },
+    .{
+        .path = "required_skills",
+        .description = std.fmt.comptimePrint(
+            "The skills that a file requires. Before the write tool or the edit tool " ++
+                "changes a file that an entry matches, the whole skill file of that entry " ++
+                "must be in the conversation. Pith applies at most {d} entries.",
+            .{ai.tool.SkillGuard.rules_max},
+        ),
+    },
+    .{
+        .path = "required_skills[].glob",
+        .description = "The path pattern of one entry. Pith measures it against the path " ++
+            "relative to the working directory, and against the absolute path. A `*` and a " ++
+            "`?` match inside one path segment, and a `**` segment matches across segments.",
+    },
+    .{
+        .path = "required_skills[].skill",
+        .description = "The name of the skill that the pattern requires. Pith reports a " ++
+            "name that no discovered skill carries, and applies no rule for it.",
     },
     .{
         .path = "request.connect_timeout_ms",
@@ -389,6 +430,9 @@ const leaves: []const Leaf = blk: {
 /// leaf with no entry, a duplicate entry, and an entry that names no leaf are
 /// all compile errors.
 const key_lines = blk: {
+    // The walk pairs every leaf with every key, so its work grows with the
+    // square of the key count. Each new key needs a little more room here.
+    @setEvalBranchQuota(10_000);
     var text: []const u8 = "";
     var used = [_]bool{false} ** keys.len;
     for (leaves) |leaf| {
@@ -440,6 +484,7 @@ const effort_levels = blk: {
 const example =
     \\{
     \\  "user_instructions": [{ "path": "instructions.md" }],
+    \\  "required_skills": [{ "glob": "**/*.zig", "skill": "zig-style" }],
     \\  "request": { "idle_timeout_ms": 90000 },
     \\  "bash": { "timeout_ms": 300000 },
     \\  "cache": { "openai_retention_ms": 600000, "warning_min_cost": 0.05 },
@@ -518,11 +563,16 @@ pub fn document(
     });
 }
 
-/// Free the path, the user instruction files, their messages, the
-/// dropped-default names, and the unknown keys.
+/// Free the path, the user instruction files, their messages, the required
+/// skills, the dropped-default names, and the unknown keys.
 pub fn deinit(self: *Config, gpa: std.mem.Allocator) void {
     gpa.free(self.path);
     self.user_instructions.deinit();
+    for (self.required_skills) |required| {
+        gpa.free(required.glob);
+        gpa.free(required.skill);
+    }
+    gpa.free(self.required_skills);
     for (self.dropped_models) |dropped| gpa.free(dropped.name);
     gpa.free(self.dropped_models);
     if (self.dropped_effort) |name| gpa.free(name);
@@ -595,6 +645,22 @@ fn loadFromData(gpa: std.mem.Allocator, io: std.Io, options: *const DataOptions)
     });
     errdefer user_instructions.deinit();
 
+    var required: std.ArrayList(RequiredSkill) = .empty;
+    errdefer {
+        for (required.items) |item| {
+            gpa.free(item.glob);
+            gpa.free(item.skill);
+        }
+        required.deinit(gpa);
+    }
+    for (parsed.value.required_skills) |configured| {
+        const owned_glob = try gpa.dupe(u8, configured.glob.value);
+        errdefer gpa.free(owned_glob);
+        const owned_skill = try gpa.dupe(u8, configured.skill.value);
+        errdefer gpa.free(owned_skill);
+        try required.append(gpa, .{ .glob = owned_glob, .skill = owned_skill });
+    }
+
     var dropped: std.ArrayList(DroppedModel) = .empty;
     errdefer {
         for (dropped.items) |item| gpa.free(item.name);
@@ -665,6 +731,11 @@ fn loadFromData(gpa: std.mem.Allocator, io: std.Io, options: *const DataOptions)
         gpa.free(unknown_keys);
     }
     const dropped_models = try dropped.toOwnedSlice(gpa);
+    errdefer {
+        for (dropped_models) |item| gpa.free(item.name);
+        gpa.free(dropped_models);
+    }
+    const required_skills = try required.toOwnedSlice(gpa);
     return .{
         .path = owned_path,
         .timeouts = .{
@@ -689,6 +760,7 @@ fn loadFromData(gpa: std.mem.Allocator, io: std.Io, options: *const DataOptions)
         .default_models = default_models,
         .default_effort = default_effort,
         .user_instructions = user_instructions,
+        .required_skills = required_skills,
         .dropped_models = dropped_models,
         .dropped_effort = dropped_effort,
         .dropped_cost = dropped_cost,
@@ -1054,6 +1126,33 @@ test "load fills missing fields and sections from defaults" {
     try std.testing.expectEqual(timeouts_default.idle_ms, empty.timeouts.idle_ms);
     try std.testing.expectEqual(retry_default.attempts_max, empty.retry.attempts_max);
     try std.testing.expectEqual(@as(usize, 0), empty.user_instructions.files().len);
+}
+
+test "load reads the required skills in file order" {
+    var config = try loadDataForTest(
+        \\{ "required_skills": [{ "glob": "**/*.zig", "skill": "zig-style" },
+        \\  { "glob": "src/**/*.ts", "skill": "ts-style" }] }
+    );
+    defer config.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), config.required_skills.len);
+    try std.testing.expectEqualStrings("**/*.zig", config.required_skills[0].glob);
+    try std.testing.expectEqualStrings("zig-style", config.required_skills[0].skill);
+    try std.testing.expectEqualStrings("src/**/*.ts", config.required_skills[1].glob);
+    try std.testing.expectEqualStrings("ts-style", config.required_skills[1].skill);
+
+    // An entry states both halves, and each one is a string. The load resolves
+    // no name here, because the skill scan runs later.
+    try std.testing.expectError(error.MissingField, loadDataForTest(
+        \\{ "required_skills": [{ "glob": "**/*.zig" }] }
+    ));
+    try std.testing.expectError(error.UnexpectedToken, loadDataForTest(
+        \\{ "required_skills": [{ "glob": "**/*.zig", "skill": ["zig-style"] }] }
+    ));
+
+    // Without the key no file requires a skill.
+    var empty = try loadDataForTest("{}");
+    defer empty.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), empty.required_skills.len);
 }
 
 test "load resolves default_models to compiled models, dropping unknown names" {

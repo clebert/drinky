@@ -5,6 +5,9 @@
 
 const std = @import("std");
 
+const llm = @import("../llm.zig");
+const SkillGuard = @import("SkillGuard.zig");
+
 gpa: std.mem.Allocator,
 io: std.Io,
 /// Bounds the bash tool: how much of a command's output survives, and how long
@@ -16,6 +19,15 @@ bash: Bash = .{},
 /// any app-specific knowledge. An empty document means the host exposes no
 /// config, and the tool reports that.
 config_document: []const u8 = "",
+/// The path-triggered skill rules of the session, or null when the host applies
+/// none. A tool that writes a file asks the guard first. The host owns the guard
+/// and its rules.
+skill_guard: ?*SkillGuard = null,
+/// The conversation below the reply that asked for this call. The guard proves
+/// a loaded skill against it. The reply itself stays out, so a skill that one
+/// reply reads cannot license a write that the same reply already asked for.
+/// The slice is valid for the duration of the call.
+history: []const llm.Item = &.{},
 
 pub const Bash = struct {
     /// The whole lines kept from the tail of a command's output.

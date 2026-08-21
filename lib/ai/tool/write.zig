@@ -6,6 +6,7 @@ const format = @import("../format.zig");
 const llm = @import("../llm.zig");
 const Context = @import("Context.zig");
 const Result = @import("Result.zig");
+const SkillGuard = @import("SkillGuard.zig");
 const fs = @import("fs.zig");
 const parse = @import("parse.zig");
 
@@ -38,6 +39,16 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
     defer parsed.deinit();
     const path = parsed.value.path;
     const contents = parsed.value.content;
+
+    // A rule that guards this file refuses the call before it changes anything.
+    if (context.skill_guard) |guard| {
+        if (try guard.refusal(&.{
+            .gpa = gpa,
+            .io = context.io,
+            .path = path,
+            .history = context.history,
+        })) |refused| return refused;
+    }
 
     fs.writeFile(context.io, std.Io.Dir.cwd(), .{ .sub_path = path, .data = contents }) catch |err|
         return Result.cannot(gpa, err, "write", path);
@@ -124,6 +135,57 @@ test "write canceled mid-write propagates and leaves the file untouched" {
     const data = try tmp.dir.readFileAlloc(io, "f.txt", gpa, .limited(64));
     defer gpa.free(data);
     try std.testing.expectEqualStrings("old", data);
+}
+
+// A rule that guards the file must stop the call before it writes anything.
+// A refusal after the write states a requirement the file no longer needs.
+test "a required skill refuses the write and leaves the file absent" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const body = "---\nname: zig-style\n---\nUse four spaces.\n";
+    try tmp.dir.writeFile(io, .{ .sub_path = "SKILL.md", .data = body });
+    const cwd = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cwd);
+    const source = try std.fs.path.join(
+        gpa,
+        &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "SKILL.md" },
+    );
+    defer gpa.free(source);
+    var guard: SkillGuard = .{ .working_directory = cwd };
+    try guard.add(.{ .glob = "**/*.zig", .skill = "zig-style", .source = source });
+
+    var input_buf: [128]u8 = undefined;
+    const input = try std.fmt.bufPrint(&input_buf,
+        \\{{"path":".zig-cache/tmp/{s}/new.zig","content":"const x = 1;\n"}}
+    , .{tmp.sub_path});
+    const blocked: Context = .{ .gpa = gpa, .io = io, .skill_guard = &guard };
+    const refused = try run(&blocked, input);
+    defer refused.deinit(gpa);
+    try std.testing.expect(refused.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, refused.content, "zig-style") != null);
+    try std.testing.expectError(
+        error.FileNotFound,
+        tmp.dir.readFileAlloc(io, "new.zig", gpa, .limited(64)),
+    );
+
+    // The conversation carries the whole skill file, so the same call writes.
+    const history = [_]llm.Item{
+        .{ .tool_result = .{ .call_id = "1", .content = body, .is_error = false } },
+    };
+    const loaded: Context = .{
+        .gpa = gpa,
+        .io = io,
+        .skill_guard = &guard,
+        .history = &history,
+    };
+    const written = try run(&loaded, input);
+    defer written.deinit(gpa);
+    try std.testing.expect(!written.is_error);
+    const data = try tmp.dir.readFileAlloc(io, "new.zig", gpa, .limited(64));
+    defer gpa.free(data);
+    try std.testing.expectEqualStrings("const x = 1;\n", data);
 }
 
 // `write` and `read` count lines under one rule, so a write and a read of the

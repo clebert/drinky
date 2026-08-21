@@ -355,6 +355,10 @@ pub const TurnEvent = struct {
         /// turn as one combined message: show it, hide those rows from the queue
         /// view, and retain their rich drafts until the receipt resolves them.
         steering_consumed: SteeringConsumed,
+        /// Pith sent one skill file into the running turn, because a tool met a
+        /// file that a rule guards. It is no message of the user, so it shows as
+        /// a head line rather than a user box.
+        skill_loaded: SkillLoaded,
         /// Payload-free wakeup: the authoritative worker result is ready to join.
         turn_ended,
 
@@ -369,6 +373,9 @@ pub const TurnEvent = struct {
             is_error: bool,
         };
         pub const SteeringConsumed = struct { text: []u8, count: usize };
+        /// The name and the file of one skill that Pith sent. The event owns
+        /// both.
+        pub const SkillLoaded = struct { skill: []u8, source: []u8 };
         /// The requested and the served model name of one switched reply. The
         /// event owns both, and the named fields keep the two apart.
         pub const ModelMismatch = struct { requested: []u8, served: []u8 };
@@ -386,6 +393,10 @@ pub const TurnEvent = struct {
                 if (result.summary) |summary| gpa.free(summary.text);
             },
             .steering_consumed => |consumed| gpa.free(consumed.text),
+            .skill_loaded => |loaded| {
+                gpa.free(loaded.skill);
+                gpa.free(loaded.source);
+            },
             .model_mismatch => |mismatch| {
                 gpa.free(mismatch.requested);
                 gpa.free(mismatch.served);
@@ -621,6 +632,20 @@ pub fn applyTurnEvent(self: *Session, event: *const TurnEvent) !bool {
                 @min(self.steering_consumed_count + consumed.count, self.steering.items.len);
             self.steering_retained_count =
                 @max(self.steering_retained_count, self.steering_consumed_count);
+        },
+        .skill_loaded => |loaded| {
+            // The head reads like the head of a `/skill:name` line and takes no
+            // box, because the user typed none of it. The skill file itself
+            // stays out of the transcript, as an invoked skill does.
+            const source = try ai.format.path(self.gpa, loaded.source, &self.display_roots);
+            defer self.gpa.free(source);
+            const text = try std.fmt.allocPrint(
+                self.gpa,
+                "Skill: {s} · File: {s}",
+                .{ loaded.skill, source },
+            );
+            defer self.gpa.free(text);
+            try self.transcript.append(.skill, .{}, text);
         },
         .turn_ended => {
             turn.progress_sequence_applied = event.progress_sequence;
@@ -2976,6 +3001,37 @@ test "a partial cancel removes consumed steering beyond the commit frontier" {
     try std.testing.expectEqual(@as(usize, 2), blocks.len);
     try std.testing.expectEqualStrings("committed answer", blocks[1].model.items);
     try std.testing.expectEqualStrings("restore me", session.editor.visible());
+}
+
+// A skill that Pith sent is no message of the user, so it must not read like
+// one. It takes a head line of its own, and the file it names stays out.
+test "a delivered skill shows as a head line, not as a user box" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    defer session.deinit();
+    session.display_roots = .{ .working_directory = "/work", .home_directory = "/home/you" };
+    session.beginTurn(1);
+
+    _ = try session.applyTurnEvent(&.{
+        .generation = 1,
+        .progress_sequence = 1,
+        .payload = .{ .skill_loaded = .{
+            .skill = try gpa.dupe(u8, "zig-style"),
+            .source = try gpa.dupe(u8, "/work/.agents/skills/zig-style/SKILL.md"),
+        } },
+    });
+
+    const blocks = session.transcript.blocks();
+    try std.testing.expectEqual(@as(usize, 1), blocks.len);
+    switch (blocks[0]) {
+        .skill => |head| try std.testing.expectEqualStrings(
+            "Skill: zig-style · File: .agents/skills/zig-style/SKILL.md",
+            head.items,
+        ),
+        else => return error.ExpectedSkill,
+    }
 }
 
 // A normal completion frees the retained prompt (paste payloads included), so a

@@ -271,6 +271,10 @@ Pith never stages, commits, restores, or changes the index.
 Every role receives the normal environment, instruction, skill, and tool sections. Every role gets
 the complete tool registry.
 
+A path-triggered skill reaches every role through its reads. Pith sends the skill file when a tool
+first touches a file that a rule matches, so the reviewer and the judge hold the rules of the code
+they read. Neither role writes, so a refusal never carries those rules to them.
+
 The reviewer and judge:
 
 - Can run required verification commands.

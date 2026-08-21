@@ -4,15 +4,24 @@
 
 const std = @import("std");
 
+const format = @import("format.zig");
 const instructions = @import("instructions.zig");
 const project = @import("project.zig");
 const skill_header = @import("skill_header.zig");
+const tool = @import("tool/root.zig");
 
 const entries_visited_max = 100_000;
 const candidates_retained_max = 1024;
 const skills_max = 1024;
 const notices_max = 1024;
 const skill_file_bytes_max = 16 << 20;
+
+/// A skill must fit the window of one `read` call. The model then holds the
+/// whole file after one call, and Pith can prove from the conversation that it
+/// loaded the skill. A file above either bound comes back in parts, which
+/// proves nothing, so the scan skips it and says so.
+const skill_lines_max = tool.read_lines_max;
+const skill_bytes_max = tool.read_bytes_max;
 
 pub const Skill = struct {
     name: []const u8,
@@ -120,6 +129,9 @@ pub const Registry = struct {
     /// The startup messages of the scan, in the shape every instruction source
     /// reports, so the app has one way to show them all.
     notice_items: std.ArrayList(instructions.Notice) = .empty,
+    /// How many user skills a project skill of the same name replaced. The
+    /// replacement is the documented precedence, so it counts and never warns.
+    replaced_count: usize = 0,
     skills_capped: bool = false,
     notices_capped: bool = false,
 
@@ -148,6 +160,10 @@ pub const Registry = struct {
 
     pub fn notices(self: *const Registry) []const instructions.Notice {
         return self.notice_items.items;
+    }
+
+    pub fn replacedCount(self: *const Registry) usize {
+        return self.replaced_count;
     }
 
     pub fn get(self: *const Registry, name: []const u8) ?*const Skill {
@@ -326,6 +342,20 @@ pub const Registry = struct {
             );
             return;
         }
+        if (data.len > skill_bytes_max) {
+            try self.warn(
+                "Pith skipped {s} because the skill file is larger than {d} bytes.",
+                .{ path, skill_bytes_max },
+            );
+            return;
+        }
+        if (format.lines(data) > skill_lines_max) {
+            try self.warn(
+                "Pith skipped {s} because the skill file has more than {d} lines.",
+                .{ path, skill_lines_max },
+            );
+            return;
+        }
 
         var frontmatter = skill_header.parse(self.gpa, data) catch |err| switch (err) {
             error.MissingFrontmatter => {
@@ -429,10 +459,7 @@ pub const Registry = struct {
         for (self.skill_items.items) |*existing| {
             if (!std.mem.eql(u8, existing.name, incoming.name)) continue;
             if (incoming.scope == .project and existing.scope == .user) {
-                try self.warn(
-                    "The project skill \"{s}\" at {s} replaces the user skill at {s}.",
-                    .{ incoming.name, incoming.path, existing.path },
-                );
+                self.replaced_count += 1;
                 existing.deinit(self.gpa);
                 existing.* = incoming.*;
                 incoming.* = undefined;
@@ -462,7 +489,7 @@ pub const Registry = struct {
     /// the user must fix, so they all carry `.failure`.
     fn warn(
         self: *Registry,
-        comptime format: []const u8,
+        comptime template: []const u8,
         args: anytype,
     ) !void {
         if (self.notices_capped) return;
@@ -474,7 +501,7 @@ pub const Registry = struct {
             self.notices_capped = true;
             return;
         }
-        const text = try std.fmt.allocPrint(self.gpa, format, args);
+        const text = try std.fmt.allocPrint(self.gpa, template, args);
         errdefer self.gpa.free(text);
         try self.notice_items.append(self.gpa, .{ .severity = .failure, .text = text });
     }
@@ -734,7 +761,13 @@ test "discovery is recursive and project skills shadow user and ancestor skills"
     try std.testing.expectEqualStrings("nearest copy", registry.get("shared").?.description);
     try std.testing.expect(registry.get("other") != null);
     try std.testing.expect(registry.get("outside") == null);
-    try std.testing.expect(registry.notices().len >= 2);
+    // The project copy replaces the user copy silently, because that is the
+    // documented precedence. Only the same-scope clash still warns.
+    try std.testing.expectEqual(@as(usize, 1), registry.replacedCount());
+    try std.testing.expectEqual(@as(usize, 1), registry.notices().len);
+    try std.testing.expect(
+        std.mem.indexOf(u8, registry.notices()[0].text, "has priority") != null,
+    );
 }
 
 test "a path that is not absolute and a root that is not an ancestor both fail safely" {
@@ -799,6 +832,62 @@ test "without a Git root the project scan covers only the working directory" {
     try std.testing.expect(registry.get("helper") != null);
     try std.testing.expect(registry.get("local") != null);
     try std.testing.expect(registry.get("ancestor") == null);
+}
+
+// A skill above the window of one `read` call comes back in parts, and a part
+// proves nothing about a loaded skill. The scan keeps every skill provable.
+test "a skill file above the window of one read call is skipped" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const head = "---\nname: {s}\ndescription: a long skill\n---\n";
+    const wide = try std.fmt.allocPrint(gpa, head ++ "{s}\n", .{
+        "wide",
+        "x" ** (skill_bytes_max + 1),
+    });
+    defer gpa.free(wide);
+    try writeTestSkill(io, tmp.dir, "user/wide/SKILL.md", wide);
+    var tall: std.Io.Writer.Allocating = .init(gpa);
+    defer tall.deinit();
+    try tall.writer.print(head, .{"tall"});
+    for (0..skill_lines_max) |_| try tall.writer.writeAll("body\n");
+    try writeTestSkill(io, tmp.dir, "user/tall/SKILL.md", tall.written());
+    // The last file that still fits: the bounds are inclusive.
+    var edge: std.Io.Writer.Allocating = .init(gpa);
+    defer edge.deinit();
+    try edge.writer.print(head, .{"edge"});
+    while (format.lines(edge.written()) < skill_lines_max) try edge.writer.writeAll("body\n");
+    try writeTestSkill(io, tmp.dir, "user/edge/SKILL.md", edge.written());
+    var work = try tmp.dir.createDirPathOpen(io, "work", .{});
+    work.close(io);
+
+    const user_root = try tmpPath(gpa, io, &tmp, "user");
+    defer gpa.free(user_root);
+    const project_start = try tmpPath(gpa, io, &tmp, "work");
+    defer gpa.free(project_start);
+    var registry = try discover(gpa, io, &.{
+        .user_root = user_root,
+        .project_start = project_start,
+        .project_root = null,
+    });
+    defer registry.deinit();
+
+    try std.testing.expect(registry.get("wide") == null);
+    try std.testing.expect(registry.get("tall") == null);
+    try std.testing.expect(registry.get("edge") != null);
+    try std.testing.expectEqual(@as(usize, 2), registry.notices().len);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        registry.notices()[1].text,
+        "larger than",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        registry.notices()[0].text,
+        "more than",
+    ) != null);
 }
 
 test "invalid names fall back, empty descriptions skip, and hidden skills stay out of catalog" {
