@@ -1,78 +1,61 @@
-Drinky is a minimal, dependency-free coding-agent harness in Zig, inspired by pi. Its focus is a
-hand-rolled terminal UI renderer for modern terminals such as Ghostty.
+Drinky is a terminal-native coding agent that keeps the conversation in normal scrollback. It is a
+dependency-free Zig program with a hand-written terminal renderer.
 
-### Layout
+## Architecture
 
-The project has three modules, wired in `build.zig`. Imports flow one way: `drinky` depends on both
-libs, and the libs never import each other or the app. The module boundary makes a back-edge a
-compile error:
+`build.zig` defines three modules. Dependencies flow from the app to the libraries only.
 
-- `lib/terminal/`: the reusable terminal rendering engine (`Tty`, `escape`, the reconciling `View`
-  renderer, `Input`, the UAX #29 `grapheme` segmenter, and the display-`width` math built on it). It
-  knows nothing about the app or the agent.
-- `lib/ai/`: the provider-neutral agent core (`Agent`, `llm`, `models`, `provider`, `command`,
-  `tool`, `anthropic`).
-- `src/`: the `drinky` app. It contains `main`, `App` (the composition root and event loop), the
-  `Transcript` model, the `layout` projection onto the bounded window, and the `ui/` widgets drawn
-  on the engine (`Editor`, `Picker`, `status`, and the `block`, `role`, `attribute`, and `paint`
-  primitives).
+- `lib/terminal/` contains reusable terminal rendering, input, grapheme segmentation, and display
+  width code. It knows nothing about the app or the agent.
+- `lib/ai/` contains the provider-neutral agent core, provider transports, commands, and tools.
+- `src/` contains the composition root, event loop, transcript, layout, and UI.
 
-Each module has its own test artifact. Its `root.zig` owns the public namespace and is the only
-place where re-exports are allowed. A test only runs if its file is reachable from the module
-`root.zig` through a re-export or an analyzed test path. An unwired test file passes silently.
-Because of this, `test-audit.sh` fails CI when the number of tests that ran differs from the number
-declared in source.
+The libraries never import each other or the app. Only the `root.zig` file in a module can re-export
+names.
 
-### Features and backlog
+Each module has one test artifact. A test runs only when its file is reachable from `root.zig` or an
+analyzed test path. The `scripts/test-audit.sh` script fails if a source test does not run.
 
-`FEATURES.md` is a human-readable overview of what Drinky supports, with one short sentence per
-capability. Keep it current. When you land a capability, add its line. When a capability goes away,
-delete its line. Keep the file short. It is an orientation document, not a spec. The tests are what
-guard against regressions.
+## Documents
 
-`BACKLOG.md` holds the planned work in priority order, and `TODO.md` is the loose inbox that feeds
-it. When you land an entry, delete it from `BACKLOG.md`. Read the header of `BACKLOG.md` before you
-change either file.
+`README.md` describes the stable user-facing product shape. Keep it concise and synchronized with
+`FEATURES.md`. Keep roadmap and decision history out of the README.
 
-### The name
+`FEATURES.md` lists current capabilities with one short sentence each. It is an overview, not a
+specification. Add a line when a capability lands. Delete the line when a capability goes away.
 
-The project is `drinky`. The two written forms have separate jobs, so do not exchange them.
+`BACKLOG.md` holds planned work in priority order. `TODO.md` is the git-ignored inbox that feeds it.
+Delete a landed entry from `BACKLOG.md`. Read the `BACKLOG.md` header before you change either file.
 
-- Write `drinky` in lowercase for every name that a machine parses. This covers the executable, the
-  Zig module, the `~/.drinky/` directory, the repository, and the `drinky.sh` domain. Put this form
-  in backticks in Markdown.
-- Write `Drinky` with a capital letter for the product as a proper noun in prose. This form covers
-  Markdown sentences, code comments, and every user-facing string. A title takes this form too, so
-  the README heading is `# Drinky`.
-- Never start a sentence with the lowercase form. Write `Drinky`, or rewrite the sentence.
-- `DRINKY` is reserved for an environment variable. Never use that form in prose or in an
-  identifier.
+## Name
 
-### Writing style
+- Use lowercase `drinky` for every machine-parsed name. Format it as code in Markdown.
+- Use `Drinky` for the product in prose, comments, user-facing text, and titles.
+- Never start a sentence with lowercase `drinky`.
+- Reserve `DRINKY` for an environment variable. Do not use it in prose or code identifiers.
 
-Write all human-readable prose in ASD-STE100 Simplified Technical English. This covers all Markdown
-files, the code comments, and every Drinky-generated user-facing string. Apply these practical
-rules:
+## Writing style
 
-- Write short sentences in the active voice or the direct imperative. Keep one topic per sentence.
-  Use at most 20 words in an instruction and 25 in a description.
-- Use the same noun for the same thing. Prefer a simple technical noun over a rare synonym. Break up
-  a chain of more than three nouns.
-- Keep the articles (`the`, `a`, `this`). Write `must` for a requirement and `can` for a capability.
-  Do not write `should`, `may`, `might`, or `would`.
-- Do not use semicolons or contractions (write `do not`, `cannot`). Prefer a finite verb to an -ing
-  form. Keep the rest of normal English punctuation.
-- A message that reports an event, a result, or a required action is a complete sentence in sentence
-  case with end punctuation. A label, metric, or control hint can stay a fragment. Give a fragment
-  clear casing and a colon between its key or action and its value (`Context: 42%`, `Esc: Cancel`).
+Use ASD-STE100 Simplified Technical English for Markdown, code comments, and Drinky-generated text.
+
+- Use active voice or a direct imperative. Put one topic in each sentence.
+- Limit an instruction to 20 words and a description to 25 words.
+- Use the same noun for the same concept. Prefer simple technical nouns.
+- Use at most three nouns in a chain.
+- Keep the articles. Use `must` for requirements and `can` for capabilities.
+- Do not use `should`, `may`, `might`, or `would`.
+- Do not use semicolons or contractions. Prefer a finite verb to an `-ing` form.
+- Use a complete sentence for an event, result, or required action. Use sentence case and end
+  punctuation.
+- A label, metric, or control hint can be a fragment. Use clear casing and a colon between its key
+  and value.
 - Wrap a dynamic error name in a complete sentence:
   `Drinky could not open {path} because of error {name}.`
 
-The rules do not cover provider, model, user, or shell output. They also do not cover literal
-technical identifiers (command names, flags, JSON keys, tool argument schemas). Preserve the meaning
-and the terminal-width limits when you reword a string.
+The rules do not apply to literal technical identifiers or schemas. Preserve meaning and
+terminal-width limits when you reword text.
 
-### CI
+## Checks
 
 After code changes, always run:
 
@@ -82,6 +65,5 @@ zig fmt --check build.zig src lib scripts
 sh scripts/test-audit.sh
 ```
 
-`zig build unicode` regenerates `lib/terminal/unicode_data.zig` (the display-width and
-grapheme-break tables) from the Unicode Character Database. It fetches over the network. Run it by
-hand, never as part of the default build.
+`zig build unicode` regenerates `lib/terminal/unicode_data.zig` from the Unicode Character Database.
+It uses the network. Run it manually, never as part of the default build.

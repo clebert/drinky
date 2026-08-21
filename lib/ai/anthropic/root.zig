@@ -1,7 +1,11 @@
-//! The Anthropic provider: the credential lifecycles (`Auth` for the
-//! subscription, `ConsoleAuth` for the Console account), the OAuth PKCE flows
-//! (`oauth`, `console`) they drive, the Messages API transport (`Transport`),
-//! and request serialization (`wire`).
+//! The Anthropic provider.
+//!
+//! `Auth` manages subscription credentials. `ConsoleAuth` manages the API key from Console OAuth.
+//! `oauth` and `console` reuse the Claude Code OAuth client and private endpoints.
+//! Anthropic does not document these interfaces for third-party clients. They can change without
+//! notice. Both login paths prepend the exact Claude Code identity in `wire`. The Console key needs
+//! this identity to reach every model. A plain API key omits it. `Transport` sends Messages API
+//! requests.
 
 const std = @import("std");
 

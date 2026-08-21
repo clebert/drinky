@@ -1,46 +1,62 @@
 # Drinky
 
-Drinky is a coding agent for the terminal. You type a prompt. The model reads, searches, writes, and
-edits the files in the working directory, and the reply streams into your scrollback.
+A terminal-native coding agent that keeps the conversation in normal scrollback.
 
-Drinky is written in Zig and has no dependencies. It talks to Anthropic and OpenAI, through a
-subscription login or an API key. The agent loop is the easy part. The terminal UI is the hard part.
-The goal is a small hand-rolled renderer for modern terminals, with the lowest line count possible.
-The project takes its inspiration from [pi](https://github.com/earendil-works/pi-mono).
+Give Drinky a prompt. The model can read, search, and change files or run commands in the working
+directory. Drinky is written in Zig and has no third-party dependencies.
 
-Status: early and unreleased. There is no license yet.
+## Features
 
-## Run
+- Drinky streams the conversation into normal scrollback and reserves full-window pages for
+  temporary views.
+- Drinky accepts steering during a turn and keeps completed work visible after a cancellation or
+  retry.
+- Drinky connects to Anthropic and OpenAI through a subscription login or an API key.
+- Drinky loads repository instructions and skills on demand, and can require skills for selected
+  paths.
 
-Drinky needs Zig 0.16.0, a POSIX system, and the `HOME` variable.
+See [`FEATURES.md`](FEATURES.md) for the complete capability overview.
+
+## Build and run
+
+Drinky requires Zig 0.16.0, a POSIX system, and the `HOME` variable. Drinky works best in a modern
+terminal. The project uses [Ghostty](https://ghostty.org/) for development and testing.
+
+Build the `ReleaseSafe` executable, then run it:
 
 ```sh
-zig build          # build and ZLS check
-zig build run      # run
-zig build test     # run all tests
+zig build -Doptimize=ReleaseSafe
+./zig-out/bin/drinky
 ```
 
-Set `ANTHROPIC_API_KEY` or `OPENAI_API_KEY`, or sign in with `/login`. `~/.drinky/config.json` is
-optional.
+Set `ANTHROPIC_API_KEY` or `OPENAI_API_KEY`. You can also use `/login` for a subscription account.
 
-## Terminal
+## Configuration
 
-Drinky uses synchronized output, the Kitty keyboard protocol, and grapheme cluster processing
-(DECSET 2027). It paints with the default colors and the ANSI slots 0 to 15 alone, so the theme of
-the terminal owns every color.
+The `~/.drinky/config.json` file is optional. Ask Drinky to maintain the file directly. The agent
+can describe every setting, type, default, and meaning. Drinky applies changes at the next start.
 
-Drinky does not query the terminal. It reads `TERM_PROGRAM` for one exception: Apple Terminal has
-neither the modern alternate screen nor the alternate-scroll mode, so it takes the older escapes and
-the mouse reports. Every other terminal takes the modern path. An older terminal still shows the
-interface, but an emoji can take the wrong width and a repaint can flicker.
+## Provider access
 
-## Trust
+API keys use the public provider APIs. Subscription login uses unsupported provider interfaces that
+can change or stop working. See the [Anthropic implementation note](lib/ai/anthropic/root.zig) and
+the [OpenAI implementation note](lib/ai/openai/oauth.zig).
 
-The `AGENTS.md` files and the skills of a repository are model instructions. Drinky has no
-permission gate and no sandbox. Open an untrusted repository in a container.
+Drinky is not affiliated with Anthropic or OpenAI.
 
-## More
+## Security
 
-- [`FEATURES.md`](FEATURES.md): every capability, one sentence each.
-- [`BACKLOG.md`](BACKLOG.md): the planned work.
-- [`docs/`](docs): the design notes.
+The `AGENTS.md` files and the skills in a repository are model instructions. Drinky has no
+permission gate or sandbox. Open an untrusted repository in a container.
+
+## Name and inspiration
+
+Drinky takes its name from Homer Simpson's drinking bird, which repeatedly presses `Y` on his remote
+nuclear plant workstation.
+
+Drinky takes inspiration for its terminal rendering model from
+[pi](https://github.com/earendil-works/pi-mono).
+
+## License
+
+Drinky is available under the [MIT License](LICENSE).

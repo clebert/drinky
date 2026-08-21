@@ -1,7 +1,8 @@
 # FEATURES.md
 
-What Drinky does, one short sentence per capability. It is an overview, not a specification: the
-_why_ and _how_ live in commit history, `BACKLOG.md` (planned work), and `docs/`.
+What Drinky does, one short sentence per capability. It is an overview, not a specification. Tests
+define behavior. Git history preserves implementation decisions, and `BACKLOG.md` holds planned
+work.
 
 Drinky is a terminal coding agent. You type a prompt. The model reads, searches, writes, and edits
 files in the working directory while the conversation streams inline into your scrollback. It talks
@@ -351,6 +352,6 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 ## Keeping this file true
 
 One short sentence per capability, at the concept level: what a user gets, not how the code spells
-it. When a capability lands, add its line and tick the matching `BACKLOG.md` item. When one goes
-away, delete the line. Merge a fact into a neighbouring line rather than add a new one. If a section
+it. When a capability lands, add its line and delete the matching `BACKLOG.md` entry. When one goes
+away, delete the line. Merge a fact into a related line rather than add a new one. If a section
 passes roughly a dozen lines, it is either two sections or too much detail.

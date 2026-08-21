@@ -4,8 +4,13 @@
     .fingerprint = 0xa027a170957ef40,
     .minimum_zig_version = "0.16.0",
     .paths = .{
+        "FEATURES.md",
+        "LICENSE",
+        "README.md",
         "build.zig",
         "build.zig.zon",
+        "lib",
+        "scripts",
         "src",
     },
 }
