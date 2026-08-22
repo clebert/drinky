@@ -21,7 +21,6 @@ path: []const u8,
 timeouts: ai.net.ProviderTimeouts = .{},
 retry: ai.net.Retry = .{},
 bash: ai.tool.Context.Bash = .{},
-cache: ai.Agent.CachePolicy = .{},
 default_models: DefaultModels = .{},
 /// The configured default reasoning-effort level, or null when the file names
 /// none or names an unknown level. The caller falls back to a compiled default.
@@ -43,11 +42,6 @@ dropped_models: []const DroppedModel = &.{},
 /// so the app can tell the user Drinky ignored their line. Owned. `deinit` frees
 /// it.
 dropped_effort: ?[]const u8 = null,
-/// The configured cache warning cost that Drinky cannot use, as the user wrote it.
-/// The config keeps it so the app can tell the user Drinky ignored their line, and
-/// the policy falls back to the built-in floor. Null on a legal value. Owned.
-/// `deinit` frees it.
-dropped_cost: ?[]const u8 = null,
 /// The configured command timeout that Drinky cannot use, in milliseconds. The
 /// config keeps it so the app can tell the user Drinky ignored their line, and the
 /// bash tool falls back to the built-in timeout. Null on a legal value.
@@ -103,7 +97,6 @@ const File = struct {
     required_skills: []const File.RequiredSkill = &.{},
     request: Request = .{},
     bash: Bash = .{},
-    cache: Cache = .{},
     default_models: DefaultModelsFile = .{},
     default_effort: ?JsonString = null,
 
@@ -162,12 +155,6 @@ const File = struct {
         deny: []const JsonString = &.{},
     };
 
-    const Cache = struct {
-        anthropic_retention_ms: ?u64 = cache_default.anthropic_retention_ms,
-        openai_retention_ms: ?u64 = cache_default.openai_retention_ms,
-        warning_min_cost: f64 = cache_default.warning_min_cost,
-    };
-
     /// Model names keyed by account tag. Each resolves to a compiled model.
     const DefaultModelsFile = struct {
         anthropic_api: ?JsonString = null,
@@ -194,7 +181,6 @@ const DataOptions = struct {
 const timeouts_default: ai.net.ProviderTimeouts = .{};
 const retry_default: ai.net.Retry = .{};
 const bash_default: ai.tool.Context.Bash = .{};
-const cache_default: ai.Agent.CachePolicy = .{};
 
 /// A malformed file must not fill the startup transcript with one event per
 /// key. Sixteen paths identify a broad shape mismatch. One final event reports
@@ -304,25 +290,6 @@ const keys = [_]Key{
         .description = "The literal patterns that deny a command. The bash tool refuses a " ++
             "command that contains one of the entries, and the refusal names that entry. " ++
             "Drinky ignores an empty entry.",
-    },
-    .{
-        .path = "cache.anthropic_retention_ms",
-        .description = "The prompt-cache retention that Drinky assumes for an Anthropic model. " ++
-            "Without the key, each model states its own, today 5 minutes. A value of 0 " ++
-            "turns the stale-cache warning off.",
-    },
-    .{
-        .path = "cache.openai_retention_ms",
-        .description = "The prompt-cache retention that Drinky assumes for an OpenAI model. " ++
-            "Without the key, each model states its own, today 30 minutes. A value of 0 " ++
-            "turns the stale-cache warning off.",
-    },
-    .{
-        .path = "cache.warning_min_cost",
-        .description = "The smallest extra input cost, in dollars, that arms the stale-cache " ++
-            "warning. Drinky starts a cheaper turn without a warning. The value must be a " ++
-            "finite number of zero or more. A value that is too large for a double is not " ++
-            "finite. Drinky reports a value it cannot use and warns about every risk.",
     },
     .{
         .path = "default_models.anthropic_api",
@@ -507,7 +474,6 @@ const example =
     \\  "required_skills": [{ "glob": "**/*.zig", "skill": "zig-style" }],
     \\  "request": { "anthropic_idle_timeout_ms": 90000 },
     \\  "bash": { "timeout_ms": 300000, "deny": ["git add"] },
-    \\  "cache": { "openai_retention_ms": 600000, "warning_min_cost": 0.05 },
     \\  "default_models": { "anthropic_subscription": "claude-opus-5" },
     \\  "default_effort": "high"
     \\}
@@ -599,7 +565,6 @@ pub fn deinit(self: *Config, gpa: std.mem.Allocator) void {
     for (self.dropped_models) |dropped| gpa.free(dropped.name);
     gpa.free(self.dropped_models);
     if (self.dropped_effort) |name| gpa.free(name);
-    if (self.dropped_cost) |text| gpa.free(text);
     for (self.unknown_keys) |key| gpa.free(key);
     gpa.free(self.unknown_keys);
 }
@@ -633,6 +598,11 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, options: *const LoadOptions) !Co
 /// file, so it needs `io`. Only a malformed file fails the load. A path Drinky
 /// cannot use becomes a message, so a bad entry never stops Drinky.
 fn loadFromData(gpa: std.mem.Allocator, io: std.Io, options: *const DataOptions) !Config {
+    // Every number keeps its text, and the typed parse converts it exactly. A
+    // dynamic parse would send a decimal or an exponent form through `f64`
+    // first. The value `18446744073709551615.0` then rounds up past every
+    // `u64`. The typed parse asserts that cast, so such a file would crash
+    // Drinky. Drinky must report a value it cannot use instead.
     const source = try std.json.parseFromSlice(
         std.json.Value,
         gpa,
@@ -649,7 +619,6 @@ fn loadFromData(gpa: std.mem.Allocator, io: std.Io, options: *const DataOptions)
     defer parsed.deinit();
     const request = parsed.value.request;
     const bash = parsed.value.bash;
-    const cache = parsed.value.cache;
     const names = parsed.value.default_models;
 
     // The paths borrow the parsed arena, and the loader dupes what it keeps. The
@@ -745,14 +714,6 @@ fn loadFromData(gpa: std.mem.Allocator, io: std.Io, options: *const DataOptions)
         &dropped_effort,
         File.JsonString.get(parsed.value.default_effort),
     );
-    var dropped_cost: ?[]const u8 = null;
-    errdefer if (dropped_cost) |text| gpa.free(text);
-    const warning_min_cost = try resolveCost(
-        gpa,
-        &dropped_cost,
-        &source.value,
-        cache.warning_min_cost,
-    );
     var dropped_bash_timeout_ms: ?u64 = null;
     const bash_timeout_ms = resolveBashTimeout(&dropped_bash_timeout_ms, bash.timeout_ms);
     var unknown: std.ArrayList([]const u8) = .empty;
@@ -807,18 +768,12 @@ fn loadFromData(gpa: std.mem.Allocator, io: std.Io, options: *const DataOptions)
             .timeout_ms = bash_timeout_ms,
             .deny = deny_patterns,
         },
-        .cache = .{
-            .anthropic_retention_ms = cache.anthropic_retention_ms,
-            .openai_retention_ms = cache.openai_retention_ms,
-            .warning_min_cost = warning_min_cost,
-        },
         .default_models = default_models,
         .default_effort = default_effort,
         .user_instructions = user_instructions,
         .required_skills = required_skills,
         .dropped_models = dropped_models,
         .dropped_effort = dropped_effort,
-        .dropped_cost = dropped_cost,
         .dropped_bash_timeout_ms = dropped_bash_timeout_ms,
         .dropped_deny_empty = dropped_deny_empty,
         .unknown_keys = unknown_keys,
@@ -932,21 +887,6 @@ fn resolveEffort(
     return null;
 }
 
-/// Resolve the configured cache warning cost. A floor below zero states nothing,
-/// and an unbounded one (a literal like 1e400 parses to infinity) silences every
-/// warning. Both fall back to the built-in floor. The function also records the
-/// line in `dropped` so the app can surface it.
-fn resolveCost(
-    gpa: std.mem.Allocator,
-    dropped: *?[]const u8,
-    source: *const std.json.Value,
-    configured: f64,
-) !f64 {
-    if (std.math.isFinite(configured) and configured >= 0) return configured;
-    dropped.* = try dupeConfiguredCost(gpa, source, configured);
-    return cache_default.warning_min_cost;
-}
-
 /// Resolve the configured command timeout. Every command runs under a limit, so
 /// a value outside the legal window states a wait that no command can take. Such
 /// a value falls back to the built-in timeout, and the function records it in
@@ -957,29 +897,6 @@ fn resolveBashTimeout(dropped: *?u64, configured: u64) u64 {
         return configured;
     dropped.* = configured;
     return bash_default.timeout_ms;
-}
-
-/// The text of `cache.warning_min_cost` as the user wrote it, duped for the
-/// report. The load keeps every number as text, so the report can quote the line
-/// instead of a value that already rounded to `inf`. A value the walk cannot
-/// find falls back to the parsed number.
-fn dupeConfiguredCost(
-    gpa: std.mem.Allocator,
-    source: *const std.json.Value,
-    configured: f64,
-) ![]const u8 {
-    const maybe_written: ?[]const u8 = written: {
-        if (source.* != .object) break :written null;
-        const section = source.object.get("cache") orelse break :written null;
-        if (section != .object) break :written null;
-        const value = section.object.get("warning_min_cost") orelse break :written null;
-        break :written switch (value) {
-            .number_string => |text| text,
-            else => null,
-        };
-    };
-    if (maybe_written) |written| return gpa.dupe(u8, written);
-    return std.fmt.allocPrint(gpa, "{d}", .{configured});
 }
 
 /// Resolve a configured model name for `account` against the compiled table for
@@ -1138,62 +1055,35 @@ test "a command timeout Drinky cannot use falls back to the default and is repor
     }
 }
 
-test "load reads the cache section" {
-    var config = try loadDataForTest(
-        \\{ "cache": { "anthropic_retention_ms": 0, "openai_retention_ms": 600000,
-        \\  "warning_min_cost": 0.05 } }
-    );
-    defer config.deinit(std.testing.allocator);
-    // Zero is a real override that turns the warning off, so it must survive as
-    // a value and not read as an unset key.
-    try std.testing.expectEqual(@as(?u64, 0), config.cache.anthropic_retention_ms);
-    try std.testing.expectEqual(@as(?u64, 600_000), config.cache.openai_retention_ms);
-    try std.testing.expectApproxEqAbs(@as(f64, 0.05), config.cache.warning_min_cost, 1e-9);
-
-    // Without the section, no retention is overridden and every risk warns.
-    var empty = try loadDataForTest("{}");
-    defer empty.deinit(std.testing.allocator);
-    try std.testing.expect(empty.cache.anthropic_retention_ms == null);
-    try std.testing.expect(empty.cache.openai_retention_ms == null);
-    try std.testing.expectEqual(@as(f64, 0), empty.cache.warning_min_cost);
-}
-
-test "a cost floor Drinky cannot use falls back to zero and is reported" {
-    // A negative floor states nothing, so the load keeps the line for the report
-    // and warns about every risk again.
-    var negative = try loadDataForTest(
-        \\{ "cache": { "warning_min_cost": -0.5 } }
-    );
-    defer negative.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(f64, 0), negative.cache.warning_min_cost);
-    try std.testing.expectEqualStrings("-0.5", negative.dropped_cost.?);
-
-    // An infinite one suppresses every warning in silence, which is the opposite
-    // of what the key is for. The report quotes the line, not the parsed `inf`.
-    var unbounded = try loadDataForTest(
-        \\{ "cache": { "warning_min_cost": 1e400 } }
-    );
-    defer unbounded.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(f64, 0), unbounded.cache.warning_min_cost);
-    try std.testing.expectEqualStrings("1e400", unbounded.dropped_cost.?);
-
-    // A retention counts milliseconds, so the parse itself refuses a negative
-    // one and one past the counter.
+// A count of milliseconds holds no sign, and one past the counter names a wait
+// that no clock can hold. Such a file is malformed, so the load fails instead of
+// a fallback that reports a value Drinky could not even read.
+test "a configured number that no counter can hold fails the load" {
     try std.testing.expectError(error.Overflow, loadDataForTest(
-        \\{ "cache": { "anthropic_retention_ms": -1 } }
+        \\{ "bash": { "timeout_ms": -1 } }
     ));
     try std.testing.expectError(error.Overflow, loadDataForTest(
-        \\{ "cache": { "openai_retention_ms": 99999999999999999999 } }
+        \\{ "request": { "anthropic_idle_timeout_ms": 99999999999999999999 } }
     ));
 
-    // Zero stays legal on both keys, and it drops nothing.
+    // A decimal or an exponent form counts milliseconds too. The load keeps the
+    // text, so a value past the counter reports as one that Drinky cannot read.
+    // Through a double it would round to 2^64 and crash the typed parse.
+    try std.testing.expectError(error.Overflow, loadDataForTest(
+        \\{ "bash": { "timeout_ms": 1.8446744073709552e19 } }
+    ));
+    try std.testing.expectError(error.Overflow, loadDataForTest(
+        \\{ "request": { "openai_idle_timeout_ms": 18446744073709551616.0 } }
+    ));
+
+    // A whole count that such a form writes stays legal, and the bash timeout
+    // holds it, because 300 seconds are inside the legal window.
     var config = try loadDataForTest(
-        \\{ "cache": { "anthropic_retention_ms": 0, "warning_min_cost": 0 } }
+        \\{ "bash": { "timeout_ms": 3e5 } }
     );
     defer config.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(?u64, 0), config.cache.anthropic_retention_ms);
-    try std.testing.expectEqual(@as(f64, 0), config.cache.warning_min_cost);
-    try std.testing.expect(config.dropped_cost == null);
+    try std.testing.expectEqual(@as(u64, 300_000), config.bash.timeout_ms);
+    try std.testing.expect(config.dropped_bash_timeout_ms == null);
 }
 
 test "load fills missing fields and sections from defaults" {
@@ -1596,7 +1486,6 @@ fn checkLoadAllocationFailure(gpa: std.mem.Allocator, io: std.Io, home: []const 
     try std.testing.expectEqual(@as(usize, 1), config.user_instructions.notices().len);
     try std.testing.expectEqual(@as(usize, 1), config.dropped_models.len);
     try std.testing.expect(config.dropped_effort != null);
-    try std.testing.expect(config.dropped_cost != null);
     try std.testing.expectEqual(@as(usize, 1), config.bash.deny.len);
     try std.testing.expect(config.dropped_deny_empty);
     try std.testing.expectEqual(@as(usize, 1), config.unknown_keys.len);
@@ -1618,8 +1507,7 @@ test "the config load frees every partial allocation" {
         .data =
         \\{ "user_instructions": [{ "path": "first.md" }, { "path": "missing.md" }],
         \\  "default_models": { "openai_api": "nope" }, "default_effort": "nope",
-        \\  "bash": { "deny": ["git add", ""] },
-        \\  "cache": { "warning_min_cost": -1 }, "unknown": 1 }
+        \\  "bash": { "deny": ["git add", ""] }, "unknown": 1 }
         ,
     });
     const home = try tmpPath(gpa, io, &tmp, "");

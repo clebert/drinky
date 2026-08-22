@@ -41,11 +41,6 @@ const effort_default: ai.llm.Effort = .xhigh;
 const intro_text = "Enter: Send · Shift+Enter: New line · Esc: Cancel · " ++
     "Ctrl+C: Clear · Ctrl+C twice: Quit · Ctrl+D: Quit";
 
-/// The control hint that opens a stale-cache warning. The key that passes the
-/// warning differs between a submit and a retry, so each one names its own key.
-const cache_hint_submit = "Enter: Send anyway";
-const cache_hint_retry = "Ctrl+N: Try again anyway";
-
 /// Two Ctrl+C presses within this window quit. A lone press clears the editor.
 const ctrl_c_window_ms = 500;
 
@@ -602,7 +597,6 @@ pub fn run(
         .bash = config.bash,
         .config_document = self.config_document,
         .skill_guard = &self.skill_guard,
-        .cache = config.cache,
     });
     defer self.agent.deinit();
     // Startup applies the remembered or the default choices, so it saves nothing.
@@ -641,12 +635,6 @@ pub fn run(
         "Drinky ignored the configured default effort level \"{s}\" because Drinky does not " ++
             "know that level. Drinky uses the effort level \"{s}\".",
         .{ dropped, @tagName(self.agent.effort) },
-    );
-    if (config.dropped_cost) |dropped| try self.recordEvent(
-        .failure,
-        "Drinky ignored the configured cache warning cost \"{s}\" because the value must be a " ++
-            "finite number of zero or more. Drinky warns about every stale prompt cache.",
-        .{dropped},
     );
     if (config.dropped_bash_timeout_ms) |dropped| try self.recordEvent(
         .failure,
@@ -1314,12 +1302,6 @@ fn flushEscape(self: *App) !void {
 
 fn handleKey(self: *App, event: *const terminal.Input.Key) !void {
     const at_prompt = self.session.mode == .prompt;
-    // Only an idle Enter or Ctrl+N can confirm the stale-cache warning, because
-    // both send the next request. Every other user action clears the notice and
-    // its one-shot confirmation.
-    const retries = event.* == .ctrl and event.ctrl == 'n';
-    const confirms_cache = at_prompt and (event.* == .enter or retries);
-    if (!confirms_cache) self.session.cancelConfirmation(.cache);
     // A refused command line goes to the model on the next Enter alone. The prompt
     // sends it, and a turn queues it, so both modes can confirm.
     const confirms_message = (at_prompt or self.session.mode == .turn) and event.* == .enter;
@@ -1681,18 +1663,9 @@ fn nowNs(self: *App) i96 {
 /// sends that line to the model as typed.
 fn submit(self: *App) !void {
     if (self.session.editor.blank()) {
-        self.session.cancelConfirmation(.cache);
         self.session.cancelConfirmation(.message);
         return;
     }
-    const maybe_cache_risk = self.agent.cacheRisk();
-    if (maybe_cache_risk) |*cache_risk| return self.submitWithCacheRisk(cache_risk);
-    return self.submitWithCacheRisk(null);
-}
-
-/// Submit with an injected cache risk. The seam lets tests stop at the warning
-/// without starting a real provider worker.
-fn submitWithCacheRisk(self: *App, maybe_cache_risk: ?*const ai.Agent.CacheRisk) !void {
     const text = try self.session.editor.expanded(.whole_prompt);
     defer self.gpa.free(text);
     self.session.dirty = true;
@@ -1706,10 +1679,9 @@ fn submitWithCacheRisk(self: *App, maybe_cache_risk: ?*const ai.Agent.CacheRisk)
         if (try self.checkCommand(text)) |refusal|
             return self.armMessageSend(refusal, "Send as a message");
         if (try self.dispatchCommand(text)) |outcome|
-            return self.applySubmittedCommand(outcome, maybe_cache_risk);
+            return self.applySubmittedCommand(outcome);
     }
     if (!self.signedIn()) {
-        self.session.cancelConfirmation(.cache);
         self.session.editor.clear();
         return self.reportNotice(
             .failure,
@@ -1717,41 +1689,29 @@ fn submitWithCacheRisk(self: *App, maybe_cache_risk: ?*const ai.Agent.CacheRisk)
             .{},
         );
     }
-    if (try self.preflightModelSubmit(maybe_cache_risk, cache_hint_submit)) {
-        const base = try self.startUserTurn(text);
-        // The turn is live and owns its own copy. Retain the prompt's rich draft
-        // so an abnormal exit that commits nothing can return it. Leave the
-        // editor empty for in-progress text. Both steps are infallible, so the
-        // rollback above stays correct.
-        var prompt = self.session.editor.detachTrimmed();
-        self.session.retainTurnPrompt(&prompt, base);
-    } else if (message_confirmed) {
-        // The stale-cache warning stopped this send and armed its own Enter. Keep
-        // the message confirmation, or the next Enter falls back into the registry
-        // and both warnings alternate forever.
-        self.session.armConfirmation(.message);
-    }
+    const base = try self.startUserTurn(text);
+    // The turn is live and owns its own copy. Retain the prompt's rich draft
+    // so an abnormal exit that commits nothing can return it. Leave the
+    // editor empty for in-progress text. Both steps are infallible, so the
+    // rollback above stays correct.
+    var prompt = self.session.editor.detachTrimmed();
+    self.session.retainTurnPrompt(&prompt, base);
 }
 
 /// Apply the outcome of a submitted command line.
-fn applySubmittedCommand(
-    self: *App,
-    outcome: ai.command.Outcome,
-    maybe_cache_risk: ?*const ai.Agent.CacheRisk,
-) !void {
+fn applySubmittedCommand(self: *App, outcome: ai.command.Outcome) !void {
     switch (outcome) {
         // A skill line starts its own turn, so it keeps the editor's rich draft.
         .prompt => |prompt| {
             defer prompt.deinit(self.gpa);
             if (!self.signedIn()) {
-                self.session.cancelConfirmation(.cache);
                 self.session.editor.clear();
                 try self.reportNotice(
                     .failure,
                     "Sign in with /login before you send a message.",
                     .{},
                 );
-            } else if (try self.preflightModelSubmit(maybe_cache_risk, cache_hint_submit)) {
+            } else {
                 const base = try self.startSkillTurn(&prompt);
                 // The line reproduces this request, so a failure that commits
                 // nothing returns it to the editor like any other human request.
@@ -1760,15 +1720,10 @@ fn applySubmittedCommand(
             }
         },
         // The registry accepted the line, so this refusal is a command that broke.
-        // Another try is the way forward, so the line stays in the editor and no
-        // confirmation arms.
-        .refusal => {
-            self.session.cancelConfirmation(.cache);
-            try self.applyOutcome(outcome);
-        },
+        // Another try is the way forward, so the line stays in the editor.
+        .refusal => try self.applyOutcome(outcome),
         // Every other command clears the editor first.
         else => {
-            self.session.cancelConfirmation(.cache);
             self.session.editor.clear();
             try self.applyOutcome(outcome);
         },
@@ -1786,66 +1741,9 @@ fn armMessageSend(
     action: []const u8,
 ) !void {
     defer self.gpa.free(refusal.content);
-    self.session.cancelConfirmation(.cache);
     // Arm last, so a failed notice leaves no offer that the row never showed.
     try self.reportNotice(refusal.severity, "Enter: {s} · {s}", .{ action, refusal.content });
     self.session.armConfirmation(.message);
-}
-
-/// Stop the first stale-cache submission and arm one confirmation for the
-/// unchanged prompt. `action` names the key that passes the warning, because the
-/// prompt and a retry send through different keys.
-fn preflightModelSubmit(
-    self: *App,
-    maybe_cache_risk: ?*const ai.Agent.CacheRisk,
-    action: []const u8,
-) !bool {
-    if (self.session.takeConfirmation(.cache)) return true;
-    const cache_risk = maybe_cache_risk orelse return true;
-    // A stale cache names the window it outlived. A cold cache has no window
-    // to name: the active model holds no cache for this conversation, so the
-    // next request processes the history fresh.
-    var state_buffer: [64]u8 = undefined;
-    const state = switch (cache_risk.cause) {
-        .stale => state: {
-            const retention = retentionText(cache_risk.retention_ms);
-            break :state try std.fmt.bufPrint(
-                &state_buffer,
-                "Probably stale after {d}{s}",
-                .{ retention.count, retention.unit },
-            );
-        },
-        .cold => "Cold for this model and effort",
-    };
-
-    if (cache_risk.cost_extra >= 0.01) {
-        try self.reportNotice(
-            .warning,
-            "{s} · Cache: {s} · Extra input cost: ~${d:.2}",
-            .{ action, state, cache_risk.cost_extra },
-        );
-    } else {
-        try self.reportNotice(
-            .warning,
-            "{s} · Cache: {s} · Extra input cost: ~${d:.4}",
-            .{ action, state, cache_risk.cost_extra },
-        );
-    }
-    self.session.armConfirmation(.cache);
-    return false;
-}
-
-/// One cache retention as a whole count and its unit. The ladder keeps the
-/// largest unit that divides the value, so a configured retention under one
-/// second reads as milliseconds instead of `0s`.
-fn retentionText(retention_ms: u64) struct { count: u64, unit: []const u8 } {
-    if (retention_ms % std.time.ms_per_hour == 0)
-        return .{ .count = @divExact(retention_ms, std.time.ms_per_hour), .unit = "h" };
-    if (retention_ms % std.time.ms_per_min == 0)
-        return .{ .count = @divExact(retention_ms, std.time.ms_per_min), .unit = "m" };
-    if (retention_ms % std.time.ms_per_s == 0)
-        return .{ .count = @divExact(retention_ms, std.time.ms_per_s), .unit = "s" };
-    return .{ .count = retention_ms, .unit = "ms" };
 }
 
 /// Record the user message of one skill invocation, then spawn the turn over
@@ -1915,16 +1813,13 @@ fn retryTurn(self: *App) !void {
         "Sign in with /login before you try the turn again.",
         .{},
     );
-    const maybe_cache_risk = self.agent.cacheRisk();
-    if (maybe_cache_risk) |*cache_risk| return self.retryWithCacheRisk(cache_risk);
-    return self.retryWithCacheRisk(null);
+    return self.sendRetryTurn();
 }
 
-/// Retry with an injected cache risk. An attempt rewrites the same prompt cache as
-/// any other request, so it takes the same warning. The seam lets tests stop at
-/// that warning without starting a real provider worker.
-fn retryWithCacheRisk(self: *App, maybe_cache_risk: ?*const ai.Agent.CacheRisk) !void {
-    if (!try self.preflightModelSubmit(maybe_cache_risk, cache_hint_retry)) return;
+/// Spawn one attempt, past the gate above. The two statements pair, so they
+/// stay in one place. A test drives this half with a signed-out agent, because
+/// the worker then fails fast instead of reaching the network.
+fn sendRetryTurn(self: *App) !void {
     const base = try self.startRetryTurn();
     // The editor holds no part of this attempt, so the rewind anchor stands alone.
     self.session.markTurnBase(base);
@@ -4456,7 +4351,7 @@ test "/new clears the conversation and the scrollback without a configuration ch
         .role = .user,
         .text = try gpa.dupe(u8, "old prompt"),
     } });
-    var seeded: ai.Agent.Stats = .{ .cost = 2.5, .last = .{ .input = 10 }, .model_count = 1 };
+    var seeded: ai.Agent.Stats = .{ .cost = 2.5, .cache_usage = .{ .input = 10 }, .model_count = 1 };
     seeded.by_model[0] = .{
         .name = anthropic_default.name,
         .cost = 2.5,
@@ -4471,9 +4366,7 @@ test "/new clears the conversation and the scrollback without a configuration ch
     try app.session.paint(.{ .columns = 80, .rows = 6 });
 
     try app.session.editor.insert("/new");
-    app.session.armConfirmation(.cache);
     try app.submit();
-    try std.testing.expect(!app.session.takeConfirmation(.cache));
 
     // The empty conversation must start on a clean screen. The paint clears the
     // visible rows and drops the scrollback with them.
@@ -5547,7 +5440,9 @@ test "Ctrl+N sends the attempt and keeps the editor text" {
     app.setRetry(.{ .failure = try gpa.dupe(u8, "The provider is overloaded.") });
     try app.session.editor.insert("a draft that stays");
 
-    try app.retryWithCacheRisk(null);
+    // The spawn runs past the sign-in gate, so the worker reaches the agent and
+    // reports the signed-out state as the failure of this attempt.
+    try app.sendRetryTurn();
 
     try std.testing.expect(app.session.mode == .turn);
     try std.testing.expect(app.retry == null);
@@ -5611,62 +5506,6 @@ test "a signed-out Ctrl+N names the sign-in and keeps the retry" {
         "Sign in with /login before you try the turn again.",
         app.session.notice.?.content,
     );
-}
-
-// An attempt rewrites the same prompt cache as any other request, so the first
-// Ctrl+N warns and the second one sends. Every other key drops that offer.
-test "a stale cache stops the first Ctrl+N and the next one sends" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-
-    var app: App = undefined;
-    app.initForTest(gpa);
-    defer app.drainQueue();
-    app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
-        .system = "",
-        .retry = .{},
-    });
-    defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
-    defer app.session.deinit();
-    defer app.dropRetry();
-
-    app.setRetry(.{ .failure = try gpa.dupe(u8, "The provider is overloaded.") });
-    const risk: ai.Agent.CacheRisk = .{
-        .retention_ms = 5 * std.time.ms_per_min,
-        .cost_extra = 1.15,
-        .cause = .stale,
-    };
-
-    try app.retryWithCacheRisk(&risk);
-    try std.testing.expect(app.session.mode == .prompt);
-    try std.testing.expect(app.retry != null);
-    try std.testing.expect(app.session.confirmations.contains(.cache));
-    try std.testing.expect(std.mem.startsWith(
-        u8,
-        app.session.notice.?.content,
-        "Ctrl+N: Try again anyway · Cache: Probably stale after 5m",
-    ));
-
-    // The key that passes the warning keeps its own offer, and any other key drops
-    // it. Signed out, this Ctrl+N stops at the sign-in and sends nothing.
-    try app.handleKey(&.{ .ctrl = 'n' });
-    try std.testing.expect(app.session.confirmations.contains(.cache));
-    try app.handleKey(&.left);
-    try std.testing.expect(!app.session.confirmations.contains(.cache));
-
-    // Armed again, the next Ctrl+N passes the warning and starts the attempt.
-    try app.retryWithCacheRisk(&risk);
-    try std.testing.expect(app.session.confirmations.contains(.cache));
-    try app.retryWithCacheRisk(&risk);
-    try std.testing.expect(app.session.mode == .turn);
-    try std.testing.expect(app.retry == null);
-    const result = app.awaitTurnFuture().?;
-    defer app.freeWorkerResult(&result);
-    try app.finishWorkerResult(&result);
 }
 
 // The attempt never takes the editor text: a network or provider failure is
@@ -6062,141 +5901,6 @@ test "a turn that ends under the queue offer clears the row too" {
     );
     try std.testing.expect(app.session.confirmations.contains(.message));
     try std.testing.expectEqual(@as(usize, 0), app.session.transcript.blocks().len);
-}
-
-test "a stale cache blocks one submit and keeps the prompt unchanged" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const home = try tmpPath(gpa, io, &tmp, "");
-    defer gpa.free(home);
-
-    var app: App = undefined;
-    app.initForTest(gpa);
-    app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{ .anthropic = "sk-test" });
-    defer app.accounts.deinit();
-    app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_api), .{
-        .model = anthropic_default,
-        .system = "",
-        .retry = .{},
-    });
-    defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
-    defer app.session.deinit();
-
-    try app.session.editor.insert("keep this prompt");
-    const risk: ai.Agent.CacheRisk = .{
-        .retention_ms = 5 * std.time.ms_per_min,
-        .cost_extra = 1.15,
-        .cause = .stale,
-    };
-    try app.submitWithCacheRisk(&risk);
-
-    try std.testing.expect(app.session.mode == .prompt);
-    try std.testing.expectEqualStrings("keep this prompt", app.session.editor.visible());
-    try std.testing.expectEqual(@as(usize, 0), app.session.transcript.blocks().len);
-    try std.testing.expectEqual(ai.command.Outcome.Severity.warning, app.session.notice.?.severity);
-    try std.testing.expect(std.mem.startsWith(
-        u8,
-        app.session.notice.?.content,
-        "Enter: Send anyway · Cache: Probably stale after 5m",
-    ));
-    try std.testing.expect(std.mem.indexOf(u8, app.session.notice.?.content, "$1.15") != null);
-
-    // The next preflight consumes the confirmation instead of warning again.
-    try std.testing.expect(try app.preflightModelSubmit(&risk, cache_hint_submit));
-    try std.testing.expect(!app.session.takeConfirmation(.cache));
-
-    // Any other user key cancels a later confirmation.
-    app.session.armConfirmation(.cache);
-    try app.handleKey(&.left);
-    try std.testing.expect(!app.session.takeConfirmation(.cache));
-}
-
-// Two one-shot confirmations can meet on one line. The stale-cache warning stops
-// the send and consumes the message confirmation, so that confirmation must
-// survive. Otherwise the next Enter falls back into the registry, and both
-// warnings alternate forever with an empty transcript.
-test "a stale cache keeps the send-as-a-message confirmation" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const home = try tmpPath(gpa, io, &tmp, "");
-    defer gpa.free(home);
-
-    var app: App = undefined;
-    app.initForTest(gpa);
-    app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{ .anthropic = "sk-test" });
-    defer app.accounts.deinit();
-    app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_api), .{
-        .model = anthropic_default,
-        .system = "",
-        .retry = .{},
-    });
-    defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
-    defer app.session.deinit();
-
-    const risk: ai.Agent.CacheRisk = .{
-        .retention_ms = 5 * std.time.ms_per_min,
-        .cost_extra = 1.15,
-        .cause = .stale,
-    };
-    try app.session.editor.insert("/tmp/x.log is empty");
-
-    // Enter 1: the registry refuses the line and offers the send.
-    try app.submitWithCacheRisk(&risk);
-    try std.testing.expect(app.session.confirmations.contains(.message));
-    try std.testing.expect(!app.session.confirmations.contains(.cache));
-
-    // Enter 2: the send meets the stale-cache warning, which sends nothing.
-    try app.submitWithCacheRisk(&risk);
-    try std.testing.expect(app.session.confirmations.contains(.cache));
-    try std.testing.expect(std.mem.startsWith(
-        u8,
-        app.session.notice.?.content,
-        "Enter: Send anyway · Cache: Probably stale after 5m",
-    ));
-    // Both offers stand, so the line is not back at the registry refusal.
-    try std.testing.expect(app.session.confirmations.contains(.message));
-    try std.testing.expectEqualStrings("/tmp/x.log is empty", app.session.editor.visible());
-    try std.testing.expectEqual(@as(usize, 0), app.session.transcript.blocks().len);
-
-    // Enter 3 opens both gates, so it starts the turn instead of warning again.
-    // The turn spawn itself stays out of this test.
-    try std.testing.expect(app.session.takeConfirmation(.message));
-    try std.testing.expect(try app.preflightModelSubmit(&risk, cache_hint_submit));
-}
-
-test "a cache warning names its retention in the largest whole unit" {
-    const hour = retentionText(std.time.ms_per_hour);
-    try std.testing.expectEqual(@as(u64, 1), hour.count);
-    try std.testing.expectEqualStrings("h", hour.unit);
-
-    const minutes = retentionText(30 * std.time.ms_per_min);
-    try std.testing.expectEqual(@as(u64, 30), minutes.count);
-    try std.testing.expectEqualStrings("m", minutes.unit);
-
-    // 90 seconds make no whole minute, so the second carries them.
-    const seconds = retentionText(90 * std.time.ms_per_s);
-    try std.testing.expectEqual(@as(u64, 90), seconds.count);
-    try std.testing.expectEqualStrings("s", seconds.unit);
-
-    // A configured retention under one second keeps its milliseconds. It must
-    // never read as `0s`.
-    const brief = retentionText(500);
-    try std.testing.expectEqual(@as(u64, 500), brief.count);
-    try std.testing.expectEqualStrings("ms", brief.unit);
-
-    const mixed = retentionText(1500);
-    try std.testing.expectEqual(@as(u64, 1500), mixed.count);
-    try std.testing.expectEqualStrings("ms", mixed.unit);
 }
 
 // A sentence that starts with a command name is a command line, so an idle Enter

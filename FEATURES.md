@@ -90,7 +90,7 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - With no account at all, the login picker opens by itself.
 - While signed out, Drinky refuses a message with a prompt to `/login`.
 - Reasoning replays only to the account that produced it. A login, a logout, or a credential
-  replacement discards that account's reasoning, cache evidence, and allowance.
+  replacement discards that account's reasoning, cache-hit rate, and allowance.
 
 ## Signing in
 
@@ -160,9 +160,6 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - A reply enters the conversation only once the provider reports it complete.
 - Prompt caching is always on: explicit breakpoints for Anthropic, the automatic per-session cache
   for OpenAI.
-- A stale or cold prompt cache blocks the first submit, estimates the extra input cost, and lets the
-  next Enter continue.
-- The assumed cache retention per provider and the cost that arms this warning are configurable.
 - Reasoning is requested summarized at the resolved effort, and replayed verbatim on later turns.
 - Anthropic Subscription and Anthropic Console requests carry the Claude Code client identity. A
   plain API key goes straight to the platform API.
@@ -178,14 +175,8 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - A reply that names a model other than the requested one records a durable transcript event with
   both names, so a fallback or a proxy substitution never passes silently. An unchanged fallback
   reports once per turn.
-- A switched reply is priced at the model that served it, and its usage and cache evidence book
-  under that model. An unknown served model fails the turn with a report that names it.
-- Cache evidence is kept per account, model, and resolved effort, and the warning judges the model
-  expected to serve next. A switch to an unused pairing warns about its cold cache at once, and a
-  switch back within retention stays silent. Effort levels that fold onto one wire form share one
-  cache.
-- Every provider-accepted request refreshes the cache-warning anchor at its dispatch, so a canceled
-  or failed attempt cannot leave a stale anchor and a premature warning.
+- A switched reply is priced at the model that served it, and its usage books under that model. An
+  unknown served model fails the turn with a report that names it.
 - A failed request reports the message from the provider JSON error body, not the raw bytes. A
   failed response head names its status too. For a spent OpenAI subscription, the message names the
   plan and the wait.
@@ -256,8 +247,16 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - The bottom line shows `directory (branch)`, context fill, cost, quota, and cache-hit rate on the
   left, and `model (account) · Effort: level` on the right. At most one temporary notice replaces it
   until the next user action.
+- The context gauge holds what the last committed reply measured. Empty history is exactly 0.
+- The gauge reads `Context: Unknown` while the next request renders that history in another way. A
+  model switch changes the tokenizer. An account renders the whole prompt around the history, so
+  every account switch hides the count. An effort change hides it only when it stops a stored
+  reasoning block from replaying. A switch back to the measured setup shows the count again.
+- The cache-hit rate holds the last request of the active account, model, and resolved effort. A
+  change to any of the three hides it. Two effort levels that resolve to one wire form share the
+  cache, so the rate survives that change. A canceled attempt still rates its own prompt.
 - A narrow window shortens the directory, branch, and context gauge before it removes parts, and it
-  always keeps the context percentage.
+  always keeps the context gauge.
 - The branch comes from the `HEAD` file of the repository, never from the git command. Drinky
   re-reads it when a turn starts and when one ends.
 - A picker is a single-choice list that tags the current value. Enter confirms, and Esc, Ctrl+C, or
@@ -331,13 +330,12 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
   and at most 32 KiB. Each source loads at most 32 files and 64 KiB, and one file loads once even
   when two paths or a symbolic link reach it. Drinky reports what it skips.
 - `~/.drinky/config.json` is optional: paths for user instructions, request and bash limits, a bash
-  deny list, the prompt-cache warning, a default model per account, a default effort level, and the
-  skills that a path requires. Drinky reads it only at startup, so a change applies at the next
-  start.
+  deny list, a default model per account, a default effort level, and the skills that a path
+  requires. Drinky reads it only at startup, so a change applies at the next start.
 - It holds no secrets. API keys come from `ANTHROPIC_API_KEY` and `OPENAI_API_KEY`.
 - A configured model that is not valid for its account is reported, and the compiled default used.
-  An unknown effort level and a cache warning cost that Drinky cannot use are reported the same way.
-  A key that Drinky does not know is reported too, so a typo never looks like an applied setting.
+  An unknown effort level is reported the same way. A key that Drinky does not know is reported too,
+  so a typo never looks like an applied setting.
 - A required skill whose name no discovered skill carries guards nothing in that project. The
   startup line counts each such name once, because the global config serves every project.
 - The config document is generated from the struct that parses the file, so a new key that carries

@@ -58,161 +58,31 @@ config_document: []const u8,
 skill_guard: ?*tool.SkillGuard,
 items: std.ArrayList(llm.Item),
 stats: Stats,
+/// The context that the last committed reply measured, with the setup that
+/// produced it. Null means no measurement describes the current history.
+measured_context: ?MeasuredContext,
 /// Steering messages the user submitted mid-turn, drained into the running turn
 /// at each round boundary. Thread-safe: the UI thread pushes, and the worker takes.
 steering: Steering,
-/// The local policy for the stale-prompt-cache warning.
-cache: CachePolicy,
 /// The stable per-conversation prompt-cache routing key (used by OpenAI). Every
 /// turn shares it until a deliberate reset rotates it.
 cache_key: [32]u8,
-/// The local cache evidence of this conversation, per account-model pair. Each
-/// timestamp marks request dispatch, because the cache lookup happens before
-/// response generation.
-cache_evidence: CacheEvidence,
 
-/// The newest possible touch of each cache the conversation used, plus the
-/// model expected to serve the next request. The provider isolates caches per
-/// account, a model change breaks the cache, and the resolved effort renders
-/// into the request bytes, so the account-model-effort triple is the real key.
-/// Bounded like `Stats.by_model`, so recording never allocates. A full table
-/// drops a new triple, which then reads as a cold cache and warns: the cheap
-/// failure direction.
-const CacheEvidence = struct {
-    entries: [entries_max]Entry = undefined,
-    entry_count: usize = 0,
-    /// The model that served the last reply, or empty for the active model. A
-    /// provider-side fallback holds for a conversation, so the last server is
-    /// the best prediction of the next one.
-    expected_model: []const u8 = "",
-
-    const entries_max = 16;
-
-    /// One cache: its newest possible touch and the size of its reusable
-    /// prefix. `model` points into the compiled model table. `effort` is the
-    /// resolved wire form, because two levels that fold onto one named level
-    /// write identical request bytes and share one cache.
-    const Entry = struct {
-        account: llm.Account,
-        model: []const u8,
-        effort: models.Model.EffortMap.Resolution,
-        retention_ms: u64,
-        request_at: std.Io.Clock.Timestamp,
-        prefix_tokens: u64,
-    };
-
-    fn indexOf(
-        self: *const CacheEvidence,
-        account: llm.Account,
-        model_name: []const u8,
-        effort: models.Model.EffortMap.Resolution,
-    ) ?usize {
-        for (self.entries[0..self.entry_count], 0..) |*entry, index| {
-            if (entry.account == account and std.mem.eql(u8, entry.model, model_name) and
-                entry.effort.eql(effort))
-            {
-                return index;
-            }
-        }
-        return null;
-    }
-
-    /// Record or update one triple. A full table drops the new triple.
-    fn touch(self: *CacheEvidence, entry: Entry) void {
-        if (self.indexOf(entry.account, entry.model, entry.effort)) |index| {
-            self.entries[index] = entry;
-            return;
-        }
-        if (self.entry_count == self.entries.len) return;
-        self.entries[self.entry_count] = entry;
-        self.entry_count += 1;
-    }
-
-    /// Drop every entry of one account, for a credential replacement.
-    fn dropAccount(self: *CacheEvidence, account: llm.Account) void {
-        var retained_count: usize = 0;
-        for (self.entries[0..self.entry_count]) |entry| {
-            if (entry.account == account) continue;
-            self.entries[retained_count] = entry;
-            retained_count += 1;
-        }
-        self.entry_count = retained_count;
-    }
-
-    fn clear(self: *CacheEvidence) void {
-        self.entry_count = 0;
-        self.expected_model = "";
-    }
-
-    /// The newest entry of one account. The history is shared across the
-    /// models of a conversation, so any entry's prefix approximates a cold
-    /// model's rewrite size, and the newest is the closest.
-    fn newestOf(self: *const CacheEvidence, account: llm.Account) ?*const Entry {
-        var newest: ?*const Entry = null;
-        for (self.entries[0..self.entry_count]) |*entry| {
-            if (entry.account != account) continue;
-            const current = newest orelse {
-                newest = entry;
-                continue;
-            };
-            if (entry.request_at.raw.toNanoseconds() > current.request_at.raw.toNanoseconds())
-                newest = entry;
-        }
-        return newest;
-    }
-};
-
-/// The estimated cost effect when the next request probably reads no cache.
-/// The cost covers only the reusable prefix, priced at the active model's
-/// public API rates, which is the worst case among the candidate servers.
-pub const CacheRisk = struct {
-    retention_ms: u64,
-    cost_extra: f64,
-    cause: Cause,
-
-    /// Why the next request probably reads no cache: the expected cache passed
-    /// its retention window, or the expected model holds no cache in this
-    /// conversation (after `/model` to a model the conversation has not used).
-    pub const Cause = enum { stale, cold };
-};
-
-/// The local policy for the stale-prompt-cache warning. The host patches it from
-/// its configuration. Nothing here reaches the wire, because the provider owns
-/// the real retention.
-pub const CachePolicy = struct {
-    /// The retention that every Anthropic model uses in place of its compiled
-    /// value. Null keeps the compiled value, and 0 turns the warning off.
-    anthropic_retention_ms: ?u64 = null,
-    /// The same override for every OpenAI model.
-    openai_retention_ms: ?u64 = null,
-    /// The smallest estimated extra cost that arms the warning. A cheaper risk
-    /// starts its turn with no warning. Zero warns about every risk.
-    warning_min_cost: f64 = 0,
-
-    /// The retention this policy applies to `model` under `account`: the
-    /// configured override of that vendor, or the model's compiled value.
-    pub fn retentionMs(
-        self: *const CachePolicy,
-        account: llm.Account,
-        model: *const models.Model,
-    ) ?u64 {
-        const configured = switch (account.provider()) {
-            .anthropic => self.anthropic_retention_ms,
-            .openai => self.openai_retention_ms,
-        };
-        return configured orelse model.cache_retention_ms;
-    }
-};
-
-/// The cumulative session cost and cache savings, plus the last message's usage
-/// and the latest subscription allowance for the gauges. Each message is priced
-/// against the model that produced it, so the totals stay correct across a
-/// mid-session `/model` switch. A plain value type: it copies whole across the
-/// UI channel.
+/// The cumulative session cost and cache savings, the two gauge measurements,
+/// and the latest subscription allowance. Each message is priced against the
+/// model that produced it, so the totals stay correct across a mid-session
+/// `/model` switch. A plain value type: it copies whole across the UI channel.
 pub const Stats = struct {
     cost: f64 = 0,
     saved: f64 = 0,
-    last: llm.Usage = .{},
+    /// The conversation context that the last committed reply measured. Null
+    /// means no measurement describes the current history, or the way the next
+    /// request renders it. Empty history is 0.
+    context_tokens: ?u64 = 0,
+    /// The prompt usage of the last request under the active cache key. An
+    /// all-zero prompt hides the cache rate, so a cleared value reads as
+    /// absent. A canceled attempt counts: its prompt was processed and billed.
+    cache_usage: llm.Usage = .{},
     /// The active subscription account's remaining allowance, adopted from each
     /// response head that carries one. This includes a head whose stream then
     /// errors or is canceled, so an exhausted 429 still updates it. A head that
@@ -299,6 +169,23 @@ pub const Outcome = struct {
     };
 };
 
+/// One measurement of the conversation context, with the request setup that
+/// produced it. A later request renders the same history to the same tokens
+/// only while the setup holds, so the gauge judges the measurement against it.
+const MeasuredContext = struct {
+    /// The whole prompt of the measuring request plus the output it produced.
+    tokens: u64,
+    /// The model the request named. A tokenizer belongs to its model. The name
+    /// points into the compiled model table (static lifetime).
+    model: []const u8,
+    /// The account that rendered the request. It selects account-specific system
+    /// blocks and stored reasoning proofs.
+    account: llm.Account,
+    /// The effort the request rendered. It decides the replay for Anthropic.
+    /// A named level points into the compiled table too (static lifetime).
+    resolution: models.Model.EffortMap.Resolution,
+};
+
 /// The turn transaction's private bookkeeping. It holds the pre-turn history
 /// length, the latest replay-valid checkpoint an abnormal exit rolls back to,
 /// and the counts and flags surfaced in the receipt. It also retains (and owns)
@@ -309,6 +196,10 @@ const TurnState = struct {
     steering_committed_count: usize = 0,
     truncated: bool = false,
     pending_steering: ?[][]u8 = null,
+    /// The measurement of the latest reply, held until that reply commits. A
+    /// reply that never commits is rolled back, so its measurement must not
+    /// reach the gauge.
+    pending_context: ?MeasuredContext = null,
     presentation_closed: bool = false,
 };
 
@@ -420,7 +311,6 @@ pub fn init(
         bash: tool.Context.Bash = .{},
         config_document: []const u8 = "",
         skill_guard: ?*tool.SkillGuard = null,
-        cache: CachePolicy = .{},
     },
 ) Agent {
     return .{
@@ -436,10 +326,9 @@ pub fn init(
         .skill_guard = options.skill_guard,
         .items = .empty,
         .stats = .{},
+        .measured_context = null,
         .steering = Steering.init(gpa, io),
-        .cache = options.cache,
         .cache_key = generateCacheKey(io),
-        .cache_evidence = .{},
     };
 }
 
@@ -454,9 +343,9 @@ pub fn deinit(self: *Agent) void {
 pub fn resetConversation(self: *Agent) void {
     self.rollback(0);
     self.stats = .{};
+    self.measured_context = null;
     self.steering.clear();
     self.cache_key = generateCacheKey(self.io);
-    self.cache_evidence.clear();
 }
 
 /// Switch the account and the model together, effective on the next turn. The
@@ -469,54 +358,58 @@ pub fn switchTo(self: *Agent, client: provider.Client, model: models.Model) void
         active.account() != client.account()
     else
         true;
+    const model_changed = !std.mem.eql(u8, self.model.name, model.name);
     self.client = client;
     self.model = model;
     // An allowance belongs to the account whose response reported it. Session
     // totals span account switches, but this point-in-time gauge must not.
     if (account_changed) self.stats.quota = null;
-    // The cache entries stay: they key on the account-model pair, a switch
-    // invalidates none of them on the provider, and a switch back within
-    // retention meets a warm cache. Only the serving expectation resets,
-    // because it belonged to the previous pairing.
-    self.cache_evidence.expected_model = "";
+    // The provider isolates a cache per principal, and it keys the entry on the
+    // rendered model too, so either change makes the measured rate foreign.
+    if (account_changed or model_changed) self.stats.cache_usage = .{};
+    // The context gauge judges its own measurement against the new setup, so a
+    // switch back to the measured setup shows the count again.
+    self.refreshContext();
 }
 
 /// Drop the active account and leave the agent signed out. `model` is kept as
-/// the last-shown value. The account-specific allowance and cache evidence are
-/// forgotten.
+/// the last-shown value. The account-specific allowance and cache rate are
+/// forgotten. The context gauge stands, because a signed-out Drinky sends no
+/// request that renders the history in another way.
 pub fn signOut(self: *Agent) void {
     self.client = null;
     self.stats.quota = null;
-    self.cache_evidence.clear();
+    self.stats.cache_usage = .{};
+    self.refreshContext();
 }
 
 /// Forget everything bound to the provider principal behind `account`: its
-/// replay proofs, its cache evidence, and its allowance gauge. A credential
+/// replay proofs, its cache rate, and its allowance gauge. A credential
 /// replacement can put another principal in the same account slot, and none of
 /// this state crosses that boundary. The account itself stays authenticated,
 /// so a caller that drops the account calls `signOut` or `switchTo` as well.
+///
+/// The context gauge keys on the account slot, which is not the principal. The
+/// next principal renders the same prompt bytes today, so a dropped proof is
+/// the only thing that voids the measurement here. Metadata of a principal that
+/// ever reaches the prompt must void it here too.
 pub fn dropAccountEvidence(self: *Agent, account: llm.Account) void {
     self.dropReasoning(account);
-    self.dropCacheEvidence(account);
-    // The gauge holds what the last response of the active account reported,
-    // so only that account can own it. The serving expectation came from the
-    // active account's replies too, so a replaced active principal takes it.
+    // Both gauges hold what the last response of the active account reported,
+    // so only that account can own them.
     const client = self.client orelse return;
     if (client.account() == account) {
         self.stats.quota = null;
-        self.cache_evidence.expected_model = "";
+        self.stats.cache_usage = .{};
     }
 }
 
-/// Drop cache evidence for an account whose credential changed. A credential
-/// can now identify a different provider principal with an isolated cache.
-fn dropCacheEvidence(self: *Agent, account: llm.Account) void {
-    self.cache_evidence.dropAccount(account);
-}
-
 /// Remove replay proofs produced by one account slot. A successful credential
-/// replacement calls this before that slot can represent another principal.
+/// replacement calls this before that slot can represent another principal. A
+/// dropped proof shortens the history, so the measured context no longer
+/// describes it.
 fn dropReasoning(self: *Agent, account: llm.Account) void {
+    const previous_count = self.items.items.len;
     var retained_count: usize = 0;
     for (self.items.items) |item| {
         const drop = switch (item) {
@@ -531,81 +424,84 @@ fn dropReasoning(self: *Agent, account: llm.Account) void {
         retained_count += 1;
     }
     self.items.shrinkRetainingCapacity(retained_count);
+    if (retained_count != previous_count) {
+        self.measured_context = null;
+        self.refreshContext();
+    }
 }
 
 /// Switch the reasoning-effort level. It takes effect on the next turn.
 pub fn setEffort(self: *Agent, effort: llm.Effort) void {
-    // The entries stay: the resolved effort is part of the cache key, so a
-    // change reads as a cold cache and a change back within retention meets
-    // the old warm one.
+    // Anthropic renders `output_config.effort` into the prompt and states that
+    // a change always invalidates the cached message blocks. Two levels that
+    // fold onto one wire form render the same bytes, so they share one cache
+    // and the rate survives.
+    const rendered_before = self.model.effort.resolve(self.effort);
+    const rendered_after = self.model.effort.resolve(effort);
+    if (!rendered_before.eql(rendered_after)) self.stats.cache_usage = .{};
     self.effort = effort;
+    // The same history renders to the same tokens, unless the new effort takes
+    // the stored reasoning out of the prompt or puts it back.
+    self.refreshContext();
 }
 
-/// Estimate the cache rewrite risk for an idle submission. Null means there is
-/// no committed context, no matching cache evidence past its retention, or a
-/// cost under the policy's floor.
-pub fn cacheRisk(self: *const Agent) ?CacheRisk {
-    const now = std.Io.Clock.Timestamp.now(self.io, .boot);
-    return self.cacheRiskAt(&now);
+/// Publish the measurement to the context gauge, or hide it while the next
+/// request renders the measured history in another way.
+///
+/// The gauge is a cache of `contextShown`, because `Stats` copies whole across
+/// the UI channel. Every change of the history, the measurement, or the request
+/// setup calls this, so the two never disagree. A new mutation point must call
+/// it too.
+fn refreshContext(self: *Agent) void {
+    self.stats.context_tokens = self.contextShown();
 }
 
-fn cacheRiskAt(self: *const Agent, now: *const std.Io.Clock.Timestamp) ?CacheRisk {
-    if (self.items.items.len == 0) return null;
-    const client = self.client orelse return null;
+/// The context the gauge shows. Empty history holds exactly zero tokens,
+/// measured or not. A measurement holds while the next request renders the same
+/// prompt around the same history. Anything else returns null, because Drinky
+/// counts no token itself.
+fn contextShown(self: *const Agent) ?u64 {
+    if (self.items.items.len == 0) return 0;
+    const measured = self.measured_context orelse return null;
+    // A tokenizer belongs to its model. Anthropic states that its models from
+    // 4.7 on count the same text about 30 percent higher.
+    if (!std.mem.eql(u8, measured.model, self.model.name)) return null;
+    // A signed-out Drinky sends nothing, so no request renders this history
+    // differently. The next account decides that.
+    const client = self.client orelse return measured.tokens;
     const account = client.account();
-    const expected = self.expectedModel();
-    // The policy can turn the warning off for a vendor, and a model without a
-    // stated retention cannot be judged. The expected model is the one whose
-    // cache the check judges, so it resolves the policy too.
-    const policy_retention_ms = self.cache.retentionMs(account, &expected) orelse return null;
-    if (policy_retention_ms == 0) return null;
-    if (now.clock != .boot) return null;
-    const evidence = &self.cache_evidence;
-    const effort = expected.effort.resolve(self.effort);
-    const index = evidence.indexOf(account, expected.name, effort) orelse {
-        // The expected model holds no cache under the active effort, so the
-        // next request probably rewrites the whole history: the case after
-        // `/model` or `/effort` to a pairing the conversation has not used.
-        // The newest entry of the account sizes the estimate, because the
-        // history is shared. A conversation with no entry at all has no size
-        // and nothing to lose.
-        const newest = evidence.newestOf(account) orelse return null;
-        return self.riskOverPrefix(newest.prefix_tokens, policy_retention_ms, .cold);
-    };
-    const entry = &evidence.entries[index];
-    if (entry.request_at.clock != .boot) return null;
-    const elapsed_ns = entry.request_at.durationTo(now.*).raw.toNanoseconds();
-    const retention_ns = @as(i96, @intCast(entry.retention_ms)) * std.time.ns_per_ms;
-    if (elapsed_ns < retention_ns) return null;
-    return self.riskOverPrefix(entry.prefix_tokens, entry.retention_ms, .stale);
+    // The count covers the whole prompt: the system blocks, the tools, the
+    // history, and the output. The account renders all of that around the
+    // history. It decides which stored proofs replay, and an Anthropic
+    // subscription or Console request also leads with the Claude Code identity
+    // that an API key omits. So another account states another number.
+    if (account != measured.account) return null;
+    // One account is left, and only the rendered effort can still move a proof.
+    // Anthropic drops every thinking block unless the request names an effort,
+    // so a change that flips the replay takes each proof of this account out of
+    // the prompt, or puts it back.
+    const resolution = self.model.effort.resolve(self.effort);
+    const vendor = account.provider();
+    if (resolution.replaysReasoning(vendor) == measured.resolution.replaysReasoning(vendor))
+        return measured.tokens;
+    return if (self.holdsProofOf(account)) null else measured.tokens;
 }
 
-/// The rewrite risk over one prefix, priced at the active model's rates and
-/// held to the policy floor. Null on an empty prefix or a cost under the floor.
-fn riskOverPrefix(
-    self: *const Agent,
-    prefix_tokens: u64,
-    retention_ms: u64,
-    cause: CacheRisk.Cause,
-) ?CacheRisk {
-    if (prefix_tokens == 0) return null;
-    const fresh = self.model.cost(&.{ .cache_read = prefix_tokens });
-    const stale = self.model.cost(&.{ .cache_write = prefix_tokens });
-    const cost_extra = @max(0, stale - fresh);
-    // A rewrite under the floor is not worth an interruption, so the turn
-    // starts without one. The default floor of zero warns about every risk.
-    if (cost_extra < self.cache.warning_min_cost) return null;
-    return .{ .retention_ms = retention_ms, .cost_extra = cost_extra, .cause = cause };
-}
-
-/// The model expected to serve the next request: the one that served the last
-/// reply, or the active model when no reply arrived since the last switch. The
-/// table entry resolves the active effort into the wire form the cache keys on.
-fn expectedModel(self: *const Agent) models.Model {
-    const expected_name = self.cache_evidence.expected_model;
-    if (expected_name.len == 0) return self.model;
-    const client = self.client orelse return self.model;
-    return models.get(client.account().provider(), expected_name) orelse self.model;
+/// Whether the history holds one stored reasoning proof of `account`. Only such
+/// a proof can enter or leave the prompt of that account.
+///
+/// A serializer also drops an incomplete proof. This scan does not repeat that
+/// test, because `dupeOutput` refuses a reply whose proof is empty, so every
+/// stored proof is complete.
+fn holdsProofOf(self: *const Agent, account: llm.Account) bool {
+    for (self.items.items) |item| {
+        const reasoning = switch (item) {
+            .reasoning => |value| value,
+            else => continue,
+        };
+        if (std.meta.activeTag(reasoning.replay) == account) return true;
+    }
+    return false;
 }
 
 /// Run one user turn as a checkpointed transaction, stream output through
@@ -717,10 +613,7 @@ fn runRounds(
         const ran_tools = try self.runToolsWith(Dispatch, reply, turn, handler);
         // A no-tool reply commits here. A tool-calling reply committed itself
         // together with its reserved results before dispatch.
-        if (!ran_tools) {
-            self.advanceCheckpoint(turn);
-            notifyCheckpoint(handler);
-        }
+        if (!ran_tools) try self.commitRound(turn, handler);
         // Send every skill file that this round asked for, before the steering
         // of the user. A tool met a file that a rule guards, so the model needs
         // the rules of that file for whatever it does next.
@@ -746,15 +639,35 @@ fn rollbackTurn(self: *Agent, turn: *TurnState) void {
     }
 }
 
+/// Commit the latest round: advance the checkpoint, tell the handler, and
+/// publish the gauges when this commit adopted a new context measurement. The
+/// usage frame of a round arrives before its commit, so a gauge that waits for
+/// the next frame trails one committed reply for a whole round.
+fn commitRound(self: *Agent, turn: *TurnState, handler: anytype) !void {
+    const measured = self.advanceCheckpoint(turn);
+    notifyCheckpoint(handler);
+    if (measured) try presentation(&turn.presentation_closed, handler.onUsage(self.stats));
+}
+
 /// Advance the checkpoint to commit the latest reply (and any reserved
-/// tool-result slots). The same advance commits the steering batch that preceded it.
-fn advanceCheckpoint(self: *Agent, turn: *TurnState) void {
+/// tool-result slots). The same advance commits the steering batch that preceded
+/// it, and the context that the reply measured. Returns whether it adopted a new
+/// measurement. The advance itself never fails, because a commit and the release
+/// of its steering batch must not come apart.
+fn advanceCheckpoint(self: *Agent, turn: *TurnState) bool {
     turn.checkpoint = self.items.items.len;
+    const measured = turn.pending_context != null;
+    if (turn.pending_context) |measured_context| {
+        self.measured_context = measured_context;
+        turn.pending_context = null;
+        self.refreshContext();
+    }
     if (turn.pending_steering) |batch| {
         turn.steering_committed_count += batch.len;
         freeSteeringBatch(self.gpa, batch);
         turn.pending_steering = null;
     }
+    return measured;
 }
 
 /// Tell presentation handlers that every event they accepted so far now belongs
@@ -859,7 +772,6 @@ fn fetchReply(
     while (true) : (attempt += 1) {
         if (attempt > 1)
             try presentation(&turn.presentation_closed, handler.onStreamReset());
-        const request_at = std.Io.Clock.Timestamp.now(self.io, .boot);
         var stream: @TypeOf(fetch.*).Stream = undefined;
         fetch.send(&stream, &request) catch |err| {
             const failure: net.Retry.Failure = .{ .attempt = attempt };
@@ -898,22 +810,16 @@ fn fetchReply(
             try presentation(&turn.presentation_closed, handler.onError(stream.errorText()));
             return error.ApiError;
         }
-        // The provider accepted this attempt, so its cache lookup already
-        // refreshed the real retention window. Anchor the evidence now, not at
-        // usage receipt, so a canceled or failed attempt cannot leave a stale
-        // anchor and a premature warning.
-        self.refreshCacheAnchor(&request_at);
         var usage_recorded = false;
         const reply = self.readReplyWith(
             &model,
             &stream,
             turn,
             &usage_recorded,
-            &request_at,
             handler,
         ) catch |err| switch (err) {
             error.ApiError => {
-                self.recordUsageSoFar(&model, &stream, &usage_recorded, &request_at);
+                self.recordUsageSoFar(&model, &stream, &usage_recorded);
                 const failure: net.Retry.Failure = .{
                     .attempt = attempt,
                     .suggested_ms = stream.retryAfterMs() orelse 0,
@@ -928,11 +834,11 @@ fn fetchReply(
             error.Canceled => {
                 // A cancel that interrupts the read before its terminal `.stop`
                 // still records whatever usage the provider delivered so far.
-                self.recordUsageSoFar(&model, &stream, &usage_recorded, &request_at);
+                self.recordUsageSoFar(&model, &stream, &usage_recorded);
                 return err;
             },
             else => {
-                self.recordUsageSoFar(&model, &stream, &usage_recorded, &request_at);
+                self.recordUsageSoFar(&model, &stream, &usage_recorded);
                 const failure: net.Retry.Failure = .{ .attempt = attempt };
                 if (retryableError(err) and self.retry.allows(failure)) {
                     try self.backoff(failure);
@@ -990,6 +896,9 @@ fn rollback(self: *Agent, base: usize) void {
     // A dropped item can carry the proof that a skill is loaded, so the guard
     // searches the shortened history again.
     if (self.skill_guard) |guard| guard.forget();
+    // The rollback keeps every committed reply, so the measurement survives. An
+    // emptied history reads as zero again.
+    self.refreshContext();
 }
 
 /// Free one history item's owned strings. An empty string frees as a no-op.
@@ -1013,6 +922,18 @@ fn appendUser(self: *Agent, text: []const u8) !void {
     const owned = try self.gpa.dupe(u8, text);
     errdefer self.gpa.free(owned);
     try self.items.append(self.gpa, .{ .message = .{ .role = .user, .text = owned } });
+    // The first message of a conversation ends the zero that empty history
+    // states, and no reply has measured this text. A message that follows a
+    // measured reply leaves that measurement alone, like every other item the
+    // turn appends.
+    self.refreshContext();
+}
+
+/// The conversation context one request reports: its whole prompt plus the
+/// output it produced. Saturating, because the counts arrive from the provider
+/// stream unchecked.
+fn contextTokens(usage: *const llm.Usage) u64 {
+    return usage.input +| usage.cache_read +| usage.cache_write +| usage.output;
 }
 
 /// Fold one message's usage into the totals, priced with `model`. The model is
@@ -1023,40 +944,11 @@ fn recordUsage(self: *Agent, model: *const models.Model, usage: *const llm.Usage
     const saved = model.savings(usage);
     self.stats.cost += cost;
     self.stats.saved += saved;
-    self.stats.last = usage.*;
+    // The prompt of an accepted request is processed and billed whole, even
+    // when the stream is canceled before its reply ends, so its hit rate is
+    // final as soon as the counts arrive.
+    self.stats.cache_usage = usage.*;
     self.stats.attribute(model.name, cost, saved, usage);
-}
-
-/// Record billing and the cache prefix from one provider-accepted request.
-/// `model` is the model that served the reply, or the requested model on the
-/// error paths where no served name arrived. The reply is direct evidence for
-/// the serving model's cache: its cache buckets describe that cache, touched
-/// at this request's dispatch. `request_at` is the dispatch time, not the
-/// later response completion, because the cache lookup happens before response
-/// generation.
-fn recordRequestUsage(
-    self: *Agent,
-    model: *const models.Model,
-    usage: *const llm.Usage,
-    request_at: *const std.Io.Clock.Timestamp,
-) void {
-    self.recordUsage(model, usage);
-    const account = if (self.client) |client| client.account() else return;
-    // A model whose retention the policy turns off, or one that states none,
-    // takes no warning, so it needs no entry.
-    const retention_ms = self.cache.retentionMs(account, model) orelse return;
-    if (retention_ms == 0) return;
-    // Only the cache buckets become a cheap read on the next request. The
-    // uncached input and the output form a new delta regardless of expiry.
-    const prefix_tokens = usage.cache_read +| usage.cache_write;
-    self.cache_evidence.touch(.{
-        .account = account,
-        .model = model.name,
-        .effort = model.effort.resolve(self.effort),
-        .retention_ms = retention_ms,
-        .request_at = request_at.*,
-        .prefix_tokens = prefix_tokens,
-    });
 }
 
 /// The model that prices one reply: the requested one, or the table entry of
@@ -1087,35 +979,17 @@ fn pricingModel(
     return error.UnknownServedModel;
 }
 
-/// Refresh the cache anchor of the model expected to serve an attempt the
-/// provider accepted. The cache lookup happens before response generation, so
-/// an accepted attempt refreshes the real retention window even when it later
-/// fails, is canceled, or streams no usage frame. Without this refresh the
-/// anchor goes stale and the next submit warns early. Evidence recorded later
-/// by the same attempt overwrites this with the same timestamp.
-fn refreshCacheAnchor(self: *Agent, request_at: *const std.Io.Clock.Timestamp) void {
-    const client = self.client orelse return;
-    const expected = self.expectedModel();
-    const index = self.cache_evidence.indexOf(
-        client.account(),
-        expected.name,
-        expected.effort.resolve(self.effort),
-    ) orelse return;
-    self.cache_evidence.entries[index].request_at = request_at.*;
-}
-
 /// Record a stream's nonzero running usage unless its terminal event already did.
 fn recordUsageSoFar(
     self: *Agent,
     model: *const models.Model,
     stream: anytype,
     usage_recorded: *bool,
-    request_at: *const std.Io.Clock.Timestamp,
 ) void {
     if (usage_recorded.*) return;
     const usage = stream.usageSoFar();
     if (std.meta.eql(usage, llm.Usage{})) return;
-    self.recordRequestUsage(model, &usage, request_at);
+    self.recordUsage(model, &usage);
     usage_recorded.* = true;
 }
 
@@ -1133,8 +1007,7 @@ fn readReply(
 ) ![]const llm.Item {
     var turn: TurnState = .{ .base = self.items.items.len, .checkpoint = self.items.items.len };
     var usage_recorded = false;
-    const request_at = std.Io.Clock.Timestamp.now(self.io, .boot);
-    return self.readReplyWith(model, stream, &turn, &usage_recorded, &request_at, handler);
+    return self.readReplyWith(model, stream, &turn, &usage_recorded, handler);
 }
 
 fn readReplyWith(
@@ -1143,7 +1016,6 @@ fn readReplyWith(
     stream: anytype,
     turn: *TurnState,
     usage_recorded: *bool,
-    request_at: *const std.Io.Clock.Timestamp,
     handler: anytype,
 ) ![]const llm.Item {
     const gpa = self.gpa;
@@ -1179,11 +1051,7 @@ fn readReplyWith(
     const priced_model = try self.pricingModel(model, stop.model, presentation_closed, handler);
     // Terminal usage is billable even when replay validation rejects the reply
     // and the request is retried.
-    self.recordRequestUsage(&priced_model, &stop.usage, request_at);
-    // The server that answered last is the best prediction of the next one,
-    // because a provider-side fallback holds for a conversation. Only a reply
-    // states its server, so the error paths leave the expectation alone.
-    self.cache_evidence.expected_model = priced_model.name;
+    self.recordUsage(&priced_model, &stop.usage);
     usage_recorded.* = true;
     try presentation(presentation_closed, handler.onUsage(self.stats));
 
@@ -1213,6 +1081,18 @@ fn readReplyWith(
 
     const start = self.items.items.len;
     try self.items.appendSlice(gpa, reply_items.items);
+    // The reply now belongs to the history, so its own report of the whole
+    // prompt plus the output measures that history exactly. Every rejection
+    // path returned above, so a discarded attempt never measures anything. The
+    // checkpoint adopts the measurement, because a round that fails before that
+    // point rolls this reply back out of the history again. The requested model
+    // names it, because the next request goes out under that model.
+    if (self.client) |client| turn.pending_context = .{
+        .tokens = contextTokens(&stop.usage),
+        .model = model.name,
+        .account = client.account(),
+        .resolution = model.effort.resolve(self.effort),
+    };
     // Only a committed reply's cutoff is worth a report: a rejected truncation
     // is retried, and a resampled attempt can finish.
     if (stop.status == .truncated) turn.truncated = true;
@@ -1309,8 +1189,7 @@ fn runToolsWith(
     // (reply + results) before any side effect can occur. A preparation failure
     // announces and dispatches nothing. The turn rolls back the reply.
     try self.reserveResults(calls);
-    self.advanceCheckpoint(turn);
-    notifyCheckpoint(handler);
+    try self.commitRound(turn, handler);
 
     const context: tool.Context = .{
         .gpa = self.gpa,
@@ -1506,13 +1385,9 @@ test "resetConversation clears conversation state and preserves configuration" {
     agent.effort = .high;
     try agent.appendUser("old prompt");
     const usage: llm.Usage = .{ .input = 1000, .output = 200, .cache_write = 500 };
-    const request_at: std.Io.Clock.Timestamp = .{
-        .raw = .fromNanoseconds(std.time.ns_per_ms),
-        .clock = .boot,
-    };
-    agent.recordRequestUsage(&agent.model, &usage, &request_at);
+    agent.recordUsage(&agent.model, &usage);
+    seedContext(&agent, contextTokens(&usage));
     try std.testing.expect(agent.stats.model_count == 1);
-    try std.testing.expectEqual(@as(usize, 1), agent.cache_evidence.entry_count);
     try agent.steering.push("old steering");
 
     agent.resetConversation();
@@ -1525,7 +1400,8 @@ test "resetConversation clears conversation state and preserves configuration" {
     defer gpa.free(steering);
     try std.testing.expectEqual(@as(usize, 0), steering.len);
     try std.testing.expect(!std.mem.eql(u8, &cache_key, &agent.cache_key));
-    try std.testing.expectEqual(@as(usize, 0), agent.cache_evidence.entry_count);
+    try std.testing.expectEqual(@as(?u64, 0), agent.stats.context_tokens);
+    try std.testing.expect(agent.measured_context == null);
     try std.testing.expectEqual(account, agent.client.?.account());
     try std.testing.expectEqualStrings(model.name, agent.model.name);
     try std.testing.expectEqual(llm.Effort.high, agent.effort);
@@ -1560,234 +1436,178 @@ test "an account change or sign-out clears the previous account's quota" {
     try std.testing.expect(agent.stats.quota == null);
 }
 
-test "cache risk follows the active provider retention and refresh time" {
+// The provider keys its cache on the principal, the model, and the rendered
+// effort, so a change to any of the three makes the measured rate foreign. Two
+// effort levels that fold onto one wire form write the same bytes and share
+// one cache, so the rate survives that change.
+test "the cache rate expires with the principal, the model, and the wire effort" {
+    const gpa = std.testing.allocator;
+    var agent = scriptedAgent(gpa);
+    defer agent.deinit();
+
+    const same_account = agent.client.?;
+    const sonnet = models.get(.anthropic, "claude-sonnet-4-6").?;
+    const usage: llm.Usage = .{ .input = 100, .output = 20, .cache_read = 900 };
+    try agent.appendUser("committed context");
+
+    agent.stats.cache_usage = usage;
+    agent.setEffort(.high);
+    try std.testing.expectEqual(llm.Usage{}, agent.stats.cache_usage);
+
+    // Sonnet 4.6 folds xhigh onto high, so this change writes the same bytes.
+    agent.switchTo(same_account, sonnet);
+    agent.setEffort(.high);
+    agent.stats.cache_usage = usage;
+    agent.setEffort(.xhigh);
+    try std.testing.expectEqual(usage, agent.stats.cache_usage);
+
+    // Another principal owns another cache.
+    const other_account = provider.Client.init(
+        gpa,
+        std.testing.io,
+        .{ .anthropic_api = "key" },
+        .{},
+    );
+    agent.switchTo(other_account, agent.model);
+    try std.testing.expectEqual(llm.Usage{}, agent.stats.cache_usage);
+
+    // The provider keys its entry on the rendered model too.
+    agent.stats.cache_usage = usage;
+    agent.switchTo(other_account, models.get(.anthropic, "claude-opus-4-8").?);
+    try std.testing.expectEqual(llm.Usage{}, agent.stats.cache_usage);
+
+    // A sign-out has no account left to attribute a rate to.
+    agent.stats.cache_usage = usage;
+    agent.signOut();
+    try std.testing.expectEqual(llm.Usage{}, agent.stats.cache_usage);
+}
+
+// The context gauge shows a measurement, and Drinky counts no token itself. So
+// the measurement holds exactly while the next request renders the same prompt
+// around the same history. A tokenizer belongs to its model: Anthropic counts
+// the same text about 30 percent higher from Claude 4.7 on. The account renders
+// everything around the history. Under one account, only the rendered effort
+// still moves a proof, because Anthropic replays a thinking block only under a
+// named effort. The measurement carries the setup it describes, so a switch back
+// to that setup shows the count again.
+test "the context gauge holds while the tokenizer and the replayed reasoning hold" {
+    const gpa = std.testing.allocator;
+    var agent = scriptedAgent(gpa);
+    defer agent.deinit();
+
+    const subscription = agent.client.?;
+    const opus = agent.model;
+    try agent.appendUser("committed context");
+    try appendProof(&agent, .anthropic_subscription);
+    agent.setEffort(.high);
+    seedContext(&agent, 1020);
+
+    // Another named effort keeps every thinking block in the prompt.
+    agent.setEffort(.max);
+    try std.testing.expectEqual(@as(?u64, 1020), agent.stats.context_tokens);
+
+    // Opus omits the effort control for `none`, which takes every thinking
+    // block out of the prompt. The count no longer describes what goes out.
+    agent.setEffort(.none);
+    try std.testing.expect(agent.stats.context_tokens == null);
+
+    // Back under a named effort the proof replays again, so the count returns.
+    agent.setEffort(.high);
+    try std.testing.expectEqual(@as(?u64, 1020), agent.stats.context_tokens);
+
+    // Another account renders another prompt, and it cannot replay this proof.
+    const console = provider.Client.init(gpa, std.testing.io, .{ .anthropic_console = "k" }, .{});
+    agent.switchTo(console, opus);
+    try std.testing.expect(agent.stats.context_tokens == null);
+    agent.switchTo(subscription, opus);
+    try std.testing.expectEqual(@as(?u64, 1020), agent.stats.context_tokens);
+
+    // A signed-out Drinky sends nothing, so the count stands until an account
+    // that renders the history in another way replaces it.
+    agent.signOut();
+    try std.testing.expectEqual(@as(?u64, 1020), agent.stats.context_tokens);
+    agent.switchTo(console, opus);
+    try std.testing.expect(agent.stats.context_tokens == null);
+
+    // The rule holds whatever account went before, so the gauge never depends
+    // on the order of the switches.
+    agent.signOut();
+    try std.testing.expectEqual(@as(?u64, 1020), agent.stats.context_tokens);
+    agent.switchTo(subscription, opus);
+
+    // Another model counts the same history with another tokenizer.
+    agent.switchTo(subscription, models.get(.anthropic, "claude-sonnet-4-6").?);
+    try std.testing.expect(agent.stats.context_tokens == null);
+    agent.switchTo(subscription, opus);
+    try std.testing.expectEqual(@as(?u64, 1020), agent.stats.context_tokens);
+
+    // Empty history holds exactly zero tokens, so a reset needs no measurement.
+    agent.resetConversation();
+    try std.testing.expectEqual(@as(?u64, 0), agent.stats.context_tokens);
+}
+
+// The measured count covers the whole prompt, not the history alone, and the
+// account renders everything around that history. An Anthropic subscription or
+// Console request leads with the Claude Code identity that an API key omits, so
+// the count of one account states nothing about another. A history with no
+// stored proof changes nothing about that.
+test "an account switch hides the count, and a switch back restores it" {
+    const gpa = std.testing.allocator;
+    var agent = scriptedAgent(gpa);
+    defer agent.deinit();
+
+    const subscription = agent.client.?;
+    const opus = agent.model;
+    try agent.appendUser("committed context");
+    agent.setEffort(.high);
+    seedContext(&agent, 1020);
+
+    const console = provider.Client.init(gpa, std.testing.io, .{ .anthropic_console = "k" }, .{});
+    agent.switchTo(console, opus);
+    try std.testing.expect(agent.stats.context_tokens == null);
+
+    // The measurement waits for its own setup, so the switch back shows it.
+    agent.switchTo(subscription, opus);
+    try std.testing.expectEqual(@as(?u64, 1020), agent.stats.context_tokens);
+}
+
+// An effort change moves a token only when it takes a stored proof out of the
+// prompt of the active account, or puts one back.
+test "the context gauge survives every effort change that replays the same reasoning" {
     const gpa = std.testing.allocator;
     var anthropic_agent = scriptedAgent(gpa);
     defer anthropic_agent.deinit();
+
+    const subscription = anthropic_agent.client.?;
     try anthropic_agent.appendUser("committed context");
+    anthropic_agent.setEffort(.high);
+    seedContext(&anthropic_agent, 1020);
 
-    const start: std.Io.Clock.Timestamp = .{ .raw = .zero, .clock = .boot };
-    const usage: llm.Usage = .{ .cache_read = 160_000, .cache_write = 40_000 };
-    anthropic_agent.recordRequestUsage(&anthropic_agent.model, &usage, &start);
+    // Opus omits the effort control for `none`, but this history holds no proof
+    // that the omission can take out of the prompt.
+    anthropic_agent.setEffort(.none);
+    try std.testing.expectEqual(@as(?u64, 1020), anthropic_agent.stats.context_tokens);
 
-    const before_anthropic: std.Io.Clock.Timestamp = .{
-        .raw = .fromNanoseconds(5 * std.time.ns_per_min - 1),
-        .clock = .boot,
-    };
-    try std.testing.expect(anthropic_agent.cacheRiskAt(&before_anthropic) == null);
-    const at_anthropic: std.Io.Clock.Timestamp = .{
-        .raw = .fromNanoseconds(5 * std.time.ns_per_min),
-        .clock = .boot,
-    };
-    const anthropic_risk = anthropic_agent.cacheRiskAt(&at_anthropic).?;
-    try std.testing.expectEqual(@as(u64, 5 * std.time.ms_per_min), anthropic_risk.retention_ms);
-    try std.testing.expectApproxEqAbs(@as(f64, 1.15), anthropic_risk.cost_extra, 1e-9);
-
-    const refreshed_at: std.Io.Clock.Timestamp = .{
-        .raw = .fromNanoseconds(4 * std.time.ns_per_min),
-        .clock = .boot,
-    };
-    anthropic_agent.recordRequestUsage(&anthropic_agent.model, &usage, &refreshed_at);
-    try std.testing.expect(anthropic_agent.cacheRiskAt(&at_anthropic) == null);
-    const after_refresh: std.Io.Clock.Timestamp = .{
-        .raw = .fromNanoseconds(9 * std.time.ns_per_min),
-        .clock = .boot,
-    };
-    try std.testing.expect(anthropic_agent.cacheRiskAt(&after_refresh) != null);
+    // Sonnet 4.6 folds xhigh onto high. Both name an effort, so the proof of
+    // this account replays either way and the count stands.
+    const sonnet = models.get(.anthropic, "claude-sonnet-4-6").?;
+    anthropic_agent.switchTo(subscription, sonnet);
+    try appendProof(&anthropic_agent, .anthropic_subscription);
+    anthropic_agent.setEffort(.high);
+    seedContext(&anthropic_agent, 1020);
+    anthropic_agent.setEffort(.xhigh);
+    try std.testing.expectEqual(@as(?u64, 1020), anthropic_agent.stats.context_tokens);
 
     var openai_agent = openaiScriptedAgent(gpa);
     defer openai_agent.deinit();
     try openai_agent.appendUser("committed context");
-    openai_agent.recordRequestUsage(&openai_agent.model, &usage, &start);
-    try std.testing.expect(openai_agent.cacheRiskAt(&at_anthropic) == null);
-    const at_openai: std.Io.Clock.Timestamp = .{
-        .raw = .fromNanoseconds(30 * std.time.ns_per_min),
-        .clock = .boot,
-    };
-    try std.testing.expect(openai_agent.cacheRiskAt(&at_openai) != null);
-}
+    try appendProof(&openai_agent, .openai_api);
+    openai_agent.setEffort(.high);
+    seedContext(&openai_agent, 1020);
 
-test "the cache policy overrides one vendor's retention and floors the warning" {
-    const gpa = std.testing.allocator;
-    var agent = scriptedAgent(gpa);
-    defer agent.deinit();
-    agent.cache = .{ .anthropic_retention_ms = std.time.ms_per_min };
-    try agent.appendUser("committed context");
-
-    const start: std.Io.Clock.Timestamp = .{ .raw = .zero, .clock = .boot };
-    const usage: llm.Usage = .{ .cache_read = 160_000, .cache_write = 40_000 };
-    const at_minute: std.Io.Clock.Timestamp = .{
-        .raw = .fromNanoseconds(std.time.ns_per_min),
-        .clock = .boot,
-    };
-
-    // The override replaces the compiled 5 minutes of the model, so the same
-    // evidence goes stale four minutes earlier.
-    agent.recordRequestUsage(&agent.model, &usage, &start);
-    const risk = agent.cacheRiskAt(&at_minute).?;
-    try std.testing.expectEqual(@as(u64, std.time.ms_per_min), risk.retention_ms);
-    try std.testing.expectApproxEqAbs(@as(f64, 1.15), risk.cost_extra, 1e-9);
-
-    // An override of the other vendor leaves this model on its compiled value.
-    agent.cache = .{ .openai_retention_ms = std.time.ms_per_min };
-    agent.recordRequestUsage(&agent.model, &usage, &start);
-    try std.testing.expect(agent.cacheRiskAt(&at_minute) == null);
-
-    // A floor above the estimate starts the turn without a warning. The
-    // estimate itself still arms one.
-    agent.cache = .{
-        .anthropic_retention_ms = std.time.ms_per_min,
-        .warning_min_cost = 1.2,
-    };
-    agent.recordRequestUsage(&agent.model, &usage, &start);
-    try std.testing.expect(agent.cacheRiskAt(&at_minute) == null);
-    agent.cache.warning_min_cost = 1.15;
-    try std.testing.expect(agent.cacheRiskAt(&at_minute) != null);
-
-    // A retention of 0 turns the warning off, however long the wait was.
-    agent.cache = .{ .anthropic_retention_ms = 0 };
-    agent.recordRequestUsage(&agent.model, &usage, &start);
-    const at_hour: std.Io.Clock.Timestamp = .{
-        .raw = .fromNanoseconds(std.time.ns_per_hour),
-        .clock = .boot,
-    };
-    try std.testing.expect(agent.cacheRiskAt(&at_hour) == null);
-}
-
-test "cache risk needs matching setup, effort, and a reusable prefix" {
-    const gpa = std.testing.allocator;
-    var agent = scriptedAgent(gpa);
-    defer agent.deinit();
-    const start: std.Io.Clock.Timestamp = .{ .raw = .zero, .clock = .boot };
-    const stale_at: std.Io.Clock.Timestamp = .{
-        .raw = .fromNanoseconds(5 * std.time.ns_per_min),
-        .clock = .boot,
-    };
-
-    agent.recordRequestUsage(&agent.model, &.{ .cache_read = 1000 }, &start);
-    try std.testing.expect(agent.cacheRiskAt(&stale_at) == null);
-    try agent.appendUser("committed context");
-    agent.recordRequestUsage(&agent.model, &.{ .input = 1000 }, &start);
-    try std.testing.expect(agent.cacheRiskAt(&stale_at) == null);
-
-    agent.recordRequestUsage(&agent.model, &.{ .cache_read = 1000 }, &start);
-    try std.testing.expect(agent.cacheRiskAt(&stale_at) != null);
-    // The resolved effort is part of the cache key: a change reads as a cold
-    // cache at once, and a change back within retention meets the old warm one.
-    const warm_at: std.Io.Clock.Timestamp = .{
-        .raw = .fromNanoseconds(std.time.ns_per_min),
-        .clock = .boot,
-    };
-    try std.testing.expect(agent.cacheRiskAt(&warm_at) == null);
-    agent.setEffort(.high);
-    try std.testing.expect(agent.cache_evidence.entry_count != 0);
-    try std.testing.expectEqual(
-        CacheRisk.Cause.cold,
-        agent.cacheRiskAt(&warm_at).?.cause,
-    );
-    agent.setEffort(.none);
-    try std.testing.expect(agent.cacheRiskAt(&warm_at) == null);
-
-    const client = agent.client.?;
-    agent.switchTo(client, models.get(.anthropic, "claude-sonnet-4-6").?);
-    // A model switch keeps the entries: the new model's cold cache warns at
-    // once, and a switch back can meet the old model's warm cache.
-    try std.testing.expect(agent.cache_evidence.entry_count != 0);
-    try std.testing.expectEqual(
-        CacheRisk.Cause.cold,
-        agent.cacheRiskAt(&stale_at).?.cause,
-    );
-
-    agent.recordRequestUsage(&agent.model, &.{ .cache_write = 1000 }, &start);
-    agent.dropCacheEvidence(.anthropic_subscription);
-    try std.testing.expect(agent.cache_evidence.entry_count == 0);
-
-    agent.recordRequestUsage(&agent.model, &.{ .cache_write = 1000 }, &start);
-    agent.client = null;
-    // A signed-out record books the money and leaves the evidence alone, and
-    // the consult returns null without a client either way.
-    agent.recordRequestUsage(&agent.model, &.{ .cache_write = 1000 }, &start);
-    try std.testing.expect(agent.cacheRiskAt(&stale_at) == null);
-}
-
-// A model switch meets per-model reality: the new model holds no cache for
-// this conversation, so the first submit warns at once, and a switch back
-// within retention meets the old model's still-warm cache and stays silent.
-test "a model switch warns on a cold cache and not on a warm one" {
-    const gpa = std.testing.allocator;
-    var agent = scriptedAgent(gpa);
-    defer agent.deinit();
-    try agent.appendUser("committed context");
-    const start: std.Io.Clock.Timestamp = .{ .raw = .zero, .clock = .boot };
-    const usage: llm.Usage = .{ .cache_read = 160_000, .cache_write = 40_000 };
-    agent.recordRequestUsage(&agent.model, &usage, &start);
-
-    // Warm on the same model: silence.
-    const soon: std.Io.Clock.Timestamp = .{
-        .raw = .fromNanoseconds(std.time.ns_per_min),
-        .clock = .boot,
-    };
-    try std.testing.expect(agent.cacheRiskAt(&soon) == null);
-
-    // `/model` to a model this conversation has not used: its cache is cold,
-    // so the warning fires at once, sized by the shared history and priced at
-    // the new model's rates: (3.75 - 0.3) * 0.2 million tokens.
-    const client = agent.client.?;
-    agent.switchTo(client, models.get(.anthropic, "claude-sonnet-4-6").?);
-    const cold_risk = agent.cacheRiskAt(&soon).?;
-    try std.testing.expectEqual(CacheRisk.Cause.cold, cold_risk.cause);
-    try std.testing.expectApproxEqAbs(@as(f64, 0.69), cold_risk.cost_extra, 1e-9);
-
-    // The switch back within retention meets the old model's warm cache.
-    agent.switchTo(client, models.get(.anthropic, "claude-opus-4-8").?);
-    try std.testing.expect(agent.cacheRiskAt(&soon) == null);
-    // Past retention the timing rule warns as always.
-    const late: std.Io.Clock.Timestamp = .{
-        .raw = .fromNanoseconds(10 * std.time.ns_per_min),
-        .clock = .boot,
-    };
-    try std.testing.expectEqual(
-        CacheRisk.Cause.stale,
-        agent.cacheRiskAt(&late).?.cause,
-    );
-}
-
-/// A cache-only clock over a real vtable. This test calls only `now`, because
-/// each copied backend function expects the backend's original userdata.
-const CacheClock = struct {
-    vtable: std.Io.VTable,
-    now_ns: i96,
-    requested: ?std.Io.Clock = null,
-
-    fn init(backend: std.Io, now_ns: i96) CacheClock {
-        var vtable = backend.vtable.*;
-        vtable.now = now;
-        return .{ .vtable = vtable, .now_ns = now_ns };
-    }
-
-    fn io(self: *CacheClock) std.Io {
-        return .{ .userdata = self, .vtable = &self.vtable };
-    }
-
-    fn now(userdata: ?*anyopaque, clock: std.Io.Clock) std.Io.Timestamp {
-        const self: *CacheClock = @ptrCast(@alignCast(userdata));
-        self.requested = clock;
-        return .fromNanoseconds(self.now_ns);
-    }
-};
-
-test "cache expiry requests the monotonic boot clock" {
-    const gpa = std.testing.allocator;
-    var agent = scriptedAgent(gpa);
-    defer agent.deinit();
-    try agent.appendUser("committed context");
-    const start: std.Io.Clock.Timestamp = .{ .raw = .zero, .clock = .boot };
-    agent.recordRequestUsage(&agent.model, &.{ .cache_read = 1000 }, &start);
-
-    var clock = CacheClock.init(std.testing.io, 5 * std.time.ns_per_min);
-    agent.io = clock.io();
-    try std.testing.expect(agent.cacheRisk() != null);
-    try std.testing.expectEqual(std.Io.Clock.boot, clock.requested.?);
+    // OpenAI names an effort at every level and keeps the encrypted item.
+    openai_agent.setEffort(.none);
+    try std.testing.expectEqual(@as(?u64, 1020), openai_agent.stats.context_tokens);
 }
 
 test "usage is attributed to the model that produced it across a switch" {
@@ -1846,7 +1666,7 @@ test "cumulative totals stay exact past the per-model bound" {
     try std.testing.expectEqual(@as(usize, by_model_max), agent.stats.model_count);
     try std.testing.expectEqualStrings("m15", agent.stats.by_model[by_model_max - 1].name);
     try std.testing.expectApproxEqAbs(@as(f64, 85), agent.stats.cost, 1e-9);
-    try std.testing.expectEqual(@as(u64, 1_000_000), agent.stats.last.input);
+    try std.testing.expectEqual(@as(u64, 1_000_000), agent.stats.cache_usage.input);
 }
 
 const ScriptedStream = struct {
@@ -2103,6 +1923,8 @@ const CaptureHandler = struct {
     /// Every reported model switch as `requested served`, one per line.
     model_mismatches: std.ArrayList(u8) = .empty,
     errors: std.ArrayList(u8) = .empty,
+    /// Every context measurement the agent published, in order.
+    published_context: std.ArrayList(?u64) = .empty,
     usage_count: usize = 0,
     tool_start_count: usize = 0,
     tool_result_count: usize = 0,
@@ -2118,6 +1940,7 @@ const CaptureHandler = struct {
         self.streamed_tools.deinit(self.gpa);
         self.model_mismatches.deinit(self.gpa);
         self.errors.deinit(self.gpa);
+        self.published_context.deinit(self.gpa);
     }
 
     fn onStreamReset(self: *CaptureHandler) !void {
@@ -2146,7 +1969,7 @@ const CaptureHandler = struct {
     }
 
     fn onUsage(self: *CaptureHandler, stats: Stats) !void {
-        _ = stats;
+        try self.published_context.append(self.gpa, stats.context_tokens);
         self.usage_count += 1;
         if (self.fail_usage) return error.Canceled;
     }
@@ -2202,6 +2025,46 @@ fn scriptedAgent(gpa: std.mem.Allocator) Agent {
         .system = "",
         .retry = .{},
     });
+}
+
+/// Seed the measurement that a committed reply under the current setup leaves.
+fn seedContext(agent: *Agent, tokens: u64) void {
+    agent.measured_context = .{
+        .tokens = tokens,
+        .model = agent.model.name,
+        .account = agent.client.?.account(),
+        .resolution = agent.model.effort.resolve(agent.effort),
+    };
+    agent.refreshContext();
+}
+
+/// Append one stored reasoning proof of `account` to the history. Every string
+/// is owned, because `deinit` frees the whole item.
+fn appendProof(agent: *Agent, account: llm.Account) !void {
+    const gpa = agent.gpa;
+    const text = try gpa.dupe(u8, "think");
+    errdefer gpa.free(text);
+    const proof = try gpa.dupe(u8, "proof");
+    errdefer gpa.free(proof);
+    const replay: llm.Item.Reasoning.Replay = switch (account) {
+        inline .anthropic_subscription,
+        .anthropic_api,
+        .anthropic_console,
+        => |tag| @unionInit(
+            llm.Item.Reasoning.Replay,
+            @tagName(tag),
+            .{ .signature = .{ .text = text, .signature = proof } },
+        ),
+        inline .openai_subscription, .openai_api => |tag| replay: {
+            const id = try gpa.dupe(u8, "rs_1");
+            break :replay @unionInit(
+                llm.Item.Reasoning.Replay,
+                @tagName(tag),
+                .{ .text = text, .id = id, .encrypted_content = proof },
+            );
+        },
+    };
+    try agent.items.append(gpa, .{ .reasoning = .{ .replay = replay } });
 }
 
 fn openaiScriptedAgent(gpa: std.mem.Allocator) Agent {
@@ -2337,9 +2200,8 @@ test "readReply reports a reply that another model served" {
 
 // The provider bills a switched request at the fallback's rates, so the ledger
 // must price the reply at the model that served it and attribute the usage to
-// that model's bucket. The reply is also direct evidence for the serving
-// model's cache, and that model is the expected next server, so the warning
-// stays silent while the fallback's cache is warm and fires past retention.
+// that model's bucket. The cache rate takes the same reply, because the
+// fallback keeps serving the conversation.
 test "readReply prices a reply at the model that served it" {
     const gpa = std.testing.allocator;
     var agent = scriptedAgent(gpa);
@@ -2359,65 +2221,7 @@ test "readReply prices a reply at the model that served it" {
     try std.testing.expectEqual(served.cost(&usage), agent.stats.cost);
     try std.testing.expectEqual(served.savings(&usage), agent.stats.saved);
     try std.testing.expectEqualStrings("claude-sonnet-4-6", agent.stats.by_model[0].name);
-    try std.testing.expectEqualStrings("claude-sonnet-4-6", agent.cache_evidence.entries[0].model);
-    try std.testing.expectEqualStrings("claude-sonnet-4-6", agent.cache_evidence.expected_model);
-
-    // The anchor moves to a known time first, because readReply stamped the
-    // real clock.
-    const anchored_at: std.Io.Clock.Timestamp = .{
-        .raw = .fromNanoseconds(std.time.ns_per_ms),
-        .clock = .boot,
-    };
-    agent.refreshCacheAnchor(&anchored_at);
-    // Within retention the sticky fallback keeps its own cache warm: silence.
-    const warm_at: std.Io.Clock.Timestamp = .{
-        .raw = .fromNanoseconds(4 * std.time.ns_per_min),
-        .clock = .boot,
-    };
-    try std.testing.expect(agent.cacheRiskAt(&warm_at) == null);
-    // Past retention every candidate cache is stale, so the warning fires.
-    const probe_at: std.Io.Clock.Timestamp = .{
-        .raw = .fromNanoseconds(10 * std.time.ns_per_min),
-        .clock = .boot,
-    };
-    try std.testing.expectEqual(
-        CacheRisk.Cause.stale,
-        agent.cacheRiskAt(&probe_at).?.cause,
-    );
-}
-
-// The cache lookup happens before response generation, so an attempt the
-// provider accepted refreshes the real retention window at its dispatch even
-// when it streams no usage. The anchor must follow, or the next submit warns
-// about a cache the provider just refreshed.
-test "an accepted attempt refreshes the cache anchor without usage" {
-    const gpa = std.testing.allocator;
-    var agent = scriptedAgent(gpa);
-    defer agent.deinit();
-
-    const first_at: std.Io.Clock.Timestamp = .{
-        .raw = .fromNanoseconds(std.time.ns_per_ms),
-        .clock = .boot,
-    };
-    agent.recordRequestUsage(&agent.model, &.{ .cache_write = 1000 }, &first_at);
-    const later_at: std.Io.Clock.Timestamp = .{
-        .raw = .fromNanoseconds(4 * std.time.ns_per_min),
-        .clock = .boot,
-    };
-    agent.refreshCacheAnchor(&later_at);
-    try std.testing.expectEqual(later_at.raw, agent.cache_evidence.entries[0].request_at.raw);
-    // The refreshed prefix stays warm past the old anchor's expiry.
-    const probe_at: std.Io.Clock.Timestamp = .{
-        .raw = .fromNanoseconds(8 * std.time.ns_per_min),
-        .clock = .boot,
-    };
-    try agent.appendUser("hi");
-    try std.testing.expect(agent.cacheRiskAt(&probe_at) == null);
-
-    // Without evidence there is nothing to anchor, so the refresh is a no-op.
-    agent.cache_evidence.clear();
-    agent.refreshCacheAnchor(&later_at);
-    try std.testing.expectEqual(@as(usize, 0), agent.cache_evidence.entry_count);
+    try std.testing.expectEqual(usage, agent.stats.cache_usage);
 }
 
 // A price at rates Drinky does not know corrupts the ledger silently, so an
@@ -2501,7 +2305,7 @@ test "readReply records terminal usage before rejecting an invalid reply" {
             error.IncompleteReply,
             agent.readReply(&agent.model, &stream, &handler),
         );
-        try std.testing.expectEqual(@as(u64, 17), agent.stats.last.input);
+        try std.testing.expectEqual(@as(u64, 17), agent.stats.cache_usage.input);
         try std.testing.expectEqual(@as(usize, 1), handler.usage_count);
         try std.testing.expectEqual(@as(usize, 0), agent.items.items.len);
     }
@@ -2520,7 +2324,7 @@ test "readReply records terminal usage before rejecting an invalid reply" {
             error.EmptyReply,
             agent.readReply(&agent.model, &stream, &handler),
         );
-        try std.testing.expectEqual(@as(u64, 23), agent.stats.last.output);
+        try std.testing.expectEqual(@as(u64, 23), agent.stats.cache_usage.output);
         try std.testing.expectEqual(@as(usize, 1), handler.usage_count);
     }
     // Invalid completed item data is latched. Remaining display content is
@@ -2545,7 +2349,7 @@ test "readReply records terminal usage before rejecting an invalid reply" {
             agent.readReply(&agent.model, &stream, &handler),
         );
         try std.testing.expectEqual(events.len, stream.index);
-        try std.testing.expectEqual(@as(u64, 29), agent.stats.last.cache_read);
+        try std.testing.expectEqual(@as(u64, 29), agent.stats.cache_usage.cache_read);
         try std.testing.expectEqual(@as(usize, 1), handler.usage_count);
         try std.testing.expectEqualStrings("", handler.text.items);
     }
@@ -2566,7 +2370,7 @@ test "readReply rejects a terminal response with no assistant items" {
         error.EmptyReply,
         agent.readReply(&agent.model, &stream, &handler),
     );
-    try std.testing.expectEqual(@as(u64, 3), agent.stats.last.output);
+    try std.testing.expectEqual(@as(u64, 3), agent.stats.cache_usage.output);
     try std.testing.expectEqual(@as(usize, 1), handler.usage_count);
     try std.testing.expectEqual(@as(usize, 0), agent.items.items.len);
 }
@@ -2735,8 +2539,8 @@ test "readReply accepts Anthropic message_stop without waiting for later traffic
     const reply = try agent.readReply(&agent.model, &stream, &handler);
     try std.testing.expectEqual(@as(usize, 1), reply.len);
     try std.testing.expectEqualStrings("done", reply[0].message.text);
-    try std.testing.expectEqual(@as(u64, 10), agent.stats.last.input);
-    try std.testing.expectEqual(@as(u64, 4), agent.stats.last.output);
+    try std.testing.expectEqual(@as(u64, 10), agent.stats.cache_usage.input);
+    try std.testing.expectEqual(@as(u64, 4), agent.stats.cache_usage.output);
     try std.testing.expectEqual(@as(usize, 1), handler.usage_count);
     try std.testing.expect(std.mem.indexOf(u8, reader.buffered(), "message_stop") == null);
     try std.testing.expect(std.mem.indexOf(u8, reader.buffered(), "ping") != null);
@@ -2765,8 +2569,8 @@ test "readReply accepts OpenAI completion without consuming its done sentinel" {
     const reply = try agent.readReply(&agent.model, &stream, &handler);
     try std.testing.expectEqual(@as(usize, 1), reply.len);
     try std.testing.expectEqualStrings("done", reply[0].message.text);
-    try std.testing.expectEqual(@as(u64, 10), agent.stats.last.input);
-    try std.testing.expectEqual(@as(u64, 4), agent.stats.last.output);
+    try std.testing.expectEqual(@as(u64, 10), agent.stats.cache_usage.input);
+    try std.testing.expectEqual(@as(u64, 4), agent.stats.cache_usage.output);
     try std.testing.expectEqual(@as(usize, 1), handler.usage_count);
     try std.testing.expect(std.mem.indexOf(u8, reader.buffered(), "[DONE]") != null);
 }
@@ -2795,8 +2599,8 @@ test "provider rejections retain terminal usage before failing the reply" {
             error.UnsupportedReply,
             agent.readReply(&agent.model, &stream, &handler),
         );
-        try std.testing.expectEqual(@as(u64, 11), agent.stats.last.input);
-        try std.testing.expectEqual(@as(u64, 7), agent.stats.last.output);
+        try std.testing.expectEqual(@as(u64, 11), agent.stats.cache_usage.input);
+        try std.testing.expectEqual(@as(u64, 7), agent.stats.cache_usage.output);
         try std.testing.expectEqual(@as(usize, 1), handler.usage_count);
     }
     // OpenAI refusal frames drain through response.completed and its usage.
@@ -2818,8 +2622,8 @@ test "provider rejections retain terminal usage before failing the reply" {
             error.UnsupportedReply,
             agent.readReply(&agent.model, &stream, &handler),
         );
-        try std.testing.expectEqual(@as(u64, 13), agent.stats.last.input);
-        try std.testing.expectEqual(@as(u64, 5), agent.stats.last.output);
+        try std.testing.expectEqual(@as(u64, 13), agent.stats.cache_usage.input);
+        try std.testing.expectEqual(@as(u64, 5), agent.stats.cache_usage.output);
         try std.testing.expectEqual(@as(usize, 1), handler.usage_count);
     }
     // An incomplete function item is retryable, but the rejected attempt is
@@ -2846,8 +2650,8 @@ test "provider rejections retain terminal usage before failing the reply" {
             error.IncompleteReply,
             agent.readReply(&agent.model, &stream, &handler),
         );
-        try std.testing.expectEqual(@as(u64, 17), agent.stats.last.input);
-        try std.testing.expectEqual(@as(u64, 3), agent.stats.last.output);
+        try std.testing.expectEqual(@as(u64, 17), agent.stats.cache_usage.input);
+        try std.testing.expectEqual(@as(u64, 3), agent.stats.cache_usage.output);
         try std.testing.expectEqual(@as(usize, 1), handler.usage_count);
         try std.testing.expectEqual(@as(usize, 0), agent.items.items.len);
     }
@@ -3062,7 +2866,7 @@ test "readReply assembles a reasoning run, answer, and tool call in stream order
     try std.testing.expectEqualStrings("{\"path\":\"a\"}", reply[2].tool_call.arguments_json);
     try std.testing.expectEqualStrings("weigh it", handler.thinking.items);
     try std.testing.expectEqual(@as(usize, 1), handler.usage_count);
-    try std.testing.expectEqual(@as(u64, 5), agent.stats.last.output);
+    try std.testing.expectEqual(@as(u64, 5), agent.stats.cache_usage.output);
 }
 
 test "readReply keeps a redacted block and a signature-only run in order" {
@@ -3259,14 +3063,19 @@ test "dropReasoning invalidates only the replaced account slot" {
     _ = try agent.readReply(&agent.model, &openai_stream, &handler);
 
     try std.testing.expectEqual(@as(usize, 2), agent.items.items.len);
+    seedContext(&agent, 1020);
     agent.dropReasoning(.anthropic_subscription);
     try std.testing.expectEqual(@as(usize, 1), agent.items.items.len);
     try std.testing.expectEqual(
         llm.Account.openai_api,
         std.meta.activeTag(agent.items.items[0].reasoning.replay),
     );
+    // A shorter history leaves no valid measurement of it.
+    try std.testing.expect(agent.stats.context_tokens == null);
     agent.dropReasoning(.openai_api);
     try std.testing.expectEqual(@as(usize, 0), agent.items.items.len);
+    // Empty history holds exactly zero tokens, measured or not.
+    try std.testing.expectEqual(@as(?u64, 0), agent.stats.context_tokens);
 }
 
 test "dropped account evidence takes the allowance of the active account only" {
@@ -3275,40 +3084,20 @@ test "dropped account evidence takes the allowance of the active account only" {
     defer agent.deinit();
     const quota: llm.Quota = .{ .primary = .{ .used_percent = 25, .window_minutes = 300 } };
 
-    // The gauge belongs to the account whose response reported it, so another
-    // account's replaced credential leaves it alone.
+    // Both gauges belong to the account whose response reported them, so
+    // another account's replaced credential leaves them alone.
+    const usage: llm.Usage = .{ .input = 100, .cache_read = 900 };
     agent.stats.quota = quota;
-    agent.cache_evidence.touch(.{
-        .account = .openai_api,
-        .model = "gpt-5.6-sol",
-        .effort = .{ .named = "xhigh" },
-        .retention_ms = 300_000,
-        .request_at = .{ .raw = .zero, .clock = .boot },
-        .prefix_tokens = 1000,
-    });
-    agent.cache_evidence.touch(.{
-        .account = .anthropic_subscription,
-        .model = "claude-opus-4-8",
-        .effort = .omitted,
-        .retention_ms = 300_000,
-        .request_at = .{ .raw = .zero, .clock = .boot },
-        .prefix_tokens = 1000,
-    });
-    agent.cache_evidence.expected_model = "claude-opus-4-8";
+    agent.stats.cache_usage = usage;
     agent.dropAccountEvidence(.openai_api);
     try std.testing.expect(agent.stats.quota != null);
-    // Only the replaced account's entries fall. The other account keeps its
-    // evidence and its serving expectation, because its principal did not
-    // change.
-    try std.testing.expectEqual(@as(usize, 1), agent.cache_evidence.entry_count);
-    try std.testing.expectEqualStrings("claude-opus-4-8", agent.cache_evidence.entries[0].model);
-    try std.testing.expectEqualStrings("claude-opus-4-8", agent.cache_evidence.expected_model);
+    try std.testing.expectEqual(usage, agent.stats.cache_usage);
 
-    // A replaced credential of the active account takes it, because the next
-    // principal has its own allowance and its own serving history.
+    // A replaced credential of the active account takes them, because the next
+    // principal has its own allowance and its own isolated cache.
     agent.dropAccountEvidence(.anthropic_subscription);
     try std.testing.expect(agent.stats.quota == null);
-    try std.testing.expectEqualStrings("", agent.cache_evidence.expected_model);
+    try std.testing.expectEqual(llm.Usage{}, agent.stats.cache_usage);
 
     // A signed-out agent has no account to compare, and drops nothing.
     agent.signOut();
@@ -3775,6 +3564,9 @@ test "a barrier presents the reads before it before announcing its mutation" {
         ) !void {
             try self.note("-", name);
         }
+        // The commit of the round publishes the gauges. This test drives that
+        // path directly, so it takes the callback and logs nothing.
+        fn onUsage(_: *@This(), _: Stats) !void {}
     };
     var handler: Handler = .{ .gpa = gpa };
     defer handler.log.deinit(gpa);
@@ -3910,6 +3702,148 @@ test "run commits a no-tool reply and ends the turn" {
     try std.testing.expectEqualStrings("hi", agent.items.items[1].message.text);
     try std.testing.expectEqual(llm.Role.assistant, agent.items.items[1].message.role);
     try std.testing.expectEqual(@as(usize, 1), handler.checkpoint_count);
+}
+
+// Only a reply that stays in the history measures that history. A rejected
+// reply is retried and never reaches the append, a round that breaks before its
+// checkpoint rolls the reply back out, and a canceled attempt rolls its prompt
+// back, so all three leave the count on the last committed reply. The prompt of
+// an accepted request is processed and billed whole either way, so its hit rate
+// is final as soon as the counts arrive.
+test "only a committed reply measures the context, while any prompt rates the cache" {
+    const gpa = std.testing.allocator;
+
+    // Empty history holds exactly zero tokens. The first prompt ends that
+    // certainty, because no reply has measured that text. A rollback to an
+    // empty history states the zero again.
+    {
+        var agent = scriptedAgent(gpa);
+        defer agent.deinit();
+        try std.testing.expectEqual(@as(?u64, 0), agent.stats.context_tokens);
+        try agent.appendUser("the first prompt");
+        try std.testing.expect(agent.stats.context_tokens == null);
+        agent.rollback(0);
+        try std.testing.expectEqual(@as(?u64, 0), agent.stats.context_tokens);
+    }
+
+    // A committed reply measures the whole prompt plus its own output.
+    {
+        var agent = scriptedAgent(gpa);
+        defer agent.deinit();
+        var handler: CaptureHandler = .{ .gpa = gpa };
+        defer handler.deinit();
+        const usage: llm.Usage = .{ .input = 10, .output = 20, .cache_read = 100 };
+        const events = [_]llm.Event{
+            .{ .item = .{ .message = "hi" } },
+            .{ .stop = .{ .usage = usage } },
+        };
+        var fetch: ScriptedFetch = .{ .attempts = &.{.{ .stream = .{ .events = &events } }} };
+        try agent.runWith(&fetch, "go", &handler);
+        try std.testing.expectEqual(@as(?u64, 130), agent.stats.context_tokens);
+        try std.testing.expectEqual(usage, agent.stats.cache_usage);
+    }
+
+    // A rejected reply returns before the append, so it rates the cache and
+    // measures nothing. Its retry then commits and measures.
+    {
+        var agent = scriptedAgent(gpa);
+        defer agent.deinit();
+        var handler: CaptureHandler = .{ .gpa = gpa };
+        defer handler.deinit();
+        const rejected: llm.Usage = .{ .input = 7, .cache_read = 3 };
+        const rejected_events = [_]llm.Event{
+            .{ .stop = .{ .usage = rejected, .rejection = .invalid } },
+        };
+        var stream: ScriptedStream = .{ .events = &rejected_events };
+        try std.testing.expectError(
+            error.IncompleteReply,
+            agent.readReply(&agent.model, &stream, &handler),
+        );
+        try std.testing.expectEqual(@as(?u64, 0), agent.stats.context_tokens);
+        try std.testing.expectEqual(rejected, agent.stats.cache_usage);
+    }
+
+    // A reply that reaches no checkpoint leaves the history with its round, so
+    // the count waits for the checkpoint and stands where it was.
+    {
+        var agent = scriptedAgent(gpa);
+        defer agent.deinit();
+        var handler: CaptureHandler = .{ .gpa = gpa };
+        defer handler.deinit();
+        try agent.appendUser("an earlier prompt");
+        seedContext(&agent, 130);
+        const uncommitted: llm.Usage = .{ .input = 40, .output = 5, .cache_read = 60 };
+        const events = [_]llm.Event{
+            .{ .item = .{ .message = "hi" } },
+            .{ .stop = .{ .usage = uncommitted } },
+        };
+        var stream: ScriptedStream = .{ .events = &events };
+        _ = try agent.readReply(&agent.model, &stream, &handler);
+        try std.testing.expectEqual(@as(?u64, 130), agent.stats.context_tokens);
+        try std.testing.expectEqual(uncommitted, agent.stats.cache_usage);
+    }
+
+    // A cancel rolls the prompt back to the checkpoint that the last count
+    // already describes, so that count stands and the rate still moves.
+    {
+        var agent = scriptedAgent(gpa);
+        defer agent.deinit();
+        var handler: CaptureHandler = .{ .gpa = gpa };
+        defer handler.deinit();
+        try agent.appendUser("an earlier prompt");
+        seedContext(&agent, 130);
+        const partial: llm.Usage = .{ .input = 40, .cache_read = 60 };
+        var fetch: ScriptedFetch = .{ .attempts = &.{.{ .stream = .{
+            .events = &.{},
+            .usage_so_far = partial,
+            .terminal_error = error.Canceled,
+        } }} };
+        const outcome = agent.runTurnWith(&fetch, fake_tools, "go", &handler);
+        try std.testing.expect(std.meta.activeTag(outcome.disposition) == .canceled);
+        try std.testing.expectEqual(@as(?u64, 130), agent.stats.context_tokens);
+        try std.testing.expectEqual(partial, agent.stats.cache_usage);
+    }
+}
+
+// The usage frame of a round arrives before the commit of that round, so the
+// commit publishes the gauges itself. Otherwise a tool round leaves the whole
+// next round with the measurement of the reply before it.
+test "each commit publishes its measurement before the next round streams" {
+    const gpa = std.testing.allocator;
+    var agent = scriptedAgent(gpa);
+    defer agent.deinit();
+    var handler: CaptureHandler = .{ .gpa = gpa };
+    defer handler.deinit();
+
+    // Round one asks for a tool, and round two answers. Every prompt grows, so
+    // each measurement differs from the one before it.
+    const call_events = [_]llm.Event{
+        .{ .item = .{ .tool_call = .{
+            .call_id = "r1",
+            .name = "read",
+            .arguments_json = "{}",
+        } } },
+        .{ .stop = .{ .usage = .{ .input = 100, .output = 20 } } },
+    };
+    const answer_events = [_]llm.Event{
+        .{ .item = .{ .message = "done" } },
+        .{ .stop = .{ .usage = .{ .input = 300, .output = 40 } } },
+    };
+    var fetch: ScriptedFetch = .{ .attempts = &.{
+        .{ .stream = .{ .events = &call_events } },
+        .{ .stream = .{ .events = &answer_events } },
+    } };
+    try agent.runWith(&fetch, "go", &handler);
+
+    // The stream of a round reports the measurement of the round before it, and
+    // the commit that follows reports its own. So the second round streams with
+    // 120 already on the gauge, not with the null of a fresh conversation.
+    try std.testing.expectEqualSlices(
+        ?u64,
+        &.{ null, 120, 120, 340 },
+        handler.published_context.items,
+    );
+    try std.testing.expectEqual(@as(?u64, 340), agent.stats.context_tokens);
 }
 
 test "a committed truncation is reported in the receipt; a resampled one is not" {
@@ -4456,6 +4390,8 @@ test "a completed mutation's real result survives a callback failure" {
             try std.testing.expectEqualStrings("summary", summary.text);
             return error.Boom;
         }
+        // The commit of the round publishes the gauges before any dispatch.
+        fn onUsage(_: *@This(), _: Stats) !void {}
     };
     var handler: Handler = .{};
     const reply = [_]llm.Item{
@@ -4601,21 +4537,21 @@ test "a canceled request's partial usage is folded into the cost stats" {
     } }} };
     const outcome = agent.runTurnWith(&fetch, fake_tools, "go", &handler);
     try std.testing.expect(std.meta.activeTag(outcome.disposition) == .canceled);
-    // The billed prompt is recorded, and the last-request gauge reflects it.
+    // The billed prompt is recorded, and the cache-rate gauge reflects it.
     try std.testing.expect(agent.stats.cost > 0);
-    try std.testing.expectEqual(@as(u64, 1_000_000), agent.stats.last.input);
-    try std.testing.expectEqual(@as(u64, 200_000), agent.stats.last.cache_read);
+    try std.testing.expectEqual(@as(u64, 1_000_000), agent.stats.cache_usage.input);
+    try std.testing.expectEqual(@as(u64, 200_000), agent.stats.cache_usage.cache_read);
 }
 
-test "a cancel before any usage frame leaves the last-request gauge intact" {
+test "a cancel before any usage frame leaves the cache-rate gauge intact" {
     const gpa = std.testing.allocator;
     var agent = scriptedAgent(gpa);
     defer agent.deinit();
     var handler: CaptureHandler = .{ .gpa = gpa };
     defer handler.deinit();
 
-    // A prior request's usage backs the last-request gauge.
-    agent.stats.last = .{ .input = 42 };
+    // A prior request's usage backs the cache-rate gauge.
+    agent.stats.cache_usage = .{ .input = 42 };
     // A cancel before the stream reports any usage must not fold a zero reading
     // in and reset that gauge.
     var fetch: ScriptedFetch = .{
@@ -4623,7 +4559,7 @@ test "a cancel before any usage frame leaves the last-request gauge intact" {
     };
     const outcome = agent.runTurnWith(&fetch, fake_tools, "go", &handler);
     try std.testing.expect(std.meta.activeTag(outcome.disposition) == .canceled);
-    try std.testing.expectEqual(@as(u64, 42), agent.stats.last.input);
+    try std.testing.expectEqual(@as(u64, 42), agent.stats.cache_usage.input);
 }
 
 test "a cancel during the post-stop usage callback books terminal usage only once" {
@@ -4648,7 +4584,7 @@ test "a cancel during the post-stop usage callback books terminal usage only onc
     try std.testing.expect(std.meta.activeTag(outcome.disposition) == .canceled);
     // Recorded exactly once: opus prices 1M input at $5, so 1000 input is $0.005.
     try std.testing.expectApproxEqAbs(@as(f64, 0.005), agent.stats.cost, 1e-9);
-    try std.testing.expectEqual(@as(u64, 1000), agent.stats.last.input);
+    try std.testing.expectEqual(@as(u64, 1000), agent.stats.cache_usage.input);
 }
 
 test "a no-tool reply is retained when a later steered reply is canceled" {

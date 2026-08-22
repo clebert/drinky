@@ -4,7 +4,7 @@
 //! caller-built `Info` snapshot.
 //!
 //! A narrow window first shortens fields in one fixed order. It then removes
-//! complete parts in another fixed order. The context percentage never goes.
+//! complete parts in another fixed order. The context gauge never goes.
 
 const std = @import("std");
 
@@ -23,7 +23,13 @@ pub const Info = struct {
     /// The branch of the repository, or null outside one and for a head that
     /// Drinky could not read. The caller bounds it at `ai.project.head_name_bytes_max`.
     branch: ?[]const u8,
-    last: ai.llm.Usage,
+    /// The conversation context the last committed reply measured. Null shows
+    /// the unknown form, which happens before the first reply and after a
+    /// change that renders the same history in another way.
+    context_tokens: ?u64,
+    /// The prompt usage of the last request under the active cache key. An
+    /// all-zero prompt hides the cache rate.
+    cache_usage: ai.llm.Usage,
     cost: f64,
     context_window: u64,
     model: []const u8,
@@ -79,9 +85,9 @@ const Parts = struct {
     /// The branch: whole, or its first bounded prefix with an ellipsis.
     const Branch = enum { full, short };
 
-    /// The context gauge: with its token counts, or the percentage alone. It has
-    /// no hidden form, because the fill of the window drives what the user does
-    /// next.
+    /// The context gauge: with its token counts, or the percentage alone. An
+    /// unknown measurement has one form. The gauge has no hidden form, because
+    /// the fill of the window drives what the user does next.
     const Context = enum { full, short };
 
     const all: Parts = .{
@@ -280,10 +286,11 @@ fn writeBranch(out: *std.Io.Writer, branch: []const u8, form: Parts.Branch) !voi
     try out.writeAll(mark);
 }
 
-/// Context now: the last request's whole prompt plus its output, against the
-/// model's window. The one "now" number. The rest is session-cumulative.
+/// Context now: what the last committed reply measured, against the model's
+/// window. The one "now" number. The rest is session-cumulative. A model switch
+/// leaves no valid measurement, because a tokenizer belongs to its model.
 fn writeContext(out: *std.Io.Writer, info: *const Info, form: Parts.Context) !void {
-    const context = promptTokens(info) +| info.last.output;
+    const context = info.context_tokens orelse return out.writeAll("Context: Unknown");
     const percent = if (info.context_window > 0)
         asFloat(context) / asFloat(info.context_window) * 100.0
     else
@@ -297,20 +304,15 @@ fn writeContext(out: *std.Io.Writer, info: *const Info, form: Parts.Context) !vo
     try out.writeByte(')');
 }
 
-/// The last request's cache hit rate over the whole prompt. The value is zero
-/// after a cold start, model switch, or cache expiry, and absent before the
-/// first request, so the line never shows a 0/0 rate.
+/// The last request's cache hit rate over the whole prompt. An all-zero prompt
+/// means no measurement describes the active account, model, and effort, so the
+/// part goes rather than show a 0/0 rate.
 fn writeCache(out: *std.Io.Writer, info: *const Info) !void {
-    const prompt = promptTokens(info);
+    const usage = &info.cache_usage;
+    const prompt = usage.input +| usage.cache_read +| usage.cache_write;
     if (prompt == 0) return;
-    const hit = asFloat(info.last.cache_read) / asFloat(prompt) * 100.0;
+    const hit = asFloat(usage.cache_read) / asFloat(prompt) * 100.0;
     try out.print("{s}Cache: {d:.0}%", .{ separator, hit });
-}
-
-/// The whole prompt of the last request. Saturating: the counts arrive from the
-/// provider stream unchecked.
-fn promptTokens(info: *const Info) u64 {
-    return info.last.input +| info.last.cache_read +| info.last.cache_write;
 }
 
 /// Append one identified quota window as ` · <label>: N% remaining`, or nothing when
@@ -372,7 +374,13 @@ test writeTokens {
 const test_info: Info = .{
     .directory = "~/github/clebert/drinky",
     .branch = "main",
-    .last = .{ .input = 22, .output = 23_000, .cache_read = 160_000, .cache_write = 23_000 },
+    .context_tokens = 206_022,
+    .cache_usage = .{
+        .input = 22,
+        .output = 23_000,
+        .cache_read = 160_000,
+        .cache_write = 23_000,
+    },
     .cost = 0.393,
     .context_window = 1_000_000,
     .model = "claude-opus-4-8",
@@ -445,6 +453,37 @@ test render {
     const context = std.mem.indexOf(u8, painted, "Context:").?;
     try std.testing.expect(place < context);
     try std.testing.expect(context < std.mem.indexOf(u8, painted, "claude-opus-4-8").?);
+}
+
+// The two gauges answer different questions, so an absent measurement reads
+// differently. The fill of the window drives what the user does next, so the
+// gauge names the gap instead of showing a number it does not have. The rate is
+// a secondary number that a narrow window drops first, so it just goes.
+test "an unmeasured context reads as unknown, and an unmeasured rate hides" {
+    const gpa = std.testing.allocator;
+
+    var unknown = test_info;
+    unknown.context_tokens = null;
+    unknown.cache_usage = .{};
+    var unknown_out: std.Io.Writer.Allocating = .init(gpa);
+    defer unknown_out.deinit();
+    try renderForTest(gpa, &unknown, 200, &unknown_out);
+    try expectShows(unknown_out.written(), &.{"Context: Unknown"});
+    try expectHides(unknown_out.written(), &.{ "Context: 21%", "(206k/1.0M)", "Cache:" });
+
+    // Empty history is a measurement, not a gap: it holds exactly zero tokens.
+    var empty = test_info;
+    empty.context_tokens = 0;
+    var empty_out: std.Io.Writer.Allocating = .init(gpa);
+    defer empty_out.deinit();
+    try renderForTest(gpa, &empty, 200, &empty_out);
+    try expectShows(empty_out.written(), &.{"Context: 0% (0/1.0M)"});
+
+    // The gauge outranks every other part, so it survives the narrowest window.
+    var narrow_out: std.Io.Writer.Allocating = .init(gpa);
+    defer narrow_out.deinit();
+    try renderForTest(gpa, &unknown, 20, &narrow_out);
+    try expectShows(narrow_out.written(), &.{"Context: Unknown"});
 }
 
 test "a narrow window shortens fields before it gives up parts" {
@@ -630,7 +669,7 @@ test "a signed-out status shows the indicator in place of the model" {
     const gpa = std.testing.allocator;
     var info = test_info;
     info.account = null;
-    info.last = .{};
+    info.cache_usage = .{};
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
     try renderForTest(gpa, &info, 120, &out);

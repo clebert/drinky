@@ -66,9 +66,8 @@ decision already taken, or a dependency on another entry. Module layout and exte
   request runs at a time with no nesting._
 - **Save and resume conversations** — a conversation reopens after a restart and does not start
   empty. _This entry introduces the per-turn cost ledger and persists it, since history items carry
-  no cost. The `/session` breakdown entry then reads that ledger. Persist the prompt-cache write
-  times too, so a resume knows what retention is left. Generate the OpenAI cache key once per
-  conversation and restore it verbatim. Rotate it only on a deliberately fresh start. A
+  no cost. The `/session` breakdown entry then reads that ledger. Generate the OpenAI cache key once
+  per conversation and restore it verbatim. Rotate it only on a deliberately fresh start. A
   billing-product enum is not sufficient provenance for opaque reasoning. Persist a durable
   non-secret principal identity and replay only on a match. Versioned, atomic, owner-only._
 - **Headless mode** — Drinky answers a prompt with no terminal: text in, text out, with a session id

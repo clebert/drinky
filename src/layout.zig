@@ -267,7 +267,8 @@ fn editorSlot(presentation: *const EditorPresentation) Slot {
 const test_status: ui.status.Info = .{
     .directory = "~/work",
     .branch = "main",
-    .last = .{},
+    .context_tokens = 0,
+    .cache_usage = .{},
     .cost = 0,
     .context_window = 1000,
     .model = "footerqq",

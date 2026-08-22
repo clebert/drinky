@@ -46,11 +46,12 @@ conversation switch performs one:
 - Clear the prior screen and terminal scrollback.
 - Render only the selected context.
 
-Context fill uses the projected history. Usage and cost remain cumulative. The status uses the
+Context fill holds the measurement of the last committed reply, so a switch reads as unknown until
+the next reply measures the projected history. Usage and cost remain cumulative. The status uses the
 active account allowance.
 
-A switch clears local cache-activity evidence when its cached prefix is no longer valid. It does not
-claim to clear provider cache storage.
+A switch clears the local cache-hit rate, because another account, model, or resolved effort reads
+another cache. It does not claim to clear provider cache storage.
 
 ### Failure recovery and retry
 
@@ -76,9 +77,6 @@ row belongs to a request that no editor line holds, and `/review` is the first o
 A failed attempt keeps the retry, because the work that it continues from stays in history. Its own
 failure sentence replaces the sentence before it. A canceled attempt ends the recovery instead,
 because the user stopped that turn and a cancellation arms no retry.
-
-An attempt rewrites the prompt cache like any other request, so it takes the same stale-cache
-warning. The first Ctrl+N reports the extra cost, and the next one sends.
 
 Blank Enter has no action. Ctrl+N never sends the editor text and never clears it.
 
@@ -639,7 +637,7 @@ history, and clears the matching transcript.
 The judge keeps its history and transcript until the workflow ends. An account switch uses the
 shared filtered projection.
 
-Review histories, cache evidence, and usage stay separate from the main agent. Review mode never
+Review histories, gauge measurements, and usage stay separate from the main agent. Review mode never
 compacts or resets the main conversation.
 
 A running phase uses this compact frame:

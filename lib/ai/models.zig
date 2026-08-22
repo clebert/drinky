@@ -1,9 +1,9 @@
-//! Per-model economics, cache retention, and limits, namespaced by provider so
-//! the same model name can carry different prices and windows. Base prices
-//! are USD per million tokens. Cache read/write rates are stored absolute
-//! rather than derived, so a provider with different cache economics slots in
-//! as new entries. An unknown model has no entry. Without a known context
-//! window it cannot be sized, so it is unsupported rather than given a guessed
+//! Per-model economics and limits, namespaced by provider so the same model
+//! name can carry different prices and windows. Base prices are USD per
+//! million tokens. Cache read/write rates are stored absolute rather than
+//! derived, so a provider with different cache economics slots in as new
+//! entries. An unknown model has no entry. Without a known context window it
+//! cannot be sized, so it is unsupported rather than given a guessed
 //! fallback. The table is compiled in. Account-aware metadata can overlay a
 //! copied model at runtime and does not mutate these provider-wide defaults.
 
@@ -19,9 +19,6 @@ pub const Model = struct {
     output: f64,
     cache_read: f64,
     cache_write: f64,
-    /// The active cache policy's inactivity window. Null means the provider
-    /// does not expose a duration that Drinky can use without a guess.
-    cache_retention_ms: ?u64,
     context_window: u64,
     /// The model's maximum output tokens, sent verbatim as `max_tokens`. The
     /// effort level governs how much of it the model actually spends.
@@ -43,9 +40,24 @@ pub const Model = struct {
             disabled,
             named: []const u8,
 
+            /// Whether a request that renders this resolution replays the
+            /// stored reasoning of `vendor`. Anthropic drops every thinking
+            /// block unless the request names an effort. OpenAI replays an
+            /// encrypted item at every effort. The gauges and the serializers
+            /// read one rule here, so they cannot drift apart.
+            pub fn replaysReasoning(self: Resolution, vendor: llm.Provider) bool {
+                return switch (vendor) {
+                    .anthropic => switch (self) {
+                        .named => true,
+                        .omitted, .disabled => false,
+                    },
+                    .openai => true,
+                };
+            }
+
             /// Whether two resolutions produce the same request bytes. Two
             /// effort levels that fold onto one named level share a prompt
-            /// cache, so a cache key compares resolutions, not levels.
+            /// cache, so the cache-hit rate compares resolutions, not levels.
             pub fn eql(self: Resolution, other: Resolution) bool {
                 return switch (self) {
                     .omitted => other == .omitted,
@@ -148,7 +160,6 @@ const table = [_]Entry{
         .output = 50,
         .cache_read = 1,
         .cache_write = 12.5,
-        .cache_retention_ms = 5 * std.time.ms_per_min,
         .context_window = 1_000_000,
         .tokens_max = 128_000,
         .effort = anthropic_effort_always_on,
@@ -159,7 +170,6 @@ const table = [_]Entry{
         .output = 25,
         .cache_read = 0.5,
         .cache_write = 6.25,
-        .cache_retention_ms = 5 * std.time.ms_per_min,
         .context_window = 1_000_000,
         .tokens_max = 128_000,
         .effort = anthropic_effort_default_on,
@@ -170,7 +180,6 @@ const table = [_]Entry{
         .output = 25,
         .cache_read = 0.5,
         .cache_write = 6.25,
-        .cache_retention_ms = 5 * std.time.ms_per_min,
         .context_window = 1_000_000,
         .tokens_max = 128_000,
         .effort = anthropic_effort_default_off,
@@ -183,7 +192,6 @@ const table = [_]Entry{
         .output = 15,
         .cache_read = 0.3,
         .cache_write = 3.75,
-        .cache_retention_ms = 5 * std.time.ms_per_min,
         .context_window = 1_000_000,
         .tokens_max = 128_000,
         .effort = anthropic_effort_default_on,
@@ -194,7 +202,6 @@ const table = [_]Entry{
         .output = 15,
         .cache_read = 0.3,
         .cache_write = 3.75,
-        .cache_retention_ms = 5 * std.time.ms_per_min,
         .context_window = 1_000_000,
         .tokens_max = 128_000,
         .effort = anthropic_effort_no_xhigh,
@@ -202,8 +209,8 @@ const table = [_]Entry{
     // The gpt-5.6 family reaches the same models over the API-key and the
     // ChatGPT-subscription (Codex) backends. One openai vendor row supplies
     // prices and fallback limits to both accounts. Subscription discovery can
-    // overlay its context windows per account. The automatic cache has a
-    // 30-minute minimum retention. Standard-tier pricing, per million tokens.
+    // overlay its context windows per account. Standard-tier pricing, per
+    // million tokens.
     // Fallback context: 1.05M. Max output: 128K.
     .{ .provider = .openai, .model = .{
         .name = "gpt-5.6-sol",
@@ -211,7 +218,6 @@ const table = [_]Entry{
         .output = 30,
         .cache_read = 0.5,
         .cache_write = 6.25,
-        .cache_retention_ms = 30 * std.time.ms_per_min,
         .context_window = 1_050_000,
         .tokens_max = 128_000,
         .effort = openai_effort,
@@ -222,7 +228,6 @@ const table = [_]Entry{
         .output = 15,
         .cache_read = 0.25,
         .cache_write = 3.125,
-        .cache_retention_ms = 30 * std.time.ms_per_min,
         .context_window = 1_050_000,
         .tokens_max = 128_000,
         .effort = openai_effort,
@@ -233,7 +238,6 @@ const table = [_]Entry{
         .output = 6,
         .cache_read = 0.1,
         .cache_write = 1.25,
-        .cache_retention_ms = 30 * std.time.ms_per_min,
         .context_window = 1_050_000,
         .tokens_max = 128_000,
         .effort = openai_effort,
@@ -300,7 +304,6 @@ test "new Anthropic models have current prices and limits" {
     try std.testing.expectEqual(@as(f64, 50), fable.output);
     try std.testing.expectEqual(@as(f64, 1), fable.cache_read);
     try std.testing.expectEqual(@as(f64, 12.5), fable.cache_write);
-    try std.testing.expectEqual(@as(?u64, 5 * std.time.ms_per_min), fable.cache_retention_ms);
     try std.testing.expectEqual(@as(u64, 1_000_000), fable.context_window);
     try std.testing.expectEqual(@as(u32, 128_000), fable.tokens_max);
 
@@ -311,17 +314,6 @@ test "new Anthropic models have current prices and limits" {
     try std.testing.expectEqual(@as(f64, 6.25), opus.cache_write);
     try std.testing.expectEqual(@as(u64, 1_000_000), opus.context_window);
     try std.testing.expectEqual(@as(u32, 128_000), opus.tokens_max);
-}
-
-test "cache retention follows each provider's active default" {
-    try std.testing.expectEqual(
-        @as(?u64, 5 * std.time.ms_per_min),
-        get(.anthropic, "claude-sonnet-4-6").?.cache_retention_ms,
-    );
-    try std.testing.expectEqual(
-        @as(?u64, 30 * std.time.ms_per_min),
-        get(.openai, "gpt-5.6-sol").?.cache_retention_ms,
-    );
 }
 
 test "effort maps resolve each model's supported levels" {
@@ -368,4 +360,19 @@ test "resolutions compare by the request bytes they produce" {
     // Sonnet 4.6 folds xhigh onto high, so the two levels share one cache.
     const sonnet = get(.anthropic, "claude-sonnet-4-6").?;
     try std.testing.expect(sonnet.effort.resolve(.xhigh).eql(sonnet.effort.resolve(.high)));
+}
+
+// An Anthropic request that names no effort carries no thinking block back, so
+// the stored reasoning leaves the prompt. An OpenAI request replays its
+// encrypted item whatever the effort names.
+test "reasoning replay follows the rendered effort of the vendor" {
+    const opus = get(.anthropic, "claude-opus-4-8").?;
+    try std.testing.expect(opus.effort.resolve(.high).replaysReasoning(.anthropic));
+    try std.testing.expect(!opus.effort.resolve(.none).replaysReasoning(.anthropic));
+    const sonnet = get(.anthropic, "claude-sonnet-5").?;
+    try std.testing.expect(!sonnet.effort.resolve(.none).replaysReasoning(.anthropic));
+
+    const sol = get(.openai, "gpt-5.6-sol").?;
+    try std.testing.expect(sol.effort.resolve(.none).replaysReasoning(.openai));
+    try std.testing.expect(sol.effort.resolve(.max).replaysReasoning(.openai));
 }

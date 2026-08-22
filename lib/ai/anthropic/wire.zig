@@ -47,10 +47,7 @@ pub fn serialize(gpa: std.mem.Allocator, request: *const llm.Request, account: l
     // The model map selects no control, an explicit off control, or adaptive
     // thinking with a named effort.
     const effort = effortResolution(request);
-    const emit_thinking = switch (effort) {
-        .named => true,
-        .omitted, .disabled => false,
-    };
+    const emit_thinking = effort.replaysReasoning(.anthropic);
     switch (effort) {
         .omitted => {},
         .disabled => {

@@ -305,8 +305,6 @@ const TurnOrigin = struct {
 /// leave this layer and nothing else, so it warns only where it destroys the
 /// draft, and Ctrl+C clears without a warning because the clear is its purpose.
 pub const Confirmation = enum {
-    /// One unchanged idle Enter passes the stale-cache warning.
-    cache,
     /// One unchanged Enter sends a refused command line to the model as typed.
     /// The prompt sends it as a message, and a turn queues it as steering. The
     /// row that named the offer goes with the confirmation: a key cancels both
@@ -505,7 +503,7 @@ pub fn clearNotice(self: *Session) void {
 /// that can arm one are the modes whose key raises its warning.
 pub fn armConfirmation(self: *Session, confirmation: Confirmation) void {
     switch (confirmation) {
-        .cache, .quit => std.debug.assert(self.mode == .prompt),
+        .quit => std.debug.assert(self.mode == .prompt),
         .message => std.debug.assert(self.mode == .prompt or self.mode == .turn),
         .turn_cancel => std.debug.assert(self.mode == .turn),
     }
@@ -1160,7 +1158,8 @@ pub fn paint(self: *Session, size: terminal.View.Size) !void {
     const status: ui.status.Info = .{
         .directory = self.directory_shown,
         .branch = self.branch(),
-        .last = self.stats_shown.last,
+        .context_tokens = self.stats_shown.context_tokens,
+        .cache_usage = self.stats_shown.cache_usage,
         .cost = self.stats_shown.cost,
         .context_window = self.model_shown.context_window,
         .model = self.model_shown.name,
@@ -1712,7 +1711,7 @@ test "a notice replaces the footer and clearing restores the status" {
     try std.testing.expect(std.mem.indexOf(u8, status_frame, test_model.name) != null);
 }
 
-test "cache confirmation is one-shot and separate from its notice" {
+test "a confirmation is one-shot and separate from its notice" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
@@ -1720,16 +1719,16 @@ test "cache confirmation is one-shot and separate from its notice" {
     defer session.deinit();
 
     try session.applyOutcome(
-        try ai.command.Outcome.reportNotice(gpa, .warning, "Cache warning", .{}),
+        try ai.command.Outcome.reportNotice(gpa, .warning, "A warning.", .{}),
     );
-    session.armConfirmation(.cache);
+    session.armConfirmation(.message);
     session.clearNotice();
-    try std.testing.expect(session.takeConfirmation(.cache));
-    try std.testing.expect(!session.takeConfirmation(.cache));
+    try std.testing.expect(session.takeConfirmation(.message));
+    try std.testing.expect(!session.takeConfirmation(.message));
 
-    session.armConfirmation(.cache);
-    session.cancelConfirmation(.cache);
-    try std.testing.expect(!session.takeConfirmation(.cache));
+    session.armConfirmation(.message);
+    session.cancelConfirmation(.message);
+    try std.testing.expect(!session.takeConfirmation(.message));
 }
 
 test "an event survives notice clearing until the conversation resets" {
@@ -1792,7 +1791,7 @@ test "scripted stream events drive the model and one coalesced paint" {
     try applyEvent(&session, 1, .{ .usage = .{
         .cost = 1.5,
         .saved = 0.25,
-        .last = .{ .input = 10, .output = 20 },
+        .cache_usage = .{ .input = 10, .output = 20 },
     } });
 
     // The applied events mark the model dirty but paint nothing.
