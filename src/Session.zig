@@ -862,8 +862,10 @@ pub fn commitSteeringDraft(self: *Session, draft: *ui.Editor.Draft) void {
     self.markEdited();
 }
 
-/// Preflight enough editor capacity to recall any queue suffix. The mirror is
-/// consumer-owned and remains stable until `recallSteering`.
+/// Preflight enough editor capacity to recall any queue suffix, appended or
+/// prepended: both consumers need at most one separator per draft. The mirror is
+/// consumer-owned and remains stable until `recallSteering` or
+/// `recallLateSteering`.
 pub fn reserveSteeringRecall(self: *Session) !void {
     try self.editor.reserveDrafts(self.steering.items);
 }
@@ -878,6 +880,18 @@ pub fn recallSteering(self: *Session, pending_count: usize) void {
     self.steering.shrinkRetainingCapacity(pending_start);
     self.steering_retained_count = self.steering.items.len;
     self.steering_consumed_count = @min(self.steering_consumed_count, self.steering.items.len);
+    self.markEdited();
+}
+
+/// Return the whole steering mirror to the editor, in submission order and
+/// above the in-progress line. The recall is automatic, so it composes like the
+/// other automatic returns instead of the caret-anchored Ctrl+P recall.
+/// Infallible after `reserveSteeringRecall`.
+pub fn recallLateSteering(self: *Session) void {
+    self.editor.prependComposition(null, self.steering.items);
+    self.steering.clearRetainingCapacity();
+    self.steering_retained_count = 0;
+    self.steering_consumed_count = 0;
     self.markEdited();
 }
 
@@ -1013,7 +1027,7 @@ pub fn abortTurn(self: *Session) !void {
 }
 
 /// Apply a completed turn's receipt, append any cutoff event, and end it. Late
-/// steering remains pending so the app can promote it into a successor turn.
+/// steering remains pending so the app can return it to the editor.
 pub fn endTurnWithReceipt(self: *Session, receipt: *const ai.Agent.Receipt) !void {
     self.applyReceiptNormal(receipt);
     self.dropTurnOrigin();
@@ -1044,7 +1058,7 @@ pub fn failTurnWithReceipt(
 
 /// Resolve the rich steering mirror on a completed terminal: drop the committed
 /// prefix (now in history) and make every remaining draft pending again.
-/// Late-steering handling can then start it as a new turn. Infallible.
+/// Late-steering handling can then recall it into the editor. Infallible.
 fn applyReceiptNormal(self: *Session, receipt: *const ai.Agent.Receipt) void {
     self.dropSteeringPrefix(receipt.steering_committed_count);
     self.steering_retained_count = 0;
@@ -1623,9 +1637,9 @@ test "a turn end drops the send-as-a-message confirmation and the footer" {
     try std.testing.expect(session.notice == null);
 }
 
-// The first Esc of a new turn must warn, never cancel. A turn that ends with
-// leftover steering auto-starts the next turn with no key between them, so only
-// the turn boundaries can drop a confirmation that the ended turn armed.
+// The first Esc of a new turn must warn, never cancel. A queued Enter can start
+// the next turn with no key between the two turns, so only the turn boundaries
+// can drop a confirmation that the ended turn armed.
 test "a turn boundary drops the turn-cancel confirmation" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);

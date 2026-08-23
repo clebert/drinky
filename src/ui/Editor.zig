@@ -86,40 +86,6 @@ pub const Draft = struct {
         return .{ .visible = buffer, .atoms = .empty };
     }
 
-    /// Deep-copy drafts into one blank-line-separated draft and preserve every
-    /// paste atom. The sources remain untouched so callers can prepare a joined
-    /// prompt before the operation that transfers their ownership commits.
-    pub fn fromDrafts(gpa: std.mem.Allocator, drafts: []const Draft) !Draft {
-        var visible_len: usize = 0;
-        var atom_count: usize = 0;
-        for (drafts, 0..) |draft, index| {
-            if (index > 0)
-                visible_len = try std.math.add(usize, visible_len, draft_separator.len);
-            visible_len = try std.math.add(usize, visible_len, draft.visible.items.len);
-            atom_count = try std.math.add(usize, atom_count, draft.atoms.items.len);
-        }
-
-        var joined: Draft = .empty;
-        errdefer joined.deinit(gpa);
-        try joined.visible.ensureTotalCapacityPrecise(gpa, visible_len);
-        try joined.atoms.ensureTotalCapacityPrecise(gpa, atom_count);
-        for (drafts, 0..) |draft, index| {
-            if (index > 0) joined.visible.appendSliceAssumeCapacity(draft_separator);
-            const base = joined.visible.items.len;
-            joined.visible.appendSliceAssumeCapacity(draft.visible.items);
-            for (draft.atoms.items) |atom| {
-                const payload = try gpa.dupe(u8, atom.payload);
-                joined.atoms.appendAssumeCapacity(.{
-                    .start = base + atom.start,
-                    .end = base + atom.end,
-                    .id = atom.id,
-                    .payload = payload,
-                });
-            }
-        }
-        return joined;
-    }
-
     /// Allocate the expanded text: literal bytes with each atom's exact payload
     /// spliced in for its marker span, in document order. `trim` can strip the
     /// leading and trailing whole-prompt whitespace. The caller owns the result.

@@ -479,7 +479,8 @@ at the main prompt.
 | Esc     | Stop review mode.                                             |
 
 The role reads steering at its next tool boundary. If queued steering arrives after the role
-finishes, Drinky starts a successor turn in the same context.
+finishes, Drinky returns it to the editor. The restored text is a brake. The same boundary enters a
+user hold, so the user reviews the text before Drinky sends it.
 
 A direct stop cancels and joins the active request. Drinky destroys every submitted review message
 with the review context and does not add it to the main editor.
@@ -505,7 +506,7 @@ the latest judge decision settled the review. These Esc paths restore the main c
 
 Ctrl+N and Ctrl+E preserve editor text. That text applies the normal brake at the next boundary.
 
-Ctrl+P has no hold action. Drinky resolves late steering before it enters a hold.
+Ctrl+P has no hold action. Drinky returns late steering to the editor before it enters a hold.
 
 A failure hold uses the shared recovery rules:
 
@@ -719,7 +720,7 @@ data.
 
 Drinky resolves a completed phase in this order:
 
-1. Continue for late steering.
+1. Return late steering to the editor.
 2. Enter a user hold for editor text.
 3. Request one complete correction for an invalid judge report.
 4. Enter a judge hold for a required decision.

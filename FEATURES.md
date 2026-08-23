@@ -16,7 +16,7 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
   alone, in call order.
 - Enter during a turn queues a steering message that folds into the run at the next tool round.
 - Ctrl+P pulls messages the turn has not picked up yet back into the editor to keep editing.
-- Steering left in the queue when a turn completes starts the next turn on its own.
+- Steering left in the queue when a turn completes returns to the editor for review.
 - Esc or Ctrl+D cancels a turn and keeps the draft. Esc with a draft warns first and cancels on the
   second press. Ctrl+C clears a draft in the editor first, and cancels only on an empty editor.
   Canceled or failed turns keep finished rounds, drop the in-flight tail, and return uncommitted

@@ -855,8 +855,8 @@ fn freeWorkerResult(self: *App, result: *const WorkerResult) void {
     if (result.error_text) |text| self.gpa.free(text);
 }
 
-/// Reconcile a completed or failed joined result, then promote late steering
-/// only after a completion. A failure returns uncommitted drafts to the editor.
+/// Reconcile a completed or failed joined result, then return late steering to
+/// the editor after a completion. A failure returns uncommitted drafts too.
 fn finishWorkerResult(self: *App, result: *const WorkerResult) !void {
     self.session.stats_shown = self.agent.stats;
     // A turn can check out another branch, so the status line settles here.
@@ -865,7 +865,7 @@ fn finishWorkerResult(self: *App, result: *const WorkerResult) !void {
         .completed => {
             _ = self.takeTurnRetry();
             try self.session.endTurnWithReceipt(&result.outcome.receipt);
-            if (self.session.hasSteering()) try self.startSteeringTurn();
+            if (self.session.hasSteering()) try self.returnLateSteering();
         },
         .credential_replaced => {
             const account = self.activeAccount() orelse
@@ -1485,34 +1485,24 @@ fn pullSteering(self: *App) !void {
     self.session.recallSteering(taken.len);
 }
 
-/// Start a turn from steering the worker never took because the previous turn
-/// ended first. Keep both plain and rich forms recoverable until the transcript
-/// block and worker have committed.
-fn startSteeringTurn(self: *App) !void {
-    var taken = try self.agent.steering.take();
+/// Return steering the worker never took before the turn ended. The user wrote
+/// it against an unfinished reply, so it can depend on work the final reply
+/// changed. The drafts go back above the in-progress line for review instead of
+/// starting a turn on their own.
+fn returnLateSteering(self: *App) !void {
+    // Reserve every possible draft move so no fallible work follows the channel
+    // take.
+    try self.session.reserveSteeringRecall();
+    const taken = try self.agent.steering.take();
     defer {
         for (taken) |message| self.gpa.free(message);
         self.gpa.free(taken);
     }
-    errdefer self.agent.steering.restoreTaken(&taken);
-    if (taken.len == 0) {
-        self.session.clearSteering();
-        return;
-    }
-
-    const joined = try ai.Steering.join(self.gpa, taken);
-    defer self.gpa.free(joined);
-    // Copy the rich mirror before the spawn, so a failed start leaves its original
-    // drafts untouched. A later cancellation can then return paste atoms intact.
-    var prompt = try ui.Editor.Draft.fromDrafts(self.gpa, self.session.steering.items);
-    errdefer prompt.deinit(self.gpa);
-    const base = self.session.transcript.blocks().len;
-    errdefer self.session.transcript.truncate(base);
-    try self.session.transcript.append(.user, .{}, joined);
-    self.session.dirty = true;
-    try self.runTurn(joined);
-    self.session.retainTurnPrompt(&prompt, base);
-    self.session.clearSteering();
+    // The mirror and the channel always move together, and a completed turn
+    // exits with no consumed-but-uncommitted batch, so the counts match here.
+    std.debug.assert(taken.len == self.session.steering.items.len);
+    self.session.recallLateSteering();
+    try self.reportNotice(.information, "Drinky returned every queued message to the editor.", .{});
 }
 
 /// Abort the running turn: cancel and join the worker, then resolve from its
@@ -2719,7 +2709,7 @@ fn spawnCommittedCanceledTurn(app: *App) !void {
     app.turn_future = try app.io.concurrent(committedCanceledWorker, .{});
 }
 
-test "a failed late-steering turn start restores queue, mirror, and transcript" {
+test "a late steering return restores a paste as a live placeholder atom" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -2727,7 +2717,6 @@ test "a failed late-steering turn start restores queue, mirror, and transcript" 
 
     var app: App = undefined;
     app.initForTest(gpa);
-    app.turn_generation = std.math.maxInt(u64);
     app.agent = ai.Agent.init(gpa, io, null, .{
         .model = anthropic_default,
         .system = "",
@@ -2745,65 +2734,17 @@ test "a failed late-steering turn start restores queue, mirror, and transcript" 
     var draft = app.session.editor.detachTrimmed();
     app.session.commitSteeringDraft(&draft);
 
-    try std.testing.expectError(error.TurnGenerationExhausted, app.startSteeringTurn());
-    try std.testing.expect(app.session.mode == .prompt);
-    try std.testing.expect(app.session.hasSteering());
-    try std.testing.expectEqual(@as(usize, 1), app.session.steering.items[0].atoms.items.len);
-    const rich = try app.session.steering.items[0].expanded(gpa, .none);
-    defer gpa.free(rich);
-    try std.testing.expectEqualStrings(payload, rich);
-    try std.testing.expectEqual(@as(usize, 0), app.session.transcript.blocks().len);
-
-    const restored = try app.agent.steering.take();
-    defer {
-        for (restored) |message| gpa.free(message);
-        gpa.free(restored);
-    }
-    try std.testing.expectEqual(@as(usize, 1), restored.len);
-    try std.testing.expectEqualStrings(delivered, restored[0]);
-}
-
-test "canceling a promoted steering turn restores its rich paste draft" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-
-    var app: App = undefined;
-    app.initForTest(gpa);
-    defer app.drainQueue();
-    app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
-        .system = "",
-        .retry = .{},
-    });
-    defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
-    defer app.session.deinit();
-
-    const payload = "late\n" ** 15;
-    const delivered = std.mem.trim(u8, payload, " \t\r\n");
-    try app.agent.steering.push(delivered);
-    try app.session.editor.paste(payload, true);
-    try app.session.reserveSteering();
-    var draft = app.session.editor.detachTrimmed();
-    app.session.commitSteeringDraft(&draft);
-
-    try app.startSteeringTurn();
-    try std.testing.expectEqual(@as(usize, 1), app.session.turn_origin.?.prompt.atoms.items.len);
-
-    // Replace the signed-out production worker with a deterministic canceled
-    // result. Keep the live turn and its origin under test.
-    if (app.cancelTurnFuture()) |result| app.freeWorkerResult(&result);
-    app.drainQueue();
-    try spawnCanceledTurn(&app);
-    try app.cancelTurn();
-
-    try std.testing.expect(app.session.mode == .prompt);
+    try app.returnLateSteering();
+    try std.testing.expect(!app.session.hasSteering());
     try std.testing.expectEqual(@as(usize, 1), app.session.editor.draft.atoms.items.len);
     const restored = try app.session.editor.expanded(.none);
     defer gpa.free(restored);
     try std.testing.expectEqualStrings(payload, restored);
+    try std.testing.expectEqual(@as(usize, 0), app.session.transcript.blocks().len);
+
+    const remaining = try app.agent.steering.take();
+    defer gpa.free(remaining);
+    try std.testing.expectEqual(@as(usize, 0), remaining.len);
 }
 
 test "ctrl+c during a turn clears the draft first and cancels only on an empty editor" {
@@ -3373,6 +3314,7 @@ test "a cancel that loses the race waits for the terminal fence" {
     defer app.session.deinit();
     app.session.beginTurn(7);
 
+    try app.agent.steering.push("keep");
     try seedSteering(&app, "keep");
 
     const worker_result: WorkerResult = .{
@@ -3396,7 +3338,7 @@ test "a cancel that loses the race waits for the terminal fence" {
 
     try std.testing.expect(app.session.mode == .prompt);
     try std.testing.expect(app.pending_turn_result == null);
-    try std.testing.expectEqualStrings("", app.session.editor.visible());
+    try std.testing.expectEqualStrings("keep", app.session.editor.visible());
     try std.testing.expectEqual(@as(usize, 0), app.session.steering.items.len);
     try std.testing.expectEqual(@as(usize, 0), app.session.transcript.blocks().len);
 }
@@ -3707,7 +3649,7 @@ test "a cancel that loses the race applies the failed joined result" {
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "boom") != null);
 }
 
-test "a joined completion starts older steering before a newer prompt" {
+test "a joined completion returns late steering to the editor" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -3729,16 +3671,13 @@ test "a joined completion starts older steering before a newer prompt" {
 
     try app.agent.steering.push("older");
     try seedSteering(&app, "older");
+    try app.session.editor.insert("draft");
     const worker_result: WorkerResult = .{
         .outcome = .{ .receipt = zero_receipt, .disposition = .completed },
         .error_text = null,
         .generation = 3,
     };
     app.turn_future = try io.concurrent(fakeWorker, .{&worker_result});
-    defer if (app.turn_future) |*future| {
-        const result = future.cancel(io);
-        app.freeWorkerResult(&result);
-    };
     try app.cancelTurn();
     try std.testing.expect(app.session.mode == .turn);
 
@@ -3747,15 +3686,22 @@ test "a joined completion starts older steering before a newer prompt" {
     try std.testing.expectEqual(events.len, count);
     try std.testing.expect(!try app.applyBatch(events[0..count]));
 
-    // The replacement terminal fence starts pending steering before the
-    // consumer can take a newer queue event.
-    try std.testing.expect(app.session.mode == .turn);
-    try std.testing.expectEqual(@as(usize, 1), app.session.transcript.blocks().len);
-    switch (app.session.transcript.blocks()[0]) {
-        .user => |text| try std.testing.expectEqualStrings("older", text.items),
-        else => return error.UnexpectedTranscriptBlock,
-    }
+    // The replacement terminal fence returns pending steering to the editor
+    // before the consumer can take a newer queue event. No turn starts, so the
+    // user reviews the reply before the text sends. The recall is automatic, so
+    // the older steering composes above the newer in-progress line, and a
+    // notice announces the return.
+    try std.testing.expect(app.session.mode == .prompt);
+    try std.testing.expectEqual(@as(usize, 0), app.session.transcript.blocks().len);
+    try std.testing.expectEqualStrings("older\n\ndraft", app.session.editor.visible());
     try std.testing.expect(!app.session.hasSteering());
+    try std.testing.expectEqualStrings(
+        "Drinky returned every queued message to the editor.",
+        app.session.notice.?.content,
+    );
+    const remaining = try app.agent.steering.take();
+    defer gpa.free(remaining);
+    try std.testing.expectEqual(@as(usize, 0), remaining.len);
 }
 
 // Shutdown is teardown, not an interactive cancel: it frees the worker result and
@@ -4006,7 +3952,7 @@ test "mid-turn Enter queues a message but refuses a slash line or a blank line" 
     try std.testing.expectEqualStrings("the account matters too", taken[0]);
 }
 
-test "late placeholder steering starts before a newer key in the same batch" {
+test "late placeholder steering returns before a newer key in the same batch" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -4041,15 +3987,19 @@ test "late placeholder steering starts before a newer key in the same batch" {
     try app.submitSteering();
     const events = [_]Session.UiEvent{
         .{ .turn = .{ .generation = 1, .payload = endedPayload() } },
-        .{ .keys = try gpa.dupe(u8, "new\r") },
+        .{ .keys = try gpa.dupe(u8, "new") },
     };
     try std.testing.expect(!try app.applyBatch(&events));
 
-    try std.testing.expect(app.session.mode == .turn);
-    try std.testing.expectEqualStrings(payload, app.session.transcript.blocks()[0].user.items);
-    try std.testing.expectEqual(@as(usize, 1), app.session.turn_origin.?.prompt.atoms.items.len);
-    try std.testing.expectEqual(@as(usize, 1), app.session.steering.items.len);
-    try std.testing.expectEqualStrings("new", app.session.steering.items[0].visible.items);
+    // The fence returns the paste to the editor first, so the newer key lands
+    // behind it in the same draft instead of an already gone steering queue.
+    try std.testing.expect(app.session.mode == .prompt);
+    try std.testing.expectEqual(@as(usize, 0), app.session.steering.items.len);
+    try std.testing.expectEqual(@as(usize, 0), app.session.transcript.blocks().len);
+    try std.testing.expectEqual(@as(usize, 1), app.session.editor.draft.atoms.items.len);
+    const expanded = try app.session.editor.expanded(.none);
+    defer gpa.free(expanded);
+    try std.testing.expectEqualStrings(payload ++ "new", expanded);
 }
 
 // The lifecycle calls model cancellation and resubmission key entries from a
