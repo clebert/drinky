@@ -64,7 +64,7 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - Searches skip common noise directories: version-control stores, dependency directories, and
   build caches. A path that ends with a skipped directory name searches it fully. An empty search
   names up to three skipped noise directories, except version-control stores.
-- `find` and `grep` run under a fixed 30-second timeout that neither a call nor the config changes.
+- `find` and `grep` run under a fixed 10-second timeout that neither a call nor the config changes.
   A search checks the clock between filesystem steps.
 - A stopped search keeps the matches it found, and a stopped command keeps the tail of its output.
   Each one states the stop, so the model can narrow the next call on evidence.

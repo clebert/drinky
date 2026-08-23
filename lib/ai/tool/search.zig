@@ -6,9 +6,10 @@ const std = @import("std");
 const Result = @import("Result.zig");
 
 /// The wall-clock timeout of one search, in milliseconds. A search of a whole
-/// repository stays far below it. The interface reads the same value, because
-/// neither a call nor the config changes it.
-pub const timeout_ms = 30 * std.time.ms_per_s;
+/// repository stays far below it, so this window catches a mis-scoped path or a
+/// slow mount. The interface reads the same value, because neither a call nor
+/// the config changes it.
+pub const timeout_ms = 10 * std.time.ms_per_s;
 
 /// The clock of one run: when it started, and whether its time is spent.
 ///

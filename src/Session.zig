@@ -3117,7 +3117,7 @@ test "a running search reports its run time against its timeout" {
     const painted = out.written();
     try std.testing.expect(std.mem.indexOf(u8, painted, "Tool: grep · Pattern: columns") != null);
     try std.testing.expect(
-        std.mem.indexOf(u8, painted, "Time: 4.5s · Timeout: 30.0s") != null,
+        std.mem.indexOf(u8, painted, "Time: 4.5s · Timeout: 10.0s") != null,
     );
 }
 
