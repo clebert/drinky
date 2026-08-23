@@ -222,6 +222,8 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - A tool box that states measures wraps no line. Each line takes one row and marks a cut with one
   `…`, so the rows a call occupies follow its state and never the length of its arguments. A box
   that holds the sentence of a failure wraps instead.
+- The head row of a tool box paints the name of the tool bold, so the tool stands out from the keys
+  around it.
 - A call names what it acts on as `File:`, `Pattern:`, or `Command:`. A row holds the tool and its
   subject alone, with each run of whitespace collapsed to one space. A tool row shortens a path the
   way `Skill:` does: relative to the working directory below it, `~` for the home directory, and the

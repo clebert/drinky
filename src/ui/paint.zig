@@ -26,6 +26,21 @@ const Notice = struct {
     prefix: []const u8,
 };
 
+/// One box content row: the text it paints, how that text fits the row, the
+/// emphasized run inside it, and the role that colors it. The row applies that
+/// role at its start, and again behind the run. The role is the one source of
+/// the color of the row, so no caller states it twice.
+const Line = struct {
+    content: []const u8,
+    fit: Fit,
+    run: Run = .{},
+    role: role.Name = .text,
+};
+
+/// An emphasized run of bytes, as offsets into the text that holds it. A row
+/// paints the part of the run that it holds. An empty run paints nothing.
+const Run = struct { start: usize = 0, end: usize = 0 };
+
 /// Where a component composes its rows: the sink to write into, the anchor `id`
 /// its rows carry, the terminal width, the line its content starts at (`base`,
 /// after any leading separator), and how many of its top rows to drop (`skip`,
@@ -49,12 +64,37 @@ pub const Fit = enum {
     head,
 };
 
-/// The body of one box: its text and how a long line fits. The role that colors
-/// the box is a paint-time choice, so the measure does not take it.
+/// The body of one box: its text, how a long line fits, and which part of the
+/// text the paint emphasizes. The role that colors the box is a paint-time
+/// choice, so the measure does not take it.
 pub const Box = struct {
     text: []const u8,
     fit: Fit = .wrap,
+    emphasis: Emphasis = .none,
+
+    /// Which part of a box body the paint emphasizes. The caller names the part
+    /// and never the byte range, so the text and the range cannot disagree.
+    pub const Emphasis = enum {
+        /// No part. Every row paints one style from end to end.
+        none,
+        /// The value of the first key in the head row, such as the name of a
+        /// tool. That name then stands out from the keys around it.
+        first_value,
+    };
 };
+
+/// The run that `.first_value` names: the value of the first key of the head
+/// row. The run ends at the blank behind the value, or at the end of the head
+/// row. The run is empty for a head row that holds no key.
+fn firstValue(text: []const u8) Run {
+    const head = text[0 .. std.mem.indexOfScalar(u8, text, '\n') orelse text.len];
+    const separator = ": ";
+    const key_end = std.mem.indexOf(u8, head, separator) orelse return .{};
+    const start = key_end + separator.len;
+    const value = head[start..];
+    const length = std.mem.indexOfScalar(u8, value, ' ') orelse value.len;
+    return .{ .start = start, .end = start + length };
+}
 
 /// The physical rows a box occupies at `columns`: the two padding rows around
 /// the body plus the body itself. A `wrap` body counts its wrapped rows, and a
@@ -149,18 +189,45 @@ pub fn notice(placement: *const Placement, look: *const Notice, text: []const u8
 pub fn box(placement: *const Placement, name: role.Name, body: *const Box) !void {
     var line = placement.base;
     try boxPad(placement, &line, name);
+    const run: Run = switch (body.emphasis) {
+        .none => .{},
+        .first_value => firstValue(body.text),
+    };
+    var offset: usize = 0;
     var lines = std.mem.splitScalar(u8, body.text, '\n');
     while (lines.next()) |source| {
+        // The line break the split consumed belongs to the offset of the next
+        // line, so the run keeps its place in the whole text.
+        defer offset += source.len + 1;
         const content = lineText(source);
         switch (body.fit) {
             .wrap => {
                 var iterator = terminal.width.wrapper(content, contentColumns(placement.columns));
-                while (iterator.next()) |row| try boxLine(placement, &line, name, .wrap, row);
+                while (iterator.nextSpan()) |span| {
+                    try boxLine(placement, &line, &.{
+                        .content = terminal.width.rowText(content[span.start..span.end]),
+                        .fit = .wrap,
+                        .run = rowRun(run, offset + span.start),
+                        .role = name,
+                    });
+                }
             },
-            .head => try boxLine(placement, &line, name, .head, content),
+            .head => try boxLine(placement, &line, &.{
+                .content = content,
+                .fit = .head,
+                .run = rowRun(run, offset),
+                .role = name,
+            }),
         }
     }
     try boxPad(placement, &line, name);
+}
+
+/// `run` in the coordinates of a row that starts at `offset` in the box text. A
+/// row that starts in front of the run keeps its offsets. The row cuts its own
+/// text later, so `boxLineText` alone drops what the row does not hold.
+fn rowRun(run: Run, offset: usize) Run {
+    return .{ .start = run.start -| offset, .end = run.end -| offset };
 }
 
 /// A box's blank padding row: the fill carried to full width.
@@ -174,49 +241,57 @@ fn boxPad(placement: *const Placement, line: *usize, name: role.Name) !void {
     placement.sink.end(.{ .id = placement.id, .line = line.* });
 }
 
-/// A box's content row: `content` from the first column, then the fill carried
-/// to full width.
-fn boxLine(
-    placement: *const Placement,
-    line: *usize,
-    name: role.Name,
-    fit: Fit,
-    content: []const u8,
-) !void {
+/// A box's content row: the text from the first column, then the fill carried to
+/// full width.
+fn boxLine(placement: *const Placement, line: *usize, row: *const Line) !void {
     defer line.* += 1;
     if (line.* < placement.skip) return;
     placement.sink.begin();
-    try role.apply(placement.sink, name);
-    try boxLineCells(placement.sink, placement.columns, fit, content);
+    try role.apply(placement.sink, row.role);
+    try boxLineCells(placement.sink, placement.columns, row);
     try attribute.apply(placement.sink, .reset);
     placement.sink.end(.{ .id = placement.id, .line = line.* });
 }
 
 /// The cells of the first box content row, without the row bookkeeping. The
-/// text wraps at the live box width. The caller opens the row, applies the box
-/// color, and closes the style. The color preview page uses this fixed row.
+/// text wraps at the live box width. The row carries no emphasized run. The
+/// caller opens the row, applies the box color, and closes the style. The color
+/// preview page uses this fixed row.
 pub fn boxCells(sink: *terminal.View.Sink, columns: usize, text: []const u8) !void {
     var iterator = terminal.width.wrapper(text, contentColumns(columns));
-    try boxLineCells(sink, columns, .wrap, iterator.next().?);
+    try boxLineCells(sink, columns, &.{ .content = iterator.next().?, .fit = .wrap });
 }
 
-fn boxLineCells(
-    sink: *terminal.View.Sink,
-    columns: usize,
-    fit: Fit,
-    content: []const u8,
-) !void {
+fn boxLineCells(sink: *terminal.View.Sink, columns: usize, row: *const Line) !void {
     const room = contentColumns(columns);
-    switch (fit) {
+    switch (row.fit) {
         // The wrap already cut the row, so it needs no mark of its own.
-        .wrap => try sink.text(terminal.width.truncate(content, room)),
+        .wrap => try boxLineText(sink, terminal.width.truncate(row.content, room), row),
         .head => {
-            const shown = cut(content, room);
-            try sink.text(shown.kept);
+            const shown = cut(row.content, room);
+            try boxLineText(sink, shown.kept, row);
             if (shown.marked) try sink.text(ellipsis);
         },
     }
     try sink.spaces(columns -| sink.columns_written);
+}
+
+/// The text of one box row, with the part of the run that `text` holds in the
+/// emphasis of the box role. The reset that closes the emphasis also closes the
+/// color, so the row applies that role again behind the run.
+fn boxLineText(sink: *terminal.View.Sink, text: []const u8, row: *const Line) !void {
+    // The row cuts its text after the run reaches it, so the clamp lives here
+    // alone. A cut inside the run then emphasizes what the row kept of it. The
+    // clamp keeps the order of the bounds, because `@min` is monotone.
+    const start = @min(row.run.start, text.len);
+    const end = @min(row.run.end, text.len);
+    if (start == end) return sink.text(text);
+    try sink.text(text[0..start]);
+    try attribute.emphasize(sink, row.role, false);
+    try sink.text(text[start..end]);
+    try attribute.apply(sink, .reset);
+    try role.apply(sink, row.role);
+    try sink.text(text[end..]);
 }
 
 const frame_separator_rows = 2;
@@ -712,6 +787,108 @@ test "a fitted box holds one row per line" {
     try std.testing.expect(std.mem.indexOf(u8, painted, "Tool: write · File:\u{2026}") != null);
     // The summary line keeps its own row and fits whole.
     try std.testing.expect(std.mem.indexOf(u8, painted, "Lines: 1") != null);
+}
+
+// The head row of a tool box names the tool, and that name takes the emphasis of
+// the box role. The reset that closes the emphasis also closes the color, so the
+// row applies that role again behind the name. No other row emphasizes anything.
+test "a box emphasizes the value of its first key" {
+    const gpa = std.testing.allocator;
+    var output: std.Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    var view = terminal.View.init(gpa, &output.writer);
+    defer view.deinit();
+
+    const columns = 40;
+    const body: Box = .{
+        .text = "Tool: read \u{00B7} File: a.zig\nLines: 3",
+        .fit = .head,
+        .emphasis = .first_value,
+    };
+    const sink = try view.beginFrame(.{ .columns = columns, .rows = 8 }, 1);
+    try box(&.{
+        .sink = sink,
+        .id = 0,
+        .columns = columns,
+        .base = 0,
+        .skip = 0,
+    }, .tool_success, &body);
+    try view.render();
+
+    const painted = output.written();
+    const head = comptime "Tool: \x1b[1mread\x1b[0m" ++ role.sequence(.tool_success) ++
+        " \u{00B7} File: a.zig";
+    try std.testing.expect(std.mem.indexOf(u8, painted, head) != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, painted, "\x1b[1m"));
+
+    // A terminal copy loses every style, so each row reads as one line of text.
+    const plain = try terminal.View.plainText(gpa, painted);
+    defer gpa.free(plain);
+    try std.testing.expect(std.mem.indexOf(u8, plain, "Tool: read \u{00B7} File: a.zig") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plain, "Lines: 3") != null);
+}
+
+// A row cuts its text after the run reaches it. The row then emphasizes what it
+// kept of the run, and a wrap carries the rest to the row below. Every row still
+// carries its fill to the full width.
+test "a narrow box cuts its run and carries the rest to the next row" {
+    const gpa = std.testing.allocator;
+    var output: std.Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    var view = terminal.View.init(gpa, &output.writer);
+    defer view.deinit();
+
+    const columns = 12;
+    const body: Box = .{
+        .text = "Tool: read_the_file \u{00B7} File: a",
+        .emphasis = .first_value,
+    };
+    const sink = try view.beginFrame(.{ .columns = columns, .rows = 8 }, 1);
+    try box(&.{
+        .sink = sink,
+        .id = 0,
+        .columns = columns,
+        .base = 0,
+        .skip = 0,
+    }, .tool_pending, &body);
+    try view.render();
+
+    const painted = output.written();
+    // The name is wider than the row, so the row that opens it emphasizes every
+    // cell, and the row below emphasizes the rest of the name alone.
+    const opened = comptime role.sequence(.tool_pending) ++ "\x1b[1mread_the_fil";
+    const carried = comptime "\x1b[1me\x1b[0m" ++ role.sequence(.tool_pending) ++
+        " \u{00B7} File: a";
+    try std.testing.expect(std.mem.indexOf(u8, painted, opened) != null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, carried) != null);
+
+    // Two padding rows around three content rows, each one full row of fill.
+    const plain = try terminal.View.plainText(gpa, painted);
+    defer gpa.free(plain);
+    var rows = std.mem.splitSequence(u8, plain, "\r\n");
+    var count: usize = 0;
+    while (rows.next()) |row| : (count += 1)
+        try std.testing.expectEqual(columns, terminal.width.ofText(row));
+    try std.testing.expectEqual(boxRows(&body, columns), count);
+}
+
+// The run covers the value of the first key of the head row. A body that holds no
+// key states no run. A row keeps the offsets of the run, and only the paint
+// clamps them to the text that the row shows.
+test "the emphasized run covers the first value alone" {
+    try std.testing.expectEqual(Run{ .start = 6, .end = 10 }, firstValue(
+        "Tool: read \u{00B7} File: a.zig\nLines: 3",
+    ));
+    // A call with no subject is its name alone, and the name ends the row.
+    try std.testing.expectEqual(Run{ .start = 6, .end = 21 }, firstValue("Tool: describe_config"));
+    // A user message holds no key, so no part of the box takes the emphasis.
+    try std.testing.expectEqual(Run{}, firstValue("please read a.zig"));
+
+    const run: Run = .{ .start = 6, .end = 10 };
+    // A row behind the run keeps no offset of it, so the paint shows no run.
+    try std.testing.expectEqual(Run{ .start = 0, .end = 0 }, rowRun(run, 25));
+    // A row in front of the run keeps every byte of it.
+    try std.testing.expectEqual(run, rowRun(run, 0));
 }
 
 test "activity at column zero emits no unused frame role" {

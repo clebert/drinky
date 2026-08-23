@@ -484,6 +484,37 @@ pub fn parkCursor(self: *View) !void {
     try writer.flush();
 }
 
+/// The visible text of painted frame bytes: the CSI sequences, the hyperlink
+/// strings, and the zero-width seam guards of the sink stripped away. The rows
+/// keep their `\r\n` separators. A style can open inside a row, so a caller that
+/// reads a whole row reads it here. The caller owns the returned bytes.
+pub fn plainText(gpa: std.mem.Allocator, bytes: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    var index: usize = 0;
+    while (index < bytes.len) {
+        if (std.mem.startsWith(u8, bytes[index..], escape.link_set)) {
+            const rest = bytes[index + escape.link_set.len ..];
+            const end = std.mem.indexOf(u8, rest, escape.string_end) orelse rest.len;
+            index = bytes.len - rest.len + end + escape.string_end.len;
+            continue;
+        }
+        if (bytes[index] == 0x1b and index + 1 < bytes.len and bytes[index + 1] == '[') {
+            index += 2;
+            while (index < bytes.len and (bytes[index] < 0x40 or bytes[index] > 0x7e)) index += 1;
+            if (index < bytes.len) index += 1;
+            continue;
+        }
+        if (std.mem.startsWith(u8, bytes[index..], "\u{200B}")) {
+            index += "\u{200B}".len;
+            continue;
+        }
+        try out.append(gpa, bytes[index]);
+        index += 1;
+    }
+    return out.toOwnedSlice(gpa);
+}
+
 /// Reconcile frames that share the new top row. `delta` locates that row in
 /// `prev`.
 fn paintAligned(self: *View, prev: *const Frame, back: *Frame, delta: usize) !void {
@@ -1841,4 +1872,17 @@ test "a styled row reprinted from its own start carries its escapes" {
     try harness.emulator.expectVisible(&.{ "a", "BOLD" });
     // The row re-opens and closes its own SGR. It relies on no state from above.
     try std.testing.expect(std.mem.indexOf(u8, harness.lastBytes(), styled) != null);
+}
+
+// A reader of a painted frame wants its text, not its styles. The strip drops
+// the SGR sequences, the target of a hyperlink, and the seam guards, and it keeps
+// the row separators.
+test "the plain text of painted bytes holds the rows alone" {
+    const gpa = std.testing.allocator;
+    const bytes = escape.sync_set ++ "\x1b[1mbold\x1b[0m\r\n" ++
+        escape.link_set ++ "https://example.com" ++ escape.string_end ++ "link" ++
+        escape.link_reset ++ "\u{200B}!" ++ escape.sync_reset;
+    const plain = try plainText(gpa, bytes);
+    defer gpa.free(plain);
+    try std.testing.expectEqualStrings("bold\r\nlink!", plain);
 }

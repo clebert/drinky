@@ -1362,36 +1362,6 @@ fn frameBody(bytes: []const u8) []const u8 {
     return bytes[terminal.escape.sync_set.len .. bytes.len - terminal.escape.sync_reset.len];
 }
 
-// The frame's visible text: the CSI sequences, the hyperlink strings, and the
-// sink's zero-width seam guards stripped away. The rows keep their `\r\n`
-// separators. The caller owns the returned bytes.
-fn plainBody(gpa: std.mem.Allocator, bytes: []const u8) ![]u8 {
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(gpa);
-    var index: usize = 0;
-    while (index < bytes.len) {
-        if (std.mem.startsWith(u8, bytes[index..], terminal.escape.link_set)) {
-            const rest = bytes[index + terminal.escape.link_set.len ..];
-            const end = std.mem.indexOf(u8, rest, terminal.escape.string_end) orelse rest.len;
-            index = bytes.len - rest.len + end + terminal.escape.string_end.len;
-            continue;
-        }
-        if (bytes[index] == 0x1b and index + 1 < bytes.len and bytes[index + 1] == '[') {
-            index += 2;
-            while (index < bytes.len and (bytes[index] < 0x40 or bytes[index] > 0x7e)) index += 1;
-            if (index < bytes.len) index += 1;
-            continue;
-        }
-        if (std.mem.startsWith(u8, bytes[index..], "\u{200B}")) {
-            index += "\u{200B}".len;
-            continue;
-        }
-        try out.append(gpa, bytes[index]);
-        index += 1;
-    }
-    return out.toOwnedSlice(gpa);
-}
-
 // Paint `text` and compare the visible rows, character for character.
 fn expectPlainRows(
     gpa: std.mem.Allocator,
@@ -1401,7 +1371,7 @@ fn expectPlainRows(
 ) !void {
     const bytes = try painted(gpa, text, columns, null, 0);
     defer gpa.free(bytes);
-    const body = try plainBody(gpa, frameBody(bytes));
+    const body = try terminal.View.plainText(gpa, frameBody(bytes));
     defer gpa.free(body);
     var actual = std.mem.splitSequence(u8, body, "\r\n");
     for (expected) |row| try std.testing.expectEqualStrings(row, actual.next() orelse "");
@@ -1668,7 +1638,7 @@ test "a table draws every grid row to one width" {
         for ([_]usize{ 72, 40, 24, 16, 13, 11, 10, 9 }) |columns| {
             const bytes = try painted(gpa, text, columns, null, 0);
             defer gpa.free(bytes);
-            const body = try plainBody(gpa, frameBody(bytes));
+            const body = try terminal.View.plainText(gpa, frameBody(bytes));
             defer gpa.free(body);
             var width: ?usize = null;
             var painted_rows = std.mem.splitSequence(u8, body, "\r\n");

@@ -111,7 +111,13 @@ pub const Entry = union(enum) {
             .tool_result => |flagged| try paint.box(
                 placement,
                 if (flagged.is_error) .tool_error else .tool_success,
-                &.{ .text = flagged.text.items, .fit = flagged.fit },
+                // The head row names the tool, so the box emphasizes that
+                // name. A finished box then reads like the running one.
+                &.{
+                    .text = flagged.text.items,
+                    .fit = flagged.fit,
+                    .emphasis = .first_value,
+                },
             ),
             .thinking => |text| try markdown.render(placement, .muted, text.items),
             .model => |text| try markdown.render(placement, null, text.items),

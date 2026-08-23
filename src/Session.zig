@@ -229,11 +229,18 @@ const Turn = struct {
         self.box_view.clearRetainingCapacity();
         // Every row holds one call. A committed one names what it acts on, and a
         // streamed one counts the bytes that have arrived. A call under a
-        // timeout adds the row that reports its time.
-        for (self.tools.items) |*tool|
-            try self.box_view.append(gpa, .{ .text = try tool.text(gpa, now_ms), .fit = .head });
-        for (self.streamed_tools.items) |streamed|
-            try self.box_view.append(gpa, .{ .text = streamed.box.items, .fit = .head });
+        // timeout adds the row that reports its time. Each head row names its
+        // tool, so every box emphasizes that name.
+        for (self.tools.items) |*tool| try self.box_view.append(gpa, .{
+            .text = try tool.text(gpa, now_ms),
+            .fit = .head,
+            .emphasis = .first_value,
+        });
+        for (self.streamed_tools.items) |streamed| try self.box_view.append(gpa, .{
+            .text = streamed.box.items,
+            .fit = .head,
+            .emphasis = .first_value,
+        });
         return self.box_view.items;
     }
 };
@@ -1429,6 +1436,17 @@ fn applyEvent(session: *Session, generation: u64, payload: TurnEvent.Payload) !v
     _ = try session.applyTurnEvent(&.{ .generation = generation, .payload = payload });
 }
 
+// The visible text of a painted frame holds `text`. A box emphasizes the name of
+// its tool, so a style opens inside the head row. The search reads the text of
+// the frame instead of its bytes, and a failure prints that text.
+fn expectPainted(gpa: std.mem.Allocator, painted: []const u8, text: []const u8) !void {
+    const plain = try terminal.View.plainText(gpa, painted);
+    defer gpa.free(plain);
+    if (std.mem.indexOf(u8, plain, text) != null) return;
+    std.debug.print("the frame holds no row with \"{s}\":\n{s}\n", .{ text, plain });
+    return error.TestExpectedRow;
+}
+
 // One committed round: a reply, then a call that reports its real result. The
 // sequence numbers mirror what the app's turn handler produces.
 fn applyFinishedToolRound(session: *Session) !void {
@@ -1885,7 +1903,7 @@ test "a tool result without a box line keeps the call row alone" {
 
     try session.paint(.{ .columns = 80, .rows = 24 });
     const painted = out.written();
-    try std.testing.expect(std.mem.indexOf(u8, painted, "Tool: describe_config") != null);
+    try expectPainted(gpa, painted, "Tool: describe_config");
 }
 
 // A failure states one sentence, and that sentence is the box line. The block
@@ -1976,11 +1994,7 @@ test "a streamed tool call counts its bytes until the call commits" {
     const size: terminal.View.Size = .{ .columns = 60, .rows = 24 };
     try session.paint(size);
     const streaming = out.written();
-    try std.testing.expect(std.mem.indexOf(
-        u8,
-        streaming,
-        "Tool: write · Received: 31 B · Status: Streaming",
-    ) != null);
+    try expectPainted(gpa, streaming, "Tool: write · Received: 31 B · Status: Streaming");
     // `Received` names the wire, and it is the only count in a box that reads
     // in bytes. No finished call reports a size, so no reader can take the
     // streamed count for the size of what the call wrote.
@@ -2001,7 +2015,7 @@ test "a streamed tool call counts its bytes until the call commits" {
     try session.paint(size);
     const committed = out.written();
     // The row names the file, not the argument list around it.
-    try std.testing.expect(std.mem.indexOf(u8, committed, "Tool: write · File: src/App.zig") != null);
+    try expectPainted(gpa, committed, "Tool: write · File: src/App.zig");
     try std.testing.expect(std.mem.indexOf(u8, committed, "content") == null);
 }
 
@@ -2032,14 +2046,10 @@ test "a committed call replaces its own streamed row and leaves its sibling" {
 
     try session.paint(.{ .columns = 60, .rows = 24 });
     const painted = out.written();
-    try std.testing.expect(std.mem.indexOf(u8, painted, "Tool: write · File: a") != null);
+    try expectPainted(gpa, painted, "Tool: write · File: a");
     // The reply committed, so the sibling waits its turn. Its count stopped
     // climbing, and the row keeps that count next to the state it reached.
-    try std.testing.expect(std.mem.indexOf(
-        u8,
-        painted,
-        "Tool: read · Received: 12 B · Status: Queued",
-    ) != null);
+    try expectPainted(gpa, painted, "Tool: read · Received: 12 B · Status: Queued");
 }
 
 // A reply streams its calls one after the other, so the row above stops counting
@@ -2093,7 +2103,7 @@ test "a narrow window cuts the phase of a streamed row and keeps the count" {
 
     try session.paint(.{ .columns = 40, .rows = 24 });
     const painted = out.written();
-    try std.testing.expect(std.mem.indexOf(u8, painted, "Tool: write · Received: 12 B") != null);
+    try expectPainted(gpa, painted, "Tool: write · Received: 12 B");
     try std.testing.expect(std.mem.indexOf(u8, painted, "Streaming") == null);
     try std.testing.expect(std.mem.indexOf(u8, painted, "\u{2026}") != null);
 }
@@ -3087,7 +3097,7 @@ test "a running command reports its run time against its timeout" {
     session.clock_ms = 13_400;
     try session.paint(.{ .columns = 60, .rows = 24 });
     const painted = out.written();
-    try std.testing.expect(std.mem.indexOf(u8, painted, "Tool: bash · Command: zig build test") != null);
+    try expectPainted(gpa, painted, "Tool: bash · Command: zig build test");
     try std.testing.expect(
         std.mem.indexOf(u8, painted, "Time: 12.4s · Timeout: 2m 0s") != null,
     );
@@ -3115,7 +3125,7 @@ test "a running search reports its run time against its timeout" {
     session.clock_ms = 6_500;
     try session.paint(.{ .columns = 60, .rows = 24 });
     const painted = out.written();
-    try std.testing.expect(std.mem.indexOf(u8, painted, "Tool: grep · Pattern: columns") != null);
+    try expectPainted(gpa, painted, "Tool: grep · Pattern: columns");
     try std.testing.expect(
         std.mem.indexOf(u8, painted, "Time: 4.5s · Timeout: 10.0s") != null,
     );
@@ -3156,7 +3166,7 @@ test "a tool without a timeout keeps one row" {
     } });
     try session.paint(.{ .columns = 60, .rows = 24 });
     const painted = out.written();
-    try std.testing.expect(std.mem.indexOf(u8, painted, "Tool: read · File: src/App.zig") != null);
+    try expectPainted(gpa, painted, "Tool: read · File: src/App.zig");
     try std.testing.expect(std.mem.indexOf(u8, painted, "Timeout:") == null);
 }
 
