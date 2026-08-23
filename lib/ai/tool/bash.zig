@@ -9,13 +9,18 @@ const format = @import("../format.zig");
 const llm = @import("../llm.zig");
 const net = @import("../net.zig");
 const Context = @import("Context.zig");
-const parse = @import("parse.zig");
 const Result = @import("Result.zig");
+const parse = @import("parse.zig");
 
 /// The hard cap on captured output. Beyond this, Drinky stops the command and
 /// does not buffer without bound. The configured window keeps only the tail
 /// below it.
 const capture_bytes_max = 8 << 20;
+
+/// The transfer buffer of one pipe read. One read takes up to this many bytes,
+/// so the size bounds the syscall count and the copy count of a loud command
+/// to a handful per megabyte.
+const read_buffer_bytes = 64 * 1024;
 
 /// The UTF-8 replacement character, substituted for malformed input bytes.
 const replacement = "\u{FFFD}";
@@ -24,7 +29,8 @@ pub const spec: llm.Tool = .{
     .name = "bash",
     .description = "Run a bash command in the working directory and return its combined " ++
         "stdout and stderr. Output is truncated to a bounded tail, and a non-zero exit is " ++
-        "reported. Give an optional timeout in seconds; the default comes from configuration. " ++
+        "reported. A timed-out or oversized command still returns the tail of its output. " ++
+        "Give an optional timeout in seconds; the default comes from configuration. " ++
         "Drinky has no web tool, so a network request also runs through this tool. " ++
         "Use the find and grep tools for normal file discovery and literal content searches. " ++
         "They skip noise directories and save time. Use this tool when they cannot express " ++
@@ -58,23 +64,17 @@ const Input = struct {
     timeout_seconds: ?u64 = null,
 };
 
-const Completed = struct {
-    output: []u8,
-    term: std.process.Child.Term,
-};
-
+/// The caller-owned state of one command run. The run races the timeout, and a
+/// timeout cancels the collecting task. The output streams into this state as
+/// it arrives, so a killed command still hands over the tail it printed. The
+/// collector writes between io operations, and the race joins it before the
+/// caller reads, so no read races a write.
 const Execution = struct {
-    gpa: std.mem.Allocator,
-    completed: ?Completed = null,
+    output: std.Io.Writer.Allocating,
+    term: ?std.process.Child.Term = null,
 
     fn deinit(self: *Execution) void {
-        if (self.completed) |completed| self.gpa.free(completed.output);
-    }
-
-    fn take(self: *Execution) Completed {
-        const completed = self.completed.?;
-        self.completed = null;
-        return completed;
+        self.output.deinit();
     }
 };
 
@@ -106,23 +106,20 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
         limits.timeout_ms);
 
     const started_ms = std.Io.Timestamp.now(context.io, .awake).toMilliseconds();
-    const completed = execute(context, command, timeout_ms) catch |err| switch (err) {
+    var execution: Execution = .{ .output = .init(gpa) };
+    defer execution.deinit();
+    const executed = execute(context, command, timeout_ms, &execution);
+    const elapsed_ms = std.Io.Timestamp.now(context.io, .awake).toMilliseconds() - started_ms;
+    // Every end state that holds output renders it through one path, so a
+    // stopped command reads like one that ran: the tail it printed, the notice
+    // that names the stop, and the measures the box shows.
+    const stop: Stop = if (executed) |term| .{ .completed = term } else |err| switch (err) {
         error.Canceled => return error.Canceled,
         // A command that ran out of time reports that time the way a command
         // that finished does, because the row above it counted up to this
         // moment and the box must not drop the number the user watched.
-        error.Timeout => return timedOut(
-            gpa,
-            std.Io.Timestamp.now(context.io, .awake).toMilliseconds() - started_ms,
-            timeout_ms,
-        ),
-        error.StreamTooLong => return Result.report(
-            gpa,
-            .err,
-            "The command produced more than {d} bytes of output and stopped. " ++
-                "Reduce the output or redirect it to a file.",
-            .{capture_bytes_max},
-        ),
+        error.Timeout => .{ .timed_out = timeout_ms },
+        error.StreamTooLong => .oversized,
         else => return Result.report(
             gpa,
             .err,
@@ -130,60 +127,31 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
             .{@errorName(err)},
         ),
     };
-    defer gpa.free(completed.output);
-
-    const output = try sanitize(gpa, completed.output);
+    const output = try sanitize(gpa, execution.output.written());
     defer gpa.free(output);
-
-    const failed = switch (completed.term) {
-        .exited => |code| code != 0,
-        else => true,
-    };
-    const elapsed_ms = std.Io.Timestamp.now(context.io, .awake).toMilliseconds() - started_ms;
-    return render(gpa, output, limits, completed.term, failed, elapsed_ms);
+    return render(gpa, output, limits, stop, elapsed_ms);
 }
 
-/// The result of a command the timeout stopped. Both spans read in the units the
-/// interface uses, never in raw milliseconds, and the summary carries the run
-/// time so every command reports one. `timeout_ms` arrives clamped, so it always
-/// fits a signed span.
-fn timedOut(gpa: std.mem.Allocator, elapsed_ms: i64, timeout_ms: u64) !Result {
-    var limit: [24]u8 = undefined;
-    var scale: [24]u8 = undefined;
-    // Built field by field: the content states the limit to the model, and the
-    // box reports the run time instead. An assignment over a report leaks the
-    // sentence that the report put in the summary.
-    const content = try std.fmt.allocPrint(gpa, "The command timed out after {s}.", .{
-        format.duration(&limit, @intCast(timeout_ms)),
-    });
-    errdefer gpa.free(content);
-    const summary = try std.fmt.allocPrint(gpa, "Time: {s} · Status: Timed out", .{
-        format.duration(&scale, elapsed_ms),
-    });
-    return .{ .content = content, .summary = .{ .text = summary }, .is_error = true };
-}
-
-fn execute(context: *const Context, command: []const u8, timeout_ms: u64) !Completed {
+fn execute(
+    context: *const Context,
+    command: []const u8,
+    timeout_ms: u64,
+    execution: *Execution,
+) !std.process.Child.Term {
     std.debug.assert(timeout_ms >= Context.Bash.timeout_ms_min);
     std.debug.assert(timeout_ms <= Context.Bash.timeout_ms_max);
 
-    var execution: Execution = .{ .gpa = context.gpa };
-    defer execution.deinit();
     const work_result = net.race(
         context.io,
         timeout_ms,
-        collectInto,
-        .{ context, command, &execution },
+        collect,
+        .{ context, command, execution },
     ) catch return error.ConcurrencyUnavailable;
     try work_result;
-    return execution.take();
+    return execution.term.?;
 }
 
-fn collectInto(context: *const Context, command: []const u8, execution: *Execution) !void {
-    execution.completed = try collect(context, command);
-}
-
-fn collect(context: *const Context, command: []const u8) !Completed {
+fn collect(context: *const Context, command: []const u8, execution: *Execution) !void {
     const io = context.io;
     const handles = try std.Io.Threaded.pipe2(.{ .CLOEXEC = true });
     const output_files = [2]std.Io.File{
@@ -207,19 +175,26 @@ fn collect(context: *const Context, command: []const u8) !Completed {
     defer output_files[0].close(io);
     pipe_owned = false;
 
-    var read_buffer: [4096]u8 = undefined;
+    var read_buffer: [read_buffer_bytes]u8 = undefined;
     var reader = std.Io.File.Reader.initStreaming(output_files[0], io, &read_buffer);
-    const output = reader.interface.allocRemaining(
-        context.gpa,
-        .limited(capture_bytes_max + 1),
-    ) catch |err| switch (err) {
-        error.ReadFailed => return reader.err orelse error.ReadFailed,
-        else => |other| return other,
-    };
-    errdefer context.gpa.free(output);
-    if (output.len > capture_bytes_max) return error.StreamTooLong;
-
-    return .{ .output = output, .term = try child.wait(io) };
+    // `peekGreedy` commits after one arrival, so a cancel or an overflow keeps
+    // every byte the pipe delivered before it. The direct routes (`stream`,
+    // `sendFile`, `readSliceShort`) fill a fixed destination across reads
+    // before they commit, and a cancel mid-fill takes the arrived bytes of
+    // that pass with it. The loop ends at end of stream or past the capture
+    // cap, so it is bounded.
+    while (execution.output.written().len <= capture_bytes_max) {
+        const chunk = reader.interface.peekGreedy(1) catch |err| switch (err) {
+            error.EndOfStream => {
+                execution.term = try child.wait(io);
+                return;
+            },
+            error.ReadFailed => return reader.err orelse error.ReadFailed,
+        };
+        try execution.output.writer.writeAll(chunk);
+        reader.interface.toss(chunk.len);
+    }
+    return error.StreamTooLong;
 }
 
 fn stopAndReap(
@@ -293,22 +268,42 @@ fn decodeAt(bytes: []const u8, index: usize) ?usize {
     return length;
 }
 
+/// How one command run ended. Every variant renders through the same path, so
+/// a stopped command keeps the measures a finished one reports.
+const Stop = union(enum) {
+    /// The command ended on its own, with this term.
+    completed: std.process.Child.Term,
+    /// The wall killed the command at this clamped limit, in milliseconds.
+    timed_out: u64,
+    /// The capture cap killed the command.
+    oversized,
+};
+
 /// Build the tool result: a truncation note when the tail was cut, the kept
 /// window, and a status line when the command failed.
 ///
 /// Every end state reports the same measures, so a command that exited with a
-/// non-zero code reads as a command that ran, not as a broken tool. The failure
-/// flag still reaches the model, and the box still marks it.
+/// non-zero code, or one that a limit killed, reads as a command that ran, not
+/// as a broken tool. The failure flag still reaches the model, and the box
+/// still marks it.
 fn render(
     gpa: std.mem.Allocator,
     output: []const u8,
     limits: *const Context.Bash,
-    term: std.process.Child.Term,
-    failed: bool,
+    stop: Stop,
     /// The wall-clock time the command ran. A long command is the one whose cost
     /// the user weighs, so the box reports it beside the exit status.
     elapsed_ms: i64,
 ) !Result {
+    const failed = switch (stop) {
+        .completed => |term| switch (term) {
+            .exited => |code| code != 0,
+            else => true,
+        },
+        // A killed command never completed its work, so the flag reaches the
+        // model even though the output above it stands.
+        .timed_out, .oversized => true,
+    };
     const start = tailStart(output, limits);
     const window = output[start..];
 
@@ -332,25 +327,47 @@ fn render(
         try result_writer.writer.writeAll("(No output)");
     if (failed) {
         if (result_writer.writer.buffered().len > 0) try result_writer.writer.writeAll("\n\n");
-        switch (term) {
-            .exited => |code| try result_writer.writer.print(
-                "[The command exited with code {d}.]",
-                .{code},
+        switch (stop) {
+            .completed => |term| switch (term) {
+                .exited => |code| try result_writer.writer.print(
+                    "[The command exited with code {d}.]",
+                    .{code},
+                ),
+                else => try result_writer.writer.writeAll(
+                    "[The command stopped before it completed.]",
+                ),
+            },
+            // The notice states the limit to the model, and the summary
+            // reports the run time instead.
+            .timed_out => |timeout_ms| {
+                var limit_buffer: [24]u8 = undefined;
+                try result_writer.writer.print("[The command timed out after {s}.]", .{
+                    format.duration(&limit_buffer, @intCast(timeout_ms)),
+                });
+            },
+            .oversized => try result_writer.writer.print(
+                "[The command produced more than {d} MB of output, so Drinky stopped it.]",
+                .{capture_bytes_max >> 20},
             ),
-            else => try result_writer.writer.writeAll("[The command stopped before it completed.]"),
         }
     }
     var summary_output: std.Io.Writer.Allocating = .init(gpa);
     errdefer summary_output.deinit();
-    var scale: [24]u8 = undefined;
+    var elapsed_buffer: [24]u8 = undefined;
     // The run time comes first, because the row above counted up to it and a
     // narrow window cuts the tail of this row.
-    try summary_output.writer.print("Time: {s}", .{format.duration(&scale, elapsed_ms)});
+    try summary_output.writer.print("Time: {s}", .{
+        format.duration(&elapsed_buffer, elapsed_ms),
+    });
     // `code` is the number the command returned. `Status` names a state instead,
     // so a killed command cannot read as one that exited.
-    switch (term) {
-        .exited => |code| try summary_output.writer.print(" · Exit code: {d}", .{code}),
-        else => try summary_output.writer.writeAll(" · Status: Terminated"),
+    switch (stop) {
+        .completed => |term| switch (term) {
+            .exited => |code| try summary_output.writer.print(" · Exit code: {d}", .{code}),
+            else => try summary_output.writer.writeAll(" · Status: Terminated"),
+        },
+        .timed_out => try summary_output.writer.writeAll(" · Status: Timed out"),
+        .oversized => try summary_output.writer.writeAll(" · Status: Output limit"),
     }
     // The line count names the whole output, not the tail the box keeps. A
     // command that printed nothing reports none, because a zero says less than
@@ -625,7 +642,8 @@ test "render summary discloses line and byte truncation" {
     const gpa = std.testing.allocator;
     {
         const limits: Context.Bash = .{ .lines_max = 2 };
-        const result = try render(gpa, "a\nb\nc\n", &limits, .{ .exited = 0 }, false, 1_500);
+        const result =
+            try render(gpa, "a\nb\nc\n", &limits, .{ .completed = .{ .exited = 0 } }, 1_500);
         defer result.deinit(gpa);
         try std.testing.expectEqualStrings(
             "Time: 1.5s · Exit code: 0 · Lines: 3 · Output: Truncated",
@@ -634,13 +652,69 @@ test "render summary discloses line and byte truncation" {
     }
     {
         const limits: Context.Bash = .{ .lines_max = 1000, .bytes_max = 4 };
-        const result = try render(gpa, "abcdef\n", &limits, .{ .exited = 0 }, false, 0);
+        const result =
+            try render(gpa, "abcdef\n", &limits, .{ .completed = .{ .exited = 0 } }, 0);
         defer result.deinit(gpa);
         try std.testing.expectEqualStrings(
-            "Time: 0.0s · Exit code: 0 · Lines: 1 · Output: Truncated",
+            "Time: 0ms · Exit code: 0 · Lines: 1 · Output: Truncated",
             result.summary.?.text,
         );
     }
+}
+
+// A killed command keeps the tail it printed. The output is the evidence of
+// where the time went, so the model does not retry blind.
+test "a timed-out command keeps its output and states the stop" {
+    const gpa = std.testing.allocator;
+    const context: Context = .{
+        .gpa = gpa,
+        .io = std.testing.io,
+        .bash = .{ .timeout_ms = Context.Bash.timeout_ms_min },
+    };
+    const result = try run(&context,
+        \\{"command":"echo started; sleep 5"}
+    );
+    defer result.deinit(gpa);
+    try std.testing.expect(result.is_error);
+    // The output stands first, and the notice closes the result. The separator
+    // between them belongs to the shared render path, which the exit-code
+    // tests pin.
+    try std.testing.expect(std.mem.startsWith(u8, result.content, "started\n"));
+    try std.testing.expectStringEndsWith(result.content, "[The command timed out after 1.0s.]");
+    try std.testing.expect(std.mem.startsWith(u8, result.summary.?.text, "Time: "));
+    try std.testing.expect(
+        std.mem.endsWith(u8, result.summary.?.text, " · Status: Timed out · Lines: 1"),
+    );
+}
+
+// The capture cap kills the flood but keeps the window before it, so the last
+// real step before the flood stays readable.
+test "an oversized command keeps its output tail and states the stop" {
+    const gpa = std.testing.allocator;
+    const context: Context = .{ .gpa = gpa, .io = std.testing.io };
+    var command_buf: [160]u8 = undefined;
+    const input = try std.fmt.bufPrint(
+        &command_buf,
+        "{{\"command\":\"echo marker; yes x | head -c {d}\"}}",
+        .{capture_bytes_max + (1 << 20)},
+    );
+    const result = try run(&context, input);
+    defer result.deinit(gpa);
+    try std.testing.expect(result.is_error);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.content,
+        "[The command produced more than 8 MB of output, so Drinky stopped it.]",
+    ) != null);
+    // The configured tail window keeps the flood, not the whole capture.
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "Drinky omitted") != null);
+    try std.testing.expect(std.mem.startsWith(u8, result.summary.?.text, "Time: "));
+    try std.testing.expect(
+        std.mem.indexOf(u8, result.summary.?.text, " · Status: Output limit · Lines: ") != null,
+    );
+    try std.testing.expect(
+        std.mem.endsWith(u8, result.summary.?.text, " · Output: Truncated"),
+    );
 }
 
 test "tailStart keeps the last lines within the line budget" {

@@ -64,6 +64,10 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - Searches skip common noise directories: version-control stores, dependency directories, and
   build caches. A path that ends with a skipped directory name searches it fully. An empty search
   names up to three skipped noise directories, except version-control stores.
+- `find` and `grep` run under a fixed 30-second timeout that neither a call nor the config changes.
+  A search checks the clock between filesystem steps.
+- A stopped search keeps the matches it found, and a stopped command keeps the tail of its output.
+  Each one states the stop, so the model can narrow the next call on evidence.
 - Binary files are skipped, oversized files are refused, and every result says when a limit cut it
   short.
 - A failing tool returns an error the model can read, and a cancel stops it at once.
@@ -226,17 +230,21 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
   and `Status: Streaming`. The count measures the arguments the model has sent. A call can wait,
   because a later call streams or an earlier call runs. It then keeps its count and reports
   `Status: Queued`. A window too narrow for the row cuts the status and keeps the count.
-- A running command adds a row with the time it has run and the timeout it runs under. The row names
-  the clamped limit, so it states the wait the command really takes. Every other tool runs under no
-  timeout, so its box keeps one row.
+- A running command or search adds a row with its elapsed time and timeout. A command names its
+  clamped timeout, and a search names its fixed timeout. Every other tool runs under no timeout, so
+  its box keeps one row.
 - A finished call keeps its call row and one line below it: a line of measures, or the sentence of a
   failure. A call with nothing to state, like `describe_config`, keeps the call row alone.
 - `read` reports `Lines: 42`, or `Lines: 594–648 of 2868` when a window cut the file. `write`
-  reports the lines it wrote, `edit` reports `Lines: -12 +8`, and `find` and `grep` report their
-  matches. Each line adds a qualifier, such as `Output: Truncated`, when a limit cut the result.
-- `bash` reports `Time: 0.4s · Exit code: 1 · Lines: 3`, and it names a timeout or a kill as
-  `Status:` in place of the code. A non-zero exit takes no `Error:` prefix, because the line names
-  its own state. The box still paints the failure, and the model still reads the result as one.
+  reports the lines it wrote, `edit` reports `Lines: -12 +8`, and `find` and `grep` report
+  `Time: 420ms · Matches: 3`. Each line adds one qualifier for every bound that cut the result,
+  such as `Output: Truncated` or `Search: Timed out`.
+- `bash` reports `Time: 420ms · Exit code: 1 · Lines: 3`, and it names a timeout or a kill as
+  `Status:` in place of the code. A stopped command keeps the tail of its output below the same
+  measures. A non-zero exit takes no `Error:` prefix, because the line names its own state. The box
+  still paints the failure, and the model still reads the result as one.
+- Every span in the interface takes one shape: whole milliseconds below a second, then seconds to
+  one decimal, then whole minutes and seconds.
 - Every box row starts at the first column, like an editor row and a reasoning row, so a terminal
   copy of them lines up. An indent appears only where it groups rows under a head, as in a markdown
   list.

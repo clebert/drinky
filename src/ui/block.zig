@@ -204,7 +204,7 @@ test "each entry variant renders exactly the rows it counts" {
         .{
             .kind = .tool_result,
             .options = .{ .is_error = true },
-            .text = "Tool: bash · Command: ls\nTime: 0.4s · Exit code: 1",
+            .text = "Tool: bash · Command: ls\nTime: 400ms · Exit code: 1",
         },
         // A call whose tool decided no box line is the call row alone.
         .{ .kind = .tool_result, .options = .{}, .text = "Tool: describe_config" },

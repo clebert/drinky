@@ -106,13 +106,20 @@ test lines {
     try std.testing.expectEqual(@as(usize, 2), lines("a\n\n"));
 }
 
-/// A compact wall-clock span: seconds to one decimal below a minute, else whole
-/// minutes and seconds. Integer math throughout. `buffer` needs two dozen bytes,
-/// because a span of many minutes prints every digit of its minute count. A
-/// negative span reads as zero, so a clock that steps backward cannot print a
-/// span that runs the wrong way.
+/// A compact wall-clock span: whole milliseconds below a second, seconds to one
+/// decimal below a minute, else whole minutes and seconds. Integer math
+/// throughout. `buffer` needs two dozen bytes, because a span of many minutes
+/// prints every digit of its minute count. A negative span reads as zero, so a
+/// clock that steps backward cannot print a span that runs the wrong way.
+///
+/// Every span in the interface takes this one shape, so no two spans read in
+/// two vocabularies. Each tier measures in a unit that its spans fill: a search
+/// that ends in 42 milliseconds states that span, rather than the `0.0s` that
+/// tenths alone can offer it.
 pub fn duration(buffer: []u8, milliseconds: i64) []const u8 {
     const total: u64 = @intCast(@max(milliseconds, 0));
+    if (total < std.time.ms_per_s)
+        return std.fmt.bufPrint(buffer, "{d}ms", .{total}) catch unreachable;
     if (total < std.time.ms_per_min) {
         const tenths = @divFloor(total, 100);
         return std.fmt.bufPrint(buffer, "{d}.{d}s", .{
@@ -129,14 +136,19 @@ pub fn duration(buffer: []u8, milliseconds: i64) []const u8 {
 
 test duration {
     var buffer: [24]u8 = undefined;
-    try std.testing.expectEqualStrings("0.0s", duration(&buffer, 0));
-    try std.testing.expectEqualStrings("0.4s", duration(&buffer, 450));
+    try std.testing.expectEqualStrings("0ms", duration(&buffer, 0));
+    try std.testing.expectEqualStrings("42ms", duration(&buffer, 42));
+    try std.testing.expectEqualStrings("450ms", duration(&buffer, 450));
+    // Each tier ends where the next one carries the same digits, so no span
+    // reads in two shapes and no shape loses a digit at its edge.
+    try std.testing.expectEqualStrings("999ms", duration(&buffer, 999));
+    try std.testing.expectEqualStrings("1.0s", duration(&buffer, 1_000));
     try std.testing.expectEqualStrings("41.6s", duration(&buffer, 41_600));
     try std.testing.expectEqualStrings("59.9s", duration(&buffer, 59_999));
     try std.testing.expectEqualStrings("1m 0s", duration(&buffer, 60_000));
     try std.testing.expectEqualStrings("2m 5s", duration(&buffer, 125_400));
     // A backward clock step reads as no time at all, never as a negative span.
-    try std.testing.expectEqualStrings("0.0s", duration(&buffer, -1));
+    try std.testing.expectEqualStrings("0ms", duration(&buffer, -1));
 }
 
 test bytes {

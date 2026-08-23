@@ -18,6 +18,7 @@ const find = @import("find.zig");
 const grep = @import("grep.zig");
 const bash = @import("bash.zig");
 const describe_config = @import("describe_config.zig");
+const search = @import("search.zig");
 
 /// The window of one `read` call: a file inside both bounds comes back whole.
 /// The skill scan holds a skill file below it, so one call can put the whole
@@ -41,11 +42,43 @@ const Entry = struct {
     /// other path in the interface reads. A pattern and a command are not paths,
     /// and a shortened one means something else.
     subject_is_path: bool = false,
-    /// The argument that overrides the wall-clock timeout of a call, in seconds.
-    /// Empty when the tool runs under no timeout. A tool with a timeout can run
-    /// long enough that the user weighs whether to cancel it, so its row reports
-    /// how long it has run and how long it can run.
-    timeout: []const u8 = "",
+    /// Where the wall-clock timeout of a call comes from. A tool with a timeout
+    /// can run long enough that the user weighs whether to cancel it, so its row
+    /// reports how long it has run and how long it can run.
+    timeout: Timeout = .none,
+
+    /// The source of the wall-clock timeout that one tool runs under.
+    const Timeout = union(enum) {
+        /// The tool runs under no timeout, so its row reports no time.
+        none,
+        /// The host configures the timeout, and the named argument overrides it
+        /// per call, in seconds.
+        argument: []const u8,
+        /// The tool holds one built-in timeout, in milliseconds, and no call
+        /// changes it.
+        fixed: u64,
+
+        /// The timeout of a call whose argument list states no override. Null
+        /// when the tool runs under no timeout at all.
+        fn defaultMs(self: Timeout, configured_ms: u64) ?u64 {
+            return switch (self) {
+                .none => null,
+                // The configured value comes from a file the user writes, so it
+                // takes the same clamp the argument takes.
+                .argument => Context.Bash.clampTimeoutMs(configured_ms),
+                .fixed => |fixed_ms| fixed_ms,
+            };
+        }
+
+        /// The argument that overrides the timeout, or null when no call can
+        /// change it.
+        fn argumentName(self: Timeout) ?[]const u8 {
+            return switch (self) {
+                .argument => |name| name,
+                else => null,
+            };
+        }
+    };
 };
 
 const registry = [_]Entry{
@@ -79,6 +112,7 @@ const registry = [_]Entry{
         .mutates = false,
         .subject = "pattern",
         .subject_label = "Pattern",
+        .timeout = .{ .fixed = search.timeout_ms },
     },
     .{
         .tool = grep.spec,
@@ -86,6 +120,7 @@ const registry = [_]Entry{
         .mutates = false,
         .subject = "pattern",
         .subject_label = "Pattern",
+        .timeout = .{ .fixed = search.timeout_ms },
     },
     .{
         .tool = bash.spec,
@@ -93,7 +128,7 @@ const registry = [_]Entry{
         .mutates = true,
         .subject = "command",
         .subject_label = "Command",
-        .timeout = "timeout_seconds",
+        .timeout = .{ .argument = "timeout_seconds" },
     },
     .{ .tool = describe_config.spec, .run = describe_config.run, .mutates = false },
 };
@@ -153,10 +188,11 @@ pub const Call = struct {
 /// An unknown tool, an unparsable list, and a missing subject all fall back to
 /// the empty subject, so a caller always has a row to draw.
 ///
-/// A call can override the configured timeout, so this reads that argument and
-/// falls back to `default_timeout_ms`. Both take the clamp the tool applies, so
-/// the row states the limit the command really runs under. An absurd number from
-/// a model or a config file therefore cannot overflow the display below it.
+/// A `bash` call can override the configured timeout, so this reads that
+/// argument and falls back to `default_timeout_ms`. Both take the clamp the tool
+/// applies, so the row states the limit the command really runs under. An absurd
+/// number from a model or a config file therefore cannot overflow the display
+/// below it. A search holds its own built-in timeout, which no call changes.
 pub fn describe(
     gpa: std.mem.Allocator,
     name: []const u8,
@@ -167,14 +203,16 @@ pub fn describe(
     const entry = for (registry) |candidate| {
         if (std.mem.eql(u8, name, candidate.tool.name)) break candidate;
     } else return unnamed(gpa, null);
-    if (entry.subject.len == 0 and entry.timeout.len == 0) return unnamed(gpa, null);
+    const default_ms = entry.timeout.defaultMs(default_timeout_ms);
+    // A tool with no subject and no timeout has nothing to read arguments for.
+    if (entry.subject.len == 0 and default_ms == null) return unnamed(gpa, null);
 
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
     // An argument list the model cut short still runs under the configured
     // timeout once it completes.
     const parsed = (try json.parseObject(arena.allocator(), input_json)) orelse
-        return unnamed(gpa, defaultTimeoutMs(&entry, default_timeout_ms));
+        return unnamed(gpa, default_ms);
 
     const timeout_ms = readTimeoutMs(&entry, &parsed, default_timeout_ms);
     if (entry.subject.len == 0) return unnamed(gpa, timeout_ms);
@@ -221,23 +259,16 @@ fn unnamed(gpa: std.mem.Allocator, timeout_ms: ?u64) !Call {
     return .{ .label = "", .subject = try gpa.dupe(u8, ""), .timeout_ms = timeout_ms };
 }
 
-/// The timeout of a tool whose argument list gave no override, held inside the
-/// legal window. The configured value comes from a file the user writes, so it
-/// takes the same clamp the argument does.
-fn defaultTimeoutMs(entry: *const Entry, default_timeout_ms: u64) ?u64 {
-    if (entry.timeout.len == 0) return null;
-    return Context.Bash.clampTimeoutMs(default_timeout_ms);
-}
-
 fn readTimeoutMs(
     entry: *const Entry,
     parsed: *const std.json.ObjectMap,
     default_timeout_ms: u64,
 ) ?u64 {
-    if (entry.timeout.len == 0) return null;
+    const default_ms = entry.timeout.defaultMs(default_timeout_ms);
+    const argument = entry.timeout.argumentName() orelse return default_ms;
     // An absent argument, and a null one, both leave the configured timeout.
-    const raw = parsed.get(entry.timeout) orelse return defaultTimeoutMs(entry, default_timeout_ms);
-    if (raw == .null) return defaultTimeoutMs(entry, default_timeout_ms);
+    const raw = parsed.get(argument) orelse return default_ms;
+    if (raw == .null) return default_ms;
     // A value the typed parse rejects makes the call fail before it runs, so no
     // timeout applies to it. Reporting one states a wait for a call that never
     // starts. The two parses must agree on which values those are, or the row
@@ -432,6 +463,14 @@ test "a described call reports the timeout it runs under" {
             .input = "{\"command\":\"true\",\"timeout_seconds\":0}",
             .expected = Context.Bash.timeout_ms_min,
         },
+        // A search holds its own timeout, and no argument of a call changes it.
+        .{ .name = "find", .input = "{\"pattern\":\"*.zig\"}", .expected = search.timeout_ms },
+        .{
+            .name = "grep",
+            .input = "{\"pattern\":\"x\",\"timeout_seconds\":5}",
+            .expected = search.timeout_ms,
+        },
+        // Every other tool ends on its own, so its row states no wait.
         .{ .name = "read", .input = "{\"path\":\"a\"}", .expected = null },
         .{ .name = "nonesuch", .input = "{}", .expected = null },
         // An argument list the model cut short still yields the configured timeout.

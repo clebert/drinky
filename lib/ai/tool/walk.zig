@@ -2,11 +2,14 @@
 //! path matches a glob. Skips noise directories: version-control stores,
 //! dependency directories, and build caches. A base whose final non-dot
 //! component names a noise directory turns the filter off. An explicit search
-//! then sees every file. Shared by the `find` and `grep` tools.
+//! then sees every file. Shared by the `find` and `grep` tools, which give the
+//! walk the timer of their search, so a walk that runs too long stops itself
+//! and keeps the matches it found.
 
 const std = @import("std");
 
 const glob = @import("glob.zig");
+const search = @import("search.zig");
 
 /// Version-control stores are noise, but an empty search never suggests them.
 const version_control_directories = [_][]const u8{
@@ -85,6 +88,10 @@ pub const Options = struct {
     pattern: []const u8,
     retain: usize,
     entries_max: usize = entries_visited_max,
+    /// The wall-clock timer of the search, or null when `entries_max` alone
+    /// bounds the walk. The walk checks this timeout after filesystem steps. A
+    /// stopped walk reports the bound and keeps the matches that it found.
+    timer: ?search.Timer = null,
 };
 
 const NoisePruning = enum { disabled, enabled };
@@ -94,16 +101,25 @@ pub const Match = struct {
     /// The lexicographically-smallest matches, sorted ascending, at most
     /// `retain` of them.
     paths: [][]const u8,
-    /// The total matches seen. This is a lower bound when `capped`, since the
-    /// walk stopped early. `matched > paths.len` means the walk found matches
-    /// that it did not retain.
+    /// The total matches seen. This is a lower bound when a bound stopped the
+    /// walk, since the walk ended early. `matched > paths.len` means the walk
+    /// found matches that it did not retain.
     matched: usize,
-    /// Whether the walk stopped at its entry-visit cap (`entries_max`) before
-    /// it exhausted the tree, so `paths` depends on filesystem enumeration
-    /// order and is incomplete.
-    capped: bool,
+    /// What ended the walk. A walk that a bound stopped leaves `paths` dependent
+    /// on filesystem enumeration order, so its result is incomplete.
+    stop: Stop,
     /// The reportable noise directory names that this walk skipped.
     skipped_noise: SkippedNoise,
+
+    /// What ended one walk.
+    pub const Stop = enum {
+        /// The walk exhausted the tree, so it retained every match it could.
+        none,
+        /// The walk reached its entry-visit cap (`entries_max`).
+        entries,
+        /// The search ran out of time.
+        time,
+    };
 
     pub const SkippedNoise = struct {
         names: []const []const u8,
@@ -162,10 +178,12 @@ pub const Match = struct {
 
 /// The lexicographically-smallest matches under `options.base` whose
 /// base-relative path matches `options.pattern`, sorted, each relative to the
-/// working directory. `options.retain` bounds memory (the walk merely counts
-/// the total), and `options.entries_max` bounds time. The walk skips unreadable
-/// directories. Cancellation stops the walk at once. Every exit releases every
-/// directory handle and retained path.
+/// working directory. `options.retain` bounds memory, and
+/// `options.entries_max` bounds the entries processed. `options.timer` adds a
+/// timeout. A walk that reaches either bound returns the matches it retained
+/// and names the bound. The walk skips unreadable directories.
+/// Cancellation stops the walk at once. Every exit releases every directory
+/// handle and retained path.
 pub fn collect(io: std.Io, gpa: std.mem.Allocator, options: *const Options) !Match {
     // A base that ends in a noise name aims the walk inside that directory.
     // Disable pruning because package managers can nest one noise directory
@@ -199,21 +217,30 @@ fn collectWithNoisePruning(
     var noise_skipped: [noise_directories.len]bool = @splat(false);
     const at_root = std.mem.eql(u8, options.base, ".");
     var visited: usize = 0;
-    var capped = false;
+    var stop: Match.Stop = .none;
     while (true) {
         const entry = (walker.next(io) catch |err| switch (err) {
-            // Cancellation aborts the turn, so stop the walk at once. The walk
-            // is one-shot, and a resume does real traversal I/O. Any other
-            // iteration error skips the bad directory (the walker has already
-            // closed it) and keeps the walk resilient.
-            error.Canceled => return err,
+            // Cancellation aborts the turn, so stop the walk at once. An
+            // allocation failure can happen after the iterator consumed an
+            // entry without closing its directory, so it must also propagate
+            // instead of bypassing every bound through repeated failures. Any
+            // other iteration error skips the bad directory (the walker has
+            // already closed it) and keeps the walk resilient.
+            error.Canceled, error.OutOfMemory => return err,
             else => continue,
         }) orelse break;
         // Stop only once a further entry proves the tree is not exhausted. The
         // walk then does not falsely flag a tree with exactly `entries_max`
         // entries.
         if (visited >= options.entries_max) {
-            capped = true;
+            stop = .entries;
+            break;
+        }
+        // Preserve the first entry even when the clock is already spent, so a
+        // stopped search still retains evidence.
+        const out_of_time = visited > 0 and if (options.timer) |timer| timer.spent() else false;
+        if (out_of_time) {
+            stop = .time;
             break;
         }
         visited += 1;
@@ -230,7 +257,9 @@ fn collectWithNoisePruning(
                     }
                 }
                 walker.enter(io, entry) catch |err| switch (err) {
-                    error.Canceled => return err,
+                    // The walker can allocate while it adds this directory to
+                    // its stack. Never turn that failure into a skipped tree.
+                    error.Canceled, error.OutOfMemory => return err,
                     else => {},
                 };
             },
@@ -252,7 +281,7 @@ fn collectWithNoisePruning(
     return .{
         .paths = try keeper.toOwnedSorted(gpa),
         .matched = keeper.matched,
-        .capped = capped,
+        .stop = stop,
         .skipped_noise = skipped_noise,
     };
 }
@@ -335,6 +364,10 @@ fn lessThan(_: void, a: []const u8, b: []const u8) bool {
 // Wraps a real io. It fails one directory syscall once (cancellation is
 // one-shot), then counts the traversal opens and reads that follow. The
 // open/close balance proves the walk released every opened handle.
+//
+// `io` replaces the backend userdata with this double, so only the vtable
+// functions overridden below are safe to call. A test that needs another one
+// adds a delegating proxy for it.
 const FaultyIo = struct {
     backend: std.Io,
     vtable: std.Io.VTable,
@@ -479,6 +512,61 @@ test "collect skips an unreadable directory and keeps walking" {
     try std.testing.expectEqual(@as(usize, 0), faulty.open_handles);
 }
 
+// The walker allocates after it consumes a directory entry. An allocation
+// failure must propagate, or repeated failures can bypass both walk bounds.
+test "collect propagates an allocation failure from the walker" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "one.txt", .data = "hit\n" });
+    var base_buf: [128]u8 = undefined;
+    const base = try std.fmt.bufPrint(&base_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+
+    // The walker's stack takes the first allocation. Its path buffer takes the
+    // second allocation, after the iterator consumed `one.txt`.
+    var failing: std.testing.FailingAllocator =
+        .init(std.testing.allocator, .{ .fail_index = 1 });
+    try std.testing.expectError(error.OutOfMemory, collect(
+        io,
+        failing.allocator(),
+        &.{ .base = base, .pattern = "**", .retain = 1000 },
+    ));
+    try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+}
+
+fn collectUnderAllocationFailure(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    base: []const u8,
+) !void {
+    var matches = try collect(
+        io,
+        gpa,
+        &.{ .base = base, .pattern = "**", .retain = 1000 },
+    );
+    defer matches.deinit(gpa);
+}
+
+// A deep tree forces the walker to grow its directory stack in `enter`. Every
+// allocation failure must propagate and release all open directories.
+test "collect propagates every allocation failure from a deep walk" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const deep_path = "d/" ** 32 ++ "leaf";
+    var leaf = try tmp.dir.createDirPathOpen(io, deep_path, .{});
+    defer leaf.close(io);
+    try leaf.writeFile(io, .{ .sub_path = "one.txt", .data = "hit\n" });
+    var base_buf: [128]u8 = undefined;
+    const base = try std.fmt.bufPrint(&base_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        collectUnderAllocationFailure,
+        .{ io, base },
+    );
+}
+
 fn makeTree(io: std.Io, dir: std.Io.Dir, counts: struct { dirs: usize, files: usize }) !void {
     for (0..counts.dirs) |d| {
         var name_buf: [16]u8 = undefined;
@@ -512,7 +600,7 @@ test "collect retains only the smallest matches and counts the rest" {
 
     try std.testing.expectEqual(@as(usize, 200), matches.matched);
     try std.testing.expectEqual(@as(usize, 5), matches.paths.len);
-    try std.testing.expect(!matches.capped);
+    try std.testing.expectEqual(Match.Stop.none, matches.stop);
     try std.testing.expect(std.mem.endsWith(u8, matches.paths[0], "/d000/f000.txt"));
     try std.testing.expect(std.mem.endsWith(u8, matches.paths[4], "/d000/f004.txt"));
 }
@@ -535,9 +623,59 @@ test "collect stops at the entry-visit work cap" {
     });
     defer matches.deinit(std.testing.allocator);
 
-    try std.testing.expect(matches.capped);
+    try std.testing.expectEqual(Match.Stop.entries, matches.stop);
     try std.testing.expect(matches.matched < 200);
     try std.testing.expect(matches.paths.len <= 10);
+}
+
+// The walk polls the search timer after each step. It keeps the matches found
+// before the clock stops a further step.
+test "collect stops when the search runs out of time" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try makeTree(io, tmp.dir, .{ .dirs = 20, .files = 10 });
+    var base_buf: [128]u8 = undefined;
+    const base = try std.fmt.bufPrint(&base_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+
+    // A search that started a whole timeout ago is out of time at its first
+    // check. The walk still takes one step, so it stops on the second entry.
+    var matches = try collect(io, std.testing.allocator, &.{
+        .base = base,
+        .pattern = "**",
+        .retain = 1000,
+        .timer = .startedAgo(io, search.timeout_ms),
+    });
+    defer matches.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(Match.Stop.time, matches.stop);
+    try std.testing.expect(matches.matched < 200);
+}
+
+// A walk of one entry alone read the whole tree, so no bound stopped it. A stop
+// states that a further entry waited, and a spent clock cannot invent one.
+test "collect reports no stop for a tree it read whole" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "only.txt", .data = "hit\n" });
+    var base_buf: [128]u8 = undefined;
+    const base = try std.fmt.bufPrint(&base_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+
+    var matches = try collect(io, std.testing.allocator, &.{
+        .base = base,
+        .pattern = "**",
+        .retain = 1000,
+        .timer = .startedAgo(io, search.timeout_ms),
+    });
+    defer matches.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(Match.Stop.none, matches.stop);
+    try std.testing.expectEqual(@as(usize, 1), matches.paths.len);
 }
 
 test "baseNamesNoise only accepts the final path component" {

@@ -83,7 +83,7 @@ const StreamedTool = struct {
     }
 
     fn refresh(self: *StreamedTool, gpa: std.mem.Allocator) !void {
-        var scale: [16]u8 = undefined;
+        var bytes_buffer: [16]u8 = undefined;
         self.box.clearRetainingCapacity();
         // The count comes before the phase, because a narrow window cuts the
         // tail of the row. The count is the field that reports progress, so the
@@ -92,7 +92,7 @@ const StreamedTool = struct {
         // the count.
         try self.box.print(gpa, "Tool: {s} · Received: {s} · Status: {s}", .{
             self.name,
-            ai.format.bytes(&scale, self.bytes),
+            ai.format.bytes(&bytes_buffer, self.bytes),
             switch (self.phase) {
                 .streaming => "Streaming",
                 // Both waiting phases read the same. They differ in how long the
@@ -269,17 +269,17 @@ const ActiveTool = struct {
     /// its two rows, because the time it has run changes between frames.
     fn text(self: *ActiveTool, gpa: std.mem.Allocator, now_ms: i64) ![]const u8 {
         const timeout_ms = self.timeout_ms orelse return self.box;
-        var elapsed: [24]u8 = undefined;
-        var allowed: [24]u8 = undefined;
+        var elapsed_buffer: [24]u8 = undefined;
+        var limit_buffer: [24]u8 = undefined;
         // Every timeout arrives clamped, so it always fits a signed span and the
         // row always names a real wait.
-        const limit = ai.format.duration(&allowed, @intCast(timeout_ms));
+        const limit = ai.format.duration(&limit_buffer, @intCast(timeout_ms));
         self.rows.clearRetainingCapacity();
         // `Time` names the same measure the finished box reports, so a call does
         // not rename its own run time when it ends.
         try self.rows.print(gpa, "{s}\nTime: {s} · Timeout: {s}", .{
             self.box,
-            ai.format.duration(&elapsed, now_ms - self.started_ms),
+            ai.format.duration(&elapsed_buffer, now_ms - self.started_ms),
             limit,
         });
         return self.rows.items;
@@ -1439,7 +1439,7 @@ fn applyFinishedToolRound(session: *Session) !void {
         .progress_sequence_committed = 1,
         .payload = .{ .tool_result = .{
             .name = try gpa.dupe(u8, "bash"),
-            .summary = .{ .text = try gpa.dupe(u8, "Time: 0.0s · Exit code: 0") },
+            .summary = .{ .text = try gpa.dupe(u8, "Time: 0ms · Exit code: 0") },
             .is_error = false,
         } },
     });
@@ -1925,7 +1925,7 @@ test "a failed tool result that states measures takes no prefix" {
     try applyEvent(&session, 1, .{ .tool_result = .{
         .name = try gpa.dupe(u8, "bash"),
         .summary = .{
-            .text = try gpa.dupe(u8, "Time: 0.4s · Exit code: 1 · Lines: 1"),
+            .text = try gpa.dupe(u8, "Time: 400ms · Exit code: 1 · Lines: 1"),
             .kind = .measures,
         },
         .is_error = true,
@@ -1936,7 +1936,7 @@ test "a failed tool result that states measures takes no prefix" {
     try std.testing.expectEqual(@as(usize, 1), blocks.len);
     try std.testing.expect(blocks[0].tool_result.is_error);
     try std.testing.expectEqualStrings(
-        "Tool: bash · Command: ls missing\nTime: 0.4s · Exit code: 1 · Lines: 1",
+        "Tool: bash · Command: ls missing\nTime: 400ms · Exit code: 1 · Lines: 1",
         blocks[0].tool_result.text.items,
     );
     try std.testing.expectEqual(ui.paint.Fit.head, blocks[0].tool_result.fit);
@@ -2873,7 +2873,7 @@ test "a finished tool block survives a cancel in the same round" {
     try std.testing.expectEqual(@as(usize, 4), blocks.len);
     try std.testing.expect(!blocks[2].tool_result.is_error);
     try std.testing.expect(
-        std.mem.endsWith(u8, blocks[2].tool_result.text.items, "\nTime: 0.0s · Exit code: 0"),
+        std.mem.endsWith(u8, blocks[2].tool_result.text.items, "\nTime: 0ms · Exit code: 0"),
     );
     try std.testing.expectEqualStrings("You canceled the turn.", blocks[3].event.text.items);
 }
@@ -2911,7 +2911,7 @@ test "a finished tool block survives a failure in the same round" {
     try std.testing.expectEqual(@as(usize, 4), blocks.len);
     try std.testing.expect(!blocks[2].tool_result.is_error);
     try std.testing.expect(
-        std.mem.endsWith(u8, blocks[2].tool_result.text.items, "\nTime: 0.0s · Exit code: 0"),
+        std.mem.endsWith(u8, blocks[2].tool_result.text.items, "\nTime: 0ms · Exit code: 0"),
     );
     try std.testing.expectEqualStrings("boom", blocks[3].event.text.items);
 }
@@ -3079,6 +3079,34 @@ test "a running command reports its run time against its timeout" {
     );
 }
 
+// A search reaches a tree that nobody measured first, so it can run long enough
+// that the user weighs a cancel. Its row counts the same way a command row does.
+test "a running search reports its run time against its timeout" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    defer session.deinit();
+    // A search holds its own timeout, so the configured command timeout cannot
+    // reach this row.
+    session.bash_timeout_ms = 120_000;
+    session.beginTurn(1);
+
+    session.clock_ms = 2_000;
+    try applyEvent(&session, 1, .{ .tool_start = .{
+        .name = try gpa.dupe(u8, "grep"),
+        .input_json = try gpa.dupe(u8, "{\"pattern\":\"columns\"}"),
+    } });
+
+    session.clock_ms = 6_500;
+    try session.paint(.{ .columns = 60, .rows = 24 });
+    const painted = out.written();
+    try std.testing.expect(std.mem.indexOf(u8, painted, "Tool: grep · Pattern: columns") != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, painted, "Time: 4.5s · Timeout: 30.0s") != null,
+    );
+}
+
 // A call that names its own timeout reports that one, not the configured
 // default, or the row tells the user to expect the wrong wait.
 test "a command that names its own timeout reports it" {
@@ -3098,7 +3126,7 @@ test "a command that names its own timeout reports it" {
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "Timeout: 5.0s") != null);
 }
 
-// Every other tool finishes promptly, so its box stays one row and reports no
+// Every other tool ends on its own, so its box stays one row and reports no
 // timeout it does not run under.
 test "a tool without a timeout keeps one row" {
     const gpa = std.testing.allocator;
@@ -3181,7 +3209,7 @@ test "a command that asks for no limit reports the smallest one" {
     session.clock_ms = 500;
     try session.paint(.{ .columns = 60, .rows = 24 });
     try std.testing.expect(
-        std.mem.indexOf(u8, out.written(), "Time: 0.5s · Timeout: 1.0s") != null,
+        std.mem.indexOf(u8, out.written(), "Time: 500ms · Timeout: 1.0s") != null,
     );
 }
 
