@@ -61,7 +61,9 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - That proof is the conversation itself, so a resumed conversation proves itself. A read of its
   `SKILL.md` and a `/skill:name` line both count as the proof.
 - Globs use `*` and `?` within a path segment and `**` across segments.
-- Searches skip version-control and build directories.
+- Searches skip common noise directories: version-control stores, dependency directories, and
+  build caches. A path that ends with a skipped directory name searches it fully. An empty search
+  names up to three skipped noise directories, except version-control stores.
 - Binary files are skipped, oversized files are refused, and every result says when a limit cut it
   short.
 - A failing tool returns an error the model can read, and a cancel stops it at once.

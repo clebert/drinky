@@ -23,7 +23,9 @@ pub const spec: llm.Tool = .{
     .name = "grep",
     .description = "Search file contents for a literal substring (not a regex). " ++
         "Returns matching lines as 'path:line:text', with paths relative to the working " ++
-        "directory. Ignores .git, zig-out, and build cache directories.",
+        "directory. Skips common version-control stores, dependency directories, virtual " ++
+        "environments, build outputs, and tool caches. A path that ends with a skipped " ++
+        "directory name searches it fully.",
     .parameters = &.{
         .{
             .name = "pattern",
@@ -90,7 +92,7 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
     var files_incomplete = false;
     var maybe_match: ?walk.Match = null;
     defer if (maybe_match) |*match| match.deinit(gpa);
-    if (walk.collect(context.io, gpa, .{
+    if (walk.collect(context.io, gpa, &.{
         .base = base,
         .pattern = file_glob,
         .retain = files_max,
@@ -175,6 +177,12 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
             );
         } else {
             try out.writer.print("Drinky found no matches for {s}.", .{pattern});
+        }
+        if (maybe_match) |*match| {
+            if (!match.skipped_noise.isEmpty()) {
+                try out.writer.writeAll(" ");
+                try match.skipped_noise.writeNotice(&out.writer);
+            }
         }
     } else if (line_capped) {
         try out.writer.print(
@@ -443,6 +451,32 @@ test "grep reports no matches of a complete search" {
     defer result.deinit(gpa);
     try std.testing.expect(!result.is_error);
     try std.testing.expectEqualStrings("Drinky found no matches for miss.", result.content);
+    try std.testing.expectEqualStrings("Matches: 0", result.summary.?.text);
+}
+
+test "grep reports skipped noise after an empty search" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const context: Context = .{ .gpa = gpa, .io = io };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dependency = try tmp.dir.createDirPathOpen(io, "node_modules/pkg", .{});
+    defer dependency.close(io);
+    try dependency.writeFile(io, .{ .sub_path = "ignored.txt", .data = "needle\n" });
+    var input_buf: [128]u8 = undefined;
+    const input = try std.fmt.bufPrint(&input_buf,
+        \\{{"pattern":"needle","path":".zig-cache/tmp/{s}"}}
+    , .{tmp.sub_path});
+
+    const result = try run(&context, input);
+    defer result.deinit(gpa);
+
+    try std.testing.expect(!result.is_error);
+    try std.testing.expectEqualStrings(
+        "Drinky found no matches for needle. Drinky skipped these noise directories: " ++
+            "`node_modules`. Set the path to a skipped directory to search that directory fully.",
+        result.content,
+    );
     try std.testing.expectEqualStrings("Matches: 0", result.summary.?.text);
 }
 

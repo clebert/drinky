@@ -14,8 +14,9 @@ pub const spec: llm.Tool = .{
     .name = "find",
     .description = "Find files by glob pattern. Returns paths relative to the working " ++
         "directory, one per line. The pattern matches the whole path and * and ? never " ++
-        "cross '/', so use a '**/' prefix to recurse. Ignores .git, zig-out, and build " ++
-        "cache directories.",
+        "cross '/', so use a '**/' prefix to recurse. Skips common version-control stores, " ++
+        "dependency directories, virtual environments, build outputs, and tool caches. " ++
+        "A path that ends with a skipped directory name searches it fully.",
     .parameters = &.{
         .{
             .name = "pattern",
@@ -50,7 +51,7 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
     const base = parsed.value.path;
     const limit = parsed.value.limit;
 
-    var matches = walk.collect(context.io, gpa, .{
+    var matches = walk.collect(context.io, gpa, &.{
         .base = base,
         .pattern = pattern,
         .retain = limit,
@@ -91,6 +92,10 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
             "[Drinky omitted {d} matches. Increase limit to see them.]",
             .{matches.matched - shown},
         );
+    }
+    if (matches.matched == 0 and !matches.skipped_noise.isEmpty()) {
+        try out.writer.writeAll(" ");
+        try matches.skipped_noise.writeNotice(&out.writer);
     }
 
     var summary_output: std.Io.Writer.Allocating = .init(gpa);
@@ -169,5 +174,34 @@ test "find reports when no files match" {
     try std.testing.expectEqualStrings("No files match *.md.", result.content);
     // An empty search still states its count, so the box reads like every other
     // result of this tool.
+    try std.testing.expectEqualStrings("Matches: 0", result.summary.?.text);
+}
+
+test "find reports skipped noise after an empty search" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const context: Context = .{ .gpa = gpa, .io = io };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dependency = try tmp.dir.createDirPathOpen(io, "node_modules/pkg", .{});
+    defer dependency.close(io);
+    try dependency.writeFile(io, .{ .sub_path = "ignored.md", .data = "" });
+    var repository = try tmp.dir.createDirPathOpen(io, ".git/objects", .{});
+    defer repository.close(io);
+    try repository.writeFile(io, .{ .sub_path = "ignored.md", .data = "" });
+    var input_buf: [128]u8 = undefined;
+    const input = try std.fmt.bufPrint(&input_buf,
+        \\{{"pattern":"**/*.md","path":".zig-cache/tmp/{s}"}}
+    , .{tmp.sub_path});
+
+    const result = try run(&context, input);
+    defer result.deinit(gpa);
+
+    try std.testing.expect(!result.is_error);
+    try std.testing.expectEqualStrings(
+        "No files match **/*.md. Drinky skipped these noise directories: `node_modules`. " ++
+            "Set the path to a skipped directory to search that directory fully.",
+        result.content,
+    );
     try std.testing.expectEqualStrings("Matches: 0", result.summary.?.text);
 }

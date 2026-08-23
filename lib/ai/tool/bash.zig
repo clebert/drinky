@@ -25,7 +25,10 @@ pub const spec: llm.Tool = .{
     .description = "Run a bash command in the working directory and return its combined " ++
         "stdout and stderr. Output is truncated to a bounded tail, and a non-zero exit is " ++
         "reported. Give an optional timeout in seconds; the default comes from configuration. " ++
-        "Drinky has no web tool, so a network request also runs through this tool.",
+        "Drinky has no web tool, so a network request also runs through this tool. " ++
+        "Use the find and grep tools for normal file discovery and literal content searches. " ++
+        "They skip noise directories and save time. Use this tool when they cannot express " ++
+        "the search. Keep a recursive search narrow.",
     .parameters = &.{
         .{
             .name = "command",

@@ -1,16 +1,93 @@
 //! Walks a directory tree and collects the regular files whose base-relative
-//! path matches a glob. Skips version-control and build-cache directories.
-//! Shared by the `find` and `grep` tools.
+//! path matches a glob. Skips noise directories: version-control stores,
+//! dependency directories, and build caches. A base whose final non-dot
+//! component names a noise directory turns the filter off. An explicit search
+//! then sees every file. Shared by the `find` and `grep` tools.
 
 const std = @import("std");
 
 const glob = @import("glob.zig");
 
-const noise_dirs = [_][]const u8{ ".git", ".zig-cache", "zig-cache", "zig-out" };
+/// Version-control stores are noise, but an empty search never suggests them.
+const version_control_directories = [_][]const u8{
+    ".bzr",
+    ".git",
+    ".hg",
+    ".jj",
+    ".pijul",
+    ".sl",
+    ".svn",
+    "CVS",
+    "_darcs",
+};
+
+/// The directory names that a walk skips. They hold generated or vendored
+/// files in bulk, so a walk inside them burns time and rarely serves a search.
+/// The list favors a missed optimization over hidden source files.
+const noise_directories = version_control_directories ++ [_][]const u8{
+    // Dependency directories and virtual environments.
+    ".dart_tool",
+    ".direnv",
+    ".pnpm-store",
+    ".venv",
+    "__pypackages__",
+    "bower_components",
+    "jspm_packages",
+    "node_modules",
+    "venv",
+    "web_modules",
+    // Build outputs and tool caches.
+    ".aws-sam",
+    ".build",
+    ".cache",
+    ".cdk.staging",
+    ".gradle",
+    ".mypy_cache",
+    ".next",
+    ".nox",
+    ".nuxt",
+    ".nyc_output",
+    ".parcel-cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".serverless",
+    ".sst",
+    ".stack-work",
+    ".svelte-kit",
+    ".terraform",
+    ".terragrunt-cache",
+    ".terragrunt-stack",
+    ".tox",
+    ".turbo",
+    ".vs",
+    ".zig-cache",
+    "CMakeFiles",
+    "DerivedData",
+    "__pycache__",
+    "_build",
+    "buck-out",
+    "cdk.out",
+    "cdktf.out",
+    "dist-newstyle",
+    "target",
+    "zig-cache",
+    "zig-out",
+};
 
 /// The hard cap on entries examined per walk, so a huge tree cannot make
 /// traversal run unbounded. Real repositories never reach it.
 const entries_visited_max = 1_000_000;
+const skipped_noise_names_max = 3;
+
+/// The bounds and match query for one directory walk.
+pub const Options = struct {
+    base: []const u8,
+    pattern: []const u8,
+    retain: usize,
+    entries_max: usize = entries_visited_max,
+};
+
+const NoisePruning = enum { disabled, enabled };
 
 /// The matches a walk retained. The caller's `gpa` owns them.
 pub const Match = struct {
@@ -25,10 +102,60 @@ pub const Match = struct {
     /// it exhausted the tree, so `paths` depends on filesystem enumeration
     /// order and is incomplete.
     capped: bool,
+    /// The reportable noise directory names that this walk skipped.
+    skipped_noise: SkippedNoise,
+
+    pub const SkippedNoise = struct {
+        names: []const []const u8,
+
+        fn init(
+            gpa: std.mem.Allocator,
+            skipped: *const [noise_directories.len]bool,
+        ) !SkippedNoise {
+            var count: usize = 0;
+            for (skipped) |was_skipped| {
+                if (was_skipped) count += 1;
+            }
+            const names = try gpa.alloc([]const u8, count);
+            var index: usize = 0;
+            for (noise_directories, skipped) |name, was_skipped| {
+                if (!was_skipped) continue;
+                names[index] = name;
+                index += 1;
+            }
+            std.mem.sort([]const u8, names, {}, lessThan);
+            return .{ .names = names };
+        }
+
+        fn deinit(self: *SkippedNoise, gpa: std.mem.Allocator) void {
+            gpa.free(self.names);
+            self.* = undefined;
+        }
+
+        pub fn isEmpty(self: *const SkippedNoise) bool {
+            return self.names.len == 0;
+        }
+
+        pub fn writeNotice(self: *const SkippedNoise, writer: *std.Io.Writer) !void {
+            std.debug.assert(!self.isEmpty());
+            const names_shown = @min(self.names.len, skipped_noise_names_max);
+            try writer.writeAll("Drinky skipped these noise directories: ");
+            for (self.names[0..names_shown], 0..) |name, index| {
+                if (index > 0) try writer.writeAll(", ");
+                try writer.print("`{s}`", .{name});
+            }
+            const names_omitted = self.names.len - names_shown;
+            if (names_omitted > 0) try writer.print(", and {d} more", .{names_omitted});
+            try writer.writeAll(
+                ". Set the path to a skipped directory to search that directory fully.",
+            );
+        }
+    };
 
     pub fn deinit(self: *Match, gpa: std.mem.Allocator) void {
         for (self.paths) |path| gpa.free(path);
         gpa.free(self.paths);
+        self.skipped_noise.deinit(gpa);
         self.* = undefined;
     }
 };
@@ -39,15 +166,19 @@ pub const Match = struct {
 /// the total), and `options.entries_max` bounds time. The walk skips unreadable
 /// directories. Cancellation stops the walk at once. Every exit releases every
 /// directory handle and retained path.
-pub fn collect(
+pub fn collect(io: std.Io, gpa: std.mem.Allocator, options: *const Options) !Match {
+    // A base that ends in a noise name aims the walk inside that directory.
+    // Disable pruning because package managers can nest one noise directory
+    // inside another.
+    const noise_pruning: NoisePruning = if (baseNamesNoise(options.base)) .disabled else .enabled;
+    return collectWithNoisePruning(io, gpa, options, noise_pruning);
+}
+
+fn collectWithNoisePruning(
     io: std.Io,
     gpa: std.mem.Allocator,
-    options: struct {
-        base: []const u8,
-        pattern: []const u8,
-        retain: usize,
-        entries_max: usize = entries_visited_max,
-    },
+    options: *const Options,
+    noise_pruning: NoisePruning,
 ) !Match {
     var dir = try std.Io.Dir.cwd().openDir(io, options.base, .{ .iterate = true });
     defer dir.close(io);
@@ -65,6 +196,7 @@ pub fn collect(
     var path_buf: std.ArrayList(u8) = .empty;
     defer path_buf.deinit(gpa);
 
+    var noise_skipped: [noise_directories.len]bool = @splat(false);
     const at_root = std.mem.eql(u8, options.base, ".");
     var visited: usize = 0;
     var capped = false;
@@ -87,7 +219,16 @@ pub fn collect(
         visited += 1;
         switch (entry.kind) {
             .directory => {
-                if (isNoise(entry.basename)) continue;
+                if (noise_pruning == .enabled) {
+                    const maybe_noise_index = noiseIndex(entry.basename);
+                    if (maybe_noise_index) |noise_index| {
+                        // Version-control entries form a silent prefix in noise_directories.
+                        if (noise_index >= version_control_directories.len) {
+                            noise_skipped[noise_index] = true;
+                        }
+                        continue;
+                    }
+                }
                 walker.enter(io, entry) catch |err| switch (err) {
                     error.Canceled => return err,
                     else => {},
@@ -106,10 +247,13 @@ pub fn collect(
             else => {},
         }
     }
+    var skipped_noise = try Match.SkippedNoise.init(gpa, &noise_skipped);
+    errdefer skipped_noise.deinit(gpa);
     return .{
         .paths = try keeper.toOwnedSorted(gpa),
         .matched = keeper.matched,
         .capped = capped,
+        .skipped_noise = skipped_noise,
     };
 }
 
@@ -162,11 +306,26 @@ const Keeper = struct {
     }
 };
 
-fn isNoise(basename: []const u8) bool {
-    for (noise_dirs) |noise| {
-        if (std.mem.eql(u8, basename, noise)) return true;
+fn noiseIndex(basename: []const u8) ?usize {
+    for (noise_directories, 0..) |noise, index| {
+        if (std.mem.eql(u8, basename, noise)) return index;
     }
-    return false;
+    return null;
+}
+
+fn isNoise(basename: []const u8) bool {
+    return noiseIndex(basename) != null;
+}
+
+/// Whether the final nonempty, non-dot segment of `base` is a noise name.
+/// Such a base explicitly selects the noise directory.
+fn baseNamesNoise(base: []const u8) bool {
+    var basename: []const u8 = "";
+    var segments = std.mem.splitScalar(u8, base, '/');
+    while (segments.next()) |segment| {
+        if (segment.len > 0 and !std.mem.eql(u8, segment, ".")) basename = segment;
+    }
+    return isNoise(basename);
 }
 
 fn lessThan(_: void, a: []const u8, b: []const u8) bool {
@@ -278,7 +437,7 @@ test "collect stops walking when an entered directory is canceled" {
     try std.testing.expectError(error.Canceled, collect(
         faulty.io(),
         std.testing.allocator,
-        .{ .base = "lib", .pattern = "**", .retain = 1000 },
+        &.{ .base = "lib", .pattern = "**", .retain = 1000 },
     ));
     try std.testing.expectEqual(@as(usize, 0), faulty.traversal_after_inject);
     try std.testing.expectEqual(@as(usize, 0), faulty.open_handles);
@@ -295,7 +454,7 @@ test "collect stops walking when a subdirectory read is canceled" {
     try std.testing.expectError(error.Canceled, collect(
         faulty.io(),
         std.testing.allocator,
-        .{ .base = "lib", .pattern = "**", .retain = 1000 },
+        &.{ .base = "lib", .pattern = "**", .retain = 1000 },
     ));
     try std.testing.expectEqual(@as(usize, 0), faulty.traversal_after_inject);
     try std.testing.expectEqual(@as(usize, 0), faulty.open_handles);
@@ -312,7 +471,7 @@ test "collect skips an unreadable directory and keeps walking" {
     var matches = try collect(
         faulty.io(),
         std.testing.allocator,
-        .{ .base = "lib", .pattern = "**/*.zig", .retain = 1000 },
+        &.{ .base = "lib", .pattern = "**/*.zig", .retain = 1000 },
     );
     defer matches.deinit(std.testing.allocator);
     try std.testing.expect(matches.paths.len > 0);
@@ -344,7 +503,7 @@ test "collect retains only the smallest matches and counts the rest" {
     var base_buf: [128]u8 = undefined;
     const base = try std.fmt.bufPrint(&base_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
 
-    var matches = try collect(io, std.testing.allocator, .{
+    var matches = try collect(io, std.testing.allocator, &.{
         .base = base,
         .pattern = "**",
         .retain = 5,
@@ -368,7 +527,7 @@ test "collect stops at the entry-visit work cap" {
     var base_buf: [128]u8 = undefined;
     const base = try std.fmt.bufPrint(&base_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
 
-    var matches = try collect(io, std.testing.allocator, .{
+    var matches = try collect(io, std.testing.allocator, &.{
         .base = base,
         .pattern = "**",
         .retain = 1000,
@@ -379,4 +538,118 @@ test "collect stops at the entry-visit work cap" {
     try std.testing.expect(matches.capped);
     try std.testing.expect(matches.matched < 200);
     try std.testing.expect(matches.paths.len <= 10);
+}
+
+test "baseNamesNoise only accepts the final path component" {
+    try std.testing.expect(!baseNamesNoise("."));
+    try std.testing.expect(!baseNamesNoise("lib/terminal"));
+    try std.testing.expect(!baseNamesNoise("node_modules_backup"));
+    try std.testing.expect(baseNamesNoise("node_modules"));
+    try std.testing.expect(baseNamesNoise("./node_modules/"));
+    try std.testing.expect(baseNamesNoise("packages/app/node_modules/."));
+    try std.testing.expect(!baseNamesNoise("packages/app/node_modules/react"));
+    try std.testing.expect(!baseNamesNoise("/home/user/.cache/project"));
+    try std.testing.expect(!baseNamesNoise("/repo/target/src"));
+    try std.testing.expect(!baseNamesNoise(".zig-cache/tmp/x"));
+    try std.testing.expect(!baseNamesNoise("node_modules/.."));
+}
+
+test "noise list includes Zig and CDK output directories" {
+    for ([_][]const u8{
+        ".cdk.staging",
+        ".zig-cache",
+        "cdk.out",
+        "cdktf.out",
+        "zig-cache",
+        "zig-out",
+    }) |name| try std.testing.expect(isNoise(name));
+}
+
+test "noise list keeps Nx workflows visible" {
+    try std.testing.expect(!isNoise(".nx"));
+}
+
+test "skipped noise notice caps directory names" {
+    const skipped_noise: Match.SkippedNoise = .{ .names = &.{
+        ".cache",
+        ".tox",
+        "node_modules",
+        "target",
+    } };
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+
+    try skipped_noise.writeNotice(&out.writer);
+
+    try std.testing.expectEqualStrings(
+        "Drinky skipped these noise directories: `.cache`, `.tox`, `node_modules`, and 1 " ++
+            "more. Set the path to a skipped directory to search that directory fully.",
+        out.writer.buffered(),
+    );
+}
+
+test "collect prunes noise directories in an isolated tree" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "kept.txt", .data = "keep\n" });
+    for (noise_directories) |name| {
+        var noise_directory = try tmp.dir.createDirPathOpen(io, name, .{});
+        defer noise_directory.close(io);
+        try noise_directory.writeFile(io, .{ .sub_path = "ignored.txt", .data = "ignore\n" });
+    }
+    var base_buf: [128]u8 = undefined;
+    const base = try std.fmt.bufPrint(&base_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+
+    var matches = try collectWithNoisePruning(io, std.testing.allocator, &.{
+        .base = base,
+        .pattern = "**",
+        .retain = 10,
+    }, .enabled);
+    defer matches.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), matches.matched);
+    try std.testing.expect(std.mem.endsWith(u8, matches.paths[0], "/kept.txt"));
+    try std.testing.expectEqual(
+        noise_directories.len - version_control_directories.len,
+        matches.skipped_noise.names.len,
+    );
+    for (matches.skipped_noise.names) |name| {
+        try std.testing.expect(noiseIndex(name).? >= version_control_directories.len);
+    }
+}
+
+test "collect keeps nested noise visible when the base names noise" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // A pnpm-style layout nests node_modules inside the named base.
+    var pkg = try tmp.dir.createDirPathOpen(io, "node_modules/node_modules/pkg", .{});
+    defer pkg.close(io);
+    try pkg.writeFile(io, .{ .sub_path = "index.js", .data = "hit\n" });
+    var base_buf: [160]u8 = undefined;
+    const base = try std.fmt.bufPrint(
+        &base_buf,
+        ".zig-cache/tmp/{s}/node_modules",
+        .{tmp.sub_path},
+    );
+
+    var matches = try collect(io, std.testing.allocator, &.{
+        .base = base,
+        .pattern = "**/*.js",
+        .retain = 10,
+    });
+    defer matches.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), matches.matched);
+    try std.testing.expect(
+        std.mem.endsWith(u8, matches.paths[0], "node_modules/node_modules/pkg/index.js"),
+    );
+    try std.testing.expect(matches.skipped_noise.isEmpty());
 }
