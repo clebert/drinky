@@ -282,8 +282,14 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - The cache-hit rate holds the last request of the active account, model, and resolved effort. A
   change to any of the three hides it. Two effort levels that resolve to one wire form share the
   cache, so the rate survives that change. A canceled attempt still rates its own prompt.
+- The context gauge and each quota window take the warning color from 75% used, and the error color
+  from 90% used. A color on this line always means pressure. The color reads the share that the
+  field prints, so the number and the color always agree.
+- The model name and the effort value take the normal intensity in the muted line, so the two
+  settings that the user changes stand out.
 - A narrow window shortens the directory, branch, and context gauge before it removes parts, and it
-  always keeps the context gauge.
+  always keeps the context gauge. A bracketed detail goes before the head that carries it. The
+  account goes before the model, and the branch goes before the directory.
 - The branch comes from the `HEAD` file of the repository, never from the git command. Drinky
   re-reads it when a turn starts and when one ends.
 - A picker is a single-choice list that tags the current value. Enter confirms, and Esc, Ctrl+C, or

@@ -5,6 +5,10 @@
 //!
 //! A narrow window first shortens fields in one fixed order. It then removes
 //! complete parts in another fixed order. The context gauge never goes.
+//!
+//! The line paints muted. Two kinds of field leave that role. A gauge takes a
+//! color when it fills past a threshold, and an identity field takes the normal
+//! intensity. Color means pressure. Intensity means identity.
 
 const std = @import("std");
 
@@ -66,6 +70,14 @@ const separator = " · ";
 /// The compact branch keeps at most this many display columns before its mark.
 const branch_prefix_columns_max = 16;
 
+/// A gauge that fills to this share of its limit takes the warning color, and
+/// one that fills to `pressure_percent_error` takes the error color. A gauge
+/// below the warning share keeps the muted role, so a color on this line always
+/// means pressure. The shares are compiled, because no evidence supports one
+/// number over another and a configurable pair helps nobody yet.
+const pressure_percent_warning: f64 = 75;
+const pressure_percent_error: f64 = 90;
+
 /// The parts the line shows. `all` is what a wide window gets. Each reduction
 /// selects a shorter form or removes one complete part.
 const Parts = struct {
@@ -82,8 +94,10 @@ const Parts = struct {
     /// The directory: whole, its last component alone, or gone with its branch.
     const Place = enum { full, short, hidden };
 
-    /// The branch: whole, or its first bounded prefix with an ellipsis.
-    const Branch = enum { full, short };
+    /// The branch: whole, its first bounded prefix with an ellipsis, or gone. A
+    /// bracketed detail goes before the head that carries it, so the branch goes
+    /// while the directory stays.
+    const Branch = enum { full, short, hidden };
 
     /// The context gauge: with its token counts, or the percentage alone. An
     /// unknown measurement has one form. The gauge has no hidden form, because
@@ -105,7 +119,9 @@ const Parts = struct {
 
 /// Shorten each field before any complete part goes. The cache rate goes first
 /// after that. The cost goes before either quota because an allowance is a hard
-/// stop. The account, place, and effort go after all session numbers.
+/// stop. Each side then gives up its bracketed detail before the head that
+/// carries it: the account, then the branch, then the place. The effort goes
+/// last, after every session number.
 const reductions = [_]Reduction{
     .shorten_directory,
     .shorten_branch,
@@ -115,6 +131,7 @@ const reductions = [_]Reduction{
     .drop_quota_secondary,
     .drop_quota_primary,
     .drop_account,
+    .drop_branch,
     .drop_place,
     .drop_effort,
 };
@@ -128,6 +145,7 @@ const Reduction = enum {
     drop_quota_secondary,
     drop_quota_primary,
     drop_account,
+    drop_branch,
     drop_place,
     drop_effort,
 };
@@ -142,9 +160,88 @@ fn reduce(parts: *Parts, reduction: Reduction) void {
         .drop_quota_secondary => parts.quota_secondary = false,
         .drop_quota_primary => parts.quota_primary = false,
         .drop_account => parts.account = false,
+        .drop_branch => parts.branch = .hidden,
         .drop_place => parts.place = .hidden,
         .drop_effort => parts.effort = false,
     }
+}
+
+/// One painted run of a line: the bytes from `start` to `end`, and the role that
+/// paints them. A line is muted outside every run.
+const Run = struct { start: usize, end: usize, name: role.Name };
+
+/// The runs one side can hold: the context gauge and the two quota windows on
+/// the left, the model and the effort value on the right.
+const runs_max = 3;
+
+/// One side of the line under construction: its bytes, and the runs that leave
+/// the muted role. A field marks its own run after it writes, so a field that
+/// shortens or goes away needs no separate accounting.
+///
+/// A function that writes a whole field takes the line. A function that formats
+/// one fragment, such as a token count, takes the writer alone and can mark
+/// nothing.
+const Line = struct {
+    out: std.Io.Writer,
+    runs: [runs_max]Run,
+    count: usize,
+
+    fn init(buffer: []u8) Line {
+        return .{ .out = .fixed(buffer), .runs = undefined, .count = 0 };
+    }
+
+    fn text(self: *const Line) []const u8 {
+        return self.out.buffered();
+    }
+
+    fn offset(self: *const Line) usize {
+        return self.out.buffered().len;
+    }
+
+    /// Paint the bytes from `start` to the end of the line with `name`. A muted
+    /// field records nothing, because the whole line already paints muted. A
+    /// line with no run left keeps the field muted, so one field more than
+    /// `runs_max` loses a color and never writes past the array.
+    fn mark(self: *Line, start: usize, name: role.Name) void {
+        if (name == .muted or self.count == self.runs.len) return;
+        self.runs[self.count] = .{ .start = start, .end = self.offset(), .name = name };
+        self.count += 1;
+    }
+
+    fn marked(self: *const Line) []const Run {
+        return self.runs[0..self.count];
+    }
+};
+
+/// The role a gauge takes at `used_percent`. A gauge below the warning share
+/// keeps the muted role of the line, so a color always means pressure.
+///
+/// The caller passes the used share that the printed number implies, not the
+/// measured share. Two rows that print one number then always take one color,
+/// and the color never contradicts the number beside it.
+fn pressureRole(used_percent: f64) role.Name {
+    if (used_percent >= pressure_percent_error) return .@"error";
+    if (used_percent >= pressure_percent_warning) return .warning;
+    return .muted;
+}
+
+/// Paint `kept` of `line`: each run in its own role, and the muted role around
+/// them. A run opens with the reset, because the muted role holds the faint
+/// intensity that an identity field must drop. The runs come in write order, so
+/// they never overlap, and a cut drops a whole run or its tail alone.
+fn paintRuns(sink: *terminal.View.Sink, line: *const Line, kept: []const u8) !void {
+    var cursor: usize = 0;
+    for (line.marked()) |run| {
+        if (run.start >= kept.len) break;
+        std.debug.assert(cursor <= run.start);
+        try sink.text(kept[cursor..run.start]);
+        try attribute.apply(sink, .reset);
+        try role.apply(sink, run.name);
+        cursor = @min(run.end, kept.len);
+        try sink.text(kept[run.start..cursor]);
+        try role.apply(sink, .muted);
+    }
+    try sink.text(kept[cursor..]);
 }
 
 /// Stream the status line through `placement`. Put the place and the session
@@ -175,19 +272,18 @@ pub fn render(placement: *const paint.Placement, info: *const Info) !void {
     var left_scratch: [ai.project.head_name_bytes_max + 512]u8 = undefined;
     var right_scratch: [192]u8 = undefined;
     var parts: Parts = .all;
-    var left_line: []const u8 = "";
-    var right_line: []const u8 = "";
+    // The loop always runs, so it writes both sides before any read.
+    var left: Line = undefined;
+    var right: Line = undefined;
     var left_columns: usize = 0;
     var right_columns: usize = 0;
     for (0..reductions.len + 1) |index| {
-        var left: std.Io.Writer = .fixed(&left_scratch);
-        var right: std.Io.Writer = .fixed(&right_scratch);
+        left = .init(&left_scratch);
+        right = .init(&right_scratch);
         writeLeft(&left, info, &parts) catch unreachable;
         writeRight(&right, info, &parts) catch unreachable;
-        left_line = left.buffered();
-        right_line = right.buffered();
-        left_columns = terminal.width.ofText(left_line);
-        right_columns = terminal.width.ofText(right_line);
+        left_columns = terminal.width.ofText(left.text());
+        right_columns = terminal.width.ofText(right.text());
         if (left_columns + right_columns + 1 <= placement.columns) break;
         if (index == reductions.len) break;
         reduce(&parts, reductions[index]);
@@ -196,12 +292,12 @@ pub fn render(placement: *const paint.Placement, info: *const Info) !void {
     placement.sink.begin();
     try role.apply(placement.sink, .muted);
     if (left_columns + right_columns + 1 <= placement.columns) {
-        try placement.sink.text(left_line);
+        try paintRuns(placement.sink, &left, left.text());
         try placement.sink.spaces(placement.columns - left_columns - right_columns);
-        try placement.sink.text(right_line);
+        try paintRuns(placement.sink, &right, right.text());
     } else {
-        const shown = paint.cut(left_line, placement.columns);
-        try placement.sink.text(shown.kept);
+        const shown = paint.cut(left.text(), placement.columns);
+        try paintRuns(placement.sink, &left, shown.kept);
         if (shown.marked) try placement.sink.text(paint.ellipsis);
     }
     try attribute.apply(placement.sink, .reset);
@@ -210,50 +306,58 @@ pub fn render(placement: *const paint.Placement, info: *const Info) !void {
 
 /// The agent: `model (account) · Effort: level`, or the signed-out indicator.
 /// Each part carries its own label, so a part that goes away never leaves a bare
-/// value behind.
-fn writeRight(out: *std.Io.Writer, info: *const Info, parts: *const Parts) !void {
-    const account = info.account orelse return out.writeAll(signed_out_label);
-    try out.writeAll(info.model);
+/// value behind. The model and the effort level are the two settings the user
+/// changes, so both values take the normal intensity. The label and the
+/// bracketed account stay muted.
+fn writeRight(line: *Line, info: *const Info, parts: *const Parts) !void {
+    const account = info.account orelse return line.out.writeAll(signed_out_label);
+    const model_start = line.offset();
+    try line.out.writeAll(info.model);
+    line.mark(model_start, .text);
     if (parts.account) {
-        try out.writeAll(account_open);
-        try out.writeAll(account.label());
-        try out.writeAll(account_close);
+        try line.out.writeAll(account_open);
+        try line.out.writeAll(account.label());
+        try line.out.writeAll(account_close);
     }
     if (parts.effort) {
-        try out.writeAll(separator);
-        try out.print("Effort: {s}", .{info.effort});
+        try line.out.writeAll(separator);
+        try line.out.writeAll("Effort: ");
+        const effort_start = line.offset();
+        try line.out.writeAll(info.effort);
+        line.mark(effort_start, .text);
     }
 }
 
 /// The place and the session numbers. The context gauge always comes, so every
 /// later part can carry its own leading separator.
-fn writeLeft(out: *std.Io.Writer, info: *const Info, parts: *const Parts) !void {
+fn writeLeft(line: *Line, info: *const Info, parts: *const Parts) !void {
     if (parts.place != .hidden and info.directory.len > 0) {
-        try writePlace(out, info, parts);
-        try out.writeAll(separator);
+        try writePlace(line, info, parts);
+        try line.out.writeAll(separator);
     }
-    try writeContext(out, info, parts.context);
+    try writeContext(line, info, parts.context);
     if (parts.cost) {
         // Session cost uses public API rates. It is an estimate because the login
         // type does not reveal billing.
-        try out.print("{s}Cost: ${d:.2}", .{ separator, info.cost });
+        try line.out.print("{s}Cost: ${d:.2}", .{ separator, info.cost });
     }
     if (info.quota) |quota| {
-        if (parts.quota_primary) try writeQuotaWindow(out, quota.primary);
-        if (parts.quota_secondary) try writeQuotaWindow(out, quota.secondary);
+        if (parts.quota_primary) try writeQuotaWindow(line, quota.primary);
+        if (parts.quota_secondary) try writeQuotaWindow(line, quota.secondary);
     }
-    if (parts.cache) try writeCache(out, info);
+    if (parts.cache) try writeCache(line, info);
 }
 
 /// The working directory, and the branch that a command here acts on. A
 /// path names itself, so it takes no label. The branch follows it in brackets,
 /// the same shape the agent takes on the right.
-fn writePlace(out: *std.Io.Writer, info: *const Info, parts: *const Parts) !void {
-    try writeDirectory(out, info.directory, parts.place);
+fn writePlace(line: *Line, info: *const Info, parts: *const Parts) !void {
+    try writeDirectory(&line.out, info.directory, parts.place);
+    if (parts.branch == .hidden) return;
     if (info.branch) |branch| {
-        try out.writeAll(" (");
-        try writeBranch(out, branch, parts.branch);
-        try out.writeByte(')');
+        try line.out.writeAll(" (");
+        try writeBranch(&line.out, branch, parts.branch);
+        try line.out.writeByte(')');
     }
 }
 
@@ -292,39 +396,52 @@ fn writeBranch(out: *std.Io.Writer, branch: []const u8, form: Parts.Branch) !voi
 /// Context now: what the last committed reply measured, against the model's
 /// window. The one "now" number. The rest is session-cumulative. A model switch
 /// leaves no valid measurement, because a tokenizer belongs to its model.
-fn writeContext(out: *std.Io.Writer, info: *const Info, form: Parts.Context) !void {
-    const context = info.context_tokens orelse return out.writeAll("Context: Unknown");
+fn writeContext(line: *Line, info: *const Info, form: Parts.Context) !void {
+    const context = info.context_tokens orelse return line.out.writeAll("Context: Unknown");
     const percent = if (info.context_window > 0)
         asFloat(context) / asFloat(info.context_window) * 100.0
     else
         0.0;
-    try out.print("Context: {d:.0}%", .{percent});
-    if (form == .short) return;
-    try out.writeAll(" (");
-    try writeTokens(out, context);
-    try out.writeByte('/');
-    try writeTokens(out, info.context_window);
-    try out.writeByte(')');
+    // The line prints the rounded share and colors that same number, so a row
+    // never shows one figure and the color of another.
+    const shown = @round(percent);
+    const start = line.offset();
+    try line.out.print("Context: {d:.0}%", .{shown});
+    if (form == .full) {
+        try line.out.writeAll(" (");
+        try writeTokens(&line.out, context);
+        try line.out.writeByte('/');
+        try writeTokens(&line.out, info.context_window);
+        try line.out.writeByte(')');
+    }
+    line.mark(start, pressureRole(shown));
 }
 
 /// The last request's cache hit rate over the whole prompt. An all-zero prompt
 /// means no measurement describes the active account, model, and effort, so the
 /// part goes rather than show a 0/0 rate.
-fn writeCache(out: *std.Io.Writer, info: *const Info) !void {
+fn writeCache(line: *Line, info: *const Info) !void {
     const usage = &info.cache_usage;
     const prompt = usage.input +| usage.cache_read +| usage.cache_write;
     if (prompt == 0) return;
     const hit = asFloat(usage.cache_read) / asFloat(prompt) * 100.0;
-    try out.print("{s}Cache: {d:.0}%", .{ separator, hit });
+    try line.out.print("{s}Cache: {d:.0}%", .{ separator, hit });
 }
 
 /// Append one identified quota window as ` · <label>: N% remaining`, or nothing when
-/// absent or when its duration does not identify it.
-fn writeQuotaWindow(out: *std.Io.Writer, maybe_window: ?ai.llm.Quota.Window) !void {
+/// absent or when its duration does not identify it. The used share drives the
+/// color, so the allowance and the context window read the same way.
+fn writeQuotaWindow(line: *Line, maybe_window: ?ai.llm.Quota.Window) !void {
     const window = maybe_window orelse return;
     const label = quotaLabel(window.window_minutes) orelse return;
     const remaining = @max(0.0, @min(100.0, 100.0 - window.used_percent));
-    try out.print(" · {s}: {d:.0}% remaining", .{ label, remaining });
+    // The color reads the share that the printed remainder leaves, so two rows
+    // that print one remainder always take one color.
+    const shown = @round(remaining);
+    try line.out.writeAll(separator);
+    const start = line.offset();
+    try line.out.print("{s}: {d:.0}% remaining", .{ label, shown });
+    line.mark(start, pressureRole(100.0 - shown));
 }
 
 /// A human label for a rolling window, keyed off its length in minutes. The
@@ -449,7 +566,11 @@ test render {
         "5h quota: 88% remaining",
         "Weekly quota: 26% remaining",
         "Cache: 87%",
-        "claude-opus-4-8 (Anthropic Subscription) · Effort: xhigh",
+        // The model and the effort value carry their own intensity, so a style
+        // sequence sits between them and the muted text around them.
+        "claude-opus-4-8",
+        " (Anthropic Subscription) · Effort: ",
+        "xhigh",
     });
     // The place anchors the left, and the agent anchors the right.
     const place = std.mem.indexOf(u8, painted, "~/github").?;
@@ -526,18 +647,20 @@ test "a narrow window shortens fields before it gives up parts" {
         },
         .{
             .columns = 110,
-            .shows = &.{ "~/…/drinky (main)", "Anthropic Subscription", "Effort: xhigh" },
+            .shows = &.{ "~/…/drinky (main)", "Anthropic Subscription", "Effort: " },
             .hides = &.{"quota"},
         },
         .{
             .columns = 80,
-            .shows = &.{ "~/…/drinky (main)", "claude-opus-4-8", "Effort: xhigh" },
+            .shows = &.{ "~/…/drinky (main)", "claude-opus-4-8", "Effort: " },
             .hides = &.{"Anthropic Subscription"},
         },
         .{
+            // The branch is a detail of the place, so it goes while the
+            // directory stays.
             .columns = 60,
-            .shows = &.{ "Context: 21%", "claude-opus-4-8", "Effort: xhigh" },
-            .hides = &.{"drinky"},
+            .shows = &.{ "~/…/drinky · Context: 21%", "claude-opus-4-8", "Effort: " },
+            .hides = &.{"(main)"},
         },
         .{
             .columns = 40,
@@ -577,6 +700,92 @@ test "the context gauge survives every width" {
         }
         try expectShows(out.written(), &.{ "Context: 21%"[0 .. columns - 1], paint.ellipsis });
     }
+}
+
+test "a gauge takes a color when it fills past its threshold" {
+    const gpa = std.testing.allocator;
+    var info = test_info;
+    // Each gauge sits on its own edge: 75% used takes the warning color, 90%
+    // used takes the error color, and 74% used takes neither.
+    info.context_tokens = 750_000;
+    info.quota = .{
+        .primary = .{ .used_percent = 90, .window_minutes = 300 },
+        .secondary = .{ .used_percent = 74, .window_minutes = 10080 },
+    };
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try renderForTest(gpa, &info, 200, &out);
+
+    // The color covers the whole field, so the label and the bracket carry it
+    // too. The two gauges use one rule, and each one names its own fill.
+    const painted = out.written();
+    try expectShows(painted, &.{
+        comptime role.sequence(.warning) ++ "Context: 75% (750k/1.0M)",
+        comptime role.sequence(.@"error") ++ "5h quota: 10% remaining",
+    });
+    // The weekly window stays under the warning share, so it keeps the muted
+    // role of the line.
+    try expectHides(painted, &.{
+        comptime role.sequence(.warning) ++ "Weekly quota",
+        comptime role.sequence(.@"error") ++ "Weekly quota",
+    });
+}
+
+test "the color follows the share that the line prints" {
+    const gpa = std.testing.allocator;
+    var info = test_info;
+    // The measured shares stay under both thresholds. The printed shares reach
+    // them, so the row and its color must agree with the printed number.
+    info.context_tokens = 746_000;
+    info.quota = .{
+        .primary = .{ .used_percent = 89.6, .window_minutes = 300 },
+        .secondary = null,
+    };
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try renderForTest(gpa, &info, 200, &out);
+
+    const painted = out.written();
+    try expectShows(painted, &.{
+        comptime role.sequence(.warning) ++ "Context: 75%",
+        comptime role.sequence(.@"error") ++ "5h quota: 10% remaining",
+    });
+}
+
+test "the model and the effort value leave the faint intensity" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try renderForTest(gpa, &test_info, 200, &out);
+
+    // The reset opens each identity field, because the muted role holds the
+    // faint intensity. The muted role closes it again.
+    const painted = out.written();
+    const reset = comptime attribute.sequence(.reset);
+    const muted = comptime role.sequence(.muted);
+    try expectShows(painted, &.{
+        reset ++ "claude-opus-4-8" ++ muted,
+        reset ++ "xhigh" ++ muted,
+    });
+    // The label and the account keep the muted role of the line.
+    try expectHides(painted, &.{ reset ++ "Effort", reset ++ " (Anthropic" });
+}
+
+test "a cut keeps the color of the run it lands in" {
+    const gpa = std.testing.allocator;
+    var info = test_info;
+    info.context_tokens = 950_000;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try renderForTest(gpa, &info, 10, &out);
+
+    // Nine columns of the gauge stay, and the mark of the cut takes the last
+    // column. The mark belongs to the line, so it paints muted.
+    const painted = out.written();
+    try expectShows(painted, &.{
+        comptime role.sequence(.@"error") ++ "Context: ",
+        comptime role.sequence(.muted) ++ paint.ellipsis,
+    });
 }
 
 test "shortening the directory never costs columns" {
@@ -706,15 +915,15 @@ test "quota windows show the remaining allowance, labeled by length" {
 
 test "unidentified quota windows stay hidden beside a known window" {
     var buffer: [512]u8 = undefined;
-    var out: std.Io.Writer = .fixed(&buffer);
+    var line: Line = .init(&buffer);
     var info = test_info;
     info.quota = .{
         .primary = .{ .used_percent = 77, .window_minutes = 10080 },
         .secondary = .{ .used_percent = 0 },
     };
 
-    try writeLeft(&out, &info, &Parts.all);
-    const written = out.buffered();
+    try writeLeft(&line, &info, &Parts.all);
+    const written = line.text();
     try std.testing.expect(std.mem.indexOf(u8, written, "Weekly quota: 23% remaining") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "100% remaining") == null);
     try std.testing.expect(quotaLabel(null) == null);

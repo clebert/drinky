@@ -20,13 +20,21 @@ pub const Name = enum {
 
 const Emphasis = enum { bold, underline, double_underline };
 
+/// The complete SGR sequence `name` writes. This map is the only place where an
+/// attribute becomes bytes, so a test can pin them instead of repeating them.
+pub fn sequence(comptime name: Name) []const u8 {
+    return switch (name) {
+        .reset => "\x1b[0m",
+        .italic => "\x1b[3m",
+        .underline => "\x1b[4m",
+        .strikethrough => "\x1b[9m",
+    };
+}
+
 /// Apply one role-independent attribute through the sink's validated SGR path.
 pub fn apply(sink: *terminal.View.Sink, name: Name) !void {
     switch (name) {
-        .reset => try sink.sgr("\x1b[0m"),
-        .italic => try sink.sgr("\x1b[3m"),
-        .underline => try sink.sgr("\x1b[4m"),
-        .strikethrough => try sink.sgr("\x1b[9m"),
+        inline else => |tag| try sink.sgr(sequence(tag)),
     }
 }
 
@@ -44,6 +52,20 @@ pub fn emphasize(sink: *terminal.View.Sink, name: role.Name, underlined: bool) !
 fn emphasis(name: role.Name, underlined: bool) Emphasis {
     if (name != .muted) return .bold;
     return if (underlined) .double_underline else .underline;
+}
+
+test "the attribute map pins the SGR sequence for each attribute" {
+    // The switch is exhaustive, so a new attribute fails to compile until this
+    // test pins its bytes too.
+    inline for (std.enums.values(Name)) |name| {
+        const pinned = switch (name) {
+            .reset => "\x1b[0m",
+            .italic => "\x1b[3m",
+            .underline => "\x1b[4m",
+            .strikethrough => "\x1b[9m",
+        };
+        try std.testing.expectEqualStrings(pinned, sequence(name));
+    }
 }
 
 test "muted emphasis stays distinct from an existing underline" {
