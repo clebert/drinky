@@ -3,7 +3,14 @@
 A terminal-native coding agent that keeps the conversation in normal scrollback.
 
 Give Drinky a prompt. The model can read, search, and change files or run commands in the working
-directory. Drinky is written in Zig and has no third-party dependencies.
+directory. Drinky is written in Zig.
+
+## Philosophy
+
+Drinky has no third-party dependencies, so a human or a model can review the program and the Zig
+standard library. Drinky keeps core rules in every session. It adds detailed harness guidance and
+complete skill instructions only when a task needs them. This design keeps more context available
+for the task.
 
 ## Features
 
