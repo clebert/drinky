@@ -79,7 +79,19 @@ pub const Account = enum {
 /// The vendor axis: whose wire protocol and model table an account uses. Both
 /// accounts of a vendor share one serializer and one set of models. The model
 /// table and the serializers key on this rather than on the full account.
-pub const Provider = enum { anthropic, openai };
+pub const Provider = enum {
+    anthropic,
+    openai,
+
+    /// The human-readable label, e.g. "Anthropic". Every account label of the
+    /// vendor starts with it.
+    pub fn label(self: Provider) []const u8 {
+        return switch (self) {
+            .anthropic => "Anthropic",
+            .openai => "OpenAI",
+        };
+    }
+};
 
 pub const Role = enum { user, assistant };
 
@@ -467,6 +479,15 @@ test "reasoning proofs bind only to compatible exact accounts" {
         "secret",
         redacted.replay(.anthropic_subscription).?.anthropic_subscription.redacted,
     );
+}
+
+test "a provider label prefixes the label of each of its accounts" {
+    for (std.enums.values(Account)) |account| {
+        const vendor = account.provider();
+        try std.testing.expect(std.mem.startsWith(u8, account.label(), vendor.label()));
+    }
+    try std.testing.expectEqualStrings("Anthropic", Provider.anthropic.label());
+    try std.testing.expectEqualStrings("OpenAI", Provider.openai.label());
 }
 
 test "Account.provider maps each account to its vendor" {

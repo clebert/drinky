@@ -324,7 +324,8 @@ fn renderForTest(
 // selection keep one height.
 test "a row too wide for the window is cut and marked" {
     const gpa = std.testing.allocator;
-    // A `/model` row, because only a list with a current value carries the tag.
+    // A long row and a current value, because only a list with a current value
+    // carries the tag.
     var picker = try testPicker(gpa, &.{
         "claude-sonnet-5 (Anthropic Subscription)",
         "two\nrows in one option",

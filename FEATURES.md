@@ -134,7 +134,8 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 
 - **/help** — pick a command from an alphabetical list. Each row holds the name of one command and a
   short summary. Enter runs the picked command at once, and a bare `/` opens the same list.
-- **/model** — switch account and model together, from the next turn on.
+- **/model** — switch account and model together, from the next turn on. The picker steps through
+  the provider, the account, and the model, and it skips a step that offers one row alone.
 - **/effort** — set the reasoning-effort level, from the next turn on.
 - **/login** — sign in, switch to an account already signed in, or name the API key to set.
 - **/logout** — drop a signed-in account's credentials and hand the session to another account.

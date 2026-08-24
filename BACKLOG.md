@@ -24,10 +24,6 @@ decision already taken, or a dependency on another entry. Module layout and exte
 
 ## Improvements
 
-- **Pick the provider first, then the model** — so neither list grows too long. _`/model` lists one
-  row per account-model pair today, up to 21 rows. `/login` lists accounts alone. A provider step
-  does not name the account, because Anthropic has three, so the steps are provider, account, and
-  model._
 - **Configurable transcript window** — the 8-page transcript window moves into `config.json` and
   trades scrollback retention against per-frame redraw cost. _Clamp to at least one page._
 - **Configurable gauge thresholds** — `config.json` sets the two shares at which a gauge takes the
