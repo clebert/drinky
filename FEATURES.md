@@ -27,7 +27,7 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
   retry cause.
 - A failed turn that committed work arms a retry above the editor. Ctrl+N asks the model to continue
   and Esc discards the retry. The attempt never takes the editor text, and the start of any turn
-  drops the retry.
+  drops the retry. Drinky wrote the message of the attempt, so its line takes the user color.
 - A reply cut short by the output cap is kept, and reported as cut short.
 - Model-side failures — a refusal, an empty reply, the round cap — read as a plain sentence rather
   than an internal error.
@@ -152,7 +152,7 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
   opens the same list.
 - **/skill:name** — load a discovered skill explicitly, record one head line that reads
   `Skill: name · File: path`, and record any trailing text as its task in a user box below it. The
-  head takes the user color and no box, so a typed message cannot forge it.
+  head takes the user color and no box.
 - Every line that starts with a slash is a command line, so Drinky reads it locally first and sends
   it only after a confirmation. A command that takes no argument refuses text after the name, as in
   `/new must clear the scrollback`. `/skill:name` is the one exception, because it takes its task as
@@ -320,6 +320,9 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - The terminal supplies every color and the muted intensity. Drinky uses the default colors, ANSI
   slots 0 to 15, faint, and reverse video. A filled box keeps the terminal background for its text.
   A label or a glyph marks every state, so color is never the only signal.
+- A line that reports a message that Drinky wrote for the user takes the user color and no box. A
+  typed message cannot forge it. The head of a loaded skill and the line of a retry attempt read
+  this way. A muted event reports the state of the session instead.
 - Model, tool, and user text can never emit escapes: controls and malformed UTF-8 render as
   replacement characters.
 

@@ -1827,7 +1827,7 @@ fn appendSkillPrompt(self: *App, prompt: *const ai.command.Outcome.Prompt) !usiz
     errdefer self.session.transcript.truncate(base);
     const head = try self.skillHead(prompt);
     defer self.gpa.free(head);
-    try self.session.transcript.append(.skill, .{}, head);
+    try self.session.transcript.append(.user_note, .{}, head);
     if (prompt.arguments.len > 0)
         try self.session.transcript.append(.user, .{}, prompt.arguments);
     return base;
@@ -1881,10 +1881,10 @@ fn sendRetryTurn(self: *App) !void {
     self.session.markTurnBase(base);
 }
 
-/// Send one retry attempt: record the event that names it, then spawn its turn
+/// Send one retry attempt: record the line that names it, then spawn its turn
 /// over the generated request. The attempt carries no user text, so its turn
 /// takes the context and the next failure arms a fresh one that names its own
-/// error. Returns the rewind checkpoint of the event.
+/// error. Returns the rewind checkpoint of that line.
 fn startRetryTurn(self: *App) !usize {
     std.debug.assert(self.retry != null);
     const retry = &self.retry.?;
@@ -1892,9 +1892,10 @@ fn startRetryTurn(self: *App) !usize {
     defer self.gpa.free(text);
     const base = self.session.transcript.blocks().len;
     errdefer self.session.transcript.truncate(base);
-    // The complete request stays out of the transcript, as a skill box keeps its
-    // expanded file out of it.
-    try self.session.transcript.append(.event, .{}, Retry.event_text);
+    // Drinky wrote this user message, so its line takes the user color, like the
+    // head of a loaded skill. The complete request stays out of the transcript,
+    // as a skill head keeps its expanded file out of it.
+    try self.session.transcript.append(.user_note, .{}, Retry.note_text);
     // The spawn drops the context, so the flag marks the attempt after it.
     try self.runTurn(text);
     // A failure of this attempt arms the context again from its own error.
@@ -5476,7 +5477,7 @@ test "an invoked skill sends a head that no box holds, and its task in a box" {
     const blocks = app.session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 2), blocks.len);
     switch (blocks[0]) {
-        .skill => |head| try std.testing.expectEqualStrings(
+        .user_note => |head| try std.testing.expectEqualStrings(
             "Skill: zig-style · File: .agents/skills/zig-style/SKILL.md",
             head.items,
         ),
@@ -5522,7 +5523,7 @@ test "an invoked skill with no task sends its head alone" {
     const blocks = app.session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 1), blocks.len);
     switch (blocks[0]) {
-        .skill => |head| try std.testing.expectEqualStrings(
+        .user_note => |head| try std.testing.expectEqualStrings(
             "Skill: interview · File: ~/.agents/skills/interview/SKILL.md",
             head.items,
         ),
@@ -5727,7 +5728,7 @@ test "an uncommitted skill failure returns its line and arms no retry" {
 }
 
 // Ctrl+N sends the attempt alone: no editor text goes with it, the transcript
-// records one event, and the failure of the attempt arms the retry again.
+// records one line, and the failure of the attempt arms the retry again.
 test "Ctrl+N sends the attempt and keeps the editor text" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -5762,10 +5763,11 @@ test "Ctrl+N sends the attempt and keeps the editor text" {
     try std.testing.expectEqualStrings("a draft that stays", app.session.editor.visible());
     try std.testing.expect(app.session.turn_origin == null);
     {
+        // Drinky wrote the message of the attempt, so its line is a user note.
+        // That kind alone paints the user color, which `ui.block` pins.
         const blocks = app.session.transcript.blocks();
         try std.testing.expectEqual(@as(usize, 1), blocks.len);
-        try std.testing.expectEqualStrings(Retry.event_text, blocks[0].event.text.items);
-        try std.testing.expect(!blocks[0].event.is_error);
+        try std.testing.expectEqualStrings(Retry.note_text, blocks[0].user_note.items);
     }
 
     {
@@ -5774,7 +5776,7 @@ test "Ctrl+N sends the attempt and keeps the editor text" {
         try app.finishWorkerResult(&result);
     }
     // The attempt continues committed work, so its own failure arms the context
-    // again. Its event block rewinds, and only the failure event stays.
+    // again. Its line rewinds, and only the failure event stays.
     try std.testing.expect(app.session.retry_shown);
     try std.testing.expect(std.mem.indexOf(u8, app.retry.?.failure, "SignedOut") != null);
     try std.testing.expectEqualStrings("a draft that stays", app.session.editor.visible());
@@ -6025,7 +6027,11 @@ test "a skill line runs while a retry waits and takes the context with it" {
     try std.testing.expect(app.turn_future != null);
     const blocks = app.session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 2), blocks.len);
-    try std.testing.expect(std.mem.startsWith(u8, blocks[0].skill.items, "Skill: demo · File:"));
+    try std.testing.expect(std.mem.startsWith(
+        u8,
+        blocks[0].user_note.items,
+        "Skill: demo · File:",
+    ));
     try std.testing.expectEqualStrings("apply it", blocks[1].user.items);
 
     const result = app.awaitTurnFuture().?;

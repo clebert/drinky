@@ -17,9 +17,10 @@ const role = @import("role.zig");
 pub const Entry = union(enum) {
     intro: std.ArrayList(u8),
     user: std.ArrayList(u8),
-    /// What Drinky sent for the user, such as the head of a loaded skill. It is
-    /// not a box, so a typed message cannot forge it.
-    skill: std.ArrayList(u8),
+    /// A line that reports a message that Drinky wrote for the user. The head of
+    /// a loaded skill and the line of a retry attempt read this way. It is not a
+    /// box, so a typed message cannot forge it.
+    user_note: std.ArrayList(u8),
     thinking: Reasoning,
     model: std.ArrayList(u8),
     tool_result: Flagged,
@@ -91,7 +92,7 @@ pub const Entry = union(enum) {
 
     pub fn deinit(self: *Entry, gpa: std.mem.Allocator) void {
         switch (self.*) {
-            .intro, .user, .skill, .model => |*text| text.deinit(gpa),
+            .intro, .user, .user_note, .model => |*text| text.deinit(gpa),
             .thinking => |*reasoning| reasoning.text.deinit(gpa),
             .tool_result, .event => |*flagged| flagged.text.deinit(gpa),
         }
@@ -103,7 +104,7 @@ pub const Entry = union(enum) {
     pub fn account(self: *const Entry) ?ai.llm.Account {
         return switch (self.*) {
             .thinking => |reasoning| reasoning.account,
-            .intro, .user, .skill, .model, .tool_result, .event => null,
+            .intro, .user, .user_note, .model, .tool_result, .event => null,
         };
     }
 
@@ -112,14 +113,14 @@ pub const Entry = union(enum) {
     pub fn survivesRewind(self: *const Entry) bool {
         return switch (self.*) {
             .event => |event| event.survives_rewind,
-            .intro, .user, .skill, .thinking, .model, .tool_result => false,
+            .intro, .user, .user_note, .thinking, .model, .tool_result => false,
         };
     }
 
     /// The bytes this block holds.
     fn bytes(self: *const Entry) []const u8 {
         return switch (self.*) {
-            .intro, .user, .skill, .model => |list| list.items,
+            .intro, .user, .user_note, .model => |list| list.items,
             .thinking => |reasoning| reasoning.text.items,
             .tool_result, .event => |flagged| flagged.text.items,
         };
@@ -131,7 +132,7 @@ pub const Entry = union(enum) {
     fn notice(self: *const Entry) ?paint.Notice {
         return switch (self.*) {
             .intro => .{ .role = .muted },
-            .skill => .{ .role = .user_note },
+            .user_note => .{ .role = .user_note },
             // An error event wraps like every other event. The transcript is the
             // place where the whole sentence must stay readable.
             .event => |flagged| .{
@@ -139,6 +140,17 @@ pub const Entry = union(enum) {
                 .prefix = if (flagged.is_error) "Error: " else "",
             },
             .user, .tool_result, .thinking, .model => null,
+        };
+    }
+
+    /// The role of the box this block paints, or null for a block that paints a
+    /// notice or markdown. A failed call takes the error color, so the state of
+    /// a call decides the color of its box.
+    fn boxRole(self: *const Entry) ?role.Name {
+        return switch (self.*) {
+            .user => .user,
+            .tool_result => |flagged| if (flagged.is_error) .tool_error else .tool_success,
+            .intro, .user_note, .thinking, .model, .event => null,
         };
     }
 
@@ -155,7 +167,7 @@ pub const Entry = union(enum) {
             ),
             .thinking => |reasoning| markdown.rows(reasoning.text.items, columns),
             .model => |list| markdown.rows(list.items, columns),
-            .intro, .skill, .event => unreachable,
+            .intro, .user_note, .event => unreachable,
         };
     }
 
@@ -163,12 +175,13 @@ pub const Entry = union(enum) {
     /// rows (nonzero only for the clip).
     pub fn render(self: *const Entry, placement: *const paint.Placement) !void {
         if (self.notice()) |look| return paint.notice(placement, &look, self.bytes());
+        const box = self.boxRole();
         switch (self.*) {
-            .intro, .skill, .event => unreachable,
-            .user => |list| try paint.box(placement, .user, &.{ .text = list.items }),
+            .intro, .user_note, .event => unreachable,
+            .user => |list| try paint.box(placement, box.?, &.{ .text = list.items }),
             .tool_result => |flagged| try paint.box(
                 placement,
-                if (flagged.is_error) .tool_error else .tool_success,
+                box.?,
                 // The head row names the tool, so the box emphasizes that
                 // name. A finished box then reads like the running one.
                 &.{
@@ -250,7 +263,7 @@ test "each entry variant renders exactly the rows it counts" {
         .{ .kind = .user, .options = .{}, .text = "a user message long enough to wrap " ++
             "across the narrow test width more than once" },
         // The head of a skill invocation: one line that no box holds.
-        .{ .kind = .skill, .options = .{}, .text = "Skill: zig-style · File: " ++
+        .{ .kind = .user_note, .options = .{}, .text = "Skill: zig-style · File: " ++
             ".agents/skills/zig-style/SKILL.md" },
         .{ .kind = .model, .options = .{}, .text = "model reply\nwith a blank\n\n" ++
             "then a long paragraph that must wrap several rows" },
@@ -379,6 +392,50 @@ test "a clipped block shows its bottom rows" {
     const columns = 20;
     try std.testing.expectEqual(@as(usize, 40), entry.rows(columns));
     try std.testing.expectEqual(@as(usize, 15), try renderedRows(gpa, &entry, columns, 25));
+}
+
+/// One pinned block, and the role it paints as a notice or as a box. A block
+/// that paints markdown carries neither name.
+const Pinned = struct {
+    kind: Entry.Kind,
+    options: Entry.Options = .{},
+    notice: ?role.Name = null,
+    box: ?role.Name = null,
+};
+
+// The color of a block states who wrote it. A line that reports a message that
+// Drinky wrote for the user takes the user color. It never reads as a report
+// about the state of the session. A kind that the list leaves out fails, so a
+// new kind cannot reach a release unclassified.
+test "each block kind pins the role that it paints" {
+    const gpa = std.testing.allocator;
+    const pinned = [_]Pinned{
+        .{ .kind = .intro, .notice = .muted },
+        // Every message that Drinky wrote for the user reports in this color.
+        .{ .kind = .user_note, .notice = .user_note },
+        .{ .kind = .event, .notice = .muted },
+        .{ .kind = .event, .options = .{ .is_error = true }, .notice = .@"error" },
+        .{ .kind = .user, .box = .user },
+        .{ .kind = .tool_result, .box = .tool_success },
+        .{ .kind = .tool_result, .options = .{ .is_error = true }, .box = .tool_error },
+        // Reasoning and a reply paint markdown, which owns its own colors.
+        .{ .kind = .thinking },
+        .{ .kind = .model },
+    };
+    var seen: std.EnumSet(Entry.Kind) = .initEmpty();
+    for (pinned) |pin| {
+        var entry = try Entry.init(gpa, pin.kind, pin.options, "one line");
+        defer entry.deinit(gpa);
+        const look = entry.notice();
+        if (pin.notice) |name| {
+            try std.testing.expectEqual(name, look.?.role);
+        } else {
+            try std.testing.expect(look == null);
+        }
+        try std.testing.expectEqual(pin.box, entry.boxRole());
+        seen.insert(pin.kind);
+    }
+    try std.testing.expectEqual(std.enums.values(Entry.Kind).len, seen.count());
 }
 
 // An error event must be visibly distinct: the error role and an "Error: "

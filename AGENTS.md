@@ -34,6 +34,20 @@ Delete a landed entry from `BACKLOG.md`. Read the `BACKLOG.md` header before you
 - Never start a sentence with lowercase `drinky`.
 - Reserve `DRINKY` for an environment variable. Do not use it in prose or code identifiers.
 
+## Interface
+
+`src/ui/role.zig` is the one seam from a semantic role to color bytes. A widget names a role and
+writes no color of its own. The `colors` preview page is the one exception.
+
+- A message that Drinky wrote for the user takes the user color and no box. The head of a loaded
+  skill and the line of a retry attempt are such messages. Use the `user_note` block kind for each
+  one, so no message box can forge it.
+- An event block reports the state of the session, never a message. It stays muted, or it takes the
+  error color for a failure.
+- A user box holds typed text alone.
+- Pin a new block kind in the role test of `src/ui/block.zig`, so no kind reaches a release
+  unclassified.
+
 ## Writing style
 
 Use ASD-STE100 Simplified Technical English for Markdown, code comments, and Drinky-generated text.

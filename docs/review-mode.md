@@ -13,8 +13,8 @@ Land these shared features before review mode:
 Each feature must use the normal app path. Review mode must not implement a private variant.
 
 The command refusal path below already exists. Review mode uses it. Failure recovery and retry,
-active context projection, and conversation switching have all landed, so every prerequisite is
-in place.
+active context projection, and conversation switching have all landed, so every prerequisite is in
+place.
 
 ### Active context projection
 
@@ -113,9 +113,10 @@ request contains only the latest error and never nests an older retry request.
 Retry never rewrites committed conversation history. Earlier retry requests, tool calls, results,
 reasoning, and human messages remain in order.
 
-Each attempt records one local event that names what it sends. The complete request stays out of the
-transcript, as a `/skill:` line keeps its expanded file out of it. An attempt that commits nothing
-takes its own blocks out again, so the transcript keeps only the failure events.
+Each attempt records one local line that names what it sends. Drinky wrote that message, so the line
+takes the user color and no box, like the head of a loaded skill. The complete request stays out of
+the transcript, as a `/skill:` line keeps its expanded file out of it. An attempt that commits
+nothing takes its own blocks out again, so the transcript keeps only the failure events.
 
 Failure events are local transcript events. They remain visible after success and across model
 switches. The model sees an error only through a generated retry request.

@@ -862,7 +862,7 @@ pub fn applyTurnEvent(self: *Session, event: *const TurnEvent) !bool {
                 .{ loaded.skill, source },
             );
             defer self.gpa.free(text);
-            try self.transcript.append(.skill, .{}, text);
+            try self.transcript.append(.user_note, .{}, text);
         },
         .turn_ended => {
             turn.progress_sequence_applied = event.progress_sequence;
@@ -3420,7 +3420,7 @@ test "a delivered skill shows as a head line, not as a user box" {
     const blocks = session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 1), blocks.len);
     switch (blocks[0]) {
-        .skill => |head| try std.testing.expectEqualStrings(
+        .user_note => |head| try std.testing.expectEqualStrings(
             "Skill: zig-style · File: .agents/skills/zig-style/SKILL.md",
             head.items,
         ),

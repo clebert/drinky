@@ -22,9 +22,11 @@ const Retry = @This();
 /// The latest complete failure sentence. Owned.
 failure: []const u8,
 
-/// The transcript event that reports one attempt. The request itself stays out
-/// of the transcript, as a skill marker keeps its expanded file out of it.
-pub const event_text = "Drinky asked the model to continue from the committed work.";
+/// The transcript line that reports one attempt. Drinky wrote the message that
+/// the attempt sends, so the line takes the user color and no box. The request
+/// itself stays out of the transcript, as a skill marker keeps its expanded file
+/// out of it.
+pub const note_text = "Drinky asked the model to continue from the committed work.";
 
 /// The line that tells the model where to continue.
 const continuation = "Continue from the last committed checkpoint.";

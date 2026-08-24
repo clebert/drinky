@@ -139,7 +139,13 @@ const items = blk: {
             .name = .muted,
             .text = "~/drinky (main) · Context: 42% · $0.14",
         } },
-        .{ .sample = .{ .label = "Notice", .name = .muted, .text = "Selection canceled." } },
+        // An information notice replaces the muted status line, so it reads at
+        // the normal intensity. Only a warning and a failure carry a color.
+        .{ .sample = .{
+            .label = "Notice",
+            .name = .text,
+            .text = "Drinky returned every queued message to the editor.",
+        } },
         .{ .sample = .{
             .label = "Thinking",
             .name = .muted,
@@ -156,7 +162,7 @@ const items = blk: {
         } },
         .{ .sample = .{ .label = "Accent", .name = .accent, .text = "Queued message:" } },
         .{ .sample = .{
-            .label = "Skill",
+            .label = "User note",
             .name = .user_note,
             .text = "Skill: zig-style · File: .agents/skills/zig-style/SKILL.md",
         } },
@@ -299,8 +305,10 @@ fn renderStyle(sink: *terminal.View.Sink, comptime style: Style) !void {
     try attribute.apply(sink, .reset);
 }
 
+/// One text-role row: the label of the role, then the sample in that role. The
+/// label column holds the longest label and one blank after it.
 fn renderSample(sink: *terminal.View.Sink, comptime sample: Sample) !void {
-    try sink.text(std.fmt.comptimePrint("{s:<10}", .{sample.label ++ ":"}));
+    try sink.text(std.fmt.comptimePrint("{s:<11}", .{sample.label ++ ":"}));
     try role.apply(sink, sample.name);
     if (sample.italic) try attribute.apply(sink, .italic);
     if (sample.underline) try attribute.apply(sink, .underline);
