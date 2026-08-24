@@ -14,6 +14,11 @@ pub const default_core =
     "You are a coding assistant operating inside Drinky, a terminal coding-agent harness.\n\n" ++
     "Complete the user's request.\n" ++
     "Use the available tools according to their schemas.\n" ++
+    // A model can reach for a shell grep that the grep tool already covers. The
+    // tools skip the noise directories, cost no process, and give the transcript
+    // a pattern row instead of a command.
+    "Use the find tool and the grep tool to search files.\n" ++
+    "Run a search in bash only when these tools cannot express it.\n" ++
     "Read a file before you change it, because an edit must match the current bytes.\n" ++
     "Answer a question about Drinky itself from the describe_drinky tool, and never from " ++
     "memory.\n" ++
@@ -317,6 +322,8 @@ test "the compiled core is stable" {
             "harness.\n\n" ++
             "Complete the user's request.\n" ++
             "Use the available tools according to their schemas.\n" ++
+            "Use the find tool and the grep tool to search files.\n" ++
+            "Run a search in bash only when these tools cannot express it.\n" ++
             "Read a file before you change it, because an edit must match the current bytes.\n" ++
             "Answer a question about Drinky itself from the describe_drinky tool, and never " ++
             "from memory.\n" ++

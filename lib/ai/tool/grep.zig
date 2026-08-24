@@ -24,6 +24,9 @@ const bytes_read_max = 256 << 20;
 pub const spec: llm.Tool = .{
     .name = "grep",
     .description = "Search file contents for a literal substring (not a regex). " ++
+        // The routing sentence belongs here, not in the bash description alone.
+        // A model reads the bash schema after it chose bash.
+        "Use this tool for a literal search instead of a grep or rg command in bash. " ++
         "Returns matching lines as 'path:line:text', with paths relative to the working " ++
         "directory. Skips common version-control stores, dependency directories, virtual " ++
         "environments, build outputs, and tool caches. A path that ends with a skipped " ++
