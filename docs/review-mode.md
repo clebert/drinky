@@ -13,36 +13,45 @@ Land these shared features before review mode:
 Each feature must use the normal app path. Review mode must not implement a private variant.
 
 The command refusal path below already exists. Review mode uses it. Failure recovery and retry
-landed too, so only active context projection and conversation switching remain.
+landed too, and active context projection with them, so only conversation switching remains.
 
 ### Active context projection
 
-Drinky keeps complete provider-neutral history. It projects that history for the active account.
+Status: Landed.
+
+Drinky keeps complete provider-neutral history. It projects that history for the setup of the next
+request: the account, the model, and the effort level.
 
 - User and assistant messages remain compatible.
 - Opaque reasoning requires the exact account that created it.
+- Anthropic replays stored reasoning only while the request names an effort, so the resolved effort
+  selects it too.
 - A tool call and its results form one linked group.
 - Drinky includes a tool group only when the active provider can represent it correctly.
 - Hidden items stay in canonical history and return after a compatible switch.
 - A credential replacement permanently removes replay proofs from that account slot.
 
-The model is not a projection dimension. Anthropic replays mixed-model reasoning in one account,
-which its Fable fallback shows. Drinky records no producing model on a reasoning item, and every
-`/model` switch already replays the previous model's reasoning. Whether OpenAI accepts a cross-model
-replay of encrypted reasoning is unconfirmed. A rejection surfaces as a loud API error, so Drinky
-does not filter on a guess.
+Model identity does not filter reasoning. Anthropic replays mixed-model reasoning in one account,
+which its Fable fallback shows. Drinky records no producing model on a reasoning item, so a `/model`
+switch replays the reasoning of the previous model. Whether OpenAI accepts a cross-model replay of
+encrypted reasoning is unconfirmed. A rejection surfaces as a loud API error, so Drinky does not
+filter on a guess.
+
+The new model can still change the replay, because it brings its own effort map. Fable resolves
+`none` to `low` and replays, and Opus resolves `none` to no thinking and replays nothing. That
+switch drops the prior reasoning, so it repaints deeply.
 
 The visible conversation blocks must match the projected model context. Drinky shows no marker for a
 hidden item.
 
 Local event blocks remain visible because they are not model context.
 
-A model switch within one account hides nothing, so it needs no deep repaint. An account or
-conversation switch performs one:
+A switch that keeps the account and the replay hides nothing, so it needs no deep repaint. Every
+other account, model, effort, or conversation switch performs one:
 
 - Select the canonical history and its local events.
 - Project compatible conversation items.
-- Rebuild the transcript from that projection.
+- Filter the canonical transcript to that projection.
 - Clear the prior screen and terminal scrollback.
 - Render only the selected context.
 

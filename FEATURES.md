@@ -98,6 +98,8 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - While signed out, Drinky refuses a message with a prompt to `/login`.
 - Reasoning replays only to the account that produced it. A login, a logout, or a credential
   replacement discards that account's reasoning, cache-hit rate, and allowance.
+- Drinky shows only the conversation that the next request carries, so a change that drops stored
+  reasoning repaints the screen and the scrollback without it.
 
 ## Signing in
 

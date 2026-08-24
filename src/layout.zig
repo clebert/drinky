@@ -20,8 +20,11 @@ const window_pages = 8;
 
 /// Anchor ids for the tail rows. They come from a reserved high range a growing
 /// transcript index (a block's id) can never reach, so anchors never alias as
-/// the model grows. The editor and picker share `id_input`: they occupy the same
-/// region, so the diff repaints it in place when one replaces the other.
+/// the model grows. A block takes its index in the projection, and a projection
+/// that hides a block moves every index behind it. Such a change repaints the
+/// whole window, so no stale anchor survives it. The editor and picker share
+/// `id_input`: they occupy the same region, so the diff repaints it in place
+/// when one replaces the other.
 const id_reserved = std.math.maxInt(usize) - 255;
 const id_status = id_reserved;
 const id_input = id_reserved + 1;
@@ -42,7 +45,10 @@ pub const Scene = union(enum) {
     page: *const ui.Page,
 
     pub const Conversation = struct {
-        transcript: []const ui.block.Entry,
+        /// The transcript blocks the active account shows, oldest first. A
+        /// projection hides the blocks of another account, so the scene borrows
+        /// one pointer per shown block instead of a contiguous slice.
+        transcript: []const *const ui.block.Entry,
         tail: Tail,
         status: *const ui.status.Info,
     };
@@ -213,7 +219,7 @@ fn tailCount(tail: *const Tail) usize {
 /// tail, then the status line.
 fn slotAt(scene: *const Scene.Conversation, index: usize) Slot {
     if (index < scene.transcript.len) return .{
-        .component = .{ .entry = &scene.transcript[index] },
+        .component = .{ .entry = scene.transcript[index] },
         .id = index,
         .leading_blank = index > 0,
     };
@@ -278,6 +284,18 @@ const test_status: ui.status.Info = .{
     .quota = null,
 };
 
+// The projection of `entries`: one borrowed pointer per shown block, as the
+// session hands the layout its projected transcript. Caller-owned.
+fn shownEntries(
+    gpa: std.mem.Allocator,
+    entries: []const ui.block.Entry,
+) !std.ArrayList(*const ui.block.Entry) {
+    var shown: std.ArrayList(*const ui.block.Entry) = .empty;
+    errdefer shown.deinit(gpa);
+    for (entries) |*entry| try shown.append(gpa, entry);
+    return shown;
+}
+
 // Projects `scene` into a fresh view at `size` and returns the frame's bytes,
 // caller-owned.
 fn projected(gpa: std.mem.Allocator, size: terminal.View.Size, scene: *const Scene) ![]u8 {
@@ -307,8 +325,11 @@ test "projection stacks the transcript above the tail, newest at the bottom" {
     try entries.append(gpa, try ui.block.Entry.init(gpa, .user, .{}, "useryy"));
     try entries.append(gpa, try ui.block.Entry.init(gpa, .model, .{}, "replyzz"));
 
+    var shown = try shownEntries(gpa, entries.items);
+    defer shown.deinit(gpa);
+
     const scene: Scene = .{ .conversation = .{
-        .transcript = entries.items,
+        .transcript = shown.items,
         .tail = .{ .prompt = .{ .hint = null, .editor = &editor } },
         .status = &test_status,
     } };
@@ -339,7 +360,7 @@ test "a turn tail stacks tool boxes above the active editor" {
         .{ .text = "grepbox", .fit = .head },
     };
     const scene: Scene = .{ .conversation = .{
-        .transcript = &[_]ui.block.Entry{},
+        .transcript = &.{},
         .tail = .{ .turn = .{
             .tools = &tools,
             .activity = .{ .motion_tick = 0, .progress_age_ticks = 0 },
@@ -401,7 +422,7 @@ test "a turn with 253 tool boxes keeps its anchor ids from wrapping" {
 
     const tools = [_]ui.paint.Box{.{ .text = "toolbox" }} ** 253;
     const scene: Scene = .{ .conversation = .{
-        .transcript = &[_]ui.block.Entry{},
+        .transcript = &.{},
         .tail = .{ .turn = .{
             .tools = &tools,
             .activity = .{ .motion_tick = 0, .progress_age_ticks = 0 },
@@ -424,7 +445,7 @@ test "a turn tail shows the steering queue above the editor" {
 
     const queue = [_][]const u8{ "fix the bug", "then add a test\nnot this row" };
     const scene: Scene = .{ .conversation = .{
-        .transcript = &[_]ui.block.Entry{},
+        .transcript = &.{},
         .tail = .{ .turn = .{
             .tools = &.{},
             .activity = .{ .motion_tick = 0, .progress_age_ticks = 0 },
@@ -467,8 +488,11 @@ test "a prompt tail shows its hint row above the editor" {
         try ui.block.Entry.init(gpa, .event, .{ .is_error = true }, "the turn failed"),
     );
 
+    var shown = try shownEntries(gpa, entries.items);
+    defer shown.deinit(gpa);
+
     const scene: Scene = .{ .conversation = .{
-        .transcript = entries.items,
+        .transcript = shown.items,
         .tail = .{ .prompt = .{
             .hint = "Ctrl+N: Try again · Esc: Dismiss",
             .editor = &editor,
@@ -487,7 +511,7 @@ test "a prompt tail shows its hint row above the editor" {
     try std.testing.expect(draft < footer);
 
     const bare: Scene = .{ .conversation = .{
-        .transcript = entries.items,
+        .transcript = shown.items,
         .tail = .{ .prompt = .{ .hint = null, .editor = &editor } },
         .status = &test_status,
     } };
@@ -512,7 +536,7 @@ test "a narrow window clips the steering rows to width" {
 
     const queue = [_][]const u8{"\u{4F60}x is wider than the window"};
     const scene: Scene = .{ .conversation = .{
-        .transcript = &[_]ui.block.Entry{},
+        .transcript = &.{},
         .tail = .{ .turn = .{
             .tools = &.{},
             .activity = .{ .motion_tick = 0, .progress_age_ticks = 0 },
@@ -568,8 +592,11 @@ test "projection clips the oldest block to fill the window exactly" {
     }
     try entries.append(gpa, try ui.block.Entry.init(gpa, .model, .{}, text.items));
 
+    var shown = try shownEntries(gpa, entries.items);
+    defer shown.deinit(gpa);
+
     const scene: Scene = .{ .conversation = .{
-        .transcript = entries.items,
+        .transcript = shown.items,
         .tail = .{ .prompt = .{ .hint = null, .editor = &editor } },
         .status = &test_status,
     } };

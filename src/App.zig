@@ -634,7 +634,7 @@ pub fn run(
 
     self.session = Session.init(gpa, self.tty.writer(), self.agent.model, self.agent.effort);
     defer self.session.deinit();
-    self.session.account_shown = active;
+    self.session.showSetup(active, self.agent.model, self.agent.effort);
     // The session reports how long a call has run against this timeout, so it
     // must read the same one the tool runs under.
     self.session.bash_timeout_ms = config.bash.timeout_ms;
@@ -1965,9 +1965,9 @@ fn applyOutcome(self: *App, outcome: ai.command.Outcome) !void {
 /// Mirror the agent configuration into the session and the project state.
 fn mirrorAgentState(self: *App) !void {
     self.session.stats_shown = self.agent.stats;
-    self.session.model_shown = self.agent.model;
-    self.session.effort_shown = self.agent.effort;
-    self.session.account_shown = self.activeAccount();
+    // The account, the model, and the effort select the transcript projection
+    // too, so a change repaints the conversation that the next request carries.
+    self.session.showSetup(self.activeAccount(), self.agent.model, self.agent.effort);
     try self.recordState();
 }
 
@@ -2021,7 +2021,7 @@ fn loginAccount(self: *App, account: ai.llm.Account) !void {
 
     // A fresh login can represent another principal in the same account slot.
     // Nothing that principal produced crosses that boundary.
-    self.agent.dropAccountEvidence(account);
+    self.dropAccountEvidence(account);
     self.adopt(account);
     switch (login) {
         .saved => |path| try prompt.showAuthorized(path),
@@ -2074,7 +2074,7 @@ fn reportLoginFailure(self: *App, login_error: anyerror) !void {
 /// before this credential can run the restored turn.
 fn acceptCredentialReplacement(self: *App, account: ai.llm.Account) !void {
     self.accounts.dropPrincipalMetadata(account);
-    self.agent.dropAccountEvidence(account);
+    self.dropAccountEvidence(account);
     self.adopt(account);
     try self.mirrorAgentState();
 }
@@ -2092,7 +2092,7 @@ fn rejectCredential(self: *App, account: ai.llm.Account) !void {
         maybe_removal_error = err;
         break :failure false;
     };
-    self.agent.dropAccountEvidence(account);
+    self.dropAccountEvidence(account);
     if (recovered) {
         // `invalidate` dropped the limits the replaced credential discovered, so
         // the model resolves again before the session shows it.
@@ -2157,7 +2157,7 @@ fn logoutAccount(self: *App, account: ai.llm.Account) !void {
             .{@errorName(err)},
         );
     };
-    self.agent.dropAccountEvidence(account);
+    self.dropAccountEvidence(account);
     if (!was_active)
         return self.recordEvent(.information, "Drinky signed out of {s}.", .{account.label()});
     if (self.accounts.firstAuthenticated()) |next| {
@@ -2186,6 +2186,15 @@ fn logoutAccount(self: *App, account: ai.llm.Account) !void {
 /// account or read it from the registry.
 fn adopt(self: *App, account: ai.llm.Account) void {
     self.agent.switchTo(self.accounts.client(account).?, self.accountModel(account));
+}
+
+/// Forget everything the principal behind `account` produced: the replay proofs
+/// in history, and the reasoning blocks that hold them in the transcript. Both
+/// sides drop together, so the interface never shows a block that no request
+/// carries.
+fn dropAccountEvidence(self: *App, account: ai.llm.Account) void {
+    self.agent.dropAccountEvidence(account);
+    self.session.dropAccountReasoning(account);
 }
 
 /// The shared refusal path for a command that the active state does not allow.
@@ -4583,6 +4592,64 @@ test "an account-switch command clears the quota snapshot and records the projec
     );
 }
 
+// The command path that switches the account also projects the conversation for
+// it: the canonical history and transcript keep every item, and the interface
+// shows what the next request carries.
+test "an account switch projects the conversation for the new account" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    const anthropic_client = ai.provider.Client.init(
+        gpa,
+        io,
+        .{ .anthropic_subscription = undefined },
+        .{},
+    );
+    var app: App = undefined;
+    app.initForTest(gpa);
+    // The effort names a thinking control, so the request of this account replays
+    // its stored reasoning.
+    app.agent = ai.Agent.init(gpa, io, anthropic_client, .{
+        .model = anthropic_default,
+        .system = "",
+        .retry = .{},
+        .effort = .high,
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .high);
+    defer app.session.deinit();
+    app.session.showSetup(.anthropic_subscription, anthropic_default, .high);
+
+    const replay: ai.llm.Item.Reasoning.Replay = .{ .anthropic_subscription = .{
+        .signature = .{ .text = "weigh it", .signature = "proof" },
+    } };
+    try app.agent.items.append(gpa, .{ .reasoning = .{ .replay = try replay.dupe(gpa) } });
+    try app.session.transcript.appendStream(.thinking, .anthropic_subscription, "weigh it");
+    try app.session.transcript.appendStream(.model, null, "the answer");
+    try app.session.paint(.{ .columns = 80, .rows = 24 });
+
+    const switched_start = out.written().len;
+    const openai_client = ai.provider.Client.init(gpa, io, .{ .openai_api = "sk-test" }, .{});
+    app.agent.switchTo(openai_client, openai_default);
+    try app.applyOutcome(
+        try ai.command.Outcome.reportEvent(gpa, .information, "switched", .{}),
+    );
+
+    // The OpenAI request replays no Anthropic proof, so the reasoning block
+    // leaves the screen. Both records keep it for the switch back.
+    try std.testing.expectEqual(@as(usize, 1), app.agent.items.items.len);
+    try std.testing.expectEqual(@as(usize, 3), app.session.transcript.blocks().len);
+    try std.testing.expect(app.session.view.force_reset);
+    try app.session.paint(.{ .columns = 80, .rows = 24 });
+    const switched = try terminal.View.plainText(gpa, out.written()[switched_start..]);
+    defer gpa.free(switched);
+    try std.testing.expect(std.mem.indexOf(u8, switched, "weigh it") == null);
+    try std.testing.expect(std.mem.indexOf(u8, switched, "the answer") != null);
+    try std.testing.expect(std.mem.indexOf(u8, switched, "switched") != null);
+}
+
 test "startup resumes on the account, model, and effort level this project used last" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -5017,6 +5084,9 @@ test "a replacement saved before invalidation keeps the account active" {
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
     defer app.session.deinit();
     app.session.account_shown = .anthropic_subscription;
+    // The block of that proof stands above the turn, so only the replacement can
+    // take it out again.
+    try app.session.transcript.appendStream(.thinking, .anthropic_subscription, "thought");
     app.session.beginTurn(1);
 
     try ai.json_store.save(gpa, io, app.accounts.anthropic_auth.path, "anthropic_subscription", .{
@@ -5061,6 +5131,8 @@ test "a replacement saved before invalidation keeps the account active" {
     );
     try std.testing.expect(app.session.mode == .prompt);
 
+    // The reasoning block of the replaced principal went with its proof, so the
+    // two events are all that stands.
     const blocks = app.session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 2), blocks.len);
     try std.testing.expect(std.mem.indexOf(u8, blocks[0].event.text.items, "signed out") == null);

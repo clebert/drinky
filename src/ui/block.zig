@@ -1,12 +1,13 @@
 //! The transcript-block model. `Entry` is a tagged union that carries exactly
 //! each block's data: the plain blocks a byte buffer, the flagged ones a buffer
-//! plus an error flag. It owns its bytes (`init`/`deinit`), measures itself
-//! (`rows`), and paints itself (`render`) with the shared `paint` primitives.
-//! The model block grows in place as its reply streams, and its markdown
-//! renders as it goes.
+//! plus an error flag, the reasoning one a buffer plus the account that produced
+//! it. It owns its bytes (`init`/`deinit`), measures itself (`rows`), and paints
+//! itself (`render`) with the shared `paint` primitives. The model block grows in
+//! place as its reply streams, and its markdown renders as it goes.
 
 const std = @import("std");
 
+const ai = @import("ai");
 const terminal = @import("terminal");
 
 const markdown = @import("markdown.zig");
@@ -19,7 +20,7 @@ pub const Entry = union(enum) {
     /// What Drinky sent for the user, such as the head of a loaded skill. It is
     /// not a box, so a typed message cannot forge it.
     skill: std.ArrayList(u8),
-    thinking: std.ArrayList(u8),
+    thinking: Reasoning,
     model: std.ArrayList(u8),
     tool_result: Flagged,
     event: Flagged,
@@ -30,6 +31,15 @@ pub const Entry = union(enum) {
         /// How a line wider than the window fits. Only a tool box reads it. An
         /// event renders as a notice, which always wraps.
         fit: paint.Fit,
+    };
+
+    /// One run of model reasoning and the account slot that produced it. Only
+    /// that slot replays the stored proof of that reasoning, so only that slot
+    /// shows the block. Null marks a block that no account claims, and every
+    /// projection shows such a block.
+    pub const Reasoning = struct {
+        text: std.ArrayList(u8),
+        account: ?ai.llm.Account,
     };
     pub const Kind = std.meta.Tag(Entry);
 
@@ -44,6 +54,9 @@ pub const Entry = union(enum) {
         /// sentence of a failure wraps, because its instruction sits at the end,
         /// and a cut there takes the half the user needs.
         fit: paint.Fit = .head,
+        /// The account slot that produced a reasoning block. Every other variant
+        /// ignores it.
+        account: ?ai.llm.Account = null,
     };
 
     /// A new block that owns a copy of `text`.
@@ -64,21 +77,34 @@ pub const Entry = union(enum) {
         return switch (kind) {
             .tool_result => .{ .tool_result = flagged },
             .event => .{ .event = flagged },
+            .thinking => .{ .thinking = .{ .text = list, .account = options.account } },
             inline else => |tag| @unionInit(Entry, @tagName(tag), list),
         };
     }
 
     pub fn deinit(self: *Entry, gpa: std.mem.Allocator) void {
         switch (self.*) {
-            .intro, .user, .skill, .thinking, .model => |*text| text.deinit(gpa),
+            .intro, .user, .skill, .model => |*text| text.deinit(gpa),
+            .thinking => |*reasoning| reasoning.text.deinit(gpa),
             .tool_result, .event => |*flagged| flagged.text.deinit(gpa),
         }
+    }
+
+    /// The account slot whose model context holds this block, or null for a
+    /// local block that every account shows. Only stored reasoning binds to one
+    /// account, because only that account replays its proof.
+    pub fn account(self: *const Entry) ?ai.llm.Account {
+        return switch (self.*) {
+            .thinking => |reasoning| reasoning.account,
+            .intro, .user, .skill, .model, .tool_result, .event => null,
+        };
     }
 
     /// The bytes this block holds.
     fn bytes(self: *const Entry) []const u8 {
         return switch (self.*) {
-            .intro, .user, .skill, .thinking, .model => |list| list.items,
+            .intro, .user, .skill, .model => |list| list.items,
+            .thinking => |reasoning| reasoning.text.items,
             .tool_result, .event => |flagged| flagged.text.items,
         };
     }
@@ -111,7 +137,8 @@ pub const Entry = union(enum) {
                 &.{ .text = flagged.text.items, .fit = flagged.fit },
                 columns,
             ),
-            .thinking, .model => |list| markdown.rows(list.items, columns),
+            .thinking => |reasoning| markdown.rows(reasoning.text.items, columns),
+            .model => |list| markdown.rows(list.items, columns),
             .intro, .skill, .event => unreachable,
         };
     }
@@ -134,7 +161,7 @@ pub const Entry = union(enum) {
                     .emphasis = .first_value,
                 },
             ),
-            .thinking => |list| try markdown.render(placement, .muted, list.items),
+            .thinking => |reasoning| try markdown.render(placement, .muted, reasoning.text.items),
             .model => |list| try markdown.render(placement, null, list.items),
         }
     }

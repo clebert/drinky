@@ -134,7 +134,9 @@ model_shown: ai.models.Model,
 /// indicator. It updates after a command runs.
 effort_shown: ai.llm.Effort,
 /// The active account. It mirrors the agent after a command runs. Null shows a
-/// signed-out indicator. The model and effort are then stale placeholders.
+/// signed-out indicator. The model and effort are then stale placeholders. The
+/// three together select the transcript projection, so `showSetup` owns every
+/// change of them after the start.
 account_shown: ?ai.llm.Account,
 /// The working directory the status line shows, with the home directory
 /// abbreviated. It borrows `App` storage, because the working directory cannot
@@ -497,6 +499,58 @@ pub fn resetConversation(self: *Session) void {
     self.dirty = true;
 }
 
+/// Show the setup of the next request — the account that sends it, the model it
+/// names, and the effort level it renders — and project the transcript for it.
+/// All three decide together which stored reasoning that request replays, so they
+/// change as one step.
+///
+/// A change that hides or restores a block repaints deeply: the next paint clears
+/// the screen and the terminal scrollback, then prints the projected
+/// conversation alone. No row of another setup stays reachable, and a restored
+/// row returns above the window. A change that keeps every block keeps the
+/// scrollback, so a switch that replays the same reasoning costs nothing.
+pub fn showSetup(
+    self: *Session,
+    account: ?ai.llm.Account,
+    model: ai.models.Model,
+    effort: ai.llm.Effort,
+) void {
+    const previous = self.projectionSetup();
+    self.account_shown = account;
+    self.model_shown = model;
+    self.effort_shown = effort;
+    if (self.transcript.projectionChanges(previous, self.projectionSetup()))
+        self.view.resetScreen();
+    self.dirty = true;
+}
+
+/// What the next request carries of the stored reasoning. The account decides
+/// which proofs it can replay at all, and the model with the effort level decides
+/// whether it replays any. A signed-out Drinky sends no request, so its setup
+/// hides nothing.
+fn projectionSetup(self: *const Session) Transcript.Setup {
+    const account = self.account_shown orelse
+        return .{ .account = null, .replays_reasoning = true };
+    const resolution = self.model_shown.effort.resolve(self.effort_shown);
+    return .{
+        .account = account,
+        .replays_reasoning = resolution.replaysReasoning(account.provider()),
+    };
+}
+
+/// Forget the reasoning blocks that `account` produced. A credential replacement
+/// removes the replay proofs of that account slot from history for good, so the
+/// blocks that hold that reasoning leave the interface with them. Commands and
+/// credential changes run between turns, so this cannot discard live turn state.
+pub fn dropAccountReasoning(self: *Session, account: ai.llm.Account) void {
+    std.debug.assert(self.mode == .prompt);
+    // Only a block the active projection showed can leave a row on the screen.
+    const was_shown = Transcript.shows(account, self.projectionSetup());
+    if (!self.transcript.dropAccount(account)) return;
+    if (was_shown) self.view.resetScreen();
+    self.dirty = true;
+}
+
 /// Clear the transient notice. The regular footer returns on the next frame.
 pub fn clearNotice(self: *Session) void {
     if (self.notice) |notice| {
@@ -586,11 +640,13 @@ pub fn applyTurnEvent(self: *Session, event: *const TurnEvent) !bool {
     switch (event.payload) {
         .text => |delta| {
             self.dropStaleTools(turn);
-            try self.transcript.appendStream(.model, delta);
+            try self.transcript.appendStream(.model, null, delta);
         },
         .thinking => |delta| {
             self.dropStaleTools(turn);
-            try self.transcript.appendStream(.thinking, delta);
+            // The account cannot change while a turn runs, so the account the
+            // status line shows is the account that produced this reasoning.
+            try self.transcript.appendStream(.thinking, self.account_shown, delta);
         },
         .tool_name => |name| {
             self.dropStaleTools(turn);
@@ -1217,7 +1273,7 @@ pub fn paint(self: *Session, size: terminal.View.Size) !void {
         .viewing => unreachable,
     };
     const scene: layout.Scene = .{ .conversation = .{
-        .transcript = self.transcript.blocks(),
+        .transcript = try self.transcript.projection(self.projectionSetup()),
         .tail = tail,
         .status = &status,
     } };
@@ -1431,6 +1487,16 @@ fn freeTurn(self: *Session, turn: *Turn) void {
 
 const test_model = ai.models.get(.anthropic, "claude-sonnet-4-6") orelse
     @compileError("test model is not in the model table");
+
+// The model of the other vendor, for a switch that crosses accounts. A model
+// never pairs with a foreign vendor's account.
+const test_model_openai = ai.models.get(.openai, "gpt-5.6-sol") orelse
+    @compileError("test model is not in the model table");
+
+// The effort level that names a thinking control on `test_model`, so a request of
+// that setup replays its stored reasoning. Level `none` omits the control there,
+// which takes every stored thinking block out of the request.
+const replaying_effort: ai.llm.Effort = .high;
 
 fn applyEvent(session: *Session, generation: u64, payload: TurnEvent.Payload) !void {
     _ = try session.applyTurnEvent(&.{ .generation = generation, .payload = payload });
@@ -1801,7 +1867,9 @@ test "scripted stream events drive the model and one coalesced paint" {
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
 
-    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    // The effort names a thinking control, so the request of the shown account
+    // replays the reasoning that this turn streams.
+    var session: Session = Session.init(gpa, &out.writer, test_model, replaying_effort);
     defer session.deinit();
     session.beginTurn(1);
 
@@ -2596,7 +2664,7 @@ test "a failure with nothing committed rewinds the tail and returns the prompt" 
     try session.transcript.append(.event, .{}, "earlier");
     const base = session.transcript.blocks().len;
     try session.transcript.append(.user, .{}, "my prompt");
-    try session.transcript.appendStream(.model, "partial reply");
+    try session.transcript.appendStream(.model, null, "partial reply");
     var prompt = try ui.Editor.Draft.fromText(gpa, "my prompt");
     session.retainTurnPrompt(&prompt, base);
     try queueSteeringText(&session, "steer");
@@ -2693,7 +2761,7 @@ test "a cancel with nothing committed rewinds the tail and returns the prompt" {
     try session.transcript.append(.event, .{}, "earlier");
     const base = session.transcript.blocks().len;
     try session.transcript.append(.user, .{}, "my prompt");
-    try session.transcript.appendStream(.model, "partial reply");
+    try session.transcript.appendStream(.model, null, "partial reply");
 
     var prompt = try ui.Editor.Draft.fromText(gpa, "my prompt");
     session.retainTurnPrompt(&prompt, base);
@@ -2812,7 +2880,7 @@ test "a cancel during a tool call keeps the call and shows it as failed" {
     const blocks = session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 4), blocks.len);
     try std.testing.expectEqualStrings("prompt", blocks[0].user.items);
-    try std.testing.expectEqualStrings("I run one command.", blocks[1].thinking.items);
+    try std.testing.expectEqualStrings("I run one command.", blocks[1].thinking.text.items);
     try std.testing.expect(blocks[2].tool_result.is_error);
     try std.testing.expectEqualStrings(
         "Tool: bash · Command: sleep 600\nError: " ++ ai.Agent.unfinished_tool_result,
@@ -3323,4 +3391,151 @@ test "a committed call with no streamed row leaves its sibling's row alone" {
         .input_json = try gpa.dupe(u8, "{\"pattern\":\"x\"}"),
     } });
     try std.testing.expectEqual(@as(usize, 0), session.mode.turn.streamed_tools.items.len);
+}
+
+// Active context projection: one canonical transcript, one visible conversation
+// per request setup. A provider replays stored reasoning only to the account that
+// produced it, so the screen must hold no reasoning that the next request drops.
+// The switch repaints deeply, which clears the terminal scrollback with the
+// screen, and a switch back shows the block again.
+test "an account switch hides the reasoning of the other account" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var session: Session = Session.init(gpa, &out.writer, test_model, replaying_effort);
+    defer session.deinit();
+    session.showSetup(.anthropic_subscription, test_model, replaying_effort);
+    session.beginTurn(1);
+
+    try applyEvent(&session, 1, .{ .thinking = try gpa.dupe(u8, "weigh it") });
+    try applyEvent(&session, 1, .{ .text = try gpa.dupe(u8, "the answer") });
+    try finishTurn(&session, 0);
+    try session.paint(.{ .columns = 80, .rows = 24 });
+    try expectPainted(gpa, out.written(), "weigh it");
+
+    // The switch arms the deep repaint before the paint runs.
+    const switched_start = out.written().len;
+    session.showSetup(.openai_api, test_model_openai, replaying_effort);
+    try std.testing.expect(session.view.force_reset);
+    try session.paint(.{ .columns = 80, .rows = 24 });
+    const switched = out.written()[switched_start..];
+    // The reset drops the scrollback, so no earlier row of the reasoning stays
+    // reachable.
+    try std.testing.expect(std.mem.indexOf(u8, switched, terminal.escape.screen_reset) != null);
+    const shown = try terminal.View.plainText(gpa, switched);
+    defer gpa.free(shown);
+    try std.testing.expect(std.mem.indexOf(u8, shown, "weigh it") == null);
+    try std.testing.expect(std.mem.indexOf(u8, shown, "the answer") != null);
+    // The canonical record keeps the hidden block.
+    try std.testing.expectEqual(@as(usize, 2), session.transcript.blocks().len);
+
+    const restored_start = out.written().len;
+    session.showSetup(.anthropic_subscription, test_model, replaying_effort);
+    try session.paint(.{ .columns = 80, .rows = 24 });
+    try expectPainted(gpa, out.written()[restored_start..], "weigh it");
+}
+
+// The account is not the only dimension of the projection. Anthropic drops every
+// thinking block unless the request names an effort, so an effort level that names
+// none takes the reasoning out of the request and off the screen.
+test "an effort level that replays no reasoning hides it" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var session: Session = Session.init(gpa, &out.writer, test_model, replaying_effort);
+    defer session.deinit();
+    session.showSetup(.anthropic_subscription, test_model, replaying_effort);
+    session.beginTurn(1);
+
+    try applyEvent(&session, 1, .{ .thinking = try gpa.dupe(u8, "weigh it") });
+    try applyEvent(&session, 1, .{ .text = try gpa.dupe(u8, "the answer") });
+    try finishTurn(&session, 0);
+    try session.paint(.{ .columns = 80, .rows = 24 });
+    try expectPainted(gpa, out.written(), "weigh it");
+
+    const silent_start = out.written().len;
+    session.showSetup(.anthropic_subscription, test_model, .none);
+    try std.testing.expect(session.view.force_reset);
+    try session.paint(.{ .columns = 80, .rows = 24 });
+    const silent = try terminal.View.plainText(gpa, out.written()[silent_start..]);
+    defer gpa.free(silent);
+    try std.testing.expect(std.mem.indexOf(u8, silent, "weigh it") == null);
+    try std.testing.expect(std.mem.indexOf(u8, silent, "the answer") != null);
+
+    // The level returns the block, because the proof stayed in the record.
+    const restored_start = out.written().len;
+    session.showSetup(.anthropic_subscription, test_model, .low);
+    try std.testing.expect(session.view.force_reset);
+    try session.paint(.{ .columns = 80, .rows = 24 });
+    try expectPainted(gpa, out.written()[restored_start..], "weigh it");
+}
+
+// A deep repaint costs the user the scrollback, so only a change that changes the
+// projection pays it. A conversation that holds no reasoning projects the same
+// under every setup.
+test "a setup change that hides no block keeps the scrollback" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var session: Session = Session.init(gpa, &out.writer, test_model, replaying_effort);
+    defer session.deinit();
+    session.showSetup(.anthropic_subscription, test_model, replaying_effort);
+    session.beginTurn(1);
+
+    try applyEvent(&session, 1, .{ .text = try gpa.dupe(u8, "the answer") });
+    try finishTurn(&session, 0);
+    try session.paint(.{ .columns = 80, .rows = 24 });
+
+    session.showSetup(.openai_api, test_model_openai, .none);
+    try std.testing.expect(!session.view.force_reset);
+    try std.testing.expect(session.dirty);
+
+    // A reasoning block of the active setup survives a model switch inside that
+    // account, because every level of both models names a control.
+    session.beginTurn(2);
+    try applyEvent(&session, 2, .{ .thinking = try gpa.dupe(u8, "weigh it") });
+    try finishTurn(&session, 0);
+    try session.paint(.{ .columns = 80, .rows = 24 });
+    const other_openai = ai.models.get(.openai, "gpt-5.6-luna").?;
+    session.showSetup(.openai_api, other_openai, .none);
+    try std.testing.expect(!session.view.force_reset);
+    // The block stays on the screen, so the paint of the new setup rewrites no
+    // row of it. Its projection is what the next frame shows.
+    const projected = try session.transcript.projection(session.projectionSetup());
+    try std.testing.expectEqual(@as(usize, 2), projected.len);
+    try std.testing.expectEqualStrings("weigh it", projected[1].thinking.text.items);
+}
+
+// A credential replacement can put another principal in one account slot. The
+// agent drops the replay proofs of that slot, so the blocks that hold them leave
+// the interface too, and no switch brings them back.
+test "dropped account reasoning leaves the transcript for good" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var session: Session = Session.init(gpa, &out.writer, test_model, replaying_effort);
+    defer session.deinit();
+    session.showSetup(.anthropic_subscription, test_model, replaying_effort);
+    session.beginTurn(1);
+
+    try applyEvent(&session, 1, .{ .thinking = try gpa.dupe(u8, "weigh it") });
+    try applyEvent(&session, 1, .{ .text = try gpa.dupe(u8, "the answer") });
+    try finishTurn(&session, 0);
+    try session.paint(.{ .columns = 80, .rows = 24 });
+
+    session.dropAccountReasoning(.anthropic_subscription);
+    try std.testing.expect(session.view.force_reset);
+    try std.testing.expectEqual(@as(usize, 1), session.transcript.blocks().len);
+
+    const dropped_start = out.written().len;
+    try session.paint(.{ .columns = 80, .rows = 24 });
+    const dropped = try terminal.View.plainText(gpa, out.written()[dropped_start..]);
+    defer gpa.free(dropped);
+    try std.testing.expect(std.mem.indexOf(u8, dropped, "weigh it") == null);
+    try std.testing.expect(std.mem.indexOf(u8, dropped, "the answer") != null);
+
+    // A slot with nothing left to drop keeps the screen as it is.
+    session.view.force_reset = false;
+    session.dropAccountReasoning(.anthropic_subscription);
+    try std.testing.expect(!session.view.force_reset);
 }
