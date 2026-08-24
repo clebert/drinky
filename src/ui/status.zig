@@ -8,7 +8,8 @@
 //!
 //! The line paints muted. Two kinds of field leave that role. A gauge takes a
 //! color when it fills past a threshold, and an identity field takes the normal
-//! intensity. Color means pressure. Intensity means identity.
+//! intensity. Color means pressure. Intensity means identity. A notice takes the
+//! role of its severity, and an information notice takes the normal intensity.
 
 const std = @import("std");
 
@@ -268,8 +269,11 @@ fn paintRuns(sink: *terminal.View.Sink, line: *const Line, kept: []const u8) !vo
 pub fn render(placement: *const paint.Placement, info: *const Info) !void {
     if (placement.base < placement.skip) return;
     if (info.notice) |notice| {
+        // An information notice takes the text role, not the muted role of the
+        // line. The row must read as a new message and not as the status it
+        // replaces. A warning and a failure carry their own color already.
         const name: role.Name = switch (notice.severity) {
-            .information => .muted,
+            .information => .text,
             .warning => .warning,
             .failure => .@"error",
         };
@@ -980,6 +984,26 @@ test "a warning notice uses the warning role without an error label" {
         painted,
         comptime role.sequence(.warning),
     ) != null);
+}
+
+test "an information notice reads at the normal intensity" {
+    const gpa = std.testing.allocator;
+    var info = test_info;
+    info.notice = .{ .text = "Drinky loaded every queued message.", .severity = .information };
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try renderForTest(gpa, &info, 40, &out);
+
+    const painted = out.written();
+    try expectShows(painted, &.{"Drinky loaded every queued message."});
+    try expectHides(painted, &.{"Error:"});
+    // The muted role belongs to the line that the notice replaces. The row drops
+    // it, so a notice never reads as the status behind it.
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        painted,
+        comptime role.sequence(.muted),
+    ) == null);
 }
 
 test "a signed-out status shows the indicator in place of the model" {

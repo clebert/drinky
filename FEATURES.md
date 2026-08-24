@@ -276,7 +276,8 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - Queued steering shows as `Queued message:` rows, and becomes one user message once consumed.
 - The bottom line shows `directory (branch)`, context fill, cost, quota, and cache-hit rate on the
   left, and `model (account) · Effort: level` on the right. At most one temporary notice replaces it
-  until the next user action. The notice keeps one row, so it never moves the editor above it.
+  until the next user action. The notice keeps one row, so it never moves the editor above it. A
+  warning and a failure carry their color, and an information notice reads at the normal intensity.
 - The context gauge holds what the last committed reply measured. Empty history is exactly 0.
 - The gauge reads `Context: Unknown` while the next request renders that history in another way. A
   model switch changes the tokenizer. An account renders the whole prompt around the history, so
