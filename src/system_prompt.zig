@@ -15,6 +15,8 @@ pub const default_core =
     "Complete the user's request.\n" ++
     "Use the available tools according to their schemas.\n" ++
     "Read a file before you change it, because an edit must match the current bytes.\n" ++
+    "Answer a question about Drinky itself from the describe_drinky tool, and never from " ++
+    "memory.\n" ++
     "Drinky renders your answer as Markdown in a terminal, so keep it short.";
 
 /// The final nanosecond of 9999-12-31 UTC.
@@ -316,6 +318,8 @@ test "the compiled core is stable" {
             "Complete the user's request.\n" ++
             "Use the available tools according to their schemas.\n" ++
             "Read a file before you change it, because an edit must match the current bytes.\n" ++
+            "Answer a question about Drinky itself from the describe_drinky tool, and never " ++
+            "from memory.\n" ++
             "Drinky renders your answer as Markdown in a terminal, so keep it short.",
         default_core,
     );

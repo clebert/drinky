@@ -83,6 +83,10 @@ const EditorPresentation = struct {
     activity: ?ui.paint.Activity,
 };
 
+/// How the control-hint row above the input paints. The measure and the paint
+/// share it, so the rows the hint takes cannot diverge from the rows it paints.
+const hint_notice: ui.paint.Notice = .{ .role = .muted };
+
 /// One screen component: a transcript block or a piece of the tail. Each variant
 /// carries what `measure` and `render` need.
 const Component = union(enum) {
@@ -103,7 +107,7 @@ const Component = union(enum) {
             .entry => |entry| entry.rows(size.columns),
             .tool_box => |box| ui.paint.boxRows(&box, size.columns),
             .steering => |messages| ui.paint.steeringRows(messages),
-            .hint => |text| std.mem.count(u8, text, "\n") + 1,
+            .hint => |text| ui.paint.noticeRows(&hint_notice, text, size.columns),
             .editor => |presentation| presentation.editor.rows(size),
             .status => 1,
             .picker => |picker| picker.rows(size),
@@ -121,10 +125,7 @@ const Component = union(enum) {
             .entry => |entry| try entry.render(placement),
             .tool_box => |box| try ui.paint.box(placement, .tool_pending, &box),
             .steering => |messages| try ui.paint.steering(placement, messages),
-            .hint => |text| try ui.paint.notice(placement, &.{
-                .role = .muted,
-                .prefix = "",
-            }, text),
+            .hint => |text| try ui.paint.notice(placement, &hint_notice, text),
             .status => |info| try ui.status.render(placement, info),
             .editor => |presentation| try presentation.editor.render(placement, &.{
                 .viewport_rows = viewport_rows,
@@ -439,7 +440,10 @@ test "a turn tail shows the steering queue above the editor" {
     const second = std.mem.indexOf(u8, painted, "then add a test").?;
     const hint = std.mem.indexOf(u8, painted, "Ctrl+P").?;
     const footer = std.mem.indexOf(u8, painted, "footerqq").?;
+    // The row keeps the first line alone, and one mark states the lines it hides.
     try std.testing.expect(std.mem.indexOf(u8, painted, "not this row") == null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "then add a test…") != null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "fix the bug…") == null);
     try std.testing.expect(first < second);
     try std.testing.expect(second < hint);
     try std.testing.expect(hint < footer);
@@ -497,14 +501,16 @@ test "a prompt tail shows its hint row above the editor" {
     );
 }
 
-// Regression: a window narrower than the "Queued message: " label must not emit
-// a row wider than the width. The sink asserts every row fits.
+// A window that leaves the message no cell at all still states the cut: the label
+// gives up its last column to the mark. Regression: a window narrower than the
+// "Queued message: " label must not emit a row wider than the width. The sink
+// asserts every row fits.
 test "a narrow window clips the steering rows to width" {
     const gpa = std.testing.allocator;
     var editor = ui.Editor.init(gpa);
     defer editor.deinit();
 
-    const queue = [_][]const u8{"a steering message wider than the window"};
+    const queue = [_][]const u8{"\u{4F60}x is wider than the window"};
     const scene: Scene = .{ .conversation = .{
         .transcript = &[_]ui.block.Entry{},
         .tail = .{ .turn = .{
@@ -516,6 +522,32 @@ test "a narrow window clips the steering rows to width" {
         .status = &test_status,
     } };
     gpa.free(try projected(gpa, .{ .columns = 8, .rows = 24 }, &scene));
+
+    const label_width = try projected(gpa, .{ .columns = 16, .rows = 24 }, &scene);
+    defer gpa.free(label_width);
+    // A terminal copy holds the row without its styles, so the mark reads beside
+    // the label that gave up its last column for it.
+    const plain = try terminal.View.plainText(gpa, label_width);
+    defer gpa.free(plain);
+    const marked = comptime "Queued message:" ++ ui.paint.ellipsis;
+    try std.testing.expect(std.mem.indexOf(u8, plain, marked) != null);
+
+    // A wide cluster at the cut would take the cell of the mark, so the row drops
+    // the cluster. Every row holds the width, and every cut states itself.
+    for ([_]usize{ 18, 19, 20 }) |columns| {
+        const painted = try projected(gpa, .{ .columns = columns, .rows = 24 }, &scene);
+        defer gpa.free(painted);
+        const rows = try terminal.View.plainText(gpa, painted);
+        defer gpa.free(rows);
+        var lines = std.mem.splitSequence(u8, rows, "\r\n");
+        while (lines.next()) |row| {
+            // The frame parks its cursor with one carriage return behind the last
+            // row, and that byte is no content of the row.
+            const line = std.mem.trimEnd(u8, row, "\r");
+            try std.testing.expect(terminal.width.ofText(line) <= columns);
+        }
+        try std.testing.expect(std.mem.indexOf(u8, rows, ui.paint.ellipsis) != null);
+    }
 }
 
 // When the transcript overflows the window, the projection clips the oldest

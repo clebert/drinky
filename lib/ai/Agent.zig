@@ -49,9 +49,9 @@ effort: llm.Effort,
 retry: net.Retry,
 /// Bounds the bash tool's output window and runtime, handed to every tool call.
 bash: tool.Context.Bash,
-/// What the `describe_config` tool returns. The host owns the text and keeps it
-/// alive for the session. An empty document means the host exposes no config.
-config_document: []const u8,
+/// What the `describe_drinky` tool returns. The host owns the text and keeps it
+/// alive for the session. An empty document means the host describes nothing.
+document: []const u8,
 /// The path-triggered skill rules, handed to every tool call. The host owns the
 /// guard and keeps it alive for the session. Null means the host applies no
 /// rule. The loaded skills belong to the conversation, so a reset forgets them.
@@ -309,7 +309,7 @@ pub fn init(
         retry: net.Retry,
         effort: llm.Effort = .none,
         bash: tool.Context.Bash = .{},
-        config_document: []const u8 = "",
+        document: []const u8 = "",
         skill_guard: ?*tool.SkillGuard = null,
     },
 ) Agent {
@@ -322,7 +322,7 @@ pub fn init(
         .effort = options.effort,
         .retry = options.retry,
         .bash = options.bash,
-        .config_document = options.config_document,
+        .document = options.document,
         .skill_guard = options.skill_guard,
         .items = .empty,
         .stats = .{},
@@ -1195,7 +1195,7 @@ fn runToolsWith(
         .gpa = self.gpa,
         .io = self.io,
         .bash = self.bash,
-        .config_document = self.config_document,
+        .document = self.document,
         .skill_guard = self.skill_guard,
         // The reply that asked for these calls stays out, so a skill that this
         // reply reads cannot license a write that the same reply asked for.

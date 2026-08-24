@@ -1884,11 +1884,11 @@ test "a tool result without a box line keeps the call row alone" {
     session.beginTurn(1);
 
     try applyEvent(&session, 1, .{ .tool_start = .{
-        .name = try gpa.dupe(u8, "describe_config"),
+        .name = try gpa.dupe(u8, "describe_drinky"),
         .input_json = try gpa.dupe(u8, "{}"),
     } });
     try applyEvent(&session, 1, .{ .tool_result = .{
-        .name = try gpa.dupe(u8, "describe_config"),
+        .name = try gpa.dupe(u8, "describe_drinky"),
         .is_error = false,
     } });
     try finishTurn(&session, 0);
@@ -1896,14 +1896,14 @@ test "a tool result without a box line keeps the call row alone" {
     const blocks = session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 1), blocks.len);
     try std.testing.expectEqualStrings(
-        "Tool: describe_config",
+        "Tool: describe_drinky",
         blocks[0].tool_result.text.items,
     );
     try std.testing.expectEqual(@as(usize, 3), blocks[0].rows(80));
 
     try session.paint(.{ .columns = 80, .rows = 24 });
     const painted = out.written();
-    try expectPainted(gpa, painted, "Tool: describe_config");
+    try expectPainted(gpa, painted, "Tool: describe_drinky");
 }
 
 // A failure states one sentence, and that sentence is the box line. The block

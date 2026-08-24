@@ -36,7 +36,7 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 ## Tools
 
 - The model gets seven tools: `read`, `write`, `edit`, `find`, `grep`, `bash`, and
-  `describe_config`.
+  `describe_drinky`.
 - **read** — page a UTF-8 file from a 1-indexed line offset, 2000 lines or 50 KiB per call, with a
   next-offset hint.
 - **write** — create or overwrite a file atomically.
@@ -50,10 +50,11 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
   second to 1 hour, so neither the config nor a call can lift the limit. A configured deny list
   refuses a command that contains one of its patterns, and the refusal names the pattern. Drinky has
   no web tool, so a network request also runs through bash.
-- **describe_config** — describe `config.json`, so the model can change it for the user. It names
-  the file and lists every key with its type, its default, and its meaning, plus the legal model
-  names, the effort levels, the compiled fallbacks, and the memory that outranks the file. It
-  reports no current value, because it never reads the file.
+- **describe_drinky** — describe the harness itself, so the model answers a question about Drinky
+  from the tool and not from memory. One section per topic: every slash command, `config.json` with
+  every key, the key bindings, the discovery rules of the instruction and skill files, and the
+  repository. It reports no current value, because it reads no file. The command section comes from
+  the command registry and the key bindings from the intro line, so neither can drift.
 - A configured glob can require a skill. When a tool first touches a matching file, Drinky sends the
   whole skill file into the turn at the next tool round, and the transcript names it. A read is
   never refused. `write` and `edit` refuse until the whole skill file stands in the conversation,
@@ -61,9 +62,9 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - That proof is the conversation itself, so a resumed conversation proves itself. A read of its
   `SKILL.md` and a `/skill:name` line both count as the proof.
 - Globs use `*` and `?` within a path segment and `**` across segments.
-- Searches skip common noise directories: version-control stores, dependency directories, and
-  build caches. A path that ends with a skipped directory name searches it fully. An empty search
-  names up to three skipped noise directories, except version-control stores.
+- Searches skip common noise directories: version-control stores, dependency directories, and build
+  caches. A path that ends with a skipped directory name searches it fully. An empty search names up
+  to three skipped noise directories, except version-control stores.
 - `find` and `grep` run under a fixed 10-second timeout that neither a call nor the config changes.
   A search checks the clock between filesystem steps.
 - A stopped search keeps the matches it found, and a stopped command keeps the tail of its output.
@@ -134,6 +135,7 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - **/logout** — drop a signed-in account's credentials and hand the session to another account.
 - **/new** — clear the conversation, usage stats, and steering without changing its configuration.
   The next paint drops the terminal scrollback, so the empty conversation starts on a clean screen.
+  The intro line returns with it, and the startup counts line does not.
 - **/system** — inspect the complete provider-neutral system prompt as rendered Markdown in a
   scrollable full-window page. `M` toggles its exact source.
 - **/colors** — preview ANSI slots 0 to 15, colored backgrounds, default styles, message boxes, text
@@ -191,13 +193,22 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 
 - The conversation renders inline into the normal screen buffer and real scrollback. Temporary
   full-window pages use the alternate screen and restore the conversation on close.
+- Every row above the input wraps: the intro line, the startup counts line, a transcript event, a
+  skill head line, a control hint, the picker caption, and a page header. A row breaks at a `·`
+  separator first. A hint too wide for one row keeps that row and marks its cut, so no hint splits
+  over two rows. A line that holds no separator is a sentence, so it breaks between words and keeps
+  its tail.
+- An element whose height must stay stable keeps one row and marks its cut with one `…`: a tool box,
+  both steering rows, a picker option, a table cell, a code row, and the footer notice. The status
+  line shortens its fields and then drops them instead.
 - A page asks the terminal to send an arrow key for a wheel notch. A trackpad then scrolls the page,
   and a drag still selects text.
 - Apple Terminal has no such mode. A page there takes mouse reports and the legacy alternate screen.
   A trackpad scrolls it, but a text selection needs the Fn key. The close reprints the conversation
   window.
 - A full-window page scrolls with the arrow keys, PgUp/PgDn, and Home/End. Esc closes it, and its
-  header says so. Ctrl+C and Ctrl+D close it too, so an exit attempt always works.
+  header says so, on as many rows as the header needs. Ctrl+C and Ctrl+D close it too, so an exit
+  attempt always works.
 - Repaints only the rows that changed, atomically. A shrink or height change keeps native scrollback
   intact and can leave blank rows below the interface. A width change or a change above the viewport
   reprints the window.
@@ -217,8 +228,8 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - A link becomes a clickable terminal hyperlink when a click can open its target, and a bare URL
   links to itself. Any other target, such as a relative path, shows its URL as text.
 - A pipe table draws as a box grid that fits the window and keeps the indentation of its source. The
-  alignment colons parse but do not align. A long cell truncates to its column. A table stays plain
-  text when the window is narrower than its smallest grid.
+  alignment colons parse but do not align. A long cell cuts to its column and marks the cut. A table
+  stays plain text when the window is narrower than its smallest grid.
 - A tool box that states measures wraps no line. Each line takes one row and marks a cut with one
   `…`, so the rows a call occupies follow its state and never the length of its arguments. A box
   that holds the sentence of a failure wraps instead.
@@ -236,11 +247,11 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
   clamped timeout, and a search names its fixed timeout. Every other tool runs under no timeout, so
   its box keeps one row.
 - A finished call keeps its call row and one line below it: a line of measures, or the sentence of a
-  failure. A call with nothing to state, like `describe_config`, keeps the call row alone.
+  failure. A call with nothing to state, like `describe_drinky`, keeps the call row alone.
 - `read` reports `Lines: 42`, or `Lines: 594–648 of 2868` when a window cut the file. `write`
   reports the lines it wrote, `edit` reports `Lines: -12 +8`, and `find` and `grep` report
-  `Time: 420ms · Matches: 3`. Each line adds one qualifier for every bound that cut the result,
-  such as `Output: Truncated` or `Search: Timed out`.
+  `Time: 420ms · Matches: 3`. Each line adds one qualifier for every bound that cut the result, such
+  as `Output: Truncated` or `Search: Timed out`.
 - `bash` reports `Time: 420ms · Exit code: 1 · Lines: 3`, and it names a timeout or a kill as
   `Status:` in place of the code. A stopped command keeps the tail of its output below the same
   measures. A non-zero exit takes no `Error:` prefix, because the line names its own state. The box
@@ -258,7 +269,7 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - Queued steering shows as `Queued message:` rows, and becomes one user message once consumed.
 - The bottom line shows `directory (branch)`, context fill, cost, quota, and cache-hit rate on the
   left, and `model (account) · Effort: level` on the right. At most one temporary notice replaces it
-  until the next user action.
+  until the next user action. The notice keeps one row, so it never moves the editor above it.
 - The context gauge holds what the last committed reply measured. Empty history is exactly 0.
 - The gauge reads `Context: Unknown` while the next request renders that history in another way. A
   model switch changes the tokenizer. An account renders the whole prompt around the history, so
@@ -276,8 +287,8 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - Every option holds one row. Drinky cuts a row that is too wide for the window and marks the cut
   with one `…`. The cut takes the option text, so the tag of the row stays. A selection can open a
   second list. That list replaces the first one, and Esc closes the picker with no step back.
-- A muted caption above the picker frame holds the title and the key hint. It stays outside the
-  scrolled window, so the picker window never scrolls it away.
+- A muted caption above the picker frame holds the title and the key hint. Each of the two wraps. It
+  stays outside the scrolled window, so the picker window never scrolls it away.
 - The open input area grows to about a quarter of the screen and labels hidden rows "↑ Hidden: N"
   and "↓ Hidden: N".
 - The terminal supplies every color and the muted intensity. Drinky uses the default colors, ANSI
@@ -289,7 +300,8 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 ## Editing & text
 
 - Enter sends, Shift+Enter or Ctrl+J makes a newline, Esc cancels, Ctrl+C clears, Ctrl+D quits. An
-  intro line shows the bindings at launch.
+  intro line shows those bindings at launch and closes with `/help: Commands`. It wraps, so a narrow
+  window keeps every hint.
 - A second Ctrl+C within 500 ms quits, as does Ctrl+D on an empty editor or a closed stdin. Ctrl+D
   with a draft warns that the quit discards the draft, and quits on the second press.
 - The caret moves by grapheme cluster, by wrapped row with a sticky column, and to the start or end
@@ -350,8 +362,9 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
   so a typo never looks like an applied setting.
 - A required skill whose name no discovered skill carries guards nothing in that project. The
   startup line counts each such name once, because the global config serves every project.
-- The config document is generated from the struct that parses the file, so a new key that carries
-  no description fails the build and the document cannot drift.
+- The configuration section of the `describe_drinky` document is generated from the struct that
+  parses the file, so a new key that carries no description fails the build and the section cannot
+  drift.
 - JSON store writes use owner-only sibling `.lock` files to coordinate Drinky instances.
 - `~/.drinky/state.json` remembers per project which account and effort level Drinky used last, and
   the model of each account. It is machine-local, owner-only, and keeps the 1000 most recently

@@ -4,6 +4,12 @@
 //! transcript `block`s and the chrome (the tool box, the input area, and the
 //! status line) share them. Each painter names a `role.Name`, and that role
 //! decides the color, so no painter holds a color value of its own.
+//!
+//! One wrap rule serves every notice: a row breaks at a separator first. A hint
+//! that is still too wide keeps one row and marks its cut, so no hint splits. A
+//! line that holds no separator is a sentence, and it breaks between its words.
+//! Each painter states its rows through a count of its own, so a measure and a
+//! paint cannot diverge.
 
 const std = @import("std");
 
@@ -19,12 +25,142 @@ const activity_growth_interval_ticks: u64 = 6;
 // At 16 ms per frame, show the caret about 600 ms and hide it about 600 ms.
 const caret_blink_ticks: u64 = 37;
 
-/// A notice's look: the role that colors every line, and a prefix (an error tag,
-/// or empty) before each line.
-const Notice = struct {
+/// How a notice paints: the role that colors every row, the tag that opens it,
+/// how a line wider than one row fits, and the rows the notice can take.
+pub const Notice = struct {
     role: role.Name,
-    prefix: []const u8,
+    /// An error tag, or empty. It stands on the first row of the notice alone.
+    /// Two tags read as two errors, and an indent puts blanks into a copied row.
+    prefix: []const u8 = "",
+    fit: Fit = .wrap,
+    /// The rows the notice can paint. A page header takes the height of its
+    /// window, so a wrapped header can never outgrow the page.
+    rows_max: usize = std.math.maxInt(usize),
 };
+
+/// The separator between two parts of a legend: a blank, a middle dot, and a
+/// blank. A notice row breaks here first, and the break drops all three, so no
+/// row starts or ends with a separator.
+pub const separator = " \u{00B7} ";
+
+/// One row of one logical line: where the content of the row ends, whether that
+/// row cut a hint, and where the next row starts. A `next` at the end of the line
+/// closes that line.
+const Row = struct { end: usize, next: usize, marked: bool = false };
+
+/// A notice as physical rows. Each row breaks at a separator first, so a legend
+/// keeps every hint whole. A hint too wide for a row of its own keeps that row
+/// and states its cut, so no hint ever splits over two rows. A line that holds no
+/// separator is a sentence: it wraps between its words and keeps its tail. The
+/// prefix takes room on the first row alone, and every later row starts at the
+/// first column.
+const Wrap = struct {
+    rest: []const u8,
+    columns: usize,
+    /// The columns the prefix takes. The first row gives them up, and `next`
+    /// then clears it.
+    lead: usize,
+    /// Whether the open logical line holds a separator. The whole line decides
+    /// it, so the last hint of a legend cuts like every hint in front of it.
+    legend: bool = false,
+    /// Whether `rest` still starts at the head of a logical line, which is where
+    /// `legend` reads that line.
+    fresh: bool = true,
+    done: bool = false,
+
+    /// The cells of the next row and the mark of its cut, or null once the notice
+    /// is complete. An empty notice yields one empty row, as an empty line does.
+    fn next(self: *Wrap) ?Cut {
+        if (self.done) return null;
+        const lead = self.lead;
+        self.lead = 0;
+        // A prefix that fills the row leaves no cell for content. The row then
+        // holds the prefix alone, and the text opens on the row under it. A row
+        // that takes a cluster there loses it to the clip of the sink.
+        if (lead > 0 and lead >= self.columns and self.rest.len > 0) {
+            const break_at = std.mem.indexOfScalar(u8, self.rest, '\n') orelse self.rest.len;
+            // The prefix row stands for the first line, so an empty first line
+            // takes no row of its own behind it.
+            if (break_at < self.rest.len and lineText(self.rest[0..break_at]).len == 0)
+                self.rest = self.rest[break_at + 1 ..];
+            return .{ .kept = "", .marked = false };
+        }
+        const room = @max(self.columns -| lead, 1);
+        const line_end = std.mem.indexOfScalar(u8, self.rest, '\n') orelse self.rest.len;
+        const line = lineText(self.rest[0..line_end]);
+        if (self.fresh) self.legend = std.mem.indexOf(u8, line, separator) != null;
+        const row = nextRow(line, room, self.legend);
+        self.fresh = row.next >= line.len;
+        if (!self.fresh) {
+            self.rest = self.rest[row.next..];
+        } else if (line_end < self.rest.len) {
+            self.rest = self.rest[line_end + 1 ..];
+        } else {
+            self.done = true;
+        }
+        return .{ .kept = terminal.width.rowText(line[0..row.end]), .marked = row.marked };
+    }
+};
+
+/// The row that `line` opens with at `room` columns. The row takes as many
+/// separated pieces as it holds. A piece too wide for a row of its own cuts on a
+/// `legend` line, and breaks between its words on a line that holds one sentence.
+fn nextRow(line: []const u8, room: usize, legend: bool) Row {
+    const separator_columns = terminal.width.ofText(separator);
+    var index: usize = 0;
+    var end: usize = 0;
+    var columns: usize = 0;
+    while (index < line.len) {
+        const piece_end = std.mem.indexOfPos(u8, line, index, separator) orelse line.len;
+        const piece = line[index..piece_end];
+        const lead = if (index == 0) 0 else separator_columns;
+        const piece_columns = terminal.width.ofText(piece);
+        if (columns + lead + piece_columns <= room) {
+            columns += lead + piece_columns;
+            end = piece_end;
+            index = @min(piece_end + separator.len, line.len);
+            continue;
+        }
+        // The break drops the separator in front of the piece, so the next row
+        // opens on the piece itself, where the branches below cut or wrap it.
+        if (index > 0) return .{ .end = end, .next = index };
+        const behind = @min(piece_end + separator.len, line.len);
+        if (legend) {
+            // One hint keeps one row, and the mark states what the row dropped.
+            // A hint that splits reads as two hints.
+            const shown = cut(piece, room);
+            return .{ .end = shown.kept.len, .next = behind, .marked = shown.marked };
+        }
+        var iterator = terminal.width.wrapper(piece, room);
+        const span = iterator.nextSpan().?;
+        // A piece that the word wrap takes whole still did not fit the measure
+        // above, so the row ends on it and the next row opens behind it.
+        if (span.end == piece.len) return .{ .end = piece_end, .next = behind };
+        return .{ .end = span.end, .next = span.end };
+    }
+    return .{ .end = end, .next = line.len };
+}
+
+/// The physical rows `text` occupies as a notice at `columns`. Must equal
+/// exactly what `notice` paints, because the window math relies on the parity.
+pub fn noticeRows(look: *const Notice, text: []const u8, columns: usize) usize {
+    if (look.fit == .head) return @min(1, look.rows_max);
+    var wrap = noticeWrap(look, text, columns);
+    var count: usize = 0;
+    while (wrap.next()) |_| count += 1;
+    return @min(count, look.rows_max);
+}
+
+fn noticeWrap(look: *const Notice, text: []const u8, columns: usize) Wrap {
+    return .{
+        .rest = text,
+        .columns = columns,
+        // Saturating: a cluster wider than the whole budget survives `truncate`
+        // as a one-column replacement but measures its true width here. A prefix
+        // that opens on one can then report more columns than the row has.
+        .lead = terminal.width.ofText(terminal.width.truncate(look.prefix, columns)),
+    };
+}
 
 /// One box content row: the text it paints, how that text fits the row, the
 /// emphasized run inside it, and the role that colors it. The row applies that
@@ -54,13 +190,14 @@ pub const Placement = struct {
     skip: usize,
 };
 
-/// How a box fits a logical line that is wider than one row.
+/// How an element fits a logical line that is wider than one row.
 pub const Fit = enum {
     /// Break the line across as many rows as it needs.
     wrap,
     /// Keep one row and show the start of the line. One `…` marks the cut. A
     /// caller picks this when the start of a line identifies it, so the cut
-    /// falls on the detail behind that.
+    /// falls on the detail behind that. A box keeps one row per line, and a
+    /// notice keeps one row for the whole text.
     head,
 };
 
@@ -88,9 +225,9 @@ pub const Box = struct {
 /// row. The run is empty for a head row that holds no key.
 fn firstValue(text: []const u8) Run {
     const head = text[0 .. std.mem.indexOfScalar(u8, text, '\n') orelse text.len];
-    const separator = ": ";
-    const key_end = std.mem.indexOf(u8, head, separator) orelse return .{};
-    const start = key_end + separator.len;
+    const key_separator = ": ";
+    const key_end = std.mem.indexOf(u8, head, key_separator) orelse return .{};
+    const start = key_end + key_separator.len;
     const value = head[start..];
     const length = std.mem.indexOfScalar(u8, value, ' ') orelse value.len;
     return .{ .start = start, .end = start + length };
@@ -147,7 +284,15 @@ pub const Cut = struct { kept: []const u8, marked: bool };
 pub fn cut(text: []const u8, columns_max: usize) Cut {
     const shown = terminal.width.truncate(text, columns_max);
     if (shown.len == text.len) return .{ .kept = shown, .marked = false };
-    return .{ .kept = terminal.width.truncate(text, columns_max -| 1), .marked = true };
+    const room = columns_max -| 1;
+    const kept = terminal.width.truncate(text, room);
+    // Saturating: `truncate` keeps a cluster wider than its whole budget, because
+    // a row that narrow shows it as a one-column replacement. A row of the full
+    // width paints the real cells of that cluster instead, and the mark then
+    // reaches no cell at all. Such a cluster opens the text and is the whole of
+    // `kept`, so the cut drops it and the mark takes the row.
+    if (terminal.width.ofText(kept) > room) return .{ .kept = "", .marked = true };
+    return .{ .kept = kept, .marked = true };
 }
 
 /// One box line without the carriage return of a CRLF break. The split that
@@ -158,27 +303,76 @@ fn lineText(line: []const u8) []const u8 {
     return std.mem.trimEnd(u8, line, "\r");
 }
 
-/// Each `\n`-separated line of `text`, styled and truncated to one row, with the
-/// notice's prefix before every line (a notice, error, or the intro).
+/// `text` as a notice (a notice, an error, the intro, a hint, or a header): the
+/// wrapped rows of every line, with the prefix on the first row alone. A hint
+/// too wide for a row keeps that row and marks its cut. A `head` notice keeps one
+/// row of the first line and marks the cut the same way.
 pub fn notice(placement: *const Placement, look: *const Notice, text: []const u8) !void {
-    var pieces = std.mem.splitScalar(u8, text, '\n');
+    if (look.fit == .head) return noticeHead(placement, look, text);
+    const shown_prefix = terminal.width.truncate(look.prefix, placement.columns);
+    var wrap = noticeWrap(look, text, placement.columns);
     var index: usize = 0;
-    while (pieces.next()) |piece| : (index += 1) {
+    while (wrap.next()) |row| : (index += 1) {
+        if (index >= look.rows_max) break;
         const line = placement.base + index;
         if (line < placement.skip) continue;
-        const shown_prefix = terminal.width.truncate(look.prefix, placement.columns);
-        // Saturating: a cluster wider than the whole budget survives `truncate`
-        // as a one-column replacement but measures its true width here. A prefix
-        // that opens on one can then report more columns than the row has.
-        const available = placement.columns -| terminal.width.ofText(shown_prefix);
-        const clipped = terminal.width.truncate(piece, available);
         placement.sink.begin();
         try role.apply(placement.sink, look.role);
-        try placement.sink.text(shown_prefix);
-        try placement.sink.text(clipped);
+        if (index == 0) try placement.sink.text(shown_prefix);
+        try placement.sink.text(row.kept);
+        if (row.marked) try placement.sink.text(ellipsis);
         try attribute.apply(placement.sink, .reset);
         placement.sink.end(.{ .id = placement.id, .line = line });
     }
+}
+
+/// What one row keeps of `text`: the head of its first line, and whether the row
+/// dropped anything. A line break ends the row, so every line behind it is a cut
+/// too, and the mark states it even where the first line fits whole.
+fn headCut(text: []const u8, columns_max: usize) Cut {
+    const line_end = std.mem.indexOfScalar(u8, text, '\n') orelse text.len;
+    const line = lineText(text[0..line_end]);
+    if (line_end == text.len) return cut(line, columns_max);
+    return .{ .kept = terminal.width.truncate(line, columns_max -| 1), .marked = true };
+}
+
+/// One row of a fixed label and the head of the text behind it: the label that
+/// opens the row, the cells it leaves to the text, and the mark of the cut.
+const Head = struct { label: []const u8, kept: []const u8, marked: bool };
+
+/// The one row that `label` and `text` share at `columns`. The label comes first,
+/// so a window narrower than the label can never overflow the row. The mark of a
+/// cut takes the last column of the row, and a label that leaves no column for it
+/// gives up its own last column. Every cut then states itself.
+fn headRow(label: []const u8, text: []const u8, columns: usize) Head {
+    const shown_label = terminal.width.truncate(label, columns);
+    const room = columns -| terminal.width.ofText(shown_label);
+    const shown = headCut(text, room);
+    if (room > 0 or !shown.marked) return .{
+        .label = shown_label,
+        .kept = shown.kept,
+        .marked = shown.marked,
+    };
+    return .{
+        .label = terminal.width.truncate(shown_label, columns -| 1),
+        .kept = "",
+        .marked = true,
+    };
+}
+
+/// The one row of a `head` notice: the prefix, the head of its first line, and
+/// one `…` where the row cut the rest. A caller takes this form where a taller
+/// notice would move the interface around it.
+fn noticeHead(placement: *const Placement, look: *const Notice, text: []const u8) !void {
+    if (look.rows_max == 0 or placement.base < placement.skip) return;
+    const row = headRow(look.prefix, text, placement.columns);
+    placement.sink.begin();
+    try role.apply(placement.sink, look.role);
+    try placement.sink.text(row.label);
+    try placement.sink.text(row.kept);
+    if (row.marked) try placement.sink.text(ellipsis);
+    try attribute.apply(placement.sink, .reset);
+    placement.sink.end(.{ .id = placement.id, .line = placement.base });
 }
 
 /// A filled box in one role: a blank padding row, the body fitted to the row
@@ -641,38 +835,41 @@ fn writeSeparatorGlyph(
 }
 
 /// Physical rows the steering queue occupies: one row per queued message plus a
-/// hint row. Zero when the queue is empty, so it contributes no component.
+/// hint row. Zero when the queue is empty, so it contributes no component. Every
+/// row of the block keeps one row, so the count needs no width.
 pub fn steeringRows(messages: []const []const u8) usize {
     if (messages.len == 0) return 0;
     return messages.len + 1;
 }
 
 /// The steering queue: a `Queued message: <message>` row per queued message
-/// (each cut to its first line and the window width), then a faint hint row.
+/// (each cut to its first line and the window width, with one `…` on either cut),
+/// then a faint hint row. Every row of the block keeps one row, so the queue
+/// never moves the editor under it.
 pub fn steering(placement: *const Placement, messages: []const []const u8) !void {
     var line = placement.base;
     for (messages) |message| {
         defer line += 1;
         if (line < placement.skip) continue;
-        // Truncate the label first, then give the message whatever width is left.
-        // A window narrower than the label can then never overflow the row.
-        const label = terminal.width.truncate("Queued message: ", placement.columns);
-        const first = message[0 .. std.mem.indexOfScalar(u8, message, '\n') orelse message.len];
-        const room = placement.columns -| terminal.width.ofText(label);
-        const shown = terminal.width.truncate(first, room);
+        // The row keeps the first line of the message, and the mark states both
+        // the width it cut and the lines it left out. The label opens the row, and
+        // it gives up its last column where the mark has nowhere else to stand.
+        const row = headRow("Queued message: ", message, placement.columns);
         placement.sink.begin();
         try role.apply(placement.sink, .accent);
-        try placement.sink.text(label);
+        try placement.sink.text(row.label);
         try attribute.apply(placement.sink, .reset);
         try role.apply(placement.sink, .muted);
-        try placement.sink.text(shown);
+        try placement.sink.text(row.kept);
+        if (row.marked) try placement.sink.text(ellipsis);
         try attribute.apply(placement.sink, .reset);
         placement.sink.end(.{ .id = placement.id, .line = line });
     }
     var hint_placement = placement.*;
     hint_placement.base = line;
+    // The key stands first, so a cut takes the explanation and never the key.
     const hint = "\u{21B3} Ctrl+P: Edit all queued messages";
-    try notice(&hint_placement, &.{ .role = .muted, .prefix = "" }, hint);
+    try notice(&hint_placement, &.{ .role = .muted, .fit = .head }, hint);
 }
 
 test "box preview cells use the live wrap width" {
@@ -880,7 +1077,7 @@ test "the emphasized run covers the first value alone" {
         "Tool: read \u{00B7} File: a.zig\nLines: 3",
     ));
     // A call with no subject is its name alone, and the name ends the row.
-    try std.testing.expectEqual(Run{ .start = 6, .end = 21 }, firstValue("Tool: describe_config"));
+    try std.testing.expectEqual(Run{ .start = 6, .end = 21 }, firstValue("Tool: describe_drinky"));
     // A user message holds no key, so no part of the box takes the emphasis.
     try std.testing.expectEqual(Run{}, firstValue("please read a.zig"));
 
@@ -1123,13 +1320,233 @@ test "overflow labels compact before disappearing" {
     }) == null);
 }
 
-test "a wide notice prefix fits in a one-column row" {
-    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+// The case the width of an error tag makes: the tag fills the row, so the
+// sentence starts under it and keeps every word.
+test "a notice keeps its text where the prefix fills the row" {
+    const gpa = std.testing.allocator;
+    const look: Notice = .{ .role = .@"error", .prefix = "Error: " };
+    const plain = try paintedNotice(gpa, &look, "boom", 7);
+    defer gpa.free(plain);
+    try std.testing.expectEqualStrings("Error: \r\nboom", plain);
+    try std.testing.expectEqual(@as(usize, 2), noticeRows(&look, "boom", 7));
+}
+
+fn expectCut(shown: Cut, kept: []const u8, marked: bool) !void {
+    try std.testing.expectEqualStrings(kept, shown.kept);
+    try std.testing.expectEqual(marked, shown.marked);
+}
+
+// One cut keeps the column of its mark, whatever the clusters of the text do. A
+// row that paints a wide cluster in the cells of the mark cuts silently, and a
+// silent cut is the one thing the mark exists to stop.
+test "a cut always leaves the mark a column of its own" {
+    try expectCut(cut("ab", 2), "ab", false);
+    try expectCut(cut("abc", 2), "a", true);
+    // A cluster that fits the room stays, and the mark takes the column behind it.
+    try expectCut(cut("\u{4F60}ab", 3), "\u{4F60}", true);
+    // A cluster wider than the room goes away whole, so the mark stands alone.
+    try expectCut(cut("\u{4F60}x", 2), "", true);
+    try expectCut(cut("\u{4F60}x", 1), "", true);
+    // Every cut holds the width: the cells it keeps plus the one of the mark.
+    for ([_][]const u8{ "abc", "\u{4F60}x", "a\u{4F60}b", "\u{4F60}\u{4F60}" }) |text| {
+        for (1..6) |columns| {
+            const shown = cut(text, columns);
+            const columns_used = terminal.width.ofText(shown.kept) + @intFromBool(shown.marked);
+            try std.testing.expect(columns_used <= columns);
+        }
+    }
+}
+
+// The rows one notice paints at `columns`, as one plain text the caller owns.
+// Every style goes, so each row reads as one line of text.
+fn paintedNotice(
+    gpa: std.mem.Allocator,
+    look: *const Notice,
+    text: []const u8,
+    columns: usize,
+) ![]u8 {
+    var output: std.Io.Writer.Allocating = .init(gpa);
     defer output.deinit();
-    var view = terminal.View.init(std.testing.allocator, &output.writer);
+    var view = terminal.View.init(gpa, &output.writer);
+    defer view.deinit();
+    const sink = try view.beginFrame(.{ .columns = columns, .rows = 100 }, 1);
+    try notice(&.{
+        .sink = sink,
+        .id = 0,
+        .columns = columns,
+        .base = 0,
+        .skip = 0,
+    }, look, text);
+    try view.render();
+    return terminal.View.plainText(gpa, output.written());
+}
+
+// A legend breaks at its separators, so every hint stays whole and no row starts
+// or ends with a separator. A hint too wide for a row of its own keeps one row
+// and states its cut. The count and the paint agree at every width.
+test "a notice breaks its rows at a separator" {
+    const gpa = std.testing.allocator;
+    const parts = [_][]const u8{
+        "Enter: Send",
+        "Shift+Enter: New line",
+        "Esc: Cancel",
+        "/help: Commands",
+    };
+    const text = parts[0] ++ separator ++ parts[1] ++ separator ++ parts[2] ++
+        separator ++ parts[3];
+    const look: Notice = .{ .role = .muted };
+    for ([_]usize{ 98, 60, 40, 22, 12 }) |columns| {
+        const plain = try paintedNotice(gpa, &look, text, columns);
+        defer gpa.free(plain);
+        var rows = std.mem.splitSequence(u8, plain, "\r\n");
+        var count: usize = 0;
+        while (rows.next()) |row| : (count += 1) {
+            try std.testing.expect(terminal.width.ofText(row) <= columns);
+            try std.testing.expect(!std.mem.startsWith(u8, row, "\u{00B7}"));
+            try std.testing.expect(!std.mem.endsWith(u8, row, "\u{00B7}"));
+        }
+        try std.testing.expectEqual(noticeRows(&look, text, columns), count);
+        // A row that holds the widest hint keeps every hint whole. A row too
+        // narrow for one hint breaks that hint between its words instead.
+        if (columns < 21) continue;
+        for (parts) |part| try std.testing.expect(std.mem.indexOf(u8, plain, part) != null);
+    }
+    // A width that holds two hints and their separator holds no third one.
+    const plain = try paintedNotice(gpa, &look, text, 40);
+    defer gpa.free(plain);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        plain,
+        "Enter: Send \u{00B7} Shift+Enter: New line\r\n",
+    ) != null);
+
+    // A hint wider than the whole row cuts, because a hint that splits over two
+    // rows reads as two hints. Every hint then holds exactly one row.
+    const narrow = try paintedNotice(gpa, &look, text, 12);
+    defer gpa.free(narrow);
+    var narrow_rows = std.mem.splitSequence(u8, narrow, "\r\n");
+    try std.testing.expectEqualStrings("Enter: Send", narrow_rows.next().?);
+    try std.testing.expectEqualStrings("Shift+Enter" ++ ellipsis, narrow_rows.next().?);
+    try std.testing.expectEqualStrings("Esc: Cancel", narrow_rows.next().?);
+    try std.testing.expectEqualStrings("/help: Comm" ++ ellipsis, narrow_rows.next().?);
+    try std.testing.expect(narrow_rows.next() == null);
+}
+
+// A line that holds no separator is a sentence. It breaks between its words, as
+// the plain wrap breaks one, so a notice never loses the tail of a sentence and
+// never marks a cut it did not make.
+test "a notice sentence breaks between its words and keeps its tail" {
+    const gpa = std.testing.allocator;
+    const look: Notice = .{ .role = .muted };
+    const text = "Drinky could not open the file because of error AccessDenied.";
+    const plain = try paintedNotice(gpa, &look, text, 20);
+    defer gpa.free(plain);
+
+    var rows = std.mem.splitSequence(u8, plain, "\r\n");
+    while (rows.next()) |row| {
+        try std.testing.expect(terminal.width.ofText(row) <= 20);
+        try std.testing.expect(!std.mem.endsWith(u8, row, " "));
+    }
+    try std.testing.expect(std.mem.indexOf(u8, plain, "Drinky could not") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plain, "AccessDenied.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plain, ellipsis) == null);
+    // A word wider than the whole row still breaks inside itself, as it must.
+    const word = try paintedNotice(gpa, &look, "AccessDeniedError", 8);
+    defer gpa.free(word);
+    try std.testing.expectEqualStrings("AccessDe\r\nniedErro\r\nr", word);
+}
+
+// The tag of an error stands on the first row of one notice alone. Two tags read
+// as two errors, and an indent puts blanks into a copied row.
+test "a notice prefix opens its first row alone" {
+    const gpa = std.testing.allocator;
+    const look: Notice = .{ .role = .@"error", .prefix = "Error: " };
+    const text = "Drinky could not read the file.\nTry again.";
+    const plain = try paintedNotice(gpa, &look, text, 24);
+    defer gpa.free(plain);
+
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, plain, "Error: "));
+    try std.testing.expect(std.mem.startsWith(u8, plain, "Error: Drinky could"));
+    var rows = std.mem.splitSequence(u8, plain, "\r\n");
+    var count: usize = 0;
+    while (rows.next()) |row| : (count += 1) {
+        try std.testing.expect(terminal.width.ofText(row) <= 24);
+        // Every row after the first one opens on its own first character.
+        if (count > 0) try std.testing.expect(!std.mem.startsWith(u8, row, " "));
+    }
+    try std.testing.expectEqual(noticeRows(&look, text, 24), count);
+    try std.testing.expect(std.mem.indexOf(u8, plain, "Try again.") != null);
+}
+
+// A one-row notice keeps its height and marks what the row cut. The footer and
+// the steering hint take this form, because a row that grows moves the interface
+// under it.
+test "a head notice keeps one row and marks its cut" {
+    const gpa = std.testing.allocator;
+    const look: Notice = .{ .role = .muted, .fit = .head };
+    const text = "Ctrl+P: Edit all queued messages\nnot another row";
+    try std.testing.expectEqual(@as(usize, 1), noticeRows(&look, text, 16));
+
+    const plain = try paintedNotice(gpa, &look, text, 16);
+    defer gpa.free(plain);
+    try std.testing.expectEqualStrings("Ctrl+P: Edit al" ++ ellipsis, plain);
+
+    // A row that holds the whole text takes no mark.
+    const short = try paintedNotice(gpa, &look, "Ctrl+P: Edit", 16);
+    defer gpa.free(short);
+    try std.testing.expectEqualStrings("Ctrl+P: Edit", short);
+
+    // A first line that fits still hides every line behind it, so the mark
+    // states that cut too.
+    const dropped = try paintedNotice(gpa, &look, "boom\nmore", 16);
+    defer gpa.free(dropped);
+    try std.testing.expectEqualStrings("boom" ++ ellipsis, dropped);
+
+    // A cluster wider than the room of the row would take the cells of the mark,
+    // so the cut drops it and the mark states the row on its own.
+    const wide = try paintedNotice(gpa, &look, "\u{4F60}x", 2);
+    defer gpa.free(wide);
+    try std.testing.expectEqualStrings(ellipsis, wide);
+
+    // A prefix that fills the row gives up its last column to the mark, because
+    // the mark states the cut of a row that shows no content at all.
+    const tagged: Notice = .{ .role = .@"error", .prefix = "Error: ", .fit = .head };
+    const filled = try paintedNotice(gpa, &tagged, "boom", 7);
+    defer gpa.free(filled);
+    try std.testing.expectEqualStrings("Error:" ++ ellipsis, filled);
+    // A row that holds the whole text keeps the whole prefix.
+    const fits = try paintedNotice(gpa, &tagged, "boom", 11);
+    defer gpa.free(fits);
+    try std.testing.expectEqualStrings("Error: boom", fits);
+}
+
+// A wrapped notice behind a full-width prefix opens on the row under the prefix.
+// An empty first line needs no row there, because the prefix row is that line.
+test "a notice prefix row stands for an empty first line" {
+    const gpa = std.testing.allocator;
+    const look: Notice = .{ .role = .@"error", .prefix = "Error: " };
+    const plain = try paintedNotice(gpa, &look, "\nTry again.", 7);
+    defer gpa.free(plain);
+    try std.testing.expectEqualStrings("Error: \r\nTry\r\nagain.", plain);
+    try std.testing.expectEqual(@as(usize, 3), noticeRows(&look, "\nTry again.", 7));
+}
+
+// A prefix wider than the whole row takes that row for itself, and the text
+// opens on the row under it. No row overflows the width, and no cluster of the
+// text falls behind the prefix, where the clip of the sink would eat it.
+test "a wide notice prefix fits in a one-column row" {
+    const gpa = std.testing.allocator;
+    var output: std.Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    var view = terminal.View.init(gpa, &output.writer);
     defer view.deinit();
 
-    const sink = try view.beginFrame(.{ .columns = 1, .rows = 1 }, 1);
+    const look: Notice = .{ .role = .muted, .prefix = "你" };
+    try std.testing.expectEqual(@as(usize, 3), noticeRows(&look, "hi", 1));
+    // An empty notice states its prefix and needs no row of its own for content.
+    try std.testing.expectEqual(@as(usize, 1), noticeRows(&look, "", 1));
+
+    const sink = try view.beginFrame(.{ .columns = 1, .rows = 8 }, 1);
     const placement: Placement = .{
         .sink = sink,
         .id = 0,
@@ -1137,10 +1554,18 @@ test "a wide notice prefix fits in a one-column row" {
         .base = 0,
         .skip = 0,
     };
-    try notice(&placement, &.{ .role = .muted, .prefix = "你" }, "hidden");
+    try notice(&placement, &look, "hi");
     try std.testing.expectEqual(@as(usize, 1), sink.columns_written);
     try view.render();
-    try std.testing.expect(std.mem.indexOf(u8, output.written(), "hidden") == null);
+
+    const plain = try terminal.View.plainText(gpa, output.written());
+    defer gpa.free(plain);
+    var rows = std.mem.splitSequence(u8, plain, "\r\n");
+    // The prefix holds the first row, and the text follows it whole.
+    try std.testing.expectEqualStrings("\u{FFFD}", rows.next().?);
+    try std.testing.expectEqualStrings("h", rows.next().?);
+    try std.testing.expectEqualStrings("i", rows.next().?);
+    try std.testing.expect(rows.next() == null);
 }
 
 test "the body limit tracks a quarter of the viewport, clamped to five and fifteen" {

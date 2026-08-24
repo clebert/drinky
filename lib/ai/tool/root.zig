@@ -17,7 +17,7 @@ const edit = @import("edit.zig");
 const find = @import("find.zig");
 const grep = @import("grep.zig");
 const bash = @import("bash.zig");
-const describe_config = @import("describe_config.zig");
+const describe_drinky = @import("describe_drinky.zig");
 const search = @import("search.zig");
 
 /// The window of one `read` call: a file inside both bounds comes back whole.
@@ -130,7 +130,7 @@ const registry = [_]Entry{
         .subject_label = "Command",
         .timeout = .{ .argument = "timeout_seconds" },
     },
-    .{ .tool = describe_config.spec, .run = describe_config.run, .mutates = false },
+    .{ .tool = describe_drinky.spec, .run = describe_drinky.run, .mutates = false },
 };
 
 /// The schemas of every tool, advertised to the provider in a request.
@@ -386,7 +386,7 @@ test describe {
             .subject = "cat <<'EOF' one two EOF",
         },
         // The tool takes no arguments, so its row is the name alone.
-        .{ .name = "describe_config", .input = "{}", .label = "", .subject = "" },
+        .{ .name = "describe_drinky", .input = "{}", .label = "", .subject = "" },
         // A list the model cut short still yields a row.
         .{ .name = "write", .input = "{\"path\":\"a.zig\",\"conte", .label = "", .subject = "" },
         .{ .name = "read", .input = "{\"offset\":3}", .label = "", .subject = "" },

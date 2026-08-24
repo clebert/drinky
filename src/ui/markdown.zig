@@ -278,7 +278,10 @@ const Table = struct {
     /// Truncates one cell's styled spans to the room its column gives. Once a
     /// span overflows, the cell is full: a later span must not slip into the
     /// gap a dropped cluster leaves. The room the content does not take stays
-    /// for the pad, so every row of the grid draws to one width.
+    /// for the pad, so every row of the grid draws to one width. A cell cuts
+    /// rather than wraps, because a wrapped cell needs a grid row as tall as its
+    /// tallest cell. `cellRow` reserves the column of the mark up front, because
+    /// a span cannot take a column back once it painted it.
     fn Writer(comptime Emitter: type) type {
         return struct {
             emitter: *Emitter,
@@ -447,8 +450,11 @@ const Table = struct {
         emitter.end();
     }
 
-    /// One content row: every cell under `look`, truncated to its column and
-    /// padded out to it, between pipe borders.
+    /// One content row: every cell under `look`, cut to its column and padded out
+    /// to it, between pipe borders. A cell whose content outgrows its column
+    /// keeps one column of that column for the mark of the cut. The measure
+    /// decides that before the spans stream, so the mark shows however the spans
+    /// of the cell fall.
     fn cellRow(
         self: *const Table,
         comptime Emitter: type,
@@ -462,8 +468,16 @@ const Table = struct {
         for (self.widths[0..self.count]) |width| {
             try emitter.span(muted_look, "│");
             try emitter.span(.{}, " ");
-            var writer: Writer(Emitter) = .{ .emitter = emitter, .room = width };
-            try inlines(Writer(Emitter), &writer, look, cells.next() orelse "");
+            const cell = cells.next() orelse "";
+            var measure: Measure = .{};
+            try inlines(Measure, &measure, look, cell);
+            const marked = measure.columns > width;
+            var writer: Writer(Emitter) = .{
+                .emitter = emitter,
+                .room = if (marked) width - 1 else width,
+            };
+            try inlines(Writer(Emitter), &writer, look, cell);
+            if (marked) try emitter.span(look, paint.ellipsis);
             var remaining = writer.room + 1;
             while (remaining > 0) {
                 const chunk = @min(remaining, blanks.len);
@@ -784,7 +798,10 @@ fn prefixColumns(prefix: *const Prefix) usize {
     return terminal.width.ofText(prefix.indent) + terminal.width.ofText(prefix.marker);
 }
 
-/// One row that never wraps: `indent`, then `bytes` cut to the width left over.
+/// One row that never wraps: `indent`, then `bytes` cut to the width left over,
+/// with one `…` on the cut. Code keeps its alignment, so a code row cuts rather
+/// than wraps: both a cut and a wrap break a copied line, and only the cut keeps
+/// the alignment.
 fn plainRow(
     comptime Emitter: type,
     emitter: *Emitter,
@@ -795,14 +812,18 @@ fn plainRow(
 ) !void {
     const shown = terminal.width.truncate(indent, prefixRoom(columns));
     const room = columns -| terminal.width.ofText(shown);
-    const content = terminal.width.truncate(bytes, room);
+    // The prefix takes at most half of a row of one column or more, so content
+    // always keeps a column and the mark of a cut always fits beside it.
+    std.debug.assert(room > 0);
+    const content = paint.cut(bytes, room);
     emitter.begin();
     // The indent decorates content. A row with no content drops it, so a copy of
     // an empty code row carries no blank.
-    if (content.len > 0) {
+    if (content.kept.len > 0) {
         try emitter.span(.{}, shown);
-        try emitter.span(look, content);
+        try emitter.span(look, content.kept);
     }
+    if (content.marked) try emitter.span(look, paint.ellipsis);
     emitter.end();
 }
 
@@ -1568,7 +1589,8 @@ test "a table renders as a box grid with padded cells" {
 }
 
 // A cell wider than the window cannot widen the grid past it: the widest
-// column gives up cells until the grid fits, and its content truncates.
+// column gives up cells until the grid fits, and its content cuts. One `…`
+// marks that cut, and it takes the last column of the cell.
 test "a table shrinks its widest column to fit the window" {
     const gpa = std.testing.allocator;
     const text =
@@ -1580,13 +1602,13 @@ test "a table shrinks its widest column to fit the window" {
         "┌───────┬────────────────────┐",
         "│ a     │ b                  │",
         "├───────┼────────────────────┤",
-        "│ short │ this cell is much  │",
+        "│ short │ this cell is much… │",
         "└───────┴────────────────────┘",
     });
 }
 
-// A wide cluster that straddles the column's edge drops whole, and the pad
-// keeps the grid aligned behind it.
+// A wide cluster that straddles the column's edge drops whole. The mark of the
+// cut takes one column, and the pad keeps the grid aligned behind it.
 test "a wide glyph in a table cell truncates whole" {
     const gpa = std.testing.allocator;
     const text =
@@ -1598,14 +1620,14 @@ test "a wide glyph in a table cell truncates whole" {
         "┌─────┬───┐",
         "│ a   │ b │",
         "├─────┼───┤",
-        "│ x你 │ y │",
+        "│ x…  │ y │",
         "└─────┴───┘",
     });
 }
 
 // A cluster that is wider than the whole column drops as well. `truncate`
 // keeps such a cluster as a one-column replacement, which a cell must not
-// count as one column and must not draw.
+// count as one column and must not draw. The mark then states the cut.
 test "a cluster wider than its column drops from the cell" {
     const gpa = std.testing.allocator;
     const text =
@@ -1615,20 +1637,65 @@ test "a cluster wider than its column drops from the cell" {
     ;
     try expectPlainRows(gpa, text, 9, &.{
         "┌───┬───┐",
-        "│   │ b │",
+        "│ … │ b │",
         "├───┼───┤",
         "│ c │ d │",
         "└───┴───┘",
     });
 }
 
-// Every row of one grid draws to the same width. A cell that truncates gives
-// the columns it does not fill back to the pad, so the right border lines up.
+// A cell can hold several styled spans, and one of them can fill the column
+// before the next arrives. The column reserves the cell of its mark up front, so
+// the mark shows whatever the spans do. A span cannot take a column back.
+test "a cell that cuts between two spans still marks its cut" {
+    const gpa = std.testing.allocator;
+    const text =
+        \\| a | b |
+        \\| - | - |
+        \\| **ab**c | y |
+    ;
+    try expectPlainRows(gpa, text, 10, &.{
+        "┌────┬───┐",
+        "│ a  │ b │",
+        "├────┼───┤",
+        "│ a… │ y │",
+        "└────┴───┘",
+    });
+}
+
+// A code row keeps its alignment, so it cuts and marks the cut. The indent of a
+// fenced row leaves the mark its column at every width.
+test "a narrow code row marks its cut" {
+    const gpa = std.testing.allocator;
+    const text =
+        \\```zig
+        \\const a = 1;
+        \\```
+    ;
+    try expectPlainRows(gpa, text, 6, &.{ "```zig", "  con…", "```" });
+    // A row too narrow for the indent and one character drops both and states
+    // the cut. No row of a code block ever paints as a blank row.
+    try expectPlainRows(gpa, text, 3, &.{ "``…", "…", "```" });
+    try expectPlainRows(gpa, text, 1, &.{ "…", "…", "…" });
+
+    // A cluster wider than the room of the row would take the cell of the mark,
+    // so the row drops the cluster and keeps the mark.
+    const wide =
+        \\```zig
+        \\你x = 1;
+        \\```
+    ;
+    try expectPlainRows(gpa, wide, 4, &.{ "```…", "…", "```" });
+}
+
+// Every row of one grid draws to the same width. A cell that cuts gives the
+// columns it does not fill, the mark of the cut included, back to the pad, so
+// the right border lines up.
 test "a table draws every grid row to one width" {
     const gpa = std.testing.allocator;
     try expectPlainRows(gpa, "| a你你 | bbbbbb |\n| - | - |\n| c | d |", 16, &.{
         "┌──────┬───────┐",
-        "│ a你  │ bbbbb │",
+        "│ a你… │ bbbb… │",
         "├──────┼───────┤",
         "│ c    │ d     │",
         "└──────┴───────┘",

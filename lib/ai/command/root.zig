@@ -63,6 +63,49 @@ comptime {
     }
 }
 
+/// One command as a host that documents Drinky reads it: its name, its summary,
+/// the line that opens it too, and the text it takes after its name.
+pub const Summary = struct {
+    name: []const u8,
+    summary: []const u8,
+    /// Another line that runs the same command, or empty for a command with one
+    /// line alone. A line that carries no name at all opens a list.
+    alias: []const u8 = "",
+    /// What the command takes after its name, or empty for a command that takes
+    /// no argument. Only a skill line carries one.
+    tail: []const u8 = "",
+};
+
+/// The name and the summary of every command, in the order of the table. A host
+/// that describes Drinky reads the registry from here, so its document and the
+/// command list cannot drift.
+pub const summaries = blk: {
+    var list: [commands.len + 1]Summary = undefined;
+    for (commands, 0..) |entry, index| list[index] = .{
+        .name = entry.name,
+        .summary = entry.summary,
+        .alias = aliasOf(entry.name),
+    };
+    // The skill prefix is no table entry, because it takes an argument tail. Its
+    // summary is its own on purpose: the `skill` entry states the list that the
+    // bare name opens, and this row states the load of one named skill.
+    list[commands.len] = .{
+        .name = skill_prefix ++ "name",
+        .summary = "load one named skill",
+        .tail = "the task of the skill",
+    };
+    break :blk list;
+};
+
+/// The line that runs `name` beside `/name`, or empty when none does. A line
+/// with no name at all is an alias of a list: `/` opens the command list, and
+/// `/skill:` opens the skill list. `lookup` resolves both.
+fn aliasOf(comptime name: []const u8) []const u8 {
+    if (std.mem.eql(u8, name, help_name)) return "/";
+    if (std.mem.eql(u8, name, skill.name)) return "/" ++ skill_prefix;
+    return "";
+}
+
 /// The rows of the command list: every command but `/help`, which names the
 /// list that the user already reads.
 const listed = blk: {
@@ -255,6 +298,21 @@ fn runSkill(context: *Context, target: *const skills.Skill, arguments: []const u
         .content = content,
         .source = source_copy,
     } };
+}
+
+// A line that carries no name opens a list, so the registry states that line
+// beside the command it runs. A host that documents Drinky then names it, and a
+// reader learns what a bare `/` does.
+test "the registry names the alias line of each list" {
+    for (summaries) |command| {
+        const expected = if (std.mem.eql(u8, command.name, help_name))
+            "/"
+        else if (std.mem.eql(u8, command.name, skill.name))
+            "/skill:"
+        else
+            "";
+        try std.testing.expectEqualStrings(expected, command.alias);
+    }
 }
 
 test "unknown command is reported" {

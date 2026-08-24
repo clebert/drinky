@@ -5,8 +5,9 @@
 //!
 //! The caption carries the title and the key hint above the frame. It is chrome,
 //! not content. It stays outside the scrolled window, so the picker window never
-//! scrolls it away. The hidden-row labels then count option rows alone. The page
-//! header follows the same pattern.
+//! scrolls it away. The hidden-row labels then count option rows alone. The title
+//! and the key hint each wrap, like every row above the input. The page header
+//! follows the same pattern.
 //!
 //! The picker owns its option strings and the composed `content` buffer (freed on
 //! `deinit`) and borrows the title. Navigation moves the selection and rolls over
@@ -27,6 +28,9 @@ const terminal = @import("terminal");
 const Picker = @This();
 
 const hint = "↑/↓: Move · Enter: Select · Esc: Cancel";
+/// How both caption rows paint. The measure and the paint share it, so the rows
+/// the caption takes cannot diverge from the rows it paints.
+const caption: paint.Notice = .{ .role = .muted };
 /// The tag of the option that holds the value the picker starts on.
 const tag_current = " (Current)";
 /// The width a picker composes its rows for before the first paint measures the
@@ -135,7 +139,8 @@ pub fn reflow(self: *Picker, size: terminal.View.Size) !void {
 pub fn rows(self: *const Picker, size: terminal.View.Size) usize {
     const columns_max = paint.contentColumns(size.columns);
     const total_body = terminal.width.rows(self.content.items, columns_max);
-    return self.captionRows() + paint.framedRows(@min(total_body, paint.bodyLimit(size.rows)));
+    return self.captionRows(size.columns) +
+        paint.framedRows(@min(total_body, paint.bodyLimit(size.rows)));
 }
 
 /// Stream the caption, then the option rows between their separators, through
@@ -148,7 +153,7 @@ pub fn render(self: *const Picker, placement: *const paint.Placement, viewport_r
     const visible_rows = @min(total_body, paint.bodyLimit(viewport_rows));
     // The derived placement copies its parent. Only the geometry changes.
     var frame_placement = placement.*;
-    frame_placement.base = placement.base + self.captionRows();
+    frame_placement.base = placement.base + self.captionRows(placement.columns);
     try paint.framed(&frame_placement, &.{
         .body = self.content.items,
         .body_rows = visible_rows,
@@ -158,25 +163,25 @@ pub fn render(self: *const Picker, placement: *const paint.Placement, viewport_r
     });
 }
 
-/// The muted caption above the frame: the title, then the key hint. Each row
-/// truncates instead of wrapping, so the caption keeps its height at every width.
+/// The muted caption above the frame: the title, then the key hint. Each of the
+/// two wraps, so a narrow window keeps every word of both. A caption that grows
+/// adds its rows above the framed list, which `paint.bodyLimit` bounds on its own.
 fn renderCaption(self: *const Picker, placement: *const paint.Placement) !void {
-    try paint.notice(placement, &.{ .role = .muted, .prefix = "" }, self.title);
+    try paint.notice(placement, &caption, self.title);
     // The derived placement copies its parent. Only the geometry changes.
     var hint_placement = placement.*;
-    hint_placement.base = placement.base + titleRows(self.title);
-    try paint.notice(&hint_placement, &.{ .role = .muted, .prefix = "" }, hint);
+    hint_placement.base = placement.base + titleRows(self.title, placement.columns);
+    try paint.notice(&hint_placement, &caption, hint);
 }
 
-/// Physical rows of the caption: the title rows and the one key-hint row.
-fn captionRows(self: *const Picker) usize {
-    return titleRows(self.title) + 1;
+/// Physical rows of the caption: the title rows and the key-hint rows.
+fn captionRows(self: *const Picker, columns: usize) usize {
+    return titleRows(self.title, columns) + paint.noticeRows(&caption, hint, columns);
 }
 
-/// Rows the title holds. A notice truncates each of its lines to one row, so only
-/// a title with a line break takes more than one row.
-fn titleRows(title: []const u8) usize {
-    return 1 + std.mem.count(u8, title, "\n");
+/// Rows the title holds once wrapped to `columns`.
+fn titleRows(title: []const u8, columns: usize) usize {
+    return paint.noticeRows(&caption, title, columns);
 }
 
 /// Rebuild `content`: one row per option, the selected one in the selection role
@@ -266,7 +271,7 @@ test "the frame holds the option rows alone and the caption stays above it" {
 
     // A title row, a hint row, two separators, and two option rows make six
     // rows. A short list wastes no row, so no blank row sits inside the frame.
-    try std.testing.expectEqual(@as(usize, 2), picker.captionRows());
+    try std.testing.expectEqual(@as(usize, 2), picker.captionRows(size.columns));
     try std.testing.expectEqual(@as(usize, 6), picker.rows(size));
     try std.testing.expect(std.mem.indexOf(u8, picker.content.items, "\n\n") == null);
     try std.testing.expect(!std.mem.startsWith(u8, picker.content.items, "\n"));
@@ -328,9 +333,11 @@ test "a row too wide for the window is cut and marked" {
     const size: terminal.View.Size = .{ .columns = 24, .rows = 24 };
 
     try picker.reflow(size);
-    // Two options, so two rows: the caption and the two separators add four.
+    // Two options, so two rows. This narrow caption wraps its key hint over
+    // three rows, so the caption and the two separators add six.
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, picker.content.items, "\n") + 1);
-    try std.testing.expectEqual(@as(usize, 6), picker.rows(size));
+    try std.testing.expectEqual(@as(usize, 4), picker.captionRows(size.columns));
+    try std.testing.expectEqual(@as(usize, 8), picker.rows(size));
     try std.testing.expect(std.mem.indexOf(u8, picker.content.items, "…") != null);
     // The row break inside an option cannot open a row of its own.
     try std.testing.expect(std.mem.indexOf(u8, picker.content.items, "rows in one option") == null);
@@ -340,7 +347,10 @@ test "a row too wide for the window is cut and marked" {
     // The tag states what the row is, so the cut takes the text it marks and
     // never the tag itself.
     try std.testing.expect(std.mem.indexOf(u8, painted, " > claude-son… (Current)") != null);
-    try std.testing.expectEqual(@as(usize, 6), block.paintedRows(painted));
+    try std.testing.expectEqual(@as(usize, 8), block.paintedRows(painted));
+    // The caption wraps at its separators, so every key hint stays whole.
+    for ([_][]const u8{ "↑/↓: Move", "Enter: Select", "Esc: Cancel" }) |part|
+        try std.testing.expect(std.mem.indexOf(u8, painted, part) != null);
 
     // Every row holds the width, even a window narrower than the tag.
     for ([_]usize{ 24, 8, 3, 1 }) |columns| {

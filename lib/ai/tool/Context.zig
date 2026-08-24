@@ -14,11 +14,11 @@ io: std.Io,
 /// a command runs before Drinky kills it. The defaults hold when no config
 /// overrides them.
 bash: Bash = .{},
-/// The document that describes every config key, which the `describe_config`
+/// The document that describes the harness itself, which the `describe_drinky`
 /// tool hands back. The host writes it and owns it, so the tool stays free of
-/// any app-specific knowledge. An empty document means the host exposes no
-/// config, and the tool reports that.
-config_document: []const u8 = "",
+/// any app-specific knowledge. An empty document means the host describes
+/// nothing, and the tool reports that.
+document: []const u8 = "",
 /// The path-triggered skill rules of the session, or null when the host applies
 /// none. A tool that writes a file asks the guard first. The host owns the guard
 /// and its rules.

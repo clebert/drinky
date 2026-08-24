@@ -479,9 +479,9 @@ const example =
     \\}
 ;
 
-/// The key list of the document. It is a compiled constant, so the document
-/// costs no work at startup beyond one format call.
-const keys_section = "\n## Keys\n\n" ++ key_lines;
+/// The key list of the section. It is a compiled constant, so the section costs
+/// no work at startup beyond one format call.
+const keys_section = "\n### Keys\n\n" ++ key_lines;
 
 const anthropic_names = joinNames(ai.models.names(.anthropic));
 const openai_names = joinNames(ai.models.names(.openai));
@@ -495,10 +495,10 @@ pub const DocumentOptions = struct {
     effort: ai.llm.Effort,
 };
 
-/// Build what the `describe_config` tool returns: a compiled key list between a
-/// header and a section that states the fallbacks the app compiles in. The
-/// header names the real file, so the model edits the path that Drinky reads. The
-/// caller owns the text.
+/// Build the configuration section of the document that the `describe_drinky`
+/// tool returns: a compiled key list between a head and a part that states the
+/// fallbacks the app compiles in. The head names the real file, so the model
+/// edits the path that Drinky reads. The caller owns the text.
 ///
 /// The tool shows no box line beside the call, so this measures nothing. The
 /// document is the same text at every call, and a measure of it states nothing
@@ -509,7 +509,7 @@ pub fn document(
     options: *const DocumentOptions,
 ) ![]u8 {
     return std.fmt.allocPrint(gpa,
-        \\# Drinky configuration
+        \\## Configuration
         \\
         \\Drinky reads {s} once, at startup. A change to that file applies at
         \\the next start of Drinky, and never to the session that runs now. Tell the user so.
@@ -521,7 +521,7 @@ pub fn document(
         \\The file holds no secret. An API key comes from the ANTHROPIC_API_KEY or the
         \\OPENAI_API_KEY variable.
         \\{s}
-        \\## Models and effort
+        \\### Models and effort
         \\
         \\- An Anthropic account takes one of: {s}. Without a key, Drinky uses {s}.
         \\- An OpenAI account takes one of: {s}. Without a key, Drinky uses {s}.
@@ -530,7 +530,7 @@ pub fn document(
         \\  file, and that memory outranks this file. Only the /model and the /effort command
         \\  change a project that Drinky already ran in.
         \\
-        \\## Example
+        \\### Example
         \\
         \\```json
         \\{s}

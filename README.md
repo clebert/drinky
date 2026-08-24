@@ -35,6 +35,7 @@ Set `ANTHROPIC_API_KEY` or `OPENAI_API_KEY`. You can also use `/login` for a sub
 
 A line that starts with a slash runs in Drinky and reaches no model. Type `/` or `/help` for the
 complete list. Each row names one command and states what it does, and Enter runs the picked one.
+You can also ask Drinky to explain its own commands, keys, and settings.
 
 - `/login` signs in. `/model` and `/effort` change the model and the reasoning effort.
 - `/skill` picks a discovered skill. `/skill:name` loads one skill with an optional task.
@@ -43,7 +44,9 @@ complete list. Each row names one command and states what it does, and Enter run
 ## Configuration
 
 The `~/.drinky/config.json` file is optional. Ask Drinky to maintain the file directly. The agent
-can describe every setting, type, default, and meaning. Drinky applies changes at the next start.
+can describe the harness itself: every command, every setting with its type, default, and meaning,
+the keys of the prompt and of a running turn, and the files that Drinky discovers. Drinky applies
+changes at the next start.
 
 ## Provider access
 

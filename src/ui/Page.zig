@@ -1,17 +1,17 @@
-//! A temporary full-window, read-only page: one muted key-hint row above a
-//! bounded body. Pages own their source and can show rendered Markdown or the
-//! exact wrapped source. They preserve a source location across reflow. The
-//! colors presentation shows the generated color preview instead of a source.
+//! A temporary full-window, read-only page: a muted key-hint header above a
+//! bounded body. The header wraps at its separators, so a narrow window keeps
+//! every key that the page offers. Pages own their source and can show rendered
+//! Markdown or the exact wrapped source. They preserve a source location across
+//! reflow. The colors presentation shows the generated color preview instead of
+//! a source.
 
 const std = @import("std");
 
 const terminal = @import("terminal");
 
-const attribute = @import("attribute.zig");
 const colors = @import("colors.zig");
 const markdown = @import("markdown.zig");
 const paint = @import("paint.zig");
-const role = @import("role.zig");
 
 const Page = @This();
 
@@ -22,6 +22,11 @@ const hint = "↑/↓: Scroll · PgUp/PgDn: Page · Home/End: Jump";
 const header_markdown = "Esc: Close · M: Source · " ++ hint;
 const header_source = "Esc: Close · M: Render · " ++ hint;
 const header_colors = "Esc: Close · " ++ hint;
+
+/// How the header paints. It wraps at its separators, because a cut header can
+/// hide the key that closes the page. The window bounds its rows, so the header
+/// can never outgrow the page.
+const header_notice: paint.Notice = .{ .role = .muted };
 
 gpa: std.mem.Allocator,
 content: []const u8,
@@ -107,12 +112,12 @@ pub fn moveDown(self: *Page, size: terminal.View.Size) void {
 
 pub fn pageUp(self: *Page, size: terminal.View.Size) void {
     self.reflow(size);
-    self.setScroll(size, self.scroll -| @max(bodyRows(size), 1));
+    self.setScroll(size, self.scroll -| @max(self.bodyRows(size), 1));
 }
 
 pub fn pageDown(self: *Page, size: terminal.View.Size) void {
     self.reflow(size);
-    self.setScroll(size, self.scroll +| @max(bodyRows(size), 1));
+    self.setScroll(size, self.scroll +| @max(self.bodyRows(size), 1));
 }
 
 pub fn moveHome(self: *Page) void {
@@ -143,7 +148,7 @@ pub fn render(
     placement: *const paint.Placement,
     size: terminal.View.Size,
 ) !void {
-    try self.renderHeader(placement);
+    try self.renderHeader(placement, size);
     switch (self.presentation) {
         .markdown => try self.renderMarkdown(placement, size),
         .source => try self.renderSource(placement, size),
@@ -151,18 +156,33 @@ pub fn render(
     }
 }
 
-fn renderHeader(self: *const Page, placement: *const paint.Placement) !void {
-    if (placement.base < placement.skip) return;
-    const header = switch (self.presentation) {
+fn renderHeader(
+    self: *const Page,
+    placement: *const paint.Placement,
+    size: terminal.View.Size,
+) !void {
+    var look = header_notice;
+    look.rows_max = self.headerRows(size);
+    try paint.notice(placement, &look, self.header());
+}
+
+/// The key hints of the active presentation.
+fn header(self: *const Page) []const u8 {
+    return switch (self.presentation) {
         .markdown => header_markdown,
         .source => header_source,
         .colors => header_colors,
     };
-    placement.sink.begin();
-    try role.apply(placement.sink, .muted);
-    try placement.sink.text(header);
-    try attribute.apply(placement.sink, .reset);
-    placement.sink.end(.{ .id = placement.id, .line = placement.base });
+}
+
+/// Physical rows the header occupies at `size`. The window bounds the count, so
+/// a header wider than a short window takes the whole page and leaves no body.
+fn headerRows(self: *const Page, size: terminal.View.Size) usize {
+    const rows_max = @max(size.rows, 1);
+    return @min(
+        paint.noticeRows(&header_notice, self.header(), @max(size.columns, 1)),
+        rows_max,
+    );
 }
 
 fn renderMarkdown(
@@ -170,13 +190,13 @@ fn renderMarkdown(
     placement: *const paint.Placement,
     size: terminal.View.Size,
 ) !void {
-    const body_base = placement.base + 1;
+    const body_base = placement.base + self.headerRows(size);
     // The derived placement copies its parent. Only the geometry changes.
     var body_placement = placement.*;
     body_placement.base = body_base;
     body_placement.skip = body_base + self.scroll;
     try markdown.renderWindow(&body_placement, self.content, &.{
-        .rows_max = bodyRows(size),
+        .rows_max = self.bodyRows(size),
     });
 }
 
@@ -185,12 +205,12 @@ fn renderColors(
     placement: *const paint.Placement,
     size: terminal.View.Size,
 ) !void {
-    const body_base = placement.base + 1;
+    const body_base = placement.base + self.headerRows(size);
     // The derived placement copies its parent. Only the geometry changes.
     var body_placement = placement.*;
     body_placement.base = body_base;
     body_placement.skip = body_base + self.scroll;
-    try colors.renderWindow(&body_placement, bodyRows(size));
+    try colors.renderWindow(&body_placement, self.bodyRows(size));
 }
 
 fn renderSource(
@@ -198,7 +218,8 @@ fn renderSource(
     placement: *const paint.Placement,
     size: terminal.View.Size,
 ) !void {
-    const visible_rows = bodyRows(size);
+    const visible_rows = self.bodyRows(size);
+    const header_rows = self.headerRows(size);
     const columns_max = @max(size.columns, 1);
     var iterator = terminal.width.wrapper(self.content, columns_max);
     var source_index: usize = 0;
@@ -206,20 +227,21 @@ fn renderSource(
     while (iterator.next()) |row| : (source_index += 1) {
         if (source_index < self.scroll) continue;
         if (shown >= visible_rows) break;
-        const local_line = 1 + shown;
         shown += 1;
-        if (placement.base + local_line < placement.skip) continue;
+        // The anchor names the source row, as the markdown body names its own
+        // row. One row then keeps one anchor across a scroll, and the clip reads
+        // the same line that the anchor states.
+        const line = placement.base + header_rows + source_index;
+        if (line < placement.skip) continue;
         placement.sink.begin();
         try placement.sink.text(row);
-        placement.sink.end(.{
-            .id = placement.id,
-            .line = placement.base + 1 + source_index,
-        });
+        placement.sink.end(.{ .id = placement.id, .line = line });
     }
 }
 
-fn bodyRows(size: terminal.View.Size) usize {
-    return @max(size.rows, 1) - 1;
+/// Body rows the window leaves below the header.
+fn bodyRows(self: *const Page, size: terminal.View.Size) usize {
+    return @max(size.rows, 1) - self.headerRows(size);
 }
 
 /// Body rows the content occupies in the laid-out width and presentation.
@@ -234,7 +256,7 @@ fn totalRows(self: *const Page) usize {
 
 fn scrollMax(self: *const Page, size: terminal.View.Size) usize {
     std.debug.assert(self.layout_columns == @max(size.columns, 1));
-    return self.layout_rows -| bodyRows(size);
+    return self.layout_rows -| self.bodyRows(size);
 }
 
 fn setScroll(self: *Page, size: terminal.View.Size, row: usize) void {
@@ -447,14 +469,25 @@ test "a colors page scrolls the preview and ignores the source toggle" {
     try std.testing.expect(std.mem.indexOf(u8, bottom, "ANSI slots") == null);
 
     // A narrow reflow keeps the exact row, because the row count is constant.
-    // The narrow window truncates the selected row, so its tail label goes.
     const scroll = page.scroll;
-    page.reflow(.{ .columns = 24, .rows = 12 });
+    const narrow_size: terminal.View.Size = .{ .columns = 24, .rows = 12 };
+    page.reflow(narrow_size);
     try std.testing.expectEqual(scroll, page.scroll);
-    const narrow = try renderForTest(&page, .{ .columns = 24, .rows = 12 });
+    // The narrow header wraps, and it keeps every key that the page offers. Its
+    // rows come off the body, so the body shows fewer preview rows.
+    const narrow = try renderForTest(&page, narrow_size);
     defer gpa.free(narrow);
-    try std.testing.expect(std.mem.indexOf(u8, narrow, "The selected option") != null);
-    try std.testing.expect(std.mem.indexOf(u8, narrow, "(Current)") == null);
+    try std.testing.expectEqual(@as(usize, 3), page.headerRows(narrow_size));
+    for ([_][]const u8{ "Esc: Close", "PgUp/PgDn: Page", "Home/End: Jump" }) |part|
+        try std.testing.expect(std.mem.indexOf(u8, narrow, part) != null);
+
+    // The end of the narrow page shows the last preview rows again, and the
+    // narrow window clips the tail label of the selected row.
+    page.moveEnd(narrow_size);
+    const tail = try renderForTest(&page, narrow_size);
+    defer gpa.free(tail);
+    try std.testing.expect(std.mem.indexOf(u8, tail, "The selected option") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tail, "(Current)") == null);
 }
 
 test "a one-row page renders only its header" {

@@ -154,17 +154,18 @@ fn reduce(parts: *Parts, reduction: Reduction) void {
 pub fn render(placement: *const paint.Placement, info: *const Info) !void {
     if (placement.base < placement.skip) return;
     if (info.notice) |notice| {
-        const line_end = std.mem.indexOfScalar(u8, notice.text, '\n') orelse notice.text.len;
         const name: role.Name = switch (notice.severity) {
             .information => .muted,
             .warning => .warning,
             .failure => .@"error",
         };
         const prefix = if (notice.severity == .failure) "Error: " else "";
+        // The footer keeps one row, because a footer that grows moves the editor,
+        // and a moving interface is worse than a cut sentence.
         return paint.notice(
             placement,
-            &.{ .role = name, .prefix = prefix },
-            notice.text[0..line_end],
+            &.{ .role = name, .prefix = prefix, .fit = .head },
+            notice.text,
         );
     }
 
@@ -199,7 +200,9 @@ pub fn render(placement: *const paint.Placement, info: *const Info) !void {
         try placement.sink.spaces(placement.columns - left_columns - right_columns);
         try placement.sink.text(right_line);
     } else {
-        try placement.sink.text(terminal.width.truncate(left_line, placement.columns));
+        const shown = paint.cut(left_line, placement.columns);
+        try placement.sink.text(shown.kept);
+        if (shown.marked) try placement.sink.text(paint.ellipsis);
     }
     try attribute.apply(placement.sink, .reset);
     placement.sink.end(.{ .id = placement.id, .line = placement.base });
@@ -565,10 +568,14 @@ test "the context gauge survives every width" {
         var out: std.Io.Writer.Allocating = .init(gpa);
         defer out.deinit();
         try renderForTest(gpa, &test_info, columns, &out);
-        // Below the width of the gauge itself only the truncation is left, and
-        // the percentage is what it truncates toward.
-        const expected = if (columns >= 12) "Context: 21%" else "Context:"[0..@min(8, columns)];
-        try expectShows(out.written(), &.{expected});
+        // Below the width of the gauge itself only the cut is left, and the
+        // percentage is what it cuts toward. The mark states that cut, and it
+        // takes the last column of the row.
+        if (columns >= 12) {
+            try expectShows(out.written(), &.{"Context: 21%"});
+            continue;
+        }
+        try expectShows(out.written(), &.{ "Context: 21%"[0 .. columns - 1], paint.ellipsis });
     }
 }
 
@@ -642,7 +649,8 @@ test "a notice replaces the status for exactly one row" {
     try renderForTest(gpa, &info, 40, &out);
 
     const painted = out.written();
-    try expectShows(painted, &.{ "Error: ", "boom" });
+    // The row keeps the first line, and the mark states the line it hides.
+    try expectShows(painted, &.{ "Error: ", "boom" ++ paint.ellipsis });
     try expectHides(painted, &.{ "not another row", "hidden-model" });
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, painted, "\r\n"));
 }

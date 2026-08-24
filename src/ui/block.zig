@@ -28,7 +28,7 @@ pub const Entry = union(enum) {
         text: std.ArrayList(u8),
         is_error: bool,
         /// How a line wider than the window fits. Only a tool box reads it. An
-        /// event renders as a notice, which always cuts.
+        /// event renders as a notice, which always wraps.
         fit: paint.Fit,
     };
     pub const Kind = std.meta.Tag(Entry);
@@ -75,39 +75,54 @@ pub const Entry = union(enum) {
         }
     }
 
+    /// The bytes this block holds.
+    fn bytes(self: *const Entry) []const u8 {
+        return switch (self.*) {
+            .intro, .user, .skill, .thinking, .model => |list| list.items,
+            .tool_result, .event => |flagged| flagged.text.items,
+        };
+    }
+
+    /// How this block paints as a notice, or null for a block that paints a box
+    /// or markdown. The measure and the paint share it, so the rows a block
+    /// counts cannot diverge from the rows it paints.
+    fn notice(self: *const Entry) ?paint.Notice {
+        return switch (self.*) {
+            .intro => .{ .role = .muted },
+            .skill => .{ .role = .user_note },
+            // An error event wraps like every other event. The transcript is the
+            // place where the whole sentence must stay readable.
+            .event => |flagged| .{
+                .role = if (flagged.is_error) .@"error" else .muted,
+                .prefix = if (flagged.is_error) "Error: " else "",
+            },
+            .user, .tool_result, .thinking, .model => null,
+        };
+    }
+
     /// The physical rows this block wraps to at `columns`, its leading separator
     /// excluded. Must equal exactly what `render` emits: the parity the diff
     /// and window math rely on.
     pub fn rows(self: *const Entry, columns: usize) usize {
+        if (self.notice()) |look| return paint.noticeRows(&look, self.bytes(), columns);
         return switch (self.*) {
-            .intro, .skill => |text| std.mem.count(u8, text.items, "\n") + 1,
-            .event => |flagged| std.mem.count(u8, flagged.text.items, "\n") + 1,
-            .user => |text| paint.boxRows(&.{ .text = text.items }, columns),
+            .user => |list| paint.boxRows(&.{ .text = list.items }, columns),
             .tool_result => |flagged| paint.boxRows(
                 &.{ .text = flagged.text.items, .fit = flagged.fit },
                 columns,
             ),
-            .thinking, .model => |text| markdown.rows(text.items, columns),
+            .thinking, .model => |list| markdown.rows(list.items, columns),
+            .intro, .skill, .event => unreachable,
         };
     }
 
     /// Compose this block's rows through `placement` and drop its top `skip`
     /// rows (nonzero only for the clip).
     pub fn render(self: *const Entry, placement: *const paint.Placement) !void {
+        if (self.notice()) |look| return paint.notice(placement, &look, self.bytes());
         switch (self.*) {
-            .intro => |text| try paint.notice(placement, &.{
-                .role = .muted,
-                .prefix = "",
-            }, text.items),
-            .skill => |text| try paint.notice(placement, &.{
-                .role = .user_note,
-                .prefix = "",
-            }, text.items),
-            .event => |flagged| try paint.notice(placement, &.{
-                .role = if (flagged.is_error) .@"error" else .muted,
-                .prefix = if (flagged.is_error) "Error: " else "",
-            }, flagged.text.items),
-            .user => |text| try paint.box(placement, .user, &.{ .text = text.items }),
+            .intro, .skill, .event => unreachable,
+            .user => |list| try paint.box(placement, .user, &.{ .text = list.items }),
             .tool_result => |flagged| try paint.box(
                 placement,
                 if (flagged.is_error) .tool_error else .tool_success,
@@ -119,8 +134,8 @@ pub const Entry = union(enum) {
                     .emphasis = .first_value,
                 },
             ),
-            .thinking => |text| try markdown.render(placement, .muted, text.items),
-            .model => |text| try markdown.render(placement, null, text.items),
+            .thinking => |list| try markdown.render(placement, .muted, list.items),
+            .model => |list| try markdown.render(placement, null, list.items),
         }
     }
 };
@@ -213,7 +228,7 @@ test "each entry variant renders exactly the rows it counts" {
             .text = "Tool: bash · Command: ls\nTime: 400ms · Exit code: 1",
         },
         // A call whose tool decided no box line is the call row alone.
-        .{ .kind = .tool_result, .options = .{}, .text = "Tool: describe_config" },
+        .{ .kind = .tool_result, .options = .{}, .text = "Tool: describe_drinky" },
         // A wide-glyph box, to exercise the narrow-width row cap.
         .{ .kind = .user, .options = .{}, .text = "你好世界" },
     };

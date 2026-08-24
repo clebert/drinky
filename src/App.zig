@@ -22,6 +22,7 @@ const ai = @import("ai");
 const terminal = @import("terminal");
 
 const Config = @import("Config.zig");
+const describe = @import("describe.zig");
 const Retry = @import("Retry.zig");
 const Session = @import("Session.zig");
 const State = @import("State.zig");
@@ -38,8 +39,24 @@ const openai_default = ai.models.get(.openai, "gpt-5.6-sol") orelse
     @compileError("default openai model is not in the model table");
 const effort_default: ai.llm.Effort = .xhigh;
 
-const intro_text = "Enter: Send · Shift+Enter: New line · Esc: Cancel · " ++
-    "Ctrl+C: Clear · Ctrl+C twice: Quit · Ctrl+D: Quit";
+/// The key hints of the intro line, in the order the line shows them. The
+/// `describe_drinky` document names the same hints, so the legend of the
+/// interface and the document cannot drift.
+const intro_keys = [_][]const u8{
+    "Enter: Send",
+    "Shift+Enter: New line",
+    "Esc: Cancel",
+    "Ctrl+C: Clear",
+    "Ctrl+D: Quit",
+};
+
+/// The intro line: every key hint, then the pointer at the command list. The
+/// line wraps at its separators, so no hint ever goes away.
+const intro_text = blk: {
+    var line: []const u8 = "";
+    for (intro_keys) |hint| line = line ++ hint ++ ui.paint.separator;
+    break :blk line ++ "/help: Commands";
+};
 
 /// Two Ctrl+C presses within this window quit. A lone press clears the editor.
 const ctrl_c_window_ms = 500;
@@ -80,9 +97,9 @@ home_directory: []const u8,
 project_instructions: ai.instructions.Result,
 skills: ai.skills.Registry,
 prompt: []const u8,
-/// What the `describe_config` tool returns: the document that describes every
-/// key of `config.json`. It outlives the agent, which borrows it.
-config_document: []const u8,
+/// What the `describe_drinky` tool returns: the document that describes the
+/// harness itself. It outlives the agent, which borrows it.
+document: []const u8,
 /// The path-triggered skill rules of the session. Every rule borrows its glob
 /// from the config and its name and file from the skill registry, so both
 /// outlive the agent, which borrows the guard itself.
@@ -573,12 +590,17 @@ pub fn run(
         .required_skills = self.skill_guard.rules(),
     });
     defer gpa.free(self.prompt);
-    self.config_document = try config.document(gpa, &.{
-        .anthropic_model = anthropic_default.name,
-        .openai_model = openai_default.name,
-        .effort = effort_default,
+    self.document = try describe.compose(gpa, &.{
+        .config = &config,
+        .defaults = .{
+            .anthropic_model = anthropic_default.name,
+            .openai_model = openai_default.name,
+            .effort = effort_default,
+        },
+        .key_hints = &intro_keys,
+        .ctrl_c_window_ms = ctrl_c_window_ms,
     });
-    defer gpa.free(self.config_document);
+    defer gpa.free(self.document);
 
     // Start on the account this project used last, then on the first
     // authenticated account, or signed out (no client) when none is. The login
@@ -595,7 +617,7 @@ pub fn run(
         .retry = config.retry,
         .effort = start_effort,
         .bash = config.bash,
-        .config_document = self.config_document,
+        .document = self.document,
         .skill_guard = &self.skill_guard,
     });
     defer self.agent.deinit();
@@ -736,7 +758,7 @@ fn initFields(self: *App, gpa: std.mem.Allocator, io: std.Io) void {
         .project_instructions = .init(gpa, .project),
         .skills = .init(gpa),
         .prompt = "",
-        .config_document = "",
+        .document = "",
         // The rules join it in `run`, once the config and the skill scan are
         // both read.
         .skill_guard = .{},
@@ -1909,6 +1931,10 @@ fn applyOutcome(self: *App, outcome: ai.command.Outcome) !void {
         .new_conversation => {
             self.agent.resetConversation();
             self.session.resetConversation();
+            // The intro line is the legend of the interface, so the empty
+            // conversation opens on it again. The startup counts line does not
+            // return, because it reports the discovery of one start alone.
+            try self.session.transcript.append(.intro, .{}, intro_text);
             // The cleared conversation holds no work to continue from.
             self.clearRetry();
         },
@@ -2396,6 +2422,20 @@ fn initForTest(self: *App, gpa: std.mem.Allocator) void {
     self.initFields(gpa, std.testing.io);
     // A test drives an app that already runs, so a key that quits can be seen.
     self.running = true;
+}
+
+// The intro line is the legend of the interface. It holds every key hint in the
+// order of the constant, and the pointer at the command list closes it. The line
+// wraps, so its width costs no hint at a narrow window.
+test "the intro line holds every key hint and closes on the command list" {
+    try std.testing.expectEqualStrings(
+        "Enter: Send · Shift+Enter: New line · Esc: Cancel · Ctrl+C: Clear · Ctrl+D: Quit · " ++
+            "/help: Commands",
+        intro_text,
+    );
+    try std.testing.expectEqual(@as(usize, 98), terminal.width.ofText(intro_text));
+    for (intro_keys) |hint|
+        try std.testing.expect(std.mem.indexOf(u8, intro_text, hint) != null);
 }
 
 test "only Apple Terminal without a multiplexer takes the legacy screen and mouse reports" {
@@ -4332,7 +4372,9 @@ test "/new clears the conversation and the scrollback without a configuration ch
     const steering = try app.agent.steering.take();
     defer gpa.free(steering);
     try std.testing.expectEqual(@as(usize, 0), steering.len);
-    try std.testing.expectEqual(@as(usize, 0), app.session.transcript.blocks().len);
+    // The intro line returns, so the empty conversation shows its legend again.
+    try std.testing.expectEqual(@as(usize, 1), app.session.transcript.blocks().len);
+    try std.testing.expectEqualStrings(intro_text, app.session.transcript.blocks()[0].intro.items);
     try std.testing.expect(std.meta.eql(ai.Agent.Stats{}, app.session.stats_shown));
     try std.testing.expect(!app.session.hasSteering());
     try std.testing.expectEqualStrings("", app.session.editor.visible());
@@ -5606,7 +5648,9 @@ test "a retry survives an account switch and Ctrl+N routes to it" {
     try app.applyOutcome(.new_conversation);
     try std.testing.expect(app.retry == null);
     try std.testing.expect(!app.session.retry_shown);
-    try std.testing.expectEqual(@as(usize, 0), app.session.transcript.blocks().len);
+    // The event of the account switch goes, and the intro line takes its place.
+    try std.testing.expectEqual(@as(usize, 1), app.session.transcript.blocks().len);
+    try std.testing.expect(app.session.transcript.blocks()[0] == .intro);
 }
 
 // A waiting retry restricts no command, because it owns no key but Ctrl+N. A
