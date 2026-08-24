@@ -12,6 +12,9 @@ const std = @import("std");
 
 const ai = @import("ai");
 
+const layout = @import("layout.zig");
+const ui = @import("ui/root.zig");
+
 const Config = @This();
 
 /// The absolute path of `config.json`, present whether or not the file exists.
@@ -21,6 +24,12 @@ path: []const u8,
 timeouts: ai.net.ProviderTimeouts = .{},
 retry: ai.net.Retry = .{},
 bash: ai.tool.Context.Bash = .{},
+/// The pages of the newest conversation that one frame retains. A count outside
+/// the window that the layout accepts falls back to the compiled count.
+window_pages: usize = layout.window_pages_default,
+/// The shares at which a status gauge takes the warning color and the error
+/// color. A pair that names no valid shares falls back to the compiled pair.
+gauge: ui.status.Gauge = .{},
 default_models: DefaultModels = .{},
 /// The configured default reasoning-effort level, or null when the file names
 /// none or names an unknown level. The caller falls back to a compiled default.
@@ -46,6 +55,16 @@ dropped_effort: ?[]const u8 = null,
 /// config keeps it so the app can tell the user Drinky ignored their line, and the
 /// bash tool falls back to the built-in timeout. Null on a legal value.
 dropped_bash_timeout_ms: ?u64 = null,
+/// The configured page count that Drinky cannot use. The config keeps it so the
+/// app can tell the user Drinky ignored their line, and the frame falls back to
+/// the compiled count. Null on a legal value.
+dropped_window_pages: ?usize = null,
+/// The gauge shares that Drinky cannot use, as the load resolved them. The file
+/// can state one share alone, and the other is then the compiled one. The config
+/// keeps the pair so the app can tell the user Drinky ignored their line, and the
+/// status line falls back to the compiled pair. The two shares hold one rule
+/// between them, so they drop together. Null on a legal pair.
+dropped_gauge: ?ui.status.Gauge = null,
 /// Whether the file held an empty bash deny pattern. Drinky drops it, because an
 /// empty pattern states no command. The config keeps the fact so the app can
 /// tell the user Drinky ignored the entry.
@@ -97,6 +116,7 @@ const File = struct {
     required_skills: []const File.RequiredSkill = &.{},
     request: Request = .{},
     bash: Bash = .{},
+    interface: Interface = .{},
     default_models: DefaultModelsFile = .{},
     default_effort: ?JsonString = null,
 
@@ -155,6 +175,15 @@ const File = struct {
         deny: []const JsonString = &.{},
     };
 
+    /// How much of the conversation one frame retains, and where a status gauge
+    /// leaves the muted role. A value outside its window states an interface
+    /// that Drinky cannot paint, so the load reports it and keeps the default.
+    const Interface = struct {
+        window_pages: usize = layout.window_pages_default,
+        gauge_percent_warning: f64 = gauge_default.percent_warning,
+        gauge_percent_error: f64 = gauge_default.percent_error,
+    };
+
     /// Model names keyed by account tag. Each resolves to a compiled model.
     const DefaultModelsFile = struct {
         anthropic_api: ?JsonString = null,
@@ -181,6 +210,7 @@ const DataOptions = struct {
 const timeouts_default: ai.net.ProviderTimeouts = .{};
 const retry_default: ai.net.Retry = .{};
 const bash_default: ai.tool.Context.Bash = .{};
+const gauge_default: ui.status.Gauge = .{};
 
 /// A malformed file must not fill the startup transcript with one event per
 /// key. Sixteen paths identify a broad shape mismatch. One final event reports
@@ -290,6 +320,35 @@ const keys = [_]Key{
         .description = "The literal patterns that deny a command. The bash tool refuses a " ++
             "command that contains one of the entries, and the refusal names that entry. " ++
             "Drinky ignores an empty entry and names each kept entry in the system prompt.",
+    },
+    .{
+        .path = "interface.window_pages",
+        .description = std.fmt.comptimePrint(
+            "The pages of the newest conversation that Drinky keeps on the screen. One page " ++
+                "is one window height. Every frame measures and paints each kept row again, " ++
+                "so a higher count keeps more of the conversation and costs more work per " ++
+                "frame. The count must be from {d} to {d}. Drinky reports a value it cannot " ++
+                "use and keeps the default.",
+            .{ layout.window_pages_min, layout.window_pages_max },
+        ),
+    },
+    .{
+        .path = "interface.gauge_percent_warning",
+        .description = std.fmt.comptimePrint(
+            "The used share at which the context gauge and a quota window take the warning " ++
+                "color. The share must be from {d} to {d}, and it must not pass the error " ++
+                "share. Drinky reports a pair it cannot use and keeps both compiled shares.",
+            .{ ui.status.Gauge.percent_min, ui.status.Gauge.percent_max },
+        ),
+    },
+    .{
+        .path = "interface.gauge_percent_error",
+        .description = std.fmt.comptimePrint(
+            "The used share at which the context gauge and a quota window take the error " ++
+                "color. The share must be from {d} to {d}. Drinky reports a pair it cannot " ++
+                "use and keeps both compiled shares.",
+            .{ ui.status.Gauge.percent_min, ui.status.Gauge.percent_max },
+        ),
     },
     .{
         .path = "default_models.anthropic_api",
@@ -474,6 +533,7 @@ const example =
     \\  "required_skills": [{ "glob": "**/*.zig", "skill": "zig-style" }],
     \\  "request": { "anthropic_idle_timeout_ms": 90000 },
     \\  "bash": { "timeout_ms": 300000, "deny": ["git add"] },
+    \\  "interface": { "window_pages": 12 },
     \\  "default_models": { "anthropic_subscription": "claude-opus-5" },
     \\  "default_effort": "high"
     \\}
@@ -619,6 +679,7 @@ fn loadFromData(gpa: std.mem.Allocator, io: std.Io, options: *const DataOptions)
     defer parsed.deinit();
     const request = parsed.value.request;
     const bash = parsed.value.bash;
+    const interface = parsed.value.interface;
     const names = parsed.value.default_models;
 
     // The paths borrow the parsed arena, and the loader dupes what it keeps. The
@@ -716,6 +777,10 @@ fn loadFromData(gpa: std.mem.Allocator, io: std.Io, options: *const DataOptions)
     );
     var dropped_bash_timeout_ms: ?u64 = null;
     const bash_timeout_ms = resolveBashTimeout(&dropped_bash_timeout_ms, bash.timeout_ms);
+    var dropped_window_pages: ?usize = null;
+    const window_pages = resolveWindowPages(&dropped_window_pages, interface.window_pages);
+    var dropped_gauge: ?ui.status.Gauge = null;
+    const gauge = resolveGauge(&dropped_gauge, &interface);
     var unknown: std.ArrayList([]const u8) = .empty;
     errdefer {
         for (unknown.items) |key| gpa.free(key);
@@ -768,6 +833,8 @@ fn loadFromData(gpa: std.mem.Allocator, io: std.Io, options: *const DataOptions)
             .timeout_ms = bash_timeout_ms,
             .deny = deny_patterns,
         },
+        .window_pages = window_pages,
+        .gauge = gauge,
         .default_models = default_models,
         .default_effort = default_effort,
         .user_instructions = user_instructions,
@@ -775,6 +842,8 @@ fn loadFromData(gpa: std.mem.Allocator, io: std.Io, options: *const DataOptions)
         .dropped_models = dropped_models,
         .dropped_effort = dropped_effort,
         .dropped_bash_timeout_ms = dropped_bash_timeout_ms,
+        .dropped_window_pages = dropped_window_pages,
+        .dropped_gauge = dropped_gauge,
         .dropped_deny_empty = dropped_deny_empty,
         .unknown_keys = unknown_keys,
         .unknown_keys_omitted = unknown_keys_omitted,
@@ -899,6 +968,40 @@ fn resolveBashTimeout(dropped: *?u64, configured: u64) u64 {
     return bash_default.timeout_ms;
 }
 
+/// Resolve the configured page count. A count of no page retains nothing, and a
+/// count above the window costs work in every frame that no user sees. Such a
+/// count falls back to the compiled count, and the function records it in
+/// `dropped` so the app can surface it.
+fn resolveWindowPages(dropped: *?usize, configured: usize) usize {
+    if (configured >= layout.window_pages_min and configured <= layout.window_pages_max)
+        return configured;
+    dropped.* = configured;
+    return layout.window_pages_default;
+}
+
+/// Resolve the configured gauge shares. Each share names a part of a limit, and
+/// the warning color comes before the error color, so the warning share must not
+/// pass the error share. A pair that breaks either rule falls back to the
+/// compiled pair, and the function records it in `dropped` so the app can
+/// surface it. The rule spans both shares, so the pair drops as one.
+fn resolveGauge(dropped: *?ui.status.Gauge, configured: *const File.Interface) ui.status.Gauge {
+    const gauge: ui.status.Gauge = .{
+        .percent_warning = configured.gauge_percent_warning,
+        .percent_error = configured.gauge_percent_error,
+    };
+    if (isShare(gauge.percent_warning) and isShare(gauge.percent_error) and
+        gauge.percent_warning <= gauge.percent_error) return gauge;
+    dropped.* = gauge;
+    return gauge_default;
+}
+
+/// Whether `percent` names a share of a limit. A huge literal parses as an
+/// infinity, and a quoted word can parse as a not-a-number value. Neither one
+/// orders against a bound, so both fail here and drop.
+fn isShare(percent: f64) bool {
+    return percent >= ui.status.Gauge.percent_min and percent <= ui.status.Gauge.percent_max;
+}
+
 /// Resolve a configured model name for `account` against the compiled table for
 /// that account's vendor. A name that is unknown or belongs to another vendor
 /// resolves to null. The function also records it in `dropped` so the app can
@@ -988,6 +1091,113 @@ test "load reads the bash section" {
     try std.testing.expectEqual(@as(usize, 4096), config.bash.bytes_max);
     try std.testing.expectEqual(@as(u64, 1500), config.bash.timeout_ms);
     try std.testing.expect(config.dropped_bash_timeout_ms == null);
+}
+
+test "load reads the interface section" {
+    var config = try loadDataForTest(
+        \\{ "interface": { "window_pages": 3, "gauge_percent_warning": 60,
+        \\  "gauge_percent_error": 80 } }
+    );
+    defer config.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 3), config.window_pages);
+    try std.testing.expectEqual(@as(f64, 60), config.gauge.percent_warning);
+    try std.testing.expectEqual(@as(f64, 80), config.gauge.percent_error);
+    try std.testing.expect(config.dropped_window_pages == null);
+    try std.testing.expect(config.dropped_gauge == null);
+
+    // Without the section the compiled interface applies.
+    var empty = try loadDataForTest("{}");
+    defer empty.deinit(std.testing.allocator);
+    try std.testing.expectEqual(layout.window_pages_default, empty.window_pages);
+    try std.testing.expectEqual(gauge_default.percent_warning, empty.gauge.percent_warning);
+    try std.testing.expectEqual(gauge_default.percent_error, empty.gauge.percent_error);
+    try std.testing.expect(empty.dropped_window_pages == null);
+    try std.testing.expect(empty.dropped_gauge == null);
+}
+
+// A window of no page retains nothing, and a count above the window costs work
+// in every frame that no user sees. Both keep the line for the report and fall
+// back to the compiled count, as every other value Drinky cannot use does.
+test "a page count Drinky cannot use falls back to the default and is reported" {
+    const cases = [_]usize{ 0, layout.window_pages_max + 1, 100_000 };
+    for (cases) |configured| {
+        const data = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "{{ \"interface\": {{ \"window_pages\": {d} }} }}",
+            .{configured},
+        );
+        defer std.testing.allocator.free(data);
+        var config = try loadDataForTest(data);
+        defer config.deinit(std.testing.allocator);
+        try std.testing.expectEqual(layout.window_pages_default, config.window_pages);
+        try std.testing.expectEqual(@as(?usize, configured), config.dropped_window_pages);
+    }
+
+    // Both edges of the window are legal counts, so neither is reported.
+    const edges = [_]usize{ layout.window_pages_min, layout.window_pages_max };
+    for (edges) |configured| {
+        const data = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "{{ \"interface\": {{ \"window_pages\": {d} }} }}",
+            .{configured},
+        );
+        defer std.testing.allocator.free(data);
+        var config = try loadDataForTest(data);
+        defer config.deinit(std.testing.allocator);
+        try std.testing.expectEqual(configured, config.window_pages);
+        try std.testing.expect(config.dropped_window_pages == null);
+    }
+}
+
+// A share outside 0 to 100 names no part of a limit, and a warning share above
+// the error share would hide the warning color. The pair holds one rule, so it
+// drops as one and the report names both shares as the file states them.
+test "gauge shares Drinky cannot use fall back to the compiled pair and are reported" {
+    const cases = [_][]const u8{
+        \\{ "interface": { "gauge_percent_warning": -20, "gauge_percent_error": 90 } }
+        ,
+        \\{ "interface": { "gauge_percent_warning": 75, "gauge_percent_error": 250 } }
+        ,
+        // A huge literal parses as an infinity, and a quoted word parses as a
+        // not-a-number value. Neither one orders against a bound.
+        \\{ "interface": { "gauge_percent_warning": 75, "gauge_percent_error": 1e999 } }
+        ,
+        \\{ "interface": { "gauge_percent_warning": "nan", "gauge_percent_error": 90 } }
+        ,
+        // The warning color comes first, so the warning share must not pass the
+        // error share.
+        \\{ "interface": { "gauge_percent_warning": 90, "gauge_percent_error": 40 } }
+        ,
+    };
+    for (cases) |data| {
+        var config = try loadDataForTest(data);
+        defer config.deinit(std.testing.allocator);
+        try std.testing.expectEqual(gauge_default.percent_warning, config.gauge.percent_warning);
+        try std.testing.expectEqual(gauge_default.percent_error, config.gauge.percent_error);
+        try std.testing.expect(config.dropped_gauge != null);
+    }
+
+    // The report names the pair the file states, so the user reads their own
+    // line back.
+    var config = try loadDataForTest(
+        \\{ "interface": { "gauge_percent_warning": 90, "gauge_percent_error": 40 } }
+    );
+    defer config.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(f64, 90), config.dropped_gauge.?.percent_warning);
+    try std.testing.expectEqual(@as(f64, 40), config.dropped_gauge.?.percent_error);
+
+    // Both edges and an equal pair are legal, so none of them is reported.
+    var edges = try loadDataForTest(
+        \\{ "interface": { "gauge_percent_warning": 0, "gauge_percent_error": 100 } }
+    );
+    defer edges.deinit(std.testing.allocator);
+    try std.testing.expect(edges.dropped_gauge == null);
+    var equal = try loadDataForTest(
+        \\{ "interface": { "gauge_percent_warning": 50, "gauge_percent_error": 50 } }
+    );
+    defer equal.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(f64, 50), equal.gauge.percent_warning);
+    try std.testing.expect(equal.dropped_gauge == null);
 }
 
 test "load reads the bash deny list and drops an empty pattern" {
@@ -1355,6 +1565,12 @@ test "the config document names the file and its own example loads clean" {
     try std.testing.expect(std.mem.indexOf(u8, text, "retry-after") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "keepalive") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "folds a level") != null);
+    // A bounded key states its window, so a reader knows which value Drinky
+    // reports and drops.
+    try std.testing.expect(std.mem.indexOf(u8, text, std.fmt.comptimePrint(
+        "count must be from {d} to {d}",
+        .{ layout.window_pages_min, layout.window_pages_max },
+    )) != null);
     // The instruction caps come from the loader that enforces them.
     try std.testing.expect(std.mem.indexOf(u8, text, std.fmt.comptimePrint(
         "at most {d} files",
@@ -1376,6 +1592,7 @@ test "the config document names the file and its own example loads clean" {
         from_example.timeouts.openai.idle_ms,
     );
     try std.testing.expectEqual(@as(u64, 300_000), from_example.bash.timeout_ms);
+    try std.testing.expectEqual(@as(usize, 12), from_example.window_pages);
     try std.testing.expectEqual(@as(usize, 1), from_example.bash.deny.len);
     try std.testing.expectEqualStrings("git add", from_example.bash.deny[0]);
     try std.testing.expect(!from_example.dropped_deny_empty);

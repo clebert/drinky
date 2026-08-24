@@ -24,12 +24,6 @@ decision already taken, or a dependency on another entry. Module layout and exte
 
 ## Improvements
 
-- **Configurable transcript window** — the 8-page transcript window moves into `config.json` and
-  trades scrollback retention against per-frame redraw cost. _Clamp to at least one page._
-- **Configurable gauge thresholds** — `config.json` sets the two shares at which a gauge takes the
-  warning color and the error color. _The compiled pair is 75% and 90%, and it drives the context
-  gauge and every quota window through one helper in `src/ui/status.zig`._
-
 ## Features
 
 - **`/review`** — a bounded workflow reviews pending changes with a fresh reviewer, a persistent

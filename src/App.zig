@@ -23,6 +23,7 @@ const terminal = @import("terminal");
 
 const Config = @import("Config.zig");
 const describe = @import("describe.zig");
+const layout = @import("layout.zig");
 const Retry = @import("Retry.zig");
 const Session = @import("Session.zig");
 const State = @import("State.zig");
@@ -671,6 +672,10 @@ pub fn run(
     // The session reports how long a call has run against this timeout, so it
     // must read the same one the tool runs under.
     self.session.bash_timeout_ms = config.bash.timeout_ms;
+    // The interface settings reach the frame through the session, because paint
+    // reads no configuration of its own.
+    self.session.window_pages = config.window_pages;
+    self.session.gauge = config.gauge;
     self.session.display_roots = self.displayRoots();
     self.session.directory_shown = self.directory_label;
     self.session.branch_root = self.project_instructions.projectRoot();
@@ -700,6 +705,34 @@ pub fn run(
             ai.tool.Context.Bash.timeout_ms_min,
             ai.tool.Context.Bash.timeout_ms_max,
             config.bash.timeout_ms,
+        },
+    );
+    if (config.dropped_window_pages) |dropped| try self.recordEvent(
+        .failure,
+        "Drinky ignored the configured window page count {d} because the count must be from " ++
+            "{d} to {d}. Drinky uses the default count of {d} pages.",
+        .{
+            dropped,
+            layout.window_pages_min,
+            layout.window_pages_max,
+            config.window_pages,
+        },
+    );
+    if (config.dropped_gauge) |dropped| try self.recordEvent(
+        .failure,
+        // The file can state one share alone, and the other one is then the
+        // compiled share. The pair is therefore not always a configured pair,
+        // so the sentence names the shares and not the lines of the file.
+        "Drinky ignored the gauge shares {d} and {d}. A share must be from {d} to {d}, and " ++
+            "the warning share must not pass the error share. Drinky uses the shares {d} " ++
+            "and {d}.",
+        .{
+            dropped.percent_warning,
+            dropped.percent_error,
+            ui.status.Gauge.percent_min,
+            ui.status.Gauge.percent_max,
+            config.gauge.percent_warning,
+            config.gauge.percent_error,
         },
     );
     if (config.dropped_deny_empty) try self.recordEvent(

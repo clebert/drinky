@@ -57,6 +57,9 @@ pub const Info = struct {
     /// allowance, so an idle number can read too low, and it reads too high
     /// once the window starts again. Only a response head states the truth.
     turn_active: bool,
+    /// The shares at which a gauge takes a color. The default is the compiled
+    /// pair, so a caller that configures none keeps it.
+    gauge: Gauge = .{},
     /// A temporary notice replaces this footer until the next user action.
     notice: ?Notice = null,
 
@@ -64,6 +67,21 @@ pub const Info = struct {
         text: []const u8,
         severity: ai.command.Outcome.Severity,
     };
+};
+
+/// The two shares at which a gauge leaves the muted role of the line. A gauge
+/// that fills to `percent_warning` takes the warning color, and one that fills
+/// to `percent_error` takes the error color. A gauge below the warning share
+/// keeps the muted role, so a color on this line always means pressure. The
+/// configuration sets the pair, and the two defaults are the compiled pair.
+pub const Gauge = struct {
+    percent_warning: f64 = 75,
+    percent_error: f64 = 90,
+
+    /// The window that a configured share must fall in. A gauge measures a share
+    /// of its own limit, so no threshold sits outside it.
+    pub const percent_min: f64 = 0;
+    pub const percent_max: f64 = 100;
 };
 
 /// The longest directory the caller passes. It bounds the left scratch buffer,
@@ -81,14 +99,6 @@ const separator = " · ";
 
 /// The compact branch keeps at most this many display columns before its mark.
 const branch_prefix_columns_max = 16;
-
-/// A gauge that fills to this share of its limit takes the warning color, and
-/// one that fills to `pressure_percent_error` takes the error color. A gauge
-/// below the warning share keeps the muted role, so a color on this line always
-/// means pressure. The shares are compiled, because no evidence supports one
-/// number over another and a configurable pair helps nobody yet.
-const pressure_percent_warning: f64 = 75;
-const pressure_percent_error: f64 = 90;
 
 /// The parts the line shows. `all` is what a wide window gets. Each reduction
 /// selects a shorter form or removes one complete part.
@@ -231,15 +241,15 @@ const Line = struct {
     }
 };
 
-/// The role a gauge takes at `used_percent`. A gauge below the warning share
-/// keeps the muted role of the line, so a color always means pressure.
+/// The role a gauge takes at `used_percent`. A gauge below the warning share of
+/// `gauge` keeps the muted role of the line, so a color always means pressure.
 ///
 /// The caller passes the used share that the printed number implies, not the
 /// measured share. Two rows that print one number then always take one color,
 /// and the color never contradicts the number beside it.
-fn pressureRole(used_percent: f64) role.Name {
-    if (used_percent >= pressure_percent_error) return .@"error";
-    if (used_percent >= pressure_percent_warning) return .warning;
+fn pressureRole(gauge: Gauge, used_percent: f64) role.Name {
+    if (used_percent >= gauge.percent_error) return .@"error";
+    if (used_percent >= gauge.percent_warning) return .warning;
     return .muted;
 }
 
@@ -414,7 +424,7 @@ fn writeQuotaPart(
         waitSeconds(window.reset_seconds, info.quota_age_ms)
     else
         null;
-    try writeQuotaWindow(line, &window, wait_seconds);
+    try writeQuotaWindow(line, &window, info.gauge, wait_seconds);
 }
 
 /// The working directory, and the branch that a command here acts on. A
@@ -483,7 +493,7 @@ fn writeContext(line: *Line, info: *const Info, form: Parts.Context) !void {
         try writeTokens(&line.out, info.context_window);
         try line.out.writeByte(')');
     }
-    line.mark(start, pressureRole(shown));
+    line.mark(start, pressureRole(info.gauge, shown));
 }
 
 /// The last request's cache hit rate over the whole prompt. An all-zero prompt
@@ -504,6 +514,7 @@ fn writeCache(line: *Line, info: *const Info) !void {
 fn writeQuotaWindow(
     line: *Line,
     window: *const ai.llm.Quota.Window,
+    gauge: Gauge,
     wait_seconds: ?u64,
 ) !void {
     const label = quotaLabel(window.window_minutes) orelse return;
@@ -516,7 +527,7 @@ fn writeQuotaWindow(
         try writeWait(&line.out, seconds);
         try line.out.writeByte(')');
     }
-    line.mark(start, pressureRole(used));
+    line.mark(start, pressureRole(gauge, used));
 }
 
 /// The seconds left on a window that stated `reset_seconds` when its response
@@ -827,6 +838,35 @@ test "a gauge takes a color when it fills past its threshold" {
     });
     // The weekly window stays under the warning share, so it keeps the muted
     // role of the line.
+    try expectHides(painted, &.{
+        comptime role.sequence(.warning) ++ "Week:",
+        comptime role.sequence(.@"error") ++ "Week:",
+    });
+}
+
+// The configuration sets the pair, and both gauges read the configured one. The
+// compiled pair reaches no gauge then.
+test "a configured pair moves the shares at which a gauge takes a color" {
+    const gpa = std.testing.allocator;
+    var info = test_info;
+    info.gauge = .{ .percent_warning = 20, .percent_error = 50 };
+    // The context gauge prints 21%, which stays under the compiled warning share
+    // and reaches the configured one.
+    info.quota = .{
+        .primary = .{ .used_percent = 50, .window_minutes = 300 },
+        .secondary = .{ .used_percent = 19, .window_minutes = 10080 },
+    };
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try renderForTest(gpa, &info, 200, &out);
+
+    const painted = out.written();
+    try expectShows(painted, &.{
+        comptime role.sequence(.warning) ++ "Context: 21%",
+        comptime role.sequence(.@"error") ++ "5h: 50%",
+    });
+    // The weekly window stays under the configured warning share, so it keeps
+    // the muted role of the line.
     try expectHides(painted, &.{
         comptime role.sequence(.warning) ++ "Week:",
         comptime role.sequence(.@"error") ++ "Week:",

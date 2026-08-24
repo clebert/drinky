@@ -190,6 +190,12 @@ boot_clock_ms: i64,
 /// The wall-clock timeout a `bash` call runs under when the call names none, in
 /// milliseconds. The driver copies it from the configuration.
 bash_timeout_ms: u64,
+/// The pages of the newest conversation that one frame retains. The driver
+/// copies the resolved count from the configuration.
+window_pages: usize,
+/// The shares at which a status gauge takes a color. The driver copies them
+/// from the configuration.
+gauge: ui.status.Gauge,
 /// The roots every path in a tool row is measured against. The driver copies
 /// them from the resolved session. Empty roots leave every path as it is.
 display_roots: ai.format.Roots,
@@ -536,6 +542,8 @@ pub fn init(
         .clock_ms = 0,
         .boot_clock_ms = 0,
         .bash_timeout_ms = (ai.tool.Context.Bash{}).timeout_ms,
+        .window_pages = layout.window_pages_default,
+        .gauge = .{},
         .display_roots = .{},
     };
     self.page_view.preserveScrollback();
@@ -1452,6 +1460,7 @@ pub fn paint(self: *Session, size: terminal.View.Size) !void {
         // response even across a sleep.
         .quota_age_ms = self.boot_clock_ms - self.stats_shown.quota_seen_ms,
         .turn_active = self.mode == .turn,
+        .gauge = self.gauge,
         .notice = if (self.notice) |notice| .{
             .text = notice.content,
             .severity = notice.severity,
@@ -1482,6 +1491,7 @@ pub fn paint(self: *Session, size: terminal.View.Size) !void {
         .viewing => unreachable,
     };
     const scene: layout.Scene = .{ .conversation = .{
+        .window_pages = self.window_pages,
         .transcript = try self.transcript.projection(self.projectionSetup()),
         .tail = tail,
         .status = &status,

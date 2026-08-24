@@ -219,6 +219,9 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - Repaints only the rows that changed, atomically. A shrink or height change keeps native scrollback
   intact and can leave blank rows below the interface. A width change or a change above the viewport
   reprints the window.
+- Drinky redraws the newest eight window heights of the conversation, and the configuration sets
+  that count. Older rows rest in the native scrollback. A page more keeps more of the conversation
+  live and costs more work in every frame.
 - A span seam takes a zero-width guard only where the two fragments can fuse into one grapheme, so
   almost no seam carries one.
 - Restores the terminal on exit, on a failed start, and around an interactive OAuth login.
@@ -295,8 +298,8 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - The quota and the cache-hit rate show while a turn runs. Each one measures one request, and only a
   response head states the truth.
 - The context gauge and each quota window take the warning color from 75% used, and the error color
-  from 90% used. A color on this line always means pressure. The color reads the share that the
-  field prints, so the number and the color always agree.
+  from 90% used. The configuration sets both shares. A color on this line always means pressure. The
+  color reads the share that the field prints, so the number and the color always agree.
 - The model name and the effort value take the normal intensity in the muted line, so the two
   settings that the user changes stand out.
 - A narrow window shortens the directory, branch, context gauge, and both countdowns before it
@@ -384,12 +387,13 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
   and at most 32 KiB. Each source loads at most 32 files and 64 KiB, and one file loads once even
   when two paths or a symbolic link reach it. Drinky reports what it skips.
 - `~/.drinky/config.json` is optional: paths for user instructions, request and bash limits, a bash
-  deny list, a default model per account, a default effort level, and the skills that a path
-  requires. Drinky reads it only at startup, so a change applies at the next start.
+  deny list, a default model per account, a default effort level, the skills that a path requires,
+  and the interface settings. Drinky reads it only at startup, so a change applies at the next
+  start.
 - It holds no secrets. API keys come from `ANTHROPIC_API_KEY` and `OPENAI_API_KEY`.
 - A configured model that is not valid for its account is reported, and the compiled default used.
-  An unknown effort level is reported the same way. A key that Drinky does not know is reported too,
-  so a typo never looks like an applied setting.
+  An unknown effort level and an interface value Drinky cannot use are reported the same way. A key
+  that Drinky does not know is reported too, so a typo never looks like an applied setting.
 - A required skill whose name no discovered skill carries guards nothing in that project. The
   startup line counts each such name once, because the global config serves every project.
 - The configuration section of the `describe_drinky` document is generated from the struct that

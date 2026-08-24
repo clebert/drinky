@@ -15,8 +15,16 @@ const terminal = @import("terminal");
 
 const ui = @import("ui/root.zig");
 
-/// The view retains this many pages (terminal heights) of the newest content.
-const window_pages = 8;
+/// The pages (terminal heights) of the newest content that a frame retains when
+/// the configuration names no count. A page more keeps more of the conversation
+/// on the screen, and each frame measures and composes every retained row again.
+pub const window_pages_default: usize = 8;
+
+/// The window that a configured page count falls in. One page retains the newest
+/// content alone. The upper bound keeps the work of one frame inside the frame
+/// interval, because the projection repeats that work at every frame.
+pub const window_pages_min: usize = 1;
+pub const window_pages_max: usize = 64;
 
 /// Anchor ids for the tail rows. They come from a reserved high range a growing
 /// transcript index (a block's id) can never reach, so anchors never alias as
@@ -45,6 +53,9 @@ pub const Scene = union(enum) {
     page: *const ui.Page,
 
     pub const Conversation = struct {
+        /// The pages of the newest content this frame retains. The driver passes
+        /// the configured count, which `Config` resolves into the window above.
+        window_pages: usize = window_pages_default,
         /// The transcript blocks the active account shows, oldest first. A
         /// projection hides the blocks of another account, so the scene borrows
         /// one pointer per shown block instead of a contiguous slice.
@@ -173,8 +184,13 @@ fn projectConversation(
     size: terminal.View.Size,
     scene: *const Scene.Conversation,
 ) !void {
+    // `Config` reports and drops a count outside the window, so every caller
+    // states a legal one. A count of zero would retain nothing, and a huge count
+    // would overflow the capacity below.
+    std.debug.assert(scene.window_pages >= window_pages_min);
+    std.debug.assert(scene.window_pages <= window_pages_max);
     const total = scene.transcript.len + tailCount(&scene.tail) + 1;
-    const capacity = @max(size.rows, 1) * window_pages;
+    const capacity = @max(size.rows, 1) * scene.window_pages;
 
     var rows: usize = 0;
     var shown: usize = 0;
@@ -184,7 +200,10 @@ fn projectConversation(
     }
     const skip = if (rows > capacity) rows - capacity else 0;
 
-    const sink = try view.beginFrame(.{ .columns = size.columns, .rows = size.rows }, window_pages);
+    const sink = try view.beginFrame(
+        .{ .columns = size.columns, .rows = size.rows },
+        scene.window_pages,
+    );
     const start = total - shown;
     var index = start;
     while (index < total) : (index += 1) {
@@ -580,6 +599,8 @@ test "a narrow window clips the steering rows to width" {
 // visible block to fill it exactly. The frame is `rows * window_pages` rows.
 // The clip drops that block's top rows while its newest content and the tail
 // below still show.
+//
+// A scene that names no count retains the compiled pages.
 test "projection clips the oldest block to fill the window exactly" {
     const gpa = std.testing.allocator;
     var editor = ui.Editor.init(gpa);
@@ -606,10 +627,44 @@ test "projection clips the oldest block to fill the window exactly" {
     const painted = try projected(gpa, .{ .columns = 40, .rows = rows }, &scene);
     defer gpa.free(painted);
 
-    try std.testing.expectEqual(rows * window_pages, ui.block.paintedRows(painted));
+    try std.testing.expectEqual(rows * window_pages_default, ui.block.paintedRows(painted));
     // The clip drops its top rows: its last line shows, its first does not, and
     // the tail still sits at the bottom.
     try std.testing.expect(std.mem.indexOf(u8, painted, "L59") != null);
     try std.testing.expect(std.mem.indexOf(u8, painted, "L0") == null);
     try std.testing.expect(std.mem.indexOf(u8, painted, "footerqq") != null);
+}
+
+// The configured count sets how much of the newest content one frame retains.
+// A frame of more pages keeps more of the conversation on the screen, and it
+// composes every one of those rows again.
+test "the retained window follows the configured page count" {
+    const gpa = std.testing.allocator;
+    var editor = ui.Editor.init(gpa);
+    defer editor.deinit();
+
+    var text = try ui.block.numberedLines(gpa, 200);
+    defer text.deinit(gpa);
+    var entries: std.ArrayList(ui.block.Entry) = .empty;
+    defer {
+        for (entries.items) |*entry| entry.deinit(gpa);
+        entries.deinit(gpa);
+    }
+    try entries.append(gpa, try ui.block.Entry.init(gpa, .model, .{}, text.items));
+
+    var shown = try shownEntries(gpa, entries.items);
+    defer shown.deinit(gpa);
+
+    const rows: usize = 4;
+    for ([_]usize{ window_pages_min, 3, 12 }) |pages| {
+        const scene: Scene = .{ .conversation = .{
+            .window_pages = pages,
+            .transcript = shown.items,
+            .tail = .{ .prompt = .{ .hint = null, .editor = &editor } },
+            .status = &test_status,
+        } };
+        const painted = try projected(gpa, .{ .columns = 40, .rows = rows }, &scene);
+        defer gpa.free(painted);
+        try std.testing.expectEqual(rows * pages, ui.block.paintedRows(painted));
+    }
 }

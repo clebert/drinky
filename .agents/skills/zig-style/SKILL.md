@@ -33,17 +33,17 @@ description:
   `root.zig` can, for the public API
 - **Subsystems are namespaces, not prefixes**: keep a family of related modules in a subdirectory
   and expose it as one namespace, so call sites read `widget.Button`. Never flatten them into the
-  parent with a shared prefix (`WidgetButton`, `WidgetPanel`). `root.zig` owns the export that
-  forms the namespace
-- **`root.zig` exports, never feeds**: `root.zig` imports its subsystem's modules to form the
-  public namespace. No module ever imports its own subsystem's `root.zig`, because that inverts the
+  parent with a shared prefix (`WidgetButton`, `WidgetPanel`). `root.zig` owns the export that forms
+  the namespace
+- **`root.zig` exports, never feeds**: `root.zig` imports its subsystem's modules to form the public
+  namespace. No module ever imports its own subsystem's `root.zig`, because that inverts the
   dependency and cycles the imports. A module that needs a sibling imports that sibling directly
 - **Shared types nest in their owning module**: a union or enum that several modules of a subsystem
   share lives as a nested `pub` type in the struct module that owns that seam. The parser owns its
   token (`Parser.Token`), and the widget owns its style (`Button.Style`). It never lives in
   `root.zig` (exports only), and never in a file of its own. A file is always a struct, so a
-  union-as-file is impossible, and the workarounds (a stuttering `token.Token` path or a
-  single-decl alias) are both banned above
+  union-as-file is impossible, and the workarounds (a stuttering `token.Token` path or a single-decl
+  alias) are both banned above
 - **No fake `pub`**: do not mark unused code `pub` to silence warnings. Remove it, along with any
   tests that exist only to exercise it. A symbol consumed elsewhere (including tests in _other_
   modules, e.g. `Srgb.white`) is real API, so keep it and its symmetric constants
@@ -61,12 +61,12 @@ description:
   Neither is what this rule forbids
 - **Bounded loops**: every loop must provably terminate. A `for` over a fixed range or a fixed-size
   array is fine. A loop whose count comes from runtime input must bound that input: a validated
-  length, or an explicit iteration cap on a poll/retry/spin. An intentionally endless loop — an
-  idle or event spin (`while (true) {}`) — is the only exception and must be written to read as
+  length, or an explicit iteration cap on a poll/retry/spin. An intentionally endless loop — an idle
+  or event spin (`while (true) {}`) — is the only exception and must be written to read as
   deliberate
 - **Struct member order**: fields, then types, then methods
-- **Callbacks last**: a callback parameter goes at the end of the parameter list, which mirrors
-  that it runs last
+- **Callbacks last**: a callback parameter goes at the end of the parameter list, which mirrors that
+  it runs last
 - **Options struct for confusable arguments**: when positional arguments can be swapped, pass a
   named-field `options` struct. A function that takes two `u64`s must. Name nullable arguments so
   the meaning of `null` is clear at the call site
