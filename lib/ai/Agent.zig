@@ -148,6 +148,21 @@ pub const ModelMismatch = struct {
     served: []const u8,
 };
 
+/// One retry that is about to start, with the cause that ended the prior
+/// attempt. The attempt number includes the initial request, so the first retry
+/// is attempt two. A response slice stays valid only for the callback.
+pub const RetryAttempt = struct {
+    attempt: u32,
+    cause: Cause,
+
+    pub const Cause = union(enum) {
+        /// A local request or stream failure. The error name identifies it.
+        failure: anyerror,
+        /// The error text from a provider response head or stream.
+        response: []const u8,
+    };
+};
+
 /// The receipt of one turn: the history span it produced, how far steering
 /// commitment advanced, and whether a committed reply was cut short. Owns no
 /// memory and stays valid only until another turn mutates the agent history.
@@ -752,12 +767,12 @@ fn drainSteering(self: *Agent, turn: *TurnState, handler: anytype) !bool {
 
 /// Stream one assistant reply and retry transient failures. Only whole
 /// requests are safe to retry, so a failed attempt's partial reply is discarded
-/// (history untouched). `handler.onStreamReset` clears partial output first.
-/// Returns the reply's items (already appended to history). An API error is
-/// retried when its head or streamed event marks it transient and the retry
-/// policy allows another try (see `net.Retry.allows`). An exhausted or permanent
-/// one is reported through `handler.onError` and surfaced as `error.ApiError`,
-/// which rolls the turn back to its latest checkpoint.
+/// (history untouched). `handler.onStreamReset` clears partial output and reports
+/// the next attempt with its cause. Returns the reply's items, already appended
+/// to history. An API error is retried when its head or streamed event marks it
+/// transient and the retry policy allows another try (see `net.Retry.allows`). An
+/// exhausted or permanent error is reported through `handler.onError`. It surfaces
+/// as `error.ApiError`, which rolls the turn back to its latest checkpoint.
 ///
 /// A head that rejects the credential takes one renewal and one repeat outside
 /// that policy, because another Drinky instance can have rotated the token this
@@ -781,13 +796,12 @@ fn fetchReply(
     var attempt: u32 = 1;
     var renewed = false;
     while (true) : (attempt += 1) {
-        if (attempt > 1)
-            try presentation(&turn.presentation_closed, handler.onStreamReset());
         var stream: @TypeOf(fetch.*).Stream = undefined;
         fetch.send(&stream, &request) catch |err| {
             const failure: net.Retry.Failure = .{ .attempt = attempt };
             if (retryableError(err) and self.retry.allows(failure)) {
                 try self.backoff(failure);
+                try notifyRetry(turn, attempt + 1, &.{ .failure = err }, handler);
                 continue;
             }
             return err;
@@ -813,7 +827,15 @@ fn fetchReply(
             // output.
             if (!renewed and stream.unauthorized()) {
                 renewed = true;
-                if (try fetch.renewCredential()) continue;
+                if (try fetch.renewCredential()) {
+                    try notifyRetry(
+                        turn,
+                        attempt + 1,
+                        &.{ .response = stream.errorText() },
+                        handler,
+                    );
+                    continue;
+                }
             }
             const failure: net.Retry.Failure = .{
                 .attempt = attempt,
@@ -821,6 +843,12 @@ fn fetchReply(
             };
             if (stream.retryable() and self.retry.allows(failure)) {
                 try self.backoff(failure);
+                try notifyRetry(
+                    turn,
+                    attempt + 1,
+                    &.{ .response = stream.errorText() },
+                    handler,
+                );
                 continue;
             }
             try presentation(&turn.presentation_closed, handler.onError(stream.errorText()));
@@ -842,6 +870,12 @@ fn fetchReply(
                 };
                 if (stream.retryable() and self.retry.allows(failure)) {
                     try self.backoff(failure);
+                    try notifyRetry(
+                        turn,
+                        attempt + 1,
+                        &.{ .response = stream.errorText() },
+                        handler,
+                    );
                     continue;
                 }
                 try presentation(&turn.presentation_closed, handler.onError(stream.errorText()));
@@ -858,6 +892,7 @@ fn fetchReply(
                 const failure: net.Retry.Failure = .{ .attempt = attempt };
                 if (retryableError(err) and self.retry.allows(failure)) {
                     try self.backoff(failure);
+                    try notifyRetry(turn, attempt + 1, &.{ .failure = err }, handler);
                     continue;
                 }
                 return err;
@@ -865,6 +900,17 @@ fn fetchReply(
         };
         return reply;
     }
+}
+
+/// Report the retry that is about to start, so the handler clears the rejected stream.
+fn notifyRetry(
+    turn: *TurnState,
+    attempt: u32,
+    cause: *const RetryAttempt.Cause,
+    handler: anytype,
+) !void {
+    const retry: RetryAttempt = .{ .attempt = attempt, .cause = cause.* };
+    try presentation(&turn.presentation_closed, handler.onStreamReset(&retry));
 }
 
 /// Wait before the retry after a failed attempt: the server's `retry-after`
@@ -1938,6 +1984,8 @@ const CaptureHandler = struct {
     streamed_tools: std.ArrayList(u8) = .empty,
     /// Every reported model switch as `requested served`, one per line.
     model_mismatches: std.ArrayList(u8) = .empty,
+    /// Every retry as `attempt cause-kind cause`, one per line.
+    retries: std.ArrayList(u8) = .empty,
     errors: std.ArrayList(u8) = .empty,
     /// Every context measurement the agent published, in order.
     published_context: std.ArrayList(?u64) = .empty,
@@ -1955,12 +2003,25 @@ const CaptureHandler = struct {
         self.text.deinit(self.gpa);
         self.streamed_tools.deinit(self.gpa);
         self.model_mismatches.deinit(self.gpa);
+        self.retries.deinit(self.gpa);
         self.errors.deinit(self.gpa);
         self.published_context.deinit(self.gpa);
     }
 
-    fn onStreamReset(self: *CaptureHandler) !void {
+    fn onStreamReset(self: *CaptureHandler, retry: *const RetryAttempt) !void {
         self.stream_reset_count += 1;
+        switch (retry.cause) {
+            .failure => |failure| try self.retries.print(
+                self.gpa,
+                "{d} failure {s}\n",
+                .{ retry.attempt, @errorName(failure) },
+            ),
+            .response => |response| try self.retries.print(
+                self.gpa,
+                "{d} response {s}\n",
+                .{ retry.attempt, response },
+            ),
+        }
     }
 
     fn onError(self: *CaptureHandler, text: []const u8) !void {
@@ -3961,6 +4022,10 @@ test "run retries transient failures, resetting the stream before each reattempt
     try agent.runWith(&fetch, "go", &handler);
     try std.testing.expectEqual(@as(usize, 3), fetch.sends);
     try std.testing.expectEqual(@as(usize, 2), handler.stream_reset_count);
+    try std.testing.expectEqualStrings(
+        "2 failure ConnectionRefused\n3 failure Timeout\n",
+        handler.retries.items,
+    );
     try std.testing.expectEqual(@as(usize, 2), agent.items.items.len);
     try std.testing.expectEqualStrings("hi", agent.items.items[1].message.text);
     try std.testing.expectEqualStrings("hi", handler.text.items);
@@ -3989,6 +4054,7 @@ test "run retries a streamed transient API error" {
     try agent.runWith(&fetch, "go", &handler);
     try std.testing.expectEqual(@as(usize, 2), fetch.sends);
     try std.testing.expectEqual(@as(usize, 1), handler.stream_reset_count);
+    try std.testing.expectEqualStrings("2 response Overloaded\n", handler.retries.items);
     try std.testing.expectEqual(@as(usize, 0), handler.errors.items.len);
     try std.testing.expectEqual(@as(usize, 1), log.count);
     try std.testing.expectEqual(@as(u64, 5000), log.slept_ms[0]);
@@ -4009,6 +4075,10 @@ test "run surfaces the failure once the attempt bound is exhausted" {
     try std.testing.expectError(error.Timeout, agent.runWith(&fetch, "go", &handler));
     try std.testing.expectEqual(@as(usize, 3), fetch.sends);
     try std.testing.expectEqual(@as(usize, 2), handler.stream_reset_count);
+    try std.testing.expectEqualStrings(
+        "2 failure Timeout\n3 failure Timeout\n",
+        handler.retries.items,
+    );
     try std.testing.expectEqual(@as(usize, 0), agent.items.items.len);
 }
 
@@ -4028,6 +4098,7 @@ test "a retryable head's retry-after hint reaches backoff" {
             .head_ok = false,
             .head_retryable = true,
             .retry_after_ms = 5000,
+            .error_text = "Overloaded",
         } },
         .{ .stream = .{ .events = &end_turn_events } },
     } };
@@ -4035,6 +4106,7 @@ test "a retryable head's retry-after hint reaches backoff" {
     try std.testing.expectEqual(@as(usize, 1), log.count);
     try std.testing.expectEqual(@as(u64, 5000), log.slept_ms[0]);
     try std.testing.expectEqual(@as(usize, 1), handler.stream_reset_count);
+    try std.testing.expectEqualStrings("2 response Overloaded\n", handler.retries.items);
     try std.testing.expectEqualStrings("hi", handler.text.items);
 }
 
@@ -4097,6 +4169,10 @@ test "a rejected credential renews once and repeats the request" {
     try std.testing.expectEqual(@as(usize, 1), fetch.renewals);
     // The repeat carries the new credential at once, so it waits for nothing.
     try std.testing.expectEqual(@as(usize, 0), log.count);
+    try std.testing.expectEqualStrings(
+        "2 response 401 Unauthorized: OAuth access token has been revoked.\n",
+        handler.retries.items,
+    );
     try std.testing.expectEqualStrings("hi", handler.text.items);
     try std.testing.expectEqualStrings("", handler.errors.items);
 }

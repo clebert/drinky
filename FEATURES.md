@@ -23,7 +23,8 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
   text to the editor.
 - Drinky records a tool call left unfinished as an error in the history. The transcript shows it as
   a failed call, so a canceled mutation is never hidden.
-- Timeouts and transient failures retry the whole request and clear the partial reply first.
+- Timeouts and transient failures retry the whole request, clear the partial reply, and record each
+  retry cause.
 - A failed turn that committed work arms a retry above the editor. Ctrl+N asks the model to continue
   and Esc discards the retry. The attempt never takes the editor text, and the start of any turn
   drops the retry.

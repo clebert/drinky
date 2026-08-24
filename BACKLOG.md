@@ -30,12 +30,6 @@ decision already taken, or a dependency on another entry. Module layout and exte
   model._
 - **Configurable transcript window** — the 8-page transcript window moves into `config.json` and
   trades scrollback retention against per-frame redraw cost. _Clamp to at least one page._
-- **A retry is recorded in the transcript** — a transcript event names each retry attempt and its
-  cause, so a restarted reply never reads as a change of mind. _A permanent event block, like the
-  model and login events, not a footer notice. It covers every attempt, including one that fails at
-  the response head and shows nothing. A later refinement can narrow it to an attempt that discards
-  streamed rows. `Agent.fetchReply` retries at four points and calls `onStreamReset` on every
-  attempt after the first, so that callback needs a cause payload, not a second callback._
 - **Configurable gauge thresholds** — `config.json` sets the two shares at which a gauge takes the
   warning color and the error color. _The compiled pair is 75% and 90%, and it drives the context
   gauge and every quota window through one helper in `src/ui/status.zig`._

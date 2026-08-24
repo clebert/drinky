@@ -357,9 +357,10 @@ pub const TurnEvent = struct {
         tool_start: Tool,
         tool_result: ToolResult,
         usage: ai.Agent.Stats,
-        /// A retry is about to re-stream the reply: drop the partial text shown so
-        /// far so the retried attempt starts clean.
-        stream_reset,
+        /// A retry is about to re-stream the reply. Drop the partial text shown
+        /// so far, then record the numbered attempt and its cause. A response
+        /// cause owns its text.
+        stream_reset: ai.Agent.RetryAttempt,
         /// The provider answered with another model than the request named. The
         /// consumer records a durable event, so the switch stays visible in the
         /// history instead of passing as the requested model's reply.
@@ -414,7 +415,11 @@ pub const TurnEvent = struct {
                 gpa.free(mismatch.requested);
                 gpa.free(mismatch.served);
             },
-            .usage, .stream_reset, .turn_ended => {},
+            .stream_reset => |retry| switch (retry.cause) {
+                .failure => {},
+                .response => |response| gpa.free(response),
+            },
+            .usage, .turn_ended => {},
         }
     }
 };
@@ -680,6 +685,30 @@ fn deinitMode(self: *Session) void {
     }
 }
 
+/// Build the permanent event that identifies one retry and its cause.
+fn retryEventText(gpa: std.mem.Allocator, retry: *const ai.Agent.RetryAttempt) ![]u8 {
+    return switch (retry.cause) {
+        .failure => |failure| std.fmt.allocPrint(
+            gpa,
+            "Drinky started retry attempt {d} because of error {s}.",
+            .{ retry.attempt, @errorName(failure) },
+        ),
+        .response => |response| if (response.len == 0)
+            std.fmt.allocPrint(
+                gpa,
+                "Drinky started retry attempt {d} because the provider rejected the " ++
+                    "request without error text.",
+                .{retry.attempt},
+            )
+        else
+            std.fmt.allocPrint(
+                gpa,
+                "Drinky started retry attempt {d} because the provider reported \"{s}\".",
+                .{ retry.attempt, response },
+            ),
+    };
+}
+
 /// Apply one turn worker event to the model, mark it dirty, and free the
 /// event's bytes. This function never paints. It drops an event unless its
 /// captured generation is still the active turn.
@@ -722,9 +751,18 @@ pub fn applyTurnEvent(self: *Session, event: *const TurnEvent) !bool {
         },
         .tool_result => |result| try self.applyToolResult(result),
         .usage => |stats| self.stats_shown = stats,
-        .stream_reset => {
+        .stream_reset => |retry| {
+            // Discard first. A discrete event ends the streamed message, so a
+            // reset after the append cannot find the rejected attempt.
             self.transcript.discardMessage();
             self.clearStreamedTools(turn);
+            const text = try retryEventText(self.gpa, &retry);
+            defer self.gpa.free(text);
+            try self.transcript.append(
+                .event,
+                .{ .survives_rewind = true },
+                text,
+            );
         },
         .model_mismatch => |mismatch| {
             // A durable event block, so the switch survives in the history the
@@ -1217,7 +1255,7 @@ pub fn cancelReceipt(
 fn reconcileAbnormalReceipt(self: *Session, receipt: *const ai.Agent.Receipt) void {
     self.dropSteeringPrefix(receipt.steering_committed_count);
     const turn = self.activeTurn() orelse unreachable;
-    self.transcript.truncate(turn.transcript_checkpoint);
+    self.transcript.rewind(turn.transcript_checkpoint);
 
     const committed = receipt.history_end != receipt.history_base;
     var lead: ?*ui.Editor.Draft = null;
@@ -2280,9 +2318,19 @@ test "a stream reset drops the tool boxes of the discarded attempt" {
     try applyEvent(&session, 1, .{ .text = try gpa.dupe(u8, "partial") });
     try applyEvent(&session, 1, .{ .tool_name = try gpa.dupe(u8, "read") });
     try applyEvent(&session, 1, .{ .tool_arguments = try gpa.dupe(u8, "{\"path\"") });
-    try applyEvent(&session, 1, .stream_reset);
+    try applyEvent(&session, 1, .{ .stream_reset = .{
+        .attempt = 2,
+        .cause = .{ .failure = error.Timeout },
+    } });
     try std.testing.expectEqual(@as(usize, 0), session.mode.turn.streamed_tools.items.len);
-    try std.testing.expectEqual(@as(usize, 0), session.transcript.blocks().len);
+    {
+        const blocks = session.transcript.blocks();
+        try std.testing.expectEqual(@as(usize, 1), blocks.len);
+        try std.testing.expectEqualStrings(
+            "Drinky started retry attempt 2 because of error Timeout.",
+            blocks[0].event.text.items,
+        );
+    }
 
     // A fragment that arrives with no open call shows nothing and appends
     // nothing.
@@ -2290,6 +2338,49 @@ test "a stream reset drops the tool boxes of the discarded attempt" {
     try std.testing.expectEqual(@as(usize, 0), session.mode.turn.streamed_tools.items.len);
     try session.paint(.{ .columns = 40, .rows = 24 });
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "orphan") == null);
+}
+
+// An attempt can fail at the response head and stream nothing. Its event must
+// remain when the next retry starts and when the whole turn fails.
+test "response-head retries remain after an abnormal rewind" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    defer session.deinit();
+
+    try session.transcript.append(.user, .{}, "try this");
+    session.beginTurn(1);
+    session.markTurnBase(0);
+    try applyEvent(&session, 1, .{ .stream_reset = .{
+        .attempt = 2,
+        .cause = .{ .response = try gpa.dupe(u8, "Overloaded") },
+    } });
+    try applyEvent(&session, 1, .{ .stream_reset = .{
+        .attempt = 3,
+        .cause = .{ .failure = error.Timeout },
+    } });
+    try session.failTurnWithReceipt(
+        &.{
+            .history_base = 0,
+            .history_end = 0,
+            .steering_committed_count = 0,
+        },
+        "The request failed.",
+    );
+
+    const blocks = session.transcript.blocks();
+    try std.testing.expectEqual(@as(usize, 3), blocks.len);
+    try std.testing.expectEqualStrings(
+        "Drinky started retry attempt 2 because the provider reported \"Overloaded\".",
+        blocks[0].event.text.items,
+    );
+    try std.testing.expectEqualStrings(
+        "Drinky started retry attempt 3 because of error Timeout.",
+        blocks[1].event.text.items,
+    );
+    try std.testing.expect(blocks[2].event.is_error);
+    try std.testing.expectEqualStrings("The request failed.", blocks[2].event.text.items);
 }
 
 // A provider can switch a request to another model. The event names both

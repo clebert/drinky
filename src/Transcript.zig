@@ -139,6 +139,23 @@ pub fn truncate(self: *Transcript, entry_count: usize) void {
     self.entries.shrinkRetainingCapacity(entry_count);
 }
 
+/// Drop every rewindable block from `entry_count` onward. Preserve a retry event
+/// because it records a request that happened, even when no reply committed.
+pub fn rewind(self: *Transcript, entry_count: usize) void {
+    std.debug.assert(entry_count <= self.entries.items.len);
+    self.endMessage();
+    var retained_count = entry_count;
+    for (self.entries.items[entry_count..]) |*entry| {
+        if (entry.survivesRewind()) {
+            self.entries.items[retained_count] = entry.*;
+            retained_count += 1;
+        } else {
+            entry.deinit(self.gpa);
+        }
+    }
+    self.entries.shrinkRetainingCapacity(retained_count);
+}
+
 /// Every block above the live tail, oldest first: the canonical record, hidden
 /// blocks included.
 pub fn blocks(self: *const Transcript) []const ui.block.Entry {
@@ -292,6 +309,24 @@ test "truncate removes optimistic tail blocks" {
     transcript.truncate(1);
     try std.testing.expectEqual(@as(usize, 1), transcript.blocks().len);
     try std.testing.expectEqualStrings("keep", transcript.blocks()[0].user.items);
+}
+
+test "rewind preserves only marked events after its checkpoint" {
+    const gpa = std.testing.allocator;
+    var transcript = Transcript.init(gpa);
+    defer transcript.deinit();
+
+    try transcript.append(.event, .{}, "keep before checkpoint");
+    try transcript.append(.user, .{}, "drop user prompt");
+    try transcript.append(.event, .{ .survives_rewind = true }, "keep retry");
+    try transcript.append(.event, .{}, "drop ordinary event");
+    try transcript.appendStream(.model, null, "drop partial reply");
+    transcript.rewind(1);
+
+    const entries = transcript.blocks();
+    try std.testing.expectEqual(@as(usize, 2), entries.len);
+    try std.testing.expectEqualStrings("keep before checkpoint", entries[0].event.text.items);
+    try std.testing.expectEqualStrings("keep retry", entries[1].event.text.items);
 }
 
 test "reasoning collects into a thinking block that the answer run does not extend" {

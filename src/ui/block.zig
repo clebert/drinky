@@ -31,6 +31,9 @@ pub const Entry = union(enum) {
         /// How a line wider than the window fits. Only a tool box reads it. An
         /// event renders as a notice, which always wraps.
         fit: paint.Fit,
+        /// Whether an event stays when an abnormal turn rewinds its model tail.
+        /// Other flagged blocks ignore this field.
+        survives_rewind: bool,
     };
 
     /// One run of model reasoning and the account slot that produced it. Only
@@ -57,6 +60,9 @@ pub const Entry = union(enum) {
         /// The account slot that produced a reasoning block. Every other variant
         /// ignores it.
         account: ?ai.llm.Account = null,
+        /// Whether an event survives an abnormal turn rewind. Every other
+        /// variant ignores it.
+        survives_rewind: bool = false,
     };
 
     /// A new block that owns a copy of `text`.
@@ -73,6 +79,7 @@ pub const Entry = union(enum) {
             .text = list,
             .is_error = options.is_error,
             .fit = options.fit,
+            .survives_rewind = options.survives_rewind,
         };
         return switch (kind) {
             .tool_result => .{ .tool_result = flagged },
@@ -97,6 +104,15 @@ pub const Entry = union(enum) {
         return switch (self.*) {
             .thinking => |reasoning| reasoning.account,
             .intro, .user, .skill, .model, .tool_result, .event => null,
+        };
+    }
+
+    /// Whether this event remains visible when an abnormal turn rewinds its
+    /// model tail. Every other block follows the rewind checkpoint.
+    pub fn survivesRewind(self: *const Entry) bool {
+        return switch (self.*) {
+            .event => |event| event.survives_rewind,
+            .intro, .user, .skill, .thinking, .model, .tool_result => false,
         };
     }
 

@@ -292,8 +292,25 @@ const TurnHandler = struct {
         try self.enqueue(.{ .usage = stats });
     }
 
-    pub fn onStreamReset(self: *TurnHandler) !void {
-        try self.enqueue(.stream_reset);
+    pub fn onStreamReset(
+        self: *TurnHandler,
+        retry: *const ai.Agent.RetryAttempt,
+    ) !void {
+        const owned: ai.Agent.RetryAttempt = switch (retry.cause) {
+            .failure => |failure| .{
+                .attempt = retry.attempt,
+                .cause = .{ .failure = failure },
+            },
+            .response => |response| .{
+                .attempt = retry.attempt,
+                .cause = .{ .response = try self.app.gpa.dupe(u8, response) },
+            },
+        };
+        errdefer switch (owned.cause) {
+            .failure => {},
+            .response => |response| self.app.gpa.free(response),
+        };
+        try self.enqueue(.{ .stream_reset = owned });
     }
 
     /// Report the model that really served a reply. The turn's requests share
@@ -2727,7 +2744,11 @@ test "turn producers keep their captured generation" {
         try handler.onToolResult("read", "result", .{ .text = summary }, false);
     }
     try handler.onUsage(.{});
-    try handler.onStreamReset();
+    const retry: ai.Agent.RetryAttempt = .{
+        .attempt = 2,
+        .cause = .{ .response = "Overloaded" },
+    };
+    try handler.onStreamReset(&retry);
     try handler.onSteering("steer", 1);
     try handler.onModelMismatch(.{ .requested = "claude-fable-5", .served = "claude-opus-5" });
     // The same served model reports once per turn, so the repeat adds no event.
@@ -2757,6 +2778,9 @@ test "turn producers keep their captured generation" {
     const tool_result = events[3].turn.payload.tool_result;
     try std.testing.expectEqualStrings("summary", tool_result.summary.?.text);
     try std.testing.expectEqual(@as(u64, 4), events[4].turn.progress_sequence_committed);
+    const queued_retry = events[5].turn.payload.stream_reset;
+    try std.testing.expectEqual(@as(u32, 2), queued_retry.attempt);
+    try std.testing.expectEqualStrings("Overloaded", queued_retry.cause.response);
     const mismatch = events[7].turn.payload.model_mismatch;
     try std.testing.expectEqualStrings("claude-fable-5", mismatch.requested);
     try std.testing.expectEqualStrings("claude-opus-5", mismatch.served);
@@ -3507,7 +3531,10 @@ test "cancel does not commit stale text across a reset held in the current batch
         .{ .turn = .{
             .generation = 1,
             .progress_sequence = 2,
-            .payload = .stream_reset,
+            .payload = .{ .stream_reset = .{
+                .attempt = 2,
+                .cause = .{ .failure = error.Timeout },
+            } },
         } },
     };
     try std.testing.expect(!try app.applyBatch(&events));
