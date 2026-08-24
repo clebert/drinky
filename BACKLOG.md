@@ -82,6 +82,7 @@ decision already taken, or a dependency on another entry. Module layout and exte
 
 ## Ideas
 
+- Notify the user when a turn ends or fails and the terminal is not in the foreground.
 - A picker layered over a live turn, so a command list opens mid-turn.
 - Restart the same prompt in a new session.
 - Benchmark models inside the Drinky harness.
