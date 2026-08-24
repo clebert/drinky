@@ -31,6 +31,15 @@ zig build -Doptimize=ReleaseSafe
 
 Set `ANTHROPIC_API_KEY` or `OPENAI_API_KEY`. You can also use `/login` for a subscription account.
 
+## Slash commands
+
+A line that starts with a slash runs in Drinky and reaches no model. Type `/` or `/help` for the
+complete list. Each row names one command and states what it does, and Enter runs the picked one.
+
+- `/login` signs in. `/model` and `/effort` change the model and the reasoning effort.
+- `/skill` picks a discovered skill. `/skill:name` loads one skill with an optional task.
+- `/new` clears the conversation. `/system` shows the complete system prompt.
+
 ## Configuration
 
 The `~/.drinky/config.json` file is optional. Ask Drinky to maintain the file directly. The agent

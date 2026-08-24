@@ -89,6 +89,13 @@ decision already taken, or a dependency on another entry. Module layout and exte
   Compiled defaults stay authoritative, so a known model always has a known context window. The file
   patches or adds alone. The endpoint form opens local and third-party models: ds4, qwen 3.6 27b,
   qwen 3.8 27b, gemma4, glimmer._
+- **`/sources`** — a full-window page lists every instruction file, every skill, and every path rule
+  that Drinky discovered at startup. _The page covers the guidance sources alone and holds no file
+  content. It expands the startup counts line, and that line stays unchanged. It names each
+  instruction file in load order, each skill, each replacement pair, each skipped file with its
+  reason, and each path rule with its resolved skill or its missing name. It reports the startup
+  discovery state, because every later skill load reads from that state. A run with no source opens
+  the page too, and the page states that Drinky found nothing._
 
 ## Ideas
 
