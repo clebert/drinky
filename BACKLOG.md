@@ -24,6 +24,10 @@ decision already taken, or a dependency on another entry. Module layout and exte
 
 ## Improvements
 
+- **Refresh the branch on input** — an input event that wakes the loop re-reads the repository head,
+  so a checkout in another terminal shows without a turn. _An idle Drinky paints no frame, so the
+  label stays stale until the next event. This limit is a decision, not a bug._
+
 ## Features
 
 - **`/review`** — a bounded workflow reviews pending changes with a fresh reviewer, a persistent
