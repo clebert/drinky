@@ -179,8 +179,14 @@ turn_origin: ?TurnOrigin,
 retry_shown: bool,
 /// Milliseconds on the monotonic clock, written by the driver before each paint.
 /// The session does no io, so it cannot read a clock of its own. It stays zero
-/// until the first paint, which makes every span it reports zero.
+/// until the first paint, which makes every span it reports zero. Every span of
+/// work that Drinky itself measures reads this clock, so a tool row and the
+/// timeout of that tool stay one measure.
 clock_ms: i64,
+/// Milliseconds on the monotonic clock that counts a suspended system too,
+/// written beside `clock_ms`. A quota window runs on the server while the
+/// machine sleeps, so its age reads this clock alone.
+boot_clock_ms: i64,
 /// The wall-clock timeout a `bash` call runs under when the call names none, in
 /// milliseconds. The driver copies it from the configuration.
 bash_timeout_ms: u64,
@@ -465,6 +471,7 @@ pub fn init(
         .turn_origin = null,
         .retry_shown = false,
         .clock_ms = 0,
+        .boot_clock_ms = 0,
         .bash_timeout_ms = (ai.tool.Context.Bash{}).timeout_ms,
         .display_roots = .{},
     };
@@ -1296,6 +1303,11 @@ pub fn paint(self: *Session, size: terminal.View.Size) !void {
         .effort = @tagName(self.effort_shown),
         .account = self.account_shown,
         .quota = self.stats_shown.quota,
+        // The agent stamps the head that stated the allowance on the clock that
+        // counts a suspended system, so the difference is the age of that
+        // response even across a sleep.
+        .quota_age_ms = self.boot_clock_ms - self.stats_shown.quota_seen_ms,
+        .turn_active = self.mode == .turn,
         .notice = if (self.notice) |notice| .{
             .text = notice.content,
             .severity = notice.severity,

@@ -91,6 +91,9 @@ pub const Stream = struct {
     /// no model rather than a stale one.
     served_model: std.ArrayList(u8),
     usage: llm.Usage,
+    /// The allowance the response head stated, or null when the head sent no
+    /// unified rate-limit headers.
+    quota: ?llm.Quota,
     decompress: std.http.Decompress,
     decompress_buffer: []u8,
     /// This buffer backs the request's extra headers. The retained request
@@ -131,9 +134,21 @@ pub const Stream = struct {
     pub const usageSoFar = engine.usageSoFar;
     pub const next = engine.next;
 
-    /// Anthropic surfaces no subscription allowance, so the seam reports none.
-    pub fn quotaSoFar(_: *const Stream) ?llm.Quota {
-        return null;
+    /// Capture the subscription allowance from the response head. Anthropic
+    /// states each reset as an absolute epoch, so the capture reads the wall
+    /// clock once and keeps the wait in seconds. The engine calls this while the
+    /// head is still valid. The wall clock serves this one conversion alone. The
+    /// agent then ages the wait on the monotonic clock that the interface uses,
+    /// so no later drift between the two clocks reaches the countdown.
+    pub fn captureHead(self: *Stream, head: *const std.http.Client.Response.Head) void {
+        const now_ms = std.Io.Timestamp.now(self.io, .real).toMilliseconds();
+        self.quota = parseQuota(head, @divFloor(now_ms, std.time.ms_per_s));
+    }
+
+    /// The subscription allowance captured from the response head (see
+    /// `captureHead`), or null on a head that stated none.
+    pub fn quotaSoFar(self: *const Stream) ?llm.Quota {
+        return self.quota;
     }
 
     /// The message a failed head's error body carries (see
@@ -159,6 +174,7 @@ pub const Stream = struct {
         self.tool_call_id = .empty;
         self.tool_name = .empty;
         self.served_model = .empty;
+        self.quota = null;
         self.authorization = &.{};
     }
 
@@ -540,6 +556,72 @@ fn mergeUsage(usage: *llm.Usage, object: std.json.ObjectMap) void {
     if (json.unsigned(object.get("cache_creation_input_tokens"))) |value| usage.cache_write = value;
 }
 
+/// The rolling windows of the unified rate limit, keyed by the name the header
+/// carries. Each one states the plan allowance that Drinky shows. The head also
+/// carries an `overage` window, which counts paid usage above the plan and
+/// answers a billing question, so this table leaves it out.
+const quota_windows = [_]struct { name: []const u8, minutes: u32 }{
+    .{ .name = "5h", .minutes = 300 },
+    .{ .name = "7d", .minutes = 10080 },
+};
+
+/// Parse the unified subscription allowance from the response head. Anthropic
+/// states a share as a fraction of one and a reset as an absolute epoch, so the
+/// parse scales the share and turns the reset into seconds from `now_seconds`.
+/// A window arrives once its utilization header does. Null when the head names
+/// no plan window at all.
+fn parseQuota(head: *const std.http.Client.Response.Head, now_seconds: i64) ?llm.Quota {
+    var used: [quota_windows.len]?f64 = @splat(null);
+    var reset_seconds: [quota_windows.len]?u64 = @splat(null);
+    var headers = head.iterateHeaders();
+    while (headers.next()) |header| {
+        const value = std.mem.trim(u8, header.value, " \t");
+        inline for (quota_windows, 0..) |window, index| {
+            const prefix = "anthropic-ratelimit-unified-" ++ window.name;
+            if (std.ascii.eqlIgnoreCase(header.name, prefix ++ "-utilization")) {
+                used[index] = parseUtilization(value);
+            } else if (std.ascii.eqlIgnoreCase(header.name, prefix ++ "-reset")) {
+                reset_seconds[index] = parseResetSeconds(value, now_seconds);
+            }
+        }
+    }
+    var parsed: [quota_windows.len]?llm.Quota.Window = @splat(null);
+    var found = false;
+    for (quota_windows, 0..) |window, index| {
+        const share = used[index] orelse continue;
+        parsed[index] = .{
+            .used_percent = share,
+            .window_minutes = window.minutes,
+            .reset_seconds = reset_seconds[index],
+        };
+        found = true;
+    }
+    if (!found) return null;
+    return .{ .primary = parsed[0], .secondary = parsed[1] };
+}
+
+/// Decode a utilization fraction as a percentage: `0.06` is 6% used. A share
+/// above the whole window clamps, because a spent allowance must still read as
+/// spent. A negative or non-finite value is no measurement.
+fn parseUtilization(value: []const u8) ?f64 {
+    const fraction = std.fmt.parseFloat(f64, value) catch return null;
+    if (!std.math.isFinite(fraction) or fraction < 0) return null;
+    return @min(100.0, fraction * 100.0);
+}
+
+/// Turn an absolute epoch reset into the seconds that remain at `now_seconds`.
+/// A reset that has gone, or one the head did not write as a count, is no data.
+///
+/// Every captured head states the reset as a plain count of seconds since the
+/// epoch. The published documentation describes an RFC 3339 time instead, which
+/// this parse does not read: the countdown then goes, the used share stays, and
+/// one dump of a response head states the new wire form.
+fn parseResetSeconds(value: []const u8, now_seconds: i64) ?u64 {
+    const epoch = std.fmt.parseInt(i64, value, 10) catch return null;
+    if (epoch <= now_seconds) return null;
+    return @intCast(epoch - now_seconds);
+}
+
 /// A stream over `body` for the tests: test allocator, fresh decode state, and
 /// the given window and budget. The connection fields stay undefined. Pair with
 /// `defer stream.deinitDecode()` to free whatever decoding retains.
@@ -605,6 +687,83 @@ fn decodeBlocksUnderOom(gpa: std.mem.Allocator) !void {
     try decodeTestFrame(&stream,
         \\{"type":"content_block_stop","index":2}
     );
+}
+
+test parseQuota {
+    // The head of a real subscription turn. It states the 5h window and an
+    // overage window, and no 7d window.
+    const captured = "HTTP/1.1 200 OK\r\n" ++
+        "anthropic-ratelimit-unified-status: allowed\r\n" ++
+        "anthropic-ratelimit-unified-5h-status: allowed\r\n" ++
+        "anthropic-ratelimit-unified-5h-reset: 1787598000\r\n" ++
+        "anthropic-ratelimit-unified-5h-utilization: 0.06\r\n" ++
+        "anthropic-ratelimit-unified-overage-utilization: 0.5\r\n" ++
+        "anthropic-ratelimit-unified-overage-reset: 1788220800\r\n" ++
+        "content-length:0\r\n\r\n";
+    const captured_head = try std.http.Client.Response.Head.parse(captured);
+    const quota = parseQuota(&captured_head, 1_787_589_400).?;
+    try std.testing.expectApproxEqAbs(
+        @as(f64, 6),
+        quota.primary.?.used_percent,
+        1e-9,
+    );
+    try std.testing.expectEqual(@as(?u32, 300), quota.primary.?.window_minutes);
+    try std.testing.expectEqual(@as(?u64, 8600), quota.primary.?.reset_seconds);
+    // The overage window counts paid usage above the plan, so no window carries
+    // it and the weekly slot stays empty.
+    try std.testing.expect(quota.secondary == null);
+
+    // A head that states both plan windows fills both slots, shortest first.
+    const both = "HTTP/1.1 200 OK\r\n" ++
+        "anthropic-ratelimit-unified-5h-utilization: 0.042\r\n" ++
+        "anthropic-ratelimit-unified-5h-reset: 1787598000\r\n" ++
+        "anthropic-ratelimit-unified-7d-utilization: 0.3\r\n" ++
+        "anthropic-ratelimit-unified-7d-reset: 1788220800\r\n" ++
+        "content-length:0\r\n\r\n";
+    const both_head = try std.http.Client.Response.Head.parse(both);
+    const windows = parseQuota(&both_head, 1_787_589_400).?;
+    try std.testing.expectApproxEqAbs(@as(f64, 4.2), windows.primary.?.used_percent, 1e-9);
+    try std.testing.expectEqual(@as(?u32, 10080), windows.secondary.?.window_minutes);
+    try std.testing.expectEqual(@as(?u64, 631_400), windows.secondary.?.reset_seconds);
+
+    // A reset that has gone keeps its window and drops its countdown alone.
+    const stale_head = try std.http.Client.Response.Head.parse(
+        "HTTP/1.1 200 OK\r\n" ++
+            "anthropic-ratelimit-unified-5h-utilization: 0.9\r\n" ++
+            "anthropic-ratelimit-unified-5h-reset: 1787000000\r\n" ++
+            "content-length:0\r\n\r\n",
+    );
+    const stale = parseQuota(&stale_head, 1_787_589_400).?;
+    try std.testing.expectApproxEqAbs(@as(f64, 90), stale.primary.?.used_percent, 1e-9);
+    try std.testing.expect(stale.primary.?.reset_seconds == null);
+
+    // No unified headers: null, so an API-key response shows no allowance.
+    const none_head = try std.http.Client.Response.Head.parse(
+        "HTTP/1.1 200 OK\r\ncontent-length:0\r\n\r\n",
+    );
+    try std.testing.expect(parseQuota(&none_head, 1_787_589_400) == null);
+}
+
+test parseResetSeconds {
+    const now: i64 = 1_787_589_400;
+    try std.testing.expectEqual(@as(?u64, 8600), parseResetSeconds("1787598000", now));
+    // A reset that has gone states nothing, and so does the documented RFC 3339
+    // form, which no captured head sends.
+    try std.testing.expect(parseResetSeconds("1787000000", now) == null);
+    try std.testing.expect(parseResetSeconds("2026-08-24T19:00:00Z", now) == null);
+    try std.testing.expect(parseResetSeconds("soon", now) == null);
+    try std.testing.expect(parseResetSeconds("", now) == null);
+}
+
+test parseUtilization {
+    try std.testing.expectEqual(@as(?f64, 0), parseUtilization("0.0"));
+    try std.testing.expectEqual(@as(?f64, 100), parseUtilization("1"));
+    // A share above the whole window clamps, so a spent allowance reads spent.
+    try std.testing.expectEqual(@as(?f64, 100), parseUtilization("1.4"));
+    try std.testing.expect(parseUtilization("-0.1") == null);
+    try std.testing.expect(parseUtilization("nan") == null);
+    try std.testing.expect(parseUtilization("inf") == null);
+    try std.testing.expect(parseUtilization("half") == null);
 }
 
 test "completed block decoding frees state at every allocation-failure point" {

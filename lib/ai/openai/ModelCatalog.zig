@@ -16,17 +16,10 @@ const endpoint = "https://chatgpt.com/backend-api/codex/models?client_version=" 
 const originator = "drinky";
 const body_bytes_max = 2 * 1024 * 1024;
 const model_count_max = 1024;
-const effective_context_window_percent_default = 95;
 
 const ModelCatalog = @This();
 
 parsed: std.json.Parsed(std.json.Value),
-
-const Metadata = struct {
-    context_window: u64,
-    max_context_window: ?u64,
-    effective_context_window_percent: ?u8,
-};
 
 pub fn deinit(self: *ModelCatalog) void {
     self.parsed.deinit();
@@ -130,11 +123,6 @@ pub fn parse(gpa: std.mem.Allocator, body: []const u8) !ModelCatalog {
 /// falls back to `max_context_window` exactly when `context_window` is absent.
 /// Null means the entry is absent or its selected value is invalid.
 pub fn contextWindow(self: *const ModelCatalog, slug: []const u8) ?u64 {
-    const decoded = self.metadata(slug) orelse return null;
-    return decoded.context_window;
-}
-
-fn metadata(self: *const ModelCatalog, slug: []const u8) ?Metadata {
     const object = json.object(self.parsed.value) orelse unreachable;
     const entries = json.array(object.get("models")) orelse unreachable;
     for (entries.items) |entry| {
@@ -143,19 +131,10 @@ fn metadata(self: *const ModelCatalog, slug: []const u8) ?Metadata {
         if (!std.mem.eql(u8, found_slug, slug)) continue;
 
         const max_context_window = positiveInt(model.get("max_context_window"));
-        const context_window = if (model.get("context_window")) |value| switch (value) {
-            .null => max_context_window orelse return null,
-            else => positiveInt(value) orelse return null,
-        } else max_context_window orelse return null;
-        const effective_context_window_percent: ?u8 =
-            if (model.get("effective_context_window_percent")) |value|
-                percent(value)
-            else
-                effective_context_window_percent_default;
-        return .{
-            .context_window = context_window,
-            .max_context_window = max_context_window,
-            .effective_context_window_percent = effective_context_window_percent,
+        const stated = model.get("context_window") orelse return max_context_window;
+        return switch (stated) {
+            .null => max_context_window,
+            else => positiveInt(stated),
         };
     }
     return null;
@@ -166,30 +145,21 @@ fn positiveInt(value: ?std.json.Value) ?u64 {
     return if (found > 0) @intCast(found) else null;
 }
 
-fn percent(value: std.json.Value) ?u8 {
-    const found = json.integer(value) orelse return null;
-    return if (found > 0 and found <= 100) @intCast(found) else null;
-}
-
-test "parse decodes raw, maximum, and effective context metadata" {
+test "the stated window wins, and the maximum stands in for an absent one" {
     var catalog = try parse(std.testing.allocator,
         \\{ "models": [
         \\  { "slug": "gpt-5.6-sol", "context_window": 372000,
-        \\    "max_context_window": 400000, "effective_context_window_percent": 95 },
+        \\    "max_context_window": 400000 },
         \\  { "slug": "gpt-5.6-terra", "context_window": null,
-        \\    "max_context_window": 300000 }
+        \\    "max_context_window": 300000 },
+        \\  { "slug": "gpt-5.6-luna", "max_context_window": 200000 }
         \\] }
     );
     defer catalog.deinit();
 
-    const sol = catalog.metadata("gpt-5.6-sol").?;
-    try std.testing.expectEqual(@as(u64, 372_000), sol.context_window);
-    try std.testing.expectEqual(@as(?u64, 400_000), sol.max_context_window);
-    try std.testing.expectEqual(@as(?u8, 95), sol.effective_context_window_percent);
-
-    const terra = catalog.metadata("gpt-5.6-terra").?;
-    try std.testing.expectEqual(@as(u64, 300_000), terra.context_window);
-    try std.testing.expectEqual(@as(?u8, 95), terra.effective_context_window_percent);
+    try std.testing.expectEqual(@as(?u64, 372_000), catalog.contextWindow("gpt-5.6-sol"));
+    try std.testing.expectEqual(@as(?u64, 300_000), catalog.contextWindow("gpt-5.6-terra"));
+    try std.testing.expectEqual(@as(?u64, 200_000), catalog.contextWindow("gpt-5.6-luna"));
 }
 
 test "missing and malformed model fields do not produce context windows" {
@@ -199,8 +169,7 @@ test "missing and malformed model fields do not produce context windows" {
         \\  { "slug": "zero", "context_window": 0, "max_context_window": 10 },
         \\  { "slug": "string", "context_window": "372000" },
         \\  { "context_window": 123 },
-        \\  { "slug": "valid", "context_window": 123,
-        \\    "effective_context_window_percent": 101 }
+        \\  { "slug": "valid", "context_window": 123 }
         \\] }
     );
     defer catalog.deinit();
@@ -210,10 +179,6 @@ test "missing and malformed model fields do not produce context windows" {
     try std.testing.expectEqual(@as(?u64, null), catalog.contextWindow("string"));
     try std.testing.expectEqual(@as(?u64, null), catalog.contextWindow("unknown"));
     try std.testing.expectEqual(@as(u64, 123), catalog.contextWindow("valid").?);
-    try std.testing.expectEqual(
-        @as(?u8, null),
-        catalog.metadata("valid").?.effective_context_window_percent,
-    );
 }
 
 test "malformed catalog envelopes are rejected" {

@@ -89,6 +89,17 @@ pub const Stats = struct {
     /// omits one leaves it unchanged. The value is null until a head reports one.
     /// An account switch clears it. API-key accounts report none.
     quota: ?llm.Quota = null,
+    /// The monotonic milliseconds at which a head last stated `quota`, counted
+    /// on the clock that includes a suspended system, because a window runs on
+    /// the server while the machine sleeps. A window states its reset relative
+    /// to its own response, so a consumer subtracts this from its own reading of
+    /// that clock to show the wait that is left. A head that omits the allowance
+    /// leaves this alone, so a kept countdown keeps running down instead of
+    /// starting again. It travels with the stats, so a failed turn, a canceled
+    /// turn, and a conversation switch all carry the right age. The value is
+    /// relative to this process alone, so a save must drop it and a restart must
+    /// read it as unknown.
+    quota_seen_ms: i64 = 0,
     by_model: [by_model_max]ByModel = [_]ByModel{.{}} ** by_model_max,
     model_count: usize = 0,
 
@@ -787,8 +798,13 @@ fn fetchReply(
         // errors, is canceled, or never reaches its terminal `.stop` still
         // updates the gauge. The most visible case is an exhausted 429 that
         // reports a spent account. A head that reports none leaves the last-known
-        // allowance.
-        if (stream.quotaSoFar()) |quota| self.stats.quota = quota;
+        // allowance. The stamp uses the clock the interface ages it against, so
+        // the countdown measures from this head and not from the terminal event
+        // of a long stream.
+        if (stream.quotaSoFar()) |quota| {
+            self.stats.quota = quota;
+            self.stats.quota_seen_ms = std.Io.Timestamp.now(self.io, .boot).toMilliseconds();
+        }
 
         if (!stream.ok()) {
             // The provider rejected the credential. Another instance can have
@@ -4243,6 +4259,40 @@ test "a failed or canceled attempt still adopts the head's allowance" {
         try std.testing.expectError(error.Canceled, agent.runWith(&fetch, "go", &handler));
         try std.testing.expectEqual(@as(f64, 100), agent.stats.quota.?.primary.?.used_percent);
     }
+}
+
+test "the head that states an allowance stamps its own arrival" {
+    const gpa = std.testing.allocator;
+    var agent = scriptedAgent(gpa);
+    defer agent.deinit();
+    var handler: CaptureHandler = .{ .gpa = gpa };
+    defer handler.deinit();
+
+    // A window states its reset against the response that carried it, so the
+    // stamp must move only when a head states an allowance.
+    agent.stats.quota_seen_ms = 0;
+    var stated: ScriptedFetch = .{ .attempts = &.{
+        .{ .stream = .{
+            .events = &end_turn_events,
+            .quota = .{ .primary = .{
+                .used_percent = 12,
+                .window_minutes = 300,
+                .reset_seconds = 3180,
+            } },
+        } },
+    } };
+    try agent.runWith(&stated, "go", &handler);
+    const stamped = agent.stats.quota_seen_ms;
+    try std.testing.expect(stamped > 0);
+
+    // A head that states none keeps both the allowance and its stamp, so the
+    // countdown keeps running down instead of starting again.
+    var silent: ScriptedFetch = .{ .attempts = &.{
+        .{ .stream = .{ .events = &end_turn_events } },
+    } };
+    try agent.runWith(&silent, "again", &handler);
+    try std.testing.expectEqual(@as(f64, 12), agent.stats.quota.?.primary.?.used_percent);
+    try std.testing.expectEqual(stamped, agent.stats.quota_seen_ms);
 }
 
 test "steering queued at the end of a turn keeps that turn alive" {

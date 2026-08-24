@@ -1667,19 +1667,30 @@ fn refresh(self: *App) !void {
     if (try self.tty.setAlternateScreen(self.session.mode == .viewing)) {
         self.session.view.invalidateWindow();
     }
-    // The session does no io, so the driver hands it the clock every frame.
+    // The session does no io, so the driver hands it both clocks every frame.
     self.session.clock_ms = self.nowMs();
+    self.session.boot_clock_ms = self.nowBootMs();
     try self.session.paint(size);
 }
 
-/// Milliseconds on the monotonic clock. It drives every span the interface
-/// measures: the double Ctrl+C window, the escape wait, and the frame clock the
-/// io-free session reads.
+/// Milliseconds on the monotonic clock that stops with a suspended system. It
+/// drives every span the interface measures against work of its own: the double
+/// Ctrl+C window, the escape wait, and the frame clock the io-free session
+/// reads. A tool measures its own timeout on this clock, so a running row and
+/// its timeout stay one measure.
 fn nowMs(self: *App) i64 {
     return std.Io.Timestamp.now(self.io, .awake).toMilliseconds();
 }
 
-/// Nanoseconds on the monotonic clock, for frame scheduling.
+/// Milliseconds on the monotonic clock that counts a suspended system too. It
+/// ages a span that a server measures, which keeps running while the machine
+/// sleeps. The quota countdown is the one such span.
+fn nowBootMs(self: *App) i64 {
+    return std.Io.Timestamp.now(self.io, .boot).toMilliseconds();
+}
+
+/// Nanoseconds on the monotonic clock that stops with a suspended system, for
+/// frame scheduling. A machine that sleeps owes no frame for that sleep.
 fn nowNs(self: *App) i96 {
     return std.Io.Timestamp.now(self.io, .awake).toNanoseconds();
 }

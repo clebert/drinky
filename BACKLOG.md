@@ -36,14 +36,9 @@ decision already taken, or a dependency on another entry. Module layout and exte
   the response head and shows nothing. A later refinement can narrow it to an attempt that discards
   streamed rows. `Agent.fetchReply` retries at four points and calls `onStreamReset` on every
   attempt after the first, so that callback needs a cause payload, not a second callback._
-- **Context-window pressure signal** — the context gauge warns as it fills, and feeds a compaction
-  threshold. _The thresholds are configurable. Color the gauge as it fills, and consider the same
-  accent for the branch, the model, and the effort level. Fold in two model-specific dimensions:
-  tiered pricing above a context threshold, and OpenAI's effective context window. The window that a
-  ChatGPT login discovers already resolves the displayed limit. The unused parts are
-  `max_context_window` and `effective_context_window_percent`, and that percent of the resolved
-  window must drive the warning. Quality degradation has no evidence-based number, so keep it a soft
-  warning._
+- **Configurable gauge thresholds** — `config.json` sets the two shares at which a gauge takes the
+  warning color and the error color. _The compiled pair is 75% and 90%, and it drives the context
+  gauge and every quota window through one helper in `src/ui/status.zig`._
 
 ## Features
 

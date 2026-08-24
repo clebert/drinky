@@ -41,10 +41,21 @@ pub const Info = struct {
     /// The active account. Null shows "Account: Signed out" instead of the
     /// model, account, and effort.
     account: ?ai.llm.Account,
-    /// A subscription's remaining allowance, or null when the active provider
-    /// reports none (an API key, or a non-subscription turn). Each window whose
-    /// duration identifies it shows on the left as `<label>: N% remaining`.
+    /// A subscription's allowance, or null when the active provider reports
+    /// none (an API key, or a non-subscription turn). Each window whose duration
+    /// identifies it shows on the left as `<label>: N% (<wait>)`.
     quota: ?ai.llm.Quota,
+    /// The time since the response that carried the quota. The reset of a
+    /// window ages with that response, so the line subtracts this to show the
+    /// wait that is left now.
+    quota_age_ms: i64,
+    /// Whether a turn runs. The quota and the cache rate each measure one
+    /// request, so both show while a turn runs and go when it ends. An idle
+    /// Drinky paints no frame, which freezes a countdown on the screen. The
+    /// share is no safer: another agent on the same account spends the same
+    /// allowance, so an idle number can read too low, and it reads too high
+    /// once the window starts again. Only a response head states the truth.
+    turn_active: bool,
     /// A temporary notice replaces this footer until the next user action.
     notice: ?Notice = null,
 
@@ -84,9 +95,10 @@ const Parts = struct {
     place: Place,
     branch: Branch,
     context: Context,
+    quota_wait: bool,
     cost: bool,
-    quota_primary: bool,
-    quota_secondary: bool,
+    quota_short: bool,
+    quota_long: bool,
     cache: bool,
     account: bool,
     effort: bool,
@@ -108,28 +120,31 @@ const Parts = struct {
         .place = .full,
         .branch = .full,
         .context = .full,
+        .quota_wait = true,
         .cost = true,
-        .quota_primary = true,
-        .quota_secondary = true,
+        .quota_short = true,
+        .quota_long = true,
         .cache = true,
         .account = true,
         .effort = true,
     };
 };
 
-/// Shorten each field before any complete part goes. The cache rate goes first
-/// after that. The cost goes before either quota because an allowance is a hard
-/// stop. Each side then gives up its bracketed detail before the head that
-/// carries it: the account, then the branch, then the place. The effort goes
-/// last, after every session number.
+/// Shorten each field before any complete part goes. The measurements of one
+/// request go next, longest window first, because they leave the line when the
+/// turn ends anyway. The session cost outlives them, so a narrow line holds the
+/// same numbers whether a turn runs or not. Each side then gives up its
+/// bracketed detail before the head that carries it: the account, then the
+/// branch, then the place. The effort goes last.
 const reductions = [_]Reduction{
     .shorten_directory,
     .shorten_branch,
     .shorten_context,
+    .shorten_quota,
     .drop_cache,
+    .drop_quota_long,
+    .drop_quota_short,
     .drop_cost,
-    .drop_quota_secondary,
-    .drop_quota_primary,
     .drop_account,
     .drop_branch,
     .drop_place,
@@ -140,10 +155,11 @@ const Reduction = enum {
     shorten_directory,
     shorten_branch,
     shorten_context,
+    shorten_quota,
     drop_cache,
+    drop_quota_long,
+    drop_quota_short,
     drop_cost,
-    drop_quota_secondary,
-    drop_quota_primary,
     drop_account,
     drop_branch,
     drop_place,
@@ -155,10 +171,11 @@ fn reduce(parts: *Parts, reduction: Reduction) void {
         .shorten_directory => parts.place = .short,
         .shorten_branch => parts.branch = .short,
         .shorten_context => parts.context = .short,
+        .shorten_quota => parts.quota_wait = false,
         .drop_cache => parts.cache = false,
         .drop_cost => parts.cost = false,
-        .drop_quota_secondary => parts.quota_secondary = false,
-        .drop_quota_primary => parts.quota_primary = false,
+        .drop_quota_long => parts.quota_long = false,
+        .drop_quota_short => parts.quota_short = false,
         .drop_account => parts.account = false,
         .drop_branch => parts.branch = .hidden,
         .drop_place => parts.place = .hidden,
@@ -341,11 +358,59 @@ fn writeLeft(line: *Line, info: *const Info, parts: *const Parts) !void {
         // type does not reveal billing.
         try line.out.print("{s}Cost: ${d:.2}", .{ separator, info.cost });
     }
+    // The quota and the cache rate each measure one request, so they belong to
+    // a running turn alone. A spent OpenAI subscription still names its plan and
+    // its wait in the failure message of the turn.
+    if (!info.turn_active) return;
     if (info.quota) |quota| {
-        if (parts.quota_primary) try writeQuotaWindow(line, quota.primary);
-        if (parts.quota_secondary) try writeQuotaWindow(line, quota.secondary);
+        const windows = orderedWindows(&quota);
+        if (parts.quota_short) try writeQuotaPart(line, &windows[0], info, parts);
+        if (parts.quota_long) try writeQuotaPart(line, &windows[1], info, parts);
     }
     if (parts.cache) try writeCache(line, info);
+}
+
+/// The windows of `quota`, shortest first, and null for a window the line
+/// cannot label. The slots of the head carry no fixed window, so the length
+/// orders the line and one account never reads in another order than the next.
+fn orderedWindows(quota: *const ai.llm.Quota) [2]?ai.llm.Quota.Window {
+    const maybe_first = labeledWindow(&quota.primary);
+    const maybe_second = labeledWindow(&quota.secondary);
+    const first = maybe_first orelse return .{ maybe_second, null };
+    const second = maybe_second orelse return .{ first, null };
+    if (windowMinutes(&second) < windowMinutes(&first)) return .{ second, first };
+    return .{ first, second };
+}
+
+/// The length of a labeled window. `labeledWindow` passes a window whose length
+/// identifies it, so the fallback never orders a line.
+fn windowMinutes(window: *const ai.llm.Quota.Window) u32 {
+    return window.window_minutes orelse 0;
+}
+
+/// `maybe_window` when its duration identifies it, and null otherwise. A window
+/// that Drinky cannot name states an allowance that the user cannot act on.
+fn labeledWindow(maybe_window: *const ?ai.llm.Quota.Window) ?ai.llm.Quota.Window {
+    const window = maybe_window.* orelse return null;
+    if (quotaLabel(window.window_minutes) == null) return null;
+    return window;
+}
+
+/// Write one window of the ordered pair, with the wait that the parts allow.
+/// An absent window writes nothing, so a provider that states one window alone
+/// leaves no gap behind.
+fn writeQuotaPart(
+    line: *Line,
+    maybe_window: *const ?ai.llm.Quota.Window,
+    info: *const Info,
+    parts: *const Parts,
+) !void {
+    const window = maybe_window.* orelse return;
+    const wait_seconds = if (parts.quota_wait)
+        waitSeconds(window.reset_seconds, info.quota_age_ms)
+    else
+        null;
+    try writeQuotaWindow(line, &window, wait_seconds);
 }
 
 /// The working directory, and the branch that a command here acts on. A
@@ -428,29 +493,57 @@ fn writeCache(line: *Line, info: *const Info) !void {
     try line.out.print("{s}Cache: {d:.0}%", .{ separator, hit });
 }
 
-/// Append one identified quota window as ` · <label>: N% remaining`, or nothing when
-/// absent or when its duration does not identify it. The used share drives the
-/// color, so the allowance and the context window read the same way.
-fn writeQuotaWindow(line: *Line, maybe_window: ?ai.llm.Quota.Window) !void {
-    const window = maybe_window orelse return;
+/// Append one identified quota window as ` · <label>: N% (<wait>)`, or nothing
+/// for an absent one. The used share drives the number and the color, so the
+/// allowance and the context window read the same way. The bracket holds the
+/// wait until the window starts again, the one figure the user cannot derive.
+fn writeQuotaWindow(
+    line: *Line,
+    window: *const ai.llm.Quota.Window,
+    wait_seconds: ?u64,
+) !void {
     const label = quotaLabel(window.window_minutes) orelse return;
-    const remaining = @max(0.0, @min(100.0, 100.0 - window.used_percent));
-    // The color reads the share that the printed remainder leaves, so two rows
-    // that print one remainder always take one color.
-    const shown = @round(remaining);
+    const used = @round(@max(0.0, @min(100.0, window.used_percent)));
     try line.out.writeAll(separator);
     const start = line.offset();
-    try line.out.print("{s}: {d:.0}% remaining", .{ label, shown });
-    line.mark(start, pressureRole(100.0 - shown));
+    try line.out.print("{s}: {d:.0}%", .{ label, used });
+    if (wait_seconds) |seconds| {
+        try line.out.writeAll(" (");
+        try writeWait(&line.out, seconds);
+        try line.out.writeByte(')');
+    }
+    line.mark(start, pressureRole(used));
 }
 
-/// A human label for a rolling window, keyed off its length in minutes. The
-/// ChatGPT plans use 5h and weekly windows. Unrecognized or absent lengths stay
-/// hidden rather than show as an allowance we cannot identify.
+/// The seconds left on a window that stated `reset_seconds` when its response
+/// arrived `age_ms` ago. Null when the head stated no reset, and null once the
+/// wait has run out, because the next response states the window that follows.
+fn waitSeconds(reset_seconds: ?u64, age_ms: i64) ?u64 {
+    const reset = reset_seconds orelse return null;
+    const age = @max(0, age_ms);
+    const left = reset -| @as(u64, @intCast(@divFloor(age, std.time.ms_per_s)));
+    return if (left == 0) null else left;
+}
+
+/// A wait in one unit: minutes below an hour, hours below a day, then days. It
+/// rounds down, so the user checks a little early. A value that rounds down to
+/// nothing still reads as `1m`, because the window is still closed.
+fn writeWait(out: *std.Io.Writer, seconds: u64) !void {
+    const minute = 60;
+    const hour = 60 * minute;
+    const day = 24 * hour;
+    if (seconds < hour) return out.print("{d}m", .{@max(1, @divFloor(seconds, minute))});
+    if (seconds < day) return out.print("{d}h", .{@divFloor(seconds, hour)});
+    return out.print("{d}d", .{@divFloor(seconds, day)});
+}
+
+/// A compact label for a rolling window, keyed off its length in minutes. Both
+/// subscription backends use a 5h and a weekly window. Unrecognized or absent
+/// lengths stay hidden rather than show as an allowance we cannot identify.
 fn quotaLabel(maybe_minutes: ?u32) ?[]const u8 {
     const minutes = maybe_minutes orelse return null;
-    if (approxWindow(minutes, 300)) return "5h quota";
-    if (approxWindow(minutes, 10080)) return "Weekly quota";
+    if (approxWindow(minutes, 300)) return "5h";
+    if (approxWindow(minutes, 10080)) return "Week";
     return null;
 }
 
@@ -507,9 +600,11 @@ const test_info: Info = .{
     .effort = "xhigh",
     .account = .anthropic_subscription,
     .quota = .{
-        .primary = .{ .used_percent = 11.6, .window_minutes = 300 },
-        .secondary = .{ .used_percent = 73.6, .window_minutes = 10080 },
+        .primary = .{ .used_percent = 11.6, .window_minutes = 300, .reset_seconds = 3180 },
+        .secondary = .{ .used_percent = 73.6, .window_minutes = 10080, .reset_seconds = 580_769 },
     },
+    .quota_age_ms = 0,
+    .turn_active = true,
 };
 
 fn renderForTest(
@@ -563,8 +658,9 @@ test render {
         "~/github/clebert/drinky (main)",
         "Context: 21% (206k/1.0M)",
         "Cost: $0.39",
-        "5h quota: 88% remaining",
-        "Weekly quota: 26% remaining",
+        // The shortest window prints first, each with the share it used and the
+        // wait until it starts again.
+        "5h: 12% (53m) · Week: 74% (6d)",
         "Cache: 87%",
         // The model and the effort value carry their own intensity, so a style
         // sequence sits between them and the muted text around them.
@@ -619,41 +715,43 @@ test "a narrow window shortens fields before it gives up parts" {
     }{
         .{
             // The directory shortens before any complete part goes.
-            .columns = 190,
+            .columns = 165,
             .shows = &.{ "~/…/drinky (main)", "Context: 21% (206k/1.0M)", "Cache: 87%" },
             .hides = &.{"~/github"},
         },
         .{
             // The context gauge shortens before any complete part goes.
-            .columns = 175,
-            .shows = &.{ "Context: 21%", "Cost: $0.39", "Weekly quota", "Cache: 87%" },
+            .columns = 150,
+            .shows = &.{ "Context: 21%", "5h: 12% (53m)", "Week: 74% (6d)", "Cache: 87%" },
             .hides = &.{"(206k/1.0M)"},
         },
         .{
-            .columns = 160,
-            .shows = &.{ "Cost: $0.39", "5h quota", "Weekly quota" },
+            // Both countdowns go together, so the two windows always read alike.
+            .columns = 140,
+            .shows = &.{ "Cost: $0.39", "5h: 12%", "Week: 74%", "Cache: 87%" },
+            .hides = &.{ "(53m)", "(6d)" },
+        },
+        .{
+            .columns = 130,
+            .shows = &.{ "Cost: $0.39", "5h: 12%", "Week: 74%" },
             .hides = &.{"Cache:"},
         },
         .{
-            // Both quotas outlast the cost.
-            .columns = 150,
-            .shows = &.{ "5h quota", "Weekly quota" },
-            .hides = &.{ "Cost:", "Cache:" },
+            // The longest window goes first.
+            .columns = 115,
+            .shows = &.{ "Cost: $0.39", "5h: 12%" },
+            .hides = &.{ "Week:", "Cache:" },
         },
         .{
-            .columns = 140,
-            .shows = &.{ "5h quota", "Anthropic Subscription" },
-            .hides = &.{ "Weekly quota", "Cost:", "Cache:" },
-        },
-        .{
-            .columns = 110,
-            .shows = &.{ "~/…/drinky (main)", "Anthropic Subscription", "Effort: " },
-            .hides = &.{"quota"},
+            // The session cost outlives every measurement of one request.
+            .columns = 105,
+            .shows = &.{ "~/…/drinky (main)", "Cost: $0.39", "Anthropic Subscription" },
+            .hides = &.{ "5h:", "Week:", "Cache:" },
         },
         .{
             .columns = 80,
             .shows = &.{ "~/…/drinky (main)", "claude-opus-4-8", "Effort: " },
-            .hides = &.{"Anthropic Subscription"},
+            .hides = &.{ "Anthropic Subscription", "Cost:" },
         },
         .{
             // The branch is a detail of the place, so it goes while the
@@ -721,13 +819,13 @@ test "a gauge takes a color when it fills past its threshold" {
     const painted = out.written();
     try expectShows(painted, &.{
         comptime role.sequence(.warning) ++ "Context: 75% (750k/1.0M)",
-        comptime role.sequence(.@"error") ++ "5h quota: 10% remaining",
+        comptime role.sequence(.@"error") ++ "5h: 90%",
     });
     // The weekly window stays under the warning share, so it keeps the muted
     // role of the line.
     try expectHides(painted, &.{
-        comptime role.sequence(.warning) ++ "Weekly quota",
-        comptime role.sequence(.@"error") ++ "Weekly quota",
+        comptime role.sequence(.warning) ++ "Week:",
+        comptime role.sequence(.@"error") ++ "Week:",
     });
 }
 
@@ -748,7 +846,7 @@ test "the color follows the share that the line prints" {
     const painted = out.written();
     try expectShows(painted, &.{
         comptime role.sequence(.warning) ++ "Context: 75%",
-        comptime role.sequence(.@"error") ++ "5h quota: 10% remaining",
+        comptime role.sequence(.@"error") ++ "5h: 90%",
     });
 }
 
@@ -821,15 +919,17 @@ test "a long branch keeps 16 columns and a whole grapheme" {
     info.branch = "feature/" ++ "🇩🇪" ** 8;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    try renderForTest(gpa, &info, 197, &out);
+    // The width that the shortened branch needs, and one column less than the
+    // whole branch needs.
+    try renderForTest(gpa, &info, 174, &out);
 
     const painted = out.written();
     try expectShows(painted, &.{
         "~/…/drinky (feature/" ++ "🇩🇪" ** 4 ++ "…)",
         "Context: 21% (206k/1.0M)",
         "Cost: $0.39",
-        "5h quota",
-        "Weekly quota",
+        "5h: 12% (53m)",
+        "Week: 74% (6d)",
         "Cache: 87%",
     });
     try expectHides(painted, &.{ "~/github", "🇩🇪" ** 5 });
@@ -897,7 +997,7 @@ test "a signed-out status shows the indicator in place of the model" {
     try expectHides(painted, &.{ "claude-opus-4-8", "Effort:", "Cache" });
 }
 
-test "quota windows show the remaining allowance, labeled by length" {
+test "quota windows show the used share, labeled by length" {
     const gpa = std.testing.allocator;
     var info = test_info;
     info.directory = "";
@@ -908,9 +1008,26 @@ test "quota windows show the remaining allowance, labeled by length" {
     try renderForTest(gpa, &info, 160, &out);
 
     const painted = out.written();
-    try expectShows(painted, &.{ "5h quota: 88% remaining", "Weekly quota: 26% remaining" });
+    try expectShows(painted, &.{ "5h: 12% (53m)", "Week: 74% (6d)" });
     // An empty directory hides the whole place, separator and all.
     try expectHides(painted, &.{" · Context:"});
+}
+
+test "the shortest window prints first, whatever slot carries it" {
+    var buffer: [512]u8 = undefined;
+    var line: Line = .init(&buffer);
+    var info = test_info;
+    // The head of a real account carried the weekly window in the primary slot.
+    info.quota = .{
+        .primary = .{ .used_percent = 10, .window_minutes = 10080, .reset_seconds = 580_769 },
+        .secondary = .{ .used_percent = 4, .window_minutes = 300, .reset_seconds = 8600 },
+    };
+
+    try writeLeft(&line, &info, &Parts.all);
+    const written = line.text();
+    const short = std.mem.indexOf(u8, written, "5h: 4% (2h)").?;
+    const long = std.mem.indexOf(u8, written, "Week: 10% (6d)").?;
+    try std.testing.expect(short < long);
 }
 
 test "unidentified quota windows stay hidden beside a known window" {
@@ -924,8 +1041,78 @@ test "unidentified quota windows stay hidden beside a known window" {
 
     try writeLeft(&line, &info, &Parts.all);
     const written = line.text();
-    try std.testing.expect(std.mem.indexOf(u8, written, "Weekly quota: 23% remaining") != null);
-    try std.testing.expect(std.mem.indexOf(u8, written, "100% remaining") == null);
+    // The weekly window keeps its place, and it shows no bracket because the
+    // head stated no reset.
+    try std.testing.expect(std.mem.indexOf(u8, written, "Week: 77% · Cache") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "0%") == null);
     try std.testing.expect(quotaLabel(null) == null);
     try std.testing.expect(quotaLabel(600) == null);
+}
+
+test writeWait {
+    const cases = [_]struct { seconds: u64, shown: []const u8 }{
+        // A window that is still closed never reads as no wait at all.
+        .{ .seconds = 0, .shown = "1m" },
+        .{ .seconds = 59, .shown = "1m" },
+        .{ .seconds = 60, .shown = "1m" },
+        .{ .seconds = 3599, .shown = "59m" },
+        .{ .seconds = 3600, .shown = "1h" },
+        .{ .seconds = 86_399, .shown = "23h" },
+        .{ .seconds = 86_400, .shown = "1d" },
+        // The reset that a real weekly window stated.
+        .{ .seconds = 580_769, .shown = "6d" },
+    };
+    for (cases) |case| {
+        var buffer: [16]u8 = undefined;
+        var out: std.Io.Writer = .fixed(&buffer);
+        try writeWait(&out, case.seconds);
+        try std.testing.expectEqualStrings(case.shown, out.buffered());
+    }
+}
+
+test waitSeconds {
+    // The wait ages with the response that stated it.
+    try std.testing.expectEqual(@as(?u64, 3180), waitSeconds(3180, 0));
+    try std.testing.expectEqual(@as(?u64, 3120), waitSeconds(3180, 60_000));
+    // A head that stated no reset shows no wait, and neither does a window that
+    // has already started again.
+    try std.testing.expect(waitSeconds(null, 0) == null);
+    try std.testing.expect(waitSeconds(60, 60_000) == null);
+    try std.testing.expect(waitSeconds(60, 600_000) == null);
+    // A clock that steps back never lengthens a wait.
+    try std.testing.expectEqual(@as(?u64, 60), waitSeconds(60, -600_000));
+}
+
+test "the quota and the cache rate show while a turn runs alone" {
+    const gpa = std.testing.allocator;
+    var idle = test_info;
+    idle.turn_active = false;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try renderForTest(gpa, &idle, 200, &out);
+
+    // Both measure one request. The place, the context gauge, and the session
+    // cost describe a state that outlives the turn, so they stay.
+    const painted = out.written();
+    try expectShows(painted, &.{ "~/github/clebert/drinky (main)", "Context: 21%", "Cost: $0.39" });
+    try expectHides(painted, &.{ "5h:", "Week:", "Cache:" });
+}
+
+test "a countdown that runs out drops its bracket and keeps its share" {
+    const gpa = std.testing.allocator;
+    var info = test_info;
+    info.quota = .{
+        .primary = .{ .used_percent = 12, .window_minutes = 300, .reset_seconds = 3180 },
+        .secondary = null,
+    };
+    // The response that stated the reset is one hour old, so the 53-minute wait
+    // has run out. The share still describes the last measured request.
+    info.quota_age_ms = 3_600_000;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try renderForTest(gpa, &info, 200, &out);
+
+    const painted = out.written();
+    try expectShows(painted, &.{"5h: 12% · Cache"});
+    try expectHides(painted, &.{"(53m)"});
 }

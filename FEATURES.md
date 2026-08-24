@@ -280,16 +280,25 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
   every account switch hides the count. An effort change hides it only when it stops a stored
   reasoning block from replaying. A switch back to the measured setup shows the count again.
 - The cache-hit rate holds the last request of the active account, model, and resolved effort. A
-  change to any of the three hides it. Two effort levels that resolve to one wire form share the
-  cache, so the rate survives that change. A canceled attempt still rates its own prompt.
+  change to any of the three hides it in the turns that follow. Two effort levels that resolve to
+  one wire form share the cache, so the rate survives that change. A canceled attempt still rates
+  its own prompt.
+- A subscription window reads `5h: 12% (53m)`: the share it used, and the wait until it starts
+  again. The wait shows one unit and rounds down: `53m`, `22h`, `6d`. The shortest window prints
+  first, whatever slot the response head used.
+- Both subscription backends state the allowance in the response head. OpenAI states the wait in
+  seconds, and Anthropic states an absolute reset, which Drinky turns into the same wait.
+- The quota and the cache-hit rate show while a turn runs. Each one measures one request, and only a
+  response head states the truth.
 - The context gauge and each quota window take the warning color from 75% used, and the error color
   from 90% used. A color on this line always means pressure. The color reads the share that the
   field prints, so the number and the color always agree.
 - The model name and the effort value take the normal intensity in the muted line, so the two
   settings that the user changes stand out.
-- A narrow window shortens the directory, branch, and context gauge before it removes parts, and it
-  always keeps the context gauge. A bracketed detail goes before the head that carries it. The
-  account goes before the model, and the branch goes before the directory.
+- A narrow window shortens the directory, branch, context gauge, and both countdowns before it
+  removes parts, and it always keeps the context gauge. The measurements of one request go next,
+  longest window first, and the session cost outlives them. A bracketed detail goes before the head
+  that carries it. The account goes before the model, and the branch goes before the directory.
 - The branch comes from the `HEAD` file of the repository, never from the git command. Drinky
   re-reads it when a turn starts and when one ends.
 - A picker is a single-choice list that tags the current value. Enter confirms, and Esc, Ctrl+C, or

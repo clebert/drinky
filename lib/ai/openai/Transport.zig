@@ -763,46 +763,70 @@ fn mergeUsage(usage: *llm.Usage, object: std.json.ObjectMap) void {
 }
 
 /// Parse the Codex subscription allowance from the response head. A window is
-/// present only when its `used-percent` header is. Its `window-minutes` can be
-/// absent. Null when the head has no quota headers at all: an API-key
-/// response, or a backend that sends none.
+/// present only when its `used-percent` header is. Its `window-minutes` and its
+/// reset can be absent. Null when the head has no quota headers at all: an
+/// API-key response, or a backend that sends none.
+///
+/// The reset arrives as seconds from this response, which is what the interface
+/// needs. The backend states it as `0` on an empty slot, so `0` reads as no
+/// data. A live window that resets inside one second loses its countdown for
+/// that one response, which no user can see.
 fn parseQuota(head: *const std.http.Client.Response.Head) ?llm.Quota {
-    var primary_used: ?f64 = null;
-    var primary_minutes: ?u32 = null;
-    var secondary_used: ?f64 = null;
-    var secondary_minutes: ?u32 = null;
+    var primary: Slot = .{};
+    var secondary: Slot = .{};
     var headers = head.iterateHeaders();
     while (headers.next()) |header| {
         const value = std.mem.trim(u8, header.value, " \t");
         if (std.ascii.eqlIgnoreCase(header.name, "x-codex-primary-used-percent")) {
-            primary_used = parseQuotaPercent(value);
+            primary.used = parseQuotaPercent(value);
         } else if (std.ascii.eqlIgnoreCase(header.name, "x-codex-primary-window-minutes")) {
-            primary_minutes = std.fmt.parseInt(u32, value, 10) catch null;
+            primary.minutes = std.fmt.parseInt(u32, value, 10) catch null;
+        } else if (std.ascii.eqlIgnoreCase(header.name, "x-codex-primary-reset-after-seconds")) {
+            primary.reset_seconds = parseResetSeconds(value);
         } else if (std.ascii.eqlIgnoreCase(header.name, "x-codex-secondary-used-percent")) {
-            secondary_used = parseQuotaPercent(value);
+            secondary.used = parseQuotaPercent(value);
         } else if (std.ascii.eqlIgnoreCase(header.name, "x-codex-secondary-window-minutes")) {
-            secondary_minutes = std.fmt.parseInt(u32, value, 10) catch null;
+            secondary.minutes = std.fmt.parseInt(u32, value, 10) catch null;
+        } else if (std.ascii.eqlIgnoreCase(header.name, "x-codex-secondary-reset-after-seconds")) {
+            secondary.reset_seconds = parseResetSeconds(value);
         }
     }
-    const primary: ?llm.Quota.Window = if (primary_used) |used|
-        .{ .used_percent = used, .window_minutes = primary_minutes }
-    else
-        null;
-    const secondary: ?llm.Quota.Window = if (secondary_used) |used|
-        .{ .used_percent = used, .window_minutes = secondary_minutes }
-    else
-        null;
-    if (primary == null and secondary == null) return null;
-    return .{ .primary = primary, .secondary = secondary };
+    if (primary.used == null and secondary.used == null) return null;
+    return .{ .primary = primary.window(), .secondary = secondary.window() };
 }
 
-/// Decode a percentage only inside its finite semantic range. `parseFloat`
-/// accepts NaN and infinities, which must not turn malformed provider data into
-/// a plausible remaining-allowance gauge.
+/// The headers of one slot while the parse runs. The slot yields a window once
+/// its used share arrived, because that share is what the interface shows.
+const Slot = struct {
+    used: ?f64 = null,
+    minutes: ?u32 = null,
+    reset_seconds: ?u64 = null,
+
+    fn window(self: *const Slot) ?llm.Quota.Window {
+        const used = self.used orelse return null;
+        return .{
+            .used_percent = used,
+            .window_minutes = self.minutes,
+            .reset_seconds = self.reset_seconds,
+        };
+    }
+};
+
+/// Decode a reset that the head states in seconds. Zero reads as no data, and
+/// so does anything the backend did not write as a plain count.
+fn parseResetSeconds(value: []const u8) ?u64 {
+    const seconds = std.fmt.parseInt(u64, value, 10) catch return null;
+    return if (seconds == 0) null else seconds;
+}
+
+/// Decode a used share as a percentage. `parseFloat` accepts NaN and
+/// infinities, which must not turn malformed provider data into a plausible
+/// gauge. A share above the whole window clamps, because a spent allowance must
+/// still read as spent, which is the same rule the Anthropic transport applies.
 fn parseQuotaPercent(value: []const u8) ?f64 {
     const percent = std.fmt.parseFloat(f64, value) catch return null;
-    if (!std.math.isFinite(percent) or percent < 0 or percent > 100) return null;
-    return percent;
+    if (!std.math.isFinite(percent) or percent < 0) return null;
+    return @min(100.0, percent);
 }
 
 /// A stream over `body` for the tests: test allocator, fresh decode state, and
@@ -835,15 +859,37 @@ test parseQuota {
     const both = "HTTP/1.1 200 OK\r\n" ++
         "x-codex-primary-used-percent: 11.5\r\n" ++
         "x-codex-primary-window-minutes: 300\r\n" ++
+        "x-codex-primary-reset-after-seconds: 9000\r\n" ++
         "x-codex-secondary-used-percent: 74\r\n" ++
         "x-codex-secondary-window-minutes: 10080\r\n" ++
+        "x-codex-secondary-reset-after-seconds: 580769\r\n" ++
         "content-length:0\r\n\r\n";
     const both_head = try std.http.Client.Response.Head.parse(both);
     const quota = parseQuota(&both_head).?;
     try std.testing.expectEqual(@as(f64, 11.5), quota.primary.?.used_percent);
     try std.testing.expectEqual(@as(?u32, 300), quota.primary.?.window_minutes);
+    try std.testing.expectEqual(@as(?u64, 9000), quota.primary.?.reset_seconds);
     try std.testing.expectEqual(@as(f64, 74), quota.secondary.?.used_percent);
     try std.testing.expectEqual(@as(?u32, 10080), quota.secondary.?.window_minutes);
+    try std.testing.expectEqual(@as(?u64, 580_769), quota.secondary.?.reset_seconds);
+
+    // The dumped head of a real account: the weekly window sits in the primary
+    // slot, and the empty secondary slot states every value as zero. A zero
+    // reset is no data, so that slot shows no countdown.
+    const weekly_primary = "HTTP/1.1 200 OK\r\n" ++
+        "x-codex-primary-used-percent: 10\r\n" ++
+        "x-codex-primary-window-minutes: 10080\r\n" ++
+        "x-codex-primary-reset-after-seconds: 580769\r\n" ++
+        "x-codex-secondary-used-percent: 0\r\n" ++
+        "x-codex-secondary-window-minutes: 0\r\n" ++
+        "x-codex-secondary-reset-after-seconds: 0\r\n" ++
+        "content-length:0\r\n\r\n";
+    const weekly_primary_head = try std.http.Client.Response.Head.parse(weekly_primary);
+    const slots = parseQuota(&weekly_primary_head).?;
+    try std.testing.expectEqual(@as(?u32, 10080), slots.primary.?.window_minutes);
+    try std.testing.expectEqual(@as(?u64, 580_769), slots.primary.?.reset_seconds);
+    try std.testing.expectEqual(@as(?u32, 0), slots.secondary.?.window_minutes);
+    try std.testing.expectEqual(@as(?u64, null), slots.secondary.?.reset_seconds);
 
     // A $20 plan reports only the weekly window: the other slot stays null.
     const weekly = "HTTP/1.1 200 OK\r\n" ++
@@ -878,8 +924,19 @@ test "quota percentages reject non-finite and out-of-range values" {
     try std.testing.expect(parseQuotaPercent("inf") == null);
     try std.testing.expect(parseQuotaPercent("-inf") == null);
     try std.testing.expect(parseQuotaPercent("-0.1") == null);
-    try std.testing.expect(parseQuotaPercent("100.1") == null);
+    // A spent window still reads as spent, never as absent.
+    try std.testing.expectEqual(@as(?f64, 100), parseQuotaPercent("100.1"));
     try std.testing.expect(parseQuotaPercent("not-a-number") == null);
+}
+
+test parseResetSeconds {
+    try std.testing.expectEqual(@as(?u64, 580_769), parseResetSeconds("580769"));
+    try std.testing.expectEqual(@as(?u64, 1), parseResetSeconds("1"));
+    // An empty slot states zero, and a value Drinky cannot read is no data too.
+    try std.testing.expect(parseResetSeconds("0") == null);
+    try std.testing.expect(parseResetSeconds("") == null);
+    try std.testing.expect(parseResetSeconds("-5") == null);
+    try std.testing.expect(parseResetSeconds("soon") == null);
 }
 
 test "an empty terminal output snapshot does not reject the streamed reply" {

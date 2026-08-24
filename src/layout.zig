@@ -282,6 +282,8 @@ const test_status: ui.status.Info = .{
     .effort = "high",
     .account = .anthropic_subscription,
     .quota = null,
+    .quota_age_ms = 0,
+    .turn_active = false,
 };
 
 // The projection of `entries`: one borrowed pointer per shown block, as the

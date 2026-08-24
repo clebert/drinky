@@ -244,7 +244,15 @@ test "quotaSoFar reads the head allowance through the stream seam" {
     codex.openai_subscription.quota = .{ .primary = .{ .used_percent = 40, .window_minutes = 300 } };
     try std.testing.expectEqual(@as(f64, 40), codex.quotaSoFar().?.primary.?.used_percent);
 
-    // Anthropic surfaces no subscription allowance through the seam.
-    const claude: Stream = .{ .anthropic_subscription = undefined };
+    // Both providers read their allowance out of the head, so the seam reports
+    // each one the same way.
+    var claude: Stream = .{ .anthropic_subscription = undefined };
+    claude.anthropic_subscription.quota = .{
+        .primary = .{ .used_percent = 6, .window_minutes = 300, .reset_seconds = 8600 },
+    };
+    try std.testing.expectEqual(@as(?u64, 8600), claude.quotaSoFar().?.primary.?.reset_seconds);
+
+    // A head that stated none reports none.
+    claude.anthropic_subscription.quota = null;
     try std.testing.expect(claude.quotaSoFar() == null);
 }

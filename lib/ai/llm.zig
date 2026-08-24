@@ -293,6 +293,10 @@ test "accumulated usage saturates rather than overflowing on absurd counts" {
 /// length (`window_minutes` ≈ 300 → a 5h window, ≈ 10080 → weekly). The quota
 /// is absent for API-key accounts and any provider that reports no quota.
 /// `used_percent` runs 0–100, so the remaining share is `100 - used_percent`.
+///
+/// The two slots carry no fixed window. One provider sent the weekly window in
+/// the primary slot and left the secondary slot empty, so a consumer must read
+/// `window_minutes` and never the slot.
 pub const Quota = struct {
     primary: ?Window = null,
     secondary: ?Window = null,
@@ -300,6 +304,10 @@ pub const Quota = struct {
     pub const Window = struct {
         used_percent: f64,
         window_minutes: ?u32 = null,
+        /// Seconds from the response until the window starts again, or null
+        /// when the head named none. It ages with the response that carried it,
+        /// so a consumer must subtract the time since that response.
+        reset_seconds: ?u64 = null,
     };
 };
 
