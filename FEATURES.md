@@ -360,7 +360,8 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - The system prompt adds the startup UTC date, the working directory, and the repository root. It
   also ranks the instruction sources it carries, so the model knows which one wins on a conflict. It
   names each path pattern that requires a skill, so the model knows the rule before it acts and
-  knows that Drinky sends the skill file on the first touch.
+  knows that Drinky sends the skill file on the first touch. It names each bash deny pattern, so the
+  model avoids a refused command.
 - Drinky loads exact-case `AGENTS.md` files in path order, from the Git root down to the working
   directory. Outside a repository it reads that directory alone.
 - Drinky looks for skills in `~/.agents/skills/`, and in `.agents/skills/` from the Git root down to

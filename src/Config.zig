@@ -289,7 +289,7 @@ const keys = [_]Key{
         .path = "bash.deny",
         .description = "The literal patterns that deny a command. The bash tool refuses a " ++
             "command that contains one of the entries, and the refusal names that entry. " ++
-            "Drinky ignores an empty entry.",
+            "Drinky ignores an empty entry and names each kept entry in the system prompt.",
     },
     .{
         .path = "default_models.anthropic_api",
