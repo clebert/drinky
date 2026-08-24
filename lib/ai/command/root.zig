@@ -171,12 +171,15 @@ fn runHelp(context: *Context) !Outcome {
     var options: Outcome.Options = .{ .gpa = context.gpa };
     errdefer options.deinit();
     for (listed) |entry| try options.print("/{s} — {s}", .{ entry.name, entry.summary });
+    // The list builds itself again, so Esc in the picker that a row opens
+    // returns to the list.
     return .{ .pick = .{
         .select = selectCommand,
         .title = "Select a command",
         .cancellation_message = "You canceled the command selection.",
         .options = try options.toOwnedSlice(),
         .current = null,
+        .reopen = runHelp,
     } };
 }
 
@@ -534,6 +537,9 @@ test "a line without a name opens its list" {
                     gpa.free(pick.options);
                 }
                 try std.testing.expectEqualStrings("Select a command", pick.title);
+                // The list builds itself again, so Esc in the picker that a row
+                // opens returns to the list.
+                try std.testing.expect(pick.reopen.? == &runHelp);
                 try std.testing.expectEqual(commands.len - 1, pick.options.len);
                 // Alphabetical, the summary after the name, and no `/help` row.
                 try std.testing.expectEqualStrings(

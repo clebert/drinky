@@ -27,7 +27,11 @@ const terminal = @import("terminal");
 
 const Picker = @This();
 
-const hint = "↑/↓: Move · Enter: Select · Esc: Cancel";
+/// The key hint of a first step. Esc leaves the picker.
+const hint_cancel = "↑/↓: Move · Enter: Select · Esc: Cancel";
+/// The key hint of a later step. Esc opens the step above, and one Esc per step
+/// leaves the picker.
+const hint_back = "↑/↓: Move · Enter: Select · Esc: Back";
 /// How both caption rows paint. The measure and the paint share it, so the rows
 /// the caption takes cannot diverge from the rows it paints.
 const caption: paint.Notice = .{ .role = .muted };
@@ -62,26 +66,54 @@ cursor_offset: usize,
 /// `init` runs before the first paint. `reflow` sets the live width, so a width
 /// change recomposes the rows.
 columns_max: usize,
+/// Whether a step stands above this list. It selects the key hint alone. See
+/// `Start`.
+can_step_back: bool,
 
-/// Take ownership of `options` and compose the initial body. `current`, if set,
-/// is the row to mark and preselect. On failure the caller still owns `options`.
+/// Where a list sits: the highlighted row, and the first body row the window
+/// shows. A caller that reopens a list hands both back, so the list looks as the
+/// user left it. `reflow` corrects a pair that the live window cannot hold.
+pub const Position = struct {
+    cursor: usize = 0,
+    scroll: usize = 0,
+};
+
+/// How a list opens.
+pub const Start = struct {
+    /// The row that holds the value already in use. It carries the tag, and the
+    /// highlight opens on it. Null tags no row.
+    current: ?usize = null,
+    /// Where the user left this list, over `current`. Null opens the list on
+    /// `current`, at the top.
+    position: ?Position = null,
+    /// Whether a step stands above this list. It selects the key hint alone, and
+    /// the caller owns what Esc then does.
+    can_step_back: bool = false,
+};
+
+/// Take ownership of `options` and compose the initial body. On failure the
+/// caller still owns `options`.
 pub fn init(
     gpa: std.mem.Allocator,
     title: []const u8,
     options: []const []const u8,
-    current: ?usize,
+    start: Start,
 ) !Picker {
+    // A rebuilt list can be shorter than the one the position came from.
+    const rows_max = options.len -| 1;
+    const opened: Position = start.position orelse .{ .cursor = start.current orelse 0 };
     var self: Picker = .{
         .gpa = gpa,
         .title = title,
         .options = options,
-        .cursor = current orelse 0,
-        .marked = current,
+        .cursor = @min(opened.cursor, rows_max),
+        .marked = start.current,
         .content = .empty,
         .line_roles = .empty,
-        .scroll = 0,
+        .scroll = @min(opened.scroll, rows_max),
         .cursor_offset = 0,
         .columns_max = unbounded,
+        .can_step_back = start.can_step_back,
     };
     errdefer self.content.deinit(gpa);
     errdefer self.line_roles.deinit(gpa);
@@ -94,6 +126,12 @@ pub fn deinit(self: *Picker) void {
     self.gpa.free(self.options);
     self.content.deinit(self.gpa);
     self.line_roles.deinit(self.gpa);
+}
+
+/// Where the list sits now. A caller that replaces this picker keeps it, so the
+/// list it reopens later looks as the user left it.
+pub fn position(self: *const Picker) Position {
+    return .{ .cursor = self.cursor, .scroll = self.scroll };
 }
 
 /// Move the selection one row up. The first option rolls over to the last one.
@@ -171,12 +209,18 @@ fn renderCaption(self: *const Picker, placement: *const paint.Placement) !void {
     // The derived placement copies its parent. Only the geometry changes.
     var hint_placement = placement.*;
     hint_placement.base = placement.base + titleRows(self.title, placement.columns);
-    try paint.notice(&hint_placement, &caption, hint);
+    try paint.notice(&hint_placement, &caption, self.hint());
 }
 
 /// Physical rows of the caption: the title rows and the key-hint rows.
 fn captionRows(self: *const Picker, columns: usize) usize {
-    return titleRows(self.title, columns) + paint.noticeRows(&caption, hint, columns);
+    return titleRows(self.title, columns) + paint.noticeRows(&caption, self.hint(), columns);
+}
+
+/// The key hint of this list. The measure and the paint read the same one, so
+/// the rows the caption takes cannot diverge from the rows it paints.
+fn hint(self: *const Picker) []const u8 {
+    return if (self.can_step_back) hint_back else hint_cancel;
 }
 
 /// Rows the title holds once wrapped to `columns`.
@@ -240,7 +284,7 @@ fn startLine(self: *Picker, name: role.Name) !void {
 fn testPicker(gpa: std.mem.Allocator, labels: []const []const u8, cursor: usize) !Picker {
     const options = try gpa.alloc([]const u8, labels.len);
     for (labels, 0..) |label, index| options[index] = try gpa.dupe(u8, label);
-    var picker = try Picker.init(gpa, "Pick", options, 0);
+    var picker = try Picker.init(gpa, "Pick", options, .{ .current = 0 });
     picker.cursor = cursor;
     try picker.compose();
     return picker;
@@ -317,6 +361,74 @@ fn renderForTest(
     try picker.render(&placement, size.rows);
     try view.render();
     return gpa.dupe(u8, out.written());
+}
+
+// A list that the user returns to opens on the row they left, over the row that
+// carries the tag. The rebuilt list can be shorter, so the row clamps.
+test "the opening row takes the cursor over the current value, inside the list" {
+    const gpa = std.testing.allocator;
+    const labels = [_][]const u8{ "alpha", "beta", "gamma" };
+
+    for ([_]struct { start: Start, cursor: usize, scroll: usize = 0, marked: ?usize }{
+        .{ .start = .{}, .cursor = 0, .marked = null },
+        .{ .start = .{ .current = 2 }, .cursor = 2, .marked = 2 },
+        .{
+            .start = .{ .current = 2, .position = .{ .cursor = 1 } },
+            .cursor = 1,
+            .marked = 2,
+        },
+        .{
+            .start = .{ .position = .{ .cursor = 1, .scroll = 1 } },
+            .cursor = 1,
+            .scroll = 1,
+            .marked = null,
+        },
+        // A pair past the end of a shorter list falls back to the last row.
+        .{
+            .start = .{ .position = .{ .cursor = 99, .scroll = 99 } },
+            .cursor = 2,
+            .scroll = 2,
+            .marked = null,
+        },
+    }) |case| {
+        const options = try gpa.alloc([]const u8, labels.len);
+        for (labels, 0..) |label, index| options[index] = try gpa.dupe(u8, label);
+        var picker = try Picker.init(gpa, "Pick", options, case.start);
+        defer picker.deinit();
+        try std.testing.expectEqual(case.cursor, picker.cursor);
+        try std.testing.expectEqual(case.scroll, picker.scroll);
+        try std.testing.expectEqual(case.marked, picker.marked);
+        try std.testing.expectEqual(case.cursor, picker.position().cursor);
+        try std.testing.expectEqual(case.scroll, picker.position().scroll);
+    }
+
+    // An empty list holds no row at all.
+    const no_rows = try gpa.alloc([]const u8, 0);
+    var empty = try Picker.init(gpa, "Pick", no_rows, .{ .position = .{ .cursor = 4 } });
+    defer empty.deinit();
+    try std.testing.expectEqual(@as(usize, 0), empty.cursor);
+}
+
+// A step above the list changes one word of the key hint, so the user reads what
+// Esc does before pressing it.
+test "the key hint states the step above a later step" {
+    const gpa = std.testing.allocator;
+    var picker = try testPicker(gpa, &.{ "alpha", "beta" }, 0);
+    defer picker.deinit();
+    const size: terminal.View.Size = .{ .columns = 60, .rows = 24 };
+    try picker.reflow(size);
+
+    const first_step = try renderForTest(gpa, &picker, size);
+    defer gpa.free(first_step);
+    try std.testing.expect(std.mem.indexOf(u8, first_step, "Esc: Cancel") != null);
+
+    picker.can_step_back = true;
+    const later_step = try renderForTest(gpa, &picker, size);
+    defer gpa.free(later_step);
+    try std.testing.expect(std.mem.indexOf(u8, later_step, "Esc: Back") != null);
+    try std.testing.expect(std.mem.indexOf(u8, later_step, "Esc: Cancel") == null);
+    // Both hints hold one row at this width, so the frame keeps its place.
+    try std.testing.expectEqual(@as(usize, 2), picker.captionRows(size.columns));
 }
 
 // Every option holds one row, whatever the width does. A row too wide for the

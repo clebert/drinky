@@ -2467,8 +2467,10 @@ fn handlePickerKey(self: *App, event: *const terminal.Input.Key) !void {
         .up => try picker.moveUp(),
         .down => try picker.moveDown(),
         .enter => return self.confirmPicker(),
-        .escape => return self.session.cancelPicker(),
+        .escape => return self.leavePicker(),
         .ctrl => |letter| switch (letter) {
+            // Ctrl+C and Ctrl+D leave the whole command, however deep the step
+            // is, so a stepped picker keeps a one-key way out.
             'c', 'd' => return self.session.cancelPicker(),
             else => return,
         },
@@ -2479,19 +2481,37 @@ fn handlePickerKey(self: *App, event: *const terminal.Input.Key) !void {
 
 /// Apply the highlighted picker row: the command that opened the picker runs its
 /// own handler over the selected row.
+///
+/// A row that opens another picker keeps this one open, because the replacement
+/// records it on its trail. Every other outcome ends the picker, so it closes
+/// first.
 fn confirmPicker(self: *App) !void {
     const picking = &self.session.mode.picking;
     const cursor = picking.picker.cursor;
-    var context: ai.command.Context = .{
-        .gpa = self.gpa,
-        .io = self.io,
-        .agent = &self.agent,
-        .accounts = &self.accounts,
-        .skill_registry = &self.skills,
-    };
+    var context = self.commandContext();
     const outcome = try picking.select(&context, cursor);
-    self.session.closePicker();
+    if (outcome != .pick) self.session.closePicker();
     try self.applyOutcome(outcome);
+}
+
+/// Open the picker one step above, or cancel the command where the open picker is
+/// its first step. One Esc per step therefore leaves a stepped command.
+///
+/// The mode stays `picking` on a step up, so `handleKeys` drains no key behind
+/// that Esc and a fast repeat walks the whole way out.
+fn leavePicker(self: *App) !void {
+    const opener = self.session.stepAbove() orelse return self.session.cancelPicker();
+    var context = self.commandContext();
+    const outcome = try opener(&context);
+    switch (outcome) {
+        .pick => |*pick| try self.session.openPickerAbove(pick),
+        // The step above reports instead of opening. That leaves no picker to
+        // return to, so the command ends here.
+        else => {
+            self.session.closePicker();
+            try self.applyOutcome(outcome);
+        },
+    }
 }
 
 /// Test scaffolding: an `App` with every field set, so no test reads a field that
@@ -6311,6 +6331,176 @@ test "Esc, Ctrl+C, and Ctrl+D each cancel the picker with context" {
         );
         try std.testing.expectEqual(@as(usize, 0), app.session.transcript.blocks().len);
     }
+}
+
+// Esc leaves one step of a stepped command, so a repeat walks the whole way out.
+// The mode stays in the picker on the way up, so the keys behind that Esc are
+// kept and a fast repeat reaches the prompt.
+test "Esc opens the step above the picker and cancels at the first step" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(home);
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    defer app.input.deinit();
+    app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{
+        .anthropic = "sk-anthropic",
+        .openai = "sk-openai",
+    });
+    defer app.accounts.deinit();
+    app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_api), .{
+        .model = anthropic_default,
+        .system = "",
+        .retry = .{},
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+
+    try app.session.editor.insert("/model");
+    try app.submit();
+    const vendors = &app.session.mode.picking.picker;
+    try std.testing.expectEqualStrings("Select a provider", vendors.title);
+    try std.testing.expect(!vendors.can_step_back);
+
+    // The active account marks and opens on its own provider, and the walk goes
+    // down the other one. Each provider holds one authenticated account here, so
+    // the row opens the model list of that account and skips the account step.
+    try std.testing.expectEqual(@as(usize, 0), vendors.cursor);
+    try app.handleKey(&.down);
+    try app.handleKey(&.enter);
+    const listed_models = &app.session.mode.picking.picker;
+    try std.testing.expectEqualStrings("Select a model for OpenAI API", listed_models.title);
+    try std.testing.expect(listed_models.can_step_back);
+
+    // Two Escape bytes in one chunk. The first opens the step above, and the
+    // second stays for its own key instead of draining with an exit.
+    try app.handleKeys("\x1b\x1b");
+    try std.testing.expect(app.session.mode == .picking);
+    const reopened_vendors = &app.session.mode.picking.picker;
+    try std.testing.expectEqualStrings("Select a provider", reopened_vendors.title);
+    // The list opens on the row the walk left, not on the default row. One Enter
+    // therefore returns to the same branch.
+    try std.testing.expectEqual(@as(usize, 1), reopened_vendors.cursor);
+    // The tag still names the account in use, which the walk did not change.
+    try std.testing.expectEqual(@as(usize, 0), reopened_vendors.marked.?);
+    try std.testing.expect(app.input.pendingEscape());
+    try std.testing.expect(app.session.notice == null);
+
+    // The first step has no step above it, so Esc there leaves the command.
+    try app.handleKey(&.escape);
+    try std.testing.expect(app.session.mode == .prompt);
+    try std.testing.expectEqualStrings(
+        "You canceled the model selection.",
+        app.session.notice.?.content,
+    );
+    try std.testing.expectEqualStrings(anthropic_default.name, app.agent.model.name);
+
+    // Ctrl+C leaves the whole command from any step, so a deep flow keeps a
+    // one-key way out.
+    try app.session.editor.insert("/model");
+    try app.submit();
+    try app.handleKey(&.enter);
+    try std.testing.expect(app.session.mode.picking.picker.can_step_back);
+    try app.handleKey(&.{ .ctrl = 'c' });
+    try std.testing.expect(app.session.mode == .prompt);
+}
+
+// The trail holds every picker the walk down replaced, so the walk up reaches the
+// command list that started it. A step that Drinky skipped opened no picker, so
+// it enters no trail and the walk up skips it too.
+test "Esc walks back through the command list that opened the command" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(home);
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{
+        .anthropic = "sk-anthropic",
+        .openai = "sk-openai",
+    });
+    defer app.accounts.deinit();
+    app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_api), .{
+        .model = anthropic_default,
+        .system = "",
+        .retry = .{},
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+
+    try app.session.editor.insert("/help");
+    try app.submit();
+    const commands = &app.session.mode.picking.picker;
+    try std.testing.expect(!commands.can_step_back);
+    const model_row = for (commands.options, 0..) |option, index| {
+        if (std.mem.startsWith(u8, option, "/model —")) break index;
+    } else return error.MissingModelRow;
+
+    // Down to the last row and back up to the model row, in a window too short
+    // for the list. The row then sits inside a scrolled window, so the walk must
+    // return the window too and not the row alone.
+    const window: terminal.View.Size = .{ .columns = 80, .rows = 12 };
+    const last_row = commands.options.len - 1;
+    for (0..last_row) |_| try app.handleKey(&.down);
+    try app.session.paint(window);
+    for (0..last_row - model_row) |_| try app.handleKey(&.up);
+    try app.session.paint(window);
+    const left_cursor = commands.cursor;
+    const left_scroll = commands.scroll;
+    try std.testing.expectEqual(model_row, left_cursor);
+    try std.testing.expect(left_scroll > 0);
+
+    // Down to the model list: the list, the provider step, and the account step
+    // that one authenticated account per provider skips.
+    try app.handleKey(&.enter);
+    try std.testing.expectEqualStrings("Select a provider", app.session.mode.picking.picker.title);
+    try app.handleKey(&.enter);
+    try std.testing.expectEqualStrings(
+        "Select a model for Anthropic API",
+        app.session.mode.picking.picker.title,
+    );
+
+    // Up again, one Esc per picker the walk down opened. Each step marks the
+    // frame, because a step that paints nothing leaves the old list on screen.
+    app.session.dirty = false;
+    try app.handleKey(&.escape);
+    try std.testing.expectEqualStrings("Select a provider", app.session.mode.picking.picker.title);
+    try std.testing.expect(app.session.dirty);
+
+    app.session.dirty = false;
+    try app.handleKey(&.escape);
+    const reopened = &app.session.mode.picking.picker;
+    try std.testing.expectEqualStrings("Select a command", reopened.title);
+    try std.testing.expect(!reopened.can_step_back);
+    try std.testing.expect(app.session.dirty);
+    // The list opens where it was left, so the next Enter runs the same command
+    // and the window does not jump. The list marks no row, so nothing but the
+    // trail holds either value.
+    try std.testing.expectEqualStrings("/model", reopened.options[reopened.cursor][0..6]);
+    try std.testing.expectEqual(left_cursor, reopened.cursor);
+    try std.testing.expectEqual(left_scroll, reopened.scroll);
+    try std.testing.expect(reopened.marked == null);
+
+    // The list is the first step, so the next Esc leaves the command.
+    try app.handleKey(&.escape);
+    try std.testing.expect(app.session.mode == .prompt);
+    try std.testing.expectEqualStrings(
+        "You canceled the command selection.",
+        app.session.notice.?.content,
+    );
 }
 
 // The command list is the first picker over a picker. A row that opens a list

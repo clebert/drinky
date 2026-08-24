@@ -111,7 +111,17 @@ pub const Outcome = union(enum) {
         cancellation_message: []const u8,
         options: []const []const u8,
         current: ?usize,
+        /// Build this same picker again, or null where the picker cannot return.
+        /// A picker that a row of this one opens keeps the opener, so Esc there
+        /// returns here. The app owns that trail, so a step names itself alone
+        /// and knows nothing of the step above it.
+        reopen: ?Opener = null,
     };
+
+    /// Build one picker from the live state. A selector takes the row index
+    /// alone and holds no earlier choice, so a step of a stepped command needs
+    /// one opener for each value of the choice that reached it.
+    pub const Opener = *const fn (*Context) anyerror!Outcome;
 
     /// Builds a picker's owned rows. When the build fails, it frees the rows already built.
     pub const Options = struct {

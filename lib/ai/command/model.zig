@@ -4,8 +4,13 @@
 //! always chooses a model together with its account. The command takes no
 //! argument.
 //!
+//! Every step names the opener that builds it again, so Esc in a later step
+//! returns to it. The app keeps the trail, and a step that the flow skipped
+//! opened no picker, so Esc never lands on a list that the user never saw.
+//!
 //! A selector receives the row index alone, so it carries no earlier choice. The
-//! compiler therefore builds one selector per provider and one per account.
+//! compiler therefore builds one selector and one opener per provider, and one
+//! of each per account. Every step re-derives its lists from the live state.
 
 const std = @import("std");
 
@@ -28,6 +33,7 @@ const Selector = *const fn (*Context, usize) anyerror!Context.Outcome;
 /// The parts of the model picker that name one account.
 const ModelStep = struct {
     select: Selector,
+    open: Context.Outcome.Opener,
     title: []const u8,
 };
 
@@ -60,6 +66,7 @@ pub fn run(context: *Context) !Context.Outcome {
         .cancellation_message = cancellation_message,
         .options = try options.toOwnedSlice(),
         .current = current,
+        .reopen = run,
     } };
 }
 
@@ -102,7 +109,19 @@ fn accountStep(context: *Context, vendor: llm.Provider) !Context.Outcome {
         .cancellation_message = cancellation_message,
         .options = try options.toOwnedSlice(),
         .current = current,
+        .reopen = switch (vendor) {
+            inline else => |tag| accountStepOf(tag),
+        },
     } };
+}
+
+/// The opener of the account picker of `vendor`.
+fn accountStepOf(comptime vendor: llm.Provider) Context.Outcome.Opener {
+    return struct {
+        fn open(context: *Context) anyerror!Context.Outcome {
+            return accountStep(context, vendor);
+        }
+    }.open;
 }
 
 /// The selector of the account picker of `vendor`.
@@ -123,7 +142,7 @@ fn selectAccountOf(comptime vendor: llm.Provider) Selector {
 }
 
 /// The last step: a picker over the models of `account`. The title names the
-/// account, because an earlier step can collapse and hide it.
+/// account, because the flow can skip the step that names it.
 fn modelStep(context: *Context, account: llm.Account) !Context.Outcome {
     const gpa = context.gpa;
     var list: std.ArrayList(models.Model) = .empty;
@@ -146,10 +165,11 @@ fn modelStep(context: *Context, account: llm.Account) !Context.Outcome {
         .cancellation_message = cancellation_message,
         .options = try options.toOwnedSlice(),
         .current = current,
+        .reopen = step.open,
     } };
 }
 
-/// The selector and the title of the model picker of `account`.
+/// The selector, the opener, and the title of the model picker of `account`.
 fn modelStepOf(comptime account: llm.Account) ModelStep {
     return .{
         .select = struct {
@@ -167,6 +187,11 @@ fn modelStepOf(comptime account: llm.Account) ModelStep {
                 return apply(context, account, &list.items[index]);
             }
         }.select,
+        .open = struct {
+            fn open(context: *Context) anyerror!Context.Outcome {
+                return modelStep(context, account);
+            }
+        }.open,
         .title = comptime "Select a model for " ++ account.label(),
     };
 }
@@ -326,6 +351,47 @@ test "a provider row opens its accounts, and an account row opens its models" {
     try std.testing.expectEqualStrings("Select a model for OpenAI API", openai_models.title);
     try std.testing.expectEqual(@as(usize, 3), openai_models.options.len);
     try std.testing.expectEqualStrings("gpt-5.6-sol", openai_models.options[0]);
+}
+
+// Esc returns to the picker that a row opened, so every step names the opener
+// that builds it again. The app keeps the trail of those openers.
+test "each step names the opener that builds it again" {
+    const gpa = std.testing.allocator;
+    var accounts = testing.accounts(
+        .{ .anthropic = "sk-ant", .openai = "sk-openai" },
+        .{ .anthropic = true },
+    );
+    var agent = testing.agent(gpa, .{ .anthropic_api = "sk-ant" });
+    defer agent.deinit();
+    var context: Context = .{ .gpa = gpa, .io = undefined, .agent = &agent, .accounts = &accounts };
+
+    const vendors = try expectPick(try run(&context));
+    defer freePick(gpa, &vendors);
+    try std.testing.expect(vendors.reopen.? == &run);
+
+    const anthropic_accounts = try expectPick(try vendors.select(&context, 0));
+    defer freePick(gpa, &anthropic_accounts);
+    try std.testing.expect(anthropic_accounts.reopen.? == accountStepOf(.anthropic));
+
+    const anthropic_models = try expectPick(try anthropic_accounts.select(&context, 0));
+    defer freePick(gpa, &anthropic_models);
+    try std.testing.expect(
+        anthropic_models.reopen.? == modelStepOf(.anthropic_subscription).open,
+    );
+
+    // An opener builds the same picker again: the same rows, and the same
+    // opener on the rebuilt one.
+    const reopened = try expectPick(try anthropic_accounts.reopen.?(&context));
+    defer freePick(gpa, &reopened);
+    try std.testing.expectEqualStrings("Select an account", reopened.title);
+    try std.testing.expectEqualStrings("Anthropic Subscription", reopened.options[0]);
+    try std.testing.expect(reopened.reopen.? == accountStepOf(.anthropic));
+
+    // A step that the flow skipped opens no picker, so it enters no trail and
+    // Esc cannot land on it.
+    const openai_models = try expectPick(try vendors.select(&context, 1));
+    defer freePick(gpa, &openai_models);
+    try std.testing.expect(openai_models.reopen.? == modelStepOf(.openai_api).open);
 }
 
 test "a model row switches to the chosen account and model" {

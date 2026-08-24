@@ -307,6 +307,64 @@ const Picking = struct {
     select: *const fn (*ai.command.Context, usize) anyerror!ai.command.Outcome,
     /// The borrowed sentence that identifies the canceled selection.
     cancellation_message: []const u8,
+    /// The handler that builds this picker again, or null where the picker
+    /// cannot return. A picker that replaces this one puts it on its trail.
+    reopen: ?ai.command.Outcome.Opener,
+    /// The pickers this one replaced, oldest first. Esc opens the last one.
+    trail: Trail,
+};
+
+/// The pickers a step can return to. Each entry builds one picker again and
+/// opens it on the row it was left on, so the user leaves a stepped command one
+/// step at a time and every list looks as they left it.
+const Trail = struct {
+    /// Bounded on purpose. The deepest flow today is the command list and the
+    /// three steps of `/model`.
+    entries: [8]Entry = undefined,
+    len: usize = 0,
+
+    /// One picker of the walk down.
+    const Entry = struct {
+        open: ai.command.Outcome.Opener,
+        /// Where that picker sat. The opener rebuilds the list from state that
+        /// the walk does not change, so the row still names the same option. A
+        /// shorter list and a smaller window both clamp it.
+        position: ui.Picker.Position,
+    };
+
+    /// Record the picker a replacement covers, and where it sat. A picker that
+    /// cannot build itself again ends the trail, because no Esc reaches past it.
+    fn push(
+        self: *Trail,
+        position: ui.Picker.Position,
+        opener: ?ai.command.Outcome.Opener,
+    ) void {
+        const open = opener orelse {
+            self.len = 0;
+            return;
+        };
+        // A flow deeper than the trail drops its oldest entry, so Esc ends the
+        // walk early and never returns to the wrong picker.
+        if (self.len == self.entries.len) {
+            std.mem.copyForwards(
+                Entry,
+                self.entries[0 .. self.len - 1],
+                self.entries[1..self.len],
+            );
+            self.len -= 1;
+        }
+        self.entries[self.len] = .{ .open = open, .position = position };
+        self.len += 1;
+    }
+
+    /// The picker one step above, or null where the trail is empty.
+    fn last(self: *const Trail) ?Entry {
+        return if (self.len == 0) null else self.entries[self.len - 1];
+    }
+
+    fn dropLast(self: *Trail) void {
+        if (self.len > 0) self.len -= 1;
+    }
 };
 
 /// The retained prompt draft for a live turn.
@@ -944,13 +1002,56 @@ pub fn applyOutcome(self: *Session, outcome: ai.command.Outcome) !void {
 }
 
 /// Enter picker mode over `pick`, whose confirmation goes to `pick.select`. Takes
-/// ownership of `pick.options`.
+/// ownership of `pick.options`. A picker that `pick` replaces goes on the trail,
+/// so Esc returns to it.
 fn openPicker(self: *Session, pick: *const ai.command.Outcome.Pick) !void {
+    var trail: Trail = .{};
+    if (self.mode == .picking) {
+        trail = self.mode.picking.trail;
+        trail.push(self.mode.picking.picker.position(), self.mode.picking.reopen);
+    }
+    return self.enterPicker(pick, trail, null);
+}
+
+/// Enter picker mode over the picker one step above the open one. The trail drops
+/// the entry that opened it, so one Esc per step leaves the whole command. The
+/// caller took that entry from `stepAbove` and ran it to produce `pick`, which
+/// opens where the walk down left it.
+pub fn openPickerAbove(self: *Session, pick: *const ai.command.Outcome.Pick) !void {
+    std.debug.assert(self.mode == .picking);
+    var trail = self.mode.picking.trail;
+    // `stepAbove` reported this entry, and the opener that produced `pick`
+    // cannot reach the session, so the trail still holds it.
+    const entry = trail.last().?;
+    trail.dropLast();
+    return self.enterPicker(pick, trail, entry.position);
+}
+
+/// The handler that builds the picker one step above the open one, or null where
+/// the picker is the first step of its command. Esc runs it, and the outcome goes
+/// to `openPickerAbove`. It changes nothing, so a failed run leaves the trail.
+pub fn stepAbove(self: *const Session) ?ai.command.Outcome.Opener {
+    return switch (self.mode) {
+        .picking => |*picking| if (picking.trail.last()) |entry| entry.open else null,
+        else => null,
+    };
+}
+
+fn enterPicker(
+    self: *Session,
+    pick: *const ai.command.Outcome.Pick,
+    trail: Trail,
+    position: ?ui.Picker.Position,
+) !void {
     errdefer {
         for (pick.options) |option| self.gpa.free(option);
         self.gpa.free(pick.options);
     }
-    const picker = try ui.Picker.init(self.gpa, pick.title, pick.options, pick.current);
+    const picker = try ui.Picker.init(self.gpa, pick.title, pick.options, .{
+        .current = pick.current,
+        .position = position,
+        .can_step_back = trail.len > 0,
+    });
     // Init succeeded and now owns the options. Drop whatever the previous mode
     // held before the replacement, so a picker opened over a live turn or
     // picker cannot leak.
@@ -959,7 +1060,12 @@ fn openPicker(self: *Session, pick: *const ai.command.Outcome.Pick) !void {
         .picker = picker,
         .select = pick.select,
         .cancellation_message = pick.cancellation_message,
+        .reopen = pick.reopen,
+        .trail = trail,
     } };
+    // The one place that enters picker mode marks the frame. `applyOutcome`
+    // marks its own outcomes, but a step back reaches this function alone.
+    self.dirty = true;
 }
 
 /// Leave picker mode and free the picker. A no-op in any other mode.
@@ -2655,6 +2761,45 @@ test "the steering view shows a paste collapsed, not its payload" {
     const painted = out.written();
     try std.testing.expect(std.mem.indexOf(u8, painted, "[Paste #1: 16 lines]") != null);
     try std.testing.expect(std.mem.indexOf(u8, painted, "secret line") == null);
+}
+
+// The trail is bounded, so a flow deeper than its capacity must degrade in one
+// stated way instead of writing past the array.
+test "the picker trail bounds its depth and ends where a picker cannot return" {
+    const first = struct {
+        fn open(_: *ai.command.Context) anyerror!ai.command.Outcome {
+            unreachable;
+        }
+    }.open;
+    const rest = struct {
+        fn open(_: *ai.command.Context) anyerror!ai.command.Outcome {
+            unreachable;
+        }
+    }.open;
+
+    var trail: Trail = .{};
+    try std.testing.expect(trail.last() == null);
+    trail.dropLast();
+
+    trail.push(.{ .cursor = 3, .scroll = 1 }, first);
+    for (1..trail.entries.len) |_| trail.push(.{}, rest);
+    try std.testing.expectEqual(trail.entries.len, trail.len);
+    try std.testing.expect(trail.entries[0].open == first);
+    try std.testing.expectEqual(@as(usize, 3), trail.entries[0].position.cursor);
+    try std.testing.expectEqual(@as(usize, 1), trail.entries[0].position.scroll);
+
+    // A step past the capacity drops the oldest entry, so the walk up ends early
+    // and never returns to the wrong picker.
+    trail.push(.{ .cursor = 7 }, rest);
+    try std.testing.expectEqual(trail.entries.len, trail.len);
+    try std.testing.expect(trail.entries[0].open == rest);
+    try std.testing.expect(trail.last().?.open == rest);
+    try std.testing.expectEqual(@as(usize, 7), trail.last().?.position.cursor);
+
+    // No Esc reaches past a picker that cannot build itself again.
+    trail.push(.{}, null);
+    try std.testing.expectEqual(@as(usize, 0), trail.len);
+    try std.testing.expect(trail.last() == null);
 }
 
 // A picked line that takes an argument lands in the editor, so the user adds the

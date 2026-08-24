@@ -133,7 +133,8 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 ## Slash commands
 
 - **/help** — pick a command from an alphabetical list. Each row holds the name of one command and a
-  short summary. Enter runs the picked command at once, and a bare `/` opens the same list.
+  short summary. Enter runs the picked command at once, and a bare `/` opens the same list. Esc
+  returns to the list from any picker that a row of it opened, however deep.
 - **/model** — switch account and model together, from the next turn on. The picker steps through
   the provider, the account, and the model, and it skips a step that offers one row alone.
 - **/effort** — set the reasoning-effort level, from the next turn on.
@@ -303,11 +304,14 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
   that carries it. The account goes before the model, and the branch goes before the directory.
 - The branch comes from the `HEAD` file of the repository, never from the git command. Drinky
   re-reads it when a turn starts and when one ends.
-- A picker is a single-choice list that tags the current value. Enter confirms, and Esc, Ctrl+C, or
-  Ctrl+D cancels. The selection rolls over at both ends of the list.
+- A picker is a single-choice list that tags the current value. Enter confirms, and Ctrl+C or Ctrl+D
+  cancels from any step. The selection rolls over at both ends of the list.
+- A selection can open a second list, which replaces the first one. Esc returns to the list that the
+  selection came from, so one Esc per list leaves the command, and Esc at a first list cancels. The
+  key hint states which of the two the Esc does. Drinky skips a list on the way back that it skipped
+  on the way down. Drinky reopens each list with the row and the window that the user left.
 - Every option holds one row. Drinky cuts a row that is too wide for the window and marks the cut
-  with one `…`. The cut takes the option text, so the tag of the row stays. A selection can open a
-  second list. That list replaces the first one, and Esc closes the picker with no step back.
+  with one `…`. The cut takes the option text, so the tag of the row stays.
 - A muted caption above the picker frame holds the title and the key hint. Each of the two wraps. It
   stays outside the scrolled window, so the picker window never scrolls it away.
 - The open input area grows to about a quarter of the screen and labels hidden rows "↑ Hidden: N"
