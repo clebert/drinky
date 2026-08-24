@@ -51,14 +51,11 @@ decision already taken, or a dependency on another entry. Module layout and exte
 
 ## Features
 
-- **Conversation switching** — Drinky selects the agent, history, transcript, and status through one
-  shared operation, then applies active context projection.
 - **`/review`** — a bounded workflow reviews pending changes with a fresh reviewer, a persistent
   judge, and a fixer, and it asks the user only about an open product choice. _The plan is
-  `docs/review-mode.md`. It depends on the preceding entry. Store three account-model-effort role
-  choices per project. Every role keeps the complete tool registry. The reviewer and judge prompts
-  prohibit mutation, but `bash` remains unrestricted. It is not a subagent system, so one request
-  runs at a time with no nesting._
+  `docs/review-mode.md`. Store three account-model-effort role choices per project. Every role keeps
+  the complete tool registry. The reviewer and judge prompts prohibit mutation, but `bash` remains
+  unrestricted. It is not a subagent system, so one request runs at a time with no nesting._
 - **Save and resume conversations** — a conversation reopens after a restart and does not start
   empty. _This entry introduces the per-turn cost ledger and persists it, since history items carry
   no cost. The `/session` breakdown entry then reads that ledger. Generate the OpenAI cache key once

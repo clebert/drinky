@@ -165,6 +165,21 @@ pub const Options = struct {
     screen_session: ?[]const u8 = null,
 };
 
+/// A whole conversation the app can hold: the agent and its canonical history,
+/// paired with the interface state that projects it. `switchConversation` swaps
+/// one of these in for the active one, so the agent the worker runs and the
+/// conversation the interface shows can never name two different conversations.
+pub const Conversation = struct {
+    agent: ai.Agent,
+    presentation: Session.Conversation,
+
+    pub fn deinit(self: *Conversation) void {
+        const gpa = self.agent.gpa;
+        self.agent.deinit();
+        self.presentation.deinit(gpa);
+    }
+};
+
 /// The frame grid: the deadlines that pace the repaints. Each deadline is one
 /// interval after the previous deadline, not one interval after the previous
 /// frame ended. The work of a frame therefore falls inside its own interval and
@@ -1929,8 +1944,30 @@ fn applyOutcome(self: *App, outcome: ai.command.Outcome) !void {
             .presentation = .colors,
         }),
         .new_conversation => {
-            self.agent.resetConversation();
-            self.session.resetConversation();
+            // Conversation switching swaps the agent, its canonical history,
+            // and the interface state that projects it together, in one
+            // shared operation, so the two can never name different
+            // conversations. `/new` keeps nothing to switch back to, so it
+            // discards what the swap hands back at once.
+            var discarded: Conversation = .{
+                .agent = ai.Agent.init(self.gpa, self.io, self.agent.client, .{
+                    .model = self.agent.model,
+                    .system = self.agent.system,
+                    .retry = self.agent.retry,
+                    .effort = self.agent.effort,
+                    .bash = self.agent.bash,
+                    .document = self.agent.document,
+                    .skill_guard = self.agent.skill_guard,
+                }),
+                .presentation = Session.Conversation.empty(
+                    self.gpa,
+                    self.activeAccount(),
+                    &self.agent.model,
+                    self.agent.effort,
+                ),
+            };
+            self.switchConversation(&discarded);
+            discarded.deinit();
             // The intro line is the legend of the interface, so the empty
             // conversation opens on it again. The startup counts line does not
             // return, because it reports the discovery of one start alone.
@@ -1960,6 +1997,25 @@ fn applyOutcome(self: *App, outcome: ai.command.Outcome) !void {
     // agent snapshot so an allowance cleared by that transition disappears at
     // the same time as the account changes.
     try self.mirrorAgentState();
+}
+
+/// Switch the active conversation for `other`, and leave the conversation this
+/// call replaces in `other`. The one shared operation that moves Drinky to a
+/// different conversation: it swaps the agent together with the interface
+/// state that projects it, so the worker and the screen always agree on which
+/// conversation is active. A caller that keeps `other` after the call can
+/// switch back to the exact conversation it replaced.
+///
+/// The skill guard is one app-owned cache that every agent shares, because the
+/// rules belong to the host, not the conversation. Its proof memo is only true
+/// for the history it was proven against, so the switch forgets it: a proof
+/// from the conversation this call replaces must never license a write in the
+/// one it activates. A history that still carries the skill text, such as one
+/// this call restores, proves itself again on the next check.
+fn switchConversation(self: *App, other: *Conversation) void {
+    std.mem.swap(ai.Agent, &self.agent, &other.agent);
+    self.session.switchConversation(&other.presentation);
+    self.skill_guard.forget();
 }
 
 /// Mirror the agent configuration into the session and the project state.
@@ -4389,6 +4445,137 @@ test "/new clears the conversation and the scrollback without a configuration ch
     try std.testing.expectEqualStrings("", app.session.editor.visible());
     try std.testing.expectEqualStrings(anthropic_default.name, app.agent.model.name);
     try std.testing.expectEqual(ai.llm.Effort.high, app.agent.effort);
+}
+
+// The shared switch must move the agent's canonical history and the interface
+// that projects it together, so the worker and the screen can never name two
+// different conversations. A round trip proves it is a real swap: switching
+// away and back again restores the first conversation exactly.
+test "switchConversation swaps the agent and the interface together, and restores both" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = anthropic_default,
+        .system = "test system",
+        .retry = .{},
+        .effort = .high,
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .high);
+    defer app.session.deinit();
+
+    try app.agent.items.append(gpa, .{ .message = .{
+        .role = .user,
+        .text = try gpa.dupe(u8, "role a prompt"),
+    } });
+    app.agent.stats.cost = 2.5;
+    try app.session.transcript.append(.user, .{}, "role a prompt");
+    app.session.stats_shown.cost = 2.5;
+
+    var role_b: Conversation = .{
+        .agent = ai.Agent.init(gpa, io, null, .{
+            .model = anthropic_default,
+            .system = "test system",
+            .retry = .{},
+            .effort = .high,
+        }),
+        .presentation = Session.Conversation.empty(gpa, null, &anthropic_default, .high),
+    };
+    try role_b.agent.items.append(gpa, .{ .message = .{
+        .role = .user,
+        .text = try gpa.dupe(u8, "role b prompt"),
+    } });
+    role_b.agent.stats.cost = 1;
+    try role_b.presentation.transcript.append(.user, .{}, "role b prompt");
+    role_b.presentation.stats.cost = 1;
+
+    app.switchConversation(&role_b);
+
+    // The worker and the screen must agree: both now name role B.
+    try std.testing.expectEqualStrings(
+        "role b prompt",
+        app.agent.items.items[0].message.text,
+    );
+    try std.testing.expectEqual(@as(f64, 1), app.agent.stats.cost);
+    try std.testing.expectEqual(@as(usize, 1), app.session.transcript.blocks().len);
+    try std.testing.expectEqualStrings(
+        "role b prompt",
+        app.session.transcript.blocks()[0].user.items,
+    );
+    try std.testing.expectEqual(@as(f64, 1), app.session.stats_shown.cost);
+
+    // `role_b` now holds role A exactly as it stood, so switching to it again
+    // restores role A's history in the agent and role A's blocks on screen
+    // together.
+    app.switchConversation(&role_b);
+    defer role_b.deinit();
+
+    try std.testing.expectEqualStrings(
+        "role a prompt",
+        app.agent.items.items[0].message.text,
+    );
+    try std.testing.expectEqual(@as(f64, 2.5), app.agent.stats.cost);
+    try std.testing.expectEqual(@as(usize, 1), app.session.transcript.blocks().len);
+    try std.testing.expectEqualStrings(
+        "role a prompt",
+        app.session.transcript.blocks()[0].user.items,
+    );
+    try std.testing.expectEqual(@as(f64, 2.5), app.session.stats_shown.cost);
+}
+
+// The skill guard is one app-owned cache that every agent shares, because its
+// rules belong to the host, not to a conversation. Its proof memo is only true
+// for the history it was proven against, so a switch that leaves a stale memo
+// behind could let the new, empty history skip a proof it never earned.
+test "switchConversation forgets a skill proof from the conversation it replaces" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = anthropic_default,
+        .system = "test system",
+        .retry = .{},
+        .effort = .high,
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .high);
+    defer app.session.deinit();
+    app.skill_guard = .{};
+    try app.skill_guard.add(.{
+        .glob = "**/*.zig",
+        .skill = "demo",
+        .source = "/skills/demo/SKILL.md",
+    });
+    // The parked conversation already proved the rule, so a write in it needs
+    // no read of its own.
+    app.skill_guard.rule_items[0].loaded.store(true, .monotonic);
+    try std.testing.expect(app.skill_guard.rule_items[0].loaded.load(.monotonic));
+
+    var role_b: Conversation = .{
+        .agent = ai.Agent.init(gpa, io, null, .{
+            .model = anthropic_default,
+            .system = "test system",
+            .retry = .{},
+            .effort = .high,
+        }),
+        .presentation = Session.Conversation.empty(gpa, null, &anthropic_default, .high),
+    };
+    defer role_b.deinit();
+
+    app.switchConversation(&role_b);
+
+    // The new, empty history never proved the rule, so the memo the switch
+    // replaces must not survive into it.
+    try std.testing.expect(!app.skill_guard.rule_items[0].loaded.load(.monotonic));
 }
 
 test "/system opens the composed prompt alone and escape restores the conversation" {

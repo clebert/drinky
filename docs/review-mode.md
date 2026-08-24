@@ -12,8 +12,9 @@ Land these shared features before review mode:
 
 Each feature must use the normal app path. Review mode must not implement a private variant.
 
-The command refusal path below already exists. Review mode uses it. Failure recovery and retry
-landed too, and active context projection with them, so only conversation switching remains.
+The command refusal path below already exists. Review mode uses it. Failure recovery and retry,
+active context projection, and conversation switching have all landed, so every prerequisite is
+in place.
 
 ### Active context projection
 
@@ -189,6 +190,8 @@ the turn as the task.
 
 ### Conversation switching
 
+Status: Landed.
+
 One shared operation switches a conversation context. It selects:
 
 - The agent and its canonical history.
@@ -197,6 +200,19 @@ One shared operation switches a conversation context. It selects:
 - The context fill, allowance, and cumulative cost.
 
 The operation uses the deep repaint rule above. It never appends one context to another transcript.
+
+`App.switchConversation` is the shared operation. It takes an `App.Conversation`: an agent (with its
+canonical history) paired with a `Session.Conversation` (its transcript, request setup, usage
+snapshot, and steering mirror). It swaps the agent and the `Session.Conversation` together with the
+active pair, so the caller's value now holds what was active, and the worker and the screen can
+never disagree about which conversation is running. Switching to that value again restores the exact
+conversation it replaced, blocks and history alike. It always deep-repaints, because the transcript
+changed regardless of whether the new setup would have kept the same blocks on its own.
+
+`/new` is its first caller: it builds a fresh, empty agent and conversation on the same setup, swaps
+it in, and discards what the swap hands back, since `/new` keeps nothing to restore. A caller that
+parks a conversation instead keeps the value the swap hands back. A caller that switches to a
+distinct live agent, such as a review role, builds its own `App.Conversation` around that agent.
 
 ## Concept
 

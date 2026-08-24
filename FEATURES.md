@@ -100,6 +100,8 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
   replacement discards that account's reasoning, cache-hit rate, and allowance.
 - Drinky shows only the conversation that the next request carries, so a change that drops stored
   reasoning repaints the screen and the scrollback without it.
+- A conversation switch swaps the agent, its history, and the interface together, so the worker and
+  the screen never disagree or mix two conversations.
 
 ## Signing in
 

@@ -484,17 +484,70 @@ pub fn deinit(self: *Session) void {
     self.editor.deinit();
 }
 
-/// Clear the visible conversation and its usage and steering snapshots. Commands
-/// run only in prompt mode, so the reset cannot discard live turn state. The next
-/// paint resets the screen, so no row of the cleared conversation stays in the
-/// terminal scrollback.
-pub fn resetConversation(self: *Session) void {
+/// A conversation's whole presentation state: its own transcript, its request
+/// setup, its usage snapshot, and its steering mirror. `switchConversation`
+/// swaps a whole one in, so a caller that keeps the value the swap hands back
+/// can switch to it again and see the exact conversation it left, blocks and
+/// queued steering alike.
+pub const Conversation = struct {
+    transcript: Transcript,
+    account: ?ai.llm.Account,
+    model: ai.models.Model,
+    effort: ai.llm.Effort,
+    stats: ai.Agent.Stats = .{},
+    steering: std.ArrayList(ui.Editor.Draft) = .empty,
+    steering_retained_count: usize = 0,
+    steering_consumed_count: usize = 0,
+
+    /// A fresh conversation on the given setup, with no transcript block, no
+    /// usage, and no queued steering. A caller that switches to it and then
+    /// discards what the switch hands back, such as `/new`, never keeps this
+    /// value around.
+    pub fn empty(
+        gpa: std.mem.Allocator,
+        account: ?ai.llm.Account,
+        model: *const ai.models.Model,
+        effort: ai.llm.Effort,
+    ) Conversation {
+        return .{
+            .transcript = Transcript.init(gpa),
+            .account = account,
+            .model = model.*,
+            .effort = effort,
+        };
+    }
+
+    pub fn deinit(self: *Conversation, gpa: std.mem.Allocator) void {
+        self.transcript.deinit();
+        for (self.steering.items) |*draft| draft.deinit(gpa);
+        self.steering.deinit(gpa);
+    }
+};
+
+/// Switch the active conversation for `other`, in one shared operation, and
+/// leave the conversation this call replaces in `other`. This is the one
+/// operation that moves the interface to a different conversation: every field
+/// swaps whole, so the interface never appends one conversation's blocks or
+/// queued steering to the transcript of the other, and a caller that keeps
+/// `other` after the call can switch back to the exact conversation it left.
+///
+/// The deep repaint always runs, because the transcript changed regardless of
+/// whether the new setup would have kept the same blocks under the one before
+/// it. Active context projection follows from the swapped-in setup and
+/// transcript alone: the next paint projects exactly the blocks that setup
+/// keeps, and hides the rest until a switch back restores them.
+pub fn switchConversation(self: *Session, other: *Conversation) void {
     std.debug.assert(self.mode == .prompt);
-    self.transcript.truncate(0);
     self.clearNotice();
     self.confirmations = .initEmpty();
-    self.stats_shown = .{};
-    self.clearSteering();
+    std.mem.swap(Transcript, &self.transcript, &other.transcript);
+    std.mem.swap(?ai.llm.Account, &self.account_shown, &other.account);
+    std.mem.swap(ai.models.Model, &self.model_shown, &other.model);
+    std.mem.swap(ai.llm.Effort, &self.effort_shown, &other.effort);
+    std.mem.swap(ai.Agent.Stats, &self.stats_shown, &other.stats);
+    std.mem.swap(std.ArrayList(ui.Editor.Draft), &self.steering, &other.steering);
+    std.mem.swap(usize, &self.steering_retained_count, &other.steering_retained_count);
+    std.mem.swap(usize, &self.steering_consumed_count, &other.steering_consumed_count);
     self.view.resetScreen();
     self.dirty = true;
 }
@@ -1829,7 +1882,7 @@ test "a confirmation is one-shot and separate from its notice" {
     try std.testing.expect(!session.takeConfirmation(.message));
 }
 
-test "an event survives notice clearing until the conversation resets" {
+test "an event survives notice clearing until a conversation switch discards it" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
@@ -1850,7 +1903,9 @@ test "an event survives notice clearing until the conversation resets" {
         session.transcript.blocks()[0].event.text.items,
     );
     session.dirty = false;
-    session.resetConversation();
+    var fresh = Conversation.empty(gpa, .anthropic_subscription, &test_model, .none);
+    session.switchConversation(&fresh);
+    fresh.deinit(gpa);
     try std.testing.expectEqual(@as(usize, 0), session.transcript.blocks().len);
     try std.testing.expect(session.notice == null);
     // The post-condition the app depends on: a dirty model and a pending screen
@@ -3538,4 +3593,65 @@ test "dropped account reasoning leaves the transcript for good" {
     session.view.force_reset = false;
     session.dropAccountReasoning(.anthropic_subscription);
     try std.testing.expect(!session.view.force_reset);
+}
+
+// Conversation switching is the one shared operation that moves the interface
+// to a different conversation, and back again. It swaps whole rather than
+// appending, so it never mixes the blocks of the two, and a caller that keeps
+// what the swap hands back can restore the exact conversation it left.
+test "a conversation switch swaps whole and can restore what it replaced" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var session: Session = Session.init(gpa, &out.writer, test_model, replaying_effort);
+    defer session.deinit();
+    session.showSetup(.anthropic_subscription, test_model, replaying_effort);
+    session.beginTurn(1);
+
+    try applyEvent(&session, 1, .{ .thinking = try gpa.dupe(u8, "weigh it") });
+    try applyEvent(&session, 1, .{ .text = try gpa.dupe(u8, "the answer") });
+    try finishTurn(&session, 0);
+    try session.paint(.{ .columns = 80, .rows = 24 });
+
+    // The same account and model would keep both blocks under a plain setup
+    // change, because the projection would not change. A conversation switch
+    // must discard them from the screen anyway, since it moves to another
+    // conversation and must never append that conversation to this one's
+    // transcript.
+    session.view.force_reset = false;
+    var other = Conversation.empty(gpa, .anthropic_subscription, &test_model, replaying_effort);
+    other.stats.cost = 1.5;
+    session.switchConversation(&other);
+    try std.testing.expectEqual(@as(usize, 0), session.transcript.blocks().len);
+    try std.testing.expect(session.view.force_reset);
+    try std.testing.expectEqual(@as(f64, 1.5), session.stats_shown.cost);
+    try std.testing.expectEqual(@as(?ai.llm.Account, .anthropic_subscription), session.account_shown);
+
+    const switched_start = out.written().len;
+    try session.paint(.{ .columns = 80, .rows = 24 });
+    const switched = try terminal.View.plainText(gpa, out.written()[switched_start..]);
+    defer gpa.free(switched);
+    try std.testing.expect(std.mem.indexOf(u8, switched, "weigh it") == null);
+    try std.testing.expect(std.mem.indexOf(u8, switched, "the answer") == null);
+
+    // A block the new conversation appends after the switch starts the fresh
+    // transcript alone. `other` now holds the parked conversation, exactly as
+    // the switch left it, cost and all.
+    try session.transcript.append(.intro, .{}, "fresh conversation");
+    try std.testing.expectEqual(@as(usize, 1), session.transcript.blocks().len);
+
+    // Switching to `other` again restores every block of the parked
+    // conversation and its own cost. This is a real swap, not a one-way reset:
+    // the fresh conversation this call now discards into `other` never mixes
+    // with what it restores.
+    session.view.force_reset = false;
+    session.switchConversation(&other);
+    defer other.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 2), session.transcript.blocks().len);
+    try std.testing.expectEqual(@as(f64, 0), session.stats_shown.cost);
+    try std.testing.expect(session.view.force_reset);
+
+    const restored_start = out.written().len;
+    try session.paint(.{ .columns = 80, .rows = 24 });
+    try expectPainted(gpa, out.written()[restored_start..], "weigh it");
 }
