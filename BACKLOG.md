@@ -44,10 +44,6 @@ decision already taken, or a dependency on another entry. Module layout and exte
   `max_context_window` and `effective_context_window_percent`, and that percent of the resolved
   window must drive the warning. Quality degradation has no evidence-based number, so keep it a soft
   warning._
-- **A two-line status bar** — a narrow window falls back to two rows instead of dropping fields.
-  _Shorter quota text and shorter labels are the cheaper first step._
-- **A parked message and a message history** — the user parks the editor content to run a command,
-  and walks earlier messages with the arrow keys. _Ctrl+P already recalls the steering queue._
 
 ## Features
 
@@ -92,6 +88,5 @@ decision already taken, or a dependency on another entry. Module layout and exte
 ## Ideas
 
 - A picker layered over a live turn, so a command list opens mid-turn.
-- Subagents, in some shape: a subshell, or a scheduler inside one process.
 - Restart the same prompt in a new session.
 - Benchmark models inside the Drinky harness.
