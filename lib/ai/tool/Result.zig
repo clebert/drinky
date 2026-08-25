@@ -76,7 +76,9 @@ pub fn report(
 }
 
 /// Report an I/O failure as a complete sentence with the operation, path,
-/// and error. Cancellation propagates so the aborted turn stops at once.
+/// and error. Cancellation propagates so the aborted turn stops at once. An
+/// empty path prints as `an empty path`, so the sentence keeps no invisible
+/// hole.
 pub fn cannot(
     gpa: std.mem.Allocator,
     err: anyerror,
@@ -84,11 +86,12 @@ pub fn cannot(
     path: []const u8,
 ) !Result {
     if (err == error.Canceled) return error.Canceled;
+    const shown = if (path.len == 0) "an empty path" else path;
     return report(
         gpa,
         .err,
         "Drinky could not " ++ verb ++ " {s} because of error {s}.",
-        .{ path, @errorName(err) },
+        .{ shown, @errorName(err) },
     );
 }
 
@@ -108,6 +111,19 @@ test "a failure reports its sentence as the box line and a success does not" {
     defer success.deinit(gpa);
     try std.testing.expect(!success.is_error);
     try std.testing.expectEqual(@as(?Summary, null), success.summary);
+}
+
+// An empty path leaves an invisible hole in the sentence, so the report names
+// it instead.
+test "cannot names an empty path" {
+    const gpa = std.testing.allocator;
+    const result = try cannot(gpa, error.FileNotFound, "read", "");
+    defer result.deinit(gpa);
+    try std.testing.expect(result.is_error);
+    try std.testing.expectEqualStrings(
+        "Drinky could not read an empty path because of error FileNotFound.",
+        result.content,
+    );
 }
 
 test "takeContent transfers only content ownership" {

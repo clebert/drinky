@@ -64,7 +64,9 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
 fn runTimed(context: *const Context, input: *const Input, timer: *const search.Timer) !Result {
     const gpa = context.gpa;
     const pattern = input.pattern;
-    const base = input.path;
+    // A model sometimes sends an empty path instead of no path. An empty path
+    // means the default, so the search runs from the working directory.
+    const base = if (input.path.len == 0) "." else input.path;
     const limit = input.limit;
 
     var matches = walk.collect(context.io, gpa, &.{
@@ -199,6 +201,20 @@ test "find reports how many more matched beyond the limit" {
     );
     try std.testing.expectEqualStrings(expected, result.content);
     try search.expectMeasures(result.summary.?, "Matches: 1 · Omitted matches: 2");
+}
+
+// A model sometimes sends an empty path instead of no path. An empty path
+// means the default, so the search runs from the working directory and does
+// not fail with an invisible path. The spent timer stops the walk after one
+// entry, so the test does not scan the whole working tree.
+test "find treats an empty path as the working directory" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const context: Context = .{ .gpa = gpa, .io = io };
+    const timer: search.Timer = .startedAgo(io, search.timeout_ms);
+    const result = try runTimed(&context, &.{ .pattern = "**/*.zig", .path = "" }, &timer);
+    defer result.deinit(gpa);
+    try std.testing.expect(!result.is_error);
 }
 
 test "find reports when no files match" {
