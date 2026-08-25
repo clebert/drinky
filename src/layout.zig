@@ -36,9 +36,7 @@ pub const window_pages_max: usize = 64;
 const id_reserved = std.math.maxInt(usize) - 255;
 const id_status = id_reserved;
 const id_input = id_reserved + 1;
-const id_steering = id_reserved + 2;
-const id_page = id_reserved + 3;
-const id_hint = id_reserved + 4;
+const id_page = id_reserved + 2;
 
 /// The anchor id of the tool box at `index` in the running turn. Grows downward
 /// from just below the fixed ids, so it never wraps past `maxInt` however many
@@ -74,23 +72,20 @@ pub const Tail = union(enum) {
     turn: Turn,
     picking: *const ui.Picker,
 
-    /// An idle prompt: the editor, and above it one optional control hint, such
-    /// as the hint of a waiting retry.
+    /// An idle prompt: one editor with an optional semantic caption.
     pub const Prompt = struct {
-        hint: ?[]const u8,
+        caption: ?ui.Caption,
         editor: *const ui.Editor,
     };
 
-    /// A streaming turn: the running tool calls, the steering queue, then the
-    /// editor with activity that crosses its separators. No line of a tool box
-    /// wraps, so a box takes one row per line it holds: a committed call names
-    /// what it acts on, one the model still streams counts the argument bytes
-    /// that have arrived, and a call under a timeout adds the row that reports
-    /// its time.
+    /// A streaming turn: the running tool calls, then one editor with its
+    /// optional caption and activity. No line of a tool box wraps, so a box
+    /// takes one row per line it holds. A committed call names what it acts on.
+    /// A streamed call counts its argument bytes. A timed call adds its time.
     pub const Turn = struct {
         tools: []const ui.paint.Box,
         activity: ui.paint.Activity,
-        steering: []const []const u8,
+        caption: ?ui.Caption,
         editor: *const ui.Editor,
     };
 };
@@ -98,20 +93,36 @@ pub const Tail = union(enum) {
 const EditorPresentation = struct {
     editor: *const ui.Editor,
     activity: ?ui.paint.Activity,
-};
+    caption: ?ui.Caption,
 
-/// How the control-hint row above the input paints. The measure and the paint
-/// share it, so the rows the hint takes cannot diverge from the rows it paints.
-const hint_notice: ui.paint.Notice = .{ .role = .muted };
+    fn rows(self: *const EditorPresentation, size: terminal.View.Size) usize {
+        const caption_rows = if (self.caption) |caption| caption.rows(size.columns) else 0;
+        return caption_rows + self.editor.rows(size);
+    }
+
+    fn render(
+        self: *const EditorPresentation,
+        placement: *const ui.paint.Placement,
+        viewport_rows: usize,
+    ) !void {
+        const caption_rows = if (self.caption) |*caption|
+            try caption.render(placement)
+        else
+            0;
+        var editor_placement = placement.*;
+        editor_placement.base = placement.base + caption_rows;
+        try self.editor.render(&editor_placement, &.{
+            .viewport_rows = viewport_rows,
+            .activity = self.activity,
+        });
+    }
+};
 
 /// One screen component: a transcript block or a piece of the tail. Each variant
 /// carries what `measure` and `render` need.
 const Component = union(enum) {
     entry: *const ui.block.Entry,
     tool_box: ui.paint.Box,
-    steering: []const []const u8,
-    /// A muted control-hint row above the input.
-    hint: []const u8,
     editor: EditorPresentation,
     picker: *const ui.Picker,
     status: *const ui.status.Info,
@@ -123,9 +134,7 @@ const Component = union(enum) {
         return switch (self.*) {
             .entry => |entry| entry.rows(size.columns),
             .tool_box => |box| ui.paint.boxRows(&box, size.columns),
-            .steering => |messages| ui.paint.steeringRows(messages),
-            .hint => |text| ui.paint.noticeRows(&hint_notice, text, size.columns),
-            .editor => |presentation| presentation.editor.rows(size),
+            .editor => |presentation| presentation.rows(size),
             .status => 1,
             .picker => |picker| picker.rows(size),
         };
@@ -141,13 +150,8 @@ const Component = union(enum) {
         switch (self.*) {
             .entry => |entry| try entry.render(placement),
             .tool_box => |box| try ui.paint.box(placement, .tool_pending, &box),
-            .steering => |messages| try ui.paint.steering(placement, messages),
-            .hint => |text| try ui.paint.notice(placement, &hint_notice, text),
             .status => |info| try ui.status.render(placement, info),
-            .editor => |presentation| try presentation.editor.render(placement, &.{
-                .viewport_rows = viewport_rows,
-                .activity = presentation.activity,
-            }),
+            .editor => |presentation| try presentation.render(placement, viewport_rows),
             .picker => |picker| try picker.render(placement, viewport_rows),
         }
     }
@@ -228,9 +232,8 @@ fn projectConversation(
 /// How many components the tail contributes.
 fn tailCount(tail: *const Tail) usize {
     return switch (tail.*) {
-        .prompt => |prompt| 1 + @as(usize, @intFromBool(prompt.hint != null)),
-        .picking => 1,
-        .turn => |turn| turn.tools.len + 1 + @intFromBool(turn.steering.len > 0),
+        .prompt, .picking => 1,
+        .turn => |turn| turn.tools.len + 1,
     };
 }
 
@@ -247,21 +250,15 @@ fn slotAt(scene: *const Scene.Conversation, index: usize) Slot {
     return .{ .component = .{ .status = scene.status }, .id = id_status, .leading_blank = false };
 }
 
-/// The tail component at `offset`, in screen order: for a turn the tool boxes,
-/// then the steering queue (when non-empty), then the live editor. For a prompt
-/// its hint row (when present), then the editor. Otherwise the sole input.
+/// The tail component at `offset`, in screen order. A turn puts its tool boxes
+/// before the captioned editor. A prompt and a picker each hold one input.
 fn tailSlot(tail: *const Tail, offset: usize) Slot {
     switch (tail.*) {
-        .prompt => |prompt| {
-            if (prompt.hint) |text| {
-                if (offset == 0) return .{
-                    .component = .{ .hint = text },
-                    .id = id_hint,
-                    .leading_blank = true,
-                };
-            }
-            return editorSlot(&.{ .editor = prompt.editor, .activity = null });
-        },
+        .prompt => |prompt| return editorSlot(&.{
+            .editor = prompt.editor,
+            .activity = null,
+            .caption = prompt.caption,
+        }),
         .picking => |picker| return .{
             .component = .{ .picker = picker },
             .id = id_input,
@@ -273,14 +270,10 @@ fn tailSlot(tail: *const Tail, offset: usize) Slot {
                 .id = idTool(offset),
                 .leading_blank = true,
             };
-            if (turn.steering.len > 0 and offset == turn.tools.len) return .{
-                .component = .{ .steering = turn.steering },
-                .id = id_steering,
-                .leading_blank = true,
-            };
             return editorSlot(&.{
                 .editor = turn.editor,
                 .activity = turn.activity,
+                .caption = turn.caption,
             });
         },
     }
@@ -351,7 +344,7 @@ test "projection stacks the transcript above the tail, newest at the bottom" {
 
     const scene: Scene = .{ .conversation = .{
         .transcript = shown.items,
-        .tail = .{ .prompt = .{ .hint = null, .editor = &editor } },
+        .tail = .{ .prompt = .{ .caption = null, .editor = &editor } },
         .status = &test_status,
     } };
     const painted = try projected(gpa, .{ .columns = 40, .rows = 24 }, &scene);
@@ -385,7 +378,7 @@ test "a turn tail stacks tool boxes above the active editor" {
         .tail = .{ .turn = .{
             .tools = &tools,
             .activity = .{ .motion_tick = 0, .progress_age_ticks = 0 },
-            .steering = &.{},
+            .caption = null,
             .editor = &editor,
         } },
         .status = &test_status,
@@ -410,7 +403,7 @@ test "separator activity does not change the input tail height" {
 
     const prompt: Scene = .{ .conversation = .{
         .transcript = &.{},
-        .tail = .{ .prompt = .{ .hint = null, .editor = &editor } },
+        .tail = .{ .prompt = .{ .caption = null, .editor = &editor } },
         .status = &test_status,
     } };
     const turn: Scene = .{ .conversation = .{
@@ -418,7 +411,7 @@ test "separator activity does not change the input tail height" {
         .tail = .{ .turn = .{
             .tools = &.{},
             .activity = .{ .motion_tick = 0, .progress_age_ticks = 0 },
-            .steering = &.{},
+            .caption = null,
             .editor = &editor,
         } },
         .status = &test_status,
@@ -447,7 +440,7 @@ test "a turn with 253 tool boxes keeps its anchor ids from wrapping" {
         .tail = .{ .turn = .{
             .tools = &tools,
             .activity = .{ .motion_tick = 0, .progress_age_ticks = 0 },
-            .steering = &.{},
+            .caption = null,
             .editor = &editor,
         } },
         .status = &test_status,
@@ -457,20 +450,22 @@ test "a turn with 253 tool boxes keeps its anchor ids from wrapping" {
     try std.testing.expect(idTool(252) < id_reserved);
 }
 
-// A turn tail with queued steering shows each "Queued message:" row and the
-// recall hint above the editor. A multi-line message shows only its first line.
-test "a turn tail shows the steering queue above the editor" {
+// A turn tail keeps the steering count and recall control in one caption that
+// touches the editor frame. It shows no queued message content.
+test "a turn tail shows its steering caption above the editor" {
     const gpa = std.testing.allocator;
     var editor = ui.Editor.init(gpa);
     defer editor.deinit();
 
-    const queue = [_][]const u8{ "fix the bug", "then add a test\nnot this row" };
     const scene: Scene = .{ .conversation = .{
         .transcript = &.{},
         .tail = .{ .turn = .{
             .tools = &.{},
             .activity = .{ .motion_tick = 0, .progress_age_ticks = 0 },
-            .steering = &queue,
+            .caption = .{
+                .title = "Queued messages: 2",
+                .controls = "Ctrl+P: Edit all",
+            },
             .editor = &editor,
         } },
         .status = &test_status,
@@ -478,22 +473,19 @@ test "a turn tail shows the steering queue above the editor" {
     const painted = try projected(gpa, .{ .columns = 40, .rows = 24 }, &scene);
     defer gpa.free(painted);
 
-    const first = std.mem.indexOf(u8, painted, "fix the bug").?;
-    const second = std.mem.indexOf(u8, painted, "then add a test").?;
-    const hint = std.mem.indexOf(u8, painted, "Ctrl+P").?;
+    const title = std.mem.indexOf(u8, painted, "Queued messages: 2").?;
+    const control = std.mem.indexOf(u8, painted, "Ctrl+P: Edit all").?;
+    const frame = std.mem.indexOf(u8, painted, "─").?;
     const footer = std.mem.indexOf(u8, painted, "footerqq").?;
-    // The row keeps the first line alone, and one mark states the lines it hides.
-    try std.testing.expect(std.mem.indexOf(u8, painted, "not this row") == null);
-    try std.testing.expect(std.mem.indexOf(u8, painted, "then add a test…") != null);
-    try std.testing.expect(std.mem.indexOf(u8, painted, "fix the bug…") == null);
-    try std.testing.expect(first < second);
-    try std.testing.expect(second < hint);
-    try std.testing.expect(hint < footer);
+    try std.testing.expect(title < control);
+    try std.testing.expect(control < frame);
+    try std.testing.expect(frame < footer);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "fix the bug") == null);
 }
 
-// A prompt tail with a hint shows that one row above the editor frame and keeps
-// the transcript above it. A prompt without a hint contributes the editor alone.
-test "a prompt tail shows its hint row above the editor" {
+// A prompt tail keeps a retry caption inside the editor component. A prompt
+// without a caption contributes the editor alone.
+test "a prompt tail shows its retry caption above the editor" {
     const gpa = std.testing.allocator;
     var editor = ui.Editor.init(gpa);
     defer editor.deinit();
@@ -515,84 +507,72 @@ test "a prompt tail shows its hint row above the editor" {
     const scene: Scene = .{ .conversation = .{
         .transcript = shown.items,
         .tail = .{ .prompt = .{
-            .hint = "Ctrl+N: Try again · Esc: Dismiss",
+            .caption = .{
+                .title = "Failed turn",
+                .controls = "Ctrl+N: Try again · Esc: Dismiss",
+            },
             .editor = &editor,
         } },
         .status = &test_status,
     } };
-    const painted = try projected(gpa, .{ .columns = 40, .rows = 24 }, &scene);
+    const painted = try projected(gpa, .{ .columns = 80, .rows = 24 }, &scene);
     defer gpa.free(painted);
 
     const failure = std.mem.indexOf(u8, painted, "the turn failed").?;
-    const hint = std.mem.indexOf(u8, painted, "Ctrl+N: Try again").?;
+    const title = std.mem.indexOf(u8, painted, "Failed turn").?;
+    const control = std.mem.indexOf(u8, painted, "Ctrl+N: Try again").?;
     const draft = std.mem.indexOf(u8, painted, "draft text").?;
     const footer = std.mem.indexOf(u8, painted, "footerqq").?;
-    try std.testing.expect(failure < hint);
-    try std.testing.expect(hint < draft);
+    try std.testing.expect(failure < title);
+    try std.testing.expect(title < control);
+    try std.testing.expect(control < draft);
     try std.testing.expect(draft < footer);
 
     const bare: Scene = .{ .conversation = .{
         .transcript = shown.items,
-        .tail = .{ .prompt = .{ .hint = null, .editor = &editor } },
+        .tail = .{ .prompt = .{ .caption = null, .editor = &editor } },
         .status = &test_status,
     } };
-    const without = try projected(gpa, .{ .columns = 40, .rows = 24 }, &bare);
+    const without = try projected(gpa, .{ .columns = 80, .rows = 24 }, &bare);
     defer gpa.free(without);
     try std.testing.expect(std.mem.indexOf(u8, without, "Ctrl+N") == null);
-    // The hint costs its own row and the blank that separates it.
+    // The caption costs one row. It adds no blank before the editor frame.
     try std.testing.expectEqual(
         ui.block.paintedRows(painted),
-        ui.block.paintedRows(without) + 2,
+        ui.block.paintedRows(without) + 1,
     );
 }
 
-// A window that leaves the message no cell at all still states the cut: the label
-// gives up its last column to the mark. Regression: a window narrower than the
-// "Queued message: " label must not emit a row wider than the width. The sink
-// asserts every row fits.
-test "a narrow window clips the steering rows to width" {
+// A narrow caption and its editor remain one bounded component. Every row fits
+// the window after the title and an overwide control cut.
+test "a narrow editor caption keeps every row inside the window" {
     const gpa = std.testing.allocator;
     var editor = ui.Editor.init(gpa);
     defer editor.deinit();
 
-    const queue = [_][]const u8{"\u{4F60}x is wider than the window"};
     const scene: Scene = .{ .conversation = .{
         .transcript = &.{},
         .tail = .{ .turn = .{
             .tools = &.{},
             .activity = .{ .motion_tick = 0, .progress_age_ticks = 0 },
-            .steering = &queue,
+            .caption = .{
+                .title = "Queued messages: 1",
+                .controls = "Ctrl+P: Edit all",
+            },
             .editor = &editor,
         } },
         .status = &test_status,
     } };
-    gpa.free(try projected(gpa, .{ .columns = 8, .rows = 24 }, &scene));
-
-    const label_width = try projected(gpa, .{ .columns = 16, .rows = 24 }, &scene);
-    defer gpa.free(label_width);
-    // A terminal copy holds the row without its styles, so the mark reads beside
-    // the label that gave up its last column for it.
-    const plain = try terminal.View.plainText(gpa, label_width);
+    const painted = try projected(gpa, .{ .columns = 8, .rows = 24 }, &scene);
+    defer gpa.free(painted);
+    const plain = try terminal.View.plainText(gpa, painted);
     defer gpa.free(plain);
-    const marked = comptime "Queued message:" ++ ui.paint.ellipsis;
-    try std.testing.expect(std.mem.indexOf(u8, plain, marked) != null);
-
-    // A wide cluster at the cut would take the cell of the mark, so the row drops
-    // the cluster. Every row holds the width, and every cut states itself.
-    for ([_]usize{ 18, 19, 20 }) |columns| {
-        const painted = try projected(gpa, .{ .columns = columns, .rows = 24 }, &scene);
-        defer gpa.free(painted);
-        const rows = try terminal.View.plainText(gpa, painted);
-        defer gpa.free(rows);
-        var lines = std.mem.splitSequence(u8, rows, "\r\n");
-        while (lines.next()) |row| {
-            // The frame parks its cursor with one carriage return behind the last
-            // row, and that byte is no content of the row.
-            const line = std.mem.trimEnd(u8, row, "\r");
-            try std.testing.expect(terminal.width.ofText(line) <= columns);
-        }
-        try std.testing.expect(std.mem.indexOf(u8, rows, ui.paint.ellipsis) != null);
+    var lines = std.mem.splitSequence(u8, plain, "\r\n");
+    while (lines.next()) |row| {
+        const line = std.mem.trimEnd(u8, row, "\r");
+        try std.testing.expect(terminal.width.ofText(line) <= 8);
     }
+    try std.testing.expect(std.mem.indexOf(u8, plain, ui.paint.ellipsis) != null);
 }
 
 // When the transcript overflows the window, the projection clips the oldest
@@ -620,7 +600,7 @@ test "projection clips the oldest block to fill the window exactly" {
 
     const scene: Scene = .{ .conversation = .{
         .transcript = shown.items,
-        .tail = .{ .prompt = .{ .hint = null, .editor = &editor } },
+        .tail = .{ .prompt = .{ .caption = null, .editor = &editor } },
         .status = &test_status,
     } };
     const rows: usize = 4;
@@ -660,7 +640,7 @@ test "the retained window follows the configured page count" {
         const scene: Scene = .{ .conversation = .{
             .window_pages = pages,
             .transcript = shown.items,
-            .tail = .{ .prompt = .{ .hint = null, .editor = &editor } },
+            .tail = .{ .prompt = .{ .caption = null, .editor = &editor } },
             .status = &test_status,
         } };
         const painted = try projected(gpa, .{ .columns = 40, .rows = rows }, &scene);

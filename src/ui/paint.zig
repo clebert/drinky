@@ -26,16 +26,13 @@ const activity_growth_interval_ticks: u64 = 6;
 const caret_blink_ticks: u64 = 37;
 
 /// How a notice paints: the role that colors every row, the tag that opens it,
-/// how a line wider than one row fits, and the rows the notice can take.
+/// and how a line wider than one row fits.
 pub const Notice = struct {
     role: role.Name,
     /// An error tag, or empty. It stands on the first row of the notice alone.
     /// Two tags read as two errors, and an indent puts blanks into a copied row.
     prefix: []const u8 = "",
     fit: Fit = .wrap,
-    /// The rows the notice can paint. A page header takes the height of its
-    /// window, so a wrapped header can never outgrow the page.
-    rows_max: usize = std.math.maxInt(usize),
 };
 
 /// The separator between two parts of a legend: a blank, a middle dot, and a
@@ -144,11 +141,11 @@ fn nextRow(line: []const u8, room: usize, legend: bool) Row {
 /// The physical rows `text` occupies as a notice at `columns`. Must equal
 /// exactly what `notice` paints, because the window math relies on the parity.
 pub fn noticeRows(look: *const Notice, text: []const u8, columns: usize) usize {
-    if (look.fit == .head) return @min(1, look.rows_max);
+    if (look.fit == .head) return 1;
     var wrap = noticeWrap(look, text, columns);
     var count: usize = 0;
     while (wrap.next()) |_| count += 1;
-    return @min(count, look.rows_max);
+    return count;
 }
 
 fn noticeWrap(look: *const Notice, text: []const u8, columns: usize) Wrap {
@@ -313,7 +310,6 @@ pub fn notice(placement: *const Placement, look: *const Notice, text: []const u8
     var wrap = noticeWrap(look, text, placement.columns);
     var index: usize = 0;
     while (wrap.next()) |row| : (index += 1) {
-        if (index >= look.rows_max) break;
         const line = placement.base + index;
         if (line < placement.skip) continue;
         placement.sink.begin();
@@ -329,7 +325,7 @@ pub fn notice(placement: *const Placement, look: *const Notice, text: []const u8
 /// What one row keeps of `text`: the head of its first line, and whether the row
 /// dropped anything. A line break ends the row, so every line behind it is a cut
 /// too, and the mark states it even where the first line fits whole.
-fn headCut(text: []const u8, columns_max: usize) Cut {
+pub fn headCut(text: []const u8, columns_max: usize) Cut {
     const line_end = std.mem.indexOfScalar(u8, text, '\n') orelse text.len;
     const line = lineText(text[0..line_end]);
     if (line_end == text.len) return cut(line, columns_max);
@@ -364,7 +360,7 @@ fn headRow(label: []const u8, text: []const u8, columns: usize) Head {
 /// one `…` where the row cut the rest. A caller takes this form where a taller
 /// notice would move the interface around it.
 fn noticeHead(placement: *const Placement, look: *const Notice, text: []const u8) !void {
-    if (look.rows_max == 0 or placement.base < placement.skip) return;
+    if (placement.base < placement.skip) return;
     const row = headRow(look.prefix, text, placement.columns);
     placement.sink.begin();
     try role.apply(placement.sink, look.role);
@@ -832,44 +828,6 @@ fn writeSeparatorGlyph(
         .left_light_right_heavy => try sink.repeat("╼", count),
         .left_heavy_right_light => try sink.repeat("╾", count),
     }
-}
-
-/// Physical rows the steering queue occupies: one row per queued message plus a
-/// hint row. Zero when the queue is empty, so it contributes no component. Every
-/// row of the block keeps one row, so the count needs no width.
-pub fn steeringRows(messages: []const []const u8) usize {
-    if (messages.len == 0) return 0;
-    return messages.len + 1;
-}
-
-/// The steering queue: a `Queued message: <message>` row per queued message
-/// (each cut to its first line and the window width, with one `…` on either cut),
-/// then a faint hint row. Every row of the block keeps one row, so the queue
-/// never moves the editor under it.
-pub fn steering(placement: *const Placement, messages: []const []const u8) !void {
-    var line = placement.base;
-    for (messages) |message| {
-        defer line += 1;
-        if (line < placement.skip) continue;
-        // The row keeps the first line of the message, and the mark states both
-        // the width it cut and the lines it left out. The label opens the row, and
-        // it gives up its last column where the mark has nowhere else to stand.
-        const row = headRow("Queued message: ", message, placement.columns);
-        placement.sink.begin();
-        try role.apply(placement.sink, .accent);
-        try placement.sink.text(row.label);
-        try attribute.apply(placement.sink, .reset);
-        try role.apply(placement.sink, .muted);
-        try placement.sink.text(row.kept);
-        if (row.marked) try placement.sink.text(ellipsis);
-        try attribute.apply(placement.sink, .reset);
-        placement.sink.end(.{ .id = placement.id, .line = line });
-    }
-    var hint_placement = placement.*;
-    hint_placement.base = line;
-    // The key stands first, so a cut takes the explanation and never the key.
-    const hint = "\u{21B3} Ctrl+P: Edit all queued messages";
-    try notice(&hint_placement, &.{ .role = .muted, .fit = .head }, hint);
 }
 
 test "box preview cells use the live wrap width" {
@@ -1478,18 +1436,17 @@ test "a notice prefix opens its first row alone" {
     try std.testing.expect(std.mem.indexOf(u8, plain, "Try again.") != null);
 }
 
-// A one-row notice keeps its height and marks what the row cut. The footer and
-// the steering hint take this form, because a row that grows moves the interface
-// under it.
+// A one-row notice keeps its height and marks what the row cut. The footer
+// takes this form, because a row that grows moves the interface under it.
 test "a head notice keeps one row and marks its cut" {
     const gpa = std.testing.allocator;
     const look: Notice = .{ .role = .muted, .fit = .head };
-    const text = "Ctrl+P: Edit all queued messages\nnot another row";
+    const text = "Drinky returned every queued message\nnot another row";
     try std.testing.expectEqual(@as(usize, 1), noticeRows(&look, text, 16));
 
     const plain = try paintedNotice(gpa, &look, text, 16);
     defer gpa.free(plain);
-    try std.testing.expectEqualStrings("Ctrl+P: Edit al" ++ ellipsis, plain);
+    try std.testing.expectEqualStrings("Drinky returned" ++ ellipsis, plain);
 
     // A row that holds the whole text takes no mark.
     const short = try paintedNotice(gpa, &look, "Ctrl+P: Edit", 16);

@@ -31,7 +31,7 @@ pub fn run(context: *Context) !Context.Outcome {
     );
     return .{ .pick = .{
         .select = select,
-        .title = "Select a skill",
+        .title = "Skill",
         .cancellation_message = "You canceled the skill selection.",
         .options = try options.toOwnedSlice(),
         .current = null,
@@ -114,6 +114,7 @@ test "the list shows one row per skill, ordered by name" {
                 for (pick.options) |option| gpa.free(option);
                 gpa.free(pick.options);
             }
+            try std.testing.expectEqualStrings("Skill", pick.title);
             try std.testing.expectEqual(@as(usize, 2), pick.options.len);
             // The row holds the line it writes, and the summary stops at the
             // first sentence of the description.

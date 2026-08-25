@@ -62,7 +62,7 @@ pub fn run(context: *Context) !Context.Outcome {
     }
     return .{ .pick = .{
         .select = selectProvider,
-        .title = "Select a provider",
+        .title = "Provider",
         .cancellation_message = cancellation_message,
         .options = try options.toOwnedSlice(),
         .current = current,
@@ -105,7 +105,7 @@ fn accountStep(context: *Context, vendor: llm.Provider) !Context.Outcome {
         .select = switch (vendor) {
             inline else => |tag| selectAccountOf(tag),
         },
-        .title = "Select an account",
+        .title = "Account",
         .cancellation_message = cancellation_message,
         .options = try options.toOwnedSlice(),
         .current = current,
@@ -192,7 +192,7 @@ fn modelStepOf(comptime account: llm.Account) ModelStep {
                 return modelStep(context, account);
             }
         }.open,
-        .title = comptime "Select a model for " ++ account.label(),
+        .title = comptime "Model: " ++ account.label(),
     };
 }
 
@@ -280,7 +280,7 @@ test "the first step lists the providers with an authenticated account" {
 
     const pick = try expectPick(try run(&context));
     defer freePick(gpa, &pick);
-    try std.testing.expectEqualStrings("Select a provider", pick.title);
+    try std.testing.expectEqualStrings("Provider", pick.title);
     try std.testing.expectEqual(@as(usize, 2), pick.options.len);
     try std.testing.expectEqualStrings("Anthropic", pick.options[0]);
     try std.testing.expectEqualStrings("OpenAI", pick.options[1]);
@@ -297,7 +297,7 @@ test "one provider alone opens the account step at once" {
 
     const pick = try expectPick(try run(&context));
     defer freePick(gpa, &pick);
-    try std.testing.expectEqualStrings("Select an account", pick.title);
+    try std.testing.expectEqualStrings("Account", pick.title);
     try std.testing.expectEqual(@as(usize, 2), pick.options.len);
     try std.testing.expectEqualStrings("Anthropic Subscription", pick.options[0]);
     try std.testing.expectEqualStrings("Anthropic API", pick.options[1]);
@@ -314,7 +314,7 @@ test "one account alone opens the model step at once" {
     // Both earlier steps hold one row, so the model list is the whole command.
     const pick = try expectPick(try run(&context));
     defer freePick(gpa, &pick);
-    try std.testing.expectEqualStrings("Select a model for Anthropic API", pick.title);
+    try std.testing.expectEqualStrings("Model: Anthropic API", pick.title);
     try std.testing.expectEqual(@as(usize, 5), pick.options.len);
     try std.testing.expectEqualStrings("claude-fable-5", pick.options[0]);
     try std.testing.expectEqualStrings("claude-sonnet-4-6", pick.options[pick.current.?]);
@@ -339,7 +339,7 @@ test "a provider row opens its accounts, and an account row opens its models" {
     const anthropic_models = try expectPick(try anthropic_accounts.select(&context, 0));
     defer freePick(gpa, &anthropic_models);
     try std.testing.expectEqualStrings(
-        "Select a model for Anthropic Subscription",
+        "Model: Anthropic Subscription",
         anthropic_models.title,
     );
     // The subscription is not the active account, so no row is the current one.
@@ -348,7 +348,7 @@ test "a provider row opens its accounts, and an account row opens its models" {
     // OpenAI holds one authenticated account, so its row skips the account step.
     const openai_models = try expectPick(try vendors.select(&context, 1));
     defer freePick(gpa, &openai_models);
-    try std.testing.expectEqualStrings("Select a model for OpenAI API", openai_models.title);
+    try std.testing.expectEqualStrings("Model: OpenAI API", openai_models.title);
     try std.testing.expectEqual(@as(usize, 3), openai_models.options.len);
     try std.testing.expectEqualStrings("gpt-5.6-sol", openai_models.options[0]);
 }
@@ -383,7 +383,7 @@ test "each step names the opener that builds it again" {
     // opener on the rebuilt one.
     const reopened = try expectPick(try anthropic_accounts.reopen.?(&context));
     defer freePick(gpa, &reopened);
-    try std.testing.expectEqualStrings("Select an account", reopened.title);
+    try std.testing.expectEqualStrings("Account", reopened.title);
     try std.testing.expectEqualStrings("Anthropic Subscription", reopened.options[0]);
     try std.testing.expect(reopened.reopen.? == accountStepOf(.anthropic));
 

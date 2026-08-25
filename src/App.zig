@@ -1009,8 +1009,8 @@ fn armRetry(self: *App, result: *const WorkerResult, attempt: bool) !void {
     self.setRetry(.{ .failure = failure });
 }
 
-/// Replace the retry context and mirror its hint row into the session. This is the
-/// one place that moves both together, so the row can never outlive the context.
+/// Replace the retry context and mirror its caption into the session. This is
+/// the one place that moves both together, so the caption cannot outlive it.
 ///
 /// The call frees the context that it replaces, so a caller builds `maybe_retry`
 /// and every byte in it first. `armRetry` duplicates the failure sentence before
@@ -1037,7 +1037,7 @@ fn dropRetry(self: *App) void {
     self.retry = null;
 }
 
-/// Discard the retry context and its hint row. The editor keeps its text, because
+/// Discard the retry context and its caption. The editor keeps its text because
 /// Esc dismisses the retry alone.
 fn clearRetry(self: *App) void {
     if (self.retry == null) return;
@@ -2001,8 +2001,12 @@ fn runCommand(self: *App, line: []const u8) !void {
 /// app or agent. Presentation-only outcomes go to the session.
 fn applyOutcome(self: *App, outcome: ai.command.Outcome) !void {
     switch (outcome) {
-        .show_system_prompt => try self.session.openPage(&.{ .content = self.prompt }),
+        .show_system_prompt => try self.session.openPage(&.{
+            .title = "System prompt",
+            .content = self.prompt,
+        }),
         .show_colors => try self.session.openPage(&.{
+            .title = "Colors",
             .content = "",
             .presentation = .colors,
         }),
@@ -4317,7 +4321,7 @@ test "a legacy escape byte closes a page after its wait" {
     defer app.input.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
     defer app.session.deinit();
-    try app.session.openPage(&.{ .content = "", .presentation = .colors });
+    try app.session.openPage(&.{ .title = "Colors", .content = "", .presentation = .colors });
 
     // A terminal without the Kitty protocol sends this one byte. It can still
     // start a longer sequence, so the page stays open while the wait runs.
@@ -4357,7 +4361,7 @@ test "a page close drops the rest of an exit attempt in one chunk" {
         app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
         defer app.session.deinit();
         try app.session.editor.insert("draft");
-        try app.session.openPage(&.{ .content = "", .presentation = .colors });
+        try app.session.openPage(&.{ .title = "Colors", .content = "", .presentation = .colors });
 
         try app.handleKeys(chunk);
         try std.testing.expect(app.session.mode == .prompt);
@@ -4701,6 +4705,7 @@ test "/system opens the composed prompt alone and escape restores the conversati
     const page_start = out.written().len;
     try app.session.paint(.{ .columns = 80, .rows = 6 });
     const page_bytes = out.written()[page_start..];
+    try std.testing.expect(std.mem.indexOf(u8, page_bytes, "System prompt") != null);
     try std.testing.expect(std.mem.indexOf(u8, page_bytes, "Esc: Close") != null);
     try std.testing.expect(std.mem.indexOf(u8, page_bytes, "M: Source") != null);
     try std.testing.expect(std.mem.indexOf(u8, page_bytes, "Core") != null);
@@ -4780,6 +4785,7 @@ test "/colors opens the color preview page and ctrl+d restores the conversation"
     const page_start = out.written().len;
     try app.session.paint(.{ .columns = 80, .rows = 12 });
     const page_bytes = out.written()[page_start..];
+    try std.testing.expect(std.mem.indexOf(u8, page_bytes, "Colors") != null);
     try std.testing.expect(std.mem.indexOf(u8, page_bytes, "Esc: Close") != null);
     try std.testing.expect(std.mem.indexOf(u8, page_bytes, "M: Source") == null);
     try std.testing.expect(std.mem.indexOf(u8, page_bytes, "ANSI slots 0 to 15") != null);
@@ -5147,7 +5153,7 @@ test "the logout of the last account signs out and opens the login picker" {
     );
     try std.testing.expect(app.session.mode == .picking);
     const picker = app.session.mode.picking.picker;
-    try std.testing.expectEqualStrings("Select an account to sign in", picker.title);
+    try std.testing.expectEqualStrings("Sign in", picker.title);
     try std.testing.expectEqual(std.enums.values(ai.llm.Account).len, picker.options.len);
     try std.testing.expectEqualStrings("Anthropic Subscription", picker.options[0]);
 }
@@ -5595,7 +5601,7 @@ test displayRoots {
     try std.testing.expectEqualStrings("/work/.agents/skills/demo/SKILL.md", bare);
 }
 
-// A failed turn that committed work arms a retry: the hint row appears above the
+// A failed turn that committed work arms a retry. Its caption appears above the
 // editor, and Esc dismisses that retry alone.
 test "a committed failure arms a retry that Esc dismisses" {
     const gpa = std.testing.allocator;
@@ -5634,9 +5640,10 @@ test "a committed failure arms a retry that Esc dismisses" {
     try std.testing.expectEqualStrings("The provider is overloaded.", app.retry.?.failure);
     try std.testing.expect(app.session.retry_shown);
 
-    // The hint row names the two keys that own the retry. Enter belongs to the
-    // editor text, so the row leaves it out.
+    // The caption names the failed state and the two keys that own the retry.
+    // Enter belongs to the editor text, so the controls leave it out.
     try app.session.paint(.{ .columns = 80, .rows = 24 });
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "Failed turn") != null);
     try std.testing.expect(std.mem.indexOf(
         u8,
         out.written(),
@@ -6406,7 +6413,7 @@ test "Esc opens the step above the picker and cancels at the first step" {
     try app.session.editor.insert("/model");
     try app.submit();
     const vendors = &app.session.mode.picking.picker;
-    try std.testing.expectEqualStrings("Select a provider", vendors.title);
+    try std.testing.expectEqualStrings("Provider", vendors.title);
     try std.testing.expect(!vendors.can_step_back);
 
     // The active account marks and opens on its own provider, and the walk goes
@@ -6416,7 +6423,7 @@ test "Esc opens the step above the picker and cancels at the first step" {
     try app.handleKey(&.down);
     try app.handleKey(&.enter);
     const listed_models = &app.session.mode.picking.picker;
-    try std.testing.expectEqualStrings("Select a model for OpenAI API", listed_models.title);
+    try std.testing.expectEqualStrings("Model: OpenAI API", listed_models.title);
     try std.testing.expect(listed_models.can_step_back);
 
     // Two Escape bytes in one chunk. The first opens the step above, and the
@@ -6424,7 +6431,7 @@ test "Esc opens the step above the picker and cancels at the first step" {
     try app.handleKeys("\x1b\x1b");
     try std.testing.expect(app.session.mode == .picking);
     const reopened_vendors = &app.session.mode.picking.picker;
-    try std.testing.expectEqualStrings("Select a provider", reopened_vendors.title);
+    try std.testing.expectEqualStrings("Provider", reopened_vendors.title);
     // The list opens on the row the walk left, not on the default row. One Enter
     // therefore returns to the same branch.
     try std.testing.expectEqual(@as(usize, 1), reopened_vendors.cursor);
@@ -6506,10 +6513,10 @@ test "Esc walks back through the command list that opened the command" {
     // Down to the model list: the list, the provider step, and the account step
     // that one authenticated account per provider skips.
     try app.handleKey(&.enter);
-    try std.testing.expectEqualStrings("Select a provider", app.session.mode.picking.picker.title);
+    try std.testing.expectEqualStrings("Provider", app.session.mode.picking.picker.title);
     try app.handleKey(&.enter);
     try std.testing.expectEqualStrings(
-        "Select a model for Anthropic API",
+        "Model: Anthropic API",
         app.session.mode.picking.picker.title,
     );
 
@@ -6517,13 +6524,13 @@ test "Esc walks back through the command list that opened the command" {
     // frame, because a step that paints nothing leaves the old list on screen.
     app.session.dirty = false;
     try app.handleKey(&.escape);
-    try std.testing.expectEqualStrings("Select a provider", app.session.mode.picking.picker.title);
+    try std.testing.expectEqualStrings("Provider", app.session.mode.picking.picker.title);
     try std.testing.expect(app.session.dirty);
 
     app.session.dirty = false;
     try app.handleKey(&.escape);
     const reopened = &app.session.mode.picking.picker;
-    try std.testing.expectEqualStrings("Select a command", reopened.title);
+    try std.testing.expectEqualStrings("Command", reopened.title);
     try std.testing.expect(!reopened.can_step_back);
     try std.testing.expect(app.session.dirty);
     // The list opens where it was left, so the next Enter runs the same command
@@ -6599,7 +6606,7 @@ test "the command list opens the skill list and writes the picked line" {
     try app.handleKey(&enter);
     try std.testing.expect(app.session.mode == .picking);
     const listed_skills = &app.session.mode.picking.picker;
-    try std.testing.expectEqualStrings("Select a skill", listed_skills.title);
+    try std.testing.expectEqualStrings("Skill", listed_skills.title);
     try std.testing.expectEqualStrings("/skill:demo — Shape a demo.", listed_skills.options[0]);
 
     // The skill row closes the picker and writes its line, with the trailing

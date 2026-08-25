@@ -10,6 +10,7 @@ const std = @import("std");
 const ai = @import("ai");
 const terminal = @import("terminal");
 
+const Caption = @import("Caption.zig");
 const markdown = @import("markdown.zig");
 const paint = @import("paint.zig");
 const role = @import("role.zig");
@@ -131,7 +132,6 @@ pub const Entry = union(enum) {
     /// counts cannot diverge from the rows it paints.
     fn notice(self: *const Entry) ?paint.Notice {
         return switch (self.*) {
-            .intro => .{ .role = .muted },
             .user_note => .{ .role = .user_note },
             // An error event wraps like every other event. The transcript is the
             // place where the whole sentence must stay readable.
@@ -139,8 +139,15 @@ pub const Entry = union(enum) {
                 .role = if (flagged.is_error) .@"error" else .muted,
                 .prefix = if (flagged.is_error) "Error: " else "",
             },
-            .user, .tool_result, .thinking, .model => null,
+            .intro, .user, .tool_result, .thinking, .model => null,
         };
+    }
+
+    /// The intro line as the caption of the interface: the product title, then
+    /// the legend this block carries. It keeps the default row bound, because a
+    /// transcript block scrolls away and moves no input around.
+    fn introCaption(legend: []const u8) Caption {
+        return .{ .title = "Drinky", .controls = legend };
     }
 
     /// The role of the box this block paints, or null for a block that paints a
@@ -160,6 +167,7 @@ pub const Entry = union(enum) {
     pub fn rows(self: *const Entry, columns: usize) usize {
         if (self.notice()) |look| return paint.noticeRows(&look, self.bytes(), columns);
         return switch (self.*) {
+            .intro => |list| introCaption(list.items).rows(columns),
             .user => |list| paint.boxRows(&.{ .text = list.items }, columns),
             .tool_result => |flagged| paint.boxRows(
                 &.{ .text = flagged.text.items, .fit = flagged.fit },
@@ -167,7 +175,7 @@ pub const Entry = union(enum) {
             ),
             .thinking => |reasoning| markdown.rows(reasoning.text.items, columns),
             .model => |list| markdown.rows(list.items, columns),
-            .intro, .user_note, .event => unreachable,
+            .user_note, .event => unreachable,
         };
     }
 
@@ -177,7 +185,8 @@ pub const Entry = union(enum) {
         if (self.notice()) |look| return paint.notice(placement, &look, self.bytes());
         const box = self.boxRole();
         switch (self.*) {
-            .intro, .user_note, .event => unreachable,
+            .user_note, .event => unreachable,
+            .intro => |list| _ = try introCaption(list.items).render(placement),
             .user => |list| try paint.box(placement, box.?, &.{ .text = list.items }),
             .tool_result => |flagged| try paint.box(
                 placement,
@@ -394,13 +403,15 @@ test "a clipped block shows its bottom rows" {
     try std.testing.expectEqual(@as(usize, 15), try renderedRows(gpa, &entry, columns, 25));
 }
 
-/// One pinned block, and the role it paints as a notice or as a box. A block
-/// that paints markdown carries neither name.
+/// One pinned block, and the role it paints as a notice or as a box. A caption
+/// block owns the accent title and the muted legend of the shared caption. A
+/// block that paints markdown carries no name at all.
 const Pinned = struct {
     kind: Entry.Kind,
     options: Entry.Options = .{},
     notice: ?role.Name = null,
     box: ?role.Name = null,
+    caption: bool = false,
 };
 
 // The color of a block states who wrote it. A line that reports a message that
@@ -410,7 +421,7 @@ const Pinned = struct {
 test "each block kind pins the role that it paints" {
     const gpa = std.testing.allocator;
     const pinned = [_]Pinned{
-        .{ .kind = .intro, .notice = .muted },
+        .{ .kind = .intro, .caption = true },
         // Every message that Drinky wrote for the user reports in this color.
         .{ .kind = .user_note, .notice = .user_note },
         .{ .kind = .event, .notice = .muted },
@@ -433,9 +444,45 @@ test "each block kind pins the role that it paints" {
             try std.testing.expect(look == null);
         }
         try std.testing.expectEqual(pin.box, entry.boxRole());
+        if (pin.caption) try std.testing.expect(pin.kind == .intro);
         seen.insert(pin.kind);
     }
     try std.testing.expectEqual(std.enums.values(Entry.Kind).len, seen.count());
+}
+
+// The intro block paints the shared caption: the accent product title, then
+// the muted legend beside it. A narrow window splits the legend under the
+// title, and the block still counts exactly the rows it paints.
+test "the intro block paints the Drinky caption" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var view = terminal.View.init(gpa, &out.writer);
+    defer view.deinit();
+    var intro = try Entry.init(gpa, .intro, .{}, "Enter: Send · Ctrl+D: Quit");
+    defer intro.deinit(gpa);
+
+    const columns = 60;
+    try std.testing.expectEqual(@as(usize, 1), intro.rows(columns));
+    const sink = try view.beginFrame(.{ .columns = columns, .rows = 24 }, 8);
+    const placement: paint.Placement = .{
+        .sink = sink,
+        .id = 0,
+        .columns = columns,
+        .base = 0,
+        .skip = 0,
+    };
+    try intro.render(&placement);
+    try view.render();
+
+    const painted = out.written();
+    const title = comptime role.sequence(.accent) ++ "Drinky\x1b[0m";
+    const legend = comptime role.sequence(.muted) ++ " · Enter: Send";
+    try std.testing.expect(std.mem.indexOf(u8, painted, title) != null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, legend) != null);
+
+    // A window narrower than the joined row splits the legend under the title.
+    try std.testing.expectEqual(@as(usize, 3), intro.rows(14));
 }
 
 // An error event must be visibly distinct: the error role and an "Error: "

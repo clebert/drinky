@@ -34,7 +34,7 @@ pub fn run(context: *Context) !Context.Outcome {
     }
     return .{ .pick = .{
         .select = select,
-        .title = "Select an effort level",
+        .title = "Effort",
         .cancellation_message = "You canceled the effort selection.",
         .options = try options.toOwnedSlice(),
         .current = current,
@@ -76,6 +76,7 @@ test "the picker lists every level, preselecting the current one" {
                 gpa.free(pick.options);
             }
             try std.testing.expect(pick.select == &select);
+            try std.testing.expectEqualStrings("Effort", pick.title);
             try std.testing.expectEqual(levels.len, pick.options.len);
             try std.testing.expectEqualStrings("high", pick.options[pick.current.?]);
         },

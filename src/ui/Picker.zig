@@ -1,13 +1,13 @@
-//! A single-choice list for the live region: a muted caption, then the options.
-//! The options sit between the same open separators as the editor, so the list
-//! takes the editor's place. Each option holds one row, the selected one is
-//! highlighted, and a pre-existing choice is tagged "(Current)".
+//! A single-choice list for the live region: a responsive caption, then the
+//! options. The options sit between the same open separators as the editor, so
+//! the list takes the editor's place. Each option holds one row, the selected
+//! one is highlighted, and a pre-existing choice is tagged "(Current)".
 //!
-//! The caption carries the title and the key hint above the frame. It is chrome,
-//! not content. It stays outside the scrolled window, so the picker window never
-//! scrolls it away. The hidden-row labels then count option rows alone. The title
-//! and the key hint each wrap, like every row above the input. The page header
-//! follows the same pattern.
+//! The caption carries an accent title and a muted key hint above the frame. It
+//! is chrome, not content. It stays outside the scrolled window, so the picker
+//! window never scrolls it away. The hidden-row labels then count option rows
+//! alone. The shared caption component owns every responsive split, and three
+//! rows bound it, so chrome cannot crowd the options out of a narrow window.
 //!
 //! The picker owns its option strings and the composed `content` buffer (freed on
 //! `deinit`) and borrows the title. Navigation moves the selection and rolls over
@@ -20,6 +20,7 @@
 
 const std = @import("std");
 
+const Caption = @import("Caption.zig");
 const block = @import("block.zig");
 const paint = @import("paint.zig");
 const role = @import("role.zig");
@@ -32,9 +33,6 @@ const hint_cancel = "↑/↓: Move · Enter: Select · Esc: Cancel";
 /// The key hint of a later step. Esc opens the step above, and one Esc per step
 /// leaves the picker.
 const hint_back = "↑/↓: Move · Enter: Select · Esc: Back";
-/// How both caption rows paint. The measure and the paint share it, so the rows
-/// the caption takes cannot diverge from the rows it paints.
-const caption: paint.Notice = .{ .role = .muted };
 /// The tag of the option that holds the value the picker starts on.
 const tag_current = " (Current)";
 /// The width a picker composes its rows for before the first paint measures the
@@ -185,13 +183,13 @@ pub fn rows(self: *const Picker, size: terminal.View.Size) usize {
 /// `placement`. Window the list to its scroll limit for `viewport_rows`. Assumes
 /// `reflow` set the scroll.
 pub fn render(self: *const Picker, placement: *const paint.Placement, viewport_rows: usize) !void {
-    try self.renderCaption(placement);
+    const caption_rows = try self.renderCaption(placement);
     const columns_max = paint.contentColumns(placement.columns);
     const total_body = terminal.width.rows(self.content.items, columns_max);
     const visible_rows = @min(total_body, paint.bodyLimit(viewport_rows));
     // The derived placement copies its parent. Only the geometry changes.
     var frame_placement = placement.*;
-    frame_placement.base = placement.base + self.captionRows(placement.columns);
+    frame_placement.base = placement.base + caption_rows;
     try paint.framed(&frame_placement, &.{
         .body = self.content.items,
         .body_rows = visible_rows,
@@ -201,31 +199,27 @@ pub fn render(self: *const Picker, placement: *const paint.Placement, viewport_r
     });
 }
 
-/// The muted caption above the frame: the title, then the key hint. Each of the
-/// two wraps, so a narrow window keeps every word of both. A caption that grows
-/// adds its rows above the framed list, which `paint.bodyLimit` bounds on its own.
-fn renderCaption(self: *const Picker, placement: *const paint.Placement) !void {
-    try paint.notice(placement, &caption, self.title);
-    // The derived placement copies its parent. Only the geometry changes.
-    var hint_placement = placement.*;
-    hint_placement.base = placement.base + titleRows(self.title, placement.columns);
-    try paint.notice(&hint_placement, &caption, self.hint());
+/// Paint the responsive caption and return its occupied rows.
+fn renderCaption(self: *const Picker, placement: *const paint.Placement) !usize {
+    const chrome = self.caption();
+    return chrome.render(placement);
 }
 
-/// Physical rows of the caption: the title rows and the key-hint rows.
+/// Physical rows of the shared caption.
 fn captionRows(self: *const Picker, columns: usize) usize {
-    return titleRows(self.title, columns) + paint.noticeRows(&caption, self.hint(), columns);
+    const chrome = self.caption();
+    return chrome.rows(columns);
 }
 
-/// The key hint of this list. The measure and the paint read the same one, so
-/// the rows the caption takes cannot diverge from the rows it paints.
-fn hint(self: *const Picker) []const u8 {
-    return if (self.can_step_back) hint_back else hint_cancel;
-}
-
-/// Rows the title holds once wrapped to `columns`.
-fn titleRows(title: []const u8, columns: usize) usize {
-    return paint.noticeRows(&caption, title, columns);
+/// The semantic title and key hint of this list. Three rows bound the caption,
+/// so narrow chrome stays predictable: the title row, then the control rows
+/// that fit. A control segment past the bound drops whole.
+fn caption(self: *const Picker) Caption {
+    return .{
+        .title = self.title,
+        .controls = if (self.can_step_back) hint_back else hint_cancel,
+        .rows_max = 3,
+    };
 }
 
 /// Rebuild `content`: one row per option, the selected one in the selection role
@@ -313,10 +307,10 @@ test "the frame holds the option rows alone and the caption stays above it" {
     defer picker.deinit();
     const size: terminal.View.Size = .{ .columns = 80, .rows = 24 };
 
-    // A title row, a hint row, two separators, and two option rows make six
-    // rows. A short list wastes no row, so no blank row sits inside the frame.
-    try std.testing.expectEqual(@as(usize, 2), picker.captionRows(size.columns));
-    try std.testing.expectEqual(@as(usize, 6), picker.rows(size));
+    // One caption row, two separators, and two option rows make five rows. A
+    // short list wastes no row, so no blank row sits inside the frame.
+    try std.testing.expectEqual(@as(usize, 1), picker.captionRows(size.columns));
+    try std.testing.expectEqual(@as(usize, 5), picker.rows(size));
     try std.testing.expect(std.mem.indexOf(u8, picker.content.items, "\n\n") == null);
     try std.testing.expect(!std.mem.startsWith(u8, picker.content.items, "\n"));
     try std.testing.expect(!std.mem.endsWith(u8, picker.content.items, "\n"));
@@ -327,18 +321,20 @@ test "the frame holds the option rows alone and the caption stays above it" {
     try std.testing.expect(std.mem.indexOfScalar(u8, picker.content.items, 0x1b) == null);
     try std.testing.expectEqual(role.Name.selection, picker.line_roles.items[1].?);
 
-    // Painted order: the muted caption, then the frame around the options.
+    // Painted order: the accent title and muted controls, then the frame.
     const painted = try renderForTest(gpa, &picker, size);
     defer gpa.free(painted);
-    const title = comptime role.sequence(.muted) ++ "Pick\x1b[0m";
+    const title = comptime role.sequence(.accent) ++ "Pick\x1b[0m";
+    const controls = comptime role.sequence(.muted) ++ " · ↑/↓: Move";
     try std.testing.expect(std.mem.indexOf(u8, painted, title) != null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, controls) != null);
     try std.testing.expect(
         std.mem.indexOf(u8, painted, "Pick").? < std.mem.indexOf(u8, painted, "─").?,
     );
     try std.testing.expect(
         std.mem.indexOf(u8, painted, "Esc: Cancel").? < std.mem.indexOf(u8, painted, "─").?,
     );
-    try std.testing.expectEqual(@as(usize, 6), block.paintedRows(painted));
+    try std.testing.expectEqual(@as(usize, 5), block.paintedRows(painted));
 }
 
 fn renderForTest(
@@ -427,8 +423,8 @@ test "the key hint states the step above a later step" {
     defer gpa.free(later_step);
     try std.testing.expect(std.mem.indexOf(u8, later_step, "Esc: Back") != null);
     try std.testing.expect(std.mem.indexOf(u8, later_step, "Esc: Cancel") == null);
-    // Both hints hold one row at this width, so the frame keeps its place.
-    try std.testing.expectEqual(@as(usize, 2), picker.captionRows(size.columns));
+    // Both complete captions hold one row, so the frame keeps its place.
+    try std.testing.expectEqual(@as(usize, 1), picker.captionRows(size.columns));
 }
 
 // Every option holds one row, whatever the width does. A row too wide for the
@@ -446,11 +442,11 @@ test "a row too wide for the window is cut and marked" {
     const size: terminal.View.Size = .{ .columns = 24, .rows = 24 };
 
     try picker.reflow(size);
-    // Two options, so two rows. This narrow caption wraps its key hint over
-    // three rows, so the caption and the two separators add six.
+    // Two options, so two rows. Three rows bound this narrow caption: the
+    // title, then two control rows. With the two separators that makes five.
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, picker.content.items, "\n") + 1);
-    try std.testing.expectEqual(@as(usize, 4), picker.captionRows(size.columns));
-    try std.testing.expectEqual(@as(usize, 8), picker.rows(size));
+    try std.testing.expectEqual(@as(usize, 3), picker.captionRows(size.columns));
+    try std.testing.expectEqual(@as(usize, 7), picker.rows(size));
     try std.testing.expect(std.mem.indexOf(u8, picker.content.items, "…") != null);
     // The row break inside an option cannot open a row of its own.
     try std.testing.expect(std.mem.indexOf(u8, picker.content.items, "rows in one option") == null);
@@ -460,10 +456,12 @@ test "a row too wide for the window is cut and marked" {
     // The tag states what the row is, so the cut takes the text it marks and
     // never the tag itself.
     try std.testing.expect(std.mem.indexOf(u8, painted, " > claude-son… (Current)") != null);
-    try std.testing.expectEqual(@as(usize, 8), block.paintedRows(painted));
-    // The caption wraps at its separators, so every key hint stays whole.
-    for ([_][]const u8{ "↑/↓: Move", "Enter: Select", "Esc: Cancel" }) |part|
+    try std.testing.expectEqual(@as(usize, 7), block.paintedRows(painted));
+    // The kept control rows hold whole segments, and the segment past the row
+    // bound drops whole. Esc still cancels, so the drop costs no capability.
+    for ([_][]const u8{ "↑/↓: Move", "Enter: Select" }) |part|
         try std.testing.expect(std.mem.indexOf(u8, painted, part) != null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "Esc: Cancel") == null);
 
     // Every row holds the width, even a window narrower than the tag.
     for ([_]usize{ 24, 8, 3, 1 }) |columns| {
@@ -492,10 +490,10 @@ test "a tall option list scrolls the window to keep the selection in view" {
 
     // A 20-row viewport caps the list at six rows. With the selection on the
     // first option the window sits at the top and nothing scrolls. The caption
-    // and the two separators add four rows above and below it.
+    // and the two separators add three rows around it.
     try picker.reflow(size);
     try std.testing.expectEqual(@as(usize, 0), picker.scroll);
-    try std.testing.expectEqual(@as(usize, 10), picker.rows(size));
+    try std.testing.expectEqual(@as(usize, 9), picker.rows(size));
 
     // A walk of the selection to the last option drags the window down after it.
     for (0..19) |_| {

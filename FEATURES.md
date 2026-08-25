@@ -25,9 +25,9 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
   a failed call, so a canceled mutation is never hidden.
 - Timeouts and transient failures retry the whole request, clear the partial reply, and record each
   retry cause.
-- A failed turn that committed work arms a retry above the editor. Ctrl+N asks the model to continue
-  and Esc discards the retry. The attempt never takes the editor text, and the start of any turn
-  drops the retry. Drinky wrote the message of the attempt, so its line takes the user color.
+- A failed turn that committed work shows a `Failed turn` caption above the editor. Ctrl+N asks the
+  model to continue, and Esc discards the retry. The attempt never takes the editor text. The start
+  of any turn drops the retry. Drinky wrote the attempt message, so its line takes the user color.
 - A reply cut short by the output cap is kept, and reported as cut short.
 - Model-side failures — a refusal, an empty reply, the round cap — read as a plain sentence rather
   than an internal error.
@@ -200,22 +200,25 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 
 - The conversation renders inline into the normal screen buffer and real scrollback. Temporary
   full-window pages use the alternate screen and restore the conversation on close.
-- Every row above the input wraps: the intro line, the startup counts line, a transcript event, a
-  skill head line, a control hint, the picker caption, and a page header. A row breaks at a `·`
-  separator first. A hint too wide for one row keeps that row and marks its cut, so no hint splits
-  over two rows. A line that holds no separator is a sentence, so it breaks between words and keeps
-  its tail.
+- Every notice above the input wraps. It breaks at a `·` separator first. A hint too wide for one
+  row keeps that row and marks its cut. A sentence breaks between words and keeps its tail.
+- One semantic caption heads the intro line, a picker, an editor state, and a full-window page. Its
+  accent title and muted controls share one row when they fit. At the first overflow, the title
+  takes one row that never wraps and cuts with one `…` when too wide. The control segments wrap at
+  their `·` boundaries under it, and a segment alone on a row that still overflows cuts with `…`.
+- A row bound caps each caption: one row for a page, three for a picker or an editor state, none for
+  the intro line. A control segment past the bound drops whole and leaves no mark. A one-row caption
+  keeps the title and the longest prefix of whole segments, so the title survives longest.
 - An element whose height must stay stable keeps one row and marks its cut with one `…`: a tool box,
-  both steering rows, a picker option, a table cell, a code row, and the footer notice. The status
-  line shortens its fields and then drops them instead.
+  a picker option, a table cell, a code row, and the footer notice. The status line shortens its
+  fields and then drops them instead.
 - A page asks the terminal to send an arrow key for a wheel notch. A trackpad then scrolls the page,
   and a drag still selects text.
 - Apple Terminal has no such mode. A page there takes mouse reports and the legacy alternate screen.
   A trackpad scrolls it, but a text selection needs the Fn key. The close reprints the conversation
   window.
-- A full-window page scrolls with the arrow keys, PgUp/PgDn, and Home/End. Esc closes it, and its
-  header says so, on as many rows as the header needs. Ctrl+C and Ctrl+D close it too, so an exit
-  attempt always works.
+- A full-window page scrolls with the arrow keys, PgUp/PgDn, and Home/End. Its fixed caption names
+  the page and its controls. Esc, Ctrl+C, and Ctrl+D close it, so an exit attempt always works.
 - Repaints only the rows that changed, atomically. A shrink or height change keeps native scrollback
   intact and can leave blank rows below the interface. A width change or a change above the viewport
   reprints the window.
@@ -276,7 +279,8 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - Drinky blinks the input caret while a turn runs, because a terminal holds its own cursor solid
   under a continuous repaint. An edit restarts the blink, so the caret stays visible while the user
   types.
-- Queued steering shows as `Queued message:` rows, and becomes one user message once consumed.
+- Pending steering shows its message count and Ctrl+P control in the editor caption. Its content
+  becomes one user message once consumed.
 - The bottom line shows `directory (branch)`, context fill, cost, quota, and cache-hit rate on the
   left, and `model (account) · Effort: level` on the right. At most one temporary notice replaces it
   until the next user action. The notice keeps one row, so it never moves the editor above it. A
@@ -316,8 +320,7 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
   on the way down. Drinky reopens each list with the row and the window that the user left.
 - Every option holds one row. Drinky cuts a row that is too wide for the window and marks the cut
   with one `…`. The cut takes the option text, so the tag of the row stays.
-- A muted caption above the picker frame holds the title and the key hint. Each of the two wraps. It
-  stays outside the scrolled window, so the picker window never scrolls it away.
+- The picker caption stays outside the scrolled window, so the picker never scrolls it away.
 - The open input area grows to about a quarter of the screen and labels hidden rows "↑ Hidden: N"
   and "↓ Hidden: N".
 - The terminal supplies every color and the muted intensity. Drinky uses the default colors, ANSI
@@ -332,8 +335,8 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 ## Editing & text
 
 - Enter sends, Shift+Enter or Ctrl+J makes a newline, Esc cancels, Ctrl+C clears, Ctrl+D quits. An
-  intro line shows those bindings at launch and closes with `/help: Commands`. It wraps, so a narrow
-  window keeps every hint.
+  intro line shows those bindings at launch under the `Drinky` title and closes with
+  `/help: Commands`. It wraps without a row bound, so a narrow window keeps every hint.
 - A second Ctrl+C within 500 ms quits, as does Ctrl+D on an empty editor or a closed stdin. Ctrl+D
   with a draft warns that the quit discards the draft, and quits on the second press.
 - The caret moves by grapheme cluster, by wrapped row with a sticky column, and to the start or end

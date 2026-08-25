@@ -18,6 +18,7 @@ const std = @import("std");
 
 const terminal = @import("terminal");
 
+const Caption = @import("Caption.zig");
 const attribute = @import("attribute.zig");
 const paint = @import("paint.zig");
 const role = @import("role.zig");
@@ -30,6 +31,8 @@ const Item = union(enum) {
     title: []const u8,
     /// A muted label row above a sample group.
     note: []const u8,
+    /// One live semantic caption, bounded to this preview row.
+    caption: CaptionSample,
     /// One ANSI palette slot: its label, a foreground sample, and a filled
     /// background sample.
     slot: u8,
@@ -50,6 +53,7 @@ const Item = union(enum) {
 };
 
 const Style = struct { parameters: []const u8, label: []const u8 };
+const CaptionSample = struct { title: []const u8, controls: []const u8 };
 
 const Sample = struct {
     label: []const u8,
@@ -160,7 +164,7 @@ const items = blk: {
             .underline = true,
             .text = "https://example.com",
         } },
-        .{ .sample = .{ .label = "Accent", .name = .accent, .text = "Queued message:" } },
+        .{ .sample = .{ .label = "Accent", .name = .accent, .text = "Caption title" } },
         .{ .sample = .{
             .label = "User note",
             .name = .user_note,
@@ -178,8 +182,10 @@ const items = blk: {
         .blank,
         .{ .note = "A picker with its caption above the frame and one selected row:" },
         .blank,
-        .{ .note = "Select a model" },
-        .{ .note = "↑/↓: Move · Enter: Select · Esc: Cancel" },
+        .{ .caption = .{
+            .title = "Model: Anthropic Subscription",
+            .controls = "↑/↓: Move · Enter: Select · Esc: Cancel",
+        } },
         .{ .separator = .plain },
         .{ .framed = .{ .name = .muted, .text = "   Another option" } },
         .{ .framed = .{ .name = .selection, .text = " > The selected option (Current)" } },
@@ -218,6 +224,15 @@ fn renderItem(placement: *const paint.Placement, comptime item: Item, line: usiz
     sink.begin();
     switch (item) {
         .blank => {},
+        .caption => |sample| {
+            // The one-row form of the shared caption, so the sample cannot
+            // diverge from the live widget.
+            const caption: Caption = .{
+                .title = sample.title,
+                .controls = sample.controls,
+            };
+            try caption.renderRowCells(sink, placement.columns);
+        },
         .title => |text| {
             try attribute.emphasize(sink, .text, false);
             try sink.text(text);
@@ -357,6 +372,10 @@ fn renderFramed(sink: *terminal.View.Sink, comptime framed: Framed) !void {
 
 fn collectRoles(comptime item: Item, names: *std.EnumSet(role.Name)) void {
     switch (item) {
+        .caption => {
+            names.insert(.accent);
+            names.insert(.muted);
+        },
         .sample => |sample| names.insert(sample.name),
         .box_fill => |name| names.insert(name),
         .box_text => |box| names.insert(box.name),
@@ -485,6 +504,8 @@ test "the preview shows the palette, the styles, the boxes, the roles, and the f
     try std.testing.expect(std.mem.indexOf(u8, painted, "↑ Hidden: 3") != null);
     const segment = comptime role.sequence(.activity) ++ "╼━━━━╾";
     try std.testing.expect(std.mem.indexOf(u8, painted, segment) != null);
+    const caption = comptime role.sequence(.accent) ++ "Model: Anthropic Subscription";
+    try std.testing.expect(std.mem.indexOf(u8, painted, caption) != null);
     try std.testing.expect(std.mem.indexOf(u8, painted, "(Current)") != null);
 }
 

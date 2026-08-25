@@ -18,7 +18,7 @@ pub fn run(context: *Context) !Context.Outcome {
         try options.print("{s}{s}", .{ account.label(), marker(context, account) });
     return .{ .pick = .{
         .select = select,
-        .title = "Select an account to sign in",
+        .title = "Sign in",
         .cancellation_message = "You canceled the sign-in selection.",
         .options = try options.toOwnedSlice(),
         .current = null,
@@ -75,6 +75,7 @@ test "the picker lists every account, marking the active and authenticated ones"
                 for (pick.options) |option| gpa.free(option);
                 gpa.free(pick.options);
             }
+            try std.testing.expectEqualStrings("Sign in", pick.title);
             try std.testing.expectEqual(@as(usize, 5), pick.options.len);
             try std.testing.expectEqualStrings(
                 "Anthropic Subscription (Signed in)",

@@ -23,10 +23,17 @@ const Session = @This();
 const truncated_event =
     "The response is incomplete. The model reached an output or context limit.";
 
-/// The row above the editor while a retry waits. It names the two keys that own
-/// the retry. Enter is not one of them: it sends the editor text as a message of
-/// its own, and that turn drops the retry.
-const retry_hint = "Ctrl+N: Try again · Esc: Dismiss";
+/// The semantic title above the editor while a retry waits.
+const retry_title = "Failed turn";
+/// The controls of a waiting retry. Enter sends the editor text as a separate
+/// message, and that turn drops the retry.
+const retry_controls = "Ctrl+N: Try again · Esc: Dismiss";
+/// The control that returns pending steering to the editor.
+const steering_controls = "Ctrl+P: Edit all";
+/// The row bound of a caption above the editor: the title row and the control
+/// rows that fit. The bound keeps the chrome from crowding the input out of a
+/// narrow window. A control segment past the bound drops whole.
+const editor_caption_rows_max: usize = 3;
 
 /// One tool call the model is still streaming. The row counts the argument bytes
 /// that arrived instead of showing them, because the arguments are JSON until
@@ -156,26 +163,22 @@ branch_length: usize,
 /// a suffix of this list. Consumed drafts remain owned until the terminal
 /// receipt either drops or restores them.
 steering: std.ArrayList(ui.Editor.Draft),
-/// Leading drafts hidden from the compact queue view because the worker has
-/// taken them. A taken draft is consumed into the running turn, or in flight
-/// after a Ctrl+P take that did not return it. Consumption never destroys
-/// their rich drafts, so a rolled-back batch remains recoverable. The terminal
-/// receipt resolves them. Always at most `steering.items.len`.
+/// Leading drafts hidden from the steering count because the worker has taken
+/// them. A taken draft is consumed into the running turn, or in flight after a
+/// Ctrl+P take that did not return it. Consumption preserves the rich drafts,
+/// so a rolled-back batch remains recoverable. The terminal receipt resolves
+/// them. Always at most `steering.items.len`.
 steering_retained_count: usize,
 /// Leading drafts the worker has reported as consumed (≤ `steering_retained_count`
 /// and the source of it on consumption). The count is cumulative, so a delayed
 /// consumed event does not double-count drafts a Ctrl+P already hid.
 steering_consumed_count: usize,
-/// Borrowed compact `Queued message:` rows: each non-retained draft's collapsed
-/// visible text. Each paint rebuilds them, so the tail gets a
-/// `[]const []const u8` without a per-repaint allocation.
-steering_view: std.ArrayList([]const u8),
 /// The submitted prompt's rich draft, retained while a turn is live. A failed
 /// or canceled turn that committed nothing returns it to the editor. Every
 /// other terminal frees it because the prompt belongs to committed history.
 turn_origin: ?TurnOrigin,
 /// Whether a retry context waits at the prompt. `App` owns that context and
-/// mirrors this bit, so the hint row above the editor names its controls.
+/// mirrors this bit, so the editor caption names its state and controls.
 retry_shown: bool,
 /// Milliseconds on the monotonic clock, written by the driver before each paint.
 /// The session does no io, so it cannot read a clock of its own. It stays zero
@@ -536,7 +539,6 @@ pub fn init(
         .steering = .empty,
         .steering_retained_count = 0,
         .steering_consumed_count = 0,
-        .steering_view = .empty,
         .turn_origin = null,
         .retry_shown = false,
         .clock_ms = 0,
@@ -555,7 +557,6 @@ pub fn deinit(self: *Session) void {
     self.clearNotice();
     self.clearSteering();
     self.steering.deinit(self.gpa);
-    self.steering_view.deinit(self.gpa);
     self.transcript.deinit();
     self.page_view.deinit();
     self.view.deinit();
@@ -1234,15 +1235,10 @@ pub fn clearSteering(self: *Session) void {
     self.dirty = true;
 }
 
-/// Borrowed compact `Queued message:` rows: each non-retained draft's collapsed
-/// visible text. Each paint rebuilds them without a per-frame allocation.
-/// Borrows stay valid only until the mirror next mutates.
-fn steeringView(self: *Session) ![]const []const u8 {
+/// Steering drafts that remain pending and appear in the editor caption.
+fn steeringPendingCount(self: *const Session) usize {
     std.debug.assert(self.steering_retained_count <= self.steering.items.len);
-    self.steering_view.clearRetainingCapacity();
-    for (self.steering.items[self.steering_retained_count..]) |draft|
-        try self.steering_view.append(self.gpa, draft.visible.items);
-    return self.steering_view.items;
+    return self.steering.items.len - self.steering_retained_count;
 }
 
 /// Close any open model run, then enter turn mode with fresh separator activity
@@ -1467,20 +1463,36 @@ pub fn paint(self: *Session, size: terminal.View.Size) !void {
         } else null,
     };
 
+    // The caption borrows this buffer through `layout.project` below. Its 64
+    // bytes hold the 17-byte label and every decimal `usize` value.
+    var steering_title_buffer: [64]u8 = undefined;
     const tail: layout.Tail = switch (self.mode) {
         .prompt => prompt: {
             self.editor.reflow(size);
             break :prompt .{ .prompt = .{
-                .hint = if (self.retry_shown) retry_hint else null,
+                .caption = if (self.retry_shown) .{
+                    .title = retry_title,
+                    .controls = retry_controls,
+                    .rows_max = editor_caption_rows_max,
+                } else null,
                 .editor = &self.editor,
             } };
         },
         .turn => |*turn| turn: {
             self.editor.reflow(size);
+            const steering_count = self.steeringPendingCount();
             break :turn .{ .turn = .{
                 .tools = try turn.boxes(self.gpa, self.clock_ms),
                 .activity = turn.activity(),
-                .steering = try self.steeringView(),
+                .caption = if (steering_count > 0) .{
+                    .title = std.fmt.bufPrint(
+                        &steering_title_buffer,
+                        "Queued messages: {d}",
+                        .{steering_count},
+                    ) catch unreachable,
+                    .controls = steering_controls,
+                    .rows_max = editor_caption_rows_max,
+                } else null,
                 .editor = &self.editor,
             } };
         },
@@ -2680,9 +2692,9 @@ test "committing a steering draft empties the source" {
     try std.testing.expectEqualStrings("move me", session.steering.items[0].visible.items);
 }
 
-// Queued steering shows in the tail. A consumed event moves the combined text
-// into the transcript as one user block and drops the queued rows.
-test "steering queues, then a consumed event shows it and clears the queue" {
+// Queued steering contributes to the caption count. A consumed event moves the
+// combined text into one user block and removes it from that count.
+test "steering counts, then a consumed event shows it and clears the count" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
@@ -2699,8 +2711,8 @@ test "steering queues, then a consumed event shows it and clears the queue" {
         .text = try gpa.dupe(u8, "fix it\n\nand test"),
         .count = 2,
     } });
-    // The combined batch shows as one user block. Its compact rows drop from
-    // the view. The session retains the rich drafts (hidden), so a rolled-back
+    // The combined batch shows as one user block. Its drafts drop from the
+    // caption count. The session retains the rich drafts, so a rolled-back
     // batch stays recoverable until the receipt resolves it.
     try std.testing.expectEqual(@as(usize, 1), session.transcript.blocks().len);
     try std.testing.expectEqualStrings(
@@ -2709,7 +2721,7 @@ test "steering queues, then a consumed event shows it and clears the queue" {
     );
     try std.testing.expectEqual(@as(usize, 2), session.steering.items.len);
     try std.testing.expectEqual(@as(usize, 2), session.steering_retained_count);
-    try std.testing.expectEqual(@as(usize, 0), (try session.steeringView()).len);
+    try std.testing.expectEqual(@as(usize, 0), session.steeringPendingCount());
 
     // A normal completion whose receipt committed the batch drops those drafts.
     try finishTurn(&session, 2);
@@ -2751,9 +2763,9 @@ test "cancelReceipt drops the committed prefix and restores the uncommitted suff
     try std.testing.expectEqualStrings("restore me", session.editor.visible());
 }
 
-// A steered large paste shows as its collapsed marker in the compact queue view,
-// never its payload. The payload rides along in the rich draft for recall.
-test "the steering view shows a paste collapsed, not its payload" {
+// A steered large paste contributes one to the caption without exposing its
+// marker or payload. The rich draft still carries both for recall.
+test "the steering caption counts a paste without showing its content" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
@@ -2769,7 +2781,8 @@ test "the steering view shows a paste collapsed, not its payload" {
 
     try session.paint(.{ .columns = 80, .rows = 24 });
     const painted = out.written();
-    try std.testing.expect(std.mem.indexOf(u8, painted, "[Paste #1: 16 lines]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "Queued messages: 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "[Paste #1: 16 lines]") == null);
     try std.testing.expect(std.mem.indexOf(u8, painted, "secret line") == null);
 }
 

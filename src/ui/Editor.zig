@@ -192,8 +192,8 @@ pub fn deinit(self: *Editor) void {
     self.capture.deinit(self.gpa);
 }
 
-/// The visible text — literal bytes plus marker labels — borrowed for rendering,
-/// display-length checks, and compact steering rows. Never a send boundary.
+/// The visible text — literal bytes plus marker labels — borrowed for rendering
+/// and display-length checks. Never a send boundary.
 pub fn visible(self: *const Editor) []const u8 {
     return self.draft.visible.items;
 }

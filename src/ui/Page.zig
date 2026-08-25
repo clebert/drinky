@@ -1,14 +1,15 @@
-//! A temporary full-window, read-only page: a muted key-hint header above a
-//! bounded body. The header wraps at its separators, so a narrow window keeps
-//! every key that the page offers. Pages own their source and can show rendered
-//! Markdown or the exact wrapped source. They preserve a source location across
-//! reflow. The colors presentation shows the generated color preview instead of
-//! a source.
+//! A temporary full-window, read-only page: a one-row semantic caption above a
+//! bounded body. The caption keeps an accent title and sheds whole muted
+//! control segments as the window narrows. Pages own their title and source,
+//! and can show rendered Markdown or the exact wrapped source. They preserve a
+//! source location across reflow. The colors presentation shows the generated
+//! color preview instead of a source.
 
 const std = @import("std");
 
 const terminal = @import("terminal");
 
+const Caption = @import("Caption.zig");
 const colors = @import("colors.zig");
 const markdown = @import("markdown.zig");
 const paint = @import("paint.zig");
@@ -17,20 +18,17 @@ const Page = @This();
 
 const hint = "↑/↓: Scroll · PgUp/PgDn: Page · Home/End: Jump";
 // Esc is the documented way out. Ctrl+C and Ctrl+D close the page too, but they
-// stay off the header: they are a fallback for a terminal that drops the Esc
+// stay off the caption. They are a fallback for a terminal that drops the Esc
 // report, not a second binding to learn.
-const header_markdown = "Esc: Close · M: Source · " ++ hint;
-const header_source = "Esc: Close · M: Render · " ++ hint;
-const header_colors = "Esc: Close · " ++ hint;
-
-/// How the header paints. It wraps at its separators, because a cut header can
-/// hide the key that closes the page. The window bounds its rows, so the header
-/// can never outgrow the page.
-const header_notice: paint.Notice = .{ .role = .muted };
+const controls_markdown = "Esc: Close · M: Source · " ++ hint;
+const controls_source = "Esc: Close · M: Render · " ++ hint;
+const controls_colors = "Esc: Close · " ++ hint;
 
 gpa: std.mem.Allocator,
+/// The semantic title in the fixed caption.
+title: []const u8,
 content: []const u8,
-/// First rendered body row visible below the fixed header.
+/// First rendered body row visible below the fixed caption.
 scroll: usize,
 /// Source location of the top body row, retained across a width or presentation
 /// change. Null after a scroll, which leaves the location unmapped: the map
@@ -49,17 +47,22 @@ layout_rows: usize,
 pub const Presentation = enum { markdown, source, colors };
 
 pub const Options = struct {
+    /// The semantic title in the fixed caption.
+    title: []const u8,
     /// The page's source. The colors presentation generates its body, so it
     /// takes an empty content.
     content: []const u8,
     presentation: Presentation = .markdown,
 };
 
-/// Copy the content into a page owned by `gpa`.
+/// Copy the title and content into a page owned by `gpa`.
 pub fn init(gpa: std.mem.Allocator, options: *const Options) !Page {
+    const title = try gpa.dupe(u8, options.title);
+    errdefer gpa.free(title);
     const content = try gpa.dupe(u8, options.content);
     return .{
         .gpa = gpa,
+        .title = title,
         .content = content,
         .scroll = 0,
         .source_offset = 0,
@@ -71,6 +74,7 @@ pub fn init(gpa: std.mem.Allocator, options: *const Options) !Page {
 }
 
 pub fn deinit(self: *Page) void {
+    self.gpa.free(self.title);
     self.gpa.free(self.content);
 }
 
@@ -142,61 +146,59 @@ pub fn toggleSource(self: *Page, size: terminal.View.Size) void {
     self.reflow(size);
 }
 
-/// Render the fixed header and the active presentation's bounded body window.
+/// Render the fixed caption row and the active presentation's bounded body
+/// window.
 pub fn render(
     self: *const Page,
     placement: *const paint.Placement,
     size: terminal.View.Size,
 ) !void {
-    try self.renderHeader(placement, size);
+    const caption_rows = try self.caption().render(placement);
     switch (self.presentation) {
-        .markdown => try self.renderMarkdown(placement, size),
-        .source => try self.renderSource(placement, size),
-        .colors => try self.renderColors(placement, size),
+        .markdown => try self.renderMarkdown(placement, size, caption_rows),
+        .source => try self.renderSource(placement, size, caption_rows),
+        .colors => try self.renderColors(placement, size, caption_rows),
     }
 }
 
-fn renderHeader(
-    self: *const Page,
-    placement: *const paint.Placement,
-    size: terminal.View.Size,
-) !void {
-    var look = header_notice;
-    look.rows_max = self.headerRows(size);
-    try paint.notice(placement, &look, self.header());
-}
-
 /// The key hints of the active presentation.
-fn header(self: *const Page) []const u8 {
+fn controls(self: *const Page) []const u8 {
     return switch (self.presentation) {
-        .markdown => header_markdown,
-        .source => header_source,
-        .colors => header_colors,
+        .markdown => controls_markdown,
+        .source => controls_source,
+        .colors => controls_colors,
     };
 }
 
-/// Physical rows the header occupies at `size`. The window bounds the count, so
-/// a header wider than a short window takes the whole page and leaves no body.
-fn headerRows(self: *const Page, size: terminal.View.Size) usize {
-    const rows_max = @max(size.rows, 1);
-    return @min(
-        paint.noticeRows(&header_notice, self.header(), @max(size.columns, 1)),
-        rows_max,
-    );
+/// The fixed title and controls at the head of this page. The caption keeps
+/// one row at every width: it sheds whole control segments from the tail, and
+/// only the title of a very narrow window cuts with one `…`.
+fn caption(self: *const Page) Caption {
+    return .{
+        .title = self.title,
+        .controls = self.controls(),
+        .rows_max = 1,
+    };
+}
+
+/// Physical rows the caption occupies: always one.
+fn captionRows(self: *const Page, size: terminal.View.Size) usize {
+    return self.caption().rows(@max(size.columns, 1));
 }
 
 fn renderMarkdown(
     self: *const Page,
     placement: *const paint.Placement,
     size: terminal.View.Size,
+    caption_rows: usize,
 ) !void {
-    const body_base = placement.base + self.headerRows(size);
+    const body_base = placement.base + caption_rows;
     // The derived placement copies its parent. Only the geometry changes.
     var body_placement = placement.*;
     body_placement.base = body_base;
     body_placement.skip = body_base + self.scroll;
     try markdown.renderWindow(&body_placement, self.content, &.{
-        .rows_max = self.bodyRows(size),
+        .rows_max = @max(size.rows, 1) - caption_rows,
     });
 }
 
@@ -204,22 +206,23 @@ fn renderColors(
     self: *const Page,
     placement: *const paint.Placement,
     size: terminal.View.Size,
+    caption_rows: usize,
 ) !void {
-    const body_base = placement.base + self.headerRows(size);
+    const body_base = placement.base + caption_rows;
     // The derived placement copies its parent. Only the geometry changes.
     var body_placement = placement.*;
     body_placement.base = body_base;
     body_placement.skip = body_base + self.scroll;
-    try colors.renderWindow(&body_placement, self.bodyRows(size));
+    try colors.renderWindow(&body_placement, @max(size.rows, 1) - caption_rows);
 }
 
 fn renderSource(
     self: *const Page,
     placement: *const paint.Placement,
     size: terminal.View.Size,
+    caption_rows: usize,
 ) !void {
-    const visible_rows = self.bodyRows(size);
-    const header_rows = self.headerRows(size);
+    const visible_rows = @max(size.rows, 1) - caption_rows;
     const columns_max = @max(size.columns, 1);
     var iterator = terminal.width.wrapper(self.content, columns_max);
     var source_index: usize = 0;
@@ -231,7 +234,7 @@ fn renderSource(
         // The anchor names the source row, as the markdown body names its own
         // row. One row then keeps one anchor across a scroll, and the clip reads
         // the same line that the anchor states.
-        const line = placement.base + header_rows + source_index;
+        const line = placement.base + caption_rows + source_index;
         if (line < placement.skip) continue;
         placement.sink.begin();
         try placement.sink.text(row);
@@ -239,9 +242,9 @@ fn renderSource(
     }
 }
 
-/// Body rows the window leaves below the header.
+/// Body rows the window leaves below the caption.
 fn bodyRows(self: *const Page, size: terminal.View.Size) usize {
-    return @max(size.rows, 1) - self.headerRows(size);
+    return @max(size.rows, 1) - self.captionRows(size);
 }
 
 /// Body rows the content occupies in the laid-out width and presentation.
@@ -339,6 +342,7 @@ fn renderForTest(page: *const Page, size: terminal.View.Size) ![]u8 {
 test "source navigation scrolls by wrapped body rows and clamps at both ends" {
     const gpa = std.testing.allocator;
     var page = try Page.init(gpa, &.{
+        .title = "Test page",
         .content = "L0\nL1\nL2\nL3",
         .presentation = .source,
     });
@@ -368,6 +372,7 @@ test "source navigation scrolls by wrapped body rows and clamps at both ends" {
 test "source reflow preserves the byte location across width changes" {
     const gpa = std.testing.allocator;
     var page = try Page.init(gpa, &.{
+        .title = "Test page",
         .content = "abcdefghij\nlast",
         .presentation = .source,
     });
@@ -390,6 +395,7 @@ test "source reflow preserves the byte location across width changes" {
 test "markdown is default and source toggles around the same logical line" {
     const gpa = std.testing.allocator;
     var page = try Page.init(gpa, &.{
+        .title = "Test page",
         .content = "# Heading\n\n- item with **bold** text\nplain 1\nplain 2\nplain 3\nplain 4",
     });
     defer page.deinit();
@@ -428,6 +434,7 @@ test "markdown is default and source toggles around the same logical line" {
 test "source rendering is bounded and sanitizes terminal controls" {
     const gpa = std.testing.allocator;
     var page = try Page.init(gpa, &.{
+        .title = "Test page",
         .content = "first\nsecond\x1b[2J\nthird",
         .presentation = .source,
     });
@@ -447,7 +454,7 @@ test "source rendering is bounded and sanitizes terminal controls" {
 
 test "a colors page scrolls the preview and ignores the source toggle" {
     const gpa = std.testing.allocator;
-    var page = try Page.init(gpa, &.{ .content = "", .presentation = .colors });
+    var page = try Page.init(gpa, &.{ .title = "Test page", .content = "", .presentation = .colors });
     defer page.deinit();
     const size: terminal.View.Size = .{ .columns = 80, .rows = 12 };
     page.reflow(size);
@@ -468,18 +475,20 @@ test "a colors page scrolls the preview and ignores the source toggle" {
     try std.testing.expect(std.mem.indexOf(u8, bottom, "(Current)") != null);
     try std.testing.expect(std.mem.indexOf(u8, bottom, "ANSI slots") == null);
 
-    // A narrow reflow keeps the exact row, because the row count is constant.
+    // A narrow reflow keeps the exact row, because the caption keeps one row
+    // at every width and the preview row count is constant.
     const scroll = page.scroll;
     const narrow_size: terminal.View.Size = .{ .columns = 24, .rows = 12 };
     page.reflow(narrow_size);
     try std.testing.expectEqual(scroll, page.scroll);
-    // The narrow header wraps, and it keeps every key that the page offers. Its
-    // rows come off the body, so the body shows fewer preview rows.
+    // The narrow caption sheds whole control segments from the tail and keeps
+    // the close key, so the body loses no preview row to the caption.
     const narrow = try renderForTest(&page, narrow_size);
     defer gpa.free(narrow);
-    try std.testing.expectEqual(@as(usize, 3), page.headerRows(narrow_size));
-    for ([_][]const u8{ "Esc: Close", "PgUp/PgDn: Page", "Home/End: Jump" }) |part|
-        try std.testing.expect(std.mem.indexOf(u8, narrow, part) != null);
+    try std.testing.expectEqual(@as(usize, 1), page.captionRows(narrow_size));
+    try std.testing.expect(std.mem.indexOf(u8, narrow, "Esc: Close") != null);
+    try std.testing.expect(std.mem.indexOf(u8, narrow, "PgUp/PgDn: Page") == null);
+    try std.testing.expect(std.mem.indexOf(u8, narrow, "Home/End: Jump") == null);
 
     // The end of the narrow page shows the last preview rows again, and the
     // narrow window clips the tail label of the selected row.
@@ -490,14 +499,19 @@ test "a colors page scrolls the preview and ignores the source toggle" {
     try std.testing.expect(std.mem.indexOf(u8, tail, "(Current)") == null);
 }
 
-test "a one-row page renders only its header" {
+// A one-row window holds the caption alone: the title, the close key, and the
+// whole segments that fit. A dropped segment leaves no mark.
+test "a one-row page renders only its caption" {
     const gpa = std.testing.allocator;
-    var page = try Page.init(gpa, &.{ .content = "# Hidden" });
+    var page = try Page.init(gpa, &.{ .title = "Test page", .content = "# Hidden" });
     defer page.deinit();
     const painted = try renderForTest(&page, .{ .columns = 80, .rows = 1 });
     defer gpa.free(painted);
 
+    try std.testing.expect(std.mem.indexOf(u8, painted, "Test page") != null);
     try std.testing.expect(std.mem.indexOf(u8, painted, "Esc: Close") != null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "Home/End: Jump") == null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, paint.ellipsis) == null);
     try std.testing.expect(std.mem.indexOf(u8, painted, "Hidden") == null);
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, painted, "\r\n"));
 }

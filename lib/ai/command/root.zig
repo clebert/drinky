@@ -175,7 +175,7 @@ fn runHelp(context: *Context) !Outcome {
     // returns to the list.
     return .{ .pick = .{
         .select = selectCommand,
-        .title = "Select a command",
+        .title = "Command",
         .cancellation_message = "You canceled the command selection.",
         .options = try options.toOwnedSlice(),
         .current = null,
@@ -536,7 +536,7 @@ test "a line without a name opens its list" {
                     for (pick.options) |option| gpa.free(option);
                     gpa.free(pick.options);
                 }
-                try std.testing.expectEqualStrings("Select a command", pick.title);
+                try std.testing.expectEqualStrings("Command", pick.title);
                 // The list builds itself again, so Esc in the picker that a row
                 // opens returns to the list.
                 try std.testing.expect(pick.reopen.? == &runHelp);

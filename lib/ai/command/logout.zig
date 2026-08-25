@@ -27,7 +27,7 @@ pub fn run(context: *Context) !Context.Outcome {
     for (accounts) |account| try options.print("{s}", .{account.label()});
     return .{ .pick = .{
         .select = select,
-        .title = "Select an account to sign out",
+        .title = "Sign out",
         .cancellation_message = "You canceled the sign-out selection.",
         .options = try options.toOwnedSlice(),
         .current = null,
@@ -71,6 +71,7 @@ test "the picker lists only signed-in accounts, and none reports an error" {
                 for (pick.options) |option| gpa.free(option);
                 gpa.free(pick.options);
             }
+            try std.testing.expectEqualStrings("Sign out", pick.title);
             try std.testing.expectEqual(@as(usize, 1), pick.options.len);
             try std.testing.expectEqualStrings("OpenAI Subscription", pick.options[0]);
         },
