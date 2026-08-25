@@ -212,7 +212,9 @@ pub fn caretEnd(text: []const u8, span: Wrapper.Span, columns_max: usize) usize 
 }
 
 /// One word of `text` and the blanks behind it: `bytes` is what one row consumes,
-/// `columns` measures the word alone, and `blank_columns` the blanks.
+/// `columns` measures the word alone, and `blank_columns` the blanks. A word that
+/// outgrows the whole row reports exactly `columns_max + 1` columns, and `bytes`
+/// then covers only the scanned head of it (see `nextWord`).
 pub const Word = struct { bytes: usize, columns: usize, blank_columns: usize };
 
 /// The next word of `text` on a row `columns_max` columns wide. A word ends at
@@ -226,6 +228,13 @@ pub const Word = struct { bytes: usize, columns: usize, blank_columns: usize };
 ///
 /// A caller that composes a row from several styled pieces places one word at a
 /// time, so it breaks its rows where `Wrapper` breaks a plain one.
+///
+/// The scan stops once the word outgrows the whole row: such a word fits no
+/// room on the row, so its measures past `columns_max` decide nothing.
+/// `columns` saturates at `columns_max + 1` to state the stop, and `bytes`
+/// covers the scanned head alone and no blanks, which every caller treats as
+/// a break inside the word and never advances by. The stop keeps a long
+/// unbroken word linear: each row it wraps onto scans one row of it.
 pub fn nextWord(text: []const u8, columns_max: usize) Word {
     var result: Word = .{ .bytes = 0, .columns = 0, .blank_columns = 0 };
     while (result.bytes < text.len) {
@@ -233,6 +242,11 @@ pub fn nextWord(text: []const u8, columns_max: usize) Word {
         if (unit.kind == .line_break or blankUnit(text[result.bytes..], &unit)) break;
         result.columns += fittedColumns(&unit, columns_max);
         result.bytes += unit.bytes;
+        if (result.columns > columns_max) {
+            // No overflow: the branch implies `columns_max` is below `columns`.
+            result.columns = columns_max + 1;
+            return result;
+        }
     }
     while (result.bytes < text.len) {
         const unit = displayUnit(text[result.bytes..]);
@@ -600,6 +614,15 @@ test nextWord {
     // A zero-column row fits nothing, so every measure is zero.
     const none: Word = .{ .bytes = 4, .columns = 0, .blank_columns = 0 };
     try std.testing.expectEqual(none, nextWord("word", 0));
+    // The scan stops once the word outgrows the whole row, so a long unbroken
+    // word costs each row only the row, not its own length. `bytes` covers the
+    // scanned head alone, which no caller advances by.
+    const stopped: Word = .{ .bytes = 4, .columns = 4, .blank_columns = 0 };
+    try std.testing.expectEqual(stopped, nextWord("abcdef gh", 3));
+    // The columns of a stopped word saturate at one past the row, so a wide
+    // cluster cannot leak a larger measure through the stop.
+    const saturated: Word = .{ .bytes = 6, .columns = 3, .blank_columns = 0 };
+    try std.testing.expectEqual(saturated, nextWord("你你x", 2));
 }
 
 test rows {

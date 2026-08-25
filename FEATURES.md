@@ -210,8 +210,8 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
   the intro line. A control segment past the bound drops whole and leaves no mark. A one-row caption
   keeps the title and the longest prefix of whole segments, so the title survives longest.
 - An element whose height must stay stable keeps one row and marks its cut with one `…`: a tool box,
-  a picker option, a table cell, a code row, and the footer notice. The status line shortens its
-  fields and then drops them instead.
+  a picker option, a code row, and the footer notice. The status line shortens its fields and then
+  drops them instead.
 - A page asks the terminal to send an arrow key for a wheel notch. A trackpad then scrolls the page,
   and a drag still selects text.
 - Apple Terminal has no such mode. A page there takes mouse reports and the legacy alternate screen.
@@ -241,8 +241,9 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - A link becomes a clickable terminal hyperlink when a click can open its target, and a bare URL
   links to itself. Any other target, such as a relative path, shows its URL as text.
 - A pipe table draws as a box grid that fits the window and keeps the indentation of its source. The
-  alignment colons parse but do not align. A long cell cuts to its column and marks the cut. A table
-  stays plain text when the window is narrower than its smallest grid.
+  alignment colons parse but do not align. A long cell wraps inside its column and grows the grid
+  row. A run of clusters wider than the column drops behind one `…`. A table stays plain text when
+  the window is narrower than its smallest grid.
 - A tool box that states measures wraps no line. Each line takes one row and marks a cut with one
   `…`, so the rows a call occupies follow its state and never the length of its arguments. A box
   that holds the sentence of a failure wraps instead.

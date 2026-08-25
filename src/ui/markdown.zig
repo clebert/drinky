@@ -275,35 +275,133 @@ const Table = struct {
         }
     };
 
-    /// Truncates one cell's styled spans to the room its column gives. Once a
-    /// span overflows, the cell is full: a later span must not slip into the
-    /// gap a dropped cluster leaves. The room the content does not take stays
-    /// for the pad, so every row of the grid draws to one width. A cell cuts
-    /// rather than wraps, because a wrapped cell needs a grid row as tall as its
-    /// tallest cell. `cellRow` reserves the column of the mark up front, because
-    /// a span cannot take a column back once it painted it.
-    fn Writer(comptime Emitter: type) type {
+    /// One cell's wrap across the lines of its grid row, at the word-break
+    /// policy of `Flow`. The inline scan and the span it left half-consumed
+    /// carry from line to line, so each line consumes its own words alone and
+    /// a long cell costs linear time. Every emitter runs the same code, so
+    /// all of them break in the same places.
+    fn CellFlow(comptime Emitter: type) type {
         return struct {
             emitter: *Emitter,
-            room: usize,
-            full: bool = false,
+            scanner: InlineScanner,
+            width: usize,
+            /// The tail of the open span that the last line left unconsumed.
+            rest: []const u8 = "",
+            look: Look = .{},
+            used: usize = 0,
+            /// Display columns the open line streamed. The pad of the cell
+            /// fills the rest of the column, so the grid stays one width.
+            painted: usize = 0,
+            /// Blank columns the open line owes (see `Flow.pending`).
+            pending: usize = 0,
+            pending_look: Look = .{},
+            done: bool = false,
 
-            fn write(self: *@This(), look: Look, bytes: []const u8) !void {
-                if (self.full) return;
-                const shown = terminal.width.truncate(bytes, self.room);
-                const columns = terminal.width.ofText(shown);
-                // Saturating: a cluster wider than the room survives
-                // `truncate` as a one-column replacement. A cell cannot wrap,
-                // so the cluster drops whole and the pad takes its columns.
-                if (columns > self.room) {
-                    self.full = true;
-                    return;
+            /// Paint the next line of the cell: as many whole words as the
+            /// column holds. The line ends where a word runs past the column,
+            /// and `done` rises once the cell has no content left.
+            fn paintLine(self: *@This()) !void {
+                self.used = 0;
+                self.painted = 0;
+                self.pending = 0;
+                // Bounded: every pass consumes bytes of the open span, pulls
+                // the bounded scan forward, or ends the line.
+                while (!self.done) {
+                    if (self.rest.len == 0) {
+                        const span = self.scanner.next() orelse {
+                            self.done = true;
+                            return;
+                        };
+                        self.rest = span.bytes;
+                        self.look = span.look;
+                        continue;
+                    }
+                    const room = self.width -| self.used;
+                    const run = self.wordRun(self.rest);
+                    // The next line takes the word whole, as the plain wrap
+                    // does. A run of zero never opens on a blank, so no line
+                    // of a cell opens on one either.
+                    if (run == 0 and self.used > 0) return;
+                    // A word too long for a line of its own breaks inside
+                    // itself. A run of blanks against a full line truncates
+                    // to nothing, which places nothing and still consumes it.
+                    const cut = if (run > 0) self.rest[0..run] else self.rest;
+                    const shown = terminal.width.truncate(cut, room);
+                    std.debug.assert(run > 0 or shown.len > 0);
+                    if (terminal.width.ofText(shown) > room) {
+                        // A cluster wider than the room survives `truncate` as
+                        // its one-column replacement. The cell cannot show a
+                        // cluster wider than its whole column: it drops whole,
+                        // and one `…` states the drop in its place.
+                        if (self.used > 0) return;
+                        try self.place(paint.ellipsis);
+                        self.rest = self.rest[terminal.width.boundaryAfter(self.rest, 0)..];
+                        // One mark covers the whole run: every following
+                        // cluster that also outgrows the column drops behind
+                        // the same mark, so the grid grows by one line per
+                        // run, never by one line per glyph.
+                        while (self.rest.len > 0) {
+                            const cluster = terminal.width.boundaryAfter(self.rest, 0);
+                            if (terminal.width.ofText(self.rest[0..cluster]) <= self.width) break;
+                            self.rest = self.rest[cluster..];
+                        }
+                        continue;
+                    }
+                    try self.place(shown);
+                    self.rest = self.rest[if (run > 0) run else shown.len..];
                 }
-                if (shown.len > 0) {
-                    try self.emitter.span(look, shown);
-                    self.room -= columns;
+            }
+
+            /// Draw `shown` on the open line and charge every column it takes.
+            /// The blanks it ends on wait as pending, the way `Flow.place`
+            /// holds them, so no line of a cell ends on a painted blank.
+            fn place(self: *@This(), shown: []const u8) !void {
+                const body = terminal.width.rowText(shown);
+                if (body.len > 0) {
+                    try self.paintPending();
+                    try self.stream(self.look, body);
                 }
-                if (shown.len < bytes.len) self.full = true;
+                const trailing = terminal.width.ofText(shown[body.len..]);
+                if (trailing > 0) {
+                    self.pending += trailing;
+                    self.pending_look = self.look;
+                }
+                self.used += terminal.width.ofText(body) + trailing;
+            }
+
+            /// Paint the blanks the line owes, ahead of the content that pays
+            /// them.
+            fn paintPending(self: *@This()) !void {
+                var left = self.pending;
+                self.pending = 0;
+                while (left > 0) {
+                    const chunk = @min(left, blanks.len);
+                    try self.stream(self.pending_look, blank(chunk));
+                    left -= chunk;
+                }
+            }
+
+            /// Emit `bytes` on the open line and measure it, so the pad fills
+            /// exactly the columns the line does not take.
+            fn stream(self: *@This(), look: Look, bytes: []const u8) !void {
+                self.painted += terminal.width.ofText(bytes);
+                try self.emitter.span(look, bytes);
+            }
+
+            /// Bytes of `text` the open line takes: as many whole words as the
+            /// room left on it holds (see `Flow.wordRun`).
+            fn wordRun(self: *const @This(), text: []const u8) usize {
+                const room = self.width -| self.used;
+                var bytes: usize = 0;
+                var columns: usize = 0;
+                while (bytes < text.len) {
+                    const word = terminal.width.nextWord(text[bytes..], self.width);
+                    std.debug.assert(word.bytes > 0);
+                    if (columns + word.columns > room) break;
+                    bytes += word.bytes;
+                    columns = @min(columns + word.columns + word.blank_columns, room);
+                }
+                return bytes;
             }
         };
     }
@@ -450,11 +548,12 @@ const Table = struct {
         emitter.end();
     }
 
-    /// One content row: every cell under `look`, cut to its column and padded out
-    /// to it, between pipe borders. A cell whose content outgrows its column
-    /// keeps one column of that column for the mark of the cut. The measure
-    /// decides that before the spans stream, so the mark shows however the spans
-    /// of the cell fall.
+    /// One grid row: every cell under `look` wraps inside its column, and the
+    /// row grows as tall as its tallest cell. Each line pads out to the column
+    /// between pipe borders. Every cell carries its wrap state across the
+    /// lines, so no line replays content an earlier line consumed and a long
+    /// cell costs linear time. No allocation buffers a wrapped cell, and every
+    /// emitter runs the same code, so the count and the paint cannot diverge.
     fn cellRow(
         self: *const Table,
         comptime Emitter: type,
@@ -462,31 +561,38 @@ const Table = struct {
         row: []const u8,
         look: Look,
     ) !void {
-        emitter.begin();
-        try emitter.span(.{}, self.indent);
+        var flows: [count_max]CellFlow(Emitter) = undefined;
         var cells = Cells.init(row);
-        for (self.widths[0..self.count]) |width| {
-            try emitter.span(muted_look, "│");
-            try emitter.span(.{}, " ");
-            const cell = cells.next() orelse "";
-            var measure: Measure = .{};
-            try inlines(Measure, &measure, look, cell);
-            const marked = measure.columns > width;
-            var writer: Writer(Emitter) = .{
+        for (flows[0..self.count], self.widths[0..self.count]) |*flow, width| {
+            flow.* = .{
                 .emitter = emitter,
-                .room = if (marked) width - 1 else width,
+                .scanner = InlineScanner.init(look, cells.next() orelse ""),
+                .width = width,
             };
-            try inlines(Writer(Emitter), &writer, look, cell);
-            if (marked) try emitter.span(look, paint.ellipsis);
-            var remaining = writer.room + 1;
-            while (remaining > 0) {
-                const chunk = @min(remaining, blanks.len);
-                try emitter.span(.{}, blank(chunk));
-                remaining -= chunk;
-            }
         }
-        try emitter.span(muted_look, "│");
-        emitter.end();
+        var more = true;
+        // Bounded: every line consumes words of at least one open cell, and
+        // the first line paints even when every cell is empty.
+        while (more) {
+            more = false;
+            emitter.begin();
+            try emitter.span(.{}, self.indent);
+            for (flows[0..self.count]) |*flow| {
+                try emitter.span(muted_look, "│");
+                try emitter.span(.{}, " ");
+                try flow.paintLine();
+                more = more or !flow.done;
+                std.debug.assert(flow.painted <= flow.width);
+                var remaining = flow.width -| flow.painted + 1;
+                while (remaining > 0) {
+                    const chunk = @min(remaining, blanks.len);
+                    try emitter.span(.{}, blank(chunk));
+                    remaining -= chunk;
+                }
+            }
+            try emitter.span(muted_look, "│");
+            emitter.end();
+        }
     }
 };
 
@@ -887,77 +993,129 @@ const Closer = struct {
 /// The two closers a `[label](url)` scan needs, memoized across one line.
 const Link = struct { label: Closer = .{ .byte = ']' }, url: Closer = .{ .byte = ')' } };
 
-/// Place `text`'s inline runs into `sink` under `base` and slice the markers
-/// away. A run that holds markers of its own opens a scope, so `**_both_**`
-/// sheds both pairs. A marker whose closer has not streamed in yet stays
-/// literal. The sink is a `Flow` for a wrapped block, or a `Table.Writer` for
-/// one table cell.
-fn inlines(comptime Sink: type, sink: *Sink, base: Look, text: []const u8) !void {
-    var stack: [nesting_max]Scope = undefined;
-    var depth: usize = 0;
-    var look = base;
-    var link: Link = .{};
-    var start: usize = 0;
-    var index: usize = 0;
-    // Bounded: every step raises `index`. A run opens after its own marker, a
-    // closed run resumes past its closer, and any other byte advances by one.
-    // The scan therefore reaches the end of `text` and stops there.
-    while (index < text.len or depth > 0) {
-        if (depth > 0 and index >= stack[depth - 1].end) {
-            const scope = stack[depth - 1];
+/// A resumable scan over `text`'s inline runs that slices the markers away.
+/// `next` yields one styled span at a time. A run that holds markers of its
+/// own opens a scope, so `**_both_**` sheds both pairs. A marker whose closer
+/// has not streamed in yet stays literal. `Table.CellFlow` pulls the spans one
+/// line at a time, so a wrapped cell resumes where its last line ended.
+const InlineScanner = struct {
+    text: []const u8,
+    base: Look,
+    look: Look,
+    stack: [nesting_max]Scope = undefined,
+    depth: usize = 0,
+    link: Link = .{},
+    start: usize = 0,
+    index: usize = 0,
+    done: bool = false,
+    /// Spans one step settles ahead of `next`: at most a closing run, the
+    /// content of a closed one, and the three parts of one URL trailer.
+    queue: [5]Span = undefined,
+    queue_len: usize = 0,
+    queue_head: usize = 0,
+
+    const Span = struct { look: Look, bytes: []const u8 };
+
+    fn init(base: Look, text: []const u8) InlineScanner {
+        return .{ .text = text, .base = base, .look = base };
+    }
+
+    /// The next non-empty span, or null once the scan consumed `text`.
+    fn next(self: *InlineScanner) ?Span {
+        // Bounded: every queued span pops once, and every `step` advances the
+        // bounded scan.
+        while (true) {
+            while (self.queue_head < self.queue_len) {
+                const span = self.queue[self.queue_head];
+                self.queue_head += 1;
+                if (span.bytes.len > 0) return span;
+            }
+            if (self.done) return null;
+            self.queue_head = 0;
+            self.queue_len = 0;
+            self.step();
+        }
+    }
+
+    /// One step of the scan, which queues the spans it settles. Every step
+    /// raises `index`, closes one scope, or finishes: a run opens after its
+    /// own marker, a closed run resumes past its closer, and any other byte
+    /// advances by one. The scan therefore reaches the end of `text` and
+    /// stops there.
+    fn step(self: *InlineScanner) void {
+        const text = self.text;
+        if (self.index >= text.len and self.depth == 0) {
+            self.enqueue(self.look, text[self.start..]);
+            self.done = true;
+            return;
+        }
+        if (self.depth > 0 and self.index >= self.stack[self.depth - 1].end) {
+            const scope = self.stack[self.depth - 1];
             // A closer is never stepped over: no doubled marker can straddle
             // one, so the scan lands on it exactly.
-            std.debug.assert(index == scope.end);
-            try sink.write(look, text[start..index]);
-            depth -= 1;
-            look = if (depth > 0) stack[depth - 1].look else base;
-            try trailer(Sink, sink, look, scope.url);
-            index = scope.after;
-            start = index;
-            continue;
+            std.debug.assert(self.index == scope.end);
+            self.enqueue(self.look, text[self.start..self.index]);
+            self.depth -= 1;
+            self.look = if (self.depth > 0) self.stack[self.depth - 1].look else self.base;
+            self.enqueueTrailer(scope.url);
+            self.index = scope.after;
+            self.start = self.index;
+            return;
         }
         // A run must close inside the run that holds it. One that reaches past
         // it interleaves rather than nests, so its marker stays literal.
-        const limit = if (depth > 0) stack[depth - 1].end else text.len;
-        if (runAt(text, index, &link)) |run| {
+        const limit = if (self.depth > 0) self.stack[self.depth - 1].end else text.len;
+        if (runAt(text, self.index, &self.link)) |run| {
             if (run.after <= limit) {
-                try sink.write(look, text[start..index]);
-                const inner = merged(look, run.look);
-                if (run.nests and depth < nesting_max) {
-                    stack[depth] = .{
+                self.enqueue(self.look, text[self.start..self.index]);
+                const inner = merged(self.look, run.look);
+                if (run.nests and self.depth < nesting_max) {
+                    self.stack[self.depth] = .{
                         .look = inner,
                         .end = run.end,
                         .after = run.after,
                         .url = run.url,
                     };
-                    depth += 1;
-                    look = inner;
-                    index = run.start;
+                    self.depth += 1;
+                    self.look = inner;
+                    self.index = run.start;
                 } else {
-                    try sink.write(inner, text[run.start..run.end]);
-                    try trailer(Sink, sink, look, run.url);
-                    index = run.after;
+                    self.enqueue(inner, text[run.start..run.end]);
+                    self.enqueueTrailer(run.url);
+                    self.index = run.after;
                 }
-                start = index;
-                continue;
+                self.start = self.index;
+                return;
             }
         }
         // A marker with no closer stays literal whole: a later byte of it must
         // not reopen as a shorter marker and split `**bold` into a stray
         // asterisk and an italic run mid-stream.
-        index += literal(text, index);
+        self.index += literal(text, self.index);
     }
-    try sink.write(look, text[start..]);
-}
 
-/// Place the URL a link shows as text, in the muted color of the context it
-/// closes into.
-fn trailer(comptime Sink: type, sink: *Sink, look: Look, url: []const u8) !void {
-    if (url.len == 0) return;
-    const shown = merged(look, muted_look);
-    try sink.write(shown, " (");
-    try sink.write(shown, url);
-    try sink.write(shown, ")");
+    fn enqueue(self: *InlineScanner, look: Look, bytes: []const u8) void {
+        self.queue[self.queue_len] = .{ .look = look, .bytes = bytes };
+        self.queue_len += 1;
+    }
+
+    /// Queue the URL a link shows as text, in the muted color of the context
+    /// it closes into.
+    fn enqueueTrailer(self: *InlineScanner, url: []const u8) void {
+        if (url.len == 0) return;
+        const shown = merged(self.look, muted_look);
+        self.enqueue(shown, " (");
+        self.enqueue(shown, url);
+        self.enqueue(shown, ")");
+    }
+};
+
+/// Place `text`'s inline runs into `sink` under `base`, one scanned span at a
+/// time (see `InlineScanner`). The sink is a `Flow` for a wrapped block, or a
+/// `Table.Measure` for one table cell.
+fn inlines(comptime Sink: type, sink: *Sink, base: Look, text: []const u8) !void {
+    var scanner = InlineScanner.init(base, text);
+    while (scanner.next()) |span| try sink.write(span.look, span.bytes);
 }
 
 /// The inline run that opens at `index`, or null when none does.
@@ -1290,7 +1448,7 @@ const tables =
 
 // Cells whose clusters take more than one column, indented under a list item.
 // A narrow window shrinks a column below one cluster, which is where a naive
-// truncation drops a column of the pad or counts more than it has.
+// wrap paints a column of the pad or counts more than it has.
 const wide_tables =
     \\- item
     \\  | 你 | b |
@@ -1589,9 +1747,10 @@ test "a table renders as a box grid with padded cells" {
 }
 
 // A cell wider than the window cannot widen the grid past it: the widest
-// column gives up cells until the grid fits, and its content cuts. One `…`
-// marks that cut, and it takes the last column of the cell.
-test "a table shrinks its widest column to fit the window" {
+// column gives up cells until the grid fits, and its content wraps inside the
+// column. The grid row grows as tall as its tallest cell, and the pad fills
+// the shorter cells beside it.
+test "a table wraps a long cell and grows its grid row" {
     const gpa = std.testing.allocator;
     const text =
         \\| a | b |
@@ -1602,14 +1761,16 @@ test "a table shrinks its widest column to fit the window" {
         "┌───────┬────────────────────┐",
         "│ a     │ b                  │",
         "├───────┼────────────────────┤",
-        "│ short │ this cell is much… │",
+        "│ short │ this cell is much  │",
+        "│       │ longer than the    │",
+        "│       │ window             │",
         "└───────┴────────────────────┘",
     });
 }
 
-// A wide cluster that straddles the column's edge drops whole. The mark of the
-// cut takes one column, and the pad keeps the grid aligned behind it.
-test "a wide glyph in a table cell truncates whole" {
+// A wide cluster that straddles the column's edge moves to the next line
+// whole, so no line of a cell paints a broken glyph and no content is lost.
+test "a wide glyph in a table cell wraps whole" {
     const gpa = std.testing.allocator;
     const text =
         \\| a | b |
@@ -1620,14 +1781,16 @@ test "a wide glyph in a table cell truncates whole" {
         "┌─────┬───┐",
         "│ a   │ b │",
         "├─────┼───┤",
-        "│ x…  │ y │",
+        "│ x你 │ y │",
+        "│ x   │   │",
         "└─────┴───┘",
     });
 }
 
-// A cluster that is wider than the whole column drops as well. `truncate`
+// A cluster wider than the whole column cannot show on any line. `truncate`
 // keeps such a cluster as a one-column replacement, which a cell must not
-// count as one column and must not draw. The mark then states the cut.
+// count as one column and must not draw. It drops whole, and one `…` states
+// the drop in its place.
 test "a cluster wider than its column drops from the cell" {
     const gpa = std.testing.allocator;
     const text =
@@ -1644,10 +1807,68 @@ test "a cluster wider than its column drops from the cell" {
     });
 }
 
+// A run of clusters wider than the whole column drops behind one mark: a
+// second mark would state nothing new, and the grid must not grow by one line
+// per glyph it cannot show. A cluster the column can show still wraps onto a
+// line of its own behind the run.
+test "one mark covers a whole run of dropped clusters" {
+    const gpa = std.testing.allocator;
+    const text = "| 你你你 | b |\n| - | - |\n| 你你a | d |";
+    try expectPlainRows(gpa, text, 9, &.{
+        "┌───┬───┐",
+        "│ … │ b │",
+        "├───┼───┤",
+        "│ … │ d │",
+        "│ a │   │",
+        "└───┴───┘",
+    });
+}
+
+// A styled span can fill the line exactly while the next span opens on a
+// blank. The blank consumes against the full line and paints nothing, so the
+// wrap advances to the word behind it instead of tripping on the blank.
+test "a blank behind a full cell line starts no line of its own" {
+    const gpa = std.testing.allocator;
+    const text = "| a | b |\n| - | - |\n| **a** b | c |";
+    try expectPlainRows(gpa, text, 9, &.{
+        "┌───┬───┐",
+        "│ a │ b │",
+        "├───┼───┤",
+        "│ a │ c │",
+        "│ b │   │",
+        "└───┴───┘",
+    });
+}
+
+// Adversarial: a wrapped cell once replayed its whole content for every line
+// it painted, so a long cell cost quadratic time on every frame. The scan
+// carries its state from line to line, and each line consumes its own words
+// alone. A replay turns this test from milliseconds to minutes.
+test "a huge table cell wraps in linear time" {
+    const gpa = std.testing.allocator;
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(gpa);
+    try text.appendSlice(gpa, "| a |\n| - |\n| ");
+    for (0..40_000) |_| try text.appendSlice(gpa, "word ");
+    try text.appendSlice(gpa, "|");
+    // Three words to a line in a column 16 cells wide, and the last word
+    // alone on the final line: 13334 lines between three border rows and one
+    // header row.
+    try std.testing.expectEqual(@as(usize, 13_338), rows(text.items, 20));
+
+    // One unbroken token: the word scan stops at the edge of the column, so a
+    // giant token also costs each line only the line, not its own length.
+    text.clearRetainingCapacity();
+    try text.appendSlice(gpa, "| a |\n| - |\n| ");
+    try text.appendNTimes(gpa, 'a', 100_000);
+    try text.appendSlice(gpa, " |");
+    try std.testing.expectEqual(@as(usize, 6_254), rows(text.items, 20));
+}
+
 // A cell can hold several styled spans, and one of them can fill the column
-// before the next arrives. The column reserves the cell of its mark up front, so
-// the mark shows whatever the spans do. A span cannot take a column back.
-test "a cell that cuts between two spans still marks its cut" {
+// before the next arrives. A word that spans two looks breaks at that seam,
+// the way `Flow` breaks a row, so the later span continues on the next line.
+test "a cell wraps at a look seam when the column fills" {
     const gpa = std.testing.allocator;
     const text =
         \\| a | b |
@@ -1658,7 +1879,8 @@ test "a cell that cuts between two spans still marks its cut" {
         "┌────┬───┐",
         "│ a  │ b │",
         "├────┼───┤",
-        "│ a… │ y │",
+        "│ ab │ y │",
+        "│ c  │   │",
         "└────┴───┘",
     });
 }
@@ -1688,18 +1910,25 @@ test "a narrow code row marks its cut" {
     try expectPlainRows(gpa, wide, 4, &.{ "```…", "…", "```" });
 }
 
-// Every row of one grid draws to the same width. A cell that cuts gives the
-// columns it does not fill, the mark of the cut included, back to the pad, so
-// the right border lines up.
+// Every row of one grid draws to the same width. A cell that wraps gives the
+// columns each of its lines does not fill back to the pad, so the right border
+// lines up on every line of the grid row.
 test "a table draws every grid row to one width" {
     const gpa = std.testing.allocator;
     try expectPlainRows(gpa, "| a你你 | bbbbbb |\n| - | - |\n| c | d |", 16, &.{
         "┌──────┬───────┐",
-        "│ a你… │ bbbb… │",
+        "│ a你  │ bbbbb │",
+        "│ 你   │ b     │",
         "├──────┼───────┤",
         "│ c    │ d     │",
         "└──────┴───────┘",
     });
+
+    // The look of the row replays on every line of it, so the second line of a
+    // wrapped header cell stays bold.
+    const wrapped = try painted(gpa, "| a你你 | bbbbbb |\n| - | - |\n| c | d |", 16, null, 0);
+    defer gpa.free(wrapped);
+    try std.testing.expect(std.mem.indexOf(u8, wrapped, "\x1b[1m你") != null);
 
     for ([_][]const u8{ tables, wide_tables, partial_tables }) |text| {
         for ([_]usize{ 72, 40, 24, 16, 13, 11, 10, 9 }) |columns| {
