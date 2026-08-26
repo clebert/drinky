@@ -59,14 +59,14 @@ Use ASD-STE100 Simplified Technical English for Markdown, code comments, and Dri
 - Keep the articles. Use `must` for requirements and `can` for capabilities.
 - Do not use `should`, `may`, `might`, or `would`.
 - Do not use semicolons or contractions. Prefer a finite verb to an `-ing` form.
-- Use a complete sentence for an event, result, or required action. Use sentence case and end
+- Use a complete sentence for an event, a result, or a required action. Use sentence case and end
   punctuation.
-- A label, metric, or control hint can be a fragment. Use clear casing and a colon between its key
-  and value.
+- A label, a metric, or a control hint can be a fragment. Use clear casing and a colon between its
+  key and its value.
 - Wrap a dynamic error name in a complete sentence:
   `Drinky could not open {path} because of error {name}.`
 
-The rules do not apply to literal technical identifiers or schemas. Preserve meaning and
+The rules do not apply to literal technical identifiers or schemas. Preserve the meaning and the
 terminal-width limits when you reword text.
 
 ## Checks

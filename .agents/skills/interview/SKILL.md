@@ -1,8 +1,8 @@
 ---
 name: interview
 description:
-  Interview the user one question at a time to shape a complex design, or to check an existing
-  document or feature against the intent of the user. Use it when the user asks for an interview.
+  Interview the user one question at a time. The interview shapes a complex design, or checks a
+  document or a feature against the intent of the user. Use it when the user asks for an interview.
   Offer it before a plan whose user experience, edge cases, or trade-offs belong to the user. Load
   it before the first question.
 ---
