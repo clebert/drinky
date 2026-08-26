@@ -169,6 +169,9 @@ frame_grid: FrameGrid,
 /// The process environment that the app cannot read for itself. `main` owns every
 /// lookup, so a test can run the app with no environment at all.
 pub const Options = struct {
+    /// Each bash command inherits this process environment. `Agent.init` demands one, so the
+    /// default here holds only for a test that runs no command.
+    environ: std.process.Environ = .empty,
     /// The provider keys that authenticate an account without a login.
     api_keys: ai.Accounts.ApiKeys = .{},
     /// The value of `TERM_PROGRAM`, which names the terminal, or null when it is unset.
@@ -781,6 +784,7 @@ pub fn run(
         .model = start_model,
         .system = self.prompt,
         .retry = config.retry,
+        .environ = options.environ,
         .effort = start_effort,
         .bash = config.bash,
         .document = self.document,
@@ -2384,6 +2388,7 @@ fn roleConversation(
             .model = choice.model,
             .system = system,
             .retry = self.agent.retry,
+            .environ = self.agent.environ,
             .effort = choice.effort,
             .bash = self.agent.bash,
             .document = self.agent.document,
@@ -2964,6 +2969,7 @@ fn applyOutcome(self: *App, outcome: ai.command.Outcome) !void {
                     .model = self.agent.model,
                     .system = self.agent.system,
                     .retry = self.agent.retry,
+                    .environ = self.agent.environ,
                     .effort = self.agent.effort,
                     .bash = self.agent.bash,
                     .document = self.agent.document,
@@ -3663,6 +3669,7 @@ test "a grant rejection refuses an account without a refresh credential" {
         .model = anthropic_default,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -3775,6 +3782,7 @@ test "turn producers keep their captured generation" {
         .model = anthropic_default,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
 
@@ -3906,6 +3914,7 @@ test "a late steering return restores a paste as a live placeholder atom" {
         .model = anthropic_default,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -3945,6 +3954,7 @@ test "ctrl+c during a turn clears the draft first and cancels only on an empty e
         .model = anthropic_default,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -3978,6 +3988,7 @@ test "esc and ctrl+d cancel a turn and keep the draft" {
         .model = anthropic_default,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -4019,6 +4030,7 @@ test "a key between two esc presses drops the turn-cancel confirmation" {
         .model = anthropic_default,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -4080,6 +4092,7 @@ test "canceling a turn joins and clears its active worker" {
         .model = anthropic_default,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -4140,6 +4153,7 @@ test "canceling a turn restores in-flight steering and reads the usage again" {
         .model = anthropic_default,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -4181,6 +4195,7 @@ test "cancel preflight failure leaves the turn and steering untouched" {
         .model = anthropic_default,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -4218,6 +4233,7 @@ test "cancel restores steering before event allocation failure" {
         .model = anthropic_default,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -4257,6 +4273,7 @@ test "ctrl+p recalls the steering queue after in-progress editor text" {
         .model = anthropic_default,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -4287,6 +4304,7 @@ test "ctrl+p restores a steered paste as a live placeholder atom" {
         .model = anthropic_default,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -4325,6 +4343,7 @@ test "cancel restores an in-flight steered paste as a live placeholder atom" {
         .model = anthropic_default,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -4376,6 +4395,7 @@ test "cancel restores a steered paste even after its consumed event applied" {
         .model = anthropic_default,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -4429,6 +4449,7 @@ test "ctrl+p recalls the pending suffix and retains the in-flight prefix" {
         .model = anthropic_default,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -4460,6 +4481,7 @@ test "cancel restores an in-flight prefix retained by ctrl+p" {
         .model = anthropic_default,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -4493,6 +4515,7 @@ test "a cancel that loses the race waits for the terminal fence" {
         .model = anthropic_default,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -4541,6 +4564,7 @@ test "cancel does not commit stale text across a reset held in the current batch
         .model = anthropic_default,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -4605,6 +4629,7 @@ test "cancel preserves progress before a queued terminal fence" {
         .model = anthropic_default,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -4666,6 +4691,7 @@ test "cancel replaces an interrupted terminal fence after queued progress" {
         .model = anthropic_default,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -4735,6 +4761,7 @@ test "an interrupted terminal fence retries after a full queue drain" {
         .model = anthropic_default,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -4795,6 +4822,7 @@ test "a cancel that loses the race applies the failed joined result" {
         .model = anthropic_default,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -4851,6 +4879,7 @@ test "a joined completion returns late steering to the editor" {
         .model = anthropic_default,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -4906,6 +4935,7 @@ test "shutdown frees the worker result without restoring or recording an event" 
         .model = anthropic_default,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -4938,6 +4968,7 @@ test "a delayed consumed event after ctrl+p cannot remove newer steering" {
         .model = anthropic_default,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -4989,6 +5020,7 @@ test "a delivery restored after ctrl+p recalls its retained rich drafts" {
         .model = anthropic_default,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -5034,6 +5066,7 @@ test "recall of literal-edge-trimmed steering rejoins without edge spaces" {
         .model = anthropic_default,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -5063,6 +5096,7 @@ test "mid-turn Enter queues a message but refuses a slash line or a blank line" 
         .model = anthropic_default,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -5152,6 +5186,7 @@ test "late placeholder steering returns before a newer key in the same batch" {
         .model = anthropic_default,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -5205,6 +5240,7 @@ test "a drained batch routes only the active turn generation" {
         .model = anthropic_default,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -5375,6 +5411,7 @@ test "a picker confirmation keeps the characters typed behind it" {
         .model = anthropic_default,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -5416,6 +5453,7 @@ test "a turn cancel drops the rest of an exit attempt in one chunk" {
         .model = anthropic_default,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -5478,6 +5516,7 @@ test "/new clears the conversation and the scrollback without a configuration ch
         .model = anthropic_default,
         .system = "test system",
         .retry = .{},
+        .environ = .empty,
         .effort = .high,
     });
     defer app.agent.deinit();
@@ -5546,6 +5585,7 @@ test "switchConversation swaps the agent and the interface together, and restore
         .model = anthropic_default,
         .system = "test system",
         .retry = .{},
+        .environ = .empty,
         .effort = .high,
     });
     defer app.agent.deinit();
@@ -5565,6 +5605,7 @@ test "switchConversation swaps the agent and the interface together, and restore
             .model = anthropic_default,
             .system = "test system",
             .retry = .{},
+            .environ = .empty,
             .effort = .high,
         }),
         .presentation = Session.Conversation.empty(gpa, null, &anthropic_default, .high),
@@ -5627,6 +5668,7 @@ test "switchConversation forgets a skill proof from the conversation it replaces
         .model = anthropic_default,
         .system = "test system",
         .retry = .{},
+        .environ = .empty,
         .effort = .high,
     });
     defer app.agent.deinit();
@@ -5648,6 +5690,7 @@ test "switchConversation forgets a skill proof from the conversation it replaces
             .model = anthropic_default,
             .system = "test system",
             .retry = .{},
+            .environ = .empty,
             .effort = .high,
         }),
         .presentation = Session.Conversation.empty(gpa, null, &anthropic_default, .high),
@@ -5675,6 +5718,7 @@ test "/system opens the composed prompt alone and escape restores the conversati
         .model = anthropic_default,
         .system = full_prompt,
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -5757,6 +5801,7 @@ test "/colors opens the color preview page and ctrl+d restores the conversation"
         .model = anthropic_default,
         .system = "unused",
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -5820,6 +5865,7 @@ test "an account-switch command clears the quota snapshot and records the projec
         .model = anthropic_default,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -5887,6 +5933,7 @@ test "an account switch projects the conversation for the new account" {
         .model = anthropic_default,
         .system = "",
         .retry = .{},
+        .environ = .empty,
         .effort = .high,
     });
     defer app.agent.deinit();
@@ -6034,6 +6081,7 @@ test "a switch back to an account restores the model that account ran" {
         .model = start_model,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, start_model, .none);
@@ -6120,6 +6168,7 @@ test "the logout of the last account signs out and opens the login picker" {
         .model = anthropic_default,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -6174,6 +6223,7 @@ test "a principal replacement drops old evidence before the restored turn" {
         .model = anthropic_default,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -6240,6 +6290,7 @@ test "token request failures keep the credential before a grant rejection remove
         .model = anthropic_default,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -6351,6 +6402,7 @@ test "a replacement saved before invalidation keeps the account active" {
         .model = discovered,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -6443,6 +6495,7 @@ test "a rejected refresh credential hands the session to another account" {
         .model = anthropic_default,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -6601,6 +6654,7 @@ test "a committed failure arms a retry that Esc dismisses" {
         .model = anthropic_default,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -6663,6 +6717,7 @@ test "an uncommitted human failure returns to the editor and arms no retry" {
         .model = anthropic_default,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -6709,6 +6764,7 @@ test "an uncommitted skill failure returns its line and arms no retry" {
         .model = anthropic_default,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -6768,6 +6824,7 @@ test "Ctrl+N sends the attempt and keeps the editor text" {
         .model = anthropic_default,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -6825,6 +6882,7 @@ test "a signed-out Ctrl+N names the sign-in and keeps the retry" {
         .model = anthropic_default,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -6862,6 +6920,7 @@ test "Enter sends a plain message and drops the waiting retry" {
         .model = anthropic_default,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -6920,6 +6979,7 @@ test "canceling an attempt ends the recovery" {
         .model = anthropic_default,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -6965,6 +7025,7 @@ test "a retry survives an account switch and Ctrl+N routes to it" {
         .model = anthropic_default,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -7026,6 +7087,7 @@ test "a skill line runs while a retry waits and takes the context with it" {
         .model = anthropic_default,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -7079,6 +7141,7 @@ test "/review needs a Git worktree and refuses a waiting retry or a second revie
         .model = anthropic_default,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -7122,6 +7185,7 @@ fn installReviewFlow(
             .model = anthropic_default,
             .system = "",
             .retry = .{},
+            .environ = .empty,
         }),
         .presentation = Session.Conversation.empty(gpa, null, &anthropic_default, .none),
     };
@@ -7188,6 +7252,7 @@ test "a settled judge report restores the main conversation and records completi
         .model = anthropic_default,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -7220,6 +7285,7 @@ test "editor text brakes the workflow and Esc stops it with the text preserved" 
         .model = anthropic_default,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -7288,6 +7354,7 @@ test "a fix decision starts the fixer, a failed request resends, and Esc stops" 
         .model = anthropic_default,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -7384,6 +7451,7 @@ test "/review opens the setup on the session configuration and Start checks acco
         .model = anthropic_default,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -7422,6 +7490,7 @@ test "a confirmed role choice persists and reopens the setup" {
         .model = anthropic_default,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -7466,6 +7535,7 @@ test "ctrl+s at a failure hold opens the menu of the failed role alone" {
         .model = anthropic_default,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -7525,6 +7595,7 @@ test "a role setup step leaves the project memory to the main conversation" {
         .model = role_model,
         .system = "",
         .retry = .{},
+        .environ = .empty,
         .effort = .max,
     });
     defer app.agent.deinit();
@@ -7604,6 +7675,7 @@ test "a credential disposition at a role turn holds the workflow and keeps the r
             .model = role_model,
             .system = "",
             .retry = .{},
+            .environ = .empty,
             .effort = .max,
         });
         defer app.agent.deinit();
@@ -7722,6 +7794,7 @@ test "empty-editor ctrl+d in a review turn quits without a completion event" {
         .model = anthropic_default,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -7789,6 +7862,7 @@ test "a stop that loses the cancellation race ends the workflow" {
             .model = anthropic_default,
             .system = "",
             .retry = .{},
+            .environ = .empty,
         });
         defer app.agent.deinit();
         app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -7855,6 +7929,7 @@ test "a message at a review hold runs under the phase caption and returns to the
         .model = anthropic_default,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -7932,6 +8007,7 @@ test "a postponed correction request keeps its budget" {
         .model = anthropic_default,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -8018,6 +8094,7 @@ test "ctrl+n after an unmarked reviewer reply sends the correction" {
         .model = anthropic_default,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -8081,6 +8158,7 @@ test "a resent correction request records the correction head" {
         .model = anthropic_default,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -8160,6 +8238,7 @@ test "an allocation failure during a phase turn start parks nothing and frees on
             .model = anthropic_default,
             .system = "",
             .retry = .{},
+            .environ = .empty,
         });
         defer app.agent.deinit();
         app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -8222,6 +8301,7 @@ test "an allocation failure during a successor turn start frees its request once
             .model = anthropic_default,
             .system = "",
             .retry = .{},
+            .environ = .empty,
         });
         defer app.agent.deinit();
         app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -8266,6 +8346,7 @@ test "a retry attempt in a review runs under the phase caption" {
         .model = anthropic_default,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -8321,6 +8402,7 @@ test "a limit-hold answer that a committed failure interrupts stays an answer" {
         .model = anthropic_default,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -8423,6 +8505,7 @@ test "the failure hold drops Ctrl+N when no retry and no request stand behind it
         .model = anthropic_default,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -8514,6 +8597,7 @@ test "a judge copy of a direct message waits for the turn that commits it" {
         .model = anthropic_default,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -8596,6 +8680,7 @@ test "participation holds the boundary and ctrl+n arms the resume again" {
         .model = anthropic_default,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -8678,6 +8763,7 @@ test "a judge copy of a steering message waits for the commit of its batch" {
         .model = anthropic_default,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -8761,6 +8847,7 @@ test "the judge copies of one turn keep the order the user sent them" {
         .model = anthropic_default,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -8822,6 +8909,7 @@ test "a signed-out submit is refused with a login prompt" {
         .model = anthropic_default,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -8854,6 +8942,7 @@ test "a refused command line reaches the model on the next Enter" {
         .model = anthropic_default,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -8904,6 +8993,7 @@ test "a refused command line queues as steering on the next Enter" {
         .model = anthropic_default,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -8953,6 +9043,7 @@ test "a turn that ends under the queue offer clears the row too" {
         .model = anthropic_default,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -9005,6 +9096,7 @@ test "an idle submit of a slash line with a tail is refused and keeps its text" 
         .model = anthropic_default,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -9046,6 +9138,7 @@ test "a large pasted slash command is classified from expanded text" {
         .model = anthropic_default,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -9134,6 +9227,7 @@ test "Esc opens the step above the picker and cancels at the first step" {
         .model = anthropic_default,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -9212,6 +9306,7 @@ test "Esc walks back through the command list that opened the command" {
         .model = anthropic_default,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -9309,6 +9404,7 @@ test "the command list opens the skill list and writes the picked line" {
         .model = anthropic_default,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -9804,6 +9900,7 @@ test "progress allocation failure still finalizes a canceled turn" {
         .model = anthropic_default,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -9854,6 +9951,7 @@ test "cancel returns the submitted prompt as a rich draft with its paste placeho
         .model = anthropic_default,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
@@ -9893,6 +9991,7 @@ test "a committed cancel drains queued progress into the transcript before rewin
         .model = anthropic_default,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, anthropic_default, .none);

@@ -10,6 +10,9 @@ const SkillGuard = @import("SkillGuard.zig");
 
 gpa: std.mem.Allocator,
 io: std.Io,
+/// Each bash command inherits this process environment. The host owns it for the session.
+/// Tests can use an empty environment.
+environ: std.process.Environ = .empty,
 /// Bounds the bash tool: how much of a command's output survives, and how long
 /// a command runs before Drinky kills it. The defaults hold when no config
 /// overrides them.

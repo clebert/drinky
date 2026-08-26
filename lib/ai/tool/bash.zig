@@ -22,6 +22,15 @@ const capture_bytes_max = 8 << 20;
 /// to a handful per megabyte.
 const read_buffer_bytes = 64 * 1024;
 
+/// A child setup step retries an interrupted or partial system call up to this count.
+const child_setup_attempts_max = 64;
+
+/// The child exits with this code after it sends a typed setup error to the parent.
+const child_error_exit_code = 1;
+
+/// The error pipe carries one child setup error as this integer.
+const ChildErrorInt = std.meta.Int(.unsigned, @sizeOf(anyerror) * 8);
+
 /// The UTF-8 replacement character, substituted for malformed input bytes.
 const replacement = "\u{FFFD}";
 
@@ -31,6 +40,7 @@ pub const spec: llm.Tool = .{
         "stdout and stderr. Output is truncated to a bounded tail, and a non-zero exit is " ++
         "reported. A timed-out or oversized command still returns the tail of its output. " ++
         "Give an optional timeout in seconds; the default comes from configuration. " ++
+        "A command runs without a terminal, so an interactive prompt fails. " ++
         "Drinky has no web tool, so a network request also runs through this tool. " ++
         "Use the find and grep tools for normal file discovery and literal content searches. " ++
         "They skip noise directories and save time. Use this tool when they cannot express " ++
@@ -161,13 +171,7 @@ fn collect(context: *const Context, command: []const u8, execution: *Execution) 
     var pipe_owned = true;
     defer if (pipe_owned) std.Io.File.closeMany(io, &output_files);
 
-    var child = try std.process.spawn(io, .{
-        .argv = &.{ "bash", "-c", command },
-        .stdin = .ignore,
-        .stdout = .{ .file = output_files[1] },
-        .stderr = .{ .file = output_files[1] },
-        .pgid = 0,
-    });
+    var child = try spawnCommand(context, command, output_files[1]);
     const process_group = child.id.?;
     errdefer stopAndReap(&child, io, process_group);
 
@@ -195,6 +199,252 @@ fn collect(context: *const Context, command: []const u8, execution: *Execution) 
         reader.interface.toss(chunk.len);
     }
     return error.StreamTooLong;
+}
+
+/// Start the shell as a session leader without a controlling terminal. A command cannot open
+/// `/dev/tty` or take terminal ownership from Drinky.
+///
+/// Zig 0.16 exposes no session option in `SpawnOptions`. This POSIX spawn mirrors the standard
+/// library steps and adds `setsid`. The error pipe stays, so a child setup failure keeps its type.
+/// The child calls raw system wrappers alone, so it needs no cancel guard of its own.
+fn spawnCommand(
+    context: *const Context,
+    command: []const u8,
+    output_file: std.Io.File,
+) !std.process.Child {
+    const io = context.io;
+    var dev_null = try std.Io.Dir.openFileAbsolute(io, "/dev/null", .{ .mode = .read_write });
+    defer dev_null.close(io);
+    const command_z = try context.gpa.dupeZ(u8, command);
+    defer context.gpa.free(command_z);
+    const argv = [_:null]?[*:0]const u8{ "bash", "-c", command_z.ptr };
+    const path = context.environ.getPosix("PATH") orelse std.Io.Threaded.default_PATH;
+
+    const error_handles = try std.Io.Threaded.pipe2(.{ .CLOEXEC = true });
+    const error_files = [2]std.Io.File{
+        .{ .handle = error_handles[0], .flags = .{ .nonblocking = false } },
+        .{ .handle = error_handles[1], .flags = .{ .nonblocking = false } },
+    };
+    var error_files_owned = true;
+    defer if (error_files_owned) std.Io.File.closeMany(io, &error_files);
+
+    const setup: ChildSetup = .{
+        .in_handle = dev_null.handle,
+        .out_handle = output_file.handle,
+        .error_handle = error_files[1].handle,
+        .argv = &argv,
+        .environ = context.environ.block.slice.ptr,
+        .path = path,
+    };
+
+    const fork_result = std.posix.system.fork();
+    switch (std.posix.errno(fork_result)) {
+        .SUCCESS => {},
+        .AGAIN, .NOMEM => return error.SystemResources,
+        .NOSYS => return error.OperationUnsupported,
+        else => |err| return std.posix.unexpectedErrno(err),
+    }
+    const process_id: std.posix.pid_t = @intCast(fork_result);
+    // The child holds its own copy of this frame, so the pointer stays valid across the fork.
+    if (process_id == 0) runCommandChild(&setup);
+
+    error_files[1].close(io);
+    defer error_files[0].close(io);
+    error_files_owned = false;
+    const maybe_child_error = readCommandChildError(io, error_files[0]) catch |err| {
+        killAndReapCommandChild(process_id);
+        return err;
+    };
+    if (maybe_child_error) |child_error| {
+        reapCommandChild(process_id);
+        return child_error;
+    }
+
+    return .{
+        .id = process_id,
+        .thread_handle = {},
+        .stdin = null,
+        .stdout = null,
+        .stderr = null,
+        .request_resource_usage_statistics = false,
+    };
+}
+
+/// Everything the child needs after the fork. A named field prevents a swap of two handles, or
+/// of the two string vectors, at the call.
+const ChildSetup = struct {
+    /// The child reads standard input from this handle.
+    in_handle: std.posix.fd_t,
+    /// The child writes both standard output and standard error to this handle.
+    out_handle: std.posix.fd_t,
+    /// The child reports a setup failure on this handle and closes it at a successful exec.
+    error_handle: std.posix.fd_t,
+    argv: [*:null]const ?[*:0]const u8,
+    environ: [*:null]const ?[*:0]const u8,
+    /// The directory list that the executable search walks.
+    path: []const u8,
+};
+
+/// This child path calls only async-signal-safe functions between fork and exec.
+fn runCommandChild(setup: *const ChildSetup) noreturn {
+    duplicateCommandHandle(setup.in_handle, std.posix.STDIN_FILENO) catch |err|
+        failCommandChild(setup.error_handle, err);
+    duplicateCommandHandle(setup.out_handle, std.posix.STDOUT_FILENO) catch |err|
+        failCommandChild(setup.error_handle, err);
+    duplicateCommandHandle(setup.out_handle, std.posix.STDERR_FILENO) catch |err|
+        failCommandChild(setup.error_handle, err);
+    createCommandSession() catch |err| failCommandChild(setup.error_handle, err);
+    failCommandChild(setup.error_handle, execCommand(setup));
+}
+
+fn duplicateCommandHandle(old_handle: std.posix.fd_t, new_handle: std.posix.fd_t) !void {
+    for (0..child_setup_attempts_max) |_| switch (std.posix.errno(
+        std.posix.system.dup2(old_handle, new_handle),
+    )) {
+        .SUCCESS => return,
+        .BUSY, .INTR => continue,
+        .MFILE => return error.ProcessFdQuotaExceeded,
+        .NOMEM => return error.SystemResources,
+        else => return error.Unexpected,
+    };
+    return error.SystemResources;
+}
+
+fn createCommandSession() !void {
+    switch (std.posix.errno(std.posix.system.setsid())) {
+        .SUCCESS => {},
+        .PERM => return error.PermissionDenied,
+        else => return error.Unexpected,
+    }
+}
+
+fn execCommand(setup: *const ChildSetup) std.process.SpawnError {
+    const name = std.mem.span(setup.argv[0].?);
+    var path_buffer: [std.posix.PATH_MAX]u8 = undefined;
+    var search = std.mem.tokenizeScalar(u8, setup.path, ':');
+    var access_denied = false;
+    while (search.next()) |directory| {
+        const path_len = directory.len + name.len + 1;
+        if (path_buffer.len < path_len + 1) return error.NameTooLong;
+        @memcpy(path_buffer[0..directory.len], directory);
+        path_buffer[directory.len] = '/';
+        @memcpy(path_buffer[directory.len + 1 ..][0..name.len], name);
+        path_buffer[path_len] = 0;
+        const executable_path = path_buffer[0..path_len :0];
+        const exec_error = commandExecError(std.posix.errno(std.posix.system.execve(
+            executable_path,
+            setup.argv,
+            setup.environ,
+        )));
+        switch (exec_error) {
+            error.AccessDenied => access_denied = true,
+            error.FileNotFound, error.NotDir => {},
+            else => return exec_error,
+        }
+    }
+    if (access_denied) return error.AccessDenied;
+    return error.FileNotFound;
+}
+
+fn commandExecError(err: std.posix.E) std.process.SpawnError {
+    return switch (err) {
+        .@"2BIG", .NOMEM => error.SystemResources,
+        .MFILE => error.ProcessFdQuotaExceeded,
+        .NAMETOOLONG => error.NameTooLong,
+        .NFILE => error.SystemFdQuotaExceeded,
+        .ACCES => error.AccessDenied,
+        .PERM => error.PermissionDenied,
+        .INVAL, .NOEXEC => error.InvalidExe,
+        .IO, .LOOP => error.FileSystem,
+        .ISDIR => error.IsDir,
+        .NOENT => error.FileNotFound,
+        .NOTDIR => error.NotDir,
+        .TXTBSY => error.FileBusy,
+        else => switch (builtin.os.tag) {
+            .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => switch (err) {
+                .BADEXEC, .BADARCH => error.InvalidExe,
+                else => error.Unexpected,
+            },
+            .linux => switch (err) {
+                .LIBBAD => error.InvalidExe,
+                else => error.Unexpected,
+            },
+            else => error.Unexpected,
+        },
+    };
+}
+
+fn failCommandChild(error_handle: std.posix.fd_t, child_error: std.process.SpawnError) noreturn {
+    var buffer: [@sizeOf(ChildErrorInt)]u8 = undefined;
+    std.mem.writeInt(ChildErrorInt, &buffer, @intFromError(child_error), .little);
+    var offset: usize = 0;
+    for (0..child_setup_attempts_max) |_| {
+        const write_result = std.posix.system.write(
+            error_handle,
+            buffer[offset..].ptr,
+            buffer.len - offset,
+        );
+        switch (std.posix.errno(write_result)) {
+            .SUCCESS => {
+                const count: usize = @intCast(write_result);
+                offset += count;
+                if (offset == buffer.len) break;
+            },
+            .INTR => continue,
+            else => break,
+        }
+    }
+    exitCommandChild(child_error_exit_code);
+}
+
+/// The setup error that the child sent, or null when the pipe closed at a successful exec.
+/// The io interface owns the read, so a canceled turn reaches the parent as `Canceled`.
+fn readCommandChildError(io: std.Io, error_file: std.Io.File) !?std.process.SpawnError {
+    var buffer: [@sizeOf(ChildErrorInt)]u8 = undefined;
+    var offset: usize = 0;
+    for (0..child_setup_attempts_max) |_| {
+        const count = error_file.readStreaming(io, &.{buffer[offset..]}) catch |err| switch (err) {
+            // The write end closes on exec, so a clean end of stream proves the exec.
+            error.EndOfStream => return if (offset == 0) null else error.Unexpected,
+            else => |read_error| return read_error,
+        };
+        offset += count;
+        if (offset == buffer.len) {
+            const child_error: std.process.SpawnError = @errorCast(@errorFromInt(
+                std.mem.readInt(ChildErrorInt, &buffer, .little),
+            ));
+            return @as(?std.process.SpawnError, child_error);
+        }
+    }
+    return error.SystemResources;
+}
+
+fn reapCommandChild(process_id: std.posix.pid_t) void {
+    var status: if (builtin.link_libc) c_int else u32 = undefined;
+    for (0..child_setup_attempts_max) |_| switch (std.posix.errno(
+        std.posix.system.waitpid(process_id, &status, 0),
+    )) {
+        .INTR => continue,
+        else => return,
+    };
+}
+
+/// Stop a child that never reported its setup. Both signals are needed: the group covers a child
+/// that reached `setsid` and started work of its own, and the id covers the window before it.
+fn killAndReapCommandChild(process_id: std.posix.pid_t) void {
+    _ = std.posix.system.kill(-process_id, .KILL);
+    _ = std.posix.system.kill(process_id, .KILL);
+    reapCommandChild(process_id);
+}
+
+fn exitCommandChild(code: u8) noreturn {
+    if (comptime builtin.link_libc) {
+        std.c._exit(code);
+    } else if (comptime builtin.os.tag == .linux) {
+        std.os.linux.exit_group(code);
+    } else {
+        @compileError("The command child exit path needs a POSIX implementation.");
+    }
 }
 
 fn stopAndReap(
@@ -430,6 +680,91 @@ test "bash preserves stdout and stderr order" {
     defer result.deinit(gpa);
     try std.testing.expect(!result.is_error);
     try std.testing.expectEqualStrings("out1err1out2err2", result.content);
+}
+
+test "bash starts a command in a separate session" {
+    const gpa = std.testing.allocator;
+    const context: Context = .{ .gpa = gpa, .io = std.testing.io };
+    const result = try run(&context,
+        \\{"command":"case $(ps -o stat= -p $$) in *s*) exit 0;; *) exit 1;; esac"}
+    );
+    defer result.deinit(gpa);
+    try std.testing.expectEqualStrings("(No output)", result.content);
+    try std.testing.expect(!result.is_error);
+}
+
+test "bash inherits the process environment" {
+    const gpa = std.testing.allocator;
+    const entries = [_:null]?[*:0]const u8{
+        "PATH=/usr/local/bin:/bin:/usr/bin",
+        "DRINKY_BASH_TEST=inherited",
+    };
+    const context: Context = .{
+        .gpa = gpa,
+        .io = std.testing.io,
+        .environ = .{ .block = .{ .slice = &entries } },
+    };
+    const result = try run(&context,
+        \\{"command":"printf %s \"$DRINKY_BASH_TEST\""}
+    );
+    defer result.deinit(gpa);
+    try std.testing.expect(!result.is_error);
+    try std.testing.expectEqualStrings("inherited", result.content);
+}
+
+test "bash skips a directory with the executable name in PATH" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io, "bash", .default_dir);
+    const path_entry = try std.fmt.allocPrintSentinel(
+        gpa,
+        "PATH=.zig-cache/tmp/{s}:/bin:/usr/bin",
+        .{tmp.sub_path},
+        0,
+    );
+    defer gpa.free(path_entry);
+    const entries = [_:null]?[*:0]const u8{path_entry.ptr};
+    const context: Context = .{
+        .gpa = gpa,
+        .io = io,
+        .environ = .{ .block = .{ .slice = &entries } },
+    };
+    const result = try run(&context,
+        \\{"command":"printf ok"}
+    );
+    defer result.deinit(gpa);
+    try std.testing.expect(!result.is_error);
+    try std.testing.expectEqualStrings("ok", result.content);
+}
+
+test "bash reports an executable search failure as a tool error" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io, "bash", .default_dir);
+    const path_entry = try std.fmt.allocPrintSentinel(
+        gpa,
+        "PATH=.zig-cache/tmp/{s}",
+        .{tmp.sub_path},
+        0,
+    );
+    defer gpa.free(path_entry);
+    const entries = [_:null]?[*:0]const u8{path_entry.ptr};
+    const context: Context = .{
+        .gpa = gpa,
+        .io = io,
+        .environ = .{ .block = .{ .slice = &entries } },
+    };
+    const result = try run(&context,
+        \\{"command":"printf unreachable"}
+    );
+    defer result.deinit(gpa);
+    try std.testing.expect(result.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "error AccessDenied") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "exit code") == null);
 }
 
 test "bash reports a non-zero exit as an error" {

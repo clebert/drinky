@@ -49,8 +49,9 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
   order, and return a bounded tail. A non-zero exit is reported. Output caps and the timeout are
   configurable, and the timeout is also settable per call. Every command runs under a timeout from 1
   second to 1 hour, so neither the config nor a call can lift the limit. A configured deny list
-  refuses a command that contains one of its patterns, and the refusal names the pattern. Drinky has
-  no web tool, so a network request also runs through bash.
+  refuses a command that contains one of its patterns, and the refusal names the pattern. Each
+  command runs without a controlling terminal, so it cannot take terminal ownership from Drinky.
+  Drinky has no web tool, so a network request also runs through bash.
 - **describe_drinky** — describe the harness itself, so the model answers a question about Drinky
   from the tool and not from memory. One section per topic: every slash command, `config.json` with
   every key, the key bindings, the discovery rules of the instruction and skill files, and the

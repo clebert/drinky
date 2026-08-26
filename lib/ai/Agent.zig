@@ -40,6 +40,8 @@ const by_model_max = 16;
 
 gpa: std.mem.Allocator,
 io: std.Io,
+/// Each bash command inherits this process environment. The host owns it for the session.
+environ: std.process.Environ,
 /// The active account's transport, or null while signed out. The app refuses to
 /// start a turn while signed out, so the internal uses assume one.
 client: ?provider.Client,
@@ -333,6 +335,7 @@ pub fn init(
         model: models.Model,
         system: []const u8,
         retry: net.Retry,
+        environ: std.process.Environ,
         effort: llm.Effort = .none,
         bash: tool.Context.Bash = .{},
         document: []const u8 = "",
@@ -342,6 +345,7 @@ pub fn init(
     return .{
         .gpa = gpa,
         .io = io,
+        .environ = options.environ,
         .client = client,
         .model = options.model,
         .system = options.system,
@@ -1276,6 +1280,7 @@ fn runToolsWith(
     const context: tool.Context = .{
         .gpa = self.gpa,
         .io = self.io,
+        .environ = self.environ,
         .bash = self.bash,
         .document = self.document,
         .skill_guard = self.skill_guard,
@@ -1738,6 +1743,7 @@ test "usage is attributed to the model that produced it across a switch" {
         .model = sonnet,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
     defer agent.deinit();
 
@@ -2153,6 +2159,7 @@ fn scriptedAgent(gpa: std.mem.Allocator) Agent {
         .model = model,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
 }
 
@@ -2199,7 +2206,12 @@ fn appendProof(agent: *Agent, account: llm.Account) !void {
 fn openaiScriptedAgent(gpa: std.mem.Allocator) Agent {
     const model = models.get(.openai, "gpt-5.6-sol").?;
     const client = provider.Client.init(gpa, std.testing.io, .{ .openai_api = "sk-test" }, .{});
-    return Agent.init(gpa, std.testing.io, client, .{ .model = model, .system = "", .retry = .{} });
+    return Agent.init(gpa, std.testing.io, client, .{
+        .model = model,
+        .system = "",
+        .retry = .{},
+        .environ = .empty,
+    });
 }
 
 fn anthropicStream(io: std.Io, reader: *std.Io.Reader, idle_ms: u64) provider.Stream {

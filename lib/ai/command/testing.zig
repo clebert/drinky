@@ -37,5 +37,6 @@ pub fn agent(gpa: std.mem.Allocator, credentials: provider.Credentials) Agent {
         .model = models.get(.anthropic, "claude-sonnet-4-6").?,
         .system = "",
         .retry = .{},
+        .environ = .empty,
     });
 }
