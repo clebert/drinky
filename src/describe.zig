@@ -135,7 +135,9 @@ fn writeKeys(writer: *std.Io.Writer, options: *const Options) !void {
         \\
         \\A running `/review` workflow gives the keys below another meaning, at its prompt and
         \\during its turns. The caption above the editor names the state of the workflow and its
-        \\controls.
+        \\controls, and the running caption marks the next boundary as `Resume: Auto` or
+        \\`Resume: Hold`. The boundary holds for text in the editor and for a phase the user
+        \\took part in with a message or with steering.
         \\
         \\- Esc stops the workflow at a hold. During a turn it cancels the turn and stops the
         \\  workflow. Drinky records one completion event and restores the main conversation.
@@ -147,7 +149,8 @@ fn writeKeys(writer: *std.Io.Writer, options: *const Options) !void {
         \\  step. At the hold of a failed role request it resends that request. A failed turn that
         \\  committed work takes the retry attempt instead. The control row names Ctrl+N only
         \\  while one of the two stands behind it. Ctrl+N has no action at the judge hold and at
-        \\  the round limit.
+        \\  the round limit. During a role turn it arms the automatic resume again, so a steered
+        \\  phase proceeds by itself.
         \\- Ctrl+E adds one round at the round limit.
         \\- Ctrl+S opens the account, model, and effort menu of the role whose request failed.
         \\

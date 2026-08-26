@@ -8,6 +8,10 @@
 //! validates the findings and settles the review. A fresh fixer applies the
 //! judge report, or disputes it with evidence. Only a fresh reviewer starts a
 //! round, and the round ceiling bounds unattended progress.
+//!
+//! Every role report starts with its marker line, so a reply to the user can
+//! never travel as a report. An unmarked reply gets one correction request,
+//! and a second unmarked reply after that request stops the workflow.
 
 const std = @import("std");
 
@@ -40,7 +44,7 @@ fixer_report: ?FixerReport = null,
 /// it. Owned.
 judge_report: ?[]u8 = null,
 /// Whether the machine already composed the one correction request of the
-/// active judge report. A second invalid report then stops the workflow. A
+/// active phase reply. A second unmarked reply then stops the workflow. A
 /// step that no compose follows leaves the budget whole.
 correction_requested: bool = false,
 /// Whether the active round already counted its reviewer report. A successor
@@ -122,10 +126,10 @@ pub const Step = union(enum) {
     hold_limit,
     /// The judge settled the review, so the workflow completes.
     settled,
-    /// The judge report holds no valid decision line, so one correction
-    /// request follows in the judge context.
+    /// The phase reply holds no valid marker line, so one correction request
+    /// follows in the role context.
     request_correction,
-    /// A second invalid judge report stops the workflow.
+    /// A second unmarked reply of the active phase stops the workflow.
     stop_invalid,
 };
 
@@ -183,7 +187,12 @@ pub const reviewer_core =
     \\speculative improvements, and valid design preferences.
     \\
     \\A report contains at most eight findings in severity order. Report no findings when none
-    \\exist. Return only the reviewer report.
+    \\exist. Start every report with exactly one of these lines.
+    \\
+    \\Findings: none.
+    \\Findings: {count}.
+    \\
+    \\Replace {count} with the number of findings. Return only the reviewer report.
 ;
 
 /// The static core of the judge prompt. The judge validates findings, resolves
@@ -268,9 +277,23 @@ pub const judge_core =
     \\finding still requires a fix. Return only the judge report.
 ;
 
+/// The correction request for a reviewer reply without a valid findings line.
+/// It runs in the reviewer context, so the reviewer holds the reply it
+/// corrects.
+pub const reviewer_correction_request =
+    \\<reviewer_report_correction>
+    \\Your previous message was not a complete reviewer report.
+    \\Return the complete reviewer report.
+    \\Start it with exactly one of these lines.
+    \\Findings: none.
+    \\Findings: {count}.
+    \\Replace {count} with the number of findings.
+    \\</reviewer_report_correction>
+;
+
 /// The correction request for a judge report without a valid decision line.
 /// It runs in the judge context, so the judge holds the report it corrects.
-pub const correction_request =
+pub const judge_correction_request =
     \\<judge_report_correction>
     \\Your previous report did not start with a valid decision line.
     \\Return the complete corrected judge report.
@@ -279,6 +302,19 @@ pub const correction_request =
     \\Decision: Review settled.
     \\Decision: User decision required.
     \\</judge_report_correction>
+;
+
+/// The correction request for a fixer reply without a valid application line.
+/// It runs in the fixer context, so the fixer holds the reply it corrects.
+pub const fixer_correction_request =
+    \\<fixer_report_correction>
+    \\Your previous message was not a complete fixer report.
+    \\Return the complete fixer report.
+    \\Start it with exactly one of these lines.
+    \\Applied: all.
+    \\Applied: partial.
+    \\Applied: none.
+    \\</fixer_report_correction>
 ;
 
 pub fn init(gpa: std.mem.Allocator, rounds_max: u64) Review {
@@ -302,22 +338,33 @@ pub fn composeReviewerRequest(self: *Review) ![]u8 {
     self.rounds_started += 1;
     self.next_pass = .first;
     self.round_reported = false;
+    self.correction_requested = false;
     self.phase = .reviewer;
     return std.fmt.allocPrint(
         self.gpa,
         "<reviewer_request round=\"{d}\">\n" ++
             "Review the current target from HEAD.\n" ++
             "Inspect the current files and run required verification.\n" ++
+            "Start the report with exactly one of these lines.\n" ++
+            "Findings: none.\n" ++
+            "Findings: {{count}}.\n" ++
+            "Replace {{count}} with the number of findings.\n" ++
             "Return only the reviewer report.\n" ++
             "</reviewer_request>",
         .{self.rounds_started},
     );
 }
 
-/// Take the complete reviewer report of the active round. The next judge
-/// request carries it.
+/// Take the reviewer reply of the active round. A marked report goes to the
+/// next judge request whole. A reply without a findings line is no report, so
+/// it gets one correction request before the invalid stop.
 pub fn finishReviewer(self: *Review, report: []const u8) !Step {
     std.debug.assert(self.phase == .reviewer);
+    if (classifyFindings(report) == null) {
+        if (self.correction_requested) return .stop_invalid;
+        return .request_correction;
+    }
+    self.correction_requested = false;
     const copy = try self.gpa.dupe(u8, report);
     if (self.reviewer_report) |old| self.gpa.free(old);
     self.reviewer_report = copy;
@@ -382,13 +429,17 @@ pub fn finishJudge(self: *Review, report: []const u8) !Step {
     };
 }
 
-/// Spend the one correction budget of the active judge report and return the
-/// request text. It runs in the judge context, so the caller owns nothing. A
+/// Spend the one correction budget of the active phase reply and return the
+/// request text. It runs in the role context, so the caller owns nothing. A
 /// `request_correction` step that never reaches this leaves the budget whole.
 pub fn composeCorrectionRequest(self: *Review) []const u8 {
-    std.debug.assert(self.phase == .judge);
     self.correction_requested = true;
-    return correction_request;
+    return switch (self.phase) {
+        .setup => unreachable,
+        .reviewer => reviewer_correction_request,
+        .judge => judge_correction_request,
+        .fixer => fixer_correction_request,
+    };
 }
 
 /// Take a judge answer during a limit hold. A valid decision line replaces the
@@ -457,23 +508,28 @@ pub fn composeFixerRequest(self: *Review, pass: Pass) ![]u8 {
     self.gpa.free(report);
     self.judge_report = null;
     self.pass_reported = false;
+    self.correction_requested = false;
     self.phase = .{ .fixer = pass };
     return request;
 }
 
-/// Take the complete fixer report and resolve the transition. The next judge
-/// request carries the report, whether the dispute path or the next round
-/// delivers it. An absent or unknown application line takes the conservative
-/// path and starts a fresh reviewer.
+/// Take the fixer reply of the active pass and resolve the transition. The
+/// next judge request carries a marked report, whether the dispute path or
+/// the next round delivers it. A reply without an application line is no
+/// report, so it gets one correction request before the invalid stop.
 pub fn finishFixer(self: *Review, report: []const u8) !Step {
     const pass = self.phase.fixer;
+    const application = classifyApplication(report) orelse {
+        if (self.correction_requested) return .stop_invalid;
+        return .request_correction;
+    };
+    self.correction_requested = false;
     const copy = try self.gpa.dupe(u8, report);
     if (self.fixer_report) |old| self.gpa.free(old.text);
     self.fixer_report = .{ .round = self.rounds_started, .pass = pass, .text = copy };
     if (!self.pass_reported) self.passes_completed += 1;
     self.pass_reported = true;
     if (pass == .second) return .start_reviewer;
-    const application = classifyApplication(report) orelse return .start_reviewer;
     if (application != .none) return .start_reviewer;
     // The fixer changed no file and disputes the report, so the judge resolves
     // the dispute before any fresh review. A rejection arms the final pass.
@@ -504,6 +560,17 @@ pub fn classifyDecision(report: []const u8) ?Decision {
     if (matchesValue(value, "review settled")) return .review_settled;
     if (matchesValue(value, "user decision required")) return .user_decision_required;
     return null;
+}
+
+/// The findings count of a reviewer report: the first line that starts with
+/// `Findings:`, or null when no line does or the value is unknown. The value
+/// `none` counts as zero. Markdown decoration and letter case do not affect
+/// classification.
+pub fn classifyFindings(report: []const u8) ?u64 {
+    const value = classifiedValue(report, "findings:") orelse return null;
+    if (matchesValue(value, "none")) return 0;
+    const body = if (std.mem.endsWith(u8, value, ".")) value[0 .. value.len - 1] else value;
+    return std.fmt.parseInt(u64, body, 10) catch null;
 }
 
 /// The application of a fixer report: the first line that starts with
@@ -579,6 +646,21 @@ test "an application line classifies through markdown decoration and letter case
     try std.testing.expect(classifyApplication("The fixer applied the findings.") == null);
 }
 
+test "a findings line classifies through markdown decoration and letter case" {
+    try std.testing.expectEqual(@as(u64, 0), classifyFindings("Findings: none.\nAll clear.").?);
+    try std.testing.expectEqual(@as(u64, 3), classifyFindings("**findings: 3**\nFinding 1 …").?);
+    try std.testing.expectEqual(@as(u64, 12), classifyFindings("# FINDINGS: 12.").?);
+    // Prose before the line does not hide it.
+    try std.testing.expectEqual(@as(u64, 0), classifyFindings(
+        "The target builds.\nFindings: none.",
+    ).?);
+    // A value the workflow cannot read as `none` or a count stays invalid.
+    try std.testing.expect(classifyFindings("Findings: some.") == null);
+    try std.testing.expect(classifyFindings("Findings:") == null);
+    try std.testing.expect(classifyFindings("I found nothing.") == null);
+    try std.testing.expect(classifyFindings("") == null);
+}
+
 test "the flow runs reviewer, judge, fixer, and a fresh round to settlement" {
     const gpa = std.testing.allocator;
     var review = Review.init(gpa, 4);
@@ -591,6 +673,10 @@ test "the flow runs reviewer, judge, fixer, and a fresh round to settlement" {
         "<reviewer_request round=\"1\">\n" ++
             "Review the current target from HEAD.\n" ++
             "Inspect the current files and run required verification.\n" ++
+            "Start the report with exactly one of these lines.\n" ++
+            "Findings: none.\n" ++
+            "Findings: {count}.\n" ++
+            "Replace {count} with the number of findings.\n" ++
             "Return only the reviewer report.\n" ++
             "</reviewer_request>",
         first_request,
@@ -599,13 +685,16 @@ test "the flow runs reviewer, judge, fixer, and a fresh round to settlement" {
     try std.testing.expectEqual(@as(u64, 0), review.rounds_completed);
 
     // The reviewer report goes to the judge whole.
-    try std.testing.expectEqual(Step.start_judge, try review.finishReviewer("Finding: a bug."));
+    try std.testing.expectEqual(
+        Step.start_judge,
+        try review.finishReviewer("Findings: 1.\nFinding: a bug."),
+    );
     try std.testing.expectEqual(@as(u64, 1), review.rounds_completed);
     const judge_request = try review.composeJudgeRequest();
     defer gpa.free(judge_request);
     try std.testing.expectEqualStrings(
         "<judge_request round=\"1\">\n" ++
-            "<reviewer_report>\nFinding: a bug.\n</reviewer_report>\n\n" ++
+            "<reviewer_report>\nFindings: 1.\nFinding: a bug.\n</reviewer_report>\n\n" ++
             "</judge_request>",
         judge_request,
     );
@@ -641,13 +730,13 @@ test "the flow runs reviewer, judge, fixer, and a fresh round to settlement" {
     const second_request = try review.composeReviewerRequest();
     defer gpa.free(second_request);
     try std.testing.expectEqual(@as(u64, 2), review.rounds_started);
-    try std.testing.expectEqual(Step.start_judge, try review.finishReviewer("No findings."));
+    try std.testing.expectEqual(Step.start_judge, try review.finishReviewer("Findings: none."));
     const second_judge = try review.composeJudgeRequest();
     defer gpa.free(second_judge);
     try std.testing.expectEqualStrings(
         "<judge_request round=\"2\">\n" ++
             "<fixer_report round=\"1\" pass=\"1\">\nApplied: all.\nDone.\n</fixer_report>\n\n" ++
-            "<reviewer_report>\nNo findings.\n</reviewer_report>\n\n" ++
+            "<reviewer_report>\nFindings: none.\n</reviewer_report>\n\n" ++
             "</judge_request>",
         second_judge,
     );
@@ -660,7 +749,10 @@ test "an applied-none dispute returns to the judge and bounds the passes" {
     var review = Review.init(gpa, 4);
     defer review.deinit();
     gpa.free(try review.composeReviewerRequest());
-    try std.testing.expectEqual(Step.start_judge, try review.finishReviewer("Finding: a bug."));
+    try std.testing.expectEqual(
+        Step.start_judge,
+        try review.finishReviewer("Findings: 1.\nFinding: a bug."),
+    );
     gpa.free(try review.composeJudgeRequest());
     try std.testing.expectEqual(
         Step{ .start_fixer = .first },
@@ -705,16 +797,67 @@ test "an applied-none dispute returns to the judge and bounds the passes" {
     try std.testing.expectEqual(@as(u64, 2), review.passes_completed);
 }
 
-test "an absent application line takes the conservative path" {
+test "an unmarked reviewer reply gets one correction and a second one stops" {
     const gpa = std.testing.allocator;
     var review = Review.init(gpa, 4);
     defer review.deinit();
     gpa.free(try review.composeReviewerRequest());
-    _ = try review.finishReviewer("Finding: a bug.");
+
+    // An answer to the user is no report, so it stores nothing for the judge
+    // and counts no completion. Steps without a sent request spend no budget.
+    try std.testing.expectEqual(
+        Step.request_correction,
+        try review.finishReviewer("Understood. I ignore the steering test."),
+    );
+    try std.testing.expect(review.reviewer_report == null);
+    try std.testing.expectEqual(@as(u64, 0), review.rounds_completed);
+    try std.testing.expectEqual(Step.request_correction, try review.finishReviewer("Noted."));
+    try std.testing.expect(!review.correction_requested);
+
+    // The sent correction spends the budget, and a marked report resets it,
+    // so a later answer to the user gets a fresh correction.
+    try std.testing.expectEqualStrings(
+        reviewer_correction_request,
+        review.composeCorrectionRequest(),
+    );
+    try std.testing.expectEqual(Step.start_judge, try review.finishReviewer("Findings: none."));
+    try std.testing.expect(!review.correction_requested);
+    try std.testing.expectEqual(
+        Step.request_correction,
+        try review.finishReviewer("You are welcome."),
+    );
+
+    // A second unmarked reply after a sent correction stops the workflow.
+    _ = review.composeCorrectionRequest();
+    try std.testing.expectEqual(Step.stop_invalid, try review.finishReviewer("Prose again."));
+}
+
+test "an unmarked fixer reply gets one correction and a second one stops" {
+    const gpa = std.testing.allocator;
+    var review = Review.init(gpa, 4);
+    defer review.deinit();
+    gpa.free(try review.composeReviewerRequest());
+    _ = try review.finishReviewer("Findings: 1.\nFinding: a bug.");
     gpa.free(try review.composeJudgeRequest());
     _ = try review.finishJudge("Decision: Fix required.\nFix it.");
     gpa.free(try review.composeFixerRequest(.first));
-    try std.testing.expectEqual(Step.start_reviewer, try review.finishFixer("I fixed the bug."));
+
+    // A reply without an application line is no report, so it starts no fresh
+    // round and stores nothing for the judge.
+    try std.testing.expectEqual(
+        Step.request_correction,
+        try review.finishFixer("I fixed the bug."),
+    );
+    try std.testing.expect(review.fixer_report == null);
+    try std.testing.expectEqual(@as(u64, 0), review.passes_completed);
+
+    // The sent correction spends the budget, and the second unmarked reply
+    // stops the workflow.
+    try std.testing.expectEqualStrings(
+        fixer_correction_request,
+        review.composeCorrectionRequest(),
+    );
+    try std.testing.expectEqual(Step.stop_invalid, try review.finishFixer("Still prose."));
 }
 
 test "an invalid judge report gets one correction and a second one stops" {
@@ -722,7 +865,7 @@ test "an invalid judge report gets one correction and a second one stops" {
     var review = Review.init(gpa, 4);
     defer review.deinit();
     gpa.free(try review.composeReviewerRequest());
-    _ = try review.finishReviewer("Finding: a bug.");
+    _ = try review.finishReviewer("Findings: 1.\nFinding: a bug.");
     gpa.free(try review.composeJudgeRequest());
 
     // A step that no compose follows sends no request, so the budget stays
@@ -732,7 +875,10 @@ test "an invalid judge report gets one correction and a second one stops" {
     try std.testing.expectEqual(Step.request_correction, try review.finishJudge("Still fine."));
 
     // The composed request spends the budget.
-    try std.testing.expectEqualStrings(correction_request, review.composeCorrectionRequest());
+    try std.testing.expectEqualStrings(
+        judge_correction_request,
+        review.composeCorrectionRequest(),
+    );
     try std.testing.expect(review.correction_requested);
     // The corrected report controls the transition like any complete report.
     try std.testing.expectEqual(Step.settled, try review.finishJudge("Decision: Review settled."));
@@ -750,7 +896,7 @@ test "the ceiling holds progress and a raise resumes the latest decision" {
     var review = Review.init(gpa, 1);
     defer review.deinit();
     gpa.free(try review.composeReviewerRequest());
-    _ = try review.finishReviewer("Finding: a bug.");
+    _ = try review.finishReviewer("Findings: 1.\nFinding: a bug.");
     gpa.free(try review.composeJudgeRequest());
 
     // A fix at the ceiling cannot start a fixer, because no later reviewer
@@ -773,7 +919,7 @@ test "the ceiling holds progress and a raise resumes the latest decision" {
 
     // A settled answer at the next hold resumes as one more reviewer round.
     gpa.free(try review.composeReviewerRequest());
-    _ = try review.finishReviewer("Finding: another bug.");
+    _ = try review.finishReviewer("Findings: 1.\nFinding: another bug.");
     gpa.free(try review.composeJudgeRequest());
     try std.testing.expectEqual(Step.hold_limit, try review.finishJudge("Decision: Fix required."));
     try std.testing.expect(try review.adoptJudgeAnswer("Decision: Review settled."));
@@ -785,10 +931,10 @@ test "a successor report replaces its phase report and counts no second completi
     var review = Review.init(gpa, 4);
     defer review.deinit();
     gpa.free(try review.composeReviewerRequest());
-    _ = try review.finishReviewer("Finding: a bug.");
-    // The user steered the completed reviewer, so its next reply replaces the
-    // report. The round completed once.
-    _ = try review.finishReviewer("Finding: a bug in the parser.");
+    _ = try review.finishReviewer("Findings: 1.\nFinding: a bug.");
+    // The user steered the completed reviewer, so its next marked reply
+    // replaces the report. The round completed once.
+    _ = try review.finishReviewer("Findings: 1.\nFinding: a bug in the parser.");
     try std.testing.expectEqual(@as(u64, 1), review.rounds_completed);
     const request = try review.composeJudgeRequest();
     defer gpa.free(request);
@@ -806,7 +952,7 @@ test "workflow messages ride into the next judge request in user order" {
     defer review.deinit();
     gpa.free(try review.composeReviewerRequest());
     try review.pushMessage(.reviewer, "Check the config parser too.");
-    _ = try review.finishReviewer("Finding: a bug.");
+    _ = try review.finishReviewer("Findings: 1.\nFinding: a bug.");
     try review.pushMessage(.reviewer, "Ignore the generated file.");
     const request = try review.composeJudgeRequest();
     defer gpa.free(request);
@@ -818,7 +964,7 @@ test "workflow messages ride into the next judge request in user order" {
             "<user_message round=\"1\" to=\"reviewer\">\nIgnore the generated file.\n" ++
             "</user_message>\n" ++
             "</workflow_messages>\n\n" ++
-            "<reviewer_report>\nFinding: a bug.\n</reviewer_report>\n\n" ++
+            "<reviewer_report>\nFindings: 1.\nFinding: a bug.\n</reviewer_report>\n\n" ++
             "</judge_request>",
         request,
     );
@@ -836,7 +982,7 @@ test "a user decision holds the workflow and the answer resolves it" {
     var review = Review.init(gpa, 4);
     defer review.deinit();
     gpa.free(try review.composeReviewerRequest());
-    _ = try review.finishReviewer("Finding: the flag renames a public option.");
+    _ = try review.finishReviewer("Findings: 1.\nFinding: the flag renames a public option.");
     gpa.free(try review.composeJudgeRequest());
     try std.testing.expectEqual(
         Step.hold_judge,
@@ -874,11 +1020,25 @@ test "the role cores carry the shared rules and the report lines" {
         judge_core,
         "Decision: User decision required.",
     ) != null);
-    // The correction request repeats them, so a corrected report can classify.
+    // The reviewer core states the findings lines the classifier reads.
+    try std.testing.expect(std.mem.indexOf(u8, reviewer_core, "Findings: none.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reviewer_core, "Findings: {count}.") != null);
+    // Each correction request repeats the lines of its role, so a corrected
+    // report can classify.
     try std.testing.expect(std.mem.indexOf(
         u8,
-        correction_request,
+        judge_correction_request,
         "Decision: User decision required.",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        reviewer_correction_request,
+        "Findings: none.",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        fixer_correction_request,
+        "Applied: none.",
     ) != null);
     // The reviewer core bounds the report.
     try std.testing.expect(std.mem.indexOf(u8, reviewer_core, "at most eight findings") != null);

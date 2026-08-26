@@ -190,12 +190,16 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - The editor is the brake: an empty editor lets the workflow run unattended, and text holds it at
   the next boundary. Enter steers the active role, and a message that reaches the reviewer or the
   fixer gets one judge copy, so a report never reads as a user instruction.
+- A phase the user takes part in holds at its boundary too, so the reply waits for a read before
+  the role resets. A mid-turn Ctrl+N arms the automatic resume again, and the running caption marks
+  the state as `Resume: Auto` or `Resume: Hold`, live against the editor and the participation.
 - A message that the user sends at a hold runs as its own turn under the round caption. A failure
   that commits nothing returns the text to the editor and the workflow to that hold.
 - The judge asks the user only about an open product choice. The `review.rounds_max` ceiling
   bounds unattended rounds, and Ctrl+E adds one round at the limit.
-- A rejected fixer dispute gets one final pass, and an invalid judge report gets one correction
-  request before the workflow stops.
+- Every role reply must start with its marker line: `Findings:`, `Decision:`, or `Applied:`. An
+  answer to the user never travels as a report, and an unmarked reply gets one correction request
+  before the workflow stops. A rejected fixer dispute gets one final pass.
 - A failed role request holds the workflow: Ctrl+N retries the committed work or resends the
   request while one of the two stands behind it, and Ctrl+S reopens the setup of the failed role. A
   credential replacement and a credential rejection end a role turn in that same hold, and neither

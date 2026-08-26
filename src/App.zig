@@ -241,6 +241,11 @@ const ReviewFlow = struct {
     /// Whether the user stopped the workflow while a turn ran. A worker that
     /// won the cancellation race honors the stop at its own terminal.
     stop_requested: bool,
+    /// Whether the user took part in the active phase: a message at a hold or
+    /// a consumed steering batch. Such a phase holds at its boundary, so the
+    /// reply of the role waits for a read. A mid-turn Ctrl+N clears it, and a
+    /// fresh phase starts without it.
+    participated: bool,
     /// The cost of finished reviewer and fixer conversations, banked before
     /// each reset. The completion event adds the live role and judge costs.
     cost_banked: f64,
@@ -250,7 +255,7 @@ const ReviewFlow = struct {
     const Request = struct {
         /// Owned.
         text: []u8,
-        /// Whether the text is the judge correction request.
+        /// Whether the text is a correction request.
         correction: bool,
     };
 
@@ -1695,6 +1700,9 @@ fn handleTurnKey(self: *App, event: *const terminal.Input.Key) !void {
             } else {
                 try self.cancelTurn();
             },
+            // Ctrl+N during a review turn arms the automatic resume again, so
+            // a steered phase proceeds by itself although the user took part.
+            'n' => self.setReviewParticipation(false),
             'p' => try self.pullSteering(),
             else => {},
         },
@@ -2348,6 +2356,7 @@ fn startReview(self: *App) !void {
         .message = null,
         .steering = .empty,
         .stop_requested = false,
+        .participated = false,
         .cost_banked = 0,
     };
     self.startReviewTurn(.reviewer, request) catch |err| {
@@ -2454,15 +2463,19 @@ fn startReviewTurn(self: *App, role: Review.Role, request: []u8) !void {
     flow.hold = null;
     flow.hold_origin = null;
     flow.step = null;
+    // A fresh phase starts without participation, so an unattended run stays
+    // unattended and a read boundary never carries into the next role.
+    flow.participated = false;
+    self.session.review_participated = false;
     if (flow.request) |old| self.gpa.free(old.text);
     flow.request = .{ .text = request, .correction = false };
     self.session.setReviewCaption(title, review_turn_controls);
 }
 
-/// Start one more generated request in the active role context. The judge
-/// correction and a failure resend both run here, so the phase keeps its
-/// conversation and its transcript. A failure changes no phase state and frees
-/// the copy.
+/// Start one more generated request in the active role context. A role
+/// correction request and a failure resend both run here, so the phase keeps
+/// its conversation and its transcript. A failure changes no phase state and
+/// frees the copy.
 fn startReviewSuccessor(self: *App, request: []const u8, correction: bool) !void {
     const flow = &self.review.?;
     const copy = try self.gpa.dupe(u8, request);
@@ -2478,8 +2491,8 @@ fn startReviewSuccessor(self: *App, request: []const u8, correction: bool) !void
         errdefer self.gpa.free(title);
         const head = if (correction) try std.fmt.allocPrint(
             self.gpa,
-            "Request: Judge correction · Round: {d} of {d}",
-            .{ flow.machine.rounds_started, flow.machine.rounds_max },
+            "Request: {s} correction · Round: {d} of {d}",
+            .{ flow.role.?.label(), flow.machine.rounds_started, flow.machine.rounds_max },
         ) else try self.composeReviewRequestHead(flow.role.?);
         defer self.gpa.free(head);
         const base = self.session.transcript.blocks().len;
@@ -2523,12 +2536,17 @@ fn finishReviewPhase(self: *App) !void {
     try self.applyReviewStep(step, true);
 }
 
-/// Apply one workflow step. With `brake`, editor text holds the workflow at
-/// this boundary, and Ctrl+N applies the held step later. A stop on a broken
-/// judge never waits, because no continue can mend it.
+/// Apply one workflow step. With `brake`, editor text or participation holds
+/// the workflow at this boundary, and Ctrl+N applies the held step later. A
+/// stop on a broken role reply never waits, because no continue can mend it.
 fn applyReviewStep(self: *App, step: Review.Step, brake: bool) !void {
     const flow = &self.review.?;
-    if (brake and step != .stop_invalid and self.session.editor.visible().len != 0) {
+    // The brake reads two signals: text in the editor, and participation in
+    // the phase. Text releases when the editor clears, and participation
+    // holds until a mid-turn Ctrl+N arms the resume again, so a reply the
+    // user asked for waits for a read before the role resets.
+    const held = flow.participated or self.session.editor.visible().len != 0;
+    if (brake and step != .stop_invalid and held) {
         flow.hold = .user;
         flow.step = step;
         return self.showReviewCaption();
@@ -2563,16 +2581,19 @@ fn applyReviewStep(self: *App, step: Review.Step, brake: bool) !void {
 }
 
 /// Retain the direct message of the live turn, so its judge copy can queue
-/// once the turn commits it. A message outside a review finds no flow.
+/// once the turn commits it. A message outside a review finds no flow. The
+/// message is participation, so the boundary of this phase holds.
 fn retainReviewMessage(self: *App, text: []const u8) !void {
     const flow = if (self.review) |*flow| flow else return;
     const copy = try self.gpa.dupe(u8, text);
     if (flow.message) |old| self.gpa.free(old);
     flow.message = copy;
+    self.setReviewParticipation(true);
 }
 
 /// Retain one steering batch of the live turn, so its judge copy can queue
-/// once the turn commits it. A batch outside a review finds no flow.
+/// once the turn commits it. A batch outside a review finds no flow. Consumed
+/// steering is participation, so the boundary of this phase holds.
 fn retainReviewSteering(
     self: *App,
     consumed: *const Session.TurnEvent.Payload.SteeringConsumed,
@@ -2581,6 +2602,16 @@ fn retainReviewSteering(
     const copy = try self.gpa.dupe(u8, consumed.text);
     errdefer self.gpa.free(copy);
     try flow.steering.append(self.gpa, .{ .text = copy, .count = consumed.count });
+    self.setReviewParticipation(true);
+}
+
+/// Record whether the user takes part in the active phase, in the flow and in
+/// the caption mirror together, so the marker and the brake cannot disagree.
+fn setReviewParticipation(self: *App, participated: bool) void {
+    const flow = if (self.review) |*flow| flow else return;
+    flow.participated = participated;
+    self.session.review_participated = participated;
+    self.session.dirty = true;
 }
 
 /// Resolve the retained messages at the terminal of their turn, in the order
@@ -2633,6 +2664,10 @@ fn continueReview(self: *App) !void {
             const step = flow.step orelse return;
             flow.hold = null;
             flow.step = null;
+            // The continue consumes the participation, so a successor request
+            // in the same phase does not hold again for a reply the user
+            // already read.
+            self.setReviewParticipation(false);
             try self.applyReviewStep(step, false);
         },
         // Enter answers the judge, and Ctrl+E raises the ceiling.
@@ -2787,6 +2822,7 @@ fn stopReview(self: *App, end: ReviewEnd) !void {
     self.switchConversation(&flow.main);
     flow.deinit(self.gpa);
     self.session.setReviewCaption(null, "");
+    self.session.review_participated = false;
     // A role retry names work of a destroyed context.
     self.clearRetry();
     // The return resets the double-Ctrl+C timer, so a press from review mode
@@ -2805,9 +2841,9 @@ fn stopReview(self: *App, end: ReviewEnd) !void {
         ),
         .invalid => try self.recordEvent(
             .failure,
-            "Review stopped on a second invalid judge report. Rounds: {d} · Fixer passes: " ++
+            "Review stopped on a second invalid {s} report. Rounds: {d} · Fixer passes: " ++
                 "{d} · Cost: ${d:.2}",
-            .{ rounds, passes, cost },
+            .{ if (role) |value| @tagName(value) else "role", rounds, passes, cost },
         ),
     }
 }
@@ -2828,6 +2864,7 @@ fn quitReview(self: *App) !void {
     self.review = null;
     defer flow.deinit(self.gpa);
     self.session.setReviewCaption(null, "");
+    self.session.review_participated = false;
     self.running = false;
     try self.cancelTurn();
 }
@@ -7068,18 +7105,18 @@ test "/review needs a Git worktree and refuses a waiting retry or a second revie
     ) != null);
 }
 
-/// A review flow in the judge phase, installed by hand: the machine took one
-/// reviewer report, the active conversation is the judge, and the parked main
-/// conversation holds one marker block. The active agent history ends on
-/// `report`, so `finishReviewPhase` classifies it.
-fn installJudgeFlow(app: *App, report: []const u8) !void {
+/// Test helper: install a review flow by hand around `machine`, with `role`
+/// active over the app agent and the parked main conversation holding one
+/// marker block. The active agent history ends on `report`, so
+/// `finishReviewPhase` classifies it. The flow copies the machine, so a
+/// failure leaves the machine of the caller whole.
+fn installReviewFlow(
+    app: *App,
+    machine: *const Review,
+    role: Review.Role,
+    report: []const u8,
+) !void {
     const gpa = app.gpa;
-    var machine = Review.init(gpa, 4);
-    errdefer machine.deinit();
-    gpa.free(try machine.composeReviewerRequest());
-    _ = try machine.finishReviewer("Finding: a bug.");
-    gpa.free(try machine.composeJudgeRequest());
-
     var main_conversation: Conversation = .{
         .agent = ai.Agent.init(gpa, std.testing.io, null, .{
             .model = anthropic_default,
@@ -7096,10 +7133,10 @@ fn installJudgeFlow(app: *App, report: []const u8) !void {
     try app.agent.items.append(gpa, .{ .message = .{ .role = .assistant, .text = owned } });
 
     app.review = .{
-        .machine = machine,
+        .machine = machine.*,
         .main = main_conversation,
         .judge = null,
-        .role = .judge,
+        .role = role,
         .choices = .initFill(.{
             .account = .anthropic_api,
             .model = anthropic_default,
@@ -7112,8 +7149,31 @@ fn installJudgeFlow(app: *App, report: []const u8) !void {
         .message = null,
         .steering = .empty,
         .stop_requested = false,
+        .participated = false,
         .cost_banked = 0,
     };
+}
+
+/// A review flow in the judge phase: the machine took one reviewer report and
+/// composed the judge request.
+fn installJudgeFlow(app: *App, report: []const u8) !void {
+    const gpa = app.gpa;
+    var machine = Review.init(gpa, 4);
+    errdefer machine.deinit();
+    gpa.free(try machine.composeReviewerRequest());
+    _ = try machine.finishReviewer("Findings: 1.\nFinding: a bug.");
+    gpa.free(try machine.composeJudgeRequest());
+    try installReviewFlow(app, &machine, .judge, report);
+}
+
+/// A review flow in the reviewer phase: the round started, and no report
+/// arrived yet.
+fn installReviewerFlow(app: *App, report: []const u8) !void {
+    const gpa = app.gpa;
+    var machine = Review.init(gpa, 4);
+    errdefer machine.deinit();
+    gpa.free(try machine.composeReviewerRequest());
+    try installReviewFlow(app, &machine, .reviewer, report);
 }
 
 test "a settled judge report restores the main conversation and records completion" {
@@ -7908,12 +7968,81 @@ test "a postponed correction request keeps its budget" {
     };
     try app.finishWorkerResult(&committed);
     try std.testing.expect(app.review != null);
+    // The message was participation, so the boundary holds for a read of the
+    // reply, and the postponed correction still spends no budget.
+    try std.testing.expectEqual(ReviewFlow.Hold.user, app.review.?.hold.?);
+    try std.testing.expectEqual(Review.Step.request_correction, app.review.?.step.?);
+    try std.testing.expect(!app.review.?.machine.correction_requested);
+
+    // Ctrl+N continues, and only the sent correction spends the budget.
+    try app.handleKey(&.{ .ctrl = 'n' });
     try std.testing.expect(app.review.?.machine.correction_requested);
     try std.testing.expect(app.session.mode == .turn);
     {
         const blocks = app.session.transcript.blocks();
         try std.testing.expectEqualStrings(
             "Request: Judge correction · Round: 1 of 4",
+            blocks[blocks.len - 1].user_note.items,
+        );
+    }
+    {
+        const result = app.awaitTurnFuture().?;
+        defer app.freeWorkerResult(&result);
+        try app.finishWorkerResult(&result);
+    }
+
+    // Esc ends the workflow and frees every parked conversation.
+    try app.handleKey(&.escape);
+    try std.testing.expect(app.review == null);
+}
+
+// The latest reply of a phase governs the resume. An acknowledgment to the
+// user carries no findings line, so Ctrl+N must send the correction request in
+// the reviewer context and never ship the acknowledgment to the judge.
+test "ctrl+n after an unmarked reviewer reply sends the correction" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(home);
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    defer app.drainQueue();
+    app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
+    defer app.accounts.deinit();
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = anthropic_default,
+        .system = "",
+        .retry = .{},
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+    defer app.dropRetry();
+    try installReviewerFlow(&app, "Understood. I treat the steering as a test and ignore it.");
+    // The user steered the reviewer, so the boundary holds for a read.
+    app.setReviewParticipation(true);
+
+    // The reply carries no findings line, so the postponed step is the
+    // correction request, never the judge start.
+    try app.finishReviewPhase();
+    try std.testing.expectEqual(ReviewFlow.Hold.user, app.review.?.hold.?);
+    try std.testing.expectEqual(Review.Step.request_correction, app.review.?.step.?);
+
+    // Ctrl+N stays in the reviewer context and sends the correction request,
+    // so no judge request can carry the acknowledgment as a report.
+    try app.handleKey(&.{ .ctrl = 'n' });
+    try std.testing.expectEqual(Review.Role.reviewer, app.review.?.role.?);
+    try std.testing.expect(app.review.?.machine.correction_requested);
+    try std.testing.expect(app.review.?.machine.reviewer_report == null);
+    {
+        const blocks = app.session.transcript.blocks();
+        try std.testing.expectEqualStrings(
+            "Request: Reviewer correction · Round: 1 of 4",
             blocks[blocks.len - 1].user_note.items,
         );
     }
@@ -8101,7 +8230,7 @@ test "an allocation failure during a successor turn start frees its request once
 
         failing.fail_index = failing.alloc_index + fail_index;
         started = true;
-        app.startReviewSuccessor(Review.correction_request, true) catch {
+        app.startReviewSuccessor(Review.judge_correction_request, true) catch {
             started = false;
         };
         failing.fail_index = std.math.maxInt(usize);
@@ -8441,6 +8570,88 @@ test "a judge copy of a direct message waits for the turn that commits it" {
     // The completed turn ended the phase, so no request waits for a resend.
     try std.testing.expect(app.review.?.request == null);
 
+    try app.handleKey(&.escape);
+    try std.testing.expect(app.review == null);
+}
+
+// A phase the user takes part in holds at its boundary, so the reply of the
+// role waits for a read before the role resets. Ctrl+N at the hold consumes
+// the participation, and a mid-turn Ctrl+N arms the resume again.
+test "participation holds the boundary and ctrl+n arms the resume again" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(home);
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    defer app.drainQueue();
+    app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
+    defer app.accounts.deinit();
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = anthropic_default,
+        .system = "",
+        .retry = .{},
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+    defer app.dropRetry();
+    try installJudgeFlow(&app, "Decision: Fix required.\nFix the leak.");
+
+    // The message to the judge is participation, and the flow mirrors it into
+    // the caption state.
+    try sendReviewMessage(&app, "why is this a bug?");
+    try std.testing.expect(app.review.?.participated);
+    try std.testing.expect(app.session.review_participated);
+    {
+        const result = app.awaitTurnFuture().?;
+        app.freeWorkerResult(&result);
+    }
+
+    // The committed reply completes the phase, and the boundary holds for a
+    // read although the editor is empty.
+    const committed: WorkerResult = .{
+        .outcome = .{ .receipt = .{
+            .history_base = 0,
+            .history_end = 1,
+            .steering_committed_count = 0,
+        }, .disposition = .completed },
+        .error_text = null,
+    };
+    try app.finishWorkerResult(&committed);
+    try std.testing.expect(app.session.mode == .prompt);
+    try std.testing.expectEqual(ReviewFlow.Hold.user, app.review.?.hold.?);
+    try std.testing.expectEqual(Review.Step{ .start_fixer = .first }, app.review.?.step.?);
+
+    // Ctrl+N consumes the participation and starts the fixer, whose fresh
+    // phase begins without it.
+    try app.handleKey(&.{ .ctrl = 'n' });
+    try std.testing.expect(app.session.mode == .turn);
+    try std.testing.expectEqual(Review.Role.fixer, app.review.?.role.?);
+    try std.testing.expect(!app.review.?.participated);
+    try std.testing.expect(!app.session.review_participated);
+
+    // Consumed steering is participation, and a mid-turn Ctrl+N arms the
+    // automatic resume again.
+    const steered = try gpa.dupe(u8, "check the parser too");
+    defer gpa.free(steered);
+    try app.retainReviewSteering(&.{ .text = steered, .count = 1 });
+    try std.testing.expect(app.review.?.participated);
+    try app.handleKey(&.{ .ctrl = 'n' });
+    try std.testing.expect(!app.review.?.participated);
+    try std.testing.expect(!app.session.review_participated);
+
+    // Teardown: the fixer worker fails fast, and Esc ends the workflow.
+    {
+        const result = app.awaitTurnFuture().?;
+        defer app.freeWorkerResult(&result);
+        try app.finishWorkerResult(&result);
+    }
     try app.handleKey(&.escape);
     try std.testing.expect(app.review == null);
 }

@@ -187,6 +187,10 @@ retry_shown: bool,
 review_title: ?[]u8,
 /// The static controls beside `review_title`.
 review_controls: []const u8,
+/// Whether the user took part in the active review phase. `App` owns that
+/// state and mirrors this bit, so the running caption marks the boundary as
+/// one that holds, and its controls offer the key that arms the resume again.
+review_participated: bool,
 /// Milliseconds on the monotonic clock, written by the driver before each paint.
 /// The session does no io, so it cannot read a clock of its own. It stays zero
 /// until the first paint, which makes every span it reports zero. Every span of
@@ -550,6 +554,7 @@ pub fn init(
         .retry_shown = false,
         .review_title = null,
         .review_controls = "",
+        .review_participated = false,
         .clock_ms = 0,
         .boot_clock_ms = 0,
         .bash_timeout_ms = (ai.tool.Context.Bash{}).timeout_ms,
@@ -581,6 +586,17 @@ pub fn setReviewCaption(self: *Session, title: ?[]u8, controls: []const u8) void
     self.review_title = title;
     self.review_controls = controls;
     self.dirty = true;
+}
+
+/// The running review caption title with its resume marker. The boundary holds
+/// for text in the editor or for a phase the user took part in, so the marker
+/// reads both live: a cleared draft arms the resume again, and only Ctrl+N
+/// clears the participation. A title too long for the buffer keeps its bytes
+/// and drops the marker, so the round and the role always survive.
+fn reviewTurnTitle(self: *const Session, title: []const u8, buffer: []u8) []const u8 {
+    const holds = self.review_participated or self.editor.visible().len != 0;
+    const label: []const u8 = if (holds) "Hold" else "Auto";
+    return std.fmt.bufPrint(buffer, "{s} · Resume: {s}", .{ title, label }) catch title;
 }
 
 /// A conversation's whole presentation state: its own transcript, its request
@@ -1492,9 +1508,11 @@ pub fn paint(self: *Session, size: terminal.View.Size) !void {
         } else null,
     };
 
-    // The caption borrows this buffer through `layout.project` below. Its 64
-    // bytes hold the 17-byte label and every decimal `usize` value.
+    // The captions borrow these buffers through `layout.project` below. The
+    // steering bytes hold the 17-byte label and every decimal `usize` value,
+    // and the review bytes hold the longest running title with its marker.
     var steering_title_buffer: [64]u8 = undefined;
+    var review_title_buffer: [96]u8 = undefined;
     const tail: layout.Tail = switch (self.mode) {
         .prompt => prompt: {
             self.editor.reflow(size);
@@ -1533,8 +1551,14 @@ pub fn paint(self: *Session, size: terminal.View.Size) !void {
                         .controls = steering_controls,
                         .rows_max = editor_caption_rows_max,
                     } else if (self.review_title) |title| .{
-                        .title = title,
-                        .controls = self.review_controls,
+                        .title = self.reviewTurnTitle(title, &review_title_buffer),
+                        // The key that arms the resume again shows only while
+                        // the participation holds the boundary, so the row
+                        // never offers a key that does nothing.
+                        .controls = if (self.review_participated)
+                            "Enter: Steer · Ctrl+N: Auto · Esc: Stop"
+                        else
+                            self.review_controls,
                         .rows_max = editor_caption_rows_max,
                     } else null,
                     .editor = &self.editor,
@@ -3970,4 +3994,64 @@ test "a conversation switch swaps whole and can restore what it replaced" {
     const restored_start = out.written().len;
     try session.paint(.{ .columns = 80, .rows = 24 });
     try expectPainted(gpa, out.written()[restored_start..], "weigh it");
+}
+
+// The running review caption marks the next boundary live: text in the editor
+// holds it and releases when the editor clears, and participation holds it
+// until the app clears that flag. The controls offer the re-arm key only
+// while the participation holds the boundary.
+test "the review caption marks whether the boundary resumes by itself" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var session = Session.init(gpa, &out.writer, test_model, .none);
+    defer session.deinit();
+    session.beginTurn(1);
+    session.setReviewCaption(
+        try gpa.dupe(u8, "Review: Round 1 of 4 · Judge"),
+        "Enter: Steer · Esc: Stop",
+    );
+
+    // An empty editor without participation resumes by itself.
+    var start = out.written().len;
+    try session.paint(.{ .columns = 120, .rows = 24 });
+    try expectPainted(gpa, out.written()[start..], "Resume: Auto");
+
+    // Text in the editor holds the boundary, and a cleared editor arms the
+    // resume again.
+    try session.editor.insert("wait");
+    start = out.written().len;
+    try session.paint(.{ .columns = 120, .rows = 24 });
+    try expectPainted(gpa, out.written()[start..], "Resume: Hold");
+    session.editor.clear();
+    start = out.written().len;
+    try session.paint(.{ .columns = 120, .rows = 24 });
+    try expectPainted(gpa, out.written()[start..], "Resume: Auto");
+
+    // Participation holds the boundary whatever the editor does, and the
+    // controls then offer the key that arms the resume again.
+    session.review_participated = true;
+    start = out.written().len;
+    try session.paint(.{ .columns = 120, .rows = 24 });
+    try expectPainted(gpa, out.written()[start..], "Resume: Hold");
+    try expectPainted(gpa, out.written()[start..], "Ctrl+N: Auto");
+
+    // The cleared flag arms the resume and takes the key out of the row.
+    session.review_participated = false;
+    start = out.written().len;
+    try session.paint(.{ .columns = 120, .rows = 24 });
+    const rearmed = try terminal.View.plainText(gpa, out.written()[start..]);
+    defer gpa.free(rearmed);
+    try std.testing.expect(std.mem.indexOf(u8, rearmed, "Resume: Auto") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rearmed, "Ctrl+N: Auto") == null);
+
+    // A hold caption at the prompt carries no marker, because no boundary can
+    // resume while the workflow waits.
+    session.endTurn();
+    start = out.written().len;
+    try session.paint(.{ .columns = 120, .rows = 24 });
+    const held = try terminal.View.plainText(gpa, out.written()[start..]);
+    defer gpa.free(held);
+    try std.testing.expect(std.mem.indexOf(u8, held, "Review: Round 1 of 4 · Judge") != null);
+    try std.testing.expect(std.mem.indexOf(u8, held, "Resume:") == null);
 }
