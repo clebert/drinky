@@ -220,8 +220,8 @@ const ReviewFlow = struct {
     choices: std.EnumArray(Review.Role, State.RoleChoice),
     /// The generated request that no role conversation holds, or null. A
     /// failure that commits nothing keeps it, because no editor line
-    /// reproduces it, and Ctrl+N resends it whole. Owned.
-    request: ?[]u8,
+    /// reproduces it, and Ctrl+N resends it whole.
+    request: ?Request,
     /// The hold the workflow waits in, or null while a phase runs or drives.
     hold: ?Hold,
     /// The hold that the live work of the user started from, or null when the
@@ -245,6 +245,15 @@ const ReviewFlow = struct {
     /// each reset. The completion event adds the live role and judge costs.
     cost_banked: f64,
 
+    /// One generated request that waits for a resend. The kind travels with
+    /// the text, so the resend records the head line of the request it sends.
+    const Request = struct {
+        /// Owned.
+        text: []u8,
+        /// Whether the text is the judge correction request.
+        correction: bool,
+    };
+
     /// Why the workflow waits for the user.
     const Hold = enum { user, judge, limit, failure };
 
@@ -263,7 +272,7 @@ const ReviewFlow = struct {
         self.machine.deinit();
         self.main.deinit();
         if (self.judge) |*judge| judge.deinit();
-        if (self.request) |request| gpa.free(request);
+        if (self.request) |request| gpa.free(request.text);
         if (self.message) |message| gpa.free(message);
         for (self.steering.items) |batch| gpa.free(batch.text);
         self.steering.deinit(gpa);
@@ -2383,8 +2392,9 @@ fn roleConversation(
 /// Switch to `role`, start its phase turn over `request`, and park the
 /// conversation the switch replaces. Takes ownership of `request`. On failure
 /// the previous conversation stays active and nothing is parked. The
-/// transcript shows the complete request as a line that Drinky wrote, and a
-/// turn that commits nothing takes it out again.
+/// transcript records one head line that names the request, and a turn that
+/// commits nothing takes it out again. The request itself stays out, as a
+/// retry attempt and a skill line keep their requests out.
 fn startReviewTurn(self: *App, role: Review.Role, request: []u8) !void {
     const flow = &self.review.?;
     var title: []u8 = undefined;
@@ -2392,11 +2402,13 @@ fn startReviewTurn(self: *App, role: Review.Role, request: []u8) !void {
         // The transfer below ends this window, so no later failure frees a
         // slice that the flow owns.
         errdefer self.gpa.free(request);
-        // The caption allocates here, because every step after the parking
-        // must be infallible. A failure there leaves the caller no way to
-        // restore the parked conversation.
+        // The caption and the head allocate here, because every step after
+        // the parking must be infallible. A failure there leaves the caller
+        // no way to restore the parked conversation.
         title = try self.composeReviewTitle(role);
         errdefer self.gpa.free(title);
+        const head = try self.composeReviewRequestHead(role);
+        defer self.gpa.free(head);
         const choice = flow.choices.get(role);
         var target: Conversation = undefined;
         if (role == .judge and flow.judge != null) {
@@ -2419,7 +2431,7 @@ fn startReviewTurn(self: *App, role: Review.Role, request: []u8) !void {
             }
             const base = self.session.transcript.blocks().len;
             errdefer self.session.transcript.truncate(base);
-            try self.session.transcript.append(.user_note, .{}, request);
+            try self.session.transcript.append(.user_note, .{}, head);
             try self.runTurn(request);
             self.session.markTurnBase(base);
         }
@@ -2442,8 +2454,8 @@ fn startReviewTurn(self: *App, role: Review.Role, request: []u8) !void {
     flow.hold = null;
     flow.hold_origin = null;
     flow.step = null;
-    if (flow.request) |old| self.gpa.free(old);
-    flow.request = request;
+    if (flow.request) |old| self.gpa.free(old.text);
+    flow.request = .{ .text = request, .correction = false };
     self.session.setReviewCaption(title, review_turn_controls);
 }
 
@@ -2451,7 +2463,7 @@ fn startReviewTurn(self: *App, role: Review.Role, request: []u8) !void {
 /// correction and a failure resend both run here, so the phase keeps its
 /// conversation and its transcript. A failure changes no phase state and frees
 /// the copy.
-fn startReviewSuccessor(self: *App, request: []const u8) !void {
+fn startReviewSuccessor(self: *App, request: []const u8, correction: bool) !void {
     const flow = &self.review.?;
     const copy = try self.gpa.dupe(u8, request);
     var title: []u8 = undefined;
@@ -2459,18 +2471,25 @@ fn startReviewSuccessor(self: *App, request: []const u8) !void {
         // The transfer below ends this window, so no later failure frees a
         // slice that the flow owns.
         errdefer self.gpa.free(copy);
-        // The caption allocates here, because every step after the turn start
-        // must be infallible. Only an active role runs a successor turn.
+        // The caption and the head allocate here, because every step after
+        // the turn start must be infallible. Only an active role runs a
+        // successor turn.
         title = try self.composeReviewTitle(flow.role.?);
         errdefer self.gpa.free(title);
+        const head = if (correction) try std.fmt.allocPrint(
+            self.gpa,
+            "Request: Judge correction · Round: {d} of {d}",
+            .{ flow.machine.rounds_started, flow.machine.rounds_max },
+        ) else try self.composeReviewRequestHead(flow.role.?);
+        defer self.gpa.free(head);
         const base = self.session.transcript.blocks().len;
         errdefer self.session.transcript.truncate(base);
-        try self.session.transcript.append(.user_note, .{}, copy);
+        try self.session.transcript.append(.user_note, .{}, head);
         try self.runTurn(copy);
         self.session.markTurnBase(base);
     }
-    if (flow.request) |old| self.gpa.free(old);
-    flow.request = copy;
+    if (flow.request) |old| self.gpa.free(old.text);
+    flow.request = .{ .text = copy, .correction = correction };
     flow.hold = null;
     flow.hold_origin = null;
     flow.step = null;
@@ -2526,6 +2545,7 @@ fn applyReviewStep(self: *App, step: Review.Step, brake: bool) !void {
         ),
         .request_correction => try self.startReviewSuccessor(
             flow.machine.composeCorrectionRequest(),
+            true,
         ),
         .hold_judge => {
             flow.hold = .judge;
@@ -2622,7 +2642,7 @@ fn continueReview(self: *App) !void {
         // behind it names no Ctrl+N, and the key acts on nothing.
         .failure => {
             const request = flow.request orelse return;
-            try self.startReviewSuccessor(request);
+            try self.startReviewSuccessor(request.text, request.correction);
         },
     }
 }
@@ -2668,12 +2688,33 @@ fn holdReviewFailure(self: *App, committed: bool) !void {
 fn dropReviewRequest(self: *App) void {
     const flow = &self.review.?;
     const request = flow.request orelse return;
-    self.gpa.free(request);
+    self.gpa.free(request.text);
     flow.request = null;
 }
 
 /// The controls of a running phase turn.
 const review_turn_controls = "Enter: Steer · Esc: Stop";
+
+/// The transcript line of one generated request: the role it goes to and
+/// where the workflow stands. The request itself stays out of the transcript,
+/// as a retry attempt and a skill line keep their requests out, so the judge
+/// view never reads as a mix of the role transcripts. The caller owns the
+/// line.
+fn composeReviewRequestHead(self: *App, role: Review.Role) ![]u8 {
+    const machine = &self.review.?.machine;
+    return switch (machine.phase) {
+        .fixer => |pass| std.fmt.allocPrint(
+            self.gpa,
+            "Request: {s} · Round: {d} of {d} · Pass: {d}",
+            .{ role.label(), machine.rounds_started, machine.rounds_max, pass.number() },
+        ),
+        else => std.fmt.allocPrint(
+            self.gpa,
+            "Request: {s} · Round: {d} of {d}",
+            .{ role.label(), machine.rounds_started, machine.rounds_max },
+        ),
+    };
+}
 
 /// The caption title of a running phase turn: the round, the ceiling, and the
 /// role. The caller owns it.
@@ -7194,8 +7235,8 @@ test "a fix decision starts the fixer, a failed request resends, and Esc stops" 
     try installJudgeFlow(&app, "Decision: Fix required.\nFix the leak.");
 
     // The fix decision parks the judge and starts the pass-1 fixer over the
-    // whole judge report. The transcript shows the complete request as a line
-    // that Drinky wrote.
+    // whole judge report. The transcript records the head line that Drinky
+    // wrote, and the request stays out.
     try app.finishReviewPhase();
     try std.testing.expect(app.session.mode == .turn);
     try std.testing.expectEqual(Review.Role.fixer, app.review.?.role.?);
@@ -7203,15 +7244,12 @@ test "a fix decision starts the fixer, a failed request resends, and Esc stops" 
     try std.testing.expectEqualStrings("Review: Round 1 of 4 · Fixer", app.session.review_title.?);
     try std.testing.expectEqualStrings("Enter: Steer · Esc: Stop", app.session.review_controls);
     {
+        // The head names the request, and the request itself stays out, so
+        // the fixer view never shows the embedded judge report.
         const blocks = app.session.transcript.blocks();
         try std.testing.expectEqual(@as(usize, 1), blocks.len);
         const note = blocks[0].user_note.items;
-        try std.testing.expect(std.mem.indexOf(
-            u8,
-            note,
-            "<fixer_request round=\"1\" pass=\"1\">",
-        ) != null);
-        try std.testing.expect(std.mem.indexOf(u8, note, "Fix the leak.") != null);
+        try std.testing.expectEqualStrings("Request: Fixer · Round: 1 of 4 · Pass: 1", note);
     }
 
     // The signed-out worker fails without a commit, so no retry arms and the
@@ -7239,11 +7277,10 @@ test "a fix decision starts the fixer, a failed request resends, and Esc stops" 
     {
         const blocks = app.session.transcript.blocks();
         try std.testing.expect(blocks[0].event.is_error);
-        try std.testing.expect(std.mem.indexOf(
-            u8,
+        try std.testing.expectEqualStrings(
+            "Request: Fixer · Round: 1 of 4 · Pass: 1",
             blocks[blocks.len - 1].user_note.items,
-            "<fixer_request round=\"1\" pass=\"1\">",
-        ) != null);
+        );
     }
     {
         const result = app.awaitTurnFuture().?;
@@ -7525,7 +7562,10 @@ test "a credential disposition at a role turn holds the workflow and keeps the r
         try installJudgeFlow(&app, "Decision: Fix required.\nFix the leak.");
         // The judge phase turn stored its generated request, so the resend of
         // that request stands behind Ctrl+N at the failure hold.
-        app.review.?.request = try gpa.dupe(u8, "<judge_request round=\"1\">");
+        app.review.?.request = .{
+            .text = try gpa.dupe(u8, "<judge_request round=\"1\">"),
+            .correction = false,
+        };
 
         // The parked main conversation holds a replay proof of the same
         // principal, and the block that shows it.
@@ -7872,11 +7912,86 @@ test "a postponed correction request keeps its budget" {
     try std.testing.expect(app.session.mode == .turn);
     {
         const blocks = app.session.transcript.blocks();
-        try std.testing.expect(std.mem.indexOf(
-            u8,
+        try std.testing.expectEqualStrings(
+            "Request: Judge correction · Round: 1 of 4",
             blocks[blocks.len - 1].user_note.items,
-            "<judge_report_correction>",
-        ) != null);
+        );
+    }
+    {
+        const result = app.awaitTurnFuture().?;
+        defer app.freeWorkerResult(&result);
+        try app.finishWorkerResult(&result);
+    }
+
+    // Esc ends the workflow and frees every parked conversation.
+    try app.handleKey(&.escape);
+    try std.testing.expect(app.review == null);
+}
+
+// A correction request that commits nothing waits in the failure hold, and the
+// resend must name the request that it sends. The head of the resent turn
+// therefore repeats the correction head, never the plain judge head.
+test "a resent correction request records the correction head" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(home);
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    defer app.drainQueue();
+    // No account is authenticated, so the judge worker fails fast at the
+    // sign-in gate instead of reaching the network.
+    app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
+    defer app.accounts.deinit();
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = anthropic_default,
+        .system = "",
+        .retry = .{},
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+    defer app.dropRetry();
+    try installJudgeFlow(&app, "The target looks fine to me.");
+
+    // The invalid report sends the one correction request, and its head names
+    // the correction.
+    try app.finishReviewPhase();
+    try std.testing.expect(app.session.mode == .turn);
+    {
+        const blocks = app.session.transcript.blocks();
+        try std.testing.expectEqualStrings(
+            "Request: Judge correction · Round: 1 of 4",
+            blocks[blocks.len - 1].user_note.items,
+        );
+    }
+
+    // The signed-out worker fails without a commit, so the correction request
+    // waits behind Ctrl+N at the failure hold.
+    {
+        const result = app.awaitTurnFuture().?;
+        defer app.freeWorkerResult(&result);
+        try app.finishWorkerResult(&result);
+    }
+    try std.testing.expect(app.retry == null);
+    try std.testing.expectEqual(ReviewFlow.Hold.failure, app.review.?.hold.?);
+    try std.testing.expect(app.review.?.request != null);
+
+    // Ctrl+N sends the same correction request again, so the head of the
+    // resent turn names the correction too.
+    try app.handleKey(&.{ .ctrl = 'n' });
+    try std.testing.expect(app.session.mode == .turn);
+    {
+        const blocks = app.session.transcript.blocks();
+        try std.testing.expectEqualStrings(
+            "Request: Judge correction · Round: 1 of 4",
+            blocks[blocks.len - 1].user_note.items,
+        );
     }
     {
         const result = app.awaitTurnFuture().?;
@@ -7986,7 +8101,7 @@ test "an allocation failure during a successor turn start frees its request once
 
         failing.fail_index = failing.alloc_index + fail_index;
         started = true;
-        app.startReviewSuccessor(Review.correction_request) catch {
+        app.startReviewSuccessor(Review.correction_request, true) catch {
             started = false;
         };
         failing.fail_index = std.math.maxInt(usize);

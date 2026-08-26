@@ -183,8 +183,10 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - Every role runs in its own conversation with the shared instructions, skills, and tools. The
   reviewer and the judge work under nonmutation prompts, and the fixer changes files like a normal
   turn.
-- Each generated request shows whole in the transcript as a line that Drinky wrote, and a caption
-  above the editor names the round, the active role, and the controls.
+- Each generated request records one head line that Drinky wrote, such as
+  `Request: Fixer · Round: 2 of 4 · Pass: 1`. The request itself stays out of the transcript, like
+  a loaded skill file and a retry request. A caption above the editor names the round, the active
+  role, and the controls.
 - The editor is the brake: an empty editor lets the workflow run unattended, and text holds it at
   the next boundary. Enter steers the active role, and a message that reaches the reviewer or the
   fixer gets one judge copy, so a report never reads as a user instruction.

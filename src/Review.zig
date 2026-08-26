@@ -76,8 +76,8 @@ pub const Pass = enum {
     first,
     second,
 
-    /// The pass number that a generated request names.
-    fn number(self: Pass) u64 {
+    /// The pass number that a generated request and its transcript line name.
+    pub fn number(self: Pass) u64 {
         return switch (self) {
             .first => 1,
             .second => 2,
