@@ -513,6 +513,26 @@ fn contextShown(self: *const Agent) ?u64 {
     return if (self.holdsProofOf(account)) null else measured.tokens;
 }
 
+/// The text of the latest complete reply: every trailing assistant message,
+/// joined by one blank line. A completed turn ends on assistant text, so this
+/// is the report of that turn, and a successor turn replaces it. The caller
+/// owns the result, and a history without a trailing reply returns empty text.
+pub fn latestReplyAlloc(self: *const Agent, gpa: std.mem.Allocator) ![]u8 {
+    var start = self.items.items.len;
+    while (start > 0) {
+        const item = self.items.items[start - 1];
+        if (item != .message or item.message.role != .assistant) break;
+        start -= 1;
+    }
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    for (self.items.items[start..], 0..) |item, index| {
+        if (index > 0) try out.writer.writeAll("\n\n");
+        try out.writer.writeAll(item.message.text);
+    }
+    return out.toOwnedSlice();
+}
+
 /// Whether the history holds one stored reasoning proof of `account`. Only such
 /// a proof can enter or leave the prompt of that account.
 ///
@@ -1467,6 +1487,38 @@ test "resetConversation clears conversation state and preserves configuration" {
     try std.testing.expectEqual(account, agent.client.?.account());
     try std.testing.expectEqualStrings(model.name, agent.model.name);
     try std.testing.expectEqual(llm.Effort.high, agent.effort);
+}
+
+test "the latest reply is the trailing assistant text and nothing before it" {
+    const gpa = std.testing.allocator;
+    var agent = scriptedAgent(gpa);
+    defer agent.deinit();
+
+    // An empty history holds no reply.
+    const empty = try agent.latestReplyAlloc(gpa);
+    defer gpa.free(empty);
+    try std.testing.expectEqualStrings("", empty);
+
+    try agent.appendUser("review the target");
+    const first = try gpa.dupe(u8, "Finding: a bug.");
+    try agent.items.append(gpa, .{ .message = .{ .role = .assistant, .text = first } });
+    const one = try agent.latestReplyAlloc(gpa);
+    defer gpa.free(one);
+    try std.testing.expectEqualStrings("Finding: a bug.", one);
+
+    // A later user message ends the reply, and the next assistant run joins
+    // its parts with one blank line.
+    try agent.appendUser("check the parser too");
+    const second = try gpa.dupe(u8, "Decision: Fix required.");
+    try agent.items.append(gpa, .{ .message = .{ .role = .assistant, .text = second } });
+    const third = try gpa.dupe(u8, "The parser drops the sign.");
+    try agent.items.append(gpa, .{ .message = .{ .role = .assistant, .text = third } });
+    const joined = try agent.latestReplyAlloc(gpa);
+    defer gpa.free(joined);
+    try std.testing.expectEqualStrings(
+        "Decision: Fix required.\n\nThe parser drops the sign.",
+        joined,
+    );
 }
 
 test "an account change or sign-out clears the previous account's quota" {

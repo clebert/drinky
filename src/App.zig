@@ -25,6 +25,7 @@ const Config = @import("Config.zig");
 const describe = @import("describe.zig");
 const layout = @import("layout.zig");
 const Retry = @import("Retry.zig");
+const Review = @import("Review.zig");
 const Session = @import("Session.zig");
 const State = @import("State.zig");
 const system_prompt = @import("system_prompt.zig");
@@ -141,6 +142,20 @@ turn_generation: u64,
 /// The retry context of the latest failed turn, or null when none waits. It
 /// lives at the prompt alone, because the start of any turn takes it.
 retry: ?Retry,
+/// The active `/review` workflow, or null when none runs. The active role's
+/// conversation lives in `agent` and `session`, so the flow parks only the
+/// inactive ones.
+review: ?ReviewFlow,
+/// The reviewer-round ceiling that a new workflow starts on, from the config.
+review_rounds_max: u64,
+/// The composed role prompts of the review workflow. Each role agent borrows
+/// one of them, and the fixer takes the main `prompt`. Both outlive the agents.
+reviewer_prompt: []const u8,
+judge_prompt: []const u8,
+/// The live review setup that the `/review` pickers read and write, or null
+/// before the first setup opens. It stays behind a closed picker, because a
+/// selector reaches it only through a picker that the app opened on it.
+review_setup: ?ai.command.Context.ReviewSetup,
 /// Whether the live turn is a retry attempt. Its failure arms the context again,
 /// because the committed work that it continues from is still in history.
 turn_retry: bool,
@@ -174,12 +189,89 @@ pub const Conversation = struct {
     agent: ai.Agent,
     presentation: Session.Conversation,
 
+    /// Forget everything the principal behind `account` produced here: the
+    /// replay proofs in history, and the reasoning blocks that hold them. A
+    /// parked conversation shows no row, so this needs no repaint.
+    fn dropAccountEvidence(self: *Conversation, account: ai.llm.Account) void {
+        self.agent.dropAccountEvidence(account);
+        self.presentation.dropAccountReasoning(account);
+    }
+
     pub fn deinit(self: *Conversation) void {
         const gpa = self.agent.gpa;
         self.agent.deinit();
         self.presentation.deinit(gpa);
     }
 };
+
+/// The active `/review` workflow: the machine, the parked conversations, and
+/// the phase bookkeeping. The workflow owns every role conversation that is not
+/// active, and the completion restores the parked main conversation.
+const ReviewFlow = struct {
+    machine: Review,
+    /// The parked main conversation while the workflow runs.
+    main: Conversation,
+    /// The persistent judge conversation between judge phases, or null while
+    /// the judge itself runs or before its first phase.
+    judge: ?Conversation,
+    /// The active role, or null while the main conversation is still active.
+    role: ?Review.Role,
+    /// The role setup of this workflow.
+    choices: std.EnumArray(Review.Role, State.RoleChoice),
+    /// The generated request that no role conversation holds, or null. A
+    /// failure that commits nothing keeps it, because no editor line
+    /// reproduces it, and Ctrl+N resends it whole. Owned.
+    request: ?[]u8,
+    /// The hold the workflow waits in, or null while a phase runs or drives.
+    hold: ?Hold,
+    /// The hold that the live work of the user started from, or null when the
+    /// workflow started that work itself. The work spans the turn, a committed
+    /// failure of it, and the attempt that continues it. Work that commits
+    /// nothing returns the workflow to this hold, and the postponed step stays
+    /// with it.
+    hold_origin: ?Hold,
+    /// The step a user hold postponed. Ctrl+N applies it.
+    step: ?Review.Step,
+    /// The direct message of the live turn, until the turn commits it. The
+    /// judge copy queues at that commit alone. Owned.
+    message: ?[]u8,
+    /// The steering batches of the live turn, in delivery order. Each one
+    /// waits for the commit that the receipt reports. Owned.
+    steering: std.ArrayList(SteeringBatch),
+    /// Whether the user stopped the workflow while a turn ran. A worker that
+    /// won the cancellation race honors the stop at its own terminal.
+    stop_requested: bool,
+    /// The cost of finished reviewer and fixer conversations, banked before
+    /// each reset. The completion event adds the live role and judge costs.
+    cost_banked: f64,
+
+    /// Why the workflow waits for the user.
+    const Hold = enum { user, judge, limit, failure };
+
+    /// One steering batch that a turn folded in: the combined text and the
+    /// count of drafts it delivered. The receipt names how many drafts the
+    /// turn committed, so the counts decide which batch gets a judge copy.
+    const SteeringBatch = struct {
+        /// Owned.
+        text: []u8,
+        count: usize,
+    };
+
+    /// Free everything the flow still parks. The caller resolves the active
+    /// conversation first, so a teardown and a completion both end here.
+    fn deinit(self: *ReviewFlow, gpa: std.mem.Allocator) void {
+        self.machine.deinit();
+        self.main.deinit();
+        if (self.judge) |*judge| judge.deinit();
+        if (self.request) |request| gpa.free(request);
+        if (self.message) |message| gpa.free(message);
+        for (self.steering.items) |batch| gpa.free(batch.text);
+        self.steering.deinit(gpa);
+    }
+};
+
+/// How a review workflow ended, for its completion event.
+const ReviewEnd = enum { settled, stopped, invalid };
 
 /// The frame grid: the deadlines that pace the repaints. Each deadline is one
 /// interval after the previous deadline, not one interval after the previous
@@ -624,6 +716,32 @@ pub fn run(
         .denied_commands = config.bash.deny,
     });
     defer gpa.free(self.prompt);
+    // The review roles carry the same guidance as a normal turn around their
+    // own cores, so their prompts compose from the same sources. The fixer
+    // changes files like a normal turn and takes the main prompt.
+    self.reviewer_prompt = try system_prompt.compose(gpa, &.{
+        .core = Review.reviewer_core,
+        .current_time = std.Io.Clock.real.now(io),
+        .working_directory = cwd,
+        .user_instructions = config.user_instructions.files(),
+        .project_instructions = &self.project_instructions,
+        .skills = self.skills.catalog(),
+        .required_skills = self.skill_guard.rules(),
+        .denied_commands = config.bash.deny,
+    });
+    defer gpa.free(self.reviewer_prompt);
+    self.judge_prompt = try system_prompt.compose(gpa, &.{
+        .core = Review.judge_core,
+        .current_time = std.Io.Clock.real.now(io),
+        .working_directory = cwd,
+        .user_instructions = config.user_instructions.files(),
+        .project_instructions = &self.project_instructions,
+        .skills = self.skills.catalog(),
+        .required_skills = self.skill_guard.rules(),
+        .denied_commands = config.bash.deny,
+    });
+    defer gpa.free(self.judge_prompt);
+    self.review_rounds_max = config.review_rounds_max;
     self.document = try describe.compose(gpa, &.{
         .config = &config,
         .defaults = .{
@@ -734,6 +852,12 @@ pub fn run(
             config.gauge.percent_warning,
             config.gauge.percent_error,
         },
+    );
+    if (config.dropped_review_rounds) |dropped| try self.recordEvent(
+        .failure,
+        "Drinky ignored the configured review round count {d} because the count must be at " ++
+            "least 1. Drinky uses the default count of {d} rounds.",
+        .{ dropped, config.review_rounds_max },
     );
     if (config.dropped_deny_empty) try self.recordEvent(
         .failure,
@@ -848,6 +972,11 @@ fn initFields(self: *App, gpa: std.mem.Allocator, io: std.Io) void {
         .pending_turn_result = null,
         .turn_generation = 0,
         .retry = null,
+        .review = null,
+        .review_rounds_max = Config.review_rounds_default,
+        .reviewer_prompt = "",
+        .judge_prompt = "",
+        .review_setup = null,
         .turn_retry = false,
         .tick_future = null,
         .tick_pending = false,
@@ -873,7 +1002,13 @@ fn prepareTerminalExit(self: *App) void {
 /// the tty restores termios.
 fn shutdownTasks(self: *App) void {
     // Shutdown is teardown, not an interactive cancel: free the worker result's
-    // owned terminal text and leave the session untouched.
+    // owned terminal text and leave the session untouched. The active role
+    // conversation tears down through the agent and session defers, so the
+    // flow frees only what it parks.
+    if (self.review) |*flow| {
+        flow.deinit(self.gpa);
+        self.review = null;
+    }
     self.dropRetry();
     if (self.cancelTurnFuture()) |result| self.freeWorkerResult(&result);
     if (self.pending_turn_result) |result| {
@@ -949,18 +1084,30 @@ fn finishWorkerResult(self: *App, result: *const WorkerResult) !void {
     self.session.stats_shown = self.agent.stats;
     // A turn can check out another branch, so the status line settles here.
     self.refreshBranch();
+    const receipt = &result.outcome.receipt;
+    // The judge copies resolve before any transition, so a step that composes
+    // the next judge request carries them.
+    try self.resolveReviewMessages(receipt);
     switch (result.outcome.disposition) {
         .completed => {
             _ = self.takeTurnRetry();
             try self.session.endTurnWithReceipt(&result.outcome.receipt);
+            // Late steering returns first, so the restored text brakes the
+            // workflow at this boundary.
             if (self.session.hasSteering()) try self.returnLateSteering();
+            try self.resolveReviewStop();
+            if (self.review != null) try self.finishReviewPhase();
         },
+        // The workflow resolves between the failed turn and the credential
+        // work, because that work can open a picker and it belongs to the
+        // restored main conversation.
         .credential_replaced => {
             const account = self.activeAccount() orelse
                 return error.UnexpectedCredentialReplacement;
             if (!account.hasRefreshCredential())
                 return error.UnexpectedCredentialReplacement;
-            try self.finishFailedWorker(result, null);
+            try self.finishFailedWorker(result);
+            try self.resolveReviewFailure(receipt);
             try self.acceptCredentialReplacement(account);
         },
         .credential_rejected => {
@@ -968,20 +1115,40 @@ fn finishWorkerResult(self: *App, result: *const WorkerResult) !void {
                 return error.UnexpectedTokenGrantRejection;
             if (!account.hasRefreshCredential())
                 return error.UnexpectedTokenGrantRejection;
-            try self.finishFailedWorker(result, account);
+            try self.finishFailedWorker(result);
+            try self.resolveReviewFailure(receipt);
+            try self.rejectCredential(account);
         },
-        .failed => try self.finishFailedWorker(result, null),
+        .failed => {
+            try self.finishFailedWorker(result);
+            try self.resolveReviewFailure(receipt);
+        },
         .canceled, .closed => return error.UnexpectedTurnDisposition,
     }
 }
 
-/// Apply one failed result, arm its retry, then invalidate its rejected account
-/// when present.
-fn finishFailedWorker(
-    self: *App,
-    result: *const WorkerResult,
-    maybe_rejected: ?ai.llm.Account,
-) !void {
+/// End the workflow when the user stopped it while a worker won the
+/// cancellation race. The joined result has resolved the session by now, so the
+/// stop restores a clean prompt and no later phase turn can follow it.
+fn resolveReviewStop(self: *App) !void {
+    const flow = if (self.review) |*flow| flow else return;
+    if (!flow.stop_requested) return;
+    try self.stopReview(.stopped);
+}
+
+/// Resolve the workflow at the terminal of a failed role turn: honor a stop
+/// that a worker beat, else enter the hold whose controls act. Every failed
+/// disposition passes here, so no joined result leaves the workflow without an
+/// action.
+fn resolveReviewFailure(self: *App, receipt: *const ai.Agent.Receipt) !void {
+    try self.resolveReviewStop();
+    if (self.review == null) return;
+    try self.holdReviewFailure(receipt.history_end != receipt.history_base);
+}
+
+/// Apply one failed result and arm its retry. A rejected credential is the work
+/// of the caller, because a stopped review workflow resolves between the two.
+fn finishFailedWorker(self: *App, result: *const WorkerResult) !void {
     // The turn ends here whatever follows, so its attempt flag resolves first.
     const attempt = self.takeTurnRetry();
     try self.session.reserveFailureRestore(&result.outcome.receipt);
@@ -990,7 +1157,6 @@ fn finishFailedWorker(
     // that step infallible. The arm allocates, so it stays outside that window.
     try self.session.failTurnWithReceipt(&result.outcome.receipt, result.error_text);
     try self.armRetry(result, attempt);
-    if (maybe_rejected) |account| try self.rejectCredential(account);
 }
 
 /// Arm one retry context from a failed turn, so Ctrl+N can ask the model to
@@ -1133,6 +1299,12 @@ fn applyBatch(self: *App, events: []const Session.UiEvent) !bool {
                 try self.handleKeys(bytes);
             },
             .turn => |*turn_event| {
+                // A consumed steering batch commits with the reply that
+                // follows it, so the workflow retains it until the receipt of
+                // the turn resolves it. A canceled role turn destroys the
+                // workflow first, so a stale event of it finds no flow.
+                if (turn_event.payload == .steering_consumed)
+                    try self.retainReviewSteering(&turn_event.payload.steering_consumed);
                 const turn_finished = try self.session.applyTurnEvent(turn_event);
                 if (turn_finished) {
                     const result = self.takeTurnResult() orelse return error.MissingTurnWorker;
@@ -1413,18 +1585,36 @@ fn handleKey(self: *App, event: *const terminal.Input.Key) !void {
     if (try self.editKey(event)) return;
     switch (event.*) {
         .enter => try self.submit(),
-        // Esc owns the waiting retry alone, and it keeps the editor text. An idle
-        // prompt without a retry has nothing to cancel.
-        .escape => self.clearRetry(),
+        // Esc stops an active review workflow. Without one it owns the waiting
+        // retry alone, and it keeps the editor text either way.
+        .escape => if (self.review != null) {
+            try self.stopReviewFromEscape();
+        } else {
+            self.clearRetry();
+        },
         .ctrl => |letter| switch (letter) {
             'c' => {
-                self.clearOrQuit();
+                if (self.review != null) {
+                    // Ctrl+C never quits Drinky from review mode: it clears a
+                    // draft, and over an empty editor it takes the Esc action.
+                    if (self.session.editor.visible().len != 0) {
+                        self.session.editor.clear();
+                    } else {
+                        try self.stopReviewFromEscape();
+                    }
+                } else {
+                    self.clearOrQuit();
+                }
                 if (self.running) self.session.dirty = true;
             },
             // Ctrl+D quits at once on an empty editor. A draft arms a one-shot
             // confirmation and warns instead, because the quit discards it. The
-            // second Ctrl+D quits anyway.
-            'd' => if (self.session.editor.visible().len == 0 or
+            // second Ctrl+D quits anyway. In review mode a draft takes the key
+            // away instead, and the empty-editor quit uses normal teardown,
+            // which destroys the workflow and writes no completion event.
+            'd' => if (self.review != null) {
+                if (self.session.editor.visible().len == 0) self.running = false;
+            } else if (self.session.editor.visible().len == 0 or
                 self.session.takeConfirmation(.quit))
             {
                 self.running = false;
@@ -1436,7 +1626,9 @@ fn handleKey(self: *App, event: *const terminal.Input.Key) !void {
                     .{},
                 );
             },
+            'e' => try self.extendReview(),
             'n' => try self.retryTurn(),
+            's' => try self.openReviewRoleSetup(),
             else => {},
         },
         else => {},
@@ -1486,7 +1678,14 @@ fn handleTurnKey(self: *App, event: *const terminal.Input.Key) !void {
         .escape => try self.warnOrCancel(),
         .ctrl => |letter| switch (letter) {
             'c' => try self.clearOrCancel(),
-            'd' => try self.cancelTurn(),
+            // Empty-editor Ctrl+D in review mode quits Drinky whole, because
+            // the workflow owns this turn and a plain cancel already has two
+            // keys. A draft takes the key away.
+            'd' => if (self.review != null) {
+                if (self.session.editor.visible().len == 0) try self.quitReview();
+            } else {
+                try self.cancelTurn();
+            },
             'p' => try self.pullSteering(),
             else => {},
         },
@@ -1634,6 +1833,11 @@ fn cancelTurn(self: *App) !void {
             } else {
                 self.session.endTurn();
             }
+            // A direct stop of a role request ends the workflow. The cancel
+            // settled the session first, so the stop restores a clean prompt.
+            if (self.review != null) self.stopReview(.stopped) catch |err| {
+                if (maybe_progress_error == null) maybe_progress_error = err;
+            };
             if (maybe_progress_error) |progress_error| return progress_error;
         },
         // The worker won the race. Retain the joined result until FIFO progress
@@ -1641,6 +1845,9 @@ fn cancelTurn(self: *App) !void {
         // enqueue, append a replacement fence and do not block the consumer.
         .completed, .credential_replaced, .credential_rejected, .failed => {
             std.debug.assert(self.pending_turn_result == null);
+            // The stop of a role request stands, so it waits for the retained
+            // result and ends the workflow there.
+            if (self.review) |*flow| flow.stop_requested = true;
             self.pending_turn_result = result;
             self.enqueuePendingTurnFence();
         },
@@ -1767,6 +1974,13 @@ fn submit(self: *App) !void {
     if (!message_confirmed) {
         if (try self.checkCommand(text)) |refusal|
             return self.armMessageSend(refusal, "Send as a message");
+        // A command can switch the account, the model, or the conversation, and
+        // a review role must keep its setup, so every command waits. The
+        // registry decided first, so this refusal names the true restriction.
+        if (self.review != null) {
+            if (ai.command.parse(text)) |name|
+                return self.refuseCommand(name, "while a review runs");
+        }
         if (try self.dispatchCommand(text)) |outcome|
             return self.applySubmittedCommand(outcome);
     }
@@ -1779,6 +1993,11 @@ fn submit(self: *App) !void {
         );
     }
     const base = try self.startUserTurn(text);
+    // A review workflow leaves its hold for this turn. A committed reviewer or
+    // fixer message gets one pending judge copy at the terminal of the turn, so
+    // the judge holds every constraint the user gave a fresh role.
+    try self.leaveReviewHold();
+    try self.retainReviewMessage(text);
     // The turn is live and owns its own copy. Retain the prompt's rich draft
     // so an abnormal exit that commits nothing can return it. Leave the
     // editor empty for in-progress text. Both steps are infallible, so the
@@ -1811,6 +2030,9 @@ fn applySubmittedCommand(self: *App, outcome: ai.command.Outcome) !void {
         // The registry accepted the line, so this refusal is a command that broke.
         // Another try is the way forward, so the line stays in the editor.
         .refusal => try self.applyOutcome(outcome),
+        // The review setup owns its editor clear, because its own refusals
+        // keep the typed line.
+        .review => try self.applyOutcome(outcome),
         // Every other command clears the editor first.
         else => {
             self.session.editor.clear();
@@ -1896,6 +2118,9 @@ fn startUserTurn(self: *App, text: []const u8) !usize {
 /// the conversation sends it with Enter, before the attempt or as steering during
 /// it. A prompt with no waiting retry has nothing to send.
 fn retryTurn(self: *App) !void {
+    // A committed failure keeps the normal retry, in a review role context
+    // too. Only without one does Ctrl+N continue a held review workflow.
+    if (self.retry == null and self.review != null) return self.continueReview();
     if (self.retry == null) return;
     if (!self.signedIn()) return self.reportNotice(
         .failure,
@@ -1912,6 +2137,8 @@ fn sendRetryTurn(self: *App) !void {
     const base = try self.startRetryTurn();
     // The editor holds no part of this attempt, so the rewind anchor stands alone.
     self.session.markTurnBase(base);
+    // A review workflow leaves its hold, because this attempt is its turn now.
+    try self.leaveReviewHold();
 }
 
 /// Send one retry attempt: record the line that names it, then spawn its turn
@@ -1934,6 +2161,634 @@ fn startRetryTurn(self: *App) !usize {
     // A failure of this attempt arms the context again from its own error.
     self.turn_retry = true;
     return base;
+}
+
+/// The machine role of one setup role. The lib setup cannot import the app
+/// machine, so each side owns one enum, and this pair maps them.
+fn machineRole(role: ai.command.Context.ReviewSetup.Role) Review.Role {
+    return switch (role) {
+        .reviewer => .reviewer,
+        .judge => .judge,
+        .fixer => .fixer,
+    };
+}
+
+/// The setup role of one machine role, the other direction of `machineRole`.
+fn setupRole(role: Review.Role) ai.command.Context.ReviewSetup.Role {
+    return switch (role) {
+        .reviewer => .reviewer,
+        .judge => .judge,
+        .fixer => .fixer,
+    };
+}
+
+/// Open the `/review` setup: seed each role with the stored choice of this
+/// project, or with the active session configuration, then open the top
+/// picker. A refusal keeps the typed line, and a notice ends the command, so
+/// the editor clears only on an open or a notice.
+fn openReviewSetup(self: *App) !void {
+    if (self.review != null)
+        return self.refuseCommand("review", "while a review runs");
+    if (self.retry != null)
+        return self.refuseCommand("review", "while a failed turn offers the retry");
+    if (self.session.branch_root == null) {
+        self.session.editor.clear();
+        return self.reportNotice(.failure, "The command /review needs a Git worktree.", .{});
+    }
+    var choices: std.EnumArray(
+        ai.command.Context.ReviewSetup.Role,
+        ai.command.Context.ReviewSetup.Choice,
+    ) = undefined;
+    for (std.enums.values(ai.command.Context.ReviewSetup.Role)) |role| {
+        const choice = self.state.review.get(machineRole(role)) orelse inherit: {
+            const account = self.activeAccount() orelse {
+                self.session.editor.clear();
+                return self.reportNotice(
+                    .failure,
+                    "Sign in with /login before you start a review.",
+                    .{},
+                );
+            };
+            break :inherit State.RoleChoice{
+                .account = account,
+                .model = self.agent.model,
+                .effort = self.agent.effort,
+            };
+        };
+        choices.set(role, .{
+            .account = choice.account,
+            .model = choice.model,
+            .effort = choice.effort,
+        });
+    }
+    self.session.editor.clear();
+    self.review_setup = .{ .choices = choices };
+    var context = self.commandContext();
+    try self.session.applyOutcome(try ai.command.review.setup(&context));
+}
+
+/// Take one confirmed role choice: persist all three, and during a failure
+/// hold apply the choices to the live workflow. Before a workflow runs, the
+/// top setup opens again with the new value on its row.
+fn confirmReviewSetup(self: *App) !void {
+    const setup = if (self.review_setup) |*value| value else return;
+    var stored: std.EnumArray(Review.Role, ?State.RoleChoice) = .initFill(null);
+    for (std.enums.values(ai.command.Context.ReviewSetup.Role)) |role| {
+        const choice = setup.choices.get(role);
+        stored.set(machineRole(role), .{
+            .account = choice.account,
+            .model = choice.model,
+            .effort = choice.effort,
+        });
+    }
+    self.state.recordReview(&stored) catch |err| try self.reportStateSaveFailure(err);
+    const flow = if (self.review) |*value| value else {
+        // No workflow runs, so the top setup returns with the new value.
+        var context = self.commandContext();
+        return self.session.applyOutcome(try ai.command.review.setup(&context));
+    };
+    // The failure hold edits the failed role, so the confirmed choice reaches
+    // its live conversation, and the next attempt runs on it.
+    for (std.enums.values(Review.Role)) |role| {
+        const choice = setup.choices.get(setupRole(role));
+        flow.choices.set(role, .{
+            .account = choice.account,
+            .model = choice.model,
+            .effort = choice.effort,
+        });
+    }
+    const active_role = flow.role orelse return;
+    const choice = flow.choices.get(active_role);
+    const client = self.accounts.client(choice.account) orelse return;
+    self.agent.switchTo(client, choice.model);
+    self.agent.setEffort(choice.effort);
+    self.session.showSetup(choice.account, choice.model, choice.effort);
+    self.session.stats_shown = self.agent.stats;
+}
+
+/// Ctrl+S at a failure hold: open the account, model, and effort menu of the
+/// failed role alone. A confirmed choice saves and applies at once, and picker
+/// Esc returns unchanged to the hold. The menu has no start action.
+fn openReviewRoleSetup(self: *App) !void {
+    const flow = if (self.review) |*value| value else return;
+    if (flow.hold != .failure) return;
+    const role = flow.role orelse return;
+    var choices: std.EnumArray(
+        ai.command.Context.ReviewSetup.Role,
+        ai.command.Context.ReviewSetup.Choice,
+    ) = undefined;
+    for (std.enums.values(Review.Role)) |each| {
+        const choice = flow.choices.get(each);
+        choices.set(setupRole(each), .{
+            .account = choice.account,
+            .model = choice.model,
+            .effort = choice.effort,
+        });
+    }
+    self.review_setup = .{ .choices = choices, .role = setupRole(role) };
+    var context = self.commandContext();
+    try self.session.applyOutcome(try ai.command.review.roleStep(&context));
+}
+
+/// Start the workflow over the confirmed setup: save the choices, park the
+/// main conversation, and start the first reviewer round. Editor text stays,
+/// because it is the brake at the first boundary.
+fn startReview(self: *App) !void {
+    if (self.review != null)
+        return self.refuseCommand("review", "while a review runs");
+    if (self.retry != null)
+        return self.refuseCommand("review", "while a failed turn offers the retry");
+    const setup = if (self.review_setup) |*value| value else return;
+    var choices: std.EnumArray(Review.Role, State.RoleChoice) = undefined;
+    for (std.enums.values(ai.command.Context.ReviewSetup.Role)) |role| {
+        const choice = setup.choices.get(role);
+        // An unavailable account blocks the start. Drinky selects no fallback.
+        if (!self.accounts.isAuthenticated(choice.account)) return self.reportNotice(
+            .failure,
+            "The {s} account {s} is not signed in, so the review cannot start.",
+            .{ @tagName(role), choice.account.label() },
+        );
+        choices.set(machineRole(role), .{
+            .account = choice.account,
+            .model = choice.model,
+            .effort = choice.effort,
+        });
+    }
+    var stored: std.EnumArray(Review.Role, ?State.RoleChoice) = .initFill(null);
+    for (std.enums.values(Review.Role)) |role| stored.set(role, choices.get(role));
+    self.state.recordReview(&stored) catch |err| try self.reportStateSaveFailure(err);
+
+    var machine = Review.init(self.gpa, self.review_rounds_max);
+    const request = machine.composeReviewerRequest() catch |err| {
+        machine.deinit();
+        return err;
+    };
+    // The flow installs before the switch, so the parking inside
+    // `startReviewTurn` can reach it. That call fills the `main` slot with the
+    // parked main conversation, so a failed start uninstalls by hand.
+    self.review = .{
+        .machine = machine,
+        .main = undefined,
+        .judge = null,
+        .role = null,
+        .choices = choices,
+        .request = null,
+        .hold = null,
+        .hold_origin = null,
+        .step = null,
+        .message = null,
+        .steering = .empty,
+        .stop_requested = false,
+        .cost_banked = 0,
+    };
+    self.startReviewTurn(.reviewer, request) catch |err| {
+        self.review.?.machine.deinit();
+        self.review = null;
+        return err;
+    };
+}
+
+/// A fresh conversation for `role`: an agent on the role choice, and an empty
+/// presentation. The reviewer and the judge take their nonmutation cores, and
+/// the fixer changes files like a normal turn, so it takes the main prompt.
+fn roleConversation(
+    self: *App,
+    role: Review.Role,
+    choice: *const State.RoleChoice,
+) Conversation {
+    const system = switch (role) {
+        .reviewer => self.reviewer_prompt,
+        .judge => self.judge_prompt,
+        .fixer => self.prompt,
+    };
+    return .{
+        .agent = ai.Agent.init(self.gpa, self.io, self.accounts.client(choice.account), .{
+            .model = choice.model,
+            .system = system,
+            .retry = self.agent.retry,
+            .effort = choice.effort,
+            .bash = self.agent.bash,
+            .document = self.agent.document,
+            .skill_guard = self.agent.skill_guard,
+        }),
+        .presentation = Session.Conversation.empty(
+            self.gpa,
+            choice.account,
+            &choice.model,
+            choice.effort,
+        ),
+    };
+}
+
+/// Switch to `role`, start its phase turn over `request`, and park the
+/// conversation the switch replaces. Takes ownership of `request`. On failure
+/// the previous conversation stays active and nothing is parked. The
+/// transcript shows the complete request as a line that Drinky wrote, and a
+/// turn that commits nothing takes it out again.
+fn startReviewTurn(self: *App, role: Review.Role, request: []u8) !void {
+    const flow = &self.review.?;
+    var title: []u8 = undefined;
+    {
+        // The transfer below ends this window, so no later failure frees a
+        // slice that the flow owns.
+        errdefer self.gpa.free(request);
+        // The caption allocates here, because every step after the parking
+        // must be infallible. A failure there leaves the caller no way to
+        // restore the parked conversation.
+        title = try self.composeReviewTitle(role);
+        errdefer self.gpa.free(title);
+        const choice = flow.choices.get(role);
+        var target: Conversation = undefined;
+        if (role == .judge and flow.judge != null) {
+            target = flow.judge.?;
+            flow.judge = null;
+        } else {
+            target = self.roleConversation(role, &choice);
+        }
+        self.switchConversation(&target);
+        {
+            errdefer {
+                // Undo the switch, so the previous conversation is active again
+                // and the fresh or parked role conversation goes back.
+                self.switchConversation(&target);
+                if (role == .judge) {
+                    flow.judge = target;
+                } else {
+                    target.deinit();
+                }
+            }
+            const base = self.session.transcript.blocks().len;
+            errdefer self.session.transcript.truncate(base);
+            try self.session.transcript.append(.user_note, .{}, request);
+            try self.runTurn(request);
+            self.session.markTurnBase(base);
+        }
+        // The switch handed the previous conversation back in `target`.
+        if (flow.role) |parked| {
+            switch (parked) {
+                .judge => flow.judge = target,
+                // A fresh role resets: bank its cost, then drop its agent
+                // history and its transcript together.
+                .reviewer, .fixer => {
+                    flow.cost_banked += target.agent.stats.cost;
+                    target.deinit();
+                },
+            }
+        } else {
+            flow.main = target;
+        }
+    }
+    flow.role = role;
+    flow.hold = null;
+    flow.hold_origin = null;
+    flow.step = null;
+    if (flow.request) |old| self.gpa.free(old);
+    flow.request = request;
+    self.session.setReviewCaption(title, review_turn_controls);
+}
+
+/// Start one more generated request in the active role context. The judge
+/// correction and a failure resend both run here, so the phase keeps its
+/// conversation and its transcript. A failure changes no phase state and frees
+/// the copy.
+fn startReviewSuccessor(self: *App, request: []const u8) !void {
+    const flow = &self.review.?;
+    const copy = try self.gpa.dupe(u8, request);
+    var title: []u8 = undefined;
+    {
+        // The transfer below ends this window, so no later failure frees a
+        // slice that the flow owns.
+        errdefer self.gpa.free(copy);
+        // The caption allocates here, because every step after the turn start
+        // must be infallible. Only an active role runs a successor turn.
+        title = try self.composeReviewTitle(flow.role.?);
+        errdefer self.gpa.free(title);
+        const base = self.session.transcript.blocks().len;
+        errdefer self.session.transcript.truncate(base);
+        try self.session.transcript.append(.user_note, .{}, copy);
+        try self.runTurn(copy);
+        self.session.markTurnBase(base);
+    }
+    if (flow.request) |old| self.gpa.free(old);
+    flow.request = copy;
+    flow.hold = null;
+    flow.hold_origin = null;
+    flow.step = null;
+    self.session.setReviewCaption(title, review_turn_controls);
+}
+
+/// Drive the workflow after a completed turn in a role context. The latest
+/// complete report of the phase controls the transition, so a successor turn
+/// replaces it. During a limit hold a judge answer can replace the latest
+/// decision, and the workflow returns to the hold either way.
+fn finishReviewPhase(self: *App) !void {
+    const flow = &self.review.?;
+    const role = flow.role orelse return;
+    const origin = flow.hold_origin;
+    flow.hold_origin = null;
+    // The completed turn ends the request of this phase, so no resend of it
+    // can follow. The next phase turn stores its own request.
+    self.dropReviewRequest();
+    const report = try self.agent.latestReplyAlloc(self.gpa);
+    defer self.gpa.free(report);
+    if (origin == .limit) {
+        _ = try flow.machine.adoptJudgeAnswer(report);
+        flow.hold = .limit;
+        return self.showReviewCaption();
+    }
+    const step = switch (role) {
+        .reviewer => try flow.machine.finishReviewer(report),
+        .judge => try flow.machine.finishJudge(report),
+        .fixer => try flow.machine.finishFixer(report),
+    };
+    try self.applyReviewStep(step, true);
+}
+
+/// Apply one workflow step. With `brake`, editor text holds the workflow at
+/// this boundary, and Ctrl+N applies the held step later. A stop on a broken
+/// judge never waits, because no continue can mend it.
+fn applyReviewStep(self: *App, step: Review.Step, brake: bool) !void {
+    const flow = &self.review.?;
+    if (brake and step != .stop_invalid and self.session.editor.visible().len != 0) {
+        flow.hold = .user;
+        flow.step = step;
+        return self.showReviewCaption();
+    }
+    switch (step) {
+        .start_reviewer => try self.startReviewTurn(
+            .reviewer,
+            try flow.machine.composeReviewerRequest(),
+        ),
+        .start_judge => try self.startReviewTurn(.judge, try flow.machine.composeJudgeRequest()),
+        .start_fixer => |pass| try self.startReviewTurn(
+            .fixer,
+            try flow.machine.composeFixerRequest(pass),
+        ),
+        .request_correction => try self.startReviewSuccessor(
+            flow.machine.composeCorrectionRequest(),
+        ),
+        .hold_judge => {
+            flow.hold = .judge;
+            flow.step = null;
+            try self.showReviewCaption();
+        },
+        .hold_limit => {
+            flow.hold = .limit;
+            flow.step = null;
+            try self.showReviewCaption();
+        },
+        .settled => try self.stopReview(.settled),
+        .stop_invalid => try self.stopReview(.invalid),
+    }
+}
+
+/// Retain the direct message of the live turn, so its judge copy can queue
+/// once the turn commits it. A message outside a review finds no flow.
+fn retainReviewMessage(self: *App, text: []const u8) !void {
+    const flow = if (self.review) |*flow| flow else return;
+    const copy = try self.gpa.dupe(u8, text);
+    if (flow.message) |old| self.gpa.free(old);
+    flow.message = copy;
+}
+
+/// Retain one steering batch of the live turn, so its judge copy can queue
+/// once the turn commits it. A batch outside a review finds no flow.
+fn retainReviewSteering(
+    self: *App,
+    consumed: *const Session.TurnEvent.Payload.SteeringConsumed,
+) !void {
+    const flow = if (self.review) |*flow| flow else return;
+    const copy = try self.gpa.dupe(u8, consumed.text);
+    errdefer self.gpa.free(copy);
+    try flow.steering.append(self.gpa, .{ .text = copy, .count = consumed.count });
+}
+
+/// Resolve the retained messages at the terminal of their turn, in the order
+/// the user sent them: the direct message that started the turn, then each
+/// steering batch that the turn folded in. Text that no commit kept leaves no
+/// judge copy, so a resend produces one copy. A judge message stays in judge
+/// history and needs no copy.
+fn resolveReviewMessages(self: *App, receipt: *const ai.Agent.Receipt) !void {
+    const flow = if (self.review) |*flow| flow else return;
+    defer {
+        if (flow.message) |text| self.gpa.free(text);
+        flow.message = null;
+        for (flow.steering.items) |batch| self.gpa.free(batch.text);
+        flow.steering.clearRetainingCapacity();
+    }
+    const role = flow.role orelse return;
+    if (role == .judge) return;
+    if (receipt.history_end != receipt.history_base) {
+        if (flow.message) |text| try flow.machine.pushMessage(role, text);
+    }
+    // The turn commits its batches in delivery order, so the committed drafts
+    // are the prefix that the receipt count covers.
+    var delivered_count: usize = 0;
+    for (flow.steering.items) |batch| {
+        delivered_count += batch.count;
+        if (delivered_count > receipt.steering_committed_count) break;
+        try flow.machine.pushMessage(role, batch.text);
+    }
+}
+
+/// Take the workflow out of its hold for a turn that the user starts. The
+/// caption then names the running phase, and the hold returns when that turn
+/// commits nothing. A turn from the failure hold continues the work that
+/// failed there, so the origin of that work stays with it.
+fn leaveReviewHold(self: *App) !void {
+    const flow = if (self.review) |*flow| flow else return;
+    if (flow.hold != .failure) flow.hold_origin = flow.hold;
+    flow.hold = null;
+    try self.showReviewCaption();
+}
+
+/// Ctrl+N in a held review: apply the postponed step, or send the failed
+/// generated request again. The editor keeps its text, and that text brakes
+/// the workflow again at the next boundary.
+fn continueReview(self: *App) !void {
+    const flow = &self.review.?;
+    const hold = flow.hold orelse return;
+    switch (hold) {
+        .user => {
+            const step = flow.step orelse return;
+            flow.hold = null;
+            flow.step = null;
+            try self.applyReviewStep(step, false);
+        },
+        // Enter answers the judge, and Ctrl+E raises the ceiling.
+        .judge, .limit => {},
+        // The normal retry continues a committed failure, so only a request
+        // that no role conversation holds waits here. A hold with neither one
+        // behind it names no Ctrl+N, and the key acts on nothing.
+        .failure => {
+            const request = flow.request orelse return;
+            try self.startReviewSuccessor(request);
+        },
+    }
+}
+
+/// Ctrl+E at a limit hold: add one round and resume the latest judge decision.
+/// The editor keeps its text, which brakes at the next boundary.
+fn extendReview(self: *App) !void {
+    const flow = if (self.review) |*flow| flow else return;
+    if (flow.hold != .limit) return;
+    flow.hold = null;
+    try self.applyReviewStep(flow.machine.raiseCeiling(), false);
+}
+
+/// Enter the hold after a failed review turn. Work that the user started and
+/// that committed nothing returns to its own hold, because the editor holds
+/// that text again and the postponed step still stands. Every other failure
+/// takes the failure hold, where Ctrl+N retries a committed failure through the
+/// normal retry and resends an uncommitted generated request whole.
+fn holdReviewFailure(self: *App, committed: bool) !void {
+    const flow = &self.review.?;
+    if (committed) {
+        // Committed work reached the role conversation, so the normal retry
+        // continues it and no resend of the request can follow. The attempt
+        // behind Ctrl+N continues the work of the user, so its origin waits
+        // through this hold.
+        self.dropReviewRequest();
+    } else {
+        const origin = flow.hold_origin;
+        flow.hold_origin = null;
+        if (origin) |hold| {
+            flow.hold = hold;
+            return self.showReviewCaption();
+        }
+    }
+    flow.hold = .failure;
+    // Only work of the user carries a postponed step back to its own hold.
+    if (flow.hold_origin == null) flow.step = null;
+    try self.showReviewCaption();
+}
+
+/// Free the generated request that waits for a resend. The failure hold offers
+/// Ctrl+N only while a request or a retry stands behind it.
+fn dropReviewRequest(self: *App) void {
+    const flow = &self.review.?;
+    const request = flow.request orelse return;
+    self.gpa.free(request);
+    flow.request = null;
+}
+
+/// The controls of a running phase turn.
+const review_turn_controls = "Enter: Steer · Esc: Stop";
+
+/// The caption title of a running phase turn: the round, the ceiling, and the
+/// role. The caller owns it.
+fn composeReviewTitle(self: *App, role: Review.Role) ![]u8 {
+    const machine = &self.review.?.machine;
+    return std.fmt.allocPrint(
+        self.gpa,
+        "Review: Round {d} of {d} · {s}",
+        .{ machine.rounds_started, machine.rounds_max, role.label() },
+    );
+}
+
+/// Show the workflow state above the editor. The caption persists across
+/// frames and keypresses, so the controls of the active hold stay readable,
+/// and it outranks the retry caption, whose Esc means something else here.
+fn showReviewCaption(self: *App) !void {
+    const flow = &self.review.?;
+    const machine = &flow.machine;
+    const role = flow.role orelse return;
+    const hold = flow.hold orelse {
+        const title = try self.composeReviewTitle(role);
+        return self.session.setReviewCaption(title, review_turn_controls);
+    };
+    const title: []u8 = switch (hold) {
+        .user => try std.fmt.allocPrint(
+            self.gpa,
+            "Review hold: The {s} completed",
+            .{@tagName(role)},
+        ),
+        .judge => try self.gpa.dupe(u8, "Review hold: The judge asks you"),
+        .limit => try std.fmt.allocPrint(
+            self.gpa,
+            "Review limit: Round {d} of {d}",
+            .{ machine.rounds_started, machine.rounds_max },
+        ),
+        .failure => try std.fmt.allocPrint(
+            self.gpa,
+            "Review hold: The {s} request failed",
+            .{@tagName(role)},
+        ),
+    };
+    const controls: []const u8 = switch (hold) {
+        .user => "Enter: Send · Ctrl+N: Continue · Esc: Stop",
+        .judge => "Enter: Answer · Esc: Stop",
+        .limit => "Enter: Ask the judge · Ctrl+E: Add a round · Esc: Finish",
+        // A message from this hold can take the retry and commit nothing, so
+        // the row names Ctrl+N only while an attempt or a resend stands behind
+        // it.
+        .failure => if (self.retry != null or flow.request != null)
+            "Ctrl+N: Try again · Ctrl+S: Role setup · Esc: Stop"
+        else
+            "Ctrl+S: Role setup · Esc: Stop",
+    };
+    self.session.setReviewCaption(title, controls);
+}
+
+/// End the workflow: restore the parked main conversation, free every role
+/// context, and record one completion event with the accounting data. Review
+/// completion adds no model context to the main agent.
+fn stopReview(self: *App, end: ReviewEnd) !void {
+    var flow = self.review.?;
+    self.review = null;
+    var cost = flow.cost_banked + self.agent.stats.cost;
+    if (flow.judge) |*judge| cost += judge.agent.stats.cost;
+    const rounds = flow.machine.rounds_completed;
+    const passes = flow.machine.passes_completed;
+    const role = flow.role;
+    // The swap parks the last role conversation in the flow, and the flow
+    // teardown frees it with everything else it still holds.
+    self.switchConversation(&flow.main);
+    flow.deinit(self.gpa);
+    self.session.setReviewCaption(null, "");
+    // A role retry names work of a destroyed context.
+    self.clearRetry();
+    // The return resets the double-Ctrl+C timer, so a press from review mode
+    // cannot pair with one at the main prompt.
+    self.ctrl_c_ms_last = self.nowMs() - ctrl_c_window_ms;
+    switch (end) {
+        .settled => try self.recordEvent(
+            .information,
+            "Review settled. Rounds: {d} · Fixer passes: {d} · Cost: ${d:.2}",
+            .{ rounds, passes, cost },
+        ),
+        .stopped => try self.recordEvent(
+            .information,
+            "Review stopped at the {s}. Rounds: {d} · Fixer passes: {d} · Cost: ${d:.2}",
+            .{ if (role) |value| @tagName(value) else "setup", rounds, passes, cost },
+        ),
+        .invalid => try self.recordEvent(
+            .failure,
+            "Review stopped on a second invalid judge report. Rounds: {d} · Fixer passes: " ++
+                "{d} · Cost: ${d:.2}",
+            .{ rounds, passes, cost },
+        ),
+    }
+}
+
+/// Esc at the prompt with an active workflow. It claims settlement only when
+/// the latest judge decision settled the review at the limit hold.
+fn stopReviewFromEscape(self: *App) !void {
+    const flow = &self.review.?;
+    const settled = flow.hold == .limit and flow.machine.decision == .review_settled;
+    try self.stopReview(if (settled) .settled else .stopped);
+}
+
+/// Empty-editor Ctrl+D in review mode: cancel and join any active request,
+/// destroy the workflow without a completion event, and exit through normal
+/// app teardown.
+fn quitReview(self: *App) !void {
+    var flow = self.review.?;
+    self.review = null;
+    defer flow.deinit(self.gpa);
+    self.session.setReviewCaption(null, "");
+    self.running = false;
+    try self.cancelTurn();
 }
 
 /// Spawn a turn worker over `text` and enter turn mode. The worker owns its own
@@ -1974,6 +2829,7 @@ fn commandContext(self: *App) ai.command.Context {
         .agent = &self.agent,
         .accounts = &self.accounts,
         .skill_registry = &self.skills,
+        .review_setup = if (self.review_setup) |*setup| setup else null,
     };
 }
 
@@ -2010,6 +2866,15 @@ fn applyOutcome(self: *App, outcome: ai.command.Outcome) !void {
             .content = "",
             .presentation = .colors,
         }),
+        // The setup clears the editor itself once it opens, so a refusal keeps
+        // the typed line. The early return skips the agent mirror below,
+        // because a role setup must not overwrite the remembered project
+        // state.
+        .review => |action| return switch (action) {
+            .setup => self.openReviewSetup(),
+            .confirm => self.confirmReviewSetup(),
+            .start => self.startReview(),
+        },
         .new_conversation => {
             // Conversation switching swaps the agent, its canonical history,
             // and the interface state that projects it together, in one
@@ -2103,9 +2968,23 @@ fn mirrorAgentState(self: *App) !void {
 /// A signed-out session records nothing, because the entry names an account.
 /// This drops no user choice: `/model` and `/effort` both refuse while no
 /// account is active, so the only signed-out change is the sign-in itself.
+///
+/// A running review workflow records nothing either, because the active agent
+/// belongs to a role and not to the project. The role choices persist through
+/// `recordReview` alone, so no setup step and no credential path can replace
+/// the project memory with a role configuration.
 fn recordState(self: *App) !void {
+    if (self.review != null) return;
     const account = self.activeAccount() orelse return;
-    self.state.record(account, &self.agent.model, self.agent.effort) catch |err| switch (err) {
+    self.state.record(account, &self.agent.model, self.agent.effort) catch |err|
+        try self.reportStateSaveFailure(err);
+}
+
+/// Report one failed write of the project state file. The session choices and
+/// the review role choices save through the same store, so the two report the
+/// same sentences.
+fn reportStateSaveFailure(self: *App, err: anyerror) !void {
+    switch (err) {
         error.StoreBusy => try self.recordEvent(
             .failure,
             "Drinky could not save the choices of this project because another Drinky instance " ++
@@ -2123,7 +3002,7 @@ fn recordState(self: *App) !void {
             "Drinky stopped saving the choices of this project to {s} because of error {s}.",
             .{ self.state.path, @errorName(err) },
         ),
-    };
+    }
 }
 
 /// Log in to `account`, then switch to it on the model it ran last here, else on
@@ -2192,13 +3071,23 @@ fn reportLoginFailure(self: *App, login_error: anyerror) !void {
     return self.reportNotice(.failure, "{s}", .{message});
 }
 
+/// Whether the credential work of `account` can move the active agent. A role
+/// conversation keeps the account, the model, and the effort level that its
+/// setup chose, so only Ctrl+S changes them. A stop that ran first restored the
+/// main conversation, which keeps its own account too.
+fn adoptsCredential(self: *const App, account: ai.llm.Account) bool {
+    if (self.review != null) return false;
+    const active = self.activeAccount() orelse return false;
+    return active == account;
+}
+
 /// Accept a credential that the store identifies as another principal. The
 /// worker stopped before its model request, so drop old evidence and metadata
 /// before this credential can run the restored turn.
 fn acceptCredentialReplacement(self: *App, account: ai.llm.Account) !void {
     self.accounts.dropPrincipalMetadata(account);
     self.dropAccountEvidence(account);
-    self.adopt(account);
+    if (self.adoptsCredential(account)) self.adopt(account);
     try self.mirrorAgentState();
 }
 
@@ -2209,7 +3098,11 @@ fn acceptCredentialReplacement(self: *App, account: ai.llm.Account) !void {
 /// instance saved can represent another principal in the same account slot.
 /// Nothing that principal produced crosses that boundary, so the evidence goes
 /// before the two paths divide.
+///
+/// A conversation that keeps its own account takes the removal alone. It stays
+/// on that account, and the report names the sign-out and nothing else.
 fn rejectCredential(self: *App, account: ai.llm.Account) !void {
+    const adopts = self.adoptsCredential(account);
     var maybe_removal_error: ?anyerror = null;
     const recovered = self.accounts.invalidate(account) catch |err| failure: {
         maybe_removal_error = err;
@@ -2219,7 +3112,7 @@ fn rejectCredential(self: *App, account: ai.llm.Account) !void {
     if (recovered) {
         // `invalidate` dropped the limits the replaced credential discovered, so
         // the model resolves again before the session shows it.
-        self.adopt(account);
+        if (adopts) self.adopt(account);
         try self.recordEvent(
             .information,
             "Drinky reloaded the refresh credential that another Drinky instance saved. " ++
@@ -2229,14 +3122,22 @@ fn rejectCredential(self: *App, account: ai.llm.Account) !void {
         return self.mirrorAgentState();
     }
 
-    const maybe_next = self.accounts.firstAuthenticated();
-    if (maybe_next) |next| self.adopt(next) else self.agent.signOut();
+    // The agent settles before any fallible report. A conversation that keeps
+    // its own account moves nothing, so it needs no next account.
+    const maybe_next = if (adopts) self.accounts.firstAuthenticated() else null;
+    if (adopts) {
+        if (maybe_next) |next| self.adopt(next) else self.agent.signOut();
+    }
 
     if (maybe_removal_error) |removal_error| try self.recordEvent(
         .failure,
         "Drinky could not remove the rejected credential for {s} because of error {s}.",
         .{ account.label(), @errorName(removal_error) },
     );
+    if (!adopts) {
+        try self.recordEvent(.information, "Drinky signed out of {s}.", .{account.label()});
+        return self.mirrorAgentState();
+    }
     if (maybe_next) |next| {
         try self.recordEvent(
             .information,
@@ -2315,9 +3216,16 @@ fn adopt(self: *App, account: ai.llm.Account) void {
 /// in history, and the reasoning blocks that hold them in the transcript. Both
 /// sides drop together, so the interface never shows a block that no request
 /// carries.
+///
+/// A review workflow parks whole conversations, and each parked one drops the
+/// same evidence. A conversation that the workflow restores later can therefore
+/// replay no proof of the principal that this call ends.
 fn dropAccountEvidence(self: *App, account: ai.llm.Account) void {
     self.agent.dropAccountEvidence(account);
     self.session.dropAccountReasoning(account);
+    const flow = if (self.review) |*flow| flow else return;
+    flow.main.dropAccountEvidence(account);
+    if (flow.judge) |*judge| judge.dropAccountEvidence(account);
 }
 
 /// The shared refusal path for a command that the active state does not allow.
@@ -6081,6 +6989,1501 @@ test "a skill line runs while a retry waits and takes the context with it" {
 
 // Signed out, Drinky must refuse a normal message with a /login prompt rather
 // than spawn a turn against no client.
+test "/review needs a Git worktree and refuses a waiting retry or a second review" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = anthropic_default,
+        .system = "",
+        .retry = .{},
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+
+    // Outside a Git worktree the command reports a notice and starts nothing.
+    try app.runCommand("/review");
+    try std.testing.expect(app.review == null);
+    try std.testing.expectEqualStrings(
+        "The command /review needs a Git worktree.",
+        app.session.notice.?.content,
+    );
+
+    // A waiting retry blocks the start, so Ctrl+N keeps its one meaning.
+    app.session.branch_root = "/repo";
+    app.setRetry(.{ .failure = try gpa.dupe(u8, "The provider is overloaded.") });
+    defer app.dropRetry();
+    try app.runCommand("/review");
+    try std.testing.expect(app.review == null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        app.session.notice.?.content,
+        "cannot run while a failed turn offers the retry",
+    ) != null);
+}
+
+/// A review flow in the judge phase, installed by hand: the machine took one
+/// reviewer report, the active conversation is the judge, and the parked main
+/// conversation holds one marker block. The active agent history ends on
+/// `report`, so `finishReviewPhase` classifies it.
+fn installJudgeFlow(app: *App, report: []const u8) !void {
+    const gpa = app.gpa;
+    var machine = Review.init(gpa, 4);
+    errdefer machine.deinit();
+    gpa.free(try machine.composeReviewerRequest());
+    _ = try machine.finishReviewer("Finding: a bug.");
+    gpa.free(try machine.composeJudgeRequest());
+
+    var main_conversation: Conversation = .{
+        .agent = ai.Agent.init(gpa, std.testing.io, null, .{
+            .model = anthropic_default,
+            .system = "",
+            .retry = .{},
+        }),
+        .presentation = Session.Conversation.empty(gpa, null, &anthropic_default, .none),
+    };
+    errdefer main_conversation.deinit();
+    try main_conversation.presentation.transcript.append(.user, .{}, "main marker");
+
+    const owned = try gpa.dupe(u8, report);
+    errdefer gpa.free(owned);
+    try app.agent.items.append(gpa, .{ .message = .{ .role = .assistant, .text = owned } });
+
+    app.review = .{
+        .machine = machine,
+        .main = main_conversation,
+        .judge = null,
+        .role = .judge,
+        .choices = .initFill(.{
+            .account = .anthropic_api,
+            .model = anthropic_default,
+            .effort = .none,
+        }),
+        .request = null,
+        .hold = null,
+        .hold_origin = null,
+        .step = null,
+        .message = null,
+        .steering = .empty,
+        .stop_requested = false,
+        .cost_banked = 0,
+    };
+}
+
+test "a settled judge report restores the main conversation and records completion" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = anthropic_default,
+        .system = "",
+        .retry = .{},
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+    try installJudgeFlow(&app, "Decision: Review settled.");
+
+    try app.finishReviewPhase();
+    try std.testing.expect(app.review == null);
+    const blocks = app.session.transcript.blocks();
+    try std.testing.expectEqual(@as(usize, 2), blocks.len);
+    // The parked main conversation returned whole, and the completion event
+    // carries the counters without any model context.
+    try std.testing.expectEqualStrings("main marker", blocks[0].user.items);
+    try std.testing.expectEqualStrings(
+        "Review settled. Rounds: 1 · Fixer passes: 0 · Cost: $0.00",
+        blocks[1].event.text.items,
+    );
+    try std.testing.expect(!blocks[1].event.is_error);
+}
+
+test "editor text brakes the workflow and Esc stops it with the text preserved" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = anthropic_default,
+        .system = "",
+        .retry = .{},
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+    try installJudgeFlow(&app, "Decision: Fix required.\nFix the bug in src/App.zig.");
+    try app.session.editor.insert("do not touch the config format");
+
+    // The fix decision starts no fixer, because the editor text is the brake.
+    // The persistent caption names the hold and its controls.
+    try app.finishReviewPhase();
+    try std.testing.expect(app.review != null);
+    try std.testing.expectEqual(ReviewFlow.Hold.user, app.review.?.hold.?);
+    try std.testing.expectEqual(Review.Step{ .start_fixer = .first }, app.review.?.step.?);
+    try std.testing.expectEqualStrings(
+        "Review hold: The judge completed",
+        app.session.review_title.?,
+    );
+    try std.testing.expectEqualStrings(
+        "Enter: Send · Ctrl+N: Continue · Esc: Stop",
+        app.session.review_controls,
+    );
+
+    // Ctrl+C clears the draft first and releases no hold.
+    try app.handleKey(&.{ .ctrl = 'c' });
+    try std.testing.expect(app.review != null);
+    try std.testing.expectEqual(ReviewFlow.Hold.user, app.review.?.hold.?);
+    try std.testing.expectEqual(@as(usize, 0), app.session.editor.visible().len);
+
+    // Esc stops the workflow, restores the main conversation, drops the
+    // caption, and preserves the editor exactly.
+    try app.session.editor.insert("do not touch the config format");
+    try app.handleKey(&.escape);
+    try std.testing.expect(app.review == null);
+    try std.testing.expect(app.session.review_title == null);
+    try std.testing.expect(app.running);
+    const blocks = app.session.transcript.blocks();
+    try std.testing.expectEqualStrings("main marker", blocks[0].user.items);
+    try std.testing.expectEqualStrings(
+        "Review stopped at the judge. Rounds: 1 · Fixer passes: 0 · Cost: $0.00",
+        blocks[1].event.text.items,
+    );
+    try std.testing.expectEqualStrings(
+        "do not touch the config format",
+        app.session.editor.visible(),
+    );
+}
+
+test "a fix decision starts the fixer, a failed request resends, and Esc stops" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(home);
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    defer app.drainQueue();
+    // No account is authenticated, so a role worker fails fast at the sign-in
+    // gate instead of reaching the network.
+    app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
+    defer app.accounts.deinit();
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = anthropic_default,
+        .system = "",
+        .retry = .{},
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+    try installJudgeFlow(&app, "Decision: Fix required.\nFix the leak.");
+
+    // The fix decision parks the judge and starts the pass-1 fixer over the
+    // whole judge report. The transcript shows the complete request as a line
+    // that Drinky wrote.
+    try app.finishReviewPhase();
+    try std.testing.expect(app.session.mode == .turn);
+    try std.testing.expectEqual(Review.Role.fixer, app.review.?.role.?);
+    try std.testing.expect(app.review.?.judge != null);
+    try std.testing.expectEqualStrings("Review: Round 1 of 4 · Fixer", app.session.review_title.?);
+    try std.testing.expectEqualStrings("Enter: Steer · Esc: Stop", app.session.review_controls);
+    {
+        const blocks = app.session.transcript.blocks();
+        try std.testing.expectEqual(@as(usize, 1), blocks.len);
+        const note = blocks[0].user_note.items;
+        try std.testing.expect(std.mem.indexOf(
+            u8,
+            note,
+            "<fixer_request round=\"1\" pass=\"1\">",
+        ) != null);
+        try std.testing.expect(std.mem.indexOf(u8, note, "Fix the leak.") != null);
+    }
+
+    // The signed-out worker fails without a commit, so no retry arms and the
+    // workflow enters the failure hold that offers the resend.
+    {
+        const result = app.awaitTurnFuture().?;
+        defer app.freeWorkerResult(&result);
+        try app.finishWorkerResult(&result);
+    }
+    try std.testing.expect(app.retry == null);
+    try std.testing.expectEqual(ReviewFlow.Hold.failure, app.review.?.hold.?);
+    try std.testing.expectEqualStrings(
+        "Review hold: The fixer request failed",
+        app.session.review_title.?,
+    );
+    try std.testing.expectEqualStrings(
+        "Ctrl+N: Try again · Ctrl+S: Role setup · Esc: Stop",
+        app.session.review_controls,
+    );
+
+    // Ctrl+N sends the same generated request again, because no editor line
+    // reproduces it.
+    try app.handleKey(&.{ .ctrl = 'n' });
+    try std.testing.expect(app.session.mode == .turn);
+    {
+        const blocks = app.session.transcript.blocks();
+        try std.testing.expect(blocks[0].event.is_error);
+        try std.testing.expect(std.mem.indexOf(
+            u8,
+            blocks[blocks.len - 1].user_note.items,
+            "<fixer_request round=\"1\" pass=\"1\">",
+        ) != null);
+    }
+    {
+        const result = app.awaitTurnFuture().?;
+        defer app.freeWorkerResult(&result);
+        try app.finishWorkerResult(&result);
+    }
+
+    // Esc stops the workflow at the fixer and restores the main conversation.
+    try app.handleKey(&.escape);
+    try std.testing.expect(app.review == null);
+    const blocks = app.session.transcript.blocks();
+    try std.testing.expectEqualStrings("main marker", blocks[0].user.items);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        blocks[1].event.text.items,
+        "Review stopped at the fixer.",
+    ) != null);
+}
+
+test "/review opens the setup on the session configuration and Start checks accounts" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(home);
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    defer app.input.deinit();
+    app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
+    defer app.accounts.deinit();
+    app.agent = ai.Agent.init(gpa, io, ai.provider.Client.init(
+        gpa,
+        io,
+        .{ .anthropic_api = "key" },
+        .{},
+    ), .{
+        .model = anthropic_default,
+        .system = "",
+        .retry = .{},
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+    app.session.branch_root = "/repo";
+
+    // The project stores no choice, so every role inherits the active session
+    // configuration into the setup.
+    try app.runCommand("/review");
+    try std.testing.expect(app.session.mode == .picking);
+    const reviewer = app.review_setup.?.choices.get(.reviewer);
+    try std.testing.expectEqual(ai.llm.Account.anthropic_api, reviewer.account);
+    try std.testing.expectEqualStrings(anthropic_default.name, reviewer.model.name);
+
+    // Enter on the start row blocks the start, because no account is
+    // authenticated, and Drinky selects no fallback.
+    try app.handleKeys("\r");
+    try std.testing.expect(app.session.mode == .prompt);
+    try std.testing.expect(app.review == null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        app.session.notice.?.content,
+        "is not signed in, so the review cannot start",
+    ) != null);
+}
+
+test "a confirmed role choice persists and reopens the setup" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = anthropic_default,
+        .system = "",
+        .retry = .{},
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+
+    // The pickers wrote a judge choice into the live setup and reported the
+    // confirm action.
+    app.review_setup = .{ .choices = .initFill(.{
+        .account = .anthropic_api,
+        .model = anthropic_default,
+        .effort = .high,
+    }) };
+    var choice = app.review_setup.?.choices.get(.judge);
+    choice.effort = .max;
+    app.review_setup.?.choices.set(.judge, choice);
+    try app.applyOutcome(.{ .review = .confirm });
+
+    // The confirm persisted every role choice and opened the top setup again,
+    // with the new value on its row.
+    try std.testing.expectEqual(ai.llm.Effort.max, app.state.review.get(.judge).?.effort);
+    try std.testing.expectEqual(ai.llm.Effort.high, app.state.review.get(.reviewer).?.effort);
+    try std.testing.expect(app.session.mode == .picking);
+}
+
+test "ctrl+s at a failure hold opens the menu of the failed role alone" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(home);
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    // The confirm reads the registry for the account of the failed role, and
+    // no key signs one in here, so the lookup finds none.
+    app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
+    defer app.accounts.deinit();
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = anthropic_default,
+        .system = "",
+        .retry = .{},
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+    try installJudgeFlow(&app, "Decision: Review settled.");
+
+    // Outside a failure hold the key has no action.
+    try app.handleKey(&.{ .ctrl = 's' });
+    try std.testing.expect(app.session.mode == .prompt);
+
+    app.review.?.hold = .failure;
+    try app.handleKey(&.{ .ctrl = 's' });
+    try std.testing.expect(app.session.mode == .picking);
+    try std.testing.expectEqual(
+        ai.command.Context.ReviewSetup.Role.judge,
+        app.review_setup.?.role,
+    );
+
+    // A confirmed choice reaches the workflow choices at once, and the
+    // workflow stays in its failure hold.
+    var choice = app.review_setup.?.choices.get(.judge);
+    choice.effort = .low;
+    app.review_setup.?.choices.set(.judge, choice);
+    app.session.closePicker();
+    try app.applyOutcome(.{ .review = .confirm });
+    try std.testing.expectEqual(ai.llm.Effort.low, app.review.?.choices.get(.judge).effort);
+    try std.testing.expectEqual(ReviewFlow.Hold.failure, app.review.?.hold.?);
+    try std.testing.expect(app.session.mode == .prompt);
+
+    // Teardown: the test installed the flow by hand, so it frees it by hand.
+    var flow = app.review.?;
+    app.review = null;
+    flow.deinit(gpa);
+}
+
+// The project memory names the main conversation. A setup step of a role runs
+// on the role agent, so no step of it can replace the remembered account, the
+// remembered model, or the remembered effort level of the project.
+test "a role setup step leaves the project memory to the main conversation" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(home);
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    const role_model = ai.models.get(.anthropic, "claude-sonnet-4-6").?;
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{ .anthropic = "sk-ant" });
+    defer app.accounts.deinit();
+    // The active agent is the role agent of the failed request, so its model
+    // and its effort level belong to that role alone.
+    app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_api), .{
+        .model = role_model,
+        .system = "",
+        .retry = .{},
+        .effort = .max,
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, role_model, .max);
+    defer app.session.deinit();
+    app.state = try State.open(gpa, io, &.{
+        .working_directory = home,
+        .home = home,
+        .project = "/work",
+    });
+    defer app.state.deinit();
+    // The main conversation of this project runs the compiled default model at
+    // no effort. The seed writes no file.
+    try app.state.seed(.anthropic_api, &anthropic_default, .none);
+    try installJudgeFlow(&app, "Decision: Review settled.");
+    app.review.?.hold = .failure;
+
+    // Ctrl+S opens the menu of the failed role, and Enter on the effort row
+    // opens the step below it.
+    try app.handleKey(&.{ .ctrl = 's' });
+    try app.handleKey(&.down);
+    try app.handleKey(&.enter);
+    try std.testing.expect(app.session.mode == .picking);
+    try std.testing.expectEqualStrings("Effort", app.session.mode.picking.picker.title);
+
+    // Neither the remembered model of the account nor the file took the role
+    // configuration.
+    try std.testing.expectEqualStrings(
+        anthropic_default.name,
+        app.state.models.get(.anthropic_api).?.name,
+    );
+    var maybe_file = try ai.json_store.open(gpa, io, app.state.path);
+    defer if (maybe_file) |*file| file.deinit();
+    if (maybe_file) |*file| try std.testing.expect(file.entry("/work") == null);
+
+    // Teardown: the test installed the flow by hand, so it frees it by hand.
+    var flow = app.review.?;
+    app.review = null;
+    flow.deinit(gpa);
+}
+
+// A credential disposition ends a role turn like any other failure, so the
+// workflow enters the hold whose caption and controls act. The role keeps the
+// account, the model, and the effort level of its setup, the project memory
+// keeps the main conversation choices, and the principal that the disposition
+// ends loses its evidence in the parked conversations too.
+test "a credential disposition at a role turn holds the workflow and keeps the role setup" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const role_model = ai.models.get(.anthropic, "claude-sonnet-4-6").?;
+
+    for ([_]ai.Agent.Outcome.Disposition{
+        .credential_replaced,
+        .credential_rejected,
+    }) |disposition| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const home = try tmpPath(gpa, io, &tmp, "");
+        defer gpa.free(home);
+        var store = try tmp.dir.createDirPathOpen(io, ".drinky", .{});
+        store.close(io);
+        try tmp.dir.writeFile(io, .{
+            .sub_path = ".drinky/auth.json",
+            .data =
+            \\{ "anthropic_subscription":
+            \\    { "access": "a", "refresh": "r", "expires_ms": 4102444800000 } }
+            ,
+        });
+        var out: std.Io.Writer.Allocating = .init(gpa);
+        defer out.deinit();
+
+        var app: App = undefined;
+        app.initForTest(gpa);
+        app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{ .openai = "sk-openai" });
+        defer app.accounts.deinit();
+        app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_subscription), .{
+            .model = role_model,
+            .system = "",
+            .retry = .{},
+            .effort = .max,
+        });
+        defer app.agent.deinit();
+        app.session = Session.init(gpa, &out.writer, role_model, .max);
+        defer app.session.deinit();
+        app.session.account_shown = .anthropic_subscription;
+        app.state = try State.open(gpa, io, &.{
+            .working_directory = home,
+            .home = home,
+            .project = "/work",
+        });
+        defer app.state.deinit();
+        // The main conversation of this project runs another account, and the
+        // seed writes no file.
+        try app.state.seed(.openai_api, &openai_default, .none);
+        try installJudgeFlow(&app, "Decision: Fix required.\nFix the leak.");
+        // The judge phase turn stored its generated request, so the resend of
+        // that request stands behind Ctrl+N at the failure hold.
+        app.review.?.request = try gpa.dupe(u8, "<judge_request round=\"1\">");
+
+        // The parked main conversation holds a replay proof of the same
+        // principal, and the block that shows it.
+        const replay: ai.llm.Item.Reasoning.Replay = .{ .anthropic_subscription = .{
+            .signature = .{ .text = "thought", .signature = "proof" },
+        } };
+        {
+            const parked = &app.review.?.main;
+            try parked.agent.items.append(gpa, .{
+                .reasoning = .{ .replay = try replay.dupe(gpa) },
+            });
+            try parked.presentation.transcript.appendStream(
+                .thinking,
+                .anthropic_subscription,
+                "thought",
+            );
+        }
+
+        app.session.beginTurn(1);
+        var result: WorkerResult = .{
+            .outcome = .{ .receipt = zero_receipt, .disposition = disposition },
+            .error_text = try gpa.dupe(u8, "The provider replaced the credential."),
+        };
+        defer app.freeWorkerResult(&result);
+        try app.finishWorkerResult(&result);
+
+        // The workflow waits in the hold whose caption and controls act, and no
+        // login picker opened inside the role conversation.
+        try std.testing.expect(app.review != null);
+        try std.testing.expectEqual(ReviewFlow.Hold.failure, app.review.?.hold.?);
+        try std.testing.expectEqualStrings(
+            "Review hold: The judge request failed",
+            app.session.review_title.?,
+        );
+        try std.testing.expectEqualStrings(
+            "Ctrl+N: Try again · Ctrl+S: Role setup · Esc: Stop",
+            app.session.review_controls,
+        );
+        try std.testing.expect(app.session.mode == .prompt);
+
+        // The role kept the account, the model, and the effort level of its
+        // setup.
+        try std.testing.expectEqual(
+            ai.llm.Account.anthropic_subscription,
+            app.activeAccount().?,
+        );
+        try std.testing.expectEqualStrings(role_model.name, app.agent.model.name);
+        try std.testing.expectEqual(ai.llm.Effort.max, app.agent.effort);
+
+        // The project memory kept the main conversation choices.
+        try std.testing.expect(app.state.models.get(.anthropic_subscription) == null);
+        var maybe_file = try ai.json_store.open(gpa, io, app.state.path);
+        defer if (maybe_file) |*file| file.deinit();
+        if (maybe_file) |*file| try std.testing.expect(file.entry("/work") == null);
+
+        // The parked conversation lost the proof and the block that held it, so
+        // the restored main conversation replays neither.
+        const parked = &app.review.?.main;
+        try std.testing.expectEqual(@as(usize, 0), parked.agent.items.items.len);
+        try std.testing.expectEqual(
+            @as(usize, 1),
+            parked.presentation.transcript.blocks().len,
+        );
+
+        // Esc ends the workflow and frees every parked conversation.
+        try app.handleKey(&.escape);
+        try std.testing.expect(app.review == null);
+    }
+}
+
+test "empty-editor ctrl+d in a review turn quits without a completion event" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(home);
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    defer app.drainQueue();
+    // A fast worker can win the cancellation race, and the app then quits
+    // before the fence applies. Production frees the pending result in
+    // `shutdownTasks`, so this teardown mirrors it.
+    defer if (app.pending_turn_result) |result| {
+        app.freeWorkerResult(&result);
+        app.pending_turn_result = null;
+    };
+    app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
+    defer app.accounts.deinit();
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = anthropic_default,
+        .system = "",
+        .retry = .{},
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+    try installJudgeFlow(&app, "Decision: Fix required.\nFix the leak.");
+    try app.finishReviewPhase();
+    try std.testing.expect(app.session.mode == .turn);
+
+    // A draft takes the key away, so the turn keeps running.
+    try app.session.editor.insert("draft");
+    try app.handleKey(&.{ .ctrl = 'd' });
+    try std.testing.expect(app.running);
+    try std.testing.expect(app.review != null);
+
+    // The empty-editor quit cancels the request, destroys the workflow, and
+    // writes no completion event.
+    app.session.editor.clear();
+    try app.handleKey(&.{ .ctrl = 'd' });
+    try std.testing.expect(!app.running);
+    try std.testing.expect(app.review == null);
+    for (app.session.transcript.blocks()) |block| {
+        if (block == .event) try std.testing.expect(std.mem.indexOf(
+            u8,
+            block.event.text.items,
+            "Review stopped",
+        ) == null);
+    }
+}
+
+/// Test helper: the tail of `submit` for a message that the user sends at a
+/// review hold. The sign-in gate blocks the whole path here, so the helper
+/// drives the same steps in the same order.
+fn sendReviewMessage(app: *App, text: []const u8) !void {
+    app.session.editor.clear();
+    try app.session.editor.insert(text);
+    const base = try app.startUserTurn(text);
+    try app.leaveReviewHold();
+    try app.retainReviewMessage(text);
+    var prompt = app.session.editor.detachTrimmed();
+    app.session.retainTurnPrompt(&prompt, base);
+}
+
+// A stop that the worker beats must still end the workflow. The retained result
+// resolves the session first, and the stop follows it, so no phase turn and no
+// failure hold can come after the stop.
+test "a stop that loses the cancellation race ends the workflow" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(home);
+
+    const failed: ai.Agent.Outcome.Disposition = .{ .failed = error.ApiError };
+    for ([_]ai.Agent.Outcome.Disposition{ .completed, failed }) |disposition| {
+        var out: std.Io.Writer.Allocating = .init(gpa);
+        defer out.deinit();
+
+        var app: App = undefined;
+        app.initForTest(gpa);
+        defer app.drainQueue();
+        app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
+        defer app.accounts.deinit();
+        app.agent = ai.Agent.init(gpa, io, null, .{
+            .model = anthropic_default,
+            .system = "",
+            .retry = .{},
+        });
+        defer app.agent.deinit();
+        app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+        defer app.session.deinit();
+        defer app.dropRetry();
+        try installJudgeFlow(&app, "Decision: Fix required.\nFix the leak.");
+        app.session.beginTurn(7);
+
+        const worker_result: WorkerResult = .{
+            .outcome = .{ .receipt = zero_receipt, .disposition = disposition },
+            .error_text = null,
+            .generation = 7,
+            .terminal_queued = true,
+        };
+        app.turn_future = try io.concurrent(fakeWorker, .{&worker_result});
+
+        // Esc over an empty editor stops the workflow, and the worker wins the
+        // join, so its result waits for the terminal fence.
+        try app.handleKey(&.escape);
+        try std.testing.expect(app.pending_turn_result != null);
+        try std.testing.expect(app.review != null);
+
+        const events = [_]Session.UiEvent{.{ .turn = .{
+            .generation = 7,
+            .payload = endedPayload(),
+        } }};
+        try std.testing.expect(!try app.applyBatch(&events));
+
+        // The stop ended the workflow: the main conversation returned, one
+        // completion event records the stop, and no successor turn runs.
+        try std.testing.expect(app.review == null);
+        try std.testing.expect(app.turn_future == null);
+        try std.testing.expect(app.session.mode == .prompt);
+        try std.testing.expect(app.session.review_title == null);
+        const blocks = app.session.transcript.blocks();
+        try std.testing.expectEqual(@as(usize, 2), blocks.len);
+        try std.testing.expectEqualStrings("main marker", blocks[0].user.items);
+        try std.testing.expectEqualStrings(
+            "Review stopped at the judge. Rounds: 1 · Fixer passes: 0 · Cost: $0.00",
+            blocks[1].event.text.items,
+        );
+    }
+}
+
+// A message that the user sends at a hold runs as its own turn, so the caption
+// names the running phase and states the controls of a turn. A failure that
+// commits nothing returns the workflow to that hold with its postponed step.
+test "a message at a review hold runs under the phase caption and returns to the hold" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(home);
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    defer app.drainQueue();
+    app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
+    defer app.accounts.deinit();
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = anthropic_default,
+        .system = "",
+        .retry = .{},
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+    defer app.dropRetry();
+    try installJudgeFlow(&app, "Decision: Fix required.\nFix the leak.");
+
+    // The editor text brakes the workflow, so the fix decision postpones its
+    // step and the workflow waits for the user.
+    try app.session.editor.insert("keep the config format");
+    try app.finishReviewPhase();
+    try std.testing.expectEqual(ReviewFlow.Hold.user, app.review.?.hold.?);
+
+    // The message starts a turn, so the hold and its controls go.
+    try sendReviewMessage(&app, "keep the config format");
+    try std.testing.expect(app.session.mode == .turn);
+    try std.testing.expect(app.review.?.hold == null);
+    try std.testing.expectEqualStrings("Review: Round 1 of 4 · Judge", app.session.review_title.?);
+    try std.testing.expectEqualStrings("Enter: Steer · Esc: Stop", app.session.review_controls);
+
+    // The signed-out worker fails and commits nothing, so the text returns to
+    // the editor and the workflow waits in the hold it came from.
+    {
+        const result = app.awaitTurnFuture().?;
+        defer app.freeWorkerResult(&result);
+        try app.finishWorkerResult(&result);
+    }
+    try std.testing.expect(app.retry == null);
+    try std.testing.expectEqual(ReviewFlow.Hold.user, app.review.?.hold.?);
+    try std.testing.expectEqual(Review.Step{ .start_fixer = .first }, app.review.?.step.?);
+    try std.testing.expectEqualStrings(
+        "Review hold: The judge completed",
+        app.session.review_title.?,
+    );
+    try std.testing.expectEqualStrings(
+        "Enter: Send · Ctrl+N: Continue · Esc: Stop",
+        app.session.review_controls,
+    );
+    try std.testing.expectEqualStrings("keep the config format", app.session.editor.visible());
+
+    // Ctrl+N applies the postponed step, which the failure kept.
+    try app.handleKey(&.{ .ctrl = 'n' });
+    try std.testing.expect(app.session.mode == .turn);
+    try std.testing.expectEqual(Review.Role.fixer, app.review.?.role.?);
+    {
+        const result = app.awaitTurnFuture().?;
+        defer app.freeWorkerResult(&result);
+        try app.finishWorkerResult(&result);
+    }
+
+    // Esc ends the workflow and frees every parked conversation.
+    try app.handleKey(&.escape);
+    try std.testing.expect(app.review == null);
+}
+
+// The correction budget counts a request that Drinky sent. A brake postpones
+// the request, so the budget stays whole and the next invalid judge report
+// still gets the one correction instead of the invalid stop.
+test "a postponed correction request keeps its budget" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(home);
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    defer app.drainQueue();
+    app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
+    defer app.accounts.deinit();
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = anthropic_default,
+        .system = "",
+        .retry = .{},
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+    defer app.dropRetry();
+    try installJudgeFlow(&app, "The target looks fine to me.");
+
+    // The editor text brakes the invalid report, so the correction request
+    // waits at the hold and no request goes out.
+    try app.session.editor.insert("check the parser too");
+    try app.finishReviewPhase();
+    try std.testing.expectEqual(ReviewFlow.Hold.user, app.review.?.hold.?);
+    try std.testing.expectEqual(Review.Step.request_correction, app.review.?.step.?);
+    try std.testing.expect(!app.review.?.machine.correction_requested);
+
+    // The message runs as a judge turn. Its reply carries no decision line
+    // either, so the workflow asks for the correction instead of stopping.
+    try sendReviewMessage(&app, "check the parser too");
+    {
+        const result = app.awaitTurnFuture().?;
+        app.freeWorkerResult(&result);
+    }
+    try app.agent.items.append(gpa, .{ .message = .{
+        .role = .assistant,
+        .text = try gpa.dupe(u8, "I still see no defect."),
+    } });
+    const committed: WorkerResult = .{
+        .outcome = .{ .receipt = .{
+            .history_base = 0,
+            .history_end = 1,
+            .steering_committed_count = 0,
+        }, .disposition = .completed },
+        .error_text = null,
+    };
+    try app.finishWorkerResult(&committed);
+    try std.testing.expect(app.review != null);
+    try std.testing.expect(app.review.?.machine.correction_requested);
+    try std.testing.expect(app.session.mode == .turn);
+    {
+        const blocks = app.session.transcript.blocks();
+        try std.testing.expect(std.mem.indexOf(
+            u8,
+            blocks[blocks.len - 1].user_note.items,
+            "<judge_report_correction>",
+        ) != null);
+    }
+    {
+        const result = app.awaitTurnFuture().?;
+        defer app.freeWorkerResult(&result);
+        try app.finishWorkerResult(&result);
+    }
+
+    // Esc ends the workflow and frees every parked conversation.
+    try app.handleKey(&.escape);
+    try std.testing.expect(app.review == null);
+}
+
+// One owner holds the generated request at every point of a phase turn start,
+// and a failed start parks no conversation. Every allocation failure across the
+// call therefore leaves a flow that a teardown frees once and whole.
+test "an allocation failure during a phase turn start parks nothing and frees once" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(std.testing.allocator, io, &tmp, "");
+    defer std.testing.allocator.free(home);
+
+    var started = false;
+    var fail_index: usize = 0;
+    while (fail_index < 32) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        const gpa = failing.allocator();
+        var out: std.Io.Writer.Allocating = .init(gpa);
+        defer out.deinit();
+
+        var app: App = undefined;
+        app.initForTest(gpa);
+        defer app.drainQueue();
+        app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
+        defer app.accounts.deinit();
+        app.agent = ai.Agent.init(gpa, io, null, .{
+            .model = anthropic_default,
+            .system = "",
+            .retry = .{},
+        });
+        defer app.agent.deinit();
+        app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+        defer app.session.deinit();
+        try installJudgeFlow(&app, "Decision: Fix required.\nFix the leak.");
+
+        const request = try gpa.dupe(u8, "<fixer_request round=\"1\" pass=\"1\">");
+        failing.fail_index = failing.alloc_index + fail_index;
+        started = true;
+        app.startReviewTurn(.fixer, request) catch {
+            started = false;
+        };
+        failing.fail_index = std.math.maxInt(usize);
+        if (app.turn_future != null) {
+            const result = app.awaitTurnFuture().?;
+            app.freeWorkerResult(&result);
+        }
+        if (started) {
+            try std.testing.expectEqual(Review.Role.fixer, app.review.?.role.?);
+            try std.testing.expect(app.review.?.judge != null);
+            try std.testing.expect(app.review.?.request != null);
+        } else {
+            // The judge conversation is active again, so the flow parks no
+            // judge and holds no request of the failed start.
+            try std.testing.expectEqual(Review.Role.judge, app.review.?.role.?);
+            try std.testing.expect(app.review.?.judge == null);
+            try std.testing.expect(app.review.?.request == null);
+        }
+        var flow = app.review.?;
+        app.review = null;
+        flow.deinit(gpa);
+    }
+    // The last index falls past the call, so the loop covered every allocation.
+    try std.testing.expect(started);
+}
+
+// A successor turn transfers its request copy to the flow, so no later failure
+// can free a slice that the flow owns.
+test "an allocation failure during a successor turn start frees its request once" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(std.testing.allocator, io, &tmp, "");
+    defer std.testing.allocator.free(home);
+
+    var started = false;
+    var fail_index: usize = 0;
+    while (fail_index < 32) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        const gpa = failing.allocator();
+        var out: std.Io.Writer.Allocating = .init(gpa);
+        defer out.deinit();
+
+        var app: App = undefined;
+        app.initForTest(gpa);
+        defer app.drainQueue();
+        app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
+        defer app.accounts.deinit();
+        app.agent = ai.Agent.init(gpa, io, null, .{
+            .model = anthropic_default,
+            .system = "",
+            .retry = .{},
+        });
+        defer app.agent.deinit();
+        app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+        defer app.session.deinit();
+        try installJudgeFlow(&app, "Looks fine.");
+
+        failing.fail_index = failing.alloc_index + fail_index;
+        started = true;
+        app.startReviewSuccessor(Review.correction_request) catch {
+            started = false;
+        };
+        failing.fail_index = std.math.maxInt(usize);
+        if (app.turn_future != null) {
+            const result = app.awaitTurnFuture().?;
+            app.freeWorkerResult(&result);
+        }
+        if (started) {
+            try std.testing.expect(app.review.?.request != null);
+        } else {
+            try std.testing.expect(app.review.?.request == null);
+        }
+        var flow = app.review.?;
+        app.review = null;
+        flow.deinit(gpa);
+    }
+    // The last index falls past the call, so the loop covered every allocation.
+    try std.testing.expect(started);
+}
+
+// A retry attempt at a failure hold is a running turn too, so the caption names
+// the phase and drops the controls that only a hold answers.
+test "a retry attempt in a review runs under the phase caption" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    defer app.drainQueue();
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = anthropic_default,
+        .system = "",
+        .retry = .{},
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+    defer app.dropRetry();
+    try installJudgeFlow(&app, "Decision: Review settled.");
+    app.review.?.hold = .failure;
+    app.setRetry(.{ .failure = try gpa.dupe(u8, "The provider is overloaded.") });
+
+    // The attempt continues committed work, so the workflow leaves the hold.
+    try app.sendRetryTurn();
+    try std.testing.expect(app.session.mode == .turn);
+    try std.testing.expect(app.review.?.hold == null);
+    try std.testing.expectEqualStrings("Review: Round 1 of 4 · Judge", app.session.review_title.?);
+    try std.testing.expectEqualStrings("Enter: Steer · Esc: Stop", app.session.review_controls);
+
+    // The failed attempt returns the workflow to the failure hold.
+    {
+        const result = app.awaitTurnFuture().?;
+        defer app.freeWorkerResult(&result);
+        try app.finishWorkerResult(&result);
+    }
+    try std.testing.expectEqual(ReviewFlow.Hold.failure, app.review.?.hold.?);
+    try std.testing.expectEqualStrings(
+        "Ctrl+N: Try again · Ctrl+S: Role setup · Esc: Stop",
+        app.session.review_controls,
+    );
+
+    try app.handleKey(&.escape);
+    try std.testing.expect(app.review == null);
+}
+
+// A judge turn that the user started at the limit hold stays an answer. The
+// origin of that work survives a committed failure and the retry attempt that
+// continues it, so the completed attempt returns the workflow to the limit
+// hold and asks for no correction.
+test "a limit-hold answer that a committed failure interrupts stays an answer" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(home);
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    defer app.drainQueue();
+    app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
+    defer app.accounts.deinit();
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = anthropic_default,
+        .system = "",
+        .retry = .{},
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+    defer app.dropRetry();
+    try installJudgeFlow(&app, "Decision: Fix required.\nFix the leak.");
+    // The active round is the last one the ceiling permits, so the fix
+    // decision holds the workflow at the limit.
+    app.review.?.machine.rounds_max = 1;
+
+    try app.finishReviewPhase();
+    try std.testing.expectEqual(ReviewFlow.Hold.limit, app.review.?.hold.?);
+
+    // The user answers the judge at that hold, and the turn fails with
+    // committed work, so the normal retry waits behind the failure hold.
+    try sendReviewMessage(&app, "the finding rests on the diff alone");
+    try std.testing.expectEqual(ReviewFlow.Hold.limit, app.review.?.hold_origin.?);
+    {
+        const result = app.awaitTurnFuture().?;
+        app.freeWorkerResult(&result);
+    }
+    var failed: WorkerResult = .{
+        .outcome = .{
+            .receipt = .{
+                .history_base = 0,
+                .history_end = 1,
+                .steering_committed_count = 0,
+            },
+            .disposition = .{ .failed = error.ApiError },
+        },
+        .error_text = try gpa.dupe(u8, "The provider is overloaded."),
+    };
+    defer app.freeWorkerResult(&failed);
+    try app.finishWorkerResult(&failed);
+    try std.testing.expect(app.retry != null);
+    try std.testing.expectEqual(ReviewFlow.Hold.failure, app.review.?.hold.?);
+
+    // Ctrl+N sends the attempt. Its gate needs an account, so the test drives
+    // the half that spawns the turn.
+    try app.sendRetryTurn();
+    {
+        const result = app.awaitTurnFuture().?;
+        app.freeWorkerResult(&result);
+    }
+    // The attempt reached the judge, so its history holds the request and the
+    // answer that the judge returned.
+    try app.agent.items.append(gpa, .{ .message = .{
+        .role = .user,
+        .text = try gpa.dupe(u8, "the finding rests on the diff alone"),
+    } });
+    try app.agent.items.append(gpa, .{ .message = .{
+        .role = .assistant,
+        .text = try gpa.dupe(u8, "The finding rests on the diff alone."),
+    } });
+    const completed: WorkerResult = .{
+        .outcome = .{ .receipt = .{
+            .history_base = 0,
+            .history_end = 1,
+            .steering_committed_count = 0,
+        }, .disposition = .completed },
+        .error_text = null,
+    };
+    try app.finishWorkerResult(&completed);
+
+    // The attempt completed the answer of the user, so the workflow returns to
+    // the limit hold. The answer carries no decision line, and the machine
+    // spends no correction budget on it.
+    try std.testing.expectEqual(ReviewFlow.Hold.limit, app.review.?.hold.?);
+    try std.testing.expect(app.turn_future == null);
+    try std.testing.expect(!app.review.?.machine.correction_requested);
+    try std.testing.expectEqualStrings("Review limit: Round 1 of 1", app.session.review_title.?);
+    try std.testing.expectEqualStrings(
+        "Enter: Ask the judge · Ctrl+E: Add a round · Esc: Finish",
+        app.session.review_controls,
+    );
+
+    try app.handleKey(&.escape);
+    try std.testing.expect(app.review == null);
+}
+
+// The failure hold names only controls that act. A message from that hold
+// takes the armed retry with it, so a failure of that message which commits
+// nothing leaves nothing behind Ctrl+N, and the control row drops the key.
+test "the failure hold drops Ctrl+N when no retry and no request stand behind it" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(home);
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    defer app.drainQueue();
+    app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
+    defer app.accounts.deinit();
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = anthropic_default,
+        .system = "",
+        .retry = .{},
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+    defer app.dropRetry();
+    try installJudgeFlow(&app, "Decision: Fix required.\nFix the leak.");
+
+    // The fix decision starts the fixer, and that phase turn fails with
+    // committed work.
+    try app.finishReviewPhase();
+    try std.testing.expectEqual(Review.Role.fixer, app.review.?.role.?);
+    {
+        const result = app.awaitTurnFuture().?;
+        app.freeWorkerResult(&result);
+    }
+    var failed: WorkerResult = .{
+        .outcome = .{
+            .receipt = .{
+                .history_base = 0,
+                .history_end = 1,
+                .steering_committed_count = 0,
+            },
+            .disposition = .{ .failed = error.ApiError },
+        },
+        .error_text = try gpa.dupe(u8, "The provider is overloaded."),
+    };
+    defer app.freeWorkerResult(&failed);
+    try app.finishWorkerResult(&failed);
+
+    // The committed failure drops the stored request, so the armed retry is
+    // the one action behind Ctrl+N.
+    try std.testing.expectEqual(ReviewFlow.Hold.failure, app.review.?.hold.?);
+    try std.testing.expect(app.review.?.request == null);
+    try std.testing.expect(app.retry != null);
+    try std.testing.expectEqualStrings(
+        "Ctrl+N: Try again · Ctrl+S: Role setup · Esc: Stop",
+        app.session.review_controls,
+    );
+
+    // The message takes the retry, and its turn fails without a commit, so
+    // neither a retry context nor a request stands behind the key.
+    try sendReviewMessage(&app, "focus on the parser");
+    try std.testing.expect(app.retry == null);
+    {
+        const result = app.awaitTurnFuture().?;
+        defer app.freeWorkerResult(&result);
+        try app.finishWorkerResult(&result);
+    }
+    try std.testing.expectEqual(ReviewFlow.Hold.failure, app.review.?.hold.?);
+    try std.testing.expect(app.retry == null);
+    try std.testing.expect(app.review.?.request == null);
+    try std.testing.expectEqualStrings(
+        "Ctrl+S: Role setup · Esc: Stop",
+        app.session.review_controls,
+    );
+
+    // The press has no action, so no turn starts and the transcript grows by
+    // no block.
+    const block_count = app.session.transcript.blocks().len;
+    try app.handleKey(&.{ .ctrl = 'n' });
+    try std.testing.expect(app.turn_future == null);
+    try std.testing.expect(app.session.mode == .prompt);
+    try std.testing.expectEqual(ReviewFlow.Hold.failure, app.review.?.hold.?);
+    try std.testing.expectEqual(block_count, app.session.transcript.blocks().len);
+
+    try app.handleKey(&.escape);
+    try std.testing.expect(app.review == null);
+}
+
+// The judge copy of a direct message must exist only after the message enters
+// the role conversation, so a turn that commits nothing leaves no copy and one
+// resend produces one copy.
+test "a judge copy of a direct message waits for the turn that commits it" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(home);
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    defer app.drainQueue();
+    app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
+    defer app.accounts.deinit();
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = anthropic_default,
+        .system = "",
+        .retry = .{},
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+    defer app.dropRetry();
+    try installJudgeFlow(&app, "Decision: Fix required.\nFix the leak.");
+
+    // The empty editor lets the workflow start the fixer, whose request fails.
+    try app.finishReviewPhase();
+    try std.testing.expectEqual(Review.Role.fixer, app.review.?.role.?);
+    {
+        const result = app.awaitTurnFuture().?;
+        defer app.freeWorkerResult(&result);
+        try app.finishWorkerResult(&result);
+    }
+    try std.testing.expectEqual(ReviewFlow.Hold.failure, app.review.?.hold.?);
+
+    // The message to the fixer fails and commits nothing, so no copy waits.
+    try sendReviewMessage(&app, "check the parser too");
+    {
+        const result = app.awaitTurnFuture().?;
+        defer app.freeWorkerResult(&result);
+        try app.finishWorkerResult(&result);
+    }
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        app.review.?.machine.pending_messages.items.len,
+    );
+    try std.testing.expectEqualStrings("check the parser too", app.session.editor.visible());
+    // No history holds the fixer request, so its resend still stands.
+    try std.testing.expect(app.review.?.request != null);
+
+    // The resend reaches the fixer. The joined worker stands in for a reply, so
+    // the committed receipt reports the message in the role conversation.
+    try sendReviewMessage(&app, "check the parser too");
+    {
+        const result = app.awaitTurnFuture().?;
+        app.freeWorkerResult(&result);
+    }
+    try app.session.editor.insert("hold the workflow here");
+    const committed: WorkerResult = .{
+        .outcome = .{ .receipt = .{
+            .history_base = 0,
+            .history_end = 1,
+            .steering_committed_count = 0,
+        }, .disposition = .completed },
+        .error_text = null,
+    };
+    try app.finishWorkerResult(&committed);
+    const pending = app.review.?.machine.pending_messages.items;
+    try std.testing.expectEqual(@as(usize, 1), pending.len);
+    try std.testing.expectEqual(Review.Role.fixer, pending[0].role);
+    try std.testing.expectEqualStrings("check the parser too", pending[0].text);
+    // The completed turn ended the phase, so no request waits for a resend.
+    try std.testing.expect(app.review.?.request == null);
+
+    try app.handleKey(&.escape);
+    try std.testing.expect(app.review == null);
+}
+
+// A consumed steering batch commits with the reply that follows it. A turn
+// that fails before that commit returns the text to the editor, so the copy
+// waits for the commit and the resend leaves one copy alone.
+test "a judge copy of a steering message waits for the commit of its batch" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(home);
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    defer app.drainQueue();
+    app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
+    defer app.accounts.deinit();
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = anthropic_default,
+        .system = "",
+        .retry = .{},
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+    defer app.dropRetry();
+    try installJudgeFlow(&app, "Decision: Fix required.\nFix the leak.");
+
+    // The empty editor lets the workflow start the fixer, whose request fails.
+    try app.finishReviewPhase();
+    try std.testing.expectEqual(Review.Role.fixer, app.review.?.role.?);
+
+    // The turn folds the steering message in, and no reply commits the batch.
+    try app.session.editor.insert("check the parser too");
+    try app.submitSteering();
+    const consumed = [_]Session.UiEvent{.{ .turn = .{
+        .generation = app.session.mode.turn.generation,
+        .payload = .{ .steering_consumed = .{
+            .text = try gpa.dupe(u8, "check the parser too"),
+            .count = 1,
+        } },
+    } }};
+    _ = try app.applyBatch(&consumed);
+    {
+        const result = app.awaitTurnFuture().?;
+        defer app.freeWorkerResult(&result);
+        try app.finishWorkerResult(&result);
+    }
+    try std.testing.expectEqual(ReviewFlow.Hold.failure, app.review.?.hold.?);
+
+    // The uncommitted batch returned to the editor, so no copy waits.
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        app.review.?.machine.pending_messages.items.len,
+    );
+    try std.testing.expectEqualStrings("check the parser too", app.session.editor.visible());
+
+    // The resend reaches the fixer as its own turn, and the committed receipt
+    // leaves one copy of the text.
+    try sendReviewMessage(&app, "check the parser too");
+    {
+        const result = app.awaitTurnFuture().?;
+        app.freeWorkerResult(&result);
+    }
+    try app.session.editor.insert("hold the workflow here");
+    const committed: WorkerResult = .{
+        .outcome = .{ .receipt = .{
+            .history_base = 0,
+            .history_end = 1,
+            .steering_committed_count = 0,
+        }, .disposition = .completed },
+        .error_text = null,
+    };
+    try app.finishWorkerResult(&committed);
+    const pending = app.review.?.machine.pending_messages.items;
+    try std.testing.expectEqual(@as(usize, 1), pending.len);
+    try std.testing.expectEqual(Review.Role.fixer, pending[0].role);
+    try std.testing.expectEqualStrings("check the parser too", pending[0].text);
+
+    try app.handleKey(&.escape);
+    try std.testing.expect(app.review == null);
+}
+
+// The user sends the direct message of a turn before every steering message
+// that the same turn folds in, so the copies keep that order.
+test "the judge copies of one turn keep the order the user sent them" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(home);
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    defer app.drainQueue();
+    app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
+    defer app.accounts.deinit();
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = anthropic_default,
+        .system = "",
+        .retry = .{},
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+    defer app.dropRetry();
+    try installJudgeFlow(&app, "Decision: Fix required.\nFix the leak.");
+
+    // The failed fixer request holds the workflow, so the user answers it.
+    try app.finishReviewPhase();
+    {
+        const result = app.awaitTurnFuture().?;
+        defer app.freeWorkerResult(&result);
+        try app.finishWorkerResult(&result);
+    }
+    try std.testing.expectEqual(ReviewFlow.Hold.failure, app.review.?.hold.?);
+
+    // The answer starts a turn, and the turn folds one steering message in.
+    try sendReviewMessage(&app, "check the parser too");
+    const consumed = [_]Session.UiEvent{.{ .turn = .{
+        .generation = app.session.mode.turn.generation,
+        .payload = .{ .steering_consumed = .{
+            .text = try gpa.dupe(u8, "the parser file moved"),
+            .count = 1,
+        } },
+    } }};
+    _ = try app.applyBatch(&consumed);
+    {
+        const result = app.awaitTurnFuture().?;
+        app.freeWorkerResult(&result);
+    }
+    try app.session.editor.insert("hold the workflow here");
+    const committed: WorkerResult = .{
+        .outcome = .{ .receipt = .{
+            .history_base = 0,
+            .history_end = 2,
+            .steering_committed_count = 1,
+        }, .disposition = .completed },
+        .error_text = null,
+    };
+    try app.finishWorkerResult(&committed);
+    const pending = app.review.?.machine.pending_messages.items;
+    try std.testing.expectEqual(@as(usize, 2), pending.len);
+    try std.testing.expectEqualStrings("check the parser too", pending[0].text);
+    try std.testing.expectEqualStrings("the parser file moved", pending[1].text);
+
+    try app.handleKey(&.escape);
+    try std.testing.expect(app.review == null);
+}
+
 test "a signed-out submit is refused with a login prompt" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;

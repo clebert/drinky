@@ -46,14 +46,15 @@ You can also ask Drinky to explain its own commands, keys, and settings.
 
 - `/login` signs in. `/model` and `/effort` change the model and the reasoning effort.
 - `/skill` picks a discovered skill. `/skill:name` loads one skill with an optional task.
+- `/review` reviews the pending changes in bounded rounds with a reviewer, a judge, and a fixer.
 - `/new` clears the conversation. `/system` shows the complete system prompt.
 
 ## Configuration
 
 The `~/.drinky/config.json` file is optional. Ask Drinky to maintain the file directly. The agent
 can describe the harness itself: every command, every setting with its type, default, and meaning,
-the keys of the prompt and of a running turn, and the files that Drinky discovers. Drinky applies
-changes at the next start.
+the keys of the prompt, of a running turn, and of a review, and the files that Drinky discovers.
+Drinky applies changes at the next start.
 
 ## Provider access
 

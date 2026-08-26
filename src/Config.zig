@@ -30,6 +30,9 @@ window_pages: usize = layout.window_pages_default,
 /// The shares at which a status gauge takes the warning color and the error
 /// color. A pair that names no valid shares falls back to the compiled pair.
 gauge: ui.status.Gauge = .{},
+/// The reviewer-round ceiling that a `/review` workflow starts on. A count of
+/// no round starts no reviewer, so it falls back to the compiled count.
+review_rounds_max: u64 = review_rounds_default,
 default_models: DefaultModels = .{},
 /// The configured default reasoning-effort level, or null when the file names
 /// none or names an unknown level. The caller falls back to a compiled default.
@@ -65,6 +68,10 @@ dropped_window_pages: ?usize = null,
 /// status line falls back to the compiled pair. The two shares hold one rule
 /// between them, so they drop together. Null on a legal pair.
 dropped_gauge: ?ui.status.Gauge = null,
+/// The configured review round count that Drinky cannot use. The config keeps it
+/// so the app can tell the user Drinky ignored their line, and the workflow
+/// falls back to the compiled count. Null on a legal value.
+dropped_review_rounds: ?u64 = null,
 /// Whether the file held an empty bash deny pattern. Drinky drops it, because an
 /// empty pattern states no command. The config keeps the fact so the app can
 /// tell the user Drinky ignored the entry.
@@ -117,6 +124,7 @@ const File = struct {
     request: Request = .{},
     bash: Bash = .{},
     interface: Interface = .{},
+    review: Review = .{},
     default_models: DefaultModelsFile = .{},
     default_effort: ?JsonString = null,
 
@@ -184,6 +192,12 @@ const File = struct {
         gauge_percent_error: f64 = gauge_default.percent_error,
     };
 
+    /// The bounds of one `/review` workflow. A round is one fresh reviewer,
+    /// so the count bounds unattended review progress.
+    const Review = struct {
+        rounds_max: u64 = review_rounds_default,
+    };
+
     /// Model names keyed by account tag. Each resolves to a compiled model.
     const DefaultModelsFile = struct {
         anthropic_api: ?JsonString = null,
@@ -211,6 +225,9 @@ const timeouts_default: ai.net.ProviderTimeouts = .{};
 const retry_default: ai.net.Retry = .{};
 const bash_default: ai.tool.Context.Bash = .{};
 const gauge_default: ui.status.Gauge = .{};
+/// The compiled reviewer-round ceiling of one `/review` workflow. The app
+/// starts its workflow bookkeeping on it before the file loads.
+pub const review_rounds_default: u64 = 4;
 
 /// A malformed file must not fill the startup transcript with one event per
 /// key. Sixteen paths identify a broad shape mismatch. One final event reports
@@ -349,6 +366,13 @@ const keys = [_]Key{
                 "use and keeps both compiled shares.",
             .{ ui.status.Gauge.percent_min, ui.status.Gauge.percent_max },
         ),
+    },
+    .{
+        .path = "review.rounds_max",
+        .description = "The reviewer rounds that one /review workflow runs unattended. The " ++
+            "count must be at least 1, and Ctrl+E adds one round to a running workflow " ++
+            "without a change to this file. Drinky reports a count it cannot use and keeps " ++
+            "the default.",
     },
     .{
         .path = "default_models.anthropic_api",
@@ -781,6 +805,11 @@ fn loadFromData(gpa: std.mem.Allocator, io: std.Io, options: *const DataOptions)
     const window_pages = resolveWindowPages(&dropped_window_pages, interface.window_pages);
     var dropped_gauge: ?ui.status.Gauge = null;
     const gauge = resolveGauge(&dropped_gauge, &interface);
+    var dropped_review_rounds: ?u64 = null;
+    const review_rounds_max = resolveReviewRounds(
+        &dropped_review_rounds,
+        parsed.value.review.rounds_max,
+    );
     var unknown: std.ArrayList([]const u8) = .empty;
     errdefer {
         for (unknown.items) |key| gpa.free(key);
@@ -835,6 +864,7 @@ fn loadFromData(gpa: std.mem.Allocator, io: std.Io, options: *const DataOptions)
         },
         .window_pages = window_pages,
         .gauge = gauge,
+        .review_rounds_max = review_rounds_max,
         .default_models = default_models,
         .default_effort = default_effort,
         .user_instructions = user_instructions,
@@ -844,6 +874,7 @@ fn loadFromData(gpa: std.mem.Allocator, io: std.Io, options: *const DataOptions)
         .dropped_bash_timeout_ms = dropped_bash_timeout_ms,
         .dropped_window_pages = dropped_window_pages,
         .dropped_gauge = dropped_gauge,
+        .dropped_review_rounds = dropped_review_rounds,
         .dropped_deny_empty = dropped_deny_empty,
         .unknown_keys = unknown_keys,
         .unknown_keys_omitted = unknown_keys_omitted,
@@ -977,6 +1008,16 @@ fn resolveWindowPages(dropped: *?usize, configured: usize) usize {
         return configured;
     dropped.* = configured;
     return layout.window_pages_default;
+}
+
+/// Resolve the configured review round count. A count of no round starts no
+/// reviewer, so a workflow cannot run under it. Such a count falls back to the
+/// compiled count, and the function records it in `dropped` so the app can
+/// surface it.
+fn resolveReviewRounds(dropped: *?u64, configured: u64) u64 {
+    if (configured >= 1) return configured;
+    dropped.* = configured;
+    return review_rounds_default;
 }
 
 /// Resolve the configured gauge shares. Each share names a part of a limit, and
@@ -1113,6 +1154,36 @@ test "load reads the interface section" {
     try std.testing.expectEqual(gauge_default.percent_error, empty.gauge.percent_error);
     try std.testing.expect(empty.dropped_window_pages == null);
     try std.testing.expect(empty.dropped_gauge == null);
+}
+
+test "load reads the review section and drops a count of no round" {
+    var config = try loadDataForTest(
+        \\{ "review": { "rounds_max": 7 } }
+    );
+    defer config.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u64, 7), config.review_rounds_max);
+    try std.testing.expect(config.dropped_review_rounds == null);
+
+    // A count of no round starts no reviewer, so it keeps the line for the
+    // report and falls back to the compiled count.
+    var zero = try loadDataForTest(
+        \\{ "review": { "rounds_max": 0 } }
+    );
+    defer zero.deinit(std.testing.allocator);
+    try std.testing.expectEqual(review_rounds_default, zero.review_rounds_max);
+    try std.testing.expectEqual(@as(?u64, 0), zero.dropped_review_rounds);
+
+    // Without the section the compiled count applies, and one round is legal.
+    var empty = try loadDataForTest("{}");
+    defer empty.deinit(std.testing.allocator);
+    try std.testing.expectEqual(review_rounds_default, empty.review_rounds_max);
+    try std.testing.expect(empty.dropped_review_rounds == null);
+    var one = try loadDataForTest(
+        \\{ "review": { "rounds_max": 1 } }
+    );
+    defer one.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u64, 1), one.review_rounds_max);
+    try std.testing.expect(one.dropped_review_rounds == null);
 }
 
 // A window of no page retains nothing, and a count above the window costs work

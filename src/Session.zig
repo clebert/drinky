@@ -180,6 +180,13 @@ turn_origin: ?TurnOrigin,
 /// Whether a retry context waits at the prompt. `App` owns that context and
 /// mirrors this bit, so the editor caption names its state and controls.
 retry_shown: bool,
+/// The review caption above the editor, or null outside a review workflow. It
+/// outranks the retry caption, because its controls own the prompt then. The
+/// session owns the title bytes, and the workflow survives a conversation
+/// switch, so a switch leaves the caption in place.
+review_title: ?[]u8,
+/// The static controls beside `review_title`.
+review_controls: []const u8,
 /// Milliseconds on the monotonic clock, written by the driver before each paint.
 /// The session does no io, so it cannot read a clock of its own. It stays zero
 /// until the first paint, which makes every span it reports zero. Every span of
@@ -541,6 +548,8 @@ pub fn init(
         .steering_consumed_count = 0,
         .turn_origin = null,
         .retry_shown = false,
+        .review_title = null,
+        .review_controls = "",
         .clock_ms = 0,
         .boot_clock_ms = 0,
         .bash_timeout_ms = (ai.tool.Context.Bash{}).timeout_ms,
@@ -553,6 +562,7 @@ pub fn init(
 }
 
 pub fn deinit(self: *Session) void {
+    self.setReviewCaption(null, "");
     self.deinitMode();
     self.clearNotice();
     self.clearSteering();
@@ -561,6 +571,16 @@ pub fn deinit(self: *Session) void {
     self.page_view.deinit();
     self.view.deinit();
     self.editor.deinit();
+}
+
+/// Replace the review caption. A null title removes it, and the session frees
+/// the title it replaces. The caption persists across frames and conversation
+/// switches, so the workflow controls survive a keypress, unlike a notice.
+pub fn setReviewCaption(self: *Session, title: ?[]u8, controls: []const u8) void {
+    if (self.review_title) |old| self.gpa.free(old);
+    self.review_title = title;
+    self.review_controls = controls;
+    self.dirty = true;
 }
 
 /// A conversation's whole presentation state: its own transcript, its request
@@ -594,6 +614,14 @@ pub const Conversation = struct {
             .model = model.*,
             .effort = effort,
         };
+    }
+
+    /// Forget the reasoning blocks that `account` produced in this parked
+    /// conversation. A parked conversation paints no row, so this changes no
+    /// screen state. The active conversation drops through
+    /// `Session.dropAccountReasoning` instead.
+    pub fn dropAccountReasoning(self: *Conversation, account: ai.llm.Account) void {
+        _ = self.transcript.dropAccount(account);
     }
 
     pub fn deinit(self: *Conversation, gpa: std.mem.Allocator) void {
@@ -1003,6 +1031,7 @@ pub fn applyOutcome(self: *Session, outcome: ai.command.Outcome) !void {
         .logout,
         .switch_account,
         .new_conversation,
+        .review,
         .show_system_prompt,
         .show_colors,
         => unreachable,
@@ -1469,32 +1498,48 @@ pub fn paint(self: *Session, size: terminal.View.Size) !void {
     const tail: layout.Tail = switch (self.mode) {
         .prompt => prompt: {
             self.editor.reflow(size);
-            break :prompt .{ .prompt = .{
-                .caption = if (self.retry_shown) .{
-                    .title = retry_title,
-                    .controls = retry_controls,
-                    .rows_max = editor_caption_rows_max,
-                } else null,
-                .editor = &self.editor,
-            } };
+            break :prompt .{
+                .prompt = .{
+                    // The review caption outranks the retry caption, because its
+                    // controls own the prompt while a workflow runs.
+                    .caption = if (self.review_title) |title| .{
+                        .title = title,
+                        .controls = self.review_controls,
+                        .rows_max = editor_caption_rows_max,
+                    } else if (self.retry_shown) .{
+                        .title = retry_title,
+                        .controls = retry_controls,
+                        .rows_max = editor_caption_rows_max,
+                    } else null,
+                    .editor = &self.editor,
+                },
+            };
         },
         .turn => |*turn| turn: {
             self.editor.reflow(size);
             const steering_count = self.steeringPendingCount();
-            break :turn .{ .turn = .{
-                .tools = try turn.boxes(self.gpa, self.clock_ms),
-                .activity = turn.activity(),
-                .caption = if (steering_count > 0) .{
-                    .title = std.fmt.bufPrint(
-                        &steering_title_buffer,
-                        "Queued messages: {d}",
-                        .{steering_count},
-                    ) catch unreachable,
-                    .controls = steering_controls,
-                    .rows_max = editor_caption_rows_max,
-                } else null,
-                .editor = &self.editor,
-            } };
+            break :turn .{
+                .turn = .{
+                    .tools = try turn.boxes(self.gpa, self.clock_ms),
+                    .activity = turn.activity(),
+                    // Queued steering outranks the review caption, because its
+                    // count and recall control matter at that moment.
+                    .caption = if (steering_count > 0) .{
+                        .title = std.fmt.bufPrint(
+                            &steering_title_buffer,
+                            "Queued messages: {d}",
+                            .{steering_count},
+                        ) catch unreachable,
+                        .controls = steering_controls,
+                        .rows_max = editor_caption_rows_max,
+                    } else if (self.review_title) |title| .{
+                        .title = title,
+                        .controls = self.review_controls,
+                        .rows_max = editor_caption_rows_max,
+                    } else null,
+                    .editor = &self.editor,
+                },
+            };
         },
         .picking => |*picking| picking: {
             try picking.picker.reflow(size);

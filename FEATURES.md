@@ -98,7 +98,8 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - With no account at all, the login picker opens by itself.
 - While signed out, Drinky refuses a message with a prompt to `/login`.
 - Reasoning replays only to the account that produced it. A login, a logout, or a credential
-  replacement discards that account's reasoning, cache-hit rate, and allowance.
+  replacement discards that account's reasoning, cache-hit rate, and allowance. A review workflow
+  parks conversations, and each parked one discards the same reasoning.
 - Drinky shows only the conversation that the next request carries, so a change that drops stored
   reasoning repaints the screen and the scrollback without it.
 - A conversation switch swaps the agent, its history, and the interface together, so the worker and
@@ -140,6 +141,9 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - **/effort** — set the reasoning-effort level, from the next turn on.
 - **/login** — sign in, switch to an account already signed in, or name the API key to set.
 - **/logout** — drop a signed-in account's credentials and hand the session to another account.
+- **/review** — review every pending change from `HEAD` in bounded rounds: a fresh reviewer finds
+  defects, a persistent judge validates and settles, and a fresh fixer applies the accepted
+  findings.
 - **/new** — clear the conversation, usage stats, and steering without changing its configuration.
   The next paint drops the terminal scrollback, so the empty conversation starts on a clean screen.
   The intro line returns with it, and the startup counts line does not.
@@ -168,6 +172,36 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - A local command failure temporarily replaces the footer until the next user action.
 - A command that can run stays in the editor while a turn runs, and one notice names the command and
   the restriction. The next Enter runs it once the turn ends.
+
+## Reviewing changes
+
+- `/review` needs a Git worktree, and its target is every staged, unstaged, and untracked change
+  from `HEAD`. Drinky itself runs no Git command and never touches the index.
+- The setup picker chooses the account, the model, and the effort level of each role, and the
+  project remembers a confirmed choice. An unchosen role inherits the active session configuration.
+  A role choice never replaces the project choices of the main conversation.
+- Every role runs in its own conversation with the shared instructions, skills, and tools. The
+  reviewer and the judge work under nonmutation prompts, and the fixer changes files like a normal
+  turn.
+- Each generated request shows whole in the transcript as a line that Drinky wrote, and a caption
+  above the editor names the round, the active role, and the controls.
+- The editor is the brake: an empty editor lets the workflow run unattended, and text holds it at
+  the next boundary. Enter steers the active role, and a message that reaches the reviewer or the
+  fixer gets one judge copy, so a report never reads as a user instruction.
+- A message that the user sends at a hold runs as its own turn under the round caption. A failure
+  that commits nothing returns the text to the editor and the workflow to that hold.
+- The judge asks the user only about an open product choice. The `review.rounds_max` ceiling
+  bounds unattended rounds, and Ctrl+E adds one round at the limit.
+- A rejected fixer dispute gets one final pass, and an invalid judge report gets one correction
+  request before the workflow stops.
+- A failed role request holds the workflow: Ctrl+N retries the committed work or resends the
+  request while one of the two stands behind it, and Ctrl+S reopens the setup of the failed role. A
+  credential replacement and a credential rejection end a role turn in that same hold, and neither
+  one changes a role choice.
+- Esc stops the workflow at a hold and during a turn. A worker that beats the cancel keeps its
+  reply, and the stop still ends the workflow.
+- The stop restores the main conversation exactly and records one completion event with the rounds,
+  the fixer passes, and the review cost. Empty-editor Ctrl+D quits Drinky whole.
 
 ## Providers
 
@@ -391,9 +425,9 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
   and at most 32 KiB. Each source loads at most 32 files and 64 KiB, and one file loads once even
   when two paths or a symbolic link reach it. Drinky reports what it skips.
 - `~/.drinky/config.json` is optional: paths for user instructions, request and bash limits, a bash
-  deny list, a default model per account, a default effort level, the skills that a path requires,
-  and the interface settings. Drinky reads it only at startup, so a change applies at the next
-  start.
+  deny list, a default model per account, a default effort level, the review round ceiling, the
+  skills that a path requires, and the interface settings. Drinky reads it only at startup, so a
+  change applies at the next start.
 - It holds no secrets. API keys come from `ANTHROPIC_API_KEY` and `OPENAI_API_KEY`.
 - A configured model that is not valid for its account is reported, and the compiled default used.
   An unknown effort level and an interface value Drinky cannot use are reported the same way. A key
@@ -404,9 +438,9 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
   parses the file, so a new key that carries no description fails the build and the section cannot
   drift.
 - JSON store writes use owner-only sibling `.lock` files to coordinate Drinky instances.
-- `~/.drinky/state.json` remembers per project which account and effort level Drinky used last, and
-  the model of each account. It is machine-local, owner-only, and keeps the 1000 most recently
-  changed projects. A repository is one project, keyed by its Git root.
+- `~/.drinky/state.json` remembers per project which account and effort level Drinky used last, the
+  model of each account, and the review role choices. It is machine-local, owner-only, and keeps
+  the 1000 most recently changed projects. A repository is one project, keyed by its Git root.
 - Drinky reads that file only at startup, so a change in one instance reaches only the next start. A
   persistent save failure is reported once and never stops the session.
 - `HOME` must be set, since the config, the credentials, and the state all live under `~/.drinky`.

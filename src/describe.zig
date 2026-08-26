@@ -108,9 +108,9 @@ fn writeCommands(writer: *std.Io.Writer) !void {
     try writer.writeAll("\nEvery other command refuses text after its name.\n");
 }
 
-/// The key hints of the intro line, then the keys of the prompt and the keys of a
-/// running turn. The hints come from the same constant that the intro line shows.
-/// One key can mean two things, so each list states its own mode.
+/// The key hints of the intro line, then the keys of the prompt, of a running
+/// turn, and of a review workflow. The hints come from the same constant that the
+/// intro line shows. One key can mean two things, so each list states its own mode.
 fn writeKeys(writer: *std.Io.Writer, options: *const Options) !void {
     try writer.writeAll(key_head);
     for (options.key_hints) |hint| try writer.print("- {s}\n", .{hint});
@@ -133,8 +133,27 @@ fn writeKeys(writer: *std.Io.Writer, options: *const Options) !void {
         \\- Ctrl+D cancels the turn at once.
         \\- Ctrl+C clears a draft, and it cancels the turn at an empty editor.
         \\
-        \\This section names the keys of the prompt and of a turn. A full-window page states its
-        \\own keys in its header, and the editor carries the movement keys of a text field.
+        \\A running `/review` workflow gives the keys below another meaning, at its prompt and
+        \\during its turns. The caption above the editor names the state of the workflow and its
+        \\controls.
+        \\
+        \\- Esc stops the workflow at a hold. During a turn it cancels the turn and stops the
+        \\  workflow. Drinky records one completion event and restores the main conversation.
+        \\- Ctrl+C clears a draft. At an empty editor it takes the Esc action, and it never
+        \\  quits Drinky.
+        \\- Ctrl+D quits Drinky at an empty editor, and the workflow ends with no completion
+        \\  event. Ctrl+D with a draft has no action.
+        \\- Ctrl+N answers two holds. At the hold of a completed role it continues the postponed
+        \\  step. At the hold of a failed role request it resends that request. A failed turn that
+        \\  committed work takes the retry attempt instead. The control row names Ctrl+N only
+        \\  while one of the two stands behind it. Ctrl+N has no action at the judge hold and at
+        \\  the round limit.
+        \\- Ctrl+E adds one round at the round limit.
+        \\- Ctrl+S opens the account, model, and effort menu of the role whose request failed.
+        \\
+        \\This section names the keys of the prompt, of a turn, and of a review workflow. A
+        \\full-window page states its own keys in its header, and the editor carries the
+        \\movement keys of a text field.
         \\
     , .{options.ctrl_c_window_ms});
 }
@@ -207,15 +226,53 @@ test "the document states every command, key, and discovery rule" {
     try std.testing.expect(std.mem.indexOf(u8, text, "- Ctrl+D: Quit\n") != null);
     const prompt = std.mem.indexOf(u8, text, "The prompt takes these keys:").?;
     const turn = std.mem.indexOf(u8, text, "A running turn takes these keys:").?;
+    const review = std.mem.indexOf(u8, text, "A running `/review` workflow gives").?;
     try std.testing.expect(prompt < turn);
+    try std.testing.expect(turn < review);
     // The quit rule and the retry belong to the prompt alone, and the steering
     // recall and the cancel belong to the turn alone.
     try std.testing.expect(std.mem.indexOf(u8, text[prompt..turn], "within 500 milli") != null);
     try std.testing.expect(std.mem.indexOf(u8, text[prompt..turn], "Ctrl+N asks") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text[turn..], "Ctrl+P moves") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text[turn..], "cancels the turn at once") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text[turn..], "Ctrl+N") == null);
-    try std.testing.expect(std.mem.indexOf(u8, text[turn..], "milliseconds") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text[turn..review], "Ctrl+P moves") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        text[turn..review],
+        "cancels the turn at once",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(u8, text[turn..review], "Ctrl+N") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text[turn..review], "milliseconds") == null);
+
+    // A review changes what six keys do, so its own list states each one. The
+    // two keys that only a review takes have no other answer in the document.
+    const review_keys = text[review..];
+    for ([_][]const u8{
+        "- Esc stops the workflow",
+        "- Ctrl+C clears a draft",
+        "- Ctrl+D quits Drinky at an empty editor",
+        "- Ctrl+N answers two holds",
+        "- Ctrl+E adds one round",
+        "- Ctrl+S opens the account, model, and effort menu",
+    }) |row| try std.testing.expect(std.mem.indexOf(u8, review_keys, row) != null);
+    // Ctrl+N answers two of the four holds, so the row names the two that it
+    // leaves to another key.
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        review_keys,
+        "no action at the judge hold and at\n  the round limit",
+    ) != null);
+    // A failure hold with nothing behind the key shows no Ctrl+N, so the row
+    // states the condition.
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        review_keys,
+        "names Ctrl+N only\n  while one of the two stands behind it",
+    ) != null);
+    // The quit and the completion event are the two answers that a false one
+    // costs the most, so the section states both.
+    try std.testing.expect(std.mem.indexOf(u8, review_keys, "never\n  quits Drinky") != null);
+    try std.testing.expect(std.mem.indexOf(u8, review_keys, "no completion") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text[keys..review], "Ctrl+E") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text[keys..review], "Ctrl+S") == null);
 
     // The discovery rules carry no config key, so only this document holds them.
     try std.testing.expect(std.mem.indexOf(u8, text, "`AGENTS.md`") != null);
@@ -225,7 +282,7 @@ test "the document states every command, key, and discovery rule" {
     // for every change that a user makes.
     try std.testing.expect(std.mem.indexOf(u8, text, "reaches the session that runs now") != null);
     // The keys of a page and of the editor stay out, so the section says so.
-    try std.testing.expect(std.mem.indexOf(u8, text, "states its\nown keys") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "own keys in its header") != null);
     try std.testing.expect(std.mem.indexOf(
         u8,
         text,
