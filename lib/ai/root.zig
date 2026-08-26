@@ -5,7 +5,6 @@
 
 const std = @import("std");
 
-const oauth_callback = @import("oauth_callback.zig");
 const oauth_login = @import("oauth_login.zig");
 
 pub const Accounts = @import("Accounts.zig");
@@ -18,6 +17,7 @@ pub const instructions = @import("instructions.zig");
 pub const llm = @import("llm.zig");
 pub const models = @import("models.zig");
 pub const net = @import("net.zig");
+pub const oauth_callback = @import("oauth_callback.zig");
 pub const openai = @import("openai/root.zig");
 pub const project = @import("project.zig");
 pub const provider = @import("provider.zig");
@@ -27,6 +27,5 @@ pub const tool = @import("tool/root.zig");
 
 test {
     std.testing.refAllDecls(@This());
-    _ = oauth_callback;
     _ = oauth_login;
 }

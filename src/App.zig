@@ -511,20 +511,37 @@ const WorkerResult = struct {
 /// and path values, which pass through the terminal's inert-text policy.
 const OauthPrompt = struct {
     writer: *std.Io.Writer,
+    io: std.Io,
+    /// Whether a paste watch reads the terminal. The authorization prompt
+    /// promises the paste path only while one exists.
+    paste_enabled: bool = false,
+    /// The login worker and the paste watch write concurrently. One lock
+    /// serializes them.
+    mutex: std.Io.Mutex = .init,
 
     pub fn showAuthorization(self: *OauthPrompt, url: []const u8) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         try self.writer.writeAll("Open this URL to authorize Drinky:\n\n");
         try self.writeText(url);
         try self.writer.writeAll("\n\nDrinky waits for the response from the browser.\n");
+        if (self.paste_enabled) try self.writer.writeAll(
+            "If the browser shows an error, paste the URL from its address bar here " ++
+                "and press Enter.\n",
+        );
         try self.writer.flush();
     }
 
     pub fn showBrowserLaunchFailed(self: *OauthPrompt) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         try self.writer.writeAll("Drinky could not open the browser. Open the URL above.\n");
         try self.writer.flush();
     }
 
     pub fn showAuthorized(self: *OauthPrompt, path: []const u8) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         try self.writer.writeAll("Drinky received authorization. Drinky saved the credentials to ");
         try self.writeText(path);
         try self.writer.writeAll(".\n");
@@ -532,6 +549,8 @@ const OauthPrompt = struct {
     }
 
     pub fn showSaveFailed(self: *OauthPrompt, path: []const u8, error_name: []const u8) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         try self.writer.writeAll(
             "Drinky received authorization. Drinky could not save the credentials to ",
         );
@@ -543,6 +562,47 @@ const OauthPrompt = struct {
         try self.writer.flush();
     }
 
+    pub fn showPasteInvalid(self: *OauthPrompt) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        try self.writer.writeAll("The pasted line is not the callback URL. " ++
+            "Paste the complete URL from the address bar.\n");
+        try self.writer.flush();
+    }
+
+    pub fn showPasteFailed(self: *OauthPrompt, error_name: []const u8) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        try self.writer.print(
+            "Drinky could not replay the pasted URL because of error {s}.\n",
+            .{error_name},
+        );
+        try self.writer.flush();
+    }
+
+    pub fn showPasteTooLong(self: *OauthPrompt) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        try self.writer.writeAll("The pasted line is too long for a callback URL. " ++
+            "Paste only the URL from the address bar.\n");
+        try self.writer.flush();
+    }
+
+    pub fn showPasteLate(self: *OauthPrompt) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        try self.writer.writeAll("Drinky already received the response for this sign-in.\n");
+        try self.writer.flush();
+    }
+
+    pub fn showPasteStopped(self: *OauthPrompt) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        try self.writer.writeAll("Drinky no longer reads a pasted URL. " ++
+            "The browser response still completes the sign-in.\n");
+        try self.writer.flush();
+    }
+
     fn writeText(self: *OauthPrompt, text: []const u8) !void {
         var lines = std.mem.splitScalar(u8, text, '\n');
         var first = true;
@@ -550,6 +610,82 @@ const OauthPrompt = struct {
             if (!first) try self.writer.writeByte('\n');
             _ = try terminal.width.writeText(self.writer, line);
             first = false;
+        }
+    }
+};
+
+/// The blocking OAuth login as a worker task, so the main task can watch the
+/// terminal for a pasted callback URL meanwhile. `done` flips last, and the
+/// paste watch polls it.
+const LoginWorker = struct {
+    accounts: *ai.Accounts,
+    account: ai.llm.Account,
+    prompt: *OauthPrompt,
+    done: std.atomic.Value(bool) = .init(false),
+
+    fn run(self: *LoginWorker) anyerror!ai.Accounts.Login {
+        defer self.done.store(true, .release);
+        return self.accounts.login(self.account, self.prompt);
+    }
+};
+
+/// The line handler of the paste watch: validate a line and replay it to the
+/// local redirect listener. A failure reports through the prompt and the watch
+/// continues, because the browser callback can still land.
+const PasteHandler = struct {
+    io: std.Io,
+    port: u16,
+    prompt: *OauthPrompt,
+
+    fn onLine(self: *const PasteHandler, text: []const u8) void {
+        if (!ai.oauth_callback.holdsRedirect(text)) {
+            self.prompt.showPasteInvalid() catch {};
+            return;
+        }
+        ai.oauth_callback.replay(self.io, self.port, text) catch |err| switch (err) {
+            // The listener closes as soon as it holds a response, so a refused
+            // port means the sign-in already moved on. A second paste is
+            // ordinary, and it must not read as a fault.
+            error.ConnectionRefused => self.prompt.showPasteLate() catch {},
+            else => self.prompt.showPasteFailed(@errorName(err)) catch {},
+        };
+    }
+
+    fn onLongLine(self: *const PasteHandler) void {
+        self.prompt.showPasteTooLong() catch {};
+    }
+};
+
+/// Assemble cooked-mode terminal chunks into whole trimmed lines for the
+/// paste watch. The storage takes the shared paste limit, so every line the
+/// validator can accept passes through whole. A longer line is dropped whole
+/// and reported once.
+const PasteSplitter = struct {
+    storage: [ai.oauth_callback.paste_bytes_max]u8 = undefined,
+    length: usize = 0,
+    dropping: bool = false,
+
+    fn feed(self: *PasteSplitter, chunk: []const u8, handler: anytype) void {
+        for (chunk) |byte| {
+            if (byte == '\n') {
+                const dropped = self.dropping;
+                const text = std.mem.trim(u8, self.storage[0..self.length], " \t\r");
+                self.length = 0;
+                self.dropping = false;
+                if (dropped) {
+                    handler.onLongLine();
+                } else if (text.len != 0) {
+                    handler.onLine(text);
+                }
+                continue;
+            }
+            if (self.dropping) continue;
+            if (self.length == self.storage.len) {
+                self.dropping = true;
+                continue;
+            }
+            self.storage[self.length] = byte;
+            self.length += 1;
         }
     }
 };
@@ -919,7 +1055,7 @@ pub fn run(
 
     self.running = true;
     defer self.shutdownTasks();
-    self.input_future = try self.io.concurrent(readInput, .{self});
+    try self.startInputReader();
     self.resize_future = try self.io.concurrent(readResize, .{self});
 
     try self.runLoop();
@@ -3095,14 +3231,21 @@ fn reportStateSaveFailure(self: *App, err: anyerror) !void {
 /// credential replacement, account readiness and replay invalidation complete
 /// before any fallible final presentation.
 fn loginAccount(self: *App, account: ai.llm.Account) !void {
+    // The input reader task owns stdin. Pause it for the whole cooked window,
+    // so no line the user types there reaches the key queue. The paste watch is
+    // the only reader of that window. The resume runs after the raw-mode
+    // restore below, because the two defers unwind in reverse.
+    const input_live = self.input_future != null;
+    self.cancelFuture(&self.input_future);
+    defer if (input_live) self.resumeInputReader();
     self.tty.leaveRaw();
     defer {
         self.tty.enterRaw() catch {};
         self.session.view.invalidate();
         self.session.dirty = true;
     }
-    var prompt: OauthPrompt = .{ .writer = self.tty.writer() };
-    const login = self.accounts.login(account, &prompt) catch |login_error|
+    var prompt: OauthPrompt = .{ .writer = self.tty.writer(), .io = self.io };
+    const login = self.runLogin(account, &prompt) catch |login_error|
         return self.reportLoginFailure(login_error);
 
     // A fresh login can represent another principal in the same account slot.
@@ -3132,6 +3275,78 @@ fn loginAccount(self: *App, account: ai.llm.Account) !void {
     }
 }
 
+/// Run the blocking OAuth login as a worker task and watch the cooked
+/// terminal meanwhile. A browser that a policy blocks (an HTTPS-Only mode)
+/// shows an error page whose address bar still holds the callback URL. A
+/// paste of that URL replays into the same listener, so one wait serves both
+/// paths. Without a port or without concurrency the login runs plain, with no
+/// paste path.
+fn runLogin(self: *App, account: ai.llm.Account, prompt: *OauthPrompt) !ai.Accounts.Login {
+    const port = ai.Accounts.callbackPort(account) orelse
+        return self.accounts.login(account, prompt);
+    var worker: LoginWorker = .{
+        .accounts = &self.accounts,
+        .account = account,
+        .prompt = prompt,
+    };
+    // Enabled before the worker starts, so the prompt it prints can promise
+    // the paste path only when the watch below really runs.
+    prompt.paste_enabled = true;
+    var future = self.io.concurrent(LoginWorker.run, .{&worker}) catch {
+        prompt.paste_enabled = false;
+        return self.accounts.login(account, prompt);
+    };
+    self.watchForPaste(&worker.done, port, prompt);
+    return future.await(self.io);
+}
+
+/// Start the input reader task. Startup propagates a failure, and a resume
+/// degrades instead, so the two callers own their own policies.
+fn startInputReader(self: *App) !void {
+    self.input_future = try self.io.concurrent(readInput, .{self});
+}
+
+/// Restart the input reader task after a pause. A failed restart closes the
+/// queue, so the main loop winds down instead of running deaf.
+fn resumeInputReader(self: *App) void {
+    self.startInputReader() catch self.queue.close(self.io);
+}
+
+/// Watch the cooked terminal during the login wait, and replay each pasted
+/// callback URL to the local listener on `port`. The loop is an event wait:
+/// `done` flips when the login worker finishes, and the worker's own callback
+/// deadline bounds that. A closed stdin or a read fault stops the watch
+/// alone, and the login wait continues.
+fn watchForPaste(
+    self: *App,
+    done: *const std.atomic.Value(bool),
+    port: u16,
+    prompt: *OauthPrompt,
+) void {
+    // The poll bounds the exit lag after `done` flips. A paste is a human
+    // action, so 200 ms costs nothing perceptible and saves a third
+    // concurrent task with its cancellation path.
+    const poll: std.Io.Timeout =
+        .{ .duration = .{ .raw = .fromMilliseconds(200), .clock = .awake } };
+    var splitter: PasteSplitter = .{};
+    var handler: PasteHandler = .{ .io = self.io, .port = port, .prompt = prompt };
+    var buffer: [512]u8 = undefined;
+    while (!done.load(.acquire)) {
+        const result = self.tty.read(&buffer, poll) catch {
+            prompt.showPasteStopped() catch {};
+            return;
+        };
+        const count = result orelse continue;
+        // A zero-byte read from a cooked tty is Ctrl+D: the end of input.
+        // Stop the watch, or this loop spins hot on it.
+        if (count == 0) {
+            prompt.showPasteStopped() catch {};
+            return;
+        }
+        splitter.feed(buffer[0..count], &handler);
+    }
+}
+
 fn reportLoginFailure(self: *App, login_error: anyerror) !void {
     const message = switch (login_error) {
         error.Canceled => return error.Canceled,
@@ -3141,6 +3356,16 @@ fn reportLoginFailure(self: *App, login_error: anyerror) !void {
             "response was too large.",
         error.CallbackTimeoutUnavailable => "Drinky could not sign in because it could not " ++
             "set a browser time limit.",
+        // The redirect reports a refusal, a scope fault, and a provider fault
+        // under one parameter. The code of the failure reaches no report, so
+        // one sentence covers the whole set.
+        error.AuthorizationFailed => "The provider did not authorize Drinky. " ++
+            "Start the sign-in again.",
+        // The redirect carries the state of an earlier sign-in. A tab left open
+        // and a paste of its URL both deliver one, so the sentence names no
+        // source.
+        error.StateMismatch => "The response belongs to another sign-in. " ++
+            "Start the sign-in again.",
         // The exchange rejects an authorization that expired or was used before.
         error.TokenGrantRejected => "The provider rejected the authorization. " ++
             "Start the sign-in again.",
@@ -3604,20 +3829,101 @@ test "only Apple Terminal without a multiplexer takes the legacy screen and mous
 test "OAuth prompts render runtime fields as inert text" {
     var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
-    var prompt: OauthPrompt = .{ .writer = &out.writer };
+    var prompt: OauthPrompt = .{ .writer = &out.writer, .io = std.testing.io };
 
+    // Without a paste watch, the prompt must not promise the paste path.
+    try prompt.showAuthorization("https://example.test/\x1b]52;c;b3duZWQ=\x07");
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "paste the URL") == null);
+    prompt.paste_enabled = true;
     try prompt.showAuthorization("https://example.test/\x1b]52;c;b3duZWQ=\x07");
     try prompt.showBrowserLaunchFailed();
     try prompt.showAuthorized("/home/\x1b[2J/.drinky/auth.json");
     try prompt.showSaveFailed("/home/\x1b[2J/.drinky/auth.json", "AccessDenied");
+    try prompt.showPasteInvalid();
+    try prompt.showPasteTooLong();
+    try prompt.showPasteFailed("ConnectionRefused");
+    try prompt.showPasteLate();
+    try prompt.showPasteStopped();
 
     const written = out.written();
+    try std.testing.expect(std.mem.indexOf(u8, written, "paste the URL") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "not the callback URL") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "too long for a callback URL") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "error ConnectionRefused") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "already received the response") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "no longer reads") != null);
     const url_inert = "https://example.test/\u{200B}�\u{200B}]52;c;b3duZWQ=\u{200B}�\u{200B}";
     try std.testing.expect(std.mem.indexOf(u8, written, "\x1b]52;c;b3duZWQ=\x07") == null);
     try std.testing.expect(std.mem.indexOf(u8, written, "\x1b[2J") == null);
     try std.testing.expect(std.mem.indexOf(u8, written, url_inert) != null);
     const path_inert = "/home/\u{200B}�\u{200B}[2J/.drinky/auth.json";
     try std.testing.expect(std.mem.indexOf(u8, written, path_inert) != null);
+}
+
+test "the paste watch assembles chunks into trimmed lines and drops a long line" {
+    const Collector = struct {
+        buffer: [256]u8 = undefined,
+        length: usize = 0,
+        long_line_count: usize = 0,
+
+        fn onLine(self: *@This(), text: []const u8) void {
+            @memcpy(self.buffer[self.length..][0..text.len], text);
+            self.length += text.len;
+            self.buffer[self.length] = '|';
+            self.length += 1;
+        }
+
+        fn onLongLine(self: *@This()) void {
+            self.long_line_count += 1;
+        }
+    };
+
+    var splitter: PasteSplitter = .{};
+    var collector: Collector = .{};
+    // A line split across reads, cooked-terminal padding included. A blank
+    // line reports nothing.
+    splitter.feed("  https://localhost/callback?", &collector);
+    splitter.feed("code=1&state=2 \r\nsecond\n\r\n", &collector);
+    try std.testing.expectEqualStrings(
+        "https://localhost/callback?code=1&state=2|second|",
+        collector.buffer[0..collector.length],
+    );
+    try std.testing.expectEqual(@as(usize, 0), collector.long_line_count);
+    // A line past the shared paste limit is dropped whole and the next line
+    // still lands.
+    const junk: [ai.oauth_callback.paste_bytes_max + 1]u8 = @splat('x');
+    splitter.feed(&junk, &collector);
+    splitter.feed("\nafter\n", &collector);
+    try std.testing.expectEqual(@as(usize, 1), collector.long_line_count);
+    try std.testing.expect(std.mem.endsWith(u8, collector.buffer[0..collector.length], "|after|"));
+}
+
+test "the paste handler reports each unusable line by its own cause" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var prompt: OauthPrompt = .{ .writer = &out.writer, .io = std.testing.io };
+    const handler: PasteHandler = .{ .io = std.testing.io, .port = 1, .prompt = &prompt };
+
+    // A line that holds no outcome asks for the complete URL. A dropped line
+    // was too long for one, so it asks for the URL alone.
+    handler.onLine("https://localhost:1455/auth/callback?code=without-state");
+    handler.onLongLine();
+
+    const written = out.written();
+    const guidance = "not the callback URL";
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, written, guidance));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, written, "too long"));
+
+    // The listener owns the denial verdict, so the handler replays an `error`
+    // line and reports no guidance for it. Port 1 holds no listener, and a
+    // refused connection means the listener already has its response.
+    handler.onLine("https://localhost:1455/auth/callback?error=access_denied");
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, out.written(), guidance));
+    try std.testing.expect(
+        std.mem.indexOf(u8, out.written(), "already received the response") != null,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "could not replay") == null);
 }
 
 test "a turn failure the agent named itself reads as a sentence, not an error name" {
@@ -3721,6 +4027,18 @@ test "a login the provider refused reads as a sentence, not an error name" {
     try app.reportLoginFailure(error.TokenGrantRejected);
     try std.testing.expectEqualStrings(
         "The provider rejected the authorization. Start the sign-in again.",
+        app.session.notice.?.content,
+    );
+    try app.reportLoginFailure(error.AuthorizationFailed);
+    try std.testing.expectEqualStrings(
+        "The provider did not authorize Drinky. Start the sign-in again.",
+        app.session.notice.?.content,
+    );
+    // A stale tab and a stale paste both deliver a redirect of an earlier
+    // sign-in, so the sentence names neither source.
+    try app.reportLoginFailure(error.StateMismatch);
+    try std.testing.expectEqualStrings(
+        "The response belongs to another sign-in. Start the sign-in again.",
         app.session.notice.?.content,
     );
     try app.reportLoginFailure(error.TokenServiceUnavailable);

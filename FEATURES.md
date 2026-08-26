@@ -111,6 +111,8 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - OAuth login uses PKCE (S256) with a loopback callback, and opens the system browser.
 - The Anthropic Console login trades its grant for a minted platform key, stored like a token.
 - When no browser opens, the printed URL still works, and the callback waits five minutes.
+- When the browser cannot reach the local callback, a paste of the URL from its address bar
+  completes the same login.
 - The browser lands on a plain "Drinky received authorization. Close this tab." page.
 - Subscription tokens and the Console key live in the owner-only `~/.drinky/auth.json`, one entry
   per account, saved atomically.

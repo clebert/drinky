@@ -183,6 +183,18 @@ pub fn listModels(
     for (out.items[start..]) |*model| model.* = self.resolveModel(account, model.*);
 }
 
+/// The loopback port of the OAuth redirect listener for `account`, or null
+/// for an API account, which has no browser login. A pasted callback URL
+/// replays to this port.
+pub fn callbackPort(account: llm.Account) ?u16 {
+    return switch (account) {
+        .anthropic_subscription => anthropic.oauth.callback_port,
+        .anthropic_console => anthropic.console.callback_port,
+        .openai_subscription => openai.oauth.callback_port,
+        .anthropic_api, .openai_api => null,
+    };
+}
+
 /// Run the interactive OAuth login for `account`, mark its committed
 /// replacement authenticated, and return its persistence outcome. An
 /// API account has no login (its key comes from the environment), so it is an
@@ -354,6 +366,17 @@ test "isAuthenticated and firstAuthenticated read keys and readiness, subscripti
 
     var none = testAccounts(.{}, false, false);
     try std.testing.expect(none.firstAuthenticated() == null);
+}
+
+test "an account has a callback port exactly when it has a login" {
+    for (std.enums.values(llm.Account)) |account| {
+        try std.testing.expectEqual(account.hasLogin(), callbackPort(account) != null);
+    }
+    // The pinned ports keep the three listeners apart and match each provider
+    // OAuth registration.
+    try std.testing.expectEqual(@as(?u16, 53692), callbackPort(.anthropic_subscription));
+    try std.testing.expectEqual(@as(?u16, 53693), callbackPort(.anthropic_console));
+    try std.testing.expectEqual(@as(?u16, 1455), callbackPort(.openai_subscription));
 }
 
 test "logout rejects api accounts, which are env-sourced" {
