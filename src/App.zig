@@ -1526,7 +1526,6 @@ fn readInput(self: *App) void {
             },
         };
         const count = result orelse continue;
-        if (count == 0) continue;
         const copy = self.gpa.dupe(u8, buffer[0..count]) catch {
             self.queue.close(self.io);
             return;
@@ -3337,12 +3336,6 @@ fn watchForPaste(
             return;
         };
         const count = result orelse continue;
-        // A zero-byte read from a cooked tty is Ctrl+D: the end of input.
-        // Stop the watch, or this loop spins hot on it.
-        if (count == 0) {
-            prompt.showPasteStopped() catch {};
-            return;
-        }
         splitter.feed(buffer[0..count], &handler);
     }
 }
@@ -3778,8 +3771,9 @@ fn leavePicker(self: *App) !void {
 /// undefined, so a test builds each one that it uses. The state starts inert, so
 /// only a test that reads a saved choice opens a real one.
 ///
-/// It also leaves the `tty` and the resize watcher undefined, and no test builds
-/// either one. A test therefore paints through the session, never the terminal.
+/// It leaves the `tty` and the resize watcher undefined. A terminal input test
+/// configures only the required `tty` fields. No test builds the resize watcher.
+/// A session rendering test paints through the session, never the terminal.
 ///
 /// The key decoder and the skill registry start empty and own nothing. A test that
 /// feeds a key, or that loads a skill, must free that growth itself.
@@ -4086,6 +4080,35 @@ test "OAuth callback bounds have friendly failure notices" {
         try std.testing.expectEqualStrings(message, notice.content);
         try std.testing.expectEqual(@as(usize, 0), app.session.transcript.blocks().len);
     }
+}
+
+test "the input reader closes the key queue at the end of stdin" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var app: App = undefined;
+    app.initForTest(gpa);
+    defer app.drainQueue();
+
+    // A pipe with a closed write end reports the end of its input, which is
+    // what stdin reports once the terminal behind it is gone. `Tty.read` maps
+    // that to an error, never to a zero-byte read, so the reader has one exit.
+    const fds = try std.Io.Threaded.pipe2(.{ .CLOEXEC = true });
+    defer _ = std.posix.system.close(fds[0]);
+    _ = std.posix.system.close(fds[1]);
+    app.tty.io = io;
+    app.tty.in_handle = fds[0];
+
+    // The race bounds the reader, so a reader that fails to stop reads as a
+    // failed test instead of a spin that never returns.
+    const bounded = try ai.net.race(io, 2 * std.time.ms_per_s, readInput, .{&app});
+    try bounded;
+
+    // A closed queue winds the main loop down. An open queue leaves the session
+    // waiting on a terminal that can never answer. A zero minimum makes the open
+    // queue return immediately. The `error.Closed` expectation then fails without
+    // a hang.
+    var batch: [1]Session.UiEvent = undefined;
+    try std.testing.expectError(error.Closed, app.queue.get(io, &batch, 0));
 }
 
 test "turn producers keep their captured generation" {
