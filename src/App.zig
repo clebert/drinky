@@ -1779,7 +1779,6 @@ fn handleKey(self: *App, event: *const terminal.Input.Key) !void {
                     .{},
                 );
             },
-            'e' => try self.extendReview(),
             'n' => try self.retryTurn(),
             's' => try self.openReviewRoleSetup(),
             else => {},
@@ -2697,6 +2696,14 @@ fn applyReviewStep(self: *App, step: Review.Step, brake: bool) !void {
             try flow.machine.composeReviewerRequest(),
         ),
         .start_judge => try self.startReviewTurn(.judge, try flow.machine.composeJudgeRequest()),
+        // The judge is the active role at the limit hold, so the resume runs
+        // as one more request in its own conversation. That history holds the
+        // latest decision, the reports, and every answer of the user.
+        .resume_judge => {
+            const request = try flow.machine.composeResumeRequest();
+            defer self.gpa.free(request);
+            try self.startReviewSuccessor(request, false);
+        },
         .start_fixer => |pass| try self.startReviewTurn(
             .fixer,
             try flow.machine.composeFixerRequest(pass),
@@ -2793,9 +2800,9 @@ fn leaveReviewHold(self: *App) !void {
     try self.showReviewCaption();
 }
 
-/// Ctrl+N in a held review: apply the postponed step, or send the failed
-/// generated request again. The editor keeps its text, and that text brakes
-/// the workflow again at the next boundary.
+/// Ctrl+N in a held review: apply the postponed step, add one round at the
+/// limit, or send the failed generated request again. The editor keeps its
+/// text, and that text brakes the workflow again at the next boundary.
 fn continueReview(self: *App) !void {
     const flow = &self.review.?;
     const hold = flow.hold orelse return;
@@ -2810,8 +2817,18 @@ fn continueReview(self: *App) !void {
             self.setReviewParticipation(false);
             try self.applyReviewStep(step, false);
         },
-        // Enter answers the judge, and Ctrl+E raises the ceiling.
-        .judge, .limit => {},
+        // Enter answers the judge, so the key acts on nothing here.
+        .judge => {},
+        // The raise adds one round and resumes the latest judge decision. An
+        // answer that moved the judge past that decision sends the added round
+        // through the judge, so the answer reaches the next role.
+        .limit => {
+            flow.hold = null;
+            // The added round starts a phase, so the answer that the user
+            // already read holds no boundary in it.
+            self.setReviewParticipation(false);
+            try self.applyReviewStep(flow.machine.raiseCeiling(), false);
+        },
         // The normal retry continues a committed failure, so only a request
         // that no role conversation holds waits here. A hold with neither one
         // behind it names no Ctrl+N, and the key acts on nothing.
@@ -2820,15 +2837,6 @@ fn continueReview(self: *App) !void {
             try self.startReviewSuccessor(request.text, request.correction);
         },
     }
-}
-
-/// Ctrl+E at a limit hold: add one round and resume the latest judge decision.
-/// The editor keeps its text, which brakes at the next boundary.
-fn extendReview(self: *App) !void {
-    const flow = if (self.review) |*flow| flow else return;
-    if (flow.hold != .limit) return;
-    flow.hold = null;
-    try self.applyReviewStep(flow.machine.raiseCeiling(), false);
 }
 
 /// Enter the hold after a failed review turn. Work that the user started and
@@ -2935,7 +2943,12 @@ fn showReviewCaption(self: *App) !void {
     const controls: []const u8 = switch (hold) {
         .user => "Enter: Send · Ctrl+N: Continue · Esc: Stop",
         .judge => "Enter: Answer · Esc: Stop",
-        .limit => "Enter: Ask the judge · Ctrl+E: Add a round · Esc: Finish",
+        // A failure of an answer from this hold can arm the attempt, and that
+        // attempt outranks the raise, so the row names the action of the key.
+        .limit => if (self.retry != null)
+            "Enter: Ask the judge · Ctrl+N: Try again · Esc: Finish"
+        else
+            "Enter: Ask the judge · Ctrl+N: Add a round · Esc: Finish",
         // A message from this hold can take the retry and commit nothing, so
         // the row names Ctrl+N only while an attempt or a resend stands behind
         // it.
@@ -8844,9 +8857,306 @@ test "a limit-hold answer that a committed failure interrupts stays an answer" {
     try std.testing.expect(!app.review.?.machine.correction_requested);
     try std.testing.expectEqualStrings("Review limit: Round 1 of 1", app.session.review_title.?);
     try std.testing.expectEqualStrings(
-        "Enter: Ask the judge · Ctrl+E: Add a round · Esc: Finish",
+        "Enter: Ask the judge · Ctrl+N: Add a round · Esc: Finish",
         app.session.review_controls,
     );
+
+    try app.handleKey(&.escape);
+    try std.testing.expect(app.review == null);
+}
+
+// An answer at the limit hold moves the judge past its latest decision, so the
+// stored fixer packet no longer covers the judge conversation. Ctrl+N must then
+// buy the round for a judge turn, never for a fixer over that stale packet.
+test "a limit-hold answer sends the added round through the judge" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(home);
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    defer app.drainQueue();
+    app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
+    defer app.accounts.deinit();
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = anthropic_default,
+        .system = "",
+        .retry = .{},
+        .environ = .empty,
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+    defer app.dropRetry();
+    try installJudgeFlow(&app, "Decision: Fix required.\nFix the leak.");
+    // The active round is the last one the ceiling permits, so the fix
+    // decision holds the workflow at the limit.
+    app.review.?.machine.rounds_max = 1;
+
+    try app.finishReviewPhase();
+    try std.testing.expectEqual(ReviewFlow.Hold.limit, app.review.?.hold.?);
+
+    // The user asks the judge at that hold, and the judge answers in prose.
+    try sendReviewMessage(&app, "does the finding survive the guard above it?");
+    {
+        const result = app.awaitTurnFuture().?;
+        app.freeWorkerResult(&result);
+    }
+    // The turn reached the judge, so its history holds the question and the
+    // answer that no decision line marks.
+    try app.agent.items.append(gpa, .{ .message = .{
+        .role = .user,
+        .text = try gpa.dupe(u8, "does the finding survive the guard above it?"),
+    } });
+    try app.agent.items.append(gpa, .{ .message = .{
+        .role = .assistant,
+        .text = try gpa.dupe(u8, "The guard covers it, so the finding falls."),
+    } });
+    const completed: WorkerResult = .{
+        .outcome = .{ .receipt = .{
+            .history_base = 0,
+            .history_end = 1,
+            .steering_committed_count = 0,
+        }, .disposition = .completed },
+        .error_text = null,
+    };
+    try app.finishWorkerResult(&completed);
+    try std.testing.expectEqual(ReviewFlow.Hold.limit, app.review.?.hold.?);
+    try std.testing.expect(app.review.?.machine.decision_stale);
+
+    // Ctrl+N adds the round and asks the judge to decide again, so the answer
+    // of the user reaches the next role.
+    try app.handleKey(&.{ .ctrl = 'n' });
+    try std.testing.expectEqual(Review.Role.judge, app.review.?.role.?);
+    try std.testing.expect(app.review.?.hold == null);
+    try std.testing.expectEqual(@as(u64, 2), app.review.?.machine.rounds_max);
+    try std.testing.expect(std.mem.startsWith(
+        u8,
+        app.review.?.request.?.text,
+        "<judge_resume_request round=\"1\">",
+    ));
+    try std.testing.expectEqualStrings("Judge: Round 1 of 2", app.session.review_title.?);
+    {
+        const blocks = app.session.transcript.blocks();
+        const note = blocks[blocks.len - 1].content.user_note.items;
+        try std.testing.expectEqualStrings("Request: Judge · Round: 1 of 2", note);
+    }
+    // The request runs in the judge conversation, so the history that holds the
+    // decision, the reports, and the answers carries it. The judge is active,
+    // so no copy of it parks beside it.
+    try std.testing.expect(app.review.?.judge == null);
+    try std.testing.expectEqual(@as(usize, 3), app.agent.items.items.len);
+    try std.testing.expectEqualStrings(
+        "The guard covers it, so the finding falls.",
+        app.agent.items.items[2].message.text,
+    );
+
+    // The signed-out worker fails without a commit, so the resume request
+    // waits behind the failure hold like every other generated request.
+    {
+        const result = app.awaitTurnFuture().?;
+        defer app.freeWorkerResult(&result);
+        try app.finishWorkerResult(&result);
+    }
+    try std.testing.expectEqual(ReviewFlow.Hold.failure, app.review.?.hold.?);
+    try std.testing.expect(app.review.?.request != null);
+
+    try app.handleKey(&.escape);
+    try std.testing.expect(app.review == null);
+}
+
+// The resume turn runs in the judge conversation, so the switch after the
+// fresh decision parks that one conversation whole. A second judge
+// conversation would drop the history of the workflow and leak it here.
+test "the added round decides in the judge history and parks it once" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(home);
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    defer app.drainQueue();
+    app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
+    defer app.accounts.deinit();
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = anthropic_default,
+        .system = "",
+        .retry = .{},
+        .environ = .empty,
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+    defer app.dropRetry();
+    try installJudgeFlow(&app, "Decision: Fix required.\nFix the leak.");
+    app.review.?.machine.rounds_max = 1;
+
+    try app.finishReviewPhase();
+    try std.testing.expectEqual(ReviewFlow.Hold.limit, app.review.?.hold.?);
+
+    // The user asks the judge at that hold, and the judge answers in prose.
+    try sendReviewMessage(&app, "does the finding survive the guard above it?");
+    {
+        const result = app.awaitTurnFuture().?;
+        app.freeWorkerResult(&result);
+    }
+    try app.agent.items.append(gpa, .{ .message = .{
+        .role = .user,
+        .text = try gpa.dupe(u8, "does the finding survive the guard above it?"),
+    } });
+    try app.agent.items.append(gpa, .{ .message = .{
+        .role = .assistant,
+        .text = try gpa.dupe(u8, "The guard covers it, so the finding falls."),
+    } });
+    const completed: WorkerResult = .{
+        .outcome = .{ .receipt = .{
+            .history_base = 0,
+            .history_end = 1,
+            .steering_committed_count = 0,
+        }, .disposition = .completed },
+        .error_text = null,
+    };
+    try app.finishWorkerResult(&completed);
+    try std.testing.expectEqual(ReviewFlow.Hold.limit, app.review.?.hold.?);
+
+    // Ctrl+N adds the round and asks the judge to decide again.
+    try app.handleKey(&.{ .ctrl = 'n' });
+    {
+        const result = app.awaitTurnFuture().?;
+        app.freeWorkerResult(&result);
+    }
+    // The resume turn reached the judge, so its history holds the request and
+    // the fresh decision.
+    try app.agent.items.append(gpa, .{ .message = .{
+        .role = .user,
+        .text = try gpa.dupe(u8, "<judge_resume_request round=\"1\">"),
+    } });
+    try app.agent.items.append(gpa, .{ .message = .{
+        .role = .assistant,
+        .text = try gpa.dupe(u8, "Decision: Fix required.\nFix the parser instead."),
+    } });
+    try app.finishWorkerResult(&completed);
+
+    // The resume consumed the participation of the answer, so the added round
+    // proceeds to the fixer of the fresh decision.
+    try std.testing.expectEqual(Review.Role.fixer, app.review.?.role.?);
+    try std.testing.expect(app.review.?.hold == null);
+    try std.testing.expect(!app.review.?.participated);
+    try std.testing.expect(std.mem.indexOf(u8, app.review.?.request.?.text, "parser") != null);
+    // The switch parked the one judge conversation, and every message of the
+    // workflow is still in it.
+    try std.testing.expectEqual(@as(usize, 5), app.review.?.judge.?.agent.items.items.len);
+
+    {
+        const result = app.awaitTurnFuture().?;
+        defer app.freeWorkerResult(&result);
+        try app.finishWorkerResult(&result);
+    }
+    try app.handleKey(&.escape);
+    try std.testing.expect(app.review == null);
+}
+
+// The retry attempt outranks the raise, so a limit hold that carries an armed
+// attempt must name that attempt. A row that named the raise there would
+// promise an action that the key does not take.
+test "an armed retry at the limit hold names the attempt and adds no round" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(home);
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    defer app.drainQueue();
+    app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
+    defer app.accounts.deinit();
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = anthropic_default,
+        .system = "",
+        .retry = .{},
+        .environ = .empty,
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+    defer app.dropRetry();
+    try installJudgeFlow(&app, "Decision: Fix required.\nFix the leak.");
+    app.review.?.machine.rounds_max = 1;
+
+    try app.finishReviewPhase();
+    try std.testing.expectEqual(ReviewFlow.Hold.limit, app.review.?.hold.?);
+
+    // The user asks the judge at that hold, and the turn fails with committed
+    // work, so the attempt waits behind the failure hold.
+    try sendReviewMessage(&app, "does the finding survive the guard above it?");
+    {
+        const result = app.awaitTurnFuture().?;
+        app.freeWorkerResult(&result);
+    }
+    const committed_failure: WorkerResult = .{
+        .outcome = .{
+            .receipt = .{
+                .history_base = 0,
+                .history_end = 1,
+                .steering_committed_count = 0,
+            },
+            .disposition = .{ .failed = error.ApiError },
+        },
+        .error_text = try gpa.dupe(u8, "The provider is overloaded."),
+    };
+    defer app.freeWorkerResult(&committed_failure);
+    try app.finishWorkerResult(&committed_failure);
+    try std.testing.expectEqual(ReviewFlow.Hold.failure, app.review.?.hold.?);
+
+    // The attempt fails and commits nothing, so the workflow returns to the
+    // limit hold and the attempt stays armed there.
+    try app.sendRetryTurn();
+    {
+        const result = app.awaitTurnFuture().?;
+        app.freeWorkerResult(&result);
+    }
+    const empty_failure: WorkerResult = .{
+        .outcome = .{
+            .receipt = .{
+                .history_base = 1,
+                .history_end = 1,
+                .steering_committed_count = 0,
+            },
+            .disposition = .{ .failed = error.ApiError },
+        },
+        .error_text = try gpa.dupe(u8, "The provider is overloaded."),
+    };
+    defer app.freeWorkerResult(&empty_failure);
+    try app.finishWorkerResult(&empty_failure);
+    try std.testing.expectEqual(ReviewFlow.Hold.limit, app.review.?.hold.?);
+    try std.testing.expect(app.retry != null);
+    try std.testing.expectEqualStrings("Review limit: Round 1 of 1", app.session.review_title.?);
+    try std.testing.expectEqualStrings(
+        "Enter: Ask the judge · Ctrl+N: Try again · Esc: Finish",
+        app.session.review_controls,
+    );
+
+    // The press takes the armed attempt, so the ceiling stands. The signed-out
+    // gate stops that attempt and reports the way in.
+    try app.handleKey(&.{ .ctrl = 'n' });
+    try std.testing.expectEqual(@as(u64, 1), app.review.?.machine.rounds_max);
+    try std.testing.expectEqual(ReviewFlow.Hold.limit, app.review.?.hold.?);
+    try std.testing.expect(app.turn_future == null);
+    try std.testing.expect(app.retry != null);
 
     try app.handleKey(&.escape);
     try std.testing.expect(app.review == null);

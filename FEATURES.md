@@ -200,7 +200,8 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - A message that the user sends at a hold runs as its own turn under the round caption. A failure
   that commits nothing returns the text to the editor and the workflow to that hold.
 - The judge asks the user only about an open product choice. The `review.rounds_max` ceiling bounds
-  unattended rounds, and Ctrl+E adds one round at the limit.
+  unattended rounds, and Ctrl+N adds one round at the limit. An answer that moved the judge past its
+  latest decision sends that round through the judge, so it decides again.
 - Every role reply must start with its marker line: `Findings:`, `Decision:`, or `Applied:`. An
   answer to the user never travels as a report, and an unmarked reply gets one correction request
   before the workflow stops. A rejected fixer dispute gets one final pass.

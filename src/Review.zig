@@ -35,6 +35,10 @@ next_pass: Pass = .first,
 /// The latest complete judge decision, or null before the first one. A raise
 /// of the ceiling resumes it.
 decision: ?Decision = null,
+/// Whether an answer at a limit hold moved the judge past `decision`. A raise
+/// then asks the judge to decide again, so every answer of the user reaches
+/// the next generated request.
+decision_stale: bool = false,
 /// The latest reviewer report. The next judge request consumes it. Owned.
 reviewer_report: ?[]u8 = null,
 /// The latest fixer report with its source round and pass. The next judge
@@ -118,6 +122,9 @@ pub const Step = union(enum) {
     start_reviewer,
     /// Start the persistent judge over the pending reports and messages.
     start_judge,
+    /// Ask the judge to decide again, because an answer at the limit hold
+    /// moved it past its latest decision.
+    resume_judge,
     /// Start a fresh fixer over the stored judge report.
     start_fixer: Pass,
     /// The judge needs a user decision, so the workflow waits.
@@ -443,23 +450,53 @@ pub fn composeCorrectionRequest(self: *Review) []const u8 {
 }
 
 /// Take a judge answer during a limit hold. A valid decision line replaces the
-/// latest decision, and the workflow returns to the hold either way. Returns
-/// whether the answer replaced the decision.
+/// latest decision, and the workflow returns to the hold either way. An answer
+/// without one leaves the latest decision stale. Returns whether the answer
+/// replaced the decision.
 pub fn adoptJudgeAnswer(self: *Review, report: []const u8) !bool {
-    const decision = classifyDecision(report) orelse return false;
+    const decision = classifyDecision(report) orelse {
+        self.decision_stale = true;
+        return false;
+    };
     try self.adoptDecision(decision, report);
     return true;
 }
 
-/// Raise the ceiling by one round and resume the latest judge decision. Only
+/// Raise the ceiling by one round and resume the workflow. A stale decision
+/// goes back to the judge, because the answers of the user can change it. Only
 /// a limit hold calls it, so a decision exists.
 pub fn raiseCeiling(self: *Review) Step {
     self.rounds_max += 1;
+    if (self.decision_stale) return .resume_judge;
     return switch (self.decision.?) {
         .fix_required => self.fixStep(),
         .review_settled => .start_reviewer,
         .user_decision_required => .hold_judge,
     };
+}
+
+/// Ask the judge to decide again over its own history, and return the
+/// generated request. It consumes no stored report and no pending message,
+/// because a later judge request still carries each one. The caller owns the
+/// request.
+pub fn composeResumeRequest(self: *Review) ![]u8 {
+    const request = try std.fmt.allocPrint(
+        self.gpa,
+        "<judge_resume_request round=\"{d}\">\n" ++
+            "The user added one round to the workflow.\n" ++
+            "Decide again over your latest decision and the answers of the user.\n" ++
+            "Inspect the current target again where an answer changes it.\n" ++
+            "Start the report with exactly one of these lines.\n" ++
+            "Decision: Fix required.\n" ++
+            "Decision: Review settled.\n" ++
+            "Decision: User decision required.\n" ++
+            "Return only the judge report.\n" ++
+            "</judge_resume_request>",
+        .{self.rounds_started},
+    );
+    self.correction_requested = false;
+    self.phase = .judge;
+    return request;
 }
 
 /// The step of a `fix required` decision: the fixer of the armed pass, unless
@@ -470,13 +507,16 @@ fn fixStep(self: *Review) Step {
 }
 
 /// Keep `decision` with its report. Only a `fix required` report feeds a next
-/// request, so the machine stores that one alone.
+/// request, so the machine stores that one alone. The decision covers the judge
+/// conversation again, so it stops being stale. A failed copy adopts nothing.
 fn adoptDecision(self: *Review, decision: Decision, report: []const u8) !void {
+    if (decision == .fix_required) {
+        const copy = try self.gpa.dupe(u8, report);
+        if (self.judge_report) |old| self.gpa.free(old);
+        self.judge_report = copy;
+    }
     self.decision = decision;
-    if (decision != .fix_required) return;
-    const copy = try self.gpa.dupe(u8, report);
-    if (self.judge_report) |old| self.gpa.free(old);
-    self.judge_report = copy;
+    self.decision_stale = false;
 }
 
 /// Start a fresh fixer pass and return its generated request. It consumes the
@@ -906,12 +946,8 @@ test "the ceiling holds progress and a raise resumes the latest decision" {
         try review.finishJudge("Decision: Fix required.\nFix it."),
     );
 
-    // A judge answer can replace the decision, and the workflow returns to the
-    // hold. An answer without a decision line replaces nothing.
-    try std.testing.expect(!try review.adoptJudgeAnswer("The finding rests on the diff alone."));
-    try std.testing.expectEqual(Review.Decision.fix_required, review.decision.?);
-
-    // One added round resumes the fix and starts the pass-1 fixer.
+    // No answer moved the judge, so one added round resumes the fix and starts
+    // the pass-1 fixer.
     try std.testing.expectEqual(Step{ .start_fixer = .first }, review.raiseCeiling());
     try std.testing.expectEqual(@as(u64, 2), review.rounds_max);
     gpa.free(try review.composeFixerRequest(.first));
@@ -924,6 +960,57 @@ test "the ceiling holds progress and a raise resumes the latest decision" {
     try std.testing.expectEqual(Step.hold_limit, try review.finishJudge("Decision: Fix required."));
     try std.testing.expect(try review.adoptJudgeAnswer("Decision: Review settled."));
     try std.testing.expectEqual(Step.start_reviewer, review.raiseCeiling());
+}
+
+test "an answer without a decision sends the added round through the judge" {
+    const gpa = std.testing.allocator;
+    var review = Review.init(gpa, 1);
+    defer review.deinit();
+    gpa.free(try review.composeReviewerRequest());
+    _ = try review.finishReviewer("Findings: 1.\nFinding: a bug.");
+    gpa.free(try review.composeJudgeRequest());
+    try std.testing.expectEqual(
+        Step.hold_limit,
+        try review.finishJudge("Decision: Fix required.\nFix it."),
+    );
+
+    // The answer holds no decision line, so the stored packet no longer covers
+    // the judge conversation. The raise asks the judge instead of resuming it.
+    try std.testing.expect(!try review.adoptJudgeAnswer("The finding rests on the diff alone."));
+    try std.testing.expect(review.decision_stale);
+    try std.testing.expectEqual(Step.resume_judge, review.raiseCeiling());
+    try std.testing.expectEqual(@as(u64, 2), review.rounds_max);
+    const request = try review.composeResumeRequest();
+    defer gpa.free(request);
+    try std.testing.expectEqualStrings(
+        "<judge_resume_request round=\"1\">\n" ++
+            "The user added one round to the workflow.\n" ++
+            "Decide again over your latest decision and the answers of the user.\n" ++
+            "Inspect the current target again where an answer changes it.\n" ++
+            "Start the report with exactly one of these lines.\n" ++
+            "Decision: Fix required.\n" ++
+            "Decision: Review settled.\n" ++
+            "Decision: User decision required.\n" ++
+            "Return only the judge report.\n" ++
+            "</judge_resume_request>",
+        request,
+    );
+
+    // The fresh report controls the added round, so the fixer packet carries
+    // what the answer changed.
+    try std.testing.expectEqual(
+        Step{ .start_fixer = .first },
+        try review.finishJudge("Decision: Fix required.\nFix the parser instead."),
+    );
+    try std.testing.expect(!review.decision_stale);
+    const fixer_request = try review.composeFixerRequest(.first);
+    defer gpa.free(fixer_request);
+    try std.testing.expect(std.mem.indexOf(u8, fixer_request, "parser") != null);
+
+    // The added round holds the fresh reviewer that checks the fix.
+    try std.testing.expectEqual(Step.start_reviewer, try review.finishFixer("Applied: all."));
+    gpa.free(try review.composeReviewerRequest());
+    try std.testing.expectEqual(@as(u64, 2), review.rounds_started);
 }
 
 test "a successor report replaces its phase report and counts no second completion" {

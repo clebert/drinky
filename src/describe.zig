@@ -146,13 +146,15 @@ fn writeKeys(writer: *std.Io.Writer, options: *const Options) !void {
         \\  quits Drinky.
         \\- Ctrl+D quits Drinky at an empty editor, and the workflow ends with no completion
         \\  event. Ctrl+D with a draft has no action.
-        \\- Ctrl+N answers two holds. At the hold of a completed role it continues the postponed
-        \\  step. At the hold of a failed role request it resends that request. A failed turn that
-        \\  committed work takes the retry attempt instead. The control row names Ctrl+N only
-        \\  while one of the two stands behind it. Ctrl+N has no action at the judge hold and at
-        \\  the round limit. During a role turn it arms the automatic resume again, so a steered
-        \\  phase proceeds by itself.
-        \\- Ctrl+E adds one round at the round limit.
+        \\- Ctrl+N answers three holds. At the hold of a completed role it continues the
+        \\  postponed step. At the round limit it adds one round and resumes the latest judge
+        \\  decision. An answer of the judge without a decision line sends that round through
+        \\  the judge instead. At the hold of a failed role request it resends that request. A
+        \\  failed turn that committed work takes the retry attempt before every one of these,
+        \\  at the round limit too. The row of the round limit then names that attempt. The
+        \\  row of the failure hold names Ctrl+N only while a resend or an attempt stands
+        \\  behind it. Ctrl+N has no action at the judge hold. During a role turn it arms the
+        \\  automatic resume again, so a steered phase proceeds by itself.
         \\- Ctrl+S opens the account, model, and effort menu of the role whose request failed.
         \\
         \\This section names the keys of the prompt, of a turn, and of a review workflow. A
@@ -246,36 +248,50 @@ test "the document states every command, key, and discovery rule" {
     try std.testing.expect(std.mem.indexOf(u8, text[turn..review], "Ctrl+N") == null);
     try std.testing.expect(std.mem.indexOf(u8, text[turn..review], "milliseconds") == null);
 
-    // A review changes what six keys do, so its own list states each one. The
-    // two keys that only a review takes have no other answer in the document.
+    // A review changes what five keys do, so its own list states each one. The
+    // one key that only a review takes has no other answer in the document.
     const review_keys = text[review..];
     for ([_][]const u8{
         "- Esc stops the workflow",
         "- Ctrl+C clears a draft",
         "- Ctrl+D quits Drinky at an empty editor",
-        "- Ctrl+N answers two holds",
-        "- Ctrl+E adds one round",
+        "- Ctrl+N answers three holds",
         "- Ctrl+S opens the account, model, and effort menu",
     }) |row| try std.testing.expect(std.mem.indexOf(u8, review_keys, row) != null);
-    // Ctrl+N answers two of the four holds, so the row names the two that it
-    // leaves to another key.
+    // Ctrl+N answers three of the four holds, so the row names the one that it
+    // leaves to Enter.
     try std.testing.expect(std.mem.indexOf(
         u8,
         review_keys,
-        "no action at the judge hold and at\n  the round limit",
+        "Ctrl+N has no action at the judge hold",
+    ) != null);
+    // The round that Ctrl+N adds is the one press that spends beyond the
+    // configured ceiling, so the row states what that press starts.
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        review_keys,
+        "At the round limit it adds one round",
+    ) != null);
+    // An armed attempt takes the key from every hold action, so the row states
+    // that order and what the limit hold then names.
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        review_keys,
+        "takes the retry attempt before every one of these,\n  at the round limit too." ++
+            " The row of the round limit then names that attempt.",
     ) != null);
     // A failure hold with nothing behind the key shows no Ctrl+N, so the row
     // states the condition.
     try std.testing.expect(std.mem.indexOf(
         u8,
         review_keys,
-        "names Ctrl+N only\n  while one of the two stands behind it",
+        "The\n  row of the failure hold names Ctrl+N only while a resend or an attempt" ++
+            " stands\n  behind it.",
     ) != null);
     // The quit and the completion event are the two answers that a false one
     // costs the most, so the section states both.
     try std.testing.expect(std.mem.indexOf(u8, review_keys, "never\n  quits Drinky") != null);
     try std.testing.expect(std.mem.indexOf(u8, review_keys, "no completion") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text[keys..review], "Ctrl+E") == null);
     try std.testing.expect(std.mem.indexOf(u8, text[keys..review], "Ctrl+S") == null);
 
     // The discovery rules carry no config key, so only this document holds them.

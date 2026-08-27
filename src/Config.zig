@@ -370,7 +370,7 @@ const keys = [_]Key{
     .{
         .path = "review.rounds_max",
         .description = "The reviewer rounds that one /review workflow runs unattended. The " ++
-            "count must be at least 1, and Ctrl+E adds one round to a running workflow " ++
+            "count must be at least 1, and Ctrl+N adds one round to a running workflow " ++
             "without a change to this file. Drinky reports a count it cannot use and keeps " ++
             "the default.",
     },
