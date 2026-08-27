@@ -22,6 +22,14 @@ decision already taken, or a dependency on another entry. Module layout and exte
 
 ## Bugs
 
+- **Re-sync the cursor after a resize** — the view queries the cursor position (`DSR 6`) after a
+  resize and rebases its tracked screen top, so a tracking divergence cannot strand stale rows in
+  the scrollback. _A height-only change never resets, so a divergence is permanent. Two causes
+  exist: a resize that lands inside a frame burst, and a terminal that pulls scrollback down on
+  height growth. Both are rare, and a forced reset is no fix, because it drops the scrollback.
+  Accept `R` as a report only while a query is outstanding, because a modified F3 also ends in `R`.
+  Give the `Emulator` a bottom-anchored resize mode for the regression test._
+
 ## Improvements
 
 - **Refresh the branch on input** — an input event that wakes the loop re-reads the repository head,
