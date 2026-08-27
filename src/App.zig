@@ -263,7 +263,7 @@ const ReviewFlow = struct {
     };
 
     /// Why the workflow waits for the user.
-    const Hold = enum { user, judge, limit, failure };
+    const Hold = enum { user, judge, limit, settled, failure };
 
     /// One steering batch that a turn folded in: the combined text and the
     /// count of drafts it delivered. The receipt names how many drafts the
@@ -2651,7 +2651,8 @@ fn startReviewSuccessor(self: *App, request: []const u8, correction: bool) !void
 /// Drive the workflow after a completed turn in a role context. The latest
 /// complete report of the phase controls the transition, so a successor turn
 /// replaces it. During a limit hold a judge answer can replace the latest
-/// decision, and the workflow returns to the hold either way.
+/// decision, and the workflow returns to that hold either way. At a settled
+/// hold a fresh decision leaves the hold and parks its step.
 fn finishReviewPhase(self: *App) !void {
     const flow = &self.review.?;
     const role = flow.role orelse return;
@@ -2666,6 +2667,17 @@ fn finishReviewPhase(self: *App) !void {
         _ = try flow.machine.adoptJudgeAnswer(report);
         flow.hold = .limit;
         return self.showReviewCaption();
+    }
+    // An answer at the settled hold can move the judge off its settlement. The
+    // step of the fresh decision then waits behind Ctrl+N, and a judge that
+    // keeps the settlement returns the workflow to the hold.
+    if (origin == .settled) {
+        _ = try flow.machine.adoptJudgeAnswer(report);
+        const answered = flow.machine.settledStep() orelse {
+            flow.hold = .settled;
+            return self.showReviewCaption();
+        };
+        return self.applyReviewStep(answered, true);
     }
     const step = switch (role) {
         .reviewer => try flow.machine.finishReviewer(report),
@@ -2685,7 +2697,9 @@ fn applyReviewStep(self: *App, step: Review.Step, brake: bool) !void {
     // holds until a mid-turn Ctrl+N arms the resume again, so a reply the
     // user asked for waits for a read before the role resets.
     const held = flow.participated or self.session.editor.visible().len != 0;
-    if (brake and step != .stop_invalid and held) {
+    // A settlement holds by itself, so the brake adds nothing to it. A stop on
+    // a broken reply waits for nobody.
+    if (brake and step != .stop_invalid and step != .settled and held) {
         flow.hold = .user;
         flow.step = step;
         return self.showReviewCaption();
@@ -2722,7 +2736,13 @@ fn applyReviewStep(self: *App, step: Review.Step, brake: bool) !void {
             flow.step = null;
             try self.showReviewCaption();
         },
-        .settled => try self.stopReview(.settled),
+        // The judge settled, so the workflow waits for a read of its report.
+        // Esc ends the review, and a message can still reach the judge.
+        .settled => {
+            flow.hold = .settled;
+            flow.step = null;
+            try self.showReviewCaption();
+        },
         .stop_invalid => try self.stopReview(.invalid),
     }
 }
@@ -2829,6 +2849,11 @@ fn continueReview(self: *App) !void {
             self.setReviewParticipation(false);
             try self.applyReviewStep(flow.machine.raiseCeiling(), false);
         },
+        // The settled judge left no step, so Enter answers it and Esc ends the
+        // review. At the settlement only an armed attempt gives Ctrl+N an
+        // action. The retry above takes that attempt, so this branch stays
+        // empty.
+        .settled => {},
         // The normal retry continues a committed failure, so only a request
         // that no role conversation holds waits here. A hold with neither one
         // behind it names no Ctrl+N, and the key acts on nothing.
@@ -2929,26 +2954,37 @@ fn showReviewCaption(self: *App) !void {
             .{@tagName(role)},
         ),
         .judge => try self.gpa.dupe(u8, "Review hold: The judge asks you"),
+        // The title names the judge, because a message from this hold reaches
+        // that role alone.
         .limit => try std.fmt.allocPrint(
             self.gpa,
-            "Review limit: Round {d} of {d}",
+            "Review limit: The judge waits at round {d} of {d}",
             .{ machine.rounds_started, machine.rounds_max },
         ),
+        .settled => try self.gpa.dupe(u8, "Review hold: The judge settled the review"),
         .failure => try std.fmt.allocPrint(
             self.gpa,
             "Review hold: The {s} request failed",
             .{@tagName(role)},
         ),
     };
+    // The session adds the Enter key while the editor holds something to send,
+    // so no row below names it.
     const controls: []const u8 = switch (hold) {
-        .user => "Enter: Send · Ctrl+N: Continue · Esc: Stop",
-        .judge => "Enter: Answer · Esc: Stop",
+        .user => "Ctrl+N: Continue · Esc: Stop",
+        .judge => "Esc: Stop",
         // A failure of an answer from this hold can arm the attempt, and that
         // attempt outranks the raise, so the row names the action of the key.
         .limit => if (self.retry != null)
-            "Enter: Ask the judge · Ctrl+N: Try again · Esc: Finish"
+            "Ctrl+N: Try again · Esc: Finish"
         else
-            "Enter: Ask the judge · Ctrl+N: Add a round · Esc: Finish",
+            "Ctrl+N: Add a round · Esc: Finish",
+        // A settlement leaves no step, so only an armed attempt puts Ctrl+N in
+        // this row.
+        .settled => if (self.retry != null)
+            "Ctrl+N: Try again · Esc: Finish"
+        else
+            "Esc: Finish",
         // A message from this hold can take the retry and commit nothing, so
         // the row names Ctrl+N only while an attempt or a resend stands behind
         // it.
@@ -3002,11 +3038,13 @@ fn stopReview(self: *App, end: ReviewEnd) !void {
     }
 }
 
-/// Esc at the prompt with an active workflow. It claims settlement only when
-/// the latest judge decision settled the review at the limit hold.
+/// Esc at the prompt with an active workflow. It claims settlement only at the
+/// settled hold or the limit hold, and only while the latest judge decision
+/// settled the review.
 fn stopReviewFromEscape(self: *App) !void {
     const flow = &self.review.?;
-    const settled = flow.hold == .limit and flow.machine.decision == .review_settled;
+    const waits = flow.hold == .settled or flow.hold == .limit;
+    const settled = waits and flow.machine.decision == .review_settled;
     try self.stopReview(if (settled) .settled else .stopped);
 }
 
@@ -7622,7 +7660,9 @@ fn installReviewerFlow(app: *App, report: []const u8) !void {
     try installReviewFlow(app, &machine, .reviewer, report);
 }
 
-test "a settled judge report restores the main conversation and records completion" {
+// The settlement is the one output of the workflow, so the workflow waits at
+// it. Esc then restores the main conversation and records the completion.
+test "a settled judge report holds the workflow and Esc records the completion" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -7641,8 +7681,26 @@ test "a settled judge report restores the main conversation and records completi
     defer app.session.deinit();
     try installJudgeFlow(&app, "Decision: Review settled.");
 
+    // The settlement holds by itself, so the empty editor ends no review. The
+    // row names no key that does nothing.
     try app.finishReviewPhase();
+    try std.testing.expectEqual(ReviewFlow.Hold.settled, app.review.?.hold.?);
+    try std.testing.expect(app.review.?.step == null);
+    try std.testing.expectEqualStrings(
+        "Review hold: The judge settled the review",
+        app.session.review_title.?,
+    );
+    try std.testing.expectEqualStrings("Esc: Finish", app.session.review_controls);
+
+    // The press has no action at this hold, because no attempt stands behind
+    // it and the judge left no step.
+    try app.handleKey(&.{ .ctrl = 'n' });
+    try std.testing.expectEqual(ReviewFlow.Hold.settled, app.review.?.hold.?);
+    try std.testing.expect(app.turn_future == null);
+
+    try app.handleKey(&.escape);
     try std.testing.expect(app.review == null);
+    try std.testing.expect(app.session.review_title == null);
     const blocks = app.session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 2), blocks.len);
     // The parked main conversation returned whole, and the completion event
@@ -7653,6 +7711,323 @@ test "a settled judge report restores the main conversation and records completi
         blocks[1].content.event.text.items,
     );
     try std.testing.expect(!blocks[1].content.event.is_error);
+}
+
+// A settlement holds by itself, so editor text must add no user hold to it. A
+// brake over the settlement parks the workflow where Esc reports a stop, and
+// the judge settled the review.
+test "editor text leaves a settlement at the settled hold" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = anthropic_default,
+        .system = "",
+        .retry = .{},
+        .environ = .empty,
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+    try installJudgeFlow(&app, "Decision: Review settled.");
+    try app.session.editor.insert("keep the public interface");
+
+    // The brake stands, and the settlement still takes its own hold with no
+    // step behind Ctrl+N.
+    try app.finishReviewPhase();
+    try std.testing.expectEqual(ReviewFlow.Hold.settled, app.review.?.hold.?);
+    try std.testing.expect(app.review.?.step == null);
+    try std.testing.expectEqualStrings(
+        "Review hold: The judge settled the review",
+        app.session.review_title.?,
+    );
+    try std.testing.expectEqualStrings("Esc: Finish", app.session.review_controls);
+
+    // Esc ends the review at the settled hold, so the event reports the
+    // settlement and never a stop.
+    try app.handleKey(&.escape);
+    try std.testing.expect(app.review == null);
+    const blocks = app.session.transcript.blocks();
+    try std.testing.expectEqualStrings(
+        "Review settled. Rounds: 1 · Fixer passes: 0 · Cost: $0.00",
+        blocks[blocks.len - 1].content.event.text.items,
+    );
+}
+
+// A message at the settled hold reaches the judge like an answer, so no marker
+// line is due. A reply that keeps the settlement returns the workflow to the
+// hold, and Esc still reports the settlement.
+test "a settled-hold answer that keeps the settlement returns to the hold" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(home);
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    defer app.drainQueue();
+    app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
+    defer app.accounts.deinit();
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = anthropic_default,
+        .system = "",
+        .retry = .{},
+        .environ = .empty,
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+    defer app.dropRetry();
+    try installJudgeFlow(&app, "Decision: Review settled.");
+
+    try app.finishReviewPhase();
+    try std.testing.expectEqual(ReviewFlow.Hold.settled, app.review.?.hold.?);
+
+    // The user questions the settlement, so the turn runs in the judge
+    // conversation and carries the origin of the hold.
+    try sendReviewMessage(&app, "did you read every untracked file?");
+    try std.testing.expectEqual(ReviewFlow.Hold.settled, app.review.?.hold_origin.?);
+    {
+        const result = app.awaitTurnFuture().?;
+        app.freeWorkerResult(&result);
+    }
+    try app.agent.items.append(gpa, .{ .message = .{
+        .role = .user,
+        .text = try gpa.dupe(u8, "did you read every untracked file?"),
+    } });
+    try app.agent.items.append(gpa, .{ .message = .{
+        .role = .assistant,
+        .text = try gpa.dupe(u8, "I read each one, and none holds a defect."),
+    } });
+    const completed: WorkerResult = .{
+        .outcome = .{ .receipt = .{
+            .history_base = 0,
+            .history_end = 1,
+            .steering_committed_count = 0,
+        }, .disposition = .completed },
+        .error_text = null,
+    };
+    try app.finishWorkerResult(&completed);
+
+    // The answer holds no decision line, so the settlement stands, the hold
+    // offers no step, and the machine spends no correction budget.
+    try std.testing.expectEqual(ReviewFlow.Hold.settled, app.review.?.hold.?);
+    try std.testing.expect(app.review.?.step == null);
+    try std.testing.expect(!app.review.?.machine.correction_requested);
+    try std.testing.expectEqualStrings("Esc: Finish", app.session.review_controls);
+
+    // The judge kept its decision, so the end reports the settlement.
+    try app.handleKey(&.escape);
+    try std.testing.expect(app.review == null);
+    const blocks = app.session.transcript.blocks();
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        blocks[blocks.len - 1].content.event.text.items,
+        "Review settled.",
+    ) != null);
+}
+
+// An answer that moves the judge off its settlement leaves the step of the
+// fresh decision. The participation holds that step for a read, so Ctrl+N
+// applies it and the review is settled no more.
+test "a settled-hold answer that changes the decision parks the next step" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(home);
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    defer app.drainQueue();
+    app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
+    defer app.accounts.deinit();
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = anthropic_default,
+        .system = "",
+        .retry = .{},
+        .environ = .empty,
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+    defer app.dropRetry();
+    try installJudgeFlow(&app, "Decision: Review settled.");
+
+    try app.finishReviewPhase();
+    try std.testing.expectEqual(ReviewFlow.Hold.settled, app.review.?.hold.?);
+
+    try sendReviewMessage(&app, "the parser drops the last field");
+    {
+        const result = app.awaitTurnFuture().?;
+        app.freeWorkerResult(&result);
+    }
+    try app.agent.items.append(gpa, .{ .message = .{
+        .role = .user,
+        .text = try gpa.dupe(u8, "the parser drops the last field"),
+    } });
+    try app.agent.items.append(gpa, .{ .message = .{
+        .role = .assistant,
+        .text = try gpa.dupe(u8, "Decision: Fix required.\nFix the parser."),
+    } });
+    const completed: WorkerResult = .{
+        .outcome = .{ .receipt = .{
+            .history_base = 0,
+            .history_end = 1,
+            .steering_committed_count = 0,
+        }, .disposition = .completed },
+        .error_text = null,
+    };
+    try app.finishWorkerResult(&completed);
+
+    // The fresh decision leaves the fixer step, and the read of the answer
+    // holds it behind Ctrl+N.
+    try std.testing.expectEqual(ReviewFlow.Hold.user, app.review.?.hold.?);
+    try std.testing.expectEqual(Review.Step{ .start_fixer = .first }, app.review.?.step.?);
+    try std.testing.expectEqualStrings(
+        "Review hold: The judge completed",
+        app.session.review_title.?,
+    );
+    try std.testing.expectEqualStrings(
+        "Ctrl+N: Continue · Esc: Stop",
+        app.session.review_controls,
+    );
+
+    // Ctrl+N starts the fixer over the packet that the fresh decision stored.
+    try app.handleKey(&.{ .ctrl = 'n' });
+    try std.testing.expectEqual(Review.Role.fixer, app.review.?.role.?);
+    try std.testing.expect(std.mem.indexOf(u8, app.review.?.request.?.text, "parser") != null);
+    {
+        const result = app.awaitTurnFuture().?;
+        defer app.freeWorkerResult(&result);
+        try app.finishWorkerResult(&result);
+    }
+
+    // The judge left its settlement, so the end reports a stop.
+    try app.handleKey(&.escape);
+    try std.testing.expect(app.review == null);
+    const blocks = app.session.transcript.blocks();
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        blocks[blocks.len - 1].content.event.text.items,
+        "Review stopped at the fixer.",
+    ) != null);
+}
+
+// The settlement leaves no step, so Ctrl+N acts there only over an armed
+// attempt. The row must name that attempt, because a row without the key would
+// hide an action that the key takes.
+test "an armed retry at the settled hold names the attempt and keeps the hold" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(home);
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    defer app.drainQueue();
+    app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
+    defer app.accounts.deinit();
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = anthropic_default,
+        .system = "",
+        .retry = .{},
+        .environ = .empty,
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    defer app.session.deinit();
+    defer app.dropRetry();
+    try installJudgeFlow(&app, "Decision: Review settled.");
+
+    try app.finishReviewPhase();
+    try std.testing.expectEqual(ReviewFlow.Hold.settled, app.review.?.hold.?);
+
+    // The user questions the settlement, and that turn fails with committed
+    // work, so the attempt waits behind the failure hold.
+    try sendReviewMessage(&app, "does the guard cover the empty path?");
+    {
+        const result = app.awaitTurnFuture().?;
+        app.freeWorkerResult(&result);
+    }
+    const committed_failure: WorkerResult = .{
+        .outcome = .{
+            .receipt = .{
+                .history_base = 0,
+                .history_end = 1,
+                .steering_committed_count = 0,
+            },
+            .disposition = .{ .failed = error.ApiError },
+        },
+        .error_text = try gpa.dupe(u8, "The provider is overloaded."),
+    };
+    defer app.freeWorkerResult(&committed_failure);
+    try app.finishWorkerResult(&committed_failure);
+    try std.testing.expectEqual(ReviewFlow.Hold.failure, app.review.?.hold.?);
+
+    // The attempt fails and commits nothing, so the workflow returns to the
+    // settled hold and the attempt stays armed there.
+    try app.sendRetryTurn();
+    {
+        const result = app.awaitTurnFuture().?;
+        app.freeWorkerResult(&result);
+    }
+    const empty_failure: WorkerResult = .{
+        .outcome = .{
+            .receipt = .{
+                .history_base = 1,
+                .history_end = 1,
+                .steering_committed_count = 0,
+            },
+            .disposition = .{ .failed = error.ApiError },
+        },
+        .error_text = try gpa.dupe(u8, "The provider is overloaded."),
+    };
+    defer app.freeWorkerResult(&empty_failure);
+    try app.finishWorkerResult(&empty_failure);
+    try std.testing.expectEqual(ReviewFlow.Hold.settled, app.review.?.hold.?);
+    try std.testing.expect(app.retry != null);
+    try std.testing.expectEqualStrings(
+        "Review hold: The judge settled the review",
+        app.session.review_title.?,
+    );
+    try std.testing.expectEqualStrings(
+        "Ctrl+N: Try again · Esc: Finish",
+        app.session.review_controls,
+    );
+
+    // The press takes the armed attempt over the hold, so the settlement and
+    // the hold both stand. The signed-out gate stops that attempt.
+    try app.handleKey(&.{ .ctrl = 'n' });
+    try std.testing.expectEqual(ReviewFlow.Hold.settled, app.review.?.hold.?);
+    try std.testing.expect(app.review.?.step == null);
+    try std.testing.expect(app.turn_future == null);
+    try std.testing.expect(app.retry != null);
+
+    // The judge kept its settlement, so the end reports it as settled.
+    try app.handleKey(&.escape);
+    try std.testing.expect(app.review == null);
+    const blocks = app.session.transcript.blocks();
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        blocks[blocks.len - 1].content.event.text.items,
+        "Review settled.",
+    ) != null);
 }
 
 test "editor text brakes the workflow and Esc stops it with the text preserved" {
@@ -7686,7 +8061,7 @@ test "editor text brakes the workflow and Esc stops it with the text preserved" 
         app.session.review_title.?,
     );
     try std.testing.expectEqualStrings(
-        "Enter: Send · Ctrl+N: Continue · Esc: Stop",
+        "Ctrl+N: Continue · Esc: Stop",
         app.session.review_controls,
     );
 
@@ -8347,7 +8722,7 @@ test "a message at a review hold runs under the phase caption and returns to the
         app.session.review_title.?,
     );
     try std.testing.expectEqualStrings(
-        "Enter: Send · Ctrl+N: Continue · Esc: Stop",
+        "Ctrl+N: Continue · Esc: Stop",
         app.session.review_controls,
     );
     try std.testing.expectEqualStrings("keep the config format", app.session.editor.visible());
@@ -8855,9 +9230,12 @@ test "a limit-hold answer that a committed failure interrupts stays an answer" {
     try std.testing.expectEqual(ReviewFlow.Hold.limit, app.review.?.hold.?);
     try std.testing.expect(app.turn_future == null);
     try std.testing.expect(!app.review.?.machine.correction_requested);
-    try std.testing.expectEqualStrings("Review limit: Round 1 of 1", app.session.review_title.?);
     try std.testing.expectEqualStrings(
-        "Enter: Ask the judge · Ctrl+N: Add a round · Esc: Finish",
+        "Review limit: The judge waits at round 1 of 1",
+        app.session.review_title.?,
+    );
+    try std.testing.expectEqualStrings(
+        "Ctrl+N: Add a round · Esc: Finish",
         app.session.review_controls,
     );
 
@@ -9144,9 +9522,12 @@ test "an armed retry at the limit hold names the attempt and adds no round" {
     try app.finishWorkerResult(&empty_failure);
     try std.testing.expectEqual(ReviewFlow.Hold.limit, app.review.?.hold.?);
     try std.testing.expect(app.retry != null);
-    try std.testing.expectEqualStrings("Review limit: Round 1 of 1", app.session.review_title.?);
     try std.testing.expectEqualStrings(
-        "Enter: Ask the judge · Ctrl+N: Try again · Esc: Finish",
+        "Review limit: The judge waits at round 1 of 1",
+        app.session.review_title.?,
+    );
+    try std.testing.expectEqualStrings(
+        "Ctrl+N: Try again · Esc: Finish",
         app.session.review_controls,
     );
 

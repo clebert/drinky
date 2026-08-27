@@ -30,6 +30,9 @@ const retry_title = "Failed turn";
 const retry_controls = "Ctrl+N: Try again · Esc: Dismiss";
 /// The control that returns pending steering to the editor.
 const steering_controls = "Ctrl+P: Edit all";
+/// The control that sends the draft at a review hold. The row names it only
+/// while the editor holds something to send.
+const review_send_control = "Enter: Send";
 /// The row bound of a caption above the editor: the title row and the control
 /// rows that fit. The bound keeps the chrome from crowding the input out of a
 /// narrow window. A control segment past the bound drops whole.
@@ -586,6 +589,20 @@ pub fn setReviewCaption(self: *Session, title: ?[]u8, controls: []const u8) void
     self.review_title = title;
     self.review_controls = controls;
     self.dirty = true;
+}
+
+/// The control row of a review hold: the stored controls, with the send control
+/// ahead of them while the editor holds something to send. An empty editor
+/// names no key that does nothing. The row borrows `buffer`.
+fn reviewHoldControls(self: *const Session, buffer: []u8) []const u8 {
+    if (self.editor.blank()) return self.review_controls;
+    // A row that outgrew the buffer keeps the stored controls, so no key of the
+    // hold can go missing.
+    return std.fmt.bufPrint(buffer, "{s}{s}{s}", .{
+        review_send_control,
+        ui.paint.separator,
+        self.review_controls,
+    }) catch self.review_controls;
 }
 
 /// A conversation's whole presentation state: its own transcript, its request
@@ -1500,6 +1517,9 @@ pub fn paint(self: *Session, size: terminal.View.Size) !void {
     // The steering caption borrows this buffer through `layout.project` below.
     // The bytes hold the 17-byte label and every decimal `usize` value.
     var steering_title_buffer: [64]u8 = undefined;
+    // The review hold row borrows this buffer the same way. The bytes hold the
+    // send control, its separator, and the longest stored control row.
+    var review_controls_buffer: [96]u8 = undefined;
     const tail: layout.Tail = switch (self.mode) {
         .prompt => prompt: {
             self.editor.reflow(size);
@@ -1509,7 +1529,7 @@ pub fn paint(self: *Session, size: terminal.View.Size) !void {
                     // controls own the prompt while a workflow runs.
                     .caption = if (self.review_title) |title| .{
                         .title = title,
-                        .controls = self.review_controls,
+                        .controls = self.reviewHoldControls(&review_controls_buffer),
                         .rows_max = editor_caption_rows_max,
                     } else if (self.retry_shown) .{
                         .title = retry_title,
@@ -1527,6 +1547,9 @@ pub fn paint(self: *Session, size: terminal.View.Size) !void {
             // again, and only Ctrl+N clears the participation.
             const draft_held = self.editor.visible().len != 0;
             const boundary_held = self.review_participated or draft_held;
+            // A draft of whitespace alone queues no steering, so the send key
+            // reads the same boundary as the hold row.
+            const draft_sendable = !self.editor.blank();
             break :turn .{
                 .turn = .{
                     .tools = try turn.boxes(self.gpa, self.clock_ms),
@@ -1548,13 +1571,14 @@ pub fn paint(self: *Session, size: terminal.View.Size) !void {
                         .state = if (boundary_held) "Resume: Hold" else "Resume: Auto",
                         .state_role = if (boundary_held) .warning else .muted,
                         // The row never offers a key that does nothing: Enter
-                        // needs a draft, and Ctrl+N needs a participation.
+                        // needs a draft that the editor can send, and Ctrl+N
+                        // needs a participation.
                         .controls = if (self.review_participated)
-                            (if (draft_held)
+                            (if (draft_sendable)
                                 "Enter: Steer · Ctrl+N: Auto · Esc: Stop"
                             else
                                 "Ctrl+N: Auto · Esc: Stop")
-                        else if (draft_held)
+                        else if (draft_sendable)
                             "Enter: Steer · Esc: Stop"
                         else
                             "Esc: Stop",
@@ -4023,7 +4047,8 @@ test "a conversation switch swaps whole and can restore what it replaced" {
 // The running review caption marks the next boundary live: text in the editor
 // holds it and releases when the editor clears, and participation holds it
 // until the app clears that flag. The controls offer a key only while it does
-// something: Enter needs a draft, and Ctrl+N needs a participation.
+// something: Enter needs a draft that the editor can send, and Ctrl+N needs a
+// participation.
 test "the review caption marks whether the boundary resumes by itself" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -4043,6 +4068,19 @@ test "the review caption marks whether the boundary resumes by itself" {
         defer gpa.free(idle);
         try std.testing.expect(std.mem.indexOf(u8, idle, "Enter: Steer") == null);
     }
+
+    // Whitespace alone holds the boundary and sends nothing, so the row marks
+    // the hold and still offers no steer key.
+    try session.editor.insert("  ");
+    start = out.written().len;
+    try session.paint(.{ .columns = 120, .rows = 24 });
+    try expectPainted(gpa, out.written()[start..], "Resume: Hold");
+    {
+        const spaces = try terminal.View.plainText(gpa, out.written()[start..]);
+        defer gpa.free(spaces);
+        try std.testing.expect(std.mem.indexOf(u8, spaces, "Enter: Steer") == null);
+    }
+    session.editor.clear();
 
     // Text in the editor holds the boundary, shows the steer key, and colors
     // the held state. A cleared editor arms the resume again.
@@ -4084,4 +4122,54 @@ test "the review caption marks whether the boundary resumes by itself" {
     defer gpa.free(held);
     try std.testing.expect(std.mem.indexOf(u8, held, "Judge: Round 1 of 4") != null);
     try std.testing.expect(std.mem.indexOf(u8, held, "Resume:") == null);
+}
+
+// A review hold waits for the user, and Enter acts there only over a draft. The
+// row therefore names the send key live, ahead of the stored controls, and an
+// empty editor names no key that does nothing.
+test "a review hold row names the send key only over a draft" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var session = Session.init(gpa, &out.writer, test_model, .none);
+    defer session.deinit();
+    session.setReviewCaption(
+        try gpa.dupe(u8, "Review hold: The judge settled the review"),
+        "Esc: Finish",
+    );
+
+    var start = out.written().len;
+    try session.paint(.{ .columns = 120, .rows = 24 });
+    {
+        const empty = try terminal.View.plainText(gpa, out.written()[start..]);
+        defer gpa.free(empty);
+        try std.testing.expect(std.mem.indexOf(u8, empty, "Esc: Finish") != null);
+        try std.testing.expect(std.mem.indexOf(u8, empty, "Enter: Send") == null);
+    }
+
+    // Whitespace alone sends nothing, so the row stays as it is.
+    try session.editor.insert("  ");
+    start = out.written().len;
+    try session.paint(.{ .columns = 120, .rows = 24 });
+    {
+        const spaces = try terminal.View.plainText(gpa, out.written()[start..]);
+        defer gpa.free(spaces);
+        try std.testing.expect(std.mem.indexOf(u8, spaces, "Enter: Send") == null);
+    }
+
+    // A draft with content names the key ahead of the stored controls.
+    try session.editor.insert("did you read the untracked files?");
+    start = out.written().len;
+    try session.paint(.{ .columns = 120, .rows = 24 });
+    try expectPainted(gpa, out.written()[start..], "Enter: Send · Esc: Finish");
+
+    // The cleared editor takes the key out of the row again.
+    session.editor.clear();
+    start = out.written().len;
+    try session.paint(.{ .columns = 120, .rows = 24 });
+    {
+        const cleared = try terminal.View.plainText(gpa, out.written()[start..]);
+        defer gpa.free(cleared);
+        try std.testing.expect(std.mem.indexOf(u8, cleared, "Enter: Send") == null);
+    }
 }

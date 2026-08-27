@@ -35,9 +35,9 @@ next_pass: Pass = .first,
 /// The latest complete judge decision, or null before the first one. A raise
 /// of the ceiling resumes it.
 decision: ?Decision = null,
-/// Whether an answer at a limit hold moved the judge past `decision`. A raise
-/// then asks the judge to decide again, so every answer of the user reaches
-/// the next generated request.
+/// Whether an answer at a hold moved the judge past `decision`. A raise then
+/// asks the judge to decide again, so every answer of the user reaches the next
+/// generated request. A settled hold offers no step while the flag stands.
 decision_stale: bool = false,
 /// The latest reviewer report. The next judge request consumes it. Owned.
 reviewer_report: ?[]u8 = null,
@@ -131,7 +131,7 @@ pub const Step = union(enum) {
     hold_judge,
     /// The ceiling blocks progress, so the workflow waits.
     hold_limit,
-    /// The judge settled the review, so the workflow completes.
+    /// The judge settled the review, so the workflow waits.
     settled,
     /// The phase reply holds no valid marker line, so one correction request
     /// follows in the role context.
@@ -449,10 +449,10 @@ pub fn composeCorrectionRequest(self: *Review) []const u8 {
     };
 }
 
-/// Take a judge answer during a limit hold. A valid decision line replaces the
-/// latest decision, and the workflow returns to the hold either way. An answer
-/// without one leaves the latest decision stale. Returns whether the answer
-/// replaced the decision.
+/// Take a judge answer at a limit hold or at a settled hold. A valid decision
+/// line replaces the latest decision, and a limit hold returns to itself either
+/// way. An answer without a decision line leaves the latest decision stale.
+/// Returns whether the answer replaced the decision.
 pub fn adoptJudgeAnswer(self: *Review, report: []const u8) !bool {
     const decision = classifyDecision(report) orelse {
         self.decision_stale = true;
@@ -471,6 +471,18 @@ pub fn raiseCeiling(self: *Review) Step {
     return switch (self.decision.?) {
         .fix_required => self.fixStep(),
         .review_settled => .start_reviewer,
+        .user_decision_required => .hold_judge,
+    };
+}
+
+/// The step that an answer at the settled hold left, or null while the judge
+/// keeps its settlement. An answer without a decision line changes nothing, so
+/// the hold stands. Only a settled hold calls it, so a decision exists.
+pub fn settledStep(self: *Review) ?Step {
+    if (self.decision_stale) return null;
+    return switch (self.decision.?) {
+        .review_settled => null,
+        .fix_required => self.fixStep(),
         .user_decision_required => .hold_judge,
     };
 }
@@ -1011,6 +1023,58 @@ test "an answer without a decision sends the added round through the judge" {
     try std.testing.expectEqual(Step.start_reviewer, try review.finishFixer("Applied: all."));
     gpa.free(try review.composeReviewerRequest());
     try std.testing.expectEqual(@as(u64, 2), review.rounds_started);
+}
+
+test "an answer at the settled hold leaves a step only for a fresh decision" {
+    const gpa = std.testing.allocator;
+    var review = Review.init(gpa, 4);
+    defer review.deinit();
+    gpa.free(try review.composeReviewerRequest());
+    _ = try review.finishReviewer("Findings: 1.\nFinding: a bug.");
+    gpa.free(try review.composeJudgeRequest());
+    try std.testing.expectEqual(Step.settled, try review.finishJudge("Decision: Review settled."));
+
+    // An answer in prose changes no decision, so the settlement stands and the
+    // hold offers no step.
+    try std.testing.expect(!try review.adoptJudgeAnswer("The guard covers that path."));
+    try std.testing.expect(review.settledStep() == null);
+
+    // A repeated settlement stands too.
+    try std.testing.expect(try review.adoptJudgeAnswer("Decision: Review settled."));
+    try std.testing.expect(review.settledStep() == null);
+
+    // An answer that convinces the judge leaves the step of the fresh
+    // decision, and the fixer packet carries what the judge accepted.
+    try std.testing.expect(try review.adoptJudgeAnswer(
+        "Decision: Fix required.\nFix the parser.",
+    ));
+    try std.testing.expectEqual(Step{ .start_fixer = .first }, review.settledStep().?);
+    const request = try review.composeFixerRequest(.first);
+    defer gpa.free(request);
+    try std.testing.expect(std.mem.indexOf(u8, request, "parser") != null);
+}
+
+test "a settled hold at the ceiling sends a fresh fix decision to the limit" {
+    const gpa = std.testing.allocator;
+    var review = Review.init(gpa, 1);
+    defer review.deinit();
+    gpa.free(try review.composeReviewerRequest());
+    _ = try review.finishReviewer("Findings: none.");
+    gpa.free(try review.composeJudgeRequest());
+    try std.testing.expectEqual(Step.settled, try review.finishJudge("Decision: Review settled."));
+
+    // No later reviewer round could check a fix, so the fresh decision holds
+    // at the limit instead of starting the fixer.
+    try std.testing.expect(try review.adoptJudgeAnswer(
+        "Decision: Fix required.\nFix the parser.",
+    ));
+    try std.testing.expectEqual(Step.hold_limit, review.settledStep().?);
+
+    // A question that the judge turns back on the user holds too.
+    try std.testing.expect(try review.adoptJudgeAnswer(
+        "Decision: User decision required.\nKeep or rename the option?",
+    ));
+    try std.testing.expectEqual(Step.hold_judge, review.settledStep().?);
 }
 
 test "a successor report replaces its phase report and counts no second completion" {

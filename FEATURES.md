@@ -196,9 +196,12 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - A phase the user takes part in holds at its boundary too, so the reply waits for a read before the
   role resets. A mid-turn Ctrl+N arms the automatic resume again, and the running caption marks the
   state as `Resume: Auto` or `Resume: Hold`, live against the editor and the participation. The held
-  state takes the warning color, and the row names Enter only while the editor holds text.
+  state takes the warning color, and every control row names Enter only while the editor holds
+  something to send.
 - A message that the user sends at a hold runs as its own turn under the round caption. A failure
   that commits nothing returns the text to the editor and the workflow to that hold.
+- A settled judge holds the workflow, so its report waits for a read. A message from that hold
+  reaches the judge, and a fresh decision leaves its step behind Ctrl+N. Esc finishes the review.
 - The judge asks the user only about an open product choice. The `review.rounds_max` ceiling bounds
   unattended rounds, and Ctrl+N adds one round at the limit. An answer that moved the judge past its
   latest decision sends that round through the judge, so it decides again.
@@ -210,7 +213,7 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
   credential replacement and a credential rejection end a role turn in that same hold, and neither
   one changes a role choice.
 - Esc stops the workflow at a hold and during a turn. A worker that beats the cancel keeps its
-  reply, and the stop still ends the workflow.
+  reply, and the stop still ends the workflow. Esc at the settlement reports it as settled.
 - The stop restores the main conversation exactly and records one completion event with the rounds,
   the fixer passes, and the review cost. Empty-editor Ctrl+D quits Drinky whole.
 
