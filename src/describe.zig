@@ -137,7 +137,8 @@ fn writeKeys(writer: *std.Io.Writer, options: *const Options) !void {
         \\during its turns. The caption above the editor names the state of the workflow and its
         \\controls, and the running caption marks the next boundary as `Resume: Auto` or
         \\`Resume: Hold`. The boundary holds for text in the editor and for a phase the user
-        \\took part in with a message or with steering.
+        \\took part in with a message or with steering. `Resume: Hold` takes the warning
+        \\color, and the control row names Enter only while the editor holds text.
         \\
         \\- Esc stops the workflow at a hold. During a turn it cancels the turn and stops the
         \\  workflow. Drinky records one completion event and restores the main conversation.

@@ -195,7 +195,8 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
   fixer gets one judge copy, so a report never reads as a user instruction.
 - A phase the user takes part in holds at its boundary too, so the reply waits for a read before the
   role resets. A mid-turn Ctrl+N arms the automatic resume again, and the running caption marks the
-  state as `Resume: Auto` or `Resume: Hold`, live against the editor and the participation.
+  state as `Resume: Auto` or `Resume: Hold`, live against the editor and the participation. The held
+  state takes the warning color, and the row names Enter only while the editor holds text.
 - A message that the user sends at a hold runs as its own turn under the round caption. A failure
   that commits nothing returns the text to the editor and the workflow to that hold.
 - The judge asks the user only about an open product choice. The `review.rounds_max` ceiling bounds
@@ -249,6 +250,8 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
   accent title and muted controls share one row when they fit. At the first overflow, the title
   takes one row that never wraps and cuts with one `…` when too wide. The control segments wrap at
   their `·` boundaries under it, and a segment alone on a row that still overflows cuts with `…`.
+- A caption can carry one state segment between its title and its controls. The segment takes its
+  own color and packs before every control, so it survives them on a narrow row.
 - A row bound caps each caption: one row for a page, three for a picker or an editor state, none for
   the intro line. A control segment past the bound drops whole and leaves no mark. A one-row caption
   keeps the title and the longest prefix of whole segments, so the title survives longest.

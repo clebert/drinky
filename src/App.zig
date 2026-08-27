@@ -2867,8 +2867,9 @@ fn dropReviewRequest(self: *App) void {
     flow.request = null;
 }
 
-/// The controls of a running phase turn.
-const review_turn_controls = "Enter: Steer · Esc: Stop";
+/// The stored controls of a running phase turn. The session composes the live
+/// control row at paint time, so this value paints only outside a turn.
+const review_turn_controls = "Esc: Stop";
 
 /// The transcript line of one generated request: the role it goes to and
 /// where the workflow stands. The request itself stays out of the transcript,
@@ -2891,14 +2892,14 @@ fn composeReviewRequestHead(self: *App, role: Review.Role) ![]u8 {
     };
 }
 
-/// The caption title of a running phase turn: the round, the ceiling, and the
-/// role. The caller owns it.
+/// The caption title of a running phase turn: the active role, the round, and
+/// the ceiling. The caller owns it.
 fn composeReviewTitle(self: *App, role: Review.Role) ![]u8 {
     const machine = &self.review.?.machine;
     return std.fmt.allocPrint(
         self.gpa,
-        "Review: Round {d} of {d} · {s}",
-        .{ machine.rounds_started, machine.rounds_max, role.label() },
+        "{s}: Round {d} of {d}",
+        .{ role.label(), machine.rounds_started, machine.rounds_max },
     );
 }
 
@@ -7736,8 +7737,8 @@ test "a fix decision starts the fixer, a failed request resends, and Esc stops" 
     try std.testing.expect(app.session.mode == .turn);
     try std.testing.expectEqual(Review.Role.fixer, app.review.?.role.?);
     try std.testing.expect(app.review.?.judge != null);
-    try std.testing.expectEqualStrings("Review: Round 1 of 4 · Fixer", app.session.review_title.?);
-    try std.testing.expectEqualStrings("Enter: Steer · Esc: Stop", app.session.review_controls);
+    try std.testing.expectEqualStrings("Fixer: Round 1 of 4", app.session.review_title.?);
+    try std.testing.expectEqualStrings("Esc: Stop", app.session.review_controls);
     {
         // The head names the request, and the request itself stays out, so
         // the fixer view never shows the embedded judge report.
@@ -8315,8 +8316,8 @@ test "a message at a review hold runs under the phase caption and returns to the
     try sendReviewMessage(&app, "keep the config format");
     try std.testing.expect(app.session.mode == .turn);
     try std.testing.expect(app.review.?.hold == null);
-    try std.testing.expectEqualStrings("Review: Round 1 of 4 · Judge", app.session.review_title.?);
-    try std.testing.expectEqualStrings("Enter: Steer · Esc: Stop", app.session.review_controls);
+    try std.testing.expectEqualStrings("Judge: Round 1 of 4", app.session.review_title.?);
+    try std.testing.expectEqualStrings("Esc: Stop", app.session.review_controls);
 
     // The signed-out worker fails and commits nothing, so the text returns to
     // the editor and the workflow waits in the hold it came from.
@@ -8728,8 +8729,8 @@ test "a retry attempt in a review runs under the phase caption" {
     try app.sendRetryTurn();
     try std.testing.expect(app.session.mode == .turn);
     try std.testing.expect(app.review.?.hold == null);
-    try std.testing.expectEqualStrings("Review: Round 1 of 4 · Judge", app.session.review_title.?);
-    try std.testing.expectEqualStrings("Enter: Steer · Esc: Stop", app.session.review_controls);
+    try std.testing.expectEqualStrings("Judge: Round 1 of 4", app.session.review_title.?);
+    try std.testing.expectEqualStrings("Esc: Stop", app.session.review_controls);
 
     // The failed attempt returns the workflow to the failure hold.
     {
