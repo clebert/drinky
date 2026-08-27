@@ -3,7 +3,8 @@
 A terminal-native coding agent that keeps the conversation in normal scrollback.
 
 Give Drinky a prompt. The model can read, search, and change files or run commands in the working
-directory. Drinky is written in Zig.
+directory. Drinky talks to Anthropic and OpenAI, through a subscription login or an API key. Drinky
+is written in Zig.
 
 ## Philosophy
 
@@ -14,13 +15,18 @@ for the task.
 
 ## Features
 
+- `/review` reviews every pending change from `HEAD` in bounded rounds. A reviewer finds defects, a
+  judge settles them, and a fixer applies them. Each role can run its own account, model, and effort
+  level. An empty editor lets the rounds run unattended, and typed text holds the review at the next
+  boundary.
 - Drinky streams the conversation into normal scrollback and reserves full-window pages for
   temporary views.
-- Drinky accepts steering during a turn and keeps completed work visible after a cancellation or
-  retry.
-- Drinky connects to Anthropic and OpenAI through a subscription login or an API key.
-- Drinky loads repository instructions and skills on demand, and can require skills for selected
-  paths.
+- Drinky accepts steering during a turn. A cancellation or a failure keeps the finished work. One
+  key continues a failed turn.
+- A path pattern can require a skill. Drinky sends the whole skill file on the first touch. It
+  refuses a change to a matching file until the whole skill file stands in the conversation.
+- Drinky describes itself. The model answers a question about the commands, the keys, and the
+  settings from a generated document, never from memory.
 
 See [`FEATURES.md`](FEATURES.md) for the complete capability overview.
 
@@ -51,10 +57,15 @@ You can also ask Drinky to explain its own commands, keys, and settings.
 
 ## Configuration
 
-The `~/.drinky/config.json` file is optional. Ask Drinky to maintain the file directly. The agent
+The `~/.drinky/config.json` file is optional. Ask the model to maintain the file directly. The model
 can describe the harness itself: every command, every setting with its type, default, and meaning,
 the keys of the prompt, of a running turn, and of a review, and the files that Drinky discovers.
 Drinky applies changes at the next start.
+
+Drinky reads `config.json` and never writes it, so the file stays yours. You can keep it in version
+control. The machine-specific data lives in two separate files: the credentials in
+`~/.drinky/auth.json`, and the last account, model, and effort level in `~/.drinky/state.json`. The
+state file remembers those three per project, so a model switch touches no configuration.
 
 ## Provider access
 
