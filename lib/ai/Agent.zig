@@ -668,12 +668,14 @@ fn runRounds(
         // of the user. A tool met a file that a rule guards, so the model needs
         // the rules of that file for whatever it does next.
         const loaded = try self.drainSkills(turn, handler);
-        // Fold mid-turn steering in before the next round. With no tools asked,
-        // a steering message keeps the turn alive and does not end it. A skill
-        // file keeps it alive the same way, so the rules reach the model even
-        // when the reply asked for nothing more.
-        const steered = try self.drainSteering(turn, handler);
-        if (!ran_tools and !steered and !loaded) return;
+        // A reply that asks for no tool ends the turn, and a queued steering
+        // message stays for review. The user wrote it against a reply that was
+        // still streaming, so the finished reply can change what they want to
+        // send. A skill file keeps the turn alive, because it is guidance that
+        // Drinky owes the model before whatever the model does next.
+        if (!ran_tools and !loaded) return;
+        // Fold mid-turn steering in before the next round.
+        try self.drainSteering(turn, handler);
     }
     return error.TooManyToolRounds;
 }
@@ -767,13 +769,13 @@ fn notifySkill(handler: anytype, skill: []const u8, source: []const u8) !void {
 /// Deliver every queued steering message as one combined user message, appended
 /// to history and reported. On success the taken batch is retained in turn state
 /// until its following reply commits. This lets an abnormal exit before then
-/// return it to the queue. A failed delivery returns it at once. Returns whether
-/// anything was delivered.
-fn drainSteering(self: *Agent, turn: *TurnState, handler: anytype) !bool {
+/// return it to the queue. A failed delivery returns it at once. The caller
+/// decides that the turn continues, so an empty queue is not an outcome it reads.
+fn drainSteering(self: *Agent, turn: *TurnState, handler: anytype) !void {
     var pending = try self.steering.take();
     if (pending.len == 0) {
         self.gpa.free(pending);
-        return false;
+        return;
     }
     // A failed delivery restores the whole batch ahead of messages submitted
     // since the take. It does not allocate or expose a partial batch. The move
@@ -786,7 +788,6 @@ fn drainSteering(self: *Agent, turn: *TurnState, handler: anytype) !bool {
     try presentation(&turn.presentation_closed, handler.onSteering(combined, pending.len));
     std.debug.assert(turn.pending_steering == null);
     turn.pending_steering = pending;
-    return true;
 }
 
 /// Stream one assistant reply and retry transient failures. Only whole
@@ -1924,7 +1925,7 @@ test "steering is delivered as one combined user message" {
     defer if (turn.pending_steering) |batch| freeSteeringBatch(gpa, batch);
     try agent.steering.push("a");
     try agent.steering.push("b");
-    try std.testing.expect(try agent.drainSteering(&turn, &handler));
+    try agent.drainSteering(&turn, &handler);
 
     try std.testing.expectEqual(@as(usize, 1), agent.items.items.len);
     try std.testing.expectEqual(llm.Role.user, agent.items.items[0].message.role);
@@ -1935,7 +1936,10 @@ test "steering is delivered as one combined user message" {
     try std.testing.expect(turn.pending_steering != null);
     try std.testing.expectEqual(@as(usize, 0), turn.steering_committed_count);
 
-    try std.testing.expect(!try agent.drainSteering(&turn, &handler));
+    // An empty queue delivers nothing, so history and the report stand.
+    try agent.drainSteering(&turn, &handler);
+    try std.testing.expectEqual(@as(usize, 1), agent.items.items.len);
+    try std.testing.expectEqual(@as(usize, 2), handler.count);
 }
 
 test "steering appends a separate user item, leaving grouping to the serializer" {
@@ -1951,7 +1955,7 @@ test "steering appends a separate user item, leaving grouping to the serializer"
     defer if (turn.pending_steering) |batch| freeSteeringBatch(gpa, batch);
     try agent.appendUser("tool results");
     try agent.steering.push("steer");
-    try std.testing.expect(try agent.drainSteering(&turn, &handler));
+    try agent.drainSteering(&turn, &handler);
 
     try std.testing.expectEqual(@as(usize, 2), agent.items.items.len);
     try std.testing.expectEqual(llm.Role.user, agent.items.items[0].message.role);
@@ -4435,30 +4439,62 @@ test "the head that states an allowance stamps its own arrival" {
     try std.testing.expectEqual(stamped, agent.stats.quota_seen_ms);
 }
 
-test "steering queued at the end of a turn keeps that turn alive" {
+// The user wrote the message against a reply that was still streaming, so the
+// finished reply can change what they want to send. A reply that asks for no
+// tool ends the turn, and the queue holds the message for review.
+test "steering queued during a final reply stays queued" {
     const gpa = std.testing.allocator;
     var agent = scriptedAgent(gpa);
     defer agent.deinit();
     var handler: CaptureHandler = .{ .gpa = gpa };
     defer handler.deinit();
 
-    const second_events = [_]llm.Event{
-        .{ .text = "more" },
-        .{ .item = .{ .message = "more" } },
-        .{ .stop = .{ .usage = .{} } },
-    };
     var fetch: ScriptedFetch = .{ .attempts = &.{
         .{ .stream = .{ .events = &end_turn_events } },
-        .{ .stream = .{ .events = &second_events } },
     } };
     try agent.steering.push("steer");
     try agent.runWith(&fetch, "go", &handler);
+    try std.testing.expectEqual(@as(usize, 1), fetch.sends);
+    try std.testing.expectEqual(@as(usize, 0), handler.steer_count);
+    try std.testing.expectEqual(@as(usize, 2), agent.items.items.len);
+
+    const queued = try agent.steering.take();
+    defer {
+        for (queued) |message| gpa.free(message);
+        gpa.free(queued);
+    }
+    try std.testing.expectEqual(@as(usize, 1), queued.len);
+    try std.testing.expectEqualStrings("steer", queued[0]);
+}
+
+// A round that asks for a tool keeps the turn alive on its own, so the steering
+// of the user reaches the model before the model acts again.
+test "steering folds into a turn that a tool round keeps alive" {
+    const gpa = std.testing.allocator;
+    var agent = scriptedAgent(gpa);
+    defer agent.deinit();
+    var handler: CaptureHandler = .{ .gpa = gpa };
+    defer handler.deinit();
+
+    var fetch: ScriptedFetch = .{ .attempts = &.{
+        .{ .stream = .{ .events = &tool_round_events } },
+        .{ .stream = .{ .events = &end_turn_events } },
+    } };
+    try agent.steering.push("steer");
+    const outcome = agent.runTurnWith(&fetch, fake_tools, "go", &handler);
+    try std.testing.expect(outcome.disposition == .completed);
     try std.testing.expectEqual(@as(usize, 2), fetch.sends);
     try std.testing.expectEqual(@as(usize, 1), handler.steer_count);
-    try std.testing.expectEqual(@as(usize, 4), agent.items.items.len);
-    try std.testing.expectEqual(llm.Role.user, agent.items.items[2].message.role);
-    try std.testing.expectEqualStrings("steer", agent.items.items[2].message.text);
-    try std.testing.expectEqualStrings("more", agent.items.items[3].message.text);
+    try std.testing.expectEqual(@as(usize, 1), outcome.receipt.steering_committed_count);
+    try std.testing.expectEqual(@as(usize, 5), agent.items.items.len);
+    try std.testing.expectEqual(llm.Role.user, agent.items.items[3].message.role);
+    try std.testing.expectEqualStrings("steer", agent.items.items[3].message.text);
+    try std.testing.expectEqualStrings("hi", agent.items.items[4].message.text);
+
+    // The batch left the queue with the reply that committed it.
+    const queued = try agent.steering.take();
+    defer gpa.free(queued);
+    try std.testing.expectEqual(@as(usize, 0), queued.len);
 }
 
 // A minimal tool source for whole-turn tests: "write" mutates, everything else
@@ -4777,26 +4813,27 @@ test "a cancel during the post-stop usage callback books terminal usage only onc
     try std.testing.expectEqual(@as(u64, 1000), agent.stats.cache_usage.input);
 }
 
-test "a no-tool reply is retained when a later steered reply is canceled" {
+test "a completed round is retained when a later steered reply is canceled" {
     const gpa = std.testing.allocator;
     var agent = scriptedAgent(gpa);
     defer agent.deinit();
     var handler: CaptureHandler = .{ .gpa = gpa };
     defer handler.deinit();
 
-    // Round 1 answers with no tools. A steering message keeps the turn alive.
-    // Round 2 is canceled before it commits.
+    // Round 1 asks for a tool, which keeps the turn alive and folds the steering
+    // in. Round 2 is canceled before it commits.
     try agent.steering.push("steer");
     var fetch: ScriptedFetch = .{ .attempts = &.{
-        .{ .stream = .{ .events = &end_turn_events } },
+        .{ .stream = .{ .events = &tool_round_events } },
         .{ .stream = .{ .events = &.{}, .terminal_error = error.Canceled } },
     } };
     const outcome = agent.runTurnWith(&fetch, fake_tools, "go", &handler);
     try std.testing.expect(std.meta.activeTag(outcome.disposition) == .canceled);
-    // The completed no-tool reply survives. The canceled steer round is dropped.
-    try std.testing.expectEqual(@as(usize, 2), agent.items.items.len);
+    // The completed tool round survives. The canceled steer round is dropped.
+    try std.testing.expectEqual(@as(usize, 3), agent.items.items.len);
     try std.testing.expectEqualStrings("go", agent.items.items[0].message.text);
-    try std.testing.expectEqualStrings("hi", agent.items.items[1].message.text);
+    try std.testing.expectEqualStrings("t1", agent.items.items[1].tool_call.call_id);
+    try std.testing.expectEqualStrings("t1", agent.items.items[2].tool_result.call_id);
     // The steer was consumed but not committed, so it returns to the queue.
     try std.testing.expectEqual(@as(usize, 0), outcome.receipt.steering_committed_count);
     const restored = try agent.steering.take();
@@ -4815,20 +4852,15 @@ test "the receipt reports the committed steering count and history span" {
     var handler: CaptureHandler = .{ .gpa = gpa };
     defer handler.deinit();
 
-    const second_events = [_]llm.Event{
-        .{ .text = "more" },
-        .{ .item = .{ .message = "more" } },
-        .{ .stop = .{ .usage = .{} } },
-    };
     try agent.steering.push("steer");
     var fetch: ScriptedFetch = .{ .attempts = &.{
+        .{ .stream = .{ .events = &tool_round_events } },
         .{ .stream = .{ .events = &end_turn_events } },
-        .{ .stream = .{ .events = &second_events } },
     } };
     const outcome = agent.runTurnWith(&fetch, fake_tools, "go", &handler);
     try std.testing.expect(std.meta.activeTag(outcome.disposition) == .completed);
     // The steer batch is consumed in round 1 and committed by round 2's reply.
     try std.testing.expectEqual(@as(usize, 1), outcome.receipt.steering_committed_count);
-    try std.testing.expectEqual(@as(usize, 4), outcome.receipt.history_end);
+    try std.testing.expectEqual(@as(usize, 5), outcome.receipt.history_end);
     try std.testing.expect(!outcome.receipt.truncated);
 }
