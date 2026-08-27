@@ -1479,7 +1479,7 @@ pub fn paint(self: *Session, size: terminal.View.Size) !void {
         .viewing => |*page| {
             page.reflow(size);
             const scene: layout.Scene = .{ .page = page };
-            try layout.project(&self.page_view, size, &scene);
+            try layout.project(self.gpa, &self.page_view, size, &scene);
             return;
         },
         else => {},
@@ -1577,7 +1577,7 @@ pub fn paint(self: *Session, size: terminal.View.Size) !void {
         .tail = tail,
         .status = &status,
     } };
-    try layout.project(&self.view, size, &scene);
+    try layout.project(self.gpa, &self.view, size, &scene);
 }
 
 /// Move the terminal cursor below the interface. Call once at shutdown, so the
@@ -2147,7 +2147,7 @@ test "an event survives notice clearing until a conversation switch discards it"
     try std.testing.expectEqual(@as(usize, 1), session.transcript.blocks().len);
     try std.testing.expectEqualStrings(
         "Drinky changed the model.",
-        session.transcript.blocks()[0].event.text.items,
+        session.transcript.blocks()[0].content.event.text.items,
     );
     session.dirty = false;
     var fresh = Conversation.empty(gpa, .anthropic_subscription, &test_model, .none);
@@ -2237,7 +2237,7 @@ test "a tool result box shows the line the tool decided" {
     const painted = out.written();
     try std.testing.expectEqualStrings(
         "Tool: read · File: x\nLines: 3",
-        session.transcript.blocks()[0].tool_result.text.items,
+        session.transcript.blocks()[0].content.tool_result.text.items,
     );
     try std.testing.expect(std.mem.indexOf(u8, painted, "Lines: 3") != null);
 }
@@ -2267,7 +2267,7 @@ test "a tool result without a box line keeps the call row alone" {
     try std.testing.expectEqual(@as(usize, 1), blocks.len);
     try std.testing.expectEqualStrings(
         "Tool: describe_drinky",
-        blocks[0].tool_result.text.items,
+        blocks[0].content.tool_result.text.items,
     );
     try std.testing.expectEqual(@as(usize, 3), blocks[0].rows(80));
 
@@ -2300,13 +2300,13 @@ test "a failed tool result keeps its sentence below the call row" {
 
     const blocks = session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 1), blocks.len);
-    try std.testing.expect(blocks[0].tool_result.is_error);
+    try std.testing.expect(blocks[0].content.tool_result.is_error);
     try std.testing.expectEqualStrings(
         "Tool: read · File: a.zig\nError: " ++ sentence,
-        blocks[0].tool_result.text.items,
+        blocks[0].content.tool_result.text.items,
     );
     // The instruction of a sentence sits at its end, so the box wraps it.
-    try std.testing.expectEqual(ui.paint.Fit.wrap, blocks[0].tool_result.fit);
+    try std.testing.expectEqual(ui.paint.Fit.wrap, blocks[0].content.tool_result.fit);
 }
 
 // A failed call that states measures names its own end, so the box adds no
@@ -2336,12 +2336,12 @@ test "a failed tool result that states measures takes no prefix" {
 
     const blocks = session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 1), blocks.len);
-    try std.testing.expect(blocks[0].tool_result.is_error);
+    try std.testing.expect(blocks[0].content.tool_result.is_error);
     try std.testing.expectEqualStrings(
         "Tool: bash · Command: ls missing\nTime: 400ms · Exit code: 1 · Lines: 1",
-        blocks[0].tool_result.text.items,
+        blocks[0].content.tool_result.text.items,
     );
-    try std.testing.expectEqual(ui.paint.Fit.head, blocks[0].tool_result.fit);
+    try std.testing.expectEqual(ui.paint.Fit.head, blocks[0].content.tool_result.fit);
 }
 
 // While the model streams a call, the row counts the argument bytes instead of
@@ -2525,7 +2525,7 @@ test "a stream reset drops the tool boxes of the discarded attempt" {
         try std.testing.expectEqual(@as(usize, 1), blocks.len);
         try std.testing.expectEqualStrings(
             "Drinky started retry attempt 2 because of error Timeout.",
-            blocks[0].event.text.items,
+            blocks[0].content.event.text.items,
         );
     }
 
@@ -2570,14 +2570,14 @@ test "response-head retries remain after an abnormal rewind" {
     try std.testing.expectEqual(@as(usize, 3), blocks.len);
     try std.testing.expectEqualStrings(
         "Drinky started retry attempt 2 because the provider reported \"Overloaded\".",
-        blocks[0].event.text.items,
+        blocks[0].content.event.text.items,
     );
     try std.testing.expectEqualStrings(
         "Drinky started retry attempt 3 because of error Timeout.",
-        blocks[1].event.text.items,
+        blocks[1].content.event.text.items,
     );
-    try std.testing.expect(blocks[2].event.is_error);
-    try std.testing.expectEqualStrings("The request failed.", blocks[2].event.text.items);
+    try std.testing.expect(blocks[2].content.event.is_error);
+    try std.testing.expectEqualStrings("The request failed.", blocks[2].content.event.text.items);
 }
 
 // A provider can switch a request to another model. The event names both
@@ -2599,12 +2599,12 @@ test "a model mismatch records a durable event beside the answer" {
 
     const blocks = session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 2), blocks.len);
-    try std.testing.expectEqualStrings("answer", blocks[0].model.items);
-    try std.testing.expect(blocks[1].event.is_error);
+    try std.testing.expectEqualStrings("answer", blocks[0].content.model.items);
+    try std.testing.expect(blocks[1].content.event.is_error);
     try std.testing.expectEqualStrings(
         "The provider answered with the model \"claude-opus-5\" instead of the " ++
             "requested model \"claude-fable-5\".",
-        blocks[1].event.text.items,
+        blocks[1].content.event.text.items,
     );
 }
 
@@ -2628,9 +2628,9 @@ test "a truncated receipt appends an event after the answer" {
 
     const blocks = session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 2), blocks.len);
-    try std.testing.expectEqualStrings("half an ans", blocks[0].model.items);
-    try std.testing.expect(!blocks[1].event.is_error);
-    try std.testing.expectEqualStrings(truncated_event, blocks[1].event.text.items);
+    try std.testing.expectEqualStrings("half an ans", blocks[0].content.model.items);
+    try std.testing.expect(!blocks[1].content.event.is_error);
+    try std.testing.expectEqualStrings(truncated_event, blocks[1].content.event.text.items);
 
     // A turn that both truncated and failed reports the cutoff before the error.
     session.beginTurn(2);
@@ -2644,9 +2644,9 @@ test "a truncated receipt appends an event after the answer" {
     try session.failTurnWithReceipt(&receipt, "boom");
     const after = session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 4), after.len);
-    try std.testing.expectEqualStrings(truncated_event, after[2].event.text.items);
-    try std.testing.expect(after[3].event.is_error);
-    try std.testing.expectEqualStrings("boom", after[3].event.text.items);
+    try std.testing.expectEqualStrings(truncated_event, after[2].content.event.text.items);
+    try std.testing.expect(after[3].content.event.is_error);
+    try std.testing.expectEqualStrings("boom", after[3].content.event.text.items);
 }
 
 test "streamed and tool text cannot emit terminal controls" {
@@ -2738,7 +2738,10 @@ test "a canceled turn's stale output and completion cannot affect its successor"
     try std.testing.expect(!session.animating());
     // Three blocks: the stale error appended no event block either.
     try std.testing.expectEqual(@as(usize, 3), session.transcript.blocks().len);
-    try std.testing.expectEqualStrings("turn B", session.transcript.blocks()[2].model.items);
+    try std.testing.expectEqualStrings(
+        "turn B",
+        session.transcript.blocks()[2].content.model.items,
+    );
 }
 
 test "committing a steering draft empties the source" {
@@ -2786,7 +2789,7 @@ test "steering counts, then a consumed event shows it and clears the count" {
     try std.testing.expectEqual(@as(usize, 1), session.transcript.blocks().len);
     try std.testing.expectEqualStrings(
         "fix it\n\nand test",
-        session.transcript.blocks()[0].user.items,
+        session.transcript.blocks()[0].content.user.items,
     );
     try std.testing.expectEqual(@as(usize, 2), session.steering.items.len);
     try std.testing.expectEqual(@as(usize, 2), session.steering_retained_count);
@@ -3075,9 +3078,9 @@ test "a failure with nothing committed rewinds the tail and returns the prompt" 
 
     const blocks = session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 2), blocks.len);
-    try std.testing.expectEqualStrings("earlier", blocks[0].event.text.items);
-    try std.testing.expect(blocks[1].event.is_error);
-    try std.testing.expectEqualStrings("Overloaded", blocks[1].event.text.items);
+    try std.testing.expectEqualStrings("earlier", blocks[0].content.event.text.items);
+    try std.testing.expect(blocks[1].content.event.is_error);
+    try std.testing.expectEqualStrings("Overloaded", blocks[1].content.event.text.items);
     try std.testing.expectEqualStrings("my prompt\n\nsteer\n\ntyping", session.editor.visible());
     try std.testing.expect(session.turn_origin == null);
     try std.testing.expect(!session.hasSteering());
@@ -3127,16 +3130,16 @@ test "a failure after a committed round keeps it and restores only steering" {
 
     const blocks = session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 4), blocks.len);
-    try std.testing.expectEqualStrings("prompt", blocks[0].user.items);
-    try std.testing.expectEqualStrings("round one", blocks[1].model.items);
+    try std.testing.expectEqualStrings("prompt", blocks[0].content.user.items);
+    try std.testing.expectEqualStrings("round one", blocks[1].content.model.items);
     // The committed round holds the call, so the unfinished tool shows as failed.
-    try std.testing.expect(blocks[2].tool_result.is_error);
+    try std.testing.expect(blocks[2].content.tool_result.is_error);
     try std.testing.expectEqualStrings(
         "Tool: read\nError: " ++ ai.Agent.unfinished_tool_result,
-        blocks[2].tool_result.text.items,
+        blocks[2].content.tool_result.text.items,
     );
-    try std.testing.expect(blocks[3].event.is_error);
-    try std.testing.expectEqualStrings("boom", blocks[3].event.text.items);
+    try std.testing.expect(blocks[3].content.event.is_error);
+    try std.testing.expectEqualStrings("boom", blocks[3].content.event.text.items);
     try std.testing.expectEqualStrings("restore me", session.editor.visible());
     try std.testing.expect(session.turn_origin == null);
     try std.testing.expect(!session.hasSteering());
@@ -3173,7 +3176,7 @@ test "a cancel with nothing committed rewinds the tail and returns the prompt" {
     // Only the prior block survives the rewind.
     const blocks = session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 1), blocks.len);
-    try std.testing.expectEqualStrings("earlier", blocks[0].event.text.items);
+    try std.testing.expectEqualStrings("earlier", blocks[0].content.event.text.items);
     // The editor preserves chronological authorship order.
     try std.testing.expectEqualStrings("my prompt\n\nsteer\n\ntyping", session.editor.visible());
     try std.testing.expect(session.turn_origin == null);
@@ -3227,8 +3230,8 @@ test "a cancel with a committed round keeps it and drops the in-flight tail" {
     // The committed prompt and round stay. The in-flight message is gone.
     const blocks = session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 2), blocks.len);
-    try std.testing.expectEqualStrings("prompt", blocks[0].user.items);
-    try std.testing.expectEqualStrings("round one", blocks[1].model.items);
+    try std.testing.expectEqualStrings("prompt", blocks[0].content.user.items);
+    try std.testing.expectEqualStrings("round one", blocks[1].content.model.items);
     try std.testing.expectEqualStrings("", session.editor.visible());
     try std.testing.expect(session.turn_origin == null);
 }
@@ -3274,15 +3277,18 @@ test "a cancel during a tool call keeps the call and shows it as failed" {
 
     const blocks = session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 4), blocks.len);
-    try std.testing.expectEqualStrings("prompt", blocks[0].user.items);
-    try std.testing.expectEqualStrings("I run one command.", blocks[1].thinking.text.items);
-    try std.testing.expect(blocks[2].tool_result.is_error);
+    try std.testing.expectEqualStrings("prompt", blocks[0].content.user.items);
+    try std.testing.expectEqualStrings("I run one command.", blocks[1].content.thinking.text.items);
+    try std.testing.expect(blocks[2].content.tool_result.is_error);
     try std.testing.expectEqualStrings(
         "Tool: bash · Command: sleep 600\nError: " ++ ai.Agent.unfinished_tool_result,
-        blocks[2].tool_result.text.items,
+        blocks[2].content.tool_result.text.items,
     );
-    try std.testing.expect(!blocks[3].event.is_error);
-    try std.testing.expectEqualStrings("You canceled the turn.", blocks[3].event.text.items);
+    try std.testing.expect(!blocks[3].content.event.is_error);
+    try std.testing.expectEqualStrings(
+        "You canceled the turn.",
+        blocks[3].content.event.text.items,
+    );
     try std.testing.expect(session.mode == .prompt);
 }
 
@@ -3326,7 +3332,11 @@ test "running tool calls fail oldest first" {
             index,
         });
         defer gpa.free(head);
-        try std.testing.expect(std.mem.startsWith(u8, blocks[index].tool_result.text.items, head));
+        try std.testing.expect(std.mem.startsWith(
+            u8,
+            blocks[index].content.tool_result.text.items,
+            head,
+        ));
     }
 }
 
@@ -3358,11 +3368,18 @@ test "a finished tool block survives a cancel in the same round" {
 
     const blocks = session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 4), blocks.len);
-    try std.testing.expect(!blocks[2].tool_result.is_error);
+    try std.testing.expect(!blocks[2].content.tool_result.is_error);
     try std.testing.expect(
-        std.mem.endsWith(u8, blocks[2].tool_result.text.items, "\nTime: 0ms · Exit code: 0"),
+        std.mem.endsWith(
+            u8,
+            blocks[2].content.tool_result.text.items,
+            "\nTime: 0ms · Exit code: 0",
+        ),
     );
-    try std.testing.expectEqualStrings("You canceled the turn.", blocks[3].event.text.items);
+    try std.testing.expectEqualStrings(
+        "You canceled the turn.",
+        blocks[3].content.event.text.items,
+    );
 }
 
 // The failure path takes that frontier from the worker's terminal fence instead.
@@ -3396,11 +3413,15 @@ test "a finished tool block survives a failure in the same round" {
 
     const blocks = session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 4), blocks.len);
-    try std.testing.expect(!blocks[2].tool_result.is_error);
+    try std.testing.expect(!blocks[2].content.tool_result.is_error);
     try std.testing.expect(
-        std.mem.endsWith(u8, blocks[2].tool_result.text.items, "\nTime: 0ms · Exit code: 0"),
+        std.mem.endsWith(
+            u8,
+            blocks[2].content.tool_result.text.items,
+            "\nTime: 0ms · Exit code: 0",
+        ),
     );
-    try std.testing.expectEqualStrings("boom", blocks[3].event.text.items);
+    try std.testing.expectEqualStrings("boom", blocks[3].content.event.text.items);
 }
 
 test "a final commit frontier keeps an open reply when no later event carries it" {
@@ -3430,7 +3451,7 @@ test "a final commit frontier keeps an open reply when no later event carries it
 
     const blocks = session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 2), blocks.len);
-    try std.testing.expectEqualStrings("committed answer", blocks[1].model.items);
+    try std.testing.expectEqualStrings("committed answer", blocks[1].content.model.items);
 }
 
 test "a partial cancel removes consumed steering beyond the commit frontier" {
@@ -3485,7 +3506,7 @@ test "a partial cancel removes consumed steering beyond the commit frontier" {
 
     const blocks = session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 2), blocks.len);
-    try std.testing.expectEqualStrings("committed answer", blocks[1].model.items);
+    try std.testing.expectEqualStrings("committed answer", blocks[1].content.model.items);
     try std.testing.expectEqualStrings("restore me", session.editor.visible());
 }
 
@@ -3511,7 +3532,7 @@ test "a delivered skill shows as a head line, not as a user box" {
 
     const blocks = session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 1), blocks.len);
-    switch (blocks[0]) {
+    switch (blocks[0].content) {
         .user_note => |head| try std.testing.expectEqualStrings(
             "Skill: zig-style · File: .agents/skills/zig-style/SKILL.md",
             head.items,
@@ -3856,6 +3877,9 @@ test "an effort level that replays no reasoning hides it" {
     defer gpa.free(silent);
     try std.testing.expect(std.mem.indexOf(u8, silent, "weigh it") == null);
     try std.testing.expect(std.mem.indexOf(u8, silent, "the answer") != null);
+    // A hidden block paints nothing, so it retains no rows either.
+    const reasoning = &session.transcript.blocks()[0];
+    try std.testing.expectEqual(@as(usize, 0), reasoning.cache.lines.count());
 
     // The level returns the block, because the proof stayed in the record.
     const restored_start = out.written().len;
@@ -3863,6 +3887,7 @@ test "an effort level that replays no reasoning hides it" {
     try std.testing.expect(session.view.force_reset);
     try session.paint(.{ .columns = 80, .rows = 24 });
     try expectPainted(gpa, out.written()[restored_start..], "weigh it");
+    try std.testing.expect(reasoning.cache.lines.count() > 0);
 }
 
 // A deep repaint costs the user the scrollback, so only a change that changes the
@@ -3898,7 +3923,7 @@ test "a setup change that hides no block keeps the scrollback" {
     // row of it. Its projection is what the next frame shows.
     const projected = try session.transcript.projection(session.projectionSetup());
     try std.testing.expectEqual(@as(usize, 2), projected.len);
-    try std.testing.expectEqualStrings("weigh it", projected[1].thinking.text.items);
+    try std.testing.expectEqualStrings("weigh it", projected[1].content.thinking.text.items);
 }
 
 // A credential replacement can put another principal in one account slot. The

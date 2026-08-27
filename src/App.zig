@@ -4952,7 +4952,10 @@ test "cancel does not commit stale text across a reset held in the current batch
     try std.testing.expect(app.session.mode == .prompt);
     const blocks = app.session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 1), blocks.len);
-    try std.testing.expectEqualStrings("You canceled the turn.", blocks[0].event.text.items);
+    try std.testing.expectEqualStrings(
+        "You canceled the turn.",
+        blocks[0].content.event.text.items,
+    );
 }
 
 // Cancellation can join a worker before the consumer reaches progress that the
@@ -5013,8 +5016,8 @@ test "cancel preserves progress before a queued terminal fence" {
     try std.testing.expectEqual(@as(usize, 0), app.session.steering.items.len);
     const blocks = app.session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 2), blocks.len);
-    try std.testing.expectEqualStrings("answer", blocks[0].model.items);
-    try std.testing.expectEqualStrings("folded", blocks[1].user.items);
+    try std.testing.expectEqualStrings("answer", blocks[0].content.model.items);
+    try std.testing.expectEqualStrings("folded", blocks[1].content.user.items);
 }
 
 // The same ordering holds when cancellation interrupts the worker's terminal
@@ -5073,8 +5076,8 @@ test "cancel replaces an interrupted terminal fence after queued progress" {
     try std.testing.expect(app.pending_turn_result.?.terminal_queued);
     const prefix = app.session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 2), prefix.len);
-    try std.testing.expectEqualStrings("answer", prefix[0].model.items);
-    try std.testing.expectEqualStrings("folded", prefix[1].user.items);
+    try std.testing.expectEqualStrings("answer", prefix[0].content.model.items);
+    try std.testing.expectEqualStrings("folded", prefix[1].content.user.items);
 
     var fence: [1]Session.UiEvent = undefined;
     const count = try app.queue.get(io, &fence, 1);
@@ -5145,7 +5148,10 @@ test "an interrupted terminal fence retries after a full queue drain" {
 
     try std.testing.expect(app.session.mode == .prompt);
     try std.testing.expect(app.pending_turn_result == null);
-    try std.testing.expectEqualStrings("answer", app.session.transcript.blocks()[0].model.items);
+    try std.testing.expectEqualStrings(
+        "answer",
+        app.session.transcript.blocks()[0].content.model.items,
+    );
 }
 
 // A cancel that loses to a failed worker applies the authoritative joined
@@ -5201,7 +5207,7 @@ test "a cancel that loses the race applies the failed joined result" {
     try std.testing.expectEqual(@as(usize, 0), remaining_steering.len);
     const blocks = app.session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 1), blocks.len);
-    try std.testing.expectEqualStrings("boom", blocks[0].event.text.items);
+    try std.testing.expectEqualStrings("boom", blocks[0].content.event.text.items);
     try app.session.paint(.{ .columns = 80, .rows = 24 });
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "boom") != null);
 }
@@ -5618,7 +5624,10 @@ test "a drained batch routes only the active turn generation" {
 
     try std.testing.expect(!app.session.animating());
     try std.testing.expectEqual(@as(usize, 3), app.session.transcript.blocks().len);
-    try std.testing.expectEqualStrings("turn B", app.session.transcript.blocks()[2].model.items);
+    try std.testing.expectEqualStrings(
+        "turn B",
+        app.session.transcript.blocks()[2].content.model.items,
+    );
 }
 
 // A resize marks the model dirty with no tick, so even an idle interface
@@ -5902,7 +5911,10 @@ test "/new clears the conversation and the scrollback without a configuration ch
     try std.testing.expectEqual(@as(usize, 0), steering.len);
     // The intro line returns, so the empty conversation shows its legend again.
     try std.testing.expectEqual(@as(usize, 1), app.session.transcript.blocks().len);
-    try std.testing.expectEqualStrings(intro_text, app.session.transcript.blocks()[0].intro.items);
+    try std.testing.expectEqualStrings(
+        intro_text,
+        app.session.transcript.blocks()[0].content.intro.items,
+    );
     try std.testing.expect(std.meta.eql(ai.Agent.Stats{}, app.session.stats_shown));
     try std.testing.expect(!app.session.hasSteering());
     try std.testing.expectEqualStrings("", app.session.editor.visible());
@@ -5970,7 +5982,7 @@ test "switchConversation swaps the agent and the interface together, and restore
     try std.testing.expectEqual(@as(usize, 1), app.session.transcript.blocks().len);
     try std.testing.expectEqualStrings(
         "role b prompt",
-        app.session.transcript.blocks()[0].user.items,
+        app.session.transcript.blocks()[0].content.user.items,
     );
     try std.testing.expectEqual(@as(f64, 1), app.session.stats_shown.cost);
 
@@ -5988,7 +6000,7 @@ test "switchConversation swaps the agent and the interface together, and restore
     try std.testing.expectEqual(@as(usize, 1), app.session.transcript.blocks().len);
     try std.testing.expectEqualStrings(
         "role a prompt",
-        app.session.transcript.blocks()[0].user.items,
+        app.session.transcript.blocks()[0].content.user.items,
     );
     try std.testing.expectEqual(@as(f64, 2.5), app.session.stats_shown.cost);
 }
@@ -6525,7 +6537,7 @@ test "the logout of the last account signs out and opens the login picker" {
     // The event names the way back in, and the picker it names is open.
     try std.testing.expectEqualStrings(
         "Drinky signed out of Anthropic Subscription. Select an account to sign in.",
-        app.session.transcript.blocks()[0].event.text.items,
+        app.session.transcript.blocks()[0].content.event.text.items,
     );
     try std.testing.expect(app.session.mode == .picking);
     const picker = app.session.mode.picking.picker;
@@ -6595,10 +6607,10 @@ test "a principal replacement drops old evidence before the restored turn" {
     try std.testing.expect(app.session.mode == .prompt);
     const blocks = app.session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 1), blocks.len);
-    try std.testing.expect(blocks[0].event.is_error);
+    try std.testing.expect(blocks[0].content.event.is_error);
     try std.testing.expect(std.mem.indexOf(
         u8,
-        blocks[0].event.text.items,
+        blocks[0].content.event.text.items,
         "Try the turn again.",
     ) != null);
 }
@@ -6692,16 +6704,20 @@ test "token request failures keep the credential before a grant rejection remove
 
     const blocks = app.session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 4), blocks.len);
-    try std.testing.expect(blocks[2].event.is_error);
+    try std.testing.expect(blocks[2].content.event.is_error);
     try std.testing.expect(std.mem.indexOf(
         u8,
-        blocks[2].event.text.items,
+        blocks[2].content.event.text.items,
         "provider rejected",
     ) != null);
-    try std.testing.expect(std.mem.indexOf(u8, blocks[2].event.text.items, "/login") == null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        blocks[2].content.event.text.items,
+        "/login",
+    ) == null);
     try std.testing.expectEqualStrings(
         "Drinky signed out of Anthropic Subscription. Select an account to sign in.",
-        blocks[3].event.text.items,
+        blocks[3].content.event.text.items,
     );
     try std.testing.expect(app.session.mode == .picking);
     try std.testing.expectEqualStrings(
@@ -6800,11 +6816,15 @@ test "a replacement saved before invalidation keeps the account active" {
     // two events are all that stands.
     const blocks = app.session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 2), blocks.len);
-    try std.testing.expect(std.mem.indexOf(u8, blocks[0].event.text.items, "signed out") == null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        blocks[0].content.event.text.items,
+        "signed out",
+    ) == null);
     try std.testing.expectEqualStrings(
         "Drinky reloaded the refresh credential that another Drinky instance saved. " ++
             "Try the turn again.",
-        blocks[1].event.text.items,
+        blocks[1].content.event.text.items,
     );
 }
 
@@ -6862,11 +6882,15 @@ test "a rejected refresh credential hands the session to another account" {
 
     const blocks = app.session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 2), blocks.len);
-    try std.testing.expect(std.mem.indexOf(u8, blocks[0].event.text.items, "/login") == null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        blocks[0].content.event.text.items,
+        "/login",
+    ) == null);
     try std.testing.expectEqualStrings(
         "Drinky signed out of Anthropic Subscription. " ++
             "Drinky now uses gpt-5.6-sol with OpenAI API.",
-        blocks[1].event.text.items,
+        blocks[1].content.event.text.items,
     );
 }
 
@@ -6895,14 +6919,14 @@ test "an invoked skill sends a head that no box holds, and its task in a box" {
     // one part of the pair that the user cannot forge.
     const blocks = app.session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 2), blocks.len);
-    switch (blocks[0]) {
+    switch (blocks[0].content) {
         .user_note => |head| try std.testing.expectEqualStrings(
             "Skill: zig-style · File: .agents/skills/zig-style/SKILL.md",
             head.items,
         ),
         else => return error.ExpectedSkill,
     }
-    switch (blocks[1]) {
+    switch (blocks[1].content) {
         .user => |message| try std.testing.expectEqualStrings("review this file", message.items),
         else => return error.ExpectedUser,
     }
@@ -6941,7 +6965,7 @@ test "an invoked skill with no task sends its head alone" {
 
     const blocks = app.session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 1), blocks.len);
-    switch (blocks[0]) {
+    switch (blocks[0].content) {
         .user_note => |head| try std.testing.expectEqualStrings(
             "Skill: interview · File: ~/.agents/skills/interview/SKILL.md",
             head.items,
@@ -7086,7 +7110,7 @@ test "an uncommitted human failure returns to the editor and arms no retry" {
     try std.testing.expect(!app.session.retry_shown);
     const blocks = app.session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 1), blocks.len);
-    try std.testing.expect(blocks[0].event.is_error);
+    try std.testing.expect(blocks[0].content.event.is_error);
 }
 
 // A skill line reproduces its own request, so an uncommitted failure returns the
@@ -7142,7 +7166,7 @@ test "an uncommitted skill failure returns its line and arms no retry" {
     // request that no history holds.
     const blocks = app.session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 1), blocks.len);
-    try std.testing.expect(blocks[0].event.is_error);
+    try std.testing.expect(blocks[0].content.event.is_error);
     // The restored line is still one command line, and its tail is the new task.
     try std.testing.expectEqualStrings(
         "skill:demo",
@@ -7191,7 +7215,7 @@ test "Ctrl+N sends the attempt and keeps the editor text" {
         // That kind alone paints the user color, which `ui.block` pins.
         const blocks = app.session.transcript.blocks();
         try std.testing.expectEqual(@as(usize, 1), blocks.len);
-        try std.testing.expectEqualStrings(Retry.note_text, blocks[0].user_note.items);
+        try std.testing.expectEqualStrings(Retry.note_text, blocks[0].content.user_note.items);
     }
 
     {
@@ -7206,7 +7230,7 @@ test "Ctrl+N sends the attempt and keeps the editor text" {
     try std.testing.expectEqualStrings("a draft that stays", app.session.editor.visible());
     const blocks = app.session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 1), blocks.len);
-    try std.testing.expect(blocks[0].event.is_error);
+    try std.testing.expect(blocks[0].content.event.is_error);
 }
 
 // A retry needs an account, so Ctrl+N names the sign-in and sends nothing. Without
@@ -7289,7 +7313,7 @@ test "Enter sends a plain message and drops the waiting retry" {
     {
         const blocks = app.session.transcript.blocks();
         try std.testing.expectEqual(@as(usize, 1), blocks.len);
-        try std.testing.expectEqualStrings("also check the tests", blocks[0].user.items);
+        try std.testing.expectEqualStrings("also check the tests", blocks[0].content.user.items);
     }
 
     {
@@ -7303,7 +7327,7 @@ test "Enter sends a plain message and drops the waiting retry" {
     try std.testing.expect(!app.session.retry_shown);
     const blocks = app.session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 1), blocks.len);
-    try std.testing.expect(blocks[0].event.is_error);
+    try std.testing.expect(blocks[0].content.event.is_error);
 }
 
 // A cancellation is the user's own stop, so it arms no retry. Esc during an attempt
@@ -7339,7 +7363,10 @@ test "canceling an attempt ends the recovery" {
     try std.testing.expect(!app.turn_retry);
     const blocks = app.session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 1), blocks.len);
-    try std.testing.expectEqualStrings("You canceled the turn.", blocks[0].event.text.items);
+    try std.testing.expectEqualStrings(
+        "You canceled the turn.",
+        blocks[0].content.event.text.items,
+    );
 }
 
 // A retry belongs to the conversation, not to one configuration: an account switch
@@ -7398,7 +7425,7 @@ test "a retry survives an account switch and Ctrl+N routes to it" {
     try std.testing.expect(!app.session.retry_shown);
     // The event of the account switch goes, and the intro line takes its place.
     try std.testing.expectEqual(@as(usize, 1), app.session.transcript.blocks().len);
-    try std.testing.expect(app.session.transcript.blocks()[0] == .intro);
+    try std.testing.expect(app.session.transcript.blocks()[0].content == .intro);
 }
 
 // A waiting retry restricts no command, because it owns no key but Ctrl+N. A
@@ -7458,10 +7485,10 @@ test "a skill line runs while a retry waits and takes the context with it" {
     try std.testing.expectEqual(@as(usize, 2), blocks.len);
     try std.testing.expect(std.mem.startsWith(
         u8,
-        blocks[0].user_note.items,
+        blocks[0].content.user_note.items,
         "Skill: demo · File:",
     ));
-    try std.testing.expectEqualStrings("apply it", blocks[1].user.items);
+    try std.testing.expectEqualStrings("apply it", blocks[1].content.user.items);
 
     const result = app.awaitTurnFuture().?;
     defer app.freeWorkerResult(&result);
@@ -7606,12 +7633,12 @@ test "a settled judge report restores the main conversation and records completi
     try std.testing.expectEqual(@as(usize, 2), blocks.len);
     // The parked main conversation returned whole, and the completion event
     // carries the counters without any model context.
-    try std.testing.expectEqualStrings("main marker", blocks[0].user.items);
+    try std.testing.expectEqualStrings("main marker", blocks[0].content.user.items);
     try std.testing.expectEqualStrings(
         "Review settled. Rounds: 1 · Fixer passes: 0 · Cost: $0.00",
-        blocks[1].event.text.items,
+        blocks[1].content.event.text.items,
     );
-    try std.testing.expect(!blocks[1].event.is_error);
+    try std.testing.expect(!blocks[1].content.event.is_error);
 }
 
 test "editor text brakes the workflow and Esc stops it with the text preserved" {
@@ -7663,10 +7690,10 @@ test "editor text brakes the workflow and Esc stops it with the text preserved" 
     try std.testing.expect(app.session.review_title == null);
     try std.testing.expect(app.running);
     const blocks = app.session.transcript.blocks();
-    try std.testing.expectEqualStrings("main marker", blocks[0].user.items);
+    try std.testing.expectEqualStrings("main marker", blocks[0].content.user.items);
     try std.testing.expectEqualStrings(
         "Review stopped at the judge. Rounds: 1 · Fixer passes: 0 · Cost: $0.00",
-        blocks[1].event.text.items,
+        blocks[1].content.event.text.items,
     );
     try std.testing.expectEqualStrings(
         "do not touch the config format",
@@ -7716,7 +7743,7 @@ test "a fix decision starts the fixer, a failed request resends, and Esc stops" 
         // the fixer view never shows the embedded judge report.
         const blocks = app.session.transcript.blocks();
         try std.testing.expectEqual(@as(usize, 1), blocks.len);
-        const note = blocks[0].user_note.items;
+        const note = blocks[0].content.user_note.items;
         try std.testing.expectEqualStrings("Request: Fixer · Round: 1 of 4 · Pass: 1", note);
     }
 
@@ -7744,10 +7771,10 @@ test "a fix decision starts the fixer, a failed request resends, and Esc stops" 
     try std.testing.expect(app.session.mode == .turn);
     {
         const blocks = app.session.transcript.blocks();
-        try std.testing.expect(blocks[0].event.is_error);
+        try std.testing.expect(blocks[0].content.event.is_error);
         try std.testing.expectEqualStrings(
             "Request: Fixer · Round: 1 of 4 · Pass: 1",
-            blocks[blocks.len - 1].user_note.items,
+            blocks[blocks.len - 1].content.user_note.items,
         );
     }
     {
@@ -7760,10 +7787,10 @@ test "a fix decision starts the fixer, a failed request resends, and Esc stops" 
     try app.handleKey(&.escape);
     try std.testing.expect(app.review == null);
     const blocks = app.session.transcript.blocks();
-    try std.testing.expectEqualStrings("main marker", blocks[0].user.items);
+    try std.testing.expectEqualStrings("main marker", blocks[0].content.user.items);
     try std.testing.expect(std.mem.indexOf(
         u8,
-        blocks[1].event.text.items,
+        blocks[1].content.event.text.items,
         "Review stopped at the fixer.",
     ) != null);
 }
@@ -8157,9 +8184,9 @@ test "empty-editor ctrl+d in a review turn quits without a completion event" {
     try std.testing.expect(!app.running);
     try std.testing.expect(app.review == null);
     for (app.session.transcript.blocks()) |block| {
-        if (block == .event) try std.testing.expect(std.mem.indexOf(
+        if (block.content == .event) try std.testing.expect(std.mem.indexOf(
             u8,
-            block.event.text.items,
+            block.content.event.text.items,
             "Review stopped",
         ) == null);
     }
@@ -8240,10 +8267,10 @@ test "a stop that loses the cancellation race ends the workflow" {
         try std.testing.expect(app.session.review_title == null);
         const blocks = app.session.transcript.blocks();
         try std.testing.expectEqual(@as(usize, 2), blocks.len);
-        try std.testing.expectEqualStrings("main marker", blocks[0].user.items);
+        try std.testing.expectEqualStrings("main marker", blocks[0].content.user.items);
         try std.testing.expectEqualStrings(
             "Review stopped at the judge. Rounds: 1 · Fixer passes: 0 · Cost: $0.00",
-            blocks[1].event.text.items,
+            blocks[1].content.event.text.items,
         );
     }
 }
@@ -8399,7 +8426,7 @@ test "a postponed correction request keeps its budget" {
         const blocks = app.session.transcript.blocks();
         try std.testing.expectEqualStrings(
             "Request: Judge correction · Round: 1 of 4",
-            blocks[blocks.len - 1].user_note.items,
+            blocks[blocks.len - 1].content.user_note.items,
         );
     }
     {
@@ -8461,7 +8488,7 @@ test "ctrl+n after an unmarked reviewer reply sends the correction" {
         const blocks = app.session.transcript.blocks();
         try std.testing.expectEqualStrings(
             "Request: Reviewer correction · Round: 1 of 4",
-            blocks[blocks.len - 1].user_note.items,
+            blocks[blocks.len - 1].content.user_note.items,
         );
     }
     {
@@ -8515,7 +8542,7 @@ test "a resent correction request records the correction head" {
         const blocks = app.session.transcript.blocks();
         try std.testing.expectEqualStrings(
             "Request: Judge correction · Round: 1 of 4",
-            blocks[blocks.len - 1].user_note.items,
+            blocks[blocks.len - 1].content.user_note.items,
         );
     }
 
@@ -8538,7 +8565,7 @@ test "a resent correction request records the correction head" {
         const blocks = app.session.transcript.blocks();
         try std.testing.expectEqualStrings(
             "Request: Judge correction · Round: 1 of 4",
-            blocks[blocks.len - 1].user_note.items,
+            blocks[blocks.len - 1].content.user_note.items,
         );
     }
     {
@@ -9821,8 +9848,8 @@ test "a transcript event survives later typing" {
 
     const blocks = app.session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 1), blocks.len);
-    try std.testing.expect(blocks[0].event.is_error);
-    try std.testing.expectEqualStrings("backend failed", blocks[0].event.text.items);
+    try std.testing.expect(blocks[0].content.event.is_error);
+    try std.testing.expectEqualStrings("backend failed", blocks[0].content.event.text.items);
 }
 
 /// The absolute path of `suffix` inside a test temporary directory.
@@ -9904,16 +9931,20 @@ test "the startup report counts the sources in one line and keeps a skip verbose
 
     const blocks = app.session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 2), blocks.len);
-    try std.testing.expect(!blocks[0].event.is_error);
+    try std.testing.expect(!blocks[0].content.event.is_error);
     // The count covers the two skills the scan kept, minus the one that disabled
     // model invocation, because `/system` never shows that one.
     try std.testing.expectEqualStrings(
         "Instructions: 2 user, 1 project · Skills: 1 (1 replaced)",
-        blocks[0].event.text.items,
+        blocks[0].content.event.text.items,
     );
     // A source that skipped something stays verbose, because the user must fix it.
-    try std.testing.expect(blocks[1].event.is_error);
-    try std.testing.expect(std.mem.indexOf(u8, blocks[1].event.text.items, "missing.md") != null);
+    try std.testing.expect(blocks[1].content.event.is_error);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        blocks[1].content.event.text.items,
+        "missing.md",
+    ) != null);
 }
 
 // A configured rule reaches the guard only through a discovered skill. A name
@@ -10015,10 +10046,10 @@ test "a configured required skill applies, and an unknown name reports" {
     });
     const blocks = app.session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 1), blocks.len);
-    try std.testing.expect(!blocks[0].event.is_error);
+    try std.testing.expect(!blocks[0].content.event.is_error);
     try std.testing.expectEqualStrings(
         "Skills: 1 (1 missing)",
-        blocks[0].event.text.items,
+        blocks[0].content.event.text.items,
     );
 }
 
@@ -10398,14 +10429,17 @@ test "a committed cancel drains queued progress into the transcript before rewin
     const blocks = app.session.transcript.blocks();
     // [user "prompt", model "answer", the read call and its box line, cancellation event]
     try std.testing.expectEqual(@as(usize, 4), blocks.len);
-    try std.testing.expectEqualStrings("prompt", blocks[0].user.items);
-    try std.testing.expectEqualStrings("answer", blocks[1].model.items);
+    try std.testing.expectEqualStrings("prompt", blocks[0].content.user.items);
+    try std.testing.expectEqualStrings("answer", blocks[1].content.model.items);
     try std.testing.expectEqualStrings(
         "Tool: read\nLines: 1",
-        blocks[2].tool_result.text.items,
+        blocks[2].content.tool_result.text.items,
     );
-    try std.testing.expect(!blocks[3].event.is_error);
-    try std.testing.expectEqualStrings("You canceled the turn.", blocks[3].event.text.items);
+    try std.testing.expect(!blocks[3].content.event.is_error);
+    try std.testing.expectEqualStrings(
+        "You canceled the turn.",
+        blocks[3].content.event.text.items,
+    );
     try std.testing.expectEqual(@as(f64, 2.5), app.session.stats_shown.cost);
 }
 

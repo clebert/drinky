@@ -21,11 +21,11 @@ const Transcript = @This();
 gpa: std.mem.Allocator,
 entries: std.ArrayList(ui.block.Entry),
 /// The blocks of the last `projection`, in screen order. Each paint rebuilds
-/// them, so the layout gets a `[]const *const ui.block.Entry` without a
-/// per-repaint allocation. A projection hides the blocks of another account, and
-/// a hidden block breaks a contiguous slice, so the list holds one pointer per
-/// shown block.
-projected: std.ArrayList(*const ui.block.Entry),
+/// them, so the layout gets a `[]const *ui.block.Entry` without a per-repaint
+/// allocation. A projection hides the blocks of another account, and a hidden
+/// block breaks a contiguous slice, so the list holds one pointer per shown
+/// block.
+projected: std.ArrayList(*ui.block.Entry),
 /// The index and kind of the current run's streamed block, so deltas of that
 /// kind append to it. Null when no run is open.
 current: ?struct { index: usize, kind: ui.block.Entry.Kind },
@@ -95,11 +95,7 @@ pub fn appendStream(
     if (delta.len == 0) return;
     if (self.current == null or self.current.?.kind != kind)
         self.current = .{ .index = try self.openRun(kind, account), .kind = kind };
-    switch (self.entries.items[self.current.?.index]) {
-        .model => |*list| try list.appendSlice(self.gpa, delta),
-        .thinking => |*reasoning| try reasoning.text.appendSlice(self.gpa, delta),
-        else => unreachable,
-    }
+    try self.entries.items[self.current.?.index].appendText(self.gpa, delta);
 }
 
 /// Open a streamed block of `kind` at the tail and return its index. Record it
@@ -173,11 +169,17 @@ pub fn shows(producer: ?ai.llm.Account, setup: Setup) bool {
 }
 
 /// The blocks `setup` shows, oldest first, for projection. Each paint rebuilds
-/// the list. The pointers stay valid until the blocks next change.
-pub fn projection(self: *Transcript, setup: Setup) ![]const *const ui.block.Entry {
+/// the list. The pointers stay valid until the blocks next change. A paint fills
+/// the cache of each block it shows, so the list reaches the blocks themselves.
+/// A hidden block paints nothing, so it releases the rows it retained.
+pub fn projection(self: *Transcript, setup: Setup) ![]const *ui.block.Entry {
     self.projected.clearRetainingCapacity();
     for (self.entries.items) |*entry| {
-        if (shows(entry.account(), setup)) try self.projected.append(self.gpa, entry);
+        if (shows(entry.account(), setup)) {
+            try self.projected.append(self.gpa, entry);
+        } else {
+            entry.release(self.gpa);
+        }
     }
     return self.projected.items;
 }
@@ -239,12 +241,12 @@ test "streamed deltas collect into one block until a discrete block ends the run
     try transcript.appendStream(.model, null, "hel");
     try transcript.appendStream(.model, null, "lo");
     try std.testing.expectEqual(@as(usize, 1), transcript.entries.items.len);
-    try std.testing.expectEqualStrings("hello", transcript.entries.items[0].model.items);
+    try std.testing.expectEqualStrings("hello", transcript.entries.items[0].content.model.items);
 
     try transcript.append(.user, .{}, "hi");
     try transcript.appendStream(.model, null, "more");
     try std.testing.expectEqual(@as(usize, 3), transcript.entries.items.len);
-    try std.testing.expectEqualStrings("more", transcript.entries.items[2].model.items);
+    try std.testing.expectEqualStrings("more", transcript.entries.items[2].content.model.items);
 }
 
 // Regression: a provider can stream a delta with no bytes. It used to open a
@@ -263,7 +265,7 @@ test "an empty delta opens no block and does not break a run" {
     try transcript.appendStream(.model, null, "");
     try transcript.appendStream(.model, null, "llo");
     try std.testing.expectEqual(@as(usize, 1), transcript.entries.items.len);
-    try std.testing.expectEqualStrings("hello", transcript.entries.items[0].model.items);
+    try std.testing.expectEqualStrings("hello", transcript.entries.items[0].content.model.items);
 }
 
 test "endMessage forces the next delta into a new block" {
@@ -291,7 +293,7 @@ test "discardMessage drops the open run so a retry starts clean" {
 
     try transcript.appendStream(.model, null, "fresh");
     try std.testing.expectEqual(@as(usize, 2), transcript.entries.items.len);
-    try std.testing.expectEqualStrings("fresh", transcript.entries.items[1].model.items);
+    try std.testing.expectEqualStrings("fresh", transcript.entries.items[1].content.model.items);
 
     // A no-op when no run is open.
     transcript.endMessage();
@@ -308,7 +310,7 @@ test "truncate removes optimistic tail blocks" {
     try transcript.append(.user, .{}, "rollback");
     transcript.truncate(1);
     try std.testing.expectEqual(@as(usize, 1), transcript.blocks().len);
-    try std.testing.expectEqualStrings("keep", transcript.blocks()[0].user.items);
+    try std.testing.expectEqualStrings("keep", transcript.blocks()[0].content.user.items);
 }
 
 test "rewind preserves only marked events after its checkpoint" {
@@ -325,8 +327,11 @@ test "rewind preserves only marked events after its checkpoint" {
 
     const entries = transcript.blocks();
     try std.testing.expectEqual(@as(usize, 2), entries.len);
-    try std.testing.expectEqualStrings("keep before checkpoint", entries[0].event.text.items);
-    try std.testing.expectEqualStrings("keep retry", entries[1].event.text.items);
+    try std.testing.expectEqualStrings(
+        "keep before checkpoint",
+        entries[0].content.event.text.items,
+    );
+    try std.testing.expectEqualStrings("keep retry", entries[1].content.event.text.items);
 }
 
 test "reasoning collects into a thinking block that the answer run does not extend" {
@@ -338,8 +343,9 @@ test "reasoning collects into a thinking block that the answer run does not exte
     try transcript.appendStream(.thinking, test_account, "it");
     try transcript.appendStream(.model, null, "answer");
     try std.testing.expectEqual(@as(usize, 2), transcript.entries.items.len);
-    try std.testing.expectEqualStrings("weigh it", transcript.entries.items[0].thinking.text.items);
-    try std.testing.expectEqualStrings("answer", transcript.entries.items[1].model.items);
+    const reasoning = transcript.entries.items[0].content.thinking;
+    try std.testing.expectEqualStrings("weigh it", reasoning.text.items);
+    try std.testing.expectEqualStrings("answer", transcript.entries.items[1].content.model.items);
 }
 
 test "discard drops a partial message's reasoning and answer together" {
@@ -357,7 +363,8 @@ test "discard drops a partial message's reasoning and answer together" {
 
     try transcript.appendStream(.thinking, test_account, "fresh");
     try std.testing.expectEqual(@as(usize, 2), transcript.entries.items.len);
-    try std.testing.expectEqualStrings("fresh", transcript.entries.items[1].thinking.text.items);
+    const reasoning = transcript.entries.items[1].content.thinking;
+    try std.testing.expectEqualStrings("fresh", reasoning.text.items);
 }
 
 // One canonical record, one projection per account. A provider replays stored
@@ -374,12 +381,12 @@ test "a projection holds the reasoning of its own account alone" {
 
     const own = try transcript.projection(replaying(test_account));
     try std.testing.expectEqual(@as(usize, 3), own.len);
-    try std.testing.expectEqualStrings("weigh it", own[1].thinking.text.items);
+    try std.testing.expectEqualStrings("weigh it", own[1].content.thinking.text.items);
 
     const other = try transcript.projection(replaying(other_account));
     try std.testing.expectEqual(@as(usize, 2), other.len);
-    try std.testing.expect(other[0].* == .event);
-    try std.testing.expectEqualStrings("answer", other[1].model.items);
+    try std.testing.expect(other[0].content == .event);
+    try std.testing.expectEqualStrings("answer", other[1].content.model.items);
 
     // The hidden block stays in the canonical record and returns with its
     // account.
@@ -405,7 +412,7 @@ test "a projection hides its own reasoning when the request replays none" {
 
     const shown_blocks = try transcript.projection(silent(test_account));
     try std.testing.expectEqual(@as(usize, 1), shown_blocks.len);
-    try std.testing.expectEqualStrings("answer", shown_blocks[0].model.items);
+    try std.testing.expectEqualStrings("answer", shown_blocks[0].content.model.items);
     // The block waits for a setup that carries it again.
     try std.testing.expectEqual(@as(usize, 2), transcript.blocks().len);
     const replayed = try transcript.projection(replaying(test_account));
@@ -450,8 +457,9 @@ test "dropAccount removes the reasoning of one account for good" {
 
     try std.testing.expect(transcript.dropAccount(test_account));
     try std.testing.expectEqual(@as(usize, 2), transcript.blocks().len);
-    try std.testing.expectEqualStrings("answer", transcript.blocks()[0].model.items);
-    try std.testing.expectEqualStrings("another slot", transcript.blocks()[1].thinking.text.items);
+    try std.testing.expectEqualStrings("answer", transcript.blocks()[0].content.model.items);
+    const reasoning = transcript.blocks()[1].content.thinking;
+    try std.testing.expectEqualStrings("another slot", reasoning.text.items);
     // The removal is permanent, so the projection of that account holds no
     // reasoning either.
     const own = try transcript.projection(replaying(test_account));

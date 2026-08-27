@@ -1,9 +1,15 @@
-//! The transcript-block model. `Entry` is a tagged union that carries exactly
-//! each block's data: the plain blocks a byte buffer, the flagged ones a buffer
-//! plus an error flag, the reasoning one a buffer plus the account that produced
-//! it. It owns its bytes (`init`/`deinit`), measures itself (`rows`), and paints
-//! itself (`render`) with the shared `paint` primitives. The model block grows in
-//! place as its reply streams, and its markdown renders as it goes.
+//! The transcript-block model. `Entry.Content` is a tagged union that carries
+//! exactly each block's data: the plain blocks a byte buffer, the flagged ones a
+//! buffer plus an error flag, the reasoning one a buffer plus the account that
+//! produced it. A block owns its bytes (`init`/`deinit`), measures itself
+//! (`rows`), and paints itself (`render`) with the shared `paint` primitives. The
+//! model block grows in place as its reply streams, and its markdown renders as
+//! it goes.
+//!
+//! Each block also retains the rows of its last paint. A frame replays those
+//! rows and runs the markdown of the blocks that changed alone. A block is
+//! append-only, so `appendText` drops the rows of the streaming tail and every
+//! block above it retains its own.
 
 const std = @import("std");
 
@@ -15,17 +21,23 @@ const markdown = @import("markdown.zig");
 const paint = @import("paint.zig");
 const role = @import("role.zig");
 
-pub const Entry = union(enum) {
-    intro: std.ArrayList(u8),
-    user: std.ArrayList(u8),
-    /// A line that reports a message that Drinky wrote for the user. The head of
-    /// a loaded skill and the line of a retry attempt read this way. It is not a
-    /// box, so a typed message cannot forge it.
-    user_note: std.ArrayList(u8),
-    thinking: Reasoning,
-    model: std.ArrayList(u8),
-    tool_result: Flagged,
-    event: Flagged,
+pub const Entry = struct {
+    content: Content,
+    /// The rows this block painted last, so the frames that follow replay them.
+    cache: Cache = .{},
+
+    pub const Content = union(enum) {
+        intro: std.ArrayList(u8),
+        user: std.ArrayList(u8),
+        /// A line that reports a message that Drinky wrote for the user. The
+        /// head of a loaded skill and the line of a retry attempt read this way.
+        /// It is not a box, so a typed message cannot forge it.
+        user_note: std.ArrayList(u8),
+        thinking: Reasoning,
+        model: std.ArrayList(u8),
+        tool_result: Flagged,
+        event: Flagged,
+    };
 
     pub const Flagged = struct {
         text: std.ArrayList(u8),
@@ -46,7 +58,7 @@ pub const Entry = union(enum) {
         text: std.ArrayList(u8),
         account: ?ai.llm.Account,
     };
-    pub const Kind = std.meta.Tag(Entry);
+    pub const Kind = std.meta.Tag(Content);
 
     /// What a block carries beyond its text. A variant that ignores a field
     /// takes its default, so a plain block states nothing.
@@ -67,6 +79,47 @@ pub const Entry = union(enum) {
         survives_rewind: bool = false,
     };
 
+    /// The composed rows of one block at one width. A frame that painted the
+    /// block whole retained them, and their count is the measure of the block.
+    /// A clipped block retains nothing, so the rows stay inside the window.
+    /// Every block paints at least one row, so an empty store means that no
+    /// frame retained one.
+    pub const Cache = struct {
+        /// The width the retained rows fit.
+        columns: usize = 0,
+        /// Every row the block paints at `columns`.
+        lines: terminal.View.Lines = .empty,
+
+        fn deinit(self: *Cache, gpa: std.mem.Allocator) void {
+            self.lines.deinit(gpa);
+        }
+
+        /// The rows retained for `columns`, or null when the cache holds none.
+        fn retained(self: *const Cache, columns: usize) ?*const terminal.View.Lines {
+            if (self.columns != columns or self.lines.count() == 0) return null;
+            return &self.lines;
+        }
+
+        /// Retain the rows that `sink` composed from `options.first_row` on.
+        /// They fit `options.columns`, so a frame at another width composes the
+        /// block again.
+        fn retain(
+            self: *Cache,
+            gpa: std.mem.Allocator,
+            sink: *const terminal.View.Sink,
+            options: struct { columns: usize, first_row: usize },
+        ) !void {
+            self.columns = options.columns;
+            self.lines.clearRetainingCapacity();
+            try sink.capture(gpa, options.first_row, &self.lines);
+        }
+
+        /// Drop the retained rows and hold their buffers for the next paint.
+        fn invalidate(self: *Cache) void {
+            self.lines.clearRetainingCapacity();
+        }
+    };
+
     /// A new block that owns a copy of `text`.
     pub fn init(
         gpa: std.mem.Allocator,
@@ -83,27 +136,45 @@ pub const Entry = union(enum) {
             .fit = options.fit,
             .survives_rewind = options.survives_rewind,
         };
-        return switch (kind) {
+        return .{ .content = switch (kind) {
             .tool_result => .{ .tool_result = flagged },
             .event => .{ .event = flagged },
             .thinking => .{ .thinking = .{ .text = list, .account = options.account } },
-            inline else => |tag| @unionInit(Entry, @tagName(tag), list),
-        };
+            inline else => |tag| @unionInit(Content, @tagName(tag), list),
+        } };
     }
 
     pub fn deinit(self: *Entry, gpa: std.mem.Allocator) void {
-        switch (self.*) {
+        switch (self.content) {
             .intro, .user, .user_note, .model => |*text| text.deinit(gpa),
             .thinking => |*reasoning| reasoning.text.deinit(gpa),
             .tool_result, .event => |*flagged| flagged.text.deinit(gpa),
         }
+        self.cache.deinit(gpa);
+    }
+
+    /// Append `delta` to the text of a streamed block, and drop the rows that
+    /// held the text before it. Only a block that a run streams accepts text.
+    pub fn appendText(self: *Entry, gpa: std.mem.Allocator, delta: []const u8) !void {
+        switch (self.content) {
+            .model => |*list| try list.appendSlice(gpa, delta),
+            .thinking => |*reasoning| try reasoning.text.appendSlice(gpa, delta),
+            .intro, .user, .user_note, .tool_result, .event => unreachable,
+        }
+        self.cache.invalidate();
+    }
+
+    /// Free the rows this block retains. A block that a frame does not paint
+    /// retains none, so the retained rows stay inside the window.
+    pub fn release(self: *Entry, gpa: std.mem.Allocator) void {
+        self.cache.lines.clear(gpa);
     }
 
     /// The account slot whose model context holds this block, or null for a
     /// local block that every account shows. Only stored reasoning binds to one
     /// account, because only that account replays its proof.
     pub fn account(self: *const Entry) ?ai.llm.Account {
-        return switch (self.*) {
+        return switch (self.content) {
             .thinking => |reasoning| reasoning.account,
             .intro, .user, .user_note, .model, .tool_result, .event => null,
         };
@@ -112,7 +183,7 @@ pub const Entry = union(enum) {
     /// Whether this event remains visible when an abnormal turn rewinds its
     /// model tail. Every other block follows the rewind checkpoint.
     pub fn survivesRewind(self: *const Entry) bool {
-        return switch (self.*) {
+        return switch (self.content) {
             .event => |event| event.survives_rewind,
             .intro, .user, .user_note, .thinking, .model, .tool_result => false,
         };
@@ -120,7 +191,7 @@ pub const Entry = union(enum) {
 
     /// The bytes this block holds.
     fn bytes(self: *const Entry) []const u8 {
-        return switch (self.*) {
+        return switch (self.content) {
             .intro, .user, .user_note, .model => |list| list.items,
             .thinking => |reasoning| reasoning.text.items,
             .tool_result, .event => |flagged| flagged.text.items,
@@ -131,7 +202,7 @@ pub const Entry = union(enum) {
     /// or markdown. The measure and the paint share it, so the rows a block
     /// counts cannot diverge from the rows it paints.
     fn notice(self: *const Entry) ?paint.Notice {
-        return switch (self.*) {
+        return switch (self.content) {
             .user_note => .{ .role = .user_note },
             // An error event wraps like every other event. The transcript is the
             // place where the whole sentence must stay readable.
@@ -154,7 +225,7 @@ pub const Entry = union(enum) {
     /// notice or markdown. A failed call takes the error color, so the state of
     /// a call decides the color of its box.
     fn boxRole(self: *const Entry) ?role.Name {
-        return switch (self.*) {
+        return switch (self.content) {
             .user => .user,
             .tool_result => |flagged| if (flagged.is_error) .tool_error else .tool_success,
             .intro, .user_note, .thinking, .model, .event => null,
@@ -163,10 +234,16 @@ pub const Entry = union(enum) {
 
     /// The physical rows this block wraps to at `columns`, its leading separator
     /// excluded. Must equal exactly what `render` emits: the parity the diff
-    /// and window math rely on.
+    /// and window math rely on. The rows of the last paint state that count, so
+    /// a block that painted whole at this width measures itself again for free.
     pub fn rows(self: *const Entry, columns: usize) usize {
+        if (self.cache.retained(columns)) |lines| return lines.count();
+        return self.measure(columns);
+    }
+
+    fn measure(self: *const Entry, columns: usize) usize {
         if (self.notice()) |look| return paint.noticeRows(&look, self.bytes(), columns);
-        return switch (self.*) {
+        return switch (self.content) {
             .intro => |list| introCaption(list.items).rows(columns),
             .user => |list| paint.boxRows(&.{ .text = list.items }, columns),
             .tool_result => |flagged| paint.boxRows(
@@ -180,11 +257,46 @@ pub const Entry = union(enum) {
     }
 
     /// Compose this block's rows through `placement` and drop its top `skip`
-    /// rows (nonzero only for the clip).
-    pub fn render(self: *const Entry, placement: *const paint.Placement) !void {
+    /// rows (nonzero only for the clip). The rows of the last paint at this
+    /// width replay as they are, so an unchanged block runs no markdown.
+    ///
+    /// A paint that composed the block whole retains its rows for the frames
+    /// that follow. A clipped block composes its visible rows alone and retains
+    /// none, so its hidden top never materializes and the retained rows stay
+    /// inside the window. Rows that Drinky cannot hold cost the frame nothing,
+    /// because the paint below already wrote every one of them.
+    pub fn render(
+        self: *Entry,
+        gpa: std.mem.Allocator,
+        placement: *const paint.Placement,
+    ) !void {
+        if (self.cache.retained(placement.columns)) |lines| return replay(placement, lines);
+        const first_row = placement.sink.composed();
+        try self.compose(placement);
+        if (placement.skip > 0) return;
+        self.cache.retain(gpa, placement.sink, .{
+            .columns = placement.columns,
+            .first_row = first_row,
+        }) catch self.cache.invalidate();
+    }
+
+    /// Compose the retained rows through `placement`, its clipped top dropped.
+    /// The rows carry the anchors of a fresh paint, so the diff of the frame
+    /// cannot tell the two apart.
+    fn replay(placement: *const paint.Placement, lines: *const terminal.View.Lines) !void {
+        for (0..lines.count()) |index| {
+            const line = placement.base + index;
+            if (line < placement.skip) continue;
+            placement.sink.begin();
+            try placement.sink.replay(lines, index);
+            placement.sink.end(.{ .id = placement.id, .line = line });
+        }
+    }
+
+    fn compose(self: *const Entry, placement: *const paint.Placement) !void {
         if (self.notice()) |look| return paint.notice(placement, &look, self.bytes());
         const box = self.boxRole();
-        switch (self.*) {
+        switch (self.content) {
             .user_note, .event => unreachable,
             .intro => |list| _ = try introCaption(list.items).render(placement),
             .user => |list| try paint.box(placement, box.?, &.{ .text = list.items }),
@@ -240,10 +352,10 @@ const markdown_reply =
     \\That is **it**.
 ;
 
-// Rows `entry` paints into a fresh view. The paint drops its top `skip`. Fresh
-// so the paint is a full reprint whose rows `paintedRows` can count. The window
-// is tall enough that only `skip` clips.
-fn renderedRows(gpa: std.mem.Allocator, entry: *const Entry, columns: usize, skip: usize) !usize {
+// The bytes `entry` paints into a fresh view. The paint drops its top `skip`.
+// Fresh so the paint is a full reprint whose rows `paintedRows` can count. The
+// window is tall enough that only `skip` clips. Caller-owned.
+fn rendered(gpa: std.mem.Allocator, entry: *Entry, columns: usize, skip: usize) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
     var view = terminal.View.init(gpa, &out.writer);
@@ -256,9 +368,16 @@ fn renderedRows(gpa: std.mem.Allocator, entry: *const Entry, columns: usize, ski
         .base = 0,
         .skip = skip,
     };
-    try entry.render(&placement);
+    try entry.render(gpa, &placement);
     try view.render();
-    return paintedRows(out.written());
+    return gpa.dupe(u8, out.written());
+}
+
+// Rows `entry` paints into a fresh view, through `rendered`.
+fn renderedRows(gpa: std.mem.Allocator, entry: *Entry, columns: usize, skip: usize) !usize {
+    const painted = try rendered(gpa, entry, columns, skip);
+    defer gpa.free(painted);
+    return paintedRows(painted);
 }
 
 // The parity contract: what `rows` counts is exactly what `render` emits. Here
@@ -304,8 +423,10 @@ test "each entry variant renders exactly the rows it counts" {
         var entry = try Entry.init(gpa, case.kind, case.options, case.text);
         defer entry.deinit(gpa);
         for (widths) |columns| {
-            const painted = try renderedRows(gpa, &entry, columns, 0);
-            try std.testing.expectEqual(entry.rows(columns), painted);
+            // The measure runs ahead of the paint, so it walks the content of
+            // the block and never reads the rows of the paint before it.
+            const counted = entry.rows(columns);
+            try std.testing.expectEqual(counted, try renderedRows(gpa, &entry, columns, 0));
         }
     }
 }
@@ -336,8 +457,8 @@ test "no box carries a pad, so a copy of the rows lines up" {
     var second = placement;
     second.id = 1;
     second.base = user.rows(columns);
-    try user.render(&placement);
-    try thinking.render(&second);
+    try user.render(gpa, &placement);
+    try thinking.render(gpa, &second);
     try view.render();
 
     // Every row opens on its own first character.
@@ -371,7 +492,13 @@ test "a tool box wraps a sentence and cuts a line of measures" {
     var view = terminal.View.init(gpa, &out.writer);
     defer view.deinit();
     const sink = try view.beginFrame(.{ .columns = columns, .rows = 24 }, 8);
-    try wrapped.render(&.{ .sink = sink, .id = 0, .columns = columns, .base = 0, .skip = 0 });
+    try wrapped.render(gpa, &.{
+        .sink = sink,
+        .id = 0,
+        .columns = columns,
+        .base = 0,
+        .skip = 0,
+    });
     try view.render();
     // The tail of the sentence reaches the interface, and no row cut it.
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "around it.") != null);
@@ -397,10 +524,67 @@ test "a clipped block shows its bottom rows" {
     const gpa = std.testing.allocator;
     var text = try numberedLines(gpa, 40);
     defer text.deinit(gpa);
-    const entry: Entry = .{ .model = text };
+    var entry: Entry = .{ .content = .{ .model = text } };
+    defer entry.cache.deinit(gpa);
     const columns = 20;
     try std.testing.expectEqual(@as(usize, 40), entry.rows(columns));
     try std.testing.expectEqual(@as(usize, 15), try renderedRows(gpa, &entry, columns, 25));
+}
+
+// A block that painted whole retains its rows, so every frame that follows runs
+// no markdown for it. The replay must paint exactly the bytes of that first
+// paint, and a change of the text or of the width must reach the screen.
+test "a block replays its rows until its text or its width changes" {
+    const gpa = std.testing.allocator;
+    var entry = try Entry.init(gpa, .model, .{}, markdown_reply);
+    defer entry.deinit(gpa);
+
+    const columns = 24;
+    const first = try rendered(gpa, &entry, columns, 0);
+    defer gpa.free(first);
+    try std.testing.expectEqual(entry.cache.lines.count(), entry.rows(columns));
+    try std.testing.expect(entry.cache.lines.count() > 0);
+
+    const replayed = try rendered(gpa, &entry, columns, 0);
+    defer gpa.free(replayed);
+    try std.testing.expectEqualStrings(first, replayed);
+
+    // Another width composes the block again, and its rows replace the old ones.
+    const narrow = try rendered(gpa, &entry, 16, 0);
+    defer gpa.free(narrow);
+    try std.testing.expect(!std.mem.eql(u8, first, narrow));
+    try std.testing.expectEqual(@as(usize, 16), entry.cache.columns);
+
+    // Streamed text drops the retained rows, so the next paint carries it.
+    try entry.appendText(gpa, "\n\nEpilogue\n");
+    try std.testing.expectEqual(@as(usize, 0), entry.cache.lines.count());
+    const grown = try rendered(gpa, &entry, 16, 0);
+    defer gpa.free(grown);
+    try std.testing.expect(std.mem.indexOf(u8, grown, "Epilogue") != null);
+    try std.testing.expectEqual(entry.cache.lines.count(), entry.rows(16));
+}
+
+// A clip reads the retained rows the way the paint does: it drops the same top
+// rows and shows the same tail. A clipped paint retains no rows, because the
+// window holds no whole block then.
+test "a replayed block drops the rows that the clip hides" {
+    const gpa = std.testing.allocator;
+    var text = try numberedLines(gpa, 40);
+    defer text.deinit(gpa);
+    const columns = 20;
+
+    var fresh: Entry = .{ .content = .{ .model = text } };
+    defer fresh.cache.deinit(gpa);
+    const composed = try rendered(gpa, &fresh, columns, 25);
+    defer gpa.free(composed);
+    try std.testing.expectEqual(@as(usize, 0), fresh.cache.lines.count());
+
+    var kept: Entry = .{ .content = .{ .model = text } };
+    defer kept.cache.deinit(gpa);
+    gpa.free(try rendered(gpa, &kept, columns, 0));
+    const clipped = try rendered(gpa, &kept, columns, 25);
+    defer gpa.free(clipped);
+    try std.testing.expectEqualStrings(composed, clipped);
 }
 
 /// One pinned block, and the role it paints as a notice or as a box. A caption
@@ -472,7 +656,7 @@ test "the intro block paints the Drinky caption" {
         .base = 0,
         .skip = 0,
     };
-    try intro.render(&placement);
+    try intro.render(gpa, &placement);
     try view.render();
 
     const painted = out.written();
@@ -508,8 +692,8 @@ test "an error event paints the error role and its prefix" {
     };
     var second = placement;
     second.id = 1;
-    try failure.render(&placement);
-    try success.render(&second);
+    try failure.render(gpa, &placement);
+    try success.render(gpa, &second);
     try view.render();
 
     const painted = out.written();
@@ -536,7 +720,8 @@ test "a clipped block streams into a warmed frame without allocating" {
     defer text.deinit(std.testing.allocator);
     try text.append(std.testing.allocator, '\n');
     try text.appendSlice(std.testing.allocator, markdown_reply);
-    const entry: Entry = .{ .model = text };
+    var entry: Entry = .{ .content = .{ .model = text } };
+    defer entry.cache.deinit(gpa);
     const columns = 20;
 
     // Warm both frames and the output at the block's full size.
@@ -549,9 +734,12 @@ test "a clipped block streams into a warmed frame without allocating" {
             .base = 0,
             .skip = 0,
         };
-        try entry.render(&placement);
+        try entry.render(gpa, &placement);
         try view.render();
     }
+    // The window holds no whole block here, so the block retains no rows. The
+    // clipped paint below then runs the renderer, not a replay.
+    entry.release(gpa);
     // Drop the accumulated output so the arm measures only the clipped render.
     // Its bytes fit the buffer the full-size warm already grew.
     out.clearRetainingCapacity();
@@ -568,7 +756,7 @@ test "a clipped block streams into a warmed frame without allocating" {
         .base = 0,
         .skip = 30,
     };
-    try entry.render(&placement);
+    try entry.render(gpa, &placement);
     try view.render();
 
     // The paint emits only the visible rows. The clipped top never materializes.

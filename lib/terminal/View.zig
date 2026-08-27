@@ -86,8 +86,58 @@ pub const Anchor = struct {
 
 /// One complete physical line, fitted to at most the terminal width. An offset
 /// into the frame's `blob`, not a slice: `blob` grows during composition and
-/// can reallocate, which dangles a slice. An offset survives.
-const Row = struct { offset: usize, len: usize, anchor: Anchor };
+/// can reallocate, which dangles a slice. An offset survives. `columns` holds
+/// the display columns the row took, so a capture can restore them.
+const Row = struct { offset: usize, len: usize, columns: usize, anchor: Anchor };
+
+/// Rows that one frame composed, retained for the frames that follow. A producer
+/// captures the rows of a component once and replays them while the content and
+/// the width behind them hold, so no later frame composes that component again.
+/// Only a `Sink` fills a store, so every byte in it passed the checks of the
+/// composition that wrote it.
+pub const Lines = struct {
+    blob: std.ArrayList(u8),
+    spans: std.ArrayList(Span),
+
+    /// One captured row: its bytes in `blob`, and the display columns it took.
+    const Span = struct { offset: usize, len: usize, columns: usize };
+
+    pub const empty: Lines = .{ .blob = .empty, .spans = .empty };
+
+    pub fn deinit(self: *Lines, gpa: std.mem.Allocator) void {
+        self.blob.deinit(gpa);
+        self.spans.deinit(gpa);
+    }
+
+    /// Drop every row and free the buffers that held them.
+    pub fn clear(self: *Lines, gpa: std.mem.Allocator) void {
+        self.blob.clearAndFree(gpa);
+        self.spans.clearAndFree(gpa);
+    }
+
+    /// Drop every row and keep the buffers for the next capture.
+    pub fn clearRetainingCapacity(self: *Lines) void {
+        self.blob.clearRetainingCapacity();
+        self.spans.clearRetainingCapacity();
+    }
+
+    /// The rows this store holds.
+    pub fn count(self: *const Lines) usize {
+        return self.spans.items.len;
+    }
+
+    fn append(self: *Lines, gpa: std.mem.Allocator, row: []const u8, columns: usize) !void {
+        const offset = self.blob.items.len;
+        try self.blob.appendSlice(gpa, row);
+        errdefer self.blob.shrinkRetainingCapacity(offset);
+        try self.spans.append(gpa, .{ .offset = offset, .len = row.len, .columns = columns });
+    }
+
+    fn bytes(self: *const Lines, index: usize) []const u8 {
+        const span = self.spans.items[index];
+        return self.blob.items[span.offset..][0..span.len];
+    }
+};
 
 /// Hardware cursor position after a repaint: a display `column` on window-relative
 /// `row` (a producer reports it relative to its own rows, and the assembler
@@ -97,7 +147,9 @@ pub const Caret = struct { row: usize, column: usize };
 /// Composes rows directly into the back frame's `blob`. The caller opens a row
 /// with `begin` and writes inert display content through `text` and application
 /// styling through `sgr`. An optional `setCaret` marks the caret, and `end`
-/// closes the row. The sink never exposes the underlying writer. The one piece
+/// closes the row. A caller can `capture` the rows it composed into a `Lines`
+/// store and `replay` them into a later frame, so an unchanged component
+/// composes once. The sink never exposes the underlying writer. The one piece
 /// of runtime content that reaches the trusted terminal-control channel is the
 /// hyperlink URL, which `linkable` clears before `linkSet` writes any.
 pub const Sink = struct {
@@ -227,9 +279,43 @@ pub const Sink = struct {
         // row: a visible glitch, not an out-of-bounds write.
         std.debug.assert(self.frame.rows.items.len < self.rows_max);
         if (self.frame.rows.items.len == self.rows_max) return;
-        self.frame.rows.appendAssumeCapacity(
-            .{ .offset = self.offset, .len = len, .anchor = anchor },
-        );
+        self.frame.rows.appendAssumeCapacity(.{
+            .offset = self.offset,
+            .len = len,
+            .columns = self.columns_written,
+            .anchor = anchor,
+        });
+    }
+
+    /// The rows the frame under composition holds. A producer records this
+    /// before it composes a component and passes it to `capture` after.
+    pub fn composed(self: *const Sink) usize {
+        return self.frame.rows.items.len;
+    }
+
+    /// Copy every row from `first` on into `lines`, so a later frame can replay
+    /// them. The bytes fit the width of this composition alone, so the producer
+    /// that keeps the store must drop it when that width or its content changes.
+    pub fn capture(self: *const Sink, gpa: std.mem.Allocator, first: usize, lines: *Lines) !void {
+        for (self.frame.rows.items[first..]) |row| {
+            try lines.append(gpa, self.frame.bytes(row), row.columns);
+        }
+    }
+
+    /// Compose the captured row at `index` into the row that `begin` opened. A
+    /// captured row is complete, so it takes the open row whole.
+    pub fn replay(self: *Sink, lines: *const Lines, index: usize) !void {
+        std.debug.assert(!self.has_text);
+        const span = lines.spans.items[index];
+        // A store captured at another width overflows the row. In safe builds
+        // that is loud, and in unsafe builds it is one over-wide row.
+        std.debug.assert(span.columns <= self.columns);
+        try self.frame.blob.writer.writeAll(lines.bytes(index));
+        self.columns_written = span.columns;
+        self.has_text = true;
+        // The captured tail is unknown, so a fragment after it takes a guard.
+        // A complete row gets none, so no frame carries a guard for it.
+        self.tail_joining = true;
     }
 
     /// Place the caret at display `column` on the row under composition, the
@@ -1463,6 +1549,54 @@ test "a fitted fragment preserves room for trailing cells" {
     // The replacement brings its own boundaries and `|` joins nothing, so the
     // seam between the two fragments stays bare.
     try harness.emulator.expectVisible(&.{"\u{200B}�\u{200B}|"});
+}
+
+// A producer that keeps the rows of an unchanged component replays them instead
+// of composing them again. The replay must reproduce the captured bytes exactly,
+// so the diff of the frame that follows finds no change at all.
+test "a replayed capture composes the rows of the composition it captured" {
+    const gpa = std.testing.allocator;
+    const harness = try makeHarness(gpa, 10);
+    defer {
+        harness.deinit();
+        gpa.destroy(harness);
+    }
+    var lines: View.Lines = .empty;
+    defer lines.deinit(gpa);
+
+    const sink = try harness.view.beginFrame(.{ .columns = 10, .rows = 4 }, 1);
+    const first = sink.composed();
+    sink.begin();
+    try sink.sgr("\x1b[1m");
+    try sink.text("bold");
+    try sink.sgr("\x1b[0m");
+    sink.end(.{ .id = 0, .line = 0 });
+    sink.begin();
+    try sink.text("你好");
+    sink.end(.{ .id = 0, .line = 1 });
+    try sink.capture(gpa, first, &lines);
+    try harness.view.render();
+    harness.emulator.rows = 4;
+    try harness.emulator.feed(harness.out.written());
+    harness.consumed = harness.out.written().len;
+    try harness.emulator.expectVisible(&.{ "bold", "你好" });
+    try std.testing.expectEqual(@as(usize, 2), lines.count());
+
+    harness.last_from = harness.consumed;
+    const replayed = try harness.view.beginFrame(.{ .columns = 10, .rows = 4 }, 1);
+    for (0..lines.count()) |index| {
+        replayed.begin();
+        try replayed.replay(&lines, index);
+        replayed.end(.{ .id = 0, .line = index });
+    }
+    try harness.view.render();
+    try harness.emulator.feed(harness.out.written()[harness.consumed..]);
+    harness.consumed = harness.out.written().len;
+    try harness.emulator.expectVisible(&.{ "bold", "你好" });
+    // The replayed rows carry the captured bytes, so the repaint prints none of
+    // them again.
+    try std.testing.expect(std.mem.indexOf(u8, harness.lastBytes(), "bold") == null);
+    try std.testing.expect(std.mem.indexOf(u8, harness.lastBytes(), "你好") == null);
 }
 
 test "the caret is hidden with no caret and when above the viewport" {

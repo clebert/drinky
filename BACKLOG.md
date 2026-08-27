@@ -24,13 +24,6 @@ decision already taken, or a dependency on another entry. Module layout and exte
 
 ## Improvements
 
-- **Cache block measurement and rendering** — a transcript block keeps its measured rows and
-  rendered lines per column width, so a frame runs markdown only for the block that changed. _The
-  layout caches nothing between frames today, and a turn repaints at the frame rate, so the cost
-  of one frame is the whole retained window twice: once to measure, once to render. Blocks are
-  append-only, so a content generation per block invalidates the streaming tail alone. This
-  decision keeps the complete generated request visible in a review transcript, instead of a
-  collapse of that block, and it outranks a repaint throttle, which helps less and touches more._
 - **Refresh the branch on input** — an input event that wakes the loop re-reads the repository head,
   so a checkout in another terminal shows without a turn. _An idle Drinky paints no frame, so the
   label stays stale until the next event. This limit is a decision, not a bug._

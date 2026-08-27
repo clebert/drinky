@@ -4,8 +4,10 @@
 //! A page is exclusive and emits only its fixed header and visible body window.
 //!
 //! Conversation layout uses two passes: measure newest → oldest to find the
-//! bounded clip, then compose clip → newest. The layout caches nothing between
-//! frames and projects the scene again at each size. A single blank line
+//! bounded clip, then compose clip → newest. The layout holds nothing between
+//! frames and projects the scene again at each size. Each transcript block
+//! retains the rows of its own last paint, so a frame runs the markdown of the
+//! blocks that changed alone and replays every other block. A single blank line
 //! separates adjacent conversation components. Boxes carry their own colored
 //! padding.
 
@@ -17,7 +19,7 @@ const ui = @import("ui/root.zig");
 
 /// The pages (terminal heights) of the newest content that a frame retains when
 /// the configuration names no count. A page more keeps more of the conversation
-/// on the screen, and each frame measures and composes every retained row again.
+/// on the screen, and each frame emits every retained row again.
 pub const window_pages_default: usize = 8;
 
 /// The window that a configured page count falls in. One page retains the newest
@@ -56,8 +58,9 @@ pub const Scene = union(enum) {
         window_pages: usize = window_pages_default,
         /// The transcript blocks the active account shows, oldest first. A
         /// projection hides the blocks of another account, so the scene borrows
-        /// one pointer per shown block instead of a contiguous slice.
-        transcript: []const *const ui.block.Entry,
+        /// one pointer per shown block instead of a contiguous slice. A block
+        /// retains the rows of its paint, so the pointer reaches the block.
+        transcript: []const *ui.block.Entry,
         tail: Tail,
         status: *const ui.status.Info,
     };
@@ -121,7 +124,7 @@ const EditorPresentation = struct {
 /// One screen component: a transcript block or a piece of the tail. Each variant
 /// carries what `measure` and `render` need.
 const Component = union(enum) {
-    entry: *const ui.block.Entry,
+    entry: *ui.block.Entry,
     tool_box: ui.paint.Box,
     editor: EditorPresentation,
     picker: *const ui.Picker,
@@ -141,14 +144,16 @@ const Component = union(enum) {
     }
 
     /// Compose this component's rows through `placement` and drop its top `skip`
-    /// rows (nonzero only for the clip).
+    /// rows (nonzero only for the clip). A block retains the rows of this paint,
+    /// so `gpa` holds them.
     fn render(
         self: *const Component,
+        gpa: std.mem.Allocator,
         placement: *const ui.paint.Placement,
         viewport_rows: usize,
     ) !void {
         switch (self.*) {
-            .entry => |entry| try entry.render(placement),
+            .entry => |entry| try entry.render(gpa, placement),
             .tool_box => |box| try ui.paint.box(placement, .tool_pending, &box),
             .status => |info| try ui.status.render(placement, info),
             .editor => |presentation| try presentation.render(placement, viewport_rows),
@@ -161,10 +166,17 @@ const Component = union(enum) {
 /// carry, and whether a blank separator row precedes it as its line 0.
 const Slot = struct { component: Component, id: usize, leading_blank: bool };
 
-/// Project `scene` onto the window at `size` and hand it to `view`.
-pub fn project(view: *terminal.View, size: terminal.View.Size, scene: *const Scene) !void {
+/// Project `scene` onto the window at `size` and hand it to `view`. A shown
+/// block retains the rows of its paint in `gpa`, and a block that the window
+/// drops releases them again.
+pub fn project(
+    gpa: std.mem.Allocator,
+    view: *terminal.View,
+    size: terminal.View.Size,
+    scene: *const Scene,
+) !void {
     switch (scene.*) {
-        .conversation => try projectConversation(view, size, &scene.conversation),
+        .conversation => try projectConversation(gpa, view, size, &scene.conversation),
         .page => |page| try projectPage(view, size, page),
     }
 }
@@ -184,6 +196,7 @@ fn projectPage(view: *terminal.View, size: terminal.View.Size, page: *const ui.P
 
 /// Fold one conversation onto the retained multi-page window.
 fn projectConversation(
+    gpa: std.mem.Allocator,
     view: *terminal.View,
     size: terminal.View.Size,
     scene: *const Scene.Conversation,
@@ -203,12 +216,15 @@ fn projectConversation(
         rows += @intFromBool(slot.leading_blank) + slot.component.measure(size);
     }
     const skip = if (rows > capacity) rows - capacity else 0;
+    const start = total - shown;
+    // A block above the window paints nothing, so it retains no rows either.
+    // The rows that every block retains then stay inside the window.
+    for (scene.transcript[0..@min(start, scene.transcript.len)]) |entry| entry.release(gpa);
 
     const sink = try view.beginFrame(
         .{ .columns = size.columns, .rows = size.rows },
         scene.window_pages,
     );
-    const start = total - shown;
     var index = start;
     while (index < total) : (index += 1) {
         const slot = slotAt(scene, index);
@@ -224,7 +240,7 @@ fn projectConversation(
             sink.begin();
             sink.end(.{ .id = slot.id, .line = 0 });
         }
-        try slot.component.render(&placement, size.rows);
+        try slot.component.render(gpa, &placement, size.rows);
     }
     try view.render();
 }
@@ -302,9 +318,9 @@ const test_status: ui.status.Info = .{
 // session hands the layout its projected transcript. Caller-owned.
 fn shownEntries(
     gpa: std.mem.Allocator,
-    entries: []const ui.block.Entry,
-) !std.ArrayList(*const ui.block.Entry) {
-    var shown: std.ArrayList(*const ui.block.Entry) = .empty;
+    entries: []ui.block.Entry,
+) !std.ArrayList(*ui.block.Entry) {
+    var shown: std.ArrayList(*ui.block.Entry) = .empty;
     errdefer shown.deinit(gpa);
     for (entries) |*entry| try shown.append(gpa, entry);
     return shown;
@@ -317,7 +333,7 @@ fn projected(gpa: std.mem.Allocator, size: terminal.View.Size, scene: *const Sce
     defer out.deinit();
     var view = terminal.View.init(gpa, &out.writer);
     defer view.deinit();
-    try project(&view, size, scene);
+    try project(gpa, &view, size, scene);
     return gpa.dupe(u8, out.written());
 }
 
@@ -615,9 +631,111 @@ test "projection clips the oldest block to fill the window exactly" {
     try std.testing.expect(std.mem.indexOf(u8, painted, "footerqq") != null);
 }
 
+// Every shown block retains the rows of its paint, and a repeat of one scene
+// replays them. The replayed rows must equal the composed ones, so the view
+// finds no change and reprints nothing.
+test "a repeated projection composes the rows of the first one" {
+    const gpa = std.testing.allocator;
+    var editor = ui.Editor.init(gpa);
+    defer editor.deinit();
+
+    var entries: std.ArrayList(ui.block.Entry) = .empty;
+    defer {
+        for (entries.items) |*entry| entry.deinit(gpa);
+        entries.deinit(gpa);
+    }
+    try entries.append(gpa, try ui.block.Entry.init(gpa, .user, .{}, "useryy"));
+    try entries.append(gpa, try ui.block.Entry.init(gpa, .model, .{}, "## replyzz\n\nsome text"));
+
+    var shown = try shownEntries(gpa, entries.items);
+    defer shown.deinit(gpa);
+
+    const scene: Scene = .{ .conversation = .{
+        .transcript = shown.items,
+        .tail = .{ .prompt = .{ .caption = null, .editor = &editor } },
+        .status = &test_status,
+    } };
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var view = terminal.View.init(gpa, &out.writer);
+    defer view.deinit();
+    const size: terminal.View.Size = .{ .columns = 40, .rows = 24 };
+
+    try project(gpa, &view, size, &scene);
+    const composed = out.written().len;
+    for (entries.items) |*entry| {
+        try std.testing.expectEqual(size.columns, entry.cache.columns);
+        try std.testing.expect(entry.cache.lines.count() > 0);
+    }
+
+    try project(gpa, &view, size, &scene);
+    const replayed = out.written()[composed..];
+    try std.testing.expect(std.mem.indexOf(u8, replayed, "useryy") == null);
+    try std.testing.expect(std.mem.indexOf(u8, replayed, "replyzz") == null);
+
+    // A streamed delta paints the block that grew, and no block above it.
+    const streamed = out.written().len;
+    try entries.items[1].appendText(gpa, "\n\ngrownxx");
+    try project(gpa, &view, size, &scene);
+    const grown = out.written()[streamed..];
+    try std.testing.expect(std.mem.indexOf(u8, grown, "grownxx") != null);
+    try std.testing.expect(std.mem.indexOf(u8, grown, "useryy") == null);
+}
+
+// The rows that every block retains stay inside the window that a frame paints.
+// A block that the window leaves behind releases them, so a long conversation
+// holds no rows that no frame shows.
+test "a block outside the window releases the rows it retained" {
+    const gpa = std.testing.allocator;
+    var editor = ui.Editor.init(gpa);
+    defer editor.deinit();
+
+    var entries: std.ArrayList(ui.block.Entry) = .empty;
+    defer {
+        for (entries.items) |*entry| entry.deinit(gpa);
+        entries.deinit(gpa);
+    }
+    for (0..6) |index| {
+        var buffer: [8]u8 = undefined;
+        const text = std.fmt.bufPrint(&buffer, "block{d}", .{index}) catch unreachable;
+        try entries.append(gpa, try ui.block.Entry.init(gpa, .model, .{}, text));
+    }
+
+    var shown = try shownEntries(gpa, entries.items);
+    defer shown.deinit(gpa);
+
+    const tall: Scene = .{ .conversation = .{
+        .transcript = shown.items,
+        .tail = .{ .prompt = .{ .caption = null, .editor = &editor } },
+        .status = &test_status,
+    } };
+    gpa.free(try projected(gpa, .{ .columns = 40, .rows = 24 }, &tall));
+    for (entries.items) |*entry| try std.testing.expect(entry.cache.lines.count() > 0);
+
+    // One page of eight rows holds the newest blocks alone.
+    const short: Scene = .{ .conversation = .{
+        .window_pages = window_pages_min,
+        .transcript = shown.items,
+        .tail = .{ .prompt = .{ .caption = null, .editor = &editor } },
+        .status = &test_status,
+    } };
+    const painted = try projected(gpa, .{ .columns = 40, .rows = 8 }, &short);
+    defer gpa.free(painted);
+
+    try std.testing.expect(std.mem.indexOf(u8, painted, "block0") == null);
+    try std.testing.expectEqual(@as(usize, 0), entries.items[0].cache.lines.count());
+    try std.testing.expect(entries.items[entries.items.len - 1].cache.lines.count() > 0);
+    for (entries.items, 0..) |*entry, index| {
+        var buffer: [8]u8 = undefined;
+        const text = std.fmt.bufPrint(&buffer, "block{d}", .{index}) catch unreachable;
+        if (std.mem.indexOf(u8, painted, text) != null) continue;
+        try std.testing.expectEqual(@as(usize, 0), entry.cache.lines.count());
+    }
+}
+
 // The configured count sets how much of the newest content one frame retains.
 // A frame of more pages keeps more of the conversation on the screen, and it
-// composes every one of those rows again.
+// paints every one of those rows again.
 test "the retained window follows the configured page count" {
     const gpa = std.testing.allocator;
     var editor = ui.Editor.init(gpa);

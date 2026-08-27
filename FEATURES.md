@@ -187,24 +187,24 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
   reviewer and the judge work under nonmutation prompts, and the fixer changes files like a normal
   turn.
 - Each generated request records one head line that Drinky wrote, such as
-  `Request: Fixer · Round: 2 of 4 · Pass: 1`. The request itself stays out of the transcript, like
-  a loaded skill file and a retry request. A caption above the editor names the round, the active
+  `Request: Fixer · Round: 2 of 4 · Pass: 1`. The request itself stays out of the transcript, like a
+  loaded skill file and a retry request. A caption above the editor names the round, the active
   role, and the controls.
 - The editor is the brake: an empty editor lets the workflow run unattended, and text holds it at
   the next boundary. Enter steers the active role, and a message that reaches the reviewer or the
   fixer gets one judge copy, so a report never reads as a user instruction.
-- A phase the user takes part in holds at its boundary too, so the reply waits for a read before
-  the role resets. A mid-turn Ctrl+N arms the automatic resume again, and the running caption marks
-  the state as `Resume: Auto` or `Resume: Hold`, live against the editor and the participation.
+- A phase the user takes part in holds at its boundary too, so the reply waits for a read before the
+  role resets. A mid-turn Ctrl+N arms the automatic resume again, and the running caption marks the
+  state as `Resume: Auto` or `Resume: Hold`, live against the editor and the participation.
 - A message that the user sends at a hold runs as its own turn under the round caption. A failure
   that commits nothing returns the text to the editor and the workflow to that hold.
-- The judge asks the user only about an open product choice. The `review.rounds_max` ceiling
-  bounds unattended rounds, and Ctrl+E adds one round at the limit.
+- The judge asks the user only about an open product choice. The `review.rounds_max` ceiling bounds
+  unattended rounds, and Ctrl+E adds one round at the limit.
 - Every role reply must start with its marker line: `Findings:`, `Decision:`, or `Applied:`. An
   answer to the user never travels as a report, and an unmarked reply gets one correction request
   before the workflow stops. A rejected fixer dispute gets one final pass.
-- A failed role request holds the workflow: Ctrl+N retries the committed work or resends the
-  request while one of the two stands behind it, and Ctrl+S reopens the setup of the failed role. A
+- A failed role request holds the workflow: Ctrl+N retries the committed work or resends the request
+  while one of the two stands behind it, and Ctrl+S reopens the setup of the failed role. A
   credential replacement and a credential rejection end a role turn in that same hold, and neither
   one changes a role choice.
 - Esc stops the workflow at a hold and during a turn. A worker that beats the cancel keeps its
@@ -268,6 +268,8 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - Drinky redraws the newest eight window heights of the conversation, and the configuration sets
   that count. Older rows rest in the native scrollback. A page more keeps more of the conversation
   live and costs more work in every frame.
+- Each transcript block keeps the rows it painted at the current width, so a frame renders the
+  markdown of the block that changed alone. A block that leaves the window drops those rows again.
 - A span seam takes a zero-width guard only where the two fragments can fuse into one grapheme, so
   almost no seam carries one.
 - Restores the terminal on exit, on a failed start, and around an interactive OAuth login.
@@ -448,8 +450,8 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
   drift.
 - JSON store writes use owner-only sibling `.lock` files to coordinate Drinky instances.
 - `~/.drinky/state.json` remembers per project which account and effort level Drinky used last, the
-  model of each account, and the review role choices. It is machine-local, owner-only, and keeps
-  the 1000 most recently changed projects. A repository is one project, keyed by its Git root.
+  model of each account, and the review role choices. It is machine-local, owner-only, and keeps the
+  1000 most recently changed projects. A repository is one project, keyed by its Git root.
 - Drinky reads that file only at startup, so a change in one instance reaches only the next start. A
   persistent save failure is reported once and never stops the session.
 - `HOME` must be set, since the config, the credentials, and the state all live under `~/.drinky`.
