@@ -76,9 +76,11 @@ pub const Account = enum {
     }
 };
 
-/// The vendor axis: whose wire protocol and model table an account uses. Both
-/// accounts of a vendor share one serializer and one set of models. The model
-/// table and the serializers key on this rather than on the full account.
+/// The vendor axis: whose wire protocol an account uses. The choice of the
+/// serializer keys on this, and each serializer then takes the full account.
+/// The catalog keeps one model list per account, because such a list belongs to
+/// the principal behind a credential. It keeps the public metadata per vendor,
+/// because those facts belong to nobody.
 pub const Provider = enum {
     anthropic,
     openai,
@@ -98,9 +100,13 @@ pub const Role = enum { user, assistant };
 /// A named reasoning-effort level passed through to the provider, which picks
 /// the actual thinking depth itself. Anthropic maps it to
 /// `output_config.effort` under adaptive thinking. OpenAI maps it to its
-/// reasoning-effort control. `none` disables reasoning when the model permits
-/// it. Otherwise, the model map folds `none` onto the minimum level.
-pub const Effort = enum { none, low, medium, high, xhigh, max };
+/// reasoning-effort control.
+///
+/// Declaration order is the ladder. A model that does not name a level resolves
+/// it onto the nearest level it does name, so the order carries meaning and
+/// every member must keep its place. `none` is no rung on that ladder. It asks
+/// the model to stop reasoning, and each provider states that in its own way.
+pub const Effort = enum { none, minimal, low, medium, high, xhigh, max, ultra };
 
 /// One entry in the flat, ordered conversation history. Every provider
 /// translates its wire format to and from this list. The agent loop appends
@@ -252,12 +258,52 @@ pub const Request = struct {
     system: []const u8,
     items: []const Item,
     tools: []const Tool,
-    effort: Effort = .none,
+    /// The reasoning control, already resolved against the model that serves
+    /// this request.
+    reasoning: Reasoning = .omitted,
     /// A stable per-conversation key a provider can use to improve prompt-cache
     /// routing. Empty sends none. OpenAI combines it with the prompt-prefix
     /// hash to keep a session's growing requests on one cache. Anthropic
     /// ignores it (its caching is driven by explicit breakpoints).
     cache_key: []const u8 = "",
+
+    /// The reasoning control of one request, already resolved against the model
+    /// that serves it. A serializer renders it, so no serializer needs to know
+    /// which levels a model offers.
+    pub const Reasoning = union(enum) {
+        /// The request names no reasoning control and takes the provider default.
+        omitted,
+        /// The request asks the model to stop reasoning.
+        disabled,
+        /// The request names this level.
+        named: Effort,
+
+        /// Whether a request that renders this control replays the stored
+        /// reasoning of `vendor`. Anthropic drops every thinking block unless
+        /// the request names a level. OpenAI replays an encrypted item at every
+        /// level. The gauges and the serializers read this one rule, so they
+        /// cannot drift apart.
+        pub fn replaysReasoning(self: Reasoning, vendor: Provider) bool {
+            return switch (vendor) {
+                .anthropic => self == .named,
+                .openai => true,
+            };
+        }
+
+        /// Whether two controls produce the same request bytes. Two effort
+        /// levels that fold onto one level share a prompt cache, so the
+        /// cache-hit rate compares controls, not levels.
+        pub fn eql(self: Reasoning, other: Reasoning) bool {
+            return switch (self) {
+                .omitted => other == .omitted,
+                .disabled => other == .disabled,
+                .named => |level| switch (other) {
+                    .named => |other_level| level == other_level,
+                    .omitted, .disabled => false,
+                },
+            };
+        }
+    };
 };
 
 /// Token counts for one assistant message. `input` is uncached prompt tokens.
@@ -267,38 +313,7 @@ pub const Usage = struct {
     output: u64 = 0,
     cache_read: u64 = 0,
     cache_write: u64 = 0,
-
-    /// The field-wise sum, to accumulate several messages' usage. The sum
-    /// saturates. The counts arrive from the provider stream unchecked, so a
-    /// hostile or buggy response must skew a gauge, never overflow a total.
-    pub fn plus(self: *const Usage, other: *const Usage) Usage {
-        return .{
-            .input = self.input +| other.input,
-            .output = self.output +| other.output,
-            .cache_read = self.cache_read +| other.cache_read,
-            .cache_write = self.cache_write +| other.cache_write,
-        };
-    }
 };
-
-test "accumulated usage saturates rather than overflowing on absurd counts" {
-    // A provider reports counts as JSON integers, so one message can claim up
-    // to maxInt(i64) per field. Three of them must not wrap the per-model
-    // total.
-    const absurd: Usage = .{
-        .input = std.math.maxInt(i64),
-        .output = std.math.maxInt(i64),
-        .cache_read = std.math.maxInt(i64),
-        .cache_write = std.math.maxInt(i64),
-    };
-    var total: Usage = .{};
-    for (0..3) |_| total = total.plus(&absurd);
-    const ceiling = std.math.maxInt(u64);
-    try std.testing.expectEqual(ceiling, total.input);
-    try std.testing.expectEqual(ceiling, total.output);
-    try std.testing.expectEqual(ceiling, total.cache_read);
-    try std.testing.expectEqual(ceiling, total.cache_write);
-}
 
 /// A subscription account's remaining allowance, read from the provider's
 /// response head. Each window is optional and independent. Classify one by its

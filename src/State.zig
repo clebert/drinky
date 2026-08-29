@@ -21,11 +21,13 @@
 //! project. The file keeps the `projects_max` most recently written projects.
 //!
 //! Nothing here is authoritative. Every read failure reads as nothing
-//! remembered, and the caller falls back to its configured or compiled default.
-//! A failed write stops every later write, so one broken file reports once
-//! instead of on every change. Store contention is the one exception, because
-//! it clears by itself: that snapshot stays pending, and the next write sends
-//! it even when the choices went back to the saved ones.
+//! remembered. For the account and the effort level, the caller then falls back
+//! to its configured or compiled default. A model the catalog does not resolve
+//! leaves the account with none, and the user picks one. A failed write stops
+//! every later write, so one broken file reports once instead of on every
+//! change. Store contention is the one exception, because it clears by itself:
+//! that snapshot stays pending, and the next write sends it even when the
+//! choices went back to the saved ones.
 
 const std = @import("std");
 
@@ -47,16 +49,12 @@ start: Start,
 /// The model each account ran last in this project. It starts from the file and
 /// takes every later choice. An account therefore keeps its model for the rest
 /// of the session and for the next start. Null for an account that ran none
-/// here, and that account falls back to its own default.
+/// here, and that account starts with no model until the user picks one.
 ///
-/// Each model is the compiled table's own entry, so this allocates nothing. The
-/// entry still points at the name bytes of that table. `Saved` copies its name
-/// instead, because it must survive a table that a later feature builds at
-/// runtime.
-///
-/// An entry also carries no account overlay, because an overlay belongs to the
-/// account that applies it, not to the file.
-models: std.EnumArray(ai.llm.Account, ?ai.models.Model),
+/// An entry names a model and describes none, because the catalog says what a
+/// name is and a stored description goes stale behind it. The name lives in the
+/// model itself, so this allocates nothing.
+models: std.EnumArray(ai.llm.Account, ?ai.Model),
 /// The `/review` role choices of this project: the account, the model, and the
 /// effort level of each role. It starts from the file and takes every later
 /// confirmation. Null for a role the project never chose, and that role
@@ -81,11 +79,11 @@ pub const Start = struct {
 };
 
 /// The setup of one `/review` role: the account that runs it, the model, and
-/// the effort level. The model is the compiled table's own entry, so a choice
-/// allocates nothing.
+/// the effort level. The model names itself and describes nothing, like every
+/// other model this file holds.
 pub const RoleChoice = struct {
     account: ai.llm.Account,
-    model: ai.models.Model,
+    model: ai.Model,
     effort: ai.llm.Effort,
 };
 
@@ -110,14 +108,14 @@ const Entry = struct {
     /// an account that ran none here costs nothing in the file. It borrows the
     /// state's model table alone, because the JSON shape needs nothing else.
     const Models = struct {
-        table: *const std.EnumArray(ai.llm.Account, ?ai.models.Model),
+        table: *const std.EnumArray(ai.llm.Account, ?ai.Model),
 
         pub fn jsonStringify(self: Models, stringify: anytype) !void {
             try stringify.beginObject();
             for (std.enums.values(ai.llm.Account)) |account| {
                 const model = self.table.get(account) orelse continue;
                 try stringify.objectField(@tagName(account));
-                try stringify.write(model.name);
+                try stringify.write(model.name());
             }
             try stringify.endObject();
         }
@@ -136,7 +134,7 @@ const Entry = struct {
                 try stringify.objectField(@tagName(role));
                 try stringify.write(.{
                     .account = @tagName(choice.account),
-                    .model = choice.model.name,
+                    .model = choice.model.name(),
                     .effort = @tagName(choice.effort),
                 });
             }
@@ -230,12 +228,12 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, options: *const OpenOptions) !St
 pub fn seed(
     self: *State,
     account: ai.llm.Account,
-    model: *const ai.models.Model,
+    model: ?ai.Model,
     effort: ai.llm.Effort,
 ) !void {
-    self.setModel(account, model);
+    const kept = self.keepModel(account, model);
     if (!self.save_enabled) return;
-    try self.remember(account, model, effort);
+    try self.remember(account, kept, effort);
 }
 
 /// Save the choices the project now uses. A choice equal to the seeded or last
@@ -248,16 +246,16 @@ pub fn seed(
 pub fn record(
     self: *State,
     account: ai.llm.Account,
-    model: *const ai.models.Model,
+    model: ?ai.Model,
     effort: ai.llm.Effort,
 ) !void {
-    self.setModel(account, model);
+    const kept = self.keepModel(account, model);
     if (!self.save_enabled) return;
-    if (!self.save_pending and self.unchanged(account, model, effort)) return;
+    if (!self.save_pending and self.unchanged(account, kept, effort)) return;
     // A persistent failure stops later writes. StoreBusy keeps this snapshot
     // pending, even when the active choices later return to their saved values.
     try self.save(account, effort);
-    self.remember(account, model, effort) catch |err| {
+    self.remember(account, kept, effort) catch |err| {
         self.save_enabled = false;
         return err;
     };
@@ -269,16 +267,35 @@ pub fn record(
 /// carries the whole entry, so it needs the main choices that `seed` or
 /// `record` kept. A state that never kept them holds the choices for the
 /// session alone.
+///
+/// A kept choice names its model and describes none, like every other model
+/// this file holds. The catalog owns every other field, and a fetch invalidates
+/// a copy of it.
 pub fn recordReview(
     self: *State,
     choices: *const std.EnumArray(Review.Role, ?RoleChoice),
 ) !void {
     const changed = !self.reviewUnchanged(choices);
-    self.review = choices.*;
+    for (std.enums.values(Review.Role)) |role| {
+        self.review.set(role, namedChoice(choices.get(role)));
+    }
     if (!changed or !self.save_enabled) return;
     const saved = self.saved orelse return;
     try self.save(saved.account, saved.effort);
     self.save_pending = false;
+}
+
+/// `choice` with the name of its model alone. A model that names itself again
+/// carries no window, no output limit, and no price that a fetch can invalidate.
+/// Every model reaches this call through `ai.Model.init`, so a name that fails
+/// there names no model at all, and the role then inherits the session.
+fn namedChoice(maybe_choice: ?RoleChoice) ?RoleChoice {
+    const choice = maybe_choice orelse return null;
+    return .{
+        .account = choice.account,
+        .model = ai.Model.init(choice.model.name()) catch return null,
+        .effort = choice.effort,
+    };
 }
 
 /// Write the whole project entry. A persistent failure stops later writes, and
@@ -312,10 +329,10 @@ fn read(self: *State) void {
     if (readObject(&entry, "models")) |listed| {
         for (std.enums.values(ai.llm.Account)) |account| {
             const name = readString(&listed, @tagName(account)) orelse continue;
-            // The account names the vendor, so the model resolves against that
-            // vendor's table. An absent or unknown name leaves the account with
-            // no model, and it falls back to its own default.
-            self.models.set(account, ai.models.get(account.provider(), name));
+            // The file names a model and nothing more. A name that the account
+            // no longer offers resolves to nothing when the catalog reads it,
+            // and that account then starts without a model.
+            self.models.set(account, ai.Model.init(name) catch continue);
         }
     }
     if (readObject(&entry, "review")) |roles| {
@@ -333,16 +350,22 @@ fn readRoleChoice(roles: *const std.json.ObjectMap, field: []const u8) ?RoleChoi
     const account = readEnum(ai.llm.Account, &entry, "account") orelse return null;
     const effort = readEnum(ai.llm.Effort, &entry, "effort") orelse return null;
     const name = readString(&entry, "model") orelse return null;
-    const model = ai.models.get(account.provider(), name) orelse return null;
+    const model = ai.Model.init(name) catch return null;
     return .{ .account = account, .model = model, .effort = effort };
 }
 
-/// Adopt `model` as the one `account` ran here. The state keeps the compiled
-/// table's own entry rather than the caller's copy, so an account overlay stays
-/// with the account that applies it. A model the table does not offer clears the
-/// entry, because the state can only name what a later read can resolve.
-fn setModel(self: *State, account: ai.llm.Account, model: *const ai.models.Model) void {
-    self.models.set(account, ai.models.get(account.provider(), model.name));
+/// Adopt `model` as the one `account` ran here and return what the entry now
+/// holds. The state keeps the name alone, because the catalog owns every other
+/// field and a copy of it goes stale.
+///
+/// No model keeps the name the entry already holds. The catalog resolves a name
+/// it has no list for to no model, and a logout, a replaced credential, and a
+/// start before the first fetch each leave such a list empty. The account runs
+/// with no model until then, and a later fetch returns it to the model it ran.
+fn keepModel(self: *State, account: ai.llm.Account, model: ?ai.Model) ?ai.Model {
+    const named = model orelse return self.models.get(account);
+    self.models.set(account, ai.Model.init(named.name()) catch null);
+    return self.models.get(account);
 }
 
 fn readEnum(comptime Enum: type, entry: *const std.json.ObjectMap, field: []const u8) ?Enum {
@@ -370,12 +393,13 @@ fn readString(entry: *const std.json.ObjectMap, field: []const u8) ?[]const u8 {
 fn unchanged(
     self: *const State,
     account: ai.llm.Account,
-    model: *const ai.models.Model,
+    model: ?ai.Model,
     effort: ai.llm.Effort,
 ) bool {
     const saved = self.saved orelse return false;
-    return saved.account == account and saved.effort == effort and
-        std.mem.eql(u8, saved.model, model.name);
+    if (saved.account != account or saved.effort != effort) return false;
+    const named = model orelse return saved.model.len == 0;
+    return named.sameName(saved.model);
 }
 
 /// Whether `choices` equals the kept role choices, so an unchanged confirmation
@@ -392,26 +416,26 @@ fn reviewUnchanged(
         const next_choice = next orelse continue;
         if (kept_choice.account != next_choice.account) return false;
         if (kept_choice.effort != next_choice.effort) return false;
-        if (!std.mem.eql(u8, kept_choice.model.name, next_choice.model.name)) return false;
+        if (!kept_choice.model.sameName(next_choice.model.name())) return false;
     }
     return true;
 }
 
-/// Replace the comparison snapshot. The model name is copied, so it survives a
-/// model table that a later feature builds at runtime.
+/// Replace the comparison snapshot. The model name is copied, so it survives
+/// every catalog the session later fetches. No model keeps an empty name, which
+/// no model can carry.
 fn remember(
     self: *State,
     account: ai.llm.Account,
-    model: *const ai.models.Model,
+    model: ?ai.Model,
     effort: ai.llm.Effort,
 ) !void {
-    const name = try self.gpa.dupe(u8, model.name);
+    const name = try self.gpa.dupe(u8, if (model) |named| named.name() else "");
     if (self.saved) |saved| self.gpa.free(saved.model);
     self.saved = .{ .account = account, .model = name, .effort = effort };
 }
 
-const test_model = ai.models.get(.anthropic, "claude-opus-5") orelse
-    @compileError("test model is not in the model table");
+const test_model = ai.testing.model("claude-opus-5");
 
 fn tmpHome(gpa: std.mem.Allocator, io: std.Io, tmp: *const std.testing.TmpDir) ![]u8 {
     const cwd = try std.process.currentPathAlloc(io, gpa);
@@ -476,10 +500,10 @@ test "a stored entry reads back the account, the effort level, and one model per
     // Every account the entry names keeps its own model, not only the active one.
     try std.testing.expectEqualStrings(
         "claude-opus-5",
-        state.models.get(.anthropic_subscription).?.name,
+        state.models.get(.anthropic_subscription).?.name(),
     );
-    try std.testing.expectEqualStrings("gpt-5.6-luna", state.models.get(.openai_api).?.name);
-    // An account the entry does not name has no model and takes its own default.
+    try std.testing.expectEqualStrings("gpt-5.6-luna", state.models.get(.openai_api).?.name());
+    // An account the entry does not name remembers no model.
     try std.testing.expect(state.models.get(.anthropic_api) == null);
 }
 
@@ -492,8 +516,7 @@ test "an unusable value reads as nothing remembered" {
         "[1, 2, 3]",
         // An unknown account, an unknown model, and a model of another vendor.
         \\{ "/work": { "account": "nope",
-        \\    "models": { "nope": "claude-opus-5", "anthropic_api": "nope",
-        \\      "anthropic_subscription": "gpt-5.6-luna" } } }
+        \\    "models": { "nope": "claude-opus-5" } } }
         ,
         // A missing field, and a field of the wrong JSON type.
         \\{ "/work": { "effort": "max" } }
@@ -551,16 +574,16 @@ test "only a change writes the file, and it keeps another project" {
 
     var state = try openForTest(gpa, io, home);
     defer state.deinit();
-    try state.seed(.anthropic_api, &test_model, .xhigh);
+    try state.seed(.anthropic_api, test_model, .xhigh);
 
     // The seeded choice is the current one, so neither call writes.
-    try state.record(.anthropic_api, &test_model, .xhigh);
+    try state.record(.anthropic_api, test_model, .xhigh);
     var before = (try ai.json_store.open(gpa, io, state.path)).?;
     defer before.deinit();
     try std.testing.expect(before.entry("/work") == null);
 
     // A changed effort level writes the whole entry and keeps the other project.
-    try state.record(.anthropic_api, &test_model, .none);
+    try state.record(.anthropic_api, test_model, .none);
     var after = (try ai.json_store.open(gpa, io, state.path)).?;
     defer after.deinit();
     const entry = after.entry("/work").?;
@@ -583,7 +606,7 @@ test "only a change writes the file, and it keeps another project" {
     try std.testing.expectEqual(ai.llm.Account.anthropic_api, restarted.start.account.?);
     try std.testing.expectEqualStrings(
         "claude-opus-5",
-        restarted.models.get(.anthropic_api).?.name,
+        restarted.models.get(.anthropic_api).?.name(),
     );
     try std.testing.expectEqual(ai.llm.Effort.none, restarted.start.effort.?);
 }
@@ -591,7 +614,7 @@ test "only a change writes the file, and it keeps another project" {
 test "each account keeps its own model across a switch and a restart" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const openai_model = ai.models.get(.openai, "gpt-5.6-luna").?;
+    const openai_model = ai.testing.model("gpt-5.6-luna");
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const home = try tmpHome(gpa, io, &tmp);
@@ -599,13 +622,13 @@ test "each account keeps its own model across a switch and a restart" {
 
     var state = try openForTest(gpa, io, home);
     defer state.deinit();
-    try state.seed(.anthropic_api, &test_model, .high);
+    try state.seed(.anthropic_api, test_model, .high);
     // A switch to another account records that account's model. The model of the
     // account left behind stays, because a model belongs to the account that ran
     // it.
-    try state.record(.openai_api, &openai_model, .high);
-    try std.testing.expectEqualStrings("claude-opus-5", state.models.get(.anthropic_api).?.name);
-    try std.testing.expectEqualStrings("gpt-5.6-luna", state.models.get(.openai_api).?.name);
+    try state.record(.openai_api, openai_model, .high);
+    try std.testing.expectEqualStrings("claude-opus-5", state.models.get(.anthropic_api).?.name());
+    try std.testing.expectEqualStrings("gpt-5.6-luna", state.models.get(.openai_api).?.name());
 
     // The next start reads both models back, so a switch there returns to the
     // model each account ran.
@@ -614,17 +637,18 @@ test "each account keeps its own model across a switch and a restart" {
     try std.testing.expectEqual(ai.llm.Account.openai_api, restarted.start.account.?);
     try std.testing.expectEqualStrings(
         "claude-opus-5",
-        restarted.models.get(.anthropic_api).?.name,
+        restarted.models.get(.anthropic_api).?.name(),
     );
-    try std.testing.expectEqualStrings("gpt-5.6-luna", restarted.models.get(.openai_api).?.name);
+    try std.testing.expectEqualStrings("gpt-5.6-luna", restarted.models.get(.openai_api).?.name());
 }
 
-test "a model the compiled table does not offer clears the memory of its account" {
+// The file names a model and describes none, so the state keeps whatever name a
+// command recorded. The catalog decides at read time whether an account still
+// offers it, and a name it does not know resolves to no model there.
+test "the state keeps the model name that a command recorded" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    // A model with a name that no table entry carries.
-    var unknown_model = test_model;
-    unknown_model.name = "claude-opus-6";
+    const other_model = ai.testing.model("claude-opus-6");
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const home = try tmpHome(gpa, io, &tmp);
@@ -638,36 +662,51 @@ test "a model the compiled table does not offer clears the memory of its account
     defer state.deinit();
     try std.testing.expect(state.models.get(.anthropic_api) != null);
 
-    // The state can only name what a later read resolves, so an unknown model
-    // drops the memory the file held rather than replacing it.
-    try state.record(.anthropic_api, &unknown_model, .none);
-    try std.testing.expect(state.models.get(.anthropic_api) == null);
+    // A recorded name replaces the one the file held.
+    try state.record(.anthropic_api, other_model, .none);
+    try std.testing.expectEqualStrings(
+        "claude-opus-6",
+        state.models.get(.anthropic_api).?.name(),
+    );
 
-    // A model of another vendor does not resolve for this account either.
-    try state.record(.openai_api, &test_model, .none);
+    // No model keeps the name the entry holds, because a catalog that resolves
+    // nothing must not erase the memory of the account. An account that ran none
+    // here still names none.
+    try state.record(.openai_api, null, .none);
     try std.testing.expect(state.models.get(.openai_api) == null);
+    try state.record(.anthropic_api, null, .none);
+    try std.testing.expectEqualStrings(
+        "claude-opus-6",
+        state.models.get(.anthropic_api).?.name(),
+    );
 
-    // The entry then names no model at all. The account and the effort level
-    // still reach the file, so the next start resumes on them.
+    // The entry names that model alone. The account and the effort level reach
+    // the file with it, so the next start resumes on them.
     var file = (try ai.json_store.open(gpa, io, state.path)).?;
     defer file.deinit();
     const entry = file.entry("/work").?;
-    try std.testing.expectEqualStrings("openai_api", entry.get("account").?.string);
+    try std.testing.expectEqualStrings("anthropic_api", entry.get("account").?.string);
     try std.testing.expectEqualStrings("none", entry.get("effort").?.string);
-    try std.testing.expectEqual(@as(usize, 0), entry.get("models").?.object.count());
+    const listed = entry.get("models").?.object;
+    try std.testing.expectEqual(@as(usize, 1), listed.count());
+    try std.testing.expectEqualStrings("claude-opus-6", listed.get("anthropic_api").?.string);
 
-    // A restart reads that entry back and falls back to a default for every
-    // account.
+    // A restart reads that entry back, so a later fetch returns the account to
+    // the model it ran.
     var restarted = try openForTest(gpa, io, home);
     defer restarted.deinit();
-    try std.testing.expectEqual(ai.llm.Account.openai_api, restarted.start.account.?);
-    for (restarted.models.values) |maybe_model| try std.testing.expect(maybe_model == null);
+    try std.testing.expectEqual(ai.llm.Account.anthropic_api, restarted.start.account.?);
+    try std.testing.expectEqualStrings(
+        "claude-opus-6",
+        restarted.models.get(.anthropic_api).?.name(),
+    );
+    try std.testing.expect(restarted.models.get(.openai_api) == null);
 }
 
 test "review role choices write with the entry and read back per role" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const judge_model = ai.models.get(.openai, "gpt-5.6-sol").?;
+    const judge_model = ai.testing.model("gpt-5.6-sol");
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const home = try tmpHome(gpa, io, &tmp);
@@ -676,7 +715,7 @@ test "review role choices write with the entry and read back per role" {
     var state = try openForTest(gpa, io, home);
     defer state.deinit();
     for (state.review.values) |maybe_choice| try std.testing.expect(maybe_choice == null);
-    try state.seed(.anthropic_api, &test_model, .high);
+    try state.seed(.anthropic_api, test_model, .high);
 
     // The confirmation writes the choices with the whole entry. The fixer stays
     // unchosen, so the entry carries the two chosen roles alone.
@@ -704,10 +743,41 @@ test "review role choices write with the entry and read back per role" {
     defer restarted.deinit();
     const judge = restarted.review.get(.judge).?;
     try std.testing.expectEqual(ai.llm.Account.openai_api, judge.account);
-    try std.testing.expectEqualStrings("gpt-5.6-sol", judge.model.name);
+    try std.testing.expectEqualStrings("gpt-5.6-sol", judge.model.name());
     try std.testing.expectEqual(ai.llm.Effort.xhigh, judge.effort);
     try std.testing.expect(restarted.review.get(.reviewer) != null);
     try std.testing.expect(restarted.review.get(.fixer) == null);
+}
+
+// A role choice names a model and describes none, like every other model this
+// file holds. The catalog owns the window, the output limit, and the price, and
+// a fetch invalidates a copy of them.
+test "a recorded review choice keeps the model name alone" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpHome(gpa, io, &tmp);
+    defer gpa.free(home);
+
+    var state = try openForTest(gpa, io, home);
+    defer state.deinit();
+    try state.seed(.anthropic_api, test_model, .high);
+
+    var choices: std.EnumArray(Review.Role, ?RoleChoice) = .initFill(null);
+    choices.set(.judge, .{
+        .account = .openai_api,
+        .model = ai.testing.model("gpt-5.6-sol"),
+        .effort = .xhigh,
+    });
+    try state.recordReview(&choices);
+
+    const judge = state.review.get(.judge).?;
+    const named = ai.testing.bareModel("gpt-5.6-sol");
+    try std.testing.expect(judge.model.eql(&named));
+    // The account and the effort level of the role survive the strip.
+    try std.testing.expectEqual(ai.llm.Account.openai_api, judge.account);
+    try std.testing.expectEqual(ai.llm.Effort.xhigh, judge.effort);
 }
 
 test "a review role choice with an unusable part reads as nothing remembered" {
@@ -722,12 +792,12 @@ test "a review role choice with an unusable part reads as nothing remembered" {
         \\    "models": {},
         \\    "review": {
         \\      "reviewer": { "account": "nope", "model": "claude-opus-5", "effort": "high" },
-        \\      "judge": { "account": "openai_api", "model": "claude-opus-5", "effort": "high" },
+        \\      "judge": { "account": "openai_api", "effort": "high" },
         \\      "fixer": { "account": "anthropic_api", "model": "claude-opus-5" } } } }
     );
 
-    // A wrong account, a model of another vendor, and a missing effort level
-    // each drop their role alone. The main entry stays usable.
+    // A wrong account, a missing model, and a missing effort level each drop
+    // their role alone. The main entry stays usable.
     var state = try openForTest(gpa, io, home);
     defer state.deinit();
     for (state.review.values) |maybe_choice| try std.testing.expect(maybe_choice == null);
@@ -744,7 +814,7 @@ test "an unchanged review confirmation writes nothing" {
 
     var state = try openForTest(gpa, io, home);
     defer state.deinit();
-    try state.seed(.anthropic_api, &test_model, .high);
+    try state.seed(.anthropic_api, test_model, .high);
     var choices: std.EnumArray(Review.Role, ?RoleChoice) = .initFill(null);
     choices.set(.reviewer, .{ .account = .anthropic_api, .model = test_model, .effort = .high });
     try state.recordReview(&choices);
@@ -765,7 +835,7 @@ test "an unchanged review confirmation writes nothing" {
 test "temporary store contention leaves project-state saving enabled" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const openai_model = ai.models.get(.openai, "gpt-5.6-luna").?;
+    const openai_model = ai.testing.model("gpt-5.6-luna");
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const home = try tmpHome(gpa, io, &tmp);
@@ -774,7 +844,7 @@ test "temporary store contention leaves project-state saving enabled" {
 
     var state = try openForTest(gpa, io, home);
     defer state.deinit();
-    try state.seed(.anthropic_api, &test_model, .none);
+    try state.seed(.anthropic_api, test_model, .none);
     const lock_path = try std.fmt.allocPrint(gpa, "{s}.lock", .{state.path});
     defer gpa.free(lock_path);
     {
@@ -786,7 +856,7 @@ test "temporary store contention leaves project-state saving enabled" {
         defer held.close(io);
         try std.testing.expectError(
             error.StoreBusy,
-            state.record(.openai_api, &openai_model, .high),
+            state.record(.openai_api, openai_model, .high),
         );
         try std.testing.expect(state.save_enabled);
         try std.testing.expect(state.save_pending);
@@ -794,14 +864,14 @@ test "temporary store contention leaves project-state saving enabled" {
 
     // The choices return to the saved values. The pending snapshot still forces
     // this retry, so no earlier model-table change can stay only in memory.
-    try state.record(.anthropic_api, &test_model, .none);
+    try state.record(.anthropic_api, test_model, .none);
     try std.testing.expect(!state.save_pending);
     var file = (try ai.json_store.open(gpa, io, state.path)).?;
     defer file.deinit();
     const entry = file.entry("/work").?;
     try std.testing.expectEqualStrings("anthropic_api", entry.get("account").?.string);
     try std.testing.expectEqualStrings(
-        openai_model.name,
+        openai_model.name(),
         entry.get("models").?.object.get("openai_api").?.string,
     );
 }
@@ -819,7 +889,7 @@ test "a corrupt file survives a refused write" {
     defer state.deinit();
     try std.testing.expectError(
         error.CorruptStore,
-        state.record(.anthropic_api, &test_model, .high),
+        state.record(.anthropic_api, test_model, .high),
     );
     const data = try std.Io.Dir.cwd().readFileAlloc(io, state.path, gpa, .unlimited);
     defer gpa.free(data);
@@ -828,13 +898,13 @@ test "a corrupt file survives a refused write" {
     // The failure is the last write this state attempts, so the caller reports
     // one message rather than one per change.
     try std.testing.expect(!state.save_enabled);
-    try state.record(.anthropic_api, &test_model, .low);
+    try state.record(.anthropic_api, test_model, .low);
 }
 
 test "an inert state saves nothing and owns nothing" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const openai_model = ai.models.get(.openai, "gpt-5.6-luna").?;
+    const openai_model = ai.testing.model("gpt-5.6-luna");
 
     var state: State = .inert(gpa, io);
     defer state.deinit();
@@ -842,9 +912,9 @@ test "an inert state saves nothing and owns nothing" {
     try std.testing.expect(state.start.effort == null);
     // Neither call writes: an inert state names no file. Both still take the
     // model, because the session memory does not depend on the file.
-    try state.seed(.anthropic_api, &test_model, .high);
-    try state.record(.openai_api, &openai_model, .low);
+    try state.seed(.anthropic_api, test_model, .high);
+    try state.record(.openai_api, openai_model, .low);
     try std.testing.expect(state.saved == null);
-    try std.testing.expectEqualStrings("claude-opus-5", state.models.get(.anthropic_api).?.name);
-    try std.testing.expectEqualStrings("gpt-5.6-luna", state.models.get(.openai_api).?.name);
+    try std.testing.expectEqualStrings("claude-opus-5", state.models.get(.anthropic_api).?.name());
+    try std.testing.expectEqualStrings("gpt-5.6-luna", state.models.get(.openai_api).?.name());
 }

@@ -3,11 +3,16 @@
 //! Producer tasks push `Session.UiEvent`s onto the channel. The consumer loop
 //! here drains them, drives the `Session` model, and paints through it.
 //!
-//! Network and stream I/O run off the UI thread. Four `io.concurrent` producers
+//! Turn and stream I/O run off the UI thread. Four `io.concurrent` producers
 //! feed one `std.Io.Queue(Session.UiEvent)`: a long-lived input reader
 //! (stdin → `.keys`), the current turn worker (`agent.run` → generation-tagged
 //! `.turn` events), a one-shot frame timer (sleep → `.tick`), and a SIGWINCH
 //! watcher (self-pipe → `.resize`).
+//!
+//! A command runs on the consumer, so a command step that reaches the network
+//! stops the interface until it ends. Such a step paints a wait line first
+//! through `Context.Wait`, so the stop never reads as a hang. The OAuth login
+//! is the one blocking step that leaves raw mode and prints its own prompts.
 //!
 //! The consumer-owned model and rendering live in `Session`: the transcript,
 //! transient notice, live tail, editor, view, stats/model snapshots, and the
@@ -33,13 +38,16 @@ const ui = @import("ui/root.zig");
 
 const App = @This();
 
-// The compiled fallback model per vendor, used when config names none for the
-// active account. Resolved at compile time so a bad name is a build error.
-const anthropic_default = ai.models.get(.anthropic, "claude-opus-5") orelse
-    @compileError("default anthropic model is not in the model table");
-const openai_default = ai.models.get(.openai, "gpt-5.6-sol") orelse
-    @compileError("default openai model is not in the model table");
 const effort_default: ai.llm.Effort = .xhigh;
+
+/// The refusal a send meets while the active account offers no model. Drinky
+/// compiles none in, so the user fetches a list and picks one there.
+const no_model_refusal = "Select a model with /model before you send a message.";
+
+/// Two models for the tests, which build what they need because Drinky compiles
+/// no model in.
+const test_anthropic_model = ai.testing.model("claude-opus-5");
+const test_openai_model = ai.testing.model("gpt-5.6-sol");
 
 /// The key hints of the intro line, in the order the line shows them. The
 /// `describe_drinky` document names the same hints, so the legend of the
@@ -79,9 +87,6 @@ tty: terminal.Tty,
 /// SIGWINCH watcher: turns terminal resizes into `.resize` events.
 resize: terminal.Resize,
 accounts: ai.Accounts,
-/// The configured default model per account, so an account switch mid-session
-/// (a `/model`, `/login`, or `/logout`) resolves the same model as startup.
-default_models: Config.DefaultModels,
 /// The machine-local choices of this project: read once at startup, written
 /// whenever the account, the model, or the effort level changes.
 state: State,
@@ -820,7 +825,6 @@ pub fn run(
 
     self.accounts = try ai.Accounts.init(gpa, io, home, config.timeouts, options.api_keys);
     defer self.accounts.deinit();
-    self.default_models = config.default_models;
 
     const home_directory = try homeDirectory(gpa, io, cwd, home);
     defer gpa.free(home_directory);
@@ -897,11 +901,7 @@ pub fn run(
     self.review_rounds_max = config.review_rounds_max;
     self.document = try describe.compose(gpa, &.{
         .config = &config,
-        .defaults = .{
-            .anthropic_model = anthropic_default.name,
-            .openai_model = openai_default.name,
-            .effort = effort_default,
-        },
+        .defaults = .{ .effort = effort_default },
         .key_hints = &intro_keys,
         .ctrl_c_window_ms = ctrl_c_window_ms,
     });
@@ -909,8 +909,9 @@ pub fn run(
 
     // Start on the account this project used last, then on the first
     // authenticated account, or signed out (no client) when none is. The login
-    // picker opens below to sign in. Drinky resolves the model for the chosen or
-    // placeholder account either way, so the status line has one to show.
+    // picker opens below to sign in. The model resolves from the name that
+    // account ran here. A name the account no longer offers, and an account
+    // that no fetch ran for, resolve to no model, and the status line says so.
     const active = self.startAccount();
     const start_account = active orelse .anthropic_subscription;
     const start_client = if (active) |account| self.accounts.client(account) else null;
@@ -930,7 +931,7 @@ pub fn run(
     // Startup applies the remembered or the default choices, so it saves nothing.
     // Only a later change writes the file. A signed-out start has no account to
     // remember, so the first login records one.
-    if (active) |account| try self.state.seed(account, &start_model, start_effort);
+    if (active) |account| try self.state.seed(account, start_model, start_effort);
 
     try self.tty.init(io, terminalOptions(options));
     defer self.tty.deinit();
@@ -954,14 +955,6 @@ pub fn run(
     self.refreshBranch();
 
     try self.session.transcript.append(.intro, .{}, intro_text);
-    // Surface any configured default-model name that did not resolve, so a typo or
-    // a wrong-vendor entry does not disappear silently.
-    for (config.dropped_models) |dropped| try self.recordEvent(
-        .failure,
-        "Drinky ignored the configured default model \"{s}\" because the model is not valid for " ++
-            "the {s} account. Drinky uses the model \"{s}\" for this account.",
-        .{ dropped.name, dropped.account.label(), self.defaultModel(dropped.account).name },
-    );
     if (config.dropped_effort) |dropped| try self.recordEvent(
         .failure,
         "Drinky ignored the configured default effort level \"{s}\" because Drinky does not " ++
@@ -1092,7 +1085,6 @@ fn initFields(self: *App, gpa: std.mem.Allocator, io: std.Io) void {
         .agent = undefined,
         // It needs the writer that the caller reads back.
         .session = undefined,
-        .default_models = .{},
         .state = .inert(gpa, io),
         .directory_label = "",
         .working_directory = "",
@@ -1545,8 +1537,13 @@ fn readInput(self: *App) void {
 /// busy credential store keeps the refreshed token in memory. The next turn
 /// retries its save before a provider request. Anything unmapped returns null,
 /// and the caller wraps its error name.
+///
+/// Every path that starts a turn refuses without a model, so `NoModel` reaches
+/// this only through a residual path. It maps to the same refusal, because the
+/// internal name helps no user.
 fn turnFailureText(err: anyerror) ?[]const u8 {
     return switch (err) {
+        error.NoModel => no_model_refusal,
         error.UnsupportedReply => "Drinky cannot keep the response because the model returned " ++
             "a refusal, a pause, or an unsupported result.",
         error.EmptyReply => "The model returned an empty response.",
@@ -1554,8 +1551,10 @@ fn turnFailureText(err: anyerror) ?[]const u8 {
         error.UncorrelatedReply => "Drinky could not match a streamed part of the response to " ++
             "the item it belongs to. The provider changed the order of its stream.",
         error.TooManyToolRounds => "The turn reached the limit for tool rounds.",
+        // The next step depends on the transition that follows this failure, so
+        // the app names it in a later event.
         error.CredentialReplaced => "Drinky found a replacement credential for this account. " ++
-            "Drinky removed the prior account evidence. Try the turn again.",
+            "Drinky removed the prior account evidence.",
         error.TokenGrantRejected => "The provider rejected the refresh credential.",
         error.TokenRequestFailed => "The provider did not accept the token request. " ++
             "Drinky kept this account signed in.",
@@ -1635,33 +1634,22 @@ fn startAccount(self: *const App) ?ai.llm.Account {
     return self.accounts.firstAuthenticated();
 }
 
-/// The model `account` runs: the one it ran last in this project, else the
-/// account's default model. A model belongs to the account that ran it, so
-/// another account gets its own default. Startup, a switch, and a login all read
-/// this one rule.
+/// The model `account` runs: the one it ran last in this project, else none. A
+/// model belongs to the account that ran it, so another account starts on its
+/// own last model. Startup, a switch, and a login all read this one rule.
 ///
-/// `state` holds the compiled table's own entry, so the account overlay applies
-/// here on every read. An OpenAI subscription learns its real context windows at
-/// login. A model resolved before that login keeps a stale window.
-fn accountModel(self: *const App, account: ai.llm.Account) ai.models.Model {
-    const base = self.state.models.get(account) orelse return self.defaultModel(account);
-    return self.accounts.resolveModel(account, base);
+/// `state` remembers a name alone, and the catalog says what that name is. A
+/// name the account no longer offers, and an account that no fetch ran for,
+/// resolve to no model, so the user picks one with `/model`.
+fn accountModel(self: *const App, account: ai.llm.Account) ?ai.Model {
+    const remembered = self.state.models.get(account) orelse return null;
+    return self.accounts.findModel(account, remembered.name());
 }
 
 /// The effort level to start on: the one this project used last, else the
 /// `configured` default, else the compiled fallback.
 fn startEffort(self: *const App, configured: ?ai.llm.Effort) ai.llm.Effort {
     return self.state.start.effort orelse configured orelse effort_default;
-}
-
-/// The model to start `account` on: the configured default, else the compiled
-/// per-vendor fallback.
-fn defaultModel(self: *const App, account: ai.llm.Account) ai.models.Model {
-    const base = self.default_models.get(account) orelse switch (account.provider()) {
-        .anthropic => anthropic_default,
-        .openai => openai_default,
-    };
-    return self.accounts.resolveModel(account, base);
 }
 
 /// Decode a stdin chunk into key events and apply each. Runs on the consumer, so
@@ -2139,14 +2127,15 @@ fn submit(self: *App) !void {
         if (try self.dispatchCommand(text)) |outcome|
             return self.applySubmittedCommand(outcome);
     }
-    if (!self.signedIn()) {
-        self.session.editor.clear();
-        return self.reportNotice(
-            .failure,
-            "Sign in with /login before you send a message.",
-            .{},
-        );
-    }
+    // A refused send starts no turn, so the editor keeps every byte the user
+    // typed. The same Enter sends that line once the account and the model
+    // stand.
+    if (!self.signedIn()) return self.reportNotice(
+        .failure,
+        "Sign in with /login before you send a message.",
+        .{},
+    );
+    if (self.agent.model == null) return self.reportNotice(.failure, no_model_refusal, .{});
     const base = try self.startUserTurn(text);
     // A review workflow leaves its hold for this turn. A committed reviewer or
     // fixer message gets one pending judge copy at the terminal of the turn, so
@@ -2165,15 +2154,17 @@ fn submit(self: *App) !void {
 fn applySubmittedCommand(self: *App, outcome: ai.command.Outcome) !void {
     switch (outcome) {
         // A skill line starts its own turn, so it keeps the editor's rich draft.
+        // A refused line starts none, so the editor keeps that draft as typed.
         .prompt => |prompt| {
             defer prompt.deinit(self.gpa);
             if (!self.signedIn()) {
-                self.session.editor.clear();
                 try self.reportNotice(
                     .failure,
                     "Sign in with /login before you send a message.",
                     .{},
                 );
+            } else if (self.agent.model == null) {
+                try self.reportNotice(.failure, no_model_refusal, .{});
             } else {
                 const base = try self.startSkillTurn(&prompt);
                 // The line reproduces this request, so a failure that commits
@@ -2282,6 +2273,7 @@ fn retryTurn(self: *App) !void {
         "Sign in with /login before you try the turn again.",
         .{},
     );
+    if (self.agent.model == null) return self.reportNotice(.failure, no_model_refusal, .{});
     return self.sendRetryTurn();
 }
 
@@ -2355,7 +2347,7 @@ fn openReviewSetup(self: *App) !void {
         ai.command.Context.ReviewSetup.Choice,
     ) = undefined;
     for (std.enums.values(ai.command.Context.ReviewSetup.Role)) |role| {
-        const choice = self.state.review.get(machineRole(role)) orelse inherit: {
+        const choice = self.storedRoleChoice(machineRole(role)) orelse inherit: {
             const account = self.activeAccount() orelse {
                 self.session.editor.clear();
                 return self.reportNotice(
@@ -2364,22 +2356,63 @@ fn openReviewSetup(self: *App) !void {
                     .{},
                 );
             };
-            break :inherit State.RoleChoice{
+            break :inherit ai.command.Context.ReviewSetup.Choice{
                 .account = account,
                 .model = self.agent.model,
                 .effort = self.agent.effort,
             };
         };
-        choices.set(role, .{
-            .account = choice.account,
-            .model = choice.model,
-            .effort = choice.effort,
-        });
+        choices.set(role, choice);
     }
     self.session.editor.clear();
     self.review_setup = .{ .choices = choices };
     var context = self.commandContext();
     try self.session.applyOutcome(try ai.command.review.setup(&context));
+}
+
+/// The stored choice of `role`, with its model resolved through the catalog.
+/// The state file names a model and describes none, so a role that runs on that
+/// name alone carries no context window, no output limit, and no price.
+///
+/// A name that the account no longer offers resolves to no model. The choice
+/// keeps its account and its effort level and names none, because a review role
+/// is the choice of the user and Drinky substitutes no other model for it. The
+/// setup then holds the start until the user picks one.
+fn storedRoleChoice(
+    self: *const App,
+    role: Review.Role,
+) ?ai.command.Context.ReviewSetup.Choice {
+    const stored = self.state.review.get(role) orelse return null;
+    return .{
+        .account = stored.account,
+        .model = self.accounts.findModel(stored.account, stored.model.name()),
+        .effort = stored.effort,
+    };
+}
+
+/// The choice of `role` to persist, the write side of `storedRoleChoice`. The
+/// file always names a model, so `State.RoleChoice` keeps a model and never an
+/// optional one.
+///
+/// A row that names no model carries a stored name that the catalog did not
+/// resolve. That name stays in the file with its account, so a confirmation of
+/// another role leaves the choice of the user whole. Only a model selection
+/// changes an account, so the kept pair stays consistent, and the effort level
+/// follows the row.
+fn recordedRoleChoice(
+    self: *const App,
+    role: Review.Role,
+    choice: *const ai.command.Context.ReviewSetup.Choice,
+) ?State.RoleChoice {
+    const model = choice.model orelse {
+        const stored = self.state.review.get(role) orelse return null;
+        return .{
+            .account = stored.account,
+            .model = stored.model,
+            .effort = choice.effort,
+        };
+    };
+    return .{ .account = choice.account, .model = model, .effort = choice.effort };
 }
 
 /// Take one confirmed role choice: persist all three, and during a failure
@@ -2389,12 +2422,9 @@ fn confirmReviewSetup(self: *App) !void {
     const setup = if (self.review_setup) |*value| value else return;
     var stored: std.EnumArray(Review.Role, ?State.RoleChoice) = .initFill(null);
     for (std.enums.values(ai.command.Context.ReviewSetup.Role)) |role| {
+        const machine = machineRole(role);
         const choice = setup.choices.get(role);
-        stored.set(machineRole(role), .{
-            .account = choice.account,
-            .model = choice.model,
-            .effort = choice.effort,
-        });
+        stored.set(machine, self.recordedRoleChoice(machine, &choice));
     }
     self.state.recordReview(&stored) catch |err| try self.reportStateSaveFailure(err);
     const flow = if (self.review) |*value| value else {
@@ -2403,12 +2433,15 @@ fn confirmReviewSetup(self: *App) !void {
         return self.session.applyOutcome(try ai.command.review.setup(&context));
     };
     // The failure hold edits the failed role, so the confirmed choice reaches
-    // its live conversation, and the next attempt runs on it.
+    // its live conversation, and the next attempt runs on it. A running workflow
+    // holds a model for every role, so a row that names none keeps the one that
+    // runs.
     for (std.enums.values(Review.Role)) |role| {
         const choice = setup.choices.get(setupRole(role));
+        const model = choice.model orelse continue;
         flow.choices.set(role, .{
             .account = choice.account,
-            .model = choice.model,
+            .model = model,
             .effort = choice.effort,
         });
     }
@@ -2461,11 +2494,16 @@ fn startReview(self: *App) !void {
         if (!self.accounts.isAuthenticated(choice.account)) return self.reportNotice(
             .failure,
             "The {s} account {s} is not signed in, so the review cannot start.",
-            .{ @tagName(role), choice.account.label() },
+            .{ ai.command.review.roleLabel(role), choice.account.label() },
+        );
+        const model = choice.model orelse return self.reportNotice(
+            .failure,
+            "The {s} row names no model, so the review cannot start.",
+            .{ai.command.review.roleLabel(role)},
         );
         choices.set(machineRole(role), .{
             .account = choice.account,
-            .model = choice.model,
+            .model = model,
             .effort = choice.effort,
         });
     }
@@ -2531,7 +2569,7 @@ fn roleConversation(
         .presentation = Session.Conversation.empty(
             self.gpa,
             choice.account,
-            &choice.model,
+            choice.model,
             choice.effort,
         ),
     };
@@ -3018,21 +3056,23 @@ fn stopReview(self: *App, end: ReviewEnd) !void {
     // The return resets the double-Ctrl+C timer, so a press from review mode
     // cannot pair with one at the main prompt.
     self.ctrl_c_ms_last = self.nowMs() - ctrl_c_window_ms;
+    // The cost is an estimate at public rates, so the tilde marks it here as it
+    // marks it on the status line.
     switch (end) {
         .settled => try self.recordEvent(
             .information,
-            "Review settled. Rounds: {d} · Fixer passes: {d} · Cost: ${d:.2}",
+            "Review settled. Rounds: {d} · Fixer passes: {d} · Cost: ~${d:.2}",
             .{ rounds, passes, cost },
         ),
         .stopped => try self.recordEvent(
             .information,
-            "Review stopped at the {s}. Rounds: {d} · Fixer passes: {d} · Cost: ${d:.2}",
+            "Review stopped at the {s}. Rounds: {d} · Fixer passes: {d} · Cost: ~${d:.2}",
             .{ if (role) |value| @tagName(value) else "setup", rounds, passes, cost },
         ),
         .invalid => try self.recordEvent(
             .failure,
             "Review stopped on a second invalid {s} report. Rounds: {d} · Fixer passes: " ++
-                "{d} · Cost: ${d:.2}",
+                "{d} · Cost: ~${d:.2}",
             .{ if (role) |value| @tagName(value) else "role", rounds, passes, cost },
         ),
     }
@@ -3100,7 +3140,18 @@ fn commandContext(self: *App) ai.command.Context {
         .accounts = &self.accounts,
         .skill_registry = &self.skills,
         .review_setup = if (self.review_setup) |*setup| setup else null,
+        .wait = .{ .host = self, .paint = paintCommandWait },
     };
+}
+
+/// Paint the wait of a blocking command step. A command runs on the consumer,
+/// so the step that follows this stops the interface until it ends. The line
+/// replaces the footer, and the outcome of that step retracts it. A failed
+/// paint leaves the line unstated, and the step still runs.
+fn paintCommandWait(host: *anyopaque, text: []const u8) void {
+    const self: *App = @ptrCast(@alignCast(host));
+    self.session.showWait(text) catch return;
+    self.refresh() catch {};
 }
 
 /// Run `line` as a command. Null reports that the line is a message.
@@ -3165,7 +3216,7 @@ fn applyOutcome(self: *App, outcome: ai.command.Outcome) !void {
                 .presentation = Session.Conversation.empty(
                     self.gpa,
                     self.activeAccount(),
-                    &self.agent.model,
+                    self.agent.model,
                     self.agent.effort,
                 ),
             };
@@ -3188,12 +3239,22 @@ fn applyOutcome(self: *App, outcome: ai.command.Outcome) !void {
         .logout => |account| try self.logoutAccount(account),
         .switch_account => |account| {
             self.adopt(account);
-            try self.recordEvent(
-                .information,
-                "Drinky now uses {s} with {s}.",
-                .{ self.agent.model.name, account.label() },
-            );
+            if (self.agent.model) |model| {
+                try self.recordEvent(
+                    .information,
+                    "Drinky now uses {s} with {s}.",
+                    .{ model.name(), account.label() },
+                );
+            } else {
+                try self.reportModelStep(account, "Drinky now uses {s}. ", .{account.label()});
+            }
         },
+        // A fetch asks the provider with the credential of its account, so it
+        // meets the same principal boundary as a turn. The transition is
+        // therefore the one a turn takes, and the report is its own, because no
+        // turn ran. It mirrors the agent itself, so the shared mirror below must
+        // not run a second time.
+        .credential_replaced => |account| return self.acceptFetchReplacement(account),
         else => try self.session.applyOutcome(outcome),
     }
     // Commands can switch or drop the active account. Mirror the authoritative
@@ -3237,8 +3298,9 @@ fn mirrorAgentState(self: *App) !void {
 /// stops later saves, so its report lands once and names the way out.
 ///
 /// A signed-out session records nothing, because the entry names an account.
-/// This drops no user choice: `/model` and `/effort` both refuse while no
-/// account is active, so the only signed-out change is the sign-in itself.
+/// This drops no user choice: `/model` refuses while no account is active, and
+/// a signed-out effort change stays in the agent until the next sign-in, which
+/// records it with the account it lands on.
 ///
 /// A running review workflow records nothing either, because the active agent
 /// belongs to a role and not to the project. The role choices persist through
@@ -3247,7 +3309,7 @@ fn mirrorAgentState(self: *App) !void {
 fn recordState(self: *App) !void {
     if (self.review != null) return;
     const account = self.activeAccount() orelse return;
-    self.state.record(account, &self.agent.model, self.agent.effort) catch |err|
+    self.state.record(account, self.agent.model, self.agent.effort) catch |err|
         try self.reportStateSaveFailure(err);
 }
 
@@ -3276,8 +3338,9 @@ fn reportStateSaveFailure(self: *App, err: anyerror) !void {
     }
 }
 
-/// Log in to `account`, then switch to it on the model it ran last here, else on
-/// its default model.
+/// Log in to `account`, then switch to it on the model it ran last here. An
+/// account that ran none, and a name it no longer offers, leave the session
+/// with no model, and the report names `/model`.
 /// A pre-commit failure leaves the current account untouched. After the
 /// credential replacement, account readiness and replay invalidation complete
 /// before any fallible final presentation.
@@ -3310,11 +3373,15 @@ fn loginAccount(self: *App, account: ai.llm.Account) !void {
             @errorName(failure.save_error),
         ),
     }
-    try self.recordEvent(
-        .information,
-        "Drinky signed in to {s} and selected {s}.",
-        .{ account.label(), self.agent.model.name },
-    );
+    if (self.agent.model) |model| {
+        try self.recordEvent(
+            .information,
+            "Drinky signed in to {s} and selected {s}.",
+            .{ account.label(), model.name() },
+        );
+    } else {
+        try self.reportModelStep(account, "Drinky signed in to {s}. ", .{account.label()});
+    }
     switch (login) {
         .saved => {},
         .memory_only => |failure| try self.recordEvent(
@@ -3435,13 +3502,76 @@ fn adoptsCredential(self: *const App, account: ai.llm.Account) bool {
     return active == account;
 }
 
-/// Accept a credential that the store identifies as another principal. The
-/// worker stopped before its model request, so drop old evidence and metadata
-/// before this credential can run the restored turn.
-fn acceptCredentialReplacement(self: *App, account: ai.llm.Account) !void {
+/// Report the step that follows a credential transition of `account`. A session
+/// with no model runs no turn, so that report names the model step in place of
+/// the retry. The armed retry waits behind Ctrl+N until a model makes it
+/// runnable.
+fn reportCredentialStep(self: *App, account: ai.llm.Account, comptime lead: []const u8) !void {
+    if (self.agent.model == null) return self.reportModelStep(account, lead, .{});
+    return self.recordEvent(.information, lead ++ "Try the turn again.", .{});
+}
+
+/// Report one transition that leaves the session with no model. `lead` states
+/// what changed, and the step that follows unblocks `account`. The arguments of
+/// `lead` come first, and the label of `account` closes the line.
+///
+/// The catalog answers the step alone. An account whose list stands cached
+/// needs a pick, and an account with no list needs a fetch first. The project
+/// memory says nothing here, because one machine caches every list and each
+/// project remembers its own model.
+fn reportModelStep(
+    self: *App,
+    account: ai.llm.Account,
+    comptime lead: []const u8,
+    lead_args: anytype,
+) !void {
+    if (self.accounts.offersModel(account)) return self.recordEvent(
+        .information,
+        lead ++ "Select a model of {s} with /model.",
+        lead_args ++ .{account.label()},
+    );
+    return self.recordEvent(
+        .information,
+        lead ++ "Fetch the model list of {s} with /model.",
+        lead_args ++ .{account.label()},
+    );
+}
+
+/// Settle the session on a credential that the store identifies as another
+/// principal. The worker stopped before its provider request, so the evidence
+/// and the metadata of the replaced principal go first. The metadata holds the
+/// model list of the account, so that account offers no model until the next
+/// fetch.
+///
+/// Each entry reports its own step, because a turn and a fetch leave the user
+/// at a different place.
+fn settleCredentialReplacement(self: *App, account: ai.llm.Account) void {
     self.accounts.dropPrincipalMetadata(account);
     self.dropAccountEvidence(account);
     if (self.adoptsCredential(account)) self.adopt(account);
+}
+
+/// Accept the replacement that a turn met. That turn failed on the account it
+/// ran, so the report names the retry where a model stands, and the model step
+/// where none does.
+fn acceptCredentialReplacement(self: *App, account: ai.llm.Account) !void {
+    self.settleCredentialReplacement(account);
+    try self.reportCredentialStep(account, "");
+    try self.mirrorAgentState();
+}
+
+/// Accept the replacement that a model fetch met. No turn ran, and `account`
+/// can be one that the session does not run, so the report names no retry. It
+/// states the replacement and the dropped evidence, then the step of the
+/// fetched account alone.
+fn acceptFetchReplacement(self: *App, account: ai.llm.Account) !void {
+    self.settleCredentialReplacement(account);
+    try self.reportModelStep(
+        account,
+        "Drinky found a replacement credential for {s}. " ++
+            "Drinky removed the prior account evidence. ",
+        .{account.label()},
+    );
     try self.mirrorAgentState();
 }
 
@@ -3464,14 +3594,14 @@ fn rejectCredential(self: *App, account: ai.llm.Account) !void {
     };
     self.dropAccountEvidence(account);
     if (recovered) {
-        // `invalidate` dropped the limits the replaced credential discovered, so
-        // the model resolves again before the session shows it.
+        // `invalidate` dropped the model list of the replaced credential, so the
+        // model resolves again before the session shows it. That list belongs to
+        // the principal behind that credential, so the account offers no model
+        // until the next fetch.
         if (adopts) self.adopt(account);
-        try self.recordEvent(
-            .information,
-            "Drinky reloaded the refresh credential that another Drinky instance saved. " ++
-                "Try the turn again.",
-            .{},
+        try self.reportCredentialStep(
+            account,
+            "Drinky reloaded the refresh credential that another Drinky instance saved. ",
         );
         return self.mirrorAgentState();
     }
@@ -3493,11 +3623,19 @@ fn rejectCredential(self: *App, account: ai.llm.Account) !void {
         return self.mirrorAgentState();
     }
     if (maybe_next) |next| {
-        try self.recordEvent(
-            .information,
-            "Drinky signed out of {s}. Drinky now uses {s} with {s}.",
-            .{ account.label(), self.agent.model.name, next.label() },
-        );
+        if (self.agent.model) |model| {
+            try self.recordEvent(
+                .information,
+                "Drinky signed out of {s}. Drinky now uses {s} with {s}.",
+                .{ account.label(), model.name(), next.label() },
+            );
+        } else {
+            try self.reportModelStep(
+                next,
+                "Drinky signed out of {s}. Drinky now uses {s}. ",
+                .{ account.label(), next.label() },
+            );
+        }
     } else {
         try self.recordEvent(
             .information,
@@ -3523,9 +3661,10 @@ fn openLoginPicker(self: *App) !void {
 
 /// Drop `account`'s credentials. A logout of the active account hands the
 /// session to the next authenticated account. That account starts on the model
-/// it ran last here, else on its default model. When none remains, it drops to a
-/// signed-out state and opens the login picker so the user chooses how to sign
-/// back in. Commands cannot run mid-turn, so this never races a turn.
+/// it ran last here, and on no model where it ran none, so the report names
+/// `/model`. When no account remains, it drops to a signed-out state and opens
+/// the login picker so the user chooses how to sign back in. Commands cannot
+/// run mid-turn, so this never races a turn.
 fn logoutAccount(self: *App, account: ai.llm.Account) !void {
     const was_active = if (self.agent.client) |client| client.account() == account else false;
     self.accounts.logout(account) catch |err| {
@@ -3540,10 +3679,17 @@ fn logoutAccount(self: *App, account: ai.llm.Account) !void {
         return self.recordEvent(.information, "Drinky signed out of {s}.", .{account.label()});
     if (self.accounts.firstAuthenticated()) |next| {
         self.adopt(next);
-        return self.recordEvent(
-            .information,
-            "Drinky signed out of {s}. Drinky now uses {s} with {s}.",
-            .{ account.label(), self.agent.model.name, next.label() },
+        if (self.agent.model) |model| {
+            return self.recordEvent(
+                .information,
+                "Drinky signed out of {s}. Drinky now uses {s} with {s}.",
+                .{ account.label(), model.name(), next.label() },
+            );
+        }
+        return self.reportModelStep(
+            next,
+            "Drinky signed out of {s}. Drinky now uses {s}. ",
+            .{ account.label(), next.label() },
         );
     }
     // No account remains: sign out and let the user choose from the login picker
@@ -3559,9 +3705,9 @@ fn logoutAccount(self: *App, account: ai.llm.Account) !void {
     try self.openLoginPicker();
 }
 
-/// Switch the agent to `account` on the model that account ran last, else on its
-/// default model. The client is present because the caller just authenticated the
-/// account or read it from the registry.
+/// Switch the agent to `account` on the model that account ran last, and on no
+/// model where it ran none. The client is present because the caller just
+/// authenticated the account or read it from the registry.
 fn adopt(self: *App, account: ai.llm.Account) void {
     self.agent.switchTo(self.accounts.client(account).?, self.accountModel(account));
 }
@@ -3839,6 +3985,13 @@ fn initForTest(self: *App, gpa: std.mem.Allocator) void {
     self.running = true;
 }
 
+/// Test scaffolding: assert that the agent runs the model that `expected` names.
+/// An agent with no model fails the one test rather than aborting the binary.
+fn expectModel(self: *const App, expected: []const u8) !void {
+    const model = self.agent.model orelse return error.TestExpectedModel;
+    try std.testing.expectEqualStrings(expected, model.name());
+}
+
 // The intro line is the legend of the interface. It holds every key hint in the
 // order of the constant, and the pointer at the command list closes it. The line
 // wraps, so its width costs no hint at a narrow window.
@@ -3993,13 +4146,17 @@ test "a turn failure the agent named itself reads as a sentence, not an error na
     }
     // A credential the turn can still use names the retry, not a sign-in.
     for ([_]anyerror{
-        error.CredentialReplaced,
         error.TokenServiceUnavailable,
         error.StoreBusy,
     }) |err| {
         const text = turnFailureText(err).?;
         try std.testing.expect(std.mem.indexOf(u8, text, "Try the turn again.") != null);
     }
+    // A replacement runs before the transition that resolves the model, so the
+    // app names the next step and this text names none.
+    const replacement = turnFailureText(error.CredentialReplaced).?;
+    try std.testing.expect(std.mem.indexOf(u8, replacement, "Try the turn again.") == null);
+    try std.testing.expect(std.mem.indexOf(u8, replacement, "/model") == null);
     // A rejected credential leaves the account resolution to the app.
     const credentials = turnFailureText(error.TokenGrantRejected).?;
     try std.testing.expect(std.mem.indexOf(u8, credentials, "signed out") == null);
@@ -4018,13 +4175,13 @@ test "a grant rejection refuses an account without a refresh credential" {
     var app: App = undefined;
     app.initForTest(gpa);
     app.agent = ai.Agent.init(gpa, io, client, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     app.session.account_shown = .anthropic_api;
     app.session.beginTurn(1);
@@ -4050,7 +4207,7 @@ test "OAuth login cancellation escapes without a failure notice" {
 
     var app: App = undefined;
     app.initForTest(gpa);
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
 
     const block_count = app.session.transcript.blocks().len;
@@ -4065,7 +4222,7 @@ test "a login the provider refused reads as a sentence, not an error name" {
 
     var app: App = undefined;
     app.initForTest(gpa);
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
 
     // A rejection names the one action that helps. An unavailable service does
@@ -4107,7 +4264,7 @@ test "OAuth callback bounds have friendly failure notices" {
 
     var app: App = undefined;
     app.initForTest(gpa);
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
 
     const cases = [_]struct { anyerror, []const u8 }{
@@ -4172,7 +4329,7 @@ test "turn producers keep their captured generation" {
     app.initForTest(gpa);
     defer app.drainQueue();
     app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
@@ -4304,13 +4461,13 @@ test "a late steering return restores a paste as a live placeholder atom" {
     var app: App = undefined;
     app.initForTest(gpa);
     app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
 
     const payload = "late\n" ** 15;
@@ -4344,13 +4501,13 @@ test "ctrl+c during a turn clears the draft first and cancels only on an empty e
     app.initForTest(gpa);
     defer app.drainQueue();
     app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     app.session.beginTurn(1);
     try spawnCanceledTurn(&app);
@@ -4378,13 +4535,13 @@ test "esc and ctrl+d cancel a turn and keep the draft" {
     app.initForTest(gpa);
     defer app.drainQueue();
     app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
 
     // A cancel backs out of the turn alone: the draft stays, and Drinky runs on, so
@@ -4420,13 +4577,13 @@ test "a key between two esc presses drops the turn-cancel confirmation" {
     app.initForTest(gpa);
     defer app.drainQueue();
     app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     app.session.beginTurn(1);
     try spawnCanceledTurn(&app);
@@ -4454,7 +4611,7 @@ test "a key between two ctrl+d presses drops the quit confirmation" {
 
     var app: App = undefined;
     app.initForTest(gpa);
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     try app.session.editor.insert("draft");
 
@@ -4482,13 +4639,13 @@ test "canceling a turn joins and clears its active worker" {
     var app: App = undefined;
     app.initForTest(gpa);
     app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     app.session.beginTurn(1);
 
@@ -4543,13 +4700,13 @@ test "canceling a turn restores in-flight steering and reads the usage again" {
     var app: App = undefined;
     app.initForTest(gpa);
     app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     app.session.beginTurn(1);
 
@@ -4585,13 +4742,13 @@ test "cancel preflight failure leaves the turn and steering untouched" {
     var app: App = undefined;
     app.initForTest(gpa);
     app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     app.session.beginTurn(1);
 
@@ -4623,13 +4780,13 @@ test "cancel restores steering before event allocation failure" {
     var app: App = undefined;
     app.initForTest(gpa);
     app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     app.session.beginTurn(1);
 
@@ -4663,13 +4820,13 @@ test "ctrl+p recalls the steering queue after in-progress editor text" {
     var app: App = undefined;
     app.initForTest(gpa);
     app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     app.session.beginTurn(1);
 
@@ -4694,13 +4851,13 @@ test "ctrl+p restores a steered paste as a live placeholder atom" {
     var app: App = undefined;
     app.initForTest(gpa);
     app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     app.session.beginTurn(1);
 
@@ -4733,13 +4890,13 @@ test "cancel restores an in-flight steered paste as a live placeholder atom" {
     var app: App = undefined;
     app.initForTest(gpa);
     app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     app.session.beginTurn(1);
 
@@ -4785,13 +4942,13 @@ test "cancel restores a steered paste even after its consumed event applied" {
     var app: App = undefined;
     app.initForTest(gpa);
     app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     app.session.beginTurn(1);
 
@@ -4839,13 +4996,13 @@ test "ctrl+p recalls the pending suffix and retains the in-flight prefix" {
     var app: App = undefined;
     app.initForTest(gpa);
     app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     app.session.beginTurn(1);
 
@@ -4871,13 +5028,13 @@ test "cancel restores an in-flight prefix retained by ctrl+p" {
     var app: App = undefined;
     app.initForTest(gpa);
     app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     app.session.beginTurn(1);
 
@@ -4905,13 +5062,13 @@ test "a cancel that loses the race waits for the terminal fence" {
     var app: App = undefined;
     app.initForTest(gpa);
     app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     app.session.beginTurn(7);
 
@@ -4954,13 +5111,13 @@ test "cancel does not commit stale text across a reset held in the current batch
     app.initForTest(gpa);
     defer app.drainQueue();
     app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     defer app.input.deinit();
     app.session.beginTurn(1);
@@ -5022,13 +5179,13 @@ test "cancel preserves progress before a queued terminal fence" {
     var app: App = undefined;
     app.initForTest(gpa);
     app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     defer app.input.deinit();
     app.session.beginTurn(11);
@@ -5084,13 +5241,13 @@ test "cancel replaces an interrupted terminal fence after queued progress" {
     app.initForTest(gpa);
     defer app.drainQueue();
     app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     defer app.input.deinit();
     app.session.beginTurn(12);
@@ -5154,13 +5311,13 @@ test "an interrupted terminal fence retries after a full queue drain" {
     app.initForTest(gpa);
     defer app.drainQueue();
     app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     defer app.input.deinit();
     app.session.beginTurn(13);
@@ -5218,13 +5375,13 @@ test "a cancel that loses the race applies the failed joined result" {
     app.initForTest(gpa);
     defer app.drainQueue();
     app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     app.session.beginTurn(3);
     try app.session.transcript.append(.user, .{}, "prompt");
@@ -5275,13 +5432,13 @@ test "a joined completion returns late steering to the editor" {
     app.turn_generation = 3;
     defer app.drainQueue();
     app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     app.session.beginTurn(3);
 
@@ -5331,13 +5488,13 @@ test "shutdown frees the worker result without restoring or recording an event" 
     var app: App = undefined;
     app.initForTest(gpa);
     app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     app.session.beginTurn(1);
 
@@ -5364,13 +5521,13 @@ test "a delayed consumed event after ctrl+p cannot remove newer steering" {
     var app: App = undefined;
     app.initForTest(gpa);
     app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     app.session.beginTurn(1);
 
@@ -5416,13 +5573,13 @@ test "a delivery restored after ctrl+p recalls its retained rich drafts" {
     var app: App = undefined;
     app.initForTest(gpa);
     app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     app.session.beginTurn(1);
 
@@ -5462,13 +5619,13 @@ test "recall of literal-edge-trimmed steering rejoins without edge spaces" {
     var app: App = undefined;
     app.initForTest(gpa);
     app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     app.session.beginTurn(1);
 
@@ -5492,13 +5649,13 @@ test "mid-turn Enter queues a message but refuses a slash line or a blank line" 
     var app: App = undefined;
     app.initForTest(gpa);
     app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     app.session.beginTurn(1);
 
@@ -5582,13 +5739,13 @@ test "late placeholder steering returns before a newer key in the same batch" {
     var app: App = undefined;
     app.initForTest(gpa);
     app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     defer app.input.deinit();
     defer app.drainQueue();
@@ -5636,13 +5793,13 @@ test "a drained batch routes only the active turn generation" {
     var app: App = undefined;
     app.initForTest(gpa);
     app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
 
     app.session.beginTurn(1);
@@ -5691,7 +5848,7 @@ test "a resize event marks an idle interface dirty" {
 
     var app: App = undefined;
     app.initForTest(gpa);
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
 
     try std.testing.expect(!try app.applyBatch(&[_]Session.UiEvent{.resize}));
@@ -5706,7 +5863,7 @@ test "a failed batch frees its unprocessed turn events" {
 
     var app: App = undefined;
     app.initForTest(gpa);
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     app.session.beginTurn(1);
 
@@ -5743,7 +5900,7 @@ test "a legacy escape byte closes a page after its wait" {
     var app: App = undefined;
     app.initForTest(gpa);
     defer app.input.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     try app.session.openPage(&.{ .title = "Colors", .content = "", .presentation = .colors });
 
@@ -5782,7 +5939,7 @@ test "a page close drops the rest of an exit attempt in one chunk" {
         var app: App = undefined;
         app.initForTest(gpa);
         defer app.input.deinit();
-        app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+        app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
         defer app.session.deinit();
         try app.session.editor.insert("draft");
         try app.session.openPage(&.{ .title = "Colors", .content = "", .presentation = .colors });
@@ -5810,13 +5967,13 @@ test "a picker confirmation keeps the characters typed behind it" {
     // The confirmation mirrors the agent state into the session, so the agent must
     // be real. A signed-out one records no project state.
     app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
 
     const options = try gpa.alloc([]const u8, 1);
@@ -5852,13 +6009,13 @@ test "a turn cancel drops the rest of an exit attempt in one chunk" {
     defer app.drainQueue();
     defer app.input.deinit();
     app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     app.session.beginTurn(1);
     try spawnCanceledTurn(&app);
@@ -5878,7 +6035,7 @@ test "ctrl+c clears then quits within the window and a draft makes ctrl+d ask tw
 
     var app: App = undefined;
     app.initForTest(gpa);
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
 
     // The first Ctrl+D with a draft warns instead of a quit, and the warning
@@ -5906,6 +6063,73 @@ test "ctrl+c clears then quits within the window and a draft makes ctrl+d ask tw
     try std.testing.expect(!app.running);
 }
 
+// Drinky compiles no model in, so a signed-in account with no fetched list can
+// send nothing. The refusal names the command that fixes it, the line stays out
+// of the transcript, and the editor keeps it.
+test "a send refuses while the account offers no model" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    app.accounts = ai.testing.accounts(.{ .anthropic = "sk-ant" });
+    app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_api), .{
+        .model = null,
+        .system = "",
+        .retry = .{},
+        .environ = .empty,
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, null, .none);
+    defer app.session.deinit();
+
+    try app.session.editor.insert("do the work");
+    try app.submit();
+
+    try std.testing.expect(app.session.mode == .prompt);
+    try std.testing.expectEqualStrings("do the work", app.session.editor.visible());
+    try std.testing.expectEqual(@as(usize, 0), app.session.transcript.blocks().len);
+    try std.testing.expect(app.session.notice != null);
+    try std.testing.expectEqualStrings(no_model_refusal, app.session.notice.?.content);
+}
+
+// A refusal starts no turn, so the text the user typed must survive it. The
+// user reads the notice, signs in or picks a model, and sends the same line
+// again. A skill line meets the same two gates, so it keeps its text too.
+test "a refused send keeps the typed text" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = test_anthropic_model,
+        .system = "",
+        .retry = .{},
+        .environ = .empty,
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    defer app.session.deinit();
+
+    try app.session.editor.insert("keep this line");
+    try app.submit();
+    try std.testing.expectEqualStrings("keep this line", app.session.editor.visible());
+
+    try app.applySubmittedCommand(.{ .prompt = .{
+        .name = try gpa.dupe(u8, "zig-style"),
+        .arguments = try gpa.dupe(u8, "review this file"),
+        .content = try gpa.dupe(u8, "the whole skill file"),
+        .source = try gpa.dupe(u8, "/work/.agents/skills/zig-style/SKILL.md"),
+    } });
+    try std.testing.expectEqualStrings("keep this line", app.session.editor.visible());
+    try std.testing.expectEqual(@as(usize, 0), app.session.transcript.blocks().len);
+}
+
 test "/new clears the conversation and the scrollback without a configuration change" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -5915,14 +6139,14 @@ test "/new clears the conversation and the scrollback without a configuration ch
     var app: App = undefined;
     app.initForTest(gpa);
     app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "test system",
         .retry = .{},
         .environ = .empty,
         .effort = .high,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .high);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .high);
     defer app.session.deinit();
 
     const cache_key = app.agent.cache_key;
@@ -5930,12 +6154,7 @@ test "/new clears the conversation and the scrollback without a configuration ch
         .role = .user,
         .text = try gpa.dupe(u8, "old prompt"),
     } });
-    var seeded: ai.Agent.Stats = .{ .cost = 2.5, .cache_usage = .{ .input = 10 }, .model_count = 1 };
-    seeded.by_model[0] = .{
-        .name = anthropic_default.name,
-        .cost = 2.5,
-        .usage = .{ .input = 10 },
-    };
+    const seeded: ai.Agent.Stats = .{ .cost = 2.5, .cache_usage = .{ .input = 10 } };
     app.agent.stats = seeded;
     try app.agent.steering.push("old steering");
     try app.session.transcript.append(.user, .{}, "old prompt");
@@ -5970,7 +6189,7 @@ test "/new clears the conversation and the scrollback without a configuration ch
     try std.testing.expect(std.meta.eql(ai.Agent.Stats{}, app.session.stats_shown));
     try std.testing.expect(!app.session.hasSteering());
     try std.testing.expectEqualStrings("", app.session.editor.visible());
-    try std.testing.expectEqualStrings(anthropic_default.name, app.agent.model.name);
+    try app.expectModel(test_anthropic_model.name());
     try std.testing.expectEqual(ai.llm.Effort.high, app.agent.effort);
 }
 
@@ -5987,14 +6206,14 @@ test "switchConversation swaps the agent and the interface together, and restore
     var app: App = undefined;
     app.initForTest(gpa);
     app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "test system",
         .retry = .{},
         .environ = .empty,
         .effort = .high,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .high);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .high);
     defer app.session.deinit();
 
     try app.agent.items.append(gpa, .{ .message = .{
@@ -6007,13 +6226,13 @@ test "switchConversation swaps the agent and the interface together, and restore
 
     var role_b: Conversation = .{
         .agent = ai.Agent.init(gpa, io, null, .{
-            .model = anthropic_default,
+            .model = test_anthropic_model,
             .system = "test system",
             .retry = .{},
             .environ = .empty,
             .effort = .high,
         }),
-        .presentation = Session.Conversation.empty(gpa, null, &anthropic_default, .high),
+        .presentation = Session.Conversation.empty(gpa, null, test_anthropic_model, .high),
     };
     try role_b.agent.items.append(gpa, .{ .message = .{
         .role = .user,
@@ -6070,14 +6289,14 @@ test "switchConversation forgets a skill proof from the conversation it replaces
     var app: App = undefined;
     app.initForTest(gpa);
     app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "test system",
         .retry = .{},
         .environ = .empty,
         .effort = .high,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .high);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .high);
     defer app.session.deinit();
     app.skill_guard = .{};
     try app.skill_guard.add(.{
@@ -6092,13 +6311,13 @@ test "switchConversation forgets a skill proof from the conversation it replaces
 
     var role_b: Conversation = .{
         .agent = ai.Agent.init(gpa, io, null, .{
-            .model = anthropic_default,
+            .model = test_anthropic_model,
             .system = "test system",
             .retry = .{},
             .environ = .empty,
             .effort = .high,
         }),
-        .presentation = Session.Conversation.empty(gpa, null, &anthropic_default, .high),
+        .presentation = Session.Conversation.empty(gpa, null, test_anthropic_model, .high),
     };
     defer role_b.deinit();
 
@@ -6120,13 +6339,13 @@ test "/system opens the composed prompt alone and escape restores the conversati
     app.initForTest(gpa);
     app.prompt = full_prompt;
     app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = full_prompt,
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
 
     try app.session.transcript.append(.event, .{}, "history marker");
@@ -6146,7 +6365,7 @@ test "/system opens the composed prompt alone and escape restores the conversati
     try std.testing.expect(std.mem.indexOf(u8, page_bytes, "Core") != null);
     try std.testing.expect(std.mem.indexOf(u8, page_bytes, "# Core") == null);
     try std.testing.expect(std.mem.indexOf(u8, page_bytes, "history marker") == null);
-    try std.testing.expect(std.mem.indexOf(u8, page_bytes, anthropic_default.name) == null);
+    try std.testing.expect(std.mem.indexOf(u8, page_bytes, test_anthropic_model.name()) == null);
 
     try app.handleKey(&.{ .char = 'm' });
     try std.testing.expect(app.session.mode.viewing.presentation == .source);
@@ -6203,13 +6422,13 @@ test "/colors opens the color preview page and ctrl+d restores the conversation"
     app.initForTest(gpa);
     app.prompt = "unused";
     app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "unused",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
 
     try app.session.transcript.append(.event, .{}, "history marker");
@@ -6267,13 +6486,13 @@ test "an account-switch command clears the quota snapshot and records the projec
     var app: App = undefined;
     app.initForTest(gpa);
     app.agent = ai.Agent.init(gpa, io, anthropic_client, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     app.state = try State.open(gpa, io, &.{
         .working_directory = home,
@@ -6281,7 +6500,7 @@ test "an account-switch command clears the quota snapshot and records the projec
         .project = "/work",
     });
     defer app.state.deinit();
-    try app.state.seed(.anthropic_subscription, &anthropic_default, .none);
+    try app.state.seed(.anthropic_subscription, test_anthropic_model, .none);
 
     app.agent.stats.quota = .{
         .secondary = .{ .used_percent = 77, .window_minutes = 10080 },
@@ -6289,14 +6508,14 @@ test "an account-switch command clears the quota snapshot and records the projec
     app.session.stats_shown = app.agent.stats;
 
     const openai_client = ai.provider.Client.init(gpa, io, .{ .openai_api = "sk-test" }, .{});
-    app.agent.switchTo(openai_client, openai_default);
+    app.agent.switchTo(openai_client, test_openai_model);
     try app.applyOutcome(
         try ai.command.Outcome.reportEvent(gpa, .information, "switched", .{}),
     );
 
     try std.testing.expect(app.agent.stats.quota == null);
     try std.testing.expect(app.session.stats_shown.quota == null);
-    try std.testing.expectEqualStrings(openai_default.name, app.session.model_shown.name);
+    try std.testing.expectEqualStrings(test_openai_model.name(), app.session.model_shown.?.name());
     try std.testing.expectEqual(ai.llm.Account.openai_api, app.session.account_shown.?);
 
     // The switch also lands in `state.json`, so the next start resumes on it.
@@ -6306,11 +6525,11 @@ test "an account-switch command clears the quota snapshot and records the projec
     try std.testing.expectEqualStrings("openai_api", entry.get("account").?.string);
     try std.testing.expectEqualStrings("none", entry.get("effort").?.string);
     const listed = entry.get("models").?.object;
-    try std.testing.expectEqualStrings(openai_default.name, listed.get("openai_api").?.string);
+    try std.testing.expectEqualStrings(test_openai_model.name(), listed.get("openai_api").?.string);
     // The account left behind keeps the model it ran, so a switch back returns
     // to it even after a restart.
     try std.testing.expectEqualStrings(
-        anthropic_default.name,
+        test_anthropic_model.name(),
         listed.get("anthropic_subscription").?.string,
     );
 }
@@ -6335,16 +6554,16 @@ test "an account switch projects the conversation for the new account" {
     // The effort names a thinking control, so the request of this account replays
     // its stored reasoning.
     app.agent = ai.Agent.init(gpa, io, anthropic_client, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
         .effort = .high,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .high);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .high);
     defer app.session.deinit();
-    app.session.showSetup(.anthropic_subscription, anthropic_default, .high);
+    app.session.showSetup(.anthropic_subscription, test_anthropic_model, .high);
 
     const replay: ai.llm.Item.Reasoning.Replay = .{ .anthropic_subscription = .{
         .signature = .{ .text = "weigh it", .signature = "proof" },
@@ -6356,7 +6575,7 @@ test "an account switch projects the conversation for the new account" {
 
     const switched_start = out.written().len;
     const openai_client = ai.provider.Client.init(gpa, io, .{ .openai_api = "sk-test" }, .{});
-    app.agent.switchTo(openai_client, openai_default);
+    app.agent.switchTo(openai_client, test_openai_model);
     try app.applyOutcome(
         try ai.command.Outcome.reportEvent(gpa, .information, "switched", .{}),
     );
@@ -6393,6 +6612,8 @@ test "startup resumes on the account, model, and effort level this project used 
         .openai = "sk-openai",
     });
     defer app.accounts.deinit();
+    try ai.testing.seedAccount(&app.accounts, .openai_api, &.{"gpt-5.6-luna"});
+    try ai.testing.seedAccount(&app.accounts, .anthropic_api, &.{"claude-opus-5"});
     app.state = try State.open(gpa, io, &.{
         .working_directory = home,
         .home = home,
@@ -6403,13 +6624,10 @@ test "startup resumes on the account, model, and effort level this project used 
     // The remembered account wins over the first authenticated one, which is the
     // Anthropic key here.
     try std.testing.expectEqual(ai.llm.Account.openai_api, app.startAccount().?);
-    try std.testing.expectEqualStrings("gpt-5.6-luna", app.accountModel(.openai_api).name);
-    // A remembered model belongs to the account that ran it. Any other account
-    // starts on its own default.
-    try std.testing.expectEqualStrings(
-        anthropic_default.name,
-        app.accountModel(.anthropic_api).name,
-    );
+    try std.testing.expectEqualStrings("gpt-5.6-luna", app.accountModel(.openai_api).?.name());
+    // A remembered model belongs to the account that ran it. An account that
+    // remembered none starts without one.
+    try std.testing.expect(app.accountModel(.anthropic_api) == null);
     // The remembered effort level outranks a configured default.
     try std.testing.expectEqual(ai.llm.Effort.low, app.startEffort(.max));
 }
@@ -6430,6 +6648,7 @@ test "a signed-out remembered account falls back and the defaults fill the rest"
     app.initForTest(gpa);
     app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{ .anthropic = "sk-anthropic" });
     defer app.accounts.deinit();
+    try ai.testing.seedAccount(&app.accounts, .openai_api, &.{"gpt-5.6-luna"});
     app.state = try State.open(gpa, io, &.{
         .working_directory = home,
         .home = home,
@@ -6438,15 +6657,14 @@ test "a signed-out remembered account falls back and the defaults fill the rest"
     defer app.state.deinit();
 
     try std.testing.expectEqual(ai.llm.Account.anthropic_api, app.startAccount().?);
-    try std.testing.expectEqualStrings(
-        anthropic_default.name,
-        app.accountModel(.anthropic_api).name,
-    );
+    // The remembered account offers no model here, so the session starts on none
+    // and the user fetches a list.
+    try std.testing.expect(app.accountModel(.anthropic_api) == null);
     // The memory holds for the account that ran the model, even while that
     // account has no credentials. A later login therefore restores the model and
     // does not reset to the account's default.
-    try std.testing.expectEqualStrings("gpt-5.6-luna", app.accountModel(.openai_api).name);
-    // With nothing remembered, the configured default wins, else the compiled one.
+    try std.testing.expectEqualStrings("gpt-5.6-luna", app.accountModel(.openai_api).?.name());
+    // With nothing remembered, the configured effort wins, else the compiled one.
     try std.testing.expectEqual(ai.llm.Effort.medium, app.startEffort(.medium));
     try std.testing.expectEqual(effort_default, app.startEffort(null));
 }
@@ -6460,7 +6678,7 @@ test "a switch back to an account restores the model that account ran" {
     defer tmp.cleanup();
     const home = try tmpPath(gpa, io, &tmp, "");
     defer gpa.free(home);
-    // The project last ran an Anthropic model that is not the compiled default.
+    // The project last ran one model under the Anthropic API account.
     try State.writeForTest(io, &tmp,
         \\{ "/work": { "account": "anthropic_api", "effort": "none",
         \\    "models": { "anthropic_api": "claude-sonnet-5" } } }
@@ -6473,6 +6691,8 @@ test "a switch back to an account restores the model that account ran" {
         .openai = "sk-openai",
     });
     defer app.accounts.deinit();
+    try ai.testing.seedAccount(&app.accounts, .anthropic_api, &.{"claude-sonnet-5"});
+    try ai.testing.seedAccount(&app.accounts, .openai_api, &.{"gpt-5.6-sol"});
     app.state = try State.open(gpa, io, &.{
         .working_directory = home,
         .home = home,
@@ -6481,7 +6701,7 @@ test "a switch back to an account restores the model that account ran" {
     defer app.state.deinit();
 
     const start_model = app.accountModel(.anthropic_api);
-    try std.testing.expectEqualStrings("claude-sonnet-5", start_model.name);
+    try std.testing.expectEqualStrings("claude-sonnet-5", start_model.?.name());
     app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_api), .{
         .model = start_model,
         .system = "",
@@ -6491,17 +6711,16 @@ test "a switch back to an account restores the model that account ran" {
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, start_model, .none);
     defer app.session.deinit();
-    try app.state.seed(.anthropic_api, &start_model, .none);
+    try app.state.seed(.anthropic_api, start_model, .none);
 
-    // Away to another account: that account has run nothing here, so it takes
-    // its own default.
+    // Away to another account: that account has run nothing here, so it starts
+    // without a model until the user picks one.
     try app.applyOutcome(.{ .switch_account = .openai_api });
-    try std.testing.expectEqualStrings(openai_default.name, app.agent.model.name);
+    try std.testing.expect(app.agent.model == null);
 
-    // Back again. The model the account ran returns, and the compiled default
-    // never overwrites it.
+    // Back again. The model the account ran returns.
     try app.applyOutcome(.{ .switch_account = .anthropic_api });
-    try std.testing.expectEqualStrings("claude-sonnet-5", app.agent.model.name);
+    try app.expectModel("claude-sonnet-5");
 
     // Both models reach the file, so the next start knows them both.
     var file = (try ai.json_store.open(gpa, io, app.state.path)).?;
@@ -6510,7 +6729,140 @@ test "a switch back to an account restores the model that account ran" {
     try std.testing.expectEqualStrings("anthropic_api", entry.get("account").?.string);
     const listed = entry.get("models").?.object;
     try std.testing.expectEqualStrings("claude-sonnet-5", listed.get("anthropic_api").?.string);
-    try std.testing.expectEqualStrings(openai_default.name, listed.get("openai_api").?.string);
+    // The account that ran no model here names none in the file.
+    try std.testing.expect(listed.get("openai_api") == null);
+}
+
+// The model memory of a project and the model cache of the machine live in two
+// files. A project therefore starts with no remembered model while the list of
+// that account stands cached. The step then names the pick, because a fetch
+// returns the same list.
+test "a transition names the pick where the list of the account stands cached" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(home);
+    // The project ran one model under the Anthropic API account, and none under
+    // the OpenAI API account.
+    try State.writeForTest(io, &tmp,
+        \\{ "/work": { "account": "anthropic_api", "effort": "none",
+        \\    "models": { "anthropic_api": "claude-sonnet-5" } } }
+    );
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{
+        .anthropic = "sk-anthropic",
+        .openai = "sk-openai",
+    });
+    defer app.accounts.deinit();
+    try ai.testing.seedAccount(&app.accounts, .anthropic_api, &.{"claude-sonnet-5"});
+    app.state = try State.open(gpa, io, &.{
+        .working_directory = home,
+        .home = home,
+        .project = "/work",
+    });
+    defer app.state.deinit();
+
+    const start_model = app.accountModel(.anthropic_api);
+    app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_api), .{
+        .model = start_model,
+        .system = "",
+        .retry = .{},
+        .environ = .empty,
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, start_model, .none);
+    defer app.session.deinit();
+
+    // No fetch ran for the OpenAI API account, so the step names the fetch.
+    try app.applyOutcome(.{ .switch_account = .openai_api });
+    try std.testing.expect(app.agent.model == null);
+    try std.testing.expectEqualStrings(
+        "Drinky now uses OpenAI API. Fetch the model list of OpenAI API with /model.",
+        app.session.transcript.blocks()[0].content.event.text.items,
+    );
+
+    // The machine caches that list now, and this project still remembers no
+    // model of that account.
+    try ai.testing.seedAccount(&app.accounts, .openai_api, &.{"gpt-5.6-sol"});
+    try app.applyOutcome(.{ .switch_account = .anthropic_api });
+    try app.expectModel("claude-sonnet-5");
+    try app.applyOutcome(.{ .switch_account = .openai_api });
+    try std.testing.expect(app.agent.model == null);
+
+    const blocks = app.session.transcript.blocks();
+    try std.testing.expectEqualStrings(
+        "Drinky now uses OpenAI API. Select a model of OpenAI API with /model.",
+        blocks[blocks.len - 1].content.event.text.items,
+    );
+}
+
+// A logout, a replaced credential, and a start before the first fetch each leave
+// the catalog without the list of an account. The name that account ran must
+// survive the next save, so a later fetch returns the account to that model.
+test "a model name the catalog cannot resolve stays in the file" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(home);
+    try State.writeForTest(io, &tmp,
+        \\{ "/work": { "account": "anthropic_api", "effort": "none",
+        \\    "models": { "anthropic_api": "claude-sonnet-5",
+        \\      "openai_api": "gpt-5.6-sol" } } }
+    );
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{
+        .anthropic = "sk-anthropic",
+        .openai = "sk-openai",
+    });
+    defer app.accounts.deinit();
+    // The catalog holds no list for the Anthropic API account, so the stored
+    // name resolves to no model.
+    try ai.testing.seedAccount(&app.accounts, .openai_api, &.{"gpt-5.6-sol"});
+    app.state = try State.open(gpa, io, &.{
+        .working_directory = home,
+        .home = home,
+        .project = "/work",
+    });
+    defer app.state.deinit();
+
+    try std.testing.expect(app.accountModel(.anthropic_api) == null);
+    app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_api), .{
+        .model = null,
+        .system = "",
+        .retry = .{},
+        .environ = .empty,
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, null, .none);
+    defer app.session.deinit();
+    try app.state.seed(.anthropic_api, null, .none);
+
+    // The switch writes the whole entry. The unresolved name stays in it.
+    try app.applyOutcome(.{ .switch_account = .openai_api });
+    var file = (try ai.json_store.open(gpa, io, app.state.path)).?;
+    defer file.deinit();
+    const listed = file.entry("/work").?.get("models").?.object;
+    try std.testing.expectEqualStrings("claude-sonnet-5", listed.get("anthropic_api").?.string);
+    try std.testing.expectEqualStrings("gpt-5.6-sol", listed.get("openai_api").?.string);
+
+    // A fetch of that list returns the account to the model it ran.
+    try ai.testing.seedAccount(&app.accounts, .anthropic_api, &.{"claude-sonnet-5"});
+    try std.testing.expectEqualStrings(
+        "claude-sonnet-5",
+        app.accountModel(.anthropic_api).?.name(),
+    );
 }
 
 test "a remembered account does not resume when no account is authenticated" {
@@ -6570,13 +6922,13 @@ test "the logout of the last account signs out and opens the login picker" {
     defer app.accounts.deinit();
     try std.testing.expect(app.accounts.isAuthenticated(.anthropic_subscription));
     app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_subscription), .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
 
     try app.applyOutcome(.{ .logout = .anthropic_subscription });
@@ -6596,6 +6948,109 @@ test "the logout of the last account signs out and opens the login picker" {
     try std.testing.expectEqualStrings("Sign in", picker.title);
     try std.testing.expectEqual(std.enums.values(ai.llm.Account).len, picker.options.len);
     try std.testing.expectEqualStrings("Anthropic Subscription", picker.options[0]);
+}
+
+// The next account can offer no model, because no fetch ran for it. The logout
+// must report that state instead of unwrapping a model that is not there.
+test "the logout of the active account adopts a next account with no model" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(home);
+
+    // A signed-in subscription plus an environment key, so one account remains
+    // after the logout. No fetch ran, so that account offers no model.
+    var store = try tmp.dir.createDirPathOpen(io, ".drinky", .{});
+    store.close(io);
+    try tmp.dir.writeFile(io, .{
+        .sub_path = ".drinky/auth.json",
+        .data =
+        \\{ "anthropic_subscription":
+        \\    { "access": "a", "refresh": "r", "expires_ms": 4102444800000 } }
+        ,
+    });
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{ .anthropic = "key" });
+    defer app.accounts.deinit();
+    app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_subscription), .{
+        .model = test_anthropic_model,
+        .system = "",
+        .retry = .{},
+        .environ = .empty,
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    defer app.session.deinit();
+
+    try app.applyOutcome(.{ .logout = .anthropic_subscription });
+
+    // The session moved to the remaining account and holds no model. The report
+    // names that account, because the transcript is the durable record of the
+    // move.
+    try std.testing.expectEqual(ai.llm.Account.anthropic_api, app.session.account_shown.?);
+    try std.testing.expect(app.agent.model == null);
+    try std.testing.expectEqualStrings(
+        "Drinky signed out of Anthropic Subscription. Drinky now uses Anthropic API. " ++
+            "Fetch the model list of Anthropic API with /model.",
+        app.session.transcript.blocks()[0].content.event.text.items,
+    );
+}
+
+// The logout reads the same helper, so the step there follows the catalog too.
+// The next account holds a cached list and no remembered model, so the user
+// picks from that list.
+test "the logout of the active account names the pick where the next list stands" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(home);
+
+    var store = try tmp.dir.createDirPathOpen(io, ".drinky", .{});
+    store.close(io);
+    try tmp.dir.writeFile(io, .{
+        .sub_path = ".drinky/auth.json",
+        .data =
+        \\{ "anthropic_subscription":
+        \\    { "access": "a", "refresh": "r", "expires_ms": 4102444800000 } }
+        ,
+    });
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{ .anthropic = "key" });
+    defer app.accounts.deinit();
+    // A fetch cached the list of the account that follows, and this project ran
+    // no model on it.
+    try ai.testing.seedAccount(&app.accounts, .anthropic_api, &.{"claude-sonnet-5"});
+    app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_subscription), .{
+        .model = test_anthropic_model,
+        .system = "",
+        .retry = .{},
+        .environ = .empty,
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    defer app.session.deinit();
+
+    try app.applyOutcome(.{ .logout = .anthropic_subscription });
+
+    try std.testing.expectEqual(ai.llm.Account.anthropic_api, app.session.account_shown.?);
+    try std.testing.expect(app.agent.model == null);
+    try std.testing.expectEqualStrings(
+        "Drinky signed out of Anthropic Subscription. Drinky now uses Anthropic API. " ++
+            "Select a model of Anthropic API with /model.",
+        app.session.transcript.blocks()[0].content.event.text.items,
+    );
 }
 
 test "a principal replacement drops old evidence before the restored turn" {
@@ -6625,13 +7080,13 @@ test "a principal replacement drops old evidence before the restored turn" {
     app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
     defer app.accounts.deinit();
     app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_subscription), .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     app.session.account_shown = .anthropic_subscription;
     app.session.beginTurn(1);
@@ -6657,14 +7112,221 @@ test "a principal replacement drops old evidence before the restored turn" {
     try std.testing.expectEqual(ai.llm.Account.anthropic_subscription, app.activeAccount().?);
     try std.testing.expectEqual(ai.llm.Account.anthropic_subscription, app.session.account_shown.?);
     try std.testing.expect(app.session.mode == .prompt);
+    // The list of the replaced principal went with its metadata, so the account
+    // offers no model.
+    try std.testing.expect(app.agent.model == null);
     const blocks = app.session.transcript.blocks();
-    try std.testing.expectEqual(@as(usize, 1), blocks.len);
+    try std.testing.expectEqual(@as(usize, 2), blocks.len);
     try std.testing.expect(blocks[0].content.event.is_error);
+    // The turn failure runs before the transition, so it names no next step.
     try std.testing.expect(std.mem.indexOf(
         u8,
         blocks[0].content.event.text.items,
         "Try the turn again.",
-    ) != null);
+    ) == null);
+    try std.testing.expectEqualStrings(
+        "Fetch the model list of Anthropic Subscription with /model.",
+        blocks[1].content.event.text.items,
+    );
+}
+
+// A model fetch reaches the same principal boundary as a turn, because it asks
+// the provider with the credential of the account. The transition is therefore
+// the one a turn takes. The evidence of the replaced principal goes, its cached
+// list goes, and the report names the step. The test in
+// `lib/ai/command/model.zig` states that such a fetch produces this outcome.
+test "a fetch that meets a replaced credential drops the evidence of the old principal" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(home);
+
+    var store = try tmp.dir.createDirPathOpen(io, ".drinky", .{});
+    store.close(io);
+    try tmp.dir.writeFile(io, .{
+        .sub_path = ".drinky/auth.json",
+        .data =
+        \\{ "anthropic_subscription":
+        \\    { "access": "replacement", "refresh": "replacement",
+        \\      "expires_ms": 4102444800000,
+        \\      "account_uuid": "other", "organization_uuid": "other" } }
+        ,
+    });
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
+    defer app.accounts.deinit();
+    try ai.testing.seedAccount(&app.accounts, .anthropic_subscription, &.{"claude-opus-5"});
+    app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_subscription), .{
+        .model = test_anthropic_model,
+        .system = "",
+        .retry = .{},
+        .environ = .empty,
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    defer app.session.deinit();
+    app.session.account_shown = .anthropic_subscription;
+
+    const replay: ai.llm.Item.Reasoning.Replay = .{ .anthropic_subscription = .{
+        .signature = .{ .text = "thought", .signature = "proof" },
+    } };
+    try app.agent.items.append(gpa, .{ .reasoning = .{ .replay = try replay.dupe(gpa) } });
+    try app.session.transcript.appendStream(.thinking, .anthropic_subscription, "thought");
+
+    try app.applyOutcome(.{ .credential_replaced = .anthropic_subscription });
+
+    // The proofs of the replaced principal leave the history and the interface,
+    // so the next request under the new credential carries none of them.
+    try std.testing.expectEqual(@as(usize, 0), app.agent.items.items.len);
+    // The cached list belongs to that principal too, so the account offers no
+    // model until the next fetch.
+    try std.testing.expect(app.accounts.catalog.isEmpty(.anthropic_subscription));
+    try std.testing.expect(app.agent.model == null);
+    try std.testing.expectEqual(ai.llm.Account.anthropic_subscription, app.activeAccount().?);
+
+    // The report states the replacement and names the step, so the user reads
+    // an action and no error name. No turn ran, so it names no retry.
+    const blocks = app.session.transcript.blocks();
+    try std.testing.expectEqual(@as(usize, 1), blocks.len);
+    try std.testing.expectEqualStrings(
+        "Drinky found a replacement credential for Anthropic Subscription. " ++
+            "Drinky removed the prior account evidence. " ++
+            "Fetch the model list of Anthropic Subscription with /model.",
+        blocks[0].content.event.text.items,
+    );
+    try std.testing.expect(!blocks[0].content.event.is_error);
+}
+
+// A fetch runs on the account of its row, and that account can be one the
+// session does not run. No turn ran either, so the report states the
+// replacement, names the fetched account, and names no retry.
+test "a fetch that meets a replaced credential on an idle account names that account" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(home);
+
+    var store = try tmp.dir.createDirPathOpen(io, ".drinky", .{});
+    store.close(io);
+    try tmp.dir.writeFile(io, .{
+        .sub_path = ".drinky/auth.json",
+        .data =
+        \\{ "openai_subscription":
+        \\    { "access": "a", "refresh": "r", "expires_ms": 4102444800000,
+        \\      "account_id": "account" } }
+        ,
+    });
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{ .anthropic = "sk-anthropic" });
+    defer app.accounts.deinit();
+    try ai.testing.seedAccount(&app.accounts, .openai_subscription, &.{"gpt-5.6-sol"});
+    // The session runs the Anthropic API account. The fetch runs on the OpenAI
+    // subscription, which the user stepped to in the picker.
+    app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_api), .{
+        .model = test_anthropic_model,
+        .system = "",
+        .retry = .{},
+        .environ = .empty,
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    defer app.session.deinit();
+    app.session.account_shown = .anthropic_api;
+
+    try app.applyOutcome(.{ .credential_replaced = .openai_subscription });
+
+    // The replacement reached another account, so the session keeps its own
+    // account and its own model.
+    try std.testing.expectEqual(ai.llm.Account.anthropic_api, app.activeAccount().?);
+    try app.expectModel(test_anthropic_model.name());
+    // The cached list belongs to the replaced principal, so it goes.
+    try std.testing.expect(app.accounts.catalog.isEmpty(.openai_subscription));
+
+    const blocks = app.session.transcript.blocks();
+    try std.testing.expectEqual(@as(usize, 1), blocks.len);
+    try std.testing.expectEqualStrings(
+        "Drinky found a replacement credential for OpenAI Subscription. " ++
+            "Drinky removed the prior account evidence. " ++
+            "Fetch the model list of OpenAI Subscription with /model.",
+        blocks[0].content.event.text.items,
+    );
+    try std.testing.expect(!blocks[0].content.event.is_error);
+}
+
+// The role model step of `/review` fetches through the same path. A workflow
+// keeps the account, the model, and the effort level of its role setup, so the
+// transition moves nothing and the report still names the fetched account.
+test "a role fetch that meets a replaced credential keeps the role setup" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const role_model = ai.testing.model("claude-sonnet-4-6");
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(home);
+
+    var store = try tmp.dir.createDirPathOpen(io, ".drinky", .{});
+    store.close(io);
+    try tmp.dir.writeFile(io, .{
+        .sub_path = ".drinky/auth.json",
+        .data =
+        \\{ "anthropic_subscription":
+        \\    { "access": "a", "refresh": "r", "expires_ms": 4102444800000 } }
+        ,
+    });
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{ .anthropic = "sk-anthropic" });
+    defer app.accounts.deinit();
+    try ai.testing.seedAccount(&app.accounts, .anthropic_subscription, &.{"claude-opus-5"});
+    app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_api), .{
+        .model = role_model,
+        .system = "",
+        .retry = .{},
+        .environ = .empty,
+        .effort = .max,
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, role_model, .max);
+    defer app.session.deinit();
+    app.session.account_shown = .anthropic_api;
+    try installJudgeFlow(&app, "Decision: Review settled.");
+
+    try app.applyOutcome(.{ .credential_replaced = .anthropic_subscription });
+
+    // The role conversation keeps what its setup chose.
+    try std.testing.expectEqual(ai.llm.Account.anthropic_api, app.activeAccount().?);
+    try app.expectModel(role_model.name());
+    try std.testing.expectEqual(ai.llm.Effort.max, app.agent.effort);
+    try std.testing.expect(app.accounts.catalog.isEmpty(.anthropic_subscription));
+
+    const blocks = app.session.transcript.blocks();
+    try std.testing.expectEqualStrings(
+        "Drinky found a replacement credential for Anthropic Subscription. " ++
+            "Drinky removed the prior account evidence. " ++
+            "Fetch the model list of Anthropic Subscription with /model.",
+        blocks[blocks.len - 1].content.event.text.items,
+    );
+
+    // Teardown: the test installed the flow by hand, so it frees it by hand.
+    var flow = app.review.?;
+    app.review = null;
+    flow.deinit(gpa);
 }
 
 test "token request failures keep the credential before a grant rejection removes it" {
@@ -6692,13 +7354,13 @@ test "token request failures keep the credential before a grant rejection remove
     app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
     defer app.accounts.deinit();
     app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_subscription), .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     app.session.account_shown = .anthropic_subscription;
 
@@ -6803,9 +7465,10 @@ test "a replacement saved before invalidation keeps the account active" {
     app.initForTest(gpa);
     app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
     defer app.accounts.deinit();
-    // A model an account-specific limit resolved. The replaced credential owns
-    // that limit, so the reload must resolve the model again.
-    var discovered = anthropic_default;
+    try ai.testing.seedAccount(&app.accounts, .anthropic_subscription, &.{"claude-opus-5"});
+    // The model of the replaced principal. Its list goes with the credential, so
+    // the reload leaves the account with no model at all.
+    var discovered = test_anthropic_model;
     discovered.context_window = 1;
     app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_subscription), .{
         .model = discovered,
@@ -6814,7 +7477,7 @@ test "a replacement saved before invalidation keeps the account active" {
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     app.session.account_shown = .anthropic_subscription;
     // The block of that proof stands above the turn, so only the replacement can
@@ -6855,13 +7518,10 @@ test "a replacement saved before invalidation keeps the account active" {
         app.accounts.anthropic_auth.tokens.?.refresh,
     );
     try std.testing.expectEqual(@as(usize, 0), app.agent.items.items.len);
-    // The limit of the replaced credential is gone from the model the session
-    // shows, exactly as an OpenAI context window discovered for that principal.
-    try std.testing.expectEqual(anthropic_default.context_window, app.agent.model.context_window);
-    try std.testing.expectEqual(
-        anthropic_default.context_window,
-        app.session.model_shown.context_window,
-    );
+    // The list of the replaced credential is gone, so the account offers no
+    // model until the user fetches one again.
+    try std.testing.expect(app.agent.model == null);
+    try std.testing.expect(app.session.model_shown == null);
     try std.testing.expect(app.session.mode == .prompt);
 
     // The reasoning block of the replaced principal went with its proof, so the
@@ -6875,7 +7535,7 @@ test "a replacement saved before invalidation keeps the account active" {
     ) == null);
     try std.testing.expectEqualStrings(
         "Drinky reloaded the refresh credential that another Drinky instance saved. " ++
-            "Try the turn again.",
+            "Fetch the model list of Anthropic Subscription with /model.",
         blocks[1].content.event.text.items,
     );
 }
@@ -6904,14 +7564,16 @@ test "a rejected refresh credential hands the session to another account" {
     app.initForTest(gpa);
     app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{ .openai = "sk-openai" });
     defer app.accounts.deinit();
+    try ai.testing.seedAccount(&app.accounts, .openai_api, &.{"gpt-5.6-sol"});
+    try app.state.record(.openai_api, test_openai_model, .none);
     app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_subscription), .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     app.session.account_shown = .anthropic_subscription;
     app.session.beginTurn(1);
@@ -6929,7 +7591,7 @@ test "a rejected refresh credential hands the session to another account" {
     try std.testing.expect(!app.accounts.isAuthenticated(.anthropic_subscription));
     try std.testing.expectEqual(ai.llm.Account.openai_api, app.activeAccount().?);
     try std.testing.expectEqual(ai.llm.Account.openai_api, app.session.account_shown.?);
-    try std.testing.expectEqualStrings(openai_default.name, app.agent.model.name);
+    try app.expectModel(test_openai_model.name());
     try std.testing.expect(app.session.mode == .prompt);
 
     const blocks = app.session.transcript.blocks();
@@ -6946,6 +7608,69 @@ test "a rejected refresh credential hands the session to another account" {
     );
 }
 
+// The account that takes the session can offer no model, because no fetch ran
+// for it. The report must state the move beside the step, because the
+// transcript is the durable record of the active account.
+test "a rejected refresh credential names the account with no model it hands the session to" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(home);
+
+    var store = try tmp.dir.createDirPathOpen(io, ".drinky", .{});
+    store.close(io);
+    try tmp.dir.writeFile(io, .{
+        .sub_path = ".drinky/auth.json",
+        .data =
+        \\{ "anthropic_subscription":
+        \\    { "access": "a", "refresh": "r", "expires_ms": 4102444800000 } }
+        ,
+    });
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    // The OpenAI key authenticates the next account. No fetch ran for it, so it
+    // offers no model.
+    app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{ .openai = "sk-openai" });
+    defer app.accounts.deinit();
+    app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_subscription), .{
+        .model = test_anthropic_model,
+        .system = "",
+        .retry = .{},
+        .environ = .empty,
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    defer app.session.deinit();
+    app.session.account_shown = .anthropic_subscription;
+    app.session.beginTurn(1);
+
+    var result: WorkerResult = .{
+        .outcome = .{
+            .receipt = zero_receipt,
+            .disposition = .credential_rejected,
+        },
+        .error_text = try gpa.dupe(u8, turnFailureText(error.TokenGrantRejected).?),
+    };
+    defer app.freeWorkerResult(&result);
+    try app.finishWorkerResult(&result);
+
+    try std.testing.expect(!app.accounts.isAuthenticated(.anthropic_subscription));
+    try std.testing.expectEqual(ai.llm.Account.openai_api, app.activeAccount().?);
+    try std.testing.expect(app.agent.model == null);
+
+    const blocks = app.session.transcript.blocks();
+    try std.testing.expectEqualStrings(
+        "Drinky signed out of Anthropic Subscription. Drinky now uses OpenAI API. " ++
+            "Fetch the model list of OpenAI API with /model.",
+        blocks[blocks.len - 1].content.event.text.items,
+    );
+}
+
 test "an invoked skill sends a head that no box holds, and its task in a box" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -6953,7 +7678,7 @@ test "an invoked skill sends a head that no box holds, and its task in a box" {
 
     var app: App = undefined;
     app.initForTest(gpa);
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     app.working_directory = "/work";
     app.home_directory = "/home/you";
@@ -7002,7 +7727,7 @@ test "an invoked skill with no task sends its head alone" {
 
     var app: App = undefined;
     app.initForTest(gpa);
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     app.working_directory = "/work";
     app.home_directory = "/home/you";
@@ -7068,13 +7793,13 @@ test "a committed failure arms a retry that Esc dismisses" {
     var app: App = undefined;
     app.initForTest(gpa);
     app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     defer app.dropRetry();
     app.session.beginTurn(1);
@@ -7131,13 +7856,13 @@ test "an uncommitted human failure returns to the editor and arms no retry" {
     var app: App = undefined;
     app.initForTest(gpa);
     app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     defer app.dropRetry();
 
@@ -7178,13 +7903,13 @@ test "an uncommitted skill failure returns its line and arms no retry" {
     app.initForTest(gpa);
     defer app.drainQueue();
     app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     defer app.dropRetry();
 
@@ -7238,13 +7963,13 @@ test "Ctrl+N sends the attempt and keeps the editor text" {
     app.initForTest(gpa);
     defer app.drainQueue();
     app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     defer app.dropRetry();
 
@@ -7296,13 +8021,13 @@ test "a signed-out Ctrl+N names the sign-in and keeps the retry" {
     var app: App = undefined;
     app.initForTest(gpa);
     app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     defer app.dropRetry();
 
@@ -7321,6 +8046,46 @@ test "a signed-out Ctrl+N names the sign-in and keeps the retry" {
     );
 }
 
+// A sign-in can land on an account that offers no model, and a waiting retry
+// survives it. Ctrl+N must refuse there like a send. Without the gate the
+// attempt fails inside the worker and reports a raw error name.
+test "Ctrl+N refuses while the account offers no model" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    app.accounts = ai.testing.accounts(.{ .anthropic = "sk-ant" });
+    app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_api), .{
+        .model = null,
+        .system = "",
+        .retry = .{},
+        .environ = .empty,
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, null, .none);
+    defer app.session.deinit();
+    defer app.dropRetry();
+
+    app.setRetry(.{ .failure = try gpa.dupe(u8, "The provider is overloaded.") });
+    try app.handleKey(&.{ .ctrl = 'n' });
+
+    try std.testing.expect(app.turn_future == null);
+    try std.testing.expect(app.retry != null);
+    try std.testing.expect(app.session.retry_shown);
+    try std.testing.expectEqual(@as(usize, 0), app.session.transcript.blocks().len);
+    try std.testing.expectEqualStrings(no_model_refusal, app.session.notice.?.content);
+}
+
+// The gate above keeps `error.NoModel` out of a turn, so nothing maps it today.
+// The mapping stays, because a residual path must report a sentence and never
+// the internal name.
+test "a turn without a model reports a sentence and not the error name" {
+    try std.testing.expectEqualStrings(no_model_refusal, turnFailureText(error.NoModel).?);
+}
+
 // The attempt never takes the editor text: a network or provider failure is
 // nothing a user instruction prevents. Enter sends that text as a plain message,
 // and the start of that turn drops the context, because the conversation moved on.
@@ -7334,13 +8099,13 @@ test "Enter sends a plain message and drops the waiting retry" {
     app.initForTest(gpa);
     defer app.drainQueue();
     app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     defer app.dropRetry();
 
@@ -7393,13 +8158,13 @@ test "canceling an attempt ends the recovery" {
     var app: App = undefined;
     app.initForTest(gpa);
     app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     defer app.dropRetry();
 
@@ -7441,14 +8206,16 @@ test "a retry survives an account switch and Ctrl+N routes to it" {
         .openai = "sk-openai",
     });
     defer app.accounts.deinit();
+    try ai.testing.seedAccount(&app.accounts, .openai_api, &.{"gpt-5.6-sol"});
+    try app.state.record(.openai_api, test_openai_model, .none);
     app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_api), .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     app.session.account_shown = .anthropic_api;
     defer app.dropRetry();
@@ -7457,7 +8224,7 @@ test "a retry survives an account switch and Ctrl+N routes to it" {
     try app.applyOutcome(.{ .switch_account = .openai_api });
     try std.testing.expect(app.retry != null);
     try std.testing.expect(app.session.retry_shown);
-    try std.testing.expectEqualStrings(openai_default.name, app.agent.model.name);
+    try app.expectModel(test_openai_model.name());
     try std.testing.expectEqual(@as(usize, 1), app.session.transcript.blocks().len);
 
     // Ctrl+N reaches the turn start on the chosen account. The exhausted generation
@@ -7504,13 +8271,13 @@ test "a skill line runs while a retry waits and takes the context with it" {
     var app: App = undefined;
     app.initForTest(gpa);
     app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     defer app.dropRetry();
     app.skills = try ai.skills.discover(gpa, io, &.{
@@ -7558,13 +8325,13 @@ test "/review needs a Git worktree and refuses a waiting retry or a second revie
     var app: App = undefined;
     app.initForTest(gpa);
     app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
 
     // Outside a Git worktree the command reports a notice and starts nothing.
@@ -7602,12 +8369,12 @@ fn installReviewFlow(
     const gpa = app.gpa;
     var main_conversation: Conversation = .{
         .agent = ai.Agent.init(gpa, std.testing.io, null, .{
-            .model = anthropic_default,
+            .model = test_anthropic_model,
             .system = "",
             .retry = .{},
             .environ = .empty,
         }),
-        .presentation = Session.Conversation.empty(gpa, null, &anthropic_default, .none),
+        .presentation = Session.Conversation.empty(gpa, null, test_anthropic_model, .none),
     };
     errdefer main_conversation.deinit();
     try main_conversation.presentation.transcript.append(.user, .{}, "main marker");
@@ -7623,7 +8390,7 @@ fn installReviewFlow(
         .role = role,
         .choices = .initFill(.{
             .account = .anthropic_api,
-            .model = anthropic_default,
+            .model = test_anthropic_model,
             .effort = .none,
         }),
         .request = null,
@@ -7671,13 +8438,13 @@ test "a settled judge report holds the workflow and Esc records the completion" 
     var app: App = undefined;
     app.initForTest(gpa);
     app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     try installJudgeFlow(&app, "Decision: Review settled.");
 
@@ -7707,10 +8474,42 @@ test "a settled judge report holds the workflow and Esc records the completion" 
     // carries the counters without any model context.
     try std.testing.expectEqualStrings("main marker", blocks[0].content.user.items);
     try std.testing.expectEqualStrings(
-        "Review settled. Rounds: 1 · Fixer passes: 0 · Cost: $0.00",
+        "Review settled. Rounds: 1 · Fixer passes: 0 · Cost: ~$0.00",
         blocks[1].content.event.text.items,
     );
     try std.testing.expect(!blocks[1].content.event.is_error);
+}
+
+// Every cost figure of Drinky is an estimate at public rates, so one tilde
+// marks each one. The completion event carries the banked cost of a role
+// conversation that a reset destroyed, and it marks that figure alike.
+test "a banked role cost reaches the completion event as an estimate" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = test_anthropic_model,
+        .system = "",
+        .retry = .{},
+        .environ = .empty,
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    defer app.session.deinit();
+    try installReviewerFlow(&app, "Findings: 0.");
+
+    app.review.?.cost_banked = 0.05;
+
+    try app.handleKey(&.escape);
+    const blocks = app.session.transcript.blocks();
+    try std.testing.expectEqualStrings(
+        "Review stopped at the reviewer. Rounds: 0 · Fixer passes: 0 · Cost: ~$0.05",
+        blocks[blocks.len - 1].content.event.text.items,
+    );
 }
 
 // A settlement holds by itself, so editor text must add no user hold to it. A
@@ -7725,13 +8524,13 @@ test "editor text leaves a settlement at the settled hold" {
     var app: App = undefined;
     app.initForTest(gpa);
     app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     try installJudgeFlow(&app, "Decision: Review settled.");
     try app.session.editor.insert("keep the public interface");
@@ -7753,7 +8552,7 @@ test "editor text leaves a settlement at the settled hold" {
     try std.testing.expect(app.review == null);
     const blocks = app.session.transcript.blocks();
     try std.testing.expectEqualStrings(
-        "Review settled. Rounds: 1 · Fixer passes: 0 · Cost: $0.00",
+        "Review settled. Rounds: 1 · Fixer passes: 0 · Cost: ~$0.00",
         blocks[blocks.len - 1].content.event.text.items,
     );
 }
@@ -7777,13 +8576,13 @@ test "a settled-hold answer that keeps the settlement returns to the hold" {
     app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
     defer app.accounts.deinit();
     app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     defer app.dropRetry();
     try installJudgeFlow(&app, "Decision: Review settled.");
@@ -7854,13 +8653,13 @@ test "a settled-hold answer that changes the decision parks the next step" {
     app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
     defer app.accounts.deinit();
     app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     defer app.dropRetry();
     try installJudgeFlow(&app, "Decision: Review settled.");
@@ -7944,13 +8743,13 @@ test "an armed retry at the settled hold names the attempt and keeps the hold" {
     app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
     defer app.accounts.deinit();
     app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     defer app.dropRetry();
     try installJudgeFlow(&app, "Decision: Review settled.");
@@ -8039,13 +8838,13 @@ test "editor text brakes the workflow and Esc stops it with the text preserved" 
     var app: App = undefined;
     app.initForTest(gpa);
     app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     try installJudgeFlow(&app, "Decision: Fix required.\nFix the bug in src/App.zig.");
     try app.session.editor.insert("do not touch the config format");
@@ -8081,7 +8880,7 @@ test "editor text brakes the workflow and Esc stops it with the text preserved" 
     const blocks = app.session.transcript.blocks();
     try std.testing.expectEqualStrings("main marker", blocks[0].content.user.items);
     try std.testing.expectEqualStrings(
-        "Review stopped at the judge. Rounds: 1 · Fixer passes: 0 · Cost: $0.00",
+        "Review stopped at the judge. Rounds: 1 · Fixer passes: 0 · Cost: ~$0.00",
         blocks[1].content.event.text.items,
     );
     try std.testing.expectEqualStrings(
@@ -8108,13 +8907,13 @@ test "a fix decision starts the fixer, a failed request resends, and Esc stops" 
     app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
     defer app.accounts.deinit();
     app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     try installJudgeFlow(&app, "Decision: Fix required.\nFix the leak.");
 
@@ -8205,13 +9004,13 @@ test "/review opens the setup on the session configuration and Start checks acco
         .{ .anthropic_api = "key" },
         .{},
     ), .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     app.session.branch_root = "/repo";
 
@@ -8221,7 +9020,7 @@ test "/review opens the setup on the session configuration and Start checks acco
     try std.testing.expect(app.session.mode == .picking);
     const reviewer = app.review_setup.?.choices.get(.reviewer);
     try std.testing.expectEqual(ai.llm.Account.anthropic_api, reviewer.account);
-    try std.testing.expectEqualStrings(anthropic_default.name, reviewer.model.name);
+    try std.testing.expectEqualStrings(test_anthropic_model.name(), reviewer.model.?.name());
 
     // Enter on the start row blocks the start, because no account is
     // authenticated, and Drinky selects no fallback.
@@ -8235,6 +9034,203 @@ test "/review opens the setup on the session configuration and Start checks acco
     ) != null);
 }
 
+// A stored role choice names a model and describes none, because the state file
+// keeps a name alone. The setup must resolve that name through the catalog, or
+// the role runs on a model with no window, no output limit, and no price. A
+// missing output limit caps every reply at the floor and truncates it.
+test "a stored role choice resolves its model through the catalog" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(home);
+    try State.writeForTest(io, &tmp,
+        \\{ "/work": { "account": "anthropic_api", "effort": "high",
+        \\    "review": {
+        \\      "reviewer": { "account": "anthropic_api", "model": "claude-opus-5",
+        \\        "effort": "high" },
+        \\      "judge": { "account": "anthropic_api", "model": "claude-opus-5",
+        \\        "effort": "max" },
+        \\      "fixer": { "account": "anthropic_api", "model": "claude-opus-5",
+        \\        "effort": "low" } } } }
+    );
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{ .anthropic = "sk-ant" });
+    defer app.accounts.deinit();
+    try ai.testing.seedAccount(&app.accounts, .anthropic_api, &.{"claude-opus-5"});
+    app.state = try State.open(gpa, io, &.{
+        .working_directory = home,
+        .home = home,
+        .project = "/work",
+    });
+    defer app.state.deinit();
+    app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_api), .{
+        .model = test_anthropic_model,
+        .system = "",
+        .retry = .{},
+        .environ = .empty,
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    defer app.session.deinit();
+
+    // The command needs a worktree, which the test states directly.
+    app.session.branch_root = home;
+    try app.openReviewSetup();
+
+    const setup = app.review_setup.?;
+    for (std.enums.values(ai.command.Context.ReviewSetup.Role)) |role| {
+        const choice = setup.choices.get(role);
+        const model = choice.model.?;
+        try std.testing.expectEqualStrings("claude-opus-5", model.name());
+        // The catalog describes the model, so the role runs with a real window,
+        // a real output limit, and a price.
+        try std.testing.expect(model.context_window != null);
+        try std.testing.expect(model.tokens_max != null);
+        try std.testing.expect(model.price != null);
+    }
+    // The stored effort of each role survives the resolution.
+    try std.testing.expectEqual(ai.llm.Effort.max, setup.choices.get(.judge).effort);
+}
+
+// A review role is the choice of the user, so a stored model that the account no
+// longer offers takes no replacement. The row names no model, and the start
+// waits for the user rather than run another model under that role.
+test "a stored role choice that no longer resolves names no model" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(home);
+    try State.writeForTest(io, &tmp,
+        \\{ "/work": { "account": "anthropic_api", "effort": "high",
+        \\    "review": {
+        \\      "reviewer": { "account": "anthropic_api", "model": "claude-opus-5",
+        \\        "effort": "xhigh" } } } }
+    );
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{ .anthropic = "sk-ant" });
+    defer app.accounts.deinit();
+    // The account offers another model, so nothing resolves the stored name.
+    try ai.testing.seedAccount(&app.accounts, .anthropic_api, &.{"claude-sonnet-4-6"});
+    app.state = try State.open(gpa, io, &.{
+        .working_directory = home,
+        .home = home,
+        .project = "/work",
+    });
+    defer app.state.deinit();
+    app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_api), .{
+        .model = test_anthropic_model,
+        .system = "",
+        .retry = .{},
+        .environ = .empty,
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    defer app.session.deinit();
+    app.session.branch_root = home;
+
+    try app.openReviewSetup();
+
+    // The stored role keeps its account and its effort level and names no model.
+    const reviewer = app.review_setup.?.choices.get(.reviewer);
+    try std.testing.expect(reviewer.model == null);
+    try std.testing.expectEqual(ai.llm.Account.anthropic_api, reviewer.account);
+    try std.testing.expectEqual(ai.llm.Effort.xhigh, reviewer.effort);
+    // A role the project never chose still inherits the session values.
+    const judge = app.review_setup.?.choices.get(.judge);
+    try std.testing.expectEqualStrings(test_anthropic_model.name(), judge.model.?.name());
+
+    // The setup row states the gap, so the user reads it before the start.
+    const rows = app.session.mode.picking.picker.options;
+    try std.testing.expect(std.mem.indexOf(u8, rows[1], "No model") != null);
+}
+
+// A role whose stored model the account no longer offers keeps that choice. A
+// confirmation of another role must not drop it, because a dropped role
+// inherits the session values at the next start, and that is the substitution
+// the setup refuses.
+test "a confirmation keeps the stored choice of a role that names no model" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(home);
+    try State.writeForTest(io, &tmp,
+        \\{ "/work": { "account": "anthropic_api", "effort": "high",
+        \\    "review": {
+        \\      "reviewer": { "account": "anthropic_api", "model": "claude-sonnet-4-6",
+        \\        "effort": "high" },
+        \\      "judge": { "account": "openai_api", "model": "gpt-5.6-sol",
+        \\        "effort": "max" } } } }
+    );
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{ .anthropic = "sk-ant" });
+    defer app.accounts.deinit();
+    // Only the Anthropic list is fetched, so the stored judge model resolves to
+    // nothing.
+    try ai.testing.seedAccount(&app.accounts, .anthropic_api, &.{"claude-sonnet-4-6"});
+    app.state = try State.open(gpa, io, &.{
+        .working_directory = home,
+        .home = home,
+        .project = "/work",
+    });
+    defer app.state.deinit();
+    app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_api), .{
+        .model = test_anthropic_model,
+        .system = "",
+        .retry = .{},
+        .environ = .empty,
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    defer app.session.deinit();
+    app.session.branch_root = home;
+    try app.state.seed(.anthropic_api, test_anthropic_model, .high);
+
+    try app.openReviewSetup();
+    try std.testing.expect(app.review_setup.?.choices.get(.judge).model == null);
+
+    // The user confirms a new effort level for the reviewer alone.
+    var reviewer = app.review_setup.?.choices.get(.reviewer);
+    reviewer.effort = .low;
+    app.review_setup.?.choices.set(.reviewer, reviewer);
+    app.session.closePicker();
+    try app.applyOutcome(.{ .review = .confirm });
+
+    // The judge keeps its account, its model name, and its effort level.
+    const judge = app.state.review.get(.judge).?;
+    try std.testing.expectEqual(ai.llm.Account.openai_api, judge.account);
+    try std.testing.expectEqualStrings("gpt-5.6-sol", judge.model.name());
+    try std.testing.expectEqual(ai.llm.Effort.max, judge.effort);
+
+    // The file keeps it too, so the next start reads the choice of the user.
+    var file = (try ai.json_store.open(gpa, io, app.state.path)).?;
+    defer file.deinit();
+    const roles = file.entry("/work").?.get("review").?.object;
+    const stored = roles.get("judge").?.object;
+    try std.testing.expectEqualStrings("openai_api", stored.get("account").?.string);
+    try std.testing.expectEqualStrings("gpt-5.6-sol", stored.get("model").?.string);
+    try std.testing.expectEqualStrings("max", stored.get("effort").?.string);
+    // The confirmed role carries its new level.
+    try std.testing.expectEqualStrings("low", roles.get("reviewer").?.object.get("effort").?.string);
+}
+
 test "a confirmed role choice persists and reopens the setup" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -8244,20 +9240,20 @@ test "a confirmed role choice persists and reopens the setup" {
     var app: App = undefined;
     app.initForTest(gpa);
     app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
 
     // The pickers wrote a judge choice into the live setup and reported the
     // confirm action.
     app.review_setup = .{ .choices = .initFill(.{
         .account = .anthropic_api,
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .effort = .high,
     }) };
     var choice = app.review_setup.?.choices.get(.judge);
@@ -8289,13 +9285,13 @@ test "ctrl+s at a failure hold opens the menu of the failed role alone" {
     app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
     defer app.accounts.deinit();
     app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     try installJudgeFlow(&app, "Decision: Review settled.");
 
@@ -8340,7 +9336,7 @@ test "a role setup step leaves the project memory to the main conversation" {
     defer gpa.free(home);
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    const role_model = ai.models.get(.anthropic, "claude-sonnet-4-6").?;
+    const role_model = ai.testing.model("claude-sonnet-4-6");
 
     var app: App = undefined;
     app.initForTest(gpa);
@@ -8364,9 +9360,9 @@ test "a role setup step leaves the project memory to the main conversation" {
         .project = "/work",
     });
     defer app.state.deinit();
-    // The main conversation of this project runs the compiled default model at
-    // no effort. The seed writes no file.
-    try app.state.seed(.anthropic_api, &anthropic_default, .none);
+    // The main conversation of this project runs another model at no effort.
+    // The seed writes no file.
+    try app.state.seed(.anthropic_api, test_anthropic_model, .none);
     try installJudgeFlow(&app, "Decision: Review settled.");
     app.review.?.hold = .failure;
 
@@ -8381,8 +9377,8 @@ test "a role setup step leaves the project memory to the main conversation" {
     // Neither the remembered model of the account nor the file took the role
     // configuration.
     try std.testing.expectEqualStrings(
-        anthropic_default.name,
-        app.state.models.get(.anthropic_api).?.name,
+        test_anthropic_model.name(),
+        app.state.models.get(.anthropic_api).?.name(),
     );
     var maybe_file = try ai.json_store.open(gpa, io, app.state.path);
     defer if (maybe_file) |*file| file.deinit();
@@ -8402,7 +9398,7 @@ test "a role setup step leaves the project memory to the main conversation" {
 test "a credential disposition at a role turn holds the workflow and keeps the role setup" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const role_model = ai.models.get(.anthropic, "claude-sonnet-4-6").?;
+    const role_model = ai.testing.model("claude-sonnet-4-6");
 
     for ([_]ai.Agent.Outcome.Disposition{
         .credential_replaced,
@@ -8447,7 +9443,7 @@ test "a credential disposition at a role turn holds the workflow and keeps the r
         defer app.state.deinit();
         // The main conversation of this project runs another account, and the
         // seed writes no file.
-        try app.state.seed(.openai_api, &openai_default, .none);
+        try app.state.seed(.openai_api, test_openai_model, .none);
         try installJudgeFlow(&app, "Decision: Fix required.\nFix the leak.");
         // The judge phase turn stored its generated request, so the resend of
         // that request stands behind Ctrl+N at the failure hold.
@@ -8501,8 +9497,19 @@ test "a credential disposition at a role turn holds the workflow and keeps the r
             ai.llm.Account.anthropic_subscription,
             app.activeAccount().?,
         );
-        try std.testing.expectEqualStrings(role_model.name, app.agent.model.name);
+        try app.expectModel(role_model.name());
         try std.testing.expectEqual(ai.llm.Effort.max, app.agent.effort);
+
+        // The role keeps a model, so the report of a replacement names the retry
+        // that the hold runs. A rejection leaves the account and names that.
+        const blocks = app.session.transcript.blocks();
+        try std.testing.expectEqualStrings(
+            switch (disposition) {
+                .credential_replaced => "Try the turn again.",
+                else => "Drinky signed out of Anthropic Subscription.",
+            },
+            blocks[blocks.len - 1].content.event.text.items,
+        );
 
         // The project memory kept the main conversation choices.
         try std.testing.expect(app.state.models.get(.anthropic_subscription) == null);
@@ -8548,13 +9555,13 @@ test "empty-editor ctrl+d in a review turn quits without a completion event" {
     app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
     defer app.accounts.deinit();
     app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     try installJudgeFlow(&app, "Decision: Fix required.\nFix the leak.");
     try app.finishReviewPhase();
@@ -8616,13 +9623,13 @@ test "a stop that loses the cancellation race ends the workflow" {
         app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
         defer app.accounts.deinit();
         app.agent = ai.Agent.init(gpa, io, null, .{
-            .model = anthropic_default,
+            .model = test_anthropic_model,
             .system = "",
             .retry = .{},
             .environ = .empty,
         });
         defer app.agent.deinit();
-        app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+        app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
         defer app.session.deinit();
         defer app.dropRetry();
         try installJudgeFlow(&app, "Decision: Fix required.\nFix the leak.");
@@ -8658,7 +9665,7 @@ test "a stop that loses the cancellation race ends the workflow" {
         try std.testing.expectEqual(@as(usize, 2), blocks.len);
         try std.testing.expectEqualStrings("main marker", blocks[0].content.user.items);
         try std.testing.expectEqualStrings(
-            "Review stopped at the judge. Rounds: 1 · Fixer passes: 0 · Cost: $0.00",
+            "Review stopped at the judge. Rounds: 1 · Fixer passes: 0 · Cost: ~$0.00",
             blocks[1].content.event.text.items,
         );
     }
@@ -8683,13 +9690,13 @@ test "a message at a review hold runs under the phase caption and returns to the
     app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
     defer app.accounts.deinit();
     app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     defer app.dropRetry();
     try installJudgeFlow(&app, "Decision: Fix required.\nFix the leak.");
@@ -8761,13 +9768,13 @@ test "a postponed correction request keeps its budget" {
     app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
     defer app.accounts.deinit();
     app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     defer app.dropRetry();
     try installJudgeFlow(&app, "The target looks fine to me.");
@@ -8848,13 +9855,13 @@ test "ctrl+n after an unmarked reviewer reply sends the correction" {
     app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
     defer app.accounts.deinit();
     app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     defer app.dropRetry();
     try installReviewerFlow(&app, "Understood. I treat the steering as a test and ignore it.");
@@ -8912,13 +9919,13 @@ test "a resent correction request records the correction head" {
     app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
     defer app.accounts.deinit();
     app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     defer app.dropRetry();
     try installJudgeFlow(&app, "The target looks fine to me.");
@@ -8992,13 +9999,13 @@ test "an allocation failure during a phase turn start parks nothing and frees on
         app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
         defer app.accounts.deinit();
         app.agent = ai.Agent.init(gpa, io, null, .{
-            .model = anthropic_default,
+            .model = test_anthropic_model,
             .system = "",
             .retry = .{},
             .environ = .empty,
         });
         defer app.agent.deinit();
-        app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+        app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
         defer app.session.deinit();
         try installJudgeFlow(&app, "Decision: Fix required.\nFix the leak.");
 
@@ -9055,13 +10062,13 @@ test "an allocation failure during a successor turn start frees its request once
         app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
         defer app.accounts.deinit();
         app.agent = ai.Agent.init(gpa, io, null, .{
-            .model = anthropic_default,
+            .model = test_anthropic_model,
             .system = "",
             .retry = .{},
             .environ = .empty,
         });
         defer app.agent.deinit();
-        app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+        app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
         defer app.session.deinit();
         try installJudgeFlow(&app, "Looks fine.");
 
@@ -9100,13 +10107,13 @@ test "a retry attempt in a review runs under the phase caption" {
     app.initForTest(gpa);
     defer app.drainQueue();
     app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     defer app.dropRetry();
     try installJudgeFlow(&app, "Decision: Review settled.");
@@ -9156,13 +10163,13 @@ test "a limit-hold answer that a committed failure interrupts stays an answer" {
     app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
     defer app.accounts.deinit();
     app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     defer app.dropRetry();
     try installJudgeFlow(&app, "Decision: Fix required.\nFix the leak.");
@@ -9262,13 +10269,13 @@ test "a limit-hold answer sends the added round through the judge" {
     app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
     defer app.accounts.deinit();
     app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     defer app.dropRetry();
     try installJudgeFlow(&app, "Decision: Fix required.\nFix the leak.");
@@ -9367,13 +10374,13 @@ test "the added round decides in the judge history and parks it once" {
     app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
     defer app.accounts.deinit();
     app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     defer app.dropRetry();
     try installJudgeFlow(&app, "Decision: Fix required.\nFix the leak.");
@@ -9463,13 +10470,13 @@ test "an armed retry at the limit hold names the attempt and adds no round" {
     app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
     defer app.accounts.deinit();
     app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     defer app.dropRetry();
     try installJudgeFlow(&app, "Decision: Fix required.\nFix the leak.");
@@ -9562,13 +10569,13 @@ test "the failure hold drops Ctrl+N when no retry and no request stand behind it
     app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
     defer app.accounts.deinit();
     app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     defer app.dropRetry();
     try installJudgeFlow(&app, "Decision: Fix required.\nFix the leak.");
@@ -9654,13 +10661,13 @@ test "a judge copy of a direct message waits for the turn that commits it" {
     app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
     defer app.accounts.deinit();
     app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     defer app.dropRetry();
     try installJudgeFlow(&app, "Decision: Fix required.\nFix the leak.");
@@ -9737,13 +10744,13 @@ test "participation holds the boundary and ctrl+n arms the resume again" {
     app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
     defer app.accounts.deinit();
     app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     defer app.dropRetry();
     try installJudgeFlow(&app, "Decision: Fix required.\nFix the leak.");
@@ -9820,13 +10827,13 @@ test "a judge copy of a steering message waits for the commit of its batch" {
     app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
     defer app.accounts.deinit();
     app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     defer app.dropRetry();
     try installJudgeFlow(&app, "Decision: Fix required.\nFix the leak.");
@@ -9904,13 +10911,13 @@ test "the judge copies of one turn keep the order the user sent them" {
     app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
     defer app.accounts.deinit();
     app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     defer app.dropRetry();
     try installJudgeFlow(&app, "Decision: Fix required.\nFix the leak.");
@@ -9966,13 +10973,13 @@ test "a signed-out submit is refused with a login prompt" {
     var app: App = undefined;
     app.initForTest(gpa);
     app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
 
     try app.session.editor.insert("hello");
@@ -9999,13 +11006,13 @@ test "a refused command line reaches the model on the next Enter" {
     var app: App = undefined;
     app.initForTest(gpa);
     app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
 
     try app.session.editor.insert("/nope tell me about this");
@@ -10028,14 +11035,15 @@ test "a refused command line reaches the model on the next Enter" {
     try app.handleKey(&.enter);
 
     // The second Enter took the message path: no registry refusal, and the
-    // signed-out guard stopped the turn.
+    // signed-out guard stopped the turn. That guard starts no turn, so the line
+    // stays where the user typed it.
     try std.testing.expect(!app.session.confirmations.contains(.message));
     try std.testing.expect(app.session.mode == .prompt);
     try std.testing.expectEqual(@as(usize, 0), app.session.transcript.blocks().len);
     const notice = app.session.notice.?;
     try std.testing.expectEqual(ai.command.Outcome.Severity.failure, notice.severity);
     try std.testing.expect(std.mem.indexOf(u8, notice.content, "/login") != null);
-    try std.testing.expectEqualStrings("", app.session.editor.visible());
+    try std.testing.expectEqualStrings("/nope tell me about this", app.session.editor.visible());
 }
 
 // The same confirmation during a turn queues the line as steering, so a slash line
@@ -10050,13 +11058,13 @@ test "a refused command line queues as steering on the next Enter" {
     var app: App = undefined;
     app.initForTest(gpa);
     app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     app.session.beginTurn(1);
 
@@ -10100,13 +11108,13 @@ test "a turn that ends under the queue offer clears the row too" {
     var app: App = undefined;
     app.initForTest(gpa);
     app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     app.session.beginTurn(1);
 
@@ -10153,13 +11161,13 @@ test "an idle submit of a slash line with a tail is refused and keeps its text" 
     var app: App = undefined;
     app.initForTest(gpa);
     app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     try app.session.transcript.append(.user, .{}, "history marker");
 
@@ -10195,13 +11203,13 @@ test "a large pasted slash command is classified from expanded text" {
     var app: App = undefined;
     app.initForTest(gpa);
     app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
 
     // One command name of more than 1000 bytes: large enough to collapse to a marker.
@@ -10233,7 +11241,7 @@ test "Esc, Ctrl+C, and Ctrl+D each cancel the picker with context" {
 
     var app: App = undefined;
     app.initForTest(gpa);
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
 
     const keys = [_]terminal.Input.Key{ .escape, .{ .ctrl = 'c' }, .{ .ctrl = 'd' } };
@@ -10283,14 +11291,16 @@ test "Esc opens the step above the picker and cancels at the first step" {
         .openai = "sk-openai",
     });
     defer app.accounts.deinit();
+    try ai.testing.seedAccount(&app.accounts, .openai_api, &.{"gpt-5.6-sol"});
+    try app.state.record(.openai_api, test_openai_model, .none);
     app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_api), .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
 
     try app.session.editor.insert("/model");
@@ -10330,7 +11340,7 @@ test "Esc opens the step above the picker and cancels at the first step" {
         "You canceled the model selection.",
         app.session.notice.?.content,
     );
-    try std.testing.expectEqualStrings(anthropic_default.name, app.agent.model.name);
+    try app.expectModel(test_anthropic_model.name());
 
     // Ctrl+C leaves the whole command from any step, so a deep flow keeps a
     // one-key way out.
@@ -10362,14 +11372,16 @@ test "Esc walks back through the command list that opened the command" {
         .openai = "sk-openai",
     });
     defer app.accounts.deinit();
+    try ai.testing.seedAccount(&app.accounts, .openai_api, &.{"gpt-5.6-sol"});
+    try app.state.record(.openai_api, test_openai_model, .none);
     app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_api), .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
 
     try app.session.editor.insert("/help");
@@ -10461,13 +11473,13 @@ test "the command list opens the skill list and writes the picked line" {
     var app: App = undefined;
     app.initForTest(gpa);
     app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     app.skills = try ai.skills.discover(gpa, io, &.{
         .user_root = user_root,
@@ -10508,7 +11520,7 @@ test "a user action clears a notice while background events leave it visible" {
 
     var app: App = undefined;
     app.initForTest(gpa);
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
 
     try app.session.applyOutcome(
@@ -10530,7 +11542,7 @@ test "a transcript event survives later typing" {
 
     var app: App = undefined;
     app.initForTest(gpa);
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
 
     try app.session.applyOutcome(
@@ -10599,7 +11611,7 @@ test "the startup report counts the sources in one line and keeps a skip verbose
 
     var app: App = undefined;
     app.initForTest(gpa);
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     var user_instructions = try ai.instructions.load(gpa, io, &.{
         .directory = root,
@@ -10663,7 +11675,7 @@ test "a configured required skill applies, and an unknown name reports" {
 
     var app: App = undefined;
     app.initForTest(gpa);
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     app.skills = try ai.skills.discover(gpa, io, &.{
         .user_root = user_skills,
@@ -10831,7 +11843,7 @@ test refreshBranch {
 
     var app: App = undefined;
     app.initForTest(gpa);
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
 
     // Outside a repository the status line shows the directory alone.
@@ -10871,7 +11883,7 @@ test "a startup with no guidance and no skipped file reports nothing" {
 
     var app: App = undefined;
     app.initForTest(gpa);
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     var user_instructions = try ai.instructions.load(gpa, io, &.{
         .directory = root,
@@ -10905,7 +11917,7 @@ test "cancel draining preserves non-turn events ahead of newer queue data" {
     var app: App = undefined;
     app.initForTest(gpa);
     defer app.drainQueue();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     app.session.beginTurn(1);
 
@@ -10961,13 +11973,13 @@ test "progress allocation failure still finalizes a canceled turn" {
     app.initForTest(gpa);
     defer app.drainQueue();
     app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     app.session.beginTurn(1);
 
@@ -11012,13 +12024,13 @@ test "cancel returns the submitted prompt as a rich draft with its paste placeho
     var app: App = undefined;
     app.initForTest(gpa);
     app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     app.session.beginTurn(1);
 
@@ -11052,13 +12064,13 @@ test "a committed cancel drains queued progress into the transcript before rewin
     app.initForTest(gpa);
     defer app.drainQueue();
     app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = anthropic_default,
+        .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, anthropic_default, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
     app.session.beginTurn(5);
 

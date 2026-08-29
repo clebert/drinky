@@ -4,7 +4,7 @@
 const std = @import("std");
 
 const llm = @import("../llm.zig");
-const models = @import("../models.zig");
+const Model = @import("../Model.zig");
 const skills = @import("../skills.zig");
 const Accounts = @import("../Accounts.zig");
 const Agent = @import("../Agent.zig");
@@ -24,6 +24,18 @@ skill_registry: ?*const skills.Registry = null,
 /// set across their steps. Null where no setup is open: a dispatch of a fixed
 /// command line, and the command tests that do not need it.
 review_setup: ?*ReviewSetup = null,
+/// The host hook that states a wait. Null where nothing paints: a dispatch of a
+/// fixed command line, and the command tests that do not need it.
+wait: ?Wait = null,
+
+/// The host hook that a command calls before a step that blocks. A command runs
+/// on the thread that paints and reads the keys, so a network step stops the
+/// whole interface. The line the host paints tells the user what that stop is.
+pub const Wait = struct {
+    /// The host state that `paint` writes through. The host owns it.
+    host: *anyopaque,
+    paint: *const fn (*anyopaque, []const u8) void,
+};
 
 /// The transient state of the review setup pickers. The host owns one and
 /// hands a pointer through the context, so a selector reaches the choices
@@ -36,10 +48,12 @@ pub const ReviewSetup = struct {
     /// The three roles of the review workflow, in setup order.
     pub const Role = enum { reviewer, judge, fixer };
 
-    /// The setup of one role.
+    /// The setup of one role. The model is null for a role whose stored choice
+    /// names a model that its account no longer offers. Drinky selects no
+    /// replacement for it, so the user picks one before the workflow starts.
     pub const Choice = struct {
         account: llm.Account,
-        model: models.Model,
+        model: ?Model,
         effort: llm.Effort,
     };
 };
@@ -70,8 +84,14 @@ pub const Outcome = union(enum) {
     /// forces a login.
     logout: llm.Account,
     /// Switch to this already-authenticated account. The app owns the switch so
-    /// its configured per-account default model applies.
+    /// the model that account ran last applies. An account that ran none takes
+    /// no model, and the user picks one.
     switch_account: llm.Account,
+    /// The credential store of this account held the credential of another
+    /// principal, so the step stopped before its model request. The app drops
+    /// the evidence of the replaced principal and reports the step that
+    /// follows. A turn that meets the same replacement takes that transition.
+    credential_replaced: llm.Account,
     /// Clear conversation and presentation state but keep the configuration.
     new_conversation,
     /// A step of the review workflow that the app owns: open the setup, take a
@@ -143,6 +163,11 @@ pub const Outcome = union(enum) {
         cancellation_message: []const u8,
         options: []const []const u8,
         current: ?usize,
+        /// A line the app records beside this picker, or null where the step
+        /// reports nothing. A step that both reports and opens a list needs it.
+        /// A cache write that failed must not close a list that arrived. The
+        /// content transfers to the app.
+        report: ?Message = null,
         /// Build this same picker again, or null where the picker cannot return.
         /// A picker that a row of this one opens keeps the opener, so Esc there
         /// returns here. The app owns that trail, so a step names itself alone
@@ -252,3 +277,55 @@ pub const Outcome = union(enum) {
         }
     }
 };
+
+/// State the wait of a model fetch of `account`. The requests of a fetch run on
+/// the thread that paints and reads the keys, so the interface stops until they
+/// end. The line states that stop, so it never reads as a hang.
+pub fn stateFetchWait(self: *const Context, account: llm.Account) !void {
+    if (self.wait == null) return;
+    const text = try std.fmt.allocPrint(
+        self.gpa,
+        "Drinky fetches the model list of {s}. The interface waits for the provider.",
+        .{account.label()},
+    );
+    defer self.gpa.free(text);
+    self.stateWait(text);
+}
+
+/// State `text` as the wait of the step that follows, or do nothing where the
+/// host paints none.
+fn stateWait(self: *const Context, text: []const u8) void {
+    const wait = self.wait orelse return;
+    wait.paint(wait.host, text);
+}
+
+test stateFetchWait {
+    const Host = struct {
+        text: [128]u8 = undefined,
+        length: usize = 0,
+
+        fn paint(host: *anyopaque, text: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(host));
+            @memcpy(self.text[0..text.len], text);
+            self.length = text.len;
+        }
+    };
+    var host: Host = .{};
+    var context: Context = .{
+        .gpa = std.testing.allocator,
+        .io = undefined,
+        .agent = undefined,
+        .accounts = undefined,
+    };
+
+    // Without a host hook the call paints nothing and reports no failure.
+    try context.stateFetchWait(.openai_api);
+    try std.testing.expectEqual(@as(usize, 0), host.length);
+
+    context.wait = .{ .host = &host, .paint = Host.paint };
+    try context.stateFetchWait(.openai_api);
+    try std.testing.expectEqualStrings(
+        "Drinky fetches the model list of OpenAI API. The interface waits for the provider.",
+        host.text[0..host.length],
+    );
+}

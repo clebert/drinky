@@ -4,18 +4,21 @@
 //! bytes. A client built here stays valid for the whole session. It reports
 //! which accounts are authenticated and builds a client for one on demand. The
 //! selection is always an explicit account, never inferred from a precedence.
-//! It also owns best-effort account-specific model limits, so the
-//! provider-wide compiled catalog remains immutable.
+//! It also owns the model catalog, because a fetch needs the credential of the
+//! account it fetches for. No fetch runs at startup: the user asks for one.
 
 const std = @import("std");
 
 const anthropic = @import("anthropic/root.zig");
 const auth = @import("auth.zig");
+const Catalog = @import("Catalog.zig");
 const llm = @import("llm.zig");
-const models = @import("models.zig");
+const Model = @import("Model.zig");
 const net = @import("net.zig");
 const openai = @import("openai/root.zig");
+const OpenRouter = @import("OpenRouter.zig");
 const provider = @import("provider.zig");
+const testing = @import("testing.zig");
 
 const Accounts = @This();
 
@@ -33,13 +36,27 @@ anthropic_subscription_ready: bool,
 openai_subscription_ready: bool,
 /// Whether the Console store loaded a minted key from `auth.json`.
 anthropic_console_ready: bool,
-/// Valid account-specific context windows discovered for known OpenAI models.
-/// Empty means every subscription model uses its compiled fallback.
-openai_subscription_context_windows: std.ArrayList(ContextWindow),
+/// Every model Drinky knows, loaded from its caches. A fetch replaces the list
+/// of one account, and the user asks for that fetch.
+catalog: Catalog,
 
-const ContextWindow = struct {
-    model: []const u8,
-    tokens: u64,
+/// What one fetch achieved. A part that failed leaves the cached part of its
+/// own kind untouched, so a user who fetches again keeps what already arrived.
+pub const Refresh = struct {
+    /// The models the account offers after the fetch.
+    count: usize = 0,
+    /// Why the account list did not arrive, or null when it did.
+    models_error: ?anyerror = null,
+    /// Why the public metadata did not arrive, or null when it did.
+    metadata_error: ?anyerror = null,
+    /// Why the fetched account list did not reach its cache file, or null when
+    /// that write succeeded or never ran. The list serves this session in every
+    /// case.
+    models_save_error: ?anyerror = null,
+    /// Why the fetched public metadata did not reach its cache file, or null
+    /// when that write succeeded or never ran. The metadata serves this session
+    /// in every case.
+    metadata_save_error: ?anyerror = null,
 };
 
 /// The per-vendor API keys, each null when its environment variable is unset.
@@ -81,7 +98,10 @@ pub fn init(
     const anthropic_console_ready = try anthropic_console_auth.load();
     const openai_ready = try openai_auth.load();
 
-    var accounts: Accounts = .{
+    var catalog = try Catalog.init(gpa, io, home);
+    errdefer catalog.deinit();
+
+    return .{
         .gpa = gpa,
         .io = io,
         .timeouts = timeouts,
@@ -92,14 +112,12 @@ pub fn init(
         .anthropic_subscription_ready = anthropic_ready,
         .openai_subscription_ready = openai_ready,
         .anthropic_console_ready = anthropic_console_ready,
-        .openai_subscription_context_windows = .empty,
+        .catalog = catalog,
     };
-    if (openai_ready) accounts.refreshOpenaiSubscriptionModels();
-    return accounts;
 }
 
 pub fn deinit(self: *Accounts) void {
-    self.openai_subscription_context_windows.deinit(self.gpa);
+    self.catalog.deinit();
     self.anthropic_auth.deinit();
     self.anthropic_console_auth.deinit();
     self.openai_auth.deinit();
@@ -157,30 +175,100 @@ pub fn client(self: *Accounts, account: llm.Account) ?provider.Client {
     return provider.Client.init(self.gpa, self.io, credentials, timeouts);
 }
 
-/// Overlay account-specific metadata onto a compiled or configured model.
-/// API-key and Anthropic accounts always receive the model unchanged.
-pub fn resolveModel(self: *const Accounts, account: llm.Account, base: models.Model) models.Model {
-    if (account != .openai_subscription) return base;
-    var resolved = base;
-    for (self.openai_subscription_context_windows.items) |context_window| {
-        if (!std.mem.eql(u8, context_window.model, base.name)) continue;
-        resolved.context_window = context_window.tokens;
-        break;
-    }
-    return resolved;
+/// The model `name` of `account`, or null when the account does not offer it.
+pub fn findModel(self: *const Accounts, account: llm.Account, name: []const u8) ?Model {
+    return self.catalog.find(account, name);
 }
 
-/// Append every compiled model offered to `account` and apply only that
-/// account's valid metadata overlays.
+/// Whether `account` offers at least one model, so a pick can run without a
+/// fetch. An account whose list no fetch cached offers none.
+pub fn offersModel(self: *const Accounts, account: llm.Account) bool {
+    return !self.catalog.isEmpty(account);
+}
+
+/// Append every model `account` offers, in the order its provider listed it.
 pub fn listModels(
     self: *const Accounts,
     account: llm.Account,
-    out: *std.ArrayList(models.Model),
+    out: *std.ArrayList(Model),
     gpa: std.mem.Allocator,
 ) !void {
-    const start = out.items.len;
-    try models.list(account.provider(), out, gpa);
-    for (out.items[start..]) |*model| model.* = self.resolveModel(account, model.*);
+    try self.catalog.list(account, out, gpa);
+}
+
+/// Fetch the model list of `account` and the public metadata, and store both.
+/// The two requests are independent, so a failure of one keeps the result of
+/// the other. Only the user starts this.
+pub fn refresh(self: *Accounts, account: llm.Account) Refresh {
+    var result: Refresh = .{};
+
+    if (self.fetchModels(account)) |discovered| {
+        defer self.gpa.free(discovered);
+        recordSave(&result.models_save_error, self.catalog.setAccount(account, discovered));
+    } else |err| {
+        result.models_error = err;
+    }
+
+    if (OpenRouter.fetch(self.gpa, self.io, self.timeouts.anthropic)) |fetched| {
+        var metadata = fetched;
+        defer metadata.deinit();
+        recordSave(&result.metadata_save_error, self.catalog.setMetadata(metadata.entries));
+    } else |err| {
+        result.metadata_error = err;
+    }
+
+    var listed: std.ArrayList(Model) = .empty;
+    defer listed.deinit(self.gpa);
+    if (self.catalog.list(account, &listed, self.gpa)) {
+        result.count = listed.items.len;
+    } else |_| {}
+    return result;
+}
+
+/// Fold the outcome of one cache write into `slot`. The catalog holds what
+/// arrived before it writes the file, so a failed write is a failed save and
+/// never a failed fetch. Each write owns its own slot, so a report names the
+/// cache that failed.
+fn recordSave(slot: *?anyerror, outcome: anyerror!void) void {
+    outcome catch |err| {
+        slot.* = err;
+    };
+}
+
+/// The vendor list of `account`, fetched with that account's own credential.
+fn fetchModels(self: *Accounts, account: llm.Account) ![]Model {
+    return switch (account) {
+        .anthropic_subscription => anthropic.models.fetch(
+            self.gpa,
+            self.io,
+            self.timeouts.anthropic,
+            .{ .subscription = try self.anthropic_auth.accessToken() },
+        ),
+        .anthropic_console => anthropic.models.fetch(
+            self.gpa,
+            self.io,
+            self.timeouts.anthropic,
+            .{ .api_key = self.anthropic_console_auth.apiKey() orelse return error.SignedOut },
+        ),
+        .anthropic_api => anthropic.models.fetch(
+            self.gpa,
+            self.io,
+            self.timeouts.anthropic,
+            .{ .api_key = self.keys.anthropic orelse return error.SignedOut },
+        ),
+        .openai_subscription => openai.models.fetchSubscription(
+            self.gpa,
+            self.io,
+            self.timeouts.openai,
+            &self.openai_auth,
+        ),
+        .openai_api => openai.models.fetchApi(
+            self.gpa,
+            self.io,
+            self.timeouts.openai,
+            self.keys.openai orelse return error.SignedOut,
+        ),
+    };
 }
 
 /// The loopback port of the OAuth redirect listener for `account`, or null
@@ -209,7 +297,6 @@ pub fn login(self: *Accounts, account: llm.Account, prompt: anytype) !Login {
         .openai_subscription => committed: {
             const committed_login = try self.openai_auth.login(prompt);
             self.openai_subscription_ready = true;
-            self.refreshOpenaiSubscriptionModels();
             break :committed committed_login;
         },
         .anthropic_console => committed: {
@@ -236,28 +323,32 @@ pub fn logout(self: *Accounts, account: llm.Account) !void {
         .anthropic_subscription => {
             try self.anthropic_auth.logout();
             self.anthropic_subscription_ready = false;
+            self.catalog.dropAccount(account);
         },
         .openai_subscription => {
             try self.openai_auth.logout();
             self.openai_subscription_ready = false;
-            self.openai_subscription_context_windows.clearAndFree(self.gpa);
+            self.catalog.dropAccount(account);
         },
         .anthropic_console => {
             try self.anthropic_console_auth.logout();
             self.anthropic_console_ready = false;
+            self.catalog.dropAccount(account);
         },
         .anthropic_api, .openai_api => return error.ApiAccountHasNoLogout,
     }
 }
 
 /// Forget a rejected subscription credential. Return true when another
-/// instance replaced the stored token and this account reloaded it. The
-/// discovered limits go in every case, because they belong to the principal
-/// behind the replaced credential. Every model falls back to its compiled
-/// limit until the next login or the next start.
+/// instance replaced the stored token and this account reloaded it. The model
+/// list leaves this session in every case, because it belongs to the principal
+/// behind the replaced credential. The account offers no model until the next
+/// fetch. A cache file that Drinky cannot rewrite keeps that list, so the next
+/// start loads it again.
 pub fn invalidate(self: *Accounts, account: llm.Account) !bool {
     switch (account) {
         .anthropic_subscription => {
+            defer self.catalog.dropAccount(account);
             const recovered = self.anthropic_auth.invalidate() catch |err| {
                 self.anthropic_subscription_ready = false;
                 return err;
@@ -266,7 +357,7 @@ pub fn invalidate(self: *Accounts, account: llm.Account) !bool {
             return recovered;
         },
         .openai_subscription => {
-            defer self.openai_subscription_context_windows.clearAndFree(self.gpa);
+            defer self.catalog.dropAccount(account);
             const recovered = self.openai_auth.invalidate() catch |err| {
                 self.openai_subscription_ready = false;
                 return err;
@@ -280,45 +371,11 @@ pub fn invalidate(self: *Accounts, account: llm.Account) !bool {
     }
 }
 
-/// Drop metadata that belongs to the principal behind a replaced credential.
-/// Anthropic has no discovered metadata. OpenAI returns to compiled limits.
+/// Drop the data that belongs to the principal behind a replaced credential.
+/// The model list of an account is such data, so the account offers no model
+/// for the rest of this session, until the user fetches again.
 pub fn dropPrincipalMetadata(self: *Accounts, account: llm.Account) void {
-    if (account == .openai_subscription)
-        self.openai_subscription_context_windows.clearAndFree(self.gpa);
-}
-
-/// Replace this account's discovered limits. Any fetch, envelope, or
-/// allocation failure leaves the override set empty and restores every
-/// compiled fallback.
-fn refreshOpenaiSubscriptionModels(self: *Accounts) void {
-    self.replaceOpenaiSubscriptionCatalog(openai.ModelCatalog.fetch(
-        self.gpa,
-        self.io,
-        self.timeouts.openai,
-        &self.openai_auth,
-    ));
-}
-
-fn replaceOpenaiSubscriptionCatalog(
-    self: *Accounts,
-    result: anyerror!openai.ModelCatalog,
-) void {
-    self.openai_subscription_context_windows.clearAndFree(self.gpa);
-
-    var catalog = result catch return;
-    defer catalog.deinit();
-
-    var vendor_models: std.ArrayList(models.Model) = .empty;
-    defer vendor_models.deinit(self.gpa);
-    models.list(.openai, &vendor_models, self.gpa) catch return;
-
-    for (vendor_models.items) |model| {
-        const context_window = catalog.contextWindow(model.name) orelse continue;
-        self.openai_subscription_context_windows.append(self.gpa, .{
-            .model = model.name,
-            .tokens = context_window,
-        }) catch return self.openai_subscription_context_windows.clearAndFree(self.gpa);
-    }
+    self.catalog.dropAccount(account);
 }
 
 fn testAccounts(keys: ApiKeys, anthropic_ready: bool, openai_ready: bool) Accounts {
@@ -333,8 +390,27 @@ fn testAccounts(keys: ApiKeys, anthropic_ready: bool, openai_ready: bool) Accoun
         .anthropic_subscription_ready = anthropic_ready,
         .openai_subscription_ready = openai_ready,
         .anthropic_console_ready = false,
-        .openai_subscription_context_windows = .empty,
+        .catalog = testCatalog(),
     };
+}
+
+/// A catalog with no file behind it, so a test reads and writes memory alone.
+fn testCatalog() Catalog {
+    return .{
+        .gpa = std.testing.allocator,
+        .io = std.testing.io,
+        .models_path = "",
+        .metadata_path = "",
+        .accounts = .initFill(&.{}),
+        .metadata = &.{},
+    };
+}
+
+/// Give `account` one model, as a fetch does.
+fn seedModel(accounts: *Accounts, account: llm.Account, name: []const u8) !void {
+    const seeded = try accounts.gpa.dupe(Model, &.{testing.model(name)});
+    accounts.gpa.free(accounts.catalog.accounts.get(account));
+    accounts.catalog.accounts.set(account, seeded);
 }
 
 test "isAuthenticated and firstAuthenticated read keys and readiness, subscription first" {
@@ -460,7 +536,7 @@ test "invalidation forgets a rejected credential when store removal fails" {
     try std.testing.expect(accounts.client(.anthropic_subscription) == null);
 }
 
-test "OpenAI invalidation clears context overrides when store removal fails" {
+test "OpenAI invalidation drops the model list when store removal fails" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -483,16 +559,14 @@ test "OpenAI invalidation clears context overrides when store removal fails" {
     );
 
     var accounts = testAccounts(.{}, false, true);
-    defer accounts.openai_subscription_context_windows.deinit(gpa);
+    defer gpa.free(accounts.catalog.accounts.get(.openai_subscription));
     accounts.openai_auth = try openai.Auth.init(gpa, io, home, .{});
     defer accounts.openai_auth.deinit();
     try std.testing.expect(try accounts.openai_auth.load());
-    try accounts.openai_subscription_context_windows.append(gpa, .{
-        .model = "gpt-5.6-sol",
-        .tokens = 372_000,
-    });
+    try seedModel(&accounts, .openai_subscription, "gpt-5.6-sol");
+    try std.testing.expect(!accounts.catalog.isEmpty(.openai_subscription));
 
-    // A failed removal must clear both the credential and its account metadata.
+    // A failed removal must drop both the credential and the list behind it.
     try tmp.dir.writeFile(io, .{ .sub_path = ".drinky/auth.json", .data = "not json" });
     try std.testing.expectError(
         error.BadCredentials,
@@ -500,13 +574,10 @@ test "OpenAI invalidation clears context overrides when store removal fails" {
     );
     try std.testing.expect(!accounts.isAuthenticated(.openai_subscription));
     try std.testing.expect(accounts.openai_auth.tokens == null);
-    try std.testing.expectEqual(
-        @as(usize, 0),
-        accounts.openai_subscription_context_windows.items.len,
-    );
+    try std.testing.expect(accounts.catalog.isEmpty(.openai_subscription));
 }
 
-test "OpenAI invalidation reloads a replacement without its discovered limits" {
+test "OpenAI invalidation reloads a replacement without its model list" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -529,14 +600,11 @@ test "OpenAI invalidation reloads a replacement without its discovered limits" {
     );
 
     var accounts = testAccounts(.{}, false, true);
-    defer accounts.openai_subscription_context_windows.deinit(gpa);
+    defer gpa.free(accounts.catalog.accounts.get(.openai_subscription));
     accounts.openai_auth = try openai.Auth.init(gpa, io, home, .{});
     defer accounts.openai_auth.deinit();
     try std.testing.expect(try accounts.openai_auth.load());
-    try accounts.openai_subscription_context_windows.append(gpa, .{
-        .model = "gpt-5.6-sol",
-        .tokens = 372_000,
-    });
+    try seedModel(&accounts, .openai_subscription, "gpt-5.6-sol");
 
     // Another instance saved a replacement. The reloaded credential can belong
     // to another principal, so its discovered limits go with the old one.
@@ -554,97 +622,67 @@ test "OpenAI invalidation reloads a replacement without its discovered limits" {
         "new_refresh",
         accounts.openai_auth.tokens.?.refresh,
     );
-    try std.testing.expectEqual(
-        @as(usize, 0),
-        accounts.openai_subscription_context_windows.items.len,
-    );
+    try std.testing.expect(accounts.catalog.isEmpty(.openai_subscription));
 }
 
-test "a principal replacement drops only OpenAI subscription metadata" {
+test "a principal replacement drops the list of that account alone" {
     const gpa = std.testing.allocator;
     var accounts = testAccounts(.{}, false, true);
-    defer accounts.openai_subscription_context_windows.deinit(gpa);
-    try accounts.openai_subscription_context_windows.append(gpa, .{
-        .model = "gpt-5.6-sol",
-        .tokens = 372_000,
-    });
+    defer for (std.enums.values(llm.Account)) |account|
+        gpa.free(accounts.catalog.accounts.get(account));
+
+    try seedModel(&accounts, .openai_subscription, "gpt-5.6-sol");
+    try seedModel(&accounts, .anthropic_subscription, "claude-opus-5");
 
     accounts.dropPrincipalMetadata(.anthropic_subscription);
-    try std.testing.expectEqual(
-        @as(usize, 1),
-        accounts.openai_subscription_context_windows.items.len,
-    );
+    try std.testing.expect(accounts.catalog.isEmpty(.anthropic_subscription));
+    try std.testing.expect(!accounts.catalog.isEmpty(.openai_subscription));
+
     accounts.dropPrincipalMetadata(.openai_subscription);
-    try std.testing.expectEqual(
-        @as(usize, 0),
-        accounts.openai_subscription_context_windows.items.len,
-    );
+    try std.testing.expect(accounts.catalog.isEmpty(.openai_subscription));
 }
 
-test "catalog limits apply to known subscription models only" {
+// A fetch that arrived serves this session, whatever the cache file did, so a
+// failed write is a failed save and never a failed fetch. A picker that reads
+// `models_error` must therefore stay open over the list that arrived.
+test "a failed cache write reports a failed save, not a failed fetch" {
+    var result: Refresh = .{};
+    recordSave(&result.models_save_error, {});
+    try std.testing.expect(result.models_save_error == null);
+
+    // Another Drinky instance holds the lock of the cache file.
+    recordSave(&result.models_save_error, error.StoreBusy);
+    try std.testing.expectEqual(@as(?anyerror, error.StoreBusy), result.models_save_error);
+    try std.testing.expect(result.models_error == null);
+    try std.testing.expect(result.metadata_error == null);
+
+    // Each write owns its own slot, so a report names the cache that failed and
+    // no failure hides behind another.
+    recordSave(&result.metadata_save_error, error.AccessDenied);
+    try std.testing.expectEqual(@as(?anyerror, error.StoreBusy), result.models_save_error);
+    try std.testing.expectEqual(@as(?anyerror, error.AccessDenied), result.metadata_save_error);
+}
+
+test "an account lists the models of its own catalog entry" {
     const gpa = std.testing.allocator;
     var accounts = testAccounts(.{ .openai = "sk-openai" }, false, true);
-    defer accounts.openai_subscription_context_windows.deinit(gpa);
+    defer for (std.enums.values(llm.Account)) |account|
+        gpa.free(accounts.catalog.accounts.get(account));
 
-    const response =
-        \\{ "models": [
-        \\  { "slug": "gpt-5.6-sol", "context_window": 372000 },
-        \\  { "slug": "not-compiled", "context_window": 999999 }
-        \\] }
-    ;
-    accounts.replaceOpenaiSubscriptionCatalog(try openai.ModelCatalog.parse(gpa, response));
+    try std.testing.expect(accounts.catalog.isEmpty(.openai_subscription));
+    try std.testing.expect(!accounts.offersModel(.openai_subscription));
+    try seedModel(&accounts, .openai_subscription, "gpt-5.6-sol");
+    try std.testing.expect(accounts.offersModel(.openai_subscription));
 
-    const sol = models.get(.openai, "gpt-5.6-sol").?;
-    const terra = models.get(.openai, "gpt-5.6-terra").?;
-    try std.testing.expectEqual(
-        @as(u64, 372_000),
-        accounts.resolveModel(.openai_subscription, sol).context_window,
-    );
-    try std.testing.expectEqual(
-        @as(u64, 1_050_000),
-        accounts.resolveModel(.openai_subscription, terra).context_window,
-    );
-    try std.testing.expectEqual(
-        @as(u64, 1_050_000),
-        accounts.resolveModel(.openai_api, sol).context_window,
-    );
-    try std.testing.expectEqual(
-        @as(usize, 1),
-        accounts.openai_subscription_context_windows.items.len,
-    );
-
-    var listed: std.ArrayList(models.Model) = .empty;
+    var listed: std.ArrayList(Model) = .empty;
     defer listed.deinit(gpa);
     try accounts.listModels(.openai_subscription, &listed, gpa);
-    try std.testing.expectEqual(@as(u64, 372_000), listed.items[0].context_window);
-}
+    try std.testing.expectEqual(@as(usize, 1), listed.items.len);
+    try std.testing.expectEqualStrings("gpt-5.6-sol", listed.items[0].name());
+    try std.testing.expect(accounts.findModel(.openai_subscription, "gpt-5.6-sol") != null);
 
-test "catalog request failure restores compiled subscription defaults" {
-    const gpa = std.testing.allocator;
-    var accounts = testAccounts(.{}, false, true);
-    defer accounts.openai_subscription_context_windows.deinit(gpa);
-
-    const response =
-        \\{ "models": [
-        \\  { "slug": "gpt-5.6-sol", "context_window": 372000 }
-        \\] }
-    ;
-    accounts.replaceOpenaiSubscriptionCatalog(try openai.ModelCatalog.parse(gpa, response));
-    try std.testing.expectEqual(
-        @as(usize, 1),
-        accounts.openai_subscription_context_windows.items.len,
-    );
-
-    accounts.replaceOpenaiSubscriptionCatalog(
-        @as(anyerror!openai.ModelCatalog, error.ConnectionRefused),
-    );
-    const sol = models.get(.openai, "gpt-5.6-sol").?;
-    try std.testing.expectEqual(
-        @as(u64, 1_050_000),
-        accounts.resolveModel(.openai_subscription, sol).context_window,
-    );
-    try std.testing.expectEqual(
-        @as(usize, 0),
-        accounts.openai_subscription_context_windows.items.len,
-    );
+    // The list of one account never reaches another.
+    try std.testing.expect(accounts.findModel(.openai_api, "gpt-5.6-sol") == null);
+    try std.testing.expect(accounts.catalog.isEmpty(.openai_api));
+    try std.testing.expect(!accounts.offersModel(.openai_api));
 }

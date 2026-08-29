@@ -117,6 +117,9 @@ gpa: std.mem.Allocator,
 transcript: Transcript,
 /// The sole transient notice. Its owned content never enters the transcript.
 notice: ?ai.command.Outcome.Message,
+/// Whether that notice is the wait line of a blocking command step. Only such a
+/// line retracts itself when the step reports its outcome.
+notice_wait: bool,
 /// The armed one-shot confirmations. A warning arms one, the key that raised it
 /// passes it once, and any other user action cancels it.
 confirmations: std.EnumSet(Confirmation),
@@ -139,7 +142,7 @@ dirty: bool,
 stats_shown: ai.Agent.Stats,
 /// The consumer-owned copy of the active model. It updates after a command
 /// runs, so `paint` needs no agent for the context-window and model-name gauges.
-model_shown: ai.models.Model,
+model_shown: ?ai.Model,
 /// The consumer-owned copy of the reasoning-effort level for the status-line
 /// indicator. It updates after a command runs.
 effort_shown: ai.llm.Effort,
@@ -527,13 +530,14 @@ pub const UiEvent = union(enum) {
 pub fn init(
     gpa: std.mem.Allocator,
     writer: *std.Io.Writer,
-    model: ai.models.Model,
+    model: ?ai.Model,
     effort: ai.llm.Effort,
 ) Session {
     var self: Session = .{
         .gpa = gpa,
         .transcript = Transcript.init(gpa),
         .notice = null,
+        .notice_wait = false,
         .confirmations = .initEmpty(),
         .editor = ui.Editor.init(gpa),
         .view = terminal.View.init(gpa, writer),
@@ -613,7 +617,7 @@ fn reviewHoldControls(self: *const Session, buffer: []u8) []const u8 {
 pub const Conversation = struct {
     transcript: Transcript,
     account: ?ai.llm.Account,
-    model: ai.models.Model,
+    model: ?ai.Model,
     effort: ai.llm.Effort,
     stats: ai.Agent.Stats = .{},
     steering: std.ArrayList(ui.Editor.Draft) = .empty,
@@ -627,13 +631,13 @@ pub const Conversation = struct {
     pub fn empty(
         gpa: std.mem.Allocator,
         account: ?ai.llm.Account,
-        model: *const ai.models.Model,
+        model: ?ai.Model,
         effort: ai.llm.Effort,
     ) Conversation {
         return .{
             .transcript = Transcript.init(gpa),
             .account = account,
-            .model = model.*,
+            .model = model,
             .effort = effort,
         };
     }
@@ -671,7 +675,7 @@ pub fn switchConversation(self: *Session, other: *Conversation) void {
     self.confirmations = .initEmpty();
     std.mem.swap(Transcript, &self.transcript, &other.transcript);
     std.mem.swap(?ai.llm.Account, &self.account_shown, &other.account);
-    std.mem.swap(ai.models.Model, &self.model_shown, &other.model);
+    std.mem.swap(?ai.Model, &self.model_shown, &other.model);
     std.mem.swap(ai.llm.Effort, &self.effort_shown, &other.effort);
     std.mem.swap(ai.Agent.Stats, &self.stats_shown, &other.stats);
     std.mem.swap(std.ArrayList(ui.Editor.Draft), &self.steering, &other.steering);
@@ -694,7 +698,7 @@ pub fn switchConversation(self: *Session, other: *Conversation) void {
 pub fn showSetup(
     self: *Session,
     account: ?ai.llm.Account,
-    model: ai.models.Model,
+    model: ?ai.Model,
     effort: ai.llm.Effort,
 ) void {
     const previous = self.projectionSetup();
@@ -713,10 +717,13 @@ pub fn showSetup(
 fn projectionSetup(self: *const Session) Transcript.Setup {
     const account = self.account_shown orelse
         return .{ .account = null, .replays_reasoning = true };
-    const resolution = self.model_shown.effort.resolve(self.effort_shown);
+    // Without a model no request goes out, so nothing hides.
+    const model = self.model_shown orelse
+        return .{ .account = account, .replays_reasoning = true };
+    const reasoning = model.reasoning(self.effort_shown);
     return .{
         .account = account,
-        .replays_reasoning = resolution.replaysReasoning(account.provider()),
+        .replays_reasoning = reasoning.replaysReasoning(account.provider()),
     };
 }
 
@@ -735,6 +742,7 @@ pub fn dropAccountReasoning(self: *Session, account: ai.llm.Account) void {
 
 /// Clear the transient notice. The regular footer returns on the next frame.
 pub fn clearNotice(self: *Session) void {
+    self.notice_wait = false;
     if (self.notice) |notice| {
         self.gpa.free(notice.content);
         self.notice = null;
@@ -787,6 +795,13 @@ fn showNotice(
     text: []const u8,
 ) !void {
     self.setNotice(.{ .content = try self.gpa.dupe(u8, text), .severity = severity });
+}
+
+/// Show `text` as the wait line of a blocking command step. The step stops the
+/// interface, so the line states that stop before the step runs.
+pub fn showWait(self: *Session, text: []const u8) !void {
+    try self.showNotice(.information, text);
+    self.notice_wait = true;
 }
 
 /// Free whatever the current mode owns.
@@ -1021,21 +1036,34 @@ fn appendToolBlock(self: *Session, block: *const ToolBlock) !void {
     try self.transcript.append(.tool_result, options, text);
 }
 
+/// Append one command message as a transcript event and free its content. A
+/// failure takes the error color, and every other severity stays muted, because
+/// an event reports the state of the session and never a message.
+///
+/// One rule serves every event of a command. The line of a finished step and
+/// the report of a picker read alike.
+fn appendEvent(self: *Session, message: ai.command.Outcome.Message) !void {
+    defer self.gpa.free(message.content);
+    try self.transcript.append(
+        .event,
+        .{ .is_error = message.severity == .failure },
+        message.content,
+    );
+}
+
 /// Apply a command outcome to the model: replace its notice, record its event,
 /// open its picker, or write its line into the editor.
+///
+/// An outcome proves that the step which produced it ended, so a wait line goes
+/// first. A line that outlives its wait misinforms the user as much as a silent
+/// stop does.
 pub fn applyOutcome(self: *Session, outcome: ai.command.Outcome) !void {
+    if (self.notice_wait) self.clearNotice();
     switch (outcome) {
         // A refusal is a notice whose line stays in the editor. The app owns that
         // rule, because the session never clears the editor for a command.
         .notice, .refusal => |message| self.setNotice(message),
-        .event => |event| {
-            defer self.gpa.free(event.content);
-            try self.transcript.append(
-                .event,
-                .{ .is_error = event.severity == .failure },
-                event.content,
-            );
-        },
+        .event => |event| try self.appendEvent(event),
         .pick => |*pick| try self.openPicker(pick),
         // A picked line that takes an argument replaces the draft, so the user
         // completes it and sends it. The command that opened the picker already
@@ -1052,6 +1080,7 @@ pub fn applyOutcome(self: *Session, outcome: ai.command.Outcome) !void {
         .login,
         .logout,
         .switch_account,
+        .credential_replaced,
         .new_conversation,
         .review,
         .show_system_prompt,
@@ -1064,13 +1093,28 @@ pub fn applyOutcome(self: *Session, outcome: ai.command.Outcome) !void {
 /// Enter picker mode over `pick`, whose confirmation goes to `pick.select`. Takes
 /// ownership of `pick.options`. A picker that `pick` replaces goes on the trail,
 /// so Esc returns to it.
+///
+/// A step that rebuilds itself stays one step. A row can act inside its own
+/// step, like the fetch row of a model step, and the reopened list is that same
+/// step. A push there gives Esc a first press that rebuilds the same list, and a
+/// repeated action pushes the steps above out of the bounded trail.
 fn openPicker(self: *Session, pick: *const ai.command.Outcome.Pick) !void {
     var trail: Trail = .{};
     if (self.mode == .picking) {
         trail = self.mode.picking.trail;
-        trail.push(self.mode.picking.picker.position(), self.mode.picking.reopen);
+        if (!sameStep(self.mode.picking.reopen, pick.reopen))
+            trail.push(self.mode.picking.picker.position(), self.mode.picking.reopen);
     }
     return self.enterPicker(pick, trail, null);
+}
+
+/// Whether two pickers are the same step. Each step names the one handler that
+/// builds it again, so equal handlers mean one step. A picker that names none
+/// cannot be matched, and it ends the trail anyway.
+fn sameStep(step: ?ai.command.Outcome.Opener, other: ?ai.command.Outcome.Opener) bool {
+    const step_open = step orelse return false;
+    const other_open = other orelse return false;
+    return step_open == other_open;
 }
 
 /// Enter picker mode over the picker one step above the open one. The trail drops
@@ -1107,6 +1151,10 @@ fn enterPicker(
         for (pick.options) |option| self.gpa.free(option);
         self.gpa.free(pick.options);
     }
+    // A step that both reports and opens a list records its line first. The
+    // scrollback holds the report, so a failed picker loses neither the line nor
+    // its bytes, and a report of several sentences reads whole.
+    if (pick.report) |message| try self.appendEvent(message);
     const picker = try ui.Picker.init(self.gpa, pick.title, pick.options, .{
         .current = pick.current,
         .position = position,
@@ -1491,28 +1539,7 @@ pub fn paint(self: *Session, size: terminal.View.Size) !void {
         else => {},
     }
 
-    const status: ui.status.Info = .{
-        .directory = self.directory_shown,
-        .branch = self.branch(),
-        .context_tokens = self.stats_shown.context_tokens,
-        .cache_usage = self.stats_shown.cache_usage,
-        .cost = self.stats_shown.cost,
-        .context_window = self.model_shown.context_window,
-        .model = self.model_shown.name,
-        .effort = @tagName(self.effort_shown),
-        .account = self.account_shown,
-        .quota = self.stats_shown.quota,
-        // The agent stamps the head that stated the allowance on the clock that
-        // counts a suspended system, so the difference is the age of that
-        // response even across a sleep.
-        .quota_age_ms = self.boot_clock_ms - self.stats_shown.quota_seen_ms,
-        .turn_active = self.mode == .turn,
-        .gauge = self.gauge,
-        .notice = if (self.notice) |notice| .{
-            .text = notice.content,
-            .severity = notice.severity,
-        } else null,
-    };
+    const status = self.statusInfo();
 
     // The steering caption borrows this buffer through `layout.project` below.
     // The bytes hold the 17-byte label and every decimal `usize` value.
@@ -1601,6 +1628,36 @@ pub fn paint(self: *Session, size: terminal.View.Size) !void {
         .status = &status,
     } };
     try layout.project(self.gpa, &self.view, size, &scene);
+}
+
+/// The status line of this session. Every text of the result borrows the
+/// session, so the result must not outlive it and must never point into a copy
+/// of a field.
+fn statusInfo(self: *const Session) ui.status.Info {
+    return .{
+        .directory = self.directory_shown,
+        .branch = self.branch(),
+        .context_tokens = self.stats_shown.context_tokens,
+        .cache_usage = self.stats_shown.cache_usage,
+        .cost = self.stats_shown.cost,
+        .context_window = if (self.model_shown) |model| model.context_window else null,
+        // The name points into the model, so the capture must be a pointer at
+        // the model of the session and never at a copy of it.
+        .model = if (self.model_shown) |*model| model.name() else null,
+        .effort = @tagName(self.effort_shown),
+        .account = self.account_shown,
+        .quota = self.stats_shown.quota,
+        // The agent stamps the head that stated the allowance on the clock that
+        // counts a suspended system, so the difference is the age of that
+        // response even across a sleep.
+        .quota_age_ms = self.boot_clock_ms - self.stats_shown.quota_seen_ms,
+        .turn_active = self.mode == .turn,
+        .gauge = self.gauge,
+        .notice = if (self.notice) |notice| .{
+            .text = notice.content,
+            .severity = notice.severity,
+        } else null,
+    };
 }
 
 /// Move the terminal cursor below the interface. Call once at shutdown, so the
@@ -1808,13 +1865,11 @@ fn freeTurn(self: *Session, turn: *Turn) void {
     turn.box_view.deinit(self.gpa);
 }
 
-const test_model = ai.models.get(.anthropic, "claude-sonnet-4-6") orelse
-    @compileError("test model is not in the model table");
+const test_model = ai.testing.model("claude-sonnet-4-6");
 
 // The model of the other vendor, for a switch that crosses accounts. A model
 // never pairs with a foreign vendor's account.
-const test_model_openai = ai.models.get(.openai, "gpt-5.6-sol") orelse
-    @compileError("test model is not in the model table");
+const test_model_openai = ai.testing.model("gpt-5.6-sol");
 
 // The effort level that names a thinking control on `test_model`, so a request of
 // that setup replays its stored reasoning. Level `none` omits the control there,
@@ -2107,6 +2162,116 @@ test "a notice replaces its predecessor without entering the transcript" {
     try std.testing.expect(session.notice == null);
 }
 
+// A blocking command step states its wait before it runs, because the interface
+// stops while the step runs. The outcome of the step proves that the stop ended,
+// so the line must go with it. A wait line that outlives its wait misinforms the
+// user as much as a silent stop does.
+test "the wait line of a blocking step goes with the outcome of that step" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    defer session.deinit();
+
+    const wait_text = "Drinky fetches the model list. The interface waits for the provider.";
+    try session.showWait(wait_text);
+    try std.testing.expectEqualStrings(wait_text, session.notice.?.content);
+
+    // The refreshed list opens, so the wait ended.
+    const options = try gpa.alloc([]const u8, 1);
+    options[0] = try gpa.dupe(u8, "claude-sonnet-4-6");
+    try session.applyOutcome(.{ .pick = .{
+        .select = undefined,
+        .title = "Model",
+        .cancellation_message = "You canceled the model selection.",
+        .options = options,
+        .current = null,
+    } });
+    try std.testing.expect(session.mode == .picking);
+    try std.testing.expect(session.notice == null);
+
+    // A failed fetch reports an event instead, and the wait ended there too.
+    try session.showWait(wait_text);
+    try session.applyOutcome(
+        try ai.command.Outcome.reportEvent(gpa, .failure, "Drinky could not fetch.", .{}),
+    );
+    try std.testing.expect(session.notice == null);
+
+    // A notice of another kind names no wait, so an outcome leaves it alone.
+    try session.applyOutcome(
+        try ai.command.Outcome.reportNotice(gpa, .failure, "Select a valid model.", .{}),
+    );
+    try session.applyOutcome(
+        try ai.command.Outcome.reportEvent(gpa, .information, "An event.", .{}),
+    );
+    try std.testing.expectEqualStrings("Select a valid model.", session.notice.?.content);
+}
+
+// A step can report and open a list at once. A cache write that failed is such
+// a step: the fetched list serves this session, so the picker opens over it and
+// the failed save states itself in the scrollback. The report holds several
+// sentences, so the transcript keeps it whole and the footer keeps none of it.
+test "a picker that reports records its line and still opens its list" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    defer session.deinit();
+
+    const wait_text = "Drinky fetches the model list. The interface waits for the provider.";
+    try session.showWait(wait_text);
+
+    const options = try gpa.alloc([]const u8, 1);
+    options[0] = try gpa.dupe(u8, "claude-sonnet-4-6");
+    try session.applyOutcome(.{ .pick = .{
+        .select = undefined,
+        .title = "Model",
+        .cancellation_message = "You canceled the model selection.",
+        .options = options,
+        .current = null,
+        .report = .{
+            .content = try gpa.dupe(u8, "Drinky could not save the list."),
+            .severity = .failure,
+        },
+    } });
+
+    try std.testing.expect(session.mode == .picking);
+    // The fetch ended, so its wait line leaves the footer with the outcome.
+    try std.testing.expect(session.notice == null);
+    const failure_blocks = session.transcript.blocks();
+    try std.testing.expectEqual(@as(usize, 1), failure_blocks.len);
+    try std.testing.expectEqualStrings(
+        "Drinky could not save the list.",
+        failure_blocks[0].content.event.text.items,
+    );
+    // A failure takes the error color. Every other severity stays muted.
+    try std.testing.expect(failure_blocks[0].content.event.is_error);
+
+    session.closePicker();
+    const empty_options = try gpa.alloc([]const u8, 1);
+    empty_options[0] = try gpa.dupe(u8, "Fetch the model list");
+    try session.applyOutcome(.{ .pick = .{
+        .select = undefined,
+        .title = "Model",
+        .cancellation_message = "You canceled the model selection.",
+        .options = empty_options,
+        .current = null,
+        .report = .{
+            .content = try gpa.dupe(u8, "The account offers no model now."),
+            .severity = .warning,
+        },
+    } });
+
+    try std.testing.expect(session.mode == .picking);
+    const blocks = session.transcript.blocks();
+    try std.testing.expectEqual(@as(usize, 2), blocks.len);
+    try std.testing.expectEqualStrings(
+        "The account offers no model now.",
+        blocks[1].content.event.text.items,
+    );
+    try std.testing.expect(!blocks[1].content.event.is_error);
+}
+
 test "a notice replaces the footer and clearing restores the status" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -2123,13 +2288,32 @@ test "a notice replaces the footer and clearing restores the status" {
     const notice_frame = out.written()[notice_start..];
     try std.testing.expect(std.mem.indexOf(u8, notice_frame, "Error: ") != null);
     try std.testing.expect(std.mem.indexOf(u8, notice_frame, "Temporary notice.") != null);
-    try std.testing.expect(std.mem.indexOf(u8, notice_frame, test_model.name) == null);
+    try std.testing.expect(std.mem.indexOf(u8, notice_frame, test_model.name()) == null);
 
     const status_start = out.written().len;
     session.clearNotice();
     try session.paint(.{ .columns = 80, .rows = 24 });
     const status_frame = out.written()[status_start..];
-    try std.testing.expect(std.mem.indexOf(u8, status_frame, test_model.name) != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_frame, test_model.name()) != null);
+}
+
+// The name of a model lives in the model itself, so a copy of that model owns
+// its own bytes. The status line must borrow the model of the session, because
+// a slice into a copy that the caller dropped points at dead memory.
+test "the status line borrows the model name of the session" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    defer session.deinit();
+
+    const info = session.statusInfo();
+    try std.testing.expectEqual(session.model_shown.?.name().ptr, info.model.?.ptr);
+    try std.testing.expectEqualStrings(test_model.name(), info.model.?);
+
+    // An account with no model states no name at all.
+    session.model_shown = null;
+    try std.testing.expect(session.statusInfo().model == null);
 }
 
 test "a confirmation is one-shot and separate from its notice" {
@@ -2173,7 +2357,7 @@ test "an event survives notice clearing until a conversation switch discards it"
         session.transcript.blocks()[0].content.event.text.items,
     );
     session.dirty = false;
-    var fresh = Conversation.empty(gpa, .anthropic_subscription, &test_model, .none);
+    var fresh = Conversation.empty(gpa, .anthropic_subscription, test_model, .none);
     session.switchConversation(&fresh);
     fresh.deinit(gpa);
     try std.testing.expectEqual(@as(usize, 0), session.transcript.blocks().len);
@@ -2215,7 +2399,6 @@ test "scripted stream events drive the model and one coalesced paint" {
     try std.testing.expectEqual(@as(usize, 0), session.mode.turn.tools.items.len);
     try applyEvent(&session, 1, .{ .usage = .{
         .cost = 1.5,
-        .saved = 0.25,
         .cache_usage = .{ .input = 10, .output = 20 },
     } });
 
@@ -2879,6 +3062,64 @@ test "the steering caption counts a paste without showing its content" {
     try std.testing.expect(std.mem.indexOf(u8, painted, "Queued messages: 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, painted, "[Paste #1: 16 lines]") == null);
     try std.testing.expect(std.mem.indexOf(u8, painted, "secret line") == null);
+}
+
+// A row can rebuild the step it sits in. The fetch row of a model step does, so
+// the reopened list is the same step, not a deeper one. A push there makes the
+// first Esc rebuild the same list and read as a dead key, and a repeated fetch
+// pushes the steps above out of the bounded trail.
+test "a pick that reopens its own step leaves the trail depth unchanged" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    defer session.deinit();
+
+    const account_step = struct {
+        fn open(_: *ai.command.Context) anyerror!ai.command.Outcome {
+            unreachable;
+        }
+    }.open;
+    const model_step = struct {
+        fn open(_: *ai.command.Context) anyerror!ai.command.Outcome {
+            unreachable;
+        }
+    }.open;
+
+    try session.applyOutcome(.{ .pick = try pickForTest(gpa, "Account", account_step) });
+    try std.testing.expectEqual(@as(usize, 0), session.mode.picking.trail.len);
+
+    // The model step covers the account step, so Esc returns to it.
+    try session.applyOutcome(.{ .pick = try pickForTest(gpa, "Model", model_step) });
+    try std.testing.expectEqual(@as(usize, 1), session.mode.picking.trail.len);
+
+    // The fetch row rebuilds the model step. Two of them add no depth, so one
+    // Esc still reaches the account step.
+    for (0..2) |_| {
+        try session.applyOutcome(.{ .pick = try pickForTest(gpa, "Model", model_step) });
+        try std.testing.expectEqual(@as(usize, 1), session.mode.picking.trail.len);
+    }
+    try std.testing.expect(session.mode.picking.trail.last().?.open == account_step);
+}
+
+/// Test helper: a one-row picker that names `open` as the handler that builds it
+/// again. The rows transfer to the session.
+fn pickForTest(
+    gpa: std.mem.Allocator,
+    title: []const u8,
+    open: ai.command.Outcome.Opener,
+) !ai.command.Outcome.Pick {
+    const options = try gpa.alloc([]const u8, 1);
+    errdefer gpa.free(options);
+    options[0] = try gpa.dupe(u8, "row");
+    return .{
+        .select = undefined,
+        .title = title,
+        .cancellation_message = "You canceled the selection.",
+        .options = options,
+        .current = null,
+        .reopen = open,
+    };
 }
 
 // The trail is bounded, so a flow deeper than its capacity must degrade in one
@@ -3939,7 +4180,7 @@ test "a setup change that hides no block keeps the scrollback" {
     try applyEvent(&session, 2, .{ .thinking = try gpa.dupe(u8, "weigh it") });
     try finishTurn(&session, 0);
     try session.paint(.{ .columns = 80, .rows = 24 });
-    const other_openai = ai.models.get(.openai, "gpt-5.6-luna").?;
+    const other_openai = ai.testing.model("gpt-5.6-luna");
     session.showSetup(.openai_api, other_openai, .none);
     try std.testing.expect(!session.view.force_reset);
     // The block stays on the screen, so the paint of the new setup rewrites no
@@ -4007,7 +4248,7 @@ test "a conversation switch swaps whole and can restore what it replaced" {
     // conversation and must never append that conversation to this one's
     // transcript.
     session.view.force_reset = false;
-    var other = Conversation.empty(gpa, .anthropic_subscription, &test_model, replaying_effort);
+    var other = Conversation.empty(gpa, .anthropic_subscription, test_model, replaying_effort);
     other.stats.cost = 1.5;
     session.switchConversation(&other);
     try std.testing.expectEqual(@as(usize, 0), session.transcript.blocks().len);

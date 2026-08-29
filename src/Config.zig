@@ -33,7 +33,6 @@ gauge: ui.status.Gauge = .{},
 /// The reviewer-round ceiling that a `/review` workflow starts on. A count of
 /// no round starts no reviewer, so it falls back to the compiled count.
 review_rounds_max: u64 = review_rounds_default,
-default_models: DefaultModels = .{},
 /// The configured default reasoning-effort level, or null when the file names
 /// none or names an unknown level. The caller falls back to a compiled default.
 default_effort: ?ai.llm.Effort = null,
@@ -45,11 +44,6 @@ user_instructions: ai.instructions.Result,
 /// pairs each entry with a discovered skill and reports one it cannot pair.
 /// Owned. `deinit` frees them.
 required_skills: []const RequiredSkill = &.{},
-/// The configured default-model names that did not resolve (unknown, or a model
-/// of the wrong vendor for their account). The config keeps them so the app can
-/// tell the user Drinky ignored their line. Empty on the built-in default. Owned.
-/// `deinit` frees them.
-dropped_models: []const DroppedModel = &.{},
 /// The configured default effort level that did not resolve. The config keeps it
 /// so the app can tell the user Drinky ignored their line. Owned. `deinit` frees
 /// it.
@@ -84,31 +78,6 @@ unknown_keys: []const []const u8 = &.{},
 /// omission once, so the diagnostic cap never hides silently.
 unknown_keys_omitted: bool = false,
 
-/// The configured default model per account, resolved against the compiled model
-/// table. An unset or unknown name is null, so the caller falls back to a
-/// compiled default. A resolved model's name points into the static table, so
-/// this outlives the parse with no owned memory.
-pub const DefaultModels = struct {
-    anthropic_api: ?ai.models.Model = null,
-    anthropic_subscription: ?ai.models.Model = null,
-    openai_api: ?ai.models.Model = null,
-    openai_subscription: ?ai.models.Model = null,
-    anthropic_console: ?ai.models.Model = null,
-
-    pub fn get(self: *const DefaultModels, account: ai.llm.Account) ?ai.models.Model {
-        return switch (account) {
-            inline else => |tag| @field(self, @tagName(tag)),
-        };
-    }
-};
-
-/// A configured default-model name that did not resolve, with the account the
-/// user wrote it under. Owns `name` (duped out of the parsed file).
-pub const DroppedModel = struct {
-    account: ai.llm.Account,
-    name: []const u8,
-};
-
 /// One configured path-triggered skill: the path glob and the name of the skill
 /// that a matching file requires. Owns both strings (duped out of the parsed
 /// file).
@@ -125,7 +94,6 @@ const File = struct {
     bash: Bash = .{},
     interface: Interface = .{},
     review: Review = .{},
-    default_models: DefaultModelsFile = .{},
     default_effort: ?JsonString = null,
 
     /// A JSON value that must be a string. The default parser for `[]const u8`
@@ -196,15 +164,6 @@ const File = struct {
     /// so the count bounds unattended review progress.
     const Review = struct {
         rounds_max: u64 = review_rounds_default,
-    };
-
-    /// Model names keyed by account tag. Each resolves to a compiled model.
-    const DefaultModelsFile = struct {
-        anthropic_api: ?JsonString = null,
-        anthropic_subscription: ?JsonString = null,
-        openai_api: ?JsonString = null,
-        openai_subscription: ?JsonString = null,
-        anthropic_console: ?JsonString = null,
     };
 };
 
@@ -375,26 +334,6 @@ const keys = [_]Key{
             "the default.",
     },
     .{
-        .path = "default_models.anthropic_api",
-        .description = "The model of the Anthropic API account. Use an Anthropic name." ++ new_project_only,
-    },
-    .{
-        .path = "default_models.anthropic_subscription",
-        .description = "The model of the Anthropic Subscription account. Use an Anthropic name." ++ new_project_only,
-    },
-    .{
-        .path = "default_models.openai_api",
-        .description = "The model of the OpenAI API account. Use an OpenAI name." ++ new_project_only,
-    },
-    .{
-        .path = "default_models.openai_subscription",
-        .description = "The model of the OpenAI Subscription account. Use an OpenAI name." ++ new_project_only,
-    },
-    .{
-        .path = "default_models.anthropic_console",
-        .description = "The model of the Anthropic Console account. Use an Anthropic name." ++ new_project_only,
-    },
-    .{
         .path = "default_effort",
         .description = "The reasoning effort that a session starts on. Drinky folds a level " ++
             "that the model does not support onto the nearest one it does." ++ new_project_only,
@@ -558,7 +497,6 @@ const example =
     \\  "request": { "anthropic_idle_timeout_ms": 90000 },
     \\  "bash": { "timeout_ms": 300000, "deny": ["git add"] },
     \\  "interface": { "window_pages": 12 },
-    \\  "default_models": { "anthropic_subscription": "claude-opus-5" },
     \\  "default_effort": "high"
     \\}
 ;
@@ -567,15 +505,10 @@ const example =
 /// no work at startup beyond one format call.
 const keys_section = "\n### Keys\n\n" ++ key_lines;
 
-const anthropic_names = joinNames(ai.models.names(.anthropic));
-const openai_names = joinNames(ai.models.names(.openai));
-
 /// The fallbacks that the app compiles in. A key that names none of them leaves
 /// the value to these, so the document must state them. The app owns them,
 /// because it owns the account and the effort level that a session starts on.
 pub const DocumentOptions = struct {
-    anthropic_model: []const u8,
-    openai_model: []const u8,
     effort: ai.llm.Effort,
 };
 
@@ -607,12 +540,13 @@ pub fn document(
         \\{s}
         \\### Models and effort
         \\
-        \\- An Anthropic account takes one of: {s}. Without a key, Drinky uses {s}.
-        \\- An OpenAI account takes one of: {s}. Without a key, Drinky uses {s}.
+        \\- This file names no model. Drinky learns every model from the provider, and the user
+        \\  fetches that list from the /model command. Drinky remembers the model of each
+        \\  account per project in a separate state file.
         \\- `default_effort` takes one of: {s}. Without the key, Drinky uses {s}.
-        \\- Drinky remembers the model and the effort level of each project in a separate state
-        \\  file, and that memory outranks this file. Only the /model and the /effort command
-        \\  change a project that Drinky already ran in.
+        \\- Drinky remembers the effort level of each project in that same state file, and that
+        \\  memory outranks this file. Only the /effort command changes a project that Drinky
+        \\  already ran in.
         \\
         \\### Example
         \\
@@ -623,10 +557,6 @@ pub fn document(
     , .{
         self.path,
         keys_section,
-        anthropic_names,
-        options.anthropic_model,
-        openai_names,
-        options.openai_model,
         effort_levels,
         @tagName(options.effort),
         example,
@@ -646,8 +576,6 @@ pub fn deinit(self: *Config, gpa: std.mem.Allocator) void {
     gpa.free(self.required_skills);
     for (self.bash.deny) |pattern| gpa.free(pattern);
     gpa.free(self.bash.deny);
-    for (self.dropped_models) |dropped| gpa.free(dropped.name);
-    gpa.free(self.dropped_models);
     if (self.dropped_effort) |name| gpa.free(name);
     for (self.unknown_keys) |key| gpa.free(key);
     gpa.free(self.unknown_keys);
@@ -704,7 +632,6 @@ fn loadFromData(gpa: std.mem.Allocator, io: std.Io, options: *const DataOptions)
     const request = parsed.value.request;
     const bash = parsed.value.bash;
     const interface = parsed.value.interface;
-    const names = parsed.value.default_models;
 
     // The paths borrow the parsed arena, and the loader dupes what it keeps. The
     // loader inspects at most `files_max` entries, and one entry past that cap
@@ -755,43 +682,6 @@ fn loadFromData(gpa: std.mem.Allocator, io: std.Io, options: *const DataOptions)
         try deny.append(gpa, owned);
     }
 
-    var dropped: std.ArrayList(DroppedModel) = .empty;
-    errdefer {
-        for (dropped.items) |item| gpa.free(item.name);
-        dropped.deinit(gpa);
-    }
-    const default_models: DefaultModels = .{
-        .anthropic_api = try resolveModel(
-            gpa,
-            &dropped,
-            .anthropic_api,
-            File.JsonString.get(names.anthropic_api),
-        ),
-        .anthropic_subscription = try resolveModel(
-            gpa,
-            &dropped,
-            .anthropic_subscription,
-            File.JsonString.get(names.anthropic_subscription),
-        ),
-        .openai_api = try resolveModel(
-            gpa,
-            &dropped,
-            .openai_api,
-            File.JsonString.get(names.openai_api),
-        ),
-        .openai_subscription = try resolveModel(
-            gpa,
-            &dropped,
-            .openai_subscription,
-            File.JsonString.get(names.openai_subscription),
-        ),
-        .anthropic_console = try resolveModel(
-            gpa,
-            &dropped,
-            .anthropic_console,
-            File.JsonString.get(names.anthropic_console),
-        ),
-    };
     var dropped_effort: ?[]const u8 = null;
     errdefer if (dropped_effort) |name| gpa.free(name);
     const default_effort = try resolveEffort(
@@ -824,11 +714,6 @@ fn loadFromData(gpa: std.mem.Allocator, io: std.Io, options: *const DataOptions)
     errdefer {
         for (unknown_keys) |key| gpa.free(key);
         gpa.free(unknown_keys);
-    }
-    const dropped_models = try dropped.toOwnedSlice(gpa);
-    errdefer {
-        for (dropped_models) |item| gpa.free(item.name);
-        gpa.free(dropped_models);
     }
     const required_skills = try required.toOwnedSlice(gpa);
     errdefer {
@@ -865,11 +750,9 @@ fn loadFromData(gpa: std.mem.Allocator, io: std.Io, options: *const DataOptions)
         .window_pages = window_pages,
         .gauge = gauge,
         .review_rounds_max = review_rounds_max,
-        .default_models = default_models,
         .default_effort = default_effort,
         .user_instructions = user_instructions,
         .required_skills = required_skills,
-        .dropped_models = dropped_models,
         .dropped_effort = dropped_effort,
         .dropped_bash_timeout_ms = dropped_bash_timeout_ms,
         .dropped_window_pages = dropped_window_pages,
@@ -1043,29 +926,9 @@ fn isShare(percent: f64) bool {
     return percent >= ui.status.Gauge.percent_min and percent <= ui.status.Gauge.percent_max;
 }
 
-/// Resolve a configured model name for `account` against the compiled table for
-/// that account's vendor. A name that is unknown or belongs to another vendor
-/// resolves to null. The function also records it in `dropped` so the app can
-/// surface it. An unset name is just null.
-fn resolveModel(
-    gpa: std.mem.Allocator,
-    dropped: *std.ArrayList(DroppedModel),
-    account: ai.llm.Account,
-    name: ?[]const u8,
-) !?ai.models.Model {
-    const model_name = name orelse return null;
-    if (ai.models.get(account.provider(), model_name)) |model| return model;
-    const owned = try gpa.dupe(u8, model_name);
-    errdefer gpa.free(owned);
-    try dropped.append(gpa, .{ .account = account, .name = owned });
-    return null;
-}
-
 /// The compiled fallbacks that the app passes in. The values only have to be
 /// legal, because the document quotes them and never resolves them.
 const document_options_for_test: DocumentOptions = .{
-    .anthropic_model = "claude-opus-5",
-    .openai_model = "gpt-5.6-sol",
     .effort = .xhigh,
 };
 
@@ -1420,30 +1283,16 @@ test "load reads the required skills in file order" {
     try std.testing.expectEqual(@as(usize, 0), empty.required_skills.len);
 }
 
-test "load resolves default_models to compiled models, dropping unknown names" {
+// The five `default_models` keys went away with the compiled model table. A file
+// that still holds them reads them as unknown keys, so the next start reports
+// them and keeps running.
+test "a stale default_models key reads as an unknown key" {
     var config = try loadDataForTest(
-        \\{ "default_models": { "anthropic_subscription": "claude-sonnet-5",
-        \\  "anthropic_api": "gpt-5.6-sol", "openai_api": "nope" } }
+        \\{ "default_models": { "anthropic_subscription": "claude-sonnet-5" } }
     );
     defer config.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings(
-        "claude-sonnet-5",
-        config.default_models.get(.anthropic_subscription).?.name,
-    );
-    // A wrong-vendor name (an openai model under an anthropic account) does not
-    // resolve, so it falls back to null.
-    try std.testing.expect(config.default_models.get(.anthropic_api) == null);
-    // An unknown name and an unset account both resolve to null.
-    try std.testing.expect(config.default_models.get(.openai_api) == null);
-    try std.testing.expect(config.default_models.get(.openai_subscription) == null);
-
-    // The parse records the two present-but-unresolved names for the app to
-    // surface. It does not record the valid one or the unset ones.
-    try std.testing.expectEqual(@as(usize, 2), config.dropped_models.len);
-    try std.testing.expectEqual(ai.llm.Account.anthropic_api, config.dropped_models[0].account);
-    try std.testing.expectEqualStrings("gpt-5.6-sol", config.dropped_models[0].name);
-    try std.testing.expectEqual(ai.llm.Account.openai_api, config.dropped_models[1].account);
-    try std.testing.expectEqualStrings("nope", config.dropped_models[1].name);
+    try std.testing.expectEqual(@as(usize, 1), config.unknown_keys.len);
+    try std.testing.expectEqualStrings("default_models", config.unknown_keys[0]);
 }
 
 test "load resolves default_effort, dropping an unknown level" {
@@ -1482,17 +1331,11 @@ test "a configured name must be a JSON string" {
         ),
     );
     // The default parser for `[]const u8` reads an array of numbers as bytes.
-    // Both the paths and the model names reject it.
+    // A path rejects it.
     try std.testing.expectError(
         error.UnexpectedToken,
         loadDataForTest(
             \\{ "user_instructions": [{ "path": [105, 110, 115, 116, 114] }] }
-        ),
-    );
-    try std.testing.expectError(
-        error.UnexpectedToken,
-        loadDataForTest(
-            \\{ "default_models": { "openai_api": [103, 112, 116] } }
         ),
     );
     try std.testing.expectError(
@@ -1593,11 +1436,10 @@ test "the config document names the file and its own example loads clean" {
     defer gpa.free(text);
     try std.testing.expect(std.mem.indexOf(u8, text, "/unused/config.json") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "`bash.timeout_ms`") != null);
-    // The compiled model table and effort enum feed the document, so a new model
-    // or level cannot go missing from it.
-    try std.testing.expect(std.mem.indexOf(u8, text, "claude-sonnet-4-6") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "gpt-5.6-luna") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "none, low, medium, high") != null);
+    // The effort enum feeds the document, so a new level cannot go missing from
+    // it. The document names no model, because Drinky compiles none in.
+    try std.testing.expect(std.mem.indexOf(u8, text, "none, minimal, low") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "This file names no model") != null);
     try std.testing.expect(std.mem.indexOf(
         u8,
         text,
@@ -1610,12 +1452,8 @@ test "the config document names the file and its own example loads clean" {
         "default: unset.") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "default: none") == null);
 
-    // The app's compiled fallbacks reach the document, so a key left out never
+    // The app's compiled fallback reaches the document, so a key left out never
     // looks like it has no value at all.
-    try std.testing.expect(std.mem.indexOf(u8, text, "Without a key, Drinky uses " ++
-        "claude-opus-5.") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "Without a key, Drinky uses " ++
-        "gpt-5.6-sol.") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "Without the key, Drinky uses " ++
         "xhigh.") != null);
 
@@ -1627,7 +1465,7 @@ test "the config document names the file and its own example loads clean" {
     // every key it governs. A reader that misses it promises an inert change.
     try std.testing.expect(std.mem.indexOf(u8, text, "outranks this file") != null);
     try std.testing.expectEqual(
-        @as(usize, 6),
+        @as(usize, 1),
         std.mem.count(u8, text, new_project_only),
     );
 
@@ -1653,7 +1491,6 @@ test "the config document names the file and its own example loads clean" {
     var from_example = try loadDataForTest(example);
     defer from_example.deinit(gpa);
     try std.testing.expectEqual(@as(usize, 0), from_example.unknown_keys.len);
-    try std.testing.expectEqual(@as(usize, 0), from_example.dropped_models.len);
     try std.testing.expect(from_example.dropped_effort == null);
     try std.testing.expectEqual(ai.llm.Effort.high, from_example.default_effort.?);
     try std.testing.expectEqual(@as(u64, 90_000), from_example.timeouts.anthropic.idle_ms);
@@ -1667,10 +1504,6 @@ test "the config document names the file and its own example loads clean" {
     try std.testing.expectEqual(@as(usize, 1), from_example.bash.deny.len);
     try std.testing.expectEqualStrings("git add", from_example.bash.deny[0]);
     try std.testing.expect(!from_example.dropped_deny_empty);
-    try std.testing.expectEqualStrings(
-        "claude-opus-5",
-        from_example.default_models.get(.anthropic_subscription).?.name,
-    );
 }
 
 test "load resolves user instruction paths against the config directory in order" {
@@ -1764,7 +1597,6 @@ test "an absent config file loads the built-in defaults" {
     );
     try std.testing.expectEqual(@as(usize, 0), config.user_instructions.files().len);
     try std.testing.expectEqual(@as(usize, 0), config.user_instructions.notices().len);
-    try std.testing.expectEqual(@as(usize, 0), config.dropped_models.len);
 }
 
 fn checkLoadAllocationFailure(gpa: std.mem.Allocator, io: std.Io, home: []const u8) !void {
@@ -1772,11 +1604,10 @@ fn checkLoadAllocationFailure(gpa: std.mem.Allocator, io: std.Io, home: []const 
     defer config.deinit(gpa);
     try std.testing.expectEqual(@as(usize, 1), config.user_instructions.files().len);
     try std.testing.expectEqual(@as(usize, 1), config.user_instructions.notices().len);
-    try std.testing.expectEqual(@as(usize, 1), config.dropped_models.len);
     try std.testing.expect(config.dropped_effort != null);
     try std.testing.expectEqual(@as(usize, 1), config.bash.deny.len);
     try std.testing.expect(config.dropped_deny_empty);
-    try std.testing.expectEqual(@as(usize, 1), config.unknown_keys.len);
+    try std.testing.expectEqual(@as(usize, 2), config.unknown_keys.len);
     const text = try config.document(gpa, &document_options_for_test);
     defer gpa.free(text);
 }

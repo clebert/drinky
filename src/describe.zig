@@ -191,8 +191,6 @@ test "the document states every command, key, and discovery rule" {
     const text = try compose(gpa, &.{
         .config = &config,
         .defaults = .{
-            .anthropic_model = "claude-opus-5",
-            .openai_model = "gpt-5.6-sol",
             .effort = .xhigh,
         },
         .key_hints = &.{ "Enter: Send", "Ctrl+D: Quit" },

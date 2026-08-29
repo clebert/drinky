@@ -15,8 +15,9 @@
 const std = @import("std");
 
 const Accounts = @import("../Accounts.zig");
+const format = @import("../format.zig");
 const llm = @import("../llm.zig");
-const models = @import("../models.zig");
+const Model = @import("../Model.zig");
 const Context = @import("Context.zig");
 const testing = @import("testing.zig");
 
@@ -25,6 +26,16 @@ pub const summary = "switch account and model together";
 
 /// Every step belongs to one `/model` run, so all three report one cancellation.
 const cancellation_message = "You canceled the model selection.";
+
+/// The first row of the model step. It reads as a fetch while the account
+/// offers nothing, because no list exists to refresh yet.
+const fetch_row = "Fetch the model list";
+const refresh_row = "Refresh the model list";
+
+/// The mark of a model whose output limit no source states. Drinky then sends a
+/// low default, which can cut a long reply short, so the row states that Drinky
+/// does not know the output support of the model.
+const output_limit_mark = " · Output limit unknown";
 
 /// A picker selector. It takes the row index alone, so a step that depends on an
 /// earlier choice needs one selector for each value of that choice.
@@ -141,20 +152,23 @@ fn selectAccountOf(comptime vendor: llm.Provider) Selector {
     }.select;
 }
 
-/// The last step: a picker over the models of `account`. The title names the
-/// account, because the flow can skip the step that names it.
+/// The last step: the fetch row, then a picker over the models of `account`.
+/// The title names the account, because the flow can skip the step that names
+/// it. Drinky compiles no model in, so an account that the user has not fetched
+/// yet holds the fetch row alone.
 fn modelStep(context: *Context, account: llm.Account) !Context.Outcome {
     const gpa = context.gpa;
-    var list: std.ArrayList(models.Model) = .empty;
+    var list: std.ArrayList(Model) = .empty;
     defer list.deinit(gpa);
     try context.accounts.listModels(account, &list, gpa);
 
     var options: Context.Outcome.Options = .{ .gpa = gpa };
     errdefer options.deinit();
     var current: ?usize = null;
-    for (list.items, 0..) |model, index| {
-        try options.print("{s}", .{model.name});
-        if (isActive(context, account, model.name)) current = index;
+    try options.print("{s}", .{firstRow(list.items.len)});
+    for (list.items, 0..) |*model, index| {
+        try row(&options, account, model);
+        if (isActive(context, account, model.name())) current = index + 1;
     }
     const step: ModelStep = switch (account) {
         inline else => |tag| modelStepOf(tag),
@@ -169,22 +183,45 @@ fn modelStep(context: *Context, account: llm.Account) !Context.Outcome {
     } };
 }
 
+/// The label of the row that leads a model step over `count` models. It reads
+/// as a fetch while the account offers no model, because no list exists to
+/// refresh yet. The model step of `/review` leads its list with it too, so both
+/// pickers label one row alike.
+pub fn firstRow(count: usize) []const u8 {
+    return if (count == 0) fetch_row else refresh_row;
+}
+
+/// Write the picker row of `model` under `account`. A model whose output limit
+/// no source states carries the mark, because a request for it then sends the
+/// low default of `Model.tokens_max_fallback`. The model step of `/review`
+/// builds its rows here too, so both pickers state one fact alike.
+pub fn row(
+    options: *Context.Outcome.Options,
+    account: llm.Account,
+    model: *const Model,
+) !void {
+    if (model.outputLimitUnknown(account))
+        return options.print("{s}" ++ output_limit_mark, .{model.name()});
+    return options.print("{s}", .{model.name()});
+}
+
 /// The selector, the opener, and the title of the model picker of `account`.
 fn modelStepOf(comptime account: llm.Account) ModelStep {
     return .{
         .select = struct {
             fn select(context: *Context, index: usize) anyerror!Context.Outcome {
                 const gpa = context.gpa;
-                var list: std.ArrayList(models.Model) = .empty;
+                if (index == 0) return fetchStep(context, account);
+                var list: std.ArrayList(Model) = .empty;
                 defer list.deinit(gpa);
                 try context.accounts.listModels(account, &list, gpa);
-                if (index >= list.items.len) return Context.Outcome.reportNotice(
+                if (index - 1 >= list.items.len) return Context.Outcome.reportNotice(
                     gpa,
                     .failure,
                     "Select a valid model.",
                     .{},
                 );
-                return apply(context, account, &list.items[index]);
+                return apply(context, account, &list.items[index - 1]);
             }
         }.select,
         .open = struct {
@@ -197,21 +234,24 @@ fn modelStepOf(comptime account: llm.Account) ModelStep {
 }
 
 /// Run `model` under `account` from the next turn on. The account of a picked
-/// row is authenticated, so it always has a client.
-fn apply(context: *Context, account: llm.Account, model: *const models.Model) !Context.Outcome {
+/// row is authenticated, so it always has a client. A pick that repeats the
+/// active pair switches too, because a fetch can have replaced the description
+/// behind that name. Only the pair that already runs in every part reports
+/// itself and switches nothing.
+fn apply(context: *Context, account: llm.Account, model: *const Model) !Context.Outcome {
     const gpa = context.gpa;
-    if (isActive(context, account, model.name)) return Context.Outcome.reportNotice(
+    if (isCurrent(context, account, model)) return Context.Outcome.reportNotice(
         gpa,
         .information,
         "Drinky already uses {s} with {s}.",
-        .{ model.name, account.label() },
+        .{ model.name(), account.label() },
     );
     context.agent.switchTo(context.accounts.client(account).?, model.*);
     return Context.Outcome.reportEvent(
         gpa,
         .information,
         "Drinky now uses {s} with {s}.",
-        .{ model.name, account.label() },
+        .{ model.name(), account.label() },
     );
 }
 
@@ -251,10 +291,183 @@ fn activeAccount(context: *const Context) ?llm.Account {
     return client.account();
 }
 
-/// Whether `account` and `model_name` are the pair that runs now.
+/// Whether `account` and `model_name` are the pair that runs now. A row marks
+/// the active model by its name, because that name is what the row shows.
 fn isActive(context: *const Context, account: llm.Account, model_name: []const u8) bool {
     const active_account = activeAccount(context) orelse return false;
-    return active_account == account and std.mem.eql(u8, context.agent.model.name, model_name);
+    const model = context.agent.model orelse return false;
+    return active_account == account and model.sameName(model_name);
+}
+
+/// Whether the session already runs `model` under `account`, description and
+/// all. A fetch replaces the description of a model and keeps its name, so a
+/// comparison of names alone leaves the session on the description that the
+/// fetch replaced.
+fn isCurrent(context: *const Context, account: llm.Account, model: *const Model) bool {
+    const active_account = activeAccount(context) orelse return false;
+    const active = context.agent.model orelse return false;
+    return active_account == account and active.eql(model);
+}
+
+/// Fetch the list of `account` and reopen its step over the result. Drinky asks
+/// the provider and the public metadata in one step, so the user chooses a model
+/// out of a list that is current. A fetch has three exits. A failed account list
+/// reports itself and opens nothing, so the user reads what went wrong before
+/// another try. That report names a cache write that failed with it. A failed
+/// metadata request opens the list and states itself beside it. A failed cache
+/// write does the same, because that list arrived.
+///
+/// The two requests block the thread that paints and reads the keys, so the
+/// interface stops until they end. The wait line states that stop first.
+fn fetchStep(context: *Context, account: llm.Account) !Context.Outcome {
+    try context.stateFetchWait(account);
+    const result = context.accounts.refresh(account);
+    return fetchOutcome(context, account, &result);
+}
+
+/// The outcome of one fetch of `account` over `result`. It holds no request, so
+/// a test reaches every exit without a socket.
+fn fetchOutcome(
+    context: *Context,
+    account: llm.Account,
+    result: *const Accounts.Refresh,
+) !Context.Outcome {
+    if (result.models_error) |err|
+        return fetchFailure(context.gpa, account, err, result.metadata_save_error);
+    var outcome = try modelStep(context, account);
+    errdefer freePick(context.gpa, &outcome.pick);
+    outcome.pick.report = try fetchReport(context.gpa, account, result);
+    return outcome;
+}
+
+/// The outcome of a fetch of `account` whose account list never arrived. The
+/// metadata request runs even then, so `metadata_save_failure` names the cache
+/// write that failed with it, and one line states both. The metadata that
+/// arrived serves this session alone. The role model step of `/review` reads the
+/// same outcome, so both commands treat one failure alike.
+///
+/// A store that held the credential of another principal stopped the request
+/// before it ran. The evidence of that principal must leave the session, and
+/// only the app can drop it. The account therefore goes to the app in place of
+/// a line that states an error name and no step.
+pub fn fetchFailure(
+    gpa: std.mem.Allocator,
+    account: llm.Account,
+    models_failure: anyerror,
+    metadata_save_failure: ?anyerror,
+) !Context.Outcome {
+    if (models_failure == error.CredentialReplaced)
+        return .{ .credential_replaced = account };
+    const cache_failure = metadata_save_failure orelse return Context.Outcome.reportEvent(
+        gpa,
+        .failure,
+        "Drinky could not fetch the model list of {s} because of error {t}.",
+        .{ account.label(), models_failure },
+    );
+    return Context.Outcome.reportEvent(
+        gpa,
+        .failure,
+        "Drinky could not fetch the model list of {s} because of error {t}. Drinky could not " ++
+            "save the public metadata because of error {t}. The metadata serves this session.",
+        .{ account.label(), models_failure, cache_failure },
+    );
+}
+
+/// The head of every line that reports a fetch whose public metadata never
+/// arrived. Three of those lines share it, so they state that miss alike. The
+/// list and the metadata take one sentence each, because they arrived apart.
+const metadata_gone_head = "Drinky fetched the model list of {s}. Drinky could not fetch the " ++
+    "public metadata because of error {t}.";
+
+/// The sentence that states an empty list, or nothing while the account offers a
+/// model. A fetch that described no model returns the user to the same fetch
+/// row, so every report of such a fetch ends on this one fact.
+fn emptyNote(count: usize) []const u8 {
+    return if (count == 0) " The account offers no model now." else "";
+}
+
+/// The line that states what a fetch of `account` missed, or null when the
+/// metadata and both caches took what arrived and the list holds a model. A
+/// fetch writes one cache per kind, so the line names the cache that failed. The
+/// list stands beside the line, because neither failure costs this session a
+/// model.
+///
+/// A fetch that arrived and described no model returns the user to the same
+/// fetch row, so every line states that result too. The role model step of
+/// `/review` reads the same line, so both commands state one miss alike.
+pub fn fetchReport(
+    gpa: std.mem.Allocator,
+    account: llm.Account,
+    result: *const Accounts.Refresh,
+) !?Context.Outcome.Message {
+    const empty = emptyNote(result.count);
+    // No metadata arrived, so its cache write never ran. The list write is the
+    // one write that can have failed here.
+    if (result.metadata_error) |metadata_failure| {
+        if (result.models_save_error) |save_failure| return try Context.Outcome.Message.print(
+            gpa,
+            .failure,
+            metadata_gone_head ++ " Drinky could not save the model list because of error " ++
+                "{t}. The list serves this session.{s}",
+            .{ account.label(), metadata_failure, save_failure, empty },
+        );
+        if (result.count == 0) return try Context.Outcome.Message.print(
+            gpa,
+            .failure,
+            metadata_gone_head ++ "{s}",
+            .{ account.label(), metadata_failure, empty },
+        );
+        return try Context.Outcome.Message.print(
+            gpa,
+            .failure,
+            metadata_gone_head ++ " The account offers {d} model{s} now.",
+            .{
+                account.label(),
+                metadata_failure,
+                result.count,
+                format.pluralSuffix(result.count),
+            },
+        );
+    }
+    if (result.models_save_error) |list_failure| {
+        if (result.metadata_save_error) |metadata_failure| return try Context.Outcome.Message.print(
+            gpa,
+            .failure,
+            "Drinky fetched the model list of {s}. Drinky could not save the model list " ++
+                "because of error {t}. Drinky could not save the public metadata because of " ++
+                "error {t}. Both serve this session.{s}",
+            .{ account.label(), list_failure, metadata_failure, empty },
+        );
+        return try Context.Outcome.Message.print(
+            gpa,
+            .failure,
+            "Drinky fetched the model list of {s}. Drinky could not save the model list " ++
+                "because of error {t}. The list serves this session.{s}",
+            .{ account.label(), list_failure, empty },
+        );
+    }
+    const metadata_failure = result.metadata_save_error orelse {
+        if (result.count > 0) return null;
+        return try Context.Outcome.Message.print(
+            gpa,
+            .warning,
+            "Drinky fetched the model list of {s}. The account offers no model now.",
+            .{account.label()},
+        );
+    };
+    return try Context.Outcome.Message.print(
+        gpa,
+        .failure,
+        "Drinky fetched the model list of {s}. Drinky could not save the public metadata " ++
+            "because of error {t}. The metadata serves this session.{s}",
+        .{ account.label(), metadata_failure, empty },
+    );
+}
+
+/// Free the rows of a picker that reaches no caller.
+fn freePick(gpa: std.mem.Allocator, pick: *const Context.Outcome.Pick) void {
+    for (pick.options) |option| gpa.free(option);
+    gpa.free(pick.options);
 }
 
 /// Test helper: the picker of `outcome`, which the caller must free.
@@ -265,15 +478,142 @@ fn expectPick(outcome: Context.Outcome) !Context.Outcome.Pick {
     };
 }
 
-/// Test helper: free the rows of a picker.
-fn freePick(gpa: std.mem.Allocator, pick: *const Context.Outcome.Pick) void {
-    for (pick.options) |option| gpa.free(option);
-    gpa.free(pick.options);
+// A cache write that failed costs this session no model, and a metadata request
+// that failed costs it none either, so each states itself beside the list that
+// arrived. A failed account list alone opens nothing.
+test "a fetch opens the list that arrived and states what it missed" {
+    const gpa = std.testing.allocator;
+    var accounts = testing.accounts(.{ .anthropic = "sk-ant" }, .{});
+    defer testing.deinitAccounts(&accounts);
+    try testing.seed(&accounts, .anthropic_api, &.{ "claude-fable-5", "claude-sonnet-4-6" });
+    var agent = testing.agent(gpa, .{ .anthropic_api = "sk-ant" });
+    defer agent.deinit();
+    var context: Context = .{ .gpa = gpa, .io = undefined, .agent = &agent, .accounts = &accounts };
+
+    // The account list never arrived, so no list can open.
+    try Context.Outcome.expectEvent(
+        try fetchOutcome(&context, .anthropic_api, &.{ .models_error = error.ConnectionRefused }),
+        .failure,
+    );
+
+    // Every part arrived, so the list opens and states nothing beside itself.
+    const complete = try expectPick(try fetchOutcome(&context, .anthropic_api, &.{ .count = 2 }));
+    defer freePick(gpa, &complete);
+    try std.testing.expect(complete.report == null);
+
+    // The metadata never arrived, so the list opens beside that failure.
+    const metadata_gone = try expectPick(try fetchOutcome(&context, .anthropic_api, &.{
+        .count = 2,
+        .metadata_error = error.ConnectionTimedOut,
+    }));
+    defer freePick(gpa, &metadata_gone);
+    defer gpa.free(metadata_gone.report.?.content);
+    try std.testing.expectEqual(@as(usize, 3), metadata_gone.options.len);
+    try std.testing.expectEqualStrings("claude-fable-5", metadata_gone.options[1]);
+    try std.testing.expectEqual(
+        Context.Outcome.Severity.failure,
+        metadata_gone.report.?.severity,
+    );
+    try std.testing.expectEqualStrings(
+        "Drinky fetched the model list of Anthropic API. Drinky could not fetch the public " ++
+            "metadata because of error ConnectionTimedOut. The account offers 2 models now.",
+        metadata_gone.report.?.content,
+    );
+
+    // The list write failed, so the list opens beside that failure.
+    const save_gone = try expectPick(try fetchOutcome(&context, .anthropic_api, &.{
+        .count = 2,
+        .models_save_error = error.StoreBusy,
+    }));
+    defer freePick(gpa, &save_gone);
+    defer gpa.free(save_gone.report.?.content);
+    try std.testing.expectEqualStrings(
+        "Drinky fetched the model list of Anthropic API. Drinky could not save the model list " ++
+            "because of error StoreBusy. The list serves this session.",
+        save_gone.report.?.content,
+    );
+
+    // Both failed, so one line states both beside the list.
+    const both_gone = try expectPick(try fetchOutcome(&context, .anthropic_api, &.{
+        .count = 2,
+        .metadata_error = error.ConnectionTimedOut,
+        .models_save_error = error.StoreBusy,
+    }));
+    defer freePick(gpa, &both_gone);
+    defer gpa.free(both_gone.report.?.content);
+    try std.testing.expectEqualStrings(
+        "Drinky fetched the model list of Anthropic API. Drinky could not fetch the public " ++
+            "metadata because of error ConnectionTimedOut. Drinky could not save the model " ++
+            "list because of error StoreBusy. The list serves this session.",
+        both_gone.report.?.content,
+    );
+}
+
+// The metadata request runs even when the account list fails, so a cache write
+// can fail on that path too. The metadata that arrived serves this session
+// alone, so the line that names the failed fetch names that write as well.
+test "a failed fetch states the cache write that failed with it" {
+    const gpa = std.testing.allocator;
+    var accounts = testing.accounts(.{ .anthropic = "sk-ant" }, .{});
+    defer testing.deinitAccounts(&accounts);
+    var agent = testing.agent(gpa, .{ .anthropic_api = "sk-ant" });
+    defer agent.deinit();
+    var context: Context = .{ .gpa = gpa, .io = undefined, .agent = &agent, .accounts = &accounts };
+
+    switch (try fetchOutcome(&context, .anthropic_api, &.{
+        .models_error = error.ConnectionRefused,
+        .metadata_save_error = error.StoreBusy,
+    })) {
+        .event => |event| {
+            defer gpa.free(event.content);
+            try std.testing.expectEqual(Context.Outcome.Severity.failure, event.severity);
+            try std.testing.expectEqualStrings(
+                "Drinky could not fetch the model list of Anthropic API because of error " ++
+                    "ConnectionRefused. Drinky could not save the public metadata because of " ++
+                    "error StoreBusy. The metadata serves this session.",
+                event.content,
+            );
+        },
+        else => return error.ExpectedEvent,
+    }
+}
+
+// A store that holds the credential of another principal stops the fetch before
+// its model request. The evidence of that principal must leave the session, and
+// only the app can drop it. The outcome therefore names the account and no
+// error.
+test "a fetch that meets a replaced credential hands its account to the app" {
+    const gpa = std.testing.allocator;
+    var accounts = testing.accounts(.{}, .{ .anthropic = true });
+    defer testing.deinitAccounts(&accounts);
+    var agent = testing.agent(gpa, .{ .anthropic_subscription = undefined });
+    defer agent.deinit();
+    var context: Context = .{ .gpa = gpa, .io = undefined, .agent = &agent, .accounts = &accounts };
+
+    const outcome = try fetchOutcome(&context, .anthropic_subscription, &.{
+        .models_error = error.CredentialReplaced,
+    });
+    try std.testing.expectEqual(
+        llm.Account.anthropic_subscription,
+        outcome.credential_replaced,
+    );
+
+    // The metadata request runs even then. A failed cache write of that metadata
+    // changes no principal, so the transition stands alone.
+    const with_save_failure = try fetchOutcome(&context, .anthropic_subscription, &.{
+        .models_error = error.CredentialReplaced,
+        .metadata_save_error = error.StoreBusy,
+    });
+    try std.testing.expectEqual(
+        llm.Account.anthropic_subscription,
+        with_save_failure.credential_replaced,
+    );
 }
 
 test "the first step lists the providers with an authenticated account" {
     const gpa = std.testing.allocator;
     var accounts = testing.accounts(.{ .anthropic = "sk-ant", .openai = "sk-openai" }, .{});
+    defer testing.deinitAccounts(&accounts);
     var agent = testing.agent(gpa, .{ .anthropic_api = "sk-ant" });
     defer agent.deinit();
     var context: Context = .{ .gpa = gpa, .io = undefined, .agent = &agent, .accounts = &accounts };
@@ -291,6 +631,7 @@ test "the first step lists the providers with an authenticated account" {
 test "one provider alone opens the account step at once" {
     const gpa = std.testing.allocator;
     var accounts = testing.accounts(.{ .anthropic = "sk-ant" }, .{ .anthropic = true });
+    defer testing.deinitAccounts(&accounts);
     var agent = testing.agent(gpa, .{ .anthropic_api = "sk-ant" });
     defer agent.deinit();
     var context: Context = .{ .gpa = gpa, .io = undefined, .agent = &agent, .accounts = &accounts };
@@ -307,6 +648,8 @@ test "one provider alone opens the account step at once" {
 test "one account alone opens the model step at once" {
     const gpa = std.testing.allocator;
     var accounts = testing.accounts(.{ .anthropic = "sk-ant" }, .{});
+    defer testing.deinitAccounts(&accounts);
+    try testing.seed(&accounts, .anthropic_api, &.{ "claude-fable-5", "claude-sonnet-4-6" });
     var agent = testing.agent(gpa, .{ .anthropic_api = "sk-ant" });
     defer agent.deinit();
     var context: Context = .{ .gpa = gpa, .io = undefined, .agent = &agent, .accounts = &accounts };
@@ -315,9 +658,60 @@ test "one account alone opens the model step at once" {
     const pick = try expectPick(try run(&context));
     defer freePick(gpa, &pick);
     try std.testing.expectEqualStrings("Model: Anthropic API", pick.title);
-    try std.testing.expectEqual(@as(usize, 5), pick.options.len);
-    try std.testing.expectEqualStrings("claude-fable-5", pick.options[0]);
+    // The fetch row leads the list, so the user can replace a stale one.
+    try std.testing.expectEqual(@as(usize, 3), pick.options.len);
+    try std.testing.expectEqualStrings("Refresh the model list", pick.options[0]);
+    try std.testing.expectEqualStrings("claude-fable-5", pick.options[1]);
     try std.testing.expectEqualStrings("claude-sonnet-4-6", pick.options[pick.current.?]);
+}
+
+// Anthropic takes the output limit from every request, so a model that states
+// none runs at the fallback and can lose the tail of a long reply. The row
+// states that, because Drinky does not know the output support of that model.
+// OpenAI takes no limit from the request, so no row of such an account carries
+// the mark, whatever its list states.
+test "a model row marks an output limit that no source states" {
+    const gpa = std.testing.allocator;
+    var accounts = testing.accounts(.{ .anthropic = "sk-ant", .openai = "sk-openai" }, .{});
+    defer testing.deinitAccounts(&accounts);
+    try testing.seed(&accounts, .anthropic_api, &.{ "claude-fable-5", "claude-sonnet-4-6" });
+    try testing.seed(&accounts, .openai_api, &.{"gpt-5.6-sol"});
+    // No source states an output limit for these two models.
+    accounts.catalog.accounts.get(.anthropic_api)[1].tokens_max = null;
+    accounts.catalog.accounts.get(.openai_api)[0].tokens_max = null;
+    var agent = testing.agent(gpa, .{ .anthropic_api = "sk-ant" });
+    defer agent.deinit();
+    var context: Context = .{ .gpa = gpa, .io = undefined, .agent = &agent, .accounts = &accounts };
+
+    const anthropic_models = try expectPick(try modelStep(&context, .anthropic_api));
+    defer freePick(gpa, &anthropic_models);
+    // The vendor stated the limit of this model, so its row stands as it is.
+    try std.testing.expectEqualStrings("claude-fable-5", anthropic_models.options[1]);
+    try std.testing.expectEqualStrings(
+        "claude-sonnet-4-6 · Output limit unknown",
+        anthropic_models.options[2],
+    );
+
+    const openai_models = try expectPick(try modelStep(&context, .openai_api));
+    defer freePick(gpa, &openai_models);
+    try std.testing.expectEqualStrings("gpt-5.6-sol", openai_models.options[1]);
+}
+
+// Drinky compiles no model in, so an account the user never fetched offers the
+// fetch row and nothing else.
+test "an account with no model offers the fetch row alone" {
+    const gpa = std.testing.allocator;
+    var accounts = testing.accounts(.{ .anthropic = "sk-ant" }, .{});
+    defer testing.deinitAccounts(&accounts);
+    var agent = testing.agent(gpa, .{ .anthropic_api = "sk-ant" });
+    defer agent.deinit();
+    var context: Context = .{ .gpa = gpa, .io = undefined, .agent = &agent, .accounts = &accounts };
+
+    const pick = try expectPick(try run(&context));
+    defer freePick(gpa, &pick);
+    try std.testing.expectEqual(@as(usize, 1), pick.options.len);
+    try std.testing.expectEqualStrings("Fetch the model list", pick.options[0]);
+    try std.testing.expect(pick.current == null);
 }
 
 test "a provider row opens its accounts, and an account row opens its models" {
@@ -326,6 +720,8 @@ test "a provider row opens its accounts, and an account row opens its models" {
         .{ .anthropic = "sk-ant", .openai = "sk-openai" },
         .{ .anthropic = true },
     );
+    defer testing.deinitAccounts(&accounts);
+    try testing.seed(&accounts, .openai_api, &.{ "gpt-5.6-sol", "gpt-5.6-luna" });
     var agent = testing.agent(gpa, .{ .anthropic_api = "sk-ant" });
     defer agent.deinit();
     var context: Context = .{ .gpa = gpa, .io = undefined, .agent = &agent, .accounts = &accounts };
@@ -350,7 +746,7 @@ test "a provider row opens its accounts, and an account row opens its models" {
     defer freePick(gpa, &openai_models);
     try std.testing.expectEqualStrings("Model: OpenAI API", openai_models.title);
     try std.testing.expectEqual(@as(usize, 3), openai_models.options.len);
-    try std.testing.expectEqualStrings("gpt-5.6-sol", openai_models.options[0]);
+    try std.testing.expectEqualStrings("gpt-5.6-sol", openai_models.options[1]);
 }
 
 // Esc returns to the picker that a row opened, so every step names the opener
@@ -361,6 +757,7 @@ test "each step names the opener that builds it again" {
         .{ .anthropic = "sk-ant", .openai = "sk-openai" },
         .{ .anthropic = true },
     );
+    defer testing.deinitAccounts(&accounts);
     var agent = testing.agent(gpa, .{ .anthropic_api = "sk-ant" });
     defer agent.deinit();
     var context: Context = .{ .gpa = gpa, .io = undefined, .agent = &agent, .accounts = &accounts };
@@ -397,6 +794,8 @@ test "each step names the opener that builds it again" {
 test "a model row switches to the chosen account and model" {
     const gpa = std.testing.allocator;
     var accounts = testing.accounts(.{ .anthropic = "sk-ant", .openai = "sk-openai" }, .{});
+    defer testing.deinitAccounts(&accounts);
+    try testing.seed(&accounts, .openai_api, &.{"gpt-5.6-sol"});
     var agent = testing.agent(gpa, .{ .anthropic_api = "sk-ant" });
     defer agent.deinit();
     var context: Context = .{ .gpa = gpa, .io = undefined, .agent = &agent, .accounts = &accounts };
@@ -407,12 +806,187 @@ test "a model row switches to the chosen account and model" {
     defer freePick(gpa, &openai_models);
 
     // The selection crosses vendors, so it switches the account too.
-    try Context.Outcome.expectEvent(try openai_models.select(&context, 0), .information);
-    try std.testing.expectEqualStrings("gpt-5.6-sol", agent.model.name);
+    try Context.Outcome.expectEvent(try openai_models.select(&context, 1), .information);
+    try std.testing.expectEqualStrings("gpt-5.6-sol", agent.model.?.name());
     try std.testing.expectEqual(llm.Account.openai_api, agent.client.?.account());
 
-    try Context.Outcome.expectNotice(try openai_models.select(&context, 0), .information);
-    try std.testing.expectEqualStrings("gpt-5.6-sol", agent.model.name);
+    try Context.Outcome.expectNotice(try openai_models.select(&context, 1), .information);
+    try std.testing.expectEqualStrings("gpt-5.6-sol", agent.model.?.name());
+}
+
+// A fetch replaces the description of a model and keeps its name. The row of
+// the model that already runs is the common pick after a fetch, so that pick
+// must carry the fetched description into the session.
+test "a pick of the active model adopts the fetched description" {
+    const gpa = std.testing.allocator;
+    var accounts = testing.accounts(.{ .anthropic = "sk-ant" }, .{});
+    defer testing.deinitAccounts(&accounts);
+    try testing.seed(&accounts, .anthropic_api, &.{"claude-opus-5"});
+    var agent = testing.agent(gpa, .{ .anthropic_api = "sk-ant" });
+    defer agent.deinit();
+
+    // The session runs the description that the fetch replaced.
+    var stale = try Model.init("claude-opus-5");
+    stale.context_window = 7;
+    stale.tokens_max = 11;
+    stale.addEffort(.low);
+    stale.price = .{ .input = 99, .output = 99, .cache_read = 99, .cache_write = 99 };
+    agent.switchTo(accounts.client(.anthropic_api).?, stale);
+    var context: Context = .{ .gpa = gpa, .io = undefined, .agent = &agent, .accounts = &accounts };
+
+    const pick = try expectPick(try run(&context));
+    defer freePick(gpa, &pick);
+    try std.testing.expectEqualStrings("claude-opus-5", pick.options[pick.current.?]);
+
+    const outcome = try pick.select(&context, 1);
+    switch (outcome) {
+        .event => |event| gpa.free(event.content),
+        .notice => |notice| gpa.free(notice.content),
+        else => return error.ExpectedEvent,
+    }
+    const active = agent.model.?;
+    try std.testing.expectEqual(@as(?u64, 1_000_000), active.context_window);
+    try std.testing.expectEqual(@as(?u32, 128_000), active.tokens_max);
+    try std.testing.expect(active.offers(.max));
+    try std.testing.expectEqual(@as(f64, 3), active.price.?.input);
+    // The description changed, so the line states the switch.
+    try std.testing.expect(outcome == .event);
+}
+
+// The two cache writes of a fetch fail on their own, so a line must name the
+// cache that failed. A user who reads the wrong cache fetches a list that
+// already reached the disk, and the write that failed stays unnamed.
+test "a report of a failed metadata write names the metadata" {
+    const gpa = std.testing.allocator;
+    const report = (try fetchReport(gpa, .anthropic_api, &.{
+        .count = 2,
+        .metadata_save_error = error.StoreBusy,
+    })).?;
+    defer gpa.free(report.content);
+    try std.testing.expectEqual(Context.Outcome.Severity.failure, report.severity);
+    try std.testing.expectEqualStrings(
+        "Drinky fetched the model list of Anthropic API. Drinky could not save the public " ++
+            "metadata because of error StoreBusy. The metadata serves this session.",
+        report.content,
+    );
+}
+
+// A fetch that arrived and described no model returns the user to the same
+// fetch row. Without a line, that result reads like a fetch that never ran.
+test "a report of a fetch that described no model states that result" {
+    const gpa = std.testing.allocator;
+    const report = (try fetchReport(gpa, .anthropic_api, &.{ .count = 0 })).?;
+    defer gpa.free(report.content);
+    try std.testing.expectEqual(Context.Outcome.Severity.warning, report.severity);
+    try std.testing.expectEqualStrings(
+        "Drinky fetched the model list of Anthropic API. The account offers no model now.",
+        report.content,
+    );
+
+    // A list that holds a model needs no line, because the list itself shows it.
+    try std.testing.expect(try fetchReport(gpa, .anthropic_api, &.{ .count = 1 }) == null);
+}
+
+// A failed write and a missed metadata leave the picker on the fetch row too
+// when no model arrived. Each report therefore ends on the same one fact, so a
+// user never reads that a list serves a session that has no model.
+test "every report of a fetch that described no model states that result" {
+    const gpa = std.testing.allocator;
+    const cases = [_]struct {
+        result: Accounts.Refresh,
+        content: []const u8,
+    }{
+        .{
+            .result = .{ .count = 0, .models_save_error = error.StoreBusy },
+            .content = "Drinky fetched the model list of Anthropic API. Drinky could not save " ++
+                "the model list because of error StoreBusy. The list serves this session. " ++
+                "The account offers no model now.",
+        },
+        .{
+            .result = .{
+                .count = 0,
+                .metadata_error = error.ConnectionTimedOut,
+                .models_save_error = error.StoreBusy,
+            },
+            .content = "Drinky fetched the model list of Anthropic API. Drinky could not " ++
+                "fetch the public metadata because of error ConnectionTimedOut. Drinky could " ++
+                "not save the model list because of error StoreBusy. The list serves this " ++
+                "session. The account offers no model now.",
+        },
+        .{
+            .result = .{ .count = 0, .metadata_save_error = error.StoreBusy },
+            .content = "Drinky fetched the model list of Anthropic API. Drinky could not save " ++
+                "the public metadata because of error StoreBusy. The metadata serves this " ++
+                "session. The account offers no model now.",
+        },
+        .{
+            .result = .{
+                .count = 0,
+                .models_save_error = error.StoreBusy,
+                .metadata_save_error = error.AccessDenied,
+            },
+            .content = "Drinky fetched the model list of Anthropic API. Drinky could not save " ++
+                "the model list because of error StoreBusy. Drinky could not save the public " ++
+                "metadata because of error AccessDenied. Both serve this session. " ++
+                "The account offers no model now.",
+        },
+        .{
+            .result = .{ .count = 0, .metadata_error = error.ConnectionTimedOut },
+            .content = "Drinky fetched the model list of Anthropic API. Drinky could not " ++
+                "fetch the public metadata because of error ConnectionTimedOut. " ++
+                "The account offers no model now.",
+        },
+    };
+
+    for (cases) |case| {
+        const report = (try fetchReport(gpa, .anthropic_api, &case.result)).?;
+        defer gpa.free(report.content);
+        try std.testing.expectEqual(Context.Outcome.Severity.failure, report.severity);
+        try std.testing.expectEqualStrings(case.content, report.content);
+    }
+}
+
+// A line that counts models must read correctly for one model.
+test "a report of a missed metadata counts one model in the singular" {
+    const gpa = std.testing.allocator;
+    const report = (try fetchReport(gpa, .anthropic_api, &.{
+        .count = 1,
+        .metadata_error = error.ConnectionTimedOut,
+    })).?;
+    defer gpa.free(report.content);
+    try std.testing.expectEqualStrings(
+        "Drinky fetched the model list of Anthropic API. Drinky could not fetch the public " ++
+            "metadata because of error ConnectionTimedOut. The account offers 1 model now.",
+        report.content,
+    );
+}
+
+test "a report of a failed list write names the list" {
+    const gpa = std.testing.allocator;
+    const report = (try fetchReport(gpa, .anthropic_api, &.{
+        .count = 2,
+        .models_save_error = error.StoreBusy,
+    })).?;
+    defer gpa.free(report.content);
+    try std.testing.expectEqualStrings(
+        "Drinky fetched the model list of Anthropic API. Drinky could not save the model list " ++
+            "because of error StoreBusy. The list serves this session.",
+        report.content,
+    );
+
+    // Both writes can fail together, so one line states both.
+    const both = (try fetchReport(gpa, .anthropic_api, &.{
+        .count = 2,
+        .models_save_error = error.StoreBusy,
+        .metadata_save_error = error.AccessDenied,
+    })).?;
+    defer gpa.free(both.content);
+    try std.testing.expectEqualStrings(
+        "Drinky fetched the model list of Anthropic API. Drinky could not save the model list " ++
+            "because of error StoreBusy. Drinky could not save the public metadata because of " ++
+            "error AccessDenied. Both serve this session.",
+        both.content,
+    );
 }
 
 test "every step reports a row that its list does not hold" {
@@ -421,6 +995,8 @@ test "every step reports a row that its list does not hold" {
         .{ .anthropic = "sk-ant", .openai = "sk-openai" },
         .{ .anthropic = true },
     );
+    defer testing.deinitAccounts(&accounts);
+    try testing.seed(&accounts, .anthropic_api, &.{"claude-sonnet-4-6"});
     var agent = testing.agent(gpa, .{ .anthropic_api = "sk-ant" });
     defer agent.deinit();
     var context: Context = .{ .gpa = gpa, .io = undefined, .agent = &agent, .accounts = &accounts };
@@ -448,12 +1024,13 @@ test "every step reports a row that its list does not hold" {
         .failure,
         "valid model",
     );
-    try std.testing.expectEqualStrings("claude-sonnet-4-6", agent.model.name);
+    try std.testing.expectEqualStrings("claude-sonnet-4-6", agent.model.?.name());
 }
 
 test "no authenticated accounts reports an error instead of a picker" {
     const gpa = std.testing.allocator;
     var accounts = testing.accounts(.{}, .{});
+    defer testing.deinitAccounts(&accounts);
     var context: Context = .{
         .gpa = gpa,
         .io = undefined,
@@ -469,6 +1046,9 @@ test "the active mark matches the account, not just the model name" {
     // Both Anthropic accounts are authenticated, so every model name appears
     // under two accounts. The mark must land inside the active account's list.
     var accounts = testing.accounts(.{ .anthropic = "sk-ant" }, .{ .anthropic = true });
+    defer testing.deinitAccounts(&accounts);
+    try testing.seed(&accounts, .anthropic_subscription, &.{"claude-sonnet-4-6"});
+    try testing.seed(&accounts, .anthropic_api, &.{"claude-sonnet-4-6"});
     var agent = testing.agent(gpa, .{ .anthropic_subscription = undefined });
     defer agent.deinit();
     var context: Context = .{ .gpa = gpa, .io = undefined, .agent = &agent, .accounts = &accounts };
@@ -498,6 +1078,8 @@ fn runUnderOom(gpa: std.mem.Allocator) !void {
         .{ .anthropic = "sk-ant", .openai = "sk-openai" },
         .{ .anthropic = true },
     );
+    defer testing.deinitAccounts(&accounts);
+    try testing.seed(&accounts, .anthropic_subscription, &.{"claude-opus-5"});
     var agent = testing.agent(gpa, .{ .anthropic_api = "sk-ant" });
     defer agent.deinit();
     var context: Context = .{ .gpa = gpa, .io = undefined, .agent = &agent, .accounts = &accounts };
@@ -509,7 +1091,8 @@ fn runUnderOom(gpa: std.mem.Allocator) !void {
     const anthropic_models = try expectPick(try anthropic_accounts.select(&context, 0));
     defer freePick(gpa, &anthropic_models);
 
-    switch (try anthropic_models.select(&context, 0)) {
+    // Row 0 fetches over the network, so the walk picks a model row.
+    switch (try anthropic_models.select(&context, 1)) {
         .event => |event| gpa.free(event.content),
         else => return error.ExpectedEvent,
     }

@@ -7,6 +7,7 @@
 
 const std = @import("std");
 
+const format = @import("../format.zig");
 const json = @import("../json.zig");
 const llm = @import("../llm.zig");
 const net = @import("../net.zig");
@@ -699,32 +700,28 @@ fn resetText(arena: std.mem.Allocator, seconds: u64) ![]const u8 {
     if (minutes == 0) return "less than a minute";
     if (hours == 0) return std.fmt.allocPrint(arena, "{d} minute{s}", .{
         minutes,
-        pluralSuffix(minutes),
+        format.pluralSuffix(minutes),
     });
     if (days == 0) {
         const rest_minutes = minutes - hours * 60;
         if (rest_minutes == 0)
-            return std.fmt.allocPrint(arena, "{d} hour{s}", .{ hours, pluralSuffix(hours) });
+            return std.fmt.allocPrint(arena, "{d} hour{s}", .{ hours, format.pluralSuffix(hours) });
         return std.fmt.allocPrint(arena, "{d} hour{s} {d} minute{s}", .{
             hours,
-            pluralSuffix(hours),
+            format.pluralSuffix(hours),
             rest_minutes,
-            pluralSuffix(rest_minutes),
+            format.pluralSuffix(rest_minutes),
         });
     }
     const rest_hours = hours - days * 24;
     if (rest_hours == 0)
-        return std.fmt.allocPrint(arena, "{d} day{s}", .{ days, pluralSuffix(days) });
+        return std.fmt.allocPrint(arena, "{d} day{s}", .{ days, format.pluralSuffix(days) });
     return std.fmt.allocPrint(arena, "{d} day{s} {d} hour{s}", .{
         days,
-        pluralSuffix(days),
+        format.pluralSuffix(days),
         rest_hours,
-        pluralSuffix(rest_hours),
+        format.pluralSuffix(rest_hours),
     });
-}
-
-fn pluralSuffix(count: u64) []const u8 {
-    return if (count == 1) "" else "s";
 }
 
 fn errorRetryable(object: *const std.json.ObjectMap) bool {

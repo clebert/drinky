@@ -141,7 +141,7 @@ const items = blk: {
         .{ .sample = .{
             .label = "Status",
             .name = .muted,
-            .text = "~/drinky (main) · Context: 42% · $0.14",
+            .text = "~/drinky (main) · Context: 42% · ~$0.14",
         } },
         // An information notice replaces the muted status line, so it reads at
         // the normal intensity. Only a warning and a failure carry a color.
@@ -499,6 +499,9 @@ test "the preview shows the palette, the styles, the boxes, the roles, and the f
     // The text roles and the frames include plain reply text and a labelled
     // separator with its activity segment to the right of the label.
     try std.testing.expect(std.mem.indexOf(u8, painted, "A plain model reply.") != null);
+    // Every cost figure of Drinky carries the tilde of an estimate, so the
+    // sample status line carries it too.
+    try std.testing.expect(std.mem.indexOf(u8, painted, "Context: 42% · ~$0.14") != null);
     try std.testing.expect(std.mem.indexOf(u8, painted, "Thinking:") != null);
     try std.testing.expect(std.mem.indexOf(u8, painted, "https://example.com") != null);
     try std.testing.expect(std.mem.indexOf(u8, painted, "↑ Hidden: 3") != null);

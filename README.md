@@ -63,9 +63,15 @@ the keys of the prompt, of a running turn, and of a review, and the files that D
 Drinky applies changes at the next start.
 
 Drinky reads `config.json` and never writes it, so the file stays yours. You can keep it in version
-control. The machine-specific data lives in two separate files: the credentials in
-`~/.drinky/auth.json`, and the last account, model, and effort level in `~/.drinky/state.json`. The
-state file remembers those three per project, so a model switch touches no configuration.
+control. The machine-specific data lives in separate files. `~/.drinky/auth.json` holds the
+credentials, and `~/.drinky/state.json` holds the last account, model, and effort level.
+`~/.drinky/models.json` holds the model list of each account, and `~/.drinky/metadata.json` holds
+the public facts of a vendor. The state file remembers the three choices per project, so a model
+switch touches no configuration.
+
+Drinky compiles no model in. It learns every model, limit, effort level, and price from the provider
+and from OpenRouter, and it makes no request until you ask for one. Fetch a list from `/model`, then
+pick the model to run.
 
 ## Provider access
 

@@ -7,10 +7,11 @@
 const std = @import("std");
 
 const llm = @import("llm.zig");
-const models = @import("models.zig");
+const Model = @import("Model.zig");
 const net = @import("net.zig");
 const provider = @import("provider.zig");
 const Steering = @import("Steering.zig");
+const testing = @import("testing.zig");
 const tool = @import("tool/root.zig");
 
 const Agent = @This();
@@ -34,10 +35,6 @@ pub const unfinished_tool_result =
     "The tool stopped before Drinky recorded a result. " ++
     "Drinky does not know if the tool changed the system.";
 
-/// The distinct models one session breaks its cost down by. An overflow drops
-/// only the per-model detail, never the cumulative totals.
-const by_model_max = 16;
-
 gpa: std.mem.Allocator,
 io: std.Io,
 /// Each bash command inherits this process environment. The host owns it for the session.
@@ -45,7 +42,7 @@ environ: std.process.Environ,
 /// The active account's transport, or null while signed out. The app refuses to
 /// start a turn while signed out, so the internal uses assume one.
 client: ?provider.Client,
-model: models.Model,
+model: ?Model,
 system: []const u8,
 effort: llm.Effort,
 retry: net.Retry,
@@ -70,13 +67,14 @@ steering: Steering,
 /// turn shares it until a deliberate reset rotates it.
 cache_key: [32]u8,
 
-/// The cumulative session cost and cache savings, the two gauge measurements,
-/// and the latest subscription allowance. Each message is priced against the
-/// model that produced it, so the totals stay correct across a mid-session
-/// `/model` switch. A plain value type: it copies whole across the UI channel.
+/// The cumulative session cost, the two gauge measurements, and the latest
+/// subscription allowance. Each message is priced against the model that
+/// produced it, so the total stays correct across a mid-session `/model`
+/// switch. A plain value type: it copies whole across the UI channel.
 pub const Stats = struct {
+    /// The session cost of every reply Drinky could price. It is an estimate at
+    /// public rates, and a subscription pays none of it.
     cost: f64 = 0,
-    saved: f64 = 0,
     /// The conversation context that the last committed reply measured. Null
     /// means no measurement describes the current history, or the way the next
     /// request renders it. Empty history is 0.
@@ -102,42 +100,6 @@ pub const Stats = struct {
     /// relative to this process alone, so a save must drop it and a restart must
     /// read it as unknown.
     quota_seen_ms: i64 = 0,
-    by_model: [by_model_max]ByModel = [_]ByModel{.{}} ** by_model_max,
-    model_count: usize = 0,
-
-    /// One model's session totals. `name` points into the compiled model table
-    /// (static lifetime).
-    pub const ByModel = struct {
-        name: []const u8 = "",
-        cost: f64 = 0,
-        saved: f64 = 0,
-        usage: llm.Usage = .{},
-    };
-
-    /// Attribute one message to `name` and open a bucket on first appearance.
-    fn attribute(
-        self: *Stats,
-        name: []const u8,
-        cost: f64,
-        saved: f64,
-        usage: *const llm.Usage,
-    ) void {
-        const entry = self.entryFor(name) orelse return;
-        entry.cost += cost;
-        entry.saved += saved;
-        entry.usage = entry.usage.plus(usage);
-    }
-
-    fn entryFor(self: *Stats, name: []const u8) ?*ByModel {
-        for (self.by_model[0..self.model_count]) |*entry| {
-            if (std.mem.eql(u8, entry.name, name)) return entry;
-        }
-        if (self.model_count == self.by_model.len) return null;
-        const entry = &self.by_model[self.model_count];
-        entry.* = .{ .name = name };
-        self.model_count += 1;
-        return entry;
-    }
 };
 
 /// A reply that another model served than the request named. A provider can
@@ -204,14 +166,13 @@ const MeasuredContext = struct {
     /// The whole prompt of the measuring request plus the output it produced.
     tokens: u64,
     /// The model the request named. A tokenizer belongs to its model. The name
-    /// points into the compiled model table (static lifetime).
-    model: []const u8,
+    /// is copied, because a model outlives no catalog refresh.
+    model: Model,
     /// The account that rendered the request. It selects account-specific system
     /// blocks and stored reasoning proofs.
     account: llm.Account,
-    /// The effort the request rendered. It decides the replay for Anthropic.
-    /// A named level points into the compiled table too (static lifetime).
-    resolution: models.Model.EffortMap.Resolution,
+    /// The control the request rendered. It decides the replay for Anthropic.
+    reasoning: llm.Request.Reasoning,
 };
 
 /// The turn transaction's private bookkeeping. It holds the pre-turn history
@@ -332,7 +293,7 @@ pub fn init(
     io: std.Io,
     client: ?provider.Client,
     options: struct {
-        model: models.Model,
+        model: ?Model,
         system: []const u8,
         retry: net.Retry,
         environ: std.process.Environ,
@@ -383,19 +344,24 @@ pub fn resetConversation(self: *Agent) void {
 /// pair is one atomic step. A model is never paired with a foreign vendor's
 /// client. History is untouched. The new account drops reasoning it did not
 /// produce.
-pub fn switchTo(self: *Agent, client: provider.Client, model: models.Model) void {
+pub fn switchTo(self: *Agent, client: provider.Client, model: ?Model) void {
     const account_changed = if (self.client) |active|
         active.account() != client.account()
     else
         true;
-    const model_changed = !std.mem.eql(u8, self.model.name, model.name);
+    const model_changed = if (self.model) |active|
+        if (model) |next| !active.eql(&next) else true
+    else
+        model != null;
     self.client = client;
     self.model = model;
     // An allowance belongs to the account whose response reported it. Session
     // totals span account switches, but this point-in-time gauge must not.
     if (account_changed) self.stats.quota = null;
     // The provider isolates a cache per principal, and it keys the entry on the
-    // rendered model too, so either change makes the measured rate foreign.
+    // rendered model too, so either change makes the measured rate foreign. A
+    // replaced description keeps the name and can still render another
+    // reasoning control, so the comparison reads every described part.
     if (account_changed or model_changed) self.stats.cache_usage = .{};
     // The context gauge judges its own measurement against the new setup, so a
     // switch back to the measured setup shows the count again.
@@ -466,9 +432,11 @@ pub fn setEffort(self: *Agent, effort: llm.Effort) void {
     // a change always invalidates the cached message blocks. Two levels that
     // fold onto one wire form render the same bytes, so they share one cache
     // and the rate survives.
-    const rendered_before = self.model.effort.resolve(self.effort);
-    const rendered_after = self.model.effort.resolve(effort);
-    if (!rendered_before.eql(rendered_after)) self.stats.cache_usage = .{};
+    if (self.model) |model| {
+        const rendered_before = model.reasoning(self.effort);
+        const rendered_after = model.reasoning(effort);
+        if (!rendered_before.eql(rendered_after)) self.stats.cache_usage = .{};
+    }
     self.effort = effort;
     // The same history renders to the same tokens, unless the new effort takes
     // the stored reasoning out of the prompt or puts it back.
@@ -495,7 +463,10 @@ fn contextShown(self: *const Agent) ?u64 {
     const measured = self.measured_context orelse return null;
     // A tokenizer belongs to its model. Anthropic states that its models from
     // 4.7 on count the same text about 30 percent higher.
-    if (!std.mem.eql(u8, measured.model, self.model.name)) return null;
+    // Without a model no request goes out, so nothing states how this history
+    // renders.
+    const model = self.model orelse return null;
+    if (!measured.model.sameName(model.name())) return null;
     // A signed-out Drinky sends nothing, so no request renders this history
     // differently. The next account decides that.
     const client = self.client orelse return measured.tokens;
@@ -510,9 +481,9 @@ fn contextShown(self: *const Agent) ?u64 {
     // Anthropic drops every thinking block unless the request names an effort,
     // so a change that flips the replay takes each proof of this account out of
     // the prompt, or puts it back.
-    const resolution = self.model.effort.resolve(self.effort);
+    const reasoning = model.reasoning(self.effort);
     const vendor = account.provider();
-    if (resolution.replaysReasoning(vendor) == measured.resolution.replaysReasoning(vendor))
+    if (reasoning.replaysReasoning(vendor) == measured.reasoning.replaysReasoning(vendor))
         return measured.tokens;
     return if (self.holdsProofOf(account)) null else measured.tokens;
 }
@@ -808,14 +779,18 @@ fn fetchReply(
     turn: *TurnState,
     handler: anytype,
 ) ![]const llm.Item {
-    const model = self.model;
+    const model = self.model orelse return error.NoModel;
     const request: llm.Request = .{
-        .model = model.name,
-        .tokens_max = model.tokens_max,
+        .model = model.name(),
+        // A provider that requires an output limit gets the one its own list
+        // stated. A model that states none takes the floor, which truncates a
+        // long reply, and `Model.outputLimitUnknown` marks such a model in a
+        // picker.
+        .tokens_max = model.tokens_max orelse Model.tokens_max_fallback,
         .system = self.system,
         .items = self.items.items,
         .tools = &tool.specs,
-        .effort = self.effort,
+        .reasoning = model.reasoning(self.effort),
         .cache_key = &self.cache_key,
     };
     var attempt: u32 = 1;
@@ -1026,50 +1001,33 @@ fn contextTokens(usage: *const llm.Usage) u64 {
 /// Fold one message's usage into the totals, priced with `model`. The model is
 /// threaded from the request so billing cannot drift when `/model` changes
 /// `self.model`.
-fn recordUsage(self: *Agent, model: *const models.Model, usage: *const llm.Usage) void {
-    const cost = model.cost(usage);
-    const saved = model.savings(usage);
-    self.stats.cost += cost;
-    self.stats.saved += saved;
+fn recordUsage(self: *Agent, model: *const Model, usage: *const llm.Usage) void {
+    if (model.cost(usage)) |cost| self.stats.cost += cost;
     // The prompt of an accepted request is processed and billed whole, even
     // when the stream is canceled before its reply ends, so its hit rate is
     // final as soon as the counts arrive.
     self.stats.cache_usage = usage.*;
-    self.stats.attribute(model.name, cost, saved, usage);
 }
 
-/// The model that prices one reply: the requested one, or the table entry of
-/// the model the response names as the one that served it. An unknown served
-/// name fails the turn, because a price at rates Drinky does not know corrupts
-/// the ledger silently. The failed attempt still bills at the requested rates
-/// through the usage-so-far path, so the spend is kept while the report names
-/// the model Drinky cannot price.
-fn pricingModel(
-    self: *Agent,
-    requested: *const models.Model,
-    served_name: []const u8,
-    presentation_closed: *bool,
-    handler: anytype,
-) !models.Model {
-    if (served_name.len == 0 or std.mem.eql(u8, served_name, requested.name))
-        return requested.*;
-    const account = self.client.?.account();
-    if (models.get(account.provider(), served_name)) |served| return served;
-    const text = try std.fmt.allocPrint(
-        self.gpa,
-        "Drinky does not know the model \"{s}\" that served this reply, so Drinky cannot price " ++
-            "it. Use /model to pick another model.",
-        .{served_name},
-    );
-    defer self.gpa.free(text);
-    try presentation(presentation_closed, handler.onError(text));
-    return error.UnknownServedModel;
+/// The model that prices one reply: the requested one, or the one the response
+/// names as the model that served it. Drinky knows no rate for a model it did
+/// not request, so a served reply carries no price. A served name that no model
+/// can hold keeps the requested name and drops the price, because the rates of
+/// one model never price another. The session total then counts nothing for
+/// that reply.
+fn pricingModel(requested: *const Model, served_name: []const u8) Model {
+    if (served_name.len == 0 or requested.sameName(served_name)) return requested.*;
+    return Model.init(served_name) catch {
+        var unpriced = requested.*;
+        unpriced.price = null;
+        return unpriced;
+    };
 }
 
 /// Record a stream's nonzero running usage unless its terminal event already did.
 fn recordUsageSoFar(
     self: *Agent,
-    model: *const models.Model,
+    model: *const Model,
     stream: anytype,
     usage_recorded: *bool,
 ) void {
@@ -1088,7 +1046,7 @@ fn recordUsageSoFar(
 /// the next append (which `runTools` performs only after the reply is read).
 fn readReply(
     self: *Agent,
-    model: *const models.Model,
+    model: *const Model,
     stream: anytype,
     handler: anytype,
 ) ![]const llm.Item {
@@ -1099,7 +1057,7 @@ fn readReply(
 
 fn readReplyWith(
     self: *Agent,
-    model: *const models.Model,
+    model: *const Model,
     stream: anytype,
     turn: *TurnState,
     usage_recorded: *bool,
@@ -1133,9 +1091,8 @@ fn readReplyWith(
     }
     const stop = maybe_stop orelse return error.IncompleteReply;
     // The model that really served the reply prices it, so a provider-side
-    // fallback bills at the fallback's rates. An unknown served model fails the
-    // turn instead of pricing at rates Drinky cannot know.
-    const priced_model = try self.pricingModel(model, stop.model, presentation_closed, handler);
+    // fallback bills under its own name.
+    const priced_model = pricingModel(model, stop.model);
     // Terminal usage is billable even when replay validation rejects the reply
     // and the request is retried.
     self.recordUsage(&priced_model, &stop.usage);
@@ -1160,9 +1117,9 @@ fn readReplyWith(
     // cannot discard. The attempt that lands reports the switch. It reports
     // before the commit below, so a closed presentation channel cannot fail
     // the reply after history already owns its items.
-    if (stop.model.len != 0 and !std.mem.eql(u8, stop.model, model.name))
+    if (stop.model.len != 0 and !model.sameName(stop.model))
         try presentation(presentation_closed, handler.onModelMismatch(.{
-            .requested = model.name,
+            .requested = model.name(),
             .served = stop.model,
         }));
 
@@ -1176,9 +1133,9 @@ fn readReplyWith(
     // names it, because the next request goes out under that model.
     if (self.client) |client| turn.pending_context = .{
         .tokens = contextTokens(&stop.usage),
-        .model = model.name,
+        .model = model.*,
         .account = client.account(),
-        .resolution = model.effort.resolve(self.effort),
+        .reasoning = model.reasoning(self.effort),
     };
     // Only a committed reply's cutoff is worth a report: a rejected truncation
     // is retried, and a resampled attempt can finish.
@@ -1468,14 +1425,13 @@ test "resetConversation clears conversation state and preserves configuration" {
     defer agent.deinit();
 
     const account = agent.client.?.account();
-    const model = agent.model;
+    const model = agent.model.?;
     const cache_key = agent.cache_key;
     agent.effort = .high;
     try agent.appendUser("old prompt");
     const usage: llm.Usage = .{ .input = 1000, .output = 200, .cache_write = 500 };
-    agent.recordUsage(&agent.model, &usage);
+    agent.recordUsage(&agent.model.?, &usage);
     seedContext(&agent, contextTokens(&usage));
-    try std.testing.expect(agent.stats.model_count == 1);
     try agent.steering.push("old steering");
 
     agent.resetConversation();
@@ -1491,7 +1447,7 @@ test "resetConversation clears conversation state and preserves configuration" {
     try std.testing.expectEqual(@as(?u64, 0), agent.stats.context_tokens);
     try std.testing.expect(agent.measured_context == null);
     try std.testing.expectEqual(account, agent.client.?.account());
-    try std.testing.expectEqualStrings(model.name, agent.model.name);
+    try std.testing.expectEqualStrings(model.name(), agent.model.?.name());
     try std.testing.expectEqual(llm.Effort.high, agent.effort);
 }
 
@@ -1533,7 +1489,8 @@ test "an account change or sign-out clears the previous account's quota" {
     defer agent.deinit();
 
     const same_account = agent.client.?;
-    const sonnet = models.get(.anthropic, "claude-sonnet-4-6").?;
+    var sonnet = testing.model("claude-sonnet-4-6");
+    sonnet.efforts.remove(.xhigh);
     agent.stats.quota = .{ .primary = .{ .used_percent = 25, .window_minutes = 300 } };
 
     // A model change within one account keeps that account's latest allowance.
@@ -1547,7 +1504,7 @@ test "an account change or sign-out clears the previous account's quota" {
         .{ .openai_api = "sk-test" },
         .{},
     );
-    const openai_model = models.get(.openai, "gpt-5.6-sol").?;
+    const openai_model = testing.model("gpt-5.6-sol");
     agent.switchTo(openai_client, openai_model);
     try std.testing.expect(agent.stats.quota == null);
 
@@ -1566,7 +1523,8 @@ test "the cache rate expires with the principal, the model, and the wire effort"
     defer agent.deinit();
 
     const same_account = agent.client.?;
-    const sonnet = models.get(.anthropic, "claude-sonnet-4-6").?;
+    var sonnet = testing.model("claude-sonnet-4-6");
+    sonnet.efforts.remove(.xhigh);
     const usage: llm.Usage = .{ .input = 100, .output = 20, .cache_read = 900 };
     try agent.appendUser("committed context");
 
@@ -1574,7 +1532,8 @@ test "the cache rate expires with the principal, the model, and the wire effort"
     agent.setEffort(.high);
     try std.testing.expectEqual(llm.Usage{}, agent.stats.cache_usage);
 
-    // Sonnet 4.6 folds xhigh onto high, so this change writes the same bytes.
+    // This model names no xhigh, so that level folds onto high and the change
+    // writes the same bytes.
     agent.switchTo(same_account, sonnet);
     agent.setEffort(.high);
     agent.stats.cache_usage = usage;
@@ -1588,12 +1547,20 @@ test "the cache rate expires with the principal, the model, and the wire effort"
         .{ .anthropic_api = "key" },
         .{},
     );
-    agent.switchTo(other_account, agent.model);
+    agent.switchTo(other_account, agent.model.?);
     try std.testing.expectEqual(llm.Usage{}, agent.stats.cache_usage);
 
     // The provider keys its entry on the rendered model too.
     agent.stats.cache_usage = usage;
-    agent.switchTo(other_account, models.get(.anthropic, "claude-opus-4-8").?);
+    agent.switchTo(other_account, testing.model("claude-opus-4-8"));
+    try std.testing.expectEqual(llm.Usage{}, agent.stats.cache_usage);
+
+    // A fetch replaces the description of a model and keeps its name. A
+    // narrowed ladder renders another effort control, so the rate goes with it.
+    agent.stats.cache_usage = usage;
+    var narrowed = testing.model("claude-opus-4-8");
+    narrowed.efforts.remove(.max);
+    agent.switchTo(other_account, narrowed);
     try std.testing.expectEqual(llm.Usage{}, agent.stats.cache_usage);
 
     // A sign-out has no account left to attribute a rate to.
@@ -1616,7 +1583,7 @@ test "the context gauge holds while the tokenizer and the replayed reasoning hol
     defer agent.deinit();
 
     const subscription = agent.client.?;
-    const opus = agent.model;
+    const opus = agent.model.?;
     try agent.appendUser("committed context");
     try appendProof(&agent, .anthropic_subscription);
     agent.setEffort(.high);
@@ -1656,7 +1623,7 @@ test "the context gauge holds while the tokenizer and the replayed reasoning hol
     agent.switchTo(subscription, opus);
 
     // Another model counts the same history with another tokenizer.
-    agent.switchTo(subscription, models.get(.anthropic, "claude-sonnet-4-6").?);
+    agent.switchTo(subscription, testing.model("claude-sonnet-4-6"));
     try std.testing.expect(agent.stats.context_tokens == null);
     agent.switchTo(subscription, opus);
     try std.testing.expectEqual(@as(?u64, 1020), agent.stats.context_tokens);
@@ -1677,7 +1644,7 @@ test "an account switch hides the count, and a switch back restores it" {
     defer agent.deinit();
 
     const subscription = agent.client.?;
-    const opus = agent.model;
+    const opus = agent.model.?;
     try agent.appendUser("committed context");
     agent.setEffort(.high);
     seedContext(&agent, 1020);
@@ -1710,7 +1677,7 @@ test "the context gauge survives every effort change that replays the same reaso
 
     // Sonnet 4.6 folds xhigh onto high. Both name an effort, so the proof of
     // this account replays either way and the count stands.
-    const sonnet = models.get(.anthropic, "claude-sonnet-4-6").?;
+    const sonnet = testing.model("claude-sonnet-4-6");
     anthropic_agent.switchTo(subscription, sonnet);
     try appendProof(&anthropic_agent, .anthropic_subscription);
     anthropic_agent.setEffort(.high);
@@ -1730,10 +1697,11 @@ test "the context gauge survives every effort change that replays the same reaso
     try std.testing.expectEqual(@as(?u64, 1020), openai_agent.stats.context_tokens);
 }
 
-test "usage is attributed to the model that produced it across a switch" {
+test "usage is priced with the model that produced it, not the active one" {
     const gpa = std.testing.allocator;
-    const sonnet = models.get(.anthropic, "claude-sonnet-4-6").?;
-    const opus = models.get(.anthropic, "claude-opus-4-8").?;
+    const sonnet = testing.model("claude-sonnet-4-6");
+    var opus = testing.model("claude-opus-4-8");
+    opus.price.?.input = 5;
     const client = provider.Client.init(
         gpa,
         std.testing.io,
@@ -1755,39 +1723,28 @@ test "usage is attributed to the model that produced it across a switch" {
     agent.switchTo(client, opus);
     agent.recordUsage(&sonnet, &one_million);
     try std.testing.expectApproxEqAbs(@as(f64, 3), agent.stats.cost, 1e-9);
-    try std.testing.expectApproxEqAbs(@as(f64, 3), agent.stats.by_model[0].cost, 1e-9);
 
     // An opus turn blends both rates: sonnet $3 + opus $5.
     agent.recordUsage(&opus, &one_million);
     try std.testing.expectApproxEqAbs(@as(f64, 8), agent.stats.cost, 1e-9);
-    try std.testing.expectEqual(@as(usize, 2), agent.stats.model_count);
-    try std.testing.expectEqualStrings("claude-sonnet-4-6", agent.stats.by_model[0].name);
-    try std.testing.expectEqualStrings("claude-opus-4-8", agent.stats.by_model[1].name);
-    try std.testing.expectApproxEqAbs(@as(f64, 5), agent.stats.by_model[1].cost, 1e-9);
-
-    // A second sonnet turn folds into the existing bucket, not a third one.
-    agent.recordUsage(&sonnet, &one_million);
-    try std.testing.expectEqual(@as(usize, 2), agent.stats.model_count);
-    try std.testing.expectApproxEqAbs(@as(f64, 6), agent.stats.by_model[0].cost, 1e-9);
-    try std.testing.expectEqual(@as(u64, 2_000_000), agent.stats.by_model[0].usage.input);
+    try std.testing.expectEqual(@as(u64, 1_000_000), agent.stats.cache_usage.input);
 }
 
-test "cumulative totals stay exact past the per-model bound" {
+// A model that no source priced adds no cost at all. Drinky states no rate it
+// does not know, so such a reply leaves the total where it stood.
+test "an unpriced model adds no cost to the session total" {
     var agent = scriptedAgent(std.testing.allocator);
     defer agent.deinit();
 
-    // The 17th model opens no bucket, yet the totals and last-usage gauge
-    // still include it.
-    const opus = models.get(.anthropic, "claude-opus-4-8").?;
-    inline for (0..by_model_max + 1) |index| {
-        var model = opus;
-        model.name = std.fmt.comptimePrint("m{d}", .{index});
-        agent.recordUsage(&model, &.{ .input = 1_000_000 });
-    }
-    try std.testing.expectEqual(@as(usize, by_model_max), agent.stats.model_count);
-    try std.testing.expectEqualStrings("m15", agent.stats.by_model[by_model_max - 1].name);
-    try std.testing.expectApproxEqAbs(@as(f64, 85), agent.stats.cost, 1e-9);
-    try std.testing.expectEqual(@as(u64, 1_000_000), agent.stats.cache_usage.input);
+    const priced = testing.model("priced");
+    agent.recordUsage(&priced, &.{ .input = 1_000_000 });
+    try std.testing.expectApproxEqAbs(@as(f64, 3), agent.stats.cost, 1e-9);
+
+    const unpriced = testing.bareModel("unpriced");
+    agent.recordUsage(&unpriced, &.{ .input = 2_000_000 });
+    try std.testing.expectApproxEqAbs(@as(f64, 3), agent.stats.cost, 1e-9);
+    // The cache gauge reads the last prompt whatever its price.
+    try std.testing.expectEqual(@as(u64, 2_000_000), agent.stats.cache_usage.input);
 }
 
 const ScriptedStream = struct {
@@ -2152,7 +2109,7 @@ const CaptureHandler = struct {
 };
 
 fn scriptedAgent(gpa: std.mem.Allocator) Agent {
-    const model = models.get(.anthropic, "claude-opus-4-8").?;
+    const model = testing.model("claude-opus-4-8");
     const client = provider.Client.init(
         gpa,
         std.testing.io,
@@ -2171,9 +2128,9 @@ fn scriptedAgent(gpa: std.mem.Allocator) Agent {
 fn seedContext(agent: *Agent, tokens: u64) void {
     agent.measured_context = .{
         .tokens = tokens,
-        .model = agent.model.name,
+        .model = agent.model.?,
         .account = agent.client.?.account(),
-        .resolution = agent.model.effort.resolve(agent.effort),
+        .reasoning = agent.model.?.reasoning(agent.effort),
     };
     agent.refreshContext();
 }
@@ -2208,7 +2165,7 @@ fn appendProof(agent: *Agent, account: llm.Account) !void {
 }
 
 fn openaiScriptedAgent(gpa: std.mem.Allocator) Agent {
-    const model = models.get(.openai, "gpt-5.6-sol").?;
+    const model = testing.model("gpt-5.6-sol");
     const client = provider.Client.init(gpa, std.testing.io, .{ .openai_api = "sk-test" }, .{});
     return Agent.init(gpa, std.testing.io, client, .{
         .model = model,
@@ -2250,7 +2207,7 @@ fn expectIncompleteToolStream(
     handler: *CaptureHandler,
 ) !void {
     const maybe_reply: ?[]const llm.Item =
-        agent.readReply(&agent.model, stream, handler) catch |err| switch (err) {
+        agent.readReply(&agent.model.?, stream, handler) catch |err| switch (err) {
             error.IncompleteReply => null,
             else => return err,
         };
@@ -2275,7 +2232,7 @@ test "readReply stops before a post-completion timeout" {
     var handler: CaptureHandler = .{ .gpa = std.testing.allocator };
     defer handler.deinit();
 
-    const reply = try agent.readReply(&agent.model, &stream, &handler);
+    const reply = try agent.readReply(&agent.model.?, &stream, &handler);
     try std.testing.expectEqual(@as(usize, 1), reply.len);
     try std.testing.expectEqualStrings("done", reply[0].message.text);
     try std.testing.expectEqual(@as(usize, 1), handler.usage_count);
@@ -2297,7 +2254,7 @@ test "readReply reports a reply that another model served" {
         .{ .stop = .{ .usage = .{ .output = 1 }, .model = "claude-sonnet-4-6" } },
     };
     var fallback_stream: ScriptedStream = .{ .events = &served_by_fallback };
-    _ = try agent.readReply(&agent.model, &fallback_stream, &handler);
+    _ = try agent.readReply(&agent.model.?, &fallback_stream, &handler);
     try std.testing.expectEqualStrings(
         "claude-opus-4-8 claude-sonnet-4-6\n",
         handler.model_mismatches.items,
@@ -2308,13 +2265,13 @@ test "readReply reports a reply that another model served" {
         .{ .stop = .{ .usage = .{ .output = 1 }, .model = "claude-opus-4-8" } },
     };
     var matching_stream: ScriptedStream = .{ .events = &served_as_requested };
-    _ = try agent.readReply(&agent.model, &matching_stream, &handler);
+    _ = try agent.readReply(&agent.model.?, &matching_stream, &handler);
     const served_unnamed = [_]llm.Event{
         .{ .item = .{ .message = "done" } },
         .{ .stop = .{ .usage = .{ .output = 1 } } },
     };
     var unnamed_stream: ScriptedStream = .{ .events = &served_unnamed };
-    _ = try agent.readReply(&agent.model, &unnamed_stream, &handler);
+    _ = try agent.readReply(&agent.model.?, &unnamed_stream, &handler);
     try std.testing.expectEqualStrings(
         "claude-opus-4-8 claude-sonnet-4-6\n",
         handler.model_mismatches.items,
@@ -2335,7 +2292,7 @@ test "readReply reports a reply that another model served" {
     var rejected_stream: ScriptedStream = .{ .events = &served_and_rejected };
     try std.testing.expectError(
         error.IncompleteReply,
-        agent.readReply(&agent.model, &rejected_stream, &handler),
+        agent.readReply(&agent.model.?, &rejected_stream, &handler),
     );
     try std.testing.expectEqualStrings(
         "claude-opus-4-8 claude-sonnet-4-6\n",
@@ -2347,7 +2304,7 @@ test "readReply reports a reply that another model served" {
 // must price the reply at the model that served it and attribute the usage to
 // that model's bucket. The cache rate takes the same reply, because the
 // fallback keeps serving the conversation.
-test "readReply prices a reply at the model that served it" {
+test "readReply prices a reply that the requested model served" {
     const gpa = std.testing.allocator;
     var agent = scriptedAgent(gpa);
     defer agent.deinit();
@@ -2357,22 +2314,20 @@ test "readReply prices a reply at the model that served it" {
     const usage: llm.Usage = .{ .input = 1_000_000, .output = 10_000, .cache_write = 100 };
     const events = [_]llm.Event{
         .{ .item = .{ .message = "done" } },
-        .{ .stop = .{ .usage = usage, .model = "claude-sonnet-4-6" } },
+        .{ .stop = .{ .usage = usage, .model = "claude-opus-4-8" } },
     };
     var stream: ScriptedStream = .{ .events = &events };
-    _ = try agent.readReply(&agent.model, &stream, &handler);
+    _ = try agent.readReply(&agent.model.?, &stream, &handler);
 
-    const served = models.get(.anthropic, "claude-sonnet-4-6").?;
-    try std.testing.expectEqual(served.cost(&usage), agent.stats.cost);
-    try std.testing.expectEqual(served.savings(&usage), agent.stats.saved);
-    try std.testing.expectEqualStrings("claude-sonnet-4-6", agent.stats.by_model[0].name);
+    // The requested model served the reply, so its own rates price it.
+    try std.testing.expectEqual(agent.model.?.cost(&usage), agent.stats.cost);
     try std.testing.expectEqual(usage, agent.stats.cache_usage);
 }
 
-// A price at rates Drinky does not know corrupts the ledger silently, so an
-// unknown served model fails the turn with a report that names it. The user
-// adds support for the model instead of reading a wrong total.
-test "readReply fails a reply that an unknown model served" {
+// Drinky knows no rate for a model it did not request, so the reply carries no
+// price and adds nothing to the total. A provider-side fallback must not fail
+// the turn.
+test "readReply keeps a reply that an unknown model served, unpriced" {
     const gpa = std.testing.allocator;
     var agent = scriptedAgent(gpa);
     defer agent.deinit();
@@ -2384,18 +2339,45 @@ test "readReply fails a reply that an unknown model served" {
         .{ .stop = .{ .usage = .{ .output = 1 }, .model = "claude-mythos-5" } },
     };
     var stream: ScriptedStream = .{ .events = &events };
-    try std.testing.expectError(
-        error.UnknownServedModel,
-        agent.readReply(&agent.model, &stream, &handler),
-    );
-    try std.testing.expectEqualStrings(
-        "Drinky does not know the model \"claude-mythos-5\" that served this reply, " ++
-            "so Drinky cannot price it. Use /model to pick another model.",
-        handler.errors.items,
-    );
-    // Nothing was priced, so the ledger holds no number the report contradicts.
-    try std.testing.expectEqual(@as(usize, 0), handler.usage_count);
+    const reply = try agent.readReply(&agent.model.?, &stream, &handler);
+
+    try std.testing.expectEqual(@as(usize, 1), reply.len);
+    try std.testing.expectEqual(@as(usize, 0), handler.errors.items.len);
     try std.testing.expectEqual(@as(f64, 0), agent.stats.cost);
+    // The reply reports the switch, so the user sees which model answered.
+    try std.testing.expectEqualStrings(
+        "claude-opus-4-8 claude-mythos-5\n",
+        handler.model_mismatches.items,
+    );
+}
+
+// A served name arrives from the provider stream unchecked, so it can be longer
+// than a model name Drinky holds. Such a name states no rate either, so the
+// rates of the requested model must never price its reply.
+test "readReply keeps a reply that a model with an over-long name served" {
+    const gpa = std.testing.allocator;
+    var agent = scriptedAgent(gpa);
+    defer agent.deinit();
+    var handler: CaptureHandler = .{ .gpa = gpa };
+    defer handler.deinit();
+
+    const served = "c" ** (Model.name_bytes_max + 1);
+    // The requested model prices this usage, so a fallback to it is visible.
+    try std.testing.expect(agent.model.?.price != null);
+    try std.testing.expect(pricingModel(&agent.model.?, served).price == null);
+
+    const events = [_]llm.Event{
+        .{ .item = .{ .message = "done" } },
+        .{ .stop = .{ .usage = .{ .output = 1_000_000 }, .model = served } },
+    };
+    var stream: ScriptedStream = .{ .events = &events };
+    _ = try agent.readReply(&agent.model.?, &stream, &handler);
+
+    try std.testing.expectEqual(@as(f64, 0), agent.stats.cost);
+    try std.testing.expectEqualStrings(
+        "claude-opus-4-8 " ++ served ++ "\n",
+        handler.model_mismatches.items,
+    );
 }
 
 // The name and the argument fragments of a tool call are display only. They
@@ -2420,7 +2402,7 @@ test "readReply streams a tool call's name and arguments for display alone" {
         .{ .stop = .{ .usage = .{ .output = 3 } } },
     };
     var stream: ScriptedStream = .{ .events = &events };
-    const reply = try agent.readReply(&agent.model, &stream, &handler);
+    const reply = try agent.readReply(&agent.model.?, &stream, &handler);
 
     try std.testing.expectEqualStrings("read {\"path\":\"x\"}", handler.streamed_tools.items);
     try std.testing.expectEqual(@as(usize, 1), reply.len);
@@ -2448,7 +2430,7 @@ test "readReply records terminal usage before rejecting an invalid reply" {
         var stream: ScriptedStream = .{ .events = &events };
         try std.testing.expectError(
             error.IncompleteReply,
-            agent.readReply(&agent.model, &stream, &handler),
+            agent.readReply(&agent.model.?, &stream, &handler),
         );
         try std.testing.expectEqual(@as(u64, 17), agent.stats.cache_usage.input);
         try std.testing.expectEqual(@as(usize, 1), handler.usage_count);
@@ -2467,7 +2449,7 @@ test "readReply records terminal usage before rejecting an invalid reply" {
         var stream: ScriptedStream = .{ .events = &events };
         try std.testing.expectError(
             error.EmptyReply,
-            agent.readReply(&agent.model, &stream, &handler),
+            agent.readReply(&agent.model.?, &stream, &handler),
         );
         try std.testing.expectEqual(@as(u64, 23), agent.stats.cache_usage.output);
         try std.testing.expectEqual(@as(usize, 1), handler.usage_count);
@@ -2491,7 +2473,7 @@ test "readReply records terminal usage before rejecting an invalid reply" {
         var stream: ScriptedStream = .{ .events = &events };
         try std.testing.expectError(
             error.IncompleteReply,
-            agent.readReply(&agent.model, &stream, &handler),
+            agent.readReply(&agent.model.?, &stream, &handler),
         );
         try std.testing.expectEqual(events.len, stream.index);
         try std.testing.expectEqual(@as(u64, 29), agent.stats.cache_usage.cache_read);
@@ -2513,7 +2495,7 @@ test "readReply rejects a terminal response with no assistant items" {
 
     try std.testing.expectError(
         error.EmptyReply,
-        agent.readReply(&agent.model, &stream, &handler),
+        agent.readReply(&agent.model.?, &stream, &handler),
     );
     try std.testing.expectEqual(@as(u64, 3), agent.stats.cache_usage.output);
     try std.testing.expectEqual(@as(usize, 1), handler.usage_count);
@@ -2545,7 +2527,7 @@ test "a failed reply attempt reclaims its transient allocations" {
     // handler buffers) so the measured window isolates per-attempt retention.
     handler.text.clearRetainingCapacity();
     var warmup: ScriptedStream = .{ .events = &events, .terminal_error = error.Timeout };
-    try std.testing.expectError(error.Timeout, agent.readReply(&agent.model, &warmup, &handler));
+    try std.testing.expectError(error.Timeout, agent.readReply(&agent.model.?, &warmup, &handler));
     try std.testing.expectEqual(@as(usize, 0), agent.items.items.len);
     const settled = failing.allocated_bytes - failing.freed_bytes;
 
@@ -2555,7 +2537,7 @@ test "a failed reply attempt reclaims its transient allocations" {
         var stream: ScriptedStream = .{ .events = &events, .terminal_error = error.Timeout };
         try std.testing.expectError(
             error.Timeout,
-            agent.readReply(&agent.model, &stream, &handler),
+            agent.readReply(&agent.model.?, &stream, &handler),
         );
         try std.testing.expectEqual(@as(usize, 0), agent.items.items.len);
     }
@@ -2592,7 +2574,7 @@ test "rollback frees every item appended since the base" {
         .{ .stop = .{ .usage = .{} } },
     };
     var stream: ScriptedStream = .{ .events = &events };
-    const reply = try agent.readReply(&agent.model, &stream, &handler);
+    const reply = try agent.readReply(&agent.model.?, &stream, &handler);
     try std.testing.expectEqual(@as(usize, 3), reply.len);
     try std.testing.expect(agent.items.items.len > base);
 
@@ -2628,7 +2610,7 @@ fn readReplyUnderOom(allocator: std.mem.Allocator) !void {
         .{ .stop = .{ .usage = .{ .output = 5 } } },
     };
     var stream: ScriptedStream = .{ .events = &events };
-    _ = try agent.readReply(&agent.model, &stream, &handler);
+    _ = try agent.readReply(&agent.model.?, &stream, &handler);
 }
 
 fn readOpenAiReasoningUnderOom(allocator: std.mem.Allocator) !void {
@@ -2646,7 +2628,7 @@ fn readOpenAiReasoningUnderOom(allocator: std.mem.Allocator) !void {
         .{ .stop = .{ .usage = .{} } },
     };
     var stream: ScriptedStream = .{ .events = &events };
-    _ = try agent.readReply(&agent.model, &stream, &handler);
+    _ = try agent.readReply(&agent.model.?, &stream, &handler);
 }
 
 test "readReply frees partial work at every allocation-failure point" {
@@ -2681,7 +2663,7 @@ test "readReply accepts Anthropic message_stop without waiting for later traffic
     var handler: CaptureHandler = .{ .gpa = std.testing.allocator };
     defer handler.deinit();
 
-    const reply = try agent.readReply(&agent.model, &stream, &handler);
+    const reply = try agent.readReply(&agent.model.?, &stream, &handler);
     try std.testing.expectEqual(@as(usize, 1), reply.len);
     try std.testing.expectEqualStrings("done", reply[0].message.text);
     try std.testing.expectEqual(@as(u64, 10), agent.stats.cache_usage.input);
@@ -2711,7 +2693,7 @@ test "readReply accepts OpenAI completion without consuming its done sentinel" {
     var handler: CaptureHandler = .{ .gpa = std.testing.allocator };
     defer handler.deinit();
 
-    const reply = try agent.readReply(&agent.model, &stream, &handler);
+    const reply = try agent.readReply(&agent.model.?, &stream, &handler);
     try std.testing.expectEqual(@as(usize, 1), reply.len);
     try std.testing.expectEqualStrings("done", reply[0].message.text);
     try std.testing.expectEqual(@as(u64, 10), agent.stats.cache_usage.input);
@@ -2742,7 +2724,7 @@ test "provider rejections retain terminal usage before failing the reply" {
 
         try std.testing.expectError(
             error.UnsupportedReply,
-            agent.readReply(&agent.model, &stream, &handler),
+            agent.readReply(&agent.model.?, &stream, &handler),
         );
         try std.testing.expectEqual(@as(u64, 11), agent.stats.cache_usage.input);
         try std.testing.expectEqual(@as(u64, 7), agent.stats.cache_usage.output);
@@ -2765,7 +2747,7 @@ test "provider rejections retain terminal usage before failing the reply" {
 
         try std.testing.expectError(
             error.UnsupportedReply,
-            agent.readReply(&agent.model, &stream, &handler),
+            agent.readReply(&agent.model.?, &stream, &handler),
         );
         try std.testing.expectEqual(@as(u64, 13), agent.stats.cache_usage.input);
         try std.testing.expectEqual(@as(u64, 5), agent.stats.cache_usage.output);
@@ -2793,7 +2775,7 @@ test "provider rejections retain terminal usage before failing the reply" {
 
         try std.testing.expectError(
             error.IncompleteReply,
-            agent.readReply(&agent.model, &stream, &handler),
+            agent.readReply(&agent.model.?, &stream, &handler),
         );
         try std.testing.expectEqual(@as(u64, 17), agent.stats.cache_usage.input);
         try std.testing.expectEqual(@as(u64, 3), agent.stats.cache_usage.output);
@@ -2832,7 +2814,7 @@ test "readReply separates OpenAI reasoning summary parts with a blank line" {
     var handler: CaptureHandler = .{ .gpa = std.testing.allocator };
     defer handler.deinit();
 
-    const reply = try agent.readReply(&agent.model, &stream, &handler);
+    const reply = try agent.readReply(&agent.model.?, &stream, &handler);
     try std.testing.expectEqual(@as(usize, 1), reply.len);
     try std.testing.expectEqualStrings("a\n\nb", reply[0].reasoning.replay.openai_api.text);
     try std.testing.expectEqual(
@@ -2872,7 +2854,7 @@ test "readReply separates a redacted Anthropic block from the reasoning before i
     var handler: CaptureHandler = .{ .gpa = std.testing.allocator };
     defer handler.deinit();
 
-    const reply = try agent.readReply(&agent.model, &stream, &handler);
+    const reply = try agent.readReply(&agent.model.?, &stream, &handler);
     try std.testing.expectEqual(@as(usize, 2), reply.len);
     try std.testing.expectEqualStrings(
         "weigh it",
@@ -2903,7 +2885,7 @@ test "readReply rejects provider EOF before text completion" {
 
         try std.testing.expectError(
             error.IncompleteReply,
-            agent.readReply(&agent.model, &stream, &handler),
+            agent.readReply(&agent.model.?, &stream, &handler),
         );
         try std.testing.expectEqual(@as(usize, 0), agent.items.items.len);
         try std.testing.expectEqual(@as(usize, 0), handler.usage_count);
@@ -2921,7 +2903,7 @@ test "readReply rejects provider EOF before text completion" {
 
         try std.testing.expectError(
             error.IncompleteReply,
-            agent.readReply(&agent.model, &stream, &handler),
+            agent.readReply(&agent.model.?, &stream, &handler),
         );
         try std.testing.expectEqual(@as(usize, 0), agent.items.items.len);
         try std.testing.expectEqual(@as(usize, 0), handler.usage_count);
@@ -2991,7 +2973,7 @@ test "readReply assembles a reasoning run, answer, and tool call in stream order
     };
     var stream: ScriptedStream = .{ .events = &events };
 
-    const reply = try agent.readReply(&agent.model, &stream, &handler);
+    const reply = try agent.readReply(&agent.model.?, &stream, &handler);
     try std.testing.expectEqual(@as(usize, 3), reply.len);
     try std.testing.expectEqualStrings(
         "weigh it",
@@ -3032,7 +3014,7 @@ test "readReply keeps a redacted block and a signature-only run in order" {
     };
     var stream: ScriptedStream = .{ .events = &events };
 
-    const reply = try agent.readReply(&agent.model, &stream, &handler);
+    const reply = try agent.readReply(&agent.model.?, &stream, &handler);
     try std.testing.expectEqual(@as(usize, 3), reply.len);
     try std.testing.expectEqualStrings(
         "enc",
@@ -3069,7 +3051,7 @@ test "readReply commits trailing text after the final tool in stream order" {
     };
     var stream: ScriptedStream = .{ .events = &events };
 
-    const reply = try agent.readReply(&agent.model, &stream, &handler);
+    const reply = try agent.readReply(&agent.model.?, &stream, &handler);
     try std.testing.expectEqual(@as(usize, 2), reply.len);
     try std.testing.expectEqualStrings("t1", reply[0].tool_call.call_id);
     try std.testing.expectEqualStrings("after", reply[1].message.text);
@@ -3114,7 +3096,7 @@ test "readReply keeps adjacent reasoning runs as separate items in stream order"
     };
     var stream: ScriptedStream = .{ .events = &events };
 
-    const reply = try agent.readReply(&agent.model, &stream, &handler);
+    const reply = try agent.readReply(&agent.model.?, &stream, &handler);
     try std.testing.expectEqual(@as(usize, 5), reply.len);
     try std.testing.expectEqualStrings("A", reply[0].reasoning.replay.openai_api.text);
     try std.testing.expectEqualStrings(
@@ -3157,7 +3139,7 @@ test "readReply binds reasoning proof to the active account" {
         .{ .stop = .{ .usage = .{} } },
     };
     var stream: ScriptedStream = .{ .events = &events };
-    const reply = try agent.readReply(&agent.model, &stream, &handler);
+    const reply = try agent.readReply(&agent.model.?, &stream, &handler);
     try std.testing.expectEqual(@as(usize, 2), reply.len);
     try std.testing.expectEqual(
         llm.Account.openai_api,
@@ -3186,9 +3168,9 @@ test "dropReasoning invalidates only the replaced account slot" {
         .{ .stop = .{ .usage = .{} } },
     };
     var anthropic_stream: ScriptedStream = .{ .events = &anthropic_events };
-    _ = try agent.readReply(&agent.model, &anthropic_stream, &handler);
+    _ = try agent.readReply(&agent.model.?, &anthropic_stream, &handler);
 
-    const openai_model = models.get(.openai, "gpt-5.6-sol").?;
+    const openai_model = testing.model("gpt-5.6-sol");
     const openai_client = provider.Client.init(
         gpa,
         std.testing.io,
@@ -3205,7 +3187,7 @@ test "dropReasoning invalidates only the replaced account slot" {
         .{ .stop = .{ .usage = .{} } },
     };
     var openai_stream: ScriptedStream = .{ .events = &openai_events };
-    _ = try agent.readReply(&agent.model, &openai_stream, &handler);
+    _ = try agent.readReply(&agent.model.?, &openai_stream, &handler);
 
     try std.testing.expectEqual(@as(usize, 2), agent.items.items.len);
     seedContext(&agent, 1020);
@@ -3265,7 +3247,7 @@ test "readReply retains a truncated tool-free reply but rejects a truncated tool
             .{ .stop = .{ .usage = .{}, .status = .truncated } },
         };
         var stream: ScriptedStream = .{ .events = &events };
-        const reply = try agent.readReply(&agent.model, &stream, &handler);
+        const reply = try agent.readReply(&agent.model.?, &stream, &handler);
         try std.testing.expectEqual(@as(usize, 1), reply.len);
         try std.testing.expectEqualStrings("half", reply[0].message.text);
     }
@@ -3286,7 +3268,7 @@ test "readReply retains a truncated tool-free reply but rejects a truncated tool
         var stream: ScriptedStream = .{ .events = &events };
         try std.testing.expectError(
             error.IncompleteReply,
-            agent.readReply(&agent.model, &stream, &handler),
+            agent.readReply(&agent.model.?, &stream, &handler),
         );
         try std.testing.expectEqual(@as(usize, 0), agent.items.items.len);
     }
@@ -3309,7 +3291,7 @@ test "readReply validates tool arguments: empty is an object, non-object rejects
             .{ .stop = .{ .usage = .{} } },
         };
         var stream: ScriptedStream = .{ .events = &events };
-        const reply = try agent.readReply(&agent.model, &stream, &handler);
+        const reply = try agent.readReply(&agent.model.?, &stream, &handler);
         try std.testing.expectEqual(@as(usize, 1), reply.len);
         try std.testing.expectEqualStrings("{}", reply[0].tool_call.arguments_json);
     }
@@ -3330,7 +3312,7 @@ test "readReply validates tool arguments: empty is an object, non-object rejects
         var stream: ScriptedStream = .{ .events = &events };
         try std.testing.expectError(
             error.IncompleteReply,
-            agent.readReply(&agent.model, &stream, &handler),
+            agent.readReply(&agent.model.?, &stream, &handler),
         );
         try std.testing.expectEqual(@as(usize, 0), agent.items.items.len);
     }
@@ -3372,7 +3354,7 @@ test "readReply rejects empty and duplicate call identifiers" {
         var stream: ScriptedStream = .{ .events = case.events };
         try std.testing.expectError(
             error.IncompleteReply,
-            agent.readReply(&agent.model, &stream, &handler),
+            agent.readReply(&agent.model.?, &stream, &handler),
         );
         try std.testing.expectEqual(@as(usize, 0), agent.items.items.len);
     }
@@ -3394,7 +3376,7 @@ test "readReply rejects incomplete or invalid reasoning proof" {
         var stream: ScriptedStream = .{ .events = &events };
         try std.testing.expectError(
             error.EmptyReply,
-            agent.readReply(&agent.model, &stream, &handler),
+            agent.readReply(&agent.model.?, &stream, &handler),
         );
         try std.testing.expectEqual(@as(usize, 0), agent.items.items.len);
     }
@@ -3416,7 +3398,7 @@ test "readReply rejects incomplete or invalid reasoning proof" {
         var stream: ScriptedStream = .{ .events = &events };
         try std.testing.expectError(
             error.IncompleteReply,
-            agent.readReply(&agent.model, &stream, &handler),
+            agent.readReply(&agent.model.?, &stream, &handler),
         );
         try std.testing.expectEqual(@as(usize, 0), agent.items.items.len);
     }
@@ -3433,7 +3415,7 @@ test "readReply rejects incomplete or invalid reasoning proof" {
         var stream: ScriptedStream = .{ .events = &events };
         try std.testing.expectError(
             error.IncompleteReply,
-            agent.readReply(&agent.model, &stream, &handler),
+            agent.readReply(&agent.model.?, &stream, &handler),
         );
         try std.testing.expectEqual(@as(usize, 0), agent.items.items.len);
     }
@@ -3902,7 +3884,7 @@ test "only a committed reply measures the context, while any prompt rates the ca
         var stream: ScriptedStream = .{ .events = &rejected_events };
         try std.testing.expectError(
             error.IncompleteReply,
-            agent.readReply(&agent.model, &stream, &handler),
+            agent.readReply(&agent.model.?, &stream, &handler),
         );
         try std.testing.expectEqual(@as(?u64, 0), agent.stats.context_tokens);
         try std.testing.expectEqual(rejected, agent.stats.cache_usage);
@@ -3923,7 +3905,7 @@ test "only a committed reply measures the context, while any prompt rates the ca
             .{ .stop = .{ .usage = uncommitted } },
         };
         var stream: ScriptedStream = .{ .events = &events };
-        _ = try agent.readReply(&agent.model, &stream, &handler);
+        _ = try agent.readReply(&agent.model.?, &stream, &handler);
         try std.testing.expectEqual(@as(?u64, 130), agent.stats.context_tokens);
         try std.testing.expectEqual(uncommitted, agent.stats.cache_usage);
     }
@@ -4127,7 +4109,6 @@ test "run retries a streamed transient API error" {
     try std.testing.expectEqual(@as(usize, 1), log.count);
     try std.testing.expectEqual(@as(u64, 5000), log.slept_ms[0]);
     try std.testing.expectEqual(@as(usize, 2), agent.items.items.len);
-    try std.testing.expectEqual(@as(u64, 7), agent.stats.by_model[0].usage.input);
 }
 
 test "run surfaces the failure once the attempt bound is exhausted" {
@@ -4808,8 +4789,9 @@ test "a cancel during the post-stop usage callback books terminal usage only onc
     } }} };
     const outcome = agent.runTurnWith(&fetch, fake_tools, "go", &handler);
     try std.testing.expect(std.meta.activeTag(outcome.disposition) == .canceled);
-    // Recorded exactly once: opus prices 1M input at $5, so 1000 input is $0.005.
-    try std.testing.expectApproxEqAbs(@as(f64, 0.005), agent.stats.cost, 1e-9);
+    // Recorded exactly once: the model prices 1M input at $3, so 1000 input
+    // is $0.003.
+    try std.testing.expectApproxEqAbs(@as(f64, 0.003), agent.stats.cost, 1e-9);
     try std.testing.expectEqual(@as(u64, 1000), agent.stats.cache_usage.input);
 }
 

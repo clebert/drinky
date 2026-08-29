@@ -35,9 +35,14 @@ pub const Info = struct {
     /// The prompt usage of the last request under the active cache key. An
     /// all-zero prompt hides the cache rate.
     cache_usage: ai.llm.Usage,
+    /// The session cost at public rates. It is an estimate, and a subscription
+    /// pays none of it.
     cost: f64,
-    context_window: u64,
-    model: []const u8,
+    /// The context limit of the active model, or null when no source stated one.
+    /// The gauge then shows the tokens alone.
+    context_window: ?u64,
+    /// The active model, or null when the account offers none yet.
+    model: ?[]const u8,
     effort: []const u8,
     /// The active account. Null shows "Account: Signed out" instead of the
     /// model, account, and effort.
@@ -90,6 +95,8 @@ pub const directory_bytes_max = 96;
 
 /// The right-side indicator shown while no account is active.
 const signed_out_label = "Account: Signed out";
+/// The model slot of an account that offers no model yet.
+const no_model_label = "No model";
 
 const account_open = " (";
 const account_close = ")";
@@ -299,7 +306,8 @@ pub fn render(placement: *const paint.Placement, info: *const Info) !void {
 
     // Sized so `catch unreachable` is sound. The branch can fill one bounded
     // `HEAD` file. The remaining space holds the directory and every number.
-    // The compiled tables bound the model name and the account label.
+    // `ai.Model.name_bytes_max` bounds the model name, and the account label,
+    // the effort level, and every separator are compiled strings.
     var left_scratch: [ai.project.head_name_bytes_max + 512]u8 = undefined;
     var right_scratch: [192]u8 = undefined;
     var parts: Parts = .all;
@@ -343,8 +351,27 @@ pub fn render(placement: *const paint.Placement, info: *const Info) !void {
 fn writeRight(line: *Line, info: *const Info, parts: *const Parts) !void {
     const account = info.account orelse return line.out.writeAll(signed_out_label);
     const model_start = line.offset();
-    try line.out.writeAll(info.model);
+    const model = info.model orelse {
+        // An account with no model can run nothing, and the user passes that
+        // state by fetching a list, so it warns rather than fails.
+        try line.out.writeAll(no_model_label);
+        line.mark(model_start, .warning);
+        try writeAccountAndEffort(line, info, parts, account);
+        return;
+    };
+    try line.out.writeAll(model);
     line.mark(model_start, .text);
+    try writeAccountAndEffort(line, info, parts, account);
+}
+
+/// The bracketed account and the effort level, which follow the model whether
+/// the account offers one or not.
+fn writeAccountAndEffort(
+    line: *Line,
+    info: *const Info,
+    parts: *const Parts,
+    account: ai.llm.Account,
+) !void {
     if (parts.account) {
         try line.out.writeAll(account_open);
         try line.out.writeAll(account.label());
@@ -368,9 +395,11 @@ fn writeLeft(line: *Line, info: *const Info, parts: *const Parts) !void {
     }
     try writeContext(line, info, parts.context);
     if (parts.cost) {
-        // Session cost uses public API rates. It is an estimate because the login
-        // type does not reveal billing.
-        try line.out.print("{s}Cost: ${d:.2}", .{ separator, info.cost });
+        // The cost is an estimate at public rates, so the tilde marks it: the
+        // login type does not reveal the billing, a subscription pays none of
+        // it, and a reply that Drinky could not price counts nothing. Every
+        // cost figure of Drinky takes this one mark.
+        try line.out.print("{s}Cost: ~${d:.2}", .{ separator, info.cost });
     }
     // The quota and the cache rate each measure one request, so they belong to
     // a running turn alone. A spent OpenAI subscription still names its plan and
@@ -477,8 +506,15 @@ fn writeBranch(out: *std.Io.Writer, branch: []const u8, form: Parts.Branch) !voi
 /// leaves no valid measurement, because a tokenizer belongs to its model.
 fn writeContext(line: *Line, info: *const Info, form: Parts.Context) !void {
     const context = info.context_tokens orelse return line.out.writeAll("Context: Unknown");
-    const percent = if (info.context_window > 0)
-        asFloat(context) / asFloat(info.context_window) * 100.0
+    // A model whose limit no source states shows the tokens alone. The share
+    // and its pressure color need a limit, and Drinky states no figure it
+    // cannot know.
+    const window = info.context_window orelse {
+        try line.out.writeAll("Context: ");
+        return writeTokens(&line.out, context);
+    };
+    const percent = if (window > 0)
+        asFloat(context) / asFloat(window) * 100.0
     else
         0.0;
     // The line prints the rounded share and colors that same number, so a row
@@ -490,7 +526,7 @@ fn writeContext(line: *Line, info: *const Info, form: Parts.Context) !void {
         try line.out.writeAll(" (");
         try writeTokens(&line.out, context);
         try line.out.writeByte('/');
-        try writeTokens(&line.out, info.context_window);
+        try writeTokens(&line.out, window);
         try line.out.writeByte(')');
     }
     line.mark(start, pressureRole(info.gauge, shown));
@@ -672,7 +708,7 @@ test render {
     try expectShows(painted, &.{
         "~/github/clebert/drinky (main)",
         "Context: 21% (206k/1.0M)",
-        "Cost: $0.39",
+        "Cost: ~$0.39",
         // The shortest window prints first, each with the share it used and the
         // wait until it starts again.
         "5h: 12% (53m) · Week: 74% (6d)",
@@ -743,24 +779,24 @@ test "a narrow window shortens fields before it gives up parts" {
         .{
             // Both countdowns go together, so the two windows always read alike.
             .columns = 140,
-            .shows = &.{ "Cost: $0.39", "5h: 12%", "Week: 74%", "Cache: 87%" },
+            .shows = &.{ "Cost: ~$0.39", "5h: 12%", "Week: 74%", "Cache: 87%" },
             .hides = &.{ "(53m)", "(6d)" },
         },
         .{
             .columns = 130,
-            .shows = &.{ "Cost: $0.39", "5h: 12%", "Week: 74%" },
+            .shows = &.{ "Cost: ~$0.39", "5h: 12%", "Week: 74%" },
             .hides = &.{"Cache:"},
         },
         .{
             // The longest window goes first.
             .columns = 115,
-            .shows = &.{ "Cost: $0.39", "5h: 12%" },
+            .shows = &.{ "Cost: ~$0.39", "5h: 12%" },
             .hides = &.{ "Week:", "Cache:" },
         },
         .{
             // The session cost outlives every measurement of one request.
             .columns = 105,
-            .shows = &.{ "~/…/drinky (main)", "Cost: $0.39", "Anthropic Subscription" },
+            .shows = &.{ "~/…/drinky (main)", "Cost: ~$0.39", "Anthropic Subscription" },
             .hides = &.{ "5h:", "Week:", "Cache:" },
         },
         .{
@@ -965,13 +1001,13 @@ test "a long branch keeps 16 columns and a whole grapheme" {
     defer out.deinit();
     // The width that the shortened branch needs, and one column less than the
     // whole branch needs.
-    try renderForTest(gpa, &info, 174, &out);
+    try renderForTest(gpa, &info, 175, &out);
 
     const painted = out.written();
     try expectShows(painted, &.{
         "~/…/drinky (feature/" ++ "🇩🇪" ** 4 ++ "…)",
         "Context: 21% (206k/1.0M)",
-        "Cost: $0.39",
+        "Cost: ~$0.39",
         "5h: 12% (53m)",
         "Week: 74% (6d)",
         "Cache: 87%",
@@ -1059,6 +1095,41 @@ test "a signed-out status shows the indicator in place of the model" {
     try expectShows(painted, &.{"Account: Signed out"});
     // No prompt tokens sent yet: the cache figure is absent, never a 0/0 rate.
     try expectHides(painted, &.{ "claude-opus-4-8", "Effort:", "Cache" });
+}
+
+// Drinky compiles no model in, so a signed-in account can offer none. The slot
+// names that state and warns, because the user passes it with one fetch.
+test "an account with no model shows the label in the warning role" {
+    const gpa = std.testing.allocator;
+    var info = test_info;
+    info.model = null;
+    info.context_window = null;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try renderForTest(gpa, &info, 200, &out);
+
+    const painted = out.written();
+    try expectShows(painted, &.{
+        comptime role.sequence(.warning) ++ "No model",
+        " (Anthropic Subscription) · Effort: ",
+        "xhigh",
+    });
+    try expectHides(painted, &.{"claude-opus-4-8"});
+}
+
+// A share needs a limit. A model whose window no source states shows the tokens
+// alone, because Drinky states no figure it cannot know.
+test "an unknown context window shows the tokens with no share" {
+    const gpa = std.testing.allocator;
+    var info = test_info;
+    info.context_window = null;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try renderForTest(gpa, &info, 200, &out);
+
+    const painted = out.written();
+    try expectShows(painted, &.{"Context: 206k"});
+    try expectHides(painted, &.{ "Context: 21%", "206k/1.0M" });
 }
 
 test "quota windows show the used share, labeled by length" {
@@ -1158,7 +1229,7 @@ test "the quota and the cache rate show while a turn runs alone" {
     // Both measure one request. The place, the context gauge, and the session
     // cost describe a state that outlives the turn, so they stay.
     const painted = out.written();
-    try expectShows(painted, &.{ "~/github/clebert/drinky (main)", "Context: 21%", "Cost: $0.39" });
+    try expectShows(painted, &.{ "~/github/clebert/drinky (main)", "Context: 21%", "Cost: ~$0.39" });
     try expectHides(painted, &.{ "5h:", "Week:", "Cache:" });
 }
 

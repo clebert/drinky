@@ -38,8 +38,8 @@ pub fn select(context: *Context, index: usize) !Context.Outcome {
             "{s} is already the active account.",
             .{account.label()},
         );
-    // Authenticated but inactive: the app performs the switch so the configured
-    // default model applies, exactly as in a startup on this account.
+    // Authenticated but inactive: the app performs the switch so the model that
+    // account ran last applies, exactly as in a startup on this account.
     if (context.accounts.isAuthenticated(account)) return .{ .switch_account = account };
     if (account.hasLogin()) return .{ .login = account };
     return Context.Outcome.reportNotice(
@@ -65,6 +65,7 @@ fn isActive(context: *const Context, account: llm.Account) bool {
 test "the picker lists every account, marking the active and authenticated ones" {
     const gpa = std.testing.allocator;
     var accounts = testing.accounts(.{ .anthropic = "sk-ant" }, .{ .anthropic = true });
+    defer testing.deinitAccounts(&accounts);
     var agent = testing.agent(gpa, .{ .anthropic_api = "sk-ant" });
     defer agent.deinit();
     var context: Context = .{ .gpa = gpa, .io = undefined, .agent = &agent, .accounts = &accounts };
@@ -94,6 +95,7 @@ test "the picker lists every account, marking the active and authenticated ones"
 test "select starts login, instructs an API account, and no-ops the active one" {
     const gpa = std.testing.allocator;
     var accounts = testing.accounts(.{ .anthropic = "sk-ant" }, .{});
+    defer testing.deinitAccounts(&accounts);
     var agent = testing.agent(gpa, .{ .anthropic_api = "sk-ant" });
     defer agent.deinit();
     var context: Context = .{ .gpa = gpa, .io = undefined, .agent = &agent, .accounts = &accounts };
@@ -122,6 +124,7 @@ test "select starts login, instructs an API account, and no-ops the active one" 
 test "select never re-runs the login for the active subscription" {
     const gpa = std.testing.allocator;
     var accounts = testing.accounts(.{}, .{ .anthropic = true });
+    defer testing.deinitAccounts(&accounts);
     var agent = testing.agent(gpa, .{ .anthropic_subscription = undefined });
     defer agent.deinit();
     var context: Context = .{ .gpa = gpa, .io = undefined, .agent = &agent, .accounts = &accounts };
@@ -137,6 +140,7 @@ test "select never re-runs the login for the active subscription" {
 test "select hands an authenticated but inactive account to the app to switch" {
     const gpa = std.testing.allocator;
     var accounts = testing.accounts(.{ .anthropic = "sk-ant" }, .{ .anthropic = true });
+    defer testing.deinitAccounts(&accounts);
     var agent = testing.agent(gpa, .{ .anthropic_api = "sk-ant" });
     defer agent.deinit();
     var context: Context = .{ .gpa = gpa, .io = undefined, .agent = &agent, .accounts = &accounts };

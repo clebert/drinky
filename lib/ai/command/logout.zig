@@ -86,6 +86,7 @@ test "the picker lists only signed-in accounts, and none reports an error" {
 test "select names the chosen signed-in account, rejecting out of range" {
     const gpa = std.testing.allocator;
     var accounts = testing.accounts(.{ .anthropic = "sk-ant" }, .{ .anthropic = true });
+    defer testing.deinitAccounts(&accounts);
     var context: Context = .{
         .gpa = gpa,
         .io = undefined,

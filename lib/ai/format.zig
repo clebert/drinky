@@ -22,6 +22,19 @@ pub fn bytes(buffer: []u8, count: usize) []const u8 {
     }) catch unreachable;
 }
 
+/// The `s` that a plural needs, and an empty string for a count of one. Every
+/// sentence that counts a thing reads it from here, so no line states a count
+/// of one in the plural.
+pub fn pluralSuffix(count: u64) []const u8 {
+    return if (count == 1) "" else "s";
+}
+
+test pluralSuffix {
+    try std.testing.expectEqualStrings("s", pluralSuffix(0));
+    try std.testing.expectEqualStrings("", pluralSuffix(1));
+    try std.testing.expectEqualStrings("s", pluralSuffix(2));
+}
+
 /// The two roots a shown path is measured against. Either can be empty when the
 /// host does not know it, which leaves every path as it is.
 pub const Roots = struct {

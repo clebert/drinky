@@ -57,12 +57,6 @@ decision already taken, or a dependency on another entry. Module layout and exte
   ledger, not in history items. Billing is per request. History must stay byte-stable for cache
   hits. A canceled turn's reply rolls back out of history. Canceled and failed turns get their own
   entries, so cost survives `/handoff` compaction._
-- **Runtime model overrides** — an optional `~/.drinky/models.json` extends the compiled model table
-  and adds an OpenAI-compatible endpoint, without a rebuild. _The noun `model catalog` belongs to
-  the ChatGPT catalog in `lib/ai/openai/ModelCatalog.zig`, so this file is the model override file.
-  Compiled defaults stay authoritative, so a known model always has a known context window. The file
-  patches or adds alone. The endpoint form opens local and third-party models: ds4, qwen 3.6 27b,
-  qwen 3.8 27b, gemma4, glimmer._
 - **`/sources`** — a full-window page lists every instruction file, every skill, and every path rule
   that Drinky discovered at startup. _The page covers the guidance sources alone and holds no file
   content. It expands the startup counts line, and that line stays unchanged. It names each

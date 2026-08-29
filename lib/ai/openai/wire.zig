@@ -7,11 +7,9 @@ const std = @import("std");
 
 const json = @import("../json.zig");
 const llm = @import("../llm.zig");
-const models = @import("../models.zig");
 
 /// Serialize `request` into an owned JSON body. Caller frees the result.
-/// `account` keys the per-model effort lookup and guards which stored
-/// reasoning items are replayed (see `writeItem`).
+/// `account` guards which stored reasoning items are replayed (see `writeItem`).
 pub fn serialize(gpa: std.mem.Allocator, request: *const llm.Request, account: llm.Account) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
@@ -35,9 +33,9 @@ pub fn serialize(gpa: std.mem.Allocator, request: *const llm.Request, account: l
         try stringify.write(request.cache_key);
     }
 
-    // Steer reasoning depth with the named effort. A null resolution (an
-    // unknown model) omits the config.
-    if (effortName(request, account)) |effort| {
+    // Steer reasoning depth with the control the request carries. A request
+    // that carries none omits the config.
+    if (effortName(request)) |effort| {
         try stringify.objectField("reasoning");
         try stringify.write(Reasoning{ .effort = effort });
     }
@@ -80,14 +78,13 @@ pub fn serialize(gpa: std.mem.Allocator, request: *const llm.Request, account: l
     return out.toOwnedSlice();
 }
 
-/// Resolve the request through the model's effort map. An unknown model omits
-/// the reasoning control.
-fn effortName(request: *const llm.Request, account: llm.Account) ?[]const u8 {
-    const model = models.get(account.provider(), request.model) orelse return null;
-    return switch (model.effort.resolve(request.effort)) {
+/// The wire name of the resolved control. OpenAI states "stop reasoning" as a
+/// level of its own, so the off control renders as a name like any other.
+fn effortName(request: *const llm.Request) ?[]const u8 {
+    return switch (request.reasoning) {
         .omitted => null,
         .disabled => "none",
-        .named => |name| name,
+        .named => |level| @tagName(level),
     };
 }
 
@@ -234,7 +231,7 @@ test serialize {
         .system = "be terse",
         .items = &items,
         .tools = &tools,
-        .effort = .high,
+        .reasoning = .{ .named = .high },
     }, .openai_api);
     defer std.testing.allocator.free(body);
 
@@ -278,7 +275,9 @@ test serialize {
     try std.testing.expectEqualStrings("path", schema.get("required").?.array.items[0].string);
 }
 
-test "effort none uses the provider's named off level" {
+// OpenAI states "stop reasoning" as a level of its own, so the off control
+// renders as a name like any other.
+test "the off control renders as the named none level" {
     const items = [_]llm.Item{.{ .message = .{ .role = .user, .text = "hi" } }};
     const body = try serialize(std.testing.allocator, &.{
         .model = "gpt-5.6-sol",
@@ -286,7 +285,7 @@ test "effort none uses the provider's named off level" {
         .system = "s",
         .items = &items,
         .tools = &.{},
-        .effort = .none,
+        .reasoning = .disabled,
     }, .openai_api);
     defer std.testing.allocator.free(body);
 
@@ -459,7 +458,7 @@ test "reasoning replays only the active account's complete proof" {
     try std.testing.expectEqualStrings("message", input[1].object.get("type").?.string);
 }
 
-test "assistant text uses output_text, unknown model omits reasoning" {
+test "assistant text uses output_text, and no control omits reasoning" {
     const items = [_]llm.Item{
         .{ .message = .{ .role = .assistant, .text = "prior turn" } },
     };
@@ -469,13 +468,13 @@ test "assistant text uses output_text, unknown model omits reasoning" {
         .system = "s",
         .items = &items,
         .tools = &.{},
-        .effort = .high,
     }, .openai_api);
     defer std.testing.allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
     defer parsed.deinit();
     const root = parsed.value.object;
+    // The request carries no control, so it names no reasoning at all.
     try std.testing.expect(root.get("reasoning") == null);
     const content =
         root.get("input").?.array.items[0].object.get("content").?.array.items[0].object;
@@ -534,7 +533,7 @@ test "serialized bytes match the expected Responses wire output" {
         .system = "be terse",
         .items = &golden_items,
         .tools = &tools,
-        .effort = .xhigh,
+        .reasoning = .{ .named = .xhigh },
     }, .openai_api);
     defer std.testing.allocator.free(body);
     try std.testing.expectEqualStrings(golden, body);

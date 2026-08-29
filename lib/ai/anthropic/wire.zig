@@ -6,7 +6,6 @@ const std = @import("std");
 
 const json = @import("../json.zig");
 const llm = @import("../llm.zig");
-const models = @import("../models.zig");
 
 /// The exact leading identity the Claude Code compatibility path expects. Both
 /// the subscription and the Console account send it, so the Console key reaches
@@ -44,21 +43,20 @@ pub fn serialize(gpa: std.mem.Allocator, request: *const llm.Request, account: l
     try stringify.objectField("stream");
     try stringify.write(true);
 
-    // The model map selects no control, an explicit off control, or adaptive
-    // thinking with a named effort.
-    const effort = effortResolution(request);
-    const emit_thinking = effort.replaysReasoning(.anthropic);
-    switch (effort) {
+    // The request carries no control, an explicit off control, or adaptive
+    // thinking with a named level. The Agent resolved it against the model.
+    const emit_thinking = request.reasoning.replaysReasoning(.anthropic);
+    switch (request.reasoning) {
         .omitted => {},
         .disabled => {
             try stringify.objectField("thinking");
             try stringify.write(DisabledThinking{});
         },
-        .named => |name| {
+        .named => |level| {
             try stringify.objectField("thinking");
             try stringify.write(AdaptiveThinking{});
             try stringify.objectField("output_config");
-            try stringify.write(OutputConfig{ .effort = name });
+            try stringify.write(OutputConfig{ .effort = @tagName(level) });
         },
     }
 
@@ -112,13 +110,6 @@ pub fn serialize(gpa: std.mem.Allocator, request: *const llm.Request, account: l
     try stringify.endObject();
 
     return out.toOwnedSlice();
-}
-
-/// Resolve the request through the model's effort map. An unknown model omits
-/// the reasoning control.
-fn effortResolution(request: *const llm.Request) models.Model.EffortMap.Resolution {
-    const model = models.get(.anthropic, request.model) orelse return .omitted;
-    return model.effort.resolve(request.effort);
 }
 
 /// JSON bytes written through verbatim rather than re-encoded as a quoted
@@ -454,48 +445,65 @@ test "cache_control marks the system prompt, last tool, and last message block" 
     try std.testing.expect(last_blocks[1].object.get("cache_control") != null);
 }
 
-test "effort is dropped for a model with no table entry" {
-    // This proves the level resolves through the per-model table, not from @tagName.
+test "every reasoning control renders its own block" {
+    const gpa = std.testing.allocator;
     const items = [_]llm.Item{.{ .message = .{ .role = .user, .text = "hi" } }};
-    const body = try serialize(std.testing.allocator, &.{
-        .model = "unlisted-model",
+    const request: llm.Request = .{
+        .model = "any-model",
         .tokens_max = 8192,
         .system = "s",
         .items = &items,
         .tools = &.{},
-        .effort = .max,
-    }, .anthropic_subscription);
-    defer std.testing.allocator.free(body);
+    };
 
-    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
-    defer parsed.deinit();
-    try std.testing.expect(parsed.value.object.get("thinking") == null);
-    try std.testing.expect(parsed.value.object.get("output_config") == null);
+    // A request that names no control writes no thinking block at all, so the
+    // model keeps its own default.
+    {
+        const body = try serialize(gpa, &request, .anthropic_subscription);
+        defer gpa.free(body);
+        const parsed = try std.json.parseFromSlice(std.json.Value, gpa, body, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value.object.get("thinking") == null);
+        try std.testing.expect(parsed.value.object.get("output_config") == null);
+    }
+
+    // A named level renders adaptive thinking and states the level verbatim.
+    {
+        var named = request;
+        named.reasoning = .{ .named = .xhigh };
+        const body = try serialize(gpa, &named, .anthropic_subscription);
+        defer gpa.free(body);
+        const parsed = try std.json.parseFromSlice(std.json.Value, gpa, body, .{});
+        defer parsed.deinit();
+        const root = parsed.value.object;
+        try std.testing.expectEqualStrings(
+            "adaptive",
+            root.get("thinking").?.object.get("type").?.string,
+        );
+        try std.testing.expectEqualStrings(
+            "xhigh",
+            root.get("output_config").?.object.get("effort").?.string,
+        );
+    }
+
+    // The off control writes the explicit disabled block and no level.
+    {
+        var stopped = request;
+        stopped.reasoning = .disabled;
+        const body = try serialize(gpa, &stopped, .anthropic_subscription);
+        defer gpa.free(body);
+        const parsed = try std.json.parseFromSlice(std.json.Value, gpa, body, .{});
+        defer parsed.deinit();
+        const root = parsed.value.object;
+        try std.testing.expectEqualStrings(
+            "disabled",
+            root.get("thinking").?.object.get("type").?.string,
+        );
+        try std.testing.expect(root.get("output_config") == null);
+    }
 }
 
-test "an effort level a model lacks folds to one it accepts" {
-    // Sonnet 4.6 has no xhigh: its map folds xhigh onto high, so the default
-    // effort works without the user's knowledge.
-    const items = [_]llm.Item{.{ .message = .{ .role = .user, .text = "hi" } }};
-    const body = try serialize(std.testing.allocator, &.{
-        .model = "claude-sonnet-4-6",
-        .tokens_max = 128_000,
-        .system = "s",
-        .items = &items,
-        .tools = &.{},
-        .effort = .xhigh,
-    }, .anthropic_subscription);
-    defer std.testing.allocator.free(body);
-
-    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
-    defer parsed.deinit();
-    try std.testing.expectEqualStrings(
-        "high",
-        parsed.value.object.get("output_config").?.object.get("effort").?.string,
-    );
-}
-
-test "no thinking or output_config when effort is none" {
+test "an omitted control writes no thinking and no output_config" {
     const items = [_]llm.Item{.{ .message = .{ .role = .user, .text = "hi" } }};
     const body = try serialize(std.testing.allocator, &.{
         .model = "claude-opus-4-8",
@@ -513,7 +521,7 @@ test "no thinking or output_config when effort is none" {
     try std.testing.expectEqual(@as(i64, 8192), parsed.value.object.get("max_tokens").?.integer);
 }
 
-test "Opus 5 disables default thinking for effort none" {
+test "an off control writes a disabled thinking block and drops the replay" {
     const items = [_]llm.Item{
         .{ .message = .{ .role = .user, .text = "hi" } },
         .{ .reasoning = .{ .replay = .{ .anthropic_subscription = .{ .signature = .{
@@ -528,7 +536,7 @@ test "Opus 5 disables default thinking for effort none" {
         .system = "s",
         .items = &items,
         .tools = &.{},
-        .effort = .none,
+        .reasoning = .disabled,
     }, .anthropic_subscription);
     defer std.testing.allocator.free(body);
 
@@ -545,7 +553,7 @@ test "Opus 5 disables default thinking for effort none" {
     try std.testing.expectEqualStrings("text", assistant[0].object.get("type").?.string);
 }
 
-test "Fable 5 floors effort none onto low thinking" {
+test "a named control writes adaptive thinking and keeps the replay" {
     const items = [_]llm.Item{
         .{ .message = .{ .role = .user, .text = "hi" } },
         .{ .reasoning = .{ .replay = .{ .anthropic_subscription = .{ .signature = .{
@@ -560,7 +568,7 @@ test "Fable 5 floors effort none onto low thinking" {
         .system = "s",
         .items = &items,
         .tools = &.{},
-        .effort = .none,
+        .reasoning = .{ .named = .low },
     }, .anthropic_subscription);
     defer std.testing.allocator.free(body);
 
@@ -629,7 +637,7 @@ test "golden bytes keep the serialized prefix stable" {
         .system = "be terse",
         .items = &golden_items,
         .tools = &.{},
-        .effort = .xhigh,
+        .reasoning = .{ .named = .xhigh },
     }, .anthropic_subscription);
     defer std.testing.allocator.free(on);
     try std.testing.expectEqualStrings(golden_on, on);
@@ -640,7 +648,6 @@ test "golden bytes keep the serialized prefix stable" {
         .system = "be terse",
         .items = &golden_items,
         .tools = &.{},
-        .effort = .none,
     }, .anthropic_subscription);
     defer std.testing.allocator.free(none);
     try std.testing.expectEqualStrings(golden_none, none);
@@ -673,7 +680,7 @@ test "the api-key account omits the system header and keeps every other block" {
         .system = "be terse",
         .items = &golden_items_api,
         .tools = &.{},
-        .effort = .xhigh,
+        .reasoning = .{ .named = .xhigh },
     }, .anthropic_api);
     defer std.testing.allocator.free(body);
     try std.testing.expectEqualStrings(golden_api, body);
@@ -694,7 +701,7 @@ test "the console account prepends the Claude Code header and replays its own re
         .system = "be terse",
         .items = &items,
         .tools = &.{},
-        .effort = .xhigh,
+        .reasoning = .{ .named = .xhigh },
     }, .anthropic_console);
     defer std.testing.allocator.free(body);
 
@@ -727,7 +734,7 @@ test "a reasoning-only run dropped by an account switch emits no empty envelope"
         .system = "s",
         .items = &items,
         .tools = &.{},
-        .effort = .xhigh,
+        .reasoning = .{ .named = .xhigh },
     }, .anthropic_api);
     defer std.testing.allocator.free(body);
 
@@ -758,7 +765,7 @@ test "reasoning is dropped when its replay account differs within the vendor" {
         .system = "s",
         .items = &items,
         .tools = &.{},
-        .effort = .xhigh,
+        .reasoning = .{ .named = .xhigh },
     }, .anthropic_api);
     defer std.testing.allocator.free(body);
 

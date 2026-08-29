@@ -21,6 +21,7 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
   second press. Ctrl+C clears a draft in the editor first, and cancels only on an empty editor.
   Canceled or failed turns keep finished rounds, drop the in-flight tail, and return uncommitted
   text to the editor.
+- A refused send starts no turn, so the editor keeps the typed line for the next Enter.
 - Drinky records a tool call left unfinished as an error in the history. The transcript shows it as
   a failed call, so a canceled mutation is never hidden.
 - Timeouts and transient failures retry the whole request, clear the partial reply, and record each
@@ -77,18 +78,38 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 
 ## Models & reasoning effort
 
-- Anthropic supports `claude-fable-5`, `claude-opus-5`, `claude-opus-4-8`, `claude-sonnet-5`, and
-  `claude-sonnet-4-6` with 1M tokens of context.
-- OpenAI `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna`, at 1.05M tokens of context.
-- Output caps at 128k tokens per turn.
-- A ChatGPT subscription learns its real context windows after login.
-- Reasoning effort runs `none`, `low`, `medium`, `high`, `xhigh`, `max`, folded to what the model
-  supports.
-- A restart resumes on the account, model, and effort level this project used last.
-- Each account keeps the model it ran in this project. A switch, a login, and a restart all return
-  to it.
-- `/model` and `/effort` both refuse while signed out, since the status line hides both values then.
-- Session cost and cache savings accumulate per model and count a canceled turn's billed usage.
+- Drinky compiles no model in. Every model, limit, effort level, and price comes from the provider
+  and from OpenRouter, and the user fetches that list from `/model`.
+- No request runs at startup. A fetch runs when the user asks for one, and its result is cached in
+  `models.json` per account and `metadata.json` per vendor.
+- A fetch states its wait in the footer, because the interface stops until the provider answers.
+- Drinky records a transcript event when a fetch has something to report, so a report of several
+  sentences reads whole.
+- The provider wins every field it states. Only OpenRouter prices a model, and for Anthropic only
+  OpenRouter states whether the reasoning can stop.
+- A model that no source describes never reaches the picker, and a Codex model that the backend
+  hides stays hidden.
+- An OpenAI API key states no model fact, so that account offers no model until OpenRouter describes
+  one.
+- Anthropic takes the output cap from the request, so a model that states no limit runs at a low
+  default. Both model pickers mark such a model, because that default can cut a reply short.
+- Reasoning effort runs `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, and `ultra`. The
+  level states the intention of the user. Therefore `/effort` offers every level at every time, with
+  an account or without one and with a model or without one.
+- Each request resolves that level against its model, and every resolution is silent. A level the
+  model does not name folds to the nearest one it names, which is a spelling that the provider
+  knows. A tie between a lower and a higher level takes the lower one. A model that takes no level
+  drops the level.
+- An account with no model shows `No model` in the warning color, and a send refuses with the
+  command that fixes it.
+- A restart resumes on the account, model, and effort level this project used last. A model the
+  account no longer offers drops in silence.
+- Each account keeps the model it ran in this project. A switch, a login, and a restart return to
+  it, and an account whose list is not cached returns to none.
+- `/model` refuses while signed out, since the status line hides the model then. `/effort` stands,
+  and the next sign-in adopts the level it set.
+- Session cost accumulates at public rates and counts a canceled turn's billed usage. Every cost
+  figure of Drinky reads `~$0.42`, and the tilde marks it as an estimate.
 
 ## Accounts
 
@@ -140,8 +161,11 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
   short summary. Enter runs the picked command at once, and a bare `/` opens the same list. Esc
   returns to the list from any picker that a row of it opened, however deep.
 - **/model** — switch account and model together, from the next turn on. The picker steps through
-  the provider, the account, and the model, and it skips a step that offers one row alone.
-- **/effort** — set the reasoning-effort level, from the next turn on.
+  the provider, the account, and the model, and it skips a step that offers one row alone. The
+  model step leads with a row that fetches the list of that account, and the choice that follows a
+  fetch cannot go stale.
+- **/effort** — set the reasoning-effort level, from the next turn on. The picker lists every level,
+  and the model of the turn resolves the picked one.
 - **/login** — sign in, switch to an account already signed in, or name the API key to set.
 - **/logout** — drop a signed-in account's credentials and hand the session to another account.
 - **/review** — review every pending change from `HEAD` in bounded rounds: a fresh reviewer finds
@@ -180,6 +204,10 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 
 - `/review` needs a Git worktree, and its target is every staged, unstaged, and untracked change
   from `HEAD`. Drinky itself runs no Git command and never touches the index.
+- A role whose remembered model the account no longer offers names `No model`, and the start row
+  refuses until the user picks one. Drinky substitutes no other model for that choice.
+- The model step of a role leads with the same fetch row as `/model`, so a role reaches an account
+  that no fetch ran for.
 - The setup picker chooses the account, the model, and the effort level of each role, and the
   project remembers a confirmed choice. An unchosen role inherits the active session configuration.
   A role choice never replaces the project choices of the main conversation.
@@ -238,8 +266,8 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - A reply that names a model other than the requested one records a durable transcript event with
   both names, so a fallback or a proxy substitution never passes silently. An unchanged fallback
   reports once per turn.
-- A switched reply is priced at the model that served it, and its usage books under that model. An
-  unknown served model fails the turn with a report that names it.
+- Drinky knows no rate for a model it did not request. A switched reply therefore carries no price,
+  and the session total counts nothing for it.
 - A failed request reports the message from the provider JSON error body, not the raw bytes. A
   failed response head names its status too. For a spent OpenAI subscription, the message names the
   plan and the wait.
@@ -343,6 +371,8 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
   model switch changes the tokenizer. An account renders the whole prompt around the history, so
   every account switch hides the count. An effort change hides it only when it stops a stored
   reasoning block from replaying. A switch back to the measured setup shows the count again.
+- The gauge reads `Context: 206k`, the tokens alone with no share and no color, when no source
+  states the context window of the model.
 - The cache-hit rate holds the last request of the active account, model, and resolved effort. A
   change to any of the three hides it in the turns that follow. Two effort levels that resolve to
   one wire form share the cache, so the rate survives that change. A canceled attempt still rates
@@ -443,13 +473,11 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
   and at most 32 KiB. Each source loads at most 32 files and 64 KiB, and one file loads once even
   when two paths or a symbolic link reach it. Drinky reports what it skips.
 - `~/.drinky/config.json` is optional: paths for user instructions, request and bash limits, a bash
-  deny list, a default model per account, a default effort level, the review round ceiling, the
-  skills that a path requires, and the interface settings. Drinky reads it only at startup, so a
-  change applies at the next start.
+  deny list, a default effort level, the review round ceiling, the skills that a path requires, and
+  the interface settings. Drinky reads it only at startup, so a change applies at the next start.
 - It holds no secrets. API keys come from `ANTHROPIC_API_KEY` and `OPENAI_API_KEY`.
-- A configured model that is not valid for its account is reported, and the compiled default used.
-  An unknown effort level and an interface value Drinky cannot use are reported the same way. A key
-  that Drinky does not know is reported too, so a typo never looks like an applied setting.
+- An unknown effort level and an interface value Drinky cannot use are reported. A key that Drinky
+  does not know is reported too, so a typo never looks like an applied setting.
 - A required skill whose name no discovered skill carries guards nothing in that project. The
   startup line counts each such name once, because the global config serves every project.
 - The configuration section of the `describe_drinky` document is generated from the struct that
