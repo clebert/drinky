@@ -22,6 +22,29 @@ decision already taken, or a dependency on another entry. Module layout and exte
 
 ## Bugs
 
+- **Keep the review alive through a canceled turn** — Esc, Ctrl+C, and Ctrl+D during a role turn end
+  that turn alone and leave the workflow at a cancel hold. _`cancelTurn` calls `stopReview` today,
+  so one Esc over an empty editor destroys the judge history. The cancel hold is its own kind with
+  its own caption, because a cancel is a decision of the user and not a failure. It offers Enter and
+  Esc alone, under the general rule of the Ctrl+N entry below. The role keeps the work that the turn
+  committed, because a cancel rolls back to the checkpoint and drops the unfinished reply alone._
+- **Warn before a key ends a review** — Esc, Ctrl+C, and Ctrl+D at a review hold warn once, and the
+  second press of the same key stops the review. _Only the same key confirms, so a Ctrl+C never
+  completes a warning that Esc armed. Ctrl+D leaves the review layer instead of quitting Drinky, and
+  it acts over a draft, which the stop keeps. The core rules of `AGENTS.md` state the rule behind
+  this entry, and `describe.zig` holds the key legend of each layer and states the old behavior._
+- **Offer Ctrl+N only behind a fresh report** — a commit after a role report makes that report
+  stale, so the hold of a completed role offers Ctrl+N only behind a valid report. _The user hold
+  offers Ctrl+N for a `request_correction` step today, under a caption that reads "The reviewer
+  completed". The machine must drop the stored report of a phase when a successor turn commits no
+  valid line. The role then reports again before the workflow proceeds. The other meanings of Ctrl+N
+  stand whole. During a turn it arms the automatic resume. At the limit hold it adds one round. At
+  the failure hold it resends the failed generated request. An armed retry attempt takes the key at
+  the limit hold and at the settlement. The key never asks a role for a report._
+- **Hold a stopped review in its role context** — a second invalid role report leaves the workflow
+  at a hold that offers Enter and Esc, so the state and the conversation survive. _`stop_invalid`
+  calls `stopReview` today and frees every role context, so the user cannot ask the role what went
+  wrong. The hold takes the shape of the cancel hold above._
 - **Re-sync the cursor after a resize** — the view queries the cursor position (`DSR 6`) after a
   resize and rebases its tracked screen top, so a tracking divergence cannot strand stale rows in
   the scrollback. _A height-only change never resets, so a divergence is permanent. Two causes
@@ -29,15 +52,92 @@ decision already taken, or a dependency on another entry. Module layout and exte
   height growth. Both are rare, and a forced reset is no fix, because it drops the scrollback.
   Accept `R` as a report only while a query is outstanding, because a modified F3 also ends in `R`.
   Give the `Emulator` a bottom-anchored resize mode for the regression test._
+- **Paint a truncated reply as an error** — the event of a cut-short reply takes the error role,
+  because an incomplete answer is a failed turn. _The session appends it with `is_error` false, and
+  `block.zig` paints the error role from that flag alone._
+- **Drop the trailing blank rows of a streamed block** — a reply or a reasoning block that ends on
+  blank lines paints no empty row under it. _The transcript stores every delta verbatim, so the
+  markdown walk counts those lines. Reproduce it first. An empty block cannot occur, because
+  `appendStream` returns on a zero-length delta._
 
 ## Improvements
 
+- **Let a role ask the user** — one shared `Question:` line reaches the user from every role, and it
+  replaces `Decision: User decision required.` _The machine accepts the line from the reviewer and
+  the fixer only after the user spoke to that role in the running phase. An unattended run then
+  cannot stall on a role question. Every other question is an invalid report and takes the
+  correction path. The judge can always ask, because a decision of the judge sometimes needs the
+  user. A question takes the judge hold, where Enter answers and no Ctrl+N stands. That hold and its
+  caption must name the asking role instead of the judge alone. `Review` needs a per-phase flag for
+  the interaction. The app already resolves the messages of the user into the machine before it
+  classifies the report._
+- **Close a review at a reasonable round** — a closing fix decision of the judge runs the fixer, and
+  the judge verifies that pass itself and settles with no fresh reviewer round. _A fixer pass that
+  applies a change starts a fresh reviewer round today. A fresh reviewer almost always reports
+  another finding, so the loop rarely reaches a round with none. The dispute path already routes a
+  fixer report back to the judge. A first pass that reports `Applied: none.` takes it, and the
+  closing phase takes that route. The judge names the closing fix on its decision line. That phase
+  reuses the two-pass bound of a round. Its second pass opens for an incomplete fix and for a
+  rejected dispute. A closing phase that spends both passes without the fix holds and asks the user.
+  A fix that failed twice under the judge is evidence that the judge misread the target._
+- **State the decision scope in the judge prompt** — the judge decides wording and every technical
+  matter alone, and it asks the user when the interaction logic or the observed behavior changes.
+  _The judge decides alone on a bug fix, the architecture and the design of code, and efficiency and
+  performance. It also decides a unit test, a comment, documentation prose, and an edge case. A race
+  condition, a memory leak, and an inconsistency that the user cannot observe belong to the judge
+  too. A label, a message, and a notice belong to the judge too, because a model words them better
+  than the user. A key binding, a default, a workflow step, and the shape of the interface belong to
+  the user. The judge asks whenever a little doubt stands. It asks at the moment of the decision,
+  because a settled report hides a call it took alone. A settled report lists every such call. An
+  existing behavior and a test written in the same change are weak evidence, so neither settles a
+  question that belongs to the user. A precedent in the repository never outranks the user on
+  behavior, and the core rules of `AGENTS.md` outrank both._
+- **Account for every message of the user in a role report** — a report ends with one line per
+  message of the user: the message and its resolution, accepted or dismissed with the reason. _An
+  answer to a role question counts as a message. `pushMessage` copies each message into the next
+  judge request verbatim, and `reviewer_core` states nothing about that copy. The judge then reads a
+  message with no resolution beside it, and it cannot tell a settled discussion from an ignored
+  remark. The copy stays, because it is the one channel that a role cannot rewrite. A fresh role is
+  gone after its round, and the judge keeps the copy. The reviewer prompt and the fixer prompt state
+  the copy and the accounting. The judge prompt reads a copied message as a constraint, checks the
+  report against it, and can overrule a dismissal that the user accepted._
+- **Raise the default review rounds to ten** — `review_rounds_default` becomes 10, because a review
+  of four rounds ends before the judge can settle it. _Land the closing fix phase above first. A
+  higher ceiling without it adds more rounds of the finding loop and nothing else._
+- **Fetch the model list on a worker** — the fetch leaves the consumer thread, so the wait animates,
+  Esc cancels it, and the picker clears its rows while it runs. _`Accounts.refresh` runs inside the
+  command step today, so the frame timer never rearms and the interface paints zero frames._
+- **Bound a model fetch with one deadline** — one deadline covers the whole fetch, so a hung
+  provider cannot hold the fetch open without end. _A 30-second bound covers each request alone, and
+  no idle bound reaches a model fetch. A list runs up to eight pages, and the OpenRouter request
+  follows it, so the sum is minutes. `net.Deadline` exists for this. The entry above takes the
+  freeze away, so this one guards the socket alone and waits for it._
+- **Show a model that no source describes** — such a model takes a disabled picker row that names
+  what it lacks, and its selection opens the hint for the config key. _`Catalog.merge` returns null
+  and the caller drops the model today, so it leaves the picker with no line. A picker row carries
+  the selection role or the muted role alone, so the row needs a third role. The `No model` row of
+  the `/review` setup takes that same role, and the effort marker entry below needs it too. The hint
+  names the config key of the model metadata feature, so land that feature first._
+- **Mark an effort level that the model does not name** — the effort picker marks a level that
+  folds, so the fold is visible before the choice. _The ladder prints the tag alone today._
+- **Correct the README** — the README promotes the request policy and the runtime model discovery
+  into its distinctive part, and replaces the core-rules sentence. _The Configuration section
+  carries both facts today, and the distinctive part of the README carries neither. "Drinky keeps
+  core rules in every session" is true and unreadable. It means that the system prompt core always
+  stands. The harness document and a skill file arrive only when a task needs them._
+- **Show tokens per second during a turn** — the status line states the rate of the running turn.
+  _The provider counts the tokens at the end of a turn. The live figure estimates from the bytes of
+  the stream and the ratio of the last turn._
 - **Refresh the branch on input** — an input event that wakes the loop re-reads the repository head,
   so a checkout in another terminal shows without a turn. _An idle Drinky paints no frame, so the
   label stays stale until the next event. This limit is a decision, not a bug._
 
 ## Features
 
+- **Model metadata in the config** — the config describes a model that no provider and no OpenRouter
+  entry describes, so the user can unblock any model. _The provider wins every field it states, the
+  config wins over OpenRouter, and OpenRouter fills the rest. It is the one metadata source for a
+  local server. A later step can let Drinky write the entry for the user._
 - **Save and resume conversations** — a conversation reopens after a restart and does not start
   empty. _This entry introduces the per-turn cost ledger and persists it, since history items carry
   no cost. The `/session` breakdown entry then reads that ledger. Generate the OpenAI cache key once
@@ -64,6 +164,20 @@ decision already taken, or a dependency on another entry. Module layout and exte
   reason, and each path rule with its resolved skill or its missing name. It reports the startup
   discovery state, because every later skill load reads from that state. A run with no source opens
   the page too, and the page states that Drinky found nothing._
+- **Discussion mode** — a session mode switches the write tools off and allows the bash commands
+  that the config lists, so a conversation cannot change the repository. _The bash tool holds deny
+  patterns today, and this mode needs the opposite: an allow list that stands for the mode alone._
+- **llama.cpp server support** — Drinky reaches a local llama.cpp server and discovers its models
+  from `/v1/models`. _The server speaks the chat/completions API, so this needs a third transport
+  with its own stream shape and tool-call format. It depends on the config metadata entry, because
+  `/v1/models` describes no model and prices none._
+- **A herdr state socket** — Drinky reports a turn end, a failure, a review hold, and a settlement
+  over a socket, so herdr can notify the user. _The channel carries state outward alone, and nothing
+  outside Drinky drives the session. Herdr holds a terminal open, so the work survives a closed lid.
+  See <https://herdr.dev>._
+- **A review record** — Drinky writes each generated request and each role report into one
+  plain-text file per review, so the prompts improve from real runs. _The file holds no tool call,
+  no tool result, and no message of the user, because that traffic buries the material._
 
 ## Ideas
 
@@ -71,3 +185,5 @@ decision already taken, or a dependency on another entry. Module layout and exte
 - A picker layered over a live turn, so a command list opens mid-turn.
 - Restart the same prompt in a new session.
 - Benchmark models inside the Drinky harness.
+- Separate the changes of the user from the changes of Drinky with a git snapshot.
+- A rounds row in the `/review` setup, so a run picks its own ceiling.

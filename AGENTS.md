@@ -1,6 +1,17 @@
 Drinky is a terminal-native coding agent that keeps the conversation in normal scrollback. It is a
 dependency-free Zig program with a hand-written terminal renderer.
 
+## Core rules
+
+A core rule outranks every precedent in the repository and every consistency argument. An existing
+behavior can be wrong. The judge of a review reads this list too.
+
+- **An exit ends one thing.** No exit reaches past the step, the page, the turn, or the review that
+  holds it.
+- **Drinky destroys nothing without a decision.** Where a press can mean something else, Drinky
+  warns, and the second press of the same key is the decision.
+- **A failure is not a decision.** Every draft survives it.
+
 ## Architecture
 
 `build.zig` defines three modules. Dependencies flow from the app to the libraries only.
