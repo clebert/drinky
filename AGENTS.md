@@ -10,7 +10,7 @@ behavior can be wrong. The judge of a review reads this list too.
   holds it.
 - **Drinky destroys nothing without a decision.** Where a press can mean something else, Drinky
   warns, and the second press of the same key is the decision.
-- **A failure is not a decision.** Every draft survives it.
+- **A failure is not a decision.** Every draft and every message of the user survives it.
 
 ## Architecture
 

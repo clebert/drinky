@@ -161,9 +161,9 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
   short summary. Enter runs the picked command at once, and a bare `/` opens the same list. Esc
   returns to the list from any picker that a row of it opened, however deep.
 - **/model** — switch account and model together, from the next turn on. The picker steps through
-  the provider, the account, and the model, and it skips a step that offers one row alone. The
-  model step leads with a row that fetches the list of that account, and the choice that follows a
-  fetch cannot go stale.
+  the provider, the account, and the model, and it skips a step that offers one row alone. The model
+  step leads with a row that fetches the list of that account, and the choice that follows a fetch
+  cannot go stale.
 - **/effort** — set the reasoning-effort level, from the next turn on. The picker lists every level,
   and the model of the turn resolves the picked one.
 - **/login** — sign in, switch to an account already signed in, or name the API key to set.
@@ -218,32 +218,51 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
   `Request: Fixer · Round: 2 of 4 · Pass: 1`. The request itself stays out of the transcript, like a
   loaded skill file and a retry request. A caption above the editor names the round, the active
   role, and the controls.
-- The editor is the brake: an empty editor lets the workflow run unattended, and text holds it at
-  the next boundary. Enter steers the active role, and a message that reaches the reviewer or the
+- The editor and the messages of the user are the brake. A phase runs unattended while the editor
+  holds no text and the user sent nothing to the active role. An unattended phase starts the next
+  phase by itself, and an attended phase holds at its boundary, so the reply waits for a read before
+  the role resets. Enter steers the active role, and a message that reaches the reviewer or the
   fixer gets one judge copy, so a report never reads as a user instruction.
-- A phase the user takes part in holds at its boundary too, so the reply waits for a read before the
-  role resets. A mid-turn Ctrl+N arms the automatic resume again, and the running caption marks the
-  state as `Resume: Auto` or `Resume: Hold`, live against the editor and the participation. The held
-  state takes the warning color, and every control row names Enter only while the editor holds
-  something to send.
+- A mid-turn Ctrl+N makes a steered phase unattended again, so an empty editor lets it resume by
+  itself. The running caption marks the next boundary as `Resume: Auto` or `Resume: Hold`, live
+  against the editor and the messages. The held state takes the warning color, and every control row
+  names Enter only while the editor holds something to send.
 - A message that the user sends at a hold runs as its own turn under the round caption. A failure
   that commits nothing returns the text to the editor and the workflow to that hold.
-- A settled judge holds the workflow, so its report waits for a read. A message from that hold
-  reaches the judge, and a fresh decision leaves its step behind Ctrl+N. Esc finishes the review.
-- The judge asks the user only about an open product choice. The `review.rounds_max` ceiling bounds
-  unattended rounds, and Ctrl+N adds one round at the limit. An answer that moved the judge past its
-  latest decision sends that round through the judge, so it decides again.
-- Every role reply must start with its marker line: `Findings:`, `Decision:`, or `Applied:`. An
-  answer to the user never travels as a report, and an unmarked reply gets one correction request
-  before the workflow stops. A rejected fixer dispute gets one final pass.
+- Every role reply must start with its marker line: `Findings:`, `Decision:`, or `Applied:`. A
+  marked reply is a report, and every report is one of three kinds. A handover enables a transition
+  to another role. A dispute is a handover from the fixer back to the judge. Only the judge can
+  issue a question about an open product choice, and a question waits for the decision of the user.
+  A settlement declares the review complete and waits for the user to finish it.
+- Each report leaves one pending outcome: a role transition, a required answer, or a review finish.
+  A handover also carries what the next role needs, so Drinky stores it until that request goes out.
+  A rejected dispute gets one final fixer pass.
+- A message that reaches the active role consumes or invalidates the outcome of its previous report.
+  It makes a handover stale, answers a question, or challenges a settlement. The role must produce a
+  fresh report before the workflow proceeds.
+- If a turn fails after the message commits, the message survives and the previous outcome stays
+  discarded. The retry continues that role turn. If the turn commits nothing, the role never saw the
+  message, so the previous report and its outcome remain valid.
+- An unmarked reply is no report. A role that received a message of the user can answer in prose,
+  and that answer sends no correction request. Without such a message, Drinky asks for the report
+  once. A draft can brake that correction request before it goes out.
+- A phase without a report holds in the role context, and no key continues the workflow there. The
+  user asks the role for a report, and the next marked reply supplies a fresh outcome.
+- The `review.rounds_max` ceiling bounds unattended rounds. A fresh judge handover at the limit
+  offers one added round, and that round applies the handover directly to the fixer.
 - A failed role request holds the workflow: Ctrl+N retries the committed work or resends the request
   while one of the two stands behind it, and Ctrl+S reopens the setup of the failed role. A
   credential replacement and a credential rejection end a role turn in that same hold, and neither
   one changes a role choice.
-- Esc stops the workflow at a hold and during a turn. A worker that beats the cancel keeps its
-  reply, and the stop still ends the workflow. Esc at the settlement reports it as settled.
-- The stop restores the main conversation exactly and records one completion event with the rounds,
-  the fixer passes, and the review cost. Empty-editor Ctrl+D quits Drinky whole.
+- A user turn that starts from a failure hold returns there when canceled, so the failed generated
+  request remains available for retry.
+- Esc, Ctrl+C, and Ctrl+D cancel a running role turn. The cancel ends that turn alone, and every
+  role conversation survives it. A worker that beats the cancel keeps its reply, and the phase then
+  holds at its boundary.
+- The same three keys end the workflow at a hold, and each one warns first. Only the second press of
+  the same key ends the review. Neither Ctrl+C nor Ctrl+D quits Drinky while a review runs.
+- The end restores the main conversation exactly and records one completion event with the rounds,
+  the fixer passes, and the review cost. An end at the settlement reports it as settled.
 
 ## Providers
 

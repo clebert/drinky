@@ -403,6 +403,10 @@ const TurnOrigin = struct {
 /// types, so a key that a reflex can hit while typing warns first. Ctrl+D means
 /// leave this layer and nothing else, so it warns only where it destroys the
 /// draft, and Ctrl+C clears without a warning because the clear is its purpose.
+/// The end of a review destroys every role conversation, so each key that ends
+/// one warns over a draft and over an empty editor alike. Ctrl+C is the one
+/// exception, because a draft takes that key for the clear. Each of those keys
+/// owns its confirmation, because only the same key can complete a warning.
 pub const Confirmation = enum {
     /// One unchanged Enter sends a refused command line to the model as typed.
     /// The prompt sends it as a message, and a turn queues it as steering. The
@@ -417,6 +421,15 @@ pub const Confirmation = enum {
     /// One more Ctrl+D quits over a draft. The first Ctrl+D with a draft arms
     /// it, because the quit discards the draft.
     quit,
+    /// One more Esc ends a review workflow at a hold. The end frees every role
+    /// conversation, so the first press warns.
+    review_stop_escape,
+    /// One more Ctrl+C ends a review workflow at a hold. A draft takes the key
+    /// away first, because the clear is its purpose.
+    review_stop_ctrl_c,
+    /// One more Ctrl+D ends a review workflow at a hold. It acts over a draft
+    /// too, because the end keeps that draft.
+    review_stop_ctrl_d,
 };
 
 /// A turn worker's message to the render consumer, tagged with the generation it
@@ -757,6 +770,10 @@ pub fn armConfirmation(self: *Session, confirmation: Confirmation) void {
         .quit => std.debug.assert(self.mode == .prompt),
         .message => std.debug.assert(self.mode == .prompt or self.mode == .turn),
         .turn_cancel => std.debug.assert(self.mode == .turn),
+        .review_stop_escape,
+        .review_stop_ctrl_c,
+        .review_stop_ctrl_d,
+        => std.debug.assert(self.mode == .prompt),
     }
     self.confirmations.insert(confirmation);
 }
@@ -839,6 +856,25 @@ fn retryEventText(gpa: std.mem.Allocator, retry: *const ai.Agent.RetryAttempt) !
                 .{ retry.attempt, response },
             ),
     };
+}
+
+/// Whether `applyTurnEvent` applies `event`. The generation gate is the one
+/// rule, so an event of a turn that already ended reaches no consumer of it.
+pub fn acceptsTurnEvent(self: *const Session, event: *const TurnEvent) bool {
+    return switch (self.mode) {
+        .turn => |*turn| event.generation == turn.generation,
+        else => false,
+    };
+}
+
+/// Whether `applyCanceledTurnEvent` applies `event`. The drain reads the queue
+/// directly, so the sequence of the event must follow the applied one too.
+pub fn acceptsCanceledTurnEvent(self: *const Session, event: *const TurnEvent) bool {
+    if (!self.acceptsTurnEvent(event)) return false;
+    if (event.progress_sequence == 0) return true;
+    const turn = &self.mode.turn;
+    if (turn.progress_sequence_applied == std.math.maxInt(u64)) return false;
+    return event.progress_sequence == turn.progress_sequence_applied + 1;
 }
 
 /// Apply one turn worker event to the model, mark it dirty, and free the
@@ -954,14 +990,7 @@ pub fn applyTurnEvent(self: *Session, event: *const TurnEvent) !bool {
 /// current batch, so a sequence gap is an allowed presentation gap. Discard this
 /// and every later queued event rather than apply progress out of order.
 pub fn applyCanceledTurnEvent(self: *Session, event: *const TurnEvent) !void {
-    const turn = self.activeTurn() orelse {
-        event.deinit(self.gpa);
-        return;
-    };
-    const sequence_gap = event.progress_sequence != 0 and
-        (turn.progress_sequence_applied == std.math.maxInt(u64) or
-            event.progress_sequence != turn.progress_sequence_applied + 1);
-    if (event.generation != turn.generation or sequence_gap) {
+    if (!self.acceptsCanceledTurnEvent(event)) {
         event.deinit(self.gpa);
         return;
     }
@@ -1599,16 +1628,17 @@ pub fn paint(self: *Session, size: terminal.View.Size) !void {
                         .state_role = if (boundary_held) .warning else .muted,
                         // The row never offers a key that does nothing: Enter
                         // needs a draft that the editor can send, and Ctrl+N
-                        // needs a participation.
+                        // needs a participation. Esc cancels this turn and
+                        // ends no review, so every row names the cancel.
                         .controls = if (self.review_participated)
                             (if (draft_sendable)
-                                "Enter: Steer · Ctrl+N: Auto · Esc: Stop"
+                                "Enter: Steer · Ctrl+N: Auto · Esc: Cancel"
                             else
-                                "Ctrl+N: Auto · Esc: Stop")
+                                "Ctrl+N: Auto · Esc: Cancel")
                         else if (draft_sendable)
-                            "Enter: Steer · Esc: Stop"
+                            "Enter: Steer · Esc: Cancel"
                         else
-                            "Esc: Stop",
+                            "Esc: Cancel",
                         .rows_max = editor_caption_rows_max,
                     } else null,
                     .editor = &self.editor,
@@ -4297,7 +4327,7 @@ test "the review caption marks whether the boundary resumes by itself" {
     var session = Session.init(gpa, &out.writer, test_model, .none);
     defer session.deinit();
     session.beginTurn(1);
-    session.setReviewCaption(try gpa.dupe(u8, "Judge: Round 1 of 4"), "Esc: Stop");
+    session.setReviewCaption(try gpa.dupe(u8, "Judge: Round 1 of 4"), "Esc: Cancel");
 
     // An empty editor without participation resumes by itself, and the row
     // offers no steer key without a draft.

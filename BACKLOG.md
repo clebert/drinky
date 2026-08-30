@@ -22,29 +22,6 @@ decision already taken, or a dependency on another entry. Module layout and exte
 
 ## Bugs
 
-- **Keep the review alive through a canceled turn** — Esc, Ctrl+C, and Ctrl+D during a role turn end
-  that turn alone and leave the workflow at a cancel hold. _`cancelTurn` calls `stopReview` today,
-  so one Esc over an empty editor destroys the judge history. The cancel hold is its own kind with
-  its own caption, because a cancel is a decision of the user and not a failure. It offers Enter and
-  Esc alone, under the general rule of the Ctrl+N entry below. The role keeps the work that the turn
-  committed, because a cancel rolls back to the checkpoint and drops the unfinished reply alone._
-- **Warn before a key ends a review** — Esc, Ctrl+C, and Ctrl+D at a review hold warn once, and the
-  second press of the same key stops the review. _Only the same key confirms, so a Ctrl+C never
-  completes a warning that Esc armed. Ctrl+D leaves the review layer instead of quitting Drinky, and
-  it acts over a draft, which the stop keeps. The core rules of `AGENTS.md` state the rule behind
-  this entry, and `describe.zig` holds the key legend of each layer and states the old behavior._
-- **Offer Ctrl+N only behind a fresh report** — a commit after a role report makes that report
-  stale, so the hold of a completed role offers Ctrl+N only behind a valid report. _The user hold
-  offers Ctrl+N for a `request_correction` step today, under a caption that reads "The reviewer
-  completed". The machine must drop the stored report of a phase when a successor turn commits no
-  valid line. The role then reports again before the workflow proceeds. The other meanings of Ctrl+N
-  stand whole. During a turn it arms the automatic resume. At the limit hold it adds one round. At
-  the failure hold it resends the failed generated request. An armed retry attempt takes the key at
-  the limit hold and at the settlement. The key never asks a role for a report._
-- **Hold a stopped review in its role context** — a second invalid role report leaves the workflow
-  at a hold that offers Enter and Esc, so the state and the conversation survive. _`stop_invalid`
-  calls `stopReview` today and frees every role context, so the user cannot ask the role what went
-  wrong. The hold takes the shape of the cancel hold above._
 - **Re-sync the cursor after a resize** — the view queries the cursor position (`DSR 6`) after a
   resize and rebases its tracked screen top, so a tracking divergence cannot strand stale rows in
   the scrollback. _A height-only change never resets, so a divergence is permanent. Two causes
@@ -62,15 +39,6 @@ decision already taken, or a dependency on another entry. Module layout and exte
 
 ## Improvements
 
-- **Let a role ask the user** — one shared `Question:` line reaches the user from every role, and it
-  replaces `Decision: User decision required.` _The machine accepts the line from the reviewer and
-  the fixer only after the user spoke to that role in the running phase. An unattended run then
-  cannot stall on a role question. Every other question is an invalid report and takes the
-  correction path. The judge can always ask, because a decision of the judge sometimes needs the
-  user. A question takes the judge hold, where Enter answers and no Ctrl+N stands. That hold and its
-  caption must name the asking role instead of the judge alone. `Review` needs a per-phase flag for
-  the interaction. The app already resolves the messages of the user into the machine before it
-  classifies the report._
 - **Close a review at a reasonable round** — a closing fix decision of the judge runs the fixer, and
   the judge verifies that pass itself and settles with no fresh reviewer round. _A fixer pass that
   applies a change starts a fresh reviewer round today. A fresh reviewer almost always reports

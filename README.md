@@ -18,7 +18,7 @@ for the task.
 - `/review` reviews every pending change from `HEAD` in bounded rounds. A reviewer finds defects, a
   judge settles them, and a fixer applies them. Each role can run its own account, model, and effort
   level. An empty editor lets the rounds run unattended, and typed text holds the review at the next
-  boundary. The settlement of the judge waits for a read, and Esc finishes the review.
+  boundary. The settlement of the judge waits for a read, and a repeated Esc finishes the review.
 - Drinky streams the conversation into normal scrollback and reserves full-window pages for
   temporary views.
 - Drinky accepts steering during a turn. A cancellation or a failure keeps the finished work. One

@@ -139,25 +139,31 @@ fn writeKeys(writer: *std.Io.Writer, options: *const Options) !void {
         \\`Resume: Hold`. The boundary holds for text in the editor and for a phase the user
         \\took part in with a message or with steering. `Resume: Hold` takes the warning
         \\color, and every control row names Enter only while the editor holds something to
-        \\send. A settled judge holds the workflow too, so its report waits for a read.
+        \\send. A settled judge holds the workflow too, so its report waits for a read. An answer
+        \\in prose holds the workflow in the role context, where no key continues it. An unmarked
+        \\reply without a message of the user gets one correction request unless a draft or a
+        \\cancel brakes it. A cancel holds in the role context unless its turn commits nothing
+        \\from an existing hold. It then returns to that hold. A turn of the user discards no
+        \\failed request, so a cancel of it returns to the failure hold that offers the resend.
         \\
-        \\- Esc stops the workflow at a hold. At the settlement it finishes the review. During
-        \\  a turn it cancels the turn and stops the workflow. Drinky records one completion
-        \\  event and restores the main conversation.
-        \\- Ctrl+C clears a draft. At an empty editor it takes the Esc action, and it never
-        \\  quits Drinky.
-        \\- Ctrl+D quits Drinky at an empty editor, and the workflow ends with no completion
-        \\  event. Ctrl+D with a draft has no action.
-        \\- Ctrl+N answers three holds. At the hold of a completed role it continues the
-        \\  postponed step. At the round limit it adds one round and resumes the latest judge
-        \\  decision. An answer of the judge without a decision line sends that round through
-        \\  the judge instead. At the hold of a failed role request it resends that request. A
-        \\  failed turn that committed work takes the retry attempt before every one of these,
-        \\  at the round limit and at the settlement too. The row of each one then names that
-        \\  attempt. The row of the failure hold names Ctrl+N only while a resend or an
-        \\  attempt stands behind it. Ctrl+N has no action at the judge hold. At the
-        \\  settlement only an armed attempt gives it an action. During a role turn it arms
-        \\  the automatic resume again, so a steered phase proceeds by itself.
+        \\- Esc, Ctrl+C, and Ctrl+D each end the workflow at a hold. Each one warns first, and
+        \\  the second press of the same key ends the review, so no other key completes that
+        \\  warning. Drinky records one completion event and restores the main conversation. Only
+        \\  an end at the settlement reports the review as settled.
+        \\- The same three keys cancel a running role turn. The cancel ends that turn alone and
+        \\  holds the workflow, so every role conversation survives it.
+        \\- Ctrl+C clears a draft first, at a hold and during a turn. It never quits Drinky
+        \\  while a review runs.
+        \\- Ctrl+D acts over a draft, and the end of the review keeps that draft. It never quits
+        \\  Drinky while a review runs.
+        \\- Ctrl+N acts at three holds. At the hold of a completed role it applies the postponed
+        \\  handover. At the round limit it adds one round and applies the fresh judge handover
+        \\  to the fixer. At the hold of a failed role request it resends that request. The row
+        \\  of the failure hold names Ctrl+N only while a resend or an attempt stands behind it.
+        \\  Ctrl+N has no action at the question hold, at the answer hold, or at the cancel hold.
+        \\  It has no action at the settlement or at the hold of an invalid report, because no
+        \\  handover stands behind it there. During a role turn it arms the automatic resume
+        \\  again, so a steered phase proceeds by itself.
         \\- Ctrl+S opens the account, model, and effort menu of the role whose request failed.
         \\
         \\This section names the keys of the prompt, of a turn, and of a review workflow. A
@@ -253,23 +259,36 @@ test "the document states every command, key, and discovery rule" {
     // one key that only a review takes has no other answer in the document.
     const review_keys = text[review..];
     for ([_][]const u8{
-        "- Esc stops the workflow",
-        "- Ctrl+C clears a draft",
-        "- Ctrl+D quits Drinky at an empty editor",
-        "- Ctrl+N answers three holds",
+        "- Esc, Ctrl+C, and Ctrl+D each end the workflow at a hold",
+        "- The same three keys cancel a running role turn",
+        "- Ctrl+C clears a draft first",
+        "- Ctrl+D acts over a draft",
+        "- Ctrl+N acts at three holds",
         "- Ctrl+S opens the account, model, and effort menu",
     }) |row| try std.testing.expect(std.mem.indexOf(u8, review_keys, row) != null);
-    // Ctrl+N answers three of the five holds, so the row names the two that it
-    // leaves to Enter. An armed attempt is the one action it takes at the
-    // settlement.
+    // A single press must never end a review, so the section states the
+    // warning and the key that completes it.
     try std.testing.expect(std.mem.indexOf(
         u8,
         review_keys,
-        "Ctrl+N has no action at the judge hold. At the\n  settlement only an armed attempt" ++
-            " gives it an action.",
+        "Each one warns first, and\n  the second press of the same key ends the review",
+    ) != null);
+    // A cancel destroys no conversation, so the section states what survives.
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        review_keys,
+        "The cancel ends that turn alone and\n  holds the workflow",
+    ) != null);
+    // Ctrl+N acts at three of the eight holds, so the row names the five where
+    // it has no action.
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        review_keys,
+        "Ctrl+N has no action at the question hold, at the answer hold, or at the cancel hold.\n" ++
+            "  It has no action at the settlement or at the hold of an invalid report",
     ) != null);
     // A settled judge ends no review by itself, so the section states the hold
-    // and the key that finishes it.
+    // and what the end of it reports.
     try std.testing.expect(std.mem.indexOf(
         u8,
         review_keys,
@@ -278,7 +297,7 @@ test "the document states every command, key, and discovery rule" {
     try std.testing.expect(std.mem.indexOf(
         u8,
         review_keys,
-        "At the settlement it finishes the review.",
+        "an end at the settlement reports the review as settled",
     ) != null);
     // The round that Ctrl+N adds is the one press that spends beyond the
     // configured ceiling, so the row states what that press starts.
@@ -287,26 +306,20 @@ test "the document states every command, key, and discovery rule" {
         review_keys,
         "At the round limit it adds one round",
     ) != null);
-    // An armed attempt takes the key from every hold action, so the row states
-    // that order and what the two waiting holds then name.
-    try std.testing.expect(std.mem.indexOf(
-        u8,
-        review_keys,
-        "takes the retry attempt before every one of these,\n  at the round limit and at" ++
-            " the settlement too. The row of each one then names that\n  attempt.",
-    ) != null);
     // A failure hold with nothing behind the key shows no Ctrl+N, so the row
     // states the condition.
     try std.testing.expect(std.mem.indexOf(
         u8,
         review_keys,
-        "The row of the failure hold names Ctrl+N only while a resend or an\n  attempt" ++
-            " stands behind it.",
+        "The row\n  of the failure hold names Ctrl+N only while a resend or an attempt stands" ++
+            " behind it.",
     ) != null);
-    // The quit and the completion event are the two answers that a false one
-    // costs the most, so the section states both.
-    try std.testing.expect(std.mem.indexOf(u8, review_keys, "never\n  quits Drinky") != null);
-    try std.testing.expect(std.mem.indexOf(u8, review_keys, "no completion") != null);
+    // No key quits Drinky from a review, and a false answer there costs the
+    // most, so both rows of those keys state it.
+    for ([_][]const u8{
+        "It never quits Drinky\n  while a review runs.",
+        "It never quits\n  Drinky while a review runs.",
+    }) |row| try std.testing.expect(std.mem.indexOf(u8, review_keys, row) != null);
     try std.testing.expect(std.mem.indexOf(u8, text[keys..review], "Ctrl+S") == null);
 
     // The discovery rules carry no config key, so only this document holds them.
