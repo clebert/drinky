@@ -39,39 +39,6 @@ decision already taken, or a dependency on another entry. Module layout and exte
 
 ## Improvements
 
-- **Close a review at a reasonable round** — a closing fix decision of the judge runs the fixer, and
-  the judge verifies that pass itself and settles with no fresh reviewer round. _A fixer pass that
-  applies a change starts a fresh reviewer round today. A fresh reviewer almost always reports
-  another finding, so the loop rarely reaches a round with none. The dispute path already routes a
-  fixer report back to the judge. A first pass that reports `Applied: none.` takes it, and the
-  closing phase takes that route. The judge names the closing fix on its decision line. That phase
-  reuses the two-pass bound of a round. Its second pass opens for an incomplete fix and for a
-  rejected dispute. A closing phase that spends both passes without the fix holds and asks the user.
-  A fix that failed twice under the judge is evidence that the judge misread the target._
-- **State the decision scope in the judge prompt** — the judge decides wording and every technical
-  matter alone, and it asks the user when the interaction logic or the observed behavior changes.
-  _The judge decides alone on a bug fix, the architecture and the design of code, and efficiency and
-  performance. It also decides a unit test, a comment, documentation prose, and an edge case. A race
-  condition, a memory leak, and an inconsistency that the user cannot observe belong to the judge
-  too. A label, a message, and a notice belong to the judge too, because a model words them better
-  than the user. A key binding, a default, a workflow step, and the shape of the interface belong to
-  the user. The judge asks whenever a little doubt stands. It asks at the moment of the decision,
-  because a settled report hides a call it took alone. A settled report lists every such call. An
-  existing behavior and a test written in the same change are weak evidence, so neither settles a
-  question that belongs to the user. A precedent in the repository never outranks the user on
-  behavior, and the core rules of `AGENTS.md` outrank both._
-- **Account for every message of the user in a role report** — a report ends with one line per
-  message of the user: the message and its resolution, accepted or dismissed with the reason. _An
-  answer to a role question counts as a message. `pushMessage` copies each message into the next
-  judge request verbatim, and `reviewer_core` states nothing about that copy. The judge then reads a
-  message with no resolution beside it, and it cannot tell a settled discussion from an ignored
-  remark. The copy stays, because it is the one channel that a role cannot rewrite. A fresh role is
-  gone after its round, and the judge keeps the copy. The reviewer prompt and the fixer prompt state
-  the copy and the accounting. The judge prompt reads a copied message as a constraint, checks the
-  report against it, and can overrule a dismissal that the user accepted._
-- **Raise the default review rounds to ten** — `review_rounds_default` becomes 10, because a review
-  of four rounds ends before the judge can settle it. _Land the closing fix phase above first. A
-  higher ceiling without it adds more rounds of the finding loop and nothing else._
 - **Fetch the model list on a worker** — the fetch leaves the consumer thread, so the wait animates,
   Esc cancels it, and the picker clears its rows while it runs. _`Accounts.refresh` runs inside the
   command step today, so the frame timer never rearms and the interface paints zero frames._

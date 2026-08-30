@@ -281,11 +281,13 @@ const ReviewFlow = struct {
 
     /// Why the workflow waits for the user. The answer hold, the cancel hold,
     /// and the invalid hold leave the phase without a report, so none offers a
-    /// step.
+    /// step. The spent-pass hold holds a fix decision that no pass of the round
+    /// can serve.
     const Hold = enum {
         user,
         judge,
         limit,
+        passes_spent,
         settled,
         failure,
         answered,
@@ -2819,6 +2821,16 @@ fn applyReviewStep(self: *App, step: Review.Step, brake: bool) !void {
         },
         .hold_judge => try self.holdReview(.judge),
         .hold_limit => try self.holdReview(.limit),
+        // The judge asks for a fix that no pass of the round can serve, so the
+        // hold names that cause and the event records it.
+        .hold_passes => {
+            try self.holdReview(.passes_spent);
+            try self.recordEvent(
+                .failure,
+                "Drinky holds the review because the round spent both fixer passes.",
+                .{},
+            );
+        },
         // The judge settled, so the workflow waits for a read of its report.
         // Esc ends the review, and a message can still reach the judge.
         .settled => try self.holdReview(.settled),
@@ -2984,6 +2996,9 @@ fn continueReview(self: *App) !void {
             const request = flow.request orelse return;
             try self.startReviewSuccessor(request.text, request.correction);
         },
+        // The round has no fixer pass left, so the key starts nothing. A
+        // message reaches the judge, which can settle or ask the user.
+        .passes_spent => {},
         // None of these holds has a report, so the key continues nothing. The
         // role reports again through a message of the user.
         .answered, .canceled, .invalid_report => {},
@@ -3121,6 +3136,9 @@ fn showReviewCaption(self: *App) !void {
             "Review limit: The judge waits at round {d} of {d}",
             .{ machine.rounds_started, machine.rounds_max },
         ),
+        // The round budget blocks the fix, so the title names the passes and
+        // not a question of the judge.
+        .passes_spent => try self.gpa.dupe(u8, "Review hold: The round spent both fixer passes"),
         .settled => try self.gpa.dupe(u8, "Review hold: The judge settled the review"),
         .failure => try std.fmt.allocPrint(
             self.gpa,
@@ -3155,6 +3173,9 @@ fn showReviewCaption(self: *App) !void {
         // an end there reports a stop, and only the settlement names the
         // finish.
         .limit => "Ctrl+N: Add a round · Esc: Stop",
+        // No pass of the round remains, so no key continues the workflow. A
+        // message reaches the judge, and Esc ends the review.
+        .passes_spent => "Esc: Stop",
         .settled => "Esc: Finish",
         // A message from this hold can take the retry and commit nothing, so
         // the row names Ctrl+N only while an attempt or a resend stands behind
@@ -8568,6 +8589,26 @@ fn installReportedReviewerFlow(app: *App, report: []const u8) !void {
     try installReviewFlow(app, &machine, .reviewer, report);
 }
 
+/// A review flow in the judge phase whose round returned both fixer passes as
+/// closing fixes, so `report` is the judge report over a spent pass budget.
+fn installSpentClosingFlow(app: *App, report: []const u8) !void {
+    const gpa = app.gpa;
+    var machine = Review.init(gpa, 4);
+    errdefer machine.deinit();
+    gpa.free(try machine.composeReviewerRequest());
+    _ = try machine.finishReviewer("Findings: none.");
+    gpa.free(try machine.composeJudgeRequest());
+    _ = try machine.finishJudge("Decision: Closing fix required: Correct the parser.");
+    gpa.free(try machine.composeFixerRequest(.first));
+    _ = try machine.finishFixer("Applied: partial.\nOne case still fails.");
+    gpa.free(try machine.composeJudgeRequest());
+    _ = try machine.finishJudge("Decision: Closing fix required: Correct the remaining case.");
+    gpa.free(try machine.composeFixerRequest(.second));
+    _ = try machine.finishFixer("Applied: none.\nThe required case does not exist.");
+    gpa.free(try machine.composeJudgeRequest());
+    try installReviewFlow(app, &machine, .judge, report);
+}
+
 /// A review flow in the reviewer phase that already spent its one correction
 /// request, so `report` is the second unmarked reply of the phase.
 fn installCorrectedReviewerFlow(app: *App, report: []const u8) !void {
@@ -8930,6 +8971,52 @@ test "an attended question enters the judge hold directly" {
     try std.testing.expectEqual(ReviewFlow.Hold.judge, app.review.?.hold.?);
     try std.testing.expect(app.review.?.step == null);
     try std.testing.expectEqualStrings("Esc: Stop", app.session.review_controls);
+
+    try stopReviewByEscape(&app);
+    try std.testing.expect(app.review == null);
+}
+
+// A spent pass budget is no question of the judge. The hold must name that
+// cause, and an event must record it.
+test "a fix decision over a spent pass budget holds and names the spent passes" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = test_anthropic_model,
+        .system = "",
+        .retry = .{},
+        .environ = .empty,
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    defer app.session.deinit();
+    try installSpentClosingFlow(&app, "Decision: Closing fix required: Correct it again.");
+
+    // The round has no pass left, so the judge report starts no third pass.
+    try app.finishReviewPhase();
+    try std.testing.expectEqual(ReviewFlow.Hold.passes_spent, app.review.?.hold.?);
+    try std.testing.expect(app.review.?.step == null);
+    try std.testing.expectEqualStrings(
+        "Review hold: The round spent both fixer passes",
+        app.session.review_title.?,
+    );
+    try std.testing.expectEqualStrings("Esc: Stop", app.session.review_controls);
+
+    // No key continues the workflow here, and the event states the cause.
+    try app.handleKey(&.{ .ctrl = 'n' });
+    try std.testing.expectEqual(ReviewFlow.Hold.passes_spent, app.review.?.hold.?);
+    const blocks = app.session.transcript.blocks();
+    const event = blocks[blocks.len - 1].content.event;
+    try std.testing.expect(event.is_error);
+    try std.testing.expectEqualStrings(
+        "Drinky holds the review because the round spent both fixer passes.",
+        event.text.items,
+    );
 
     try stopReviewByEscape(&app);
     try std.testing.expect(app.review == null);

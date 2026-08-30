@@ -186,7 +186,7 @@ const bash_default: ai.tool.Context.Bash = .{};
 const gauge_default: ui.status.Gauge = .{};
 /// The compiled reviewer-round ceiling of one `/review` workflow. The app
 /// starts its workflow bookkeeping on it before the file loads.
-pub const review_rounds_default: u64 = 4;
+pub const review_rounds_default: u64 = 10;
 
 /// A malformed file must not fill the startup transcript with one event per
 /// key. Sixteen paths identify a broad shape mismatch. One final event reports
@@ -1020,6 +1020,7 @@ test "load reads the interface section" {
 }
 
 test "load reads the review section and drops a count of no round" {
+    try std.testing.expectEqual(@as(u64, 10), review_rounds_default);
     var config = try loadDataForTest(
         \\{ "review": { "rounds_max": 7 } }
     );

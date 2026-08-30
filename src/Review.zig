@@ -6,8 +6,10 @@
 //! The workflow reviews every pending change from `HEAD` in bounded rounds. A
 //! fresh reviewer starts a round and reports defects. The persistent judge
 //! validates the findings and settles the review. A fresh fixer applies the
-//! judge report, or disputes it with evidence. Only a fresh reviewer starts a
-//! round, and the round ceiling bounds unattended progress.
+//! judge report, or disputes it with evidence. A closing fix returns directly
+//! to the judge for verification, and it spends a pass of the round like a
+//! normal fix. Only a fresh reviewer starts a round, so the two passes of a
+//! round and the round ceiling bound unattended progress.
 //!
 //! Every role report starts with its marker line, so a reply to the user can
 //! never travel as a report. An unmarked reply gets one correction request,
@@ -29,9 +31,17 @@ rounds_completed: u64 = 0,
 passes_completed: u64 = 0,
 /// The active phase. The app maps it onto the interface.
 phase: Phase = .setup,
-/// The pass of the fixer that a `fix required` decision starts next. A
-/// rejected pass-1 dispute moves it to `second`, and a fresh round resets it.
-next_pass: Pass = .first,
+/// The fixer pass that the next fix decision starts, or null when the round
+/// spent both passes. A fix decision and a closing fix decision take the same
+/// budget, and only a fresh round refills it.
+next_pass: ?Pass = .first,
+/// Whether the active fixer pass is a closing fix. Such a pass returns to the
+/// judge for verification instead of a fresh reviewer round.
+closing: bool = false,
+/// Whether the latest fixer report of the round disputed the judge report with
+/// `Applied: none`. The judge report after such a pass rejected that dispute,
+/// so the next pass must not repeat it.
+disputed: bool = false,
 /// The latest complete judge decision, or null before the first one and after
 /// a message of the user makes it stale.
 decision: ?Decision = null,
@@ -74,8 +84,8 @@ pub const Role = enum {
     }
 };
 
-/// The two fixer passes of one round. At most two passes run between reviewer
-/// rounds, because only a rejected pass-1 dispute adds the second pass.
+/// The two fixer passes of one round. A fix decision and a closing fix
+/// decision spend the same two passes, so one round starts no third pass.
 pub const Pass = enum {
     first,
     second,
@@ -92,6 +102,7 @@ pub const Pass = enum {
 /// The decision line of a judge report.
 pub const Decision = enum {
     fix_required,
+    closing_fix_required,
     review_settled,
     user_decision_required,
 };
@@ -124,6 +135,8 @@ pub const Step = union(enum) {
     hold_judge,
     /// The ceiling blocks progress, so the workflow waits.
     hold_limit,
+    /// The round spent both fixer passes, so the workflow waits.
+    hold_passes,
     /// The judge settled the review, so the workflow waits.
     settled,
     /// The phase reply holds no valid marker line, so one correction request
@@ -138,7 +151,13 @@ pub const Step = union(enum) {
     pub fn postpones(self: Step) bool {
         return switch (self) {
             .start_reviewer, .start_judge, .start_fixer => true,
-            .hold_judge, .hold_limit, .settled, .request_correction, .hold_invalid => false,
+            .hold_judge,
+            .hold_limit,
+            .hold_passes,
+            .settled,
+            .request_correction,
+            .hold_invalid,
+            => false,
         };
     }
 };
@@ -203,6 +222,17 @@ pub const reviewer_core =
     \\Findings: {count}.
     \\
     \\Replace {count} with the number of findings. Return only the reviewer report.
+    \\
+    \\Drinky copies each direct message verbatim into the next judge request.
+    \\End each report with one line for each direct message from the user.
+    \\An answer to a role question counts as a message. Copy the message into the line.
+    \\Replace its line breaks with spaces.
+    \\State Accepted and its resolution, or Dismissed and the reason. Use these forms:
+    \\
+    \\User message: {message} — Accepted: {resolution}.
+    \\User message: {message} — Dismissed: {reason}.
+    \\
+    \\Write `User messages: none.` when the user sent no direct message.
 ;
 
 /// The static core of the judge prompt. The judge validates findings, resolves
@@ -256,35 +286,57 @@ pub const judge_core =
     \\- An unrelated defect or a speculative requirement.
     \\- A duplicate or resolved finding.
     \\
-    \\Settlement requires a fresh review of the current target. No accepted finding, failed
-    \\required check, or pending user decision can remain.
+    \\Settlement requires a fresh review of the current target or a verified closing fix from
+    \\that review. No accepted finding, failed check, or pending user decision can remain.
+    \\
+    \\## Closing fix
+    \\
+    \\After a fresh reviewer report, use a closing fix when one bounded fix alone blocks
+    \\settlement. Name the fix on the decision line. The fixer report returns directly to you.
+    \\Inspect the current files and verify the fix yourself. Settle without a fresh reviewer when
+    \\the fix is complete and no issue remains.
+    \\
+    \\A round has two fixer passes, and a closing fix spends the same two. Use another closing fix
+    \\decision for an incomplete first pass or a rejected first-pass dispute. After both passes
+    \\leave the fix incomplete, ask the user with `Decision: User decision required.` Two failed
+    \\passes are evidence that you misread the target.
     \\
     \\## The user
     \\
-    \\A review never comes from the user, so a finding is not necessarily aligned with the goal
-    \\of the user. Ask the user only when all of these conditions apply:
+    \\Decide wording and every technical matter without the user. These matters include a bug
+    \\fix, code architecture, code design, efficiency, performance, a unit test, a comment,
+    \\documentation prose, and an edge case. They also include a race condition, a memory leak,
+    \\and an inconsistency that the user cannot observe. A label, a message, and a notice also
+    \\belong to you. Their wording alone requires no user question.
     \\
-    \\- The choice changes visible behavior, an interface, or a public contract.
-    \\- At least two outcomes are valid.
-    \\- Requirements, tests, and documentation select no outcome.
-    \\- Technical evidence cannot resolve the choice.
+    \\Ask the user when a decision changes interaction logic or observed behavior.
+    \\A key binding, a default, a workflow step, and the interface shape belong to the user.
+    \\Ask when you have any doubt about that boundary. Ask at the time of the decision.
+    \\A settled report must list each interaction or observed behavior decision and its source.
     \\
-    \\Resolve naming, internal architecture, test strategy, and clean-code disputes yourself.
-    \\A question to the user includes the options, their consequences, one recommendation, and
-    \\the missing requirement.
+    \\Existing behavior and a test from the same change are weak evidence. Neither one settles a
+    \\decision that belongs to the user. Repository precedent never outranks the user on behavior.
+    \\The core rules of `AGENTS.md` outrank both.
+    \\
+    \\A question includes the options, their consequences, one recommendation, and the missing
+    \\requirement.
+    \\
+    \\Treat each copied `<user_message>` as a constraint from the user. Check that the role report
+    \\resolves each copied message. You can overrule a dismissal that conflicts with the message.
     \\
     \\## Report
     \\
     \\Start every report with exactly one of these lines.
     \\
     \\Decision: Fix required.
+    \\Decision: Closing fix required: {fix}.
     \\Decision: Review settled.
     \\Decision: User decision required.
     \\
-    \\Each `Decision: Fix required.` report is a self-contained fixer packet. It includes each
-    \\finding location, the required result, every user constraint, and the required
-    \\verification. When you reject a fixer dispute, quote that dispute and explain why the
-    \\finding still requires a fix. Return only the judge report.
+    \\Replace {fix} with a short name for the closing fix. Each fix report is a self-contained
+    \\fixer packet. It includes each finding location, the required result, every user constraint,
+    \\and the required verification. When you reject a fixer dispute, quote that dispute. Explain
+    \\why the finding still requires a fix. Return only the judge report.
 ;
 
 /// The correction request for a reviewer reply without a valid findings line.
@@ -309,8 +361,10 @@ pub const judge_correction_request =
     \\Return the complete corrected judge report.
     \\Start it with exactly one of these lines.
     \\Decision: Fix required.
+    \\Decision: Closing fix required: {fix}.
     \\Decision: Review settled.
     \\Decision: User decision required.
+    \\Replace {fix} with a short name for the closing fix.
     \\</judge_report_correction>
 ;
 
@@ -347,6 +401,8 @@ pub fn composeReviewerRequest(self: *Review) ![]u8 {
     std.debug.assert(self.rounds_started < self.rounds_max);
     self.rounds_started += 1;
     self.next_pass = .first;
+    self.closing = false;
+    self.disputed = false;
     self.round_reported = false;
     self.correction_requested = false;
     self.phase = .reviewer;
@@ -438,6 +494,7 @@ pub fn finishJudge(self: *Review, report: []const u8) !Step {
         .review_settled => .settled,
         .user_decision_required => .hold_judge,
         .fix_required => self.fixStep(),
+        .closing_fix_required => self.closingFixStep(),
     };
 }
 
@@ -463,17 +520,28 @@ pub fn raiseCeiling(self: *Review) Step {
     return self.fixStep();
 }
 
-/// The step of a `fix required` decision: the fixer of the armed pass, unless
-/// the ceiling permits no later reviewer round.
+/// The step of a `fix required` decision: the fixer of the next pass, unless
+/// the round spent both passes or the ceiling permits no later reviewer round.
 fn fixStep(self: *Review) Step {
+    const pass = self.next_pass orelse return .hold_passes;
     if (self.rounds_started >= self.rounds_max) return .hold_limit;
-    return .{ .start_fixer = self.next_pass };
+    self.closing = false;
+    return .{ .start_fixer = pass };
 }
 
-/// Keep `decision` with its report. Only a `fix required` report feeds a next
-/// request, so the machine stores that one alone. A failed copy adopts nothing.
+/// Start or continue a closing fix. A closing fix needs no later reviewer, so
+/// the round ceiling does not block it. It spends a pass of the round like a
+/// normal fix, and a spent budget holds the workflow for the user.
+fn closingFixStep(self: *Review) Step {
+    const pass = self.next_pass orelse return .hold_passes;
+    self.closing = true;
+    return .{ .start_fixer = pass };
+}
+
+/// Keep `decision` with its report. A fix report feeds the next fixer request,
+/// while the other reports remain in the persistent judge conversation.
 fn adoptDecision(self: *Review, decision: Decision, report: []const u8) !void {
-    if (decision == .fix_required) {
+    if (decision == .fix_required or decision == .closing_fix_required) {
         const copy = try self.gpa.dupe(u8, report);
         if (self.judge_report) |old| self.gpa.free(old);
         self.judge_report = copy;
@@ -486,10 +554,12 @@ fn adoptDecision(self: *Review, decision: Decision, report: []const u8) !void {
 /// keeps its own history. The caller owns the request.
 pub fn composeFixerRequest(self: *Review, pass: Pass) ![]u8 {
     const report = self.judge_report.?;
-    const dispute_instruction = switch (pass) {
-        .first => "You can dispute the report only with concrete evidence.",
-        .second => "Do not repeat the dispute that this revised judge report rejected.",
-    };
+    // A rejected dispute is the one history that forbids a repeat. A pass that
+    // follows an incomplete fix disputed nothing, so it keeps the permission.
+    const dispute_instruction = if (pass == .second and self.disputed)
+        "Do not repeat the dispute that this revised judge report rejected."
+    else
+        "You can dispute the report only with concrete evidence.";
     const request = try std.fmt.allocPrint(
         self.gpa,
         "<fixer_request round=\"{d}\" pass=\"{d}\">\n" ++
@@ -502,6 +572,15 @@ pub fn composeFixerRequest(self: *Review, pass: Pass) ![]u8 {
             "Applied: partial.\n" ++
             "Applied: none.\n" ++
             "Return only the fixer report.\n" ++
+            "Drinky copies each direct message verbatim into the next judge request.\n" ++
+            "End the report with one line for each direct message from the user.\n" ++
+            "An answer to a role question counts as a message.\n" ++
+            "Copy the message into the line.\n" ++
+            "Replace its line breaks with spaces.\n" ++
+            "State Accepted and its resolution, or Dismissed and the reason.\n" ++
+            "User message: {{message}} — Accepted: {{resolution}}.\n" ++
+            "User message: {{message}} — Dismissed: {{reason}}.\n" ++
+            "Write `User messages: none.` when the user sent no direct message.\n" ++
             "\n" ++
             "<judge_report>\n{s}\n</judge_report>\n" ++
             "</fixer_request>",
@@ -509,16 +588,22 @@ pub fn composeFixerRequest(self: *Review, pass: Pass) ![]u8 {
     );
     self.gpa.free(report);
     self.judge_report = null;
+    // The started pass leaves the budget of the round, so the second pass of a
+    // round is its last one.
+    self.next_pass = switch (pass) {
+        .first => .second,
+        .second => null,
+    };
     self.pass_reported = false;
     self.correction_requested = false;
     self.phase = .{ .fixer = pass };
     return request;
 }
 
-/// Take the fixer reply of the active pass and resolve the transition. The
-/// next judge request carries a marked report, whether the dispute path or
-/// the next round delivers it. A reply without an application line is no
-/// report, so it gets one correction request before the invalid hold.
+/// Take the fixer reply of the active pass and resolve the transition. A
+/// closing fix returns directly to the judge. Another fix starts a fresh round,
+/// unless an unchanged first pass disputes the report. A reply without an
+/// application line gets one correction request before the invalid hold.
 pub fn finishFixer(self: *Review, report: []const u8) !Step {
     const pass = self.phase.fixer;
     const application = classifyApplication(report) orelse {
@@ -532,11 +617,14 @@ pub fn finishFixer(self: *Review, report: []const u8) !Step {
     self.fixer_report = .{ .round = self.rounds_started, .pass = pass, .text = copy };
     if (!self.pass_reported) self.passes_completed += 1;
     self.pass_reported = true;
+    self.disputed = application == .none;
+    // The judge verifies a closing fix itself, so that pass returns to it.
+    if (self.closing) return .start_judge;
     if (pass == .second) return .start_reviewer;
     if (application != .none) return .start_reviewer;
     // The fixer changed no file and disputes the report, so the judge resolves
-    // the dispute before any fresh review. A rejection arms the final pass.
-    self.next_pass = .second;
+    // the dispute before any fresh review. The started pass already armed the
+    // final pass of the round.
     return .start_judge;
 }
 
@@ -584,6 +672,7 @@ pub fn pushMessage(self: *Review, role: Role, text: []const u8) !void {
 pub fn classifyDecision(report: []const u8) ?Decision {
     const value = classifiedValue(report, "decision:") orelse return null;
     if (matchesValue(value, "fix required")) return .fix_required;
+    if (matchesNamedValue(value, "closing fix required:")) return .closing_fix_required;
     if (matchesValue(value, "review settled")) return .review_settled;
     if (matchesValue(value, "user decision required")) return .user_decision_required;
     return null;
@@ -638,6 +727,15 @@ fn matchesValue(value: []const u8, comptime expected: []const u8) bool {
     return std.ascii.eqlIgnoreCase(body, expected);
 }
 
+/// Whether `value` starts with a decision name and carries text after it. The
+/// closing decision uses the trailing text to name the fix on the same line.
+fn matchesNamedValue(value: []const u8, comptime prefix: []const u8) bool {
+    const body = if (std.mem.endsWith(u8, value, ".")) value[0 .. value.len - 1] else value;
+    if (body.len <= prefix.len) return false;
+    if (!std.ascii.eqlIgnoreCase(body[0..prefix.len], prefix)) return false;
+    return std.mem.trim(u8, body[prefix.len..], decoration).len > 0;
+}
+
 test "a decision line classifies through markdown decoration and letter case" {
     try std.testing.expectEqual(Decision.fix_required, classifyDecision(
         "Decision: Fix required.\nFinding 1 …",
@@ -648,6 +746,10 @@ test "a decision line classifies through markdown decoration and letter case" {
     try std.testing.expectEqual(Decision.user_decision_required, classifyDecision(
         "# decision: USER DECISION REQUIRED",
     ).?);
+    try std.testing.expectEqual(Decision.closing_fix_required, classifyDecision(
+        "Decision: Closing fix required: Correct the parser.",
+    ).?);
+    try std.testing.expect(classifyDecision("Decision: Closing fix required:") == null);
     try std.testing.expectEqual(Decision.fix_required, classifyDecision(
         "> `Decision: fix required`\r\nbody",
     ).?);
@@ -742,6 +844,15 @@ test "the flow runs reviewer, judge, fixer, and a fresh round to settlement" {
             "Applied: partial.\n" ++
             "Applied: none.\n" ++
             "Return only the fixer report.\n" ++
+            "Drinky copies each direct message verbatim into the next judge request.\n" ++
+            "End the report with one line for each direct message from the user.\n" ++
+            "An answer to a role question counts as a message.\n" ++
+            "Copy the message into the line.\n" ++
+            "Replace its line breaks with spaces.\n" ++
+            "State Accepted and its resolution, or Dismissed and the reason.\n" ++
+            "User message: {message} — Accepted: {resolution}.\n" ++
+            "User message: {message} — Dismissed: {reason}.\n" ++
+            "Write `User messages: none.` when the user sent no direct message.\n" ++
             "\n" ++
             "<judge_report>\nDecision: Fix required.\nFix the bug in src/App.zig.\n" ++
             "</judge_report>\n" ++
@@ -1105,6 +1216,177 @@ test "a user decision holds the workflow and the answer resolves it" {
     );
 }
 
+test "a closing fix returns to the judge without a fresh reviewer round" {
+    const gpa = std.testing.allocator;
+    var review = Review.init(gpa, 1);
+    defer review.deinit();
+    gpa.free(try review.composeReviewerRequest());
+    _ = try review.finishReviewer("Findings: none.");
+    gpa.free(try review.composeJudgeRequest());
+
+    // A closing fix can start at the round ceiling because the judge verifies
+    // it without another reviewer round.
+    try std.testing.expectEqual(
+        Step{ .start_fixer = .first },
+        try review.finishJudge(
+            "Decision: Closing fix required: Correct the command description.",
+        ),
+    );
+    gpa.free(try review.composeFixerRequest(.first));
+    try std.testing.expectEqual(
+        Step.start_judge,
+        try review.finishFixer("Applied: all.\nCorrected the description."),
+    );
+    const verification = try review.composeJudgeRequest();
+    defer gpa.free(verification);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        verification,
+        "<fixer_report round=\"1\" pass=\"1\">",
+    ) != null);
+    try std.testing.expectEqual(Step.settled, try review.finishJudge(
+        "Decision: Review settled.",
+    ));
+    try std.testing.expectEqual(@as(u64, 1), review.rounds_started);
+}
+
+test "a closing fix gets two passes before the judge must hold" {
+    const gpa = std.testing.allocator;
+    var review = Review.init(gpa, 1);
+    defer review.deinit();
+    gpa.free(try review.composeReviewerRequest());
+    _ = try review.finishReviewer("Findings: none.");
+    gpa.free(try review.composeJudgeRequest());
+    _ = try review.finishJudge("Decision: Closing fix required: Correct the parser.");
+    gpa.free(try review.composeFixerRequest(.first));
+
+    // An incomplete first pass returns to the judge. Its revised closing
+    // decision opens the second pass.
+    try std.testing.expectEqual(
+        Step.start_judge,
+        try review.finishFixer("Applied: partial.\nOne case still fails."),
+    );
+    gpa.free(try review.composeJudgeRequest());
+    try std.testing.expectEqual(
+        Step{ .start_fixer = .second },
+        try review.finishJudge("Decision: Closing fix required: Correct the remaining case."),
+    );
+    gpa.free(try review.composeFixerRequest(.second));
+
+    // The second failed pass returns for verification. A third closing fix
+    // holds for the user instead of opening another pass.
+    try std.testing.expectEqual(
+        Step.start_judge,
+        try review.finishFixer("Applied: none.\nThe required case does not exist."),
+    );
+    gpa.free(try review.composeJudgeRequest());
+    try std.testing.expectEqual(
+        Step.hold_passes,
+        try review.finishJudge("Decision: Closing fix required: Correct the remaining case."),
+    );
+    try std.testing.expectEqual(@as(u64, 2), review.passes_completed);
+    try std.testing.expectEqual(@as(u64, 1), review.rounds_started);
+}
+
+// A round holds two fixer passes, and a closing fix spends the same two. No
+// alternation of fix decisions can start a third pass inside one round.
+test "a closing fix and a normal fix share the two passes of one round" {
+    const gpa = std.testing.allocator;
+    var review = Review.init(gpa, 4);
+    defer review.deinit();
+    gpa.free(try review.composeReviewerRequest());
+    _ = try review.finishReviewer("Findings: 1.\nFinding: a bug.");
+    gpa.free(try review.composeJudgeRequest());
+
+    // The closing decision spends the first pass of the round.
+    try std.testing.expectEqual(
+        Step{ .start_fixer = .first },
+        try review.finishJudge("Decision: Closing fix required: Correct the parser."),
+    );
+    gpa.free(try review.composeFixerRequest(.first));
+    try std.testing.expectEqual(
+        Step.start_judge,
+        try review.finishFixer("Applied: none.\nThe finding misreads the guard."),
+    );
+    gpa.free(try review.composeJudgeRequest());
+
+    // The fix decision continues that budget, so the round reaches its final
+    // pass instead of another first pass.
+    try std.testing.expectEqual(
+        Step{ .start_fixer = .second },
+        try review.finishJudge("Decision: Fix required.\nThe guard reads as claimed."),
+    );
+    gpa.free(try review.composeFixerRequest(.second));
+
+    // The final pass of a round always returns to a fresh reviewer.
+    try std.testing.expectEqual(
+        Step.start_reviewer,
+        try review.finishFixer("Applied: none.\nStill wrong."),
+    );
+    try std.testing.expectEqual(@as(u64, 2), review.passes_completed);
+    try std.testing.expectEqual(@as(u64, 1), review.rounds_started);
+}
+
+// Two returned passes spend the budget of the round. Another fix decision of
+// either kind then holds, because no third pass can start.
+test "a spent pass budget holds the workflow instead of a third pass" {
+    const gpa = std.testing.allocator;
+    var review = Review.init(gpa, 4);
+    defer review.deinit();
+    gpa.free(try review.composeReviewerRequest());
+    _ = try review.finishReviewer("Findings: none.");
+    gpa.free(try review.composeJudgeRequest());
+    _ = try review.finishJudge("Decision: Closing fix required: Correct the parser.");
+    gpa.free(try review.composeFixerRequest(.first));
+    _ = try review.finishFixer("Applied: partial.\nOne case still fails.");
+    gpa.free(try review.composeJudgeRequest());
+    _ = try review.finishJudge("Decision: Closing fix required: Correct the remaining case.");
+    gpa.free(try review.composeFixerRequest(.second));
+    _ = try review.finishFixer("Applied: none.\nThe required case does not exist.");
+    gpa.free(try review.composeJudgeRequest());
+
+    // The ceiling permits three more rounds, so the spent budget alone holds
+    // the workflow here.
+    try std.testing.expectEqual(
+        Step.hold_passes,
+        try review.finishJudge("Decision: Fix required.\nFix the remaining case."),
+    );
+    try std.testing.expectEqual(
+        Step.hold_passes,
+        try review.finishJudge("Decision: Closing fix required: Correct it again."),
+    );
+    try std.testing.expectEqual(@as(u64, 2), review.passes_completed);
+}
+
+// The instruction of a pass follows the history of the previous pass. An
+// incomplete first pass rejected no dispute, so the second pass keeps the
+// permission to answer with evidence.
+test "a second closing pass after an incomplete fix keeps the dispute permission" {
+    const gpa = std.testing.allocator;
+    var review = Review.init(gpa, 4);
+    defer review.deinit();
+    gpa.free(try review.composeReviewerRequest());
+    _ = try review.finishReviewer("Findings: none.");
+    gpa.free(try review.composeJudgeRequest());
+    _ = try review.finishJudge("Decision: Closing fix required: Correct the parser.");
+    gpa.free(try review.composeFixerRequest(.first));
+    _ = try review.finishFixer("Applied: partial.\nOne case still fails.");
+    gpa.free(try review.composeJudgeRequest());
+    try std.testing.expectEqual(
+        Step{ .start_fixer = .second },
+        try review.finishJudge("Decision: Closing fix required: Correct the remaining case."),
+    );
+    const request = try review.composeFixerRequest(.second);
+    defer gpa.free(request);
+    try std.testing.expect(std.mem.indexOf(u8, request, "pass=\"2\"") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        request,
+        "You can dispute the report only with concrete evidence.",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(u8, request, "Do not repeat the dispute") == null);
+}
+
 test "the role cores carry the shared rules and the report lines" {
     // Both roles inspect the same target through the same path, and neither
     // one may change a file on purpose.
@@ -1121,7 +1403,7 @@ test "the role cores carry the shared rules and the report lines" {
             "Do not intentionally change source",
         ) != null);
     }
-    // The judge core states the three decision lines the classifier reads.
+    // The judge core states each decision line that the classifier reads.
     try std.testing.expect(std.mem.indexOf(u8, judge_core, "Decision: Fix required.") != null);
     try std.testing.expect(std.mem.indexOf(u8, judge_core, "Decision: Review settled.") != null);
     try std.testing.expect(std.mem.indexOf(
@@ -1138,6 +1420,11 @@ test "the role cores carry the shared rules and the report lines" {
         u8,
         judge_correction_request,
         "Decision: User decision required.",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        judge_correction_request,
+        "Decision: Closing fix required: {fix}.",
     ) != null);
     try std.testing.expect(std.mem.indexOf(
         u8,
@@ -1160,5 +1447,40 @@ test "the role cores carry the shared rules and the report lines" {
         u8,
         reviewer_core,
         "A direct message is the one exception",
+    ) != null);
+    // The role prompts require one resolution for each message of the user.
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        reviewer_core,
+        "End each report with one line for each direct message from the user.",
+    ) != null);
+    var review = Review.init(std.testing.allocator, 2);
+    defer review.deinit();
+    std.testing.allocator.free(try review.composeReviewerRequest());
+    _ = try review.finishReviewer("Findings: 1.\nFinding: a defect.");
+    std.testing.allocator.free(try review.composeJudgeRequest());
+    _ = try review.finishJudge("Decision: Fix required.\nFix the defect.");
+    const fixer_request = try review.composeFixerRequest(.first);
+    defer std.testing.allocator.free(fixer_request);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        fixer_request,
+        "End the report with one line for each direct message from the user.",
+    ) != null);
+    // The judge owns visible behavior decisions and checks each copied message.
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        judge_core,
+        "A key binding, a default, a workflow step, and the interface shape belong to the user.",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        judge_core,
+        "Treat each copied `<user_message>` as a constraint from the user.",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        judge_core,
+        "Decision: Closing fix required: {fix}.",
     ) != null);
 }

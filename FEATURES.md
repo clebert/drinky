@@ -215,14 +215,16 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
   reviewer and the judge work under nonmutation prompts, and the fixer changes files like a normal
   turn.
 - Each generated request records one head line that Drinky wrote, such as
-  `Request: Fixer · Round: 2 of 4 · Pass: 1`. The request itself stays out of the transcript, like a
-  loaded skill file and a retry request. A caption above the editor names the round, the active
+  `Request: Fixer · Round: 2 of 10 · Pass: 1`. The request itself stays out of the transcript, like
+  a loaded skill file and a retry request. A caption above the editor names the round, the active
   role, and the controls.
 - The editor and the messages of the user are the brake. A phase runs unattended while the editor
   holds no text and the user sent nothing to the active role. An unattended phase starts the next
   phase by itself, and an attended phase holds at its boundary, so the reply waits for a read before
   the role resets. Enter steers the active role, and a message that reaches the reviewer or the
   fixer gets one judge copy, so a report never reads as a user instruction.
+- Each reviewer and fixer report resolves every message of the user as accepted or dismissed with a
+  reason. The judge checks each resolution against its verbatim copy.
 - A mid-turn Ctrl+N makes a steered phase unattended again, so an empty editor lets it resume by
   itself. The running caption marks the next boundary as `Resume: Auto` or `Resume: Hold`, live
   against the editor and the messages. The held state takes the warning color, and every control row
@@ -234,9 +236,16 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
   to another role. A dispute is a handover from the fixer back to the judge. Only the judge can
   issue a question about an open product choice, and a question waits for the decision of the user.
   A settlement declares the review complete and waits for the user to finish it.
+- The judge decides wording and technical matters. It asks the user before it selects interaction
+  logic, observed behavior, a key binding, a default, a workflow step, or the interface shape.
 - Each report leaves one pending outcome: a role transition, a required answer, or a review finish.
   A handover also carries what the next role needs, so Drinky stores it until that request goes out.
-  A rejected dispute gets one final fixer pass.
+  A rejected dispute gets one more fixer pass while the round has a pass left.
+- The judge can name one closing fix on its decision line. Each closing pass returns directly to the
+  judge, which verifies the fix and settles without a fresh reviewer round.
+- A round holds two fixer passes, and a closing fix spends the same two. The judge asks the user
+  when both passes fail to complete the fix. Drinky holds the review when the judge asks for another
+  fix and the round has no pass left.
 - A message that reaches the active role consumes or invalidates the outcome of its previous report.
   It makes a handover stale, answers a question, or challenges a settlement. The role must produce a
   fresh report before the workflow proceeds.
@@ -248,8 +257,8 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
   once. A draft can brake that correction request before it goes out.
 - A phase without a report holds in the role context, and no key continues the workflow there. The
   user asks the role for a report, and the next marked reply supplies a fresh outcome.
-- The `review.rounds_max` ceiling bounds unattended rounds. A fresh judge handover at the limit
-  offers one added round, and that round applies the handover directly to the fixer.
+- The `review.rounds_max` ceiling defaults to ten and bounds unattended rounds. A fresh judge
+  handover at the limit offers one added round, and that round applies the handover to the fixer.
 - A failed role request holds the workflow: Ctrl+N retries the committed work or resends the request
   while one of the two stands behind it, and Ctrl+S reopens the setup of the failed role. A
   credential replacement and a credential rejection end a role turn in that same hold, and neither
