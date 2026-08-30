@@ -145,6 +145,9 @@ fn writeKeys(writer: *std.Io.Writer, options: *const Options) !void {
         \\cancel brakes it. A cancel holds in the role context unless its turn commits nothing
         \\from an existing hold. It then returns to that hold. A turn of the user discards no
         \\failed request, so a cancel of it returns to the failure hold that offers the resend.
+        \\A spent fixer pass budget holds the review. A committed message to the judge refills
+        \\that budget in the same reviewer round. Each later spent budget requires another
+        \\committed message.
         \\
         \\- Esc, Ctrl+C, and Ctrl+D each end the workflow at a hold. Each one warns first, and
         \\  the second press of the same key ends the review, so no other key completes that
@@ -298,6 +301,17 @@ test "the document states every command, key, and discovery rule" {
         u8,
         review_keys,
         "an end at the settlement reports the review as settled",
+    ) != null);
+    // A user message can authorize more fixer work without a fresh reviewer.
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        review_keys,
+        "A spent fixer pass budget holds the review.",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        review_keys,
+        "A committed message to the judge refills",
     ) != null);
     // The round that Ctrl+N adds is the one press that spends beyond the
     // configured ceiling, so the row states what that press starts.

@@ -240,12 +240,15 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
   logic, observed behavior, a key binding, a default, a workflow step, or the interface shape.
 - Each report leaves one pending outcome: a role transition, a required answer, or a review finish.
   A handover also carries what the next role needs, so Drinky stores it until that request goes out.
-  A rejected dispute gets one more fixer pass while the round has a pass left.
+  A rejected dispute gets one more fixer pass while the pass budget has one left.
 - The judge can name one closing fix on its decision line. Each closing pass returns directly to the
   judge, which verifies the fix and settles without a fresh reviewer round.
-- A round holds two fixer passes, and a closing fix spends the same two. The judge asks the user
-  when both passes fail to complete the fix. Drinky holds the review when the judge asks for another
-  fix and the round has no pass left.
+- A pass budget holds two fixer passes, and a closing fix spends the same two. The judge asks the
+  user when both passes fail to complete the fix.
+- A committed message to the judge refills a spent pass budget in the same reviewer round. Each
+  later message can refill another spent budget, while an uncommitted message changes nothing.
+- Drinky holds the review when the judge asks for another fix before a user message refills the
+  spent pass budget.
 - A message that reaches the active role consumes or invalidates the outcome of its previous report.
   It makes a handover stale, answers a question, or challenges a settlement. The role must produce a
   fresh report before the workflow proceeds.

@@ -7,9 +7,11 @@
 //! fresh reviewer starts a round and reports defects. The persistent judge
 //! validates the findings and settles the review. A fresh fixer applies the
 //! judge report, or disputes it with evidence. A closing fix returns directly
-//! to the judge for verification, and it spends a pass of the round like a
-//! normal fix. Only a fresh reviewer starts a round, so the two passes of a
-//! round and the round ceiling bound unattended progress.
+//! to the judge for verification, and it spends a pass of the pass budget like
+//! a normal fix. Only a fresh reviewer starts a round and fills its initial
+//! pass budget. A committed message of the user can refill a spent budget in
+//! that round. Between such messages, two passes and the round ceiling bound
+//! unattended progress.
 //!
 //! Every role report starts with its marker line, so a reply to the user can
 //! never travel as a report. An unmarked reply gets one correction request,
@@ -31,9 +33,10 @@ rounds_completed: u64 = 0,
 passes_completed: u64 = 0,
 /// The active phase. The app maps it onto the interface.
 phase: Phase = .setup,
-/// The fixer pass that the next fix decision starts, or null when the round
-/// spent both passes. A fix decision and a closing fix decision take the same
-/// budget, and only a fresh round refills it.
+/// The fixer pass that the next fix decision starts, or null when the pass
+/// budget is spent. A fix decision and a closing fix decision take the same
+/// budget. A fresh round refills it, as does a committed judge message after
+/// the budget is spent.
 next_pass: ?Pass = .first,
 /// Whether the active fixer pass is a closing fix. Such a pass returns to the
 /// judge for verification instead of a fresh reviewer round.
@@ -84,8 +87,9 @@ pub const Role = enum {
     }
 };
 
-/// The two fixer passes of one round. A fix decision and a closing fix
-/// decision spend the same two passes, so one round starts no third pass.
+/// The two fixer passes of one pass budget. A fix decision and a closing fix
+/// decision spend the same passes. A committed judge message can refill the
+/// budget after both passes are spent.
 pub const Pass = enum {
     first,
     second,
@@ -135,7 +139,7 @@ pub const Step = union(enum) {
     hold_judge,
     /// The ceiling blocks progress, so the workflow waits.
     hold_limit,
-    /// The round spent both fixer passes, so the workflow waits.
+    /// The fixer pass budget is spent, so the workflow waits.
     hold_passes,
     /// The judge settled the review, so the workflow waits.
     settled,
@@ -296,10 +300,11 @@ pub const judge_core =
     \\Inspect the current files and verify the fix yourself. Settle without a fresh reviewer when
     \\the fix is complete and no issue remains.
     \\
-    \\A round has two fixer passes, and a closing fix spends the same two. Use another closing fix
-    \\decision for an incomplete first pass or a rejected first-pass dispute. After both passes
-    \\leave the fix incomplete, ask the user with `Decision: User decision required.` Two failed
-    \\passes are evidence that you misread the target.
+    \\A pass budget has two fixer passes, and a closing fix spends the same two. Use another
+    \\closing fix decision for an incomplete first pass or a rejected first-pass dispute. After
+    \\both passes leave the fix incomplete, ask the user with `Decision: User decision required.`
+    \\Two failed passes are evidence that you misread the target. A committed message from the
+    \\user then refills both passes in the same round. Each later refill requires another message.
     \\
     \\## The user
     \\
@@ -521,7 +526,7 @@ pub fn raiseCeiling(self: *Review) Step {
 }
 
 /// The step of a `fix required` decision: the fixer of the next pass, unless
-/// the round spent both passes or the ceiling permits no later reviewer round.
+/// the pass budget is spent or the ceiling permits no later reviewer round.
 fn fixStep(self: *Review) Step {
     const pass = self.next_pass orelse return .hold_passes;
     if (self.rounds_started >= self.rounds_max) return .hold_limit;
@@ -530,8 +535,8 @@ fn fixStep(self: *Review) Step {
 }
 
 /// Start or continue a closing fix. A closing fix needs no later reviewer, so
-/// the round ceiling does not block it. It spends a pass of the round like a
-/// normal fix, and a spent budget holds the workflow for the user.
+/// the round ceiling does not block it. It spends a pass of the pass budget
+/// like a normal fix, and a spent budget holds the workflow for the user.
 fn closingFixStep(self: *Review) Step {
     const pass = self.next_pass orelse return .hold_passes;
     self.closing = true;
@@ -588,8 +593,8 @@ pub fn composeFixerRequest(self: *Review, pass: Pass) ![]u8 {
     );
     self.gpa.free(report);
     self.judge_report = null;
-    // The started pass leaves the budget of the round, so the second pass of a
-    // round is its last one.
+    // The started pass leaves the pass budget, so its second pass is the last
+    // one before a committed judge message refills it.
     self.next_pass = switch (pass) {
         .first => .second,
         .second => null,
@@ -624,7 +629,7 @@ pub fn finishFixer(self: *Review, report: []const u8) !Step {
     if (application != .none) return .start_reviewer;
     // The fixer changed no file and disputes the report, so the judge resolves
     // the dispute before any fresh review. The started pass already armed the
-    // final pass of the round.
+    // final pass of the pass budget.
     return .start_judge;
 }
 
@@ -650,6 +655,15 @@ pub fn dropPhaseReport(self: *Review) void {
             self.fixer_report = null;
         },
     }
+}
+
+/// Refill a spent pass budget after a committed message to the judge. A budget
+/// that still holds a pass stays unchanged, so a message never enlarges it.
+pub fn refillPassBudgetAfterUserMessage(self: *Review) void {
+    if (self.next_pass != null) return;
+    self.next_pass = .first;
+    self.closing = false;
+    self.disputed = false;
 }
 
 /// Queue one committed workflow message for the next judge request. Only
@@ -1288,9 +1302,9 @@ test "a closing fix gets two passes before the judge must hold" {
     try std.testing.expectEqual(@as(u64, 1), review.rounds_started);
 }
 
-// A round holds two fixer passes, and a closing fix spends the same two. No
-// alternation of fix decisions can start a third pass inside one round.
-test "a closing fix and a normal fix share the two passes of one round" {
+// A pass budget holds two fixer passes, and a closing fix spends the same two.
+// No alternation can start a third pass without a committed judge message.
+test "a closing fix and a normal fix share one pass budget" {
     const gpa = std.testing.allocator;
     var review = Review.init(gpa, 4);
     defer review.deinit();
@@ -1298,7 +1312,7 @@ test "a closing fix and a normal fix share the two passes of one round" {
     _ = try review.finishReviewer("Findings: 1.\nFinding: a bug.");
     gpa.free(try review.composeJudgeRequest());
 
-    // The closing decision spends the first pass of the round.
+    // The closing decision spends the first pass of the budget.
     try std.testing.expectEqual(
         Step{ .start_fixer = .first },
         try review.finishJudge("Decision: Closing fix required: Correct the parser."),
@@ -1310,8 +1324,8 @@ test "a closing fix and a normal fix share the two passes of one round" {
     );
     gpa.free(try review.composeJudgeRequest());
 
-    // The fix decision continues that budget, so the round reaches its final
-    // pass instead of another first pass.
+    // The fix decision continues that budget, so it reaches its final pass
+    // instead of another first pass.
     try std.testing.expectEqual(
         Step{ .start_fixer = .second },
         try review.finishJudge("Decision: Fix required.\nThe guard reads as claimed."),
@@ -1327,8 +1341,8 @@ test "a closing fix and a normal fix share the two passes of one round" {
     try std.testing.expectEqual(@as(u64, 1), review.rounds_started);
 }
 
-// Two returned passes spend the budget of the round. Another fix decision of
-// either kind then holds, because no third pass can start.
+// Two returned passes spend the pass budget. Another fix decision of either
+// kind then holds, because no third pass can start without a user message.
 test "a spent pass budget holds the workflow instead of a third pass" {
     const gpa = std.testing.allocator;
     var review = Review.init(gpa, 4);
@@ -1356,6 +1370,27 @@ test "a spent pass budget holds the workflow instead of a third pass" {
         try review.finishJudge("Decision: Closing fix required: Correct it again."),
     );
     try std.testing.expectEqual(@as(u64, 2), review.passes_completed);
+}
+
+// A committed message refills only a spent pass budget. A message that arrives
+// before the budget is spent leaves the second pass armed and adds no pass.
+test "a user message leaves an unspent pass budget unchanged" {
+    const gpa = std.testing.allocator;
+    var review = Review.init(gpa, 4);
+    defer review.deinit();
+    gpa.free(try review.composeReviewerRequest());
+    _ = try review.finishReviewer("Findings: none.");
+    gpa.free(try review.composeJudgeRequest());
+    _ = try review.finishJudge("Decision: Closing fix required: Correct the parser.");
+    gpa.free(try review.composeFixerRequest(.first));
+    _ = try review.finishFixer("Applied: partial.\nOne case still fails.");
+    gpa.free(try review.composeJudgeRequest());
+
+    review.refillPassBudgetAfterUserMessage();
+    try std.testing.expectEqual(
+        Step{ .start_fixer = .second },
+        try review.finishJudge("Decision: Closing fix required: Correct the remaining case."),
+    );
 }
 
 // The instruction of a pass follows the history of the previous pass. An

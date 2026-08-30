@@ -281,8 +281,8 @@ const ReviewFlow = struct {
 
     /// Why the workflow waits for the user. The answer hold, the cancel hold,
     /// and the invalid hold leave the phase without a report, so none offers a
-    /// step. The spent-pass hold holds a fix decision that no pass of the round
-    /// can serve.
+    /// step. The spent-pass hold holds a fix decision that the current pass
+    /// budget cannot serve.
     const Hold = enum {
         user,
         judge,
@@ -2821,13 +2821,13 @@ fn applyReviewStep(self: *App, step: Review.Step, brake: bool) !void {
         },
         .hold_judge => try self.holdReview(.judge),
         .hold_limit => try self.holdReview(.limit),
-        // The judge asks for a fix that no pass of the round can serve, so the
-        // hold names that cause and the event records it.
+        // The judge asks for a fix that the current pass budget cannot serve,
+        // so the hold names that cause and the event records it.
         .hold_passes => {
             try self.holdReview(.passes_spent);
             try self.recordEvent(
                 .failure,
-                "Drinky holds the review because the round spent both fixer passes.",
+                "Drinky holds the review because the fixer pass budget is spent.",
                 .{},
             );
         },
@@ -2905,6 +2905,7 @@ fn setReviewParticipation(self: *App, participated: bool) void {
 /// report predates, and it must report again before the workflow proceeds. That
 /// text also marks the phase as addressed, because the role read it.
 /// Whether that turn answered, failed, or ended in a cancel makes no difference.
+/// A committed judge message also refills a spent fixer pass budget.
 fn resolveReviewMessages(self: *App, receipt: *const ai.Agent.Receipt) !void {
     const flow = if (self.review) |*flow| flow else return;
     defer {
@@ -2934,7 +2935,12 @@ fn resolveReviewMessages(self: *App, receipt: *const ai.Agent.Receipt) !void {
     // The message consumed or invalidated the outcome of the old hold, so no
     // failure or retry can return to it.
     flow.hold_origin = null;
-    if (role == .judge) return;
+    if (role == .judge) {
+        // A committed message explicitly authorizes another bounded fixer
+        // cycle after the current one spends both passes.
+        flow.machine.refillPassBudgetAfterUserMessage();
+        return;
+    }
     if (message) |text| try flow.machine.pushMessage(role, text);
     for (flow.steering.items[0..batch_count]) |batch|
         try flow.machine.pushMessage(role, batch.text);
@@ -2996,8 +3002,8 @@ fn continueReview(self: *App) !void {
             const request = flow.request orelse return;
             try self.startReviewSuccessor(request.text, request.correction);
         },
-        // The round has no fixer pass left, so the key starts nothing. A
-        // message reaches the judge, which can settle or ask the user.
+        // The pass budget has no fixer pass left, so the key starts nothing. A
+        // committed message refills the pass budget and reaches the judge.
         .passes_spent => {},
         // None of these holds has a report, so the key continues nothing. The
         // role reports again through a message of the user.
@@ -3136,9 +3142,9 @@ fn showReviewCaption(self: *App) !void {
             "Review limit: The judge waits at round {d} of {d}",
             .{ machine.rounds_started, machine.rounds_max },
         ),
-        // The round budget blocks the fix, so the title names the passes and
+        // The pass budget blocks the fix, so the title names that budget and
         // not a question of the judge.
-        .passes_spent => try self.gpa.dupe(u8, "Review hold: The round spent both fixer passes"),
+        .passes_spent => try self.gpa.dupe(u8, "Review hold: The fixer pass budget is spent"),
         .settled => try self.gpa.dupe(u8, "Review hold: The judge settled the review"),
         .failure => try std.fmt.allocPrint(
             self.gpa,
@@ -3173,8 +3179,8 @@ fn showReviewCaption(self: *App) !void {
         // an end there reports a stop, and only the settlement names the
         // finish.
         .limit => "Ctrl+N: Add a round · Esc: Stop",
-        // No pass of the round remains, so no key continues the workflow. A
-        // message reaches the judge, and Esc ends the review.
+        // No pass remains in the budget, so no key continues the workflow. A
+        // committed message refills the budget, and Esc ends the review.
         .passes_spent => "Esc: Stop",
         .settled => "Esc: Finish",
         // A message from this hold can take the retry and commit nothing, so
@@ -8589,8 +8595,8 @@ fn installReportedReviewerFlow(app: *App, report: []const u8) !void {
     try installReviewFlow(app, &machine, .reviewer, report);
 }
 
-/// A review flow in the judge phase whose round returned both fixer passes as
-/// closing fixes, so `report` is the judge report over a spent pass budget.
+/// A review flow in the judge phase whose pass budget returned both fixer
+/// passes, so `report` is the judge report over that spent budget.
 fn installSpentClosingFlow(app: *App, report: []const u8) !void {
     const gpa = app.gpa;
     var machine = Review.init(gpa, 4);
@@ -8997,12 +9003,12 @@ test "a fix decision over a spent pass budget holds and names the spent passes" 
     defer app.session.deinit();
     try installSpentClosingFlow(&app, "Decision: Closing fix required: Correct it again.");
 
-    // The round has no pass left, so the judge report starts no third pass.
+    // The pass budget has no pass left, so the judge report starts no third pass.
     try app.finishReviewPhase();
     try std.testing.expectEqual(ReviewFlow.Hold.passes_spent, app.review.?.hold.?);
     try std.testing.expect(app.review.?.step == null);
     try std.testing.expectEqualStrings(
-        "Review hold: The round spent both fixer passes",
+        "Review hold: The fixer pass budget is spent",
         app.session.review_title.?,
     );
     try std.testing.expectEqualStrings("Esc: Stop", app.session.review_controls);
@@ -9014,8 +9020,86 @@ test "a fix decision over a spent pass budget holds and names the spent passes" 
     const event = blocks[blocks.len - 1].content.event;
     try std.testing.expect(event.is_error);
     try std.testing.expectEqualStrings(
-        "Drinky holds the review because the round spent both fixer passes.",
+        "Drinky holds the review because the fixer pass budget is spent.",
         event.text.items,
+    );
+
+    try stopReviewByEscape(&app);
+    try std.testing.expect(app.review == null);
+}
+
+// A committed message to the judge refills a spent pass budget. An uncommitted
+// message changes no workflow state, and another committed message refills each
+// later spent budget.
+test "a committed judge message refills each spent pass budget" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = test_anthropic_model,
+        .system = "",
+        .retry = .{},
+        .environ = .empty,
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    defer app.session.deinit();
+    try installSpentClosingFlow(&app, "Decision: Closing fix required: Correct it again.");
+    try app.finishReviewPhase();
+
+    // A message that committed nothing leaves the budget spent.
+    try app.retainReviewMessage("try the correction again");
+    try app.resolveReviewMessages(&.{
+        .history_base = 0,
+        .history_end = 0,
+        .steering_committed_count = 0,
+    });
+    try std.testing.expectEqual(
+        Review.Step.hold_passes,
+        try app.review.?.machine.finishJudge(
+            "Decision: Closing fix required: Correct it again.",
+        ),
+    );
+
+    // A committed message refills both passes in the same reviewer round.
+    try app.retainReviewMessage("try the correction again");
+    try app.resolveReviewMessages(&.{
+        .history_base = 0,
+        .history_end = 1,
+        .steering_committed_count = 0,
+    });
+    try std.testing.expectEqual(
+        Review.Step{ .start_fixer = .first },
+        try app.review.?.machine.finishJudge(
+            "Decision: Closing fix required: Correct it again.",
+        ),
+    );
+    gpa.free(try app.review.?.machine.composeFixerRequest(.first));
+    _ = try app.review.?.machine.finishFixer("Applied: partial.\nOne case still fails.");
+    gpa.free(try app.review.?.machine.composeJudgeRequest());
+    _ = try app.review.?.machine.finishJudge(
+        "Decision: Closing fix required: Correct the remaining case.",
+    );
+    gpa.free(try app.review.?.machine.composeFixerRequest(.second));
+    _ = try app.review.?.machine.finishFixer("Applied: none.\nThe case still fails.");
+    gpa.free(try app.review.?.machine.composeJudgeRequest());
+
+    // Another committed message refills the budget again.
+    try app.retainReviewMessage("try one more time");
+    try app.resolveReviewMessages(&.{
+        .history_base = 0,
+        .history_end = 1,
+        .steering_committed_count = 0,
+    });
+    try std.testing.expectEqual(
+        Review.Step{ .start_fixer = .first },
+        try app.review.?.machine.finishJudge(
+            "Decision: Closing fix required: Correct it one more time.",
+        ),
     );
 
     try stopReviewByEscape(&app);
