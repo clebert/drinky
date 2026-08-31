@@ -271,8 +271,10 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - Esc, Ctrl+C, and Ctrl+D cancel a running role turn. The cancel ends that turn alone, and every
   role conversation survives it. A worker that beats the cancel keeps its reply, and the phase then
   holds at its boundary.
-- The same three keys end the workflow at a hold, and each one warns first. Only the second press of
-  the same key ends the review. Neither Ctrl+C nor Ctrl+D quits Drinky while a review runs.
+- The same three keys end the workflow at a hold. At an unfinished hold each one warns first, and
+  only the second press of the same key ends the review. The settlement over an empty editor ends on
+  one press, and a draft there returns the warning for Esc and Ctrl+D. Ctrl+C clears that draft
+  first. Neither Ctrl+C nor Ctrl+D quits Drinky while a review runs.
 - The end restores the main conversation exactly and records one completion event with the rounds,
   the fixer passes, and the review cost. An end at the settlement reports it as settled.
 - The end at the settlement moves the judge report into the editor as one `[Review: settled report]`

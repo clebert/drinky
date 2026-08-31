@@ -149,16 +149,19 @@ fn writeKeys(writer: *std.Io.Writer, options: *const Options) !void {
         \\that budget in the same reviewer round. Each later spent budget requires another
         \\committed message.
         \\
-        \\- Esc, Ctrl+C, and Ctrl+D each end the workflow at a hold. Each one warns first, and
-        \\  the second press of the same key ends the review, so no other key completes that
-        \\  warning. Drinky records one completion event and restores the main conversation. Only
-        \\  an end at the settlement reports the review as settled. That end also moves the judge
-        \\  report into the editor as one `[Review: settled report]` marker, below an existing
-        \\  draft. The user sends that report or deletes it with one keystroke.
+        \\- Esc, Ctrl+C, and Ctrl+D each end the workflow at a hold. At an unfinished hold each
+        \\  one warns first, and the second press of the same key ends the review, so no other
+        \\  key completes that warning. Drinky records one completion event and restores the
+        \\  main conversation. Only an end at the settlement reports the review as settled. That
+        \\  end also moves the judge report into the editor as one `[Review: settled report]`
+        \\  marker, below an existing draft. The user sends that report or deletes it with one
+        \\  keystroke. The settlement over an empty editor ends on one press, because the
+        \\  workflow reached its own end there. A draft there returns the warning for Esc and
+        \\  Ctrl+D.
         \\- The same three keys cancel a running role turn. The cancel ends that turn alone and
         \\  holds the workflow, so every role conversation survives it.
-        \\- Ctrl+C clears a draft first, at a hold and during a turn. It never quits Drinky
-        \\  while a review runs.
+        \\- Ctrl+C clears a draft first, at a hold and during a turn, so it never warns over
+        \\  that draft. It never quits Drinky while a review runs.
         \\- Ctrl+D acts over a draft, and the end of the review keeps that draft. It never quits
         \\  Drinky while a review runs.
         \\- Ctrl+N acts at three holds. At the hold of a completed role it applies the postponed
@@ -271,12 +274,13 @@ test "the document states every command, key, and discovery rule" {
         "- Ctrl+N acts at three holds",
         "- Ctrl+S opens the account, model, and effort menu",
     }) |row| try std.testing.expect(std.mem.indexOf(u8, review_keys, row) != null);
-    // A single press must never end a review, so the section states the
-    // warning and the key that completes it.
+    // A warning stands before every end at an unfinished hold, so the section
+    // states that warning and the key that completes it.
     try std.testing.expect(std.mem.indexOf(
         u8,
         review_keys,
-        "Each one warns first, and\n  the second press of the same key ends the review",
+        "At an unfinished hold each\n  one warns first, and the second press of the same key " ++
+            "ends the review",
     ) != null);
     // A cancel destroys no conversation, so the section states what survives.
     try std.testing.expect(std.mem.indexOf(
@@ -304,12 +308,30 @@ test "the document states every command, key, and discovery rule" {
         review_keys,
         "an end at the settlement reports the review as settled",
     ) != null);
+    // The settlement is the one hold that a single press ends, so the section
+    // states that press and the two keys that a draft warns for. Ctrl+C takes
+    // that draft for the clear, so its own row states the exception.
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        review_keys,
+        "The settlement over an empty editor ends on one press",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        review_keys,
+        "A draft there returns the warning for Esc and\n  Ctrl+D.",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        review_keys,
+        "so it never warns over\n  that draft",
+    ) != null);
     // The settled report reaches the user through the editor alone, so the
     // section states where it lands.
     try std.testing.expect(std.mem.indexOf(
         u8,
         review_keys,
-        "moves the judge\n  report into the editor as one `[Review: settled report]` marker",
+        "moves the judge report into the editor as one `[Review: settled report]`\n  marker",
     ) != null);
     // A user message can authorize more fixer work without a fresh reviewer.
     try std.testing.expect(std.mem.indexOf(
@@ -340,7 +362,7 @@ test "the document states every command, key, and discovery rule" {
     // No key quits Drinky from a review, and a false answer there costs the
     // most, so both rows of those keys state it.
     for ([_][]const u8{
-        "It never quits Drinky\n  while a review runs.",
+        "that draft. It never quits Drinky while a review runs.",
         "It never quits\n  Drinky while a review runs.",
     }) |row| try std.testing.expect(std.mem.indexOf(u8, review_keys, row) != null);
     try std.testing.expect(std.mem.indexOf(u8, text[keys..review], "Ctrl+S") == null);

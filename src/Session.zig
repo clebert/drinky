@@ -404,9 +404,11 @@ const TurnOrigin = struct {
 /// leave this layer and nothing else, so it warns only where it destroys the
 /// draft, and Ctrl+C clears without a warning because the clear is its purpose.
 /// The end of a review destroys every role conversation, so each key that ends
-/// one warns over a draft and over an empty editor alike. Ctrl+C is the one
-/// exception, because a draft takes that key for the clear. Each of those keys
-/// owns its confirmation, because only the same key can complete a warning.
+/// one warns at an unfinished hold, over a draft and over an empty editor
+/// alike. Ctrl+C is the one exception, because a draft takes that key for the
+/// clear. The settlement over an empty editor ends on one press, because the
+/// workflow reached its own end there. Each of those keys owns its
+/// confirmation, because only the same key can complete a warning.
 pub const Confirmation = enum {
     /// One unchanged Enter sends a refused command line to the model as typed.
     /// The prompt sends it as a message, and a turn queues it as steering. The
@@ -421,8 +423,9 @@ pub const Confirmation = enum {
     /// One more Ctrl+D quits over a draft. The first Ctrl+D with a draft arms
     /// it, because the quit discards the draft.
     quit,
-    /// One more Esc ends a review workflow at a hold. The end frees every role
-    /// conversation, so the first press warns.
+    /// One more Esc ends a review workflow at an unfinished hold. The end frees
+    /// every role conversation, so the first press warns there. The settlement
+    /// over an empty editor ends on one press instead.
     review_stop_escape,
     /// One more Ctrl+C ends a review workflow at a hold. A draft takes the key
     /// away first, because the clear is its purpose.

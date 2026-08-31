@@ -19,8 +19,8 @@ for the task.
   judge settles them, and a fixer applies them. The judge verifies a closing fix without another
   reviewer round. Each role can run its own account, model, and effort level. An empty editor lets
   the rounds run unattended, and typed text holds the review at the next boundary. The settlement of
-  the judge waits for a read, and a repeated Esc finishes the review. The finish moves the settled
-  report into the editor.
+  the judge waits for a read, and one Esc over an empty editor finishes the review. The finish moves
+  the settled report into the editor.
 - Drinky streams the conversation into normal scrollback and reserves full-window pages for
   temporary views.
 - Drinky accepts steering during a turn. A cancellation or a failure keeps the finished work. One

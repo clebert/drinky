@@ -1783,8 +1783,10 @@ fn handleKey(self: *App, event: *const terminal.Input.Key) !void {
     if (try self.editKey(event)) return;
     switch (event.*) {
         .enter => try self.submit(),
-        // Esc ends an active review workflow after one warning. Without one it
-        // owns the waiting retry alone, and it keeps the editor text either way.
+        // Esc ends an active review workflow. An unfinished hold warns first,
+        // and the settlement over an empty editor ends on one press. Without a
+        // review Esc owns the waiting retry alone, and it keeps the editor text
+        // either way.
         .escape => if (self.review != null) {
             try self.warnOrStopReview(.review_stop_escape, "Esc");
         } else {
@@ -3266,22 +3268,25 @@ fn handSettledReport(self: *App, report: []const u8) !void {
 
 /// A key at a hold that ends the workflow: warn once, and end the review on
 /// the second press of the same key. The warning names its own key, because no
-/// other key completes it, so no reflex press can end a review by itself.
+/// other key completes it, so no reflex press can end a review by itself. Only
+/// the settlement hold carries a fresh settlement, so every other hold reports
+/// a stop.
+///
+/// The settlement over an empty editor is the exception. The workflow reached
+/// its own end there, the finish hands the report to the editor, and an empty
+/// editor holds no message that reopens the workflow. One press finishes it. A
+/// draft signals that the user types, so the warning returns.
 fn warnOrStopReview(self: *App, confirmation: Session.Confirmation, key: []const u8) !void {
-    if (self.session.takeConfirmation(confirmation)) return self.stopReviewFromKey();
+    const settled = self.review.?.hold == .settled;
+    const decided = settled and self.session.editor.visible().len == 0;
+    if (decided or self.session.takeConfirmation(confirmation))
+        return self.stopReview(if (settled) .settled else .stopped);
     self.session.armConfirmation(confirmation);
     try self.reportNotice(
         .warning,
         "Press {s} again to end the review. The end discards every role conversation.",
         .{key},
     );
-}
-
-/// The confirmed end of a workflow at the prompt. Only the settlement hold
-/// carries a fresh settlement, so every other hold reports a stop.
-fn stopReviewFromKey(self: *App) !void {
-    const settled = self.review.?.hold == .settled;
-    try self.stopReview(if (settled) .settled else .stopped);
 }
 
 /// Spawn a turn worker over `text` and enter turn mode. The worker owns its own
@@ -10056,10 +10061,12 @@ test "ctrl+d in a review turn cancels the turn and keeps Drinky running" {
     try std.testing.expect(app.running);
 }
 
-/// Test helper: the confirmed stop of a review workflow. Esc warns once at a
-/// hold, so the second press is the decision that ends the review.
+/// Test helper: the confirmed stop of a review workflow. Esc warns once at an
+/// unfinished hold, so the second press is the decision that ends the review.
+/// The settlement over an empty editor ends on the first press instead.
 fn stopReviewByEscape(app: *App) !void {
     try app.handleKey(&.escape);
+    if (app.review == null) return;
     try app.handleKey(&.escape);
 }
 
@@ -10601,9 +10608,9 @@ test "a canceled turn queues the judge copy of a steering batch it committed" {
     try std.testing.expect(app.review == null);
 }
 
-// Every key that ends a review stands one press away from the loss of the
-// judge history, so each one warns first. Only the same key completes its own
-// warning, so a mixed pair keeps the review whole.
+// Every key that ends an unfinished review stands one press away from the loss
+// of the judge history, so each one warns first. Only the same key completes
+// its own warning, so a mixed pair keeps the review whole.
 test "a review hold warns before a key ends it and only the same key confirms" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -10621,8 +10628,11 @@ test "a review hold warns before a key ends it and only the same key confirms" {
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
-    try installJudgeFlow(&app, "Decision: Review settled.");
+    // The judge asks a question, so the workflow holds before its own end and
+    // every key that leaves it warns.
+    try installJudgeFlow(&app, "Decision: User decision required.\nKeep the option?");
     try app.finishReviewPhase();
+    try std.testing.expectEqual(ReviewFlow.Hold.judge, app.review.?.hold.?);
 
     // The first Esc warns and keeps the workflow.
     try app.handleKey(&.escape);
@@ -10648,9 +10658,8 @@ test "a review hold warns before a key ends it and only the same key confirms" {
     try std.testing.expect(app.running);
 
     // Ctrl+D acts over a draft, warns like the other two, and never quits
-    // Drinky. The end keeps the draft. The clear drops the report atom that the
-    // settled end above handed to the editor.
-    app.session.editor.clear();
+    // Drinky. A draft keeps the warning at the settlement too, and the end
+    // keeps that draft.
     try installJudgeFlow(&app, "Decision: Review settled.");
     try app.finishReviewPhase();
     try app.session.editor.insert("ask the judge again");
@@ -10667,6 +10676,82 @@ test "a review hold warns before a key ends it and only the same key confirms" {
     // The draft stands, and the settled report joins it below.
     try std.testing.expectEqualStrings(
         "ask the judge again\n\n\u{200B}[Review: settled report]\u{200B}",
+        app.session.editor.visible(),
+    );
+}
+
+// The settlement is the end of the workflow itself, and the end hands its
+// report to the editor. An empty editor holds no message that reopens the
+// workflow, so one press of an end key finishes the review there. A draft
+// returns the warning for Esc and Ctrl+D, because a reflex press must not end
+// a review while the user types. Ctrl+C takes that draft for the clear, so its
+// next press ends the review over the empty editor.
+test "a settled hold finishes on one press over an empty editor" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = test_anthropic_model,
+        .system = "",
+        .retry = .{},
+        .environ = .empty,
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    defer app.session.deinit();
+
+    for ([_]terminal.Input.Key{ .escape, .{ .ctrl = 'c' }, .{ .ctrl = 'd' } }) |key| {
+        app.session.editor.clear();
+        try installJudgeFlow(&app, "Decision: Review settled.");
+        try app.finishReviewPhase();
+        try std.testing.expectEqual(ReviewFlow.Hold.settled, app.review.?.hold.?);
+
+        try app.handleKey(&key);
+        try std.testing.expect(app.review == null);
+        try std.testing.expect(app.running);
+        try std.testing.expect(app.session.notice == null);
+        try std.testing.expectEqualStrings(
+            "\u{200B}[Review: settled report]\u{200B}",
+            app.session.editor.visible(),
+        );
+    }
+
+    app.session.editor.clear();
+    try installJudgeFlow(&app, "Decision: Review settled.");
+    try app.finishReviewPhase();
+    try app.session.editor.insert("ask the judge again");
+    try app.handleKey(&.escape);
+    try std.testing.expect(app.review != null);
+    try std.testing.expectEqualStrings(
+        "Press Esc again to end the review. The end discards every role conversation.",
+        app.session.notice.?.content,
+    );
+    try app.handleKey(&.escape);
+    try std.testing.expect(app.review == null);
+    try std.testing.expectEqualStrings(
+        "ask the judge again\n\n\u{200B}[Review: settled report]\u{200B}",
+        app.session.editor.visible(),
+    );
+
+    // Ctrl+C clears the draft and sets no warning. Its next press meets an
+    // empty editor and ends the settled review.
+    app.session.editor.clear();
+    try installJudgeFlow(&app, "Decision: Review settled.");
+    try app.finishReviewPhase();
+    try app.session.editor.insert("ask the judge again");
+    try app.handleKey(&.{ .ctrl = 'c' });
+    try std.testing.expect(app.review != null);
+    try std.testing.expect(app.session.notice == null);
+    try std.testing.expectEqualStrings("", app.session.editor.visible());
+    try app.handleKey(&.{ .ctrl = 'c' });
+    try std.testing.expect(app.review == null);
+    try std.testing.expect(app.running);
+    try std.testing.expectEqualStrings(
+        "\u{200B}[Review: settled report]\u{200B}",
         app.session.editor.visible(),
     );
 }
