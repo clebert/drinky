@@ -51,11 +51,6 @@ decision already taken, or a dependency on another entry. Module layout and exte
   names the config key of the model metadata feature, so land that feature first._
 - **Mark an effort level that the model does not name** — the effort picker marks a level that
   folds, so the fold is visible before the choice. _The ladder prints the tag alone today._
-- **Correct the README** — the README promotes the request policy and the runtime model discovery
-  into its distinctive part, and replaces the core-rules sentence. _The Configuration section
-  carries both facts today, and the distinctive part of the README carries neither. "Drinky keeps
-  core rules in every session" is true and unreadable. It means that the system prompt core always
-  stands. The harness document and a skill file arrive only when a task needs them._
 - **Show tokens per second during a turn** — the status line states the rate of the running turn.
   _The provider counts the tokens at the end of a turn. The live figure estimates from the bytes of
   the stream and the ratio of the last turn._
