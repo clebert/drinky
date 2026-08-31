@@ -32,10 +32,6 @@ decision already taken, or a dependency on another entry. Module layout and exte
 - **Paint a truncated reply as an error** — the event of a cut-short reply takes the error role,
   because an incomplete answer is a failed turn. _The session appends it with `is_error` false, and
   `block.zig` paints the error role from that flag alone._
-- **Drop the trailing blank rows of a streamed block** — a reply or a reasoning block that ends on
-  blank lines paints no empty row under it. _The transcript stores every delta verbatim, so the
-  markdown walk counts those lines. Reproduce it first. An empty block cannot occur, because
-  `appendStream` returns on a zero-length delta._
 
 ## Improvements
 

@@ -198,6 +198,14 @@ pub const Entry = struct {
         };
     }
 
+    /// `text` with the blank rows it ends on dropped. A provider can end a
+    /// reply or a run of reasoning on blank lines, and the markdown walk counts
+    /// a row for each one. The block then holds empty rows over the block under
+    /// it.
+    fn trimBlankTail(text: []const u8) []const u8 {
+        return std.mem.trimEnd(u8, text, " \t\r\n");
+    }
+
     /// How this block paints as a notice, or null for a block that paints a box
     /// or markdown. The measure and the paint share it, so the rows a block
     /// counts cannot diverge from the rows it paints.
@@ -250,8 +258,8 @@ pub const Entry = struct {
                 &.{ .text = flagged.text.items, .fit = flagged.fit },
                 columns,
             ),
-            .thinking => |reasoning| markdown.rows(reasoning.text.items, columns),
-            .model => |list| markdown.rows(list.items, columns),
+            .thinking => |reasoning| markdown.rows(trimBlankTail(reasoning.text.items), columns),
+            .model => |list| markdown.rows(trimBlankTail(list.items), columns),
             .user_note, .event => unreachable,
         };
     }
@@ -311,8 +319,12 @@ pub const Entry = struct {
                     .emphasis = .first_value,
                 },
             ),
-            .thinking => |reasoning| try markdown.render(placement, .muted, reasoning.text.items),
-            .model => |list| try markdown.render(placement, null, list.items),
+            .thinking => |reasoning| try markdown.render(
+                placement,
+                .muted,
+                trimBlankTail(reasoning.text.items),
+            ),
+            .model => |list| try markdown.render(placement, null, trimBlankTail(list.items)),
         }
     }
 };
@@ -429,6 +441,33 @@ test "each entry variant renders exactly the rows it counts" {
             try std.testing.expectEqual(counted, try renderedRows(gpa, &entry, columns, 0));
         }
     }
+}
+
+// Regression: a provider can end a reply or a run of reasoning on blank lines.
+// The markdown walk counted a row for each one, so empty rows opened under the
+// block.
+test "a streamed block drops the blank rows it ends on" {
+    const gpa = std.testing.allocator;
+    const columns = 20;
+    for ([_]Entry.Kind{ .model, .thinking }) |kind| {
+        var trailing = try Entry.init(gpa, kind, .{}, "the answer\n\n  \n");
+        defer trailing.deinit(gpa);
+        var tight = try Entry.init(gpa, kind, .{}, "the answer");
+        defer tight.deinit(gpa);
+
+        try std.testing.expectEqual(tight.rows(columns), trailing.rows(columns));
+        const trailing_paint = try rendered(gpa, &trailing, columns, 0);
+        defer gpa.free(trailing_paint);
+        const tight_paint = try rendered(gpa, &tight, columns, 0);
+        defer gpa.free(tight_paint);
+        try std.testing.expectEqualStrings(tight_paint, trailing_paint);
+    }
+
+    // Blank lines alone still hold the one row that every block paints.
+    var blanks_only = try Entry.init(gpa, .model, .{}, "\n\n");
+    defer blanks_only.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 1), blanks_only.rows(columns));
+    try std.testing.expectEqual(@as(usize, 1), try renderedRows(gpa, &blanks_only, columns, 0));
 }
 
 // The same padding everywhere: a copy of a reasoning row starts at the column a
