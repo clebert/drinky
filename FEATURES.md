@@ -275,6 +275,9 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
   the same key ends the review. Neither Ctrl+C nor Ctrl+D quits Drinky while a review runs.
 - The end restores the main conversation exactly and records one completion event with the rounds,
   the fixer passes, and the review cost. An end at the settlement reports it as settled.
+- The end at the settlement moves the judge report into the editor as one `[Review: settled report]`
+  marker, below an existing draft. The user sends that report to the main conversation, or deletes
+  it with one keystroke. The transcript keeps no copy of it.
 
 ## Providers
 

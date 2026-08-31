@@ -56,6 +56,9 @@ fixer_report: ?FixerReport = null,
 /// The latest `fix required` judge report. The next fixer request consumes
 /// it. Owned.
 judge_report: ?[]u8 = null,
+/// The judge report of the standing settlement, or null while no settlement
+/// stands. The settled end of the workflow hands it to the user. Owned.
+settled_report: ?[]u8 = null,
 /// Whether the machine already composed the one correction request of the
 /// active phase reply. A second unmarked reply then holds the workflow. A
 /// step that no compose follows leaves the budget whole.
@@ -395,6 +398,7 @@ pub fn deinit(self: *Review) void {
     if (self.reviewer_report) |report| self.gpa.free(report);
     if (self.fixer_report) |report| self.gpa.free(report.text);
     if (self.judge_report) |report| self.gpa.free(report);
+    if (self.settled_report) |report| self.gpa.free(report);
     for (self.pending_messages.items) |message| self.gpa.free(message.text);
     self.pending_messages.deinit(self.gpa);
 }
@@ -544,14 +548,39 @@ fn closingFixStep(self: *Review) Step {
 }
 
 /// Keep `decision` with its report. A fix report feeds the next fixer request,
-/// while the other reports remain in the persistent judge conversation.
+/// and a settled report waits for the end of the workflow. The other reports
+/// remain in the persistent judge conversation.
 fn adoptDecision(self: *Review, decision: Decision, report: []const u8) !void {
-    if (decision == .fix_required or decision == .closing_fix_required) {
-        const copy = try self.gpa.dupe(u8, report);
-        if (self.judge_report) |old| self.gpa.free(old);
-        self.judge_report = copy;
+    switch (decision) {
+        .fix_required, .closing_fix_required => {
+            const copy = try self.gpa.dupe(u8, report);
+            if (self.judge_report) |old| self.gpa.free(old);
+            self.judge_report = copy;
+            self.dropSettledReport();
+        },
+        .review_settled => {
+            const copy = try self.gpa.dupe(u8, report);
+            if (self.settled_report) |old| self.gpa.free(old);
+            self.settled_report = copy;
+        },
+        // The decision replaces a settlement, so its report goes too.
+        .user_decision_required => self.dropSettledReport(),
     }
     self.decision = decision;
+}
+
+/// Take the report of the standing settlement and leave the machine without
+/// one. The caller owns the result.
+pub fn takeSettledReport(self: *Review) ?[]u8 {
+    const report = self.settled_report;
+    self.settled_report = null;
+    return report;
+}
+
+/// Free the stored settled report, so no stale settlement can reach the user.
+fn dropSettledReport(self: *Review) void {
+    if (self.settled_report) |report| self.gpa.free(report);
+    self.settled_report = null;
 }
 
 /// Start a fresh fixer pass and return its generated request. It consumes the
@@ -648,6 +677,7 @@ pub fn dropPhaseReport(self: *Review) void {
         .judge => {
             if (self.judge_report) |report| self.gpa.free(report);
             self.judge_report = null;
+            self.dropSettledReport();
             self.decision = null;
         },
         .fixer => {
@@ -1128,6 +1158,45 @@ test "a message drops every outcome of the previous judge report" {
     );
     review.dropPhaseReport();
     try std.testing.expect(review.decision == null);
+}
+
+// The settled end of the workflow hands the judge report to the user, so the
+// machine keeps that report while the settlement stands. Every outcome that
+// replaces the settlement drops it.
+test "a settlement stores its report until the end takes it" {
+    const gpa = std.testing.allocator;
+    var review = Review.init(gpa, 4);
+    defer review.deinit();
+    gpa.free(try review.composeReviewerRequest());
+    _ = try review.finishReviewer("Findings: none.");
+    gpa.free(try review.composeJudgeRequest());
+    try std.testing.expect(review.settled_report == null);
+
+    _ = try review.finishJudge("Decision: Review settled.\nThe target is clean.");
+    try std.testing.expectEqualStrings(
+        "Decision: Review settled.\nThe target is clean.",
+        review.settled_report.?,
+    );
+
+    // A message drops the settlement, so no stale report survives it.
+    review.dropPhaseReport();
+    try std.testing.expect(review.settled_report == null);
+
+    // A fresh settlement replaces the report, and a fix decision drops it.
+    _ = try review.finishJudge("Decision: Review settled.\nThe fix holds.");
+    _ = try review.finishJudge("Decision: Fix required.\nCorrect the parser.");
+    try std.testing.expect(review.settled_report == null);
+
+    // A question drops it too, and the end takes the report of the settlement
+    // that stands.
+    _ = try review.finishJudge("Decision: Review settled.\nThe parser is correct.");
+    _ = try review.finishJudge("Decision: User decision required.\nKeep the option?");
+    try std.testing.expect(review.settled_report == null);
+    _ = try review.finishJudge("Decision: Review settled.\nThe user decided.");
+    const report = review.takeSettledReport().?;
+    defer gpa.free(report);
+    try std.testing.expectEqualStrings("Decision: Review settled.\nThe user decided.", report);
+    try std.testing.expect(review.settled_report == null);
 }
 
 test "a fresh judge report controls the workflow after a dropped outcome" {

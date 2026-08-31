@@ -152,7 +152,9 @@ fn writeKeys(writer: *std.Io.Writer, options: *const Options) !void {
         \\- Esc, Ctrl+C, and Ctrl+D each end the workflow at a hold. Each one warns first, and
         \\  the second press of the same key ends the review, so no other key completes that
         \\  warning. Drinky records one completion event and restores the main conversation. Only
-        \\  an end at the settlement reports the review as settled.
+        \\  an end at the settlement reports the review as settled. That end also moves the judge
+        \\  report into the editor as one `[Review: settled report]` marker, below an existing
+        \\  draft. The user sends that report or deletes it with one keystroke.
         \\- The same three keys cancel a running role turn. The cancel ends that turn alone and
         \\  holds the workflow, so every role conversation survives it.
         \\- Ctrl+C clears a draft first, at a hold and during a turn. It never quits Drinky
@@ -301,6 +303,13 @@ test "the document states every command, key, and discovery rule" {
         u8,
         review_keys,
         "an end at the settlement reports the review as settled",
+    ) != null);
+    // The settled report reaches the user through the editor alone, so the
+    // section states where it lands.
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        review_keys,
+        "moves the judge\n  report into the editor as one `[Review: settled report]` marker",
     ) != null);
     // A user message can authorize more fixer work without a fresh reviewer.
     try std.testing.expect(std.mem.indexOf(

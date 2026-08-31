@@ -3199,10 +3199,15 @@ fn showReviewCaption(self: *App) !void {
 
 /// End the workflow: restore the parked main conversation, free every role
 /// context, and record one completion event with the accounting data. Review
-/// completion adds no model context to the main agent.
+/// completion adds no model context to the main agent. The settled end hands
+/// the judge report to the editor as well.
 fn stopReview(self: *App, end: ReviewEnd) !void {
     var flow = self.review.?;
     self.review = null;
+    // The report leaves the machine before the teardown frees it. Only the
+    // settled end carries one.
+    const maybe_report: ?[]u8 = if (end == .settled) flow.machine.takeSettledReport() else null;
+    defer if (maybe_report) |report| self.gpa.free(report);
     var cost = flow.cost_banked + self.agent.stats.cost;
     if (flow.judge) |*judge| cost += judge.agent.stats.cost;
     const rounds = flow.machine.rounds_completed;
@@ -3235,6 +3240,28 @@ fn stopReview(self: *App, end: ReviewEnd) !void {
             .{ if (role) |value| @tagName(value) else "setup", rounds, passes, cost },
         ),
     }
+    if (maybe_report) |report| try self.handSettledReport(report);
+}
+
+/// The atom label of a settled judge report. It carries no counter, because one
+/// review settles once.
+const settled_report_label = "Review: settled report";
+
+/// Move the settled judge report into the editor as one atom, so the user sends
+/// it to the main conversation or deletes it with one keystroke. The main
+/// conversation never held the report, so the payload names the judge as its
+/// source and wraps the report verbatim. An existing draft keeps its text and
+/// takes the atom after a blank line.
+fn handSettledReport(self: *App, report: []const u8) !void {
+    const payload = try std.fmt.allocPrint(
+        self.gpa,
+        "The judge of a review settled with the report below.\n\n" ++
+            "<judge_report>\n{s}\n</judge_report>",
+        .{report},
+    );
+    errdefer self.gpa.free(payload);
+    try self.session.editor.appendAtom(settled_report_label, payload);
+    self.session.markEdited();
 }
 
 /// A key at a hold that ends the workflow: warn once, and end the review on
@@ -8680,6 +8707,85 @@ test "a settled judge report holds the workflow and Esc records the completion" 
     try std.testing.expect(!blocks[1].content.event.is_error);
 }
 
+// The settled report is the one output of the workflow, and the main
+// conversation never held it. The settled end therefore hands it to the editor,
+// where the user sends it or deletes it.
+test "the settled end hands the judge report to the editor as one atom" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = test_anthropic_model,
+        .system = "",
+        .retry = .{},
+        .environ = .empty,
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    defer app.session.deinit();
+    try installJudgeFlow(&app, "Decision: Review settled.\nEvery finding is resolved.");
+    try app.finishReviewPhase();
+    try stopReviewByEscape(&app);
+
+    // The label carries no counter, and the payload names the judge as the
+    // source of the verbatim report.
+    try std.testing.expectEqualStrings(
+        "\u{200B}[Review: settled report]\u{200B}",
+        app.session.editor.visible(),
+    );
+    const payload = try app.session.editor.expanded(.none);
+    defer gpa.free(payload);
+    try std.testing.expectEqualStrings(
+        "The judge of a review settled with the report below.\n\n" ++
+            "<judge_report>\n" ++
+            "Decision: Review settled.\nEvery finding is resolved.\n" ++
+            "</judge_report>",
+        payload,
+    );
+
+    // The transcript holds the main conversation and the completion event
+    // alone, because the report goes to the editor and nowhere else.
+    const blocks = app.session.transcript.blocks();
+    try std.testing.expectEqual(@as(usize, 2), blocks.len);
+    try std.testing.expectEqualStrings("main marker", blocks[0].content.user.items);
+
+    // One keystroke deletes the atom, and that delete loses the only copy.
+    app.session.editor.backspace();
+    try std.testing.expectEqualStrings("", app.session.editor.visible());
+}
+
+// A stop is no settlement, so the workflow produced no report to hand over and
+// the editor stays as the user left it.
+test "a review stop hands no report to the editor" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = test_anthropic_model,
+        .system = "",
+        .retry = .{},
+        .environ = .empty,
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    defer app.session.deinit();
+    try installJudgeFlow(&app, "Decision: User decision required.\nKeep the option?");
+    try app.finishReviewPhase();
+    try std.testing.expectEqual(ReviewFlow.Hold.judge, app.review.?.hold.?);
+
+    try stopReviewByEscape(&app);
+    try std.testing.expect(app.review == null);
+    try std.testing.expectEqualStrings("", app.session.editor.visible());
+}
+
 // Every cost figure of Drinky is an estimate at public rates, so one tilde
 // marks each one. The completion event carries the banked cost of a role
 // conversation that a reset destroyed, and it marks that figure alike.
@@ -10542,7 +10648,9 @@ test "a review hold warns before a key ends it and only the same key confirms" {
     try std.testing.expect(app.running);
 
     // Ctrl+D acts over a draft, warns like the other two, and never quits
-    // Drinky. The end keeps the draft.
+    // Drinky. The end keeps the draft. The clear drops the report atom that the
+    // settled end above handed to the editor.
+    app.session.editor.clear();
     try installJudgeFlow(&app, "Decision: Review settled.");
     try app.finishReviewPhase();
     try app.session.editor.insert("ask the judge again");
@@ -10556,7 +10664,11 @@ test "a review hold warns before a key ends it and only the same key confirms" {
     try app.handleKey(&.{ .ctrl = 'd' });
     try std.testing.expect(app.review == null);
     try std.testing.expect(app.running);
-    try std.testing.expectEqualStrings("ask the judge again", app.session.editor.visible());
+    // The draft stands, and the settled report joins it below.
+    try std.testing.expectEqualStrings(
+        "ask the judge again\n\n\u{200B}[Review: settled report]\u{200B}",
+        app.session.editor.visible(),
+    );
 }
 
 // A second invalid report leaves the phase without a report, and the role

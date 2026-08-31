@@ -69,14 +69,6 @@ decision already taken, or a dependency on another entry. Module layout and exte
 
 ## Features
 
-- **Hand the settled report to the editor** — the settled end of a review moves the judge report
-  into the editor as one atom, so the user sends or deletes it. _The payload is the whole settled
-  reply verbatim, inside an XML tag plus one fixed sentence that names the judge as the source. The
-  atom behaves like a large paste: the label is `[Review: settled report]` with no counter, and one
-  keystroke deletes it. That delete loses the only copy, and the loss is accepted, because the
-  review record entry later keeps each report. The transcript gets no copy, because the main
-  conversation never held the report. The atom lands on the settled end alone, joins an existing
-  draft after a blank line, and needs no config._
 - **Model metadata in the config** — the config describes a model that no provider and no OpenRouter
   entry describes, so the user can unblock any model. _The provider wins every field it states, the
   config wins over OpenRouter, and OpenRouter fills the rest. It is the one metadata source for a
