@@ -11,10 +11,6 @@ pub fn main(init: std.process.Init) !void {
             .anthropic = init.environ_map.get("ANTHROPIC_API_KEY"),
             .openai = init.environ_map.get("OPENAI_API_KEY"),
         },
-        .terminal_program = init.environ_map.get("TERM_PROGRAM"),
-        .terminal_type = init.environ_map.get("TERM"),
-        .tmux_session = init.environ_map.get("TMUX"),
-        .screen_session = init.environ_map.get("STY"),
     });
 }
 

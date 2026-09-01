@@ -156,14 +156,6 @@ pub const Options = struct {
     environ: std.process.Environ = .empty,
     /// The provider keys that authenticate an account without a login.
     api_keys: ai.Accounts.ApiKeys = .{},
-    /// The value of `TERM_PROGRAM`, which names the terminal, or null when it is unset.
-    terminal_program: ?[]const u8 = null,
-    /// The value of `TERM`, which names the terminal type, or null when it is unset.
-    terminal_type: ?[]const u8 = null,
-    /// The value of `TMUX`, which a tmux session sets, or null outside one.
-    tmux_session: ?[]const u8 = null,
-    /// The value of `STY`, which a screen session sets, or null outside one.
-    screen_session: ?[]const u8 = null,
 };
 
 /// The frame grid: the deadlines that pace the repaints. Each deadline is one
@@ -570,28 +562,6 @@ const Sources = struct {
     required_missing_count: usize = 0,
 };
 
-/// Map the terminal that the environment names onto the capabilities of the engine. Apple Terminal
-/// has neither DECSET 1049 nor DECSET 1007, so it takes the older screen and the mouse reports.
-fn terminalOptions(options: *const Options) terminal.Tty.Options {
-    if (appleTerminal(options)) return .{ .screen = .legacy, .wheel = .mouse_report };
-    return .{};
-}
-
-/// Whether the session runs in Apple Terminal itself. The name must match exactly, because a wrong
-/// verdict costs more than a missed one. The legacy screen reprints the window on every page close,
-/// and the mouse reports take a click away from the terminal. A multiplexer inherits `TERM_PROGRAM`
-/// from the terminal that started it. It draws every row itself and supports the modern path, so
-/// its own markers win over that inherited name.
-fn appleTerminal(options: *const Options) bool {
-    if (options.tmux_session != null or options.screen_session != null) return false;
-    if (options.terminal_type) |name| {
-        if (std.mem.startsWith(u8, name, "tmux") or std.mem.startsWith(u8, name, "screen"))
-            return false;
-    }
-    const program = options.terminal_program orelse return false;
-    return std.mem.eql(u8, program, "Apple_Terminal");
-}
-
 fn validateWorkingDirectory(gpa: std.mem.Allocator, path: []const u8) !void {
     if (std.unicode.utf8ValidateSlice(path)) return;
     const safe_path = try ai.instructions.diagnosticAlloc(gpa, path);
@@ -771,7 +741,7 @@ pub fn run(
     // remember, so the first login records one.
     if (active) |account| try self.state.seed(account, start_model, start_effort);
 
-    try self.tty.init(io, terminalOptions(options));
+    try self.tty.init(io);
     defer self.tty.deinit();
 
     try self.resize.init();
@@ -1766,11 +1736,7 @@ fn refresh(self: *App) !void {
         .{ .columns = window.columns, .rows = window.rows }
     else
         .{ .columns = self.session.columns, .rows = self.session.rows };
-    // A terminal on the legacy screen puts no primary content back, so the conversation reprints
-    // its window. The rows above it stay in the native scrollback.
-    if (try self.tty.setAlternateScreen(self.session.mode == .viewing)) {
-        self.session.view.invalidateWindow();
-    }
+    try self.tty.setAlternateScreen(self.session.mode == .viewing);
     // The session does no io, so the driver hands it both clocks every frame.
     self.session.clock_ms = self.nowMs();
     self.session.boot_clock_ms = self.nowBootMs();
@@ -2702,8 +2668,8 @@ fn handlePageKey(self: *App, event: *const terminal.Input.Key) !void {
             'c', 'd' => return self.session.closePage(),
             else => return,
         },
-        .up, .scroll_up => page.moveUp(size),
-        .down, .scroll_down => page.moveDown(size),
+        .up => page.moveUp(size),
+        .down => page.moveDown(size),
         .page_up => page.pageUp(size),
         .page_down => page.pageDown(size),
         .home => page.moveHome(),
@@ -2799,25 +2765,6 @@ test "the intro line holds every key hint and closes on the command list" {
     try std.testing.expectEqual(@as(usize, 98), terminal.width.ofText(intro_text));
     for (intro_keys) |hint|
         try std.testing.expect(std.mem.indexOf(u8, intro_text, hint) != null);
-}
-
-test "only Apple Terminal without a multiplexer takes the legacy screen and mouse reports" {
-    const modern: terminal.Tty.Options = .{};
-    const apple: terminal.Tty.Options = .{ .screen = .legacy, .wheel = .mouse_report };
-    try std.testing.expectEqual(modern, terminalOptions(&.{}));
-    try std.testing.expectEqual(modern, terminalOptions(&.{ .terminal_program = "ghostty" }));
-    try std.testing.expectEqual(apple, terminalOptions(
-        &.{ .terminal_program = "Apple_Terminal", .terminal_type = "xterm-256color" },
-    ));
-    // A multiplexer inherits the name of the terminal that started it. Every marker of one keeps
-    // the modern path, because the multiplexer draws every row itself.
-    const multiplexed: []const Options = &.{
-        .{ .terminal_program = "Apple_Terminal", .tmux_session = "/tmp/tmux-501/default,1,0" },
-        .{ .terminal_program = "Apple_Terminal", .screen_session = "1234.pts-0.host" },
-        .{ .terminal_program = "Apple_Terminal", .terminal_type = "tmux-256color" },
-        .{ .terminal_program = "Apple_Terminal", .terminal_type = "screen-256color" },
-    };
-    for (multiplexed) |options| try std.testing.expectEqual(modern, terminalOptions(&options));
 }
 
 test "OAuth prompts render runtime fields as inert text" {
@@ -4727,9 +4674,9 @@ test "a page close drops the rest of an exit attempt in one chunk" {
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
 
-    // Apple Terminal sends Esc as one byte, so an exit attempt can land as
-    // `\x1b\x03` or `\x1b\x04` in one chunk. The Escape closes the page, and the
-    // control key behind it must not reach the prompt below.
+    // A terminal without the Kitty protocol sends Esc as one byte, so an exit
+    // attempt can land as `\x1b\x03` or `\x1b\x04` in one chunk. The Escape
+    // closes the page, and the control key behind it must not reach the prompt.
     for ([_][]const u8{ "\x1b\x03", "\x1b\x04" }) |chunk| {
         var app: App = undefined;
         app.initForTest(gpa);
