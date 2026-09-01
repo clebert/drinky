@@ -63,7 +63,7 @@ pub fn serialize(gpa: std.mem.Allocator, request: *const llm.Request, account: l
     // Prompt-cache breakpoints, model-independent: Anthropic caches the prefix
     // (tools, then system, then messages) up to each marked block and applies
     // its per-model minimum server side. Mark the last system block, the last
-    // tool, and the last block of the last message — three of the four allowed.
+    // tool, and the two history blocks of `Breakpoints` — all four allowed.
     try stringify.objectField("system");
     try stringify.beginArray();
     if (sendsSystemHeader(account))
@@ -85,11 +85,10 @@ pub fn serialize(gpa: std.mem.Allocator, request: *const llm.Request, account: l
     // adjacent text. An item that emits no block (dropped reasoning) must not
     // open an envelope: a reasoning-only assistant run then serializes as empty
     // `content`, which Anthropic rejects with a 400. User runs left adjacent by
-    // such a skip merge. The last emitted block carries the history cache
-    // breakpoint.
+    // such a skip merge.
     try stringify.objectField("messages");
     try stringify.beginArray();
-    const last_block = lastBlockIndex(request.items, emit_thinking, account);
+    const breakpoints = historyBreakpoints(request.items, emit_thinking, account);
     var open_role: ?llm.Role = null;
     for (request.items, 0..) |*item, index| {
         if (!emitsBlock(item.*, emit_thinking, account)) continue;
@@ -103,7 +102,7 @@ pub fn serialize(gpa: std.mem.Allocator, request: *const llm.Request, account: l
             try stringify.beginArray();
             open_role = role;
         }
-        try writeItem(&stringify, item, index == last_block);
+        try writeItem(&stringify, item, breakpoints.carries(index));
     }
     if (open_role != null) try endMessage(&stringify);
     try stringify.endArray();
@@ -212,14 +211,37 @@ fn emitsBlock(item: llm.Item, emit_thinking: bool, account: llm.Account) bool {
     };
 }
 
-/// The index of the last item that emits a block, or null when none do — the
-/// block that carries the history cache breakpoint.
-fn lastBlockIndex(items: []const llm.Item, emit_thinking: bool, account: llm.Account) ?usize {
-    var last: ?usize = null;
-    for (items, 0..) |item, index| {
-        if (emitsBlock(item, emit_thinking, account)) last = index;
+/// The item indices that carry the two history cache breakpoints, or null
+/// where no item emits a block.
+const Breakpoints = struct {
+    /// The last emitted block. It writes the entry for this request.
+    current: ?usize = null,
+    /// The last block of the most recent closed user envelope. It carried the
+    /// breakpoint of the previous request. The server then reads that entry even
+    /// when the new turn adds more blocks than its automatic prefix check scans
+    /// back (about 20).
+    previous: ?usize = null,
+
+    fn carries(self: *const Breakpoints, index: usize) bool {
+        return index == self.current or index == self.previous;
     }
-    return last;
+};
+
+fn historyBreakpoints(
+    items: []const llm.Item,
+    emit_thinking: bool,
+    account: llm.Account,
+) Breakpoints {
+    var breakpoints: Breakpoints = .{};
+    var open_role: ?llm.Role = null;
+    for (items, 0..) |item, index| {
+        if (!emitsBlock(item, emit_thinking, account)) continue;
+        const role = itemRole(item);
+        if (open_role == .user and role == .assistant) breakpoints.previous = breakpoints.current;
+        open_role = role;
+        breakpoints.current = index;
+    }
+    return breakpoints;
 }
 
 /// The Anthropic message role an item belongs to: reasoning and tool calls are
@@ -405,7 +427,7 @@ test "synthetic error results group in one user envelope before steering text" {
 }
 
 // The model string is arbitrary: the serializer places breakpoints the same way for every model.
-test "cache_control marks the system prompt, last tool, and last message block" {
+test "cache_control marks the system prompt, last tool, previous user block, and last block" {
     const tools = [_]llm.Tool{
         .{ .name = "read", .description = "d", .parameters = &.{} },
         .{ .name = "grep", .description = "d", .parameters = &.{} },
@@ -439,10 +461,50 @@ test "cache_control marks the system prompt, last tool, and last message block" 
 
     const message_items = root.get("messages").?.array.items;
     const first_blocks = message_items[0].object.get("content").?.array.items;
-    try std.testing.expect(first_blocks[0].object.get("cache_control") == null);
+    try std.testing.expect(first_blocks[0].object.get("cache_control") != null);
     const last_blocks = message_items[1].object.get("content").?.array.items;
     try std.testing.expect(last_blocks[0].object.get("cache_control") == null);
     try std.testing.expect(last_blocks[1].object.get("cache_control") != null);
+}
+
+// The previous request ended at the steering text, so its breakpoint sat there.
+// The breakpoint on that block lets the server read the entry when the new turn
+// adds more blocks than its prefix check scans back. The tool result in the same
+// envelope carries none.
+test "cache_control also marks the last block of the previous user envelope" {
+    const items = [_]llm.Item{
+        .{ .message = .{ .role = .user, .text = "hello" } },
+        .{ .tool_call = .{ .call_id = "t1", .name = "read", .arguments_json = "{}" } },
+        .{ .tool_result = .{ .call_id = "t1", .content = "c", .is_error = false } },
+        .{ .message = .{ .role = .user, .text = "steer" } },
+        .{ .message = .{ .role = .assistant, .text = "a" } },
+        .{ .message = .{ .role = .user, .text = "next" } },
+    };
+    const body = try serialize(std.testing.allocator, &.{
+        .model = "any-model-x",
+        .tokens_max = 8,
+        .system = "sys",
+        .items = &items,
+        .tools = &.{},
+    }, .anthropic_subscription);
+    defer std.testing.allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+    const envelopes = parsed.value.object.get("messages").?.array.items;
+    try std.testing.expectEqual(@as(usize, 5), envelopes.len);
+    // One flag per block in envelope order: hello, t1, result, steer, a, next.
+    const marked = [_]bool{ false, false, false, true, false, true };
+    var block_index: usize = 0;
+    for (envelopes) |envelope| {
+        for (envelope.object.get("content").?.array.items) |block| {
+            try std.testing.expect(block_index < marked.len);
+            const actual = block.object.get("cache_control") != null;
+            try std.testing.expectEqual(marked[block_index], actual);
+            block_index += 1;
+        }
+    }
+    try std.testing.expectEqual(marked.len, block_index);
 }
 
 test "every reasoning control renders its own block" {
@@ -619,11 +681,11 @@ const golden_items = [_]llm.Item{
 };
 
 const golden_on =
-    \\{"model":"claude-opus-4-8","max_tokens":8192,"stream":true,"thinking":{"type":"adaptive","display":"summarized"},"output_config":{"effort":"xhigh"},"system":[{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."},{"type":"text","text":"be terse","cache_control":{"type":"ephemeral"}}],"messages":[{"role":"user","content":[{"type":"text","text":"first"},{"type":"text","text":"second"}]},{"role":"assistant","content":[{"type":"thinking","thinking":"weigh it","signature":"sig"},{"type":"redacted_thinking","data":"secret"},{"type":"tool_use","id":"t1","name":"read","input":{"path":"a.zig"}},{"type":"text","text":"checking"}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","is_error":false,"content":"contents"}]},{"role":"assistant","content":[{"type":"thinking","thinking":"more","signature":"sig2"},{"type":"tool_use","id":"t2","name":"write","input":{"path":"b"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"t2","is_error":true,"content":"done"}]},{"role":"assistant","content":[{"type":"text","text":"all set","cache_control":{"type":"ephemeral"}}]}]}
+    \\{"model":"claude-opus-4-8","max_tokens":8192,"stream":true,"thinking":{"type":"adaptive","display":"summarized"},"output_config":{"effort":"xhigh"},"system":[{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."},{"type":"text","text":"be terse","cache_control":{"type":"ephemeral"}}],"messages":[{"role":"user","content":[{"type":"text","text":"first"},{"type":"text","text":"second"}]},{"role":"assistant","content":[{"type":"thinking","thinking":"weigh it","signature":"sig"},{"type":"redacted_thinking","data":"secret"},{"type":"tool_use","id":"t1","name":"read","input":{"path":"a.zig"}},{"type":"text","text":"checking"}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","is_error":false,"content":"contents"}]},{"role":"assistant","content":[{"type":"thinking","thinking":"more","signature":"sig2"},{"type":"tool_use","id":"t2","name":"write","input":{"path":"b"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"t2","is_error":true,"content":"done","cache_control":{"type":"ephemeral"}}]},{"role":"assistant","content":[{"type":"text","text":"all set","cache_control":{"type":"ephemeral"}}]}]}
 ;
 
 const golden_none =
-    \\{"model":"claude-opus-4-8","max_tokens":8192,"stream":true,"system":[{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."},{"type":"text","text":"be terse","cache_control":{"type":"ephemeral"}}],"messages":[{"role":"user","content":[{"type":"text","text":"first"},{"type":"text","text":"second"}]},{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"read","input":{"path":"a.zig"}},{"type":"text","text":"checking"}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","is_error":false,"content":"contents"}]},{"role":"assistant","content":[{"type":"tool_use","id":"t2","name":"write","input":{"path":"b"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"t2","is_error":true,"content":"done"}]},{"role":"assistant","content":[{"type":"text","text":"all set","cache_control":{"type":"ephemeral"}}]}]}
+    \\{"model":"claude-opus-4-8","max_tokens":8192,"stream":true,"system":[{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."},{"type":"text","text":"be terse","cache_control":{"type":"ephemeral"}}],"messages":[{"role":"user","content":[{"type":"text","text":"first"},{"type":"text","text":"second"}]},{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"read","input":{"path":"a.zig"}},{"type":"text","text":"checking"}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","is_error":false,"content":"contents"}]},{"role":"assistant","content":[{"type":"tool_use","id":"t2","name":"write","input":{"path":"b"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"t2","is_error":true,"content":"done","cache_control":{"type":"ephemeral"}}]},{"role":"assistant","content":[{"type":"text","text":"all set","cache_control":{"type":"ephemeral"}}]}]}
 ;
 
 // Golden bytes keep the serialized prefix stable for Anthropic's server-side
@@ -670,7 +732,7 @@ const golden_items_api = [_]llm.Item{
 };
 
 const golden_api =
-    \\{"model":"claude-opus-4-8","max_tokens":8192,"stream":true,"thinking":{"type":"adaptive","display":"summarized"},"output_config":{"effort":"xhigh"},"system":[{"type":"text","text":"be terse","cache_control":{"type":"ephemeral"}}],"messages":[{"role":"user","content":[{"type":"text","text":"first"}]},{"role":"assistant","content":[{"type":"thinking","thinking":"weigh it","signature":"sig"},{"type":"tool_use","id":"t1","name":"read","input":{"path":"a.zig"}},{"type":"text","text":"all set","cache_control":{"type":"ephemeral"}}]}]}
+    \\{"model":"claude-opus-4-8","max_tokens":8192,"stream":true,"thinking":{"type":"adaptive","display":"summarized"},"output_config":{"effort":"xhigh"},"system":[{"type":"text","text":"be terse","cache_control":{"type":"ephemeral"}}],"messages":[{"role":"user","content":[{"type":"text","text":"first","cache_control":{"type":"ephemeral"}}]},{"role":"assistant","content":[{"type":"thinking","thinking":"weigh it","signature":"sig"},{"type":"tool_use","id":"t1","name":"read","input":{"path":"a.zig"}},{"type":"text","text":"all set","cache_control":{"type":"ephemeral"}}]}]}
 ;
 
 test "the api-key account omits the system header and keeps every other block" {
