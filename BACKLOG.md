@@ -43,9 +43,9 @@ decision already taken, or a dependency on another entry. Module layout and exte
 - **Show a model that no source describes** — such a model takes a disabled picker row that names
   what it lacks, and its selection opens the hint for the config key. _`Catalog.merge` returns null
   and the caller drops the model today, so it leaves the picker with no line. A picker row carries
-  the selection role or the muted role alone, so the row needs a third role. The `No model` row of
-  the `/review` setup takes that same role, and the effort marker entry below needs it too. The hint
-  names the config key of the model metadata feature, so land that feature first._
+  the selection role or the muted role alone, so the row needs a third role, and the effort marker
+  entry below needs it too. The hint names the config key of the model metadata feature, so land
+  that feature first._
 - **Mark an effort level that the model does not name** — the effort picker marks a level that
   folds, so the fold is visible before the choice. _The ladder prints the tag alone today._
 - **Show tokens per second during a turn** — the status line states the rate of the running turn.
@@ -94,13 +94,10 @@ decision already taken, or a dependency on another entry. Module layout and exte
   from `/v1/models`. _The server speaks the chat/completions API, so this needs a third transport
   with its own stream shape and tool-call format. It depends on the config metadata entry, because
   `/v1/models` describes no model and prices none._
-- **A herdr state socket** — Drinky reports a turn end, a failure, a review hold, and a settlement
-  over a socket, so herdr can notify the user. _The channel carries state outward alone, and nothing
-  outside Drinky drives the session. Herdr holds a terminal open, so the work survives a closed lid.
-  See <https://herdr.dev>._
-- **A review record** — Drinky writes each generated request and each role report into one
-  plain-text file per review, so the prompts improve from real runs. _The file holds no tool call,
-  no tool result, and no message of the user, because that traffic buries the material._
+- **A herdr state socket** — Drinky reports a turn end and a failure over a socket, so herdr can
+  notify the user. _The channel carries state outward alone, and nothing outside Drinky drives the
+  session. Herdr holds a terminal open, so the work survives a closed lid. See
+  <https://herdr.dev>._
 
 ## Ideas
 
@@ -109,4 +106,3 @@ decision already taken, or a dependency on another entry. Module layout and exte
 - Restart the same prompt in a new session.
 - Benchmark models inside the Drinky harness.
 - Separate the changes of the user from the changes of Drinky with a git snapshot.
-- A rounds row in the `/review` setup, so a run picks its own ceiling.

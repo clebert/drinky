@@ -17,9 +17,6 @@ const login = @import("login.zig");
 const logout = @import("logout.zig");
 const model = @import("model.zig");
 const new = @import("new.zig");
-/// Public: the app opens the review setup pickers itself, because it seeds
-/// their choices from its project state before the first step.
-pub const review = @import("review.zig");
 const skill = @import("skill.zig");
 const system = @import("system.zig");
 const testing = @import("testing.zig");
@@ -51,7 +48,6 @@ const commands = [_]Entry{
     .{ .name = logout.name, .summary = logout.summary, .run = logout.run },
     .{ .name = model.name, .summary = model.summary, .run = model.run },
     .{ .name = new.name, .summary = new.summary, .run = new.run },
-    .{ .name = review.name, .summary = review.summary, .run = review.run },
     .{ .name = skill.name, .summary = skill.summary, .run = skill.run },
     .{ .name = system.name, .summary = system.summary, .run = system.run },
 };

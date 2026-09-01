@@ -4,10 +4,9 @@ dependency-free Zig program with a hand-written terminal renderer.
 ## Core rules
 
 A core rule outranks every precedent in the repository and every consistency argument. An existing
-behavior can be wrong. The judge of a review reads this list too.
+behavior can be wrong.
 
-- **An exit ends one thing.** No exit reaches past the step, the page, the turn, or the review that
-  holds it.
+- **An exit ends one thing.** No exit reaches past the step, the page, or the turn that holds it.
 - **Drinky destroys nothing without a decision.** Where a press can mean something else, Drinky
   warns, and the second press of the same key is the decision.
 - **A failure is not a decision.** Every draft and every message of the user survives it.

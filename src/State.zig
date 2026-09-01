@@ -33,8 +33,6 @@ const std = @import("std");
 
 const ai = @import("ai");
 
-const Review = @import("Review.zig");
-
 const State = @This();
 
 gpa: std.mem.Allocator,
@@ -55,11 +53,6 @@ start: Start,
 /// name is and a stored description goes stale behind it. The name lives in the
 /// model itself, so this allocates nothing.
 models: std.EnumArray(ai.llm.Account, ?ai.Model),
-/// The `/review` role choices of this project: the account, the model, and the
-/// effort level of each role. It starts from the file and takes every later
-/// confirmation. Null for a role the project never chose, and that role
-/// inherits the active session configuration when review starts.
-review: std.EnumArray(Review.Role, ?RoleChoice),
 /// The choices Drinky seeded or recorded last, so an unchanged choice writes
 /// nothing. Null until the first `seed` or `record`.
 saved: ?Saved,
@@ -78,15 +71,6 @@ pub const Start = struct {
     effort: ?ai.llm.Effort = null,
 };
 
-/// The setup of one `/review` role: the account that runs it, the model, and
-/// the effort level. The model names itself and describes nothing, like every
-/// other model this file holds.
-pub const RoleChoice = struct {
-    account: ai.llm.Account,
-    model: ai.Model,
-    effort: ai.llm.Effort,
-};
-
 /// The choices Drinky seeded or recorded last. `model` is an owned copy of the
 /// model name.
 const Saved = struct {
@@ -102,7 +86,6 @@ const Entry = struct {
     account: []const u8,
     effort: []const u8,
     models: Models,
-    review: ReviewRoles,
 
     /// The `models` object. It writes one field per account that has a model, so
     /// an account that ran none here costs nothing in the file. It borrows the
@@ -116,27 +99,6 @@ const Entry = struct {
                 const model = self.table.get(account) orelse continue;
                 try stringify.objectField(@tagName(account));
                 try stringify.write(model.name());
-            }
-            try stringify.endObject();
-        }
-    };
-
-    /// The `review` object. It writes one field per role that has a choice, so
-    /// a project that never chose a role costs nothing in the file. It borrows
-    /// the state's choice table alone, like `Models`.
-    const ReviewRoles = struct {
-        table: *const std.EnumArray(Review.Role, ?RoleChoice),
-
-        pub fn jsonStringify(self: ReviewRoles, stringify: anytype) !void {
-            try stringify.beginObject();
-            for (std.enums.values(Review.Role)) |role| {
-                const choice = self.table.get(role) orelse continue;
-                try stringify.objectField(@tagName(role));
-                try stringify.write(.{
-                    .account = @tagName(choice.account),
-                    .model = choice.model.name(),
-                    .effort = @tagName(choice.effort),
-                });
             }
             try stringify.endObject();
         }
@@ -184,7 +146,6 @@ pub fn inert(gpa: std.mem.Allocator, io: std.Io) State {
         .project = "",
         .start = .{},
         .models = .initFill(null),
-        .review = .initFill(null),
         .saved = null,
         .save_enabled = false,
         .save_pending = false,
@@ -213,7 +174,6 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, options: *const OpenOptions) !St
         .project = project,
         .start = .{},
         .models = .initFill(null),
-        .review = .initFill(null),
         .saved = null,
         .save_enabled = true,
         .save_pending = false,
@@ -262,42 +222,6 @@ pub fn record(
     self.save_pending = false;
 }
 
-/// Save the `/review` role choices of this project. Only a change writes the
-/// file, so a workflow that keeps its choices never touches it. The write
-/// carries the whole entry, so it needs the main choices that `seed` or
-/// `record` kept. A state that never kept them holds the choices for the
-/// session alone.
-///
-/// A kept choice names its model and describes none, like every other model
-/// this file holds. The catalog owns every other field, and a fetch invalidates
-/// a copy of it.
-pub fn recordReview(
-    self: *State,
-    choices: *const std.EnumArray(Review.Role, ?RoleChoice),
-) !void {
-    const changed = !self.reviewUnchanged(choices);
-    for (std.enums.values(Review.Role)) |role| {
-        self.review.set(role, namedChoice(choices.get(role)));
-    }
-    if (!changed or !self.save_enabled) return;
-    const saved = self.saved orelse return;
-    try self.save(saved.account, saved.effort);
-    self.save_pending = false;
-}
-
-/// `choice` with the name of its model alone. A model that names itself again
-/// carries no window, no output limit, and no price that a fetch can invalidate.
-/// Every model reaches this call through `ai.Model.init`, so a name that fails
-/// there names no model at all, and the role then inherits the session.
-fn namedChoice(maybe_choice: ?RoleChoice) ?RoleChoice {
-    const choice = maybe_choice orelse return null;
-    return .{
-        .account = choice.account,
-        .model = ai.Model.init(choice.model.name()) catch return null,
-        .effort = choice.effort,
-    };
-}
-
 /// Write the whole project entry. A persistent failure stops later writes, and
 /// store contention keeps a snapshot pending.
 fn save(self: *State, account: ai.llm.Account, effort: ai.llm.Effort) !void {
@@ -305,7 +229,6 @@ fn save(self: *State, account: ai.llm.Account, effort: ai.llm.Effort) !void {
         .account = @tagName(account),
         .effort = @tagName(effort),
         .models = .{ .table = &self.models },
-        .review = .{ .table = &self.review },
     }, .{ .keys_max = projects_max }) catch |err| {
         if (err == error.StoreBusy) {
             self.save_pending = true;
@@ -335,23 +258,6 @@ fn read(self: *State) void {
             self.models.set(account, ai.Model.init(name) catch continue);
         }
     }
-    if (readObject(&entry, "review")) |roles| {
-        for (std.enums.values(Review.Role)) |role| {
-            self.review.set(role, readRoleChoice(&roles, @tagName(role)));
-        }
-    }
-}
-
-/// The `/review` role choice at `field`. A choice needs all three values, so a
-/// role with an absent or unusable part reads as nothing remembered, and that
-/// role inherits the active session configuration.
-fn readRoleChoice(roles: *const std.json.ObjectMap, field: []const u8) ?RoleChoice {
-    const entry = readObject(roles, field) orelse return null;
-    const account = readEnum(ai.llm.Account, &entry, "account") orelse return null;
-    const effort = readEnum(ai.llm.Effort, &entry, "effort") orelse return null;
-    const name = readString(&entry, "model") orelse return null;
-    const model = ai.Model.init(name) catch return null;
-    return .{ .account = account, .model = model, .effort = effort };
 }
 
 /// Adopt `model` as the one `account` ran here and return what the entry now
@@ -400,25 +306,6 @@ fn unchanged(
     if (saved.account != account or saved.effort != effort) return false;
     const named = model orelse return saved.model.len == 0;
     return named.sameName(saved.model);
-}
-
-/// Whether `choices` equals the kept role choices, so an unchanged confirmation
-/// writes nothing.
-fn reviewUnchanged(
-    self: *const State,
-    choices: *const std.EnumArray(Review.Role, ?RoleChoice),
-) bool {
-    for (std.enums.values(Review.Role)) |role| {
-        const kept = self.review.get(role);
-        const next = choices.get(role);
-        if ((kept == null) != (next == null)) return false;
-        const kept_choice = kept orelse continue;
-        const next_choice = next orelse continue;
-        if (kept_choice.account != next_choice.account) return false;
-        if (kept_choice.effort != next_choice.effort) return false;
-        if (!kept_choice.model.sameName(next_choice.model.name())) return false;
-    }
-    return true;
 }
 
 /// Replace the comparison snapshot. The model name is copied, so it survives
@@ -702,136 +589,6 @@ test "the state keeps the model name that a command recorded" {
     );
     try std.testing.expect(restarted.models.get(.openai_api) == null);
 }
-
-test "review role choices write with the entry and read back per role" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    const judge_model = ai.testing.model("gpt-5.6-sol");
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const home = try tmpHome(gpa, io, &tmp);
-    defer gpa.free(home);
-
-    var state = try openForTest(gpa, io, home);
-    defer state.deinit();
-    for (state.review.values) |maybe_choice| try std.testing.expect(maybe_choice == null);
-    try state.seed(.anthropic_api, test_model, .high);
-
-    // The confirmation writes the choices with the whole entry. The fixer stays
-    // unchosen, so the entry carries the two chosen roles alone.
-    var choices: std.EnumArray(Review.Role, ?RoleChoice) = .initFill(null);
-    choices.set(.reviewer, .{ .account = .anthropic_api, .model = test_model, .effort = .high });
-    choices.set(.judge, .{ .account = .openai_api, .model = judge_model, .effort = .xhigh });
-    try state.recordReview(&choices);
-    var file = (try ai.json_store.open(gpa, io, state.path)).?;
-    defer file.deinit();
-    const entry = file.entry("/work").?;
-    const review = entry.get("review").?.object;
-    try std.testing.expectEqual(@as(usize, 2), review.count());
-    try std.testing.expectEqualStrings(
-        "gpt-5.6-sol",
-        review.get("judge").?.object.get("model").?.string,
-    );
-    try std.testing.expectEqualStrings(
-        "xhigh",
-        review.get("judge").?.object.get("effort").?.string,
-    );
-    try std.testing.expectEqualStrings("anthropic_api", entry.get("account").?.string);
-
-    // A restart reads the chosen roles back, and the unchosen role stays null.
-    var restarted = try openForTest(gpa, io, home);
-    defer restarted.deinit();
-    const judge = restarted.review.get(.judge).?;
-    try std.testing.expectEqual(ai.llm.Account.openai_api, judge.account);
-    try std.testing.expectEqualStrings("gpt-5.6-sol", judge.model.name());
-    try std.testing.expectEqual(ai.llm.Effort.xhigh, judge.effort);
-    try std.testing.expect(restarted.review.get(.reviewer) != null);
-    try std.testing.expect(restarted.review.get(.fixer) == null);
-}
-
-// A role choice names a model and describes none, like every other model this
-// file holds. The catalog owns the window, the output limit, and the price, and
-// a fetch invalidates a copy of them.
-test "a recorded review choice keeps the model name alone" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const home = try tmpHome(gpa, io, &tmp);
-    defer gpa.free(home);
-
-    var state = try openForTest(gpa, io, home);
-    defer state.deinit();
-    try state.seed(.anthropic_api, test_model, .high);
-
-    var choices: std.EnumArray(Review.Role, ?RoleChoice) = .initFill(null);
-    choices.set(.judge, .{
-        .account = .openai_api,
-        .model = ai.testing.model("gpt-5.6-sol"),
-        .effort = .xhigh,
-    });
-    try state.recordReview(&choices);
-
-    const judge = state.review.get(.judge).?;
-    const named = ai.testing.bareModel("gpt-5.6-sol");
-    try std.testing.expect(judge.model.eql(&named));
-    // The account and the effort level of the role survive the strip.
-    try std.testing.expectEqual(ai.llm.Account.openai_api, judge.account);
-    try std.testing.expectEqual(ai.llm.Effort.xhigh, judge.effort);
-}
-
-test "a review role choice with an unusable part reads as nothing remembered" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const home = try tmpHome(gpa, io, &tmp);
-    defer gpa.free(home);
-    try writeForTest(io, &tmp,
-        \\{ "/work": { "account": "anthropic_api", "effort": "high",
-        \\    "models": {},
-        \\    "review": {
-        \\      "reviewer": { "account": "nope", "model": "claude-opus-5", "effort": "high" },
-        \\      "judge": { "account": "openai_api", "effort": "high" },
-        \\      "fixer": { "account": "anthropic_api", "model": "claude-opus-5" } } } }
-    );
-
-    // A wrong account, a missing model, and a missing effort level each drop
-    // their role alone. The main entry stays usable.
-    var state = try openForTest(gpa, io, home);
-    defer state.deinit();
-    for (state.review.values) |maybe_choice| try std.testing.expect(maybe_choice == null);
-    try std.testing.expectEqual(ai.llm.Account.anthropic_api, state.start.account.?);
-}
-
-test "an unchanged review confirmation writes nothing" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const home = try tmpHome(gpa, io, &tmp);
-    defer gpa.free(home);
-
-    var state = try openForTest(gpa, io, home);
-    defer state.deinit();
-    try state.seed(.anthropic_api, test_model, .high);
-    var choices: std.EnumArray(Review.Role, ?RoleChoice) = .initFill(null);
-    choices.set(.reviewer, .{ .account = .anthropic_api, .model = test_model, .effort = .high });
-    try state.recordReview(&choices);
-
-    // The same choices again find the file untouched, so a held lock cannot
-    // fail the confirmation.
-    const lock_path = try std.fmt.allocPrint(gpa, "{s}.lock", .{state.path});
-    defer gpa.free(lock_path);
-    var held = try std.Io.Dir.cwd().createFile(io, lock_path, .{
-        .truncate = false,
-        .lock = .exclusive,
-        .permissions = @enumFromInt(0o600),
-    });
-    defer held.close(io);
-    try state.recordReview(&choices);
-}
-
 test "temporary store contention leaves project-state saving enabled" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;

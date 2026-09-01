@@ -20,7 +20,6 @@ Use Drinky as it is, or fork it and add the features your workflow needs.
 3. **Focused context:** Harness guidance and skill instructions load only when needed.
 4. **Dynamic model catalog:** Drinky fetches current model information from providers only when you
    request it.
-5. **Structured review:** Separate roles find, verify, and fix defects.
 
 See [`FEATURES.md`](FEATURES.md) for the complete capability overview.
 
@@ -45,14 +44,13 @@ complete command list. You can also ask Drinky to explain its commands, keys, an
 
 - `/login` signs in. `/model` and `/effort` change the model and the reasoning effort.
 - `/skill` picks a discovered skill. `/skill:name` loads one skill with an optional task.
-- `/review` reviews pending changes with separate reviewer, judge, and fixer roles.
 - `/new` clears the conversation. `/system` shows the complete system prompt.
 
 ## Configuration
 
 The `~/.drinky/config.json` file is optional. It controls instruction files, request limits, denied
-shell commands, required skills, review rounds, and interface settings. Drinky reads the file only
-at startup and never writes it. You can keep it in version control.
+shell commands, required skills, and interface settings. Drinky reads the file only at startup and
+never writes it. You can keep it in version control.
 
 Ask the model to explain or maintain the file. The model can request a generated reference for every
 command, setting, key binding, and discovery rule.

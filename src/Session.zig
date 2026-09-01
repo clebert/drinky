@@ -30,9 +30,6 @@ const retry_title = "Failed turn";
 const retry_controls = "Ctrl+N: Try again · Esc: Dismiss";
 /// The control that returns pending steering to the editor.
 const steering_controls = "Ctrl+P: Edit all";
-/// The control that sends the draft at a review hold. The row names it only
-/// while the editor holds something to send.
-const review_send_control = "Enter: Send";
 /// The row bound of a caption above the editor: the title row and the control
 /// rows that fit. The bound keeps the chrome from crowding the input out of a
 /// narrow window. A control segment past the bound drops whole.
@@ -186,17 +183,6 @@ turn_origin: ?TurnOrigin,
 /// Whether a retry context waits at the prompt. `App` owns that context and
 /// mirrors this bit, so the editor caption names its state and controls.
 retry_shown: bool,
-/// The review caption above the editor, or null outside a review workflow. It
-/// outranks the retry caption, because its controls own the prompt then. The
-/// session owns the title bytes, and the workflow survives a conversation
-/// switch, so a switch leaves the caption in place.
-review_title: ?[]u8,
-/// The static controls beside `review_title`.
-review_controls: []const u8,
-/// Whether the user took part in the active review phase. `App` owns that
-/// state and mirrors this bit, so the running caption marks the boundary as
-/// one that holds, and its controls offer the key that arms the resume again.
-review_participated: bool,
 /// Milliseconds on the monotonic clock, written by the driver before each paint.
 /// The session does no io, so it cannot read a clock of its own. It stays zero
 /// until the first paint, which makes every span it reports zero. Every span of
@@ -403,12 +389,8 @@ const TurnOrigin = struct {
 /// types, so a key that a reflex can hit while typing warns first. Ctrl+D means
 /// leave this layer and nothing else, so it warns only where it destroys the
 /// draft, and Ctrl+C clears without a warning because the clear is its purpose.
-/// The end of a review destroys every role conversation, so each key that ends
-/// one warns at an unfinished hold, over a draft and over an empty editor
-/// alike. Ctrl+C is the one exception, because a draft takes that key for the
-/// clear. The settlement over an empty editor ends on one press, because the
-/// workflow reached its own end there. Each of those keys owns its
-/// confirmation, because only the same key can complete a warning.
+/// Each of those keys owns its confirmation, because only the same key can
+/// complete a warning.
 pub const Confirmation = enum {
     /// One unchanged Enter sends a refused command line to the model as typed.
     /// The prompt sends it as a message, and a turn queues it as steering. The
@@ -423,16 +405,6 @@ pub const Confirmation = enum {
     /// One more Ctrl+D quits over a draft. The first Ctrl+D with a draft arms
     /// it, because the quit discards the draft.
     quit,
-    /// One more Esc ends a review workflow at an unfinished hold. The end frees
-    /// every role conversation, so the first press warns there. The settlement
-    /// over an empty editor ends on one press instead.
-    review_stop_escape,
-    /// One more Ctrl+C ends a review workflow at a hold. A draft takes the key
-    /// away first, because the clear is its purpose.
-    review_stop_ctrl_c,
-    /// One more Ctrl+D ends a review workflow at a hold. It acts over a draft
-    /// too, because the end keeps that draft.
-    review_stop_ctrl_d,
 };
 
 /// A turn worker's message to the render consumer, tagged with the generation it
@@ -575,9 +547,6 @@ pub fn init(
         .steering_consumed_count = 0,
         .turn_origin = null,
         .retry_shown = false,
-        .review_title = null,
-        .review_controls = "",
-        .review_participated = false,
         .clock_ms = 0,
         .boot_clock_ms = 0,
         .bash_timeout_ms = (ai.tool.Context.Bash{}).timeout_ms,
@@ -590,7 +559,6 @@ pub fn init(
 }
 
 pub fn deinit(self: *Session) void {
-    self.setReviewCaption(null, "");
     self.deinitMode();
     self.clearNotice();
     self.clearSteering();
@@ -601,102 +569,18 @@ pub fn deinit(self: *Session) void {
     self.editor.deinit();
 }
 
-/// Replace the review caption. A null title removes it, and the session frees
-/// the title it replaces. The caption persists across frames and conversation
-/// switches, so the workflow controls survive a keypress, unlike a notice.
-pub fn setReviewCaption(self: *Session, title: ?[]u8, controls: []const u8) void {
-    if (self.review_title) |old| self.gpa.free(old);
-    self.review_title = title;
-    self.review_controls = controls;
-    self.dirty = true;
-}
-
-/// The control row of a review hold: the stored controls, with the send control
-/// ahead of them while the editor holds something to send. An empty editor
-/// names no key that does nothing. The row borrows `buffer`.
-fn reviewHoldControls(self: *const Session, buffer: []u8) []const u8 {
-    if (self.editor.blank()) return self.review_controls;
-    // A row that outgrew the buffer keeps the stored controls, so no key of the
-    // hold can go missing.
-    return std.fmt.bufPrint(buffer, "{s}{s}{s}", .{
-        review_send_control,
-        ui.paint.separator,
-        self.review_controls,
-    }) catch self.review_controls;
-}
-
-/// A conversation's whole presentation state: its own transcript, its request
-/// setup, its usage snapshot, and its steering mirror. `switchConversation`
-/// swaps a whole one in, so a caller that keeps the value the swap hands back
-/// can switch to it again and see the exact conversation it left, blocks and
-/// queued steering alike.
-pub const Conversation = struct {
-    transcript: Transcript,
-    account: ?ai.llm.Account,
-    model: ?ai.Model,
-    effort: ai.llm.Effort,
-    stats: ai.Agent.Stats = .{},
-    steering: std.ArrayList(ui.Editor.Draft) = .empty,
-    steering_retained_count: usize = 0,
-    steering_consumed_count: usize = 0,
-
-    /// A fresh conversation on the given setup, with no transcript block, no
-    /// usage, and no queued steering. A caller that switches to it and then
-    /// discards what the switch hands back, such as `/new`, never keeps this
-    /// value around.
-    pub fn empty(
-        gpa: std.mem.Allocator,
-        account: ?ai.llm.Account,
-        model: ?ai.Model,
-        effort: ai.llm.Effort,
-    ) Conversation {
-        return .{
-            .transcript = Transcript.init(gpa),
-            .account = account,
-            .model = model,
-            .effort = effort,
-        };
-    }
-
-    /// Forget the reasoning blocks that `account` produced in this parked
-    /// conversation. A parked conversation paints no row, so this changes no
-    /// screen state. The active conversation drops through
-    /// `Session.dropAccountReasoning` instead.
-    pub fn dropAccountReasoning(self: *Conversation, account: ai.llm.Account) void {
-        _ = self.transcript.dropAccount(account);
-    }
-
-    pub fn deinit(self: *Conversation, gpa: std.mem.Allocator) void {
-        self.transcript.deinit();
-        for (self.steering.items) |*draft| draft.deinit(gpa);
-        self.steering.deinit(gpa);
-    }
-};
-
-/// Switch the active conversation for `other`, in one shared operation, and
-/// leave the conversation this call replaces in `other`. This is the one
-/// operation that moves the interface to a different conversation: every field
-/// swaps whole, so the interface never appends one conversation's blocks or
-/// queued steering to the transcript of the other, and a caller that keeps
-/// `other` after the call can switch back to the exact conversation it left.
-///
-/// The deep repaint always runs, because the transcript changed regardless of
-/// whether the new setup would have kept the same blocks under the one before
-/// it. Active context projection follows from the swapped-in setup and
-/// transcript alone: the next paint projects exactly the blocks that setup
-/// keeps, and hides the rest until a switch back restores them.
-pub fn switchConversation(self: *Session, other: *Conversation) void {
+/// Clear the conversation and keep its request setup: drop every block, the
+/// usage snapshot, the queued steering, the notice, and every armed
+/// confirmation. The next paint clears the screen and the scrollback with them,
+/// so no row of the old conversation stays reachable. Only the prompt can clear,
+/// because a turn owns the transcript tail and the steering queue.
+pub fn clearConversation(self: *Session) void {
     std.debug.assert(self.mode == .prompt);
     self.clearNotice();
     self.confirmations = .initEmpty();
-    std.mem.swap(Transcript, &self.transcript, &other.transcript);
-    std.mem.swap(?ai.llm.Account, &self.account_shown, &other.account);
-    std.mem.swap(?ai.Model, &self.model_shown, &other.model);
-    std.mem.swap(ai.llm.Effort, &self.effort_shown, &other.effort);
-    std.mem.swap(ai.Agent.Stats, &self.stats_shown, &other.stats);
-    std.mem.swap(std.ArrayList(ui.Editor.Draft), &self.steering, &other.steering);
-    std.mem.swap(usize, &self.steering_retained_count, &other.steering_retained_count);
-    std.mem.swap(usize, &self.steering_consumed_count, &other.steering_consumed_count);
+    self.transcript.truncate(0);
+    self.stats_shown = .{};
+    self.clearSteering();
     self.view.resetScreen();
     self.dirty = true;
 }
@@ -773,10 +657,6 @@ pub fn armConfirmation(self: *Session, confirmation: Confirmation) void {
         .quit => std.debug.assert(self.mode == .prompt),
         .message => std.debug.assert(self.mode == .prompt or self.mode == .turn),
         .turn_cancel => std.debug.assert(self.mode == .turn),
-        .review_stop_escape,
-        .review_stop_ctrl_c,
-        .review_stop_ctrl_d,
-        => std.debug.assert(self.mode == .prompt),
     }
     self.confirmations.insert(confirmation);
 }
@@ -863,7 +743,7 @@ fn retryEventText(gpa: std.mem.Allocator, retry: *const ai.Agent.RetryAttempt) !
 
 /// Whether `applyTurnEvent` applies `event`. The generation gate is the one
 /// rule, so an event of a turn that already ended reaches no consumer of it.
-pub fn acceptsTurnEvent(self: *const Session, event: *const TurnEvent) bool {
+fn acceptsTurnEvent(self: *const Session, event: *const TurnEvent) bool {
     return switch (self.mode) {
         .turn => |*turn| event.generation == turn.generation,
         else => false,
@@ -872,7 +752,7 @@ pub fn acceptsTurnEvent(self: *const Session, event: *const TurnEvent) bool {
 
 /// Whether `applyCanceledTurnEvent` applies `event`. The drain reads the queue
 /// directly, so the sequence of the event must follow the applied one too.
-pub fn acceptsCanceledTurnEvent(self: *const Session, event: *const TurnEvent) bool {
+fn acceptsCanceledTurnEvent(self: *const Session, event: *const TurnEvent) bool {
     if (!self.acceptsTurnEvent(event)) return false;
     if (event.progress_sequence == 0) return true;
     const turn = &self.mode.turn;
@@ -1115,7 +995,6 @@ pub fn applyOutcome(self: *Session, outcome: ai.command.Outcome) !void {
         .switch_account,
         .credential_replaced,
         .new_conversation,
-        .review,
         .show_system_prompt,
         => unreachable,
     }
@@ -1358,7 +1237,7 @@ pub fn hasSteering(self: *const Session) bool {
 }
 
 /// Drop every steering draft and free its atoms.
-pub fn clearSteering(self: *Session) void {
+fn clearSteering(self: *Session) void {
     for (self.steering.items) |*draft| draft.deinit(self.gpa);
     self.steering.clearRetainingCapacity();
     self.steering_retained_count = 0;
@@ -1578,21 +1457,12 @@ pub fn paint(self: *Session, size: terminal.View.Size) !void {
     // The steering caption borrows this buffer through `layout.project` below.
     // The bytes hold the 17-byte label and every decimal `usize` value.
     var steering_title_buffer: [64]u8 = undefined;
-    // The review hold row borrows this buffer the same way. The bytes hold the
-    // send control, its separator, and the longest stored control row.
-    var review_controls_buffer: [96]u8 = undefined;
     const tail: layout.Tail = switch (self.mode) {
         .prompt => prompt: {
             self.editor.reflow(size);
             break :prompt .{
                 .prompt = .{
-                    // The review caption outranks the retry caption, because its
-                    // controls own the prompt while a workflow runs.
-                    .caption = if (self.review_title) |title| .{
-                        .title = title,
-                        .controls = self.reviewHoldControls(&review_controls_buffer),
-                        .rows_max = editor_caption_rows_max,
-                    } else if (self.retry_shown) .{
+                    .caption = if (self.retry_shown) .{
                         .title = retry_title,
                         .controls = retry_controls,
                         .rows_max = editor_caption_rows_max,
@@ -1604,19 +1474,10 @@ pub fn paint(self: *Session, size: terminal.View.Size) !void {
         .turn => |*turn| turn: {
             self.editor.reflow(size);
             const steering_count = self.steeringPendingCount();
-            // The boundary state reads live: a cleared draft arms the resume
-            // again, and only Ctrl+N clears the participation.
-            const draft_held = self.editor.visible().len != 0;
-            const boundary_held = self.review_participated or draft_held;
-            // A draft of whitespace alone queues no steering, so the send key
-            // reads the same boundary as the hold row.
-            const draft_sendable = !self.editor.blank();
             break :turn .{
                 .turn = .{
                     .tools = try turn.boxes(self.gpa, self.clock_ms),
                     .activity = turn.activity(),
-                    // Queued steering outranks the review caption, because its
-                    // count and recall control matter at that moment.
                     .caption = if (steering_count > 0) .{
                         .title = std.fmt.bufPrint(
                             &steering_title_buffer,
@@ -1624,26 +1485,6 @@ pub fn paint(self: *Session, size: terminal.View.Size) !void {
                             .{steering_count},
                         ) catch unreachable,
                         .controls = steering_controls,
-                        .rows_max = editor_caption_rows_max,
-                    } else if (self.review_title) |title| .{
-                        .title = title,
-                        // A held boundary stops the workflow, so it takes the
-                        // warning color, like a gauge under pressure.
-                        .state = if (boundary_held) "Resume: Hold" else "Resume: Auto",
-                        .state_role = if (boundary_held) .warning else .muted,
-                        // The row never offers a key that does nothing: Enter
-                        // needs a draft that the editor can send, and Ctrl+N
-                        // needs a participation. Esc cancels this turn and
-                        // ends no review, so every row names the cancel.
-                        .controls = if (self.review_participated)
-                            (if (draft_sendable)
-                                "Enter: Steer · Ctrl+N: Auto · Esc: Cancel"
-                            else
-                                "Ctrl+N: Auto · Esc: Cancel")
-                        else if (draft_sendable)
-                            "Enter: Steer · Esc: Cancel"
-                        else
-                            "Esc: Cancel",
                         .rows_max = editor_caption_rows_max,
                     } else null,
                     .editor = &self.editor,
@@ -2371,7 +2212,7 @@ test "a confirmation is one-shot and separate from its notice" {
     try std.testing.expect(!session.takeConfirmation(.message));
 }
 
-test "an event survives notice clearing until a conversation switch discards it" {
+test "an event survives notice clearing until a conversation clear discards it" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
@@ -2392,9 +2233,7 @@ test "an event survives notice clearing until a conversation switch discards it"
         session.transcript.blocks()[0].content.event.text.items,
     );
     session.dirty = false;
-    var fresh = Conversation.empty(gpa, .anthropic_subscription, test_model, .none);
-    session.switchConversation(&fresh);
-    fresh.deinit(gpa);
+    session.clearConversation();
     try std.testing.expectEqual(@as(usize, 0), session.transcript.blocks().len);
     try std.testing.expect(session.notice == null);
     // The post-condition the app depends on: a dirty model and a pending screen
@@ -4260,11 +4099,10 @@ test "dropped account reasoning leaves the transcript for good" {
     try std.testing.expect(!session.view.force_reset);
 }
 
-// Conversation switching is the one shared operation that moves the interface
-// to a different conversation, and back again. It swaps whole rather than
-// appending, so it never mixes the blocks of the two, and a caller that keeps
-// what the swap hands back can restore the exact conversation it left.
-test "a conversation switch swaps whole and can restore what it replaced" {
+// A conversation clear drops every block from the screen and the scrollback,
+// even where the setup alone would keep them. It keeps the request setup, and
+// it empties the usage snapshot and the steering queue with the blocks.
+test "a conversation clear drops every block and keeps the request setup" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
@@ -4276,177 +4114,31 @@ test "a conversation switch swaps whole and can restore what it replaced" {
     try applyEvent(&session, 1, .{ .thinking = try gpa.dupe(u8, "weigh it") });
     try applyEvent(&session, 1, .{ .text = try gpa.dupe(u8, "the answer") });
     try finishTurn(&session, 0);
+    session.stats_shown.cost = 1.5;
+    try session.editor.insert("later");
+    try session.reserveSteering();
+    var draft = session.editor.detachTrimmed();
+    session.commitSteeringDraft(&draft);
     try session.paint(.{ .columns = 80, .rows = 24 });
 
     // The same account and model would keep both blocks under a plain setup
-    // change, because the projection would not change. A conversation switch
-    // must discard them from the screen anyway, since it moves to another
-    // conversation and must never append that conversation to this one's
-    // transcript.
+    // change, because the projection would not change. A clear must discard
+    // them from the screen anyway.
     session.view.force_reset = false;
-    var other = Conversation.empty(gpa, .anthropic_subscription, test_model, replaying_effort);
-    other.stats.cost = 1.5;
-    session.switchConversation(&other);
+    session.clearConversation();
     try std.testing.expectEqual(@as(usize, 0), session.transcript.blocks().len);
     try std.testing.expect(session.view.force_reset);
-    try std.testing.expectEqual(@as(f64, 1.5), session.stats_shown.cost);
-    try std.testing.expectEqual(@as(?ai.llm.Account, .anthropic_subscription), session.account_shown);
-
-    const switched_start = out.written().len;
-    try session.paint(.{ .columns = 80, .rows = 24 });
-    const switched = try terminal.View.plainText(gpa, out.written()[switched_start..]);
-    defer gpa.free(switched);
-    try std.testing.expect(std.mem.indexOf(u8, switched, "weigh it") == null);
-    try std.testing.expect(std.mem.indexOf(u8, switched, "the answer") == null);
-
-    // A block the new conversation appends after the switch starts the fresh
-    // transcript alone. `other` now holds the parked conversation, exactly as
-    // the switch left it, cost and all.
-    try session.transcript.append(.intro, .{}, "fresh conversation");
-    try std.testing.expectEqual(@as(usize, 1), session.transcript.blocks().len);
-
-    // Switching to `other` again restores every block of the parked
-    // conversation and its own cost. This is a real swap, not a one-way reset:
-    // the fresh conversation this call now discards into `other` never mixes
-    // with what it restores.
-    session.view.force_reset = false;
-    session.switchConversation(&other);
-    defer other.deinit(gpa);
-    try std.testing.expectEqual(@as(usize, 2), session.transcript.blocks().len);
     try std.testing.expectEqual(@as(f64, 0), session.stats_shown.cost);
-    try std.testing.expect(session.view.force_reset);
+    try std.testing.expect(!session.hasSteering());
+    try std.testing.expectEqual(@as(?ai.llm.Account, .anthropic_subscription), session.account_shown);
+    try std.testing.expectEqualStrings(test_model.name(), session.model_shown.?.name());
+    try std.testing.expectEqual(replaying_effort, session.effort_shown);
 
-    const restored_start = out.written().len;
+    const cleared_start = out.written().len;
     try session.paint(.{ .columns = 80, .rows = 24 });
-    try expectPainted(gpa, out.written()[restored_start..], "weigh it");
-}
-
-// The running review caption marks the next boundary live: text in the editor
-// holds it and releases when the editor clears, and participation holds it
-// until the app clears that flag. The controls offer a key only while it does
-// something: Enter needs a draft that the editor can send, and Ctrl+N needs a
-// participation.
-test "the review caption marks whether the boundary resumes by itself" {
-    const gpa = std.testing.allocator;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var session = Session.init(gpa, &out.writer, test_model, .none);
-    defer session.deinit();
-    session.beginTurn(1);
-    session.setReviewCaption(try gpa.dupe(u8, "Judge: Round 1 of 4"), "Esc: Cancel");
-
-    // An empty editor without participation resumes by itself, and the row
-    // offers no steer key without a draft.
-    var start = out.written().len;
-    try session.paint(.{ .columns = 120, .rows = 24 });
-    try expectPainted(gpa, out.written()[start..], "Resume: Auto");
-    {
-        const idle = try terminal.View.plainText(gpa, out.written()[start..]);
-        defer gpa.free(idle);
-        try std.testing.expect(std.mem.indexOf(u8, idle, "Enter: Steer") == null);
-    }
-
-    // Whitespace alone holds the boundary and sends nothing, so the row marks
-    // the hold and still offers no steer key.
-    try session.editor.insert("  ");
-    start = out.written().len;
-    try session.paint(.{ .columns = 120, .rows = 24 });
-    try expectPainted(gpa, out.written()[start..], "Resume: Hold");
-    {
-        const spaces = try terminal.View.plainText(gpa, out.written()[start..]);
-        defer gpa.free(spaces);
-        try std.testing.expect(std.mem.indexOf(u8, spaces, "Enter: Steer") == null);
-    }
-    session.editor.clear();
-
-    // Text in the editor holds the boundary, shows the steer key, and colors
-    // the held state. A cleared editor arms the resume again.
-    try session.editor.insert("wait");
-    start = out.written().len;
-    try session.paint(.{ .columns = 120, .rows = 24 });
-    try expectPainted(gpa, out.written()[start..], "Resume: Hold");
-    try expectPainted(gpa, out.written()[start..], "Enter: Steer");
-    const held_state = comptime ui.role.sequence(.warning) ++ "Resume: Hold";
-    try std.testing.expect(std.mem.indexOf(u8, out.written()[start..], held_state) != null);
-    session.editor.clear();
-    start = out.written().len;
-    try session.paint(.{ .columns = 120, .rows = 24 });
-    try expectPainted(gpa, out.written()[start..], "Resume: Auto");
-
-    // Participation holds the boundary whatever the editor does, and the
-    // controls then offer the key that arms the resume again.
-    session.review_participated = true;
-    start = out.written().len;
-    try session.paint(.{ .columns = 120, .rows = 24 });
-    try expectPainted(gpa, out.written()[start..], "Resume: Hold");
-    try expectPainted(gpa, out.written()[start..], "Ctrl+N: Auto");
-
-    // The cleared flag arms the resume and takes the key out of the row.
-    session.review_participated = false;
-    start = out.written().len;
-    try session.paint(.{ .columns = 120, .rows = 24 });
-    const rearmed = try terminal.View.plainText(gpa, out.written()[start..]);
-    defer gpa.free(rearmed);
-    try std.testing.expect(std.mem.indexOf(u8, rearmed, "Resume: Auto") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rearmed, "Ctrl+N: Auto") == null);
-
-    // A hold caption at the prompt carries no marker, because no boundary can
-    // resume while the workflow waits.
-    session.endTurn();
-    start = out.written().len;
-    try session.paint(.{ .columns = 120, .rows = 24 });
-    const held = try terminal.View.plainText(gpa, out.written()[start..]);
-    defer gpa.free(held);
-    try std.testing.expect(std.mem.indexOf(u8, held, "Judge: Round 1 of 4") != null);
-    try std.testing.expect(std.mem.indexOf(u8, held, "Resume:") == null);
-}
-
-// A review hold waits for the user, and Enter acts there only over a draft. The
-// row therefore names the send key live, ahead of the stored controls, and an
-// empty editor names no key that does nothing.
-test "a review hold row names the send key only over a draft" {
-    const gpa = std.testing.allocator;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var session = Session.init(gpa, &out.writer, test_model, .none);
-    defer session.deinit();
-    session.setReviewCaption(
-        try gpa.dupe(u8, "Review hold: The judge settled the review"),
-        "Esc: Finish",
-    );
-
-    var start = out.written().len;
-    try session.paint(.{ .columns = 120, .rows = 24 });
-    {
-        const empty = try terminal.View.plainText(gpa, out.written()[start..]);
-        defer gpa.free(empty);
-        try std.testing.expect(std.mem.indexOf(u8, empty, "Esc: Finish") != null);
-        try std.testing.expect(std.mem.indexOf(u8, empty, "Enter: Send") == null);
-    }
-
-    // Whitespace alone sends nothing, so the row stays as it is.
-    try session.editor.insert("  ");
-    start = out.written().len;
-    try session.paint(.{ .columns = 120, .rows = 24 });
-    {
-        const spaces = try terminal.View.plainText(gpa, out.written()[start..]);
-        defer gpa.free(spaces);
-        try std.testing.expect(std.mem.indexOf(u8, spaces, "Enter: Send") == null);
-    }
-
-    // A draft with content names the key ahead of the stored controls.
-    try session.editor.insert("did you read the untracked files?");
-    start = out.written().len;
-    try session.paint(.{ .columns = 120, .rows = 24 });
-    try expectPainted(gpa, out.written()[start..], "Enter: Send · Esc: Finish");
-
-    // The cleared editor takes the key out of the row again.
-    session.editor.clear();
-    start = out.written().len;
-    try session.paint(.{ .columns = 120, .rows = 24 });
-    {
-        const cleared = try terminal.View.plainText(gpa, out.written()[start..]);
-        defer gpa.free(cleared);
-        try std.testing.expect(std.mem.indexOf(u8, cleared, "Enter: Send") == null);
-    }
+    const cleared = try terminal.View.plainText(gpa, out.written()[cleared_start..]);
+    defer gpa.free(cleared);
+    try std.testing.expect(std.mem.indexOf(u8, cleared, "weigh it") == null);
+    try std.testing.expect(std.mem.indexOf(u8, cleared, "the answer") == null);
+    try std.testing.expect(std.mem.indexOf(u8, cleared, "later") == null);
 }

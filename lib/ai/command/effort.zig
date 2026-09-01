@@ -19,9 +19,8 @@ const testing = @import("testing.zig");
 pub const name = "effort";
 pub const summary = "set the reasoning-effort level";
 
-/// The whole ladder, in order. The role effort step of `/review` offers the
-/// same rows, so both pickers read one list.
-pub const ladder = std.enums.values(llm.Effort);
+/// The whole ladder, in order.
+const ladder = std.enums.values(llm.Effort);
 
 pub fn run(context: *Context) !Context.Outcome {
     var options: Context.Outcome.Options = .{ .gpa = context.gpa };

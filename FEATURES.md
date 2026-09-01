@@ -120,12 +120,9 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - With no account at all, the login picker opens by itself.
 - While signed out, Drinky refuses a message with a prompt to `/login`.
 - Reasoning replays only to the account that produced it. A login, a logout, or a credential
-  replacement discards that account's reasoning, cache-hit rate, and allowance. A review workflow
-  parks conversations, and each parked one discards the same reasoning.
+  replacement discards that account's reasoning, cache-hit rate, and allowance.
 - Drinky shows only the conversation that the next request carries, so a change that drops stored
   reasoning repaints the screen and the scrollback without it.
-- A conversation switch swaps the agent, its history, and the interface together, so the worker and
-  the screen never disagree or mix two conversations.
 
 ## Signing in
 
@@ -168,9 +165,6 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
   and the model of the turn resolves the picked one.
 - **/login** — sign in, switch to an account already signed in, or name the API key to set.
 - **/logout** — drop a signed-in account's credentials and hand the session to another account.
-- **/review** — review every pending change from `HEAD` in bounded rounds: a fresh reviewer finds
-  defects, a persistent judge validates and settles, and a fresh fixer applies the accepted
-  findings.
 - **/new** — clear the conversation, usage stats, and steering without changing its configuration.
   The next paint drops the terminal scrollback, so the empty conversation starts on a clean screen.
   The intro line returns with it, and the source summary does not.
@@ -197,87 +191,6 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - A local command failure temporarily replaces the footer until the next user action.
 - A command that can run stays in the editor while a turn runs, and one notice names the command and
   the restriction. The next Enter runs it once the turn ends.
-
-## Reviewing changes
-
-- `/review` needs a Git worktree, and its target is every staged, unstaged, and untracked change
-  from `HEAD`. Drinky itself runs no Git command and never touches the index.
-- A role whose remembered model the account no longer offers names `No model`, and the start row
-  refuses until the user picks one. Drinky substitutes no other model for that choice.
-- The model step of a role leads with the same fetch row as `/model`, so a role reaches an account
-  that no fetch ran for.
-- The setup picker chooses the account, the model, and the effort level of each role, and the
-  project remembers a confirmed choice. An unchosen role inherits the active session configuration.
-  A role choice never replaces the project choices of the main conversation.
-- Every role runs in its own conversation with the shared instructions, skills, and tools. The
-  reviewer and the judge work under nonmutation prompts, and the fixer changes files like a normal
-  turn.
-- Each generated request records one head line that Drinky wrote, such as
-  `Request: Fixer · Round: 2 of 10 · Pass: 1`. The request itself stays out of the transcript, like
-  a loaded skill file and a retry request. A caption above the editor names the round, the active
-  role, and the controls.
-- The editor and the messages of the user are the brake. A phase runs unattended while the editor
-  holds no text and the user sent nothing to the active role. An unattended phase starts the next
-  phase by itself, and an attended phase holds at its boundary, so the reply waits for a read before
-  the role resets. Enter steers the active role, and a message that reaches the reviewer or the
-  fixer gets one judge copy, so a report never reads as a user instruction.
-- Each reviewer and fixer report resolves every message of the user as accepted or dismissed with a
-  reason. The judge checks each resolution against its verbatim copy.
-- A mid-turn Ctrl+N makes a steered phase unattended again, so an empty editor lets it resume by
-  itself. The running caption marks the next boundary as `Resume: Auto` or `Resume: Hold`, live
-  against the editor and the messages. The held state takes the warning color, and every control row
-  names Enter only while the editor holds something to send.
-- A message that the user sends at a hold runs as its own turn under the round caption. A failure
-  that commits nothing returns the text to the editor and the workflow to that hold.
-- Every role reply must start with its marker line: `Findings:`, `Decision:`, or `Applied:`. A
-  marked reply is a report, and every report is one of three kinds. A handover enables a transition
-  to another role. A dispute is a handover from the fixer back to the judge. Only the judge can
-  issue a question about an open product choice, and a question waits for the decision of the user.
-  A settlement declares the review complete and waits for the user to finish it.
-- The judge decides wording and technical matters. It asks the user before it selects interaction
-  logic, observed behavior, a key binding, a default, a workflow step, or the interface shape.
-- Each report leaves one pending outcome: a role transition, a required answer, or a review finish.
-  A handover also carries what the next role needs, so Drinky stores it until that request goes out.
-  A rejected dispute gets one more fixer pass while the pass budget has one left.
-- The judge can name one closing fix on its decision line. Each closing pass returns directly to the
-  judge, which verifies the fix and settles without a fresh reviewer round.
-- A pass budget holds two fixer passes, and a closing fix spends the same two. The judge asks the
-  user when both passes fail to complete the fix.
-- A committed message to the judge refills a spent pass budget in the same reviewer round. Each
-  later message can refill another spent budget, while an uncommitted message changes nothing.
-- Drinky holds the review when the judge asks for another fix before a user message refills the
-  spent pass budget.
-- A message that reaches the active role consumes or invalidates the outcome of its previous report.
-  It makes a handover stale, answers a question, or challenges a settlement. The role must produce a
-  fresh report before the workflow proceeds.
-- If a turn fails after the message commits, the message survives and the previous outcome stays
-  discarded. The retry continues that role turn. If the turn commits nothing, the role never saw the
-  message, so the previous report and its outcome remain valid.
-- An unmarked reply is no report. A role that received a message of the user can answer in prose,
-  and that answer sends no correction request. Without such a message, Drinky asks for the report
-  once. A draft can brake that correction request before it goes out.
-- A phase without a report holds in the role context, and no key continues the workflow there. The
-  user asks the role for a report, and the next marked reply supplies a fresh outcome.
-- The `review.rounds_max` ceiling defaults to ten and bounds unattended rounds. A fresh judge
-  handover at the limit offers one added round, and that round applies the handover to the fixer.
-- A failed role request holds the workflow: Ctrl+N retries the committed work or resends the request
-  while one of the two stands behind it, and Ctrl+S reopens the setup of the failed role. A
-  credential replacement and a credential rejection end a role turn in that same hold, and neither
-  one changes a role choice.
-- A user turn that starts from a failure hold returns there when canceled, so the failed generated
-  request remains available for retry.
-- Esc, Ctrl+C, and Ctrl+D cancel a running role turn. The cancel ends that turn alone, and every
-  role conversation survives it. A worker that beats the cancel keeps its reply, and the phase then
-  holds at its boundary.
-- The same three keys end the workflow at a hold. At an unfinished hold each one warns first, and
-  only the second press of the same key ends the review. The settlement over an empty editor ends on
-  one press, and a draft there returns the warning for Esc and Ctrl+D. Ctrl+C clears that draft
-  first. Neither Ctrl+C nor Ctrl+D quits Drinky while a review runs.
-- The end restores the main conversation exactly and records one completion event with the rounds,
-  the fixer passes, and the review cost. An end at the settlement reports it as settled.
-- The end at the settlement moves the judge report into the editor as one `[Review: settled report]`
-  marker, below an existing draft. The user sends that report to the main conversation, or deletes
-  it with one keystroke. The transcript keeps no copy of it.
 
 ## Providers
 
@@ -512,8 +425,8 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
   and at most 32 KiB. Each source loads at most 32 files and 64 KiB, and one file loads once even
   when two paths or a symbolic link reach it. Drinky reports what it skips.
 - `~/.drinky/config.json` is optional: paths for user instructions, request and bash limits, a bash
-  deny list, a default effort level, the review round ceiling, the skills that a path requires, and
-  the interface settings. Drinky reads it only at startup, so a change applies at the next start.
+  deny list, a default effort level, the skills that a path requires, and the interface settings.
+  Drinky reads it only at startup, so a change applies at the next start.
 - It holds no secrets. API keys come from `ANTHROPIC_API_KEY` and `OPENAI_API_KEY`.
 - An unknown effort level and an interface value Drinky cannot use are reported. A key that Drinky
   does not know is reported too, so a typo never looks like an applied setting.
@@ -523,9 +436,9 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
   parses the file, so a new key that carries no description fails the build and the section cannot
   drift.
 - JSON store writes use owner-only sibling `.lock` files to coordinate Drinky instances.
-- `~/.drinky/state.json` remembers per project which account and effort level Drinky used last, the
-  model of each account, and the review role choices. It is machine-local, owner-only, and keeps the
-  1000 most recently changed projects. A repository is one project, keyed by its Git root.
+- `~/.drinky/state.json` remembers per project which account and effort level Drinky used last, and
+  the model of each account. It is machine-local, owner-only, and keeps the 1000 most recently
+  changed projects. A repository is one project, keyed by its Git root.
 - Drinky reads that file only at startup, so a change in one instance reaches only the next start. A
   persistent save failure is reported once and never stops the session.
 - `HOME` must be set, since the config, the credentials, and the state all live under `~/.drinky`.

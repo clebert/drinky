@@ -56,9 +56,8 @@ pub const Draft = struct {
 
     /// One collapsed atom: its half-open visible range `[start, end)`, its stable
     /// ID, and the owned exact payload bytes (no guards or label). A collapsed
-    /// large paste or a caller of `appendAtom` creates it. The range is exactly
-    /// the generated marker span. The editor never infers an atom from the bytes
-    /// of literal text.
+    /// large paste creates it. The range is exactly the generated marker span.
+    /// The editor never infers an atom from the bytes of literal text.
     pub const Atom = struct {
         start: usize,
         end: usize,
@@ -288,35 +287,6 @@ pub fn appendDraft(self: *Editor, source: *Draft) void {
     source.atoms.deinit(self.gpa);
     source.visible.deinit(self.gpa);
     source.* = .empty;
-}
-
-/// Append `payload` as one collapsed atom that shows `[{label}]`, after a
-/// blank-line separator when the draft already holds text. The atom behaves like
-/// a collapsed large paste: the caret crosses it whole, one keystroke deletes it,
-/// and a send expands it to the exact payload. The label carries no counter, so
-/// the caller states what the atom holds. The editor owns `payload` after a
-/// success, and the caller keeps it after a failure.
-pub fn appendAtom(self: *Editor, label: []const u8, payload: []u8) !void {
-    if (self.paste_id_next == std.math.maxInt(u64)) return error.PasteIdExhausted;
-    var source: Draft = .empty;
-    // A failure frees the buffers alone, because the payload belongs to the
-    // caller until the atom holds it.
-    errdefer {
-        source.atoms.deinit(self.gpa);
-        source.visible.deinit(self.gpa);
-    }
-    try source.visible.appendSlice(self.gpa, marker_guard ++ "[");
-    try source.visible.appendSlice(self.gpa, label);
-    try source.visible.appendSlice(self.gpa, "]" ++ marker_guard);
-    try source.atoms.append(self.gpa, .{
-        .start = 0,
-        .end = source.visible.items.len,
-        .id = self.paste_id_next,
-        .payload = payload,
-    });
-    try self.reserveDrafts(&.{source});
-    self.appendDraft(&source);
-    self.paste_id_next += 1;
 }
 
 /// Insert `lead` (when present) then every draft in `drafts`, in order and
@@ -1498,72 +1468,6 @@ test "appendDraft onto an empty draft adds no separator" {
     try editor.reserveDrafts(&.{recalled});
     editor.appendDraft(&recalled);
     try std.testing.expectEqualStrings("\u{200B}[Paste #1: 11 lines]\u{200B}", editor.visible());
-}
-
-test "appendAtom joins a labeled atom that one keystroke deletes" {
-    const gpa = std.testing.allocator;
-    var editor = Editor.init(gpa);
-    defer editor.deinit();
-    try editor.insert("draft");
-    const payload = try gpa.dupe(u8, "report body");
-    errdefer gpa.free(payload);
-    try editor.appendAtom("Review: settled report", payload);
-
-    // The label carries no counter, and the atom still takes the next ID, so no
-    // later paste can reuse it.
-    try std.testing.expectEqualStrings(
-        "draft\n\n\u{200B}[Review: settled report]\u{200B}",
-        editor.visible(),
-    );
-    try std.testing.expectEqual(@as(usize, 1), editor.draft.atoms.items.len);
-    try std.testing.expectEqual(@as(u64, 1), editor.draft.atoms.items[0].id);
-    try std.testing.expectEqual(@as(u64, 2), editor.paste_id_next);
-    try expectExpanded(&editor, .none, "draft\n\nreport body");
-
-    // The caret sits after the atom, so one backspace deletes the whole atom
-    // and the typed text survives it.
-    editor.backspace();
-    try std.testing.expectEqual(@as(usize, 0), editor.draft.atoms.items.len);
-    try std.testing.expectEqualStrings("draft\n\n", editor.visible());
-}
-
-test "appendAtom onto an empty draft adds no separator" {
-    const gpa = std.testing.allocator;
-    var editor = Editor.init(gpa);
-    defer editor.deinit();
-    const payload = try gpa.dupe(u8, "report body");
-    errdefer gpa.free(payload);
-    try editor.appendAtom("Review: settled report", payload);
-    try std.testing.expectEqualStrings(
-        "\u{200B}[Review: settled report]\u{200B}",
-        editor.visible(),
-    );
-    try expectExpanded(&editor, .none, "report body");
-}
-
-test "a failed appendAtom leaves the draft and the payload whole" {
-    var fail_index: usize = 0;
-    while (fail_index < 20) : (fail_index += 1) {
-        var failing = std.testing.FailingAllocator.init(
-            std.testing.allocator,
-            .{ .fail_index = fail_index },
-        );
-        const gpa = failing.allocator();
-        var editor = Editor.init(gpa);
-        defer editor.deinit();
-        editor.insert("keep") catch continue;
-
-        // The caller owns the payload until the atom holds it, so a failure
-        // frees it here and never twice.
-        const payload = gpa.dupe(u8, "report body") catch continue;
-        editor.appendAtom("Review: settled report", payload) catch {
-            gpa.free(payload);
-            try std.testing.expectEqualStrings("keep", editor.visible());
-            try std.testing.expectEqual(@as(u64, 1), editor.paste_id_next);
-            continue;
-        };
-        try std.testing.expectEqual(@as(usize, 1), editor.draft.atoms.items.len);
-    }
 }
 
 test "paste IDs stay unique across detach and append with no reuse" {

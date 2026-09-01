@@ -4,7 +4,6 @@
 const std = @import("std");
 
 const llm = @import("../llm.zig");
-const Model = @import("../Model.zig");
 const skills = @import("../skills.zig");
 const Accounts = @import("../Accounts.zig");
 const Agent = @import("../Agent.zig");
@@ -20,10 +19,6 @@ accounts: *Accounts,
 /// Runtime-discovered skills. Null where no skill can run: a dispatch of a fixed
 /// command line, and the command tests that do not need them.
 skill_registry: ?*const skills.Registry = null,
-/// The live review setup, so the `/review` pickers read and write one choice
-/// set across their steps. Null where no setup is open: a dispatch of a fixed
-/// command line, and the command tests that do not need it.
-review_setup: ?*ReviewSetup = null,
 /// The host hook that states a wait. Null where nothing paints: a dispatch of a
 /// fixed command line, and the command tests that do not need it.
 wait: ?Wait = null,
@@ -35,27 +30,6 @@ pub const Wait = struct {
     /// The host state that `paint` writes through. The host owns it.
     host: *anyopaque,
     paint: *const fn (*anyopaque, []const u8) void,
-};
-
-/// The transient state of the review setup pickers. The host owns one and
-/// hands a pointer through the context, so a selector reaches the choices
-/// without a closure. The host maps the roles onto its workflow.
-pub const ReviewSetup = struct {
-    choices: std.EnumArray(Role, Choice),
-    /// The role whose menus are open.
-    role: Role = .reviewer,
-
-    /// The three roles of the review workflow, in setup order.
-    pub const Role = enum { reviewer, judge, fixer };
-
-    /// The setup of one role. The model is null for a role whose stored choice
-    /// names a model that its account no longer offers. Drinky selects no
-    /// replacement for it, so the user picks one before the workflow starts.
-    pub const Choice = struct {
-        account: llm.Account,
-        model: ?Model,
-        effort: llm.Effort,
-    };
 };
 
 /// A slash command's result. Notice, event, picker, and prompt allocations
@@ -94,18 +68,10 @@ pub const Outcome = union(enum) {
     credential_replaced: llm.Account,
     /// Clear conversation and presentation state but keep the configuration.
     new_conversation,
-    /// A step of the review workflow that the app owns: open the setup, take a
-    /// confirmed role choice, or start the workflow.
-    review: ReviewAction,
     /// Show the complete provider-neutral system prompt assembled by the app.
     show_system_prompt,
 
     pub const Severity = enum { information, warning, failure };
-
-    /// What a review outcome asks the app to do. The setup opens the pickers,
-    /// a confirm persists a changed role choice, and the start runs the
-    /// workflow over the confirmed setup.
-    pub const ReviewAction = enum { setup, confirm, start };
 
     pub const Message = struct {
         /// Owned by the caller's allocator.

@@ -185,17 +185,15 @@ fn modelStep(context: *Context, account: llm.Account) !Context.Outcome {
 
 /// The label of the row that leads a model step over `count` models. It reads
 /// as a fetch while the account offers no model, because no list exists to
-/// refresh yet. The model step of `/review` leads its list with it too, so both
-/// pickers label one row alike.
-pub fn firstRow(count: usize) []const u8 {
+/// refresh yet.
+fn firstRow(count: usize) []const u8 {
     return if (count == 0) fetch_row else refresh_row;
 }
 
 /// Write the picker row of `model` under `account`. A model whose output limit
 /// no source states carries the mark, because a request for it then sends the
-/// low default of `Model.tokens_max_fallback`. The model step of `/review`
-/// builds its rows here too, so both pickers state one fact alike.
-pub fn row(
+/// low default of `Model.tokens_max_fallback`.
+fn row(
     options: *Context.Outcome.Options,
     account: llm.Account,
     model: *const Model,
@@ -343,14 +341,13 @@ fn fetchOutcome(
 /// The outcome of a fetch of `account` whose account list never arrived. The
 /// metadata request runs even then, so `metadata_save_failure` names the cache
 /// write that failed with it, and one line states both. The metadata that
-/// arrived serves this session alone. The role model step of `/review` reads the
-/// same outcome, so both commands treat one failure alike.
+/// arrived serves this session alone.
 ///
 /// A store that held the credential of another principal stopped the request
 /// before it ran. The evidence of that principal must leave the session, and
 /// only the app can drop it. The account therefore goes to the app in place of
 /// a line that states an error name and no step.
-pub fn fetchFailure(
+fn fetchFailure(
     gpa: std.mem.Allocator,
     account: llm.Account,
     models_failure: anyerror,
@@ -393,9 +390,8 @@ fn emptyNote(count: usize) []const u8 {
 /// model.
 ///
 /// A fetch that arrived and described no model returns the user to the same
-/// fetch row, so every line states that result too. The role model step of
-/// `/review` reads the same line, so both commands state one miss alike.
-pub fn fetchReport(
+/// fetch row, so every line states that result too.
+fn fetchReport(
     gpa: std.mem.Allocator,
     account: llm.Account,
     result: *const Accounts.Refresh,
