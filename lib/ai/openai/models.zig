@@ -160,7 +160,7 @@ fn get(
 
 /// Decode the Codex catalog. A model the backend hides from its own clients
 /// stays out, because the picker must offer what the user can run.
-pub fn parseSubscription(gpa: std.mem.Allocator, body: []const u8) ![]Model {
+fn parseSubscription(gpa: std.mem.Allocator, body: []const u8) ![]Model {
     var parsed = try std.json.parseFromSlice(std.json.Value, gpa, body, .{});
     defer parsed.deinit();
 
@@ -207,7 +207,7 @@ fn hidden(value: ?std.json.Value) bool {
 }
 
 /// Decode `GET /v1/models`, which states an id and nothing more.
-pub fn parseApi(gpa: std.mem.Allocator, body: []const u8) ![]Model {
+fn parseApi(gpa: std.mem.Allocator, body: []const u8) ![]Model {
     var parsed = try std.json.parseFromSlice(std.json.Value, gpa, body, .{});
     defer parsed.deinit();
 

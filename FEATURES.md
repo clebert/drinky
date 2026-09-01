@@ -229,8 +229,6 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
   accent title and muted controls share one row when they fit. At the first overflow, the title
   takes one row that never wraps and cuts with one `…` when too wide. The control segments wrap at
   their `·` boundaries under it, and a segment alone on a row that still overflows cuts with `…`.
-- A caption can carry one state segment between its title and its controls. The segment takes its
-  own color and packs before every control, so it survives them on a narrow row.
 - A row bound caps each caption: one row for a page, three for a picker or an editor state, none for
   the intro line. A control segment past the bound drops whole and leaves no mark. A one-row caption
   keeps the title and the longest prefix of whole segments, so the title survives longest.

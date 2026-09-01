@@ -1,25 +1,17 @@
-//! The composition root and event loop. It authenticates, wires the tty, agent,
-//! and `Session` together, then runs the interface off a single event channel.
-//! Producer tasks push `Session.UiEvent`s onto the channel. The consumer loop
-//! here drains them, drives the `Session` model, and paints through it.
+//! The composition root and event loop. It wires the tty, the agent, and the
+//! `Session` together, then runs the interface off one `std.Io.Queue` of
+//! `Session.UiEvent`. Four `io.concurrent` producers feed it: the input reader
+//! (`.keys`), the turn worker (generation-tagged `.turn` events), a one-shot
+//! frame timer (`.tick`), and a SIGWINCH watcher (`.resize`).
 //!
-//! Turn and stream I/O run off the UI thread. Four `io.concurrent` producers
-//! feed one `std.Io.Queue(Session.UiEvent)`: a long-lived input reader
-//! (stdin → `.keys`), the current turn worker (`agent.run` → generation-tagged
-//! `.turn` events), a one-shot frame timer (sleep → `.tick`), and a SIGWINCH
-//! watcher (self-pipe → `.resize`).
+//! A command runs on the consumer, so a step that reaches the network stops the
+//! interface and paints a wait line first through `Context.Wait`. The OAuth
+//! login is the one blocking step that leaves raw mode and prints its own
+//! prompts.
 //!
-//! A command runs on the consumer, so a command step that reaches the network
-//! stops the interface until it ends. Such a step paints a wait line first
-//! through `Context.Wait`, so the stop never reads as a hang. The OAuth login
-//! is the one blocking step that leaves raw mode and prints its own prompts.
-//!
-//! The consumer-owned model and rendering live in `Session`: the transcript,
-//! transient notice, live tail, editor, view, stats/model snapshots, and the
-//! `applyTurnEvent`/`paint` seam. `Session` is io-, tty-, and agent-free, so a
-//! test can drive the render loop from a scripted event sequence. `App` keeps
-//! only the io, tasks, tty, and agent wiring and the key/command/turn
-//! orchestration that drives the `Session`.
+//! `Session` owns the model and the rendering and is io-, tty-, and agent-free,
+//! so a test drives it from a scripted event sequence. `App` keeps the io, the
+//! tasks, the tty, the agent, and the key, command, and turn orchestration.
 
 const std = @import("std");
 
@@ -417,13 +409,10 @@ const OauthPrompt = struct {
     }
 
     pub fn showBrowserLaunchFailed(self: *OauthPrompt) !void {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        try self.writer.writeAll("Drinky could not open the browser. Open the URL above.\n");
-        try self.writer.flush();
+        try self.show("Drinky could not open the browser. Open the URL above.\n");
     }
 
-    pub fn showAuthorized(self: *OauthPrompt, path: []const u8) !void {
+    fn showAuthorized(self: *OauthPrompt, path: []const u8) !void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         try self.writer.writeAll("Drinky received authorization. Drinky saved the credentials to ");
@@ -432,7 +421,7 @@ const OauthPrompt = struct {
         try self.writer.flush();
     }
 
-    pub fn showSaveFailed(self: *OauthPrompt, path: []const u8, error_name: []const u8) !void {
+    fn showSaveFailed(self: *OauthPrompt, path: []const u8, error_name: []const u8) !void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         try self.writer.writeAll(
@@ -446,15 +435,12 @@ const OauthPrompt = struct {
         try self.writer.flush();
     }
 
-    pub fn showPasteInvalid(self: *OauthPrompt) !void {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        try self.writer.writeAll("The pasted line is not the callback URL. " ++
+    fn showPasteInvalid(self: *OauthPrompt) !void {
+        try self.show("The pasted line is not the callback URL. " ++
             "Paste the complete URL from the address bar.\n");
-        try self.writer.flush();
     }
 
-    pub fn showPasteFailed(self: *OauthPrompt, error_name: []const u8) !void {
+    fn showPasteFailed(self: *OauthPrompt, error_name: []const u8) !void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         try self.writer.print(
@@ -464,26 +450,25 @@ const OauthPrompt = struct {
         try self.writer.flush();
     }
 
-    pub fn showPasteTooLong(self: *OauthPrompt) !void {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        try self.writer.writeAll("The pasted line is too long for a callback URL. " ++
+    fn showPasteTooLong(self: *OauthPrompt) !void {
+        try self.show("The pasted line is too long for a callback URL. " ++
             "Paste only the URL from the address bar.\n");
-        try self.writer.flush();
     }
 
-    pub fn showPasteLate(self: *OauthPrompt) !void {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        try self.writer.writeAll("Drinky already received the response for this sign-in.\n");
-        try self.writer.flush();
+    fn showPasteLate(self: *OauthPrompt) !void {
+        try self.show("Drinky already received the response for this sign-in.\n");
     }
 
-    pub fn showPasteStopped(self: *OauthPrompt) !void {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        try self.writer.writeAll("Drinky no longer reads a pasted URL. " ++
+    fn showPasteStopped(self: *OauthPrompt) !void {
+        try self.show("Drinky no longer reads a pasted URL. " ++
             "The browser response still completes the sign-in.\n");
+    }
+
+    /// Write one trusted sentence under the lock.
+    fn show(self: *OauthPrompt, text: []const u8) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        try self.writer.writeAll(text);
         try self.writer.flush();
     }
 
@@ -901,23 +886,10 @@ pub fn run(
     try self.runLoop();
 }
 
-/// Give every field of a pinned `App` its start value. `run` and the test
-/// scaffolding both begin here, so one literal holds every default and the two
-/// cannot drift.
-///
-/// The literal is exhaustive, because Zig demands every field of it. A field added
-/// to `App` therefore fails this build until someone gives it a start value here,
-/// or marks it one that the caller owns.
-///
-/// Every value here allocates nothing, so a caller can overwrite one without a
-/// leak. `run` replaces most of them with the resources it discovers. An inert
-/// start costs one thing: a read before that discovery now finds an empty value
-/// rather than a crash. The compile-time guard is worth more than the crash.
-///
-/// Five fields stay `undefined`, because each one needs a live resource that only
-/// `run` can build, or a choice that only a test can make. A caller that reads one
-/// of the five must set it first. Three more hold storage: the two buffers take no
-/// start value, and the queue borrows one of them below.
+/// Give every field its start value. `run` and the test scaffolding both begin
+/// here, and the exhaustive literal fails the build for a field with no start.
+/// No value allocates, so a caller overwrites one without a leak. A field that
+/// stays `undefined` needs a live resource that only `run` or a test can build.
 fn initFields(self: *App, gpa: std.mem.Allocator, io: std.Io) void {
     self.* = .{
         .gpa = gpa,
@@ -1275,11 +1247,9 @@ fn armTick(self: *App) void {
 }
 
 /// Frame timer task: wait for the deadline, then push one `.tick`. It waits on
-/// the deadline itself, not on a duration, so the wait cannot drift with the time
-/// that the arming took. A deadline that has already gone returns at once, which
-/// is what `std.Io.Clock.Timestamp.wait` promises. Canceled at shutdown or when
-/// its frame is superseded. A cancel just drops the tick. It takes the deadline
-/// by value, so it reads no state the consumer can write.
+/// the deadline, not on a duration, so the arming time cannot drift the frame. A
+/// cancel drops the tick. The deadline arrives by value, so the task reads no
+/// state the consumer can write.
 fn frameTimer(self: *App, deadline_ns: i96) void {
     const deadline: std.Io.Clock.Timestamp = .{
         .raw = .fromNanoseconds(deadline_ns),
@@ -1325,17 +1295,9 @@ fn readInput(self: *App) void {
 }
 
 /// Transcript text for a turn the agent failed without a report through `onError`.
-/// These are the agent's own verdicts on a reply, not server messages, so each
-/// gets a sentence. A refusal or an unrecognized provider outcome is ordinary
-/// model behavior and must not read as an internal fault. A rejected credential
-/// reports only the provider result. The app records its account resolution. A
-/// busy credential store keeps the refreshed token in memory. The next turn
-/// retries its save before a provider request. Anything unmapped returns null,
-/// and the caller wraps its error name.
-///
-/// Every path that starts a turn refuses without a model, so `NoModel` reaches
-/// this only through a residual path. It maps to the same refusal, because the
-/// internal name helps no user.
+/// Each is the agent's own verdict on a reply, so it reads as a sentence and
+/// never as an internal fault. Anything unmapped returns null, and the caller
+/// wraps its error name.
 fn turnFailureText(err: anyerror) ?[]const u8 {
     return switch (err) {
         error.NoModel => no_model_refusal,
@@ -1447,16 +1409,10 @@ fn startEffort(self: *const App, configured: ?ai.llm.Effort) ai.llm.Effort {
     return self.state.start.effort orelse configured orelse effort_default;
 }
 
-/// Decode a stdin chunk into key events and apply each. Runs on the consumer, so
-/// a submitted line spawns a turn worker and ctrl-c cancels a running one.
-///
-/// An exit key that returns the session to the prompt — a page close, a picker
-/// cancel, a turn cancel — ends the chunk, and the keys behind it are dropped.
-/// Those keys are the rest of one exit attempt, such as the Esc and Ctrl+D of
-/// `\x1b\x04` from a terminal without the Kitty protocol. The prompt must never
-/// act on them, because Ctrl+D there quits Drinky and Ctrl+C there clears the draft
-/// the closed layer hid. Only an exit key drains, so a picker confirmation still
-/// keeps the characters typed behind it.
+/// Decode a stdin chunk into key events and apply each. An exit key that returns
+/// the session to the prompt ends the chunk and drops the keys behind it. Those
+/// keys are the rest of one exit attempt, such as `\x1b\x04` from a terminal
+/// without the Kitty protocol, and Ctrl+D at the prompt quits Drinky.
 fn handleKeys(self: *App, bytes: []const u8) !void {
     try self.input.feed(bytes);
     while (self.input.next()) |event| {
@@ -1576,16 +1532,11 @@ fn editKey(self: *App, event: *const terminal.Input.Key) !bool {
     return true;
 }
 
-/// Keys during a streaming turn. The editor stays live for steering: the user can
-/// type and edit, Enter queues a steering message, and Ctrl+P recalls the queue
-/// into the editor. Esc and Ctrl+D cancel the turn, and the cancel keeps the draft.
-///
-/// The two cancel keys differ on purpose. A draft signals that the user types, and
-/// a reflex Esc while typing can mean a dismiss or a clear, so Esc warns first and
-/// cancels on the second press. Ctrl+D means leave this layer and nothing else, so
-/// one press of it is a decision and cancels at once. The one-press Ctrl+D also
-/// keeps the legacy exit attempt Esc+Ctrl+D working while the Esc only warns.
-/// Ctrl+C keeps its prompt meaning and clears a draft first.
+/// Keys during a streaming turn. The editor stays live: Enter queues steering,
+/// and Ctrl+P recalls the queue. Esc and Ctrl+D cancel the turn and keep the
+/// draft. Esc warns first over a draft, because a reflex Esc while the user
+/// types can mean a dismiss or a clear. Ctrl+D cancels at once, so the legacy
+/// exit attempt Esc+Ctrl+D still works. Ctrl+C clears a draft first.
 fn handleTurnKey(self: *App, event: *const terminal.Input.Key) !void {
     if (try self.editKey(event)) return;
     switch (event.*) {
@@ -1625,17 +1576,11 @@ fn clearOrCancel(self: *App) !void {
     try self.cancelTurn();
 }
 
-/// Enter during a turn: queue the line as a steering message, shown at once and
-/// carried to the worker to fold into the turn. A slash line is never steering,
-/// and no command can run mid-turn, because a command can open a picker that a
-/// turn cannot host. Such a line takes the shared refusal path instead.
-///
-/// The registry decides first. A line it cannot run as typed keeps its own
-/// refusal, because an unknown name and an unwanted tail stay unrunnable after the
-/// turn ends. That refusal arms one Enter to queue the line as steering, so plain
-/// text that starts with a slash still reaches the turn. A runnable command has no
-/// such arm, because the next Enter runs it once the turn ends. The check itself
-/// runs no command.
+/// Enter during a turn: queue the line as steering. No command runs mid-turn,
+/// because a command can open a picker that a turn cannot host. A line the
+/// registry cannot run as typed keeps its refusal, which arms one Enter to queue
+/// it as steering. A runnable command has no such arm, because the next Enter
+/// runs it once the turn ends.
 fn submitSteering(self: *App) !void {
     if (self.session.editor.blank()) {
         self.session.cancelConfirmation(.message);
@@ -2185,16 +2130,10 @@ fn mirrorAgentState(self: *App) !void {
     try self.recordState();
 }
 
-/// Remember the account, model, and effort level this project now uses, so the
-/// next start resumes on them. The model stays with the account that ran it, so
-/// a switch away keeps it. Only a change writes the file. A failed write never
-/// stops the session, because this state is a convenience. A persistent failure
-/// stops later saves, so its report lands once and names the way out.
-///
-/// A signed-out session records nothing, because the entry names an account.
-/// This drops no user choice: `/model` refuses while no account is active, and
-/// a signed-out effort change stays in the agent until the next sign-in, which
-/// records it with the account it lands on.
+/// Remember the account, model, and effort level this project now uses. Only a
+/// change writes the file, and a failed write never stops the session. A
+/// signed-out session records nothing, because the entry names an account. A
+/// signed-out effort change stays in the agent until the next sign-in records it.
 fn recordState(self: *App) !void {
     const account = self.activeAccount() orelse return;
     self.state.record(account, self.agent.model, self.agent.effort) catch |err|
@@ -2457,16 +2396,10 @@ fn acceptFetchReplacement(self: *App, account: ai.llm.Account) !void {
     try self.mirrorAgentState();
 }
 
-/// Resolve a rejected refresh credential. Reload a replacement from another
-/// instance. Otherwise, leave the account and select the next account.
-///
-/// Both paths replace the credential of `account`, and a replacement another
-/// instance saved can represent another principal in the same account slot.
-/// Nothing that principal produced crosses that boundary, so the evidence goes
-/// before the two paths divide.
-///
-/// A conversation that keeps its own account takes the removal alone. It stays
-/// on that account, and the report names the sign-out and nothing else.
+/// Resolve a rejected refresh credential: reload a replacement that another
+/// instance saved, else leave the account and select the next one. Either way
+/// the credential changes principal, so the reasoning evidence of the account
+/// goes before the two paths divide.
 fn rejectCredential(self: *App, account: ai.llm.Account) !void {
     const adopts = self.adoptsCredential(account);
     var maybe_removal_error: ?anyerror = null;
@@ -2837,24 +2770,10 @@ fn leavePicker(self: *App) !void {
     }
 }
 
-/// Test scaffolding: an `App` with every field set, so no test reads a field that
-/// nothing set. A test overwrites what it drives after this call.
-///
-/// `initFields` owns the defaults and the guard, so a test app and a real one
-/// cannot drift. It leaves the `agent`, the `session`, and the `accounts`
-/// undefined, so a test builds each one that it uses. The state starts inert, so
-/// only a test that reads a saved choice opens a real one.
-///
-/// It leaves the `tty` and the resize watcher undefined. A terminal input test
-/// configures only the required `tty` fields. No test builds the resize watcher.
-/// A session rendering test paints through the session, never the terminal.
-///
-/// The key decoder and the skill registry start empty and own nothing. A test that
-/// feeds a key, or that loads a skill, must free that growth itself.
-///
-/// `gpa` is a parameter, because an OOM test drives the app through a
-/// `FailingAllocator` and every allocation of the app must reach it. The io is
-/// not, because every test runs on `std.testing.io`.
+/// Test scaffolding: an `App` on the defaults of `initFields`. A test builds the
+/// `agent`, the `session`, the `accounts`, and the `tty` that it uses, and it
+/// frees what a fed key or a loaded skill grows. `gpa` is a parameter so an OOM
+/// test reaches every allocation through a `FailingAllocator`.
 fn initForTest(self: *App, gpa: std.mem.Allocator) void {
     self.initFields(gpa, std.testing.io);
     // A test drives an app that already runs, so a key that quits can be seen.

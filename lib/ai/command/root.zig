@@ -132,7 +132,7 @@ pub fn parse(line: []const u8) ?[]const u8 {
 /// A caller that cannot host such a request refuses the line before it runs. The
 /// bare prefix names no skill and opens the skill list, so it expands nothing.
 /// `name` must come from `parse(line)`.
-pub fn loadsSkill(name: []const u8) bool {
+fn loadsSkill(name: []const u8) bool {
     return name.len > skill_prefix.len and std.mem.startsWith(u8, name, skill_prefix);
 }
 

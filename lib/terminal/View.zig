@@ -194,7 +194,7 @@ pub const Sink = struct {
 
     /// Append inert display text fitted to both `columns_max` and the row's
     /// remaining capacity. This lets a caller reserve trailing decoration.
-    pub fn textFitted(self: *Sink, bytes: []const u8, columns_max: usize) !void {
+    fn textFitted(self: *Sink, bytes: []const u8, columns_max: usize) !void {
         if (bytes.len == 0) return;
         try self.guard(bytes);
         const available = @min(columns_max, self.columns -| self.columns_written);
