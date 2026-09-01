@@ -6,7 +6,7 @@ planned work.
 
 Drinky is a terminal coding agent. You type a prompt. The model reads, searches, writes, and edits
 files in the working directory, and the conversation streams into your scrollback. Drinky talks to
-Anthropic and OpenAI through a subscription login or an API key.
+Anthropic and OpenAI through a subscription login, an Anthropic Console login, or an API key.
 
 ## Talking to it
 

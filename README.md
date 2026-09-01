@@ -3,8 +3,8 @@
 A dependency-free coding agent you can own end to end.
 
 Give Drinky a prompt in the terminal. The model can read, search, and change files or run commands
-in the working directory. Drinky talks to Anthropic and OpenAI, through a subscription login or an
-API key.
+in the working directory. Drinky talks to Anthropic and OpenAI, through a subscription login, an
+Anthropic Console login, or an API key.
 
 ## Philosophy
 
@@ -42,7 +42,9 @@ zig build -Doptimize=ReleaseSafe
 ./zig-out/bin/drinky
 ```
 
-Set `ANTHROPIC_API_KEY` or `OPENAI_API_KEY`. You can also use `/login` for a subscription account.
+Run `/login` to sign in with a subscription account or an Anthropic Console account. The Console
+login mints an API key in the browser and stores it, so no environment variable is needed. You can
+also set `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` by hand.
 
 ## Slash commands
 
@@ -67,8 +69,10 @@ separate files under `~/.drinky/`.
 ## Provider access
 
 API-key accounts use the public provider APIs. Subscription accounts use unsupported provider
-interfaces that can change or stop working. See the implementation notes for
-[Anthropic](lib/ai/anthropic/root.zig) and [OpenAI](lib/ai/openai/oauth.zig).
+interfaces that can change or stop working. The Anthropic Console account sits between them. Its key
+bills at API rates and uses the public API, but the login that mints it is unsupported. See the
+implementation notes for [Anthropic](lib/ai/anthropic/root.zig) and
+[OpenAI](lib/ai/openai/oauth.zig).
 
 Drinky is not affiliated with Anthropic or OpenAI.
 
