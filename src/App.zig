@@ -3370,11 +3370,6 @@ fn applyOutcome(self: *App, outcome: ai.command.Outcome) !void {
             .title = "System prompt",
             .content = self.prompt,
         }),
-        .show_colors => try self.session.openPage(&.{
-            .title = "Colors",
-            .content = "",
-            .presentation = .colors,
-        }),
         // The setup clears the editor itself once it opens, so a refusal keeps
         // the typed line. The early return skips the agent mirror below,
         // because a role setup must not overwrite the remembered project
@@ -6091,7 +6086,7 @@ test "a legacy escape byte closes a page after its wait" {
     defer app.input.deinit();
     app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
-    try app.session.openPage(&.{ .title = "Colors", .content = "", .presentation = .colors });
+    try app.session.openPage(&.{ .title = "Test page", .content = "body" });
 
     // A terminal without the Kitty protocol sends this one byte. It can still
     // start a longer sequence, so the page stays open while the wait runs.
@@ -6131,7 +6126,7 @@ test "a page close drops the rest of an exit attempt in one chunk" {
         app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
         defer app.session.deinit();
         try app.session.editor.insert("draft");
-        try app.session.openPage(&.{ .title = "Colors", .content = "", .presentation = .colors });
+        try app.session.openPage(&.{ .title = "Test page", .content = "body" });
 
         try app.handleKeys(chunk);
         try std.testing.expect(app.session.mode == .prompt);
@@ -6601,52 +6596,22 @@ test "/system opens the composed prompt alone and escape restores the conversati
     try std.testing.expect(std.mem.indexOf(u8, conversation_bytes, "System prompt") == null);
 }
 
-test "/colors opens the color preview page and ctrl+d restores the conversation" {
+// Ctrl+D closes a page and keeps Drinky running, so a terminal that drops the
+// Esc report still has a way out.
+test "ctrl+d closes a page and restores the conversation" {
     const gpa = std.testing.allocator;
-    const io = std.testing.io;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
 
     var app: App = undefined;
     app.initForTest(gpa);
-    app.prompt = "unused";
-    app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = test_anthropic_model,
-        .system = "unused",
-        .retry = .{},
-        .environ = .empty,
-    });
-    defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
     defer app.session.deinit();
 
     try app.session.transcript.append(.event, .{}, "history marker");
-    try app.session.editor.insert("/colors");
-    try app.submit();
-
+    try app.session.openPage(&.{ .title = "Test page", .content = "body" });
     try std.testing.expect(app.session.mode == .viewing);
-    try std.testing.expect(app.session.mode.viewing.presentation == .colors);
-    const page_start = out.written().len;
-    try app.session.paint(.{ .columns = 80, .rows = 12 });
-    const page_bytes = out.written()[page_start..];
-    try std.testing.expect(std.mem.indexOf(u8, page_bytes, "Colors") != null);
-    try std.testing.expect(std.mem.indexOf(u8, page_bytes, "Esc: Close") != null);
-    try std.testing.expect(std.mem.indexOf(u8, page_bytes, "M: Source") == null);
-    try std.testing.expect(std.mem.indexOf(u8, page_bytes, "ANSI slots 0 to 15") != null);
-    try std.testing.expect(std.mem.indexOf(u8, page_bytes, "history marker") == null);
 
-    // The M toggle has no source to show, so the presentation stays.
-    try app.handleKey(&.{ .char = 'm' });
-    try std.testing.expect(app.session.mode.viewing.presentation == .colors);
-    try app.handleKey(&.scroll_down);
-    try std.testing.expectEqual(@as(usize, 1), app.session.mode.viewing.scroll);
-    try app.handleKey(&.scroll_up);
-    try std.testing.expectEqual(@as(usize, 0), app.session.mode.viewing.scroll);
-    try app.handleKey(&.page_down);
-    try std.testing.expect(app.session.mode.viewing.scroll > 0);
-
-    // Ctrl+D closes the page and keeps Drinky running, so a terminal that drops the
-    // Esc report still has a way out.
     try app.handleKey(&.{ .ctrl = 'd' });
     try std.testing.expect(app.session.mode == .prompt);
     try std.testing.expect(app.running);

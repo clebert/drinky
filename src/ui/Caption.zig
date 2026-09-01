@@ -143,9 +143,8 @@ pub fn render(self: *const Caption, placement: *const paint.Placement) !usize {
 }
 
 /// Paint the one-row form inside an open sink row: the title, then the longest
-/// prefix of whole control segments that fits beside it. The colors preview
-/// uses this path, so its sample cannot diverge from the widget.
-pub fn renderRowCells(
+/// prefix of whole control segments that fits beside it.
+fn renderRowCells(
     self: *const Caption,
     sink: *terminal.View.Sink,
     columns: usize,

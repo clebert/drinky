@@ -2,15 +2,13 @@
 //! bounded body. The caption keeps an accent title and sheds whole muted
 //! control segments as the window narrows. Pages own their title and source,
 //! and can show rendered Markdown or the exact wrapped source. They preserve a
-//! source location across reflow. The colors presentation shows the generated
-//! color preview instead of a source.
+//! source location across reflow.
 
 const std = @import("std");
 
 const terminal = @import("terminal");
 
 const Caption = @import("Caption.zig");
-const colors = @import("colors.zig");
 const markdown = @import("markdown.zig");
 const paint = @import("paint.zig");
 
@@ -22,7 +20,6 @@ const hint = "↑/↓: Scroll · PgUp/PgDn: Page · Home/End: Jump";
 // report, not a second binding to learn.
 const controls_markdown = "Esc: Close · M: Source · " ++ hint;
 const controls_source = "Esc: Close · M: Render · " ++ hint;
-const controls_colors = "Esc: Close · " ++ hint;
 
 gpa: std.mem.Allocator,
 /// The semantic title in the fixed caption.
@@ -44,13 +41,12 @@ layout_presentation: Presentation,
 /// costs one pass over the content, so a scroll step reads it from here.
 layout_rows: usize,
 
-pub const Presentation = enum { markdown, source, colors };
+pub const Presentation = enum { markdown, source };
 
 pub const Options = struct {
     /// The semantic title in the fixed caption.
     title: []const u8,
-    /// The page's source. The colors presentation generates its body, so it
-    /// takes an empty content.
+    /// The page's source.
     content: []const u8,
     presentation: Presentation = .markdown,
 };
@@ -135,13 +131,12 @@ pub fn moveEnd(self: *Page, size: terminal.View.Size) void {
 }
 
 /// Toggle between rendered Markdown and exact source around the same source
-/// line. The colors presentation has no source, so it stays in place.
+/// line.
 pub fn toggleSource(self: *Page, size: terminal.View.Size) void {
     self.reflow(size);
     self.presentation = switch (self.presentation) {
         .markdown => .source,
         .source => .markdown,
-        .colors => return,
     };
     self.reflow(size);
 }
@@ -157,7 +152,6 @@ pub fn render(
     switch (self.presentation) {
         .markdown => try self.renderMarkdown(placement, size, caption_rows),
         .source => try self.renderSource(placement, size, caption_rows),
-        .colors => try self.renderColors(placement, size, caption_rows),
     }
 }
 
@@ -166,7 +160,6 @@ fn controls(self: *const Page) []const u8 {
     return switch (self.presentation) {
         .markdown => controls_markdown,
         .source => controls_source,
-        .colors => controls_colors,
     };
 }
 
@@ -200,20 +193,6 @@ fn renderMarkdown(
     try markdown.renderWindow(&body_placement, self.content, &.{
         .rows_max = @max(size.rows, 1) - caption_rows,
     });
-}
-
-fn renderColors(
-    self: *const Page,
-    placement: *const paint.Placement,
-    size: terminal.View.Size,
-    caption_rows: usize,
-) !void {
-    const body_base = placement.base + caption_rows;
-    // The derived placement copies its parent. Only the geometry changes.
-    var body_placement = placement.*;
-    body_placement.base = body_base;
-    body_placement.skip = body_base + self.scroll;
-    try colors.renderWindow(&body_placement, @max(size.rows, 1) - caption_rows);
 }
 
 fn renderSource(
@@ -253,7 +232,6 @@ fn totalRows(self: *const Page) usize {
     return switch (self.layout_presentation) {
         .markdown => markdown.rows(self.content, columns),
         .source => terminal.width.rows(self.content, columns),
-        .colors => colors.rows(),
     };
 }
 
@@ -282,9 +260,6 @@ fn sourceAtRow(self: *const Page, row: usize) usize {
             .row = row,
         }),
         .source => self.sourceOffsetAtRow(row),
-        // A preview row maps to itself: the row count never depends on the
-        // width, so the identity keeps the exact position across a reflow.
-        .colors => row,
     };
 }
 
@@ -295,7 +270,6 @@ fn rowAtSource(self: *const Page, source_offset: usize) usize {
             .source_offset = source_offset,
         }),
         .source => self.sourceRowAtOffset(source_offset),
-        .colors => @min(source_offset, colors.rows() -| 1),
     };
 }
 
@@ -450,53 +424,6 @@ test "source rendering is bounded and sanitizes terminal controls" {
     try std.testing.expect(std.mem.indexOf(u8, painted, "third") != null);
     try std.testing.expect(std.mem.indexOf(u8, painted, "\x1b[2J") == null);
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, painted, "\r\n"));
-}
-
-test "a colors page scrolls the preview and ignores the source toggle" {
-    const gpa = std.testing.allocator;
-    var page = try Page.init(gpa, &.{ .title = "Test page", .content = "", .presentation = .colors });
-    defer page.deinit();
-    const size: terminal.View.Size = .{ .columns = 80, .rows = 12 };
-    page.reflow(size);
-
-    const top = try renderForTest(&page, size);
-    defer gpa.free(top);
-    try std.testing.expect(std.mem.indexOf(u8, top, "Esc: Close") != null);
-    try std.testing.expect(std.mem.indexOf(u8, top, "M: Source") == null);
-    try std.testing.expect(std.mem.indexOf(u8, top, "ANSI slots 0 to 15") != null);
-
-    page.toggleSource(size);
-    try std.testing.expect(page.presentation == .colors);
-
-    page.moveEnd(size);
-    try std.testing.expectEqual(colors.rows() - (size.rows - 1), page.scroll);
-    const bottom = try renderForTest(&page, size);
-    defer gpa.free(bottom);
-    try std.testing.expect(std.mem.indexOf(u8, bottom, "(Current)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, bottom, "ANSI slots") == null);
-
-    // A narrow reflow keeps the exact row, because the caption keeps one row
-    // at every width and the preview row count is constant.
-    const scroll = page.scroll;
-    const narrow_size: terminal.View.Size = .{ .columns = 24, .rows = 12 };
-    page.reflow(narrow_size);
-    try std.testing.expectEqual(scroll, page.scroll);
-    // The narrow caption sheds whole control segments from the tail and keeps
-    // the close key, so the body loses no preview row to the caption.
-    const narrow = try renderForTest(&page, narrow_size);
-    defer gpa.free(narrow);
-    try std.testing.expectEqual(@as(usize, 1), page.captionRows(narrow_size));
-    try std.testing.expect(std.mem.indexOf(u8, narrow, "Esc: Close") != null);
-    try std.testing.expect(std.mem.indexOf(u8, narrow, "PgUp/PgDn: Page") == null);
-    try std.testing.expect(std.mem.indexOf(u8, narrow, "Home/End: Jump") == null);
-
-    // The end of the narrow page shows the last preview rows again, and the
-    // narrow window clips the tail label of the selected row.
-    page.moveEnd(narrow_size);
-    const tail = try renderForTest(&page, narrow_size);
-    defer gpa.free(tail);
-    try std.testing.expect(std.mem.indexOf(u8, tail, "The selected option") != null);
-    try std.testing.expect(std.mem.indexOf(u8, tail, "(Current)") == null);
 }
 
 // A one-row window holds the caption alone: the title, the close key, and the

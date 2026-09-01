@@ -1117,7 +1117,6 @@ pub fn applyOutcome(self: *Session, outcome: ai.command.Outcome) !void {
         .new_conversation,
         .review,
         .show_system_prompt,
-        .show_colors,
         => unreachable,
     }
     self.dirty = true;

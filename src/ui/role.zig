@@ -1,19 +1,17 @@
 //! The app's presentation roles: the one seam from a semantic role to the SGR
 //! bytes a row carries. A widget names a role and never writes a color of its
-//! own. The `colors` preview page is the one exception: it samples the raw
-//! ANSI slots so the user can judge the theme of the terminal.
+//! own.
 //!
 //! Drinky names no RGB value. A role emits the ANSI slots 0 to 7 and the default
 //! colors alone, so the theme of the terminal decides every value. The bright
 //! slots 8 to 15 stay out of the interface, because they do not read well in
-//! every theme. Only the preview page samples them. The terminal can select
-//! values for a dark or light theme. Drinky needs no palette or color
-//! configuration. Plain text writes no bytes, so it keeps the terminal
-//! foreground. The muted role uses faint intensity with the default foreground.
-//! The terminal derives this secondary tone from its own theme. A terminal that
-//! ignores faint shows muted text at normal intensity. Underline carries
-//! emphasis because bold and faint share one intensity. Double underline keeps
-//! an existing underline distinct.
+//! every theme. The terminal can select values for a dark or light theme.
+//! Drinky needs no palette or color configuration. Plain text writes no bytes,
+//! so it keeps the terminal foreground. The muted role uses faint intensity with
+//! the default foreground. The terminal derives this secondary tone from its own
+//! theme. A terminal that ignores faint shows muted text at normal intensity.
+//! Underline carries emphasis because bold and faint share one intensity. Double
+//! underline keeps an existing underline distinct.
 //!
 //! A filled message box takes one foreground color plus reverse video. The
 //! terminal swaps that color with its background. The box then keeps the

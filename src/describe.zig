@@ -239,7 +239,7 @@ test "the document states every command, key, and discovery rule" {
     try std.testing.expect(std.mem.indexOf(u8, text, "/unused/config.json") != null);
 
     // Every list opens under a blank line, so the Markdown reads as a list.
-    try std.testing.expect(std.mem.indexOf(u8, text, "must type.\n\n- `/colors`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "must type.\n\n- `/effort`") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "these keys:\n\n- Enter: Send\n") != null);
 
     // The keys come from the intro line, and each mode states its own keys after

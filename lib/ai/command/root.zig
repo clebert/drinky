@@ -12,7 +12,6 @@ const skills = @import("../skills.zig");
 pub const Context = @import("Context.zig");
 pub const Outcome = Context.Outcome;
 
-const colors = @import("colors.zig");
 const effort = @import("effort.zig");
 const login = @import("login.zig");
 const logout = @import("logout.zig");
@@ -46,7 +45,6 @@ const whitespace = " \t\r\n";
 
 /// Every command, in the order the command list shows them.
 const commands = [_]Entry{
-    .{ .name = colors.name, .summary = colors.summary, .run = colors.run },
     .{ .name = effort.name, .summary = effort.summary, .run = effort.run },
     .{ .name = help_name, .summary = help_summary, .run = runHelp },
     .{ .name = login.name, .summary = login.summary, .run = login.run },
@@ -429,16 +427,6 @@ test "run routes system" {
     try std.testing.expect((try run(&context, "/system")).? == .show_system_prompt);
 }
 
-test "run routes colors" {
-    var context: Context = .{
-        .gpa = undefined,
-        .io = undefined,
-        .agent = undefined,
-        .accounts = undefined,
-    };
-    try std.testing.expect((try run(&context, "/colors")).? == .show_colors);
-}
-
 test "trailing whitespace does not hide an unknown command name" {
     const gpa = std.testing.allocator;
     var context: Context = .{
@@ -547,7 +535,7 @@ test "a line without a name opens its list" {
                 try std.testing.expectEqual(commands.len - 1, pick.options.len);
                 // Alphabetical, the summary after the name, and no `/help` row.
                 try std.testing.expectEqualStrings(
-                    "/colors — preview every color and text style",
+                    "/effort — set the reasoning-effort level",
                     pick.options[0],
                 );
                 try std.testing.expectEqualStrings(

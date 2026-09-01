@@ -328,17 +328,6 @@ pub fn notice(placement: *const Placement, look: *const Notice, text: []const u8
     }
 }
 
-/// Paint one unbounded notice row inside an open sink row. The colors preview
-/// uses this path, so its event and source samples cannot diverge from a block.
-pub fn noticeCells(sink: *terminal.View.Sink, look: *const Notice, text: []const u8) !void {
-    try noticePrefix(sink, look, look.prefix);
-    try noticeBody(sink, look, text, .{
-        .role_active = look.prefix.len > 0,
-        .starts_part = true,
-    });
-    try attribute.apply(sink, .reset);
-}
-
 /// Paint the prefix in its role. An absent prefix emits no role bytes.
 fn noticePrefix(sink: *terminal.View.Sink, look: *const Notice, prefix: []const u8) !void {
     if (prefix.len == 0) return;
@@ -532,15 +521,6 @@ fn boxLine(placement: *const Placement, line: *usize, row: *const Line) !void {
     placement.sink.end(.{ .id = placement.id, .line = line.* });
 }
 
-/// The cells of the first box content row, without the row bookkeeping. The
-/// text wraps at the live box width. The row carries no emphasized run. The
-/// caller opens the row, applies the box color, and closes the style. The color
-/// preview page uses this fixed row.
-pub fn boxCells(sink: *terminal.View.Sink, columns: usize, text: []const u8) !void {
-    var iterator = terminal.width.wrapper(text, contentColumns(columns));
-    try boxLineCells(sink, columns, &.{ .content = iterator.next().?, .fit = .wrap });
-}
-
 fn boxLineCells(sink: *terminal.View.Sink, columns: usize, row: *const Line) !void {
     const room = contentColumns(columns);
     switch (row.fit) {
@@ -630,12 +610,6 @@ const SeparatorCell = struct { glyph: SeparatorGlyph, active: bool };
 const HorizontalWeights = struct { left: bool, right: bool };
 const RuleRange = struct { rule: Rule, start: usize, end: usize };
 const LabelOptions = struct { arrow: []const u8, more: usize, columns: usize };
-
-/// Optional activity and hidden-row label for a top separator.
-pub const SeparatorOptions = struct {
-    activity: ?Activity = null,
-    hidden_above: usize = 0,
-};
 
 /// Stream the input area that `framing` describes. It contains a labelled top
 /// separator, its open body rows, and a labelled bottom separator.
@@ -786,18 +760,6 @@ fn labelFits(columns: usize, label: []const u8) bool {
     return columns > used;
 }
 
-/// One complete top input separator across `columns`. The options can add its
-/// hidden-row label and the moving activity segment. The caller opens the row
-/// and closes the style. The color preview page samples the live painter.
-pub fn separatorCells(
-    sink: *terminal.View.Sink,
-    columns: usize,
-    options: *const SeparatorOptions,
-) !void {
-    const separators: Separators = .{ .columns = columns, .activity = options.activity };
-    try ruleCells(sink, &separators, .top, "↑", options.hidden_above);
-}
-
 fn drawRuleRange(
     sink: *terminal.View.Sink,
     separators: *const Separators,
@@ -917,24 +879,6 @@ fn writeSeparatorGlyph(
         .left_light_right_heavy => try sink.repeat("╼", count),
         .left_heavy_right_light => try sink.repeat("╾", count),
     }
-}
-
-test "box preview cells use the live wrap width" {
-    const gpa = std.testing.allocator;
-    var output: std.Io.Writer.Allocating = .init(gpa);
-    defer output.deinit();
-    var view = terminal.View.init(gpa, &output.writer);
-    defer view.deinit();
-
-    const sink = try view.beginFrame(.{ .columns = 10, .rows = 1 }, 1);
-    sink.begin();
-    try boxCells(sink, 10, "abcdefghijk");
-    try std.testing.expectEqual(@as(usize, 10), sink.columns_written);
-    sink.end(.{ .id = 0, .line = 0 });
-    try view.render();
-
-    try std.testing.expect(std.mem.indexOf(u8, output.written(), "abcdefghij") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output.written(), "abcdefghijk") == null);
 }
 
 // A box wraps its text between words, so a copy of its rows out of the terminal

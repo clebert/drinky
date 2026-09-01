@@ -176,8 +176,6 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
   The intro line returns with it, and the source summary does not.
 - **/system** — inspect the complete provider-neutral system prompt as rendered Markdown in a
   scrollable full-window page. `M` toggles its exact source.
-- **/colors** — preview ANSI slots 0 to 15, colored backgrounds, default styles, message boxes, text
-  roles, and input frames in a scrollable full-window page.
 - **/skill** — pick one of the discovered skills. Each row holds the first sentence of the skill
   description. Enter writes its `/skill:name ` line into the editor, so a task can follow. `/skill:`
   opens the same list.
