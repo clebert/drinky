@@ -11,22 +11,29 @@ API key.
 Drinky is a dependency-free Zig program. It needs no Node.js runtime or third-party package tree. A
 complete review covers Drinky and the Zig standard library.
 
+Drinky does one job: it runs an agent loop with a small set of file and shell tools. It ships no
+sub-agents, no workflow mode, and no opinion about how the model does its work. Those rules live in
+your instruction files, where you can read and change them.
+
 Use Drinky as it is, or fork it and add the features your workflow needs.
 
 ## Highlights
 
-1. **Terminal-native interface:** The conversation stays in scrollback.
-2. **User control:** Steering and failures never discard finished work.
-3. **Focused context:** Harness guidance and skill instructions load only when needed.
-4. **Dynamic model catalog:** Drinky fetches current model information from providers only when you
-   request it.
+1. **Terminal-native:** The conversation stays in the normal scrollback.
+2. **One job:** An agent loop and seven tools, with no sub-agents and no workflow mode.
+3. **Small system prompt:** The compiled prompt states the mechanics. Your instruction files and
+   skills carry every rule about how to work.
+4. **Self-describing:** The model can read every command, setting, and key binding of Drinky, so it
+   can maintain your config for you.
+5. **No compiled-in models:** Every model, limit, and price comes from the provider at runtime.
 
 See [`FEATURES.md`](FEATURES.md) for the complete capability overview.
 
 ## Build and run
 
-Drinky requires Zig 0.16.0, a POSIX system, and the `HOME` variable. A modern terminal gives the
-best experience. The project uses [Ghostty](https://ghostty.org/) for development and testing.
+Drinky requires Zig 0.16.0, a POSIX system, and the `HOME` variable. A terminal with the Kitty
+keyboard protocol and grapheme cluster processing gives the best experience. The project uses
+[Ghostty](https://ghostty.org/) for development and testing.
 
 Build and run the `ReleaseSafe` executable:
 
@@ -48,12 +55,11 @@ complete command list. You can also ask Drinky to explain its commands, keys, an
 
 ## Configuration
 
-The `~/.drinky/config.json` file is optional. It controls instruction files, request limits, denied
-shell commands, required skills, and interface settings. Drinky reads the file only at startup and
-never writes it. You can keep it in version control.
+The `~/.drinky/config.json` file is optional. It controls instruction files, request and bash
+limits, denied shell commands, required skills, a default effort level, and interface settings.
+Drinky reads the file only at startup and never writes it. You can keep it in version control.
 
-Ask the model to explain or maintain the file. The model can request a generated reference for every
-command, setting, key binding, and discovery rule.
+Ask the model to explain or maintain the file.
 
 The config file holds no secrets. Credentials, project state, and cached model information live in
 separate files under `~/.drinky/`.
