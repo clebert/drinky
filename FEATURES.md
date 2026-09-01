@@ -58,7 +58,7 @@ Anthropic and OpenAI through a subscription login or an API key.
 - A configured glob can require a skill. When a tool first touches a matching file, Drinky sends the
   whole skill file into the turn, and the transcript names it. A read is never refused. `write` and
   `edit` refuse until the whole skill file is in the conversation. A read of the `SKILL.md` file and
-  a `/skill:name` line both count, and a resumed conversation still counts.
+  a `/skill:name` line both count.
 - A glob uses `*` and `?` inside a path segment and `**` across segments.
 - A search skips common noise directories: version-control stores, dependency directories, and build
   caches. A path that ends with such a name searches it fully. An empty search names up to three

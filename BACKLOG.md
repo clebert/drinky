@@ -49,14 +49,13 @@ decision already taken, or a dependency on another entry. Module layout and exte
   Drinky drives itself._
 - **Model metadata in the config** — the config describes a model that no provider and no OpenRouter
   entry describes, so the user can unblock any model. _The provider wins every field it states, the
-  config wins over OpenRouter, and OpenRouter fills the rest. It is the one metadata source for a
-  local server. A later step can let Drinky write the entry for the user._
+  config wins over OpenRouter, and OpenRouter fills the rest. A later step can let Drinky write the
+  entry for the user._
 - **Save and resume conversations** — a conversation reopens after a restart and does not start
   empty. _This entry introduces the per-turn cost ledger and persists it, since history items carry
-  no cost. The `/session` breakdown entry then reads that ledger. Generate the OpenAI cache key once
-  per conversation and restore it verbatim. Rotate it only on a deliberately fresh start. A
-  billing-product enum is not sufficient provenance for opaque reasoning. Persist a durable
-  non-secret principal identity and replay only on a match. Versioned, atomic, owner-only._
+  no cost. Restore the OpenAI cache key verbatim. Store the principal identity beside the reasoning
+  and replay only on a match, because the account slot alone is not sufficient provenance.
+  Versioned, atomic, owner-only._
 
 ## Ideas
 
