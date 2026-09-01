@@ -709,7 +709,7 @@ pub fn run(
     defer gpa.free(self.prompt);
     self.document = try describe.compose(gpa, &.{
         .config = &config,
-        .defaults = .{ .effort = effort_default },
+        .effort_default = effort_default,
         .key_hints = &intro_keys,
         .ctrl_c_window_ms = ctrl_c_window_ms,
     });
@@ -920,10 +920,7 @@ fn initFields(self: *App, gpa: std.mem.Allocator, io: std.Io) void {
 /// Leave the alternate screen and park the primary cursor before terminal teardown.
 /// An output failure does not stop terminal teardown.
 fn prepareTerminalExit(self: *App) void {
-    // A reported content loss gets no repaint, because the app writes no further frame. An exit
-    // with a page open reaches this only through a failure, because every exit key closes the page
-    // first. A repaint needs the page closed and one more frame at teardown.
-    _ = self.tty.setAlternateScreen(false) catch return;
+    self.tty.setAlternateScreen(false) catch return;
     self.session.parkCursor() catch {};
 }
 
@@ -2283,10 +2280,10 @@ fn reportLoginFailure(self: *App, login_error: anyerror) !void {
     return self.reportNotice(.failure, "{s}", .{message});
 }
 
-/// Whether the credential work of `account` can move the active agent.
-fn adoptsCredential(self: *const App, account: ai.llm.Account) bool {
-    const active = self.activeAccount() orelse return false;
-    return active == account;
+/// Whether `account` is the account the agent runs, so a change to its
+/// credential moves the active agent.
+fn isActive(self: *const App, account: ai.llm.Account) bool {
+    return self.activeAccount() == account;
 }
 
 /// Report the step that follows a credential transition of `account`. A session
@@ -2335,7 +2332,7 @@ fn reportModelStep(
 fn settleCredentialReplacement(self: *App, account: ai.llm.Account) void {
     self.accounts.dropPrincipalMetadata(account);
     self.dropAccountEvidence(account);
-    if (self.adoptsCredential(account)) self.adopt(account);
+    if (self.isActive(account)) self.adopt(account);
 }
 
 /// Accept the replacement that a turn met. That turn failed on the account it
@@ -2367,7 +2364,7 @@ fn acceptFetchReplacement(self: *App, account: ai.llm.Account) !void {
 /// the credential changes principal, so the reasoning evidence of the account
 /// goes before the two paths divide.
 fn rejectCredential(self: *App, account: ai.llm.Account) !void {
-    const adopts = self.adoptsCredential(account);
+    const adopts = self.isActive(account);
     var maybe_removal_error: ?anyerror = null;
     const recovered = self.accounts.invalidate(account) catch |err| failure: {
         maybe_removal_error = err;
@@ -2389,10 +2386,7 @@ fn rejectCredential(self: *App, account: ai.llm.Account) !void {
 
     // The agent settles before any fallible report. A conversation that keeps
     // its own account moves nothing, so it needs no next account.
-    const maybe_next = if (adopts) self.accounts.firstAuthenticated() else null;
-    if (adopts) {
-        if (maybe_next) |next| self.adopt(next) else self.agent.signOut();
-    }
+    const maybe_next = if (adopts) self.handOff() else null;
 
     if (maybe_removal_error) |removal_error| try self.recordEvent(
         .failure,
@@ -2403,51 +2397,55 @@ fn rejectCredential(self: *App, account: ai.llm.Account) !void {
         try self.recordEvent(.information, "Drinky signed out of {s}.", .{account.label()});
         return self.mirrorAgentState();
     }
-    if (maybe_next) |next| {
-        if (self.agent.model) |model| {
-            try self.recordEvent(
-                .information,
-                "Drinky signed out of {s}. Drinky now uses {s} with {s}.",
-                .{ account.label(), model.name(), next.label() },
-            );
-        } else {
-            try self.reportModelStep(
-                next,
-                "Drinky signed out of {s}. Drinky now uses {s}. ",
-                .{ account.label(), next.label() },
-            );
-        }
-    } else {
+    try self.reportHandOff(account, maybe_next);
+    try self.mirrorAgentState();
+}
+
+/// Move the session off its account: adopt the first authenticated account, or
+/// sign out when none remains. Returns the account that took the session.
+fn handOff(self: *App) ?ai.llm.Account {
+    const maybe_next = self.accounts.firstAuthenticated();
+    if (maybe_next) |next| self.adopt(next) else self.agent.signOut();
+    return maybe_next;
+}
+
+/// Report where the session went after `account` left it. The next account
+/// starts on the model it ran last here, and on no model where it ran none, so
+/// that report names `/model`. When no account remains, the login picker opens
+/// so the user chooses how to sign back in.
+fn reportHandOff(self: *App, account: ai.llm.Account, maybe_next: ?ai.llm.Account) !void {
+    const next = maybe_next orelse {
         try self.recordEvent(
             .information,
             "Drinky signed out of {s}. Select an account to sign in.",
             .{account.label()},
         );
-        try self.openLoginPicker();
-    }
-    try self.mirrorAgentState();
+        return self.openLoginPicker();
+    };
+    if (self.agent.model) |model| return self.recordEvent(
+        .information,
+        "Drinky signed out of {s}. Drinky now uses {s} with {s}.",
+        .{ account.label(), model.name(), next.label() },
+    );
+    return self.reportModelStep(
+        next,
+        "Drinky signed out of {s}. Drinky now uses {s}. ",
+        .{ account.label(), next.label() },
+    );
 }
 
-/// Open the login picker without routing its outcome back through the app.
+/// Open the login picker through the session alone. A route through
+/// `applyOutcome` cycles the inferred error sets of `logoutAccount` back to
+/// itself.
 fn openLoginPicker(self: *App) !void {
-    var context: ai.command.Context = .{
-        .gpa = self.gpa,
-        .io = self.io,
-        .agent = &self.agent,
-        .accounts = &self.accounts,
-    };
-    if (try ai.command.run(&context, "/login")) |outcome|
-        try self.session.applyOutcome(outcome);
+    if (try self.dispatchCommand("/login")) |outcome| try self.session.applyOutcome(outcome);
 }
 
 /// Drop `account`'s credentials. A logout of the active account hands the
-/// session to the next authenticated account. That account starts on the model
-/// it ran last here, and on no model where it ran none, so the report names
-/// `/model`. When no account remains, it drops to a signed-out state and opens
-/// the login picker so the user chooses how to sign back in. Commands cannot
-/// run mid-turn, so this never races a turn.
+/// session to the next authenticated account, or to the login picker when none
+/// remains. Commands cannot run mid-turn, so this never races a turn.
 fn logoutAccount(self: *App, account: ai.llm.Account) !void {
-    const was_active = if (self.agent.client) |client| client.account() == account else false;
+    const was_active = self.isActive(account);
     self.accounts.logout(account) catch |err| {
         return self.reportNotice(
             .failure,
@@ -2458,32 +2456,7 @@ fn logoutAccount(self: *App, account: ai.llm.Account) !void {
     self.dropAccountEvidence(account);
     if (!was_active)
         return self.recordEvent(.information, "Drinky signed out of {s}.", .{account.label()});
-    if (self.accounts.firstAuthenticated()) |next| {
-        self.adopt(next);
-        if (self.agent.model) |model| {
-            return self.recordEvent(
-                .information,
-                "Drinky signed out of {s}. Drinky now uses {s} with {s}.",
-                .{ account.label(), model.name(), next.label() },
-            );
-        }
-        return self.reportModelStep(
-            next,
-            "Drinky signed out of {s}. Drinky now uses {s}. ",
-            .{ account.label(), next.label() },
-        );
-    }
-    // No account remains: sign out and let the user choose from the login picker
-    // (no forced browser, no loop).
-    self.agent.signOut();
-    try self.recordEvent(
-        .information,
-        "Drinky signed out of {s}. Select an account to sign in.",
-        .{account.label()},
-    );
-    // Route through the session. A route through `applyOutcome` cycles the
-    // inferred error sets from `logoutAccount` back to itself.
-    try self.openLoginPicker();
+    try self.reportHandOff(account, self.handOff());
 }
 
 /// Switch the agent to `account` on the model that account ran last, and on no
@@ -6539,7 +6512,7 @@ test "Ctrl+N sends the attempt and keeps the editor text" {
     // The attempt sends and clears nothing of the editor, and it retains no draft,
     // because the editor holds no part of it.
     try std.testing.expectEqualStrings("a draft that stays", app.session.editor.visible());
-    try std.testing.expect(app.session.turn_origin == null);
+    try std.testing.expect(app.session.turn_prompt == null);
     {
         // Drinky wrote the message of the attempt, so its line is a user note.
         // That kind alone paints the user color, which `ui.block` pins.

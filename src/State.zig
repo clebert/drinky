@@ -589,6 +589,7 @@ test "the state keeps the model name that a command recorded" {
     );
     try std.testing.expect(restarted.models.get(.openai_api) == null);
 }
+
 test "temporary store contention leaves project-state saving enabled" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;

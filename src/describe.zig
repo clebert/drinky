@@ -9,12 +9,13 @@ const ai = @import("ai");
 
 const Config = @import("Config.zig");
 
-/// What the app holds and the document states: the config file, the fallbacks
-/// that the app compiles in, the key hints of the intro line, and the window of
-/// the double Ctrl+C.
+/// What the app holds and the document states: the config file, the effort
+/// level that the app compiles in, the key hints of the intro line, and the
+/// window of the double Ctrl+C.
 pub const Options = struct {
     config: *const Config,
-    defaults: Config.DocumentOptions,
+    /// The effort level a session starts on when no file and no state names one.
+    effort_default: ai.llm.Effort,
     /// The key hints of the intro line, in the order the line shows them.
     key_hints: []const []const u8,
     /// The window in which a second Ctrl+C quits, in milliseconds.
@@ -82,7 +83,7 @@ pub fn compose(gpa: std.mem.Allocator, options: *const Options) ![]u8 {
     errdefer output.deinit();
     try output.writer.writeAll(head);
     try writeCommands(&output.writer);
-    const configuration = try options.config.document(gpa, &options.defaults);
+    const configuration = try options.config.document(gpa, options.effort_default);
     defer gpa.free(configuration);
     try output.writer.writeByte('\n');
     try output.writer.writeAll(configuration);
@@ -163,9 +164,7 @@ test "the document states every command, key, and discovery rule" {
     defer config.deinit(gpa);
     const text = try compose(gpa, &.{
         .config = &config,
-        .defaults = .{
-            .effort = .xhigh,
-        },
+        .effort_default = .xhigh,
         .key_hints = &.{ "Enter: Send", "Ctrl+D: Quit" },
         .ctrl_c_window_ms = 500,
     });

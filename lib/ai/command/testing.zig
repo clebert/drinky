@@ -19,26 +19,11 @@ pub fn accounts(
         anthropic_console: bool = false,
     },
 ) Accounts {
-    return .{
-        .gpa = std.testing.allocator,
-        .io = std.testing.io,
-        .timeouts = .{},
-        .anthropic_auth = undefined,
-        .anthropic_console_auth = undefined,
-        .openai_auth = undefined,
-        .keys = keys,
-        .anthropic_subscription_ready = ready.anthropic,
-        .openai_subscription_ready = ready.openai,
-        .anthropic_console_ready = ready.anthropic_console,
-        .catalog = .{
-            .gpa = std.testing.allocator,
-            .io = std.testing.io,
-            .models_path = "",
-            .metadata_path = "",
-            .accounts = .initFill(&.{}),
-            .metadata = &.{},
-        },
-    };
+    var registry = model_testing.accounts(keys);
+    registry.anthropic_subscription_ready = ready.anthropic;
+    registry.openai_subscription_ready = ready.openai;
+    registry.anthropic_console_ready = ready.anthropic_console;
+    return registry;
 }
 
 /// Free every model list a `seed` call added. A registry from `accounts` owns

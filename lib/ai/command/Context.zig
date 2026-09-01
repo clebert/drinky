@@ -16,11 +16,10 @@ io: std.Io,
 agent: *Agent,
 /// For account-qualified model selection.
 accounts: *Accounts,
-/// Runtime-discovered skills. Null where no skill can run: a dispatch of a fixed
-/// command line, and the command tests that do not need them.
+/// Runtime-discovered skills. Null in the command tests that do not need them.
 skill_registry: ?*const skills.Registry = null,
-/// The host hook that states a wait. Null where nothing paints: a dispatch of a
-/// fixed command line, and the command tests that do not need it.
+/// The host hook that states a wait. Null in the command tests that do not need
+/// it.
 wait: ?Wait = null,
 
 /// The host hook that a command calls before a step that blocks. A command runs

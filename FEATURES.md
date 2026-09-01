@@ -349,8 +349,8 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - The open input area grows to about a quarter of the screen and labels hidden rows "↑ Hidden: N"
   and "↓ Hidden: N".
 - The terminal supplies every color and the muted intensity. Drinky uses the default colors, ANSI
-  slots 0 to 15, faint, and reverse video. A filled box keeps the terminal background for its text.
-  A label or a glyph marks every state, so color is never the only signal.
+  slots 0 to 7, faint, and reverse video. A filled box keeps the terminal background for its text. A
+  label or a glyph marks every state, so color is never the only signal.
 - A source summary paints its `Instructions:` and `Skills:` labels in the accent color and keeps its
   values muted.
 - A line that reports a message that Drinky wrote for the user takes the user color and no box. A

@@ -179,7 +179,7 @@ steering_consumed_count: usize,
 /// The submitted prompt's rich draft, retained while a turn is live. A failed
 /// or canceled turn that committed nothing returns it to the editor. Every
 /// other terminal frees it because the prompt belongs to committed history.
-turn_origin: ?TurnOrigin,
+turn_prompt: ?ui.Editor.Draft,
 /// Whether a retry context waits at the prompt. `App` owns that context and
 /// mirrors this bit, so the editor caption names its state and controls.
 retry_shown: bool,
@@ -379,11 +379,6 @@ const Trail = struct {
     }
 };
 
-/// The retained prompt draft for a live turn.
-const TurnOrigin = struct {
-    prompt: ui.Editor.Draft,
-};
-
 /// The one-shot confirmations. Each names a warning that one repeat of its own
 /// key passes. The guards differ on purpose: a draft signals that the user
 /// types, so a key that a reflex can hit while typing warns first. Ctrl+D means
@@ -545,7 +540,7 @@ pub fn init(
         .steering = .empty,
         .steering_retained_count = 0,
         .steering_consumed_count = 0,
-        .turn_origin = null,
+        .turn_prompt = null,
         .retry_shown = false,
         .clock_ms = 0,
         .boot_clock_ms = 0,
@@ -710,7 +705,7 @@ fn deinitMode(self: *Session) void {
         .prompt => {},
         .turn => |*turn| {
             self.freeTurn(turn);
-            self.dropTurnOrigin();
+            self.dropTurnPrompt();
         },
         .picking => |*picking| picking.picker.deinit(),
         .viewing => |*page| page.deinit(),
@@ -741,21 +736,16 @@ fn retryEventText(gpa: std.mem.Allocator, retry: *const ai.Agent.RetryAttempt) !
     };
 }
 
-/// Whether `applyTurnEvent` applies `event`. The generation gate is the one
-/// rule, so an event of a turn that already ended reaches no consumer of it.
-fn acceptsTurnEvent(self: *const Session, event: *const TurnEvent) bool {
-    return switch (self.mode) {
-        .turn => |*turn| event.generation == turn.generation,
-        else => false,
-    };
-}
-
-/// Whether `applyCanceledTurnEvent` applies `event`. The drain reads the queue
-/// directly, so the sequence of the event must follow the applied one too.
+/// Whether `applyCanceledTurnEvent` applies `event`. The generation gate of
+/// `applyTurnEvent` holds, and the drain reads the queue directly, so the
+/// sequence of the event must follow the applied one too.
 fn acceptsCanceledTurnEvent(self: *const Session, event: *const TurnEvent) bool {
-    if (!self.acceptsTurnEvent(event)) return false;
+    const turn = switch (self.mode) {
+        .turn => |*turn| turn,
+        else => return false,
+    };
+    if (event.generation != turn.generation) return false;
     if (event.progress_sequence == 0) return true;
-    const turn = &self.mode.turn;
     if (turn.progress_sequence_applied == std.math.maxInt(u64)) return false;
     return event.progress_sequence == turn.progress_sequence_applied + 1;
 }
@@ -1194,18 +1184,18 @@ pub fn markTurnBase(self: *Session, transcript_base: usize) void {
 /// checkpoint. An abnormal exit that commits nothing can then return the prompt.
 /// Takes ownership of `prompt` and leaves it empty.
 pub fn retainTurnPrompt(self: *Session, prompt: *ui.Editor.Draft, transcript_base: usize) void {
-    std.debug.assert(self.turn_origin == null);
+    std.debug.assert(self.turn_prompt == null);
     self.markTurnBase(transcript_base);
-    self.turn_origin = .{ .prompt = prompt.* };
+    self.turn_prompt = prompt.*;
     prompt.* = .empty;
 }
 
-/// Drop the live turn's rewind anchor and free the retained prompt draft. By
-/// then it has either entered committed history or moved back into the editor.
-fn dropTurnOrigin(self: *Session) void {
-    if (self.turn_origin) |*origin| {
-        origin.prompt.deinit(self.gpa);
-        self.turn_origin = null;
+/// Free the retained prompt draft. By then it has either entered committed
+/// history or moved back into the editor.
+fn dropTurnPrompt(self: *Session) void {
+    if (self.turn_prompt) |*prompt| {
+        prompt.deinit(self.gpa);
+        self.turn_prompt = null;
     }
 }
 
@@ -1215,17 +1205,17 @@ fn dropTurnOrigin(self: *Session) void {
 /// it returns, so a partial commit intentionally over-reserves.
 pub fn reserveSteeringRestore(self: *Session) !void {
     const lead: ?*const ui.Editor.Draft =
-        if (self.turn_origin) |*origin| &origin.prompt else null;
+        if (self.turn_prompt) |*prompt| prompt else null;
     try self.editor.reserveComposition(lead, self.steering.items);
 }
 
 /// Preflight only the drafts a known failed receipt will restore. This avoids
-/// capacity for an origin or steering prefix already committed to history.
+/// capacity for a prompt or steering prefix already committed to history.
 pub fn reserveFailureRestore(self: *Session, receipt: *const ai.Agent.Receipt) !void {
     const committed = receipt.history_end != receipt.history_base;
     var lead: ?*const ui.Editor.Draft = null;
     if (!committed) {
-        if (self.turn_origin) |*origin| lead = &origin.prompt;
+        if (self.turn_prompt) |*prompt| lead = prompt;
     }
     const steering_start = @min(receipt.steering_committed_count, self.steering.items.len);
     try self.editor.reserveComposition(lead, self.steering.items[steering_start..]);
@@ -1311,7 +1301,7 @@ pub fn abortTurn(self: *Session) !void {
 /// steering remains pending so the app can return it to the editor.
 pub fn endTurnWithReceipt(self: *Session, receipt: *const ai.Agent.Receipt) !void {
     self.applyReceiptNormal(receipt);
-    self.dropTurnOrigin();
+    self.dropTurnPrompt();
     if (receipt.truncated)
         try self.transcript.append(.event, .{ .is_error = true }, truncated_event);
     self.transcript.endMessage();
@@ -1373,7 +1363,7 @@ pub fn cancelReceipt(
 }
 
 /// Rewind presentation to the latest agent checkpoint and compose the editor
-/// from the uncommitted origin, steering, and in-progress text.
+/// from the uncommitted prompt, steering, and in-progress text.
 fn reconcileAbnormalReceipt(self: *Session, receipt: *const ai.Agent.Receipt) void {
     self.dropSteeringPrefix(receipt.steering_committed_count);
     const turn = self.activeTurn() orelse unreachable;
@@ -1382,13 +1372,13 @@ fn reconcileAbnormalReceipt(self: *Session, receipt: *const ai.Agent.Receipt) vo
     const committed = receipt.history_end != receipt.history_base;
     var lead: ?*ui.Editor.Draft = null;
     if (!committed) {
-        if (self.turn_origin) |*origin| lead = &origin.prompt;
+        if (self.turn_prompt) |*prompt| lead = prompt;
     }
     self.editor.prependComposition(lead, self.steering.items);
     self.steering.clearRetainingCapacity();
     self.steering_retained_count = 0;
     self.steering_consumed_count = 0;
-    self.dropTurnOrigin();
+    self.dropTurnPrompt();
     self.dirty = true;
 }
 
@@ -1430,7 +1420,7 @@ pub fn branch(self: *const Session) ?[]const u8 {
 /// prompt has.
 pub fn endTurn(self: *Session) void {
     if (self.activeTurn()) |turn| self.freeTurn(turn);
-    self.dropTurnOrigin();
+    self.dropTurnPrompt();
     self.clearNotice();
     self.confirmations = .initEmpty();
     self.mode = .prompt;
@@ -3074,14 +3064,14 @@ test "opening a picker over a turn releases its retained prompt" {
         .current = null,
     } });
     try std.testing.expect(session.mode == .picking);
-    try std.testing.expect(session.turn_origin == null);
+    try std.testing.expect(session.turn_prompt == null);
 
     session.closePicker();
     session.beginTurn(2);
     var next_prompt = try ui.Editor.Draft.fromText(gpa, "second");
     session.retainTurnPrompt(&next_prompt, 0);
     session.endTurn();
-    try std.testing.expect(session.turn_origin == null);
+    try std.testing.expect(session.turn_prompt == null);
 }
 
 // The activity clock advances between stream events. Each horizontal step
@@ -3221,7 +3211,7 @@ test "a failure with nothing committed rewinds the tail and returns the prompt" 
     try std.testing.expect(blocks[1].content.event.is_error);
     try std.testing.expectEqualStrings("Overloaded", blocks[1].content.event.text.items);
     try std.testing.expectEqualStrings("my prompt\n\nsteer\n\ntyping", session.editor.visible());
-    try std.testing.expect(session.turn_origin == null);
+    try std.testing.expect(session.turn_prompt == null);
     try std.testing.expect(!session.hasSteering());
 }
 
@@ -3280,7 +3270,7 @@ test "a failure after a committed round keeps it and restores only steering" {
     try std.testing.expect(blocks[3].content.event.is_error);
     try std.testing.expectEqualStrings("boom", blocks[3].content.event.text.items);
     try std.testing.expectEqualStrings("restore me", session.editor.visible());
-    try std.testing.expect(session.turn_origin == null);
+    try std.testing.expect(session.turn_prompt == null);
     try std.testing.expect(!session.hasSteering());
 }
 
@@ -3318,7 +3308,7 @@ test "a cancel with nothing committed rewinds the tail and returns the prompt" {
     try std.testing.expectEqualStrings("earlier", blocks[0].content.event.text.items);
     // The editor preserves chronological authorship order.
     try std.testing.expectEqualStrings("my prompt\n\nsteer\n\ntyping", session.editor.visible());
-    try std.testing.expect(session.turn_origin == null);
+    try std.testing.expect(session.turn_prompt == null);
 }
 
 // A cancel whose turn committed a round keeps that round and drops only the
@@ -3372,7 +3362,7 @@ test "a cancel with a committed round keeps it and drops the in-flight tail" {
     try std.testing.expectEqualStrings("prompt", blocks[0].content.user.items);
     try std.testing.expectEqualStrings("round one", blocks[1].content.model.items);
     try std.testing.expectEqualStrings("", session.editor.visible());
-    try std.testing.expect(session.turn_origin == null);
+    try std.testing.expect(session.turn_prompt == null);
 }
 
 // The agent commits the reply and one error result per call before it
@@ -3696,7 +3686,7 @@ test "a normal completion frees the retained prompt" {
     session.retainTurnPrompt(&prompt, 0);
 
     try finishTurn(&session, 0);
-    try std.testing.expect(session.turn_origin == null);
+    try std.testing.expect(session.turn_prompt == null);
 }
 
 // A command can run long enough that the user weighs a cancel. Its row reports

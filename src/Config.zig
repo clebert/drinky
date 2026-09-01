@@ -185,11 +185,6 @@ const Key = struct {
     description: []const u8,
 };
 
-/// The caveat on the keys that a remembered per-project choice outranks. One
-/// constant states it on every such key, so the trap sits where the reader
-/// decides rather than in a later section.
-const new_project_only = " Only a new project reads it.";
-
 const keys = [_]Key{
     .{
         .path = "user_instructions",
@@ -312,7 +307,8 @@ const keys = [_]Key{
     .{
         .path = "default_effort",
         .description = "The reasoning effort that a session starts on. Drinky folds a level " ++
-            "that the model does not support onto the nearest one it does." ++ new_project_only,
+            "that the model does not support onto the nearest one it does. Only a new " ++
+            "project reads it.",
     },
 };
 
@@ -481,17 +477,13 @@ const example =
 /// no work at startup beyond one format call.
 const keys_section = "\n### Keys\n\n" ++ key_lines;
 
-/// The fallbacks that the app compiles in. A key that names none of them leaves
-/// the value to these, so the document must state them. The app owns them,
-/// because it owns the account and the effort level that a session starts on.
-pub const DocumentOptions = struct {
-    effort: ai.llm.Effort,
-};
-
 /// Build the configuration section of the document that the `describe_drinky`
 /// tool returns: a compiled key list between a head and a part that states the
 /// fallbacks the app compiles in. The head names the real file, so the model
 /// edits the path that Drinky reads. The caller owns the text.
+///
+/// `effort_default` is the level a session starts on when neither the file nor
+/// the project state names one. The app owns it, so the app passes it in.
 ///
 /// The tool shows no box line beside the call, so this measures nothing. The
 /// document is the same text at every call, and a measure of it states nothing
@@ -499,7 +491,7 @@ pub const DocumentOptions = struct {
 pub fn document(
     self: *const Config,
     gpa: std.mem.Allocator,
-    options: *const DocumentOptions,
+    effort_default: ai.llm.Effort,
 ) ![]u8 {
     return std.fmt.allocPrint(gpa,
         \\## Configuration
@@ -534,7 +526,7 @@ pub fn document(
         self.path,
         keys_section,
         effort_levels,
-        @tagName(options.effort),
+        @tagName(effort_default),
         example,
     });
 }
@@ -884,12 +876,6 @@ fn resolveGauge(dropped: *?ui.status.Gauge, configured: *const File.Interface) u
 fn isShare(percent: f64) bool {
     return percent >= ui.status.Gauge.percent_min and percent <= ui.status.Gauge.percent_max;
 }
-
-/// The compiled fallbacks that the app passes in. The values only have to be
-/// legal, because the document quotes them and never resolves them.
-const document_options_for_test: DocumentOptions = .{
-    .effort = .xhigh,
-};
 
 /// Whether `path` names a leaf key of `File`. Only the tests read `leaves`
 /// through it, to prove the walk reached sections and array entries.
@@ -1361,7 +1347,7 @@ test "the config document names the file and its own example loads clean" {
     var config = try loadDataForTest("{}");
     defer config.deinit(gpa);
 
-    const text = try config.document(gpa, &document_options_for_test);
+    const text = try config.document(gpa, .xhigh);
     defer gpa.free(text);
     try std.testing.expect(std.mem.indexOf(u8, text, "/unused/config.json") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "`bash.timeout_ms`") != null);
@@ -1395,7 +1381,7 @@ test "the config document names the file and its own example loads clean" {
     try std.testing.expect(std.mem.indexOf(u8, text, "outranks this file") != null);
     try std.testing.expectEqual(
         @as(usize, 1),
-        std.mem.count(u8, text, new_project_only),
+        std.mem.count(u8, text, "Only a new project reads it."),
     );
 
     // A description states behavior that the key name does not imply, so a
@@ -1537,7 +1523,7 @@ fn checkLoadAllocationFailure(gpa: std.mem.Allocator, io: std.Io, home: []const 
     try std.testing.expectEqual(@as(usize, 1), config.bash.deny.len);
     try std.testing.expect(config.dropped_deny_empty);
     try std.testing.expectEqual(@as(usize, 2), config.unknown_keys.len);
-    const text = try config.document(gpa, &document_options_for_test);
+    const text = try config.document(gpa, .xhigh);
     defer gpa.free(text);
 }
 
