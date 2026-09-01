@@ -62,3 +62,4 @@ decision already taken, or a dependency on another entry. Module layout and exte
 
 - Restart the same prompt in a new session.
 - Show tokens per second during a turn.
+- Keep the request prefix byte-stable, so a local server reuses its prompt cache.
