@@ -1,13 +1,14 @@
 //! The composition root and event loop. It wires the tty, the agent, and the
 //! `Session` together, then runs the interface off one `std.Io.Queue` of
-//! `Session.UiEvent`. Four `io.concurrent` producers feed it: the input reader
-//! (`.keys`), the turn worker (generation-tagged `.turn` events), a one-shot
-//! frame timer (`.tick`), and a SIGWINCH watcher (`.resize`).
+//! `Session.UiEvent`. Five `io.concurrent` producers feed it: the input reader
+//! (`.keys`), the turn worker (generation-tagged `.turn` events), the model
+//! fetch worker (a generation-tagged `.fetch_ended` wakeup), a one-shot frame
+//! timer (`.tick`), and a SIGWINCH watcher (`.resize`).
 //!
-//! A command runs on the consumer, so a step that reaches the network stops the
-//! interface and paints a wait line first through `Context.Wait`. The OAuth
-//! login is the one blocking step that leaves raw mode and prints its own
-//! prompts.
+//! A command runs on the consumer. A model fetch is the one command step that
+//! reaches the network, so it leaves the consumer for a worker, and the picker
+//! that asked for it waits until the result rebuilds it. The OAuth login is the
+//! one blocking step: it leaves raw mode and prints its own prompts.
 //!
 //! `Session` owns the model and the rendering and is io-, tty-, and agent-free,
 //! so a test drives it from a scripted event sequence. `App` keeps the io, the
@@ -34,6 +35,10 @@ const effort_default: ai.llm.Effort = .xhigh;
 /// The refusal a send meets while the active account offers no model. Drinky
 /// compiles none in, so the user fetches a list and picks one there.
 const no_model_refusal = "Select a model with /model before you send a message.";
+
+/// The row that a model picker shows while its fetch runs. The title of the
+/// picker names the account, so the row names the work alone.
+const fetch_wait_text = "Drinky fetches the model list.";
 
 /// Two models for the tests, which build what they need because Drinky compiles
 /// no model in.
@@ -135,6 +140,13 @@ turn_future: ?std.Io.Future(WorkerResult),
 pending_turn_result: ?WorkerResult,
 /// Last generation reserved for a turn worker. The app never reuses a generation.
 turn_generation: u64,
+/// The running model fetch, or null between fetches. The picker that asked for
+/// it waits with no rows while it runs. Its join is the sole result.
+fetch: ?Fetch,
+/// Last generation reserved for a fetch worker. A canceled fetch can leave its
+/// wakeup in the queue, so the wakeup names the fetch it belongs to and cannot
+/// join the fetch that follows.
+fetch_generation: u64,
 /// The retry context of the latest failed turn, or null when none waits. It
 /// lives at the prompt alone, because the start of any turn takes it.
 retry: ?Retry,
@@ -373,6 +385,15 @@ const WorkerResult = struct {
     /// interrupted worker enqueue, the consumer uses this bit to enqueue a
     /// replacement once it joins the result.
     terminal_queued: bool = false,
+};
+
+/// One model fetch on a worker. The worker owns the account registry until the
+/// join, and the picker mode admits no command meanwhile, so the consumer never
+/// reads the registry under it.
+const Fetch = struct {
+    future: std.Io.Future(ai.Accounts.Refresh),
+    account: ai.llm.Account,
+    generation: u64,
 };
 
 /// Cooked-mode OAuth output keeps trusted prompt text separate from runtime URL
@@ -906,6 +927,8 @@ fn initFields(self: *App, gpa: std.mem.Allocator, io: std.Io) void {
         .turn_future = null,
         .pending_turn_result = null,
         .turn_generation = 0,
+        .fetch = null,
+        .fetch_generation = 0,
         .retry = null,
         .turn_retry = false,
         .tick_future = null,
@@ -936,6 +959,7 @@ fn shutdownTasks(self: *App) void {
         self.freeWorkerResult(&result);
         self.pending_turn_result = null;
     }
+    self.dropFetch();
     self.cancelFuture(&self.input_future);
     self.cancelFuture(&self.resize_future);
     self.cancelFuture(&self.tick_future);
@@ -1192,6 +1216,7 @@ fn applyBatch(self: *App, events: []const Session.UiEvent) !bool {
                     try self.finishWorkerResult(&result);
                 }
             },
+            .fetch_ended => |generation| try self.finishFetch(generation),
         }
     }
     return ticked;
@@ -1966,7 +1991,7 @@ fn runTurn(self: *App, text: []const u8) !void {
     // The user can check out another branch between two turns, so the label is
     // true at the moment the turn starts.
     self.refreshBranch();
-    const generation = try self.reserveTurnGeneration();
+    const generation = try reserveGeneration(&self.turn_generation);
     const owned = try self.gpa.dupe(u8, text);
     errdefer self.gpa.free(owned);
     self.turn_future = try self.io.concurrent(runTurnWorker, .{ self, owned, generation });
@@ -1978,12 +2003,76 @@ fn runTurn(self: *App, text: []const u8) !void {
     self.setRetry(null);
 }
 
-/// Permanently reserve the next turn generation before a worker can observe it.
-/// A failed allocation or spawn can leave a gap, but the app never reuses a generation.
-fn reserveTurnGeneration(self: *App) !u64 {
-    if (self.turn_generation == std.math.maxInt(u64)) return error.TurnGenerationExhausted;
-    self.turn_generation += 1;
-    return self.turn_generation;
+/// Permanently reserve the next generation of `counter` before a worker can
+/// observe it. A failed allocation or spawn can leave a gap, but the app never
+/// reuses a generation.
+fn reserveGeneration(counter: *u64) error{GenerationExhausted}!u64 {
+    if (counter.* == std.math.maxInt(u64)) return error.GenerationExhausted;
+    counter.* += 1;
+    return counter.*;
+}
+
+/// Start the model fetch that a picker row asked for, on a worker, so the
+/// interface keeps painting and reading keys. The picker clears its rows
+/// meanwhile, and `finishFetch` rebuilds it from the result. The worker owns the
+/// account registry until the join, and the picker mode admits no command, so
+/// no consumer step reads the registry under it.
+fn startFetch(self: *App, account: ai.llm.Account) !void {
+    std.debug.assert(self.fetch == null);
+    std.debug.assert(self.session.mode == .picking);
+    const generation = try reserveGeneration(&self.fetch_generation);
+    const future = try self.io.concurrent(runFetchWorker, .{ self, account, generation });
+    self.fetch = .{ .future = future, .account = account, .generation = generation };
+    errdefer self.dropFetch();
+    try self.session.beginPickerWait(fetch_wait_text);
+}
+
+/// Fetch worker task: run one fetch, queue its wakeup, and return the sole
+/// result. A canceled or closed channel drops the wakeup, and the join still
+/// holds the result.
+fn runFetchWorker(self: *App, account: ai.llm.Account, generation: u64) ai.Accounts.Refresh {
+    const result = self.accounts.refresh(account);
+    self.queue.putOne(self.io, .{ .fetch_ended = generation }) catch {};
+    return result;
+}
+
+/// Join the fetch of `generation` at its wakeup and rebuild the picker from the
+/// result, as a confirmed row does. A wakeup of a fetch that a cancel already
+/// joined names a stale generation, so it changes nothing.
+fn finishFetch(self: *App, generation: u64) !void {
+    const fetch = if (self.fetch) |*fetch| fetch else return;
+    if (fetch.generation != generation) return;
+    const account = fetch.account;
+    const result = fetch.future.await(self.io);
+    self.fetch = null;
+    std.debug.assert(self.session.pickerWaits());
+    var context = self.commandContext();
+    const outcome = try ai.command.model.fetchOutcome(&context, account, &result);
+    if (!keepsPicker(outcome)) self.session.closePicker();
+    try self.applyOutcome(outcome);
+}
+
+/// Esc during a fetch: stop the worker, then rebuild the step that asked for it,
+/// so the rows return. The fetch is the one thing this exit ends. The notice
+/// states the cancel, because a list that looks unchanged reads as a fetch that
+/// found nothing new.
+fn cancelFetch(self: *App) !void {
+    self.dropFetch();
+    const opener = self.session.mode.picking.reopen orelse return self.session.cancelPicker();
+    var context = self.commandContext();
+    const outcome = try opener(&context);
+    if (!keepsPicker(outcome)) self.session.closePicker();
+    try self.applyOutcome(outcome);
+    try self.reportNotice(.information, "You canceled the model fetch.", .{});
+}
+
+/// Cancel and join the fetch worker, if one runs, and forget it. The result is
+/// discarded: the catalog already holds whatever arrived, and the step that
+/// follows reads the catalog.
+fn dropFetch(self: *App) void {
+    const fetch = if (self.fetch) |*fetch| fetch else return;
+    _ = fetch.future.cancel(self.io);
+    self.fetch = null;
 }
 
 /// The ambient state that every command handler reads.
@@ -1994,18 +2083,7 @@ fn commandContext(self: *App) ai.command.Context {
         .agent = &self.agent,
         .accounts = &self.accounts,
         .skill_registry = &self.skills,
-        .wait = .{ .host = self, .paint = paintCommandWait },
     };
-}
-
-/// Paint the wait of a blocking command step. A command runs on the consumer,
-/// so the step that follows this stops the interface until it ends. The line
-/// replaces the footer, and the outcome of that step retracts it. A failed
-/// paint leaves the line unstated, and the step still runs.
-fn paintCommandWait(host: *anyopaque, text: []const u8) void {
-    const self: *App = @ptrCast(@alignCast(host));
-    self.session.showWait(text) catch return;
-    self.refresh() catch {};
 }
 
 /// Run `line` as a command. Null reports that the line is a message.
@@ -2076,6 +2154,9 @@ fn applyOutcome(self: *App, outcome: ai.command.Outcome) !void {
         // turn ran. It mirrors the agent itself, so the shared mirror below must
         // not run a second time.
         .credential_replaced => |account| return self.acceptFetchReplacement(account),
+        // The fetch starts and changes nothing yet, so no mirror runs. Its
+        // result arrives through `finishFetch`, which applies its own outcome.
+        .fetch => |account| return self.startFetch(account),
         else => try self.session.applyOutcome(outcome),
     }
     // Commands can switch or drop the active account. Mirror the authoritative
@@ -2657,6 +2738,7 @@ fn handlePageKey(self: *App, event: *const terminal.Input.Key) !void {
 }
 
 fn handlePickerKey(self: *App, event: *const terminal.Input.Key) !void {
+    if (self.session.pickerWaits()) return self.handleFetchKey(event);
     const picker = &self.session.mode.picking.picker;
     switch (event.*) {
         .up => try picker.moveUp(),
@@ -2674,19 +2756,46 @@ fn handlePickerKey(self: *App, event: *const terminal.Input.Key) !void {
     self.session.dirty = true;
 }
 
+/// The keys of a picker that waits for a fetch. Esc cancels the fetch alone, and
+/// the rows return. Ctrl+C and Ctrl+D leave the whole command, as they do from
+/// any step, and take the fetch with it. Every other key does nothing, because
+/// the list holds no row.
+fn handleFetchKey(self: *App, event: *const terminal.Input.Key) !void {
+    switch (event.*) {
+        .escape => try self.cancelFetch(),
+        .ctrl => |letter| switch (letter) {
+            'c', 'd' => {
+                self.dropFetch();
+                try self.session.cancelPicker();
+            },
+            else => {},
+        },
+        else => {},
+    }
+}
+
 /// Apply the highlighted picker row: the command that opened the picker runs its
 /// own handler over the selected row.
 ///
 /// A row that opens another picker keeps this one open, because the replacement
-/// records it on its trail. Every other outcome ends the picker, so it closes
+/// records it on its trail. A row that starts a fetch keeps it too, because the
+/// list waits for the result. Every other outcome ends the picker, so it closes
 /// first.
 fn confirmPicker(self: *App) !void {
     const picking = &self.session.mode.picking;
     const cursor = picking.picker.cursor;
     var context = self.commandContext();
     const outcome = try picking.select(&context, cursor);
-    if (outcome != .pick) self.session.closePicker();
+    if (!keepsPicker(outcome)) self.session.closePicker();
     try self.applyOutcome(outcome);
+}
+
+/// Whether `outcome` continues inside the open picker.
+fn keepsPicker(outcome: ai.command.Outcome) bool {
+    return switch (outcome) {
+        .pick, .fetch => true,
+        else => false,
+    };
 }
 
 /// Open the picker one step above, or cancel the command where the open picker is
@@ -4597,14 +4706,11 @@ test "a failed batch frees its unprocessed turn events" {
     try std.testing.expectError(error.OutOfMemory, app.applyBatch(&events));
 }
 
-test "turn generations cannot wrap or be reused" {
-    const gpa = std.testing.allocator;
-    var app: App = undefined;
-    app.initForTest(gpa);
-    app.turn_generation = std.math.maxInt(u64);
-
-    try std.testing.expectError(error.TurnGenerationExhausted, app.reserveTurnGeneration());
-    try std.testing.expectEqual(std.math.maxInt(u64), app.turn_generation);
+test "generations cannot wrap or be reused" {
+    var counter: u64 = std.math.maxInt(u64) - 1;
+    try std.testing.expectEqual(std.math.maxInt(u64), try reserveGeneration(&counter));
+    try std.testing.expectError(error.GenerationExhausted, reserveGeneration(&counter));
+    try std.testing.expectEqual(std.math.maxInt(u64), counter);
 }
 
 test "a legacy escape byte closes a page after its wait" {
@@ -6757,7 +6863,7 @@ test "a retry survives an account switch and Ctrl+N routes to it" {
     // stops it there, and its rollback keeps the retry for another try.
     app.turn_generation = std.math.maxInt(u64);
     try std.testing.expectError(
-        error.TurnGenerationExhausted,
+        error.GenerationExhausted,
         app.handleKey(&.{ .ctrl = 'n' }),
     );
     try std.testing.expect(app.retry != null);
@@ -7227,6 +7333,238 @@ test "Esc opens the step above the picker and cancels at the first step" {
     try app.handleKey(&.enter);
     try std.testing.expect(app.session.mode.picking.picker.can_step_back);
     try app.handleKey(&.{ .ctrl = 'c' });
+    try std.testing.expect(app.session.mode == .prompt);
+}
+
+// A fake fetch worker that returns a fixed result at once, so a test drives the
+// join and the picker rebuild without a socket.
+fn fakeFetch(result: *const ai.Accounts.Refresh) ai.Accounts.Refresh {
+    return result.*;
+}
+
+/// Test scaffolding: an app at the model step of the Anthropic API account, with
+/// the provider step on the trail. The account offers no model yet, so the step
+/// holds the fetch row alone.
+fn openModelStepForTest(app: *App, out: *std.Io.Writer.Allocating, home: []const u8) !void {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{
+        .anthropic = "sk-anthropic",
+        .openai = "sk-openai",
+    });
+    try ai.testing.seedAccount(&app.accounts, .openai_api, &.{"gpt-5.6-sol"});
+    app.agent = ai.Agent.init(gpa, io, app.accounts.client(.openai_api), .{
+        .model = test_openai_model,
+        .system = "",
+        .retry = .{},
+        .environ = .empty,
+    });
+    app.session = Session.init(gpa, &out.writer, test_openai_model, .none);
+
+    try app.session.editor.insert("/model");
+    try app.submit();
+    try std.testing.expectEqualStrings("Provider", app.session.mode.picking.picker.title);
+    try app.handleKey(&.up);
+    try app.handleKey(&.enter);
+    const picker = &app.session.mode.picking.picker;
+    try std.testing.expectEqualStrings("Model: Anthropic API", picker.title);
+    try std.testing.expectEqual(@as(usize, 1), picker.options.len);
+    try std.testing.expect(picker.can_step_back);
+}
+
+/// Test scaffolding: the state `startFetch` leaves behind, over a worker that
+/// returns `result` instead of a request. The real worker reaches the network,
+/// so a test never spawns it.
+fn spawnFakeFetch(app: *App, result: *const ai.Accounts.Refresh) !void {
+    const generation = try reserveGeneration(&app.fetch_generation);
+    app.fetch = .{
+        .future = try app.io.concurrent(fakeFetch, .{result}),
+        .account = .anthropic_api,
+        .generation = generation,
+    };
+    try app.session.beginPickerWait(fetch_wait_text);
+}
+
+// The fetch leaves the consumer, so the picker waits with no rows until the
+// wakeup joins the result. The result rebuilds the same step over the list that
+// arrived, with the report beside it and the trail above it intact.
+test "a fetch wakeup rebuilds the model step over the fetched list" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(home);
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    defer app.input.deinit();
+    try openModelStepForTest(&app, &out, home);
+    defer app.accounts.deinit();
+    defer app.agent.deinit();
+    defer app.session.deinit();
+
+    const result: ai.Accounts.Refresh = .{ .count = 1, .metadata_error = error.ConnectionTimedOut };
+    try spawnFakeFetch(&app, &result);
+    try std.testing.expect(app.session.pickerWaits());
+    try std.testing.expect(app.session.animating());
+    try std.testing.expectEqual(@as(usize, 0), app.session.mode.picking.picker.options.len);
+
+    // A wakeup of another generation belongs to a fetch that a cancel already
+    // joined, so it joins nothing.
+    _ = try app.applyBatch(&.{.{ .fetch_ended = 99 }});
+    try std.testing.expect(app.fetch != null);
+    try std.testing.expect(app.session.pickerWaits());
+
+    // The worker stored the list before its wakeup. The join reads it.
+    try ai.testing.seedAccount(&app.accounts, .anthropic_api, &.{"claude-opus-5"});
+    _ = try app.applyBatch(&.{.{ .fetch_ended = app.fetch.?.generation }});
+    try std.testing.expect(app.fetch == null);
+    try std.testing.expect(!app.session.pickerWaits());
+    try std.testing.expect(!app.session.animating());
+    const rebuilt = &app.session.mode.picking.picker;
+    try std.testing.expectEqualStrings("Model: Anthropic API", rebuilt.title);
+    try std.testing.expectEqual(@as(usize, 2), rebuilt.options.len);
+    try std.testing.expectEqualStrings("Refresh the model list", rebuilt.options[0]);
+    try std.testing.expectEqualStrings("claude-opus-5", rebuilt.options[1]);
+    try std.testing.expect(rebuilt.can_step_back);
+    // The missed metadata states itself in the scrollback beside the list.
+    const blocks = app.session.transcript.blocks();
+    try std.testing.expectEqual(@as(usize, 1), blocks.len);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        blocks[0].content.event.text.items,
+        "ConnectionTimedOut",
+    ) != null);
+
+    // The rebuilt step still returns to the provider step above it.
+    try app.handleKey(&.escape);
+    try std.testing.expectEqualStrings("Provider", app.session.mode.picking.picker.title);
+}
+
+// A fetch whose account list never arrived opens no list. The picker closes and
+// the failure goes to the transcript, as the blocking fetch did before.
+test "a failed fetch closes the picker and records the failure" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(home);
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    defer app.input.deinit();
+    try openModelStepForTest(&app, &out, home);
+    defer app.accounts.deinit();
+    defer app.agent.deinit();
+    defer app.session.deinit();
+
+    const result: ai.Accounts.Refresh = .{ .models_error = error.Timeout };
+    try spawnFakeFetch(&app, &result);
+    _ = try app.applyBatch(&.{.{ .fetch_ended = app.fetch.?.generation }});
+    try std.testing.expect(app.fetch == null);
+    try std.testing.expect(app.session.mode == .prompt);
+    const blocks = app.session.transcript.blocks();
+    try std.testing.expectEqual(@as(usize, 1), blocks.len);
+    try std.testing.expect(blocks[0].content.event.is_error);
+    try std.testing.expectEqualStrings(
+        "Drinky could not fetch the model list of Anthropic API because of error Timeout.",
+        blocks[0].content.event.text.items,
+    );
+}
+
+// Esc ends one thing. During a fetch that thing is the fetch: the worker joins,
+// the step that asked for it returns with its rows, and the trail above it
+// stands. A late wakeup of the joined fetch changes nothing.
+test "Esc cancels a fetch and returns the rows of its step" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(home);
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    defer app.input.deinit();
+    try openModelStepForTest(&app, &out, home);
+    defer app.accounts.deinit();
+    defer app.agent.deinit();
+    defer app.session.deinit();
+
+    const result: ai.Accounts.Refresh = .{ .count = 0 };
+    try spawnFakeFetch(&app, &result);
+    const generation = app.fetch.?.generation;
+
+    // A key that moves or selects a row has no row to act on, so the wait holds.
+    try app.handleKey(&.down);
+    try app.handleKey(&.enter);
+    try std.testing.expect(app.fetch != null);
+    try std.testing.expect(app.session.pickerWaits());
+
+    try app.handleKey(&.escape);
+    try std.testing.expect(app.fetch == null);
+    try std.testing.expect(app.session.mode == .picking);
+    try std.testing.expect(!app.session.pickerWaits());
+    const reopened = &app.session.mode.picking.picker;
+    try std.testing.expectEqualStrings("Model: Anthropic API", reopened.title);
+    try std.testing.expectEqualStrings("Fetch the model list", reopened.options[0]);
+    try std.testing.expect(reopened.can_step_back);
+    try std.testing.expectEqualStrings(
+        "You canceled the model fetch.",
+        app.session.notice.?.content,
+    );
+    try std.testing.expectEqual(@as(usize, 0), app.session.transcript.blocks().len);
+
+    // The joined worker can have left its wakeup in the queue.
+    _ = try app.applyBatch(&.{.{ .fetch_ended = generation }});
+    try std.testing.expect(app.fetch == null);
+    try std.testing.expect(app.session.mode == .picking);
+
+    // The next Esc leaves the step, as it did before the fetch.
+    try app.handleKey(&.escape);
+    try std.testing.expectEqualStrings("Provider", app.session.mode.picking.picker.title);
+}
+
+// Ctrl+C and Ctrl+D leave the whole command from any step, and a fetch is no
+// exception. The worker joins with the picker, so no result reaches a picker
+// that is gone.
+test "Ctrl+C during a fetch leaves the command and joins the worker" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(home);
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    defer app.input.deinit();
+    try openModelStepForTest(&app, &out, home);
+    defer app.accounts.deinit();
+    defer app.agent.deinit();
+    defer app.session.deinit();
+
+    const result: ai.Accounts.Refresh = .{ .count = 0 };
+    try spawnFakeFetch(&app, &result);
+    const generation = app.fetch.?.generation;
+    try app.handleKey(&.{ .ctrl = 'c' });
+    try std.testing.expect(app.fetch == null);
+    try std.testing.expect(app.session.mode == .prompt);
+    try std.testing.expectEqualStrings(
+        "You canceled the model selection.",
+        app.session.notice.?.content,
+    );
+    _ = try app.applyBatch(&.{.{ .fetch_ended = generation }});
     try std.testing.expect(app.session.mode == .prompt);
 }
 

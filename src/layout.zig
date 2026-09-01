@@ -73,12 +73,19 @@ pub const Scene = union(enum) {
 pub const Tail = union(enum) {
     prompt: Prompt,
     turn: Turn,
-    picking: *const ui.Picker,
+    picking: Picking,
 
     /// An idle prompt: one editor with an optional semantic caption.
     pub const Prompt = struct {
         caption: ?ui.Caption,
         editor: *const ui.Editor,
+    };
+
+    /// A picker that owns the region. A list that waits for a fetch moves its
+    /// separators as a turn does, so the wait reads as work in progress.
+    pub const Picking = struct {
+        picker: *const ui.Picker,
+        activity: ?ui.paint.Activity,
     };
 
     /// A streaming turn: the running tool calls, then one editor with its
@@ -127,7 +134,7 @@ const Component = union(enum) {
     entry: *ui.block.Entry,
     tool_box: ui.paint.Box,
     editor: EditorPresentation,
-    picker: *const ui.Picker,
+    picker: Tail.Picking,
     status: *const ui.status.Info,
 
     /// The physical rows this component occupies, its leading separator excluded.
@@ -139,7 +146,7 @@ const Component = union(enum) {
             .tool_box => |box| ui.paint.boxRows(&box, size.columns),
             .editor => |presentation| presentation.rows(size),
             .status => 1,
-            .picker => |picker| picker.rows(size),
+            .picker => |picking| picking.picker.rows(size),
         };
     }
 
@@ -157,7 +164,10 @@ const Component = union(enum) {
             .tool_box => |box| try ui.paint.box(placement, .tool_pending, &box),
             .status => |info| try ui.status.render(placement, info),
             .editor => |presentation| try presentation.render(placement, viewport_rows),
-            .picker => |picker| try picker.render(placement, viewport_rows),
+            .picker => |picking| try picking.picker.render(placement, &.{
+                .viewport_rows = viewport_rows,
+                .activity = picking.activity,
+            }),
         }
     }
 };
@@ -275,8 +285,8 @@ fn tailSlot(tail: *const Tail, offset: usize) Slot {
             .activity = null,
             .caption = prompt.caption,
         }),
-        .picking => |picker| return .{
-            .component = .{ .picker = picker },
+        .picking => |picking| return .{
+            .component = .{ .picker = picking },
             .id = id_input,
             .leading_blank = true,
         },

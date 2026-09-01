@@ -168,11 +168,7 @@ pub fn client(self: *Accounts, account: llm.Account) ?provider.Client {
         else
             return null,
     };
-    const timeouts = switch (account.provider()) {
-        .anthropic => self.timeouts.anthropic,
-        .openai => self.timeouts.openai,
-    };
-    return provider.Client.init(self.gpa, self.io, credentials, timeouts);
+    return provider.Client.init(self.gpa, self.io, credentials, self.timeoutsOf(account));
 }
 
 /// The model `name` of `account`, or null when the account does not offer it.
@@ -199,17 +195,42 @@ pub fn listModels(
 /// Fetch the model list of `account` and the public metadata, and store both.
 /// The two requests are independent, so a failure of one keeps the result of
 /// the other. Only the user starts this.
+///
+/// One window bounds the whole fetch: the token refresh, every page of the
+/// list, and the metadata request behind it. A list runs up to eight pages, so a
+/// bound per request would let a hung provider hold the fetch open for minutes.
+/// The window takes the connect bound of the provider, because no stream runs
+/// here and no idle bound applies.
 pub fn refresh(self: *Accounts, account: llm.Account) Refresh {
+    const deadline = net.Deadline.start(self.io, self.timeoutsOf(account).connect_ms);
+    return self.refreshWithin(account, deadline, fetchModels, OpenRouter.fetch);
+}
+
+/// `refresh` inside a window that the caller opened, over the list request
+/// `listFn` and the metadata request `metadataFn`. A test hands in doubles, so
+/// it reaches every exit without a socket.
+fn refreshWithin(
+    self: *Accounts,
+    account: llm.Account,
+    deadline: net.Deadline,
+    comptime listFn: anytype,
+    comptime metadataFn: anytype,
+) Refresh {
     var result: Refresh = .{};
 
-    if (self.fetchModels(account)) |discovered| {
+    if (listFn(self, account, deadline)) |discovered| {
         defer self.gpa.free(discovered);
         recordSave(&result.models_save_error, self.catalog.setAccount(account, discovered));
     } else |err| {
         result.models_error = err;
     }
+    // A cancel is one-shot: the blocking call that took it acknowledged it, and
+    // every later blocking call runs to its end. The metadata request would then
+    // hold the join for the rest of the window, so the fetch ends here. The
+    // caller discards the result of a canceled fetch.
+    if (isCanceled(result.models_error) or isCanceled(result.models_save_error)) return result;
 
-    if (OpenRouter.fetch(self.gpa, self.io, self.timeouts.anthropic)) |fetched| {
+    if (metadataFn(self.gpa, self.io, deadline)) |fetched| {
         var metadata = fetched;
         defer metadata.deinit();
         recordSave(&result.metadata_save_error, self.catalog.setMetadata(metadata.entries));
@@ -235,39 +256,58 @@ fn recordSave(slot: *?anyerror, outcome: anyerror!void) void {
     };
 }
 
-/// The vendor list of `account`, fetched with that account's own credential.
-fn fetchModels(self: *Accounts, account: llm.Account) ![]Model {
+/// Whether a cancel ended the part of a fetch that `slot` reports.
+fn isCanceled(slot: ?anyerror) bool {
+    return (slot orelse return false) == error.Canceled;
+}
+
+/// The vendor list of `account`, fetched with that account's own credential
+/// inside `deadline`. The subscription token can need a refresh first, and that
+/// request draws on the same window.
+fn fetchModels(self: *Accounts, account: llm.Account, deadline: net.Deadline) ![]Model {
     return switch (account) {
         .anthropic_subscription => anthropic.models.fetch(
             self.gpa,
             self.io,
-            self.timeouts.anthropic,
-            .{ .subscription = try self.anthropic_auth.accessToken() },
+            deadline,
+            .{ .subscription = try deadline.call(
+                self.io,
+                anthropic.Auth.accessToken,
+                .{&self.anthropic_auth},
+            ) },
         ),
         .anthropic_console => anthropic.models.fetch(
             self.gpa,
             self.io,
-            self.timeouts.anthropic,
+            deadline,
             .{ .api_key = self.anthropic_console_auth.apiKey() orelse return error.SignedOut },
         ),
         .anthropic_api => anthropic.models.fetch(
             self.gpa,
             self.io,
-            self.timeouts.anthropic,
+            deadline,
             .{ .api_key = self.keys.anthropic orelse return error.SignedOut },
         ),
         .openai_subscription => openai.models.fetchSubscription(
             self.gpa,
             self.io,
-            self.timeouts.openai,
+            deadline,
             &self.openai_auth,
         ),
         .openai_api => openai.models.fetchApi(
             self.gpa,
             self.io,
-            self.timeouts.openai,
+            deadline,
             self.keys.openai orelse return error.SignedOut,
         ),
+    };
+}
+
+/// The timeout pair of the provider behind `account`.
+fn timeoutsOf(self: *const Accounts, account: llm.Account) net.Timeouts {
+    return switch (account.provider()) {
+        .anthropic => self.timeouts.anthropic,
+        .openai => self.timeouts.openai,
     };
 }
 
@@ -661,6 +701,60 @@ test "a failed cache write reports a failed save, not a failed fetch" {
     recordSave(&result.metadata_save_error, error.AccessDenied);
     try std.testing.expectEqual(@as(?anyerror, error.StoreBusy), result.models_save_error);
     try std.testing.expectEqual(@as(?anyerror, error.AccessDenied), result.metadata_save_error);
+}
+
+// One window covers the list and the metadata, so a window that has closed
+// refuses both requests before either opens a socket. Each part records the
+// timeout as its own failure, so the report names what the user lost.
+test "an expired window ends both parts of a fetch without a request" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var accounts = testAccounts(.{ .anthropic = "sk-ant", .openai = "sk-openai" }, false, false);
+    accounts.io = io;
+
+    const expired: net.Deadline = .{ .at = std.Io.Clock.awake.now(io) };
+    for ([_]llm.Account{ .anthropic_api, .openai_api }) |account| {
+        const result = accounts.refreshWithin(account, expired, fetchModels, OpenRouter.fetch);
+        try std.testing.expectEqual(@as(?anyerror, error.Timeout), result.models_error);
+        try std.testing.expectEqual(@as(?anyerror, error.Timeout), result.metadata_error);
+        try std.testing.expectEqual(@as(usize, 0), result.count);
+        try std.testing.expect(accounts.catalog.isEmpty(account));
+    }
+}
+
+fn cancelList(_: *Accounts, _: llm.Account, _: net.Deadline) anyerror![]Model {
+    return error.Canceled;
+}
+
+fn refuseList(_: *Accounts, _: llm.Account, _: net.Deadline) anyerror![]Model {
+    return error.ConnectionRefused;
+}
+
+fn refuseMetadata(_: std.mem.Allocator, _: std.Io, _: net.Deadline) anyerror!OpenRouter {
+    return error.MetadataRequestFailed;
+}
+
+// A cancel is one-shot: the blocking call that takes it acknowledges it, and
+// every later blocking call runs to its end. A metadata request after a canceled
+// list would therefore hold the join for the rest of the window, and the
+// interface with it. The fetch must end on the cancel. An ordinary failure of
+// the list keeps the metadata request, because the two are independent.
+test "a canceled list ends the fetch before the metadata request" {
+    var accounts = testAccounts(.{ .anthropic = "sk-ant" }, false, false);
+    const unbounded: net.Deadline = .{ .at = null };
+
+    const canceled = accounts.refreshWithin(.anthropic_api, unbounded, cancelList, refuseMetadata);
+    try std.testing.expectEqual(@as(?anyerror, error.Canceled), canceled.models_error);
+    // The metadata double fails, so a null here proves that it never ran.
+    try std.testing.expect(canceled.metadata_error == null);
+
+    const refused = accounts.refreshWithin(.anthropic_api, unbounded, refuseList, refuseMetadata);
+    try std.testing.expectEqual(@as(?anyerror, error.ConnectionRefused), refused.models_error);
+    try std.testing.expectEqual(
+        @as(?anyerror, error.MetadataRequestFailed),
+        refused.metadata_error,
+    );
 }
 
 test "an account lists the models of its own catalog entry" {

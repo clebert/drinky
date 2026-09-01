@@ -39,11 +39,12 @@ pub const Page = struct {
 };
 
 /// Every model the credential behind `identity` can reach, in the order the API
-/// lists it. The caller owns the result.
+/// lists it. The caller owns the result. One `deadline` bounds every page, so a
+/// list that keeps reporting pages cannot hold the fetch open past it.
 pub fn fetch(
     gpa: std.mem.Allocator,
     io: std.Io,
-    timeouts: net.Timeouts,
+    deadline: net.Deadline,
     identity: Transport.Identity,
 ) ![]Model {
     var collected: std.ArrayList(Model) = .empty;
@@ -51,7 +52,7 @@ pub fn fetch(
 
     var cursor: ?[]const u8 = null;
     for (0..pages_max) |_| {
-        var page = try fetchPage(gpa, io, timeouts, identity, cursor);
+        var page = try fetchPage(gpa, io, deadline, identity, cursor);
         defer page.deinit(gpa);
         try collected.appendSlice(gpa, page.models);
         if (!page.has_more or page.models.len == 0) break;
@@ -64,12 +65,12 @@ pub fn fetch(
 fn fetchPage(
     gpa: std.mem.Allocator,
     io: std.Io,
-    timeouts: net.Timeouts,
+    deadline: net.Deadline,
     identity: Transport.Identity,
     cursor: ?[]const u8,
 ) !Page {
     var maybe_page: ?Page = null;
-    net.withTimeout(io, timeouts.connect_ms, request, .{
+    deadline.call(io, request, .{
         gpa,
         io,
         identity,
@@ -282,6 +283,20 @@ test "the credential guard reads the credential that each identity sends" {
     try std.testing.expect(!validCredential(.{ .subscription = "" }));
     try std.testing.expect(!validCredential(.{ .api_key = "sk-ant\r\nx-injected: 1" }));
     try std.testing.expect(!validCredential(.{ .subscription = "token\nx-injected: 1" }));
+}
+
+// The deadline of a fetch is shared with the requests around it, so a page must
+// take what is left of the window and not a window of its own. A window that has
+// closed refuses the page before it opens a socket.
+test "an expired deadline refuses the list without a request" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const expired: net.Deadline = .{ .at = std.Io.Clock.awake.now(io) };
+    try std.testing.expectError(
+        error.Timeout,
+        fetch(std.testing.allocator, io, expired, .{ .api_key = "sk-ant-key" }),
+    );
 }
 
 test parse {

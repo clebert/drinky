@@ -33,8 +33,15 @@ const hint_cancel = "↑/↓: Move · Enter: Select · Esc: Cancel";
 /// The key hint of a later step. Esc opens the step above, and one Esc per step
 /// leaves the picker.
 const hint_back = "↑/↓: Move · Enter: Select · Esc: Back";
+/// The key hint of a list that waits. It holds no row to move or select, and
+/// Esc ends the wait alone.
+const hint_wait = "Esc: Cancel";
 /// The tag of the option that holds the value the picker starts on.
 const tag_current = " (Current)";
+/// The pad in front of a row: the marker column of the selection. The wait row
+/// keeps it, so its text lines up with the rows it replaced.
+const pad_selected = " > ";
+const pad_plain = "   ";
 /// The width a picker composes its rows for before the first paint measures the
 /// window. No row reaches it, so no row is cut at that point.
 const unbounded = std.math.maxInt(usize);
@@ -67,6 +74,9 @@ columns_max: usize,
 /// Whether a step stands above this list. It selects the key hint alone. See
 /// `Start`.
 can_step_back: bool,
+/// The text that stands in for the rows while the list waits, or null while the
+/// list holds its rows. Borrowed. See `beginWait`.
+wait: ?[]const u8,
 
 /// Where a list sits: the highlighted row, and the first body row the window
 /// shows. A caller that reopens a list hands both back, so the list looks as the
@@ -87,6 +97,14 @@ pub const Start = struct {
     /// Whether a step stands above this list. It selects the key hint alone, and
     /// the caller owns what Esc then does.
     can_step_back: bool = false,
+};
+
+/// What a paint passes to `render` beside the placement.
+pub const RenderOptions = struct {
+    viewport_rows: usize,
+    /// The motion of the separators while the list waits. Null paints them
+    /// still, as every list that holds its rows does.
+    activity: ?paint.Activity = null,
 };
 
 /// Take ownership of `options` and compose the initial body. On failure the
@@ -112,6 +130,7 @@ pub fn init(
         .cursor_offset = 0,
         .columns_max = unbounded,
         .can_step_back = start.can_step_back,
+        .wait = null,
     };
     errdefer self.content.deinit(gpa);
     errdefer self.line_roles.deinit(gpa);
@@ -120,10 +139,27 @@ pub fn init(
 }
 
 pub fn deinit(self: *Picker) void {
-    for (self.options) |option| self.gpa.free(option);
-    self.gpa.free(self.options);
+    self.freeOptions();
     self.content.deinit(self.gpa);
     self.line_roles.deinit(self.gpa);
+}
+
+/// Drop every row and state `text` in their place, so no selection can land on
+/// a row that a pending result replaces. The caller rebuilds the list from that
+/// result, or reopens the step on a cancel. The list borrows `text`.
+pub fn beginWait(self: *Picker, text: []const u8) !void {
+    self.freeOptions();
+    self.options = &.{};
+    self.cursor = 0;
+    self.marked = null;
+    self.scroll = 0;
+    self.wait = text;
+    try self.compose();
+}
+
+fn freeOptions(self: *Picker) void {
+    for (self.options) |option| self.gpa.free(option);
+    self.gpa.free(self.options);
 }
 
 /// Where the list sits now. A caller that replaces this picker keeps it, so the
@@ -180,13 +216,17 @@ pub fn rows(self: *const Picker, size: terminal.View.Size) usize {
 }
 
 /// Stream the caption, then the option rows between their separators, through
-/// `placement`. Window the list to its scroll limit for `viewport_rows`. Assumes
-/// `reflow` set the scroll.
-pub fn render(self: *const Picker, placement: *const paint.Placement, viewport_rows: usize) !void {
+/// `placement`. Window the list to its scroll limit for `options.viewport_rows`.
+/// Assumes `reflow` set the scroll.
+pub fn render(
+    self: *const Picker,
+    placement: *const paint.Placement,
+    options: *const RenderOptions,
+) !void {
     const caption_rows = try self.renderCaption(placement);
     const columns_max = paint.contentColumns(placement.columns);
     const total_body = terminal.width.rows(self.content.items, columns_max);
-    const visible_rows = @min(total_body, paint.bodyLimit(viewport_rows));
+    const visible_rows = @min(total_body, paint.bodyLimit(options.viewport_rows));
     // The derived placement copies its parent. Only the geometry changes.
     var frame_placement = placement.*;
     frame_placement.base = placement.base + caption_rows;
@@ -196,6 +236,7 @@ pub fn render(self: *const Picker, placement: *const paint.Placement, viewport_r
         .hidden_above = self.scroll,
         .hidden_below = total_body - self.scroll - visible_rows,
         .line_roles = self.line_roles.items,
+        .activity = options.activity,
     });
 }
 
@@ -217,7 +258,12 @@ fn captionRows(self: *const Picker, columns: usize) usize {
 fn caption(self: *const Picker) Caption {
     return .{
         .title = self.title,
-        .controls = if (self.can_step_back) hint_back else hint_cancel,
+        .controls = if (self.wait != null)
+            hint_wait
+        else if (self.can_step_back)
+            hint_back
+        else
+            hint_cancel,
         .rows_max = 3,
     };
 }
@@ -227,12 +273,22 @@ fn caption(self: *const Picker) Caption {
 /// terminal foreground and background. Every row carries text, so the frame holds
 /// no blank row. Rows are `\n`-separated and carry a three-column left pad for
 /// the selection marker. The trusted role lives separately in `line_roles`.
+///
+/// A list that waits holds one muted row with its wait text in place of the
+/// options. The row keeps the pad, so it lines up with the rows it replaced.
 fn compose(self: *Picker) !void {
     self.content.clearRetainingCapacity();
     self.line_roles.clearRetainingCapacity();
     // Reset with the buffers it indexes into: a failure below must not leave the
     // offset past the shorter rebuilt content for `reflow` to slice.
     self.cursor_offset = 0;
+
+    if (self.wait) |text| {
+        try self.startLine(.muted);
+        try self.content.appendSlice(self.gpa, pad_plain);
+        try self.content.appendSlice(self.gpa, text);
+        return self.cut(0, self.columns_max);
+    }
 
     for (self.options, 0..) |option, index| {
         const chosen = index == self.cursor;
@@ -242,7 +298,7 @@ fn compose(self: *Picker) !void {
         const start = self.content.items.len;
         const tag = if (self.marked == index) tag_current else "";
         const tag_columns = terminal.width.ofText(tag);
-        try self.content.appendSlice(self.gpa, if (chosen) " > " else "   ");
+        try self.content.appendSlice(self.gpa, if (chosen) pad_selected else pad_plain);
         try self.content.appendSlice(self.gpa, option);
         if (tag_columns < self.columns_max) {
             // The tag states what the row is, so the cut takes the option text
@@ -354,9 +410,68 @@ fn renderForTest(
         .base = 0,
         .skip = 0,
     };
-    try picker.render(&placement, size.rows);
+    try picker.render(&placement, &.{ .viewport_rows = size.rows });
     try view.render();
     return gpa.dupe(u8, out.written());
+}
+
+// A row that starts a fetch clears the list, so no selection can land on a row
+// that the result replaces. The wait row takes the place of the options, the
+// hint names the one key that still acts, and the separators move while the
+// list waits.
+test "a list that waits drops its rows, states the wait, and moves its separators" {
+    const gpa = std.testing.allocator;
+    var picker = try testPicker(gpa, &.{ "Refresh the model list", "claude-opus-5" }, 1);
+    defer picker.deinit();
+    picker.can_step_back = true;
+    const size: terminal.View.Size = .{ .columns = 60, .rows = 24 };
+
+    try picker.beginWait("Drinky fetches the model list.");
+    try picker.reflow(size);
+    try std.testing.expectEqual(@as(usize, 0), picker.options.len);
+    try std.testing.expectEqual(@as(usize, 0), picker.cursor);
+    try std.testing.expect(picker.marked == null);
+    // The one body row is the wait text in the muted role, padded like a row.
+    try std.testing.expectEqualStrings("   Drinky fetches the model list.", picker.content.items);
+    try std.testing.expectEqual(@as(usize, 1), picker.line_roles.items.len);
+    try std.testing.expectEqual(role.Name.muted, picker.line_roles.items[0].?);
+    try std.testing.expect(std.mem.indexOf(u8, picker.content.items, "claude") == null);
+    // The caption, two separators, and the wait row make four rows.
+    try std.testing.expectEqual(@as(usize, 4), picker.rows(size));
+
+    // No row remains to move to, so a move changes nothing.
+    try picker.moveDown();
+    try picker.moveUp();
+    try std.testing.expectEqual(@as(usize, 0), picker.cursor);
+
+    const painted = try renderForTest(gpa, &picker, size);
+    defer gpa.free(painted);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "Esc: Cancel") != null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "Esc: Back") == null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "Enter: Select") == null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "Drinky fetches") != null);
+    try std.testing.expectEqual(@as(usize, 4), block.paintedRows(painted));
+    // The separators stand still without an activity.
+    try std.testing.expect(std.mem.indexOf(u8, painted, "━") == null);
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var view = terminal.View.init(gpa, &out.writer);
+    defer view.deinit();
+    const sink = try view.beginFrame(size, 4);
+    const placement: paint.Placement = .{
+        .sink = sink,
+        .id = 0,
+        .columns = size.columns,
+        .base = 0,
+        .skip = 0,
+    };
+    try picker.render(&placement, &.{
+        .viewport_rows = size.rows,
+        .activity = .{ .motion_tick = 3, .progress_age_ticks = 0 },
+    });
+    try view.render();
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "━") != null);
 }
 
 // A list that the user returns to opens on the row they left, over the row that

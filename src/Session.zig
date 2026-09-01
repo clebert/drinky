@@ -114,9 +114,6 @@ gpa: std.mem.Allocator,
 transcript: Transcript,
 /// The sole transient notice. Its owned content never enters the transcript.
 notice: ?ai.command.Outcome.Message,
-/// Whether that notice is the wait line of a blocking command step. Only such a
-/// line retracts itself when the step reports its outcome.
-notice_wait: bool,
 /// The armed one-shot confirmations. A warning arms one, the key that raised it
 /// passes it once, and any other user action cancels it.
 confirmations: std.EnumSet(Confirmation),
@@ -324,6 +321,18 @@ const Picking = struct {
     reopen: ?ai.command.Outcome.Opener,
     /// The pickers this one replaced, oldest first. Esc opens the last one.
     trail: Trail,
+    /// The frames since the list started to wait for a fetch, or null while the
+    /// list holds its rows. The separators move with it, so the wait reads as
+    /// work in progress. The result of the fetch rebuilds the list.
+    wait_tick: ?u64,
+
+    /// The motion of the separators, or null while the list holds its rows. A
+    /// fetch reports no progress, so the segment keeps its length, and the list
+    /// paints no caret, so it carries no blink clock.
+    fn activity(self: *const Picking) ?ui.paint.Activity {
+        const tick = self.wait_tick orelse return null;
+        return .{ .motion_tick = tick, .progress_age_ticks = 0 };
+    }
 };
 
 /// The pickers a step can return to. Each entry builds one picker again and
@@ -498,12 +507,16 @@ pub const UiEvent = union(enum) {
     turn: TurnEvent,
     tick,
     resize,
+    /// The wakeup of the fetch worker of this generation: its result is ready
+    /// to join. A canceled fetch can leave one behind, so the consumer joins the
+    /// fetch of this generation alone.
+    fetch_ended: u64,
 
     pub fn deinit(self: *const UiEvent, gpa: std.mem.Allocator) void {
         switch (self.*) {
             .keys => |bytes| gpa.free(bytes),
             .turn => |*event| event.deinit(gpa),
-            .tick, .resize => {},
+            .tick, .resize, .fetch_ended => {},
         }
     }
 };
@@ -520,7 +533,6 @@ pub fn init(
         .gpa = gpa,
         .transcript = Transcript.init(gpa),
         .notice = null,
-        .notice_wait = false,
         .confirmations = .initEmpty(),
         .editor = ui.Editor.init(gpa),
         .view = terminal.View.init(gpa, writer),
@@ -637,7 +649,6 @@ pub fn dropAccountReasoning(self: *Session, account: ai.llm.Account) void {
 
 /// Clear the transient notice. The regular footer returns on the next frame.
 pub fn clearNotice(self: *Session) void {
-    self.notice_wait = false;
     if (self.notice) |notice| {
         self.gpa.free(notice.content);
         self.notice = null;
@@ -690,13 +701,6 @@ fn showNotice(
     text: []const u8,
 ) !void {
     self.setNotice(.{ .content = try self.gpa.dupe(u8, text), .severity = severity });
-}
-
-/// Show `text` as the wait line of a blocking command step. The step stops the
-/// interface, so the line states that stop before the step runs.
-pub fn showWait(self: *Session, text: []const u8) !void {
-    try self.showNotice(.information, text);
-    self.notice_wait = true;
 }
 
 /// Free whatever the current mode owns.
@@ -956,12 +960,7 @@ fn appendEvent(self: *Session, message: ai.command.Outcome.Message) !void {
 
 /// Apply a command outcome to the model: replace its notice, record its event,
 /// open its picker, or write its line into the editor.
-///
-/// An outcome proves that the step which produced it ended, so a wait line goes
-/// first. A line that outlives its wait misinforms the user as much as a silent
-/// stop does.
 pub fn applyOutcome(self: *Session, outcome: ai.command.Outcome) !void {
-    if (self.notice_wait) self.clearNotice();
     switch (outcome) {
         // A refusal is a notice whose line stays in the editor. The app owns that
         // rule, because the session never clears the editor for a command.
@@ -977,13 +976,14 @@ pub fn applyOutcome(self: *Session, outcome: ai.command.Outcome) !void {
             try self.editor.insert(text);
             self.markEdited();
         },
-        // The app intercepts prompt, account, conversation, and inspection
-        // actions. They never reach the io-free session.
+        // The app intercepts prompt, account, fetch, conversation, and
+        // inspection actions. They never reach the io-free session.
         .prompt,
         .login,
         .logout,
         .switch_account,
         .credential_replaced,
+        .fetch,
         .new_conversation,
         .show_system_prompt,
         => unreachable,
@@ -1071,6 +1071,7 @@ fn enterPicker(
         .cancellation_message = pick.cancellation_message,
         .reopen = pick.reopen,
         .trail = trail,
+        .wait_tick = null,
     } };
     // The one place that enters picker mode marks the frame. `applyOutcome`
     // marks its own outcomes, but a step back reaches this function alone.
@@ -1087,6 +1088,28 @@ pub fn closePicker(self: *Session) void {
         },
         else => {},
     }
+}
+
+/// Clear the rows of the open picker and state `text` in their place, until the
+/// step that asked for the wait rebuilds the list or a cancel reopens it. The
+/// separators move meanwhile, so the wait reads as work in progress and never as
+/// a hang. The list borrows `text`, and the trail stays, so the rebuilt list
+/// returns to the same steps above it.
+pub fn beginPickerWait(self: *Session, text: []const u8) !void {
+    std.debug.assert(self.mode == .picking);
+    const picking = &self.mode.picking;
+    try picking.picker.beginWait(text);
+    picking.wait_tick = 0;
+    self.dirty = true;
+}
+
+/// Whether the open picker waits for a fetch. Its rows are gone, so a key that
+/// moves or selects a row has nothing to act on.
+pub fn pickerWaits(self: *const Session) bool {
+    return switch (self.mode) {
+        .picking => |*picking| picking.wait_tick != null,
+        else => false,
+    };
 }
 
 /// Close the picker and show its cancellation until the next user action.
@@ -1483,7 +1506,10 @@ pub fn paint(self: *Session, size: terminal.View.Size) !void {
         },
         .picking => |*picking| picking: {
             try picking.picker.reflow(size);
-            break :picking .{ .picking = &picking.picker };
+            break :picking .{ .picking = .{
+                .picker = &picking.picker,
+                .activity = picking.activity(),
+            } };
         },
         .viewing => unreachable,
     };
@@ -1542,23 +1568,34 @@ pub fn markEdited(self: *Session) void {
 
 /// Advance the activity clock and report whether this tick repaints. A turn
 /// advances without marking the model dirty, so motion continues between model
-/// events. The caret blink shares the clock, so a blink flip also repaints.
+/// events. The caret blink shares the clock, so a blink flip also repaints. A
+/// picker that waits advances the same way.
 pub fn advanceFrame(self: *Session) bool {
     var activity_changed = false;
-    if (self.activeTurn()) |turn| {
-        turn.activity_tick +%= 1;
-        turn.caret_tick +%= 1;
-        const activity = turn.activity();
-        activity_changed = ui.paint.activityChanged(&activity, self.columns);
+    switch (self.mode) {
+        .turn => |*turn| {
+            turn.activity_tick +%= 1;
+            turn.caret_tick +%= 1;
+            const activity = turn.activity();
+            activity_changed = ui.paint.activityChanged(&activity, self.columns);
+        },
+        .picking => |*picking| if (picking.wait_tick) |*tick| {
+            tick.* +%= 1;
+            const activity = picking.activity().?;
+            activity_changed = ui.paint.activityChanged(&activity, self.columns);
+        },
+        .prompt, .viewing => {},
     }
     return self.dirty or activity_changed;
 }
 
-/// Whether a component wants continuous frames: the active turn's separators.
+/// Whether a component wants continuous frames: the separators of the active
+/// turn, or of a picker that waits.
 pub fn animating(self: *const Session) bool {
     return switch (self.mode) {
         .turn => true,
-        else => false,
+        .picking => |*picking| picking.wait_tick != null,
+        .prompt, .viewing => false,
     };
 }
 
@@ -2028,49 +2065,64 @@ test "a notice replaces its predecessor without entering the transcript" {
     try std.testing.expect(session.notice == null);
 }
 
-// A blocking command step states its wait before it runs, because the interface
-// stops while the step runs. The outcome of the step proves that the stop ended,
-// so the line must go with it. A wait line that outlives its wait misinforms the
-// user as much as a silent stop does.
-test "the wait line of a blocking step goes with the outcome of that step" {
+// A fetch runs on a worker, and the picker that asked for it waits. The rows go,
+// so no selection lands on a row that the result replaces, and the separators
+// move, so the wait reads as work in progress. The result rebuilds the list as
+// the same step, so the trail above it stands.
+test "a picker that waits drops its rows, animates, and keeps its trail" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
     var session: Session = Session.init(gpa, &out.writer, test_model, .none);
     defer session.deinit();
+    const size: terminal.View.Size = .{ .columns = 80, .rows = 24 };
+    const account_step = struct {
+        fn open(_: *ai.command.Context) anyerror!ai.command.Outcome {
+            unreachable;
+        }
+    }.open;
+    const model_step = struct {
+        fn open(_: *ai.command.Context) anyerror!ai.command.Outcome {
+            unreachable;
+        }
+    }.open;
 
-    const wait_text = "Drinky fetches the model list. The interface waits for the provider.";
-    try session.showWait(wait_text);
-    try std.testing.expectEqualStrings(wait_text, session.notice.?.content);
+    try session.applyOutcome(.{ .pick = try pickForTest(gpa, "Account", account_step) });
+    try session.applyOutcome(.{ .pick = try pickForTest(gpa, "Model", model_step) });
+    try std.testing.expect(!session.pickerWaits());
+    try std.testing.expect(!session.animating());
+    session.dirty = false;
 
-    // The refreshed list opens, so the wait ended.
-    const options = try gpa.alloc([]const u8, 1);
-    options[0] = try gpa.dupe(u8, "claude-sonnet-4-6");
-    try session.applyOutcome(.{ .pick = .{
-        .select = undefined,
-        .title = "Model",
-        .cancellation_message = "You canceled the model selection.",
-        .options = options,
-        .current = null,
-    } });
-    try std.testing.expect(session.mode == .picking);
-    try std.testing.expect(session.notice == null);
+    try session.beginPickerWait("Drinky fetches the model list.");
+    try std.testing.expect(session.pickerWaits());
+    try std.testing.expect(session.animating());
+    try std.testing.expect(session.dirty);
+    try std.testing.expectEqual(@as(usize, 1), session.mode.picking.trail.len);
+    try std.testing.expectEqual(@as(usize, 0), session.mode.picking.picker.options.len);
 
-    // A failed fetch reports an event instead, and the wait ended there too.
-    try session.showWait(wait_text);
-    try session.applyOutcome(
-        try ai.command.Outcome.reportEvent(gpa, .failure, "Drinky could not fetch.", .{}),
-    );
-    try std.testing.expect(session.notice == null);
+    // The frame clock moves the separators, so each tick repaints.
+    try session.paint(size);
+    session.dirty = false;
+    try std.testing.expect(session.advanceFrame());
+    try std.testing.expectEqual(@as(u64, 1), session.mode.picking.wait_tick.?);
+    try session.paint(size);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "Drinky fetches") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "Esc: Cancel") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "━") != null);
 
-    // A notice of another kind names no wait, so an outcome leaves it alone.
-    try session.applyOutcome(
-        try ai.command.Outcome.reportNotice(gpa, .failure, "Select a valid model.", .{}),
-    );
-    try session.applyOutcome(
-        try ai.command.Outcome.reportEvent(gpa, .information, "An event.", .{}),
-    );
-    try std.testing.expectEqualStrings("Select a valid model.", session.notice.?.content);
+    // The result rebuilds the same step, so the wait ends and the trail stands.
+    try session.applyOutcome(.{ .pick = try pickForTest(gpa, "Model", model_step) });
+    try std.testing.expect(!session.pickerWaits());
+    try std.testing.expect(!session.animating());
+    try std.testing.expectEqual(@as(usize, 1), session.mode.picking.trail.len);
+    try std.testing.expect(session.mode.picking.trail.last().?.open == account_step);
+    try std.testing.expectEqual(@as(usize, 1), session.mode.picking.picker.options.len);
+
+    // A closed picker ends the wait with it.
+    try session.beginPickerWait("Drinky fetches the model list.");
+    session.closePicker();
+    try std.testing.expect(!session.pickerWaits());
+    try std.testing.expect(!session.animating());
 }
 
 // A step can report and open a list at once. A cache write that failed is such
@@ -2083,9 +2135,6 @@ test "a picker that reports records its line and still opens its list" {
     defer out.deinit();
     var session: Session = Session.init(gpa, &out.writer, test_model, .none);
     defer session.deinit();
-
-    const wait_text = "Drinky fetches the model list. The interface waits for the provider.";
-    try session.showWait(wait_text);
 
     const options = try gpa.alloc([]const u8, 1);
     options[0] = try gpa.dupe(u8, "claude-sonnet-4-6");
@@ -2102,7 +2151,6 @@ test "a picker that reports records its line and still opens its list" {
     } });
 
     try std.testing.expect(session.mode == .picking);
-    // The fetch ended, so its wait line leaves the footer with the outcome.
     try std.testing.expect(session.notice == null);
     const failure_blocks = session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 1), failure_blocks.len);

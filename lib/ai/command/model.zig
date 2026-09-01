@@ -28,7 +28,9 @@ pub const summary = "switch account and model together";
 const cancellation_message = "You canceled the model selection.";
 
 /// The first row of the model step. It reads as a fetch while the account
-/// offers nothing, because no list exists to refresh yet.
+/// offers nothing, because no list exists to refresh yet. The row hands its
+/// account to the app, which runs the fetch and returns the result to
+/// `fetchOutcome`.
 const fetch_row = "Fetch the model list";
 const refresh_row = "Refresh the model list";
 
@@ -209,7 +211,7 @@ fn modelStepOf(comptime account: llm.Account) ModelStep {
         .select = struct {
             fn select(context: *Context, index: usize) anyerror!Context.Outcome {
                 const gpa = context.gpa;
-                if (index == 0) return fetchStep(context, account);
+                if (index == 0) return .{ .fetch = account };
                 var list: std.ArrayList(Model) = .empty;
                 defer list.deinit(gpa);
                 try context.accounts.listModels(account, &list, gpa);
@@ -307,25 +309,20 @@ fn isCurrent(context: *const Context, account: llm.Account, model: *const Model)
     return active_account == account and active.eql(model);
 }
 
-/// Fetch the list of `account` and reopen its step over the result. Drinky asks
-/// the provider and the public metadata in one step, so the user chooses a model
-/// out of a list that is current. A fetch has three exits. A failed account list
-/// reports itself and opens nothing, so the user reads what went wrong before
-/// another try. That report names a cache write that failed with it. A failed
-/// metadata request opens the list and states itself beside it. A failed cache
-/// write does the same, because that list arrived.
+/// The outcome of one fetch of `account` over `result`: its step, reopened over
+/// the list that arrived. Drinky asks the provider and the public metadata in
+/// one fetch, so the user chooses a model out of a list that is current. A fetch
+/// has three exits. A failed account list reports itself and opens nothing, so
+/// the user reads what went wrong before another try. That report names a cache
+/// write that failed with it. A failed metadata request opens the list and
+/// states itself beside it. A failed cache write does the same, because that
+/// list arrived.
 ///
-/// The two requests block the thread that paints and reads the keys, so the
-/// interface stops until they end. The wait line states that stop first.
-fn fetchStep(context: *Context, account: llm.Account) !Context.Outcome {
-    try context.stateFetchWait(account);
-    const result = context.accounts.refresh(account);
-    return fetchOutcome(context, account, &result);
-}
-
-/// The outcome of one fetch of `account` over `result`. It holds no request, so
-/// a test reaches every exit without a socket.
-fn fetchOutcome(
+/// The fetch row returns `Outcome.fetch`, and the app runs the two requests on a
+/// worker, so the interface stays live and Esc can cancel them. The app then
+/// hands the result here. The function holds no request, so a test reaches every
+/// exit without a socket.
+pub fn fetchOutcome(
     context: *Context,
     account: llm.Account,
     result: *const Accounts.Refresh,
@@ -710,6 +707,41 @@ test "an account with no model offers the fetch row alone" {
     try std.testing.expect(pick.current == null);
 }
 
+// A fetch reaches the network, and a command runs on the thread that paints and
+// reads the keys. The row therefore runs no request of its own and names the
+// account for the app, which fetches on a worker. The row of a stale list does
+// the same, because both rows lead to one fetch.
+test "the fetch row hands its account to the app" {
+    const gpa = std.testing.allocator;
+    var accounts = testing.accounts(.{ .anthropic = "sk-ant", .openai = "sk-openai" }, .{});
+    defer testing.deinitAccounts(&accounts);
+    try testing.seed(&accounts, .openai_api, &.{"gpt-5.6-sol"});
+    var agent = testing.agent(gpa, .{ .anthropic_api = "sk-ant" });
+    defer agent.deinit();
+    var context: Context = .{ .gpa = gpa, .io = undefined, .agent = &agent, .accounts = &accounts };
+
+    const vendors = try expectPick(try run(&context));
+    defer freePick(gpa, &vendors);
+    const anthropic_models = try expectPick(try vendors.select(&context, 0));
+    defer freePick(gpa, &anthropic_models);
+    try std.testing.expectEqualStrings("Fetch the model list", anthropic_models.options[0]);
+    try std.testing.expectEqual(
+        llm.Account.anthropic_api,
+        (try anthropic_models.select(&context, 0)).fetch,
+    );
+
+    const openai_models = try expectPick(try vendors.select(&context, 1));
+    defer freePick(gpa, &openai_models);
+    try std.testing.expectEqualStrings("Refresh the model list", openai_models.options[0]);
+    try std.testing.expectEqual(
+        llm.Account.openai_api,
+        (try openai_models.select(&context, 0)).fetch,
+    );
+    // The row itself changes nothing: the catalog and the agent stand as before.
+    try std.testing.expect(!accounts.offersModel(.anthropic_api));
+    try std.testing.expectEqualStrings("claude-sonnet-4-6", agent.model.?.name());
+}
+
 test "a provider row opens its accounts, and an account row opens its models" {
     const gpa = std.testing.allocator;
     var accounts = testing.accounts(
@@ -1087,7 +1119,8 @@ fn runUnderOom(gpa: std.mem.Allocator) !void {
     const anthropic_models = try expectPick(try anthropic_accounts.select(&context, 0));
     defer freePick(gpa, &anthropic_models);
 
-    // Row 0 fetches over the network, so the walk picks a model row.
+    // Row 0 hands off to the app and allocates nothing, so the walk picks a
+    // model row.
     switch (try anthropic_models.select(&context, 1)) {
         .event => |event| gpa.free(event.content),
         else => return error.ExpectedEvent,

@@ -32,14 +32,6 @@ decision already taken, or a dependency on another entry. Module layout and exte
 
 ## Improvements
 
-- **Fetch the model list on a worker** — the fetch leaves the consumer thread, so the wait animates,
-  Esc cancels it, and the picker clears its rows while it runs. _`Accounts.refresh` runs inside the
-  command step today, so the frame timer never rearms and the interface paints zero frames._
-- **Bound a model fetch with one deadline** — one deadline covers the whole fetch, so a hung
-  provider cannot hold the fetch open without end. _A 30-second bound covers each request alone, and
-  no idle bound reaches a model fetch. A list runs up to eight pages, and the OpenRouter request
-  follows it, so the sum is minutes. `net.Deadline` exists for this. The entry above takes the
-  freeze away, so this one guards the socket alone and waits for it._
 - **Show a model that no source describes** — such a model takes a disabled picker row that names
   what it lacks, and its selection opens the hint for the config key. _`Catalog.merge` returns null
   and the caller drops the model today, so it leaves the picker with no line. A picker row carries
@@ -96,8 +88,7 @@ decision already taken, or a dependency on another entry. Module layout and exte
   `/v1/models` describes no model and prices none._
 - **A herdr state socket** — Drinky reports a turn end and a failure over a socket, so herdr can
   notify the user. _The channel carries state outward alone, and nothing outside Drinky drives the
-  session. Herdr holds a terminal open, so the work survives a closed lid. See
-  <https://herdr.dev>._
+  session. Herdr holds a terminal open, so the work survives a closed lid. See <https://herdr.dev>._
 
 ## Ideas
 

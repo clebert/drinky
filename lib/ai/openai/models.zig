@@ -28,15 +28,15 @@ const body_bytes_max = 4 * 1024 * 1024;
 const entry_count_max = 1024;
 
 /// Every model the ChatGPT subscription behind `auth` can run. The caller owns
-/// the result.
+/// the result. The `deadline` bounds the request and the token refresh inside it.
 pub fn fetchSubscription(
     gpa: std.mem.Allocator,
     io: std.Io,
-    timeouts: net.Timeouts,
+    deadline: net.Deadline,
     auth: *Auth,
 ) ![]Model {
     var collected: ?[]Model = null;
-    net.withTimeout(io, timeouts.connect_ms, requestSubscription, .{
+    deadline.call(io, requestSubscription, .{
         gpa,
         io,
         auth,
@@ -99,15 +99,16 @@ fn validSubscriptionCredentials(access_token: []const u8, account_id: []const u8
     return account_id.len == 0 or net.validHeaderValue(account_id);
 }
 
-/// Every model the API key `key` can name. The caller owns the result.
+/// Every model the API key `key` can name. The caller owns the result. The
+/// `deadline` bounds the request.
 pub fn fetchApi(
     gpa: std.mem.Allocator,
     io: std.Io,
-    timeouts: net.Timeouts,
+    deadline: net.Deadline,
     key: []const u8,
 ) ![]Model {
     var collected: ?[]Model = null;
-    net.withTimeout(io, timeouts.connect_ms, requestApi, .{ gpa, io, key, &collected }) catch |err| {
+    deadline.call(io, requestApi, .{ gpa, io, key, &collected }) catch |err| {
         if (collected) |models| gpa.free(models);
         return err;
     };
@@ -282,6 +283,33 @@ test "the Codex list omits the account headers when the credential names none" {
     const anonymous = subscriptionHeaders("", &extra);
     try std.testing.expectEqual(@as(usize, 1), anonymous.len);
     try std.testing.expectEqualStrings("accept", anonymous[0].name);
+}
+
+// Both lists share the deadline of the fetch around them, so a window that has
+// closed refuses each request before it opens a socket.
+test "an expired deadline refuses both lists without a request" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const expired: net.Deadline = .{ .at = std.Io.Clock.awake.now(io) };
+    try std.testing.expectError(
+        error.Timeout,
+        fetchApi(std.testing.allocator, io, expired, "sk-openai"),
+    );
+    // The subscription reads its token inside the request, so a refused request
+    // never reaches this store. A signed-out store would answer with
+    // `NotAuthenticated` if it did.
+    var signed_out: Auth = .{
+        .gpa = std.testing.allocator,
+        .io = io,
+        .timeouts = .{},
+        .path = "",
+        .tokens = null,
+    };
+    try std.testing.expectError(
+        error.Timeout,
+        fetchSubscription(std.testing.allocator, io, expired, &signed_out),
+    );
 }
 
 test "the Codex guard accepts a credential that names no account" {

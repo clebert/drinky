@@ -18,18 +18,6 @@ agent: *Agent,
 accounts: *Accounts,
 /// Runtime-discovered skills. Null in the command tests that do not need them.
 skill_registry: ?*const skills.Registry = null,
-/// The host hook that states a wait. Null in the command tests that do not need
-/// it.
-wait: ?Wait = null,
-
-/// The host hook that a command calls before a step that blocks. A command runs
-/// on the thread that paints and reads the keys, so a network step stops the
-/// whole interface. The line the host paints tells the user what that stop is.
-pub const Wait = struct {
-    /// The host state that `paint` writes through. The host owns it.
-    host: *anyopaque,
-    paint: *const fn (*anyopaque, []const u8) void,
-};
 
 /// A slash command's result. Notice, event, picker, and prompt allocations
 /// transfer to the caller. The app owns account and conversation actions. A
@@ -65,6 +53,12 @@ pub const Outcome = union(enum) {
     /// the evidence of the replaced principal and reports the step that
     /// follows. A turn that meets the same replacement takes that transition.
     credential_replaced: llm.Account,
+    /// Fetch the model list of this account and the public metadata. A command
+    /// runs on the thread that paints and reads the keys, so the app runs the
+    /// fetch on a worker and the interface stays live. The picker that asked
+    /// stays open with no rows until the result rebuilds it, and Esc cancels
+    /// the fetch alone. The app hands the result to `model.fetchOutcome`.
+    fetch: llm.Account,
     /// Clear conversation and presentation state but keep the configuration.
     new_conversation,
     /// Show the complete provider-neutral system prompt assembled by the app.
@@ -240,55 +234,3 @@ pub const Outcome = union(enum) {
         }
     }
 };
-
-/// State the wait of a model fetch of `account`. The requests of a fetch run on
-/// the thread that paints and reads the keys, so the interface stops until they
-/// end. The line states that stop, so it never reads as a hang.
-pub fn stateFetchWait(self: *const Context, account: llm.Account) !void {
-    if (self.wait == null) return;
-    const text = try std.fmt.allocPrint(
-        self.gpa,
-        "Drinky fetches the model list of {s}. The interface waits for the provider.",
-        .{account.label()},
-    );
-    defer self.gpa.free(text);
-    self.stateWait(text);
-}
-
-/// State `text` as the wait of the step that follows, or do nothing where the
-/// host paints none.
-fn stateWait(self: *const Context, text: []const u8) void {
-    const wait = self.wait orelse return;
-    wait.paint(wait.host, text);
-}
-
-test stateFetchWait {
-    const Host = struct {
-        text: [128]u8 = undefined,
-        length: usize = 0,
-
-        fn paint(host: *anyopaque, text: []const u8) void {
-            const self: *@This() = @ptrCast(@alignCast(host));
-            @memcpy(self.text[0..text.len], text);
-            self.length = text.len;
-        }
-    };
-    var host: Host = .{};
-    var context: Context = .{
-        .gpa = std.testing.allocator,
-        .io = undefined,
-        .agent = undefined,
-        .accounts = undefined,
-    };
-
-    // Without a host hook the call paints nothing and reports no failure.
-    try context.stateFetchWait(.openai_api);
-    try std.testing.expectEqual(@as(usize, 0), host.length);
-
-    context.wait = .{ .host = &host, .paint = Host.paint };
-    try context.stateFetchWait(.openai_api);
-    try std.testing.expectEqualStrings(
-        "Drinky fetches the model list of OpenAI API. The interface waits for the provider.",
-        host.text[0..host.length],
-    );
-}

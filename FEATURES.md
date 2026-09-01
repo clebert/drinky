@@ -76,8 +76,11 @@ Anthropic and OpenAI through a subscription login or an API key.
   and from OpenRouter. The user fetches that list from `/model`.
 - No request runs at startup. A fetch runs on request, and Drinky caches the result in `models.json`
   per account and in `metadata.json` per vendor.
-- A fetch states its wait in the footer, because the interface stops until the provider answers. A
-  fetch with something to report records a transcript event.
+- A fetch runs beside the interface. The picker clears its rows, states the wait, and moves its
+  separators. Esc cancels the fetch and returns the rows. A fetch with something to report records a
+  transcript event.
+- One window of `request.connect_timeout_ms` bounds a whole fetch: the token refresh, every page of
+  the list, and the metadata request.
 - The provider wins every field that it states. Only OpenRouter prices a model. For Anthropic only
   OpenRouter states whether the reasoning can stop.
 - A model that no source describes never reaches the picker. A Codex model that the backend hides

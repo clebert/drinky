@@ -41,10 +41,11 @@ pub fn deinit(self: *OpenRouter) void {
     self.gpa.free(self.entries);
 }
 
-/// Fetch and decode the public list. The request carries no credential.
-pub fn fetch(gpa: std.mem.Allocator, io: std.Io, timeouts: net.Timeouts) !OpenRouter {
+/// Fetch and decode the public list. The request carries no credential. The
+/// `deadline` bounds it, and the account list before it shares that window.
+pub fn fetch(gpa: std.mem.Allocator, io: std.Io, deadline: net.Deadline) !OpenRouter {
     var maybe_metadata: ?OpenRouter = null;
-    net.withTimeout(io, timeouts.connect_ms, request, .{ gpa, io, &maybe_metadata }) catch |err| {
+    deadline.call(io, request, .{ gpa, io, &maybe_metadata }) catch |err| {
         if (maybe_metadata) |*metadata| metadata.deinit();
         return err;
     };
@@ -236,6 +237,16 @@ fn reasoning(model: *Model, value: ?std.json.Value) void {
         }
         model.addEffort(found);
     }
+}
+
+// The metadata request follows the account list inside one window. A window
+// that the list spent refuses the request before it opens a socket.
+test "an expired deadline refuses the metadata without a request" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const expired: net.Deadline = .{ .at = std.Io.Clock.awake.now(io) };
+    try std.testing.expectError(error.Timeout, fetch(std.testing.allocator, io, expired));
 }
 
 test slug {

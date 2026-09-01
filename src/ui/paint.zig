@@ -253,15 +253,17 @@ pub fn boxRows(body: *const Box, columns: usize) usize {
 pub const Activity = struct {
     motion_tick: u64,
     progress_age_ticks: u64,
-    /// The blink clock of the caret. The producer restarts it at zero on each
+    /// The blink clock of the caret, or null for an input that paints no caret,
+    /// such as a picker that waits. The producer restarts it at zero on each
     /// edit, so the caret stays visible while the user types.
-    caret_tick: u64 = 0,
+    caret_tick: ?u64 = null,
 };
 
 /// Whether `activity` changes the input area at this width: the separator
-/// segment moves, or the caret blink flips.
+/// segment moves, or the caret blink flips. An input without a caret has no
+/// blink, so its motion alone decides.
 pub fn activityChanged(activity: *const Activity, columns: usize) bool {
-    if (caretBlinkChanged(activity.caret_tick)) return true;
+    if (activity.caret_tick) |caret_tick| if (caretBlinkChanged(caret_tick)) return true;
     if (columns == 0) return false;
     return activityHead(activity.motion_tick, columns) !=
         activityHead(activity.motion_tick -% 1, columns);
@@ -624,7 +626,10 @@ pub fn framed(placement: *const Placement, framing: *const Framing) !void {
     // its own cursor solid under a continuous repaint, and an animated input
     // repaints about every 16 ms. An idle input writes nothing, so the terminal
     // blinks the caret there.
-    const caret_shown = if (maybe_activity) |activity| caretVisible(activity.caret_tick) else true;
+    const caret_shown = if (maybe_activity) |activity|
+        caretVisible(activity.caret_tick orelse 0)
+    else
+        true;
     const maybe_caret = if (caret_shown) framing.caret else null;
     var line = placement.base;
     try ruleRow(placement, &separators, &line, .top, "↑", framing.hidden_above);
@@ -1240,6 +1245,9 @@ test "the caret blinks in equal halves and each flip repaints" {
         &.{ .motion_tick = 1, .progress_age_ticks = 0, .caret_tick = caret_blink_ticks + 1 },
         0,
     ));
+    // An input without a caret has no flip, so a segment that cannot move
+    // repaints nothing.
+    try std.testing.expect(!activityChanged(&.{ .motion_tick = 0, .progress_age_ticks = 0 }, 0));
 }
 
 test "an animated input places its caret only on the visible half" {

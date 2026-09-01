@@ -11,11 +11,12 @@ const skills = @import("../skills.zig");
 
 pub const Context = @import("Context.zig");
 pub const Outcome = Context.Outcome;
+/// The app hands the result of a model fetch back to this command.
+pub const model = @import("model.zig");
 
 const effort = @import("effort.zig");
 const login = @import("login.zig");
 const logout = @import("logout.zig");
-const model = @import("model.zig");
 const new = @import("new.zig");
 const skill = @import("skill.zig");
 const system = @import("system.zig");

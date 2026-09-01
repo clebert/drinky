@@ -225,7 +225,8 @@ const keys = [_]Key{
     },
     .{
         .path = "request.connect_timeout_ms",
-        .description = "The time that Drinky waits for the head of a provider response.",
+        .description = "The time that Drinky waits for the head of a provider response. One " ++
+            "window of this size also bounds a whole model fetch.",
     },
     .{
         .path = "request.anthropic_idle_timeout_ms",
