@@ -36,9 +36,11 @@ const terminal = @import("terminal");
 pub const Name = enum {
     /// Reply and prompt text, in the terminal foreground.
     text,
-    /// Secondary text, a key hint, a Markdown rule, and a table border.
+    /// Secondary text, a source value, a key hint, and Markdown structure.
     muted,
-    /// A semantic caption title, a list marker, and an inline code span.
+    /// A caption title, a source label, a list marker, and an inline code span.
+    /// A failed event takes the error role, and every other event takes this
+    /// role.
     accent,
     /// A Markdown heading.
     heading,
@@ -76,7 +78,9 @@ pub fn sequence(comptime name: Name) []const u8 {
     return switch (name) {
         .text => "",
         .muted => "\x1b[2;39m",
-        .accent => "\x1b[36m",
+        // The `22` sets normal intensity, because a label takes this role
+        // straight behind a faint body role, with no reset between them.
+        .accent => "\x1b[22;36m",
         .heading => "\x1b[33m",
         .code => "\x1b[32m",
         .link => "\x1b[34m",
@@ -108,10 +112,10 @@ pub fn paints(name: Name) bool {
     return name != .text;
 }
 
-/// The SGR parameters that a role can carry: faint intensity, reverse video,
-/// the eight ANSI foreground slots, and the default foreground.
+/// The SGR parameters that a role can carry: faint or normal intensity, reverse
+/// video, the eight ANSI foreground slots, and the default foreground.
 fn legalParameter(parameter: u16) bool {
-    if (parameter == 2 or parameter == 7) return true;
+    if (parameter == 2 or parameter == 7 or parameter == 22) return true;
     return parameter >= 30 and parameter <= 39;
 }
 
@@ -135,7 +139,7 @@ test "the role map pins the SGR sequence for each role" {
     try expectSequences(&.{
         .{ .name = .text, .sequence = "" },
         .{ .name = .muted, .sequence = "\x1b[2;39m" },
-        .{ .name = .accent, .sequence = "\x1b[36m" },
+        .{ .name = .accent, .sequence = "\x1b[22;36m" },
         .{ .name = .heading, .sequence = "\x1b[33m" },
         .{ .name = .code, .sequence = "\x1b[32m" },
         .{ .name = .link, .sequence = "\x1b[34m" },

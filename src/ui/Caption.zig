@@ -1,7 +1,7 @@
 //! A semantic title and its control legend above an input or at the head of a
-//! page. The title takes the accent role, and every control stays muted. An
-//! optional state segment sits between them and takes its own role, so a
-//! caption can color one live state.
+//! page. The title takes the accent role, and every control stays muted. The
+//! product title adds emphasis. An optional state segment sits between them and
+//! takes its own role, so a caption can color one live state.
 //!
 //! The state packs as the first legend segment. A segment drops from the tail,
 //! so the state outlives every control on a narrow row.
@@ -30,6 +30,8 @@ const Caption = @This();
 
 /// The semantic name of the surface. It never takes more than one row.
 title: []const u8,
+/// Whether the title takes emphasis. The product title uses this distinction.
+title_emphasized: bool = false,
 /// A live state segment between the title and the controls, or empty. It
 /// packs before every control, so it survives them on a narrow row.
 state: []const u8 = "",
@@ -98,9 +100,7 @@ pub fn render(self: *const Caption, placement: *const paint.Placement) !usize {
         .split => {
             if (placement.base >= placement.skip) {
                 placement.sink.begin();
-                try role.apply(placement.sink, .accent);
-                try writeHeadText(placement.sink, self.title, columns_max);
-                try attribute.apply(placement.sink, .reset);
+                try self.renderTitle(placement.sink, columns_max);
                 placement.sink.end(.{ .id = placement.id, .line = placement.base });
             }
             var index: usize = 0;
@@ -151,19 +151,14 @@ pub fn renderRowCells(
     columns: usize,
 ) !void {
     const columns_max = @max(columns, 1);
+    try self.renderTitle(sink, columns_max);
     const title_columns = terminal.width.ofText(self.title);
     if (title_columns > columns_max or
         std.mem.indexOfScalar(u8, self.title, '\n') != null)
     {
-        try role.apply(sink, .accent);
-        try writeHeadText(sink, self.title, columns_max);
-        try attribute.apply(sink, .reset);
         return;
     }
 
-    try role.apply(sink, .accent);
-    try sink.text(self.title);
-    try attribute.apply(sink, .reset);
     const legend = self.rowLegend(columns_max);
     if (legend.state) {
         try role.apply(sink, .muted);
@@ -179,6 +174,14 @@ pub fn renderRowCells(
         try sink.text(legend.controls);
         try attribute.apply(sink, .reset);
     }
+}
+
+/// Paint the title in the accent role and add its optional emphasis.
+fn renderTitle(self: *const Caption, sink: *terminal.View.Sink, columns_max: usize) !void {
+    try role.apply(sink, .accent);
+    if (self.title_emphasized) try attribute.emphasize(sink, .accent, false);
+    try writeHeadText(sink, self.title, columns_max);
+    try attribute.apply(sink, .reset);
 }
 
 /// Resolve one caption layout for both measurement and painting.

@@ -1069,8 +1069,9 @@ fn appendToolBlock(self: *Session, block: *const ToolBlock) !void {
 }
 
 /// Append one command message as a transcript event and free its content. A
-/// failure takes the error color, and every other severity stays muted, because
-/// an event reports the state of the session and never a message.
+/// failure takes the error color and the `Error:` prefix. Every other severity
+/// takes the accent color and the `Event:` prefix, because an event reports the
+/// state of the session and never a message.
 ///
 /// One rule serves every event of a command. The line of a finished step and
 /// the report of a picker read alike.
@@ -1433,7 +1434,8 @@ pub fn abortTurn(self: *Session) !void {
 pub fn endTurnWithReceipt(self: *Session, receipt: *const ai.Agent.Receipt) !void {
     self.applyReceiptNormal(receipt);
     self.dropTurnOrigin();
-    if (receipt.truncated) try self.transcript.append(.event, .{}, truncated_event);
+    if (receipt.truncated)
+        try self.transcript.append(.event, .{ .is_error = true }, truncated_event);
     self.transcript.endMessage();
     self.endTurn();
 }
@@ -1451,7 +1453,8 @@ pub fn failTurnWithReceipt(
     // The flush runs before the chrome goes, but a lost block must not hide the
     // failure, so its error waits for the event.
     const maybe_flush_error = self.flushRunningTools();
-    if (receipt.truncated) try self.transcript.append(.event, .{}, truncated_event);
+    if (receipt.truncated)
+        try self.transcript.append(.event, .{ .is_error = true }, truncated_event);
     if (error_text) |text| try self.transcript.append(.event, .{ .is_error = true }, text);
     self.transcript.endMessage();
     self.endTurn();
@@ -2277,7 +2280,7 @@ test "a picker that reports records its line and still opens its list" {
         "Drinky could not save the list.",
         failure_blocks[0].content.event.text.items,
     );
-    // A failure takes the error color. Every other severity stays muted.
+    // A failure sets the error flag. Every other severity leaves it false.
     try std.testing.expect(failure_blocks[0].content.event.is_error);
 
     session.closePicker();
@@ -2868,7 +2871,7 @@ test "a truncated receipt appends an event after the answer" {
     const blocks = session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 2), blocks.len);
     try std.testing.expectEqualStrings("half an ans", blocks[0].content.model.items);
-    try std.testing.expect(!blocks[1].content.event.is_error);
+    try std.testing.expect(blocks[1].content.event.is_error);
     try std.testing.expectEqualStrings(truncated_event, blocks[1].content.event.text.items);
 
     // A turn that both truncated and failed reports the cutoff before the error.
@@ -2883,6 +2886,7 @@ test "a truncated receipt appends an event after the answer" {
     try session.failTurnWithReceipt(&receipt, "boom");
     const after = session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 4), after.len);
+    try std.testing.expect(after[2].content.event.is_error);
     try std.testing.expectEqualStrings(truncated_event, after[2].content.event.text.items);
     try std.testing.expect(after[3].content.event.is_error);
     try std.testing.expectEqualStrings("boom", after[3].content.event.text.items);

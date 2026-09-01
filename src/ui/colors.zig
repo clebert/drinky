@@ -2,7 +2,7 @@
 //! ANSI slots 0 to 15 as foreground and as reverse-video fills, each in the
 //! faint, normal, and bold intensities, every text color option on each
 //! colored background, the default-color styles, the filled message boxes, the
-//! text roles, and the input frames with an activity segment. The user judges
+//! text roles, the transcript notices, and the input frames. The user judges
 //! the theme of the terminal against these samples.
 //!
 //! Except for `role`, this module is the only place that writes color bytes,
@@ -42,6 +42,8 @@ const Item = union(enum) {
     style: Style,
     /// One interface text role, with its attributes, applied to a sample.
     sample: Sample,
+    /// One notice with its live prefix and label roles.
+    notice: NoticeSample,
     /// A filled padding row of one live box role.
     box_fill: role.Name,
     /// A filled text row of one live box role.
@@ -58,11 +60,13 @@ const CaptionSample = struct { title: []const u8, controls: []const u8 };
 const Sample = struct {
     label: []const u8,
     name: role.Name,
+    emphasized: bool = false,
     italic: bool = false,
     underline: bool = false,
     text: []const u8,
 };
 
+const NoticeSample = struct { label: []const u8, look: paint.Notice, text: []const u8 };
 const BoxText = struct { name: role.Name, text: []const u8 };
 const Separator = enum { plain, labelled };
 const Framed = struct { name: ?role.Name = null, text: []const u8 = "" };
@@ -137,11 +141,27 @@ const items = blk: {
         .blank,
         .{ .title = "Text roles" },
         .blank,
+        .{ .sample = .{
+            .label = "Product",
+            .name = .accent,
+            .emphasized = true,
+            .text = "Drinky",
+        } },
         .{ .sample = .{ .label = "Reply", .name = .text, .text = "A plain model reply." } },
         .{ .sample = .{
             .label = "Status",
             .name = .muted,
             .text = "~/drinky (main) · Context: 42% · ~$0.14",
+        } },
+        .{ .notice = .{
+            .label = "Sources",
+            .look = .{ .role = .muted, .label_role = .accent },
+            .text = "Instructions: 1 user, 1 project · Skills: 3",
+        } },
+        .{ .notice = .{
+            .label = "Event",
+            .look = .{ .role = .accent, .prefix = "Event: " },
+            .text = "Drinky set the effort level to high.",
         } },
         // An information notice replaces the muted status line, so it reads at
         // the normal intensity. Only a warning and a failure carry a color.
@@ -247,6 +267,7 @@ fn renderItem(placement: *const paint.Placement, comptime item: Item, line: usiz
         .contrast => |index| try renderContrast(sink, index),
         .style => |style| try renderStyle(sink, style),
         .sample => |sample| try renderSample(sink, sample),
+        .notice => |sample| try renderNoticeSample(sink, sample),
         .box_fill => |name| try renderBoxFill(placement, name),
         .box_text => |box| try renderBoxText(placement, box),
         .separator => |separator| try renderSeparator(placement, separator),
@@ -325,12 +346,19 @@ fn renderStyle(sink: *terminal.View.Sink, comptime style: Style) !void {
 fn renderSample(sink: *terminal.View.Sink, comptime sample: Sample) !void {
     try sink.text(std.fmt.comptimePrint("{s:<11}", .{sample.label ++ ":"}));
     try role.apply(sink, sample.name);
+    if (sample.emphasized) try attribute.emphasize(sink, sample.name, sample.underline);
     if (sample.italic) try attribute.apply(sink, .italic);
     if (sample.underline) try attribute.apply(sink, .underline);
     try sink.text(sample.text);
-    if (role.paints(sample.name) or sample.italic or sample.underline) {
+    if (role.paints(sample.name) or sample.emphasized or sample.italic or sample.underline) {
         try attribute.apply(sink, .reset);
     }
+}
+
+/// One notice sample through the live notice role painter.
+fn renderNoticeSample(sink: *terminal.View.Sink, comptime sample: NoticeSample) !void {
+    try sink.text(std.fmt.comptimePrint("{s:<11}", .{sample.label ++ ":"}));
+    try paint.noticeCells(sink, &sample.look, sample.text);
 }
 
 /// A box padding row: the role's fill carried to the full width.
@@ -377,6 +405,10 @@ fn collectRoles(comptime item: Item, names: *std.EnumSet(role.Name)) void {
             names.insert(.muted);
         },
         .sample => |sample| names.insert(sample.name),
+        .notice => |sample| {
+            names.insert(sample.look.role);
+            if (sample.look.label_role) |label_role| names.insert(label_role);
+        },
         .box_fill => |name| names.insert(name),
         .box_text => |box| names.insert(box.name),
         .separator => |separator| {
@@ -393,11 +425,11 @@ fn collectRoles(comptime item: Item, names: *std.EnumSet(role.Name)) void {
     }
 }
 
-/// The SGR parameters the preview can emit: the reset, the bold, faint, italic,
-/// underline, and reverse styles, and the terminal-owned color slots.
+/// The SGR parameters the preview can emit: reset, intensity, italic, underline,
+/// reverse video, and the terminal-owned color slots.
 fn legalParameter(parameter: u16) bool {
     return switch (parameter) {
-        0, 1, 2, 3, 4, 7, 39, 49 => true,
+        0, 1, 2, 3, 4, 7, 22, 39, 49 => true,
         else => (parameter >= 30 and parameter <= 37) or
             (parameter >= 40 and parameter <= 47) or
             (parameter >= 90 and parameter <= 97) or
@@ -502,6 +534,17 @@ test "the preview shows the palette, the styles, the boxes, the roles, and the f
     // Every cost figure of Drinky carries the tilde of an estimate, so the
     // sample status line carries it too.
     try std.testing.expect(std.mem.indexOf(u8, painted, "Context: 42% · ~$0.14") != null);
+    const accent = comptime role.sequence(.accent);
+    const muted = comptime role.sequence(.muted);
+    try std.testing.expect(std.mem.indexOf(u8, painted, accent ++ "\x1b[1mDrinky") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        painted,
+        accent ++ "Instructions:" ++ muted ++ " 1 user",
+    ) != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, painted, accent ++ "Event: Drinky set the effort") != null,
+    );
     try std.testing.expect(std.mem.indexOf(u8, painted, "Thinking:") != null);
     try std.testing.expect(std.mem.indexOf(u8, painted, "https://example.com") != null);
     try std.testing.expect(std.mem.indexOf(u8, painted, "↑ Hidden: 3") != null);

@@ -53,8 +53,10 @@ writes no color of its own. The `colors` preview page is the one exception.
 - A message that Drinky wrote for the user takes the user color and no box. The head of a loaded
   skill and the line of a retry attempt are such messages. Use the `user_note` block kind for each
   one, so no message box can forge it.
-- An event block reports the state of the session, never a message. It stays muted, or it takes the
-  error color for a failure.
+- An event block reports the state of the session, never a message.
+- A failed event paints its complete text in the error color. Every other event paints its complete
+  text in the accent color.
+- A source summary is not an event. Its labels take the accent color, and its values stay muted.
 - A user box holds typed text alone.
 - Pin a new block kind in the role test of `src/ui/block.zig`, so no kind reaches a release
   unclassified.

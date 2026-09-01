@@ -29,9 +29,6 @@ decision already taken, or a dependency on another entry. Module layout and exte
   height growth. Both are rare, and a forced reset is no fix, because it drops the scrollback.
   Accept `R` as a report only while a query is outstanding, because a modified F3 also ends in `R`.
   Give the `Emulator` a bottom-anchored resize mode for the regression test._
-- **Paint a truncated reply as an error** — the event of a cut-short reply takes the error role,
-  because an incomplete answer is a failed turn. _The session appends it with `is_error` false, and
-  `block.zig` paints the error role from that flag alone._
 
 ## Improvements
 

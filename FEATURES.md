@@ -173,7 +173,7 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
   findings.
 - **/new** — clear the conversation, usage stats, and steering without changing its configuration.
   The next paint drops the terminal scrollback, so the empty conversation starts on a clean screen.
-  The intro line returns with it, and the startup counts line does not.
+  The intro line returns with it, and the source summary does not.
 - **/system** — inspect the complete provider-neutral system prompt as rendered Markdown in a
   scrollable full-window page. `M` toggles its exact source.
 - **/colors** — preview ANSI slots 0 to 15, colored backgrounds, default styles, message boxes, text
@@ -445,16 +445,21 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - The terminal supplies every color and the muted intensity. Drinky uses the default colors, ANSI
   slots 0 to 15, faint, and reverse video. A filled box keeps the terminal background for its text.
   A label or a glyph marks every state, so color is never the only signal.
+- A source summary paints its `Instructions:` and `Skills:` labels in the accent color and keeps its
+  values muted.
 - A line that reports a message that Drinky wrote for the user takes the user color and no box. A
   typed message cannot forge it. The head of a loaded skill and the line of a retry attempt read
-  this way. A muted event reports the state of the session instead.
+  this way.
+- A failed event opens with `Error:` and paints its complete text in the error color. Every other
+  event opens with `Event:` and paints its complete text in the accent color.
+- An incomplete reply ends with an `Error:` event that states the output or context limit.
 - Model, tool, and user text can never emit escapes: controls and malformed UTF-8 render as
   replacement characters.
 
 ## Editing & text
 
 - Enter sends, Shift+Enter or Ctrl+J makes a newline, Esc cancels, Ctrl+C clears, Ctrl+D quits. An
-  intro line shows those bindings at launch under the `Drinky` title and closes with
+  intro line shows those bindings under the bold accent `Drinky` title and closes with
   `/help: Commands`. It wraps without a row bound, so a narrow window keeps every hint.
 - A second Ctrl+C within 500 ms quits, as does Ctrl+D on an empty editor or a closed stdin. Ctrl+D
   with a draft warns that the quit discards the draft, and quits on the second press.
@@ -501,10 +506,10 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
   instructions on demand. A skill file above the window of one `read` call, 2000 lines or 50 KiB, is
   skipped and reported, so one call always shows the model a whole skill.
 - Drinky loads the user instruction files that `config.json` names, in order.
-- One dense startup line counts the instruction files that Drinky loaded, the skills that it found,
-  the user skills that a project skill replaced, and the required skills that this project does not
-  carry. A count of zero stays out of the line. Only a skipped file gets its own line, and `/system`
-  shows every counted path.
+- One dense source summary counts the instruction files that Drinky loaded, the skills that it
+  found, the user skills that a project skill replaced, and the required skills that this project
+  does not carry. A count of zero stays out of the summary. Only a skipped file gets its own line,
+  and `/system` shows every counted path.
 - User and project instructions obey one policy: a regular UTF-8 file, with content, no NUL byte,
   and at most 32 KiB. Each source loads at most 32 files and 64 KiB, and one file loads once even
   when two paths or a symbolic link reach it. Drinky reports what it skips.
@@ -514,8 +519,8 @@ to Anthropic and OpenAI, through either a subscription login or an API key.
 - It holds no secrets. API keys come from `ANTHROPIC_API_KEY` and `OPENAI_API_KEY`.
 - An unknown effort level and an interface value Drinky cannot use are reported. A key that Drinky
   does not know is reported too, so a typo never looks like an applied setting.
-- A required skill whose name no discovered skill carries guards nothing in that project. The
-  startup line counts each such name once, because the global config serves every project.
+- A required skill whose name no discovered skill carries guards nothing in that project. The source
+  summary counts each such name once, because the global config serves every project.
 - The configuration section of the `describe_drinky` document is generated from the struct that
   parses the file, so a new key that carries no description fails the build and the section cannot
   drift.

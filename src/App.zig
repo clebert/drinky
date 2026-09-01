@@ -3411,7 +3411,7 @@ fn applyOutcome(self: *App, outcome: ai.command.Outcome) !void {
             self.switchConversation(&discarded);
             discarded.deinit();
             // The intro line is the legend of the interface, so the empty
-            // conversation opens on it again. The startup counts line does not
+            // conversation opens on it again. The source summary does not
             // return, because it reports the discovery of one start alone.
             try self.session.transcript.append(.intro, .{}, intro_text);
             // The cleared conversation holds no work to continue from.
@@ -3937,11 +3937,11 @@ fn reportNotice(
     );
 }
 
-/// Report one count line for the guidance that Drinky holds, then what each source
-/// skipped. The line uses dense count fragments so it fits a narrow window,
-/// because a normal load has nothing the user must act on. `/system` shows the
-/// path of every counted file. A count of zero stays out of the line, so a run
-/// with no guidance and no skipped file reports nothing.
+/// Record one source summary for the guidance that Drinky holds, then report
+/// what each source skipped. The summary describes startup state, not an event.
+/// It uses dense count fragments because a normal load needs no action.
+/// `/system` shows each counted path. A run with no guidance and no skipped file
+/// records nothing.
 fn reportSources(self: *App, sources: *const Sources) !void {
     var line: std.Io.Writer.Allocating = .init(self.gpa);
     defer line.deinit();
@@ -3974,7 +3974,8 @@ fn reportSources(self: *App, sources: *const Sources) !void {
             try line.writer.writeByte(')');
         }
     }
-    if (line.written().len > 0) try self.recordEvent(.information, "{s}", .{line.written()});
+    if (line.written().len > 0)
+        try self.session.transcript.append(.source_summary, .{}, line.written());
     try self.reportNotices(sources.user_instructions.notices());
     try self.reportNotices(sources.project_instructions.notices());
     try self.reportNotices(sources.skills.notices());
@@ -3983,7 +3984,7 @@ fn reportSources(self: *App, sources: *const Sources) !void {
 /// Pair every configured path-triggered skill with a discovered skill and hand
 /// the pair to the guard. The global config serves every project, so a name
 /// that no skill here carries is a normal state. It returns the count of such
-/// names for the startup line, because a typo in a name silently disables a
+/// names for the source summary, because a typo in a name silently disables a
 /// guard, and the system prompt names only the rules that resolved. An entry
 /// past the cap drops with a failure.
 ///
@@ -13110,12 +13111,12 @@ test "the startup report counts the sources in one line and keeps a skip verbose
 
     const blocks = app.session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 2), blocks.len);
-    try std.testing.expect(!blocks[0].content.event.is_error);
+    try std.testing.expect(blocks[0].content == .source_summary);
     // The count covers the two skills the scan kept, minus the one that disabled
     // model invocation, because `/system` never shows that one.
     try std.testing.expectEqualStrings(
         "Instructions: 2 user, 1 project · Skills: 1 (1 replaced)",
-        blocks[0].content.event.text.items,
+        blocks[0].content.source_summary.items,
     );
     // A source that skipped something stays verbose, because the user must fix it.
     try std.testing.expect(blocks[1].content.event.is_error);
@@ -13124,6 +13125,15 @@ test "the startup report counts the sources in one line and keeps a skip verbose
         blocks[1].content.event.text.items,
         "missing.md",
     ) != null);
+
+    try app.session.paint(.{ .columns = 100, .rows = 24 });
+    const painted = out.written();
+    const accent_sequence = comptime ui.role.sequence(.accent);
+    const muted_sequence = comptime ui.role.sequence(.muted);
+    try std.testing.expect(std.mem.indexOf(u8, painted, accent_sequence ++ "Instructions:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, accent_sequence ++ "Skills:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, muted_sequence ++ " 2 user") != null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "Event: Instructions:") == null);
 }
 
 // A configured rule reaches the guard only through a discovered skill. A name
@@ -13225,10 +13235,10 @@ test "a configured required skill applies, and an unknown name reports" {
     });
     const blocks = app.session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 1), blocks.len);
-    try std.testing.expect(!blocks[0].content.event.is_error);
+    try std.testing.expect(blocks[0].content == .source_summary);
     try std.testing.expectEqualStrings(
         "Skills: 1 (1 missing)",
-        blocks[0].content.event.text.items,
+        blocks[0].content.source_summary.items,
     );
 }
 
