@@ -10,8 +10,8 @@ const ai = @import("ai");
 /// binary holds. The user instructions, the project instructions, and the skills
 /// carry that guidance, and the user controls all three.
 pub const default_core =
-    "# System Prompt\n\n" ++
-    "You are a coding assistant operating inside Drinky, a terminal coding-agent harness.\n\n" ++
+    "# System prompt\n\n" ++
+    "You are a coding assistant. You run inside Drinky, a terminal coding-agent harness.\n\n" ++
     "Complete the user's request.\n" ++
     "Use the available tools according to their schemas.\n" ++
     // A model can reach for a shell grep that the grep tool already covers. The
@@ -216,9 +216,9 @@ fn writeSkills(
 ) !void {
     try writer.writeAll("\n\n## Skills\n\n");
     try writer.writeAll(
-        "The following skills provide specialized instructions.\n" ++
-            "When the user requests a skill or the task matches a skill description, read that " ++
-            "skill's SKILL.md before you proceed.\n\n" ++
+        "The skills below provide specialized instructions.\n" ++
+            "When the user requests a skill or the task matches a skill description, read the " ++
+            "skill file before you proceed.\n\n" ++
             "<skills>\n",
     );
     var iterator = catalog.iterator();
@@ -250,8 +250,8 @@ fn writeRequiredSkills(
             "Drinky sends you the whole skill file when a tool first touches a file that the " ++
             "pattern matches.\n" ++
             "Read that skill file, and follow it for every file of that pattern.\n" ++
-            "Drinky refuses a write and an edit until the whole skill file is in this " ++
-            "conversation.\n\n" ++
+            "Drinky refuses the write tool and the edit tool for a file of that pattern until " ++
+            "the whole skill file is in this conversation.\n\n" ++
             "<required_skills>\n",
     );
     for (rules) |rule| {
@@ -347,8 +347,8 @@ test "a wall clock outside the supported years empties the date but composes" {
 
 test "the compiled core is stable" {
     try std.testing.expectEqualStrings(
-        "# System Prompt\n\n" ++
-            "You are a coding assistant operating inside Drinky, a terminal coding-agent " ++
+        "# System prompt\n\n" ++
+            "You are a coding assistant. You run inside Drinky, a terminal coding-agent " ++
             "harness.\n\n" ++
             "Complete the user's request.\n" ++
             "Use the available tools according to their schemas.\n" ++
@@ -458,9 +458,9 @@ test "composition orders sections and preserves instruction Markdown" {
     try std.testing.expect(std.mem.indexOf(
         u8,
         prompt,
-        "The following skills provide specialized instructions.\n" ++
-            "When the user requests a skill or the task matches a skill description, read that " ++
-            "skill's SKILL.md before you proceed.\n\n" ++
+        "The skills below provide specialized instructions.\n" ++
+            "When the user requests a skill or the task matches a skill description, read the " ++
+            "skill file before you proceed.\n\n" ++
             "<skills>\n  <skill_file path=\"/skills/a&apos;b/SKILL.md\">",
     ) != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "<location>") == null);
@@ -588,8 +588,8 @@ test "the required skills section names every rule and stays out without one" {
     try std.testing.expect(std.mem.indexOf(
         u8,
         prompt,
-        "Drinky refuses a write and an edit until the whole skill file is in this " ++
-            "conversation.\n\n" ++
+        "Drinky refuses the write tool and the edit tool for a file of that pattern until " ++
+            "the whole skill file is in this conversation.\n\n" ++
             "<required_skills>\n" ++
             "  <required_skill pattern=\"**/*.zig\" skill=\"zig-style\" " ++
             "path=\"/work/.agents/skills/zig-style/SKILL.md\" />\n" ++

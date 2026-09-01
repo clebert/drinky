@@ -1,10 +1,10 @@
 #!/bin/sh
-# Run the test suite and fail if any test declared in source did not actually
-# run. Zig only compiles tests in files reachable from a module's root via a
-# used declaration, so a test in an unwired file passes silently (see the Layout
-# note in AGENTS.md). Modules never share files, so the number of `test` blocks
-# in source must equal the number the runner reports; a mismatch means a test
-# went dark.
+# Run the test suite and fail if a test in the source did not run. Zig
+# compiles a test only when an import chain from the module root reaches its
+# file, so a test in an unreachable file passes silently (see the Architecture
+# section in AGENTS.md). No two modules share a file, so the number of `test`
+# blocks in the source must equal the number that the runner reports. A
+# mismatch means that a test went dark.
 set -eu
 
 summary=$(zig build test --summary all 2>&1) || {
@@ -18,7 +18,7 @@ declared=$(grep -rhE '^test ' src lib --include='*.zig' | wc -l | tr -d ' ')
 
 if [ "${ran:-0}" != "$declared" ]; then
     printf 'test-audit: %s tests declared in source but only %s ran.\n' "$declared" "${ran:-0}" >&2
-    printf 'A test file is not reachable from its module root (see AGENTS.md Layout).\n' >&2
+    printf 'A test file is not reachable from its module root (see AGENTS.md Architecture).\n' >&2
     exit 1
 fi
 

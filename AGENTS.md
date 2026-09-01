@@ -6,7 +6,8 @@ dependency-free Zig program with a hand-written terminal renderer.
 A core rule outranks every precedent in the repository and every consistency argument. An existing
 behavior can be wrong.
 
-- **An exit ends one thing.** No exit reaches past the step, the page, or the turn that holds it.
+- **An exit ends one thing.** An exit is Esc, Ctrl+C, or Ctrl+D. No exit reaches past the step, the
+  page, or the turn that holds it.
 - **Drinky destroys nothing without a decision.** Where a press can mean something else, Drinky
   warns, and the second press of the same key is the decision.
 - **A failure is not a decision.** Every draft and every message of the user survives it.
@@ -23,19 +24,20 @@ behavior can be wrong.
 The libraries never import each other or the app. Only the `root.zig` file in a module can re-export
 names.
 
-Each module has one test artifact. A test runs only when its file is reachable from `root.zig` or an
-analyzed test path. The `scripts/test-audit.sh` script fails if a source test does not run.
+Each module has one test binary. Zig compiles a test only when an import chain from the module root
+reaches its file.
 
 ## Documents
 
-`README.md` describes the stable user-facing product shape. Keep it concise and synchronized with
-`FEATURES.md`. Keep roadmap and decision history out of the README.
+`README.md` describes the stable product as a user sees it. Keep it concise and synchronized with
+`FEATURES.md`. Keep the roadmap and the decision history out of `README.md`.
 
 `FEATURES.md` lists current capabilities with one short sentence each. It is an overview, not a
-specification. Add a line when a capability lands. Delete the line when a capability goes away.
+specification. Add a line for a new capability. Delete the line of a removed capability.
 
 `BACKLOG.md` holds planned work in priority order. `TODO.md` is the git-ignored inbox that feeds it.
-Delete a landed entry from `BACKLOG.md`. Read the `BACKLOG.md` header before you change either file.
+Read the `BACKLOG.md` header before you change either file. Delete an entry from `BACKLOG.md` when
+its work is done.
 
 ## Name
 
@@ -44,7 +46,7 @@ Delete a landed entry from `BACKLOG.md`. Read the `BACKLOG.md` header before you
 - Never start a sentence with lowercase `drinky`.
 - Reserve `DRINKY` for an environment variable. Do not use it in prose or code identifiers.
 
-## Interface
+## User interface
 
 `src/ui/role.zig` is the one seam from a semantic role to color bytes. A widget names a role and
 writes no color of its own.
@@ -57,7 +59,7 @@ writes no color of its own.
   text in the accent color.
 - A source summary is not an event. Its labels take the accent color, and its values stay muted.
 - A user box holds typed text alone.
-- Pin a new block kind in the role test of `src/ui/block.zig`, so no kind reaches a release
+- Add a new block kind to the role test of `src/ui/block.zig`, so no kind reaches a release
   unclassified.
 
 ## Writing style
@@ -83,13 +85,15 @@ terminal-width limits when you reword text.
 
 ## Checks
 
-After code changes, always run:
+After a code change, run these commands:
 
 ```sh
 zig build
 zig fmt --check build.zig src lib scripts
 sh scripts/test-audit.sh
 ```
+
+The audit script runs `zig build test` and fails if a source test does not run.
 
 `zig build unicode` regenerates `lib/terminal/unicode_data.zig` from the Unicode Character Database.
 It uses the network. Run it manually, never as part of the default build.
