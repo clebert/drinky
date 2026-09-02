@@ -1206,6 +1206,9 @@ fn applyBatch(self: *App, events: []const Session.UiEvent) !bool {
             .resize => self.session.dirty = true,
             .keys => |bytes| {
                 defer self.gpa.free(bytes);
+                // A checkout in another terminal shows on the next key. An idle
+                // loop paints no frame, so the label waits for this wake.
+                self.refreshBranch();
                 try self.handleKeys(bytes);
             },
             .turn => |*turn_event| {
@@ -8089,6 +8092,36 @@ test refreshBranch {
     try tmp.dir.writeFile(io, .{ .sub_path = ".git/HEAD", .data = "garbage\n" });
     app.refreshBranch();
     try std.testing.expect(app.session.branch() == null);
+}
+
+// A checkout in another terminal shows on the next key, so the label needs no
+// turn to follow it.
+test "an input event re-reads the branch" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var marker = try tmp.dir.createDirPathOpen(io, ".git", .{});
+    marker.close(io);
+    try tmp.dir.writeFile(io, .{ .sub_path = ".git/HEAD", .data = "ref: refs/heads/topic\n" });
+    const root = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(root);
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
+    defer app.session.deinit();
+    defer app.input.deinit();
+    app.session.branch_root = root;
+    app.refreshBranch();
+    try std.testing.expectEqualStrings("topic", app.session.branch().?);
+
+    try tmp.dir.writeFile(io, .{ .sub_path = ".git/HEAD", .data = "ref: refs/heads/other\n" });
+    const events = [_]Session.UiEvent{.{ .keys = try gpa.dupe(u8, "x") }};
+    try std.testing.expect(!try app.applyBatch(&events));
+    try std.testing.expectEqualStrings("other", app.session.branch().?);
 }
 
 test "a startup with no guidance and no skipped file reports nothing" {

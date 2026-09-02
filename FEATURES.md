@@ -316,7 +316,8 @@ Anthropic and OpenAI through a subscription login, an Anthropic Console login, o
   the session cost, longest window first. A bracketed detail goes before its head: the account
   before the model, and the branch before the directory.
 - The branch comes from the `HEAD` file of the repository, never from the git command. Drinky
-  re-reads it when a turn starts and when one ends.
+  re-reads it on each key, when a turn starts, and when one ends, so a checkout in another terminal
+  shows without a turn.
 
 ### Pickers
 

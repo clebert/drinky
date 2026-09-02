@@ -29,19 +29,16 @@ decision already taken, or a dependency on another entry. Module layout and exte
   and the caller drops the model today, so it leaves the picker with no line. A picker row carries
   the selection role or the muted role alone, so the row needs a third role. The hint names the
   config key of the model metadata feature, so land that feature first._
-- **Refresh the branch on input** — an input event that wakes the loop re-reads the repository head,
-  so a checkout in another terminal shows without a turn. _An idle Drinky paints no frame, so the
-  label stays stale until the next event. This limit is a decision, not a bug._
 
 ## Features
 
+- **A herdr state socket** — Drinky reports a turn end and a failure over a socket, so herdr can
+  notify the user. _The channel carries state outward alone, and nothing outside Drinky drives the
+  session. Herdr holds a terminal open, so the work survives a closed lid. See <https://herdr.dev>._
 - **Model metadata in the config** — the config describes a model that no provider and no OpenRouter
   entry describes, so the user can unblock any model. _The provider wins every field it states, the
   config wins over OpenRouter, and OpenRouter fills the rest. A later step can let Drinky write the
   entry for the user._
-- **A herdr state socket** — Drinky reports a turn end and a failure over a socket, so herdr can
-  notify the user. _The channel carries state outward alone, and nothing outside Drinky drives the
-  session. Herdr holds a terminal open, so the work survives a closed lid. See <https://herdr.dev>._
 - **Discussion mode** — a session mode switches the write tools off and allows the bash commands
   that the config lists, so a conversation cannot change the repository. _The bash tool holds deny
   patterns today, and this mode needs the opposite: an allow list that stands for the mode alone._
