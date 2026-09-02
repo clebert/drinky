@@ -32,9 +32,6 @@ decision already taken, or a dependency on another entry. Module layout and exte
 
 ## Features
 
-- **A herdr state socket** — Drinky reports a turn end and a failure over a socket, so herdr can
-  notify the user. _The channel carries state outward alone, and nothing outside Drinky drives the
-  session. Herdr holds a terminal open, so the work survives a closed lid. See <https://herdr.dev>._
 - **Model metadata in the config** — the config describes a model that no provider and no OpenRouter
   entry describes, so the user can unblock any model. _The provider wins every field it states, the
   config wins over OpenRouter, and OpenRouter fills the rest. A later step can let Drinky write the

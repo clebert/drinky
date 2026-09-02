@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const App = @import("App.zig");
+const Herdr = @import("Herdr.zig");
 
 pub fn main(init: std.process.Init) !void {
     const home = init.environ_map.get("HOME") orelse return error.NoHomeDir;
@@ -11,6 +12,7 @@ pub fn main(init: std.process.Init) !void {
             .anthropic = init.environ_map.get("ANTHROPIC_API_KEY"),
             .openai = init.environ_map.get("OPENAI_API_KEY"),
         },
+        .herdr = Herdr.fromEnviron(init.environ_map),
     });
 }
 

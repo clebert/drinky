@@ -415,6 +415,14 @@ Anthropic and OpenAI through a subscription login, an Anthropic Console login, o
   the failure never stops the session.
 - `HOME` must be set, because the config, the credentials, and the state live under `~/.drinky`.
 
+## Herdr
+
+- Inside a Herdr pane, Drinky reports its state over the Herdr socket: `working` during a turn,
+  `blocked` while a failed turn waits for Ctrl+N, and `idle` otherwise. Herdr can then notify the
+  user of a turn end and a failure, and the work survives a closed lid.
+- The channel carries state outward alone, and nothing outside Drinky drives the session. Drinky
+  releases the pane on exit. A Herdr that Drinky cannot reach never stops or slows the work.
+
 ## Keeping this file true
 
 Write one short sentence per capability at the concept level: what a user gets, not how the code

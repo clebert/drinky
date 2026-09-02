@@ -46,6 +46,9 @@ Run `/login` to sign in with a subscription account or an Anthropic Console acco
 login mints an API key in the browser and stores it, so no environment variable is needed. You can
 also set `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` by hand.
 
+Inside a [Herdr](https://herdr.dev) pane, Drinky reports its state over the Herdr socket, so Herdr
+can notify you when a turn ends or fails. This needs no setup.
+
 ## Slash commands
 
 A line that starts with a slash runs in Drinky and reaches no model. Type `/` or `/help` to open the

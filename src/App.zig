@@ -21,6 +21,7 @@ const terminal = @import("terminal");
 
 const Config = @import("Config.zig");
 const describe = @import("describe.zig");
+const Herdr = @import("Herdr.zig");
 const layout = @import("layout.zig");
 const Retry = @import("Retry.zig");
 const Session = @import("Session.zig");
@@ -159,6 +160,9 @@ tick_future: ?std.Io.Future(void),
 tick_pending: bool,
 /// The frame schedule. Only `armTick` advances it, so no frame can reset it.
 frame_grid: FrameGrid,
+/// The state report to Herdr. Inert outside a Herdr pane. The loop derives the
+/// state after each batch, so no turn end path reports it.
+herdr: Herdr,
 
 /// The process environment that the app cannot read for itself. `main` owns every
 /// lookup, so a test can run the app with no environment at all.
@@ -168,6 +172,8 @@ pub const Options = struct {
     environ: std.process.Environ = .empty,
     /// The provider keys that authenticate an account without a login.
     api_keys: ai.Accounts.ApiKeys = .{},
+    /// The Herdr pane this process runs in, or null outside Herdr.
+    herdr: ?Herdr.Env = null,
 };
 
 /// The frame grid: the deadlines that pace the repaints. Each deadline is one
@@ -869,6 +875,10 @@ pub fn run(
     // one interval after it rather than at once.
     self.frame_grid = .reset(self.nowNs());
 
+    // The release is the last word of this process to Herdr, so it runs after
+    // every other task is down.
+    self.herdr.start(options.herdr);
+    defer self.herdr.deinit();
     self.running = true;
     defer self.shutdownTasks();
     try self.startInputReader();
@@ -934,6 +944,7 @@ fn initFields(self: *App, gpa: std.mem.Allocator, io: std.Io) void {
         .tick_future = null,
         .tick_pending = false,
         .frame_grid = .reset(0),
+        .herdr = .init(io),
     };
     // The literal above writes `queue_buffer` too. A result location does put that
     // buffer at its final address, but do not depend on that, so take it here.
@@ -1173,6 +1184,7 @@ fn runLoop(self: *App) !void {
             };
         self.enqueuePendingTurnFence();
         const ticked = try self.applyBatch(batch[0..count]);
+        self.herdr.sync(self.herdrState());
         try self.flushEscape();
         if (ticked) {
             self.tick_pending = false;
@@ -1189,6 +1201,15 @@ fn runLoop(self: *App) !void {
             self.escape_deadline_ms != null;
         if (waiting and !self.tick_pending) self.armTick();
     }
+}
+
+/// The state that Herdr shows for this pane, read from the model after a batch.
+/// A turn works. A failed turn that waits for Ctrl+N blocks, because the user
+/// must decide on it. Everything else, the pickers included, is idle.
+fn herdrState(self: *const App) Herdr.State {
+    if (self.session.mode == .turn) return .working;
+    if (self.retry != null) return .blocked;
+    return .idle;
 }
 
 /// Apply one bounded queue batch. Once the queue hands the batch to the consumer,
@@ -6780,6 +6801,53 @@ test "Enter sends a plain message and drops the waiting retry" {
     const blocks = app.session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 1), blocks.len);
     try std.testing.expect(blocks[0].content.event.is_error);
+}
+
+// Herdr reads one state per pane. The loop derives it from the model after each
+// batch, so a turn end path of any kind needs no report of its own.
+test "the Herdr state follows the turn and the waiting retry" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    defer app.drainQueue();
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = test_anthropic_model,
+        .system = "",
+        .retry = .{},
+        .environ = .empty,
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
+    defer app.session.deinit();
+    defer app.dropRetry();
+
+    try std.testing.expectEqual(Herdr.State.idle, app.herdrState());
+    // A page is no turn, so Herdr sees no work in progress.
+    try app.session.openPage(&.{ .title = "Test page", .content = "body" });
+    try std.testing.expectEqual(Herdr.State.idle, app.herdrState());
+    app.session.closePage();
+
+    app.session.beginTurn(1);
+    try std.testing.expectEqual(Herdr.State.working, app.herdrState());
+    app.session.endTurn();
+
+    // A failed turn with committed work waits for Ctrl+N, and the user must decide.
+    app.setRetry(.{ .failure = try gpa.dupe(u8, "The provider is overloaded.") });
+    try std.testing.expectEqual(Herdr.State.blocked, app.herdrState());
+    // The attempt is a turn again, and it takes the context.
+    app.session.beginTurn(2);
+    app.setRetry(null);
+    try std.testing.expectEqual(Herdr.State.working, app.herdrState());
+    app.session.endTurn();
+    try std.testing.expectEqual(Herdr.State.idle, app.herdrState());
+
+    // Outside Herdr the reporter is inert, so the loop's call costs nothing.
+    app.herdr.sync(app.herdrState());
+    try std.testing.expect(app.herdr.future == null);
 }
 
 // A cancellation is the user's own stop, so it arms no retry. Esc during an attempt
