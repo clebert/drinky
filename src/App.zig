@@ -651,6 +651,16 @@ fn homeDirectory(
     return owned;
 }
 
+/// Herdr labels its pane with the directory and the branch, so inside a pane the
+/// status line leaves them to Herdr. The null root then also ends every branch
+/// readout, because the status line is the only reader of the branch.
+fn showProject(self: *App, inside_herdr: bool) void {
+    if (inside_herdr) return;
+    self.session.directory_shown = self.directory_label;
+    self.session.branch_root = self.project_instructions.projectRoot();
+    self.refreshBranch();
+}
+
 /// Read the branch of the project and show it on the status line. Display only:
 /// a repository whose head Drinky cannot read leaves the directory standing alone.
 fn refreshBranch(self: *App) void {
@@ -785,9 +795,7 @@ pub fn run(
     self.session.window_pages = config.window_pages;
     self.session.gauge = config.gauge;
     self.session.display_roots = self.displayRoots();
-    self.session.directory_shown = self.directory_label;
-    self.session.branch_root = self.project_instructions.projectRoot();
-    self.refreshBranch();
+    self.showProject(options.herdr != null);
 
     try self.session.transcript.append(.intro, .{}, intro_text);
     if (config.dropped_effort) |dropped| try self.recordEvent(
@@ -8160,6 +8168,42 @@ test refreshBranch {
     try tmp.dir.writeFile(io, .{ .sub_path = ".git/HEAD", .data = "garbage\n" });
     app.refreshBranch();
     try std.testing.expect(app.session.branch() == null);
+}
+
+// Herdr labels its pane with the directory and the branch, so the status line
+// inside a pane shows neither, and no key reads the head.
+test showProject {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var marker = try tmp.dir.createDirPathOpen(io, ".git", .{});
+    marker.close(io);
+    try tmp.dir.writeFile(io, .{ .sub_path = ".git/HEAD", .data = "ref: refs/heads/topic\n" });
+    const root = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(root);
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
+    defer app.session.deinit();
+    defer app.input.deinit();
+    app.directory_label = "~/project";
+    app.project_instructions = try ai.instructions.discover(gpa, io, root);
+    defer app.project_instructions.deinit();
+
+    app.showProject(true);
+    try std.testing.expectEqualStrings("", app.session.directory_shown);
+    try std.testing.expect(app.session.branch_root == null);
+    const events = [_]Session.UiEvent{.{ .keys = try gpa.dupe(u8, "x") }};
+    try std.testing.expect(!try app.applyBatch(&events));
+    try std.testing.expect(app.session.branch() == null);
+
+    app.showProject(false);
+    try std.testing.expectEqualStrings("~/project", app.session.directory_shown);
+    try std.testing.expectEqualStrings("topic", app.session.branch().?);
 }
 
 // A checkout in another terminal shows on the next key, so the label needs no

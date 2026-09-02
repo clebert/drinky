@@ -422,6 +422,8 @@ Anthropic and OpenAI through a subscription login, an Anthropic Console login, o
   user of a turn end and a failure, and the work survives a closed lid.
 - The channel carries state outward alone, and nothing outside Drinky drives the session. Drinky
   releases the pane on exit. A Herdr that Drinky cannot reach never stops or slows the work.
+- Inside a Herdr pane, the status line shows neither the directory nor the branch, because the pane
+  label holds both.
 
 ## Keeping this file true
 

@@ -47,7 +47,8 @@ login mints an API key in the browser and stores it, so no environment variable 
 also set `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` by hand.
 
 Inside a [Herdr](https://herdr.dev) pane, Drinky reports its state over the Herdr socket, so Herdr
-can notify you when a turn ends or fails. This needs no setup.
+can notify you when a turn ends or fails. The status line leaves the directory and the branch to the
+Herdr pane label. This needs no setup.
 
 ## Slash commands
 
