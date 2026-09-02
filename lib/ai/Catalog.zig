@@ -12,8 +12,7 @@
 //! logout.
 //!
 //! A merge joins them, and the vendor wins every field it states. Only the
-//! aggregator prices a model, and for Anthropic only the aggregator states
-//! whether the reasoning can stop.
+//! aggregator prices a model.
 
 const std = @import("std");
 
@@ -131,8 +130,7 @@ fn merge(self: *const Catalog, account: llm.Account, vendor: Model) ?Model {
         merged.price = extra.price;
         if (merged.context_window == null) merged.context_window = extra.context_window;
         // A vendor that states no thinking at all takes the state of the
-        // aggregator, which is the only source that knows whether the reasoning
-        // can stop. A vendor that named a level proves that the model reasons,
+        // aggregator. A vendor that named a level proves that the model reasons,
         // so the aggregator can never deny the reasoning of such a model.
         const denies = extra.thinking == .unsupported and merged.efforts.count() != 0;
         if (merged.thinking == .unknown and !denies) merged.thinking = extra.thinking;
@@ -262,7 +260,7 @@ fn encode(gpa: std.mem.Allocator, model: *const Model) !Encoded {
     var buffer: [efforts_bytes_max]u8 = undefined;
     var length: usize = 0;
     for (comptime std.enums.values(llm.Effort)) |level| {
-        if (level == .none or !model.efforts.contains(level)) continue;
+        if (!model.efforts.contains(level)) continue;
         const name = @tagName(level);
         if (length != 0) {
             buffer[length] = ',';
@@ -294,8 +292,7 @@ fn decodeModel(value: std.json.Value) ?Model {
     if (json.string(object.get("efforts"))) |efforts| {
         var levels = std.mem.splitScalar(u8, efforts, ',');
         while (levels.next()) |level| {
-            const found = std.meta.stringToEnum(llm.Effort, level) orelse continue;
-            if (found != .none) model.addEffort(found);
+            model.addEffort(std.meta.stringToEnum(llm.Effort, level) orelse continue);
         }
     }
     model.efforts_denied = boolean(object.get("efforts_denied"));
@@ -381,7 +378,7 @@ test "the vendor wins every field it states and the aggregator fills the rest" {
 
     var public = Model.init("gpt-5.6-sol") catch unreachable;
     public.context_window = 1_050_000;
-    public.thinking = .optional;
+    public.thinking = .supported;
     public.addEffort(.low);
     public.price = .{ .input = 2, .output = 10, .cache_read = 0.2, .cache_write = 2.5 };
     const entries = [_]OpenRouter.Entry{.{ .provider = .openai, .model = public }};
@@ -393,10 +390,10 @@ test "the vendor wins every field it states and the aggregator fills the rest" {
     // The vendor named a level, so its list stands whole.
     try std.testing.expect(merged.offers(.high));
     try std.testing.expect(!merged.offers(.low));
-    // Only the aggregator prices a model and states that the reasoning can stop.
+    // Only the aggregator prices a model. The Codex list states no thinking
+    // state, so the aggregator fills it.
     try std.testing.expectEqual(@as(f64, 2), merged.price.?.input);
-    try std.testing.expectEqual(Model.Thinking.optional, merged.thinking);
-    try std.testing.expect(merged.offers(.none));
+    try std.testing.expectEqual(Model.Thinking.supported, merged.thinking);
 }
 
 test "a vendor that states no reasoning keeps every aggregator level out" {
@@ -411,7 +408,7 @@ test "a vendor that states no reasoning keeps every aggregator level out" {
     defer gpa.free(catalog.accounts.get(.anthropic_api));
 
     var public = Model.init("claude-haiku-4.5") catch unreachable;
-    public.thinking = .optional;
+    public.thinking = .supported;
     public.addEffort(.low);
     public.addEffort(.high);
     const entries = [_]OpenRouter.Entry{.{ .provider = .anthropic, .model = public }};
@@ -439,16 +436,15 @@ test "a vendor that denies the effort control keeps every aggregator level out" 
     defer gpa.free(catalog.accounts.get(.anthropic_api));
 
     var public = Model.init("claude-fable-5") catch unreachable;
-    public.thinking = .optional;
+    public.thinking = .supported;
     public.addEffort(.high);
     const entries = [_]OpenRouter.Entry{.{ .provider = .anthropic, .model = public }};
     catalog.metadata = try gpa.dupe(OpenRouter.Entry, &entries);
     defer gpa.free(catalog.metadata);
 
     const merged = catalog.find(.anthropic_api, "claude-fable-5").?;
-    // The aggregator still states that the reasoning can stop.
-    try std.testing.expectEqual(Model.Thinking.optional, merged.thinking);
-    try std.testing.expect(merged.offers(.none));
+    // The aggregator still states the thinking state.
+    try std.testing.expectEqual(Model.Thinking.supported, merged.thinking);
     try std.testing.expect(!merged.offers(.high));
     try std.testing.expect(merged.reasoning(.high) == .omitted);
 }
@@ -539,7 +535,7 @@ test "a stored model survives a round trip through both files" {
     var model = Model.init("claude-opus-4-8") catch unreachable;
     model.context_window = 1_000_000;
     model.tokens_max = 128_000;
-    model.thinking = .optional;
+    model.thinking = .supported;
     model.addEffort(.low);
     model.addEffort(.xhigh);
     model.price = .{ .input = 5, .output = 25, .cache_read = 0.5, .cache_write = 6.25 };
@@ -556,7 +552,7 @@ test "a stored model survives a round trip through both files" {
     const restored = read.find(.anthropic_subscription, "claude-opus-4-8").?;
     try std.testing.expectEqual(@as(?u64, 1_000_000), restored.context_window);
     try std.testing.expectEqual(@as(?u32, 128_000), restored.tokens_max);
-    try std.testing.expectEqual(Model.Thinking.optional, restored.thinking);
+    try std.testing.expectEqual(Model.Thinking.supported, restored.thinking);
     try std.testing.expect(restored.offers(.low));
     try std.testing.expect(restored.offers(.xhigh));
     try std.testing.expect(!restored.offers(.high));

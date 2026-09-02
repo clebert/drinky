@@ -3005,7 +3005,7 @@ test "a grant rejection refuses an account without a refresh credential" {
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
     app.session.account_shown = .anthropic_api;
     app.session.beginTurn(1);
@@ -3031,7 +3031,7 @@ test "OAuth login cancellation escapes without a failure notice" {
 
     var app: App = undefined;
     app.initForTest(gpa);
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
 
     const block_count = app.session.transcript.blocks().len;
@@ -3046,7 +3046,7 @@ test "a login the provider refused reads as a sentence, not an error name" {
 
     var app: App = undefined;
     app.initForTest(gpa);
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
 
     // A rejection names the one action that helps. An unavailable service does
@@ -3088,7 +3088,7 @@ test "OAuth callback bounds have friendly failure notices" {
 
     var app: App = undefined;
     app.initForTest(gpa);
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
 
     const cases = [_]struct { anyerror, []const u8 }{
@@ -3291,7 +3291,7 @@ test "a late steering return restores a paste as a live placeholder atom" {
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
 
     const payload = "late\n" ** 15;
@@ -3331,7 +3331,7 @@ test "ctrl+c during a turn clears the draft first and cancels only on an empty e
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
     app.session.beginTurn(1);
     try spawnCanceledTurn(&app);
@@ -3365,7 +3365,7 @@ test "esc and ctrl+d cancel a turn and keep the draft" {
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
 
     // A cancel backs out of the turn alone: the draft stays, and Drinky runs on, so
@@ -3407,7 +3407,7 @@ test "a key between two esc presses drops the turn-cancel confirmation" {
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
     app.session.beginTurn(1);
     try spawnCanceledTurn(&app);
@@ -3435,7 +3435,7 @@ test "a key between two ctrl+d presses drops the quit confirmation" {
 
     var app: App = undefined;
     app.initForTest(gpa);
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
     try app.session.editor.insert("draft");
 
@@ -3469,7 +3469,7 @@ test "canceling a turn joins and clears its active worker" {
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
     app.session.beginTurn(1);
 
@@ -3530,7 +3530,7 @@ test "canceling a turn restores in-flight steering and reads the usage again" {
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
     app.session.beginTurn(1);
 
@@ -3572,7 +3572,7 @@ test "cancel preflight failure leaves the turn and steering untouched" {
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
     app.session.beginTurn(1);
 
@@ -3610,7 +3610,7 @@ test "cancel restores steering before event allocation failure" {
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
     app.session.beginTurn(1);
 
@@ -3650,7 +3650,7 @@ test "ctrl+p recalls the steering queue after in-progress editor text" {
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
     app.session.beginTurn(1);
 
@@ -3681,7 +3681,7 @@ test "ctrl+p restores a steered paste as a live placeholder atom" {
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
     app.session.beginTurn(1);
 
@@ -3720,7 +3720,7 @@ test "cancel restores an in-flight steered paste as a live placeholder atom" {
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
     app.session.beginTurn(1);
 
@@ -3772,7 +3772,7 @@ test "cancel restores a steered paste even after its consumed event applied" {
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
     app.session.beginTurn(1);
 
@@ -3826,7 +3826,7 @@ test "ctrl+p recalls the pending suffix and retains the in-flight prefix" {
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
     app.session.beginTurn(1);
 
@@ -3858,7 +3858,7 @@ test "cancel restores an in-flight prefix retained by ctrl+p" {
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
     app.session.beginTurn(1);
 
@@ -3892,7 +3892,7 @@ test "a cancel that loses the race waits for the terminal fence" {
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
     app.session.beginTurn(7);
 
@@ -3941,7 +3941,7 @@ test "cancel does not commit stale text across a reset held in the current batch
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
     defer app.input.deinit();
     app.session.beginTurn(1);
@@ -4009,7 +4009,7 @@ test "cancel preserves progress before a queued terminal fence" {
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
     defer app.input.deinit();
     app.session.beginTurn(11);
@@ -4071,7 +4071,7 @@ test "cancel replaces an interrupted terminal fence after queued progress" {
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
     defer app.input.deinit();
     app.session.beginTurn(12);
@@ -4141,7 +4141,7 @@ test "an interrupted terminal fence retries after a full queue drain" {
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
     defer app.input.deinit();
     app.session.beginTurn(13);
@@ -4205,7 +4205,7 @@ test "a cancel that loses the race applies the failed joined result" {
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
     app.session.beginTurn(3);
     try app.session.transcript.append(.user, .{}, "prompt");
@@ -4262,7 +4262,7 @@ test "a joined completion returns late steering to the editor" {
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
     app.session.beginTurn(3);
 
@@ -4318,7 +4318,7 @@ test "shutdown frees the worker result without restoring or recording an event" 
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
     app.session.beginTurn(1);
 
@@ -4351,7 +4351,7 @@ test "a delayed consumed event after ctrl+p cannot remove newer steering" {
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
     app.session.beginTurn(1);
 
@@ -4403,7 +4403,7 @@ test "a delivery restored after ctrl+p recalls its retained rich drafts" {
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
     app.session.beginTurn(1);
 
@@ -4449,7 +4449,7 @@ test "recall of literal-edge-trimmed steering rejoins without edge spaces" {
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
     app.session.beginTurn(1);
 
@@ -4479,7 +4479,7 @@ test "mid-turn Enter queues a message but refuses a slash line or a blank line" 
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
     app.session.beginTurn(1);
 
@@ -4569,7 +4569,7 @@ test "late placeholder steering returns before a newer key in the same batch" {
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
     defer app.input.deinit();
     defer app.drainQueue();
@@ -4623,7 +4623,7 @@ test "a drained batch routes only the active turn generation" {
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
 
     app.session.beginTurn(1);
@@ -4672,7 +4672,7 @@ test "a resize event marks an idle interface dirty" {
 
     var app: App = undefined;
     app.initForTest(gpa);
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
 
     try std.testing.expect(!try app.applyBatch(&[_]Session.UiEvent{.resize}));
@@ -4687,7 +4687,7 @@ test "a failed batch frees its unprocessed turn events" {
 
     var app: App = undefined;
     app.initForTest(gpa);
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
     app.session.beginTurn(1);
 
@@ -4721,7 +4721,7 @@ test "a legacy escape byte closes a page after its wait" {
     var app: App = undefined;
     app.initForTest(gpa);
     defer app.input.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
     try app.session.openPage(&.{ .title = "Test page", .content = "body" });
 
@@ -4760,7 +4760,7 @@ test "a page close drops the rest of an exit attempt in one chunk" {
         var app: App = undefined;
         app.initForTest(gpa);
         defer app.input.deinit();
-        app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+        app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
         defer app.session.deinit();
         try app.session.editor.insert("draft");
         try app.session.openPage(&.{ .title = "Test page", .content = "body" });
@@ -4794,7 +4794,7 @@ test "a picker confirmation keeps the characters typed behind it" {
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
 
     const options = try gpa.alloc([]const u8, 1);
@@ -4836,7 +4836,7 @@ test "a turn cancel drops the rest of an exit attempt in one chunk" {
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
     app.session.beginTurn(1);
     try spawnCanceledTurn(&app);
@@ -4856,7 +4856,7 @@ test "ctrl+c clears then quits within the window and a draft makes ctrl+d ask tw
 
     var app: App = undefined;
     app.initForTest(gpa);
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
 
     // The first Ctrl+D with a draft warns instead of a quit, and the warning
@@ -4903,7 +4903,7 @@ test "a send refuses while the account offers no model" {
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, null, .none);
+    app.session = Session.init(gpa, &out.writer, null, .low);
     defer app.session.deinit();
 
     try app.session.editor.insert("do the work");
@@ -4934,7 +4934,7 @@ test "a refused send keeps the typed text" {
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
 
     try app.session.editor.insert("keep this line");
@@ -5071,7 +5071,7 @@ test "/system opens the composed prompt alone and escape restores the conversati
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
 
     try app.session.transcript.append(.event, .{}, "history marker");
@@ -5147,7 +5147,7 @@ test "ctrl+d closes a page and restores the conversation" {
 
     var app: App = undefined;
     app.initForTest(gpa);
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
 
     try app.session.transcript.append(.event, .{}, "history marker");
@@ -5188,7 +5188,7 @@ test "an account-switch command clears the quota snapshot and records the projec
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
     app.state = try State.open(gpa, io, &.{
         .working_directory = home,
@@ -5196,7 +5196,7 @@ test "an account-switch command clears the quota snapshot and records the projec
         .project = "/work",
     });
     defer app.state.deinit();
-    try app.state.seed(.anthropic_subscription, test_anthropic_model, .none);
+    try app.state.seed(.anthropic_subscription, test_anthropic_model, .low);
 
     app.agent.stats.quota = .{
         .secondary = .{ .used_percent = 77, .window_minutes = 10080 },
@@ -5219,7 +5219,7 @@ test "an account-switch command clears the quota snapshot and records the projec
     defer file.deinit();
     const entry = file.entry("/work").?;
     try std.testing.expectEqualStrings("openai_api", entry.get("account").?.string);
-    try std.testing.expectEqualStrings("none", entry.get("effort").?.string);
+    try std.testing.expectEqualStrings("low", entry.get("effort").?.string);
     const listed = entry.get("models").?.object;
     try std.testing.expectEqualStrings(test_openai_model.name(), listed.get("openai_api").?.string);
     // The account left behind keeps the model it ran, so a switch back returns
@@ -5376,7 +5376,7 @@ test "a switch back to an account restores the model that account ran" {
     defer gpa.free(home);
     // The project last ran one model under the Anthropic API account.
     try State.writeForTest(io, &tmp,
-        \\{ "/work": { "account": "anthropic_api", "effort": "none",
+        \\{ "/work": { "account": "anthropic_api", "effort": "low",
         \\    "models": { "anthropic_api": "claude-sonnet-5" } } }
     );
 
@@ -5405,9 +5405,9 @@ test "a switch back to an account restores the model that account ran" {
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, start_model, .none);
+    app.session = Session.init(gpa, &out.writer, start_model, .low);
     defer app.session.deinit();
-    try app.state.seed(.anthropic_api, start_model, .none);
+    try app.state.seed(.anthropic_api, start_model, .low);
 
     // Away to another account: that account has run nothing here, so it starts
     // without a model until the user picks one.
@@ -5445,7 +5445,7 @@ test "a transition names the pick where the list of the account stands cached" {
     // The project ran one model under the Anthropic API account, and none under
     // the OpenAI API account.
     try State.writeForTest(io, &tmp,
-        \\{ "/work": { "account": "anthropic_api", "effort": "none",
+        \\{ "/work": { "account": "anthropic_api", "effort": "low",
         \\    "models": { "anthropic_api": "claude-sonnet-5" } } }
     );
 
@@ -5472,7 +5472,7 @@ test "a transition names the pick where the list of the account stands cached" {
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, start_model, .none);
+    app.session = Session.init(gpa, &out.writer, start_model, .low);
     defer app.session.deinit();
 
     // No fetch ran for the OpenAI API account, so the step names the fetch.
@@ -5511,7 +5511,7 @@ test "a model name the catalog cannot resolve stays in the file" {
     const home = try tmpPath(gpa, io, &tmp, "");
     defer gpa.free(home);
     try State.writeForTest(io, &tmp,
-        \\{ "/work": { "account": "anthropic_api", "effort": "none",
+        \\{ "/work": { "account": "anthropic_api", "effort": "low",
         \\    "models": { "anthropic_api": "claude-sonnet-5",
         \\      "openai_api": "gpt-5.6-sol" } } }
     );
@@ -5541,9 +5541,9 @@ test "a model name the catalog cannot resolve stays in the file" {
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, null, .none);
+    app.session = Session.init(gpa, &out.writer, null, .low);
     defer app.session.deinit();
-    try app.state.seed(.anthropic_api, null, .none);
+    try app.state.seed(.anthropic_api, null, .low);
 
     // The switch writes the whole entry. The unresolved name stays in it.
     try app.applyOutcome(.{ .switch_account = .openai_api });
@@ -5624,7 +5624,7 @@ test "the logout of the last account signs out and opens the login picker" {
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
 
     try app.applyOutcome(.{ .logout = .anthropic_subscription });
@@ -5681,7 +5681,7 @@ test "the logout of the active account adopts a next account with no model" {
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
 
     try app.applyOutcome(.{ .logout = .anthropic_subscription });
@@ -5735,7 +5735,7 @@ test "the logout of the active account names the pick where the next list stands
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
 
     try app.applyOutcome(.{ .logout = .anthropic_subscription });
@@ -5782,7 +5782,7 @@ test "a principal replacement drops old evidence before the restored turn" {
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
     app.session.account_shown = .anthropic_subscription;
     app.session.beginTurn(1);
@@ -5865,7 +5865,7 @@ test "a fetch that meets a replaced credential drops the evidence of the old pri
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
     app.session.account_shown = .anthropic_subscription;
 
@@ -5937,7 +5937,7 @@ test "a fetch that meets a replaced credential on an idle account names that acc
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
     app.session.account_shown = .anthropic_api;
 
@@ -5992,7 +5992,7 @@ test "token request failures keep the credential before a grant rejection remove
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
     app.session.account_shown = .anthropic_subscription;
 
@@ -6109,7 +6109,7 @@ test "a replacement saved before invalidation keeps the account active" {
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
     app.session.account_shown = .anthropic_subscription;
     // The block of that proof stands above the turn, so only the replacement can
@@ -6197,7 +6197,7 @@ test "a rejected refresh credential hands the session to another account" {
     app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{ .openai = "sk-openai" });
     defer app.accounts.deinit();
     try ai.testing.seedAccount(&app.accounts, .openai_api, &.{"gpt-5.6-sol"});
-    try app.state.record(.openai_api, test_openai_model, .none);
+    try app.state.record(.openai_api, test_openai_model, .low);
     app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_subscription), .{
         .model = test_anthropic_model,
         .system = "",
@@ -6205,7 +6205,7 @@ test "a rejected refresh credential hands the session to another account" {
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
     app.session.account_shown = .anthropic_subscription;
     app.session.beginTurn(1);
@@ -6276,7 +6276,7 @@ test "a rejected refresh credential names the account with no model it hands the
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
     app.session.account_shown = .anthropic_subscription;
     app.session.beginTurn(1);
@@ -6310,7 +6310,7 @@ test "an invoked skill sends a head that no box holds, and its task in a box" {
 
     var app: App = undefined;
     app.initForTest(gpa);
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
     app.working_directory = "/work";
     app.home_directory = "/home/you";
@@ -6359,7 +6359,7 @@ test "an invoked skill with no task sends its head alone" {
 
     var app: App = undefined;
     app.initForTest(gpa);
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
     app.working_directory = "/work";
     app.home_directory = "/home/you";
@@ -6431,7 +6431,7 @@ test "a committed failure arms a retry that Esc dismisses" {
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
     defer app.dropRetry();
     app.session.beginTurn(1);
@@ -6494,7 +6494,7 @@ test "an uncommitted human failure returns to the editor and arms no retry" {
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
     defer app.dropRetry();
 
@@ -6541,7 +6541,7 @@ test "an uncommitted skill failure returns its line and arms no retry" {
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
     defer app.dropRetry();
 
@@ -6601,7 +6601,7 @@ test "Ctrl+N sends the attempt and keeps the editor text" {
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
     defer app.dropRetry();
 
@@ -6659,7 +6659,7 @@ test "a signed-out Ctrl+N names the sign-in and keeps the retry" {
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
     defer app.dropRetry();
 
@@ -6697,7 +6697,7 @@ test "Ctrl+N refuses while the account offers no model" {
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, null, .none);
+    app.session = Session.init(gpa, &out.writer, null, .low);
     defer app.session.deinit();
     defer app.dropRetry();
 
@@ -6737,7 +6737,7 @@ test "Enter sends a plain message and drops the waiting retry" {
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
     defer app.dropRetry();
 
@@ -6796,7 +6796,7 @@ test "canceling an attempt ends the recovery" {
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
     defer app.dropRetry();
 
@@ -6839,7 +6839,7 @@ test "a retry survives an account switch and Ctrl+N routes to it" {
     });
     defer app.accounts.deinit();
     try ai.testing.seedAccount(&app.accounts, .openai_api, &.{"gpt-5.6-sol"});
-    try app.state.record(.openai_api, test_openai_model, .none);
+    try app.state.record(.openai_api, test_openai_model, .low);
     app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_api), .{
         .model = test_anthropic_model,
         .system = "",
@@ -6847,7 +6847,7 @@ test "a retry survives an account switch and Ctrl+N routes to it" {
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
     app.session.account_shown = .anthropic_api;
     defer app.dropRetry();
@@ -6909,7 +6909,7 @@ test "a skill line runs while a retry waits and takes the context with it" {
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
     defer app.dropRetry();
     app.skills = try ai.skills.discover(gpa, io, &.{
@@ -6963,7 +6963,7 @@ test "a signed-out submit is refused with a login prompt" {
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
 
     try app.session.editor.insert("hello");
@@ -6996,7 +6996,7 @@ test "a refused command line reaches the model on the next Enter" {
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
 
     try app.session.editor.insert("/nope tell me about this");
@@ -7048,7 +7048,7 @@ test "a refused command line queues as steering on the next Enter" {
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
     app.session.beginTurn(1);
 
@@ -7098,7 +7098,7 @@ test "a turn that ends under the queue offer clears the row too" {
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
     app.session.beginTurn(1);
 
@@ -7151,7 +7151,7 @@ test "an idle submit of a slash line with a tail is refused and keeps its text" 
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
     try app.session.transcript.append(.user, .{}, "history marker");
 
@@ -7193,7 +7193,7 @@ test "a large pasted slash command is classified from expanded text" {
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
 
     // One command name of more than 1000 bytes: large enough to collapse to a marker.
@@ -7225,7 +7225,7 @@ test "Esc, Ctrl+C, and Ctrl+D each cancel the picker with context" {
 
     var app: App = undefined;
     app.initForTest(gpa);
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
 
     const keys = [_]terminal.Input.Key{ .escape, .{ .ctrl = 'c' }, .{ .ctrl = 'd' } };
@@ -7276,7 +7276,7 @@ test "Esc opens the step above the picker and cancels at the first step" {
     });
     defer app.accounts.deinit();
     try ai.testing.seedAccount(&app.accounts, .openai_api, &.{"gpt-5.6-sol"});
-    try app.state.record(.openai_api, test_openai_model, .none);
+    try app.state.record(.openai_api, test_openai_model, .low);
     app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_api), .{
         .model = test_anthropic_model,
         .system = "",
@@ -7284,7 +7284,7 @@ test "Esc opens the step above the picker and cancels at the first step" {
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
 
     try app.session.editor.insert("/model");
@@ -7359,7 +7359,7 @@ fn openModelStepForTest(app: *App, out: *std.Io.Writer.Allocating, home: []const
         .retry = .{},
         .environ = .empty,
     });
-    app.session = Session.init(gpa, &out.writer, test_openai_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_openai_model, .low);
 
     try app.session.editor.insert("/model");
     try app.submit();
@@ -7589,7 +7589,7 @@ test "Esc walks back through the command list that opened the command" {
     });
     defer app.accounts.deinit();
     try ai.testing.seedAccount(&app.accounts, .openai_api, &.{"gpt-5.6-sol"});
-    try app.state.record(.openai_api, test_openai_model, .none);
+    try app.state.record(.openai_api, test_openai_model, .low);
     app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_api), .{
         .model = test_anthropic_model,
         .system = "",
@@ -7597,7 +7597,7 @@ test "Esc walks back through the command list that opened the command" {
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
 
     try app.session.editor.insert("/help");
@@ -7695,7 +7695,7 @@ test "the command list opens the skill list and writes the picked line" {
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
     app.skills = try ai.skills.discover(gpa, io, &.{
         .user_root = user_root,
@@ -7736,7 +7736,7 @@ test "a user action clears a notice while background events leave it visible" {
 
     var app: App = undefined;
     app.initForTest(gpa);
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
 
     try app.session.applyOutcome(
@@ -7758,7 +7758,7 @@ test "a transcript event survives later typing" {
 
     var app: App = undefined;
     app.initForTest(gpa);
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
 
     try app.session.applyOutcome(
@@ -7827,7 +7827,7 @@ test "the startup report counts the sources in one line and keeps a skip verbose
 
     var app: App = undefined;
     app.initForTest(gpa);
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
     var user_instructions = try ai.instructions.load(gpa, io, &.{
         .directory = root,
@@ -7900,7 +7900,7 @@ test "a configured required skill applies, and an unknown name reports" {
 
     var app: App = undefined;
     app.initForTest(gpa);
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
     app.skills = try ai.skills.discover(gpa, io, &.{
         .user_root = user_skills,
@@ -8068,7 +8068,7 @@ test refreshBranch {
 
     var app: App = undefined;
     app.initForTest(gpa);
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
 
     // Outside a repository the status line shows the directory alone.
@@ -8108,7 +8108,7 @@ test "a startup with no guidance and no skipped file reports nothing" {
 
     var app: App = undefined;
     app.initForTest(gpa);
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
     var user_instructions = try ai.instructions.load(gpa, io, &.{
         .directory = root,
@@ -8142,7 +8142,7 @@ test "cancel draining preserves non-turn events ahead of newer queue data" {
     var app: App = undefined;
     app.initForTest(gpa);
     defer app.drainQueue();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
     app.session.beginTurn(1);
 
@@ -8204,7 +8204,7 @@ test "progress allocation failure still finalizes a canceled turn" {
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
     app.session.beginTurn(1);
 
@@ -8255,7 +8255,7 @@ test "cancel returns the submitted prompt as a rich draft with its paste placeho
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
     app.session.beginTurn(1);
 
@@ -8295,7 +8295,7 @@ test "a committed cancel drains queued progress into the transcript before rewin
         .environ = .empty,
     });
     defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .none);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
     app.session.beginTurn(5);
 

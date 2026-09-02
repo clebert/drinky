@@ -27,17 +27,18 @@ decision already taken, or a dependency on another entry. Module layout and exte
 - **Show a model that no source describes** — such a model takes a disabled picker row that names
   what it lacks, and its selection opens the hint for the config key. _`Catalog.merge` returns null
   and the caller drops the model today, so it leaves the picker with no line. A picker row carries
-  the selection role or the muted role alone, so the row needs a third role, and the effort marker
-  entry below needs it too. The hint names the config key of the model metadata feature, so land
-  that feature first._
-- **Mark an effort level that the model does not name** — the effort picker marks a level that
-  folds, so the fold is visible before the choice. _The ladder prints the tag alone today._
+  the selection role or the muted role alone, so the row needs a third role. The hint names the
+  config key of the model metadata feature, so land that feature first._
 - **Refresh the branch on input** — an input event that wakes the loop re-reads the repository head,
   so a checkout in another terminal shows without a turn. _An idle Drinky paints no frame, so the
   label stays stale until the next event. This limit is a decision, not a bug._
 
 ## Features
 
+- **Model metadata in the config** — the config describes a model that no provider and no OpenRouter
+  entry describes, so the user can unblock any model. _The provider wins every field it states, the
+  config wins over OpenRouter, and OpenRouter fills the rest. A later step can let Drinky write the
+  entry for the user._
 - **A herdr state socket** — Drinky reports a turn end and a failure over a socket, so herdr can
   notify the user. _The channel carries state outward alone, and nothing outside Drinky drives the
   session. Herdr holds a terminal open, so the work survives a closed lid. See <https://herdr.dev>._
@@ -47,10 +48,6 @@ decision already taken, or a dependency on another entry. Module layout and exte
 - **Headless mode** — Drinky answers a prompt with no terminal: text in, text out, with a session id
   to continue and flags for the model and the effort level. _This is the base for any agent that
   Drinky drives itself._
-- **Model metadata in the config** — the config describes a model that no provider and no OpenRouter
-  entry describes, so the user can unblock any model. _The provider wins every field it states, the
-  config wins over OpenRouter, and OpenRouter fills the rest. A later step can let Drinky write the
-  entry for the user._
 - **Save and resume conversations** — a conversation reopens after a restart and does not start
   empty. _This entry introduces the per-turn cost ledger and persists it, since history items carry
   no cost. Restore the OpenAI cache key verbatim. Store the principal identity beside the reasoning

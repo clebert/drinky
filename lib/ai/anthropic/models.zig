@@ -4,9 +4,7 @@
 //!
 //! An entry states the id, the context window (`max_input_tokens`), the output
 //! limit (`max_tokens`), and a capability object. The capability object names
-//! the effort levels the model offers and whether it reasons at all. It never
-//! states whether the reasoning can be stopped, so that one field stays unknown
-//! here and an aggregator fills it.
+//! the effort levels the model offers and whether it reasons at all.
 
 const std = @import("std");
 
@@ -213,16 +211,14 @@ fn decode(value: std.json.Value) ?Model {
 /// control denies the whole ladder, which no other source can reopen.
 fn capabilities(model: *Model, value: ?std.json.Value) void {
     const object = json.object(value orelse return) orelse return;
-    if (json.object(object.get("thinking"))) |thinking| {
-        if (!boolean(thinking.get("supported"))) model.thinking = .unsupported;
-    }
+    if (json.object(object.get("thinking"))) |thinking|
+        model.thinking = if (boolean(thinking.get("supported"))) .supported else .unsupported;
     const effort = json.object(object.get("effort")) orelse return;
     if (!boolean(effort.get("supported"))) {
         model.efforts_denied = true;
         return;
     }
     for (comptime std.enums.values(llm.Effort)) |level| {
-        if (level == .none) continue;
         const named = json.object(effort.get(@tagName(level))) orelse continue;
         if (boolean(named.get("supported"))) model.addEffort(level);
     }
@@ -311,14 +307,9 @@ test parse {
     try std.testing.expectEqualStrings("claude-opus-4-8", opus.name());
     try std.testing.expectEqual(@as(?u64, 1_000_000), opus.context_window);
     try std.testing.expectEqual(@as(?u32, 128_000), opus.tokens_max);
-    for ([_]llm.Effort{ .low, .medium, .high, .xhigh, .max }) |level|
+    for (comptime std.enums.values(llm.Effort)) |level|
         try std.testing.expect(opus.offers(level));
-    try std.testing.expect(!opus.offers(.minimal));
-    try std.testing.expect(!opus.offers(.ultra));
-    // The vendor never states whether the reasoning can stop, so the level that
-    // stops it stays hidden until an aggregator states it.
-    try std.testing.expectEqual(Model.Thinking.unknown, opus.thinking);
-    try std.testing.expect(!opus.offers(.none));
+    try std.testing.expectEqual(Model.Thinking.supported, opus.thinking);
 
     // A level the vendor marks unsupported folds onto the nearest one it names.
     const sonnet = page.models[1];

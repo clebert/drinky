@@ -297,7 +297,7 @@ pub fn init(
         system: []const u8,
         retry: net.Retry,
         environ: std.process.Environ,
-        effort: llm.Effort = .none,
+        effort: llm.Effort = .low,
         bash: tool.Context.Bash = .{},
         document: []const u8 = "",
         skill_guard: ?*tool.SkillGuard = null,
@@ -477,10 +477,10 @@ fn contextShown(self: *const Agent) ?u64 {
     // subscription or Console request also leads with the Claude Code identity
     // that an API key omits. So another account states another number.
     if (account != measured.account) return null;
-    // One account is left, and only the rendered effort can still move a proof.
-    // Anthropic drops every thinking block unless the request names an effort,
-    // so a change that flips the replay takes each proof of this account out of
-    // the prompt, or puts it back.
+    // One account is left, and only the rendered reasoning control can still
+    // move a proof. Anthropic drops every thinking block unless the request
+    // names an effort, so a model change that flips the replay takes each proof
+    // of this account out of the prompt, or puts it back.
     const reasoning = model.reasoning(self.effort);
     const vendor = account.provider();
     if (reasoning.replaysReasoning(vendor) == measured.reasoning.replaysReasoning(vendor))
@@ -1541,13 +1541,16 @@ test "the context gauge holds while the tokenizer and the replayed reasoning hol
     agent.setEffort(.max);
     try std.testing.expectEqual(@as(?u64, 1020), agent.stats.context_tokens);
 
-    // Opus omits the effort control for `none`, which takes every thinking
-    // block out of the prompt. The count no longer describes what goes out.
-    agent.setEffort(.none);
+    // A fetch can replace the description of opus with one that takes no level.
+    // Such a model omits the effort control, which takes every thinking block
+    // out of the prompt. The count no longer describes what goes out.
+    var closed = opus;
+    closed.efforts_denied = true;
+    agent.switchTo(subscription, closed);
     try std.testing.expect(agent.stats.context_tokens == null);
 
     // Back under a named effort the proof replays again, so the count returns.
-    agent.setEffort(.high);
+    agent.switchTo(subscription, opus);
     try std.testing.expectEqual(@as(?u64, 1020), agent.stats.context_tokens);
 
     // Another account renders another prompt, and it cannot replay this proof.
@@ -1606,7 +1609,7 @@ test "an account switch hides the count, and a switch back restores it" {
     try std.testing.expectEqual(@as(?u64, 1020), agent.stats.context_tokens);
 }
 
-// An effort change moves a token only when it takes a stored proof out of the
+// A setup change moves a token only when it takes a stored proof out of the
 // prompt of the active account, or puts one back.
 test "the context gauge survives every effort change that replays the same reasoning" {
     const gpa = std.testing.allocator;
@@ -1618,9 +1621,11 @@ test "the context gauge survives every effort change that replays the same reaso
     anthropic_agent.setEffort(.high);
     seedContext(&anthropic_agent, 1020);
 
-    // Opus omits the effort control for `none`, but this history holds no proof
-    // that the omission can take out of the prompt.
-    anthropic_agent.setEffort(.none);
+    // A description that takes no level omits the effort control, but this
+    // history holds no proof that the omission can take out of the prompt.
+    var closed = anthropic_agent.model.?;
+    closed.efforts_denied = true;
+    anthropic_agent.switchTo(subscription, closed);
     try std.testing.expectEqual(@as(?u64, 1020), anthropic_agent.stats.context_tokens);
 
     // Sonnet 4.6 folds xhigh onto high. Both name an effort, so the proof of
@@ -1641,7 +1646,7 @@ test "the context gauge survives every effort change that replays the same reaso
     seedContext(&openai_agent, 1020);
 
     // OpenAI names an effort at every level and keeps the encrypted item.
-    openai_agent.setEffort(.none);
+    openai_agent.setEffort(.low);
     try std.testing.expectEqual(@as(?u64, 1020), openai_agent.stats.context_tokens);
 }
 

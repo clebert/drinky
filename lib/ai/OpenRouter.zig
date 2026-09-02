@@ -1,7 +1,6 @@
 //! The public model metadata of OpenRouter, which needs no credential. It is
-//! the only source that states a price, and the only one that states whether a
-//! model can stop reasoning, so Drinky reads it for every account and merges it
-//! under whatever the vendor itself stated.
+//! the only source that states a price, so Drinky reads it for every account and
+//! merges it under whatever the vendor itself stated.
 //!
 //! `GET https://openrouter.ai/api/v1/models` answers with every model of every
 //! vendor. Drinky keeps a normalized subset: the vendors it reaches, and per
@@ -212,30 +211,20 @@ fn rate(value: ?std.json.Value) ?f64 {
     return if (std.math.isFinite(scaled)) scaled else null;
 }
 
-/// The effort levels and the thinking state. `mandatory` is the one field no
-/// vendor states, so it decides whether the user can stop the reasoning. A model
-/// with no reasoning object never reasons.
+/// The effort levels and the thinking state. A model with a reasoning object
+/// reasons, and a model with none never reasons.
 fn reasoning(model: *Model, value: ?std.json.Value) void {
     const object = json.object(value orelse {
         model.thinking = .unsupported;
         return;
     }) orelse return;
 
-    model.thinking = switch (object.get("mandatory") orelse std.json.Value.null) {
-        .bool => |mandatory| if (mandatory) .mandatory else .optional,
-        else => .unknown,
-    };
+    model.thinking = .supported;
     const levels = json.array(object.get("supported_efforts")) orelse return;
     for (levels.items) |level| {
         const name = json.string(level) orelse continue;
-        const found = std.meta.stringToEnum(llm.Effort, name) orelse continue;
-        // A vendor that names `none` as a level states that the reasoning stops,
-        // which Drinky records as the thinking state rather than as a rung.
-        if (found == .none) {
-            model.thinking = .optional;
-            continue;
-        }
-        model.addEffort(found);
+        // A name the ladder does not hold drops. `none` is one such name.
+        model.addEffort(std.meta.stringToEnum(llm.Effort, name) orelse continue);
     }
 }
 
@@ -285,7 +274,8 @@ const sample =
     \\  { "id": "openai/gpt-5.6-sol", "context_length": 1050000,
     \\    "pricing": { "prompt": "0.000002", "completion": "0.00001" },
     \\    "reasoning": { "mandatory": false,
-    \\                   "supported_efforts": ["max", "xhigh", "high", "medium", "low", "none"] } },
+    \\                   "supported_efforts": ["ultra", "max", "xhigh", "high", "medium", "low",
+    \\                                         "minimal", "none"] } },
     \\  { "id": "openai/gpt-4o", "context_length": 128000,
     \\    "pricing": { "prompt": "0.0000025", "completion": "0.00001" } },
     \\  { "id": "openai/gpt-5.6-sol:batch", "context_length": 1050000,
@@ -313,26 +303,26 @@ test parse {
     try std.testing.expectEqual(@as(f64, 0.5), opus.price.?.cache_read);
     // The 5-minute write rate wins, because Drinky writes no 1-hour entry.
     try std.testing.expectEqual(@as(f64, 6.25), opus.price.?.cache_write);
-    try std.testing.expectEqual(Model.Thinking.optional, opus.thinking);
+    try std.testing.expectEqual(Model.Thinking.supported, opus.thinking);
     try std.testing.expect(opus.offers(.max));
-    try std.testing.expect(!opus.offers(.ultra));
     // A model with a price but no cache rates charges nothing for a cache hit.
     const fable = metadata.lookup(.anthropic, "claude-fable-5").?;
     try std.testing.expectEqual(@as(f64, 0), fable.price.?.cache_read);
-    // Mandatory reasoning offers no way to stop it.
-    try std.testing.expectEqual(Model.Thinking.mandatory, fable.thinking);
-    try std.testing.expect(!fable.offers(.none));
+    // Whether the reasoning is mandatory changes nothing, because Drinky never
+    // stops it.
+    try std.testing.expectEqual(Model.Thinking.supported, fable.thinking);
 
-    // A vendor that names `none` as a level states the thinking state instead.
+    // A name outside the ladder, such as `ultra`, `minimal`, or `none`, drops,
+    // so the model names the five rungs alone.
     const sol = metadata.lookup(.openai, "gpt-5.6-sol").?;
-    try std.testing.expectEqual(Model.Thinking.optional, sol.thinking);
-    try std.testing.expect(sol.offers(.none));
-    try std.testing.expect(!sol.efforts.contains(.none));
+    try std.testing.expectEqual(Model.Thinking.supported, sol.thinking);
+    try std.testing.expectEqual(@as(usize, 5), sol.efforts.count());
+    try std.testing.expect(sol.offers(.low));
+    try std.testing.expect(sol.offers(.max));
 
     // A model with no reasoning object never reasons, so it offers no level.
     const legacy = metadata.lookup(.openai, "gpt-4o").?;
     try std.testing.expectEqual(Model.Thinking.unsupported, legacy.thinking);
-    try std.testing.expect(!legacy.offers(.none));
     try std.testing.expect(legacy.reasoning(.high) == .omitted);
 
     // A free endpoint states no rate, so it reports no price at all.

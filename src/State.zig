@@ -470,12 +470,12 @@ test "only a change writes the file, and it keeps another project" {
     try std.testing.expect(before.entry("/work") == null);
 
     // A changed effort level writes the whole entry and keeps the other project.
-    try state.record(.anthropic_api, test_model, .none);
+    try state.record(.anthropic_api, test_model, .low);
     var after = (try ai.json_store.open(gpa, io, state.path)).?;
     defer after.deinit();
     const entry = after.entry("/work").?;
     try std.testing.expectEqualStrings("anthropic_api", entry.get("account").?.string);
-    try std.testing.expectEqualStrings("none", entry.get("effort").?.string);
+    try std.testing.expectEqualStrings("low", entry.get("effort").?.string);
     try std.testing.expectEqualStrings(
         "claude-opus-5",
         entry.get("models").?.object.get("anthropic_api").?.string,
@@ -495,7 +495,7 @@ test "only a change writes the file, and it keeps another project" {
         "claude-opus-5",
         restarted.models.get(.anthropic_api).?.name(),
     );
-    try std.testing.expectEqual(ai.llm.Effort.none, restarted.start.effort.?);
+    try std.testing.expectEqual(ai.llm.Effort.low, restarted.start.effort.?);
 }
 
 test "each account keeps its own model across a switch and a restart" {
@@ -541,7 +541,7 @@ test "the state keeps the model name that a command recorded" {
     const home = try tmpHome(gpa, io, &tmp);
     defer gpa.free(home);
     try writeForTest(io, &tmp,
-        \\{ "/work": { "account": "anthropic_api", "effort": "none",
+        \\{ "/work": { "account": "anthropic_api", "effort": "low",
         \\    "models": { "anthropic_api": "claude-opus-5" } } }
     );
 
@@ -550,7 +550,7 @@ test "the state keeps the model name that a command recorded" {
     try std.testing.expect(state.models.get(.anthropic_api) != null);
 
     // A recorded name replaces the one the file held.
-    try state.record(.anthropic_api, other_model, .none);
+    try state.record(.anthropic_api, other_model, .low);
     try std.testing.expectEqualStrings(
         "claude-opus-6",
         state.models.get(.anthropic_api).?.name(),
@@ -559,9 +559,9 @@ test "the state keeps the model name that a command recorded" {
     // No model keeps the name the entry holds, because a catalog that resolves
     // nothing must not erase the memory of the account. An account that ran none
     // here still names none.
-    try state.record(.openai_api, null, .none);
+    try state.record(.openai_api, null, .low);
     try std.testing.expect(state.models.get(.openai_api) == null);
-    try state.record(.anthropic_api, null, .none);
+    try state.record(.anthropic_api, null, .low);
     try std.testing.expectEqualStrings(
         "claude-opus-6",
         state.models.get(.anthropic_api).?.name(),
@@ -573,7 +573,7 @@ test "the state keeps the model name that a command recorded" {
     defer file.deinit();
     const entry = file.entry("/work").?;
     try std.testing.expectEqualStrings("anthropic_api", entry.get("account").?.string);
-    try std.testing.expectEqualStrings("none", entry.get("effort").?.string);
+    try std.testing.expectEqualStrings("low", entry.get("effort").?.string);
     const listed = entry.get("models").?.object;
     try std.testing.expectEqual(@as(usize, 1), listed.count());
     try std.testing.expectEqualStrings("claude-opus-6", listed.get("anthropic_api").?.string);
@@ -602,7 +602,7 @@ test "temporary store contention leaves project-state saving enabled" {
 
     var state = try openForTest(gpa, io, home);
     defer state.deinit();
-    try state.seed(.anthropic_api, test_model, .none);
+    try state.seed(.anthropic_api, test_model, .low);
     const lock_path = try std.fmt.allocPrint(gpa, "{s}.lock", .{state.path});
     defer gpa.free(lock_path);
     {
@@ -622,7 +622,7 @@ test "temporary store contention leaves project-state saving enabled" {
 
     // The choices return to the saved values. The pending snapshot still forces
     // this retry, so no earlier model-table change can stay only in memory.
-    try state.record(.anthropic_api, test_model, .none);
+    try state.record(.anthropic_api, test_model, .low);
     try std.testing.expect(!state.save_pending);
     var file = (try ai.json_store.open(gpa, io, state.path)).?;
     defer file.deinit();

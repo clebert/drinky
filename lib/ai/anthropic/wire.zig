@@ -43,15 +43,11 @@ pub fn serialize(gpa: std.mem.Allocator, request: *const llm.Request, account: l
     try stringify.objectField("stream");
     try stringify.write(true);
 
-    // The request carries no control, an explicit off control, or adaptive
-    // thinking with a named level. The Agent resolved it against the model.
+    // The request carries no control, or adaptive thinking with a named level.
+    // The Agent resolved it against the model.
     const emit_thinking = request.reasoning.replaysReasoning(.anthropic);
     switch (request.reasoning) {
         .omitted => {},
-        .disabled => {
-            try stringify.objectField("thinking");
-            try stringify.write(DisabledThinking{});
-        },
         .named => |level| {
             try stringify.objectField("thinking");
             try stringify.write(AdaptiveThinking{});
@@ -134,8 +130,6 @@ const AdaptiveThinking = struct {
     display: []const u8 = "summarized",
 };
 
-const DisabledThinking = struct { type: []const u8 = "disabled" };
-
 /// The named effort level that steers reasoning depth (and answer effort).
 const OutputConfig = struct { effort: []const u8 };
 
@@ -187,9 +181,9 @@ fn writeTool(stringify: *std.json.Stringify, tool: *const llm.Tool, cache: bool)
     try stringify.endObject();
 }
 
-/// Whether an item serializes to a content block. Reasoning drops when it
-/// is disabled, belongs to another account, or carries a different provider's
-/// replay proof.
+/// Whether an item serializes to a content block. Reasoning drops when the
+/// request names no thinking control, when it belongs to another account, or
+/// when it carries a different provider's replay proof.
 fn emitsBlock(item: llm.Item, emit_thinking: bool, account: llm.Account) bool {
     return switch (item) {
         .reasoning => |reasoning| if (!emit_thinking)
@@ -547,22 +541,6 @@ test "every reasoning control renders its own block" {
             root.get("output_config").?.object.get("effort").?.string,
         );
     }
-
-    // The off control writes the explicit disabled block and no level.
-    {
-        var stopped = request;
-        stopped.reasoning = .disabled;
-        const body = try serialize(gpa, &stopped, .anthropic_subscription);
-        defer gpa.free(body);
-        const parsed = try std.json.parseFromSlice(std.json.Value, gpa, body, .{});
-        defer parsed.deinit();
-        const root = parsed.value.object;
-        try std.testing.expectEqualStrings(
-            "disabled",
-            root.get("thinking").?.object.get("type").?.string,
-        );
-        try std.testing.expect(root.get("output_config") == null);
-    }
 }
 
 test "an omitted control writes no thinking and no output_config" {
@@ -583,7 +561,9 @@ test "an omitted control writes no thinking and no output_config" {
     try std.testing.expectEqual(@as(i64, 8192), parsed.value.object.get("max_tokens").?.integer);
 }
 
-test "an off control writes a disabled thinking block and drops the replay" {
+// Anthropic rejects a thinking block in a request that names no thinking control,
+// so an omitted control drops the stored replay.
+test "an omitted control drops the replay" {
     const items = [_]llm.Item{
         .{ .message = .{ .role = .user, .text = "hi" } },
         .{ .reasoning = .{ .replay = .{ .anthropic_subscription = .{ .signature = .{
@@ -598,17 +578,14 @@ test "an off control writes a disabled thinking block and drops the replay" {
         .system = "s",
         .items = &items,
         .tools = &.{},
-        .reasoning = .disabled,
+        .reasoning = .omitted,
     }, .anthropic_subscription);
     defer std.testing.allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
     defer parsed.deinit();
     const root = parsed.value.object;
-    try std.testing.expectEqualStrings(
-        "disabled",
-        root.get("thinking").?.object.get("type").?.string,
-    );
+    try std.testing.expect(root.get("thinking") == null);
     try std.testing.expect(root.get("output_config") == null);
     const assistant = root.get("messages").?.array.items[1].object.get("content").?.array.items;
     try std.testing.expectEqual(@as(usize, 1), assistant.len);

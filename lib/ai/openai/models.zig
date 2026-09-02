@@ -196,7 +196,9 @@ fn decodeSubscription(value: std.json.Value) ?Model {
     for (levels.items) |entry| {
         const level = json.object(entry) orelse continue;
         const name = json.string(level.get("effort")) orelse continue;
-        addLevel(&model, name);
+        // A name the ladder does not hold drops, so no picker offers a level
+        // that Drinky cannot send. `none` and `ultra` are such names.
+        model.addEffort(std.meta.stringToEnum(llm.Effort, name) orelse continue);
     }
     return model;
 }
@@ -227,19 +229,6 @@ fn parseApi(gpa: std.mem.Allocator, body: []const u8) ![]Model {
     return models.toOwnedSlice(gpa);
 }
 
-/// Record one level name the provider stated. A provider that names `none` as a
-/// level states that the reasoning can stop, which is a thinking state here and
-/// no rung on the ladder. A name the ladder does not hold is dropped, so a new
-/// provider level cannot reach a picker that has no order for it.
-fn addLevel(model: *Model, name: []const u8) void {
-    const level = std.meta.stringToEnum(llm.Effort, name) orelse return;
-    if (level == .none) {
-        model.thinking = .optional;
-        return;
-    }
-    model.addEffort(level);
-}
-
 fn positive(value: ?std.json.Value) ?u64 {
     const found = json.integer(value) orelse return null;
     return if (found > 0) @intCast(found) else null;
@@ -260,7 +249,8 @@ const codex_sample =
     \\      { "effort": "ultra", "description": "Maximum with delegation" } ] },
     \\  { "slug": "gpt-5.4", "visibility": "list",
     \\    "context_window": null, "max_context_window": 1000000,
-    \\    "supported_reasoning_levels": [ { "effort": "low" }, { "effort": "high" } ] },
+    \\    "supported_reasoning_levels": [ { "effort": "none" }, { "effort": "low" },
+    \\                                    { "effort": "high" } ] },
     \\  { "slug": "gpt-reserve", "visibility": "hide",
     \\    "context_window": 272000, "max_context_window": 872000 }
     \\] }
@@ -335,13 +325,12 @@ test parseSubscription {
     const sol = models[0];
     // The stated window wins over the maximum, and it contradicts the public API.
     try std.testing.expectEqual(@as(?u64, 272_000), sol.context_window);
-    // The backend offers a level the public API never does.
-    try std.testing.expect(sol.offers(.ultra));
+    // The catalog lists `ultra`, which no rung of the ladder holds, so it drops.
+    try std.testing.expectEqual(@as(usize, 5), sol.efforts.count());
     try std.testing.expect(sol.offers(.low));
-    try std.testing.expect(!sol.offers(.minimal));
-    // The catalog names no level that stops the reasoning, so none stays hidden.
+    try std.testing.expect(sol.offers(.max));
+    // The catalog states no thinking state.
     try std.testing.expectEqual(Model.Thinking.unknown, sol.thinking);
-    try std.testing.expect(!sol.offers(.none));
     // The backend prices nothing and states no output limit.
     try std.testing.expect(sol.price == null);
     try std.testing.expectEqual(@as(?u32, null), sol.tokens_max);
@@ -349,6 +338,8 @@ test parseSubscription {
     // A null window falls back to the maximum.
     try std.testing.expectEqual(@as(?u64, 1_000_000), models[1].context_window);
     try std.testing.expectEqual(llm.Effort.high, models[1].reasoning(.max).named);
+    // `none` is no rung, so it drops like any name outside the ladder.
+    try std.testing.expectEqual(@as(usize, 2), models[1].efforts.count());
 }
 
 test parseApi {

@@ -25,8 +25,7 @@ pub const tokens_max_fallback = 4096;
 
 name_buffer: [name_bytes_max]u8,
 name_length: u8,
-/// The levels the provider named for this model. It never holds `none`, because
-/// a request states "stop reasoning" through `thinking` instead.
+/// The levels the provider named for this model.
 efforts: std.EnumSet(llm.Effort),
 /// Whether the vendor stated that this model takes no effort level at all. An
 /// empty list alone cannot state that, because a source that names no level
@@ -37,15 +36,12 @@ context_window: ?u64,
 tokens_max: ?u32,
 price: ?Price,
 
-/// What Drinky knows about stopping the reasoning of a model. Only an
-/// aggregator states this for Anthropic, so `unknown` is a common state and it
-/// offers the user no way to stop the reasoning.
+/// Whether the model reasons, as far as a source stated it. Only `unsupported`
+/// closes the ladder.
 pub const Thinking = enum {
     unknown,
-    /// A request can stop the reasoning.
-    optional,
-    /// The model always reasons.
-    mandatory,
+    /// The model reasons.
+    supported,
     /// The model never reasons.
     unsupported,
 };
@@ -100,7 +96,6 @@ pub fn name(self: *const Model) []const u8 {
 
 /// Record that the provider named `level` for this model.
 pub fn addEffort(self: *Model, level: llm.Effort) void {
-    std.debug.assert(level != .none);
     self.efforts.insert(level);
 }
 
@@ -131,12 +126,10 @@ pub fn takesEffort(self: *const Model) bool {
     return !self.efforts_denied and self.thinking != .unsupported;
 }
 
-/// Whether this model names `level`. `none` is no rung of the ladder, so it
-/// asks instead whether the reasoning of this model can stop. The answer
-/// describes the model alone. `reasoning` resolves the level of a request, and
-/// it reads the ladder of the model directly.
+/// Whether this model names `level`. The answer describes the model alone.
+/// `reasoning` resolves the level of a request, and it reads the ladder of the
+/// model directly.
 pub fn offers(self: *const Model, level: llm.Effort) bool {
-    if (level == .none) return self.thinking == .optional;
     return self.takesEffort() and self.efforts.contains(level);
 }
 
@@ -147,7 +140,6 @@ pub fn offers(self: *const Model, level: llm.Effort) bool {
 /// provider itself named, so the request carries a spelling that provider
 /// knows.
 pub fn reasoning(self: *const Model, level: llm.Effort) llm.Request.Reasoning {
-    if (level == .none) return if (self.thinking == .optional) .disabled else .omitted;
     if (!self.takesEffort()) return .omitted;
     const found = self.nearest(level) orelse return .omitted;
     return .{ .named = found };
@@ -163,10 +155,7 @@ fn nearest(self: *const Model, level: llm.Effort) ?llm.Effort {
     // so the index widens before it.
     const start: usize = @intFromEnum(level);
     for (0..ladder.len) |distance| {
-        // `none` sits at index 0 and is no rung, so the downward walk stops
-        // above it. `efforts` holds no `none` either, so the upward walk needs
-        // no such guard.
-        if (start > distance) {
+        if (start >= distance) {
             const lower = ladder[start - distance];
             if (self.efforts.contains(lower)) return lower;
         }
@@ -294,7 +283,7 @@ test eql {
     try std.testing.expect(!fetched.eql(&denied));
 
     var thinks = init("claude-opus-5") catch unreachable;
-    thinks.thinking = .optional;
+    thinks.thinking = .supported;
     try std.testing.expect(!fetched.eql(&thinks));
 }
 
@@ -309,10 +298,13 @@ test "a fold takes the nearest level and prefers the lower one on a tie" {
     // A level above the highest named one folds down to it.
     try std.testing.expectEqual(llm.Effort.high, model.reasoning(.max).named);
     try std.testing.expectEqual(llm.Effort.high, model.reasoning(.xhigh).named);
-    try std.testing.expectEqual(llm.Effort.high, model.reasoning(.ultra).named);
+
     // A level below the lowest named one turns upward, because no lower level
     // exists to fold onto.
-    try std.testing.expectEqual(llm.Effort.low, model.reasoning(.minimal).named);
+    var raised = try init("raised");
+    raised.addEffort(.medium);
+    raised.addEffort(.high);
+    try std.testing.expectEqual(llm.Effort.medium, raised.reasoning(.low).named);
 
     // A near level above beats a far level below, so the fold reads the whole
     // ladder rather than the part under the level.
@@ -320,7 +312,6 @@ test "a fold takes the nearest level and prefers the lower one on a tie" {
     gapped.addEffort(.low);
     gapped.addEffort(.max);
     try std.testing.expectEqual(llm.Effort.max, gapped.reasoning(.xhigh).named);
-    try std.testing.expectEqual(llm.Effort.low, gapped.reasoning(.minimal).named);
     try std.testing.expectEqual(llm.Effort.low, gapped.reasoning(.medium).named);
 
     // Two named levels at one distance tie, and the tie takes the lower one, so
@@ -330,33 +321,32 @@ test "a fold takes the nearest level and prefers the lower one on a tie" {
     tied.addEffort(.high);
     try std.testing.expectEqual(llm.Effort.low, tied.reasoning(.medium).named);
 
-    // One named level answers every request.
-    var single = try init("single");
-    single.addEffort(.high);
-    for ([_]llm.Effort{ .minimal, .low, .medium, .high, .xhigh, .max, .ultra }) |level|
-        try std.testing.expectEqual(llm.Effort.high, single.reasoning(level).named);
+    // One named level answers every request. The lowest rung sits at index 0,
+    // so the downward walk must reach it from every rung above.
+    for ([_]llm.Effort{ .low, .high }) |named| {
+        var single = try init("single");
+        single.addEffort(named);
+        for (comptime std.enums.values(llm.Effort)) |level|
+            try std.testing.expectEqual(named, single.reasoning(level).named);
+    }
 
     // A model that names no level carries no control at all.
     const bare = try init("bare");
     try std.testing.expect(bare.reasoning(.high) == .omitted);
-    try std.testing.expect(bare.reasoning(.none) == .omitted);
+    try std.testing.expect(bare.reasoning(.low) == .omitted);
 }
 
-test "only a model that can stop reasoning offers the none level" {
+// A model that reasons, and one whose state no source stated, render a level
+// alike. Only a model that never reasons closes the ladder.
+test "a thinking state that reasons renders every level alike" {
     var model = try init("thinks");
     model.addEffort(.low);
     model.addEffort(.max);
 
-    model.thinking = .optional;
-    try std.testing.expect(model.offers(.none));
-    try std.testing.expect(model.reasoning(.none) == .disabled);
-
-    // A mandatory, an unsupported, and an unstated thinking state each hide the
-    // level, so the user never picks a control the provider rejects.
-    for ([_]Thinking{ .mandatory, .unsupported, .unknown }) |state| {
+    for ([_]Thinking{ .supported, .unknown }) |state| {
         model.thinking = state;
-        try std.testing.expect(!model.offers(.none));
-        try std.testing.expect(model.reasoning(.none) == .omitted);
+        try std.testing.expectEqual(llm.Effort.low, model.reasoning(.low).named);
+        try std.testing.expectEqual(llm.Effort.max, model.reasoning(.xhigh).named);
     }
 }
 
@@ -373,14 +363,11 @@ test takesEffort {
     try std.testing.expect(model.reasoning(.high) == .omitted);
 
     // A vendor that denies the effort control closes the ladder the same way.
-    model.thinking = .optional;
+    model.thinking = .supported;
     model.efforts_denied = true;
     try std.testing.expect(!model.takesEffort());
     try std.testing.expect(!model.offers(.high));
     try std.testing.expect(model.reasoning(.high) == .omitted);
-    // The reasoning of such a model can still stop, which is its own control.
-    try std.testing.expect(model.offers(.none));
-    try std.testing.expect(model.reasoning(.none) == .disabled);
 }
 
 test "a model names the levels its provider stated alone" {
@@ -390,7 +377,7 @@ test "a model names the levels its provider stated alone" {
 
     try std.testing.expect(model.offers(.medium));
     try std.testing.expect(model.offers(.xhigh));
-    for ([_]llm.Effort{ .minimal, .low, .high, .max, .ultra }) |level|
+    for ([_]llm.Effort{ .low, .high, .max }) |level|
         try std.testing.expect(!model.offers(level));
 }
 
@@ -429,8 +416,6 @@ test cost {
 test "a reasoning control compares by the request bytes it produces" {
     const Reasoning = llm.Request.Reasoning;
     try std.testing.expect(Reasoning.eql(.omitted, .omitted));
-    try std.testing.expect(Reasoning.eql(.disabled, .disabled));
-    try std.testing.expect(!Reasoning.eql(.omitted, .disabled));
     try std.testing.expect(Reasoning.eql(.{ .named = .high }, .{ .named = .high }));
     try std.testing.expect(!Reasoning.eql(.{ .named = .high }, .{ .named = .xhigh }));
     try std.testing.expect(!Reasoning.eql(.{ .named = .high }, .omitted));
@@ -447,10 +432,11 @@ test "a reasoning control compares by the request bytes it produces" {
 test "reasoning replay follows the rendered control of the vendor" {
     var model = try init("replays");
     model.addEffort(.high);
-    model.thinking = .optional;
-
     try std.testing.expect(model.reasoning(.high).replaysReasoning(.anthropic));
-    try std.testing.expect(!model.reasoning(.none).replaysReasoning(.anthropic));
-    try std.testing.expect(model.reasoning(.none).replaysReasoning(.openai));
     try std.testing.expect(model.reasoning(.high).replaysReasoning(.openai));
+
+    // A model that takes no level renders no control.
+    const bare = try init("bare");
+    try std.testing.expect(!bare.reasoning(.high).replaysReasoning(.anthropic));
+    try std.testing.expect(bare.reasoning(.high).replaysReasoning(.openai));
 }

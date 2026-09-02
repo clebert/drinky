@@ -11,13 +11,13 @@ const llm = @import("llm.zig");
 const Model = @import("Model.zig");
 
 /// A fully described model: a window, an output limit, every effort level, a
-/// stoppable reasoning, and a price. A test that needs another shape starts
+/// reasoning, and a price. A test that needs another shape starts
 /// here and overwrites the one field it cares about.
 pub fn model(name: []const u8) Model {
     var built = Model.init(name) catch unreachable;
     built.context_window = 1_000_000;
     built.tokens_max = 128_000;
-    built.thinking = .optional;
+    built.thinking = .supported;
     for ([_]llm.Effort{ .low, .medium, .high, .xhigh, .max }) |level| built.addEffort(level);
     built.price = .{ .input = 3, .output = 15, .cache_read = 0.3, .cache_write = 3.75 };
     return built;
@@ -73,7 +73,6 @@ test model {
     try std.testing.expectEqualStrings("test-model", built.name());
     try std.testing.expectEqual(@as(?u64, 1_000_000), built.context_window);
     try std.testing.expect(built.offers(.high));
-    try std.testing.expect(built.offers(.none));
     try std.testing.expectEqual(@as(f64, 3), built.price.?.input);
 }
 

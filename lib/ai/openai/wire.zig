@@ -78,12 +78,10 @@ pub fn serialize(gpa: std.mem.Allocator, request: *const llm.Request, account: l
     return out.toOwnedSlice();
 }
 
-/// The wire name of the resolved control. OpenAI states "stop reasoning" as a
-/// level of its own, so the off control renders as a name like any other.
+/// The wire name of the resolved control, or null when the request carries none.
 fn effortName(request: *const llm.Request) ?[]const u8 {
     return switch (request.reasoning) {
         .omitted => null,
-        .disabled => "none",
         .named => |level| @tagName(level),
     };
 }
@@ -273,28 +271,6 @@ test serialize {
         schema.get("properties").?.object.get("path").?.object.get("type").?.string,
     );
     try std.testing.expectEqualStrings("path", schema.get("required").?.array.items[0].string);
-}
-
-// OpenAI states "stop reasoning" as a level of its own, so the off control
-// renders as a name like any other.
-test "the off control renders as the named none level" {
-    const items = [_]llm.Item{.{ .message = .{ .role = .user, .text = "hi" } }};
-    const body = try serialize(std.testing.allocator, &.{
-        .model = "gpt-5.6-sol",
-        .tokens_max = 128_000,
-        .system = "s",
-        .items = &items,
-        .tools = &.{},
-        .reasoning = .disabled,
-    }, .openai_api);
-    defer std.testing.allocator.free(body);
-
-    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
-    defer parsed.deinit();
-    try std.testing.expectEqualStrings(
-        "none",
-        parsed.value.object.get("reasoning").?.object.get("effort").?.string,
-    );
 }
 
 test "prompt_cache_key is sent when set and omitted when empty" {

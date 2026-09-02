@@ -81,20 +81,22 @@ Anthropic and OpenAI through a subscription login, an Anthropic Console login, o
   transcript event.
 - One window of `request.connect_timeout_ms` bounds a whole fetch: the token refresh, every page of
   the list, and the metadata request.
-- The provider wins every field that it states. Only OpenRouter prices a model. For Anthropic only
-  OpenRouter states whether the reasoning can stop.
+- The provider wins every field that it states. Only OpenRouter prices a model.
 - A model that no source describes never reaches the picker. A Codex model that the backend hides
   stays hidden.
 - An OpenAI API key states no model fact, so that account offers no model until OpenRouter describes
   one.
 - An Anthropic request must name an output cap. A model that states no limit runs at a low default,
   and the model picker marks it, because that default can cut a reply short.
-- The effort levels are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, and `ultra`. The
-  level states the intention of the user, so `/effort` offers every level at every time, with or
-  without an account or a model.
+- The effort levels are `low`, `medium`, `high`, `xhigh`, and `max`. Every level is a wire spelling
+  that a provider accepts, and a name outside the ladder drops when Drinky reads a list. The level
+  states the intention of the user, so `/effort` offers every level at every time, with or without
+  an account or a model.
+- Drinky never asks a model to stop its reasoning. A model that reasons runs at a named level, and a
+  model that takes no level runs with no control.
 - Each request resolves the level against its model in silence. A level that the model does not name
   folds to the nearest one it names. A tie takes the lower level. A model that takes no level drops
-  it.
+  it. The effort picker marks each such level, so the fold is visible before the choice.
 - An account with no model shows `No model` in the warning color. A send then refuses and names the
   command that fixes it.
 - Each account keeps the model it ran in this project. A switch, a login, and a restart return to
@@ -152,7 +154,8 @@ Anthropic and OpenAI through a subscription login, an Anthropic Console login, o
 - **/model** — switch the account and the model together, from the next turn on. The picker steps
   through the provider, the account, and the model, and skips a step with one row. The model step
   starts with a row that fetches the list of that account.
-- **/effort** — set the reasoning-effort level, from the next turn on. The picker lists every level.
+- **/effort** — set the reasoning-effort level, from the next turn on. The picker lists every level
+  and marks a level that the active model folds or drops.
 - **/login** — sign in, switch to a signed-in account, or name the API key to set.
 - **/logout** — drop the credentials of a signed-in account and hand the session to another account.
 - **/new** — clear the conversation, the usage stats, and the steering. The configuration stays. The

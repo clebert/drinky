@@ -104,9 +104,10 @@ pub const Role = enum { user, assistant };
 ///
 /// Declaration order is the ladder. A model that does not name a level resolves
 /// it onto the nearest level it does name, so the order carries meaning and
-/// every member must keep its place. `none` is no rung on that ladder. It asks
-/// the model to stop reasoning, and each provider states that in its own way.
-pub const Effort = enum { none, minimal, low, medium, high, xhigh, max, ultra };
+/// every member must keep its place. Every rung is a wire spelling that a
+/// provider accepts. Drinky never asks a model to stop its reasoning, so the
+/// ladder holds no such rung.
+pub const Effort = enum { low, medium, high, xhigh, max };
 
 /// One entry in the flat, ordered conversation history. Every provider
 /// translates its wire format to and from this list. The agent loop appends
@@ -273,8 +274,6 @@ pub const Request = struct {
     pub const Reasoning = union(enum) {
         /// The request names no reasoning control and takes the provider default.
         omitted,
-        /// The request asks the model to stop reasoning.
-        disabled,
         /// The request names this level.
         named: Effort,
 
@@ -296,10 +295,9 @@ pub const Request = struct {
         pub fn eql(self: Reasoning, other: Reasoning) bool {
             return switch (self) {
                 .omitted => other == .omitted,
-                .disabled => other == .disabled,
                 .named => |level| switch (other) {
                     .named => |other_level| level == other_level,
-                    .omitted, .disabled => false,
+                    .omitted => false,
                 },
             };
         }

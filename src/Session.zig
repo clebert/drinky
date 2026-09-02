@@ -1775,9 +1775,18 @@ const test_model = ai.testing.model("claude-sonnet-4-6");
 const test_model_openai = ai.testing.model("gpt-5.6-sol");
 
 // The effort level that names a thinking control on `test_model`, so a request of
-// that setup replays its stored reasoning. Level `none` omits the control there,
-// which takes every stored thinking block out of the request.
+// that setup replays its stored reasoning. Every level names one there, so only a
+// model that takes no level omits the control, which takes every stored thinking
+// block out of the request.
 const replaying_effort: ai.llm.Effort = .high;
+
+// The description of `test_model` after a fetch that denies the effort control.
+// A request for it carries no thinking control.
+const test_model_closed = blk: {
+    var model = test_model;
+    model.efforts_denied = true;
+    break :blk model;
+};
 
 fn applyEvent(session: *Session, generation: u64, payload: TurnEvent.Payload) !void {
     _ = try session.applyTurnEvent(&.{ .generation = generation, .payload = payload });
@@ -1972,7 +1981,7 @@ test "a turn end drops the send-as-a-message confirmation and the footer" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
     defer session.deinit();
 
     session.beginTurn(1);
@@ -2009,7 +2018,7 @@ test "a turn boundary drops the turn-cancel confirmation" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
     defer session.deinit();
 
     session.beginTurn(1);
@@ -2026,7 +2035,7 @@ test "a new notice drops the send-as-a-message confirmation" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
     defer session.deinit();
 
     session.armConfirmation(.message);
@@ -2048,7 +2057,7 @@ test "a notice replaces its predecessor without entering the transcript" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
     defer session.deinit();
 
     try session.applyOutcome(
@@ -2073,7 +2082,7 @@ test "a picker that waits drops its rows, animates, and keeps its trail" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
     defer session.deinit();
     const size: terminal.View.Size = .{ .columns = 80, .rows = 24 };
     const account_step = struct {
@@ -2133,7 +2142,7 @@ test "a picker that reports records its line and still opens its list" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
     defer session.deinit();
 
     const options = try gpa.alloc([]const u8, 1);
@@ -2190,7 +2199,7 @@ test "a notice replaces the footer and clearing restores the status" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
     defer session.deinit();
 
     try session.paint(.{ .columns = 80, .rows = 24 });
@@ -2218,7 +2227,7 @@ test "the status line borrows the model name of the session" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
     defer session.deinit();
 
     const info = session.statusInfo();
@@ -2234,7 +2243,7 @@ test "a confirmation is one-shot and separate from its notice" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
     defer session.deinit();
 
     try session.applyOutcome(
@@ -2254,7 +2263,7 @@ test "an event survives notice clearing until a conversation clear discards it" 
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
     defer session.deinit();
 
     try session.applyOutcome(
@@ -2336,7 +2345,7 @@ test "a tool result box shows the line the tool decided" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
     defer session.deinit();
     session.beginTurn(1);
 
@@ -2367,7 +2376,7 @@ test "a tool result without a box line keeps the call row alone" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
     defer session.deinit();
     session.beginTurn(1);
 
@@ -2400,7 +2409,7 @@ test "a failed tool result keeps its sentence below the call row" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
     defer session.deinit();
     session.beginTurn(1);
 
@@ -2434,7 +2443,7 @@ test "a failed tool result that states measures takes no prefix" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
     defer session.deinit();
     session.beginTurn(1);
 
@@ -2469,7 +2478,7 @@ test "a streamed tool call counts its bytes until the call commits" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
     defer session.deinit();
     session.beginTurn(1);
 
@@ -2514,7 +2523,7 @@ test "a committed call replaces its own streamed row and leaves its sibling" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
     defer session.deinit();
     session.beginTurn(1);
 
@@ -2547,7 +2556,7 @@ test "a streamed row that stopped counting reads as queued" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
     defer session.deinit();
     session.beginTurn(1);
 
@@ -2582,7 +2591,7 @@ test "a narrow window cuts the phase of a streamed row and keeps the count" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
     defer session.deinit();
     session.beginTurn(1);
 
@@ -2602,7 +2611,7 @@ test "a streamed row stays one short line however long the arguments run" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
     defer session.deinit();
     session.beginTurn(1);
 
@@ -2626,7 +2635,7 @@ test "a stream reset drops the tool boxes of the discarded attempt" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
     defer session.deinit();
     session.beginTurn(1);
 
@@ -2661,7 +2670,7 @@ test "response-head retries remain after an abnormal rewind" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
     defer session.deinit();
 
     try session.transcript.append(.user, .{}, "try this");
@@ -2705,7 +2714,7 @@ test "a model mismatch records a durable event beside the answer" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
     defer session.deinit();
     session.beginTurn(1);
 
@@ -2732,7 +2741,7 @@ test "a truncated receipt appends an event after the answer" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
     defer session.deinit();
     session.beginTurn(1);
 
@@ -2773,7 +2782,7 @@ test "streamed and tool text cannot emit terminal controls" {
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
 
-    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
     defer session.deinit();
     session.beginTurn(1);
 
@@ -2819,7 +2828,7 @@ test "stream events are dropped once the turn is over" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
     defer session.deinit();
 
     try applyEvent(&session, 1, .{ .text = try gpa.dupe(u8, "straggler") });
@@ -2833,7 +2842,7 @@ test "a canceled turn's stale output and completion cannot affect its successor"
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
     defer session.deinit();
 
     session.beginTurn(1);
@@ -2867,7 +2876,7 @@ test "committing a steering draft empties the source" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
     defer session.deinit();
 
     var editor = ui.Editor.init(gpa);
@@ -2889,7 +2898,7 @@ test "steering counts, then a consumed event shows it and clears the count" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
     defer session.deinit();
     session.beginTurn(1);
 
@@ -2925,7 +2934,7 @@ test "cancelReceipt drops the committed prefix and restores the uncommitted suff
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
     defer session.deinit();
     session.beginTurn(1);
 
@@ -2960,7 +2969,7 @@ test "the steering caption counts a paste without showing its content" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
     defer session.deinit();
     session.beginTurn(1);
 
@@ -2985,7 +2994,7 @@ test "a pick that reopens its own step leaves the trail depth unchanged" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
     defer session.deinit();
 
     const account_step = struct {
@@ -3080,7 +3089,7 @@ test "a picked line replaces the draft in the editor" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
     defer session.deinit();
 
     try session.editor.insert("stale text");
@@ -3096,7 +3105,7 @@ test "opening a picker over a turn releases its retained prompt" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
     defer session.deinit();
     session.beginTurn(1);
 
@@ -3128,7 +3137,7 @@ test "activity ticks repaint each separator step" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
     defer session.deinit();
 
     session.beginTurn(1);
@@ -3159,7 +3168,7 @@ test "an edit restarts the caret blink of a running turn" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
     defer session.deinit();
 
     session.beginTurn(1);
@@ -3184,7 +3193,7 @@ test "a running turn hides and shows the hardware cursor of the input" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
     defer session.deinit();
 
     session.beginTurn(1);
@@ -3212,7 +3221,7 @@ test "accepted turn progress restarts separator growth without resetting motion"
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
     defer session.deinit();
 
     session.beginTurn(7);
@@ -3232,7 +3241,7 @@ test "a failure with nothing committed rewinds the tail and returns the prompt" 
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
     defer session.deinit();
     session.beginTurn(1);
 
@@ -3267,7 +3276,7 @@ test "a failure after a committed round keeps it and restores only steering" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
     defer session.deinit();
     session.beginTurn(1);
 
@@ -3328,7 +3337,7 @@ test "a cancel with nothing committed rewinds the tail and returns the prompt" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
     defer session.deinit();
     session.beginTurn(1);
 
@@ -3365,7 +3374,7 @@ test "a cancel with a committed round keeps it and drops the in-flight tail" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
     defer session.deinit();
     session.beginTurn(1);
 
@@ -3420,7 +3429,7 @@ test "a cancel during a tool call keeps the call and shows it as failed" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
     defer session.deinit();
     session.beginTurn(1);
 
@@ -3475,7 +3484,7 @@ test "running tool calls fail oldest first" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
     defer session.deinit();
     session.beginTurn(1);
 
@@ -3524,7 +3533,7 @@ test "a finished tool block survives a cancel in the same round" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
     defer session.deinit();
     session.beginTurn(1);
 
@@ -3564,7 +3573,7 @@ test "a finished tool block survives a failure in the same round" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
     defer session.deinit();
     session.beginTurn(1);
 
@@ -3605,7 +3614,7 @@ test "a final commit frontier keeps an open reply when no later event carries it
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
     defer session.deinit();
     session.beginTurn(1);
 
@@ -3635,7 +3644,7 @@ test "a partial cancel removes consumed steering beyond the commit frontier" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
     defer session.deinit();
     session.beginTurn(1);
 
@@ -3693,7 +3702,7 @@ test "a delivered skill shows as a head line, not as a user box" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
     defer session.deinit();
     session.display_roots = .{ .working_directory = "/work", .home_directory = "/home/you" };
     session.beginTurn(1);
@@ -3724,7 +3733,7 @@ test "a normal completion frees the retained prompt" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
     defer session.deinit();
     session.beginTurn(1);
 
@@ -3744,7 +3753,7 @@ test "a running command reports its run time against its timeout" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
     defer session.deinit();
     session.bash_timeout_ms = 120_000;
     session.beginTurn(1);
@@ -3770,7 +3779,7 @@ test "a running search reports its run time against its timeout" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
     defer session.deinit();
     // A search holds its own timeout, so the configured command timeout cannot
     // reach this row.
@@ -3798,7 +3807,7 @@ test "a command that names its own timeout reports it" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
     defer session.deinit();
     session.bash_timeout_ms = 120_000;
     session.beginTurn(1);
@@ -3817,7 +3826,7 @@ test "a tool without a timeout keeps one row" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
     defer session.deinit();
     session.beginTurn(1);
 
@@ -3837,7 +3846,7 @@ test "an absurd timeout still paints its row" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
     defer session.deinit();
     session.beginTurn(1);
 
@@ -3861,7 +3870,7 @@ test "an absurd configured timeout still paints its row" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
     defer session.deinit();
     session.bash_timeout_ms = std.math.maxInt(u64);
     session.beginTurn(1);
@@ -3880,7 +3889,7 @@ test "a command that asks for no limit reports the smallest one" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
     defer session.deinit();
     session.beginTurn(1);
 
@@ -3905,7 +3914,7 @@ test "an unnamed fragment does not count against a stale row" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
     defer session.deinit();
     session.beginTurn(1);
 
@@ -3933,7 +3942,7 @@ test "a stale row that its reply never committed goes with that reply" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
     defer session.deinit();
     session.beginTurn(1);
 
@@ -3962,7 +3971,7 @@ test "a committed call with no streamed row leaves its sibling's row alone" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var session: Session = Session.init(gpa, &out.writer, test_model, .none);
+    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
     defer session.deinit();
     session.beginTurn(1);
 
@@ -4029,9 +4038,9 @@ test "an account switch hides the reasoning of the other account" {
 }
 
 // The account is not the only dimension of the projection. Anthropic drops every
-// thinking block unless the request names an effort, so an effort level that names
-// none takes the reasoning out of the request and off the screen.
-test "an effort level that replays no reasoning hides it" {
+// thinking block unless the request names an effort, so a model that takes no
+// level takes the reasoning out of the request and off the screen.
+test "a model that replays no reasoning hides it" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
@@ -4047,7 +4056,7 @@ test "an effort level that replays no reasoning hides it" {
     try expectPainted(gpa, out.written(), "weigh it");
 
     const silent_start = out.written().len;
-    session.showSetup(.anthropic_subscription, test_model, .none);
+    session.showSetup(.anthropic_subscription, test_model_closed, replaying_effort);
     try std.testing.expect(session.view.force_reset);
     try session.paint(.{ .columns = 80, .rows = 24 });
     const silent = try terminal.View.plainText(gpa, out.written()[silent_start..]);
@@ -4058,7 +4067,7 @@ test "an effort level that replays no reasoning hides it" {
     const reasoning = &session.transcript.blocks()[0];
     try std.testing.expectEqual(@as(usize, 0), reasoning.cache.lines.count());
 
-    // The level returns the block, because the proof stayed in the record.
+    // The model returns the block, because the proof stayed in the record.
     const restored_start = out.written().len;
     session.showSetup(.anthropic_subscription, test_model, .low);
     try std.testing.expect(session.view.force_reset);
@@ -4083,7 +4092,7 @@ test "a setup change that hides no block keeps the scrollback" {
     try finishTurn(&session, 0);
     try session.paint(.{ .columns = 80, .rows = 24 });
 
-    session.showSetup(.openai_api, test_model_openai, .none);
+    session.showSetup(.openai_api, test_model_openai, .low);
     try std.testing.expect(!session.view.force_reset);
     try std.testing.expect(session.dirty);
 
@@ -4094,7 +4103,7 @@ test "a setup change that hides no block keeps the scrollback" {
     try finishTurn(&session, 0);
     try session.paint(.{ .columns = 80, .rows = 24 });
     const other_openai = ai.testing.model("gpt-5.6-luna");
-    session.showSetup(.openai_api, other_openai, .none);
+    session.showSetup(.openai_api, other_openai, .low);
     try std.testing.expect(!session.view.force_reset);
     // The block stays on the screen, so the paint of the new setup rewrites no
     // row of it. Its projection is what the next frame shows.

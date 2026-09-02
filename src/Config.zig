@@ -358,8 +358,8 @@ fn maybeDefaultText(comptime field: std.builtin.Type.StructField) ?[]const u8 {
     const value = @as(*const field.type, @ptrCast(@alignCast(pointer))).*;
     return switch (@typeInfo(field.type)) {
         .int, .float => std.fmt.comptimePrint("{d}", .{value}),
-        // "unset", never "none": `none` is itself a legal effort level, so that
-        // word reads as a value rather than as the absence of one.
+        // "unset", never "none": a provider spells a reasoning level `none`, so
+        // that word reads as a value rather than as the absence of one.
         .optional => if (value == null) "unset" else @compileError("expected a null default"),
         .pointer => if (value.len == 0) "empty" else @compileError("expected an empty default"),
         else => @compileError("the config field " ++ field.name ++ " has no printable default"),
@@ -1354,7 +1354,7 @@ test "the config document names the file and its own example loads clean" {
     try std.testing.expect(std.mem.indexOf(u8, text, "`bash.timeout_ms`") != null);
     // The effort enum feeds the document, so a new level cannot go missing from
     // it. The document names no model, because Drinky compiles none in.
-    try std.testing.expect(std.mem.indexOf(u8, text, "none, minimal, low") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "low, medium, high, xhigh, max") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "This file names no model") != null);
     try std.testing.expect(std.mem.indexOf(
         u8,
@@ -1362,8 +1362,9 @@ test "the config document names the file and its own example loads clean" {
         "`user_instructions[].path` — string, required.",
     ) != null);
 
-    // An unset key reads as "unset", never as "none". The word `none` is itself
-    // an effort level, so it reads as a value rather than as no value.
+    // An unset key reads as "unset", never as "none". A provider spells a
+    // reasoning level `none`, so that word reads as a value rather than as no
+    // value.
     try std.testing.expect(std.mem.indexOf(u8, text, "`default_effort` — string, " ++
         "default: unset.") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "default: none") == null);

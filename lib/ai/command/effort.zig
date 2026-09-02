@@ -7,11 +7,14 @@
 //!
 //! The model resolves the intention when a request goes out. A model that names
 //! no such level folds it onto the nearest level it names, and a model that
-//! takes no level drops it. Every resolution is silent.
+//! takes no level drops it. The request resolves in silence, and the picker
+//! marks the resolution of each level under the active model, so the fold is
+//! visible before the choice.
 
 const std = @import("std");
 
 const llm = @import("../llm.zig");
+const Model = @import("../Model.zig");
 const model_testing = @import("../testing.zig");
 const Context = @import("Context.zig");
 const testing = @import("testing.zig");
@@ -22,12 +25,21 @@ pub const summary = "set the reasoning-effort level";
 /// The whole ladder, in order.
 const ladder = std.enums.values(llm.Effort);
 
+/// The mark of a level that the model does not name. The request then carries
+/// the nearest level the model names, and the mark states that level.
+const fold_mark = " · Folds to ";
+
+/// The mark of a level that the model drops. The request then carries no
+/// reasoning control.
+const drop_mark = " · Dropped";
+
 pub fn run(context: *Context) !Context.Outcome {
     var options: Context.Outcome.Options = .{ .gpa = context.gpa };
     errdefer options.deinit();
     var current: ?usize = null;
+    const maybe_model: ?*const Model = if (context.agent.model) |*model| model else null;
     for (ladder, 0..) |level, index| {
-        try options.print("{s}", .{@tagName(level)});
+        try printRow(&options, maybe_model, level);
         if (level == context.agent.effort) current = index;
     }
     return .{ .pick = .{
@@ -37,6 +49,26 @@ pub fn run(context: *Context) !Context.Outcome {
         .options = try options.toOwnedSlice(),
         .current = current,
     } };
+}
+
+/// Write the picker row of `level`. The row carries the mark of the resolution
+/// that a request under the model renders, unless that resolution is the level
+/// itself. Without a model nothing resolves the level, so the row holds the
+/// level alone.
+fn printRow(
+    options: *Context.Outcome.Options,
+    maybe_model: ?*const Model,
+    level: llm.Effort,
+) !void {
+    const tag = @tagName(level);
+    const model = maybe_model orelse return options.print("{s}", .{tag});
+    return switch (model.reasoning(level)) {
+        .named => |found| if (found == level)
+            options.print("{s}", .{tag})
+        else
+            options.print("{s}" ++ fold_mark ++ "{s}", .{ tag, @tagName(found) }),
+        .omitted => options.print("{s}" ++ drop_mark, .{tag}),
+    };
 }
 
 pub fn select(context: *Context, index: usize) !Context.Outcome {
@@ -91,13 +123,38 @@ test "the picker lists every level, preselecting the current one" {
             try std.testing.expect(pick.select == &select);
             try std.testing.expectEqualStrings("Effort", pick.title);
             try std.testing.expectEqual(ladder.len, pick.options.len);
-            try std.testing.expectEqualStrings("none", pick.options[0]);
-            try std.testing.expectEqualStrings("minimal", pick.options[1]);
-            try std.testing.expectEqualStrings("ultra", pick.options[ladder.len - 1]);
+            try std.testing.expectEqualStrings("low", pick.options[0]);
+            try std.testing.expectEqualStrings("max", pick.options[ladder.len - 1]);
             try std.testing.expectEqualStrings("high", pick.options[pick.current.?]);
         },
         else => return error.ExpectedPick,
     }
+}
+
+// The mark states what the request carries for each level, so the user sees the
+// fold before the choice. A tie folds to the lower level.
+test "the picker marks a level that the model folds" {
+    const gpa = std.testing.allocator;
+    var agent = testing.agent(gpa, .{ .anthropic_subscription = undefined });
+    defer agent.deinit();
+    var model = model_testing.model("subset");
+    model.efforts = .initEmpty();
+    model.addEffort(.low);
+    model.addEffort(.max);
+    agent.model = model;
+    var context = contextForTest(&agent);
+
+    const rows = try expectRows(try run(&context));
+    defer freeRows(rows);
+    const expected = [_][]const u8{
+        "low",
+        "medium · Folds to low",
+        "high · Folds to low",
+        "xhigh · Folds to max",
+        "max",
+    };
+    try std.testing.expectEqual(expected.len, rows.len);
+    for (expected, rows) |want, row| try std.testing.expectEqualStrings(want, row);
 }
 
 // The level is a wish of the user, so a model that names fewer levels narrows
@@ -110,7 +167,6 @@ test "a model that names fewer levels still offers every level" {
     model.efforts = .initEmpty();
     model.addEffort(.low);
     model.addEffort(.max);
-    model.thinking = .mandatory;
     agent.model = model;
     var context = contextForTest(&agent);
 
@@ -118,15 +174,10 @@ test "a model that names fewer levels still offers every level" {
     defer freeRows(rows);
     try std.testing.expectEqual(ladder.len, rows.len);
 
-    // The rows are the ladder, so index 7 is ultra, which folds down to max.
-    try Context.Outcome.expectEvent(try select(&context, 7), .information);
-    try std.testing.expectEqual(llm.Effort.ultra, agent.effort);
+    // The rows are the ladder, so index 3 is xhigh, which folds up to max.
+    try Context.Outcome.expectEvent(try select(&context, 3), .information);
+    try std.testing.expectEqual(llm.Effort.xhigh, agent.effort);
     try std.testing.expectEqual(llm.Effort.max, agent.model.?.reasoning(agent.effort).named);
-
-    // The reasoning of this model cannot stop, so `none` drops silently.
-    try Context.Outcome.expectEvent(try select(&context, 0), .information);
-    try std.testing.expectEqual(llm.Effort.none, agent.effort);
-    try std.testing.expect(agent.model.?.reasoning(agent.effort) == .omitted);
 }
 
 test "a model that names no level keeps every row" {
@@ -139,8 +190,13 @@ test "a model that names no level keeps every row" {
     const rows = try expectRows(try run(&context));
     defer freeRows(rows);
     try std.testing.expectEqual(ladder.len, rows.len);
+    // The model takes no level, so every row states that the request drops it.
+    for (ladder, rows) |level, row| {
+        try std.testing.expect(std.mem.startsWith(u8, row, @tagName(level)));
+        try std.testing.expect(std.mem.endsWith(u8, row, " · Dropped"));
+    }
 
-    try Context.Outcome.expectEvent(try select(&context, 6), .information);
+    try Context.Outcome.expectEvent(try select(&context, 4), .information);
     try std.testing.expectEqual(llm.Effort.max, agent.effort);
     // The model takes no level, so the request carries no reasoning control.
     try std.testing.expect(agent.model.?.reasoning(agent.effort) == .omitted);
@@ -160,8 +216,8 @@ test "the picker stands while no account is active" {
     defer freeRows(rows);
     try std.testing.expectEqual(ladder.len, rows.len);
 
-    try Context.Outcome.expectEvent(try select(&context, 7), .information);
-    try std.testing.expectEqual(llm.Effort.ultra, agent.effort);
+    try Context.Outcome.expectEvent(try select(&context, 4), .information);
+    try std.testing.expectEqual(llm.Effort.max, agent.effort);
 }
 
 // A session reaches a model list only after a fetch, and the intention holds
@@ -176,9 +232,11 @@ test "the picker stands while the account offers no model" {
     const rows = try expectRows(try run(&context));
     defer freeRows(rows);
     try std.testing.expectEqual(ladder.len, rows.len);
+    // No model resolves the level, so no row carries a mark.
+    for (ladder, rows) |level, row| try std.testing.expectEqualStrings(@tagName(level), row);
 
-    try Context.Outcome.expectEvent(try select(&context, 2), .information);
-    try std.testing.expectEqual(llm.Effort.low, agent.effort);
+    try Context.Outcome.expectEvent(try select(&context, 1), .information);
+    try std.testing.expectEqual(llm.Effort.medium, agent.effort);
 }
 
 test "select applies the level at a row index, rejecting out of range" {
@@ -187,11 +245,11 @@ test "select applies the level at a row index, rejecting out of range" {
     defer agent.deinit();
     var context = contextForTest(&agent);
 
-    // The rows are the ladder, so row 5 is xhigh.
-    try Context.Outcome.expectEvent(try select(&context, 5), .information);
+    // The rows are the ladder, so row 3 is xhigh.
+    try Context.Outcome.expectEvent(try select(&context, 3), .information);
     try std.testing.expectEqual(llm.Effort.xhigh, agent.effort);
 
-    try Context.Outcome.expectNotice(try select(&context, 5), .information);
+    try Context.Outcome.expectNotice(try select(&context, 3), .information);
     try Context.Outcome.expectNotice(try select(&context, ladder.len), .failure);
     try std.testing.expectEqual(llm.Effort.xhigh, agent.effort);
 }
