@@ -4,7 +4,8 @@ A dependency-free coding agent you can own end to end.
 
 Give Drinky a prompt in the terminal. The model can read, search, and change files or run commands
 in the working directory. Drinky talks to Anthropic and OpenAI, through a subscription login, an
-Anthropic Console login, or an API key.
+Anthropic Console login, or an API key, and to Gemini on Google Vertex AI through a service account
+key file.
 
 ## Philosophy
 
@@ -44,7 +45,9 @@ zig build -Doptimize=ReleaseSafe
 
 Run `/login` to sign in with a subscription account or an Anthropic Console account. The Console
 login mints an API key in the browser and stores it, so no environment variable is needed. You can
-also set `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` by hand.
+also set `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` by hand. For Gemini on Google Vertex AI, set
+`GOOGLE_APPLICATION_CREDENTIALS` to a service account key file and `GOOGLE_CLOUD_LOCATION` to `eu`,
+`us`, or `global`. Drinky serves Gemini 3 and later.
 
 Inside a [Herdr](https://herdr.dev) pane, Drinky reports its state over the Herdr socket, so Herdr
 can notify you when a turn ends or fails. The status line leaves the directory and the branch to the

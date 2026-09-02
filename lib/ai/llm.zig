@@ -25,23 +25,29 @@ pub const Account = enum {
     openai_subscription,
     /// Per-token platform API, authorized with a `Bearer` key.
     openai_api,
+    /// Gemini models on Vertex AI, authorized with an access token that Drinky
+    /// mints from a service account key file. It goes last, so the startup
+    /// order prefers every other account.
+    google_vertex,
 
     /// Whether this account signs in through an interactive OAuth login (as
-    /// opposed to an environment API key). Such an account can be logged in and
-    /// out mid-session. The Console account signs in this way even though it
+    /// opposed to an environment credential). Such an account can be logged in
+    /// and out mid-session. The Console account signs in this way even though it
     /// then authorizes with a minted `x-api-key` key.
     pub fn hasLogin(self: Account) bool {
         return switch (self) {
             .anthropic_subscription, .openai_subscription, .anthropic_console => true,
-            .anthropic_api, .openai_api => false,
+            .anthropic_api, .openai_api, .google_vertex => false,
         };
     }
 
-    /// Whether this account uses a refresh credential for provider requests.
+    /// Whether this account uses a refresh credential for provider requests. The
+    /// Vertex account renews its token once, but a rejected token is a
+    /// configuration problem of the user and not a rotated credential.
     pub fn hasRefreshCredential(self: Account) bool {
         return switch (self) {
             .anthropic_subscription, .openai_subscription => true,
-            .anthropic_console, .anthropic_api, .openai_api => false,
+            .anthropic_console, .anthropic_api, .openai_api, .google_vertex => false,
         };
     }
 
@@ -53,16 +59,28 @@ pub const Account = enum {
             .anthropic_api => "Anthropic API",
             .openai_subscription => "OpenAI Subscription",
             .openai_api => "OpenAI API",
+            .google_vertex => "Google Vertex",
         };
     }
 
-    /// The environment variable that supplies an API account's key, or null for a
-    /// subscription (whose credential comes from an interactive login, not the
-    /// environment).
-    pub fn apiKeyEnv(self: Account) ?[]const u8 {
+    /// The kind of credential that an account without a login holds, as a
+    /// picker names it, or null for an account with a login.
+    pub fn credentialLabel(self: Account) ?[]const u8 {
+        return switch (self) {
+            .anthropic_api, .openai_api => "API key",
+            .google_vertex => "Key file",
+            .anthropic_subscription, .openai_subscription, .anthropic_console => null,
+        };
+    }
+
+    /// The environment variables that supply the credential of an account
+    /// without a login, or null for a subscription (whose credential comes from
+    /// an interactive login, not the environment).
+    pub fn credentialEnv(self: Account) ?[]const u8 {
         return switch (self) {
             .anthropic_api => "ANTHROPIC_API_KEY",
             .openai_api => "OPENAI_API_KEY",
+            .google_vertex => "GOOGLE_APPLICATION_CREDENTIALS and GOOGLE_CLOUD_LOCATION",
             .anthropic_subscription, .openai_subscription, .anthropic_console => null,
         };
     }
@@ -72,6 +90,7 @@ pub const Account = enum {
         return switch (self) {
             .anthropic_api, .anthropic_subscription, .anthropic_console => .anthropic,
             .openai_api, .openai_subscription => .openai,
+            .google_vertex => .google,
         };
     }
 };
@@ -84,6 +103,7 @@ pub const Account = enum {
 pub const Provider = enum {
     anthropic,
     openai,
+    google,
 
     /// The human-readable label, e.g. "Anthropic". Every account label of the
     /// vendor starts with it.
@@ -91,6 +111,7 @@ pub const Provider = enum {
         return switch (self) {
             .anthropic => "Anthropic",
             .openai => "OpenAI",
+            .google => "Google",
         };
     }
 };
@@ -143,6 +164,9 @@ pub const Item = union(enum) {
             anthropic_api: Anthropic,
             openai_subscription: OpenAi,
             openai_api: OpenAi,
+            /// The `thoughtSignature` of one part. The text stays empty, because
+            /// no wire needs the thought text back.
+            google_vertex: Signature,
 
             pub fn dupe(
                 self: *const Replay,
@@ -153,23 +177,16 @@ pub const Item = union(enum) {
                     .anthropic_api,
                     .anthropic_console,
                     => |proof, tag| switch (proof) {
-                        .signature => |signature| signature: {
-                            const text_copy = try gpa.dupe(u8, signature.text);
-                            errdefer gpa.free(text_copy);
-                            const proof_copy = try gpa.dupe(u8, signature.signature);
-                            break :signature @unionInit(Replay, @tagName(tag), .{
-                                .signature = .{
-                                    .text = text_copy,
-                                    .signature = proof_copy,
-                                },
-                            });
-                        },
+                        .signature => |signature| @unionInit(Replay, @tagName(tag), .{
+                            .signature = try signature.dupe(gpa),
+                        }),
                         .redacted => |data| @unionInit(
                             Replay,
                             @tagName(tag),
                             .{ .redacted = try gpa.dupe(u8, data) },
                         ),
                     },
+                    .google_vertex => |signature| .{ .google_vertex = try signature.dupe(gpa) },
                     inline .openai_subscription, .openai_api => |proof, tag| openai: {
                         const text_copy = try gpa.dupe(u8, proof.text);
                         errdefer gpa.free(text_copy);
@@ -191,10 +208,7 @@ pub const Item = union(enum) {
                     .anthropic_api,
                     .anthropic_console,
                     => |proof| switch (proof) {
-                        .signature => |signature| {
-                            gpa.free(signature.text);
-                            gpa.free(signature.signature);
-                        },
+                        .signature => |signature| signature.deinit(gpa),
                         .redacted => |data| gpa.free(data),
                     },
                     inline .openai_subscription, .openai_api => |proof| {
@@ -202,6 +216,7 @@ pub const Item = union(enum) {
                         gpa.free(proof.id);
                         gpa.free(proof.encrypted_content);
                     },
+                    .google_vertex => |signature| signature.deinit(gpa),
                 }
             }
         };
@@ -214,6 +229,17 @@ pub const Item = union(enum) {
         pub const Signature = struct {
             text: []const u8,
             signature: []const u8,
+
+            pub fn dupe(self: *const Signature, gpa: std.mem.Allocator) !Signature {
+                const text_copy = try gpa.dupe(u8, self.text);
+                errdefer gpa.free(text_copy);
+                return .{ .text = text_copy, .signature = try gpa.dupe(u8, self.signature) };
+            }
+
+            pub fn deinit(self: *const Signature, gpa: std.mem.Allocator) void {
+                gpa.free(self.text);
+                gpa.free(self.signature);
+            }
         };
 
         pub const OpenAi = struct {
@@ -280,12 +306,13 @@ pub const Request = struct {
         /// Whether a request that renders this control replays the stored
         /// reasoning of `vendor`. Anthropic drops every thinking block unless
         /// the request names a level. OpenAI replays an encrypted item at every
-        /// level. The gauges and the serializers read this one rule, so they
-        /// cannot drift apart.
+        /// level. Gemini validates the signature of every function call, so a
+        /// request replays them whatever the control names. The gauges and the
+        /// serializers read this one rule, so they cannot drift apart.
         pub fn replaysReasoning(self: Reasoning, vendor: Provider) bool {
             return switch (vendor) {
                 .anthropic => self == .named,
-                .openai => true,
+                .openai, .google => true,
             };
         }
 
@@ -415,6 +442,13 @@ pub const Event = union(enum) {
                         null,
                     .signature, .redacted => null,
                 },
+                .google_vertex => switch (self.*) {
+                    .signature => |signature| if (signature.signature.len != 0)
+                        .{ .google_vertex = signature }
+                    else
+                        null,
+                    .redacted, .encrypted => null,
+                },
             };
         }
 
@@ -492,6 +526,27 @@ test "reasoning proofs bind only to compatible exact accounts" {
         "secret",
         redacted.replay(.anthropic_subscription).?.anthropic_subscription.redacted,
     );
+
+    // The Vertex account takes a signature alone, and only one with bytes.
+    const google_replay = signature.replay(.google_vertex).?;
+    try std.testing.expectEqualStrings("sig", google_replay.google_vertex.signature);
+    try std.testing.expect(redacted.replay(.google_vertex) == null);
+    try std.testing.expect(encrypted.replay(.google_vertex) == null);
+    const unsigned: Event.Reasoning = .{ .signature = .{ .text = "hmm", .signature = "" } };
+    try std.testing.expect(unsigned.replay(.google_vertex) == null);
+    try std.testing.expect(unsigned.replay(.anthropic_api) == null);
+}
+
+test "a replay copies and frees every arm" {
+    const gpa = std.testing.allocator;
+    const google: Item.Reasoning.Replay = .{
+        .google_vertex = .{ .text = "think", .signature = "sig" },
+    };
+    const copy = try google.dupe(gpa);
+    defer copy.deinit(gpa);
+    try std.testing.expectEqualStrings("think", copy.google_vertex.text);
+    try std.testing.expectEqualStrings("sig", copy.google_vertex.signature);
+    try std.testing.expect(copy.google_vertex.signature.ptr != google.google_vertex.signature.ptr);
 }
 
 test "a provider label prefixes the label of each of its accounts" {
@@ -501,6 +556,7 @@ test "a provider label prefixes the label of each of its accounts" {
     }
     try std.testing.expectEqualStrings("Anthropic", Provider.anthropic.label());
     try std.testing.expectEqualStrings("OpenAI", Provider.openai.label());
+    try std.testing.expectEqualStrings("Google", Provider.google.label());
 }
 
 test "Account.provider maps each account to its vendor" {
@@ -509,6 +565,7 @@ test "Account.provider maps each account to its vendor" {
     try std.testing.expectEqual(Provider.openai, Account.openai_api.provider());
     try std.testing.expectEqual(Provider.openai, Account.openai_subscription.provider());
     try std.testing.expectEqual(Provider.anthropic, Account.anthropic_console.provider());
+    try std.testing.expectEqual(Provider.google, Account.google_vertex.provider());
 }
 
 test "account credential flags and label" {
@@ -517,11 +574,13 @@ test "account credential flags and label" {
     try std.testing.expect(Account.anthropic_console.hasLogin());
     try std.testing.expect(!Account.anthropic_api.hasLogin());
     try std.testing.expect(!Account.openai_api.hasLogin());
+    try std.testing.expect(!Account.google_vertex.hasLogin());
     try std.testing.expect(Account.anthropic_subscription.hasRefreshCredential());
     try std.testing.expect(Account.openai_subscription.hasRefreshCredential());
     try std.testing.expect(!Account.anthropic_console.hasRefreshCredential());
     try std.testing.expect(!Account.anthropic_api.hasRefreshCredential());
     try std.testing.expect(!Account.openai_api.hasRefreshCredential());
+    try std.testing.expect(!Account.google_vertex.hasRefreshCredential());
     try std.testing.expectEqualStrings(
         "Anthropic Subscription",
         Account.anthropic_subscription.label(),
@@ -529,9 +588,22 @@ test "account credential flags and label" {
     try std.testing.expectEqualStrings("Anthropic Console", Account.anthropic_console.label());
     try std.testing.expectEqualStrings("Anthropic API", Account.anthropic_api.label());
     try std.testing.expectEqualStrings("OpenAI Subscription", Account.openai_subscription.label());
-    try std.testing.expectEqualStrings("ANTHROPIC_API_KEY", Account.anthropic_api.apiKeyEnv().?);
-    try std.testing.expectEqualStrings("OPENAI_API_KEY", Account.openai_api.apiKeyEnv().?);
-    try std.testing.expect(Account.anthropic_console.apiKeyEnv() == null);
+    try std.testing.expectEqualStrings("Google Vertex", Account.google_vertex.label());
+    try std.testing.expectEqualStrings("ANTHROPIC_API_KEY", Account.anthropic_api.credentialEnv().?);
+    try std.testing.expectEqualStrings("OPENAI_API_KEY", Account.openai_api.credentialEnv().?);
+    try std.testing.expectEqualStrings(
+        "GOOGLE_APPLICATION_CREDENTIALS and GOOGLE_CLOUD_LOCATION",
+        Account.google_vertex.credentialEnv().?,
+    );
+    try std.testing.expect(Account.anthropic_console.credentialEnv() == null);
+    // An account names a credential kind exactly when it names a variable.
+    for (std.enums.values(Account)) |account|
+        try std.testing.expectEqual(account.credentialEnv() == null, account.credentialLabel() == null);
+    try std.testing.expectEqualStrings("API key", Account.openai_api.credentialLabel().?);
+    try std.testing.expectEqualStrings("Key file", Account.google_vertex.credentialLabel().?);
+    // The Vertex account goes last, so the startup order prefers every other one.
+    const accounts = std.enums.values(Account);
+    try std.testing.expectEqual(Account.google_vertex, accounts[accounts.len - 1]);
 }
 
 test "a rejection a retry cannot clear outranks one it can" {

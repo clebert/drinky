@@ -8,6 +8,7 @@
 const std = @import("std");
 
 const anthropic = @import("anthropic/root.zig");
+const google = @import("google/root.zig");
 const llm = @import("llm.zig");
 const net = @import("net.zig");
 const openai = @import("openai/root.zig");
@@ -17,14 +18,16 @@ const codex_url = "https://chatgpt.com/backend-api/codex/responses";
 
 /// What a client needs to authenticate, tagged by the account it belongs to. A
 /// subscription account holds an OAuth `Auth` (owned by the caller, refreshed on
-/// demand). An API account holds a bare key (owned by the caller). The active tag
-/// picks the account, so `Client.init` needs no separate selector.
+/// demand). An API account holds a bare key (owned by the caller). The Vertex
+/// account holds the `Auth` that mints its token from the key file. The active
+/// tag picks the account, so `Client.init` needs no separate selector.
 pub const Credentials = union(llm.Account) {
     anthropic_subscription: *anthropic.Auth,
     anthropic_console: []const u8,
     anthropic_api: []const u8,
     openai_subscription: *openai.Auth,
     openai_api: []const u8,
+    google_vertex: *google.Auth,
 };
 
 pub const Client = struct {
@@ -51,12 +54,16 @@ pub const Client = struct {
     /// report whether the credential changed. A caller repeats a request only
     /// on a true result, because an unchanged credential fails the same way.
     ///
-    /// Only a subscription account can renew itself. An API key comes from the
-    /// environment, and the Console key is minted once at login. Neither one
-    /// rotates, so Drinky has nothing to take in their place.
+    /// An OAuth account and the Vertex account can renew themselves: the one
+    /// refreshes its token, the other mints a new one from its key. An API key
+    /// comes from the environment, and the Console key is minted once at login.
+    /// Neither one rotates, so Drinky has nothing to take in their place.
     pub fn renewCredential(self: *Client) !bool {
         return switch (self.credentials) {
-            inline .anthropic_subscription, .openai_subscription => |credential| credential.renew(),
+            inline .anthropic_subscription,
+            .openai_subscription,
+            .google_vertex,
+            => |credential| credential.renew(),
             .anthropic_console, .anthropic_api, .openai_api => false,
         };
     }
@@ -102,6 +109,26 @@ pub const Client = struct {
                     .access_token = token,
                 });
             },
+            .google_vertex => |credential| {
+                const token = try credential.accessToken();
+                const body = try google.wire.serialize(self.gpa, request);
+                defer self.gpa.free(body);
+                // The model names the endpoint, so the URL is built per request.
+                const endpoint = try google.Transport.url(self.gpa, &.{
+                    .project = credential.project,
+                    .location = credential.location,
+                    .model = request.model,
+                });
+                defer self.gpa.free(endpoint);
+                out.* = .{ .google_vertex = undefined };
+                var transport: google.Transport = .{
+                    .gpa = self.gpa,
+                    .io = self.io,
+                    .timeouts = self.timeouts,
+                    .endpoint = endpoint,
+                };
+                try transport.send(&out.google_vertex, &.{ .body = body, .access_token = token });
+            },
         }
     }
 };
@@ -115,6 +142,7 @@ pub const Stream = union(llm.Account) {
     anthropic_api: anthropic.Transport.Stream,
     openai_subscription: openai.Transport.Stream,
     openai_api: openai.Transport.Stream,
+    google_vertex: google.Transport.Stream,
 
     pub fn deinit(self: *Stream) void {
         switch (self.*) {
@@ -204,11 +232,14 @@ test "init selects the arm matching the credentials" {
     try std.testing.expectEqual(llm.Account.openai_api, openai_key.account());
     const codex = Client.init(gpa, std.testing.io, .{ .openai_subscription = undefined }, .{});
     try std.testing.expectEqual(llm.Account.openai_subscription, codex.account());
+    const vertex = Client.init(gpa, std.testing.io, .{ .google_vertex = undefined }, .{});
+    try std.testing.expectEqual(llm.Account.google_vertex, vertex.account());
 }
 
-// A key account holds one fixed secret, so a rejected request stands. Only an
-// OAuth account can take another token, and one without a credential takes none.
-test "only an OAuth account renews its credential" {
+// A key account holds one fixed secret, so a rejected request stands. An OAuth
+// account and the Vertex account can take another token, and an OAuth account
+// without a credential takes none.
+test "an OAuth account and the Vertex account renew, a key account does not" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     for ([_]Credentials{

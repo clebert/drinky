@@ -19,7 +19,7 @@ const system_header = "You are Claude Code, Anthropic's official CLI for Claude.
 fn sendsSystemHeader(account: llm.Account) bool {
     return switch (account) {
         .anthropic_subscription, .anthropic_console => true,
-        .anthropic_api, .openai_subscription, .openai_api => false,
+        .anthropic_api, .openai_subscription, .openai_api, .google_vertex => false,
     };
 }
 
@@ -107,18 +107,6 @@ pub fn serialize(gpa: std.mem.Allocator, request: *const llm.Request, account: l
     return out.toOwnedSlice();
 }
 
-/// JSON bytes written through verbatim rather than re-encoded as a quoted
-/// string, so an already-serialized value embeds as itself.
-const RawJson = struct {
-    bytes: []const u8,
-
-    pub fn jsonStringify(self: @This(), stringify: anytype) !void {
-        try stringify.beginWriteRaw();
-        try stringify.writer.writeAll(self.bytes);
-        stringify.endWriteRaw();
-    }
-};
-
 /// A prompt-cache breakpoint: Anthropic caches the request prefix up to and
 /// including the block that carries it (5-minute ephemeral).
 const CacheControl = struct { type: []const u8 = "ephemeral" };
@@ -154,7 +142,7 @@ const ToolUseBlock = struct {
     type: []const u8 = "tool_use",
     id: []const u8,
     name: []const u8,
-    input: RawJson,
+    input: json.Raw,
     cache_control: ?CacheControl = null,
 };
 
@@ -199,7 +187,7 @@ fn emitsBlock(item: llm.Item, emit_thinking: bool, account: llm.Account) bool {
                     .redacted => |data| data.len != 0,
                 };
             },
-            .openai_subscription, .openai_api => false,
+            .openai_subscription, .openai_api, .google_vertex => false,
         },
         else => true,
     };
@@ -292,7 +280,7 @@ fn writeThinking(stringify: *std.json.Stringify, reasoning: *const llm.Item.Reas
             }),
             .redacted => |data| try stringify.write(RedactedThinkingBlock{ .data = data }),
         },
-        .openai_subscription, .openai_api => unreachable,
+        .openai_subscription, .openai_api, .google_vertex => unreachable,
     }
 }
 

@@ -1,7 +1,7 @@
 //! Shared JSON plumbing: the lenient body parse and the lenient
 //! `std.json.Value` accessors for the wire decoders — a malformed body, an
 //! absent value, or a mismatched type reads as null — plus the tool-parameters
-//! JSON-schema writer both provider serializers emit.
+//! JSON-schema writer and the raw-bytes value the provider serializers emit.
 
 const std = @import("std");
 
@@ -55,11 +55,30 @@ pub fn integer(value: ?std.json.Value) ?i64 {
     };
 }
 
+pub fn boolean(value: ?std.json.Value) ?bool {
+    return switch (value orelse return null) {
+        .bool => |found| found,
+        else => null,
+    };
+}
+
 /// A token count: a negative integer clamps to zero.
 pub fn unsigned(value: ?std.json.Value) ?u64 {
     const found = integer(value) orelse return null;
     return if (found < 0) 0 else @intCast(found);
 }
+
+/// JSON bytes written through verbatim rather than re-encoded as a quoted
+/// string, so an already-serialized value embeds as itself.
+pub const Raw = struct {
+    bytes: []const u8,
+
+    pub fn jsonStringify(self: @This(), stringify: anytype) !void {
+        try stringify.beginWriteRaw();
+        try stringify.writer.writeAll(self.bytes);
+        stringify.endWriteRaw();
+    }
+};
 
 /// The `{"type":"object","properties":…,"required":…}` schema for a tool's
 /// parameters.

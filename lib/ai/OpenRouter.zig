@@ -178,6 +178,7 @@ fn decode(value: std.json.Value) ?Entry {
 fn providerOf(vendor: []const u8) ?llm.Provider {
     if (std.mem.eql(u8, vendor, "anthropic")) return .anthropic;
     if (std.mem.eql(u8, vendor, "openai")) return .openai;
+    if (std.mem.eql(u8, vendor, "google")) return .google;
     return null;
 }
 
@@ -281,7 +282,10 @@ const sample =
     \\  { "id": "openai/gpt-5.6-sol:batch", "context_length": 1050000,
     \\    "pricing": { "prompt": "0.000001", "completion": "0.000005" } },
     \\  { "id": "google/gemini-3.7-flash", "context_length": 1048576,
-    \\    "pricing": { "prompt": "0.0000004", "completion": "0.000002" } },
+    \\    "pricing": { "prompt": "0.0000004", "completion": "0.000002" },
+    \\    "reasoning": { "supported_efforts": ["high", "medium", "low", "minimal"] } },
+    \\  { "id": "mistralai/mistral-large", "context_length": 128000,
+    \\    "pricing": { "prompt": "0.000002", "completion": "0.000006" } },
     \\  { "id": "openai/free-one", "pricing": { "prompt": "0", "completion": "0" } }
     \\] }
 ;
@@ -292,8 +296,17 @@ test parse {
 
     // A vendor Drinky does not reach, and a variant that no vendor answers to,
     // both stay out of the subset.
-    try std.testing.expectEqual(@as(usize, 5), metadata.entries.len);
+    try std.testing.expectEqual(@as(usize, 6), metadata.entries.len);
     try std.testing.expect(metadata.lookup(.openai, "gpt-5.6-sol:batch") == null);
+
+    // A Gemini id already reads like the aggregator spelling, so it needs no
+    // normalization, and the vendor is a third one Drinky reaches.
+    const gemini = metadata.lookup(.google, "gemini-3.7-flash").?;
+    try std.testing.expectEqual(@as(?u64, 1_048_576), gemini.context_window);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.4), gemini.price.?.input, 1e-9);
+    try std.testing.expect(gemini.offers(.medium));
+    try std.testing.expect(!gemini.offers(.max));
+    try std.testing.expect(metadata.lookup(.anthropic, "gemini-3.7-flash") == null);
 
     // The vendor id normalizes onto the aggregator spelling.
     const opus = metadata.lookup(.anthropic, "claude-opus-4-8").?;

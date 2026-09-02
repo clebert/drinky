@@ -1,7 +1,7 @@
 //! The provider-neutral agent core: the `Agent` turn loop, the neutral `llm`
 //! wire types, the `Catalog` of discovered models, the `provider` client, the
 //! `command` registry, Agent Skills discovery, the `tool` registry, and the
-//! `anthropic`, `openai`, and `OpenRouter` provider modules.
+//! `anthropic`, `openai`, `google`, and `OpenRouter` provider modules.
 
 const std = @import("std");
 
@@ -14,6 +14,7 @@ pub const json_store = @import("json_store.zig");
 pub const Catalog = @import("Catalog.zig");
 pub const command = @import("command/root.zig");
 pub const format = @import("format.zig");
+pub const google = @import("google/root.zig");
 pub const instructions = @import("instructions.zig");
 pub const llm = @import("llm.zig");
 pub const Model = @import("Model.zig");

@@ -2113,6 +2113,7 @@ fn appendProof(agent: *Agent, account: llm.Account) !void {
                 .{ .text = text, .id = id, .encrypted_content = proof },
             );
         },
+        .google_vertex => .{ .google_vertex = .{ .text = text, .signature = proof } },
     };
     try agent.items.append(gpa, .{ .reasoning = .{ .replay = replay } });
 }

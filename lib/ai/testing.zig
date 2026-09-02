@@ -29,9 +29,9 @@ pub fn bareModel(name: []const u8) Model {
     return Model.init(name) catch unreachable;
 }
 
-/// A registry stubbed to the given API keys, which offers no model until a
+/// A registry stubbed to the given environment, which offers no model until a
 /// `seedAccount` call. It owns no store, so a caller frees only what it seeds.
-pub fn accounts(keys: Accounts.ApiKeys) Accounts {
+pub fn accounts(environment: Accounts.Environment) Accounts {
     return .{
         .gpa = std.testing.allocator,
         .io = std.testing.io,
@@ -39,7 +39,9 @@ pub fn accounts(keys: Accounts.ApiKeys) Accounts {
         .anthropic_auth = undefined,
         .anthropic_console_auth = undefined,
         .openai_auth = undefined,
-        .keys = keys,
+        .google_auth = null,
+        .google_error = null,
+        .environment = environment,
         .anthropic_subscription_ready = false,
         .openai_subscription_ready = false,
         .anthropic_console_ready = false,

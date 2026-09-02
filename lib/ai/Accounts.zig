@@ -1,17 +1,19 @@
 //! The set of configured accounts and their live credentials: the OAuth login
-//! stores and the two environment-sourced API keys. It owns what
-//! a `provider.Client` points into: the `Auth` structs and (by borrow) the key
-//! bytes. A client built here stays valid for the whole session. It reports
-//! which accounts are authenticated and builds a client for one on demand. The
-//! selection is always an explicit account, never inferred from a precedence.
-//! It also owns the model catalog, because a fetch needs the credential of the
-//! account it fetches for. No fetch runs at startup: the user asks for one.
+//! stores, the two environment-sourced API keys, and the Google service account
+//! key file. It owns what a `provider.Client` points into: the `Auth` structs
+//! and (by borrow) the key bytes. A client built here stays valid for the whole
+//! session. It reports which accounts are authenticated and builds a client for
+//! one on demand. The selection is always an explicit account, never inferred
+//! from a precedence. It also owns the model catalog, because a fetch needs the
+//! credential of the account it fetches for. No fetch runs at startup: the user
+//! asks for one.
 
 const std = @import("std");
 
 const anthropic = @import("anthropic/root.zig");
 const auth = @import("auth.zig");
 const Catalog = @import("Catalog.zig");
+const google = @import("google/root.zig");
 const llm = @import("llm.zig");
 const Model = @import("Model.zig");
 const net = @import("net.zig");
@@ -30,7 +32,15 @@ timeouts: net.ProviderTimeouts,
 anthropic_auth: anthropic.Auth,
 anthropic_console_auth: anthropic.ConsoleAuth,
 openai_auth: openai.Auth,
-keys: ApiKeys,
+/// The Vertex credential, or null when the environment names no readable key
+/// file beside a location Drinky serves.
+google_auth: ?google.Auth,
+/// Why the account that both variables name did not load, or null. Startup
+/// reports nothing, because the key path is also the variable of every other
+/// Google client. The login picker names the cause when the user picks the
+/// account.
+google_error: ?anyerror,
+environment: Environment,
 /// Whether each subscription store loaded a credential from `auth.json`.
 anthropic_subscription_ready: bool,
 openai_subscription_ready: bool,
@@ -59,12 +69,16 @@ pub const Refresh = struct {
     metadata_save_error: ?anyerror = null,
 };
 
-/// The per-vendor API keys, each null when its environment variable is unset.
-/// The keys are borrowed for the process lifetime (they point into the
-/// environment), so they are never freed here.
-pub const ApiKeys = struct {
+/// The credentials of the accounts without a login, each null when its
+/// environment variable is unset. The values are borrowed for the process
+/// lifetime (they point into the environment), so they are never freed here.
+pub const Environment = struct {
     anthropic: ?[]const u8 = null,
     openai: ?[]const u8 = null,
+    /// `GOOGLE_APPLICATION_CREDENTIALS`, the path of the service account key file.
+    google_key_path: ?[]const u8 = null,
+    /// `GOOGLE_CLOUD_LOCATION`: `eu`, `us`, or `global`.
+    google_location: ?[]const u8 = null,
 };
 
 /// A committed subscription login's persistence outcome. Both variants mean
@@ -77,15 +91,17 @@ pub const Login = union(enum) {
     },
 };
 
-/// Open the OAuth login stores, load any stored credential, and take the
-/// environment API keys. A malformed `auth.json` surfaces here and is not
-/// silently ignored.
+/// Open the OAuth login stores, load any stored credential, take the
+/// environment API keys, and read the Google key file. A malformed `auth.json`
+/// surfaces here and is not silently ignored. A key file that does not load
+/// leaves the Vertex account absent and records why, because the other accounts
+/// must still serve.
 pub fn init(
     gpa: std.mem.Allocator,
     io: std.Io,
     home: []const u8,
     timeouts: net.ProviderTimeouts,
-    keys: ApiKeys,
+    environment: Environment,
 ) !Accounts {
     var anthropic_auth = try anthropic.Auth.init(gpa, io, home, timeouts.anthropic);
     errdefer anthropic_auth.deinit();
@@ -98,6 +114,20 @@ pub fn init(
     const anthropic_console_ready = try anthropic_console_auth.load();
     const openai_ready = try openai_auth.load();
 
+    var google_auth: ?google.Auth = null;
+    var google_error: ?anyerror = null;
+    if (environment.google_key_path != null and environment.google_location != null) {
+        google_auth = google.Auth.init(gpa, io, timeouts.google, &.{
+            .key_path = environment.google_key_path.?,
+            .location = environment.google_location.?,
+        }) catch |err| failed: {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            google_error = err;
+            break :failed null;
+        };
+    }
+    errdefer if (google_auth) |*vertex| vertex.deinit();
+
     var catalog = try Catalog.init(gpa, io, home);
     errdefer catalog.deinit();
 
@@ -108,7 +138,9 @@ pub fn init(
         .anthropic_auth = anthropic_auth,
         .anthropic_console_auth = anthropic_console_auth,
         .openai_auth = openai_auth,
-        .keys = keys,
+        .google_auth = google_auth,
+        .google_error = google_error,
+        .environment = environment,
         .anthropic_subscription_ready = anthropic_ready,
         .openai_subscription_ready = openai_ready,
         .anthropic_console_ready = anthropic_console_ready,
@@ -121,17 +153,29 @@ pub fn deinit(self: *Accounts) void {
     self.anthropic_auth.deinit();
     self.anthropic_console_auth.deinit();
     self.openai_auth.deinit();
+    if (self.google_auth) |*vertex| vertex.deinit();
 }
 
-/// Whether `account` has a usable credential: an env key for an API account,
-/// or a loaded credential for a login account.
+/// Whether `account` has a usable credential: an env key for an API account, a
+/// loaded key file for the Vertex account, or a loaded credential for a login
+/// account.
 pub fn isAuthenticated(self: *const Accounts, account: llm.Account) bool {
     return switch (account) {
-        .anthropic_api => self.keys.anthropic != null,
+        .anthropic_api => self.environment.anthropic != null,
         .anthropic_subscription => self.anthropic_subscription_ready,
-        .openai_api => self.keys.openai != null,
+        .openai_api => self.environment.openai != null,
         .openai_subscription => self.openai_subscription_ready,
         .anthropic_console => self.anthropic_console_ready,
+        .google_vertex => self.google_auth != null,
+    };
+}
+
+/// Why the environment names `account` and the account still did not load, or
+/// null. Only the Vertex account loads a file at startup, so only it can fail.
+pub fn loadError(self: *const Accounts, account: llm.Account) ?anyerror {
+    return switch (account) {
+        .google_vertex => self.google_error,
+        else => null,
     };
 }
 
@@ -153,18 +197,22 @@ pub fn firstAuthenticated(self: *const Accounts) ?llm.Account {
 /// or null when the account is not authenticated.
 pub fn client(self: *Accounts, account: llm.Account) ?provider.Client {
     const credentials: provider.Credentials = switch (account) {
-        .anthropic_api => .{ .anthropic_api = self.keys.anthropic orelse return null },
+        .anthropic_api => .{ .anthropic_api = self.environment.anthropic orelse return null },
         .anthropic_subscription => if (self.anthropic_subscription_ready)
             .{ .anthropic_subscription = &self.anthropic_auth }
         else
             return null,
-        .openai_api => .{ .openai_api = self.keys.openai orelse return null },
+        .openai_api => .{ .openai_api = self.environment.openai orelse return null },
         .openai_subscription => if (self.openai_subscription_ready)
             .{ .openai_subscription = &self.openai_auth }
         else
             return null,
         .anthropic_console => if (self.anthropic_console_ready)
             .{ .anthropic_console = self.anthropic_console_auth.apiKey() orelse return null }
+        else
+            return null,
+        .google_vertex => if (self.google_auth) |*vertex|
+            .{ .google_vertex = vertex }
         else
             return null,
     };
@@ -286,7 +334,7 @@ fn fetchModels(self: *Accounts, account: llm.Account, deadline: net.Deadline) ![
             self.gpa,
             self.io,
             deadline,
-            .{ .api_key = self.keys.anthropic orelse return error.SignedOut },
+            .{ .api_key = self.environment.anthropic orelse return error.SignedOut },
         ),
         .openai_subscription => openai.models.fetchSubscription(
             self.gpa,
@@ -298,8 +346,17 @@ fn fetchModels(self: *Accounts, account: llm.Account, deadline: net.Deadline) ![
             self.gpa,
             self.io,
             deadline,
-            self.keys.openai orelse return error.SignedOut,
+            self.environment.openai orelse return error.SignedOut,
         ),
+        .google_vertex => if (self.google_auth) |*vertex| google.models.fetch(
+            self.gpa,
+            self.io,
+            deadline,
+            &.{
+                .access_token = try deadline.call(self.io, google.Auth.accessToken, .{vertex}),
+                .location = vertex.location,
+            },
+        ) else error.SignedOut,
     };
 }
 
@@ -308,25 +365,26 @@ fn timeoutsOf(self: *const Accounts, account: llm.Account) net.Timeouts {
     return switch (account.provider()) {
         .anthropic => self.timeouts.anthropic,
         .openai => self.timeouts.openai,
+        .google => self.timeouts.google,
     };
 }
 
 /// The loopback port of the OAuth redirect listener for `account`, or null
-/// for an API account, which has no browser login. A pasted callback URL
-/// replays to this port.
+/// for an account without a browser login. A pasted callback URL replays to
+/// this port.
 pub fn callbackPort(account: llm.Account) ?u16 {
     return switch (account) {
         .anthropic_subscription => anthropic.oauth.callback_port,
         .anthropic_console => anthropic.console.callback_port,
         .openai_subscription => openai.oauth.callback_port,
-        .anthropic_api, .openai_api => null,
+        .anthropic_api, .openai_api, .google_vertex => null,
     };
 }
 
 /// Run the interactive OAuth login for `account`, mark its committed
-/// replacement authenticated, and return its persistence outcome. An
-/// API account has no login (its key comes from the environment), so it is an
-/// error. No error is returned after the credential has been replaced.
+/// replacement authenticated, and return its persistence outcome. An account
+/// without a login (its credential comes from the environment) is an error. No
+/// error is returned after the credential has been replaced.
 pub fn login(self: *Accounts, account: llm.Account, prompt: anytype) !Login {
     const provider_login: auth.Login = switch (account) {
         .anthropic_subscription => committed: {
@@ -344,7 +402,7 @@ pub fn login(self: *Accounts, account: llm.Account, prompt: anytype) !Login {
             self.anthropic_console_ready = true;
             break :committed committed_login;
         },
-        .anthropic_api, .openai_api => return error.ApiAccountHasNoLogin,
+        .anthropic_api, .openai_api, .google_vertex => return error.ApiAccountHasNoLogin,
     };
     return switch (provider_login) {
         .saved => |path| .{ .saved = path },
@@ -356,8 +414,8 @@ pub fn login(self: *Accounts, account: llm.Account, prompt: anytype) !Login {
 }
 
 /// Drop a login `account`'s stored credentials and mark it no longer
-/// authenticated. An API account has no login to drop (its key comes from the
-/// environment), so it is an error.
+/// authenticated. An account without a login has nothing to drop (its
+/// credential comes from the environment), so it is an error.
 pub fn logout(self: *Accounts, account: llm.Account) !void {
     switch (account) {
         .anthropic_subscription => {
@@ -375,7 +433,7 @@ pub fn logout(self: *Accounts, account: llm.Account) !void {
             self.anthropic_console_ready = false;
             self.catalog.dropAccount(account);
         },
-        .anthropic_api, .openai_api => return error.ApiAccountHasNoLogout,
+        .anthropic_api, .openai_api, .google_vertex => return error.ApiAccountHasNoLogout,
     }
 }
 
@@ -405,7 +463,7 @@ pub fn invalidate(self: *Accounts, account: llm.Account) !bool {
             self.openai_subscription_ready = recovered;
             return recovered;
         },
-        .anthropic_console, .anthropic_api, .openai_api => {
+        .anthropic_console, .anthropic_api, .openai_api, .google_vertex => {
             return error.AccountHasNoRefreshCredential;
         },
     }
@@ -418,7 +476,7 @@ pub fn dropPrincipalMetadata(self: *Accounts, account: llm.Account) void {
     self.catalog.dropAccount(account);
 }
 
-fn testAccounts(keys: ApiKeys, anthropic_ready: bool, openai_ready: bool) Accounts {
+fn testAccounts(environment: Environment, anthropic_ready: bool, openai_ready: bool) Accounts {
     return .{
         .gpa = std.testing.allocator,
         .io = std.testing.io,
@@ -426,7 +484,9 @@ fn testAccounts(keys: ApiKeys, anthropic_ready: bool, openai_ready: bool) Accoun
         .anthropic_auth = undefined,
         .anthropic_console_auth = undefined,
         .openai_auth = undefined,
-        .keys = keys,
+        .google_auth = null,
+        .google_error = null,
+        .environment = environment,
         .anthropic_subscription_ready = anthropic_ready,
         .openai_subscription_ready = openai_ready,
         .anthropic_console_ready = false,
@@ -495,10 +555,11 @@ test "an account has a callback port exactly when it has a login" {
     try std.testing.expectEqual(@as(?u16, 1455), callbackPort(.openai_subscription));
 }
 
-test "logout rejects api accounts, which are env-sourced" {
+test "logout rejects the accounts whose credential is env-sourced" {
     var accounts = testAccounts(.{ .anthropic = "sk-ant" }, false, false);
-    try std.testing.expectError(error.ApiAccountHasNoLogout, accounts.logout(.anthropic_api));
-    try std.testing.expectError(error.ApiAccountHasNoLogout, accounts.logout(.openai_api));
+    for ([_]llm.Account{ .anthropic_api, .openai_api, .google_vertex }) |account| {
+        try std.testing.expectError(error.ApiAccountHasNoLogout, accounts.logout(account));
+    }
 }
 
 test "invalidation rejects accounts without a refresh credential" {
@@ -507,6 +568,7 @@ test "invalidation rejects accounts without a refresh credential" {
         .anthropic_console,
         .anthropic_api,
         .openai_api,
+        .google_vertex,
     }) |account| {
         try std.testing.expectError(
             error.AccountHasNoRefreshCredential,
@@ -523,6 +585,8 @@ test "client selects the arm for an authenticated account, null otherwise" {
     );
     try std.testing.expect(accounts.client(.openai_api) == null);
     try std.testing.expect(accounts.client(.anthropic_subscription) == null);
+    try std.testing.expect(accounts.client(.google_vertex) == null);
+    try std.testing.expect(!accounts.isAuthenticated(.google_vertex));
 }
 
 test "a client carries the timeout pair of its provider" {
@@ -530,6 +594,7 @@ test "a client carries the timeout pair of its provider" {
     accounts.timeouts = .{
         .anthropic = .{ .idle_ms = 1 },
         .openai = .{ .idle_ms = 2 },
+        .google = .{ .idle_ms = 3 },
     };
     try std.testing.expectEqual(
         @as(u64, 1),
@@ -539,6 +604,65 @@ test "a client carries the timeout pair of its provider" {
         @as(u64, 2),
         accounts.client(.openai_api).?.timeouts.idle_ms,
     );
+    try std.testing.expectEqual(@as(u64, 3), accounts.timeoutsOf(.google_vertex).idle_ms);
+}
+
+test "the Vertex account loads from the key file and records a failed load" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var home_buffer: [128]u8 = undefined;
+    const home = try std.fmt.bufPrint(&home_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var key_buffer: [160]u8 = undefined;
+    const key_path = try std.fmt.bufPrint(&key_buffer, "{s}/key.json", .{home});
+
+    // One variable alone leaves the account absent with no failure to report.
+    var half = try Accounts.init(gpa, io, home, .{}, .{ .google_location = "global" });
+    defer half.deinit();
+    try std.testing.expect(!half.isAuthenticated(.google_vertex));
+    try std.testing.expect(half.google_error == null);
+
+    // Both variables and no file: the account is absent and the error names why.
+    var missing = try Accounts.init(gpa, io, home, .{}, .{
+        .google_key_path = key_path,
+        .google_location = "global",
+    });
+    defer missing.deinit();
+    try std.testing.expect(!missing.isAuthenticated(.google_vertex));
+    try std.testing.expectEqual(@as(?anyerror, error.FileNotFound), missing.google_error);
+    try std.testing.expectEqual(@as(?anyerror, error.FileNotFound), missing.loadError(.google_vertex));
+    try std.testing.expect(missing.loadError(.openai_api) == null);
+    try std.testing.expect(missing.firstAuthenticated() == null);
+
+    const file = try std.json.Stringify.valueAlloc(gpa, .{
+        .type = "service_account",
+        .project_id = "my-project",
+        .private_key = google.rs256.fixture_pem,
+        .client_email = "robot@example.iam.gserviceaccount.com",
+    }, .{});
+    defer gpa.free(file);
+    try tmp.dir.writeFile(io, .{ .sub_path = "key.json", .data = file });
+    var ready = try Accounts.init(gpa, io, home, .{}, .{
+        .google_key_path = key_path,
+        .google_location = "eu",
+    });
+    defer ready.deinit();
+    try std.testing.expect(ready.isAuthenticated(.google_vertex));
+    try std.testing.expect(ready.google_error == null);
+    try std.testing.expectEqual(llm.Account.google_vertex, ready.firstAuthenticated().?);
+    try std.testing.expectEqual(llm.Account.google_vertex, ready.client(.google_vertex).?.account());
+    try std.testing.expectEqualStrings("my-project", ready.google_auth.?.project);
+
+    // A region is a failed load too, and every other account still serves.
+    var bad_location = try Accounts.init(gpa, io, home, .{}, .{
+        .anthropic = "sk-ant",
+        .google_key_path = key_path,
+        .google_location = "europe-west4",
+    });
+    defer bad_location.deinit();
+    try std.testing.expectEqual(@as(?anyerror, error.BadLocation), bad_location.google_error);
+    try std.testing.expectEqual(llm.Account.anthropic_api, bad_location.firstAuthenticated().?);
 }
 
 test "invalidation forgets a rejected credential when store removal fails" {

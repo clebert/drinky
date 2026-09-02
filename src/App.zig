@@ -170,8 +170,8 @@ pub const Options = struct {
     /// Each bash command inherits this process environment. `Agent.init` demands one, so the
     /// default here holds only for a test that runs no command.
     environ: std.process.Environ = .empty,
-    /// The provider keys that authenticate an account without a login.
-    api_keys: ai.Accounts.ApiKeys = .{},
+    /// The provider credentials that authenticate an account without a login.
+    credentials: ai.Accounts.Environment = .{},
     /// The Herdr pane this process runs in, or null outside Herdr.
     herdr: ?Herdr.Env = null,
 };
@@ -694,7 +694,7 @@ pub fn run(
     var config = try Config.load(gpa, io, &.{ .working_directory = cwd, .home = home });
     defer config.deinit(gpa);
 
-    self.accounts = try ai.Accounts.init(gpa, io, home, config.timeouts, options.api_keys);
+    self.accounts = try ai.Accounts.init(gpa, io, home, config.timeouts, options.credentials);
     defer self.accounts.deinit();
 
     const home_directory = try homeDirectory(gpa, io, cwd, home);
@@ -1337,6 +1337,7 @@ fn turnFailureText(err: anyerror) ?[]const u8 {
         error.CredentialReplaced => "Drinky found a replacement credential for this account. " ++
             "Drinky removed the prior account evidence.",
         error.TokenGrantRejected => "The provider rejected the refresh credential.",
+        error.KeyRejected => "Google rejected the service account key.",
         error.TokenRequestFailed => "The provider did not accept the token request. " ++
             "Drinky kept this account signed in.",
         error.TokenServiceUnavailable => "The provider credential service is not available. " ++
@@ -2992,6 +2993,7 @@ test "a turn failure the agent named itself reads as a sentence, not an error na
         error.TooManyToolRounds,
         error.CredentialReplaced,
         error.TokenGrantRejected,
+        error.KeyRejected,
         error.TokenRequestFailed,
         error.TokenServiceUnavailable,
         error.StoreBusy,
