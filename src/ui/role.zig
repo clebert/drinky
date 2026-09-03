@@ -36,9 +36,9 @@ pub const Name = enum {
     text,
     /// Secondary text, a source value, a key hint, and Markdown structure.
     muted,
-    /// A caption title, a source label, a list marker, and an inline code span.
-    /// A failed event takes the error role, and every other event takes this
-    /// role.
+    /// A caption title, a source label, a list marker, an inline code span, and
+    /// a paste marker. A failed event takes the error role, and every other
+    /// event takes this role.
     accent,
     /// A Markdown heading.
     heading,

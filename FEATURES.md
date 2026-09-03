@@ -368,7 +368,8 @@ Gemini on Google Vertex AI through a service account key file.
 - The caret moves by grapheme cluster, by wrapped row with a sticky column, and to the start or end
   of the input.
 - A paste over 10 lines or 1000 bytes collapses to a `[Paste #N: L lines]` marker. The marker moves,
-  deletes, and counts as one unit, and it submits its exact bytes.
+  deletes, and counts as one unit, and it submits its exact bytes. It takes the accent color, so it
+  stands apart from typed text.
 - Drinky decodes the Kitty keyboard protocol and traditional escape sequences, also when a sequence
   splits across reads. A terminal without the Kitty protocol reports Escape as one byte. That byte
   becomes the Escape key after a 50 ms wait, and a control byte right after it stays a key of its

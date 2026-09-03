@@ -12,6 +12,7 @@
 const std = @import("std");
 
 const paint = @import("paint.zig");
+const role = @import("role.zig");
 const terminal = @import("terminal");
 
 const Editor = @This();
@@ -165,6 +166,10 @@ const byte_count_max = 1000;
 /// one atom for editing (crossed and deleted whole) but not one unit for wrapping.
 /// A marker wider than the terminal breaks across rows but stays a single atom.
 const marker_guard = "\u{200B}";
+/// The role a marker paints in. A marker is a label for content the user did not
+/// type, so it takes the role of a label, and the typed text around it stays
+/// plain.
+const marker_role: role.Name = .accent;
 /// The widest a marker span can be: two guards, the fixed label text, and two
 /// u64s in decimal. The line form `[Paste #{d}: {d} lines]` and the byte form
 /// have equal length.
@@ -714,6 +719,11 @@ pub fn render(
     const text = self.draft.visible.items;
     const total_body = self.bodyRows(columns_max);
     const visible_rows = @min(total_body, paint.bodyLimit(options.viewport_rows));
+    const atoms = self.draft.atoms.items;
+    const marks = try self.gpa.alloc(paint.Mark, atoms.len);
+    defer self.gpa.free(marks);
+    for (marks, atoms) |*mark, atom|
+        mark.* = .{ .start = atom.start, .end = atom.end, .role = marker_role };
     try paint.framed(placement, &.{
         .body = text,
         .body_rows = visible_rows,
@@ -721,6 +731,7 @@ pub fn render(
         .hidden_above = self.scroll,
         .hidden_below = total_body - self.scroll - visible_rows,
         .trailing_row = total_body > terminal.width.rows(text, columns_max),
+        .marks = marks,
         .activity = options.activity,
     });
 }
@@ -1576,6 +1587,24 @@ test "a marker renders its label into the input area" {
     const painted = try rendered(gpa, &editor, .{ .columns = 80, .rows = 24 });
     defer gpa.free(painted);
     try std.testing.expect(std.mem.indexOf(u8, painted, "[Paste #1: 11 lines]") != null);
+}
+
+// A marker stands for content the user did not type, so it takes the accent role.
+// The typed text around it stays plain, and a typed marker-looking string is
+// typed text.
+test "a marker paints in the accent role between plain text" {
+    const gpa = std.testing.allocator;
+    var editor = Editor.init(gpa);
+    defer editor.deinit();
+    try editor.insert("ab");
+    try pasteWhole(&editor, eleven_lines);
+    try editor.insert("cd [Paste #2: 1 lines]");
+    const painted = try rendered(gpa, &editor, .{ .columns = 80, .rows = 24 });
+    defer gpa.free(painted);
+    const row = comptime "ab" ++ role.sequence(.accent) ++ "\u{200B}[Paste #1: 11 lines]\u{200B}" ++
+        "\x1b[0mcd [Paste #2: 1 lines]\r\n";
+    try std.testing.expect(std.mem.indexOf(u8, painted, row) != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, painted, role.sequence(.accent)));
 }
 
 test "a full-width line reserves an empty trailing row for the wrapped caret" {

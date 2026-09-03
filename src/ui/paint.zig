@@ -178,6 +178,12 @@ const Line = struct {
 /// paints the part of the run that it holds. An empty run paints nothing.
 const Run = struct { start: usize = 0, end: usize = 0 };
 
+/// A run of a body that takes a role of its own, as byte offsets into that body.
+/// A collapsed paste marker is such a run. A row paints the part of the run that
+/// it holds in that role, so a run wider than the row keeps its role on every
+/// row it crosses.
+pub const Mark = struct { start: usize, end: usize, role: role.Name };
+
 /// Where a component composes its rows: the sink to write into, the anchor `id`
 /// its rows carry, the terminal width, the line its content starts at (`base`,
 /// after any leading separator), and how many of its top rows to drop (`skip`,
@@ -591,6 +597,9 @@ pub const Framing = struct {
     /// The role per logical `\n`-delimited body line (lines past the end are
     /// plain). Wrapped continuations retain their source line's role.
     line_roles: []const ?role.Name = &.{},
+    /// The runs of the body that take a role of their own, sorted by `start` and
+    /// non-overlapping. The role of a line takes over again behind each one.
+    marks: []const Mark = &.{},
     activity: ?Activity = null,
 };
 
@@ -650,18 +659,32 @@ pub fn framed(placement: *const Placement, framing: *const Framing) !void {
         // out of it. A row that keeps the blanks it breaks at puts them in every
         // copy of the input.
         const content = terminal.width.rowText(framing.body[span.start..span.end]);
-        try framedRow(placement, maybe_caret, &line, content, maybe_role);
+        try framedRow(placement, maybe_caret, &line, &.{
+            .content = content,
+            .offset = span.start,
+            .role = maybe_role,
+            .marks = framing.marks,
+        });
         body_count += 1;
     }
     // The wrapper exhausts at `index == wrapped rows`, the trailing row's index.
     // Emit it when the window reaches it (a `break` above leaves it out of view).
     if (framing.trailing_row and index >= framing.hidden_above and index < window_end) {
-        try framedRow(placement, maybe_caret, &line, "", null);
+        try framedRow(placement, maybe_caret, &line, &.{ .content = "" });
         body_count += 1;
     }
     std.debug.assert(body_count == framing.body_rows);
     try ruleRow(placement, &separators, &line, .bottom, "↓", framing.hidden_below);
 }
+
+/// One body row of an input area: its cells, where they start in the body, the
+/// role of its logical line, and the marks of the body.
+const FramedRow = struct {
+    content: []const u8,
+    offset: usize = 0,
+    role: ?role.Name = null,
+    marks: []const Mark = &.{},
+};
 
 /// One open body row. It adds no side glyphs or padding, and it ends on the last
 /// cell it fills, so a terminal copy contains only the body text. The function
@@ -670,18 +693,41 @@ fn framedRow(
     placement: *const Placement,
     maybe_caret: ?terminal.View.Caret,
     line: *usize,
-    content: []const u8,
-    maybe_role: ?role.Name,
+    row: *const FramedRow,
 ) !void {
     defer line.* += 1;
     if (line.* < placement.skip) return;
     placement.sink.begin();
-    if (maybe_role) |name| try role.apply(placement.sink, name);
-    try placement.sink.text(content);
-    if (maybe_role != null) try attribute.apply(placement.sink, .reset);
+    if (row.role) |name| try role.apply(placement.sink, name);
+    try framedRowText(placement.sink, row);
+    if (row.role != null) try attribute.apply(placement.sink, .reset);
     if (maybe_caret) |caret|
         if (placement.base + caret.row == line.*) placement.sink.setCaret(caret.column);
     placement.sink.end(.{ .id = placement.id, .line = line.* });
+}
+
+/// The text of one framed row, with the part of each mark that the row holds in
+/// the role of the mark. The reset that closes a mark also closes the role of the
+/// line, so the row applies that role again behind the mark. A row with no line
+/// role and no mark writes no escape at all.
+fn framedRowText(sink: *terminal.View.Sink, row: *const FramedRow) !void {
+    const text = row.content;
+    var position: usize = 0;
+    for (row.marks) |mark| {
+        // A mark in front of the row or behind it clamps to an empty run. The
+        // clamp keeps the order of the bounds, because `@min` is monotone.
+        const start = @min(mark.start -| row.offset, text.len);
+        const end = @min(mark.end -| row.offset, text.len);
+        if (start == end) continue;
+        std.debug.assert(start >= position);
+        try sink.text(text[position..start]);
+        try role.apply(sink, mark.role);
+        try sink.text(text[start..end]);
+        try attribute.apply(sink, .reset);
+        if (row.role) |name| try role.apply(sink, name);
+        position = end;
+    }
+    try sink.text(text[position..]);
 }
 
 /// One labelled horizontal separator. A label masks the moving segment, and the
@@ -1284,6 +1330,75 @@ test "an animated input places its caret only on the visible half" {
         const shown = std.mem.indexOf(u8, output.written(), terminal.escape.cursor_show) != null;
         try std.testing.expectEqual(sample.shown, shown);
     }
+}
+
+/// Paint `framing` into a fresh view of `columns` and return the bytes of the
+/// frame. The caller owns the result.
+fn paintedFramed(gpa: std.mem.Allocator, columns: usize, framing: *const Framing) ![]u8 {
+    var output: std.Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    var view = terminal.View.init(gpa, &output.writer);
+    defer view.deinit();
+    const sink = try view.beginFrame(.{ .columns = columns, .rows = 8 }, 1);
+    try framed(&.{
+        .sink = sink,
+        .id = 0,
+        .columns = columns,
+        .base = 0,
+        .skip = 0,
+    }, framing);
+    try view.render();
+    return gpa.dupe(u8, output.written());
+}
+
+// A mark takes its role for its own bytes alone. The text around it stays plain,
+// so a row with no line role writes no escape outside the mark.
+test "a framed row paints a mark in its role and keeps the rest plain" {
+    const gpa = std.testing.allocator;
+    const marker = "\u{200B}[Paste #1: 11 lines]\u{200B}";
+    const body = "ab" ++ marker ++ "cd";
+    const painted = try paintedFramed(gpa, 40, &.{
+        .body = body,
+        .body_rows = 1,
+        .marks = &.{.{ .start = 2, .end = 2 + marker.len, .role = .accent }},
+    });
+    defer gpa.free(painted);
+    const row = comptime "\r\nab" ++ role.sequence(.accent) ++ marker ++ "\x1b[0mcd\r\n";
+    try std.testing.expect(std.mem.indexOf(u8, painted, row) != null);
+}
+
+// A mark wider than the row breaks with the wrap. Each row paints the part of
+// the mark that it holds in the role of the mark, so no part of it reads plain.
+test "a mark that wraps keeps its role on every row it crosses" {
+    const gpa = std.testing.allocator;
+    const marker = "\u{200B}[Paste #1: 11 lines]\u{200B}";
+    const painted = try paintedFramed(gpa, 12, &.{
+        .body = marker,
+        .body_rows = 2,
+        .marks = &.{.{ .start = 0, .end = marker.len, .role = .accent }},
+    });
+    defer gpa.free(painted);
+    const opened = comptime "\r\n" ++ role.sequence(.accent) ++ "\u{200B}[Paste #1:\x1b[0m\r\n";
+    const carried = comptime "\r\n" ++ role.sequence(.accent) ++ "11 lines]\u{200B}\x1b[0m\r\n";
+    try std.testing.expect(std.mem.indexOf(u8, painted, opened) != null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, carried) != null);
+}
+
+// A line role opens the row, and it takes over again behind a mark, so the text
+// behind the mark keeps the color of its line.
+test "a line role resumes behind a mark" {
+    const gpa = std.testing.allocator;
+    const roles = [_]?role.Name{.muted};
+    const painted = try paintedFramed(gpa, 40, &.{
+        .body = "ab[x]cd",
+        .body_rows = 1,
+        .line_roles = &roles,
+        .marks = &.{.{ .start = 2, .end = 5, .role = .accent }},
+    });
+    defer gpa.free(painted);
+    const row = comptime "\r\n" ++ role.sequence(.muted) ++ "ab" ++ role.sequence(.accent) ++
+        "[x]\x1b[0m" ++ role.sequence(.muted) ++ "cd\x1b[0m\r\n";
+    try std.testing.expect(std.mem.indexOf(u8, painted, row) != null);
 }
 
 test "activity segment grows after a quiet grace period up to one separator" {
