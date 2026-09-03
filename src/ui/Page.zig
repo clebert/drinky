@@ -1,8 +1,8 @@
-//! A temporary full-window, read-only page: a one-row semantic caption above a
-//! bounded body. The caption keeps an accent title and sheds whole muted
-//! control segments as the window narrows. Pages own their title and source,
-//! and can show rendered Markdown or the exact wrapped source. They preserve a
-//! source location across reflow.
+//! A temporary full-window, read-only page: a one-row semantic caption, one
+//! blank row, and a bounded body under them. The caption keeps an accent title
+//! and sheds whole muted control segments as the window narrows. Pages own
+//! their title and source, and can show rendered Markdown or the exact wrapped
+//! source. They preserve a source location across reflow.
 
 const std = @import("std");
 
@@ -141,17 +141,25 @@ pub fn toggleSource(self: *Page, size: terminal.View.Size) void {
     self.reflow(size);
 }
 
-/// Render the fixed caption row and the active presentation's bounded body
-/// window.
+/// Render the fixed head and the active presentation's bounded body window.
+/// The head is the caption row and the blank row that separates it from the body.
 pub fn render(
     self: *const Page,
     placement: *const paint.Placement,
     size: terminal.View.Size,
 ) !void {
     const caption_rows = try self.caption().render(placement);
+    const head_rows = self.headRows(size);
+    if (head_rows > caption_rows) {
+        const line = placement.base + caption_rows;
+        if (line >= placement.skip) {
+            placement.sink.begin();
+            placement.sink.end(.{ .id = placement.id, .line = line });
+        }
+    }
     switch (self.presentation) {
-        .markdown => try self.renderMarkdown(placement, size, caption_rows),
-        .source => try self.renderSource(placement, size, caption_rows),
+        .markdown => try self.renderMarkdown(placement, size, head_rows),
+        .source => try self.renderSource(placement, size, head_rows),
     }
 }
 
@@ -179,19 +187,25 @@ fn captionRows(self: *const Page, size: terminal.View.Size) usize {
     return self.caption().rows(@max(size.columns, 1));
 }
 
+/// Physical rows the head occupies: the caption and the blank row under it. A
+/// one-row window holds the caption alone.
+fn headRows(self: *const Page, size: terminal.View.Size) usize {
+    return @min(self.captionRows(size) + 1, @max(size.rows, 1));
+}
+
 fn renderMarkdown(
     self: *const Page,
     placement: *const paint.Placement,
     size: terminal.View.Size,
-    caption_rows: usize,
+    head_rows: usize,
 ) !void {
-    const body_base = placement.base + caption_rows;
+    const body_base = placement.base + head_rows;
     // The derived placement copies its parent. Only the geometry changes.
     var body_placement = placement.*;
     body_placement.base = body_base;
     body_placement.skip = body_base + self.scroll;
     try markdown.renderWindow(&body_placement, self.content, &.{
-        .rows_max = @max(size.rows, 1) - caption_rows,
+        .rows_max = @max(size.rows, 1) - head_rows,
     });
 }
 
@@ -199,9 +213,9 @@ fn renderSource(
     self: *const Page,
     placement: *const paint.Placement,
     size: terminal.View.Size,
-    caption_rows: usize,
+    head_rows: usize,
 ) !void {
-    const visible_rows = @max(size.rows, 1) - caption_rows;
+    const visible_rows = @max(size.rows, 1) - head_rows;
     const columns_max = @max(size.columns, 1);
     var iterator = terminal.width.wrapper(self.content, columns_max);
     var source_index: usize = 0;
@@ -213,7 +227,7 @@ fn renderSource(
         // The anchor names the source row, as the markdown body names its own
         // row. One row then keeps one anchor across a scroll, and the clip reads
         // the same line that the anchor states.
-        const line = placement.base + caption_rows + source_index;
+        const line = placement.base + head_rows + source_index;
         if (line < placement.skip) continue;
         placement.sink.begin();
         try placement.sink.text(row);
@@ -221,9 +235,9 @@ fn renderSource(
     }
 }
 
-/// Body rows the window leaves below the caption.
+/// Body rows the window leaves below the head.
 fn bodyRows(self: *const Page, size: terminal.View.Size) usize {
-    return @max(size.rows, 1) - self.captionRows(size);
+    return @max(size.rows, 1) - self.headRows(size);
 }
 
 /// Body rows the content occupies in the laid-out width and presentation.
@@ -321,7 +335,7 @@ test "source navigation scrolls by wrapped body rows and clamps at both ends" {
         .presentation = .source,
     });
     defer page.deinit();
-    const size: terminal.View.Size = .{ .columns = 80, .rows = 3 };
+    const size: terminal.View.Size = .{ .columns = 80, .rows = 4 };
 
     page.moveUp(size);
     try std.testing.expectEqual(@as(usize, 0), page.scroll);
@@ -339,7 +353,7 @@ test "source navigation scrolls by wrapped body rows and clamps at both ends" {
     try std.testing.expectEqual(@as(usize, 0), page.scroll);
 
     page.moveEnd(size);
-    page.reflow(.{ .columns = 80, .rows = 5 });
+    page.reflow(.{ .columns = 80, .rows = 6 });
     try std.testing.expectEqual(@as(usize, 0), page.scroll);
 }
 
@@ -351,14 +365,14 @@ test "source reflow preserves the byte location across width changes" {
         .presentation = .source,
     });
     defer page.deinit();
-    const narrow: terminal.View.Size = .{ .columns = 5, .rows = 2 };
+    const narrow: terminal.View.Size = .{ .columns = 5, .rows = 3 };
 
     // A scroll leaves the location unmapped, and the reflow into the new width
     // maps it back.
     page.moveDown(narrow);
     try std.testing.expectEqual(@as(usize, 1), page.scroll);
     try std.testing.expectEqual(@as(?usize, null), page.source_offset);
-    page.reflow(.{ .columns = 10, .rows = 2 });
+    page.reflow(.{ .columns = 10, .rows = 3 });
     try std.testing.expectEqual(@as(usize, 0), page.scroll);
     try std.testing.expectEqual(@as(?usize, 5), page.source_offset);
     page.reflow(narrow);
@@ -373,7 +387,7 @@ test "markdown is default and source toggles around the same logical line" {
         .content = "# Heading\n\n- item with **bold** text\nplain 1\nplain 2\nplain 3\nplain 4",
     });
     defer page.deinit();
-    const size: terminal.View.Size = .{ .columns = 80, .rows = 6 };
+    const size: terminal.View.Size = .{ .columns = 80, .rows = 7 };
     page.reflow(size);
 
     const rendered = try renderForTest(&page, size);
@@ -395,7 +409,7 @@ test "markdown is default and source toggles around the same logical line" {
     try std.testing.expect(std.mem.indexOf(u8, source, "M: Render") != null);
     try std.testing.expect(std.mem.indexOf(u8, source, "**bold**") != null);
 
-    const narrow: terminal.View.Size = .{ .columns = 20, .rows = 6 };
+    const narrow: terminal.View.Size = .{ .columns = 20, .rows = 7 };
     page.reflow(narrow);
     try std.testing.expectEqual(@as(?usize, source_offset), page.source_offset);
     page.toggleSource(narrow);
@@ -413,7 +427,7 @@ test "source rendering is bounded and sanitizes terminal controls" {
         .presentation = .source,
     });
     defer page.deinit();
-    const size: terminal.View.Size = .{ .columns = 80, .rows = 3 };
+    const size: terminal.View.Size = .{ .columns = 80, .rows = 4 };
     page.pageDown(size);
 
     const painted = try renderForTest(&page, size);
@@ -423,7 +437,34 @@ test "source rendering is bounded and sanitizes terminal controls" {
     try std.testing.expect(std.mem.indexOf(u8, painted, "second") != null);
     try std.testing.expect(std.mem.indexOf(u8, painted, "third") != null);
     try std.testing.expect(std.mem.indexOf(u8, painted, "\x1b[2J") == null);
-    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, painted, "\r\n"));
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, painted, "\r\n"));
+}
+
+// The blank row separates the caption from the body, so a body that opens with
+// its own heading does not touch the title. A two-row window holds the head
+// alone.
+test "a blank row separates the caption from the body" {
+    const gpa = std.testing.allocator;
+    var page = try Page.init(gpa, &.{
+        .title = "Test page",
+        .content = "first\nsecond",
+        .presentation = .source,
+    });
+    defer page.deinit();
+
+    const painted = try renderForTest(&page, .{ .columns = 40, .rows = 4 });
+    defer gpa.free(painted);
+    const plain = try terminal.View.plainText(gpa, painted);
+    defer gpa.free(plain);
+    try std.testing.expectEqualStrings(
+        "Test page · Esc: Close · M: Render\r\n\r\nfirst\r\nsecond",
+        plain,
+    );
+
+    const short = try renderForTest(&page, .{ .columns = 40, .rows = 2 });
+    defer gpa.free(short);
+    try std.testing.expect(std.mem.indexOf(u8, short, "first") == null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, short, "\r\n"));
 }
 
 // A one-row window holds the caption alone: the title, the close key, and the

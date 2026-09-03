@@ -34,8 +34,9 @@ pub fn compose(gpa: std.mem.Allocator, options: *const Options) ![]u8 {
     var output: std.Io.Writer.Allocating = .init(gpa);
     errdefer output.deinit();
     const writer = &output.writer;
-    try writer.writeAll("# Sources\n\n" ++
-        "Drinky reads these sources at startup alone. A new file waits for the next start.\n");
+    try writer.writeAll(
+        "Drinky reads these sources at startup alone. A new file waits for the next start.\n",
+    );
     try writeFiles(gpa, writer, &options.roots, &.{
         .title = "User instructions",
         .empty = "Drinky loaded no user instruction file.",
@@ -275,8 +276,7 @@ test "an empty source states its empty state" {
     });
     defer gpa.free(page);
     try std.testing.expectEqualStrings(
-        "# Sources\n\n" ++
-            "Drinky reads these sources at startup alone. A new file waits for the next start.\n" ++
+        "Drinky reads these sources at startup alone. A new file waits for the next start.\n" ++
             "\n## User instructions\n\nDrinky loaded no user instruction file.\n" ++
             "\n## Project instructions\n\nDrinky found no project instruction file.\n" ++
             "\n## Skills\n\nDrinky found no skill.\n" ++

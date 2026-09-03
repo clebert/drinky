@@ -241,7 +241,8 @@ Gemini on Google Vertex AI through a service account key file.
 - Typing, streaming output, and resizes run concurrently, so the interface never freezes during a
   turn.
 - A full-window page scrolls with the arrow keys, PgUp/PgDn, and Home/End. Its fixed caption names
-  the page and its controls. Esc, Ctrl+C, and Ctrl+D close it.
+  the page and its controls. One blank row separates the caption from the body. Esc, Ctrl+C, and
+  Ctrl+D close it.
 - A page asks the terminal to send an arrow key for a wheel notch, so a trackpad scrolls the page
   and a drag still selects text.
 

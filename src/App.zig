@@ -7862,7 +7862,7 @@ test "/sources opens the composed page alone and escape restores the conversatio
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
 
-    const page = "# Sources\n\n## Skills\n\n- `demo` · Scope: project · File: `SKILL.md`\n";
+    const page = "## Skills\n\n- `demo` · Scope: project · File: `SKILL.md`\n";
     var app: App = undefined;
     app.initForTest(gpa);
     app.sources_page = page;
