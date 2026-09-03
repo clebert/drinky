@@ -247,8 +247,9 @@ Gemini on Google Vertex AI through a service account key file.
 - Every notice above the input wraps. It breaks at a `·` separator first. A hint too wide for one
   row keeps that row and marks the cut. A sentence breaks between words.
 - One caption heads the intro line, a picker, an editor state, and a full-window page. Its accent
-  title and muted controls share one row when they fit. On overflow the title takes one row and cuts
-  with one `…`, and the control segments wrap at their `·` boundaries under it.
+  title and muted controls share one row when they fit. The `Drinky` title of the intro line takes
+  the terminal foreground in bold instead. On overflow the title takes one row and cuts with one
+  `…`, and the control segments wrap at their `·` boundaries under it.
 - A row bound caps each caption: one row for a page, three for a picker or an editor state, none for
   the intro line. A control segment past the bound drops whole, so the title survives longest.
 - An element with a stable height keeps one row and marks its cut with one `…`: a tool box, a picker
@@ -362,7 +363,7 @@ Gemini on Google Vertex AI through a service account key file.
 ## Editing & text
 
 - Enter sends. Shift+Enter or Ctrl+J makes a newline. Esc cancels, Ctrl+C clears, and Ctrl+D quits.
-  The intro line shows these bindings under the bold accent `Drinky` title and closes with
+  The intro line shows these bindings under the bold `Drinky` title and closes with
   `/help: Commands`. It wraps with no row bound, so a narrow window keeps every hint.
 - A second Ctrl+C within 500 ms quits. Ctrl+D quits at an empty editor or a closed stdin. Ctrl+D
   with a draft warns first and quits on the second press.

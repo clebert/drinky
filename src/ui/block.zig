@@ -231,7 +231,7 @@ pub const Entry = struct {
     /// the legend this block carries. It keeps the default row bound, because a
     /// transcript block scrolls away and moves no input around.
     fn introCaption(legend: []const u8) Caption {
-        return .{ .title = "Drinky", .title_emphasized = true, .controls = legend };
+        return .{ .title = "Drinky", .product = true, .controls = legend };
     }
 
     /// The role of the box this block paints, or null for a block that paints a
@@ -682,9 +682,9 @@ test "each block kind pins the role that it paints" {
     try std.testing.expectEqual(std.enums.values(Entry.Kind).len, seen.count());
 }
 
-// The intro block paints the shared caption: the emphasized accent product
-// title, then the muted legend. A narrow window splits the legend under the
-// title, and the block still counts exactly the rows it paints.
+// The intro block paints the shared caption: the product title in the terminal
+// foreground in bold, then the muted legend. A narrow window splits the legend
+// under the title, and the block still counts exactly the rows it paints.
 test "the intro block paints the Drinky caption" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -708,9 +708,11 @@ test "the intro block paints the Drinky caption" {
     try view.render();
 
     const painted = out.written();
-    const title = comptime role.sequence(.accent) ++ "\x1b[1mDrinky\x1b[0m";
+    const title = "\x1b[1mDrinky\x1b[0m";
+    const accent_title = comptime role.sequence(.accent) ++ title;
     const legend = comptime role.sequence(.muted) ++ " · Enter: Send";
     try std.testing.expect(std.mem.indexOf(u8, painted, title) != null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, accent_title) == null);
     try std.testing.expect(std.mem.indexOf(u8, painted, legend) != null);
 
     // A window narrower than the joined row splits the legend under the title.

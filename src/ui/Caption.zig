@@ -1,6 +1,6 @@
 //! A semantic title and its control legend above an input or at the head of a
-//! page. The title takes the accent role, and every control stays muted. The
-//! product title adds emphasis.
+//! page. A title takes the accent role, and every control stays muted. The
+//! product title takes the terminal foreground in bold instead.
 //!
 //! A caption that fits keeps the title and all controls on one row. A caption
 //! bounded to one row keeps the title and the longest prefix of whole legend
@@ -25,8 +25,9 @@ const Caption = @This();
 
 /// The semantic name of the surface. It never takes more than one row.
 title: []const u8,
-/// Whether the title takes emphasis. The product title uses this distinction.
-title_emphasized: bool = false,
+/// Whether the title names the product. It then takes the terminal foreground in
+/// bold, where every other title takes the accent role.
+product: bool = false,
 /// A separator-joined control legend, or empty when the title stands alone.
 controls: []const u8 = "",
 /// The rows this caption can occupy. A page pins its caption to one row. An
@@ -131,10 +132,14 @@ fn renderRowCells(
     }
 }
 
-/// Paint the title in the accent role and add its optional emphasis.
+/// Paint the title: the product title in the foreground in bold, every other
+/// title in the accent role.
 fn renderTitle(self: *const Caption, sink: *terminal.View.Sink, columns_max: usize) !void {
-    try role.apply(sink, .accent);
-    if (self.title_emphasized) try attribute.emphasize(sink, .accent, false);
+    if (self.product) {
+        try attribute.emphasize(sink, .text, false);
+    } else {
+        try role.apply(sink, .accent);
+    }
     try writeHeadText(sink, self.title, columns_max);
     try attribute.apply(sink, .reset);
 }

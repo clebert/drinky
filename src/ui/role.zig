@@ -32,7 +32,7 @@ const terminal = @import("terminal");
 /// What a widget asks for. A role names the part of the interface, never a
 /// color. This list is complete.
 pub const Name = enum {
-    /// Reply and prompt text, in the terminal foreground.
+    /// Reply and prompt text, and the product title, in the terminal foreground.
     text,
     /// Secondary text, a source value, a key hint, and Markdown structure.
     muted,
