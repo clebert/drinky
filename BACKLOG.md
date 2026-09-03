@@ -24,6 +24,10 @@ decision already taken, or a dependency on another entry. Module layout and exte
 
 ## Improvements
 
+- **Remove the bash deny list** — the `bash.deny` key, the check in the bash tool, and the
+  `Denied commands` section of the system prompt go. _A pattern list states a boundary that a script
+  or a `bash -c` passes, so Drinky states only a restriction that it can hold. The prose rule in an
+  instruction file carries the habit guidance instead._
 - **Show a model that no source describes** — such a model takes a disabled picker row that names
   what it lacks, and its selection opens the hint for the config key. _`Catalog.merge` returns null
   and the caller drops the model today, so it leaves the picker with no line. A picker row carries
@@ -41,12 +45,23 @@ decision already taken, or a dependency on another entry. Module layout and exte
   entry describes, so the user can unblock any model. _The provider wins every field it states, the
   config wins over OpenRouter, and OpenRouter fills the rest. A later step can let Drinky write the
   entry for the user._
-- **Configurable modes** — a named mode from the config restricts bash commands and tools, adds an
-  instruction file, and colors the status line, and `/mode` switches it. _The default mode is white
-  and restricts nothing. A mode holds a bash allow list or a bash deny list, and it can switch a
-  built-in tool off. The mode replaces the bash deny list of the config, so that key goes. The mode
-  colors are white, yellow, and red. The instruction file of a mode holds the prose that belongs to
-  its restriction alone, so a git restriction and its rule live together._
+- **Read-only mode** — `/mode` switches between `Full` and `Read-only`, and the read-only mode sends
+  no tool that changes the system, so the model never sees `write`, `edit`, or `bash`. _The system
+  prompt core states the active mode in one sentence. The status line shows `Mode: Read-only` like
+  the effort, a muted label and a value in the normal intensity. Nothing persists the mode, so every
+  session starts in the full mode. A switch keeps the conversation and accepts one cold cache.
+  Verify against each provider that a history with a call to a tool that the list no longer names
+  passes, and clear the conversation on the switch otherwise._
+- **Diff tool** — a `diff` tool shows the changes of the working tree against `HEAD` or the index as
+  a unified diff, in the full mode and the read-only mode alike. _Drinky runs the git binary with a
+  fixed argv and no shell, `--no-pager diff --no-ext-diff --no-textconv`, an optional `--cached`,
+  and a path after `--`, so no flag of the model reaches git. Untracked files need a second step,
+  because `git diff` skips them._
+- **Fetch tool** — a `fetch` tool reads a web page or a file by URL with GET alone, turns HTML into
+  text, and pages the result like `read`. _The HTTP client of the standard library serves it, so it
+  adds no dependency. It follows a bounded number of redirects and caps the body. It reaches what
+  the machine reaches, the same as `curl` in bash today. Search needs an external API and a key, so
+  it stays out._
 - **Headless mode** — Drinky answers one prompt with no terminal: text in, text out, with flags for
   the model and the effort level. _This is the base for any agent that Drinky drives itself._
 
