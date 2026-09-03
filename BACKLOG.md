@@ -32,6 +32,28 @@ decision already taken, or a dependency on another entry. Module layout and exte
 
 ## Features
 
+- **Model metadata in the config** — the config describes a model that no provider and no OpenRouter
+  entry describes, so the user can unblock any model. _The provider wins every field it states, the
+  config wins over OpenRouter, and OpenRouter fills the rest. The `provider` field of an entry names
+  a provider or a configured server, so one flat `models` array serves both. The other fields of an
+  entry take the names of the `models.json` shape. A later step can let Drinky write the entry for
+  the user._
+- **OpenAI-compatible servers** — the config names servers that speak Chat Completions, so Drinky
+  talks to a model on llama.cpp, Ollama, vLLM, or a cloud endpoint with a key. _One account with the
+  label "OpenAI Compatible" covers every server. The server name prefixes the model name, as in
+  `ollama/qwen3:32b`. A metadata entry of a server model holds the server name in `provider` and the
+  bare id in `name`. A `servers` entry holds a name, a base URL up to `/v1`, and an optional
+  `api_key_env`, so the file holds no secret. The load refuses a server that has the name of a
+  provider. The fetch reads `/v1/models` for the id alone. It visits every server in parallel inside
+  one window. It keeps every list that arrived and names each server that did not. The stream
+  carries reasoning as `reasoning_content` on llama.cpp, vLLM, and DeepSeek, as `reasoning` on
+  Ollama, or as inline `<think>` tags. The decoder reads all three. This replay sends the text back
+  under the field name of the stream. It covers only the messages after the latest user message,
+  because the vendors that document interleaved thinking ask for that scope. A tag stream goes back
+  inside `content` with its tags. The replay keys on the server, not on the account, because one
+  account spans every server. The wire sends `reasoning_effort` only when the request names a level.
+  The account goes first among the accounts without a login. This entry depends on the metadata
+  entry, because a server states no window._
 - **Headless mode** — Drinky answers one prompt with no terminal: text in, text out, with flags for
   the model and the effort level. _This is the base for any agent that Drinky drives itself._
 - **Telegram remote control** — a session binds to a configured Telegram bot, so the user can send
@@ -39,14 +61,11 @@ decision already taken, or a dependency on another entry. Module layout and exte
   dependency. A bot binds to one session, because an update offset is consume-once. A picker maps to
   an inline keyboard, so no command needs an argument grammar. A configured chat id gates every
   update, because the bot name is public and the session holds a bash tool._
-- **Model metadata in the config** — the config describes a model that no provider and no OpenRouter
-  entry describes, so the user can unblock any model. _The provider wins every field it states, the
-  config wins over OpenRouter, and OpenRouter fills the rest. A later step can let Drinky write the
-  entry for the user._
 
 ## Ideas
 
 - Restart the same prompt in a new session.
 - Show tokens per second during a turn.
 - Keep the request prefix byte-stable, so a local server reuses its prompt cache.
+- Read the window of a server model from the native endpoint of its server.
 - Run the FrontierHarness Eval tasks through a Harbor agent adapter.
