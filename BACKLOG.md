@@ -47,14 +47,8 @@ decision already taken, or a dependency on another entry. Module layout and exte
   built-in tool off. The mode replaces the bash deny list of the config, so that key goes. The mode
   colors are white, yellow, and red. The instruction file of a mode holds the prose that belongs to
   its restriction alone, so a git restriction and its rule live together._
-- **Headless mode** — Drinky answers a prompt with no terminal: text in, text out, with a session id
-  to continue and flags for the model and the effort level. _This is the base for any agent that
-  Drinky drives itself._
-- **Save and resume conversations** — a conversation reopens after a restart and does not start
-  empty. _This entry introduces the per-turn cost ledger and persists it, since history items carry
-  no cost. Restore the OpenAI cache key verbatim. Store the principal identity beside the reasoning
-  and replay only on a match, because the account slot alone is not sufficient provenance.
-  Versioned, atomic, owner-only._
+- **Headless mode** — Drinky answers one prompt with no terminal: text in, text out, with flags for
+  the model and the effort level. _This is the base for any agent that Drinky drives itself._
 
 ## Ideas
 

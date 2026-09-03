@@ -20,7 +20,8 @@ Use Drinky as it is, or fork it and add the features your workflow needs.
 
 ## Highlights
 
-1. **Terminal-native:** The conversation stays in the normal scrollback.
+1. **Terminal-native:** The conversation stays in the normal scrollback. A session is the process,
+   and Drinky saves no conversation to resume.
 2. **One job:** An agent loop and seven tools, with no sub-agents and no workflow mode.
 3. **Small system prompt:** The compiled prompt states the mechanics. Your instruction files and
    skills carry every rule about how to work.
