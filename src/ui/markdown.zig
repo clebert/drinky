@@ -222,11 +222,17 @@ const Fence = struct {
     }
 };
 
+/// Returns true when an odd number of backslashes immediately precedes `index`.
+fn isEscaped(text: []const u8, index: usize) bool {
+    var backslashes: usize = 0;
+    while (backslashes < index and text[index - 1 - backslashes] == '\\') : (backslashes += 1) {}
+    return backslashes % 2 == 1;
+}
+
 /// A pipe table's grid: the column count its header row sets, the display width
 /// each column gets after the fit to the window, and the blanks that hold the
-/// grid at the indentation of its source. Every row must open with a pipe, an
-/// escaped pipe gets no special treatment, and the alignment colons of the
-/// delimiter row parse but do not align.
+/// grid at the indentation of its source. Every row must open with a pipe, and
+/// the alignment colons of the delimiter row parse but do not align.
 const Table = struct {
     count: usize,
     widths: [count_max]usize,
@@ -260,18 +266,24 @@ const Table = struct {
         fn init(row: []const u8) Cells {
             var body = std.mem.trim(u8, row, " \t\r");
             if (body.len > 0 and body[0] == '|') body = body[1..];
-            if (body.len > 0 and body[body.len - 1] == '|') body = body[0 .. body.len - 1];
+            if (body.len > 0 and body[body.len - 1] == '|' and !isEscaped(body, body.len - 1)) {
+                body = body[0 .. body.len - 1];
+            }
             return .{ .rest = body };
         }
 
         fn next(self: *Cells) ?[]const u8 {
             if (self.done) return null;
-            const pipe = std.mem.indexOfScalar(u8, self.rest, '|') orelse {
-                self.done = true;
-                return std.mem.trim(u8, self.rest, " \t");
-            };
-            defer self.rest = self.rest[pipe + 1 ..];
-            return std.mem.trim(u8, self.rest[0..pipe], " \t");
+            var search_from: usize = 0;
+            while (std.mem.indexOfScalarPos(u8, self.rest, search_from, '|')) |pipe| {
+                if (!isEscaped(self.rest, pipe)) {
+                    defer self.rest = self.rest[pipe + 1 ..];
+                    return std.mem.trim(u8, self.rest[0..pipe], " \t");
+                }
+                search_from = pipe + 1;
+            }
+            self.done = true;
+            return std.mem.trim(u8, self.rest, " \t");
         }
     };
 
@@ -566,7 +578,7 @@ const Table = struct {
         for (flows[0..self.count], self.widths[0..self.count]) |*flow, width| {
             flow.* = .{
                 .emitter = emitter,
-                .scanner = InlineScanner.init(look, cells.next() orelse ""),
+                .scanner = InlineScanner.init(look, cells.next() orelse "", .table),
                 .width = width,
             };
         }
@@ -936,7 +948,7 @@ fn plainRow(
 /// An inline run: where its content lies in the source, the look that content
 /// takes, and where the scan continues after it. `nests` marks content that can
 /// carry markers of its own. `url` is the target a link appends as text when the
-/// terminal cannot make the label itself clickable.
+/// terminal cannot make the label itself clickable. `code` marks a code span.
 const Run = struct {
     look: Look,
     start: usize,
@@ -944,13 +956,20 @@ const Run = struct {
     after: usize,
     nests: bool,
     url: []const u8 = "",
+    code: bool = false,
 };
 
 /// One open run: what the scan restores when that run closes.
-const Scope = struct { look: Look, end: usize, after: usize, url: []const u8 };
+const Scope = struct {
+    look: Look,
+    end: usize,
+    after: usize,
+    url: []const u8,
+    code: bool,
+};
 
 /// Levels of nested inline markers the scan follows. A deeper marker stays
-/// literal, which bounds the stack the scan carries.
+/// literal, which bounds the scopes a marker can open.
 const nesting_max = 4;
 
 /// Inline markers, each longer form before the shorter one that prefixes it.
@@ -1002,7 +1021,10 @@ const InlineScanner = struct {
     text: []const u8,
     base: Look,
     look: Look,
-    stack: [nesting_max]Scope = undefined,
+    context: Context,
+    /// Scopes the open runs hold. A code scope can open at `nesting_max` and
+    /// never nests further.
+    stack: [nesting_max + 1]Scope = undefined,
     depth: usize = 0,
     link: Link = .{},
     start: usize = 0,
@@ -1014,10 +1036,11 @@ const InlineScanner = struct {
     queue_len: usize = 0,
     queue_head: usize = 0,
 
+    const Context = enum { block, table };
     const Span = struct { look: Look, bytes: []const u8 };
 
-    fn init(base: Look, text: []const u8) InlineScanner {
-        return .{ .text = text, .base = base, .look = base };
+    fn init(base: Look, text: []const u8, context: Context) InlineScanner {
+        return .{ .text = text, .base = base, .look = base, .context = context };
     }
 
     /// The next non-empty span, or null once the scan consumed `text`.
@@ -1065,16 +1088,46 @@ const InlineScanner = struct {
         // A run must close inside the run that holds it. One that reaches past
         // it interleaves rather than nests, so its marker stays literal.
         const limit = if (self.depth > 0) self.stack[self.depth - 1].end else text.len;
+        if (self.context == .table and
+            self.index + 1 < limit and
+            text[self.index] == '\\' and
+            text[self.index + 1] == '|' and
+            isEscaped(text, self.index + 1))
+        {
+            self.enqueue(self.look, text[self.start..self.index]);
+            self.enqueue(self.look, text[self.index + 1 .. self.index + 2]);
+            self.index += 2;
+            self.start = self.index;
+            return;
+        }
+        if (self.depth > 0 and self.stack[self.depth - 1].code) {
+            const next_backslash = std.mem.indexOfScalarPos(
+                u8,
+                text[0..limit],
+                self.index + 1,
+                '\\',
+            ) orelse limit;
+            self.index = next_backslash;
+            return;
+        }
         if (runAt(text, self.index, &self.link)) |run| {
             if (run.after <= limit) {
                 self.enqueue(self.look, text[self.start..self.index]);
                 const inner = merged(self.look, run.look);
-                if (run.nests and self.depth < nesting_max) {
+                // GFM unescapes a pipe in a code span only inside a table cell.
+                // A code scope opens only when the span holds an escaped pipe.
+                const has_pipe = self.context == .table and
+                    run.code and
+                    std.mem.indexOf(u8, text[run.start..run.end], "\\|") != null;
+                const opens = (run.nests and self.depth < nesting_max) or has_pipe;
+                if (opens) {
+                    std.debug.assert(self.depth < self.stack.len);
                     self.stack[self.depth] = .{
                         .look = inner,
                         .end = run.end,
                         .after = run.after,
                         .url = run.url,
+                        .code = run.code,
                     };
                     self.depth += 1;
                     self.look = inner;
@@ -1114,7 +1167,8 @@ const InlineScanner = struct {
 /// time (see `InlineScanner`). The sink is a `Flow` for a wrapped block, or a
 /// `Table.Measure` for one table cell.
 fn inlines(comptime Sink: type, sink: *Sink, base: Look, text: []const u8) !void {
-    var scanner = InlineScanner.init(base, text);
+    const context: InlineScanner.Context = if (Sink == Table.Measure) .table else .block;
+    var scanner = InlineScanner.init(base, text, context);
     while (scanner.next()) |span| try sink.write(span.look, span.bytes);
 }
 
@@ -1130,6 +1184,7 @@ fn runAt(text: []const u8, index: usize, link: *Link) ?Run {
             .end = close,
             .after = close + 1,
             .nests = false,
+            .code = true,
         };
     }
     if (rest[0] == '[') return linkAt(text, index, link);
@@ -1746,6 +1801,38 @@ test "a table renders as a box grid with padded cells" {
     ) != null);
 }
 
+// An escaped pipe inside a cell does not split the cell. The renderer paints
+// the escaped pipe as a literal pipe character.
+test "a table preserves an escaped pipe in a cell" {
+    const gpa = std.testing.allocator;
+    const text =
+        \\| Command | Description |
+        \\| :--- | :--- |
+        \\| `cat \| grep` | filter |
+        \\| a \| b | plain text |
+        \\| `\|` | lone pipe |
+        \\| **_~~*`cat \| grep`*~~_** | deep |
+    ;
+    try expectPlainRows(gpa, text, 40, &.{
+        "┌────────────┬─────────────┐",
+        "│ Command    │ Description │",
+        "├────────────┼─────────────┤",
+        "│ cat | grep │ filter      │",
+        "│ a | b      │ plain text  │",
+        "│ |          │ lone pipe   │",
+        "│ cat | grep │ deep        │",
+        "└────────────┴─────────────┘",
+    });
+}
+
+// CommonMark keeps a code span literal outside tables.
+test "a code span outside a table keeps backslash before pipe" {
+    const gpa = std.testing.allocator;
+    try expectPlainRows(gpa, "Use `cat \\| grep` here.", 40, &.{
+        "Use cat \\| grep here.",
+    });
+}
+
 // A cell wider than the window cannot widen the grid past it: the widest
 // column gives up cells until the grid fits, and its content wraps inside the
 // column. The grid row grows as tall as its tallest cell, and the pad fills
@@ -2051,6 +2138,10 @@ test "a delimiter row is dashes with optional alignment colons" {
     try std.testing.expectEqual(@as(usize, 2), Table.cellCount("| a | b |"));
     try std.testing.expectEqual(@as(usize, 2), Table.cellCount("| a | b"));
     try std.testing.expectEqual(@as(usize, 1), Table.cellCount("|"));
+    try std.testing.expectEqual(@as(usize, 2), Table.cellCount("| `a \\| b` | c |"));
+    try std.testing.expectEqual(@as(usize, 2), Table.cellCount("| a \\| b | c |"));
+    try std.testing.expectEqual(@as(usize, 2), Table.cellCount("| a | b\\|"));
+    try std.testing.expectEqual(@as(usize, 3), Table.cellCount("| a \\\\| b | c |"));
 }
 
 // A prefix never crowds the body out of the row: at two columns a bullet gives
