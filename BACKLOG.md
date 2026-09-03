@@ -56,11 +56,9 @@ decision already taken, or a dependency on another entry. Module layout and exte
   entry, because a server states no window._
 - **Headless mode** — Drinky answers one prompt with no terminal: text in, text out, with flags for
   the model and the effort level. _This is the base for any agent that Drinky drives itself._
-- **Telegram remote control** — a session binds to a configured Telegram bot, so the user can send
-  messages and run commands from a phone. _Drinky polls `getUpdates` with a long timeout and adds no
-  dependency. A bot binds to one session, because an update offset is consume-once. A picker maps to
-  an inline keyboard, so no command needs an argument grammar. A configured chat id gates every
-  update, because the bot name is public and the session holds a bash tool._
+- **Telegram remote control** — a session attaches to a Telegram bot, so the user drives it from a
+  phone while the terminal shows the work. _`docs/telegram-remote.md` holds the decisions and the
+  phases. Drinky adds no dependency._
 
 ## Ideas
 
