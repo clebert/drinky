@@ -24,10 +24,6 @@ decision already taken, or a dependency on another entry. Module layout and exte
 
 ## Improvements
 
-- **Remove the bash deny list** — the `bash.deny` key, the check in the bash tool, and the
-  `Denied commands` section of the system prompt go. _A pattern list states a boundary that a script
-  or a `bash -c` passes, so Drinky states only a restriction that it can hold. The prose rule in an
-  instruction file carries the habit guidance instead._
 - **Show a model that no source describes** — such a model takes a disabled picker row that names
   what it lacks, and its selection opens the hint for the config key. _`Catalog.merge` returns null
   and the caller drops the model today, so it leaves the picker with no line. A picker row carries

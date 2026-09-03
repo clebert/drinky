@@ -42,10 +42,6 @@ pub const Options = struct {
     /// discovered skill, so a configured rule that resolved to none states
     /// nothing here. An empty list leaves the section out.
     required_skills: []const ai.tool.SkillGuard.Rule = &.{},
-    /// The literal patterns that deny a bash command. The config load already
-    /// drops an empty entry, so every pattern here holds text. An empty list
-    /// leaves the section out.
-    denied_commands: []const []const u8 = &.{},
 };
 
 const InstructionsOptions = struct {
@@ -59,8 +55,6 @@ pub fn compose(gpa: std.mem.Allocator, options: *const Options) ![]u8 {
     errdefer output.deinit();
     try output.writer.writeAll(options.core);
     try writeEnvironment(gpa, &output.writer, options);
-    if (options.denied_commands.len > 0)
-        try writeDeniedCommands(&output.writer, options.denied_commands);
     const project_files = options.project_instructions.files();
     try writePrecedence(&output.writer, options);
     if (options.user_instructions.len > 0) try writeInstructions(gpa, &output.writer, &.{
@@ -183,30 +177,6 @@ fn writeEnvironment(
         try writer.writeAll("  <repository_root />\n");
     }
     try writer.writeAll("</environment>");
-}
-
-/// Name every configured deny pattern, so the model avoids a refused command
-/// instead of a refusal that teaches the rule. The bash tool stays the
-/// backstop: it refuses the command whatever this section says.
-///
-/// The escape covers the five XML entities only, so a control byte in a
-/// pattern reaches the prompt raw. The user owns the config, as the user
-/// owns a required-skill glob.
-fn writeDeniedCommands(writer: *std.Io.Writer, patterns: []const []const u8) !void {
-    try writer.writeAll("\n\n## Denied commands\n\n");
-    try writer.writeAll(
-        "The bash tool refuses a command that contains one of the patterns below.\n" ++
-            "The refusal names the matched pattern.\n" ++
-            "The user set each pattern to block an action, so do not cause that action in a " ++
-            "different way.\n\n" ++
-            "<denied_commands>\n",
-    );
-    for (patterns) |pattern| {
-        try writer.writeAll("  <denied_command pattern=\"");
-        try writeEscaped(writer, pattern);
-        try writer.writeAll("\" />\n");
-    }
-    try writer.writeAll("</denied_commands>");
 }
 
 fn writeSkills(
@@ -610,62 +580,6 @@ test "the required skills section names every rule and stays out without one" {
     defer gpa.free(plain);
     try std.testing.expect(std.mem.indexOf(u8, plain, "## Skills") != null);
     try std.testing.expect(std.mem.indexOf(u8, plain, "## Required skills") == null);
-}
-
-// The prompt must name every configured pattern, so the model avoids a
-// refused command.
-test "the denied commands section names every pattern and stays out without one" {
-    const gpa = std.testing.allocator;
-    var empty_instructions = ai.instructions.Result.init(gpa, .project);
-    defer empty_instructions.deinit();
-    const patterns = [_][]const u8{ "git add", "rm -rf <path>" };
-    const user_instructions = [_]ai.instructions.File{.{
-        .path = "/home/first.md",
-        .content = "Use direct language.\n",
-        .identity = "/home/first.md",
-    }};
-    const prompt = try compose(gpa, &.{
-        .core = "core",
-        .current_time = .zero,
-        .working_directory = "/work",
-        .user_instructions = &user_instructions,
-        .project_instructions = &empty_instructions,
-        .skills = try ai.skills.Catalog.init(&.{}),
-        .denied_commands = &patterns,
-    });
-    defer gpa.free(prompt);
-
-    // The section follows the environment and precedes the instruction
-    // sources, so the mechanical harness facts stand together.
-    const environment_index = std.mem.indexOf(u8, prompt, "## Environment").?;
-    const denied_index = std.mem.indexOf(u8, prompt, "## Denied commands").?;
-    const precedence_index = std.mem.indexOf(u8, prompt, "## Instruction precedence").?;
-    try std.testing.expect(environment_index < denied_index);
-    try std.testing.expect(denied_index < precedence_index);
-    try std.testing.expect(std.mem.indexOf(
-        u8,
-        prompt,
-        "The bash tool refuses a command that contains one of the patterns below.\n" ++
-            "The refusal names the matched pattern.\n" ++
-            "The user set each pattern to block an action, so do not cause that action in a " ++
-            "different way.\n\n" ++
-            "<denied_commands>\n" ++
-            "  <denied_command pattern=\"git add\" />\n" ++
-            "  <denied_command pattern=\"rm -rf &lt;path&gt;\" />\n" ++
-            "</denied_commands>",
-    ) != null);
-
-    // A session with no pattern at all carries no section.
-    const plain = try compose(gpa, &.{
-        .core = "core",
-        .current_time = .zero,
-        .working_directory = "/work",
-        .user_instructions = &.{},
-        .project_instructions = &empty_instructions,
-        .skills = try ai.skills.Catalog.init(&.{}),
-    });
-    defer gpa.free(plain);
-    try std.testing.expect(std.mem.indexOf(u8, plain, "## Denied commands") == null);
 }
 
 test "generated paths cannot add prompt lines or controls" {

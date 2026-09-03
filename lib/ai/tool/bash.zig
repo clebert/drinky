@@ -98,15 +98,6 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
     defer parsed.deinit();
     const command = parsed.value.command;
     const limits = &context.bash;
-    // The guard runs first, so a denied command never starts. The user owns
-    // the pattern list. It is a tripwire against a configured habit, not a
-    // permission model, and no prompt asks for consent.
-    if (limits.denies(command)) |pattern| return Result.report(
-        gpa,
-        .err,
-        "Drinky refused this command because it contains the denied pattern \"{s}\".",
-        .{pattern},
-    );
     // Both sources take the same clamp, so a command always runs under a limit
     // the interface can measure, and neither the model nor the config can lift
     // it.
@@ -914,34 +905,6 @@ test "bash timeout kills descendant processes" {
     try std.testing.expect(result.is_error);
     try io.sleep(.fromMilliseconds(1_000), .awake);
     try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "marker", .{}));
-}
-
-test "bash refuses a denied command before it runs" {
-    const gpa = std.testing.allocator;
-    const deny = [_][]const u8{"git add"};
-    const context: Context = .{
-        .gpa = gpa,
-        .io = std.testing.io,
-        .bash = .{ .deny = &deny },
-    };
-    const result = try run(&context,
-        \\{"command":"echo forbidden_output; git add -A"}
-    );
-    defer result.deinit(gpa);
-    try std.testing.expect(result.is_error);
-    try std.testing.expect(std.mem.indexOf(u8, result.content, "\"git add\"") != null);
-    // The refusal comes before the spawn, so no part of the command ran.
-    try std.testing.expect(std.mem.indexOf(u8, result.content, "forbidden_output") == null);
-    // The box shows the sentence of the refusal, so it wraps rather than cuts.
-    try std.testing.expectEqual(Result.Summary.Kind.sentence, result.summary.?.kind);
-
-    // A command that no pattern matches still runs.
-    const allowed = try run(&context,
-        \\{"command":"echo ok"}
-    );
-    defer allowed.deinit(gpa);
-    try std.testing.expect(!allowed.is_error);
-    try std.testing.expectEqualStrings("ok\n", allowed.content);
 }
 
 test "bash rejects invalid input" {

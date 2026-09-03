@@ -40,10 +40,6 @@ pub const Bash = struct {
     /// The default wall-clock timeout a command runs under, in milliseconds. A
     /// per-call `timeout_seconds` overrides it, inside the window below.
     timeout_ms: u64 = 120_000,
-    /// The literal patterns that deny a command. The bash tool refuses a
-    /// command that contains one of them, so the user can fence off a habit
-    /// such as `git add`. The host owns the strings.
-    deny: []const []const u8 = &.{},
 
     /// The smallest timeout a command can run under. A command that ends at once
     /// still needs a window that a slow start fits in.
@@ -59,30 +55,7 @@ pub const Bash = struct {
     pub fn clampTimeoutMs(timeout_ms: u64) u64 {
         return std.math.clamp(timeout_ms, timeout_ms_min, timeout_ms_max);
     }
-
-    /// The first configured pattern that `command` contains, or null when no
-    /// pattern denies it. An empty pattern denies nothing, so a stray empty
-    /// entry cannot deny every command.
-    pub fn denies(self: *const Bash, command: []const u8) ?[]const u8 {
-        for (self.deny) |pattern| {
-            if (pattern.len == 0) continue;
-            if (std.mem.indexOf(u8, command, pattern) != null) return pattern;
-        }
-        return null;
-    }
 };
-
-test "denies reports the first matching pattern and skips an empty one" {
-    const deny = [_][]const u8{ "", "git add", "git push" };
-    const bash: Bash = .{ .deny = &deny };
-    try std.testing.expectEqualStrings("git add", bash.denies("git add -A").?);
-    try std.testing.expectEqualStrings("git push", bash.denies("git push --force").?);
-    try std.testing.expect(bash.denies("git status") == null);
-    // An empty pattern sits inside every command, so the match must skip it.
-    try std.testing.expect(bash.denies("echo ok") == null);
-    const unguarded: Bash = .{};
-    try std.testing.expect(unguarded.denies("git add -A") == null);
-}
 
 test "clampTimeoutMs holds every value inside the legal window" {
     try std.testing.expectEqual(@as(u64, Bash.timeout_ms_min), Bash.clampTimeoutMs(0));

@@ -49,9 +49,8 @@ Gemini on Google Vertex AI through a service account key file.
 - **bash** — run a shell command in the working directory and return the tail of its combined
   output. Drinky reports a non-zero exit. The output caps and the default timeout come from the
   config, and a call can set its own timeout. Every command runs under a timeout from 1 second to 1
-  hour. A configured deny list refuses a command that contains one of its patterns, and the refusal
-  names the pattern. A command runs without a controlling terminal, so it cannot take the terminal
-  from Drinky. Drinky has no web tool, so a network request also runs through `bash`.
+  hour. A command runs without a controlling terminal, so it cannot take the terminal from Drinky.
+  Drinky has no web tool, so a network request also runs through `bash`.
 - **describe_drinky** — describe Drinky itself: every slash command, every `config.json` key, the
   key bindings, the discovery rules, and the repository. The model answers a question about Drinky
   from this document, not from memory. The command list, the config keys, and the key bindings come
@@ -395,8 +394,7 @@ Gemini on Google Vertex AI through a service account key file.
 - The compiled core is minimal, so the user owns the guidance that steers a turn.
 - The system prompt adds the startup UTC date, the working directory, and the repository root. It
   ranks the instruction sources, so the model knows which one wins on a conflict. It names each path
-  pattern that requires a skill and each bash deny pattern, so the model knows the rules before it
-  acts.
+  pattern that requires a skill, so the model knows the rule before it acts.
 - Drinky loads the exact-case `AGENTS.md` files from the Git root down to the working directory, in
   that order. Outside a repository it reads that directory alone.
 - Drinky looks for skills in `~/.agents/skills/` and in each `.agents/skills/` from the Git root
@@ -414,10 +412,10 @@ Gemini on Google Vertex AI through a service account key file.
   source loads at most 32 files and 64 KiB, and one file loads once even when two paths reach it.
   Drinky reports what it skips.
 - `~/.drinky/config.json` is optional. It holds the user instruction paths, the request and bash
-  limits, a bash deny list, a default effort level, the skills that a path requires, and the
-  interface settings. Drinky reads it only at startup, so a change applies at the next start. It
-  holds no secrets. API keys come from `ANTHROPIC_API_KEY` and `OPENAI_API_KEY`, and the Google
-  Vertex credential from `GOOGLE_APPLICATION_CREDENTIALS` and `GOOGLE_CLOUD_LOCATION`.
+  limits, a default effort level, the skills that a path requires, and the interface settings.
+  Drinky reads it only at startup, so a change applies at the next start. It holds no secrets. API
+  keys come from `ANTHROPIC_API_KEY` and `OPENAI_API_KEY`, and the Google Vertex credential from
+  `GOOGLE_APPLICATION_CREDENTIALS` and `GOOGLE_CLOUD_LOCATION`.
 - Drinky reports an unknown key, an unknown effort level, and an interface value that it cannot use,
   so a typo never looks like an applied setting.
 - A required skill whose name no discovered skill carries guards nothing in that project. The source

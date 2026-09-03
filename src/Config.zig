@@ -59,10 +59,6 @@ dropped_window_pages: ?usize = null,
 /// status line falls back to the compiled pair. The two shares hold one rule
 /// between them, so they drop together. Null on a legal pair.
 dropped_gauge: ?ui.status.Gauge = null,
-/// Whether the file held an empty bash deny pattern. Drinky drops it, because an
-/// empty pattern states no command. The config keeps the fact so the app can
-/// tell the user Drinky ignored the entry.
-dropped_deny_empty: bool = false,
 /// The keys of `config.json` that no field of `File` matches, as paths in file
 /// order. The parse ignores them, so the app reports them and a typo does not
 /// disappear silently. Owned. `deinit` frees them.
@@ -141,7 +137,6 @@ const File = struct {
         output_lines_max: usize = bash_default.lines_max,
         output_bytes_max: usize = bash_default.bytes_max,
         timeout_ms: u64 = bash_default.timeout_ms,
-        deny: []const JsonString = &.{},
     };
 
     /// How much of the conversation one frame retains, and where a status gauge
@@ -276,12 +271,6 @@ const keys = [_]Key{
                 "{d} to {d}. Drinky reports a value it cannot use and keeps the default.",
             .{ ai.tool.Context.Bash.timeout_ms_min, ai.tool.Context.Bash.timeout_ms_max },
         ),
-    },
-    .{
-        .path = "bash.deny",
-        .description = "The literal patterns that deny a command. The bash tool refuses a " ++
-            "command that contains one of the entries, and the refusal names that entry. " ++
-            "Drinky ignores an empty entry and names each kept entry in the system prompt.",
     },
     .{
         .path = "interface.window_pages",
@@ -475,7 +464,7 @@ const example =
     \\  "user_instructions": [{ "path": "instructions.md" }],
     \\  "required_skills": [{ "glob": "**/*.zig", "skill": "zig-style" }],
     \\  "request": { "anthropic_idle_timeout_ms": 90000 },
-    \\  "bash": { "timeout_ms": 300000, "deny": ["git add"] },
+    \\  "bash": { "timeout_ms": 300000 },
     \\  "interface": { "window_pages": 12 },
     \\  "default_effort": "high"
     \\}
@@ -541,8 +530,7 @@ pub fn document(
 }
 
 /// Free the path, the user instruction files, their messages, the required
-/// skills, the bash deny patterns, the dropped-default names, and the unknown
-/// keys.
+/// skills, the dropped-default names, and the unknown keys.
 pub fn deinit(self: *Config, gpa: std.mem.Allocator) void {
     gpa.free(self.path);
     self.user_instructions.deinit();
@@ -551,8 +539,6 @@ pub fn deinit(self: *Config, gpa: std.mem.Allocator) void {
         gpa.free(required.skill);
     }
     gpa.free(self.required_skills);
-    for (self.bash.deny) |pattern| gpa.free(pattern);
-    gpa.free(self.bash.deny);
     if (self.dropped_effort) |name| gpa.free(name);
     for (self.unknown_keys) |key| gpa.free(key);
     gpa.free(self.unknown_keys);
@@ -642,23 +628,6 @@ fn loadFromData(gpa: std.mem.Allocator, io: std.Io, options: *const DataOptions)
         try required.append(gpa, .{ .glob = owned_glob, .skill = owned_skill });
     }
 
-    var deny: std.ArrayList([]const u8) = .empty;
-    errdefer {
-        for (deny.items) |pattern| gpa.free(pattern);
-        deny.deinit(gpa);
-    }
-    var dropped_deny_empty = false;
-    for (bash.deny) |configured| {
-        // An empty pattern states no command, so it cannot deny one.
-        if (configured.value.len == 0) {
-            dropped_deny_empty = true;
-            continue;
-        }
-        const owned = try gpa.dupe(u8, configured.value);
-        errdefer gpa.free(owned);
-        try deny.append(gpa, owned);
-    }
-
     var dropped_effort: ?[]const u8 = null;
     errdefer if (dropped_effort) |name| gpa.free(name);
     const default_effort = try resolveEffort(
@@ -688,14 +657,6 @@ fn loadFromData(gpa: std.mem.Allocator, io: std.Io, options: *const DataOptions)
         gpa.free(unknown_keys);
     }
     const required_skills = try required.toOwnedSlice(gpa);
-    errdefer {
-        for (required_skills) |item| {
-            gpa.free(item.glob);
-            gpa.free(item.skill);
-        }
-        gpa.free(required_skills);
-    }
-    const deny_patterns = try deny.toOwnedSlice(gpa);
     return .{
         .path = owned_path,
         .timeouts = .{
@@ -721,7 +682,6 @@ fn loadFromData(gpa: std.mem.Allocator, io: std.Io, options: *const DataOptions)
             .lines_max = bash.output_lines_max,
             .bytes_max = bash.output_bytes_max,
             .timeout_ms = bash_timeout_ms,
-            .deny = deny_patterns,
         },
         .window_pages = window_pages,
         .gauge = gauge,
@@ -732,7 +692,6 @@ fn loadFromData(gpa: std.mem.Allocator, io: std.Io, options: *const DataOptions)
         .dropped_bash_timeout_ms = dropped_bash_timeout_ms,
         .dropped_window_pages = dropped_window_pages,
         .dropped_gauge = dropped_gauge,
-        .dropped_deny_empty = dropped_deny_empty,
         .unknown_keys = unknown_keys,
         .unknown_keys_omitted = unknown_keys_omitted,
     };
@@ -1062,33 +1021,6 @@ test "gauge shares Drinky cannot use fall back to the compiled pair and are repo
     defer equal.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(f64, 50), equal.gauge.percent_warning);
     try std.testing.expect(equal.dropped_gauge == null);
-}
-
-test "load reads the bash deny list and drops an empty pattern" {
-    var config = try loadDataForTest(
-        \\{ "bash": { "deny": ["git add", "", "git push"] } }
-    );
-    defer config.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 2), config.bash.deny.len);
-    try std.testing.expectEqualStrings("git add", config.bash.deny[0]);
-    try std.testing.expectEqualStrings("git push", config.bash.deny[1]);
-    // The load keeps the fact, so the app can tell the user Drinky ignored the
-    // empty entry.
-    try std.testing.expect(config.dropped_deny_empty);
-
-    // A pattern must be a JSON string.
-    try std.testing.expectError(error.UnexpectedToken, loadDataForTest(
-        \\{ "bash": { "deny": [3] } }
-    ));
-    try std.testing.expectError(error.UnexpectedToken, loadDataForTest(
-        \\{ "bash": { "deny": "git add" } }
-    ));
-
-    // Without the key, no pattern denies a command.
-    var empty = try loadDataForTest("{}");
-    defer empty.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 0), empty.bash.deny.len);
-    try std.testing.expect(!empty.dropped_deny_empty);
 }
 
 // Every command runs under a limit. A zero used to mean no limit, so a stale
@@ -1433,9 +1365,6 @@ test "the config document names the file and its own example loads clean" {
     );
     try std.testing.expectEqual(@as(u64, 300_000), from_example.bash.timeout_ms);
     try std.testing.expectEqual(@as(usize, 12), from_example.window_pages);
-    try std.testing.expectEqual(@as(usize, 1), from_example.bash.deny.len);
-    try std.testing.expectEqualStrings("git add", from_example.bash.deny[0]);
-    try std.testing.expect(!from_example.dropped_deny_empty);
 }
 
 test "load resolves user instruction paths against the config directory in order" {
@@ -1537,8 +1466,6 @@ fn checkLoadAllocationFailure(gpa: std.mem.Allocator, io: std.Io, home: []const 
     try std.testing.expectEqual(@as(usize, 1), config.user_instructions.files().len);
     try std.testing.expectEqual(@as(usize, 1), config.user_instructions.notices().len);
     try std.testing.expect(config.dropped_effort != null);
-    try std.testing.expectEqual(@as(usize, 1), config.bash.deny.len);
-    try std.testing.expect(config.dropped_deny_empty);
     try std.testing.expectEqual(@as(usize, 2), config.unknown_keys.len);
     const text = try config.document(gpa, .xhigh);
     defer gpa.free(text);
@@ -1558,7 +1485,7 @@ test "the config load frees every partial allocation" {
         .data =
         \\{ "user_instructions": [{ "path": "first.md" }, { "path": "missing.md" }],
         \\  "default_models": { "openai_api": "nope" }, "default_effort": "nope",
-        \\  "bash": { "deny": ["git add", ""] }, "unknown": 1 }
+        \\  "unknown": 1 }
         ,
     });
     const home = try tmpPath(gpa, io, &tmp, "");

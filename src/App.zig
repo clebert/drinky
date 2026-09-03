@@ -741,7 +741,6 @@ pub fn run(
         .project_instructions = &self.project_instructions,
         .skills = self.skills.catalog(),
         .required_skills = self.skill_guard.rules(),
-        .denied_commands = config.bash.deny,
     });
     defer gpa.free(self.prompt);
     self.document = try describe.compose(gpa, &.{
@@ -842,11 +841,6 @@ pub fn run(
             config.gauge.percent_warning,
             config.gauge.percent_error,
         },
-    );
-    if (config.dropped_deny_empty) try self.recordEvent(
-        .failure,
-        "Drinky ignored an empty bash deny pattern because the pattern must hold text.",
-        .{},
     );
     try self.reportNotices(skill_notices.items);
     // The parse ignores an unknown key so that an older binary reads a newer

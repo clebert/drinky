@@ -66,8 +66,8 @@ complete command list. You can also ask Drinky to explain its commands, keys, an
 ## Configuration
 
 The `~/.drinky/config.json` file is optional. It controls instruction files, request and bash
-limits, denied shell commands, required skills, a default effort level, and interface settings.
-Drinky reads the file only at startup and never writes it. You can keep it in version control.
+limits, required skills, a default effort level, and interface settings. Drinky reads the file only
+at startup and never writes it. You can keep it in version control.
 
 Ask the model to explain or maintain the file.
 
