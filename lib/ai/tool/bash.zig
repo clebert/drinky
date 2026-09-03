@@ -93,19 +93,27 @@ comptime {
 }
 
 pub fn run(context: *const Context, input_json: []const u8) !Result {
-    const gpa = context.gpa;
-    const parsed = try parse.input(Input, gpa, input_json);
+    const parsed = try parse.input(Input, context.gpa, input_json);
     defer parsed.deinit();
-    const command = parsed.value.command;
-    const limits = &context.bash;
-    // Both sources take the same clamp, so a command always runs under a limit
-    // the interface can measure, and neither the model nor the config can lift
-    // it.
-    const timeout_ms = Context.Bash.clampTimeoutMs(if (parsed.value.timeout_seconds) |seconds|
+    return runWithTimeout(context, parsed.value.command, timeoutMs(&parsed.value, &context.bash));
+}
+
+/// The window a call runs under: its own `timeout_seconds`, else the configured
+/// default. Both sources take the same clamp, so a command always runs under a
+/// limit the interface can measure, and neither the model nor the config can
+/// lift it.
+fn timeoutMs(input: *const Input, limits: *const Context.Bash) u64 {
+    return Context.Bash.clampTimeoutMs(if (input.timeout_seconds) |seconds|
         seconds *| std.time.ms_per_s
     else
         limits.timeout_ms);
+}
 
+/// Run `command` under `timeout_ms`, which `run` has clamped. A test passes a
+/// window below the floor, so a stop costs it no full second.
+fn runWithTimeout(context: *const Context, command: []const u8, timeout_ms: u64) !Result {
+    const gpa = context.gpa;
+    const limits = &context.bash;
     const started_ms = std.Io.Timestamp.now(context.io, .awake).toMilliseconds();
     var execution: Execution = .{ .output = .init(gpa) };
     defer execution.deinit();
@@ -139,7 +147,6 @@ fn execute(
     timeout_ms: u64,
     execution: *Execution,
 ) !std.process.Child.Term {
-    std.debug.assert(timeout_ms >= Context.Bash.timeout_ms_min);
     std.debug.assert(timeout_ms <= Context.Bash.timeout_ms_max);
 
     const work_result = net.race(
@@ -792,124 +799,28 @@ test "bash reports empty successful output" {
     try std.testing.expect(std.mem.endsWith(u8, result.summary.?.text, " · Exit code: 0"));
 }
 
-test "bash honors a per-call timeout" {
-    const gpa = std.testing.allocator;
-    const context: Context = .{ .gpa = gpa, .io = std.testing.io };
-    const result = try run(&context,
-        \\{"command":"sleep 5","timeout_seconds":1}
-    );
-    defer result.deinit(gpa);
-    try std.testing.expect(result.is_error);
-    try std.testing.expect(std.mem.indexOf(u8, result.content, "timed out after 1.0s") != null);
-    // Every command reports its run time, so a stopped one keeps that row too.
-    try std.testing.expect(std.mem.startsWith(u8, result.summary.?.text, "Time: "));
-    try std.testing.expect(std.mem.endsWith(u8, result.summary.?.text, " · Status: Timed out"));
-}
-
-// A command that asks for no limit still runs under the smallest legal one, so
-// no call can hold the turn open.
-test "bash holds a per-call timeout inside the legal window" {
-    const gpa = std.testing.allocator;
-    const context: Context = .{ .gpa = gpa, .io = std.testing.io };
-    const result = try run(&context,
-        \\{"command":"sleep 5","timeout_seconds":0}
-    );
-    defer result.deinit(gpa);
-    try std.testing.expect(result.is_error);
-    try std.testing.expect(std.mem.indexOf(u8, result.content, "timed out after 1.0s") != null);
-}
-
-// A configured value outside the window cannot lift the limit either. Zero used
-// to mean no limit, so this is the path a stale config file takes.
-test "bash holds a configured timeout inside the legal window" {
-    const gpa = std.testing.allocator;
-    const context: Context = .{
-        .gpa = gpa,
-        .io = std.testing.io,
-        .bash = .{ .timeout_ms = 0 },
-    };
-    const result = try run(&context,
-        \\{"command":"sleep 5"}
-    );
-    defer result.deinit(gpa);
-    try std.testing.expect(result.is_error);
-    try std.testing.expect(std.mem.indexOf(u8, result.content, "timed out after 1.0s") != null);
-}
-
-test "bash timeout is absolute while output arrives" {
-    const gpa = std.testing.allocator;
-    const context: Context = .{
-        .gpa = gpa,
-        .io = std.testing.io,
-        .bash = .{ .timeout_ms = Context.Bash.timeout_ms_min },
-    };
-    const result = try run(&context,
-        \\{"command":"for i in {1..40}; do echo tick; sleep 0.05; done"}
-    );
-    defer result.deinit(gpa);
-    try std.testing.expect(result.is_error);
-    try std.testing.expect(std.mem.indexOf(u8, result.content, "timed out after 1.0s") != null);
-}
-
-test "bash timeout reaps a command after output closes" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const input = try std.fmt.allocPrint(
-        gpa,
-        "{{\"command\":\"echo $$ > .zig-cache/tmp/{s}/pid; exec 1>&- 2>&-; sleep 5\"}}",
-        .{tmp.sub_path},
-    );
-    defer gpa.free(input);
-    const context: Context = .{
-        .gpa = gpa,
-        .io = io,
-        .bash = .{ .timeout_ms = Context.Bash.timeout_ms_min },
-    };
-    const result = try run(&context, input);
-    defer result.deinit(gpa);
-    try std.testing.expect(result.is_error);
-    try std.testing.expect(std.mem.indexOf(u8, result.content, "timed out after 1.0s") != null);
-
-    const pid_text = try tmp.dir.readFileAlloc(io, "pid", gpa, .limited(64));
-    defer gpa.free(pid_text);
-    const process_id = try std.fmt.parseInt(
-        std.posix.pid_t,
-        std.mem.trimEnd(u8, pid_text, "\n"),
-        10,
-    );
-    var status: if (builtin.link_libc) c_int else u32 = undefined;
-    const wait_result = std.posix.system.waitpid(process_id, &status, std.posix.W.NOHANG);
-    try std.testing.expectEqual(std.posix.E.CHILD, std.posix.errno(wait_result));
-}
-
-test "bash timeout kills descendant processes" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const input = try std.fmt.allocPrint(
-        gpa,
-        "{{\"command\":\"(sleep 1.5; touch .zig-cache/tmp/{s}/marker) & wait\"}}",
-        .{tmp.sub_path},
-    );
-    defer gpa.free(input);
-    const context: Context = .{
-        .gpa = gpa,
-        .io = io,
-        .bash = .{ .timeout_ms = Context.Bash.timeout_ms_min },
-    };
-    const result = try run(&context, input);
-    defer result.deinit(gpa);
-    try std.testing.expect(result.is_error);
-    try io.sleep(.fromMilliseconds(1_000), .awake);
-    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "marker", .{}));
-}
-
 test "bash rejects invalid input" {
     const context: Context = .{ .gpa = std.testing.allocator, .io = std.testing.io };
     try std.testing.expectError(error.InvalidArguments, run(&context, "{}"));
+}
+
+// A per-call value wins over the config, and both stay inside the legal window.
+// A zero used to mean no limit, so a stale config file takes the floor.
+test "the timeout of a call comes from either source and takes the clamp" {
+    const defaults: Context.Bash = .{};
+    const config: Context.Bash = .{ .timeout_ms = 5_000 };
+    const stale: Context.Bash = .{ .timeout_ms = 0 };
+    const two_seconds: Input = .{ .command = "", .timeout_seconds = 2 };
+    const zero_seconds: Input = .{ .command = "", .timeout_seconds = 0 };
+    const huge_seconds: Input = .{ .command = "", .timeout_seconds = std.math.maxInt(u64) };
+    const no_seconds: Input = .{ .command = "" };
+
+    try std.testing.expectEqual(@as(u64, 2_000), timeoutMs(&two_seconds, &config));
+    try std.testing.expectEqual(@as(u64, 5_000), timeoutMs(&no_seconds, &config));
+    try std.testing.expectEqual(@as(u64, defaults.timeout_ms), timeoutMs(&no_seconds, &defaults));
+    try std.testing.expectEqual(Context.Bash.timeout_ms_min, timeoutMs(&zero_seconds, &config));
+    try std.testing.expectEqual(Context.Bash.timeout_ms_min, timeoutMs(&no_seconds, &stale));
+    try std.testing.expectEqual(Context.Bash.timeout_ms_max, timeoutMs(&huge_seconds, &config));
 }
 
 test "sanitize keeps text, drops controls, and replaces invalid bytes" {
@@ -960,29 +871,108 @@ test "render summary discloses line and byte truncation" {
     }
 }
 
+// The timeout tests below run under a window that `run` never grants, so each
+// stop costs a fraction of a second. A command that must act before the stop
+// still has a wide margin for a slow start.
+const test_timeout_ms = 200;
+
 // A killed command keeps the tail it printed. The output is the evidence of
 // where the time went, so the model does not retry blind.
 test "a timed-out command keeps its output and states the stop" {
     const gpa = std.testing.allocator;
-    const context: Context = .{
-        .gpa = gpa,
-        .io = std.testing.io,
-        .bash = .{ .timeout_ms = Context.Bash.timeout_ms_min },
-    };
-    const result = try run(&context,
-        \\{"command":"echo started; sleep 5"}
-    );
+    const context: Context = .{ .gpa = gpa, .io = std.testing.io };
+    const result = try runWithTimeout(&context, "echo started; sleep 5", test_timeout_ms);
     defer result.deinit(gpa);
     try std.testing.expect(result.is_error);
-    // The output stands first, and the notice closes the result. The separator
-    // between them belongs to the shared render path, which the exit-code
-    // tests pin.
-    try std.testing.expect(std.mem.startsWith(u8, result.content, "started\n"));
-    try std.testing.expectStringEndsWith(result.content, "[The command timed out after 1.0s.]");
+    // The output stands first, the shared separator follows, and the notice
+    // closes the result.
+    try std.testing.expectEqualStrings(
+        "started\n\n\n[The command timed out after 200ms.]",
+        result.content,
+    );
     try std.testing.expect(std.mem.startsWith(u8, result.summary.?.text, "Time: "));
     try std.testing.expect(
         std.mem.endsWith(u8, result.summary.?.text, " · Status: Timed out · Lines: 1"),
     );
+}
+
+// The ticks arrive well inside the window, so an idle timeout would never fire.
+test "bash timeout is absolute while output arrives" {
+    const gpa = std.testing.allocator;
+    const context: Context = .{ .gpa = gpa, .io = std.testing.io };
+    const result = try runWithTimeout(
+        &context,
+        "for i in {1..200}; do echo tick; sleep 0.02; done",
+        test_timeout_ms,
+    );
+    defer result.deinit(gpa);
+    try std.testing.expect(result.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "timed out after 200ms") != null);
+}
+
+test "bash timeout reaps a command after output closes" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const command = try std.fmt.allocPrint(
+        gpa,
+        "echo $$ > .zig-cache/tmp/{s}/pid; exec 1>&- 2>&-; sleep 5",
+        .{tmp.sub_path},
+    );
+    defer gpa.free(command);
+    const context: Context = .{ .gpa = gpa, .io = io };
+    const result = try runWithTimeout(&context, command, test_timeout_ms);
+    defer result.deinit(gpa);
+    try std.testing.expect(result.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "timed out after 200ms") != null);
+
+    const process_id = try readProcessId(gpa, io, &tmp);
+    var status: if (builtin.link_libc) c_int else u32 = undefined;
+    const wait_result = std.posix.system.waitpid(process_id, &status, std.posix.W.NOHANG);
+    try std.testing.expectEqual(std.posix.E.CHILD, std.posix.errno(wait_result));
+}
+
+// The stop reaches the whole process group, so a background child of the shell
+// dies with it. Its parent is gone, so the system reaps it, and the probe polls
+// for that moment inside a bound.
+test "bash timeout kills descendant processes" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const command = try std.fmt.allocPrint(
+        gpa,
+        "sleep 5 & echo $! > .zig-cache/tmp/{s}/pid; wait",
+        .{tmp.sub_path},
+    );
+    defer gpa.free(command);
+    const context: Context = .{ .gpa = gpa, .io = io };
+    const result = try runWithTimeout(&context, command, test_timeout_ms);
+    defer result.deinit(gpa);
+    try std.testing.expect(result.is_error);
+
+    const process_id = try readProcessId(gpa, io, &tmp);
+    var gone = false;
+    for (0..200) |_| {
+        // Signal zero probes for existence and delivers nothing.
+        std.posix.kill(process_id, @enumFromInt(0)) catch |err| switch (err) {
+            error.ProcessNotFound => {
+                gone = true;
+                break;
+            },
+            else => return err,
+        };
+        try io.sleep(.fromMilliseconds(5), .awake);
+    }
+    try std.testing.expect(gone);
+}
+
+/// The process id that a test command wrote to `pid` in its temporary directory.
+fn readProcessId(gpa: std.mem.Allocator, io: std.Io, tmp: *std.testing.TmpDir) !std.posix.pid_t {
+    const text = try tmp.dir.readFileAlloc(io, "pid", gpa, .limited(64));
+    defer gpa.free(text);
+    return std.fmt.parseInt(std.posix.pid_t, std.mem.trimEnd(u8, text, "\n"), 10);
 }
 
 // The capture cap kills the flood but keeps the window before it, so the last

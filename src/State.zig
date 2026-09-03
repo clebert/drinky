@@ -603,6 +603,8 @@ test "temporary store contention leaves project-state saving enabled" {
     var state = try openForTest(gpa, io, home);
     defer state.deinit();
     try state.seed(.anthropic_api, test_model, .low);
+    ai.json_store.lock_policy = .{ .attempts_max = 2, .wait_ms = 0 };
+    defer ai.json_store.lock_policy = .{};
     const lock_path = try std.fmt.allocPrint(gpa, "{s}.lock", .{state.path});
     defer gpa.free(lock_path);
     {

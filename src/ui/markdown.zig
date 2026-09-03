@@ -1671,20 +1671,27 @@ test "markdown windows emit exactly their bounded row slice" {
 test "rendered rows map back to their source logical line" {
     for ([_]usize{ 40, 7, 1 }) |columns| {
         const total = rows(sample, columns);
+        // The first row of a logical line is a function of its source offset
+        // alone, so the rows of one line share the lookup.
+        var line_source: ?usize = null;
+        var line_first: usize = 0;
         for (0..total) |row| {
             const source_offset = sourceAtRow(sample, &.{
                 .columns = columns,
                 .row = row,
             });
-            const first = rowAtSource(sample, &.{
-                .columns = columns,
-                .source_offset = source_offset,
-            });
-            try std.testing.expect(first <= row);
-            try std.testing.expectEqual(source_offset, sourceAtRow(sample, &.{
-                .columns = columns,
-                .row = first,
-            }));
+            if (line_source != source_offset) {
+                line_source = source_offset;
+                line_first = rowAtSource(sample, &.{
+                    .columns = columns,
+                    .source_offset = source_offset,
+                });
+                try std.testing.expectEqual(source_offset, sourceAtRow(sample, &.{
+                    .columns = columns,
+                    .row = line_first,
+                }));
+            }
+            try std.testing.expect(line_first <= row);
         }
     }
 }

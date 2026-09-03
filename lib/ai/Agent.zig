@@ -16,11 +16,6 @@ const tool = @import("tool/root.zig");
 
 const Agent = @This();
 
-/// The per-turn bound on tool rounds. It is a guard against a runaway loop, not
-/// a budget. A long task must never reach it. The user cancels a turn with Esc,
-/// and a real loop grows the prompt until it hits the context limit first.
-const rounds_max = 1000;
-
 /// The placeholder shown for a redacted reasoning block (its content is encrypted).
 const redacted_notice = "[redacted thinking]";
 
@@ -46,6 +41,10 @@ model: ?Model,
 system: []const u8,
 effort: llm.Effort,
 retry: net.Retry,
+/// The per-turn bound on tool rounds. It is a guard against a runaway loop, not
+/// a budget. A long task must never reach it. The user cancels a turn with Esc,
+/// and a real loop grows the prompt until it hits the context limit first.
+rounds_max: usize = 1000,
 /// Bounds the bash tool's output window and runtime, handed to every tool call.
 bash: tool.Context.Bash,
 /// What the `describe_drinky` tool returns. The host owns the text and keeps it
@@ -609,7 +608,7 @@ fn runRounds(
 ) !void {
     try self.appendUser(user_text);
     var round: usize = 0;
-    while (round < rounds_max) : (round += 1) {
+    while (round < self.rounds_max) : (round += 1) {
         const reply = try self.fetchReply(fetch, turn, handler);
         const ran_tools = try self.runToolsWith(Dispatch, reply, turn, handler);
         // A no-tool reply commits here. A tool-calling reply committed itself
@@ -3753,6 +3752,8 @@ test "the round cap retains the completed rounds and fails the turn" {
     defer agent.deinit();
     var handler: CaptureHandler = .{ .gpa = gpa };
     defer handler.deinit();
+    const rounds_max = 3;
+    agent.rounds_max = rounds_max;
 
     // A model that asks for a tool every round overruns the bound after exactly
     // `rounds_max` rounds. Each round's side effects are real, so every

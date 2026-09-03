@@ -11,12 +11,16 @@ const std = @import("std");
 
 const json = @import("json.zig");
 
-const LockPolicy = struct {
+pub const LockPolicy = struct {
     /// The maximum number of nonblocking lock attempts.
     attempts_max: usize = 50,
     /// The wait between attempts. The default total wait is about 490 ms.
     wait_ms: u64 = 10,
 };
+
+/// The policy of every lock. A test that provokes contention in a caller lowers
+/// it, because the bounded retry itself is proven here.
+pub var lock_policy: LockPolicy = .{};
 
 /// A parsed store file that owns its backing memory and answers entry lookups.
 /// Open with `open`. Free with `deinit`.
@@ -153,16 +157,16 @@ fn ensureParent(io: std.Io, path: []const u8) !void {
 
 /// Open the stable sibling lock file and take its exclusive advisory lock.
 fn lockFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !std.Io.File {
-    return lockFileWithPolicy(gpa, io, path, .{});
+    return lockFileWithPolicy(gpa, io, path, lock_policy);
 }
 
 fn lockFileWithPolicy(
     gpa: std.mem.Allocator,
     io: std.Io,
     path: []const u8,
-    comptime policy: LockPolicy,
+    policy: LockPolicy,
 ) !std.Io.File {
-    comptime std.debug.assert(policy.attempts_max > 0);
+    std.debug.assert(policy.attempts_max > 0);
     const lock_path = try std.fmt.allocPrint(gpa, "{s}.lock", .{path});
     defer gpa.free(lock_path);
     for (0..policy.attempts_max) |attempt| {
@@ -174,7 +178,7 @@ fn lockFileWithPolicy(
         }) catch |err| switch (err) {
             error.WouldBlock => {
                 if (attempt + 1 == policy.attempts_max) return error.StoreBusy;
-                try io.sleep(.fromMilliseconds(policy.wait_ms), .awake);
+                try io.sleep(.fromMilliseconds(@intCast(policy.wait_ms)), .awake);
                 continue;
             },
             else => return err,

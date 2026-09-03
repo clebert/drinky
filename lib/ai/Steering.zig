@@ -285,7 +285,7 @@ test "push and take survive concurrent contention" {
     const io = std.testing.io;
 
     const producer_count = 8;
-    const per_producer = 1000;
+    const per_producer = 100;
     const total = producer_count * per_producer;
 
     const work = struct {

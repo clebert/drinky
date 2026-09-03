@@ -851,6 +851,8 @@ test "a busy store retries a refreshed credential before the next request" {
         },
     };
     defer subject.tokens.?.deinit(gpa);
+    json_store.lock_policy = .{ .attempts_max = 2, .wait_ms = 0 };
+    defer json_store.lock_policy = .{};
 
     const lock_path = try std.fmt.allocPrint(gpa, "{s}.lock", .{path});
     defer gpa.free(lock_path);

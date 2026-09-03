@@ -588,6 +588,8 @@ test "a locked cache file keeps the fetched list of this session" {
     defer catalog.deinit();
     var directory = try tmp.dir.createDirPathOpen(io, ".drinky", .{});
     directory.close(io);
+    json_store.lock_policy = .{ .attempts_max = 2, .wait_ms = 0 };
+    defer json_store.lock_policy = .{};
 
     // Another Drinky instance holds the lock of the models file.
     const lock_path = try std.fmt.allocPrint(gpa, "{s}.lock", .{catalog.models_path});
