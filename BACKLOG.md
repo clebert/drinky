@@ -32,13 +32,21 @@ decision already taken, or a dependency on another entry. Module layout and exte
 
 ## Features
 
+- **Telegram remote control** — a session binds to a configured Telegram bot, so the user can send
+  messages and run commands from a phone. _Drinky polls `getUpdates` with a long timeout and adds no
+  dependency. A bot binds to one session, because an update offset is consume-once. A picker maps to
+  an inline keyboard, so no command needs an argument grammar. A configured chat id gates every
+  update, because the bot name is public and the session holds a bash tool._
 - **Model metadata in the config** — the config describes a model that no provider and no OpenRouter
   entry describes, so the user can unblock any model. _The provider wins every field it states, the
   config wins over OpenRouter, and OpenRouter fills the rest. A later step can let Drinky write the
   entry for the user._
-- **Discussion mode** — a session mode switches the write tools off and allows the bash commands
-  that the config lists, so a conversation cannot change the repository. _The bash tool holds deny
-  patterns today, and this mode needs the opposite: an allow list that stands for the mode alone._
+- **Configurable modes** — a named mode from the config restricts bash commands and tools, adds an
+  instruction file, and colors the status line, and `/mode` switches it. _The default mode is white
+  and restricts nothing. A mode holds a bash allow list or a bash deny list, and it can switch a
+  built-in tool off. The mode replaces the bash deny list of the config, so that key goes. The mode
+  colors are white, yellow, and red. The instruction file of a mode holds the prose that belongs to
+  its restriction alone, so a git restriction and its rule live together._
 - **Headless mode** — Drinky answers a prompt with no terminal: text in, text out, with a session id
   to continue and flags for the model and the effort level. _This is the base for any agent that
   Drinky drives itself._
