@@ -32,6 +32,8 @@ decision already taken, or a dependency on another entry. Module layout and exte
 
 ## Features
 
+- **Headless mode** — Drinky answers one prompt with no terminal: text in, text out, with flags for
+  the model and the effort level. _This is the base for any agent that Drinky drives itself._
 - **Telegram remote control** — a session binds to a configured Telegram bot, so the user can send
   messages and run commands from a phone. _Drinky polls `getUpdates` with a long timeout and adds no
   dependency. A bot binds to one session, because an update offset is consume-once. A picker maps to
@@ -41,25 +43,6 @@ decision already taken, or a dependency on another entry. Module layout and exte
   entry describes, so the user can unblock any model. _The provider wins every field it states, the
   config wins over OpenRouter, and OpenRouter fills the rest. A later step can let Drinky write the
   entry for the user._
-- **Read-only mode** — `/mode` switches between `Full` and `Read-only`, and the read-only mode sends
-  no tool that changes the system, so the model never sees `write`, `edit`, or `bash`. _The system
-  prompt core states the active mode in one sentence. The status line shows `Mode: Read-only` like
-  the effort, a muted label and a value in the normal intensity. Nothing persists the mode, so every
-  session starts in the full mode. A switch keeps the conversation and accepts one cold cache.
-  Verify against each provider that a history with a call to a tool that the list no longer names
-  passes, and clear the conversation on the switch otherwise._
-- **Diff tool** — a `diff` tool shows the changes of the working tree against `HEAD` or the index as
-  a unified diff, in the full mode and the read-only mode alike. _Drinky runs the git binary with a
-  fixed argv and no shell, `--no-pager diff --no-ext-diff --no-textconv`, an optional `--cached`,
-  and a path after `--`, so no flag of the model reaches git. Untracked files need a second step,
-  because `git diff` skips them._
-- **Fetch tool** — a `fetch` tool reads a web page or a file by URL with GET alone, turns HTML into
-  text, and pages the result like `read`. _The HTTP client of the standard library serves it, so it
-  adds no dependency. It follows a bounded number of redirects and caps the body. It reaches what
-  the machine reaches, the same as `curl` in bash today. Search needs an external API and a key, so
-  it stays out._
-- **Headless mode** — Drinky answers one prompt with no terminal: text in, text out, with flags for
-  the model and the effort level. _This is the base for any agent that Drinky drives itself._
 
 ## Ideas
 
