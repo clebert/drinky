@@ -30,6 +30,10 @@ pub const Skill = struct {
     path: []const u8,
     model_invocation_disabled: bool,
     scope: Scope,
+    /// The `SKILL.md` path of the user skill that this project skill replaced,
+    /// or null. The replacement is the documented precedence, so it warns
+    /// nowhere, and this path is its one record. Owned.
+    replaced_path: ?[]const u8 = null,
 
     pub const Scope = enum { user, project };
 
@@ -37,6 +41,7 @@ pub const Skill = struct {
         gpa.free(self.name);
         gpa.free(self.description);
         gpa.free(self.path);
+        if (self.replaced_path) |path| gpa.free(path);
         self.* = undefined;
     }
 
@@ -129,9 +134,6 @@ pub const Registry = struct {
     /// The startup messages of the scan, in the shape every instruction source
     /// reports, so the app has one way to show them all.
     notice_items: std.ArrayList(instructions.Notice) = .empty,
-    /// How many user skills a project skill of the same name replaced. The
-    /// replacement is the documented precedence, so it counts and never warns.
-    replaced_count: usize = 0,
     skills_capped: bool = false,
     notices_capped: bool = false,
 
@@ -160,10 +162,6 @@ pub const Registry = struct {
 
     pub fn notices(self: *const Registry) []const instructions.Notice {
         return self.notice_items.items;
-    }
-
-    pub fn replacedCount(self: *const Registry) usize {
-        return self.replaced_count;
     }
 
     pub fn get(self: *const Registry, name: []const u8) ?*const Skill {
@@ -460,7 +458,9 @@ pub const Registry = struct {
         for (self.skill_items.items) |*existing| {
             if (!std.mem.eql(u8, existing.name, incoming.name)) continue;
             if (incoming.scope == .project and existing.scope == .user) {
-                self.replaced_count += 1;
+                // A user skill never replaces a skill, so no record is lost here.
+                std.debug.assert(existing.replaced_path == null);
+                incoming.replaced_path = try self.gpa.dupe(u8, existing.path);
                 existing.deinit(self.gpa);
                 existing.* = incoming.*;
                 incoming.* = undefined;
@@ -763,8 +763,14 @@ test "discovery is recursive and project skills shadow user and ancestor skills"
     try std.testing.expect(registry.get("other") != null);
     try std.testing.expect(registry.get("outside") == null);
     // The project copy replaces the user copy silently, because that is the
-    // documented precedence. Only the same-scope clash still warns.
-    try std.testing.expectEqual(@as(usize, 1), registry.replacedCount());
+    // documented precedence. The winner records the path of the user copy, so
+    // the user can still find it. Only the same-scope clash still warns.
+    try std.testing.expect(std.mem.endsWith(
+        u8,
+        registry.get("shared").?.replaced_path.?,
+        "user/shared/SKILL.md",
+    ));
+    try std.testing.expect(registry.get("other").?.replaced_path == null);
     try std.testing.expectEqual(@as(usize, 1), registry.notices().len);
     try std.testing.expect(
         std.mem.indexOf(u8, registry.notices()[0].text, "has priority") != null,

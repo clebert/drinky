@@ -61,7 +61,8 @@ complete command list. You can also ask Drinky to explain its commands, keys, an
 
 - `/login` signs in. `/model` and `/effort` change the model and the reasoning effort.
 - `/skill` picks a discovered skill. `/skill:name` loads one skill with an optional task.
-- `/new` clears the conversation. `/system` shows the complete system prompt.
+- `/new` clears the conversation. `/sources` shows the loaded instruction files and skills.
+  `/system` shows the complete system prompt.
 
 ## Configuration
 

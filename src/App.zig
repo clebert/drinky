@@ -25,6 +25,7 @@ const Herdr = @import("Herdr.zig");
 const layout = @import("layout.zig");
 const Retry = @import("Retry.zig");
 const Session = @import("Session.zig");
+const sources = @import("sources.zig");
 const State = @import("State.zig");
 const system_prompt = @import("system_prompt.zig");
 const ui = @import("ui/root.zig");
@@ -104,6 +105,10 @@ prompt: []const u8,
 /// What the `describe_drinky` tool returns: the document that describes the
 /// harness itself. It outlives the agent, which borrows it.
 document: []const u8,
+/// The page that `/sources` opens: the instruction files, the skills, and the
+/// required skills of this start. `run` composes it once, because the sources
+/// of a session never change after that.
+sources_page: []const u8,
 /// The path-triggered skill rules of the session. Every rule borrows its glob
 /// from the config and its name and file from the skill registry, so both
 /// outlive the agent, which borrows the guard itself.
@@ -578,17 +583,6 @@ const PasteSplitter = struct {
     }
 };
 
-/// The guidance sources of one startup report. Both instruction results have the
-/// same type, so the field names keep the two apart at the call site.
-const Sources = struct {
-    user_instructions: *const ai.instructions.Result,
-    project_instructions: *const ai.instructions.Result,
-    skills: *const ai.skills.Registry,
-    /// How many required skill names no discovered skill carries, each name
-    /// counted once. `resolveRequiredSkills` reports the count.
-    required_missing_count: usize = 0,
-};
-
 fn validateWorkingDirectory(gpa: std.mem.Allocator, path: []const u8) !void {
     if (std.unicode.utf8ValidateSlice(path)) return;
     const safe_path = try ai.instructions.diagnosticAlloc(gpa, path);
@@ -732,7 +726,9 @@ pub fn run(
         for (skill_notices.items) |notice| gpa.free(notice.text);
         skill_notices.deinit(gpa);
     }
-    const required_missing_count = try self.resolveRequiredSkills(&config, &skill_notices);
+    var required_missing: std.ArrayList(Config.RequiredSkill) = .empty;
+    defer required_missing.deinit(gpa);
+    try self.resolveRequiredSkills(&config, &skill_notices, &required_missing);
     self.prompt = try system_prompt.compose(gpa, &.{
         .core = system_prompt.default_core,
         .current_time = std.Io.Clock.real.now(io),
@@ -743,6 +739,15 @@ pub fn run(
         .required_skills = self.skill_guard.rules(),
     });
     defer gpa.free(self.prompt);
+    self.sources_page = try sources.compose(gpa, &.{
+        .user_instructions = config.user_instructions.files(),
+        .project_instructions = self.project_instructions.files(),
+        .skills = &self.skills,
+        .required_skills = self.skill_guard.rules(),
+        .required_missing = required_missing.items,
+        .roots = self.displayRoots(),
+    });
+    defer gpa.free(self.sources_page);
     self.document = try describe.compose(gpa, &.{
         .config = &config,
         .effort_default = effort_default,
@@ -855,12 +860,11 @@ pub fn run(
         "Drinky omitted the remaining unknown configuration keys in {s}.",
         .{config.path},
     );
-    try self.reportSources(&.{
-        .user_instructions = &config.user_instructions,
-        .project_instructions = &self.project_instructions,
-        .skills = &self.skills,
-        .required_missing_count = required_missing_count,
-    });
+    // Only a skipped file gets a line. A normal load reports nothing, and
+    // `/sources` shows what it loaded.
+    try self.reportNotices(config.user_instructions.notices());
+    try self.reportNotices(self.project_instructions.notices());
+    try self.reportNotices(self.skills.notices());
     // No account signed in: open the login picker (the same one /login opens) so
     // the user chooses how to sign in.
     if (!self.signedIn()) {
@@ -917,6 +921,7 @@ fn initFields(self: *App, gpa: std.mem.Allocator, io: std.Io) void {
         .skills = .init(gpa),
         .prompt = "",
         .document = "",
+        .sources_page = "",
         // The rules join it in `run`, once the config and the skill scan are
         // both read.
         .skill_guard = .{},
@@ -2141,6 +2146,10 @@ fn applyOutcome(self: *App, outcome: ai.command.Outcome) !void {
             .title = "System prompt",
             .content = self.prompt,
         }),
+        .show_sources => try self.session.openPage(&.{
+            .title = "Sources",
+            .content = self.sources_page,
+        }),
         .new_conversation => {
             // The agent drops its history, and the session drops the blocks
             // that project it, so the worker and the screen empty together.
@@ -2149,8 +2158,7 @@ fn applyOutcome(self: *App, outcome: ai.command.Outcome) !void {
             self.agent.resetConversation();
             self.session.clearConversation();
             // The intro line is the legend of the interface, so the empty
-            // conversation opens on it again. The source summary does not
-            // return, because it reports the discovery of one start alone.
+            // conversation opens on it again.
             try self.session.transcript.append(.intro, .{}, intro_text);
             // The cleared conversation holds no work to continue from.
             self.clearRetry();
@@ -2604,54 +2612,10 @@ fn reportNotice(
     );
 }
 
-/// Record one source summary for the guidance that Drinky holds, then report
-/// what each source skipped. The summary describes startup state, not an event.
-/// It uses dense count fragments because a normal load needs no action.
-/// `/system` shows each counted path. A run with no guidance and no skipped file
-/// records nothing.
-fn reportSources(self: *App, sources: *const Sources) !void {
-    var line: std.Io.Writer.Allocating = .init(self.gpa);
-    defer line.deinit();
-    const user_count = sources.user_instructions.files().len;
-    const project_count = sources.project_instructions.files().len;
-    if (user_count > 0 or project_count > 0) {
-        try line.writer.writeAll("Instructions:");
-        if (user_count > 0) try line.writer.print(" {d} user", .{user_count});
-        if (user_count > 0 and project_count > 0) try line.writer.writeByte(',');
-        if (project_count > 0) try line.writer.print(" {d} project", .{project_count});
-    }
-    // The catalog counts the skills the model can see, which is what `/system`
-    // shows. Drinky only finds a skill here and advertises its name and its
-    // description. The instructions stay on disk until the skill runs. A
-    // project skill that replaces a user skill of the same name is the
-    // documented precedence, and a required skill that this project does not
-    // carry is normal under a global config. Both are counts, not warnings,
-    // and both repeat in a stable setup, so they must stay this small.
-    const skill_count = sources.skills.catalog().count();
-    const replaced_count = sources.skills.replacedCount();
-    const missing_count = sources.required_missing_count;
-    if (skill_count > 0 or missing_count > 0) {
-        if (line.written().len > 0) try line.writer.writeAll(" · ");
-        try line.writer.print("Skills: {d}", .{skill_count});
-        if (replaced_count > 0 or missing_count > 0) {
-            try line.writer.writeAll(" (");
-            if (replaced_count > 0) try line.writer.print("{d} replaced", .{replaced_count});
-            if (replaced_count > 0 and missing_count > 0) try line.writer.writeAll(", ");
-            if (missing_count > 0) try line.writer.print("{d} missing", .{missing_count});
-            try line.writer.writeByte(')');
-        }
-    }
-    if (line.written().len > 0)
-        try self.session.transcript.append(.source_summary, .{}, line.written());
-    try self.reportNotices(sources.user_instructions.notices());
-    try self.reportNotices(sources.project_instructions.notices());
-    try self.reportNotices(sources.skills.notices());
-}
-
 /// Pair every configured path-triggered skill with a discovered skill and hand
 /// the pair to the guard. The global config serves every project, so a name
-/// that no skill here carries is a normal state. It returns the count of such
-/// names for the source summary, because a typo in a name silently disables a
+/// that no skill here carries is a normal state. Such a pair goes into
+/// `missing` for the sources page, because a typo in a name silently disables a
 /// guard, and the system prompt names only the rules that resolved. An entry
 /// past the cap drops with a failure.
 ///
@@ -2661,18 +2625,11 @@ fn resolveRequiredSkills(
     self: *App,
     config: *const Config,
     notices: *std.ArrayList(ai.instructions.Notice),
-) !usize {
-    // The missing names, each once. Several patterns often share one skill,
-    // and one name must not count once per pattern.
-    var missing: std.ArrayList([]const u8) = .empty;
-    defer missing.deinit(self.gpa);
+    missing: *std.ArrayList(Config.RequiredSkill),
+) !void {
     for (config.required_skills) |required| {
         const target = self.skills.get(required.skill) orelse {
-            var seen = false;
-            for (missing.items) |name| {
-                if (std.mem.eql(u8, name, required.skill)) seen = true;
-            }
-            if (!seen) try missing.append(self.gpa, required.skill);
+            try missing.append(self.gpa, required);
             continue;
         };
         self.skill_guard.add(.{
@@ -2691,7 +2648,6 @@ fn resolveRequiredSkills(
             },
         };
     }
-    return missing.items.len;
 }
 
 /// Retain one startup message that the transcript cannot take yet.
@@ -7859,96 +7815,87 @@ fn tmpPath(
     return std.fs.path.join(gpa, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, suffix });
 }
 
-test "the startup report counts the sources in one line and keeps a skip verbose" {
+// The startup records no count. A file that a source skipped is the one thing
+// the user must fix, so it alone gets a line.
+test "the startup reports a skipped file alone" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-
-    // The `.git` marker bounds both ancestor scans, so the enclosing repository
-    // cannot add its own instruction files or skills to the counts.
-    var git = try tmp.dir.createDirPathOpen(io, ".git", .{});
-    git.close(io);
-    try tmp.dir.writeFile(io, .{ .sub_path = "AGENTS.md", .data = "Project.\n" });
     try tmp.dir.writeFile(io, .{ .sub_path = "first.md", .data = "First.\n" });
-    try tmp.dir.writeFile(io, .{ .sub_path = "second.md", .data = "Second.\n" });
-    var skill = try tmp.dir.createDirPathOpen(io, ".agents/skills/demo", .{});
-    skill.close(io);
-    try tmp.dir.writeFile(io, .{
-        .sub_path = ".agents/skills/demo/SKILL.md",
-        .data = "---\nname: demo\ndescription: a test skill\n---\nbody\n",
-    });
-    var hidden = try tmp.dir.createDirPathOpen(io, ".agents/skills/hidden", .{});
-    hidden.close(io);
-    try tmp.dir.writeFile(io, .{
-        .sub_path = ".agents/skills/hidden/SKILL.md",
-        .data = "---\nname: hidden\ndescription: a manual skill\n" ++
-            "disable-model-invocation: true\n---\nbody\n",
-    });
-    // A user skill with the same name. The project copy replaces it, and the
-    // line reports the replacement as a count, not as a failure.
-    var user_demo = try tmp.dir.createDirPathOpen(io, "home/.agents/skills/demo", .{});
-    user_demo.close(io);
-    try tmp.dir.writeFile(io, .{
-        .sub_path = "home/.agents/skills/demo/SKILL.md",
-        .data = "---\nname: demo\ndescription: the user copy\n---\nbody\n",
-    });
     const root = try tmpPath(gpa, io, &tmp, "");
     defer gpa.free(root);
-    const user_skills = try std.fs.path.join(gpa, &.{ root, "home", ".agents", "skills" });
-    defer gpa.free(user_skills);
 
     var app: App = undefined;
     app.initForTest(gpa);
     app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
-    var user_instructions = try ai.instructions.load(gpa, io, &.{
+    var loaded = try ai.instructions.load(gpa, io, &.{
         .directory = root,
-        .paths = &.{ "first.md", "second.md", "missing.md" },
+        .paths = &.{"first.md"},
     });
-    defer user_instructions.deinit();
-    app.project_instructions = try ai.instructions.discover(gpa, io, root);
-    defer app.project_instructions.deinit();
-    app.skills = try ai.skills.discover(gpa, io, &.{
-        .user_root = user_skills,
-        .project_start = root,
-        .project_root = app.project_instructions.projectRoot(),
-    });
-    defer app.skills.deinit();
+    defer loaded.deinit();
+    try app.reportNotices(loaded.notices());
+    try std.testing.expectEqual(@as(usize, 0), app.session.transcript.blocks().len);
 
-    try app.reportSources(&.{
-        .user_instructions = &user_instructions,
-        .project_instructions = &app.project_instructions,
-        .skills = &app.skills,
+    var skipped = try ai.instructions.load(gpa, io, &.{
+        .directory = root,
+        .paths = &.{ "first.md", "missing.md" },
     });
-
+    defer skipped.deinit();
+    try app.reportNotices(skipped.notices());
     const blocks = app.session.transcript.blocks();
-    try std.testing.expectEqual(@as(usize, 2), blocks.len);
-    try std.testing.expect(blocks[0].content == .source_summary);
-    // The count covers the two skills the scan kept, minus the one that disabled
-    // model invocation, because `/system` never shows that one.
-    try std.testing.expectEqualStrings(
-        "Instructions: 2 user, 1 project · Skills: 1 (1 replaced)",
-        blocks[0].content.source_summary.items,
-    );
-    // A source that skipped something stays verbose, because the user must fix it.
-    try std.testing.expect(blocks[1].content.event.is_error);
+    try std.testing.expectEqual(@as(usize, 1), blocks.len);
+    try std.testing.expect(blocks[0].content.event.is_error);
     try std.testing.expect(std.mem.indexOf(
         u8,
-        blocks[1].content.event.text.items,
+        blocks[0].content.event.text.items,
         "missing.md",
     ) != null);
+}
 
-    try app.session.paint(.{ .columns = 100, .rows = 24 });
-    const painted = out.written();
-    const accent_sequence = comptime ui.role.sequence(.accent);
-    const muted_sequence = comptime ui.role.sequence(.muted);
-    try std.testing.expect(std.mem.indexOf(u8, painted, accent_sequence ++ "Instructions:") != null);
-    try std.testing.expect(std.mem.indexOf(u8, painted, accent_sequence ++ "Skills:") != null);
-    try std.testing.expect(std.mem.indexOf(u8, painted, muted_sequence ++ " 2 user") != null);
-    try std.testing.expect(std.mem.indexOf(u8, painted, "Event: Instructions:") == null);
+test "/sources opens the composed page alone and escape restores the conversation" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    const page = "# Sources\n\n## Skills\n\n- `demo` · Scope: project · File: `SKILL.md`\n";
+    var app: App = undefined;
+    app.initForTest(gpa);
+    app.sources_page = page;
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = test_anthropic_model,
+        .system = "",
+        .retry = .{},
+        .environ = .empty,
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
+    defer app.session.deinit();
+
+    try app.session.transcript.append(.event, .{}, "history marker");
+    try app.session.editor.insert("/sources");
+    try app.submit();
+
+    try std.testing.expect(app.session.mode == .viewing);
+    try std.testing.expectEqualStrings(page, app.session.mode.viewing.content);
+    try std.testing.expectEqualStrings("", app.session.editor.visible());
+    try std.testing.expectEqual(@as(usize, 1), app.session.transcript.blocks().len);
+    const page_start = out.written().len;
+    try app.session.paint(.{ .columns = 80, .rows = 8 });
+    const page_bytes = out.written()[page_start..];
+    try std.testing.expect(std.mem.indexOf(u8, page_bytes, "Sources") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page_bytes, "Esc: Close") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page_bytes, "Scope: project") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page_bytes, "## Skills") == null);
+    try std.testing.expect(std.mem.indexOf(u8, page_bytes, "history marker") == null);
+
+    try app.handleKey(&.escape);
+    try std.testing.expect(app.session.mode == .prompt);
+    try std.testing.expectEqual(@as(usize, 1), app.session.transcript.blocks().len);
 }
 
 // A configured rule reaches the guard only through a discovered skill. A name
@@ -7987,8 +7934,6 @@ test "a configured required skill applies, and an unknown name reports" {
 
     var user_instructions = ai.instructions.Result.init(gpa, .user);
     defer user_instructions.deinit();
-    var project_instructions = ai.instructions.Result.init(gpa, .project);
-    defer project_instructions.deinit();
     const required = [_]Config.RequiredSkill{
         .{ .glob = "**/*.zig", .skill = "demo" },
         .{ .glob = "**/*.ts", .skill = "nonesuch" },
@@ -8004,7 +7949,9 @@ test "a configured required skill applies, and an unknown name reports" {
         for (notices.items) |notice| gpa.free(notice.text);
         notices.deinit(gpa);
     }
-    const missing_count = try app.resolveRequiredSkills(&config, &notices);
+    var missing: std.ArrayList(Config.RequiredSkill) = .empty;
+    defer missing.deinit(gpa);
+    try app.resolveRequiredSkills(&config, &notices, &missing);
     try app.reportNotices(notices.items);
 
     // The pair that resolved guards its files, and it names the file that the
@@ -8038,23 +7985,13 @@ test "a configured required skill applies, and an unknown name reports" {
         .history = &.{},
     })) == null);
     // A missing name is a normal state of the global config, so it leaves no
-    // message of its own. Two patterns name the skill once, and the startup
-    // line carries the count as one dense fragment.
-    try std.testing.expectEqual(@as(usize, 1), missing_count);
+    // message of its own. Each pair that names it goes to the sources page.
     try std.testing.expectEqual(@as(usize, 0), notices.items.len);
-    try app.reportSources(&.{
-        .user_instructions = &user_instructions,
-        .project_instructions = &project_instructions,
-        .skills = &app.skills,
-        .required_missing_count = missing_count,
-    });
-    const blocks = app.session.transcript.blocks();
-    try std.testing.expectEqual(@as(usize, 1), blocks.len);
-    try std.testing.expect(blocks[0].content == .source_summary);
-    try std.testing.expectEqualStrings(
-        "Skills: 1 (1 missing)",
-        blocks[0].content.source_summary.items,
-    );
+    try std.testing.expectEqual(@as(usize, 2), missing.items.len);
+    try std.testing.expectEqualStrings("**/*.ts", missing.items[0].glob);
+    try std.testing.expectEqualStrings("nonesuch", missing.items[0].skill);
+    try std.testing.expectEqualStrings("**/*.tsx", missing.items[1].glob);
+    try std.testing.expectEqual(@as(usize, 0), app.session.transcript.blocks().len);
 }
 
 test directoryLabel {
@@ -8230,48 +8167,6 @@ test "an input event re-reads the branch" {
     const events = [_]Session.UiEvent{.{ .keys = try gpa.dupe(u8, "x") }};
     try std.testing.expect(!try app.applyBatch(&events));
     try std.testing.expectEqualStrings("other", app.session.branch().?);
-}
-
-test "a startup with no guidance and no skipped file reports nothing" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var git = try tmp.dir.createDirPathOpen(io, ".git", .{});
-    git.close(io);
-    const root = try tmpPath(gpa, io, &tmp, "");
-    defer gpa.free(root);
-    const user_skills = try std.fs.path.join(gpa, &.{ root, "home", ".agents", "skills" });
-    defer gpa.free(user_skills);
-
-    var app: App = undefined;
-    app.initForTest(gpa);
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
-    defer app.session.deinit();
-    var user_instructions = try ai.instructions.load(gpa, io, &.{
-        .directory = root,
-        .paths = &.{},
-    });
-    defer user_instructions.deinit();
-    app.project_instructions = try ai.instructions.discover(gpa, io, root);
-    defer app.project_instructions.deinit();
-    app.skills = try ai.skills.discover(gpa, io, &.{
-        .user_root = user_skills,
-        .project_start = root,
-        .project_root = app.project_instructions.projectRoot(),
-    });
-    defer app.skills.deinit();
-
-    try app.reportSources(&.{
-        .user_instructions = &user_instructions,
-        .project_instructions = &app.project_instructions,
-        .skills = &app.skills,
-    });
-
-    try std.testing.expectEqual(@as(usize, 0), app.session.transcript.blocks().len);
 }
 
 test "cancel draining preserves non-turn events ahead of newer queue data" {

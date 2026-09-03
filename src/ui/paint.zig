@@ -25,17 +25,14 @@ const activity_growth_interval_ticks: u64 = 6;
 // At 16 ms per frame, show the caret about 600 ms and hide it about 600 ms.
 const caret_blink_ticks: u64 = 37;
 
-/// How a notice paints: the role of its body, the role of its labels, and the
-/// tag that opens it. It states how a line wider than one row fits too.
+/// How a notice paints: the role of its body and the tag that opens it. It
+/// states how a line wider than one row fits too.
 pub const Notice = struct {
-    /// The role of the body and of every separator between its labelled parts.
+    /// The role of the body.
     role: role.Name,
     /// A semantic tag, or empty. It stands on the first row of the notice alone.
     /// Continuation rows start without an indent, so copied text holds no blanks.
     prefix: []const u8 = "",
-    /// The role of each label before `: `, or null when the body has no labels.
-    /// A separator starts another labelled part.
-    label_role: ?role.Name = null,
     fit: Fit = .wrap,
 };
 
@@ -326,10 +323,7 @@ pub fn notice(placement: *const Placement, look: *const Notice, text: []const u8
         if (line < placement.skip) continue;
         placement.sink.begin();
         if (index == 0) try noticePrefix(placement.sink, look, shown_prefix);
-        try noticeBody(placement.sink, look, row.kept, .{
-            .role_active = index == 0 and shown_prefix.len > 0,
-            .starts_part = startsNoticePart(text, row.kept),
-        });
+        try noticeBody(placement.sink, look, row.kept, index == 0 and shown_prefix.len > 0);
         if (row.marked) try placement.sink.text(ellipsis);
         try attribute.apply(placement.sink, .reset);
         placement.sink.end(.{ .id = placement.id, .line = line });
@@ -343,67 +337,16 @@ fn noticePrefix(sink: *terminal.View.Sink, look: *const Notice, prefix: []const 
     try sink.text(prefix);
 }
 
-/// Whether `row` starts a separator-delimited part or a logical line of
-/// `source`. A wrapped value starts at neither boundary.
-fn startsNoticePart(source: []const u8, row: []const u8) bool {
-    if (row.len == 0) return false;
-    const source_start = @intFromPtr(source.ptr);
-    const row_start = @intFromPtr(row.ptr);
-    std.debug.assert(row_start >= source_start);
-    const offset = row_start - source_start;
-    if (offset == 0 or source[offset - 1] == '\n') return true;
-    return offset >= separator.len and
-        std.mem.eql(u8, source[offset - separator.len .. offset], separator);
-}
-
-/// The state one body row opens in. A caller names each field, so it can never
-/// swap the two.
-const BodyOptions = struct {
-    /// Whether the prefix already applied the body role to the row.
-    role_active: bool,
-    /// Whether the row starts a separator-delimited part or a logical line.
-    starts_part: bool,
-};
-
-/// Paint one body row. Each separator-delimited part gives its label the label
-/// role and gives its value and separator the body role.
+/// Paint one body row in the body role. `role_active` states that the prefix
+/// already applied that role to the row.
 fn noticeBody(
     sink: *terminal.View.Sink,
     look: *const Notice,
     text: []const u8,
-    options: BodyOptions,
+    role_active: bool,
 ) !void {
-    const maybe_label_role = look.label_role;
-    if (maybe_label_role == null or !options.starts_part) {
-        if (!options.role_active) try role.apply(sink, look.role);
-        try sink.text(text);
-        return;
-    }
-
-    var rest = text;
-    while (true) {
-        const part_end = std.mem.indexOf(u8, rest, separator) orelse rest.len;
-        const part = rest[0..part_end];
-        const maybe_value_start = if (std.mem.indexOf(u8, part, ": ")) |colon|
-            colon + 1
-        else
-            null;
-        if (maybe_value_start) |value_start| {
-            try role.apply(sink, maybe_label_role.?);
-            try sink.text(part[0..value_start]);
-            try role.apply(sink, look.role);
-            try sink.text(part[value_start..]);
-        } else {
-            // A narrow cut can hide the colon. The visible part is then label
-            // text alone, so it keeps the label role through the ellipsis.
-            try role.apply(sink, maybe_label_role.?);
-            try sink.text(part);
-        }
-        if (part_end == rest.len) return;
-        try role.apply(sink, look.role);
-        try sink.text(separator);
-        rest = rest[part_end + separator.len ..];
-    }
+    if (!role_active) try role.apply(sink, look.role);
+    try sink.text(text);
 }
 
 /// What one row keeps of `text`: the head of its first line, and whether the row
@@ -448,10 +391,7 @@ fn noticeHead(placement: *const Placement, look: *const Notice, text: []const u8
     const row = headRow(look.prefix, text, placement.columns);
     placement.sink.begin();
     try noticePrefix(placement.sink, look, row.label);
-    try noticeBody(placement.sink, look, row.kept, .{
-        .role_active = row.label.len > 0,
-        .starts_part = true,
-    });
+    try noticeBody(placement.sink, look, row.kept, row.label.len > 0);
     if (row.marked) try placement.sink.text(ellipsis);
     try attribute.apply(placement.sink, .reset);
     placement.sink.end(.{ .id = placement.id, .line = placement.base });

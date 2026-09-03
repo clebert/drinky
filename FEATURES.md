@@ -170,7 +170,11 @@ Gemini on Google Vertex AI through a service account key file.
 - **/logout** — drop the credentials of a signed-in account and hand the session to another account.
 - **/new** — clear the conversation, the usage stats, and the steering. The configuration stays. The
   next paint clears the terminal scrollback, so the empty conversation starts on a clean screen. The
-  intro line returns, and the source summary does not.
+  intro line returns.
+- **/sources** — show the instruction files, the skills, and the required skills of this start in a
+  scrollable full-window page. Each skill row names its scope and its file. A row marks a skill that
+  the model cannot invoke, and a project skill row names the user skill that it replaced. A required
+  skill row marks a configured name that no discovered skill carries.
 - **/system** — show the complete system prompt as rendered Markdown in a scrollable full-window
   page. `M` toggles the exact source.
 - **/skill** — pick one of the discovered skills. Each row holds the first sentence of the
@@ -350,8 +354,6 @@ Gemini on Google Vertex AI through a service account key file.
 - The terminal supplies every color and the muted intensity. Drinky uses the default colors, ANSI
   slots 0 to 7, faint, and reverse video. A filled box keeps the terminal background for its text. A
   label or a glyph marks every state, so color is never the only signal.
-- A source summary paints its `Instructions:` and `Skills:` labels in the accent color and keeps its
-  values muted.
 - A message that Drinky wrote for the user takes the user color and no box: the head of a loaded
   skill and the line of a retry attempt. A typed message cannot forge it.
 - A failed event opens with `Error:` and paints its whole text in the error color. Every other event
@@ -406,9 +408,8 @@ Gemini on Google Vertex AI through a service account key file.
   Drinky skips and reports a skill file above the window of one `read` call, 2000 lines or 50 KiB,
   so one call always shows the model a whole skill.
 - Drinky loads the user instruction files that `config.json` names, in order.
-- One source summary counts the loaded instruction files, the found skills, the user skills that a
-  project skill replaced, and the required skills that this project does not carry. A count of zero
-  stays out. Only a skipped file gets its own line, and `/system` shows every counted path.
+- A normal load reports nothing at startup. Only a skipped file gets its own line, and `/sources`
+  shows every loaded file.
 - An instruction file is a regular UTF-8 file with content, no NUL byte, and at most 32 KiB. Each
   source loads at most 32 files and 64 KiB, and one file loads once even when two paths reach it.
   Drinky reports what it skips.
@@ -419,8 +420,8 @@ Gemini on Google Vertex AI through a service account key file.
   `GOOGLE_APPLICATION_CREDENTIALS` and `GOOGLE_CLOUD_LOCATION`.
 - Drinky reports an unknown key, an unknown effort level, and an interface value that it cannot use,
   so a typo never looks like an applied setting.
-- A required skill whose name no discovered skill carries guards nothing in that project. The source
-  summary counts each such name once, because the global config serves every project.
+- A required skill whose name no discovered skill carries guards nothing in that project. It reports
+  no failure, because the global config serves every project, and `/sources` names each such pair.
 - Drinky locks each JSON store with an owner-only sibling `.lock` file, so two instances write in
   turn.
 - `~/.drinky/state.json` remembers per project the last account and effort level, and the model of

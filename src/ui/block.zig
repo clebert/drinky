@@ -28,9 +28,6 @@ pub const Entry = struct {
 
     pub const Content = union(enum) {
         intro: std.ArrayList(u8),
-        /// The startup counts of instruction and skill sources. Its own labels
-        /// identify it, so it takes no generic event prefix.
-        source_summary: std.ArrayList(u8),
         user: std.ArrayList(u8),
         /// A line that reports a message that Drinky wrote for the user. The
         /// head of a loaded skill and the line of a retry attempt read this way.
@@ -150,7 +147,7 @@ pub const Entry = struct {
 
     pub fn deinit(self: *Entry, gpa: std.mem.Allocator) void {
         switch (self.content) {
-            .intro, .source_summary, .user, .user_note, .model => |*text| text.deinit(gpa),
+            .intro, .user, .user_note, .model => |*text| text.deinit(gpa),
             .thinking => |*reasoning| reasoning.text.deinit(gpa),
             .tool_result, .event => |*flagged| flagged.text.deinit(gpa),
         }
@@ -163,7 +160,7 @@ pub const Entry = struct {
         switch (self.content) {
             .model => |*list| try list.appendSlice(gpa, delta),
             .thinking => |*reasoning| try reasoning.text.appendSlice(gpa, delta),
-            .intro, .source_summary, .user, .user_note, .tool_result, .event => unreachable,
+            .intro, .user, .user_note, .tool_result, .event => unreachable,
         }
         self.cache.invalidate();
     }
@@ -180,7 +177,7 @@ pub const Entry = struct {
     pub fn account(self: *const Entry) ?ai.llm.Account {
         return switch (self.content) {
             .thinking => |reasoning| reasoning.account,
-            .intro, .source_summary, .user, .user_note, .model, .tool_result, .event => null,
+            .intro, .user, .user_note, .model, .tool_result, .event => null,
         };
     }
 
@@ -189,14 +186,14 @@ pub const Entry = struct {
     pub fn survivesRewind(self: *const Entry) bool {
         return switch (self.content) {
             .event => |event| event.survives_rewind,
-            .intro, .source_summary, .user, .user_note, .thinking, .model, .tool_result => false,
+            .intro, .user, .user_note, .thinking, .model, .tool_result => false,
         };
     }
 
     /// The bytes this block holds.
     fn bytes(self: *const Entry) []const u8 {
         return switch (self.content) {
-            .intro, .source_summary, .user, .user_note, .model => |list| list.items,
+            .intro, .user, .user_note, .model => |list| list.items,
             .thinking => |reasoning| reasoning.text.items,
             .tool_result, .event => |flagged| flagged.text.items,
         };
@@ -215,7 +212,6 @@ pub const Entry = struct {
     /// counts cannot diverge from the rows it paints.
     fn notice(self: *const Entry) ?paint.Notice {
         return switch (self.content) {
-            .source_summary => .{ .role = .muted, .label_role = .accent },
             .user_note => .{ .role = .user_note },
             // An event wraps, so the transcript keeps the complete sentence.
             // Its prefix preserves the event type in copied text.
@@ -241,7 +237,7 @@ pub const Entry = struct {
         return switch (self.content) {
             .user => .user,
             .tool_result => |flagged| if (flagged.is_error) .tool_error else .tool_success,
-            .intro, .source_summary, .user_note, .thinking, .model, .event => null,
+            .intro, .user_note, .thinking, .model, .event => null,
         };
     }
 
@@ -265,7 +261,7 @@ pub const Entry = struct {
             ),
             .thinking => |reasoning| markdown.rows(trimBlankTail(reasoning.text.items), columns),
             .model => |list| markdown.rows(trimBlankTail(list.items), columns),
-            .source_summary, .user_note, .event => unreachable,
+            .user_note, .event => unreachable,
         };
     }
 
@@ -310,7 +306,7 @@ pub const Entry = struct {
         if (self.notice()) |look| return paint.notice(placement, &look, self.bytes());
         const box = self.boxRole();
         switch (self.content) {
-            .source_summary, .user_note, .event => unreachable,
+            .user_note, .event => unreachable,
             .intro => |list| _ = try introCaption(list.items).render(placement),
             .user => |list| try paint.box(placement, box.?, &.{ .text = list.items }),
             .tool_result => |flagged| try paint.box(
@@ -403,8 +399,6 @@ test "each entry variant renders exactly the rows it counts" {
     const gpa = std.testing.allocator;
     const cases = [_]struct { kind: Entry.Kind, options: Entry.Options, text: []const u8 }{
         .{ .kind = .intro, .options = .{}, .text = "a single intro line" },
-        .{ .kind = .source_summary, .options = .{}, .text = "Instructions: 1 user, 1 project" ++
-            " · Skills: 3 (2 replaced)" },
         .{ .kind = .event, .options = .{}, .text = "first\nsecond\nthird" },
         .{ .kind = .event, .options = .{ .is_error = true }, .text = "boom" },
         .{ .kind = .user, .options = .{}, .text = "a user message long enough to wrap " ++
@@ -640,7 +634,6 @@ const Pinned = struct {
     kind: Entry.Kind,
     options: Entry.Options = .{},
     notice: ?role.Name = null,
-    notice_label: ?role.Name = null,
     box: ?role.Name = null,
     caption: bool = false,
 };
@@ -652,7 +645,6 @@ test "each block kind pins the role that it paints" {
     const gpa = std.testing.allocator;
     const pinned = [_]Pinned{
         .{ .kind = .intro, .caption = true },
-        .{ .kind = .source_summary, .notice = .muted, .notice_label = .accent },
         // Every message that Drinky wrote for the user reports in this color.
         .{ .kind = .user_note, .notice = .user_note },
         .{ .kind = .event, .notice = .accent },
@@ -671,7 +663,6 @@ test "each block kind pins the role that it paints" {
         const look = entry.notice();
         if (pin.notice) |name| {
             try std.testing.expectEqual(name, look.?.role);
-            try std.testing.expectEqual(pin.notice_label, look.?.label_role);
         } else {
             try std.testing.expect(look == null);
         }
@@ -716,56 +707,6 @@ test "the intro block paints the Drinky caption" {
 
     // A window narrower than the joined row splits the legend under the title.
     try std.testing.expectEqual(@as(usize, 3), intro.rows(14));
-}
-
-// The source summary names its parts in the accent color and keeps their values
-// muted. Its labels identify it without a generic event prefix.
-test "the source summary paints accent labels and muted values" {
-    const gpa = std.testing.allocator;
-    var summary = try Entry.init(
-        gpa,
-        .source_summary,
-        .{},
-        "Instructions: 1 user, 1 project · Skills: 3 (2 replaced)",
-    );
-    defer summary.deinit(gpa);
-
-    const painted = try rendered(gpa, &summary, 80, 0);
-    defer gpa.free(painted);
-    const accent_sequence = comptime role.sequence(.accent);
-    const muted_sequence = comptime role.sequence(.muted);
-    try std.testing.expect(std.mem.indexOf(
-        u8,
-        painted,
-        accent_sequence ++ "Instructions:" ++ muted_sequence ++ " 1 user",
-    ) != null);
-    try std.testing.expect(std.mem.indexOf(
-        u8,
-        painted,
-        accent_sequence ++ "Skills:" ++ muted_sequence ++ " 3",
-    ) != null);
-    try std.testing.expect(std.mem.indexOf(u8, painted, "Event:") == null);
-
-    // A width that wraps the two parts puts the second label on its own row.
-    // The break drops the separator, so the row opens behind it and starts a new
-    // labelled part with an accent label.
-    const wrapped = try rendered(gpa, &summary, 40, 0);
-    defer gpa.free(wrapped);
-    try std.testing.expectEqual(@as(usize, 2), paintedRows(wrapped));
-    var rows = std.mem.splitSequence(u8, wrapped, "\r\n");
-    _ = rows.next().?;
-    const continuation = rows.next().?;
-    try std.testing.expect(std.mem.indexOf(
-        u8,
-        continuation,
-        accent_sequence ++ "Skills:" ++ muted_sequence ++ " 3 (2 replaced)",
-    ) != null);
-
-    var single = try Entry.init(gpa, .source_summary, .{}, "Skills: 1 (1 missing)");
-    defer single.deinit(gpa);
-    const narrow = try rendered(gpa, &single, 12, 0);
-    defer gpa.free(narrow);
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, narrow, accent_sequence));
 }
 
 // A prefix identifies an event when its color or an error role is unavailable

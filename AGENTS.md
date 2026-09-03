@@ -57,7 +57,6 @@ writes no color of its own.
 - An event block reports the state of the session, never a message.
 - A failed event paints its complete text in the error color. Every other event paints its complete
   text in the accent color.
-- A source summary is not an event. Its labels take the accent color, and its values stay muted.
 - A user box holds typed text alone.
 - Add a new block kind to the role test of `src/ui/block.zig`, so no kind reaches a release
   unclassified.

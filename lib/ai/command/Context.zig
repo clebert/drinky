@@ -61,6 +61,9 @@ pub const Outcome = union(enum) {
     fetch: llm.Account,
     /// Clear conversation and presentation state but keep the configuration.
     new_conversation,
+    /// Show the instruction files, the skills, and the required skills that the
+    /// app loaded at startup.
+    show_sources,
     /// Show the complete provider-neutral system prompt assembled by the app.
     show_system_prompt,
 

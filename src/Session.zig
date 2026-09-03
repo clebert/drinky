@@ -985,6 +985,7 @@ pub fn applyOutcome(self: *Session, outcome: ai.command.Outcome) !void {
         .credential_replaced,
         .fetch,
         .new_conversation,
+        .show_sources,
         .show_system_prompt,
         => unreachable,
     }
