@@ -1,0 +1,268 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<meta name="description" content="A dependency-free coding agent you can own end to end.">
+<meta property="og:type" content="website">
+<meta property="og:title" content="Drinky">
+<meta property="og:description" content="A dependency-free coding agent you can own end to end.">
+<meta property="og:url" content="https://drinky.dev/">
+<title>Drinky</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpolygon points='20,17 31,20 20,21' fill='%23e8b64a'/%3E%3Ccircle cx='13' cy='19' r='9' fill='%23e5484d'/%3E%3Crect x='8' y='1' width='10' height='9' fill='%234a5160'/%3E%3Crect x='4' y='9' width='18' height='3' rx='1' fill='%234a5160'/%3E%3Ccircle cx='17' cy='16.5' r='1.6' fill='%23fff'/%3E%3C/svg%3E">
+<style>
+  :root {
+    --bg: #0b0d11;
+    --fg: #e8eaee;
+    --muted: #8b919c;
+    --accent: #5fd4d4;
+    --user: #d47fd4;
+    --error: #e5484d;
+    --warning: #e8b64a;
+    --ink: #343a47;
+    --eye: #ffffff;
+    --glass: rgba(255, 255, 255, 0.08);
+    --glass-edge: rgba(255, 255, 255, 0.4);
+    --shine: rgba(255, 255, 255, 0.35);
+    --stand: #414857;
+    --base: #1a1d24;
+    --cap: #2c313b;
+    --cap-top: #3b414d;
+    --cycle: 10s;
+  }
+
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f6f6f3;
+      --fg: #15171b;
+      --muted: #6b717b;
+      --accent: #0f8f8f;
+      --user: #9b3b9b;
+      --error: #c62f35;
+      --warning: #b07d12;
+      --ink: #1e2128;
+      --glass: rgba(0, 0, 0, 0.09);
+      --glass-edge: rgba(0, 0, 0, 0.4);
+      --shine: rgba(255, 255, 255, 0.85);
+      --stand: #6b7383;
+      --base: #b9bdc6;
+      --cap: #cdd0d7;
+      --cap-top: #e2e4e9;
+    }
+  }
+
+  html {
+    height: 100%;
+  }
+
+  body {
+    min-height: 100%;
+    margin: 0;
+    display: grid;
+    place-items: center;
+    background: var(--bg);
+    color: var(--fg);
+    font: 16px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial,
+      sans-serif, "Apple Color Emoji", "Segoe UI Emoji";
+    overflow-x: hidden;
+  }
+
+  main {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 1.25rem;
+    padding: 2rem 1.5rem;
+    text-align: center;
+  }
+
+  .scene {
+    display: block;
+    width: min(92vw, 56vh);
+    height: auto;
+    overflow: visible;
+  }
+
+  h1 {
+    margin: 0.5rem 0 0;
+    font-size: clamp(2rem, 7vw, 3rem);
+    font-weight: 600;
+    line-height: 1.25;
+  }
+
+  p {
+    margin: 0;
+    max-width: 34ch;
+    color: var(--muted);
+  }
+
+  a {
+    color: var(--fg);
+    text-decoration: underline;
+    text-decoration-color: var(--accent);
+    text-decoration-thickness: 2px;
+    text-underline-offset: 0.25em;
+  }
+
+  a:hover {
+    text-decoration-color: var(--user);
+  }
+
+  /* Motion */
+
+  .bird {
+    transform-box: view-box;
+    transform-origin: 110px 150px;
+    animation: rock var(--cycle) ease-in-out infinite;
+  }
+
+  .tube-liquid {
+    transform-box: fill-box;
+    transform-origin: 50% 100%;
+    animation: fill var(--cycle) linear infinite;
+  }
+
+  .bulb-level {
+    transform-box: view-box;
+    transform-origin: 110px 222px;
+    animation: level var(--cycle) ease-in-out infinite;
+  }
+
+  .bulb-liquid {
+    animation: slosh var(--cycle) linear infinite;
+  }
+
+  .keycap {
+    animation: press var(--cycle) ease-in-out infinite;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .bird, .tube-liquid, .bulb-level, .bulb-liquid, .keycap {
+      animation-play-state: paused;
+    }
+  }
+
+  @keyframes rock {
+    0% { transform: rotate(0deg); animation-timing-function: linear; }
+    18% { transform: rotate(0deg); animation-timing-function: cubic-bezier(0.9, 0, 0.95, 0.1); }
+    54% { transform: rotate(85deg); animation-timing-function: ease-out; }
+    55.5% { transform: rotate(83.5deg); animation-timing-function: ease-in-out; }
+    57% { transform: rotate(85deg); animation-timing-function: linear; }
+    58% { transform: rotate(85deg); animation-timing-function: cubic-bezier(0.7, 0, 0.3, 1); }
+    67.5% { transform: rotate(-18deg); }
+    73.5% { transform: rotate(8deg); }
+    79.5% { transform: rotate(-3.5deg); }
+    85.5% { transform: rotate(1.5deg); }
+    92% { transform: rotate(0deg); animation-timing-function: linear; }
+    100% { transform: rotate(0deg); }
+  }
+
+  /* This mirrors `rock`, so the surface in the bulb stays level on screen. */
+  @keyframes level {
+    0% { transform: rotate(0deg); animation-timing-function: linear; }
+    18% { transform: rotate(0deg); animation-timing-function: cubic-bezier(0.9, 0, 0.95, 0.1); }
+    54% { transform: rotate(-85deg); animation-timing-function: ease-out; }
+    55.5% { transform: rotate(-83.5deg); animation-timing-function: ease-in-out; }
+    57% { transform: rotate(-85deg); animation-timing-function: linear; }
+    58% { transform: rotate(-85deg); animation-timing-function: cubic-bezier(0.7, 0, 0.3, 1); }
+    67.5% { transform: rotate(18deg); }
+    73.5% { transform: rotate(-8deg); }
+    79.5% { transform: rotate(3.5deg); }
+    85.5% { transform: rotate(-1.5deg); }
+    92% { transform: rotate(0deg); animation-timing-function: linear; }
+    100% { transform: rotate(0deg); }
+  }
+
+  @keyframes fill {
+    0% { transform: scaleY(0.51); }
+    50% { transform: scaleY(1); }
+    56% { transform: scaleY(1); }
+    60% { transform: scaleY(0.12); }
+    100% { transform: scaleY(0.51); }
+  }
+
+  @keyframes slosh {
+    0% { transform: translateY(3.5px); }
+    50% { transform: translateY(8px); }
+    56% { transform: translateY(8px); }
+    60% { transform: translateY(0); }
+    100% { transform: translateY(3.5px); }
+  }
+
+  @keyframes press {
+    0%, 53.6% { transform: translateY(0); }
+    54% { transform: translateY(4px); }
+    55.5% { transform: translateY(2.5px); }
+    57%, 59% { transform: translateY(4px); }
+    61%, 100% { transform: translateY(0); }
+  }
+
+  /* Drawing */
+
+  .scene text {
+    font: 700 14px ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono",
+      monospace;
+    text-anchor: middle;
+  }
+
+  .stand line { stroke: var(--stand); stroke-width: 6; stroke-linecap: round; }
+  .stand rect, .stand circle { fill: var(--stand); }
+  .key-base { fill: var(--base); }
+  .keycap-side { fill: var(--cap); }
+  .keycap-top { fill: var(--cap-top); }
+  .key-label { fill: var(--user); }
+  .glass { fill: var(--glass); stroke: var(--glass-edge); stroke-width: 2; }
+  .liquid { fill: var(--accent); }
+  .shine { fill: var(--shine); }
+  .beak { fill: var(--warning); }
+  .felt { fill: var(--error); }
+  .eye { fill: var(--eye); }
+  .pupil, .hat, .axle { fill: var(--ink); }
+</style>
+</head>
+<body>
+<main>
+  <svg class="scene" viewBox="-25 8 270 260" xmlns="http://www.w3.org/2000/svg" role="img"
+    aria-label="A drinking bird presses the Y key.">
+    <defs>
+      <clipPath id="bulb-clip"><circle cx="110" cy="222" r="28"/></clipPath>
+    </defs>
+    <g class="stand">
+      <line x1="110" y1="150" x2="78" y2="258"/>
+      <line x1="110" y1="150" x2="142" y2="258"/>
+      <rect x="66" y="256" width="88" height="8" rx="4"/>
+      <circle cx="110" cy="150" r="7"/>
+    </g>
+    <g class="key">
+      <rect class="key-base" x="184" y="238" width="28" height="26"/>
+      <g class="keycap">
+        <rect class="keycap-side" x="178" y="212" width="40" height="28" rx="6"/>
+        <rect class="keycap-top" x="182" y="214" width="32" height="18" rx="4"/>
+        <text class="key-label" x="198" y="229">Y</text>
+      </g>
+    </g>
+    <g class="bird">
+      <rect class="glass tube" x="105" y="80" width="10" height="160" rx="5"/>
+      <circle class="glass bulb" cx="110" cy="222" r="30"/>
+      <rect class="liquid tube-liquid" x="107" y="84" width="6" height="156"/>
+      <g clip-path="url(#bulb-clip)">
+        <g class="bulb-level">
+          <rect class="liquid bulb-liquid" x="70" y="228" width="80" height="40"/>
+        </g>
+      </g>
+      <ellipse class="shine" cx="98" cy="212" rx="4" ry="9"/>
+      <polygon class="beak" points="130,55 184,68 130,69"/>
+      <circle class="felt" cx="110" cy="60" r="24"/>
+      <circle class="eye" cx="121" cy="54" r="3.5"/>
+      <circle class="pupil" cx="122" cy="54" r="1.6"/>
+      <polygon class="hat" points="84,44 84,38 93,38 93,16 127,16 127,38 136,38 136,44"/>
+      <circle class="axle" cx="110" cy="150" r="3.5"/>
+    </g>
+  </svg>
+  <h1>Drinky</h1>
+  <p>A dependency-free coding agent you can own end to end.</p>
+  <p><a href="https://github.com/clebert/drinky">github.com/clebert/drinky</a></p>
+</main>
+</body>
+</html>
