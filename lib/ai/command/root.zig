@@ -18,6 +18,7 @@ const effort = @import("effort.zig");
 const login = @import("login.zig");
 const logout = @import("logout.zig");
 const new = @import("new.zig");
+const remote = @import("remote.zig");
 const skill = @import("skill.zig");
 const sources = @import("sources.zig");
 const system = @import("system.zig");
@@ -50,6 +51,7 @@ const commands = [_]Entry{
     .{ .name = logout.name, .summary = logout.summary, .run = logout.run },
     .{ .name = model.name, .summary = model.summary, .run = model.run },
     .{ .name = new.name, .summary = new.summary, .run = new.run },
+    .{ .name = remote.name, .summary = remote.summary, .run = remote.run },
     .{ .name = skill.name, .summary = skill.summary, .run = skill.run },
     .{ .name = sources.name, .summary = sources.summary, .run = sources.run },
     .{ .name = system.name, .summary = system.summary, .run = system.run },

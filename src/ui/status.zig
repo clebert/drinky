@@ -343,6 +343,24 @@ pub fn render(placement: *const paint.Placement, info: *const Info) !void {
     placement.sink.end(.{ .id = placement.id, .line = placement.base });
 }
 
+/// Write the state of the session as one line for a reader with no column
+/// budget: the place in full, the context share, and the agent. The parts take
+/// the words and the order of the line, so the attach event of a remote bot
+/// reads like the status line. An empty directory leaves the place out.
+pub fn writeSummary(out: *std.Io.Writer, info: *const Info) !void {
+    var scratch: [ai.project.head_name_bytes_max + 512]u8 = undefined;
+    var line: Line = .init(&scratch);
+    const parts: Parts = .all;
+    if (info.directory.len > 0) {
+        try writePlace(&line, info, &parts);
+        try line.out.writeAll(separator);
+    }
+    try writeContext(&line, info, .short);
+    try line.out.writeAll(separator);
+    try writeRight(&line, info, &parts);
+    try out.writeAll(line.text());
+}
+
 /// The agent: `model (account) · Effort: level`, or the signed-out indicator.
 /// Each part carries its own label, so a part that goes away never leaves a bare
 /// value behind. The model and the effort level are the two settings the user
@@ -657,6 +675,47 @@ const test_info: Info = .{
     .quota_age_ms = 0,
     .turn_active = true,
 };
+
+fn expectSummary(expected: []const u8, info: *const Info) !void {
+    var buffer: [512]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&buffer);
+    try writeSummary(&out, info);
+    try std.testing.expectEqualStrings(expected, out.buffered());
+}
+
+// The summary is the status line for a reader with no column budget, so it takes
+// the words and the order of the line, with the place in full and the gauge as a
+// share alone.
+test "the summary states the place, the gauge, and the agent in the order of the line" {
+    try expectSummary(
+        "~/github/clebert/drinky (main) · Context: 21% · claude-opus-4-8 (Anthropic Subscription) · " ++
+            "Effort: xhigh",
+        &test_info,
+    );
+
+    var signed_out = test_info;
+    signed_out.account = null;
+    signed_out.context_tokens = null;
+    try expectSummary(
+        "~/github/clebert/drinky (main) · Context: Unknown · Account: Signed out",
+        &signed_out,
+    );
+
+    var no_model = test_info;
+    no_model.model = null;
+    no_model.context_window = null;
+    no_model.directory = "";
+    try expectSummary("Context: 206k · No model (Anthropic Subscription) · Effort: xhigh", &no_model);
+
+    var empty = test_info;
+    empty.context_tokens = 0;
+    empty.branch = null;
+    try expectSummary(
+        "~/github/clebert/drinky · Context: 0% · claude-opus-4-8 (Anthropic Subscription) · " ++
+            "Effort: xhigh",
+        &empty,
+    );
+}
 
 fn renderForTest(
     gpa: std.mem.Allocator,

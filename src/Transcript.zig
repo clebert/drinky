@@ -109,6 +109,11 @@ fn openRun(self: *Transcript, kind: ui.block.Entry.Kind, account: ?ai.llm.Accoun
     return index;
 }
 
+/// Whether a streamed run is open, so a discrete append now splits the message.
+pub fn streaming(self: *const Transcript) bool {
+    return self.current != null;
+}
+
 /// End the current message's streamed runs so the next delta opens a new block.
 pub fn endMessage(self: *Transcript) void {
     self.current = null;

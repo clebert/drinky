@@ -77,6 +77,12 @@ can_step_back: bool,
 /// The text that stands in for the rows while the list waits, or null while the
 /// list holds its rows. Borrowed. See `beginWait`.
 wait: ?[]const u8,
+/// The link beside the wait text, or null for a wait without one. Borrowed.
+/// See `beginLinkedWait`.
+wait_link: ?[]const u8,
+/// The one run of the body that takes a role of its own: the link of a wait.
+marks: [1]paint.Mark,
+mark_count: usize,
 
 /// Where a list sits: the highlighted row, and the first body row the window
 /// shows. A caller that reopens a list hands both back, so the list looks as the
@@ -131,6 +137,9 @@ pub fn init(
         .columns_max = unbounded,
         .can_step_back = start.can_step_back,
         .wait = null,
+        .wait_link = null,
+        .marks = undefined,
+        .mark_count = 0,
     };
     errdefer self.content.deinit(gpa);
     errdefer self.line_roles.deinit(gpa);
@@ -148,12 +157,29 @@ pub fn deinit(self: *Picker) void {
 /// a row that a pending result replaces. The caller rebuilds the list from that
 /// result, or reopens the step on a cancel. The list borrows `text`.
 pub fn beginWait(self: *Picker, text: []const u8) !void {
+    return self.beginLinkedWait(text, null);
+}
+
+/// `beginWait` with a terminal hyperlink to `url` behind the text, so one click
+/// from the host can act on the wait. The list borrows both, so a failed compose
+/// drops both again: the caller then frees them, and no row can name freed bytes.
+pub fn beginLinkedWait(self: *Picker, text: []const u8, url: ?[]const u8) !void {
     self.freeOptions();
     self.options = &.{};
     self.cursor = 0;
     self.marked = null;
     self.scroll = 0;
     self.wait = text;
+    self.wait_link = url;
+    errdefer {
+        self.wait = null;
+        self.wait_link = null;
+        self.mark_count = 0;
+        // The half-built row of the failed compose goes with them, because
+        // `reflow` rebuilds the content at a width change alone.
+        self.content.clearRetainingCapacity();
+        self.line_roles.clearRetainingCapacity();
+    }
     try self.compose();
 }
 
@@ -236,6 +262,7 @@ pub fn render(
         .hidden_above = self.scroll,
         .hidden_below = total_body - self.scroll - visible_rows,
         .line_roles = self.line_roles.items,
+        .marks = self.marks[0..self.mark_count],
         .activity = options.activity,
     });
 }
@@ -283,10 +310,18 @@ fn compose(self: *Picker) !void {
     // offset past the shorter rebuilt content for `reflow` to slice.
     self.cursor_offset = 0;
 
+    self.mark_count = 0;
     if (self.wait) |text| {
         try self.startLine(.muted);
         try self.content.appendSlice(self.gpa, pad_plain);
         try self.content.appendSlice(self.gpa, text);
+        if (self.wait_link) |url| {
+            try self.content.appendSlice(self.gpa, paint.separator);
+            const start = self.content.items.len;
+            try self.content.appendSlice(self.gpa, url);
+            self.marks[0] = .{ .start = start, .end = self.content.items.len, .role = .link, .url = url };
+            self.mark_count = 1;
+        }
         return self.cut(0, self.columns_max);
     }
 
@@ -419,6 +454,62 @@ fn renderForTest(
 // that the result replaces. The wait row takes the place of the options, the
 // hint names the one key that still acts, and the separators move while the
 // list waits.
+// A pairing states its code beside a link, so one click from the host sends the
+// code. The link is a terminal hyperlink inside the wait row, and a narrow window
+// cuts the row while the target stays whole.
+test "a linked wait paints its link as a terminal hyperlink" {
+    const gpa = std.testing.allocator;
+    var picker = try testPicker(gpa, &.{"row"}, 0);
+    defer picker.deinit();
+    const size: terminal.View.Size = .{ .columns = 80, .rows = 24 };
+
+    try picker.beginLinkedWait("Send the code x7kq4m2p to @bot", "https://t.me/bot?start=x7kq4m2p");
+    try picker.reflow(size);
+    try std.testing.expectEqualStrings(
+        "   Send the code x7kq4m2p to @bot · https://t.me/bot?start=x7kq4m2p",
+        picker.content.items,
+    );
+    try std.testing.expectEqual(@as(usize, 1), picker.mark_count);
+    try std.testing.expectEqual(role.Name.link, picker.marks[0].role);
+    const painted = try renderForTest(gpa, &picker, size);
+    defer gpa.free(painted);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        painted,
+        "\x1b]8;;https://t.me/bot?start=x7kq4m2p\x1b\\https://t.me/bot?start=x7kq4m2p\x1b]8;;\x1b\\",
+    ) != null);
+
+    // A plain wait carries no link and no mark.
+    try picker.beginWait("Drinky checks the bot token.");
+    try std.testing.expectEqual(@as(usize, 0), picker.mark_count);
+    try std.testing.expect(std.mem.indexOf(u8, picker.content.items, "·") == null);
+}
+
+// A wait borrows its text and its link, and the caller frees both when the wait
+// fails. The list must then name neither, because no row can point into freed
+// bytes.
+test "a wait that cannot compose keeps no borrowed text" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const gpa = failing.allocator();
+    var picker = try testPicker(gpa, &.{"row"}, 0);
+    defer picker.deinit();
+
+    const text = "x" ** 4096;
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+    try std.testing.expectError(error.OutOfMemory, picker.beginLinkedWait(text, "https://t.me/bot"));
+    failing.fail_index = std.math.maxInt(usize);
+    failing.resize_fail_index = std.math.maxInt(usize);
+
+    try std.testing.expect(picker.wait == null);
+    try std.testing.expect(picker.wait_link == null);
+    try std.testing.expectEqual(@as(usize, 0), picker.mark_count);
+    try std.testing.expectEqual(@as(usize, 0), picker.content.items.len);
+    // The empty list still paints, so the failure costs the rows alone.
+    const painted = try renderForTest(gpa, &picker, .{ .columns = 80, .rows = 24 });
+    defer gpa.free(painted);
+}
+
 test "a list that waits drops its rows, states the wait, and moves its separators" {
     const gpa = std.testing.allocator;
     var picker = try testPicker(gpa, &.{ "Refresh the model list", "claude-opus-5" }, 1);

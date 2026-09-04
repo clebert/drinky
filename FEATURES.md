@@ -432,6 +432,47 @@ Gemini on Google Vertex AI through a service account key file.
   the failure never stops the session.
 - `HOME` must be set, because the config, the credentials, and the state live under `~/.drinky`.
 
+## Remote
+
+- **/remote** — pick a saved Telegram bot to attach, add a bot with its token, or remove a saved bot
+  from a second list.
+- The saved bots live in the owner-only `~/.drinky/remote.json`. The config file holds no bot,
+  because a bot token is a secret.
+- The `Add a bot` row switches the editor into a token prompt with the caption
+  `Bot token · Enter: Save · Esc: Cancel`. A rejected token returns to the prompt with the token.
+- A new bot pairs: the picker states `Send the code x7kq4m2p to @bot` beside a clickable link, and
+  the private chat that sends the code within five minutes binds. Drinky saves the bot as soon as
+  the token check passes, so a failed pairing keeps it in the picker.
+- Three wrong codes end a pairing, and so does a five-minute wait. A group message counts as
+  nothing, and an exit key cancels the pairing alone.
+- While a bot is attached, the bot holds the input. The editor shows `Remote: @bot · Esc: Detach`
+  with the count of the queued messages. Enter names the bot, and every exit key detaches.
+- The attach event opens the chat and states the bot and the session in the words of the status
+  line. The detach event is the last message of the chat.
+- After a detach the editor stays locked under `Remote: @bot · Esc: Cancel` until the last message
+  went out, for five seconds at most. An exit key there drops that message and frees the editor at
+  once.
+- A Telegram message runs as a prompt, and during a turn it queues as steering. A message the turn
+  did not commit drops while the bot is attached, and returns to the editor after a detach.
+- A command line from Telegram refuses with a reply that names the terminal, and so does a message
+  while the session is signed out or has no model.
+- A photo, a sticker, or a voice note gets one reply: `Drinky reads text alone.`
+- The attach removes an active webhook, confirms every update from before it, and ignores every chat
+  but the paired one. Every message goes out silent.
+- The long poll keeps its own head window, so a short configured request timeout never turns it into
+  a busy poll.
+- A failed poll or send retries with a backoff and records one `Error:` event at the first failure
+  and one event at the recovery. A 429 waits the named seconds in silence, and a rejection that no
+  retry can fix drops that one message with an event.
+- The send queue takes each message at once, and a full queue drops the message and reports the
+  first drop of a run.
+- A revoked token, a blocked bot, a second poller on the same bot, and a rejected poll each detach
+  with an `Error:` event. A credential rejection detaches before the login picker opens.
+- A detach and the exit drain the pending sends within a bound, and the detach event keeps part of
+  that window for itself, so it ends the chat even behind a full queue.
+- An event that a task raises while a reply streams waits for the next message boundary, so it never
+  splits a streamed reply.
+
 ## Herdr
 
 - Inside a Herdr pane, Drinky reports its state over the Herdr socket: `working` during a turn,

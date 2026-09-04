@@ -1,9 +1,11 @@
 //! The composition root and event loop. It wires the tty, the agent, and the
 //! `Session` together, then runs the interface off one `std.Io.Queue` of
-//! `Session.UiEvent`. Five `io.concurrent` producers feed it: the input reader
+//! `UiEvent`. Five `io.concurrent` producers feed it: the input reader
 //! (`.keys`), the turn worker (generation-tagged `.turn` events), the model
 //! fetch worker (a generation-tagged `.fetch_ended` wakeup), a one-shot frame
-//! timer (`.tick`), and a SIGWINCH watcher (`.resize`).
+//! timer (`.tick`), and a SIGWINCH watcher (`.resize`). An attached Telegram
+//! bot adds its poller and its sender (generation-tagged `.remote` events), and
+//! a bot pairing adds its worker (generation-tagged `.pairing` events).
 //!
 //! A command runs on the consumer. A model fetch is the one command step that
 //! reaches the network, so it leaves the consumer for a worker, and the picker
@@ -23,6 +25,7 @@ const Config = @import("Config.zig");
 const describe = @import("describe.zig");
 const Herdr = @import("Herdr.zig");
 const layout = @import("layout.zig");
+const remote = @import("remote/root.zig");
 const Retry = @import("Retry.zig");
 const Session = @import("Session.zig");
 const sources = @import("sources.zig");
@@ -37,6 +40,14 @@ const effort_default: ai.llm.Effort = .xhigh;
 /// The refusal a send meets while the active account offers no model. Drinky
 /// compiles none in, so the user fetches a list and picks one there.
 const no_model_refusal = "Select a model with /model before you send a message.";
+
+/// The refusals of a Telegram message while the session is signed out or has no
+/// model. Each names the terminal, because the command that repairs the state
+/// runs there alone.
+const telegram_signed_out_refusal =
+    "Sign in with /login in the terminal before you send a message.";
+const telegram_no_model_refusal =
+    "Select a model with /model in the terminal before you send a message.";
 
 /// The row that a model picker shows while its fetch runs. The title of the
 /// picker names the account, so the row names the work alone.
@@ -65,6 +76,9 @@ const intro_text = blk: {
     for (intro_keys) |hint| line = line ++ hint ++ ui.paint.separator;
     break :blk line ++ "/help: Commands";
 };
+
+/// The wait row of the picker while the token check runs.
+const token_check_wait_text = "Drinky checks the bot token.";
 
 /// Two Ctrl+C presses within this window quit. A lone press clears the editor.
 const ctrl_c_window_ms = 500;
@@ -125,11 +139,11 @@ ctrl_c_ms_last: i64,
 escape_deadline_ms: ?i64,
 /// The one cross-thread channel: producer tasks push `UiEvent`s, and the consumer
 /// drains and applies them. Backed by `queue_buffer`, so pin the `App`.
-queue: std.Io.Queue(Session.UiEvent),
-queue_buffer: [queue_capacity]Session.UiEvent,
+queue: std.Io.Queue(UiEvent),
+queue_buffer: [queue_capacity]UiEvent,
 /// Non-turn events temporarily removed while cancellation applies queued worker
 /// progress. The consumer processes this prefix before reading newer queue data.
-deferred_events: [queue_capacity]Session.UiEvent,
+deferred_events: [queue_capacity]UiEvent,
 deferred_event_count: usize,
 /// The long-lived stdin reader task, or null before the spawn. Shutdown cancels
 /// and reaps it.
@@ -168,6 +182,17 @@ frame_grid: FrameGrid,
 /// The state report to Herdr. Inert outside a Herdr pane. The loop derives the
 /// state after each batch, so no turn end path reports it.
 herdr: Herdr,
+/// The Telegram remote control: the saved bots, a pairing, and the attached bot.
+/// It is the one source of truth for that state, and it reports through
+/// `onRemoteAction`. The app maps its state to the session.
+controller: remote.Controller,
+/// The caption title of the inactive editor while a bot holds the input,
+/// `Remote: @bot`. Owned, and the session borrows it.
+remote_title: []const u8,
+/// The wait row of the pairing picker and the link beside it. Owned, and the
+/// picker borrows them.
+pairing_wait_text: []const u8,
+pairing_wait_link: []const u8,
 
 /// The process environment that the app cannot read for itself. `main` owns every
 /// lookup, so a test can run the app with no environment at all.
@@ -396,6 +421,36 @@ const WorkerResult = struct {
     /// interrupted worker enqueue, the consumer uses this bit to enqueue a
     /// replacement once it joins the result.
     terminal_queued: bool = false,
+};
+
+/// A message from any producer task to the render consumer. Turn-owned events
+/// carry a generation. Input and presentation-control events do not.
+pub const UiEvent = union(enum) {
+    keys: []u8,
+    turn: Session.TurnEvent,
+    tick,
+    resize,
+    /// The wakeup of the fetch worker of this generation: its result is ready
+    /// to join. A canceled fetch can leave one behind, so the consumer joins the
+    /// fetch of this generation alone.
+    fetch_ended: u64,
+    /// A report of a bot attachment: a Telegram message, a failure, a recovery, a
+    /// permanent condition, or the end of a drain. The controller drops a report
+    /// of an attachment that ended by its generation.
+    remote: remote.Attachment.Event,
+    /// A report of a bot pairing: the token check, the bind, or the end. The
+    /// controller drops a report of a canceled pairing by its generation.
+    pairing: remote.Pairing.Event,
+
+    pub fn deinit(self: *const UiEvent, gpa: std.mem.Allocator) void {
+        switch (self.*) {
+            .keys => |bytes| gpa.free(bytes),
+            .turn => |*event| event.deinit(gpa),
+            .remote => |*event| event.deinit(gpa),
+            .pairing => |*event| event.deinit(gpa),
+            .tick, .resize, .fetch_ended => {},
+        }
+    }
 };
 
 /// One model fetch on a worker. The worker owns the account registry until the
@@ -690,6 +745,11 @@ pub fn run(
 
     self.accounts = try ai.Accounts.init(gpa, io, home, config.timeouts, options.credentials);
     defer self.accounts.deinit();
+    try self.controller.openStore(home);
+    defer self.controller.deinit();
+    // The connect window depends on the network, not on the provider, so every
+    // provider shares it and either one serves the Telegram calls.
+    self.controller.connect_ms = config.timeouts.anthropic.connect_ms;
 
     const home_directory = try homeDirectory(gpa, io, cwd, home);
     defer gpa.free(home_directory);
@@ -848,6 +908,11 @@ pub fn run(
         },
     );
     try self.reportNotices(skill_notices.items);
+    if (self.controller.loadError()) |err| try self.recordEvent(
+        .failure,
+        "Drinky could not read the saved bots in {s} because of error {s}.",
+        .{ self.controller.storePath(), @errorName(err) },
+    );
     // The parse ignores an unknown key so that an older binary reads a newer
     // file. Report it, because a typo otherwise looks like an applied setting.
     for (config.unknown_keys) |key| try self.recordEvent(
@@ -952,10 +1017,21 @@ fn initFields(self: *App, gpa: std.mem.Allocator, io: std.Io) void {
         .tick_pending = false,
         .frame_grid = .reset(0),
         .herdr = .init(io),
+        // The controller reports into this app and routes its tasks into the
+        // queue below, and `run` replaces the inert store.
+        .controller = .init(gpa, io, &.{
+            .store = .inert(gpa, io),
+            .sink = .{ .context = self, .act = onRemoteAction },
+            .attachment_sink = .{ .context = self, .emit = emitRemoteEvent },
+            .pairing_sink = .{ .context = self, .emit = emitPairingEvent },
+        }),
+        .remote_title = "",
+        .pairing_wait_text = "",
+        .pairing_wait_link = "",
     };
     // The literal above writes `queue_buffer` too. A result location does put that
     // buffer at its final address, but do not depend on that, so take it here.
-    self.queue = std.Io.Queue(Session.UiEvent).init(&self.queue_buffer);
+    self.queue = std.Io.Queue(UiEvent).init(&self.queue_buffer);
 }
 
 /// Leave the alternate screen and park the primary cursor before terminal teardown.
@@ -969,6 +1045,13 @@ fn prepareTerminalExit(self: *App) void {
 /// buffered. Runs before `tty.deinit`, so the reader no longer touches stdin when
 /// the tty restores termios.
 fn shutdownTasks(self: *App) void {
+    // No consumer drains the channel from here on, so it closes first: a producer
+    // that meets a full channel then ends instead of a wait that no one answers.
+    self.queue.close(self.io);
+    // The detach goes first, so its event is the last message of the chat, and
+    // the drain of the sender is bounded, so a dead network cannot hold the exit.
+    self.controller.shutdown();
+    self.freeRemoteStrings();
     // Shutdown is teardown, not an interactive cancel: free the worker result's
     // owned terminal text and leave the session untouched.
     self.dropRetry();
@@ -1025,7 +1108,7 @@ fn enqueuePendingTurnFence(self: *App) void {
     const result = if (self.pending_turn_result) |*pending| pending else return;
     if (result.terminal_queued) return;
     if (result.progress_sequence == std.math.maxInt(u64)) return;
-    const events = [1]Session.UiEvent{.{ .turn = .{
+    const events = [1]UiEvent{.{ .turn = .{
         .generation = result.generation,
         .progress_sequence = result.progress_sequence + 1,
         .progress_sequence_committed = result.progress_sequence_committed,
@@ -1066,6 +1149,11 @@ fn finishWorkerResult(self: *App, result: *const WorkerResult) !void {
                 return error.UnexpectedTokenGrantRejection;
             if (!account.hasRefreshCredential())
                 return error.UnexpectedTokenGrantRejection;
+            // The repair is a login, and `/login` is terminal-only, so the bot
+            // hands the session back first. The failed turn then returns its
+            // uncommitted Telegram messages to the editor like every message
+            // after a detach, and the picker opens over them.
+            try self.controller.detach(.credential_rejected);
             try self.finishFailedWorker(result);
             try self.rejectCredential(account);
         },
@@ -1157,7 +1245,7 @@ fn awaitFuture(self: *App, maybe_future: *?std.Io.Future(void)) void {
 /// Free every event still buffered on the channel. Only safe once the producers
 /// are reaped, so no new event can arrive mid-drain.
 fn drainQueue(self: *App) void {
-    var batch: [queue_capacity]Session.UiEvent = undefined;
+    var batch: [queue_capacity]UiEvent = undefined;
     while (true) {
         const count = self.queue.get(self.io, &batch, 0) catch break;
         if (count == 0) break;
@@ -1168,7 +1256,7 @@ fn drainQueue(self: *App) void {
 }
 
 /// Move the consumer-owned prefix into `batch` and transfer event ownership.
-fn takeDeferredEvents(self: *App, batch: *[queue_capacity]Session.UiEvent) usize {
+fn takeDeferredEvents(self: *App, batch: *[queue_capacity]UiEvent) usize {
     const count = self.deferred_event_count;
     @memcpy(batch[0..count], self.deferred_events[0..count]);
     self.deferred_event_count = 0;
@@ -1181,7 +1269,7 @@ fn takeDeferredEvents(self: *App, batch: *[queue_capacity]Session.UiEvent) usize
 /// pending. A clean idle interface stays inert (no tick, blocked on an empty
 /// channel).
 fn runLoop(self: *App) !void {
-    var batch: [queue_capacity]Session.UiEvent = undefined;
+    var batch: [queue_capacity]UiEvent = undefined;
     while (self.running) {
         const count = if (self.deferred_event_count > 0)
             self.takeDeferredEvents(&batch)
@@ -1221,7 +1309,7 @@ fn herdrState(self: *const App) Herdr.State {
 
 /// Apply one bounded queue batch. Once the queue hands the batch to the consumer,
 /// this function owns every event. An error frees the unprocessed suffix.
-fn applyBatch(self: *App, events: []const Session.UiEvent) !bool {
+fn applyBatch(self: *App, events: []const UiEvent) !bool {
     std.debug.assert(events.len <= queue_capacity);
     var applied_count: usize = 0;
     errdefer for (events[applied_count..]) |event| event.deinit(self.gpa);
@@ -1248,6 +1336,8 @@ fn applyBatch(self: *App, events: []const Session.UiEvent) !bool {
                 }
             },
             .fetch_ended => |generation| try self.finishFetch(generation),
+            .remote => |*remote_event| try self.controller.applyAttachmentEvent(remote_event),
+            .pairing => |*pairing_event| try self.controller.applyPairingEvent(pairing_event),
         }
     }
     return ticked;
@@ -1441,8 +1531,14 @@ fn handleKeys(self: *App, bytes: []const u8) !void {
     try self.input.feed(bytes);
     while (self.input.next()) |event| {
         const at_prompt = self.session.mode == .prompt;
+        const owner = self.session.input.owner;
         try self.handleKey(&event);
-        if (!at_prompt and self.session.mode == .prompt and isExitKey(&event)) {
+        // A detach and the end of its wait each move the input one step toward
+        // the terminal, so the rest of that exit attempt must not reach the
+        // prompt either.
+        const returned = (!at_prompt and self.session.mode == .prompt) or
+            owner != self.session.input.owner;
+        if (returned and isExitKey(&event)) {
             while (self.input.next()) |_| {}
             break;
         }
@@ -1478,26 +1574,41 @@ fn flushEscape(self: *App) !void {
 
 fn handleKey(self: *App, event: *const terminal.Input.Key) !void {
     const at_prompt = self.session.mode == .prompt;
+    // The input owner is a second axis over the mode. While the terminal does not
+    // hold the input, no key confirms anything: the key that returns the input
+    // ends one thing, and the key after it must warn again.
+    const editor_live = self.session.input.owner == .terminal;
     // A refused command line goes to the model on the next Enter alone. The prompt
     // sends it, and a turn queues it, so both modes can confirm.
-    const confirms_message = (at_prompt or self.session.mode == .turn) and event.* == .enter;
+    const confirms_message = editor_live and (at_prompt or self.session.mode == .turn) and
+        event.* == .enter;
     if (!confirms_message) self.session.cancelConfirmation(.message);
     // Only a second Esc during a turn can confirm the turn-cancel warning. Every
     // other user action clears the warning and its one-shot confirmation.
-    const confirms_turn_cancel = self.session.mode == .turn and event.* == .escape;
+    const confirms_turn_cancel = editor_live and self.session.mode == .turn and event.* == .escape;
     if (!confirms_turn_cancel) self.session.cancelConfirmation(.turn_cancel);
     // Only a second Ctrl+D at the prompt can confirm the quit warning. Every
     // other user action clears the warning and its one-shot confirmation.
-    const confirms_quit = at_prompt and event.* == .ctrl and event.ctrl == 'd';
+    const confirms_quit = editor_live and at_prompt and event.* == .ctrl and event.ctrl == 'd';
     if (!confirms_quit) self.session.cancelConfirmation(.quit);
     // Clear before the key routes, so a notice produced by this action survives it.
     self.session.clearNotice();
+    // A picker or a page takes its keys under any owner. The attached state opens
+    // none, and the detaching state opens the login picker of a credential
+    // rejection, which the user must be able to answer.
     switch (self.session.mode) {
         .picking => return self.handlePickerKey(event),
         .viewing => return self.handlePageKey(event),
-        .turn => return self.handleTurnKey(event),
-        .prompt => {},
+        .turn, .prompt => {},
     }
+    // While the terminal does not hold the input, every exit key returns it, Enter
+    // states the reason, and no other key reaches the editor.
+    if (!editor_live) return self.handleExternalKey(event);
+    // The token prompt outranks the mode, because a bot token must never reach
+    // a model. Only the prompt mode opens it, so this takes no key from another
+    // mode today, and it keeps that true if one ever runs beside it.
+    if (self.controller.state() == .token_prompt) return self.handleTokenKey(event);
+    if (self.session.mode == .turn) return self.handleTurnKey(event);
     if (try self.editKey(event)) return;
     switch (event.*) {
         .enter => try self.submit(),
@@ -1666,7 +1777,9 @@ fn returnLateSteering(self: *App) !void {
     // The mirror and the channel always move together, and a completed turn
     // exits with no consumed-but-uncommitted batch, so the counts match here.
     std.debug.assert(taken.len == self.session.steering.items.len);
-    self.session.recallLateSteering();
+    // A Telegram message drops instead, because the chat still holds it, so a
+    // queue of Telegram messages alone reports no return.
+    if (self.session.recallLateSteering() == 0) return;
     try self.reportNotice(.information, "Drinky returned every queued message to the editor.", .{});
 }
 
@@ -1743,7 +1856,7 @@ fn drainCanceledProgress(self: *App, apply_progress: bool) ?anyerror {
     // the loop consumes the prefix rather than exceed its bounded storage.
     if (self.deferred_event_count > 0) return null;
 
-    var batch: [queue_capacity]Session.UiEvent = undefined;
+    var batch: [queue_capacity]UiEvent = undefined;
     const count = self.queue.get(self.io, &batch, 0) catch return null;
     std.debug.assert(self.deferred_event_count + count <= self.deferred_events.len);
 
@@ -2115,6 +2228,7 @@ fn commandContext(self: *App) ai.command.Context {
         .agent = &self.agent,
         .accounts = &self.accounts,
         .skill_registry = &self.skills,
+        .remote_bots = self.controller.usernames(),
     };
 }
 
@@ -2192,6 +2306,14 @@ fn applyOutcome(self: *App, outcome: ai.command.Outcome) !void {
         // The fetch starts and changes nothing yet, so no mirror runs. Its
         // result arrives through `finishFetch`, which applies its own outcome.
         .fetch => |account| return self.startFetch(account),
+        .remote_attach => |index| return self.controller.attachSaved(index),
+        .remote_add => {
+            // Enter hands the text to the pairing, so the token prompt opens on
+            // an empty editor.
+            self.session.editor.clear();
+            return self.controller.beginTokenPrompt();
+        },
+        .remote_remove => |index| return self.controller.removeBot(index),
         else => try self.session.applyOutcome(outcome),
     }
     // Commands can switch or drop the active account. Mirror the authoritative
@@ -2678,6 +2800,19 @@ fn reportNotices(self: *App, notices: []const ai.instructions.Notice) !void {
     }
 }
 
+/// Record one durable event that a task raised at any moment. A reply that
+/// streams defers it to the next message boundary.
+fn recordAsyncEvent(
+    self: *App,
+    severity: ai.command.Outcome.Severity,
+    comptime format: []const u8,
+    args: anytype,
+) !void {
+    try self.session.recordAsyncEvent(
+        try ai.command.Outcome.Message.print(self.gpa, severity, format, args),
+    );
+}
+
 /// Record one durable event in the transcript.
 fn recordEvent(
     self: *App,
@@ -2688,6 +2823,321 @@ fn recordEvent(
     try self.session.applyOutcome(
         try ai.command.Outcome.reportEvent(self.gpa, severity, format, args),
     );
+}
+
+/// The sink of an attachment: wrap each report into the one channel. The
+/// controller reads it back through `applyBatch`.
+fn emitRemoteEvent(context: *anyopaque, event: remote.Attachment.Event) error{Closed}!void {
+    const self: *App = @ptrCast(@alignCast(context));
+    self.queue.putOne(self.io, .{ .remote = event }) catch return error.Closed;
+}
+
+/// The sink of a pairing: wrap each report into the one channel.
+fn emitPairingEvent(context: *anyopaque, event: remote.Pairing.Event) error{Closed}!void {
+    const self: *App = @ptrCast(@alignCast(context));
+    self.queue.putOne(self.io, .{ .pairing = event }) catch return error.Closed;
+}
+
+/// Act on one report of the controller. Every text is borrowed for the call.
+fn onRemoteAction(context: *anyopaque, action: remote.Controller.Action) anyerror!void {
+    const self: *App = @ptrCast(@alignCast(context));
+    switch (action) {
+        .chat_message => |message| try self.submitChatMessage(message.text, message.id),
+        .report => |report| switch (report.kind) {
+            .event => try self.recordAsyncEvent(report.severity, "{s}", .{report.text}),
+            .notice => try self.reportNotice(report.severity, "{s}", .{report.text}),
+        },
+        .state_changed => try self.syncRemoteState(),
+        .pairing_changed => |change| try self.applyPairingChange(change),
+    }
+}
+
+/// Map the state of the controller onto the input of the session. An attached
+/// bot holds the input under its caption, and a fresh attach opens the chat with
+/// the attach event. A detached bot keeps the editor locked under the caption of
+/// the wait until its last message went out. The token prompt keeps the terminal
+/// under its own caption.
+fn syncRemoteState(self: *App) !void {
+    const was_terminal = self.session.input.owner == .terminal;
+    switch (self.controller.state()) {
+        .attached => {
+            const username = self.controller.botUsername().?;
+            // The input moves before the chat opens, so a failed open cannot
+            // leave the editor live under an attached bot.
+            if (was_terminal) try self.takeRemoteTitle(username);
+            self.session.input = .{ .owner = .external, .caption = .{
+                .title = self.remote_title,
+                .controls = "Esc: Detach",
+                .rows_max = Session.editor_caption_rows_max,
+            } };
+            if (was_terminal) try self.openChat(username);
+        },
+        .detaching => {
+            if (was_terminal) try self.takeRemoteTitle(self.controller.botUsername().?);
+            self.session.input = .{ .owner = .none, .caption = .{
+                .title = self.remote_title,
+                .controls = "Esc: Cancel",
+                .rows_max = Session.editor_caption_rows_max,
+            } };
+        },
+        .token_prompt => self.session.input = .{ .caption = .{
+            .title = "Bot token",
+            .controls = "Enter: Save · Esc: Cancel",
+            .rows_max = Session.editor_caption_rows_max,
+        } },
+        .idle, .checking_token, .pairing => self.session.input = .{},
+    }
+    self.session.dirty = true;
+}
+
+/// Name the caption title of the inactive editor after `username`.
+fn takeRemoteTitle(self: *App, username: []const u8) !void {
+    const title = try std.fmt.allocPrint(self.gpa, "Remote: @{s}", .{username});
+    self.gpa.free(self.remote_title);
+    self.remote_title = title;
+}
+
+/// Record the attach event, which states the session and is the first message
+/// of the chat. The editor is empty by then, because the `/remote` line went
+/// with the command.
+fn openChat(self: *App, username: []const u8) !void {
+    self.session.clearNotice();
+    const text = try self.attachEventText(username);
+    defer self.gpa.free(text);
+    try self.recordAsyncEvent(.information, "{s}", .{text});
+    try self.controller.sendEvent(.information, text);
+}
+
+/// The attach event: the bot, then the state of the session in the words and
+/// the order of the status line. The place takes its full label and its branch,
+/// because the chat has no column budget and a Herdr pane hides both from the
+/// line alone.
+fn attachEventText(self: *App, username: []const u8) ![]u8 {
+    var info = self.session.statusInfo();
+    info.directory = self.directory_label;
+    // A pane leaves the branch unread, so the event reads the head itself.
+    var maybe_head: ?ai.project.Head = null;
+    if (self.project_instructions.projectRoot()) |root|
+        maybe_head = ai.project.head(self.gpa, self.io, root);
+    info.branch = if (maybe_head) |*head| head.name() else null;
+    var out: std.Io.Writer.Allocating = .init(self.gpa);
+    defer out.deinit();
+    try out.writer.print("Remote: @{s}{s}", .{ username, ui.paint.separator });
+    try ui.status.writeSummary(&out.writer, &info);
+    return out.toOwnedSlice();
+}
+
+/// Show the pairing in the `/remote` picker: a wait row for the token check,
+/// then the code with its link, and the close of the wait at the end.
+fn applyPairingChange(self: *App, change: remote.Controller.Action.PairingChange) !void {
+    switch (change) {
+        .check_started => try self.session.openWait(&.{
+            .select = selectNothing,
+            .title = "Remote",
+            .cancellation_message = "You canceled the pairing.",
+            .options = &.{},
+            .current = null,
+        }, token_check_wait_text),
+        .code_ready => {
+            var link_buffer: [128]u8 = undefined;
+            const link = try self.gpa.dupe(u8, self.controller.pairingLink(&link_buffer));
+            errdefer self.gpa.free(link);
+            const text = try std.fmt.allocPrint(
+                self.gpa,
+                "Send the code {s} to @{s}",
+                .{ self.controller.pairingCode(), self.controller.pairingUsername() },
+            );
+            errdefer self.gpa.free(text);
+            try self.session.setPickerWait(text, link);
+            self.freePairingStrings();
+            self.pairing_wait_text = text;
+            self.pairing_wait_link = link;
+        },
+        // The token stays in the editor, so the prompt returns to it.
+        .prompt_restored => {
+            self.session.closePicker();
+            self.freePairingStrings();
+        },
+        .ended => {
+            self.session.closePicker();
+            self.session.editor.clear();
+            self.freePairingStrings();
+        },
+    }
+}
+
+/// The selector of the wait picker of a pairing. The list holds no row, so no
+/// selection reaches it.
+fn selectNothing(context: *ai.command.Context, index: usize) anyerror!ai.command.Outcome {
+    _ = index;
+    return ai.command.Outcome.reportNotice(context.gpa, .failure, "Select a valid row.", .{});
+}
+
+/// Free the wait row of the pairing picker. The picker must be closed, or it
+/// must hold other text.
+fn freePairingStrings(self: *App) void {
+    self.gpa.free(self.pairing_wait_text);
+    self.gpa.free(self.pairing_wait_link);
+    self.pairing_wait_text = "";
+    self.pairing_wait_link = "";
+}
+
+/// Free every string the remote state borrows from the app.
+fn freeRemoteStrings(self: *App) void {
+    self.freePairingStrings();
+    self.gpa.free(self.remote_title);
+    self.remote_title = "";
+}
+
+/// Keys while the terminal does not hold the input. Every exit key moves the
+/// input one step toward the terminal: a detach of the attached bot, or the end
+/// of the wait for its last message. Enter states the reason, and every other
+/// key does nothing.
+fn handleExternalKey(self: *App, event: *const terminal.Input.Key) !void {
+    switch (event.*) {
+        .escape => try self.exitRemote(),
+        .ctrl => |letter| switch (letter) {
+            'c', 'd' => try self.exitRemote(),
+            else => {},
+        },
+        .enter => try self.reportRemoteNotice(),
+        else => {},
+    }
+}
+
+/// An exit key under a bot: detach it, or end the wait for its last message.
+fn exitRemote(self: *App) !void {
+    switch (self.controller.state()) {
+        .attached => try self.controller.detach(.user),
+        .detaching => try self.controller.abortDetach(),
+        .idle, .token_prompt, .checking_token, .pairing => unreachable,
+    }
+}
+
+/// Enter under a bot: name the bot that holds the input, or the wait for its
+/// last message, and the key that ends it.
+fn reportRemoteNotice(self: *App) !void {
+    const username = self.controller.botUsername().?;
+    switch (self.controller.state()) {
+        .attached => try self.reportNotice(
+            .information,
+            "@{s} holds the input. Esc detaches.",
+            .{username},
+        ),
+        .detaching => try self.reportNotice(
+            .information,
+            "Drinky detaches @{s}. Esc ends the wait.",
+            .{username},
+        ),
+        .idle, .token_prompt, .checking_token, .pairing => unreachable,
+    }
+}
+
+/// A Telegram message enters through the path of an Enter in the editor, so every
+/// refusal and every steering rule applies once. It never reads or writes the
+/// editor, and a refusal answers the message in the chat.
+fn submitChatMessage(self: *App, text: []const u8, message_id: i64) !void {
+    switch (self.session.mode) {
+        .turn => {
+            // No command runs mid-turn, as in the terminal. The registry
+            // decides first there too, so a line it cannot run as typed keeps
+            // its own refusal instead of the one that names the turn.
+            if (ai.command.parse(text)) |name| {
+                const refusal = (try self.checkCommand(text)) orelse
+                    try ai.command.refuse(self.gpa, name, "while a turn runs");
+                defer self.gpa.free(refusal.content);
+                return self.controller.reply(message_id, refusal.content);
+            }
+            // The draft and the slot come first, so the channel push is the only
+            // fallible step before the mirror moves in.
+            var draft = try ui.Editor.Draft.fromText(self.gpa, text);
+            errdefer draft.deinit(self.gpa);
+            try self.session.reserveSteering();
+            try self.agent.steering.push(text);
+            self.session.commitExternalSteering(&draft, message_id);
+            return;
+        },
+        .prompt => {},
+        // The terminal takes no input while the bot holds it, so no picker and
+        // no page opens. The reply guards the session against a message that
+        // meets one anyway, because a message must never end the session.
+        .picking, .viewing => return self.controller.reply(
+            message_id,
+            "Drinky cannot take a message now.",
+        ),
+    }
+    // Every command line refuses in this phase, and the refusal names the
+    // terminal, because the terminal is the one place that runs a command. A
+    // line the registry cannot run as typed keeps its own refusal.
+    if (ai.command.parse(text)) |name| {
+        const refusal = (try self.checkCommand(text)) orelse try ai.command.Outcome.Message.print(
+            self.gpa,
+            .warning,
+            "The command /{s} runs in the terminal alone.",
+            .{name},
+        );
+        defer self.gpa.free(refusal.content);
+        return self.controller.reply(message_id, refusal.content);
+    }
+    if (!self.signedIn()) return self.controller.reply(message_id, telegram_signed_out_refusal);
+    if (self.agent.model == null) return self.controller.reply(message_id, telegram_no_model_refusal);
+    // The draft comes first, so the turn start is the last fallible step. The
+    // prompt then follows the rule of a queued Telegram message: it fills no editor
+    // while the bot holds the input, and it returns after a detach.
+    var draft = try ui.Editor.Draft.fromText(self.gpa, text);
+    errdefer draft.deinit(self.gpa);
+    const base = try self.startUserTurn(text);
+    self.session.retainExternalTurnPrompt(&draft, base, message_id);
+}
+
+/// Keys in the token prompt state. The editor stays live for the token, Enter
+/// hands it to the check, and every exit key ends the prompt. Ctrl+C clears a
+/// draft first, as it does at the prompt.
+fn handleTokenKey(self: *App, event: *const terminal.Input.Key) !void {
+    if (try self.editKey(event)) return;
+    switch (event.*) {
+        .enter => try self.submitToken(),
+        .escape => try self.cancelTokenPrompt(),
+        .ctrl => |letter| switch (letter) {
+            'c' => if (self.session.editor.visible().len != 0) {
+                self.session.editor.clear();
+                self.session.markEdited();
+            } else {
+                try self.cancelTokenPrompt();
+            },
+            'd' => try self.cancelTokenPrompt(),
+            else => {},
+        },
+        else => {},
+    }
+}
+
+/// Enter in the token prompt state: hand the token to the check. The editor
+/// keeps the token meanwhile, so a rejected token returns to it.
+fn submitToken(self: *App) !void {
+    const token = try self.session.editor.expanded(.whole_prompt);
+    defer self.gpa.free(token);
+    try self.controller.submitToken(token);
+}
+
+/// Leave the token prompt state without a bot.
+fn cancelTokenPrompt(self: *App) !void {
+    self.session.editor.clear();
+    try self.controller.cancelTokenPrompt();
+}
+
+/// Keys while the `/remote` picker waits for a pairing. Esc cancels the step:
+/// a token check returns to the token prompt, and a code wait ends the pairing.
+/// Ctrl+C and Ctrl+D leave the whole command, as they do from any step.
+fn handlePairingKey(self: *App, event: *const terminal.Input.Key) !void {
+    switch (event.*) {
+        .escape => try self.controller.cancelPairing(.step),
+        .ctrl => |letter| switch (letter) {
+            'c', 'd' => try self.controller.cancelPairing(.command),
+            else => {},
+        },
+        else => {},
+    }
 }
 
 /// Keys on a full-window page. Esc is the documented way out. Ctrl+C and Ctrl+D
@@ -2721,6 +3171,7 @@ fn handlePageKey(self: *App, event: *const terminal.Input.Key) !void {
 }
 
 fn handlePickerKey(self: *App, event: *const terminal.Input.Key) !void {
+    if (self.controller.pairs()) return self.handlePairingKey(event);
     if (self.session.pickerWaits()) return self.handleFetchKey(event);
     const picker = &self.session.mode.picking.picker;
     switch (event.*) {
@@ -3124,7 +3575,7 @@ test "the input reader closes the key queue at the end of stdin" {
     // waiting on a terminal that can never answer. A zero minimum makes the open
     // queue return immediately. The `error.Closed` expectation then fails without
     // a hang.
-    var batch: [1]Session.UiEvent = undefined;
+    var batch: [1]UiEvent = undefined;
     try std.testing.expectError(error.Closed, app.queue.get(io, &batch, 0));
 }
 
@@ -3177,7 +3628,7 @@ test "turn producers keep their captured generation" {
         result.error_text.?,
     );
 
-    var events: [10]Session.UiEvent = undefined;
+    var events: [10]UiEvent = undefined;
     const count = try app.queue.get(io, &events, events.len);
     defer for (events[0..count]) |event| event.deinit(gpa);
     try std.testing.expectEqual(events.len, count);
@@ -3603,7 +4054,7 @@ test "cancel restores steering before event allocation failure" {
     try app.session.editor.insert("restore me");
     try app.submitSteering();
     try spawnCommittedCanceledTurn(&app);
-    try app.session.editor.reserveDrafts(app.session.steering.items);
+    try app.session.reserveSteeringRestore();
     failing.fail_index = failing.alloc_index;
     failing.resize_fail_index = failing.resize_index;
 
@@ -3896,7 +4347,7 @@ test "a cancel that loses the race waits for the terminal fence" {
     try std.testing.expect(app.pending_turn_result != null);
     try std.testing.expectEqualStrings("", app.session.editor.visible());
 
-    const events = [_]Session.UiEvent{.{ .turn = .{
+    const events = [_]UiEvent{.{ .turn = .{
         .generation = 7,
         .payload = endedPayload(),
     } }};
@@ -3953,7 +4404,7 @@ test "cancel does not commit stale text across a reset held in the current batch
     };
     app.turn_future = try io.concurrent(fakeWorker, .{&worker_result});
 
-    const events = [_]Session.UiEvent{
+    const events = [_]UiEvent{
         .{ .keys = try gpa.dupe(u8, "\x03") },
         .{ .turn = .{
             .generation = 1,
@@ -4010,7 +4461,7 @@ test "cancel preserves progress before a queued terminal fence" {
     };
     app.turn_future = try io.concurrent(fakeWorker, .{&worker_result});
 
-    const events = [_]Session.UiEvent{
+    const events = [_]UiEvent{
         .{ .keys = try gpa.dupe(u8, "\x03") },
         .{ .turn = .{
             .generation = 11,
@@ -4073,7 +4524,7 @@ test "cancel replaces an interrupted terminal fence after queued progress" {
     };
     app.turn_future = try io.concurrent(fakeWorker, .{&worker_result});
 
-    const events = [_]Session.UiEvent{
+    const events = [_]UiEvent{
         .{ .keys = try gpa.dupe(u8, "\x03") },
         .{ .turn = .{
             .generation = 12,
@@ -4096,7 +4547,7 @@ test "cancel replaces an interrupted terminal fence after queued progress" {
     try std.testing.expectEqualStrings("answer", prefix[0].content.model.items);
     try std.testing.expectEqualStrings("folded", prefix[1].content.user.items);
 
-    var fence: [1]Session.UiEvent = undefined;
+    var fence: [1]UiEvent = undefined;
     const count = try app.queue.get(io, &fence, 1);
     try std.testing.expectEqual(fence.len, count);
     try std.testing.expect(!try app.applyBatch(fence[0..count]));
@@ -4130,7 +4581,7 @@ test "an interrupted terminal fence retries after a full queue drain" {
     defer app.input.deinit();
     app.session.beginTurn(13);
 
-    const filler = [_]Session.UiEvent{.resize} ** queue_capacity;
+    const filler = [_]UiEvent{.resize} ** queue_capacity;
     try app.queue.putAll(io, &filler);
     const worker_result: WorkerResult = .{
         .outcome = .{ .receipt = zero_receipt, .disposition = .completed },
@@ -4140,7 +4591,7 @@ test "an interrupted terminal fence retries after a full queue drain" {
     };
     app.turn_future = try io.concurrent(fakeWorker, .{&worker_result});
 
-    const events = [_]Session.UiEvent{
+    const events = [_]UiEvent{
         .{ .keys = try gpa.dupe(u8, "\x03") },
         .{ .turn = .{
             .generation = 13,
@@ -4151,14 +4602,14 @@ test "an interrupted terminal fence retries after a full queue drain" {
     try std.testing.expect(!app.pending_turn_result.?.terminal_queued);
     try std.testing.expect(app.session.mode == .turn);
 
-    var first: [1]Session.UiEvent = undefined;
+    var first: [1]UiEvent = undefined;
     const first_count = try app.queue.get(io, &first, first.len);
     try std.testing.expectEqual(first.len, first_count);
     app.enqueuePendingTurnFence();
     try std.testing.expect(app.pending_turn_result.?.terminal_queued);
     try std.testing.expect(!try app.applyBatch(first[0..first_count]));
 
-    var rest: [queue_capacity]Session.UiEvent = undefined;
+    var rest: [queue_capacity]UiEvent = undefined;
     const rest_count = try app.queue.get(io, &rest, rest.len);
     try std.testing.expectEqual(rest.len, rest_count);
     try std.testing.expect(!try app.applyBatch(rest[0..rest_count]));
@@ -4207,7 +4658,7 @@ test "a cancel that loses the race applies the failed joined result" {
     try app.cancelTurn();
     try std.testing.expect(app.session.mode == .turn);
 
-    var events: [1]Session.UiEvent = undefined;
+    var events: [1]UiEvent = undefined;
     const count = try app.queue.get(io, &events, 1);
     try std.testing.expectEqual(events.len, count);
     try std.testing.expect(!try app.applyBatch(events[0..count]));
@@ -4262,7 +4713,7 @@ test "a joined completion returns late steering to the editor" {
     try app.cancelTurn();
     try std.testing.expect(app.session.mode == .turn);
 
-    var events: [1]Session.UiEvent = undefined;
+    var events: [1]UiEvent = undefined;
     const count = try app.queue.get(io, &events, 1);
     try std.testing.expectEqual(events.len, count);
     try std.testing.expect(!try app.applyBatch(events[0..count]));
@@ -4365,7 +4816,7 @@ test "a delayed consumed event after ctrl+p cannot remove newer steering" {
     try std.testing.expectEqual(@as(usize, 2), app.session.steering.items.len);
     try std.testing.expectEqualStrings(
         "new",
-        app.session.steering.items[app.session.steering_retained_count].visible.items,
+        app.session.steering.items[app.session.steering_retained_count].draft.visible.items,
     );
 
     try app.pullSteering();
@@ -4572,7 +5023,7 @@ test "late placeholder steering returns before a newer key in the same batch" {
     const payload = "line\n" ** 10 ++ "line";
     try app.session.editor.paste(payload, true);
     try app.submitSteering();
-    const events = [_]Session.UiEvent{
+    const events = [_]UiEvent{
         .{ .turn = .{ .generation = 1, .payload = endedPayload() } },
         .{ .keys = try gpa.dupe(u8, "new") },
     };
@@ -4611,7 +5062,7 @@ test "a drained batch routes only the active turn generation" {
     defer app.session.deinit();
 
     app.session.beginTurn(1);
-    const first = [_]Session.UiEvent{.{ .turn = .{
+    const first = [_]UiEvent{.{ .turn = .{
         .generation = 1,
         .payload = .{ .text = try gpa.dupe(u8, "turn A") },
     } }};
@@ -4624,7 +5075,7 @@ test "a drained batch routes only the active turn generation" {
     };
     app.turn_future = try io.concurrent(fakeWorker, .{&worker_result});
 
-    const rest = [_]Session.UiEvent{
+    const rest = [_]UiEvent{
         .{ .turn = .{
             .generation = 1,
             .payload = .{ .text = try gpa.dupe(u8, "stale A") },
@@ -4659,7 +5110,7 @@ test "a resize event marks an idle interface dirty" {
     app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
 
-    try std.testing.expect(!try app.applyBatch(&[_]Session.UiEvent{.resize}));
+    try std.testing.expect(!try app.applyBatch(&[_]UiEvent{.resize}));
     try std.testing.expect(app.session.dirty);
 }
 
@@ -4675,7 +5126,7 @@ test "a failed batch frees its unprocessed turn events" {
     defer app.session.deinit();
     app.session.beginTurn(1);
 
-    const events = [_]Session.UiEvent{
+    const events = [_]UiEvent{
         .{ .turn = .{
             .generation = 1,
             .payload = .{ .text = try gpa.dupe(u8, "current") },
@@ -7773,7 +8224,7 @@ test "a user action clears a notice while background events leave it visible" {
     try app.session.applyOutcome(
         try ai.command.Outcome.reportNotice(gpa, .failure, "temporary", .{}),
     );
-    const background = [_]Session.UiEvent{ .resize, .tick };
+    const background = [_]UiEvent{ .resize, .tick };
     try std.testing.expect(try app.applyBatch(&background));
     try std.testing.expectEqualStrings("temporary", app.session.notice.?.content);
 
@@ -8130,13 +8581,45 @@ test showProject {
     app.showProject(true);
     try std.testing.expectEqualStrings("", app.session.directory_shown);
     try std.testing.expect(app.session.branch_root == null);
-    const events = [_]Session.UiEvent{.{ .keys = try gpa.dupe(u8, "x") }};
+    const events = [_]UiEvent{.{ .keys = try gpa.dupe(u8, "x") }};
     try std.testing.expect(!try app.applyBatch(&events));
     try std.testing.expect(app.session.branch() == null);
 
     app.showProject(false);
     try std.testing.expectEqualStrings("~/project", app.session.directory_shown);
     try std.testing.expectEqualStrings("topic", app.session.branch().?);
+}
+
+// A Herdr pane hides the place from the status line, because the pane shows it.
+// The attach event goes to a chat that sees no pane, so it states the full place
+// with the branch there too.
+test "the attach event states the branch inside a Herdr pane" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var marker = try tmp.dir.createDirPathOpen(io, ".git", .{});
+    marker.close(io);
+    try tmp.dir.writeFile(io, .{ .sub_path = ".git/HEAD", .data = "ref: refs/heads/topic\n" });
+    const root = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(root);
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
+    defer app.session.deinit();
+    defer app.input.deinit();
+    defer app.controller.deinit();
+    app.directory_label = "~/project";
+    app.project_instructions = try ai.instructions.discover(gpa, io, root);
+    defer app.project_instructions.deinit();
+    app.showProject(true);
+
+    const text = try app.attachEventText("drinky_bot");
+    defer gpa.free(text);
+    try std.testing.expect(std.mem.startsWith(u8, text, "Remote: @drinky_bot · ~/project (topic) · "));
 }
 
 // A checkout in another terminal shows on the next key, so the label needs no
@@ -8164,7 +8647,7 @@ test "an input event re-reads the branch" {
     try std.testing.expectEqualStrings("topic", app.session.branch().?);
 
     try tmp.dir.writeFile(io, .{ .sub_path = ".git/HEAD", .data = "ref: refs/heads/other\n" });
-    const events = [_]Session.UiEvent{.{ .keys = try gpa.dupe(u8, "x") }};
+    const events = [_]UiEvent{.{ .keys = try gpa.dupe(u8, "x") }};
     try std.testing.expect(!try app.applyBatch(&events));
     try std.testing.expectEqualStrings("other", app.session.branch().?);
 }
@@ -8182,7 +8665,7 @@ test "cancel draining preserves non-turn events ahead of newer queue data" {
     defer app.session.deinit();
     app.session.beginTurn(1);
 
-    var queued: [queue_capacity]Session.UiEvent = @splat(.resize);
+    var queued: [queue_capacity]UiEvent = @splat(.resize);
     queued[0] = .{ .turn = .{
         .generation = 1,
         .progress_sequence = 1,
@@ -8191,7 +8674,7 @@ test "cancel draining preserves non-turn events ahead of newer queue data" {
     try app.queue.putAll(io, &queued);
 
     const producer = struct {
-        fn put(queue: *std.Io.Queue(Session.UiEvent), producer_io: std.Io) void {
+        fn put(queue: *std.Io.Queue(UiEvent), producer_io: std.Io) void {
             queue.putOne(producer_io, .tick) catch {};
         }
     };
@@ -8210,13 +8693,13 @@ test "cancel draining preserves non-turn events ahead of newer queue data" {
     try std.testing.expect(app.drainCanceledProgress(true) == null);
     try std.testing.expectEqual(queue_capacity - 1, app.deferred_event_count);
 
-    var deferred: [queue_capacity]Session.UiEvent = undefined;
+    var deferred: [queue_capacity]UiEvent = undefined;
     const deferred_count = app.takeDeferredEvents(&deferred);
     try std.testing.expectEqual(queue_capacity - 1, deferred_count);
     for (deferred[0..deferred_count]) |event|
         try std.testing.expect(event == .resize);
 
-    var newer: [2]Session.UiEvent = undefined;
+    var newer: [2]UiEvent = undefined;
     try std.testing.expectEqual(newer.len, try app.queue.get(io, &newer, newer.len));
     try std.testing.expect(newer[0] == .tick);
     try std.testing.expect(newer[1] == .turn);
@@ -8343,7 +8826,7 @@ test "a committed cancel drains queued progress into the transcript before rewin
     // The committed round's progress is still queued, unread by the consumer.
     // Its usage snapshot predates the final canceled-stream accounting.
     app.agent.stats.cost = 2.5;
-    const queued = [_]Session.UiEvent{
+    const queued = [_]UiEvent{
         .{ .turn = .{
             .generation = 5,
             .progress_sequence = 1,
@@ -8446,4 +8929,673 @@ test "the frame grid starts again after an overrun or an idle wait" {
     // The grid picks the fixed period up again from there.
     grid.advance(idle_ns);
     try std.testing.expectEqual(idle_ns + FrameGrid.interval_ns, grid.deadline_ns);
+}
+
+const remote_testing = @import("remote/testing.zig");
+
+const remote_ok_true = "{\"ok\":true,\"result\":true}";
+const remote_ok_empty = "{\"ok\":true,\"result\":[]}";
+const remote_ok_sent = "{\"ok\":true,\"result\":{\"message_id\":1}}";
+
+/// Test scaffolding: an app whose Telegram calls reach the loopback `server`
+/// through `io`, with a session and a signed-out agent. The caller frees it with
+/// `deinitRemoteTest`.
+fn initRemoteTest(
+    self: *App,
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    out: *std.Io.Writer.Allocating,
+    server: *const remote_testing.Server,
+    url_buffer: []u8,
+) void {
+    self.initForTest(gpa);
+    self.io = io;
+    self.controller.io = io;
+    self.controller.base_url = server.url(url_buffer);
+    self.controller.connect_ms = 60_000;
+    self.controller.pace = remote_testing.pace;
+    self.controller.code = "x7kq4m2p".*;
+    self.agent = ai.Agent.init(gpa, io, null, .{
+        .model = null,
+        .system = "",
+        .retry = .{},
+        .environ = .empty,
+    });
+    self.session = Session.init(gpa, &out.writer, null, .low);
+    self.directory_label = "~/work/drinky";
+}
+
+fn deinitRemoteTest(self: *App) void {
+    self.controller.deinit();
+    self.freeRemoteStrings();
+    self.drainQueue();
+    self.input.deinit();
+    self.session.deinit();
+    self.agent.deinit();
+}
+
+/// Apply queued events until `count_min` of them applied, and wait up to about
+/// five seconds for them. A worker that never reports fails the test.
+fn pumpRemoteEvents(self: *App, count_min: usize) !void {
+    var batch: [queue_capacity]UiEvent = undefined;
+    var applied: usize = 0;
+    for (0..500) |_| {
+        const count = try self.queue.get(self.io, &batch, 0);
+        if (count > 0) {
+            _ = try self.applyBatch(batch[0..count]);
+            applied += count;
+        }
+        if (applied >= count_min) return;
+        try self.io.sleep(.fromMilliseconds(10), .awake);
+    }
+    return error.TestTimedOut;
+}
+
+/// The text of the last transcript event.
+fn lastEventText(self: *const App) []const u8 {
+    const blocks = self.session.transcript.blocks();
+    return blocks[blocks.len - 1].content.event.text.items;
+}
+
+test "/remote lists the saved bots, and the remove row drops one with an event" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    defer app.input.deinit();
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = null,
+        .system = "",
+        .retry = .{},
+        .environ = .empty,
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, null, .low);
+    defer app.session.deinit();
+    defer app.controller.deinit();
+    const store = &app.controller.store;
+    try store.save(&.{ .token = "1:a", .id = 1, .username = "first_bot", .chat_id = 5 });
+    try store.save(&.{ .token = "2:b", .id = 2, .username = "second_bot", .chat_id = 6 });
+
+    try app.session.editor.insert("/remote");
+    try app.submit();
+    try std.testing.expect(app.session.mode == .picking);
+    const picker = &app.session.mode.picking.picker;
+    try std.testing.expectEqual(@as(usize, 4), picker.options.len);
+    try std.testing.expectEqualStrings("@first_bot", picker.options[0]);
+    try std.testing.expectEqualStrings("Remove a bot", picker.options[3]);
+
+    // The remove row opens the second list, and one pick is the decision.
+    try app.handleKeys("\x1b[B\x1b[B\x1b[B\r");
+    try std.testing.expect(app.session.mode == .picking);
+    try std.testing.expectEqualStrings("Remove a bot", app.session.mode.picking.picker.title);
+    try app.handleKeys("\r");
+    try std.testing.expect(app.session.mode == .prompt);
+    try std.testing.expectEqual(@as(usize, 1), app.controller.usernames().len);
+    try std.testing.expectEqualStrings("second_bot", app.controller.usernames()[0]);
+    try std.testing.expectEqualStrings("Drinky removed the bot @first_bot.", app.lastEventText());
+}
+
+test "the add row opens the token prompt, and every exit key or a bad token keeps the session" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    defer app.input.deinit();
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = null,
+        .system = "",
+        .retry = .{},
+        .environ = .empty,
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, null, .low);
+    defer app.session.deinit();
+    defer app.controller.deinit();
+
+    // With no saved bot the picker holds the add row alone, so Enter opens the
+    // token prompt under its caption.
+    try app.session.editor.insert("/remote");
+    try app.submit();
+    try app.handleKeys("\r");
+    try std.testing.expect(app.session.mode == .prompt);
+    try std.testing.expectEqual(remote.Controller.State.token_prompt, app.controller.state());
+    try std.testing.expect(app.session.input.owner == .terminal);
+    try std.testing.expectEqualStrings("Bot token", app.session.input.caption.?.title);
+    try std.testing.expectEqualStrings("", app.session.editor.visible());
+    try app.session.paint(.{ .columns = 80, .rows = 24 });
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "Enter: Save") != null);
+
+    // Enter on an empty prompt asks for the token, and a malformed token never
+    // reaches the network.
+    try app.handleKeys("\r");
+    try std.testing.expectEqualStrings("Type the bot token.", app.session.notice.?.content);
+    try app.handleKeys("not a token\r");
+    try std.testing.expectEqual(remote.Controller.State.token_prompt, app.controller.state());
+    try std.testing.expect(std.mem.indexOf(u8, app.session.notice.?.content, "digits") != null);
+    try std.testing.expectEqualStrings("not a token", app.session.editor.visible());
+
+    // Ctrl+C clears the draft first and ends the prompt at an empty editor.
+    try app.handleKeys("\x03");
+    try std.testing.expectEqual(remote.Controller.State.token_prompt, app.controller.state());
+    try std.testing.expectEqualStrings("", app.session.editor.visible());
+    try app.handleKeys("\x03");
+    try std.testing.expectEqual(remote.Controller.State.idle, app.controller.state());
+    try std.testing.expect(app.session.input.caption == null);
+    try std.testing.expectEqualStrings("You canceled the bot token.", app.session.notice.?.content);
+    try std.testing.expect(app.running);
+
+    // Esc and Ctrl+D end the prompt too, and neither reaches past it.
+    try app.runCommand("/remote");
+    try app.handleKeys("\r");
+    try app.handleKeys("123:abc");
+    try app.handleKey(&.escape);
+    try std.testing.expectEqual(remote.Controller.State.idle, app.controller.state());
+    try std.testing.expectEqualStrings("", app.session.editor.visible());
+    try app.runCommand("/remote");
+    try app.handleKeys("\r");
+    try app.handleKeys("\x04");
+    try std.testing.expectEqual(remote.Controller.State.idle, app.controller.state());
+    try std.testing.expect(app.running);
+}
+
+test "a pairing shows its wait and its code in the picker, and the bind takes the input" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var server = try remote_testing.Server.init(gpa, io, &.{
+        .{ .method = "getMe", .replies = &.{
+            .{ .status = 401, .body = "{\"ok\":false,\"error_code\":401,\"description\":\"Unauthorized\"}" },
+            .{ .body = "{\"ok\":true,\"result\":{\"id\":42,\"is_bot\":true,\"username\":\"drinky_bot\"}}" },
+        } },
+        // The pairing polls once and finds the code, then the attach confirms
+        // the old updates and holds its long poll.
+        .{ .method = "deleteWebhook", .replies = &.{ .{ .body = remote_ok_true }, .{ .body = remote_ok_true } } },
+        .{ .method = "getUpdates", .replies = &.{
+            .{ .body = remote_ok_empty },
+            .{ .body =
+            \\{"ok":true,"result":[{"update_id":1,"message":{"message_id":1,"date":0,"chat":{"id":99,"type":"private"},"text":"/start x7kq4m2p"}}]}
+            },
+            .{ .body = remote_ok_empty },
+        } },
+        .{ .method = "sendMessage", .replies = &.{.{ .body = remote_ok_sent }} },
+    });
+    defer server.deinit();
+    try server.start();
+    var url_buffer: [64]u8 = undefined;
+
+    var app: App = undefined;
+    app.initRemoteTest(gpa, io, &out, &server, &url_buffer);
+    defer app.deinitRemoteTest();
+
+    try app.runCommand("/remote");
+    try app.handleKeys("\r");
+    try app.handleKeys("42:secret\r");
+    // The check runs on a worker, and the picker waits meanwhile.
+    try std.testing.expect(app.session.pickerWaits());
+    try std.testing.expect(app.session.input.caption == null);
+    try app.pumpRemoteEvents(1);
+    // The rejected token returns to the prompt with the token.
+    try std.testing.expect(app.session.mode == .prompt);
+    try std.testing.expectEqualStrings("Bot token", app.session.input.caption.?.title);
+    try std.testing.expectEqualStrings("42:secret", app.session.editor.visible());
+    try std.testing.expectEqualStrings("Telegram rejected the bot token.", app.session.notice.?.content);
+
+    // The second try passes the check, so the wait row states the code and the
+    // link, as a terminal hyperlink.
+    try app.handleKeys("\r");
+    try app.pumpRemoteEvents(1);
+    try std.testing.expectEqualStrings("Send the code x7kq4m2p to @drinky_bot", app.pairing_wait_text);
+    try std.testing.expectEqualStrings("https://t.me/drinky_bot?start=x7kq4m2p", app.pairing_wait_link);
+    try app.session.paint(.{ .columns = 120, .rows = 24 });
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        out.written(),
+        "\x1b]8;;https://t.me/drinky_bot?start=x7kq4m2p\x1b\\",
+    ) != null);
+
+    // The bind closes the picker, takes the input, and the attach event states
+    // the session and opens the chat.
+    try app.pumpRemoteEvents(1);
+    try std.testing.expect(app.session.mode == .prompt);
+    try std.testing.expect(app.session.input.owner == .external);
+    try std.testing.expectEqualStrings("Remote: @drinky_bot", app.session.input.caption.?.title);
+    try std.testing.expectEqualStrings("", app.session.editor.visible());
+    try std.testing.expectEqualStrings(
+        "Remote: @drinky_bot · ~/work/drinky · Context: 0 · Account: Signed out",
+        app.lastEventText(),
+    );
+    const sent = try server.waitForSend(0);
+    try std.testing.expect(std.mem.indexOf(u8, sent, "\"chat_id\":99") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        sent,
+        "\"text\":\"Event: Remote: @drinky_bot · ~/work/drinky · Context: 0 · Account: Signed out\"",
+    ) != null);
+    try server.finish();
+}
+
+test "while a bot holds the input the terminal takes a detach alone, and Enter names the bot" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var server = try remote_testing.Server.init(gpa, io, &.{
+        .{ .method = "deleteWebhook", .replies = &.{.{ .body = remote_ok_true }} },
+        .{ .method = "getUpdates", .replies = &.{.{ .body = remote_ok_empty }} },
+        .{ .method = "sendMessage", .replies = &.{ .{ .body = remote_ok_sent }, .{ .body = remote_ok_sent } } },
+    });
+    defer server.deinit();
+    try server.start();
+    var url_buffer: [64]u8 = undefined;
+
+    var app: App = undefined;
+    app.initRemoteTest(gpa, io, &out, &server, &url_buffer);
+    defer app.deinitRemoteTest();
+    try app.controller.store.save(&.{ .token = "42:secret", .id = 42, .username = "drinky_bot", .chat_id = 99 });
+
+    // A saved bot with a chat id attaches without a pairing.
+    try app.runCommand("/remote");
+    try app.handleKeys("\r");
+    try std.testing.expect(app.session.input.owner == .external);
+    try std.testing.expect(app.session.mode == .prompt);
+    try server.waitForRequests(2);
+
+    // Typed text and Enter reach no editor and no model.
+    try app.handleKeys("hello\r");
+    try std.testing.expectEqualStrings("", app.session.editor.visible());
+    try std.testing.expect(app.session.mode == .prompt);
+    try std.testing.expectEqualStrings(
+        "@drinky_bot holds the input. Esc detaches.",
+        app.session.notice.?.content,
+    );
+    try app.session.paint(.{ .columns = 80, .rows = 24 });
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "Remote: @drinky_bot") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "Esc: Detach") != null);
+
+    // Esc detaches and drops the rest of its exit attempt. The editor stays
+    // locked under the caption of the wait while the detach event goes out.
+    try app.handleKeys("\x1b\x04");
+    try std.testing.expect(app.session.input.owner == .none);
+    try std.testing.expectEqualStrings("Remote: @drinky_bot", app.session.input.caption.?.title);
+    try std.testing.expectEqualStrings("Esc: Cancel", app.session.input.caption.?.controls);
+    try std.testing.expect(app.running);
+    try std.testing.expectEqualStrings("You detached @drinky_bot.", app.lastEventText());
+    try app.handleKeys("hello\r");
+    try std.testing.expectEqualStrings("", app.session.editor.visible());
+    try std.testing.expectEqualStrings(
+        "Drinky detaches @drinky_bot. Esc ends the wait.",
+        app.session.notice.?.content,
+    );
+    const sent = try server.waitForSend(1);
+    try std.testing.expect(std.mem.indexOf(u8, sent, "\"text\":\"Event: You detached @drinky_bot.\"") != null);
+    try server.finish();
+
+    // The sender reports its end, and the terminal holds the input again, so
+    // Ctrl+D quits.
+    try app.pumpRemoteEvents(1);
+    try std.testing.expect(app.session.input.owner == .terminal);
+    try std.testing.expect(app.session.input.caption == null);
+    try app.handleKeys("\x04");
+    try std.testing.expect(!app.running);
+}
+
+// An exit key during the wait for the last message frees the editor at once and
+// drops that message, so a second Esc never leaves the user behind a dead
+// network. The rest of the exit attempt stays out of the prompt.
+test "an exit key during the detach wait frees the editor at once and drops the last message" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    // No script answers a send, so the detach event stays in flight.
+    var server = try remote_testing.Server.init(gpa, io, &.{
+        .{ .method = "deleteWebhook", .replies = &.{.{ .body = remote_ok_true }} },
+        .{ .method = "getUpdates", .replies = &.{.{ .body = remote_ok_empty }} },
+    });
+    defer server.deinit();
+    try server.start();
+    var url_buffer: [64]u8 = undefined;
+
+    var app: App = undefined;
+    app.initRemoteTest(gpa, io, &out, &server, &url_buffer);
+    defer app.deinitRemoteTest();
+    try app.controller.store.save(&.{ .token = "42:secret", .id = 42, .username = "drinky_bot", .chat_id = 99 });
+    try app.controller.attachSaved(0);
+    try server.waitForRequests(2);
+
+    try app.handleKey(&.escape);
+    try std.testing.expectEqual(remote.Controller.State.detaching, app.controller.state());
+    try server.waitForSends(1);
+    try app.handleKeys("\x1b\x04");
+    try std.testing.expectEqual(remote.Controller.State.idle, app.controller.state());
+    try std.testing.expect(app.session.input.owner == .terminal);
+    try std.testing.expect(app.session.input.caption == null);
+    try std.testing.expect(app.running);
+    try std.testing.expectEqual(@as(usize, 1), server.sendCount());
+    try server.finish();
+}
+
+// A one-shot confirmation belongs to the key that armed it. An exit key under a
+// bot ends one thing, so it must clear an older warning like every other key,
+// and the next Esc at the turn warns again instead of a cancel without one.
+test "an exit key under a bot clears an armed confirmation" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var server = try remote_testing.Server.init(gpa, io, &.{
+        .{ .method = "deleteWebhook", .replies = &.{.{ .body = remote_ok_true }} },
+        .{ .method = "getUpdates", .replies = &.{.{ .body = remote_ok_empty }} },
+    });
+    defer server.deinit();
+    try server.start();
+    var url_buffer: [64]u8 = undefined;
+
+    var app: App = undefined;
+    app.initRemoteTest(gpa, io, &out, &server, &url_buffer);
+    defer app.deinitRemoteTest();
+    try app.controller.store.save(&.{ .token = "42:secret", .id = 42, .username = "drinky_bot", .chat_id = 99 });
+
+    // Esc over a draft during a turn warns and arms the cancel.
+    app.session.beginTurn(1);
+    try app.handleKeys("draft");
+    try app.handleKey(&.escape);
+    try std.testing.expect(app.session.mode == .turn);
+    try std.testing.expect(std.mem.indexOf(u8, app.session.notice.?.content, "Press Esc again") != null);
+
+    // A bot attaches, and two exit keys detach it and end its wait.
+    try app.controller.attachSaved(0);
+    try server.waitForRequests(2);
+    try app.handleKey(&.escape);
+    try std.testing.expectEqual(remote.Controller.State.detaching, app.controller.state());
+    try app.handleKey(&.escape);
+    try std.testing.expectEqual(remote.Controller.State.idle, app.controller.state());
+    try std.testing.expect(app.session.mode == .turn);
+
+    // The next Esc at the turn warns again, because the exit keys cleared the
+    // older confirmation.
+    try app.handleKey(&.escape);
+    try std.testing.expect(app.session.mode == .turn);
+    try std.testing.expect(app.session.notice != null);
+    try std.testing.expect(std.mem.indexOf(u8, app.session.notice.?.content, "Press Esc again") != null);
+    try std.testing.expectEqualStrings("draft", app.session.editor.visible());
+    try server.finish();
+}
+
+test "a Telegram message runs as a prompt, and its refusals answer in the chat" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var server = try remote_testing.Server.init(gpa, io, &.{
+        .{ .method = "deleteWebhook", .replies = &.{.{ .body = remote_ok_true }} },
+        .{ .method = "getUpdates", .replies = &.{
+            .{ .body = remote_ok_empty },
+            .{ .body =
+            \\{"ok":true,"result":[
+            \\{"update_id":1,"message":{"message_id":1,"date":0,"chat":{"id":99,"type":"private"},"text":"/login"}},
+            \\{"update_id":2,"message":{"message_id":2,"date":0,"chat":{"id":99,"type":"private"},"text":"/nope"}},
+            \\{"update_id":3,"message":{"message_id":3,"date":0,"chat":{"id":99,"type":"private"},"text":"do the work"}}
+            \\]}
+            },
+        } },
+        .{ .method = "sendMessage", .replies = &.{
+            .{ .body = remote_ok_sent },
+            .{ .body = remote_ok_sent },
+            .{ .body = remote_ok_sent },
+            .{ .body = remote_ok_sent },
+        } },
+    });
+    defer server.deinit();
+    try server.start();
+    var url_buffer: [64]u8 = undefined;
+
+    var app: App = undefined;
+    app.initRemoteTest(gpa, io, &out, &server, &url_buffer);
+    defer app.deinitRemoteTest();
+    try app.controller.store.save(&.{ .token = "42:secret", .id = 42, .username = "drinky_bot", .chat_id = 99 });
+    try app.controller.attachSaved(0);
+
+    // Three messages, three events, and the signed-out refusal answers the prompt.
+    try app.pumpRemoteEvents(3);
+    try std.testing.expect(app.session.mode == .prompt);
+    try std.testing.expectEqual(@as(usize, 1), app.session.transcript.blocks().len);
+    try server.finish();
+    const login = try server.waitForSend(1);
+    try std.testing.expect(std.mem.indexOf(u8, login, "The command /login runs in the terminal alone.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, login, "\"reply_parameters\":{\"message_id\":1}") != null);
+    const unknown = try server.waitForSend(2);
+    try std.testing.expect(std.mem.indexOf(u8, unknown, "Drinky does not recognize the command /nope.") != null);
+    const signed_out = try server.waitForSend(3);
+    // The repair runs in the terminal alone, so the reply names it.
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        signed_out,
+        "Sign in with /login in the terminal before you send a message.",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(u8, signed_out, "\"reply_parameters\":{\"message_id\":3}") != null);
+}
+
+// A credential rejection detaches the bot, and the failed turn then returns its
+// uncommitted Telegram prompt to the editor like every message after a detach.
+// The detach must come first, or the reconciliation still runs under the bot and
+// drops the prompt that the login picker then opens over.
+test "a credential rejection returns the Telegram prompt to the editor" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(home);
+    var store = try tmp.dir.createDirPathOpen(io, ".drinky", .{});
+    store.close(io);
+    try tmp.dir.writeFile(io, .{
+        .sub_path = ".drinky/auth.json",
+        .data =
+        \\{ "anthropic_subscription":
+        \\    { "access": "a", "refresh": "r", "expires_ms": 4102444800000 } }
+        ,
+    });
+    var server = try remote_testing.Server.init(gpa, io, &.{
+        .{ .method = "deleteWebhook", .replies = &.{.{ .body = remote_ok_true }} },
+        .{ .method = "getUpdates", .replies = &.{.{ .body = remote_ok_empty }} },
+        .{ .method = "sendMessage", .replies = &.{ .{ .body = remote_ok_sent }, .{ .body = remote_ok_sent } } },
+    });
+    defer server.deinit();
+    try server.start();
+    var url_buffer: [64]u8 = undefined;
+
+    var app: App = undefined;
+    app.initRemoteTest(gpa, io, &out, &server, &url_buffer);
+    defer app.deinitRemoteTest();
+    app.agent.deinit();
+    app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
+    defer app.accounts.deinit();
+    app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_subscription), .{
+        .model = test_anthropic_model,
+        .system = "",
+        .retry = .{},
+        .environ = .empty,
+    });
+    app.session.account_shown = .anthropic_subscription;
+    try app.controller.store.save(&.{ .token = "42:secret", .id = 42, .username = "drinky_bot", .chat_id = 99 });
+    try app.controller.attachSaved(0);
+    try server.waitForRequests(2);
+
+    // A Telegram prompt starts a turn, and the provider rejects the credential
+    // before the turn commits anything.
+    app.session.beginTurn(1);
+    const base = app.session.transcript.blocks().len;
+    try app.session.transcript.append(.user, .{}, "from Telegram");
+    var draft = try ui.Editor.Draft.fromText(gpa, "from Telegram");
+    app.session.retainExternalTurnPrompt(&draft, base, 7);
+    var result: WorkerResult = .{
+        .outcome = .{ .receipt = zero_receipt, .disposition = .credential_rejected },
+        .error_text = try gpa.dupe(u8, turnFailureText(error.TokenGrantRejected).?),
+    };
+    defer app.freeWorkerResult(&result);
+    try app.finishWorkerResult(&result);
+
+    // The bot detached, the prompt is back in the editor, and the login picker
+    // stands over it.
+    try std.testing.expectEqual(remote.Controller.State.detaching, app.controller.state());
+    try std.testing.expect(app.session.input.owner == .none);
+    try std.testing.expectEqualStrings("from Telegram", app.session.editor.visible());
+    try std.testing.expect(app.session.mode == .picking);
+    try server.finish();
+}
+
+// The editor stays locked until the last message of the old bot went out, so no
+// command can run while a sender drains. The next pick then attaches at once,
+// and the chat of the old bot ended before the new chat opens.
+test "a pick after the detach wait attaches at once" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var server = try remote_testing.Server.init(gpa, io, &.{
+        .{ .method = "deleteWebhook", .replies = &.{ .{ .body = remote_ok_true }, .{ .body = remote_ok_true } } },
+        .{ .method = "getUpdates", .replies = &.{ .{ .body = remote_ok_empty }, .{ .body = remote_ok_empty } } },
+        .{ .method = "sendMessage", .replies = &.{
+            .{ .body = remote_ok_sent },
+            .{ .body = remote_ok_sent, .delay_ms = 100 },
+            .{ .body = remote_ok_sent },
+        } },
+    });
+    defer server.deinit();
+    try server.start();
+    var url_buffer: [64]u8 = undefined;
+
+    var app: App = undefined;
+    app.initRemoteTest(gpa, io, &out, &server, &url_buffer);
+    defer app.deinitRemoteTest();
+    try app.controller.store.save(&.{ .token = "42:secret", .id = 42, .username = "drinky_bot", .chat_id = 99 });
+
+    try app.controller.attachSaved(0);
+    try server.waitForRequests(2);
+    try app.handleKey(&.escape);
+    try std.testing.expectEqual(remote.Controller.State.detaching, app.controller.state());
+
+    // The editor is locked while the detach event goes out, so the `/remote`
+    // line reaches no editor.
+    try app.handleKeys("/remote\r");
+    try std.testing.expectEqualStrings("", app.session.editor.visible());
+    try std.testing.expect(app.session.mode == .prompt);
+
+    // The drain reports its end, and the next pick attaches without a wait.
+    _ = try server.waitForSend(1);
+    try app.pumpRemoteEvents(1);
+    try std.testing.expect(app.session.input.owner == .terminal);
+    try app.runCommand("/remote");
+    try app.handleKeys("\r");
+    try std.testing.expectEqual(remote.Controller.State.attached, app.controller.state());
+    try std.testing.expect(app.session.input.owner == .external);
+    _ = try server.waitForSend(2);
+    try server.finish();
+}
+
+test "a Telegram message during a turn queues as steering that drops while the bot holds the input" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var server = try remote_testing.Server.init(gpa, io, &.{
+        .{ .method = "deleteWebhook", .replies = &.{.{ .body = remote_ok_true }} },
+        .{ .method = "getUpdates", .replies = &.{.{ .body = remote_ok_empty }} },
+        .{ .method = "sendMessage", .replies = &.{
+            .{ .body = remote_ok_sent },
+            .{ .body = remote_ok_sent },
+            .{ .body = remote_ok_sent },
+            .{ .body = remote_ok_sent },
+        } },
+    });
+    defer server.deinit();
+    try server.start();
+    var url_buffer: [64]u8 = undefined;
+
+    var app: App = undefined;
+    app.initRemoteTest(gpa, io, &out, &server, &url_buffer);
+    defer app.deinitRemoteTest();
+    try app.controller.store.save(&.{ .token = "42:secret", .id = 42, .username = "drinky_bot", .chat_id = 99 });
+    try app.controller.attachSaved(0);
+    try server.waitForRequests(2);
+    app.session.beginTurn(1);
+
+    // A typed message from before the attach and a Telegram message share the queue.
+    try app.session.editor.insert("typed first");
+    try app.submitSteering();
+    try app.submitChatMessage("from the chat", 12);
+    try app.submitChatMessage("/new", 13);
+    try app.submitChatMessage("/nope", 14);
+    try std.testing.expectEqual(@as(usize, 2), app.session.steering.items.len);
+    try std.testing.expectEqual(@as(i64, 12), app.session.steering.items[1].source.external);
+    const queued = try app.agent.steering.take();
+    defer {
+        for (queued) |message| gpa.free(message);
+        gpa.free(queued);
+    }
+    try std.testing.expectEqual(@as(usize, 2), queued.len);
+    try std.testing.expectEqualStrings("from the chat", queued[1]);
+    const refusal = try server.waitForSend(1);
+    try std.testing.expect(std.mem.indexOf(u8, refusal, "The command /new cannot run while a turn runs.") != null);
+    // The registry decides first, so an unknown line keeps its own refusal
+    // instead of the one that names the turn.
+    const unknown = try server.waitForSend(2);
+    try std.testing.expect(std.mem.indexOf(u8, unknown, "Drinky does not recognize the command /nope.") != null);
+
+    // The turn ends with both uncommitted: the typed draft returns to the
+    // editor, and the Telegram message fills no editor while the bot holds the input.
+    try app.session.endTurnWithReceipt(&.{
+        .history_base = 0,
+        .history_end = 0,
+        .steering_committed_count = 0,
+    });
+    try app.session.reserveSteeringRecall();
+    try std.testing.expectEqual(@as(usize, 1), app.session.recallLateSteering());
+    try std.testing.expectEqualStrings("typed first", app.session.editor.visible());
+    try std.testing.expectEqual(@as(usize, 0), app.session.steering.items.len);
+
+    // After a detach the bot holds the input no more, so a queued Telegram message
+    // returns like a typed one, also while the last message still goes out.
+    app.session.editor.clear();
+    app.session.beginTurn(2);
+    try app.submitChatMessage("after the detach", 14);
+    try app.controller.detach(.user);
+    try std.testing.expect(app.session.input.owner == .none);
+    try app.session.endTurnWithReceipt(&.{
+        .history_base = 0,
+        .history_end = 0,
+        .steering_committed_count = 0,
+    });
+    try app.session.reserveSteeringRecall();
+    try std.testing.expectEqual(@as(usize, 1), app.session.recallLateSteering());
+    try std.testing.expectEqualStrings("after the detach", app.session.editor.visible());
+    app.agent.steering.clear();
+    try server.finish();
 }

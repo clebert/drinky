@@ -178,8 +178,14 @@ const Run = struct { start: usize = 0, end: usize = 0 };
 /// A run of a body that takes a role of its own, as byte offsets into that body.
 /// A collapsed paste marker is such a run. A row paints the part of the run that
 /// it holds in that role, so a run wider than the row keeps its role on every
-/// row it crosses.
-pub const Mark = struct { start: usize, end: usize, role: role.Name };
+/// row it crosses. A run with a `url` is a terminal hyperlink to it, underlined
+/// like a link in a reply.
+pub const Mark = struct {
+    start: usize,
+    end: usize,
+    role: role.Name,
+    url: ?[]const u8 = null,
+};
 
 /// Where a component composes its rows: the sink to write into, the anchor `id`
 /// its rows carry, the terminal width, the line its content starts at (`base`,
@@ -662,7 +668,14 @@ fn framedRowText(sink: *terminal.View.Sink, row: *const FramedRow) !void {
         std.debug.assert(start >= position);
         try sink.text(text[position..start]);
         try role.apply(sink, mark.role);
+        if (mark.url) |url| {
+            try attribute.apply(sink, .underline);
+            // The link opens and closes inside this row, so it covers exactly
+            // the text on this row and never leaks into the row under it.
+            try sink.linkSet(url);
+        }
         try sink.text(text[start..end]);
+        try sink.linkReset();
         try attribute.apply(sink, .reset);
         if (row.role) |name| try role.apply(sink, name);
         position = end;

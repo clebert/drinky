@@ -18,6 +18,9 @@ agent: *Agent,
 accounts: *Accounts,
 /// Runtime-discovered skills. Null in the command tests that do not need them.
 skill_registry: ?*const skills.Registry = null,
+/// The username of every saved Telegram bot, in the order of the store. The
+/// `/remote` picker names one row per bot, and the app owns the store.
+remote_bots: []const []const u8 = &.{},
 
 /// A slash command's result. Notice, event, picker, and prompt allocations
 /// transfer to the caller. The app owns account and conversation actions. A
@@ -66,6 +69,14 @@ pub const Outcome = union(enum) {
     show_sources,
     /// Show the complete provider-neutral system prompt assembled by the app.
     show_system_prompt,
+    /// Attach the saved Telegram bot at this index of `Context.remote_bots`.
+    /// The app owns the network, the store, and the attach state.
+    remote_attach: usize,
+    /// Ask the user for a bot token. The app switches the editor into its
+    /// token prompt state, proves the token, and pairs the bot.
+    remote_add,
+    /// Remove the saved Telegram bot at this index of `Context.remote_bots`.
+    remote_remove: usize,
 
     pub const Severity = enum { information, warning, failure };
 

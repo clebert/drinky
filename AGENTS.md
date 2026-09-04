@@ -20,6 +20,9 @@ behavior can be wrong.
   width code. It knows nothing about the app or the agent.
 - `lib/ai/` contains the provider-neutral agent core, provider transports, commands, and tools.
 - `src/` contains the composition root, event loop, transcript, layout, and UI.
+- `src/remote/` contains the Telegram remote control: the Bot API client, the store of saved bots,
+  the attachment with its poller and sender, the pairing, and the controller that owns them all. The
+  controller reports through a sink of small actions and knows nothing of the session.
 
 The libraries never import each other or the app. Only the `root.zig` file in a module can re-export
 names.
@@ -81,6 +84,23 @@ Use ASD-STE100 Simplified Technical English for Markdown, code comments, and Dri
 
 The rules do not apply to literal technical identifiers or schemas. Preserve the meaning and the
 terminal-width limits when you reword text.
+
+## Remote vocabulary
+
+The Telegram remote control uses three nouns. Each has one meaning in Markdown, comments, and
+user-facing text.
+
+- **bot** is the account with the token: `@drinky_bot`. Drinky saves, attaches, and detaches a bot,
+  and an attached bot holds the input.
+- **chat** is the Telegram conversation of that bot with the user. The pairing binds a private chat,
+  the poll gates on its chat id, the attach event opens the chat, and the detach event ends it. The
+  chat holds the text of every Telegram message.
+- **Telegram** is the far side as a source: a Telegram message, a command line from Telegram, a
+  Telegram update, an action from Telegram.
+
+Do not write "chat" for a source, and do not write "bot" for a message from the user, because a bot
+message reads as a message that the bot wrote. Do not write "conversation" for the chat, because
+that word means the model conversation that `/new` clears.
 
 ## Checks
 

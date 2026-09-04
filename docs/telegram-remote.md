@@ -1,8 +1,9 @@
 # Telegram remote control
 
-A session binds to a Telegram bot, so the user drives it from a phone. While the bot is attached,
-the phone is the one input device. It sends messages, runs commands, and acts on a turn. The
-terminal shows everything, takes no input but a detach, and keeps the process and the credentials.
+A session binds to a Telegram bot and its paired chat, so the user drives it from any Telegram
+client. While the bot is attached, the bot holds the input. It sends messages, runs commands, and
+acts on a turn. The terminal shows everything, takes no input but a detach, and keeps the process
+and the credentials.
 
 This document holds the decisions and the plan. `BACKLOG.md` holds the entry until the work lands.
 `FEATURES.md` gets the user-facing lines when it does. Delete this document when phase 3 lands,
@@ -10,41 +11,58 @@ because the tests and `FEATURES.md` then define the behavior, and the Git histor
 
 ## Decisions
 
-### One input device
+### One input owner
 
 - While a bot is attached, the terminal editor is inactive. It shows the caption
-  `Remote: @bot · Esc: Detach`. Enter shows the notice `The phone holds the input. Esc detaches.`
+  `Remote: @bot · Esc: Detach`, and a queue adds its count to the title as
+  `Remote: @bot · Queued messages: 2`, because the caption of the input owner replaces the caption
+  of the mode and the terminal must still report the depth of the queue. Enter shows the notice
+  `@bot holds the input. Esc detaches.` The notices name the bot and not the chat, because the user
+  sees the bot name on the screen.
 - Every exit key detaches: Esc, Ctrl+C, and Ctrl+D. No exit reaches past the attach, so a quit takes
   one more press after the detach, like a quit from a page. Every other key does nothing.
+- After the detach the editor stays locked under `Remote: @bot · Esc: Cancel` until the last message
+  of the chat went out, for five seconds at most. Enter shows the notice
+  `Drinky detaches @bot. Esc ends the wait.` An exit key drops that message, ends the bot at once,
+  and frees the editor. The lock keeps one rule: while the editor is free, no bot sends, so a pick
+  never meets a sender that still drains, and no attach ever waits.
 - The terminal never cancels a turn, never retries one, and never runs a command while attached. The
   transcript still shows every message, every tool box, and every event.
 - The detach hands the session to the terminal in the state it is in. That state is a running turn
-  with its queue, a waiting retry with its caption, or the idle prompt. A queued phone message stays
-  queued, and Ctrl+P recalls it like a typed one.
+  with its queue, a waiting retry with its caption, or the idle prompt. A queued Telegram message
+  stays queued, and Ctrl+P recalls it like a typed one. The prompt of the turn follows the same
+  rule: a Telegram prompt of a turn that fails before its first commit returns to the editor after
+  the detach, like a queued Telegram message, and fills no editor while the bot holds the input.
 - The attach takes the state the same way. A retry that waits at the attach sends its `Failed turn`
-  message to the phone, and the editor shows the attach caption alone.
+  message to the chat, and the editor shows the attach caption alone.
 - A credential rejection during a turn detaches with its `Error:` event, and the login picker opens
-  in the terminal as today. The phone cannot repair that state, because `/login` is terminal-only,
-  and it learns why from the last message.
+  in the terminal as today, over the locked editor. The detach comes before the failure settles,
+  so the uncommitted Telegram messages of that turn return to the editor under the picker. A picker
+  and a page take their keys under any input owner, so the user answers the picker while the last
+  message goes out. The chat cannot repair that state, because `/login` is terminal-only, and it
+  learns why from the last message.
 - The editor is empty at the attach, because the `/remote` line was its last content.
-- The attach and the detach events bracket every phone message in the transcript, so a phone message
-  is a plain user box. A `/new` while attached records the event `New conversation · Remote: @bot`
-  as the first entry, so the bracket holds.
+- The attach and the detach events bracket every Telegram message in the transcript, so a Telegram
+  message is a plain user box. A `/new` while attached records the event
+  `New conversation · Remote: @bot` as the first entry, so the bracket holds.
 
-### Scope on the phone
+### Scope in Telegram
 
-- The phone gets messages, the slash commands, and the turn actions: cancel, retry, dismiss, and
+- Telegram gets messages, the slash commands, and the turn actions: cancel, retry, dismiss, and
   withdraw steering. It gets neither quit nor clear.
-- These commands refuse on the phone with a notice that names the terminal: `/login`, `/logout`,
-  `/remote`, `/sources`, and `/system`.
-- `/new`, `/effort`, `/model`, `/help`, and `/skill` run on the phone. `/model` steps through the
-  provider and the account, so the phone changes the account there. A `/new` while attached records
-  the event `New conversation · Remote: @bot`, and the phone gets it as the first message of the new
-  mirror.
-- A command from the phone during a turn refuses with a notice, like a command in the terminal.
+- These commands refuse in Telegram with the notice
+  `The command /login runs in the terminal alone.`: `/login`, `/logout`, `/remote`, `/sources`, and
+  `/system`.
+- `/new`, `/effort`, `/model`, `/help`, and `/skill` run in Telegram. `/model` steps through the
+  provider and the account, so the account changes from Telegram too. A `/new` while attached
+  records the event `New conversation · Remote: @bot`, and the chat gets it as the first message of
+  the new mirror.
+- A command from Telegram during a turn refuses with a notice, like a command in the terminal. The
+  registry decides first there too, so a line it cannot run as typed keeps its own refusal instead
+  of the one that names the turn.
 - A refused command line gets the refusal as a reply, and the user sends the text again without the
   slash.
-- A notice that a phone action causes goes to the phone: as a toast after a tap, and as a reply
+- A notice that a Telegram action causes goes to the chat: as a toast after a tap, and as a reply
   after a message. A refusal for a signed-out session or a missing model is such a notice.
 - A non-text update, such as a photo, a sticker, or a voice note, gets one reply:
   `Drinky reads text alone.`
@@ -69,30 +87,38 @@ because the tests and `FEATURES.md` then define the behavior, and the Git histor
 - Drinky proves the token with `getMe` and names the bot by its username. A rejected token keeps the
   prompt state and shows a notice.
 - A new bot binds its chat through a pairing code. The `/remote` picker stays open with no rows and
-  states `Send the code X7KQ4M2P to @bot`, like the model fetch states its wait. Beside the code it
-  shows the link `https://t.me/bot?start=X7KQ4M2P` as a terminal hyperlink, so one click from a host
+  states `Send the code x7kq4m2p to @bot`, like the model fetch states its wait. Beside the code it
+  shows the link `https://t.me/bot?start=x7kq4m2p` as a terminal hyperlink, so one click from a host
   with Telegram Desktop sends the code. A typed code and a `/start` with the code both bind. The
-  private chat that sends the code within five minutes binds. The bind saves the bot and attaches
-  it. An exit cancels the pairing alone, and an event records the result. Drinky ignores a message
-  from a group, and it counts as neither a bind nor a wrong code.
-- The code has eight symbols from `23456789ABCDEFGHJKMNPQRSTUVWXYZ`, the 31 symbols without `0`,
-  `O`, `1`, `I`, and `L`. Three wrong codes from any private chat end the pairing with an `Error:`
-  event, because the bot name is public.
+  private chat that sends the code within five minutes binds. The check saves the bot with no chat,
+  so a pairing that ends without a bind keeps the bot in the picker and one pick starts the wait
+  again. The bind saves the chat and attaches the bot. An exit cancels the pairing alone, and an
+  event records the result. Drinky ignores a message from a group, and it counts as neither a bind
+  nor a wrong code. The window bounds every poll of the wait, its Telegram timeout and its head
+  window alike, so a code that arrives after the window does not bind and a network that never
+  answers cannot hold the pairing open past it.
+- The code has eight symbols from `23456789abcdefghjkmnpqrstuvwxyz`, the 31 symbols without `0`,
+  `o`, `1`, `i`, and `l`. It is lowercase, because an on-screen keyboard opens in lowercase, and the
+  match ignores the case, because such a keyboard can capitalize the first letter. Three wrong codes
+  from any private chat end the pairing with an `Error:` event, because the bot name is public.
 - A saved bot with a chat id attaches without a pairing.
 - The attach event names the bot and the state of the session: the place, the context gauge, the
   model with its account, and the effort. It takes the words and the order of the status line:
   `Remote: @bot · ~/work/drinky (main) · Context: 45% · claude-opus-4-8 (Anthropic Subscription) · Effort: high`.
-  The place takes its full form, because the phone has no column budget. The phone chat keeps the
-  messages of every earlier attach. This one line tells the user the place of the session and
-  whether it holds a conversation. An empty conversation reads `Context: 0%`, and the gauge takes
-  the other forms of the status line, `Context: Unknown` and `Context: 206k`. A signed-out session
-  reads `Account: Signed out` in place of the model, the account, and the effort. A missing model
-  reads `No model` in place of the model.
+  The place takes its full form, because the chat has no column budget. The chat keeps the messages
+  of every earlier attach. This one line tells the user the place of the session and whether it
+  holds a conversation. An empty conversation reads `Context: 0%`, and the gauge takes the other
+  forms of the status line, `Context: Unknown` and `Context: 206k`. A signed-out session reads
+  `Account: Signed out` in place of the model, the account, and the effort. A missing model reads
+  `No model` in place of the model.
 - The bound chat id gates every update. An update from another chat drops in silence.
 - At the attach Drinky confirms the updates from before that moment with `offset=-1` and sends no
   reply.
-- The long poll has its own timeout of `request.connect_timeout_ms` minus five seconds, with a floor
-  of one second, so the response head arrives inside the head window.
+- The long poll has its own head window, and its Telegram timeout is that window minus five seconds,
+  so the response head arrives inside the window. The window is `request.connect_timeout_ms` with a
+  floor of thirty seconds, because that setting bounds the head of one provider request, and a poll
+  under the floor would return at once and ask again every second, which Telegram answers with
+  a 429. A send keeps the configured window, because a send is a short call.
 - The attach calls `deleteWebhook` first, because an active webhook blocks every `getUpdates`.
 - A failed poll or send retries with a backoff and stays attached. Drinky records one `Error:` event
   at the first failure and one `Event:` at the recovery. A network failure and a 5xx are such
@@ -105,22 +131,24 @@ because the tests and `FEATURES.md` then define the behavior, and the Git histor
   cursor past it in one step, so no block needs a mark and a failure cannot feed itself.
 - A `401 Unauthorized` on any call while attached or during a pairing means a revoked token. It
   detaches at once with an `Error:` event that names `Remove a bot` as the repair. A `403 Forbidden`
-  means that the user blocked the bot, and it detaches the same way, because the phone has left.
+  means that the user blocked the bot, and it detaches the same way, because the chat is closed.
 - A `409 Conflict` means that another instance polls the same bot. The instance that receives it
   detaches at once with an `Error:` event, so the newer attach wins. During a pairing it ends the
   pairing the same way.
-- The detach freezes the chat. Drinky removes every open keyboard, drops every pending phone state,
+- The detach freezes the chat. Drinky removes every open keyboard, drops every pending chat state,
   sends the detach event as the last message, and sends nothing after that. A frozen chat keeps its
-  last reactions, so a 👀 can stay on a message that the terminal takes over.
-- The detach cancels a pending poll like the exit does, and the consumer drops a phone update that
-  arrives after the detach.
+  last reactions, so a 👀 can stay on a message that the terminal takes over. An exit key during
+  that last send ends the bot without it, so the chat then learns nothing of the end until the next
+  attach event.
+- The detach cancels a pending poll like the exit does, and the consumer drops a Telegram update
+  that arrives after the detach.
 - The exit of Drinky detaches first, so the detach event is the last message. Then it cancels the
   poll and drains the send queue for at most five seconds. That bound covers the keyboard removals
   and the detach event at one send per second.
 
 ### Mirror
 
-- The phone sees each committed transcript block once, except a reasoning block and a tool box. The
+- The chat sees each committed transcript block once, except a reasoning block and a tool box. The
   activity message is the substitute for both. An answer block, an event, the head line of a loaded
   skill, and the line of a retry attempt go out. Its own messages already stand in the chat, and the
   terminal sends none while attached.
@@ -129,7 +157,7 @@ because the tests and `FEATURES.md` then define the behavior, and the Git histor
   first turn. `/new` clears the transcript, and the mirror starts over at the `New conversation`
   event.
 - An answer block goes out when it commits, as one message with the formatted text. Nothing streams
-  to the phone, and a canceled block never reaches it.
+  to the chat, and a canceled block never reaches it.
 - A block above 4096 characters continues in a new message. The split works on the rendered HTML,
   never on the Markdown source, so every part parses on its own. It falls between two top-level
   elements, else on a line, else on a character inside a text node, never inside a tag or a
@@ -137,14 +165,14 @@ because the tests and `FEATURES.md` then define the behavior, and the Git histor
   them again, so a code block continues as a code block. Telegram counts the limit after the entity
   parse, so the tags are free.
 - Every message goes out with `disable_notification`, except the last message that the mirror sends
-  at the end of a completed or failed turn. The phone rings once per turn, for the final answer
+  at the end of a completed or failed turn. The chat notifies once per turn, for the final answer
   block or the `Error:` event. The last answer block closes at the receipt of the turn, so the
   mirror sends it and sees the turn end in one step. A canceled turn ends in silence, because the
-  phone canceled it. An edit never notifies, so the summary is silent. A completed turn whose last
-  round holds no text sends no last message, so it ends in silence too. Such a turn is rare, and the
-  summary still shows its end.
+  cancel came from Telegram. An edit never notifies, so the summary is silent. A completed turn
+  whose last round holds no text sends no last message, so it ends in silence too. Such a turn is
+  rare, and the summary still shows its end.
 - An event goes as one message with its `Event:` or `Error:` label. A model, effort, or account
-  change is such an event, so the phone learns each setting change from it. The skill head line
+  change is such an event, so the chat learns each setting change from it. The skill head line
   `Skill: name · File: path` goes as one italic message.
 - A second renderer turns the Markdown into Telegram HTML: bold, italic, code, pre, and links. A
   heading becomes a bold line. A table becomes a `pre` block.
@@ -155,19 +183,19 @@ because the tests and `FEATURES.md` then define the behavior, and the Git histor
   `Canceled`, and a failed turn with `Failed`. The gauge and the cost take the text of the status
   line, so the gauge reads `Context: Unknown` after a model switch and `Context: 206k` without a
   known window.
-- The phone gets no typing indicator and no pinned status. The activity message is the one live
+- The chat gets no typing indicator and no pinned status. The activity message is the one live
   element, and its summary is the status line of the chat. It goes out at the turn start, so it
   stands above the answer blocks of its turn as the header of the turn.
 
 ### Message states
 
-- A reaction on a phone message shows its transcript state. No message from the bot carries one.
+- A reaction on a Telegram message shows its transcript state. No message from the bot carries one.
 - The reactions are 👀 received and not yet committed, 👍 committed, and 👎 dropped. A message with
   no reaction is one that Drinky has not received. Telegram allows a fixed emoji list for a bot, and
   that list holds neither ✅ nor ❌.
-- A phone message gets 👀 on arrival. The receipt of the turn names how many leading queued messages
-  it committed, and that count splits them: the committed ones get 👍, the rest get 👎. A batch that
-  the turn took and a failed request rolled back is not committed, so it gets 👎.
+- A Telegram message gets 👀 on arrival. The receipt of the turn names how many leading queued
+  messages it committed, and that count splits them: the committed ones get 👍, the rest get 👎. A
+  batch that the turn took and a failed request rolled back is not committed, so it gets 👎.
 - The prompt of a turn gets 👍 when the turn commits any round. The receipt states that fact as a
   history end past its base.
 - A message that arrives during a turn queues as steering. The turn takes the whole queue at one
@@ -175,11 +203,11 @@ because the tests and `FEATURES.md` then define the behavior, and the Git histor
 - The activity message holds one `Withdraw` button for the whole turn. One tap drops the whole
   queue, like Ctrl+P, and a tap on an empty queue answers the toast `Nothing queued.` The 👀
   reactions show which messages are not yet committed.
-- A phone message that the turn did not commit gets 👎 at the end of the turn or at the withdraw.
+- A Telegram message that the turn did not commit gets 👎 at the end of the turn or at the withdraw.
   Its text fills no editor, because the chat still holds it. The return to the editor that a typed
   message takes today does not run while attached.
-- A canceled or failed turn follows the same rule. Its uncommitted phone messages get 👎. The prompt
-  of a turn that fails before its first commit is such a message.
+- A canceled or failed turn follows the same rule. Its uncommitted Telegram messages get 👎. The
+  prompt of a turn that fails before its first commit is such a message.
 
 ### Turn actions
 
@@ -191,11 +219,11 @@ because the tests and `FEATURES.md` then define the behavior, and the Git histor
   buttons. One tap each, like Ctrl+N and Esc. The message loses its buttons after the tap, and also
   when a new message starts a turn, because the start of any turn drops the retry.
 
-### Pickers on the phone
+### Pickers in Telegram
 
 - A picker is an inline keyboard under one message, one button per row, and a `✓` on the current
   row. A stepped picker edits the same message per step and adds `‹ Back` and `Cancel` buttons.
-- The `/help` keyboard lists the commands that run on the phone alone.
+- The `/help` keyboard lists the commands that run in Telegram alone.
 - Drinky edits a picker message on its pick, to state the result and remove the keyboard, and at the
   detach, because a tap after the detach gets no answer at all. A newer picker, `/new`, and the
   start of a turn make it stale instead, and a stale tap answers the toast `This list is closed.`
@@ -203,7 +231,7 @@ because the tests and `FEATURES.md` then define the behavior, and the Git histor
 - The model step lists the cached models alone and has no fetch row. A refetch happens at the
   terminal. An account with no cached list answers with a notice that names the terminal.
 - A skill row loads the skill with no task at once. A typed `/skill:name task` line carries a task.
-- The bot registers the commands that run on the phone with `setMyCommands`, each with its `/help`
+- The bot registers the commands that run in Telegram with `setMyCommands`, each with its `/help`
   summary.
 
 ## Telegram facts
@@ -244,6 +272,14 @@ because the tests and `FEATURES.md` then define the behavior, and the Git histor
   `src/ui/markdown.zig` for the parse. `lib/ai` and `lib/terminal` know nothing of it.
   `lib/ai/json.zig` is not exported today, so the client uses `std.json` or `root.zig` adds the
   export.
+- `remote.Controller` owns the store, the pairing, the attachment, the draining sender, the
+  generations, the send queue policy, and every Telegram id. It is the one source of truth for the
+  remote state, and it exposes domain state alone. It reports through a sink of four actions:
+  `chat_message`, `report`, `state_changed`, and `pairing_changed`. The app maps them to the
+  session, and the session knows the three input owners `terminal`, `external`, and `none` alone,
+  with one caption override for the state. A message of the user carries a `source` of `terminal` or
+  an external id, so the message owns its recovery metadata and no parallel list can drift. The
+  controller alone gives that id its Telegram meaning.
 - The attach is not a variant of the session `Mode`, because a turn runs while attached. It is a
   second axis: one flag that the input loop checks before the mode. While the flag is set, an exit
   key detaches and Enter shows the notice.
@@ -262,11 +298,11 @@ because the tests and `FEATURES.md` then define the behavior, and the Git histor
 - The `/remote` command lives in `lib/ai/command/` and returns outcomes. New `Outcome` variants name
   the actions, and the app owns the network, like it owns the OAuth flow of `login`. The command
   context carries the saved bot names for the picker rows.
-- A phone message enters the app through the same path as an Enter in the editor, so every refusal
-  and every steering rule applies once. It never reads or writes the editor.
+- A Telegram message enters the app through the same path as an Enter in the editor, so every
+  refusal and every steering rule applies once. It never reads or writes the editor.
 - A `callback_data` value carries an id alone, never text. The open picker lives on the session,
   keyed by message id.
-- The remote keeps one phone message id per entry of `Session.steering`. The receipt of a turn
+- The remote keeps one Telegram message id per entry of `Session.steering`. The receipt of a turn
   already carries `steering_committed_count` for the editor, and the same count splits the ids into
   committed and dropped. No count of its own, and nothing outside `src/` changes. A second list in
   lockstep with the drafts drifts on the first push, drop, or recall that touches one list alone, so
@@ -275,12 +311,36 @@ because the tests and `FEATURES.md` then define the behavior, and the Git histor
   replaces an older pending edit of the same message, and a 429 waits the named seconds.
 - A send returns a local handle at once, and the message id arrives later on the sender. An edit, a
   keyboard change, and a reaction name the handle, and the queue holds each one behind the send of
-  its handle. The render consumer never waits for Telegram.
-- The tests run the client against an in-process HTTP server. No test reaches the network.
+  its handle. The render consumer never waits for Telegram: the queue takes a message without a
+  wait, and a full queue drops it with one event per run of drops. The detach names its event as the
+  final message of the close, and the sender keeps a reserve of the drain window for it, so a full
+  queue cannot hold it back. The sender ends at the start of that reserve, and a drain task sends
+  the final message on its own, so a send in flight at the close cannot hold it back either. The
+  controller holds the detached bot in the `detaching` state until the sender reports `drained`, and
+  the session locks the editor under the owner `none` meanwhile. An exit key there aborts the drain:
+  the deadline moves to that instant and the drain task is canceled, so a send in flight ends at
+  once and the final message never goes out.
+- The tests run the client against an in-process HTTP server. `src/remote/testing.zig` holds that
+  server, the collector that every task sink reports into, and the short pace of the suite, so no
+  module of the subsystem carries test scaffolding of its own. No test reaches the network.
+- An event that a task raises while a reply streams waits in the session for the next message
+  boundary, because a discrete append splits the streamed message and a stream reset could not
+  discard the part before it. The mirror reads committed blocks, so the wait changes nothing for it.
+- A Telegram message keeps a plain draft of its text beside its message id, as a steering entry and
+  as the retained prompt of a turn. While the bot is attached, a restore drops the message, because
+  the chat holds the text. After a detach the message returns like a typed one, so Ctrl+P and the
+  end of the turn treat it as typed.
+- The poll and send failure events stay in the terminal until the mirror sends events. The mirror
+  then carries them like every other event, and the rule about an event that a mirror send caused
+  keeps the send failure out of the chat.
 
 ## Phases
 
 ### Phase 1: Transport and `/remote`
+
+This phase landed. The token check runs on a worker while the picker states
+`Drinky checks the bot token.`, and Esc there returns to the token prompt. Every command line gets
+the terminal notice above in this phase. The store keys a bot by its id.
 
 - The `remote.json` store with a bot entry: token, bot id, username, and chat id.
 - The Telegram client with the methods of this phase: `getMe`, `deleteWebhook`, `getUpdates`, and
@@ -297,10 +357,10 @@ because the tests and `FEATURES.md` then define the behavior, and the Git histor
 - The attach state: the inactive editor with its caption, the Enter notice, the detach on every exit
   key, the attach event with the session state, and the detach event.
 - The exit that detaches first, cancels the poll, and drains the send queue within a bound.
-- A phone message runs as a prompt, and its refusals reach the phone as replies. Every command line
-  from the phone refuses with a notice in this phase.
-- A phone message during a turn queues as steering, and an uncommitted one drops at the end of the
-  turn and fills no editor. The button and the reactions come later.
+- A Telegram message runs as a prompt, and its refusals reach the chat as replies. Every command
+  line from Telegram refuses with a notice in this phase.
+- A Telegram message during a turn queues as steering, and an uncommitted one drops at the end of
+  the turn and fills no editor. The button and the reactions come later.
 - The reply to a non-text update.
 
 ### Phase 2: Mirror
@@ -310,18 +370,18 @@ because the tests and `FEATURES.md` then define the behavior, and the Git histor
   as plain text with the split above 4096 characters, silent except the last message of a completed
   or failed turn.
 - The activity message with the state, the call count, and the summary at the end.
-- The 👀, 👍, and 👎 reactions on phone messages, split by the receipt of the turn.
+- The 👀, 👍, and 👎 reactions on Telegram messages, split by the receipt of the turn.
 - As the last step, the HTML renderer over the Markdown parser, the split that closes and reopens
   the open tags, and the plain-text resend after an entity parse failure, with their own tests.
 
-### Phase 3: Phone input
+### Phase 3: Telegram input
 
 - The client methods `editMessageReplyMarkup`, `answerCallbackQuery`, and `setMyCommands`.
 - The `Cancel turn` and `Withdraw` keyboard of the activity message, set at the turn start, with the
   two-tap cancel and the `Nothing queued.` toast.
 - The `Failed turn` message with `Try again` and `Dismiss`, also for a retry that waits at the
   attach.
-- The phone commands as inline keyboards, the stepped `/model` picker with `‹ Back` and `Cancel`,
+- The Telegram commands as inline keyboards, the stepped `/model` picker with `‹ Back` and `Cancel`,
   the stale-tap toast, and the skill row. The terminal-only commands keep their refusal.
 - Toasts for the notices that a tap causes.
 - `setMyCommands` at the attach.
@@ -331,6 +391,6 @@ because the tests and `FEATURES.md` then define the behavior, and the Git histor
 - Delete the entry from `BACKLOG.md` and this document when phase 3 lands.
 - Add the lines to `FEATURES.md` with each phase, because the file states what Drinky does after
   every commit. A `Remote` section holds one sentence per capability.
-- Add the `/remote` command and the phone rules to `README.md` when phase 3 lands, because the file
-  describes the stable product.
+- Add the `/remote` command and the Telegram rules to `README.md` when phase 3 lands, because the
+  file describes the stable product.
 - `describe_drinky` lists the command from the code, so it needs no edit.
