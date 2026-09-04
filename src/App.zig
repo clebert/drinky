@@ -186,6 +186,9 @@ herdr: Herdr,
 /// It is the one source of truth for that state, and it reports through
 /// `onRemoteAction`. The app maps its state to the session.
 controller: remote.Controller,
+/// The mirror of the transcript in the chat of the attached bot. The app feeds it
+/// the committed blocks after every event, and it sends through the controller.
+mirror: remote.Mirror,
 /// The caption title of the inactive editor while a bot holds the input,
 /// `Remote: @bot`. Owned, and the session borrows it.
 remote_title: []const u8,
@@ -1025,6 +1028,7 @@ fn initFields(self: *App, gpa: std.mem.Allocator, io: std.Io) void {
             .attachment_sink = .{ .context = self, .emit = emitRemoteEvent },
             .pairing_sink = .{ .context = self, .emit = emitPairingEvent },
         }),
+        .mirror = .init(gpa),
         .remote_title = "",
         .pairing_wait_text = "",
         .pairing_wait_link = "",
@@ -1130,10 +1134,14 @@ fn finishWorkerResult(self: *App, result: *const WorkerResult) !void {
     self.session.stats_shown = self.agent.stats;
     // A turn can check out another branch, so the status line settles here.
     self.refreshBranch();
+    // The chat learns the state of its messages before the session resolves
+    // them, because their ids live on the session until then.
+    try self.settleChatMessages(&result.outcome.receipt);
     switch (result.outcome.disposition) {
         .completed => {
             _ = self.takeTurnRetry();
             try self.session.endTurnWithReceipt(&result.outcome.receipt);
+            try self.endMirrorTurn(.completed);
             if (self.session.hasSteering()) try self.returnLateSteering();
         },
         .credential_replaced => {
@@ -1172,6 +1180,7 @@ fn finishFailedWorker(self: *App, result: *const WorkerResult) !void {
     // The reconciliation runs first, because `reserveFailureRestore` makes only
     // that step infallible. The arm allocates, so it stays outside that window.
     try self.session.failTurnWithReceipt(&result.outcome.receipt, result.error_text);
+    try self.endMirrorTurn(.failed);
     try self.armRetry(result, attempt);
 }
 
@@ -1339,6 +1348,7 @@ fn applyBatch(self: *App, events: []const UiEvent) !bool {
             .remote => |*remote_event| try self.controller.applyAttachmentEvent(remote_event),
             .pairing => |*pairing_event| try self.controller.applyPairingEvent(pairing_event),
         }
+        try self.syncMirror();
     }
     return ticked;
 }
@@ -1815,6 +1825,7 @@ fn cancelTurn(self: *App) !void {
             self.session.stats_shown = self.agent.stats;
             // A canceled turn can leave another branch checked out behind it.
             self.refreshBranch();
+            try self.settleChatMessages(receipt);
             self.session.cancelReceipt(receipt, result.progress_sequence_committed);
             self.agent.steering.clear();
             if (committed) {
@@ -1824,6 +1835,7 @@ fn cancelTurn(self: *App) !void {
             } else {
                 self.session.endTurn();
             }
+            try self.endMirrorTurn(.canceled);
             if (maybe_progress_error) |progress_error| return progress_error;
         },
         // The worker won the race. Retain the joined result until FIFO progress
@@ -1841,6 +1853,7 @@ fn cancelTurn(self: *App) !void {
             defer self.freeWorkerResult(&result);
             _ = self.takeTurnRetry();
             try self.session.endTurnWithReceipt(&result.outcome.receipt);
+            try self.endMirrorTurn(.canceled);
         },
     }
 }
@@ -2146,6 +2159,9 @@ fn runTurn(self: *App, text: []const u8) !void {
     // context it named is stale. The drop runs after the spawn, because a start
     // that fails must leave the context for another try.
     self.setRetry(null);
+    // The worker runs by now, so a send that fails costs the activity message of
+    // the chat alone and never the turn.
+    self.mirror.beginTurn(&self.controller, self.nowMs()) catch {};
 }
 
 /// Permanently reserve the next generation of `counter` before a worker can
@@ -2271,6 +2287,7 @@ fn applyOutcome(self: *App, outcome: ai.command.Outcome) !void {
             // history that proved it.
             self.agent.resetConversation();
             self.session.clearConversation();
+            self.mirror.restart();
             // The intro line is the legend of the interface, so the empty
             // conversation opens on it again.
             try self.session.transcript.append(.intro, .{}, intro_text);
@@ -2710,7 +2727,9 @@ fn adopt(self: *App, account: ai.llm.Account) void {
 /// carries.
 fn dropAccountEvidence(self: *App, account: ai.llm.Account) void {
     self.agent.dropAccountEvidence(account);
-    self.session.dropAccountReasoning(account);
+    // The blocks left below the cursor of the mirror, so the cursor moves back
+    // with them and the block behind them still goes out.
+    self.mirror.retreat(self.session.dropAccountReasoning(account));
 }
 
 /// The shared refusal path for a command that the active state does not allow.
@@ -2805,11 +2824,13 @@ fn reportNotices(self: *App, notices: []const ai.instructions.Notice) !void {
 fn recordAsyncEvent(
     self: *App,
     severity: ai.command.Outcome.Severity,
+    options: Session.AsyncEventOptions,
     comptime format: []const u8,
     args: anytype,
 ) !void {
     try self.session.recordAsyncEvent(
         try ai.command.Outcome.Message.print(self.gpa, severity, format, args),
+        options,
     );
 }
 
@@ -2844,7 +2865,13 @@ fn onRemoteAction(context: *anyopaque, action: remote.Controller.Action) anyerro
     switch (action) {
         .chat_message => |message| try self.submitChatMessage(message.text, message.id),
         .report => |report| switch (report.kind) {
-            .event => try self.recordAsyncEvent(report.severity, "{s}", .{report.text}),
+            .event => try self.recordAsyncEvent(report.severity, .{}, "{s}", .{report.text}),
+            .terminal_event => try self.recordAsyncEvent(
+                report.severity,
+                .{ .mirrored = false },
+                "{s}",
+                .{report.text},
+            ),
             .notice => try self.reportNotice(report.severity, "{s}", .{report.text}),
         },
         .state_changed => try self.syncRemoteState(),
@@ -2898,14 +2925,67 @@ fn takeRemoteTitle(self: *App, username: []const u8) !void {
 }
 
 /// Record the attach event, which states the session and is the first message
-/// of the chat. The editor is empty by then, because the `/remote` line went
-/// with the command.
+/// of the chat, and start the mirror behind it. The editor is empty by then,
+/// because the `/remote` line went with the command. The event goes to the chat
+/// at once, also while a reply streams and the transcript defers it, so the
+/// block carries no mirror flag and the mirror sends it no second time.
 fn openChat(self: *App, username: []const u8) !void {
     self.session.clearNotice();
     const text = try self.attachEventText(username);
     defer self.gpa.free(text);
-    try self.recordAsyncEvent(.information, "{s}", .{text});
+    try self.recordAsyncEvent(.information, .{ .mirrored = false }, "{s}", .{text});
     try self.controller.sendEvent(.information, text);
+    try self.mirror.open(&self.controller, &self.mirrorView());
+}
+
+/// What the mirror reads of the session now.
+fn mirrorView(self: *const App) remote.Mirror.View {
+    return .{
+        .blocks = self.session.transcript.blocks(),
+        .committed = self.session.committedCount(),
+        .tail = if (self.session.liveTail()) |tail| .{
+            .streaming = tail.streaming,
+            .tool = tail.tool,
+            .calls = tail.calls,
+        } else null,
+    };
+}
+
+/// Send the blocks that committed since the last step, and update the activity
+/// message. Runs after every event, so the chat follows the transcript.
+fn syncMirror(self: *App) !void {
+    try self.mirror.sync(&self.controller, &self.mirrorView());
+}
+
+/// Send the last blocks of the ending turn and turn its activity message into
+/// the summary. The session has ended the turn, so every block is committed.
+fn endMirrorTurn(self: *App, outcome: remote.Mirror.End.Outcome) !void {
+    const status = self.session.statusInfo();
+    try self.mirror.endTurn(&self.controller, &self.mirrorView(), &.{
+        .outcome = outcome,
+        .status = &status,
+        .now_ms = self.nowMs(),
+    });
+}
+
+/// Mark every Telegram message of the ending turn with its state: 👍 for one the
+/// turn committed and 👎 for one it did not. The receipt names the committed
+/// rounds and the committed steering prefix. Runs before the session resolves the
+/// messages, because it reads their ids from the session.
+fn settleChatMessages(self: *App, receipt: *const ai.Agent.Receipt) !void {
+    if (!self.controller.listens()) return;
+    const committed = receipt.history_end != receipt.history_base;
+    if (self.session.turn_prompt) |*prompt| switch (prompt.source) {
+        .external => |id| try self.controller.react(id, if (committed) .committed else .dropped),
+        .terminal => {},
+    };
+    for (self.session.steering.items, 0..) |*message, index| switch (message.source) {
+        .external => |id| try self.controller.react(
+            id,
+            if (index < receipt.steering_committed_count) .committed else .dropped,
+        ),
+        .terminal => {},
+    };
 }
 
 /// The attach event: the bot, then the state of the session in the words and
@@ -3055,7 +3135,7 @@ fn submitChatMessage(self: *App, text: []const u8, message_id: i64) !void {
             try self.session.reserveSteering();
             try self.agent.steering.push(text);
             self.session.commitExternalSteering(&draft, message_id);
-            return;
+            return self.controller.react(message_id, .seen);
         },
         .prompt => {},
         // The terminal takes no input while the bot holds it, so no picker and
@@ -3088,6 +3168,9 @@ fn submitChatMessage(self: *App, text: []const u8, message_id: i64) !void {
     errdefer draft.deinit(self.gpa);
     const base = try self.startUserTurn(text);
     self.session.retainExternalTurnPrompt(&draft, base, message_id);
+    // The message runs now, so the chat marks it as received. A refused message
+    // gets its reply instead, because no receipt settles it later.
+    try self.controller.react(message_id, .seen);
 }
 
 /// Keys in the token prompt state. The editor stays live for the token, Enter
@@ -9534,6 +9617,10 @@ test "a Telegram message during a turn queues as steering that drops while the b
             .{ .body = remote_ok_sent },
             .{ .body = remote_ok_sent },
         } },
+        .{ .method = "setMessageReaction", .replies = &.{
+            .{ .body = remote_ok_true },
+            .{ .body = remote_ok_true },
+        } },
     });
     defer server.deinit();
     try server.start();
@@ -9555,6 +9642,9 @@ test "a Telegram message during a turn queues as steering that drops while the b
     try app.submitChatMessage("/nope", 14);
     try std.testing.expectEqual(@as(usize, 2), app.session.steering.items.len);
     try std.testing.expectEqual(@as(i64, 12), app.session.steering.items[1].source.external);
+    // The queued message gets its 👀, and a refused line gets its reply alone.
+    const seen = try server.waitForRequest("/setMessageReaction", 0);
+    try std.testing.expect(std.mem.indexOf(u8, seen, "\"message_id\":12,\"reaction\":[{\"type\":\"emoji\",\"emoji\":\"👀\"}]") != null);
     const queued = try app.agent.steering.take();
     defer {
         for (queued) |message| gpa.free(message);
@@ -9597,5 +9687,157 @@ test "a Telegram message during a turn queues as steering that drops while the b
     try std.testing.expectEqual(@as(usize, 1), app.session.recallLateSteering());
     try std.testing.expectEqualStrings("after the detach", app.session.editor.visible());
     app.agent.steering.clear();
+    try server.finish();
+}
+
+// The chat follows the transcript: the activity message opens the turn, the
+// answer goes out when it commits, the summary closes the turn, and the prompt
+// of the turn gets its mark. The chat notifies once, for the answer.
+test "the chat mirrors a completed turn with its activity message, its answer, and its summary" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var server = try remote_testing.Server.init(gpa, io, &.{
+        .{ .method = "deleteWebhook", .replies = &.{.{ .body = remote_ok_true }} },
+        .{ .method = "getUpdates", .replies = &.{.{ .body = remote_ok_empty }} },
+        .{ .method = "sendMessage", .replies = &.{
+            .{ .body = remote_ok_sent },
+            .{ .body = "{\"ok\":true,\"result\":{\"message_id\":50}}" },
+            .{ .body = remote_ok_sent },
+        } },
+        .{ .method = "editMessageText", .replies = &.{ .{ .body = remote_ok_true }, .{ .body = remote_ok_true } } },
+        .{ .method = "setMessageReaction", .replies = &.{ .{ .body = remote_ok_true }, .{ .body = remote_ok_true } } },
+    });
+    defer server.deinit();
+    try server.start();
+    var url_buffer: [64]u8 = undefined;
+
+    var app: App = undefined;
+    app.initRemoteTest(gpa, io, &out, &server, &url_buffer);
+    defer app.deinitRemoteTest();
+    try app.controller.store.save(&.{ .token = "42:secret", .id = 42, .username = "drinky_bot", .chat_id = 99 });
+    try app.controller.attachSaved(0);
+    try server.waitForRequests(2);
+
+    // A Telegram prompt starts the turn, as `submitChatMessage` does past its
+    // gates, and the mirror opens the turn with its activity message.
+    app.session.beginTurn(1);
+    const base = app.session.transcript.blocks().len;
+    try app.session.transcript.append(.user, .{}, "from Telegram");
+    var draft = try ui.Editor.Draft.fromText(gpa, "from Telegram");
+    app.session.retainExternalTurnPrompt(&draft, base, 7);
+    try app.mirror.beginTurn(&app.controller, app.nowMs());
+    try app.controller.react(7, .seen);
+    const activity = try server.waitForSend(1);
+    try std.testing.expect(std.mem.indexOf(u8, activity, "\"text\":\"Thinking\"") != null);
+
+    // The reply streams: the activity message follows the state, and the answer
+    // waits for its commit.
+    var events = [_]UiEvent{.{ .turn = .{
+        .generation = 1,
+        .payload = .{ .text = try gpa.dupe(u8, "The **answer**.") },
+    } }};
+    _ = try app.applyBatch(&events);
+    const writing = try server.waitForRequest("/editMessageText", 0);
+    try std.testing.expectEqualStrings("{\"chat_id\":99,\"message_id\":50,\"text\":\"Writing\"}", writing);
+    try std.testing.expectEqual(@as(usize, 2), server.sendCount());
+
+    // The receipt commits the round: the answer goes out and notifies, the
+    // summary replaces the activity, and the prompt gets its mark.
+    var result: WorkerResult = .{
+        .outcome = .{
+            .receipt = .{ .history_base = 0, .history_end = 2, .steering_committed_count = 0 },
+            .disposition = .completed,
+        },
+        .error_text = null,
+    };
+    defer app.freeWorkerResult(&result);
+    try app.finishWorkerResult(&result);
+    try std.testing.expect(app.session.mode == .prompt);
+    const answer = try server.waitForSend(2);
+    try std.testing.expect(std.mem.indexOf(u8, answer, "\"text\":\"The <b>answer</b>.\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, answer, "\"disable_notification\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, answer, "\"parse_mode\":\"HTML\"") != null);
+    const summary = try server.waitForRequest("/editMessageText", 1);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "\"text\":\"Tools: 0 calls · Time: ") != null);
+    // A signed-out session with no model states its tokens alone, as the status
+    // line does.
+    try std.testing.expect(std.mem.indexOf(u8, summary, " · Context: 0 · Cost: ~$0.00\"") != null);
+    const committed = try server.waitForRequest("/setMessageReaction", 1);
+    try std.testing.expect(std.mem.indexOf(u8, committed, "\"message_id\":7,\"reaction\":[{\"type\":\"emoji\",\"emoji\":\"👍\"}]") != null);
+    try server.finish();
+}
+
+// A failed turn marks what it did not commit: the prompt of a turn that
+// committed nothing and the queued message alike get 👎. Its error event is the
+// one message that notifies, and the summary opens with the outcome.
+test "a failed turn marks its uncommitted messages and notifies its error" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var server = try remote_testing.Server.init(gpa, io, &.{
+        .{ .method = "deleteWebhook", .replies = &.{.{ .body = remote_ok_true }} },
+        .{ .method = "getUpdates", .replies = &.{.{ .body = remote_ok_empty }} },
+        .{ .method = "sendMessage", .replies = &.{
+            .{ .body = remote_ok_sent },
+            .{ .body = remote_ok_sent },
+            .{ .body = remote_ok_sent },
+        } },
+        .{ .method = "editMessageText", .replies = &.{.{ .body = remote_ok_true }} },
+        .{ .method = "setMessageReaction", .replies = &.{
+            .{ .body = remote_ok_true },
+            .{ .body = remote_ok_true },
+            .{ .body = remote_ok_true },
+        } },
+    });
+    defer server.deinit();
+    try server.start();
+    var url_buffer: [64]u8 = undefined;
+
+    var app: App = undefined;
+    app.initRemoteTest(gpa, io, &out, &server, &url_buffer);
+    defer app.deinitRemoteTest();
+    try app.controller.store.save(&.{ .token = "42:secret", .id = 42, .username = "drinky_bot", .chat_id = 99 });
+    try app.controller.attachSaved(0);
+    try server.waitForRequests(2);
+
+    app.session.beginTurn(1);
+    const base = app.session.transcript.blocks().len;
+    try app.session.transcript.append(.user, .{}, "from Telegram");
+    var draft = try ui.Editor.Draft.fromText(gpa, "from Telegram");
+    app.session.retainExternalTurnPrompt(&draft, base, 7);
+    try app.mirror.beginTurn(&app.controller, app.nowMs());
+    // A second message queues as steering while the turn runs.
+    try app.submitChatMessage("and this", 8);
+    try std.testing.expectEqual(@as(usize, 1), app.session.steering.items.len);
+
+    var result: WorkerResult = .{
+        .outcome = .{ .receipt = zero_receipt, .disposition = .{ .failed = error.ApiError } },
+        .error_text = try gpa.dupe(u8, "The provider refused the request."),
+    };
+    defer app.freeWorkerResult(&result);
+    try app.finishWorkerResult(&result);
+    app.agent.steering.clear();
+    try std.testing.expect(app.session.mode == .prompt);
+    // Neither message returns to the editor while the bot holds the input.
+    try std.testing.expectEqualStrings("", app.session.editor.visible());
+
+    const failure = try server.waitForSend(2);
+    try std.testing.expect(std.mem.indexOf(u8, failure, "\"text\":\"Error: The provider refused the request.\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, failure, "\"disable_notification\":false") != null);
+    const summary = try server.waitForRequest("/editMessageText", 0);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "\"text\":\"Failed · Tools: 0 calls · Time: ") != null);
+    const seen = try server.waitForRequest("/setMessageReaction", 0);
+    try std.testing.expect(std.mem.indexOf(u8, seen, "\"message_id\":8,\"reaction\":[{\"type\":\"emoji\",\"emoji\":\"👀\"}]") != null);
+    const prompt = try server.waitForRequest("/setMessageReaction", 1);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "\"message_id\":7,\"reaction\":[{\"type\":\"emoji\",\"emoji\":\"👎\"}]") != null);
+    const dropped = try server.waitForRequest("/setMessageReaction", 2);
+    try std.testing.expect(std.mem.indexOf(u8, dropped, "\"message_id\":8,\"reaction\":[{\"type\":\"emoji\",\"emoji\":\"👎\"}]") != null);
     try server.finish();
 }

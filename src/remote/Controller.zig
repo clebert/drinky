@@ -102,8 +102,17 @@ pub const Action = union(enum) {
         severity: ai.command.Outcome.Severity,
         text: []const u8,
 
-        /// A durable event of the transcript, or a transient notice.
-        pub const Kind = enum { event, notice };
+        pub const Kind = enum {
+            /// A durable event of the transcript. A mirror of the transcript
+            /// sends it to the chat too.
+            event,
+            /// A durable event that stays in the terminal, because it stands in
+            /// the chat already or a send to the chat caused it. A mirror that
+            /// sends it can feed its own failure.
+            terminal_event,
+            /// A transient notice.
+            notice,
+        };
     };
 
     pub const PairingChange = enum {
@@ -348,7 +357,8 @@ pub fn detach(self: *Controller, cause: DetachCause) !void {
         error.OutOfMemory => {},
     };
     self.mode = .{ .detaching = attachment };
-    try self.tell(.event, severity, text);
+    // The close above named the event as the last message, so no mirror sends it.
+    try self.tell(.terminal_event, severity, text);
     try self.emit(.state_changed);
 }
 
@@ -374,12 +384,83 @@ pub fn sendEvent(
 ) !void {
     const line = try eventLine(self.gpa, severity, text);
     defer self.gpa.free(line);
-    try self.sendToChat(line, &.{ .disable_notification = true });
+    try self.send(line, &.{ .disable_notification = true });
 }
 
 /// Answer the chat message `id` with `text`, silent.
 pub fn reply(self: *Controller, id: i64, text: []const u8) !void {
-    try self.sendToChat(text, &.{ .reply_to = id, .disable_notification = true });
+    try self.send(text, &.{ .reply_to = id, .disable_notification = true });
+}
+
+/// Queue `text` for the chat without a wait. A full queue drops the message and
+/// reports the first drop of a run. A closed or absent attachment takes nothing.
+pub fn send(self: *Controller, text: []const u8, options: *const Client.SendOptions) !void {
+    const attachment = self.attached() orelse return;
+    try self.takeQueued(attachment, attachment.send(text, options));
+}
+
+/// Queue `text` as a message that a later `edit` names, and return its handle.
+/// Null when no attached bot takes it or the queue dropped it.
+pub fn sendTracked(
+    self: *Controller,
+    text: []const u8,
+    options: *const Client.SendOptions,
+) !?Attachment.Handle {
+    const attachment = self.attached() orelse return null;
+    const handle = attachment.sendTracked(text, options) catch |err| {
+        try self.takeQueued(attachment, err);
+        return null;
+    };
+    self.drop_reported = false;
+    return handle;
+}
+
+/// Replace the text of the tracked message `handle`, once it went out.
+pub fn edit(self: *Controller, handle: Attachment.Handle, text: []const u8) !void {
+    const attachment = self.attached() orelse return;
+    try self.takeQueued(attachment, attachment.edit(handle, text));
+}
+
+/// Mark the chat message `message_id` with the state of its transcript entry.
+pub fn react(self: *Controller, message_id: i64, mark: Attachment.Reaction.Mark) !void {
+    const attachment = self.attached() orelse return;
+    try self.takeQueued(attachment, attachment.react(message_id, mark));
+}
+
+/// Whether a bot is attached, so a message for the chat has a taker. The mirror
+/// renders nothing for a chat that does not listen.
+pub fn listens(self: *const Controller) bool {
+    return self.mode == .attached;
+}
+
+/// The attached bot, or null in every other state. A detaching bot takes
+/// nothing more, because its close named the last message of the chat.
+fn attached(self: *Controller) ?*Attachment {
+    return switch (self.mode) {
+        .attached => |attachment| attachment,
+        else => null,
+    };
+}
+
+/// Settle the result of one queue put. A full queue drops the item and reports
+/// the first drop of a run, and the next item that the queue takes resets that
+/// run. The report stays in the terminal, because a report that the mirror
+/// sends meets the same full queue.
+fn takeQueued(self: *Controller, attachment: *Attachment, result: Attachment.SendError!void) !void {
+    result catch |err| switch (err) {
+        error.Closed, error.Canceled => return,
+        error.QueueFull => {
+            if (self.drop_reported) return;
+            self.drop_reported = true;
+            return self.recordTerminalEvent(
+                .failure,
+                "Drinky dropped a message to @{s} because the send queue is full.",
+                .{attachment.username},
+            );
+        },
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    self.drop_reported = false;
 }
 
 /// Apply one report of an attachment. A report of the attached bot acts, a
@@ -400,28 +481,45 @@ pub fn applyAttachmentEvent(self: *Controller, event: *const Attachment.Event) !
             .text = message.text,
         } }),
         .unreadable => |id| try self.reply(id, "Drinky reads text alone."),
-        .failed => |failure| try self.recordEvent(
+        // A report about the send side stays in the terminal, because a mirror
+        // that sends it meets the same failure and feeds itself.
+        .failed => |failure| try self.recordSideEvent(
+            failure.side,
             .failure,
             "Drinky could not {s} @{s} because of error {s}. Drinky tries again.",
             .{ sideVerb(failure.side), username, failure.name },
         ),
-        .recovered => |side| try self.recordEvent(
+        .recovered => |side| try self.recordSideEvent(
+            side,
             .information,
             "Drinky can {s} @{s} again.",
             .{ sideVerb(side), username },
         ),
-        .send_rejected => |description| if (description.len > 0) {
-            try self.recordEvent(
+        .send_rejected => |rejected| if (rejected.description.len > 0) {
+            try self.recordTerminalEvent(
                 .failure,
-                "Telegram rejected a message to @{s}: {s}.",
-                .{ username, description },
+                "Telegram rejected {s} @{s}: {s}.",
+                .{ rejectedNoun(rejected.kind), username, rejected.description },
             );
         } else {
-            try self.recordEvent(.failure, "Telegram rejected a message to @{s}.", .{username});
+            try self.recordTerminalEvent(
+                .failure,
+                "Telegram rejected {s} @{s}.",
+                .{ rejectedNoun(rejected.kind), username },
+            );
         },
         .detach => |reason| try self.detach(.{ .failure = reason }),
         .drained => unreachable,
     }
+}
+
+/// The noun of one rejected item, with the preposition that binds it to the bot.
+fn rejectedNoun(kind: Attachment.Event.Rejected.Kind) []const u8 {
+    return switch (kind) {
+        .message => "a message to",
+        .edit => "an edit in the chat of",
+        .reaction => "a reaction in the chat of",
+    };
 }
 
 /// Apply one report of the pairing worker. A report of a canceled pairing names
@@ -619,29 +717,6 @@ fn finishDrain(self: *Controller, generation: u64) !void {
     try self.emit(.state_changed);
 }
 
-/// Queue `text` for the chat without a wait. A full queue drops the message and
-/// reports the first drop of a run. A closed or absent attachment takes nothing.
-fn sendToChat(self: *Controller, text: []const u8, options: *const Client.SendOptions) !void {
-    const attachment = switch (self.mode) {
-        .attached => |attachment| attachment,
-        else => return,
-    };
-    attachment.send(text, options) catch |err| switch (err) {
-        error.Closed, error.Canceled => return,
-        error.QueueFull => {
-            if (self.drop_reported) return;
-            self.drop_reported = true;
-            return self.recordEvent(
-                .failure,
-                "Drinky dropped a message to @{s} because the send queue is full.",
-                .{attachment.username},
-            );
-        },
-        error.OutOfMemory => return error.OutOfMemory,
-    };
-    self.drop_reported = false;
-}
-
 /// The event of a detach. The result is owned.
 fn detachText(self: *Controller, cause: DetachCause, username: []const u8) ![]u8 {
     return switch (cause) {
@@ -726,6 +801,33 @@ fn recordEvent(
     const text = try std.fmt.allocPrint(self.gpa, format, args);
     defer self.gpa.free(text);
     try self.tell(.event, severity, text);
+}
+
+/// Hand one durable event that stays in the terminal to the owner.
+fn recordTerminalEvent(
+    self: *Controller,
+    severity: ai.command.Outcome.Severity,
+    comptime format: []const u8,
+    args: anytype,
+) !void {
+    const text = try std.fmt.allocPrint(self.gpa, format, args);
+    defer self.gpa.free(text);
+    try self.tell(.terminal_event, severity, text);
+}
+
+/// Hand one event about `side` to the owner. A poll event reaches the chat, and
+/// a send event stays in the terminal.
+fn recordSideEvent(
+    self: *Controller,
+    side: Attachment.Event.Side,
+    severity: ai.command.Outcome.Severity,
+    comptime format: []const u8,
+    args: anytype,
+) !void {
+    switch (side) {
+        .poll => try self.recordEvent(severity, format, args),
+        .send => try self.recordTerminalEvent(severity, format, args),
+    }
 }
 
 /// Hand one transient notice to the owner.

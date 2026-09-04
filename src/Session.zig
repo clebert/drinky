@@ -173,7 +173,7 @@ restorable: std.ArrayList(ui.Editor.Draft),
 /// splits the streamed message and a stream reset cannot discard the part
 /// before it, so each waits for the next message boundary. Every content is
 /// owned.
-pending_events: std.ArrayList(ai.command.Outcome.Message),
+pending_events: std.ArrayList(PendingEvent),
 /// Leading drafts hidden from the steering count because the worker has taken
 /// them. A taken draft is consumed into the running turn, or in flight after a
 /// Ctrl+P take that did not return it. Consumption preserves the rich drafts,
@@ -240,6 +240,9 @@ const Turn = struct {
     progress_tick_last: u64,
     /// The blink clock of the input caret. An edit restarts it at zero.
     caret_tick: u64,
+    /// The tool calls the turn committed so far. The activity message of a
+    /// remote chat counts them, and its summary states the total.
+    calls: usize,
     tools: std.ArrayList(ActiveTool),
     /// The tool calls the model is still streaming, oldest first. Each shows its
     /// name, the argument bytes received so far, and its phase. A committed call
@@ -423,6 +426,32 @@ pub const Input = struct {
         /// No one: the editor is locked while the last external source ends.
         none,
     };
+};
+
+/// One event of a task that waits for the next message boundary, with the reach
+/// it takes when it lands.
+const PendingEvent = struct {
+    message: ai.command.Outcome.Message,
+    options: AsyncEventOptions,
+};
+
+/// What an event of a task carries beyond its text.
+pub const AsyncEventOptions = struct {
+    /// Whether a remote mirror of the transcript sends the event. An event that
+    /// stands in the chat already, or that a send to the chat caused, stays in
+    /// the terminal.
+    mirrored: bool = true,
+};
+
+/// What the live tail of a turn shows, for a mirror of the transcript that
+/// reads no streaming event.
+pub const LiveTail = struct {
+    /// The kind of the block that streams now, or null between two.
+    streaming: ?ui.block.Entry.Kind,
+    /// The name of the tool call that started last and runs now, or null.
+    tool: ?[]const u8,
+    /// The tool calls the turn committed so far.
+    calls: usize,
 };
 
 /// One message of the user: the prompt of a turn or a queued steering message.
@@ -611,7 +640,7 @@ pub fn deinit(self: *Session) void {
     self.clearSteering();
     self.steering.deinit(self.gpa);
     self.restorable.deinit(self.gpa);
-    for (self.pending_events.items) |message| self.gpa.free(message.content);
+    for (self.pending_events.items) |pending| self.gpa.free(pending.message.content);
     self.pending_events.deinit(self.gpa);
     self.transcript.deinit();
     self.page_view.deinit();
@@ -677,17 +706,21 @@ fn projectionSetup(self: *const Session) Transcript.Setup {
     };
 }
 
-/// Forget the reasoning blocks that `account` produced. A credential replacement
-/// removes the replay proofs of that account slot from history for good, so the
-/// blocks that hold that reasoning leave the interface with them. Commands and
-/// credential changes run between turns, so this cannot discard live turn state.
-pub fn dropAccountReasoning(self: *Session, account: ai.llm.Account) void {
+/// Forget the reasoning blocks that `account` produced, and return how many left.
+/// A credential replacement removes the replay proofs of that account slot from
+/// history for good, so the blocks that hold that reasoning leave the interface
+/// with them. Commands and credential changes run between turns, so this cannot
+/// discard live turn state. The count lets a cursor over the transcript move
+/// back with the blocks that the removal shifted.
+pub fn dropAccountReasoning(self: *Session, account: ai.llm.Account) usize {
     std.debug.assert(self.mode == .prompt);
     // Only a block the active projection showed can leave a row on the screen.
     const was_shown = Transcript.shows(account, self.projectionSetup());
-    if (!self.transcript.dropAccount(account)) return;
+    const removed = self.transcript.dropAccount(account);
+    if (removed == 0) return 0;
     if (was_shown) self.view.resetScreen();
     self.dirty = true;
+    return removed;
 }
 
 /// Clear the transient notice. The regular footer returns on the next frame.
@@ -837,6 +870,7 @@ pub fn applyTurnEvent(self: *Session, event: *const TurnEvent) !bool {
             self.transcript.endMessage();
             try self.flushPendingEvents();
             try self.pushTool(turn, tool);
+            turn.calls += 1;
             // One committed call replaces its own streamed row. A sibling call
             // of the same reply keeps its row while this one runs.
             try self.dropStreamedTool(turn, tool.name);
@@ -1010,22 +1044,35 @@ fn appendEvent(self: *Session, message: ai.command.Outcome.Message) !void {
 /// attached bot. While a reply streams the event waits, because an append splits
 /// the streamed message, and it lands at the next message boundary. Takes
 /// ownership of `message.content`.
-pub fn recordAsyncEvent(self: *Session, message: ai.command.Outcome.Message) !void {
-    if (!self.transcript.streaming()) return self.appendAsyncEvent(message);
+pub fn recordAsyncEvent(
+    self: *Session,
+    message: ai.command.Outcome.Message,
+    options: AsyncEventOptions,
+) !void {
+    const pending: PendingEvent = .{ .message = message, .options = options };
+    if (!self.transcript.streaming()) {
+        defer self.gpa.free(message.content);
+        try self.appendAsyncEvent(&pending);
+        self.dirty = true;
+        return;
+    }
     errdefer self.gpa.free(message.content);
-    try self.pending_events.append(self.gpa, message);
+    try self.pending_events.append(self.gpa, pending);
 }
 
-/// Append one event of a task and free its content. It survives a rewind, because
-/// it reports the state of the session and not the turn that a failure undoes.
-fn appendAsyncEvent(self: *Session, message: ai.command.Outcome.Message) !void {
-    defer self.gpa.free(message.content);
+/// Append one event of a task. It survives a rewind, because it reports the state
+/// of the session and not the turn that a failure undoes. The caller frees the
+/// content.
+fn appendAsyncEvent(self: *Session, pending: *const PendingEvent) !void {
     try self.transcript.append(
         .event,
-        .{ .is_error = message.severity == .failure, .survives_rewind = true },
-        message.content,
+        .{
+            .is_error = pending.message.severity == .failure,
+            .survives_rewind = true,
+            .mirrored = pending.options.mirrored,
+        },
+        pending.message.content,
     );
-    self.dirty = true;
 }
 
 /// Append every waiting event, once no reply streams. A message that fails to
@@ -1033,13 +1080,9 @@ fn appendAsyncEvent(self: *Session, message: ai.command.Outcome.Message) !void {
 fn flushPendingEvents(self: *Session) !void {
     std.debug.assert(!self.transcript.streaming());
     while (self.pending_events.items.len > 0) {
-        const message = self.pending_events.items[0];
-        try self.transcript.append(
-            .event,
-            .{ .is_error = message.severity == .failure, .survives_rewind = true },
-            message.content,
-        );
-        self.gpa.free(message.content);
+        const pending = self.pending_events.items[0];
+        try self.appendAsyncEvent(&pending);
+        self.gpa.free(pending.message.content);
         _ = self.pending_events.orderedRemove(0);
     }
     self.dirty = true;
@@ -1455,11 +1498,39 @@ pub fn beginTurn(self: *Session, generation: u64) void {
         .activity_tick = 0,
         .progress_tick_last = 0,
         .caret_tick = 0,
+        .calls = 0,
         .tools = .empty,
         .streamed_tools = .empty,
         .box_view = .empty,
     } };
     self.dirty = true;
+}
+
+/// The count of leading transcript blocks that are committed. A turn commits a
+/// block once the worker reports the round that holds it, and every block is
+/// committed between turns. A mirror of the transcript sends a block once it is
+/// committed, so a rewind can never take back what the chat holds.
+pub fn committedCount(self: *const Session) usize {
+    return switch (self.mode) {
+        .turn => |*turn| turn.transcript_checkpoint,
+        else => self.transcript.blocks().len,
+    };
+}
+
+/// What the live tail of the running turn shows, or null between turns.
+pub fn liveTail(self: *const Session) ?LiveTail {
+    const turn = switch (self.mode) {
+        .turn => |*turn| turn,
+        else => return null,
+    };
+    return .{
+        .streaming = if (self.transcript.current) |current| current.kind else null,
+        .tool = if (turn.tools.items.len > 0)
+            turn.tools.items[turn.tools.items.len - 1].name
+        else
+            null,
+        .calls = turn.calls,
+    };
 }
 
 /// Move every running tool call into the transcript as a failed block, oldest
@@ -4407,7 +4478,7 @@ test "dropped account reasoning leaves the transcript for good" {
     try finishTurn(&session, 0);
     try session.paint(.{ .columns = 80, .rows = 24 });
 
-    session.dropAccountReasoning(.anthropic_subscription);
+    try std.testing.expectEqual(@as(usize, 1), session.dropAccountReasoning(.anthropic_subscription));
     try std.testing.expect(session.view.force_reset);
     try std.testing.expectEqual(@as(usize, 1), session.transcript.blocks().len);
 
@@ -4420,7 +4491,7 @@ test "dropped account reasoning leaves the transcript for good" {
 
     // A slot with nothing left to drop keeps the screen as it is.
     session.view.force_reset = false;
-    session.dropAccountReasoning(.anthropic_subscription);
+    try std.testing.expectEqual(@as(usize, 0), session.dropAccountReasoning(.anthropic_subscription));
     try std.testing.expect(!session.view.force_reset);
 }
 
@@ -4484,17 +4555,18 @@ test "an async event waits for the message boundary and survives a rewind" {
         .information,
         "idle report",
         .{},
-    ));
+    ), .{});
     try std.testing.expectEqual(@as(usize, 1), session.transcript.blocks().len);
 
     session.beginTurn(1);
     try applyEvent(&session, 1, .{ .text = try gpa.dupe(u8, "partial ") });
+    // The event stays in the terminal, and the flag lands with it.
     try session.recordAsyncEvent(try ai.command.Outcome.Message.print(
         gpa,
         .failure,
         "mid-stream report",
         .{},
-    ));
+    ), .{ .mirrored = false });
     // The stream stays one block, and the event is not in the transcript yet.
     try std.testing.expectEqual(@as(usize, 2), session.transcript.blocks().len);
     try applyEvent(&session, 1, .{ .text = try gpa.dupe(u8, "answer") });
@@ -4517,6 +4589,8 @@ test "an async event waits for the message boundary and survives a rewind" {
     try std.testing.expectEqualStrings("mid-stream report", blocks[2].content.event.text.items);
     try std.testing.expect(blocks[2].content.event.is_error);
     try std.testing.expect(blocks[2].content.event.survives_rewind);
+    try std.testing.expect(!blocks[2].content.event.mirrored);
+    try std.testing.expect(blocks[0].content.event.mirrored);
 
     // A failed turn rewinds the uncommitted tail and keeps the report.
     try session.reserveFailureRestore(&.{
@@ -4545,7 +4619,10 @@ test "the end of a turn lands the deferred events" {
 
     session.beginTurn(1);
     try applyEvent(&session, 1, .{ .text = try gpa.dupe(u8, "answer") });
-    try session.recordAsyncEvent(try ai.command.Outcome.Message.print(gpa, .information, "late", .{}));
+    try session.recordAsyncEvent(
+        try ai.command.Outcome.Message.print(gpa, .information, "late", .{}),
+        .{},
+    );
     try finishTurn(&session, 0);
     const blocks = session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 2), blocks.len);

@@ -188,13 +188,36 @@ pub const Server = struct {
 
     /// How many `sendMessage` requests arrived so far.
     pub fn sendCount(self: *Server) usize {
+        return self.countOf("/sendMessage");
+    }
+
+    /// How many requests of the method at the end of `path_suffix` arrived so far.
+    fn countOf(self: *Server, path_suffix: []const u8) usize {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         var count: usize = 0;
         for (self.requests.items) |request| {
-            if (std.mem.endsWith(u8, request.path, "/sendMessage")) count += 1;
+            if (std.mem.endsWith(u8, request.path, path_suffix)) count += 1;
         }
         return count;
+    }
+
+    /// The body of the request at `index` among those of the method at the end of
+    /// `path_suffix`, once it arrived.
+    pub fn waitForRequest(self: *Server, path_suffix: []const u8, index: usize) ![]const u8 {
+        for (0..wait_steps_max) |_| {
+            if (self.countOf(path_suffix) > index) break;
+            try self.io.sleep(.fromMilliseconds(wait_step_ms), .awake);
+        } else return error.TestTimedOut;
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var count: usize = 0;
+        for (self.requests.items) |request| {
+            if (!std.mem.endsWith(u8, request.path, path_suffix)) continue;
+            if (count == index) return request.body;
+            count += 1;
+        }
+        unreachable;
     }
 
     /// Wait until `count` messages went out.
@@ -221,19 +244,9 @@ pub const Server = struct {
         return buffer[0..count];
     }
 
-    /// The body of the `sendMessage` request at `index`, once it arrived. The
-    /// wait above proves that the send is there, and nothing drops a request.
+    /// The body of the `sendMessage` request at `index`, once it arrived.
     pub fn waitForSend(self: *Server, index: usize) ![]const u8 {
-        try self.waitForSends(index + 1);
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        var count: usize = 0;
-        for (self.requests.items) |request| {
-            if (!std.mem.endsWith(u8, request.path, "/sendMessage")) continue;
-            if (count == index) return request.body;
-            count += 1;
-        }
-        unreachable;
+        return self.waitForRequest("/sendMessage", index);
     }
 
     fn stop(self: *Server) void {
@@ -274,6 +287,29 @@ pub const Server = struct {
         var keep = false;
         defer if (!keep) connection.close(io);
 
+        const reply = try self.takeRequest(connection) orelse {
+            keep = true;
+            return;
+        };
+        // The wait runs outside the lock, so a test reads the request while the
+        // reply is still in flight and acts on that state.
+        if (reply.delay_ms > 0) try io.sleep(.fromMilliseconds(@intCast(reply.delay_ms)), .awake);
+        var write_buffer: [512]u8 = undefined;
+        var writer = connection.writer(io, &write_buffer);
+        writer.interface.print(
+            "HTTP/1.1 {d} X\r\ncontent-type: application/json\r\n" ++
+                "content-length: {d}\r\nconnection: close\r\n\r\n{s}",
+            .{ reply.status, reply.body.len, reply.body },
+        ) catch |err| return writeFailure(&writer, err);
+        writer.interface.flush() catch |err| return writeFailure(&writer, err);
+    }
+
+    /// Read the whole request of `connection`, record it, and take the reply of
+    /// its method. Null holds the connection, because the script ran out. The
+    /// list owns the strings of the request once this returns, and no failure
+    /// after the append can free them again.
+    fn takeRequest(self: *Server, connection: std.Io.net.Stream) !?*const Reply {
+        const io = self.io;
         var read_buffer: [8192]u8 = undefined;
         var reader = connection.reader(io, &read_buffer);
         const request_line = reader.interface.takeDelimiterInclusive('\n') catch |err|
@@ -300,22 +336,15 @@ pub const Server = struct {
 
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
+        // The room for a held connection comes first, so no failure follows the
+        // append.
+        try self.held.ensureUnusedCapacity(self.gpa, 1);
         try self.requests.append(self.gpa, .{ .path = path, .body = body });
-        const maybe_reply = self.nextReply(pathMethod(path));
-        const reply = maybe_reply orelse {
-            try self.held.append(self.gpa, connection);
-            keep = true;
-            return;
+        const reply = self.nextReply(pathMethod(path)) orelse {
+            self.held.appendAssumeCapacity(connection);
+            return null;
         };
-        if (reply.delay_ms > 0) try io.sleep(.fromMilliseconds(@intCast(reply.delay_ms)), .awake);
-        var write_buffer: [512]u8 = undefined;
-        var writer = connection.writer(io, &write_buffer);
-        writer.interface.print(
-            "HTTP/1.1 {d} X\r\ncontent-type: application/json\r\n" ++
-                "content-length: {d}\r\nconnection: close\r\n\r\n{s}",
-            .{ reply.status, reply.body.len, reply.body },
-        ) catch |err| return writeFailure(&writer, err);
-        writer.interface.flush() catch |err| return writeFailure(&writer, err);
+        return reply;
     }
 
     /// The next reply of `method`, or null when its script ran out or no script

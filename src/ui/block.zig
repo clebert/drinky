@@ -48,6 +48,10 @@ pub const Entry = struct {
         /// Whether an event stays when an abnormal turn rewinds its model tail.
         /// Other flagged blocks ignore this field.
         survives_rewind: bool,
+        /// Whether a remote mirror of the transcript sends this event. An event
+        /// that stands in the chat already, or that a send to the chat caused,
+        /// stays in the terminal. Other flagged blocks ignore this field.
+        mirrored: bool,
     };
 
     /// One run of model reasoning and the account slot that produced it. Only
@@ -78,6 +82,9 @@ pub const Entry = struct {
         /// Whether an event survives an abnormal turn rewind. Every other
         /// variant ignores it.
         survives_rewind: bool = false,
+        /// Whether a remote mirror of the transcript sends an event. Every
+        /// other variant ignores it.
+        mirrored: bool = true,
     };
 
     /// The composed rows of one block at one width. A frame that painted the
@@ -136,6 +143,7 @@ pub const Entry = struct {
             .is_error = options.is_error,
             .fit = options.fit,
             .survives_rewind = options.survives_rewind,
+            .mirrored = options.mirrored,
         };
         return .{ .content = switch (kind) {
             .tool_result => .{ .tool_result = flagged },

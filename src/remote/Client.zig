@@ -1,6 +1,6 @@
 //! The Telegram Bot API client: one HTTPS POST with a JSON body per call, and
-//! the reply classified by its status. The client knows the four methods that
-//! the transport needs and nothing of the session.
+//! the reply classified by its status. The client knows the six methods that
+//! the transport and the mirror need and nothing of the session.
 //!
 //! The URL of every call carries the token, so no error, event, or log names a
 //! URL. A failure reads as one of the `Error` names, and the description that
@@ -257,6 +257,52 @@ pub fn sendMessage(
     defer reply.deinit();
     const result = objectOf(try reply.result()) orelse return error.MalformedReply;
     return integerOf(result.get("message_id")) orelse error.MalformedReply;
+}
+
+/// Replace the text of the message `message_id` in `chat_id`. An edit to the
+/// text the message already holds changes nothing, and that is the state the
+/// caller asked for, so Telegram's refusal of it reads as success.
+pub fn editMessageText(
+    self: *Client,
+    chat_id: i64,
+    message_id: i64,
+    text: []const u8,
+) Error!void {
+    const body = try std.json.Stringify.valueAlloc(self.gpa, .{
+        .chat_id = chat_id,
+        .message_id = message_id,
+        .text = text,
+    }, .{});
+    defer self.gpa.free(body);
+    const reply = self.call("editMessageText", body) catch |err| switch (err) {
+        error.Rejected => {
+            if (std.mem.indexOf(u8, self.description(), "message is not modified") != null) return;
+            return err;
+        },
+        else => return err,
+    };
+    defer reply.deinit();
+    _ = try reply.result();
+}
+
+/// Set the one reaction of the bot on the message `message_id` in `chat_id`.
+/// Telegram allows a fixed emoji list for a bot.
+pub fn setMessageReaction(
+    self: *Client,
+    chat_id: i64,
+    message_id: i64,
+    emoji: []const u8,
+) Error!void {
+    const ReactionType = struct { type: []const u8 = "emoji", emoji: []const u8 };
+    const body = try std.json.Stringify.valueAlloc(self.gpa, .{
+        .chat_id = chat_id,
+        .message_id = message_id,
+        .reaction = [_]ReactionType{.{ .emoji = emoji }},
+    }, .{});
+    defer self.gpa.free(body);
+    const reply = try self.call("setMessageReaction", body);
+    defer reply.deinit();
+    _ = try reply.result();
 }
 
 /// One POST of `body` to `method`, bounded by the head window. The reply parses
@@ -583,6 +629,64 @@ test "sendMessage returns the message id and states its options" {
         "{\"chat_id\":99,\"text\":\"<b>x</b>\",\"disable_notification\":true," ++
             "\"parse_mode\":\"HTML\",\"reply_parameters\":{\"message_id\":12}}",
         server.requests.items[1].body,
+    );
+}
+
+test "editMessageText states its target, and an unchanged text counts as success" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var server = try testing.Server.init(gpa, io, &.{.{ .method = "editMessageText", .replies = &.{
+        .{ .body = "{\"ok\":true,\"result\":{\"message_id\":314}}" },
+        .{ .status = 400, .body = "{\"ok\":false,\"error_code\":400,\"description\":\"Bad Request: message is not modified\"}" },
+        .{ .status = 400, .body = "{\"ok\":false,\"error_code\":400,\"description\":\"Bad Request: message to edit not found\"}" },
+    } }});
+    defer server.deinit();
+    try server.start();
+    var url_buffer: [64]u8 = undefined;
+    var client: Client = .{
+        .gpa = gpa,
+        .io = io,
+        .base_url = server.url(&url_buffer),
+        .token = "t",
+        .connect_ms = 5_000,
+    };
+
+    try client.editMessageText(99, 314, "Writing");
+    try client.editMessageText(99, 314, "Writing");
+    try std.testing.expectError(error.Rejected, client.editMessageText(99, 315, "Writing"));
+    try server.finish();
+    try std.testing.expectEqualStrings(
+        "{\"chat_id\":99,\"message_id\":314,\"text\":\"Writing\"}",
+        server.requests.items[0].body,
+    );
+}
+
+test "setMessageReaction sets one emoji" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var server = try testing.Server.init(gpa, io, &.{.{ .method = "setMessageReaction", .replies = &.{
+        .{ .body = "{\"ok\":true,\"result\":true}" },
+    } }});
+    defer server.deinit();
+    try server.start();
+    var url_buffer: [64]u8 = undefined;
+    var client: Client = .{
+        .gpa = gpa,
+        .io = io,
+        .base_url = server.url(&url_buffer),
+        .token = "t",
+        .connect_ms = 5_000,
+    };
+
+    try client.setMessageReaction(99, 7, "👀");
+    try server.finish();
+    try std.testing.expectEqualStrings(
+        "{\"chat_id\":99,\"message_id\":7,\"reaction\":[{\"type\":\"emoji\",\"emoji\":\"👀\"}]}",
+        server.requests.items[0].body,
     );
 }
 

@@ -7,6 +7,12 @@
 //! owner never waits for Telegram. Each task holds a client of its own, because
 //! a client keeps the description of its last failure.
 //!
+//! A send returns at once, and the id of the new message arrives later on the
+//! sender. A tracked send returns a handle, and an edit names that handle. The
+//! queue holds the edit behind the send, and the newest text of a pending edit
+//! replaces an older one, so a burst of state changes costs one edit. A
+//! reaction names the id of a message of the chat.
+//!
 //! A close closes the queue, and the sender then drains what the queue still
 //! holds inside the drain window less a reserve. A drain task watches it, ends
 //! it at that point, sends the final message of the close inside the reserve on
@@ -50,6 +56,16 @@ const backoff_default: ai.net.Retry = .{
     .backoff_ms_max = 16_000,
 };
 
+/// The tracked messages the attachment remembers at once. A slot stays taken
+/// while its send waits in the queue or in flight, or while an edit of its
+/// message waits in the queue. One slot per queue item and one for the send in
+/// flight cover every taken slot, and one more keeps a free slot for the next
+/// reservation, so a reservation never fails and never takes a slot with work.
+const tracked_capacity = outbound_capacity + 2;
+
+/// The description Telegram sends for a text whose formatting it cannot parse.
+const parse_failure_description = "can't parse entities";
+
 gpa: std.mem.Allocator,
 io: std.Io,
 /// The bot token. Owned, and never part of any text this attachment produces.
@@ -66,13 +82,22 @@ poll_client: Client,
 send_client: Client,
 outbound_buffer: [outbound_capacity]Outbound,
 outbound: std.Io.Queue(Outbound),
+/// The messages that an edit can name. The owner and the sender both touch them,
+/// so the mutex guards every access.
+tracked: [tracked_capacity]Tracked,
+tracked_mutex: std.Io.Mutex,
+/// The slot after the last reserved one. A reservation scans from here, so the
+/// slots take turns and a freed slot rests before the next message takes it.
+tracked_next: usize,
+/// The handle of the next tracked send. It starts at one, so no handle is zero.
+handle_next: Handle,
 poll_future: ?std.Io.Future(void),
 send_future: ?std.Io.Future(void),
 /// The drain task of the close, or null before it. It owns the end of the sender.
 drain_future: ?std.Io.Future(void),
 /// The message that the close named as the last one of the chat, or null. The
 /// close writes it before it starts the drain task, which alone reads it.
-final: ?Outbound,
+final: ?Outbound.Send,
 /// Whether the sender task ended. `destroy` polls it, so a sender stuck in a
 /// call past the drain deadline gets canceled instead of awaited.
 send_done: std.atomic.Value(bool),
@@ -130,9 +155,8 @@ pub const Event = struct {
         failed: Failure,
         /// The first success after a run of failures on one side.
         recovered: Side,
-        /// Telegram refused one message for good, and the sender dropped it.
-        /// The text is the description of Telegram, or empty.
-        send_rejected: []u8,
+        /// Telegram refused one item for good, and the sender dropped it.
+        send_rejected: Rejected,
         /// A permanent condition that ends the attachment.
         detach: Reason,
         /// The sender ended after a close, so a `destroy` waits for nothing.
@@ -148,6 +172,15 @@ pub const Event = struct {
         side: Side,
         /// The name of the error.
         name: []const u8,
+    };
+
+    pub const Rejected = struct {
+        kind: Kind,
+        /// The description of Telegram, or empty.
+        description: []u8,
+
+        /// What the sender tried: a new message, an edit, or a reaction.
+        pub const Kind = enum { message, edit, reaction };
     };
 
     pub const Side = enum { poll, send };
@@ -166,16 +199,114 @@ pub const Event = struct {
     pub fn deinit(self: *const Event, gpa: std.mem.Allocator) void {
         switch (self.payload) {
             .message => |message| gpa.free(message.text),
-            .send_rejected => |text| gpa.free(text),
+            .send_rejected => |rejected| gpa.free(rejected.description),
             .unreadable, .failed, .recovered, .detach, .drained => {},
         }
     }
 };
 
-/// One message on its way to the chat. The queue owns the text.
-const Outbound = struct {
+/// The name of a tracked message on the side of the owner. The sender learns the
+/// id of the message later, and an edit reaches it through the handle.
+pub const Handle = u64;
+
+/// One reaction of the bot on a message of the chat.
+pub const Reaction = struct {
+    message_id: i64,
+    mark: Mark,
+
+    /// The state of a Telegram message in the transcript, as the emoji that
+    /// shows it. Telegram allows a fixed emoji list for a bot, and that list
+    /// holds neither ✅ nor ❌.
+    pub const Mark = enum {
+        /// Received and not yet committed.
+        seen,
+        committed,
+        dropped,
+
+        fn emoji(self: Mark) []const u8 {
+            return switch (self) {
+                .seen => "👀",
+                .committed => "👍",
+                .dropped => "👎",
+            };
+        }
+    };
+};
+
+/// The errors of a put into the outbound queue.
+pub const SendError = error{ Closed, Canceled, QueueFull, OutOfMemory };
+
+/// One item on its way to the chat.
+const Outbound = union(enum) {
+    /// A new message. The queue owns the text.
+    send: Send,
+    /// A pending edit of the tracked message with this handle. The text waits
+    /// in the slot of the handle, so a later edit replaces it there and the
+    /// sender takes the newest one.
+    edit: Handle,
+    react: Reaction,
+
+    const Send = struct {
+        text: []u8,
+        options: Client.SendOptions,
+        /// The slot that takes the id of the new message, or null for a message
+        /// that no edit names later.
+        handle: ?Handle,
+    };
+};
+
+/// One message that an edit can name. The owner fills the handle, the sender
+/// fills the id once the send returned it, and the pending edit waits between
+/// them.
+const Tracked = struct {
+    /// The handle of the message, or zero for a slot no message took yet.
+    handle: Handle,
+    /// The id of the message, or null before the send returned or after it
+    /// failed for good.
+    message_id: ?i64,
+    /// The newest text of a pending edit, or null while none waits. Owned.
+    edit: ?[]u8,
+    /// Whether the send of the message left the sender, delivered or dropped.
+    settled: bool,
+
+    const empty: Tracked = .{ .handle = 0, .message_id = null, .edit = null, .settled = true };
+
+    /// Whether the next reservation can take this slot: no send waits for it,
+    /// and no edit of its message waits in the queue.
+    fn free(self: *const Tracked) bool {
+        return self.settled and self.edit == null;
+    }
+};
+
+/// What a pending edit found in its slot.
+const Replace = enum {
+    /// No edit waited, so the queue needs a marker for this one.
+    opened,
+    /// An older pending text gave its place up, and its marker stands.
+    replaced,
+    /// The slot belongs to another message, so the text drops.
+    stale,
+};
+
+/// One edit that the sender resolved from its slot: the message and the text.
+const Edit = struct {
+    message_id: i64,
     text: []u8,
-    options: Client.SendOptions,
+};
+
+/// One call of the chat, as the sender delivers it.
+const Delivery = union(enum) {
+    send: Outbound.Send,
+    edit: Edit,
+    react: Reaction,
+
+    fn kind(self: *const Delivery) Event.Rejected.Kind {
+        return switch (self.*) {
+            .send => .message,
+            .edit => .edit,
+            .react => .reaction,
+        };
+    }
 };
 
 /// Build an attachment on the heap, because the queue borrows its buffer. The
@@ -214,6 +345,10 @@ pub fn create(gpa: std.mem.Allocator, io: std.Io, options: *const Options) !*Att
         },
         .outbound_buffer = undefined,
         .outbound = undefined,
+        .tracked = @splat(Tracked.empty),
+        .tracked_mutex = .init,
+        .tracked_next = 0,
+        .handle_next = 1,
         .poll_future = null,
         .send_future = null,
         .drain_future = null,
@@ -236,15 +371,140 @@ pub fn start(self: *Attachment) !void {
 /// Queue one message for the chat without a wait. The attachment copies `text`.
 /// A full queue refuses with `error.QueueFull`, so the owner never blocks behind
 /// the pace of the chat, and a closed attachment takes nothing.
-pub fn send(self: *Attachment, text: []const u8, options: *const Client.SendOptions) !void {
+pub fn send(self: *Attachment, text: []const u8, options: *const Client.SendOptions) SendError!void {
+    try self.queueSend(text, options, null);
+}
+
+/// Queue one message that a later edit names, and return its handle. The sender
+/// records the id of the message under the handle once the send returned it.
+pub fn sendTracked(
+    self: *Attachment,
+    text: []const u8,
+    options: *const Client.SendOptions,
+) SendError!Handle {
+    const handle = self.reserveHandle();
+    self.queueSend(text, options, handle) catch |err| {
+        self.settle(handle);
+        return err;
+    };
+    return handle;
+}
+
+/// Replace the text of the tracked message `handle` with `text`, once it and
+/// every item before it went out. A pending edit of the same message gives its
+/// text up for this one, so the chat sees the newest state and skips the older
+/// ones. An edit of a message whose slot another message took drops in silence.
+pub fn edit(self: *Attachment, handle: Handle, text: []const u8) SendError!void {
+    const copy = try self.gpa.dupe(u8, text);
+    switch (self.replaceEdit(handle, copy)) {
+        .stale => return self.gpa.free(copy),
+        // The marker of the older text stands, and the sender takes the newest
+        // text when it reaches it.
+        .replaced => return,
+        .opened => {},
+    }
+    self.queueOne(.{ .edit = handle }) catch |err| {
+        if (self.takeEdit(handle)) |pending| self.gpa.free(pending.text);
+        return err;
+    };
+}
+
+/// Queue one reaction on the message `message_id` of the chat.
+pub fn react(self: *Attachment, message_id: i64, mark: Reaction.Mark) SendError!void {
+    try self.queueOne(.{ .react = .{ .message_id = message_id, .mark = mark } });
+}
+
+fn queueSend(
+    self: *Attachment,
+    text: []const u8,
+    options: *const Client.SendOptions,
+    handle: ?Handle,
+) SendError!void {
     const copy = try self.gpa.dupe(u8, text);
     errdefer self.gpa.free(copy);
-    const items = [1]Outbound{.{ .text = copy, .options = options.* }};
+    try self.queueOne(.{ .send = .{ .text = copy, .options = options.*, .handle = handle } });
+}
+
+fn queueOne(self: *Attachment, item: Outbound) SendError!void {
+    const items = [1]Outbound{item};
     const count = self.outbound.put(self.io, &items, 0) catch |err| switch (err) {
         error.Closed => return error.Closed,
         error.Canceled => return error.Canceled,
     };
     if (count == 0) return error.QueueFull;
+}
+
+/// Take the next handle and give it the next free slot. A slot with a send or an
+/// edit still waiting stays with its message, so a fast run of turns cannot
+/// leave an older activity message without its summary.
+fn reserveHandle(self: *Attachment) Handle {
+    self.tracked_mutex.lockUncancelable(self.io);
+    defer self.tracked_mutex.unlock(self.io);
+    const handle = self.handle_next;
+    self.handle_next += 1;
+    for (0..tracked_capacity) |step| {
+        const index = (self.tracked_next + step) % tracked_capacity;
+        const slot = &self.tracked[index];
+        if (!slot.free()) continue;
+        slot.* = .{ .handle = handle, .message_id = null, .edit = null, .settled = false };
+        self.tracked_next = index + 1;
+        return handle;
+    }
+    // The slots outnumber the items that can hold one, so the scan always ends
+    // on a free slot while the sender runs.
+    unreachable;
+}
+
+/// Put `text` into the slot of `handle` as its pending edit, and report what it
+/// found there. The caller drops a stale text.
+fn replaceEdit(self: *Attachment, handle: Handle, text: []u8) Replace {
+    self.tracked_mutex.lockUncancelable(self.io);
+    defer self.tracked_mutex.unlock(self.io);
+    const slot = self.slotOf(handle) orelse return .stale;
+    const found: Replace = if (slot.edit != null) .replaced else .opened;
+    if (slot.edit) |old| self.gpa.free(old);
+    slot.edit = text;
+    return found;
+}
+
+/// Take the pending edit of `handle` with the id of its message, or null when
+/// none waits or the message has no id. A text with no id to reach drops here,
+/// because its send failed for good.
+fn takeEdit(self: *Attachment, handle: Handle) ?Edit {
+    self.tracked_mutex.lockUncancelable(self.io);
+    defer self.tracked_mutex.unlock(self.io);
+    const slot = self.slotOf(handle) orelse return null;
+    const text = slot.edit orelse return null;
+    slot.edit = null;
+    const message_id = slot.message_id orelse {
+        self.gpa.free(text);
+        return null;
+    };
+    return .{ .message_id = message_id, .text = text };
+}
+
+/// Record the id that the send of `handle` returned.
+fn recordMessageId(self: *Attachment, handle: Handle, message_id: i64) void {
+    self.tracked_mutex.lockUncancelable(self.io);
+    defer self.tracked_mutex.unlock(self.io);
+    const slot = self.slotOf(handle) orelse return;
+    slot.message_id = message_id;
+}
+
+/// Record that the send of `handle` left the sender, delivered or dropped, so a
+/// slot with no pending edit is free again.
+fn settle(self: *Attachment, handle: Handle) void {
+    self.tracked_mutex.lockUncancelable(self.io);
+    defer self.tracked_mutex.unlock(self.io);
+    const slot = self.slotOf(handle) orelse return;
+    slot.settled = true;
+}
+
+/// The slot that `handle` holds, or null once another message took it. The
+/// caller holds the lock.
+fn slotOf(self: *Attachment, handle: Handle) ?*Tracked {
+    for (&self.tracked) |*slot| if (slot.handle == handle) return slot;
+    return null;
 }
 
 /// Whether `close` ran.
@@ -274,6 +534,7 @@ pub fn close(self: *Attachment, final: ?[]const u8) error{OutOfMemory}!void {
     self.final = .{
         .text = try self.gpa.dupe(u8, text),
         .options = .{ .disable_notification = true },
+        .handle = null,
     };
 }
 
@@ -303,12 +564,20 @@ pub fn destroy(self: *Attachment) void {
     while (true) {
         const count = self.outbound.get(self.io, &batch, 0) catch break;
         if (count == 0) break;
-        for (batch[0..count]) |item| self.gpa.free(item.text);
+        for (batch[0..count]) |item| freeOutbound(self.gpa, &item);
     }
+    for (&self.tracked) |*slot| if (slot.edit) |text| self.gpa.free(text);
     if (self.final) |final| self.gpa.free(final.text);
     self.gpa.free(self.username);
     self.gpa.free(self.token);
     self.gpa.destroy(self);
+}
+
+fn freeOutbound(gpa: std.mem.Allocator, item: *const Outbound) void {
+    switch (item.*) {
+        .send => |send_item| gpa.free(send_item.text),
+        .edit, .react => {},
+    }
 }
 
 /// The drain task: wait for the sender until the reserve of the final message
@@ -346,7 +615,7 @@ fn runDrain(self: *Attachment) void {
 /// 429 and a transient failure wait and try again inside it. The message skips
 /// the pacing sleep, because the reserve is its whole room and a 429 answers a
 /// send that came early.
-fn deliverFinal(self: *Attachment, final: *const Outbound) void {
+fn deliverFinal(self: *Attachment, final: *const Outbound.Send) void {
     const client = &self.send_client;
     var failures: u32 = 0;
     // The loop ends on a send, a permanent failure, or the end of the window,
@@ -501,10 +770,10 @@ fn pollOnce(self: *Attachment, state: *PollState) (Client.Error || error{Closed}
     }
 }
 
-/// The sender: take one message at a time and deliver it. A 429 waits the named
-/// seconds. A transient failure waits and tries the same message again, and the
+/// The sender: take one item at a time and deliver it. A 429 waits the named
+/// seconds. A transient failure waits and tries the same item again, and the
 /// first failure and the recovery each report once. Any other 4xx drops the
-/// message with one report. A 401, a 403, and a 409 end the attachment. After a
+/// item with one report. A 401, a 403, and a 409 end the attachment. After a
 /// close the queue drains inside the window less the reserve of the final
 /// message, and the rest drops.
 fn runSender(self: *Attachment) void {
@@ -521,8 +790,8 @@ const SendState = struct {
     sent_ms: ?i64 = null,
 };
 
-/// The sender before the close: every message of the queue, until the queue
-/// closes and drains, a cancel, or a permanent failure ends it.
+/// The sender before the close: every item of the queue, until the queue closes
+/// and drains, a cancel, or a permanent failure ends it.
 fn sendUntilClosed(
     self: *Attachment,
     state: *SendState,
@@ -537,20 +806,56 @@ fn sendUntilClosed(
         };
         std.debug.assert(count == 1);
         const item = batch[0];
-        defer self.gpa.free(item.text);
-        try self.deliver(state, &item);
+        defer freeOutbound(self.gpa, &item);
+        switch (item) {
+            .send => |send_item| {
+                // The slot settles whether the send went out or dropped, so a
+                // failed send cannot pin it.
+                defer if (send_item.handle) |handle| self.settle(handle);
+                try self.deliver(state, .{ .send = send_item });
+            },
+            // The marker stands for the newest text of the slot, and it takes
+            // one text alone: an edit that arrives while this one goes out
+            // opens a marker of its own, so it keeps its place behind the items
+            // queued before it.
+            .edit => |handle| if (self.takeEdit(handle)) |pending| {
+                defer self.gpa.free(pending.text);
+                try self.deliver(state, .{ .edit = pending });
+            },
+            .react => |reaction| try self.deliver(state, .{ .react = reaction }),
+        }
     }
 }
 
-/// Deliver one message, with the waits and the retries of the pace. The message
-/// drops when Telegram rejects it for good, or when the drain window less the
-/// reserve of the final message leaves no room for it. No sleep reaches into
-/// that reserve.
+/// One call of the chat for `delivery`. A tracked send records the id of its
+/// message, so a later edit finds it.
+fn callChat(self: *Attachment, delivery: *const Delivery) Client.Error!void {
+    const client = &self.send_client;
+    switch (delivery.*) {
+        .send => |send_item| {
+            const message_id = try client.sendMessage(self.chat_id, send_item.text, &send_item.options);
+            if (send_item.handle) |handle| self.recordMessageId(handle, message_id);
+        },
+        .edit => |pending| try client.editMessageText(self.chat_id, pending.message_id, pending.text),
+        .react => |reaction| try client.setMessageReaction(
+            self.chat_id,
+            reaction.message_id,
+            reaction.mark.emoji(),
+        ),
+    }
+}
+
+/// Deliver one item, with the waits and the retries of the pace. The item drops
+/// when Telegram rejects it for good, or when the drain window less the reserve
+/// of the final message leaves no room for it. No sleep reaches into that
+/// reserve. A message whose formatting Telegram cannot parse goes again as plain
+/// text, so the ordered queue never stalls on one block.
 fn deliver(
     self: *Attachment,
     state: *SendState,
-    item: *const Outbound,
+    delivery_in: Delivery,
 ) error{ Closed, Canceled, Detached }!void {
+    var delivery = delivery_in;
     const client = &self.send_client;
     const reserve = self.pace.final_reserve_ms;
     // The loop ends on a send, a drop, or an end of the task, and every other
@@ -566,7 +871,7 @@ fn deliver(
         if (self.drainRemainingMs()) |remaining| {
             if (remaining <= reserve) return;
         }
-        _ = client.sendMessage(self.chat_id, item.text, &item.options) catch |err| switch (err) {
+        self.callChat(&delivery) catch |err| switch (err) {
             error.Canceled => return error.Canceled,
             error.Unauthorized => return self.detach(.unauthorized),
             error.Forbidden => return self.detach(.forbidden),
@@ -576,9 +881,19 @@ fn deliver(
                 continue;
             },
             error.Rejected => {
+                if (delivery == .send and delivery.send.options.parse_mode != null and
+                    std.mem.indexOf(u8, client.description(), parse_failure_description) != null)
+                {
+                    delivery.send.options.parse_mode = null;
+                    state.sent_ms = self.nowMs();
+                    continue;
+                }
                 // A copy that fails costs the description alone, not the report.
                 const text: []u8 = self.gpa.dupe(u8, client.description()) catch &.{};
-                self.emit(.{ .send_rejected = text }) catch |emit_error| {
+                self.emit(.{ .send_rejected = .{
+                    .kind = delivery.kind(),
+                    .description = text,
+                } }) catch |emit_error| {
                     self.gpa.free(text);
                     return emit_error;
                 };
@@ -785,7 +1100,7 @@ test "the sender delivers in order, retries a transient failure, and drops a rej
         .{ .method = "sendMessage", .replies = &.{
             .{ .status = 500, .body = "" },
             .{ .body = ok_sent },
-            .{ .status = 400, .body = "{\"ok\":false,\"error_code\":400,\"description\":\"Bad Request: can't parse entities\"}" },
+            .{ .status = 400, .body = "{\"ok\":false,\"error_code\":400,\"description\":\"Bad Request: message text is empty\"}" },
             .{ .body = ok_sent },
         } },
     });
@@ -819,10 +1134,226 @@ test "the sender delivers in order, retries a transient failure, and drops a rej
     const events = collector.events.items;
     try std.testing.expectEqual(Event.Side.send, events[0].payload.failed.side);
     try std.testing.expectEqual(Event.Side.send, events[1].payload.recovered);
+    try std.testing.expectEqual(Event.Rejected.Kind.message, events[2].payload.send_rejected.kind);
     try std.testing.expectEqualStrings(
-        "Bad Request: can't parse entities",
-        events[2].payload.send_rejected,
+        "Bad Request: message text is empty",
+        events[2].payload.send_rejected.description,
     );
+}
+
+// A formatted block that Telegram cannot parse must not stall the queue behind
+// it, and the chat must still get its text. The same bytes go again without a
+// parse mode, and the block behind it follows.
+test "a message whose formatting fails to parse goes again as plain text" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var server = try testing.Server.init(gpa, io, &quiet_scripts ++ [_]testing.Script{
+        .{ .method = "sendMessage", .replies = &.{
+            .{ .status = 400, .body = "{\"ok\":false,\"error_code\":400,\"description\":\"Bad Request: can't parse entities\"}" },
+            .{ .body = ok_sent },
+            .{ .body = ok_sent },
+        } },
+    });
+    defer server.deinit();
+    try server.start();
+    var collector: Collector = .{ .gpa = gpa, .io = io };
+    defer collector.deinit();
+    var url_buffer: [64]u8 = undefined;
+    const attachment = try testAttachment(gpa, io, &server, &url_buffer, &collector);
+    defer attachment.destroy();
+    try attachment.start();
+
+    try attachment.send("<b>broken", &.{ .parse_mode = "HTML" });
+    try attachment.send("next", &.{});
+    try server.waitForSends(3);
+    try server.finish();
+    var buffer: [4][]const u8 = undefined;
+    const sends = server.sentBodies(&buffer);
+    try std.testing.expect(std.mem.indexOf(u8, sends[0], "\"parse_mode\":\"HTML\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sends[1], "\"text\":\"<b>broken\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sends[1], "parse_mode") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sends[2], "\"text\":\"next\"") != null);
+    // The resend is no rejection, so nothing reports.
+    try std.testing.expectEqual(@as(usize, 0), collector.events.items.len);
+}
+
+test "an edit waits behind its tracked send, and the newest text replaces a pending one" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var server = try testing.Server.init(gpa, io, &quiet_scripts ++ [_]testing.Script{
+        .{ .method = "sendMessage", .replies = &.{
+            .{ .body = "{\"ok\":true,\"result\":{\"message_id\":314}}", .delay_ms = 100 },
+        } },
+        .{ .method = "editMessageText", .replies = &.{ .{ .body = ok_true }, .{ .body = ok_true } } },
+    });
+    defer server.deinit();
+    try server.start();
+    var collector: Collector = .{ .gpa = gpa, .io = io };
+    defer collector.deinit();
+    var url_buffer: [64]u8 = undefined;
+    const attachment = try testAttachment(gpa, io, &server, &url_buffer, &collector);
+    defer attachment.destroy();
+    try attachment.start();
+
+    const handle = try attachment.sendTracked("Thinking", &.{ .disable_notification = true });
+    // Both edits queue while the send still waits for its reply, so one edit
+    // goes out with the newest text.
+    try attachment.edit(handle, "Writing");
+    try attachment.edit(handle, "Running: bash");
+    // The sender took that text once its edit arrived, so the next edit opens
+    // a pending one of its own.
+    _ = try server.waitForRequest("/editMessageText", 0);
+    try attachment.edit(handle, "Tools: 1 call");
+    _ = try server.waitForRequest("/editMessageText", 1);
+    try server.finish();
+    var edits: [2][]const u8 = undefined;
+    var count: usize = 0;
+    for (server.requests.items) |request| {
+        if (!std.mem.endsWith(u8, request.path, "/editMessageText")) continue;
+        edits[count] = request.body;
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), count);
+    try std.testing.expectEqualStrings(
+        "{\"chat_id\":99,\"message_id\":314,\"text\":\"Running: bash\"}",
+        edits[0],
+    );
+    try std.testing.expectEqualStrings(
+        "{\"chat_id\":99,\"message_id\":314,\"text\":\"Tools: 1 call\"}",
+        edits[1],
+    );
+}
+
+// The marker of an edit takes one text alone. An edit that arrives while the
+// marker goes out queues behind the items before it, so an answer that queued
+// before the summary of its turn reaches the chat before that summary.
+test "an edit that arrives during an edit keeps its place in the queue" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var server = try testing.Server.init(gpa, io, &quiet_scripts ++ [_]testing.Script{
+        .{ .method = "sendMessage", .replies = &.{
+            .{ .body = "{\"ok\":true,\"result\":{\"message_id\":314}}" },
+            .{ .body = ok_sent },
+        } },
+        .{ .method = "editMessageText", .replies = &.{
+            .{ .body = ok_true, .delay_ms = 150 },
+            .{ .body = ok_true },
+        } },
+    });
+    defer server.deinit();
+    try server.start();
+    var collector: Collector = .{ .gpa = gpa, .io = io };
+    defer collector.deinit();
+    var url_buffer: [64]u8 = undefined;
+    const attachment = try testAttachment(gpa, io, &server, &url_buffer, &collector);
+    defer attachment.destroy();
+    try attachment.start();
+
+    const handle = try attachment.sendTracked("Thinking", &.{});
+    try attachment.edit(handle, "Writing");
+    // The first edit is in flight, and its reply waits.
+    _ = try server.waitForRequest("/editMessageText", 0);
+    try attachment.send("answer", &.{});
+    try attachment.edit(handle, "Tools: 0 calls");
+    _ = try server.waitForRequest("/editMessageText", 1);
+    try server.finish();
+    var order: [4][]const u8 = undefined;
+    var count: usize = 0;
+    for (server.requests.items) |request| {
+        if (std.mem.endsWith(u8, request.path, "/getUpdates")) continue;
+        if (std.mem.endsWith(u8, request.path, "/deleteWebhook")) continue;
+        order[count] = request.body;
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 4), count);
+    try std.testing.expect(std.mem.indexOf(u8, order[0], "\"text\":\"Thinking\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, order[1], "\"text\":\"Writing\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, order[2], "\"text\":\"answer\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, order[3], "\"text\":\"Tools: 0 calls\"") != null);
+}
+
+// A slot with a send or an edit still waiting stays with its message, however
+// many tracked sends follow. The summary of a turn then reaches its activity
+// message after a fast run of later turns.
+test "a tracked message with pending work keeps its slot through later tracked sends" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const later_sends = 12;
+    var replies: [later_sends + 1]testing.Reply = undefined;
+    replies[0] = .{ .body = "{\"ok\":true,\"result\":{\"message_id\":314}}", .delay_ms = 100 };
+    for (replies[1..]) |*reply| reply.* = .{ .body = ok_sent };
+    var server = try testing.Server.init(gpa, io, &quiet_scripts ++ [_]testing.Script{
+        .{ .method = "sendMessage", .replies = &replies },
+        .{ .method = "editMessageText", .replies = &.{.{ .body = ok_true }} },
+    });
+    defer server.deinit();
+    try server.start();
+    var collector: Collector = .{ .gpa = gpa, .io = io };
+    defer collector.deinit();
+    var url_buffer: [64]u8 = undefined;
+    const attachment = try testAttachment(gpa, io, &server, &url_buffer, &collector);
+    defer attachment.destroy();
+    try attachment.start();
+
+    const first = try attachment.sendTracked("Thinking", &.{});
+    try attachment.edit(first, "Tools: 0 calls");
+    for (0..later_sends) |_| _ = try attachment.sendTracked("Thinking", &.{});
+    const summary = try server.waitForRequest("/editMessageText", 0);
+    try std.testing.expectEqualStrings(
+        "{\"chat_id\":99,\"message_id\":314,\"text\":\"Tools: 0 calls\"}",
+        summary,
+    );
+    try server.finish();
+}
+
+// An edit can name a message whose send Telegram refused, so no id exists for
+// it. The edit drops in silence, because the report of the send already told the
+// owner, and the item behind it still goes out.
+test "an edit of a message that never went out drops" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var server = try testing.Server.init(gpa, io, &quiet_scripts ++ [_]testing.Script{
+        .{ .method = "sendMessage", .replies = &.{
+            .{ .status = 400, .body = "{\"ok\":false,\"error_code\":400,\"description\":\"Bad Request: message text is empty\"}" },
+        } },
+        .{ .method = "setMessageReaction", .replies = &.{.{ .body = ok_true }} },
+    });
+    defer server.deinit();
+    try server.start();
+    var collector: Collector = .{ .gpa = gpa, .io = io };
+    defer collector.deinit();
+    var url_buffer: [64]u8 = undefined;
+    const attachment = try testAttachment(gpa, io, &server, &url_buffer, &collector);
+    defer attachment.destroy();
+    try attachment.start();
+
+    const handle = try attachment.sendTracked("", &.{});
+    try attachment.edit(handle, "Writing");
+    try attachment.react(7, .seen);
+    try collector.waitFor(1);
+    try server.finish();
+    try std.testing.expectEqual(Event.Rejected.Kind.message, collector.events.items[0].payload.send_rejected.kind);
+    var reactions: usize = 0;
+    for (server.requests.items) |request| {
+        try std.testing.expect(!std.mem.endsWith(u8, request.path, "/editMessageText"));
+        if (!std.mem.endsWith(u8, request.path, "/setMessageReaction")) continue;
+        reactions += 1;
+        try std.testing.expectEqualStrings(
+            "{\"chat_id\":99,\"message_id\":7,\"reaction\":[{\"type\":\"emoji\",\"emoji\":\"👀\"}]}",
+            request.body,
+        );
+    }
+    try std.testing.expectEqual(@as(usize, 1), reactions);
 }
 
 test "a 403 on a send detaches" {
@@ -1050,6 +1581,8 @@ test "an abort ends the drain at once and sends no final message" {
     try attachment.send("in flight", &.{});
     try attachment.send("queued", &.{});
     try server.waitForSends(1);
+    // The poller made its scripted calls, so the abort cannot leave one unmade.
+    _ = try server.waitForRequest("/getUpdates", 0);
 
     try attachment.close("final");
     const started_ms = std.Io.Timestamp.now(io, .awake).toMilliseconds();

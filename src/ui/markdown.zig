@@ -24,17 +24,20 @@ const rule_cells = rule_cell ** rule_columns;
 
 /// One span's look: the element role a reasoning tint replaces, plus the
 /// attributes that survive it. A span with no role of its own takes `text`, the
-/// role of reply text. `url` makes the span a terminal hyperlink.
-const Look = struct {
+/// role of reply text. `url` makes the span a terminal hyperlink. `code` marks
+/// an inline code span, so a renderer without roles still knows one.
+pub const Look = struct {
     role: ?role.Name = null,
     url: []const u8 = "",
     bold: bool = false,
     italic: bool = false,
     underline: bool = false,
     strike: bool = false,
+    code: bool = false,
 };
 
 const accent_look: Look = .{ .role = .accent };
+const inline_code_look: Look = .{ .role = .accent, .code = true };
 const code_look: Look = .{ .role = .code };
 const heading_look: Look = .{ .role = .heading };
 const muted_look: Look = .{ .role = .muted };
@@ -195,11 +198,13 @@ const Painter = struct {
     }
 };
 
-const Fence = struct {
+/// A fenced code block: the byte of its fence and the length that closes it.
+pub const Fence = struct {
     marker: u8,
     length: usize,
 
-    fn open(line: []const u8) ?Fence {
+    /// The fence that `line` opens, or null for a line that opens none.
+    pub fn open(line: []const u8) ?Fence {
         if (line.len < 3) return null;
         const marker = line[0];
         if (marker != '`' and marker != '~') return null;
@@ -209,7 +214,8 @@ const Fence = struct {
         return .{ .marker = marker, .length = length };
     }
 
-    fn closes(self: Fence, line: []const u8) bool {
+    /// Whether `line` closes this fence.
+    pub fn closes(self: Fence, line: []const u8) bool {
         if (line.len < self.length or line[0] != self.marker) return false;
         const length = markerLength(line, self.marker);
         return length >= self.length and isBlank(line[length..]);
@@ -233,13 +239,13 @@ fn isEscaped(text: []const u8, index: usize) bool {
 /// each column gets after the fit to the window, and the blanks that hold the
 /// grid at the indentation of its source. Every row must open with a pipe, and
 /// the alignment colons of the delimiter row parse but do not align.
-const Table = struct {
+pub const Table = struct {
     count: usize,
     widths: [count_max]usize,
     indent: []const u8,
 
     /// Columns a grid can hold. A wider header is no table at all.
-    const count_max = 16;
+    pub const count_max = 16;
 
     /// What `detect` reads: the header line, the source that follows it (the
     /// delimiter row first), the window, and the spaces the header indents by.
@@ -259,11 +265,11 @@ const Table = struct {
 
     /// One row's cells: the outer pipes stripped and every cell trimmed. The
     /// measure pass and the paint share it, so their cells cannot diverge.
-    const Cells = struct {
+    pub const Cells = struct {
         rest: []const u8,
         done: bool = false,
 
-        fn init(row: []const u8) Cells {
+        pub fn init(row: []const u8) Cells {
             var body = std.mem.trim(u8, row, " \t\r");
             if (body.len > 0 and body[0] == '|') body = body[1..];
             if (body.len > 0 and body[body.len - 1] == '|' and !isEscaped(body, body.len - 1)) {
@@ -272,7 +278,7 @@ const Table = struct {
             return .{ .rest = body };
         }
 
-        fn next(self: *Cells) ?[]const u8 {
+        pub fn next(self: *Cells) ?[]const u8 {
             if (self.done) return null;
             var search_from: usize = 0;
             while (std.mem.indexOfScalarPos(u8, self.rest, search_from, '|')) |pipe| {
@@ -459,14 +465,14 @@ const Table = struct {
     }
 
     /// A line whose first byte after the indentation is a pipe.
-    fn isRow(line: []const u8) bool {
+    pub fn isRow(line: []const u8) bool {
         const body = line[leading(line)..];
         return body.len > 0 and body[0] == '|';
     }
 
     /// The `| --- | :-: |` row under a header: dashes with optional alignment
     /// colons in every cell.
-    fn isDelimiter(line: []const u8) bool {
+    pub fn isDelimiter(line: []const u8) bool {
         if (!isRow(line)) return false;
         var cells = Cells.init(line);
         while (cells.next()) |cell| {
@@ -479,7 +485,7 @@ const Table = struct {
         return true;
     }
 
-    fn cellCount(row: []const u8) usize {
+    pub fn cellCount(row: []const u8) usize {
         var cells = Cells.init(row);
         var count: usize = 0;
         while (cells.next() != null) count += 1;
@@ -1016,8 +1022,10 @@ const Link = struct { label: Closer = .{ .byte = ']' }, url: Closer = .{ .byte =
 /// `next` yields one styled span at a time. A run that holds markers of its
 /// own opens a scope, so `**_both_**` sheds both pairs. A marker whose closer
 /// has not streamed in yet stays literal. `Table.CellFlow` pulls the spans one
-/// line at a time, so a wrapped cell resumes where its last line ended.
-const InlineScanner = struct {
+/// line at a time, so a wrapped cell resumes where its last line ended. The
+/// Telegram renderer of the remote reads the same spans, so both renderers
+/// agree on what a marker means.
+pub const InlineScanner = struct {
     text: []const u8,
     base: Look,
     look: Look,
@@ -1036,15 +1044,16 @@ const InlineScanner = struct {
     queue_len: usize = 0,
     queue_head: usize = 0,
 
-    const Context = enum { block, table };
-    const Span = struct { look: Look, bytes: []const u8 };
+    /// Where the text stands. A table cell unescapes a pipe, a block never does.
+    pub const Context = enum { block, table };
+    pub const Span = struct { look: Look, bytes: []const u8 };
 
-    fn init(base: Look, text: []const u8, context: Context) InlineScanner {
+    pub fn init(base: Look, text: []const u8, context: Context) InlineScanner {
         return .{ .text = text, .base = base, .look = base, .context = context };
     }
 
     /// The next non-empty span, or null once the scan consumed `text`.
-    fn next(self: *InlineScanner) ?Span {
+    pub fn next(self: *InlineScanner) ?Span {
         // Bounded: every queued span pops once, and every `step` advances the
         // bounded scan.
         while (true) {
@@ -1179,7 +1188,7 @@ fn runAt(text: []const u8, index: usize, link: *Link) ?Run {
         const close = std.mem.indexOfScalarPos(u8, text, index + 1, '`') orelse return null;
         if (close == index + 1) return null;
         return .{
-            .look = accent_look,
+            .look = inline_code_look,
             .start = index + 1,
             .end = close,
             .after = close + 1,
@@ -1352,15 +1361,16 @@ fn merged(base: Look, over: Look) Look {
         .italic = base.italic or over.italic,
         .underline = base.underline or over.underline,
         .strike = base.strike or over.strike,
+        .code = base.code or over.code,
     };
 }
 
 /// The list marker at the head of `rest`: the bytes it spans in the source and
 /// what to draw. A bullet draws a normalized `- `. An ordered item draws the
 /// source digits, so a list numbered from anything but one keeps its numbering.
-const Marker = struct { source: usize, shown: []const u8 };
+pub const Marker = struct { source: usize, shown: []const u8 };
 
-fn listMarker(rest: []const u8) ?Marker {
+pub fn listMarker(rest: []const u8) ?Marker {
     if ((rest[0] == '-' or rest[0] == '*' or rest[0] == '+') and
         (rest.len == 1 or rest[1] == ' '))
     {
@@ -1376,7 +1386,7 @@ fn listMarker(rest: []const u8) ?Marker {
 }
 
 /// The `[ ] ` or `[x] ` checkbox that opens a task item's body.
-fn taskBox(body: []const u8) ?[]const u8 {
+pub fn taskBox(body: []const u8) ?[]const u8 {
     if (body.len < 3 or body[0] != '[' or body[2] != ']') return null;
     if (body[1] != ' ' and body[1] != 'x' and body[1] != 'X') return null;
     if (body.len > 3 and body[3] != ' ') return null;
@@ -1384,7 +1394,7 @@ fn taskBox(body: []const u8) ?[]const u8 {
 }
 
 /// The heading level `rest` opens with, or null when it opens none.
-fn headingLevel(rest: []const u8) ?usize {
+pub fn headingLevel(rest: []const u8) ?usize {
     var level: usize = 0;
     while (level < rest.len and rest[level] == '#') level += 1;
     if (level == 0 or level > 6) return null;
@@ -1393,7 +1403,7 @@ fn headingLevel(rest: []const u8) ?usize {
 }
 
 /// A `---`, `***`, or `___` rule: three or more of one mark and nothing else.
-fn isRule(rest: []const u8) bool {
+pub fn isRule(rest: []const u8) bool {
     const trimmed = std.mem.trimEnd(u8, rest, " \t\r");
     if (trimmed.len < 3) return false;
     const mark = trimmed[0];
@@ -1402,7 +1412,7 @@ fn isRule(rest: []const u8) bool {
     return true;
 }
 
-fn isBlank(line: []const u8) bool {
+pub fn isBlank(line: []const u8) bool {
     return std.mem.trim(u8, line, " \t\r").len == 0;
 }
 
@@ -1414,7 +1424,8 @@ fn isSpace(byte: u8) bool {
     return byte == ' ' or byte == '\t' or byte == '\r';
 }
 
-fn leading(line: []const u8) usize {
+/// The blanks `line` opens with.
+pub fn leading(line: []const u8) usize {
     var index: usize = 0;
     while (index < line.len and line[index] == ' ') index += 1;
     return index;

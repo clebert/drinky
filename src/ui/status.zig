@@ -361,6 +361,17 @@ pub fn writeSummary(out: *std.Io.Writer, info: *const Info) !void {
     try out.writeAll(line.text());
 }
 
+/// Write the two session numbers as one fragment for a reader with no column
+/// budget: the context share in its short form, then the cost. The summary of
+/// a turn in a remote chat takes them, so it reads like the status line.
+pub fn writeNumbers(out: *std.Io.Writer, info: *const Info) !void {
+    var scratch: [128]u8 = undefined;
+    var line: Line = .init(&scratch);
+    try writeContext(&line, info, .short);
+    try writeCost(&line, info);
+    try out.writeAll(line.text());
+}
+
 /// The agent: `model (account) · Effort: level`, or the signed-out indicator.
 /// Each part carries its own label, so a part that goes away never leaves a bare
 /// value behind. The model and the effort level are the two settings the user
@@ -412,13 +423,7 @@ fn writeLeft(line: *Line, info: *const Info, parts: *const Parts) !void {
         try line.out.writeAll(separator);
     }
     try writeContext(line, info, parts.context);
-    if (parts.cost) {
-        // The cost is an estimate at public rates, so the tilde marks it: the
-        // login type does not reveal the billing, a subscription pays none of
-        // it, and a reply that Drinky could not price counts nothing. Every
-        // cost figure of Drinky takes this one mark.
-        try line.out.print("{s}Cost: ~${d:.2}", .{ separator, info.cost });
-    }
+    if (parts.cost) try writeCost(line, info);
     // The quota and the cache rate each measure one request, so they belong to
     // a running turn alone. A spent OpenAI subscription still names its plan and
     // its wait in the failure message of the turn.
@@ -548,6 +553,14 @@ fn writeContext(line: *Line, info: *const Info, form: Parts.Context) !void {
         try line.out.writeByte(')');
     }
     line.mark(start, pressureRole(info.gauge, shown));
+}
+
+/// The session cost behind its separator. The cost is an estimate at public
+/// rates, so the tilde marks it: the login type does not reveal the billing, a
+/// subscription pays none of it, and a reply that Drinky could not price counts
+/// nothing. Every cost figure of Drinky takes this one mark.
+fn writeCost(line: *Line, info: *const Info) !void {
+    try line.out.print("{s}Cost: ~${d:.2}", .{ separator, info.cost });
 }
 
 /// The last request's cache hit rate over the whole prompt. An all-zero prompt
@@ -715,6 +728,22 @@ test "the summary states the place, the gauge, and the agent in the order of the
             "Effort: xhigh",
         &empty,
     );
+}
+
+// The numbers of a turn summary take the text of the line, so a reader of the
+// chat and a reader of the terminal see one gauge.
+test "the numbers state the gauge in its short form and the cost" {
+    var buffer: [128]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&buffer);
+    try writeNumbers(&out, &test_info);
+    try std.testing.expectEqualStrings("Context: 21% · Cost: ~$0.39", out.buffered());
+
+    var unknown = test_info;
+    unknown.context_tokens = null;
+    unknown.cost = 0;
+    out = .fixed(&buffer);
+    try writeNumbers(&out, &unknown);
+    try std.testing.expectEqualStrings("Context: Unknown · Cost: ~$0.00", out.buffered());
 }
 
 fn renderForTest(

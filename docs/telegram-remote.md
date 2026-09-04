@@ -36,9 +36,9 @@ because the tests and `FEATURES.md` then define the behavior, and the Git histor
 - The attach takes the state the same way. A retry that waits at the attach sends its `Failed turn`
   message to the chat, and the editor shows the attach caption alone.
 - A credential rejection during a turn detaches with its `Error:` event, and the login picker opens
-  in the terminal as today, over the locked editor. The detach comes before the failure settles,
-  so the uncommitted Telegram messages of that turn return to the editor under the picker. A picker
-  and a page take their keys under any input owner, so the user answers the picker while the last
+  in the terminal as today, over the locked editor. The detach comes before the failure settles, so
+  the uncommitted Telegram messages of that turn return to the editor under the picker. A picker and
+  a page take their keys under any input owner, so the user answers the picker while the last
   message goes out. The chat cannot repair that state, because `/login` is terminal-only, and it
   learns why from the last message.
 - The editor is empty at the attach, because the `/remote` line was its last content.
@@ -127,8 +127,9 @@ because the tests and `FEATURES.md` then define the behavior, and the Git histor
   for the entity parse sends the same block again as plain text without a parse mode, so the ordered
   queue never stalls on one block. Any other 4xx on the poll detaches with an `Error:` event,
   because a repeat of the same request cannot succeed.
-- An event that a mirror send caused stays in the terminal. The mirror records it and moves its
-  cursor past it in one step, so no block needs a mark and a failure cannot feed itself.
+- An event that a mirror send caused stays in the terminal. Its block carries a flag that the mirror
+  reads, because a deferred event lands at an index the mirror cannot know in advance, and a failure
+  cannot feed itself.
 - A `401 Unauthorized` on any call while attached or during a pairing means a revoked token. It
   detaches at once with an `Error:` event that names `Remove a bot` as the repair. A `403 Forbidden`
   means that the user blocked the bot, and it detaches the same way, because the chat is closed.
@@ -364,6 +365,13 @@ the terminal notice above in this phase. The store keys a bot by its id.
 - The reply to a non-text update.
 
 ### Phase 2: Mirror
+
+This phase landed. Three decisions moved: an event block carries a `mirrored` flag, because an event
+that arrives while a reply streams waits for the next message boundary, so its index is unknown
+until it lands and the cursor cannot skip it in one step. Only a message that runs or queues gets
+👀, because a refused message gets its reply and no receipt settles it. The attach event goes to the
+chat at once and lands in the transcript with the flag off, so a mid-turn attach opens the chat
+without a wait. The summary takes the `Cost:` label of the status line.
 
 - The client methods `editMessageText` and `setMessageReaction`.
 - The mirror cursor: the answer blocks, the events, the skill head line, and the retry attempt line,

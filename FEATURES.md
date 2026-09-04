@@ -458,7 +458,20 @@ Gemini on Google Vertex AI through a service account key file.
   while the session is signed out or has no model.
 - A photo, a sticker, or a voice note gets one reply: `Drinky reads text alone.`
 - The attach removes an active webhook, confirms every update from before it, and ignores every chat
-  but the paired one. Every message goes out silent.
+  but the paired one.
+- The chat mirrors every committed answer, event, skill head line, and retry line once. The Telegram
+  HTML holds bold, italic, code, links, quotes, and `pre` blocks for fences and tables. A reasoning
+  block, a tool box, and a user box stay in the terminal.
+- A block above 4096 characters continues in a new message that reopens the open tags. A text that
+  Telegram cannot parse goes again as plain text.
+- One activity message per turn shows `Thinking`, `Writing`, or `Running: bash` with the call count.
+  At the end it becomes the summary: the outcome, the tool count, the time, the context gauge, and
+  the cost.
+- Every message goes out silent except the last message of a completed or failed turn, so the chat
+  notifies once per turn.
+- A Telegram message that runs or queues gets 👀. At the receipt of the turn a committed message
+  gets 👍 and a dropped one 👎. A frozen chat keeps its last marks.
+- An event that a send to the chat caused stays in the terminal, so a failure cannot feed itself.
 - The long poll keeps its own head window, so a short configured request timeout never turns it into
   a busy poll.
 - A failed poll or send retries with a backoff and records one `Error:` event at the first failure

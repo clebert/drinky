@@ -202,11 +202,11 @@ pub fn projectionChanges(self: *const Transcript, previous: Setup, next: Setup) 
     return false;
 }
 
-/// Remove every block that `account` produced, and report whether one left. A
+/// Remove every block that `account` produced, and return how many left. A
 /// credential replacement drops the replay proofs of that account slot for good,
 /// so the blocks that hold that reasoning go with them. This ends the open
 /// message, because a removal moves the blocks behind it.
-pub fn dropAccount(self: *Transcript, account: ai.llm.Account) bool {
+pub fn dropAccount(self: *Transcript, account: ai.llm.Account) usize {
     self.endMessage();
     var retained_count: usize = 0;
     for (self.entries.items) |*entry| {
@@ -217,7 +217,7 @@ pub fn dropAccount(self: *Transcript, account: ai.llm.Account) bool {
         self.entries.items[retained_count] = entry.*;
         retained_count += 1;
     }
-    const removed = retained_count != self.entries.items.len;
+    const removed = self.entries.items.len - retained_count;
     self.entries.shrinkRetainingCapacity(retained_count);
     return removed;
 }
@@ -460,7 +460,7 @@ test "dropAccount removes the reasoning of one account for good" {
     try transcript.appendStream(.model, null, "answer");
     try transcript.appendStream(.thinking, other_account, "another slot");
 
-    try std.testing.expect(transcript.dropAccount(test_account));
+    try std.testing.expectEqual(@as(usize, 1), transcript.dropAccount(test_account));
     try std.testing.expectEqual(@as(usize, 2), transcript.blocks().len);
     try std.testing.expectEqualStrings("answer", transcript.blocks()[0].content.model.items);
     const reasoning = transcript.blocks()[1].content.thinking;
@@ -470,6 +470,6 @@ test "dropAccount removes the reasoning of one account for good" {
     const own = try transcript.projection(replaying(test_account));
     try std.testing.expectEqual(@as(usize, 1), own.len);
     // A slot that produced no block leaves the record as it is.
-    try std.testing.expect(!transcript.dropAccount(.anthropic_console));
+    try std.testing.expectEqual(@as(usize, 0), transcript.dropAccount(.anthropic_console));
     try std.testing.expectEqual(@as(usize, 2), transcript.blocks().len);
 }
