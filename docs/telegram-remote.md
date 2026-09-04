@@ -79,6 +79,15 @@ because the tests and `FEATURES.md` then define the behavior, and the Git histor
   `O`, `1`, `I`, and `L`. Three wrong codes from any private chat end the pairing with an `Error:`
   event, because the bot name is public.
 - A saved bot with a chat id attaches without a pairing.
+- The attach event names the bot and the state of the session: the place, the context gauge, the
+  model with its account, and the effort. It takes the words and the order of the status line:
+  `Remote: @bot · ~/work/drinky (main) · Context: 45% · claude-opus-4-8 (Anthropic Subscription) · Effort: high`.
+  The place takes its full form, because the phone has no column budget. The phone chat keeps the
+  messages of every earlier attach. This one line tells the user the place of the session and
+  whether it holds a conversation. An empty conversation reads `Context: 0%`, and the gauge takes
+  the other forms of the status line, `Context: Unknown` and `Context: 206k`. A signed-out session
+  reads `Account: Signed out` in place of the model, the account, and the effort. A missing model
+  reads `No model` in place of the model.
 - The bound chat id gates every update. An update from another chat drops in silence.
 - At the attach Drinky confirms the updates from before that moment with `offset=-1` and sends no
   reply.
@@ -116,13 +125,24 @@ because the tests and `FEATURES.md` then define the behavior, and the Git histor
   skill, and the line of a retry attempt go out. Its own messages already stand in the chat, and the
   terminal sends none while attached.
 - The mirror starts at the attach event, so the history before it stays in the terminal, and the
-  attach event is the first message of the mirror. `/new` clears the transcript, and the mirror
-  starts over at the `New conversation` event.
+  attach event is the first message of the mirror. Its session state stands in the chat before the
+  first turn. `/new` clears the transcript, and the mirror starts over at the `New conversation`
+  event.
 - An answer block goes out when it commits, as one message with the formatted text. Nothing streams
   to the phone, and a canceled block never reaches it.
-- A block above 4096 characters continues in a new message. The split falls on a paragraph boundary,
-  else on a line, else on a character. Telegram counts the limit after the entity parse, so the HTML
-  tags are free.
+- A block above 4096 characters continues in a new message. The split works on the rendered HTML,
+  never on the Markdown source, so every part parses on its own. It falls between two top-level
+  elements, else on a line, else on a character inside a text node, never inside a tag or a
+  character reference like `&amp;`. A part closes every open tag at its end, and the next part opens
+  them again, so a code block continues as a code block. Telegram counts the limit after the entity
+  parse, so the tags are free.
+- Every message goes out with `disable_notification`, except the last message that the mirror sends
+  at the end of a completed or failed turn. The phone rings once per turn, for the final answer
+  block or the `Error:` event. The last answer block closes at the receipt of the turn, so the
+  mirror sends it and sees the turn end in one step. A canceled turn ends in silence, because the
+  phone canceled it. An edit never notifies, so the summary is silent. A completed turn whose last
+  round holds no text sends no last message, so it ends in silence too. Such a turn is rare, and the
+  summary still shows its end.
 - An event goes as one message with its `Event:` or `Error:` label. A model, effort, or account
   change is such an event, so the phone learns each setting change from it. The skill head line
   `Skill: name · File: path` goes as one italic message.
@@ -198,6 +218,7 @@ because the tests and `FEATURES.md` then define the behavior, and the Git histor
   bytes fails the same way.
 - A message holds 4096 characters after the entity parse. The chat allows about one message or edit
   per second, and a 429 answer carries `retry_after` in seconds.
+- A message with `disable_notification` arrives without a sound, and an edit never notifies.
 - `editMessageText` fails with `message is not modified` on an identical edit, and the client treats
   that answer as success.
 - `callback_data` holds at most 64 bytes. Every `callback_query` needs an `answerCallbackQuery`, and
@@ -274,7 +295,7 @@ because the tests and `FEATURES.md` then define the behavior, and the Git histor
   rule, and the detach on a 401, a 403, and a 409.
 - The detach on a credential rejection.
 - The attach state: the inactive editor with its caption, the Enter notice, the detach on every exit
-  key, and the attach and detach events.
+  key, the attach event with the session state, and the detach event.
 - The exit that detaches first, cancels the poll, and drains the send queue within a bound.
 - A phone message runs as a prompt, and its refusals reach the phone as replies. Every command line
   from the phone refuses with a notice in this phase.
@@ -286,11 +307,12 @@ because the tests and `FEATURES.md` then define the behavior, and the Git histor
 
 - The client methods `editMessageText` and `setMessageReaction`.
 - The mirror cursor: the answer blocks, the events, the skill head line, and the retry attempt line,
-  as plain text with the split above 4096 characters.
+  as plain text with the split above 4096 characters, silent except the last message of a completed
+  or failed turn.
 - The activity message with the state, the call count, and the summary at the end.
 - The 👀, 👍, and 👎 reactions on phone messages, split by the receipt of the turn.
-- As the last step, the HTML renderer over the Markdown parser and the plain-text resend after an
-  entity parse failure, with their own tests.
+- As the last step, the HTML renderer over the Markdown parser, the split that closes and reopens
+  the open tags, and the plain-text resend after an entity parse failure, with their own tests.
 
 ### Phase 3: Phone input
 
