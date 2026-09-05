@@ -8,6 +8,9 @@
 //! keyboard takes a fresh serial, so a tap on a step that an edit replaced, on
 //! a picker that a newer one made stale, or on a picker the chat closed names a
 //! serial the picker no longer holds, and the owner answers it as stale.
+//!
+//! The message of the picker is scaffolding: it leaves the chat when the picker
+//! ends, so the result of the command stands in the chat once.
 
 const std = @import("std");
 
@@ -224,15 +227,17 @@ pub fn openers(self: *const Picker) []const ai.command.Outcome.Opener {
     return open.trail[0..open.trail_len];
 }
 
-/// End the open picker: its message states `text` and loses its keyboard.
-pub fn finish(self: *Picker, chat: anytype, text: []const u8) !void {
+/// End the open picker: its message leaves the chat. The message is the
+/// scaffolding of the list alone, so the event of the command, or the toast of
+/// the tap, states the result without a second line beside it.
+pub fn dismiss(self: *Picker, chat: anytype) !void {
     const open = self.open orelse return;
     defer self.close();
     const handle = open.handle orelse return;
-    try chat.edit(handle, text, null);
+    try chat.delete(handle);
 }
 
-/// Forget the open picker without an edit. Its keyboard stays in the chat
+/// Forget the open picker without a deletion. Its keyboard stays in the chat
 /// history, and a tap on it answers as stale.
 pub fn close(self: *Picker) void {
     const open = self.open orelse return;
@@ -286,11 +291,12 @@ fn dataOf(gpa: std.mem.Allocator, tap: keyboard.Tap) ![]u8 {
 }
 
 /// The chat of the tests: it records every send and every edit with the
-/// keyboard of each.
+/// keyboard of each, and every deletion.
 const Recorder = struct {
     gpa: std.mem.Allocator,
     sends: std.ArrayList(Message) = .empty,
     edits: std.ArrayList(Message) = .empty,
+    deletions: std.ArrayList(Attachment.Handle) = .empty,
     handle_next: Attachment.Handle = 1,
 
     const Message = struct {
@@ -309,6 +315,7 @@ const Recorder = struct {
         self.sends.deinit(self.gpa);
         for (self.edits.items) |message| message.deinit(self.gpa);
         self.edits.deinit(self.gpa);
+        self.deletions.deinit(self.gpa);
     }
 
     fn sendTracked(
@@ -329,6 +336,10 @@ const Recorder = struct {
         markup: ?[]const u8,
     ) !void {
         try self.edits.append(self.gpa, try self.record(handle, text, markup));
+    }
+
+    fn delete(self: *Recorder, handle: Attachment.Handle) !void {
+        try self.deletions.append(self.gpa, handle);
     }
 
     fn record(
@@ -407,11 +418,12 @@ test "a picker shows its rows as buttons with the current mark and a cancel, and
     try std.testing.expect(picker.resolve(.{ .close = 1 }).? == .close);
     try std.testing.expectEqualStrings("You canceled the effort selection.", picker.cancellationMessage());
 
-    try picker.finish(&chat, "Drinky set the effort level to low.");
+    // The message of the list goes at the end, so the event of the command
+    // states the result alone.
+    try picker.dismiss(&chat);
     try std.testing.expect(!picker.isOpen());
-    try std.testing.expectEqual(@as(?Attachment.Handle, 1), chat.lastEdit().handle);
-    try std.testing.expectEqualStrings("Drinky set the effort level to low.", chat.lastEdit().text);
-    try std.testing.expect(chat.lastEdit().markup == null);
+    try std.testing.expectEqual(@as(usize, 0), chat.edits.items.len);
+    try std.testing.expectEqualSlices(Attachment.Handle, &.{1}, chat.deletions.items);
     try std.testing.expect(picker.resolve(.{ .close = 1 }) == null);
 }
 
@@ -449,7 +461,7 @@ test "a step edits the same message, adds the back button, and a back takes the 
     try std.testing.expect(picker.resolve(.{ .back = 4 }) == null);
 }
 
-test "a newer picker makes the older one stale, and a close forgets the picker without an edit" {
+test "a newer picker makes the older one stale, and a close forgets the picker without a deletion" {
     const gpa = std.testing.allocator;
     var chat: Recorder = .{ .gpa = gpa };
     defer chat.deinit();
@@ -466,9 +478,9 @@ test "a newer picker makes the older one stale, and a close forgets the picker w
     picker.close();
     try std.testing.expect(!picker.isOpen());
     try std.testing.expect(picker.resolve(.{ .close = 2 }) == null);
-    // A closed picker takes no edit.
-    try picker.finish(&chat, "late");
-    try std.testing.expectEqual(@as(usize, 0), chat.edits.items.len);
+    // A closed picker deletes nothing.
+    try picker.dismiss(&chat);
+    try std.testing.expectEqual(@as(usize, 0), chat.deletions.items.len);
 }
 
 // A stale keyboard stays in the chat history, and a later process starts its

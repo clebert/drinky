@@ -184,6 +184,14 @@ steering_retained_count: usize,
 /// and the source of it on consumption). The count is cumulative, so a delayed
 /// consumed event does not double-count drafts a Ctrl+P already hid.
 steering_consumed_count: usize,
+/// Leading drafts that committed history holds (≤ `steering_consumed_count`).
+/// A consumed batch commits with the round that follows it, so its message can
+/// take the mark of a committed message before the receipt of the turn.
+steering_committed_count: usize,
+/// The consumed batch that waits for its checkpoint, or null. The agent holds
+/// one such batch at a time, because it commits the batch before it takes the
+/// next one.
+steering_uncommitted: ?UncommittedSteering,
 /// The submitted prompt, retained while a turn is live. A failed or canceled
 /// turn that committed nothing returns it to the editor, under the same rule as
 /// a queued message. Every other terminal frees it because the prompt belongs
@@ -443,6 +451,16 @@ pub const AsyncEventOptions = struct {
     mirrored: bool = true,
 };
 
+/// One consumed steering batch that waits for the round that commits it.
+pub const UncommittedSteering = struct {
+    /// The progress sequence of the event that reported the batch. The
+    /// checkpoint of the worker passes it once the batch belongs to history.
+    sequence: u64,
+    /// The consumed frontier that this batch reached, which the commit hands to
+    /// `steering_committed_count`.
+    consumed_count: usize,
+};
+
 /// What the live tail of a turn shows, for a mirror of the transcript that
 /// reads no streaming event.
 pub const LiveTail = struct {
@@ -620,6 +638,8 @@ pub fn init(
         .pending_events = .empty,
         .steering_retained_count = 0,
         .steering_consumed_count = 0,
+        .steering_committed_count = 0,
+        .steering_uncommitted = null,
         .turn_prompt = null,
         .retry_shown = false,
         .input = .{},
@@ -844,6 +864,7 @@ pub fn applyTurnEvent(self: *Session, event: *const TurnEvent) !bool {
             self.transcript.endMessage();
             turn.transcript_checkpoint = self.transcript.blocks().len;
             turn.progress_sequence_checkpoint = event.progress_sequence_committed;
+            self.commitSteering(event.progress_sequence_committed);
         }
     }
     self.dirty = true;
@@ -918,6 +939,12 @@ pub fn applyTurnEvent(self: *Session, event: *const TurnEvent) !bool {
                 @min(self.steering_consumed_count + consumed.count, self.steering.items.len);
             self.steering_retained_count =
                 @max(self.steering_retained_count, self.steering_consumed_count);
+            // The round that follows this batch commits it, so the batch waits
+            // for the checkpoint that passes this event.
+            self.steering_uncommitted = .{
+                .sequence = event.progress_sequence,
+                .consumed_count = self.steering_consumed_count,
+            };
         },
         .skill_loaded => |loaded| {
             // The head reads like the head of a `/skill:name` line and takes no
@@ -1061,18 +1088,17 @@ pub fn recordAsyncEvent(
 }
 
 /// Append one event of a task. It survives a rewind, because it reports the state
-/// of the session and not the turn that a failure undoes. The caller frees the
-/// content.
+/// of the session and not the turn that a failure undoes. The same terminal event
+/// again, with no block between the two, counts in the block it repeats. The
+/// caller frees the content.
 fn appendAsyncEvent(self: *Session, pending: *const PendingEvent) !void {
-    try self.transcript.append(
-        .event,
-        .{
-            .is_error = pending.message.severity == .failure,
-            .survives_rewind = true,
-            .mirrored = pending.options.mirrored,
-        },
-        pending.message.content,
-    );
+    const options: ui.block.Entry.Options = .{
+        .is_error = pending.message.severity == .failure,
+        .survives_rewind = true,
+        .mirrored = pending.options.mirrored,
+    };
+    if (try self.transcript.repeatEvent(options, pending.message.content)) return;
+    try self.transcript.append(.event, options, pending.message.content);
 }
 
 /// Append every waiting event, once no reply streams. A message that fails to
@@ -1384,6 +1410,7 @@ pub fn recallSteering(self: *Session, pending_count: usize) void {
     self.steering.shrinkRetainingCapacity(pending_start);
     self.steering_retained_count = self.steering.items.len;
     self.steering_consumed_count = @min(self.steering_consumed_count, self.steering.items.len);
+    self.steering_committed_count = @min(self.steering_committed_count, self.steering.items.len);
     self.markEdited();
 }
 
@@ -1476,6 +1503,8 @@ fn clearSteering(self: *Session) void {
     self.steering.clearRetainingCapacity();
     self.steering_retained_count = 0;
     self.steering_consumed_count = 0;
+    self.steering_committed_count = 0;
+    self.steering_uncommitted = null;
     self.dirty = true;
 }
 
@@ -1504,6 +1533,26 @@ pub fn beginTurn(self: *Session, generation: u64) void {
         .box_view = .empty,
     } };
     self.dirty = true;
+}
+
+/// Commit the waiting steering batch, once the checkpoint of the worker reached
+/// `sequence`. Its messages then belong to history, and a source that marks its
+/// messages can mark them.
+fn commitSteering(self: *Session, sequence: u64) void {
+    const uncommitted = self.steering_uncommitted orelse return;
+    if (uncommitted.sequence > sequence) return;
+    self.steering_uncommitted = null;
+    self.steering_committed_count = @min(uncommitted.consumed_count, self.steering.items.len);
+}
+
+/// Whether the running turn committed a round already, so its prompt belongs to
+/// history. Between two turns it states false.
+pub fn turnCommitted(self: *const Session) bool {
+    const turn = switch (self.mode) {
+        .turn => |*turn| turn,
+        else => return false,
+    };
+    return turn.progress_sequence_checkpoint > 0;
 }
 
 /// The count of leading transcript blocks that are committed. A turn commits a
@@ -1608,6 +1657,8 @@ fn applyReceiptNormal(self: *Session, receipt: *const ai.Agent.Receipt) void {
     self.dropSteeringPrefix(receipt.steering_committed_count);
     self.steering_retained_count = 0;
     self.steering_consumed_count = 0;
+    self.steering_committed_count = 0;
+    self.steering_uncommitted = null;
     self.dirty = true;
 }
 
@@ -3196,6 +3247,58 @@ test "steering counts, then a consumed event shows it and clears the count" {
     try std.testing.expectEqual(@as(usize, 0), session.steering.items.len);
 }
 
+// A consumed batch belongs to history once the round behind it commits. The
+// committed frontier of the queue follows that checkpoint, so a source that
+// marks its messages marks them there and not at the receipt of the turn.
+test "the committed steering frontier follows the checkpoint of the worker" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
+    defer session.deinit();
+    session.beginTurn(1);
+    try std.testing.expect(!session.turnCommitted());
+
+    try queueSteeringText(&session, "fix it");
+    try queueSteeringText(&session, "and test");
+    _ = try session.applyTurnEvent(&.{
+        .generation = 1,
+        .progress_sequence = 1,
+        .payload = .{ .steering_consumed = .{
+            .text = try gpa.dupe(u8, "fix it\n\nand test"),
+            .count = 2,
+        } },
+    });
+    // The batch waits for its round, so nothing commits yet.
+    try std.testing.expectEqual(@as(usize, 0), session.steering_committed_count);
+
+    // An event that carries no new frontier leaves the batch where it stands.
+    _ = try session.applyTurnEvent(&.{
+        .generation = 1,
+        .progress_sequence = 2,
+        .progress_sequence_committed = 0,
+        .payload = .{ .text = try gpa.dupe(u8, "partial") },
+    });
+    try std.testing.expectEqual(@as(usize, 0), session.steering_committed_count);
+    try std.testing.expect(!session.turnCommitted());
+
+    // The checkpoint passes the batch, so both messages belong to history.
+    _ = try session.applyTurnEvent(&.{
+        .generation = 1,
+        .progress_sequence = 3,
+        .progress_sequence_committed = 2,
+        .payload = .{ .text = try gpa.dupe(u8, " more") },
+    });
+    try std.testing.expectEqual(@as(usize, 2), session.steering_committed_count);
+    try std.testing.expect(session.turnCommitted());
+    try std.testing.expect(session.steering_uncommitted == null);
+
+    // The receipt resolves the queue, and the frontier starts over with it.
+    try finishTurn(&session, 2);
+    try std.testing.expectEqual(@as(usize, 0), session.steering_committed_count);
+    try std.testing.expect(!session.turnCommitted());
+}
+
 // A genuine user cancel with a committed prefix drops those drafts (they live in
 // history) and restores only the uncommitted suffix to the editor.
 test "cancelReceipt drops the committed prefix and restores the uncommitted suffix" {
@@ -4537,6 +4640,45 @@ test "a conversation clear drops every block and keeps the request setup" {
     try std.testing.expect(std.mem.indexOf(u8, cleared, "weigh it") == null);
     try std.testing.expect(std.mem.indexOf(u8, cleared, "the answer") == null);
     try std.testing.expect(std.mem.indexOf(u8, cleared, "later") == null);
+}
+
+// A task that reports the same line again and again costs one block. The count
+// stands in the text of that block, so the transcript states every occurrence
+// and takes one row for all of them. A mirrored event never repeats, because the
+// mirror sends a block once and a change below its cursor never reaches the
+// chat.
+test "an async event that repeats states its count in the block it repeats" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var session = Session.init(gpa, &out.writer, test_model, .low);
+    defer session.deinit();
+
+    const text = "Drinky could not poll @drinky_bot.";
+    for (0..3) |_| try session.recordAsyncEvent(
+        try ai.command.Outcome.Message.print(gpa, .failure, text, .{}),
+        .{ .mirrored = false },
+    );
+    try std.testing.expectEqual(@as(usize, 1), session.transcript.blocks().len);
+    try std.testing.expectEqualStrings(
+        "Drinky could not poll @drinky_bot. · Repeats: 3",
+        session.transcript.blocks()[0].content.event.text.items,
+    );
+
+    // The same text as a mirrored event opens a block of its own, and the first
+    // block keeps its count. The mirrored event again opens one more.
+    for (0..2) |_| try session.recordAsyncEvent(
+        try ai.command.Outcome.Message.print(gpa, .failure, text, .{}),
+        .{},
+    );
+    const blocks = session.transcript.blocks();
+    try std.testing.expectEqual(@as(usize, 3), blocks.len);
+    try std.testing.expectEqualStrings(
+        "Drinky could not poll @drinky_bot. · Repeats: 3",
+        blocks[0].content.event.text.items,
+    );
+    try std.testing.expectEqualStrings(text, blocks[1].content.event.text.items);
+    try std.testing.expectEqualStrings(text, blocks[2].content.event.text.items);
 }
 
 // A report of a task can arrive while a reply streams. An append then splits the

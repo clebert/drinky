@@ -1,9 +1,13 @@
-//! Telegram HTML from the Markdown of a transcript block, and the split of a
-//! long text into messages. Telegram knows a few inline tags and no block
-//! element, so a heading becomes a bold line, a list keeps its marker as text, a
-//! quote becomes a `blockquote`, and a fence or a table becomes a `pre` block.
-//! The renderer reads the source with the parser of the terminal renderer, so
-//! both agree on what a marker means.
+//! Telegram HTML from the Markdown of a transcript block, the look of a message
+//! that Drinky wrote, and the split of a long text into messages. Telegram knows
+//! a few inline tags and no block element, so a heading becomes a bold line, a
+//! list keeps its marker as text, a quote becomes a `blockquote`, and a fence or
+//! a table becomes a `pre` block. The renderer reads the source with the parser
+//! of the terminal renderer, so both agree on what a marker means.
+//!
+//! `Role` is the one seam from the role of a message that Drinky wrote to its
+//! look in the chat: a quote bar and the symbol of the role. An answer of the
+//! model takes neither, so the chat tells the two apart.
 //!
 //! A message holds at most 4096 characters after the entity parse, so the tags
 //! are free. `Parts` splits the rendered HTML: between two top-level elements,
@@ -16,6 +20,10 @@ const std = @import("std");
 const terminal = @import("terminal");
 
 const ui = @import("../ui/root.zig");
+
+/// The parse mode of every message that Drinky renders here. Telegram parses the
+/// tags of a message under it.
+pub const parse_mode = "HTML";
 
 /// The most characters one message holds after the entity parse. Telegram counts
 /// them in UTF-16 units, so a symbol outside the basic plane counts two.
@@ -111,6 +119,42 @@ pub fn render(out: *std.Io.Writer, text: []const u8) !void {
     }
     if (maybe_fence != null) try out.writeAll("</pre>");
     if (quoting) try out.writeAll("</blockquote>");
+}
+
+/// The look of a message that Drinky wrote about the session, as against an
+/// answer of the model. Each role takes its own symbol, and every one of them
+/// takes the quote bar, so no answer of the model can forge one.
+pub const Role = enum {
+    /// The state of the session.
+    event,
+    /// A failed event.
+    failure,
+    /// A line that Drinky wrote for the user.
+    note,
+
+    fn symbol(self: Role) []const u8 {
+        return switch (self) {
+            .event => "ℹ",
+            .failure => "⚠",
+            .note => "▸",
+        };
+    }
+};
+
+/// Write `text` as one message of Drinky under `role`. The text goes out
+/// escaped, so it carries no markup of its own.
+pub fn wrap(out: *std.Io.Writer, role: Role, text: []const u8) !void {
+    try out.print("<blockquote>{s} ", .{role.symbol()});
+    try escape(out, text);
+    try out.writeAll("</blockquote>");
+}
+
+/// `text` as one message of Drinky under `role`. The result is owned.
+pub fn wrapAlloc(gpa: std.mem.Allocator, role: Role, text: []const u8) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    errdefer out.deinit();
+    try wrap(&out.writer, role, text);
+    return out.toOwnedSlice();
 }
 
 /// Write `text` with the three bytes escaped that Telegram HTML reserves.
@@ -509,6 +553,28 @@ fn expectRender(expected: []const u8, source: []const u8) !void {
     defer out.deinit();
     try render(&out.writer, source);
     try std.testing.expectEqualStrings(expected, out.written());
+}
+
+// Every message that Drinky wrote takes the quote bar and the symbol of its
+// role, so it cannot read as an answer of the model. The text goes out escaped,
+// because it is prose and not markup.
+test "a message of Drinky takes the symbol of its role inside a quote" {
+    const gpa = std.testing.allocator;
+    const event = try wrapAlloc(gpa, .event, "Drinky now uses claude-opus-5.");
+    defer gpa.free(event);
+    try std.testing.expectEqualStrings(
+        "<blockquote>ℹ Drinky now uses claude-opus-5.</blockquote>",
+        event,
+    );
+    const failure = try wrapAlloc(gpa, .failure, "Telegram rejected <a> & more.");
+    defer gpa.free(failure);
+    try std.testing.expectEqualStrings(
+        "<blockquote>⚠ Telegram rejected &lt;a&gt; &amp; more.</blockquote>",
+        failure,
+    );
+    const note = try wrapAlloc(gpa, .note, "Skill: zig-style");
+    defer gpa.free(note);
+    try std.testing.expectEqualStrings("<blockquote>▸ Skill: zig-style</blockquote>", note);
 }
 
 test "a heading becomes a bold line, and the inline markers become tags" {

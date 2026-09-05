@@ -24,7 +24,8 @@ behavior can be wrong.
   the attachment with its poller, sender, and answerer, the pairing, and the controller that owns
   them all. The controller reports through a sink of small actions and knows nothing of the session.
   The mirror sends the transcript to the chat and holds the keyboards of the turn, and the picker
-  holds the open command picker of the chat.
+  holds the open command picker of the chat. `src/remote/html.zig` owns the Telegram HTML: the
+  render of a block, and the one seam from a role to the look of a message that Drinky wrote.
 
 The libraries never import each other or the app. Only the `root.zig` file in a module can re-export
 names.
@@ -65,6 +66,9 @@ writes no color of its own.
 - A user box holds typed text alone.
 - Add a new block kind to the role test of `src/ui/block.zig`, so no kind reaches a release
   unclassified.
+- In the chat, `html.Role` is the same seam. Every event and every line that Drinky wrote for the
+  user takes a quote bar and the symbol of its role. An answer of the model takes neither. A control
+  of the turn, such as the activity message or a picker, is no such message and takes no bar.
 
 ## Writing style
 

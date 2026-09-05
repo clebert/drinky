@@ -15,11 +15,13 @@ const wait_steps_max = 500;
 const wait_step_ms = 10;
 
 /// The pace of the tests: every wait of an attachment short, so the suite stays
-/// fast.
+/// fast. An outage reports at its first failure, so a test that drives one
+/// waits for nothing. A test of the report threshold names its own bound.
 pub const pace: Attachment.Pace = .{
     .drain_ms = 300,
     .send_spacing_ms = 20,
     .backoff = .{ .attempts_max = std.math.maxInt(u32), .backoff_ms_initial = 10, .backoff_ms_max = 20 },
+    .outage_ms_min = 0,
 };
 
 /// A sink for the tests: every event lands in a list under a lock, because the

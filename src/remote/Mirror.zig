@@ -4,7 +4,9 @@
 //! new committed block once, rendered as Telegram HTML, and it reads no
 //! streaming event. A reasoning block and a tool box stay in the terminal,
 //! because the activity message substitutes for both. A user box stays, because
-//! the chat holds every message of the user.
+//! the chat holds every message of the user. An event and a note go out under
+//! their role in `html`, so the chat tells a message of Drinky from an answer
+//! of the model.
 //!
 //! The activity message holds the `Cancel turn` and `Withdraw` buttons of the
 //! turn, and the failed turn message holds `Try again` and `Dismiss`. A tap
@@ -35,9 +37,6 @@ const Mirror = @This();
 /// The bytes the longest activity text takes: the phase with a tool name, the
 /// separator, and the call count with every digit of a `usize`.
 const activity_bytes_max = 96;
-
-/// The parse mode of every message that the mirror sends.
-const parse_mode = "HTML";
 
 /// The buttons of the activity message.
 const cancel_label = "Cancel turn";
@@ -389,15 +388,14 @@ fn renderBlock(self: *Mirror, block: *const ui.block.Entry) !?[]u8 {
     defer out.deinit();
     switch (block.content) {
         .model => |list| try html.render(&out.writer, std.mem.trimEnd(u8, list.items, " \t\r\n")),
-        .user_note => |list| {
-            try out.writer.writeAll("<i>");
-            try html.escape(&out.writer, list.items);
-            try out.writer.writeAll("</i>");
-        },
+        .user_note => |list| try html.wrap(&out.writer, .note, list.items),
         .event => |flagged| {
             if (!flagged.mirrored) return null;
-            try out.writer.writeAll(if (flagged.is_error) "Error: " else "Event: ");
-            try html.escape(&out.writer, flagged.text.items);
+            try html.wrap(
+                &out.writer,
+                if (flagged.is_error) .failure else .event,
+                flagged.text.items,
+            );
         },
         .intro, .user, .thinking, .tool_result => return null,
     }
@@ -413,7 +411,7 @@ fn sendHtml(self: *Mirror, chat: anytype, text: []const u8, notify: bool) !void 
     while (try parts.next(self.gpa)) |part| {
         defer self.gpa.free(part.text);
         try chat.send(part.text, &.{
-            .parse_mode = parse_mode,
+            .parse_mode = html.parse_mode,
             .disable_notification = !(notify and part.last),
         });
     }
@@ -633,9 +631,12 @@ test "a step sends each committed answer, event, and note once, and skips the re
     try std.testing.expectEqualStrings("The <b>answer</b> &amp; more.", chat.sends.items[0].text);
     try std.testing.expectEqualStrings("HTML", chat.sends.items[0].options.parse_mode.?);
     try std.testing.expect(chat.sends.items[0].options.disable_notification);
-    try std.testing.expectEqualStrings("Event: Drinky changed the model.", chat.sends.items[1].text);
     try std.testing.expectEqualStrings(
-        "<i>Skill: zig-style · File: &lt;skill&gt;</i>",
+        "<blockquote>ℹ Drinky changed the model.</blockquote>",
+        chat.sends.items[1].text,
+    );
+    try std.testing.expectEqualStrings(
+        "<blockquote>▸ Skill: zig-style · File: &lt;skill&gt;</blockquote>",
         chat.sends.items[2].text,
     );
     // A second step over the same blocks sends nothing.
@@ -662,7 +663,10 @@ test "a block above the committed frontier waits, and a rewound tail costs nothi
     try blocks.append(.model, .{}, "whole");
     try mirror.sync(&chat, &blocks.live(2, tail));
     try std.testing.expectEqual(@as(usize, 1), chat.sends.items.len);
-    try std.testing.expectEqualStrings("Event: Drinky started retry attempt 1.", chat.sends.items[0].text);
+    try std.testing.expectEqualStrings(
+        "<blockquote>ℹ Drinky started retry attempt 1.</blockquote>",
+        chat.sends.items[0].text,
+    );
     try mirror.sync(&chat, &blocks.live(3, tail));
     try std.testing.expectEqualStrings("whole", chat.lastSend().text);
 }
@@ -869,7 +873,10 @@ test "a canceled turn ends in silence, and a failed turn notifies its error" {
     try mirror.beginTurn(&chat, 1_000);
     try blocks.append(.event, .{ .is_error = true }, "The provider refused the request.");
     try mirror.endTurn(&chat, &blocks.idle(), &.{ .outcome = .failed, .status = &test_status, .now_ms = 3_000 });
-    try std.testing.expectEqualStrings("Error: The provider refused the request.", chat.lastSend().text);
+    try std.testing.expectEqualStrings(
+        "<blockquote>⚠ The provider refused the request.</blockquote>",
+        chat.lastSend().text,
+    );
     try std.testing.expect(!chat.lastSend().options.disable_notification);
     try std.testing.expect(std.mem.startsWith(u8, chat.lastEdit().text, "Failed · Tools: 0 calls · Time: 2.0s"));
 }
@@ -918,7 +925,10 @@ test "the cursor follows a cleared transcript and moves back over dropped blocks
     mirror.retreat(1);
     try mirror.sync(&chat, &blocks.idle());
     try std.testing.expectEqual(@as(usize, 2), chat.sends.items.len);
-    try std.testing.expectEqualStrings("Event: Drinky replaced the credential.", chat.lastSend().text);
+    try std.testing.expectEqualStrings(
+        "<blockquote>ℹ Drinky replaced the credential.</blockquote>",
+        chat.lastSend().text,
+    );
 
     // A new conversation clears everything, and the mirror starts over. The
     // cleared transcript grows back to the same length in the same step, so the
@@ -929,12 +939,12 @@ test "the cursor follows a cleared transcript and moves back over dropped blocks
     mirror.restart();
     try mirror.sync(&chat, &blocks.idle());
     try std.testing.expectEqual(@as(usize, 3), chat.sends.items.len);
-    try std.testing.expectEqualStrings("Event: fresh", chat.lastSend().text);
+    try std.testing.expectEqualStrings("<blockquote>ℹ fresh</blockquote>", chat.lastSend().text);
 }
 
-/// A chat that reports into the transcript on every send, as the controller does
-/// when the queue drops a message. The report appends a block, so a send moves
-/// the blocks of the transcript.
+/// A chat that reports into the transcript on every send. The report appends a
+/// block, so a send moves the blocks of the transcript. No chat of Drinky does
+/// this today, and the flush must stay safe against one.
 const Reporter = struct {
     blocks: *Blocks,
     sends: usize = 0,

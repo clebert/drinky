@@ -76,6 +76,24 @@ pub fn append(
     try self.entries.append(self.gpa, entry);
 }
 
+/// Count one more occurrence of the event at the tail, and report whether that
+/// took the place of an append. An event that states `text` under `options`
+/// again, with no block between the two, states its count instead of a block of
+/// its own, so a task that repeats itself takes one row. A mirrored event never
+/// repeats, because the mirror sends a block once and a change to a block below
+/// its cursor never reaches the chat.
+pub fn repeatEvent(
+    self: *Transcript,
+    options: ui.block.Entry.Options,
+    text: []const u8,
+) !bool {
+    if (options.mirrored or self.streaming() or self.entries.items.len == 0) return false;
+    const last = &self.entries.items[self.entries.items.len - 1];
+    if (!last.statesEvent(options, text)) return false;
+    try last.repeatEvent(self.gpa);
+    return true;
+}
+
 /// Append streamed text of `kind` (`.thinking` reasoning or `.model` answer).
 /// Open a block of that kind on demand so a run of deltas collects into one
 /// block. A kind change ends the previous run. A provider can stream a delta

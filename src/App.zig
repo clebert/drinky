@@ -199,6 +199,13 @@ remote_title: []const u8,
 /// picker borrows them.
 pairing_wait_text: []const u8,
 pairing_wait_link: []const u8,
+/// Whether the Telegram prompt of the running turn holds the committed mark
+/// already. The turn marks it once, at the round that commits it.
+prompt_marked: bool,
+/// How many Telegram messages of the steering queue hold the committed mark.
+/// The turn marks each one at the round that commits it, and the receipt marks
+/// the rest.
+steering_marked_count: usize,
 
 /// The process environment that the app cannot read for itself. `main` owns every
 /// lookup, so a test can run the app with no environment at all.
@@ -1042,6 +1049,8 @@ fn initFields(self: *App, gpa: std.mem.Allocator, io: std.Io) void {
         .remote_title = "",
         .pairing_wait_text = "",
         .pairing_wait_link = "",
+        .prompt_marked = false,
+        .steering_marked_count = 0,
     };
     // The literal above writes `queue_buffer` too. A result location does put that
     // buffer at its final address, but do not depend on that, so take it here.
@@ -1354,6 +1363,7 @@ fn applyBatch(self: *App, events: []const UiEvent) !bool {
             },
             .turn => |*turn_event| {
                 const turn_finished = try self.session.applyTurnEvent(turn_event);
+                try self.markCommittedChatMessages();
                 if (turn_finished) {
                     const result = self.takeTurnResult() orelse return error.MissingTurnWorker;
                     defer self.freeWorkerResult(&result);
@@ -2160,6 +2170,8 @@ fn runTurn(self: *App, text: []const u8) !void {
     errdefer self.gpa.free(owned);
     self.turn_future = try self.io.concurrent(runTurnWorker, .{ self, owned, generation });
     self.session.beginTurn(generation);
+    self.prompt_marked = false;
+    self.steering_marked_count = 0;
     // Every turn start takes the waiting retry, not the attempt alone. A message
     // that the user sends instead of the attempt moves the conversation on, so the
     // context it named is stale. The drop runs after the spawn, because a start
@@ -3004,24 +3016,56 @@ fn endMirrorTurn(self: *App, outcome: remote.Mirror.End.Outcome) !void {
     });
 }
 
-/// Mark every Telegram message of the ending turn with its state: 👍 for one the
-/// turn committed and 👎 for one it did not. The receipt names the committed
-/// rounds and the committed steering prefix. Runs before the session resolves the
-/// messages, because it reads their ids from the session.
+/// Mark every Telegram message that the running turn committed since the last
+/// step with 👍. A message belongs to history at the round that commits it, so
+/// the chat learns it there and not at the receipt. Runs after every event of
+/// the turn.
+fn markCommittedChatMessages(self: *App) !void {
+    if (!self.controller.listens()) return;
+    if (!self.prompt_marked and self.session.turnCommitted()) {
+        if (self.session.turn_prompt) |*prompt| switch (prompt.source) {
+            .external => |id| try self.controller.react(id, .committed),
+            .terminal => {},
+        };
+        self.prompt_marked = true;
+    }
+    const committed = self.session.steering_committed_count;
+    const messages = self.session.steering.items;
+    while (self.steering_marked_count < committed) : (self.steering_marked_count += 1) {
+        switch (messages[self.steering_marked_count].source) {
+            .external => |id| try self.controller.react(id, .committed),
+            .terminal => {},
+        }
+    }
+}
+
+/// Mark every Telegram message of the ending turn that holds no mark yet: 👍 for
+/// one the turn committed and 👎 for one it did not. The receipt names the
+/// committed rounds and the committed steering prefix. Runs before the session
+/// resolves the messages, because it reads their ids from the session.
 fn settleChatMessages(self: *App, receipt: *const ai.Agent.Receipt) !void {
     if (!self.controller.listens()) return;
     const committed = receipt.history_end != receipt.history_base;
-    if (self.session.turn_prompt) |*prompt| switch (prompt.source) {
-        .external => |id| try self.controller.react(id, if (committed) .committed else .dropped),
-        .terminal => {},
-    };
-    for (self.session.steering.items, 0..) |*message, index| switch (message.source) {
-        .external => |id| try self.controller.react(
-            id,
-            if (index < receipt.steering_committed_count) .committed else .dropped,
-        ),
-        .terminal => {},
-    };
+    // A prompt that a round of this turn marked already holds the mark it needs.
+    const prompt_settled = self.prompt_marked and committed;
+    if (!prompt_settled) {
+        if (self.session.turn_prompt) |*prompt| switch (prompt.source) {
+            .external => |id| try self.controller.react(id, if (committed) .committed else .dropped),
+            .terminal => {},
+        };
+    }
+    for (self.session.steering.items, 0..) |*message, index| {
+        const message_committed = index < receipt.steering_committed_count;
+        // A message that a round marked already holds the same mark.
+        if (message_committed and index < self.steering_marked_count) continue;
+        switch (message.source) {
+            .external => |id| try self.controller.react(
+                id,
+                if (message_committed) .committed else .dropped,
+            ),
+            .terminal => {},
+        }
+    }
 }
 
 /// The attach event: the bot, then the state of the session in the words and
@@ -3165,13 +3209,17 @@ fn submitChatMessage(self: *App, text: []const u8, message_id: i64) !void {
                 defer self.gpa.free(refusal.content);
                 return self.controller.reply(message_id, refusal.content);
             }
-            // The draft and the slot come first, so the channel push is the only
-            // fallible step. The receipt of the turn marks the message later.
+            // The draft and the slot come first, so the channel push is the last
+            // fallible step before the session takes the message. The mark of a
+            // queued message follows both, so a failed mark leaves the queue and
+            // the session in agreement. The round that commits the message
+            // replaces that mark.
             var draft = try ui.Editor.Draft.fromText(self.gpa, text);
             errdefer draft.deinit(self.gpa);
             try self.session.reserveSteering();
             try self.agent.steering.push(text);
-            return self.session.commitExternalSteering(&draft, message_id);
+            self.session.commitExternalSteering(&draft, message_id);
+            return self.controller.react(message_id, .queued);
         },
         .prompt => {},
         // The terminal takes no input while the bot holds it, so no picker and
@@ -3195,14 +3243,16 @@ fn submitChatMessage(self: *App, text: []const u8, message_id: i64) !void {
     }
     if (!self.signedIn()) return self.controller.reply(message_id, telegram_signed_out_refusal);
     if (self.agent.model == null) return self.controller.reply(message_id, telegram_no_model_refusal);
-    // The draft comes first, so the turn start is the last fallible step. The
-    // prompt then follows the rule of a queued Telegram message: it fills no editor
-    // while the bot holds the input, and it returns after a detach. The receipt
-    // of the turn marks it, and a refused message gets its reply instead.
+    // The draft comes first, so no fallible step stands between the turn start
+    // and the retained prompt. The prompt then follows the rule of a queued
+    // Telegram message: it fills no editor while the bot holds the input, and it
+    // returns after a detach. The mark of a queued message follows the retained
+    // prompt, and a refused message gets its reply instead.
     var draft = try ui.Editor.Draft.fromText(self.gpa, text);
     errdefer draft.deinit(self.gpa);
     const base = try self.startUserTurn(text);
     self.session.retainExternalTurnPrompt(&draft, base, message_id);
+    try self.controller.react(message_id, .queued);
 }
 
 /// Where a command of the chat came from, so its result finds its place.
@@ -3211,7 +3261,7 @@ const ChatOrigin = union(enum) {
     /// it starts retains it as the prompt.
     message: Line,
     /// A tap on the open picker, with the query to answer. A notice answers it
-    /// as a toast, and the picker message states the result.
+    /// as a toast, and the message of the picker goes.
     tap: []const u8,
 
     const Line = struct {
@@ -3248,14 +3298,14 @@ fn applyChatOutcome(self: *App, outcome: ai.command.Outcome, origin: ChatOrigin)
         },
         .event => |message| {
             // The session frees the content below, so a failure before it does.
-            self.stateChatResult(origin, message.content) catch |err| {
+            self.stateChatResult(origin) catch |err| {
                 self.gpa.free(message.content);
                 return err;
             };
             try self.applyOutcome(outcome);
         },
         .new_conversation => {
-            try self.stateChatResult(origin, "New conversation");
+            try self.stateChatResult(origin);
             try self.applyOutcome(outcome);
         },
         .prompt => |prompt| {
@@ -3282,7 +3332,7 @@ const terminal_only_action = "This action runs in the terminal alone.";
 /// Start the turn of a skill that the chat loaded. A skill line in a message
 /// keeps the message as the retained prompt, like every Telegram prompt. A tap
 /// retains no prompt, like a retry attempt, because its request never sat in an
-/// editor: the picker message names the skill, and a second tap loads it again.
+/// editor and has no text to return. A new `/skill` loads the skill again.
 fn startChatSkillTurn(
     self: *App,
     prompt: *const ai.command.Outcome.Prompt,
@@ -3296,10 +3346,9 @@ fn startChatSkillTurn(
             self.session.retainExternalTurnPrompt(&draft, base, line.id);
         },
         .tap => |query_id| {
-            // The picker states the result before the turn makes it stale.
-            const head = try std.fmt.allocPrint(self.gpa, "Skill: {s}", .{prompt.name});
-            defer self.gpa.free(head);
-            try self.chat_picker.finish(&self.controller, head);
+            // The head line of the skill states the load, so the message of the
+            // picker goes without a word.
+            try self.chat_picker.dismiss(&self.controller);
             try self.controller.answer(query_id, null);
             const base = try self.startSkillTurn(prompt);
             self.session.markTurnBase(base);
@@ -3308,27 +3357,27 @@ fn startChatSkillTurn(
 }
 
 /// State a notice of the chat where its origin shows it: as a reply to the
-/// message, or as a toast to the tap. The picker message of a tap states it
-/// too and loses its keyboard.
+/// message, or as a toast to the tap. A notice is short-lived, so the toast
+/// states it and the message of the picker goes.
 fn stateChatNotice(self: *App, origin: ChatOrigin, text: []const u8) !void {
     switch (origin) {
         .message => |line| try self.controller.reply(line.id, text),
         .tap => |query_id| {
             try self.controller.answer(query_id, text);
-            try self.chat_picker.finish(&self.controller, text);
+            try self.chat_picker.dismiss(&self.controller);
         },
     }
 }
 
-/// State the result of a command of the chat that is no notice. The mirror
-/// carries an event to the chat, so a message gets no reply, and a tap gets a
-/// silent answer while its picker message states the result.
-fn stateChatResult(self: *App, origin: ChatOrigin, text: []const u8) !void {
+/// End a command of the chat that states its result as an event. The mirror
+/// carries that event to the chat, so a message gets no reply, and a tap gets a
+/// silent answer while the message of its picker goes.
+fn stateChatResult(self: *App, origin: ChatOrigin) !void {
     switch (origin) {
         .message => {},
         .tap => |query_id| {
             try self.controller.answer(query_id, null);
-            try self.chat_picker.finish(&self.controller, text);
+            try self.chat_picker.dismiss(&self.controller);
         },
     }
 }
@@ -3400,7 +3449,7 @@ fn handlePickerTap(self: *App, query_id: []const u8, tap: remote.keyboard.Tap) !
         .close => {
             const message = self.chat_picker.cancellationMessage();
             try self.controller.answer(query_id, message);
-            try self.chat_picker.finish(&self.controller, message);
+            try self.chat_picker.dismiss(&self.controller);
         },
     }
 }
@@ -9527,7 +9576,8 @@ test "a pairing shows its wait and its code in the picker, and the bind takes th
     try std.testing.expect(std.mem.indexOf(
         u8,
         sent,
-        "\"text\":\"Event: Remote: @drinky_bot · ~/work/drinky · Context: 0 · Account: Signed out\"",
+        "\"text\":\"<blockquote>ℹ Remote: @drinky_bot · ~/work/drinky · Context: 0 · " ++
+            "Account: Signed out</blockquote>\"",
     ) != null);
     try server.finish();
 }
@@ -9588,7 +9638,11 @@ test "while a bot holds the input the terminal takes a detach alone, and Enter n
         app.session.notice.?.content,
     );
     const sent = try server.waitForSend(1);
-    try std.testing.expect(std.mem.indexOf(u8, sent, "\"text\":\"Event: You detached @drinky_bot.\"") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        sent,
+        "\"text\":\"<blockquote>ℹ You detached @drinky_bot.</blockquote>\"",
+    ) != null);
     try server.finish();
 
     // The sender reports its end, and the terminal holds the input again, so
@@ -9889,6 +9943,7 @@ test "a Telegram message during a turn queues as steering that drops while the b
             .{ .body = remote_ok_sent },
             .{ .body = remote_ok_sent },
         } },
+        .{ .method = "setMessageReaction", .replies = &.{.{ .body = remote_ok_true }} },
     });
     defer server.deinit();
     try server.start();
@@ -9917,11 +9972,12 @@ test "a Telegram message during a turn queues as steering that drops while the b
     }
     try std.testing.expectEqual(@as(usize, 2), queued.len);
     try std.testing.expectEqualStrings("from the chat", queued[1]);
-    // The queued message gets no mark before the receipt, and a refused line
-    // gets its reply alone.
+    // The queued message takes the mark of a queued message, and a refused
+    // line gets its reply alone.
     const refusal = try server.waitForSend(1);
     try std.testing.expect(std.mem.indexOf(u8, refusal, "The command /new cannot run while a turn runs.") != null);
-    try std.testing.expectEqual(@as(usize, 0), server.countOf("/setMessageReaction"));
+    const queued_mark = try server.waitForRequest("/setMessageReaction", 0);
+    try std.testing.expect(std.mem.indexOf(u8, queued_mark, "\"message_id\":12,\"reaction\":[{\"type\":\"emoji\",\"emoji\":\"👀\"}]") != null);
     // The registry decides first, so an unknown line keeps its own refusal
     // instead of the one that names the turn.
     const unknown = try server.waitForSend(2);
@@ -9956,12 +10012,12 @@ test "a Telegram message during a turn queues as steering that drops while the b
     try std.testing.expectEqualStrings("after the detach", app.session.editor.visible());
     app.agent.steering.clear();
     try server.finish();
-    try std.testing.expectEqual(@as(usize, 0), server.countOf("/setMessageReaction"));
 }
 
 // The chat follows the transcript: the activity message opens the turn, the
 // answer goes out when it commits, the summary closes the turn, and the prompt
-// of the turn gets its mark. The chat notifies once, for the answer.
+// of the turn gets its mark at the round that commits it. The chat notifies
+// once, for the answer.
 test "the chat mirrors a completed turn with its activity message, its answer, and its summary" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
@@ -10005,11 +10061,26 @@ test "the chat mirrors a completed turn with its activity message, its answer, a
 
     // The reply streams: the activity message follows the state, and the answer
     // waits for its commit.
+    var opening = [_]UiEvent{.{ .turn = .{
+        .generation = 1,
+        .progress_sequence = 1,
+        .payload = .{ .usage = .{} },
+    } }};
+    _ = try app.applyBatch(&opening);
+    // Nothing committed yet, so the prompt holds no mark.
+    try std.testing.expectEqual(@as(usize, 0), server.countOf("/setMessageReaction"));
+
+    // The checkpoint of the worker commits the prompt, so it takes the mark of
+    // a committed message while the turn still runs.
     var events = [_]UiEvent{.{ .turn = .{
         .generation = 1,
+        .progress_sequence = 2,
+        .progress_sequence_committed = 1,
         .payload = .{ .text = try gpa.dupe(u8, "The **answer**.") },
     } }};
     _ = try app.applyBatch(&events);
+    const committed_mark = try server.waitForRequest("/setMessageReaction", 0);
+    try std.testing.expect(std.mem.indexOf(u8, committed_mark, "\"message_id\":7,\"reaction\":[{\"type\":\"emoji\",\"emoji\":\"👍\"}]") != null);
     // The edit keeps the buttons of the turn, because an edit without them
     // drops them.
     const writing = try server.waitForRequest("/editMessageText", 0);
@@ -10021,8 +10092,8 @@ test "the chat mirrors a completed turn with its activity message, its answer, a
     );
     try std.testing.expectEqual(@as(usize, 2), server.sendCount());
 
-    // The receipt commits the round: the answer goes out and notifies, the
-    // summary replaces the activity, and the prompt gets its mark.
+    // The receipt closes the turn: the answer goes out and notifies, and the
+    // summary replaces the activity.
     var result: WorkerResult = .{
         .outcome = .{
             .receipt = .{ .history_base = 0, .history_end = 2, .steering_committed_count = 0 },
@@ -10043,10 +10114,8 @@ test "the chat mirrors a completed turn with its activity message, its answer, a
     // line does. The summary holds no button.
     try std.testing.expect(std.mem.indexOf(u8, summary, " · Context: 0 · Cost: ~$0.00\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, summary, "reply_markup") == null);
-    const committed = try server.waitForRequest("/setMessageReaction", 0);
-    try std.testing.expect(std.mem.indexOf(u8, committed, "\"message_id\":7,\"reaction\":[{\"type\":\"emoji\",\"emoji\":\"👍\"}]") != null);
     try server.finish();
-    // The prompt gets one mark: the receipt alone marks a message.
+    // The prompt gets one mark: the commit marked it, so the receipt adds none.
     try std.testing.expectEqual(@as(usize, 1), server.countOf("/setMessageReaction"));
 }
 
@@ -10071,6 +10140,7 @@ test "a failed turn marks its uncommitted messages and notifies its error" {
         } },
         .{ .method = "editMessageText", .replies = &.{.{ .body = remote_ok_true }} },
         .{ .method = "setMessageReaction", .replies = &.{
+            .{ .body = remote_ok_true },
             .{ .body = remote_ok_true },
             .{ .body = remote_ok_true },
         } },
@@ -10109,23 +10179,29 @@ test "a failed turn marks its uncommitted messages and notifies its error" {
     try std.testing.expectEqualStrings("", app.session.editor.visible());
 
     const failure = try server.waitForSend(2);
-    try std.testing.expect(std.mem.indexOf(u8, failure, "\"text\":\"Error: The provider refused the request.\"") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        failure,
+        "\"text\":\"<blockquote>⚠ The provider refused the request.</blockquote>\"",
+    ) != null);
     try std.testing.expect(std.mem.indexOf(u8, failure, "\"disable_notification\":false") != null);
     const summary = try server.waitForRequest("/editMessageText", 0);
     try std.testing.expect(std.mem.indexOf(u8, summary, "\"text\":\"Failed · Tools: 0 calls · Time: ") != null);
-    const prompt = try server.waitForRequest("/setMessageReaction", 0);
+    const prompt = try server.waitForRequest("/setMessageReaction", 1);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "\"message_id\":7,\"reaction\":[{\"type\":\"emoji\",\"emoji\":\"👎\"}]") != null);
-    const dropped = try server.waitForRequest("/setMessageReaction", 1);
+    const dropped = try server.waitForRequest("/setMessageReaction", 2);
     try std.testing.expect(std.mem.indexOf(u8, dropped, "\"message_id\":8,\"reaction\":[{\"type\":\"emoji\",\"emoji\":\"👎\"}]") != null);
     try server.finish();
-    try std.testing.expectEqual(@as(usize, 2), server.countOf("/setMessageReaction"));
+    // The queued mark of the steering message stands in front of the two marks
+    // of the receipt.
+    try std.testing.expectEqual(@as(usize, 3), server.countOf("/setMessageReaction"));
 }
 
 // A command line from Telegram runs where the registry allows it. A picker
-// shows as an inline keyboard under one message, a tap on a row runs the
-// command and the message states the result without its keyboard, and the
-// event of the change reaches the chat through the mirror. A tap on the closed
-// list gets the toast alone.
+// shows as an inline keyboard under one message, and a tap on a row runs the
+// command. The picker message is scaffolding, so it goes at the end, and the
+// event of the change states the result once through the mirror. A tap on the
+// closed list gets the toast alone.
 test "a Telegram command opens a keyboard, a tap picks a row, and a stale tap gets the toast" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
@@ -10142,7 +10218,7 @@ test "a Telegram command opens a keyboard, a tap picks a row, and a stale tap ge
             .{ .body = "{\"ok\":true,\"result\":{\"message_id\":60}}" },
             .{ .body = remote_ok_sent },
         } },
-        .{ .method = "editMessageText", .replies = &.{.{ .body = remote_ok_true }} },
+        .{ .method = "deleteMessage", .replies = &.{.{ .body = remote_ok_true }} },
         .{ .method = "answerCallbackQuery", .replies = &.{ .{ .body = remote_ok_true }, .{ .body = remote_ok_true } } },
     });
     defer server.deinit();
@@ -10168,8 +10244,8 @@ test "a Telegram command opens a keyboard, a tap picks a row, and a stale tap ge
     try std.testing.expect(std.mem.indexOf(u8, picker, "[{\"text\":\"Cancel\",\"callback_data\":\"close:1\"}]") != null);
     try std.testing.expect(std.mem.indexOf(u8, picker, "Back") == null);
 
-    // The tap sets the level. The answer is silent, because the message states
-    // the result, and the event reaches the chat once through the mirror.
+    // The tap sets the level. The answer is silent and the picker message goes,
+    // so the event of the mirror states the result once.
     try app.handleChatTap("900", .{ .row = .{ .serial = 1, .index = 2 } });
     try std.testing.expect(app.agent.effort == .high);
     try std.testing.expect(!app.chat_picker.isOpen());
@@ -10179,12 +10255,17 @@ test "a Telegram command opens a keyboard, a tap picks a row, and a stale tap ge
         try server.waitForRequest("/answerCallbackQuery", 0),
     );
     try std.testing.expectEqualStrings(
-        "{\"chat_id\":99,\"message_id\":60,\"text\":\"Drinky set the effort level to high.\"}",
-        try server.waitForRequest("/editMessageText", 0),
+        "{\"chat_id\":99,\"message_id\":60}",
+        try server.waitForRequest("/deleteMessage", 0),
     );
     try app.syncMirror();
     const event = try server.waitForSend(2);
-    try std.testing.expect(std.mem.indexOf(u8, event, "\"text\":\"Event: Drinky set the effort level to high.\"") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        event,
+        "\"text\":\"<blockquote>ℹ Drinky set the effort level to high.</blockquote>\"",
+    ) != null);
+    try std.testing.expectEqual(@as(usize, 0), server.countOf("/editMessageText"));
 
     // The list is closed, so a tap on its keyboard in the history gets the toast.
     try app.handleChatTap("901", .{ .row = .{ .serial = 1, .index = 0 } });
@@ -10215,7 +10296,10 @@ test "the activity keyboard cancels the turn on one tap and withdraws the queue"
             .{ .body = "{\"ok\":true,\"result\":{\"message_id\":50}}" },
         } },
         .{ .method = "editMessageText", .replies = &.{.{ .body = remote_ok_true }} },
-        .{ .method = "setMessageReaction", .replies = &.{.{ .body = remote_ok_true }} },
+        .{ .method = "setMessageReaction", .replies = &.{
+            .{ .body = remote_ok_true },
+            .{ .body = remote_ok_true },
+        } },
         .{ .method = "answerCallbackQuery", .replies = &.{
             .{ .body = remote_ok_true },
             .{ .body = remote_ok_true },
@@ -10240,8 +10324,10 @@ test "the activity keyboard cancels the turn on one tap and withdraws the queue"
     const activity = try server.waitForSend(1);
     try std.testing.expect(std.mem.indexOf(u8, activity, "[{\"text\":\"Cancel turn\",\"callback_data\":\"cancel:1\"}]") != null);
     try std.testing.expect(std.mem.indexOf(u8, activity, "[{\"text\":\"Withdraw\",\"callback_data\":\"withdraw:1\"}]") != null);
-    // The queued message gets no mark until the receipt of the turn.
+    // The queued message takes the mark of a queued message at once.
     try app.submitChatMessage("queued", 12);
+    const queued_mark = try server.waitForRequest("/setMessageReaction", 0);
+    try std.testing.expect(std.mem.indexOf(u8, queued_mark, "\"message_id\":12,\"reaction\":[{\"type\":\"emoji\",\"emoji\":\"👀\"}]") != null);
 
     // A tap on a keyboard of another turn gets the toast and changes nothing.
     try app.handleChatTap("900", .{ .cancel_turn = 7 });
@@ -10250,13 +10336,13 @@ test "the activity keyboard cancels the turn on one tap and withdraws the queue"
         try server.waitForRequest("/answerCallbackQuery", 0),
     );
     try std.testing.expect(app.session.mode == .turn);
-    try std.testing.expectEqual(@as(usize, 0), server.countOf("/setMessageReaction"));
+    try std.testing.expectEqual(@as(usize, 1), server.countOf("/setMessageReaction"));
 
     // The withdraw drops the queue and marks the message. The chat holds its
     // text, so no editor takes it. A second withdraw finds nothing.
     try app.handleChatTap("901", .{ .withdraw = 1 });
     try std.testing.expectEqualStrings("{\"callback_query_id\":\"901\"}", try server.waitForRequest("/answerCallbackQuery", 1));
-    const dropped = try server.waitForRequest("/setMessageReaction", 0);
+    const dropped = try server.waitForRequest("/setMessageReaction", 1);
     try std.testing.expect(std.mem.indexOf(u8, dropped, "\"message_id\":12,\"reaction\":[{\"type\":\"emoji\",\"emoji\":\"👎\"}]") != null);
     try std.testing.expectEqual(@as(usize, 0), app.session.steering.items.len);
     try std.testing.expectEqualStrings("", app.session.editor.visible());
@@ -10277,7 +10363,7 @@ test "the activity keyboard cancels the turn on one tap and withdraws the queue"
     try std.testing.expect(std.mem.indexOf(u8, summary, "reply_markup") == null);
     try server.finish();
     try std.testing.expectEqual(@as(usize, 1), server.countOf("/editMessageText"));
-    try std.testing.expectEqual(@as(usize, 1), server.countOf("/setMessageReaction"));
+    try std.testing.expectEqual(@as(usize, 2), server.countOf("/setMessageReaction"));
 }
 
 // A failed turn that armed a retry gives the chat the two controls of the
@@ -10413,7 +10499,11 @@ test "a /new from Telegram records the remote bracket as the first event" {
     try std.testing.expectEqualStrings("New conversation · Remote: @drinky_bot", app.lastEventText());
     try app.syncMirror();
     const event = try server.waitForSend(1);
-    try std.testing.expect(std.mem.indexOf(u8, event, "\"text\":\"Event: New conversation · Remote: @drinky_bot\"") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        event,
+        "\"text\":\"<blockquote>ℹ New conversation · Remote: @drinky_bot</blockquote>\"",
+    ) != null);
     try server.finish();
     // The command itself gets no reply, because the event states it.
     try std.testing.expectEqual(@as(usize, 2), server.sendCount());
@@ -10421,8 +10511,8 @@ test "a /new from Telegram records the remote bracket as the first event" {
 
 // A skill that a tap loads has no message in the chat and no line in an editor,
 // so its turn retains no prompt, like a retry attempt. A failure before the
-// first commit then returns nothing to the locked editor, and the picker message
-// names the skill for a second tap.
+// first commit then returns nothing to the locked editor, and a new `/skill`
+// loads the skill again.
 test "a skill loaded by a tap retains no prompt, so its failed turn fills no editor" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
@@ -10500,16 +10590,17 @@ test "a skill loaded by a tap retains no prompt, so its failed turn fills no edi
     try std.testing.expect(app.retry == null);
     for (app.session.transcript.blocks()) |*block| try std.testing.expect(block.content != .user_note);
     const failure = try server.waitForSend(2);
-    try std.testing.expect(std.mem.indexOf(u8, failure, "\"text\":\"Error: ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, failure, "\"text\":\"<blockquote>⚠ ") != null);
     try server.finish();
 }
 
 // The withdraw takes the agent queue and then moves the session with it. No
 // fallible step can stand between the two, or a failure leaves an agent queue
 // that is empty while the session still holds the messages. The one step that
-// can fail after the take is the mark of a dropped message when the send queue
-// is full, because its report allocates. The sweep fails every allocation of
-// the withdraw in turn, and after each failure the two sides must agree.
+// can fail after the take is the mark, when the queue takes it after a run of
+// dropped messages, because the report of the run allocates. The sweep fails
+// every allocation of the withdraw in turn, and after each failure the two
+// sides must agree.
 test "a withdraw whose mark fails after the take leaves the session and the queue in agreement" {
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
     const gpa = failing.allocator();
@@ -10519,7 +10610,7 @@ test "a withdraw whose mark fails after the take leaves the session and the queu
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
     // No script answers a send or a reaction, so the sender hangs on the first
-    // item and the queue behind it fills.
+    // item and the queue keeps the rest.
     var server = try remote_testing.Server.init(std.testing.allocator, io, &.{
         .{ .method = "deleteWebhook", .replies = &.{.{ .body = remote_ok_true }} },
         .{ .method = "setMyCommands", .replies = &.{.{ .body = remote_ok_true }} },
@@ -10532,23 +10623,24 @@ test "a withdraw whose mark fails after the take leaves the session and the queu
     var app: App = undefined;
     app.initRemoteTest(gpa, io, &out, &server, &url_buffer);
     defer app.deinitRemoteTest();
-    // The tasks of the bot allocate on their own threads, so they take the plain
-    // allocator, and the sweep reaches the app alone.
+    // The tasks of the bot allocate on their own threads, so the attach hands
+    // them the plain allocator. The controller then takes the failing one back,
+    // so the sweep reaches the report of the run.
     app.controller.gpa = std.testing.allocator;
+    defer app.controller.gpa = std.testing.allocator;
     try app.controller.store.save(&.{ .token = "42:secret", .id = 42, .username = "drinky_bot", .chat_id = 99 });
     try app.controller.attachSaved(0);
     try server.waitForRequests(3);
+    app.controller.gpa = gpa;
     app.session.beginTurn(1);
     try app.submitChatMessage("queued", 12);
     try std.testing.expectEqual(@as(usize, 1), app.agent.steering.messages.items.len);
-    // The reaction of the message holds the sender, and the fills take the rest
-    // of the queue.
-    for (0..300) |_| try app.controller.send("fill", &.{});
+    // A run of drops waits for its report, so the mark of the withdraw carries
+    // it. A report that fails keeps the count, so every pass carries it again.
+    app.controller.dropped_count = 1;
 
     var step: usize = 0;
     while (true) : (step += 1) {
-        // Every drop reports once per run, so each pass reports again.
-        app.controller.drop_reported = false;
         failing.fail_index = failing.alloc_index + step;
         const result = app.withdrawSteering();
         failing.fail_index = std.math.maxInt(usize);

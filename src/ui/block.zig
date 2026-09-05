@@ -52,6 +52,12 @@ pub const Entry = struct {
         /// that stands in the chat already, or that a send to the chat caused,
         /// stays in the terminal. Other flagged blocks ignore this field.
         mirrored: bool,
+        /// How many times this event occurred back to back. The text states the
+        /// count from two on. Other flagged blocks ignore this field.
+        repeats: usize = 1,
+        /// The bytes of the text before the suffix of its repeat count. Other
+        /// flagged blocks ignore this field.
+        base_len: usize,
     };
 
     /// One run of model reasoning and the account slot that produced it. Only
@@ -144,6 +150,7 @@ pub const Entry = struct {
             .fit = options.fit,
             .survives_rewind = options.survives_rewind,
             .mirrored = options.mirrored,
+            .base_len = text.len,
         };
         return .{ .content = switch (kind) {
             .tool_result => .{ .tool_result = flagged },
@@ -187,6 +194,41 @@ pub const Entry = struct {
             .thinking => |reasoning| reasoning.account,
             .intro, .user, .user_note, .model, .tool_result, .event => null,
         };
+    }
+
+    /// Whether this event states `text` under `options`, its repeat count
+    /// aside. A block of another kind states nothing.
+    pub fn statesEvent(self: *const Entry, options: Options, text: []const u8) bool {
+        const flagged = switch (self.content) {
+            .event => |*flagged| flagged,
+            else => return false,
+        };
+        if (flagged.is_error != options.is_error) return false;
+        if (flagged.survives_rewind != options.survives_rewind) return false;
+        if (flagged.mirrored != options.mirrored) return false;
+        return std.mem.eql(u8, eventText(flagged), text);
+    }
+
+    /// Count one more occurrence of this event, and state the count in its
+    /// text. The new count replaces the one before it, so the text carries one.
+    /// The whole text is built beside the old one, so a failure leaves the
+    /// block as it stands.
+    pub fn repeatEvent(self: *Entry, gpa: std.mem.Allocator) !void {
+        const flagged = &self.content.event;
+        const repeats = flagged.repeats + 1;
+        var text: std.ArrayList(u8) = .empty;
+        errdefer text.deinit(gpa);
+        try text.appendSlice(gpa, eventText(flagged));
+        try text.print(gpa, "{s}Repeats: {d}", .{ paint.separator, repeats });
+        flagged.text.deinit(gpa);
+        flagged.text = text;
+        flagged.repeats = repeats;
+        self.cache.invalidate();
+    }
+
+    /// The text of `flagged` without the suffix of its repeat count.
+    fn eventText(flagged: *const Flagged) []const u8 {
+        return flagged.text.items[0..flagged.base_len];
     }
 
     /// Whether this event remains visible when an abnormal turn rewinds its
@@ -754,6 +796,31 @@ test "each event paints its severity prefix" {
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, painted, "Event: "));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, painted, "Error: "));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, painted, error_sequence));
+}
+
+// One event that repeats states its count in its own text, so the count of the
+// block and the text of the block cannot come apart. The suffix of a count
+// takes the place of the one before it, and a count that takes one digit more
+// leaves no remainder of the shorter one.
+test "a repeated event states one count and matches its own text" {
+    const gpa = std.testing.allocator;
+    var entry = try Entry.init(gpa, .event, .{ .is_error = true }, "no route to host");
+    defer entry.deinit(gpa);
+
+    try std.testing.expect(entry.statesEvent(.{ .is_error = true }, "no route to host"));
+    // Every flag of the event takes part, so a mirrored event and a terminal
+    // event never share a block.
+    try std.testing.expect(!entry.statesEvent(.{ .is_error = true, .mirrored = false }, "no route to host"));
+    try std.testing.expect(!entry.statesEvent(.{}, "no route to host"));
+    try std.testing.expect(!entry.statesEvent(.{ .is_error = true }, "other"));
+
+    for (0..9) |_| try entry.repeatEvent(gpa);
+    try std.testing.expectEqualStrings(
+        "no route to host · Repeats: 10",
+        entry.content.event.text.items,
+    );
+    try std.testing.expectEqual(@as(usize, 10), entry.content.event.repeats);
+    try std.testing.expect(entry.statesEvent(.{ .is_error = true }, "no route to host"));
 }
 
 // Bounded memory: a clipped block composes only its visible rows into a frame

@@ -16,6 +16,7 @@ const ai = @import("ai");
 
 const Attachment = @import("Attachment.zig");
 const Client = @import("Client.zig");
+const html = @import("html.zig");
 const keyboard = @import("keyboard.zig");
 const Pairing = @import("Pairing.zig");
 const Store = @import("Store.zig");
@@ -64,9 +65,10 @@ pace: Attachment.Pace,
 /// The code of the next pairing, or null for a fresh random one. A test fixes
 /// it, so its scripted chat can send it.
 code: ?Pairing.Code,
-/// Whether the owner already learned that the send queue dropped a message. One
-/// run of drops reports once, and the next send that the queue takes resets it.
-drop_reported: bool,
+/// How many messages the full send queue dropped since the chat learned of the
+/// last run. The report of the run goes out once a put proves that the queue
+/// has room again.
+dropped_count: usize,
 
 /// Where the remote control stands. The tags are the `State` the owner reads.
 const Mode = union(enum) {
@@ -188,7 +190,7 @@ pub fn init(gpa: std.mem.Allocator, io: std.Io, options: *const Options) Control
         .connect_ms = options.connect_ms,
         .pace = options.pace,
         .code = options.code,
-        .drop_reported = false,
+        .dropped_count = 0,
     };
 }
 
@@ -383,7 +385,7 @@ pub fn detach(self: *Controller, cause: DetachCause) !void {
     defer self.gpa.free(text);
     const line = try eventLine(self.gpa, severity, text);
     defer self.gpa.free(line);
-    attachment.close(line) catch |err| switch (err) {
+    attachment.close(.{ .text = line, .parse_mode = html.parse_mode }) catch |err| switch (err) {
         error.OutOfMemory => {},
     };
     self.mode = .{ .detaching = attachment };
@@ -414,19 +416,27 @@ pub fn sendEvent(
 ) !void {
     const line = try eventLine(self.gpa, severity, text);
     defer self.gpa.free(line);
-    try self.send(line, &.{ .disable_notification = true });
+    try self.send(line, &.{ .disable_notification = true, .parse_mode = html.parse_mode });
 }
 
-/// Answer the chat message `id` with `text`, silent.
+/// Answer the chat message `id` with `text`, silent. The answer is a line that
+/// Drinky wrote, so it takes the note role.
 pub fn reply(self: *Controller, id: i64, text: []const u8) !void {
-    try self.send(text, &.{ .reply_to = id, .disable_notification = true });
+    const note = try html.wrapAlloc(self.gpa, .note, text);
+    defer self.gpa.free(note);
+    try self.send(note, &.{
+        .reply_to = id,
+        .disable_notification = true,
+        .parse_mode = html.parse_mode,
+    });
 }
 
-/// Queue `text` for the chat without a wait. A full queue drops the message and
-/// reports the first drop of a run. A closed or absent attachment takes nothing.
+/// Queue `text` for the chat without a wait. A full queue drops the message, and
+/// the chat learns the count of the run later. A closed or absent attachment
+/// takes nothing.
 pub fn send(self: *Controller, text: []const u8, options: *const Client.SendOptions) !void {
     const attachment = self.attached() orelse return;
-    try self.takeQueued(attachment, attachment.send(text, options));
+    try self.takeQueued(attachment, .message, attachment.send(text, options));
 }
 
 /// Queue `text` as a message that a later `edit` names, and return its handle.
@@ -438,10 +448,10 @@ pub fn sendTracked(
 ) !?Attachment.Handle {
     const attachment = self.attached() orelse return null;
     const handle = attachment.sendTracked(text, options) catch |err| {
-        try self.takeQueued(attachment, err);
+        try self.takeQueued(attachment, .message, err);
         return null;
     };
-    self.drop_reported = false;
+    try self.reportDrops(attachment);
     return handle;
 }
 
@@ -454,13 +464,19 @@ pub fn edit(
     markup: ?[]const u8,
 ) !void {
     const attachment = self.attached() orelse return;
-    try self.takeQueued(attachment, attachment.edit(handle, text, markup));
+    try self.takeQueued(attachment, .state, attachment.edit(handle, text, markup));
+}
+
+/// Take the tracked message `handle` out of the chat, once it went out.
+pub fn delete(self: *Controller, handle: Attachment.Handle) !void {
+    const attachment = self.attached() orelse return;
+    try self.takeQueued(attachment, .state, attachment.delete(handle));
 }
 
 /// Mark the chat message `message_id` with the state of its transcript entry.
 pub fn react(self: *Controller, message_id: i64, mark: Attachment.Reaction.Mark) !void {
     const attachment = self.attached() orelse return;
-    try self.takeQueued(attachment, attachment.react(message_id, mark));
+    try self.takeQueued(attachment, .state, attachment.react(message_id, mark));
 }
 
 /// Answer the tap `query_id`, with `text` as a toast or with nothing. A toast
@@ -474,7 +490,7 @@ pub fn answer(self: *Controller, query_id: []const u8, text: ?[]const u8) !void 
         while (length > 0 and length < whole.len and (whole.*[length] & 0xC0) == 0x80) length -= 1;
         whole.* = whole.*[0..length];
     }
-    try self.takeQueued(attachment, attachment.answer(query_id, toast));
+    try self.takeQueued(attachment, .state, attachment.answer(query_id, toast));
 }
 
 /// Whether a bot is attached, so a message for the chat has a taker. The mirror
@@ -492,25 +508,56 @@ fn attached(self: *Controller) ?*Attachment {
     };
 }
 
-/// Settle the result of one queue put. A full queue drops the item and reports
-/// the first drop of a run, and the next item that the queue takes resets that
-/// run. The report stays in the terminal, because a report that the mirror
-/// sends meets the same full queue.
-fn takeQueued(self: *Controller, attachment: *Attachment, result: Attachment.SendError!void) !void {
+/// What one queue put carries: a message that the chat keeps, or a state of one
+/// it has, such as a mark, an edit, a deletion, or an answer to a tap.
+const Put = enum { message, state };
+
+/// Settle the result of one queue put. A full queue drops the item. A dropped
+/// message counts, and the chat learns the count of the run once a later put
+/// proves that the queue has room again. A dropped state stays silent, because
+/// the chat loses no text with it and shows a stale mark or activity message.
+/// The terminal learns nothing, because its transcript is whole.
+fn takeQueued(
+    self: *Controller,
+    attachment: *Attachment,
+    put: Put,
+    result: Attachment.SendError!void,
+) !void {
     result catch |err| switch (err) {
         error.Closed, error.Canceled => return,
         error.QueueFull => {
-            if (self.drop_reported) return;
-            self.drop_reported = true;
-            return self.recordTerminalEvent(
-                .failure,
-                "Drinky dropped a message to @{s} because the send queue is full.",
-                .{attachment.username},
-            );
+            if (put == .message) self.dropped_count += 1;
+            return;
         },
         error.OutOfMemory => return error.OutOfMemory,
     };
-    self.drop_reported = false;
+    try self.reportDrops(attachment);
+}
+
+/// Send the chat the count of a run of dropped messages, after a put that the
+/// queue took. A report that meets a full queue waits for the next such put, so
+/// the count stays until the chat has it. The report names the terminal, because
+/// the reader of the chat has the gap and the terminal has the text.
+fn reportDrops(self: *Controller, attachment: *Attachment) !void {
+    const count = self.dropped_count;
+    if (count == 0) return;
+    const text = try std.fmt.allocPrint(
+        self.gpa,
+        "Drinky dropped {d} message{s} while the send queue was full. " ++
+            "The terminal holds the whole transcript.",
+        .{ count, ai.format.pluralSuffix(count) },
+    );
+    defer self.gpa.free(text);
+    const line = try eventLine(self.gpa, .failure, text);
+    defer self.gpa.free(line);
+    attachment.send(line, &.{
+        .disable_notification = true,
+        .parse_mode = html.parse_mode,
+    }) catch |err| switch (err) {
+        error.Closed, error.Canceled, error.QueueFull => return,
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    self.dropped_count = 0;
 }
 
 /// Apply one report of an attachment. A report of the attached bot acts, a
@@ -538,16 +585,15 @@ pub fn applyAttachmentEvent(self: *Controller, event: *const Attachment.Event) !
             try self.answer(callback.query_id, null);
         },
         .unreadable => |id| try self.reply(id, "Drinky reads text alone."),
-        // A report about the send side stays in the terminal, because a mirror
-        // that sends it meets the same failure and feeds itself.
-        .failed => |failure| try self.recordSideEvent(
-            failure.side,
+        // An outage of a side stays in the terminal. A poll outage means that
+        // the chat is out of reach, so its report lands late and states
+        // nothing the user can act on, and a send outage feeds itself.
+        .failed => |failure| try self.recordTerminalEvent(
             .failure,
             "Drinky could not {s} @{s} because of error {s}. Drinky tries again.",
             .{ sideVerb(failure.side), username, failure.name },
         ),
-        .recovered => |side| try self.recordSideEvent(
-            side,
+        .recovered => |side| try self.recordTerminalEvent(
             .information,
             "Drinky can {s} @{s} again.",
             .{ sideVerb(side), username },
@@ -575,6 +621,7 @@ fn rejectedNoun(kind: Attachment.Event.Rejected.Kind) []const u8 {
     return switch (kind) {
         .message => "a message to",
         .edit => "an edit in the chat of",
+        .deletion => "a deletion in the chat of",
         .reaction => "a reaction in the chat of",
     };
 }
@@ -758,7 +805,9 @@ fn startAttachment(self: *Controller, bot: *const Store.Bot) !void {
     self.mode = .{ .attached = attachment };
     // The destroy above runs after this, so no mode names the freed bot.
     errdefer self.mode = .idle;
-    self.drop_reported = false;
+    // A run of drops belongs to the chat that lost the messages, and that chat
+    // had its last message at the detach.
+    self.dropped_count = 0;
     try self.emit(.state_changed);
 }
 
@@ -817,14 +866,14 @@ fn detachText(self: *Controller, cause: DetachCause, username: []const u8) ![]u8
     };
 }
 
-/// The chat line of one event: the text under its `Event:` or `Error:` label.
+/// The chat message of one event, under the role of its severity. The result is
+/// owned, and it goes out as HTML.
 fn eventLine(
     gpa: std.mem.Allocator,
     severity: ai.command.Outcome.Severity,
     text: []const u8,
 ) ![]u8 {
-    const label = if (severity == .failure) "Error: " else "Event: ";
-    return std.fmt.allocPrint(gpa, "{s}{s}", .{ label, text });
+    return html.wrapAlloc(gpa, if (severity == .failure) .failure else .event, text);
 }
 
 /// The verb of one side of the attachment in a failure or recovery event.
@@ -871,21 +920,6 @@ fn recordTerminalEvent(
     const text = try std.fmt.allocPrint(self.gpa, format, args);
     defer self.gpa.free(text);
     try self.tell(.terminal_event, severity, text);
-}
-
-/// Hand one event about `side` to the owner. A poll event reaches the chat, and
-/// a send event stays in the terminal.
-fn recordSideEvent(
-    self: *Controller,
-    side: Attachment.Event.Side,
-    severity: ai.command.Outcome.Severity,
-    comptime format: []const u8,
-    args: anytype,
-) !void {
-    switch (side) {
-        .poll => try self.recordEvent(severity, format, args),
-        .send => try self.recordTerminalEvent(severity, format, args),
-    }
 }
 
 /// Hand one transient notice to the owner.
@@ -1169,11 +1203,81 @@ test "a saved bot attaches, its messages and taps reach the owner, and a detach 
     var buffer: [8][]const u8 = undefined;
     const sends = server.sentBodies(&buffer);
     try std.testing.expectEqual(@as(usize, 4), sends.len);
-    try std.testing.expect(std.mem.indexOf(u8, sends[0], "\"text\":\"Event: Remote: @drinky_bot · Context: 0\"") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        sends[0],
+        "\"text\":\"<blockquote>ℹ Remote: @drinky_bot · Context: 0</blockquote>\"",
+    ) != null);
     try std.testing.expect(std.mem.indexOf(u8, sends[1], "Drinky reads text alone.") != null);
     try std.testing.expect(std.mem.indexOf(u8, sends[1], "\"reply_parameters\":{\"message_id\":8}") != null);
     try std.testing.expect(std.mem.indexOf(u8, sends[2], "\"reply_parameters\":{\"message_id\":7}") != null);
-    try std.testing.expect(std.mem.indexOf(u8, sends[3], "\"text\":\"Event: You detached @drinky_bot.\"") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        sends[3],
+        "\"text\":\"<blockquote>ℹ You detached @drinky_bot.</blockquote>\"",
+    ) != null);
+}
+
+// A full queue drops a message for good, and the chat is the one place with the
+// gap, so the report goes there and not to the terminal, which holds the whole
+// transcript. The report waits for a put that proves the queue has room again,
+// and then states the count of the run. A dropped mark does not count, because
+// the chat loses no text with it.
+test "a run of dropped messages reports its count in the chat once the queue has room" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    // The first reply waits, so the sender holds the first message while the
+    // queue fills behind it.
+    const sends = [_]testing.Reply{.{ .body = ok_sent, .delay_ms = 200 }} ++
+        [_]testing.Reply{.{ .body = ok_sent }} ** (Attachment.outbound_capacity + 2);
+    var server = try testing.Server.init(gpa, io, &.{
+        .{ .method = "deleteWebhook", .replies = &.{.{ .body = ok_true }} },
+        .{ .method = "setMyCommands", .replies = &.{.{ .body = ok_true }} },
+        .{ .method = "getUpdates", .replies = &.{.{ .body = ok_empty }} },
+        .{ .method = "sendMessage", .replies = &sends },
+    });
+    defer server.deinit();
+    try server.start();
+    var owner: Owner = .{ .gpa = gpa, .io = io };
+    owner.init();
+    defer owner.deinit();
+    var url_buffer: [64]u8 = undefined;
+    var store = Store.inert(gpa, io);
+    try store.save(&.{ .token = "42:secret", .id = 42, .username = "drinky_bot", .chat_id = 99 });
+    var controller = Controller.init(gpa, io, &owner.options(store, &server, &url_buffer));
+    defer controller.deinit();
+    // The queue drains at full speed once the first reply lands.
+    controller.pace.send_spacing_ms = 0;
+    try controller.attachSaved(0);
+    try server.waitForRequests(3);
+
+    try controller.send("slow", &.{});
+    try server.waitForSends(1);
+    for (0..Attachment.outbound_capacity) |_| try controller.send("fill", &.{});
+    // The queue is full, so three messages and one mark drop.
+    for (0..3) |_| try controller.send("lost", &.{});
+    try controller.react(7, .committed);
+    try std.testing.expectEqual(@as(usize, 0), owner.countReports("dropped"));
+
+    // The sender took several messages, so the next put fits and the report
+    // follows it.
+    try server.waitForSends(10);
+    try controller.send("room", &.{});
+    try server.finish();
+    var buffer: [Attachment.outbound_capacity + 4][]const u8 = undefined;
+    const bodies = server.sentBodies(&buffer);
+    try std.testing.expectEqual(@as(usize, Attachment.outbound_capacity + 3), bodies.len);
+    try std.testing.expect(std.mem.indexOf(u8, bodies[bodies.len - 2], "\"text\":\"room\"") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        bodies[bodies.len - 1],
+        "\"text\":\"<blockquote>⚠ Drinky dropped 3 messages while the send queue was full. " ++
+            "The terminal holds the whole transcript.</blockquote>\"",
+    ) != null);
+    // The terminal learns nothing, because its transcript is whole.
+    try std.testing.expectEqual(@as(usize, 0), owner.countReports("dropped"));
 }
 
 // An exit key during the drain hands the input back at once. The detach event

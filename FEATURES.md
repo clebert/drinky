@@ -360,6 +360,8 @@ Gemini on Google Vertex AI through a service account key file.
 - A failed event opens with `Error:` and paints its whole text in the error color. Every other event
   opens with `Event:` and paints its whole text in the accent color. An incomplete reply ends with
   an `Error:` event that states the output or context limit.
+- An event that stays in the terminal and repeats itself back to back counts in the block it
+  repeats. That block ends with `· Repeats: 3`, so a run of the same report takes one row.
 
 ## Editing & text
 
@@ -458,9 +460,9 @@ Gemini on Google Vertex AI through a service account key file.
   `/logout`, `/remote`, `/sources`, and `/system` refuse with a reply that names the terminal, and
   so does a message while the session is signed out or has no model.
 - A command picker is an inline keyboard under one message, with a `✓` on the current row and a
-  `Cancel` button. A stepped `/model` edits the same message per step and adds `‹ Back`. A pick
-  edits the message to state the result and removes the keyboard, and a tap on a closed list answers
-  the toast `This list is closed.`
+  `Cancel` button. A stepped `/model` edits the same message per step and adds `‹ Back`. The message
+  is scaffolding: a pick and a cancel take it out of the chat, so the event of the command states
+  the result once. A tap on a closed list answers the toast `This list is closed.`
 - The `/model` keyboard lists the cached models alone, because a fetch runs in the terminal. A skill
   row loads the skill with no task at once. The `/help` keyboard lists the commands that run from
   Telegram, and the bot registers the same commands with Telegram at the attach.
@@ -477,6 +479,11 @@ Gemini on Google Vertex AI through a service account key file.
 - The chat mirrors every committed answer, event, skill head line, and retry line once. The Telegram
   HTML holds bold, italic, code, links, quotes, and `pre` blocks for fences and tables. A reasoning
   block, a tool box, and a user box stay in the terminal.
+- Every event and every line that Drinky wrote for the user takes a quote bar and the symbol of its
+  role. The symbol is `ℹ` for an event, `⚠` for a failed event, and `▸` for a line for the user, a
+  reply included. An answer of the model takes neither, so the chat tells the two apart. The
+  activity message with its summary, the failed turn message, and a picker are controls of the turn
+  and take no bar.
 - A block above 4096 characters continues in a new message that reopens the open tags. A text that
   Telegram cannot parse goes again as plain text.
 - One activity message per turn shows `Thinking`, `Writing`, or `Running: bash` with the call count.
@@ -493,16 +500,19 @@ Gemini on Google Vertex AI through a service account key file.
   after the next attach.
 - Every message goes out silent except the last message of a completed or failed turn, so the chat
   notifies once per turn.
-- A Telegram message gets its mark at the receipt of the turn: 👍 when it committed and 👎 when it
-  dropped. A frozen chat keeps its last marks.
-- An event that a send to the chat caused stays in the terminal, so a failure cannot feed itself.
+- A Telegram message gets 👀 as soon as Drinky takes it, then 👍 at the round that commits it. A
+  message that the receipt of the turn did not commit gets 👎. A frozen chat keeps its last marks.
+- An event about the poll or the send of the chat stays in the terminal. A poll outage means that
+  the chat is out of reach, and a report of a send failure feeds itself.
 - The long poll keeps its own head window, so a short configured request timeout never turns it into
   a busy poll.
-- A failed poll or send retries with a backoff and records one `Error:` event at the first failure
-  and one event at the recovery. A 429 waits the named seconds in silence, and a rejection that no
-  retry can fix drops that one message with an event.
-- The send queue takes each message at once, and a full queue drops the message and reports the
-  first drop of a run.
+- A failed poll or send retries with a backoff. An outage that lasts 30 seconds records one `Error:`
+  event, and its recovery records one event, so a network that flaps costs no line. A 429 waits the
+  named seconds in silence, and a rejection that no retry can fix drops that one message with an
+  event.
+- The send queue takes each message at once, and a full queue drops the message. Once the queue has
+  room again, one `⚠` line in the chat states how many messages the run dropped. The line names the
+  terminal, which holds the whole transcript. A dropped mark or edit stays silent.
 - A revoked token, a blocked bot, a second poller on the same bot, and a rejected poll each detach
   with an `Error:` event. A credential rejection detaches before the login picker opens.
 - A detach and the exit send the detach event alone, within a bound, and drop every pending send.

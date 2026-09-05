@@ -1,5 +1,5 @@
 //! The Telegram Bot API client: one HTTPS POST with a JSON body per call, and
-//! the reply classified by its status. The client knows the eight methods that
+//! the reply classified by its status. The client knows the nine methods that
 //! the transport, the mirror, and the keyboards need and nothing of the session.
 //!
 //! The URL of every call carries the token, so no error, event, or log names a
@@ -140,6 +140,12 @@ pub const SendOptions = struct {
     /// The `reply_markup` object of an inline keyboard as JSON, or null for a
     /// message without one. Borrowed for the call.
     markup: ?[]const u8 = null,
+};
+
+/// The message of a chat that an edit, a deletion, or a reaction acts on.
+pub const Target = struct {
+    chat_id: i64,
+    message_id: i64,
 };
 
 /// One command that `setMyCommands` registers, so the chat completes it.
@@ -336,21 +342,20 @@ pub fn sendMessage(
     return integerOf(result.get("message_id")) orelse error.MalformedReply;
 }
 
-/// Replace the text of the message `message_id` in `chat_id`, and its inline
-/// keyboard with `markup`. A null `markup` removes the keyboard, because an
-/// edit without one drops it. An edit to the state the message already holds
-/// changes nothing, and that is the state the caller asked for, so Telegram's
-/// refusal of it reads as success.
+/// Replace the text of the message `target`, and its inline keyboard with
+/// `markup`. A null `markup` removes the keyboard, because an edit without one
+/// drops it. An edit to the state the message already holds changes nothing,
+/// and that is the state the caller asked for, so Telegram's refusal of it
+/// reads as success.
 pub fn editMessageText(
     self: *Client,
-    chat_id: i64,
-    message_id: i64,
+    target: Target,
     text: []const u8,
     markup: ?[]const u8,
 ) Error!void {
     const body = try std.json.Stringify.valueAlloc(self.gpa, .{
-        .chat_id = chat_id,
-        .message_id = message_id,
+        .chat_id = target.chat_id,
+        .message_id = target.message_id,
         .text = text,
         .reply_markup = raw(markup),
     }, .{ .emit_null_optional_fields = false });
@@ -362,6 +367,20 @@ pub fn editMessageText(
         },
         else => return err,
     };
+    defer reply.deinit();
+    _ = try reply.result();
+}
+
+/// Take the message `target` out of its chat. Telegram lets a bot delete its
+/// own message for 48 hours, which every message of a picker stays inside.
+pub fn deleteMessage(self: *Client, target: Target) Error!void {
+    const body = try std.json.Stringify.valueAlloc(
+        self.gpa,
+        .{ .chat_id = target.chat_id, .message_id = target.message_id },
+        .{},
+    );
+    defer self.gpa.free(body);
+    const reply = try self.call("deleteMessage", body);
     defer reply.deinit();
     _ = try reply.result();
 }
@@ -380,18 +399,13 @@ pub fn answerCallbackQuery(self: *Client, query_id: []const u8, text: ?[]const u
     _ = try reply.result();
 }
 
-/// Set the one reaction of the bot on the message `message_id` in `chat_id`.
-/// Telegram allows a fixed emoji list for a bot.
-pub fn setMessageReaction(
-    self: *Client,
-    chat_id: i64,
-    message_id: i64,
-    emoji: []const u8,
-) Error!void {
+/// Set the one reaction of the bot on the message `target`. Telegram allows a
+/// fixed emoji list for a bot.
+pub fn setMessageReaction(self: *Client, target: Target, emoji: []const u8) Error!void {
     const ReactionType = struct { type: []const u8 = "emoji", emoji: []const u8 };
     const body = try std.json.Stringify.valueAlloc(self.gpa, .{
-        .chat_id = chat_id,
-        .message_id = message_id,
+        .chat_id = target.chat_id,
+        .message_id = target.message_id,
         .reaction = [_]ReactionType{.{ .emoji = emoji }},
     }, .{});
     defer self.gpa.free(body);
@@ -765,10 +779,14 @@ test "editMessageText states its target and keyboard, and an unchanged text coun
         .connect_ms = 5_000,
     };
 
-    try client.editMessageText(99, 314, "Writing", null);
-    try client.editMessageText(99, 314, "Writing", "{\"inline_keyboard\":[]}");
-    try client.editMessageText(99, 314, "Writing", null);
-    try std.testing.expectError(error.Rejected, client.editMessageText(99, 315, "Writing", null));
+    const target: Target = .{ .chat_id = 99, .message_id = 314 };
+    try client.editMessageText(target, "Writing", null);
+    try client.editMessageText(target, "Writing", "{\"inline_keyboard\":[]}");
+    try client.editMessageText(target, "Writing", null);
+    try std.testing.expectError(
+        error.Rejected,
+        client.editMessageText(.{ .chat_id = 99, .message_id = 315 }, "Writing", null),
+    );
     try server.finish();
     // An edit without a keyboard names none, so the message loses the one it holds.
     try std.testing.expectEqualStrings(
@@ -778,6 +796,38 @@ test "editMessageText states its target and keyboard, and an unchanged text coun
     try std.testing.expectEqualStrings(
         "{\"chat_id\":99,\"message_id\":314,\"text\":\"Writing\",\"reply_markup\":{\"inline_keyboard\":[]}}",
         server.requests.items[1].body,
+    );
+}
+
+test "deleteMessage names the message it takes out of the chat" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var server = try testing.Server.init(gpa, io, &.{.{ .method = "deleteMessage", .replies = &.{
+        .{ .body = "{\"ok\":true,\"result\":true}" },
+        .{ .status = 400, .body = "{\"ok\":false,\"error_code\":400,\"description\":\"Bad Request: message to delete not found\"}" },
+    } }});
+    defer server.deinit();
+    try server.start();
+    var url_buffer: [64]u8 = undefined;
+    var client: Client = .{
+        .gpa = gpa,
+        .io = io,
+        .base_url = server.url(&url_buffer),
+        .token = "t",
+        .connect_ms = 5_000,
+    };
+
+    try client.deleteMessage(.{ .chat_id = 99, .message_id = 314 });
+    try std.testing.expectError(
+        error.Rejected,
+        client.deleteMessage(.{ .chat_id = 99, .message_id = 315 }),
+    );
+    try server.finish();
+    try std.testing.expectEqualStrings(
+        "{\"chat_id\":99,\"message_id\":314}",
+        server.requests.items[0].body,
     );
 }
 
@@ -861,7 +911,7 @@ test "setMessageReaction sets one emoji" {
         .connect_ms = 5_000,
     };
 
-    try client.setMessageReaction(99, 7, "👍");
+    try client.setMessageReaction(.{ .chat_id = 99, .message_id = 7 }, "👍");
     try server.finish();
     try std.testing.expectEqualStrings(
         "{\"chat_id\":99,\"message_id\":7,\"reaction\":[{\"type\":\"emoji\",\"emoji\":\"👍\"}]}",
