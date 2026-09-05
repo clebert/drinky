@@ -9,7 +9,8 @@
 //! The activity message holds the `Cancel turn` and `Withdraw` buttons of the
 //! turn, and the failed turn message holds `Try again` and `Dismiss`. A tap
 //! names the serial of its keyboard, so the mirror tells a tap on the running
-//! turn from a tap on a keyboard the chat history still shows.
+//! turn from a tap on a keyboard the chat history still shows. The mirror holds
+//! no tap state: each tap acts at once or reads as stale.
 //!
 //! The mirror talks to the chat through `chat`: a pointer to the controller, or
 //! to a recorder in a test, with `listens`, `send`, `sendTracked`, and `edit`.
@@ -38,10 +39,8 @@ const activity_bytes_max = 96;
 /// The parse mode of every message that the mirror sends.
 const parse_mode = "HTML";
 
-/// The buttons of the activity message. The first tap on the cancel button
-/// changes its label, and the second tap is the decision.
+/// The buttons of the activity message.
 const cancel_label = "Cancel turn";
-const cancel_armed_label = "Tap again to cancel";
 const withdraw_label = "Withdraw";
 
 /// The failed turn message and its buttons. The text takes the title of the
@@ -99,16 +98,6 @@ pub const End = struct {
     pub const Outcome = enum { completed, canceled, failed };
 };
 
-/// What a tap on the cancel button did.
-pub const Cancel = enum {
-    /// The tap names no running turn.
-    stale,
-    /// The first tap armed the second, and the label states it.
-    armed,
-    /// The second tap is the decision, so the caller cancels the turn.
-    cancel,
-};
-
 const Turn = struct {
     started_ms: i64,
     /// The activity message, or null while the chat holds none.
@@ -117,8 +106,6 @@ const Turn = struct {
     activity: Activity,
     /// The serial of the keyboard of the activity message.
     serial: u64,
-    /// Whether the first tap on the cancel button armed the second.
-    armed: bool,
 };
 
 const RetryMessage = struct {
@@ -224,7 +211,6 @@ pub fn beginTurn(self: *Mirror, chat: anytype, now_ms: i64) !void {
         .handle = null,
         .activity = .idle,
         .serial = self.nextSerial(),
-        .armed = false,
     };
     if (!chat.listens()) return;
     try self.startActivity(chat);
@@ -269,7 +255,7 @@ fn activityMarkup(self: *Mirror, turn: *const Turn) ![]u8 {
     var withdraw_data: [keyboard.data_bytes_max]u8 = undefined;
     return keyboard.markup(self.gpa, &.{
         .{
-            .text = if (turn.armed) cancel_armed_label else cancel_label,
+            .text = cancel_label,
             .data = (keyboard.Tap{ .cancel_turn = turn.serial }).write(&cancel_data),
         },
         .{
@@ -327,19 +313,9 @@ pub fn dismissRetry(self: *Mirror, chat: anytype) !void {
     try chat.edit(handle, retry_text, null);
 }
 
-/// A tap on the cancel button of the keyboard `serial`. The first tap on the
-/// running turn arms the second and changes the label, and the second tap is
-/// the decision. The label stays until then or until the end of the turn.
-pub fn tapCancel(self: *Mirror, chat: anytype, serial: u64) !Cancel {
-    const turn = if (self.turn) |*turn| turn else return .stale;
-    if (turn.serial != serial) return .stale;
-    if (turn.armed) return .cancel;
-    turn.armed = true;
-    try self.editActivity(chat, turn);
-    return .armed;
-}
-
-/// Whether a tap on the keyboard `serial` names the running turn.
+/// Whether a tap on the keyboard `serial` names the running turn. A tap on the
+/// cancel button of the running turn cancels it at once, because the button
+/// means one thing.
 pub fn namesTurn(self: *const Mirror, serial: u64) bool {
     const turn = self.turn orelse return false;
     return turn.serial == serial;
@@ -360,7 +336,6 @@ pub fn detached(self: *Mirror) void {
     self.retry = null;
     const turn = if (self.turn) |*turn| turn else return;
     turn.handle = null;
-    turn.armed = false;
 }
 
 /// The next serial. A random seed can stand near the end of the range, so the
@@ -571,9 +546,8 @@ const Recorder = struct {
 
 /// The keyboard of the activity message with the serial `serial`, as the chat
 /// receives it.
-fn activityKeyboard(comptime serial: []const u8, comptime armed: bool) []const u8 {
-    const label = if (armed) cancel_armed_label else cancel_label;
-    return "{\"inline_keyboard\":[[{\"text\":\"" ++ label ++ "\",\"callback_data\":\"cancel:" ++
+fn activityKeyboard(comptime serial: []const u8) []const u8 {
+    return "{\"inline_keyboard\":[[{\"text\":\"Cancel turn\",\"callback_data\":\"cancel:" ++
         serial ++ "\"}],[{\"text\":\"Withdraw\",\"callback_data\":\"withdraw:" ++ serial ++ "\"}]]}";
 }
 
@@ -707,7 +681,7 @@ test "the activity message edits on a state change alone, and the summary ends i
     try std.testing.expectEqualStrings("Thinking", chat.sends.items[0].text);
     try std.testing.expect(chat.sends.items[0].handle != null);
     try std.testing.expect(chat.sends.items[0].options.disable_notification);
-    try std.testing.expectEqualStrings(activityKeyboard("1", false), chat.sends.items[0].markup.?);
+    try std.testing.expectEqualStrings(activityKeyboard("1"), chat.sends.items[0].markup.?);
     const handle = chat.sends.items[0].handle.?;
 
     // Every edit of the state carries the keyboard, because an edit without
@@ -717,7 +691,7 @@ test "the activity message edits on a state change alone, and the summary ends i
     try mirror.sync(&chat, &blocks.live(1, .{ .streaming = .model, .tool = null, .calls = 0 }));
     try std.testing.expectEqualStrings("Writing", chat.lastEdit().text);
     try std.testing.expectEqual(handle, chat.lastEdit().handle);
-    try std.testing.expectEqualStrings(activityKeyboard("1", false), chat.lastEdit().markup.?);
+    try std.testing.expectEqualStrings(activityKeyboard("1"), chat.lastEdit().markup.?);
     try mirror.sync(&chat, &blocks.live(1, .{ .streaming = null, .tool = "bash", .calls = 1 }));
     try std.testing.expectEqualStrings("Running: bash · Tools: 1 call", chat.lastEdit().text);
     try mirror.sync(&chat, &blocks.live(1, .{ .streaming = null, .tool = "bash", .calls = 1 }));
@@ -745,41 +719,34 @@ test "the activity message edits on a state change alone, and the summary ends i
     try std.testing.expect(chat.lastEdit().markup == null);
     try std.testing.expect(mirror.turn == null);
     // The turn is over, so a tap on its keyboard is stale.
-    try std.testing.expectEqual(Cancel.stale, try mirror.tapCancel(&chat, 1));
     try std.testing.expect(!mirror.namesTurn(1));
 }
 
-// A cancel destroys the work of the turn, so one tap warns and the second tap
-// is the decision. The label states the arm until then or until the end of the
-// turn, and the state edits keep it.
-test "the first cancel tap arms the second, and a stale tap names no turn" {
+// A tap names the serial of its keyboard, and the running turn alone answers to
+// its own serial. The keyboard of a turn never changes, so a tap costs no edit.
+test "a tap names the running turn alone, and the next turn makes its serial stale" {
     const gpa = std.testing.allocator;
     var chat: Recorder = .{ .gpa = gpa };
     defer chat.deinit();
     var blocks: Blocks = .{ .gpa = gpa };
     defer blocks.deinit();
     var mirror = Mirror.init(gpa);
+    try std.testing.expect(!mirror.namesTurn(1));
     try mirror.beginTurn(&chat, 0);
 
-    try std.testing.expectEqual(Cancel.stale, try mirror.tapCancel(&chat, 7));
     try std.testing.expect(!mirror.namesTurn(7));
     try std.testing.expect(mirror.namesTurn(1));
-    try std.testing.expectEqual(@as(usize, 0), chat.edits.items.len);
-    try std.testing.expectEqual(Cancel.armed, try mirror.tapCancel(&chat, 1));
-    try std.testing.expectEqualStrings("Thinking", chat.lastEdit().text);
-    try std.testing.expectEqualStrings(activityKeyboard("1", true), chat.lastEdit().markup.?);
     try mirror.sync(&chat, &blocks.live(0, .{ .streaming = .model, .tool = null, .calls = 0 }));
     try std.testing.expectEqualStrings("Writing", chat.lastEdit().text);
-    try std.testing.expectEqualStrings(activityKeyboard("1", true), chat.lastEdit().markup.?);
-    try std.testing.expectEqual(Cancel.cancel, try mirror.tapCancel(&chat, 1));
-    try std.testing.expectEqual(@as(usize, 2), chat.edits.items.len);
+    try std.testing.expectEqualStrings(activityKeyboard("1"), chat.lastEdit().markup.?);
+    try std.testing.expectEqual(@as(usize, 1), chat.edits.items.len);
 
-    // The next turn opens a new keyboard, unarmed, so the old serial is stale.
+    // The next turn opens a new keyboard, so the old serial is stale.
     try mirror.endTurn(&chat, &blocks.idle(), &.{ .outcome = .canceled, .status = &test_status, .now_ms = 0 });
     try mirror.beginTurn(&chat, 0);
-    try std.testing.expectEqualStrings(activityKeyboard("2", false), chat.lastSend().markup.?);
-    try std.testing.expectEqual(Cancel.stale, try mirror.tapCancel(&chat, 1));
-    try std.testing.expectEqual(Cancel.armed, try mirror.tapCancel(&chat, 2));
+    try std.testing.expectEqualStrings(activityKeyboard("2"), chat.lastSend().markup.?);
+    try std.testing.expect(!mirror.namesTurn(1));
+    try std.testing.expect(mirror.namesTurn(2));
 }
 
 // A failure that arms a retry gives the chat the two controls of the terminal
@@ -844,22 +811,21 @@ test "a seed moves the serials past the keyboards of an earlier process" {
 
     mirror.seedSerials(1_000);
     try mirror.beginTurn(&chat, 0);
-    try std.testing.expectEqualStrings(activityKeyboard("1001", false), chat.lastSend().markup.?);
-    try std.testing.expectEqual(Cancel.stale, try mirror.tapCancel(&chat, 1));
+    try std.testing.expectEqualStrings(activityKeyboard("1001"), chat.lastSend().markup.?);
     try std.testing.expect(!mirror.namesTurn(1));
-    try std.testing.expectEqual(Cancel.armed, try mirror.tapCancel(&chat, 1_001));
+    try std.testing.expect(mirror.namesTurn(1_001));
     try mirror.endTurn(&chat, &blocks.idle(), &.{ .outcome = .canceled, .status = &test_status, .now_ms = 0 });
 
     mirror.seedSerials(std.math.maxInt(u64));
     try mirror.beginTurn(&chat, 0);
-    try std.testing.expectEqualStrings(activityKeyboard("0", false), chat.lastSend().markup.?);
+    try std.testing.expectEqualStrings(activityKeyboard("0"), chat.lastSend().markup.?);
     try std.testing.expect(mirror.namesTurn(0));
 }
 
 // The detach leaves the chat as it stands, so the mirror forgets its messages
 // there without an edit. The turn keeps its state, and the next attach sends a
-// new activity message, unarmed, and a new failed turn message for a retry that
-// still waits. A tap on the old keyboards then reads as stale.
+// new activity message and a new failed turn message for a retry that still
+// waits. A tap on the old keyboards then reads as stale.
 test "a detach forgets the messages of the chat and keeps the turn" {
     const gpa = std.testing.allocator;
     var chat: Recorder = .{ .gpa = gpa };
@@ -869,7 +835,6 @@ test "a detach forgets the messages of the chat and keeps the turn" {
     var mirror = Mirror.init(gpa);
     try mirror.open(&chat, &.{ .blocks = &.{}, .committed = 0, .tail = null, .retry_waits = true });
     try mirror.beginTurn(&chat, 0);
-    _ = try mirror.tapCancel(&chat, 2);
     const edits = chat.edits.items.len;
 
     mirror.detached();
@@ -877,9 +842,10 @@ test "a detach forgets the messages of the chat and keeps the turn" {
     try std.testing.expect(mirror.retry == null);
     try std.testing.expect(!mirror.namesRetry(1));
     try std.testing.expect(mirror.turn != null);
+    try std.testing.expect(mirror.namesTurn(2));
     try mirror.open(&chat, &.{ .blocks = &.{}, .committed = 0, .tail = null, .retry_waits = true });
     try std.testing.expectEqualStrings(retryKeyboard("3"), chat.sends.items[2].markup.?);
-    try std.testing.expectEqualStrings(activityKeyboard("2", false), chat.lastSend().markup.?);
+    try std.testing.expectEqualStrings(activityKeyboard("2"), chat.lastSend().markup.?);
     try std.testing.expectEqual(edits, chat.edits.items.len);
 }
 

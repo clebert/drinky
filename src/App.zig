@@ -3166,13 +3166,12 @@ fn submitChatMessage(self: *App, text: []const u8, message_id: i64) !void {
                 return self.controller.reply(message_id, refusal.content);
             }
             // The draft and the slot come first, so the channel push is the only
-            // fallible step before the mirror moves in.
+            // fallible step. The receipt of the turn marks the message later.
             var draft = try ui.Editor.Draft.fromText(self.gpa, text);
             errdefer draft.deinit(self.gpa);
             try self.session.reserveSteering();
             try self.agent.steering.push(text);
-            self.session.commitExternalSteering(&draft, message_id);
-            return self.controller.react(message_id, .seen);
+            return self.session.commitExternalSteering(&draft, message_id);
         },
         .prompt => {},
         // The terminal takes no input while the bot holds it, so no picker and
@@ -3198,20 +3197,18 @@ fn submitChatMessage(self: *App, text: []const u8, message_id: i64) !void {
     if (self.agent.model == null) return self.controller.reply(message_id, telegram_no_model_refusal);
     // The draft comes first, so the turn start is the last fallible step. The
     // prompt then follows the rule of a queued Telegram message: it fills no editor
-    // while the bot holds the input, and it returns after a detach.
+    // while the bot holds the input, and it returns after a detach. The receipt
+    // of the turn marks it, and a refused message gets its reply instead.
     var draft = try ui.Editor.Draft.fromText(self.gpa, text);
     errdefer draft.deinit(self.gpa);
     const base = try self.startUserTurn(text);
     self.session.retainExternalTurnPrompt(&draft, base, message_id);
-    // The message runs now, so the chat marks it as received. A refused message
-    // gets its reply instead, because no receipt settles it later.
-    try self.controller.react(message_id, .seen);
 }
 
 /// Where a command of the chat came from, so its result finds its place.
 const ChatOrigin = union(enum) {
     /// A command line in a message. A notice answers it as a reply, and a turn
-    /// it starts marks it as received.
+    /// it starts retains it as the prompt.
     message: Line,
     /// A tap on the open picker, with the query to answer. A notice answers it
     /// as a toast, and the picker message states the result.
@@ -3297,7 +3294,6 @@ fn startChatSkillTurn(
             errdefer draft.deinit(self.gpa);
             const base = try self.startSkillTurn(prompt);
             self.session.retainExternalTurnPrompt(&draft, base, line.id);
-            try self.controller.react(line.id, .seen);
         },
         .tap => |query_id| {
             // The picker states the result before the turn makes it stale.
@@ -3347,13 +3343,10 @@ const list_closed_toast = "This list is closed.";
 /// states that.
 fn handleChatTap(self: *App, query_id: []const u8, tap: remote.keyboard.Tap) !void {
     switch (tap) {
-        .cancel_turn => |serial| switch (try self.mirror.tapCancel(&self.controller, serial)) {
-            .stale => try self.controller.answer(query_id, turn_over_toast),
-            .armed => try self.controller.answer(query_id, null),
-            .cancel => {
-                try self.controller.answer(query_id, null);
-                try self.cancelTurn();
-            },
+        .cancel_turn => |serial| {
+            if (!self.mirror.namesTurn(serial)) return self.controller.answer(query_id, turn_over_toast);
+            try self.controller.answer(query_id, null);
+            try self.cancelTurn();
         },
         .withdraw => |serial| {
             if (!self.mirror.namesTurn(serial)) return self.controller.answer(query_id, turn_over_toast);
@@ -9896,10 +9889,6 @@ test "a Telegram message during a turn queues as steering that drops while the b
             .{ .body = remote_ok_sent },
             .{ .body = remote_ok_sent },
         } },
-        .{ .method = "setMessageReaction", .replies = &.{
-            .{ .body = remote_ok_true },
-            .{ .body = remote_ok_true },
-        } },
     });
     defer server.deinit();
     try server.start();
@@ -9921,9 +9910,6 @@ test "a Telegram message during a turn queues as steering that drops while the b
     try app.submitChatMessage("/nope", 14);
     try std.testing.expectEqual(@as(usize, 2), app.session.steering.items.len);
     try std.testing.expectEqual(@as(i64, 12), app.session.steering.items[1].source.external);
-    // The queued message gets its 👀, and a refused line gets its reply alone.
-    const seen = try server.waitForRequest("/setMessageReaction", 0);
-    try std.testing.expect(std.mem.indexOf(u8, seen, "\"message_id\":12,\"reaction\":[{\"type\":\"emoji\",\"emoji\":\"👀\"}]") != null);
     const queued = try app.agent.steering.take();
     defer {
         for (queued) |message| gpa.free(message);
@@ -9931,8 +9917,11 @@ test "a Telegram message during a turn queues as steering that drops while the b
     }
     try std.testing.expectEqual(@as(usize, 2), queued.len);
     try std.testing.expectEqualStrings("from the chat", queued[1]);
+    // The queued message gets no mark before the receipt, and a refused line
+    // gets its reply alone.
     const refusal = try server.waitForSend(1);
     try std.testing.expect(std.mem.indexOf(u8, refusal, "The command /new cannot run while a turn runs.") != null);
+    try std.testing.expectEqual(@as(usize, 0), server.countOf("/setMessageReaction"));
     // The registry decides first, so an unknown line keeps its own refusal
     // instead of the one that names the turn.
     const unknown = try server.waitForSend(2);
@@ -9955,8 +9944,6 @@ test "a Telegram message during a turn queues as steering that drops while the b
     app.session.editor.clear();
     app.session.beginTurn(2);
     try app.submitChatMessage("after the detach", 14);
-    // The close drops what the queue still holds, so the mark goes out first.
-    _ = try server.waitForRequest("/setMessageReaction", 1);
     try app.controller.detach(.user);
     try std.testing.expect(app.session.input.owner == .none);
     try app.session.endTurnWithReceipt(&.{
@@ -9969,6 +9956,7 @@ test "a Telegram message during a turn queues as steering that drops while the b
     try std.testing.expectEqualStrings("after the detach", app.session.editor.visible());
     app.agent.steering.clear();
     try server.finish();
+    try std.testing.expectEqual(@as(usize, 0), server.countOf("/setMessageReaction"));
 }
 
 // The chat follows the transcript: the activity message opens the turn, the
@@ -9991,7 +9979,7 @@ test "the chat mirrors a completed turn with its activity message, its answer, a
             .{ .body = remote_ok_sent },
         } },
         .{ .method = "editMessageText", .replies = &.{ .{ .body = remote_ok_true }, .{ .body = remote_ok_true } } },
-        .{ .method = "setMessageReaction", .replies = &.{ .{ .body = remote_ok_true }, .{ .body = remote_ok_true } } },
+        .{ .method = "setMessageReaction", .replies = &.{.{ .body = remote_ok_true }} },
     });
     defer server.deinit();
     try server.start();
@@ -10012,7 +10000,6 @@ test "the chat mirrors a completed turn with its activity message, its answer, a
     var draft = try ui.Editor.Draft.fromText(gpa, "from Telegram");
     app.session.retainExternalTurnPrompt(&draft, base, 7);
     try app.mirror.beginTurn(&app.controller, app.nowMs());
-    try app.controller.react(7, .seen);
     const activity = try server.waitForSend(1);
     try std.testing.expect(std.mem.indexOf(u8, activity, "\"text\":\"Thinking\"") != null);
 
@@ -10056,9 +10043,11 @@ test "the chat mirrors a completed turn with its activity message, its answer, a
     // line does. The summary holds no button.
     try std.testing.expect(std.mem.indexOf(u8, summary, " · Context: 0 · Cost: ~$0.00\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, summary, "reply_markup") == null);
-    const committed = try server.waitForRequest("/setMessageReaction", 1);
+    const committed = try server.waitForRequest("/setMessageReaction", 0);
     try std.testing.expect(std.mem.indexOf(u8, committed, "\"message_id\":7,\"reaction\":[{\"type\":\"emoji\",\"emoji\":\"👍\"}]") != null);
     try server.finish();
+    // The prompt gets one mark: the receipt alone marks a message.
+    try std.testing.expectEqual(@as(usize, 1), server.countOf("/setMessageReaction"));
 }
 
 // A failed turn marks what it did not commit: the prompt of a turn that
@@ -10084,7 +10073,6 @@ test "a failed turn marks its uncommitted messages and notifies its error" {
         .{ .method = "setMessageReaction", .replies = &.{
             .{ .body = remote_ok_true },
             .{ .body = remote_ok_true },
-            .{ .body = remote_ok_true },
         } },
     });
     defer server.deinit();
@@ -10104,7 +10092,8 @@ test "a failed turn marks its uncommitted messages and notifies its error" {
     var draft = try ui.Editor.Draft.fromText(gpa, "from Telegram");
     app.session.retainExternalTurnPrompt(&draft, base, 7);
     try app.mirror.beginTurn(&app.controller, app.nowMs());
-    // A second message queues as steering while the turn runs.
+    // A second message queues as steering while the turn runs. It gets no mark
+    // before the receipt.
     try app.submitChatMessage("and this", 8);
     try std.testing.expectEqual(@as(usize, 1), app.session.steering.items.len);
 
@@ -10124,13 +10113,12 @@ test "a failed turn marks its uncommitted messages and notifies its error" {
     try std.testing.expect(std.mem.indexOf(u8, failure, "\"disable_notification\":false") != null);
     const summary = try server.waitForRequest("/editMessageText", 0);
     try std.testing.expect(std.mem.indexOf(u8, summary, "\"text\":\"Failed · Tools: 0 calls · Time: ") != null);
-    const seen = try server.waitForRequest("/setMessageReaction", 0);
-    try std.testing.expect(std.mem.indexOf(u8, seen, "\"message_id\":8,\"reaction\":[{\"type\":\"emoji\",\"emoji\":\"👀\"}]") != null);
-    const prompt = try server.waitForRequest("/setMessageReaction", 1);
+    const prompt = try server.waitForRequest("/setMessageReaction", 0);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "\"message_id\":7,\"reaction\":[{\"type\":\"emoji\",\"emoji\":\"👎\"}]") != null);
-    const dropped = try server.waitForRequest("/setMessageReaction", 2);
+    const dropped = try server.waitForRequest("/setMessageReaction", 1);
     try std.testing.expect(std.mem.indexOf(u8, dropped, "\"message_id\":8,\"reaction\":[{\"type\":\"emoji\",\"emoji\":\"👎\"}]") != null);
     try server.finish();
+    try std.testing.expectEqual(@as(usize, 2), server.countOf("/setMessageReaction"));
 }
 
 // A command line from Telegram runs where the registry allows it. A picker
@@ -10208,10 +10196,10 @@ test "a Telegram command opens a keyboard, a tap picks a row, and a stale tap ge
     try server.finish();
 }
 
-// The buttons of the activity message drive the turn. A cancel destroys the work
-// of the turn, so the first tap changes the label and the second tap cancels. A
-// withdraw drops the queue like Ctrl+P and marks each dropped Telegram message.
-test "the activity keyboard cancels the turn on the second tap and withdraws the queue" {
+// The buttons of the activity message drive the turn. The cancel button means
+// one thing, so one tap cancels the turn. A withdraw drops the queue like Ctrl+P
+// and marks each dropped Telegram message.
+test "the activity keyboard cancels the turn on one tap and withdraws the queue" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
@@ -10226,10 +10214,9 @@ test "the activity keyboard cancels the turn on the second tap and withdraws the
             .{ .body = remote_ok_sent },
             .{ .body = "{\"ok\":true,\"result\":{\"message_id\":50}}" },
         } },
-        .{ .method = "editMessageText", .replies = &.{ .{ .body = remote_ok_true }, .{ .body = remote_ok_true } } },
-        .{ .method = "setMessageReaction", .replies = &.{ .{ .body = remote_ok_true }, .{ .body = remote_ok_true } } },
+        .{ .method = "editMessageText", .replies = &.{.{ .body = remote_ok_true }} },
+        .{ .method = "setMessageReaction", .replies = &.{.{ .body = remote_ok_true }} },
         .{ .method = "answerCallbackQuery", .replies = &.{
-            .{ .body = remote_ok_true },
             .{ .body = remote_ok_true },
             .{ .body = remote_ok_true },
             .{ .body = remote_ok_true },
@@ -10253,8 +10240,8 @@ test "the activity keyboard cancels the turn on the second tap and withdraws the
     const activity = try server.waitForSend(1);
     try std.testing.expect(std.mem.indexOf(u8, activity, "[{\"text\":\"Cancel turn\",\"callback_data\":\"cancel:1\"}]") != null);
     try std.testing.expect(std.mem.indexOf(u8, activity, "[{\"text\":\"Withdraw\",\"callback_data\":\"withdraw:1\"}]") != null);
+    // The queued message gets no mark until the receipt of the turn.
     try app.submitChatMessage("queued", 12);
-    _ = try server.waitForRequest("/setMessageReaction", 0);
 
     // A tap on a keyboard of another turn gets the toast and changes nothing.
     try app.handleChatTap("900", .{ .cancel_turn = 7 });
@@ -10263,12 +10250,13 @@ test "the activity keyboard cancels the turn on the second tap and withdraws the
         try server.waitForRequest("/answerCallbackQuery", 0),
     );
     try std.testing.expect(app.session.mode == .turn);
+    try std.testing.expectEqual(@as(usize, 0), server.countOf("/setMessageReaction"));
 
     // The withdraw drops the queue and marks the message. The chat holds its
     // text, so no editor takes it. A second withdraw finds nothing.
     try app.handleChatTap("901", .{ .withdraw = 1 });
     try std.testing.expectEqualStrings("{\"callback_query_id\":\"901\"}", try server.waitForRequest("/answerCallbackQuery", 1));
-    const dropped = try server.waitForRequest("/setMessageReaction", 1);
+    const dropped = try server.waitForRequest("/setMessageReaction", 0);
     try std.testing.expect(std.mem.indexOf(u8, dropped, "\"message_id\":12,\"reaction\":[{\"type\":\"emoji\",\"emoji\":\"👎\"}]") != null);
     try std.testing.expectEqual(@as(usize, 0), app.session.steering.items.len);
     try std.testing.expectEqualStrings("", app.session.editor.visible());
@@ -10278,21 +10266,18 @@ test "the activity keyboard cancels the turn on the second tap and withdraws the
         try server.waitForRequest("/answerCallbackQuery", 2),
     );
 
-    // The first cancel tap arms the second and changes the label. The second
-    // tap cancels the turn, and the summary opens with the outcome.
+    // One tap on the running turn cancels it, and the summary opens with the
+    // outcome. No edit changes the label before it.
     try spawnCanceledTurn(&app);
     try app.handleChatTap("903", .{ .cancel_turn = 1 });
-    try std.testing.expect(app.session.mode == .turn);
-    const armed = try server.waitForRequest("/editMessageText", 0);
-    try std.testing.expect(std.mem.indexOf(u8, armed, "\"text\":\"Thinking\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, armed, "[{\"text\":\"Tap again to cancel\",\"callback_data\":\"cancel:1\"}]") != null);
-    try app.handleChatTap("904", .{ .cancel_turn = 1 });
     try std.testing.expect(app.session.mode == .prompt);
-    const summary = try server.waitForRequest("/editMessageText", 1);
+    try std.testing.expectEqualStrings("{\"callback_query_id\":\"903\"}", try server.waitForRequest("/answerCallbackQuery", 3));
+    const summary = try server.waitForRequest("/editMessageText", 0);
     try std.testing.expect(std.mem.indexOf(u8, summary, "\"text\":\"Canceled · Tools: 0 calls · Time: ") != null);
     try std.testing.expect(std.mem.indexOf(u8, summary, "reply_markup") == null);
-    _ = try server.waitForRequest("/answerCallbackQuery", 4);
     try server.finish();
+    try std.testing.expectEqual(@as(usize, 1), server.countOf("/editMessageText"));
+    try std.testing.expectEqual(@as(usize, 1), server.countOf("/setMessageReaction"));
 }
 
 // A failed turn that armed a retry gives the chat the two controls of the

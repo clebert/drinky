@@ -64,3 +64,4 @@ decision already taken, or a dependency on another entry. Module layout and exte
 - Keep the request prefix byte-stable, so a local server reuses its prompt cache.
 - Read the window of a server model from the native endpoint of its server.
 - Run the FrontierHarness Eval tasks through a Harbor agent adapter.
+- Let the user add optional task text after a skill selection in Telegram.

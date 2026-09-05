@@ -450,7 +450,7 @@ Gemini on Google Vertex AI through a service account key file.
 - The attach event opens the chat and states the bot and the session in the words of the status
   line. The detach event is the last message of the chat.
 - After a detach the editor stays locked under `Remote: @bot · Esc: Cancel` until the detach event
-  went out, for five seconds at most. An exit key there drops that message and frees the editor at
+  went out, for two seconds at most. An exit key there drops that message and frees the editor at
   once.
 - A Telegram message runs as a prompt, and during a turn it queues as steering. A message the turn
   did not commit drops while the bot is attached, and returns to the editor after a detach.
@@ -482,10 +482,9 @@ Gemini on Google Vertex AI through a service account key file.
 - One activity message per turn shows `Thinking`, `Writing`, or `Running: bash` with the call count.
   At the end it becomes the summary: the outcome, the tool count, the time, the context gauge, and
   the cost.
-- The activity message holds a `Cancel turn` button and a `Withdraw` button. The first cancel tap
-  changes the label to `Tap again to cancel`, and the second tap cancels. A withdraw drops the whole
-  queue like Ctrl+P and marks each dropped message with 👎, and a tap on an empty queue answers the
-  toast `Nothing queued.`
+- The activity message holds a `Cancel turn` button and a `Withdraw` button. One tap on
+  `Cancel turn` cancels the turn. A withdraw drops the whole queue like Ctrl+P and marks each
+  dropped message with 👎, and a tap on an empty queue answers the toast `Nothing queued.`
 - A failed turn that armed a retry sends one `Failed turn` message with `Try again` and `Dismiss`
   buttons, and so does an attach that finds a waiting retry. The message loses its buttons after a
   tap, at the start of a turn, and at `/new`.
@@ -494,8 +493,8 @@ Gemini on Google Vertex AI through a service account key file.
   after the next attach.
 - Every message goes out silent except the last message of a completed or failed turn, so the chat
   notifies once per turn.
-- A Telegram message that runs or queues gets 👀. At the receipt of the turn a committed message
-  gets 👍 and a dropped one 👎. A frozen chat keeps its last marks.
+- A Telegram message gets its mark at the receipt of the turn: 👍 when it committed and 👎 when it
+  dropped. A frozen chat keeps its last marks.
 - An event that a send to the chat caused stays in the terminal, so a failure cannot feed itself.
 - The long poll keeps its own head window, so a short configured request timeout never turns it into
   a busy poll.

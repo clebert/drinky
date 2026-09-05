@@ -39,9 +39,10 @@ const Attachment = @This();
 /// on it.
 const outbound_capacity = 256;
 
-/// The time the close has for its final message. A dead network cannot hold the
-/// owner past it, and a healthy one needs one call.
-const drain_ms_default = 5_000;
+/// The time the close has for its final message. The owner locks the terminal
+/// input for the whole drain, so a dead network cannot hold the user past it,
+/// and a healthy one needs one call.
+const drain_ms_default = 2_000;
 
 /// The least time between two sends to one chat, because Telegram allows about
 /// one message per second there.
@@ -243,14 +244,11 @@ pub const Reaction = struct {
     /// shows it. Telegram allows a fixed emoji list for a bot, and that list
     /// holds neither ✅ nor ❌.
     pub const Mark = enum {
-        /// Received and not yet committed.
-        seen,
         committed,
         dropped,
 
         fn emoji(self: Mark) []const u8 {
             return switch (self) {
-                .seen => "👀",
                 .committed => "👍",
                 .dropped => "👎",
             };
@@ -1558,7 +1556,7 @@ test "an edit of a message that never went out drops" {
 
     const handle = try attachment.sendTracked("", &.{});
     try attachment.edit(handle, "Writing", null);
-    try attachment.react(7, .seen);
+    try attachment.react(7, .committed);
     try collector.waitFor(1);
     try server.finish();
     try std.testing.expectEqual(Event.Rejected.Kind.message, collector.events.items[0].payload.send_rejected.kind);
@@ -1568,7 +1566,7 @@ test "an edit of a message that never went out drops" {
         if (!std.mem.endsWith(u8, request.path, "/setMessageReaction")) continue;
         reactions += 1;
         try std.testing.expectEqualStrings(
-            "{\"chat_id\":99,\"message_id\":7,\"reaction\":[{\"type\":\"emoji\",\"emoji\":\"👀\"}]}",
+            "{\"chat_id\":99,\"message_id\":7,\"reaction\":[{\"type\":\"emoji\",\"emoji\":\"👍\"}]}",
             request.body,
         );
     }
@@ -1776,6 +1774,13 @@ test "an abort ends the drain at once and sends no final message" {
     try std.testing.expect(elapsed_ms < test_drain_ms - 100);
     try std.testing.expectEqual(@as(usize, 1), server.sendCount());
     try server.finish();
+}
+
+// The owner locks the terminal input for the whole drain, so the window is the
+// longest wait a user can see after a detach. A healthy network needs one call.
+test "the default drain window is two seconds" {
+    const pace: Pace = .{};
+    try std.testing.expectEqual(@as(u64, 2_000), pace.drain_ms);
 }
 
 test "a dead network cannot hold the drain past its deadline" {

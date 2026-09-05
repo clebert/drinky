@@ -861,10 +861,10 @@ test "setMessageReaction sets one emoji" {
         .connect_ms = 5_000,
     };
 
-    try client.setMessageReaction(99, 7, "👀");
+    try client.setMessageReaction(99, 7, "👍");
     try server.finish();
     try std.testing.expectEqualStrings(
-        "{\"chat_id\":99,\"message_id\":7,\"reaction\":[{\"type\":\"emoji\",\"emoji\":\"👀\"}]}",
+        "{\"chat_id\":99,\"message_id\":7,\"reaction\":[{\"type\":\"emoji\",\"emoji\":\"👍\"}]}",
         server.requests.items[0].body,
     );
 }
