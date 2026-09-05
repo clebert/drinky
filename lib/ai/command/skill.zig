@@ -1,6 +1,8 @@
 //! `/skill` and `/skill:`: a picker over every discovered skill. A selection
 //! writes the `/skill:name ` line into the editor, so the user can add the task
-//! that the skill works on. The command takes no argument.
+//! that the skill works on. On a remote host, which has no editor, a selection
+//! loads the skill at once with no task. The command takes no argument, and
+//! `load` expands one named skill for the `/skill:name` line of the registry.
 //!
 //! The list holds every skill of the registry, not the catalog the model reads.
 //! A skill that disables model invocation still loads by hand, so the user must
@@ -40,18 +42,49 @@ pub fn run(context: *Context) !Context.Outcome {
 
 /// Write the picked skill line into the editor. The trailing blank marks the
 /// place where the task goes. The line runs on the next Enter, so a restriction
-/// that blocks a skill turn still reports itself there.
+/// that blocks a skill turn still reports itself there. A remote host has no
+/// editor, so the pick loads the skill at once with no task.
 pub fn select(context: *Context, index: usize) !Context.Outcome {
     const gpa = context.gpa;
     const items = try sorted(gpa, context.skill_registry);
     defer gpa.free(items);
     if (index >= items.len)
         return Context.Outcome.reportNotice(gpa, .failure, "Select a valid skill.", .{});
+    if (context.remote) return load(context, items[index], "");
     return .{ .editor_text = try std.fmt.allocPrint(
         gpa,
         "/{s}:{s} ",
         .{ name, items[index].name },
     ) };
+}
+
+/// Expand `target` with its optional task into a user turn. The caller resolved
+/// the skill, so this function holds no name invariant.
+pub fn load(context: *Context, target: *const skills.Skill, arguments: []const u8) !Context.Outcome {
+    const gpa = context.gpa;
+    const content = target.invoke(gpa, context.io, arguments) catch |err| {
+        if (err == error.Canceled or err == error.OutOfMemory) return err;
+        // A failure, not a warning: the name is right and the load broke, so the
+        // way forward is another try, not a send to the model.
+        return .{ .refusal = try Context.Outcome.Message.print(
+            gpa,
+            .failure,
+            "Drinky could not load the skill {s} because of error {s}.",
+            .{ target.name, @errorName(err) },
+        ) };
+    };
+    errdefer gpa.free(content);
+    const name_copy = try gpa.dupe(u8, target.name);
+    errdefer gpa.free(name_copy);
+    const arguments_copy = try gpa.dupe(u8, arguments);
+    errdefer gpa.free(arguments_copy);
+    const source_copy = try gpa.dupe(u8, target.path);
+    return .{ .prompt = .{
+        .name = name_copy,
+        .arguments = arguments_copy,
+        .content = content,
+        .source = source_copy,
+    } };
 }
 
 /// Every discovered skill, ordered by the name that the rows show. `run` and
@@ -151,6 +184,32 @@ test "a selection writes the skill line with a trailing blank" {
         else => return error.ExpectedEditorText,
     }
     try Context.Outcome.expectNoticeContaining(try select(&context, 2), .failure, "valid skill");
+}
+
+// A remote host has no editor to complete a line in, so its pick loads the
+// skill with no task at once.
+test "a selection on a remote host loads the skill with no task" {
+    const gpa = std.testing.allocator;
+    var discovered: Discovered = try .init(gpa);
+    defer discovered.deinit();
+    var context: Context = .{
+        .gpa = gpa,
+        .io = std.testing.io,
+        .agent = undefined,
+        .accounts = undefined,
+        .skill_registry = &discovered.registry,
+        .remote = true,
+    };
+
+    switch (try select(&context, 0)) {
+        .prompt => |prompt| {
+            defer prompt.deinit(gpa);
+            try std.testing.expectEqualStrings("alpha", prompt.name);
+            try std.testing.expectEqualStrings("", prompt.arguments);
+            try std.testing.expect(std.mem.indexOf(u8, prompt.content, "Follow this skill.") != null);
+        },
+        else => return error.ExpectedPrompt,
+    }
 }
 
 test "an empty registry reports that no skill exists" {

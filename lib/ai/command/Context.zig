@@ -21,6 +21,11 @@ skill_registry: ?*const skills.Registry = null,
 /// The username of every saved Telegram bot, in the order of the store. The
 /// `/remote` picker names one row per bot, and the app owns the store.
 remote_bots: []const []const u8 = &.{},
+/// Whether a remote host runs the command, such as the chat of an attached
+/// bot. A remote host has no editor and reaches no terminal: it runs no
+/// terminal-only command, it fetches no model list, and a picked skill loads at
+/// once with no task.
+remote: bool = false,
 
 /// A slash command's result. Notice, event, picker, and prompt allocations
 /// transfer to the caller. The app owns account and conversation actions. A

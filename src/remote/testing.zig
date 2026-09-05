@@ -15,10 +15,9 @@ const wait_steps_max = 500;
 const wait_step_ms = 10;
 
 /// The pace of the tests: every wait of an attachment short, so the suite stays
-/// fast and the drain of a close still holds its order.
+/// fast.
 pub const pace: Attachment.Pace = .{
     .drain_ms = 300,
-    .final_reserve_ms = 150,
     .send_spacing_ms = 20,
     .backoff = .{ .attempts_max = std.math.maxInt(u32), .backoff_ms_initial = 10, .backoff_ms_max = 20 },
 };
@@ -192,7 +191,7 @@ pub const Server = struct {
     }
 
     /// How many requests of the method at the end of `path_suffix` arrived so far.
-    fn countOf(self: *Server, path_suffix: []const u8) usize {
+    pub fn countOf(self: *Server, path_suffix: []const u8) usize {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         var count: usize = 0;

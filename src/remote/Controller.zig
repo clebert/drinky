@@ -1,5 +1,5 @@
 //! The remote control of one session: the saved bots, the pairing of a new one,
-//! the attached one, and the detached one whose sender still drains. It owns
+//! the attached one, and the detached one whose last message still goes out. It owns
 //! every network task, every generation, and every Telegram id, and it is the
 //! one source of truth for the remote state.
 //!
@@ -7,8 +7,8 @@
 //! exposes domain state alone. The owner maps that state to captions, pickers,
 //! and the transcript, and it hands the reports of the tasks back through
 //! `applyAttachmentEvent` and `applyPairingEvent`. The controller never waits on
-//! the network: a detached bot drains in the `detaching` state until its sender
-//! reports the end, or until the owner aborts the drain.
+//! the network: a detached bot stays in the `detaching` state until it reports
+//! that its last message went out, or until the owner aborts the wait.
 
 const std = @import("std");
 
@@ -16,10 +16,32 @@ const ai = @import("ai");
 
 const Attachment = @import("Attachment.zig");
 const Client = @import("Client.zig");
+const keyboard = @import("keyboard.zig");
 const Pairing = @import("Pairing.zig");
 const Store = @import("Store.zig");
 
 const Controller = @This();
+
+/// The bytes of one toast. Telegram shows 200 characters, and a byte is at most
+/// one character, so the cut stays inside that bound.
+const toast_bytes_max = 200;
+
+/// The commands the chat completes after a slash: every command that runs from
+/// Telegram, with its `/help` summary.
+const bot_commands = blk: {
+    var count = 0;
+    for (ai.command.summaries) |summary| {
+        if (summary.remote and summary.tail.len == 0) count += 1;
+    }
+    var list: [count]Client.Command = undefined;
+    var index = 0;
+    for (ai.command.summaries) |summary| {
+        if (!summary.remote or summary.tail.len != 0) continue;
+        list[index] = .{ .command = summary.name, .description = summary.summary };
+        index += 1;
+    }
+    break :blk list;
+};
 
 gpa: std.mem.Allocator,
 io: std.Io,
@@ -85,6 +107,9 @@ pub const Action = union(enum) {
     /// A text message from the bound chat. The owner runs it or queues it, and it
     /// answers with `reply`.
     chat_message: ChatMessage,
+    /// A tap on a keyboard of the bound chat. The owner acts on it and answers
+    /// it with `answer`, with a toast or with nothing.
+    chat_tap: ChatTap,
     /// One line for the owner to show.
     report: Report,
     /// The state changed. The owner reads `state` and the names it needs.
@@ -95,6 +120,11 @@ pub const Action = union(enum) {
     pub const ChatMessage = struct {
         id: i64,
         text: []const u8,
+    };
+
+    pub const ChatTap = struct {
+        query_id: []const u8,
+        tap: keyboard.Tap,
     };
 
     pub const Report = struct {
@@ -171,14 +201,14 @@ pub fn openStore(self: *Controller, home: []const u8) !void {
 }
 
 /// End every task: detach with the exit event, end a pairing, and await the
-/// sender inside its drain window. The owner calls it while it can still show
+/// last message inside its window. The owner calls it while it can still show
 /// the reports, and `deinit` frees the rest later. The end of the tasks depends
 /// on no report: a bot whose exit event cannot be written still closes.
 pub fn shutdown(self: *Controller) void {
     self.detach(.exit) catch {};
     switch (self.mode) {
         // An attached bot here failed its detach before the close, so it closes
-        // with no final message and drains like every other one.
+        // with no final message and ends like every other one.
         .attached, .detaching => |attachment| attachment.destroy(),
         .checking_token, .pairing => |pairing| pairing.destroy(),
         .idle, .token_prompt => {},
@@ -336,10 +366,10 @@ pub fn removeBot(self: *Controller, index: usize) !void {
 }
 
 /// Detach the bot: name the event as the final message of the chat, enter the
-/// `detaching` state while the sender drains, and report the event. The sender
-/// reports its end, or `abortDetach` ends it first. The close comes before every
-/// report, so a failed report cannot leave a dead bot in the attached state. A
-/// controller without an attached bot changes nothing.
+/// `detaching` state while it goes out, and report the event. The bot reports
+/// its end, or `abortDetach` ends it first. The close comes before every report,
+/// so a failed report cannot leave a dead bot in the attached state. A controller
+/// without an attached bot changes nothing.
 pub fn detach(self: *Controller, cause: DetachCause) !void {
     const attachment = switch (self.mode) {
         .attached => |attachment| attachment,
@@ -362,9 +392,9 @@ pub fn detach(self: *Controller, cause: DetachCause) !void {
     try self.emit(.state_changed);
 }
 
-/// End the drain of the detached bot now, so the owner is free at once. The last
-/// message of the chat drops with the queue. A controller without a detaching
-/// bot changes nothing.
+/// End the close of the detached bot now, so the owner is free at once. The last
+/// message of the chat never goes out. A controller without a detaching bot
+/// changes nothing.
 pub fn abortDetach(self: *Controller) !void {
     const attachment = switch (self.mode) {
         .detaching => |attachment| attachment,
@@ -415,16 +445,36 @@ pub fn sendTracked(
     return handle;
 }
 
-/// Replace the text of the tracked message `handle`, once it went out.
-pub fn edit(self: *Controller, handle: Attachment.Handle, text: []const u8) !void {
+/// Replace the text and the keyboard of the tracked message `handle`, once it
+/// went out. A null `markup` removes the keyboard.
+pub fn edit(
+    self: *Controller,
+    handle: Attachment.Handle,
+    text: []const u8,
+    markup: ?[]const u8,
+) !void {
     const attachment = self.attached() orelse return;
-    try self.takeQueued(attachment, attachment.edit(handle, text));
+    try self.takeQueued(attachment, attachment.edit(handle, text, markup));
 }
 
 /// Mark the chat message `message_id` with the state of its transcript entry.
 pub fn react(self: *Controller, message_id: i64, mark: Attachment.Reaction.Mark) !void {
     const attachment = self.attached() orelse return;
     try self.takeQueued(attachment, attachment.react(message_id, mark));
+}
+
+/// Answer the tap `query_id`, with `text` as a toast or with nothing. A toast
+/// above the bound of Telegram cuts before a UTF-8 sequence.
+pub fn answer(self: *Controller, query_id: []const u8, text: ?[]const u8) !void {
+    const attachment = self.attached() orelse return;
+    var toast = text;
+    if (toast) |*whole| {
+        var length = @min(whole.len, toast_bytes_max);
+        // A continuation byte reads `10xxxxxx`, and a sequence holds at most three.
+        while (length > 0 and length < whole.len and (whole.*[length] & 0xC0) == 0x80) length -= 1;
+        whole.* = whole.*[0..length];
+    }
+    try self.takeQueued(attachment, attachment.answer(query_id, toast));
 }
 
 /// Whether a bot is attached, so a message for the chat has a taker. The mirror
@@ -480,6 +530,13 @@ pub fn applyAttachmentEvent(self: *Controller, event: *const Attachment.Event) !
             .id = message.id,
             .text = message.text,
         } }),
+        // A tap that no keyboard of Drinky wrote gets its answer and no action,
+        // so its button stops its wait.
+        .callback => |callback| if (keyboard.Tap.parse(callback.data)) |tap| {
+            try self.emit(.{ .chat_tap = .{ .query_id = callback.query_id, .tap = tap } });
+        } else {
+            try self.answer(callback.query_id, null);
+        },
         .unreadable => |id| try self.reply(id, "Drinky reads text alone."),
         // A report about the send side stays in the terminal, because a mirror
         // that sends it meets the same failure and feeds itself.
@@ -694,6 +751,7 @@ fn startAttachment(self: *Controller, bot: *const Store.Bot) !void {
         .generation = generation,
         .sink = self.attachment_sink,
         .pace = self.pace,
+        .commands = &bot_commands,
     });
     errdefer attachment.destroy();
     try attachment.start();
@@ -872,6 +930,7 @@ const Owner = struct {
 
     const Recorded = union(enum) {
         chat_message: struct { id: i64, text: []u8 },
+        chat_tap: struct { query_id: []u8, tap: keyboard.Tap },
         report: struct { kind: Action.Report.Kind, severity: ai.command.Outcome.Severity, text: []u8 },
         state_changed,
         pairing_changed: Action.PairingChange,
@@ -879,6 +938,7 @@ const Owner = struct {
         fn deinit(self: *const Recorded, gpa: std.mem.Allocator) void {
             switch (self.*) {
                 .chat_message => |message| gpa.free(message.text),
+                .chat_tap => |tap| gpa.free(tap.query_id),
                 .report => |report| gpa.free(report.text),
                 .state_changed, .pairing_changed => {},
             }
@@ -928,6 +988,10 @@ const Owner = struct {
             .chat_message => |message| .{ .chat_message = .{
                 .id = message.id,
                 .text = try self.gpa.dupe(u8, message.text),
+            } },
+            .chat_tap => |tap| .{ .chat_tap = .{
+                .query_id = try self.gpa.dupe(u8, tap.query_id),
+                .tap = tap.tap,
             } },
             .report => |report| .{ .report = .{
                 .kind = report.kind,
@@ -1013,23 +1077,27 @@ const ok_true = "{\"ok\":true,\"result\":true}";
 const ok_empty = "{\"ok\":true,\"result\":[]}";
 const ok_sent = "{\"ok\":true,\"result\":{\"message_id\":1}}";
 
-test "a saved bot attaches, its messages reach the owner, and a detach ends the chat" {
+test "a saved bot attaches, its messages and taps reach the owner, and a detach ends the chat" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
     var server = try testing.Server.init(gpa, io, &.{
         .{ .method = "deleteWebhook", .replies = &.{.{ .body = ok_true }} },
+        .{ .method = "setMyCommands", .replies = &.{.{ .body = ok_true }} },
         .{ .method = "getUpdates", .replies = &.{
             .{ .body = ok_empty },
             .{ .body =
             \\{"ok":true,"result":[
             \\{"update_id":1,"message":{"message_id":7,"date":0,"chat":{"id":99,"type":"private"},"text":"hello"}},
-            \\{"update_id":2,"message":{"message_id":8,"date":0,"chat":{"id":99,"type":"private"},"sticker":{}}}
+            \\{"update_id":2,"message":{"message_id":8,"date":0,"chat":{"id":99,"type":"private"},"sticker":{}}},
+            \\{"update_id":3,"callback_query":{"id":"900","from":{"id":5},"chat_instance":"c","message":{"message_id":50,"date":0,"chat":{"id":99,"type":"private"}},"data":"withdraw:2"}},
+            \\{"update_id":4,"callback_query":{"id":"901","from":{"id":5},"chat_instance":"c","message":{"message_id":50,"date":0,"chat":{"id":99,"type":"private"}},"data":"not:ours"}}
             \\]}
             },
         } },
         .{ .method = "sendMessage", .replies = &.{ .{ .body = ok_sent }, .{ .body = ok_sent }, .{ .body = ok_sent } } },
+        .{ .method = "answerCallbackQuery", .replies = &.{ .{ .body = ok_true }, .{ .body = ok_true } } },
     });
     defer server.deinit();
     try server.start();
@@ -1046,18 +1114,46 @@ test "a saved bot attaches, its messages reach the owner, and a detach ends the 
     try std.testing.expectEqual(State.attached, controller.state());
     try std.testing.expectEqualStrings("drinky_bot", controller.botUsername().?);
     try std.testing.expect(owner.actions.items[0] == .state_changed);
-    try server.waitForRequests(2);
+    try server.waitForRequests(3);
+    // The attach registers the commands that run from Telegram, each with its
+    // summary.
+    const registered = try server.waitForRequest("/setMyCommands", 0);
+    try std.testing.expectEqualStrings(
+        "{\"commands\":[{\"command\":\"effort\",\"description\":\"set the reasoning-effort level\"}," ++
+            "{\"command\":\"help\",\"description\":\"list every command\"}," ++
+            "{\"command\":\"model\",\"description\":\"switch account and model together\"}," ++
+            "{\"command\":\"new\",\"description\":\"clear the conversation and its usage stats\"}," ++
+            "{\"command\":\"skill\",\"description\":\"load one of the discovered skills\"}]}",
+        registered,
+    );
     try controller.sendEvent(.information, "Remote: @drinky_bot · Context: 0");
 
-    // The text message becomes an action, and the sticker gets its reply.
-    try owner.pump(&controller, 2);
+    // The text message becomes an action, the sticker gets its reply, the tap
+    // becomes an action with its query, and a tap that no keyboard of Drinky
+    // wrote gets a silent answer alone.
+    try owner.pump(&controller, 4);
     const message = owner.actions.items[1].chat_message;
     try std.testing.expectEqual(@as(i64, 7), message.id);
     try std.testing.expectEqualStrings("hello", message.text);
     try controller.reply(7, "Sign in first.");
+    const tap = owner.actions.items[2].chat_tap;
+    try std.testing.expectEqualStrings("900", tap.query_id);
+    try std.testing.expectEqual(@as(u64, 2), tap.tap.withdraw);
+    try std.testing.expectEqual(@as(usize, 3), owner.actions.items.len);
+    try controller.answer("900", "Nothing queued.");
+    try std.testing.expectEqualStrings(
+        "{\"callback_query_id\":\"901\"}",
+        try server.waitForRequest("/answerCallbackQuery", 0),
+    );
+    try std.testing.expectEqualStrings(
+        "{\"callback_query_id\":\"900\",\"text\":\"Nothing queued.\"}",
+        try server.waitForRequest("/answerCallbackQuery", 1),
+    );
 
+    // The close drops what the queue still holds, so the reply goes out first.
+    try server.waitForSends(3);
     try controller.detach(.user);
-    // The bot drains its last message, and the owner learns the state first.
+    // The bot sends its last message, and the owner learns the state first.
     try std.testing.expectEqual(State.detaching, controller.state());
     try std.testing.expectEqualStrings("drinky_bot", controller.botUsername().?);
     try std.testing.expectEqualStrings("You detached @drinky_bot.", try owner.lastReport());
@@ -1091,6 +1187,7 @@ test "an abort of the detach frees the owner at once and drops the last message"
     // No script answers a send, so the detach event stays in flight.
     var server = try testing.Server.init(gpa, io, &.{
         .{ .method = "deleteWebhook", .replies = &.{ .{ .body = ok_true }, .{ .body = ok_true } } },
+        .{ .method = "setMyCommands", .replies = &.{ .{ .body = ok_true }, .{ .body = ok_true } } },
         .{ .method = "getUpdates", .replies = &.{ .{ .body = ok_empty }, .{ .body = ok_empty } } },
     });
     defer server.deinit();
@@ -1105,7 +1202,7 @@ test "an abort of the detach frees the owner at once and drops the last message"
     defer controller.deinit();
 
     try controller.attachSaved(0);
-    try server.waitForRequests(2);
+    try server.waitForRequests(3);
     try controller.detach(.user);
     try server.waitForSends(1);
     try std.testing.expectEqual(State.detaching, controller.state());
@@ -1121,7 +1218,7 @@ test "an abort of the detach frees the owner at once and drops the last message"
     // bot changes nothing.
     try controller.attachSaved(0);
     try std.testing.expectEqual(State.attached, controller.state());
-    try server.waitForRequests(4);
+    try server.waitForRequests(6);
     try controller.applyAttachmentEvent(&.{ .generation = 1, .payload = .drained });
     try std.testing.expectEqual(State.attached, controller.state());
     try std.testing.expectEqual(@as(usize, 1), server.sendCount());
@@ -1139,6 +1236,7 @@ test "a token pairs a new bot, and a rejected token returns to the prompt" {
             .{ .body = "{\"ok\":true,\"result\":{\"id\":42,\"is_bot\":true,\"username\":\"drinky_bot\"}}" },
         } },
         .{ .method = "deleteWebhook", .replies = &.{ .{ .body = ok_true }, .{ .body = ok_true } } },
+        .{ .method = "setMyCommands", .replies = &.{.{ .body = ok_true }} },
         .{ .method = "getUpdates", .replies = &.{
             .{ .body = ok_empty },
             .{ .body =
@@ -1276,6 +1374,7 @@ test "a failure of the chat reports once per run, and a permanent one detaches" 
     const io = threaded.io();
     var server = try testing.Server.init(gpa, io, &.{
         .{ .method = "deleteWebhook", .replies = &.{.{ .body = ok_true }} },
+        .{ .method = "setMyCommands", .replies = &.{.{ .body = ok_true }} },
         .{ .method = "getUpdates", .replies = &.{
             .{ .body = ok_empty },
             .{ .status = 502, .body = "" },
@@ -1319,6 +1418,7 @@ test "an action failure after an ownership transfer leaves the controller whole"
             .{ .body = "{\"ok\":true,\"result\":{\"id\":44,\"is_bot\":true,\"username\":\"new_bot\"}}" },
         } },
         .{ .method = "deleteWebhook", .replies = &.{ .{ .body = ok_true }, .{ .body = ok_true }, .{ .body = ok_true } } },
+        .{ .method = "setMyCommands", .replies = &.{ .{ .body = ok_true }, .{ .body = ok_true } } },
         .{ .method = "getUpdates", .replies = &.{ .{ .body = ok_empty }, .{ .body = ok_empty }, .{ .body = ok_empty } } },
     });
     defer server.deinit();
@@ -1360,9 +1460,11 @@ test "an action failure after an ownership transfer leaves the controller whole"
 
     // The bot closed, and the detach event fails: the bot still drains in the
     // `detaching` state, so no dead bot stays attached, and its end still frees
-    // the input.
+    // the input. The failed attach above ended its poller, so the count of its
+    // calls stays as it is.
+    const before = server.requestCount();
     try controller.attachSaved(0);
-    try server.waitForRequests(6);
+    try server.waitForRequests(before + 4);
     owner.fail_at = owner.actions.items.len;
     try std.testing.expectError(error.SinkFailed, controller.detach(.user));
     try std.testing.expectEqual(State.detaching, controller.state());
@@ -1379,6 +1481,7 @@ test "a shutdown closes the bot even when its report fails" {
     const io = threaded.io();
     var server = try testing.Server.init(gpa, io, &.{
         .{ .method = "deleteWebhook", .replies = &.{.{ .body = ok_true }} },
+        .{ .method = "setMyCommands", .replies = &.{.{ .body = ok_true }} },
         .{ .method = "getUpdates", .replies = &.{.{ .body = ok_empty }} },
     });
     defer server.deinit();
@@ -1393,7 +1496,7 @@ test "a shutdown closes the bot even when its report fails" {
     defer controller.deinit();
 
     try controller.attachSaved(0);
-    try server.waitForRequests(2);
+    try server.waitForRequests(3);
     owner.fail_at = owner.actions.items.len;
     controller.shutdown();
     try std.testing.expectEqual(State.idle, controller.state());

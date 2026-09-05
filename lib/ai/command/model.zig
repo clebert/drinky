@@ -157,20 +157,29 @@ fn selectAccountOf(comptime vendor: llm.Provider) Selector {
 /// The last step: the fetch row, then a picker over the models of `account`.
 /// The title names the account, because the flow can skip the step that names
 /// it. Drinky compiles no model in, so an account that the user has not fetched
-/// yet holds the fetch row alone.
+/// yet holds the fetch row alone. A remote host runs no fetch, so its step lists
+/// the cached models alone, and an account with no cached list answers with a
+/// notice that names the terminal.
 fn modelStep(context: *Context, account: llm.Account) !Context.Outcome {
     const gpa = context.gpa;
     var list: std.ArrayList(Model) = .empty;
     defer list.deinit(gpa);
     try context.accounts.listModels(account, &list, gpa);
+    if (context.remote and list.items.len == 0) return Context.Outcome.reportNotice(
+        gpa,
+        .warning,
+        "Fetch the model list of {s} with /model in the terminal first.",
+        .{account.label()},
+    );
 
     var options: Context.Outcome.Options = .{ .gpa = gpa };
     errdefer options.deinit();
     var current: ?usize = null;
-    try options.print("{s}", .{firstRow(list.items.len)});
+    const lead = leadRows(context);
+    if (lead > 0) try options.print("{s}", .{firstRow(list.items.len)});
     for (list.items, 0..) |*model, index| {
         try row(&options, account, model);
-        if (isActive(context, account, model.name())) current = index + 1;
+        if (isActive(context, account, model.name())) current = index + lead;
     }
     const step: ModelStep = switch (account) {
         inline else => |tag| modelStepOf(tag),
@@ -192,6 +201,13 @@ fn firstRow(count: usize) []const u8 {
     return if (count == 0) fetch_row else refresh_row;
 }
 
+/// The rows before the first model of a model step: the fetch row in the
+/// terminal, and none on a remote host, which runs no fetch. The step and its
+/// selector both count them, so a row index stays stable.
+fn leadRows(context: *const Context) usize {
+    return if (context.remote) 0 else 1;
+}
+
 /// Write the picker row of `model` under `account`. A model whose output limit
 /// no source states carries the mark, because a request for it then sends the
 /// low default of `Model.tokens_max_fallback`.
@@ -211,17 +227,18 @@ fn modelStepOf(comptime account: llm.Account) ModelStep {
         .select = struct {
             fn select(context: *Context, index: usize) anyerror!Context.Outcome {
                 const gpa = context.gpa;
-                if (index == 0) return .{ .fetch = account };
+                const lead = leadRows(context);
+                if (index < lead) return .{ .fetch = account };
                 var list: std.ArrayList(Model) = .empty;
                 defer list.deinit(gpa);
                 try context.accounts.listModels(account, &list, gpa);
-                if (index - 1 >= list.items.len) return Context.Outcome.reportNotice(
+                if (index - lead >= list.items.len) return Context.Outcome.reportNotice(
                     gpa,
                     .failure,
                     "Select a valid model.",
                     .{},
                 );
-                return apply(context, account, &list.items[index - 1]);
+                return apply(context, account, &list.items[index - lead]);
             }
         }.select,
         .open = struct {
@@ -705,6 +722,45 @@ test "an account with no model offers the fetch row alone" {
     try std.testing.expectEqual(@as(usize, 1), pick.options.len);
     try std.testing.expectEqualStrings("Fetch the model list", pick.options[0]);
     try std.testing.expect(pick.current == null);
+}
+
+// A remote host cannot run a fetch, so its model step lists the cached models
+// alone and a row index counts from the first model. An account that the user
+// never fetched answers with a notice that names the terminal, because the
+// fetch happens there.
+test "a remote host lists the cached models with no fetch row" {
+    const gpa = std.testing.allocator;
+    var accounts = testing.accounts(.{ .anthropic = "sk-ant", .openai = "sk-openai" }, .{});
+    defer testing.deinitAccounts(&accounts);
+    try testing.seed(&accounts, .anthropic_api, &.{ "claude-fable-5", "claude-sonnet-4-6" });
+    var agent = testing.agent(gpa, .{ .anthropic_api = "sk-ant" });
+    defer agent.deinit();
+    var context: Context = .{
+        .gpa = gpa,
+        .io = undefined,
+        .agent = &agent,
+        .accounts = &accounts,
+        .remote = true,
+    };
+
+    const anthropic_models = try expectPick(try modelStep(&context, .anthropic_api));
+    defer freePick(gpa, &anthropic_models);
+    try std.testing.expectEqual(@as(usize, 2), anthropic_models.options.len);
+    try std.testing.expectEqualStrings("claude-fable-5", anthropic_models.options[0]);
+    try std.testing.expectEqualStrings("claude-sonnet-4-6", anthropic_models.options[anthropic_models.current.?]);
+    try Context.Outcome.expectEvent(try anthropic_models.select(&context, 0), .information);
+    try std.testing.expectEqualStrings("claude-fable-5", agent.model.?.name());
+    try Context.Outcome.expectNoticeContaining(
+        try anthropic_models.select(&context, 2),
+        .failure,
+        "valid model",
+    );
+
+    try Context.Outcome.expectNoticeContaining(
+        try modelStep(&context, .openai_api),
+        .warning,
+        "Fetch the model list of OpenAI API with /model in the terminal first.",
+    );
 }
 
 // A fetch reaches the network, and a command runs on the thread that paints and

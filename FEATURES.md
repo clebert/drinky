@@ -449,16 +449,31 @@ Gemini on Google Vertex AI through a service account key file.
   with the count of the queued messages. Enter names the bot, and every exit key detaches.
 - The attach event opens the chat and states the bot and the session in the words of the status
   line. The detach event is the last message of the chat.
-- After a detach the editor stays locked under `Remote: @bot · Esc: Cancel` until the last message
+- After a detach the editor stays locked under `Remote: @bot · Esc: Cancel` until the detach event
   went out, for five seconds at most. An exit key there drops that message and frees the editor at
   once.
 - A Telegram message runs as a prompt, and during a turn it queues as steering. A message the turn
   did not commit drops while the bot is attached, and returns to the editor after a detach.
-- A command line from Telegram refuses with a reply that names the terminal, and so does a message
-  while the session is signed out or has no model.
+- `/new`, `/effort`, `/model`, `/help`, `/skill`, and `/skill:name` run from Telegram. `/login`,
+  `/logout`, `/remote`, `/sources`, and `/system` refuse with a reply that names the terminal, and
+  so does a message while the session is signed out or has no model.
+- A command picker is an inline keyboard under one message, with a `✓` on the current row and a
+  `Cancel` button. A stepped `/model` edits the same message per step and adds `‹ Back`. A pick
+  edits the message to state the result and removes the keyboard, and a tap on a closed list answers
+  the toast `This list is closed.`
+- The `/model` keyboard lists the cached models alone, because a fetch runs in the terminal. A skill
+  row loads the skill with no task at once. The `/help` keyboard lists the commands that run from
+  Telegram, and the bot registers the same commands with Telegram at the attach.
+- A keyboard shows the first 98 rows of a list, so it stays inside the button bound of Telegram. The
+  terminal picker shows every row.
+- A `/new` from Telegram opens the new conversation on the event `New conversation · Remote: @bot`,
+  so the bracket of the bot holds.
 - A photo, a sticker, or a voice note gets one reply: `Drinky reads text alone.`
 - The attach removes an active webhook, confirms every update from before it, and ignores every chat
   but the paired one.
+
+## Remote chat
+
 - The chat mirrors every committed answer, event, skill head line, and retry line once. The Telegram
   HTML holds bold, italic, code, links, quotes, and `pre` blocks for fences and tables. A reasoning
   block, a tool box, and a user box stay in the terminal.
@@ -467,6 +482,16 @@ Gemini on Google Vertex AI through a service account key file.
 - One activity message per turn shows `Thinking`, `Writing`, or `Running: bash` with the call count.
   At the end it becomes the summary: the outcome, the tool count, the time, the context gauge, and
   the cost.
+- The activity message holds a `Cancel turn` button and a `Withdraw` button. The first cancel tap
+  changes the label to `Tap again to cancel`, and the second tap cancels. A withdraw drops the whole
+  queue like Ctrl+P and marks each dropped message with 👎, and a tap on an empty queue answers the
+  toast `Nothing queued.`
+- A failed turn that armed a retry sends one `Failed turn` message with `Try again` and `Dismiss`
+  buttons, and so does an attach that finds a waiting retry. The message loses its buttons after a
+  tap, at the start of a turn, and at `/new`.
+- A notice that a tap causes goes out as a toast. The detach leaves the chat as it stands, buttons
+  included: a tap on an old keyboard gets no answer while no bot is attached, and a stale toast
+  after the next attach.
 - Every message goes out silent except the last message of a completed or failed turn, so the chat
   notifies once per turn.
 - A Telegram message that runs or queues gets 👀. At the receipt of the turn a committed message
@@ -481,8 +506,8 @@ Gemini on Google Vertex AI through a service account key file.
   first drop of a run.
 - A revoked token, a blocked bot, a second poller on the same bot, and a rejected poll each detach
   with an `Error:` event. A credential rejection detaches before the login picker opens.
-- A detach and the exit drain the pending sends within a bound, and the detach event keeps part of
-  that window for itself, so it ends the chat even behind a full queue.
+- A detach and the exit send the detach event alone, within a bound, and drop every pending send.
+  The chat is the record of the session up to that moment, and the terminal shows the rest.
 - An event that a task raises while a reply streams waits for the next message boundary, so it never
   splits a streamed reply.
 

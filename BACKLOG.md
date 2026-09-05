@@ -56,9 +56,6 @@ decision already taken, or a dependency on another entry. Module layout and exte
   entry, because a server states no window._
 - **Headless mode** — Drinky answers one prompt with no terminal: text in, text out, with flags for
   the model and the effort level. _This is the base for any agent that Drinky drives itself._
-- **Telegram remote control** — a session attaches to a Telegram bot, so the user drives it from the
-  chat while the terminal shows the work. _`docs/telegram-remote.md` holds the decisions and the
-  phases. Drinky adds no dependency._
 
 ## Ideas
 

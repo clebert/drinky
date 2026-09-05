@@ -189,6 +189,9 @@ controller: remote.Controller,
 /// The mirror of the transcript in the chat of the attached bot. The app feeds it
 /// the committed blocks after every event, and it sends through the controller.
 mirror: remote.Mirror,
+/// The open command picker of the chat, or none. A tap on its keyboard runs the
+/// selector of the command, and the app applies the outcome to the chat.
+chat_picker: remote.Picker,
 /// The caption title of the inactive editor while a bot holds the input,
 /// `Remote: @bot`. Owned, and the session borrows it.
 remote_title: []const u8,
@@ -753,6 +756,12 @@ pub fn run(
     // The connect window depends on the network, not on the provider, so every
     // provider shares it and either one serves the Telegram calls.
     self.controller.connect_ms = config.timeouts.anthropic.connect_ms;
+    // A stale keyboard stays in the chat history, so the serials of this process
+    // must never name a keyboard that an earlier process left there.
+    var serial_seed: [8]u8 = undefined;
+    io.random(&serial_seed);
+    self.mirror.seedSerials(std.mem.readInt(u64, &serial_seed, .little));
+    self.chat_picker.seedSerials(std.mem.readInt(u64, &serial_seed, .little));
 
     const home_directory = try homeDirectory(gpa, io, cwd, home);
     defer gpa.free(home_directory);
@@ -1029,6 +1038,7 @@ fn initFields(self: *App, gpa: std.mem.Allocator, io: std.Io) void {
             .pairing_sink = .{ .context = self, .emit = emitPairingEvent },
         }),
         .mirror = .init(gpa),
+        .chat_picker = .init(gpa),
         .remote_title = "",
         .pairing_wait_text = "",
         .pairing_wait_link = "",
@@ -1053,8 +1063,9 @@ fn shutdownTasks(self: *App) void {
     // that meets a full channel then ends instead of a wait that no one answers.
     self.queue.close(self.io);
     // The detach goes first, so its event is the last message of the chat, and
-    // the drain of the sender is bounded, so a dead network cannot hold the exit.
+    // its window is bounded, so a dead network cannot hold the exit.
     self.controller.shutdown();
+    self.chat_picker.deinit();
     self.freeRemoteStrings();
     // Shutdown is teardown, not an interactive cancel: free the worker result's
     // owned terminal text and leave the session untouched.
@@ -1178,10 +1189,12 @@ fn finishFailedWorker(self: *App, result: *const WorkerResult) !void {
     try self.session.reserveFailureRestore(&result.outcome.receipt);
     defer self.agent.steering.clear();
     // The reconciliation runs first, because `reserveFailureRestore` makes only
-    // that step infallible. The arm allocates, so it stays outside that window.
+    // that step infallible. The arm allocates, so it stays outside that window,
+    // and it comes before the chat learns of the end, so the chat gets the
+    // failed turn message of the retry it armed.
     try self.session.failTurnWithReceipt(&result.outcome.receipt, result.error_text);
-    try self.endMirrorTurn(.failed);
     try self.armRetry(result, attempt);
+    try self.endMirrorTurn(.failed);
 }
 
 /// Arm one retry context from a failed turn, so Ctrl+N can ask the model to
@@ -1201,12 +1214,15 @@ fn armRetry(self: *App, result: *const WorkerResult, attempt: bool) !void {
 }
 
 /// Replace the retry context and mirror its caption into the session. This is
-/// the one place that moves both together, so the caption cannot outlive it.
+/// the one place that moves both together, so the caption cannot outlive it. A
+/// retry that ends takes the buttons off its message in the chat too.
 ///
 /// The call frees the context that it replaces, so a caller builds `maybe_retry`
 /// and every byte in it first. `armRetry` duplicates the failure sentence before
 /// it arrives here for exactly that reason.
 fn setRetry(self: *App, maybe_retry: ?Retry) void {
+    // A failed edit costs the buttons of the chat alone, never the retry.
+    if (self.retry != null and maybe_retry == null) self.mirror.dismissRetry(&self.controller) catch {};
     self.dropRetry();
     self.retry = maybe_retry;
     self.session.retry_shown = maybe_retry != null;
@@ -1758,17 +1774,7 @@ fn submitSteering(self: *App) !void {
 /// the count that selects the mirror's pending suffix. The remaining prefix stays
 /// retained until it is consumed or a failed delivery makes it recallable.
 fn pullSteering(self: *App) !void {
-    // Reserve every possible draft move so no fallible work follows the channel
-    // take.
-    try self.session.reserveSteeringRecall();
-    const taken = try self.agent.steering.take();
-    defer {
-        for (taken) |message| self.gpa.free(message);
-        self.gpa.free(taken);
-    }
-    // The count identifies the rich-record suffix currently owned by the queue.
-    // A batch already owned by the worker remains retained.
-    self.session.recallSteering(taken.len);
+    _ = try self.withdrawSteering();
 }
 
 /// Return steering the worker never took before the turn ended. The user wrote
@@ -2159,6 +2165,9 @@ fn runTurn(self: *App, text: []const u8) !void {
     // context it named is stale. The drop runs after the spawn, because a start
     // that fails must leave the context for another try.
     self.setRetry(null);
+    // A turn cannot host a picker, so the start of one makes the open picker of
+    // the chat stale.
+    self.chat_picker.close();
     // The worker runs by now, so a send that fails costs the activity message of
     // the chat alone and never the turn.
     self.mirror.beginTurn(&self.controller, self.nowMs()) catch {};
@@ -2248,6 +2257,14 @@ fn commandContext(self: *App) ai.command.Context {
     };
 }
 
+/// The ambient state of a command that the chat runs. The registry then refuses
+/// a terminal-only command, lists no fetch row, and loads a picked skill at once.
+fn chatContext(self: *App) ai.command.Context {
+    var context = self.commandContext();
+    context.remote = true;
+    return context;
+}
+
 /// Run `line` as a command. Null reports that the line is a message.
 fn dispatchCommand(self: *App, line: []const u8) !?ai.command.Outcome {
     var context = self.commandContext();
@@ -2288,11 +2305,20 @@ fn applyOutcome(self: *App, outcome: ai.command.Outcome) !void {
             self.agent.resetConversation();
             self.session.clearConversation();
             self.mirror.restart();
+            self.chat_picker.close();
             // The intro line is the legend of the interface, so the empty
             // conversation opens on it again.
             try self.session.transcript.append(.intro, .{}, intro_text);
             // The cleared conversation holds no work to continue from.
             self.clearRetry();
+            // The attach event brackets every Telegram message, and the clear
+            // took it, so the new conversation opens on a bracket of its own.
+            // The mirror starts over at it, so the chat gets it first.
+            if (self.controller.listens()) try self.recordEvent(
+                .information,
+                "New conversation{s}Remote: @{s}",
+                .{ ui.paint.separator, self.controller.botUsername().? },
+            );
         },
         // Only `submit` produces a prompt outcome (from a typed `/skill:` line),
         // and it starts that turn itself, so a prompt never reaches this shared
@@ -2864,6 +2890,7 @@ fn onRemoteAction(context: *anyopaque, action: remote.Controller.Action) anyerro
     const self: *App = @ptrCast(@alignCast(context));
     switch (action) {
         .chat_message => |message| try self.submitChatMessage(message.text, message.id),
+        .chat_tap => |tap| try self.handleChatTap(tap.query_id, tap.tap),
         .report => |report| switch (report.kind) {
             .event => try self.recordAsyncEvent(report.severity, .{}, "{s}", .{report.text}),
             .terminal_event => try self.recordAsyncEvent(
@@ -2906,6 +2933,11 @@ fn syncRemoteState(self: *App) !void {
                 .controls = "Esc: Cancel",
                 .rows_max = Session.editor_caption_rows_max,
             } };
+            // The chat stands as it is from here on, so the messages of the
+            // chat that hold a keyboard are gone for the app, and the next
+            // attach sends new ones.
+            self.chat_picker.close();
+            self.mirror.detached();
         },
         .token_prompt => self.session.input = .{ .caption = .{
             .title = "Bot token",
@@ -2948,6 +2980,7 @@ fn mirrorView(self: *const App) remote.Mirror.View {
             .tool = tail.tool,
             .calls = tail.calls,
         } else null,
+        .retry_waits = self.retry != null,
     };
 }
 
@@ -2958,13 +2991,16 @@ fn syncMirror(self: *App) !void {
 }
 
 /// Send the last blocks of the ending turn and turn its activity message into
-/// the summary. The session has ended the turn, so every block is committed.
+/// the summary. The session has ended the turn, so every block is committed,
+/// and a failure armed its retry by now, so the chat gets the failed turn
+/// message with it.
 fn endMirrorTurn(self: *App, outcome: remote.Mirror.End.Outcome) !void {
     const status = self.session.statusInfo();
     try self.mirror.endTurn(&self.controller, &self.mirrorView(), &.{
         .outcome = outcome,
         .status = &status,
         .now_ms = self.nowMs(),
+        .retry_armed = outcome == .failed and self.retry != null,
     });
 }
 
@@ -3117,13 +3153,14 @@ fn reportRemoteNotice(self: *App) !void {
 /// refusal and every steering rule applies once. It never reads or writes the
 /// editor, and a refusal answers the message in the chat.
 fn submitChatMessage(self: *App, text: []const u8, message_id: i64) !void {
+    var context = self.chatContext();
     switch (self.session.mode) {
         .turn => {
             // No command runs mid-turn, as in the terminal. The registry
             // decides first there too, so a line it cannot run as typed keeps
             // its own refusal instead of the one that names the turn.
             if (ai.command.parse(text)) |name| {
-                const refusal = (try self.checkCommand(text)) orelse
+                const refusal = (try ai.command.check(&context, text)) orelse
                     try ai.command.refuse(self.gpa, name, "while a turn runs");
                 defer self.gpa.free(refusal.content);
                 return self.controller.reply(message_id, refusal.content);
@@ -3146,18 +3183,16 @@ fn submitChatMessage(self: *App, text: []const u8, message_id: i64) !void {
             "Drinky cannot take a message now.",
         ),
     }
-    // Every command line refuses in this phase, and the refusal names the
-    // terminal, because the terminal is the one place that runs a command. A
-    // line the registry cannot run as typed keeps its own refusal.
-    if (ai.command.parse(text)) |name| {
-        const refusal = (try self.checkCommand(text)) orelse try ai.command.Outcome.Message.print(
-            self.gpa,
-            .warning,
-            "The command /{s} runs in the terminal alone.",
-            .{name},
-        );
-        defer self.gpa.free(refusal.content);
-        return self.controller.reply(message_id, refusal.content);
+    // A command line runs where the registry allows it in the chat. The
+    // registry refuses a terminal-only command and a line it cannot run as
+    // typed, and the refusal answers the message.
+    if (ai.command.parse(text) != null) {
+        if (try ai.command.check(&context, text)) |refusal| {
+            defer self.gpa.free(refusal.content);
+            return self.controller.reply(message_id, refusal.content);
+        }
+        const outcome = (try ai.command.run(&context, text)).?;
+        return self.applyChatOutcome(outcome, .{ .message = .{ .id = message_id, .text = text } });
     }
     if (!self.signedIn()) return self.controller.reply(message_id, telegram_signed_out_refusal);
     if (self.agent.model == null) return self.controller.reply(message_id, telegram_no_model_refusal);
@@ -3171,6 +3206,240 @@ fn submitChatMessage(self: *App, text: []const u8, message_id: i64) !void {
     // The message runs now, so the chat marks it as received. A refused message
     // gets its reply instead, because no receipt settles it later.
     try self.controller.react(message_id, .seen);
+}
+
+/// Where a command of the chat came from, so its result finds its place.
+const ChatOrigin = union(enum) {
+    /// A command line in a message. A notice answers it as a reply, and a turn
+    /// it starts marks it as received.
+    message: Line,
+    /// A tap on the open picker, with the query to answer. A notice answers it
+    /// as a toast, and the picker message states the result.
+    tap: []const u8,
+
+    const Line = struct {
+        id: i64,
+        text: []const u8,
+    };
+};
+
+/// Apply the outcome of a command that the chat ran. A picker shows as an
+/// inline keyboard, an event reaches the chat through the mirror, and a skill
+/// starts its turn. The registry refuses every terminal-only command on a remote
+/// host, so no outcome that needs the terminal arrives here.
+fn applyChatOutcome(self: *App, outcome: ai.command.Outcome, origin: ChatOrigin) !void {
+    switch (outcome) {
+        .pick => |*pick| {
+            // A step that both reports and opens a list records its line first.
+            // The picker takes the rows below, so a failure before it frees them.
+            if (pick.report) |message| self.session.applyOutcome(.{ .event = message }) catch |err| {
+                for (pick.options) |option| self.gpa.free(option);
+                self.gpa.free(pick.options);
+                return err;
+            };
+            switch (origin) {
+                .message => try self.chat_picker.show(&self.controller, pick),
+                .tap => |query_id| {
+                    try self.chat_picker.step(&self.controller, pick);
+                    try self.controller.answer(query_id, null);
+                },
+            }
+        },
+        .notice, .refusal => |message| {
+            defer self.gpa.free(message.content);
+            try self.stateChatNotice(origin, message.content);
+        },
+        .event => |message| {
+            // The session frees the content below, so a failure before it does.
+            self.stateChatResult(origin, message.content) catch |err| {
+                self.gpa.free(message.content);
+                return err;
+            };
+            try self.applyOutcome(outcome);
+        },
+        .new_conversation => {
+            try self.stateChatResult(origin, "New conversation");
+            try self.applyOutcome(outcome);
+        },
+        .prompt => |prompt| {
+            defer prompt.deinit(self.gpa);
+            if (!self.signedIn()) return self.stateChatNotice(origin, telegram_signed_out_refusal);
+            if (self.agent.model == null) return self.stateChatNotice(origin, telegram_no_model_refusal);
+            try self.startChatSkillTurn(&prompt, origin);
+        },
+        // The chat has no editor, and the registry loads a picked skill at once,
+        // so no line arrives here. The arm frees one that does.
+        .editor_text => |text| {
+            defer self.gpa.free(text);
+            try self.stateChatNotice(origin, terminal_only_action);
+        },
+        // The registry refused every command that reaches the terminal, so
+        // this states the one fact that holds for the rest.
+        else => try self.stateChatNotice(origin, terminal_only_action),
+    }
+}
+
+/// The notice of a chat outcome that only the terminal can host.
+const terminal_only_action = "This action runs in the terminal alone.";
+
+/// Start the turn of a skill that the chat loaded. A skill line in a message
+/// keeps the message as the retained prompt, like every Telegram prompt. A tap
+/// retains no prompt, like a retry attempt, because its request never sat in an
+/// editor: the picker message names the skill, and a second tap loads it again.
+fn startChatSkillTurn(
+    self: *App,
+    prompt: *const ai.command.Outcome.Prompt,
+    origin: ChatOrigin,
+) !void {
+    switch (origin) {
+        .message => |line| {
+            var draft = try ui.Editor.Draft.fromText(self.gpa, line.text);
+            errdefer draft.deinit(self.gpa);
+            const base = try self.startSkillTurn(prompt);
+            self.session.retainExternalTurnPrompt(&draft, base, line.id);
+            try self.controller.react(line.id, .seen);
+        },
+        .tap => |query_id| {
+            // The picker states the result before the turn makes it stale.
+            const head = try std.fmt.allocPrint(self.gpa, "Skill: {s}", .{prompt.name});
+            defer self.gpa.free(head);
+            try self.chat_picker.finish(&self.controller, head);
+            try self.controller.answer(query_id, null);
+            const base = try self.startSkillTurn(prompt);
+            self.session.markTurnBase(base);
+        },
+    }
+}
+
+/// State a notice of the chat where its origin shows it: as a reply to the
+/// message, or as a toast to the tap. The picker message of a tap states it
+/// too and loses its keyboard.
+fn stateChatNotice(self: *App, origin: ChatOrigin, text: []const u8) !void {
+    switch (origin) {
+        .message => |line| try self.controller.reply(line.id, text),
+        .tap => |query_id| {
+            try self.controller.answer(query_id, text);
+            try self.chat_picker.finish(&self.controller, text);
+        },
+    }
+}
+
+/// State the result of a command of the chat that is no notice. The mirror
+/// carries an event to the chat, so a message gets no reply, and a tap gets a
+/// silent answer while its picker message states the result.
+fn stateChatResult(self: *App, origin: ChatOrigin, text: []const u8) !void {
+    switch (origin) {
+        .message => {},
+        .tap => |query_id| {
+            try self.controller.answer(query_id, null);
+            try self.chat_picker.finish(&self.controller, text);
+        },
+    }
+}
+
+/// The toasts of a tap on a keyboard whose owner is gone.
+const turn_over_toast = "The turn is over.";
+const retry_over_toast = "The retry is over.";
+const list_closed_toast = "This list is closed.";
+
+/// Act on one tap of the chat and answer it. A tap on a keyboard the chat
+/// history still shows names a serial its owner no longer holds, and the toast
+/// states that.
+fn handleChatTap(self: *App, query_id: []const u8, tap: remote.keyboard.Tap) !void {
+    switch (tap) {
+        .cancel_turn => |serial| switch (try self.mirror.tapCancel(&self.controller, serial)) {
+            .stale => try self.controller.answer(query_id, turn_over_toast),
+            .armed => try self.controller.answer(query_id, null),
+            .cancel => {
+                try self.controller.answer(query_id, null);
+                try self.cancelTurn();
+            },
+        },
+        .withdraw => |serial| {
+            if (!self.mirror.namesTurn(serial)) return self.controller.answer(query_id, turn_over_toast);
+            const count = try self.withdrawSteering();
+            try self.controller.answer(query_id, if (count == 0) "Nothing queued." else null);
+        },
+        .retry => |serial| {
+            if (!self.mirror.namesRetry(serial) or self.retry == null)
+                return self.controller.answer(query_id, retry_over_toast);
+            if (!self.signedIn()) return self.controller.answer(
+                query_id,
+                "Sign in with /login in the terminal before you try the turn again.",
+            );
+            if (self.agent.model == null) return self.controller.answer(query_id, telegram_no_model_refusal);
+            try self.controller.answer(query_id, null);
+            try self.sendRetryTurn();
+        },
+        .dismiss => |serial| {
+            if (!self.mirror.namesRetry(serial)) return self.controller.answer(query_id, retry_over_toast);
+            try self.controller.answer(query_id, null);
+            self.clearRetry();
+        },
+        .row, .back, .close => try self.handlePickerTap(query_id, tap),
+    }
+}
+
+/// A tap on the open picker of the chat: a row runs the selector of the command,
+/// `‹ Back` rebuilds the step above, and `Cancel` ends the command with its
+/// cancellation message. A tap on a closed list gets the toast alone.
+fn handlePickerTap(self: *App, query_id: []const u8, tap: remote.keyboard.Tap) !void {
+    const action = self.chat_picker.resolve(tap) orelse
+        return self.controller.answer(query_id, list_closed_toast);
+    var context = self.chatContext();
+    switch (action) {
+        .row => |index| {
+            const outcome = try self.chat_picker.select(&context, index);
+            try self.applyChatOutcome(outcome, .{ .tap = query_id });
+        },
+        .back => |opener| {
+            const outcome = try opener(&context);
+            switch (outcome) {
+                .pick => |*pick| {
+                    try self.chat_picker.replace(&self.controller, pick, self.chat_picker.openers());
+                    try self.controller.answer(query_id, null);
+                },
+                // The step above reports instead of opening, so the command
+                // ends here.
+                else => try self.applyChatOutcome(outcome, .{ .tap = query_id }),
+            }
+        },
+        .close => {
+            const message = self.chat_picker.cancellationMessage();
+            try self.controller.answer(query_id, message);
+            try self.chat_picker.finish(&self.controller, message);
+        },
+    }
+}
+
+/// Take the whole steering queue back, like Ctrl+P, and mark each Telegram
+/// message of it as dropped. A typed draft returns to the editor, and a
+/// Telegram message drops while the bot holds the input, because the chat
+/// still holds it. Returns how many messages the queue held.
+fn withdrawSteering(self: *App) !usize {
+    // Reserve every possible draft move and the room for the ids, so no fallible
+    // work follows the channel take until the session agrees with the queue.
+    try self.session.reserveSteeringRecall();
+    var dropped: std.ArrayList(i64) = .empty;
+    defer dropped.deinit(self.gpa);
+    try dropped.ensureTotalCapacity(self.gpa, self.session.steering.items.len);
+    const taken = try self.agent.steering.take();
+    defer {
+        for (taken) |message| self.gpa.free(message);
+        self.gpa.free(taken);
+    }
+    // The count identifies the rich-record suffix currently owned by the queue.
+    // A batch already owned by the worker remains retained.
+    const messages = self.session.steering.items;
+    for (messages[messages.len - taken.len ..]) |*message| switch (message.source) {
+        .external => |id| dropped.appendAssumeCapacity(id),
+        .terminal => {},
+    };
+    self.session.recallSteering(taken.len);
+    // The session and the queue agree by now, so a failed mark costs the mark
+    // alone.
+    for (dropped.items) |id| try self.controller.react(id, .dropped);
+    return taken.len;
 }
 
 /// Keys in the token prompt state. The editor stays live for the token, Enter
@@ -9050,6 +9319,8 @@ fn initRemoteTest(
 
 fn deinitRemoteTest(self: *App) void {
     self.controller.deinit();
+    self.chat_picker.deinit();
+    self.dropRetry();
     self.freeRemoteStrings();
     self.drainQueue();
     self.input.deinit();
@@ -9200,9 +9471,10 @@ test "a pairing shows its wait and its code in the picker, and the bind takes th
             .{ .status = 401, .body = "{\"ok\":false,\"error_code\":401,\"description\":\"Unauthorized\"}" },
             .{ .body = "{\"ok\":true,\"result\":{\"id\":42,\"is_bot\":true,\"username\":\"drinky_bot\"}}" },
         } },
-        // The pairing polls once and finds the code, then the attach confirms
-        // the old updates and holds its long poll.
+        // The pairing polls once and finds the code, then the attach registers
+        // the commands, confirms the old updates, and holds its long poll.
         .{ .method = "deleteWebhook", .replies = &.{ .{ .body = remote_ok_true }, .{ .body = remote_ok_true } } },
+        .{ .method = "setMyCommands", .replies = &.{.{ .body = remote_ok_true }} },
         .{ .method = "getUpdates", .replies = &.{
             .{ .body = remote_ok_empty },
             .{ .body =
@@ -9276,6 +9548,7 @@ test "while a bot holds the input the terminal takes a detach alone, and Enter n
     defer out.deinit();
     var server = try remote_testing.Server.init(gpa, io, &.{
         .{ .method = "deleteWebhook", .replies = &.{.{ .body = remote_ok_true }} },
+        .{ .method = "setMyCommands", .replies = &.{.{ .body = remote_ok_true }} },
         .{ .method = "getUpdates", .replies = &.{.{ .body = remote_ok_empty }} },
         .{ .method = "sendMessage", .replies = &.{ .{ .body = remote_ok_sent }, .{ .body = remote_ok_sent } } },
     });
@@ -9293,7 +9566,7 @@ test "while a bot holds the input the terminal takes a detach alone, and Enter n
     try app.handleKeys("\r");
     try std.testing.expect(app.session.input.owner == .external);
     try std.testing.expect(app.session.mode == .prompt);
-    try server.waitForRequests(2);
+    try server.waitForRequests(3);
 
     // Typed text and Enter reach no editor and no model.
     try app.handleKeys("hello\r");
@@ -9347,6 +9620,7 @@ test "an exit key during the detach wait frees the editor at once and drops the 
     // No script answers a send, so the detach event stays in flight.
     var server = try remote_testing.Server.init(gpa, io, &.{
         .{ .method = "deleteWebhook", .replies = &.{.{ .body = remote_ok_true }} },
+        .{ .method = "setMyCommands", .replies = &.{.{ .body = remote_ok_true }} },
         .{ .method = "getUpdates", .replies = &.{.{ .body = remote_ok_empty }} },
     });
     defer server.deinit();
@@ -9358,7 +9632,7 @@ test "an exit key during the detach wait frees the editor at once and drops the 
     defer app.deinitRemoteTest();
     try app.controller.store.save(&.{ .token = "42:secret", .id = 42, .username = "drinky_bot", .chat_id = 99 });
     try app.controller.attachSaved(0);
-    try server.waitForRequests(2);
+    try server.waitForRequests(3);
 
     try app.handleKey(&.escape);
     try std.testing.expectEqual(remote.Controller.State.detaching, app.controller.state());
@@ -9384,6 +9658,7 @@ test "an exit key under a bot clears an armed confirmation" {
     defer out.deinit();
     var server = try remote_testing.Server.init(gpa, io, &.{
         .{ .method = "deleteWebhook", .replies = &.{.{ .body = remote_ok_true }} },
+        .{ .method = "setMyCommands", .replies = &.{.{ .body = remote_ok_true }} },
         .{ .method = "getUpdates", .replies = &.{.{ .body = remote_ok_empty }} },
     });
     defer server.deinit();
@@ -9404,7 +9679,7 @@ test "an exit key under a bot clears an armed confirmation" {
 
     // A bot attaches, and two exit keys detach it and end its wait.
     try app.controller.attachSaved(0);
-    try server.waitForRequests(2);
+    try server.waitForRequests(3);
     try app.handleKey(&.escape);
     try std.testing.expectEqual(remote.Controller.State.detaching, app.controller.state());
     try app.handleKey(&.escape);
@@ -9430,6 +9705,7 @@ test "a Telegram message runs as a prompt, and its refusals answer in the chat" 
     defer out.deinit();
     var server = try remote_testing.Server.init(gpa, io, &.{
         .{ .method = "deleteWebhook", .replies = &.{.{ .body = remote_ok_true }} },
+        .{ .method = "setMyCommands", .replies = &.{.{ .body = remote_ok_true }} },
         .{ .method = "getUpdates", .replies = &.{
             .{ .body = remote_ok_empty },
             .{ .body =
@@ -9503,6 +9779,7 @@ test "a credential rejection returns the Telegram prompt to the editor" {
     });
     var server = try remote_testing.Server.init(gpa, io, &.{
         .{ .method = "deleteWebhook", .replies = &.{.{ .body = remote_ok_true }} },
+        .{ .method = "setMyCommands", .replies = &.{.{ .body = remote_ok_true }} },
         .{ .method = "getUpdates", .replies = &.{.{ .body = remote_ok_empty }} },
         .{ .method = "sendMessage", .replies = &.{ .{ .body = remote_ok_sent }, .{ .body = remote_ok_sent } } },
     });
@@ -9525,7 +9802,7 @@ test "a credential rejection returns the Telegram prompt to the editor" {
     app.session.account_shown = .anthropic_subscription;
     try app.controller.store.save(&.{ .token = "42:secret", .id = 42, .username = "drinky_bot", .chat_id = 99 });
     try app.controller.attachSaved(0);
-    try server.waitForRequests(2);
+    try server.waitForRequests(3);
 
     // A Telegram prompt starts a turn, and the provider rejects the credential
     // before the turn commits anything.
@@ -9562,6 +9839,7 @@ test "a pick after the detach wait attaches at once" {
     defer out.deinit();
     var server = try remote_testing.Server.init(gpa, io, &.{
         .{ .method = "deleteWebhook", .replies = &.{ .{ .body = remote_ok_true }, .{ .body = remote_ok_true } } },
+        .{ .method = "setMyCommands", .replies = &.{ .{ .body = remote_ok_true }, .{ .body = remote_ok_true } } },
         .{ .method = "getUpdates", .replies = &.{ .{ .body = remote_ok_empty }, .{ .body = remote_ok_empty } } },
         .{ .method = "sendMessage", .replies = &.{
             .{ .body = remote_ok_sent },
@@ -9579,7 +9857,7 @@ test "a pick after the detach wait attaches at once" {
     try app.controller.store.save(&.{ .token = "42:secret", .id = 42, .username = "drinky_bot", .chat_id = 99 });
 
     try app.controller.attachSaved(0);
-    try server.waitForRequests(2);
+    try server.waitForRequests(3);
     try app.handleKey(&.escape);
     try std.testing.expectEqual(remote.Controller.State.detaching, app.controller.state());
 
@@ -9610,6 +9888,7 @@ test "a Telegram message during a turn queues as steering that drops while the b
     defer out.deinit();
     var server = try remote_testing.Server.init(gpa, io, &.{
         .{ .method = "deleteWebhook", .replies = &.{.{ .body = remote_ok_true }} },
+        .{ .method = "setMyCommands", .replies = &.{.{ .body = remote_ok_true }} },
         .{ .method = "getUpdates", .replies = &.{.{ .body = remote_ok_empty }} },
         .{ .method = "sendMessage", .replies = &.{
             .{ .body = remote_ok_sent },
@@ -9631,7 +9910,7 @@ test "a Telegram message during a turn queues as steering that drops while the b
     defer app.deinitRemoteTest();
     try app.controller.store.save(&.{ .token = "42:secret", .id = 42, .username = "drinky_bot", .chat_id = 99 });
     try app.controller.attachSaved(0);
-    try server.waitForRequests(2);
+    try server.waitForRequests(3);
     app.session.beginTurn(1);
 
     // A typed message from before the attach and a Telegram message share the queue.
@@ -9676,6 +9955,8 @@ test "a Telegram message during a turn queues as steering that drops while the b
     app.session.editor.clear();
     app.session.beginTurn(2);
     try app.submitChatMessage("after the detach", 14);
+    // The close drops what the queue still holds, so the mark goes out first.
+    _ = try server.waitForRequest("/setMessageReaction", 1);
     try app.controller.detach(.user);
     try std.testing.expect(app.session.input.owner == .none);
     try app.session.endTurnWithReceipt(&.{
@@ -9702,6 +9983,7 @@ test "the chat mirrors a completed turn with its activity message, its answer, a
     defer out.deinit();
     var server = try remote_testing.Server.init(gpa, io, &.{
         .{ .method = "deleteWebhook", .replies = &.{.{ .body = remote_ok_true }} },
+        .{ .method = "setMyCommands", .replies = &.{.{ .body = remote_ok_true }} },
         .{ .method = "getUpdates", .replies = &.{.{ .body = remote_ok_empty }} },
         .{ .method = "sendMessage", .replies = &.{
             .{ .body = remote_ok_sent },
@@ -9720,7 +10002,7 @@ test "the chat mirrors a completed turn with its activity message, its answer, a
     defer app.deinitRemoteTest();
     try app.controller.store.save(&.{ .token = "42:secret", .id = 42, .username = "drinky_bot", .chat_id = 99 });
     try app.controller.attachSaved(0);
-    try server.waitForRequests(2);
+    try server.waitForRequests(3);
 
     // A Telegram prompt starts the turn, as `submitChatMessage` does past its
     // gates, and the mirror opens the turn with its activity message.
@@ -9741,8 +10023,15 @@ test "the chat mirrors a completed turn with its activity message, its answer, a
         .payload = .{ .text = try gpa.dupe(u8, "The **answer**.") },
     } }};
     _ = try app.applyBatch(&events);
+    // The edit keeps the buttons of the turn, because an edit without them
+    // drops them.
     const writing = try server.waitForRequest("/editMessageText", 0);
-    try std.testing.expectEqualStrings("{\"chat_id\":99,\"message_id\":50,\"text\":\"Writing\"}", writing);
+    try std.testing.expectEqualStrings(
+        "{\"chat_id\":99,\"message_id\":50,\"text\":\"Writing\",\"reply_markup\":{\"inline_keyboard\":[" ++
+            "[{\"text\":\"Cancel turn\",\"callback_data\":\"cancel:1\"}]," ++
+            "[{\"text\":\"Withdraw\",\"callback_data\":\"withdraw:1\"}]]}}",
+        writing,
+    );
     try std.testing.expectEqual(@as(usize, 2), server.sendCount());
 
     // The receipt commits the round: the answer goes out and notifies, the
@@ -9764,8 +10053,9 @@ test "the chat mirrors a completed turn with its activity message, its answer, a
     const summary = try server.waitForRequest("/editMessageText", 1);
     try std.testing.expect(std.mem.indexOf(u8, summary, "\"text\":\"Tools: 0 calls · Time: ") != null);
     // A signed-out session with no model states its tokens alone, as the status
-    // line does.
-    try std.testing.expect(std.mem.indexOf(u8, summary, " · Context: 0 · Cost: ~$0.00\"") != null);
+    // line does. The summary holds no button.
+    try std.testing.expect(std.mem.indexOf(u8, summary, " · Context: 0 · Cost: ~$0.00\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "reply_markup") == null);
     const committed = try server.waitForRequest("/setMessageReaction", 1);
     try std.testing.expect(std.mem.indexOf(u8, committed, "\"message_id\":7,\"reaction\":[{\"type\":\"emoji\",\"emoji\":\"👍\"}]") != null);
     try server.finish();
@@ -9783,6 +10073,7 @@ test "a failed turn marks its uncommitted messages and notifies its error" {
     defer out.deinit();
     var server = try remote_testing.Server.init(gpa, io, &.{
         .{ .method = "deleteWebhook", .replies = &.{.{ .body = remote_ok_true }} },
+        .{ .method = "setMyCommands", .replies = &.{.{ .body = remote_ok_true }} },
         .{ .method = "getUpdates", .replies = &.{.{ .body = remote_ok_empty }} },
         .{ .method = "sendMessage", .replies = &.{
             .{ .body = remote_ok_sent },
@@ -9805,7 +10096,7 @@ test "a failed turn marks its uncommitted messages and notifies its error" {
     defer app.deinitRemoteTest();
     try app.controller.store.save(&.{ .token = "42:secret", .id = 42, .username = "drinky_bot", .chat_id = 99 });
     try app.controller.attachSaved(0);
-    try server.waitForRequests(2);
+    try server.waitForRequests(3);
 
     app.session.beginTurn(1);
     const base = app.session.transcript.blocks().len;
@@ -9840,4 +10131,455 @@ test "a failed turn marks its uncommitted messages and notifies its error" {
     const dropped = try server.waitForRequest("/setMessageReaction", 2);
     try std.testing.expect(std.mem.indexOf(u8, dropped, "\"message_id\":8,\"reaction\":[{\"type\":\"emoji\",\"emoji\":\"👎\"}]") != null);
     try server.finish();
+}
+
+// A command line from Telegram runs where the registry allows it. A picker
+// shows as an inline keyboard under one message, a tap on a row runs the
+// command and the message states the result without its keyboard, and the
+// event of the change reaches the chat through the mirror. A tap on the closed
+// list gets the toast alone.
+test "a Telegram command opens a keyboard, a tap picks a row, and a stale tap gets the toast" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var server = try remote_testing.Server.init(gpa, io, &.{
+        .{ .method = "deleteWebhook", .replies = &.{.{ .body = remote_ok_true }} },
+        .{ .method = "setMyCommands", .replies = &.{.{ .body = remote_ok_true }} },
+        .{ .method = "getUpdates", .replies = &.{.{ .body = remote_ok_empty }} },
+        .{ .method = "sendMessage", .replies = &.{
+            .{ .body = remote_ok_sent },
+            .{ .body = "{\"ok\":true,\"result\":{\"message_id\":60}}" },
+            .{ .body = remote_ok_sent },
+        } },
+        .{ .method = "editMessageText", .replies = &.{.{ .body = remote_ok_true }} },
+        .{ .method = "answerCallbackQuery", .replies = &.{ .{ .body = remote_ok_true }, .{ .body = remote_ok_true } } },
+    });
+    defer server.deinit();
+    try server.start();
+    var url_buffer: [64]u8 = undefined;
+
+    var app: App = undefined;
+    app.initRemoteTest(gpa, io, &out, &server, &url_buffer);
+    defer app.deinitRemoteTest();
+    try app.controller.store.save(&.{ .token = "42:secret", .id = 42, .username = "drinky_bot", .chat_id = 99 });
+    try app.controller.attachSaved(0);
+    try server.waitForRequests(3);
+
+    // The picker is one message with one button per row, the current row
+    // marked, and a cancel button. The message that asked for it gets no reply.
+    try app.submitChatMessage("/effort", 20);
+    try std.testing.expect(app.chat_picker.isOpen());
+    const picker = try server.waitForSend(1);
+    try std.testing.expect(std.mem.indexOf(u8, picker, "\"text\":\"Effort\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, picker, "reply_parameters") == null);
+    try std.testing.expect(std.mem.indexOf(u8, picker, "[{\"text\":\"✓ low\",\"callback_data\":\"row:1:0\"}]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, picker, "[{\"text\":\"high\",\"callback_data\":\"row:1:2\"}]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, picker, "[{\"text\":\"Cancel\",\"callback_data\":\"close:1\"}]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, picker, "Back") == null);
+
+    // The tap sets the level. The answer is silent, because the message states
+    // the result, and the event reaches the chat once through the mirror.
+    try app.handleChatTap("900", .{ .row = .{ .serial = 1, .index = 2 } });
+    try std.testing.expect(app.agent.effort == .high);
+    try std.testing.expect(!app.chat_picker.isOpen());
+    try std.testing.expectEqualStrings("Drinky set the effort level to high.", app.lastEventText());
+    try std.testing.expectEqualStrings(
+        "{\"callback_query_id\":\"900\"}",
+        try server.waitForRequest("/answerCallbackQuery", 0),
+    );
+    try std.testing.expectEqualStrings(
+        "{\"chat_id\":99,\"message_id\":60,\"text\":\"Drinky set the effort level to high.\"}",
+        try server.waitForRequest("/editMessageText", 0),
+    );
+    try app.syncMirror();
+    const event = try server.waitForSend(2);
+    try std.testing.expect(std.mem.indexOf(u8, event, "\"text\":\"Event: Drinky set the effort level to high.\"") != null);
+
+    // The list is closed, so a tap on its keyboard in the history gets the toast.
+    try app.handleChatTap("901", .{ .row = .{ .serial = 1, .index = 0 } });
+    try std.testing.expectEqualStrings(
+        "{\"callback_query_id\":\"901\",\"text\":\"This list is closed.\"}",
+        try server.waitForRequest("/answerCallbackQuery", 1),
+    );
+    try std.testing.expect(app.agent.effort == .high);
+    try server.finish();
+}
+
+// The buttons of the activity message drive the turn. A cancel destroys the work
+// of the turn, so the first tap changes the label and the second tap cancels. A
+// withdraw drops the queue like Ctrl+P and marks each dropped Telegram message.
+test "the activity keyboard cancels the turn on the second tap and withdraws the queue" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var server = try remote_testing.Server.init(gpa, io, &.{
+        .{ .method = "deleteWebhook", .replies = &.{.{ .body = remote_ok_true }} },
+        .{ .method = "setMyCommands", .replies = &.{.{ .body = remote_ok_true }} },
+        .{ .method = "getUpdates", .replies = &.{.{ .body = remote_ok_empty }} },
+        .{ .method = "sendMessage", .replies = &.{
+            .{ .body = remote_ok_sent },
+            .{ .body = "{\"ok\":true,\"result\":{\"message_id\":50}}" },
+        } },
+        .{ .method = "editMessageText", .replies = &.{ .{ .body = remote_ok_true }, .{ .body = remote_ok_true } } },
+        .{ .method = "setMessageReaction", .replies = &.{ .{ .body = remote_ok_true }, .{ .body = remote_ok_true } } },
+        .{ .method = "answerCallbackQuery", .replies = &.{
+            .{ .body = remote_ok_true },
+            .{ .body = remote_ok_true },
+            .{ .body = remote_ok_true },
+            .{ .body = remote_ok_true },
+            .{ .body = remote_ok_true },
+        } },
+    });
+    defer server.deinit();
+    try server.start();
+    var url_buffer: [64]u8 = undefined;
+
+    var app: App = undefined;
+    app.initRemoteTest(gpa, io, &out, &server, &url_buffer);
+    defer app.deinitRemoteTest();
+    try app.controller.store.save(&.{ .token = "42:secret", .id = 42, .username = "drinky_bot", .chat_id = 99 });
+    try app.controller.attachSaved(0);
+    try server.waitForRequests(3);
+
+    // A turn runs with its activity message, and a Telegram message queues.
+    app.session.beginTurn(1);
+    try app.mirror.beginTurn(&app.controller, app.nowMs());
+    const activity = try server.waitForSend(1);
+    try std.testing.expect(std.mem.indexOf(u8, activity, "[{\"text\":\"Cancel turn\",\"callback_data\":\"cancel:1\"}]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, activity, "[{\"text\":\"Withdraw\",\"callback_data\":\"withdraw:1\"}]") != null);
+    try app.submitChatMessage("queued", 12);
+    _ = try server.waitForRequest("/setMessageReaction", 0);
+
+    // A tap on a keyboard of another turn gets the toast and changes nothing.
+    try app.handleChatTap("900", .{ .cancel_turn = 7 });
+    try std.testing.expectEqualStrings(
+        "{\"callback_query_id\":\"900\",\"text\":\"The turn is over.\"}",
+        try server.waitForRequest("/answerCallbackQuery", 0),
+    );
+    try std.testing.expect(app.session.mode == .turn);
+
+    // The withdraw drops the queue and marks the message. The chat holds its
+    // text, so no editor takes it. A second withdraw finds nothing.
+    try app.handleChatTap("901", .{ .withdraw = 1 });
+    try std.testing.expectEqualStrings("{\"callback_query_id\":\"901\"}", try server.waitForRequest("/answerCallbackQuery", 1));
+    const dropped = try server.waitForRequest("/setMessageReaction", 1);
+    try std.testing.expect(std.mem.indexOf(u8, dropped, "\"message_id\":12,\"reaction\":[{\"type\":\"emoji\",\"emoji\":\"👎\"}]") != null);
+    try std.testing.expectEqual(@as(usize, 0), app.session.steering.items.len);
+    try std.testing.expectEqualStrings("", app.session.editor.visible());
+    try app.handleChatTap("902", .{ .withdraw = 1 });
+    try std.testing.expectEqualStrings(
+        "{\"callback_query_id\":\"902\",\"text\":\"Nothing queued.\"}",
+        try server.waitForRequest("/answerCallbackQuery", 2),
+    );
+
+    // The first cancel tap arms the second and changes the label. The second
+    // tap cancels the turn, and the summary opens with the outcome.
+    try spawnCanceledTurn(&app);
+    try app.handleChatTap("903", .{ .cancel_turn = 1 });
+    try std.testing.expect(app.session.mode == .turn);
+    const armed = try server.waitForRequest("/editMessageText", 0);
+    try std.testing.expect(std.mem.indexOf(u8, armed, "\"text\":\"Thinking\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, armed, "[{\"text\":\"Tap again to cancel\",\"callback_data\":\"cancel:1\"}]") != null);
+    try app.handleChatTap("904", .{ .cancel_turn = 1 });
+    try std.testing.expect(app.session.mode == .prompt);
+    const summary = try server.waitForRequest("/editMessageText", 1);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "\"text\":\"Canceled · Tools: 0 calls · Time: ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "reply_markup") == null);
+    _ = try server.waitForRequest("/answerCallbackQuery", 4);
+    try server.finish();
+}
+
+// A failed turn that armed a retry gives the chat the two controls of the
+// terminal caption. A dismiss ends the retry and takes the buttons off, and a
+// stale tap gets the toast. The message goes out at the attach too, when the
+// retry waits there, and a detach leaves it as it stands.
+test "the failed turn message dismisses the retry from the chat and stands at the attach" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var server = try remote_testing.Server.init(gpa, io, &.{
+        .{ .method = "deleteWebhook", .replies = &.{ .{ .body = remote_ok_true }, .{ .body = remote_ok_true } } },
+        .{ .method = "setMyCommands", .replies = &.{ .{ .body = remote_ok_true }, .{ .body = remote_ok_true } } },
+        .{ .method = "getUpdates", .replies = &.{ .{ .body = remote_ok_empty }, .{ .body = remote_ok_empty } } },
+        .{ .method = "sendMessage", .replies = &.{
+            .{ .body = remote_ok_sent },
+            .{ .body = remote_ok_sent },
+            .{ .body = remote_ok_sent },
+            .{ .body = "{\"ok\":true,\"result\":{\"message_id\":70}}" },
+            .{ .body = remote_ok_sent },
+            .{ .body = remote_ok_sent },
+            .{ .body = "{\"ok\":true,\"result\":{\"message_id\":80}}" },
+            .{ .body = remote_ok_sent },
+        } },
+        .{ .method = "editMessageText", .replies = &.{ .{ .body = remote_ok_true }, .{ .body = remote_ok_true } } },
+        .{ .method = "answerCallbackQuery", .replies = &.{ .{ .body = remote_ok_true }, .{ .body = remote_ok_true } } },
+    });
+    defer server.deinit();
+    try server.start();
+    var url_buffer: [64]u8 = undefined;
+
+    var app: App = undefined;
+    app.initRemoteTest(gpa, io, &out, &server, &url_buffer);
+    defer app.deinitRemoteTest();
+    try app.controller.store.save(&.{ .token = "42:secret", .id = 42, .username = "drinky_bot", .chat_id = 99 });
+    try app.controller.attachSaved(0);
+    try server.waitForRequests(3);
+
+    // A turn that committed a round fails, so the retry arms and the chat gets
+    // the failed turn message after the error event and the summary.
+    app.session.beginTurn(1);
+    try app.mirror.beginTurn(&app.controller, app.nowMs());
+    try app.session.transcript.append(.user, .{}, "from Telegram");
+    var result: WorkerResult = .{
+        .outcome = .{
+            .receipt = .{ .history_base = 0, .history_end = 2, .steering_committed_count = 0 },
+            .disposition = .{ .failed = error.ApiError },
+        },
+        .error_text = try gpa.dupe(u8, "The provider refused the request."),
+    };
+    defer app.freeWorkerResult(&result);
+    try app.finishWorkerResult(&result);
+    try std.testing.expect(app.retry != null);
+    const failed = try server.waitForSend(3);
+    try std.testing.expect(std.mem.indexOf(u8, failed, "\"text\":\"Failed turn\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, failed, "[{\"text\":\"Try again\",\"callback_data\":\"retry:2\"}]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, failed, "[{\"text\":\"Dismiss\",\"callback_data\":\"dismiss:2\"}]") != null);
+
+    // A stale tap gets the toast, and the dismiss ends the retry: the caption
+    // goes, and the message keeps its text without its buttons.
+    try app.handleChatTap("900", .{ .dismiss = 1 });
+    try std.testing.expectEqualStrings(
+        "{\"callback_query_id\":\"900\",\"text\":\"The retry is over.\"}",
+        try server.waitForRequest("/answerCallbackQuery", 0),
+    );
+    try std.testing.expect(app.retry != null);
+    try app.handleChatTap("901", .{ .dismiss = 2 });
+    try std.testing.expect(app.retry == null);
+    try std.testing.expect(!app.session.retry_shown);
+    try std.testing.expectEqualStrings(
+        "{\"chat_id\":99,\"message_id\":70,\"text\":\"Failed turn\"}",
+        try server.waitForRequest("/editMessageText", 1),
+    );
+
+    // A retry that waits at the attach gets its message then. The detach sends
+    // the detach event alone and leaves the message as it stands, and the
+    // second attach sends a new one, so a tap on the old one reads as stale.
+    try app.armRetry(&result, false);
+    try app.handleKey(&.escape);
+    try std.testing.expect(app.session.input.owner == .none);
+    _ = try server.waitForSend(4);
+    try app.pumpRemoteEvents(1);
+    try std.testing.expect(app.session.input.owner == .terminal);
+    try app.controller.attachSaved(0);
+    const attached = try server.waitForSend(6);
+    try std.testing.expect(std.mem.indexOf(u8, attached, "\"text\":\"Failed turn\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, attached, "\"callback_data\":\"retry:3\"") != null);
+    try std.testing.expect(!app.mirror.namesRetry(2));
+    try app.handleKey(&.escape);
+    _ = try server.waitForSend(7);
+    try app.pumpRemoteEvents(1);
+    try server.finish();
+    // The two edits are the summary and the dismiss. No edit went out at either
+    // detach.
+    try std.testing.expectEqual(@as(usize, 2), server.countOf("/editMessageText"));
+}
+
+// A `/new` from the chat clears the conversation and opens the new one on the
+// bracket of the bot, so a reader of the transcript still sees which chat drove
+// every message. The mirror starts over at that event.
+test "a /new from Telegram records the remote bracket as the first event" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var server = try remote_testing.Server.init(gpa, io, &.{
+        .{ .method = "deleteWebhook", .replies = &.{.{ .body = remote_ok_true }} },
+        .{ .method = "setMyCommands", .replies = &.{.{ .body = remote_ok_true }} },
+        .{ .method = "getUpdates", .replies = &.{.{ .body = remote_ok_empty }} },
+        .{ .method = "sendMessage", .replies = &.{ .{ .body = remote_ok_sent }, .{ .body = remote_ok_sent } } },
+    });
+    defer server.deinit();
+    try server.start();
+    var url_buffer: [64]u8 = undefined;
+
+    var app: App = undefined;
+    app.initRemoteTest(gpa, io, &out, &server, &url_buffer);
+    defer app.deinitRemoteTest();
+    try app.controller.store.save(&.{ .token = "42:secret", .id = 42, .username = "drinky_bot", .chat_id = 99 });
+    try app.controller.attachSaved(0);
+    try server.waitForRequests(3);
+    try app.session.transcript.append(.model, .{}, "old answer");
+
+    try app.submitChatMessage("/new", 21);
+    const blocks = app.session.transcript.blocks();
+    try std.testing.expectEqual(@as(usize, 2), blocks.len);
+    try std.testing.expect(blocks[0].content == .intro);
+    try std.testing.expectEqualStrings("New conversation · Remote: @drinky_bot", app.lastEventText());
+    try app.syncMirror();
+    const event = try server.waitForSend(1);
+    try std.testing.expect(std.mem.indexOf(u8, event, "\"text\":\"Event: New conversation · Remote: @drinky_bot\"") != null);
+    try server.finish();
+    // The command itself gets no reply, because the event states it.
+    try std.testing.expectEqual(@as(usize, 2), server.sendCount());
+}
+
+// A skill that a tap loads has no message in the chat and no line in an editor,
+// so its turn retains no prompt, like a retry attempt. A failure before the
+// first commit then returns nothing to the locked editor, and the picker message
+// names the skill for a second tap.
+test "a skill loaded by a tap retains no prompt, so its failed turn fills no editor" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var skill = try tmp.dir.createDirPathOpen(io, ".agents/skills/demo", .{});
+    skill.close(io);
+    try tmp.dir.writeFile(io, .{
+        .sub_path = ".agents/skills/demo/SKILL.md",
+        .data = "---\nname: demo\ndescription: a test skill\n---\nbody\n",
+    });
+    const root = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(root);
+    const user_skills = try std.fs.path.join(gpa, &.{ root, "home", ".agents", "skills" });
+    defer gpa.free(user_skills);
+    var server = try remote_testing.Server.init(gpa, io, &.{
+        .{ .method = "deleteWebhook", .replies = &.{.{ .body = remote_ok_true }} },
+        .{ .method = "setMyCommands", .replies = &.{.{ .body = remote_ok_true }} },
+        .{ .method = "getUpdates", .replies = &.{.{ .body = remote_ok_empty }} },
+        .{ .method = "sendMessage", .replies = &.{
+            .{ .body = remote_ok_sent },
+            .{ .body = remote_ok_sent },
+            .{ .body = remote_ok_sent },
+        } },
+        .{ .method = "editMessageText", .replies = &.{.{ .body = remote_ok_true }} },
+        .{ .method = "answerCallbackQuery", .replies = &.{.{ .body = remote_ok_true }} },
+    });
+    defer server.deinit();
+    try server.start();
+    var url_buffer: [64]u8 = undefined;
+
+    var app: App = undefined;
+    app.initRemoteTest(gpa, io, &out, &server, &url_buffer);
+    defer app.deinitRemoteTest();
+    // A model without a client, so the worker fails fast before any commit.
+    app.agent.deinit();
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = test_anthropic_model,
+        .system = "",
+        .retry = .{},
+        .environ = .empty,
+    });
+    app.skills.deinit();
+    app.skills = try ai.skills.discover(gpa, io, &.{
+        .user_root = user_skills,
+        .project_start = root,
+        .project_root = null,
+    });
+    defer app.skills.deinit();
+    try app.controller.store.save(&.{ .token = "42:secret", .id = 42, .username = "drinky_bot", .chat_id = 99 });
+    try app.controller.attachSaved(0);
+    try server.waitForRequests(3);
+
+    var context = app.chatContext();
+    const prompt = (try ai.command.run(&context, "/skill:demo")).?.prompt;
+    defer prompt.deinit(gpa);
+    try app.startChatSkillTurn(&prompt, .{ .tap = "900" });
+    try std.testing.expect(app.session.mode == .turn);
+    try std.testing.expect(app.session.turn_prompt == null);
+    try std.testing.expectEqualStrings("{\"callback_query_id\":\"900\"}", try server.waitForRequest("/answerCallbackQuery", 0));
+
+    // The turn fails before its first commit: the transcript rewinds to the
+    // attach event, the editor stays empty under the bot, and no retry arms.
+    const result = app.awaitTurnFuture().?;
+    defer app.freeWorkerResult(&result);
+    try std.testing.expect(result.outcome.disposition == .failed);
+    try app.finishWorkerResult(&result);
+    try std.testing.expect(app.session.mode == .prompt);
+    try std.testing.expectEqualStrings("", app.session.editor.visible());
+    try std.testing.expect(app.session.input.owner == .external);
+    try std.testing.expect(app.retry == null);
+    for (app.session.transcript.blocks()) |*block| try std.testing.expect(block.content != .user_note);
+    const failure = try server.waitForSend(2);
+    try std.testing.expect(std.mem.indexOf(u8, failure, "\"text\":\"Error: ") != null);
+    try server.finish();
+}
+
+// The withdraw takes the agent queue and then moves the session with it. No
+// fallible step can stand between the two, or a failure leaves an agent queue
+// that is empty while the session still holds the messages. The one step that
+// can fail after the take is the mark of a dropped message when the send queue
+// is full, because its report allocates. The sweep fails every allocation of
+// the withdraw in turn, and after each failure the two sides must agree.
+test "a withdraw whose mark fails after the take leaves the session and the queue in agreement" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const gpa = failing.allocator();
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    // No script answers a send or a reaction, so the sender hangs on the first
+    // item and the queue behind it fills.
+    var server = try remote_testing.Server.init(std.testing.allocator, io, &.{
+        .{ .method = "deleteWebhook", .replies = &.{.{ .body = remote_ok_true }} },
+        .{ .method = "setMyCommands", .replies = &.{.{ .body = remote_ok_true }} },
+        .{ .method = "getUpdates", .replies = &.{.{ .body = remote_ok_empty }} },
+    });
+    defer server.deinit();
+    try server.start();
+    var url_buffer: [64]u8 = undefined;
+
+    var app: App = undefined;
+    app.initRemoteTest(gpa, io, &out, &server, &url_buffer);
+    defer app.deinitRemoteTest();
+    // The tasks of the bot allocate on their own threads, so they take the plain
+    // allocator, and the sweep reaches the app alone.
+    app.controller.gpa = std.testing.allocator;
+    try app.controller.store.save(&.{ .token = "42:secret", .id = 42, .username = "drinky_bot", .chat_id = 99 });
+    try app.controller.attachSaved(0);
+    try server.waitForRequests(3);
+    app.session.beginTurn(1);
+    try app.submitChatMessage("queued", 12);
+    try std.testing.expectEqual(@as(usize, 1), app.agent.steering.messages.items.len);
+    // The reaction of the message holds the sender, and the fills take the rest
+    // of the queue.
+    for (0..300) |_| try app.controller.send("fill", &.{});
+
+    var step: usize = 0;
+    while (true) : (step += 1) {
+        // Every drop reports once per run, so each pass reports again.
+        app.controller.drop_reported = false;
+        failing.fail_index = failing.alloc_index + step;
+        const result = app.withdrawSteering();
+        failing.fail_index = std.math.maxInt(usize);
+        const pending = app.session.steering.items.len - app.session.steering_retained_count;
+        try std.testing.expectEqual(pending, app.agent.steering.messages.items.len);
+        if (result) |count| {
+            // The pass whose mark failed had taken the queue and moved the
+            // session with it, so the check above held after the take and this
+            // pass finds nothing left.
+            try std.testing.expectEqual(@as(usize, 0), count);
+            break;
+        } else |err| try std.testing.expectEqual(error.OutOfMemory, err);
+        // The withdraw makes a handful of allocations, so a sweep past this
+        // count found a step that never fails.
+        if (step == 32) return error.TestSweepTooLong;
+    }
+    try std.testing.expectEqual(@as(usize, 0), app.session.steering.items.len);
+    try std.testing.expectEqualStrings("", app.session.editor.visible());
 }

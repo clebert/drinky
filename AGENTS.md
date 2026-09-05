@@ -21,8 +21,10 @@ behavior can be wrong.
 - `lib/ai/` contains the provider-neutral agent core, provider transports, commands, and tools.
 - `src/` contains the composition root, event loop, transcript, layout, and UI.
 - `src/remote/` contains the Telegram remote control: the Bot API client, the store of saved bots,
-  the attachment with its poller and sender, the pairing, and the controller that owns them all. The
-  controller reports through a sink of small actions and knows nothing of the session.
+  the attachment with its poller, sender, and answerer, the pairing, and the controller that owns
+  them all. The controller reports through a sink of small actions and knows nothing of the session.
+  The mirror sends the transcript to the chat and holds the keyboards of the turn, and the picker
+  holds the open command picker of the chat.
 
 The libraries never import each other or the app. Only the `root.zig` file in a module can re-export
 names.

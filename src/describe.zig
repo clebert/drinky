@@ -95,8 +95,9 @@ pub fn compose(gpa: std.mem.Allocator, options: *const Options) ![]u8 {
 }
 
 /// One row per command, from the registry that runs them. A row also names the
-/// line that runs the same command, such as the bare `/` of the command list, and
-/// the text that the command takes. The row then holds the whole shape of a line.
+/// line that runs the same command, such as the bare `/` of the command list, the
+/// text that the command takes, and the terminal where a command runs alone. The
+/// row then holds the whole shape of a line.
 fn writeCommands(writer: *std.Io.Writer) !void {
     for (ai.command.summaries) |command| {
         try writer.print("- `/{s}` \u{2014} {s}.", .{ command.name, command.summary });
@@ -104,6 +105,8 @@ fn writeCommands(writer: *std.Io.Writer) !void {
             try writer.print(" The line `{s}` runs it too.", .{command.alias});
         if (command.tail.len > 0)
             try writer.print(" It takes {s} as trailing text.", .{command.tail});
+        if (!command.remote)
+            try writer.writeAll(" It runs in the terminal alone, never from an attached Telegram bot.");
         try writer.writeByte('\n');
     }
     try writer.writeAll("\nEvery other command refuses text after its name.\n");
@@ -192,6 +195,14 @@ test "the document states every command, key, and discovery rule" {
     // A line that carries no name opens a list, so the rows name both such lines.
     try std.testing.expect(std.mem.indexOf(u8, text, "The line `/` runs it too.") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "The line `/skill:` runs it too.") != null);
+    // A command that needs the terminal states it, so the model can tell the
+    // user what an attached bot can run.
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        text,
+        "- `/login` \u{2014} sign in or switch the account. It runs in the terminal alone",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "- `/new` \u{2014} clear the conversation and its usage stats.\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "### Keys") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "`bash.timeout_ms`") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "/unused/config.json") != null);

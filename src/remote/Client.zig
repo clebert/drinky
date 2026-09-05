@@ -1,6 +1,6 @@
 //! The Telegram Bot API client: one HTTPS POST with a JSON body per call, and
-//! the reply classified by its status. The client knows the six methods that
-//! the transport and the mirror need and nothing of the session.
+//! the reply classified by its status. The client knows the eight methods that
+//! the transport, the mirror, and the keyboards need and nothing of the session.
 //!
 //! The URL of every call carries the token, so no error, event, or log names a
 //! URL. A failure reads as one of the `Error` names, and the description that
@@ -78,11 +78,13 @@ pub const Me = struct {
     }
 };
 
-/// One update of a poll. Only a message update carries a payload, because the
-/// poll asks for messages alone.
+/// One update of a poll: a message, a tap on an inline keyboard, or neither,
+/// because the poll asks for those two kinds alone and an edit arrives as
+/// neither.
 pub const Update = struct {
     update_id: i64,
     message: ?Message,
+    callback: ?Callback,
 
     pub const Message = struct {
         message_id: i64,
@@ -93,6 +95,18 @@ pub const Update = struct {
         /// content. Owned by the list.
         text: ?[]u8,
     };
+
+    /// One tap on a button of an inline keyboard. Every tap needs an answer
+    /// through `answerCallbackQuery` with its `id`.
+    pub const Callback = struct {
+        /// The id of the query. Owned by the list.
+        id: []u8,
+        /// The message that holds the keyboard.
+        message_id: i64,
+        chat_id: i64,
+        /// The `callback_data` of the button. Owned by the list.
+        data: []u8,
+    };
 };
 
 /// The updates of one poll, in the order Telegram sent them. The list owns
@@ -101,13 +115,20 @@ pub const Updates = struct {
     items: []Update,
 
     pub fn deinit(self: *const Updates, gpa: std.mem.Allocator) void {
-        for (self.items) |update| {
-            const message = update.message orelse continue;
-            if (message.text) |text| gpa.free(text);
-        }
+        for (self.items) |update| freeUpdate(gpa, &update);
         gpa.free(self.items);
     }
 };
+
+fn freeUpdate(gpa: std.mem.Allocator, update: *const Update) void {
+    if (update.message) |message| {
+        if (message.text) |text| gpa.free(text);
+    }
+    if (update.callback) |callback| {
+        gpa.free(callback.id);
+        gpa.free(callback.data);
+    }
+}
 
 pub const SendOptions = struct {
     /// The message that the new one answers, or null for a plain message.
@@ -116,7 +137,32 @@ pub const SendOptions = struct {
     disable_notification: bool = false,
     /// `HTML` for a formatted text, or null for plain text.
     parse_mode: ?[]const u8 = null,
+    /// The `reply_markup` object of an inline keyboard as JSON, or null for a
+    /// message without one. Borrowed for the call.
+    markup: ?[]const u8 = null,
 };
+
+/// One command that `setMyCommands` registers, so the chat completes it.
+pub const Command = struct {
+    /// The name without the slash: `[a-z0-9_]`, 1 to 32 characters.
+    command: []const u8,
+    /// The line the chat shows beside the name.
+    description: []const u8,
+};
+
+/// A JSON value that stands complete in its bytes, so a serialized keyboard
+/// embeds into a body without a second parse.
+const Raw = struct {
+    bytes: []const u8,
+
+    pub fn jsonStringify(self: Raw, jws: anytype) !void {
+        try jws.print("{s}", .{self.bytes});
+    }
+};
+
+fn raw(maybe_bytes: ?[]const u8) ?Raw {
+    return .{ .bytes = maybe_bytes orelse return null };
+}
 
 /// One reply body under its own arena.
 const Reply = struct {
@@ -186,14 +232,14 @@ pub fn deleteWebhook(self: *Client) Error!void {
     _ = try reply.result();
 }
 
-/// Poll for message updates from `offset` on, and wait at most `timeout_s` for
-/// one. An `offset` of -1 confirms every waiting update and returns the newest
-/// one alone. The caller frees the result.
+/// Poll for message and tap updates from `offset` on, and wait at most
+/// `timeout_s` for one. An `offset` of -1 confirms every waiting update and
+/// returns the newest one alone. The caller frees the result.
 pub fn getUpdates(self: *Client, offset: ?i64, timeout_s: u64) Error!Updates {
     const body = try std.json.Stringify.valueAlloc(self.gpa, .{
         .offset = offset,
         .timeout = timeout_s,
-        .allowed_updates = [_][]const u8{"message"},
+        .allowed_updates = [_][]const u8{ "message", "callback_query" },
     }, .{ .emit_null_optional_fields = false });
     defer self.gpa.free(body);
     const reply = try self.call("getUpdates", body);
@@ -204,10 +250,7 @@ pub fn getUpdates(self: *Client, offset: ?i64, timeout_s: u64) Error!Updates {
     };
     var updates: std.ArrayList(Update) = .empty;
     errdefer {
-        for (updates.items) |update| {
-            const message = update.message orelse continue;
-            if (message.text) |text| self.gpa.free(text);
-        }
+        for (updates.items) |*update| freeUpdate(self.gpa, update);
         updates.deinit(self.gpa);
     }
     try updates.ensureTotalCapacity(self.gpa, list.items.len);
@@ -229,9 +272,42 @@ pub fn getUpdates(self: *Client, offset: ?i64, timeout_s: u64) Error!Updates {
                 .text = if (maybe_text) |text| try self.gpa.dupe(u8, text) else null,
             };
         }
-        updates.appendAssumeCapacity(.{ .update_id = update_id, .message = message });
+        errdefer if (message) |found| if (found.text) |text| self.gpa.free(text);
+        var callback: ?Update.Callback = null;
+        if (objectOf(update.get("callback_query"))) |object| callback = try self.parseCallback(object);
+        updates.appendAssumeCapacity(.{
+            .update_id = update_id,
+            .message = message,
+            .callback = callback,
+        });
     }
     return .{ .items = try updates.toOwnedSlice(self.gpa) };
+}
+
+/// The tap of one `callback_query`, or null for a query without a message or
+/// without data, which no keyboard of Drinky produces.
+fn parseCallback(self: *Client, object: std.json.ObjectMap) Error!?Update.Callback {
+    const id = stringOf(object.get("id")) orelse return error.MalformedReply;
+    const message = objectOf(object.get("message")) orelse return null;
+    const data = stringOf(object.get("data")) orelse return null;
+    const chat = objectOf(message.get("chat")) orelse return error.MalformedReply;
+    const id_copy = try self.gpa.dupe(u8, id);
+    errdefer self.gpa.free(id_copy);
+    return .{
+        .id = id_copy,
+        .message_id = integerOf(message.get("message_id")) orelse return error.MalformedReply,
+        .chat_id = integerOf(chat.get("id")) orelse return error.MalformedReply,
+        .data = try self.gpa.dupe(u8, data),
+    };
+}
+
+/// Register the commands that the chat completes after a slash.
+pub fn setMyCommands(self: *Client, commands: []const Command) Error!void {
+    const body = try std.json.Stringify.valueAlloc(self.gpa, .{ .commands = commands }, .{});
+    defer self.gpa.free(body);
+    const reply = try self.call("setMyCommands", body);
+    defer reply.deinit();
+    _ = try reply.result();
 }
 
 /// Send `text` to `chat_id` and return the id of the new message.
@@ -251,6 +327,7 @@ pub fn sendMessage(
             @as(?ReplyParameters, .{ .message_id = message_id })
         else
             null,
+        .reply_markup = raw(options.markup),
     }, .{ .emit_null_optional_fields = false });
     defer self.gpa.free(body);
     const reply = try self.call("sendMessage", body);
@@ -259,20 +336,24 @@ pub fn sendMessage(
     return integerOf(result.get("message_id")) orelse error.MalformedReply;
 }
 
-/// Replace the text of the message `message_id` in `chat_id`. An edit to the
-/// text the message already holds changes nothing, and that is the state the
-/// caller asked for, so Telegram's refusal of it reads as success.
+/// Replace the text of the message `message_id` in `chat_id`, and its inline
+/// keyboard with `markup`. A null `markup` removes the keyboard, because an
+/// edit without one drops it. An edit to the state the message already holds
+/// changes nothing, and that is the state the caller asked for, so Telegram's
+/// refusal of it reads as success.
 pub fn editMessageText(
     self: *Client,
     chat_id: i64,
     message_id: i64,
     text: []const u8,
+    markup: ?[]const u8,
 ) Error!void {
     const body = try std.json.Stringify.valueAlloc(self.gpa, .{
         .chat_id = chat_id,
         .message_id = message_id,
         .text = text,
-    }, .{});
+        .reply_markup = raw(markup),
+    }, .{ .emit_null_optional_fields = false });
     defer self.gpa.free(body);
     const reply = self.call("editMessageText", body) catch |err| switch (err) {
         error.Rejected => {
@@ -281,6 +362,20 @@ pub fn editMessageText(
         },
         else => return err,
     };
+    defer reply.deinit();
+    _ = try reply.result();
+}
+
+/// Answer the tap `query_id`, with `text` as a toast or with nothing, so the
+/// button stops its wait. A query expires after a few seconds, and an answer
+/// after that fails as rejected.
+pub fn answerCallbackQuery(self: *Client, query_id: []const u8, text: ?[]const u8) Error!void {
+    const body = try std.json.Stringify.valueAlloc(self.gpa, .{
+        .callback_query_id = query_id,
+        .text = text,
+    }, .{ .emit_null_optional_fields = false });
+    defer self.gpa.free(body);
+    const reply = try self.call("answerCallbackQuery", body);
     defer reply.deinit();
     _ = try reply.result();
 }
@@ -518,7 +613,7 @@ test "getMe names the bot, and the request carries the token in the path alone" 
     try std.testing.expectEqualStrings("{}", server.requests.items[0].body);
 }
 
-test "getUpdates reads a text message, a non-text message, and the chat type" {
+test "getUpdates reads a text message, a non-text message, a tap, and the chat type" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
@@ -529,7 +624,9 @@ test "getUpdates reads a text message, a non-text message, and the chat type" {
         \\{"update_id":7,"message":{"message_id":1,"date":0,"chat":{"id":99,"type":"private"},"text":"hello"}},
         \\{"update_id":8,"message":{"message_id":2,"date":0,"chat":{"id":99,"type":"private"},"sticker":{}}},
         \\{"update_id":9,"message":{"message_id":3,"date":0,"chat":{"id":-5,"type":"group"},"text":"hi"}},
-        \\{"update_id":10,"edited_message":{"message_id":1,"date":0,"chat":{"id":99,"type":"private"},"text":"hello!"}}
+        \\{"update_id":10,"edited_message":{"message_id":1,"date":0,"chat":{"id":99,"type":"private"},"text":"hello!"}},
+        \\{"update_id":11,"callback_query":{"id":"4407","from":{"id":5},"chat_instance":"c","message":{"message_id":50,"date":0,"chat":{"id":99,"type":"private"},"text":"Thinking"},"data":"cancel:3"}},
+        \\{"update_id":12,"callback_query":{"id":"4408","from":{"id":5},"chat_instance":"c","inline_message_id":"i"}}
         \\]}
         },
     } }});
@@ -546,18 +643,29 @@ test "getUpdates reads a text message, a non-text message, and the chat type" {
 
     const updates = try client.getUpdates(7, 25);
     defer updates.deinit(gpa);
-    try std.testing.expectEqual(@as(usize, 4), updates.items.len);
+    try std.testing.expectEqual(@as(usize, 6), updates.items.len);
     try std.testing.expectEqual(@as(i64, 7), updates.items[0].update_id);
     try std.testing.expectEqualStrings("hello", updates.items[0].message.?.text.?);
     try std.testing.expect(updates.items[0].message.?.chat_private);
     try std.testing.expectEqual(@as(i64, 99), updates.items[0].message.?.chat_id);
+    try std.testing.expect(updates.items[0].callback == null);
     try std.testing.expect(updates.items[1].message.?.text == null);
     try std.testing.expect(!updates.items[2].message.?.chat_private);
     // An edit is no message, so the update carries no payload.
     try std.testing.expect(updates.items[3].message == null);
+    try std.testing.expect(updates.items[3].callback == null);
+    // A tap names its query, the message under the keyboard, and the button.
+    const tap = updates.items[4].callback.?;
+    try std.testing.expectEqualStrings("4407", tap.id);
+    try std.testing.expectEqual(@as(i64, 50), tap.message_id);
+    try std.testing.expectEqual(@as(i64, 99), tap.chat_id);
+    try std.testing.expectEqualStrings("cancel:3", tap.data);
+    try std.testing.expect(updates.items[4].message == null);
+    // A tap without a message comes from no keyboard of Drinky.
+    try std.testing.expect(updates.items[5].callback == null);
     try server.finish();
     try std.testing.expectEqualStrings(
-        "{\"offset\":7,\"timeout\":25,\"allowed_updates\":[\"message\"]}",
+        "{\"offset\":7,\"timeout\":25,\"allowed_updates\":[\"message\",\"callback_query\"]}",
         server.requests.items[0].body,
     );
 }
@@ -619,25 +727,29 @@ test "sendMessage returns the message id and states its options" {
         .reply_to = 12,
         .disable_notification = true,
         .parse_mode = "HTML",
+        .markup = "{\"inline_keyboard\":[[{\"text\":\"Cancel\",\"callback_data\":\"close:1\"}]]}",
     }));
     try server.finish();
     try std.testing.expectEqualStrings(
         "{\"chat_id\":99,\"text\":\"Event: hi\",\"disable_notification\":false}",
         server.requests.items[0].body,
     );
+    // The keyboard embeds as the object it already is.
     try std.testing.expectEqualStrings(
         "{\"chat_id\":99,\"text\":\"<b>x</b>\",\"disable_notification\":true," ++
-            "\"parse_mode\":\"HTML\",\"reply_parameters\":{\"message_id\":12}}",
+            "\"parse_mode\":\"HTML\",\"reply_parameters\":{\"message_id\":12}," ++
+            "\"reply_markup\":{\"inline_keyboard\":[[{\"text\":\"Cancel\",\"callback_data\":\"close:1\"}]]}}",
         server.requests.items[1].body,
     );
 }
 
-test "editMessageText states its target, and an unchanged text counts as success" {
+test "editMessageText states its target and keyboard, and an unchanged text counts as success" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
     var server = try testing.Server.init(gpa, io, &.{.{ .method = "editMessageText", .replies = &.{
+        .{ .body = "{\"ok\":true,\"result\":{\"message_id\":314}}" },
         .{ .body = "{\"ok\":true,\"result\":{\"message_id\":314}}" },
         .{ .status = 400, .body = "{\"ok\":false,\"error_code\":400,\"description\":\"Bad Request: message is not modified\"}" },
         .{ .status = 400, .body = "{\"ok\":false,\"error_code\":400,\"description\":\"Bad Request: message to edit not found\"}" },
@@ -653,12 +765,79 @@ test "editMessageText states its target, and an unchanged text counts as success
         .connect_ms = 5_000,
     };
 
-    try client.editMessageText(99, 314, "Writing");
-    try client.editMessageText(99, 314, "Writing");
-    try std.testing.expectError(error.Rejected, client.editMessageText(99, 315, "Writing"));
+    try client.editMessageText(99, 314, "Writing", null);
+    try client.editMessageText(99, 314, "Writing", "{\"inline_keyboard\":[]}");
+    try client.editMessageText(99, 314, "Writing", null);
+    try std.testing.expectError(error.Rejected, client.editMessageText(99, 315, "Writing", null));
     try server.finish();
+    // An edit without a keyboard names none, so the message loses the one it holds.
     try std.testing.expectEqualStrings(
         "{\"chat_id\":99,\"message_id\":314,\"text\":\"Writing\"}",
+        server.requests.items[0].body,
+    );
+    try std.testing.expectEqualStrings(
+        "{\"chat_id\":99,\"message_id\":314,\"text\":\"Writing\",\"reply_markup\":{\"inline_keyboard\":[]}}",
+        server.requests.items[1].body,
+    );
+}
+
+test "answerCallbackQuery names the query with or without a toast" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var server = try testing.Server.init(gpa, io, &.{.{ .method = "answerCallbackQuery", .replies = &.{
+        .{ .body = "{\"ok\":true,\"result\":true}" },
+        .{ .body = "{\"ok\":true,\"result\":true}" },
+    } }});
+    defer server.deinit();
+    try server.start();
+    var url_buffer: [64]u8 = undefined;
+    var client: Client = .{
+        .gpa = gpa,
+        .io = io,
+        .base_url = server.url(&url_buffer),
+        .token = "t",
+        .connect_ms = 5_000,
+    };
+
+    try client.answerCallbackQuery("4407", null);
+    try client.answerCallbackQuery("4408", "Nothing queued.");
+    try server.finish();
+    try std.testing.expectEqualStrings("{\"callback_query_id\":\"4407\"}", server.requests.items[0].body);
+    try std.testing.expectEqualStrings(
+        "{\"callback_query_id\":\"4408\",\"text\":\"Nothing queued.\"}",
+        server.requests.items[1].body,
+    );
+}
+
+test "setMyCommands registers each command with its description" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var server = try testing.Server.init(gpa, io, &.{.{ .method = "setMyCommands", .replies = &.{
+        .{ .body = "{\"ok\":true,\"result\":true}" },
+    } }});
+    defer server.deinit();
+    try server.start();
+    var url_buffer: [64]u8 = undefined;
+    var client: Client = .{
+        .gpa = gpa,
+        .io = io,
+        .base_url = server.url(&url_buffer),
+        .token = "t",
+        .connect_ms = 5_000,
+    };
+
+    try client.setMyCommands(&.{
+        .{ .command = "effort", .description = "set the reasoning-effort level" },
+        .{ .command = "new", .description = "start a new conversation" },
+    });
+    try server.finish();
+    try std.testing.expectEqualStrings(
+        "{\"commands\":[{\"command\":\"effort\",\"description\":\"set the reasoning-effort level\"}," ++
+            "{\"command\":\"new\",\"description\":\"start a new conversation\"}]}",
         server.requests.items[0].body,
     );
 }

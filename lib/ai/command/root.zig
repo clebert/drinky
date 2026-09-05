@@ -30,6 +30,9 @@ const Entry = struct {
     /// this command in `FEATURES.md`.
     summary: []const u8,
     run: *const fn (*Context) anyerror!Outcome,
+    /// Whether a remote host runs the command. A command that opens a page, an
+    /// editor prompt, or the credential flow of the terminal runs there alone.
+    remote: bool,
 };
 
 /// The command that lists every other command. The bare `/` opens it too. The
@@ -45,16 +48,16 @@ const whitespace = " \t\r\n";
 
 /// Every command, in the order the command list shows them.
 const commands = [_]Entry{
-    .{ .name = effort.name, .summary = effort.summary, .run = effort.run },
-    .{ .name = help_name, .summary = help_summary, .run = runHelp },
-    .{ .name = login.name, .summary = login.summary, .run = login.run },
-    .{ .name = logout.name, .summary = logout.summary, .run = logout.run },
-    .{ .name = model.name, .summary = model.summary, .run = model.run },
-    .{ .name = new.name, .summary = new.summary, .run = new.run },
-    .{ .name = remote.name, .summary = remote.summary, .run = remote.run },
-    .{ .name = skill.name, .summary = skill.summary, .run = skill.run },
-    .{ .name = sources.name, .summary = sources.summary, .run = sources.run },
-    .{ .name = system.name, .summary = system.summary, .run = system.run },
+    .{ .name = effort.name, .summary = effort.summary, .run = effort.run, .remote = true },
+    .{ .name = help_name, .summary = help_summary, .run = runHelp, .remote = true },
+    .{ .name = login.name, .summary = login.summary, .run = login.run, .remote = false },
+    .{ .name = logout.name, .summary = logout.summary, .run = logout.run, .remote = false },
+    .{ .name = model.name, .summary = model.summary, .run = model.run, .remote = true },
+    .{ .name = new.name, .summary = new.summary, .run = new.run, .remote = true },
+    .{ .name = remote.name, .summary = remote.summary, .run = remote.run, .remote = false },
+    .{ .name = skill.name, .summary = skill.summary, .run = skill.run, .remote = true },
+    .{ .name = sources.name, .summary = sources.summary, .run = sources.run, .remote = false },
+    .{ .name = system.name, .summary = system.summary, .run = system.run, .remote = false },
 };
 
 // The table is the order of the list, and the list reads best in one
@@ -77,6 +80,9 @@ pub const Summary = struct {
     /// What the command takes after its name, or empty for a command that takes
     /// no argument. Only a skill line carries one.
     tail: []const u8 = "",
+    /// Whether a remote host runs the command, so a host that registers the
+    /// commands of a chat lists this one.
+    remote: bool,
 };
 
 /// The name and the summary of every command, in the order of the table. A host
@@ -88,6 +94,7 @@ pub const summaries = blk: {
         .name = entry.name,
         .summary = entry.summary,
         .alias = aliasOf(entry.name),
+        .remote = entry.remote,
     };
     // The skill prefix is no table entry, because it takes an argument tail. Its
     // summary is its own on purpose: the `skill` entry states the list that the
@@ -96,6 +103,7 @@ pub const summaries = blk: {
         .name = skill_prefix ++ "name",
         .summary = "load one named skill",
         .tail = "the task of the skill",
+        .remote = true,
     };
     break :blk list;
 };
@@ -110,17 +118,18 @@ fn aliasOf(comptime name: []const u8) []const u8 {
 }
 
 /// The rows of the command list: every command but `/help`, which names the
-/// list that the user already reads.
-const listed = blk: {
-    var rows: [commands.len - 1]Entry = undefined;
-    var count = 0;
+/// list that the user already reads. A remote host lists the commands that run
+/// there alone.
+fn listed(context: *const Context, out: *[commands.len]Entry) []const Entry {
+    var count: usize = 0;
     for (commands) |entry| {
         if (std.mem.eql(u8, entry.name, help_name)) continue;
-        rows[count] = entry;
+        if (context.remote and !entry.remote) continue;
+        out[count] = entry;
         count += 1;
     }
-    break :blk rows;
-};
+    return out[0..count];
+}
 
 /// The command name in an input line, or null when the line is a plain message.
 /// Every line that starts with a slash is a command line, because the registry must
@@ -173,7 +182,10 @@ fn lookup(name: []const u8) ?*const Entry {
 fn runHelp(context: *Context) !Outcome {
     var options: Outcome.Options = .{ .gpa = context.gpa };
     errdefer options.deinit();
-    for (listed) |entry| try options.print("/{s} — {s}", .{ entry.name, entry.summary });
+    var rows: [commands.len]Entry = undefined;
+    for (listed(context, &rows)) |entry| {
+        try options.print("/{s} — {s}", .{ entry.name, entry.summary });
+    }
     // The list builds itself again, so Esc in the picker that a row opens
     // returns to the list.
     return .{ .pick = .{
@@ -187,23 +199,32 @@ fn runHelp(context: *Context) !Outcome {
 }
 
 fn selectCommand(context: *Context, index: usize) !Outcome {
-    if (index >= listed.len)
+    var rows: [commands.len]Entry = undefined;
+    const entries = listed(context, &rows);
+    if (index >= entries.len)
         return Outcome.reportNotice(context.gpa, .failure, "Select a valid command.", .{});
-    return listed[index].run(context);
+    return entries[index].run(context);
 }
 
 /// The refusal that the registry produces for `line`, or null when the registry
 /// can run the line as typed. `check` runs no command, so a caller that must
 /// refuse a command for a state restriction can name the true reason first: an
-/// unknown name and an unwanted tail never become runnable, but a restriction
-/// ends. A line that is not a command line returns null too.
+/// unknown name, a terminal-only command on a remote host, and an unwanted tail
+/// never become runnable, but a restriction ends. A line that is not a command
+/// line returns null too.
 ///
 /// Every refusal here warns, because a slash line can be plain text. The caller
 /// can offer to send the line to the model as typed.
 pub fn check(context: *Context, line: []const u8) !?Outcome.Message {
     const name = parse(line) orelse return null;
     if (loadsSkill(name)) return try checkSkill(context, name);
-    if (lookup(name) == null) return try unknownCommand(context.gpa, name);
+    const entry = lookup(name) orelse return try unknownCommand(context.gpa, name);
+    if (context.remote and !entry.remote) return try Outcome.Message.print(
+        context.gpa,
+        .warning,
+        "The command /{s} runs in the terminal alone.",
+        .{entry.name},
+    );
     if (tail(line, name).len > 0) return try Outcome.Message.print(
         context.gpa,
         .warning,
@@ -223,7 +244,7 @@ pub fn run(context: *Context, line: []const u8) !?Outcome {
     // that resolves a name, so no other function carries that invariant.
     if (loadsSkill(name)) {
         const target = context.skill_registry.?.get(name[skill_prefix.len..]).?;
-        return try runSkill(context, target, tail(line, name));
+        return try skill.load(context, target, tail(line, name));
     }
     return try lookup(name).?.run(context);
 }
@@ -276,34 +297,6 @@ fn unknownSkill(gpa: std.mem.Allocator, name: []const u8) !Outcome.Message {
         "Drinky does not recognize the skill {s}.",
         .{name},
     );
-}
-
-/// Expand `target` with its optional task into a user turn. The caller resolved
-/// the skill, so this function holds no name invariant.
-fn runSkill(context: *Context, target: *const skills.Skill, arguments: []const u8) !Outcome {
-    const content = target.invoke(context.gpa, context.io, arguments) catch |err| {
-        if (err == error.Canceled or err == error.OutOfMemory) return err;
-        // A failure, not a warning: the name is right and the load broke, so the
-        // way forward is another try, not a send to the model.
-        return .{ .refusal = try Outcome.Message.print(
-            context.gpa,
-            .failure,
-            "Drinky could not load the skill {s} because of error {s}.",
-            .{ target.name, @errorName(err) },
-        ) };
-    };
-    errdefer context.gpa.free(content);
-    const name_copy = try context.gpa.dupe(u8, target.name);
-    errdefer context.gpa.free(name_copy);
-    const arguments_copy = try context.gpa.dupe(u8, arguments);
-    errdefer context.gpa.free(arguments_copy);
-    const source_copy = try context.gpa.dupe(u8, target.path);
-    return .{ .prompt = .{
-        .name = name_copy,
-        .arguments = arguments_copy,
-        .content = content,
-        .source = source_copy,
-    } };
 }
 
 // A line that carries no name opens a list, so the registry states that line
@@ -585,7 +578,8 @@ test "a command row runs its command" {
     defer agent.deinit();
     var context: Context = .{ .gpa = gpa, .io = undefined, .agent = &agent, .accounts = undefined };
 
-    const rows = listed;
+    var buffer: [commands.len]Entry = undefined;
+    const rows = listed(&context, &buffer);
     const system_index = for (rows, 0..) |entry, index| {
         if (std.mem.eql(u8, entry.name, system.name)) break index;
     } else return error.MissingSystemRow;
@@ -610,4 +604,64 @@ test "a command row runs its command" {
         .failure,
         "valid command",
     );
+}
+
+// A remote host has no editor, no page, and no credential flow, so the registry
+// refuses the commands that need one and lists the rest alone. The refusal is a
+// registry decision, so a caller that restricts a command for its own state
+// still names the true reason first.
+test "a remote host runs the commands that need no terminal" {
+    const gpa = std.testing.allocator;
+    var agent = testing.agent(gpa, .{ .anthropic_subscription = undefined });
+    defer agent.deinit();
+    var context: Context = .{
+        .gpa = gpa,
+        .io = undefined,
+        .agent = &agent,
+        .accounts = undefined,
+        .remote = true,
+    };
+
+    for ([_][]const u8{ "/login", "/logout", "/remote", "/sources", "/system" }) |line| {
+        const refusal = (try check(&context, line)).?;
+        defer gpa.free(refusal.content);
+        try std.testing.expectEqual(Outcome.Severity.warning, refusal.severity);
+        try std.testing.expect(std.mem.endsWith(u8, refusal.content, "runs in the terminal alone."));
+        try std.testing.expect(std.mem.startsWith(u8, refusal.content, "The command /"));
+        try std.testing.expect(std.mem.indexOf(u8, refusal.content, line) != null);
+    }
+    try Outcome.expectRefusalContaining(
+        (try run(&context, "/system")).?,
+        .warning,
+        "The command /system runs in the terminal alone.",
+    );
+    // An unknown name keeps its own refusal, and a runnable command runs.
+    try Outcome.expectRefusalContaining((try run(&context, "/nope")).?, .warning, "does not recognize");
+    try std.testing.expect((try check(&context, "/effort")) == null);
+    try std.testing.expect((try check(&context, "/new")) == null);
+    try std.testing.expect((try run(&context, "/new")).? == .new_conversation);
+
+    // The list holds the runnable commands alone, and its rows index that list.
+    switch ((try run(&context, "/help")).?) {
+        .pick => |pick| {
+            defer {
+                for (pick.options) |option| gpa.free(option);
+                gpa.free(pick.options);
+            }
+            try std.testing.expectEqual(@as(usize, 4), pick.options.len);
+            try std.testing.expect(std.mem.startsWith(u8, pick.options[0], "/effort"));
+            try std.testing.expect(std.mem.startsWith(u8, pick.options[1], "/model"));
+            try std.testing.expect(std.mem.startsWith(u8, pick.options[2], "/new"));
+            try std.testing.expect(std.mem.startsWith(u8, pick.options[3], "/skill"));
+            try std.testing.expect((try pick.select(&context, 2)) == .new_conversation);
+            try Outcome.expectNoticeContaining(try pick.select(&context, 4), .failure, "valid command");
+        },
+        else => return error.ExpectedPick,
+    }
+    // The registered commands of a chat are the same set.
+    var registered: usize = 0;
+    for (summaries) |command| {
+        if (command.remote and command.tail.len == 0) registered += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 5), registered);
 }

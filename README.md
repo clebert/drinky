@@ -63,6 +63,22 @@ complete command list. You can also ask Drinky to explain its commands, keys, an
 - `/skill` picks a discovered skill. `/skill:name` loads one skill with an optional task.
 - `/new` clears the conversation. `/sources` shows the loaded instruction files and skills.
   `/system` shows the complete system prompt.
+- `/remote` attaches a Telegram bot, so you drive the session from its chat.
+
+## Telegram remote control
+
+Create a bot with BotFather, run `/remote`, and paste the token. Drinky shows a pairing code, and
+the private chat that sends it binds to the bot. A saved bot attaches with one pick.
+
+While a bot is attached, the chat holds the input and the terminal shows the work. A message from
+the chat runs as a prompt, or queues as steering during a turn. The chat mirrors every answer and
+event, and one activity message per turn shows the state and holds the `Cancel turn` and `Withdraw`
+buttons. `/effort`, `/model`, `/help`, and `/skill` open inline keyboards in the chat, and `/new`
+clears the conversation. `/login`, `/logout`, `/remote`, `/sources`, and `/system` run in the
+terminal alone.
+
+Every exit key in the terminal detaches the bot. The bot tokens live in the owner-only
+`~/.drinky/remote.json`, and Drinky talks to the Telegram Bot API directly, with no dependency.
 
 ## Configuration
 
