@@ -16,6 +16,15 @@
 //! messages that Drinky wrote, so each one takes the symbol of its role from its
 //! first send through every edit, buttons or not.
 //!
+//! The last answer of a completed turn holds the `Shorten` button. No edit ever
+//! takes that button off, so the newest answer alone names a live serial, and a
+//! tap on an answer above it reads as stale. The agent commits its last reply
+//! before the turn returns, so a trailing answer waits: its send needs the
+//! outcome, and no edit can add the button later. The wait ends at the end of
+//! the turn, at a tool that starts, or at a block that commits below the answer,
+//! because each one proves what the answer is. Every answer that goes out
+//! without the button clears the live serial.
+//!
 //! The mirror talks to the chat through `chat`: a pointer to the controller, or
 //! to a recorder in a test, with `listens`, `send`, `sendTracked`, and `edit`.
 //! A chat that does not listen gets no render and no send, and the mirror keeps
@@ -50,6 +59,9 @@ const retry_text = "Failed turn";
 const retry_label = "Try again";
 const dismiss_label = "Dismiss";
 
+/// The button of the last answer of a completed turn.
+const shorten_label = "Shorten";
+
 gpa: std.mem.Allocator,
 /// The count of leading blocks that the chat holds or that the mirror skipped.
 /// It never passes the committed frontier, so a rewind of the uncommitted tail
@@ -59,6 +71,10 @@ cursor: usize,
 turn: ?Turn,
 /// The failed turn message whose buttons wait for a tap, or null.
 retry: ?RetryMessage,
+/// The serial of the `Shorten` button of the newest answer, or null while no
+/// button of the chat names it. A newer answer replaces it, so the button above
+/// it reads as stale.
+answer_serial: ?u64,
 /// The serial of the newest keyboard. Every keyboard takes the next one, so a
 /// tap names the keyboard it came from. The owner seeds it per process, so a
 /// keyboard that an earlier process left in the chat names no serial of this one.
@@ -84,6 +100,12 @@ pub const View = struct {
         /// The tool calls the turn made so far.
         calls: usize,
     };
+
+    /// Whether a tool of the turn runs now.
+    fn toolRuns(self: *const View) bool {
+        const tail = self.tail orelse return false;
+        return tail.tool != null;
+    }
 };
 
 /// How a turn ended, and what its summary states.
@@ -178,11 +200,41 @@ const Activity = struct {
     }
 };
 
-/// Whether the blocks of a flush go out silent, or the last one notifies.
-const Notify = enum { silent, last };
+/// What the last messages of a flush carry, and where it stops.
+const Close = struct {
+    /// Whether the last message of the flush notifies.
+    notify: bool = false,
+    /// Whether the last answer of the flush takes the `Shorten` button.
+    shorten: bool = false,
+    /// Whether a trailing answer waits. Its message can still carry the button
+    /// of the turn, and the send needs the outcome. A block that commits below
+    /// it ends the wait too.
+    hold_answer: bool = false,
+};
+
+/// One rendered block of a flush.
+const Rendered = struct {
+    text: []u8,
+    /// Whether the block holds an answer of the model.
+    answer: bool,
+};
+
+/// What one send of a rendered block carries beside its text.
+const Send = struct {
+    notify: bool = false,
+    /// The keyboard of the last message of the block, or null.
+    markup: ?[]const u8 = null,
+};
 
 pub fn init(gpa: std.mem.Allocator) Mirror {
-    return .{ .gpa = gpa, .cursor = 0, .turn = null, .retry = null, .serial = 0 };
+    return .{
+        .gpa = gpa,
+        .cursor = 0,
+        .turn = null,
+        .retry = null,
+        .answer_serial = null,
+        .serial = 0,
+    };
 }
 
 /// Start the serials at `seed`. The owner draws one random seed per process.
@@ -241,7 +293,9 @@ fn activityText(self: *Mirror, turn: *const Turn) ![]u8 {
 /// message when the state of the live tail changed.
 pub fn sync(self: *Mirror, chat: anytype, view: *const View) !void {
     if (!chat.listens()) return;
-    try self.flush(chat, view, .silent);
+    // A tool that runs proves that a block follows the answer above it, so the
+    // wait of that answer ends there instead of at the end of the turn.
+    try self.flush(chat, view, .{ .hold_answer = self.turn != null and !view.toolRuns() });
     const turn = if (self.turn) |*turn| turn else return;
     const tail = view.tail orelse return;
     const activity = Activity.of(&tail);
@@ -281,11 +335,15 @@ fn activityMarkup(self: *Mirror, turn: *const Turn) ![]u8 {
 /// message of a completed or failed turn notifies. A canceled turn ends in
 /// silence, because the cancel came from the chat or the terminal took the
 /// session over. A failure that armed a retry sends the failed turn message with
-/// its buttons.
+/// its buttons. A completed turn alone gives its last answer the `Shorten`
+/// button, because a partial answer is no answer to shorten.
 pub fn endTurn(self: *Mirror, chat: anytype, view: *const View, end: *const End) !void {
     defer self.turn = null;
     if (!chat.listens()) return;
-    try self.flush(chat, view, if (end.outcome == .canceled) .silent else .last);
+    try self.flush(chat, view, .{
+        .notify = end.outcome != .canceled,
+        .shorten = end.outcome == .completed,
+    });
     if (self.turn) |*turn| {
         if (turn.handle) |handle| {
             const text = try self.summary(turn, end);
@@ -351,12 +409,23 @@ pub fn namesRetry(self: *const Mirror, serial: u64) bool {
     return retry.serial == serial;
 }
 
+/// Whether a tap on the keyboard `serial` names the newest answer of the chat.
+/// An older answer keeps its button, and a tap on it lands here as stale.
+pub fn namesAnswer(self: *const Mirror, serial: u64) bool {
+    const live = self.answer_serial orelse return false;
+    return live == serial;
+}
+
 /// Forget the messages of the chat that closed. The chat keeps them as they
 /// stand, buttons included, and a tap on one of them after the next attach reads
-/// as stale. The turn keeps its state, so a later attach gives it a new activity
-/// message, and a retry that still waits gets a new failed turn message.
+/// as stale. The next attach starts at the committed frontier, so every answer
+/// of the detached time stays out of the chat, and no `Shorten` button of the
+/// chat names the last answer any more. The turn keeps its state, so a later
+/// attach gives it a new activity message, and a retry that still waits gets a
+/// new failed turn message.
 pub fn detached(self: *Mirror) void {
     self.retry = null;
+    self.answer_serial = null;
     const turn = if (self.turn) |*turn| turn else return;
     turn.handle = null;
 }
@@ -375,34 +444,75 @@ pub fn retreat(self: *Mirror, count: usize) void {
 }
 
 /// Start over at the first block, because the transcript was cleared. The
-/// length alone cannot tell a cleared transcript from one that grew back.
+/// length alone cannot tell a cleared transcript from one that grew back. The
+/// conversation holds no answer now, so every `Shorten` button of the chat reads
+/// as stale.
 pub fn restart(self: *Mirror) void {
     self.cursor = 0;
+    self.answer_serial = null;
 }
 
 /// Send the blocks from the cursor to the committed frontier. Every block
 /// renders before the first send, because a send can report into the transcript
 /// and move its blocks. The cursor moves past them before the sends too, so a
-/// block whose send fails goes out no twice.
-fn flush(self: *Mirror, chat: anytype, view: *const View, notify: Notify) !void {
+/// block whose send fails goes out no twice. Every fallible step of the flush
+/// stands above that move, so one failure costs no block.
+fn flush(self: *Mirror, chat: anytype, view: *const View, close: Close) !void {
     self.cursor = @min(self.cursor, view.blocks.len);
-    const end = view.committed;
+    var end = view.committed;
+    // A trailing answer waits for the end of the turn, so its message can carry
+    // the button of the turn.
+    while (close.hold_answer and end > self.cursor and view.blocks[end - 1].content == .model)
+        end -= 1;
     if (self.cursor >= end) return;
-    var rendered: std.ArrayList([]u8) = .empty;
+    var rendered: std.ArrayList(Rendered) = .empty;
     defer {
-        for (rendered.items) |text| self.gpa.free(text);
+        for (rendered.items) |item| self.gpa.free(item.text);
         rendered.deinit(self.gpa);
     }
     for (view.blocks[self.cursor..end]) |*block| {
         const text = try self.renderBlock(block) orelse continue;
         errdefer self.gpa.free(text);
-        try rendered.append(self.gpa, text);
+        try rendered.append(self.gpa, .{ .text = text, .answer = block.content == .model });
     }
+    const answer_index = lastAnswer(rendered.items);
+    const shorten_index = if (close.shorten) answer_index else null;
+    var markup: ?[]u8 = null;
+    defer if (markup) |json| self.gpa.free(json);
+    if (shorten_index != null) markup = try self.armShorten();
     self.cursor = end;
-    for (rendered.items, 0..) |text, index| {
-        const last = notify == .last and index + 1 == rendered.items.len;
-        try self.sendHtml(chat, text, last);
+    // An answer that goes out without the button stands below the message that
+    // holds the live one, so that button is stale from here on.
+    if (answer_index != null and shorten_index == null) self.answer_serial = null;
+    for (rendered.items, 0..) |item, index| {
+        try self.sendHtml(chat, item.text, .{
+            .notify = close.notify and index + 1 == rendered.items.len,
+            .markup = if (shorten_index == index) markup else null,
+        });
     }
+}
+
+/// The index of the last answer of `items`, or null for a flush that holds
+/// none.
+fn lastAnswer(items: []const Rendered) ?usize {
+    var index = items.len;
+    while (index > 0) {
+        index -= 1;
+        if (items[index].answer) return index;
+    }
+    return null;
+}
+
+/// Arm the `Shorten` button of the newest answer: take the serial that a tap on
+/// it names, and return its keyboard. The result is owned.
+fn armShorten(self: *Mirror) ![]u8 {
+    const serial = self.nextSerial();
+    var data: [keyboard.data_bytes_max]u8 = undefined;
+    const json = try keyboard.markup(self.gpa, &.{
+        .{ .text = shorten_label, .data = (keyboard.Tap{ .shorten = serial }).write(&data) },
+    });
+    self.answer_serial = serial;
+    return json;
 }
 
 /// The HTML of `block`, or null for a block that stays in the terminal. The
@@ -428,15 +538,17 @@ fn renderBlock(self: *Mirror, block: *const ui.block.Entry) !?[]u8 {
 }
 
 /// Send one rendered block, in as many messages as its length takes. The last
-/// message notifies when `notify` is set.
-fn sendHtml(self: *Mirror, chat: anytype, text: []const u8, notify: bool) !void {
+/// message notifies and takes the keyboard, because a block that splits ends
+/// there.
+fn sendHtml(self: *Mirror, chat: anytype, text: []const u8, send: Send) !void {
     var parts = html.Parts.init(text, html.message_units_max);
     // Every part consumes text, so the split ends.
     while (try parts.next(self.gpa)) |part| {
         defer self.gpa.free(part.text);
         try chat.send(part.text, &.{
             .parse_mode = html.parse_mode,
-            .disable_notification = !(notify and part.last),
+            .disable_notification = !(send.notify and part.last),
+            .markup = if (part.last) send.markup else null,
         });
     }
 }
@@ -589,6 +701,12 @@ const retry_wrapped = "⚠ " ++ retry_text;
 fn retryKeyboard(comptime serial: []const u8) []const u8 {
     return "{\"inline_keyboard\":[[{\"text\":\"Try again\",\"callback_data\":\"retry:" ++ serial ++
         "\"}],[{\"text\":\"Dismiss\",\"callback_data\":\"dismiss:" ++ serial ++ "\"}]]}";
+}
+
+/// The keyboard of the newest answer with the serial `serial`.
+fn shortenKeyboard(comptime serial: []const u8) []const u8 {
+    return "{\"inline_keyboard\":[[{\"text\":\"Shorten\",\"callback_data\":\"shorten:" ++ serial ++
+        "\"}]]}";
 }
 
 /// The transcript of the tests. It owns its blocks.
@@ -1051,7 +1169,122 @@ test "a send that reports into the transcript cannot move the blocks under the f
     try std.testing.expectEqual(@as(usize, 3), chat.sends);
 }
 
-test "a long answer splits into several messages, and the last one alone notifies" {
+// The button rides the last answer of the closing flush, because a send during
+// the turn cannot know that its answer is the last one, and no edit ever adds
+// one. A block below an answer proves that the answer is not the last one, and
+// a newer answer makes the button above it stale.
+test "a completed turn gives its last answer the shorten button, and a newer answer stales it" {
+    const gpa = std.testing.allocator;
+    var chat: Recorder = .{ .gpa = gpa };
+    defer chat.deinit();
+    var blocks: Blocks = .{ .gpa = gpa };
+    defer blocks.deinit();
+    var mirror = Mirror.init(gpa);
+    try std.testing.expect(!mirror.namesAnswer(0));
+
+    // An answer that commits during the turn waits, because the turn can still
+    // end on it.
+    try mirror.beginTurn(&chat, 0);
+    try blocks.append(.model, .{}, "first");
+    try mirror.sync(&chat, &blocks.live(1, .{ .streaming = .model, .tool = null, .calls = 0 }));
+    try std.testing.expectEqual(@as(usize, 1), chat.sends.items.len);
+
+    // A tool that runs proves that a block follows the answer, so the wait ends
+    // there and the answer goes out with no button.
+    try mirror.sync(&chat, &blocks.live(1, .{ .streaming = null, .tool = "bash", .calls = 1 }));
+    try std.testing.expectEqual(@as(usize, 2), chat.sends.items.len);
+    try std.testing.expectEqualStrings("first", chat.sends.items[1].text);
+    try std.testing.expect(chat.sends.items[1].markup == null);
+    try std.testing.expect(mirror.answer_serial == null);
+
+    // A block that commits below an answer ends its wait too, so the second
+    // answer goes out with the event under it and takes no button either.
+    try blocks.append(.model, .{}, "second");
+    try mirror.sync(&chat, &blocks.live(2, .{ .streaming = .model, .tool = null, .calls = 1 }));
+    try std.testing.expectEqual(@as(usize, 2), chat.sends.items.len);
+    try blocks.append(.event, .{}, "Drinky changed the model.");
+    try mirror.sync(&chat, &blocks.live(3, .{ .streaming = null, .tool = null, .calls = 1 }));
+    try std.testing.expectEqual(@as(usize, 4), chat.sends.items.len);
+    try std.testing.expectEqualStrings("second", chat.sends.items[2].text);
+    try std.testing.expect(chat.sends.items[2].markup == null);
+    try std.testing.expect(chat.sends.items[3].markup == null);
+    try std.testing.expect(mirror.answer_serial == null);
+
+    // The closing flush gives the last answer of the turn the button.
+    try blocks.append(.model, .{}, "last");
+    try mirror.endTurn(&chat, &blocks.idle(), &.{
+        .outcome = .completed,
+        .status = &test_status,
+        .now_ms = 0,
+    });
+    try std.testing.expectEqual(@as(usize, 5), chat.sends.items.len);
+    try std.testing.expectEqualStrings("last", chat.sends.items[4].text);
+    try std.testing.expectEqualStrings(shortenKeyboard("2"), chat.sends.items[4].markup.?);
+    try std.testing.expect(mirror.namesAnswer(2));
+    try std.testing.expect(!mirror.namesAnswer(1));
+
+    // The next answer takes the live serial, so the button above it is stale.
+    try mirror.beginTurn(&chat, 0);
+    try blocks.append(.model, .{}, "newer");
+    try mirror.endTurn(&chat, &blocks.idle(), &.{
+        .outcome = .completed,
+        .status = &test_status,
+        .now_ms = 0,
+    });
+    try std.testing.expectEqualStrings(shortenKeyboard("4"), chat.lastSend().markup.?);
+    try std.testing.expect(mirror.namesAnswer(4));
+    try std.testing.expect(!mirror.namesAnswer(2));
+
+    // A cleared conversation holds no answer, so every button of the chat is
+    // stale.
+    mirror.restart();
+    try std.testing.expect(!mirror.namesAnswer(4));
+}
+
+// A partial answer is no answer to shorten, so a turn that did not complete
+// hands out no button. Its answer stands below the message that holds the live
+// button, so that button goes stale with it.
+test "a canceled turn and a failed turn give no shorten button and stale the live one" {
+    const gpa = std.testing.allocator;
+    var chat: Recorder = .{ .gpa = gpa };
+    defer chat.deinit();
+    var blocks: Blocks = .{ .gpa = gpa };
+    defer blocks.deinit();
+    var mirror = Mirror.init(gpa);
+
+    try mirror.beginTurn(&chat, 0);
+    try blocks.append(.model, .{}, "complete");
+    try mirror.endTurn(&chat, &blocks.idle(), &.{
+        .outcome = .completed,
+        .status = &test_status,
+        .now_ms = 0,
+    });
+    try std.testing.expect(mirror.namesAnswer(2));
+
+    try mirror.beginTurn(&chat, 0);
+    try blocks.append(.model, .{}, "canceled");
+    try mirror.endTurn(&chat, &blocks.idle(), &.{
+        .outcome = .canceled,
+        .status = &test_status,
+        .now_ms = 0,
+    });
+    try std.testing.expectEqualStrings("canceled", chat.lastSend().text);
+    try std.testing.expect(chat.lastSend().markup == null);
+    try std.testing.expect(mirror.answer_serial == null);
+
+    try mirror.beginTurn(&chat, 0);
+    try blocks.append(.model, .{}, "failed");
+    try mirror.endTurn(&chat, &blocks.idle(), &.{
+        .outcome = .failed,
+        .status = &test_status,
+        .now_ms = 0,
+    });
+    try std.testing.expectEqualStrings("failed", chat.lastSend().text);
+    try std.testing.expect(chat.lastSend().markup == null);
+    try std.testing.expect(mirror.answer_serial == null);
+}
+
+test "a long answer splits into several messages, and the last one notifies and takes the button" {
     const gpa = std.testing.allocator;
     var chat: Recorder = .{ .gpa = gpa };
     defer chat.deinit();
@@ -1068,4 +1301,7 @@ test "a long answer splits into several messages, and the last one alone notifie
     try std.testing.expect(chat.sends.items[1].text.len <= html.message_units_max);
     try std.testing.expect(chat.sends.items[1].options.disable_notification);
     try std.testing.expect(!chat.sends.items[2].options.disable_notification);
+    // The block ends at its last part, so the button rides that message alone.
+    try std.testing.expect(chat.sends.items[1].markup == null);
+    try std.testing.expectEqualStrings(shortenKeyboard("2"), chat.sends.items[2].markup.?);
 }

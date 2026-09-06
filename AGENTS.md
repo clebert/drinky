@@ -23,9 +23,10 @@ behavior can be wrong.
 - `src/remote/` contains the Telegram remote control: the Bot API client, the store of saved bots,
   the attachment with its poller, sender, and answerer, the pairing, and the controller that owns
   them all. The controller reports through a sink of small actions and knows nothing of the session.
-  The mirror sends the transcript to the chat and holds the keyboards of the turn, and the picker
-  holds the open command picker of the chat. `src/remote/html.zig` owns the Telegram HTML: the
-  render of a block, and the one seam from a role to the look of a message that Drinky wrote.
+  The mirror sends the transcript to the chat and holds the keyboards of the turn and of the newest
+  answer, and the picker holds the open command picker of the chat. `src/remote/html.zig` owns the
+  Telegram HTML: the render of a block, and the one seam from a role to the look of a message that
+  Drinky wrote.
 
 The libraries never import each other or the app. Only the `root.zig` file in a module can re-export
 names.
@@ -58,8 +59,8 @@ its work is done.
 writes no color of its own.
 
 - A message that Drinky wrote for the user takes the user color and no box. The head of a loaded
-  skill and the line of a retry attempt are such messages. Use the `user_note` block kind for each
-  one, so no message box can forge it.
+  skill, the line of a retry attempt, and the line of a shorten request are such messages. Use the
+  `user_note` block kind for each one, so no message box can forge it.
 - An event block reports the state of the session, never a message.
 - A failed event paints its complete text in the error color. Every other event paints its complete
   text in the accent color.

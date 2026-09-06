@@ -78,9 +78,10 @@ the chat runs as a prompt, or queues as steering during a turn. Its reaction sta
 👀 when Drinky takes it, 👍 when it reaches the conversation, and 👎 when it drops. The chat mirrors
 every answer and event. A message that Drinky wrote takes its own symbol, so the chat tells it from
 an answer of the model. One activity message per turn shows the state and holds the `Cancel turn`
-and `Withdraw` buttons. `/effort`, `/model`, `/help`, and `/skill` open inline keyboards in the
-chat, `/status` answers with the state of the session, and `/new` clears the conversation. `/login`,
-`/logout`, `/remote`, `/sources`, and `/system` run in the terminal alone.
+and `Withdraw` buttons, and the last answer of a completed turn holds a `Shorten` button that asks
+the model for a short restatement. `/effort`, `/model`, `/help`, and `/skill` open inline keyboards
+in the chat, `/status` answers with the state of the session, and `/new` clears the conversation.
+`/login`, `/logout`, `/remote`, `/sources`, and `/system` run in the terminal alone.
 
 Every exit key in the terminal detaches the bot. The bot tokens live in the owner-only
 `~/.drinky/remote.json`, and Drinky talks to the Telegram Bot API directly, with no dependency.

@@ -513,6 +513,15 @@ Gemini on Google Vertex AI through a service account key file.
 - A failed turn that armed a retry sends one `Failed turn` message with `Try again` and `Dismiss`
   buttons, and so does an attach that finds a waiting retry. The message loses its buttons after a
   tap, at the start of a turn, and at `/new`.
+- The last answer of a completed turn holds a `Shorten` button. One tap asks the model to restate
+  that answer for a phone screen, with the outcome first and one line per point that changes a
+  decision. The request runs as a normal turn, and its line reads
+  `Drinky asked the model to shorten the last answer.`
+- The `Shorten` button never leaves its message, so the newest answer alone answers a tap. A tap on
+  an older answer gets `This answer is not the newest one.`, and a tap during a turn gets
+  `A turn runs. Wait for its end.` A `/new` and a detach make every button of the chat stale.
+- An answer that stands last waits, because its message can still take that button. A tool that
+  starts ends the wait, and so does the end of the turn.
 - A notice that a tap causes goes out as a toast. The detach leaves the chat as it stands, buttons
   included: a tap on an old keyboard gets no answer while no bot is attached, and a stale toast
   after the next attach.

@@ -26,6 +26,8 @@ pub const Tap = union(enum) {
     retry: u64,
     /// The `Dismiss` button of the failed turn message.
     dismiss: u64,
+    /// The `Shorten` button of the last answer of a completed turn.
+    shorten: u64,
     /// One row of a picker.
     row: Row,
     /// The `‹ Back` button of a stepped picker.
@@ -39,7 +41,7 @@ pub const Tap = union(enum) {
     };
 
     /// The keyword of each tap in its callback data.
-    const Word = enum { cancel, withdraw, retry, dismiss, row, back, close };
+    const Word = enum { cancel, withdraw, retry, dismiss, shorten, row, back, close };
 
     /// The callback data of this tap, in `buffer`.
     pub fn write(self: Tap, buffer: *[data_bytes_max]u8) []const u8 {
@@ -48,6 +50,7 @@ pub const Tap = union(enum) {
             .withdraw => |serial| std.fmt.bufPrint(buffer, "withdraw:{d}", .{serial}),
             .retry => |serial| std.fmt.bufPrint(buffer, "retry:{d}", .{serial}),
             .dismiss => |serial| std.fmt.bufPrint(buffer, "dismiss:{d}", .{serial}),
+            .shorten => |serial| std.fmt.bufPrint(buffer, "shorten:{d}", .{serial}),
             .row => |row| std.fmt.bufPrint(buffer, "row:{d}:{d}", .{ row.serial, row.index }),
             .back => |serial| std.fmt.bufPrint(buffer, "back:{d}", .{serial}),
             .close => |serial| std.fmt.bufPrint(buffer, "close:{d}", .{serial}),
@@ -65,6 +68,7 @@ pub const Tap = union(enum) {
             .withdraw => .{ .withdraw = serial },
             .retry => .{ .retry = serial },
             .dismiss => .{ .dismiss = serial },
+            .shorten => .{ .shorten = serial },
             .row => .{ .row = .{
                 .serial = serial,
                 .index = std.fmt.parseInt(usize, parts.next() orelse return null, 10) catch
@@ -103,6 +107,7 @@ test "a tap writes its data and reads it back" {
         .{ .withdraw = 3 },
         .{ .retry = 8 },
         .{ .dismiss = 8 },
+        .{ .shorten = 9 },
         .{ .row = .{ .serial = 12, .index = 4 } },
         .{ .back = 12 },
         .{ .close = 12 },

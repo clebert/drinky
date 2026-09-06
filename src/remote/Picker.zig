@@ -218,7 +218,7 @@ pub fn resolve(self: *Picker, tap: keyboard.Tap) ?Action {
             if (serial != open.serial) return null;
             return .close;
         },
-        .cancel_turn, .withdraw, .retry, .dismiss => return null,
+        .cancel_turn, .withdraw, .retry, .dismiss, .shorten => return null,
     }
 }
 

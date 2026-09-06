@@ -49,6 +49,18 @@ const telegram_signed_out_refusal =
 const telegram_no_model_refusal =
     "Select a model with /model in the terminal before you send a message.";
 
+/// What a tap on `Shorten` in the chat sends, and the line that names it in the
+/// transcript. The request stays out of the transcript, so the note carries the
+/// meaning of the tap alone.
+const shorten_note_text = "Drinky asked the model to shorten the last answer.";
+const shorten_request_text =
+    \\Shorten your last answer for a phone screen.
+    \\- Line 1 states the outcome, and it stands alone.
+    \\- One line states each point that changes a decision. Leave out every other point.
+    \\- Write Simplified Technical English. Use a plain word, never a metaphor.
+    \\- Add no new work, no new finding, and no question.
+;
+
 /// The row that a model picker shows while its fetch runs. The title of the
 /// picker names the account, so the row names the work alone.
 const fetch_wait_text = "Drinky fetches the model list.";
@@ -2159,6 +2171,19 @@ fn startRetryTurn(self: *App) !usize {
     return base;
 }
 
+/// A tap on `Shorten` in the chat: record the line that names the request, then
+/// spawn its turn over the request. Drinky wrote that line, so it takes the note
+/// kind, like the line of a retry attempt, and the request stays out of the
+/// transcript, as a skill head keeps its expanded file out of it.
+fn sendShortenTurn(self: *App) !void {
+    const base = self.session.transcript.blocks().len;
+    errdefer self.session.transcript.truncate(base);
+    try self.session.transcript.append(.user_note, .{}, shorten_note_text);
+    try self.runTurn(shorten_request_text);
+    // The editor holds no part of this request, so the rewind anchor stands alone.
+    self.session.markTurnBase(base);
+}
+
 /// Spawn a turn worker over `text` and enter turn mode. The worker owns its own
 /// copy of the prompt. Only commit to turn mode once the spawn succeeds.
 fn runTurn(self: *App, text: []const u8) !void {
@@ -3450,6 +3475,16 @@ fn stateChatResult(self: *App, origin: ChatOrigin) !void {
 const turn_over_toast = "The turn is over.";
 const retry_over_toast = "The retry is over.";
 const list_closed_toast = "This list is closed.";
+const answer_stale_toast = "This answer is not the newest one.";
+
+/// What a tap on `Shorten` meets while the session cannot take it. Each sentence
+/// names the tap, because the user pressed a button and sent no message.
+const turn_runs_toast = "A turn runs. Wait for its end.";
+const session_busy_toast = "Drinky cannot act on a tap now.";
+const shorten_signed_out_toast =
+    "Sign in with /login in the terminal before you shorten an answer.";
+const shorten_no_model_toast =
+    "Select a model with /model in the terminal before you shorten an answer.";
 
 /// Act on one tap of the chat and answer it. A tap on a keyboard the chat
 /// history still shows names a serial its owner no longer holds, and the toast
@@ -3481,6 +3516,21 @@ fn handleChatTap(self: *App, query_id: []const u8, tap: remote.keyboard.Tap) !vo
             if (!self.mirror.namesRetry(serial)) return self.controller.answer(query_id, retry_over_toast);
             try self.controller.answer(query_id, null);
             self.clearRetry();
+        },
+        .shorten => |serial| {
+            if (!self.mirror.namesAnswer(serial))
+                return self.controller.answer(query_id, answer_stale_toast);
+            switch (self.session.mode) {
+                .prompt => {},
+                .turn => return self.controller.answer(query_id, turn_runs_toast),
+                .picking, .viewing => return self.controller.answer(query_id, session_busy_toast),
+            }
+            if (!self.signedIn())
+                return self.controller.answer(query_id, shorten_signed_out_toast);
+            if (self.agent.model == null)
+                return self.controller.answer(query_id, shorten_no_model_toast);
+            try self.controller.answer(query_id, null);
+            try self.sendShortenTurn();
         },
         .row, .back, .close => try self.handlePickerTap(query_id, tap),
     }
@@ -7676,6 +7726,53 @@ test "Ctrl+N sends the attempt and keeps the editor text" {
     try std.testing.expect(blocks[0].content.event.is_error);
 }
 
+// A tap on `Shorten` sends the request alone: the transcript records the line
+// that names it, the request itself stays out of the transcript, and the editor
+// keeps every byte it holds.
+test "a shorten request records its line and keeps the editor text" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    defer app.drainQueue();
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = test_anthropic_model,
+        .system = "",
+        .retry = .{},
+        .environ = .empty,
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
+    defer app.session.deinit();
+    defer app.dropRetry();
+
+    try app.session.editor.insert("a draft that stays");
+    // The spawn runs past the gates of the tap, so the worker reaches the agent
+    // and reports the signed-out state as the failure of this turn.
+    try app.sendShortenTurn();
+
+    try std.testing.expect(app.session.mode == .turn);
+    try std.testing.expectEqualStrings("a draft that stays", app.session.editor.visible());
+    try std.testing.expect(app.session.turn_prompt == null);
+    {
+        // Drinky wrote the request, so its line is a user note and no user box.
+        // The contract stays out of the transcript.
+        const blocks = app.session.transcript.blocks();
+        try std.testing.expectEqual(@as(usize, 1), blocks.len);
+        try std.testing.expectEqualStrings(shorten_note_text, blocks[0].content.user_note.items);
+    }
+    {
+        const result = app.awaitTurnFuture().?;
+        defer app.freeWorkerResult(&result);
+        try app.finishWorkerResult(&result);
+    }
+    try std.testing.expect(app.session.mode == .prompt);
+    try std.testing.expectEqualStrings("a draft that stays", app.session.editor.visible());
+}
+
 // A retry needs an account, so Ctrl+N names the sign-in and sends nothing. Without
 // a retry the key has no action at all.
 test "a signed-out Ctrl+N names the sign-in and keeps the retry" {
@@ -10426,6 +10523,7 @@ test "the chat mirrors a completed turn with its activity message, its answer, a
     try std.testing.expect(app.session.mode == .prompt);
     const answer = try server.waitForSend(2);
     try std.testing.expect(std.mem.indexOf(u8, answer, "\"text\":\"The <b>answer</b>.\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, answer, "\"reply_markup\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, answer, "\"disable_notification\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, answer, "\"parse_mode\":\"HTML\"") != null);
     const summary = try server.waitForRequest("/editMessageText", 1);
@@ -10812,6 +10910,195 @@ test "the failed turn message dismisses the retry from the chat and stands at th
     // The two edits are the summary and the dismiss. No edit went out at either
     // detach.
     try std.testing.expectEqual(@as(usize, 2), server.countOf("/editMessageText"));
+}
+
+// The agent commits its last reply before the turn returns, so the usage event
+// that follows the commit carries the answer over the committed frontier while
+// the turn still runs. The answer of a completed turn takes its button in that
+// order too.
+test "the chat gives the answer its button when the commit lands before the receipt" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var server = try remote_testing.Server.init(gpa, io, &.{
+        .{ .method = "deleteWebhook", .replies = &.{.{ .body = remote_ok_true }} },
+        .{ .method = "setMyCommands", .replies = &.{.{ .body = remote_ok_true }} },
+        .{ .method = "getUpdates", .replies = &.{.{ .body = remote_ok_empty }} },
+        .{ .method = "sendMessage", .replies = &.{
+            .{ .body = remote_ok_sent },
+            .{ .body = "{\"ok\":true,\"result\":{\"message_id\":50}}" },
+            .{ .body = "{\"ok\":true,\"result\":{\"message_id\":51}}" },
+        } },
+        .{ .method = "editMessageText", .replies = &.{ .{ .body = remote_ok_true }, .{ .body = remote_ok_true } } },
+    });
+    defer server.deinit();
+    try server.start();
+    var url_buffer: [64]u8 = undefined;
+
+    var app: App = undefined;
+    app.initRemoteTest(gpa, io, &out, &server, &url_buffer);
+    defer app.deinitRemoteTest();
+    try app.controller.store.save(&.{ .token = "42:secret", .id = 42, .username = "drinky_bot", .chat_id = 99 });
+    try app.controller.attachSaved(0);
+    try server.waitForRequests(3);
+
+    app.session.beginTurn(1);
+    try app.mirror.beginTurn(&app.controller, app.nowMs());
+    _ = try server.waitForSend(1);
+    var events = [_]UiEvent{.{ .turn = .{
+        .generation = 1,
+        .progress_sequence = 1,
+        .payload = .{ .text = try gpa.dupe(u8, "The answer.") },
+    } }};
+    _ = try app.applyBatch(&events);
+    // The commit of the last reply travels with the usage event that follows it,
+    // so the answer commits here and goes out before the receipt.
+    var committed = [_]UiEvent{.{ .turn = .{
+        .generation = 1,
+        .progress_sequence = 2,
+        .progress_sequence_committed = 1,
+        .payload = .{ .usage = .{} },
+    } }};
+    _ = try app.applyBatch(&committed);
+
+    var result: WorkerResult = .{
+        .outcome = .{
+            .receipt = .{ .history_base = 0, .history_end = 2, .steering_committed_count = 0 },
+            .disposition = .completed,
+        },
+        .error_text = null,
+    };
+    defer app.freeWorkerResult(&result);
+    try app.finishWorkerResult(&result);
+    const answer = try server.waitForSend(2);
+    try std.testing.expect(std.mem.indexOf(u8, answer, "\"text\":\"The answer.\"") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        answer,
+        "[{\"text\":\"Shorten\",\"callback_data\":\"shorten:2\"}]",
+    ) != null);
+    try std.testing.expect(app.mirror.namesAnswer(2));
+    try server.finish();
+}
+
+// The last answer of a completed turn carries the `Shorten` button, and the tap
+// on it acts only between turns. A tap on an older answer, a tap during a turn,
+// and a tap without an account each state why nothing happens.
+test "the shorten button rides the last answer and its tap waits for the prompt" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var server = try remote_testing.Server.init(gpa, io, &.{
+        .{ .method = "deleteWebhook", .replies = &.{.{ .body = remote_ok_true }} },
+        .{ .method = "setMyCommands", .replies = &.{.{ .body = remote_ok_true }} },
+        .{ .method = "getUpdates", .replies = &.{.{ .body = remote_ok_empty }} },
+        .{ .method = "sendMessage", .replies = &.{
+            .{ .body = remote_ok_sent },
+            .{ .body = "{\"ok\":true,\"result\":{\"message_id\":50}}" },
+            .{ .body = remote_ok_sent },
+            .{ .body = "{\"ok\":true,\"result\":{\"message_id\":60}}" },
+        } },
+        .{ .method = "editMessageText", .replies = &.{.{ .body = remote_ok_true }} },
+        .{ .method = "answerCallbackQuery", .replies = &.{
+            .{ .body = remote_ok_true },
+            .{ .body = remote_ok_true },
+            .{ .body = remote_ok_true },
+            .{ .body = remote_ok_true },
+            .{ .body = remote_ok_true },
+        } },
+    });
+    defer server.deinit();
+    try server.start();
+    var url_buffer: [64]u8 = undefined;
+
+    var app: App = undefined;
+    app.initRemoteTest(gpa, io, &out, &server, &url_buffer);
+    defer app.deinitRemoteTest();
+    try app.controller.store.save(&.{ .token = "42:secret", .id = 42, .username = "drinky_bot", .chat_id = 99 });
+    try app.controller.attachSaved(0);
+    try server.waitForRequests(3);
+
+    // A completed turn sends its answer with the button of the newest answer.
+    app.session.beginTurn(1);
+    try app.mirror.beginTurn(&app.controller, app.nowMs());
+    _ = try server.waitForSend(1);
+    try app.session.transcript.append(.model, .{}, "a long answer");
+    var result: WorkerResult = .{
+        .outcome = .{
+            .receipt = .{ .history_base = 0, .history_end = 2, .steering_committed_count = 0 },
+            .disposition = .completed,
+        },
+        .error_text = null,
+    };
+    defer app.freeWorkerResult(&result);
+    try app.finishWorkerResult(&result);
+    const answer = try server.waitForSend(2);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        answer,
+        "[{\"text\":\"Shorten\",\"callback_data\":\"shorten:2\"}]",
+    ) != null);
+
+    // A tap on a button that names no live answer states that.
+    try app.handleChatTap("900", .{ .shorten = 1 });
+    try std.testing.expectEqualStrings(
+        "{\"callback_query_id\":\"900\",\"text\":\"This answer is not the newest one.\"}",
+        try server.waitForRequest("/answerCallbackQuery", 0),
+    );
+    try std.testing.expect(app.session.mode == .prompt);
+
+    // The session has no account, so the tap names the sign-in and starts no
+    // turn.
+    try app.handleChatTap("901", .{ .shorten = 2 });
+    try std.testing.expectEqualStrings(
+        "{\"callback_query_id\":\"901\",\"text\":\"Sign in with /login in the terminal " ++
+            "before you shorten an answer.\"}",
+        try server.waitForRequest("/answerCallbackQuery", 1),
+    );
+    try std.testing.expect(app.session.mode == .prompt);
+
+    // An account with no model names the model instead.
+    app.agent.deinit();
+    app.accounts = ai.testing.accounts(.{ .anthropic = "sk-ant" });
+    app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_api), .{
+        .model = null,
+        .system = "",
+        .retry = .{},
+        .environ = .empty,
+    });
+    try app.handleChatTap("902", .{ .shorten = 2 });
+    try std.testing.expectEqualStrings(
+        "{\"callback_query_id\":\"902\",\"text\":\"Select a model with /model in the terminal " ++
+            "before you shorten an answer.\"}",
+        try server.waitForRequest("/answerCallbackQuery", 2),
+    );
+
+    // A page holds the terminal, so the tap waits for it.
+    try app.session.openPage(&.{ .title = "Test page", .content = "body" });
+    try app.handleChatTap("903", .{ .shorten = 2 });
+    try std.testing.expectEqualStrings(
+        "{\"callback_query_id\":\"903\",\"text\":\"Drinky cannot act on a tap now.\"}",
+        try server.waitForRequest("/answerCallbackQuery", 3),
+    );
+    app.session.closePage();
+
+    // A turn runs, so the tap waits for its end. The button stays live, because
+    // no answer replaced it.
+    app.session.beginTurn(2);
+    try app.mirror.beginTurn(&app.controller, app.nowMs());
+    try app.handleChatTap("904", .{ .shorten = 2 });
+    try std.testing.expectEqualStrings(
+        "{\"callback_query_id\":\"904\",\"text\":\"A turn runs. Wait for its end.\"}",
+        try server.waitForRequest("/answerCallbackQuery", 4),
+    );
+    try std.testing.expect(app.mirror.namesAnswer(2));
+    try server.finish();
 }
 
 // A `/new` from the chat clears the conversation and opens the new one on the
