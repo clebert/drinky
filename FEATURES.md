@@ -271,6 +271,7 @@ Gemini on Google Vertex AI through a service account key file.
   their markdown: headings, lists, blockquotes, code blocks, rules, tables, and nested inline
   emphasis. A heading, a quote, and an emphasis span shed their markers. A quote has no border
   glyph, so a terminal copy holds the text alone. Both blocks drop the blank rows that they end on.
+  A run of whitespace alone opens no block.
 - A link becomes a clickable terminal hyperlink when a click can open its target, and a bare URL
   links to itself. Any other target, such as a relative path, shows its URL as text.
 - A pipe table draws as a box grid that fits the window and keeps the indentation of its source. The

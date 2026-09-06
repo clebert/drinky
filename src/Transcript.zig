@@ -26,12 +26,15 @@ entries: std.ArrayList(ui.block.Entry),
 /// block breaks a contiguous slice, so the list holds one pointer per shown
 /// block.
 projected: std.ArrayList(*ui.block.Entry),
-/// The index and kind of the current run's streamed block, so deltas of that
-/// kind append to it. Null when no run is open.
-current: ?struct { index: usize, kind: ui.block.Entry.Kind },
+/// The current run of streamed deltas: its kind, so deltas of that kind append
+/// to it, and the index of its block. The index is null while the run holds
+/// whitespace alone (see `appendStream`). Null when no run is open.
+current: ?struct { kind: ui.block.Entry.Kind, index: ?usize },
+/// The whitespace of the current run before its block opened.
+held: std.ArrayList(u8),
 /// The index of the first block streamed for the current assistant message
 /// (reasoning or answer), so a retry can drop the whole partial message. Null
-/// when none is streaming.
+/// while the message has no block.
 message_start: ?usize,
 
 /// What the next request carries of the stored reasoning, so the projection can
@@ -52,6 +55,7 @@ pub fn init(gpa: std.mem.Allocator) Transcript {
         .entries = .empty,
         .projected = .empty,
         .current = null,
+        .held = .empty,
         .message_start = null,
     };
 }
@@ -60,6 +64,7 @@ pub fn deinit(self: *Transcript) void {
     for (self.entries.items) |*entry| entry.deinit(self.gpa);
     self.entries.deinit(self.gpa);
     self.projected.deinit(self.gpa);
+    self.held.deinit(self.gpa);
 }
 
 /// Append a discrete block that copies `text`. This ends any open streamed run,
@@ -94,12 +99,14 @@ pub fn repeatEvent(
     return true;
 }
 
-/// Append streamed text of `kind` (`.thinking` reasoning or `.model` answer).
-/// Open a block of that kind on demand so a run of deltas collects into one
-/// block. A kind change ends the previous run. A provider can stream a delta
-/// with no bytes. Such a delta opens no block, because an empty block shows as
-/// a blank row and its separator. It also leaves the open run alone, so the
-/// deltas around it still collect into one block.
+/// Append streamed text of `kind` (`.thinking` reasoning or `.model` answer). A
+/// run of deltas of one kind collects into one block, and a kind change ends the
+/// run. The run opens its block at its first byte that is no whitespace, because
+/// a block of whitespace alone shows as a blank row and its separator. Until
+/// then the run holds its whitespace, and the block takes it in front of its
+/// text, so the split of the deltas changes no row. A run that ends on
+/// whitespace alone opens no block. A delta with no bytes changes nothing, so
+/// the deltas around it still collect into one block.
 ///
 /// A new reasoning block records `account` as the slot that produced it, so the
 /// projection of another account hides it. An answer block ignores `account`,
@@ -111,17 +118,26 @@ pub fn appendStream(
     delta: []const u8,
 ) !void {
     if (delta.len == 0) return;
-    if (self.current == null or self.current.?.kind != kind)
-        self.current = .{ .index = try self.openRun(kind, account), .kind = kind };
-    try self.entries.items[self.current.?.index].appendText(self.gpa, delta);
+    if (self.current == null or self.current.?.kind != kind) {
+        self.current = .{ .kind = kind, .index = null };
+        self.held.clearRetainingCapacity();
+    }
+    const run = &self.current.?;
+    if (run.index == null) {
+        if (ui.block.isBlank(delta)) return self.held.appendSlice(self.gpa, delta);
+        run.index = try self.openRun(kind, account);
+    }
+    try self.entries.items[run.index.?].appendText(self.gpa, delta);
 }
 
-/// Open a streamed block of `kind` at the tail and return its index. Record it
-/// as the message's first block when none has opened yet.
+/// Open a streamed block of `kind` at the tail, with the held whitespace of the
+/// run as its text, and return its index. Record it as the message's first block
+/// when none has opened yet.
 fn openRun(self: *Transcript, kind: ui.block.Entry.Kind, account: ?ai.llm.Account) !usize {
-    var entry = try ui.block.Entry.init(self.gpa, kind, .{ .account = account }, "");
+    var entry = try ui.block.Entry.init(self.gpa, kind, .{ .account = account }, self.held.items);
     errdefer entry.deinit(self.gpa);
     try self.entries.append(self.gpa, entry);
+    self.held.clearRetainingCapacity();
     const index = self.entries.items.len - 1;
     if (self.message_start == null) self.message_start = index;
     return index;
@@ -133,18 +149,22 @@ pub fn streaming(self: *const Transcript) bool {
 }
 
 /// End the current message's streamed runs so the next delta opens a new block.
+/// The whitespace of a run that opened no block goes with the run.
 pub fn endMessage(self: *Transcript) void {
     self.current = null;
+    self.held.clearRetainingCapacity();
     self.message_start = null;
 }
 
 /// Drop the open message's streamed blocks (reasoning and answer alike) so a
 /// retried reply leaves nothing partial behind. A no-op when none is
 /// streaming. The blocks are the contiguous tail from `message_start`, because
-/// nothing discrete has ended the message.
+/// nothing discrete has ended the message. A message that holds whitespace
+/// alone has no block yet, so its end drops all of it.
 pub fn discardMessage(self: *Transcript) void {
-    const start = self.message_start orelse return;
+    const maybe_start = self.message_start;
     self.endMessage();
+    const start = maybe_start orelse return;
     for (self.entries.items[start..]) |*entry| entry.deinit(self.gpa);
     self.entries.shrinkRetainingCapacity(start);
 }
@@ -289,6 +309,48 @@ test "an empty delta opens no block and does not break a run" {
     try transcript.appendStream(.model, null, "llo");
     try std.testing.expectEqual(@as(usize, 1), transcript.entries.items.len);
     try std.testing.expectEqualStrings("hello", transcript.entries.items[0].content.model.items);
+}
+
+// Regression: a provider can stream a run of whitespace alone. It used to open a
+// block, which showed as a blank row and its separator like an empty one.
+test "a run holds its whitespace until another byte opens the block" {
+    const gpa = std.testing.allocator;
+    var transcript = Transcript.init(gpa);
+    defer transcript.deinit();
+
+    // The run has begun, so the message has, but no block shows yet.
+    try transcript.appendStream(.thinking, test_account, "\n");
+    try transcript.appendStream(.thinking, test_account, " \t\r\n");
+    try std.testing.expectEqual(@as(usize, 0), transcript.entries.items.len);
+    try std.testing.expect(transcript.streaming());
+
+    // The answer ends the run, and the whitespace of the run goes with it.
+    try transcript.appendStream(.model, null, "answer");
+    try std.testing.expectEqual(@as(usize, 1), transcript.entries.items.len);
+    try std.testing.expectEqualStrings("answer", transcript.entries.items[0].content.model.items);
+
+    // The block takes the whitespace of its run in front of its text, so the
+    // split of the deltas changes no row.
+    transcript.endMessage();
+    try transcript.appendStream(.thinking, test_account, "\n\n");
+    try transcript.appendStream(.thinking, test_account, "weigh it");
+    try std.testing.expectEqual(@as(usize, 2), transcript.entries.items.len);
+    const reasoning = transcript.entries.items[1].content.thinking;
+    try std.testing.expectEqualStrings("\n\nweigh it", reasoning.text.items);
+
+    // A discard and an end of the message both end a run of whitespace and drop
+    // the held whitespace with it, so no bytes wait while no run is open.
+    transcript.endMessage();
+    try transcript.appendStream(.model, null, " ");
+    transcript.discardMessage();
+    try std.testing.expect(!transcript.streaming());
+    try std.testing.expectEqual(@as(usize, 0), transcript.held.items.len);
+    try transcript.appendStream(.model, null, " ");
+    transcript.endMessage();
+    try std.testing.expectEqual(@as(usize, 0), transcript.held.items.len);
+    try transcript.appendStream(.model, null, "fresh");
+    try std.testing.expectEqual(@as(usize, 3), transcript.entries.items.len);
+    try std.testing.expectEqualStrings("fresh", transcript.entries.items[2].content.model.items);
 }
 
 test "endMessage forces the next delta into a new block" {

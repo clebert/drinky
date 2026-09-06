@@ -21,6 +21,16 @@ const markdown = @import("markdown.zig");
 const paint = @import("paint.zig");
 const role = @import("role.zig");
 
+/// The bytes that paint as blank rows alone. A block trims them off its tail,
+/// and the transcript holds a run of them until another byte follows, because a
+/// block of them alone shows as a blank row.
+const blank_bytes = " \t\r\n";
+
+/// Whether `text` paints as blank rows alone.
+pub fn isBlank(text: []const u8) bool {
+    return std.mem.indexOfNone(u8, text, blank_bytes) == null;
+}
+
 pub const Entry = struct {
     content: Content,
     /// The rows this block painted last, so the frames that follow replay them.
@@ -254,7 +264,7 @@ pub const Entry = struct {
     /// a row for each one. The block then holds empty rows over the block under
     /// it.
     fn trimBlankTail(text: []const u8) []const u8 {
-        return std.mem.trimEnd(u8, text, " \t\r\n");
+        return std.mem.trimEnd(u8, text, blank_bytes);
     }
 
     /// How this block paints as a notice, or null for a block that paints a box
