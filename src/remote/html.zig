@@ -6,8 +6,8 @@
 //! of the terminal renderer, so both agree on what a marker means.
 //!
 //! `Role` is the one seam from the role of a message that Drinky wrote to its
-//! look in the chat: a quote bar and the symbol of the role. An answer of the
-//! model takes neither, so the chat tells the two apart.
+//! look in the chat: the symbol of the role before the text. An answer of the
+//! model takes none, so the chat tells the two apart.
 //!
 //! A message holds at most 4096 characters after the entity parse, so the tags
 //! are free. `Parts` splits the rendered HTML: between two top-level elements,
@@ -127,8 +127,7 @@ pub fn render(out: *std.Io.Writer, text: []const u8) !void {
 }
 
 /// The look of a message that Drinky wrote, as against an answer of the model.
-/// Each role takes its symbol, and every one of them takes the quote bar, so no
-/// answer of the model can forge one.
+/// Each role takes its symbol before the text, so the chat tells the two apart.
 pub const Role = enum {
     /// The state of the session, and the answer to a question about it.
     information,
@@ -163,9 +162,8 @@ pub const Role = enum {
 /// Write `text` as one message of Drinky under `role`. The text goes out
 /// escaped, so it carries no markup of its own.
 pub fn wrap(out: *std.Io.Writer, role: Role, text: []const u8) !void {
-    try out.print("<blockquote>{s} ", .{role.symbol()});
+    try out.print("{s} ", .{role.symbol()});
     try escape(out, text);
-    try out.writeAll("</blockquote>");
 }
 
 /// `text` as one message of Drinky under `role`. The result is owned.
@@ -179,10 +177,10 @@ pub fn wrapAlloc(gpa: std.mem.Allocator, role: Role, text: []const u8) ![]u8 {
 /// Write `source`, an HTML text of this module, as plain text: every tag goes,
 /// and every character reference decodes once. The renderer escaped every
 /// literal `<` and `&`, so a `<` opens a tag and an `&` opens a reference. A
-/// message that Telegram cannot parse goes out this way. Its quote bar goes with
-/// the tag, and its symbol stays, because the symbol is text. A link keeps its
-/// target as `label (url)`, unless the label is that URL, so the plain text
-/// loses no target.
+/// message that Telegram cannot parse goes out this way, and the symbol of a
+/// message of Drinky stays, because the symbol is text. A link keeps its target
+/// as `label (url)`, unless the label is that URL, so the plain text loses no
+/// target.
 pub fn plain(out: *std.Io.Writer, source: []const u8) !void {
     var rest = source;
     // Every pass moves past one link, or to the end.
@@ -718,34 +716,25 @@ fn expectRender(expected: []const u8, source: []const u8) !void {
     try std.testing.expectEqualStrings(expected, out.written());
 }
 
-// Every message that Drinky wrote takes the quote bar and the symbol of its
-// role, so it cannot read as an answer of the model. The text goes out escaped,
+// Every message that Drinky wrote takes the symbol of its role before its text,
+// so the chat tells it from an answer of the model. The text goes out escaped,
 // because it is prose and not markup. A warning and a failure share the symbol,
 // because the text must state a failure without its color, and the role keeps
 // the two apart.
-test "a message of Drinky takes the symbol of its role inside a quote" {
+test "a message of Drinky takes the symbol of its role before its text" {
     const gpa = std.testing.allocator;
     const information = try wrapAlloc(gpa, .information, "Drinky now uses claude-opus-5.");
     defer gpa.free(information);
-    try std.testing.expectEqualStrings(
-        "<blockquote>ℹ Drinky now uses claude-opus-5.</blockquote>",
-        information,
-    );
+    try std.testing.expectEqualStrings("ℹ Drinky now uses claude-opus-5.", information);
     const warning = try wrapAlloc(gpa, .warning, "The command /login runs in the terminal alone.");
     defer gpa.free(warning);
-    try std.testing.expectEqualStrings(
-        "<blockquote>⚠ The command /login runs in the terminal alone.</blockquote>",
-        warning,
-    );
+    try std.testing.expectEqualStrings("⚠ The command /login runs in the terminal alone.", warning);
     const failure = try wrapAlloc(gpa, .failure, "Telegram rejected <a> & more.");
     defer gpa.free(failure);
-    try std.testing.expectEqualStrings(
-        "<blockquote>⚠ Telegram rejected &lt;a&gt; &amp; more.</blockquote>",
-        failure,
-    );
+    try std.testing.expectEqualStrings("⚠ Telegram rejected &lt;a&gt; &amp; more.", failure);
     const note = try wrapAlloc(gpa, .note, "Skill: zig-style");
     defer gpa.free(note);
-    try std.testing.expectEqualStrings("<blockquote>→ Skill: zig-style</blockquote>", note);
+    try std.testing.expectEqualStrings("→ Skill: zig-style", note);
     // The severity of a message names its role, one to one.
     try std.testing.expectEqual(Role.information, Role.of(.information));
     try std.testing.expectEqual(Role.warning, Role.of(.warning));
@@ -753,7 +742,7 @@ test "a message of Drinky takes the symbol of its role inside a quote" {
 }
 
 // A long message of Drinky splits like every other one. The symbol is text, so
-// the first part carries it, and every later part reopens the quote bar alone.
+// the first part carries it, and every later part carries its text alone.
 test "a split message of Drinky carries its symbol on the first part alone" {
     const gpa = std.testing.allocator;
     const wrapped = try wrapAlloc(gpa, .information, "one two three four five six seven eight");
@@ -763,25 +752,20 @@ test "a split message of Drinky carries its symbol on the first part alone" {
         for (list.items) |part| gpa.free(part);
         list.deinit(gpa);
     }
-    const expected = [_][]const u8{
-        "<blockquote>ℹ one two three four</blockquote>",
-        "<blockquote> five six seven eigh</blockquote>",
-        "<blockquote>t</blockquote>",
-    };
+    const expected = [_][]const u8{ "ℹ one two three four", " five six seven eigh", "t" };
     try std.testing.expectEqual(expected.len, list.items.len);
     for (expected, list.items) |want, got| try std.testing.expectEqualStrings(want, got);
 }
 
-// A text that Telegram cannot parse goes again as plain text. The tags go, so
-// the quote bar goes with them, and every reference decodes once, so a literal
-// `<b>` that the renderer escaped stays literal and a literal `&lt;` stays too.
-// A link keeps its target behind its label, so the plain text loses no target,
-// and a bare URL goes out once.
+// A text that Telegram cannot parse goes again as plain text. The tags go, and
+// every reference decodes once, so a literal `<b>` that the renderer escaped
+// stays literal and a literal `&lt;` stays too. A link keeps its target behind
+// its label, so the plain text loses no target, and a bare URL goes out once.
 test "the plain text of a message keeps its symbol and its literal text" {
     const gpa = std.testing.allocator;
     const cases = [_]struct { html: []const u8, plain: []const u8 }{
         .{
-            .html = "<blockquote>⚠ Telegram rejected &lt;b&gt; &amp; more.</blockquote>",
+            .html = "⚠ Telegram rejected &lt;b&gt; &amp; more.",
             .plain = "⚠ Telegram rejected <b> & more.",
         },
         .{

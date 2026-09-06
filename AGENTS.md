@@ -67,8 +67,7 @@ writes no color of its own.
 - Add a new block kind to the role test of `src/ui/block.zig`, so no kind reaches a release
   unclassified.
 - In the chat, `html.Role` is the same seam. Every event and every line that Drinky wrote for the
-  user takes a quote bar and the symbol of its role. An answer of the model takes neither. A control
-  of the turn, such as the activity message or a picker, is no such message and takes no bar.
+  user takes the symbol of its role before its text. An answer of the model takes none.
 
 ## Writing style
 

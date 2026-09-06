@@ -1523,11 +1523,11 @@ const cannot_parse_reply: testing.Reply = .{
     .body = "{\"ok\":false,\"error_code\":400,\"description\":\"Bad Request: can't parse entities\"}",
 };
 
-/// A formatted message of Drinky with a symbol, an escaped literal tag, and an
-/// escaped ampersand, and the plain text that it becomes: the tags go, the
-/// symbol stays, and every reference decodes once.
-const formatted_text = "<blockquote>⚠ Telegram rejected &lt;b&gt; &amp; more.</blockquote>";
-const formatted_plain = "⚠ Telegram rejected <b> & more.";
+/// A formatted answer with a tag, an escaped literal tag, and an escaped
+/// ampersand, and the plain text that it becomes: the tag goes, and every
+/// reference decodes once.
+const formatted_text = "<b>Telegram</b> rejected &lt;b&gt; &amp; more.";
+const formatted_plain = "Telegram rejected <b> & more.";
 
 // A formatted block that Telegram cannot parse must not stall the queue behind
 // it, and the chat must still get its words. The plain text of the same message

@@ -9787,7 +9787,7 @@ test "a pairing shows its wait and its code in the picker, and the bind takes th
     try std.testing.expect(std.mem.indexOf(
         u8,
         sent,
-        "\"text\":\"<blockquote>ℹ You attached @drinky_bot.</blockquote>\"",
+        "\"text\":\"ℹ You attached @drinky_bot.\"",
     ) != null);
     // The event went to the chat once: the block carries no mirror flag, so a
     // step of the mirror sends nothing more.
@@ -9861,7 +9861,7 @@ test "while a bot holds the input the terminal takes a detach alone, and Enter n
     try std.testing.expect(std.mem.indexOf(
         u8,
         sent,
-        "\"text\":\"<blockquote>ℹ You detached @drinky_bot.</blockquote>\"",
+        "\"text\":\"ℹ You detached @drinky_bot.\"",
     ) != null);
     try server.finish();
 
@@ -10010,7 +10010,7 @@ test "a Telegram message runs as a prompt, and its refusals answer in the chat" 
     try std.testing.expect(std.mem.indexOf(
         u8,
         login,
-        "\"text\":\"<blockquote>⚠ The command /login runs in the terminal alone.</blockquote>\"",
+        "\"text\":\"⚠ The command /login runs in the terminal alone.\"",
     ) != null);
     try std.testing.expect(std.mem.indexOf(u8, login, "\"reply_parameters\":{\"message_id\":1}") != null);
     const unknown = try server.waitForSend(2);
@@ -10021,7 +10021,7 @@ test "a Telegram message runs as a prompt, and its refusals answer in the chat" 
     try std.testing.expect(std.mem.indexOf(
         u8,
         signed_out,
-        "<blockquote>⚠ Sign in with /login in the terminal before you send a message.</blockquote>",
+        "⚠ Sign in with /login in the terminal before you send a message.",
     ) != null);
     try std.testing.expect(std.mem.indexOf(u8, signed_out, "\"reply_parameters\":{\"message_id\":3}") != null);
 }
@@ -10065,8 +10065,7 @@ test "a /status from Telegram gets one reply and no terminal event, also during 
     try app.controller.attachSaved(0);
     try server.waitForRequests(3);
     const blocks_before = app.session.transcript.blocks().len;
-    const status_wrapped = "<blockquote>ℹ ~/work/drinky · Context: 0 · Cost: ~$0.00 · " ++
-        "Account: Signed out</blockquote>";
+    const status_wrapped = "ℹ ~/work/drinky · Context: 0 · Cost: ~$0.00 · Account: Signed out";
 
     // The answer states the full place and every field of the line, under the
     // information symbol, and it names no bot.
@@ -10103,7 +10102,7 @@ test "a /status from Telegram gets one reply and no terminal event, also during 
     try std.testing.expect(std.mem.indexOf(
         u8,
         refusal,
-        "\"text\":\"<blockquote>⚠ The command /effort cannot run while a turn runs.</blockquote>\"",
+        "\"text\":\"⚠ The command /effort cannot run while a turn runs.\"",
     ) != null);
     try app.submitChatMessage("/status", 33);
     const during = try server.waitForSend(5);
@@ -10376,7 +10375,7 @@ test "the chat mirrors a completed turn with its activity message, its answer, a
     try std.testing.expect(std.mem.indexOf(
         u8,
         activity,
-        "\"text\":\"<blockquote>ℹ Thinking</blockquote>\"",
+        "\"text\":\"ℹ Thinking\"",
     ) != null);
 
     // The reply streams: the activity message follows the state, and the answer
@@ -10402,10 +10401,10 @@ test "the chat mirrors a completed turn with its activity message, its answer, a
     const committed_mark = try server.waitForRequest("/setMessageReaction", 0);
     try std.testing.expect(std.mem.indexOf(u8, committed_mark, "\"message_id\":7,\"reaction\":[{\"type\":\"emoji\",\"emoji\":\"👍\"}]") != null);
     // The edit keeps the buttons of the turn, because an edit without them
-    // drops them, and the wrapper with its parse mode.
+    // drops them, and it keeps the symbol with its parse mode.
     const writing = try server.waitForRequest("/editMessageText", 0);
     try std.testing.expectEqualStrings(
-        "{\"chat_id\":99,\"message_id\":50,\"text\":\"<blockquote>ℹ Writing</blockquote>\"," ++
+        "{\"chat_id\":99,\"message_id\":50,\"text\":\"ℹ Writing\"," ++
             "\"parse_mode\":\"HTML\",\"reply_markup\":{\"inline_keyboard\":[" ++
             "[{\"text\":\"Cancel turn\",\"callback_data\":\"cancel:1\"}]," ++
             "[{\"text\":\"Withdraw\",\"callback_data\":\"withdraw:1\"}]]}}",
@@ -10433,14 +10432,14 @@ test "the chat mirrors a completed turn with its activity message, its answer, a
     try std.testing.expect(std.mem.indexOf(
         u8,
         summary,
-        "\"text\":\"<blockquote>ℹ Tools: 0 calls · Time: ",
+        "\"text\":\"ℹ Tools: 0 calls · Time: ",
     ) != null);
     // A signed-out session with no model states its tokens alone, as the status
-    // line does. The summary holds no button and keeps its wrapper.
+    // line does. The summary holds no button and keeps its symbol.
     try std.testing.expect(std.mem.indexOf(
         u8,
         summary,
-        " · Context: 0 · Cost: ~$0.00</blockquote>\",\"parse_mode\":\"HTML\"}",
+        " · Context: 0 · Cost: ~$0.00\",\"parse_mode\":\"HTML\"}",
     ) != null);
     try std.testing.expect(std.mem.indexOf(u8, summary, "reply_markup") == null);
     try server.finish();
@@ -10511,14 +10510,14 @@ test "a failed turn marks its uncommitted messages and notifies its error" {
     try std.testing.expect(std.mem.indexOf(
         u8,
         failure,
-        "\"text\":\"<blockquote>⚠ The provider refused the request.</blockquote>\"",
+        "\"text\":\"⚠ The provider refused the request.\"",
     ) != null);
     try std.testing.expect(std.mem.indexOf(u8, failure, "\"disable_notification\":false") != null);
     const summary = try server.waitForRequest("/editMessageText", 0);
     try std.testing.expect(std.mem.indexOf(
         u8,
         summary,
-        "\"text\":\"<blockquote>⚠ Failed · Tools: 0 calls · Time: ",
+        "\"text\":\"⚠ Failed · Tools: 0 calls · Time: ",
     ) != null);
     const prompt = try server.waitForRequest("/setMessageReaction", 1);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "\"message_id\":7,\"reaction\":[{\"type\":\"emoji\",\"emoji\":\"👎\"}]") != null);
@@ -10573,7 +10572,7 @@ test "a Telegram command opens a keyboard, a tap picks a row, and a stale tap ge
     try std.testing.expect(std.mem.indexOf(
         u8,
         picker,
-        "\"text\":\"<blockquote>ℹ Effort</blockquote>\"",
+        "\"text\":\"ℹ Effort\"",
     ) != null);
     try std.testing.expect(std.mem.indexOf(u8, picker, "reply_parameters") == null);
     try std.testing.expect(std.mem.indexOf(u8, picker, "[{\"text\":\"✓ low\",\"callback_data\":\"row:1:0\"}]") != null);
@@ -10600,7 +10599,7 @@ test "a Telegram command opens a keyboard, a tap picks a row, and a stale tap ge
     try std.testing.expect(std.mem.indexOf(
         u8,
         event,
-        "\"text\":\"<blockquote>ℹ Drinky set the effort level to high.</blockquote>\"",
+        "\"text\":\"ℹ Drinky set the effort level to high.\"",
     ) != null);
     try std.testing.expectEqual(@as(usize, 0), server.countOf("/editMessageText"));
 
@@ -10699,7 +10698,7 @@ test "the activity keyboard cancels the turn on one tap and withdraws the queue"
     try std.testing.expect(std.mem.indexOf(
         u8,
         summary,
-        "\"text\":\"<blockquote>ℹ Canceled · Tools: 0 calls · Time: ",
+        "\"text\":\"ℹ Canceled · Tools: 0 calls · Time: ",
     ) != null);
     try std.testing.expect(std.mem.indexOf(u8, summary, "reply_markup") == null);
     try server.finish();
@@ -10765,7 +10764,7 @@ test "the failed turn message dismisses the retry from the chat and stands at th
     try std.testing.expect(std.mem.indexOf(
         u8,
         failed,
-        "\"text\":\"<blockquote>⚠ Failed turn</blockquote>\"",
+        "\"text\":\"⚠ Failed turn\"",
     ) != null);
     try std.testing.expect(std.mem.indexOf(u8, failed, "[{\"text\":\"Try again\",\"callback_data\":\"retry:2\"}]") != null);
     try std.testing.expect(std.mem.indexOf(u8, failed, "[{\"text\":\"Dismiss\",\"callback_data\":\"dismiss:2\"}]") != null);
@@ -10781,9 +10780,9 @@ test "the failed turn message dismisses the retry from the chat and stands at th
     try app.handleChatTap("901", .{ .dismiss = 2 });
     try std.testing.expect(app.retry == null);
     try std.testing.expect(!app.session.retry_shown);
-    // The edit that takes the buttons off keeps the wrapper and the symbol.
+    // The edit that takes the buttons off keeps the text and the symbol.
     try std.testing.expectEqualStrings(
-        "{\"chat_id\":99,\"message_id\":70,\"text\":\"<blockquote>⚠ Failed turn</blockquote>\"," ++
+        "{\"chat_id\":99,\"message_id\":70,\"text\":\"⚠ Failed turn\"," ++
             "\"parse_mode\":\"HTML\"}",
         try server.waitForRequest("/editMessageText", 1),
     );
@@ -10802,7 +10801,7 @@ test "the failed turn message dismisses the retry from the chat and stands at th
     try std.testing.expect(std.mem.indexOf(
         u8,
         attached,
-        "\"text\":\"<blockquote>⚠ Failed turn</blockquote>\"",
+        "\"text\":\"⚠ Failed turn\"",
     ) != null);
     try std.testing.expect(std.mem.indexOf(u8, attached, "\"callback_data\":\"retry:3\"") != null);
     try std.testing.expect(!app.mirror.namesRetry(2));
@@ -10859,8 +10858,8 @@ test "a /new from Telegram records the remote bracket as the first event" {
     try std.testing.expect(std.mem.indexOf(
         u8,
         event,
-        "\"text\":\"<blockquote>ℹ You cleared the conversation while @drinky_bot is " ++
-            "attached.</blockquote>\"",
+        "\"text\":\"ℹ You cleared the conversation while @drinky_bot is " ++
+            "attached.\"",
     ) != null);
     try server.finish();
     // The command itself gets no reply, because the event states it.
@@ -10948,7 +10947,7 @@ test "a skill loaded by a tap retains no prompt, so its failed turn fills no edi
     try std.testing.expect(app.retry == null);
     for (app.session.transcript.blocks()) |*block| try std.testing.expect(block.content != .user_note);
     const failure = try server.waitForSend(2);
-    try std.testing.expect(std.mem.indexOf(u8, failure, "\"text\":\"<blockquote>⚠ ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, failure, "\"text\":\"⚠ ") != null);
     try server.finish();
 }
 

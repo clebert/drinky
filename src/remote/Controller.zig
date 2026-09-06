@@ -1206,26 +1206,26 @@ test "a saved bot attaches, its messages and taps reach the owner, and a detach 
     try std.testing.expect(std.mem.indexOf(
         u8,
         sends[0],
-        "\"text\":\"<blockquote>ℹ You attached @drinky_bot.</blockquote>\"",
+        "\"text\":\"ℹ You attached @drinky_bot.\"",
     ) != null);
     // A reply keeps the severity of its notice: the two refusals warn, so both
-    // take the warning symbol under the quote bar.
+    // take the warning symbol.
     try std.testing.expect(std.mem.indexOf(
         u8,
         sends[1],
-        "\"text\":\"<blockquote>⚠ Drinky reads text alone.</blockquote>\"",
+        "\"text\":\"⚠ Drinky reads text alone.\"",
     ) != null);
     try std.testing.expect(std.mem.indexOf(u8, sends[1], "\"reply_parameters\":{\"message_id\":8}") != null);
     try std.testing.expect(std.mem.indexOf(
         u8,
         sends[2],
-        "\"text\":\"<blockquote>⚠ The command /login runs in the terminal alone.</blockquote>\"",
+        "\"text\":\"⚠ The command /login runs in the terminal alone.\"",
     ) != null);
     try std.testing.expect(std.mem.indexOf(u8, sends[2], "\"reply_parameters\":{\"message_id\":7}") != null);
     try std.testing.expect(std.mem.indexOf(
         u8,
         sends[3],
-        "\"text\":\"<blockquote>ℹ You detached @drinky_bot.</blockquote>\"",
+        "\"text\":\"ℹ You detached @drinky_bot.\"",
     ) != null);
 }
 
@@ -1284,8 +1284,8 @@ test "a run of dropped messages reports its count in the chat once the queue has
     try std.testing.expect(std.mem.indexOf(
         u8,
         bodies[bodies.len - 1],
-        "\"text\":\"<blockquote>⚠ Drinky dropped 3 messages while the send queue was full. " ++
-            "The terminal holds the whole transcript.</blockquote>\"",
+        "\"text\":\"⚠ Drinky dropped 3 messages while the send queue was full. " ++
+            "The terminal holds the whole transcript.\"",
     ) != null);
     // The terminal learns nothing, because its transcript is whole.
     try std.testing.expectEqual(@as(usize, 0), owner.countReports("dropped"));

@@ -494,17 +494,16 @@ Gemini on Google Vertex AI through a service account key file.
 - The chat mirrors every committed answer, event, skill head line, and retry line once. The Telegram
   HTML holds bold, italic, code, links, quotes, and `pre` blocks for fences and tables. A reasoning
   block, a tool box, and a user box stay in the terminal.
-- Every message that Drinky wrote takes a quote bar and the symbol of its role: `ℹ` for information,
+- Every message that Drinky wrote takes the symbol of its role before its text: `ℹ` for information,
   `⚠` for a warning or a failure, and `→` for a line for the user. The activity message, its
-  summary, the failed turn message, and a picker title keep the bar through every edit, buttons or
-  not. An answer of the model takes neither, so the chat tells the two apart, and a quote in an
-  answer stays a plain quote. A toast carries no symbol.
+  summary, the failed turn message, and a picker title keep the symbol through every edit, buttons
+  or not. An answer of the model takes none, so the chat tells the two apart. A toast carries no
+  symbol.
 - A block above 4096 characters continues in a new message that reopens the open tags. The first
-  part carries the symbol, and a later part keeps the bar alone.
+  part of a message of Drinky carries the symbol, and a later part carries its text alone.
 - A message or an edit that Telegram cannot parse goes again as plain text: the same words without
-  their tags and without the bar, to the same message, with the same reply and buttons. An escaped
-  `<b>` stays literal, and a link keeps its target as text behind its label. The detach event
-  follows the same rule.
+  their tags, to the same message, with the same reply and buttons. An escaped `<b>` stays literal,
+  and a link keeps its target as text behind its label. The detach event follows the same rule.
 - One activity message per turn shows `Thinking`, `Writing`, or `Running: bash` with the call count.
   At the end it becomes the summary: the outcome, the tool count, the time, the context gauge, and
   the cost. A failed summary opens with `⚠`, and every other one with `ℹ`.

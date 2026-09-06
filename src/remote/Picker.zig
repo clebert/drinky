@@ -11,8 +11,8 @@
 //!
 //! The message of the picker is scaffolding: it leaves the chat when the picker
 //! ends, so the result of the command stands in the chat once. Its title is a
-//! line that Drinky wrote, so it takes the quote bar and the information symbol
-//! through every step.
+//! line that Drinky wrote, so it takes the information symbol through every
+//! step.
 
 const std = @import("std");
 
@@ -421,9 +421,8 @@ test "a picker shows its rows as buttons with the current mark and a cancel, and
 
     try picker.show(&chat, &(try testPick(gpa, &.{ "low", "high" }, 1, null)));
     try std.testing.expect(picker.isOpen());
-    // The title is a line of Drinky, so it takes the quote bar and the
-    // information symbol.
-    try std.testing.expectEqualStrings("<blockquote>ℹ Effort</blockquote>", chat.sends.items[0].text);
+    // The title is a line of Drinky, so it takes the information symbol.
+    try std.testing.expectEqualStrings("ℹ Effort", chat.sends.items[0].text);
     try std.testing.expectEqualStrings(html.parse_mode, chat.sends.items[0].parse_mode.?);
     try std.testing.expectEqualStrings(
         "{\"inline_keyboard\":[[{\"text\":\"low\",\"callback_data\":\"row:1:0\"}]," ++
@@ -461,8 +460,8 @@ test "a step edits the same message, adds the back button, and a back takes the 
     try picker.step(&chat, &(try testPick(gpa, &.{ "Subscription", "API" }, null, openSecond)));
     try std.testing.expectEqual(@as(usize, 1), chat.sends.items.len);
     try std.testing.expectEqual(@as(?Attachment.Handle, 1), chat.lastEdit().handle);
-    // Every step keeps the wrapper of the title.
-    try std.testing.expectEqualStrings("<blockquote>ℹ Effort</blockquote>", chat.lastEdit().text);
+    // Every step keeps the symbol of the title.
+    try std.testing.expectEqualStrings("ℹ Effort", chat.lastEdit().text);
     try std.testing.expectEqualStrings(html.parse_mode, chat.lastEdit().parse_mode.?);
     try std.testing.expectEqualStrings(
         "{\"inline_keyboard\":[[{\"text\":\"Subscription\",\"callback_data\":\"row:2:0\"}]," ++
