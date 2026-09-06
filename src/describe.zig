@@ -96,8 +96,9 @@ pub fn compose(gpa: std.mem.Allocator, options: *const Options) ![]u8 {
 
 /// One row per command, from the registry that runs them. A row also names the
 /// line that runs the same command, such as the bare `/` of the command list, the
-/// text that the command takes, and the terminal where a command runs alone. The
-/// row then holds the whole shape of a line.
+/// text that the command takes, the terminal where a command runs alone, and the
+/// turn that hosts a command. The row then holds the whole shape of a line, and
+/// the closing sentences state the default of a row that says nothing.
 fn writeCommands(writer: *std.Io.Writer) !void {
     for (ai.command.summaries) |command| {
         try writer.print("- `/{s}` \u{2014} {s}.", .{ command.name, command.summary });
@@ -107,9 +108,14 @@ fn writeCommands(writer: *std.Io.Writer) !void {
             try writer.print(" It takes {s} as trailing text.", .{command.tail});
         if (!command.remote)
             try writer.writeAll(" It runs in the terminal alone, never from an attached Telegram bot.");
+        if (command.during_turn)
+            try writer.writeAll(" It runs during a turn too.");
         try writer.writeByte('\n');
     }
-    try writer.writeAll("\nEvery other command refuses text after its name.\n");
+    try writer.writeAll(
+        "\nA command refuses text after its name unless its row names trailing text. A command " ++
+            "waits for the end of a turn unless its row says that it runs during a turn.\n",
+    );
 }
 
 /// The key hints of the intro line, then the keys of the prompt and of a
@@ -203,6 +209,23 @@ test "the document states every command, key, and discovery rule" {
         "- `/login` \u{2014} sign in or switch the account. It runs in the terminal alone",
     ) != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "- `/new` \u{2014} clear the conversation and its usage stats.\n") != null);
+    // The status runs where no other command runs, so the model can name it
+    // to a user who waits on a turn. Its row states the run, and no other row
+    // does.
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        text,
+        "- `/status` \u{2014} show the state of the session. It runs during a turn too.\n",
+    ) != null);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        std.mem.count(u8, text, " It runs during a turn too."),
+    );
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        text,
+        "unless its row says that it runs during a turn",
+    ) != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "### Keys") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "`bash.timeout_ms`") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "/unused/config.json") != null);

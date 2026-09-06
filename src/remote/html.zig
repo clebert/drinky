@@ -14,9 +14,14 @@
 //! else on a line, else on a character inside a text node, never inside a tag or
 //! a character reference. A part closes every open tag at its end, and the next
 //! part opens them again, so a code block continues as a code block.
+//!
+//! `plain` turns the HTML back into text for a message that Telegram cannot
+//! parse: the tags go, a link keeps its target as text, and every character
+//! reference decodes once.
 
 const std = @import("std");
 
+const ai = @import("ai");
 const terminal = @import("terminal");
 
 const ui = @import("../ui/root.zig");
@@ -121,22 +126,36 @@ pub fn render(out: *std.Io.Writer, text: []const u8) !void {
     if (quoting) try out.writeAll("</blockquote>");
 }
 
-/// The look of a message that Drinky wrote about the session, as against an
-/// answer of the model. Each role takes its own symbol, and every one of them
-/// takes the quote bar, so no answer of the model can forge one.
+/// The look of a message that Drinky wrote, as against an answer of the model.
+/// Each role takes its symbol, and every one of them takes the quote bar, so no
+/// answer of the model can forge one.
 pub const Role = enum {
-    /// The state of the session.
-    event,
-    /// A failed event.
+    /// The state of the session, and the answer to a question about it.
+    information,
+    /// A refusal that the user can pass, now or after the named state ends.
+    warning,
+    /// A failure.
     failure,
-    /// A line that Drinky wrote for the user.
+    /// A line that Drinky wrote for the user: the head of a loaded skill and
+    /// the line of a retry attempt.
     note,
+
+    /// The role of a message with `severity`.
+    pub fn of(severity: ai.command.Outcome.Severity) Role {
+        return switch (severity) {
+            .information => .information,
+            .warning => .warning,
+            .failure => .failure,
+        };
+    }
 
     fn symbol(self: Role) []const u8 {
         return switch (self) {
-            .event => "ℹ",
-            .failure => "⚠",
-            .note => "▸",
+            .information => "ℹ",
+            // A warning and a failure share the symbol, and the severity keeps
+            // them apart on the way here.
+            .warning, .failure => "⚠",
+            .note => "→",
         };
     }
 };
@@ -155,6 +174,150 @@ pub fn wrapAlloc(gpa: std.mem.Allocator, role: Role, text: []const u8) ![]u8 {
     errdefer out.deinit();
     try wrap(&out.writer, role, text);
     return out.toOwnedSlice();
+}
+
+/// Write `source`, an HTML text of this module, as plain text: every tag goes,
+/// and every character reference decodes once. The renderer escaped every
+/// literal `<` and `&`, so a `<` opens a tag and an `&` opens a reference. A
+/// message that Telegram cannot parse goes out this way. Its quote bar goes with
+/// the tag, and its symbol stays, because the symbol is text. A link keeps its
+/// target as `label (url)`, unless the label is that URL, so the plain text
+/// loses no target.
+pub fn plain(out: *std.Io.Writer, source: []const u8) !void {
+    var rest = source;
+    // Every pass moves past one link, or to the end.
+    while (rest.len > 0) {
+        const link = Link.find(rest) orelse {
+            try plainText(out, rest);
+            break;
+        };
+        try plainText(out, rest[0..link.start]);
+        try plainText(out, link.label);
+        if (!link.bare()) {
+            try out.writeAll(" (");
+            try plainText(out, link.url);
+            try out.writeAll(")");
+        }
+        rest = rest[link.end..];
+    }
+}
+
+/// `source` as plain text. The result is owned.
+pub fn plainAlloc(gpa: std.mem.Allocator, source: []const u8) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    errdefer out.deinit();
+    try plain(&out.writer, source);
+    return out.toOwnedSlice();
+}
+
+/// Write `source` as plain text, with every tag gone and every character
+/// reference decoded once. A link inside loses its target here, so `plain`
+/// takes the links apart first.
+fn plainText(out: *std.Io.Writer, source: []const u8) !void {
+    var decoder: Decoder = .{ .source = source };
+    while (decoder.next()) |byte| try out.writeByte(byte);
+}
+
+/// The plain bytes of an HTML text, one at a time. A tag yields nothing, and a
+/// reference yields the bytes it names, or its own bytes for a reference that
+/// no writer of this module produces.
+const Decoder = struct {
+    source: []const u8,
+    index: usize = 0,
+    /// The plain bytes that the decoder read ahead and still owes.
+    pending: []const u8 = "",
+
+    /// The next plain byte, or null at the end.
+    fn next(self: *Decoder) ?u8 {
+        if (self.pending.len == 0) self.advance();
+        if (self.pending.len == 0) return null;
+        const byte = self.pending[0];
+        self.pending = self.pending[1..];
+        return byte;
+    }
+
+    /// Read the next plain bytes into `pending`: the text of one reference, or
+    /// one byte. A tag yields nothing, so the read moves past it. The end
+    /// leaves `pending` empty.
+    fn advance(self: *Decoder) void {
+        // Every pass moves past one tag.
+        while (self.index < self.source.len and self.source[self.index] == '<') {
+            const end = std.mem.indexOfScalarPos(u8, self.source, self.index, '>') orelse
+                self.source.len - 1;
+            self.index = end + 1;
+        }
+        if (self.index == self.source.len) return;
+        const start = self.index;
+        if (self.source[start] == '&') {
+            const end = std.mem.indexOfScalarPos(u8, self.source, start, ';') orelse
+                self.source.len - 1;
+            self.index = end + 1;
+            const reference = self.source[start..self.index];
+            self.pending = decodeReference(reference) orelse reference;
+            return;
+        }
+        self.index += 1;
+        self.pending = self.source[start..self.index];
+    }
+};
+
+/// One `<a>` element of the HTML that this module writes, with its target and
+/// its label still encoded.
+const Link = struct {
+    start: usize,
+    end: usize,
+    url: []const u8,
+    label: []const u8,
+
+    const open = "<a href=\"";
+    const close = "\">";
+    const end_tag = "</a>";
+
+    /// The first link in `source`, or null when it holds none. The renderer
+    /// writes every link whole, and a split keeps every tag whole, so a torn
+    /// link is no link.
+    fn find(source: []const u8) ?Link {
+        const start = std.mem.indexOf(u8, source, open) orelse return null;
+        const url_start = start + open.len;
+        const url_end = std.mem.indexOfScalarPos(u8, source, url_start, '"') orelse return null;
+        if (!std.mem.startsWith(u8, source[url_end..], close)) return null;
+        const label_start = url_end + close.len;
+        const label_end = std.mem.indexOfPos(u8, source, label_start, end_tag) orelse return null;
+        return .{
+            .start = start,
+            .end = label_end + end_tag.len,
+            .url = source[url_start..url_end],
+            .label = source[label_start..label_end],
+        };
+    }
+
+    /// Whether the label is the target itself, as for a bare URL. The two
+    /// compare decoded, because the attribute escapes the quote too and the
+    /// label can carry the tags of its own look.
+    fn bare(self: *const Link) bool {
+        var label: Decoder = .{ .source = self.label };
+        var url: Decoder = .{ .source = self.url };
+        while (label.next()) |byte| {
+            if (url.next() != byte) return false;
+        }
+        return url.next() == null;
+    }
+};
+
+/// The character references that the writers of this module produce, each with
+/// the text it names.
+const references = [_]struct { name: []const u8, text: []const u8 }{
+    .{ .name = "&amp;", .text = "&" },
+    .{ .name = "&lt;", .text = "<" },
+    .{ .name = "&gt;", .text = ">" },
+    .{ .name = "&quot;", .text = "\"" },
+};
+
+/// The text that `reference` names, or null for a reference that no writer of
+/// this module produces.
+fn decodeReference(reference: []const u8) ?[]const u8 {
+    for (references) |entry| if (std.mem.eql(u8, entry.name, reference)) return entry.text;
+    return null;
 }
 
 /// Write `text` with the three bytes escaped that Telegram HTML reserves.
@@ -557,14 +720,22 @@ fn expectRender(expected: []const u8, source: []const u8) !void {
 
 // Every message that Drinky wrote takes the quote bar and the symbol of its
 // role, so it cannot read as an answer of the model. The text goes out escaped,
-// because it is prose and not markup.
+// because it is prose and not markup. A warning and a failure share the symbol,
+// because the text must state a failure without its color, and the role keeps
+// the two apart.
 test "a message of Drinky takes the symbol of its role inside a quote" {
     const gpa = std.testing.allocator;
-    const event = try wrapAlloc(gpa, .event, "Drinky now uses claude-opus-5.");
-    defer gpa.free(event);
+    const information = try wrapAlloc(gpa, .information, "Drinky now uses claude-opus-5.");
+    defer gpa.free(information);
     try std.testing.expectEqualStrings(
         "<blockquote>ℹ Drinky now uses claude-opus-5.</blockquote>",
-        event,
+        information,
+    );
+    const warning = try wrapAlloc(gpa, .warning, "The command /login runs in the terminal alone.");
+    defer gpa.free(warning);
+    try std.testing.expectEqualStrings(
+        "<blockquote>⚠ The command /login runs in the terminal alone.</blockquote>",
+        warning,
     );
     const failure = try wrapAlloc(gpa, .failure, "Telegram rejected <a> & more.");
     defer gpa.free(failure);
@@ -574,7 +745,77 @@ test "a message of Drinky takes the symbol of its role inside a quote" {
     );
     const note = try wrapAlloc(gpa, .note, "Skill: zig-style");
     defer gpa.free(note);
-    try std.testing.expectEqualStrings("<blockquote>▸ Skill: zig-style</blockquote>", note);
+    try std.testing.expectEqualStrings("<blockquote>→ Skill: zig-style</blockquote>", note);
+    // The severity of a message names its role, one to one.
+    try std.testing.expectEqual(Role.information, Role.of(.information));
+    try std.testing.expectEqual(Role.warning, Role.of(.warning));
+    try std.testing.expectEqual(Role.failure, Role.of(.failure));
+}
+
+// A long message of Drinky splits like every other one. The symbol is text, so
+// the first part carries it, and every later part reopens the quote bar alone.
+test "a split message of Drinky carries its symbol on the first part alone" {
+    const gpa = std.testing.allocator;
+    const wrapped = try wrapAlloc(gpa, .information, "one two three four five six seven eight");
+    defer gpa.free(wrapped);
+    var list = try collectParts(gpa, wrapped, 20);
+    defer {
+        for (list.items) |part| gpa.free(part);
+        list.deinit(gpa);
+    }
+    const expected = [_][]const u8{
+        "<blockquote>ℹ one two three four</blockquote>",
+        "<blockquote> five six seven eigh</blockquote>",
+        "<blockquote>t</blockquote>",
+    };
+    try std.testing.expectEqual(expected.len, list.items.len);
+    for (expected, list.items) |want, got| try std.testing.expectEqualStrings(want, got);
+}
+
+// A text that Telegram cannot parse goes again as plain text. The tags go, so
+// the quote bar goes with them, and every reference decodes once, so a literal
+// `<b>` that the renderer escaped stays literal and a literal `&lt;` stays too.
+// A link keeps its target behind its label, so the plain text loses no target,
+// and a bare URL goes out once.
+test "the plain text of a message keeps its symbol and its literal text" {
+    const gpa = std.testing.allocator;
+    const cases = [_]struct { html: []const u8, plain: []const u8 }{
+        .{
+            .html = "<blockquote>⚠ Telegram rejected &lt;b&gt; &amp; more.</blockquote>",
+            .plain = "⚠ Telegram rejected <b> & more.",
+        },
+        .{
+            .html = "a &amp;lt;b&amp;gt; c &quot;quoted&quot;",
+            .plain = "a &lt;b&gt; c \"quoted\"",
+        },
+        .{
+            .html = "See <a href=\"https://example.com/?a=1&amp;b=2\">the docs</a>.",
+            .plain = "See the docs (https://example.com/?a=1&b=2).",
+        },
+        .{
+            .html = "<a href=\"https://example.com\"><b>docs</b></a>, <i>then</i> " ++
+                "<a href=\"https://example.com/2\">more</a>",
+            .plain = "docs (https://example.com), then more (https://example.com/2)",
+        },
+        // The label of a bare URL is its target. The two compare decoded,
+        // because the look of the label can nest a tag inside the link, and
+        // the attribute escapes a quote that the label keeps.
+        .{
+            .html = "<a href=\"https://example.com/bare\">https://example.com/bare</a> and " ++
+                "<a href=\"https://x.test/?q=&quot;a&quot;\"><b>https://x.test/?q=\"a\"</b></a>",
+            .plain = "https://example.com/bare and https://x.test/?q=\"a\"",
+        },
+        .{
+            .html = "<pre>const a = 1 &lt; 2;\n\n  indented</pre>\nend",
+            .plain = "const a = 1 < 2;\n\n  indented\nend",
+        },
+        .{ .html = "", .plain = "" },
+    };
+    for (cases) |case| {
+        const text = try plainAlloc(gpa, case.html);
+        defer gpa.free(text);
+        try std.testing.expectEqualStrings(case.plain, text);
+    }
 }
 
 test "a heading becomes a bold line, and the inline markers become tags" {

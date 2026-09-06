@@ -10,7 +10,9 @@
 //! serial the picker no longer holds, and the owner answers it as stale.
 //!
 //! The message of the picker is scaffolding: it leaves the chat when the picker
-//! ends, so the result of the command stands in the chat once.
+//! ends, so the result of the command stands in the chat once. Its title is a
+//! line that Drinky wrote, so it takes the quote bar and the information symbol
+//! through every step.
 
 const std = @import("std");
 
@@ -18,6 +20,7 @@ const ai = @import("ai");
 
 const Attachment = @import("Attachment.zig");
 const Client = @import("Client.zig");
+const html = @import("html.zig");
 const keyboard = @import("keyboard.zig");
 
 const Picker = @This();
@@ -105,8 +108,11 @@ pub fn show(self: *Picker, chat: anytype, pick: *const ai.command.Outcome.Pick) 
     errdefer open.deinit(self.gpa);
     const markup = try self.buildMarkup(&open, pick.current);
     defer self.gpa.free(markup);
-    open.handle = try chat.sendTracked(open.title, &.{
+    const title = try html.wrapAlloc(self.gpa, .information, open.title);
+    defer self.gpa.free(title);
+    open.handle = try chat.sendTracked(title, &.{
         .disable_notification = true,
+        .parse_mode = html.parse_mode,
         .markup = markup,
     });
     self.open = open;
@@ -150,7 +156,12 @@ pub fn replace(
     errdefer open.deinit(self.gpa);
     const markup = try self.buildMarkup(&open, pick.current);
     defer self.gpa.free(markup);
-    if (open.handle) |handle| try chat.edit(handle, open.title, markup);
+    const title = try html.wrapAlloc(self.gpa, .information, open.title);
+    defer self.gpa.free(title);
+    if (open.handle) |handle| try chat.edit(handle, title, &.{
+        .parse_mode = html.parse_mode,
+        .markup = markup,
+    });
     above.deinit(self.gpa);
     self.open = open;
 }
@@ -302,6 +313,7 @@ const Recorder = struct {
     const Message = struct {
         handle: ?Attachment.Handle,
         text: []u8,
+        parse_mode: ?[]const u8,
         markup: ?[]u8,
 
         fn deinit(self: *const Message, gpa: std.mem.Allocator) void {
@@ -325,7 +337,8 @@ const Recorder = struct {
     ) !?Attachment.Handle {
         const handle = self.handle_next;
         self.handle_next += 1;
-        try self.sends.append(self.gpa, try self.record(handle, text, options.markup));
+        const message = try self.record(handle, text, options.parse_mode, options.markup);
+        try self.sends.append(self.gpa, message);
         return handle;
     }
 
@@ -333,9 +346,10 @@ const Recorder = struct {
         self: *Recorder,
         handle: Attachment.Handle,
         text: []const u8,
-        markup: ?[]const u8,
+        options: *const Client.EditOptions,
     ) !void {
-        try self.edits.append(self.gpa, try self.record(handle, text, markup));
+        const message = try self.record(handle, text, options.parse_mode, options.markup);
+        try self.edits.append(self.gpa, message);
     }
 
     fn delete(self: *Recorder, handle: Attachment.Handle) !void {
@@ -346,12 +360,18 @@ const Recorder = struct {
         self: *Recorder,
         handle: ?Attachment.Handle,
         text: []const u8,
+        parse_mode: ?[]const u8,
         markup: ?[]const u8,
     ) !Message {
         const text_copy = try self.gpa.dupe(u8, text);
         errdefer self.gpa.free(text_copy);
         const markup_copy: ?[]u8 = if (markup) |json| try self.gpa.dupe(u8, json) else null;
-        return .{ .handle = handle, .text = text_copy, .markup = markup_copy };
+        return .{
+            .handle = handle,
+            .text = text_copy,
+            .parse_mode = parse_mode,
+            .markup = markup_copy,
+        };
     }
 
     fn lastEdit(self: *const Recorder) *const Message {
@@ -401,7 +421,10 @@ test "a picker shows its rows as buttons with the current mark and a cancel, and
 
     try picker.show(&chat, &(try testPick(gpa, &.{ "low", "high" }, 1, null)));
     try std.testing.expect(picker.isOpen());
-    try std.testing.expectEqualStrings("Effort", chat.sends.items[0].text);
+    // The title is a line of Drinky, so it takes the quote bar and the
+    // information symbol.
+    try std.testing.expectEqualStrings("<blockquote>ℹ Effort</blockquote>", chat.sends.items[0].text);
+    try std.testing.expectEqualStrings(html.parse_mode, chat.sends.items[0].parse_mode.?);
     try std.testing.expectEqualStrings(
         "{\"inline_keyboard\":[[{\"text\":\"low\",\"callback_data\":\"row:1:0\"}]," ++
             "[{\"text\":\"✓ high\",\"callback_data\":\"row:1:1\"}]," ++
@@ -438,6 +461,9 @@ test "a step edits the same message, adds the back button, and a back takes the 
     try picker.step(&chat, &(try testPick(gpa, &.{ "Subscription", "API" }, null, openSecond)));
     try std.testing.expectEqual(@as(usize, 1), chat.sends.items.len);
     try std.testing.expectEqual(@as(?Attachment.Handle, 1), chat.lastEdit().handle);
+    // Every step keeps the wrapper of the title.
+    try std.testing.expectEqualStrings("<blockquote>ℹ Effort</blockquote>", chat.lastEdit().text);
+    try std.testing.expectEqualStrings(html.parse_mode, chat.lastEdit().parse_mode.?);
     try std.testing.expectEqualStrings(
         "{\"inline_keyboard\":[[{\"text\":\"Subscription\",\"callback_data\":\"row:2:0\"}]," ++
             "[{\"text\":\"API\",\"callback_data\":\"row:2:1\"}]," ++

@@ -21,6 +21,7 @@ const new = @import("new.zig");
 const remote = @import("remote.zig");
 const skill = @import("skill.zig");
 const sources = @import("sources.zig");
+const status = @import("status.zig");
 const system = @import("system.zig");
 const testing = @import("testing.zig");
 
@@ -33,6 +34,10 @@ const Entry = struct {
     /// Whether a remote host runs the command. A command that opens a page, an
     /// editor prompt, or the credential flow of the terminal runs there alone.
     remote: bool,
+    /// Whether a turn hosts the command. A command that reads a snapshot and
+    /// opens no picker can run while a turn runs, and every other command
+    /// waits for the end of the turn.
+    during_turn: bool,
 };
 
 /// The command that lists every other command. The bare `/` opens it too. The
@@ -48,16 +53,83 @@ const whitespace = " \t\r\n";
 
 /// Every command, in the order the command list shows them.
 const commands = [_]Entry{
-    .{ .name = effort.name, .summary = effort.summary, .run = effort.run, .remote = true },
-    .{ .name = help_name, .summary = help_summary, .run = runHelp, .remote = true },
-    .{ .name = login.name, .summary = login.summary, .run = login.run, .remote = false },
-    .{ .name = logout.name, .summary = logout.summary, .run = logout.run, .remote = false },
-    .{ .name = model.name, .summary = model.summary, .run = model.run, .remote = true },
-    .{ .name = new.name, .summary = new.summary, .run = new.run, .remote = true },
-    .{ .name = remote.name, .summary = remote.summary, .run = remote.run, .remote = false },
-    .{ .name = skill.name, .summary = skill.summary, .run = skill.run, .remote = true },
-    .{ .name = sources.name, .summary = sources.summary, .run = sources.run, .remote = false },
-    .{ .name = system.name, .summary = system.summary, .run = system.run, .remote = false },
+    .{
+        .name = effort.name,
+        .summary = effort.summary,
+        .run = effort.run,
+        .remote = true,
+        .during_turn = false,
+    },
+    .{
+        .name = help_name,
+        .summary = help_summary,
+        .run = runHelp,
+        .remote = true,
+        .during_turn = false,
+    },
+    .{
+        .name = login.name,
+        .summary = login.summary,
+        .run = login.run,
+        .remote = false,
+        .during_turn = false,
+    },
+    .{
+        .name = logout.name,
+        .summary = logout.summary,
+        .run = logout.run,
+        .remote = false,
+        .during_turn = false,
+    },
+    .{
+        .name = model.name,
+        .summary = model.summary,
+        .run = model.run,
+        .remote = true,
+        .during_turn = false,
+    },
+    .{
+        .name = new.name,
+        .summary = new.summary,
+        .run = new.run,
+        .remote = true,
+        .during_turn = false,
+    },
+    .{
+        .name = remote.name,
+        .summary = remote.summary,
+        .run = remote.run,
+        .remote = false,
+        .during_turn = false,
+    },
+    .{
+        .name = skill.name,
+        .summary = skill.summary,
+        .run = skill.run,
+        .remote = true,
+        .during_turn = false,
+    },
+    .{
+        .name = sources.name,
+        .summary = sources.summary,
+        .run = sources.run,
+        .remote = false,
+        .during_turn = false,
+    },
+    .{
+        .name = status.name,
+        .summary = status.summary,
+        .run = status.run,
+        .remote = true,
+        .during_turn = true,
+    },
+    .{
+        .name = system.name,
+        .summary = system.summary,
+        .run = system.run,
+        .remote = false,
+        .during_turn = false,
+    },
 };
 
 // The table is the order of the list, and the list reads best in one
@@ -83,6 +155,9 @@ pub const Summary = struct {
     /// Whether a remote host runs the command, so a host that registers the
     /// commands of a chat lists this one.
     remote: bool,
+    /// Whether a turn hosts the command, so a host can name it to a user who
+    /// waits on a turn.
+    during_turn: bool,
 };
 
 /// The name and the summary of every command, in the order of the table. A host
@@ -95,6 +170,7 @@ pub const summaries = blk: {
         .summary = entry.summary,
         .alias = aliasOf(entry.name),
         .remote = entry.remote,
+        .during_turn = entry.during_turn,
     };
     // The skill prefix is no table entry, because it takes an argument tail. Its
     // summary is its own on purpose: the `skill` entry states the list that the
@@ -104,6 +180,7 @@ pub const summaries = blk: {
         .summary = "load one named skill",
         .tail = "the task of the skill",
         .remote = true,
+        .during_turn = false,
     };
     break :blk list;
 };
@@ -140,6 +217,15 @@ pub fn parse(line: []const u8) ?[]const u8 {
     const body = line[1..];
     const end = std.mem.indexOfAny(u8, body, whitespace) orelse body.len;
     return body[0..end];
+}
+
+/// Whether a turn hosts the command `name`. A caller with a running turn refuses
+/// every other command line after `check` accepted it, so a line the registry
+/// cannot run as typed keeps its own refusal. A skill line waits like every
+/// other command, because it starts a turn. `name` must come from `parse(line)`.
+pub fn runsDuringTurn(name: []const u8) bool {
+    const entry = lookup(name) orelse return false;
+    return entry.during_turn;
 }
 
 /// Whether `name` names the command that expands a skill into a generated request.
@@ -255,8 +341,8 @@ pub fn run(context: *Context, line: []const u8) !?Outcome {
 /// `The command /name cannot run …`, as in `while a turn runs`.
 ///
 /// The severity is a warning, not a failure: the line stays complete, and the next
-/// Enter runs it once the restriction ends. A failure carries the red `Error:`
-/// prefix, which reads as a broken turn while a reply streams.
+/// Enter runs it once the restriction ends. A failure paints red, which reads as a
+/// broken turn while a reply streams.
 pub fn refuse(
     gpa: std.mem.Allocator,
     name: []const u8,
@@ -429,6 +515,32 @@ test "run routes sources" {
         .accounts = undefined,
     };
     try std.testing.expect((try run(&context, "/sources")).? == .show_sources);
+}
+
+test "run routes status" {
+    var context: Context = .{
+        .gpa = undefined,
+        .io = undefined,
+        .agent = undefined,
+        .accounts = undefined,
+    };
+    try std.testing.expect((try run(&context, "/status")).? == .show_status);
+}
+
+// The table holds the one command that a turn hosts, so the app and the document
+// that describes Drinky read the same answer. A list line, a skill line, and an
+// unknown name wait like every other command.
+test "the registry names the command that runs during a turn" {
+    try std.testing.expect(runsDuringTurn("status"));
+    const waiting = [_][]const u8{
+        "effort", "help", "new", "skill", "", "skill:", "skill:demo", "nope",
+    };
+    for (waiting) |name| try std.testing.expect(!runsDuringTurn(name));
+    var hosted: usize = 0;
+    for (summaries) |command| {
+        if (command.during_turn) hosted += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), hosted);
 }
 
 test "trailing whitespace does not hide an unknown command name" {
@@ -639,7 +751,9 @@ test "a remote host runs the commands that need no terminal" {
     try Outcome.expectRefusalContaining((try run(&context, "/nope")).?, .warning, "does not recognize");
     try std.testing.expect((try check(&context, "/effort")) == null);
     try std.testing.expect((try check(&context, "/new")) == null);
+    try std.testing.expect((try check(&context, "/status")) == null);
     try std.testing.expect((try run(&context, "/new")).? == .new_conversation);
+    try std.testing.expect((try run(&context, "/status")).? == .show_status);
 
     // The list holds the runnable commands alone, and its rows index that list.
     switch ((try run(&context, "/help")).?) {
@@ -648,13 +762,15 @@ test "a remote host runs the commands that need no terminal" {
                 for (pick.options) |option| gpa.free(option);
                 gpa.free(pick.options);
             }
-            try std.testing.expectEqual(@as(usize, 4), pick.options.len);
+            try std.testing.expectEqual(@as(usize, 5), pick.options.len);
             try std.testing.expect(std.mem.startsWith(u8, pick.options[0], "/effort"));
             try std.testing.expect(std.mem.startsWith(u8, pick.options[1], "/model"));
             try std.testing.expect(std.mem.startsWith(u8, pick.options[2], "/new"));
             try std.testing.expect(std.mem.startsWith(u8, pick.options[3], "/skill"));
+            try std.testing.expect(std.mem.startsWith(u8, pick.options[4], "/status"));
             try std.testing.expect((try pick.select(&context, 2)) == .new_conversation);
-            try Outcome.expectNoticeContaining(try pick.select(&context, 4), .failure, "valid command");
+            try std.testing.expect((try pick.select(&context, 4)) == .show_status);
+            try Outcome.expectNoticeContaining(try pick.select(&context, 5), .failure, "valid command");
         },
         else => return error.ExpectedPick,
     }
@@ -663,5 +779,5 @@ test "a remote host runs the commands that need no terminal" {
     for (summaries) |command| {
         if (command.remote and command.tail.len == 0) registered += 1;
     }
-    try std.testing.expectEqual(@as(usize, 5), registered);
+    try std.testing.expectEqual(@as(usize, 6), registered);
 }

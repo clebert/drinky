@@ -72,6 +72,12 @@ pub const Outcome = union(enum) {
     /// Show the instruction files, the skills, and the required skills that the
     /// app loaded at startup.
     show_sources,
+    /// State the session in full: the place, the numbers, and the agent, as the
+    /// status line states them. The app composes the answer from its own
+    /// snapshot and answers the channel that asked, in the terminal or in a
+    /// chat. It is the one command that runs during a turn, because it reads a
+    /// snapshot and opens no picker.
+    show_status,
     /// Show the complete provider-neutral system prompt assembled by the app.
     show_system_prompt,
     /// Attach the saved Telegram bot at this index of `Context.remote_bots`.

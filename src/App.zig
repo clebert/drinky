@@ -1747,11 +1747,11 @@ fn clearOrCancel(self: *App) !void {
     try self.cancelTurn();
 }
 
-/// Enter during a turn: queue the line as steering. No command runs mid-turn,
-/// because a command can open a picker that a turn cannot host. A line the
-/// registry cannot run as typed keeps its refusal, which arms one Enter to queue
-/// it as steering. A runnable command has no such arm, because the next Enter
-/// runs it once the turn ends.
+/// Enter during a turn: queue the line as steering. No command but `/status`
+/// runs mid-turn, because a command can open a picker that a turn cannot host.
+/// A line the registry cannot run as typed keeps its refusal, which arms one
+/// Enter to queue it as steering. A runnable command has no such arm, because
+/// the next Enter runs it once the turn ends.
 fn submitSteering(self: *App) !void {
     if (self.session.editor.blank()) {
         self.session.cancelConfirmation(.message);
@@ -1763,6 +1763,10 @@ fn submitSteering(self: *App) !void {
         if (ai.command.parse(text)) |name| {
             if (try self.checkCommand(text)) |refusal|
                 return self.armMessageSend(refusal, "Queue as a message");
+            if (ai.command.runsDuringTurn(name)) {
+                if (try self.dispatchCommand(text)) |outcome|
+                    return self.applySubmittedCommand(outcome);
+            }
             return self.refuseCommand(name, "while a turn runs");
         }
     }
@@ -2325,11 +2329,13 @@ fn applyOutcome(self: *App, outcome: ai.command.Outcome) !void {
             self.clearRetry();
             // The attach event brackets every Telegram message, and the clear
             // took it, so the new conversation opens on a bracket of its own.
-            // The mirror starts over at it, so the chat gets it first.
+            // The mirror starts over at it, so the chat gets it first. The
+            // sentence names the model conversation, which the clear emptied,
+            // and not the chat, which keeps every message.
             if (self.controller.listens()) try self.recordEvent(
                 .information,
-                "New conversation{s}Remote: @{s}",
-                .{ ui.paint.separator, self.controller.botUsername().? },
+                "You cleared the conversation while @{s} is attached.",
+                .{self.controller.botUsername().?},
             );
         },
         // Only `submit` produces a prompt outcome (from a typed `/skill:` line),
@@ -2361,6 +2367,10 @@ fn applyOutcome(self: *App, outcome: ai.command.Outcome) !void {
         // The fetch starts and changes nothing yet, so no mirror runs. Its
         // result arrives through `finishFetch`, which applies its own outcome.
         .fetch => |account| return self.startFetch(account),
+        // The answer reads the snapshot of the session and changes nothing, so
+        // no mirror runs. A turn can run meanwhile, and the mirror below reads
+        // the agent that the worker writes.
+        .show_status => return self.recordStatus(),
         .remote_attach => |index| return self.controller.attachSaved(index),
         .remote_add => {
             // Enter hands the text to the pairing, so the token prompt opens on
@@ -2968,14 +2978,15 @@ fn takeRemoteTitle(self: *App, username: []const u8) !void {
     self.remote_title = title;
 }
 
-/// Record the attach event, which states the session and is the first message
-/// of the chat, and start the mirror behind it. The editor is empty by then,
-/// because the `/remote` line went with the command. The event goes to the chat
-/// at once, also while a reply streams and the transcript defers it, so the
-/// block carries no mirror flag and the mirror sends it no second time.
+/// Record the attach event, which is the first message of the chat, and start
+/// the mirror behind it. The event names the bot alone, and `/status` states the
+/// session on request. The editor is empty by then, because the `/remote` line
+/// went with the command. The event goes to the chat at once, also while a
+/// reply streams and the transcript defers it, so the block carries no mirror
+/// flag and the mirror sends it no second time.
 fn openChat(self: *App, username: []const u8) !void {
     self.session.clearNotice();
-    const text = try self.attachEventText(username);
+    const text = try std.fmt.allocPrint(self.gpa, "You attached @{s}.", .{username});
     defer self.gpa.free(text);
     try self.recordAsyncEvent(.information, .{ .mirrored = false }, "{s}", .{text});
     try self.controller.sendEvent(.information, text);
@@ -3068,23 +3079,36 @@ fn settleChatMessages(self: *App, receipt: *const ai.Agent.Receipt) !void {
     }
 }
 
-/// The attach event: the bot, then the state of the session in the words and
-/// the order of the status line. The place takes its full label and its branch,
-/// because the chat has no column budget and a Herdr pane hides both from the
-/// line alone.
-fn attachEventText(self: *App, username: []const u8) ![]u8 {
+/// The answer of `/status`: the state of the session now, in the words and the
+/// order of the status line and in full. The numbers come from the snapshot of
+/// the session, which the worker never writes, so the answer is safe during a
+/// turn. The place takes its whole label and its branch, because the answer has
+/// no column budget and a Herdr pane hides both from the line alone. The result
+/// is owned.
+fn statusText(self: *App) ![]u8 {
     var info = self.session.statusInfo();
     info.directory = self.directory_label;
-    // A pane leaves the branch unread, so the event reads the head itself.
+    // A pane leaves the branch unread, so the answer reads the head itself.
     var maybe_head: ?ai.project.Head = null;
     if (self.project_instructions.projectRoot()) |root|
         maybe_head = ai.project.head(self.gpa, self.io, root);
     info.branch = if (maybe_head) |*head| head.name() else null;
     var out: std.Io.Writer.Allocating = .init(self.gpa);
     defer out.deinit();
-    try out.writer.print("Remote: @{s}{s}", .{ username, ui.paint.separator });
     try ui.status.writeSummary(&out.writer, &info);
     return out.toOwnedSlice();
+}
+
+/// Answer `/status` in the terminal: one event that states the session now. It
+/// stays in the terminal, because the chat asks with a line of its own. A reply
+/// that streams defers it to the next message boundary, and every request takes
+/// a block of its own, because each one states its own moment.
+fn recordStatus(self: *App) !void {
+    const text = try self.statusText();
+    try self.session.recordAsyncEvent(
+        .{ .content = text, .severity = .information },
+        .{ .mirrored = false, .repeats = false },
+    );
 }
 
 /// Show the pairing in the `/remote` picker: a wait row for the token check,
@@ -3198,16 +3222,24 @@ fn reportRemoteNotice(self: *App) !void {
 /// editor, and a refusal answers the message in the chat.
 fn submitChatMessage(self: *App, text: []const u8, message_id: i64) !void {
     var context = self.chatContext();
+    const origin: ChatOrigin = .{ .message = .{ .id = message_id, .text = text } };
     switch (self.session.mode) {
         .turn => {
-            // No command runs mid-turn, as in the terminal. The registry
-            // decides first there too, so a line it cannot run as typed keeps
-            // its own refusal instead of the one that names the turn.
+            // No command but the status runs mid-turn, as in the terminal. The
+            // registry decides first there too, so a line it cannot run as
+            // typed keeps its own refusal instead of the one that names the turn.
             if (ai.command.parse(text)) |name| {
-                const refusal = (try ai.command.check(&context, text)) orelse
-                    try ai.command.refuse(self.gpa, name, "while a turn runs");
+                if (try ai.command.check(&context, text)) |refusal| {
+                    defer self.gpa.free(refusal.content);
+                    return self.controller.reply(message_id, refusal.severity, refusal.content);
+                }
+                if (ai.command.runsDuringTurn(name)) {
+                    const outcome = (try ai.command.run(&context, text)).?;
+                    return self.applyChatOutcome(outcome, origin);
+                }
+                const refusal = try ai.command.refuse(self.gpa, name, "while a turn runs");
                 defer self.gpa.free(refusal.content);
-                return self.controller.reply(message_id, refusal.content);
+                return self.controller.reply(message_id, refusal.severity, refusal.content);
             }
             // The draft and the slot come first, so the channel push is the last
             // fallible step before the session takes the message. The mark of a
@@ -3227,6 +3259,7 @@ fn submitChatMessage(self: *App, text: []const u8, message_id: i64) !void {
         // meets one anyway, because a message must never end the session.
         .picking, .viewing => return self.controller.reply(
             message_id,
+            .warning,
             "Drinky cannot take a message now.",
         ),
     }
@@ -3236,13 +3269,15 @@ fn submitChatMessage(self: *App, text: []const u8, message_id: i64) !void {
     if (ai.command.parse(text) != null) {
         if (try ai.command.check(&context, text)) |refusal| {
             defer self.gpa.free(refusal.content);
-            return self.controller.reply(message_id, refusal.content);
+            return self.controller.reply(message_id, refusal.severity, refusal.content);
         }
         const outcome = (try ai.command.run(&context, text)).?;
-        return self.applyChatOutcome(outcome, .{ .message = .{ .id = message_id, .text = text } });
+        return self.applyChatOutcome(outcome, origin);
     }
-    if (!self.signedIn()) return self.controller.reply(message_id, telegram_signed_out_refusal);
-    if (self.agent.model == null) return self.controller.reply(message_id, telegram_no_model_refusal);
+    if (!self.signedIn())
+        return self.controller.reply(message_id, .failure, telegram_signed_out_refusal);
+    if (self.agent.model == null)
+        return self.controller.reply(message_id, .failure, telegram_no_model_refusal);
     // The draft comes first, so no fallible step stands between the turn start
     // and the retained prompt. The prompt then follows the rule of a queued
     // Telegram message: it fills no editor while the bot holds the input, and it
@@ -3294,7 +3329,7 @@ fn applyChatOutcome(self: *App, outcome: ai.command.Outcome, origin: ChatOrigin)
         },
         .notice, .refusal => |message| {
             defer self.gpa.free(message.content);
-            try self.stateChatNotice(origin, message.content);
+            try self.stateChatNotice(origin, message.severity, message.content);
         },
         .event => |message| {
             // The session frees the content below, so a failure before it does.
@@ -3308,21 +3343,30 @@ fn applyChatOutcome(self: *App, outcome: ai.command.Outcome, origin: ChatOrigin)
             try self.stateChatResult(origin);
             try self.applyOutcome(outcome);
         },
+        // The answer reaches the chat alone, because the chat asked. The
+        // terminal keeps its own line for its own request.
+        .show_status => {
+            const text = try self.statusText();
+            defer self.gpa.free(text);
+            try self.stateChatAnswer(origin, text);
+        },
         .prompt => |prompt| {
             defer prompt.deinit(self.gpa);
-            if (!self.signedIn()) return self.stateChatNotice(origin, telegram_signed_out_refusal);
-            if (self.agent.model == null) return self.stateChatNotice(origin, telegram_no_model_refusal);
+            if (!self.signedIn())
+                return self.stateChatNotice(origin, .failure, telegram_signed_out_refusal);
+            if (self.agent.model == null)
+                return self.stateChatNotice(origin, .failure, telegram_no_model_refusal);
             try self.startChatSkillTurn(&prompt, origin);
         },
         // The chat has no editor, and the registry loads a picked skill at once,
         // so no line arrives here. The arm frees one that does.
         .editor_text => |text| {
             defer self.gpa.free(text);
-            try self.stateChatNotice(origin, terminal_only_action);
+            try self.stateChatNotice(origin, .warning, terminal_only_action);
         },
         // The registry refused every command that reaches the terminal, so
         // this states the one fact that holds for the rest.
-        else => try self.stateChatNotice(origin, terminal_only_action),
+        else => try self.stateChatNotice(origin, .warning, terminal_only_action),
     }
 }
 
@@ -3357,14 +3401,34 @@ fn startChatSkillTurn(
 }
 
 /// State a notice of the chat where its origin shows it: as a reply to the
-/// message, or as a toast to the tap. A notice is short-lived, so the toast
-/// states it and the message of the picker goes.
-fn stateChatNotice(self: *App, origin: ChatOrigin, text: []const u8) !void {
+/// message under the role of `severity`, or as a toast to the tap. A notice is
+/// short-lived, so the toast states it and the message of the picker goes. A
+/// toast carries no symbol, so the severity reaches the reply alone.
+fn stateChatNotice(
+    self: *App,
+    origin: ChatOrigin,
+    severity: ai.command.Outcome.Severity,
+    text: []const u8,
+) !void {
     switch (origin) {
-        .message => |line| try self.controller.reply(line.id, text),
+        .message => |line| try self.controller.reply(line.id, severity, text),
         .tap => |query_id| {
             try self.controller.answer(query_id, text);
             try self.chat_picker.dismiss(&self.controller);
+        },
+    }
+}
+
+/// Answer a question of the chat with `text`: as a reply to the message, or as a
+/// message of its own after a tap, whose picker goes. An answer is too long for
+/// a toast, and it states the session, so it takes the information role.
+fn stateChatAnswer(self: *App, origin: ChatOrigin, text: []const u8) !void {
+    switch (origin) {
+        .message => |line| try self.controller.reply(line.id, .information, text),
+        .tap => |query_id| {
+            try self.controller.answer(query_id, null);
+            try self.chat_picker.dismiss(&self.controller);
+            try self.controller.sendEvent(.information, text);
         },
     }
 }
@@ -5381,6 +5445,147 @@ test "mid-turn Enter queues a message but refuses a slash line or a blank line" 
     }
     try std.testing.expectEqual(@as(usize, 1), taken.len);
     try std.testing.expectEqualStrings("the account matters too", taken[0]);
+}
+
+/// The status answer of the test app: no place, because the test names no
+/// directory, then the numbers and the agent of its signed-in session.
+const test_status_line = "Context: 0% (0/1.0M) · Cost: ~$0.00 · claude-opus-5 (Anthropic " ++
+    "Subscription) · Effort: low";
+
+// The status answer reads the snapshot of the session and opens no picker, so it
+// is the one command that a turn hosts. Its event stays in the terminal, because
+// a chat asks with a line of its own, and every request takes a line of its own,
+// because each one states its own moment.
+test "/status records one terminal event for each request, also during a turn" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    defer app.input.deinit();
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = test_anthropic_model,
+        .system = "",
+        .retry = .{},
+        .environ = .empty,
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
+    defer app.session.deinit();
+
+    // At the prompt the command runs like every other one: it clears the
+    // editor and records its answer, which no mirror sends.
+    try app.handleKeys("/status\r");
+    try std.testing.expect(app.session.mode == .prompt);
+    try std.testing.expectEqualStrings("", app.session.editor.visible());
+    try std.testing.expectEqual(@as(usize, 1), app.session.transcript.blocks().len);
+    const first = &app.session.transcript.blocks()[0].content.event;
+    try std.testing.expectEqualStrings(test_status_line, first.text.items);
+    try std.testing.expect(!first.is_error);
+    try std.testing.expect(!first.mirrored);
+    try std.testing.expect(first.survives_rewind);
+
+    // A second request appends a line of its own, with no fold into a count.
+    try app.handleKeys("/status\r");
+    try std.testing.expectEqual(@as(usize, 2), app.session.transcript.blocks().len);
+    try std.testing.expectEqualStrings(test_status_line, app.lastEventText());
+
+    // During a turn every other command waits, and the status runs. It leaves
+    // the turn, the queue, and the waiting retry as they stand.
+    app.session.beginTurn(1);
+    app.retry = .{ .failure = try gpa.dupe(u8, "an older failure") };
+    defer app.dropRetry();
+    try app.handleKeys("/effort\r");
+    try std.testing.expectEqualStrings("/effort", app.session.editor.visible());
+    try std.testing.expectEqualStrings(
+        "The command /effort cannot run while a turn runs.",
+        app.session.notice.?.content,
+    );
+    app.session.editor.clear();
+    try app.handleKeys("/status\r");
+    try std.testing.expect(app.session.mode == .turn);
+    try std.testing.expectEqualStrings("", app.session.editor.visible());
+    try std.testing.expectEqual(@as(usize, 3), app.session.transcript.blocks().len);
+    try std.testing.expectEqualStrings(test_status_line, app.lastEventText());
+    try std.testing.expect(!app.session.hasSteering());
+    try std.testing.expect(app.retry != null);
+    const queued = try app.agent.steering.take();
+    defer gpa.free(queued);
+    try std.testing.expectEqual(@as(usize, 0), queued.len);
+    // The registry keeps its own rules: a tail refuses and offers the queue.
+    try app.handleKeys("/status now\r");
+    try std.testing.expectEqualStrings("/status now", app.session.editor.visible());
+    try std.testing.expectEqualStrings(
+        "Enter: Queue as a message · The command /status takes no argument.",
+        app.session.notice.?.content,
+    );
+    try std.testing.expectEqual(@as(usize, 3), app.session.transcript.blocks().len);
+}
+
+// A request during a streamed reply captures the state at once, and its event
+// waits for the next message boundary, so the reply stays one block. The event
+// reports the session and not the turn, so a failed turn keeps it while the
+// reply rewinds.
+test "a terminal status event neither splits a streamed reply nor disappears after a failed turn" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    defer app.input.deinit();
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = test_anthropic_model,
+        .system = "",
+        .retry = .{},
+        .environ = .empty,
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
+    defer app.session.deinit();
+    app.session.beginTurn(1);
+
+    var opening = [_]UiEvent{.{ .turn = .{
+        .generation = 1,
+        .progress_sequence = 1,
+        .payload = .{ .text = try gpa.dupe(u8, "partial ") },
+    } }};
+    _ = try app.applyBatch(&opening);
+    try app.handleKeys("/status\r");
+    try std.testing.expectEqualStrings("", app.session.editor.visible());
+    try std.testing.expectEqual(@as(usize, 1), app.session.transcript.blocks().len);
+    var closing = [_]UiEvent{.{ .turn = .{
+        .generation = 1,
+        .progress_sequence = 2,
+        .payload = .{ .text = try gpa.dupe(u8, "answer") },
+    } }};
+    _ = try app.applyBatch(&closing);
+    try std.testing.expectEqual(@as(usize, 1), app.session.transcript.blocks().len);
+    try std.testing.expectEqualStrings(
+        "partial answer",
+        app.session.transcript.blocks()[0].content.model.items,
+    );
+
+    // The turn fails before a commit: the reply rewinds, the failure lands, and
+    // the status event lands behind it.
+    var result: WorkerResult = .{
+        .outcome = .{ .receipt = zero_receipt, .disposition = .{ .failed = error.ApiError } },
+        .error_text = try gpa.dupe(u8, "The provider refused the request."),
+    };
+    defer app.freeWorkerResult(&result);
+    try app.finishWorkerResult(&result);
+    try std.testing.expect(app.session.mode == .prompt);
+    const blocks = app.session.transcript.blocks();
+    try std.testing.expectEqual(@as(usize, 2), blocks.len);
+    try std.testing.expectEqualStrings(
+        "The provider refused the request.",
+        blocks[0].content.event.text.items,
+    );
+    try std.testing.expectEqualStrings(test_status_line, blocks[1].content.event.text.items);
+    try std.testing.expect(!blocks[1].content.event.mirrored);
 }
 
 test "late placeholder steering returns before a newer key in the same batch" {
@@ -8985,9 +9190,9 @@ test showProject {
 }
 
 // A Herdr pane hides the place from the status line, because the pane shows it.
-// The attach event goes to a chat that sees no pane, so it states the full place
-// with the branch there too.
-test "the attach event states the branch inside a Herdr pane" {
+// The status answer is one line that stands on its own in the chat and in a
+// copy, so it states the full place with the branch there too.
+test "the status answer states the branch inside a Herdr pane" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -9010,10 +9215,18 @@ test "the attach event states the branch inside a Herdr pane" {
     app.project_instructions = try ai.instructions.discover(gpa, io, root);
     defer app.project_instructions.deinit();
     app.showProject(true);
+    try std.testing.expectEqualStrings("", app.session.directory_shown);
+    try std.testing.expect(app.session.branch() == null);
 
-    const text = try app.attachEventText("drinky_bot");
+    // The answer carries no bot name, because the state of the session is the
+    // same under every bot and under none.
+    const text = try app.statusText();
     defer gpa.free(text);
-    try std.testing.expect(std.mem.startsWith(u8, text, "Remote: @drinky_bot · ~/project (topic) · "));
+    try std.testing.expectEqualStrings(
+        "~/project (topic) · Context: 0% (0/1.0M) · Cost: ~$0.00 · claude-opus-5 (Anthropic " ++
+            "Subscription) · Effort: low",
+        text,
+    );
 }
 
 // A checkout in another terminal shows on the next key, so the label needs no
@@ -9560,26 +9773,27 @@ test "a pairing shows its wait and its code in the picker, and the bind takes th
         "\x1b]8;;https://t.me/drinky_bot?start=x7kq4m2p\x1b\\",
     ) != null);
 
-    // The bind closes the picker, takes the input, and the attach event states
-    // the session and opens the chat.
+    // The bind closes the picker, takes the input, and the attach event names
+    // the bot and opens the chat. The event states no field of the session,
+    // because `/status` answers that on request.
     try app.pumpRemoteEvents(1);
     try std.testing.expect(app.session.mode == .prompt);
     try std.testing.expect(app.session.input.owner == .external);
     try std.testing.expectEqualStrings("Remote: @drinky_bot", app.session.input.caption.?.title);
     try std.testing.expectEqualStrings("", app.session.editor.visible());
-    try std.testing.expectEqualStrings(
-        "Remote: @drinky_bot · ~/work/drinky · Context: 0 · Account: Signed out",
-        app.lastEventText(),
-    );
+    try std.testing.expectEqualStrings("You attached @drinky_bot.", app.lastEventText());
     const sent = try server.waitForSend(0);
     try std.testing.expect(std.mem.indexOf(u8, sent, "\"chat_id\":99") != null);
     try std.testing.expect(std.mem.indexOf(
         u8,
         sent,
-        "\"text\":\"<blockquote>ℹ Remote: @drinky_bot · ~/work/drinky · Context: 0 · " ++
-            "Account: Signed out</blockquote>\"",
+        "\"text\":\"<blockquote>ℹ You attached @drinky_bot.</blockquote>\"",
     ) != null);
+    // The event went to the chat once: the block carries no mirror flag, so a
+    // step of the mirror sends nothing more.
+    try app.syncMirror();
     try server.finish();
+    try std.testing.expectEqual(@as(usize, 1), server.sendCount());
 }
 
 test "while a bot holds the input the terminal takes a detach alone, and Enter names the bot" {
@@ -9611,7 +9825,8 @@ test "while a bot holds the input the terminal takes a detach alone, and Enter n
     try std.testing.expect(app.session.mode == .prompt);
     try server.waitForRequests(3);
 
-    // Typed text and Enter reach no editor and no model.
+    // Typed text and Enter reach no editor and no model, and a command line
+    // runs nothing, the status included.
     try app.handleKeys("hello\r");
     try std.testing.expectEqualStrings("", app.session.editor.visible());
     try std.testing.expect(app.session.mode == .prompt);
@@ -9619,6 +9834,11 @@ test "while a bot holds the input the terminal takes a detach alone, and Enter n
         "@drinky_bot holds the input. Esc detaches.",
         app.session.notice.?.content,
     );
+    const attached_blocks = app.session.transcript.blocks().len;
+    try app.handleKeys("/status\r");
+    try std.testing.expectEqualStrings("", app.session.editor.visible());
+    try std.testing.expectEqual(attached_blocks, app.session.transcript.blocks().len);
+    try std.testing.expectEqualStrings("You attached @drinky_bot.", app.lastEventText());
     try app.session.paint(.{ .columns = 80, .rows = 24 });
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "Remote: @drinky_bot") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "Esc: Detach") != null);
@@ -9785,19 +10005,115 @@ test "a Telegram message runs as a prompt, and its refusals answer in the chat" 
     try std.testing.expect(app.session.mode == .prompt);
     try std.testing.expectEqual(@as(usize, 1), app.session.transcript.blocks().len);
     try server.finish();
+    // A refusal warns, and the reply keeps that severity under its symbol.
     const login = try server.waitForSend(1);
-    try std.testing.expect(std.mem.indexOf(u8, login, "The command /login runs in the terminal alone.") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        login,
+        "\"text\":\"<blockquote>⚠ The command /login runs in the terminal alone.</blockquote>\"",
+    ) != null);
     try std.testing.expect(std.mem.indexOf(u8, login, "\"reply_parameters\":{\"message_id\":1}") != null);
     const unknown = try server.waitForSend(2);
-    try std.testing.expect(std.mem.indexOf(u8, unknown, "Drinky does not recognize the command /nope.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unknown, "⚠ Drinky does not recognize the command /nope.") != null);
     const signed_out = try server.waitForSend(3);
-    // The repair runs in the terminal alone, so the reply names it.
+    // The repair runs in the terminal alone, so the reply names it, and the
+    // refused send is a failure.
     try std.testing.expect(std.mem.indexOf(
         u8,
         signed_out,
-        "Sign in with /login in the terminal before you send a message.",
+        "<blockquote>⚠ Sign in with /login in the terminal before you send a message.</blockquote>",
     ) != null);
     try std.testing.expect(std.mem.indexOf(u8, signed_out, "\"reply_parameters\":{\"message_id\":3}") != null);
+}
+
+// The chat asks for the status with a line of its own, so the answer goes to the
+// chat alone, as a reply to that line, and the terminal records no event for
+// it. The turn hosts the command from the chat as it does from the terminal,
+// while every other command refuses there too.
+test "a /status from Telegram gets one reply and no terminal event, also during a turn" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var server = try remote_testing.Server.init(gpa, io, &.{
+        .{ .method = "deleteWebhook", .replies = &.{.{ .body = remote_ok_true }} },
+        .{ .method = "setMyCommands", .replies = &.{.{ .body = remote_ok_true }} },
+        .{ .method = "getUpdates", .replies = &.{.{ .body = remote_ok_empty }} },
+        .{ .method = "sendMessage", .replies = &.{
+            .{ .body = remote_ok_sent },
+            .{ .body = remote_ok_sent },
+            .{ .body = "{\"ok\":true,\"result\":{\"message_id\":60}}" },
+            .{ .body = remote_ok_sent },
+            .{ .body = remote_ok_sent },
+            .{ .body = remote_ok_sent },
+        } },
+        .{ .method = "deleteMessage", .replies = &.{.{ .body = remote_ok_true }} },
+        .{ .method = "answerCallbackQuery", .replies = &.{.{ .body = remote_ok_true }} },
+    });
+    defer server.deinit();
+    try server.start();
+    var url_buffer: [64]u8 = undefined;
+
+    var app: App = undefined;
+    app.initRemoteTest(gpa, io, &out, &server, &url_buffer);
+    defer app.deinitRemoteTest();
+    // The session shows the signed-out agent, as it does after the start.
+    app.session.showSetup(null, null, .low);
+    try app.controller.store.save(&.{ .token = "42:secret", .id = 42, .username = "drinky_bot", .chat_id = 99 });
+    try app.controller.attachSaved(0);
+    try server.waitForRequests(3);
+    const blocks_before = app.session.transcript.blocks().len;
+    const status_wrapped = "<blockquote>ℹ ~/work/drinky · Context: 0 · Cost: ~$0.00 · " ++
+        "Account: Signed out</blockquote>";
+
+    // The answer states the full place and every field of the line, under the
+    // information symbol, and it names no bot.
+    try app.submitChatMessage("/status", 30);
+    const answer = try server.waitForSend(1);
+    try std.testing.expect(std.mem.indexOf(u8, answer, "\"text\":\"" ++ status_wrapped ++ "\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, answer, "\"reply_parameters\":{\"message_id\":30}") != null);
+    try std.testing.expectEqual(blocks_before, app.session.transcript.blocks().len);
+
+    // The row of the command list answers the same way: the tap gets a silent
+    // answer, the list goes, and the answer is a message of its own.
+    try app.submitChatMessage("/help", 31);
+    _ = try server.waitForSend(2);
+    try app.handleChatTap("900", .{ .row = .{ .serial = 1, .index = 4 } });
+    try std.testing.expectEqualStrings(
+        "{\"callback_query_id\":\"900\"}",
+        try server.waitForRequest("/answerCallbackQuery", 0),
+    );
+    try std.testing.expectEqualStrings(
+        "{\"chat_id\":99,\"message_id\":60}",
+        try server.waitForRequest("/deleteMessage", 0),
+    );
+    const tapped = try server.waitForSend(3);
+    try std.testing.expect(std.mem.indexOf(u8, tapped, "\"text\":\"" ++ status_wrapped ++ "\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tapped, "reply_parameters") == null);
+    try std.testing.expect(!app.chat_picker.isOpen());
+    try std.testing.expectEqual(blocks_before, app.session.transcript.blocks().len);
+
+    // During a turn the status runs, and every other command refuses with its
+    // warning.
+    app.session.beginTurn(1);
+    try app.submitChatMessage("/effort", 32);
+    const refusal = try server.waitForSend(4);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        refusal,
+        "\"text\":\"<blockquote>⚠ The command /effort cannot run while a turn runs.</blockquote>\"",
+    ) != null);
+    try app.submitChatMessage("/status", 33);
+    const during = try server.waitForSend(5);
+    try std.testing.expect(std.mem.indexOf(u8, during, "\"text\":\"" ++ status_wrapped ++ "\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, during, "\"reply_parameters\":{\"message_id\":33}") != null);
+    try std.testing.expect(app.session.mode == .turn);
+    try std.testing.expect(!app.session.hasSteering());
+    try std.testing.expectEqual(blocks_before, app.session.transcript.blocks().len);
+    try server.finish();
+    try std.testing.expectEqual(@as(usize, 6), server.sendCount());
 }
 
 // A credential rejection detaches the bot, and the failed turn then returns its
@@ -10057,7 +10373,11 @@ test "the chat mirrors a completed turn with its activity message, its answer, a
     app.session.retainExternalTurnPrompt(&draft, base, 7);
     try app.mirror.beginTurn(&app.controller, app.nowMs());
     const activity = try server.waitForSend(1);
-    try std.testing.expect(std.mem.indexOf(u8, activity, "\"text\":\"Thinking\"") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        activity,
+        "\"text\":\"<blockquote>ℹ Thinking</blockquote>\"",
+    ) != null);
 
     // The reply streams: the activity message follows the state, and the answer
     // waits for its commit.
@@ -10082,10 +10402,11 @@ test "the chat mirrors a completed turn with its activity message, its answer, a
     const committed_mark = try server.waitForRequest("/setMessageReaction", 0);
     try std.testing.expect(std.mem.indexOf(u8, committed_mark, "\"message_id\":7,\"reaction\":[{\"type\":\"emoji\",\"emoji\":\"👍\"}]") != null);
     // The edit keeps the buttons of the turn, because an edit without them
-    // drops them.
+    // drops them, and the wrapper with its parse mode.
     const writing = try server.waitForRequest("/editMessageText", 0);
     try std.testing.expectEqualStrings(
-        "{\"chat_id\":99,\"message_id\":50,\"text\":\"Writing\",\"reply_markup\":{\"inline_keyboard\":[" ++
+        "{\"chat_id\":99,\"message_id\":50,\"text\":\"<blockquote>ℹ Writing</blockquote>\"," ++
+            "\"parse_mode\":\"HTML\",\"reply_markup\":{\"inline_keyboard\":[" ++
             "[{\"text\":\"Cancel turn\",\"callback_data\":\"cancel:1\"}]," ++
             "[{\"text\":\"Withdraw\",\"callback_data\":\"withdraw:1\"}]]}}",
         writing,
@@ -10109,10 +10430,18 @@ test "the chat mirrors a completed turn with its activity message, its answer, a
     try std.testing.expect(std.mem.indexOf(u8, answer, "\"disable_notification\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, answer, "\"parse_mode\":\"HTML\"") != null);
     const summary = try server.waitForRequest("/editMessageText", 1);
-    try std.testing.expect(std.mem.indexOf(u8, summary, "\"text\":\"Tools: 0 calls · Time: ") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        summary,
+        "\"text\":\"<blockquote>ℹ Tools: 0 calls · Time: ",
+    ) != null);
     // A signed-out session with no model states its tokens alone, as the status
-    // line does. The summary holds no button.
-    try std.testing.expect(std.mem.indexOf(u8, summary, " · Context: 0 · Cost: ~$0.00\"}") != null);
+    // line does. The summary holds no button and keeps its wrapper.
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        summary,
+        " · Context: 0 · Cost: ~$0.00</blockquote>\",\"parse_mode\":\"HTML\"}",
+    ) != null);
     try std.testing.expect(std.mem.indexOf(u8, summary, "reply_markup") == null);
     try server.finish();
     // The prompt gets one mark: the commit marked it, so the receipt adds none.
@@ -10186,7 +10515,11 @@ test "a failed turn marks its uncommitted messages and notifies its error" {
     ) != null);
     try std.testing.expect(std.mem.indexOf(u8, failure, "\"disable_notification\":false") != null);
     const summary = try server.waitForRequest("/editMessageText", 0);
-    try std.testing.expect(std.mem.indexOf(u8, summary, "\"text\":\"Failed · Tools: 0 calls · Time: ") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        summary,
+        "\"text\":\"<blockquote>⚠ Failed · Tools: 0 calls · Time: ",
+    ) != null);
     const prompt = try server.waitForRequest("/setMessageReaction", 1);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "\"message_id\":7,\"reaction\":[{\"type\":\"emoji\",\"emoji\":\"👎\"}]") != null);
     const dropped = try server.waitForRequest("/setMessageReaction", 2);
@@ -10237,7 +10570,11 @@ test "a Telegram command opens a keyboard, a tap picks a row, and a stale tap ge
     try app.submitChatMessage("/effort", 20);
     try std.testing.expect(app.chat_picker.isOpen());
     const picker = try server.waitForSend(1);
-    try std.testing.expect(std.mem.indexOf(u8, picker, "\"text\":\"Effort\"") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        picker,
+        "\"text\":\"<blockquote>ℹ Effort</blockquote>\"",
+    ) != null);
     try std.testing.expect(std.mem.indexOf(u8, picker, "reply_parameters") == null);
     try std.testing.expect(std.mem.indexOf(u8, picker, "[{\"text\":\"✓ low\",\"callback_data\":\"row:1:0\"}]") != null);
     try std.testing.expect(std.mem.indexOf(u8, picker, "[{\"text\":\"high\",\"callback_data\":\"row:1:2\"}]") != null);
@@ -10359,7 +10696,11 @@ test "the activity keyboard cancels the turn on one tap and withdraws the queue"
     try std.testing.expect(app.session.mode == .prompt);
     try std.testing.expectEqualStrings("{\"callback_query_id\":\"903\"}", try server.waitForRequest("/answerCallbackQuery", 3));
     const summary = try server.waitForRequest("/editMessageText", 0);
-    try std.testing.expect(std.mem.indexOf(u8, summary, "\"text\":\"Canceled · Tools: 0 calls · Time: ") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        summary,
+        "\"text\":\"<blockquote>ℹ Canceled · Tools: 0 calls · Time: ",
+    ) != null);
     try std.testing.expect(std.mem.indexOf(u8, summary, "reply_markup") == null);
     try server.finish();
     try std.testing.expectEqual(@as(usize, 1), server.countOf("/editMessageText"));
@@ -10421,7 +10762,11 @@ test "the failed turn message dismisses the retry from the chat and stands at th
     try app.finishWorkerResult(&result);
     try std.testing.expect(app.retry != null);
     const failed = try server.waitForSend(3);
-    try std.testing.expect(std.mem.indexOf(u8, failed, "\"text\":\"Failed turn\"") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        failed,
+        "\"text\":\"<blockquote>⚠ Failed turn</blockquote>\"",
+    ) != null);
     try std.testing.expect(std.mem.indexOf(u8, failed, "[{\"text\":\"Try again\",\"callback_data\":\"retry:2\"}]") != null);
     try std.testing.expect(std.mem.indexOf(u8, failed, "[{\"text\":\"Dismiss\",\"callback_data\":\"dismiss:2\"}]") != null);
 
@@ -10436,8 +10781,10 @@ test "the failed turn message dismisses the retry from the chat and stands at th
     try app.handleChatTap("901", .{ .dismiss = 2 });
     try std.testing.expect(app.retry == null);
     try std.testing.expect(!app.session.retry_shown);
+    // The edit that takes the buttons off keeps the wrapper and the symbol.
     try std.testing.expectEqualStrings(
-        "{\"chat_id\":99,\"message_id\":70,\"text\":\"Failed turn\"}",
+        "{\"chat_id\":99,\"message_id\":70,\"text\":\"<blockquote>⚠ Failed turn</blockquote>\"," ++
+            "\"parse_mode\":\"HTML\"}",
         try server.waitForRequest("/editMessageText", 1),
     );
 
@@ -10452,7 +10799,11 @@ test "the failed turn message dismisses the retry from the chat and stands at th
     try std.testing.expect(app.session.input.owner == .terminal);
     try app.controller.attachSaved(0);
     const attached = try server.waitForSend(6);
-    try std.testing.expect(std.mem.indexOf(u8, attached, "\"text\":\"Failed turn\"") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        attached,
+        "\"text\":\"<blockquote>⚠ Failed turn</blockquote>\"",
+    ) != null);
     try std.testing.expect(std.mem.indexOf(u8, attached, "\"callback_data\":\"retry:3\"") != null);
     try std.testing.expect(!app.mirror.namesRetry(2));
     try app.handleKey(&.escape);
@@ -10466,7 +10817,8 @@ test "the failed turn message dismisses the retry from the chat and stands at th
 
 // A `/new` from the chat clears the conversation and opens the new one on the
 // bracket of the bot, so a reader of the transcript still sees which chat drove
-// every message. The mirror starts over at that event.
+// every message. The mirror starts over at that event, and the bot stays
+// attached, because the clear empties the model conversation and not the chat.
 test "a /new from Telegram records the remote bracket as the first event" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
@@ -10496,13 +10848,19 @@ test "a /new from Telegram records the remote bracket as the first event" {
     const blocks = app.session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 2), blocks.len);
     try std.testing.expect(blocks[0].content == .intro);
-    try std.testing.expectEqualStrings("New conversation · Remote: @drinky_bot", app.lastEventText());
+    try std.testing.expectEqualStrings(
+        "You cleared the conversation while @drinky_bot is attached.",
+        app.lastEventText(),
+    );
+    try std.testing.expectEqual(remote.Controller.State.attached, app.controller.state());
+    try std.testing.expect(app.session.input.owner == .external);
     try app.syncMirror();
     const event = try server.waitForSend(1);
     try std.testing.expect(std.mem.indexOf(
         u8,
         event,
-        "\"text\":\"<blockquote>ℹ New conversation · Remote: @drinky_bot</blockquote>\"",
+        "\"text\":\"<blockquote>ℹ You cleared the conversation while @drinky_bot is " ++
+            "attached.</blockquote>\"",
     ) != null);
     try server.finish();
     // The command itself gets no reply, because the event states it.

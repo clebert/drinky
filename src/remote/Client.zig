@@ -142,6 +142,16 @@ pub const SendOptions = struct {
     markup: ?[]const u8 = null,
 };
 
+/// What an edit states beside its text.
+pub const EditOptions = struct {
+    /// `HTML` for a formatted text, or null for plain text.
+    parse_mode: ?[]const u8 = null,
+    /// The `reply_markup` object of an inline keyboard as JSON, or null for a
+    /// message without one. An edit without a keyboard removes the one the
+    /// message holds. Borrowed for the call.
+    markup: ?[]const u8 = null,
+};
+
 /// The message of a chat that an edit, a deletion, or a reaction acts on.
 pub const Target = struct {
     chat_id: i64,
@@ -342,22 +352,23 @@ pub fn sendMessage(
     return integerOf(result.get("message_id")) orelse error.MalformedReply;
 }
 
-/// Replace the text of the message `target`, and its inline keyboard with
-/// `markup`. A null `markup` removes the keyboard, because an edit without one
-/// drops it. An edit to the state the message already holds changes nothing,
-/// and that is the state the caller asked for, so Telegram's refusal of it
-/// reads as success.
+/// Replace the text of the message `target`, and its inline keyboard with the
+/// one of `options`. An edit without a keyboard removes the one the message
+/// holds. An edit to the state the message already holds changes nothing, and
+/// that is the state the caller asked for, so Telegram's refusal of it reads as
+/// success.
 pub fn editMessageText(
     self: *Client,
     target: Target,
     text: []const u8,
-    markup: ?[]const u8,
+    options: *const EditOptions,
 ) Error!void {
     const body = try std.json.Stringify.valueAlloc(self.gpa, .{
         .chat_id = target.chat_id,
         .message_id = target.message_id,
         .text = text,
-        .reply_markup = raw(markup),
+        .parse_mode = options.parse_mode,
+        .reply_markup = raw(options.markup),
     }, .{ .emit_null_optional_fields = false });
     defer self.gpa.free(body);
     const reply = self.call("editMessageText", body) catch |err| switch (err) {
@@ -780,12 +791,15 @@ test "editMessageText states its target and keyboard, and an unchanged text coun
     };
 
     const target: Target = .{ .chat_id = 99, .message_id = 314 };
-    try client.editMessageText(target, "Writing", null);
-    try client.editMessageText(target, "Writing", "{\"inline_keyboard\":[]}");
-    try client.editMessageText(target, "Writing", null);
+    try client.editMessageText(target, "Writing", &.{});
+    try client.editMessageText(target, "<b>Writing</b>", &.{
+        .parse_mode = "HTML",
+        .markup = "{\"inline_keyboard\":[]}",
+    });
+    try client.editMessageText(target, "Writing", &.{});
     try std.testing.expectError(
         error.Rejected,
-        client.editMessageText(.{ .chat_id = 99, .message_id = 315 }, "Writing", null),
+        client.editMessageText(.{ .chat_id = 99, .message_id = 315 }, "Writing", &.{}),
     );
     try server.finish();
     // An edit without a keyboard names none, so the message loses the one it holds.
@@ -793,8 +807,10 @@ test "editMessageText states its target and keyboard, and an unchanged text coun
         "{\"chat_id\":99,\"message_id\":314,\"text\":\"Writing\"}",
         server.requests.items[0].body,
     );
+    // A formatted edit names its parse mode like a formatted send.
     try std.testing.expectEqualStrings(
-        "{\"chat_id\":99,\"message_id\":314,\"text\":\"Writing\",\"reply_markup\":{\"inline_keyboard\":[]}}",
+        "{\"chat_id\":99,\"message_id\":314,\"text\":\"<b>Writing</b>\",\"parse_mode\":\"HTML\"," ++
+            "\"reply_markup\":{\"inline_keyboard\":[]}}",
         server.requests.items[1].body,
     );
 }

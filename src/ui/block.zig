@@ -74,8 +74,8 @@ pub const Entry = struct {
     /// takes its default, so a plain block states nothing.
     pub const Options = struct {
         /// Whether the block reports a failure. It selects the error role, and
-        /// it gives an event the `Error:` prefix in place of `Event:`. The plain
-        /// variants ignore it.
+        /// it gives an event the warning symbol in place of the information
+        /// symbol. The plain variants ignore it.
         is_error: bool = false,
         /// How a tool box fits a line that is wider than the window. A call row
         /// and a measures line cut, because the start of each identifies it. The
@@ -259,15 +259,15 @@ pub const Entry = struct {
 
     /// How this block paints as a notice, or null for a block that paints a box
     /// or markdown. The measure and the paint share it, so the rows a block
-    /// counts cannot diverge from the rows it paints.
+    /// counts cannot diverge from the rows it paints. Each notice opens on the
+    /// symbol of its kind, so copied text keeps the kind where the color is gone.
     fn notice(self: *const Entry) ?paint.Notice {
         return switch (self.content) {
-            .user_note => .{ .role = .user_note },
+            .user_note => .{ .role = .user_note, .prefix = paint.note_prefix },
             // An event wraps, so the transcript keeps the complete sentence.
-            // Its prefix preserves the event type in copied text.
             .event => |flagged| .{
                 .role = if (flagged.is_error) .@"error" else .accent,
-                .prefix = if (flagged.is_error) "Error: " else "Event: ",
+                .prefix = if (flagged.is_error) paint.warning_prefix else paint.information_prefix,
             },
             .intro, .user, .tool_result, .thinking, .model => null,
         };
@@ -759,9 +759,11 @@ test "the intro block paints the Drinky caption" {
     try std.testing.expectEqual(@as(usize, 3), intro.rows(14));
 }
 
-// A prefix identifies an event when its color or an error role is unavailable
-// in copied text. The prefix also separates an event from muted reasoning.
-test "each event paints its severity prefix" {
+// A symbol identifies a notice when its color is unavailable in copied text: an
+// event opens on the information symbol, a failed event on the warning symbol,
+// and a line that Drinky wrote for the user on the arrow. Each symbol paints in
+// the role of its notice, so the row reads as one.
+test "each notice paints the symbol of its kind in its role" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
@@ -771,31 +773,40 @@ test "each event paints its severity prefix" {
     defer failure.deinit(gpa);
     var information = try Entry.init(gpa, .event, .{}, "all good");
     defer information.deinit(gpa);
+    var note = try Entry.init(gpa, .user_note, .{}, "Skill: zig-style");
+    defer note.deinit(gpa);
 
     const sink = try view.beginFrame(.{ .columns = 40, .rows = 100 }, 8);
-    const placement: paint.Placement = .{
+    var placement: paint.Placement = .{
         .sink = sink,
         .id = 0,
         .columns = 40,
         .base = 0,
         .skip = 0,
     };
-    var second = placement;
-    second.id = 1;
     try failure.render(gpa, &placement);
-    try information.render(gpa, &second);
+    placement.id = 1;
+    placement.base = 1;
+    try information.render(gpa, &placement);
+    placement.id = 2;
+    placement.base = 2;
+    try note.render(gpa, &placement);
     try view.render();
 
     const painted = out.written();
     const accent_sequence = comptime role.sequence(.accent);
     const error_sequence = comptime role.sequence(.@"error");
-    try std.testing.expect(
-        std.mem.indexOf(u8, painted, accent_sequence ++ "Event: all good") != null,
-    );
-    try std.testing.expect(std.mem.indexOf(u8, painted, error_sequence ++ "Error: ") != null);
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, painted, "Event: "));
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, painted, "Error: "));
+    const note_sequence = comptime role.sequence(.user_note);
+    try std.testing.expect(std.mem.indexOf(u8, painted, accent_sequence ++ "ℹ all good") != null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, error_sequence ++ "⚠ boom") != null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, note_sequence ++ "→ Skill: zig-style") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, painted, "ℹ "));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, painted, "⚠ "));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, painted, "→ "));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, painted, error_sequence));
+    // The label of an event went with the color, so no row names one.
+    try std.testing.expect(std.mem.indexOf(u8, painted, "Event: ") == null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "Error: ") == null);
 }
 
 // One event that repeats states its count in its own text, so the count of the

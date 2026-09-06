@@ -449,6 +449,10 @@ pub const AsyncEventOptions = struct {
     /// stands in the chat already, or that a send to the chat caused, stays in
     /// the terminal.
     mirrored: bool = true,
+    /// Whether the same event again, with no block between the two, counts in
+    /// the block it repeats. A status answer states one moment, so each one
+    /// takes a block of its own.
+    repeats: bool = true,
 };
 
 /// One consumed steering batch that waits for the round that commits it.
@@ -1052,9 +1056,9 @@ fn appendToolBlock(self: *Session, block: *const ToolBlock) !void {
 }
 
 /// Append one command message as a transcript event and free its content. A
-/// failure takes the error color and the `Error:` prefix. Every other severity
-/// takes the accent color and the `Event:` prefix, because an event reports the
-/// state of the session and never a message.
+/// failure takes the error color and the warning symbol. Every other severity
+/// takes the accent color and the information symbol, because an event reports
+/// the state of the session and never a message.
 ///
 /// One rule serves every event of a command. The line of a finished step and
 /// the report of a picker read alike.
@@ -1089,15 +1093,16 @@ pub fn recordAsyncEvent(
 
 /// Append one event of a task. It survives a rewind, because it reports the state
 /// of the session and not the turn that a failure undoes. The same terminal event
-/// again, with no block between the two, counts in the block it repeats. The
-/// caller frees the content.
+/// again, with no block between the two, counts in the block it repeats, unless
+/// the event states its own moment. The caller frees the content.
 fn appendAsyncEvent(self: *Session, pending: *const PendingEvent) !void {
     const options: ui.block.Entry.Options = .{
         .is_error = pending.message.severity == .failure,
         .survives_rewind = true,
         .mirrored = pending.options.mirrored,
     };
-    if (try self.transcript.repeatEvent(options, pending.message.content)) return;
+    if (pending.options.repeats and
+        try self.transcript.repeatEvent(options, pending.message.content)) return;
     try self.transcript.append(.event, options, pending.message.content);
 }
 
@@ -1142,6 +1147,7 @@ pub fn applyOutcome(self: *Session, outcome: ai.command.Outcome) !void {
         .fetch,
         .new_conversation,
         .show_sources,
+        .show_status,
         .show_system_prompt,
         .remote_attach,
         .remote_add,
@@ -2528,8 +2534,7 @@ test "a notice replaces the footer and clearing restores the status" {
     );
     try session.paint(.{ .columns = 80, .rows = 24 });
     const notice_frame = out.written()[notice_start..];
-    try std.testing.expect(std.mem.indexOf(u8, notice_frame, "Error: ") != null);
-    try std.testing.expect(std.mem.indexOf(u8, notice_frame, "Temporary notice.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, notice_frame, "⚠ Temporary notice.") != null);
     try std.testing.expect(std.mem.indexOf(u8, notice_frame, test_model.name()) == null);
 
     const status_start = out.written().len;
@@ -4679,6 +4684,26 @@ test "an async event that repeats states its count in the block it repeats" {
     );
     try std.testing.expectEqualStrings(text, blocks[1].content.event.text.items);
     try std.testing.expectEqualStrings(text, blocks[2].content.event.text.items);
+}
+
+// An event that states its own moment, such as a status answer, takes a block of
+// its own each time, so two answers with the same numbers never fold into one
+// row with a count.
+test "an async event that states its own moment never counts in an earlier block" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var session = Session.init(gpa, &out.writer, test_model, .low);
+    defer session.deinit();
+
+    const text = "Context: 0% (0/1.0M) · Cost: ~$0.00";
+    for (0..2) |_| try session.recordAsyncEvent(
+        try ai.command.Outcome.Message.print(gpa, .information, text, .{}),
+        .{ .mirrored = false, .repeats = false },
+    );
+    const blocks = session.transcript.blocks();
+    try std.testing.expectEqual(@as(usize, 2), blocks.len);
+    for (blocks) |*block| try std.testing.expectEqualStrings(text, block.content.event.text.items);
 }
 
 // A report of a task can arrive while a reply streams. An append then splits the

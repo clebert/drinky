@@ -41,6 +41,14 @@ pub const Notice = struct {
 /// row starts or ends with a separator.
 pub const separator = " \u{00B7} ";
 
+/// The prefixes that open a notice by its kind, so copied text keeps the kind
+/// where the color is gone: information, a warning or a failure, and a line that
+/// Drinky wrote for the user. A warning and a failure share the symbol, and the
+/// role of the notice keeps them apart.
+pub const information_prefix = "ℹ ";
+pub const warning_prefix = "⚠ ";
+pub const note_prefix = "→ ";
+
 /// One row of one logical line: where the content of the row ends, whether that
 /// row cut a hint, and where the next row starts. A `next` at the end of the line
 /// closes that line.

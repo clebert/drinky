@@ -288,13 +288,18 @@ pub fn render(placement: *const paint.Placement, info: *const Info) !void {
     if (info.notice) |notice| {
         // An information notice takes the text role, not the muted role of the
         // line. The row must read as a new message and not as the status it
-        // replaces. A warning and a failure carry their own color already.
+        // replaces. A warning and a failure carry their own color already, and
+        // they share the warning symbol, so the text states either one without
+        // its color.
         const name: role.Name = switch (notice.severity) {
             .information => .text,
             .warning => .warning,
             .failure => .@"error",
         };
-        const prefix = if (notice.severity == .failure) "Error: " else "";
+        const prefix = switch (notice.severity) {
+            .information => paint.information_prefix,
+            .warning, .failure => paint.warning_prefix,
+        };
         // The footer keeps one row, because a footer that grows moves the editor,
         // and a moving interface is worse than a cut sentence.
         return paint.notice(
@@ -344,20 +349,18 @@ pub fn render(placement: *const paint.Placement, info: *const Info) !void {
 }
 
 /// Write the state of the session as one line for a reader with no column
-/// budget: the place in full, the context share, and the agent. The parts take
-/// the words and the order of the line, so the attach event of a remote bot
-/// reads like the status line. An empty directory leaves the place out.
+/// budget: every part of the line in its full form and in its order, so the
+/// answer of `/status` reads like the status line. An empty directory leaves the
+/// place out, and the quota and the cache rate come while a turn runs alone, as
+/// on the line.
 pub fn writeSummary(out: *std.Io.Writer, info: *const Info) !void {
-    var scratch: [ai.project.head_name_bytes_max + 512]u8 = undefined;
+    // Both sides of the line, with the room that `render` gives each of them,
+    // and the separator between them.
+    var scratch: [ai.project.head_name_bytes_max + 512 + separator.len + 192]u8 = undefined;
     var line: Line = .init(&scratch);
-    const parts: Parts = .all;
-    if (info.directory.len > 0) {
-        try writePlace(&line, info, &parts);
-        try line.out.writeAll(separator);
-    }
-    try writeContext(&line, info, .short);
+    try writeLeft(&line, info, &Parts.all);
     try line.out.writeAll(separator);
-    try writeRight(&line, info, &parts);
+    try writeRight(&line, info, &Parts.all);
     try out.writeAll(line.text());
 }
 
@@ -697,35 +700,47 @@ fn expectSummary(expected: []const u8, info: *const Info) !void {
 }
 
 // The summary is the status line for a reader with no column budget, so it takes
-// the words and the order of the line, with the place in full and the gauge as a
-// share alone.
-test "the summary states the place, the gauge, and the agent in the order of the line" {
+// the words and the order of the line, with every part in its full form. The
+// numbers of one request come while a turn runs alone, as on the line.
+test "the summary states every part of the line in full, in the order of the line" {
     try expectSummary(
-        "~/github/clebert/drinky (main) · Context: 21% · claude-opus-4-8 (Anthropic Subscription) · " ++
-            "Effort: xhigh",
+        "~/github/clebert/drinky (main) · Context: 21% (206k/1.0M) · Cost: ~$0.39 · " ++
+            "5h: 12% (53m) · Week: 74% (6d) · Cache: 87% · claude-opus-4-8 (Anthropic " ++
+            "Subscription) · Effort: xhigh",
         &test_info,
     );
 
-    var signed_out = test_info;
+    var idle = test_info;
+    idle.turn_active = false;
+    try expectSummary(
+        "~/github/clebert/drinky (main) · Context: 21% (206k/1.0M) · Cost: ~$0.39 · " ++
+            "claude-opus-4-8 (Anthropic Subscription) · Effort: xhigh",
+        &idle,
+    );
+
+    var signed_out = idle;
     signed_out.account = null;
     signed_out.context_tokens = null;
     try expectSummary(
-        "~/github/clebert/drinky (main) · Context: Unknown · Account: Signed out",
+        "~/github/clebert/drinky (main) · Context: Unknown · Cost: ~$0.39 · Account: Signed out",
         &signed_out,
     );
 
-    var no_model = test_info;
+    var no_model = idle;
     no_model.model = null;
     no_model.context_window = null;
     no_model.directory = "";
-    try expectSummary("Context: 206k · No model (Anthropic Subscription) · Effort: xhigh", &no_model);
+    try expectSummary(
+        "Context: 206k · Cost: ~$0.39 · No model (Anthropic Subscription) · Effort: xhigh",
+        &no_model,
+    );
 
-    var empty = test_info;
+    var empty = idle;
     empty.context_tokens = 0;
     empty.branch = null;
     try expectSummary(
-        "~/github/clebert/drinky · Context: 0% · claude-opus-4-8 (Anthropic Subscription) · " ++
-            "Effort: xhigh",
+        "~/github/clebert/drinky · Context: 0% (0/1.0M) · Cost: ~$0.39 · claude-opus-4-8 " ++
+            "(Anthropic Subscription) · Effort: xhigh",
         &empty,
     );
 }
@@ -1126,13 +1141,16 @@ test "a notice replaces the status for exactly one row" {
     try renderForTest(gpa, &info, 40, &out);
 
     const painted = out.written();
-    // The row keeps the first line, and the mark states the line it hides.
-    try expectShows(painted, &.{ "Error: ", "boom" ++ paint.ellipsis });
-    try expectHides(painted, &.{ "not another row", "hidden-model" });
+    // The row keeps the first line, and the mark states the line it hides. The
+    // failure opens on the warning symbol in the error color.
+    try expectShows(painted, &.{comptime role.sequence(.@"error") ++ "⚠ boom" ++ paint.ellipsis});
+    try expectHides(painted, &.{ "not another row", "hidden-model", "Error:" });
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, painted, "\r\n"));
 }
 
-test "a warning notice uses the warning role without an error label" {
+// A warning and a failure share the symbol, so the text states either one
+// without its color, and the role keeps the two apart on the row.
+test "a warning notice takes the warning symbol in the warning role" {
     const gpa = std.testing.allocator;
     var info = test_info;
     info.notice = .{ .text = "Enter: Send anyway", .severity = .warning };
@@ -1141,16 +1159,11 @@ test "a warning notice uses the warning role without an error label" {
     try renderForTest(gpa, &info, 40, &out);
 
     const painted = out.written();
-    try expectShows(painted, &.{"Enter: Send anyway"});
-    try expectHides(painted, &.{"Error:"});
-    try std.testing.expect(std.mem.indexOf(
-        u8,
-        painted,
-        comptime role.sequence(.warning),
-    ) != null);
+    try expectShows(painted, &.{comptime role.sequence(.warning) ++ "⚠ Enter: Send anyway"});
+    try expectHides(painted, &.{ "Error:", comptime role.sequence(.@"error") });
 }
 
-test "an information notice reads at the normal intensity" {
+test "an information notice takes the information symbol at the normal intensity" {
     const gpa = std.testing.allocator;
     var info = test_info;
     info.notice = .{ .text = "Drinky loaded every queued message.", .severity = .information };
@@ -1159,8 +1172,8 @@ test "an information notice reads at the normal intensity" {
     try renderForTest(gpa, &info, 40, &out);
 
     const painted = out.written();
-    try expectShows(painted, &.{"Drinky loaded every queued message."});
-    try expectHides(painted, &.{"Error:"});
+    try expectShows(painted, &.{"ℹ Drinky loaded every queued message."});
+    try expectHides(painted, &.{ "Error:", "⚠" });
     // The muted role belongs to the line that the notice replaces. The row drops
     // it, so a notice never reads as the status behind it.
     try std.testing.expect(std.mem.indexOf(

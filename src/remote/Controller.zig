@@ -383,7 +383,7 @@ pub fn detach(self: *Controller, cause: DetachCause) !void {
     };
     const text = try self.detachText(cause, attachment.username);
     defer self.gpa.free(text);
-    const line = try eventLine(self.gpa, severity, text);
+    const line = try html.wrapAlloc(self.gpa, .of(severity), text);
     defer self.gpa.free(line);
     attachment.close(.{ .text = line, .parse_mode = html.parse_mode }) catch |err| switch (err) {
         error.OutOfMemory => {},
@@ -407,24 +407,31 @@ pub fn abortDetach(self: *Controller) !void {
     try self.emit(.state_changed);
 }
 
-/// Queue one event line for the chat under its label. The owner sends the attach
-/// event this way, because that event states the session.
+/// Queue one line of Drinky for the chat under the role of its severity, silent.
+/// The owner sends the attach event this way, and the answer to a question that
+/// a tap asked.
 pub fn sendEvent(
     self: *Controller,
     severity: ai.command.Outcome.Severity,
     text: []const u8,
 ) !void {
-    const line = try eventLine(self.gpa, severity, text);
+    const line = try html.wrapAlloc(self.gpa, .of(severity), text);
     defer self.gpa.free(line);
     try self.send(line, &.{ .disable_notification = true, .parse_mode = html.parse_mode });
 }
 
-/// Answer the chat message `id` with `text`, silent. The answer is a line that
-/// Drinky wrote, so it takes the note role.
-pub fn reply(self: *Controller, id: i64, text: []const u8) !void {
-    const note = try html.wrapAlloc(self.gpa, .note, text);
-    defer self.gpa.free(note);
-    try self.send(note, &.{
+/// Answer the chat message `id` with `text`, silent, under the role of its
+/// severity. A refusal keeps its warning, and a failure its failure, so the chat
+/// reads each like the terminal footer does.
+pub fn reply(
+    self: *Controller,
+    id: i64,
+    severity: ai.command.Outcome.Severity,
+    text: []const u8,
+) !void {
+    const line = try html.wrapAlloc(self.gpa, .of(severity), text);
+    defer self.gpa.free(line);
+    try self.send(line, &.{
         .reply_to = id,
         .disable_notification = true,
         .parse_mode = html.parse_mode,
@@ -456,15 +463,15 @@ pub fn sendTracked(
 }
 
 /// Replace the text and the keyboard of the tracked message `handle`, once it
-/// went out. A null `markup` removes the keyboard.
+/// went out. An edit without a keyboard removes the one the message holds.
 pub fn edit(
     self: *Controller,
     handle: Attachment.Handle,
     text: []const u8,
-    markup: ?[]const u8,
+    options: *const Client.EditOptions,
 ) !void {
     const attachment = self.attached() orelse return;
-    try self.takeQueued(attachment, .state, attachment.edit(handle, text, markup));
+    try self.takeQueued(attachment, .state, attachment.edit(handle, text, options));
 }
 
 /// Take the tracked message `handle` out of the chat, once it went out.
@@ -548,7 +555,7 @@ fn reportDrops(self: *Controller, attachment: *Attachment) !void {
         .{ count, ai.format.pluralSuffix(count) },
     );
     defer self.gpa.free(text);
-    const line = try eventLine(self.gpa, .failure, text);
+    const line = try html.wrapAlloc(self.gpa, .failure, text);
     defer self.gpa.free(line);
     attachment.send(line, &.{
         .disable_notification = true,
@@ -584,7 +591,9 @@ pub fn applyAttachmentEvent(self: *Controller, event: *const Attachment.Event) !
         } else {
             try self.answer(callback.query_id, null);
         },
-        .unreadable => |id| try self.reply(id, "Drinky reads text alone."),
+        // The message stays out, and a later one with text goes in, so the
+        // reply warns like every refusal that the user can pass.
+        .unreadable => |id| try self.reply(id, .warning, "Drinky reads text alone."),
         // An outage of a side stays in the terminal. A poll outage means that
         // the chat is out of reach, so its report lands late and states
         // nothing the user can act on, and a send outage feeds itself.
@@ -864,16 +873,6 @@ fn detachText(self: *Controller, cause: DetachCause, username: []const u8) ![]u8
             ),
         },
     };
-}
-
-/// The chat message of one event, under the role of its severity. The result is
-/// owned, and it goes out as HTML.
-fn eventLine(
-    gpa: std.mem.Allocator,
-    severity: ai.command.Outcome.Severity,
-    text: []const u8,
-) ![]u8 {
-    return html.wrapAlloc(gpa, if (severity == .failure) .failure else .event, text);
 }
 
 /// The verb of one side of the attachment in a failure or recovery event.
@@ -1157,10 +1156,11 @@ test "a saved bot attaches, its messages and taps reach the owner, and a detach 
             "{\"command\":\"help\",\"description\":\"list every command\"}," ++
             "{\"command\":\"model\",\"description\":\"switch account and model together\"}," ++
             "{\"command\":\"new\",\"description\":\"clear the conversation and its usage stats\"}," ++
-            "{\"command\":\"skill\",\"description\":\"load one of the discovered skills\"}]}",
+            "{\"command\":\"skill\",\"description\":\"load one of the discovered skills\"}," ++
+            "{\"command\":\"status\",\"description\":\"show the state of the session\"}]}",
         registered,
     );
-    try controller.sendEvent(.information, "Remote: @drinky_bot · Context: 0");
+    try controller.sendEvent(.information, "You attached @drinky_bot.");
 
     // The text message becomes an action, the sticker gets its reply, the tap
     // becomes an action with its query, and a tap that no keyboard of Drinky
@@ -1169,7 +1169,7 @@ test "a saved bot attaches, its messages and taps reach the owner, and a detach 
     const message = owner.actions.items[1].chat_message;
     try std.testing.expectEqual(@as(i64, 7), message.id);
     try std.testing.expectEqualStrings("hello", message.text);
-    try controller.reply(7, "Sign in first.");
+    try controller.reply(7, .warning, "The command /login runs in the terminal alone.");
     const tap = owner.actions.items[2].chat_tap;
     try std.testing.expectEqualStrings("900", tap.query_id);
     try std.testing.expectEqual(@as(u64, 2), tap.tap.withdraw);
@@ -1206,10 +1206,21 @@ test "a saved bot attaches, its messages and taps reach the owner, and a detach 
     try std.testing.expect(std.mem.indexOf(
         u8,
         sends[0],
-        "\"text\":\"<blockquote>ℹ Remote: @drinky_bot · Context: 0</blockquote>\"",
+        "\"text\":\"<blockquote>ℹ You attached @drinky_bot.</blockquote>\"",
     ) != null);
-    try std.testing.expect(std.mem.indexOf(u8, sends[1], "Drinky reads text alone.") != null);
+    // A reply keeps the severity of its notice: the two refusals warn, so both
+    // take the warning symbol under the quote bar.
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        sends[1],
+        "\"text\":\"<blockquote>⚠ Drinky reads text alone.</blockquote>\"",
+    ) != null);
     try std.testing.expect(std.mem.indexOf(u8, sends[1], "\"reply_parameters\":{\"message_id\":8}") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        sends[2],
+        "\"text\":\"<blockquote>⚠ The command /login runs in the terminal alone.</blockquote>\"",
+    ) != null);
     try std.testing.expect(std.mem.indexOf(u8, sends[2], "\"reply_parameters\":{\"message_id\":7}") != null);
     try std.testing.expect(std.mem.indexOf(
         u8,

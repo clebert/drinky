@@ -59,10 +59,13 @@ Herdr pane label. This needs no setup.
 A line that starts with a slash runs in Drinky and reaches no model. Type `/` or `/help` to open the
 complete command list. You can also ask Drinky to explain its commands, keys, and settings.
 
-- `/login` signs in. `/model` and `/effort` change the model and the reasoning effort.
+- `/login` signs in.
+- `/model` and `/effort` change the model and the reasoning effort.
 - `/skill` picks a discovered skill. `/skill:name` loads one skill with an optional task.
-- `/new` clears the conversation. `/sources` shows the loaded instruction files and skills.
-  `/system` shows the complete system prompt.
+- `/new` clears the conversation.
+- `/status` states the session, also during a turn.
+- `/sources` shows the loaded instruction files and skills.
+- `/system` shows the complete system prompt.
 - `/remote` attaches a Telegram bot, so you drive the session from its chat.
 
 ## Telegram remote control
@@ -76,8 +79,8 @@ the chat runs as a prompt, or queues as steering during a turn. Its reaction sta
 every answer and event. A message that Drinky wrote takes a quote bar and its own symbol, so it
 cannot read as an answer of the model. One activity message per turn shows the state and holds the
 `Cancel turn` and `Withdraw` buttons. `/effort`, `/model`, `/help`, and `/skill` open inline
-keyboards in the chat, and `/new` clears the conversation. `/login`, `/logout`, `/remote`,
-`/sources`, and `/system` run in the terminal alone.
+keyboards in the chat, `/status` answers with the state of the session, and `/new` clears the
+conversation. `/login`, `/logout`, `/remote`, `/sources`, and `/system` run in the terminal alone.
 
 Every exit key in the terminal detaches the bot. The bot tokens live in the owner-only
 `~/.drinky/remote.json`, and Drinky talks to the Telegram Bot API directly, with no dependency.

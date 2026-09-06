@@ -175,6 +175,10 @@ Gemini on Google Vertex AI through a service account key file.
   scrollable full-window page. Each skill row names its scope and its file. A row marks a skill that
   the model cannot invoke, and a project skill row names the user skill that it replaced. A required
   skill row marks a configured name that no discovered skill carries.
+- **/status** — state the session in full: the directory with its branch, the context gauge, the
+  cost, the quota and the cache-hit rate of a running turn, and `model (account) · Effort: level`.
+  The answer takes the words of the status line and reaches the channel that asked alone: a terminal
+  event that the chat never sees, or a Telegram reply that the terminal never records.
 - **/system** — show the complete system prompt as rendered Markdown in a scrollable full-window
   page. `M` toggles the exact source.
 - **/skill** — pick one of the discovered skills. Each row holds the first sentence of the
@@ -191,8 +195,10 @@ Gemini on Google Vertex AI through a service account key file.
 - A command that ran clears the editor. A successful model, effort, login, logout, or account change
   records a transcript event.
 - A local command failure replaces the footer until the next user action.
-- No command runs during a turn. The command stays in the editor, a notice names the restriction,
-  and the next Enter runs it after the turn.
+- No command but `/status` runs during a turn. The command stays in the editor, a notice names the
+  restriction, and the next Enter runs it after the turn. A `/status` during a turn leaves the turn,
+  the steering queue, and a waiting retry as they stand. Its event waits for the next message
+  boundary while a reply streams.
 
 ## Providers
 
@@ -314,7 +320,8 @@ Gemini on Google Vertex AI through a service account key file.
   cache-hit rate on the left, and `model (account) · Effort: level` on the right. The model name and
   the effort value take the normal intensity, so the two settings that the user changes stand out.
 - One temporary notice replaces the bottom line until the next user action. The notice keeps one
-  row, so it never moves the editor. A warning and a failure carry their color.
+  row, so it never moves the editor. An information notice opens with `ℹ`, and a warning or a
+  failure opens with `⚠` and carries its color.
 - The context gauge holds what the last committed reply measured, and an empty history is 0. It
   reads `Context: Unknown` while the next request renders the history in another way: after a model
   switch, an account switch, or an effort change that stops a stored reasoning block from replaying.
@@ -355,13 +362,16 @@ Gemini on Google Vertex AI through a service account key file.
 - The terminal supplies every color and the muted intensity. Drinky uses the default colors, ANSI
   slots 0 to 7, faint, and reverse video. A filled box keeps the terminal background for its text. A
   label or a glyph marks every state, so color is never the only signal.
-- A message that Drinky wrote for the user takes the user color and no box: the head of a loaded
-  skill and the line of a retry attempt. A typed message cannot forge it.
-- A failed event opens with `Error:` and paints its whole text in the error color. Every other event
-  opens with `Event:` and paints its whole text in the accent color. An incomplete reply ends with
-  an `Error:` event that states the output or context limit.
+- A message that Drinky wrote for the user opens with `→` and takes the user color and no box: the
+  head of a loaded skill and the line of a retry attempt. A typed message cannot forge it.
+- A failed event opens with `⚠` and paints its whole text in the error color. Every other event
+  opens with `ℹ` and paints its whole text in the accent color. The symbol keeps the kind in copied
+  text, where the color is gone. An incomplete reply ends with a `⚠` event that states the output or
+  context limit. The sentence of a failed tool call keeps its `Error:` label, because the sentence
+  comes from the tool.
 - An event that stays in the terminal and repeats itself back to back counts in the block it
-  repeats. That block ends with `· Repeats: 3`, so a run of the same report takes one row.
+  repeats. That block ends with `· Repeats: 3`, so a run of the same report takes one row. A
+  `/status` answer takes a row of its own each time, because each one states its own moment.
 
 ## Editing & text
 
@@ -448,17 +458,20 @@ Gemini on Google Vertex AI through a service account key file.
 - Three wrong codes end a pairing, and so does a five-minute wait. A group message counts as
   nothing, and an exit key cancels the pairing alone.
 - While a bot is attached, the bot holds the input. The editor shows `Remote: @bot · Esc: Detach`
-  with the count of the queued messages. Enter names the bot, and every exit key detaches.
-- The attach event opens the chat and states the bot and the session in the words of the status
-  line. The detach event is the last message of the chat.
+  with the count of the queued messages. Enter names the bot, and every exit key detaches. No
+  command line reaches the locked editor, `/status` included.
+- The attach event `You attached @bot.` opens the chat, and `/status` states the session on request.
+  The detach event `You detached @bot.` is the last message of the chat, and an automatic detach
+  names its cause instead.
 - After a detach the editor stays locked under `Remote: @bot · Esc: Cancel` until the detach event
   went out, for two seconds at most. An exit key there drops that message and frees the editor at
   once.
 - A Telegram message runs as a prompt, and during a turn it queues as steering. A message the turn
   did not commit drops while the bot is attached, and returns to the editor after a detach.
-- `/new`, `/effort`, `/model`, `/help`, `/skill`, and `/skill:name` run from Telegram. `/login`,
-  `/logout`, `/remote`, `/sources`, and `/system` refuse with a reply that names the terminal, and
-  so does a message while the session is signed out or has no model.
+- `/new`, `/effort`, `/model`, `/help`, `/skill`, `/skill:name`, and `/status` run from Telegram.
+  `/login`, `/logout`, `/remote`, `/sources`, and `/system` refuse with a reply that names the
+  terminal, and so does a message while the session is signed out or has no model. A reply keeps the
+  severity of its notice: a refusal warns, and a refused send fails.
 - A command picker is an inline keyboard under one message, with a `✓` on the current row and a
   `Cancel` button. A stepped `/model` edits the same message per step and adds `‹ Back`. The message
   is scaffolding: a pick and a cancel take it out of the chat, so the event of the command states
@@ -468,8 +481,9 @@ Gemini on Google Vertex AI through a service account key file.
   Telegram, and the bot registers the same commands with Telegram at the attach.
 - A keyboard shows the first 98 rows of a list, so it stays inside the button bound of Telegram. The
   terminal picker shows every row.
-- A `/new` from Telegram opens the new conversation on the event `New conversation · Remote: @bot`,
-  so the bracket of the bot holds.
+- A `/new` from Telegram opens the new conversation on the event
+  `You cleared the conversation while @bot is attached.`, so the bracket of the bot holds. The bot
+  stays attached, because the clear empties the model conversation and not the chat.
 - A photo, a sticker, or a voice note gets one reply: `Drinky reads text alone.`
 - The attach removes an active webhook, confirms every update from before it, and ignores every chat
   but the paired one.
@@ -479,16 +493,20 @@ Gemini on Google Vertex AI through a service account key file.
 - The chat mirrors every committed answer, event, skill head line, and retry line once. The Telegram
   HTML holds bold, italic, code, links, quotes, and `pre` blocks for fences and tables. A reasoning
   block, a tool box, and a user box stay in the terminal.
-- Every event and every line that Drinky wrote for the user takes a quote bar and the symbol of its
-  role. The symbol is `ℹ` for an event, `⚠` for a failed event, and `▸` for a line for the user, a
-  reply included. An answer of the model takes neither, so the chat tells the two apart. The
-  activity message with its summary, the failed turn message, and a picker are controls of the turn
-  and take no bar.
-- A block above 4096 characters continues in a new message that reopens the open tags. A text that
-  Telegram cannot parse goes again as plain text.
+- Every message that Drinky wrote takes a quote bar and the symbol of its role: `ℹ` for information,
+  `⚠` for a warning or a failure, and `→` for a line for the user. The activity message, its
+  summary, the failed turn message, and a picker title keep the bar through every edit, buttons or
+  not. An answer of the model takes neither, so the chat tells the two apart, and a quote in an
+  answer stays a plain quote. A toast carries no symbol.
+- A block above 4096 characters continues in a new message that reopens the open tags. The first
+  part carries the symbol, and a later part keeps the bar alone.
+- A message or an edit that Telegram cannot parse goes again as plain text: the same words without
+  their tags and without the bar, to the same message, with the same reply and buttons. An escaped
+  `<b>` stays literal, and a link keeps its target as text behind its label. The detach event
+  follows the same rule.
 - One activity message per turn shows `Thinking`, `Writing`, or `Running: bash` with the call count.
   At the end it becomes the summary: the outcome, the tool count, the time, the context gauge, and
-  the cost.
+  the cost. A failed summary opens with `⚠`, and every other one with `ℹ`.
 - The activity message holds a `Cancel turn` button and a `Withdraw` button. One tap on
   `Cancel turn` cancels the turn. A withdraw drops the whole queue like Ctrl+P and marks each
   dropped message with 👎, and a tap on an empty queue answers the toast `Nothing queued.`
@@ -506,7 +524,7 @@ Gemini on Google Vertex AI through a service account key file.
   the chat is out of reach, and a report of a send failure feeds itself.
 - The long poll keeps its own head window, so a short configured request timeout never turns it into
   a busy poll.
-- A failed poll or send retries with a backoff. An outage that lasts 30 seconds records one `Error:`
+- A failed poll or send retries with a backoff. An outage that lasts 30 seconds records one `⚠`
   event, and its recovery records one event, so a network that flaps costs no line. A 429 waits the
   named seconds in silence, and a rejection that no retry can fix drops that one message with an
   event.
@@ -514,7 +532,8 @@ Gemini on Google Vertex AI through a service account key file.
   room again, one `⚠` line in the chat states how many messages the run dropped. The line names the
   terminal, which holds the whole transcript. A dropped mark or edit stays silent.
 - A revoked token, a blocked bot, a second poller on the same bot, and a rejected poll each detach
-  with an `Error:` event. A credential rejection detaches before the login picker opens.
+  with a `⚠` event that names the cause. A credential rejection detaches before the login picker
+  opens.
 - A detach and the exit send the detach event alone, within a bound, and drop every pending send.
   The chat is the record of the session up to that moment, and the terminal shows the rest.
 - An event that a task raises while a reply streams waits for the next message boundary, so it never
@@ -528,7 +547,8 @@ Gemini on Google Vertex AI through a service account key file.
 - The channel carries state outward alone, and nothing outside Drinky drives the session. Drinky
   releases the pane on exit. A Herdr that Drinky cannot reach never stops or slows the work.
 - Inside a Herdr pane, the status line shows neither the directory nor the branch, because the pane
-  label holds both.
+  label holds both. The `/status` answer states both, because the answer is one line that stands on
+  its own in the chat and in a copy.
 
 ## Keeping this file true
 

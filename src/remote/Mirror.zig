@@ -12,7 +12,9 @@
 //! turn, and the failed turn message holds `Try again` and `Dismiss`. A tap
 //! names the serial of its keyboard, so the mirror tells a tap on the running
 //! turn from a tap on a keyboard the chat history still shows. The mirror holds
-//! no tap state: each tap acts at once or reads as stale.
+//! no tap state: each tap acts at once or reads as stale. Both messages are
+//! messages that Drinky wrote, so each one takes the quote bar and the symbol of
+//! its role from its first send through every edit, buttons or not.
 //!
 //! The mirror talks to the chat through `chat`: a pointer to the controller, or
 //! to a recorder in a test, with `listens`, `send`, `sendTracked`, and `edit`.
@@ -219,11 +221,20 @@ fn startActivity(self: *Mirror, chat: anytype) !void {
     const turn = &self.turn.?;
     const markup = try self.activityMarkup(turn);
     defer self.gpa.free(markup);
+    const text = try self.activityText(turn);
+    defer self.gpa.free(text);
+    turn.handle = try chat.sendTracked(text, &.{
+        .disable_notification = true,
+        .parse_mode = html.parse_mode,
+        .markup = markup,
+    });
+}
+
+/// The activity message of `turn` as the chat shows it: the state of the turn
+/// under the information role. The result is owned.
+fn activityText(self: *Mirror, turn: *const Turn) ![]u8 {
     var buffer: [activity_bytes_max]u8 = undefined;
-    turn.handle = try chat.sendTracked(
-        turn.activity.text(&buffer),
-        &.{ .disable_notification = true, .markup = markup },
-    );
+    return html.wrapAlloc(self.gpa, .information, turn.activity.text(&buffer));
 }
 
 /// Send every block that committed since the last step, and edit the activity
@@ -244,8 +255,9 @@ fn editActivity(self: *Mirror, chat: anytype, turn: *const Turn) !void {
     const handle = turn.handle orelse return;
     const markup = try self.activityMarkup(turn);
     defer self.gpa.free(markup);
-    var buffer: [activity_bytes_max]u8 = undefined;
-    try chat.edit(handle, turn.activity.text(&buffer), markup);
+    const text = try self.activityText(turn);
+    defer self.gpa.free(text);
+    try chat.edit(handle, text, &.{ .parse_mode = html.parse_mode, .markup = markup });
 }
 
 /// The keyboard of the activity message of `turn`. The result is owned.
@@ -265,10 +277,11 @@ fn activityMarkup(self: *Mirror, turn: *const Turn) ![]u8 {
 }
 
 /// Send the last blocks of the turn, and turn the activity message into the
-/// summary of the turn, which holds no button. The last message of a completed
-/// or failed turn notifies. A canceled turn ends in silence, because the cancel
-/// came from the chat or the terminal took the session over. A failure that
-/// armed a retry sends the failed turn message with its buttons.
+/// summary of the turn, which holds no button and keeps the quote bar. The last
+/// message of a completed or failed turn notifies. A canceled turn ends in
+/// silence, because the cancel came from the chat or the terminal took the
+/// session over. A failure that armed a retry sends the failed turn message with
+/// its buttons.
 pub fn endTurn(self: *Mirror, chat: anytype, view: *const View, end: *const End) !void {
     defer self.turn = null;
     if (!chat.listens()) return;
@@ -277,7 +290,7 @@ pub fn endTurn(self: *Mirror, chat: anytype, view: *const View, end: *const End)
         if (turn.handle) |handle| {
             const text = try self.summary(turn, end);
             defer self.gpa.free(text);
-            try chat.edit(handle, text, null);
+            try chat.edit(handle, text, &.{ .parse_mode = html.parse_mode });
         }
     }
     if (end.retry_armed) try self.sendRetry(chat);
@@ -295,21 +308,32 @@ fn sendRetry(self: *Mirror, chat: anytype) !void {
         .{ .text = dismiss_label, .data = (keyboard.Tap{ .dismiss = serial }).write(&dismiss_data) },
     });
     defer self.gpa.free(markup);
+    const text = try self.retryText();
+    defer self.gpa.free(text);
     self.retry = .{ .serial = serial, .handle = null };
-    self.retry.?.handle = try chat.sendTracked(retry_text, &.{
+    self.retry.?.handle = try chat.sendTracked(text, &.{
         .disable_notification = true,
+        .parse_mode = html.parse_mode,
         .markup = markup,
     });
 }
 
 /// Take the buttons off the failed turn message, because the retry ended: a tap
-/// took it, a turn started, or the conversation cleared. A mirror without one
-/// changes nothing.
+/// took it, a turn started, or the conversation cleared. The message keeps its
+/// text and its quote bar. A mirror without one changes nothing.
 pub fn dismissRetry(self: *Mirror, chat: anytype) !void {
     const retry = self.retry orelse return;
     self.retry = null;
     const handle = retry.handle orelse return;
-    try chat.edit(handle, retry_text, null);
+    const text = try self.retryText();
+    defer self.gpa.free(text);
+    try chat.edit(handle, text, &.{ .parse_mode = html.parse_mode });
+}
+
+/// The failed turn message as the chat shows it: the title of the terminal
+/// caption under the failure role. The result is owned.
+fn retryText(self: *Mirror) ![]u8 {
+    return html.wrapAlloc(self.gpa, .failure, retry_text);
 }
 
 /// Whether a tap on the keyboard `serial` names the running turn. A tap on the
@@ -393,7 +417,7 @@ fn renderBlock(self: *Mirror, block: *const ui.block.Entry) !?[]u8 {
             if (!flagged.mirrored) return null;
             try html.wrap(
                 &out.writer,
-                if (flagged.is_error) .failure else .event,
+                if (flagged.is_error) .failure else .information,
                 flagged.text.items,
             );
         },
@@ -417,25 +441,28 @@ fn sendHtml(self: *Mirror, chat: anytype, text: []const u8, notify: bool) !void 
     }
 }
 
-/// The summary of the turn: its outcome where it did not complete, the tool
-/// count, the time, and the numbers of the status line. The result is owned.
+/// The summary of the turn as the chat shows it: its outcome where it did not
+/// complete, the tool count, the time, and the numbers of the status line. A
+/// failed turn takes the failure role, and every other one the information
+/// role. The result is owned.
 fn summary(self: *Mirror, turn: *const Turn, end: *const End) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(self.gpa);
-    errdefer out.deinit();
+    var text: std.Io.Writer.Allocating = .init(self.gpa);
+    defer text.deinit();
     switch (end.outcome) {
         .completed => {},
-        .canceled => try out.writer.print("Canceled{s}", .{ui.paint.separator}),
-        .failed => try out.writer.print("Failed{s}", .{ui.paint.separator}),
+        .canceled => try text.writer.print("Canceled{s}", .{ui.paint.separator}),
+        .failed => try text.writer.print("Failed{s}", .{ui.paint.separator}),
     }
-    try writeCalls(&out.writer, turn.activity.calls);
+    try writeCalls(&text.writer, turn.activity.calls);
     var buffer: [24]u8 = undefined;
-    try out.writer.print("{s}Time: {s}{s}", .{
+    try text.writer.print("{s}Time: {s}{s}", .{
         ui.paint.separator,
         ai.format.duration(&buffer, end.now_ms - turn.started_ms),
         ui.paint.separator,
     });
-    try ui.status.writeNumbers(&out.writer, end.status);
-    return out.toOwnedSlice();
+    try ui.status.writeNumbers(&text.writer, end.status);
+    const role: html.Role = if (end.outcome == .failed) .failure else .information;
+    return html.wrapAlloc(self.gpa, role, text.written());
 }
 
 /// The tool count as `Tools: N calls`.
@@ -461,6 +488,7 @@ const Recorder = struct {
     const Edited = struct {
         handle: Attachment.Handle,
         text: []u8,
+        parse_mode: ?[]const u8,
         markup: ?[]u8,
     };
 
@@ -520,13 +548,18 @@ const Recorder = struct {
         self: *Recorder,
         handle: Attachment.Handle,
         text: []const u8,
-        markup: ?[]const u8,
+        options: *const Client.EditOptions,
     ) !void {
         const text_copy = try self.gpa.dupe(u8, text);
         errdefer self.gpa.free(text_copy);
-        const markup_copy = try self.copyMarkup(markup);
+        const markup_copy = try self.copyMarkup(options.markup);
         errdefer if (markup_copy) |json| self.gpa.free(json);
-        try self.edits.append(self.gpa, .{ .handle = handle, .text = text_copy, .markup = markup_copy });
+        try self.edits.append(self.gpa, .{
+            .handle = handle,
+            .text = text_copy,
+            .parse_mode = options.parse_mode,
+            .markup = markup_copy,
+        });
     }
 
     fn copyMarkup(self: *Recorder, markup: ?[]const u8) !?[]u8 {
@@ -548,6 +581,9 @@ fn activityKeyboard(comptime serial: []const u8) []const u8 {
     return "{\"inline_keyboard\":[[{\"text\":\"Cancel turn\",\"callback_data\":\"cancel:" ++
         serial ++ "\"}],[{\"text\":\"Withdraw\",\"callback_data\":\"withdraw:" ++ serial ++ "\"}]]}";
 }
+
+/// The failed turn message as the chat receives it.
+const retry_wrapped = "<blockquote>⚠ " ++ retry_text ++ "</blockquote>";
 
 /// The keyboard of the failed turn message with the serial `serial`.
 fn retryKeyboard(comptime serial: []const u8) []const u8 {
@@ -636,7 +672,7 @@ test "a step sends each committed answer, event, and note once, and skips the re
         chat.sends.items[1].text,
     );
     try std.testing.expectEqualStrings(
-        "<blockquote>▸ Skill: zig-style · File: &lt;skill&gt;</blockquote>",
+        "<blockquote>→ Skill: zig-style · File: &lt;skill&gt;</blockquote>",
         chat.sends.items[2].text,
     );
     // A second step over the same blocks sends nothing.
@@ -680,31 +716,41 @@ test "the activity message edits on a state change alone, and the summary ends i
     try blocks.append(.user, .{}, "prompt");
     var mirror = Mirror.init(gpa);
 
-    // The activity message opens with the buttons of the turn.
+    // The activity message opens with the buttons of the turn, under the quote
+    // bar and the information symbol of a message that Drinky wrote.
     try mirror.beginTurn(&chat, 1_000);
-    try std.testing.expectEqualStrings("Thinking", chat.sends.items[0].text);
+    try std.testing.expectEqualStrings("<blockquote>ℹ Thinking</blockquote>", chat.sends.items[0].text);
+    try std.testing.expectEqualStrings(html.parse_mode, chat.sends.items[0].options.parse_mode.?);
     try std.testing.expect(chat.sends.items[0].handle != null);
     try std.testing.expect(chat.sends.items[0].options.disable_notification);
     try std.testing.expectEqualStrings(activityKeyboard("1"), chat.sends.items[0].markup.?);
     const handle = chat.sends.items[0].handle.?;
 
     // Every edit of the state carries the keyboard, because an edit without
-    // one drops it.
+    // one drops it, and the wrapper with its parse mode.
     try mirror.sync(&chat, &blocks.live(1, .{ .streaming = null, .tool = null, .calls = 0 }));
     try std.testing.expectEqual(@as(usize, 0), chat.edits.items.len);
     try mirror.sync(&chat, &blocks.live(1, .{ .streaming = .model, .tool = null, .calls = 0 }));
-    try std.testing.expectEqualStrings("Writing", chat.lastEdit().text);
+    try std.testing.expectEqualStrings("<blockquote>ℹ Writing</blockquote>", chat.lastEdit().text);
+    try std.testing.expectEqualStrings(html.parse_mode, chat.lastEdit().parse_mode.?);
     try std.testing.expectEqual(handle, chat.lastEdit().handle);
     try std.testing.expectEqualStrings(activityKeyboard("1"), chat.lastEdit().markup.?);
     try mirror.sync(&chat, &blocks.live(1, .{ .streaming = null, .tool = "bash", .calls = 1 }));
-    try std.testing.expectEqualStrings("Running: bash · Tools: 1 call", chat.lastEdit().text);
+    try std.testing.expectEqualStrings(
+        "<blockquote>ℹ Running: bash · Tools: 1 call</blockquote>",
+        chat.lastEdit().text,
+    );
     try mirror.sync(&chat, &blocks.live(1, .{ .streaming = null, .tool = "bash", .calls = 1 }));
     try std.testing.expectEqual(@as(usize, 2), chat.edits.items.len);
     try mirror.sync(&chat, &blocks.live(1, .{ .streaming = .thinking, .tool = null, .calls = 2 }));
-    try std.testing.expectEqualStrings("Thinking · Tools: 2 calls", chat.lastEdit().text);
+    try std.testing.expectEqualStrings(
+        "<blockquote>ℹ Thinking · Tools: 2 calls</blockquote>",
+        chat.lastEdit().text,
+    );
 
     // The last answer block closes at the receipt, so it goes out with the end
-    // of the turn, and it alone notifies. The summary holds no button.
+    // of the turn, and it alone notifies. The summary holds no button and keeps
+    // the wrapper.
     try blocks.append(.model, .{}, "first");
     try blocks.append(.model, .{}, "last");
     try mirror.endTurn(&chat, &blocks.idle(), &.{
@@ -717,9 +763,10 @@ test "the activity message edits on a state change alone, and the summary ends i
     try std.testing.expectEqualStrings("last", chat.sends.items[2].text);
     try std.testing.expect(!chat.sends.items[2].options.disable_notification);
     try std.testing.expectEqualStrings(
-        "Tools: 2 calls · Time: 2m 5s · Context: 45% · Cost: ~$0.42",
+        "<blockquote>ℹ Tools: 2 calls · Time: 2m 5s · Context: 45% · Cost: ~$0.42</blockquote>",
         chat.lastEdit().text,
     );
+    try std.testing.expectEqualStrings(html.parse_mode, chat.lastEdit().parse_mode.?);
     try std.testing.expect(chat.lastEdit().markup == null);
     try std.testing.expect(mirror.turn == null);
     // The turn is over, so a tap on its keyboard is stale.
@@ -741,7 +788,7 @@ test "a tap names the running turn alone, and the next turn makes its serial sta
     try std.testing.expect(!mirror.namesTurn(7));
     try std.testing.expect(mirror.namesTurn(1));
     try mirror.sync(&chat, &blocks.live(0, .{ .streaming = .model, .tool = null, .calls = 0 }));
-    try std.testing.expectEqualStrings("Writing", chat.lastEdit().text);
+    try std.testing.expectEqualStrings("<blockquote>ℹ Writing</blockquote>", chat.lastEdit().text);
     try std.testing.expectEqualStrings(activityKeyboard("1"), chat.lastEdit().markup.?);
     try std.testing.expectEqual(@as(usize, 1), chat.edits.items.len);
 
@@ -777,17 +824,22 @@ test "a failed turn that armed a retry sends the failed turn message, which lose
         .now_ms = 0,
         .retry_armed = true,
     });
-    try std.testing.expectEqualStrings(retry_text, chat.lastSend().text);
+    // The message is a message of Drinky about a failure, so it takes the quote
+    // bar and the failure symbol.
+    try std.testing.expectEqualStrings(retry_wrapped, chat.lastSend().text);
+    try std.testing.expectEqualStrings(html.parse_mode, chat.lastSend().options.parse_mode.?);
     try std.testing.expectEqualStrings(retryKeyboard("3"), chat.lastSend().markup.?);
     try std.testing.expect(chat.lastSend().options.disable_notification);
     const handle = chat.lastSend().handle.?;
     try std.testing.expect(mirror.namesRetry(3));
     try std.testing.expect(!mirror.namesRetry(2));
 
-    // The retry ends: the message keeps its text and loses its buttons.
+    // The retry ends: the message keeps its text and its wrapper, and it loses
+    // its buttons.
     try mirror.dismissRetry(&chat);
     try std.testing.expectEqual(handle, chat.lastEdit().handle);
-    try std.testing.expectEqualStrings(retry_text, chat.lastEdit().text);
+    try std.testing.expectEqualStrings(retry_wrapped, chat.lastEdit().text);
+    try std.testing.expectEqualStrings(html.parse_mode, chat.lastEdit().parse_mode.?);
     try std.testing.expect(chat.lastEdit().markup == null);
     try std.testing.expect(!mirror.namesRetry(3));
     const edits = chat.edits.items.len;
@@ -796,7 +848,7 @@ test "a failed turn that armed a retry sends the failed turn message, which lose
 
     // An attach that finds a waiting retry sends the message at once.
     try mirror.open(&chat, &.{ .blocks = &.{}, .committed = 0, .tail = null, .retry_waits = true });
-    try std.testing.expectEqualStrings(retry_text, chat.lastSend().text);
+    try std.testing.expectEqualStrings(retry_wrapped, chat.lastSend().text);
     try std.testing.expectEqualStrings(retryKeyboard("4"), chat.lastSend().markup.?);
     try std.testing.expect(mirror.namesRetry(4));
 }
@@ -865,8 +917,11 @@ test "a canceled turn ends in silence, and a failed turn notifies its error" {
     try blocks.append(.event, .{}, "You canceled the turn.");
     try mirror.endTurn(&chat, &blocks.idle(), &.{ .outcome = .canceled, .status = &test_status, .now_ms = 500 });
     try std.testing.expect(chat.lastSend().options.disable_notification);
+    // The summary keeps the outcome word, and a canceled turn keeps the
+    // information role, because nothing failed.
     try std.testing.expectEqualStrings(
-        "Canceled · Tools: 0 calls · Time: 500ms · Context: 45% · Cost: ~$0.42",
+        "<blockquote>ℹ Canceled · Tools: 0 calls · Time: 500ms · Context: 45% · " ++
+            "Cost: ~$0.42</blockquote>",
         chat.lastEdit().text,
     );
 
@@ -878,7 +933,12 @@ test "a canceled turn ends in silence, and a failed turn notifies its error" {
         chat.lastSend().text,
     );
     try std.testing.expect(!chat.lastSend().options.disable_notification);
-    try std.testing.expect(std.mem.startsWith(u8, chat.lastEdit().text, "Failed · Tools: 0 calls · Time: 2.0s"));
+    // A failed turn takes the failure symbol on its summary too.
+    try std.testing.expect(std.mem.startsWith(
+        u8,
+        chat.lastEdit().text,
+        "<blockquote>⚠ Failed · Tools: 0 calls · Time: 2.0s",
+    ));
 }
 
 test "an open starts at the committed frontier and gives a running turn its activity message" {
@@ -888,7 +948,7 @@ test "an open starts at the committed frontier and gives a running turn its acti
     var blocks: Blocks = .{ .gpa = gpa };
     defer blocks.deinit();
     try blocks.append(.model, .{}, "before the attach");
-    try blocks.append(.event, .{ .mirrored = false }, "Remote: @drinky_bot · Context: 0%");
+    try blocks.append(.event, .{ .mirrored = false }, "You attached @drinky_bot.");
     var mirror = Mirror.init(gpa);
 
     // An idle attach: the history stays in the terminal.
@@ -901,7 +961,10 @@ test "an open starts at the committed frontier and gives a running turn its acti
     try mirror.beginTurn(&chat, 0);
     try std.testing.expectEqual(@as(usize, 1), chat.sends.items.len);
     try mirror.open(&chat, &blocks.live(2, .{ .streaming = null, .tool = "read", .calls = 3 }));
-    try std.testing.expectEqualStrings("Running: read · Tools: 3 calls", chat.lastSend().text);
+    try std.testing.expectEqualStrings(
+        "<blockquote>ℹ Running: read · Tools: 3 calls</blockquote>",
+        chat.lastSend().text,
+    );
     try std.testing.expectEqual(@as(?Attachment.Handle, 2), chat.lastSend().handle);
 }
 
@@ -968,7 +1031,7 @@ const Reporter = struct {
         return null;
     }
 
-    fn edit(_: *Reporter, _: Attachment.Handle, _: []const u8, _: ?[]const u8) !void {}
+    fn edit(_: *Reporter, _: Attachment.Handle, _: []const u8, _: *const Client.EditOptions) !void {}
 };
 
 // A send can report into the transcript, and the report appends a block. The

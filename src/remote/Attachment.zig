@@ -15,8 +15,13 @@
 //! sender. A tracked send returns a handle, and an edit names that handle. The
 //! queue holds the edit behind the send, and the newest text of a pending edit
 //! replaces an older one, so a burst of state changes costs one edit. An edit
-//! carries the keyboard of the message too, because an edit without one drops
-//! it. A reaction names the id of a message of the chat.
+//! carries the parse mode of its text and the keyboard of the message too,
+//! because an edit without a keyboard drops it. A reaction names the id of a
+//! message of the chat.
+//!
+//! A formatted message or edit that Telegram cannot parse goes again as plain
+//! text: the same words without their tags, to the same target, with the same
+//! reply and keyboard. The ordered queue then never stalls on one block.
 //!
 //! A close ends the sender and the answerer at once and drops what their queues
 //! still hold, because the chat is the record of the session up to the close and
@@ -31,6 +36,7 @@ const std = @import("std");
 const ai = @import("ai");
 
 const Client = @import("Client.zig");
+const html = @import("html.zig");
 
 const Attachment = @This();
 
@@ -310,9 +316,12 @@ const Answer = struct {
     }
 };
 
-/// The new state of an edited message: its text and its keyboard. Owned.
+/// The new state of an edited message: its text, the parse mode of the text,
+/// and its keyboard. The text and the keyboard are owned, and the parse mode
+/// stays valid for the life of the attachment.
 const Pending = struct {
     text: []u8,
+    parse_mode: ?[]const u8,
     markup: ?[]u8,
 
     fn deinit(self: *const Pending, gpa: std.mem.Allocator) void {
@@ -497,18 +506,23 @@ pub fn sendTracked(
 }
 
 /// Replace the text of the tracked message `handle` with `text` and its
-/// keyboard with `markup`, once it and every item before it went out. A null
-/// `markup` removes the keyboard. A pending edit of the same message gives its
-/// state up for this one, so the chat sees the newest state and skips the older
-/// ones. An edit of a message whose slot another message took drops in silence.
+/// keyboard with the one of `options`, once it and every item before it went
+/// out. An edit without a keyboard removes the one the message holds. A pending
+/// edit of the same message gives its state up for this one, so the chat sees
+/// the newest state and skips the older ones. An edit of a message whose slot
+/// another message took drops in silence.
 pub fn edit(
     self: *Attachment,
     handle: Handle,
     text: []const u8,
-    markup: ?[]const u8,
+    options: *const Client.EditOptions,
 ) SendError!void {
-    var pending: Pending = .{ .text = try self.gpa.dupe(u8, text), .markup = null };
-    pending.markup = if (markup) |json| self.gpa.dupe(u8, json) catch |err| {
+    var pending: Pending = .{
+        .text = try self.gpa.dupe(u8, text),
+        .parse_mode = options.parse_mode,
+        .markup = null,
+    };
+    pending.markup = if (options.markup) |json| self.gpa.dupe(u8, json) catch |err| {
         self.gpa.free(pending.text);
         return err;
     } else null;
@@ -812,14 +826,20 @@ fn runDrain(self: *Attachment) void {
 fn deliverFinal(self: *Attachment, final: *const Outbound.Send) void {
     const client = &self.send_client;
     var failures: u32 = 0;
-    var options = final.options;
+    var delivery: Delivery = .{ .send = final.* };
+    var maybe_plain: ?[]u8 = null;
+    defer if (maybe_plain) |plain| self.gpa.free(plain);
     // The loop ends on a send, a permanent failure, or the end of the window,
     // and every other pass waits on the network.
     while (true) {
         const remaining = self.drainRemainingMs() orelse unreachable;
         if (remaining == 0) return;
         client.connect_ms = if (client.connect_ms == 0) remaining else @min(client.connect_ms, remaining);
-        _ = client.sendMessage(self.chat_id, final.text, &options) catch |err| switch (err) {
+        _ = client.sendMessage(
+            self.chat_id,
+            delivery.send.text,
+            &delivery.send.options,
+        ) catch |err| switch (err) {
             error.RateLimited => {
                 self.pause(@min(client.retry_after_s *| std.time.ms_per_s, remaining)) catch return;
                 continue;
@@ -833,8 +853,8 @@ fn deliverFinal(self: *Attachment, final: *const Outbound.Send) void {
             // The last message of the chat goes again as plain text, because a
             // formatting that Telegram cannot parse must not drop it.
             error.Rejected => {
-                if (options.parse_mode == null or !rejectedParse(client)) return;
-                options.parse_mode = null;
+                if (!rejectedParse(client)) return;
+                maybe_plain = self.plainOf(&delivery) orelse return;
                 continue;
             },
             error.Canceled,
@@ -845,6 +865,24 @@ fn deliverFinal(self: *Attachment, final: *const Outbound.Send) void {
         };
         return;
     }
+}
+
+/// Turn the formatted text of `delivery` into plain text, so the same words go
+/// again without a parse mode after Telegram refused their formatting. The
+/// delivery then names the plain text, which the caller owns and frees. Null
+/// for an item without formatting, and for a text that cannot allocate, which
+/// then drops with its report.
+fn plainOf(self: *Attachment, delivery: *Delivery) ?[]u8 {
+    const text: *[]u8, const parse_mode: *?[]const u8 = switch (delivery.*) {
+        .send => |*send_item| .{ &send_item.text, &send_item.options.parse_mode },
+        .edit => |*taken| .{ &taken.pending.text, &taken.pending.parse_mode },
+        .delete, .react => return null,
+    };
+    if (parse_mode.* == null) return null;
+    const plain = html.plainAlloc(self.gpa, text.*) catch return null;
+    text.* = plain;
+    parse_mode.* = null;
+    return plain;
 }
 
 fn emit(self: *Attachment, payload: Event.Payload) error{Closed}!void {
@@ -1116,7 +1154,7 @@ fn callChat(self: *Attachment, delivery: *const Delivery) Client.Error!void {
         .edit => |taken| try client.editMessageText(
             .{ .chat_id = self.chat_id, .message_id = taken.message_id },
             taken.pending.text,
-            taken.pending.markup,
+            &.{ .parse_mode = taken.pending.parse_mode, .markup = taken.pending.markup },
         ),
         .delete => |message_id| try client.deleteMessage(.{
             .chat_id = self.chat_id,
@@ -1130,15 +1168,17 @@ fn callChat(self: *Attachment, delivery: *const Delivery) Client.Error!void {
 }
 
 /// Deliver one item, with the waits and the retries of the pace. The item drops
-/// when Telegram rejects it for good. A message whose formatting Telegram cannot
-/// parse goes again as plain text, so the ordered queue never stalls on one
-/// block.
+/// when Telegram rejects it for good. A message or an edit whose formatting
+/// Telegram cannot parse goes again as plain text, so the ordered queue never
+/// stalls on one block.
 fn deliver(
     self: *Attachment,
     state: *SendState,
     delivery_in: Delivery,
 ) error{ Closed, Canceled, Detached }!void {
     var delivery = delivery_in;
+    var maybe_plain: ?[]u8 = null;
+    defer if (maybe_plain) |plain| self.gpa.free(plain);
     const client = &self.send_client;
     // The loop ends on a send, a drop, or an end of the task, and every other
     // pass waits on the network.
@@ -1158,12 +1198,12 @@ fn deliver(
                 continue;
             },
             error.Rejected => {
-                if (delivery == .send and delivery.send.options.parse_mode != null and
-                    rejectedParse(client))
-                {
-                    delivery.send.options.parse_mode = null;
-                    state.sent_ms = self.nowMs();
-                    continue;
+                if (rejectedParse(client)) {
+                    if (self.plainOf(&delivery)) |plain| {
+                        maybe_plain = plain;
+                        state.sent_ms = self.nowMs();
+                        continue;
+                    }
                 }
                 // A copy that fails costs the description alone, not the report.
                 const text: []u8 = self.gpa.dupe(u8, client.description()) catch &.{};
@@ -1477,9 +1517,22 @@ test "the sender delivers in order, retries a transient failure, and drops a rej
     );
 }
 
+/// The rejection of a text whose formatting Telegram cannot parse.
+const cannot_parse_reply: testing.Reply = .{
+    .status = 400,
+    .body = "{\"ok\":false,\"error_code\":400,\"description\":\"Bad Request: can't parse entities\"}",
+};
+
+/// A formatted message of Drinky with a symbol, an escaped literal tag, and an
+/// escaped ampersand, and the plain text that it becomes: the tags go, the
+/// symbol stays, and every reference decodes once.
+const formatted_text = "<blockquote>⚠ Telegram rejected &lt;b&gt; &amp; more.</blockquote>";
+const formatted_plain = "⚠ Telegram rejected <b> & more.";
+
 // A formatted block that Telegram cannot parse must not stall the queue behind
-// it, and the chat must still get its text. The same bytes go again without a
-// parse mode, and the block behind it follows.
+// it, and the chat must still get its words. The plain text of the same message
+// goes again without a parse mode, to the same reply and with the same keyboard,
+// and the block behind it follows.
 test "a message whose formatting fails to parse goes again as plain text" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
@@ -1487,7 +1540,7 @@ test "a message whose formatting fails to parse goes again as plain text" {
     const io = threaded.io();
     var server = try testing.Server.init(gpa, io, &quiet_scripts ++ [_]testing.Script{
         .{ .method = "sendMessage", .replies = &.{
-            .{ .status = 400, .body = "{\"ok\":false,\"error_code\":400,\"description\":\"Bad Request: can't parse entities\"}" },
+            cannot_parse_reply,
             .{ .body = ok_sent },
             .{ .body = ok_sent },
         } },
@@ -1501,17 +1554,62 @@ test "a message whose formatting fails to parse goes again as plain text" {
     defer attachment.destroy();
     try attachment.start();
 
-    try attachment.send("<b>broken", &.{ .parse_mode = "HTML" });
+    const keyboard = "{\"inline_keyboard\":[[{\"text\":\"Dismiss\",\"callback_data\":\"dismiss:1\"}]]}";
+    try attachment.send(formatted_text, &.{ .parse_mode = "HTML", .reply_to = 5, .markup = keyboard });
     try attachment.send("next", &.{});
     try server.waitForSends(3);
     try server.finish();
     var buffer: [4][]const u8 = undefined;
     const sends = server.sentBodies(&buffer);
     try std.testing.expect(std.mem.indexOf(u8, sends[0], "\"parse_mode\":\"HTML\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, sends[1], "\"text\":\"<b>broken\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, sends[1], "parse_mode") == null);
+    try std.testing.expectEqualStrings(
+        "{\"chat_id\":99,\"text\":\"" ++ formatted_plain ++ "\",\"disable_notification\":false," ++
+            "\"reply_parameters\":{\"message_id\":5},\"reply_markup\":" ++ keyboard ++ "}",
+        sends[1],
+    );
     try std.testing.expect(std.mem.indexOf(u8, sends[2], "\"text\":\"next\"") != null);
     // The resend is no rejection, so nothing reports.
+    try std.testing.expectEqual(@as(usize, 0), collector.events.items.len);
+}
+
+// An edit carries formatting too, and the same rule holds for it: the plain
+// text of the state goes again as an edit of the same message, with its
+// keyboard, so the activity message never freezes on a parse failure.
+test "an edit whose formatting fails to parse goes again as plain text on the same message" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var server = try testing.Server.init(gpa, io, &quiet_scripts ++ [_]testing.Script{
+        .{ .method = "sendMessage", .replies = &.{
+            .{ .body = "{\"ok\":true,\"result\":{\"message_id\":314}}" },
+        } },
+        .{ .method = "editMessageText", .replies = &.{ cannot_parse_reply, .{ .body = ok_true } } },
+    });
+    defer server.deinit();
+    try server.start();
+    var collector: Collector = .{ .gpa = gpa, .io = io };
+    defer collector.deinit();
+    var url_buffer: [64]u8 = undefined;
+    const attachment = try testAttachment(gpa, io, &server, &url_buffer, &collector);
+    defer attachment.destroy();
+    try attachment.start();
+
+    const keyboard = "{\"inline_keyboard\":[[{\"text\":\"Cancel turn\",\"callback_data\":\"cancel:1\"}]]}";
+    const handle = try attachment.sendTracked("Thinking", &.{});
+    try server.waitForSends(1);
+    try attachment.edit(handle, formatted_text, &.{ .parse_mode = "HTML", .markup = keyboard });
+    try std.testing.expectEqualStrings(
+        "{\"chat_id\":99,\"message_id\":314,\"text\":\"" ++ formatted_text ++ "\"," ++
+            "\"parse_mode\":\"HTML\",\"reply_markup\":" ++ keyboard ++ "}",
+        try server.waitForRequest("/editMessageText", 0),
+    );
+    try std.testing.expectEqualStrings(
+        "{\"chat_id\":99,\"message_id\":314,\"text\":\"" ++ formatted_plain ++ "\"," ++
+            "\"reply_markup\":" ++ keyboard ++ "}",
+        try server.waitForRequest("/editMessageText", 1),
+    );
+    try server.finish();
     try std.testing.expectEqual(@as(usize, 0), collector.events.items.len);
 }
 
@@ -1542,12 +1640,12 @@ test "an edit waits behind its tracked send, and the newest text replaces a pend
     });
     // Both edits queue while the send still waits for its reply, so one edit
     // goes out with the newest state, keyboard included.
-    try attachment.edit(handle, "Writing", keyboard);
-    try attachment.edit(handle, "Running: bash", keyboard);
+    try attachment.edit(handle, "Writing", &.{ .markup = keyboard });
+    try attachment.edit(handle, "Running: bash", &.{ .markup = keyboard });
     // The sender took that state once its edit arrived, so the next edit opens
     // a pending one of its own. The summary drops the keyboard.
     _ = try server.waitForRequest("/editMessageText", 0);
-    try attachment.edit(handle, "Tools: 1 call", null);
+    try attachment.edit(handle, "Tools: 1 call", &.{});
     _ = try server.waitForRequest("/editMessageText", 1);
     try server.finish();
     var buffer: [2][]const u8 = undefined;
@@ -1599,7 +1697,7 @@ test "a deletion follows the edits of its message, and a later edit of it drops"
     const handle = try attachment.sendTracked("Effort", &.{ .disable_notification = true });
     // Both queue while the send still waits for its reply, so the step of the
     // picker goes out and the deletion follows it.
-    try attachment.edit(handle, "Model", null);
+    try attachment.edit(handle, "Model", &.{});
     try attachment.delete(handle);
     try std.testing.expectEqualStrings(
         "{\"chat_id\":99,\"message_id\":314,\"text\":\"Model\"}",
@@ -1611,7 +1709,7 @@ test "a deletion follows the edits of its message, and a later edit of it drops"
     );
 
     // The message is gone, so its handle names none and a late edit drops.
-    try attachment.edit(handle, "late", null);
+    try attachment.edit(handle, "late", &.{});
     try server.finish();
     try std.testing.expectEqual(@as(usize, 1), server.countOf("/editMessageText"));
 }
@@ -1747,11 +1845,11 @@ test "an edit that arrives during an edit keeps its place in the queue" {
     try attachment.start();
 
     const handle = try attachment.sendTracked("Thinking", &.{});
-    try attachment.edit(handle, "Writing", null);
+    try attachment.edit(handle, "Writing", &.{});
     // The first edit is in flight, and its reply waits.
     _ = try server.waitForRequest("/editMessageText", 0);
     try attachment.send("answer", &.{});
-    try attachment.edit(handle, "Tools: 0 calls", null);
+    try attachment.edit(handle, "Tools: 0 calls", &.{});
     _ = try server.waitForRequest("/editMessageText", 1);
     try server.finish();
     var order: [4][]const u8 = undefined;
@@ -1796,7 +1894,7 @@ test "a tracked message with pending work keeps its slot through later tracked s
     try attachment.start();
 
     const first = try attachment.sendTracked("Thinking", &.{});
-    try attachment.edit(first, "Tools: 0 calls", null);
+    try attachment.edit(first, "Tools: 0 calls", &.{});
     for (0..later_sends) |_| _ = try attachment.sendTracked("Thinking", &.{});
     const summary = try server.waitForRequest("/editMessageText", 0);
     try std.testing.expectEqualStrings(
@@ -1830,7 +1928,7 @@ test "an edit of a message that never went out drops" {
     try attachment.start();
 
     const handle = try attachment.sendTracked("", &.{});
-    try attachment.edit(handle, "Writing", null);
+    try attachment.edit(handle, "Writing", &.{});
     try attachment.react(7, .committed);
     try collector.waitFor(1);
     try server.finish();
@@ -2012,6 +2110,41 @@ test "a send in flight at the close cannot hold the final message back" {
     try std.testing.expectEqual(@as(usize, 2), sends.len);
     try std.testing.expect(std.mem.indexOf(u8, sends[0], "\"text\":\"slow\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, sends[1], "\"text\":\"final\"") != null);
+}
+
+// The final message of the chat follows the rule of every other message: a
+// parse failure sends its plain text, so the chat learns of its end.
+test "a final message whose formatting fails to parse goes again as plain text" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var server = try testing.Server.init(gpa, io, &quiet_scripts ++ [_]testing.Script{
+        .{ .method = "sendMessage", .replies = &.{ cannot_parse_reply, .{ .body = ok_sent } } },
+    });
+    defer server.deinit();
+    try server.start();
+    var collector: Collector = .{ .gpa = gpa, .io = io };
+    defer collector.deinit();
+    var url_buffer: [64]u8 = undefined;
+    const attachment = try testAttachment(gpa, io, &server, &url_buffer, &collector);
+    var destroyed = false;
+    defer if (!destroyed) attachment.destroy();
+    try attachment.start();
+    try server.waitForRequests(3);
+
+    try attachment.close(.{ .text = formatted_text, .parse_mode = "HTML" });
+    destroyed = true;
+    attachment.destroy();
+    try server.finish();
+    var buffer: [4][]const u8 = undefined;
+    const sends = server.sentBodies(&buffer);
+    try std.testing.expectEqual(@as(usize, 2), sends.len);
+    try std.testing.expect(std.mem.indexOf(u8, sends[0], "\"parse_mode\":\"HTML\"") != null);
+    try std.testing.expectEqualStrings(
+        "{\"chat_id\":99,\"text\":\"" ++ formatted_plain ++ "\",\"disable_notification\":true}",
+        sends[1],
+    );
 }
 
 // The final message goes again as plain text for a parse failure alone. Any
