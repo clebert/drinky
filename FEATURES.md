@@ -514,8 +514,8 @@ Gemini on Google Vertex AI through a service account key file.
   buttons, and so does an attach that finds a waiting retry. The message loses its buttons after a
   tap, at the start of a turn, and at `/new`.
 - The last answer of a completed turn holds a `Shorten` button. One tap asks the model to restate
-  that answer for a phone screen, with the outcome first and one line per point that changes a
-  decision. The request runs as a normal turn, and its line reads
+  that answer for a phone screen, with the result first and one line per point that the user needs
+  for the next decision. The request runs as a normal turn, and its line reads
   `Drinky asked the model to shorten the last answer.`
 - The `Shorten` button never leaves its message, so the newest answer alone answers a tap. A tap on
   an older answer gets `This answer is not the newest one.`, and a tap during a turn gets

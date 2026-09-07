@@ -55,10 +55,9 @@ const telegram_no_model_refusal =
 const shorten_note_text = "Drinky asked the model to shorten the last answer.";
 const shorten_request_text =
     \\Shorten your last answer for a phone screen.
-    \\- Line 1 states the outcome, and it stands alone.
-    \\- One line states each point that changes a decision. Leave out every other point.
+    \\- Line 1 states the result. A reader who stops there knows it.
+    \\- One line states each point that the user needs for the next decision. Leave out every other point.
     \\- Write Simplified Technical English. Use a plain word, never a metaphor.
-    \\- Add no new work, no new finding, and no question.
 ;
 
 /// The row that a model picker shows while its fetch runs. The title of the
