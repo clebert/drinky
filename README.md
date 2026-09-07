@@ -3,31 +3,24 @@
 A dependency-free coding agent you can own end to end.
 
 Give Drinky a prompt in the terminal. The model can read, search, and change files or run commands
-in the working directory. Drinky talks to Anthropic and OpenAI, through a subscription login, an
-Anthropic Console login, or an API key, and to Gemini on Google Vertex AI through a service account
-key file.
+in the working directory. Drinky talks to Anthropic, OpenAI, and Gemini on Google Vertex AI.
 
-## Philosophy
-
-Drinky is a dependency-free Zig program. It needs no Node.js runtime or third-party package tree. A
-complete review covers Drinky and the Zig standard library.
-
-Drinky does one job: it runs an agent loop with a small set of file and shell tools. It ships no
-sub-agents, no workflow mode, and no opinion about how the model does its work. Those rules live in
-your instruction files, where you can read and change them.
-
-Use Drinky as it is, or fork it and add the features your workflow needs.
+Drinky is a single Zig program. It needs no Node.js runtime or third-party package tree, so a
+complete review covers Drinky and the Zig standard library. Use Drinky as it is, or fork it and add
+the features your workflow needs.
 
 ## Highlights
 
 1. **Terminal-native:** The conversation stays in the normal scrollback. A session is the process,
    and Drinky saves no conversation to resume.
-2. **One job:** An agent loop and seven tools, with no sub-agents and no workflow mode.
-3. **Small system prompt:** The compiled prompt states the mechanics. Your instruction files and
+2. **Telegram remote control:** Attach a bot and drive the session from its chat, while the terminal
+   shows the work.
+3. **One job:** An agent loop and seven tools, with no sub-agents and no workflow mode.
+4. **Small system prompt:** The compiled prompt states the mechanics. Your instruction files and
    skills carry every rule about how to work.
-4. **Self-describing:** The model can read every command, setting, and key binding of Drinky, so it
+5. **Self-describing:** The model can read every command, setting, and key binding of Drinky, so it
    can maintain your config for you.
-5. **No compiled-in models:** Every model, limit, and price comes from the provider at runtime.
+6. **No compiled-in models:** Every model, limit, and price comes from the provider at runtime.
 
 See [`FEATURES.md`](FEATURES.md) for the complete capability overview.
 
@@ -44,29 +37,34 @@ zig build -Doptimize=ReleaseSafe
 ./zig-out/bin/drinky
 ```
 
+## Sign in
+
 Run `/login` to sign in with a subscription account or an Anthropic Console account. The Console
 login mints an API key in the browser and stores it, so no environment variable is needed. You can
 also set `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` by hand. For Gemini on Google Vertex AI, set
 `GOOGLE_APPLICATION_CREDENTIALS` to a service account key file and `GOOGLE_CLOUD_LOCATION` to `eu`,
 `us`, or `global`. Drinky serves Gemini 3 and later.
 
-Inside a [Herdr](https://herdr.dev) pane, Drinky reports its state over the Herdr socket, so Herdr
-can notify you when a turn ends or fails. The status line leaves the directory and the branch to the
-Herdr pane label. This needs no setup.
+An API key or a service account key file uses the public provider API. A subscription login uses an
+unsupported provider interface that can change or stop working. The minted key bills at API rates
+over the public API, but the login that mints it is unsupported. See the implementation notes for
+[Anthropic](lib/ai/anthropic/root.zig) and [OpenAI](lib/ai/openai/oauth.zig).
+
+Drinky is not affiliated with Anthropic or OpenAI.
 
 ## Slash commands
 
 A line that starts with a slash runs in Drinky and reaches no model. Type `/` or `/help` to open the
-complete command list. You can also ask Drinky to explain its commands, keys, and settings.
+complete command list.
 
 - `/login` signs in.
 - `/model` and `/effort` change the model and the reasoning effort.
 - `/skill` picks a discovered skill. `/skill:name` loads one skill with an optional task.
 - `/new` clears the conversation.
-- `/status` states the session, also during a turn.
+- `/status` states the session.
 - `/sources` shows the loaded instruction files and skills.
 - `/system` shows the complete system prompt.
-- `/remote` attaches a Telegram bot, so you drive the session from its chat.
+- `/remote` attaches a Telegram bot.
 
 ## Telegram remote control
 
@@ -74,17 +72,19 @@ Create a bot with BotFather, run `/remote`, and paste the token. Drinky shows a 
 the private chat that sends it binds to the bot. A saved bot attaches with one pick.
 
 While a bot is attached, the chat holds the input and the terminal shows the work. A message from
-the chat runs as a prompt, or queues as steering during a turn. Its reaction states where it stands:
-👀 when Drinky takes it, 👍 when it reaches the conversation, and 👎 when it drops. The chat mirrors
-every answer and event. A message that Drinky wrote takes its own symbol, so the chat tells it from
-an answer of the model. One activity message per turn shows the state and holds the `Cancel turn`
-and `Withdraw` buttons, and the last answer of a completed turn holds a `Shorten` button that asks
-the model for a short restatement. `/effort`, `/model`, `/help`, and `/skill` open inline keyboards
-in the chat, `/status` answers with the state of the session, and `/new` clears the conversation.
-`/login`, `/logout`, `/remote`, `/sources`, and `/system` run in the terminal alone.
+the chat runs as a prompt, or queues as steering during a turn. The chat mirrors every answer and
+event, and one message per turn shows the state and holds a `Cancel turn` button. `/new`, `/effort`,
+`/model`, `/help`, `/skill`, and `/status` run from the chat, and the other commands run in the
+terminal alone. Every exit key in the terminal detaches the bot.
 
-Every exit key in the terminal detaches the bot. The bot tokens live in the owner-only
-`~/.drinky/remote.json`, and Drinky talks to the Telegram Bot API directly, with no dependency.
+The bot tokens live in the owner-only `~/.drinky/remote.json`, and Drinky talks to the Telegram Bot
+API directly.
+
+## Herdr
+
+Inside a [Herdr](https://herdr.dev) pane, Drinky reports its state over the Herdr socket, so Herdr
+can notify you when a turn ends or fails. The status line leaves the directory and the branch to the
+Herdr pane label. This needs no setup.
 
 ## Configuration
 
@@ -92,20 +92,8 @@ The `~/.drinky/config.json` file is optional. It controls instruction files, req
 limits, required skills, a default effort level, and interface settings. Drinky reads the file only
 at startup and never writes it. You can keep it in version control.
 
-Ask the model to explain or maintain the file.
-
 The config file holds no secrets. Credentials, project state, and cached model information live in
 separate files under `~/.drinky/`.
-
-## Provider access
-
-API-key accounts use the public provider APIs. Subscription accounts use unsupported provider
-interfaces that can change or stop working. The Anthropic Console account sits between them. Its key
-bills at API rates and uses the public API, but the login that mints it is unsupported. See the
-implementation notes for [Anthropic](lib/ai/anthropic/root.zig) and
-[OpenAI](lib/ai/openai/oauth.zig).
-
-Drinky is not affiliated with Anthropic or OpenAI.
 
 ## Security
 
