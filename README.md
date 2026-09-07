@@ -1,6 +1,6 @@
 # Drinky
 
-A dependency-free coding agent you can own end to end.
+A dependency-free terminal coding agent you can read end to end.
 
 Give Drinky a prompt in the terminal. The model can read, search, and change files or run commands
 in the working directory. Drinky talks to Anthropic, OpenAI, and Gemini on Google Vertex AI.

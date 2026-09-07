@@ -1,4 +1,4 @@
-Drinky is a dependency-free Zig coding agent that keeps the conversation in terminal scrollback.
+Drinky is a dependency-free Zig coding agent that keeps the conversation in the terminal scrollback.
 
 ## Core rules
 
