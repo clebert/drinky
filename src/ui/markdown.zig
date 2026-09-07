@@ -2452,15 +2452,31 @@ test "markdown holds row parity over arbitrary marker soup" {
     const random = prng.random();
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(gpa);
-    for (0..150) |_| {
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var view = terminal.View.init(gpa, &out.writer);
+    defer view.deinit();
+    for (0..400) |_| {
         text.clearRetainingCapacity();
         for (0..random.uintLessThan(usize, 40)) |_| {
             try text.appendSlice(gpa, tokens[random.uintLessThan(usize, tokens.len)]);
         }
         for ([_]usize{ 1, 2, 3, 5, 9, 40, 100 }) |columns| {
-            const bytes = try painted(gpa, text.items, columns, null, 0);
-            defer gpa.free(bytes);
-            try std.testing.expectEqual(rows(text.items, columns), paintedRows(bytes));
+            out.clearRetainingCapacity();
+            // Each case needs a full frame, not a diff. Reuse the buffers
+            // to avoid repeated allocation.
+            view.forget();
+            const sink = try view.beginFrame(.{ .columns = columns, .rows = 2000 }, 1);
+            const placement: paint.Placement = .{
+                .sink = sink,
+                .id = 0,
+                .columns = columns,
+                .base = 0,
+                .skip = 0,
+            };
+            try render(&placement, null, text.items);
+            try view.render();
+            try std.testing.expectEqual(rows(text.items, columns), paintedRows(out.written()));
         }
     }
 }

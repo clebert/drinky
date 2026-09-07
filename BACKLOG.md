@@ -5,8 +5,8 @@ outranks a new capability. Inside a section the top entry is the next one to do.
 
 An entry is one line: a bold subject, an em dash, and one sentence. An italic note can follow it.
 The note holds only what the implementer cannot re-derive from the code: an external constraint, a
-decision already taken, or a dependency on another entry. Module layout and extension seams live in
-`AGENTS.md`.
+decision already taken, or a dependency on another entry. The code holds the module layout and the
+extension seams.
 
 ## How to maintain this file
 

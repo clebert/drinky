@@ -1,112 +1,68 @@
-Drinky is a terminal-native coding agent that keeps the conversation in normal scrollback. It is a
-dependency-free Zig program with a hand-written terminal renderer.
+Drinky is a dependency-free Zig coding agent that keeps the conversation in terminal scrollback.
 
 ## Core rules
 
-A core rule outranks every precedent in the repository and every consistency argument. An existing
-behavior can be wrong.
+Core rules outrank existing behavior and repository precedent.
 
 - **An exit ends one thing.** An exit is Esc, Ctrl+C, or Ctrl+D. No exit reaches past the step, the
   page, or the turn that holds it.
-- **Drinky destroys nothing without a decision.** Where a press can mean something else, Drinky
-  warns, and the second press of the same key is the decision.
-- **A failure is not a decision.** Every draft and every message of the user survives it.
+- **Drinky destroys nothing without a decision.** If a key press has another meaning, Drinky warns
+  first. A second press of the same key confirms the action.
+- **A failure is not a decision.** Every draft and user message survives a failure.
 
 ## Architecture
 
-`build.zig` defines three modules. Dependencies flow from the app to the libraries only.
-
-- `lib/terminal/` contains reusable terminal rendering, input, grapheme segmentation, and display
-  width code. It knows nothing about the app or the agent.
-- `lib/ai/` contains the provider-neutral agent core, provider transports, commands, and tools.
-- `src/` contains the composition root, event loop, transcript, layout, and UI.
-- `src/remote/` contains the Telegram remote control: the Bot API client, the store of saved bots,
-  the attachment with its poller, sender, and answerer, the pairing, and the controller that owns
-  them all. The controller reports through a sink of small actions and knows nothing of the session.
-  The mirror sends the transcript to the chat and holds the keyboards of the turn and of the newest
-  answer, and the picker holds the open command picker of the chat. `src/remote/html.zig` owns the
-  Telegram HTML: the render of a block, and the one seam from a role to the look of a message that
-  Drinky wrote.
-
-The libraries never import each other or the app. Only the `root.zig` file in a module can re-export
-names.
-
-Each module has one test binary. Zig compiles a test only when an import chain from the module root
-reaches its file.
+Dependencies flow from `src/` to `lib/terminal/` and `lib/ai/` only. The libraries must not import
+each other or the app. The remote controller reports through its sink and must not depend on the
+session.
 
 ## Documents
 
-`README.md` describes the stable product as a user sees it. Keep it concise and synchronized with
-`FEATURES.md`. Keep the roadmap and the decision history out of `README.md`.
-
-`FEATURES.md` lists current capabilities with one short sentence each. It is an overview, not a
-specification. Add a line for a new capability. Delete the line of a removed capability.
-
-`BACKLOG.md` holds planned work in priority order. `TODO.md` is the git-ignored inbox that feeds it.
-Read the `BACKLOG.md` header before you change either file. Delete an entry from `BACKLOG.md` when
-its work is done.
+Keep `README.md` concise and limited to the stable product. Keep `README.md` and `FEATURES.md`
+synchronized when capabilities change. Follow the maintenance rules in the `FEATURES.md` header and
+footer. Read the `BACKLOG.md` header before you change `BACKLOG.md` or its inbox, `TODO.md`.
 
 ## Name
 
-- Use lowercase `drinky` for every machine-parsed name. Format it as code in Markdown.
-- Use `Drinky` for the product in prose, comments, user-facing text, and titles.
+- Use `drinky` for machine-parsed names and format it as code in Markdown.
+- Use `Drinky` for the product in prose and user-facing text.
 - Never start a sentence with lowercase `drinky`.
-- Reserve `DRINKY` for an environment variable. Do not use it in prose or code identifiers.
+- Reserve `DRINKY` for environment variables.
 
 ## User interface
 
-`src/ui/role.zig` is the one seam from a semantic role to color bytes. A widget names a role and
-writes no color of its own.
-
-- A message that Drinky wrote for the user takes the user color and no box. The head of a loaded
-  skill, the line of a retry attempt, and the line of a shorten request are such messages. Use the
-  `user_note` block kind for each one, so no message box can forge it.
-- An event block reports the state of the session, never a message.
-- A failed event paints its complete text in the error color. Every other event paints its complete
-  text in the accent color.
-- A user box holds typed text alone.
-- Add a new block kind to the role test of `src/ui/block.zig`, so no kind reaches a release
-  unclassified.
-- In the chat, `html.Role` is the same seam. Every event and every line that Drinky wrote for the
-  user takes the symbol of its role before its text. An answer of the model takes none.
+`src/ui/role.zig` maps a role to terminal colors. A widget names a role and writes no color of its
+own. `src/remote/html.zig` maps a role to the look of a Telegram message. Use `user_note` for
+messages that Drinky writes for the user. An event reports session state. A user box holds typed
+text alone.
 
 ## Writing style
 
 Use ASD-STE100 Simplified Technical English for Markdown, code comments, and Drinky-generated text.
 
 - Use active voice or a direct imperative. Put one topic in each sentence.
-- Limit an instruction to 20 words and a description to 25 words.
-- Use the same noun for the same concept. Prefer simple technical nouns.
-- Use at most three nouns in a chain.
+- Limit instructions to 20 words and descriptions to 25 words.
+- Use simple technical nouns consistently. Use at most three nouns in a chain.
 - Keep the articles. Use `must` for requirements and `can` for capabilities.
-- Do not use `should`, `may`, `might`, or `would`.
-- Do not use semicolons or contractions. Prefer a finite verb to an `-ing` form.
-- Use a complete sentence for an event, a result, or a required action. Use sentence case and end
-  punctuation.
-- A label, a metric, or a control hint can be a fragment. Use clear casing and a colon between its
-  key and its value.
-- Wrap a dynamic error name in a complete sentence:
+- Do not use `should`, `may`, `might`, `would`, semicolons, or contractions.
+- Prefer a finite verb to an `-ing` form.
+- Use complete sentences, sentence case, and end punctuation for events, results, and required
+  actions.
+- Labels, metrics, and control hints can be fragments. Use a colon between a key and its value.
+- Put dynamic error names in complete sentences:
   `Drinky could not open {path} because of error {name}.`
 
-The rules do not apply to literal technical identifiers or schemas. Preserve the meaning and the
+These rules do not apply to literal technical identifiers and schemas. Preserve the meaning and the
 terminal-width limits when you reword text.
 
 ## Remote vocabulary
 
-The Telegram remote control uses three nouns. Each has one meaning in Markdown, comments, and
-user-facing text.
+- **bot**: The Telegram account with its token.
+- **chat**: The private exchange of Telegram messages between the bot and the user.
+- **Telegram**: The source of messages, updates, and actions.
 
-- **bot** is the account with the token: `@drinky_bot`. Drinky saves, attaches, and detaches a bot,
-  and an attached bot holds the input.
-- **chat** is the Telegram conversation of that bot with the user. The pairing binds a private chat,
-  the poll gates on its chat id, the attach event opens the chat, and the detach event ends it. The
-  chat holds the text of every Telegram message.
-- **Telegram** is the far side as a source: a Telegram message, a command line from Telegram, a
-  Telegram update, an action from Telegram.
-
-Do not write "chat" for a source, and do not write "bot" for a message from the user, because a bot
-message reads as a message that the bot wrote. Do not write "conversation" for the chat, because
-that word means the model conversation that `/new` clears.
+Reserve **conversation** for the model conversation that `/new` clears. Never write **bot** for a
+message from the user, because a bot message reads as a message that the bot wrote.
 
 ## Checks
 
@@ -118,7 +74,12 @@ zig fmt --check build.zig src lib scripts
 sh scripts/test-audit.sh
 ```
 
-The audit script runs `zig build test` and fails if a source test does not run.
+The audit script runs `zig build test` and fails if a source test does not run. Its summary prints
+the runtime of each test binary.
 
-`zig build unicode` regenerates `lib/terminal/unicode_data.zig` from the Unicode Character Database.
-It uses the network. Run it manually, never as part of the default build.
+Note the runtimes when you start a feature, and compare them when the feature is complete.
+Investigate a repeatable increase of more than one second. A test that waits on wall-clock time is
+the usual cause. Remove unnecessary waits and setup, not assertions or useful cases.
+
+Run `zig build unicode` manually to regenerate Unicode data. It uses the network, so never add it to
+the default build.
