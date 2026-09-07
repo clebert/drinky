@@ -22,6 +22,12 @@ decision already taken, or a dependency on another entry. Module layout and exte
 
 ## Bugs
 
+- **Abort after a wake of macOS** — Investigate a process abort after a sleep or a network change
+  while a Telegram bot is attached. _Wait for another occurrence before more work. Capture the
+  terminal trace, the exit status, and the crash report of macOS. One trace names errno 49, and one
+  crash report names `EBADF` with `SIGABRT`. Their relation stays unproven. Prefer a fix in the
+  standard library over a workaround in Drinky._
+
 ## Improvements
 
 - **Show a model that no source describes** — such a model takes a disabled picker row that names
