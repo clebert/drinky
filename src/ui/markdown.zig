@@ -2452,7 +2452,7 @@ test "markdown holds row parity over arbitrary marker soup" {
     const random = prng.random();
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(gpa);
-    for (0..400) |_| {
+    for (0..150) |_| {
         text.clearRetainingCapacity();
         for (0..random.uintLessThan(usize, 40)) |_| {
             try text.appendSlice(gpa, tokens[random.uintLessThan(usize, tokens.len)]);

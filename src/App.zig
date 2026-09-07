@@ -9670,6 +9670,10 @@ fn initRemoteTest(
 }
 
 fn deinitRemoteTest(self: *App) void {
+    // The bot ends without the last message of the chat, so no test waits out a
+    // drain window that it does not test.
+    self.controller.detach(.exit) catch {};
+    self.controller.abortDetach() catch {};
     self.controller.deinit();
     self.chat_picker.deinit();
     self.dropRetry();
@@ -10302,7 +10306,7 @@ test "a pick after the detach wait attaches at once" {
         .{ .method = "getUpdates", .replies = &.{ .{ .body = remote_ok_empty }, .{ .body = remote_ok_empty } } },
         .{ .method = "sendMessage", .replies = &.{
             .{ .body = remote_ok_sent },
-            .{ .body = remote_ok_sent, .delay_ms = 100 },
+            .{ .body = remote_ok_sent },
             .{ .body = remote_ok_sent },
         } },
     });

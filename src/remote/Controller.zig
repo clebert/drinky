@@ -1110,6 +1110,15 @@ const ok_true = "{\"ok\":true,\"result\":true}";
 const ok_empty = "{\"ok\":true,\"result\":[]}";
 const ok_sent = "{\"ok\":true,\"result\":{\"message_id\":1}}";
 
+/// End `controller` at the end of a test without the last message of the chat,
+/// so no test waits out a drain window that it does not test. A test of that
+/// window ends its own bot first.
+fn endTest(controller: *Controller) void {
+    controller.detach(.exit) catch {};
+    controller.abortDetach() catch {};
+    controller.deinit();
+}
+
 test "a saved bot attaches, its messages and taps reach the owner, and a detach ends the chat" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
@@ -1141,7 +1150,7 @@ test "a saved bot attaches, its messages and taps reach the owner, and a detach 
     var store = Store.inert(gpa, io);
     try store.save(&.{ .token = "42:secret", .id = 42, .username = "drinky_bot", .chat_id = 99 });
     var controller = Controller.init(gpa, io, &owner.options(store, &server, &url_buffer));
-    defer controller.deinit();
+    defer endTest(&controller);
 
     try controller.attachSaved(0);
     try std.testing.expectEqual(State.attached, controller.state());
@@ -1241,7 +1250,7 @@ test "a run of dropped messages reports its count in the chat once the queue has
     const io = threaded.io();
     // The first reply waits, so the sender holds the first message while the
     // queue fills behind it.
-    const sends = [_]testing.Reply{.{ .body = ok_sent, .delay_ms = 200 }} ++
+    const sends = [_]testing.Reply{.{ .body = ok_sent, .delay_ms = 100 }} ++
         [_]testing.Reply{.{ .body = ok_sent }} ** (Attachment.outbound_capacity + 2);
     var server = try testing.Server.init(gpa, io, &.{
         .{ .method = "deleteWebhook", .replies = &.{.{ .body = ok_true }} },
@@ -1258,7 +1267,7 @@ test "a run of dropped messages reports its count in the chat once the queue has
     var store = Store.inert(gpa, io);
     try store.save(&.{ .token = "42:secret", .id = 42, .username = "drinky_bot", .chat_id = 99 });
     var controller = Controller.init(gpa, io, &owner.options(store, &server, &url_buffer));
-    defer controller.deinit();
+    defer endTest(&controller);
     // The queue drains at full speed once the first reply lands.
     controller.pace.send_spacing_ms = 0;
     try controller.attachSaved(0);
@@ -1314,7 +1323,7 @@ test "an abort of the detach frees the owner at once and drops the last message"
     var store = Store.inert(gpa, io);
     try store.save(&.{ .token = "42:secret", .id = 42, .username = "drinky_bot", .chat_id = 99 });
     var controller = Controller.init(gpa, io, &owner.options(store, &server, &url_buffer));
-    defer controller.deinit();
+    defer endTest(&controller);
 
     try controller.attachSaved(0);
     try server.waitForRequests(3);
@@ -1325,7 +1334,7 @@ test "an abort of the detach frees the owner at once and drops the last message"
     const started_ms = std.Io.Timestamp.now(io, .awake).toMilliseconds();
     try controller.abortDetach();
     const elapsed_ms = std.Io.Timestamp.now(io, .awake).toMilliseconds() - started_ms;
-    try std.testing.expect(elapsed_ms < testing.pace.drain_ms - 100);
+    try std.testing.expect(elapsed_ms < testing.drain_half_ms);
     try std.testing.expectEqual(State.idle, controller.state());
     try std.testing.expect(owner.actions.items[owner.actions.items.len - 1] == .state_changed);
 
@@ -1367,7 +1376,7 @@ test "a token pairs a new bot, and a rejected token returns to the prompt" {
     defer owner.deinit();
     var url_buffer: [64]u8 = undefined;
     var controller = Controller.init(gpa, io, &owner.options(Store.inert(gpa, io), &server, &url_buffer));
-    defer controller.deinit();
+    defer endTest(&controller);
 
     try controller.beginTokenPrompt();
     try std.testing.expectEqual(State.token_prompt, controller.state());
@@ -1431,7 +1440,7 @@ test "a cancel of the pairing keeps or drops the token by its scope" {
     defer owner.deinit();
     var url_buffer: [64]u8 = undefined;
     var controller = Controller.init(gpa, io, &owner.options(Store.inert(gpa, io), &server, &url_buffer));
-    defer controller.deinit();
+    defer endTest(&controller);
 
     try controller.beginTokenPrompt();
     try controller.submitToken("42:secret");
@@ -1467,7 +1476,7 @@ test "a saved bot without a chat waits for its code, and a cancel ends that wait
     var store = Store.inert(gpa, io);
     try store.save(&.{ .token = "42:secret", .id = 42, .username = "drinky_bot", .chat_id = null });
     var controller = Controller.init(gpa, io, &owner.options(store, &server, &url_buffer));
-    defer controller.deinit();
+    defer endTest(&controller);
 
     try controller.attachSaved(0);
     try std.testing.expectEqual(State.pairing, controller.state());
@@ -1506,7 +1515,7 @@ test "a failure of the chat reports once per run, and a permanent one detaches" 
     var store = Store.inert(gpa, io);
     try store.save(&.{ .token = "42:secret", .id = 42, .username = "drinky_bot", .chat_id = 99 });
     var controller = Controller.init(gpa, io, &owner.options(store, &server, &url_buffer));
-    defer controller.deinit();
+    defer endTest(&controller);
 
     try controller.attachSaved(0);
     try owner.pumpUntil(&controller, .detaching);
@@ -1546,7 +1555,7 @@ test "an action failure after an ownership transfer leaves the controller whole"
     try store.save(&.{ .token = "42:secret", .id = 42, .username = "drinky_bot", .chat_id = 99 });
     try store.save(&.{ .token = "43:other", .id = 43, .username = "other_bot", .chat_id = null });
     var controller = Controller.init(gpa, io, &owner.options(store, &server, &url_buffer));
-    defer controller.deinit();
+    defer endTest(&controller);
 
     // The username moved into the pairing, and the `code_ready` action fails.
     // The bot is saved by then, so the cancel keeps it.
@@ -1608,7 +1617,7 @@ test "a shutdown closes the bot even when its report fails" {
     var store = Store.inert(gpa, io);
     try store.save(&.{ .token = "42:secret", .id = 42, .username = "drinky_bot", .chat_id = 99 });
     var controller = Controller.init(gpa, io, &owner.options(store, &server, &url_buffer));
-    defer controller.deinit();
+    defer endTest(&controller);
 
     try controller.attachSaved(0);
     try server.waitForRequests(3);

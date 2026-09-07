@@ -1245,8 +1245,6 @@ const ok_true = "{\"ok\":true,\"result\":true}";
 const ok_empty = "{\"ok\":true,\"result\":[]}";
 const ok_sent = "{\"ok\":true,\"result\":{\"message_id\":1}}";
 
-const test_drain_ms = testing.pace.drain_ms;
-
 /// The poller script of a quiet chat: the webhook goes, the confirmation finds
 /// nothing, and the long poll then waits without an answer.
 const quiet_scripts = [_]testing.Script{
@@ -1730,7 +1728,7 @@ test "a queued deletion keeps the slot of its message while the queue fills" {
             .{ .body = "{\"ok\":true,\"result\":{\"message_id\":314}}" },
             .{ .body = ok_sent },
             .{ .body = ok_sent },
-            .{ .body = ok_sent, .delay_ms = 300 },
+            .{ .body = ok_sent, .delay_ms = 100 },
             .{ .body = ok_sent },
         } },
         .{ .method = "deleteMessage", .replies = &.{.{ .body = ok_true }} },
@@ -1740,7 +1738,11 @@ test "a queued deletion keeps the slot of its message while the queue fills" {
     var collector: Collector = .{ .gpa = gpa, .io = io };
     defer collector.deinit();
     var url_buffer: [64]u8 = undefined;
-    const attachment = try testAttachment(gpa, io, &server, &url_buffer, &collector);
+    // The order of the queue carries this test, not the pace, so the sender
+    // takes each item at full speed.
+    var pace = testing.pace;
+    pace.send_spacing_ms = 0;
+    const attachment = try testAttachmentPaced(gpa, io, &server, &url_buffer, &collector, pace);
     defer attachment.destroy();
     try attachment.start();
 
@@ -1889,7 +1891,11 @@ test "a tracked message with pending work keeps its slot through later tracked s
     var collector: Collector = .{ .gpa = gpa, .io = io };
     defer collector.deinit();
     var url_buffer: [64]u8 = undefined;
-    const attachment = try testAttachment(gpa, io, &server, &url_buffer, &collector);
+    // The slots carry this test, not the pace, so the run of sends leaves at
+    // full speed.
+    var pace = testing.pace;
+    pace.send_spacing_ms = 0;
+    const attachment = try testAttachmentPaced(gpa, io, &server, &url_buffer, &collector, pace);
     defer attachment.destroy();
     try attachment.start();
 
@@ -1990,7 +1996,7 @@ test "a close drops the queue, sends the final message alone, and then refuses a
     // The spacing outlasts the window, so the second message waits in its pacing
     // sleep when the close arrives.
     var pace = testing.pace;
-    pace.send_spacing_ms = 10 * test_drain_ms;
+    pace.send_spacing_ms = 10 * testing.pace.drain_ms;
     const attachment = try create(gpa, io, &.{
         .base_url = server.url(&url_buffer),
         .token = "42:secret",
@@ -2018,7 +2024,7 @@ test "a close drops the queue, sends the final message alone, and then refuses a
     try collector.waitFor(1);
     try std.testing.expect(collector.events.items[0].payload == .drained);
     const elapsed_ms = std.Io.Timestamp.now(io, .awake).toMilliseconds() - started_ms;
-    try std.testing.expect(elapsed_ms < test_drain_ms);
+    try std.testing.expect(elapsed_ms < testing.pace.drain_ms);
     destroyed = true;
     attachment.destroy();
     try server.finish();
@@ -2084,7 +2090,7 @@ test "a send in flight at the close cannot hold the final message back" {
     // when the close ends it.
     var server = try testing.Server.init(gpa, io, &quiet_scripts ++ [_]testing.Script{
         .{ .method = "sendMessage", .replies = &.{
-            .{ .body = ok_sent, .delay_ms = test_drain_ms - 100 },
+            .{ .body = ok_sent, .delay_ms = testing.drain_half_ms },
             .{ .body = ok_sent },
         } },
     });
@@ -2209,8 +2215,8 @@ test "an abort ends the drain at once and sends no final message" {
     ended = true;
     attachment.abort();
     const elapsed_ms = std.Io.Timestamp.now(io, .awake).toMilliseconds() - started_ms;
-    // The drain window is 300 ms in the tests, and the abort ends well inside it.
-    try std.testing.expect(elapsed_ms < test_drain_ms - 100);
+    // The abort ends well inside the drain window of the tests.
+    try std.testing.expect(elapsed_ms < testing.drain_half_ms);
     try std.testing.expectEqual(@as(usize, 1), server.sendCount());
     try server.finish();
 }
@@ -2246,7 +2252,9 @@ test "a dead network cannot hold the drain past its deadline" {
     destroyed = true;
     attachment.destroy();
     const elapsed_ms = std.Io.Timestamp.now(io, .awake).toMilliseconds() - started_ms;
-    try std.testing.expect(elapsed_ms >= test_drain_ms - 50);
-    try std.testing.expect(elapsed_ms < test_drain_ms + 2_000);
+    // The drain held the close for its whole window, and it ended at the
+    // deadline. Each bound keeps a margin for a late wake.
+    try std.testing.expect(elapsed_ms >= testing.pace.drain_ms - 10);
+    try std.testing.expect(elapsed_ms < testing.pace.drain_ms + 500);
     try server.finish();
 }

@@ -18,11 +18,15 @@ const wait_step_ms = 10;
 /// fast. An outage reports at its first failure, so a test that drives one
 /// waits for nothing. A test of the report threshold names its own bound.
 pub const pace: Attachment.Pace = .{
-    .drain_ms = 300,
+    .drain_ms = 100,
     .send_spacing_ms = 20,
     .backoff = .{ .attempts_max = std.math.maxInt(u32), .backoff_ms_initial = 10, .backoff_ms_max = 20 },
     .outage_ms_min = 0,
 };
+
+/// Half of the drain window: the margin of a wait that a test measures inside
+/// that window, and the delay of a reply that lands inside it.
+pub const drain_half_ms = @divExact(pace.drain_ms, 2);
 
 /// A sink for the tests: every event lands in a list under a lock, because the
 /// tasks of one owner emit concurrently. `Event` is the report of the task, and
