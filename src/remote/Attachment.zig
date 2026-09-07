@@ -1380,7 +1380,7 @@ test "a short configured window does not shorten the long poll" {
 
     // The webhook removal, the command registration, the confirmation, and
     // then the long poll.
-    try server.waitForRequests(4);
+    try server.waitForLongPoll();
     try server.finish();
     try std.testing.expectEqual(
         @as(u64, Client.poll_connect_ms_min),
@@ -1785,7 +1785,12 @@ test "an answer leaves ahead of the paced sends, and a failed one drops in silen
     var collector: Collector = .{ .gpa = gpa, .io = io };
     defer collector.deinit();
     var url_buffer: [64]u8 = undefined;
-    const attachment = try testAttachment(gpa, io, &server, &url_buffer, &collector);
+    // The server answers one call at a time, so the three answers leave one
+    // after the other once the late reply frees it. The spacing of the sender
+    // must outlast those round trips, and the pace of the suite is shorter.
+    var pace = testing.pace;
+    pace.send_spacing_ms = 50;
+    const attachment = try testAttachmentPaced(gpa, io, &server, &url_buffer, &collector, pace);
     defer attachment.destroy();
     try attachment.start();
 
@@ -2010,7 +2015,7 @@ test "a close drops the queue, sends the final message alone, and then refuses a
     var destroyed = false;
     defer if (!destroyed) attachment.destroy();
     try attachment.start();
-    try server.waitForRequests(3);
+    try server.waitForLongPoll();
 
     try attachment.send("first", &.{});
     try server.waitForSends(1);
@@ -2059,7 +2064,7 @@ test "a full queue refuses a send, and the final message still ends the chat" {
     var destroyed = false;
     defer if (!destroyed) attachment.destroy();
     try attachment.start();
-    try server.waitForRequests(3);
+    try server.waitForLongPoll();
 
     try attachment.send("first", &.{});
     try server.waitForSends(1);
@@ -2103,7 +2108,7 @@ test "a send in flight at the close cannot hold the final message back" {
     var destroyed = false;
     defer if (!destroyed) attachment.destroy();
     try attachment.start();
-    try server.waitForRequests(3);
+    try server.waitForLongPoll();
 
     try attachment.send("slow", &.{});
     try server.waitForSends(1);
@@ -2137,7 +2142,7 @@ test "a final message whose formatting fails to parse goes again as plain text" 
     var destroyed = false;
     defer if (!destroyed) attachment.destroy();
     try attachment.start();
-    try server.waitForRequests(3);
+    try server.waitForLongPoll();
 
     try attachment.close(.{ .text = formatted_text, .parse_mode = "HTML" });
     destroyed = true;
@@ -2175,7 +2180,7 @@ test "a rejected final message that no parse failure caused goes out once" {
     var destroyed = false;
     defer if (!destroyed) attachment.destroy();
     try attachment.start();
-    try server.waitForRequests(3);
+    try server.waitForLongPoll();
 
     try attachment.close(.{ .text = "<b>final</b>", .parse_mode = "HTML" });
     destroyed = true;
@@ -2245,7 +2250,7 @@ test "a dead network cannot hold the drain past its deadline" {
     defer if (!destroyed) attachment.destroy();
     try attachment.start();
     try attachment.send("never lands", &.{});
-    try server.waitForRequests(3);
+    try server.waitForLongPoll();
 
     const started_ms = std.Io.Timestamp.now(io, .awake).toMilliseconds();
     try attachment.close(.{ .text = "never lands either" });

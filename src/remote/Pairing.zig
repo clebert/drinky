@@ -336,6 +336,11 @@ const test_code: Code = "x7kq4m2p".*;
 const ok_true = "{\"ok\":true,\"result\":true}";
 const ok_empty = "{\"ok\":true,\"result\":[]}";
 
+/// The window of a test that waits for the expiry. A reply that must land after
+/// that expiry takes a multiple of it, so the two cannot drift apart. A wider
+/// margin costs no time, because the wait ends at the window.
+const test_window_ms = 100;
+
 fn testPairing(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -480,7 +485,7 @@ test "a short configured window does not shorten the wait poll" {
         pairing.client.connect_ms,
     );
     // The webhook removal, the confirmation, and then the long poll.
-    try server.waitForRequests(3);
+    try server.waitForLongPoll();
     try server.finish();
     try std.testing.expect(std.mem.indexOf(u8, server.requests.items[2].body, "\"timeout\":25,") != null);
 }
@@ -545,7 +550,7 @@ test "a code that arrives after the window does not bind" {
             .{ .body = ok_empty },
             .{ .body =
             \\{"ok":true,"result":[{"update_id":1,"message":{"message_id":1,"date":0,"chat":{"id":99,"type":"private"},"text":"x7kq4m2p"}}]}
-            , .delay_ms = 300 },
+            , .delay_ms = 3 * test_window_ms },
         } },
     });
     defer server.deinit();
@@ -553,7 +558,7 @@ test "a code that arrives after the window does not bind" {
     var collector: Collector = .{ .gpa = gpa, .io = io };
     defer collector.deinit();
     var url_buffer: [64]u8 = undefined;
-    const pairing = try testPairing(gpa, io, &server, &url_buffer, &collector, 200);
+    const pairing = try testPairing(gpa, io, &server, &url_buffer, &collector, test_window_ms);
     defer pairing.destroy();
     try pairing.startWait(42, try gpa.dupe(u8, "drinky_bot"));
 
@@ -581,7 +586,7 @@ test "a poll that never returns ends at the window, not at the poll head window"
     var collector: Collector = .{ .gpa = gpa, .io = io };
     defer collector.deinit();
     var url_buffer: [64]u8 = undefined;
-    const pairing = try testPairing(gpa, io, &server, &url_buffer, &collector, 200);
+    const pairing = try testPairing(gpa, io, &server, &url_buffer, &collector, test_window_ms);
     defer pairing.destroy();
     try pairing.startWait(42, try gpa.dupe(u8, "drinky_bot"));
 
@@ -606,7 +611,7 @@ test "a setup call that never returns ends at the window too" {
     var collector: Collector = .{ .gpa = gpa, .io = io };
     defer collector.deinit();
     var url_buffer: [64]u8 = undefined;
-    const pairing = try testPairing(gpa, io, &server, &url_buffer, &collector, 200);
+    const pairing = try testPairing(gpa, io, &server, &url_buffer, &collector, test_window_ms);
     defer pairing.destroy();
     try pairing.startWait(42, try gpa.dupe(u8, "drinky_bot"));
 
@@ -624,7 +629,7 @@ test "the wait expires at its window and clamps the poll to it" {
         .{ .method = "deleteWebhook", .replies = &.{.{ .body = ok_true }} },
         .{ .method = "getUpdates", .replies = &.{
             .{ .body = ok_empty },
-            .{ .body = ok_empty, .delay_ms = 300 },
+            .{ .body = ok_empty, .delay_ms = 3 * test_window_ms },
         } },
     });
     defer server.deinit();
@@ -632,7 +637,7 @@ test "the wait expires at its window and clamps the poll to it" {
     var collector: Collector = .{ .gpa = gpa, .io = io };
     defer collector.deinit();
     var url_buffer: [64]u8 = undefined;
-    const pairing = try testPairing(gpa, io, &server, &url_buffer, &collector, 200);
+    const pairing = try testPairing(gpa, io, &server, &url_buffer, &collector, test_window_ms);
     defer pairing.destroy();
     try pairing.startWait(42, try gpa.dupe(u8, "drinky_bot"));
 

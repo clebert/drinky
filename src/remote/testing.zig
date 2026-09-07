@@ -19,7 +19,7 @@ const wait_step_ms = 10;
 /// waits for nothing. A test of the report threshold names its own bound.
 pub const pace: Attachment.Pace = .{
     .drain_ms = 100,
-    .send_spacing_ms = 20,
+    .send_spacing_ms = 5,
     .backoff = .{ .attempts_max = std.math.maxInt(u32), .backoff_ms_initial = 10, .backoff_ms_max = 20 },
     .outage_ms_min = 0,
 };
@@ -174,21 +174,17 @@ pub const Server = struct {
         return error.TestTimedOut;
     }
 
-    /// The number of requests received so far.
-    pub fn requestCount(self: *Server) usize {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        return self.requests.items.len;
-    }
-
-    /// Wait until `count` requests arrived, so a test acts once the poller holds
-    /// its long poll.
-    pub fn waitForRequests(self: *Server, count: usize) !void {
-        for (0..wait_steps_max) |_| {
-            if (self.requestCount() >= count) return;
-            try self.io.sleep(.fromMilliseconds(wait_step_ms), .awake);
-        }
-        return error.TestTimedOut;
+    /// Wait until the poller holds its long poll, which is the second
+    /// `getUpdates` call behind the confirmation. The webhook removal and that
+    /// confirmation went out by then. An attach also sent its command
+    /// registration, and a pairing registers no command. A total of the calls
+    /// proves none of this, because the sender can put the attach event among
+    /// them.
+    /// The index of the call is fixed, so only the first attach or pairing of a
+    /// test takes this wait. A second one counts the calls of one method from a
+    /// baseline of its own.
+    pub fn waitForLongPoll(self: *Server) !void {
+        _ = try self.waitForRequest("/getUpdates", 1);
     }
 
     /// How many `sendMessage` requests arrived so far.

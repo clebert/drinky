@@ -1156,7 +1156,7 @@ test "a saved bot attaches, its messages and taps reach the owner, and a detach 
     try std.testing.expectEqual(State.attached, controller.state());
     try std.testing.expectEqualStrings("drinky_bot", controller.botUsername().?);
     try std.testing.expect(owner.actions.items[0] == .state_changed);
-    try server.waitForRequests(3);
+    try server.waitForLongPoll();
     // The attach registers the commands that run from Telegram, each with its
     // summary.
     const registered = try server.waitForRequest("/setMyCommands", 0);
@@ -1271,7 +1271,7 @@ test "a run of dropped messages reports its count in the chat once the queue has
     // The queue drains at full speed once the first reply lands.
     controller.pace.send_spacing_ms = 0;
     try controller.attachSaved(0);
-    try server.waitForRequests(3);
+    try server.waitForLongPoll();
 
     try controller.send("slow", &.{});
     try server.waitForSends(1);
@@ -1326,7 +1326,7 @@ test "an abort of the detach frees the owner at once and drops the last message"
     defer endTest(&controller);
 
     try controller.attachSaved(0);
-    try server.waitForRequests(3);
+    try server.waitForLongPoll();
     try controller.detach(.user);
     try server.waitForSends(1);
     try std.testing.expectEqual(State.detaching, controller.state());
@@ -1339,10 +1339,12 @@ test "an abort of the detach frees the owner at once and drops the last message"
     try std.testing.expect(owner.actions.items[owner.actions.items.len - 1] == .state_changed);
 
     // The next attach starts at once, and the stale drain report of the freed
-    // bot changes nothing.
+    // bot changes nothing. The second attach registers the commands again, so
+    // the count before it is the baseline.
+    const registrations = server.countOf("/setMyCommands");
     try controller.attachSaved(0);
     try std.testing.expectEqual(State.attached, controller.state());
-    try server.waitForRequests(6);
+    _ = try server.waitForRequest("/setMyCommands", registrations);
     try controller.applyAttachmentEvent(&.{ .generation = 1, .payload = .drained });
     try std.testing.expectEqual(State.attached, controller.state());
     try std.testing.expectEqual(@as(usize, 1), server.sendCount());
@@ -1584,11 +1586,12 @@ test "an action failure after an ownership transfer leaves the controller whole"
 
     // The bot closed, and the detach event fails: the bot still drains in the
     // `detaching` state, so no dead bot stays attached, and its end still frees
-    // the input. The failed attach above ended its poller, so the count of its
-    // calls stays as it is.
-    const before = server.requestCount();
+    // the input. The registrations before this attach are the baseline, because
+    // a failed attach above can leave one of its own. A late registration of
+    // that freed bot can end the wait early, and the detach holds either way.
+    const registrations = server.countOf("/setMyCommands");
     try controller.attachSaved(0);
-    try server.waitForRequests(before + 4);
+    _ = try server.waitForRequest("/setMyCommands", registrations);
     owner.fail_at = owner.actions.items.len;
     try std.testing.expectError(error.SinkFailed, controller.detach(.user));
     try std.testing.expectEqual(State.detaching, controller.state());
@@ -1620,7 +1623,7 @@ test "a shutdown closes the bot even when its report fails" {
     defer endTest(&controller);
 
     try controller.attachSaved(0);
-    try server.waitForRequests(3);
+    try server.waitForLongPoll();
     owner.fail_at = owner.actions.items.len;
     controller.shutdown();
     try std.testing.expectEqual(State.idle, controller.state());

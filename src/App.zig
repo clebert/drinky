@@ -9897,6 +9897,47 @@ test "a pairing shows its wait and its code in the picker, and the bind takes th
     try std.testing.expectEqual(@as(usize, 1), server.sendCount());
 }
 
+// The attach event of Drinky leaves through the sender while the poller still
+// runs its setup, so a total of three calls can hold that event instead of the
+// confirmation. A test that ends the bot at such a barrier drops a call of the
+// setup, and the reply of that call never goes out.
+test "the barrier of an attach waits for the poller and not for a count of calls" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    // The late reply of the registration keeps the poller short of its
+    // confirmation while the attach event arrives, so three calls stand without
+    // it. No script answers that event.
+    var server = try remote_testing.Server.init(gpa, io, &.{
+        .{ .method = "deleteWebhook", .replies = &.{.{ .body = remote_ok_true }} },
+        .{ .method = "setMyCommands", .replies = &.{.{ .body = remote_ok_true, .delay_ms = 50 }} },
+        .{ .method = "getUpdates", .replies = &.{.{ .body = remote_ok_empty }} },
+    });
+    defer server.deinit();
+    try server.start();
+    var url_buffer: [64]u8 = undefined;
+
+    var app: App = undefined;
+    app.initRemoteTest(gpa, io, &out, &server, &url_buffer);
+    defer app.deinitRemoteTest();
+    try app.controller.store.save(&.{ .token = "42:secret", .id = 42, .username = "drinky_bot", .chat_id = 99 });
+
+    try app.controller.attachSaved(0);
+    // The attach event went out, so it stands among the calls of the setup. The
+    // race that this test guards is live from here on.
+    try server.waitForSends(1);
+    try server.waitForLongPoll();
+    // The whole setup went out: the webhook removal, the command registration,
+    // and the confirmation that the long poll follows.
+    try std.testing.expectEqual(@as(usize, 1), server.countOf("/deleteWebhook"));
+    try std.testing.expectEqual(@as(usize, 1), server.countOf("/setMyCommands"));
+    try std.testing.expectEqual(@as(usize, 2), server.countOf("/getUpdates"));
+    try server.finish();
+}
+
 test "while a bot holds the input the terminal takes a detach alone, and Enter names the bot" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
@@ -9924,7 +9965,7 @@ test "while a bot holds the input the terminal takes a detach alone, and Enter n
     try app.handleKeys("\r");
     try std.testing.expect(app.session.input.owner == .external);
     try std.testing.expect(app.session.mode == .prompt);
-    try server.waitForRequests(3);
+    try server.waitForLongPoll();
 
     // Typed text and Enter reach no editor and no model, and a command line
     // runs nothing, the status included.
@@ -10000,7 +10041,7 @@ test "an exit key during the detach wait frees the editor at once and drops the 
     defer app.deinitRemoteTest();
     try app.controller.store.save(&.{ .token = "42:secret", .id = 42, .username = "drinky_bot", .chat_id = 99 });
     try app.controller.attachSaved(0);
-    try server.waitForRequests(3);
+    try server.waitForLongPoll();
 
     try app.handleKey(&.escape);
     try std.testing.expectEqual(remote.Controller.State.detaching, app.controller.state());
@@ -10047,7 +10088,7 @@ test "an exit key under a bot clears an armed confirmation" {
 
     // A bot attaches, and two exit keys detach it and end its wait.
     try app.controller.attachSaved(0);
-    try server.waitForRequests(3);
+    try server.waitForLongPoll();
     try app.handleKey(&.escape);
     try std.testing.expectEqual(remote.Controller.State.detaching, app.controller.state());
     try app.handleKey(&.escape);
@@ -10164,7 +10205,7 @@ test "a /status from Telegram gets one reply and no terminal event, also during 
     app.session.showSetup(null, null, .low);
     try app.controller.store.save(&.{ .token = "42:secret", .id = 42, .username = "drinky_bot", .chat_id = 99 });
     try app.controller.attachSaved(0);
-    try server.waitForRequests(3);
+    try server.waitForLongPoll();
     const blocks_before = app.session.transcript.blocks().len;
     const status_wrapped = "ℹ ~/work/drinky · Context: 0 · Cost: ~$0.00 · Account: Signed out";
 
@@ -10265,7 +10306,7 @@ test "a credential rejection returns the Telegram prompt to the editor" {
     app.session.account_shown = .anthropic_subscription;
     try app.controller.store.save(&.{ .token = "42:secret", .id = 42, .username = "drinky_bot", .chat_id = 99 });
     try app.controller.attachSaved(0);
-    try server.waitForRequests(3);
+    try server.waitForLongPoll();
 
     // A Telegram prompt starts a turn, and the provider rejects the credential
     // before the turn commits anything.
@@ -10320,7 +10361,7 @@ test "a pick after the detach wait attaches at once" {
     try app.controller.store.save(&.{ .token = "42:secret", .id = 42, .username = "drinky_bot", .chat_id = 99 });
 
     try app.controller.attachSaved(0);
-    try server.waitForRequests(3);
+    try server.waitForLongPoll();
     try app.handleKey(&.escape);
     try std.testing.expectEqual(remote.Controller.State.detaching, app.controller.state());
 
@@ -10370,7 +10411,7 @@ test "a Telegram message during a turn queues as steering that drops while the b
     defer app.deinitRemoteTest();
     try app.controller.store.save(&.{ .token = "42:secret", .id = 42, .username = "drinky_bot", .chat_id = 99 });
     try app.controller.attachSaved(0);
-    try server.waitForRequests(3);
+    try server.waitForLongPoll();
     app.session.beginTurn(1);
 
     // A typed message from before the attach and a Telegram message share the queue.
@@ -10462,7 +10503,7 @@ test "the chat mirrors a completed turn with its activity message, its answer, a
     defer app.deinitRemoteTest();
     try app.controller.store.save(&.{ .token = "42:secret", .id = 42, .username = "drinky_bot", .chat_id = 99 });
     try app.controller.attachSaved(0);
-    try server.waitForRequests(3);
+    try server.waitForLongPoll();
 
     // A Telegram prompt starts the turn, as `submitChatMessage` does past its
     // gates, and the mirror opens the turn with its activity message.
@@ -10584,7 +10625,7 @@ test "a failed turn marks its uncommitted messages and notifies its error" {
     defer app.deinitRemoteTest();
     try app.controller.store.save(&.{ .token = "42:secret", .id = 42, .username = "drinky_bot", .chat_id = 99 });
     try app.controller.attachSaved(0);
-    try server.waitForRequests(3);
+    try server.waitForLongPoll();
 
     app.session.beginTurn(1);
     const base = app.session.transcript.blocks().len;
@@ -10664,7 +10705,7 @@ test "a Telegram command opens a keyboard, a tap picks a row, and a stale tap ge
     defer app.deinitRemoteTest();
     try app.controller.store.save(&.{ .token = "42:secret", .id = 42, .username = "drinky_bot", .chat_id = 99 });
     try app.controller.attachSaved(0);
-    try server.waitForRequests(3);
+    try server.waitForLongPoll();
 
     // The picker is one message with one button per row, the current row
     // marked, and a cancel button. The message that asked for it gets no reply.
@@ -10754,7 +10795,7 @@ test "the activity keyboard cancels the turn on one tap and withdraws the queue"
     defer app.deinitRemoteTest();
     try app.controller.store.save(&.{ .token = "42:secret", .id = 42, .username = "drinky_bot", .chat_id = 99 });
     try app.controller.attachSaved(0);
-    try server.waitForRequests(3);
+    try server.waitForLongPoll();
 
     // A turn runs with its activity message, and a Telegram message queues.
     app.session.beginTurn(1);
@@ -10845,7 +10886,7 @@ test "the failed turn message dismisses the retry from the chat and stands at th
     defer app.deinitRemoteTest();
     try app.controller.store.save(&.{ .token = "42:secret", .id = 42, .username = "drinky_bot", .chat_id = 99 });
     try app.controller.attachSaved(0);
-    try server.waitForRequests(3);
+    try server.waitForLongPoll();
 
     // A turn that committed a round fails, so the retry arms and the chat gets
     // the failed turn message after the error event and the summary.
@@ -10947,7 +10988,7 @@ test "the chat gives the answer its button when the commit lands before the rece
     defer app.deinitRemoteTest();
     try app.controller.store.save(&.{ .token = "42:secret", .id = 42, .username = "drinky_bot", .chat_id = 99 });
     try app.controller.attachSaved(0);
-    try server.waitForRequests(3);
+    try server.waitForLongPoll();
 
     app.session.beginTurn(1);
     try app.mirror.beginTurn(&app.controller, app.nowMs());
@@ -11026,7 +11067,7 @@ test "the shorten button rides the last answer and its tap waits for the prompt"
     defer app.deinitRemoteTest();
     try app.controller.store.save(&.{ .token = "42:secret", .id = 42, .username = "drinky_bot", .chat_id = 99 });
     try app.controller.attachSaved(0);
-    try server.waitForRequests(3);
+    try server.waitForLongPoll();
 
     // A completed turn sends its answer with the button of the newest answer.
     app.session.beginTurn(1);
@@ -11131,7 +11172,7 @@ test "a /new from Telegram records the remote bracket as the first event" {
     defer app.deinitRemoteTest();
     try app.controller.store.save(&.{ .token = "42:secret", .id = 42, .username = "drinky_bot", .chat_id = 99 });
     try app.controller.attachSaved(0);
-    try server.waitForRequests(3);
+    try server.waitForLongPoll();
     try app.session.transcript.append(.model, .{}, "old answer");
 
     try app.submitChatMessage("/new", 21);
@@ -11216,7 +11257,7 @@ test "a skill loaded by a tap retains no prompt, so its failed turn fills no edi
     defer app.skills.deinit();
     try app.controller.store.save(&.{ .token = "42:secret", .id = 42, .username = "drinky_bot", .chat_id = 99 });
     try app.controller.attachSaved(0);
-    try server.waitForRequests(3);
+    try server.waitForLongPoll();
 
     var context = app.chatContext();
     const prompt = (try ai.command.run(&context, "/skill:demo")).?.prompt;
@@ -11278,7 +11319,7 @@ test "a withdraw whose mark fails after the take leaves the session and the queu
     defer app.controller.gpa = std.testing.allocator;
     try app.controller.store.save(&.{ .token = "42:secret", .id = 42, .username = "drinky_bot", .chat_id = 99 });
     try app.controller.attachSaved(0);
-    try server.waitForRequests(3);
+    try server.waitForLongPoll();
     app.controller.gpa = gpa;
     app.session.beginTurn(1);
     try app.submitChatMessage("queued", 12);
