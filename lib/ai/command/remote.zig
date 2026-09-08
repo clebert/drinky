@@ -29,7 +29,8 @@ pub fn run(context: *Context) !Context.Outcome {
     } };
 }
 
-pub fn select(context: *Context, index: usize) !Context.Outcome {
+pub fn select(context: *Context, selection: Context.Outcome.Pick.Selection) !Context.Outcome {
+    const index = selection.row;
     const bot_count = context.remote_bots.len;
     if (index < bot_count) return .{ .remote_attach = index };
     if (index == bot_count) return .remote_add;
@@ -52,7 +53,8 @@ fn openRemoval(context: *Context) !Context.Outcome {
     } };
 }
 
-fn selectRemoval(context: *Context, index: usize) !Context.Outcome {
+fn selectRemoval(context: *Context, selection: Context.Outcome.Pick.Selection) !Context.Outcome {
+    const index = selection.row;
     if (index >= context.remote_bots.len)
         return Context.Outcome.reportNotice(context.gpa, .failure, "Select a valid row.", .{});
     return .{ .remote_remove = index };
@@ -77,9 +79,9 @@ test "a picker with no saved bot holds the add row alone" {
         },
         else => return error.ExpectedPick,
     }
-    try std.testing.expect((try select(&context, 0)) == .remote_add);
+    try std.testing.expect((try select(&context, .ofRow(0))) == .remote_add);
     // No remove row exists, so its index is no row.
-    try Context.Outcome.expectNotice(try select(&context, 1), .failure);
+    try Context.Outcome.expectNotice(try select(&context, .ofRow(1)), .failure);
 }
 
 test "the rows name each bot, then the add row and the remove row" {
@@ -103,12 +105,12 @@ test "the rows name each bot, then the add row and the remove row" {
         },
         else => return error.ExpectedPick,
     }
-    switch (try select(&context, 1)) {
+    switch (try select(&context, .ofRow(1))) {
         .remote_attach => |index| try std.testing.expectEqual(@as(usize, 1), index),
         else => return error.ExpectedAttach,
     }
-    try std.testing.expect((try select(&context, 2)) == .remote_add);
-    try Context.Outcome.expectNotice(try select(&context, 4), .failure);
+    try std.testing.expect((try select(&context, .ofRow(2))) == .remote_add);
+    try Context.Outcome.expectNotice(try select(&context, .ofRow(4)), .failure);
 }
 
 test "the remove row opens the second list, and one pick removes" {
@@ -121,7 +123,7 @@ test "the remove row opens the second list, and one pick removes" {
         .remote_bots = &.{ "drinky_bot", "other_bot" },
     };
 
-    switch (try select(&context, 3)) {
+    switch (try select(&context, .ofRow(3))) {
         .pick => |pick| {
             defer freePick(gpa, &pick);
             try std.testing.expectEqualStrings("Remove a bot", pick.title);
@@ -129,11 +131,14 @@ test "the remove row opens the second list, and one pick removes" {
             try std.testing.expectEqualStrings("@other_bot", pick.options[1]);
             // The list builds itself again, so Esc returns to the first step.
             try std.testing.expect(pick.reopen.? == &openRemoval);
-            switch (try pick.select(&context, 1)) {
+            switch (try pick.select(&context, .ofRow(1))) {
                 .remote_remove => |index| try std.testing.expectEqual(@as(usize, 1), index),
                 else => return error.ExpectedRemove,
             }
-            try Context.Outcome.expectNotice(try pick.select(&context, 2), .failure);
+            try Context.Outcome.expectNotice(
+                try pick.select(&context, .ofRow(2)),
+                .failure,
+            );
         },
         else => return error.ExpectedPick,
     }

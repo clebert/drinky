@@ -71,8 +71,9 @@ fn printRow(
     };
 }
 
-pub fn select(context: *Context, index: usize) !Context.Outcome {
+pub fn select(context: *Context, selection: Context.Outcome.Pick.Selection) !Context.Outcome {
     const gpa = context.gpa;
+    const index = selection.row;
     if (index >= ladder.len)
         return Context.Outcome.reportNotice(gpa, .failure, "Select a valid effort level.", .{});
     const level = ladder[index];
@@ -175,7 +176,7 @@ test "a model that names fewer levels still offers every level" {
     try std.testing.expectEqual(ladder.len, rows.len);
 
     // The rows are the ladder, so index 3 is xhigh, which folds up to max.
-    try Context.Outcome.expectEvent(try select(&context, 3), .information);
+    try Context.Outcome.expectEvent(try select(&context, .ofRow(3)), .information);
     try std.testing.expectEqual(llm.Effort.xhigh, agent.effort);
     try std.testing.expectEqual(llm.Effort.max, agent.model.?.reasoning(agent.effort).named);
 }
@@ -196,7 +197,7 @@ test "a model that names no level keeps every row" {
         try std.testing.expect(std.mem.endsWith(u8, row, " · Dropped"));
     }
 
-    try Context.Outcome.expectEvent(try select(&context, 4), .information);
+    try Context.Outcome.expectEvent(try select(&context, .ofRow(4)), .information);
     try std.testing.expectEqual(llm.Effort.max, agent.effort);
     // The model takes no level, so the request carries no reasoning control.
     try std.testing.expect(agent.model.?.reasoning(agent.effort) == .omitted);
@@ -216,7 +217,7 @@ test "the picker stands while no account is active" {
     defer freeRows(rows);
     try std.testing.expectEqual(ladder.len, rows.len);
 
-    try Context.Outcome.expectEvent(try select(&context, 4), .information);
+    try Context.Outcome.expectEvent(try select(&context, .ofRow(4)), .information);
     try std.testing.expectEqual(llm.Effort.max, agent.effort);
 }
 
@@ -235,7 +236,7 @@ test "the picker stands while the account offers no model" {
     // No model resolves the level, so no row carries a mark.
     for (ladder, rows) |level, row| try std.testing.expectEqualStrings(@tagName(level), row);
 
-    try Context.Outcome.expectEvent(try select(&context, 1), .information);
+    try Context.Outcome.expectEvent(try select(&context, .ofRow(1)), .information);
     try std.testing.expectEqual(llm.Effort.medium, agent.effort);
 }
 
@@ -246,10 +247,13 @@ test "select applies the level at a row index, rejecting out of range" {
     var context = contextForTest(&agent);
 
     // The rows are the ladder, so row 3 is xhigh.
-    try Context.Outcome.expectEvent(try select(&context, 3), .information);
+    try Context.Outcome.expectEvent(try select(&context, .ofRow(3)), .information);
     try std.testing.expectEqual(llm.Effort.xhigh, agent.effort);
 
-    try Context.Outcome.expectNotice(try select(&context, 3), .information);
-    try Context.Outcome.expectNotice(try select(&context, ladder.len), .failure);
+    try Context.Outcome.expectNotice(try select(&context, .ofRow(3)), .information);
+    try Context.Outcome.expectNotice(
+        try select(&context, .ofRow(ladder.len)),
+        .failure,
+    );
     try std.testing.expectEqual(llm.Effort.xhigh, agent.effort);
 }

@@ -37,14 +37,15 @@ extension seams.
   a sign-in, Enter on a line that is the callback URL replays it to the listener, and Enter on any
   other line is refused with a notice that names the sign-in. The device login shows its user code
   the same way, and the cancel ends its poll._
-- **Bill a long xAI prompt at the long-context rate** — the session cost applies the long-context
-  rates of an xAI model to a request whose prompt reaches the threshold of that model. _OpenRouter
-  states one rate per model and no threshold. The xAI list `GET /v1/models`, which Drinky reads,
-  states `long_context_threshold` and one `*_long_context` rate per token kind, in USD cents per 100
-  million tokens, beside `context_length`. The same list holds image and video models with a window
-  and an `image_price`, and a chat model alone states `completion_text_token_price`. xAI bills every
-  token of such a request at the higher rate. Gemini Pro bills a tier above 200k tokens too, but no
-  runtime source states it, so the entry keeps to xAI._
+- **Bill a long prompt at the long-context rate** — the session cost applies the long-context rates
+  of a model to a request whose prompt reaches the threshold of that model. _The rates come from
+  `pricing.overrides` of the public metadata entry. Take the override that names
+  `min_prompt_tokens`, because another override can name a time window instead. Such an override
+  states its own rate per token kind, and an omitted kind keeps the rate of the entry. The threshold
+  is 200k tokens for xAI, Gemini Pro, and Claude Sonnet, and 272k for OpenAI. A vendor bills every
+  token of such a request at the higher rate. The xAI list states the same threshold as
+  `long_context_threshold`, and Drinky reads that list for the id and the aliases alone, so the
+  public metadata stays the one price source._
 - **Show a model that no source describes** — such a model takes a disabled picker row that names
   what it lacks, and its selection opens the hint for the config key. _`Catalog.merge` returns null
   and the caller drops the model today, so it leaves the picker with no line. A picker row carries
@@ -86,3 +87,6 @@ extension seams.
 - Read the window of a server model from the native endpoint of its server.
 - Run the FrontierHarness Eval tasks through a Harbor agent adapter.
 - Let the user add optional task text after a skill selection in Telegram.
+- Name an OpenRouter preset as a model.
+- Send the OpenRouter app attribution headers behind an opt-in.
+- State the dropped rows when a chat keyboard cannot hold a whole picker.

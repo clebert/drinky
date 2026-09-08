@@ -21,10 +21,24 @@ const markdown = @import("markdown.zig");
 const paint = @import("paint.zig");
 const role = @import("role.zig");
 
-/// The bytes that paint as blank rows alone. A block trims them off its tail,
-/// and the transcript holds a run of them until another byte follows, because a
-/// block of them alone shows as a blank row.
+/// The bytes that paint as blank rows alone. A block trims the rows of them off
+/// its ends, and the transcript holds a run of them until another byte follows,
+/// because a block of them alone shows as a blank row.
 const blank_bytes = " \t\r\n";
+
+/// `text` without the blank rows it starts on and ends on. A model can start
+/// its answer on blank lines after its reasoning, and a provider can end a
+/// reply or a run of reasoning on them. The markdown walk counts a row for each
+/// one, so the block would hold empty rows around its text. The first line
+/// keeps its indent, because markdown reads it.
+fn trimBlank(text: []const u8) []const u8 {
+    const first = std.mem.indexOfNone(u8, text, blank_bytes) orelse return text[0..0];
+    const line_start = if (std.mem.lastIndexOfScalar(u8, text[0..first], '\n')) |newline|
+        newline + 1
+    else
+        0;
+    return std.mem.trimEnd(u8, text[line_start..], blank_bytes);
+}
 
 /// Whether `text` paints as blank rows alone.
 pub fn isBlank(text: []const u8) bool {
@@ -259,14 +273,6 @@ pub const Entry = struct {
         };
     }
 
-    /// `text` with the blank rows it ends on dropped. A provider can end a
-    /// reply or a run of reasoning on blank lines, and the markdown walk counts
-    /// a row for each one. The block then holds empty rows over the block under
-    /// it.
-    fn trimBlankTail(text: []const u8) []const u8 {
-        return std.mem.trimEnd(u8, text, blank_bytes);
-    }
-
     /// How this block paints as a notice, or null for a block that paints a box
     /// or markdown. The measure and the paint share it, so the rows a block
     /// counts cannot diverge from the rows it paints. Each notice opens on the
@@ -319,8 +325,8 @@ pub const Entry = struct {
                 &.{ .text = flagged.text.items, .fit = flagged.fit },
                 columns,
             ),
-            .thinking => |reasoning| markdown.rows(trimBlankTail(reasoning.text.items), columns),
-            .model => |list| markdown.rows(trimBlankTail(list.items), columns),
+            .thinking => |reasoning| markdown.rows(trimBlank(reasoning.text.items), columns),
+            .model => |list| markdown.rows(trimBlank(list.items), columns),
             .user_note, .event => unreachable,
         };
     }
@@ -383,9 +389,9 @@ pub const Entry = struct {
             .thinking => |reasoning| try markdown.render(
                 placement,
                 .muted,
-                trimBlankTail(reasoning.text.items),
+                trimBlank(reasoning.text.items),
             ),
-            .model => |list| try markdown.render(placement, null, trimBlankTail(list.items)),
+            .model => |list| try markdown.render(placement, null, trimBlank(list.items)),
         }
     }
 };
@@ -529,6 +535,36 @@ test "a streamed block drops the blank rows it ends on" {
     defer blanks_only.deinit(gpa);
     try std.testing.expectEqual(@as(usize, 1), blanks_only.rows(columns));
     try std.testing.expectEqual(@as(usize, 1), try renderedRows(gpa, &blanks_only, columns, 0));
+}
+
+// Regression: a model can start its answer on blank lines after its reasoning.
+// The run keeps that whitespace in front of its text, so the block painted two
+// empty rows above the answer.
+test "a streamed block drops the blank rows it starts on" {
+    const gpa = std.testing.allocator;
+    const columns = 20;
+    for ([_]Entry.Kind{ .model, .thinking }) |kind| {
+        var leading = try Entry.init(gpa, kind, .{}, "\n\n  \nthe answer");
+        defer leading.deinit(gpa);
+        var tight = try Entry.init(gpa, kind, .{}, "the answer");
+        defer tight.deinit(gpa);
+
+        try std.testing.expectEqual(tight.rows(columns), leading.rows(columns));
+        const leading_paint = try rendered(gpa, &leading, columns, 0);
+        defer gpa.free(leading_paint);
+        const tight_paint = try rendered(gpa, &tight, columns, 0);
+        defer gpa.free(tight_paint);
+        try std.testing.expectEqualStrings(tight_paint, leading_paint);
+    }
+}
+
+test trimBlank {
+    try std.testing.expectEqualStrings("the answer", trimBlank("\n\n  \nthe answer\n\n  \n"));
+    // The first line keeps its indent, because markdown reads it.
+    try std.testing.expectEqualStrings("    code", trimBlank("\n \n    code"));
+    try std.testing.expectEqualStrings("  a\n  b", trimBlank("  a\n  b  "));
+    try std.testing.expectEqualStrings("", trimBlank("\n\n  \n"));
+    try std.testing.expectEqualStrings("", trimBlank(""));
 }
 
 // The same padding everywhere: a copy of a reasoning row starts at the column a

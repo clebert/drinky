@@ -2,8 +2,9 @@
 //! endpoint with the correct auth identity. It exposes the response as a pull
 //! stream of decoded SSE `response.*` events on the shared `sse` engine.
 //! Every Responses account shares it: the OpenAI API key, the ChatGPT
-//! subscription, and both xAI accounts differ only in `endpoint` and whether
-//! `account_id` is set. It knows nothing about conversation state or tools.
+//! subscription, both xAI accounts, and both OpenRouter accounts differ only in
+//! `endpoint`, in whether `account_id` is set, and in whether the account
+//! replays plain reasoning. It knows nothing about conversation state or tools.
 
 const std = @import("std");
 
@@ -27,6 +28,11 @@ endpoint: []const u8,
 /// The ChatGPT account id, sent as `chatgpt-account-id`. It is empty in
 /// API-key mode, which sends no account or originator header.
 account_id: []const u8,
+/// Whether the account replays a reasoning item without encrypted content (see
+/// `llm.Account.replaysPlainReasoning`). The request of such an account asks
+/// for no encrypted content, so its completed reasoning items carry none. The
+/// default is the strict rule, which rejects such an item and retries.
+plain_reasoning: bool = false,
 
 /// A single Responses request in flight on the shared SSE engine. The engine
 /// supplies the reading half. This struct keeps the Responses frame vocabulary
@@ -87,6 +93,10 @@ pub const Stream = struct {
     /// frame names one.
     served_model: std.ArrayList(u8),
     usage: llm.Usage,
+    /// Whether this stream may keep a completed reasoning item that carries no
+    /// encrypted content. `connect` copies it from the transport, and the blank
+    /// start keeps the strict rule of every other account.
+    plain_reasoning: bool,
     /// The subscription allowance from the response head, or null when the
     /// backend sent no quota headers (API-key mode, or none present).
     quota: ?llm.Quota,
@@ -139,6 +149,7 @@ pub const Stream = struct {
         self.call_output_index = null;
         self.call_named = false;
         self.served_model = .empty;
+        self.plain_reasoning = false;
         self.quota = null;
         self.authorization = &.{};
         self.account_id = &.{};
@@ -291,13 +302,18 @@ pub const Stream = struct {
             self.markRejection(.invalid);
     }
 
-    fn joinedSummary(self: *Stream, item: *const std.json.ObjectMap) !?[]const u8 {
-        const summary = json.array(item.get("summary")) orelse return null;
+    fn joinedReasoning(self: *Stream, item: *const std.json.ObjectMap, options: struct {
+        field: []const u8,
+        part_type: []const u8,
+    }) !?[]const u8 {
+        const parts_value = item.get(options.field) orelse return "";
+        if (parts_value == .null) return "";
+        const parts = json.array(parts_value) orelse return null;
         var text: std.ArrayList(u8) = .empty;
-        for (summary.items, 0..) |value, index| {
+        for (parts.items, 0..) |value, index| {
             const part = json.object(value) orelse return null;
             const kind = json.string(part.get("type")) orelse return null;
-            if (!std.mem.eql(u8, kind, "summary_text")) return null;
+            if (!std.mem.eql(u8, kind, options.part_type)) return null;
             const part_text = json.string(part.get("text")) orelse return null;
             if (index != 0) try text.appendSlice(self.frame_arena.allocator(), "\n\n");
             try text.appendSlice(self.frame_arena.allocator(), part_text);
@@ -338,15 +354,33 @@ pub const Stream = struct {
             // mark that seam.
             self.reasoning.end();
             if (status != .completed) return .invalid;
-            const encrypted_content = json.string(item.get("encrypted_content")) orelse
-                return .invalid;
-            if (id.len == 0 or encrypted_content.len == 0) return .invalid;
-            const text = try self.joinedSummary(&item) orelse return .invalid;
-            return .{ .event = .{ .item = .{ .reasoning = .{ .encrypted = .{
+            const encrypted_value = item.get("encrypted_content") orelse .null;
+            const encrypted_content = if (encrypted_value == .null)
+                ""
+            else
+                json.string(encrypted_value) orelse return .invalid;
+            const text = try self.joinedReasoning(&item, .{
+                .field = "summary",
+                .part_type = "summary_text",
+            }) orelse return .invalid;
+            const raw_text = try self.joinedReasoning(&item, .{
+                .field = "content",
+                .part_type = "reasoning_text",
+            }) orelse return .invalid;
+            const reasoning: llm.Item.Reasoning.OpenAi = .{
                 .text = text,
                 .id = id,
                 .encrypted_content = encrypted_content,
-            } } } } };
+                .raw_text = raw_text,
+            };
+            // An account that must hold the encrypted blob cannot replay an
+            // item without one, and the model requires the reasoning that
+            // preceded a function call, so the whole request retries. An
+            // account that replays plain reasoning asked for no blob, so an
+            // item with no text at all holds nothing a retry could recover.
+            if (!reasoning.replayable(self.plain_reasoning))
+                return if (self.plain_reasoning) .progress else .invalid;
+            return .{ .event = .{ .item = .{ .reasoning = .{ .encrypted = reasoning } } } };
         }
         if (std.mem.eql(u8, item_kind, "function_call")) {
             // This item closes the open call, so its keys stop correlating
@@ -578,12 +612,17 @@ pub const Stream = struct {
             }
             if (terminal_status == .complete and self.incomplete_message)
                 self.markRejection(.invalid);
-            if (completedUsage(object)) |usage| mergeUsage(&self.usage, usage);
+            var cost: ?f64 = null;
+            if (completedUsage(object)) |usage| {
+                mergeUsage(&self.usage, usage);
+                cost = parseCost(&usage);
+            }
             return .{ .event = .{ .stop = .{
                 .usage = self.usage,
                 .status = terminal_status,
                 .rejection = self.terminal_rejection,
                 .model = self.served_model.items,
+                .cost = cost,
             } } };
         }
         return if (std.mem.startsWith(u8, kind, "response.")) .progress else .ignored;
@@ -609,6 +648,8 @@ fn connect(self: *Transport, out: *Stream, payload: Payload) anyerror!void {
     }
     const engine = sse.Engine(Stream);
     engine.begin(out, self.gpa, self.io);
+    // `begin` blanks the decode state, so the account rule lands after it.
+    out.plain_reasoning = self.plain_reasoning;
     errdefer out.client.deinit();
     errdefer out.frame_arena.deinit();
 
@@ -651,6 +692,17 @@ fn connect(self: *Transport, out: *Stream, payload: Payload) anyerror!void {
     errdefer out.request.deinit();
 
     try engine.finish(out, payload.body);
+}
+
+/// The charge that `usage` reports in USD, or null when it states none, states
+/// it as a value that is not a number, or states a number no cost can be.
+fn parseCost(usage: *const std.json.ObjectMap) ?f64 {
+    const value = usage.get("cost") orelse return null;
+    const cost = switch (value) {
+        .string, .number_string => |text| std.fmt.parseFloat(f64, text) catch return null,
+        else => json.float(value) orelse return null,
+    };
+    return if (std.math.isFinite(cost) and cost >= 0) cost else null;
 }
 
 /// The optional `usage` object nested under a terminal frame's response.
@@ -1300,15 +1352,101 @@ test "an empty delta displays nothing and holds the pending seam" {
     )).event.thinking);
 }
 
+// An account that replays plain reasoning holds nothing to replay here, and a
+// retry would fetch the same empty item, so the answer stands. The same frame
+// latches invalid on every other account, which the test below pins.
+test "empty reasoning without encryption keeps the answer of a plain account" {
+    const payloads = [_][]const u8{
+        \\{"type":"response.output_item.done","item":{"type":"reasoning","id":"rs_1","summary":[]}}
+        ,
+        \\{"type":"response.output_item.done","item":{"type":"reasoning","id":"rs_1","summary":[],"encrypted_content":""}}
+        ,
+        \\{"type":"response.output_item.done","item":{"type":"reasoning","id":"rs_1","summary":null,"content":null,"encrypted_content":null}}
+        ,
+    };
+    for (payloads) |payload| {
+        var stream = testStream(undefined, undefined, 0, 0);
+        stream.plain_reasoning = true;
+        defer stream.deinitDecode();
+        try std.testing.expectEqual(@as(sse.Decoded, .progress), try stream.decode(payload));
+        _ = stream.frame_arena.reset(.retain_capacity);
+        _ = try stream.decode(
+            \\{"type":"response.output_item.done","item":{"type":"message","id":"msg_1","content":[{"type":"output_text","text":"answer"}]}}
+        );
+        _ = stream.frame_arena.reset(.retain_capacity);
+        const stop = try stream.decode(
+            \\{"type":"response.completed","response":{"output":[{"type":"reasoning","id":"rs_1","summary":[]},{"type":"message","id":"msg_1","content":[{"type":"output_text","text":"answer"}]}],"usage":{"input_tokens":7,"output_tokens":3}}}
+        );
+        try std.testing.expect(stop.event.stop.rejection == null);
+    }
+}
+
+test "a plain account keeps the reasoning text of an item without encryption" {
+    var stream = testStream(undefined, undefined, 0, 0);
+    stream.plain_reasoning = true;
+    defer stream.deinitDecode();
+    const item = (try stream.decode(
+        \\{"type":"response.output_item.done","item":{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"weigh it"}],"content":[{"type":"reasoning_text","text":"raw"}]}}
+    )).event.item.reasoning.encrypted;
+    try std.testing.expectEqualStrings("rs_1", item.id);
+    try std.testing.expectEqualStrings("weigh it", item.text);
+    try std.testing.expectEqualStrings("raw", item.raw_text);
+    try std.testing.expectEqualStrings("", item.encrypted_content);
+}
+
+test "terminal costs accept numeric strings and preserve small charges" {
+    const cases = [_]struct { value: []const u8, expected: ?f64 }{
+        .{ .value = "0.000123", .expected = 0.000123 },
+        .{ .value = "\"0.000123\"", .expected = 0.000123 },
+        .{ .value = "\"1.23e-4\"", .expected = 0.000123 },
+        .{ .value = "0", .expected = 0 },
+        .{ .value = "\"0\"", .expected = 0 },
+        .{ .value = "1", .expected = 1 },
+        .{ .value = "null", .expected = null },
+        .{ .value = "true", .expected = null },
+        .{ .value = "\"bad\"", .expected = null },
+        .{ .value = "\"nan\"", .expected = null },
+        .{ .value = "\"inf\"", .expected = null },
+        .{ .value = "\"-0.1\"", .expected = null },
+        .{ .value = "-0.1", .expected = null },
+        .{ .value = "1e999", .expected = null },
+    };
+    for (cases) |case| {
+        var stream = testStream(undefined, undefined, 0, 0);
+        defer stream.deinitDecode();
+        const payload = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "{{\"type\":\"response.completed\",\"response\":{{\"usage\":{{\"cost\":{s}}}}}}}",
+            .{case.value},
+        );
+        defer std.testing.allocator.free(payload);
+        const stop = try stream.decode(payload);
+        try std.testing.expectEqual(case.expected, stop.event.stop.cost);
+    }
+}
+
 test "invalid completed reasoning items latch through terminal usage" {
     const invalid = [_][]const u8{
         \\{"type":"response.output_item.done","item":{"type":"reasoning","summary":[],"encrypted_content":"enc"}}
         ,
-        \\{"type":"response.output_item.done","item":{"type":"reasoning","id":"rs_1","summary":[]}}
+        \\{"type":"response.output_item.done","item":{"type":"reasoning","id":"rs_1","summary":[],"encrypted_content":42}}
         ,
         \\{"type":"response.output_item.done","item":{"type":"reasoning","id":"rs_1","status":"incomplete","summary":[],"encrypted_content":"enc"}}
         ,
         \\{"type":"response.output_item.done","item":{"type":"reasoning","id":"rs_1","summary":[{"type":"other","text":"hmm"}],"encrypted_content":"enc"}}
+        ,
+        \\{"type":"response.output_item.done","item":{"type":"reasoning","id":"rs_1","summary":[],"content":[{"type":"other","text":"hmm"}]}}
+        ,
+        \\{"type":"response.output_item.done","item":{"type":"reasoning","id":"rs_1","summary":[],"content":[{"type":"reasoning_text"}]}}
+        ,
+        // An account that asked for the encrypted blob must not keep an item
+        // that carries none: the backend rejects such an item on the next
+        // request, so this reply retries instead.
+        \\{"type":"response.output_item.done","item":{"type":"reasoning","id":"rs_1","summary":[]}}
+        ,
+        \\{"type":"response.output_item.done","item":{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"hmm"}]}}
+        ,
+        \\{"type":"response.output_item.done","item":{"type":"reasoning","id":"rs_1","summary":[],"content":[{"type":"reasoning_text","text":"hmm"}]}}
         ,
     };
     for (invalid) |payload| {

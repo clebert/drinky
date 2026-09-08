@@ -3,13 +3,15 @@
 //! a fetch when a list is stale or empty.
 //!
 //! The two caches differ in what they belong to, so they never share a file.
-//! `models.json` holds the list of each account, which belongs to the principal
-//! behind that credential. A logout and a credential replacement drop that list
-//! from memory, and a removal that fails leaves it in the file, so the next
-//! start loads it again. An account that reads its key from the environment has
-//! no such event, so its list stands until the next fetch. `metadata.json` holds
-//! the public facts of a vendor model, which belong to nobody and survive every
-//! logout.
+//! `models.json` holds the list of each account that fetches its own models,
+//! which belongs to the principal behind that credential. A logout and a
+//! credential replacement drop that list from memory, and a removal that fails
+//! leaves it in the file, so the next start loads it again. An account that
+//! reads its key from the environment has no such event, so its list stands
+//! until the next fetch. `metadata.json` holds the public facts of a vendor
+//! model, which belong to nobody and survive every logout. It also holds the
+//! OpenRouter list, which is public, so an OpenRouter account reads that list
+//! and never writes `models.json`.
 //!
 //! A merge joins them, and the vendor wins every field it states. Only the
 //! aggregator prices a model.
@@ -19,8 +21,8 @@ const std = @import("std");
 const json = @import("json.zig");
 const json_store = @import("json_store.zig");
 const llm = @import("llm.zig");
+const Metadata = @import("Metadata.zig");
 const Model = @import("Model.zig");
-const OpenRouter = @import("OpenRouter.zig");
 
 const Catalog = @This();
 
@@ -35,11 +37,13 @@ io: std.Io,
 models_path: []const u8,
 /// Where the public metadata lives, under the same empty-path rule.
 metadata_path: []const u8,
-/// The vendor list of each account, exactly as the vendor stated it. An empty
-/// list means the user has not fetched that account yet.
+/// The vendor list of each account that fetches its own models, exactly as the
+/// vendor stated it. An empty list means the user has not fetched that account
+/// yet. An OpenRouter account holds no such list.
 accounts: std.EnumArray(llm.Account, []Model),
-/// The public metadata of every vendor model Drinky reaches.
-metadata: []OpenRouter.Entry,
+/// The public metadata of every vendor model Drinky reaches, and the OpenRouter
+/// list under that provider.
+metadata: []Metadata.Entry,
 
 /// The stored shape of one model. The writer emits an optional field that no
 /// source stated as a JSON null, so a reader cannot mistake a default for a
@@ -51,6 +55,7 @@ const Encoded = struct {
     context_window: ?u64,
     tokens_max: ?u32,
     thinking: []const u8,
+    tools: []const u8,
     /// The effort levels as one comma-separated list, which reads as a list in
     /// the file and needs no allocation to build.
     efforts: []const u8,
@@ -92,6 +97,12 @@ pub fn deinit(self: *Catalog) void {
 /// Whether `account` has no model at all, so the user must fetch its list before
 /// anything can run on it.
 pub fn isEmpty(self: *const Catalog, account: llm.Account) bool {
+    if (account.provider() == .openrouter) {
+        for (self.metadata) |entry| {
+            if (entry.provider == .openrouter) return false;
+        }
+        return true;
+    }
     for (self.accounts.get(account)) |vendor| {
         if (self.merge(account, vendor) != null) return false;
     }
@@ -107,6 +118,13 @@ pub fn list(
     out: *std.ArrayList(Model),
     gpa: std.mem.Allocator,
 ) !void {
+    if (account.provider() == .openrouter) {
+        for (self.metadata) |entry| {
+            if (entry.provider != .openrouter) continue;
+            try out.append(gpa, entry.model);
+        }
+        return;
+    }
     for (self.accounts.get(account)) |vendor| {
         const merged = self.merge(account, vendor) orelse continue;
         try out.append(gpa, merged);
@@ -115,6 +133,13 @@ pub fn list(
 
 /// The model `name` of `account`, or null when the account does not offer it.
 pub fn find(self: *const Catalog, account: llm.Account, name: []const u8) ?Model {
+    if (account.provider() == .openrouter) {
+        for (self.metadata) |entry| {
+            if (entry.provider != .openrouter) continue;
+            if (entry.model.sameName(name)) return entry.model;
+        }
+        return null;
+    }
     for (self.accounts.get(account)) |vendor| {
         if (!vendor.sameName(name)) continue;
         return self.merge(account, vendor);
@@ -139,7 +164,9 @@ fn merge(self: *const Catalog, account: llm.Account, vendor: Model) ?Model {
         // A model that takes no level keeps its empty list, so no aggregator can
         // name a control that the vendor refuses.
         if (merged.takesEffort() and merged.efforts.count() == 0) merged.efforts = extra.efforts;
+        if (merged.tools == .unknown) merged.tools = extra.tools;
     }
+    if (merged.tools == .unsupported) return null;
     const describes = merged.context_window != null or
         merged.efforts.count() != 0 or
         merged.price != null or
@@ -148,13 +175,18 @@ fn merge(self: *const Catalog, account: llm.Account, vendor: Model) ?Model {
 }
 
 fn lookup(self: *const Catalog, provider: llm.Provider, name: []const u8) ?Model {
-    const metadata: OpenRouter = .{ .gpa = self.gpa, .entries = self.metadata };
+    const metadata: Metadata = .{ .gpa = self.gpa, .entries = self.metadata };
     return metadata.lookup(provider, name);
 }
 
 /// Replace the list of `account` and write it through. The caller owns
 /// `discovered` until this returns, because the catalog copies it.
+///
+/// An OpenRouter account fetches the public metadata instead, and every read
+/// path skips its `models.json` entry, so a write here would leave a list that
+/// nothing reads.
 pub fn setAccount(self: *Catalog, account: llm.Account, discovered: []const Model) !void {
+    std.debug.assert(account.provider() != .openrouter);
     const copy = try self.gpa.dupe(Model, discovered);
     self.gpa.free(self.accounts.get(account));
     self.accounts.set(account, copy);
@@ -173,8 +205,8 @@ pub fn dropAccount(self: *Catalog, account: llm.Account) void {
 }
 
 /// Replace the public metadata and write it through.
-pub fn setMetadata(self: *Catalog, entries: []const OpenRouter.Entry) !void {
-    const copy = try self.gpa.dupe(OpenRouter.Entry, entries);
+pub fn setMetadata(self: *Catalog, entries: []const Metadata.Entry) !void {
+    const copy = try self.gpa.dupe(Metadata.Entry, entries);
     self.gpa.free(self.metadata);
     self.metadata = copy;
     try self.saveMetadata();
@@ -198,7 +230,7 @@ fn loadMetadata(self: *Catalog) void {
     var file = (json_store.open(self.gpa, self.io, self.metadata_path) catch return) orelse return;
     defer file.deinit();
 
-    var entries: std.ArrayList(OpenRouter.Entry) = .empty;
+    var entries: std.ArrayList(Metadata.Entry) = .empty;
     defer entries.deinit(self.gpa);
     for (std.enums.values(llm.Provider)) |provider| {
         const entry = file.entry(@tagName(provider)) orelse continue;
@@ -280,6 +312,7 @@ fn encode(gpa: std.mem.Allocator, model: *const Model) !Encoded {
         .context_window = model.context_window,
         .tokens_max = model.tokens_max,
         .thinking = @tagName(model.thinking),
+        .tools = @tagName(model.tools),
         .efforts = try gpa.dupe(u8, buffer[0..length]),
         .efforts_denied = model.efforts_denied,
         .price = model.price,
@@ -297,6 +330,8 @@ fn decodeModel(value: std.json.Value) ?Model {
         model.tokens_max = std.math.cast(u32, limit);
     if (json.string(object.get("thinking"))) |thinking|
         model.thinking = std.meta.stringToEnum(Model.Thinking, thinking) orelse .unknown;
+    if (json.string(object.get("tools"))) |tools|
+        model.tools = std.meta.stringToEnum(Model.Tools, tools) orelse .unknown;
     if (json.string(object.get("efforts"))) |efforts| {
         var levels = std.mem.splitScalar(u8, efforts, ',');
         while (levels.next()) |level| {
@@ -389,8 +424,8 @@ test "the vendor wins every field it states and the aggregator fills the rest" {
     public.thinking = .supported;
     public.addEffort(.low);
     public.price = .{ .input = 2, .output = 10, .cache_read = 0.2, .cache_write = 2.5 };
-    const entries = [_]OpenRouter.Entry{.{ .provider = .openai, .model = public }};
-    catalog.metadata = try gpa.dupe(OpenRouter.Entry, &entries);
+    const entries = [_]Metadata.Entry{.{ .provider = .openai, .model = public }};
+    catalog.metadata = try gpa.dupe(Metadata.Entry, &entries);
     defer gpa.free(catalog.metadata);
 
     const merged = catalog.find(.openai_subscription, "gpt-5.6-sol").?;
@@ -419,8 +454,8 @@ test "a vendor that states no reasoning keeps every aggregator level out" {
     public.thinking = .supported;
     public.addEffort(.low);
     public.addEffort(.high);
-    const entries = [_]OpenRouter.Entry{.{ .provider = .anthropic, .model = public }};
-    catalog.metadata = try gpa.dupe(OpenRouter.Entry, &entries);
+    const entries = [_]Metadata.Entry{.{ .provider = .anthropic, .model = public }};
+    catalog.metadata = try gpa.dupe(Metadata.Entry, &entries);
     defer gpa.free(catalog.metadata);
 
     const merged = catalog.find(.anthropic_api, "claude-haiku-4-5-20251001").?;
@@ -446,8 +481,8 @@ test "a vendor that denies the effort control keeps every aggregator level out" 
     var public = Model.init("claude-fable-5") catch unreachable;
     public.thinking = .supported;
     public.addEffort(.high);
-    const entries = [_]OpenRouter.Entry{.{ .provider = .anthropic, .model = public }};
-    catalog.metadata = try gpa.dupe(OpenRouter.Entry, &entries);
+    const entries = [_]Metadata.Entry{.{ .provider = .anthropic, .model = public }};
+    catalog.metadata = try gpa.dupe(Metadata.Entry, &entries);
     defer gpa.free(catalog.metadata);
 
     const merged = catalog.find(.anthropic_api, "claude-fable-5").?;
@@ -469,8 +504,8 @@ test "an aggregator that states no reasoning keeps the levels of the vendor" {
 
     var public = Model.init("claude-opus-4.8") catch unreachable;
     public.thinking = .unsupported;
-    const entries = [_]OpenRouter.Entry{.{ .provider = .anthropic, .model = public }};
-    catalog.metadata = try gpa.dupe(OpenRouter.Entry, &entries);
+    const entries = [_]Metadata.Entry{.{ .provider = .anthropic, .model = public }};
+    catalog.metadata = try gpa.dupe(Metadata.Entry, &entries);
     defer gpa.free(catalog.metadata);
 
     const merged = catalog.find(.anthropic_api, "claude-opus-4-8").?;
@@ -497,8 +532,8 @@ test "a model that no source describes is not offered" {
     var public = Model.init("gpt-5.6-sol") catch unreachable;
     public.context_window = 1_050_000;
     public.addEffort(.medium);
-    const entries = [_]OpenRouter.Entry{.{ .provider = .openai, .model = public }};
-    catalog.metadata = try gpa.dupe(OpenRouter.Entry, &entries);
+    const entries = [_]Metadata.Entry{.{ .provider = .openai, .model = public }};
+    catalog.metadata = try gpa.dupe(Metadata.Entry, &entries);
     defer gpa.free(catalog.metadata);
 
     try std.testing.expect(!catalog.isEmpty(.openai_api));
@@ -522,8 +557,8 @@ test "metadata of one vendor never reaches the account of another" {
 
     var public = Model.init("shared-name") catch unreachable;
     public.price = .{ .input = 1, .output = 2, .cache_read = 0, .cache_write = 0 };
-    const entries = [_]OpenRouter.Entry{.{ .provider = .openai, .model = public }};
-    catalog.metadata = try gpa.dupe(OpenRouter.Entry, &entries);
+    const entries = [_]Metadata.Entry{.{ .provider = .openai, .model = public }};
+    catalog.metadata = try gpa.dupe(Metadata.Entry, &entries);
     defer gpa.free(catalog.metadata);
 
     try std.testing.expect(catalog.find(.anthropic_api, "shared-name").?.price == null);
@@ -544,6 +579,7 @@ test "a stored model survives a round trip through both files" {
     model.context_window = 1_000_000;
     model.tokens_max = 128_000;
     model.thinking = .supported;
+    model.tools = .supported;
     model.addEffort(.low);
     model.addEffort(.xhigh);
     model.price = .{ .input = 5, .output = 25, .cache_read = 0.5, .cache_write = 6.25 };
@@ -563,6 +599,7 @@ test "a stored model survives a round trip through both files" {
     try std.testing.expectEqual(@as(?u64, 1_000_000), restored.context_window);
     try std.testing.expectEqual(@as(?u32, 128_000), restored.tokens_max);
     try std.testing.expectEqual(Model.Thinking.supported, restored.thinking);
+    try std.testing.expectEqual(Model.Tools.supported, restored.tools);
     try std.testing.expect(restored.offers(.low));
     try std.testing.expect(restored.offers(.xhigh));
     try std.testing.expect(!restored.offers(.high));
@@ -671,4 +708,66 @@ test "a missing or unreadable cache leaves an empty catalog" {
     defer broken.deinit();
     try std.testing.expect(broken.isEmpty(.anthropic_api));
     try std.testing.expectEqual(@as(usize, 0), broken.metadata.len);
+}
+
+test "a merged model without tool support is not offered" {
+    const gpa = std.testing.allocator;
+    var catalog = testCatalog(gpa);
+
+    const vendor_models = [_]Model{vendorModel("gpt-5.6-sol", 272_000, .high)};
+    catalog.accounts.set(.openai_api, try gpa.dupe(Model, &vendor_models));
+    defer gpa.free(catalog.accounts.get(.openai_api));
+
+    var public = Model.init("gpt-5.6-sol") catch unreachable;
+    public.tools = .unsupported;
+    public.price = .{ .input = 2, .output = 10, .cache_read = 0.2, .cache_write = 2.5 };
+    const entries = [_]Metadata.Entry{.{ .provider = .openai, .model = public }};
+    catalog.metadata = try gpa.dupe(Metadata.Entry, &entries);
+    defer gpa.free(catalog.metadata);
+
+    try std.testing.expect(catalog.find(.openai_api, "gpt-5.6-sol") == null);
+    try std.testing.expect(catalog.isEmpty(.openai_api));
+}
+
+test "an OpenRouter account reads the public list and never the account cache" {
+    const gpa = std.testing.allocator;
+    var catalog = testCatalog(gpa);
+
+    // `setAccount` refuses this account, so the stray list goes in by hand. No
+    // read path may return it.
+    const stray = [_]Model{vendorModel("ignored", 10, .high)};
+    catalog.accounts.set(.openrouter_api, try gpa.dupe(Model, &stray));
+    defer gpa.free(catalog.accounts.get(.openrouter_api));
+    try std.testing.expect(catalog.isEmpty(.openrouter_api));
+    try std.testing.expect(catalog.isEmpty(.openrouter_oauth));
+
+    var listed_model = Model.init("openai/gpt-5.6-sol") catch unreachable;
+    listed_model.context_window = 1_050_000;
+    listed_model.tools = .supported;
+    const entries = [_]Metadata.Entry{.{ .provider = .openrouter, .model = listed_model }};
+    catalog.metadata = try gpa.dupe(Metadata.Entry, &entries);
+    defer gpa.free(catalog.metadata);
+
+    try std.testing.expect(!catalog.isEmpty(.openrouter_api));
+    try std.testing.expect(!catalog.isEmpty(.openrouter_oauth));
+    try std.testing.expectEqualStrings(
+        "openai/gpt-5.6-sol",
+        catalog.find(.openrouter_oauth, "openai/gpt-5.6-sol").?.name(),
+    );
+
+    var listed: std.ArrayList(Model) = .empty;
+    defer listed.deinit(gpa);
+    try catalog.list(.openrouter_api, &listed, gpa);
+    try std.testing.expectEqual(@as(usize, 1), listed.items.len);
+    try std.testing.expectEqualStrings("openai/gpt-5.6-sol", listed.items[0].name());
+}
+
+test "a stored model without a tools field decodes as unknown" {
+    const gpa = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, gpa,
+        \\{ "name": "legacy" }
+    , .{});
+    defer parsed.deinit();
+    const model = decodeModel(parsed.value).?;
+    try std.testing.expectEqual(Model.Tools.unknown, model.tools);
 }

@@ -19,15 +19,40 @@ pub const paste_bytes_max = request_bytes_max - request_frame_bytes;
 
 pub const Redirect = struct {
     code: []const u8,
-    state: []const u8,
+    state: ?[]const u8 = null,
 };
+
+/// What binds a redirect to the login that waits for it. A grant that carries
+/// the wrong binding belongs to another sign-in, so the exchange or the listener
+/// refuses it, and the paste filter demands the same binding.
+pub const Binding = enum {
+    /// The grant carries a `state`, and the exchange compares it. A paste that
+    /// carries the state of another sign-in reaches the exchange, which names
+    /// that mismatch.
+    state,
+    /// The listener answers on a random callback path alone, so a grant must
+    /// name a path. A paste that names another path reaches no verdict: the
+    /// listener skips it and waits on, and the paste reports nothing. The
+    /// browser holds the one path of this sign-in, so such a paste is a line
+    /// of an earlier one.
+    path,
+};
+
+/// The binding of one OAuth protocol module. A module that states the length of
+/// a callback path binds its redirect with that path, and every other module
+/// binds with `state`. The login and the paste filter both read it here, so one
+/// declaration decides both.
+pub fn bindingOf(comptime oauth: type) Binding {
+    return if (@hasDecl(oauth, "callback_path_len")) .path else .state;
+}
 
 pub fn receive(
     gpa: std.mem.Allocator,
     io: std.Io,
     server: *std.Io.net.Server,
+    path: ?[]const u8,
 ) !Redirect {
-    return receiveBounded(gpa, io, server, callback_timeout_ms);
+    return receiveBounded(gpa, io, server, callback_timeout_ms, path);
 }
 
 /// The redirect wait under an explicit deadline. `receive` holds the deadline of
@@ -39,10 +64,11 @@ fn receiveBounded(
     io: std.Io,
     server: *std.Io.net.Server,
     timeout_ms: u64,
+    path: ?[]const u8,
 ) !Redirect {
     var source: ServerSource = .{ .io = io, .server = server };
     var bound: TimeoutBound = .{ .io = io, .timeout_ms = timeout_ms };
-    return receiveWith(gpa, &bound, &source);
+    return receiveWith(gpa, &bound, &source, path);
 }
 
 /// Whether a pasted line can serve as the redirect request target: a callback
@@ -50,16 +76,20 @@ fn receiveBounded(
 /// within the wire byte limit.
 ///
 /// RFC 6749 fixes the name of each outcome: `code` for a grant and `error` for
-/// a failure. The filter demands of each outcome exactly what the listener
+/// a failure. The filter demands of each outcome exactly what this login
 /// demands. A line that passes therefore reaches the verdict of the listener.
-/// A grant needs its `state` for the token exchange. A failure needs nothing
-/// more, because its own name ends the login.
-pub fn holdsRedirect(line: []const u8) bool {
+/// A grant needs its `code` and the `binding` of the login: the `state` that
+/// its exchange compares, or the path that its listener answers on. A failure
+/// needs nothing more, because its own name ends the login.
+pub fn holdsRedirect(line: []const u8, binding: Binding) bool {
     if (line.len == 0 or line.len > paste_bytes_max) return false;
     for (line) |byte| if (byte <= ' ' or byte == 0x7f) return false;
     if (std.mem.indexOf(u8, line, "error=") != null) return true;
-    return std.mem.indexOf(u8, line, "code=") != null and
-        std.mem.indexOf(u8, line, "state=") != null;
+    if (std.mem.indexOf(u8, line, "code=") == null) return false;
+    return switch (binding) {
+        .state => std.mem.indexOf(u8, line, "state=") != null,
+        .path => targetPath(line) != null,
+    };
 }
 
 /// Replay a pasted redirect line to the local listener on `port` as one HTTP
@@ -77,21 +107,26 @@ pub fn replay(io: std.Io, port: u16, line: []const u8) !void {
     try writer.interface.flush();
 }
 
-fn receiveWith(gpa: std.mem.Allocator, bound: anytype, source: anytype) !Redirect {
+fn receiveWith(
+    gpa: std.mem.Allocator,
+    bound: anytype,
+    source: anytype,
+    path: ?[]const u8,
+) !Redirect {
     var request_buffer: [request_bytes_max]u8 = undefined;
     var output: Output = .{};
     errdefer output.deinit(gpa);
 
     bound.call(
         Wire(@TypeOf(source)).receive,
-        .{ gpa, source, &request_buffer, &output },
+        .{ gpa, source, path, &request_buffer, &output },
     ) catch |err| switch (err) {
         error.Timeout => return error.CallbackTimeout,
         error.ConcurrencyUnavailable => return error.CallbackTimeoutUnavailable,
         error.StreamTooLong => return error.CallbackRequestTooLarge,
         else => return err,
     };
-    return .{ .code = output.code.?, .state = output.state.? };
+    return .{ .code = output.code.?, .state = output.state };
 }
 
 const Output = struct {
@@ -109,6 +144,7 @@ fn Wire(comptime Source: type) type {
         fn receive(
             gpa: std.mem.Allocator,
             source: Source,
+            path: ?[]const u8,
             request_buffer: *[request_bytes_max]u8,
             output: *Output,
         ) !void {
@@ -127,6 +163,10 @@ fn Wire(comptime Source: type) type {
                         error.EndOfStream, error.ReadFailed, error.StrayProtocol => continue,
                         else => return err,
                     };
+                if (path) |wanted| {
+                    const found = requestPath(request_line) orelse continue;
+                    if (!std.mem.eql(u8, found, wanted)) continue;
+                }
                 output.code = queryParameter(gpa, request_line, "code=") catch |err|
                     switch (err) {
                         // RFC 6749 fixes the `error` parameter of a failed
@@ -140,7 +180,11 @@ fn Wire(comptime Source: type) type {
                         ) == null) continue else return error.AuthorizationFailed,
                         else => return err,
                     };
-                output.state = try queryParameter(gpa, request_line, "state=");
+                output.state = queryParameter(gpa, request_line, "state=") catch |err|
+                    switch (err) {
+                        error.MissingCallbackParam => null,
+                        else => return err,
+                    };
                 // The captured redirect authorizes the login. A torn success
                 // page must not fail it, so the response is best effort. A
                 // replayed paste closes its connection right after the send,
@@ -198,6 +242,29 @@ fn takeRequestLine(reader: *std.Io.Reader) ![]const u8 {
     if (!std.ascii.isUpper(try reader.peekByte())) return error.StrayProtocol;
     const request_line = try reader.takeDelimiterInclusive('\n');
     return request_line[0 .. request_line.len - 1];
+}
+
+/// The request path of `request_line`, without its query, or null when the line
+/// names no path.
+fn requestPath(request_line: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, request_line, "GET ")) return null;
+    const rest = request_line["GET ".len..];
+    const end = std.mem.findAny(u8, rest, " \r") orelse rest.len;
+    return targetPath(rest[0..end]);
+}
+
+/// The path of a request target, without its query. An absolute URL yields the
+/// path after its host, and a target that names no path yields null.
+fn targetPath(target: []const u8) ?[]const u8 {
+    if (target.len == 0) return null;
+    const after_host = if (std.mem.indexOf(u8, target, "://")) |scheme| body: {
+        const host = target[scheme + 3 ..];
+        const path_start = std.mem.indexOfScalar(u8, host, '/') orelse return "/";
+        break :body host[path_start..];
+    } else target;
+    if (after_host[0] != '/') return null;
+    const query = std.mem.indexOfScalar(u8, after_host, '?') orelse after_host.len;
+    return after_host[0..query];
 }
 
 fn queryParameter(
@@ -337,11 +404,16 @@ const Fake = struct {
 };
 
 fn receiveFake(fake: *Fake) !Redirect {
+    return receiveFakePath(fake, null);
+}
+
+fn receiveFakePath(fake: *Fake, path: ?[]const u8) !Redirect {
     var bound: Fake.Bound = .{ .fake = fake };
     return receiveWith(
         std.testing.allocator,
         &bound,
         Fake.Source{ .fake = fake },
+        path,
     );
 }
 
@@ -363,6 +435,7 @@ test "callback refuses to run without deadline concurrency" {
             std.testing.allocator,
             &bound,
             Fake.Source{ .fake = &fake },
+            null,
         ),
     );
     try std.testing.expectEqual(@as(usize, 0), fake.accept_count);
@@ -386,6 +459,7 @@ test "callback work does not start unless its deadline timer is reserved" {
             std.testing.allocator,
             &bound,
             Fake.Source{ .fake = &fake },
+            null,
         ),
     );
     try std.testing.expectEqual(@as(usize, 0), fake.accept_count);
@@ -438,10 +512,10 @@ test "callback accepts a request at the wire byte limit" {
     const callback = try receiveFake(&fake);
     defer {
         std.testing.allocator.free(callback.code);
-        std.testing.allocator.free(callback.state);
+        if (callback.state) |state| std.testing.allocator.free(state);
     }
     try std.testing.expectEqualStrings("code", callback.code);
-    try std.testing.expectEqualStrings("state", callback.state);
+    try std.testing.expectEqualStrings("state", callback.state.?);
     try std.testing.expectEqual(request.len, fake.request_byte_count);
 }
 
@@ -454,10 +528,10 @@ test "callback accepts normal requests for both provider paths" {
         const callback = try receiveFake(&fake);
         defer {
             std.testing.allocator.free(callback.code);
-            std.testing.allocator.free(callback.state);
+            if (callback.state) |state| std.testing.allocator.free(state);
         }
         try std.testing.expect(std.mem.endsWith(u8, callback.code, "code"));
-        try std.testing.expect(std.mem.endsWith(u8, callback.state, "state"));
+        try std.testing.expect(std.mem.endsWith(u8, callback.state.?, "state"));
         try std.testing.expectEqual(@as(usize, 1), fake.close_count);
         try std.testing.expectEqual(@as(usize, 1), fake.response_count);
     }
@@ -476,10 +550,10 @@ test "callback ignores stray connections until the real redirect arrives" {
     const callback = try receiveFake(&fake);
     defer {
         std.testing.allocator.free(callback.code);
-        std.testing.allocator.free(callback.state);
+        if (callback.state) |state| std.testing.allocator.free(state);
     }
     try std.testing.expectEqualStrings("code", callback.code);
-    try std.testing.expectEqualStrings("state", callback.state);
+    try std.testing.expectEqualStrings("state", callback.state.?);
     try std.testing.expectEqual(@as(usize, 3), fake.accept_count);
     try std.testing.expectEqual(@as(usize, 3), fake.close_count);
     try std.testing.expectEqual(@as(usize, 1), fake.response_count);
@@ -504,10 +578,10 @@ test "callback ignores a TLS handshake until the real redirect arrives" {
     const callback = try receiveFake(&fake);
     defer {
         std.testing.allocator.free(callback.code);
-        std.testing.allocator.free(callback.state);
+        if (callback.state) |state| std.testing.allocator.free(state);
     }
     try std.testing.expectEqualStrings("code", callback.code);
-    try std.testing.expectEqualStrings("state", callback.state);
+    try std.testing.expectEqualStrings("state", callback.state.?);
     try std.testing.expectEqual(@as(usize, 2), fake.accept_count);
     try std.testing.expectEqual(@as(usize, 2), fake.close_count);
     try std.testing.expectEqual(@as(usize, 1), fake.response_count);
@@ -524,10 +598,10 @@ test "a torn success response does not fail an authorized login" {
     const callback = try receiveFake(&fake);
     defer {
         std.testing.allocator.free(callback.code);
-        std.testing.allocator.free(callback.state);
+        if (callback.state) |state| std.testing.allocator.free(state);
     }
     try std.testing.expectEqualStrings("code", callback.code);
-    try std.testing.expectEqualStrings("state", callback.state);
+    try std.testing.expectEqualStrings("state", callback.state.?);
     try std.testing.expectEqual(@as(usize, 1), fake.response_count);
     try std.testing.expectEqual(@as(usize, 1), fake.close_count);
 }
@@ -548,14 +622,32 @@ test "callback provider error redirects close without success response" {
     }
 }
 
-test "callback error after a partial parse frees the acquired parameter" {
-    // `code` present but `state` absent leaves `output.code` allocated when the
-    // state lookup fails. The leak-detecting allocator proves the error path
-    // frees it.
+test "a grant without state still completes the redirect" {
     var fake: Fake = .{ .request = "GET /callback?code=code HTTP/1.1\r\n" };
-    try std.testing.expectError(error.MissingCallbackParam, receiveFake(&fake));
+    const callback = try receiveFake(&fake);
+    defer {
+        std.testing.allocator.free(callback.code);
+        if (callback.state) |state| std.testing.allocator.free(state);
+    }
+    try std.testing.expectEqualStrings("code", callback.code);
+    try std.testing.expect(callback.state == null);
     try std.testing.expectEqual(@as(usize, 1), fake.close_count);
-    try std.testing.expectEqual(@as(usize, 0), fake.response_count);
+    try std.testing.expectEqual(@as(usize, 1), fake.response_count);
+}
+
+test "a random callback path binds the redirect" {
+    var fake: Fake = .{
+        .stray_requests = &.{"GET /other?code=wrong HTTP/1.1\r\n"},
+        .request = "GET /deadbeef?code=code HTTP/1.1\r\n",
+    };
+    const callback = try receiveFakePath(&fake, "/deadbeef");
+    defer {
+        std.testing.allocator.free(callback.code);
+        if (callback.state) |state| std.testing.allocator.free(state);
+    }
+    try std.testing.expectEqualStrings("code", callback.code);
+    try std.testing.expectEqual(@as(usize, 2), fake.accept_count);
+    try std.testing.expectEqual(@as(usize, 1), fake.response_count);
 }
 
 test "a deadline race cleans an acquired callback result" {
@@ -568,31 +660,60 @@ test "a deadline race cleans an acquired callback result" {
     try std.testing.expectEqual(@as(usize, 1), fake.response_count);
 }
 
+test bindingOf {
+    const path_flow = struct {
+        pub const callback_port = 53694;
+        pub const callback_path_len = 33;
+    };
+    const state_flow = struct {
+        pub const callback_port = 1455;
+    };
+    try std.testing.expectEqual(Binding.path, bindingOf(path_flow));
+    try std.testing.expectEqual(Binding.state, bindingOf(state_flow));
+}
+
 test "a pasted line must hold a callback outcome and fit the request line" {
     try std.testing.expect(holdsRedirect(
         "https://localhost:1455/auth/callback?code=paste-code&state=paste-state",
+        .state,
     ));
-    try std.testing.expect(holdsRedirect("code=paste-code&state=paste-state"));
+    try std.testing.expect(holdsRedirect("code=paste-code&state=paste-state", .state));
     // The listener ends the login on the `error` name alone, so a failure line
-    // passes with or without its state.
-    try std.testing.expect(holdsRedirect(
-        "https://localhost:1455/auth/callback?error=access_denied&state=paste-state",
+    // passes under either binding.
+    for ([_]Binding{ .state, .path }) |binding| {
+        try std.testing.expect(holdsRedirect(
+            "https://localhost:1455/auth/callback?error=access_denied&state=paste-state",
+            binding,
+        ));
+        try std.testing.expect(holdsRedirect(
+            "https://localhost:1455/auth/callback?error=server_error",
+            binding,
+        ));
+        try std.testing.expect(!holdsRedirect("", binding));
+        try std.testing.expect(!holdsRedirect("https://localhost:1455/auth/callback", binding));
+        try std.testing.expect(!holdsRedirect("code=a&state=b with a space", binding));
+        try std.testing.expect(!holdsRedirect("code=a&state=b\x1b", binding));
+    }
+    // A grant of a `state` login reaches no token exchange without its state,
+    // so the paste stops here and asks for the complete URL.
+    try std.testing.expect(!holdsRedirect(
+        "https://localhost:1455/auth/callback?code=only",
+        .state,
     ));
-    try std.testing.expect(holdsRedirect(
-        "https://localhost:1455/auth/callback?error=server_error",
+    try std.testing.expect(!holdsRedirect(
+        "https://localhost:1455/auth/callback?state=only",
+        .state,
     ));
-    try std.testing.expect(!holdsRedirect(""));
-    try std.testing.expect(!holdsRedirect("https://localhost:1455/auth/callback"));
-    // A grant without its state reaches no token exchange, so the paste stops
-    // here and asks for the complete URL.
-    try std.testing.expect(!holdsRedirect("https://localhost:1455/auth/callback?code=only"));
-    try std.testing.expect(!holdsRedirect("https://localhost:1455/auth/callback?state=only"));
-    try std.testing.expect(!holdsRedirect("code=a&state=b with a space"));
-    try std.testing.expect(!holdsRedirect("code=a&state=b\x1b"));
+    // A grant of a path-bound login needs no state, and the listener answers on
+    // its path alone, so a line that names none reaches no verdict.
+    try std.testing.expect(holdsRedirect("http://localhost:53694/deadbeef?code=only", .path));
+    try std.testing.expect(holdsRedirect("/deadbeef?code=only", .path));
+    try std.testing.expect(!holdsRedirect("code=only", .path));
+    try std.testing.expect(!holdsRedirect("code=a&state=b", .path));
     // One byte past the limit cannot fit the wire byte limit with its frame.
     var oversized: [paste_bytes_max + 1]u8 = @splat('x');
     @memcpy(oversized[0.."code=x&state=".len], "code=x&state=");
-    try std.testing.expect(!holdsRedirect(&oversized));
+    try std.testing.expect(!holdsRedirect(&oversized, .state));
 }
 
 test "a maximal paste frames a request line at the wire byte limit" {
@@ -602,7 +723,7 @@ test "a maximal paste frames a request line at the wire byte limit" {
     var line: [paste_bytes_max]u8 = @splat('x');
     const prefix = "/callback?code=code&state=state&padding=";
     @memcpy(line[0..prefix.len], prefix);
-    try std.testing.expect(holdsRedirect(&line));
+    try std.testing.expect(holdsRedirect(&line, .state));
 
     var request: [request_bytes_max]u8 = undefined;
     const framed = try std.fmt.bufPrint(&request, "GET {s} HTTP/1.1\r\n", .{&line});
@@ -612,10 +733,10 @@ test "a maximal paste frames a request line at the wire byte limit" {
     const callback = try receiveFake(&fake);
     defer {
         std.testing.allocator.free(callback.code);
-        std.testing.allocator.free(callback.state);
+        if (callback.state) |state| std.testing.allocator.free(state);
     }
     try std.testing.expectEqualStrings("code", callback.code);
-    try std.testing.expectEqualStrings("state", callback.state);
+    try std.testing.expectEqualStrings("state", callback.state.?);
     try std.testing.expectEqual(request.len, fake.request_byte_count);
 }
 
@@ -632,11 +753,11 @@ test "a replayed paste line completes the redirect wait" {
     defer server.deinit(io);
     var future = try io.concurrent(
         receiveBounded,
-        .{ std.testing.allocator, io, &server, socket_test_timeout_ms },
+        .{ std.testing.allocator, io, &server, socket_test_timeout_ms, null },
     );
     errdefer if (future.cancel(io)) |canceled| {
         std.testing.allocator.free(canceled.code);
-        std.testing.allocator.free(canceled.state);
+        if (canceled.state) |state| std.testing.allocator.free(state);
     } else |_| {};
     try replay(
         io,
@@ -646,10 +767,10 @@ test "a replayed paste line completes the redirect wait" {
     const redirect = try future.await(io);
     defer {
         std.testing.allocator.free(redirect.code);
-        std.testing.allocator.free(redirect.state);
+        if (redirect.state) |state| std.testing.allocator.free(state);
     }
     try std.testing.expectEqualStrings("paste-code", redirect.code);
-    try std.testing.expectEqualStrings("paste-state", redirect.state);
+    try std.testing.expectEqualStrings("paste-state", redirect.state.?);
 }
 
 test "a replayed denial line ends the redirect wait with the listener's verdict" {
@@ -661,11 +782,11 @@ test "a replayed denial line ends the redirect wait with the listener's verdict"
     defer server.deinit(io);
     var future = try io.concurrent(
         receiveBounded,
-        .{ std.testing.allocator, io, &server, socket_test_timeout_ms },
+        .{ std.testing.allocator, io, &server, socket_test_timeout_ms, null },
     );
     errdefer if (future.cancel(io)) |canceled| {
         std.testing.allocator.free(canceled.code);
-        std.testing.allocator.free(canceled.state);
+        if (canceled.state) |state| std.testing.allocator.free(state);
     } else |_| {};
     // A denial line carries no state, so the listener's verdict alone can end
     // this wait.

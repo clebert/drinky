@@ -27,6 +27,7 @@ pub const ProviderTimeouts = struct {
     anthropic: Timeouts = .{},
     openai: Timeouts = .{ .idle_ms = 300_000 },
     xai: Timeouts = .{ .idle_ms = 300_000 },
+    openrouter: Timeouts = .{ .idle_ms = 300_000 },
     google: Timeouts = .{ .idle_ms = 300_000 },
 };
 
@@ -372,10 +373,12 @@ test "the provider timeout defaults differ only in the idle window" {
     try std.testing.expectEqual(timeouts.anthropic.connect_ms, timeouts.openai.connect_ms);
     try std.testing.expectEqual(timeouts.anthropic.connect_ms, timeouts.google.connect_ms);
     try std.testing.expectEqual(timeouts.anthropic.connect_ms, timeouts.xai.connect_ms);
+    try std.testing.expectEqual(timeouts.anthropic.connect_ms, timeouts.openrouter.connect_ms);
     // The generic pair serves the short OAuth and token requests, so the
     // Anthropic stream default must stay in step with it.
     try std.testing.expectEqual(@as(Timeouts, .{}), timeouts.anthropic);
     try std.testing.expect(timeouts.openai.idle_ms > timeouts.anthropic.idle_ms);
     try std.testing.expectEqual(timeouts.openai.idle_ms, timeouts.google.idle_ms);
     try std.testing.expectEqual(timeouts.openai.idle_ms, timeouts.xai.idle_ms);
+    try std.testing.expectEqual(timeouts.openai.idle_ms, timeouts.openrouter.idle_ms);
 }

@@ -34,7 +34,8 @@ pub fn run(context: *Context) !Context.Outcome {
     } };
 }
 
-pub fn select(context: *Context, index: usize) !Context.Outcome {
+pub fn select(context: *Context, selection: Context.Outcome.Pick.Selection) !Context.Outcome {
+    const index = selection.row;
     var buffer: [account_count]llm.Account = undefined;
     const accounts = loggedIn(context.accounts, &buffer);
     if (index >= accounts.len)
@@ -94,12 +95,12 @@ test "select names the chosen signed-in account, rejecting out of range" {
         .accounts = &accounts,
     };
 
-    switch (try select(&context, 0)) {
+    switch (try select(&context, .{ .payload = 0, .row = 0 })) {
         .logout => |account| try std.testing.expectEqual(
             llm.Account.anthropic_subscription,
             account,
         ),
         else => return error.ExpectedLogout,
     }
-    try Context.Outcome.expectNotice(try select(&context, 99), .failure);
+    try Context.Outcome.expectNotice(try select(&context, .{ .payload = 0, .row = 99 }), .failure);
 }

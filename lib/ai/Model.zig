@@ -37,6 +37,7 @@ efforts: std.EnumSet(llm.Effort),
 /// states nothing rather than a denial.
 efforts_denied: bool,
 thinking: Thinking,
+tools: Tools,
 context_window: ?u64,
 tokens_max: ?u32,
 price: ?Price,
@@ -48,6 +49,17 @@ pub const Thinking = enum {
     /// The model reasons.
     supported,
     /// The model never reasons.
+    unsupported,
+};
+
+/// Whether the model takes tools, as far as a source stated it. `unsupported`
+/// drops the model from a picker, and the OpenRouter list holds a model that
+/// states `supported` alone.
+pub const Tools = enum {
+    unknown,
+    /// The model takes tools.
+    supported,
+    /// The model takes no tools.
     unsupported,
 };
 
@@ -75,6 +87,7 @@ pub fn init(id: []const u8) error{BadModelName}!Model {
         .efforts = .initEmpty(),
         .efforts_denied = false,
         .thinking = .unknown,
+        .tools = .unknown,
         .context_window = null,
         .tokens_max = null,
         .price = null,
@@ -144,6 +157,7 @@ pub fn eql(self: *const Model, other: *const Model) bool {
         self.efforts.eql(other.efforts) and
         self.efforts_denied == other.efforts_denied and
         self.thinking == other.thinking and
+        self.tools == other.tools and
         std.meta.eql(self.context_window, other.context_window) and
         std.meta.eql(self.tokens_max, other.tokens_max) and
         std.meta.eql(self.price, other.price);
@@ -207,7 +221,7 @@ pub fn outputLimitUnknown(self: *const Model, account: llm.Account) bool {
         // The Anthropic wire requires `max_tokens` in every request.
         .anthropic => true,
         // None of these wires sends a cap, so the budget of the model governs.
-        .openai, .xai, .google => false,
+        .openai, .xai, .openrouter, .google => false,
     };
 }
 
@@ -233,6 +247,7 @@ test init {
     try std.testing.expectEqual(@as(?u64, null), model.context_window);
     try std.testing.expectEqual(@as(?u32, null), model.tokens_max);
     try std.testing.expectEqual(Thinking.unknown, model.thinking);
+    try std.testing.expectEqual(Tools.unknown, model.tools);
     try std.testing.expect(!model.efforts_denied);
     try std.testing.expect(model.price == null);
 
@@ -315,6 +330,10 @@ test eql {
     var thinks = init("claude-opus-5") catch unreachable;
     thinks.thinking = .supported;
     try std.testing.expect(!fetched.eql(&thinks));
+
+    var tool_state = init("claude-opus-5") catch unreachable;
+    tool_state.tools = .unsupported;
+    try std.testing.expect(!fetched.eql(&tool_state));
 
     var aliased = init("claude-opus-5") catch unreachable;
     aliased.serveAs("claude-opus-5-20260101") catch unreachable;
@@ -447,6 +466,10 @@ test outputLimitUnknown {
     try std.testing.expect(model.outputLimitUnknown(.anthropic_api));
     try std.testing.expect(!model.outputLimitUnknown(.openai_subscription));
     try std.testing.expect(!model.outputLimitUnknown(.openai_api));
+    try std.testing.expect(!model.outputLimitUnknown(.xai_subscription));
+    try std.testing.expect(!model.outputLimitUnknown(.xai_api));
+    try std.testing.expect(!model.outputLimitUnknown(.openrouter_oauth));
+    try std.testing.expect(!model.outputLimitUnknown(.openrouter_api));
     try std.testing.expect(!model.outputLimitUnknown(.google_vertex));
 
     // A stated limit answers the question for every account.

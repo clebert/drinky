@@ -64,6 +64,15 @@ terminal-width limits when you reword text.
 Reserve **conversation** for the model conversation that `/new` clears. Never write **bot** for a
 message from the user, because a bot message reads as a message that the bot wrote.
 
+## Models vocabulary
+
+- **author**: The slug before the slash in an OpenRouter model id, as in `openai` of
+  `openai/gpt-5.6-sol`. OpenRouter keeps `provider` for the company that serves a request.
+- **public metadata**: The price, window, effort, thinking, and tool facts of a model. Drinky stores
+  them in `metadata.json`. Never write **OpenRouter** for that source.
+
+`OpenRouter` names the provider alone.
+
 ## Checks
 
 After a code change, run these commands:

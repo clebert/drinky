@@ -129,6 +129,7 @@ const File = struct {
         openai_idle_timeout_ms: u64 = timeouts_default.openai.idle_ms,
         xai_idle_timeout_ms: u64 = timeouts_default.xai.idle_ms,
         google_idle_timeout_ms: u64 = timeouts_default.google.idle_ms,
+        openrouter_idle_timeout_ms: u64 = timeouts_default.openrouter.idle_ms,
         attempts_max: u32 = retry_default.attempts_max,
         backoff_ms_initial: u64 = retry_default.backoff_ms_initial,
         backoff_ms_max: u64 = retry_default.backoff_ms_max,
@@ -246,6 +247,12 @@ const keys = [_]Key{
         .path = "request.google_idle_timeout_ms",
         .description = "The time that Drinky waits between two streamed Google Vertex events. " ++
             "The stream can stay silent while the model thinks, so the default matches the " ++
+            "OpenAI wait.",
+    },
+    .{
+        .path = "request.openrouter_idle_timeout_ms",
+        .description = "The time that Drinky waits between two streamed OpenRouter events. " ++
+            "The stream can stay silent while the model reasons, so the default matches the " ++
             "OpenAI wait.",
     },
     .{
@@ -508,9 +515,9 @@ pub fn document(
         \\brackets show each array entry. Drinky ignores a key that it does not know, so a typo has
         \\no effect. The next start still succeeds and shows a warning that names each ignored key.
         \\The file holds no secret. An API key comes from the ANTHROPIC_API_KEY, the
-        \\OPENAI_API_KEY, or the XAI_API_KEY variable. The Google Vertex account reads the service
-        \\account key file that GOOGLE_APPLICATION_CREDENTIALS names. GOOGLE_CLOUD_LOCATION is eu,
-        \\us, or global.
+        \\OPENAI_API_KEY, the XAI_API_KEY, or the OPENROUTER_API_KEY variable. The Google Vertex
+        \\account reads the service account key file that GOOGLE_APPLICATION_CREDENTIALS names.
+        \\GOOGLE_CLOUD_LOCATION is eu, us, or global.
         \\{s}
         \\### Models and effort
         \\
@@ -683,6 +690,10 @@ fn loadFromData(gpa: std.mem.Allocator, io: std.Io, options: *const DataOptions)
             .google = .{
                 .connect_ms = request.connect_timeout_ms,
                 .idle_ms = request.google_idle_timeout_ms,
+            },
+            .openrouter = .{
+                .connect_ms = request.connect_timeout_ms,
+                .idle_ms = request.openrouter_idle_timeout_ms,
             },
         },
         .retry = .{
@@ -1131,6 +1142,10 @@ test "load fills missing fields and sections from defaults" {
     try std.testing.expectEqual(timeouts_default.openai.idle_ms, empty.timeouts.openai.idle_ms);
     try std.testing.expectEqual(timeouts_default.xai.idle_ms, empty.timeouts.xai.idle_ms);
     try std.testing.expectEqual(timeouts_default.google.idle_ms, empty.timeouts.google.idle_ms);
+    try std.testing.expectEqual(
+        timeouts_default.openrouter.idle_ms,
+        empty.timeouts.openrouter.idle_ms,
+    );
     try std.testing.expectEqual(retry_default.attempts_max, empty.retry.attempts_max);
     try std.testing.expectEqual(@as(usize, 0), empty.user_instructions.files().len);
 }

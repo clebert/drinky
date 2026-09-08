@@ -19,6 +19,7 @@ const codex_url = "https://chatgpt.com/backend-api/codex/responses";
 /// Both xAI accounts reach the public Responses endpoint of xAI with a bearer
 /// token, so the URL names no account.
 const xai_url = "https://api.x.ai/v1/responses";
+const openrouter_url = "https://openrouter.ai/api/v1/responses";
 
 /// What a client needs to authenticate, tagged by the account it belongs to. A
 /// subscription account holds an OAuth `Auth` (owned by the caller, refreshed on
@@ -33,6 +34,8 @@ pub const Credentials = union(llm.Account) {
     openai_api: []const u8,
     xai_subscription: *xai.Auth,
     xai_api: []const u8,
+    openrouter_oauth: []const u8,
+    openrouter_api: []const u8,
     google_vertex: *google.Auth,
 };
 
@@ -71,7 +74,13 @@ pub const Client = struct {
             .xai_subscription,
             .google_vertex,
             => |credential| credential.renew(),
-            .anthropic_console, .anthropic_api, .openai_api, .xai_api => false,
+            .anthropic_console,
+            .anthropic_api,
+            .openai_api,
+            .xai_api,
+            .openrouter_oauth,
+            .openrouter_api,
+            => false,
         };
     }
 
@@ -112,14 +121,18 @@ pub const Client = struct {
                 };
                 try transport.send(&@field(out.*, @tagName(tag)), body);
             },
-            // The four Responses accounts share one transport and one wire.
+            // The six Responses accounts share one transport and one wire.
             // Only the Codex backend takes an account header. The two xAI
             // accounts differ in the credential alone, so both reach the
-            // public xAI endpoint the same way.
+            // public xAI endpoint the same way. The two OpenRouter accounts
+            // differ in the credential alone as well, and both replay plain
+            // reasoning.
             inline .openai_subscription,
             .openai_api,
             .xai_subscription,
             .xai_api,
+            .openrouter_oauth,
+            .openrouter_api,
             => |credential, tag| {
                 const subscription = tag == .openai_subscription or tag == .xai_subscription;
                 const token = if (subscription) try credential.accessToken() else credential;
@@ -132,6 +145,7 @@ pub const Client = struct {
                     .timeouts = self.timeouts,
                     .endpoint = responsesUrl(tag),
                     .account_id = if (tag == .openai_subscription) credential.accountId() else "",
+                    .plain_reasoning = tag.replaysPlainReasoning(),
                 };
                 try transport.send(&@field(out.*, @tagName(tag)), .{
                     .body = body,
@@ -169,6 +183,7 @@ fn responsesUrl(comptime account: llm.Account) []const u8 {
         .openai_subscription => codex_url,
         .openai_api => openai_url,
         .xai_subscription, .xai_api => xai_url,
+        .openrouter_oauth, .openrouter_api => openrouter_url,
         .anthropic_subscription,
         .anthropic_console,
         .anthropic_api,
@@ -188,6 +203,8 @@ pub const Stream = union(llm.Account) {
     openai_api: openai.Transport.Stream,
     xai_subscription: openai.Transport.Stream,
     xai_api: openai.Transport.Stream,
+    openrouter_oauth: openai.Transport.Stream,
+    openrouter_api: openai.Transport.Stream,
     google_vertex: google.Transport.Stream,
 
     pub fn deinit(self: *Stream) void {
@@ -282,6 +299,15 @@ test "init selects the arm matching the credentials" {
     try std.testing.expectEqual(llm.Account.xai_subscription, grok.account());
     const xai_key = Client.init(gpa, std.testing.io, .{ .xai_api = "xai-test" }, .{});
     try std.testing.expectEqual(llm.Account.xai_api, xai_key.account());
+    const openrouter_key = Client.init(gpa, std.testing.io, .{ .openrouter_api = "sk-or" }, .{});
+    try std.testing.expectEqual(llm.Account.openrouter_api, openrouter_key.account());
+    const openrouter_login = Client.init(
+        gpa,
+        std.testing.io,
+        .{ .openrouter_oauth = "sk-or" },
+        .{},
+    );
+    try std.testing.expectEqual(llm.Account.openrouter_oauth, openrouter_login.account());
     const vertex = Client.init(gpa, std.testing.io, .{ .google_vertex = undefined }, .{});
     try std.testing.expectEqual(llm.Account.google_vertex, vertex.account());
 }
@@ -297,6 +323,8 @@ test "an OAuth account and the Vertex account renew, a key account does not" {
         .{ .anthropic_console = "sk-ant-api03" },
         .{ .openai_api = "sk-test" },
         .{ .xai_api = "xai-test" },
+        .{ .openrouter_api = "sk-or" },
+        .{ .openrouter_oauth = "sk-or" },
     }) |credentials| {
         var client = Client.init(gpa, io, credentials, .{});
         try std.testing.expect(!try client.renewCredential());

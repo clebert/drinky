@@ -284,7 +284,8 @@ fn runHelp(context: *Context) !Outcome {
     } };
 }
 
-fn selectCommand(context: *Context, index: usize) !Outcome {
+fn selectCommand(context: *Context, selection: Outcome.Pick.Selection) !Outcome {
+    const index = selection.row;
     var rows: [commands.len]Entry = undefined;
     const entries = listed(context, &rows);
     if (index >= entries.len)
@@ -695,12 +696,15 @@ test "a command row runs its command" {
     const system_index = for (rows, 0..) |entry, index| {
         if (std.mem.eql(u8, entry.name, system.name)) break index;
     } else return error.MissingSystemRow;
-    try std.testing.expect((try selectCommand(&context, system_index)) == .show_system_prompt);
+    try std.testing.expect((try selectCommand(&context, .{
+        .payload = 0,
+        .row = system_index,
+    })) == .show_system_prompt);
 
     const effort_index = for (rows, 0..) |entry, index| {
         if (std.mem.eql(u8, entry.name, effort.name)) break index;
     } else return error.MissingEffortRow;
-    switch (try selectCommand(&context, effort_index)) {
+    switch (try selectCommand(&context, .ofRow(effort_index))) {
         .pick => |pick| {
             defer {
                 for (pick.options) |option| gpa.free(option);
@@ -712,7 +716,7 @@ test "a command row runs its command" {
     }
 
     try Outcome.expectNoticeContaining(
-        try selectCommand(&context, rows.len),
+        try selectCommand(&context, .ofRow(rows.len)),
         .failure,
         "valid command",
     );
@@ -768,9 +772,15 @@ test "a remote host runs the commands that need no terminal" {
             try std.testing.expect(std.mem.startsWith(u8, pick.options[2], "/new"));
             try std.testing.expect(std.mem.startsWith(u8, pick.options[3], "/skill"));
             try std.testing.expect(std.mem.startsWith(u8, pick.options[4], "/status"));
-            try std.testing.expect((try pick.select(&context, 2)) == .new_conversation);
-            try std.testing.expect((try pick.select(&context, 4)) == .show_status);
-            try Outcome.expectNoticeContaining(try pick.select(&context, 5), .failure, "valid command");
+            try std.testing.expect(
+                (try pick.select(&context, .ofRow(2))) == .new_conversation,
+            );
+            try std.testing.expect((try pick.select(&context, .ofRow(4))) == .show_status);
+            try Outcome.expectNoticeContaining(
+                try pick.select(&context, .ofRow(5)),
+                .failure,
+                "valid command",
+            );
         },
         else => return error.ExpectedPick,
     }

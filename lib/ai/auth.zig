@@ -259,21 +259,69 @@ pub fn login(
     comptime exchangeFn: anytype,
 ) !Login {
     const pair = oauth_wire.pkce(auth.io);
-    const url = try oauth.authorizeUrl(auth.gpa, &pair);
-    defer auth.gpa.free(url);
-
-    const redirect = try oauth_login.receive(oauth_callback.Redirect, &.{
-        .url = url,
-        .prompt = prompt,
-        .browser = oauth_login.Browser{ .io = auth.io },
-        .callback = CallbackSource{ .gpa = auth.gpa, .io = auth.io, .port = oauth.callback_port },
-    });
+    // A flow that binds its redirect with a random callback path builds that
+    // path first, and its authorize URL names the result. The path lives as
+    // long as the listener that answers on it, so the buffer stays in the arm
+    // that owns both. A flow that binds with `state` allocates no such buffer.
+    const redirect = switch (comptime oauth_callback.bindingOf(oauth)) {
+        .path => bound: {
+            var path_buffer: [oauth.callback_path_len]u8 = undefined;
+            const callback_path = oauth.callbackPath(&path_buffer, auth.io);
+            const url = try oauth.authorizeUrl(auth.gpa, &pair, callback_path);
+            defer auth.gpa.free(url);
+            break :bound try receiveRedirect(auth, prompt, &.{
+                .url = url,
+                .port = oauth.callback_port,
+                .path = callback_path,
+            });
+        },
+        .state => plain: {
+            const url = try oauth.authorizeUrl(auth.gpa, &pair);
+            defer auth.gpa.free(url);
+            break :plain try receiveRedirect(auth, prompt, &.{
+                .url = url,
+                .port = oauth.callback_port,
+            });
+        },
+    };
     defer {
         auth.gpa.free(redirect.code);
-        auth.gpa.free(redirect.state);
+        if (redirect.state) |state| auth.gpa.free(state);
     }
 
     return commit(auth, account_key, try exchangeFn(auth, &redirect, &pair));
+}
+
+/// The browser step of one login: the URL the prompt shows, and the loopback
+/// listener that answers its redirect. The fields are named, so no two can swap
+/// and an absent path reads as its own rule at the call site.
+const BrowserWait = struct {
+    url: []const u8,
+    port: u16,
+    /// The one callback path the listener answers on. A login that binds its
+    /// redirect with `state` names none, and the listener then answers on every
+    /// path.
+    path: ?[]const u8 = null,
+};
+
+/// Open the loopback listener, show the URL, and wait for the redirect. The
+/// caller owns the returned code and state.
+fn receiveRedirect(
+    auth: anytype,
+    prompt: anytype,
+    wait: *const BrowserWait,
+) !oauth_callback.Redirect {
+    return oauth_login.receive(oauth_callback.Redirect, &.{
+        .url = wait.url,
+        .prompt = prompt,
+        .browser = oauth_login.Browser{ .io = auth.io },
+        .callback = CallbackSource{
+            .gpa = auth.gpa,
+            .io = auth.io,
+            .port = wait.port,
+            .path = wait.path,
+        },
+    });
 }
 
 /// Run the interactive device-code login (RFC 8628) and report pre-commit
@@ -402,12 +450,14 @@ const CallbackSource = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     port: u16,
+    path: ?[]const u8,
 
     pub fn listen(self: CallbackSource) !CallbackListener {
         var address: std.Io.net.IpAddress = .{ .ip4 = .loopback(self.port) };
         return .{
             .gpa = self.gpa,
             .io = self.io,
+            .path = self.path,
             .server = try address.listen(self.io, .{ .reuse_address = true }),
         };
     }
@@ -416,6 +466,7 @@ const CallbackSource = struct {
 const CallbackListener = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
+    path: ?[]const u8,
     server: std.Io.net.Server,
 
     pub fn deinit(self: *CallbackListener) void {
@@ -423,7 +474,7 @@ const CallbackListener = struct {
     }
 
     pub fn receive(self: *CallbackListener) !oauth_callback.Redirect {
-        return oauth_callback.receive(self.gpa, self.io, &self.server);
+        return oauth_callback.receive(self.gpa, self.io, &self.server, self.path);
     }
 };
 

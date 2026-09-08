@@ -44,8 +44,9 @@ pub fn run(context: *Context) !Context.Outcome {
 /// place where the task goes. The line runs on the next Enter, so a restriction
 /// that blocks a skill turn still reports itself there. A remote host has no
 /// editor, so the pick loads the skill at once with no task.
-pub fn select(context: *Context, index: usize) !Context.Outcome {
+pub fn select(context: *Context, selection: Context.Outcome.Pick.Selection) !Context.Outcome {
     const gpa = context.gpa;
+    const index = selection.row;
     const items = try sorted(gpa, context.skill_registry);
     defer gpa.free(items);
     if (index >= items.len)
@@ -176,14 +177,18 @@ test "a selection writes the skill line with a trailing blank" {
         .skill_registry = &discovered.registry,
     };
 
-    switch (try select(&context, 1)) {
+    switch (try select(&context, .ofRow(1))) {
         .editor_text => |text| {
             defer gpa.free(text);
             try std.testing.expectEqualStrings("/skill:omega ", text);
         },
         else => return error.ExpectedEditorText,
     }
-    try Context.Outcome.expectNoticeContaining(try select(&context, 2), .failure, "valid skill");
+    try Context.Outcome.expectNoticeContaining(
+        try select(&context, .ofRow(2)),
+        .failure,
+        "valid skill",
+    );
 }
 
 // A remote host has no editor to complete a line in, so its pick loads the
@@ -201,7 +206,7 @@ test "a selection on a remote host loads the skill with no task" {
         .remote = true,
     };
 
-    switch (try select(&context, 0)) {
+    switch (try select(&context, .ofRow(0))) {
         .prompt => |prompt| {
             defer prompt.deinit(gpa);
             try std.testing.expectEqualStrings("alpha", prompt.name);
@@ -221,7 +226,11 @@ test "an empty registry reports that no skill exists" {
         .accounts = undefined,
     };
     try Context.Outcome.expectNoticeContaining(try run(&context), .warning, "found no skills");
-    try Context.Outcome.expectNoticeContaining(try select(&context, 0), .failure, "valid skill");
+    try Context.Outcome.expectNoticeContaining(
+        try select(&context, .ofRow(0)),
+        .failure,
+        "valid skill",
+    );
 }
 
 test "a summary holds the first sentence of the description" {

@@ -1,13 +1,15 @@
-//! The public model metadata of OpenRouter, which needs no credential. It is
-//! the only source that states a price, so Drinky reads it for every account and
-//! merges it under whatever the vendor itself stated.
+//! The public model metadata. It needs no credential. It is the only source
+//! that states a price, so Drinky reads it for every account and merges it
+//! under whatever the vendor itself stated. The same body also holds the
+//! OpenRouter list, which Drinky stores under that provider.
 //!
 //! `GET https://openrouter.ai/api/v1/models` answers with every model of every
 //! vendor. Drinky keeps a normalized subset: the vendors it reaches, and per
-//! model the context window, the effort levels, the thinking state, and the four
-//! rates. The endpoints of a model are deliberately ignored. They price service
-//! tiers, regions, and resellers that Drinky never calls, while the top-level
-//! `pricing` object states the standard rate of the vendor itself.
+//! model the context window, the effort levels, the thinking state, the tool
+//! state, and the four rates. The endpoints of a model are deliberately ignored.
+//! They price service tiers, regions, and resellers that Drinky never calls,
+//! while the top-level `pricing` object states the standard rate of the vendor
+//! itself.
 
 const std = @import("std");
 
@@ -16,34 +18,41 @@ const llm = @import("llm.zig");
 const Model = @import("Model.zig");
 const net = @import("net.zig");
 
-const OpenRouter = @This();
+const Metadata = @This();
 
 const endpoint = "https://openrouter.ai/api/v1/models";
 const user_agent = "drinky";
 const body_bytes_max = 8 * 1024 * 1024;
 const entry_count_max = 4096;
-/// Rates arrive in dollars per token and Drinky states them per million.
-const million = 1_000_000.0;
+/// Rates arrive in dollars per token, and Drinky states them per million
+/// tokens, so every rate scales by this many tokens.
+const tokens_per_million = 1_000_000.0;
 
 gpa: std.mem.Allocator,
 entries: []Entry,
 
 /// One model of one vendor, as the aggregator states it. The name is the
 /// aggregator spelling, which is not always the id the vendor answers to, so a
-/// lookup normalizes before it compares.
+/// lookup normalizes before it compares. An OpenRouter entry holds the full id.
 pub const Entry = struct {
     provider: llm.Provider,
     model: Model,
 };
 
-pub fn deinit(self: *OpenRouter) void {
+const Author = struct {
+    count: usize,
+    first: usize,
+};
+
+pub fn deinit(self: *Metadata) void {
     self.gpa.free(self.entries);
 }
 
 /// Fetch and decode the public list. The request carries no credential. The
-/// `deadline` bounds it, and the account list before it shares that window.
-pub fn fetch(gpa: std.mem.Allocator, io: std.Io, deadline: net.Deadline) !OpenRouter {
-    var maybe_metadata: ?OpenRouter = null;
+/// `deadline` bounds it. A fetch of a vendor account lists that account first,
+/// and both requests share the one window.
+pub fn fetch(gpa: std.mem.Allocator, io: std.Io, deadline: net.Deadline) !Metadata {
+    var maybe_metadata: ?Metadata = null;
     deadline.call(io, request, .{ gpa, io, &maybe_metadata }) catch |err| {
         if (maybe_metadata) |*metadata| metadata.deinit();
         return err;
@@ -51,7 +60,7 @@ pub fn fetch(gpa: std.mem.Allocator, io: std.Io, deadline: net.Deadline) !OpenRo
     return maybe_metadata orelse error.MetadataRequestFailed;
 }
 
-fn request(gpa: std.mem.Allocator, io: std.Io, out: *?OpenRouter) !void {
+fn request(gpa: std.mem.Allocator, io: std.Io, out: *?Metadata) !void {
     const uri = try std.Uri.parse(endpoint);
     var client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer client.deinit();
@@ -82,8 +91,9 @@ fn request(gpa: std.mem.Allocator, io: std.Io, out: *?OpenRouter) !void {
 
 /// Decode a complete response into the normalized subset. A malformed envelope
 /// rejects the whole body. A malformed entry is skipped, because one bad model
-/// must not cost the user every other price.
-pub fn parse(gpa: std.mem.Allocator, body: []const u8) !OpenRouter {
+/// must not cost the user every other price. One body fills the vendor metadata
+/// and the grouped OpenRouter list.
+pub fn parse(gpa: std.mem.Allocator, body: []const u8) !Metadata {
     var parsed = try std.json.parseFromSlice(std.json.Value, gpa, body, .{});
     defer parsed.deinit();
 
@@ -91,18 +101,30 @@ pub fn parse(gpa: std.mem.Allocator, body: []const u8) !OpenRouter {
     const listed = json.array(object.get("data")) orelse return error.BadMetadata;
     if (listed.items.len > entry_count_max) return error.BadMetadata;
 
-    var entries: std.ArrayList(Entry) = .empty;
-    errdefer entries.deinit(gpa);
+    var vendor_entries: std.ArrayList(Entry) = .empty;
+    errdefer vendor_entries.deinit(gpa);
+    var openrouter_models: std.ArrayList(Model) = .empty;
+    defer openrouter_models.deinit(gpa);
     for (listed.items) |value| {
-        const entry = decode(value) orelse continue;
-        try entries.append(gpa, entry);
+        if (decodeVendor(value)) |entry| try vendor_entries.append(gpa, entry);
+        if (decodeOpenRouter(value)) |model| try openrouter_models.append(gpa, model);
     }
-    return .{ .gpa = gpa, .entries = try entries.toOwnedSlice(gpa) };
+
+    const grouped = try groupOpenRouter(gpa, openrouter_models.items);
+    defer gpa.free(grouped);
+    try vendor_entries.ensureUnusedCapacity(gpa, grouped.len);
+    for (grouped) |model| vendor_entries.appendAssumeCapacity(.{
+        .provider = .openrouter,
+        .model = model,
+    });
+    return .{ .gpa = gpa, .entries = try vendor_entries.toOwnedSlice(gpa) };
 }
 
 /// The metadata of `name` under `provider`, or null when the list holds no such
-/// model. The vendor id normalizes to the aggregator spelling first.
-pub fn lookup(self: *const OpenRouter, provider: llm.Provider, name: []const u8) ?Model {
+/// model. The vendor id normalizes to the aggregator spelling first. An
+/// OpenRouter account does not look up here, because a slug would rewrite a
+/// full id.
+pub fn lookup(self: *const Metadata, provider: llm.Provider, name: []const u8) ?Model {
     var buffer: [Model.name_bytes_max]u8 = undefined;
     const wanted = slug(name, &buffer);
     for (self.entries) |entry| {
@@ -157,10 +179,18 @@ fn positive(value: ?std.json.Value) ?u64 {
     return if (found > 0) @intCast(found) else null;
 }
 
-/// One listed model, or null when it names no vendor Drinky reaches, when its
-/// id is unusable, or when it is a variant that no vendor answers to. A `:`
-/// marks such a variant, as in `:batch` and `:free`.
-fn decode(value: std.json.Value) ?Entry {
+/// The author slug of a full OpenRouter id, or the whole name when it holds no
+/// slash.
+pub fn authorOf(name: []const u8) []const u8 {
+    const separator = std.mem.indexOfScalar(u8, name, '/') orelse return name;
+    return name[0..separator];
+}
+
+/// One listed vendor model, or null when it names no vendor Drinky reaches,
+/// when its id is unusable, or when it is a variant that no vendor answers to.
+/// A `:` marks such a variant, as in `:batch` and `:free`. Silence about tools
+/// keeps the model, so a merge can drop it later.
+fn decodeVendor(value: std.json.Value) ?Entry {
     const object = json.object(value) orelse return null;
     const id = json.string(object.get("id")) orelse return null;
     const separator = std.mem.indexOfScalar(u8, id, '/') orelse return null;
@@ -169,10 +199,43 @@ fn decode(value: std.json.Value) ?Entry {
     if (std.mem.indexOfScalar(u8, name, ':') != null) return null;
 
     var model = Model.init(name) catch return null;
+    fillShared(&model, object);
+    return .{ .provider = provider, .model = model };
+}
+
+/// One OpenRouter model, or null when the id is not a plain `vendor/model`,
+/// when it is a router or an alias, or when the entry does not state that the
+/// model takes tools. Silence about tools drops the model here, because every
+/// Drinky request names tools and the endpoint filter of OpenRouter then serves
+/// no endpoint for it.
+fn decodeOpenRouter(value: std.json.Value) ?Model {
+    const object = json.object(value) orelse return null;
+    const id = json.string(object.get("id")) orelse return null;
+    if (std.mem.indexOfScalar(u8, id, ':') != null) return null;
+    const separator = std.mem.indexOfScalar(u8, id, '/') orelse return null;
+    if (std.mem.indexOfScalar(u8, id[separator + 1 ..], '/') != null) return null;
+    const vendor = id[0..separator];
+    const name = id[separator + 1 ..];
+    if (vendor.len == 0 or name.len == 0) return null;
+    if (vendor[0] == '~') return null;
+    if (std.mem.eql(u8, vendor, "openrouter")) return null;
+
+    var model = Model.init(id) catch return null;
+    model.serveAs(name) catch return null;
+    fillShared(&model, object);
+    if (model.tools != .supported) return null;
+    if (json.object(object.get("top_provider"))) |top| {
+        if (positive(top.get("max_completion_tokens"))) |limit|
+            model.tokens_max = std.math.cast(u32, limit);
+    }
+    return model;
+}
+
+fn fillShared(model: *Model, object: std.json.ObjectMap) void {
     model.context_window = positive(object.get("context_length"));
     model.price = price(object.get("pricing"));
-    reasoning(&model, object.get("reasoning"));
-    return .{ .provider = provider, .model = model };
+    reasoning(model, object.get("reasoning"));
+    tools(model, object.get("supported_parameters"));
 }
 
 fn providerOf(vendor: []const u8) ?llm.Provider {
@@ -181,6 +244,56 @@ fn providerOf(vendor: []const u8) ?llm.Provider {
     if (std.mem.eql(u8, vendor, "x-ai")) return .xai;
     if (std.mem.eql(u8, vendor, "google")) return .google;
     return null;
+}
+
+/// Group OpenRouter models by author: authors by tool-model count, then by the
+/// position of the first model, and inside one author the models newest first.
+fn groupOpenRouter(gpa: std.mem.Allocator, models: []const Model) ![]Model {
+    var authors: std.ArrayList(Author) = .empty;
+    defer authors.deinit(gpa);
+    for (models, 0..) |*model, index| {
+        const name = authorOf(model.name());
+        for (authors.items) |*author| {
+            if (std.mem.eql(u8, authorOf(models[author.first].name()), name)) {
+                author.count += 1;
+                break;
+            }
+        } else try authors.append(gpa, .{ .count = 1, .first = index });
+    }
+
+    const used = try gpa.alloc(bool, authors.items.len);
+    defer gpa.free(used);
+    @memset(used, false);
+
+    const grouped = try gpa.alloc(Model, models.len);
+    var out: usize = 0;
+    for (0..authors.items.len) |_| {
+        var best: ?usize = null;
+        for (authors.items, 0..) |author, index| {
+            if (used[index]) continue;
+            if (best) |found| {
+                const current = authors.items[found];
+                const more = author.count > current.count;
+                const earlier = author.count == current.count and author.first < current.first;
+                if (more or earlier) best = index;
+            } else best = index;
+        }
+        // Each pass takes one unused author, and the loop runs once per author,
+        // so an unused author always remains.
+        const chosen = best.?;
+        used[chosen] = true;
+        const author = authors.items[chosen];
+        const name = authorOf(models[author.first].name());
+        for (models) |*model| {
+            if (!std.mem.eql(u8, authorOf(model.name()), name)) continue;
+            grouped[out] = model.*;
+            out += 1;
+        }
+    }
+    // Every model belongs to exactly one author, so the passes above copy the
+    // whole list.
+    std.debug.assert(out == models.len);
+    return grouped;
 }
 
 /// The four rates Drinky charges against, converted from dollars per token. A
@@ -209,7 +322,7 @@ fn rate(value: ?std.json.Value) ?f64 {
     const text = json.string(value orelse return null) orelse return null;
     const parsed = std.fmt.parseFloat(f64, text) catch return null;
     if (parsed < 0) return null;
-    const scaled = parsed * million;
+    const scaled = parsed * tokens_per_million;
     return if (std.math.isFinite(scaled)) scaled else null;
 }
 
@@ -230,6 +343,28 @@ fn reasoning(model: *Model, value: ?std.json.Value) void {
     }
 }
 
+/// The tool state. A named parameter list without `tools` denies tools. Silence
+/// keeps the model unknown.
+fn tools(model: *Model, value: ?std.json.Value) void {
+    const listed = json.array(value orelse return) orelse return;
+    for (listed.items) |item| {
+        const name = json.string(item) orelse continue;
+        if (std.mem.eql(u8, name, "tools")) {
+            model.tools = .supported;
+            return;
+        }
+    }
+    model.tools = .unsupported;
+}
+
+fn countProvider(self: *const Metadata, provider: llm.Provider) usize {
+    var count: usize = 0;
+    for (self.entries) |entry| {
+        if (entry.provider == provider) count += 1;
+    }
+    return count;
+}
+
 // The metadata request follows the account list inside one window. A window
 // that the list spent refuses the request before it opens a socket.
 test "an expired deadline refuses the metadata without a request" {
@@ -246,7 +381,10 @@ test slug {
     try std.testing.expectEqualStrings("claude-opus-4.8", slug("claude-opus-4-8", &buffer));
     try std.testing.expectEqualStrings("claude-sonnet-4.6", slug("claude-sonnet-4-6", &buffer));
     // A dated id drops its snapshot and then takes the dot.
-    try std.testing.expectEqualStrings("claude-opus-4.5", slug("claude-opus-4-5-20251101", &buffer));
+    try std.testing.expectEqualStrings(
+        "claude-opus-4.5",
+        slug("claude-opus-4-5-20251101", &buffer),
+    );
     try std.testing.expectEqualStrings(
         "claude-haiku-4.5",
         slug("claude-haiku-4-5-20251001", &buffer),
@@ -301,8 +439,13 @@ test parse {
     defer metadata.deinit();
 
     // A vendor Drinky does not reach, and a variant that no vendor answers to,
-    // both stay out of the subset.
-    try std.testing.expectEqual(@as(usize, 7), metadata.entries.len);
+    // both stay out of the vendor subset. Silence about tools keeps those
+    // vendor models, and drops them from the OpenRouter list.
+    try std.testing.expectEqual(@as(usize, 7), countProvider(&metadata, .anthropic) +
+        countProvider(&metadata, .openai) +
+        countProvider(&metadata, .xai) +
+        countProvider(&metadata, .google));
+    try std.testing.expectEqual(@as(usize, 0), countProvider(&metadata, .openrouter));
     try std.testing.expect(metadata.lookup(.openai, "gpt-5.6-sol:batch") == null);
 
     // The aggregator spells the xAI vendor `x-ai`, and the id of a Grok model
@@ -376,7 +519,7 @@ test "a malformed envelope is rejected and a malformed entry is skipped" {
         \\] }
     );
     defer metadata.deinit();
-    try std.testing.expectEqual(@as(usize, 1), metadata.entries.len);
+    try std.testing.expectEqual(@as(usize, 1), countProvider(&metadata, .anthropic));
     try std.testing.expectEqual(@as(?u64, 7), metadata.lookup(.anthropic, "ok").?.context_window);
 }
 
@@ -411,4 +554,90 @@ test "parse bounds the entry count" {
     metadata.deinit();
     const over = "{\"data\":[{}" ++ (",{}" ** entry_count_max) ++ "]}";
     try std.testing.expectError(error.BadMetadata, parse(gpa, over));
+}
+
+test "a parameter list without tools denies tools on the vendor model" {
+    var metadata = try parse(std.testing.allocator,
+        \\{ "data": [
+        \\  { "id": "openai/with-tools", "supported_parameters": ["tools", "temperature"] },
+        \\  { "id": "openai/no-tools", "supported_parameters": ["temperature"] },
+        \\  { "id": "openai/silent" }
+        \\] }
+    );
+    defer metadata.deinit();
+    try std.testing.expectEqual(
+        Model.Tools.supported,
+        metadata.lookup(.openai, "with-tools").?.tools,
+    );
+    try std.testing.expectEqual(
+        Model.Tools.unsupported,
+        metadata.lookup(.openai, "no-tools").?.tools,
+    );
+    try std.testing.expectEqual(Model.Tools.unknown, metadata.lookup(.openai, "silent").?.tools);
+}
+
+test "the OpenRouter list keeps tool models, groups authors, and drops variants" {
+    var metadata = try parse(std.testing.allocator,
+        \\{ "data": [
+        \\  { "id": "openai/gpt-new", "supported_parameters": ["tools"],
+        \\    "top_provider": { "max_completion_tokens": 128000 } },
+        \\  { "id": "qwen/qwen-new", "supported_parameters": ["tools"] },
+        \\  { "id": "openai/gpt-mid", "supported_parameters": ["tools"] },
+        \\  { "id": "openai/gpt-old", "supported_parameters": ["tools"] },
+        \\  { "id": "qwen/qwen-mid", "supported_parameters": ["tools"] },
+        \\  { "id": "openai/gpt-no-tools", "supported_parameters": ["temperature"] },
+        \\  { "id": "openai/gpt:free", "supported_parameters": ["tools"] },
+        \\  { "id": "~openai/alias", "supported_parameters": ["tools"] },
+        \\  { "id": "openrouter/auto", "supported_parameters": ["tools"] },
+        \\  { "id": "openai/gpt/extra", "supported_parameters": ["tools"] },
+        \\  { "id": "anthropic/claude", "supported_parameters": ["tools"] }
+        \\] }
+    );
+    defer metadata.deinit();
+
+    try std.testing.expectEqual(@as(usize, 6), countProvider(&metadata, .openrouter));
+    var names: [6][]const u8 = undefined;
+    var index: usize = 0;
+    for (metadata.entries) |*entry| {
+        if (entry.provider != .openrouter) continue;
+        names[index] = entry.model.name();
+        index += 1;
+    }
+    // openai has three tool models, qwen has two, so openai leads. Inside one
+    // author the models keep the newest-first order of the body.
+    try std.testing.expectEqualStrings("openai/gpt-new", names[0]);
+    try std.testing.expectEqualStrings("openai/gpt-mid", names[1]);
+    try std.testing.expectEqualStrings("openai/gpt-old", names[2]);
+    try std.testing.expectEqualStrings("qwen/qwen-new", names[3]);
+    try std.testing.expectEqualStrings("qwen/qwen-mid", names[4]);
+    try std.testing.expectEqualStrings("anthropic/claude", names[5]);
+
+    const newest = metadata.lookup(.openrouter, "openai/gpt-new").?;
+    try std.testing.expectEqualStrings("gpt-new", newest.servedName());
+    try std.testing.expectEqual(@as(?u32, 128_000), newest.tokens_max);
+    try std.testing.expect(newest.serves("gpt-new"));
+    try std.testing.expect(newest.serves("openai/gpt-new"));
+}
+
+test "an author with the same count follows the first model of that author" {
+    var metadata = try parse(std.testing.allocator,
+        \\{ "data": [
+        \\  { "id": "beta/one", "supported_parameters": ["tools"] },
+        \\  { "id": "alpha/one", "supported_parameters": ["tools"] },
+        \\  { "id": "beta/two", "supported_parameters": ["tools"] },
+        \\  { "id": "alpha/two", "supported_parameters": ["tools"] }
+        \\] }
+    );
+    defer metadata.deinit();
+    var names: [4][]const u8 = undefined;
+    var index: usize = 0;
+    for (metadata.entries) |*entry| {
+        if (entry.provider != .openrouter) continue;
+        names[index] = entry.model.name();
+        index += 1;
+    }
+    try std.testing.expectEqualStrings("beta/one", names[0]);
+    try std.testing.expectEqualStrings("beta/two", names[1]);
+    try std.testing.expectEqualStrings("alpha/one", names[2]);
+    try std.testing.expectEqualStrings("alpha/two", names[3]);
 }

@@ -20,6 +20,7 @@ pub fn accounts(
         openai: bool = false,
         anthropic_console: bool = false,
         xai: bool = false,
+        openrouter: bool = false,
         google: bool = false,
     },
 ) Accounts {
@@ -28,6 +29,7 @@ pub fn accounts(
     registry.openai_subscription_ready = ready.openai;
     registry.anthropic_console_ready = ready.anthropic_console;
     registry.xai_subscription_ready = ready.xai;
+    registry.openrouter_oauth_ready = ready.openrouter;
     if (ready.google) registry.google_auth = .{
         .gpa = registry.gpa,
         .io = registry.io,

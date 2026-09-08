@@ -49,7 +49,13 @@ const Open = struct {
     /// The message, or null when the chat dropped the send.
     handle: ?Attachment.Handle,
     serial: u64,
-    select: *const fn (*ai.command.Context, usize) anyerror!ai.command.Outcome,
+    select: *const fn (
+        *ai.command.Context,
+        ai.command.Outcome.Pick.Selection,
+    ) anyerror!ai.command.Outcome,
+    /// The value the command set on this step. It reaches the selector beside
+    /// the tapped row.
+    payload: usize,
     /// The rows. Owned.
     options: []const []const u8,
     /// Borrowed from the command, which names it in a literal.
@@ -187,6 +193,7 @@ fn take(
         .handle = null,
         .serial = self.serial,
         .select = pick.select,
+        .payload = pick.payload,
         .options = pick.options,
         .title = pick.title,
         .cancellation_message = pick.cancellation_message,
@@ -229,7 +236,7 @@ pub fn select(
     context: *ai.command.Context,
     index: usize,
 ) anyerror!ai.command.Outcome {
-    return self.open.?.select(context, index);
+    return self.open.?.select(context, .{ .payload = self.open.?.payload, .row = index });
 }
 
 /// The steps above the open picker, for the `replace` that follows a `‹ Back`.
@@ -399,9 +406,26 @@ fn testPick(
     };
 }
 
-fn selectNothing(context: *ai.command.Context, index: usize) anyerror!ai.command.Outcome {
-    _ = index;
+fn selectNothing(
+    context: *ai.command.Context,
+    selection: ai.command.Outcome.Pick.Selection,
+) anyerror!ai.command.Outcome {
+    _ = selection;
     return ai.command.Outcome.reportNotice(context.gpa, .failure, "Select a valid row.", .{});
+}
+
+/// A selector that states the whole selection it received, so a test can read
+/// what the chat handed back.
+fn reportSelection(
+    context: *ai.command.Context,
+    selection: ai.command.Outcome.Pick.Selection,
+) anyerror!ai.command.Outcome {
+    return ai.command.Outcome.reportNotice(
+        context.gpa,
+        .information,
+        "payload {d} row {d}",
+        .{ selection.payload, selection.row },
+    );
 }
 
 fn openFirst(context: *ai.command.Context) anyerror!ai.command.Outcome {
@@ -447,6 +471,37 @@ test "a picker shows its rows as buttons with the current mark and a cancel, and
     try std.testing.expectEqual(@as(usize, 0), chat.edits.items.len);
     try std.testing.expectEqualSlices(Attachment.Handle, &.{1}, chat.deletions.items);
     try std.testing.expect(picker.resolve(.{ .close = 1 }) == null);
+}
+
+// A stepped command reads its earlier choice from the payload of the step. The
+// chat must therefore hand that payload back with the tapped row, exactly as
+// the terminal does. The author step of `/model` under an OpenRouter account
+// selects nothing without it.
+test "a tapped row carries the payload of its step to the selector" {
+    const gpa = std.testing.allocator;
+    var chat: Recorder = .{ .gpa = gpa };
+    defer chat.deinit();
+    var picker = Picker.init(gpa);
+    defer picker.deinit();
+
+    var pick = try testPick(gpa, &.{ "openai/gpt-new", "openai/gpt-old" }, null, null);
+    pick.select = reportSelection;
+    pick.payload = 4242;
+    try picker.show(&chat, &pick);
+
+    // The selector reads the allocator alone, so no session stands behind it.
+    var context: ai.command.Context = .{
+        .gpa = gpa,
+        .io = undefined,
+        .agent = undefined,
+        .accounts = undefined,
+    };
+    const action = picker.resolve(.{ .row = .{ .serial = 1, .index = 1 } }).?;
+    try ai.command.Outcome.expectNoticeContaining(
+        try picker.select(&context, action.row),
+        .information,
+        "payload 4242 row 1",
+    );
 }
 
 test "a step edits the same message, adds the back button, and a back takes the step off the trail" {

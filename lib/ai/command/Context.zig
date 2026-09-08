@@ -140,11 +140,16 @@ pub const Outcome = union(enum) {
     /// cancellation message. `current`, if set, is the row to mark and
     /// preselect.
     pub const Pick = struct {
-        select: *const fn (*Context, usize) anyerror!Outcome,
+        select: *const fn (*Context, Selection) anyerror!Outcome,
         title: []const u8,
         cancellation_message: []const u8,
         options: []const []const u8,
         current: ?usize,
+        /// A value the command sets on this picker and reads back from the
+        /// selection, beside the tapped row. It names the earlier choice that
+        /// this picker belongs to. A command that never sets it leaves zero,
+        /// and the selector of such a picker reads the row alone.
+        payload: usize = 0,
         /// A line the app records beside this picker, or null where the step
         /// reports nothing. A step that both reports and opens a list needs it.
         /// A cache write that failed must not close a list that arrived. The
@@ -155,11 +160,22 @@ pub const Outcome = union(enum) {
         /// returns here. The app owns that trail, so a step names itself alone
         /// and knows nothing of the step above it.
         reopen: ?Opener = null,
+
+        /// The tapped row and the payload the command set on this picker.
+        pub const Selection = struct {
+            payload: usize,
+            row: usize,
+
+            /// The selection of `row` on a picker that sets no payload.
+            pub fn ofRow(row: usize) Selection {
+                return .{ .payload = 0, .row = row };
+            }
+        };
     };
 
-    /// Build one picker from the live state. A selector takes the row index
-    /// alone and holds no earlier choice, so a step of a stepped command needs
-    /// one opener for each value of the choice that reached it.
+    /// Build one picker from the live state. An opener takes no argument, so a
+    /// step of a stepped command needs one opener for each value of the choice
+    /// that reached it.
     pub const Opener = *const fn (*Context) anyerror!Outcome;
 
     /// Builds a picker's owned rows. When the build fails, it frees the rows already built.

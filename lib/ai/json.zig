@@ -55,6 +55,15 @@ pub fn integer(value: ?std.json.Value) ?i64 {
     };
 }
 
+/// A JSON number as `f64`, or null when it is absent or not one.
+pub fn float(value: ?std.json.Value) ?f64 {
+    return switch (value orelse return null) {
+        .float => |found| found,
+        .integer => |found| @floatFromInt(found),
+        else => null,
+    };
+}
+
 pub fn boolean(value: ?std.json.Value) ?bool {
     return switch (value orelse return null) {
         .bool => |found| found,

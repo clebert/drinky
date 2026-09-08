@@ -71,8 +71,8 @@ cache_key: [32]u8,
 /// produced it, so the total stays correct across a mid-session `/model`
 /// switch. A plain value type: it copies whole across the UI channel.
 pub const Stats = struct {
-    /// The session cost of every reply Drinky could price. It is an estimate at
-    /// public rates, and a subscription pays none of it.
+    /// The session cost of every reply Drinky could price: the charge a reply
+    /// reports, or else an estimate at public rates.
     cost: f64 = 0,
     /// The conversation context that the last committed reply measured. Null
     /// means no measurement describes the current history, or the way the next
@@ -1009,7 +1009,22 @@ fn contextTokens(usage: *const llm.Usage) u64 {
 /// threaded from the request so billing cannot drift when `/model` changes
 /// `self.model`.
 fn recordUsage(self: *Agent, model: *const Model, usage: *const llm.Usage) void {
-    if (model.cost(usage)) |cost| self.stats.cost += cost;
+    self.recordCharge(model, usage, null);
+}
+
+fn recordStop(self: *Agent, model: *const Model, stop: *const llm.Event.Stop) void {
+    self.recordCharge(model, &stop.usage, stop.cost);
+}
+
+/// Add one reply to the totals: the charge it reports, or else its usage at the
+/// rates of `model`.
+fn recordCharge(
+    self: *Agent,
+    model: *const Model,
+    usage: *const llm.Usage,
+    reported_cost: ?f64,
+) void {
+    if (reported_cost orelse model.cost(usage)) |cost| self.stats.cost += cost;
     // The prompt of an accepted request is processed and billed whole, even
     // when the stream is canceled before its reply ends, so its hit rate is
     // final as soon as the counts arrive.
@@ -1103,7 +1118,7 @@ fn readReplyWith(
     const priced_model = pricingModel(model, stop.model);
     // Terminal usage is billable even when replay validation rejects the reply
     // and the request is retried.
-    self.recordUsage(&priced_model, &stop.usage);
+    self.recordStop(&priced_model, &stop);
     usage_recorded.* = true;
     try presentation(presentation_closed, handler.onUsage(self.stats));
 
@@ -1711,6 +1726,22 @@ test "usage is priced with the model that produced it, not the active one" {
     try std.testing.expectEqual(@as(u64, 1_000_000), agent.stats.cache_usage.input);
 }
 
+test "a reported charge outranks the rate estimate" {
+    const gpa = std.testing.allocator;
+    var agent = scriptedAgent(gpa);
+    defer agent.deinit();
+    const model = agent.model.?;
+    const usage: llm.Usage = .{ .input = 1_000_000 };
+    const estimate = model.cost(&usage).?;
+
+    agent.recordStop(&model, &.{ .usage = usage, .cost = 0.42 });
+    try std.testing.expectApproxEqAbs(@as(f64, 0.42), agent.stats.cost, 1e-9);
+
+    // A stop with no charge falls back to the rates.
+    agent.recordStop(&model, &.{ .usage = usage });
+    try std.testing.expectApproxEqAbs(0.42 + estimate, agent.stats.cost, 1e-9);
+}
+
 // A model that no source priced adds no cost at all. Drinky states no rate it
 // does not know, so such a reply leaves the total where it stood.
 test "an unpriced model adds no cost to the session total" {
@@ -2144,7 +2175,13 @@ fn appendProof(agent: *Agent, account: llm.Account) !void {
             @tagName(tag),
             .{ .signature = .{ .text = text, .signature = proof } },
         ),
-        inline .openai_subscription, .openai_api, .xai_subscription, .xai_api => |tag| replay: {
+        inline .openai_subscription,
+        .openai_api,
+        .xai_subscription,
+        .xai_api,
+        .openrouter_oauth,
+        .openrouter_api,
+        => |tag| replay: {
             const id = try gpa.dupe(u8, "rs_1");
             break :replay @unionInit(
                 llm.Item.Reasoning.Replay,
@@ -2798,6 +2835,111 @@ test "provider rejections retain terminal usage before failing the reply" {
         try std.testing.expectEqual(@as(usize, 1), handler.usage_count);
         try std.testing.expectEqual(@as(usize, 0), agent.items.items.len);
     }
+}
+
+fn expectUnencryptedReply(options: struct {
+    item: []const u8,
+    field: []const u8,
+    part_type: []const u8,
+}) !void {
+    const gpa = std.testing.allocator;
+    const openai = @import("openai/root.zig");
+    inline for (.{ llm.Account.openrouter_oauth, llm.Account.openrouter_api }) |account| {
+        const body = try std.fmt.allocPrint(
+            gpa,
+            "data: {{\"type\":\"response.reasoning_text.delta\",\"delta\":\"think\"}}\n\n" ++
+                "data: {{\"type\":\"response.output_item.done\",\"item\":{s}}}\n\n" ++
+                "data: {{\"type\":\"response.output_text.delta\",\"delta\":\"answer\"}}\n\n" ++
+                "data: {{\"type\":\"response.output_item.done\",\"item\":{{\"type\":\"message\"," ++
+                "\"id\":\"msg_1\",\"content\":[{{\"type\":\"output_text\"," ++
+                "\"text\":\"answer\"}}]}}}}\n\n" ++
+                "data: {{\"type\":\"response.completed\",\"response\":{{\"usage\":" ++
+                "{{\"input_tokens\":7,\"output_tokens\":3,\"cost\":0.000123}}}}}}\n\n",
+            .{options.item},
+        );
+        defer gpa.free(body);
+        var reader: std.Io.Reader = .fixed(body);
+        var stream = openaiStream(std.testing.io, &reader);
+        // The client sets this from the account, so a stream built by hand sets
+        // it too. Every OpenRouter account replays plain reasoning.
+        stream.openai_api.plain_reasoning = true;
+        defer stream.openai_api.deinitDecode();
+        var agent = openaiScriptedAgent(gpa);
+        defer agent.deinit();
+        agent.client.?.credentials = @unionInit(provider.Credentials, @tagName(account), "test");
+        var handler: CaptureHandler = .{ .gpa = gpa };
+        defer handler.deinit();
+
+        const reply = try agent.readReply(&agent.model.?, &stream, &handler);
+        try std.testing.expectEqual(@as(usize, 2), reply.len);
+        try std.testing.expectEqual(account, std.meta.activeTag(reply[0].reasoning.replay));
+        try std.testing.expectEqualStrings("answer", reply[1].message.text);
+        try std.testing.expectEqualStrings("answer", handler.text.items);
+        try std.testing.expectEqualStrings("think", handler.thinking.items);
+        try std.testing.expectEqual(@as(f64, 0.000123), agent.stats.cost);
+
+        const replay = try openai.wire.serialize(gpa, &.{
+            .model = "qwen/qwen3.8-flash",
+            .system = "",
+            .tokens_max = 128,
+            .items = reply,
+            .tools = &.{},
+        }, account);
+        defer gpa.free(replay);
+        const parsed = try std.json.parseFromSlice(std.json.Value, gpa, replay, .{});
+        defer parsed.deinit();
+        const input = parsed.value.object.get("input").?.array.items;
+        try std.testing.expectEqual(@as(usize, 2), input.len);
+        const reasoning = input[0].object;
+        try std.testing.expect(reasoning.get("encrypted_content") == null);
+        const part = reasoning.get(options.field).?.array.items[0].object;
+        try std.testing.expectEqualStrings(options.part_type, part.get("type").?.string);
+        try std.testing.expectEqualStrings("think", part.get("text").?.string);
+    }
+}
+
+test "readReply retains and replays an OpenRouter summary without encryption" {
+    try expectUnencryptedReply(.{
+        .item =
+        \\{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"think"}]}
+        ,
+        .field = "summary",
+        .part_type = "summary_text",
+    });
+}
+
+test "readReply retains and replays raw OpenRouter reasoning without encryption" {
+    try expectUnencryptedReply(.{
+        .item =
+        \\{"type":"reasoning","id":"rs_1","summary":[],"content":[{"type":"reasoning_text","text":"think"}],"encrypted_content":""}
+        ,
+        .field = "content",
+        .part_type = "reasoning_text",
+    });
+}
+
+test "a zero charge after a rejected reply keeps the earlier charge" {
+    const gpa = std.testing.allocator;
+    var agent = openaiScriptedAgent(gpa);
+    defer agent.deinit();
+    var handler: CaptureHandler = .{ .gpa = gpa };
+    defer handler.deinit();
+    const rejected = [_]llm.Event{
+        .{ .stop = .{ .usage = .{ .input = 7 }, .cost = 0.000123, .rejection = .invalid } },
+    };
+    var failed: ScriptedStream = .{ .events = &rejected };
+    try std.testing.expectError(
+        error.IncompleteReply,
+        agent.readReply(&agent.model.?, &failed, &handler),
+    );
+    const accepted = [_]llm.Event{
+        .{ .item = .{ .message = "answer" } },
+        .{ .stop = .{ .usage = .{ .input = 7 }, .cost = 0 } },
+    };
+    var retry: ScriptedStream = .{ .events = &accepted };
+    _ = try agent.readReply(&agent.model.?, &retry, &handler);
+    try std.testing.expectEqual(@as(f64, 0.000123), agent.stats.cost);
+    try std.testing.expectEqual(@as(usize, 2), handler.usage_count);
 }
 
 test "readReply separates OpenAI reasoning summary parts with a blank line" {

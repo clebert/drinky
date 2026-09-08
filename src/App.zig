@@ -619,15 +619,15 @@ const LoginWorker = struct {
 /// continues, because the browser callback can still land.
 const PasteHandler = struct {
     io: std.Io,
-    port: u16,
+    callback: ai.Accounts.Callback,
     prompt: *OauthPrompt,
 
     fn onLine(self: *const PasteHandler, text: []const u8) void {
-        if (!ai.oauth_callback.holdsRedirect(text)) {
+        if (!ai.oauth_callback.holdsRedirect(text, self.callback.binding)) {
             self.prompt.showPasteInvalid() catch {};
             return;
         }
-        ai.oauth_callback.replay(self.io, self.port, text) catch |err| switch (err) {
+        ai.oauth_callback.replay(self.io, self.callback.port, text) catch |err| switch (err) {
             // The listener closes as soon as it holds a response, so a refused
             // port means the sign-in already moved on. A second paste is
             // ordinary, and it must not read as a fault.
@@ -2529,7 +2529,7 @@ fn loginAccount(self: *App, account: ai.llm.Account) !void {
 /// paste path. A device-code login has no port: the poll of its grant is the
 /// whole wait.
 fn runLogin(self: *App, account: ai.llm.Account, prompt: *OauthPrompt) !ai.Accounts.Login {
-    const port = ai.Accounts.callbackPort(account) orelse
+    const callback = ai.Accounts.callback(account) orelse
         return self.accounts.login(account, prompt);
     var worker: LoginWorker = .{
         .accounts = &self.accounts,
@@ -2543,7 +2543,7 @@ fn runLogin(self: *App, account: ai.llm.Account, prompt: *OauthPrompt) !ai.Accou
         prompt.paste_enabled = false;
         return self.accounts.login(account, prompt);
     };
-    self.watchForPaste(&worker.done, port, prompt);
+    self.watchForPaste(&worker.done, callback, prompt);
     return future.await(self.io);
 }
 
@@ -2560,14 +2560,14 @@ fn resumeInputReader(self: *App) void {
 }
 
 /// Watch the cooked terminal during the login wait, and replay each pasted
-/// callback URL to the local listener on `port`. The loop is an event wait:
+/// callback URL to the local listener of `callback`. The loop is an event wait:
 /// `done` flips when the login worker finishes, and the worker's own callback
 /// deadline bounds that. A closed stdin or a read fault stops the watch
 /// alone, and the login wait continues.
 fn watchForPaste(
     self: *App,
     done: *const std.atomic.Value(bool),
-    port: u16,
+    callback: ai.Accounts.Callback,
     prompt: *OauthPrompt,
 ) void {
     // The poll bounds the exit lag after `done` flips. A paste is a human
@@ -2576,7 +2576,7 @@ fn watchForPaste(
     const poll: std.Io.Timeout =
         .{ .duration = .{ .raw = .fromMilliseconds(200), .clock = .awake } };
     var splitter: PasteSplitter = .{};
-    var handler: PasteHandler = .{ .io = self.io, .port = port, .prompt = prompt };
+    var handler: PasteHandler = .{ .io = self.io, .callback = callback, .prompt = prompt };
     var buffer: [512]u8 = undefined;
     while (!done.load(.acquire)) {
         const result = self.tty.read(&buffer, poll) catch {
@@ -3193,8 +3193,11 @@ fn applyPairingChange(self: *App, change: remote.Controller.Action.PairingChange
 
 /// The selector of the wait picker of a pairing. The list holds no row, so no
 /// selection reaches it.
-fn selectNothing(context: *ai.command.Context, index: usize) anyerror!ai.command.Outcome {
-    _ = index;
+fn selectNothing(
+    context: *ai.command.Context,
+    selection: ai.command.Outcome.Pick.Selection,
+) anyerror!ai.command.Outcome {
+    _ = selection;
     return ai.command.Outcome.reportNotice(context.gpa, .failure, "Select a valid row.", .{});
 }
 
@@ -3888,10 +3891,16 @@ test "the paste handler reports each unusable line by its own cause" {
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
     var prompt: OauthPrompt = .{ .writer = &out.writer, .io = std.testing.io };
-    const handler: PasteHandler = .{ .io = std.testing.io, .port = 1, .prompt = &prompt };
+    const handler: PasteHandler = .{
+        .io = std.testing.io,
+        .callback = .{ .port = 1, .binding = .state },
+        .prompt = &prompt,
+    };
 
-    // A line that holds no outcome asks for the complete URL. A dropped line
-    // was too long for one, so it asks for the URL alone.
+    // A line that holds no outcome asks for the complete URL, and the wait
+    // continues. A grant without its state is such a line, because the exchange
+    // of this login compares that state. A dropped line was too long for one
+    // outcome, so it asks for the URL alone.
     handler.onLine("https://localhost:1455/auth/callback?code=without-state");
     handler.onLongLine();
 
@@ -3900,11 +3909,21 @@ test "the paste handler reports each unusable line by its own cause" {
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, written, guidance));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, written, "too long"));
 
+    // A login that binds a random callback path answers on that path alone, so
+    // a line that names none reaches no verdict and asks for the URL too.
+    const bound: PasteHandler = .{
+        .io = std.testing.io,
+        .callback = .{ .port = 1, .binding = .path },
+        .prompt = &prompt,
+    };
+    bound.onLine("code=without-path");
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, out.written(), guidance));
+
     // The listener owns the denial verdict, so the handler replays an `error`
     // line and reports no guidance for it. Port 1 holds no listener, and a
     // refused connection means the listener already has its response.
     handler.onLine("https://localhost:1455/auth/callback?error=access_denied");
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, out.written(), guidance));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, out.written(), guidance));
     try std.testing.expect(
         std.mem.indexOf(u8, out.written(), "already received the response") != null,
     );
@@ -5917,7 +5936,10 @@ test "a picker confirmation keeps the characters typed behind it" {
     options[0] = try gpa.dupe(u8, "alpha");
     try app.session.applyOutcome(.{ .pick = .{
         .select = struct {
-            fn select(context: *ai.command.Context, _: usize) anyerror!ai.command.Outcome {
+            fn select(
+                context: *ai.command.Context,
+                _: ai.command.Outcome.Pick.Selection,
+            ) anyerror!ai.command.Outcome {
                 return ai.command.Outcome.reportNotice(context.gpa, .information, "picked", .{});
             }
         }.select,

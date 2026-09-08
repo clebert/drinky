@@ -1,7 +1,8 @@
 //! Translates a neutral `llm.Request` into an OpenAI Responses API JSON body.
-//! Every Responses account shares this module: the OpenAI accounts and the xAI
-//! accounts differ only in transport base and auth, never wire shape. It holds
-//! no state and does no I/O. `Transport` sends the bytes this module produces.
+//! Every Responses account shares this module: the OpenAI accounts, the xAI
+//! accounts, and the OpenRouter accounts differ in transport base, auth, and a
+//! few request options, never in wire shape. It holds no state and does no I/O.
+//! `Transport` sends the bytes this module produces.
 
 const std = @import("std");
 
@@ -50,19 +51,31 @@ pub fn serialize(gpa: std.mem.Allocator, request: *const llm.Request, account: l
         try stringify.endArray();
         try stringify.objectField("tool_choice");
         try stringify.write("auto");
-        try stringify.objectField("parallel_tool_calls");
-        try stringify.write(true);
+        // The endpoint rule: OpenRouter picks an endpoint that serves every
+        // named parameter, so this flag would drop the endpoints that do not
+        // take it. A vendor account names it, because it reaches one endpoint.
+        if (account.provider() != .openrouter) {
+            try stringify.objectField("parallel_tool_calls");
+            try stringify.write(true);
+        }
     }
 
     // Stateless replay: never persist the turn server-side, and ask for the
     // reasoning tokens encrypted so a stored reasoning item round-trips next
     // turn (the model requires the reasoning that preceded a function call).
+    //
+    // The reasoning rule: an account that replays plain reasoning asks for no
+    // blob and replays the reasoning text instead. The endpoint rule above
+    // motivates it, but the two rules govern different fields, so each names
+    // the account property it belongs to.
     try stringify.objectField("store");
     try stringify.write(false);
-    try stringify.objectField("include");
-    try stringify.beginArray();
-    try stringify.write("reasoning.encrypted_content");
-    try stringify.endArray();
+    if (!account.replaysPlainReasoning()) {
+        try stringify.objectField("include");
+        try stringify.beginArray();
+        try stringify.write("reasoning.encrypted_content");
+        try stringify.endArray();
+    }
 
     // Near pass-through: one input item per history item, in list order.
     // Unlike Anthropic, OpenAI needs no envelope merging.
@@ -73,6 +86,10 @@ pub fn serialize(gpa: std.mem.Allocator, request: *const llm.Request, account: l
 
     try stringify.objectField("stream");
     try stringify.write(true);
+    if (account.provider() == .openrouter) {
+        try stringify.objectField("provider");
+        try stringify.write(.{ .require_parameters = true });
+    }
     try stringify.endObject();
 
     return out.toOwnedSlice();
@@ -107,8 +124,10 @@ fn writeItem(
             .openai_api,
             .xai_subscription,
             .xai_api,
+            .openrouter_oauth,
+            .openrouter_api,
             => |proof, tag| {
-                if (tag == account and proof.id.len != 0 and proof.encrypted_content.len != 0)
+                if (tag == account and proof.replayable(account.replaysPlainReasoning()))
                     try writeReasoning(stringify, &proof);
             },
             .anthropic_subscription, .anthropic_api, .anthropic_console, .google_vertex => {},
@@ -137,7 +156,9 @@ fn writeMessage(stringify: *std.json.Stringify, message: *const llm.Item.Message
 }
 
 /// A stored reasoning run: its server-assigned id, optional summary, and
-/// verbatim encrypted token.
+/// verbatim encrypted token. A proof that carries no token replays its raw
+/// reasoning text instead, which only an account that replays plain reasoning
+/// holds.
 fn writeReasoning(
     stringify: *std.json.Stringify,
     replay: *const llm.Item.Reasoning.OpenAi,
@@ -158,8 +179,20 @@ fn writeReasoning(
         try stringify.endObject();
     }
     try stringify.endArray();
-    try stringify.objectField("encrypted_content");
-    try stringify.write(replay.encrypted_content);
+    if (replay.encrypted_content.len != 0) {
+        try stringify.objectField("encrypted_content");
+        try stringify.write(replay.encrypted_content);
+    } else if (replay.raw_text.len != 0) {
+        try stringify.objectField("content");
+        try stringify.beginArray();
+        try stringify.beginObject();
+        try stringify.objectField("type");
+        try stringify.write("reasoning_text");
+        try stringify.objectField("text");
+        try stringify.write(replay.raw_text);
+        try stringify.endObject();
+        try stringify.endArray();
+    }
     try stringify.endObject();
 }
 
@@ -426,7 +459,8 @@ test "reasoning replays only the active account's complete proof" {
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
     defer parsed.deinit();
     const input = parsed.value.object.get("input").?.array.items;
-    // Only this account's complete reasoning item and the message survive.
+    // Only this account's complete reasoning item and the message survive. The
+    // OpenAI backend rejects a reasoning item without its blob, so `rs_2` goes.
     try std.testing.expectEqual(@as(usize, 2), input.len);
     try std.testing.expectEqualStrings("reasoning", input[0].object.get("type").?.string);
     try std.testing.expectEqualStrings("rs_1", input[0].object.get("id").?.string);
@@ -544,4 +578,89 @@ test "serialized bytes match the expected Responses wire output" {
     }, .openai_api);
     defer std.testing.allocator.free(body);
     try std.testing.expectEqualStrings(golden, body);
+}
+
+test "an OpenRouter request requires parameters and replays its own proof" {
+    const items = [_]llm.Item{
+        .{ .reasoning = .{ .replay = .{ .openrouter_api = .{
+            .text = "think",
+            .id = "rs_or",
+            .encrypted_content = "enc",
+            .raw_text = "raw reasoning",
+        } } } },
+        .{ .reasoning = .{ .replay = .{ .openrouter_oauth = .{
+            .text = "foreign summary",
+            .id = "rs_foreign",
+            .encrypted_content = "",
+            .raw_text = "foreign reasoning",
+        } } } },
+        .{ .reasoning = .{ .replay = .{ .openrouter_api = .{
+            .text = "",
+            .id = "rs_plain",
+            .encrypted_content = "",
+            .raw_text = "plain reasoning",
+        } } } },
+    };
+    const tools = [_]llm.Tool{
+        .{ .name = "read", .description = "read a file", .parameters = &.{
+            .{ .name = "path", .type = .string, .required = true, .description = "the path" },
+        } },
+    };
+    const body = try serialize(std.testing.allocator, &.{
+        .model = "openai/gpt-5.6-sol",
+        .tokens_max = 8,
+        .system = "s",
+        .items = &items,
+        .tools = &tools,
+    }, .openrouter_api);
+    defer std.testing.allocator.free(body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    try std.testing.expect(root.get("provider").?.object.get("require_parameters").?.bool);
+    try std.testing.expect(root.get("include") == null);
+    try std.testing.expect(root.get("parallel_tool_calls") == null);
+    try std.testing.expectEqualStrings("auto", root.get("tool_choice").?.string);
+    const input = root.get("input").?.array.items;
+    // The blob wins where the proof holds one, and the raw text replays where
+    // it holds none. The proof of the other OpenRouter account stays out.
+    try std.testing.expectEqual(@as(usize, 2), input.len);
+    try std.testing.expectEqualStrings("rs_or", input[0].object.get("id").?.string);
+    try std.testing.expectEqualStrings("enc", input[0].object.get("encrypted_content").?.string);
+    try std.testing.expect(input[0].object.get("content") == null);
+    try std.testing.expectEqualStrings("rs_plain", input[1].object.get("id").?.string);
+    try std.testing.expect(input[1].object.get("encrypted_content") == null);
+    const plain_part = input[1].object.get("content").?.array.items[0].object;
+    try std.testing.expectEqualStrings("reasoning_text", plain_part.get("type").?.string);
+    try std.testing.expectEqualStrings("plain reasoning", plain_part.get("text").?.string);
+
+    inline for (.{
+        llm.Account.openai_subscription,
+        llm.Account.openai_api,
+        llm.Account.xai_subscription,
+        llm.Account.xai_api,
+    }) |account| {
+        const direct = try serialize(std.testing.allocator, &.{
+            .model = "model",
+            .tokens_max = 8,
+            .system = "s",
+            .items = &items,
+            .tools = &tools,
+        }, account);
+        defer std.testing.allocator.free(direct);
+        const direct_parsed = try std.json.parseFromSlice(
+            std.json.Value,
+            std.testing.allocator,
+            direct,
+            .{},
+        );
+        defer direct_parsed.deinit();
+        const direct_root = direct_parsed.value.object;
+        try std.testing.expect(direct_root.get("parallel_tool_calls").?.bool);
+        try std.testing.expectEqualStrings(
+            "reasoning.encrypted_content",
+            direct_root.get("include").?.array.items[0].string,
+        );
+        try std.testing.expectEqual(@as(usize, 0), direct_root.get("input").?.array.items.len);
+    }
 }

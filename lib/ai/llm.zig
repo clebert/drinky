@@ -7,10 +7,12 @@ const std = @import("std");
 /// A configured account: a vendor crossed with the billing product that
 /// authorizes its requests. The auth *mechanism* — an API key or an OAuth
 /// subscription — is data held by `provider.Credentials`, not part of the
-/// identity. This is the tag `provider.Client`/`Stream` key on. It is also the
-/// origin stamped on stored reasoning, so only the exact account that produced
-/// a blob replays it. At startup any account with a login is preferred over an
-/// environment API key, across vendors. Within a tier, declaration order decides.
+/// identity. OpenRouter is the exception: its two accounts share one billing
+/// product, and the label names the credential source. This is the tag
+/// `provider.Client`/`Stream` key on. It is also the origin stamped on stored
+/// reasoning, so only the exact account that produced a blob replays it. At
+/// startup any account with a login is preferred over an environment API key,
+/// across vendors. Within a tier, declaration order decides.
 pub const Account = enum {
     /// Claude Pro/Max subscription OAuth, authorized with a `Bearer` token and
     /// the Claude Code identity headers.
@@ -30,6 +32,10 @@ pub const Account = enum {
     xai_subscription,
     /// Per-token xAI API, authorized with a `Bearer` key.
     xai_api,
+    /// OpenRouter OAuth login, authorized with a minted `Bearer` key.
+    openrouter_oauth,
+    /// Per-token OpenRouter API, authorized with a `Bearer` key.
+    openrouter_api,
     /// Gemini models on Vertex AI, authorized with an access token that Drinky
     /// mints from a service account key file. It goes last, so the startup
     /// order prefers every other account.
@@ -45,8 +51,9 @@ pub const Account = enum {
             .openai_subscription,
             .anthropic_console,
             .xai_subscription,
+            .openrouter_oauth,
             => true,
-            .anthropic_api, .openai_api, .xai_api, .google_vertex => false,
+            .anthropic_api, .openai_api, .xai_api, .openrouter_api, .google_vertex => false,
         };
     }
 
@@ -56,7 +63,14 @@ pub const Account = enum {
     pub fn hasRefreshCredential(self: Account) bool {
         return switch (self) {
             .anthropic_subscription, .openai_subscription, .xai_subscription => true,
-            .anthropic_console, .anthropic_api, .openai_api, .xai_api, .google_vertex => false,
+            .anthropic_console,
+            .anthropic_api,
+            .openai_api,
+            .xai_api,
+            .openrouter_oauth,
+            .openrouter_api,
+            .google_vertex,
+            => false,
         };
     }
 
@@ -70,6 +84,8 @@ pub const Account = enum {
             .openai_api => "OpenAI API",
             .xai_subscription => "xAI Subscription",
             .xai_api => "xAI API",
+            .openrouter_oauth => "OpenRouter OAuth",
+            .openrouter_api => "OpenRouter API",
             .google_vertex => "Google Vertex",
         };
     }
@@ -78,12 +94,13 @@ pub const Account = enum {
     /// picker names it, or null for an account with a login.
     pub fn credentialLabel(self: Account) ?[]const u8 {
         return switch (self) {
-            .anthropic_api, .openai_api, .xai_api => "API key",
+            .anthropic_api, .openai_api, .xai_api, .openrouter_api => "API key",
             .google_vertex => "Key file",
             .anthropic_subscription,
             .openai_subscription,
             .anthropic_console,
             .xai_subscription,
+            .openrouter_oauth,
             => null,
         };
     }
@@ -96,11 +113,13 @@ pub const Account = enum {
             .anthropic_api => "ANTHROPIC_API_KEY",
             .openai_api => "OPENAI_API_KEY",
             .xai_api => "XAI_API_KEY",
+            .openrouter_api => "OPENROUTER_API_KEY",
             .google_vertex => "GOOGLE_APPLICATION_CREDENTIALS and GOOGLE_CLOUD_LOCATION",
             .anthropic_subscription,
             .openai_subscription,
             .anthropic_console,
             .xai_subscription,
+            .openrouter_oauth,
             => null,
         };
     }
@@ -111,8 +130,18 @@ pub const Account = enum {
             .anthropic_api, .anthropic_subscription, .anthropic_console => .anthropic,
             .openai_api, .openai_subscription => .openai,
             .xai_api, .xai_subscription => .xai,
+            .openrouter_oauth, .openrouter_api => .openrouter,
             .google_vertex => .google,
         };
+    }
+
+    /// Whether this account replays a reasoning item without encrypted content.
+    /// OpenRouter picks the endpoint of a request from the parameters of that
+    /// request, and a request for encrypted content reaches fewer endpoints, so
+    /// Drinky asks for none and replays the reasoning text instead. Every other
+    /// Responses account must hold the encrypted blob.
+    pub fn replaysPlainReasoning(self: Account) bool {
+        return self.provider() == .openrouter;
     }
 };
 
@@ -127,6 +156,7 @@ pub const Provider = enum {
     anthropic,
     openai,
     xai,
+    openrouter,
     google,
 
     /// The human-readable label, e.g. "Anthropic". Every account label of the
@@ -136,6 +166,7 @@ pub const Provider = enum {
             .anthropic => "Anthropic",
             .openai => "OpenAI",
             .xai => "xAI",
+            .openrouter => "OpenRouter",
             .google => "Google",
         };
     }
@@ -193,6 +224,10 @@ pub const Item = union(enum) {
             /// has the OpenAI shape.
             xai_subscription: OpenAi,
             xai_api: OpenAi,
+            /// The OpenRouter accounts speak the Responses protocol, so their
+            /// proof has the OpenAI shape.
+            openrouter_oauth: OpenAi,
+            openrouter_api: OpenAi,
             /// The `thoughtSignature` of one part. The text stays empty, because
             /// no wire needs the thought text back.
             google_vertex: Signature,
@@ -220,16 +255,21 @@ pub const Item = union(enum) {
                     .openai_api,
                     .xai_subscription,
                     .xai_api,
+                    .openrouter_oauth,
+                    .openrouter_api,
                     => |proof, tag| openai: {
                         const text_copy = try gpa.dupe(u8, proof.text);
                         errdefer gpa.free(text_copy);
                         const id_copy = try gpa.dupe(u8, proof.id);
                         errdefer gpa.free(id_copy);
                         const content_copy = try gpa.dupe(u8, proof.encrypted_content);
+                        errdefer gpa.free(content_copy);
+                        const raw_copy = try gpa.dupe(u8, proof.raw_text);
                         break :openai @unionInit(Replay, @tagName(tag), .{
                             .text = text_copy,
                             .id = id_copy,
                             .encrypted_content = content_copy,
+                            .raw_text = raw_copy,
                         });
                     },
                 };
@@ -248,10 +288,13 @@ pub const Item = union(enum) {
                     .openai_api,
                     .xai_subscription,
                     .xai_api,
+                    .openrouter_oauth,
+                    .openrouter_api,
                     => |proof| {
                         gpa.free(proof.text);
                         gpa.free(proof.id);
                         gpa.free(proof.encrypted_content);
+                        gpa.free(proof.raw_text);
                     },
                     .google_vertex => |signature| signature.deinit(gpa),
                 }
@@ -283,6 +326,17 @@ pub const Item = union(enum) {
             text: []const u8,
             id: []const u8,
             encrypted_content: []const u8,
+            raw_text: []const u8 = "",
+
+            /// Whether this proof can go back on the wire. Every account needs
+            /// the id and the encrypted blob. An account that replays plain
+            /// reasoning (see `Account.replaysPlainReasoning`) takes the summary
+            /// or the raw reasoning text instead.
+            pub fn replayable(self: *const OpenAi, plain: bool) bool {
+                if (self.id.len == 0) return false;
+                if (self.encrypted_content.len != 0) return true;
+                return plain and (self.text.len != 0 or self.raw_text.len != 0);
+            }
         };
     };
 
@@ -349,7 +403,7 @@ pub const Request = struct {
         pub fn replaysReasoning(self: Reasoning, vendor: Provider) bool {
             return switch (vendor) {
                 .anthropic => self == .named,
-                .openai, .xai, .google => true,
+                .openai, .xai, .openrouter, .google => true,
             };
         }
 
@@ -443,6 +497,8 @@ pub const Event = union(enum) {
     pub const Reasoning = union(enum) {
         signature: Item.Reasoning.Signature,
         redacted: []const u8,
+        /// The item of an account that replays plain reasoning can omit the
+        /// encrypted content.
         encrypted: Item.Reasoning.OpenAi,
 
         pub fn replay(
@@ -476,9 +532,12 @@ pub const Event = union(enum) {
                 .openai_api,
                 .xai_subscription,
                 .xai_api,
+                .openrouter_oauth,
+                .openrouter_api,
                 => |tag| switch (self.*) {
-                    .encrypted => |encrypted| if (encrypted.id.len != 0 and
-                        encrypted.encrypted_content.len != 0)
+                    .encrypted => |encrypted| if (encrypted.replayable(
+                        tag.replaysPlainReasoning(),
+                    ))
                         @unionInit(Item.Reasoning.Replay, @tagName(tag), encrypted)
                     else
                         null,
@@ -511,6 +570,9 @@ pub const Event = union(enum) {
         /// model, so the agent compares this against the requested model and
         /// reports a switch. The slice borrows the stream, like an item slice.
         model: []const u8 = "",
+        /// The reported charge of this reply in USD, or null when the wire
+        /// states none. A session prefers this number over a rate estimate.
+        cost: ?f64 = null,
 
         pub const Rejection = enum {
             /// Malformed or incomplete output that a whole-request retry can fix.
@@ -562,6 +624,11 @@ test "reasoning proofs bind only to compatible exact accounts" {
     try std.testing.expectEqualStrings("rs_1", openai_replay.openai_subscription.id);
     try std.testing.expectEqualStrings("hmm", openai_replay.openai_subscription.text);
     try std.testing.expect(encrypted.replay(.anthropic_subscription) == null);
+    try std.testing.expect(encrypted.replay(.openrouter_api) != null);
+    try std.testing.expectEqual(
+        Account.openrouter_api,
+        std.meta.activeTag(encrypted.replay(.openrouter_api).?),
+    );
     // An xAI proof has the same shape and binds to its own account alone.
     const xai_replay = encrypted.replay(.xai_subscription).?;
     try std.testing.expectEqual(Account.xai_subscription, std.meta.activeTag(xai_replay));
@@ -582,6 +649,57 @@ test "reasoning proofs bind only to compatible exact accounts" {
     const unsigned: Event.Reasoning = .{ .signature = .{ .text = "hmm", .signature = "" } };
     try std.testing.expect(unsigned.replay(.google_vertex) == null);
     try std.testing.expect(unsigned.replay(.anthropic_api) == null);
+}
+
+test "only an account that replays plain reasoning takes a summary without encryption" {
+    const reasoning: Event.Reasoning = .{ .encrypted = .{
+        .text = "think",
+        .id = "rs_1",
+        .encrypted_content = "",
+    } };
+    inline for (.{ Account.openrouter_oauth, Account.openrouter_api }) |account| {
+        const maybe_replay = reasoning.replay(account);
+        try std.testing.expect(maybe_replay != null);
+        try std.testing.expectEqualStrings("think", @field(maybe_replay.?, @tagName(account)).text);
+    }
+    // OpenAI and xAI ask for the encrypted blob, and their backend rejects a
+    // reasoning item that carries none, so such a proof replays nowhere.
+    inline for (.{
+        Account.openai_subscription,
+        Account.openai_api,
+        Account.xai_subscription,
+        Account.xai_api,
+        Account.anthropic_api,
+        Account.google_vertex,
+    }) |account| {
+        try std.testing.expect(reasoning.replay(account) == null);
+    }
+}
+
+test "an account replays plain reasoning exactly when OpenRouter serves it" {
+    for (std.enums.values(Account)) |account| {
+        try std.testing.expectEqual(
+            account.provider() == .openrouter,
+            account.replaysPlainReasoning(),
+        );
+    }
+}
+
+fn dupeRawReasoning(gpa: std.mem.Allocator) !void {
+    const source: Item.Reasoning.Replay = .{ .openrouter_api = .{
+        .text = "summary",
+        .id = "rs_1",
+        .encrypted_content = "enc",
+        .raw_text = "raw reasoning",
+    } };
+    const copy = try source.dupe(gpa);
+    defer copy.deinit(gpa);
+    try std.testing.expectEqualStrings("raw reasoning", copy.openrouter_api.raw_text);
+    try std.testing.expect(copy.openrouter_api.raw_text.ptr != source.openrouter_api.raw_text.ptr);
+}
+
+test "raw reasoning owns its text and frees every allocation on failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, dupeRawReasoning, .{});
 }
 
 test "a replay copies and frees every arm" {
@@ -612,6 +730,7 @@ test "a provider label prefixes the label of each of its accounts" {
     try std.testing.expectEqualStrings("Anthropic", Provider.anthropic.label());
     try std.testing.expectEqualStrings("OpenAI", Provider.openai.label());
     try std.testing.expectEqualStrings("xAI", Provider.xai.label());
+    try std.testing.expectEqualStrings("OpenRouter", Provider.openrouter.label());
     try std.testing.expectEqualStrings("Google", Provider.google.label());
 }
 
@@ -623,6 +742,8 @@ test "Account.provider maps each account to its vendor" {
     try std.testing.expectEqual(Provider.anthropic, Account.anthropic_console.provider());
     try std.testing.expectEqual(Provider.xai, Account.xai_subscription.provider());
     try std.testing.expectEqual(Provider.xai, Account.xai_api.provider());
+    try std.testing.expectEqual(Provider.openrouter, Account.openrouter_oauth.provider());
+    try std.testing.expectEqual(Provider.openrouter, Account.openrouter_api.provider());
     try std.testing.expectEqual(Provider.google, Account.google_vertex.provider());
 }
 
@@ -631,9 +752,11 @@ test "account credential flags and label" {
     try std.testing.expect(Account.openai_subscription.hasLogin());
     try std.testing.expect(Account.anthropic_console.hasLogin());
     try std.testing.expect(Account.xai_subscription.hasLogin());
+    try std.testing.expect(Account.openrouter_oauth.hasLogin());
     try std.testing.expect(!Account.anthropic_api.hasLogin());
     try std.testing.expect(!Account.openai_api.hasLogin());
     try std.testing.expect(!Account.xai_api.hasLogin());
+    try std.testing.expect(!Account.openrouter_api.hasLogin());
     try std.testing.expect(!Account.google_vertex.hasLogin());
     try std.testing.expect(Account.anthropic_subscription.hasRefreshCredential());
     try std.testing.expect(Account.openai_subscription.hasRefreshCredential());
@@ -642,6 +765,8 @@ test "account credential flags and label" {
     try std.testing.expect(!Account.anthropic_api.hasRefreshCredential());
     try std.testing.expect(!Account.openai_api.hasRefreshCredential());
     try std.testing.expect(!Account.xai_api.hasRefreshCredential());
+    try std.testing.expect(!Account.openrouter_oauth.hasRefreshCredential());
+    try std.testing.expect(!Account.openrouter_api.hasRefreshCredential());
     try std.testing.expect(!Account.google_vertex.hasRefreshCredential());
     try std.testing.expectEqualStrings(
         "Anthropic Subscription",
@@ -652,10 +777,16 @@ test "account credential flags and label" {
     try std.testing.expectEqualStrings("OpenAI Subscription", Account.openai_subscription.label());
     try std.testing.expectEqualStrings("xAI Subscription", Account.xai_subscription.label());
     try std.testing.expectEqualStrings("xAI API", Account.xai_api.label());
+    try std.testing.expectEqualStrings("OpenRouter OAuth", Account.openrouter_oauth.label());
+    try std.testing.expectEqualStrings("OpenRouter API", Account.openrouter_api.label());
     try std.testing.expectEqualStrings("Google Vertex", Account.google_vertex.label());
     try std.testing.expectEqualStrings("ANTHROPIC_API_KEY", Account.anthropic_api.credentialEnv().?);
     try std.testing.expectEqualStrings("OPENAI_API_KEY", Account.openai_api.credentialEnv().?);
     try std.testing.expectEqualStrings("XAI_API_KEY", Account.xai_api.credentialEnv().?);
+    try std.testing.expectEqualStrings(
+        "OPENROUTER_API_KEY",
+        Account.openrouter_api.credentialEnv().?,
+    );
     try std.testing.expectEqualStrings(
         "GOOGLE_APPLICATION_CREDENTIALS and GOOGLE_CLOUD_LOCATION",
         Account.google_vertex.credentialEnv().?,

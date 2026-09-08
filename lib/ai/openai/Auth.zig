@@ -71,7 +71,8 @@ fn exchangeRedirect(
     redirect: *const oauth_callback.Redirect,
     pair: *const oauth_wire.Pkce,
 ) !oauth.Tokens {
-    if (!std.mem.eql(u8, redirect.state, &pair.verifier)) return error.StateMismatch;
+    const state = redirect.state orelse return error.StateMismatch;
+    if (!std.mem.eql(u8, state, &pair.verifier)) return error.StateMismatch;
     return oauth.exchange(self.gpa, self.io, self.timeouts, .{
         .code = redirect.code,
         .verifier = &pair.verifier,

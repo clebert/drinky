@@ -24,6 +24,8 @@ fn sendsSystemHeader(account: llm.Account) bool {
         .openai_api,
         .xai_subscription,
         .xai_api,
+        .openrouter_oauth,
+        .openrouter_api,
         .google_vertex,
         => false,
     };
@@ -193,7 +195,14 @@ fn emitsBlock(item: llm.Item, emit_thinking: bool, account: llm.Account) bool {
                     .redacted => |data| data.len != 0,
                 };
             },
-            .openai_subscription, .openai_api, .xai_subscription, .xai_api, .google_vertex => false,
+            .openai_subscription,
+            .openai_api,
+            .xai_subscription,
+            .xai_api,
+            .openrouter_oauth,
+            .openrouter_api,
+            .google_vertex,
+            => false,
         },
         else => true,
     };
@@ -290,6 +299,8 @@ fn writeThinking(stringify: *std.json.Stringify, reasoning: *const llm.Item.Reas
         .openai_api,
         .xai_subscription,
         .xai_api,
+        .openrouter_oauth,
+        .openrouter_api,
         .google_vertex,
         => unreachable,
     }

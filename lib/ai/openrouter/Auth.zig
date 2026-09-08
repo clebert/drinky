@@ -1,8 +1,8 @@
-//! The credential lifecycle for the Anthropic Console account: the shared
-//! `auth` login and store instantiated over `console`'s protocol for the
-//! `"anthropic_console"` entry in `<home>/.drinky/auth.json`. The login mints an
+//! The credential lifecycle for the OpenRouter OAuth account: the shared
+//! `auth` login and store instantiated over `oauth`'s protocol for the
+//! `"openrouter_oauth"` entry in `<home>/.drinky/auth.json`. The login mints an
 //! API key and stores it. The key needs no refresh, so there is no
-//! `accessToken`: `apiKey` returns the stored key for the `x-api-key` header.
+//! `accessToken`: `apiKey` returns the stored key for the `Bearer` header.
 
 const std = @import("std");
 
@@ -10,18 +10,18 @@ const auth = @import("../auth.zig");
 const net = @import("../net.zig");
 const oauth_callback = @import("../oauth_callback.zig");
 const oauth_wire = @import("../oauth_wire.zig");
-const console = @import("console.zig");
+const oauth = @import("oauth.zig");
 
-const ConsoleAuth = @This();
+const Auth = @This();
 
 /// The top-level key this account's credential lives under in `auth.json`.
-const account_key = "anthropic_console";
+const account_key = "openrouter_oauth";
 
 gpa: std.mem.Allocator,
 io: std.Io,
 timeouts: net.Timeouts,
 path: []const u8,
-tokens: ?console.Tokens,
+tokens: ?oauth.Tokens,
 /// Whether a committed credential still needs a store retry. The shared
 /// lifecycle keeps this field for every account, and a busy store sets it. A
 /// minted key never refreshes, so nothing reads it back here: the key of a
@@ -33,70 +33,50 @@ pub fn init(
     io: std.Io,
     home: []const u8,
     timeouts: net.Timeouts,
-) !ConsoleAuth {
+) !Auth {
     const path = try std.fs.path.join(gpa, &.{ home, ".drinky", "auth.json" });
     return .{ .gpa = gpa, .io = io, .timeouts = timeouts, .path = path, .tokens = null };
 }
 
-pub fn deinit(self: *ConsoleAuth) void {
+pub fn deinit(self: *Auth) void {
     if (self.tokens) |tokens| tokens.deinit(self.gpa);
     self.gpa.free(self.path);
 }
 
 /// Load the stored key. The call returns false when the file is absent or holds
-/// no Anthropic Console credential.
-pub fn load(self: *ConsoleAuth) !bool {
+/// no OpenRouter OAuth credential.
+pub fn load(self: *Auth) !bool {
     return auth.load(self, account_key);
 }
 
-/// The stored API key for the `x-api-key` header, or null when signed out.
-pub fn apiKey(self: *const ConsoleAuth) ?[]const u8 {
+/// The stored API key for the `Bearer` header, or null when signed out.
+pub fn apiKey(self: *const Auth) ?[]const u8 {
     const tokens = self.tokens orelse return null;
     return tokens.api_key;
 }
 
 /// Run the interactive OAuth login, mint the API key, and return the committed
 /// credential's persistence outcome for the caller to present.
-pub fn login(self: *ConsoleAuth, prompt: anytype) !auth.Login {
-    return auth.login(self, account_key, console, prompt, exchangeRedirect);
+pub fn login(self: *Auth, prompt: anytype) !auth.Login {
+    return auth.login(self, account_key, oauth, prompt, exchangeRedirect);
 }
 
-/// `console.exchange` over the received redirect. The verifier doubles as
-/// `state`. A mismatch means the redirect is not ours.
+/// `oauth.exchange` over the received redirect. The flow carries no `state`.
 fn exchangeRedirect(
-    self: *ConsoleAuth,
+    self: *Auth,
     redirect: *const oauth_callback.Redirect,
     pair: *const oauth_wire.Pkce,
-) !console.Tokens {
-    const state = redirect.state orelse return error.StateMismatch;
-    if (!std.mem.eql(u8, state, &pair.verifier)) return error.StateMismatch;
-    return console.exchange(self.gpa, self.io, self.timeouts, &.{
+) !oauth.Tokens {
+    return oauth.exchange(self.gpa, self.io, self.timeouts, &.{
         .code = redirect.code,
-        .state = state,
         .verifier = &pair.verifier,
     });
 }
 
 /// Drop this account's credential: clear the in-memory key and remove its entry
 /// from `auth.json`. The removal preserves every other account's entry.
-pub fn logout(self: *ConsoleAuth) !void {
+pub fn logout(self: *Auth) !void {
     return auth.logout(self, account_key);
-}
-
-test "the callback state must match the verifier" {
-    var pair: oauth_wire.Pkce = undefined;
-    @memset(&pair.verifier, 'v');
-    var subject: ConsoleAuth = .{
-        .gpa = undefined,
-        .io = undefined,
-        .timeouts = .{},
-        .path = "",
-        .tokens = null,
-    };
-    try std.testing.expectError(
-        error.StateMismatch,
-        subject.exchangeRedirect(&.{ .code = "code", .state = "wrong" }, &pair),
-    );
 }
 
 test "load reads the stored api key" {
@@ -105,11 +85,11 @@ test "load reads the stored api key" {
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "auth.json",
-        .data = "{\"anthropic_console\":{\"api_key\":\"sk-ant-api03-x\"}}",
+        .data = "{\"openrouter_oauth\":{\"api_key\":\"sk-or-v1-x\"}}",
     });
     var path_buf: [128]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/auth.json", .{tmp.sub_path});
-    var subject: ConsoleAuth = .{
+    var subject: Auth = .{
         .gpa = gpa,
         .io = std.testing.io,
         .timeouts = .{},
@@ -118,7 +98,7 @@ test "load reads the stored api key" {
     };
     defer if (subject.tokens) |tokens| tokens.deinit(gpa);
     try std.testing.expect(try subject.load());
-    try std.testing.expectEqualStrings("sk-ant-api03-x", subject.apiKey().?);
+    try std.testing.expectEqualStrings("sk-or-v1-x", subject.apiKey().?);
 }
 
 test "load rejects an entry missing the api key" {
@@ -127,11 +107,11 @@ test "load rejects an entry missing the api key" {
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "auth.json",
-        .data = "{\"anthropic_console\":{}}",
+        .data = "{\"openrouter_oauth\":{}}",
     });
     var path_buf: [128]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/auth.json", .{tmp.sub_path});
-    var subject: ConsoleAuth = .{
+    var subject: Auth = .{
         .gpa = gpa,
         .io = std.testing.io,
         .timeouts = .{},

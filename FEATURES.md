@@ -7,7 +7,8 @@ planned work.
 Drinky is a terminal coding agent. You type a prompt. The model reads, searches, writes, and edits
 files in the working directory, and the conversation streams into your scrollback. Drinky talks to
 Anthropic, OpenAI, and xAI through a subscription login, an Anthropic Console login, or an API key,
-and to Gemini on Google Vertex AI through a service account key file.
+to OpenRouter through an OAuth login or an API key, and to Gemini on Google Vertex AI through a
+service account key file.
 
 ## Talking to it
 
@@ -73,21 +74,23 @@ and to Gemini on Google Vertex AI through a service account key file.
 ## Models & reasoning effort
 
 - Drinky compiles no model in. Every model, limit, effort level, and price comes from the provider
-  and from OpenRouter. The user fetches that list from `/model`.
+  and from the public metadata. The user fetches that list from `/model`.
 - No request runs at startup. A fetch runs on request, and Drinky caches the result in `models.json`
-  per account and in `metadata.json` per vendor.
+  per account and in `metadata.json` per vendor. The OpenRouter list is public, so it lives in
+  `metadata.json`.
 - A fetch runs beside the interface. The picker clears its rows, states the wait, and moves its
   separators. Esc cancels the fetch and returns the rows. A fetch with something to report records a
   transcript event.
 - One window of `request.connect_timeout_ms` bounds a whole fetch: the token refresh, every page of
   the list, and the metadata request.
-- The provider wins every field that it states. Only OpenRouter prices a model.
+- The provider wins every field that it states. Only the public metadata prices a model.
 - A model that no source describes never reaches the picker. A Codex model that the backend hides
-  stays hidden.
+  stays hidden. A model that the public metadata names without tools never reaches the picker. The
+  OpenRouter list holds a model only when that metadata states its tools.
 - An OpenAI API key and both xAI accounts state no model fact, so such an account offers no model
-  until OpenRouter describes one. The xAI list names a model under its id and its aliases, and the
-  picker shows each spelling that OpenRouter describes. A reply under the id behind an alias counts
-  as a reply of that alias.
+  until the public metadata describes one. The xAI list names a model under its id and its aliases,
+  and the picker shows each spelling that the public metadata describes. A reply under the id behind
+  an alias counts as a reply of that alias.
 - An Anthropic request must name an output cap. A model that states no limit runs at a low default,
   and the model picker marks it, because that default can cut a reply short.
 - The effort levels are `low`, `medium`, `high`, `xhigh`, and `max`. Every level is a wire spelling
@@ -107,13 +110,17 @@ and to Gemini on Google Vertex AI through a service account key file.
 - A restart resumes on the account, model, and effort level that this project used last.
 - `/model` refuses while signed out, because the status line hides the model then. `/effort` works
   while signed out, and the next sign-in adopts the level.
-- The session cost accumulates at public rates and counts the billed usage of a canceled turn. Every
-  cost figure reads `~$0.42`, and the tilde marks the estimate.
+- The session cost counts every attempt, a canceled or rejected one included. A reply that reports
+  its charge, as OpenRouter does, adds that charge, and every other reply adds its usage at public
+  rates. Every cost figure reads `~$0.42`, and the tilde marks the estimate. A positive total under
+  one cent reads `~<$0.01`.
 
 ## Accounts
 
 - Drinky supports Anthropic, OpenAI, and xAI, each as a subscription account or an API-key account.
-  The Anthropic Console account adds an OAuth login that mints and stores a platform key.
+  The Anthropic Console account adds an OAuth login that mints and stores a platform key. OpenRouter
+  adds an OAuth login that mints a key and an API-key account. Both spend the credit of one
+  OpenRouter account.
 - The Google Vertex account reads the service account key file that `GOOGLE_APPLICATION_CREDENTIALS`
   names and sends its requests to the location that `GOOGLE_CLOUD_LOCATION` names: `eu`, `us`, or
   `global`. A multi-region keeps the processing inside its jurisdiction. Drinky mints the access
@@ -134,7 +141,8 @@ and to Gemini on Google Vertex AI through a service account key file.
 
 - An Anthropic or OpenAI login uses PKCE (S256) with a loopback callback and opens the system
   browser. The Anthropic Console login trades its grant for a minted platform key that Drinky stores
-  like a token.
+  like a token. The OpenRouter login uses PKCE with no client registration and mints a permanent
+  key.
 - When no browser opens, the printed URL still works, and the callback waits five minutes. When the
   browser cannot reach the callback, a paste of the URL from its address bar completes the login.
 - The browser lands on a plain page: "Drinky received authorization. Close this tab."
@@ -168,8 +176,9 @@ and to Gemini on Google Vertex AI through a service account key file.
   Enter runs the command at once, and a bare `/` opens the same list. Esc returns to the list from
   any picker that a row opened.
 - **/model** — switch the account and the model together, from the next turn on. The picker steps
-  through the provider, the account, and the model, and skips a step with one row. The model step
-  starts with a row that fetches the list of that account.
+  through the provider, the account, the author, and the model, and skips a step with one row. An
+  OpenRouter account opens the author step. The model step starts with a row that fetches the list
+  of that account, except the OpenRouter author step holds that row.
 - **/effort** — set the reasoning-effort level, from the next turn on. The picker lists every level
   and marks a level that the active model folds or drops.
 - **/login** — sign in, switch to a signed-in account, or name the environment variables to set.
@@ -208,22 +217,23 @@ and to Gemini on Google Vertex AI through a service account key file.
 
 ## Providers
 
-- Drinky streams from the Anthropic Messages API, the OpenAI Responses API (for OpenAI and xAI), and
-  the Gemini `streamGenerateContent` API of Vertex AI over SSE. A reply enters the conversation only
-  when the provider reports it complete.
+- Drinky streams from the Anthropic Messages API, the OpenAI Responses API (for OpenAI, xAI, and
+  OpenRouter), and the Gemini `streamGenerateContent` API of Vertex AI over SSE. A reply enters the
+  conversation only when the provider reports it complete.
 - A Gemini reply carries a thought signature on one part, and Drinky sends it back on the same part,
   so a function call replays with its proof. The Gemini model list comes from the Google publisher
-  on Vertex AI, keeps Gemini 3 and later, and OpenRouter describes each model.
+  on Vertex AI, keeps Gemini 3 and later, and the public metadata describes each model.
 - Prompt caching is always on: explicit breakpoints for Anthropic, the automatic per-session cache
-  for OpenAI and xAI, and the implicit cache of Vertex AI.
+  for OpenAI, xAI, and OpenRouter, and the implicit cache of Vertex AI.
 - Drinky requests summarized reasoning at the resolved effort and replays it verbatim on later
-  turns.
+  turns. An OpenRouter request asks for no encrypted reasoning, because that request reaches fewer
+  endpoints, so its reply replays the summary or the raw reasoning text instead.
 - An Anthropic Subscription or Console request carries the Claude Code client identity. A plain API
   key goes straight to the platform API.
 - Every Anthropic request asks for the input of a tool call as the model writes it.
 - A request times out after 30 s to the response head. A streamed event must arrive within 60 s for
-  Anthropic and 300 s for OpenAI, xAI, and Google Vertex, whose streams are silent while the model
-  reasons. Keepalive filler does not count as progress. All five windows are configurable.
+  Anthropic and 300 s for OpenAI, xAI, OpenRouter, and Google Vertex, whose streams are silent while
+  the model reasons. Keepalive filler does not count as progress. All six windows are configurable.
 - A failed request runs up to 3 attempts with a backoff from 500 ms to 16 s, and it honors a
   retry-after hint. A wait longer than the backoff cap ends the request. A spent OpenAI plan states
   its reset in the error body, so Drinky reports it after one try.
@@ -276,8 +286,8 @@ and to Gemini on Google Vertex AI through a service account key file.
 - Answer text grows as one block. Reasoning grows in a separate muted and italic block. Both render
   their markdown: headings, lists, blockquotes, code blocks, rules, tables, and nested inline
   emphasis. A heading, a quote, and an emphasis span shed their markers. A quote has no border
-  glyph, so a terminal copy holds the text alone. Both blocks drop the blank rows that they end on.
-  A run of whitespace alone opens no block.
+  glyph, so a terminal copy holds the text alone. Both blocks drop the blank rows that they start on
+  and end on. A run of whitespace alone opens no block.
 - A link becomes a clickable terminal hyperlink when a click can open its target, and a bare URL
   links to itself. Any other target, such as a relative path, shows its URL as text.
 - A pipe table draws as a box grid that fits the window and keeps the indentation of its source. The

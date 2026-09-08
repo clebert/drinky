@@ -563,8 +563,10 @@ fn writeContext(line: *Line, info: *const Info, form: Parts.Context) !void {
 /// The session cost behind its separator. The cost is an estimate at public
 /// rates, so the tilde marks it: the login type does not reveal the billing, a
 /// subscription pays none of it, and a reply that Drinky could not price counts
-/// nothing. Every cost figure of Drinky takes this one mark.
+/// nothing. Every cost figure of Drinky takes this one mark. A positive total
+/// under one cent reads `<$0.01`, so a cheap session never reads as free.
 fn writeCost(line: *Line, info: *const Info) !void {
+    if (info.cost > 0 and info.cost < 0.01) return line.out.print("{s}Cost: ~<$0.01", .{separator});
     try line.out.print("{s}Cost: ~${d:.2}", .{ separator, info.cost });
 }
 
@@ -762,6 +764,25 @@ test "the numbers state the gauge in its short form and the cost" {
     out = .fixed(&buffer);
     try writeNumbers(&out, &unknown);
     try std.testing.expectEqualStrings("Context: Unknown · Cost: ~$0.00", out.buffered());
+}
+
+test "a positive sub-cent cost never displays as zero" {
+    const cases = [_]struct { cost: f64, expected: []const u8 }{
+        .{ .cost = 0.000123, .expected = " · Cost: ~<$0.01" },
+        .{ .cost = 0.00999, .expected = " · Cost: ~<$0.01" },
+        .{ .cost = 1e-12, .expected = " · Cost: ~<$0.01" },
+        .{ .cost = 0, .expected = " · Cost: ~$0.00" },
+        .{ .cost = 0.01, .expected = " · Cost: ~$0.01" },
+        .{ .cost = 0.42, .expected = " · Cost: ~$0.42" },
+    };
+    for (cases) |case| {
+        var info = test_info;
+        info.cost = case.cost;
+        var buffer: [64]u8 = undefined;
+        var line: Line = .init(&buffer);
+        try writeCost(&line, &info);
+        try std.testing.expectEqualStrings(case.expected, line.text());
+    }
 }
 
 fn renderForTest(

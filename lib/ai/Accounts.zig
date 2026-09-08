@@ -16,10 +16,12 @@ const Catalog = @import("Catalog.zig");
 const google = @import("google/root.zig");
 const json_store = @import("json_store.zig");
 const llm = @import("llm.zig");
+const Metadata = @import("Metadata.zig");
 const Model = @import("Model.zig");
 const net = @import("net.zig");
+const oauth_callback = @import("oauth_callback.zig");
 const openai = @import("openai/root.zig");
-const OpenRouter = @import("OpenRouter.zig");
+const openrouter = @import("openrouter/root.zig");
 const provider = @import("provider.zig");
 const testing = @import("testing.zig");
 const xai = @import("xai/root.zig");
@@ -35,6 +37,7 @@ anthropic_auth: anthropic.Auth,
 anthropic_console_auth: anthropic.ConsoleAuth,
 openai_auth: openai.Auth,
 xai_auth: xai.Auth,
+openrouter_auth: openrouter.Auth,
 /// The Vertex credential, or null when the environment names no readable key
 /// file beside a location Drinky serves.
 google_auth: ?google.Auth,
@@ -50,6 +53,8 @@ openai_subscription_ready: bool,
 xai_subscription_ready: bool,
 /// Whether the Console store loaded a minted key from `auth.json`.
 anthropic_console_ready: bool,
+/// Whether the OpenRouter OAuth store loaded a minted key from `auth.json`.
+openrouter_oauth_ready: bool,
 /// Every model Drinky knows, loaded from its caches. A fetch replaces the list
 /// of one account, and the user asks for that fetch.
 catalog: Catalog,
@@ -80,6 +85,7 @@ pub const Environment = struct {
     anthropic: ?[]const u8 = null,
     openai: ?[]const u8 = null,
     xai: ?[]const u8 = null,
+    openrouter: ?[]const u8 = null,
     /// `GOOGLE_APPLICATION_CREDENTIALS`, the path of the service account key file.
     google_key_path: ?[]const u8 = null,
     /// `GOOGLE_CLOUD_LOCATION`: `eu`, `us`, or `global`.
@@ -94,6 +100,13 @@ pub const Login = union(enum) {
         path: []const u8,
         save_error: anyerror,
     },
+};
+
+/// The OAuth redirect listener of one login: the loopback port it answers on,
+/// and what binds a redirect to it.
+pub const Callback = struct {
+    port: u16,
+    binding: oauth_callback.Binding,
 };
 
 /// Open the OAuth login stores, load any stored credential, take the
@@ -116,11 +129,14 @@ pub fn init(
     errdefer openai_auth.deinit();
     var xai_auth = try xai.Auth.init(gpa, io, home, timeouts.xai);
     errdefer xai_auth.deinit();
+    var openrouter_auth = try openrouter.Auth.init(gpa, io, home, timeouts.openrouter);
+    errdefer openrouter_auth.deinit();
 
     const anthropic_ready = try anthropic_auth.load();
     const anthropic_console_ready = try anthropic_console_auth.load();
     const openai_ready = try openai_auth.load();
     const xai_ready = try xai_auth.load();
+    const openrouter_ready = try openrouter_auth.load();
 
     var google_auth: ?google.Auth = null;
     var google_error: ?anyerror = null;
@@ -147,6 +163,7 @@ pub fn init(
         .anthropic_console_auth = anthropic_console_auth,
         .openai_auth = openai_auth,
         .xai_auth = xai_auth,
+        .openrouter_auth = openrouter_auth,
         .google_auth = google_auth,
         .google_error = google_error,
         .environment = environment,
@@ -154,6 +171,7 @@ pub fn init(
         .openai_subscription_ready = openai_ready,
         .xai_subscription_ready = xai_ready,
         .anthropic_console_ready = anthropic_console_ready,
+        .openrouter_oauth_ready = openrouter_ready,
         .catalog = catalog,
     };
 }
@@ -164,6 +182,7 @@ pub fn deinit(self: *Accounts) void {
     self.anthropic_console_auth.deinit();
     self.openai_auth.deinit();
     self.xai_auth.deinit();
+    self.openrouter_auth.deinit();
     if (self.google_auth) |*vertex| vertex.deinit();
 }
 
@@ -179,6 +198,8 @@ pub fn isAuthenticated(self: *const Accounts, account: llm.Account) bool {
         .xai_api => self.environment.xai != null,
         .xai_subscription => self.xai_subscription_ready,
         .anthropic_console => self.anthropic_console_ready,
+        .openrouter_api => self.environment.openrouter != null,
+        .openrouter_oauth => self.openrouter_oauth_ready,
         .google_vertex => self.google_auth != null,
     };
 }
@@ -229,6 +250,11 @@ pub fn client(self: *Accounts, account: llm.Account) ?provider.Client {
             .{ .anthropic_console = self.anthropic_console_auth.apiKey() orelse return null }
         else
             return null,
+        .openrouter_api => .{ .openrouter_api = self.environment.openrouter orelse return null },
+        .openrouter_oauth => if (self.openrouter_oauth_ready)
+            .{ .openrouter_oauth = self.openrouter_auth.apiKey() orelse return null }
+        else
+            return null,
         .google_vertex => if (self.google_auth) |*vertex|
             .{ .google_vertex = vertex }
         else
@@ -269,7 +295,7 @@ pub fn listModels(
 /// here and no idle bound applies.
 pub fn refresh(self: *Accounts, account: llm.Account) Refresh {
     const deadline = net.Deadline.start(self.io, self.timeoutsOf(account).connect_ms);
-    return self.refreshWithin(account, deadline, fetchModels, OpenRouter.fetch);
+    return self.refreshWithin(account, deadline, fetchModels, Metadata.fetch);
 }
 
 /// `refresh` inside a window that the caller opened, over the list request
@@ -284,24 +310,34 @@ fn refreshWithin(
 ) Refresh {
     var result: Refresh = .{};
 
-    if (listFn(self, account, deadline)) |discovered| {
-        defer self.gpa.free(discovered);
-        recordSave(&result.models_save_error, self.catalog.setAccount(account, discovered));
-    } else |err| {
-        result.models_error = err;
-    }
-    // A cancel is one-shot: the blocking call that took it acknowledged it, and
-    // every later blocking call runs to its end. The metadata request would then
-    // hold the join for the rest of the window, so the fetch ends here. The
-    // caller discards the result of a canceled fetch.
-    if (isCanceled(result.models_error) or isCanceled(result.models_save_error)) return result;
+    if (account.provider() == .openrouter) {
+        if (metadataFn(self.gpa, self.io, deadline)) |fetched| {
+            var metadata = fetched;
+            defer metadata.deinit();
+            recordSave(&result.metadata_save_error, self.catalog.setMetadata(metadata.entries));
+        } else |err| {
+            result.models_error = err;
+        }
+    } else {
+        if (listFn(self, account, deadline)) |discovered| {
+            defer self.gpa.free(discovered);
+            recordSave(&result.models_save_error, self.catalog.setAccount(account, discovered));
+        } else |err| {
+            result.models_error = err;
+        }
+        // A cancel is one-shot: the blocking call that took it acknowledged it, and
+        // every later blocking call runs to its end. The metadata request would then
+        // hold the join for the rest of the window, so the fetch ends here. The
+        // caller discards the result of a canceled fetch.
+        if (isCanceled(result.models_error) or isCanceled(result.models_save_error)) return result;
 
-    if (metadataFn(self.gpa, self.io, deadline)) |fetched| {
-        var metadata = fetched;
-        defer metadata.deinit();
-        recordSave(&result.metadata_save_error, self.catalog.setMetadata(metadata.entries));
-    } else |err| {
-        result.metadata_error = err;
+        if (metadataFn(self.gpa, self.io, deadline)) |fetched| {
+            var metadata = fetched;
+            defer metadata.deinit();
+            recordSave(&result.metadata_save_error, self.catalog.setMetadata(metadata.entries));
+        } else |err| {
+            result.metadata_error = err;
+        }
     }
 
     var listed: std.ArrayList(Model) = .empty;
@@ -387,6 +423,7 @@ fn fetchModels(self: *Accounts, account: llm.Account, deadline: net.Deadline) ![
                 .location = vertex.location,
             },
         ) else error.SignedOut,
+        .openrouter_oauth, .openrouter_api => error.OpenRouterHasNoList,
     };
 }
 
@@ -396,21 +433,34 @@ fn timeoutsOf(self: *const Accounts, account: llm.Account) net.Timeouts {
         .anthropic => self.timeouts.anthropic,
         .openai => self.timeouts.openai,
         .xai => self.timeouts.xai,
+        .openrouter => self.timeouts.openrouter,
         .google => self.timeouts.google,
     };
 }
 
-/// The loopback port of the OAuth redirect listener for `account`, or null
-/// for an account without a callback login. A pasted callback URL replays to
-/// this port. The xAI subscription signs in with a device code, so its login
-/// listens on no port.
-pub fn callbackPort(account: llm.Account) ?u16 {
+/// The OAuth redirect listener for `account`, or null for an account without a
+/// callback login. A pasted callback URL replays to this port, and the paste
+/// filter demands this binding. The xAI subscription signs in with a device
+/// code, so its login listens on no port.
+pub fn callback(account: llm.Account) ?Callback {
     return switch (account) {
-        .anthropic_subscription => anthropic.oauth.callback_port,
-        .anthropic_console => anthropic.console.callback_port,
-        .openai_subscription => openai.oauth.callback_port,
-        .xai_subscription, .anthropic_api, .openai_api, .xai_api, .google_vertex => null,
+        .anthropic_subscription => callbackOf(anthropic.oauth),
+        .anthropic_console => callbackOf(anthropic.console),
+        .openai_subscription => callbackOf(openai.oauth),
+        .openrouter_oauth => callbackOf(openrouter.oauth),
+        .xai_subscription,
+        .anthropic_api,
+        .openai_api,
+        .xai_api,
+        .openrouter_api,
+        .google_vertex,
+        => null,
     };
+}
+
+/// The listener of one OAuth protocol module, which states both parts of it.
+fn callbackOf(comptime oauth: type) Callback {
+    return .{ .port = oauth.callback_port, .binding = oauth_callback.bindingOf(oauth) };
 }
 
 /// Run the interactive OAuth login for `account`, mark its committed
@@ -439,7 +489,17 @@ pub fn login(self: *Accounts, account: llm.Account, prompt: anytype) !Login {
             self.xai_subscription_ready = true;
             break :committed committed_login;
         },
-        .anthropic_api, .openai_api, .xai_api, .google_vertex => return error.ApiAccountHasNoLogin,
+        .openrouter_oauth => committed: {
+            const committed_login = try self.openrouter_auth.login(prompt);
+            self.openrouter_oauth_ready = true;
+            break :committed committed_login;
+        },
+        .anthropic_api,
+        .openai_api,
+        .xai_api,
+        .openrouter_api,
+        .google_vertex,
+        => return error.ApiAccountHasNoLogin,
     };
     return switch (provider_login) {
         .saved => |path| .{ .saved = path },
@@ -475,7 +535,17 @@ pub fn logout(self: *Accounts, account: llm.Account) !void {
             self.xai_subscription_ready = false;
             self.catalog.dropAccount(account);
         },
-        .anthropic_api, .openai_api, .xai_api, .google_vertex => return error.ApiAccountHasNoLogout,
+        .openrouter_oauth => {
+            try self.openrouter_auth.logout();
+            self.openrouter_oauth_ready = false;
+            self.catalog.dropAccount(account);
+        },
+        .anthropic_api,
+        .openai_api,
+        .xai_api,
+        .openrouter_api,
+        .google_vertex,
+        => return error.ApiAccountHasNoLogout,
     }
 }
 
@@ -514,7 +584,14 @@ pub fn invalidate(self: *Accounts, account: llm.Account) !bool {
             self.xai_subscription_ready = recovered;
             return recovered;
         },
-        .anthropic_console, .anthropic_api, .openai_api, .xai_api, .google_vertex => {
+        .anthropic_console,
+        .anthropic_api,
+        .openai_api,
+        .xai_api,
+        .openrouter_oauth,
+        .openrouter_api,
+        .google_vertex,
+        => {
             return error.AccountHasNoRefreshCredential;
         },
     }
@@ -536,6 +613,7 @@ fn testAccounts(environment: Environment, anthropic_ready: bool, openai_ready: b
         .anthropic_console_auth = undefined,
         .openai_auth = undefined,
         .xai_auth = undefined,
+        .openrouter_auth = undefined,
         .google_auth = null,
         .google_error = null,
         .environment = environment,
@@ -543,6 +621,7 @@ fn testAccounts(environment: Environment, anthropic_ready: bool, openai_ready: b
         .openai_subscription_ready = openai_ready,
         .xai_subscription_ready = false,
         .anthropic_console_ready = false,
+        .openrouter_oauth_ready = false,
         .catalog = testCatalog(),
     };
 }
@@ -597,21 +676,40 @@ test "isAuthenticated and firstAuthenticated read keys and readiness, subscripti
     try std.testing.expect(none.firstAuthenticated() == null);
 }
 
-test "an account has a callback port exactly when it has a callback login" {
+test "an account has a callback listener exactly when it has a callback login" {
     for (std.enums.values(llm.Account)) |account| {
         const callback_login = account.hasLogin() and account != .xai_subscription;
-        try std.testing.expectEqual(callback_login, callbackPort(account) != null);
+        try std.testing.expectEqual(callback_login, callback(account) != null);
     }
-    // The pinned ports keep the three listeners apart and match each provider
-    // OAuth registration.
-    try std.testing.expectEqual(@as(?u16, 53692), callbackPort(.anthropic_subscription));
-    try std.testing.expectEqual(@as(?u16, 53693), callbackPort(.anthropic_console));
-    try std.testing.expectEqual(@as(?u16, 1455), callbackPort(.openai_subscription));
+    // The pinned ports keep the four listeners apart and match each provider
+    // OAuth registration. A grant of the OpenRouter login carries no state, so
+    // its random callback path binds the redirect instead.
+    try std.testing.expectEqual(@as(u16, 53692), callback(.anthropic_subscription).?.port);
+    try std.testing.expectEqual(@as(u16, 53693), callback(.anthropic_console).?.port);
+    try std.testing.expectEqual(@as(u16, 1455), callback(.openai_subscription).?.port);
+    try std.testing.expectEqual(@as(u16, 53694), callback(.openrouter_oauth).?.port);
+    for ([_]llm.Account{
+        .anthropic_subscription,
+        .anthropic_console,
+        .openai_subscription,
+    }) |account| {
+        try std.testing.expectEqual(oauth_callback.Binding.state, callback(account).?.binding);
+    }
+    try std.testing.expectEqual(
+        oauth_callback.Binding.path,
+        callback(.openrouter_oauth).?.binding,
+    );
 }
 
 test "logout rejects the accounts whose credential is env-sourced" {
     var accounts = testAccounts(.{ .anthropic = "sk-ant" }, false, false);
-    for ([_]llm.Account{ .anthropic_api, .openai_api, .xai_api, .google_vertex }) |account| {
+    for ([_]llm.Account{
+        .anthropic_api,
+        .openai_api,
+        .xai_api,
+        .openrouter_api,
+        .google_vertex,
+    }) |account| {
         try std.testing.expectError(error.ApiAccountHasNoLogout, accounts.logout(account));
     }
 }
@@ -623,6 +721,8 @@ test "invalidation rejects accounts without a refresh credential" {
         .anthropic_api,
         .openai_api,
         .xai_api,
+        .openrouter_oauth,
+        .openrouter_api,
         .google_vertex,
     }) |account| {
         try std.testing.expectError(
@@ -967,7 +1067,7 @@ test "an expired window ends both parts of a fetch without a request" {
 
     const expired: net.Deadline = .{ .at = std.Io.Clock.awake.now(io) };
     for ([_]llm.Account{ .anthropic_api, .openai_api }) |account| {
-        const result = accounts.refreshWithin(account, expired, fetchModels, OpenRouter.fetch);
+        const result = accounts.refreshWithin(account, expired, fetchModels, Metadata.fetch);
         try std.testing.expectEqual(@as(?anyerror, error.Timeout), result.models_error);
         try std.testing.expectEqual(@as(?anyerror, error.Timeout), result.metadata_error);
         try std.testing.expectEqual(@as(usize, 0), result.count);
@@ -983,7 +1083,7 @@ fn refuseList(_: *Accounts, _: llm.Account, _: net.Deadline) anyerror![]Model {
     return error.ConnectionRefused;
 }
 
-fn refuseMetadata(_: std.mem.Allocator, _: std.Io, _: net.Deadline) anyerror!OpenRouter {
+fn refuseMetadata(_: std.mem.Allocator, _: std.Io, _: net.Deadline) anyerror!Metadata {
     return error.MetadataRequestFailed;
 }
 
@@ -1007,6 +1107,39 @@ test "a canceled list ends the fetch before the metadata request" {
         @as(?anyerror, error.MetadataRequestFailed),
         refused.metadata_error,
     );
+}
+
+test "an OpenRouter fetch runs no list request and reports a failed body as the list" {
+    const gpa = std.testing.allocator;
+    var accounts = testAccounts(.{ .openrouter = "sk-or" }, false, false);
+    defer gpa.free(accounts.catalog.metadata);
+    const unbounded: net.Deadline = .{ .at = null };
+
+    const failed = accounts.refreshWithin(
+        .openrouter_api,
+        unbounded,
+        refuseList,
+        refuseMetadata,
+    );
+    try std.testing.expectEqual(@as(?anyerror, error.MetadataRequestFailed), failed.models_error);
+    try std.testing.expect(failed.metadata_error == null);
+
+    const arrived = accounts.refreshWithin(
+        .openrouter_oauth,
+        unbounded,
+        refuseList,
+        openrouterMetadata,
+    );
+    try std.testing.expect(arrived.models_error == null);
+    try std.testing.expectEqual(@as(usize, 1), arrived.count);
+}
+
+fn openrouterMetadata(gpa: std.mem.Allocator, _: std.Io, _: net.Deadline) anyerror!Metadata {
+    var model = try Model.init("openai/gpt-5.6-sol");
+    model.tools = .supported;
+    model.context_window = 1_050_000;
+    const entries = try gpa.dupe(Metadata.Entry, &.{.{ .provider = .openrouter, .model = model }});
+    return .{ .gpa = gpa, .entries = entries };
 }
 
 test "an account lists the models of its own catalog entry" {

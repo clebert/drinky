@@ -1,22 +1,23 @@
 //! `/model`: a stepped picker that ends on one model. The steps are the
-//! provider, the account, and the model. A step that offers one row alone opens
-//! the next step at once, so the user answers an open question only. A selection
-//! always chooses a model together with its account. The command takes no
-//! argument.
+//! provider, the account, the author, and the model. An OpenRouter account
+//! opens the author step. A step that offers one row alone opens the next step
+//! at once, so the user answers an open question only. A selection always
+//! chooses a model together with its account. The command takes no argument.
 //!
 //! Every step names the opener that builds it again, so Esc in a later step
 //! returns to it. The app keeps the trail, and a step that the flow skipped
 //! opened no picker, so Esc never lands on a list that the user never saw.
 //!
-//! A selector receives the row index alone, so it carries no earlier choice. The
-//! compiler therefore builds one selector and one opener per provider, and one
-//! of each per account. Every step re-derives its lists from the live state.
+//! A selector receives the tapped row and the payload the command set. A step
+//! that depends on an earlier choice needs one selector for each value of that
+//! choice. Every step re-derives its lists from the live state.
 
 const std = @import("std");
 
 const Accounts = @import("../Accounts.zig");
 const format = @import("../format.zig");
 const llm = @import("../llm.zig");
+const Metadata = @import("../Metadata.zig");
 const Model = @import("../Model.zig");
 const Context = @import("Context.zig");
 const testing = @import("testing.zig");
@@ -24,7 +25,7 @@ const testing = @import("testing.zig");
 pub const name = "model";
 pub const summary = "switch account and model together";
 
-/// Every step belongs to one `/model` run, so all three report one cancellation.
+/// Every step belongs to one `/model` run, so every step reports one cancellation.
 const cancellation_message = "You canceled the model selection.";
 
 /// The first row of the model step. It reads as a fetch while the account
@@ -39,9 +40,8 @@ const refresh_row = "Refresh the model list";
 /// does not know the output support of the model.
 const output_limit_mark = " · Output limit unknown";
 
-/// A picker selector. It takes the row index alone, so a step that depends on an
-/// earlier choice needs one selector for each value of that choice.
-const Selector = *const fn (*Context, usize) anyerror!Context.Outcome;
+/// A picker selector. It takes the tapped row and the payload the command set.
+const Selector = *const fn (*Context, Context.Outcome.Pick.Selection) anyerror!Context.Outcome;
 
 /// The parts of the model picker that name one account.
 const ModelStep = struct {
@@ -83,7 +83,11 @@ pub fn run(context: *Context) !Context.Outcome {
     } };
 }
 
-fn selectProvider(context: *Context, index: usize) anyerror!Context.Outcome {
+fn selectProvider(
+    context: *Context,
+    selection: Context.Outcome.Pick.Selection,
+) anyerror!Context.Outcome {
+    const index = selection.row;
     var buffer: [std.enums.values(llm.Provider).len]llm.Provider = undefined;
     const vendors = authenticatedProviders(context.accounts, &buffer);
     if (index >= vendors.len) return Context.Outcome.reportNotice(
@@ -102,7 +106,7 @@ fn accountStep(context: *Context, vendor: llm.Provider) !Context.Outcome {
     var buffer: [std.enums.values(llm.Account).len]llm.Account = undefined;
     const list = authenticatedAccounts(context.accounts, vendor, &buffer);
     std.debug.assert(list.len > 0);
-    if (list.len == 1) return modelStep(context, list[0]);
+    if (list.len == 1) return nextStep(context, list[0]);
 
     var options: Context.Outcome.Options = .{ .gpa = context.gpa };
     errdefer options.deinit();
@@ -140,7 +144,11 @@ fn accountStepOf(comptime vendor: llm.Provider) Context.Outcome.Opener {
 /// The selector of the account picker of `vendor`.
 fn selectAccountOf(comptime vendor: llm.Provider) Selector {
     return struct {
-        fn select(context: *Context, index: usize) anyerror!Context.Outcome {
+        fn select(
+            context: *Context,
+            selection: Context.Outcome.Pick.Selection,
+        ) anyerror!Context.Outcome {
+            const index = selection.row;
             var buffer: [std.enums.values(llm.Account).len]llm.Account = undefined;
             const list = authenticatedAccounts(context.accounts, vendor, &buffer);
             if (index >= list.len) return Context.Outcome.reportNotice(
@@ -149,9 +157,233 @@ fn selectAccountOf(comptime vendor: llm.Provider) Selector {
                 "Select a valid account.",
                 .{},
             );
-            return modelStep(context, list[index]);
+            return nextStep(context, list[index]);
         }
     }.select;
+}
+
+/// The step that follows the account: the author step of an OpenRouter account,
+/// or the model step of every other account.
+fn nextStep(context: *Context, account: llm.Account) !Context.Outcome {
+    if (account.provider() == .openrouter) return authorStep(context, account);
+    return modelStep(context, account);
+}
+
+const AuthorRow = struct {
+    name: []const u8,
+    count: usize,
+    first: usize,
+};
+
+/// The author step of an OpenRouter account: the fetch row, then one row per
+/// author. An author row opens the models of that author.
+fn authorStep(context: *Context, account: llm.Account) !Context.Outcome {
+    const gpa = context.gpa;
+    var list: std.ArrayList(Model) = .empty;
+    defer list.deinit(gpa);
+    try context.accounts.listModels(account, &list, gpa);
+    if (context.remote and list.items.len == 0) return Context.Outcome.reportNotice(
+        gpa,
+        .warning,
+        "Fetch the model list of {s} with /model in the terminal first.",
+        .{account.label()},
+    );
+
+    const authors = try gpa.alloc(AuthorRow, @max(list.items.len, 1));
+    defer gpa.free(authors);
+    const grouped = authorsOf(list.items, authors);
+
+    var options: Context.Outcome.Options = .{ .gpa = gpa };
+    errdefer options.deinit();
+    var current: ?usize = null;
+    const lead = leadRows(context);
+    if (lead > 0) try options.print("{s}", .{firstRow(list.items.len)});
+    for (grouped, 0..) |author, index| {
+        try options.print("{s} · {d} model{s}", .{
+            author.name,
+            author.count,
+            format.pluralSuffix(author.count),
+        });
+        if (isActiveAuthor(context, account, list.items, author)) current = index + lead;
+    }
+    const step: ModelStep = switch (account) {
+        inline else => |tag| authorStepOf(tag),
+    };
+    return .{ .pick = .{
+        .select = step.select,
+        .title = step.title,
+        .cancellation_message = cancellation_message,
+        .options = try options.toOwnedSlice(),
+        .current = current,
+        .reopen = step.open,
+    } };
+}
+
+/// The payload of the model step of one author. A key names the author, so a
+/// row of that step lands on a model of that author after a fetch reordered the
+/// list. An index cannot, because a stale index that meets the first model of
+/// another author reads valid.
+fn authorKey(author_name: []const u8) usize {
+    return @truncate(std.hash.Wyhash.hash(0, author_name));
+}
+
+/// The index of the tapped model in the list that `grouped` describes, or null
+/// when the row names no model of the author the selection carries.
+///
+/// Two rows of `grouped` that share one key name one author, so the list is
+/// grouped wrong or two names collide under `authorKey`. The step then knows no
+/// author and reports, rather than land the row on the models of the wrong one.
+fn authorModelIndex(
+    grouped: []const AuthorRow,
+    selection: Context.Outcome.Pick.Selection,
+) ?usize {
+    var found: ?AuthorRow = null;
+    for (grouped) |author| {
+        if (authorKey(author.name) != selection.payload) continue;
+        if (found != null) return null;
+        found = author;
+    }
+    const author = found orelse return null;
+    if (selection.row >= author.count) return null;
+    return author.first + selection.row;
+}
+
+/// The authors of `models`, one row per run of one author. `Metadata` groups
+/// the models of one author, so one run is one author. A list that broke that
+/// order yields two rows of one author, and `authorModelIndex` refuses such a
+/// pair rather than guess.
+fn authorsOf(models: []const Model, out: []AuthorRow) []AuthorRow {
+    var count: usize = 0;
+    var index: usize = 0;
+    while (index < models.len) {
+        const author_name = Metadata.authorOf(models[index].name());
+        var length: usize = 1;
+        while (index + length < models.len and
+            std.mem.eql(u8, Metadata.authorOf(models[index + length].name()), author_name))
+            length += 1;
+        out[count] = .{ .name = author_name, .count = length, .first = index };
+        count += 1;
+        index += length;
+    }
+    return out[0..count];
+}
+
+fn isActiveAuthor(
+    context: *const Context,
+    account: llm.Account,
+    models: []const Model,
+    author: AuthorRow,
+) bool {
+    const active_account = activeAccount(context) orelse return false;
+    const model = context.agent.model orelse return false;
+    if (active_account != account) return false;
+    const end = author.first + author.count;
+    for (models[author.first..end]) |*item| {
+        if (item.sameName(model.name())) return true;
+    }
+    return false;
+}
+
+fn authorStepOf(comptime account: llm.Account) ModelStep {
+    return .{
+        .select = struct {
+            fn select(
+                context: *Context,
+                selection: Context.Outcome.Pick.Selection,
+            ) anyerror!Context.Outcome {
+                const gpa = context.gpa;
+                const lead = leadRows(context);
+                if (selection.row < lead) return .{ .fetch = account };
+                var list: std.ArrayList(Model) = .empty;
+                defer list.deinit(gpa);
+                try context.accounts.listModels(account, &list, gpa);
+                const authors = try gpa.alloc(AuthorRow, @max(list.items.len, 1));
+                defer gpa.free(authors);
+                const grouped = authorsOf(list.items, authors);
+                if (selection.row - lead >= grouped.len) return Context.Outcome.reportNotice(
+                    gpa,
+                    .failure,
+                    "Select a valid author.",
+                    .{},
+                );
+                return authorModelsStep(context, account, grouped[selection.row - lead].first);
+            }
+        }.select,
+        .open = struct {
+            fn open(context: *Context) anyerror!Context.Outcome {
+                return authorStep(context, account);
+            }
+        }.open,
+        .title = comptime "Author: " ++ account.label(),
+    };
+}
+
+/// The model step of one author: that author's models, no fetch row, and the
+/// key of the author as the payload.
+fn authorModelsStep(context: *Context, account: llm.Account, first: usize) !Context.Outcome {
+    const gpa = context.gpa;
+    var list: std.ArrayList(Model) = .empty;
+    defer list.deinit(gpa);
+    try context.accounts.listModels(account, &list, gpa);
+    if (first >= list.items.len) return Context.Outcome.reportNotice(
+        gpa,
+        .failure,
+        "Select a valid author.",
+        .{},
+    );
+    const author_name = Metadata.authorOf(list.items[first].name());
+    var options: Context.Outcome.Options = .{ .gpa = gpa };
+    errdefer options.deinit();
+    var current: ?usize = null;
+    for (list.items[first..], 0..) |*model, index| {
+        if (!std.mem.eql(u8, Metadata.authorOf(model.name()), author_name)) break;
+        try row(&options, account, model);
+        if (isActive(context, account, model.name())) current = index;
+    }
+    const step: ModelStep = switch (account) {
+        inline else => |tag| authorModelsOf(tag),
+    };
+    return .{ .pick = .{
+        .select = step.select,
+        .title = step.title,
+        .cancellation_message = cancellation_message,
+        .options = try options.toOwnedSlice(),
+        .current = current,
+        .payload = authorKey(author_name),
+        .reopen = step.open,
+    } };
+}
+
+fn authorModelsOf(comptime account: llm.Account) ModelStep {
+    return .{
+        .select = struct {
+            fn select(
+                context: *Context,
+                selection: Context.Outcome.Pick.Selection,
+            ) anyerror!Context.Outcome {
+                const gpa = context.gpa;
+                var list: std.ArrayList(Model) = .empty;
+                defer list.deinit(gpa);
+                try context.accounts.listModels(account, &list, gpa);
+                const authors = try gpa.alloc(AuthorRow, @max(list.items.len, 1));
+                defer gpa.free(authors);
+                const index = authorModelIndex(authorsOf(list.items, authors), selection) orelse
+                    return Context.Outcome.reportNotice(
+                        gpa,
+                        .failure,
+                        "Select a valid model.",
+                        .{},
+                    );
+                return apply(context, account, &list.items[index]);
+            }
+        }.select,
+        .open = struct {
+            fn open(context: *Context) anyerror!Context.Outcome {
+                return authorStep(context, account);
+            }
+        }.open,
+        .title = comptime "Model: " ++ account.label(),
+    };
 }
 
 /// The last step: the fetch row, then a picker over the models of `account`.
@@ -225,8 +457,14 @@ fn row(
 fn modelStepOf(comptime account: llm.Account) ModelStep {
     return .{
         .select = struct {
-            fn select(context: *Context, index: usize) anyerror!Context.Outcome {
+            fn select(
+                context: *Context,
+                selection: Context.Outcome.Pick.Selection,
+            ) anyerror!Context.Outcome {
                 const gpa = context.gpa;
+                // This step sets no payload, because its rows already name
+                // every model of the account.
+                const index = selection.row;
                 const lead = leadRows(context);
                 if (index < lead) return .{ .fetch = account };
                 var list: std.ArrayList(Model) = .empty;
@@ -346,7 +584,7 @@ pub fn fetchOutcome(
 ) !Context.Outcome {
     if (result.models_error) |err|
         return fetchFailure(context.gpa, account, err, result.metadata_save_error);
-    var outcome = try modelStep(context, account);
+    var outcome = try nextStep(context, account);
     errdefer freePick(context.gpa, &outcome.pick);
     outcome.pick.report = try fetchReport(context.gpa, account, result);
     return outcome;
@@ -486,6 +724,17 @@ fn expectPick(outcome: Context.Outcome) !Context.Outcome.Pick {
         .pick => |pick| pick,
         else => error.ExpectedPick,
     };
+}
+
+/// Test helper: tap `row` of `pick`, the way the app taps it. The app hands the
+/// payload of the picker back with the row, so a test that builds the selection
+/// by hand cannot drift from that pairing.
+fn selectRow(
+    pick: *const Context.Outcome.Pick,
+    context: *Context,
+    index: usize,
+) anyerror!Context.Outcome {
+    return pick.select(context, .{ .payload = pick.payload, .row = index });
 }
 
 // A cache write that failed costs this session no model, and a metadata request
@@ -724,6 +973,178 @@ test "an account with no model offers the fetch row alone" {
     try std.testing.expect(pick.current == null);
 }
 
+test "an OpenRouter account opens the author step then the models of that author" {
+    const gpa = std.testing.allocator;
+    var accounts = testing.accounts(.{ .openrouter = "sk-or" }, .{});
+    defer testing.deinitAccounts(&accounts);
+    var openai_new = Model.init("openai/gpt-new") catch unreachable;
+    openai_new.context_window = 1;
+    openai_new.tools = .supported;
+    var openai_old = Model.init("openai/gpt-old") catch unreachable;
+    openai_old.context_window = 1;
+    openai_old.tools = .supported;
+    var qwen = Model.init("qwen/qwen-new") catch unreachable;
+    qwen.context_window = 1;
+    qwen.tools = .supported;
+    const entries = [_]Metadata.Entry{
+        .{ .provider = .openrouter, .model = openai_new },
+        .{ .provider = .openrouter, .model = openai_old },
+        .{ .provider = .openrouter, .model = qwen },
+    };
+    const metadata = try gpa.dupe(Metadata.Entry, &entries);
+    defer gpa.free(metadata);
+    accounts.catalog.metadata = metadata;
+    var agent = testing.agent(gpa, .{ .openrouter_api = "sk-or" });
+    defer agent.deinit();
+    var context: Context = .{ .gpa = gpa, .io = undefined, .agent = &agent, .accounts = &accounts };
+
+    const authors = try expectPick(try run(&context));
+    defer freePick(gpa, &authors);
+    try std.testing.expectEqualStrings("Author: OpenRouter API", authors.title);
+    try std.testing.expectEqual(@as(usize, 3), authors.options.len);
+    try std.testing.expectEqualStrings("Refresh the model list", authors.options[0]);
+    try std.testing.expectEqualStrings("openai · 2 models", authors.options[1]);
+    try std.testing.expectEqualStrings("qwen · 1 model", authors.options[2]);
+    try std.testing.expectEqual(
+        llm.Account.openrouter_api,
+        (try selectRow(&authors, &context, 0)).fetch,
+    );
+
+    const openai_models = try expectPick(try selectRow(&authors, &context, 1));
+    defer freePick(gpa, &openai_models);
+    try std.testing.expectEqualStrings("Model: OpenRouter API", openai_models.title);
+    try std.testing.expectEqual(@as(usize, 2), openai_models.options.len);
+    try std.testing.expectEqualStrings("openai/gpt-new", openai_models.options[0]);
+    try std.testing.expectEqualStrings("openai/gpt-old", openai_models.options[1]);
+    try std.testing.expectEqual(authorKey("openai"), openai_models.payload);
+    try Context.Outcome.expectEvent(try selectRow(&openai_models, &context, 1), .information);
+    try std.testing.expectEqualStrings("openai/gpt-old", agent.model.?.name());
+
+    const qwen_models = try expectPick(try selectRow(&authors, &context, 2));
+    defer freePick(gpa, &qwen_models);
+    try std.testing.expectEqualStrings("qwen/qwen-new", qwen_models.options[0]);
+    try std.testing.expectEqual(authorKey("qwen"), qwen_models.payload);
+
+    // A row past the models of the author must not reach the next author.
+    try Context.Outcome.expectNoticeContaining(
+        try selectRow(&openai_models, &context, 2),
+        .failure,
+        "valid model",
+    );
+    try std.testing.expectEqualStrings("openai/gpt-old", agent.model.?.name());
+
+    // A fetch that reorders the authors while the step stands open moves the
+    // models of the author. The payload names the author, so a row still lands
+    // on a model of that author.
+    std.mem.rotate(Metadata.Entry, metadata, 2);
+    try std.testing.expectEqualStrings("qwen/qwen-new", metadata[0].model.name());
+    try Context.Outcome.expectEvent(try selectRow(&openai_models, &context, 0), .information);
+    try std.testing.expectEqualStrings("openai/gpt-new", agent.model.?.name());
+
+    // An author that a fetch dropped reports, and the model stays.
+    try Context.Outcome.expectNoticeContaining(
+        try openai_models.select(&context, .{ .payload = authorKey("gone"), .row = 0 }),
+        .failure,
+        "valid model",
+    );
+    try std.testing.expectEqualStrings("openai/gpt-new", agent.model.?.name());
+}
+
+// The key of an author names one author. Two rows that carry one key therefore
+// name no author at all: the list broke its grouping, or two names collide
+// under the hash. The step must report, and never land the row on the models of
+// the wrong author.
+test "a key that two author rows carry names no model" {
+    const rows = [_]AuthorRow{
+        .{ .name = "openai", .count = 2, .first = 0 },
+        .{ .name = "qwen", .count = 1, .first = 2 },
+        .{ .name = "openai", .count = 3, .first = 3 },
+    };
+    const key = authorKey("openai");
+    try std.testing.expect(authorModelIndex(&rows, .{ .payload = key, .row = 0 }) == null);
+    try std.testing.expectEqual(
+        @as(?usize, 2),
+        authorModelIndex(&rows, .{ .payload = authorKey("qwen"), .row = 0 }),
+    );
+    // One row alone carries the key, so the row of the selection lands.
+    try std.testing.expectEqual(
+        @as(?usize, 1),
+        authorModelIndex(rows[0..2], .{ .payload = key, .row = 1 }),
+    );
+    try std.testing.expect(authorModelIndex(rows[0..2], .{ .payload = key, .row = 2 }) == null);
+}
+
+// A remote host runs no fetch, so the author step holds no fetch row and its
+// rows start at the first author. The step below it names the models of that
+// author, exactly as it does in the terminal.
+test "a remote host lists the authors with no fetch row" {
+    const gpa = std.testing.allocator;
+    var accounts = testing.accounts(.{ .openrouter = "sk-or" }, .{});
+    defer testing.deinitAccounts(&accounts);
+    var openai_model = Model.init("openai/gpt-new") catch unreachable;
+    openai_model.context_window = 1;
+    openai_model.tools = .supported;
+    var qwen = Model.init("qwen/qwen-new") catch unreachable;
+    qwen.context_window = 1;
+    qwen.tools = .supported;
+    const entries = [_]Metadata.Entry{
+        .{ .provider = .openrouter, .model = openai_model },
+        .{ .provider = .openrouter, .model = qwen },
+    };
+    accounts.catalog.metadata = try gpa.dupe(Metadata.Entry, &entries);
+    defer gpa.free(accounts.catalog.metadata);
+    var agent = testing.agent(gpa, .{ .openrouter_api = "sk-or" });
+    defer agent.deinit();
+    var context: Context = .{
+        .gpa = gpa,
+        .io = undefined,
+        .agent = &agent,
+        .accounts = &accounts,
+        .remote = true,
+    };
+
+    const authors = try expectPick(try run(&context));
+    defer freePick(gpa, &authors);
+    try std.testing.expectEqual(@as(usize, 2), authors.options.len);
+    try std.testing.expectEqualStrings("openai · 1 model", authors.options[0]);
+    try std.testing.expectEqualStrings("qwen · 1 model", authors.options[1]);
+
+    const qwen_models = try expectPick(try selectRow(&authors, &context, 1));
+    defer freePick(gpa, &qwen_models);
+    try std.testing.expectEqual(authorKey("qwen"), qwen_models.payload);
+    try Context.Outcome.expectEvent(try selectRow(&qwen_models, &context, 0), .information);
+    try std.testing.expectEqualStrings("qwen/qwen-new", agent.model.?.name());
+
+    try Context.Outcome.expectNoticeContaining(
+        try selectRow(&authors, &context, 2),
+        .failure,
+        "valid author",
+    );
+}
+
+// An OpenRouter account that the user never fetched holds no cached list, and a
+// remote host cannot fetch one, so the author step names the terminal.
+test "a remote host names the terminal when the OpenRouter list is empty" {
+    const gpa = std.testing.allocator;
+    var accounts = testing.accounts(.{ .openrouter = "sk-or" }, .{});
+    defer testing.deinitAccounts(&accounts);
+    var agent = testing.agent(gpa, .{ .openrouter_api = "sk-or" });
+    defer agent.deinit();
+    var context: Context = .{
+        .gpa = gpa,
+        .io = undefined,
+        .agent = &agent,
+        .accounts = &accounts,
+        .remote = true,
+    };
+
+    try Context.Outcome.expectNoticeContaining(
+        try run(&context),
+        .warning,
+        "Fetch the model list of OpenRouter API with /model in the terminal first.",
+    );
+}
+
 // A remote host cannot run a fetch, so its model step lists the cached models
 // alone and a row index counts from the first model. An account that the user
 // never fetched answers with a notice that names the terminal, because the
@@ -747,11 +1168,14 @@ test "a remote host lists the cached models with no fetch row" {
     defer freePick(gpa, &anthropic_models);
     try std.testing.expectEqual(@as(usize, 2), anthropic_models.options.len);
     try std.testing.expectEqualStrings("claude-fable-5", anthropic_models.options[0]);
-    try std.testing.expectEqualStrings("claude-sonnet-4-6", anthropic_models.options[anthropic_models.current.?]);
-    try Context.Outcome.expectEvent(try anthropic_models.select(&context, 0), .information);
+    try std.testing.expectEqualStrings(
+        "claude-sonnet-4-6",
+        anthropic_models.options[anthropic_models.current.?],
+    );
+    try Context.Outcome.expectEvent(try selectRow(&anthropic_models, &context, 0), .information);
     try std.testing.expectEqualStrings("claude-fable-5", agent.model.?.name());
     try Context.Outcome.expectNoticeContaining(
-        try anthropic_models.select(&context, 2),
+        try selectRow(&anthropic_models, &context, 2),
         .failure,
         "valid model",
     );
@@ -778,20 +1202,20 @@ test "the fetch row hands its account to the app" {
 
     const vendors = try expectPick(try run(&context));
     defer freePick(gpa, &vendors);
-    const anthropic_models = try expectPick(try vendors.select(&context, 0));
+    const anthropic_models = try expectPick(try selectRow(&vendors, &context, 0));
     defer freePick(gpa, &anthropic_models);
     try std.testing.expectEqualStrings("Fetch the model list", anthropic_models.options[0]);
     try std.testing.expectEqual(
         llm.Account.anthropic_api,
-        (try anthropic_models.select(&context, 0)).fetch,
+        (try selectRow(&anthropic_models, &context, 0)).fetch,
     );
 
-    const openai_models = try expectPick(try vendors.select(&context, 1));
+    const openai_models = try expectPick(try selectRow(&vendors, &context, 1));
     defer freePick(gpa, &openai_models);
     try std.testing.expectEqualStrings("Refresh the model list", openai_models.options[0]);
     try std.testing.expectEqual(
         llm.Account.openai_api,
-        (try openai_models.select(&context, 0)).fetch,
+        (try selectRow(&openai_models, &context, 0)).fetch,
     );
     // The row itself changes nothing: the catalog and the agent stand as before.
     try std.testing.expect(!accounts.offersModel(.anthropic_api));
@@ -812,11 +1236,11 @@ test "a provider row opens its accounts, and an account row opens its models" {
 
     const vendors = try expectPick(try run(&context));
     defer freePick(gpa, &vendors);
-    const anthropic_accounts = try expectPick(try vendors.select(&context, 0));
+    const anthropic_accounts = try expectPick(try selectRow(&vendors, &context, 0));
     defer freePick(gpa, &anthropic_accounts);
     try std.testing.expectEqual(@as(usize, 2), anthropic_accounts.options.len);
 
-    const anthropic_models = try expectPick(try anthropic_accounts.select(&context, 0));
+    const anthropic_models = try expectPick(try selectRow(&anthropic_accounts, &context, 0));
     defer freePick(gpa, &anthropic_models);
     try std.testing.expectEqualStrings(
         "Model: Anthropic Subscription",
@@ -826,7 +1250,7 @@ test "a provider row opens its accounts, and an account row opens its models" {
     try std.testing.expect(anthropic_models.current == null);
 
     // OpenAI holds one authenticated account, so its row skips the account step.
-    const openai_models = try expectPick(try vendors.select(&context, 1));
+    const openai_models = try expectPick(try selectRow(&vendors, &context, 1));
     defer freePick(gpa, &openai_models);
     try std.testing.expectEqualStrings("Model: OpenAI API", openai_models.title);
     try std.testing.expectEqual(@as(usize, 3), openai_models.options.len);
@@ -850,11 +1274,11 @@ test "each step names the opener that builds it again" {
     defer freePick(gpa, &vendors);
     try std.testing.expect(vendors.reopen.? == &run);
 
-    const anthropic_accounts = try expectPick(try vendors.select(&context, 0));
+    const anthropic_accounts = try expectPick(try selectRow(&vendors, &context, 0));
     defer freePick(gpa, &anthropic_accounts);
     try std.testing.expect(anthropic_accounts.reopen.? == accountStepOf(.anthropic));
 
-    const anthropic_models = try expectPick(try anthropic_accounts.select(&context, 0));
+    const anthropic_models = try expectPick(try selectRow(&anthropic_accounts, &context, 0));
     defer freePick(gpa, &anthropic_models);
     try std.testing.expect(
         anthropic_models.reopen.? == modelStepOf(.anthropic_subscription).open,
@@ -870,7 +1294,7 @@ test "each step names the opener that builds it again" {
 
     // A step that the flow skipped opens no picker, so it enters no trail and
     // Esc cannot land on it.
-    const openai_models = try expectPick(try vendors.select(&context, 1));
+    const openai_models = try expectPick(try selectRow(&vendors, &context, 1));
     defer freePick(gpa, &openai_models);
     try std.testing.expect(openai_models.reopen.? == modelStepOf(.openai_api).open);
 }
@@ -886,15 +1310,15 @@ test "a model row switches to the chosen account and model" {
 
     const vendors = try expectPick(try run(&context));
     defer freePick(gpa, &vendors);
-    const openai_models = try expectPick(try vendors.select(&context, 1));
+    const openai_models = try expectPick(try selectRow(&vendors, &context, 1));
     defer freePick(gpa, &openai_models);
 
     // The selection crosses vendors, so it switches the account too.
-    try Context.Outcome.expectEvent(try openai_models.select(&context, 1), .information);
+    try Context.Outcome.expectEvent(try selectRow(&openai_models, &context, 1), .information);
     try std.testing.expectEqualStrings("gpt-5.6-sol", agent.model.?.name());
     try std.testing.expectEqual(llm.Account.openai_api, agent.client.?.account());
 
-    try Context.Outcome.expectNotice(try openai_models.select(&context, 1), .information);
+    try Context.Outcome.expectNotice(try selectRow(&openai_models, &context, 1), .information);
     try std.testing.expectEqualStrings("gpt-5.6-sol", agent.model.?.name());
 }
 
@@ -922,7 +1346,7 @@ test "a pick of the active model adopts the fetched description" {
     defer freePick(gpa, &pick);
     try std.testing.expectEqualStrings("claude-opus-5", pick.options[pick.current.?]);
 
-    const outcome = try pick.select(&context, 1);
+    const outcome = try selectRow(&pick, &context, 1);
     switch (outcome) {
         .event => |event| gpa.free(event.content),
         .notice => |notice| gpa.free(notice.content),
@@ -1088,23 +1512,23 @@ test "every step reports a row that its list does not hold" {
     const vendors = try expectPick(try run(&context));
     defer freePick(gpa, &vendors);
     try Context.Outcome.expectNoticeContaining(
-        try vendors.select(&context, 99),
+        try selectRow(&vendors, &context, 99),
         .failure,
         "valid provider",
     );
 
-    const anthropic_accounts = try expectPick(try vendors.select(&context, 0));
+    const anthropic_accounts = try expectPick(try selectRow(&vendors, &context, 0));
     defer freePick(gpa, &anthropic_accounts);
     try Context.Outcome.expectNoticeContaining(
-        try anthropic_accounts.select(&context, 99),
+        try selectRow(&anthropic_accounts, &context, 99),
         .failure,
         "valid account",
     );
 
-    const anthropic_models = try expectPick(try anthropic_accounts.select(&context, 1));
+    const anthropic_models = try expectPick(try selectRow(&anthropic_accounts, &context, 1));
     defer freePick(gpa, &anthropic_models);
     try Context.Outcome.expectNoticeContaining(
-        try anthropic_models.select(&context, 99),
+        try selectRow(&anthropic_models, &context, 99),
         .failure,
         "valid model",
     );
@@ -1144,7 +1568,7 @@ test "the active mark matches the account, not just the model name" {
         anthropic_accounts.options[anthropic_accounts.current.?],
     );
 
-    const subscription_models = try expectPick(try anthropic_accounts.select(&context, 0));
+    const subscription_models = try expectPick(try selectRow(&anthropic_accounts, &context, 0));
     defer freePick(gpa, &subscription_models);
     try std.testing.expectEqualStrings(
         "claude-sonnet-4-6",
@@ -1152,7 +1576,7 @@ test "the active mark matches the account, not just the model name" {
     );
 
     // The same model name under the API account marks no row.
-    const api_models = try expectPick(try anthropic_accounts.select(&context, 1));
+    const api_models = try expectPick(try selectRow(&anthropic_accounts, &context, 1));
     defer freePick(gpa, &api_models);
     try std.testing.expect(api_models.current == null);
 }
@@ -1170,14 +1594,14 @@ fn runUnderOom(gpa: std.mem.Allocator) !void {
 
     const vendors = try expectPick(try run(&context));
     defer freePick(gpa, &vendors);
-    const anthropic_accounts = try expectPick(try vendors.select(&context, 0));
+    const anthropic_accounts = try expectPick(try selectRow(&vendors, &context, 0));
     defer freePick(gpa, &anthropic_accounts);
-    const anthropic_models = try expectPick(try anthropic_accounts.select(&context, 0));
+    const anthropic_models = try expectPick(try selectRow(&anthropic_accounts, &context, 0));
     defer freePick(gpa, &anthropic_models);
 
     // Row 0 hands off to the app and allocates nothing, so the walk picks a
     // model row.
-    switch (try anthropic_models.select(&context, 1)) {
+    switch (try selectRow(&anthropic_models, &context, 1)) {
         .event => |event| gpa.free(event.content),
         else => return error.ExpectedEvent,
     }

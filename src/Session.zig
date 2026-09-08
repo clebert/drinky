@@ -339,7 +339,13 @@ const ActiveTool = struct {
 const Picking = struct {
     picker: ui.Picker,
     /// The command handler a confirmed row goes to.
-    select: *const fn (*ai.command.Context, usize) anyerror!ai.command.Outcome,
+    selector: *const fn (
+        *ai.command.Context,
+        ai.command.Outcome.Pick.Selection,
+    ) anyerror!ai.command.Outcome,
+    /// The value the command set on this picker. It reaches the selector beside
+    /// the tapped row and names the earlier choice this picker belongs to.
+    payload: usize,
     /// The borrowed sentence that identifies the canceled selection.
     cancellation_message: []const u8,
     /// The handler that builds this picker again, or null where the picker
@@ -358,6 +364,14 @@ const Picking = struct {
     fn activity(self: *const Picking) ?ui.paint.Activity {
         const tick = self.wait_tick orelse return null;
         return .{ .motion_tick = tick, .progress_age_ticks = 0 };
+    }
+
+    pub fn select(
+        self: *const Picking,
+        context: *ai.command.Context,
+        row: usize,
+    ) anyerror!ai.command.Outcome {
+        return self.selector(context, .{ .payload = self.payload, .row = row });
     }
 };
 
@@ -1233,7 +1247,8 @@ fn enterPicker(
     self.deinitMode();
     self.mode = .{ .picking = .{
         .picker = picker,
-        .select = pick.select,
+        .selector = pick.select,
+        .payload = pick.payload,
         .cancellation_message = pick.cancellation_message,
         .reopen = pick.reopen,
         .trail = trail,

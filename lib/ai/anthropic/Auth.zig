@@ -140,7 +140,7 @@ fn exchangeRedirect(
 ) !oauth.Tokens {
     var tokens = try oauth.exchange(self.gpa, self.io, self.timeouts, .{
         .code = redirect.code,
-        .state = redirect.state,
+        .state = redirect.state orelse return error.StateMismatch,
         .verifier = &pair.verifier,
     });
     errdefer tokens.deinit(self.gpa);

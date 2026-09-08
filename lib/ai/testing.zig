@@ -40,6 +40,7 @@ pub fn accounts(environment: Accounts.Environment) Accounts {
         .anthropic_console_auth = undefined,
         .openai_auth = undefined,
         .xai_auth = undefined,
+        .openrouter_auth = undefined,
         .google_auth = null,
         .google_error = null,
         .environment = environment,
@@ -47,6 +48,7 @@ pub fn accounts(environment: Accounts.Environment) Accounts {
         .openai_subscription_ready = false,
         .xai_subscription_ready = false,
         .anthropic_console_ready = false,
+        .openrouter_oauth_ready = false,
         .catalog = .{
             .gpa = std.testing.allocator,
             .io = std.testing.io,
