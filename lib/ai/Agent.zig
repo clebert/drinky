@@ -66,13 +66,15 @@ steering: Steering,
 /// turn shares it until a deliberate reset rotates it.
 cache_key: [32]u8,
 
-/// The cumulative session cost, the two gauge measurements, and the latest
-/// subscription allowance. Each message is priced against the model that
-/// produced it, so the total stays correct across a mid-session `/model`
-/// switch. A plain value type: it copies whole across the UI channel.
+/// The cumulative session cost, the two gauge measurements, the latest
+/// subscription allowance, and the latest credit pool. Each message is priced
+/// against the model that produced it, so the total stays correct across a
+/// mid-session `/model` switch. A plain value type: it copies whole across the
+/// UI channel.
 pub const Stats = struct {
     /// The session cost of every reply Drinky could price: the charge a reply
-    /// reports, or else an estimate at public rates.
+    /// reports, or else an estimate at public rates. The total stops at
+    /// `llm.amount_usd_max`, so a consumer can print it into a fixed buffer.
     cost: f64 = 0,
     /// The conversation context that the last committed reply measured. Null
     /// means no measurement describes the current history, or the way the next
@@ -100,6 +102,19 @@ pub const Stats = struct {
     /// this process alone, so a save must drop it and a restart must read it as
     /// unknown.
     quota_seen_ms: i64 = 0,
+    /// The credit pool of an account that spends a prepaid pool, in USD.
+    /// Drinky reads the OpenRouter pool after each model reply. A report that
+    /// names none leaves it unchanged. The value is null until a report
+    /// arrives. An account switch clears it.
+    credits: ?llm.Credits = null,
+
+    /// Forget the allowance and the pool. Both hold what the last response of
+    /// one account reported, so an account event drops the pair and nothing
+    /// else. A live account states one of the two, never both.
+    fn forgetBilling(self: *Stats) void {
+        self.quota = null;
+        self.credits = null;
+    }
 };
 
 /// A reply that another model served than the request named. A provider can
@@ -238,6 +253,10 @@ const ClientFetch = struct {
     fn fetchQuota(self: *ClientFetch) !?llm.Quota {
         return self.client.fetchQuota();
     }
+
+    fn fetchCredits(self: *ClientFetch) !?llm.Credits {
+        return self.client.fetchCredits();
+    }
 };
 
 /// Duplicate one complete borrowed assistant output into the history shape and
@@ -359,9 +378,9 @@ pub fn switchTo(self: *Agent, client: provider.Client, model: ?Model) void {
         model != null;
     self.client = client;
     self.model = model;
-    // An allowance belongs to the account whose response reported it. Session
-    // totals span account switches, but this point-in-time gauge must not.
-    if (account_changed) self.stats.quota = null;
+    // Session totals span account switches, but a point-in-time billing report
+    // must not.
+    if (account_changed) self.stats.forgetBilling();
     // The provider isolates a cache per principal, and it keys the entry on the
     // rendered model too, so either change makes the measured rate foreign. A
     // replaced description keeps the name and can still render another
@@ -373,12 +392,12 @@ pub fn switchTo(self: *Agent, client: provider.Client, model: ?Model) void {
 }
 
 /// Drop the active account and leave the agent signed out. `model` is kept as
-/// the last-shown value. The account-specific allowance and cache rate are
-/// forgotten. The context gauge stands, because a signed-out Drinky sends no
-/// request that renders the history in another way.
+/// the last-shown value. The account-specific allowance, pool, and cache rate
+/// are forgotten. The context gauge stands, because a signed-out Drinky sends
+/// no request that renders the history in another way.
 pub fn signOut(self: *Agent) void {
     self.client = null;
-    self.stats.quota = null;
+    self.stats.forgetBilling();
     self.stats.cache_usage = .{};
     self.refreshContext();
 }
@@ -395,11 +414,11 @@ pub fn signOut(self: *Agent) void {
 /// ever reaches the prompt must void it here too.
 pub fn dropAccountEvidence(self: *Agent, account: llm.Account) void {
     self.dropReasoning(account);
-    // Both gauges hold what the last response of the active account reported,
-    // so only that account can own them.
+    // The billing reports and the cache rate hold what the last response of
+    // the active account reported, so only that account can own them.
     const client = self.client orelse return;
     if (client.account() == account) {
-        self.stats.quota = null;
+        self.stats.forgetBilling();
         self.stats.cache_usage = .{};
     }
 }
@@ -625,6 +644,7 @@ fn runRounds(
         // skill message to roll back. The next model request and the end of the
         // turn still wait.
         try self.refreshQuota(fetch, turn, handler);
+        try self.refreshCredits(fetch, turn, handler);
         // Send every skill file that this round asked for, before the steering
         // of the user. A tool met a file that a rule guards, so the model needs
         // the rules of that file for whatever it does next.
@@ -909,6 +929,23 @@ fn adoptQuota(self: *Agent, quota: llm.Quota, turn: *TurnState, handler: anytype
     try presentation(&turn.presentation_closed, handler.onUsage(self.stats));
 }
 
+/// Read the credit pool after a committed round. The OpenRouter pool is the
+/// balance behind the account, and a report that names none cannot replace a
+/// pool. A timeout or a refused GET leaves the last-known pool. A cancel or an
+/// allocation failure ends the turn and keeps the round.
+fn refreshCredits(self: *Agent, fetch: anytype, turn: *TurnState, handler: anytype) !void {
+    const maybe_credits = fetch.fetchCredits() catch |err| switch (err) {
+        error.Canceled, error.OutOfMemory => return err,
+        else => return,
+    };
+    if (maybe_credits) |credits| try self.adoptCredits(credits, turn, handler);
+}
+
+fn adoptCredits(self: *Agent, credits: llm.Credits, turn: *TurnState, handler: anytype) !void {
+    self.stats.credits = credits;
+    try presentation(&turn.presentation_closed, handler.onUsage(self.stats));
+}
+
 /// Report the retry that is about to start, so the handler clears the rejected stream.
 fn notifyRetry(
     turn: *TurnState,
@@ -1017,14 +1054,17 @@ fn recordStop(self: *Agent, model: *const Model, stop: *const llm.Event.Stop) vo
 }
 
 /// Add one reply to the totals: the charge it reports, or else its usage at the
-/// rates of `model`.
+/// rates of `model`. The total stops at the money bound, because a rate from
+/// the metadata is no more bounded than a charge from the wire.
 fn recordCharge(
     self: *Agent,
     model: *const Model,
     usage: *const llm.Usage,
     reported_cost: ?f64,
 ) void {
-    if (reported_cost orelse model.cost(usage)) |cost| self.stats.cost += cost;
+    if (reported_cost orelse model.cost(usage)) |cost| {
+        self.stats.cost = @min(self.stats.cost + cost, llm.amount_usd_max);
+    }
     // The prompt of an accepted request is processed and billed whole, even
     // when the stream is canceled before its reply ends, so its hit rate is
     // final as soon as the counts arrive.
@@ -1474,7 +1514,7 @@ test "resetConversation clears conversation state and preserves configuration" {
     try std.testing.expectEqual(llm.Effort.high, agent.effort);
 }
 
-test "an account change or sign-out clears the previous account's quota" {
+test "an account change or sign-out clears the previous account's quota and pool" {
     const gpa = std.testing.allocator;
     var agent = scriptedAgent(gpa);
     defer agent.deinit();
@@ -1483,12 +1523,16 @@ test "an account change or sign-out clears the previous account's quota" {
     var sonnet = testing.model("claude-sonnet-4-6");
     sonnet.efforts.remove(.xhigh);
     agent.stats.quota = .{ .primary = .{ .used_percent = 25, .window_minutes = 300 } };
+    agent.stats.credits = .{ .total = 10, .used = 2 };
 
-    // A model change within one account keeps that account's latest allowance.
+    // A model change within one account keeps that account's latest allowance
+    // and pool.
     agent.switchTo(same_account, sonnet);
     try std.testing.expect(agent.stats.quota != null);
+    try std.testing.expect(agent.stats.credits != null);
 
-    // A switch across accounts must not present the old account's allowance as current.
+    // A switch across accounts must not present the old account's allowance
+    // and pool as current.
     const openai_client = provider.Client.init(
         gpa,
         std.testing.io,
@@ -1498,10 +1542,13 @@ test "an account change or sign-out clears the previous account's quota" {
     const openai_model = testing.model("gpt-5.6-sol");
     agent.switchTo(openai_client, openai_model);
     try std.testing.expect(agent.stats.quota == null);
+    try std.testing.expect(agent.stats.credits == null);
 
     agent.stats.quota = .{ .secondary = .{ .used_percent = 75, .window_minutes = 10080 } };
+    agent.stats.credits = .{ .total = 10, .used = 2 };
     agent.signOut();
     try std.testing.expect(agent.stats.quota == null);
+    try std.testing.expect(agent.stats.credits == null);
 }
 
 // The provider keys its cache on the principal, the model, and the rendered
@@ -1742,6 +1789,25 @@ test "a reported charge outranks the rate estimate" {
     try std.testing.expectApproxEqAbs(0.42 + estimate, agent.stats.cost, 1e-9);
 }
 
+// The status line prints the total into a fixed buffer, so the total must stay
+// short whatever a reply reports or a rate implies. A total past the bound is
+// nonsense anyway, so the ceiling costs no true figure.
+test "the session total stops at the money bound" {
+    var agent = scriptedAgent(std.testing.allocator);
+    defer agent.deinit();
+    const model = agent.model.?;
+
+    agent.stats.cost = llm.amount_usd_max - 1;
+    agent.recordStop(&model, &.{ .usage = .{ .input = 1 }, .cost = 5 });
+    try std.testing.expectEqual(llm.amount_usd_max, agent.stats.cost);
+
+    // A rate estimate over a huge count stops at the same bound.
+    agent.stats.cost = 0;
+    const priced = testing.model("priced");
+    agent.recordUsage(&priced, &.{ .input = std.math.maxInt(u64) });
+    try std.testing.expectEqual(llm.amount_usd_max, agent.stats.cost);
+}
+
 // A model that no source priced adds no cost at all. Drinky states no rate it
 // does not know, so such a reply leaves the total where it stood.
 test "an unpriced model adds no cost to the session total" {
@@ -1829,6 +1895,11 @@ const ScriptedFetch = struct {
     quota_to_fetch: ?llm.Quota = null,
     quota_fetches: usize = 0,
     quota_error: ?anyerror = null,
+    /// The credit pool of one scripted round, or null when this fetch reports
+    /// none. The agent reads it after the round commits.
+    credits_to_fetch: ?llm.Credits = null,
+    credits_fetches: usize = 0,
+    credits_error: ?anyerror = null,
 
     const Attempt = union(enum) { fail: anyerror, stream: ScriptedStream };
     const Stream = ScriptedStream;
@@ -1852,6 +1923,12 @@ const ScriptedFetch = struct {
         self.quota_fetches += 1;
         if (self.quota_error) |err| return err;
         return self.quota_to_fetch;
+    }
+
+    fn fetchCredits(self: *ScriptedFetch) !?llm.Credits {
+        self.credits_fetches += 1;
+        if (self.credits_error) |err| return err;
+        return self.credits_to_fetch;
     }
 };
 
@@ -4680,6 +4757,77 @@ test "an out-of-memory billing read fails the turn and keeps the reply" {
     try std.testing.expectError(error.OutOfMemory, agent.runWith(&fetch, "go", &handler));
     try std.testing.expectEqual(@as(usize, 1), fetch.sends);
     try std.testing.expectEqual(@as(usize, 1), fetch.quota_fetches);
+    try std.testing.expectEqual(@as(usize, 2), agent.items.items.len);
+}
+
+test "a committed round reads the credit pool and reports it" {
+    const gpa = std.testing.allocator;
+    var agent = scriptedAgent(gpa);
+    defer agent.deinit();
+    var handler: CaptureHandler = .{ .gpa = gpa };
+    defer handler.deinit();
+
+    const pool = llm.Credits{ .total = 10, .used = 2.86 };
+    var fetch: ScriptedFetch = .{
+        .attempts = &.{.{ .stream = .{ .events = &end_turn_events } }},
+        .credits_to_fetch = pool,
+    };
+    try agent.runWith(&fetch, "go", &handler);
+    try std.testing.expectEqual(@as(usize, 1), fetch.sends);
+    try std.testing.expectEqual(@as(usize, 1), fetch.credits_fetches);
+    try std.testing.expectEqual(@as(f64, 10), agent.stats.credits.?.total);
+    try std.testing.expectEqual(@as(f64, 2.86), agent.stats.credits.?.used);
+}
+
+test "a failed credit read leaves the last-known pool and continues the turn" {
+    const gpa = std.testing.allocator;
+    var agent = scriptedAgent(gpa);
+    defer agent.deinit();
+    var handler: CaptureHandler = .{ .gpa = gpa };
+    defer handler.deinit();
+
+    agent.stats.credits = .{ .total = 10, .used = 2 };
+    var fetch: ScriptedFetch = .{
+        .attempts = &.{.{ .stream = .{ .events = &end_turn_events } }},
+        .credits_error = error.Timeout,
+    };
+    try agent.runWith(&fetch, "go", &handler);
+    try std.testing.expectEqual(@as(usize, 1), fetch.sends);
+    try std.testing.expectEqual(@as(usize, 1), fetch.credits_fetches);
+    try std.testing.expectEqual(@as(f64, 2), agent.stats.credits.?.used);
+}
+
+test "a canceled credit read keeps a finished reply" {
+    const gpa = std.testing.allocator;
+    var agent = scriptedAgent(gpa);
+    defer agent.deinit();
+    var handler: CaptureHandler = .{ .gpa = gpa };
+    defer handler.deinit();
+
+    var fetch: ScriptedFetch = .{
+        .attempts = &.{.{ .stream = .{ .events = &end_turn_events } }},
+        .credits_error = error.Canceled,
+    };
+    try std.testing.expectError(error.Canceled, agent.runWith(&fetch, "go", &handler));
+    try std.testing.expectEqual(@as(usize, 1), fetch.sends);
+    try std.testing.expectEqual(@as(usize, 1), fetch.credits_fetches);
+    try std.testing.expectEqual(@as(usize, 2), agent.items.items.len);
+}
+
+test "an out-of-memory credit read fails the turn and keeps the reply" {
+    const gpa = std.testing.allocator;
+    var agent = scriptedAgent(gpa);
+    defer agent.deinit();
+    var handler: CaptureHandler = .{ .gpa = gpa };
+    defer handler.deinit();
+
+    var fetch: ScriptedFetch = .{
+        .attempts = &.{.{ .stream = .{ .events = &end_turn_events } }},
+        .credits_error = error.OutOfMemory,
+    };
+    try std.testing.expectError(error.OutOfMemory, agent.runWith(&fetch, "go", &handler));
+    try std.testing.expectEqual(@as(usize, 1), fetch.sends);
+    try std.testing.expectEqual(@as(usize, 1), fetch.credits_fetches);
     try std.testing.expectEqual(@as(usize, 2), agent.items.items.len);
 }
 

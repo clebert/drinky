@@ -1,7 +1,9 @@
 //! Networking policy shared across the provider seam: the timeout and retry
-//! knobs (defaults live here, so the config file only patches them) and three
-//! bounds. `withTimeout` bounds one blocking operation. `Deadline` bounds a
-//! run of reads by one fixed instant. `Budget` caps a stream's total bytes.
+//! knobs (defaults live here, so the config file only patches them), three
+//! bounds, and one bounded read. `withTimeout` bounds one blocking operation.
+//! `Deadline` bounds a run of reads by one fixed instant. `Budget` caps a
+//! stream's total bytes. `getJson` reads one small JSON body behind a bearer
+//! credential.
 
 const std = @import("std");
 
@@ -187,6 +189,65 @@ pub fn validHeaderValue(value: []const u8) bool {
     return value.len != 0 and std.mem.indexOfAny(u8, value, "\r\n") == null;
 }
 
+/// One GET of a JSON body behind a bearer credential. The billing reads of the
+/// status line share this shape: a small body, a short bound, and no retry.
+/// The defaults are that policy, so a read names its endpoint and its
+/// credential alone.
+pub const Get = struct {
+    url: []const u8,
+    bearer: []const u8,
+    /// The bound on the whole request, or 0 for none. The GET only fills the
+    /// status line. A hung proxy must not stall the reply or the tools. The
+    /// end of the round can still wait on this bound.
+    timeout_ms: u64 = 5_000,
+    /// A billing body holds a few hundred bytes. The cap bounds a hostile one,
+    /// at the size the OAuth token response takes.
+    body_bytes_max: usize = 256 * 1024,
+};
+
+/// The body of an OK response to `get`, or null for any other status. The
+/// caller owns a body. A credential that cannot be a header value refuses the
+/// request before it opens. A body that arrives after the bound is freed here,
+/// so a timeout leaks nothing.
+pub fn getJson(gpa: std.mem.Allocator, io: std.Io, get: *const Get) !?[]u8 {
+    if (!validHeaderValue(get.bearer)) return error.BadCredentials;
+    var out: ?[]u8 = null;
+    withTimeout(io, get.timeout_ms, getInto, .{ gpa, io, get, &out }) catch |err| {
+        if (out) |body| gpa.free(body);
+        return err;
+    };
+    return out;
+}
+
+fn getInto(gpa: std.mem.Allocator, io: std.Io, get: *const Get, out: *?[]u8) !void {
+    const authorization = try std.fmt.allocPrint(gpa, "Bearer {s}", .{get.bearer});
+    defer gpa.free(authorization);
+
+    const uri = try std.Uri.parse(get.url);
+    var client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer client.deinit();
+
+    var request = try client.request(.GET, uri, .{
+        .headers = .{ .authorization = .{ .override = authorization } },
+        .extra_headers = &.{.{ .name = "accept", .value = "application/json" }},
+        .redirect_behavior = .not_allowed,
+    });
+    defer request.deinit();
+
+    try request.sendBodiless();
+
+    var redirect_buffer: [4096]u8 = undefined;
+    var response = try request.receiveHead(&redirect_buffer);
+    if (response.head.status != .ok) return;
+
+    const decompress_buffer = try decompressBuffer(gpa, response.head.content_encoding);
+    defer if (decompress_buffer.len != 0) gpa.free(decompress_buffer);
+    var decompress: std.http.Decompress = undefined;
+    var transfer_buffer: [16384]u8 = undefined;
+    const reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
+    out.* = try reader.allocRemaining(gpa, .limited(get.body_bytes_max));
+}
+
 /// A hard ceiling on the total wire bytes one streamed response body can
 /// deliver. Every model tops out at 128k output tokens (~14 MB of framed SSE
 /// at one token per frame). This ceiling clears any real reply several times
@@ -225,6 +286,28 @@ test "credential header values cannot inject another header" {
     try std.testing.expect(validHeaderValue("token.account"));
     try std.testing.expect(!validHeaderValue(""));
     try std.testing.expect(!validHeaderValue("token\r\nleaked: value"));
+}
+
+// The defaults are the policy of every billing read. A zero bound would let a
+// hung proxy hold the round, and a bound past the connect bound would wait
+// longer for a billing head than a model request waits for its own.
+test "a billing read takes a short bound and a small body cap by default" {
+    const get: Get = .{ .url = "https://example.invalid/", .bearer = "token" };
+    const timeouts: Timeouts = .{};
+    try std.testing.expect(get.timeout_ms > 0);
+    try std.testing.expect(get.timeout_ms < timeouts.connect_ms);
+    try std.testing.expectEqual(@as(u64, 5_000), get.timeout_ms);
+    try std.testing.expectEqual(@as(usize, 256 * 1024), get.body_bytes_max);
+}
+
+test "getJson refuses a credential that cannot be a header before it opens" {
+    for ([_][]const u8{ "", "token\r\nleaked: value" }) |bearer| {
+        try std.testing.expectError(error.BadCredentials, getJson(
+            std.testing.allocator,
+            std.testing.io,
+            &.{ .url = "https://example.invalid/", .bearer = bearer },
+        ));
+    }
 }
 
 test "Budget charges until the running total passes its ceiling" {

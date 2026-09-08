@@ -1883,6 +1883,7 @@ pub fn statusInfo(self: *const Session) ui.status.Info {
         // that counts a suspended system, so the difference is the age of that
         // report even across a sleep.
         .quota_age_ms = self.boot_clock_ms - self.stats_shown.quota_seen_ms,
+        .credits = self.stats_shown.credits,
         .turn_active = self.mode == .turn,
         .gauge = self.gauge,
         .notice = if (self.notice) |notice| .{
@@ -2576,6 +2577,26 @@ test "the status line borrows the model name of the session" {
     // An account with no model states no name at all.
     session.model_shown = null;
     try std.testing.expect(session.statusInfo().model == null);
+}
+
+// The line reads the billing reports from the stats the session shows, not
+// from the agent, so a report reaches the line only once the session adopts it.
+test "the status line states the billing reports of the shown stats" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
+    defer session.deinit();
+
+    try std.testing.expect(session.statusInfo().quota == null);
+    try std.testing.expect(session.statusInfo().credits == null);
+
+    session.stats_shown.quota = .{ .primary = .{ .used_percent = 25, .window_minutes = 300 } };
+    session.stats_shown.credits = .{ .total = 10, .used = 2.86 };
+    const info = session.statusInfo();
+    try std.testing.expectEqual(@as(f64, 25), info.quota.?.primary.?.used_percent);
+    try std.testing.expectEqual(@as(f64, 10), info.credits.?.total);
+    try std.testing.expectEqual(@as(f64, 2.86), info.credits.?.used);
 }
 
 test "a confirmation is one-shot and separate from its notice" {

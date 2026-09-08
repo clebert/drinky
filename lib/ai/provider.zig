@@ -12,6 +12,7 @@ const google = @import("google/root.zig");
 const llm = @import("llm.zig");
 const net = @import("net.zig");
 const openai = @import("openai/root.zig");
+const openrouter = @import("openrouter/root.zig");
 const xai = @import("xai/root.zig");
 
 const openai_url = "https://api.openai.com/v1/responses";
@@ -96,6 +97,21 @@ pub const Client = struct {
             },
             else => return null,
         }
+    }
+
+    /// The credit pool of this account when it spends a prepaid pool, or null
+    /// when it does not. Both OpenRouter accounts read the pool of their key.
+    /// The subscription accounts state their allowance in the response head or
+    /// on a billing endpoint instead.
+    pub fn fetchCredits(self: *Client) !?llm.Credits {
+        return switch (self.credentials) {
+            .openrouter_oauth, .openrouter_api => |key| openrouter.credits.fetch(
+                self.gpa,
+                self.io,
+                key,
+            ),
+            else => null,
+        };
     }
 
     /// Open a streaming request for `request` and fill `out` in place. On
@@ -404,4 +420,23 @@ test "fetchQuota is a billing read of the xAI subscription alone" {
     defer auth.tokens.?.deinit(gpa);
     var grok = Client.init(gpa, io, .{ .xai_subscription = &auth }, .{});
     try std.testing.expectError(error.BadCredentials, grok.fetchQuota());
+}
+
+test "fetchCredits is a pool read of the OpenRouter accounts alone" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    for ([_]Credentials{
+        .{ .anthropic_api = "sk-ant" },
+        .{ .anthropic_console = "sk-ant-api03" },
+        .{ .openai_api = "sk-test" },
+        .{ .xai_api = "xai-test" },
+    }) |credentials| {
+        var client = Client.init(gpa, io, credentials, .{});
+        try std.testing.expect(try client.fetchCredits() == null);
+    }
+
+    var key = Client.init(gpa, io, .{ .openrouter_api = "key\r\nleaked" }, .{});
+    try std.testing.expectError(error.BadCredentials, key.fetchCredits());
+    var login = Client.init(gpa, io, .{ .openrouter_oauth = "" }, .{});
+    try std.testing.expectError(error.BadCredentials, login.fetchCredits());
 }

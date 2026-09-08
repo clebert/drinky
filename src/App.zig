@@ -6339,6 +6339,7 @@ test "an account-switch command clears the quota snapshot and records the projec
     app.agent.stats.quota = .{
         .secondary = .{ .used_percent = 77, .window_minutes = 10080 },
     };
+    app.agent.stats.credits = .{ .total = 10, .used = 2 };
     app.session.stats_shown = app.agent.stats;
 
     const openai_client = ai.provider.Client.init(gpa, io, .{ .openai_api = "sk-test" }, .{});
@@ -6349,6 +6350,8 @@ test "an account-switch command clears the quota snapshot and records the projec
 
     try std.testing.expect(app.agent.stats.quota == null);
     try std.testing.expect(app.session.stats_shown.quota == null);
+    try std.testing.expect(app.agent.stats.credits == null);
+    try std.testing.expect(app.session.stats_shown.credits == null);
     try std.testing.expectEqualStrings(test_openai_model.name(), app.session.model_shown.?.name());
     try std.testing.expectEqual(ai.llm.Account.openai_api, app.session.account_shown.?);
 
@@ -6930,6 +6933,7 @@ test "a principal replacement drops old evidence before the restored turn" {
     } };
     try app.agent.items.append(gpa, .{ .reasoning = .{ .replay = try replay.dupe(gpa) } });
     app.agent.stats.quota = .{ .primary = .{ .used_percent = 25, .window_minutes = 300 } };
+    app.agent.stats.credits = .{ .total = 10, .used = 2 };
 
     var result: WorkerResult = .{
         .outcome = .{
@@ -6943,6 +6947,7 @@ test "a principal replacement drops old evidence before the restored turn" {
 
     try std.testing.expectEqual(@as(usize, 0), app.agent.items.items.len);
     try std.testing.expect(app.agent.stats.quota == null);
+    try std.testing.expect(app.agent.stats.credits == null);
     try std.testing.expectEqual(ai.llm.Account.anthropic_subscription, app.activeAccount().?);
     try std.testing.expectEqual(ai.llm.Account.anthropic_subscription, app.session.account_shown.?);
     try std.testing.expect(app.session.mode == .prompt);

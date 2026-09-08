@@ -761,6 +761,7 @@ const test_status: ui.status.Info = .{
     .account = .anthropic_subscription,
     .quota = null,
     .quota_age_ms = 0,
+    .credits = null,
     .turn_active = false,
 };
 

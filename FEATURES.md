@@ -133,7 +133,7 @@ service account key file.
 - With no account at all, the login picker opens by itself. While signed out, Drinky refuses a
   message and points to `/login`.
 - Reasoning replays only to the account that produced it. A login, a logout, or a credential
-  replacement discards the reasoning, cache-hit rate, and allowance of that account.
+  replacement discards the reasoning, cache-hit rate, allowance, and credit pool of that account.
 - Drinky shows only the conversation that the next request carries. A change that drops stored
   reasoning repaints the screen and the scrollback without it.
 
@@ -191,9 +191,10 @@ service account key file.
   the model cannot invoke, and a project skill row names the user skill that it replaced. A required
   skill row marks a configured name that no discovered skill carries.
 - **/status** — state the session in full: the directory with its branch, the context gauge, the
-  cost, the quota and the cache-hit rate of a running turn, and `model (account) · Effort: level`.
-  The answer takes the words of the status line and reaches the channel that asked alone: a terminal
-  event that the chat never sees, or a Telegram reply that the terminal never records.
+  cost, the quota, the credit pool, and the cache-hit rate of a running turn, and
+  `model (account) · Effort: level`. The answer takes the words of the status line and reaches the
+  channel that asked alone: a terminal event that the chat never sees, or a Telegram reply that the
+  terminal never records.
 - **/system** — show the complete system prompt as rendered Markdown in a scrollable full-window
   page. `M` toggles the exact source.
 - **/skill** — pick one of the discovered skills. Each row holds the first sentence of the
@@ -333,9 +334,10 @@ service account key file.
   becomes one user message once consumed.
 - The open input area grows to about a quarter of the screen and labels hidden rows `↑ Hidden: N`
   and `↓ Hidden: N`.
-- The bottom line shows `directory (branch)`, the context gauge, the cost, the quota, and the
-  cache-hit rate on the left, and `model (account) · Effort: level` on the right. The model name and
-  the effort value take the normal intensity, so the two settings that the user changes stand out.
+- The bottom line shows `directory (branch)`, the context gauge, the cost, the quota, the credit
+  pool, and the cache-hit rate on the left, and `model (account) · Effort: level` on the right. The
+  model name and the effort value take the normal intensity, so the two settings that the user
+  changes stand out.
 - One temporary notice replaces the bottom line until the next user action. The notice keeps one
   row, so it never moves the editor. An information notice opens with `ℹ`, and a warning or a
   failure opens with `⚠` and carries its color.
@@ -351,7 +353,11 @@ service account key file.
   wait shows one unit and rounds down: `53m`, `22h`, `6d`. The shortest window prints first.
   Anthropic and OpenAI state the allowance in the response head of each request. Drinky reads the
   xAI subscription allowance after each model reply. An API-key account reports none.
-- The quota and the cache-hit rate show while a turn runs. The cache-hit rate measures one request.
+- An OpenRouter account spends a prepaid credit pool. Drinky reads the pool after each model reply,
+  and the line states the remaining amount as `Credits: $7.14`. The pool takes no color, because an
+  amount states no share. A key that the endpoint refuses states no pool.
+- The quota, the credit pool, and the cache-hit rate show while a turn runs. The cache-hit rate
+  measures one request.
 - The context gauge and each quota window take the warning color from 75% used and the error color
   from 90% used. The config sets both shares. A color on this line always means pressure, and the
   color follows the printed share.

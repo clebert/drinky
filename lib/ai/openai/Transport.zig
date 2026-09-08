@@ -695,14 +695,16 @@ fn connect(self: *Transport, out: *Stream, payload: Payload) anyerror!void {
 }
 
 /// The charge that `usage` reports in USD, or null when it states none, states
-/// it as a value that is not a number, or states a number no cost can be.
+/// it as a value that is not a number, or states a number no cost can be. A
+/// charge past the money bound is such a number.
 fn parseCost(usage: *const std.json.ObjectMap) ?f64 {
     const value = usage.get("cost") orelse return null;
     const cost = switch (value) {
         .string, .number_string => |text| std.fmt.parseFloat(f64, text) catch return null,
         else => json.float(value) orelse return null,
     };
-    return if (std.math.isFinite(cost) and cost >= 0) cost else null;
+    if (!std.math.isFinite(cost) or cost < 0 or cost > llm.amount_usd_max) return null;
+    return cost;
 }
 
 /// The optional `usage` object nested under a terminal frame's response.
@@ -1410,6 +1412,10 @@ test "terminal costs accept numeric strings and preserve small charges" {
         .{ .value = "\"-0.1\"", .expected = null },
         .{ .value = "-0.1", .expected = null },
         .{ .value = "1e999", .expected = null },
+        // A charge past the money bound is no charge, so the estimate applies.
+        .{ .value = "1e9", .expected = 1e9 },
+        .{ .value = "1e10", .expected = null },
+        .{ .value = "\"1e10\"", .expected = null },
     };
     for (cases) |case| {
         var stream = testStream(undefined, undefined, 0, 0);

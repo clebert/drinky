@@ -455,6 +455,28 @@ pub const Quota = struct {
     };
 };
 
+/// The largest money figure Drinky holds, in USD. No charge, pool, or session
+/// comes near it. A consumer prints the figure into a fixed buffer, so a
+/// report that names a figure past this bound is no report, and a total stops
+/// at it.
+pub const amount_usd_max: f64 = 1_000_000_000;
+
+/// The prepaid credit pool of an account, in USD. The provider states the pool
+/// and the spend it drew from it, and a consumer derives the remaining amount.
+/// No window rolls, so a fresh report states the truth and no consumer ages
+/// the numbers. The pool states an amount and no share: the figures are
+/// lifetime totals, so their ratio measures no pressure. The OpenRouter pool
+/// states none of the window fields of a quota, so it keeps its own type.
+pub const Credits = struct {
+    total: f64,
+    used: f64,
+
+    /// The amount still available, never negative.
+    pub fn remaining(self: Credits) f64 {
+        return @max(0.0, self.total - self.used);
+    }
+};
+
 /// A decoded part of a streamed assistant reply. Display deltas are kept
 /// separate from completed conversation items. Transports own their native
 /// block/item lifecycles and emit an `item` only after the wire closes it.

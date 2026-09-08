@@ -11,10 +11,6 @@ const net = @import("../net.zig");
 /// The Grok Build credits shape. The same URL without `format=credits` is the
 /// legacy monthly API-credit body, which is empty for this plan.
 const endpoint = "https://cli-chat-proxy.grok.com/v1/billing?format=credits";
-const body_bytes_max = 256 * 1024;
-/// The GET only fills the status line. A hung proxy must not stall the reply
-/// or the tools. The end of the round can still wait on this bound.
-const fetch_timeout_ms = 5_000;
 
 /// The plan allowance behind `token`, or null when the endpoint refuses the
 /// request or the body names no used share. The caller owns nothing. Bearer
@@ -28,51 +24,11 @@ pub fn fetch(
     io: std.Io,
     token: []const u8,
 ) !?llm.Quota {
-    if (!net.validHeaderValue(token)) return error.BadCredentials;
-    var out: ?[]u8 = null;
-    net.withTimeout(io, fetch_timeout_ms, requestInto, .{ gpa, io, token, &out }) catch |err| {
-        if (out) |payload| gpa.free(payload);
-        return err;
-    };
-    const body = out orelse return null;
+    const body = try net.getJson(gpa, io, &.{ .url = endpoint, .bearer = token }) orelse
+        return null;
     defer gpa.free(body);
     const now_ms = std.Io.Timestamp.now(io, .real).toMilliseconds();
     return parse(gpa, body, now_ms);
-}
-
-fn requestInto(
-    gpa: std.mem.Allocator,
-    io: std.Io,
-    token: []const u8,
-    out: *?[]u8,
-) !void {
-    const authorization = try std.fmt.allocPrint(gpa, "Bearer {s}", .{token});
-    defer gpa.free(authorization);
-
-    const uri = try std.Uri.parse(endpoint);
-    var client: std.http.Client = .{ .allocator = gpa, .io = io };
-    defer client.deinit();
-
-    var request = try client.request(.GET, uri, .{
-        .headers = .{ .authorization = .{ .override = authorization } },
-        .extra_headers = &.{.{ .name = "accept", .value = "application/json" }},
-        .redirect_behavior = .not_allowed,
-    });
-    defer request.deinit();
-
-    try request.sendBodiless();
-
-    var redirect_buffer: [4096]u8 = undefined;
-    var response = try request.receiveHead(&redirect_buffer);
-    if (response.head.status != .ok) return;
-
-    const decompress_buffer = try net.decompressBuffer(gpa, response.head.content_encoding);
-    defer if (decompress_buffer.len != 0) gpa.free(decompress_buffer);
-    var decompress: std.http.Decompress = undefined;
-    var transfer_buffer: [16384]u8 = undefined;
-    const reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
-    const body = try reader.allocRemaining(gpa, .limited(body_bytes_max));
-    out.* = body;
 }
 
 /// Decode the credits body into one primary window. `prepaidBalance` and

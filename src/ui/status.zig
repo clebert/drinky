@@ -55,13 +55,20 @@ pub const Info = struct {
     /// ages with that report, so the line subtracts this to show the wait that
     /// is left now.
     quota_age_ms: i64,
-    /// Whether a turn runs. The quota is a live subscription allowance, and the
-    /// cache rate measures one request, so both show while a turn runs and go
-    /// when it ends. An idle Drinky paints no frame, which freezes a countdown
-    /// on the screen. The share is no safer: another agent on the same account
-    /// spends the same allowance, so an idle number can read too low, and it
-    /// reads too high once the window starts again. Only a fresh report from
-    /// the provider states the truth.
+    /// The credit pool of an account that spends a prepaid pool, or null when
+    /// the active provider reports none. An OpenRouter turn reads the pool
+    /// after each model reply, so the line shows it while a turn runs, like
+    /// the quota. The pool prints an amount and takes no color, because an
+    /// amount states no share.
+    credits: ?ai.llm.Credits,
+    /// Whether a turn runs. The quota is a live subscription allowance, the
+    /// pool is a live balance, and the cache rate measures one request, so all
+    /// three show while a turn runs and go when it ends. An idle Drinky paints
+    /// no frame, which freezes a countdown on the screen. The numbers are no
+    /// safer: another agent on the same account spends the same allowance and
+    /// the same pool, so an idle number can read too low, and it reads too
+    /// high once the window starts again. Only a fresh report from the provider
+    /// states the truth.
     turn_active: bool,
     /// The shares at which a gauge takes a color. The default is the compiled
     /// pair, so a caller that configures none keeps it.
@@ -118,6 +125,7 @@ const Parts = struct {
     cost: bool,
     quota_short: bool,
     quota_long: bool,
+    credits: bool,
     cache: bool,
     account: bool,
     effort: bool,
@@ -143,6 +151,7 @@ const Parts = struct {
         .cost = true,
         .quota_short = true,
         .quota_long = true,
+        .credits = true,
         .cache = true,
         .account = true,
         .effort = true,
@@ -150,11 +159,12 @@ const Parts = struct {
 };
 
 /// Shorten each field before any complete part goes. The measurements of one
-/// request go next, longest window first, because they leave the line when the
-/// turn ends anyway. The session cost outlives them, so a narrow line holds the
-/// same numbers whether a turn runs or not. Each side then gives up its
-/// bracketed detail before the head that carries it: the account, then the
-/// branch, then the place. The effort goes last.
+/// request go next, longest window first, and the credit pool with them,
+/// because they leave the line when the turn ends anyway. The session cost
+/// outlives them, so a narrow line holds the same numbers whether a turn runs
+/// or not. Each side then gives up its bracketed detail before the head that
+/// carries it: the account, then the branch, then the place. The effort goes
+/// last.
 const reductions = [_]Reduction{
     .shorten_directory,
     .shorten_branch,
@@ -163,6 +173,7 @@ const reductions = [_]Reduction{
     .drop_cache,
     .drop_quota_long,
     .drop_quota_short,
+    .drop_credits,
     .drop_cost,
     .drop_account,
     .drop_branch,
@@ -178,6 +189,7 @@ const Reduction = enum {
     drop_cache,
     drop_quota_long,
     drop_quota_short,
+    drop_credits,
     drop_cost,
     drop_account,
     drop_branch,
@@ -195,6 +207,7 @@ fn reduce(parts: *Parts, reduction: Reduction) void {
         .drop_cost => parts.cost = false,
         .drop_quota_long => parts.quota_long = false,
         .drop_quota_short => parts.quota_short = false,
+        .drop_credits => parts.credits = false,
         .drop_account => parts.account = false,
         .drop_branch => parts.branch = .hidden,
         .drop_place => parts.place = .hidden,
@@ -311,9 +324,12 @@ pub fn render(placement: *const paint.Placement, info: *const Info) !void {
     }
 
     // Sized so `catch unreachable` is sound. The branch can fill one bounded
-    // `HEAD` file. The remaining space holds the directory and every number.
-    // `ai.Model.name_bytes_max` bounds the model name, and the account label,
-    // the effort level, and every separator are compiled strings.
+    // `HEAD` file. The remaining space holds the directory and every number: a
+    // token count and the context share derive from a `u64`, a quota share
+    // stops at 100 at the wire, and `ai.llm.amount_usd_max` bounds the cost
+    // and the pool figure. `ai.Model.name_bytes_max` bounds the model name, and
+    // the account label, the effort level, and every separator are compiled
+    // strings.
     var left_scratch: [ai.project.head_name_bytes_max + 512]u8 = undefined;
     var right_scratch: [192]u8 = undefined;
     var parts: Parts = .all;
@@ -352,8 +368,8 @@ pub fn render(placement: *const paint.Placement, info: *const Info) !void {
 /// Write the state of the session as one line for a reader with no column
 /// budget: every part of the line in its full form and in its order, so the
 /// answer of `/status` reads like the status line. An empty directory leaves the
-/// place out, and the quota and the cache rate come while a turn runs alone, as
-/// on the line.
+/// place out, and the quota, the credit pool, and the cache rate come while a
+/// turn runs alone, as on the line.
 pub fn writeSummary(out: *std.Io.Writer, info: *const Info) !void {
     // Both sides of the line, with the room that `render` gives each of them,
     // and the separator between them.
@@ -428,17 +444,27 @@ fn writeLeft(line: *Line, info: *const Info, parts: *const Parts) !void {
     }
     try writeContext(line, info, parts.context);
     if (parts.cost) try writeCost(line, info);
-    // The quota is a live subscription allowance, and the cache rate measures
-    // one request, so they belong to a running turn alone. A spent OpenAI
-    // subscription still names its plan and its wait in the failure message of
-    // the turn.
+    // The quota is a live subscription allowance, the pool is a live balance,
+    // and the cache rate measures one request, so all three belong to a
+    // running turn alone. A spent OpenAI subscription still names its plan and
+    // its wait in the failure message of the turn.
     if (!info.turn_active) return;
     if (info.quota) |quota| {
         const windows = orderedWindows(&quota);
         if (parts.quota_short) try writeQuotaPart(line, &windows[0], info, parts);
         if (parts.quota_long) try writeQuotaPart(line, &windows[1], info, parts);
     }
+    if (parts.credits) try writeCredits(line, info);
     if (parts.cache) try writeCache(line, info);
+}
+
+/// Append the credit pool as ` · Credits: $7.14`, or nothing for an absent
+/// pool. The figure is the amount still available. It takes no color, because
+/// a color on this line means pressure and an amount states no share.
+fn writeCredits(line: *Line, info: *const Info) !void {
+    const credits = info.credits orelse return;
+    try line.out.print("{s}Credits: ", .{separator});
+    try writeUsd(&line.out, credits.remaining());
 }
 
 /// The windows of `quota`, shortest first, and null for a window the line
@@ -563,11 +589,18 @@ fn writeContext(line: *Line, info: *const Info, form: Parts.Context) !void {
 /// The session cost behind its separator. The cost is an estimate at public
 /// rates, so the tilde marks it: the login type does not reveal the billing, a
 /// subscription pays none of it, and a reply that Drinky could not price counts
-/// nothing. Every cost figure of Drinky takes this one mark. A positive total
-/// under one cent reads `<$0.01`, so a cheap session never reads as free.
+/// nothing. Every cost figure of Drinky takes this one mark.
 fn writeCost(line: *Line, info: *const Info) !void {
-    if (info.cost > 0 and info.cost < 0.01) return line.out.print("{s}Cost: ~<$0.01", .{separator});
-    try line.out.print("{s}Cost: ~${d:.2}", .{ separator, info.cost });
+    try line.out.print("{s}Cost: ~", .{separator});
+    try writeUsd(&line.out, info.cost);
+}
+
+/// One USD amount to the cent. A positive amount under one cent reads `<$0.01`,
+/// so a cheap session never reads as free and a nearly spent pool never reads
+/// as empty.
+fn writeUsd(out: *std.Io.Writer, amount: f64) !void {
+    if (amount > 0 and amount < 0.01) return out.writeAll("<$0.01");
+    try out.print("${d:.2}", .{amount});
 }
 
 /// The last request's cache hit rate over the whole prompt. An all-zero prompt
@@ -694,6 +727,7 @@ const test_info: Info = .{
         .secondary = .{ .used_percent = 73.6, .window_minutes = 10080, .reset_seconds = 580_769 },
     },
     .quota_age_ms = 0,
+    .credits = null,
     .turn_active = true,
 };
 
@@ -1307,6 +1341,101 @@ test "unidentified quota windows stay hidden beside a known window" {
     try std.testing.expect(std.mem.indexOf(u8, written, "0%") == null);
     try std.testing.expect(quotaLabel(null) == null);
     try std.testing.expect(quotaLabel(600) == null);
+}
+
+// An OpenRouter account spends a prepaid pool rather than a subscription
+// window. The line states the remaining amount while a turn runs, and it goes
+// when the turn ends, as the quota does.
+test "the credit pool shows the remaining amount while a turn runs" {
+    const gpa = std.testing.allocator;
+    var info = test_info;
+    info.model = "openai/gpt-5.6-sol";
+    info.account = .openrouter_api;
+    info.quota = null;
+    info.credits = .{ .total = 10, .used = 2.864085024 };
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try renderForTest(gpa, &info, 200, &out);
+    try expectShows(out.written(), &.{ "Cost: ~$0.39", "Credits: $7.14", "Cache: 87%" });
+
+    var idle = info;
+    idle.turn_active = false;
+    var idle_out: std.Io.Writer.Allocating = .init(gpa);
+    defer idle_out.deinit();
+    try renderForTest(gpa, &idle, 200, &idle_out);
+    try expectHides(idle_out.written(), &.{"Credits:"});
+}
+
+test "the summary states the credit pool of a running turn" {
+    var info = test_info;
+    info.model = "openai/gpt-5.6-sol";
+    info.account = .openrouter_api;
+    info.quota = null;
+    info.credits = .{ .total = 10, .used = 2.864085024 };
+    try expectSummary(
+        "~/github/clebert/drinky (main) · Context: 21% (206k/1.0M) · Cost: ~$0.39 · " ++
+            "Credits: $7.14 · Cache: 87% · openai/gpt-5.6-sol (OpenRouter API) · Effort: " ++
+            "xhigh",
+        &info,
+    );
+}
+
+test "a sub-cent credit pool never reads as an empty one" {
+    const gpa = std.testing.allocator;
+    var info = test_info;
+    info.model = "openai/gpt-5.6-sol";
+    info.account = .openrouter_api;
+    info.quota = null;
+    info.credits = .{ .total = 0.02, .used = 0.015 };
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try renderForTest(gpa, &info, 200, &out);
+    try expectShows(out.written(), &.{"Credits: <$0.01"});
+}
+
+// The pool figures are lifetime totals, so their ratio measures no pressure. A
+// nearly spent pool prints its amount in the muted role of the line.
+test "the credit pool takes no color at any used share" {
+    const gpa = std.testing.allocator;
+    var info = test_info;
+    info.model = "openai/gpt-5.6-sol";
+    info.account = .openrouter_api;
+    info.quota = null;
+    for ([_]ai.llm.Credits{
+        .{ .total = 10, .used = 9 },
+        .{ .total = 1, .used = 2 },
+        .{ .total = 0, .used = 0 },
+    }) |credits| {
+        info.credits = credits;
+        var out: std.Io.Writer.Allocating = .init(gpa);
+        defer out.deinit();
+        try renderForTest(gpa, &info, 200, &out);
+        try expectShows(out.written(), &.{"Credits: $"});
+        try expectHides(out.written(), &.{
+            comptime role.sequence(.warning) ++ "Credits:",
+            comptime role.sequence(.@"error") ++ "Credits:",
+        });
+    }
+}
+
+test "a narrow window drops the credit pool before the session cost" {
+    const gpa = std.testing.allocator;
+    var info = test_info;
+    info.model = "openai/gpt-5.6-sol";
+    info.account = .openrouter_api;
+    info.quota = null;
+    info.credits = .{ .total = 10, .used = 2.86 };
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try renderForTest(gpa, &info, 120, &out);
+    try expectShows(out.written(), &.{ "Cost: ~$0.39", "Credits: $7.14" });
+    try expectHides(out.written(), &.{"Cache:"});
+
+    var out2: std.Io.Writer.Allocating = .init(gpa);
+    defer out2.deinit();
+    try renderForTest(gpa, &info, 110, &out2);
+    try expectShows(out2.written(), &.{ "~/…/drinky (main)", "Context: 21%", "Cost: ~$0.39" });
+    try expectHides(out2.written(), &.{ "Credits:", "Cache:" });
 }
 
 test writeWait {
