@@ -1864,9 +1864,9 @@ pub fn statusInfo(self: *const Session) ui.status.Info {
         .effort = @tagName(self.effort_shown),
         .account = self.account_shown,
         .quota = self.stats_shown.quota,
-        // The agent stamps the head that stated the allowance on the clock that
-        // counts a suspended system, so the difference is the age of that
-        // response even across a sleep.
+        // The agent stamps the report that stated the allowance on the clock
+        // that counts a suspended system, so the difference is the age of that
+        // report even across a sleep.
         .quota_age_ms = self.boot_clock_ms - self.stats_shown.quota_seen_ms,
         .turn_active = self.mode == .turn,
         .gauge = self.gauge,

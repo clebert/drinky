@@ -932,6 +932,17 @@ test parseQuota {
         "HTTP/1.1 200 OK\r\ncontent-length:0\r\n\r\n",
     );
     try std.testing.expect(parseQuota(&none_head) == null);
+
+    // The xAI Responses endpoint states burst TPM and RPM. Those headers are
+    // not a subscription window, so they must not fill the gauge.
+    const burst = "HTTP/1.1 200 OK\r\n" ++
+        "x-ratelimit-limit-requests: 8300\r\n" ++
+        "x-ratelimit-remaining-requests: 8300\r\n" ++
+        "x-ratelimit-limit-tokens: 53000000\r\n" ++
+        "x-ratelimit-remaining-tokens: 53000000\r\n" ++
+        "content-length:0\r\n\r\n";
+    const burst_head = try std.http.Client.Response.Head.parse(burst);
+    try std.testing.expect(parseQuota(&burst_head) == null);
 }
 
 test "quota percentages reject non-finite and out-of-range values" {

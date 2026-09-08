@@ -377,10 +377,11 @@ pub const Usage = struct {
     cache_write: u64 = 0,
 };
 
-/// A subscription account's remaining allowance, read from the provider's
-/// response head. Each window is optional and independent. Classify one by its
-/// length (`window_minutes` ≈ 300 → a 5h window, ≈ 10080 → weekly). The quota
-/// is absent for API-key accounts and any provider that reports no quota.
+/// A subscription account's remaining allowance. Anthropic and OpenAI state it
+/// in the response head. The xAI subscription states it on a billing request.
+/// Each window is optional and independent. Classify one by its length
+/// (`window_minutes` ≈ 300 → a 5h window, ≈ 10080 → weekly). The quota is
+/// absent for API-key accounts and any provider that reports no quota.
 /// `used_percent` runs 0–100, so the remaining share is `100 - used_percent`.
 ///
 /// The two slots carry no fixed window. One provider sent the weekly window in
@@ -393,9 +394,9 @@ pub const Quota = struct {
     pub const Window = struct {
         used_percent: f64,
         window_minutes: ?u32 = null,
-        /// Seconds from the response until the window starts again, or null
-        /// when the head named none. It ages with the response that carried it,
-        /// so a consumer must subtract the time since that response.
+        /// Seconds from the report until the window starts again, or null when
+        /// the report named none. It ages with the report that carried it, so a
+        /// consumer must subtract the time since that report.
         reset_seconds: ?u64 = null,
     };
 };

@@ -5,13 +5,14 @@
 //! `Auth` manages the subscription credential. `oauth` drives the device-code
 //! login of the Grok Build client, which xAI does not document for third-party
 //! clients and can change without notice. `models` reads the list of both
-//! accounts.
+//! accounts. `quota` reads the weekly plan allowance of the subscription.
 
 const std = @import("std");
 
 pub const Auth = @import("Auth.zig");
 pub const models = @import("models.zig");
 pub const oauth = @import("oauth.zig");
+pub const quota = @import("quota.zig");
 
 test {
     std.testing.refAllDecls(@This());

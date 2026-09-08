@@ -82,21 +82,22 @@ pub const Stats = struct {
     /// all-zero prompt hides the cache rate, so a cleared value reads as
     /// absent. A canceled attempt counts: its prompt was processed and billed.
     cache_usage: llm.Usage = .{},
-    /// The active subscription account's remaining allowance, adopted from each
-    /// response head that carries one. This includes a head whose stream then
-    /// errors or is canceled, so an exhausted 429 still updates it. A head that
-    /// omits one leaves it unchanged. The value is null until a head reports one.
-    /// An account switch clears it. API-key accounts report none.
+    /// The active subscription account's remaining allowance. A response head
+    /// that carries one replaces it, and so does an xAI billing report after
+    /// each model reply. This includes a head whose stream then errors or is
+    /// canceled, so an exhausted 429 still updates it. A report that omits one
+    /// leaves it unchanged. The value is null until a report arrives. An account
+    /// switch clears it. API-key accounts report none.
     quota: ?llm.Quota = null,
-    /// The monotonic milliseconds at which a head last stated `quota`, counted
+    /// The monotonic milliseconds at which a report last stated `quota`, counted
     /// on the clock that includes a suspended system, because a window runs on
     /// the server while the machine sleeps. A window states its reset relative
-    /// to its own response, so a consumer subtracts this from its own reading of
-    /// that clock to show the wait that is left. A head that omits the allowance
-    /// leaves this alone, so a kept countdown keeps running down instead of
-    /// starting again. It travels with the stats, so a failed turn and a
-    /// canceled turn both carry the right age. The value is relative to this
-    /// process alone, so a save must drop it and a restart must read it as
+    /// to its own report, so a consumer subtracts this from its own reading of
+    /// that clock to show the wait that is left. A report that omits the
+    /// allowance leaves this alone, so a kept countdown keeps running down
+    /// instead of starting again. It travels with the stats, so a failed turn
+    /// and a canceled turn both carry the right age. The value is relative to
+    /// this process alone, so a save must drop it and a restart must read it as
     /// unknown.
     quota_seen_ms: i64 = 0,
 };
@@ -232,6 +233,10 @@ const ClientFetch = struct {
 
     fn renewCredential(self: *ClientFetch) !bool {
         return self.client.renewCredential();
+    }
+
+    fn fetchQuota(self: *ClientFetch) !?llm.Quota {
+        return self.client.fetchQuota();
     }
 };
 
@@ -614,6 +619,12 @@ fn runRounds(
         // A no-tool reply commits here. A tool-calling reply committed itself
         // together with its reserved results before dispatch.
         if (!ran_tools) try self.commitRound(turn, handler);
+        // Billing is a status-line number. It runs after the round commits, so
+        // a cancel cannot drop a finished reply, and tools never wait on the
+        // proxy. It runs before the skill drain, so a cancel has no uncommitted
+        // skill message to roll back. The next model request and the end of the
+        // turn still wait.
+        try self.refreshQuota(fetch, turn, handler);
         // Send every skill file that this round asked for, before the steering
         // of the user. A tool met a file that a rule guards, so the model needs
         // the rules of that file for whatever it does next.
@@ -787,17 +798,15 @@ fn fetchReply(
         };
         defer stream.deinit();
         // The response head carries the subscription allowance before any events,
-        // so adopt it as soon as the stream is established. A stream that then
-        // errors, is canceled, or never reaches its terminal `.stop` still
-        // updates the gauge. The most visible case is an exhausted 429 that
-        // reports a spent account. A head that reports none leaves the last-known
-        // allowance. The stamp uses the clock the interface ages it against, so
-        // the countdown measures from this head and not from the terminal event
-        // of a long stream.
-        if (stream.quotaSoFar()) |quota| {
-            self.stats.quota = quota;
-            self.stats.quota_seen_ms = std.Io.Timestamp.now(self.io, .boot).toMilliseconds();
-        }
+        // so adopt it as soon as the stream is established. adoptQuota publishes
+        // the snapshot, so a 429 head shows a spent account before the failure.
+        // A stream that then errors, is canceled, or never reaches its terminal
+        // `.stop` still updates the gauge. A head that reports none leaves the
+        // last-known allowance. The stamp uses the clock the interface ages it
+        // against, so the countdown measures from this head and not from the
+        // terminal event of a long stream.
+        const maybe_head = stream.quotaSoFar();
+        if (maybe_head) |quota| try self.adoptQuota(quota, turn, handler);
 
         if (!stream.ok()) {
             // The provider rejected the credential. Another instance can have
@@ -879,6 +888,25 @@ fn fetchReply(
         };
         return reply;
     }
+}
+
+/// Read the billing allowance after a committed round. Anthropic and OpenAI
+/// already stated theirs in the response head, and a live account never states
+/// both, so a null billing body cannot replace a head snapshot. A timeout or a
+/// refused GET leaves the last-known gauge. A cancel or an allocation failure
+/// ends the turn and keeps the round.
+fn refreshQuota(self: *Agent, fetch: anytype, turn: *TurnState, handler: anytype) !void {
+    const maybe_quota = fetch.fetchQuota() catch |err| switch (err) {
+        error.Canceled, error.OutOfMemory => return err,
+        else => return,
+    };
+    if (maybe_quota) |quota| try self.adoptQuota(quota, turn, handler);
+}
+
+fn adoptQuota(self: *Agent, quota: llm.Quota, turn: *TurnState, handler: anytype) !void {
+    self.stats.quota = quota;
+    self.stats.quota_seen_ms = std.Io.Timestamp.now(self.io, .boot).toMilliseconds();
+    try presentation(&turn.presentation_closed, handler.onUsage(self.stats));
 }
 
 /// Report the retry that is about to start, so the handler clears the rejected stream.
@@ -1765,6 +1793,11 @@ const ScriptedFetch = struct {
     /// true, and an API key reports false.
     renewal_changes: bool = false,
     renewal_error: ?anyerror = null,
+    /// The billing allowance of one scripted round, or null when this fetch
+    /// reports none. The agent reads it after the round commits.
+    quota_to_fetch: ?llm.Quota = null,
+    quota_fetches: usize = 0,
+    quota_error: ?anyerror = null,
 
     const Attempt = union(enum) { fail: anyerror, stream: ScriptedStream };
     const Stream = ScriptedStream;
@@ -1782,6 +1815,12 @@ const ScriptedFetch = struct {
         self.renewals += 1;
         if (self.renewal_error) |err| return err;
         return self.renewal_changes;
+    }
+
+    fn fetchQuota(self: *ScriptedFetch) !?llm.Quota {
+        self.quota_fetches += 1;
+        if (self.quota_error) |err| return err;
+        return self.quota_to_fetch;
     }
 };
 
@@ -4397,6 +4436,109 @@ test "the head that states an allowance stamps its own arrival" {
     try agent.runWith(&silent, "again", &handler);
     try std.testing.expectEqual(@as(f64, 12), agent.stats.quota.?.primary.?.used_percent);
     try std.testing.expectEqual(stamped, agent.stats.quota_seen_ms);
+}
+
+test "each committed round adopts a billing allowance" {
+    const gpa = std.testing.allocator;
+    var agent = scriptedAgent(gpa);
+    defer agent.deinit();
+    var handler: CaptureHandler = .{ .gpa = gpa };
+    defer handler.deinit();
+
+    const weekly: llm.Quota = .{ .primary = .{
+        .used_percent = 1,
+        .window_minutes = 10080,
+        .reset_seconds = 3600,
+    } };
+    var fetch: ScriptedFetch = .{
+        .attempts = &.{
+            .{ .stream = .{ .events = &tool_round_events } },
+            .{ .stream = .{ .events = &end_turn_events } },
+        },
+        .quota_to_fetch = weekly,
+    };
+    const outcome = agent.runTurnWith(&fetch, fake_tools, "go", &handler);
+    try std.testing.expect(outcome.disposition == .completed);
+    try std.testing.expectEqual(@as(usize, 2), fetch.sends);
+    try std.testing.expectEqual(@as(usize, 2), fetch.quota_fetches);
+    try std.testing.expectEqual(@as(f64, 1), agent.stats.quota.?.primary.?.used_percent);
+    try std.testing.expectEqual(@as(?u32, 10080), agent.stats.quota.?.primary.?.window_minutes);
+    try std.testing.expectEqual(@as(?u64, 3600), agent.stats.quota.?.primary.?.reset_seconds);
+    try std.testing.expect(agent.stats.quota_seen_ms > 0);
+}
+
+test "a response head adopts the allowance before the reply streams" {
+    const gpa = std.testing.allocator;
+    var agent = scriptedAgent(gpa);
+    defer agent.deinit();
+    var handler: CaptureHandler = .{ .gpa = gpa };
+    defer handler.deinit();
+
+    var fetch: ScriptedFetch = .{
+        .attempts = &.{.{ .stream = .{
+            .events = &end_turn_events,
+            .quota = .{ .primary = .{ .used_percent = 40, .window_minutes = 300 } },
+        } }},
+    };
+    try agent.runWith(&fetch, "go", &handler);
+    try std.testing.expectEqual(@as(f64, 40), agent.stats.quota.?.primary.?.used_percent);
+    try std.testing.expectEqual(@as(?u32, 300), agent.stats.quota.?.primary.?.window_minutes);
+    // Head publish, stop usage, and commit: three snapshots. Without the head
+    // publish the count would be two.
+    try std.testing.expectEqual(@as(usize, 3), handler.usage_count);
+}
+
+test "a failed billing read leaves the last-known allowance and continues the turn" {
+    const gpa = std.testing.allocator;
+    var agent = scriptedAgent(gpa);
+    defer agent.deinit();
+    var handler: CaptureHandler = .{ .gpa = gpa };
+    defer handler.deinit();
+
+    const weekly: llm.Quota = .{ .primary = .{ .used_percent = 1, .window_minutes = 10080 } };
+    agent.stats.quota = weekly;
+    var fetch: ScriptedFetch = .{
+        .attempts = &.{.{ .stream = .{ .events = &end_turn_events } }},
+        .quota_error = error.Timeout,
+    };
+    try agent.runWith(&fetch, "go", &handler);
+    try std.testing.expectEqual(@as(usize, 1), fetch.sends);
+    try std.testing.expectEqual(@as(usize, 1), fetch.quota_fetches);
+    try std.testing.expectEqual(@as(f64, 1), agent.stats.quota.?.primary.?.used_percent);
+}
+
+test "a canceled billing read keeps a finished reply" {
+    const gpa = std.testing.allocator;
+    var agent = scriptedAgent(gpa);
+    defer agent.deinit();
+    var handler: CaptureHandler = .{ .gpa = gpa };
+    defer handler.deinit();
+
+    var fetch: ScriptedFetch = .{
+        .attempts = &.{.{ .stream = .{ .events = &end_turn_events } }},
+        .quota_error = error.Canceled,
+    };
+    try std.testing.expectError(error.Canceled, agent.runWith(&fetch, "go", &handler));
+    try std.testing.expectEqual(@as(usize, 1), fetch.sends);
+    try std.testing.expectEqual(@as(usize, 1), fetch.quota_fetches);
+    try std.testing.expectEqual(@as(usize, 2), agent.items.items.len);
+}
+
+test "an out-of-memory billing read fails the turn and keeps the reply" {
+    const gpa = std.testing.allocator;
+    var agent = scriptedAgent(gpa);
+    defer agent.deinit();
+    var handler: CaptureHandler = .{ .gpa = gpa };
+    defer handler.deinit();
+
+    var fetch: ScriptedFetch = .{
+        .attempts = &.{.{ .stream = .{ .events = &end_turn_events } }},
+        .quota_error = error.OutOfMemory,
+    };
+    try std.testing.expectError(error.OutOfMemory, agent.runWith(&fetch, "go", &handler));
+    try std.testing.expectEqual(@as(usize, 1), fetch.sends);
+    try std.testing.expectEqual(@as(usize, 1), fetch.quota_fetches);
+    try std.testing.expectEqual(@as(usize, 2), agent.items.items.len);
 }
 
 // The user wrote the message against a reply that was still streaming, so the

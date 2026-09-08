@@ -75,6 +75,20 @@ pub const Client = struct {
         };
     }
 
+    /// The subscription allowance of this account when it lives outside the
+    /// response head, or null when the account reports none here. The xAI
+    /// subscription reads a billing endpoint. Anthropic and OpenAI state the
+    /// allowance in the response head instead.
+    pub fn fetchQuota(self: *Client) !?llm.Quota {
+        switch (self.credentials) {
+            .xai_subscription => |auth| {
+                const token = try auth.accessToken();
+                return xai.quota.fetch(self.gpa, self.io, token);
+            },
+            else => return null,
+        }
+    }
+
     /// Open a streaming request for `request` and fill `out` in place. On
     /// success the caller owns `out` and must `deinit` it.
     pub fn send(self: *Client, out: *Stream, request: *const llm.Request) !void {
@@ -333,4 +347,33 @@ test "quotaSoFar reads the head allowance through the stream seam" {
     // A head that stated none reports none.
     claude.anthropic_subscription.quota = null;
     try std.testing.expect(claude.quotaSoFar() == null);
+}
+
+test "fetchQuota is a billing read of the xAI subscription alone" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    for ([_]Credentials{
+        .{ .anthropic_api = "sk-ant" },
+        .{ .anthropic_console = "sk-ant-api03" },
+        .{ .openai_api = "sk-test" },
+        .{ .xai_api = "xai-test" },
+    }) |credentials| {
+        var client = Client.init(gpa, io, credentials, .{});
+        try std.testing.expect(try client.fetchQuota() == null);
+    }
+
+    var auth: xai.Auth = .{
+        .gpa = gpa,
+        .io = io,
+        .timeouts = .{},
+        .path = "",
+        .tokens = .{
+            .access = try gpa.dupe(u8, "token\r\nleaked"),
+            .refresh = try gpa.dupe(u8, "rt"),
+            .expires_ms = std.math.maxInt(i64),
+        },
+    };
+    defer auth.tokens.?.deinit(gpa);
+    var grok = Client.init(gpa, io, .{ .xai_subscription = &auth }, .{});
+    try std.testing.expectError(error.BadCredentials, grok.fetchQuota());
 }

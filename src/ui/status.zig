@@ -51,16 +51,17 @@ pub const Info = struct {
     /// none (an API key, or a non-subscription turn). Each window whose duration
     /// identifies it shows on the left as `<label>: N% (<wait>)`.
     quota: ?ai.llm.Quota,
-    /// The time since the response that carried the quota. The reset of a
-    /// window ages with that response, so the line subtracts this to show the
-    /// wait that is left now.
+    /// The time since the report that carried the quota. The reset of a window
+    /// ages with that report, so the line subtracts this to show the wait that
+    /// is left now.
     quota_age_ms: i64,
-    /// Whether a turn runs. The quota and the cache rate each measure one
-    /// request, so both show while a turn runs and go when it ends. An idle
-    /// Drinky paints no frame, which freezes a countdown on the screen. The
-    /// share is no safer: another agent on the same account spends the same
-    /// allowance, so an idle number can read too low, and it reads too high
-    /// once the window starts again. Only a response head states the truth.
+    /// Whether a turn runs. The quota is a live subscription allowance, and the
+    /// cache rate measures one request, so both show while a turn runs and go
+    /// when it ends. An idle Drinky paints no frame, which freezes a countdown
+    /// on the screen. The share is no safer: another agent on the same account
+    /// spends the same allowance, so an idle number can read too low, and it
+    /// reads too high once the window starts again. Only a fresh report from
+    /// the provider states the truth.
     turn_active: bool,
     /// The shares at which a gauge takes a color. The default is the compiled
     /// pair, so a caller that configures none keeps it.
@@ -427,9 +428,10 @@ fn writeLeft(line: *Line, info: *const Info, parts: *const Parts) !void {
     }
     try writeContext(line, info, parts.context);
     if (parts.cost) try writeCost(line, info);
-    // The quota and the cache rate each measure one request, so they belong to
-    // a running turn alone. A spent OpenAI subscription still names its plan and
-    // its wait in the failure message of the turn.
+    // The quota is a live subscription allowance, and the cache rate measures
+    // one request, so they belong to a running turn alone. A spent OpenAI
+    // subscription still names its plan and its wait in the failure message of
+    // the turn.
     if (!info.turn_active) return;
     if (info.quota) |quota| {
         const windows = orderedWindows(&quota);
@@ -622,9 +624,10 @@ fn writeWait(out: *std.Io.Writer, seconds: u64) !void {
     return out.print("{d}d", .{@divFloor(seconds, day)});
 }
 
-/// A compact label for a rolling window, keyed off its length in minutes. Both
-/// subscription backends use a 5h and a weekly window. Unrecognized or absent
-/// lengths stay hidden rather than show as an allowance we cannot identify.
+/// A compact label for a rolling window, keyed off its length in minutes.
+/// Anthropic and OpenAI use a 5h window and a weekly window. An xAI
+/// subscription uses a weekly window. Unrecognized or absent lengths stay
+/// hidden rather than show as an allowance we cannot identify.
 fn quotaLabel(maybe_minutes: ?u32) ?[]const u8 {
     const minutes = maybe_minutes orelse return null;
     if (approxWindow(minutes, 300)) return "5h";

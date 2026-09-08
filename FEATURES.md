@@ -338,9 +338,10 @@ and to Gemini on Google Vertex AI through a service account key file.
   change to any of the three hides it. Two effort levels that resolve to one wire form share the
   cache. A canceled attempt still rates its own prompt.
 - A subscription window reads `5h: 12% (53m)`: the share used, and the wait until it resets. The
-  wait shows one unit and rounds down: `53m`, `22h`, `6d`. The shortest window prints first. Both
-  subscription backends state the allowance in the response head.
-- The quota and the cache-hit rate show while a turn runs. Each one measures one request.
+  wait shows one unit and rounds down: `53m`, `22h`, `6d`. The shortest window prints first.
+  Anthropic and OpenAI state the allowance in the response head of each request. Drinky reads the
+  xAI subscription allowance after each model reply. An API-key account reports none.
+- The quota and the cache-hit rate show while a turn runs. The cache-hit rate measures one request.
 - The context gauge and each quota window take the warning color from 75% used and the error color
   from 90% used. The config sets both shares. A color on this line always means pressure, and the
   color follows the printed share.
