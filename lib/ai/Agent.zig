@@ -989,13 +989,14 @@ fn recordUsage(self: *Agent, model: *const Model, usage: *const llm.Usage) void 
 }
 
 /// The model that prices one reply: the requested one, or the one the response
-/// names as the model that served it. Drinky knows no rate for a model it did
-/// not request, so a served reply carries no price. A served name that no model
-/// can hold keeps the requested name and drops the price, because the rates of
-/// one model never price another. The session total then counts nothing for
-/// that reply.
+/// names as the model that served it. A provider names the id behind an alias,
+/// and the requested model knows that id, so such a reply keeps its rates.
+/// Drinky knows no rate for a model it did not request, so a served reply
+/// carries no price. A served name that no model can hold keeps the requested
+/// name and drops the price, because the rates of one model never price
+/// another. The session total then counts nothing for that reply.
 fn pricingModel(requested: *const Model, served_name: []const u8) Model {
-    if (served_name.len == 0 or requested.sameName(served_name)) return requested.*;
+    if (served_name.len == 0 or requested.serves(served_name)) return requested.*;
     return Model.init(served_name) catch {
         var unpriced = requested.*;
         unpriced.price = null;
@@ -1096,7 +1097,7 @@ fn readReplyWith(
     // cannot discard. The attempt that lands reports the switch. It reports
     // before the commit below, so a closed presentation channel cannot fail
     // the reply after history already owns its items.
-    if (stop.model.len != 0 and !model.sameName(stop.model))
+    if (stop.model.len != 0 and !model.serves(stop.model))
         try presentation(presentation_closed, handler.onModelMismatch(.{
             .requested = model.name(),
             .served = stop.model,
@@ -2104,7 +2105,7 @@ fn appendProof(agent: *Agent, account: llm.Account) !void {
             @tagName(tag),
             .{ .signature = .{ .text = text, .signature = proof } },
         ),
-        inline .openai_subscription, .openai_api => |tag| replay: {
+        inline .openai_subscription, .openai_api, .xai_subscription, .xai_api => |tag| replay: {
             const id = try gpa.dupe(u8, "rs_1");
             break :replay @unionInit(
                 llm.Item.Reasoning.Replay,
@@ -2275,6 +2276,29 @@ test "readReply prices a reply that the requested model served" {
     // The requested model served the reply, so its own rates price it.
     try std.testing.expectEqual(agent.model.?.cost(&usage), agent.stats.cost);
     try std.testing.expectEqual(usage, agent.stats.cache_usage);
+}
+
+// A provider names the id behind an alias as the model that served the reply.
+// The alias knows that id, so the reply is its own: no switch reports, and its
+// rates price the reply.
+test "readReply reads the id behind an alias as the requested model" {
+    const gpa = std.testing.allocator;
+    var agent = scriptedAgent(gpa);
+    defer agent.deinit();
+    var handler: CaptureHandler = .{ .gpa = gpa };
+    defer handler.deinit();
+    try agent.model.?.serveAs("claude-opus-4-8-20260101");
+
+    const usage: llm.Usage = .{ .input = 1_000_000, .output = 10_000 };
+    const events = [_]llm.Event{
+        .{ .item = .{ .message = "done" } },
+        .{ .stop = .{ .usage = usage, .model = "claude-opus-4-8-20260101" } },
+    };
+    var stream: ScriptedStream = .{ .events = &events };
+    _ = try agent.readReply(&agent.model.?, &stream, &handler);
+
+    try std.testing.expectEqual(@as(usize, 0), handler.model_mismatches.items.len);
+    try std.testing.expectEqual(agent.model.?.cost(&usage), agent.stats.cost);
 }
 
 // Drinky knows no rate for a model it did not request, so the reply carries no

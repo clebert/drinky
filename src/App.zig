@@ -511,6 +511,19 @@ const OauthPrompt = struct {
         try self.writer.flush();
     }
 
+    /// The device-code flow: the page asks for the code when the URL does not
+    /// carry it, and a second device can type both.
+    pub fn showDeviceCode(self: *OauthPrompt, url: []const u8, code: []const u8) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        try self.writer.writeAll("Open this URL to authorize Drinky:\n\n");
+        try self.writeText(url);
+        try self.writer.writeAll("\n\nEnter this code if the page asks for one: ");
+        try self.writeText(code);
+        try self.writer.writeAll("\n\nDrinky waits for the authorization.\n");
+        try self.writer.flush();
+    }
+
     pub fn showBrowserLaunchFailed(self: *OauthPrompt) !void {
         try self.show("Drinky could not open the browser. Open the URL above.\n");
     }
@@ -2513,7 +2526,8 @@ fn loginAccount(self: *App, account: ai.llm.Account) !void {
 /// shows an error page whose address bar still holds the callback URL. A
 /// paste of that URL replays into the same listener, so one wait serves both
 /// paths. Without a port or without concurrency the login runs plain, with no
-/// paste path.
+/// paste path. A device-code login has no port: the poll of its grant is the
+/// whole wait.
 fn runLogin(self: *App, account: ai.llm.Account, prompt: *OauthPrompt) !ai.Accounts.Login {
     const port = ai.Accounts.callbackPort(account) orelse
         return self.accounts.login(account, prompt);
@@ -2585,9 +2599,12 @@ fn reportLoginFailure(self: *App, login_error: anyerror) !void {
             "set a browser time limit.",
         // The redirect reports a refusal, a scope fault, and a provider fault
         // under one parameter. The code of the failure reaches no report, so
-        // one sentence covers the whole set.
-        error.AuthorizationFailed => "The provider did not authorize Drinky. " ++
-            "Start the sign-in again.",
+        // one sentence covers the whole set. A device-code grant that the user
+        // refused reads the same way.
+        error.AuthorizationFailed, error.AuthorizationDenied => "The provider did not " ++
+            "authorize Drinky. Start the sign-in again.",
+        error.DeviceCodeExpired => "Drinky stopped the sign-in because the authorization did " ++
+            "not arrive in time.",
         // The redirect carries the state of an earlier sign-in. A tab left open
         // and a paste of its URL both deliver one, so the sentence names no
         // source.
@@ -3808,9 +3825,13 @@ test "OAuth prompts render runtime fields as inert text" {
     try prompt.showPasteFailed("ConnectionRefused");
     try prompt.showPasteLate();
     try prompt.showPasteStopped();
+    try prompt.showDeviceCode("https://example.test/activate", "AB\x1bCD");
 
     const written = out.written();
     try std.testing.expect(std.mem.indexOf(u8, written, "paste the URL") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "if the page asks for one: AB") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "AB\x1bCD") == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "waits for the authorization") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "not the callback URL") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "too long for a callback URL") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "error ConnectionRefused") != null);
@@ -4001,6 +4022,18 @@ test "a login the provider refused reads as a sentence, not an error name" {
     try app.reportLoginFailure(error.AuthorizationFailed);
     try std.testing.expectEqualStrings(
         "The provider did not authorize Drinky. Start the sign-in again.",
+        app.session.notice.?.content,
+    );
+    // A refused device-code grant reads the same way, and a grant that ran out
+    // names the wait.
+    try app.reportLoginFailure(error.AuthorizationDenied);
+    try std.testing.expectEqualStrings(
+        "The provider did not authorize Drinky. Start the sign-in again.",
+        app.session.notice.?.content,
+    );
+    try app.reportLoginFailure(error.DeviceCodeExpired);
+    try std.testing.expectEqualStrings(
+        "Drinky stopped the sign-in because the authorization did not arrive in time.",
         app.session.notice.?.content,
     );
     // A stale tab and a stale paste both deliver a redirect of an earlier

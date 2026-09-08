@@ -25,6 +25,11 @@ pub const tokens_max_fallback = 4096;
 
 name_buffer: [name_bytes_max]u8,
 name_length: u8,
+/// The id that the provider answers under when the name is an alias of it. A
+/// response names this id as the model that served the reply. Empty when the
+/// name is the id itself.
+served_buffer: [name_bytes_max]u8,
+served_length: u8,
 /// The levels the provider named for this model.
 efforts: std.EnumSet(llm.Effort),
 /// Whether the vendor stated that this model takes no effort level at all. An
@@ -65,6 +70,8 @@ pub fn init(id: []const u8) error{BadModelName}!Model {
     var model: Model = .{
         .name_buffer = undefined,
         .name_length = @intCast(id.len),
+        .served_buffer = undefined,
+        .served_length = 0,
         .efforts = .initEmpty(),
         .efforts_denied = false,
         .thinking = .unknown,
@@ -94,6 +101,28 @@ pub fn name(self: *const Model) []const u8 {
     return self.name_buffer[0..self.name_length];
 }
 
+/// Record that the name is an alias of `id`, which the provider names in every
+/// reply. An id the name buffer cannot hold names no model Drinky can request,
+/// like a bad name in `init`.
+pub fn serveAs(self: *Model, id: []const u8) error{BadModelName}!void {
+    if (id.len == 0 or id.len > name_bytes_max) return error.BadModelName;
+    if (!requestSafe(id)) return error.BadModelName;
+    @memcpy(self.served_buffer[0..id.len], id);
+    self.served_length = @intCast(id.len);
+}
+
+/// The id behind an alias, or empty when the name is the id itself.
+pub fn servedName(self: *const Model) []const u8 {
+    return self.served_buffer[0..self.served_length];
+}
+
+/// Whether a reply that a provider names as `served` came from this model: the
+/// name itself, or the id behind an alias. A reply from any other name came from
+/// a provider-side fallback.
+pub fn serves(self: *const Model, served: []const u8) bool {
+    return self.sameName(served) or std.mem.eql(u8, self.servedName(), served);
+}
+
 /// Record that the provider named `level` for this model.
 pub fn addEffort(self: *Model, level: llm.Effort) void {
     self.efforts.insert(level);
@@ -111,6 +140,7 @@ pub fn sameName(self: *const Model, other: []const u8) bool {
 /// the whole value can stand in for this one.
 pub fn eql(self: *const Model, other: *const Model) bool {
     return self.sameName(other.name()) and
+        std.mem.eql(u8, self.servedName(), other.servedName()) and
         self.efforts.eql(other.efforts) and
         self.efforts_denied == other.efforts_denied and
         self.thinking == other.thinking and
@@ -176,8 +206,8 @@ pub fn outputLimitUnknown(self: *const Model, account: llm.Account) bool {
     return switch (account.provider()) {
         // The Anthropic wire requires `max_tokens` in every request.
         .anthropic => true,
-        // Neither wire sends a cap, so the budget of the model governs.
-        .openai, .google => false,
+        // None of these wires sends a cap, so the budget of the model governs.
+        .openai, .xai, .google => false,
     };
 }
 
@@ -285,6 +315,32 @@ test eql {
     var thinks = init("claude-opus-5") catch unreachable;
     thinks.thinking = .supported;
     try std.testing.expect(!fetched.eql(&thinks));
+
+    var aliased = init("claude-opus-5") catch unreachable;
+    aliased.serveAs("claude-opus-5-20260101") catch unreachable;
+    try std.testing.expect(!fetched.eql(&aliased));
+}
+
+// A provider names the id behind an alias as the model that served a reply, so
+// a model that knows that id reads such a reply as its own, and every other
+// name as a fallback.
+test serves {
+    var alias = try init("grok-4.20");
+    try std.testing.expect(alias.serves("grok-4.20"));
+    try std.testing.expect(!alias.serves("grok-4.20-0309-reasoning"));
+    try std.testing.expectEqualStrings("", alias.servedName());
+
+    try alias.serveAs("grok-4.20-0309-reasoning");
+    try std.testing.expectEqualStrings("grok-4.20-0309-reasoning", alias.servedName());
+    try std.testing.expect(alias.serves("grok-4.20"));
+    try std.testing.expect(alias.serves("grok-4.20-0309-reasoning"));
+    try std.testing.expect(!alias.serves("grok-4.20-0309"));
+    try std.testing.expect(!alias.serves(""));
+
+    // The served id must travel in a request line like a name.
+    try std.testing.expectError(error.BadModelName, alias.serveAs(""));
+    try std.testing.expectError(error.BadModelName, alias.serveAs("grok 4"));
+    try std.testing.expectError(error.BadModelName, alias.serveAs("x" ** (name_bytes_max + 1)));
 }
 
 test "a fold takes the nearest level and prefers the lower one on a tie" {

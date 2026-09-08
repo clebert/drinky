@@ -1,11 +1,12 @@
-//! The credential lifecycle that both subscription OAuth accounts share. Load
+//! The credential lifecycle that every subscription OAuth account shares. Load
 //! and persist a provider's tokens under its `account_key` in the keyed
 //! `auth.json` store. Refresh a stale access token on demand, and reload the
 //! store once when that refresh fails, because the token rotates. Retry a save
 //! after temporary store contention. Stop before a model request when the store
 //! holds another principal. Run the interactive login (browser + loopback
-//! callback). Forget a credential the provider rejected, and keep a replacement
-//! another instance saved. Generic over each provider's `Auth` file struct
+//! callback, or browser + device-code poll). Forget a credential the provider
+//! rejected, and keep a replacement another instance saved. Generic over each
+//! provider's `Auth` file struct
 //! (`gpa`/`io`/`timeouts`/`path`/`tokens` fields): the on-disk entry mirrors the
 //! provider's `Tokens` fields.
 //! Every save is a load-merge-write through `json_store` that never clobbers
@@ -15,6 +16,7 @@
 const std = @import("std");
 
 const json_store = @import("json_store.zig");
+const net = @import("net.zig");
 const oauth_callback = @import("oauth_callback.zig");
 const oauth_login = @import("oauth_login.zig");
 const oauth_wire = @import("oauth_wire.zig");
@@ -272,6 +274,52 @@ pub fn login(
     }
 
     return commit(auth, account_key, try exchangeFn(auth, &redirect, &pair));
+}
+
+/// Run the interactive device-code login (RFC 8628) and report pre-commit
+/// runtime text through the caller's presentation boundary. `oauth` is the
+/// provider protocol module: `requestDevice` opens the grant, and `poll` asks
+/// for its tokens. Once tokens are installed, the function returns a non-error
+/// persistence outcome, exactly as `login` does.
+pub fn loginDevice(
+    auth: anytype,
+    comptime account_key: []const u8,
+    comptime oauth: type,
+    prompt: anytype,
+) !Login {
+    const device = try oauth.requestDevice(auth.gpa, auth.io, auth.timeouts);
+    defer device.deinit(auth.gpa);
+
+    const tokens = try oauth_login.poll(oauth.Tokens, &.{
+        .url = device.url(),
+        .code = device.user_code,
+        .interval_ms = device.interval_ms,
+        .lifetime_ms = device.lifetime_ms,
+        .prompt = prompt,
+        .browser = oauth_login.Browser{ .io = auth.io },
+        .clock = oauth_login.Clock{ .io = auth.io },
+        .poller = DevicePoller(oauth){
+            .gpa = auth.gpa,
+            .io = auth.io,
+            .timeouts = auth.timeouts,
+            .device_code = device.device_code,
+        },
+    });
+    return commit(auth, account_key, tokens);
+}
+
+/// One poll of a device-code grant through the protocol module `oauth`.
+fn DevicePoller(comptime oauth: type) type {
+    return struct {
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        timeouts: net.Timeouts,
+        device_code: []const u8,
+
+        pub fn poll(self: @This()) !oauth_login.Poll(oauth.Tokens) {
+            return oauth.poll(self.gpa, self.io, self.timeouts, self.device_code);
+        }
+    };
 }
 
 /// Install exchanged tokens and report whether they reached disk. Installation

@@ -90,7 +90,7 @@ test "the picker lists every account, marking the active and authenticated ones"
                 gpa.free(pick.options);
             }
             try std.testing.expectEqualStrings("Sign in", pick.title);
-            try std.testing.expectEqual(@as(usize, 6), pick.options.len);
+            try std.testing.expectEqual(@as(usize, 8), pick.options.len);
             try std.testing.expectEqualStrings(
                 "Anthropic Subscription (Signed in)",
                 pick.options[0],
@@ -99,7 +99,9 @@ test "the picker lists every account, marking the active and authenticated ones"
             try std.testing.expectEqualStrings("Anthropic API (Active)", pick.options[2]);
             try std.testing.expectEqualStrings("OpenAI Subscription", pick.options[3]);
             try std.testing.expectEqualStrings("OpenAI API", pick.options[4]);
-            try std.testing.expectEqualStrings("Google Vertex", pick.options[5]);
+            try std.testing.expectEqualStrings("xAI Subscription", pick.options[5]);
+            try std.testing.expectEqualStrings("xAI API", pick.options[6]);
+            try std.testing.expectEqualStrings("Google Vertex", pick.options[7]);
             try std.testing.expect(pick.current == null);
         },
         else => return error.ExpectedPick,
@@ -138,7 +140,7 @@ test "the picker marks a loaded key file, a failed one, and an API key apart" {
     defer gpa.free(failed);
     try std.testing.expectEqualStrings("Google Vertex (Key file not loaded)", failed);
     try Context.Outcome.expectNoticeContaining(
-        try select(&context, 5),
+        try select(&context, 7),
         .failure,
         "because of error FileNotFound",
     );
@@ -149,7 +151,7 @@ test "the picker marks a loaded key file, a failed one, and an API key apart" {
     defer gpa.free(absent);
     try std.testing.expectEqualStrings("Google Vertex", absent);
     try Context.Outcome.expectNoticeContaining(
-        try select(&context, 5),
+        try select(&context, 7),
         .information,
         "GOOGLE_CLOUD_LOCATION",
     );
@@ -175,6 +177,15 @@ test "select starts login, instructs an API account, and no-ops the active one" 
         try select(&context, 4),
         .information,
         "OPENAI_API_KEY",
+    );
+    switch (try select(&context, 5)) {
+        .login => |account| try std.testing.expectEqual(llm.Account.xai_subscription, account),
+        else => return error.ExpectedLogin,
+    }
+    try Context.Outcome.expectNoticeContaining(
+        try select(&context, 6),
+        .information,
+        "XAI_API_KEY",
     );
     try Context.Outcome.expectNoticeContaining(
         try select(&context, 2),

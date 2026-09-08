@@ -30,6 +30,21 @@ extension seams.
 
 ## Improvements
 
+- **A sign-in that Esc cancels** — every login runs on a worker, so the interface keeps painting and
+  reading keys, and Esc cancels the sign-in. _The cooked terminal delivers Esc only with Enter and
+  turns Ctrl+C into SIGINT, so a sign-in that Esc cancels stays in raw mode. A transcript event
+  holds the URL and the code, the picker closes, and the footer offers `Esc: Cancel sign-in`. During
+  a sign-in, Enter on a line that is the callback URL replays it to the listener, and Enter on any
+  other line is refused with a notice that names the sign-in. The device login shows its user code
+  the same way, and the cancel ends its poll._
+- **Bill a long xAI prompt at the long-context rate** — the session cost applies the long-context
+  rates of an xAI model to a request whose prompt reaches the threshold of that model. _OpenRouter
+  states one rate per model and no threshold. The xAI list `GET /v1/models`, which Drinky reads,
+  states `long_context_threshold` and one `*_long_context` rate per token kind, in USD cents per 100
+  million tokens, beside `context_length`. The same list holds image and video models with a window
+  and an `image_price`, and a chat model alone states `completion_text_token_price`. xAI bills every
+  token of such a request at the higher rate. Gemini Pro bills a tier above 200k tokens too, but no
+  runtime source states it, so the entry keeps to xAI._
 - **Show a model that no source describes** — such a model takes a disabled picker row that names
   what it lacks, and its selection opens the hint for the config key. _`Catalog.merge` returns null
   and the caller drops the model today, so it leaves the picker with no line. A picker row carries

@@ -1,9 +1,9 @@
 //! The Responses API transport. It sends a serialized request to a configured
 //! endpoint with the correct auth identity. It exposes the response as a pull
 //! stream of decoded SSE `response.*` events on the shared `sse` engine.
-//! The API-key and ChatGPT-subscription providers share it and differ only
-//! in `endpoint` and whether `account_id` is set. It knows nothing about
-//! conversation state or tools.
+//! Every Responses account shares it: the OpenAI API key, the ChatGPT
+//! subscription, and both xAI accounts differ only in `endpoint` and whether
+//! `account_id` is set. It knows nothing about conversation state or tools.
 
 const std = @import("std");
 
@@ -60,7 +60,8 @@ pub const Stream = struct {
     incomplete_message: bool,
     /// Where the streamed reasoning display stands (see `sse.Reasoning`).
     reasoning: sse.Reasoning,
-    /// The `summary_index` of the reasoning part now streaming. An index that
+    /// The index of the reasoning part now streaming: the `summary_index` of a
+    /// summary part, or the `content_index` of a raw text part. An index that
     /// differs from it ends the part before it, so a stream that sends no
     /// `reasoning_summary_part.added` frame still separates its parts.
     summary_index: i64,
@@ -382,7 +383,17 @@ pub const Stream = struct {
     /// The `summary_index` of one reasoning frame, or null when the frame holds
     /// no valid index.
     fn summaryIndex(object: *const std.json.ObjectMap) ?i64 {
-        const index = json.integer(object.get("summary_index")) orelse return null;
+        return nonnegative(object.get("summary_index"));
+    }
+
+    /// The `content_index` of one raw reasoning text frame, or null when the
+    /// frame holds no valid index.
+    fn contentIndex(object: *const std.json.ObjectMap) ?i64 {
+        return nonnegative(object.get("content_index"));
+    }
+
+    fn nonnegative(value: ?std.json.Value) ?i64 {
+        const index = json.integer(value) orelse return null;
         return if (index < 0) null else index;
     }
 
@@ -516,6 +527,12 @@ pub const Stream = struct {
             // A frame with no index of its own continues the open part.
             return self.summaryPart(summaryIndex(&object) orelse self.summary_index, delta);
         }
+        if (std.mem.eql(u8, kind, "response.reasoning_text.delta")) {
+            const delta = json.string(object.get("delta")) orelse return .progress;
+            // A model that returns its raw reasoning streams it in content
+            // parts. The display treats such a part like a summary part.
+            return self.summaryPart(contentIndex(&object) orelse self.summary_index, delta);
+        }
         if (std.mem.eql(u8, kind, "response.reasoning_summary_part.added"))
             return self.reasoningPartAdded(&object);
         if (std.mem.eql(u8, kind, "response.output_item.added"))
@@ -524,6 +541,7 @@ pub const Stream = struct {
             return self.callArguments(&object);
         if (std.mem.eql(u8, kind, "response.reasoning_summary_text.done") or
             std.mem.eql(u8, kind, "response.reasoning_summary_part.done") or
+            std.mem.eql(u8, kind, "response.reasoning_text.done") or
             std.mem.eql(u8, kind, "response.function_call_arguments.done"))
         {
             return .progress;
@@ -646,6 +664,8 @@ fn errorMessage(object: std.json.ObjectMap) ?[]const u8 {
     if (json.object(object.get("error"))) |detail| {
         if (json.string(detail.get("message"))) |message| return message;
     }
+    // The xAI API states its message as the bare `error` string.
+    if (json.string(object.get("error"))) |message| return message;
     if (json.object(object.get("response"))) |response| {
         if (json.object(response.get("error"))) |detail| return json.string(detail.get("message"));
     }
@@ -1142,6 +1162,36 @@ test "reasoning deltas are display-only and done items are authoritative" {
     try std.testing.expectEqualStrings("final a\n\nfinal b", reasoning.text);
     try std.testing.expectEqualStrings("rs_1", reasoning.id);
     try std.testing.expectEqualStrings("enc", reasoning.encrypted_content);
+}
+
+// A model that returns its raw reasoning streams `reasoning_text` deltas in
+// place of summary deltas. They reach the same block, part by part.
+test "raw reasoning text deltas display like summary deltas" {
+    var stream = testStream(undefined, undefined, 0, 0);
+    defer stream.deinitDecode();
+
+    try std.testing.expectEqualStrings("think", (try stream.decode(
+        \\{"type":"response.reasoning_text.delta","item_id":"rs_1","output_index":0,"content_index":0,"delta":"think"}
+    )).event.thinking);
+    _ = stream.frame_arena.reset(.retain_capacity);
+    try std.testing.expectEqualStrings(" more", (try stream.decode(
+        \\{"type":"response.reasoning_text.delta","item_id":"rs_1","output_index":0,"content_index":0,"delta":" more"}
+    )).event.thinking);
+    _ = stream.frame_arena.reset(.retain_capacity);
+    // A new content part starts on its own paragraph, and its done frame is
+    // progress alone.
+    try std.testing.expectEqualStrings("\n\nagain", (try stream.decode(
+        \\{"type":"response.reasoning_text.delta","item_id":"rs_1","output_index":0,"content_index":1,"delta":"again"}
+    )).event.thinking);
+    _ = stream.frame_arena.reset(.retain_capacity);
+    try std.testing.expectEqual(@as(sse.Decoded, .progress), try stream.decode(
+        \\{"type":"response.reasoning_text.done","item_id":"rs_1","output_index":0,"content_index":1,"text":"again"}
+    ));
+    _ = stream.frame_arena.reset(.retain_capacity);
+    // The answer ends the reasoning run, as it does after a summary.
+    try std.testing.expectEqualStrings("hi", (try stream.decode(
+        \\{"type":"response.output_text.delta","item_id":"msg_1","delta":"hi"}
+    )).event.text);
 }
 
 test "a new reasoning item separates its display from the item before it" {
@@ -1676,6 +1726,10 @@ test "describeError reduces a failed head's error body to its message" {
     )).?);
     try std.testing.expectEqualStrings("no account", (try stream.describeError(
         \\{"message":"no account"}
+    )).?);
+    // The xAI API answers with a code and a bare message string.
+    try std.testing.expectEqualStrings("Incorrect API key provided", (try stream.describeError(
+        \\{"code":"Client specified an invalid argument","error":"Incorrect API key provided"}
     )).?);
 
     // A truncated capture and a non-JSON page both keep the raw body.

@@ -11,6 +11,7 @@ pub fn main(init: std.process.Init) !void {
         .credentials = .{
             .anthropic = init.environ_map.get("ANTHROPIC_API_KEY"),
             .openai = init.environ_map.get("OPENAI_API_KEY"),
+            .xai = init.environ_map.get("XAI_API_KEY"),
             .google_key_path = init.environ_map.get("GOOGLE_APPLICATION_CREDENTIALS"),
             .google_location = init.environ_map.get("GOOGLE_CLOUD_LOCATION"),
         },

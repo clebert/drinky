@@ -1,6 +1,7 @@
-//! OAuth wire plumbing shared by the provider PKCE flows: verifier/challenge
-//! generation and bounded POST requests with decompression. This module reads
-//! the standard OAuth error code. Each provider parses its successful payload.
+//! OAuth wire plumbing shared by the provider flows: verifier/challenge
+//! generation, form bodies, and bounded POST requests with decompression. This
+//! module reads the standard OAuth error code. Each provider parses its
+//! successful payload.
 
 const std = @import("std");
 
@@ -12,6 +13,8 @@ const token_response_bytes_max = 256 * 1024;
 
 const verifier_len = std.base64.url_safe_no_pad.Encoder.calcSize(32);
 
+pub const form_content_type = "application/x-www-form-urlencoded";
+
 pub const Pkce = struct {
     verifier: [verifier_len]u8,
     challenge: [verifier_len]u8,
@@ -20,6 +23,12 @@ pub const Pkce = struct {
 pub const BearerOptions = struct {
     url: []const u8,
     authorization: []const u8,
+};
+
+/// One field of a form body.
+pub const Field = struct {
+    name: []const u8,
+    value: []const u8,
 };
 
 /// A fresh PKCE verifier/challenge pair drawn from the Io's CSPRNG.
@@ -32,6 +41,29 @@ pub fn pkce(io: std.Io) Pkce {
     std.crypto.hash.sha2.Sha256.hash(&result.verifier, &digest, .{});
     _ = std.base64.url_safe_no_pad.Encoder.encode(&result.challenge, &digest);
     return result;
+}
+
+/// The form-urlencoded body of `fields`. Every byte outside the unreserved set
+/// percent-encodes, so a server value that holds a delimiter cannot split a
+/// field. The caller frees the result.
+pub fn formBody(gpa: std.mem.Allocator, fields: []const Field) error{OutOfMemory}![]u8 {
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    for (fields, 0..) |field, index| {
+        if (index != 0) out.writer.writeByte('&') catch return error.OutOfMemory;
+        std.Uri.Component.percentEncode(&out.writer, field.name, isUnreserved) catch
+            return error.OutOfMemory;
+        out.writer.writeByte('=') catch return error.OutOfMemory;
+        std.Uri.Component.percentEncode(&out.writer, field.value, isUnreserved) catch
+            return error.OutOfMemory;
+    }
+    return out.toOwnedSlice();
+}
+
+/// The unreserved set of RFC 3986, which every form-urlencoded decoder passes
+/// through unchanged.
+fn isUnreserved(byte: u8) bool {
+    return std.ascii.isAlphanumeric(byte) or std.mem.indexOfScalar(u8, "-._~", byte) != null;
 }
 
 /// POST `body` to an OAuth endpoint and return its owned success body. The
@@ -50,6 +82,26 @@ pub fn post(
         .content_type = content_type,
         .body = body,
         .error_body = .oauth,
+    };
+    return send(gpa, io, timeouts, &fetch);
+}
+
+/// POST the form `body` of a device-code grant (RFC 8628) and return the owned
+/// success body. The caller frees it. The poll answers of the grant read as
+/// errors of their own: `AuthorizationPending`, `SlowDown`,
+/// `AuthorizationDenied`, and `DeviceCodeExpired`.
+pub fn postDevice(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    timeouts: net.Timeouts,
+    url: []const u8,
+    body: []const u8,
+) ![]u8 {
+    const fetch: Fetch = .{
+        .url = url,
+        .content_type = form_content_type,
+        .body = body,
+        .error_body = .device,
     };
     return send(gpa, io, timeouts, &fetch);
 }
@@ -76,7 +128,21 @@ const Fetch = struct {
     authorization: ?[]const u8 = null,
     error_body: ErrorBody = .generic,
 
-    const ErrorBody = enum { generic, oauth };
+    /// What an error body of the endpoint states: nothing Drinky reads, the
+    /// standard OAuth code of a token exchange, or that code plus the poll
+    /// answers of a device-code grant.
+    const ErrorBody = enum { generic, oauth, device };
+};
+
+/// The standard OAuth error codes Drinky acts on. Every other code is a plain
+/// failure.
+const Code = enum {
+    invalid_grant,
+    authorization_pending,
+    slow_down,
+    access_denied,
+    authorization_denied,
+    expired_token,
 };
 
 fn send(gpa: std.mem.Allocator, io: std.Io, timeouts: net.Timeouts, fetch: *const Fetch) ![]u8 {
@@ -175,7 +241,10 @@ fn readBody(gpa: std.mem.Allocator, reader: *std.Io.Reader) ![]u8 {
 }
 
 /// Classify a response after its capped body is available. Only an OAuth
-/// `invalid_grant` proves that the submitted grant is no longer valid.
+/// `invalid_grant` under 400, 401, or 403 proves that the submitted grant is no
+/// longer valid. A device-code poll states its wait and its refusal in the same
+/// code field, and its code reads under every client error status, because a
+/// rate limiter can answer a `slow_down` with 429.
 fn checkResponse(
     gpa: std.mem.Allocator,
     status: std.http.Status,
@@ -183,35 +252,45 @@ fn checkResponse(
     error_body: Fetch.ErrorBody,
 ) !void {
     if (status == .ok) return;
-    switch (status) {
-        .bad_request, .unauthorized, .forbidden => {
-            if (error_body == .oauth and try isInvalidGrant(gpa, body))
-                return error.TokenGrantRejected;
-        },
-        else => {},
+    const readable = switch (error_body) {
+        .generic => false,
+        .oauth => status == .bad_request or status == .unauthorized or status == .forbidden,
+        .device => status.class() == .client_error,
+    };
+    const maybe_code = if (readable) try errorCode(gpa, body) else null;
+    if (maybe_code) |code| {
+        const device = error_body == .device;
+        switch (code) {
+            .invalid_grant => return error.TokenGrantRejected,
+            .authorization_pending => if (device) return error.AuthorizationPending,
+            .slow_down => if (device) return error.SlowDown,
+            .access_denied, .authorization_denied => if (device) return error.AuthorizationDenied,
+            .expired_token => if (device) return error.DeviceCodeExpired,
+        }
     }
     if (status == .too_many_requests or status.class() == .server_error)
         return error.TokenServiceUnavailable;
     return error.TokenRequestFailed;
 }
 
-/// Test the standard OAuth error code. A malformed body has no destructive meaning.
-fn isInvalidGrant(gpa: std.mem.Allocator, body: []const u8) !bool {
+/// The standard OAuth error code of `body`, or null for a code Drinky does not
+/// act on. A malformed body has no destructive meaning.
+fn errorCode(gpa: std.mem.Allocator, body: []const u8) !?Code {
     const parsed = std.json.parseFromSlice(std.json.Value, gpa, body, .{}) catch |err|
         return switch (err) {
             error.OutOfMemory => error.OutOfMemory,
-            else => false,
+            else => null,
         };
     defer parsed.deinit();
     const object = switch (parsed.value) {
         .object => |object| object,
-        else => return false,
+        else => return null,
     };
-    const code = switch (object.get("error") orelse return false) {
+    const code = switch (object.get("error") orelse return null) {
         .string => |code| code,
-        else => return false,
+        else => return null,
     };
-    return std.mem.eql(u8, code, "invalid_grant");
+    return std.meta.stringToEnum(Code, code);
 }
 
 test "an OAuth response reads its error before it classifies the status" {
@@ -245,6 +324,82 @@ test "an OAuth response reads its error before it classifies the status" {
         error.TokenServiceUnavailable,
         checkResponse(gpa, .service_unavailable, "", .oauth),
     );
+}
+
+// A device-code poll answers its wait and its refusal in the OAuth code field,
+// so the same status reads differently under each body kind.
+test "a device response reads the poll answers of its grant" {
+    const gpa = std.testing.allocator;
+    try std.testing.expectError(
+        error.AuthorizationPending,
+        checkResponse(gpa, .bad_request, "{\"error\":\"authorization_pending\"}", .device),
+    );
+    try std.testing.expectError(
+        error.SlowDown,
+        checkResponse(gpa, .bad_request, "{\"error\":\"slow_down\"}", .device),
+    );
+    try std.testing.expectError(
+        error.AuthorizationDenied,
+        checkResponse(gpa, .bad_request, "{\"error\":\"access_denied\"}", .device),
+    );
+    try std.testing.expectError(
+        error.AuthorizationDenied,
+        checkResponse(gpa, .forbidden, "{\"error\":\"authorization_denied\"}", .device),
+    );
+    try std.testing.expectError(
+        error.DeviceCodeExpired,
+        checkResponse(gpa, .bad_request, "{\"error\":\"expired_token\"}", .device),
+    );
+    // A rate limiter can answer the wait with 429, and a 429 without a code is
+    // still an unavailable service. A token exchange reads no code under 429,
+    // so a rejected grant there stays an unavailable service, as before.
+    try std.testing.expectError(
+        error.SlowDown,
+        checkResponse(gpa, .too_many_requests, "{\"error\":\"slow_down\"}", .device),
+    );
+    try std.testing.expectError(
+        error.TokenServiceUnavailable,
+        checkResponse(gpa, .too_many_requests, "{\"error\":\"rate_limited\"}", .device),
+    );
+    try std.testing.expectError(
+        error.TokenServiceUnavailable,
+        checkResponse(gpa, .too_many_requests, "{\"error\":\"invalid_grant\"}", .oauth),
+    );
+    try std.testing.expectError(
+        error.TokenGrantRejected,
+        checkResponse(gpa, .bad_request, "{\"error\":\"invalid_grant\"}", .device),
+    );
+    try std.testing.expectError(
+        error.TokenRequestFailed,
+        checkResponse(gpa, .bad_request, "{\"error\":\"invalid_client\"}", .device),
+    );
+    // A token exchange never polls, so the poll answers read as plain failures there.
+    try std.testing.expectError(
+        error.TokenRequestFailed,
+        checkResponse(gpa, .bad_request, "{\"error\":\"authorization_pending\"}", .oauth),
+    );
+    try std.testing.expectError(
+        error.TokenRequestFailed,
+        checkResponse(gpa, .bad_request, "{\"error\":\"slow_down\"}", .generic),
+    );
+}
+
+test formBody {
+    const gpa = std.testing.allocator;
+    const body = try formBody(gpa, &.{
+        .{ .name = "grant_type", .value = "urn:ietf:params:oauth:grant-type:device_code" },
+        .{ .name = "scope", .value = "openid api:access" },
+        .{ .name = "device_code", .value = "a-b_c.d~e&f=g%h" },
+    });
+    defer gpa.free(body);
+    try std.testing.expectEqualStrings(
+        "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Adevice_code" ++
+            "&scope=openid%20api%3Aaccess&device_code=a-b_c.d~e%26f%3Dg%25h",
+        body,
+    );
+    const empty = try formBody(gpa, &.{});
+    defer gpa.free(empty);
+    try std.testing.expectEqualStrings("", empty);
 }
 
 test "a bearer response does not classify an OAuth grant" {

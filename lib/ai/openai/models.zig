@@ -9,6 +9,10 @@
 //! The API key reads `GET /v1/models`, which states an id and nothing else. No
 //! window, no level, and no price. Every other field of such a model comes from
 //! an aggregator, so the caller merges before it offers the model to the user.
+//! Another vendor that answers in this list format reads its own endpoint
+//! through `fetchList`. Such a vendor can list a model under an id and under
+//! aliases, and the decoder keeps every spelling, because a request can name
+//! any of them and the aggregator describes one.
 
 const std = @import("std");
 
@@ -99,6 +103,13 @@ fn validSubscriptionCredentials(access_token: []const u8, account_id: []const u8
     return account_id.len == 0 or net.validHeaderValue(account_id);
 }
 
+/// One `GET /v1/models` request of a vendor that answers in the OpenAI list
+/// format: the list endpoint and the bearer credential that authorizes it.
+pub const List = struct {
+    endpoint: []const u8,
+    token: []const u8,
+};
+
 /// Every model the API key `key` can name. The caller owns the result. The
 /// `deadline` bounds the request.
 pub fn fetchApi(
@@ -107,21 +118,32 @@ pub fn fetchApi(
     deadline: net.Deadline,
     key: []const u8,
 ) ![]Model {
+    return fetchList(gpa, io, deadline, &.{ .endpoint = api_endpoint, .token = key });
+}
+
+/// Every model that `list.token` can name at `list.endpoint`. The caller owns
+/// the result. The `deadline` bounds the request.
+pub fn fetchList(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    deadline: net.Deadline,
+    list: *const List,
+) ![]Model {
     var collected: ?[]Model = null;
-    deadline.call(io, requestApi, .{ gpa, io, key, &collected }) catch |err| {
+    deadline.call(io, requestList, .{ gpa, io, list, &collected }) catch |err| {
         if (collected) |models| gpa.free(models);
         return err;
     };
     return collected orelse error.ModelListRequestFailed;
 }
 
-fn requestApi(gpa: std.mem.Allocator, io: std.Io, key: []const u8, out: *?[]Model) !void {
-    if (!net.validHeaderValue(key)) return error.BadModelListCredentials;
-    const authorization = try std.fmt.allocPrint(gpa, "Bearer {s}", .{key});
+fn requestList(gpa: std.mem.Allocator, io: std.Io, list: *const List, out: *?[]Model) !void {
+    if (!net.validHeaderValue(list.token)) return error.BadModelListCredentials;
+    const authorization = try std.fmt.allocPrint(gpa, "Bearer {s}", .{list.token});
     defer gpa.free(authorization);
 
     const extra = [_]std.http.Header{.{ .name = "accept", .value = "application/json" }};
-    const body = try get(gpa, io, api_endpoint, .{
+    const body = try get(gpa, io, list.endpoint, .{
         .headers = .{ .authorization = .{ .override = authorization } },
         .extra_headers = &extra,
         .redirect_behavior = .not_allowed,
@@ -209,7 +231,10 @@ fn hidden(value: ?std.json.Value) bool {
     return std.mem.eql(u8, visibility, "hide");
 }
 
-/// Decode `GET /v1/models`, which states an id and nothing more.
+/// Decode `GET /v1/models`, which states an id, its aliases, and nothing more
+/// that Drinky reads. A vendor that states more in this list also lists models
+/// that no chat request can run, so the aggregator decides which name describes
+/// a model.
 fn parseApi(gpa: std.mem.Allocator, body: []const u8) ![]Model {
     var parsed = try std.json.parseFromSlice(std.json.Value, gpa, body, .{});
     defer parsed.deinit();
@@ -225,6 +250,15 @@ fn parseApi(gpa: std.mem.Allocator, body: []const u8) ![]Model {
         const id = json.string(entry.get("id")) orelse continue;
         const model = Model.init(id) catch continue;
         try models.append(gpa, model);
+        // The provider names the id in every reply, so an alias records it.
+        const aliases = json.array(entry.get("aliases")) orelse continue;
+        for (aliases.items) |alias_value| {
+            const alias = json.string(alias_value) orelse continue;
+            if (std.mem.eql(u8, alias, id)) continue;
+            var named = Model.init(alias) catch continue;
+            named.serveAs(id) catch continue;
+            try models.append(gpa, named);
+        }
     }
     return models.toOwnedSlice(gpa);
 }
@@ -348,6 +382,10 @@ test parseApi {
         \\{ "object": "list", "data": [
         \\  { "id": "gpt-5.6-sol", "object": "model", "created": 1, "owned_by": "openai" },
         \\  { "id": "text-embedding-3-large", "object": "model", "created": 2 },
+        \\  { "id": "grok-imagine-image", "object": "model", "owned_by": "xai",
+        \\    "context_length": 1024, "image_price": 200000000 },
+        \\  { "id": "grok-4.20-0309-reasoning", "object": "model", "owned_by": "xai",
+        \\    "aliases": ["grok-4.20", "grok-4.20-0309-reasoning", 7, "bad name"] },
         \\  { "object": "model", "created": 3 },
         \\  "not-an-object"
         \\] }
@@ -356,12 +394,22 @@ test parseApi {
 
     // The list states an id and nothing else, so every other field stays unset
     // and the caller must merge before it offers the model.
-    try std.testing.expectEqual(@as(usize, 2), models.len);
+    try std.testing.expectEqual(@as(usize, 5), models.len);
     try std.testing.expectEqualStrings("gpt-5.6-sol", models[0].name());
     try std.testing.expectEqual(@as(?u64, null), models[0].context_window);
     try std.testing.expect(models[0].price == null);
     try std.testing.expectEqual(Model.Thinking.unknown, models[0].thinking);
     try std.testing.expect(models[0].reasoning(.high) == .omitted);
+    // The xAI list states a window for an image model too, so the decoder reads
+    // no window: such a model must stay out of the picker.
+    try std.testing.expectEqual(@as(?u64, null), models[2].context_window);
+    // An alias is a name too, and it records the id that a reply names. One that
+    // repeats the id, one that is no string, and one that no request line can
+    // carry all drop.
+    try std.testing.expectEqualStrings("grok-4.20-0309-reasoning", models[3].name());
+    try std.testing.expectEqualStrings("", models[3].servedName());
+    try std.testing.expectEqualStrings("grok-4.20", models[4].name());
+    try std.testing.expectEqualStrings("grok-4.20-0309-reasoning", models[4].servedName());
 }
 
 test "a malformed envelope is rejected and a malformed entry is skipped" {

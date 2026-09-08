@@ -19,7 +19,13 @@ const system_header = "You are Claude Code, Anthropic's official CLI for Claude.
 fn sendsSystemHeader(account: llm.Account) bool {
     return switch (account) {
         .anthropic_subscription, .anthropic_console => true,
-        .anthropic_api, .openai_subscription, .openai_api, .google_vertex => false,
+        .anthropic_api,
+        .openai_subscription,
+        .openai_api,
+        .xai_subscription,
+        .xai_api,
+        .google_vertex,
+        => false,
     };
 }
 
@@ -187,7 +193,7 @@ fn emitsBlock(item: llm.Item, emit_thinking: bool, account: llm.Account) bool {
                     .redacted => |data| data.len != 0,
                 };
             },
-            .openai_subscription, .openai_api, .google_vertex => false,
+            .openai_subscription, .openai_api, .xai_subscription, .xai_api, .google_vertex => false,
         },
         else => true,
     };
@@ -280,7 +286,12 @@ fn writeThinking(stringify: *std.json.Stringify, reasoning: *const llm.Item.Reas
             }),
             .redacted => |data| try stringify.write(RedactedThinkingBlock{ .data = data }),
         },
-        .openai_subscription, .openai_api, .google_vertex => unreachable,
+        .openai_subscription,
+        .openai_api,
+        .xai_subscription,
+        .xai_api,
+        .google_vertex,
+        => unreachable,
     }
 }
 

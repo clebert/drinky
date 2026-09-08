@@ -12,9 +12,13 @@ const google = @import("google/root.zig");
 const llm = @import("llm.zig");
 const net = @import("net.zig");
 const openai = @import("openai/root.zig");
+const xai = @import("xai/root.zig");
 
 const openai_url = "https://api.openai.com/v1/responses";
 const codex_url = "https://chatgpt.com/backend-api/codex/responses";
+/// Both xAI accounts reach the public Responses endpoint of xAI with a bearer
+/// token, so the URL names no account.
+const xai_url = "https://api.x.ai/v1/responses";
 
 /// What a client needs to authenticate, tagged by the account it belongs to. A
 /// subscription account holds an OAuth `Auth` (owned by the caller, refreshed on
@@ -27,6 +31,8 @@ pub const Credentials = union(llm.Account) {
     anthropic_api: []const u8,
     openai_subscription: *openai.Auth,
     openai_api: []const u8,
+    xai_subscription: *xai.Auth,
+    xai_api: []const u8,
     google_vertex: *google.Auth,
 };
 
@@ -62,9 +68,10 @@ pub const Client = struct {
         return switch (self.credentials) {
             inline .anthropic_subscription,
             .openai_subscription,
+            .xai_subscription,
             .google_vertex,
             => |credential| credential.renew(),
-            .anthropic_console, .anthropic_api, .openai_api => false,
+            .anthropic_console, .anthropic_api, .openai_api, .xai_api => false,
         };
     }
 
@@ -91,8 +98,16 @@ pub const Client = struct {
                 };
                 try transport.send(&@field(out.*, @tagName(tag)), body);
             },
-            inline .openai_subscription, .openai_api => |credential, tag| {
-                const subscription = tag == .openai_subscription;
+            // The four Responses accounts share one transport and one wire.
+            // Only the Codex backend takes an account header. The two xAI
+            // accounts differ in the credential alone, so both reach the
+            // public xAI endpoint the same way.
+            inline .openai_subscription,
+            .openai_api,
+            .xai_subscription,
+            .xai_api,
+            => |credential, tag| {
+                const subscription = tag == .openai_subscription or tag == .xai_subscription;
                 const token = if (subscription) try credential.accessToken() else credential;
                 const body = try openai.wire.serialize(self.gpa, request, tag);
                 defer self.gpa.free(body);
@@ -101,8 +116,8 @@ pub const Client = struct {
                     .gpa = self.gpa,
                     .io = self.io,
                     .timeouts = self.timeouts,
-                    .endpoint = if (subscription) codex_url else openai_url,
-                    .account_id = if (subscription) credential.accountId() else "",
+                    .endpoint = responsesUrl(tag),
+                    .account_id = if (tag == .openai_subscription) credential.accountId() else "",
                 };
                 try transport.send(&@field(out.*, @tagName(tag)), .{
                     .body = body,
@@ -133,6 +148,21 @@ pub const Client = struct {
     }
 };
 
+/// The Responses endpoint of one account of the OpenAI protocol. An account of
+/// another protocol has none, and the compile fails where one asks.
+fn responsesUrl(comptime account: llm.Account) []const u8 {
+    return switch (account) {
+        .openai_subscription => codex_url,
+        .openai_api => openai_url,
+        .xai_subscription, .xai_api => xai_url,
+        .anthropic_subscription,
+        .anthropic_console,
+        .anthropic_api,
+        .google_vertex,
+        => @compileError("the account speaks no Responses protocol"),
+    };
+}
+
 /// A single request in flight that decodes to neutral `llm.Event`s. Both
 /// accounts of a vendor share that vendor's transport stream. They differ only
 /// in how the request was sent, not in how the response decodes.
@@ -142,6 +172,8 @@ pub const Stream = union(llm.Account) {
     anthropic_api: anthropic.Transport.Stream,
     openai_subscription: openai.Transport.Stream,
     openai_api: openai.Transport.Stream,
+    xai_subscription: openai.Transport.Stream,
+    xai_api: openai.Transport.Stream,
     google_vertex: google.Transport.Stream,
 
     pub fn deinit(self: *Stream) void {
@@ -232,6 +264,10 @@ test "init selects the arm matching the credentials" {
     try std.testing.expectEqual(llm.Account.openai_api, openai_key.account());
     const codex = Client.init(gpa, std.testing.io, .{ .openai_subscription = undefined }, .{});
     try std.testing.expectEqual(llm.Account.openai_subscription, codex.account());
+    const grok = Client.init(gpa, std.testing.io, .{ .xai_subscription = undefined }, .{});
+    try std.testing.expectEqual(llm.Account.xai_subscription, grok.account());
+    const xai_key = Client.init(gpa, std.testing.io, .{ .xai_api = "xai-test" }, .{});
+    try std.testing.expectEqual(llm.Account.xai_api, xai_key.account());
     const vertex = Client.init(gpa, std.testing.io, .{ .google_vertex = undefined }, .{});
     try std.testing.expectEqual(llm.Account.google_vertex, vertex.account());
 }
@@ -246,6 +282,7 @@ test "an OAuth account and the Vertex account renew, a key account does not" {
         .{ .anthropic_api = "sk-ant" },
         .{ .anthropic_console = "sk-ant-api03" },
         .{ .openai_api = "sk-test" },
+        .{ .xai_api = "xai-test" },
     }) |credentials| {
         var client = Client.init(gpa, io, credentials, .{});
         try std.testing.expect(!try client.renewCredential());
@@ -260,6 +297,16 @@ test "an OAuth account and the Vertex account renew, a key account does not" {
     };
     var client = Client.init(gpa, io, .{ .anthropic_subscription = &signed_out }, .{});
     try std.testing.expect(!try client.renewCredential());
+
+    var signed_out_xai: xai.Auth = .{
+        .gpa = gpa,
+        .io = io,
+        .timeouts = .{},
+        .path = "",
+        .tokens = null,
+    };
+    var grok = Client.init(gpa, io, .{ .xai_subscription = &signed_out_xai }, .{});
+    try std.testing.expect(!try grok.renewCredential());
 }
 
 test "usageSoFar reads accumulated usage through the stream seam" {

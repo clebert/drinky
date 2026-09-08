@@ -127,6 +127,7 @@ const File = struct {
         connect_timeout_ms: u64 = timeouts_default.anthropic.connect_ms,
         anthropic_idle_timeout_ms: u64 = timeouts_default.anthropic.idle_ms,
         openai_idle_timeout_ms: u64 = timeouts_default.openai.idle_ms,
+        xai_idle_timeout_ms: u64 = timeouts_default.xai.idle_ms,
         google_idle_timeout_ms: u64 = timeouts_default.google.idle_ms,
         attempts_max: u32 = retry_default.attempts_max,
         backoff_ms_initial: u64 = retry_default.backoff_ms_initial,
@@ -234,6 +235,12 @@ const keys = [_]Key{
         .description = "The time that Drinky waits between two streamed OpenAI events. The " ++
             "stream is silent while the model reasons privately, so the default matches " ++
             "the wait of the official client.",
+    },
+    .{
+        .path = "request.xai_idle_timeout_ms",
+        .description = "The time that Drinky waits between two streamed xAI events. The " ++
+            "stream can stay silent while the model reasons, so the default matches the " ++
+            "OpenAI wait.",
     },
     .{
         .path = "request.google_idle_timeout_ms",
@@ -500,9 +507,10 @@ pub fn document(
         \\valid, and an absent key keeps its default. A dot shows a nested JSON object. Empty
         \\brackets show each array entry. Drinky ignores a key that it does not know, so a typo has
         \\no effect. The next start still succeeds and shows a warning that names each ignored key.
-        \\The file holds no secret. An API key comes from the ANTHROPIC_API_KEY or the
-        \\OPENAI_API_KEY variable. The Google Vertex account reads the service account key file
-        \\that GOOGLE_APPLICATION_CREDENTIALS names. GOOGLE_CLOUD_LOCATION is eu, us, or global.
+        \\The file holds no secret. An API key comes from the ANTHROPIC_API_KEY, the
+        \\OPENAI_API_KEY, or the XAI_API_KEY variable. The Google Vertex account reads the service
+        \\account key file that GOOGLE_APPLICATION_CREDENTIALS names. GOOGLE_CLOUD_LOCATION is eu,
+        \\us, or global.
         \\{s}
         \\### Models and effort
         \\
@@ -667,6 +675,10 @@ fn loadFromData(gpa: std.mem.Allocator, io: std.Io, options: *const DataOptions)
             .openai = .{
                 .connect_ms = request.connect_timeout_ms,
                 .idle_ms = request.openai_idle_timeout_ms,
+            },
+            .xai = .{
+                .connect_ms = request.connect_timeout_ms,
+                .idle_ms = request.xai_idle_timeout_ms,
             },
             .google = .{
                 .connect_ms = request.connect_timeout_ms,
@@ -889,15 +901,18 @@ test "load reads the request section" {
     var config = try loadDataForTest(
         \\{ "request": { "connect_timeout_ms": 1000, "anthropic_idle_timeout_ms": 2000,
         \\  "openai_idle_timeout_ms": 3000, "google_idle_timeout_ms": 4000,
+        \\  "xai_idle_timeout_ms": 4500,
         \\  "attempts_max": 5, "backoff_ms_initial": 100, "backoff_ms_max": 900 } }
     );
     defer config.deinit(std.testing.allocator);
     // The shared connect bound reaches every provider.
     try std.testing.expectEqual(@as(u64, 1000), config.timeouts.anthropic.connect_ms);
     try std.testing.expectEqual(@as(u64, 1000), config.timeouts.openai.connect_ms);
+    try std.testing.expectEqual(@as(u64, 1000), config.timeouts.xai.connect_ms);
     try std.testing.expectEqual(@as(u64, 1000), config.timeouts.google.connect_ms);
     try std.testing.expectEqual(@as(u64, 2000), config.timeouts.anthropic.idle_ms);
     try std.testing.expectEqual(@as(u64, 3000), config.timeouts.openai.idle_ms);
+    try std.testing.expectEqual(@as(u64, 4500), config.timeouts.xai.idle_ms);
     try std.testing.expectEqual(@as(u64, 4000), config.timeouts.google.idle_ms);
     try std.testing.expectEqual(@as(u32, 5), config.retry.attempts_max);
     try std.testing.expectEqual(@as(u64, 100), config.retry.backoff_ms_initial);
@@ -1114,6 +1129,7 @@ test "load fills missing fields and sections from defaults" {
         empty.timeouts.anthropic.idle_ms,
     );
     try std.testing.expectEqual(timeouts_default.openai.idle_ms, empty.timeouts.openai.idle_ms);
+    try std.testing.expectEqual(timeouts_default.xai.idle_ms, empty.timeouts.xai.idle_ms);
     try std.testing.expectEqual(timeouts_default.google.idle_ms, empty.timeouts.google.idle_ms);
     try std.testing.expectEqual(retry_default.attempts_max, empty.retry.attempts_max);
     try std.testing.expectEqual(@as(usize, 0), empty.user_instructions.files().len);

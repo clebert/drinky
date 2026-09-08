@@ -19,6 +19,7 @@ pub fn accounts(
         anthropic: bool = false,
         openai: bool = false,
         anthropic_console: bool = false,
+        xai: bool = false,
         google: bool = false,
     },
 ) Accounts {
@@ -26,6 +27,7 @@ pub fn accounts(
     registry.anthropic_subscription_ready = ready.anthropic;
     registry.openai_subscription_ready = ready.openai;
     registry.anthropic_console_ready = ready.anthropic_console;
+    registry.xai_subscription_ready = ready.xai;
     if (ready.google) registry.google_auth = .{
         .gpa = registry.gpa,
         .io = registry.io,

@@ -11,11 +11,9 @@
 const std = @import("std");
 
 const json = @import("../json.zig");
+const jwt = @import("../jwt.zig");
 const net = @import("../net.zig");
 const oauth_wire = @import("../oauth_wire.zig");
-
-const base64url = std.base64.url_safe_no_pad.Encoder;
-const base64url_decoder = std.base64.url_safe_no_pad.Decoder;
 
 const client_id = "app_EMoamEEZ73f0CkXaXp7hrann";
 const authorize_url = "https://auth.openai.com/oauth/authorize";
@@ -182,7 +180,7 @@ fn accountId(
 /// The `chatgpt_account_id` claim from `token`'s JWT payload as an owned dupe, or
 /// null when the token is malformed or lacks the claim (never a crash).
 fn claimAccountId(gpa: std.mem.Allocator, token: []const u8) error{OutOfMemory}!?[]const u8 {
-    const parsed = (try decodePayload(gpa, token)) orelse return null;
+    const parsed = (try jwt.payload(gpa, token)) orelse return null;
     defer parsed.deinit();
     const object = json.object(parsed.value) orelse return null;
     const auth = json.object(object.get(auth_claim)) orelse return null;
@@ -194,7 +192,7 @@ fn claimAccountId(gpa: std.mem.Allocator, token: []const u8) error{OutOfMemory}!
 /// (seconds) less the refresh margin. Null when the token is malformed or has
 /// no `exp`.
 fn jwtExpiryMs(gpa: std.mem.Allocator, token: []const u8) error{OutOfMemory}!?i64 {
-    const parsed = (try decodePayload(gpa, token)) orelse return null;
+    const parsed = (try jwt.payload(gpa, token)) orelse return null;
     defer parsed.deinit();
     const object = json.object(parsed.value) orelse return null;
     const exp = json.integer(object.get("exp")) orelse return null;
@@ -202,28 +200,6 @@ fn jwtExpiryMs(gpa: std.mem.Allocator, token: []const u8) error{OutOfMemory}!?i6
     // (a clean MissingExpiry upstream) rather than a panic.
     const millis = std.math.mul(i64, exp, 1000) catch return null;
     return std.math.sub(i64, millis, refresh_margin_ms) catch return null;
-}
-
-/// Decode a JWT's payload (the middle of three dot-separated segments) and
-/// parse it as JSON. Null — never an error — on fewer than three segments or
-/// bad base64. We only read our own token, so no signature is verified.
-fn decodePayload(
-    gpa: std.mem.Allocator,
-    token: []const u8,
-) error{OutOfMemory}!?std.json.Parsed(std.json.Value) {
-    var segments = std.mem.splitScalar(u8, token, '.');
-    _ = segments.next() orelse return null;
-    const payload = segments.next() orelse return null;
-    if (segments.next() == null) return null;
-
-    const len = base64url_decoder.calcSizeForSlice(payload) catch return null;
-    const buffer = try gpa.alloc(u8, len);
-    defer gpa.free(buffer);
-    base64url_decoder.decode(buffer, payload) catch return null;
-    return std.json.parseFromSlice(std.json.Value, gpa, buffer, .{}) catch |err| switch (err) {
-        error.OutOfMemory => error.OutOfMemory,
-        else => null,
-    };
 }
 
 test authorizeUrl {
@@ -246,19 +222,12 @@ test refreshBody {
     try std.testing.expectEqualStrings("r\"t", parsed.value.object.get("refresh_token").?.string);
 }
 
-/// A JWT with `payload` as its (unsigned) body, to exercise the extractors.
-fn makeJwt(gpa: std.mem.Allocator, payload: []const u8) ![]u8 {
-    var encoded: [1024]u8 = undefined;
-    const body = base64url.encode(&encoded, payload);
-    return std.fmt.allocPrint(gpa, "e30.{s}.sig", .{body});
-}
-
 test parseTokens {
     const gpa = std.testing.allocator;
     // The expiry rides on the access token. The account id rides on the id token.
-    const access = try makeJwt(gpa, "{\"exp\":2000000000}");
+    const access = try jwt.testToken(gpa, "{\"exp\":2000000000}");
     defer gpa.free(access);
-    const id = try makeJwt(
+    const id = try jwt.testToken(
         gpa,
         "{\"https://api.openai.com/auth\":{\"chatgpt_account_id\":\"acct_123\"}}",
     );
@@ -285,7 +254,7 @@ test parseTokens {
 
 test "parseTokens carries over refresh token and account id on a partial refresh" {
     const gpa = std.testing.allocator;
-    const access = try makeJwt(gpa, "{\"exp\":2000000000}");
+    const access = try jwt.testToken(gpa, "{\"exp\":2000000000}");
     defer gpa.free(access);
     const body = try std.fmt.allocPrint(gpa, "{{\"access_token\":\"{s}\"}}", .{access});
     defer gpa.free(body);
@@ -298,7 +267,7 @@ test "parseTokens carries over refresh token and account id on a partial refresh
 
 test "parseTokens fails cleanly when the account id cannot be found" {
     const gpa = std.testing.allocator;
-    const access = try makeJwt(gpa, "{\"exp\":2000000000}");
+    const access = try jwt.testToken(gpa, "{\"exp\":2000000000}");
     defer gpa.free(access);
     const body = try std.fmt.allocPrint(
         gpa,
@@ -311,7 +280,7 @@ test "parseTokens fails cleanly when the account id cannot be found" {
 
 test "parseTokens rejects a token whose JWT has no expiry" {
     const gpa = std.testing.allocator;
-    const access = try makeJwt(gpa, "{\"sub\":\"x\"}");
+    const access = try jwt.testToken(gpa, "{\"sub\":\"x\"}");
     defer gpa.free(access);
     const body = try std.fmt.allocPrint(
         gpa,
@@ -326,7 +295,7 @@ test "parseTokens skips a crafted expiry that overflows" {
     const gpa = std.testing.allocator;
     // An `exp` near maxInt(i64) must fail cleanly like a missing one, not crash
     // in the conversion to milliseconds.
-    const access = try makeJwt(gpa, "{\"exp\":9223372036854775807}");
+    const access = try jwt.testToken(gpa, "{\"exp\":9223372036854775807}");
     defer gpa.free(access);
     const body = try std.fmt.allocPrint(
         gpa,

@@ -39,11 +39,13 @@ pub fn accounts(environment: Accounts.Environment) Accounts {
         .anthropic_auth = undefined,
         .anthropic_console_auth = undefined,
         .openai_auth = undefined,
+        .xai_auth = undefined,
         .google_auth = null,
         .google_error = null,
         .environment = environment,
         .anthropic_subscription_ready = false,
         .openai_subscription_ready = false,
+        .xai_subscription_ready = false,
         .anthropic_console_ready = false,
         .catalog = .{
             .gpa = std.testing.allocator,

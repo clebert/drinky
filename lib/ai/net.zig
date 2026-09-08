@@ -20,12 +20,13 @@ pub const Timeouts = struct {
 /// stream stays busy with reasoning and argument deltas, so a 60 s gap means a
 /// dead connection. The OpenAI backend sends nothing while the model reasons
 /// privately, and its official client tolerates a 300 s gap, so the OpenAI
-/// window matches that. Gemini can hold a stream silent while it thinks, so it
-/// takes the same window. The connect bound is network-bound, so every
-/// provider shares its default.
+/// window matches that. Gemini and Grok can hold a stream silent while they
+/// think, so they take the same window. The connect bound is network-bound, so
+/// every provider shares its default.
 pub const ProviderTimeouts = struct {
     anthropic: Timeouts = .{},
     openai: Timeouts = .{ .idle_ms = 300_000 },
+    xai: Timeouts = .{ .idle_ms = 300_000 },
     google: Timeouts = .{ .idle_ms = 300_000 },
 };
 
@@ -370,9 +371,11 @@ test "the provider timeout defaults differ only in the idle window" {
     const timeouts: ProviderTimeouts = .{};
     try std.testing.expectEqual(timeouts.anthropic.connect_ms, timeouts.openai.connect_ms);
     try std.testing.expectEqual(timeouts.anthropic.connect_ms, timeouts.google.connect_ms);
+    try std.testing.expectEqual(timeouts.anthropic.connect_ms, timeouts.xai.connect_ms);
     // The generic pair serves the short OAuth and token requests, so the
     // Anthropic stream default must stay in step with it.
     try std.testing.expectEqual(@as(Timeouts, .{}), timeouts.anthropic);
     try std.testing.expect(timeouts.openai.idle_ms > timeouts.anthropic.idle_ms);
     try std.testing.expectEqual(timeouts.openai.idle_ms, timeouts.google.idle_ms);
+    try std.testing.expectEqual(timeouts.openai.idle_ms, timeouts.xai.idle_ms);
 }

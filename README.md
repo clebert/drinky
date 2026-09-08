@@ -3,7 +3,7 @@
 A dependency-free terminal coding agent you can read end to end.
 
 Give Drinky a prompt in the terminal. The model can read, search, and change files or run commands
-in the working directory. Drinky talks to Anthropic, OpenAI, and Gemini on Google Vertex AI.
+in the working directory. Drinky talks to Anthropic, OpenAI, xAI, and Gemini on Google Vertex AI.
 
 Drinky is a single Zig program. It needs no Node.js runtime or third-party package tree, so a
 complete review covers Drinky and the Zig standard library. Use Drinky as it is, or fork it and add
@@ -40,17 +40,19 @@ zig build -Doptimize=ReleaseSafe
 ## Sign in
 
 Run `/login` to sign in with a subscription account or an Anthropic Console account. The Console
-login mints an API key in the browser and stores it, so no environment variable is needed. You can
-also set `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` by hand. For Gemini on Google Vertex AI, set
+login mints an API key in the browser and stores it, so no environment variable is needed. The xAI
+subscription (SuperGrok or X Premium) signs in with a device code. You can also set
+`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or `XAI_API_KEY` by hand. For Gemini on Google Vertex AI, set
 `GOOGLE_APPLICATION_CREDENTIALS` to a service account key file and `GOOGLE_CLOUD_LOCATION` to `eu`,
 `us`, or `global`. Drinky serves Gemini 3 and later.
 
 An API key or a service account key file uses the public provider API. A subscription login uses an
 unsupported provider interface that can change or stop working. The minted key bills at API rates
 over the public API, but the login that mints it is unsupported. See the implementation notes for
-[Anthropic](lib/ai/anthropic/root.zig) and [OpenAI](lib/ai/openai/oauth.zig).
+[Anthropic](lib/ai/anthropic/root.zig), [OpenAI](lib/ai/openai/oauth.zig), and
+[xAI](lib/ai/xai/oauth.zig).
 
-Drinky is not affiliated with Anthropic or OpenAI.
+Drinky is not affiliated with Anthropic, OpenAI, or xAI.
 
 ## Slash commands
 

@@ -1,7 +1,7 @@
 //! Translates a neutral `llm.Request` into an OpenAI Responses API JSON body.
-//! The API-key and ChatGPT-subscription accounts share this module and differ
-//! only in transport base and auth, never wire shape. It holds no state and
-//! does no I/O. `Transport` sends the bytes this module produces.
+//! Every Responses account shares this module: the OpenAI accounts and the xAI
+//! accounts differ only in transport base and auth, never wire shape. It holds
+//! no state and does no I/O. `Transport` sends the bytes this module produces.
 
 const std = @import("std");
 
@@ -101,9 +101,13 @@ fn writeItem(
 ) !void {
     switch (item.*) {
         .message => |*message| try writeMessage(stringify, message),
-        // Only this exact account's complete OpenAI proof can replay here.
+        // Only this exact account's complete Responses proof can replay here.
         .reasoning => |*reasoning| switch (reasoning.replay) {
-            inline .openai_subscription, .openai_api => |proof, tag| {
+            inline .openai_subscription,
+            .openai_api,
+            .xai_subscription,
+            .xai_api,
+            => |proof, tag| {
                 if (tag == account and proof.id.len != 0 and proof.encrypted_content.len != 0)
                     try writeReasoning(stringify, &proof);
             },
@@ -432,6 +436,33 @@ test "reasoning replays only the active account's complete proof" {
         input[0].object.get("summary").?.array.items[0].object.get("text").?.string,
     );
     try std.testing.expectEqualStrings("message", input[1].object.get("type").?.string);
+
+    // An xAI proof has the same shape, but it belongs to its own account, so a
+    // Grok request replays none of the OpenAI items above.
+    const grok_items = [_]llm.Item{
+        .{ .reasoning = .{
+            .replay = .{ .xai_api = .{ .text = "", .id = "rs_x", .encrypted_content = "xenc" } },
+        } },
+    } ++ items;
+    const grok_body = try serialize(std.testing.allocator, &.{
+        .model = "grok-4.6",
+        .tokens_max = 8,
+        .system = "s",
+        .items = &grok_items,
+        .tools = &.{},
+    }, .xai_api);
+    defer std.testing.allocator.free(grok_body);
+    const grok_parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        grok_body,
+        .{},
+    );
+    defer grok_parsed.deinit();
+    const grok_input = grok_parsed.value.object.get("input").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), grok_input.len);
+    try std.testing.expectEqualStrings("rs_x", grok_input[0].object.get("id").?.string);
+    try std.testing.expectEqual(@as(usize, 0), grok_input[0].object.get("summary").?.array.items.len);
 }
 
 test "assistant text uses output_text, and no control omits reasoning" {

@@ -178,6 +178,7 @@ fn decode(value: std.json.Value) ?Entry {
 fn providerOf(vendor: []const u8) ?llm.Provider {
     if (std.mem.eql(u8, vendor, "anthropic")) return .anthropic;
     if (std.mem.eql(u8, vendor, "openai")) return .openai;
+    if (std.mem.eql(u8, vendor, "x-ai")) return .xai;
     if (std.mem.eql(u8, vendor, "google")) return .google;
     return null;
 }
@@ -284,6 +285,11 @@ const sample =
     \\  { "id": "google/gemini-3.7-flash", "context_length": 1048576,
     \\    "pricing": { "prompt": "0.0000004", "completion": "0.000002" },
     \\    "reasoning": { "supported_efforts": ["high", "medium", "low", "minimal"] } },
+    \\  { "id": "x-ai/grok-4.6", "context_length": 500000,
+    \\    "pricing": { "prompt": "0.000002", "completion": "0.000006",
+    \\                 "input_cache_read": "0.0000005" },
+    \\    "reasoning": { "mandatory": true,
+    \\                   "supported_efforts": ["xhigh", "high", "medium", "low"] } },
     \\  { "id": "mistralai/mistral-large", "context_length": 128000,
     \\    "pricing": { "prompt": "0.000002", "completion": "0.000006" } },
     \\  { "id": "openai/free-one", "pricing": { "prompt": "0", "completion": "0" } }
@@ -296,8 +302,19 @@ test parse {
 
     // A vendor Drinky does not reach, and a variant that no vendor answers to,
     // both stay out of the subset.
-    try std.testing.expectEqual(@as(usize, 6), metadata.entries.len);
+    try std.testing.expectEqual(@as(usize, 7), metadata.entries.len);
     try std.testing.expect(metadata.lookup(.openai, "gpt-5.6-sol:batch") == null);
+
+    // The aggregator spells the xAI vendor `x-ai`, and the id of a Grok model
+    // already reads like the aggregator spelling. Grok names no `max` rung, so
+    // that level folds onto `xhigh`.
+    const grok = metadata.lookup(.xai, "grok-4.6").?;
+    try std.testing.expectEqual(@as(?u64, 500_000), grok.context_window);
+    try std.testing.expectEqual(@as(f64, 2), grok.price.?.input);
+    try std.testing.expectEqual(@as(f64, 0.5), grok.price.?.cache_read);
+    try std.testing.expect(grok.offers(.xhigh));
+    try std.testing.expectEqual(llm.Effort.xhigh, grok.reasoning(.max).named);
+    try std.testing.expect(metadata.lookup(.openai, "grok-4.6") == null);
 
     // A Gemini id already reads like the aggregator spelling, so it needs no
     // normalization, and the vendor is a third one Drinky reaches.

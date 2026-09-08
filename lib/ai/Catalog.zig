@@ -46,6 +46,8 @@ metadata: []OpenRouter.Entry,
 /// fact. A decoder takes that null as the absent value it is.
 const Encoded = struct {
     name: []const u8,
+    /// The id behind an alias, or null when the name is the id itself.
+    served_as: ?[]const u8,
     context_window: ?u64,
     tokens_max: ?u32,
     thinking: []const u8,
@@ -271,6 +273,10 @@ fn encode(gpa: std.mem.Allocator, model: *const Model) !Encoded {
     }
     return .{
         .name = try gpa.dupe(u8, model.name()),
+        .served_as = if (model.servedName().len != 0)
+            try gpa.dupe(u8, model.servedName())
+        else
+            null,
         .context_window = model.context_window,
         .tokens_max = model.tokens_max,
         .thinking = @tagName(model.thinking),
@@ -284,6 +290,8 @@ fn decodeModel(value: std.json.Value) ?Model {
     const object = json.object(value) orelse return null;
     const name = json.string(object.get("name")) orelse return null;
     var model = Model.init(name) catch return null;
+    if (json.string(object.get("served_as"))) |served_as|
+        model.serveAs(served_as) catch return null;
     model.context_window = positive(object.get("context_window"));
     if (positive(object.get("tokens_max"))) |limit|
         model.tokens_max = std.math.cast(u32, limit);
@@ -539,7 +547,9 @@ test "a stored model survives a round trip through both files" {
     model.addEffort(.low);
     model.addEffort(.xhigh);
     model.price = .{ .input = 5, .output = 25, .cache_read = 0.5, .cache_write = 6.25 };
-    try written.setAccount(.anthropic_subscription, &.{model});
+    var alias = Model.init("grok-4.20") catch unreachable;
+    alias.serveAs("grok-4.20-0309-reasoning") catch unreachable;
+    try written.setAccount(.anthropic_subscription, &.{ model, alias });
 
     var bare = Model.init("public-only") catch unreachable;
     bare.context_window = 200_000;
@@ -557,6 +567,13 @@ test "a stored model survives a round trip through both files" {
     try std.testing.expect(restored.offers(.xhigh));
     try std.testing.expect(!restored.offers(.high));
     try std.testing.expectEqual(@as(f64, 6.25), restored.price.?.cache_write);
+    try std.testing.expectEqualStrings("", restored.servedName());
+    // The id behind an alias survives the file, so a reply under that id still
+    // reads as the model of the alias after a restart.
+    try std.testing.expectEqualStrings(
+        "grok-4.20-0309-reasoning",
+        read.accounts.get(.anthropic_subscription)[1].servedName(),
+    );
     // The metadata file survives its own round trip, under its vendor.
     try std.testing.expectEqual(@as(usize, 1), read.metadata.len);
     try std.testing.expectEqual(llm.Provider.anthropic, read.metadata[0].provider);
