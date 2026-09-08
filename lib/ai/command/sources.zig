@@ -6,7 +6,7 @@ const std = @import("std");
 const Context = @import("Context.zig");
 
 pub const name = "sources";
-pub const summary = "inspect the instruction files and the skills";
+pub const summary = "show the loaded instruction files and skills";
 
 pub fn run(context: *Context) !Context.Outcome {
     _ = context;

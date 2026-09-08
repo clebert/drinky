@@ -208,14 +208,14 @@ test "the document states every command, key, and discovery rule" {
         text,
         "- `/login` \u{2014} sign in or switch the account. It runs in the terminal alone",
     ) != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "- `/new` \u{2014} clear the conversation and its usage stats.\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "- `/new` \u{2014} clear the conversation.\n") != null);
     // The status runs where no other command runs, so the model can name it
     // to a user who waits on a turn. Its row states the run, and no other row
     // does.
     try std.testing.expect(std.mem.indexOf(
         u8,
         text,
-        "- `/status` \u{2014} show the state of the session. It runs during a turn too.\n",
+        "- `/status` \u{2014} state the session. It runs during a turn too.\n",
     ) != null);
     try std.testing.expectEqual(
         @as(usize, 1),

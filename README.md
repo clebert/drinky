@@ -3,8 +3,13 @@
 A dependency-free terminal coding agent you can read end to end.
 
 Give Drinky a prompt in the terminal. The model can read, search, and change files or run commands
-in the working directory. Drinky talks to Anthropic, OpenAI, xAI, OpenRouter, and Gemini on Google
-Vertex AI.
+in the working directory. Drinky talks to:
+
+- Anthropic
+- OpenAI
+- xAI
+- OpenRouter
+- Gemini on Google Vertex AI
 
 Drinky is a single Zig program. It needs no Node.js runtime or third-party package tree, so a
 complete review covers Drinky and the Zig standard library. Use Drinky as it is, or fork it and add
@@ -55,21 +60,23 @@ over the public API, but the login that mints it is unsupported. See the impleme
 [xAI](lib/ai/xai/oauth.zig). The [OpenRouter](lib/ai/openrouter/oauth.zig) login follows the
 documented OAuth flow of OpenRouter, and the key it mints bills like any other OpenRouter key.
 
-Drinky is not affiliated with Anthropic, OpenAI, xAI, or OpenRouter.
+Drinky is not affiliated with Anthropic, OpenAI, xAI, OpenRouter, or Google.
 
 ## Slash commands
 
 A line that starts with a slash runs in Drinky and reaches no model. Type `/` or `/help` to open the
 complete command list.
 
-- `/login` signs in.
-- `/model` and `/effort` change the model and the reasoning effort.
-- `/skill` picks a discovered skill. `/skill:name` loads one skill with an optional task.
-- `/new` clears the conversation.
-- `/status` states the session.
-- `/sources` shows the loaded instruction files and skills.
-- `/system` shows the complete system prompt.
-- `/remote` attaches a Telegram bot.
+- `/effort` — set the reasoning effort.
+- `/login` — sign in or switch the account.
+- `/model` — switch the model.
+- `/new` — clear the conversation.
+- `/remote` — attach a Telegram bot.
+- `/skill` — pick a skill.
+- `/skill:name` — load a skill.
+- `/sources` — show the loaded instruction files and skills.
+- `/status` — state the session.
+- `/system` — show the complete system prompt.
 
 ## Telegram remote control
 
@@ -81,6 +88,8 @@ the chat runs as a prompt, or queues as steering during a turn. The chat mirrors
 event, and one message per turn shows the state and holds a `Cancel turn` button. `/new`, `/effort`,
 `/model`, `/help`, `/skill`, and `/status` run from the chat, and the other commands run in the
 terminal alone. Every exit key in the terminal detaches the bot.
+
+> On macOS, run `caffeinate -is` so the Mac stays awake.
 
 The bot tokens live in the owner-only `~/.drinky/remote.json`, and Drinky talks to the Telegram Bot
 API directly.

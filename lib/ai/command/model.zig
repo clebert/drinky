@@ -23,7 +23,7 @@ const Context = @import("Context.zig");
 const testing = @import("testing.zig");
 
 pub const name = "model";
-pub const summary = "switch account and model together";
+pub const summary = "switch the model";
 
 /// Every step belongs to one `/model` run, so every step reports one cancellation.
 const cancellation_message = "You canceled the model selection.";

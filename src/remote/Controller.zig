@@ -1161,12 +1161,12 @@ test "a saved bot attaches, its messages and taps reach the owner, and a detach 
     // summary.
     const registered = try server.waitForRequest("/setMyCommands", 0);
     try std.testing.expectEqualStrings(
-        "{\"commands\":[{\"command\":\"effort\",\"description\":\"set the reasoning-effort level\"}," ++
+        "{\"commands\":[{\"command\":\"effort\",\"description\":\"set the reasoning effort\"}," ++
             "{\"command\":\"help\",\"description\":\"list every command\"}," ++
-            "{\"command\":\"model\",\"description\":\"switch account and model together\"}," ++
-            "{\"command\":\"new\",\"description\":\"clear the conversation and its usage stats\"}," ++
-            "{\"command\":\"skill\",\"description\":\"load one of the discovered skills\"}," ++
-            "{\"command\":\"status\",\"description\":\"show the state of the session\"}]}",
+            "{\"command\":\"model\",\"description\":\"switch the model\"}," ++
+            "{\"command\":\"new\",\"description\":\"clear the conversation\"}," ++
+            "{\"command\":\"skill\",\"description\":\"pick a skill\"}," ++
+            "{\"command\":\"status\",\"description\":\"state the session\"}]}",
         registered,
     );
     try controller.sendEvent(.information, "You attached @drinky_bot.");

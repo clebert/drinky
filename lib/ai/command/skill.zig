@@ -14,7 +14,7 @@ const skills = @import("../skills.zig");
 const Context = @import("Context.zig");
 
 pub const name = "skill";
-pub const summary = "load one of the discovered skills";
+pub const summary = "pick a skill";
 
 const whitespace = " \t\r\n";
 

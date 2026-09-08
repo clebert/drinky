@@ -177,7 +177,7 @@ pub const summaries = blk: {
     // bare name opens, and this row states the load of one named skill.
     list[commands.len] = .{
         .name = skill_prefix ++ "name",
-        .summary = "load one named skill",
+        .summary = "load a skill",
         .tail = "the task of the skill",
         .remote = true,
         .during_turn = false,
@@ -652,11 +652,11 @@ test "a line without a name opens its list" {
                 try std.testing.expectEqual(commands.len - 1, pick.options.len);
                 // Alphabetical, the summary after the name, and no `/help` row.
                 try std.testing.expectEqualStrings(
-                    "/effort — set the reasoning-effort level",
+                    "/effort — set the reasoning effort",
                     pick.options[0],
                 );
                 try std.testing.expectEqualStrings(
-                    "/system — inspect the complete system prompt",
+                    "/system — show the complete system prompt",
                     pick.options[pick.options.len - 1],
                 );
                 for (pick.options) |option|

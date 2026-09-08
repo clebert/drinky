@@ -20,7 +20,7 @@ const Context = @import("Context.zig");
 const testing = @import("testing.zig");
 
 pub const name = "effort";
-pub const summary = "set the reasoning-effort level";
+pub const summary = "set the reasoning effort";
 
 /// The whole ladder, in order.
 const ladder = std.enums.values(llm.Effort);
