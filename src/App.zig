@@ -3054,7 +3054,7 @@ fn syncMirror(self: *App) !void {
     try self.mirror.sync(&self.controller, &self.mirrorView());
 }
 
-/// Send the last blocks of the ending turn and turn its activity message into
+/// Send the last blocks of the ending turn, drop the activity message, and send
 /// the summary. The session has ended the turn, so every block is committed,
 /// and a failure armed its retry by now, so the chat gets the failed turn
 /// message with it.
@@ -10531,9 +10531,9 @@ test "a Telegram message during a turn queues as steering that drops while the b
 }
 
 // The chat follows the transcript: the activity message opens the turn, the
-// answer goes out when it commits, the summary closes the turn, and the prompt
-// of the turn gets its mark at the round that commits it. The chat notifies
-// once, for the answer.
+// answer goes out when it commits, the activity message leaves, and a new
+// summary notifies. The prompt of the turn gets its mark at the round that
+// commits it.
 test "the chat mirrors a completed turn with its activity message, its answer, and its summary" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
@@ -10549,8 +10549,10 @@ test "the chat mirrors a completed turn with its activity message, its answer, a
             .{ .body = remote_ok_sent },
             .{ .body = "{\"ok\":true,\"result\":{\"message_id\":50}}" },
             .{ .body = remote_ok_sent },
+            .{ .body = remote_ok_sent },
         } },
-        .{ .method = "editMessageText", .replies = &.{ .{ .body = remote_ok_true }, .{ .body = remote_ok_true } } },
+        .{ .method = "editMessageText", .replies = &.{.{ .body = remote_ok_true }} },
+        .{ .method = "deleteMessage", .replies = &.{.{ .body = remote_ok_true }} },
         .{ .method = "setMessageReaction", .replies = &.{.{ .body = remote_ok_true }} },
     });
     defer server.deinit();
@@ -10613,8 +10615,8 @@ test "the chat mirrors a completed turn with its activity message, its answer, a
     );
     try std.testing.expectEqual(@as(usize, 2), server.sendCount());
 
-    // The receipt closes the turn: the answer goes out and notifies, and the
-    // summary replaces the activity.
+    // The receipt closes the turn: the answer goes out silent, the activity
+    // message leaves, and a new summary notifies.
     var result: WorkerResult = .{
         .outcome = .{
             .receipt = .{ .history_base = 0, .history_end = 2, .steering_committed_count = 0 },
@@ -10628,20 +10630,24 @@ test "the chat mirrors a completed turn with its activity message, its answer, a
     const answer = try server.waitForSend(2);
     try std.testing.expect(std.mem.indexOf(u8, answer, "\"text\":\"The <b>answer</b>.\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, answer, "\"reply_markup\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, answer, "\"disable_notification\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, answer, "\"disable_notification\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, answer, "\"parse_mode\":\"HTML\"") != null);
-    const summary = try server.waitForRequest("/editMessageText", 1);
+    try std.testing.expectEqualStrings(
+        "{\"chat_id\":99,\"message_id\":50}",
+        try server.waitForRequest("/deleteMessage", 0),
+    );
+    const summary = try server.waitForSend(3);
     try std.testing.expect(std.mem.indexOf(
         u8,
         summary,
         "\"text\":\"ℹ Tools: 0 calls · Time: ",
     ) != null);
     // A signed-out session with no model states its tokens alone, as the status
-    // line does. The summary holds no button and keeps its symbol.
+    // line does. The summary holds no button, keeps its symbol, and notifies.
     try std.testing.expect(std.mem.indexOf(
         u8,
         summary,
-        " · Context: 0 · Cost: ~$0.00\",\"parse_mode\":\"HTML\"}",
+        " · Context: 0 · Cost: ~$0.00\",\"disable_notification\":false,\"parse_mode\":\"HTML\"}",
     ) != null);
     try std.testing.expect(std.mem.indexOf(u8, summary, "reply_markup") == null);
     try server.finish();
@@ -10650,9 +10656,9 @@ test "the chat mirrors a completed turn with its activity message, its answer, a
 }
 
 // A failed turn marks what it did not commit: the prompt of a turn that
-// committed nothing and the queued message alike get 👎. Its error event is the
-// one message that notifies, and the summary opens with the outcome.
-test "a failed turn marks its uncommitted messages and notifies its error" {
+// committed nothing and the queued message alike get 👎. Its error event stays
+// silent, and the summary notifies.
+test "a failed turn marks its uncommitted messages and notifies its summary" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
@@ -10667,8 +10673,9 @@ test "a failed turn marks its uncommitted messages and notifies its error" {
             .{ .body = remote_ok_sent },
             .{ .body = remote_ok_sent },
             .{ .body = remote_ok_sent },
+            .{ .body = remote_ok_sent },
         } },
-        .{ .method = "editMessageText", .replies = &.{.{ .body = remote_ok_true }} },
+        .{ .method = "deleteMessage", .replies = &.{.{ .body = remote_ok_true }} },
         .{ .method = "setMessageReaction", .replies = &.{
             .{ .body = remote_ok_true },
             .{ .body = remote_ok_true },
@@ -10714,13 +10721,14 @@ test "a failed turn marks its uncommitted messages and notifies its error" {
         failure,
         "\"text\":\"⚠ The provider refused the request.\"",
     ) != null);
-    try std.testing.expect(std.mem.indexOf(u8, failure, "\"disable_notification\":false") != null);
-    const summary = try server.waitForRequest("/editMessageText", 0);
+    try std.testing.expect(std.mem.indexOf(u8, failure, "\"disable_notification\":true") != null);
+    const summary = try server.waitForSend(3);
     try std.testing.expect(std.mem.indexOf(
         u8,
         summary,
         "\"text\":\"⚠ Failed · Tools: 0 calls · Time: ",
     ) != null);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "\"disable_notification\":false") != null);
     const prompt = try server.waitForRequest("/setMessageReaction", 1);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "\"message_id\":7,\"reaction\":[{\"type\":\"emoji\",\"emoji\":\"👎\"}]") != null);
     const dropped = try server.waitForRequest("/setMessageReaction", 2);
@@ -10927,13 +10935,15 @@ test "the failed turn message dismisses the retry from the chat and stands at th
             .{ .body = remote_ok_sent },
             .{ .body = remote_ok_sent },
             .{ .body = remote_ok_sent },
+            .{ .body = remote_ok_sent },
             .{ .body = "{\"ok\":true,\"result\":{\"message_id\":70}}" },
             .{ .body = remote_ok_sent },
             .{ .body = remote_ok_sent },
             .{ .body = "{\"ok\":true,\"result\":{\"message_id\":80}}" },
             .{ .body = remote_ok_sent },
         } },
-        .{ .method = "editMessageText", .replies = &.{ .{ .body = remote_ok_true }, .{ .body = remote_ok_true } } },
+        .{ .method = "editMessageText", .replies = &.{.{ .body = remote_ok_true }} },
+        .{ .method = "deleteMessage", .replies = &.{.{ .body = remote_ok_true }} },
         .{ .method = "answerCallbackQuery", .replies = &.{ .{ .body = remote_ok_true }, .{ .body = remote_ok_true } } },
     });
     defer server.deinit();
@@ -10962,7 +10972,7 @@ test "the failed turn message dismisses the retry from the chat and stands at th
     defer app.freeWorkerResult(&result);
     try app.finishWorkerResult(&result);
     try std.testing.expect(app.retry != null);
-    const failed = try server.waitForSend(3);
+    const failed = try server.waitForSend(4);
     try std.testing.expect(std.mem.indexOf(
         u8,
         failed,
@@ -10986,7 +10996,7 @@ test "the failed turn message dismisses the retry from the chat and stands at th
     try std.testing.expectEqualStrings(
         "{\"chat_id\":99,\"message_id\":70,\"text\":\"⚠ Failed turn\"," ++
             "\"parse_mode\":\"HTML\"}",
-        try server.waitForRequest("/editMessageText", 1),
+        try server.waitForRequest("/editMessageText", 0),
     );
 
     // A retry that waits at the attach gets its message then. The detach sends
@@ -10995,11 +11005,11 @@ test "the failed turn message dismisses the retry from the chat and stands at th
     try app.armRetry(&result, false);
     try app.handleKey(&.escape);
     try std.testing.expect(app.session.input.owner == .none);
-    _ = try server.waitForSend(4);
+    _ = try server.waitForSend(5);
     try app.pumpRemoteEvents(1);
     try std.testing.expect(app.session.input.owner == .terminal);
     try app.controller.attachSaved(0);
-    const attached = try server.waitForSend(6);
+    const attached = try server.waitForSend(7);
     try std.testing.expect(std.mem.indexOf(
         u8,
         attached,
@@ -11008,12 +11018,11 @@ test "the failed turn message dismisses the retry from the chat and stands at th
     try std.testing.expect(std.mem.indexOf(u8, attached, "\"callback_data\":\"retry:3\"") != null);
     try std.testing.expect(!app.mirror.namesRetry(2));
     try app.handleKey(&.escape);
-    _ = try server.waitForSend(7);
+    _ = try server.waitForSend(8);
     try app.pumpRemoteEvents(1);
     try server.finish();
-    // The two edits are the summary and the dismiss. No edit went out at either
-    // detach.
-    try std.testing.expectEqual(@as(usize, 2), server.countOf("/editMessageText"));
+    // The one edit is the dismiss. No edit went out at either detach.
+    try std.testing.expectEqual(@as(usize, 1), server.countOf("/editMessageText"));
 }
 
 // The agent commits its last reply before the turn returns, so the usage event
@@ -11035,8 +11044,10 @@ test "the chat gives the answer its button when the commit lands before the rece
             .{ .body = remote_ok_sent },
             .{ .body = "{\"ok\":true,\"result\":{\"message_id\":50}}" },
             .{ .body = "{\"ok\":true,\"result\":{\"message_id\":51}}" },
+            .{ .body = remote_ok_sent },
         } },
         .{ .method = "editMessageText", .replies = &.{ .{ .body = remote_ok_true }, .{ .body = remote_ok_true } } },
+        .{ .method = "deleteMessage", .replies = &.{.{ .body = remote_ok_true }} },
     });
     defer server.deinit();
     try server.start();
@@ -11058,6 +11069,7 @@ test "the chat gives the answer its button when the commit lands before the rece
         .payload = .{ .text = try gpa.dupe(u8, "The answer.") },
     } }};
     _ = try app.applyBatch(&events);
+    _ = try server.waitForRequest("/editMessageText", 0);
     // The commit of the last reply travels with the usage event that follows it,
     // so the answer commits here and goes out before the receipt.
     var committed = [_]UiEvent{.{ .turn = .{
@@ -11067,6 +11079,7 @@ test "the chat gives the answer its button when the commit lands before the rece
         .payload = .{ .usage = .{} },
     } }};
     _ = try app.applyBatch(&committed);
+    _ = try server.waitForRequest("/editMessageText", 1);
 
     var result: WorkerResult = .{
         .outcome = .{
@@ -11085,6 +11098,7 @@ test "the chat gives the answer its button when the commit lands before the rece
         "[{\"text\":\"Shorten\",\"callback_data\":\"shorten:2\"}]",
     ) != null);
     try std.testing.expect(app.mirror.namesAnswer(2));
+    _ = try server.waitForSend(3);
     try server.finish();
 }
 
@@ -11106,9 +11120,10 @@ test "the shorten button rides the last answer and its tap waits for the prompt"
             .{ .body = remote_ok_sent },
             .{ .body = "{\"ok\":true,\"result\":{\"message_id\":50}}" },
             .{ .body = remote_ok_sent },
+            .{ .body = remote_ok_sent },
             .{ .body = "{\"ok\":true,\"result\":{\"message_id\":60}}" },
         } },
-        .{ .method = "editMessageText", .replies = &.{.{ .body = remote_ok_true }} },
+        .{ .method = "deleteMessage", .replies = &.{.{ .body = remote_ok_true }} },
         .{ .method = "answerCallbackQuery", .replies = &.{
             .{ .body = remote_ok_true },
             .{ .body = remote_ok_true },
@@ -11288,8 +11303,9 @@ test "a skill loaded by a tap retains no prompt, so its failed turn fills no edi
             .{ .body = remote_ok_sent },
             .{ .body = remote_ok_sent },
             .{ .body = remote_ok_sent },
+            .{ .body = remote_ok_sent },
         } },
-        .{ .method = "editMessageText", .replies = &.{.{ .body = remote_ok_true }} },
+        .{ .method = "deleteMessage", .replies = &.{.{ .body = remote_ok_true }} },
         .{ .method = "answerCallbackQuery", .replies = &.{.{ .body = remote_ok_true }} },
     });
     defer server.deinit();

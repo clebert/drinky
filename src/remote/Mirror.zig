@@ -26,11 +26,13 @@
 //! without the button clears the live serial.
 //!
 //! The mirror talks to the chat through `chat`: a pointer to the controller, or
-//! to a recorder in a test, with `listens`, `send`, `sendTracked`, and `edit`.
-//! A chat that does not listen gets no render and no send, and the mirror keeps
-//! the state of the turn alone, so an attach during a turn finds it. Every send
-//! is silent except the last message of a completed or failed turn, so the chat
-//! notifies once per turn.
+//! to a recorder in a test, with `listens`, `send`, `sendTracked`, `edit`, and
+//! `delete`. A chat that does not listen gets no render and no send, and the
+//! mirror keeps the state of the turn alone, so an attach during a turn finds
+//! it. Every send is silent except the summary of a completed or failed turn, so
+//! the chat notifies once at the end of that turn. That summary is a new
+//! message, and the activity message leaves the chat. A canceled turn edits the
+//! activity message and stays silent.
 
 const std = @import("std");
 
@@ -202,8 +204,6 @@ const Activity = struct {
 
 /// What the last messages of a flush carry, and where it stops.
 const Close = struct {
-    /// Whether the last message of the flush notifies.
-    notify: bool = false,
     /// Whether the last answer of the flush takes the `Shorten` button.
     shorten: bool = false,
     /// Whether a trailing answer waits. Its message can still carry the button
@@ -221,7 +221,6 @@ const Rendered = struct {
 
 /// What one send of a rendered block carries beside its text.
 const Send = struct {
-    notify: bool = false,
     /// The keyboard of the last message of the block, or null.
     markup: ?[]const u8 = null,
 };
@@ -330,28 +329,48 @@ fn activityMarkup(self: *Mirror, turn: *const Turn) ![]u8 {
     });
 }
 
-/// Send the last blocks of the turn, and turn the activity message into the
-/// summary of the turn, which holds no button and keeps the symbol. The last
-/// message of a completed or failed turn notifies. A canceled turn ends in
-/// silence, because the cancel came from the chat or the terminal took the
+/// Send the last blocks of the turn, then close the activity message. A
+/// completed or failed turn deletes that message and sends the summary, which
+/// notifies. A canceled turn edits the activity message into the summary and
+/// stays silent, because the cancel came from the chat or the terminal took the
 /// session over. A failure that armed a retry sends the failed turn message with
 /// its buttons. A completed turn alone gives its last answer the `Shorten`
 /// button, because a partial answer is no answer to shorten.
 pub fn endTurn(self: *Mirror, chat: anytype, view: *const View, end: *const End) !void {
     defer self.turn = null;
     if (!chat.listens()) return;
-    try self.flush(chat, view, .{
-        .notify = end.outcome != .canceled,
-        .shorten = end.outcome == .completed,
-    });
+    try self.flush(chat, view, .{ .shorten = end.outcome == .completed });
     if (self.turn) |*turn| {
-        if (turn.handle) |handle| {
-            const text = try self.summary(turn, end);
-            defer self.gpa.free(text);
-            try chat.edit(handle, text, &.{ .parse_mode = html.parse_mode });
-        }
+        if (end.outcome == .canceled)
+            try self.editSummary(chat, turn, end)
+        else
+            try self.sendSummary(chat, turn, end);
     }
     if (end.retry_armed) try self.sendRetry(chat);
+}
+
+/// Replace the activity message of `turn` with the silent summary of a canceled
+/// turn. A turn without a handle changes nothing.
+fn editSummary(self: *Mirror, chat: anytype, turn: *const Turn, end: *const End) !void {
+    const handle = turn.handle orelse return;
+    const text = try self.summary(turn, end);
+    defer self.gpa.free(text);
+    try chat.edit(handle, text, &.{ .parse_mode = html.parse_mode });
+}
+
+/// Send the summary of a completed or failed turn, which notifies, then take
+/// the activity message out of the chat. The summary goes first, so a full
+/// queue cannot drop it after the activity message is already gone. A turn
+/// without a handle still sends the summary. A dropped summary keeps the
+/// activity message.
+fn sendSummary(self: *Mirror, chat: anytype, turn: *const Turn, end: *const End) !void {
+    const text = try self.summary(turn, end);
+    defer self.gpa.free(text);
+    if ((try chat.sendTracked(text, &.{
+        .disable_notification = false,
+        .parse_mode = html.parse_mode,
+    })) == null) return;
+    if (turn.handle) |handle| try chat.delete(handle);
 }
 
 /// Send the failed turn message with its buttons. A newer one replaces an older
@@ -486,7 +505,6 @@ fn flush(self: *Mirror, chat: anytype, view: *const View, close: Close) !void {
     if (answer_index != null and shorten_index == null) self.answer_serial = null;
     for (rendered.items, 0..) |item, index| {
         try self.sendHtml(chat, item.text, .{
-            .notify = close.notify and index + 1 == rendered.items.len,
             .markup = if (shorten_index == index) markup else null,
         });
     }
@@ -538,8 +556,8 @@ fn renderBlock(self: *Mirror, block: *const ui.block.Entry) !?[]u8 {
 }
 
 /// Send one rendered block, in as many messages as its length takes. The last
-/// message notifies and takes the keyboard, because a block that splits ends
-/// there.
+/// part takes the keyboard, because a block that splits ends there. Every part
+/// is silent. The summary of the turn notifies.
 fn sendHtml(self: *Mirror, chat: anytype, text: []const u8, send: Send) !void {
     var parts = html.Parts.init(text, html.message_units_max);
     // Every part consumes text, so the split ends.
@@ -547,7 +565,7 @@ fn sendHtml(self: *Mirror, chat: anytype, text: []const u8, send: Send) !void {
         defer self.gpa.free(part.text);
         try chat.send(part.text, &.{
             .parse_mode = html.parse_mode,
-            .disable_notification = !(send.notify and part.last),
+            .disable_notification = true,
             .markup = if (part.last) send.markup else null,
         });
     }
@@ -588,7 +606,11 @@ const Recorder = struct {
     gpa: std.mem.Allocator,
     sends: std.ArrayList(Sent) = .empty,
     edits: std.ArrayList(Edited) = .empty,
+    deletions: std.ArrayList(Attachment.Handle) = .empty,
     handle_next: Attachment.Handle = 1,
+    /// When true, a tracked send returns null and records nothing, like a full
+    /// queue on the controller.
+    drop_tracked: bool = false,
 
     const Sent = struct {
         text: []u8,
@@ -615,6 +637,7 @@ const Recorder = struct {
             if (edited.markup) |markup| self.gpa.free(markup);
         }
         self.edits.deinit(self.gpa);
+        self.deletions.deinit(self.gpa);
     }
 
     fn listens(_: *const Recorder) bool {
@@ -630,6 +653,7 @@ const Recorder = struct {
         text: []const u8,
         options: *const Client.SendOptions,
     ) !?Attachment.Handle {
+        if (self.drop_tracked) return null;
         const handle = self.handle_next;
         self.handle_next += 1;
         try self.record(text, options, handle);
@@ -654,6 +678,10 @@ const Recorder = struct {
             .markup = markup,
             .handle = handle,
         });
+    }
+
+    fn delete(self: *Recorder, handle: Attachment.Handle) !void {
+        try self.deletions.append(self.gpa, handle);
     }
 
     fn edit(
@@ -879,8 +907,8 @@ test "the activity message edits on a state change alone, and the summary ends i
     try std.testing.expectEqualStrings("ℹ Thinking · Tools: 2 calls", chat.lastEdit().text);
 
     // The last answer block closes at the receipt, so it goes out with the end
-    // of the turn, and it alone notifies. The summary holds no button and keeps
-    // the symbol.
+    // of the turn, silent. The activity message leaves, and a new summary
+    // notifies.
     try blocks.append(.model, .{}, "first");
     try blocks.append(.model, .{}, "last");
     try mirror.endTurn(&chat, &blocks.idle(), &.{
@@ -888,16 +916,19 @@ test "the activity message edits on a state change alone, and the summary ends i
         .status = &test_status,
         .now_ms = 126_400,
     });
-    try std.testing.expectEqual(@as(usize, 3), chat.sends.items.len);
+    try std.testing.expectEqual(@as(usize, 4), chat.sends.items.len);
     try std.testing.expect(chat.sends.items[1].options.disable_notification);
     try std.testing.expectEqualStrings("last", chat.sends.items[2].text);
-    try std.testing.expect(!chat.sends.items[2].options.disable_notification);
+    try std.testing.expect(chat.sends.items[2].options.disable_notification);
     try std.testing.expectEqualStrings(
         "ℹ Tools: 2 calls · Time: 2m 5s · Context: 45% · Cost: ~$0.42",
-        chat.lastEdit().text,
+        chat.lastSend().text,
     );
-    try std.testing.expectEqualStrings(html.parse_mode, chat.lastEdit().parse_mode.?);
-    try std.testing.expect(chat.lastEdit().markup == null);
+    try std.testing.expect(!chat.lastSend().options.disable_notification);
+    try std.testing.expectEqualStrings(html.parse_mode, chat.lastSend().options.parse_mode.?);
+    try std.testing.expect(chat.lastSend().markup == null);
+    try std.testing.expectEqual(@as(usize, 1), chat.deletions.items.len);
+    try std.testing.expectEqual(handle, chat.deletions.items[0]);
     try std.testing.expect(mirror.turn == null);
     // The turn is over, so a tap on its keyboard is stale.
     try std.testing.expect(!mirror.namesTurn(1));
@@ -941,10 +972,10 @@ test "a failed turn that armed a retry sends the failed turn message, which lose
     defer blocks.deinit();
     var mirror = Mirror.init(gpa);
 
-    // A failure without a retry sends no such message.
+    // A failure without a retry sends the summary and no failed turn message.
     try mirror.beginTurn(&chat, 0);
     try mirror.endTurn(&chat, &blocks.idle(), &.{ .outcome = .failed, .status = &test_status, .now_ms = 0 });
-    try std.testing.expectEqual(@as(usize, 1), chat.sends.items.len);
+    try std.testing.expectEqual(@as(usize, 2), chat.sends.items.len);
     try std.testing.expect(mirror.retry == null);
 
     try mirror.beginTurn(&chat, 0);
@@ -1035,7 +1066,7 @@ test "a detach forgets the messages of the chat and keeps the turn" {
     try std.testing.expectEqual(edits, chat.edits.items.len);
 }
 
-test "a canceled turn ends in silence, and a failed turn notifies its error" {
+test "a canceled turn ends in silence, and a failed turn notifies its summary" {
     const gpa = std.testing.allocator;
     var chat: Recorder = .{ .gpa = gpa };
     defer chat.deinit();
@@ -1053,21 +1084,73 @@ test "a canceled turn ends in silence, and a failed turn notifies its error" {
         "ℹ Canceled · Tools: 0 calls · Time: 500ms · Context: 45% · Cost: ~$0.42",
         chat.lastEdit().text,
     );
+    try std.testing.expectEqual(@as(usize, 0), chat.deletions.items.len);
 
     try mirror.beginTurn(&chat, 1_000);
     try blocks.append(.event, .{ .is_error = true }, "The provider refused the request.");
+    const activity = chat.lastSend().handle.?;
     try mirror.endTurn(&chat, &blocks.idle(), &.{ .outcome = .failed, .status = &test_status, .now_ms = 3_000 });
     try std.testing.expectEqualStrings(
         "⚠ The provider refused the request.",
-        chat.lastSend().text,
+        chat.sends.items[chat.sends.items.len - 2].text,
     );
-    try std.testing.expect(!chat.lastSend().options.disable_notification);
-    // A failed turn takes the failure symbol on its summary too.
+    try std.testing.expect(chat.sends.items[chat.sends.items.len - 2].options.disable_notification);
     try std.testing.expect(std.mem.startsWith(
         u8,
-        chat.lastEdit().text,
+        chat.lastSend().text,
         "⚠ Failed · Tools: 0 calls · Time: 2.0s",
     ));
+    try std.testing.expect(!chat.lastSend().options.disable_notification);
+    try std.testing.expectEqual(@as(usize, 1), chat.deletions.items.len);
+    try std.testing.expectEqual(activity, chat.deletions.items[0]);
+}
+
+test "a completed turn notifies on its summary when the last answer already went out" {
+    const gpa = std.testing.allocator;
+    var chat: Recorder = .{ .gpa = gpa };
+    defer chat.deinit();
+    var blocks: Blocks = .{ .gpa = gpa };
+    defer blocks.deinit();
+    var mirror = Mirror.init(gpa);
+
+    try mirror.beginTurn(&chat, 0);
+    try blocks.append(.model, .{}, "answer");
+    try mirror.sync(&chat, &blocks.live(1, .{ .streaming = null, .tool = "bash", .calls = 1 }));
+    try std.testing.expectEqualStrings("answer", chat.lastSend().text);
+    try std.testing.expect(chat.lastSend().options.disable_notification);
+    const activity = chat.sends.items[0].handle.?;
+
+    try mirror.endTurn(&chat, &blocks.idle(), &.{
+        .outcome = .completed,
+        .status = &test_status,
+        .now_ms = 0,
+    });
+    try std.testing.expectEqual(@as(usize, 3), chat.sends.items.len);
+    try std.testing.expect(!chat.lastSend().options.disable_notification);
+    try std.testing.expect(std.mem.startsWith(u8, chat.lastSend().text, "ℹ Tools: 1 call"));
+    try std.testing.expectEqual(@as(usize, 1), chat.deletions.items.len);
+    try std.testing.expectEqual(activity, chat.deletions.items[0]);
+}
+
+test "a completed turn keeps the activity message when the summary cannot queue" {
+    const gpa = std.testing.allocator;
+    var chat: Recorder = .{ .gpa = gpa };
+    defer chat.deinit();
+    var blocks: Blocks = .{ .gpa = gpa };
+    defer blocks.deinit();
+    var mirror = Mirror.init(gpa);
+
+    try mirror.beginTurn(&chat, 0);
+    const activity = chat.sends.items[0].handle.?;
+    chat.drop_tracked = true;
+    try mirror.endTurn(&chat, &blocks.idle(), &.{
+        .outcome = .completed,
+        .status = &test_status,
+        .now_ms = 0,
+    });
+    try std.testing.expectEqual(@as(usize, 1), chat.sends.items.len);
+    try std.testing.expectEqual(@as(usize, 0), chat.deletions.items.len);
+    try std.testing.expectEqual(activity, chat.sends.items[0].handle.?);
 }
 
 test "an open starts at the committed frontier and gives a running turn its activity message" {
@@ -1228,16 +1311,19 @@ test "a completed turn gives its last answer the shorten button, and a newer ans
     try std.testing.expect(chat.sends.items[3].markup == null);
     try std.testing.expect(mirror.answer_serial == null);
 
-    // The closing flush gives the last answer of the turn the button.
+    // The closing flush gives the last answer of the turn the button. The
+    // summary follows it and notifies.
     try blocks.append(.model, .{}, "last");
     try mirror.endTurn(&chat, &blocks.idle(), &.{
         .outcome = .completed,
         .status = &test_status,
         .now_ms = 0,
     });
-    try std.testing.expectEqual(@as(usize, 5), chat.sends.items.len);
+    try std.testing.expectEqual(@as(usize, 6), chat.sends.items.len);
     try std.testing.expectEqualStrings("last", chat.sends.items[4].text);
     try std.testing.expectEqualStrings(shortenKeyboard("2"), chat.sends.items[4].markup.?);
+    try std.testing.expect(chat.lastSend().markup == null);
+    try std.testing.expect(!chat.lastSend().options.disable_notification);
     try std.testing.expect(mirror.namesAnswer(2));
     try std.testing.expect(!mirror.namesAnswer(1));
 
@@ -1249,7 +1335,7 @@ test "a completed turn gives its last answer the shorten button, and a newer ans
         .status = &test_status,
         .now_ms = 0,
     });
-    try std.testing.expectEqualStrings(shortenKeyboard("4"), chat.lastSend().markup.?);
+    try std.testing.expectEqualStrings(shortenKeyboard("4"), chat.sends.items[chat.sends.items.len - 2].markup.?);
     try std.testing.expect(mirror.namesAnswer(4));
     try std.testing.expect(!mirror.namesAnswer(2));
 
@@ -1297,12 +1383,12 @@ test "a canceled turn and a failed turn give no shorten button and stale the liv
         .status = &test_status,
         .now_ms = 0,
     });
-    try std.testing.expectEqualStrings("failed", chat.lastSend().text);
-    try std.testing.expect(chat.lastSend().markup == null);
+    try std.testing.expectEqualStrings("failed", chat.sends.items[chat.sends.items.len - 2].text);
+    try std.testing.expect(chat.sends.items[chat.sends.items.len - 2].markup == null);
     try std.testing.expect(mirror.answer_serial == null);
 }
 
-test "a long answer splits into several messages, and the last one notifies and takes the button" {
+test "a long answer splits into several messages, and the last part takes the button" {
     const gpa = std.testing.allocator;
     var chat: Recorder = .{ .gpa = gpa };
     defer chat.deinit();
@@ -1314,12 +1400,14 @@ test "a long answer splits into several messages, and the last one notifies and 
     try mirror.beginTurn(&chat, 0);
 
     try mirror.endTurn(&chat, &blocks.idle(), &.{ .outcome = .completed, .status = &test_status, .now_ms = 0 });
-    // The activity message, then two parts of the answer.
-    try std.testing.expectEqual(@as(usize, 3), chat.sends.items.len);
+    // The activity message, two parts of the answer, then the summary.
+    try std.testing.expectEqual(@as(usize, 4), chat.sends.items.len);
     try std.testing.expect(chat.sends.items[1].text.len <= html.message_units_max);
     try std.testing.expect(chat.sends.items[1].options.disable_notification);
-    try std.testing.expect(!chat.sends.items[2].options.disable_notification);
+    try std.testing.expect(chat.sends.items[2].options.disable_notification);
+    try std.testing.expect(!chat.lastSend().options.disable_notification);
     // The block ends at its last part, so the button rides that message alone.
     try std.testing.expect(chat.sends.items[1].markup == null);
     try std.testing.expectEqualStrings(shortenKeyboard("2"), chat.sends.items[2].markup.?);
+    try std.testing.expect(chat.lastSend().markup == null);
 }

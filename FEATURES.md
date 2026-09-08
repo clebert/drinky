@@ -529,8 +529,9 @@ service account key file.
   their tags, to the same message, with the same reply and buttons. An escaped `<b>` stays literal,
   and a link keeps its target as text behind its label. The detach event follows the same rule.
 - One activity message per turn shows `Thinking`, `Writing`, or `Running: bash` with the call count.
-  At the end it becomes the summary: the outcome, the tool count, the time, the context gauge, and
-  the cost. A failed summary opens with `⚠`, and every other one with `ℹ`.
+  At the end it leaves the chat, and a new summary names the outcome, the tool count, the time, the
+  context gauge, and the cost. A failed summary opens with `⚠`, and every other one with `ℹ`. A
+  canceled turn edits the activity message into that summary and keeps it.
 - The activity message holds a `Cancel turn` button and a `Withdraw` button. One tap on
   `Cancel turn` cancels the turn. A withdraw drops the whole queue like Ctrl+P and marks each
   dropped message with 👎, and a tap on an empty queue answers the toast `Nothing queued.`
@@ -549,8 +550,8 @@ service account key file.
 - A notice that a tap causes goes out as a toast. The detach leaves the chat as it stands, buttons
   included: a tap on an old keyboard gets no answer while no bot is attached, and a stale toast
   after the next attach.
-- Every message goes out silent except the last message of a completed or failed turn, so the chat
-  notifies once per turn.
+- Every message goes out silent except the summary of a completed or failed turn, so the chat
+  notifies once at the end of that turn.
 - A Telegram message gets 👀 as soon as Drinky takes it, then 👍 at the round that commits it. A
   message that the receipt of the turn did not commit gets 👎. A frozen chat keeps its last marks.
 - An event about the poll or the send of the chat stays in the terminal. A poll outage means that
