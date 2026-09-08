@@ -943,7 +943,7 @@ pub fn applyTurnEvent(self: *Session, event: *const TurnEvent) !bool {
                 .{ mismatch.served, mismatch.requested },
             );
             defer self.gpa.free(text);
-            try self.transcript.append(.event, .{ .is_error = true }, text);
+            try self.transcript.append(.event, .{ .is_warning = true }, text);
         },
         .steering_consumed => |consumed| {
             // Show the folded batch and hide its rows from the queue view, but
@@ -1069,20 +1069,26 @@ fn appendToolBlock(self: *Session, block: *const ToolBlock) !void {
     try self.transcript.append(.tool_result, options, text);
 }
 
+/// The flags an event takes from a command severity. A failure outranks a
+/// warning, and information sets neither flag.
+fn eventFlags(severity: ai.command.Outcome.Severity) ui.block.Entry.Options {
+    return .{
+        .is_error = severity == .failure,
+        .is_warning = severity == .warning,
+    };
+}
+
 /// Append one command message as a transcript event and free its content. A
-/// failure takes the error color and the warning symbol. Every other severity
-/// takes the accent color and the information symbol, because an event reports
-/// the state of the session and never a message.
+/// failure takes the error color and the warning symbol. A warning takes the
+/// warning color and the same symbol. Information takes the accent color and
+/// the information symbol, because an event reports the state of the session
+/// and never a message.
 ///
 /// One rule serves every event of a command. The line of a finished step and
 /// the report of a picker read alike.
 fn appendEvent(self: *Session, message: ai.command.Outcome.Message) !void {
     defer self.gpa.free(message.content);
-    try self.transcript.append(
-        .event,
-        .{ .is_error = message.severity == .failure },
-        message.content,
-    );
+    try self.transcript.append(.event, eventFlags(message.severity), message.content);
 }
 
 /// Record an event that a task raised at any moment, such as a report of the
@@ -1110,11 +1116,9 @@ pub fn recordAsyncEvent(
 /// again, with no block between the two, counts in the block it repeats, unless
 /// the event states its own moment. The caller frees the content.
 fn appendAsyncEvent(self: *Session, pending: *const PendingEvent) !void {
-    const options: ui.block.Entry.Options = .{
-        .is_error = pending.message.severity == .failure,
-        .survives_rewind = true,
-        .mirrored = pending.options.mirrored,
-    };
+    var options = eventFlags(pending.message.severity);
+    options.survives_rewind = true;
+    options.mirrored = pending.options.mirrored;
     if (pending.options.repeats and
         try self.transcript.repeatEvent(options, pending.message.content)) return;
     try self.transcript.append(.event, options, pending.message.content);
@@ -1540,6 +1544,8 @@ fn steeringPendingCount(self: *const Session) usize {
 pub fn beginTurn(self: *Session, generation: u64) void {
     self.transcript.endMessage();
     self.confirmations = .initEmpty();
+    // The line must not show the last turn's cache rate, allowance, or pool.
+    self.stats_shown.forgetTurnEvidence();
     self.mode = .{ .turn = .{
         .generation = generation,
         .progress_sequence_applied = 0,
@@ -2508,8 +2514,9 @@ test "a picker that reports records its line and still opens its list" {
         "Drinky could not save the list.",
         failure_blocks[0].content.event.text.items,
     );
-    // A failure sets the error flag. Every other severity leaves it false.
+    // A failure sets the error flag. A warning sets the warning flag.
     try std.testing.expect(failure_blocks[0].content.event.is_error);
+    try std.testing.expect(!failure_blocks[0].content.event.is_warning);
 
     session.closePicker();
     const empty_options = try gpa.alloc([]const u8, 1);
@@ -2533,6 +2540,7 @@ test "a picker that reports records its line and still opens its list" {
         "The account offers no model now.",
         blocks[1].content.event.text.items,
     );
+    try std.testing.expect(blocks[1].content.event.is_warning);
     try std.testing.expect(!blocks[1].content.event.is_error);
 }
 
@@ -2597,6 +2605,26 @@ test "the status line states the billing reports of the shown stats" {
     try std.testing.expectEqual(@as(f64, 25), info.quota.?.primary.?.used_percent);
     try std.testing.expectEqual(@as(f64, 10), info.credits.?.total);
     try std.testing.expectEqual(@as(f64, 2.86), info.credits.?.used);
+}
+
+test "a new turn hides the last turn's cache, quota, and credits" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
+    defer session.deinit();
+
+    session.stats_shown.cache_usage = .{ .input = 10, .cache_read = 90 };
+    session.stats_shown.quota = .{ .primary = .{ .used_percent = 25, .window_minutes = 300 } };
+    session.stats_shown.credits = .{ .total = 10, .used = 2.86 };
+    session.stats_shown.quota_seen_ms = 1;
+    session.beginTurn(1);
+
+    const info = session.statusInfo();
+    try std.testing.expect(info.turn_active);
+    try std.testing.expectEqual(ai.llm.Usage{}, info.cache_usage);
+    try std.testing.expect(info.quota == null);
+    try std.testing.expect(info.credits == null);
 }
 
 test "a confirmation is one-shot and separate from its notice" {
@@ -3087,7 +3115,8 @@ test "a model mismatch records a durable event beside the answer" {
     const blocks = session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 2), blocks.len);
     try std.testing.expectEqualStrings("answer", blocks[0].content.model.items);
-    try std.testing.expect(blocks[1].content.event.is_error);
+    try std.testing.expect(blocks[1].content.event.is_warning);
+    try std.testing.expect(!blocks[1].content.event.is_error);
     try std.testing.expectEqualStrings(
         "The provider answered with the model \"claude-opus-5\" instead of the " ++
             "requested model \"claude-fable-5\".",

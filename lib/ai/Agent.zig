@@ -80,16 +80,17 @@ pub const Stats = struct {
     /// means no measurement describes the current history, or the way the next
     /// request renders it. Empty history is 0.
     context_tokens: ?u64 = 0,
-    /// The prompt usage of the last request under the active cache key. An
-    /// all-zero prompt hides the cache rate, so a cleared value reads as
+    /// The prompt usage of the last request of this turn under the active cache
+    /// key. An all-zero prompt hides the cache rate, so a cleared value reads as
     /// absent. A canceled attempt counts: its prompt was processed and billed.
+    /// A new turn drops it until this turn reports usage.
     cache_usage: llm.Usage = .{},
     /// The active subscription account's remaining allowance. A response head
     /// that carries one replaces it, and so does an xAI billing report after
     /// each model reply. This includes a head whose stream then errors or is
     /// canceled, so an exhausted 429 still updates it. A report that omits one
-    /// leaves it unchanged. The value is null until a report arrives. An account
-    /// switch clears it. API-key accounts report none.
+    /// leaves it unchanged. The value is null until a report arrives. A new turn
+    /// drops it. An account switch clears it. API-key accounts report none.
     quota: ?llm.Quota = null,
     /// The monotonic milliseconds at which a report last stated `quota`, counted
     /// on the clock that includes a suspended system, because a window runs on
@@ -97,15 +98,15 @@ pub const Stats = struct {
     /// to its own report, so a consumer subtracts this from its own reading of
     /// that clock to show the wait that is left. A report that omits the
     /// allowance leaves this alone, so a kept countdown keeps running down
-    /// instead of starting again. It travels with the stats, so a failed turn
-    /// and a canceled turn both carry the right age. The value is relative to
-    /// this process alone, so a save must drop it and a restart must read it as
-    /// unknown.
+    /// instead of starting again. A new turn drops it with the allowance. It
+    /// travels with the stats, so a failed turn and a canceled turn both carry
+    /// the right age. The value is relative to this process alone, so a save
+    /// must drop it and a restart must read it as unknown.
     quota_seen_ms: i64 = 0,
     /// The credit pool of an account that spends a prepaid pool, in USD.
     /// Drinky reads the OpenRouter pool after each model reply. A report that
     /// names none leaves it unchanged. The value is null until a report
-    /// arrives. An account switch clears it.
+    /// arrives. A new turn drops it. An account switch clears it.
     credits: ?llm.Credits = null,
 
     /// Forget the allowance and the pool. Both hold what the last response of
@@ -114,6 +115,16 @@ pub const Stats = struct {
     fn forgetBilling(self: *Stats) void {
         self.quota = null;
         self.credits = null;
+    }
+
+    /// Forget the cache rate, the allowance, and the pool. A new turn must not
+    /// show the last turn, so it drops the three until this turn reports them.
+    /// The session cost and the context gauge stay, because they describe the
+    /// conversation.
+    pub fn forgetTurnEvidence(self: *Stats) void {
+        self.cache_usage = .{};
+        self.quota_seen_ms = 0;
+        self.forgetBilling();
     }
 };
 
@@ -581,6 +592,7 @@ fn runTurnWith(
     user_text: []const u8,
     handler: anytype,
 ) Outcome {
+    self.stats.forgetTurnEvidence();
     var turn: TurnState = .{ .base = self.items.items.len, .checkpoint = self.items.items.len };
     const disposition: Outcome.Disposition =
         if (self.runRounds(Dispatch, fetch, &turn, user_text, handler)) |_|
@@ -4631,30 +4643,34 @@ test "the head that states an allowance stamps its own arrival" {
     defer handler.deinit();
 
     // A window states its reset against the response that carried it, so the
-    // stamp must move only when a head states an allowance.
+    // stamp must move only when a head states an allowance. A later head in the
+    // same turn that states none keeps both, so the countdown keeps running
+    // down instead of starting again.
     agent.stats.quota_seen_ms = 0;
     var stated: ScriptedFetch = .{ .attempts = &.{
         .{ .stream = .{
-            .events = &end_turn_events,
+            .events = &tool_round_events,
             .quota = .{ .primary = .{
                 .used_percent = 12,
                 .window_minutes = 300,
                 .reset_seconds = 3180,
             } },
         } },
+        .{ .stream = .{ .events = &end_turn_events } },
     } };
-    try agent.runWith(&stated, "go", &handler);
+    const outcome = agent.runTurnWith(&stated, fake_tools, "go", &handler);
+    try std.testing.expect(outcome.disposition == .completed);
     const stamped = agent.stats.quota_seen_ms;
     try std.testing.expect(stamped > 0);
+    try std.testing.expectEqual(@as(f64, 12), agent.stats.quota.?.primary.?.used_percent);
 
-    // A head that states none keeps both the allowance and its stamp, so the
-    // countdown keeps running down instead of starting again.
+    // A new turn drops the last turn even when its head states none.
     var silent: ScriptedFetch = .{ .attempts = &.{
         .{ .stream = .{ .events = &end_turn_events } },
     } };
     try agent.runWith(&silent, "again", &handler);
-    try std.testing.expectEqual(@as(f64, 12), agent.stats.quota.?.primary.?.used_percent);
-    try std.testing.expectEqual(stamped, agent.stats.quota_seen_ms);
+    try std.testing.expect(agent.stats.quota == null);
+    try std.testing.expectEqual(@as(i64, 0), agent.stats.quota_seen_ms);
 }
 
 test "each committed round adopts a billing allowance" {
@@ -4707,7 +4723,28 @@ test "a response head adopts the allowance before the reply streams" {
     try std.testing.expectEqual(@as(usize, 3), handler.usage_count);
 }
 
-test "a failed billing read leaves the last-known allowance and continues the turn" {
+test "a new turn drops the last turn's cache rate, allowance, and pool" {
+    const gpa = std.testing.allocator;
+    var agent = scriptedAgent(gpa);
+    defer agent.deinit();
+    var handler: CaptureHandler = .{ .gpa = gpa };
+    defer handler.deinit();
+
+    agent.stats.cache_usage = .{ .input = 100, .cache_read = 900 };
+    agent.stats.quota = .{ .primary = .{ .used_percent = 25, .window_minutes = 300 } };
+    agent.stats.quota_seen_ms = 1;
+    agent.stats.credits = .{ .total = 10, .used = 2 };
+    var fetch: ScriptedFetch = .{
+        .attempts = &.{.{ .fail = error.Unexpected }},
+    };
+    try std.testing.expectError(error.Unexpected, agent.runWith(&fetch, "go", &handler));
+    try std.testing.expectEqual(llm.Usage{}, agent.stats.cache_usage);
+    try std.testing.expect(agent.stats.quota == null);
+    try std.testing.expectEqual(@as(i64, 0), agent.stats.quota_seen_ms);
+    try std.testing.expect(agent.stats.credits == null);
+}
+
+test "a failed billing read leaves this turn's allowance and continues the turn" {
     const gpa = std.testing.allocator;
     var agent = scriptedAgent(gpa);
     defer agent.deinit();
@@ -4715,9 +4752,11 @@ test "a failed billing read leaves the last-known allowance and continues the tu
     defer handler.deinit();
 
     const weekly: llm.Quota = .{ .primary = .{ .used_percent = 1, .window_minutes = 10080 } };
-    agent.stats.quota = weekly;
     var fetch: ScriptedFetch = .{
-        .attempts = &.{.{ .stream = .{ .events = &end_turn_events } }},
+        .attempts = &.{.{ .stream = .{
+            .events = &end_turn_events,
+            .quota = weekly,
+        } }},
         .quota_error = error.Timeout,
     };
     try agent.runWith(&fetch, "go", &handler);
@@ -4779,7 +4818,7 @@ test "a committed round reads the credit pool and reports it" {
     try std.testing.expectEqual(@as(f64, 2.86), agent.stats.credits.?.used);
 }
 
-test "a failed credit read leaves the last-known pool and continues the turn" {
+test "a failed credit read at the start of a turn leaves no pool" {
     const gpa = std.testing.allocator;
     var agent = scriptedAgent(gpa);
     defer agent.deinit();
@@ -4794,7 +4833,7 @@ test "a failed credit read leaves the last-known pool and continues the turn" {
     try agent.runWith(&fetch, "go", &handler);
     try std.testing.expectEqual(@as(usize, 1), fetch.sends);
     try std.testing.expectEqual(@as(usize, 1), fetch.credits_fetches);
-    try std.testing.expectEqual(@as(f64, 2), agent.stats.credits.?.used);
+    try std.testing.expect(agent.stats.credits == null);
 }
 
 test "a canceled credit read keeps a finished reply" {
@@ -5161,20 +5200,27 @@ test "a canceled request's partial usage is folded into the cost stats" {
     try std.testing.expectEqual(@as(u64, 200_000), agent.stats.cache_usage.cache_read);
 }
 
-test "a cancel before any usage frame leaves the cache-rate gauge intact" {
+test "a cancel before any usage frame leaves this turn's cache rate intact" {
     const gpa = std.testing.allocator;
     var agent = scriptedAgent(gpa);
     defer agent.deinit();
     var handler: CaptureHandler = .{ .gpa = gpa };
     defer handler.deinit();
 
-    // A prior request's usage backs the cache-rate gauge.
-    agent.stats.cache_usage = .{ .input = 42 };
-    // A cancel before the stream reports any usage must not fold a zero reading
-    // in and reset that gauge.
-    var fetch: ScriptedFetch = .{
-        .attempts = &.{.{ .stream = .{ .events = &.{}, .terminal_error = error.Canceled } }},
+    // Round one books the prompt. A cancel of the next round before any usage
+    // must not fold a zero reading in and reset that gauge.
+    const call_events = [_]llm.Event{
+        .{ .item = .{ .tool_call = .{
+            .call_id = "t1",
+            .name = "write",
+            .arguments_json = "{}",
+        } } },
+        .{ .stop = .{ .usage = .{ .input = 42 } } },
     };
+    var fetch: ScriptedFetch = .{ .attempts = &.{
+        .{ .stream = .{ .events = &call_events } },
+        .{ .stream = .{ .events = &.{}, .terminal_error = error.Canceled } },
+    } };
     const outcome = agent.runTurnWith(&fetch, fake_tools, "go", &handler);
     try std.testing.expect(std.meta.activeTag(outcome.disposition) == .canceled);
     try std.testing.expectEqual(@as(u64, 42), agent.stats.cache_usage.input);

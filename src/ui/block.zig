@@ -1,7 +1,7 @@
 //! The transcript-block model. `Entry.Content` is a tagged union that carries
 //! exactly each block's data: the plain blocks a byte buffer, the flagged ones a
-//! buffer plus an error flag, the reasoning one a buffer plus the account that
-//! produced it. A block owns its bytes (`init`/`deinit`), measures itself
+//! buffer plus error and warning flags, the reasoning one a buffer plus the
+//! account that produced it. A block owns its bytes (`init`/`deinit`), measures itself
 //! (`rows`), and paints itself (`render`) with the shared `paint` primitives. The
 //! model block grows in place as its reply streams, and its markdown renders as
 //! it goes.
@@ -66,6 +66,9 @@ pub const Entry = struct {
     pub const Flagged = struct {
         text: std.ArrayList(u8),
         is_error: bool,
+        /// Whether an event reports a warning the user can pass. A failure
+        /// outranks it. Other flagged blocks ignore this field.
+        is_warning: bool,
         /// How a line wider than the window fits. Only a tool box reads it. An
         /// event renders as a notice, which always wraps.
         fit: paint.Fit,
@@ -82,6 +85,23 @@ pub const Entry = struct {
         /// The bytes of the text before the suffix of its repeat count. Other
         /// flagged blocks ignore this field.
         base_len: usize,
+
+        /// How an event paints. A failure outranks a warning, and every other
+        /// event takes the accent role of a session report.
+        fn eventNotice(self: *const Flagged) paint.Notice {
+            if (self.is_error) return .{
+                .role = .@"error",
+                .prefix = paint.warning_prefix,
+            };
+            if (self.is_warning) return .{
+                .role = .warning,
+                .prefix = paint.warning_prefix,
+            };
+            return .{
+                .role = .accent,
+                .prefix = paint.information_prefix,
+            };
+        }
     };
 
     /// One run of model reasoning and the account slot that produced it. Only
@@ -101,6 +121,10 @@ pub const Entry = struct {
         /// it gives an event the warning symbol in place of the information
         /// symbol. The plain variants ignore it.
         is_error: bool = false,
+        /// Whether an event reports a warning the user can pass. It selects the
+        /// warning role and the warning symbol. A failure outranks it. Every
+        /// other variant ignores it.
+        is_warning: bool = false,
         /// How a tool box fits a line that is wider than the window. A call row
         /// and a measures line cut, because the start of each identifies it. The
         /// sentence of a failure wraps, because its instruction sits at the end,
@@ -171,6 +195,7 @@ pub const Entry = struct {
         const flagged: Flagged = .{
             .text = list,
             .is_error = options.is_error,
+            .is_warning = options.is_warning,
             .fit = options.fit,
             .survives_rewind = options.survives_rewind,
             .mirrored = options.mirrored,
@@ -228,6 +253,7 @@ pub const Entry = struct {
             else => return false,
         };
         if (flagged.is_error != options.is_error) return false;
+        if (flagged.is_warning != options.is_warning) return false;
         if (flagged.survives_rewind != options.survives_rewind) return false;
         if (flagged.mirrored != options.mirrored) return false;
         return std.mem.eql(u8, eventText(flagged), text);
@@ -281,10 +307,7 @@ pub const Entry = struct {
         return switch (self.content) {
             .user_note => .{ .role = .user_note, .prefix = paint.note_prefix },
             // An event wraps, so the transcript keeps the complete sentence.
-            .event => |flagged| .{
-                .role = if (flagged.is_error) .@"error" else .accent,
-                .prefix = if (flagged.is_error) paint.warning_prefix else paint.information_prefix,
-            },
+            .event => |*flagged| flagged.eventNotice(),
             .intro, .user, .tool_result, .thinking, .model => null,
         };
     }
@@ -744,6 +767,7 @@ test "each block kind pins the role that it paints" {
         // Every message that Drinky wrote for the user reports in this color.
         .{ .kind = .user_note, .notice = .user_note },
         .{ .kind = .event, .notice = .accent },
+        .{ .kind = .event, .options = .{ .is_warning = true }, .notice = .warning },
         .{ .kind = .event, .options = .{ .is_error = true }, .notice = .@"error" },
         .{ .kind = .user, .box = .user },
         .{ .kind = .tool_result, .box = .tool_success },
@@ -806,9 +830,9 @@ test "the intro block paints the Drinky caption" {
 }
 
 // A symbol identifies a notice when its color is unavailable in copied text: an
-// event opens on the information symbol, a failed event on the warning symbol,
-// and a line that Drinky wrote for the user on the arrow. Each symbol paints in
-// the role of its notice, so the row reads as one.
+// event opens on the information symbol, a warning or a failed event on the
+// warning symbol, and a line that Drinky wrote for the user on the arrow. Each
+// symbol paints in the role of its notice, so the row reads as one.
 test "each notice paints the symbol of its kind in its role" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -817,6 +841,8 @@ test "each notice paints the symbol of its kind in its role" {
     defer view.deinit();
     var failure = try Entry.init(gpa, .event, .{ .is_error = true }, "boom");
     defer failure.deinit(gpa);
+    var warning = try Entry.init(gpa, .event, .{ .is_warning = true }, "pass this state");
+    defer warning.deinit(gpa);
     var information = try Entry.init(gpa, .event, .{}, "all good");
     defer information.deinit(gpa);
     var note = try Entry.init(gpa, .user_note, .{}, "Skill: zig-style");
@@ -833,23 +859,29 @@ test "each notice paints the symbol of its kind in its role" {
     try failure.render(gpa, &placement);
     placement.id = 1;
     placement.base = 1;
-    try information.render(gpa, &placement);
+    try warning.render(gpa, &placement);
     placement.id = 2;
     placement.base = 2;
+    try information.render(gpa, &placement);
+    placement.id = 3;
+    placement.base = 3;
     try note.render(gpa, &placement);
     try view.render();
 
     const painted = out.written();
     const accent_sequence = comptime role.sequence(.accent);
+    const warning_sequence = comptime role.sequence(.warning);
     const error_sequence = comptime role.sequence(.@"error");
     const note_sequence = comptime role.sequence(.user_note);
     try std.testing.expect(std.mem.indexOf(u8, painted, accent_sequence ++ "ℹ all good") != null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, warning_sequence ++ "⚠ pass this state") != null);
     try std.testing.expect(std.mem.indexOf(u8, painted, error_sequence ++ "⚠ boom") != null);
     try std.testing.expect(std.mem.indexOf(u8, painted, note_sequence ++ "→ Skill: zig-style") != null);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, painted, "ℹ "));
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, painted, "⚠ "));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, painted, "⚠ "));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, painted, "→ "));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, painted, error_sequence));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, painted, warning_sequence));
     // The label of an event went with the color, so no row names one.
     try std.testing.expect(std.mem.indexOf(u8, painted, "Event: ") == null);
     try std.testing.expect(std.mem.indexOf(u8, painted, "Error: ") == null);
@@ -868,6 +900,7 @@ test "a repeated event states one count and matches its own text" {
     // Every flag of the event takes part, so a mirrored event and a terminal
     // event never share a block.
     try std.testing.expect(!entry.statesEvent(.{ .is_error = true, .mirrored = false }, "no route to host"));
+    try std.testing.expect(!entry.statesEvent(.{ .is_error = true, .is_warning = true }, "no route to host"));
     try std.testing.expect(!entry.statesEvent(.{}, "no route to host"));
     try std.testing.expect(!entry.statesEvent(.{ .is_error = true }, "other"));
 

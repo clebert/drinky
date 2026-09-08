@@ -9,7 +9,7 @@
 //! The line paints muted. Two kinds of field leave that role. A gauge takes a
 //! color when it fills past a threshold, and an identity field takes the normal
 //! intensity. Color means pressure. Intensity means identity. A notice takes the
-//! role of its severity, and an information notice takes the normal intensity.
+//! role of its severity, and an information notice takes the accent role.
 
 const std = @import("std");
 
@@ -63,7 +63,8 @@ pub const Info = struct {
     credits: ?ai.llm.Credits,
     /// Whether a turn runs. The quota is a live subscription allowance, the
     /// pool is a live balance, and the cache rate measures one request, so all
-    /// three show while a turn runs and go when it ends. An idle Drinky paints
+    /// three show while a turn runs and go when it ends. They show only after
+    /// this turn reports them, never from the last turn. An idle Drinky paints
     /// no frame, which freezes a countdown on the screen. The numbers are no
     /// safer: another agent on the same account spends the same allowance and
     /// the same pool, so an idle number can read too low, and it reads too
@@ -300,13 +301,13 @@ fn paintRuns(sink: *terminal.View.Sink, line: *const Line, kept: []const u8) !vo
 pub fn render(placement: *const paint.Placement, info: *const Info) !void {
     if (placement.base < placement.skip) return;
     if (info.notice) |notice| {
-        // An information notice takes the text role, not the muted role of the
-        // line. The row must read as a new message and not as the status it
-        // replaces. A warning and a failure carry their own color already, and
-        // they share the warning symbol, so the text states either one without
-        // its color.
+        // An information notice takes the accent role, like an information
+        // event in the transcript. The row must read as a new message and not
+        // as the status it replaces. A warning and a failure carry their own
+        // color already, and they share the warning symbol, so the text states
+        // either one without its color.
         const name: role.Name = switch (notice.severity) {
-            .information => .text,
+            .information => .accent,
             .warning => .warning,
             .failure => .@"error",
         };
@@ -368,8 +369,8 @@ pub fn render(placement: *const paint.Placement, info: *const Info) !void {
 /// Write the state of the session as one line for a reader with no column
 /// budget: every part of the line in its full form and in its order, so the
 /// answer of `/status` reads like the status line. An empty directory leaves the
-/// place out, and the quota, the credit pool, and the cache rate come while a
-/// turn runs alone, as on the line.
+/// place out, and the quota, the credit pool, and the cache rate come once this
+/// turn reports them, as on the line.
 pub fn writeSummary(out: *std.Io.Writer, info: *const Info) !void {
     // Both sides of the line, with the room that `render` gives each of them,
     // and the separator between them.
@@ -446,7 +447,8 @@ fn writeLeft(line: *Line, info: *const Info, parts: *const Parts) !void {
     if (parts.cost) try writeCost(line, info);
     // The quota is a live subscription allowance, the pool is a live balance,
     // and the cache rate measures one request, so all three belong to a
-    // running turn alone. A spent OpenAI subscription still names its plan and
+    // running turn alone. A value from the last turn stays out until this turn
+    // reports a new one. A spent OpenAI subscription still names its plan and
     // its wait in the failure message of the turn.
     if (!info.turn_active) return;
     if (info.quota) |quota| {
@@ -1221,7 +1223,7 @@ test "a warning notice takes the warning symbol in the warning role" {
     try expectHides(painted, &.{ "Error:", comptime role.sequence(.@"error") });
 }
 
-test "an information notice takes the information symbol at the normal intensity" {
+test "an information notice takes the information symbol in the accent role" {
     const gpa = std.testing.allocator;
     var info = test_info;
     info.notice = .{ .text = "Drinky loaded every queued message.", .severity = .information };
@@ -1230,7 +1232,9 @@ test "an information notice takes the information symbol at the normal intensity
     try renderForTest(gpa, &info, 40, &out);
 
     const painted = out.written();
-    try expectShows(painted, &.{"ℹ Drinky loaded every queued message."});
+    try expectShows(painted, &.{
+        comptime role.sequence(.accent) ++ "ℹ Drinky loaded every queued message.",
+    });
     try expectHides(painted, &.{ "Error:", "⚠" });
     // The muted role belongs to the line that the notice replaces. The row drops
     // it, so a notice never reads as the status behind it.
@@ -1485,6 +1489,18 @@ test "the quota and the cache rate show while a turn runs alone" {
     const painted = out.written();
     try expectShows(painted, &.{ "~/github/clebert/drinky (main)", "Context: 21%", "Cost: ~$0.39" });
     try expectHides(painted, &.{ "5h:", "Week:", "Cache:" });
+}
+
+test "a running turn hides the cache, quota, and credits until this turn reports them" {
+    var info = test_info;
+    info.cache_usage = .{};
+    info.quota = null;
+    info.credits = null;
+    try expectSummary(
+        "~/github/clebert/drinky (main) · Context: 21% (206k/1.0M) · Cost: ~$0.39 · " ++
+            "claude-opus-4-8 (Anthropic Subscription) · Effort: xhigh",
+        &info,
+    );
 }
 
 test "a countdown that runs out drops its bracket and keeps its share" {

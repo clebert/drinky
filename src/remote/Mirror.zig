@@ -527,7 +527,7 @@ fn renderBlock(self: *Mirror, block: *const ui.block.Entry) !?[]u8 {
             if (!flagged.mirrored) return null;
             try html.wrap(
                 &out.writer,
-                if (flagged.is_error) .failure else .information,
+                if (flagged.is_error) .failure else if (flagged.is_warning) .warning else .information,
                 flagged.text.items,
             );
         },
@@ -797,6 +797,23 @@ test "a step sends each committed answer, event, and note once, and skips the re
     // A second step over the same blocks sends nothing.
     try mirror.sync(&chat, &blocks.idle());
     try std.testing.expectEqual(@as(usize, 3), chat.sends.items.len);
+}
+
+test "a mirrored warning event opens with the warning symbol" {
+    const gpa = std.testing.allocator;
+    var chat: Recorder = .{ .gpa = gpa };
+    defer chat.deinit();
+    var blocks: Blocks = .{ .gpa = gpa };
+    defer blocks.deinit();
+    try blocks.append(.event, .{ .is_warning = true }, "The account offers no model now.");
+    var mirror = Mirror.init(gpa);
+
+    try mirror.sync(&chat, &blocks.idle());
+    try std.testing.expectEqual(@as(usize, 1), chat.sends.items.len);
+    try std.testing.expectEqualStrings(
+        "⚠ The account offers no model now.",
+        chat.sends.items[0].text,
+    );
 }
 
 test "a block above the committed frontier waits, and a rewound tail costs nothing" {

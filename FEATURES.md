@@ -239,9 +239,9 @@ service account key file.
   retry-after hint. A wait longer than the backoff cap ends the request. A spent OpenAI plan states
   its reset in the error body, so Drinky reports it after one try.
 - A stream frame that names a call or a block other than the open one ends the turn without a retry.
-- A reply from a model other than the requested one records a transcript event with both names. An
-  unchanged fallback reports once per turn. Drinky knows no rate for that model, so the reply
-  carries no price.
+- A reply from a model other than the requested one records a warning with both names. An unchanged
+  fallback reports once per turn. Drinky knows no rate for that model, so the reply carries no
+  price.
 - A failed request reports the message from the provider JSON error body, not the raw bytes. A
   failed response head names its status too. For a spent OpenAI subscription, the message names the
   plan and the wait.
@@ -339,8 +339,8 @@ service account key file.
   model name and the effort value take the normal intensity, so the two settings that the user
   changes stand out.
 - One temporary notice replaces the bottom line until the next user action. The notice keeps one
-  row, so it never moves the editor. An information notice opens with `ℹ`, and a warning or a
-  failure opens with `⚠` and carries its color.
+  row, so it never moves the editor. An information notice opens with `ℹ` in the accent color. A
+  warning or a failure opens with `⚠` and carries its color.
 - The context gauge holds what the last committed reply measured, and an empty history is 0. It
   reads `Context: Unknown` while the next request renders the history in another way: after a model
   switch, an account switch, or an effort change that stops a stored reasoning block from replaying.
@@ -356,8 +356,8 @@ service account key file.
 - An OpenRouter account spends a prepaid credit pool. Drinky reads the pool after each model reply,
   and the line states the remaining amount as `Credits: $7.14`. The pool takes no color, because an
   amount states no share. A key that the endpoint refuses states no pool.
-- The quota, the credit pool, and the cache-hit rate show while a turn runs. The cache-hit rate
-  measures one request.
+- The quota, the credit pool, and the cache-hit rate show once this turn reports them. They never
+  show the last turn. The cache-hit rate measures one request.
 - The context gauge and each quota window take the warning color from 75% used and the error color
   from 90% used. The config sets both shares. A color on this line always means pressure, and the
   color follows the printed share.
@@ -388,11 +388,12 @@ service account key file.
   label or a glyph marks every state, so color is never the only signal.
 - A message that Drinky wrote for the user opens with `→` and takes the user color and no box: the
   head of a loaded skill and the line of a retry attempt. A typed message cannot forge it.
-- A failed event opens with `⚠` and paints its whole text in the error color. Every other event
-  opens with `ℹ` and paints its whole text in the accent color. The symbol keeps the kind in copied
-  text, where the color is gone. An incomplete reply ends with a `⚠` event that states the output or
-  context limit. The sentence of a failed tool call keeps its `Error:` label, because the sentence
-  comes from the tool.
+- A failed event opens with `⚠` and paints its whole text in the error color. A warning event opens
+  with `⚠` and paints its whole text in the warning color. Every other event opens with `ℹ` and
+  paints its whole text in the accent color. The symbol keeps the kind in copied text, where the
+  color is gone. An incomplete reply ends with a `⚠` event that states the output or context limit.
+  The sentence of a failed tool call keeps its `Error:` label, because the sentence comes from the
+  tool.
 - An event that stays in the terminal and repeats itself back to back counts in the block it
   repeats. That block ends with `· Repeats: 3`, so a run of the same report takes one row. A
   `/status` answer takes a row of its own each time, because each one states its own moment.
