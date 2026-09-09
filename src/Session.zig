@@ -259,6 +259,14 @@ const Turn = struct {
     /// The box of every tool call above. Each frame rebuilds it, so the tail
     /// gets a `[]const ui.paint.Box` without a fresh allocation per repaint.
     box_view: std.ArrayList(ui.paint.Box),
+    /// The hash of the text of every box at the last frame, by position, so
+    /// this frame can tell which box changed.
+    box_hashes: std.ArrayList(u64),
+    /// What the frames track of every box, by position: whether this frame
+    /// changed it, and the epoch of the frame that composed it last. The layout
+    /// resets the screen for a changed box above the window while the terminal
+    /// still holds its rows, because no frame repaints it there.
+    box_tracks: std.ArrayList(layout.Track),
 
     fn activity(self: *const Turn) ui.paint.Activity {
         return .{
@@ -285,6 +293,32 @@ const Turn = struct {
             .emphasis = .first_value,
         });
         return self.box_view.items;
+    }
+
+    /// The tracks of `boxes`, by position, with the change of this frame stated.
+    /// A box at a new position counts as changed, and its track starts with no
+    /// epoch, so no frame composed it yet. The hashes then move on to this
+    /// frame, so the next frame compares against it.
+    fn trackBoxes(self: *Turn, gpa: std.mem.Allocator) ![]layout.Track {
+        // Every position holds one hash and one track, so the two lists grow
+        // and shrink together.
+        std.debug.assert(self.box_tracks.items.len == self.box_hashes.items.len);
+        const count = self.box_view.items.len;
+        try self.box_tracks.ensureTotalCapacity(gpa, count);
+        try self.box_hashes.ensureTotalCapacity(gpa, count);
+        for (self.box_view.items, 0..) |box, index| {
+            const hash = std.hash.Wyhash.hash(0, box.text);
+            if (index < self.box_hashes.items.len) {
+                self.box_tracks.items[index].changed = self.box_hashes.items[index] != hash;
+                self.box_hashes.items[index] = hash;
+            } else {
+                self.box_tracks.appendAssumeCapacity(.{ .changed = true });
+                self.box_hashes.appendAssumeCapacity(hash);
+            }
+        }
+        self.box_tracks.shrinkRetainingCapacity(count);
+        self.box_hashes.shrinkRetainingCapacity(count);
+        return self.box_tracks.items;
     }
 };
 
@@ -1091,6 +1125,16 @@ fn appendEvent(self: *Session, message: ai.command.Outcome.Message) !void {
     try self.transcript.append(.event, eventFlags(message.severity), message.content);
 }
 
+/// Replace the event at `index` with `message` and free its content. The line
+/// that announced a wait becomes the line that states its result, so a wait
+/// costs the transcript one line. The frame repaints the block where it stands,
+/// and a block that no frame composes asks for a reset in the layout.
+pub fn replaceEvent(self: *Session, index: usize, message: ai.command.Outcome.Message) !void {
+    defer self.gpa.free(message.content);
+    try self.transcript.replaceEvent(index, eventFlags(message.severity), message.content);
+    self.dirty = true;
+}
+
 /// Record an event that a task raised at any moment, such as a report of the
 /// attached bot. While a reply streams the event waits, because an append splits
 /// the streamed message, and it lands at the next message boundary. Takes
@@ -1558,6 +1602,8 @@ pub fn beginTurn(self: *Session, generation: u64) void {
         .tools = .empty,
         .streamed_tools = .empty,
         .box_view = .empty,
+        .box_hashes = .empty,
+        .box_tracks = .empty,
     } };
     self.dirty = true;
 }
@@ -1815,9 +1861,13 @@ pub fn paint(self: *Session, size: terminal.View.Size) !void {
         .turn => |*turn| turn: {
             self.editor.reflow(size);
             const steering_count = self.steeringPendingCount();
+            // The tracks read the boxes of this frame, so the boxes come first.
+            const tools = try turn.boxes(self.gpa, self.clock_ms);
+            const tracks = try turn.trackBoxes(self.gpa);
             break :turn .{
                 .turn = .{
-                    .tools = try turn.boxes(self.gpa, self.clock_ms),
+                    .tools = tools,
+                    .tracks = tracks,
                     .activity = turn.activity(),
                     .caption = self.inputCaption(&caption_title_buffer, steering_count) orelse
                         if (steering_count > 0) .{
@@ -2113,6 +2163,8 @@ fn freeTurn(self: *Session, turn: *Turn) void {
     self.clearStreamedTools(turn);
     turn.streamed_tools.deinit(self.gpa);
     turn.box_view.deinit(self.gpa);
+    turn.box_hashes.deinit(self.gpa);
+    turn.box_tracks.deinit(self.gpa);
 }
 
 const test_model = ai.testing.model("claude-sonnet-4-6");

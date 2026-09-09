@@ -68,8 +68,8 @@ pub fn deinit(self: *Tty) void {
     self.leaveRaw();
 }
 
-/// Enter raw mode and enable the input/render escape modes. Used at startup and
-/// to restore the interface after a suspend (`leaveRaw`).
+/// Enter raw mode and enable the input/render escape modes. Used at startup.
+/// `leaveRaw` reverses it.
 pub fn enterRaw(self: *Tty) !void {
     var raw = self.original;
     raw.lflag.ECHO = false;
@@ -94,8 +94,7 @@ pub fn enterRaw(self: *Tty) !void {
 
 /// Restore the original cooked state first, because an escape write that blocks
 /// or fails must not strand raw mode. Then reverse the escape modes. Used at
-/// shutdown and to suspend for a mid-session login flow. Pair with `enterRaw`
-/// to resume.
+/// shutdown.
 pub fn leaveRaw(self: *Tty) void {
     // `raw` is unused on the restore path.
     var control: PosixSetup = .{

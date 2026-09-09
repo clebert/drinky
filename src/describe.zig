@@ -118,9 +118,9 @@ fn writeCommands(writer: *std.Io.Writer) !void {
     );
 }
 
-/// The key hints of the intro line, then the keys of the prompt and of a
-/// running turn. The hints come from the same constant that the intro line
-/// shows. One key can mean two things, so each list states its own mode.
+/// The key hints of the intro line, then the keys of the prompt, of a sign-in,
+/// and of a running turn. The hints come from the same constant that the intro
+/// line shows. One key can mean two things, so each list states its own mode.
 fn writeKeys(writer: *std.Io.Writer, options: *const Options) !void {
     try writer.writeAll(key_head);
     for (options.key_hints) |hint| try writer.print("- {s}\n", .{hint});
@@ -135,6 +135,12 @@ fn writeKeys(writer: *std.Io.Writer, options: *const Options) !void {
         \\- Ctrl+N asks the model to continue a failed turn that committed work.
         \\- Esc discards a waiting retry.
         \\
+        \\A sign-in takes these keys:
+        \\
+        \\- Enter replays a callback URL. Drinky refuses every other line.
+        \\- Esc or Ctrl+D cancels the sign-in and keeps the draft.
+        \\- Ctrl+C clears a draft, and it cancels the sign-in at an empty editor.
+        \\
         \\A running turn takes these keys:
         \\
         \\- Enter queues the line as a steering message.
@@ -143,8 +149,8 @@ fn writeKeys(writer: *std.Io.Writer, options: *const Options) !void {
         \\- Ctrl+D cancels the turn at once.
         \\- Ctrl+C clears a draft, and it cancels the turn at an empty editor.
         \\
-        \\This section names the keys of the prompt and of a turn. A full-window page states
-        \\its own keys in its header, and the editor carries the movement keys of a text
+        \\This section names the keys of the prompt, a sign-in, and a turn. A full-window page
+        \\states its own keys in its header, and the editor carries the movement keys of a text
         \\field.
         \\
     , .{options.ctrl_c_window_ms});
@@ -238,12 +244,16 @@ test "the document states every command, key, and discovery rule" {
     // them. One key can mean two things, so the lists must stay apart.
     try std.testing.expect(std.mem.indexOf(u8, text, "- Ctrl+D: Quit\n") != null);
     const prompt = std.mem.indexOf(u8, text, "The prompt takes these keys:").?;
+    const login = std.mem.indexOf(u8, text, "A sign-in takes these keys:").?;
     const turn = std.mem.indexOf(u8, text, "A running turn takes these keys:").?;
-    try std.testing.expect(prompt < turn);
-    // The quit rule and the retry belong to the prompt alone, and the steering
-    // recall and the cancel belong to the turn alone.
-    try std.testing.expect(std.mem.indexOf(u8, text[prompt..turn], "within 500 milli") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text[prompt..turn], "Ctrl+N asks") != null);
+    try std.testing.expect(prompt < login);
+    try std.testing.expect(login < turn);
+    // The prompt owns quitting and retry. A sign-in owns callback replay. The
+    // turn owns steering and its cancel.
+    try std.testing.expect(std.mem.indexOf(u8, text[prompt..login], "within 500 milli") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text[prompt..login], "Ctrl+N asks") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text[login..turn], "replays a callback URL") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text[login..turn], "cancels the sign-in") != null);
     try std.testing.expect(std.mem.indexOf(u8, text[turn..], "Ctrl+P moves") != null);
     try std.testing.expect(std.mem.indexOf(
         u8,

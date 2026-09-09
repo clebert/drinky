@@ -1,16 +1,12 @@
 //! The composition root and event loop. It wires the tty, the agent, and the
 //! `Session` together, then runs the interface off one `std.Io.Queue` of
-//! `UiEvent`. Five `io.concurrent` producers feed it: the input reader
-//! (`.keys`), the turn worker (generation-tagged `.turn` events), the model
-//! fetch worker (a generation-tagged `.fetch_ended` wakeup), a one-shot frame
-//! timer (`.tick`), and a SIGWINCH watcher (`.resize`). An attached Telegram
-//! bot adds its poller and its sender (generation-tagged `.remote` events), and
-//! a bot pairing adds its worker (generation-tagged `.pairing` events).
+//! `UiEvent`. Concurrent producers feed it: the input reader, turn workers,
+//! model fetch workers, sign-in workers, a frame timer, and a resize watcher.
+//! An attached Telegram bot adds its poller and sender. A bot pairing adds its
+//! worker.
 //!
-//! A command runs on the consumer. A model fetch is the one command step that
-//! reaches the network, so it leaves the consumer for a worker, and the picker
-//! that asked for it waits until the result rebuilds it. The OAuth login is the
-//! one blocking step: it leaves raw mode and prints its own prompts.
+//! A command runs on the consumer. A model fetch and a sign-in reach the
+//! network, so each runs on a worker. Their events keep the consumer live.
 //!
 //! `Session` owns the model and the rendering and is io-, tty-, and agent-free,
 //! so a test drives it from a scripted event sequence. `App` keeps the io, the
@@ -90,6 +86,11 @@ const intro_text = blk: {
 
 /// The wait row of the picker while the token check runs.
 const token_check_wait_text = "Drinky checks the bot token.";
+
+/// The controls of the editor caption while a sign-in runs. A callback login
+/// takes a callback URL on Enter, and a device-code login takes no line.
+const login_callback_controls = "Enter: Replay callback URL · Esc: Cancel";
+const login_device_controls = "Esc: Cancel";
 
 /// Two Ctrl+C presses within this window quit. A lone press clears the editor.
 const ctrl_c_window_ms = 500;
@@ -178,6 +179,12 @@ fetch: ?Fetch,
 /// wakeup in the queue, so the wakeup names the fetch it belongs to and cannot
 /// join the fetch that follows.
 fetch_generation: u64,
+/// The running sign-in, or null between sign-ins. Its worker owns the account
+/// registry until the app joins it.
+login: ?Login,
+/// Last generation reserved for a sign-in worker. A canceled sign-in can leave
+/// events in the queue, so each event names its sign-in.
+login_generation: u64,
 /// The retry context of the latest failed turn, or null when none waits. It
 /// lives at the prompt alone, because the start of any turn takes it.
 retry: ?Retry,
@@ -462,6 +469,9 @@ pub const UiEvent = union(enum) {
     /// permanent condition, or the end of a drain. The controller drops a report
     /// of an attachment that ended by its generation.
     remote: remote.Attachment.Event,
+    /// A report of a sign-in: its browser data, a launch warning, or its end.
+    /// A canceled sign-in leaves stale reports that its generation rejects.
+    login: LoginEvent,
     /// A report of a bot pairing: the token check, the bind, or the end. The
     /// controller drops a report of a canceled pairing by its generation.
     pairing: remote.Pairing.Event,
@@ -470,6 +480,7 @@ pub const UiEvent = union(enum) {
         switch (self.*) {
             .keys => |bytes| gpa.free(bytes),
             .turn => |*event| event.deinit(gpa),
+            .login => |*event| event.deinit(gpa),
             .remote => |*event| event.deinit(gpa),
             .pairing => |*event| event.deinit(gpa),
             .tick, .resize, .fetch_ended => {},
@@ -486,193 +497,107 @@ const Fetch = struct {
     generation: u64,
 };
 
-/// Cooked-mode OAuth output keeps trusted prompt text separate from runtime URL
-/// and path values, which pass through the terminal's inert-text policy.
-const OauthPrompt = struct {
-    writer: *std.Io.Writer,
-    io: std.Io,
-    /// Whether a paste watch reads the terminal. The authorization prompt
-    /// promises the paste path only while one exists.
-    paste_enabled: bool = false,
-    /// The login worker and the paste watch write concurrently. One lock
-    /// serializes them.
-    mutex: std.Io.Mutex = .init,
+/// One report from a sign-in worker. Authorization data owns its runtime
+/// strings until the consumer records them in the transcript.
+const LoginEvent = struct {
+    generation: u64,
+    payload: Payload,
 
-    pub fn showAuthorization(self: *OauthPrompt, url: []const u8) !void {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        try self.writer.writeAll("Open this URL to authorize Drinky:\n\n");
-        try self.writeText(url);
-        try self.writer.writeAll("\n\nDrinky waits for the response from the browser.\n");
-        if (self.paste_enabled) try self.writer.writeAll(
-            "If the browser shows an error, paste the URL from its address bar here " ++
-                "and press Enter.\n",
-        );
-        try self.writer.flush();
-    }
+    const Payload = union(enum) {
+        authorization: Authorization,
+        browser_launch_failed,
+        ended,
+    };
 
-    /// The device-code flow: the page asks for the code when the URL does not
-    /// carry it, and a second device can type both.
-    pub fn showDeviceCode(self: *OauthPrompt, url: []const u8, code: []const u8) !void {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        try self.writer.writeAll("Open this URL to authorize Drinky:\n\n");
-        try self.writeText(url);
-        try self.writer.writeAll("\n\nEnter this code if the page asks for one: ");
-        try self.writeText(code);
-        try self.writer.writeAll("\n\nDrinky waits for the authorization.\n");
-        try self.writer.flush();
-    }
+    const Authorization = struct {
+        url: []u8,
+        code: ?[]u8,
+    };
 
-    pub fn showBrowserLaunchFailed(self: *OauthPrompt) !void {
-        try self.show("Drinky could not open the browser. Open the URL above.\n");
-    }
-
-    fn showAuthorized(self: *OauthPrompt, path: []const u8) !void {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        try self.writer.writeAll("Drinky received authorization. Drinky saved the credentials to ");
-        try self.writeText(path);
-        try self.writer.writeAll(".\n");
-        try self.writer.flush();
-    }
-
-    fn showSaveFailed(self: *OauthPrompt, path: []const u8, error_name: []const u8) !void {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        try self.writer.writeAll(
-            "Drinky received authorization. Drinky could not save the credentials to ",
-        );
-        try self.writeText(path);
-        try self.writer.print(
-            " because of error {s}. The sign-in stays active until Drinky exits.\n",
-            .{error_name},
-        );
-        try self.writer.flush();
-    }
-
-    fn showPasteInvalid(self: *OauthPrompt) !void {
-        try self.show("The pasted line is not the callback URL. " ++
-            "Paste the complete URL from the address bar.\n");
-    }
-
-    fn showPasteFailed(self: *OauthPrompt, error_name: []const u8) !void {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        try self.writer.print(
-            "Drinky could not replay the pasted URL because of error {s}.\n",
-            .{error_name},
-        );
-        try self.writer.flush();
-    }
-
-    fn showPasteTooLong(self: *OauthPrompt) !void {
-        try self.show("The pasted line is too long for a callback URL. " ++
-            "Paste only the URL from the address bar.\n");
-    }
-
-    fn showPasteLate(self: *OauthPrompt) !void {
-        try self.show("Drinky already received the response for this sign-in.\n");
-    }
-
-    fn showPasteStopped(self: *OauthPrompt) !void {
-        try self.show("Drinky no longer reads a pasted URL. " ++
-            "The browser response still completes the sign-in.\n");
-    }
-
-    /// Write one trusted sentence under the lock.
-    fn show(self: *OauthPrompt, text: []const u8) !void {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        try self.writer.writeAll(text);
-        try self.writer.flush();
-    }
-
-    fn writeText(self: *OauthPrompt, text: []const u8) !void {
-        var lines = std.mem.splitScalar(u8, text, '\n');
-        var first = true;
-        while (lines.next()) |line| {
-            if (!first) try self.writer.writeByte('\n');
-            _ = try terminal.width.writeText(self.writer, line);
-            first = false;
+    fn deinit(self: *const LoginEvent, gpa: std.mem.Allocator) void {
+        switch (self.payload) {
+            .authorization => |authorization| {
+                gpa.free(authorization.url);
+                if (authorization.code) |code| gpa.free(code);
+            },
+            .browser_launch_failed, .ended => {},
         }
     }
 };
 
-/// The blocking OAuth login as a worker task, so the main task can watch the
-/// terminal for a pasted callback URL meanwhile. `done` flips last, and the
-/// paste watch polls it.
-const LoginWorker = struct {
-    accounts: *ai.Accounts,
+/// The presentation boundary of a sign-in worker. It sends runtime data to the
+/// consumer and never writes the terminal from the worker.
+const LoginPrompt = struct {
+    app: *App,
+    generation: u64,
+
+    pub fn showAuthorization(self: *LoginPrompt, url: []const u8) !void {
+        try self.show(url, null);
+    }
+
+    pub fn showDeviceCode(self: *LoginPrompt, url: []const u8, code: []const u8) !void {
+        try self.show(url, code);
+    }
+
+    pub fn showBrowserLaunchFailed(self: *LoginPrompt) !void {
+        try self.app.queue.putOne(self.app.io, .{ .login = .{
+            .generation = self.generation,
+            .payload = .browser_launch_failed,
+        } });
+    }
+
+    fn show(self: *LoginPrompt, url: []const u8, maybe_code: ?[]const u8) !void {
+        const url_copy = try self.app.gpa.dupe(u8, url);
+        errdefer self.app.gpa.free(url_copy);
+        const maybe_code_copy = if (maybe_code) |code|
+            try self.app.gpa.dupe(u8, code)
+        else
+            null;
+        errdefer if (maybe_code_copy) |code_copy| self.app.gpa.free(code_copy);
+        try self.app.queue.putOne(self.app.io, .{ .login = .{
+            .generation = self.generation,
+            .payload = .{ .authorization = .{
+                .url = url_copy,
+                .code = maybe_code_copy,
+            } },
+        } });
+    }
+};
+
+/// The sole result of a sign-in worker. A joined result decides whether the
+/// credential changed, even when a cancel races its terminal event.
+const LoginWorkerResult = struct {
     account: ai.llm.Account,
-    prompt: *OauthPrompt,
-    done: std.atomic.Value(bool) = .init(false),
+    generation: u64,
+    outcome: Outcome,
 
-    fn run(self: *LoginWorker) anyerror!ai.Accounts.Login {
-        defer self.done.store(true, .release);
-        return self.accounts.login(self.account, self.prompt);
-    }
+    const Outcome = union(enum) {
+        completed: ai.Accounts.Login,
+        failed: anyerror,
+    };
 };
 
-/// The line handler of the paste watch: validate a line and replay it to the
-/// local redirect listener. A failure reports through the prompt and the watch
-/// continues, because the browser callback can still land.
-const PasteHandler = struct {
-    io: std.Io,
-    callback: ai.Accounts.Callback,
-    prompt: *OauthPrompt,
-
-    fn onLine(self: *const PasteHandler, text: []const u8) void {
-        if (!ai.oauth_callback.holdsRedirect(text, self.callback.binding)) {
-            self.prompt.showPasteInvalid() catch {};
-            return;
-        }
-        ai.oauth_callback.replay(self.io, self.callback.port, text) catch |err| switch (err) {
-            // The listener closes as soon as it holds a response, so a refused
-            // port means the sign-in already moved on. A second paste is
-            // ordinary, and it must not read as a fault.
-            error.ConnectionRefused => self.prompt.showPasteLate() catch {},
-            else => self.prompt.showPasteFailed(@errorName(err)) catch {},
-        };
-    }
-
-    fn onLongLine(self: *const PasteHandler) void {
-        self.prompt.showPasteTooLong() catch {};
-    }
+/// One sign-in on a worker. The callback data lets the consumer validate and
+/// replay an entered callback URL without reading the account registry.
+const Login = struct {
+    future: std.Io.Future(LoginWorkerResult),
+    callback: ?ai.Accounts.Callback,
+    generation: u64,
+    /// The caption title of the editor, `Sign in: {account}`. Owned, and the
+    /// session borrows it.
+    title: []const u8,
+    /// The account and the transcript line of this attempt.
+    attempt: LoginAttempt,
 };
 
-/// Assemble cooked-mode terminal chunks into whole trimmed lines for the
-/// paste watch. The storage takes the shared paste limit, so every line the
-/// validator can accept passes through whole. A longer line is dropped whole
-/// and reported once.
-const PasteSplitter = struct {
-    storage: [ai.oauth_callback.paste_bytes_max]u8 = undefined,
-    length: usize = 0,
-    dropping: bool = false,
-
-    fn feed(self: *PasteSplitter, chunk: []const u8, handler: anytype) void {
-        for (chunk) |byte| {
-            if (byte == '\n') {
-                const dropped = self.dropping;
-                const text = std.mem.trim(u8, self.storage[0..self.length], " \t\r");
-                self.length = 0;
-                self.dropping = false;
-                if (dropped) {
-                    handler.onLongLine();
-                } else if (text.len != 0) {
-                    handler.onLine(text);
-                }
-                continue;
-            }
-            if (self.dropping) continue;
-            if (self.length == self.storage.len) {
-                self.dropping = true;
-                continue;
-            }
-            self.storage[self.length] = byte;
-            self.length += 1;
-        }
-    }
+/// One sign-in attempt as the transcript sees it: the account, and the event
+/// that holds its URL. The result of the attempt replaces that event, so one
+/// attempt costs the transcript one line.
+const LoginAttempt = struct {
+    account: ai.llm.Account,
+    /// The transcript index of the URL event, or null while the worker has
+    /// reported none. A result without one lands as a line of its own.
+    event_index: ?usize = null,
 };
 
 fn validateWorkingDirectory(gpa: std.mem.Allocator, path: []const u8) !void {
@@ -1054,6 +979,8 @@ fn initFields(self: *App, gpa: std.mem.Allocator, io: std.Io) void {
         .turn_generation = 0,
         .fetch = null,
         .fetch_generation = 0,
+        .login = null,
+        .login_generation = 0,
         .retry = null,
         .turn_retry = false,
         .tick_future = null,
@@ -1109,6 +1036,7 @@ fn shutdownTasks(self: *App) void {
         self.pending_turn_result = null;
     }
     self.dropFetch();
+    self.dropLogin();
     self.cancelFuture(&self.input_future);
     self.cancelFuture(&self.resize_future);
     self.cancelFuture(&self.tick_future);
@@ -1395,6 +1323,7 @@ fn applyBatch(self: *App, events: []const UiEvent) !bool {
                 }
             },
             .fetch_ended => |generation| try self.finishFetch(generation),
+            .login => |*login_event| try self.applyLoginEvent(login_event),
             .remote => |*remote_event| try self.controller.applyAttachmentEvent(remote_event),
             .pairing => |*pairing_event| try self.controller.applyPairingEvent(pairing_event),
         }
@@ -1592,12 +1521,14 @@ fn handleKeys(self: *App, bytes: []const u8) !void {
     while (self.input.next()) |event| {
         const at_prompt = self.session.mode == .prompt;
         const owner = self.session.input.owner;
+        const login_generation = if (self.login) |login| login.generation else null;
         try self.handleKey(&event);
-        // A detach and the end of its wait each move the input one step toward
-        // the terminal, so the rest of that exit attempt must not reach the
-        // prompt either.
+        // A detach, a wait end, and a sign-in cancel each return one input layer.
+        // The rest of that exit attempt must not reach the prompt.
+        const current_login_generation = if (self.login) |login| login.generation else null;
         const returned = (!at_prompt and self.session.mode == .prompt) or
-            owner != self.session.input.owner;
+            owner != self.session.input.owner or
+            login_generation != current_login_generation;
         if (returned and isExitKey(&event)) {
             while (self.input.next()) |_| {}
             break;
@@ -1637,7 +1568,9 @@ fn handleKey(self: *App, event: *const terminal.Input.Key) !void {
     // The input owner is a second axis over the mode. While the terminal does not
     // hold the input, no key confirms anything: the key that returns the input
     // ends one thing, and the key after it must warn again.
-    const editor_live = self.session.input.owner == .terminal;
+    // A sign-in holds the editor for a callback URL, so no key confirms anything
+    // there either: Enter replays a line, and an exit key cancels the sign-in.
+    const editor_live = self.session.input.owner == .terminal and self.login == null;
     // A refused command line goes to the model on the next Enter alone. The prompt
     // sends it, and a turn queues it, so both modes can confirm.
     const confirms_message = editor_live and (at_prompt or self.session.mode == .turn) and
@@ -1653,6 +1586,9 @@ fn handleKey(self: *App, event: *const terminal.Input.Key) !void {
     if (!confirms_quit) self.session.cancelConfirmation(.quit);
     // Clear before the key routes, so a notice produced by this action survives it.
     self.session.clearNotice();
+    // A sign-in keeps the raw terminal and editor. It owns every key until its
+    // worker ends or an exit cancels it.
+    if (self.login != null) return self.handleLoginKey(event);
     // A picker or a page takes its keys under any owner. The attached state opens
     // none, and the detaching state opens the login picker of a credential
     // rejection, which the user must be able to answer.
@@ -1725,6 +1661,68 @@ fn editKey(self: *App, event: *const terminal.Input.Key) !bool {
     }
     self.session.markEdited();
     return true;
+}
+
+/// Keys during a sign-in. The editor accepts a callback URL. Esc and Ctrl+D
+/// cancel the sign-in. Ctrl+C clears a draft first.
+fn handleLoginKey(self: *App, event: *const terminal.Input.Key) !void {
+    if (try self.editKey(event)) return;
+    switch (event.*) {
+        .enter => try self.submitLoginLine(),
+        .escape => try self.cancelLogin(),
+        .ctrl => |letter| switch (letter) {
+            'c' => if (self.session.editor.visible().len != 0) {
+                self.session.editor.clear();
+                self.session.markEdited();
+            } else {
+                try self.cancelLogin();
+            },
+            'd' => try self.cancelLogin(),
+            else => {},
+        },
+        else => {},
+    }
+}
+
+/// Replay an entered callback URL to the listener of the active sign-in. A
+/// refused or failed line stays in the editor.
+fn submitLoginLine(self: *App) !void {
+    const login = if (self.login) |*login| login else return;
+    const text = try self.session.editor.expanded(.whole_prompt);
+    defer self.gpa.free(text);
+    const account = login.attempt.account;
+    const callback = login.callback orelse return self.reportNotice(
+        .warning,
+        "The sign-in to {s} does not accept a callback URL. Complete the sign-in in the browser.",
+        .{account.label()},
+    );
+    if (!ai.oauth_callback.holdsRedirect(text, callback.binding)) return self.reportNotice(
+        .warning,
+        "The line is not the callback URL for the sign-in to {s}. " ++
+            "Paste the complete callback URL from the browser.",
+        .{account.label()},
+    );
+    ai.oauth_callback.replay(self.io, callback.port, text) catch |err| switch (err) {
+        // The listener closes after its response. A refused connection means
+        // that this sign-in already moved past the callback.
+        error.ConnectionRefused => {
+            self.session.editor.clear();
+            self.session.markEdited();
+            return self.reportNotice(
+                .information,
+                "Drinky already received the response for the sign-in to {s}.",
+                .{account.label()},
+            );
+        },
+        else => return self.reportNotice(
+            .failure,
+            "Drinky could not replay the callback URL for the sign-in to {s} " ++
+                "because of error {s}.",
+            .{ account.label(), @errorName(err) },
+        ),
+    };
+    self.session.editor.clear();
+    self.session.markEdited();
 }
 
 /// Keys during a streaming turn. The editor stays live: Enter queues steering,
@@ -2381,7 +2379,9 @@ fn applyOutcome(self: *App, outcome: ai.command.Outcome) !void {
         // list runs a registry entry through this path, so no listed command may
         // return a prompt: the `/skill` row writes an editor line instead.
         .prompt => unreachable,
-        .login => |account| try self.loginAccount(account),
+        // A sign-in starts and changes nothing yet. Its worker reports through
+        // `applyLoginEvent`, which mirrors the committed outcome.
+        .login => |account| return self.startLogin(account),
         .logout => |account| try self.logoutAccount(account),
         .switch_account => |account| {
             self.adopt(account);
@@ -2466,51 +2466,159 @@ fn reportStateSaveFailure(self: *App, err: anyerror) !void {
     }
 }
 
-/// Log in to `account`, then switch to it on the model it ran last here. An
-/// account that ran none, and a name it no longer offers, leave the session
-/// with no model, and the report names `/model`.
-/// A pre-commit failure leaves the current account untouched. After the
-/// credential replacement, account readiness and replay invalidation complete
-/// before any fallible final presentation.
-fn loginAccount(self: *App, account: ai.llm.Account) !void {
-    // The input reader task owns stdin. Pause it for the whole cooked window,
-    // so no line the user types there reaches the key queue. The paste watch is
-    // the only reader of that window. The resume runs after the raw-mode
-    // restore below, because the two defers unwind in reverse.
-    const input_live = self.input_future != null;
-    self.cancelFuture(&self.input_future);
-    defer if (input_live) self.resumeInputReader();
-    self.tty.leaveRaw();
-    defer {
-        self.tty.enterRaw() catch {};
-        self.session.view.invalidate();
-        self.session.dirty = true;
-    }
-    var prompt: OauthPrompt = .{ .writer = self.tty.writer(), .io = self.io };
-    const login = self.runLogin(account, &prompt) catch |login_error|
-        return self.reportLoginFailure(login_error);
+/// Start a sign-in worker and keep the raw editor active for a callback URL.
+/// The picker closed before this action arrived. No synchronous fallback can
+/// block the consumer.
+fn startLogin(self: *App, account: ai.llm.Account) !void {
+    std.debug.assert(self.login == null);
+    std.debug.assert(self.fetch == null);
+    std.debug.assert(self.session.mode == .prompt);
+    const title = try std.fmt.allocPrint(self.gpa, "Sign in: {s}", .{account.label()});
+    errdefer self.gpa.free(title);
+    const generation = try reserveGeneration(&self.login_generation);
+    const future = try self.io.concurrent(runLoginWorker, .{ self, account, generation });
+    self.login = .{
+        .future = future,
+        .callback = ai.Accounts.callback(account),
+        .generation = generation,
+        .title = title,
+        .attempt = .{ .account = account },
+    };
+    self.syncInputState();
+}
 
+/// Run one sign-in and queue its terminal event. The joined result remains the
+/// authority when a cancel interrupts that event.
+fn runLoginWorker(self: *App, account: ai.llm.Account, generation: u64) LoginWorkerResult {
+    var prompt: LoginPrompt = .{ .app = self, .generation = generation };
+    const outcome: LoginWorkerResult.Outcome = if (self.accounts.login(account, &prompt)) |login|
+        .{ .completed = login }
+    else |err|
+        .{ .failed = err };
+    self.queue.putOne(self.io, .{ .login = .{
+        .generation = generation,
+        .payload = .ended,
+    } }) catch {};
+    return .{ .account = account, .generation = generation, .outcome = outcome };
+}
+
+/// Apply one current sign-in report and free its runtime strings. A report from
+/// a canceled sign-in changes nothing. The launch warning takes the footer,
+/// because the URL event already asks the user to open the URL, and the result
+/// of the attempt replaces that event later.
+fn applyLoginEvent(self: *App, event: *const LoginEvent) !void {
+    defer event.deinit(self.gpa);
+    const login = if (self.login) |*login| login else return;
+    if (event.generation != login.generation) return;
+    switch (event.payload) {
+        .authorization => |authorization| {
+            try self.recordLoginAuthorization(login.attempt.account, &authorization);
+            login.attempt.event_index = self.session.transcript.blocks().len - 1;
+        },
+        .browser_launch_failed => try self.reportNotice(
+            .warning,
+            "Drinky could not open the browser for the sign-in to {s}. Open the URL above.",
+            .{login.attempt.account.label()},
+        ),
+        .ended => try self.finishLogin(event.generation),
+    }
+}
+
+/// Record the URL and optional user code that the provider gave this sign-in.
+fn recordLoginAuthorization(
+    self: *App,
+    account: ai.llm.Account,
+    authorization: *const LoginEvent.Authorization,
+) !void {
+    if (authorization.code) |code| return self.recordEvent(
+        .information,
+        "Open this URL to authorize the sign-in to {s}:\n\n{s}\n\n" ++
+            "Enter this code if the page asks for one: {s}",
+        .{ account.label(), authorization.url, code },
+    );
+    return self.recordEvent(
+        .information,
+        "Open this URL to authorize the sign-in to {s}:\n\n{s}\n\n" ++
+            "If the browser shows an error, paste the callback URL from its address bar " ++
+            "and press Enter.",
+        .{ account.label(), authorization.url },
+    );
+}
+
+/// Join the worker at its terminal event and resolve its authoritative result.
+fn finishLogin(self: *App, generation: u64) !void {
+    const active = if (self.login) |*login| login else return;
+    if (active.generation != generation) return;
+    try self.resolveLogin(&active.future.await(self.io));
+}
+
+/// Cancel and join the sign-in worker while the editor keeps its draft. A
+/// worker that committed first resolves as a successful sign-in.
+fn cancelLogin(self: *App) !void {
+    const active = if (self.login) |*login| login else return;
+    try self.resolveLogin(&active.future.cancel(self.io));
+}
+
+/// Forget the joined sign-in and resolve its result. A pre-commit failure keeps
+/// the current account. A completion switches to the replacement credential.
+/// The result line takes the place of the URL event, so one attempt costs the
+/// transcript one line, and the launch warning of the footer goes with it.
+fn resolveLogin(self: *App, result: *const LoginWorkerResult) !void {
+    const active = self.login.?;
+    std.debug.assert(result.generation == active.generation);
+    std.debug.assert(result.account == active.attempt.account);
+    defer self.gpa.free(active.title);
+    self.endLoginInput();
+    self.session.clearNotice();
+    switch (result.outcome) {
+        .failed => |login_error| try self.reportLoginFailure(active.attempt, login_error),
+        .completed => |login| try self.completeLogin(active.attempt, &login),
+    }
+}
+
+/// Forget the sign-in and move the input state off its caption. The caption
+/// borrows the title, so this runs before the title goes.
+fn endLoginInput(self: *App) void {
+    self.login = null;
+    self.syncInputState();
+}
+
+/// Adopt a committed sign-in and report its persistence outcome. The account
+/// switch and the evidence drop complete before any fallible presentation, so a
+/// failed line never leaves a half-switched session.
+fn completeLogin(
+    self: *App,
+    attempt: LoginAttempt,
+    login: *const ai.Accounts.Login,
+) !void {
+    const account = attempt.account;
     // A fresh login can represent another principal in the same account slot.
-    // Nothing that principal produced crosses that boundary.
+    // Nothing that principal produced crosses that boundary. The drop removes
+    // the reasoning blocks of the slot, and each one above the URL event moves
+    // that event up by one. The result line then replaces that event, or lands
+    // as a line of its own when the worker ended before it announced a URL.
+    const maybe_index = if (attempt.event_index) |index|
+        index - self.session.transcript.producedBefore(account, index)
+    else
+        null;
     self.dropAccountEvidence(account);
     self.adopt(account);
-    switch (login) {
-        .saved => |path| try prompt.showAuthorized(path),
-        .memory_only => |failure| try prompt.showSaveFailed(
-            failure.path,
-            @errorName(failure.save_error),
-        ),
-    }
     if (self.agent.model) |model| {
-        try self.recordEvent(
+        try self.recordEventAt(
+            maybe_index,
             .information,
             "Drinky signed in to {s} and selected {s}.",
             .{ account.label(), model.name() },
         );
     } else {
-        try self.reportModelStep(account, "Drinky signed in to {s}. ", .{account.label()});
+        try self.recordModelStep(
+            maybe_index,
+            account,
+            "Drinky signed in to {s}. ",
+            .{account.label()},
+        );
     }
-    switch (login) {
+    switch (login.*) {
         .saved => {},
         .memory_only => |failure| try self.recordEvent(
             .failure,
@@ -2519,78 +2627,35 @@ fn loginAccount(self: *App, account: ai.llm.Account) !void {
             .{ account.label(), failure.path, @errorName(failure.save_error) },
         ),
     }
+    try self.mirrorAgentState();
 }
 
-/// Run the blocking OAuth login as a worker task and watch the cooked
-/// terminal meanwhile. A browser that a policy blocks (an HTTPS-Only mode)
-/// shows an error page whose address bar still holds the callback URL. A
-/// paste of that URL replays into the same listener, so one wait serves both
-/// paths. Without a port or without concurrency the login runs plain, with no
-/// paste path. A device-code login has no port: the poll of its grant is the
-/// whole wait.
-fn runLogin(self: *App, account: ai.llm.Account, prompt: *OauthPrompt) !ai.Accounts.Login {
-    const callback = ai.Accounts.callback(account) orelse
-        return self.accounts.login(account, prompt);
-    var worker: LoginWorker = .{
-        .accounts = &self.accounts,
-        .account = account,
-        .prompt = prompt,
-    };
-    // Enabled before the worker starts, so the prompt it prints can promise
-    // the paste path only when the watch below really runs.
-    prompt.paste_enabled = true;
-    var future = self.io.concurrent(LoginWorker.run, .{&worker}) catch {
-        prompt.paste_enabled = false;
-        return self.accounts.login(account, prompt);
-    };
-    self.watchForPaste(&worker.done, callback, prompt);
-    return future.await(self.io);
+/// Cancel and join a sign-in during shutdown, then discard its result.
+fn dropLogin(self: *App) void {
+    const active = if (self.login) |*login| login else return;
+    _ = active.future.cancel(self.io);
+    const title = active.title;
+    self.endLoginInput();
+    self.gpa.free(title);
 }
 
-/// Start the input reader task. Startup propagates a failure, and a resume
-/// degrades instead, so the two callers own their own policies.
+/// Start the input reader task.
 fn startInputReader(self: *App) !void {
     self.input_future = try self.io.concurrent(readInput, .{self});
 }
 
-/// Restart the input reader task after a pause. A failed restart closes the
-/// queue, so the main loop winds down instead of running deaf.
-fn resumeInputReader(self: *App) void {
-    self.startInputReader() catch self.queue.close(self.io);
-}
-
-/// Watch the cooked terminal during the login wait, and replay each pasted
-/// callback URL to the local listener of `callback`. The loop is an event wait:
-/// `done` flips when the login worker finishes, and the worker's own callback
-/// deadline bounds that. A closed stdin or a read fault stops the watch
-/// alone, and the login wait continues.
-fn watchForPaste(
-    self: *App,
-    done: *const std.atomic.Value(bool),
-    callback: ai.Accounts.Callback,
-    prompt: *OauthPrompt,
-) void {
-    // The poll bounds the exit lag after `done` flips. A paste is a human
-    // action, so 200 ms costs nothing perceptible and saves a third
-    // concurrent task with its cancellation path.
-    const poll: std.Io.Timeout =
-        .{ .duration = .{ .raw = .fromMilliseconds(200), .clock = .awake } };
-    var splitter: PasteSplitter = .{};
-    var handler: PasteHandler = .{ .io = self.io, .callback = callback, .prompt = prompt };
-    var buffer: [512]u8 = undefined;
-    while (!done.load(.acquire)) {
-        const result = self.tty.read(&buffer, poll) catch {
-            prompt.showPasteStopped() catch {};
-            return;
-        };
-        const count = result orelse continue;
-        splitter.feed(buffer[0..count], &handler);
-    }
-}
-
-fn reportLoginFailure(self: *App, login_error: anyerror) !void {
+/// Report a sign-in that ended without a credential. Only an exit key cancels a
+/// sign-in, so a cancel reads as the decision of the user and not as a failure.
+/// The line replaces the URL event of the attempt. Without one, a cancel and a
+/// failure are transient, so they take the footer.
+fn reportLoginFailure(self: *App, attempt: LoginAttempt, login_error: anyerror) !void {
+    if (login_error == error.Canceled) return self.reportLoginEnd(
+        attempt,
+        .information,
+        "You canceled the sign-in to {s}.",
+        .{attempt.account.label()},
+    );
     const message = switch (login_error) {
-        error.Canceled => return error.Canceled,
         error.CallbackTimeout => "Drinky stopped the sign-in because the browser did not " ++
             "respond in time.",
         error.CallbackRequestTooLarge => "Drinky could not sign in because the browser " ++
@@ -2615,13 +2680,27 @@ fn reportLoginFailure(self: *App, login_error: anyerror) !void {
             "Start the sign-in again.",
         error.TokenServiceUnavailable => "The provider credential service is not available. " ++
             "Try the sign-in again later.",
-        else => return self.reportNotice(
+        else => return self.reportLoginEnd(
+            attempt,
             .failure,
             "Drinky could not sign in because of error {s}.",
             .{@errorName(login_error)},
         ),
     };
-    return self.reportNotice(.failure, "{s}", .{message});
+    return self.reportLoginEnd(attempt, .failure, "{s}", .{message});
+}
+
+/// State how a sign-in ended without a credential: in place of its URL event,
+/// or in the footer when it announced none.
+fn reportLoginEnd(
+    self: *App,
+    attempt: LoginAttempt,
+    severity: ai.command.Outcome.Severity,
+    comptime format: []const u8,
+    args: anytype,
+) !void {
+    const index = attempt.event_index orelse return self.reportNotice(severity, format, args);
+    try self.recordEventAt(index, severity, format, args);
 }
 
 /// Whether `account` is the account the agent runs, so a change to its
@@ -2653,12 +2732,26 @@ fn reportModelStep(
     comptime lead: []const u8,
     lead_args: anytype,
 ) !void {
-    if (self.accounts.offersModel(account)) return self.recordEvent(
+    return self.recordModelStep(null, account, lead, lead_args);
+}
+
+/// `reportModelStep` in place of the event at `maybe_index`, or as a new event
+/// when null. The result of a sign-in replaces its URL event this way.
+fn recordModelStep(
+    self: *App,
+    maybe_index: ?usize,
+    account: ai.llm.Account,
+    comptime lead: []const u8,
+    lead_args: anytype,
+) !void {
+    if (self.accounts.offersModel(account)) return self.recordEventAt(
+        maybe_index,
         .information,
         lead ++ "Select a model of {s} with /model.",
         lead_args ++ .{account.label()},
     );
-    return self.recordEvent(
+    return self.recordEventAt(
+        maybe_index,
         .information,
         lead ++ "Fetch the model list of {s} with /model.",
         lead_args ++ .{account.label()},
@@ -2930,9 +3023,22 @@ fn recordEvent(
     comptime format: []const u8,
     args: anytype,
 ) !void {
-    try self.session.applyOutcome(
-        try ai.command.Outcome.reportEvent(self.gpa, severity, format, args),
-    );
+    try self.recordEventAt(null, severity, format, args);
+}
+
+/// Record one durable event in place of the event at `maybe_index`, or as a new
+/// event when null. A line that announced a wait becomes the line that states
+/// its result this way.
+fn recordEventAt(
+    self: *App,
+    maybe_index: ?usize,
+    severity: ai.command.Outcome.Severity,
+    comptime format: []const u8,
+    args: anytype,
+) !void {
+    const message = try ai.command.Outcome.Message.print(self.gpa, severity, format, args);
+    if (maybe_index) |index| return self.session.replaceEvent(index, message);
+    try self.session.applyOutcome(.{ .event = message });
 }
 
 /// The sink of an attachment: wrap each report into the one channel. The
@@ -2969,46 +3075,65 @@ fn onRemoteAction(context: *anyopaque, action: remote.Controller.Action) anyerro
     }
 }
 
-/// Map the state of the controller onto the input of the session. An attached
-/// bot holds the input under its caption, and a fresh attach opens the chat with
-/// the attach event. A detached bot keeps the editor locked under the caption of
-/// the wait until its last message went out. The token prompt keeps the terminal
-/// under its own caption.
+/// Apply a controller state change and then map all input owners. A sign-in
+/// keeps the terminal until its worker ends.
 fn syncRemoteState(self: *App) !void {
     const was_terminal = self.session.input.owner == .terminal;
     switch (self.controller.state()) {
         .attached => {
             const username = self.controller.botUsername().?;
-            // The input moves before the chat opens, so a failed open cannot
-            // leave the editor live under an attached bot.
             if (was_terminal) try self.takeRemoteTitle(username);
-            self.session.input = .{ .owner = .external, .caption = .{
-                .title = self.remote_title,
-                .controls = "Esc: Detach",
-                .rows_max = Session.editor_caption_rows_max,
-            } };
+            // Move the input before the chat opens. A failed open cannot leave
+            // the editor live under an attached bot.
+            self.syncInputState();
             if (was_terminal) try self.openChat(username);
+            return;
         },
         .detaching => {
             if (was_terminal) try self.takeRemoteTitle(self.controller.botUsername().?);
-            self.session.input = .{ .owner = .none, .caption = .{
-                .title = self.remote_title,
-                .controls = "Esc: Cancel",
-                .rows_max = Session.editor_caption_rows_max,
-            } };
             // The chat stands as it is from here on, so the messages of the
-            // chat that hold a keyboard are gone for the app, and the next
-            // attach sends new ones.
+            // chat that hold a keyboard are gone for the app.
             self.chat_picker.close();
             self.mirror.detached();
         },
-        .token_prompt => self.session.input = .{ .caption = .{
+        .idle, .checking_token, .token_prompt, .pairing => {},
+    }
+    self.syncInputState();
+}
+
+/// Map the active sign-in and controller state onto the session input. A sign-in
+/// keeps the terminal under its own caption.
+fn syncInputState(self: *App) void {
+    if (self.login) |*login| {
+        self.session.input = .{ .caption = .{
+            .title = login.title,
+            .controls = if (login.callback != null)
+                login_callback_controls
+            else
+                login_device_controls,
+            .rows_max = Session.editor_caption_rows_max,
+        } };
+        self.session.dirty = true;
+        return;
+    }
+    self.session.input = switch (self.controller.state()) {
+        .attached => .{ .owner = .external, .caption = .{
+            .title = self.remote_title,
+            .controls = "Esc: Detach",
+            .rows_max = Session.editor_caption_rows_max,
+        } },
+        .detaching => .{ .owner = .none, .caption = .{
+            .title = self.remote_title,
+            .controls = "Esc: Cancel",
+            .rows_max = Session.editor_caption_rows_max,
+        } },
+        .token_prompt => .{ .caption = .{
             .title = "Bot token",
             .controls = "Enter: Save · Esc: Cancel",
             .rows_max = Session.editor_caption_rows_max,
         } },
-        .idle, .checking_token, .pairing => self.session.input = .{},
-    }
+        .idle, .checking_token, .pairing => .{},
+    };
     self.session.dirty = true;
 }
 
@@ -3265,6 +3390,11 @@ fn reportRemoteNotice(self: *App) !void {
 /// refusal and every steering rule applies once. It never reads or writes the
 /// editor, and a refusal answers the message in the chat.
 fn submitChatMessage(self: *App, text: []const u8, message_id: i64) !void {
+    if (self.login != null) return self.controller.reply(
+        message_id,
+        .warning,
+        "Drinky cannot take a message while a sign-in runs in the terminal.",
+    );
     var context = self.chatContext();
     const origin: ChatOrigin = .{ .message = .{ .id = message_id, .text = text } };
     switch (self.session.mode) {
@@ -3500,6 +3630,7 @@ const answer_stale_toast = "This answer is not the newest one.";
 /// names the tap, because the user pressed a button and sent no message.
 const turn_runs_toast = "A turn runs. Wait for its end.";
 const session_busy_toast = "Drinky cannot act on a tap now.";
+const login_runs_toast = "A sign-in runs in the terminal. Wait for its end.";
 const shorten_signed_out_toast =
     "Sign in with /login in the terminal before you shorten an answer.";
 const shorten_no_model_toast =
@@ -3509,6 +3640,7 @@ const shorten_no_model_toast =
 /// history still shows names a serial its owner no longer holds, and the toast
 /// states that.
 fn handleChatTap(self: *App, query_id: []const u8, tap: remote.keyboard.Tap) !void {
+    if (self.login != null) return self.controller.answer(query_id, login_runs_toast);
     switch (tap) {
         .cancel_turn => |serial| {
             if (!self.mirror.namesTurn(serial)) return self.controller.answer(query_id, turn_over_toast);
@@ -3779,6 +3911,12 @@ fn leavePicker(self: *App) !void {
     }
 }
 
+/// Test scaffolding: how many 1 ms rounds a test waits for a worker to start.
+/// A passing run leaves the wait at the first round that sees the flag, so the
+/// cap costs time only when the worker never starts. Five seconds keep a loaded
+/// machine from a false failure.
+const worker_start_rounds_max = 5000;
+
 /// Test scaffolding: an `App` on the defaults of `initFields`. A test builds the
 /// `agent`, the `session`, the `accounts`, and the `tty` that it uses, and it
 /// frees what a fed key or a loaded skill grows. `gpa` is a parameter so an OOM
@@ -3810,124 +3948,349 @@ test "the intro line holds every key hint and closes on the command list" {
         try std.testing.expect(std.mem.indexOf(u8, intro_text, hint) != null);
 }
 
-test "OAuth prompts render runtime fields as inert text" {
-    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer out.deinit();
-    var prompt: OauthPrompt = .{ .writer = &out.writer, .io = std.testing.io };
+const LoginTestSignals = struct {
+    started: std.atomic.Value(bool) = .init(false),
+    stopped: std.atomic.Value(bool) = .init(false),
+};
 
-    // Without a paste watch, the prompt must not promise the paste path.
-    try prompt.showAuthorization("https://example.test/\x1b]52;c;b3duZWQ=\x07");
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "paste the URL") == null);
-    prompt.paste_enabled = true;
-    try prompt.showAuthorization("https://example.test/\x1b]52;c;b3duZWQ=\x07");
-    try prompt.showBrowserLaunchFailed();
-    try prompt.showAuthorized("/home/\x1b[2J/.drinky/auth.json");
-    try prompt.showSaveFailed("/home/\x1b[2J/.drinky/auth.json", "AccessDenied");
-    try prompt.showPasteInvalid();
-    try prompt.showPasteTooLong();
-    try prompt.showPasteFailed("ConnectionRefused");
-    try prompt.showPasteLate();
-    try prompt.showPasteStopped();
-    try prompt.showDeviceCode("https://example.test/activate", "AB\x1bCD");
-
-    const written = out.written();
-    try std.testing.expect(std.mem.indexOf(u8, written, "paste the URL") != null);
-    try std.testing.expect(std.mem.indexOf(u8, written, "if the page asks for one: AB") != null);
-    try std.testing.expect(std.mem.indexOf(u8, written, "AB\x1bCD") == null);
-    try std.testing.expect(std.mem.indexOf(u8, written, "waits for the authorization") != null);
-    try std.testing.expect(std.mem.indexOf(u8, written, "not the callback URL") != null);
-    try std.testing.expect(std.mem.indexOf(u8, written, "too long for a callback URL") != null);
-    try std.testing.expect(std.mem.indexOf(u8, written, "error ConnectionRefused") != null);
-    try std.testing.expect(std.mem.indexOf(u8, written, "already received the response") != null);
-    try std.testing.expect(std.mem.indexOf(u8, written, "no longer reads") != null);
-    const url_inert = "https://example.test/\u{200B}�\u{200B}]52;c;b3duZWQ=\u{200B}�\u{200B}";
-    try std.testing.expect(std.mem.indexOf(u8, written, "\x1b]52;c;b3duZWQ=\x07") == null);
-    try std.testing.expect(std.mem.indexOf(u8, written, "\x1b[2J") == null);
-    try std.testing.expect(std.mem.indexOf(u8, written, url_inert) != null);
-    const path_inert = "/home/\u{200B}�\u{200B}[2J/.drinky/auth.json";
-    try std.testing.expect(std.mem.indexOf(u8, written, path_inert) != null);
-}
-
-test "the paste watch assembles chunks into trimmed lines and drops a long line" {
-    const Collector = struct {
-        buffer: [256]u8 = undefined,
-        length: usize = 0,
-        long_line_count: usize = 0,
-
-        fn onLine(self: *@This(), text: []const u8) void {
-            @memcpy(self.buffer[self.length..][0..text.len], text);
-            self.length += text.len;
-            self.buffer[self.length] = '|';
-            self.length += 1;
-        }
-
-        fn onLongLine(self: *@This()) void {
-            self.long_line_count += 1;
-        }
+/// A fake sign-in that waits until its future receives a cancel.
+fn waitForLoginCancel(
+    io: std.Io,
+    signals: *LoginTestSignals,
+    account: ai.llm.Account,
+    generation: u64,
+) LoginWorkerResult {
+    signals.started.store(true, .release);
+    defer signals.stopped.store(true, .release);
+    io.sleep(.fromSeconds(60), .awake) catch {};
+    return .{
+        .account = account,
+        .generation = generation,
+        .outcome = .{ .failed = error.Canceled },
     };
-
-    var splitter: PasteSplitter = .{};
-    var collector: Collector = .{};
-    // A line split across reads, cooked-terminal padding included. A blank
-    // line reports nothing.
-    splitter.feed("  https://localhost/callback?", &collector);
-    splitter.feed("code=1&state=2 \r\nsecond\n\r\n", &collector);
-    try std.testing.expectEqualStrings(
-        "https://localhost/callback?code=1&state=2|second|",
-        collector.buffer[0..collector.length],
-    );
-    try std.testing.expectEqual(@as(usize, 0), collector.long_line_count);
-    // A line past the shared paste limit is dropped whole and the next line
-    // still lands.
-    const junk: [ai.oauth_callback.paste_bytes_max + 1]u8 = @splat('x');
-    splitter.feed(&junk, &collector);
-    splitter.feed("\nafter\n", &collector);
-    try std.testing.expectEqual(@as(usize, 1), collector.long_line_count);
-    try std.testing.expect(std.mem.endsWith(u8, collector.buffer[0..collector.length], "|after|"));
 }
 
-test "the paste handler reports each unusable line by its own cause" {
+/// Install one fake sign-in and wait until its worker starts.
+fn beginLoginForTest(
+    app: *App,
+    account: ai.llm.Account,
+    maybe_callback: ?ai.Accounts.Callback,
+    signals: *LoginTestSignals,
+) !void {
+    const title = try std.fmt.allocPrint(app.gpa, "Sign in: {s}", .{account.label()});
+    errdefer app.gpa.free(title);
+    const generation = try reserveGeneration(&app.login_generation);
+    app.login = .{
+        .future = try app.io.concurrent(
+            waitForLoginCancel,
+            .{ app.io, signals, account, generation },
+        ),
+        .callback = maybe_callback,
+        .generation = generation,
+        .title = title,
+        .attempt = .{ .account = account },
+    };
+    app.syncInputState();
+    for (0..worker_start_rounds_max) |_| {
+        if (signals.started.load(.acquire)) return;
+        app.io.sleep(.fromMilliseconds(1), .awake) catch {};
+    }
+    return error.LoginWorkerDidNotStart;
+}
+
+test "a sign-in prompt records its URL and user code in transcript events" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var prompt: OauthPrompt = .{ .writer = &out.writer, .io = std.testing.io };
-    const handler: PasteHandler = .{
-        .io = std.testing.io,
-        .callback = .{ .port = 1, .binding = .state },
-        .prompt = &prompt,
-    };
 
-    // A line that holds no outcome asks for the complete URL, and the wait
-    // continues. A grant without its state is such a line, because the exchange
-    // of this login compares that state. A dropped line was too long for one
-    // outcome, so it asks for the URL alone.
-    handler.onLine("https://localhost:1455/auth/callback?code=without-state");
-    handler.onLongLine();
+    var app: App = undefined;
+    app.initForTest(gpa);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
+    defer app.session.deinit();
+    var signals: LoginTestSignals = .{};
+    try beginLoginForTest(&app, .anthropic_subscription, null, &signals);
+    defer app.dropLogin();
 
-    const written = out.written();
-    const guidance = "not the callback URL";
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, written, guidance));
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, written, "too long"));
+    var prompt: LoginPrompt = .{ .app = &app, .generation = app.login.?.generation };
+    try prompt.showAuthorization("https://example.test/\x1b]52;c;b3duZWQ=\x07");
+    try prompt.showDeviceCode("https://example.test/activate", "AB\x1bCD");
+    try prompt.showBrowserLaunchFailed();
 
-    // A login that binds a random callback path answers on that path alone, so
-    // a line that names none reaches no verdict and asks for the URL too.
-    const bound: PasteHandler = .{
-        .io = std.testing.io,
-        .callback = .{ .port = 1, .binding = .path },
-        .prompt = &prompt,
-    };
-    bound.onLine("code=without-path");
-    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, out.written(), guidance));
+    var events: [3]UiEvent = undefined;
+    const count = try app.queue.get(app.io, &events, events.len);
+    try std.testing.expectEqual(events.len, count);
+    _ = try app.applyBatch(events[0..count]);
 
-    // The listener owns the denial verdict, so the handler replays an `error`
-    // line and reports no guidance for it. Port 1 holds no listener, and a
-    // refused connection means the listener already has its response.
-    handler.onLine("https://localhost:1455/auth/callback?error=access_denied");
-    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, out.written(), guidance));
-    try std.testing.expect(
-        std.mem.indexOf(u8, out.written(), "already received the response") != null,
+    // The launch warning takes the footer, so the attempt still costs one line.
+    const blocks = app.session.transcript.blocks();
+    try std.testing.expectEqual(@as(usize, 2), blocks.len);
+    const authorization = blocks[0].content.event.text.items;
+    const device = blocks[1].content.event.text.items;
+    // A blank row frames the URL on each side, so the reader finds it at once.
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        authorization,
+        "Anthropic Subscription:\n\nhttps://example.test/\x1b]52;c;b3duZWQ=\x07\n\nIf the browser",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(u8, authorization, "URL:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, device, "asks for one: AB\x1bCD") != null);
+    try std.testing.expectEqualStrings(
+        "Drinky could not open the browser for the sign-in to Anthropic Subscription. " ++
+            "Open the URL above.",
+        app.session.notice.?.content,
     );
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "could not replay") == null);
+
+    try app.session.paint(.{ .columns = 120, .rows = 30 });
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "\x1b]52;c;b3duZWQ=\x07") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "AB\x1bCD") == null);
+}
+
+test "a sign-in caption names the account and Enter refuses a device login line" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
+    defer app.session.deinit();
+    var signals: LoginTestSignals = .{};
+    try beginLoginForTest(&app, .xai_subscription, null, &signals);
+    defer app.dropLogin();
+
+    // A device-code login takes no line, so its caption offers no Enter.
+    const caption = app.session.input.caption.?;
+    try std.testing.expectEqualStrings("Sign in: xAI Subscription", caption.title);
+    try std.testing.expectEqualStrings(login_device_controls, caption.controls);
+    try app.session.editor.insert("not a callback");
+    try app.handleKey(&.enter);
+    try std.testing.expectEqualStrings(
+        "The sign-in to xAI Subscription does not accept a callback URL. " ++
+            "Complete the sign-in in the browser.",
+        app.session.notice.?.content,
+    );
+    try std.testing.expectEqualStrings("not a callback", app.session.editor.visible());
+
+    try app.handleKey(&.{ .char = 'x' });
+    try std.testing.expect(app.session.notice == null);
+    try std.testing.expect(app.session.input.caption != null);
+    try app.handleKey(&.escape);
+    try std.testing.expect(app.login == null);
+    try std.testing.expect(app.session.input.caption == null);
+    try std.testing.expect(signals.stopped.load(.acquire));
+    try std.testing.expectEqualStrings(
+        "You canceled the sign-in to xAI Subscription.",
+        app.session.notice.?.content,
+    );
+    try std.testing.expectEqualStrings("not a callbackx", app.session.editor.visible());
+}
+
+test "Enter replays a callback URL from the raw editor" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var address: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try address.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    var redirect_future = try io.concurrent(
+        ai.oauth_callback.receive,
+        .{ gpa, io, &server, @as(?[]const u8, null) },
+    );
+    errdefer if (redirect_future.cancel(io)) |redirect| {
+        gpa.free(redirect.code);
+        if (redirect.state) |state| gpa.free(state);
+    } else |_| {};
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
+    defer app.session.deinit();
+    var signals: LoginTestSignals = .{};
+    try beginLoginForTest(&app, .anthropic_subscription, .{
+        .port = server.socket.address.getPort(),
+        .binding = .state,
+    }, &signals);
+    defer app.dropLogin();
+
+    // A callback login offers Enter, so the caption names the replay.
+    try std.testing.expectEqualStrings(
+        login_callback_controls,
+        app.session.input.caption.?.controls,
+    );
+    try app.session.editor.insert(
+        "https://localhost/callback?code=paste-code&state=paste-state",
+    );
+    try app.handleKey(&.enter);
+    const redirect = try redirect_future.await(io);
+    defer {
+        gpa.free(redirect.code);
+        if (redirect.state) |state| gpa.free(state);
+    }
+    try std.testing.expectEqualStrings("paste-code", redirect.code);
+    try std.testing.expectEqualStrings("paste-state", redirect.state.?);
+    try std.testing.expectEqualStrings("", app.session.editor.visible());
+}
+
+test "a sign-in cancel drops the rest of one exit attempt" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    defer app.input.deinit();
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
+    defer app.session.deinit();
+    var signals: LoginTestSignals = .{};
+    try beginLoginForTest(&app, .anthropic_subscription, null, &signals);
+    defer app.dropLogin();
+
+    try app.handleKeys("\x1b\x04");
+    try std.testing.expect(app.login == null);
+    try std.testing.expect(app.running);
+    try std.testing.expect(signals.stopped.load(.acquire));
+}
+
+/// A fake sign-in that announces its URL, commits at once, and queues its
+/// terminal event, as the real worker does.
+fn completeLoginForTest(app: *App, account: ai.llm.Account, generation: u64) LoginWorkerResult {
+    var prompt: LoginPrompt = .{ .app = app, .generation = generation };
+    prompt.showAuthorization("https://example.test/authorize") catch {};
+    app.queue.putOne(app.io, .{ .login = .{
+        .generation = generation,
+        .payload = .ended,
+    } }) catch {};
+    return .{
+        .account = account,
+        .generation = generation,
+        .outcome = .{ .completed = .{ .saved = "/home/.drinky/auth.json" } },
+    };
+}
+
+// The terminal event of a sign-in joins its worker, and the joined result moves
+// the session onto the account. The result line takes the place of the URL
+// event, so the attempt costs the transcript one line. The caption goes with the
+// sign-in.
+test "a committed sign-in adopts its account at the terminal event" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(home);
+
+    // The store holds the credential that the worker committed, so the registry
+    // answers the account with a client.
+    var store = try tmp.dir.createDirPathOpen(io, ".drinky", .{});
+    store.close(io);
+    try tmp.dir.writeFile(io, .{
+        .sub_path = ".drinky/auth.json",
+        .data =
+        \\{ "anthropic_subscription":
+        \\    { "access": "a", "refresh": "r", "expires_ms": 4102444800000 } }
+        ,
+    });
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
+    defer app.accounts.deinit();
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = null,
+        .system = "",
+        .retry = .{},
+        .environ = .empty,
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, null, .low);
+    defer app.session.deinit();
+    app.session.account_shown = null;
+    // Reasoning of an earlier principal in the same slot stands above the URL
+    // event. The sign-in drops it, and the result line must still find its event.
+    try app.session.transcript.appendStream(.thinking, .anthropic_subscription, "old reasoning");
+    app.session.transcript.endMessage();
+
+    const generation = try reserveGeneration(&app.login_generation);
+    app.login = .{
+        .future = try io.concurrent(
+            completeLoginForTest,
+            .{ &app, .anthropic_subscription, generation },
+        ),
+        .callback = ai.Accounts.callback(.anthropic_subscription),
+        .generation = generation,
+        .title = try gpa.dupe(u8, "Sign in: Anthropic Subscription"),
+        .attempt = .{ .account = .anthropic_subscription },
+    };
+    app.syncInputState();
+    try std.testing.expectEqualStrings(
+        "Sign in: Anthropic Subscription",
+        app.session.input.caption.?.title,
+    );
+
+    var events: [2]UiEvent = undefined;
+    const count = try app.queue.get(io, &events, events.len);
+    try std.testing.expectEqual(events.len, count);
+    _ = try app.applyBatch(events[0..count]);
+
+    try std.testing.expect(app.login == null);
+    try std.testing.expectEqual(ai.llm.Account.anthropic_subscription, app.activeAccount().?);
+    try std.testing.expectEqual(ai.llm.Account.anthropic_subscription, app.session.account_shown.?);
+    try std.testing.expect(app.session.input.caption == null);
+    // The old reasoning went, and the result took the place of the URL event.
+    const blocks = app.session.transcript.blocks();
+    try std.testing.expectEqual(@as(usize, 1), blocks.len);
+    try std.testing.expectEqualStrings(
+        "Drinky signed in to Anthropic Subscription. Fetch the model list of Anthropic " ++
+            "Subscription with /model.",
+        blocks[0].content.event.text.items,
+    );
+}
+
+// A cancel closes the attempt in the transcript: the URL event becomes the line
+// that states the cancel, and no footer notice repeats it.
+test "a canceled sign-in rewrites its URL event into the cancel line" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
+    defer app.session.deinit();
+    var signals: LoginTestSignals = .{};
+    try beginLoginForTest(&app, .xai_subscription, null, &signals);
+    defer app.dropLogin();
+
+    var prompt: LoginPrompt = .{ .app = &app, .generation = app.login.?.generation };
+    try prompt.showDeviceCode("https://example.test/activate", "ABCD-EFGH");
+    var events: [1]UiEvent = undefined;
+    const count = try app.queue.get(app.io, &events, 1);
+    _ = try app.applyBatch(events[0..count]);
+    try std.testing.expectEqual(@as(usize, 0), app.login.?.attempt.event_index.?);
+    // The frame paints the URL event, so the rewrite below changes painted rows.
+    try app.session.paint(.{ .columns = 120, .rows = 30 });
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "ABCD-EFGH") != null);
+
+    const painted = out.written().len;
+    try app.handleKey(&.escape);
+    try std.testing.expect(app.login == null);
+    try std.testing.expect(app.session.notice == null);
+    const blocks = app.session.transcript.blocks();
+    try std.testing.expectEqual(@as(usize, 1), blocks.len);
+    try std.testing.expectEqualStrings(
+        "You canceled the sign-in to xAI Subscription.",
+        blocks[0].content.event.text.items,
+    );
+    // The block sits at the bottom of the window, so the frame repaints it in
+    // place and asks for no reset.
+    try app.session.paint(.{ .columns = 120, .rows = 30 });
+    const repainted = out.written()[painted..];
+    try std.testing.expect(std.mem.indexOf(u8, repainted, "You canceled the sign-in") != null);
+    try std.testing.expect(std.mem.indexOf(u8, repainted, terminal.escape.screen_reset) == null);
 }
 
 test "a turn failure the agent named itself reads as a sentence, not an error name" {
@@ -4006,7 +4369,7 @@ test "a grant rejection refuses an account without a refresh credential" {
     try std.testing.expectEqual(ai.llm.Account.anthropic_api, app.activeAccount().?);
 }
 
-test "OAuth login cancellation escapes without a failure notice" {
+test "a canceled sign-in reads as a decision, not a failure" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
@@ -4017,7 +4380,13 @@ test "OAuth login cancellation escapes without a failure notice" {
     defer app.session.deinit();
 
     const block_count = app.session.transcript.blocks().len;
-    try std.testing.expectError(error.Canceled, app.reportLoginFailure(error.Canceled));
+    try app.reportLoginFailure(.{ .account = .anthropic_subscription }, error.Canceled);
+    const notice = app.session.notice.?;
+    try std.testing.expectEqual(ai.command.Outcome.Severity.information, notice.severity);
+    try std.testing.expectEqualStrings(
+        "You canceled the sign-in to Anthropic Subscription.",
+        notice.content,
+    );
     try std.testing.expectEqual(block_count, app.session.transcript.blocks().len);
 }
 
@@ -4033,42 +4402,45 @@ test "a login the provider refused reads as a sentence, not an error name" {
 
     // A rejection names the one action that helps. An unavailable service does
     // not, because the same sign-in works later.
-    try app.reportLoginFailure(error.TokenGrantRejected);
+    try app.reportLoginFailure(.{ .account = .anthropic_subscription }, error.TokenGrantRejected);
     try std.testing.expectEqualStrings(
         "The provider rejected the authorization. Start the sign-in again.",
         app.session.notice.?.content,
     );
-    try app.reportLoginFailure(error.AuthorizationFailed);
+    try app.reportLoginFailure(.{ .account = .anthropic_subscription }, error.AuthorizationFailed);
     try std.testing.expectEqualStrings(
         "The provider did not authorize Drinky. Start the sign-in again.",
         app.session.notice.?.content,
     );
     // A refused device-code grant reads the same way, and a grant that ran out
     // names the wait.
-    try app.reportLoginFailure(error.AuthorizationDenied);
+    try app.reportLoginFailure(.{ .account = .anthropic_subscription }, error.AuthorizationDenied);
     try std.testing.expectEqualStrings(
         "The provider did not authorize Drinky. Start the sign-in again.",
         app.session.notice.?.content,
     );
-    try app.reportLoginFailure(error.DeviceCodeExpired);
+    try app.reportLoginFailure(.{ .account = .anthropic_subscription }, error.DeviceCodeExpired);
     try std.testing.expectEqualStrings(
         "Drinky stopped the sign-in because the authorization did not arrive in time.",
         app.session.notice.?.content,
     );
     // A stale tab and a stale paste both deliver a redirect of an earlier
     // sign-in, so the sentence names neither source.
-    try app.reportLoginFailure(error.StateMismatch);
+    try app.reportLoginFailure(.{ .account = .anthropic_subscription }, error.StateMismatch);
     try std.testing.expectEqualStrings(
         "The response belongs to another sign-in. Start the sign-in again.",
         app.session.notice.?.content,
     );
-    try app.reportLoginFailure(error.TokenServiceUnavailable);
+    try app.reportLoginFailure(
+        .{ .account = .anthropic_subscription },
+        error.TokenServiceUnavailable,
+    );
     try std.testing.expectEqualStrings(
         "The provider credential service is not available. Try the sign-in again later.",
         app.session.notice.?.content,
     );
     // A failure with no single cause still wraps its error name in a sentence.
-    try app.reportLoginFailure(error.TokenRequestFailed);
+    try app.reportLoginFailure(.{ .account = .anthropic_subscription }, error.TokenRequestFailed);
     try std.testing.expectEqualStrings(
         "Drinky could not sign in because of error TokenRequestFailed.",
         app.session.notice.?.content,
@@ -4101,7 +4473,7 @@ test "OAuth callback bounds have friendly failure notices" {
     };
     for (cases) |case| {
         const failure, const message = case;
-        try app.reportLoginFailure(failure);
+        try app.reportLoginFailure(.{ .account = .anthropic_subscription }, failure);
         const notice = app.session.notice.?;
         try std.testing.expectEqual(ai.command.Outcome.Severity.failure, notice.severity);
         try std.testing.expectEqualStrings(message, notice.content);
@@ -4495,7 +4867,7 @@ test "canceling a turn joins and clears its active worker" {
     };
 
     var poll: usize = 0;
-    while (!started.load(.acquire) and poll < 1000) : (poll += 1)
+    while (!started.load(.acquire) and poll < worker_start_rounds_max) : (poll += 1)
         io.sleep(.fromMilliseconds(1), .awake) catch {};
     try std.testing.expect(started.load(.acquire));
 

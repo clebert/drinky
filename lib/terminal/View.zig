@@ -64,6 +64,10 @@ structural_change: bool,
 /// Set by `resetScreen`: the next `render` must clear the screen and reprint the
 /// whole window, whatever the diff finds.
 force_reset: bool,
+/// How many resets this view painted. A reset clears every row above the
+/// window, so a caller that tracks rows outside the frame compares the epoch of
+/// its last paint with this count.
+reset_epoch: u64,
 /// Full resets leave native scrollback intact, for a view on an alternate screen.
 preserve_scrollback: bool,
 
@@ -415,6 +419,7 @@ pub fn init(gpa: std.mem.Allocator, writer: *std.Io.Writer) View {
         .sink = undefined,
         .structural_change = false,
         .force_reset = false,
+        .reset_epoch = 0,
         .preserve_scrollback = false,
     };
 }
@@ -427,12 +432,21 @@ pub fn deinit(self: *View) void {
 /// policy. A view on the primary screen drops the native scrollback with it, so
 /// no earlier row stays reachable. The reprint holds the window alone, so the
 /// reset also trims reachable history back to the window. A model change must use
-/// this only when the model discards all of its content. A model that discards
-/// part of its content keeps more history through the incremental diff. The reset
-/// does not change the cursor visibility, so the tracked state stays. Call
-/// `invalidate` instead when external output can have moved the cursor.
+/// this only when the model discards all of its content, or when it changes a row
+/// above the window, which no frame composes and no incremental repaint reaches.
+/// A model that discards part of its content keeps more history through the
+/// incremental diff. The reset does not change the cursor visibility, so the
+/// tracked state stays. Call `invalidate` instead when external output can have
+/// moved the cursor.
 pub fn resetScreen(self: *View) void {
     self.force_reset = true;
+}
+
+/// The count of resets this view painted. Every row above the window belongs to
+/// the epoch of the frame that printed it, and a reset ends that epoch, so a
+/// row of an earlier epoch is gone from the terminal.
+pub fn resetEpoch(self: *const View) u64 {
+    return self.reset_epoch;
 }
 
 /// Reset the screen through `resetScreen` and record the cursor as hidden. Use
@@ -695,6 +709,7 @@ fn paint(self: *View, mode: Mode, frame: *Frame, options: struct {
         .reset => {
             try writer.writeAll(self.resetSequence());
             self.applyReset();
+            self.reset_epoch += 1;
             frame.top_line = self.cursor_line;
         },
         .incremental => {
@@ -739,6 +754,7 @@ fn paintEmpty(self: *View, prev_empty: bool) !void {
     if (!prev_empty) {
         try writer.writeAll(self.resetSequence());
         self.applyReset();
+        self.reset_epoch += 1;
     }
     if (self.cursor_visible) {
         try writer.writeAll(escape.cursor_hide);

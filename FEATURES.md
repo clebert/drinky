@@ -143,12 +143,22 @@ service account key file.
   browser. The Anthropic Console login trades its grant for a minted platform key that Drinky stores
   like a token. The OpenRouter login uses PKCE with no client registration and mints a permanent
   key.
-- When no browser opens, the printed URL still works, and the callback waits five minutes. When the
-  browser cannot reach the callback, a paste of the URL from its address bar completes the login.
+- Every login runs on a worker, so the interface keeps painting and reading keys. A transcript event
+  holds the URL, the picker closes, and the editor caption reads
+  `Sign in: account · Enter: Replay callback URL · Esc: Cancel`. A device-code login offers no
+  Enter. Esc or Ctrl+D cancels the sign-in and keeps the draft. Ctrl+C clears a draft first and
+  cancels only at an empty editor.
+- The result of a sign-in replaces its URL event, so one attempt costs the transcript one line: the
+  account it signed in to, the cancel, or the failure. A browser that does not open leaves a footer
+  notice, and the URL event still holds the URL.
+- When no browser opens, the recorded URL still works, and the callback waits five minutes. When the
+  browser cannot reach the callback, Enter on the callback URL from its address bar replays it to
+  the listener. Enter on any other line is refused with a notice that names the sign-in.
 - The browser lands on a plain page: "Drinky received authorization. Close this tab."
-- The xAI subscription login (SuperGrok or X Premium) uses the device-code grant. Drinky prints the
-  verification URL and the user code, opens the browser, and polls until the grant arrives. The code
-  lets a second device complete the login. The wait ends after five minutes, like the callback.
+- The xAI subscription login (SuperGrok or X Premium) uses the device-code grant. The event holds
+  the verification URL and the user code, Drinky opens the browser, and polls until the grant
+  arrives. The code lets a second device complete the login. The wait ends after five minutes, like
+  the callback, and a cancel ends the poll.
 - The tokens and the Console key live in the owner-only `~/.drinky/auth.json`, one entry per
   account, saved atomically.
 - Drinky refreshes and saves an expired access token. When the store is busy, Drinky keeps the
@@ -259,8 +269,12 @@ service account key file.
 - Drinky redraws the newest eight window heights of the conversation, and the config sets that
   count. Older rows rest in the native scrollback. More pages keep more of the conversation live and
   cost more work per frame.
-- Drinky restores the terminal on exit, on a failed start, and around an OAuth login. It parks the
-  cursor below the interface on exit, so the shell prompt does not overwrite the last frame.
+- A block or a tool box that is rewritten above that window clears the scrollback and reprints the
+  window, so no stale row survives anywhere. The reset takes the rows off the terminal, so later
+  rewrites cost nothing until the window reaches the block again. A streamed reply grows at its
+  bottom and never resets.
+- Drinky restores the terminal on exit and on a failed start. It parks the cursor below the
+  interface on exit, so the shell prompt does not overwrite the last frame.
 - Typing, streaming output, and resizes run concurrently, so the interface never freezes during a
   turn.
 - A full-window page scrolls with the arrow keys, PgUp/PgDn, and Home/End. Its fixed caption names

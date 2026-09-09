@@ -81,6 +81,27 @@ pub fn append(
     try self.entries.append(self.gpa, entry);
 }
 
+/// Replace the event at `index` with one that states `text` under `options`. The
+/// block keeps its place, so the line that announced a wait becomes the line
+/// that states its result.
+pub fn replaceEvent(
+    self: *Transcript,
+    index: usize,
+    options: ui.block.Entry.Options,
+    text: []const u8,
+) !void {
+    std.debug.assert(index < self.entries.items.len);
+    try self.entries.items[index].replaceEvent(self.gpa, options, text);
+}
+
+/// How many blocks before `index` `account` produced. `dropAccount` removes
+/// them, so the block at `index` moves up by this count.
+pub fn producedBefore(self: *const Transcript, account: ai.llm.Account, index: usize) usize {
+    var count: usize = 0;
+    for (self.entries.items[0..index]) |*entry| count += @intFromBool(entry.account() == account);
+    return count;
+}
+
 /// Count one more occurrence of the event at the tail, and report whether that
 /// took the place of an append. An event that states `text` under `options`
 /// again, with no block between the two, states its count instead of a block of

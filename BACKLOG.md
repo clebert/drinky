@@ -30,13 +30,13 @@ extension seams.
 
 ## Improvements
 
-- **A sign-in that Esc cancels** — every login runs on a worker, so the interface keeps painting and
-  reading keys, and Esc cancels the sign-in. _The cooked terminal delivers Esc only with Enter and
-  turns Ctrl+C into SIGINT, so a sign-in that Esc cancels stays in raw mode. A transcript event
-  holds the URL and the code, the picker closes, and the footer offers `Esc: Cancel sign-in`. During
-  a sign-in, Enter on a line that is the callback URL replays it to the listener, and Enter on any
-  other line is refused with a notice that names the sign-in. The device login shows its user code
-  the same way, and the cancel ends its poll._
+- **A live tool timer in whole seconds** — the live row of a running tool states its time and its
+  timeout in whole seconds, so a row above the viewport resets the window at most once per second.
+  _The viewport is the visible screen, and the window is the retained eight pages. The View resets
+  the window for a changed row inside the window but above the viewport, and the live row ticks
+  every frame under one second and every 100 ms after. The reset epoch of the layout covers a
+  rewrite above the window alone. Both spans of the live row take the unit, as in
+  `Time: 3s · Timeout: 30s`, and the finished box keeps the exact span._
 - **Bill a long prompt at the long-context rate** — the session cost applies the long-context rates
   of a model to a request whose prompt reaches the threshold of that model. _The rates come from
   `pricing.overrides` of the public metadata entry. Take the override that names

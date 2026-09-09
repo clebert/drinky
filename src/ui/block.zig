@@ -7,9 +7,10 @@
 //! it goes.
 //!
 //! Each block also retains the rows of its last paint. A frame replays those
-//! rows and runs the markdown of the blocks that changed alone. A block is
-//! append-only, so `appendText` drops the rows of the streaming tail and every
-//! block above it retains its own.
+//! rows and runs the markdown of the blocks that changed alone. A streamed block
+//! grows by `appendText`, which drops the rows of the streaming tail while every
+//! block above it retains its own. An event is the one block that a rewrite can
+//! replace in place, through `replaceEvent`.
 
 const std = @import("std");
 
@@ -151,6 +152,17 @@ pub const Entry = struct {
         columns: usize = 0,
         /// Every row the block paints at `columns`.
         lines: terminal.View.Lines = .empty,
+        /// The reset epoch of the last frame that composed this block, or null
+        /// before the first one. The terminal holds rows of the block while the
+        /// epoch is the current one, because a reset clears every row above the
+        /// window and the block then reaches the terminal only through a frame
+        /// that composes it again.
+        epoch: ?u64 = null,
+        /// Whether a rewrite changed the text after a frame composed it, and no
+        /// frame composed it since. An append never sets it, because an append
+        /// changes no row above the block. A frame that composes the block
+        /// again clears it.
+        rewritten: bool = false,
 
         fn deinit(self: *Cache, gpa: std.mem.Allocator) void {
             self.lines.deinit(gpa);
@@ -177,8 +189,15 @@ pub const Entry = struct {
         }
 
         /// Drop the retained rows and hold their buffers for the next paint.
-        fn invalidate(self: *Cache) void {
+        fn forget(self: *Cache) void {
             self.lines.clearRetainingCapacity();
+        }
+
+        /// A rewrite changed rows that an earlier paint composed: drop the
+        /// retained rows and mark the rewrite.
+        fn invalidate(self: *Cache) void {
+            self.forget();
+            self.rewritten = true;
         }
     };
 
@@ -220,12 +239,43 @@ pub const Entry = struct {
 
     /// Append `delta` to the text of a streamed block, and drop the rows that
     /// held the text before it. Only a block that a run streams accepts text.
+    /// An append grows the block at its bottom, so it marks no rewrite: the rows
+    /// above its last row stand, and the last row can rewrap alone. That row sits
+    /// above the window only once the whole block does, which takes a tail
+    /// taller than the window under a block that still streams, and it costs one
+    /// stale row there.
     pub fn appendText(self: *Entry, gpa: std.mem.Allocator, delta: []const u8) !void {
         switch (self.content) {
             .model => |*list| try list.appendSlice(gpa, delta),
             .thinking => |*reasoning| try reasoning.text.appendSlice(gpa, delta),
             .intro, .user, .user_note, .tool_result, .event => unreachable,
         }
+        self.cache.forget();
+    }
+
+    /// Replace the text and the flags of an event, as the end of a wait rewrites
+    /// the line that announced it. The block keeps its place, and the rows of
+    /// its earlier paint no longer match it. Only an event accepts a replacement.
+    pub fn replaceEvent(
+        self: *Entry,
+        gpa: std.mem.Allocator,
+        options: Options,
+        text: []const u8,
+    ) !void {
+        std.debug.assert(self.content == .event);
+        const flagged = &self.content.event;
+        var list: std.ArrayList(u8) = .empty;
+        errdefer list.deinit(gpa);
+        try list.appendSlice(gpa, text);
+        flagged.text.deinit(gpa);
+        flagged.text = list;
+        flagged.is_error = options.is_error;
+        flagged.is_warning = options.is_warning;
+        flagged.fit = options.fit;
+        flagged.survives_rewind = options.survives_rewind;
+        flagged.mirrored = options.mirrored;
+        flagged.repeats = 1;
+        flagged.base_len = text.len;
         self.cache.invalidate();
     }
 
@@ -233,6 +283,24 @@ pub const Entry = struct {
     /// retains none, so the retained rows stay inside the window.
     pub fn release(self: *Entry, gpa: std.mem.Allocator) void {
         self.cache.lines.clear(gpa);
+    }
+
+    /// Whether the terminal holds rows of this block that a rewrite left behind,
+    /// and clear the mark. The rows are there while `epoch` is the current reset
+    /// epoch, because a reset clears every row above the window. The layout asks
+    /// this of a block that no frame composes, because only a reset can remove
+    /// such rows.
+    pub fn takeRewritten(self: *Entry, epoch: u64) bool {
+        defer self.cache.rewritten = false;
+        return self.cache.rewritten and self.cache.epoch == epoch;
+    }
+
+    /// Record that the frame of `epoch` composed this block, so the terminal
+    /// holds its rows from here on. The layout stamps it after the frame paints,
+    /// because a reset in that same frame starts the epoch that the rows belong
+    /// to.
+    pub fn stampEpoch(self: *Entry, epoch: u64) void {
+        self.cache.epoch = epoch;
     }
 
     /// The account slot whose model context holds this block, or null for a
@@ -371,11 +439,13 @@ pub const Entry = struct {
         if (self.cache.retained(placement.columns)) |lines| return replay(placement, lines);
         const first_row = placement.sink.composed();
         try self.compose(placement);
+        // The frame holds the rows of the current text, so no rewrite waits.
+        self.cache.rewritten = false;
         if (placement.skip > 0) return;
         self.cache.retain(gpa, placement.sink, .{
             .columns = placement.columns,
             .first_row = first_row,
-        }) catch self.cache.invalidate();
+        }) catch self.cache.forget();
     }
 
     /// Compose the retained rows through `placement`, its clipped top dropped.

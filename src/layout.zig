@@ -94,10 +94,26 @@ pub const Tail = union(enum) {
     /// A streamed call counts its argument bytes. A timed call adds its time.
     pub const Turn = struct {
         tools: []const ui.paint.Box,
+        /// What the frames track of each box of `tools`, by position. The
+        /// producer keeps the slice across frames and states the change of this
+        /// frame, and the layout stamps the epoch of the frame that composed
+        /// the box. A shorter slice reads as unchanged and never composed.
+        tracks: []Track = &.{},
         activity: ui.paint.Activity,
         caption: ?ui.Caption,
         editor: *const ui.Editor,
     };
+};
+
+/// What the frames track of one tool box across frames. A box above the window
+/// that changed while the terminal still holds its rows asks for a reset, and
+/// the terminal holds them while `epoch` is the current reset epoch of the view.
+pub const Track = struct {
+    /// Whether the text of the box changed since the last frame.
+    changed: bool = false,
+    /// The reset epoch of the last frame that composed the box at this
+    /// position, or null before the first one.
+    epoch: ?u64 = null,
 };
 
 const EditorPresentation = struct {
@@ -227,6 +243,15 @@ fn projectConversation(
     }
     const skip = if (rows > capacity) rows - capacity else 0;
     const start = total - shown;
+    // No frame repaints a slot above the window, or the clipped top of the first
+    // slot. A rewrite there leaves stale rows in the scrollback while the
+    // terminal still holds rows of the slot, and only a reset removes them. The
+    // reset costs the scrollback above the window, which the reprint does not
+    // restore, so it runs for such a slot alone. The loop visits every slot,
+    // because the check of a block also clears its mark.
+    const epoch = view.resetEpoch();
+    for (0..start) |index| if (slotRewritten(scene, index, epoch)) view.resetScreen();
+    if (skip > 0 and slotRewritten(scene, start, epoch)) view.resetScreen();
     // A block above the window paints nothing, so it retains no rows either.
     // The rows that every block retains then stay inside the window.
     for (scene.transcript[0..@min(start, scene.transcript.len)]) |entry| entry.release(gpa);
@@ -253,6 +278,38 @@ fn projectConversation(
         try slot.component.render(gpa, &placement, size.rows);
     }
     try view.render();
+    // The composed slots reach the terminal in the epoch that the paint leaves
+    // behind. A reset in this frame starts that epoch, so the stamp follows the
+    // paint.
+    for (start..total) |slot_index| stampSlot(scene, slot_index, view.resetEpoch());
+}
+
+/// Whether a rewrite changed the slot at `index` while the terminal still holds
+/// rows of it from the frame of `epoch`. A block reports and clears its own
+/// mark. A tool box reads the track of its position. The editor, the picker,
+/// and the status line sit at the bottom of every frame, so the window always
+/// holds them.
+fn slotRewritten(scene: *const Scene.Conversation, index: usize, epoch: u64) bool {
+    if (index < scene.transcript.len) return scene.transcript[index].takeRewritten(epoch);
+    const offset = index - scene.transcript.len;
+    return switch (scene.tail) {
+        .turn => |turn| offset < turn.tracks.len and
+            turn.tracks[offset].changed and
+            turn.tracks[offset].epoch == epoch,
+        .prompt, .picking => false,
+    };
+}
+
+/// Record that the frame of `epoch` composed the slot at `index`.
+fn stampSlot(scene: *const Scene.Conversation, index: usize, epoch: u64) void {
+    if (index < scene.transcript.len) return scene.transcript[index].stampEpoch(epoch);
+    const offset = index - scene.transcript.len;
+    switch (scene.tail) {
+        .turn => |turn| if (offset < turn.tracks.len) {
+            turn.tracks[offset].epoch = epoch;
+        },
+        .prompt, .picking => {},
+    }
 }
 
 /// How many components the tail contributes.
@@ -742,6 +799,205 @@ test "a block outside the window releases the rows it retained" {
         if (std.mem.indexOf(u8, painted, text) != null) continue;
         try std.testing.expectEqual(@as(usize, 0), entry.cache.lines.count());
     }
+}
+
+// Whether the frames written after `painted` bytes of `written` reset the screen.
+fn resetSince(written: []const u8, painted: usize) bool {
+    return std.mem.indexOf(u8, written[painted..], terminal.escape.screen_reset) != null;
+}
+
+// No frame repaints a block above the window, so a change there leaves its old
+// rows in the scrollback. The layout asks for a reset, which clears them. A block
+// that changes inside the window repaints in place, and a block above the window
+// that does not change costs nothing.
+test "a block that changes above the window forces a reset" {
+    const gpa = std.testing.allocator;
+    var editor = ui.Editor.init(gpa);
+    defer editor.deinit();
+    // One page of twelve rows: the tail takes five, and each block below takes
+    // two, so the window holds the event with one block alone.
+    const size: terminal.View.Size = .{ .columns = 40, .rows = 12 };
+
+    var entries: std.ArrayList(ui.block.Entry) = .empty;
+    defer {
+        for (entries.items) |*entry| entry.deinit(gpa);
+        entries.deinit(gpa);
+    }
+    try entries.append(gpa, try ui.block.Entry.init(gpa, .event, .{}, "waiting"));
+    try entries.append(gpa, try ui.block.Entry.init(gpa, .model, .{}, "block0"));
+    var shown = try shownEntries(gpa, entries.items);
+    defer shown.deinit(gpa);
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var view = terminal.View.init(gpa, &out.writer);
+    defer view.deinit();
+    const scene: Scene = .{ .conversation = .{
+        .window_pages = window_pages_min,
+        .transcript = shown.items,
+        .tail = .{ .prompt = .{ .caption = null, .editor = &editor } },
+        .status = &test_status,
+    } };
+    try project(gpa, &view, size, &scene);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "waiting") != null);
+
+    // Six more blocks slide the window past the event. The slide appends, so it
+    // costs no reset, and the rows of the event stay in the scrollback.
+    for (1..7) |index| {
+        var buffer: [8]u8 = undefined;
+        const text = std.fmt.bufPrint(&buffer, "block{d}", .{index}) catch unreachable;
+        try entries.append(gpa, try ui.block.Entry.init(gpa, .model, .{}, text));
+    }
+    shown.deinit(gpa);
+    shown = try shownEntries(gpa, entries.items);
+    const slid: Scene = .{ .conversation = .{
+        .window_pages = window_pages_min,
+        .transcript = shown.items,
+        .tail = .{ .prompt = .{ .caption = null, .editor = &editor } },
+        .status = &test_status,
+    } };
+    var painted = out.written().len;
+    try project(gpa, &view, size, &slid);
+    try std.testing.expect(std.mem.indexOf(u8, out.written()[painted..], "block6") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written()[painted..], "block0") == null);
+    try std.testing.expect(!resetSince(out.written(), painted));
+
+    // The event changes above the window, so its stale rows force a reset. The
+    // reset settles the change, and the next frame runs without one.
+    try entries.items[0].replaceEvent(gpa, .{}, "changed above");
+    painted = out.written().len;
+    try project(gpa, &view, size, &slid);
+    try std.testing.expect(resetSince(out.written(), painted));
+    painted = out.written().len;
+    try project(gpa, &view, size, &slid);
+    try std.testing.expect(!resetSince(out.written(), painted));
+
+    // The reset took every row of the event off the terminal, so a second
+    // rewrite above the window has nothing to clear and costs no reset.
+    try entries.items[0].replaceEvent(gpa, .{}, "changed again");
+    painted = out.written().len;
+    try project(gpa, &view, size, &slid);
+    try std.testing.expect(!resetSince(out.written(), painted));
+
+    // A streamed delta grows the clipped block at its bottom and changes no row
+    // above the cut, so a reply taller than the window streams with no reset.
+    var reply = try ui.block.numberedLines(gpa, 20);
+    defer reply.deinit(gpa);
+    try entries.append(gpa, try ui.block.Entry.init(gpa, .model, .{}, reply.items));
+    shown.deinit(gpa);
+    shown = try shownEntries(gpa, entries.items);
+    const streaming: Scene = .{ .conversation = .{
+        .window_pages = window_pages_min,
+        .transcript = shown.items,
+        .tail = .{ .prompt = .{ .caption = null, .editor = &editor } },
+        .status = &test_status,
+    } };
+    try project(gpa, &view, size, &streaming);
+    for (0..4) |_| {
+        try entries.items[entries.items.len - 1].appendText(gpa, "\nmore");
+        painted = out.written().len;
+        try project(gpa, &view, size, &streaming);
+        try std.testing.expect(std.mem.indexOf(u8, out.written()[painted..], "more") != null);
+        try std.testing.expect(!resetSince(out.written(), painted));
+    }
+
+    // A block that no frame painted leaves no rows behind, so a change to it
+    // above the window costs no reset.
+    var fresh_out: std.Io.Writer.Allocating = .init(gpa);
+    defer fresh_out.deinit();
+    var fresh_view = terminal.View.init(gpa, &fresh_out.writer);
+    defer fresh_view.deinit();
+    var unseen = try ui.block.Entry.init(gpa, .event, .{}, "unseen");
+    defer unseen.deinit(gpa);
+    var fresh: std.ArrayList(*ui.block.Entry) = .empty;
+    defer fresh.deinit(gpa);
+    try fresh.append(gpa, &unseen);
+    for (entries.items[1..]) |*entry| try fresh.append(gpa, entry);
+    const hidden: Scene = .{ .conversation = .{
+        .window_pages = window_pages_min,
+        .transcript = fresh.items,
+        .tail = .{ .prompt = .{ .caption = null, .editor = &editor } },
+        .status = &test_status,
+    } };
+    try project(gpa, &fresh_view, size, &hidden);
+    try std.testing.expect(std.mem.indexOf(u8, fresh_out.written(), "unseen") == null);
+    try unseen.replaceEvent(gpa, .{}, "changed unseen");
+    painted = fresh_out.written().len;
+    try project(gpa, &fresh_view, size, &hidden);
+    try std.testing.expect(!resetSince(fresh_out.written(), painted));
+}
+
+// A running tool box above the window changes without a repaint too, so the
+// tail tracks each box and the layout resets for a changed one above the cut
+// while the terminal still holds its rows. A changed box inside the window
+// repaints in place, and a box that left the terminal with a reset changes for
+// free until a frame composes it again.
+test "a tool box that changes above the window forces a reset" {
+    const gpa = std.testing.allocator;
+    var editor = ui.Editor.init(gpa);
+    defer editor.deinit();
+
+    var tools: [6]ui.paint.Box = undefined;
+    for (&tools, 0..) |*box, index| {
+        var buffer: [8]u8 = undefined;
+        const text = std.fmt.bufPrint(&buffer, "tool{d}", .{index}) catch unreachable;
+        box.* = .{ .text = try gpa.dupe(u8, text), .fit = .head };
+    }
+    defer for (tools) |box| gpa.free(box.text);
+    var tracks = [_]Track{.{}} ** tools.len;
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var view = terminal.View.init(gpa, &out.writer);
+    defer view.deinit();
+    // One page of twelve rows: the editor and the status take five, and each
+    // box takes four, so the window holds the newest box whole and clips the
+    // one above it.
+    const size: terminal.View.Size = .{ .columns = 40, .rows = 12 };
+    const scene: Scene = .{ .conversation = .{
+        .window_pages = window_pages_min,
+        .transcript = &.{},
+        .tail = .{ .turn = .{
+            .tools = &tools,
+            .tracks = &tracks,
+            .activity = .{ .motion_tick = 0, .progress_age_ticks = 0 },
+            .caption = null,
+            .editor = &editor,
+        } },
+        .status = &test_status,
+    } };
+    // Every box starts on the terminal, as if the window held the whole tail
+    // once. The first frame then stamps the composed boxes alone.
+    for (&tracks) |*track| track.epoch = view.resetEpoch();
+    try project(gpa, &view, size, &scene);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "tool0") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "tool5") != null);
+
+    // A change to the newest box repaints in place.
+    tracks[tools.len - 1].changed = true;
+    var painted = out.written().len;
+    try project(gpa, &view, size, &scene);
+    try std.testing.expect(!resetSince(out.written(), painted));
+    tracks[tools.len - 1].changed = false;
+
+    // A change to the oldest box, above the cut, forces a reset once. The reset
+    // takes its rows off the terminal, so the ticks that follow cost nothing.
+    tracks[0].changed = true;
+    painted = out.written().len;
+    try project(gpa, &view, size, &scene);
+    try std.testing.expect(resetSince(out.written(), painted));
+    for (0..3) |_| {
+        painted = out.written().len;
+        try project(gpa, &view, size, &scene);
+        try std.testing.expect(!resetSince(out.written(), painted));
+    }
+
+    // A box that no frame composed has no rows to clear, so its change above
+    // the cut costs no reset either.
+    tracks[1] = .{ .changed = true };
+    painted = out.written().len;
+    try project(gpa, &view, size, &scene);
+    try std.testing.expect(!resetSince(out.written(), painted));
 }
 
 // The configured count sets how much of the newest content one frame retains.

@@ -13,8 +13,8 @@ const request_frame_bytes = "GET ".len + " HTTP/1.1\r\n".len;
 const response_page = "Drinky received authorization. Close this tab.";
 
 /// The longest pasted line that fits the wire byte limit with the request
-/// frame around it. A paste reader sizes its line storage with this, so the
-/// two limits cannot disagree.
+/// frame around it. `holdsRedirect` refuses a longer line, so the two limits
+/// cannot disagree.
 pub const paste_bytes_max = request_bytes_max - request_frame_bytes;
 
 pub const Redirect = struct {
@@ -96,7 +96,7 @@ pub fn holdsRedirect(line: []const u8, binding: Binding) bool {
 /// request, with the line as the request target. The listener parses only the
 /// request line, and its success response is best effort, so replay closes
 /// right after the flush and never waits on the listener. A listener stuck on
-/// a stalled stray connection therefore cannot stall the paste watch.
+/// a stalled stray connection therefore cannot stall the caller.
 pub fn replay(io: std.Io, port: u16, line: []const u8) !void {
     var address: std.Io.net.IpAddress = .{ .ip4 = .loopback(port) };
     const stream = try address.connect(io, .{ .mode = .stream, .protocol = .tcp });

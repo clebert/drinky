@@ -45,8 +45,8 @@ pub const Outcome = union(enum) {
     /// takes an argument lands here, so the user completes it and sends it. The
     /// bytes transfer to the caller.
     editor_text: []const u8,
-    /// Authenticate this account, then switch to it. The app owns the flow. It
-    /// must suspend the tty around the OAuth browser callback.
+    /// Authenticate this account, then switch to it. The app owns the worker,
+    /// the callback editor, and the final account change.
     login: llm.Account,
     /// Drop this account's stored credentials. A logout of the
     /// active account hands the session to the next authenticated one, or

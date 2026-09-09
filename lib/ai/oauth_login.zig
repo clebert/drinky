@@ -11,8 +11,8 @@ const slow_down_increment_ms = 5_000;
 /// The floor under a poll interval, so a grant that names a zero interval still
 /// spends the window and the loop ends.
 const interval_ms_min = 1_000;
-/// The ceiling on a grant lifetime. The callback flow waits this long too, and
-/// the wait blocks the interface, so no server can hold it open for longer.
+/// The ceiling on a grant lifetime. The callback flow waits this long too, so
+/// no server can hold its worker open for longer.
 const lifetime_ms_max = 5 * std.time.ms_per_min;
 
 /// The answer of one poll of a device-code grant.
