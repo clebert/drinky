@@ -113,7 +113,7 @@ service account key file.
 - The session cost counts every attempt, a canceled or rejected one included. A reply that reports
   its charge, as OpenRouter does, adds that charge, and every other reply adds its usage at public
   rates. Every cost figure reads `~$0.42`, and the tilde marks the estimate. A positive total under
-  one cent reads `~<$0.01`.
+  one cent reads `~$0.01`.
 
 ## Accounts
 
@@ -369,8 +369,9 @@ service account key file.
   Anthropic and OpenAI state the allowance in the response head of each request. Drinky reads the
   xAI subscription allowance after each model reply. An API-key account reports none.
 - An OpenRouter account spends a prepaid credit pool. Drinky reads the pool after each model reply,
-  and the line states the remaining amount as `Credits: $7.14`. The pool takes no color, because an
-  amount states no share. A key that the endpoint refuses states no pool.
+  and the line states the remaining amount as `Credits: $7.14`. A positive amount under one cent
+  reads `Credits: <$0.01`, so a nearly spent pool never reads as empty. The pool takes no color,
+  because an amount states no share. A key that the endpoint refuses states no pool.
 - The quota, the credit pool, and the cache-hit rate show once this turn reports them. They never
   show the last turn. The cache-hit rate measures one request.
 - The context gauge and each quota window take the warning color from 75% used and the error color

@@ -591,15 +591,16 @@ fn writeContext(line: *Line, info: *const Info, form: Parts.Context) !void {
 /// The session cost behind its separator. The cost is an estimate at public
 /// rates, so the tilde marks it: the login type does not reveal the billing, a
 /// subscription pays none of it, and a reply that Drinky could not price counts
-/// nothing. Every cost figure of Drinky takes this one mark.
+/// nothing. Every cost figure of Drinky takes this one mark. A positive cost
+/// under one cent reads `~$0.01`, so a cheap session never reads as free. The
+/// tilde already marks the estimate, so the figure takes no `<`.
 fn writeCost(line: *Line, info: *const Info) !void {
-    try line.out.print("{s}Cost: ~", .{separator});
-    try writeUsd(&line.out, info.cost);
+    const cost = if (info.cost > 0) @max(info.cost, 0.01) else info.cost;
+    try line.out.print("{s}Cost: ~${d:.2}", .{ separator, cost });
 }
 
 /// One USD amount to the cent. A positive amount under one cent reads `<$0.01`,
-/// so a cheap session never reads as free and a nearly spent pool never reads
-/// as empty.
+/// so a nearly spent pool never reads as empty.
 fn writeUsd(out: *std.Io.Writer, amount: f64) !void {
     if (amount > 0 and amount < 0.01) return out.writeAll("<$0.01");
     try out.print("${d:.2}", .{amount});
@@ -804,9 +805,9 @@ test "the numbers state the gauge in its short form and the cost" {
 
 test "a positive sub-cent cost never displays as zero" {
     const cases = [_]struct { cost: f64, expected: []const u8 }{
-        .{ .cost = 0.000123, .expected = " · Cost: ~<$0.01" },
-        .{ .cost = 0.00999, .expected = " · Cost: ~<$0.01" },
-        .{ .cost = 1e-12, .expected = " · Cost: ~<$0.01" },
+        .{ .cost = 0.000123, .expected = " · Cost: ~$0.01" },
+        .{ .cost = 0.00999, .expected = " · Cost: ~$0.01" },
+        .{ .cost = 1e-12, .expected = " · Cost: ~$0.01" },
         .{ .cost = 0, .expected = " · Cost: ~$0.00" },
         .{ .cost = 0.01, .expected = " · Cost: ~$0.01" },
         .{ .cost = 0.42, .expected = " · Cost: ~$0.42" },
