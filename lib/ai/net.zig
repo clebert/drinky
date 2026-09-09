@@ -255,6 +255,14 @@ fn getInto(gpa: std.mem.Allocator, io: std.Io, get: *const Get, out: *?[]u8) !vo
 /// tunable, like the OAuth token-response cap.
 pub const stream_response_bytes_max = 64 << 20;
 
+/// The bytes of a failed response body that a transport captures for the error
+/// report. The report reads the message out of the captured JSON, so the whole
+/// body must fit. An Anthropic or OpenAI body stays under 512 bytes. An
+/// OpenRouter body embeds the whole upstream body as a string, with remedy hints
+/// around it, so it runs to a few thousand bytes. A Google body carries a
+/// `details` array. A longer body reports its cut raw bytes.
+pub const error_body_bytes_max = 4096;
+
 /// A running byte budget for one streamed response, shared across its reads.
 /// It is the volume counterpart to `Deadline`, so a peer that continues to
 /// make valid progress still hits an aggregate ceiling. Bytes are charged

@@ -111,9 +111,7 @@ pub const Stream = struct {
     /// The composed Authorization value. The retained request points at it for
     /// the stream's whole lifetime, so the stream owns the bytes.
     authorization: []u8,
-    /// A Google error body carries a `details` array, so it runs past the 512
-    /// bytes the other transports keep, and `describeError` needs the whole body.
-    error_buffer: [4096]u8,
+    error_buffer: [net.error_body_bytes_max]u8,
     redirect_buffer: [4096]u8,
     transfer_buffer: [16384]u8,
 

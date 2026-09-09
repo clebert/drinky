@@ -112,7 +112,7 @@ pub const Stream = struct {
     /// The account id behind the `chatgpt-account-id` header, owned like
     /// `authorization`. Empty on a stream that sends no such header.
     account_id: []u8,
-    error_buffer: [512]u8,
+    error_buffer: [net.error_body_bytes_max]u8,
     redirect_buffer: [4096]u8,
     transfer_buffer: [16384]u8,
 
@@ -713,6 +713,7 @@ fn completedUsage(object: std.json.ObjectMap) ?std.json.ObjectMap {
     return json.object(response.get("usage"));
 }
 
+/// The message of an error body in one of the provider shapes, or null.
 fn errorMessage(object: std.json.ObjectMap) ?[]const u8 {
     if (json.string(object.get("message"))) |message| return message;
     if (json.object(object.get("error"))) |detail| {
@@ -726,13 +727,29 @@ fn errorMessage(object: std.json.ObjectMap) ?[]const u8 {
     return null;
 }
 
+/// The text of the upstream provider in an OpenRouter error, or null. OpenRouter
+/// wraps that error: its own message is the generic `Provider returned error`,
+/// and `metadata.raw` holds the upstream text, or the whole upstream body as an
+/// object or as a string. A body yields its message. A body string without one
+/// stands as it is, because it still holds the upstream text.
+fn upstreamText(arena: std.mem.Allocator, detail: std.json.ObjectMap) !?[]const u8 {
+    const metadata = json.object(detail.get("metadata")) orelse return null;
+    const raw = metadata.get("raw") orelse return null;
+    if (json.object(raw)) |body| return errorMessage(body);
+    const text = json.string(raw) orelse return null;
+    if (text.len == 0) return null;
+    const body = (try json.parseObject(arena, text)) orelse return text;
+    return errorMessage(body) orelse text;
+}
+
 /// The message that reports an error body or a streamed error frame: the
-/// sentences for a spent plan allowance, or else the plain provider message.
-/// Both paths read it, so a failed head and a streamed frame of the same shape
-/// report the same text.
+/// sentences for a spent plan allowance, the text of the upstream provider
+/// behind OpenRouter, or else the plain provider message. Both paths read it, so
+/// a failed head and a streamed frame of the same shape report the same text.
 fn errorDescription(arena: std.mem.Allocator, object: std.json.ObjectMap) !?[]const u8 {
     const detail = json.object(object.get("error")) orelse object;
     if (try usageLimitText(arena, detail)) |text| return text;
+    if (try upstreamText(arena, detail)) |text| return text;
     return errorMessage(object);
 }
 
@@ -1896,6 +1913,68 @@ test "describeError reduces a failed head's error body to its message" {
         try stream.describeError("<html>gateway</html>"),
     );
     try std.testing.expectEqual(@as(?[]const u8, null), try stream.describeError("{}"));
+}
+
+test "describeError reports the upstream text of an OpenRouter error" {
+    var stream = testStream(undefined, undefined, 0, 0);
+    defer stream.deinitDecode();
+
+    // OpenRouter wraps the error of the upstream provider. Its own message is
+    // generic, and the upstream text sits in `metadata.raw`.
+    try std.testing.expectEqualStrings("upstream is rate-limited", (try stream.describeError(
+        "{\"error\":{\"message\":\"Provider returned error\",\"code\":429," ++
+            "\"metadata\":{\"raw\":\"upstream is rate-limited\",\"provider_name\":\"Makora\"}}}",
+    )).?);
+    // An empty raw text and a raw object without a message both keep the message.
+    try std.testing.expectEqualStrings("Provider returned error", (try stream.describeError(
+        \\{"error":{"message":"Provider returned error","metadata":{"raw":""}}}
+    )).?);
+    try std.testing.expectEqualStrings("Provider returned error", (try stream.describeError(
+        \\{"error":{"message":"Provider returned error","metadata":{"raw":{"code":429}}}}
+    )).?);
+}
+
+test "describeError reads the message out of an upstream body in an OpenRouter error" {
+    var stream = testStream(undefined, undefined, 0, 0);
+    defer stream.deinitDecode();
+
+    // OpenRouter often puts the whole upstream body into `raw` as a string. An
+    // Anthropic body nests the message under `error`, and a Google body does too.
+    try std.testing.expectEqualStrings("Overloaded", (try stream.describeError(
+        "{\"error\":{\"message\":\"Provider returned error\",\"code\":529,\"metadata\":{\"raw\":" ++
+            "\"{\\\"type\\\":\\\"error\\\",\\\"error\\\":{\\\"type\\\":\\\"overloaded_error\\\"," ++
+            "\\\"message\\\":\\\"Overloaded\\\"}}\",\"provider_name\":\"Anthropic\"}}}",
+    )).?);
+    // A raw object with a message yields that message.
+    try std.testing.expectEqualStrings("Resource exhausted", (try stream.describeError(
+        \\{"error":{"message":"Provider returned error","metadata":{"raw":{"error":{"code":429,"message":"Resource exhausted"}}}}}
+    )).?);
+    // A body string without a message stands as it is, because it still holds
+    // the upstream text.
+    try std.testing.expectEqualStrings("{\"status\":\"RESOURCE_EXHAUSTED\"}", (try stream.describeError(
+        \\{"error":{"message":"Provider returned error","metadata":{"raw":"{\"status\":\"RESOURCE_EXHAUSTED\"}"}}}
+    )).?);
+}
+
+test "the error buffer holds a whole OpenRouter rejection body" {
+    var stream = testStream(undefined, undefined, 0, 0);
+    defer stream.deinitDecode();
+
+    const raw = "qwen/qwen3.8-flash is temporarily rate-limited upstream. Please retry " ++
+        "shortly, or add your own key to accumulate your rate limits: " ++
+        "https://openrouter.ai/settings/integrations";
+    const body = "{\"error\":{\"message\":\"Provider returned error\",\"code\":429,\"metadata\":" ++
+        "{\"raw\":\"" ++ raw ++ "\",\"provider_name\":\"Makora\",\"is_byok\":false," ++
+        "\"provider_error_code\":\"capacity\",\"limit_source\":\"upstream_provider_shared_pool\"," ++
+        "\"remedy_hint\":\"Retry shortly, add your own provider key " ++
+        "(https://openrouter.ai/settings/integrations), or route to a different provider.\"}}}";
+    var reader: std.Io.Reader = .fixed(body);
+    // The read that `connect` performs on a failed head. A buffer shorter than
+    // the body cuts the JSON, and a cut body reports its raw bytes.
+    stream.error_length = try reader.readSliceShort(&stream.error_buffer);
+    try std.testing.expectEqualStrings(raw, (try stream.describeError(
+        stream.error_buffer[0..stream.error_length],
+    )).?);
 }
 
 test "describeError names the plan and the wait of a spent usage limit" {

@@ -104,7 +104,7 @@ pub const Stream = struct {
     /// retained request points at it for the stream's whole lifetime, so the
     /// stream owns the bytes. Empty for the API-key identity.
     authorization: []u8,
-    error_buffer: [512]u8,
+    error_buffer: [net.error_body_bytes_max]u8,
     redirect_buffer: [4096]u8,
     transfer_buffer: [16384]u8,
 
@@ -1384,7 +1384,7 @@ test "decode surfaces a streamed error frame" {
     try std.testing.expect(!stream.retryable());
 
     // A message longer than the error buffer is truncated, never out of bounds.
-    const long = "x" ** 600;
+    const long = "x" ** (stream.error_buffer.len + 1);
     try std.testing.expectError(error.ApiError, stream.decode(
         "{\"type\":\"error\",\"error\":{\"message\":\"" ++ long ++ "\"}}",
     ));

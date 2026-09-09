@@ -254,7 +254,8 @@ service account key file.
   price.
 - A failed request reports the message from the provider JSON error body, not the raw bytes. A
   failed response head names its status too. For a spent OpenAI subscription, the message names the
-  plan and the wait.
+  plan and the wait. For an OpenRouter error, the message is the upstream text where OpenRouter
+  sends one.
 
 ## The interface
 
