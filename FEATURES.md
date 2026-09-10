@@ -116,7 +116,8 @@ to OpenRouter through a login or an API key, and to Gemini on the Gemini Enterpr
   its charge, as OpenRouter does, adds that charge, and every other reply adds its usage at public
   rates. A prompt that reaches the long-context threshold of its model bills the whole request at
   the long-context rates. Every cost figure reads `~$0.42`, and the tilde marks the estimate. A
-  positive total under one cent reads `~$0.01`.
+  positive total under one cent reads `~$0.01`. The figure is informational, because a subscription
+  account pays no per-token price and Drinky never knows the real charge.
 
 ## Accounts
 

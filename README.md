@@ -67,6 +67,17 @@ key file and `GOOGLE_CLOUD_LOCATION` to `eu`, `us`, or `global`.
 
 Drinky is not affiliated with Anthropic, OpenAI, xAI, OpenRouter, or Google.
 
+## Cost display
+
+The status line shows the session cost as an estimate, as in `~$0.42`, and the tilde marks it.
+Drinky prices the tokens of the session at the public rates of the model, or takes the charge that a
+reply states, as an OpenRouter reply does. The figure is informational, and it is not a bill. A
+subscription account pays no per-token price at all, and Drinky still prints the figure as an
+orientation about the weight of a session. Drinky never knows the real charge.
+
+The context gauge, the quota window, and the credit pool are different. Each one reports what the
+provider states.
+
 ## Slash commands
 
 A line that starts with a slash runs in Drinky and reaches no model. Type `/` or `/help` to open the
