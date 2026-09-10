@@ -37,10 +37,6 @@ extension seams.
   every frame under one second and every 100 ms after. The reset epoch of the layout covers a
   rewrite above the window alone. Both spans of the live row take the unit, as in
   `Time: 3s · Timeout: 30s`, and the finished box keeps the exact span._
-- **A cap on concurrent read-only calls** — at most 32 read-only calls of one reply run at a time,
-  so a burst of calls spawns a bounded number of threads. _The process `Io.Threaded` has no
-  concurrency limit, and a limit set there fails a call past it instead of queuing the call, so the
-  cap belongs to the agent._
 - **Bill a long prompt at the long-context rate** — the session cost applies the long-context rates
   of a model to a request whose prompt reaches the threshold of that model. _The rates come from
   `pricing.overrides` of the public metadata entry. Take the override that names

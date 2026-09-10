@@ -16,8 +16,8 @@ service account key file.
   results back until the model stops.
 - A turn fails after 1000 tool rounds or when one reply asks for more than 64 tool calls, so a
   runaway model stops.
-- Read-only tool calls of one reply run in parallel. A `write`, `edit`, or `bash` call runs alone,
-  in call order.
+- Read-only tool calls of one reply run in parallel, at most 32 at a time. A `write`, `edit`, or
+  `bash` call runs alone, in call order.
 - Enter during a turn queues a steering message. The turn takes it at the next tool round.
 - Ctrl+P moves the queued messages back into the editor. A message that the turn did not take
   returns to the editor when the turn ends.

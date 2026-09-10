@@ -20,6 +20,11 @@ const Agent = @This();
 const redacted_notice = "[redacted thinking]";
 /// The per-reply bound on complete tool calls. A call past this bound aborts the stream.
 pub const tool_calls_max: usize = 64;
+/// The bound on read-only calls of one reply that run at a time. Each running
+/// call holds one thread, so a burst runs in batches of this size and never
+/// spawns one thread per call. The process executor sets no limit of its own,
+/// and a limit there fails a call past it instead of holding it back.
+const read_only_calls_max: usize = 32;
 
 /// The conservative content for a reserved tool-result slot whose real result
 /// never arrived. It does not claim the call never started. One wording covers a
@@ -1277,12 +1282,12 @@ fn runTools(self: *Agent, reply: []const llm.Item, turn: *TurnState, handler: an
 /// A conservative error result is reserved in history for every call. The
 /// round is committed (checkpoint advanced) before anything is announced or
 /// dispatched. So no mutation can change the world with no result recorded.
-/// Contiguous read-only calls run concurrently. A mutating call is a barrier.
-/// It awaits, transfers, and presents every earlier read before it announces
-/// itself, and then runs alone. Any failure (a mid-turn cancel included) reaps
-/// in-flight tasks and harvests their finished results into the reserved slots.
-/// This leaves the committed round replay-valid. Returns false when no tools
-/// were asked.
+/// Contiguous read-only calls run concurrently, at most `read_only_calls_max`
+/// of them at a time. A mutating call is a barrier. It awaits, transfers, and
+/// presents every earlier read before it announces itself, and then runs alone.
+/// Any failure (a mid-turn cancel included) reaps in-flight tasks and harvests
+/// their finished results into the reserved slots. This leaves the committed
+/// round replay-valid. Returns false when no tools were asked.
 fn runToolsWith(
     self: *Agent,
     comptime Dispatch: type,
@@ -1337,16 +1342,21 @@ fn runToolsWith(
         self.harvestResults(calls);
     }
 
+    var reads_launched: usize = 0;
     for (calls) |*call| {
         const mutates = Dispatch.mutates(call.name);
-        if (mutates) {
+        if (mutates or reads_launched == read_only_calls_max) {
             // Drain earlier reads so the mutation cannot race one, and transfer
             // and present them in call order. The emptied group is reused. Both
             // happen before the announce, so presentation never shows a later
             // call start above an earlier call's result. A cancel at the barrier
             // never announces a mutation that did not run.
+            //
+            // A full batch drains for the same reason: the group awaits as a
+            // whole, and the drain keeps the presentation in call order.
             try group.await(self.io);
             group = .init;
+            reads_launched = 0;
             try self.presentReady(calls, turn, handler);
         }
         try presentation(
@@ -1358,6 +1368,7 @@ fn runToolsWith(
             try self.presentResult(call, turn, handler);
         } else {
             try group.concurrent(self.io, Runner(Dispatch).run, .{ call, &context });
+            reads_launched += 1;
         }
     }
     try group.await(self.io);
@@ -3917,6 +3928,46 @@ test "a mutating call is a barrier between the reads around it" {
     try std.testing.expectEqualStrings("r3", agent.items.items[3].tool_result.call_id);
     try std.testing.expectEqual(@as(usize, 4), handler.tool_start_count);
     try std.testing.expectEqual(@as(usize, 4), handler.tool_result_count);
+}
+
+// Each running read holds one thread, so one reply must never spawn a thread
+// per call. A burst runs in batches of the cap, and every call still gets its
+// result in call order.
+test "a burst of read-only calls runs at most the cap at a time" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var log: ScheduleLog = .init(threaded.io());
+
+    var agent = scriptedAgent(gpa);
+    agent.io = log.io();
+    defer agent.deinit();
+    var handler: CaptureHandler = .{ .gpa = gpa };
+    defer handler.deinit();
+
+    const call_count = read_only_calls_max + 8;
+    var call_ids: [call_count][8]u8 = undefined;
+    var ids: [call_count][]const u8 = undefined;
+    var reply: [call_count]llm.Item = undefined;
+    for (0..call_count) |index| {
+        ids[index] = try std.fmt.bufPrint(&call_ids[index], "r{d}", .{index});
+        reply[index] = .{ .tool_call = .{
+            .call_id = ids[index],
+            .name = "read",
+            .arguments_json = "{}",
+        } };
+    }
+    var turn: TurnState = .{ .base = 0, .checkpoint = 0 };
+    try std.testing.expect(try agent.runToolsWith(probe, &reply, &turn, &handler));
+
+    try std.testing.expectEqual(read_only_calls_max, log.launched_peak);
+    try std.testing.expectEqual(call_count, handler.tool_start_count);
+    try std.testing.expectEqual(call_count, handler.tool_result_count);
+    try std.testing.expectEqual(call_count, agent.items.items.len);
+    for (agent.items.items, ids) |item, id| {
+        try std.testing.expectEqualStrings(id, item.tool_result.call_id);
+        try std.testing.expect(!item.tool_result.is_error);
+    }
 }
 
 test "a barrier presents the reads before it before announcing its mutation" {
