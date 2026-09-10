@@ -309,7 +309,7 @@ test "File reads keyed entries" {
         .parsed = try std.json.parseFromSlice(
             std.json.Value,
             gpa,
-            "{\"openai_subscription\":{\"access\":\"x\"}}",
+            "{\"openai-sub-login\":{\"access\":\"x\"}}",
             .{},
         ),
     };
@@ -317,7 +317,7 @@ test "File reads keyed entries" {
     try std.testing.expect(keyed.entry("absent") == null);
     try std.testing.expectEqualStrings(
         "x",
-        keyed.entry("openai_subscription").?.get("access").?.string,
+        keyed.entry("openai-sub-login").?.get("access").?.string,
     );
 }
 
@@ -327,8 +327,8 @@ test "serialize adds an entry, preserving other keys" {
 
     const merged = try serialize(
         gpa,
-        "{\"openai_subscription\":{\"access\":\"keep\"}}",
-        "anthropic_subscription",
+        "{\"openai-sub-login\":{\"access\":\"keep\"}}",
+        "anthropic-sub-login",
         entry,
         .{},
     );
@@ -338,9 +338,9 @@ test "serialize adds an entry, preserving other keys" {
     const root = parsed.value.object;
     try std.testing.expectEqualStrings(
         "keep",
-        root.get("openai_subscription").?.object.get("access").?.string,
+        root.get("openai-sub-login").?.object.get("access").?.string,
     );
-    const added = root.get("anthropic_subscription").?.object;
+    const added = root.get("anthropic-sub-login").?.object;
     try std.testing.expectEqualStrings("at", added.get("access").?.string);
     try std.testing.expectEqual(@as(i64, 1234), added.get("expires_ms").?.integer);
 }
@@ -349,22 +349,22 @@ test "serialize from nothing writes just the entry, and replaces its own" {
     const gpa = std.testing.allocator;
     const entry: TestEntry = .{ .access = "new", .refresh = "rt", .expires_ms = 1 };
 
-    const fresh = try serialize(gpa, null, "openai_subscription", entry, .{});
+    const fresh = try serialize(gpa, null, "openai-sub-login", entry, .{});
     defer gpa.free(fresh);
     var parsed = try std.json.parseFromSlice(std.json.Value, gpa, fresh, .{});
     defer parsed.deinit();
     try std.testing.expectEqual(@as(usize, 1), parsed.value.object.count());
     try std.testing.expectEqualStrings(
         "new",
-        parsed.value.object.get("openai_subscription").?.object.get("access").?.string,
+        parsed.value.object.get("openai-sub-login").?.object.get("access").?.string,
     );
 
     // `serialize` replaces an existing entry under the same key and keeps a sibling.
     const replaced = try serialize(
         gpa,
-        "{\"anthropic_subscription\":{\"access\":\"keep\"}," ++
-            "\"openai_subscription\":{\"access\":\"old\"}}",
-        "openai_subscription",
+        "{\"anthropic-sub-login\":{\"access\":\"keep\"}," ++
+            "\"openai-sub-login\":{\"access\":\"old\"}}",
+        "openai-sub-login",
         entry,
         .{},
     );
@@ -373,11 +373,11 @@ test "serialize from nothing writes just the entry, and replaces its own" {
     defer parsed_replaced.deinit();
     try std.testing.expectEqualStrings(
         "keep",
-        parsed_replaced.value.object.get("anthropic_subscription").?.object.get("access").?.string,
+        parsed_replaced.value.object.get("anthropic-sub-login").?.object.get("access").?.string,
     );
     try std.testing.expectEqualStrings(
         "new",
-        parsed_replaced.value.object.get("openai_subscription").?.object.get("access").?.string,
+        parsed_replaced.value.object.get("openai-sub-login").?.object.get("access").?.string,
     );
 }
 
@@ -387,11 +387,11 @@ test "serialize errors on an unparseable or non-object existing file" {
 
     try std.testing.expectError(
         error.CorruptStore,
-        serialize(gpa, "{ not valid json", "openai_subscription", entry, .{}),
+        serialize(gpa, "{ not valid json", "openai-sub-login", entry, .{}),
     );
     try std.testing.expectError(
         error.CorruptStore,
-        serialize(gpa, "[1,2,3]", "openai_subscription", entry, .{}),
+        serialize(gpa, "[1,2,3]", "openai-sub-login", entry, .{}),
     );
 }
 
@@ -399,9 +399,9 @@ test "serialize drops a key, preserving other keys" {
     const gpa = std.testing.allocator;
     const merged = try serialize(
         gpa,
-        "{\"anthropic_subscription\":{\"access\":\"a\"}," ++
-            "\"openai_subscription\":{\"access\":\"o\"}}",
-        "openai_subscription",
+        "{\"anthropic-sub-login\":{\"access\":\"a\"}," ++
+            "\"openai-sub-login\":{\"access\":\"o\"}}",
+        "openai-sub-login",
         null,
         .{},
     );
@@ -409,14 +409,14 @@ test "serialize drops a key, preserving other keys" {
     var parsed = try std.json.parseFromSlice(std.json.Value, gpa, merged, .{});
     defer parsed.deinit();
     const root = parsed.value.object;
-    try std.testing.expect(root.get("openai_subscription") == null);
+    try std.testing.expect(root.get("openai-sub-login") == null);
     try std.testing.expectEqualStrings(
         "a",
-        root.get("anthropic_subscription").?.object.get("access").?.string,
+        root.get("anthropic-sub-login").?.object.get("access").?.string,
     );
 
     // The removal of the last key leaves a valid empty object, not a wipe error.
-    const emptied = try serialize(gpa, merged, "anthropic_subscription", null, .{});
+    const emptied = try serialize(gpa, merged, "anthropic-sub-login", null, .{});
     defer gpa.free(emptied);
     var parsed_empty = try std.json.parseFromSlice(std.json.Value, gpa, emptied, .{});
     defer parsed_empty.deinit();
@@ -496,7 +496,7 @@ test "save replaces the file atomically at owner-only permissions" {
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/auth.json", .{tmp.sub_path});
     const entry: TestEntry = .{ .access = "at", .refresh = "rt", .expires_ms = 1 };
 
-    try save(gpa, io, path, "openai_subscription", entry, .{});
+    try save(gpa, io, path, "openai-sub-login", entry, .{});
     const before = try tmp.dir.statFile(io, "auth.json", .{});
     try std.testing.expectEqual(
         @as(u32, 0o600),
@@ -504,7 +504,7 @@ test "save replaces the file atomically at owner-only permissions" {
     );
 
     // A rewrite lands on a fresh inode — renamed over, never truncated in place.
-    try save(gpa, io, path, "anthropic_subscription", entry, .{});
+    try save(gpa, io, path, "anthropic-sub-login", entry, .{});
     const after = try tmp.dir.statFile(io, "auth.json", .{});
     try std.testing.expect(before.inode != after.inode);
 
@@ -512,11 +512,11 @@ test "save replaces the file atomically at owner-only permissions" {
     defer file.deinit();
     try std.testing.expectEqualStrings(
         "at",
-        file.entry("openai_subscription").?.get("access").?.string,
+        file.entry("openai-sub-login").?.get("access").?.string,
     );
     try std.testing.expectEqualStrings(
         "at",
-        file.entry("anthropic_subscription").?.get("access").?.string,
+        file.entry("anthropic-sub-login").?.get("access").?.string,
     );
 }
 
@@ -533,16 +533,16 @@ test "remove drops only its key on disk, and a missing file opens as null" {
 
     try std.testing.expect((try open(gpa, io, path)) == null);
 
-    try save(gpa, io, path, "openai_subscription", entry, .{});
-    try save(gpa, io, path, "anthropic_subscription", entry, .{});
-    try remove(gpa, io, path, "openai_subscription");
+    try save(gpa, io, path, "openai-sub-login", entry, .{});
+    try save(gpa, io, path, "anthropic-sub-login", entry, .{});
+    try remove(gpa, io, path, "openai-sub-login");
 
     var file = (try open(gpa, io, path)).?;
     defer file.deinit();
-    try std.testing.expect(file.entry("openai_subscription") == null);
+    try std.testing.expect(file.entry("openai-sub-login") == null);
     try std.testing.expectEqualStrings(
         "at",
-        file.entry("anthropic_subscription").?.get("access").?.string,
+        file.entry("anthropic-sub-login").?.get("access").?.string,
     );
 }
 
@@ -560,10 +560,10 @@ test "a conditional removal keeps a replacement entry" {
     const original: TestEntry = .{ .access = "a1", .refresh = "r1", .expires_ms = 1 };
     const replacement: TestEntry = .{ .access = "a2", .refresh = "r2", .expires_ms = 2 };
 
-    try save(gpa, io, path, "anthropic_subscription", original, .{});
-    try save(gpa, io, path, "anthropic_subscription", replacement, .{});
+    try save(gpa, io, path, "anthropic-sub-login", original, .{});
+    try save(gpa, io, path, "anthropic-sub-login", replacement, .{});
     const replacement_removed = try removeMatchingString(gpa, io, path, &.{
-        .key = "anthropic_subscription",
+        .key = "anthropic-sub-login",
         .field = "refresh",
         .expected = "r1",
     });
@@ -574,19 +574,19 @@ test "a conditional removal keeps a replacement entry" {
         defer file.deinit();
         try std.testing.expectEqualStrings(
             "r2",
-            file.entry("anthropic_subscription").?.get("refresh").?.string,
+            file.entry("anthropic-sub-login").?.get("refresh").?.string,
         );
     }
 
     const removed = try removeMatchingString(gpa, io, path, &.{
-        .key = "anthropic_subscription",
+        .key = "anthropic-sub-login",
         .field = "refresh",
         .expected = "r2",
     });
     try std.testing.expect(removed);
     var file = (try open(gpa, io, path)).?;
     defer file.deinit();
-    try std.testing.expect(file.entry("anthropic_subscription") == null);
+    try std.testing.expect(file.entry("anthropic-sub-login") == null);
 }
 
 test "open, save, and remove refuse a corrupt file, leaving it intact on disk" {
@@ -605,9 +605,9 @@ test "open, save, and remove refuse a corrupt file, leaving it intact on disk" {
     try std.testing.expectError(error.CorruptStore, open(gpa, io, path));
     try std.testing.expectError(
         error.CorruptStore,
-        save(gpa, io, path, "openai_subscription", entry, .{}),
+        save(gpa, io, path, "openai-sub-login", entry, .{}),
     );
-    try std.testing.expectError(error.CorruptStore, remove(gpa, io, path, "openai_subscription"));
+    try std.testing.expectError(error.CorruptStore, remove(gpa, io, path, "openai-sub-login"));
 
     const data = try tmp.dir.readFileAlloc(io, "auth.json", gpa, .unlimited);
     defer gpa.free(data);
@@ -619,6 +619,6 @@ test "serialize errors on a corrupt file" {
 
     try std.testing.expectError(
         error.CorruptStore,
-        serialize(gpa, "{ not json", "openai_subscription", null, .{}),
+        serialize(gpa, "{ not json", "openai-sub-login", null, .{}),
     );
 }

@@ -1566,7 +1566,7 @@ test "an account change or sign-out clears the previous account's quota and pool
     const openai_client = provider.Client.init(
         gpa,
         std.testing.io,
-        .{ .openai_api = "sk-test" },
+        .{ .openai_api_key = "sk-test" },
         .{},
     );
     const openai_model = testing.model("gpt-5.6-sol");
@@ -1612,7 +1612,7 @@ test "the cache rate expires with the principal, the model, and the wire effort"
     const other_account = provider.Client.init(
         gpa,
         std.testing.io,
-        .{ .anthropic_api = "key" },
+        .{ .anthropic_api_key = "key" },
         .{},
     );
     agent.switchTo(other_account, agent.model.?);
@@ -1653,7 +1653,7 @@ test "the context gauge holds while the tokenizer and the replayed reasoning hol
     const subscription = agent.client.?;
     const opus = agent.model.?;
     try agent.appendUser("committed context");
-    try appendProof(&agent, .anthropic_subscription);
+    try appendProof(&agent, .anthropic_sub_login);
     agent.setEffort(.high);
     seedContext(&agent, 1020);
 
@@ -1674,7 +1674,7 @@ test "the context gauge holds while the tokenizer and the replayed reasoning hol
     try std.testing.expectEqual(@as(?u64, 1020), agent.stats.context_tokens);
 
     // Another account renders another prompt, and it cannot replay this proof.
-    const console = provider.Client.init(gpa, std.testing.io, .{ .anthropic_console = "k" }, .{});
+    const console = provider.Client.init(gpa, std.testing.io, .{ .anthropic_api_login = "k" }, .{});
     agent.switchTo(console, opus);
     try std.testing.expect(agent.stats.context_tokens == null);
     agent.switchTo(subscription, opus);
@@ -1720,7 +1720,7 @@ test "an account switch hides the count, and a switch back restores it" {
     agent.setEffort(.high);
     seedContext(&agent, 1020);
 
-    const console = provider.Client.init(gpa, std.testing.io, .{ .anthropic_console = "k" }, .{});
+    const console = provider.Client.init(gpa, std.testing.io, .{ .anthropic_api_login = "k" }, .{});
     agent.switchTo(console, opus);
     try std.testing.expect(agent.stats.context_tokens == null);
 
@@ -1752,7 +1752,7 @@ test "the context gauge survives every effort change that replays the same reaso
     // this account replays either way and the count stands.
     const sonnet = testing.model("claude-sonnet-4-6");
     anthropic_agent.switchTo(subscription, sonnet);
-    try appendProof(&anthropic_agent, .anthropic_subscription);
+    try appendProof(&anthropic_agent, .anthropic_sub_login);
     anthropic_agent.setEffort(.high);
     seedContext(&anthropic_agent, 1020);
     anthropic_agent.setEffort(.xhigh);
@@ -1761,7 +1761,7 @@ test "the context gauge survives every effort change that replays the same reaso
     var openai_agent = openaiScriptedAgent(gpa);
     defer openai_agent.deinit();
     try openai_agent.appendUser("committed context");
-    try appendProof(&openai_agent, .openai_api);
+    try appendProof(&openai_agent, .openai_api_key);
     openai_agent.setEffort(.high);
     seedContext(&openai_agent, 1020);
 
@@ -1778,7 +1778,7 @@ test "usage is priced with the model that produced it, not the active one" {
     const client = provider.Client.init(
         gpa,
         std.testing.io,
-        .{ .anthropic_subscription = undefined },
+        .{ .anthropic_sub_login = undefined },
         .{},
     );
     var agent = Agent.init(gpa, std.testing.io, client, .{
@@ -2247,7 +2247,7 @@ fn scriptedAgent(gpa: std.mem.Allocator) Agent {
     const client = provider.Client.init(
         gpa,
         std.testing.io,
-        .{ .anthropic_subscription = undefined },
+        .{ .anthropic_sub_login = undefined },
         .{},
     );
     return Agent.init(gpa, std.testing.io, client, .{
@@ -2278,20 +2278,20 @@ fn appendProof(agent: *Agent, account: llm.Account) !void {
     const proof = try gpa.dupe(u8, "proof");
     errdefer gpa.free(proof);
     const replay: llm.Item.Reasoning.Replay = switch (account) {
-        inline .anthropic_subscription,
-        .anthropic_api,
-        .anthropic_console,
+        inline .anthropic_sub_login,
+        .anthropic_api_key,
+        .anthropic_api_login,
         => |tag| @unionInit(
             llm.Item.Reasoning.Replay,
             @tagName(tag),
             .{ .signature = .{ .text = text, .signature = proof } },
         ),
-        inline .openai_subscription,
-        .openai_api,
-        .xai_subscription,
-        .xai_api,
-        .openrouter_oauth,
-        .openrouter_api,
+        inline .openai_sub_login,
+        .openai_api_key,
+        .xai_sub_login,
+        .xai_api_key,
+        .openrouter_api_login,
+        .openrouter_api_key,
         => |tag| replay: {
             const id = try gpa.dupe(u8, "rs_1");
             break :replay @unionInit(
@@ -2300,14 +2300,16 @@ fn appendProof(agent: *Agent, account: llm.Account) !void {
                 .{ .text = text, .id = id, .encrypted_content = proof },
             );
         },
-        .google_vertex => .{ .google_vertex = .{ .text = text, .signature = proof } },
+        .google_cloud_keyfile => .{
+            .google_cloud_keyfile = .{ .text = text, .signature = proof },
+        },
     };
     try agent.items.append(gpa, .{ .reasoning = .{ .replay = replay } });
 }
 
 fn openaiScriptedAgent(gpa: std.mem.Allocator) Agent {
     const model = testing.model("gpt-5.6-sol");
-    const client = provider.Client.init(gpa, std.testing.io, .{ .openai_api = "sk-test" }, .{});
+    const client = provider.Client.init(gpa, std.testing.io, .{ .openai_api_key = "sk-test" }, .{});
     return Agent.init(gpa, std.testing.io, client, .{
         .model = model,
         .system = "",
@@ -2317,28 +2319,28 @@ fn openaiScriptedAgent(gpa: std.mem.Allocator) Agent {
 }
 
 fn anthropicStream(io: std.Io, reader: *std.Io.Reader, idle_ms: u64) provider.Stream {
-    var stream: provider.Stream = .{ .anthropic_subscription = undefined };
-    stream.anthropic_subscription.gpa = std.testing.allocator;
-    stream.anthropic_subscription.io = io;
-    stream.anthropic_subscription.idle_ms = idle_ms;
-    stream.anthropic_subscription.budget = .{ .max = net.stream_response_bytes_max };
-    stream.anthropic_subscription.body = reader;
-    stream.anthropic_subscription.frame_arena = .init(std.testing.allocator);
-    stream.anthropic_subscription.beginDecode();
-    stream.anthropic_subscription.usage = .{};
+    var stream: provider.Stream = .{ .anthropic_sub_login = undefined };
+    stream.anthropic_sub_login.gpa = std.testing.allocator;
+    stream.anthropic_sub_login.io = io;
+    stream.anthropic_sub_login.idle_ms = idle_ms;
+    stream.anthropic_sub_login.budget = .{ .max = net.stream_response_bytes_max };
+    stream.anthropic_sub_login.body = reader;
+    stream.anthropic_sub_login.frame_arena = .init(std.testing.allocator);
+    stream.anthropic_sub_login.beginDecode();
+    stream.anthropic_sub_login.usage = .{};
     return stream;
 }
 
 fn openaiStream(io: std.Io, reader: *std.Io.Reader) provider.Stream {
-    var stream: provider.Stream = .{ .openai_api = undefined };
-    stream.openai_api.gpa = std.testing.allocator;
-    stream.openai_api.io = io;
-    stream.openai_api.idle_ms = 60_000;
-    stream.openai_api.budget = .{ .max = net.stream_response_bytes_max };
-    stream.openai_api.body = reader;
-    stream.openai_api.frame_arena = .init(std.testing.allocator);
-    stream.openai_api.beginDecode();
-    stream.openai_api.usage = .{};
+    var stream: provider.Stream = .{ .openai_api_key = undefined };
+    stream.openai_api_key.gpa = std.testing.allocator;
+    stream.openai_api_key.io = io;
+    stream.openai_api_key.idle_ms = 60_000;
+    stream.openai_api_key.budget = .{ .max = net.stream_response_bytes_max };
+    stream.openai_api_key.body = reader;
+    stream.openai_api_key.frame_arena = .init(std.testing.allocator);
+    stream.openai_api_key.beginDecode();
+    stream.openai_api_key.usage = .{};
     return stream;
 }
 
@@ -2821,7 +2823,7 @@ test "readReply accepts Anthropic message_stop without waiting for later traffic
     defer threaded.deinit();
     var reader: std.Io.Reader = .fixed(body);
     var stream = anthropicStream(threaded.io(), &reader, 0);
-    defer stream.anthropic_subscription.deinitDecode();
+    defer stream.anthropic_sub_login.deinitDecode();
     var agent = scriptedAgent(std.testing.allocator);
     defer agent.deinit();
     var handler: CaptureHandler = .{ .gpa = std.testing.allocator };
@@ -2851,7 +2853,7 @@ test "readReply accepts OpenAI completion without consuming its done sentinel" {
     defer threaded.deinit();
     var reader: std.Io.Reader = .fixed(body);
     var stream = openaiStream(threaded.io(), &reader);
-    defer stream.openai_api.deinitDecode();
+    defer stream.openai_api_key.deinitDecode();
     var agent = openaiScriptedAgent(std.testing.allocator);
     defer agent.deinit();
     var handler: CaptureHandler = .{ .gpa = std.testing.allocator };
@@ -2880,7 +2882,7 @@ test "provider rejections retain terminal usage before failing the reply" {
             "data: {\"type\":\"message_stop\"}\n\n";
         var reader: std.Io.Reader = .fixed(body);
         var stream = anthropicStream(threaded.io(), &reader, 60_000);
-        defer stream.anthropic_subscription.deinitDecode();
+        defer stream.anthropic_sub_login.deinitDecode();
         var agent = scriptedAgent(gpa);
         defer agent.deinit();
         var handler: CaptureHandler = .{ .gpa = gpa };
@@ -2903,7 +2905,7 @@ test "provider rejections retain terminal usage before failing the reply" {
             "\"usage\":{\"input_tokens\":13,\"output_tokens\":5}}}\n\n";
         var reader: std.Io.Reader = .fixed(body);
         var stream = openaiStream(threaded.io(), &reader);
-        defer stream.openai_api.deinitDecode();
+        defer stream.openai_api_key.deinitDecode();
         var agent = openaiScriptedAgent(gpa);
         defer agent.deinit();
         var handler: CaptureHandler = .{ .gpa = gpa };
@@ -2931,7 +2933,7 @@ test "provider rejections retain terminal usage before failing the reply" {
             "\"usage\":{\"input_tokens\":17,\"output_tokens\":3}}}\n\n";
         var reader: std.Io.Reader = .fixed(body);
         var stream = openaiStream(threaded.io(), &reader);
-        defer stream.openai_api.deinitDecode();
+        defer stream.openai_api_key.deinitDecode();
         var agent = openaiScriptedAgent(gpa);
         defer agent.deinit();
         var handler: CaptureHandler = .{ .gpa = gpa };
@@ -2955,7 +2957,7 @@ fn expectUnencryptedReply(options: struct {
 }) !void {
     const gpa = std.testing.allocator;
     const openai = @import("openai/root.zig");
-    inline for (.{ llm.Account.openrouter_oauth, llm.Account.openrouter_api }) |account| {
+    inline for (.{ llm.Account.openrouter_api_login, llm.Account.openrouter_api_key }) |account| {
         const body = try std.fmt.allocPrint(
             gpa,
             "data: {{\"type\":\"response.reasoning_text.delta\",\"delta\":\"think\"}}\n\n" ++
@@ -2973,8 +2975,8 @@ fn expectUnencryptedReply(options: struct {
         var stream = openaiStream(std.testing.io, &reader);
         // The client sets this from the account, so a stream built by hand sets
         // it too. Every OpenRouter account replays plain reasoning.
-        stream.openai_api.plain_reasoning = true;
-        defer stream.openai_api.deinitDecode();
+        stream.openai_api_key.plain_reasoning = true;
+        defer stream.openai_api_key.deinitDecode();
         var agent = openaiScriptedAgent(gpa);
         defer agent.deinit();
         agent.client.?.credentials = @unionInit(provider.Credentials, @tagName(account), "test");
@@ -3077,7 +3079,7 @@ test "readReply separates OpenAI reasoning summary parts with a blank line" {
     defer threaded.deinit();
     var reader: std.Io.Reader = .fixed(body);
     var stream = openaiStream(threaded.io(), &reader);
-    defer stream.openai_api.deinitDecode();
+    defer stream.openai_api_key.deinitDecode();
     var agent = openaiScriptedAgent(std.testing.allocator);
     defer agent.deinit();
     var handler: CaptureHandler = .{ .gpa = std.testing.allocator };
@@ -3085,13 +3087,16 @@ test "readReply separates OpenAI reasoning summary parts with a blank line" {
 
     const reply = try agent.readReply(&agent.model.?, &stream, &handler);
     try std.testing.expectEqual(@as(usize, 1), reply.len);
-    try std.testing.expectEqualStrings("a\n\nb", reply[0].reasoning.replay.openai_api.text);
+    try std.testing.expectEqualStrings("a\n\nb", reply[0].reasoning.replay.openai_api_key.text);
     try std.testing.expectEqual(
-        llm.Account.openai_api,
+        llm.Account.openai_api_key,
         std.meta.activeTag(reply[0].reasoning.replay),
     );
-    try std.testing.expectEqualStrings("enc", reply[0].reasoning.replay.openai_api.encrypted_content);
-    try std.testing.expectEqualStrings("rs_1", reply[0].reasoning.replay.openai_api.id);
+    try std.testing.expectEqualStrings(
+        "enc",
+        reply[0].reasoning.replay.openai_api_key.encrypted_content,
+    );
+    try std.testing.expectEqualStrings("rs_1", reply[0].reasoning.replay.openai_api_key.id);
     try std.testing.expectEqualStrings("a\n\nb", handler.thinking.items);
 }
 
@@ -3117,7 +3122,7 @@ test "readReply separates a redacted Anthropic block from the reasoning before i
     defer threaded.deinit();
     var reader: std.Io.Reader = .fixed(body);
     var stream = anthropicStream(threaded.io(), &reader, 60_000);
-    defer stream.anthropic_subscription.deinitDecode();
+    defer stream.anthropic_sub_login.deinitDecode();
     var agent = scriptedAgent(std.testing.allocator);
     defer agent.deinit();
     var handler: CaptureHandler = .{ .gpa = std.testing.allocator };
@@ -3127,11 +3132,11 @@ test "readReply separates a redacted Anthropic block from the reasoning before i
     try std.testing.expectEqual(@as(usize, 2), reply.len);
     try std.testing.expectEqualStrings(
         "weigh it",
-        reply[0].reasoning.replay.anthropic_subscription.signature.text,
+        reply[0].reasoning.replay.anthropic_sub_login.signature.text,
     );
     try std.testing.expectEqualStrings(
         "enc",
-        reply[1].reasoning.replay.anthropic_subscription.redacted,
+        reply[1].reasoning.replay.anthropic_sub_login.redacted,
     );
     try std.testing.expectEqualStrings("weigh it\n\n" ++ redacted_notice, handler.thinking.items);
 }
@@ -3146,7 +3151,7 @@ test "readReply rejects provider EOF before text completion" {
             "\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n";
         var reader: std.Io.Reader = .fixed(body);
         var stream = anthropicStream(threaded.io(), &reader, 60_000);
-        defer stream.anthropic_subscription.deinitDecode();
+        defer stream.anthropic_sub_login.deinitDecode();
         var agent = scriptedAgent(std.testing.allocator);
         defer agent.deinit();
         var handler: CaptureHandler = .{ .gpa = std.testing.allocator };
@@ -3164,7 +3169,7 @@ test "readReply rejects provider EOF before text completion" {
         const body = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n";
         var reader: std.Io.Reader = .fixed(body);
         var stream = openaiStream(threaded.io(), &reader);
-        defer stream.openai_api.deinitDecode();
+        defer stream.openai_api_key.deinitDecode();
         var agent = openaiScriptedAgent(std.testing.allocator);
         defer agent.deinit();
         var handler: CaptureHandler = .{ .gpa = std.testing.allocator };
@@ -3191,7 +3196,7 @@ test "incomplete provider tool calls never enter history or execute" {
             "{\"type\":\"input_json_delta\",\"partial_json\":\"{\"}}\n\n";
         var reader: std.Io.Reader = .fixed(body);
         var stream = anthropicStream(threaded.io(), &reader, 60_000);
-        defer stream.anthropic_subscription.deinitDecode();
+        defer stream.anthropic_sub_login.deinitDecode();
         var agent = scriptedAgent(std.testing.allocator);
         defer agent.deinit();
         var handler: CaptureHandler = .{ .gpa = std.testing.allocator };
@@ -3208,7 +3213,7 @@ test "incomplete provider tool calls never enter history or execute" {
             "data: {\"type\":\"response.function_call_arguments.delta\",\"delta\":\"{\"}\n\n";
         var reader: std.Io.Reader = .fixed(body);
         var stream = openaiStream(threaded.io(), &reader);
-        defer stream.openai_api.deinitDecode();
+        defer stream.openai_api_key.deinitDecode();
         var agent = openaiScriptedAgent(std.testing.allocator);
         defer agent.deinit();
         var handler: CaptureHandler = .{ .gpa = std.testing.allocator };
@@ -3246,15 +3251,15 @@ test "readReply assembles a reasoning run, answer, and tool call in stream order
     try std.testing.expectEqual(@as(usize, 3), reply.len);
     try std.testing.expectEqualStrings(
         "weigh it",
-        reply[0].reasoning.replay.anthropic_subscription.signature.text,
+        reply[0].reasoning.replay.anthropic_sub_login.signature.text,
     );
     try std.testing.expectEqual(
-        llm.Account.anthropic_subscription,
+        llm.Account.anthropic_sub_login,
         std.meta.activeTag(reply[0].reasoning.replay),
     );
     try std.testing.expectEqualStrings(
         "sig",
-        reply[0].reasoning.replay.anthropic_subscription.signature.signature,
+        reply[0].reasoning.replay.anthropic_sub_login.signature.signature,
     );
     try std.testing.expectEqualStrings("answer", reply[1].message.text);
     try std.testing.expectEqualStrings("t1", reply[2].tool_call.call_id);
@@ -3287,15 +3292,15 @@ test "readReply keeps a redacted block and a signature-only run in order" {
     try std.testing.expectEqual(@as(usize, 3), reply.len);
     try std.testing.expectEqualStrings(
         "enc",
-        reply[0].reasoning.replay.anthropic_subscription.redacted,
+        reply[0].reasoning.replay.anthropic_sub_login.redacted,
     );
     try std.testing.expectEqualStrings(
         "",
-        reply[1].reasoning.replay.anthropic_subscription.signature.text,
+        reply[1].reasoning.replay.anthropic_sub_login.signature.text,
     );
     try std.testing.expectEqualStrings(
         "sigonly",
-        reply[1].reasoning.replay.anthropic_subscription.signature.signature,
+        reply[1].reasoning.replay.anthropic_sub_login.signature.signature,
     );
     try std.testing.expectEqualStrings("hi", reply[2].message.text);
     try std.testing.expectEqualStrings(redacted_notice, handler.thinking.items);
@@ -3367,25 +3372,25 @@ test "readReply keeps adjacent reasoning runs as separate items in stream order"
 
     const reply = try agent.readReply(&agent.model.?, &stream, &handler);
     try std.testing.expectEqual(@as(usize, 5), reply.len);
-    try std.testing.expectEqualStrings("A", reply[0].reasoning.replay.openai_api.text);
+    try std.testing.expectEqualStrings("A", reply[0].reasoning.replay.openai_api_key.text);
     try std.testing.expectEqualStrings(
         "encA",
-        reply[0].reasoning.replay.openai_api.encrypted_content,
+        reply[0].reasoning.replay.openai_api_key.encrypted_content,
     );
-    try std.testing.expectEqualStrings("rs_a", reply[0].reasoning.replay.openai_api.id);
-    try std.testing.expectEqualStrings("B", reply[1].reasoning.replay.openai_api.text);
+    try std.testing.expectEqualStrings("rs_a", reply[0].reasoning.replay.openai_api_key.id);
+    try std.testing.expectEqualStrings("B", reply[1].reasoning.replay.openai_api_key.text);
     try std.testing.expectEqualStrings(
         "encB",
-        reply[1].reasoning.replay.openai_api.encrypted_content,
+        reply[1].reasoning.replay.openai_api_key.encrypted_content,
     );
-    try std.testing.expectEqualStrings("rs_b", reply[1].reasoning.replay.openai_api.id);
+    try std.testing.expectEqualStrings("rs_b", reply[1].reasoning.replay.openai_api_key.id);
     try std.testing.expectEqualStrings("between", reply[2].message.text);
-    try std.testing.expectEqualStrings("C", reply[3].reasoning.replay.openai_api.text);
+    try std.testing.expectEqualStrings("C", reply[3].reasoning.replay.openai_api_key.text);
     try std.testing.expectEqualStrings(
         "encC",
-        reply[3].reasoning.replay.openai_api.encrypted_content,
+        reply[3].reasoning.replay.openai_api_key.encrypted_content,
     );
-    try std.testing.expectEqualStrings("rs_c", reply[3].reasoning.replay.openai_api.id);
+    try std.testing.expectEqualStrings("rs_c", reply[3].reasoning.replay.openai_api_key.id);
     try std.testing.expectEqualStrings("t1", reply[4].tool_call.call_id);
 }
 
@@ -3411,14 +3416,14 @@ test "readReply binds reasoning proof to the active account" {
     const reply = try agent.readReply(&agent.model.?, &stream, &handler);
     try std.testing.expectEqual(@as(usize, 2), reply.len);
     try std.testing.expectEqual(
-        llm.Account.openai_api,
+        llm.Account.openai_api_key,
         std.meta.activeTag(reply[0].reasoning.replay),
     );
-    try std.testing.expectEqualStrings("rs_1", reply[0].reasoning.replay.openai_api.id);
-    try std.testing.expectEqualStrings("hmm", reply[0].reasoning.replay.openai_api.text);
+    try std.testing.expectEqualStrings("rs_1", reply[0].reasoning.replay.openai_api_key.id);
+    try std.testing.expectEqualStrings("hmm", reply[0].reasoning.replay.openai_api_key.text);
     try std.testing.expectEqualStrings(
         "enc",
-        reply[0].reasoning.replay.openai_api.encrypted_content,
+        reply[0].reasoning.replay.openai_api_key.encrypted_content,
     );
     try std.testing.expectEqualStrings("done", reply[1].message.text);
 }
@@ -3443,7 +3448,7 @@ test "dropReasoning invalidates only the replaced account slot" {
     const openai_client = provider.Client.init(
         gpa,
         std.testing.io,
-        .{ .openai_api = "sk-test" },
+        .{ .openai_api_key = "sk-test" },
         .{},
     );
     agent.switchTo(openai_client, openai_model);
@@ -3460,15 +3465,15 @@ test "dropReasoning invalidates only the replaced account slot" {
 
     try std.testing.expectEqual(@as(usize, 2), agent.items.items.len);
     seedContext(&agent, 1020);
-    agent.dropReasoning(.anthropic_subscription);
+    agent.dropReasoning(.anthropic_sub_login);
     try std.testing.expectEqual(@as(usize, 1), agent.items.items.len);
     try std.testing.expectEqual(
-        llm.Account.openai_api,
+        llm.Account.openai_api_key,
         std.meta.activeTag(agent.items.items[0].reasoning.replay),
     );
     // A shorter history leaves no valid measurement of it.
     try std.testing.expect(agent.stats.context_tokens == null);
-    agent.dropReasoning(.openai_api);
+    agent.dropReasoning(.openai_api_key);
     try std.testing.expectEqual(@as(usize, 0), agent.items.items.len);
     // Empty history holds exactly zero tokens, measured or not.
     try std.testing.expectEqual(@as(?u64, 0), agent.stats.context_tokens);
@@ -3485,20 +3490,20 @@ test "dropped account evidence takes the allowance of the active account only" {
     const usage: llm.Usage = .{ .input = 100, .cache_read = 900 };
     agent.stats.quota = quota;
     agent.stats.cache_usage = usage;
-    agent.dropAccountEvidence(.openai_api);
+    agent.dropAccountEvidence(.openai_api_key);
     try std.testing.expect(agent.stats.quota != null);
     try std.testing.expectEqual(usage, agent.stats.cache_usage);
 
     // A replaced credential of the active account takes them, because the next
     // principal has its own allowance and its own isolated cache.
-    agent.dropAccountEvidence(.anthropic_subscription);
+    agent.dropAccountEvidence(.anthropic_sub_login);
     try std.testing.expect(agent.stats.quota == null);
     try std.testing.expectEqual(llm.Usage{}, agent.stats.cache_usage);
 
     // A signed-out agent has no account to compare, and drops nothing.
     agent.signOut();
     agent.stats.quota = quota;
-    agent.dropAccountEvidence(.anthropic_subscription);
+    agent.dropAccountEvidence(.anthropic_sub_login);
     try std.testing.expect(agent.stats.quota != null);
 }
 

@@ -11,25 +11,25 @@ const model_testing = @import("../testing.zig");
 const provider = @import("../provider.zig");
 
 /// A registry that offers no model. A test that needs one calls `seed`. A ready
-/// Vertex account takes a credential stub that owns nothing, because the
+/// key file account takes a credential stub that owns nothing, because the
 /// commands read the authenticated state alone.
 pub fn accounts(
     environment: Accounts.Environment,
     ready: struct {
         anthropic: bool = false,
         openai: bool = false,
-        anthropic_console: bool = false,
+        anthropic_api_login: bool = false,
         xai: bool = false,
         openrouter: bool = false,
         google: bool = false,
     },
 ) Accounts {
     var registry = model_testing.accounts(environment);
-    registry.anthropic_subscription_ready = ready.anthropic;
-    registry.openai_subscription_ready = ready.openai;
-    registry.anthropic_console_ready = ready.anthropic_console;
-    registry.xai_subscription_ready = ready.xai;
-    registry.openrouter_oauth_ready = ready.openrouter;
+    registry.anthropic_sub_login_ready = ready.anthropic;
+    registry.openai_sub_login_ready = ready.openai;
+    registry.anthropic_api_login_ready = ready.anthropic_api_login;
+    registry.xai_sub_login_ready = ready.xai;
+    registry.openrouter_api_login_ready = ready.openrouter;
     if (ready.google) registry.google_auth = .{
         .gpa = registry.gpa,
         .io = registry.io,

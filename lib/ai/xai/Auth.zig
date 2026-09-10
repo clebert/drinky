@@ -1,18 +1,19 @@
 //! The credential lifecycle for the xAI subscription account: the shared `auth`
 //! lifecycle instantiated over the device-code protocol of `oauth` for the
-//! `"xai_subscription"` entry in `<home>/.drinky/auth.json`.
+//! `"xai-sub-login"` entry in `<home>/.drinky/auth.json`.
 
 const std = @import("std");
 
 const auth = @import("../auth.zig");
 const json_store = @import("../json_store.zig");
+const llm = @import("../llm.zig");
 const net = @import("../net.zig");
 const oauth = @import("oauth.zig");
 
 const Auth = @This();
 
 /// The top-level key this account's credentials live under in `auth.json`.
-const account_key = "xai_subscription";
+const account_key = llm.Account.xai_sub_login.id();
 
 gpa: std.mem.Allocator,
 io: std.Io,
@@ -33,7 +34,7 @@ pub fn deinit(self: *Auth) void {
 }
 
 /// Load stored tokens. Returns false when the file is absent or holds no
-/// `xai_subscription` entry (this account is simply not logged in).
+/// `xai-sub-login` entry (this account is simply not logged in).
 pub fn load(self: *Auth) !bool {
     return auth.load(self, account_key);
 }
@@ -83,7 +84,7 @@ test "load distinguishes signed out from corrupt credentials" {
     // both simply signed out. An own entry that lacks a field is corrupt, not
     // ignored.
     try std.testing.expect(!try subject.load());
-    try json_store.save(gpa, io, subject.path, "openai_subscription", .{ .access = "a" }, .{});
+    try json_store.save(gpa, io, subject.path, "openai-sub-login", .{ .access = "a" }, .{});
     try std.testing.expect(!try subject.load());
     try json_store.save(
         gpa,

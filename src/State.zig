@@ -97,7 +97,7 @@ const Entry = struct {
             try stringify.beginObject();
             for (std.enums.values(ai.llm.Account)) |account| {
                 const model = self.table.get(account) orelse continue;
-                try stringify.objectField(@tagName(account));
+                try stringify.objectField(account.id());
                 try stringify.write(model.name());
             }
             try stringify.endObject();
@@ -226,7 +226,7 @@ pub fn record(
 /// store contention keeps a snapshot pending.
 fn save(self: *State, account: ai.llm.Account, effort: ai.llm.Effort) !void {
     ai.json_store.save(self.gpa, self.io, self.path, self.project, Entry{
-        .account = @tagName(account),
+        .account = account.id(),
         .effort = @tagName(effort),
         .models = .{ .table = &self.models },
     }, .{ .keys_max = projects_max }) catch |err| {
@@ -246,12 +246,12 @@ fn read(self: *State) void {
     defer file.deinit();
     const entry = file.entry(self.project) orelse return;
     self.start = .{
-        .account = readEnum(ai.llm.Account, &entry, "account"),
+        .account = ai.llm.Account.parse(readString(&entry, "account") orelse ""),
         .effort = readEnum(ai.llm.Effort, &entry, "effort"),
     };
     if (readObject(&entry, "models")) |listed| {
         for (std.enums.values(ai.llm.Account)) |account| {
-            const name = readString(&listed, @tagName(account)) orelse continue;
+            const name = readString(&listed, account.id()) orelse continue;
             // The file names a model and nothing more. A name that the account
             // no longer offers resolves to nothing when the catalog reads it,
             // and that account then starts without a model.
@@ -373,25 +373,25 @@ test "a stored entry reads back the account, the effort level, and one model per
     const home = try tmpHome(gpa, io, &tmp);
     defer gpa.free(home);
     try writeForTest(io, &tmp,
-        \\{ "/elsewhere": { "account": "openai_api", "effort": "low",
-        \\    "models": { "openai_api": "gpt-5.6-luna" } },
-        \\  "/work": { "account": "anthropic_subscription", "effort": "max",
-        \\    "models": { "anthropic_subscription": "claude-opus-5",
-        \\      "openai_api": "gpt-5.6-luna" } } }
+        \\{ "/elsewhere": { "account": "openai-api-key", "effort": "low",
+        \\    "models": { "openai-api-key": "gpt-5.6-luna" } },
+        \\  "/work": { "account": "anthropic-sub-login", "effort": "max",
+        \\    "models": { "anthropic-sub-login": "claude-opus-5",
+        \\      "openai-api-key": "gpt-5.6-luna" } } }
     );
 
     var state = try openForTest(gpa, io, home);
     defer state.deinit();
-    try std.testing.expectEqual(ai.llm.Account.anthropic_subscription, state.start.account.?);
+    try std.testing.expectEqual(ai.llm.Account.anthropic_sub_login, state.start.account.?);
     try std.testing.expectEqual(ai.llm.Effort.max, state.start.effort.?);
     // Every account the entry names keeps its own model, not only the active one.
     try std.testing.expectEqualStrings(
         "claude-opus-5",
-        state.models.get(.anthropic_subscription).?.name(),
+        state.models.get(.anthropic_sub_login).?.name(),
     );
-    try std.testing.expectEqualStrings("gpt-5.6-luna", state.models.get(.openai_api).?.name());
+    try std.testing.expectEqualStrings("gpt-5.6-luna", state.models.get(.openai_api_key).?.name());
     // An account the entry does not name remembers no model.
-    try std.testing.expect(state.models.get(.anthropic_api) == null);
+    try std.testing.expect(state.models.get(.anthropic_api_key) == null);
 }
 
 test "an unusable value reads as nothing remembered" {
@@ -410,11 +410,11 @@ test "an unusable value reads as nothing remembered" {
         ,
         \\{ "/work": { "account": 42, "models": 42 } }
         ,
-        \\{ "/work": { "account": [], "models": { "anthropic_api": 42 } } }
+        \\{ "/work": { "account": [], "models": { "anthropic-api-key": 42 } } }
         ,
         // Another project's entry never applies to this one.
-        \\{ "/elsewhere": { "account": "anthropic_api",
-        \\    "models": { "anthropic_api": "claude-opus-5" } } }
+        \\{ "/elsewhere": { "account": "anthropic-api-key",
+        \\    "models": { "anthropic-api-key": "claude-opus-5" } } }
         ,
     };
 
@@ -437,13 +437,13 @@ test "an unusable value reads as nothing remembered" {
     const home = try tmpHome(gpa, io, &tmp);
     defer gpa.free(home);
     try writeForTest(io, &tmp,
-        \\{ "/work": { "account": "anthropic_api", "effort": "nope",
-        \\    "models": { "anthropic_api": "claude-opus-5" } } }
+        \\{ "/work": { "account": "anthropic-api-key", "effort": "nope",
+        \\    "models": { "anthropic-api-key": "claude-opus-5" } } }
     );
     var state = try openForTest(gpa, io, home);
     defer state.deinit();
     try std.testing.expect(state.start.account != null);
-    try std.testing.expect(state.models.get(.anthropic_api) != null);
+    try std.testing.expect(state.models.get(.anthropic_api_key) != null);
     try std.testing.expect(state.start.effort == null);
 }
 
@@ -455,45 +455,45 @@ test "only a change writes the file, and it keeps another project" {
     const home = try tmpHome(gpa, io, &tmp);
     defer gpa.free(home);
     try writeForTest(io, &tmp,
-        \\{ "/elsewhere": { "account": "openai_api", "effort": "low",
-        \\    "models": { "openai_api": "gpt-5.6-luna" } } }
+        \\{ "/elsewhere": { "account": "openai-api-key", "effort": "low",
+        \\    "models": { "openai-api-key": "gpt-5.6-luna" } } }
     );
 
     var state = try openForTest(gpa, io, home);
     defer state.deinit();
-    try state.seed(.anthropic_api, test_model, .xhigh);
+    try state.seed(.anthropic_api_key, test_model, .xhigh);
 
     // The seeded choice is the current one, so neither call writes.
-    try state.record(.anthropic_api, test_model, .xhigh);
+    try state.record(.anthropic_api_key, test_model, .xhigh);
     var before = (try ai.json_store.open(gpa, io, state.path)).?;
     defer before.deinit();
     try std.testing.expect(before.entry("/work") == null);
 
     // A changed effort level writes the whole entry and keeps the other project.
-    try state.record(.anthropic_api, test_model, .low);
+    try state.record(.anthropic_api_key, test_model, .low);
     var after = (try ai.json_store.open(gpa, io, state.path)).?;
     defer after.deinit();
     const entry = after.entry("/work").?;
-    try std.testing.expectEqualStrings("anthropic_api", entry.get("account").?.string);
+    try std.testing.expectEqualStrings("anthropic-api-key", entry.get("account").?.string);
     try std.testing.expectEqualStrings("low", entry.get("effort").?.string);
     try std.testing.expectEqualStrings(
         "claude-opus-5",
-        entry.get("models").?.object.get("anthropic_api").?.string,
+        entry.get("models").?.object.get("anthropic-api-key").?.string,
     );
     // Only the accounts that ran a model here reach the file.
     try std.testing.expectEqual(@as(usize, 1), entry.get("models").?.object.count());
     try std.testing.expectEqualStrings(
         "gpt-5.6-luna",
-        after.entry("/elsewhere").?.get("models").?.object.get("openai_api").?.string,
+        after.entry("/elsewhere").?.get("models").?.object.get("openai-api-key").?.string,
     );
 
     // A restart reads back exactly what the record wrote.
     var restarted = try openForTest(gpa, io, home);
     defer restarted.deinit();
-    try std.testing.expectEqual(ai.llm.Account.anthropic_api, restarted.start.account.?);
+    try std.testing.expectEqual(ai.llm.Account.anthropic_api_key, restarted.start.account.?);
     try std.testing.expectEqualStrings(
         "claude-opus-5",
-        restarted.models.get(.anthropic_api).?.name(),
+        restarted.models.get(.anthropic_api_key).?.name(),
     );
     try std.testing.expectEqual(ai.llm.Effort.low, restarted.start.effort.?);
 }
@@ -509,24 +509,30 @@ test "each account keeps its own model across a switch and a restart" {
 
     var state = try openForTest(gpa, io, home);
     defer state.deinit();
-    try state.seed(.anthropic_api, test_model, .high);
+    try state.seed(.anthropic_api_key, test_model, .high);
     // A switch to another account records that account's model. The model of the
     // account left behind stays, because a model belongs to the account that ran
     // it.
-    try state.record(.openai_api, openai_model, .high);
-    try std.testing.expectEqualStrings("claude-opus-5", state.models.get(.anthropic_api).?.name());
-    try std.testing.expectEqualStrings("gpt-5.6-luna", state.models.get(.openai_api).?.name());
+    try state.record(.openai_api_key, openai_model, .high);
+    try std.testing.expectEqualStrings(
+        "claude-opus-5",
+        state.models.get(.anthropic_api_key).?.name(),
+    );
+    try std.testing.expectEqualStrings("gpt-5.6-luna", state.models.get(.openai_api_key).?.name());
 
     // The next start reads both models back, so a switch there returns to the
     // model each account ran.
     var restarted = try openForTest(gpa, io, home);
     defer restarted.deinit();
-    try std.testing.expectEqual(ai.llm.Account.openai_api, restarted.start.account.?);
+    try std.testing.expectEqual(ai.llm.Account.openai_api_key, restarted.start.account.?);
     try std.testing.expectEqualStrings(
         "claude-opus-5",
-        restarted.models.get(.anthropic_api).?.name(),
+        restarted.models.get(.anthropic_api_key).?.name(),
     );
-    try std.testing.expectEqualStrings("gpt-5.6-luna", restarted.models.get(.openai_api).?.name());
+    try std.testing.expectEqualStrings(
+        "gpt-5.6-luna",
+        restarted.models.get(.openai_api_key).?.name(),
+    );
 }
 
 // The file names a model and describes none, so the state keeps whatever name a
@@ -541,30 +547,30 @@ test "the state keeps the model name that a command recorded" {
     const home = try tmpHome(gpa, io, &tmp);
     defer gpa.free(home);
     try writeForTest(io, &tmp,
-        \\{ "/work": { "account": "anthropic_api", "effort": "low",
-        \\    "models": { "anthropic_api": "claude-opus-5" } } }
+        \\{ "/work": { "account": "anthropic-api-key", "effort": "low",
+        \\    "models": { "anthropic-api-key": "claude-opus-5" } } }
     );
 
     var state = try openForTest(gpa, io, home);
     defer state.deinit();
-    try std.testing.expect(state.models.get(.anthropic_api) != null);
+    try std.testing.expect(state.models.get(.anthropic_api_key) != null);
 
     // A recorded name replaces the one the file held.
-    try state.record(.anthropic_api, other_model, .low);
+    try state.record(.anthropic_api_key, other_model, .low);
     try std.testing.expectEqualStrings(
         "claude-opus-6",
-        state.models.get(.anthropic_api).?.name(),
+        state.models.get(.anthropic_api_key).?.name(),
     );
 
     // No model keeps the name the entry holds, because a catalog that resolves
     // nothing must not erase the memory of the account. An account that ran none
     // here still names none.
-    try state.record(.openai_api, null, .low);
-    try std.testing.expect(state.models.get(.openai_api) == null);
-    try state.record(.anthropic_api, null, .low);
+    try state.record(.openai_api_key, null, .low);
+    try std.testing.expect(state.models.get(.openai_api_key) == null);
+    try state.record(.anthropic_api_key, null, .low);
     try std.testing.expectEqualStrings(
         "claude-opus-6",
-        state.models.get(.anthropic_api).?.name(),
+        state.models.get(.anthropic_api_key).?.name(),
     );
 
     // The entry names that model alone. The account and the effort level reach
@@ -572,22 +578,22 @@ test "the state keeps the model name that a command recorded" {
     var file = (try ai.json_store.open(gpa, io, state.path)).?;
     defer file.deinit();
     const entry = file.entry("/work").?;
-    try std.testing.expectEqualStrings("anthropic_api", entry.get("account").?.string);
+    try std.testing.expectEqualStrings("anthropic-api-key", entry.get("account").?.string);
     try std.testing.expectEqualStrings("low", entry.get("effort").?.string);
     const listed = entry.get("models").?.object;
     try std.testing.expectEqual(@as(usize, 1), listed.count());
-    try std.testing.expectEqualStrings("claude-opus-6", listed.get("anthropic_api").?.string);
+    try std.testing.expectEqualStrings("claude-opus-6", listed.get("anthropic-api-key").?.string);
 
     // A restart reads that entry back, so a later fetch returns the account to
     // the model it ran.
     var restarted = try openForTest(gpa, io, home);
     defer restarted.deinit();
-    try std.testing.expectEqual(ai.llm.Account.anthropic_api, restarted.start.account.?);
+    try std.testing.expectEqual(ai.llm.Account.anthropic_api_key, restarted.start.account.?);
     try std.testing.expectEqualStrings(
         "claude-opus-6",
-        restarted.models.get(.anthropic_api).?.name(),
+        restarted.models.get(.anthropic_api_key).?.name(),
     );
-    try std.testing.expect(restarted.models.get(.openai_api) == null);
+    try std.testing.expect(restarted.models.get(.openai_api_key) == null);
 }
 
 test "temporary store contention leaves project-state saving enabled" {
@@ -602,7 +608,7 @@ test "temporary store contention leaves project-state saving enabled" {
 
     var state = try openForTest(gpa, io, home);
     defer state.deinit();
-    try state.seed(.anthropic_api, test_model, .low);
+    try state.seed(.anthropic_api_key, test_model, .low);
     ai.json_store.lock_policy = .{ .attempts_max = 2, .wait_ms = 0 };
     defer ai.json_store.lock_policy = .{};
     const lock_path = try std.fmt.allocPrint(gpa, "{s}.lock", .{state.path});
@@ -616,7 +622,7 @@ test "temporary store contention leaves project-state saving enabled" {
         defer held.close(io);
         try std.testing.expectError(
             error.StoreBusy,
-            state.record(.openai_api, openai_model, .high),
+            state.record(.openai_api_key, openai_model, .high),
         );
         try std.testing.expect(state.save_enabled);
         try std.testing.expect(state.save_pending);
@@ -624,15 +630,15 @@ test "temporary store contention leaves project-state saving enabled" {
 
     // The choices return to the saved values. The pending snapshot still forces
     // this retry, so no earlier model-table change can stay only in memory.
-    try state.record(.anthropic_api, test_model, .low);
+    try state.record(.anthropic_api_key, test_model, .low);
     try std.testing.expect(!state.save_pending);
     var file = (try ai.json_store.open(gpa, io, state.path)).?;
     defer file.deinit();
     const entry = file.entry("/work").?;
-    try std.testing.expectEqualStrings("anthropic_api", entry.get("account").?.string);
+    try std.testing.expectEqualStrings("anthropic-api-key", entry.get("account").?.string);
     try std.testing.expectEqualStrings(
         openai_model.name(),
-        entry.get("models").?.object.get("openai_api").?.string,
+        entry.get("models").?.object.get("openai-api-key").?.string,
     );
 }
 
@@ -649,7 +655,7 @@ test "a corrupt file survives a refused write" {
     defer state.deinit();
     try std.testing.expectError(
         error.CorruptStore,
-        state.record(.anthropic_api, test_model, .high),
+        state.record(.anthropic_api_key, test_model, .high),
     );
     const data = try std.Io.Dir.cwd().readFileAlloc(io, state.path, gpa, .unlimited);
     defer gpa.free(data);
@@ -658,7 +664,7 @@ test "a corrupt file survives a refused write" {
     // The failure is the last write this state attempts, so the caller reports
     // one message rather than one per change.
     try std.testing.expect(!state.save_enabled);
-    try state.record(.anthropic_api, test_model, .low);
+    try state.record(.anthropic_api_key, test_model, .low);
 }
 
 test "an inert state saves nothing and owns nothing" {
@@ -672,9 +678,12 @@ test "an inert state saves nothing and owns nothing" {
     try std.testing.expect(state.start.effort == null);
     // Neither call writes: an inert state names no file. Both still take the
     // model, because the session memory does not depend on the file.
-    try state.seed(.anthropic_api, test_model, .high);
-    try state.record(.openai_api, openai_model, .low);
+    try state.seed(.anthropic_api_key, test_model, .high);
+    try state.record(.openai_api_key, openai_model, .low);
     try std.testing.expect(state.saved == null);
-    try std.testing.expectEqualStrings("claude-opus-5", state.models.get(.anthropic_api).?.name());
-    try std.testing.expectEqualStrings("gpt-5.6-luna", state.models.get(.openai_api).?.name());
+    try std.testing.expectEqualStrings(
+        "claude-opus-5",
+        state.models.get(.anthropic_api_key).?.name(),
+    );
+    try std.testing.expectEqualStrings("gpt-5.6-luna", state.models.get(.openai_api_key).?.name());
 }

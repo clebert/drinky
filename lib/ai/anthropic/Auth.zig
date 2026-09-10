@@ -1,11 +1,12 @@
 //! The credential lifecycle for subscription OAuth: the shared `auth` lifecycle
-//! instantiated over `oauth`'s protocol for the `"anthropic_subscription"`
+//! instantiated over `oauth`'s protocol for the `"anthropic-sub-login"`
 //! entry in `<home>/.drinky/auth.json`.
 
 const std = @import("std");
 
 const auth = @import("../auth.zig");
 const json_store = @import("../json_store.zig");
+const llm = @import("../llm.zig");
 const net = @import("../net.zig");
 const oauth_callback = @import("../oauth_callback.zig");
 const oauth_wire = @import("../oauth_wire.zig");
@@ -14,7 +15,7 @@ const oauth = @import("oauth.zig");
 const Auth = @This();
 
 /// The top-level key this account's credentials live under in `auth.json`.
-const account_key = "anthropic_subscription";
+const account_key = llm.Account.anthropic_sub_login.id();
 
 gpa: std.mem.Allocator,
 io: std.Io,
@@ -922,7 +923,7 @@ test "load accepts a credential from before principal markers" {
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "auth.json",
         .data =
-        \\{"anthropic_subscription":
+        \\{"anthropic-sub-login":
         \\  {"access":"a","refresh":"r","expires_ms":1}}
         ,
     });
@@ -951,7 +952,7 @@ test "load rejects an entry missing a credential field" {
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "auth.json",
-        .data = "{\"anthropic_subscription\":{\"access\":\"a\"}}",
+        .data = "{\"anthropic-sub-login\":{\"access\":\"a\"}}",
     });
     var path_buf: [128]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/auth.json", .{tmp.sub_path});

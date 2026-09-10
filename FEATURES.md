@@ -7,8 +7,8 @@ planned work.
 Drinky is a terminal coding agent. You type a prompt. The model reads, searches, writes, and edits
 files in the working directory, and the conversation streams into your scrollback. Drinky talks to
 Anthropic, OpenAI, and xAI through a subscription login, an Anthropic Console login, or an API key,
-to OpenRouter through an OAuth login or an API key, and to Gemini on Google Vertex AI through a
-service account key file.
+to OpenRouter through a login or an API key, and to Gemini on the Gemini Enterprise Agent Platform
+(Vertex AI) through a service account key file.
 
 ## Talking to it
 
@@ -103,8 +103,8 @@ service account key file.
 - Each request resolves the level against its model in silence. A level that the model does not name
   folds to the nearest one it names. A tie takes the lower level. A model that takes no level drops
   it. The effort picker marks each such level, so the fold is visible before the choice.
-- An account with no model shows `No model` in the warning color. A send then refuses and names the
-  command that fixes it.
+- An account with no model shows its identifier, then `No model` in the warning color. A send then
+  refuses and names the command that fixes it.
 - Each account keeps the model it ran in this project. A switch, a login, and a restart return to
   it. An account with no cached list returns to no model, and a model that the account no longer
   offers drops in silence.
@@ -119,14 +119,21 @@ service account key file.
 
 ## Accounts
 
+- An account identifier reads `vendor-product-source`: `anthropic-sub-login`, `anthropic-api-login`,
+  `anthropic-api-key`, `openai-sub-login`, `openai-api-key`, `xai-sub-login`, `xai-api-key`,
+  `openrouter-api-login`, `openrouter-api-key`, and `google-cloud-keyfile`. The product is `sub` for
+  a subscription, `api` for the developer API, or `cloud` for the cloud platform. The source is
+  `login`, `key`, or `keyfile`.
+- A model under an account reads `account/model`, as in `openrouter-api-login/openai/gpt-5.6-sol`.
+  The status line, the pickers, the events, and the store files hold the same identifiers.
 - Drinky supports Anthropic, OpenAI, and xAI, each as a subscription account or an API-key account.
-  The Anthropic Console account adds an OAuth login that mints and stores a platform key. OpenRouter
-  adds an OAuth login that mints a key and an API-key account. Both spend the credit of one
-  OpenRouter account.
-- The Google Vertex account reads the service account key file that `GOOGLE_APPLICATION_CREDENTIALS`
-  names and sends its requests to the location that `GOOGLE_CLOUD_LOCATION` names: `eu`, `us`, or
-  `global`. A multi-region keeps the processing inside its jurisdiction. Drinky mints the access
-  token itself and runs no network request at startup.
+  The `anthropic-api-login` account adds a login that mints and stores a platform key. OpenRouter
+  adds a login that mints a key and an API-key account. Both spend the credit of one OpenRouter
+  account.
+- The `google-cloud-keyfile` account reads the service account key file that
+  `GOOGLE_APPLICATION_CREDENTIALS` names and sends its requests to the Agent Platform location that
+  `GOOGLE_CLOUD_LOCATION` names: `eu`, `us`, or `global`. A multi-region keeps the processing inside
+  its jurisdiction. Drinky mints the access token itself and runs no network request at startup.
 - A location outside the three, or a key file that Drinky cannot read, leaves the account absent.
   Startup says nothing, because the key path is also the variable of every other Google client. The
   login picker marks the account and names the cause when you pick it.
@@ -161,8 +168,8 @@ service account key file.
   the verification URL and the user code, Drinky opens the browser, and polls until the grant
   arrives. The code lets a second device complete the login. The wait ends after five minutes, like
   the callback, and a cancel ends the poll.
-- The tokens and the Console key live in the owner-only `~/.drinky/auth.json`, one entry per
-  account, saved atomically.
+- The tokens and the minted keys live in the owner-only `~/.drinky/auth.json`, one entry per account
+  under its identifier, saved atomically.
 - Drinky refreshes and saves an expired access token. When the store is busy, Drinky keeps the
   refreshed token in memory and retries the save before the next request.
 - An Anthropic subscription login saves stable account and organization IDs from the OAuth profile,
@@ -170,9 +177,9 @@ service account key file.
   the same principal, Drinky takes that token and refreshes only an expired one. A different or
   unknown principal stops before the model request.
 - A request that the provider rejects with 401 renews the credential once and repeats. The renewal
-  takes the token that another instance saved, or refreshes the token in memory. The Google Vertex
-  account mints a new token from its key file. An API-key account holds one fixed secret, so a
-  rejected request ends the turn.
+  takes the token that another instance saved, or refreshes the token in memory. The
+  `google-cloud-keyfile` account mints a new token from its key file. An API-key account holds one
+  fixed secret, so a rejected request ends the turn.
 - A service account key that Google rejects ends the turn and says so. The account stays configured,
   because the key file is the credential.
 - When another instance saved a replacement, Drinky reloads it and keeps the account active. Without
@@ -204,7 +211,7 @@ service account key file.
   skill row marks a configured name that no discovered skill carries.
 - **/status** — state the session in full: the directory with its branch, the context gauge, the
   cost, the quota, the credit pool, and the cache-hit rate of a running turn, and
-  `model (account) · Effort: level`. The answer takes the words of the status line and reaches the
+  `account/model · Effort: level`. The answer takes the words of the status line and reaches the
   channel that asked alone: a terminal event that the chat never sees, or a Telegram reply that the
   terminal never records.
 - **/system** — show the complete system prompt as rendered Markdown in a scrollable full-window
@@ -231,22 +238,23 @@ service account key file.
 ## Providers
 
 - Drinky streams from the Anthropic Messages API, the OpenAI Responses API (for OpenAI, xAI, and
-  OpenRouter), and the Gemini `streamGenerateContent` API of Vertex AI over SSE. A reply enters the
-  conversation only when the provider reports it complete.
+  OpenRouter), and the Gemini `streamGenerateContent` API of the Agent Platform over SSE. A reply
+  enters the conversation only when the provider reports it complete.
 - A Gemini reply carries a thought signature on one part, and Drinky sends it back on the same part,
   so a function call replays with its proof. The Gemini model list comes from the Google publisher
-  on Vertex AI, keeps Gemini 3 and later, and the public metadata describes each model.
+  on the Agent Platform, keeps Gemini 3 and later, and the public metadata describes each model.
 - Prompt caching is always on: explicit breakpoints for Anthropic, the automatic per-session cache
-  for OpenAI, xAI, and OpenRouter, and the implicit cache of Vertex AI.
+  for OpenAI, xAI, and OpenRouter, and the implicit cache of the Agent Platform.
 - Drinky requests summarized reasoning at the resolved effort and replays it verbatim on later
   turns. An OpenRouter request asks for no encrypted reasoning, because that request reaches fewer
   endpoints, so its reply replays the summary or the raw reasoning text instead.
-- An Anthropic Subscription or Console request carries the Claude Code client identity. A plain API
-  key goes straight to the platform API.
+- An `anthropic-sub-login` or `anthropic-api-login` request carries the Claude Code client identity.
+  An `anthropic-api-key` request goes straight to the platform API.
 - Every Anthropic request asks for the input of a tool call as the model writes it.
 - A request times out after 30 s to the response head. A streamed event must arrive within 60 s for
-  Anthropic and 300 s for OpenAI, xAI, OpenRouter, and Google Vertex, whose streams are silent while
-  the model reasons. Keepalive filler does not count as progress. All six windows are configurable.
+  Anthropic and 300 s for OpenAI, xAI, OpenRouter, and the Agent Platform, whose streams are silent
+  while the model reasons. Keepalive filler does not count as progress. All six windows are
+  configurable.
 - A failed request runs up to 3 attempts with a backoff from 500 ms to 16 s, and it honors a
   retry-after hint. A wait longer than the backoff cap ends the request. A spent OpenAI plan states
   its reset in the error body, so Drinky reports it after one try.
@@ -354,8 +362,8 @@ service account key file.
 - The open input area grows to about a quarter of the screen and labels hidden rows `↑ Hidden: N`
   and `↓ Hidden: N`.
 - The bottom line shows `directory (branch)`, the context gauge, the cost, the quota, the credit
-  pool, and the cache-hit rate on the left, and `model (account) · Effort: level` on the right. The
-  model name and the effort value take the normal intensity, so the two settings that the user
+  pool, and the cache-hit rate on the left, and `account/model · Effort: level` on the right. The
+  identifier and the effort value take the normal intensity, so the two settings that the user
   changes stand out.
 - One temporary notice replaces the bottom line until the next user action. The notice keeps one
   row, so it never moves the editor. An information notice opens with `ℹ` in the accent color. A
@@ -383,8 +391,8 @@ service account key file.
   color follows the printed share.
 - A narrow window shortens the directory, the branch, the context gauge, and the countdowns before
   it removes parts, and it always keeps the context gauge. The per-request measurements go before
-  the session cost, longest window first. A bracketed detail goes before its head: the account
-  before the model, and the branch before the directory.
+  the session cost, longest window first. A detail goes before its head: the account prefix before
+  the model, and the branch before the directory.
 - The branch comes from the `HEAD` file of the repository, never from the git command. Drinky
   re-reads it on each key, when a turn starts, and when one ends, so a checkout in another terminal
   shows without a turn.
@@ -474,7 +482,7 @@ service account key file.
 - `~/.drinky/config.json` is optional. It holds the user instruction paths, the request and bash
   limits, a default effort level, the skills that a path requires, and the interface settings.
   Drinky reads it only at startup, so a change applies at the next start. It holds no secrets. API
-  keys come from `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, and `XAI_API_KEY`, and the Google Vertex
+  keys come from `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, and `XAI_API_KEY`, and the key file
   credential from `GOOGLE_APPLICATION_CREDENTIALS` and `GOOGLE_CLOUD_LOCATION`.
 - Drinky reports an unknown key, an unknown effort level, and an interface value that it cannot use,
   so a typo never looks like an applied setting.

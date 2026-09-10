@@ -24,20 +24,20 @@ const openrouter_url = "https://openrouter.ai/api/v1/responses";
 
 /// What a client needs to authenticate, tagged by the account it belongs to. A
 /// subscription account holds an OAuth `Auth` (owned by the caller, refreshed on
-/// demand). An API account holds a bare key (owned by the caller). The Vertex
+/// demand). An API account holds a bare key (owned by the caller). The key file
 /// account holds the `Auth` that mints its token from the key file. The active
 /// tag picks the account, so `Client.init` needs no separate selector.
 pub const Credentials = union(llm.Account) {
-    anthropic_subscription: *anthropic.Auth,
-    anthropic_console: []const u8,
-    anthropic_api: []const u8,
-    openai_subscription: *openai.Auth,
-    openai_api: []const u8,
-    xai_subscription: *xai.Auth,
-    xai_api: []const u8,
-    openrouter_oauth: []const u8,
-    openrouter_api: []const u8,
-    google_vertex: *google.Auth,
+    anthropic_sub_login: *anthropic.Auth,
+    anthropic_api_login: []const u8,
+    anthropic_api_key: []const u8,
+    openai_sub_login: *openai.Auth,
+    openai_api_key: []const u8,
+    xai_sub_login: *xai.Auth,
+    xai_api_key: []const u8,
+    openrouter_api_login: []const u8,
+    openrouter_api_key: []const u8,
+    google_cloud_keyfile: *google.Auth,
 };
 
 pub const Client = struct {
@@ -64,23 +64,23 @@ pub const Client = struct {
     /// report whether the credential changed. A caller repeats a request only
     /// on a true result, because an unchanged credential fails the same way.
     ///
-    /// An OAuth account and the Vertex account can renew themselves: the one
+    /// An OAuth account and the key file account can renew themselves: the one
     /// refreshes its token, the other mints a new one from its key. An API key
     /// comes from the environment, and the Console key is minted once at login.
     /// Neither one rotates, so Drinky has nothing to take in their place.
     pub fn renewCredential(self: *Client) !bool {
         return switch (self.credentials) {
-            inline .anthropic_subscription,
-            .openai_subscription,
-            .xai_subscription,
-            .google_vertex,
+            inline .anthropic_sub_login,
+            .openai_sub_login,
+            .xai_sub_login,
+            .google_cloud_keyfile,
             => |credential| credential.renew(),
-            .anthropic_console,
-            .anthropic_api,
-            .openai_api,
-            .xai_api,
-            .openrouter_oauth,
-            .openrouter_api,
+            .anthropic_api_login,
+            .anthropic_api_key,
+            .openai_api_key,
+            .xai_api_key,
+            .openrouter_api_login,
+            .openrouter_api_key,
             => false,
         };
     }
@@ -91,7 +91,7 @@ pub const Client = struct {
     /// allowance in the response head instead.
     pub fn fetchQuota(self: *Client) !?llm.Quota {
         switch (self.credentials) {
-            .xai_subscription => |auth| {
+            .xai_sub_login => |auth| {
                 const token = try auth.accessToken();
                 return xai.quota.fetch(self.gpa, self.io, token);
             },
@@ -105,7 +105,7 @@ pub const Client = struct {
     /// on a billing endpoint instead.
     pub fn fetchCredits(self: *Client) !?llm.Credits {
         return switch (self.credentials) {
-            .openrouter_oauth, .openrouter_api => |key| openrouter.credits.fetch(
+            .openrouter_api_login, .openrouter_api_key => |key| openrouter.credits.fetch(
                 self.gpa,
                 self.io,
                 key,
@@ -118,11 +118,11 @@ pub const Client = struct {
     /// success the caller owns `out` and must `deinit` it.
     pub fn send(self: *Client, out: *Stream, request: *const llm.Request) !void {
         switch (self.credentials) {
-            inline .anthropic_subscription,
-            .anthropic_api,
-            .anthropic_console,
+            inline .anthropic_sub_login,
+            .anthropic_api_key,
+            .anthropic_api_login,
             => |credential, tag| {
-                const identity: anthropic.Transport.Identity = if (tag == .anthropic_subscription)
+                const identity: anthropic.Transport.Identity = if (tag == .anthropic_sub_login)
                     .{ .subscription = try credential.accessToken() }
                 else
                     .{ .api_key = credential };
@@ -143,14 +143,14 @@ pub const Client = struct {
             // public xAI endpoint the same way. The two OpenRouter accounts
             // differ in the credential alone as well, and both replay plain
             // reasoning.
-            inline .openai_subscription,
-            .openai_api,
-            .xai_subscription,
-            .xai_api,
-            .openrouter_oauth,
-            .openrouter_api,
+            inline .openai_sub_login,
+            .openai_api_key,
+            .xai_sub_login,
+            .xai_api_key,
+            .openrouter_api_login,
+            .openrouter_api_key,
             => |credential, tag| {
-                const subscription = tag == .openai_subscription or tag == .xai_subscription;
+                const subscription = tag == .openai_sub_login or tag == .xai_sub_login;
                 const token = if (subscription) try credential.accessToken() else credential;
                 const body = try openai.wire.serialize(self.gpa, request, tag);
                 defer self.gpa.free(body);
@@ -160,7 +160,7 @@ pub const Client = struct {
                     .io = self.io,
                     .timeouts = self.timeouts,
                     .endpoint = responsesUrl(tag),
-                    .account_id = if (tag == .openai_subscription) credential.accountId() else "",
+                    .account_id = if (tag == .openai_sub_login) credential.accountId() else "",
                     .plain_reasoning = tag.replaysPlainReasoning(),
                 };
                 try transport.send(&@field(out.*, @tagName(tag)), .{
@@ -168,7 +168,7 @@ pub const Client = struct {
                     .access_token = token,
                 });
             },
-            .google_vertex => |credential| {
+            .google_cloud_keyfile => |credential| {
                 const token = try credential.accessToken();
                 const body = try google.wire.serialize(self.gpa, request);
                 defer self.gpa.free(body);
@@ -179,14 +179,17 @@ pub const Client = struct {
                     .model = request.model,
                 });
                 defer self.gpa.free(endpoint);
-                out.* = .{ .google_vertex = undefined };
+                out.* = .{ .google_cloud_keyfile = undefined };
                 var transport: google.Transport = .{
                     .gpa = self.gpa,
                     .io = self.io,
                     .timeouts = self.timeouts,
                     .endpoint = endpoint,
                 };
-                try transport.send(&out.google_vertex, &.{ .body = body, .access_token = token });
+                try transport.send(
+                    &out.google_cloud_keyfile,
+                    &.{ .body = body, .access_token = token },
+                );
             },
         }
     }
@@ -196,14 +199,14 @@ pub const Client = struct {
 /// another protocol has none, and the compile fails where one asks.
 fn responsesUrl(comptime account: llm.Account) []const u8 {
     return switch (account) {
-        .openai_subscription => codex_url,
-        .openai_api => openai_url,
-        .xai_subscription, .xai_api => xai_url,
-        .openrouter_oauth, .openrouter_api => openrouter_url,
-        .anthropic_subscription,
-        .anthropic_console,
-        .anthropic_api,
-        .google_vertex,
+        .openai_sub_login => codex_url,
+        .openai_api_key => openai_url,
+        .xai_sub_login, .xai_api_key => xai_url,
+        .openrouter_api_login, .openrouter_api_key => openrouter_url,
+        .anthropic_sub_login,
+        .anthropic_api_login,
+        .anthropic_api_key,
+        .google_cloud_keyfile,
         => @compileError("the account speaks no Responses protocol"),
     };
 }
@@ -212,16 +215,16 @@ fn responsesUrl(comptime account: llm.Account) []const u8 {
 /// accounts of a vendor share that vendor's transport stream. They differ only
 /// in how the request was sent, not in how the response decodes.
 pub const Stream = union(llm.Account) {
-    anthropic_subscription: anthropic.Transport.Stream,
-    anthropic_console: anthropic.Transport.Stream,
-    anthropic_api: anthropic.Transport.Stream,
-    openai_subscription: openai.Transport.Stream,
-    openai_api: openai.Transport.Stream,
-    xai_subscription: openai.Transport.Stream,
-    xai_api: openai.Transport.Stream,
-    openrouter_oauth: openai.Transport.Stream,
-    openrouter_api: openai.Transport.Stream,
-    google_vertex: google.Transport.Stream,
+    anthropic_sub_login: anthropic.Transport.Stream,
+    anthropic_api_login: anthropic.Transport.Stream,
+    anthropic_api_key: anthropic.Transport.Stream,
+    openai_sub_login: openai.Transport.Stream,
+    openai_api_key: openai.Transport.Stream,
+    xai_sub_login: openai.Transport.Stream,
+    xai_api_key: openai.Transport.Stream,
+    openrouter_api_login: openai.Transport.Stream,
+    openrouter_api_key: openai.Transport.Stream,
+    google_cloud_keyfile: google.Transport.Stream,
 
     pub fn deinit(self: *Stream) void {
         switch (self.*) {
@@ -299,48 +302,58 @@ test "init selects the arm matching the credentials" {
     const subscription = Client.init(
         gpa,
         std.testing.io,
-        .{ .anthropic_subscription = undefined },
+        .{ .anthropic_sub_login = undefined },
         .{},
     );
-    try std.testing.expectEqual(llm.Account.anthropic_subscription, subscription.account());
-    const anthropic_key = Client.init(gpa, std.testing.io, .{ .anthropic_api = "sk-ant" }, .{});
-    try std.testing.expectEqual(llm.Account.anthropic_api, anthropic_key.account());
-    const console = Client.init(gpa, std.testing.io, .{ .anthropic_console = "sk-ant-api03" }, .{});
-    try std.testing.expectEqual(llm.Account.anthropic_console, console.account());
-    const openai_key = Client.init(gpa, std.testing.io, .{ .openai_api = "sk-test" }, .{});
-    try std.testing.expectEqual(llm.Account.openai_api, openai_key.account());
-    const codex = Client.init(gpa, std.testing.io, .{ .openai_subscription = undefined }, .{});
-    try std.testing.expectEqual(llm.Account.openai_subscription, codex.account());
-    const grok = Client.init(gpa, std.testing.io, .{ .xai_subscription = undefined }, .{});
-    try std.testing.expectEqual(llm.Account.xai_subscription, grok.account());
-    const xai_key = Client.init(gpa, std.testing.io, .{ .xai_api = "xai-test" }, .{});
-    try std.testing.expectEqual(llm.Account.xai_api, xai_key.account());
-    const openrouter_key = Client.init(gpa, std.testing.io, .{ .openrouter_api = "sk-or" }, .{});
-    try std.testing.expectEqual(llm.Account.openrouter_api, openrouter_key.account());
+    try std.testing.expectEqual(llm.Account.anthropic_sub_login, subscription.account());
+    const anthropic_key = Client.init(gpa, std.testing.io, .{ .anthropic_api_key = "sk-ant" }, .{});
+    try std.testing.expectEqual(llm.Account.anthropic_api_key, anthropic_key.account());
+    const console = Client.init(
+        gpa,
+        std.testing.io,
+        .{ .anthropic_api_login = "sk-ant-api03" },
+        .{},
+    );
+    try std.testing.expectEqual(llm.Account.anthropic_api_login, console.account());
+    const openai_key = Client.init(gpa, std.testing.io, .{ .openai_api_key = "sk-test" }, .{});
+    try std.testing.expectEqual(llm.Account.openai_api_key, openai_key.account());
+    const codex = Client.init(gpa, std.testing.io, .{ .openai_sub_login = undefined }, .{});
+    try std.testing.expectEqual(llm.Account.openai_sub_login, codex.account());
+    const grok = Client.init(gpa, std.testing.io, .{ .xai_sub_login = undefined }, .{});
+    try std.testing.expectEqual(llm.Account.xai_sub_login, grok.account());
+    const xai_key = Client.init(gpa, std.testing.io, .{ .xai_api_key = "xai-test" }, .{});
+    try std.testing.expectEqual(llm.Account.xai_api_key, xai_key.account());
+    const openrouter_key = Client.init(
+        gpa,
+        std.testing.io,
+        .{ .openrouter_api_key = "sk-or" },
+        .{},
+    );
+    try std.testing.expectEqual(llm.Account.openrouter_api_key, openrouter_key.account());
     const openrouter_login = Client.init(
         gpa,
         std.testing.io,
-        .{ .openrouter_oauth = "sk-or" },
+        .{ .openrouter_api_login = "sk-or" },
         .{},
     );
-    try std.testing.expectEqual(llm.Account.openrouter_oauth, openrouter_login.account());
-    const vertex = Client.init(gpa, std.testing.io, .{ .google_vertex = undefined }, .{});
-    try std.testing.expectEqual(llm.Account.google_vertex, vertex.account());
+    try std.testing.expectEqual(llm.Account.openrouter_api_login, openrouter_login.account());
+    const cloud = Client.init(gpa, std.testing.io, .{ .google_cloud_keyfile = undefined }, .{});
+    try std.testing.expectEqual(llm.Account.google_cloud_keyfile, cloud.account());
 }
 
 // A key account holds one fixed secret, so a rejected request stands. An OAuth
-// account and the Vertex account can take another token, and an OAuth account
+// account and the key file account can take another token, and an OAuth account
 // without a credential takes none.
-test "an OAuth account and the Vertex account renew, a key account does not" {
+test "an OAuth account and the key file account renew, a key account does not" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     for ([_]Credentials{
-        .{ .anthropic_api = "sk-ant" },
-        .{ .anthropic_console = "sk-ant-api03" },
-        .{ .openai_api = "sk-test" },
-        .{ .xai_api = "xai-test" },
-        .{ .openrouter_api = "sk-or" },
-        .{ .openrouter_oauth = "sk-or" },
+        .{ .anthropic_api_key = "sk-ant" },
+        .{ .anthropic_api_login = "sk-ant-api03" },
+        .{ .openai_api_key = "sk-test" },
+        .{ .xai_api_key = "xai-test" },
+        .{ .openrouter_api_key = "sk-or" },
+        .{ .openrouter_api_login = "sk-or" },
     }) |credentials| {
         var client = Client.init(gpa, io, credentials, .{});
         try std.testing.expect(!try client.renewCredential());
@@ -353,7 +366,7 @@ test "an OAuth account and the Vertex account renew, a key account does not" {
         .path = "",
         .tokens = null,
     };
-    var client = Client.init(gpa, io, .{ .anthropic_subscription = &signed_out }, .{});
+    var client = Client.init(gpa, io, .{ .anthropic_sub_login = &signed_out }, .{});
     try std.testing.expect(!try client.renewCredential());
 
     var signed_out_xai: xai.Auth = .{
@@ -363,33 +376,33 @@ test "an OAuth account and the Vertex account renew, a key account does not" {
         .path = "",
         .tokens = null,
     };
-    var grok = Client.init(gpa, io, .{ .xai_subscription = &signed_out_xai }, .{});
+    var grok = Client.init(gpa, io, .{ .xai_sub_login = &signed_out_xai }, .{});
     try std.testing.expect(!try grok.renewCredential());
 }
 
 test "usageSoFar reads accumulated usage through the stream seam" {
-    var stream: Stream = .{ .anthropic_subscription = undefined };
-    stream.anthropic_subscription.usage = .{ .input = 7, .output = 3, .cache_read = 90 };
+    var stream: Stream = .{ .anthropic_sub_login = undefined };
+    stream.anthropic_sub_login.usage = .{ .input = 7, .output = 3, .cache_read = 90 };
     try std.testing.expectEqual(@as(u64, 7), stream.usageSoFar().input);
     try std.testing.expectEqual(@as(u64, 3), stream.usageSoFar().output);
     try std.testing.expectEqual(@as(u64, 90), stream.usageSoFar().cache_read);
 }
 
 test "quotaSoFar reads the head allowance through the stream seam" {
-    var codex: Stream = .{ .openai_subscription = undefined };
-    codex.openai_subscription.quota = .{ .primary = .{ .used_percent = 40, .window_minutes = 300 } };
+    var codex: Stream = .{ .openai_sub_login = undefined };
+    codex.openai_sub_login.quota = .{ .primary = .{ .used_percent = 40, .window_minutes = 300 } };
     try std.testing.expectEqual(@as(f64, 40), codex.quotaSoFar().?.primary.?.used_percent);
 
     // Both providers read their allowance out of the head, so the seam reports
     // each one the same way.
-    var claude: Stream = .{ .anthropic_subscription = undefined };
-    claude.anthropic_subscription.quota = .{
+    var claude: Stream = .{ .anthropic_sub_login = undefined };
+    claude.anthropic_sub_login.quota = .{
         .primary = .{ .used_percent = 6, .window_minutes = 300, .reset_seconds = 8600 },
     };
     try std.testing.expectEqual(@as(?u64, 8600), claude.quotaSoFar().?.primary.?.reset_seconds);
 
     // A head that stated none reports none.
-    claude.anthropic_subscription.quota = null;
+    claude.anthropic_sub_login.quota = null;
     try std.testing.expect(claude.quotaSoFar() == null);
 }
 
@@ -397,10 +410,10 @@ test "fetchQuota is a billing read of the xAI subscription alone" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     for ([_]Credentials{
-        .{ .anthropic_api = "sk-ant" },
-        .{ .anthropic_console = "sk-ant-api03" },
-        .{ .openai_api = "sk-test" },
-        .{ .xai_api = "xai-test" },
+        .{ .anthropic_api_key = "sk-ant" },
+        .{ .anthropic_api_login = "sk-ant-api03" },
+        .{ .openai_api_key = "sk-test" },
+        .{ .xai_api_key = "xai-test" },
     }) |credentials| {
         var client = Client.init(gpa, io, credentials, .{});
         try std.testing.expect(try client.fetchQuota() == null);
@@ -418,7 +431,7 @@ test "fetchQuota is a billing read of the xAI subscription alone" {
         },
     };
     defer auth.tokens.?.deinit(gpa);
-    var grok = Client.init(gpa, io, .{ .xai_subscription = &auth }, .{});
+    var grok = Client.init(gpa, io, .{ .xai_sub_login = &auth }, .{});
     try std.testing.expectError(error.BadCredentials, grok.fetchQuota());
 }
 
@@ -426,17 +439,17 @@ test "fetchCredits is a pool read of the OpenRouter accounts alone" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     for ([_]Credentials{
-        .{ .anthropic_api = "sk-ant" },
-        .{ .anthropic_console = "sk-ant-api03" },
-        .{ .openai_api = "sk-test" },
-        .{ .xai_api = "xai-test" },
+        .{ .anthropic_api_key = "sk-ant" },
+        .{ .anthropic_api_login = "sk-ant-api03" },
+        .{ .openai_api_key = "sk-test" },
+        .{ .xai_api_key = "xai-test" },
     }) |credentials| {
         var client = Client.init(gpa, io, credentials, .{});
         try std.testing.expect(try client.fetchCredits() == null);
     }
 
-    var key = Client.init(gpa, io, .{ .openrouter_api = "key\r\nleaked" }, .{});
+    var key = Client.init(gpa, io, .{ .openrouter_api_key = "key\r\nleaked" }, .{});
     try std.testing.expectError(error.BadCredentials, key.fetchCredits());
-    var login = Client.init(gpa, io, .{ .openrouter_oauth = "" }, .{});
+    var login = Client.init(gpa, io, .{ .openrouter_api_login = "" }, .{});
     try std.testing.expectError(error.BadCredentials, login.fetchCredits());
 }

@@ -435,7 +435,7 @@ test "a command that takes no argument refuses a tail instead of running" {
 // first, so the reason it reports is the true one. `check` runs no command.
 test "check reports only what keeps a line unrunnable" {
     const gpa = std.testing.allocator;
-    var agent = testing.agent(gpa, .{ .anthropic_subscription = undefined });
+    var agent = testing.agent(gpa, .{ .anthropic_sub_login = undefined });
     defer agent.deinit();
     agent.setEffort(.high);
     var context: Context = .{ .gpa = gpa, .io = undefined, .agent = &agent, .accounts = undefined };
@@ -482,7 +482,7 @@ test "parse takes the command name from every slash line" {
 
 test "run routes a known command" {
     const gpa = std.testing.allocator;
-    var agent = testing.agent(gpa, .{ .anthropic_subscription = undefined });
+    var agent = testing.agent(gpa, .{ .anthropic_sub_login = undefined });
     defer agent.deinit();
     var context: Context = .{ .gpa = gpa, .io = undefined, .agent = &agent, .accounts = undefined };
 
@@ -687,7 +687,7 @@ test "a line without a name opens its list" {
 // own opens the second layer.
 test "a command row runs its command" {
     const gpa = std.testing.allocator;
-    var agent = testing.agent(gpa, .{ .anthropic_subscription = undefined });
+    var agent = testing.agent(gpa, .{ .anthropic_sub_login = undefined });
     defer agent.deinit();
     var context: Context = .{ .gpa = gpa, .io = undefined, .agent = &agent, .accounts = undefined };
 
@@ -728,7 +728,7 @@ test "a command row runs its command" {
 // still names the true reason first.
 test "a remote host runs the commands that need no terminal" {
     const gpa = std.testing.allocator;
-    var agent = testing.agent(gpa, .{ .anthropic_subscription = undefined });
+    var agent = testing.agent(gpa, .{ .anthropic_sub_login = undefined });
     defer agent.deinit();
     var context: Context = .{
         .gpa = gpa,

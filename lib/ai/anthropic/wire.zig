@@ -18,15 +18,15 @@ const system_header = "You are Claude Code, Anthropic's official CLI for Claude.
 /// every model. A plain API key omits it. A new account must decide here.
 fn sendsSystemHeader(account: llm.Account) bool {
     return switch (account) {
-        .anthropic_subscription, .anthropic_console => true,
-        .anthropic_api,
-        .openai_subscription,
-        .openai_api,
-        .xai_subscription,
-        .xai_api,
-        .openrouter_oauth,
-        .openrouter_api,
-        .google_vertex,
+        .anthropic_sub_login, .anthropic_api_login => true,
+        .anthropic_api_key,
+        .openai_sub_login,
+        .openai_api_key,
+        .xai_sub_login,
+        .xai_api_key,
+        .openrouter_api_login,
+        .openrouter_api_key,
+        .google_cloud_keyfile,
         => false,
     };
 }
@@ -185,9 +185,9 @@ fn emitsBlock(item: llm.Item, emit_thinking: bool, account: llm.Account) bool {
         .reasoning => |reasoning| if (!emit_thinking)
             false
         else switch (reasoning.replay) {
-            inline .anthropic_subscription,
-            .anthropic_api,
-            .anthropic_console,
+            inline .anthropic_sub_login,
+            .anthropic_api_key,
+            .anthropic_api_login,
             => |proof, tag| proof: {
                 if (tag != account) break :proof false;
                 break :proof switch (proof) {
@@ -195,13 +195,13 @@ fn emitsBlock(item: llm.Item, emit_thinking: bool, account: llm.Account) bool {
                     .redacted => |data| data.len != 0,
                 };
             },
-            .openai_subscription,
-            .openai_api,
-            .xai_subscription,
-            .xai_api,
-            .openrouter_oauth,
-            .openrouter_api,
-            .google_vertex,
+            .openai_sub_login,
+            .openai_api_key,
+            .xai_sub_login,
+            .xai_api_key,
+            .openrouter_api_login,
+            .openrouter_api_key,
+            .google_cloud_keyfile,
             => false,
         },
         else => true,
@@ -285,9 +285,9 @@ fn writeItem(stringify: *std.json.Stringify, item: *const llm.Item, cache: bool)
 /// Serialize a stored Anthropic replay proof as normal or redacted thinking.
 fn writeThinking(stringify: *std.json.Stringify, reasoning: *const llm.Item.Reasoning) !void {
     switch (reasoning.replay) {
-        inline .anthropic_subscription,
-        .anthropic_api,
-        .anthropic_console,
+        inline .anthropic_sub_login,
+        .anthropic_api_key,
+        .anthropic_api_login,
         => |proof| switch (proof) {
             .signature => |signature| try stringify.write(ThinkingBlock{
                 .thinking = signature.text,
@@ -295,13 +295,13 @@ fn writeThinking(stringify: *std.json.Stringify, reasoning: *const llm.Item.Reas
             }),
             .redacted => |data| try stringify.write(RedactedThinkingBlock{ .data = data }),
         },
-        .openai_subscription,
-        .openai_api,
-        .xai_subscription,
-        .xai_api,
-        .openrouter_oauth,
-        .openrouter_api,
-        .google_vertex,
+        .openai_sub_login,
+        .openai_api_key,
+        .xai_sub_login,
+        .xai_api_key,
+        .openrouter_api_login,
+        .openrouter_api_key,
+        .google_cloud_keyfile,
         => unreachable,
     }
 }
@@ -321,7 +321,7 @@ test serialize {
         .system = "be terse",
         .items = &items,
         .tools = &tools,
-    }, .anthropic_subscription);
+    }, .anthropic_sub_login);
     defer std.testing.allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
@@ -367,7 +367,7 @@ test "tool_call arguments pass through raw, empty becomes an empty object" {
         .system = "s",
         .items = &items,
         .tools = &.{},
-    }, .anthropic_subscription);
+    }, .anthropic_sub_login);
     defer std.testing.allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
@@ -407,7 +407,7 @@ test "synthetic error results group in one user envelope before steering text" {
         .system = "s",
         .items = &items,
         .tools = &.{},
-    }, .anthropic_subscription);
+    }, .anthropic_sub_login);
     defer std.testing.allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
@@ -447,7 +447,7 @@ test "cache_control marks the system prompt, last tool, previous user block, and
         .system = "sys",
         .items = &items,
         .tools = &tools,
-    }, .anthropic_subscription);
+    }, .anthropic_sub_login);
     defer std.testing.allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
@@ -490,7 +490,7 @@ test "cache_control also marks the last block of the previous user envelope" {
         .system = "sys",
         .items = &items,
         .tools = &.{},
-    }, .anthropic_subscription);
+    }, .anthropic_sub_login);
     defer std.testing.allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
@@ -525,7 +525,7 @@ test "every reasoning control renders its own block" {
     // A request that names no control writes no thinking block at all, so the
     // model keeps its own default.
     {
-        const body = try serialize(gpa, &request, .anthropic_subscription);
+        const body = try serialize(gpa, &request, .anthropic_sub_login);
         defer gpa.free(body);
         const parsed = try std.json.parseFromSlice(std.json.Value, gpa, body, .{});
         defer parsed.deinit();
@@ -537,7 +537,7 @@ test "every reasoning control renders its own block" {
     {
         var named = request;
         named.reasoning = .{ .named = .xhigh };
-        const body = try serialize(gpa, &named, .anthropic_subscription);
+        const body = try serialize(gpa, &named, .anthropic_sub_login);
         defer gpa.free(body);
         const parsed = try std.json.parseFromSlice(std.json.Value, gpa, body, .{});
         defer parsed.deinit();
@@ -561,7 +561,7 @@ test "an omitted control writes no thinking and no output_config" {
         .system = "s",
         .items = &items,
         .tools = &.{},
-    }, .anthropic_subscription);
+    }, .anthropic_sub_login);
     defer std.testing.allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
@@ -576,7 +576,7 @@ test "an omitted control writes no thinking and no output_config" {
 test "an omitted control drops the replay" {
     const items = [_]llm.Item{
         .{ .message = .{ .role = .user, .text = "hi" } },
-        .{ .reasoning = .{ .replay = .{ .anthropic_subscription = .{ .signature = .{
+        .{ .reasoning = .{ .replay = .{ .anthropic_sub_login = .{ .signature = .{
             .text = "think",
             .signature = "sig",
         } } } } },
@@ -589,7 +589,7 @@ test "an omitted control drops the replay" {
         .items = &items,
         .tools = &.{},
         .reasoning = .omitted,
-    }, .anthropic_subscription);
+    }, .anthropic_sub_login);
     defer std.testing.allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
@@ -605,7 +605,7 @@ test "an omitted control drops the replay" {
 test "a named control writes adaptive thinking and keeps the replay" {
     const items = [_]llm.Item{
         .{ .message = .{ .role = .user, .text = "hi" } },
-        .{ .reasoning = .{ .replay = .{ .anthropic_subscription = .{ .signature = .{
+        .{ .reasoning = .{ .replay = .{ .anthropic_sub_login = .{ .signature = .{
             .text = "think",
             .signature = "sig",
         } } } } },
@@ -618,7 +618,7 @@ test "a named control writes adaptive thinking and keeps the replay" {
         .items = &items,
         .tools = &.{},
         .reasoning = .{ .named = .low },
-    }, .anthropic_subscription);
+    }, .anthropic_sub_login);
     defer std.testing.allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
@@ -644,12 +644,12 @@ test "a named control writes adaptive thinking and keeps the replay" {
 const golden_items = [_]llm.Item{
     .{ .message = .{ .role = .user, .text = "first" } },
     .{ .message = .{ .role = .user, .text = "second" } },
-    .{ .reasoning = .{ .replay = .{ .anthropic_subscription = .{ .signature = .{
+    .{ .reasoning = .{ .replay = .{ .anthropic_sub_login = .{ .signature = .{
         .text = "weigh it",
         .signature = "sig",
     } } } } },
     .{ .reasoning = .{
-        .replay = .{ .anthropic_subscription = .{ .redacted = "secret" } },
+        .replay = .{ .anthropic_sub_login = .{ .redacted = "secret" } },
     } },
     .{ .tool_call = .{
         .call_id = "t1",
@@ -658,7 +658,7 @@ const golden_items = [_]llm.Item{
     } },
     .{ .message = .{ .role = .assistant, .text = "checking" } },
     .{ .tool_result = .{ .call_id = "t1", .content = "contents", .is_error = false } },
-    .{ .reasoning = .{ .replay = .{ .anthropic_subscription = .{ .signature = .{
+    .{ .reasoning = .{ .replay = .{ .anthropic_sub_login = .{ .signature = .{
         .text = "more",
         .signature = "sig2",
     } } } } },
@@ -687,7 +687,7 @@ test "golden bytes keep the serialized prefix stable" {
         .items = &golden_items,
         .tools = &.{},
         .reasoning = .{ .named = .xhigh },
-    }, .anthropic_subscription);
+    }, .anthropic_sub_login);
     defer std.testing.allocator.free(on);
     try std.testing.expectEqualStrings(golden_on, on);
 
@@ -697,7 +697,7 @@ test "golden bytes keep the serialized prefix stable" {
         .system = "be terse",
         .items = &golden_items,
         .tools = &.{},
-    }, .anthropic_subscription);
+    }, .anthropic_sub_login);
     defer std.testing.allocator.free(none);
     try std.testing.expectEqualStrings(golden_none, none);
 }
@@ -706,7 +706,7 @@ test "golden bytes keep the serialized prefix stable" {
 // reasoning, with every other block byte-identical to the subscription path.
 const golden_items_api = [_]llm.Item{
     .{ .message = .{ .role = .user, .text = "first" } },
-    .{ .reasoning = .{ .replay = .{ .anthropic_api = .{ .signature = .{
+    .{ .reasoning = .{ .replay = .{ .anthropic_api_key = .{ .signature = .{
         .text = "weigh it",
         .signature = "sig",
     } } } } },
@@ -730,7 +730,7 @@ test "the api-key account omits the system header and keeps every other block" {
         .items = &golden_items_api,
         .tools = &.{},
         .reasoning = .{ .named = .xhigh },
-    }, .anthropic_api);
+    }, .anthropic_api_key);
     defer std.testing.allocator.free(body);
     try std.testing.expectEqualStrings(golden_api, body);
 }
@@ -738,7 +738,7 @@ test "the api-key account omits the system header and keeps every other block" {
 test "the console account prepends the Claude Code header and replays its own reasoning" {
     const items = [_]llm.Item{
         .{ .message = .{ .role = .user, .text = "first" } },
-        .{ .reasoning = .{ .replay = .{ .anthropic_console = .{ .signature = .{
+        .{ .reasoning = .{ .replay = .{ .anthropic_api_login = .{ .signature = .{
             .text = "weigh it",
             .signature = "sig",
         } } } } },
@@ -751,7 +751,7 @@ test "the console account prepends the Claude Code header and replays its own re
         .items = &items,
         .tools = &.{},
         .reasoning = .{ .named = .xhigh },
-    }, .anthropic_console);
+    }, .anthropic_api_login);
     defer std.testing.allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
@@ -771,7 +771,7 @@ test "a reasoning-only run dropped by an account switch emits no empty envelope"
     // the user turns then share one envelope.
     const items = [_]llm.Item{
         .{ .message = .{ .role = .user, .text = "hi" } },
-        .{ .reasoning = .{ .replay = .{ .anthropic_subscription = .{ .signature = .{
+        .{ .reasoning = .{ .replay = .{ .anthropic_sub_login = .{ .signature = .{
             .text = "weigh it",
             .signature = "sig",
         } } } } },
@@ -784,7 +784,7 @@ test "a reasoning-only run dropped by an account switch emits no empty envelope"
         .items = &items,
         .tools = &.{},
         .reasoning = .{ .named = .xhigh },
-    }, .anthropic_api);
+    }, .anthropic_api_key);
     defer std.testing.allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
@@ -802,7 +802,7 @@ test "a reasoning-only run dropped by an account switch emits no empty envelope"
 test "reasoning is dropped when its replay account differs within the vendor" {
     // Replay is an exact account match, so it drops though both are Anthropic.
     const items = [_]llm.Item{
-        .{ .reasoning = .{ .replay = .{ .anthropic_subscription = .{ .signature = .{
+        .{ .reasoning = .{ .replay = .{ .anthropic_sub_login = .{ .signature = .{
             .text = "weigh it",
             .signature = "sig",
         } } } } },
@@ -815,7 +815,7 @@ test "reasoning is dropped when its replay account differs within the vendor" {
         .items = &items,
         .tools = &.{},
         .reasoning = .{ .named = .xhigh },
-    }, .anthropic_api);
+    }, .anthropic_api_key);
     defer std.testing.allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});

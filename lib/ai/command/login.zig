@@ -36,7 +36,7 @@ pub fn select(context: *Context, selection: Context.Outcome.Pick.Selection) !Con
             gpa,
             .information,
             "{s} is already the active account.",
-            .{account.label()},
+            .{account.id()},
         );
     // Authenticated but inactive: the app performs the switch so the model that
     // account ran last applies, exactly as in a startup on this account.
@@ -47,28 +47,29 @@ pub fn select(context: *Context, selection: Context.Outcome.Pick.Selection) !Con
         gpa,
         .failure,
         "Drinky could not load the {s} account because of error {s}. Fix it and restart Drinky.",
-        .{ account.label(), @errorName(err) },
+        .{ account.id(), @errorName(err) },
     );
     return Context.Outcome.reportNotice(
         gpa,
         .information,
         "Set {s} in the environment. Restart Drinky to use {s}.",
-        .{ account.credentialEnv().?, account.label() },
+        .{ account.credentialEnv().?, account.id() },
     );
 }
 
-/// Write the picker row of `account`: its label and its state.
+/// Write the picker row of `account`: its identifier and its state. The
+/// identifier already names the credential source, so the state says whether
+/// that source delivered.
 fn writeRow(options: *Context.Outcome.Options, context: *const Context, account: llm.Account) !void {
-    const label = account.label();
-    if (isActive(context, account)) return options.print("{s} (Active)", .{label});
-    const maybe_kind = account.credentialLabel();
+    const id = account.id();
+    if (isActive(context, account)) return options.print("{s} (Active)", .{id});
     if (context.accounts.isAuthenticated(account)) {
-        const kind = maybe_kind orelse return options.print("{s} (Signed in)", .{label});
-        return options.print("{s} ({s} set)", .{ label, kind });
+        if (account.hasLogin()) return options.print("{s} (Signed in)", .{id});
+        return options.print("{s} (Set)", .{id});
     }
     if (context.accounts.loadError(account) != null)
-        return options.print("{s} ({s} not loaded)", .{ label, maybe_kind.? });
-    return options.print("{s}", .{label});
+        return options.print("{s} (Not loaded)", .{id});
+    return options.print("{s}", .{id});
 }
 
 fn isActive(context: *const Context, account: llm.Account) bool {
@@ -80,7 +81,7 @@ test "the picker lists every account, marking the active and authenticated ones"
     const gpa = std.testing.allocator;
     var accounts = testing.accounts(.{ .anthropic = "sk-ant" }, .{ .anthropic = true });
     defer testing.deinitAccounts(&accounts);
-    var agent = testing.agent(gpa, .{ .anthropic_api = "sk-ant" });
+    var agent = testing.agent(gpa, .{ .anthropic_api_key = "sk-ant" });
     defer agent.deinit();
     var context: Context = .{ .gpa = gpa, .io = undefined, .agent = &agent, .accounts = &accounts };
 
@@ -92,19 +93,16 @@ test "the picker lists every account, marking the active and authenticated ones"
             }
             try std.testing.expectEqualStrings("Sign in", pick.title);
             try std.testing.expectEqual(@as(usize, 10), pick.options.len);
-            try std.testing.expectEqualStrings(
-                "Anthropic Subscription (Signed in)",
-                pick.options[0],
-            );
-            try std.testing.expectEqualStrings("Anthropic Console", pick.options[1]);
-            try std.testing.expectEqualStrings("Anthropic API (Active)", pick.options[2]);
-            try std.testing.expectEqualStrings("OpenAI Subscription", pick.options[3]);
-            try std.testing.expectEqualStrings("OpenAI API", pick.options[4]);
-            try std.testing.expectEqualStrings("xAI Subscription", pick.options[5]);
-            try std.testing.expectEqualStrings("xAI API", pick.options[6]);
-            try std.testing.expectEqualStrings("OpenRouter OAuth", pick.options[7]);
-            try std.testing.expectEqualStrings("OpenRouter API", pick.options[8]);
-            try std.testing.expectEqualStrings("Google Vertex", pick.options[9]);
+            try std.testing.expectEqualStrings("anthropic-sub-login (Signed in)", pick.options[0]);
+            try std.testing.expectEqualStrings("anthropic-api-login", pick.options[1]);
+            try std.testing.expectEqualStrings("anthropic-api-key (Active)", pick.options[2]);
+            try std.testing.expectEqualStrings("openai-sub-login", pick.options[3]);
+            try std.testing.expectEqualStrings("openai-api-key", pick.options[4]);
+            try std.testing.expectEqualStrings("xai-sub-login", pick.options[5]);
+            try std.testing.expectEqualStrings("xai-api-key", pick.options[6]);
+            try std.testing.expectEqualStrings("openrouter-api-login", pick.options[7]);
+            try std.testing.expectEqualStrings("openrouter-api-key", pick.options[8]);
+            try std.testing.expectEqualStrings("google-cloud-keyfile", pick.options[9]);
             try std.testing.expect(pick.current == null);
         },
         else => return error.ExpectedPick,
@@ -125,23 +123,23 @@ test "the picker marks a loaded key file, a failed one, and an API key apart" {
     const gpa = std.testing.allocator;
     var accounts = testing.accounts(.{ .openai = "sk-openai" }, .{ .google = true });
     defer testing.deinitAccounts(&accounts);
-    var agent = testing.agent(gpa, .{ .openai_api = "sk-openai" });
+    var agent = testing.agent(gpa, .{ .openai_api_key = "sk-openai" });
     defer agent.deinit();
     var context: Context = .{ .gpa = gpa, .io = undefined, .agent = &agent, .accounts = &accounts };
 
-    const loaded = try row(&context, .google_vertex);
+    const loaded = try row(&context, .google_cloud_keyfile);
     defer gpa.free(loaded);
-    try std.testing.expectEqualStrings("Google Vertex (Key file set)", loaded);
-    const active = try row(&context, .openai_api);
+    try std.testing.expectEqualStrings("google-cloud-keyfile (Set)", loaded);
+    const active = try row(&context, .openai_api_key);
     defer gpa.free(active);
-    try std.testing.expectEqualStrings("OpenAI API (Active)", active);
+    try std.testing.expectEqualStrings("openai-api-key (Active)", active);
 
     // A key file that did not load shows as such, and a pick names the error.
     accounts.google_auth = null;
     accounts.google_error = error.FileNotFound;
-    const failed = try row(&context, .google_vertex);
+    const failed = try row(&context, .google_cloud_keyfile);
     defer gpa.free(failed);
-    try std.testing.expectEqualStrings("Google Vertex (Key file not loaded)", failed);
+    try std.testing.expectEqualStrings("google-cloud-keyfile (Not loaded)", failed);
     try Context.Outcome.expectNoticeContaining(
         try select(&context, .{ .payload = 0, .row = 9 }),
         .failure,
@@ -150,9 +148,9 @@ test "the picker marks a loaded key file, a failed one, and an API key apart" {
 
     // Without a load failure, the account is simply not set up.
     accounts.google_error = null;
-    const absent = try row(&context, .google_vertex);
+    const absent = try row(&context, .google_cloud_keyfile);
     defer gpa.free(absent);
-    try std.testing.expectEqualStrings("Google Vertex", absent);
+    try std.testing.expectEqualStrings("google-cloud-keyfile", absent);
     try Context.Outcome.expectNoticeContaining(
         try select(&context, .{ .payload = 0, .row = 9 }),
         .information,
@@ -164,16 +162,16 @@ test "select starts login, instructs an API account, and no-ops the active one" 
     const gpa = std.testing.allocator;
     var accounts = testing.accounts(.{ .anthropic = "sk-ant" }, .{});
     defer testing.deinitAccounts(&accounts);
-    var agent = testing.agent(gpa, .{ .anthropic_api = "sk-ant" });
+    var agent = testing.agent(gpa, .{ .anthropic_api_key = "sk-ant" });
     defer agent.deinit();
     var context: Context = .{ .gpa = gpa, .io = undefined, .agent = &agent, .accounts = &accounts };
 
     switch (try select(&context, .{ .payload = 0, .row = 1 })) {
-        .login => |account| try std.testing.expectEqual(llm.Account.anthropic_console, account),
+        .login => |account| try std.testing.expectEqual(llm.Account.anthropic_api_login, account),
         else => return error.ExpectedLogin,
     }
     switch (try select(&context, .{ .payload = 0, .row = 3 })) {
-        .login => |account| try std.testing.expectEqual(llm.Account.openai_subscription, account),
+        .login => |account| try std.testing.expectEqual(llm.Account.openai_sub_login, account),
         else => return error.ExpectedLogin,
     }
     try Context.Outcome.expectNoticeContaining(
@@ -182,7 +180,7 @@ test "select starts login, instructs an API account, and no-ops the active one" 
         "OPENAI_API_KEY",
     );
     switch (try select(&context, .{ .payload = 0, .row = 5 })) {
-        .login => |account| try std.testing.expectEqual(llm.Account.xai_subscription, account),
+        .login => |account| try std.testing.expectEqual(llm.Account.xai_sub_login, account),
         else => return error.ExpectedLogin,
     }
     try Context.Outcome.expectNoticeContaining(
@@ -191,7 +189,7 @@ test "select starts login, instructs an API account, and no-ops the active one" 
         "XAI_API_KEY",
     );
     switch (try select(&context, .{ .payload = 0, .row = 7 })) {
-        .login => |account| try std.testing.expectEqual(llm.Account.openrouter_oauth, account),
+        .login => |account| try std.testing.expectEqual(llm.Account.openrouter_api_login, account),
         else => return error.ExpectedLogin,
     }
     try Context.Outcome.expectNoticeContaining(
@@ -211,7 +209,7 @@ test "select never re-runs the login for the active subscription" {
     const gpa = std.testing.allocator;
     var accounts = testing.accounts(.{}, .{ .anthropic = true });
     defer testing.deinitAccounts(&accounts);
-    var agent = testing.agent(gpa, .{ .anthropic_subscription = undefined });
+    var agent = testing.agent(gpa, .{ .anthropic_sub_login = undefined });
     defer agent.deinit();
     var context: Context = .{ .gpa = gpa, .io = undefined, .agent = &agent, .accounts = &accounts };
 
@@ -220,20 +218,20 @@ test "select never re-runs the login for the active subscription" {
         .information,
         "active account",
     );
-    try std.testing.expectEqual(llm.Account.anthropic_subscription, agent.client.?.account());
+    try std.testing.expectEqual(llm.Account.anthropic_sub_login, agent.client.?.account());
 }
 
 test "select hands an authenticated but inactive account to the app to switch" {
     const gpa = std.testing.allocator;
     var accounts = testing.accounts(.{ .anthropic = "sk-ant" }, .{ .anthropic = true });
     defer testing.deinitAccounts(&accounts);
-    var agent = testing.agent(gpa, .{ .anthropic_api = "sk-ant" });
+    var agent = testing.agent(gpa, .{ .anthropic_api_key = "sk-ant" });
     defer agent.deinit();
     var context: Context = .{ .gpa = gpa, .io = undefined, .agent = &agent, .accounts = &accounts };
 
     switch (try select(&context, .{ .payload = 0, .row = 0 })) {
         .switch_account => |account| try std.testing.expectEqual(
-            llm.Account.anthropic_subscription,
+            llm.Account.anthropic_sub_login,
             account,
         ),
         else => return error.ExpectedSwitch,

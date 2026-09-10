@@ -38,7 +38,7 @@ anthropic_console_auth: anthropic.ConsoleAuth,
 openai_auth: openai.Auth,
 xai_auth: xai.Auth,
 openrouter_auth: openrouter.Auth,
-/// The Vertex credential, or null when the environment names no readable key
+/// The key file credential, or null when the environment names no readable key
 /// file beside a location Drinky serves.
 google_auth: ?google.Auth,
 /// Why the account that both variables name did not load, or null. Startup
@@ -48,13 +48,13 @@ google_auth: ?google.Auth,
 google_error: ?anyerror,
 environment: Environment,
 /// Whether each subscription store loaded a credential from `auth.json`.
-anthropic_subscription_ready: bool,
-openai_subscription_ready: bool,
-xai_subscription_ready: bool,
+anthropic_sub_login_ready: bool,
+openai_sub_login_ready: bool,
+xai_sub_login_ready: bool,
 /// Whether the Console store loaded a minted key from `auth.json`.
-anthropic_console_ready: bool,
+anthropic_api_login_ready: bool,
 /// Whether the OpenRouter OAuth store loaded a minted key from `auth.json`.
-openrouter_oauth_ready: bool,
+openrouter_api_login_ready: bool,
 /// Every model Drinky knows, loaded from its caches. A fetch replaces the list
 /// of one account, and the user asks for that fetch.
 catalog: Catalog,
@@ -112,7 +112,7 @@ pub const Callback = struct {
 /// Open the OAuth login stores, load any stored credential, take the
 /// environment API keys, and read the Google key file. A malformed `auth.json`
 /// surfaces here and is not silently ignored. A key file that does not load
-/// leaves the Vertex account absent and records why, because the other accounts
+/// leaves the key file account absent and records why, because the other accounts
 /// must still serve.
 pub fn init(
     gpa: std.mem.Allocator,
@@ -133,7 +133,7 @@ pub fn init(
     errdefer openrouter_auth.deinit();
 
     const anthropic_ready = try anthropic_auth.load();
-    const anthropic_console_ready = try anthropic_console_auth.load();
+    const anthropic_api_login_ready = try anthropic_console_auth.load();
     const openai_ready = try openai_auth.load();
     const xai_ready = try xai_auth.load();
     const openrouter_ready = try openrouter_auth.load();
@@ -150,7 +150,7 @@ pub fn init(
             break :failed null;
         };
     }
-    errdefer if (google_auth) |*vertex| vertex.deinit();
+    errdefer if (google_auth) |*cloud_auth| cloud_auth.deinit();
 
     var catalog = try Catalog.init(gpa, io, home);
     errdefer catalog.deinit();
@@ -167,11 +167,11 @@ pub fn init(
         .google_auth = google_auth,
         .google_error = google_error,
         .environment = environment,
-        .anthropic_subscription_ready = anthropic_ready,
-        .openai_subscription_ready = openai_ready,
-        .xai_subscription_ready = xai_ready,
-        .anthropic_console_ready = anthropic_console_ready,
-        .openrouter_oauth_ready = openrouter_ready,
+        .anthropic_sub_login_ready = anthropic_ready,
+        .openai_sub_login_ready = openai_ready,
+        .xai_sub_login_ready = xai_ready,
+        .anthropic_api_login_ready = anthropic_api_login_ready,
+        .openrouter_api_login_ready = openrouter_ready,
         .catalog = catalog,
     };
 }
@@ -183,32 +183,32 @@ pub fn deinit(self: *Accounts) void {
     self.openai_auth.deinit();
     self.xai_auth.deinit();
     self.openrouter_auth.deinit();
-    if (self.google_auth) |*vertex| vertex.deinit();
+    if (self.google_auth) |*cloud_auth| cloud_auth.deinit();
 }
 
 /// Whether `account` has a usable credential: an env key for an API account, a
-/// loaded key file for the Vertex account, or a loaded credential for a login
+/// loaded key file for the key file account, or a loaded credential for a login
 /// account.
 pub fn isAuthenticated(self: *const Accounts, account: llm.Account) bool {
     return switch (account) {
-        .anthropic_api => self.environment.anthropic != null,
-        .anthropic_subscription => self.anthropic_subscription_ready,
-        .openai_api => self.environment.openai != null,
-        .openai_subscription => self.openai_subscription_ready,
-        .xai_api => self.environment.xai != null,
-        .xai_subscription => self.xai_subscription_ready,
-        .anthropic_console => self.anthropic_console_ready,
-        .openrouter_api => self.environment.openrouter != null,
-        .openrouter_oauth => self.openrouter_oauth_ready,
-        .google_vertex => self.google_auth != null,
+        .anthropic_api_key => self.environment.anthropic != null,
+        .anthropic_sub_login => self.anthropic_sub_login_ready,
+        .openai_api_key => self.environment.openai != null,
+        .openai_sub_login => self.openai_sub_login_ready,
+        .xai_api_key => self.environment.xai != null,
+        .xai_sub_login => self.xai_sub_login_ready,
+        .anthropic_api_login => self.anthropic_api_login_ready,
+        .openrouter_api_key => self.environment.openrouter != null,
+        .openrouter_api_login => self.openrouter_api_login_ready,
+        .google_cloud_keyfile => self.google_auth != null,
     };
 }
 
 /// Why the environment names `account` and the account still did not load, or
-/// null. Only the Vertex account loads a file at startup, so only it can fail.
+/// null. Only the key file account loads a file at startup, so only it can fail.
 pub fn loadError(self: *const Accounts, account: llm.Account) ?anyerror {
     return switch (account) {
-        .google_vertex => self.google_error,
+        .google_cloud_keyfile => self.google_error,
         else => null,
     };
 }
@@ -231,32 +231,36 @@ pub fn firstAuthenticated(self: *const Accounts) ?llm.Account {
 /// or null when the account is not authenticated.
 pub fn client(self: *Accounts, account: llm.Account) ?provider.Client {
     const credentials: provider.Credentials = switch (account) {
-        .anthropic_api => .{ .anthropic_api = self.environment.anthropic orelse return null },
-        .anthropic_subscription => if (self.anthropic_subscription_ready)
-            .{ .anthropic_subscription = &self.anthropic_auth }
+        .anthropic_api_key => .{
+            .anthropic_api_key = self.environment.anthropic orelse return null,
+        },
+        .anthropic_sub_login => if (self.anthropic_sub_login_ready)
+            .{ .anthropic_sub_login = &self.anthropic_auth }
         else
             return null,
-        .openai_api => .{ .openai_api = self.environment.openai orelse return null },
-        .openai_subscription => if (self.openai_subscription_ready)
-            .{ .openai_subscription = &self.openai_auth }
+        .openai_api_key => .{ .openai_api_key = self.environment.openai orelse return null },
+        .openai_sub_login => if (self.openai_sub_login_ready)
+            .{ .openai_sub_login = &self.openai_auth }
         else
             return null,
-        .xai_api => .{ .xai_api = self.environment.xai orelse return null },
-        .xai_subscription => if (self.xai_subscription_ready)
-            .{ .xai_subscription = &self.xai_auth }
+        .xai_api_key => .{ .xai_api_key = self.environment.xai orelse return null },
+        .xai_sub_login => if (self.xai_sub_login_ready)
+            .{ .xai_sub_login = &self.xai_auth }
         else
             return null,
-        .anthropic_console => if (self.anthropic_console_ready)
-            .{ .anthropic_console = self.anthropic_console_auth.apiKey() orelse return null }
+        .anthropic_api_login => if (self.anthropic_api_login_ready)
+            .{ .anthropic_api_login = self.anthropic_console_auth.apiKey() orelse return null }
         else
             return null,
-        .openrouter_api => .{ .openrouter_api = self.environment.openrouter orelse return null },
-        .openrouter_oauth => if (self.openrouter_oauth_ready)
-            .{ .openrouter_oauth = self.openrouter_auth.apiKey() orelse return null }
+        .openrouter_api_key => .{
+            .openrouter_api_key = self.environment.openrouter orelse return null,
+        },
+        .openrouter_api_login => if (self.openrouter_api_login_ready)
+            .{ .openrouter_api_login = self.openrouter_auth.apiKey() orelse return null }
         else
             return null,
-        .google_vertex => if (self.google_auth) |*vertex|
-            .{ .google_vertex = vertex }
+        .google_cloud_keyfile => if (self.google_auth) |*cloud_auth|
+            .{ .google_cloud_keyfile = cloud_auth }
         else
             return null,
     };
@@ -368,7 +372,7 @@ fn isCanceled(slot: ?anyerror) bool {
 /// request draws on the same window.
 fn fetchModels(self: *Accounts, account: llm.Account, deadline: net.Deadline) ![]Model {
     return switch (account) {
-        .anthropic_subscription => anthropic.models.fetch(
+        .anthropic_sub_login => anthropic.models.fetch(
             self.gpa,
             self.io,
             deadline,
@@ -378,52 +382,52 @@ fn fetchModels(self: *Accounts, account: llm.Account, deadline: net.Deadline) ![
                 .{&self.anthropic_auth},
             ) },
         ),
-        .anthropic_console => anthropic.models.fetch(
+        .anthropic_api_login => anthropic.models.fetch(
             self.gpa,
             self.io,
             deadline,
             .{ .api_key = self.anthropic_console_auth.apiKey() orelse return error.SignedOut },
         ),
-        .anthropic_api => anthropic.models.fetch(
+        .anthropic_api_key => anthropic.models.fetch(
             self.gpa,
             self.io,
             deadline,
             .{ .api_key = self.environment.anthropic orelse return error.SignedOut },
         ),
-        .openai_subscription => openai.models.fetchSubscription(
+        .openai_sub_login => openai.models.fetchSubscription(
             self.gpa,
             self.io,
             deadline,
             &self.openai_auth,
         ),
-        .openai_api => openai.models.fetchApi(
+        .openai_api_key => openai.models.fetchApi(
             self.gpa,
             self.io,
             deadline,
             self.environment.openai orelse return error.SignedOut,
         ),
-        .xai_subscription => xai.models.fetch(
+        .xai_sub_login => xai.models.fetch(
             self.gpa,
             self.io,
             deadline,
             try deadline.call(self.io, xai.Auth.accessToken, .{&self.xai_auth}),
         ),
-        .xai_api => xai.models.fetch(
+        .xai_api_key => xai.models.fetch(
             self.gpa,
             self.io,
             deadline,
             self.environment.xai orelse return error.SignedOut,
         ),
-        .google_vertex => if (self.google_auth) |*vertex| google.models.fetch(
+        .google_cloud_keyfile => if (self.google_auth) |*cloud_auth| google.models.fetch(
             self.gpa,
             self.io,
             deadline,
             &.{
-                .access_token = try deadline.call(self.io, google.Auth.accessToken, .{vertex}),
-                .location = vertex.location,
+                .access_token = try deadline.call(self.io, google.Auth.accessToken, .{cloud_auth}),
+                .location = cloud_auth.location,
             },
         ) else error.SignedOut,
-        .openrouter_oauth, .openrouter_api => error.OpenRouterHasNoList,
+        .openrouter_api_login, .openrouter_api_key => error.OpenRouterHasNoList,
     };
 }
 
@@ -444,16 +448,16 @@ fn timeoutsOf(self: *const Accounts, account: llm.Account) net.Timeouts {
 /// code, so its login listens on no port.
 pub fn callback(account: llm.Account) ?Callback {
     return switch (account) {
-        .anthropic_subscription => callbackOf(anthropic.oauth),
-        .anthropic_console => callbackOf(anthropic.console),
-        .openai_subscription => callbackOf(openai.oauth),
-        .openrouter_oauth => callbackOf(openrouter.oauth),
-        .xai_subscription,
-        .anthropic_api,
-        .openai_api,
-        .xai_api,
-        .openrouter_api,
-        .google_vertex,
+        .anthropic_sub_login => callbackOf(anthropic.oauth),
+        .anthropic_api_login => callbackOf(anthropic.console),
+        .openai_sub_login => callbackOf(openai.oauth),
+        .openrouter_api_login => callbackOf(openrouter.oauth),
+        .xai_sub_login,
+        .anthropic_api_key,
+        .openai_api_key,
+        .xai_api_key,
+        .openrouter_api_key,
+        .google_cloud_keyfile,
         => null,
     };
 }
@@ -469,36 +473,36 @@ fn callbackOf(comptime oauth: type) Callback {
 /// error is returned after the credential has been replaced.
 pub fn login(self: *Accounts, account: llm.Account, prompt: anytype) !Login {
     const provider_login: auth.Login = switch (account) {
-        .anthropic_subscription => committed: {
+        .anthropic_sub_login => committed: {
             const committed_login = try self.anthropic_auth.login(prompt);
-            self.anthropic_subscription_ready = true;
+            self.anthropic_sub_login_ready = true;
             break :committed committed_login;
         },
-        .openai_subscription => committed: {
+        .openai_sub_login => committed: {
             const committed_login = try self.openai_auth.login(prompt);
-            self.openai_subscription_ready = true;
+            self.openai_sub_login_ready = true;
             break :committed committed_login;
         },
-        .anthropic_console => committed: {
+        .anthropic_api_login => committed: {
             const committed_login = try self.anthropic_console_auth.login(prompt);
-            self.anthropic_console_ready = true;
+            self.anthropic_api_login_ready = true;
             break :committed committed_login;
         },
-        .xai_subscription => committed: {
+        .xai_sub_login => committed: {
             const committed_login = try self.xai_auth.login(prompt);
-            self.xai_subscription_ready = true;
+            self.xai_sub_login_ready = true;
             break :committed committed_login;
         },
-        .openrouter_oauth => committed: {
+        .openrouter_api_login => committed: {
             const committed_login = try self.openrouter_auth.login(prompt);
-            self.openrouter_oauth_ready = true;
+            self.openrouter_api_login_ready = true;
             break :committed committed_login;
         },
-        .anthropic_api,
-        .openai_api,
-        .xai_api,
-        .openrouter_api,
-        .google_vertex,
+        .anthropic_api_key,
+        .openai_api_key,
+        .xai_api_key,
+        .openrouter_api_key,
+        .google_cloud_keyfile,
         => return error.ApiAccountHasNoLogin,
     };
     return switch (provider_login) {
@@ -515,36 +519,36 @@ pub fn login(self: *Accounts, account: llm.Account, prompt: anytype) !Login {
 /// credential comes from the environment), so it is an error.
 pub fn logout(self: *Accounts, account: llm.Account) !void {
     switch (account) {
-        .anthropic_subscription => {
+        .anthropic_sub_login => {
             try self.anthropic_auth.logout();
-            self.anthropic_subscription_ready = false;
+            self.anthropic_sub_login_ready = false;
             self.catalog.dropAccount(account);
         },
-        .openai_subscription => {
+        .openai_sub_login => {
             try self.openai_auth.logout();
-            self.openai_subscription_ready = false;
+            self.openai_sub_login_ready = false;
             self.catalog.dropAccount(account);
         },
-        .anthropic_console => {
+        .anthropic_api_login => {
             try self.anthropic_console_auth.logout();
-            self.anthropic_console_ready = false;
+            self.anthropic_api_login_ready = false;
             self.catalog.dropAccount(account);
         },
-        .xai_subscription => {
+        .xai_sub_login => {
             try self.xai_auth.logout();
-            self.xai_subscription_ready = false;
+            self.xai_sub_login_ready = false;
             self.catalog.dropAccount(account);
         },
-        .openrouter_oauth => {
+        .openrouter_api_login => {
             try self.openrouter_auth.logout();
-            self.openrouter_oauth_ready = false;
+            self.openrouter_api_login_ready = false;
             self.catalog.dropAccount(account);
         },
-        .anthropic_api,
-        .openai_api,
-        .xai_api,
-        .openrouter_api,
-        .google_vertex,
+        .anthropic_api_key,
+        .openai_api_key,
+        .xai_api_key,
+        .openrouter_api_key,
+        .google_cloud_keyfile,
         => return error.ApiAccountHasNoLogout,
     }
 }
@@ -557,40 +561,40 @@ pub fn logout(self: *Accounts, account: llm.Account) !void {
 /// start loads it again.
 pub fn invalidate(self: *Accounts, account: llm.Account) !bool {
     switch (account) {
-        .anthropic_subscription => {
+        .anthropic_sub_login => {
             defer self.catalog.dropAccount(account);
             const recovered = self.anthropic_auth.invalidate() catch |err| {
-                self.anthropic_subscription_ready = false;
+                self.anthropic_sub_login_ready = false;
                 return err;
             };
-            self.anthropic_subscription_ready = recovered;
+            self.anthropic_sub_login_ready = recovered;
             return recovered;
         },
-        .openai_subscription => {
+        .openai_sub_login => {
             defer self.catalog.dropAccount(account);
             const recovered = self.openai_auth.invalidate() catch |err| {
-                self.openai_subscription_ready = false;
+                self.openai_sub_login_ready = false;
                 return err;
             };
-            self.openai_subscription_ready = recovered;
+            self.openai_sub_login_ready = recovered;
             return recovered;
         },
-        .xai_subscription => {
+        .xai_sub_login => {
             defer self.catalog.dropAccount(account);
             const recovered = self.xai_auth.invalidate() catch |err| {
-                self.xai_subscription_ready = false;
+                self.xai_sub_login_ready = false;
                 return err;
             };
-            self.xai_subscription_ready = recovered;
+            self.xai_sub_login_ready = recovered;
             return recovered;
         },
-        .anthropic_console,
-        .anthropic_api,
-        .openai_api,
-        .xai_api,
-        .openrouter_oauth,
-        .openrouter_api,
-        .google_vertex,
+        .anthropic_api_login,
+        .anthropic_api_key,
+        .openai_api_key,
+        .xai_api_key,
+        .openrouter_api_login,
+        .openrouter_api_key,
+        .google_cloud_keyfile,
         => {
             return error.AccountHasNoRefreshCredential;
         },
@@ -617,11 +621,11 @@ fn testAccounts(environment: Environment, anthropic_ready: bool, openai_ready: b
         .google_auth = null,
         .google_error = null,
         .environment = environment,
-        .anthropic_subscription_ready = anthropic_ready,
-        .openai_subscription_ready = openai_ready,
-        .xai_subscription_ready = false,
-        .anthropic_console_ready = false,
-        .openrouter_oauth_ready = false,
+        .anthropic_sub_login_ready = anthropic_ready,
+        .openai_sub_login_ready = openai_ready,
+        .xai_sub_login_ready = false,
+        .anthropic_api_login_ready = false,
+        .openrouter_api_login_ready = false,
         .catalog = testCatalog(),
     };
 }
@@ -647,30 +651,33 @@ fn seedModel(accounts: *Accounts, account: llm.Account, name: []const u8) !void 
 
 test "isAuthenticated and firstAuthenticated read keys and readiness, subscription first" {
     var accounts = testAccounts(.{ .anthropic = "sk-ant", .openai = "sk-openai" }, true, false);
-    try std.testing.expect(accounts.isAuthenticated(.anthropic_subscription));
-    try std.testing.expect(accounts.isAuthenticated(.anthropic_api));
-    try std.testing.expect(accounts.isAuthenticated(.openai_api));
-    try std.testing.expect(!accounts.isAuthenticated(.openai_subscription));
+    try std.testing.expect(accounts.isAuthenticated(.anthropic_sub_login));
+    try std.testing.expect(accounts.isAuthenticated(.anthropic_api_key));
+    try std.testing.expect(accounts.isAuthenticated(.openai_api_key));
+    try std.testing.expect(!accounts.isAuthenticated(.openai_sub_login));
     // Both anthropic credentials are present. The subscription precedes its API
     // key in enum order, so it is the active account.
     try std.testing.expectEqual(
-        llm.Account.anthropic_subscription,
+        llm.Account.anthropic_sub_login,
         accounts.firstAuthenticated().?,
     );
 
     // With only API keys, the first authenticated in enum order (anthropic) wins.
     var api_only = testAccounts(.{ .anthropic = "sk-ant", .openai = "sk-openai" }, false, false);
-    try std.testing.expectEqual(llm.Account.anthropic_api, api_only.firstAuthenticated().?);
+    try std.testing.expectEqual(llm.Account.anthropic_api_key, api_only.firstAuthenticated().?);
 
     var cross_vendor = testAccounts(.{ .anthropic = "sk-ant" }, false, true);
     try std.testing.expectEqual(
-        llm.Account.openai_subscription,
+        llm.Account.openai_sub_login,
         cross_vendor.firstAuthenticated().?,
     );
 
     var console_first = testAccounts(.{}, false, true);
-    console_first.anthropic_console_ready = true;
-    try std.testing.expectEqual(llm.Account.anthropic_console, console_first.firstAuthenticated().?);
+    console_first.anthropic_api_login_ready = true;
+    try std.testing.expectEqual(
+        llm.Account.anthropic_api_login,
+        console_first.firstAuthenticated().?,
+    );
 
     var none = testAccounts(.{}, false, false);
     try std.testing.expect(none.firstAuthenticated() == null);
@@ -678,37 +685,37 @@ test "isAuthenticated and firstAuthenticated read keys and readiness, subscripti
 
 test "an account has a callback listener exactly when it has a callback login" {
     for (std.enums.values(llm.Account)) |account| {
-        const callback_login = account.hasLogin() and account != .xai_subscription;
+        const callback_login = account.hasLogin() and account != .xai_sub_login;
         try std.testing.expectEqual(callback_login, callback(account) != null);
     }
     // The pinned ports keep the four listeners apart and match each provider
     // OAuth registration. A grant of the OpenRouter login carries no state, so
     // its random callback path binds the redirect instead.
-    try std.testing.expectEqual(@as(u16, 53692), callback(.anthropic_subscription).?.port);
-    try std.testing.expectEqual(@as(u16, 53693), callback(.anthropic_console).?.port);
-    try std.testing.expectEqual(@as(u16, 1455), callback(.openai_subscription).?.port);
-    try std.testing.expectEqual(@as(u16, 53694), callback(.openrouter_oauth).?.port);
+    try std.testing.expectEqual(@as(u16, 53692), callback(.anthropic_sub_login).?.port);
+    try std.testing.expectEqual(@as(u16, 53693), callback(.anthropic_api_login).?.port);
+    try std.testing.expectEqual(@as(u16, 1455), callback(.openai_sub_login).?.port);
+    try std.testing.expectEqual(@as(u16, 53694), callback(.openrouter_api_login).?.port);
     for ([_]llm.Account{
-        .anthropic_subscription,
-        .anthropic_console,
-        .openai_subscription,
+        .anthropic_sub_login,
+        .anthropic_api_login,
+        .openai_sub_login,
     }) |account| {
         try std.testing.expectEqual(oauth_callback.Binding.state, callback(account).?.binding);
     }
     try std.testing.expectEqual(
         oauth_callback.Binding.path,
-        callback(.openrouter_oauth).?.binding,
+        callback(.openrouter_api_login).?.binding,
     );
 }
 
 test "logout rejects the accounts whose credential is env-sourced" {
     var accounts = testAccounts(.{ .anthropic = "sk-ant" }, false, false);
     for ([_]llm.Account{
-        .anthropic_api,
-        .openai_api,
-        .xai_api,
-        .openrouter_api,
-        .google_vertex,
+        .anthropic_api_key,
+        .openai_api_key,
+        .xai_api_key,
+        .openrouter_api_key,
+        .google_cloud_keyfile,
     }) |account| {
         try std.testing.expectError(error.ApiAccountHasNoLogout, accounts.logout(account));
     }
@@ -717,13 +724,13 @@ test "logout rejects the accounts whose credential is env-sourced" {
 test "invalidation rejects accounts without a refresh credential" {
     var accounts = testAccounts(.{ .anthropic = "a", .openai = "o" }, false, false);
     for ([_]llm.Account{
-        .anthropic_console,
-        .anthropic_api,
-        .openai_api,
-        .xai_api,
-        .openrouter_oauth,
-        .openrouter_api,
-        .google_vertex,
+        .anthropic_api_login,
+        .anthropic_api_key,
+        .openai_api_key,
+        .xai_api_key,
+        .openrouter_api_login,
+        .openrouter_api_key,
+        .google_cloud_keyfile,
     }) |account| {
         try std.testing.expectError(
             error.AccountHasNoRefreshCredential,
@@ -735,24 +742,24 @@ test "invalidation rejects accounts without a refresh credential" {
 test "client selects the arm for an authenticated account, null otherwise" {
     var accounts = testAccounts(.{ .anthropic = "sk-ant", .openai = null }, false, false);
     try std.testing.expectEqual(
-        llm.Account.anthropic_api,
-        accounts.client(.anthropic_api).?.account(),
+        llm.Account.anthropic_api_key,
+        accounts.client(.anthropic_api_key).?.account(),
     );
-    try std.testing.expect(accounts.client(.openai_api) == null);
-    try std.testing.expect(accounts.client(.anthropic_subscription) == null);
-    try std.testing.expect(accounts.client(.xai_subscription) == null);
-    try std.testing.expect(accounts.client(.google_vertex) == null);
-    try std.testing.expect(!accounts.isAuthenticated(.google_vertex));
+    try std.testing.expect(accounts.client(.openai_api_key) == null);
+    try std.testing.expect(accounts.client(.anthropic_sub_login) == null);
+    try std.testing.expect(accounts.client(.xai_sub_login) == null);
+    try std.testing.expect(accounts.client(.google_cloud_keyfile) == null);
+    try std.testing.expect(!accounts.isAuthenticated(.google_cloud_keyfile));
 
     var grok = testAccounts(.{ .xai = "xai-key" }, false, false);
-    try std.testing.expect(grok.isAuthenticated(.xai_api));
-    try std.testing.expectEqual(llm.Account.xai_api, grok.client(.xai_api).?.account());
-    try std.testing.expectEqual(llm.Account.xai_api, grok.firstAuthenticated().?);
-    grok.xai_subscription_ready = true;
-    try std.testing.expectEqual(llm.Account.xai_subscription, grok.firstAuthenticated().?);
+    try std.testing.expect(grok.isAuthenticated(.xai_api_key));
+    try std.testing.expectEqual(llm.Account.xai_api_key, grok.client(.xai_api_key).?.account());
+    try std.testing.expectEqual(llm.Account.xai_api_key, grok.firstAuthenticated().?);
+    grok.xai_sub_login_ready = true;
+    try std.testing.expectEqual(llm.Account.xai_sub_login, grok.firstAuthenticated().?);
     try std.testing.expectEqual(
-        llm.Account.xai_subscription,
-        grok.client(.xai_subscription).?.account(),
+        llm.Account.xai_sub_login,
+        grok.client(.xai_sub_login).?.account(),
     );
 }
 
@@ -766,17 +773,17 @@ test "a client carries the timeout pair of its provider" {
     };
     try std.testing.expectEqual(
         @as(u64, 1),
-        accounts.client(.anthropic_api).?.timeouts.idle_ms,
+        accounts.client(.anthropic_api_key).?.timeouts.idle_ms,
     );
     try std.testing.expectEqual(
         @as(u64, 2),
-        accounts.client(.openai_api).?.timeouts.idle_ms,
+        accounts.client(.openai_api_key).?.timeouts.idle_ms,
     );
-    try std.testing.expectEqual(@as(u64, 3), accounts.timeoutsOf(.google_vertex).idle_ms);
-    try std.testing.expectEqual(@as(u64, 4), accounts.timeoutsOf(.xai_subscription).idle_ms);
+    try std.testing.expectEqual(@as(u64, 3), accounts.timeoutsOf(.google_cloud_keyfile).idle_ms);
+    try std.testing.expectEqual(@as(u64, 4), accounts.timeoutsOf(.xai_sub_login).idle_ms);
 }
 
-test "the Vertex account loads from the key file and records a failed load" {
+test "the key file account loads from the key file and records a failed load" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -789,7 +796,7 @@ test "the Vertex account loads from the key file and records a failed load" {
     // One variable alone leaves the account absent with no failure to report.
     var half = try Accounts.init(gpa, io, home, .{}, .{ .google_location = "global" });
     defer half.deinit();
-    try std.testing.expect(!half.isAuthenticated(.google_vertex));
+    try std.testing.expect(!half.isAuthenticated(.google_cloud_keyfile));
     try std.testing.expect(half.google_error == null);
 
     // Both variables and no file: the account is absent and the error names why.
@@ -798,10 +805,13 @@ test "the Vertex account loads from the key file and records a failed load" {
         .google_location = "global",
     });
     defer missing.deinit();
-    try std.testing.expect(!missing.isAuthenticated(.google_vertex));
+    try std.testing.expect(!missing.isAuthenticated(.google_cloud_keyfile));
     try std.testing.expectEqual(@as(?anyerror, error.FileNotFound), missing.google_error);
-    try std.testing.expectEqual(@as(?anyerror, error.FileNotFound), missing.loadError(.google_vertex));
-    try std.testing.expect(missing.loadError(.openai_api) == null);
+    try std.testing.expectEqual(
+        @as(?anyerror, error.FileNotFound),
+        missing.loadError(.google_cloud_keyfile),
+    );
+    try std.testing.expect(missing.loadError(.openai_api_key) == null);
     try std.testing.expect(missing.firstAuthenticated() == null);
 
     const file = try std.json.Stringify.valueAlloc(gpa, .{
@@ -817,10 +827,13 @@ test "the Vertex account loads from the key file and records a failed load" {
         .google_location = "eu",
     });
     defer ready.deinit();
-    try std.testing.expect(ready.isAuthenticated(.google_vertex));
+    try std.testing.expect(ready.isAuthenticated(.google_cloud_keyfile));
     try std.testing.expect(ready.google_error == null);
-    try std.testing.expectEqual(llm.Account.google_vertex, ready.firstAuthenticated().?);
-    try std.testing.expectEqual(llm.Account.google_vertex, ready.client(.google_vertex).?.account());
+    try std.testing.expectEqual(llm.Account.google_cloud_keyfile, ready.firstAuthenticated().?);
+    try std.testing.expectEqual(
+        llm.Account.google_cloud_keyfile,
+        ready.client(.google_cloud_keyfile).?.account(),
+    );
     try std.testing.expectEqualStrings("my-project", ready.google_auth.?.project);
 
     // A region is a failed load too, and every other account still serves.
@@ -831,7 +844,7 @@ test "the Vertex account loads from the key file and records a failed load" {
     });
     defer bad_location.deinit();
     try std.testing.expectEqual(@as(?anyerror, error.BadLocation), bad_location.google_error);
-    try std.testing.expectEqual(llm.Account.anthropic_api, bad_location.firstAuthenticated().?);
+    try std.testing.expectEqual(llm.Account.anthropic_api_key, bad_location.firstAuthenticated().?);
 }
 
 test "invalidation forgets a rejected credential when store removal fails" {
@@ -844,7 +857,7 @@ test "invalidation forgets a rejected credential when store removal fails" {
     try tmp.dir.writeFile(io, .{
         .sub_path = ".drinky/auth.json",
         .data =
-        \\{ "anthropic_subscription":
+        \\{ "anthropic-sub-login":
         \\    { "access": "a", "refresh": "r", "expires_ms": 4102444800000 } }
         ,
     });
@@ -857,16 +870,16 @@ test "invalidation forgets a rejected credential when store removal fails" {
 
     var accounts = try Accounts.init(gpa, io, home, .{}, .{});
     defer accounts.deinit();
-    try std.testing.expect(accounts.isAuthenticated(.anthropic_subscription));
+    try std.testing.expect(accounts.isAuthenticated(.anthropic_sub_login));
 
     // A corrupt file blocks removal. The rejected token must still leave memory.
     try tmp.dir.writeFile(io, .{ .sub_path = ".drinky/auth.json", .data = "not json" });
     try std.testing.expectError(
         error.BadCredentials,
-        accounts.invalidate(.anthropic_subscription),
+        accounts.invalidate(.anthropic_sub_login),
     );
-    try std.testing.expect(!accounts.isAuthenticated(.anthropic_subscription));
-    try std.testing.expect(accounts.client(.anthropic_subscription) == null);
+    try std.testing.expect(!accounts.isAuthenticated(.anthropic_sub_login));
+    try std.testing.expect(accounts.client(.anthropic_sub_login) == null);
 }
 
 test "OpenAI invalidation drops the model list when store removal fails" {
@@ -879,7 +892,7 @@ test "OpenAI invalidation drops the model list when store removal fails" {
     try tmp.dir.writeFile(io, .{
         .sub_path = ".drinky/auth.json",
         .data =
-        \\{ "openai_subscription":
+        \\{ "openai-sub-login":
         \\    { "access": "a", "refresh": "r", "expires_ms": 4102444800000,
         \\      "account_id": "account" } }
         ,
@@ -892,22 +905,22 @@ test "OpenAI invalidation drops the model list when store removal fails" {
     );
 
     var accounts = testAccounts(.{}, false, true);
-    defer gpa.free(accounts.catalog.accounts.get(.openai_subscription));
+    defer gpa.free(accounts.catalog.accounts.get(.openai_sub_login));
     accounts.openai_auth = try openai.Auth.init(gpa, io, home, .{});
     defer accounts.openai_auth.deinit();
     try std.testing.expect(try accounts.openai_auth.load());
-    try seedModel(&accounts, .openai_subscription, "gpt-5.6-sol");
-    try std.testing.expect(!accounts.catalog.isEmpty(.openai_subscription));
+    try seedModel(&accounts, .openai_sub_login, "gpt-5.6-sol");
+    try std.testing.expect(!accounts.catalog.isEmpty(.openai_sub_login));
 
     // A failed removal must drop both the credential and the list behind it.
     try tmp.dir.writeFile(io, .{ .sub_path = ".drinky/auth.json", .data = "not json" });
     try std.testing.expectError(
         error.BadCredentials,
-        accounts.invalidate(.openai_subscription),
+        accounts.invalidate(.openai_sub_login),
     );
-    try std.testing.expect(!accounts.isAuthenticated(.openai_subscription));
+    try std.testing.expect(!accounts.isAuthenticated(.openai_sub_login));
     try std.testing.expect(accounts.openai_auth.tokens == null);
-    try std.testing.expect(accounts.catalog.isEmpty(.openai_subscription));
+    try std.testing.expect(accounts.catalog.isEmpty(.openai_sub_login));
 }
 
 test "OpenAI invalidation reloads a replacement without its model list" {
@@ -920,7 +933,7 @@ test "OpenAI invalidation reloads a replacement without its model list" {
     try tmp.dir.writeFile(io, .{
         .sub_path = ".drinky/auth.json",
         .data =
-        \\{ "openai_subscription":
+        \\{ "openai-sub-login":
         \\    { "access": "old_access", "refresh": "old_refresh",
         \\      "expires_ms": 4102444800000, "account_id": "account" } }
         ,
@@ -933,29 +946,29 @@ test "OpenAI invalidation reloads a replacement without its model list" {
     );
 
     var accounts = testAccounts(.{}, false, true);
-    defer gpa.free(accounts.catalog.accounts.get(.openai_subscription));
+    defer gpa.free(accounts.catalog.accounts.get(.openai_sub_login));
     accounts.openai_auth = try openai.Auth.init(gpa, io, home, .{});
     defer accounts.openai_auth.deinit();
     try std.testing.expect(try accounts.openai_auth.load());
-    try seedModel(&accounts, .openai_subscription, "gpt-5.6-sol");
+    try seedModel(&accounts, .openai_sub_login, "gpt-5.6-sol");
 
     // Another instance saved a replacement. The reloaded credential can belong
     // to another principal, so its discovered limits go with the old one.
     try tmp.dir.writeFile(io, .{
         .sub_path = ".drinky/auth.json",
         .data =
-        \\{ "openai_subscription":
+        \\{ "openai-sub-login":
         \\    { "access": "new_access", "refresh": "new_refresh",
         \\      "expires_ms": 4102444800000, "account_id": "account" } }
         ,
     });
-    try std.testing.expect(try accounts.invalidate(.openai_subscription));
-    try std.testing.expect(accounts.isAuthenticated(.openai_subscription));
+    try std.testing.expect(try accounts.invalidate(.openai_sub_login));
+    try std.testing.expect(accounts.isAuthenticated(.openai_sub_login));
     try std.testing.expectEqualStrings(
         "new_refresh",
         accounts.openai_auth.tokens.?.refresh,
     );
-    try std.testing.expect(accounts.catalog.isEmpty(.openai_subscription));
+    try std.testing.expect(accounts.catalog.isEmpty(.openai_sub_login));
 }
 
 // The xAI subscription runs the same lifecycle as the OpenAI one: a rejected
@@ -971,7 +984,7 @@ test "xAI invalidation forgets a rejected credential and reloads a replacement" 
     try tmp.dir.writeFile(io, .{
         .sub_path = ".drinky/auth.json",
         .data =
-        \\{ "xai_subscription":
+        \\{ "xai-sub-login":
         \\    { "access": "old_access", "refresh": "old_refresh",
         \\      "expires_ms": 4102444800000, "subject": "user-1" } }
         ,
@@ -984,37 +997,37 @@ test "xAI invalidation forgets a rejected credential and reloads a replacement" 
     );
 
     var accounts = testAccounts(.{}, false, false);
-    defer gpa.free(accounts.catalog.accounts.get(.xai_subscription));
+    defer gpa.free(accounts.catalog.accounts.get(.xai_sub_login));
     accounts.xai_auth = try xai.Auth.init(gpa, io, home, .{});
     defer accounts.xai_auth.deinit();
     try std.testing.expect(try accounts.xai_auth.load());
-    accounts.xai_subscription_ready = true;
-    try seedModel(&accounts, .xai_subscription, "grok-4.6");
+    accounts.xai_sub_login_ready = true;
+    try seedModel(&accounts, .xai_sub_login, "grok-4.6");
 
     // Another instance saved a replacement of the same user.
     try tmp.dir.writeFile(io, .{
         .sub_path = ".drinky/auth.json",
         .data =
-        \\{ "xai_subscription":
+        \\{ "xai-sub-login":
         \\    { "access": "new_access", "refresh": "new_refresh",
         \\      "expires_ms": 4102444800000, "subject": "user-1" } }
         ,
     });
-    try std.testing.expect(try accounts.invalidate(.xai_subscription));
-    try std.testing.expect(accounts.isAuthenticated(.xai_subscription));
+    try std.testing.expect(try accounts.invalidate(.xai_sub_login));
+    try std.testing.expect(accounts.isAuthenticated(.xai_sub_login));
     try std.testing.expectEqualStrings("new_refresh", accounts.xai_auth.tokens.?.refresh);
-    try std.testing.expect(accounts.catalog.isEmpty(.xai_subscription));
+    try std.testing.expect(accounts.catalog.isEmpty(.xai_sub_login));
 
     // Without a replacement, the rejected credential leaves the store and the
     // account signs out.
-    try seedModel(&accounts, .xai_subscription, "grok-4.6");
-    try std.testing.expect(!try accounts.invalidate(.xai_subscription));
-    try std.testing.expect(!accounts.isAuthenticated(.xai_subscription));
-    try std.testing.expect(accounts.client(.xai_subscription) == null);
-    try std.testing.expect(accounts.catalog.isEmpty(.xai_subscription));
+    try seedModel(&accounts, .xai_sub_login, "grok-4.6");
+    try std.testing.expect(!try accounts.invalidate(.xai_sub_login));
+    try std.testing.expect(!accounts.isAuthenticated(.xai_sub_login));
+    try std.testing.expect(accounts.client(.xai_sub_login) == null);
+    try std.testing.expect(accounts.catalog.isEmpty(.xai_sub_login));
     var file = (try json_store.open(gpa, io, accounts.xai_auth.path)).?;
     defer file.deinit();
-    try std.testing.expect(file.entry("xai_subscription") == null);
+    try std.testing.expect(file.entry("xai-sub-login") == null);
 }
 
 test "a principal replacement drops the list of that account alone" {
@@ -1023,15 +1036,15 @@ test "a principal replacement drops the list of that account alone" {
     defer for (std.enums.values(llm.Account)) |account|
         gpa.free(accounts.catalog.accounts.get(account));
 
-    try seedModel(&accounts, .openai_subscription, "gpt-5.6-sol");
-    try seedModel(&accounts, .anthropic_subscription, "claude-opus-5");
+    try seedModel(&accounts, .openai_sub_login, "gpt-5.6-sol");
+    try seedModel(&accounts, .anthropic_sub_login, "claude-opus-5");
 
-    accounts.dropPrincipalMetadata(.anthropic_subscription);
-    try std.testing.expect(accounts.catalog.isEmpty(.anthropic_subscription));
-    try std.testing.expect(!accounts.catalog.isEmpty(.openai_subscription));
+    accounts.dropPrincipalMetadata(.anthropic_sub_login);
+    try std.testing.expect(accounts.catalog.isEmpty(.anthropic_sub_login));
+    try std.testing.expect(!accounts.catalog.isEmpty(.openai_sub_login));
 
-    accounts.dropPrincipalMetadata(.openai_subscription);
-    try std.testing.expect(accounts.catalog.isEmpty(.openai_subscription));
+    accounts.dropPrincipalMetadata(.openai_sub_login);
+    try std.testing.expect(accounts.catalog.isEmpty(.openai_sub_login));
 }
 
 // A fetch that arrived serves this session, whatever the cache file did, so a
@@ -1066,7 +1079,7 @@ test "an expired window ends both parts of a fetch without a request" {
     accounts.io = io;
 
     const expired: net.Deadline = .{ .at = std.Io.Clock.awake.now(io) };
-    for ([_]llm.Account{ .anthropic_api, .openai_api }) |account| {
+    for ([_]llm.Account{ .anthropic_api_key, .openai_api_key }) |account| {
         const result = accounts.refreshWithin(account, expired, fetchModels, Metadata.fetch);
         try std.testing.expectEqual(@as(?anyerror, error.Timeout), result.models_error);
         try std.testing.expectEqual(@as(?anyerror, error.Timeout), result.metadata_error);
@@ -1096,12 +1109,22 @@ test "a canceled list ends the fetch before the metadata request" {
     var accounts = testAccounts(.{ .anthropic = "sk-ant" }, false, false);
     const unbounded: net.Deadline = .{ .at = null };
 
-    const canceled = accounts.refreshWithin(.anthropic_api, unbounded, cancelList, refuseMetadata);
+    const canceled = accounts.refreshWithin(
+        .anthropic_api_key,
+        unbounded,
+        cancelList,
+        refuseMetadata,
+    );
     try std.testing.expectEqual(@as(?anyerror, error.Canceled), canceled.models_error);
     // The metadata double fails, so a null here proves that it never ran.
     try std.testing.expect(canceled.metadata_error == null);
 
-    const refused = accounts.refreshWithin(.anthropic_api, unbounded, refuseList, refuseMetadata);
+    const refused = accounts.refreshWithin(
+        .anthropic_api_key,
+        unbounded,
+        refuseList,
+        refuseMetadata,
+    );
     try std.testing.expectEqual(@as(?anyerror, error.ConnectionRefused), refused.models_error);
     try std.testing.expectEqual(
         @as(?anyerror, error.MetadataRequestFailed),
@@ -1116,7 +1139,7 @@ test "an OpenRouter fetch runs no list request and reports a failed body as the 
     const unbounded: net.Deadline = .{ .at = null };
 
     const failed = accounts.refreshWithin(
-        .openrouter_api,
+        .openrouter_api_key,
         unbounded,
         refuseList,
         refuseMetadata,
@@ -1125,7 +1148,7 @@ test "an OpenRouter fetch runs no list request and reports a failed body as the 
     try std.testing.expect(failed.metadata_error == null);
 
     const arrived = accounts.refreshWithin(
-        .openrouter_oauth,
+        .openrouter_api_login,
         unbounded,
         refuseList,
         openrouterMetadata,
@@ -1148,20 +1171,20 @@ test "an account lists the models of its own catalog entry" {
     defer for (std.enums.values(llm.Account)) |account|
         gpa.free(accounts.catalog.accounts.get(account));
 
-    try std.testing.expect(accounts.catalog.isEmpty(.openai_subscription));
-    try std.testing.expect(!accounts.offersModel(.openai_subscription));
-    try seedModel(&accounts, .openai_subscription, "gpt-5.6-sol");
-    try std.testing.expect(accounts.offersModel(.openai_subscription));
+    try std.testing.expect(accounts.catalog.isEmpty(.openai_sub_login));
+    try std.testing.expect(!accounts.offersModel(.openai_sub_login));
+    try seedModel(&accounts, .openai_sub_login, "gpt-5.6-sol");
+    try std.testing.expect(accounts.offersModel(.openai_sub_login));
 
     var listed: std.ArrayList(Model) = .empty;
     defer listed.deinit(gpa);
-    try accounts.listModels(.openai_subscription, &listed, gpa);
+    try accounts.listModels(.openai_sub_login, &listed, gpa);
     try std.testing.expectEqual(@as(usize, 1), listed.items.len);
     try std.testing.expectEqualStrings("gpt-5.6-sol", listed.items[0].name());
-    try std.testing.expect(accounts.findModel(.openai_subscription, "gpt-5.6-sol") != null);
+    try std.testing.expect(accounts.findModel(.openai_sub_login, "gpt-5.6-sol") != null);
 
     // The list of one account never reaches another.
-    try std.testing.expect(accounts.findModel(.openai_api, "gpt-5.6-sol") == null);
-    try std.testing.expect(accounts.catalog.isEmpty(.openai_api));
-    try std.testing.expect(!accounts.offersModel(.openai_api));
+    try std.testing.expect(accounts.findModel(.openai_api_key, "gpt-5.6-sol") == null);
+    try std.testing.expect(accounts.catalog.isEmpty(.openai_api_key));
+    try std.testing.expect(!accounts.offersModel(.openai_api_key));
 }

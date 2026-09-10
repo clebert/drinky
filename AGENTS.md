@@ -73,6 +73,26 @@ message from the user, because a bot message reads as a message that the bot wro
 
 `OpenRouter` names the provider alone.
 
+## Accounts vocabulary
+
+An account identifier reads `vendor-product-source`, as in `anthropic-api-login`. The enum tag
+spells it with `_`, and `Account.id()` is the only spelling for a store key, a picker row, an event,
+and the status line. A model under an account reads `account/model`.
+
+- **vendor**: The first segment, which is the `Provider` tag: `anthropic`, `openai`, `xai`,
+  `openrouter`, or `google`.
+- **sub**: A consumer subscription, as in Claude Pro or Max, ChatGPT, and SuperGrok. The short form
+  is the term, so it is not an abbreviation.
+- **api**: The developer API of the vendor, billed per token.
+- **cloud**: The cloud platform of the vendor, as in a Google Cloud project on the Agent Platform.
+  It is a product of its own, because the vendor also sells a developer API.
+- **Agent Platform**: The short form of Gemini Enterprise Agent Platform, the Google Cloud platform
+  that was Vertex AI. Name it in full with `(Vertex AI)` on the first mention of a document. Never
+  write **Gemini Enterprise** alone, because that is another Google product.
+- **login**: A credential from an interactive OAuth login. `Account.hasLogin()` is true.
+- **key**: A credential from an environment variable.
+- **keyfile**: A credential from a service account key file.
+
 ## Checks
 
 After a code change, run these commands:

@@ -786,7 +786,7 @@ const test_status: ui.status.Info = .{
     .context_window = 100_000,
     .model = "claude-opus-4-8",
     .effort = "high",
-    .account = .anthropic_subscription,
+    .account = .anthropic_sub_login,
     .quota = null,
     .quota_age_ms = 0,
     .credits = null,
@@ -1186,7 +1186,7 @@ test "the cursor follows a cleared transcript and moves back over dropped blocks
     defer chat.deinit();
     var blocks: Blocks = .{ .gpa = gpa };
     defer blocks.deinit();
-    try blocks.append(.thinking, .{ .account = .anthropic_subscription }, "weigh it");
+    try blocks.append(.thinking, .{ .account = .anthropic_sub_login }, "weigh it");
     try blocks.append(.model, .{}, "answer");
     var mirror = Mirror.init(gpa);
     try mirror.sync(&chat, &blocks.idle());

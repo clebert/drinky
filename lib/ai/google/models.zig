@@ -1,4 +1,4 @@
-//! The model list of the Google publisher on Vertex AI. The list names every
+//! The model list of the Google publisher on the Agent Platform. The list names every
 //! publisher model of the location, so the decoder keeps the Gemini models of
 //! the generation Drinky serves. An entry states the name and nothing else
 //! Drinky reads, so `Catalog.merge` fills the facts from the public metadata.

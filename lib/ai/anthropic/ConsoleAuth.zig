@@ -1,12 +1,13 @@
 //! The credential lifecycle for the Anthropic Console account: the shared
 //! `auth` login and store instantiated over `console`'s protocol for the
-//! `"anthropic_console"` entry in `<home>/.drinky/auth.json`. The login mints an
+//! `"anthropic-api-login"` entry in `<home>/.drinky/auth.json`. The login mints an
 //! API key and stores it. The key needs no refresh, so there is no
 //! `accessToken`: `apiKey` returns the stored key for the `x-api-key` header.
 
 const std = @import("std");
 
 const auth = @import("../auth.zig");
+const llm = @import("../llm.zig");
 const net = @import("../net.zig");
 const oauth_callback = @import("../oauth_callback.zig");
 const oauth_wire = @import("../oauth_wire.zig");
@@ -15,7 +16,7 @@ const console = @import("console.zig");
 const ConsoleAuth = @This();
 
 /// The top-level key this account's credential lives under in `auth.json`.
-const account_key = "anthropic_console";
+const account_key = llm.Account.anthropic_api_login.id();
 
 gpa: std.mem.Allocator,
 io: std.Io,
@@ -105,7 +106,7 @@ test "load reads the stored api key" {
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "auth.json",
-        .data = "{\"anthropic_console\":{\"api_key\":\"sk-ant-api03-x\"}}",
+        .data = "{\"anthropic-api-login\":{\"api_key\":\"sk-ant-api03-x\"}}",
     });
     var path_buf: [128]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/auth.json", .{tmp.sub_path});
@@ -127,7 +128,7 @@ test "load rejects an entry missing the api key" {
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "auth.json",
-        .data = "{\"anthropic_console\":{}}",
+        .data = "{\"anthropic-api-login\":{}}",
     });
     var path_buf: [128]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/auth.json", .{tmp.sub_path});

@@ -641,7 +641,7 @@ test "a row too wide for the window is cut and marked" {
     // A long row and a current value, because only a list with a current value
     // carries the tag.
     var picker = try testPicker(gpa, &.{
-        "claude-sonnet-5 (Anthropic Subscription)",
+        "anthropic-sub-login/claude-sonnet-5",
         "two\nrows in one option",
     }, 0);
     defer picker.deinit();
@@ -661,7 +661,7 @@ test "a row too wide for the window is cut and marked" {
     defer gpa.free(painted);
     // The tag states what the row is, so the cut takes the text it marks and
     // never the tag itself.
-    try std.testing.expect(std.mem.indexOf(u8, painted, " > claude-son… (Current)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, " > anthropic-… (Current)") != null);
     try std.testing.expectEqual(@as(usize, 7), block.paintedRows(painted));
     // The kept control rows hold whole segments, and the segment past the row
     // bound drops whole. Esc still cancels, so the drop costs no capability.
@@ -679,7 +679,7 @@ test "a row too wide for the window is cut and marked" {
 
     // A wider window recomposes the rows and shows what the cut dropped.
     try picker.reflow(.{ .columns = 80, .rows = 24 });
-    try std.testing.expect(std.mem.indexOf(u8, picker.content.items, "Subscription") != null);
+    try std.testing.expect(std.mem.indexOf(u8, picker.content.items, "claude-sonnet-5") != null);
     try std.testing.expect(std.mem.indexOf(u8, picker.content.items, "(Current)") != null);
 }
 

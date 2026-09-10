@@ -245,7 +245,7 @@ const keys = [_]Key{
     },
     .{
         .path = "request.google_idle_timeout_ms",
-        .description = "The time that Drinky waits between two streamed Google Vertex events. " ++
+        .description = "The time that Drinky waits between two streamed Google events. " ++
             "The stream can stay silent while the model thinks, so the default matches the " ++
             "OpenAI wait.",
     },
@@ -515,8 +515,9 @@ pub fn document(
         \\brackets show each array entry. Drinky ignores a key that it does not know, so a typo has
         \\no effect. The next start still succeeds and shows a warning that names each ignored key.
         \\The file holds no secret. An API key comes from the ANTHROPIC_API_KEY, the
-        \\OPENAI_API_KEY, the XAI_API_KEY, or the OPENROUTER_API_KEY variable. The Google Vertex
-        \\account reads the service account key file that GOOGLE_APPLICATION_CREDENTIALS names.
+        \\OPENAI_API_KEY, the XAI_API_KEY, or the OPENROUTER_API_KEY variable. The
+        \\google-cloud-keyfile account reads the service account key file that
+        \\GOOGLE_APPLICATION_CREDENTIALS names.
         \\GOOGLE_CLOUD_LOCATION is eu, us, or global.
         \\{s}
         \\### Models and effort
@@ -1182,7 +1183,7 @@ test "load reads the required skills in file order" {
 // them and keeps running.
 test "a stale default_models key reads as an unknown key" {
     var config = try loadDataForTest(
-        \\{ "default_models": { "anthropic_subscription": "claude-sonnet-5" } }
+        \\{ "default_models": { "anthropic-sub-login": "claude-sonnet-5" } }
     );
     defer config.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), config.unknown_keys.len);
@@ -1515,7 +1516,7 @@ test "the config load frees every partial allocation" {
         .sub_path = "config.json",
         .data =
         \\{ "user_instructions": [{ "path": "first.md" }, { "path": "missing.md" }],
-        \\  "default_models": { "openai_api": "nope" }, "default_effort": "nope",
+        \\  "default_models": { "openai-api-key": "nope" }, "default_effort": "nope",
         \\  "unknown": 1 }
         ,
     });

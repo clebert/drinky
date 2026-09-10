@@ -24,7 +24,7 @@ pub fn run(context: *Context) !Context.Outcome {
 
     var options: Context.Outcome.Options = .{ .gpa = context.gpa };
     errdefer options.deinit();
-    for (accounts) |account| try options.print("{s}", .{account.label()});
+    for (accounts) |account| try options.print("{s}", .{account.id()});
     return .{ .pick = .{
         .select = select,
         .title = "Sign out",
@@ -74,7 +74,7 @@ test "the picker lists only signed-in accounts, and none reports an error" {
             }
             try std.testing.expectEqualStrings("Sign out", pick.title);
             try std.testing.expectEqual(@as(usize, 1), pick.options.len);
-            try std.testing.expectEqualStrings("OpenAI Subscription", pick.options[0]);
+            try std.testing.expectEqualStrings("openai-sub-login", pick.options[0]);
         },
         else => return error.ExpectedPick,
     }
@@ -97,7 +97,7 @@ test "select names the chosen signed-in account, rejecting out of range" {
 
     switch (try select(&context, .{ .payload = 0, .row = 0 })) {
         .logout => |account| try std.testing.expectEqual(
-            llm.Account.anthropic_subscription,
+            llm.Account.anthropic_sub_login,
             account,
         ),
         else => return error.ExpectedLogout,

@@ -120,17 +120,21 @@ fn writeItem(
         .message => |*message| try writeMessage(stringify, message),
         // Only this exact account's complete Responses proof can replay here.
         .reasoning => |*reasoning| switch (reasoning.replay) {
-            inline .openai_subscription,
-            .openai_api,
-            .xai_subscription,
-            .xai_api,
-            .openrouter_oauth,
-            .openrouter_api,
+            inline .openai_sub_login,
+            .openai_api_key,
+            .xai_sub_login,
+            .xai_api_key,
+            .openrouter_api_login,
+            .openrouter_api_key,
             => |proof, tag| {
                 if (tag == account and proof.replayable(account.replaysPlainReasoning()))
                     try writeReasoning(stringify, &proof);
             },
-            .anthropic_subscription, .anthropic_api, .anthropic_console, .google_vertex => {},
+            .anthropic_sub_login,
+            .anthropic_api_key,
+            .anthropic_api_login,
+            .google_cloud_keyfile,
+            => {},
         },
         .tool_call => |*call| try writeToolCall(stringify, call),
         .tool_result => |*result| try writeToolResult(stringify, gpa, result),
@@ -267,7 +271,7 @@ test serialize {
         .items = &items,
         .tools = &tools,
         .reasoning = .{ .named = .high },
-    }, .openai_api);
+    }, .openai_api_key);
     defer std.testing.allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
@@ -321,7 +325,7 @@ test "prompt_cache_key is sent when set and omitted when empty" {
         .items = &items,
         .tools = &.{},
         .cache_key = "session-abc",
-    }, .openai_api);
+    }, .openai_api_key);
     defer std.testing.allocator.free(with_key);
     {
         const parsed =
@@ -339,7 +343,7 @@ test "prompt_cache_key is sent when set and omitted when empty" {
         .system = "s",
         .items = &items,
         .tools = &.{},
-    }, .openai_api);
+    }, .openai_api_key);
     defer std.testing.allocator.free(no_key);
     {
         const parsed =
@@ -366,7 +370,7 @@ test "tool_call arguments serialize as a JSON string, error output is prefixed" 
         .system = "s",
         .items = &items,
         .tools = &.{},
-    }, .openai_api);
+    }, .openai_api_key);
     defer std.testing.allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
@@ -402,7 +406,7 @@ test "a synthetic error result emits one function_call_output with one Error pre
         .system = "s",
         .items = &items,
         .tools = &.{},
-    }, .openai_api);
+    }, .openai_api_key);
     defer std.testing.allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
@@ -425,21 +429,21 @@ test "a synthetic error result emits one function_call_output with one Error pre
 test "reasoning replays only the active account's complete proof" {
     const items = [_]llm.Item{
         .{ .reasoning = .{
-            .replay = .{ .openai_subscription = .{
+            .replay = .{ .openai_sub_login = .{
                 .text = "weigh it",
                 .id = "rs_1",
                 .encrypted_content = "enc",
             } },
         } },
         .{ .reasoning = .{
-            .replay = .{ .openai_api = .{
+            .replay = .{ .openai_api_key = .{
                 .text = "foreign",
                 .id = "rs_other",
                 .encrypted_content = "other",
             } },
         } },
         .{ .reasoning = .{
-            .replay = .{ .openai_subscription = .{
+            .replay = .{ .openai_sub_login = .{
                 .text = "no blob",
                 .id = "rs_2",
                 .encrypted_content = "",
@@ -453,7 +457,7 @@ test "reasoning replays only the active account's complete proof" {
         .system = "s",
         .items = &items,
         .tools = &.{},
-    }, .openai_subscription);
+    }, .openai_sub_login);
     defer std.testing.allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
@@ -475,7 +479,9 @@ test "reasoning replays only the active account's complete proof" {
     // Grok request replays none of the OpenAI items above.
     const grok_items = [_]llm.Item{
         .{ .reasoning = .{
-            .replay = .{ .xai_api = .{ .text = "", .id = "rs_x", .encrypted_content = "xenc" } },
+            .replay = .{
+                .xai_api_key = .{ .text = "", .id = "rs_x", .encrypted_content = "xenc" },
+            },
         } },
     } ++ items;
     const grok_body = try serialize(std.testing.allocator, &.{
@@ -484,7 +490,7 @@ test "reasoning replays only the active account's complete proof" {
         .system = "s",
         .items = &grok_items,
         .tools = &.{},
-    }, .xai_api);
+    }, .xai_api_key);
     defer std.testing.allocator.free(grok_body);
     const grok_parsed = try std.json.parseFromSlice(
         std.json.Value,
@@ -509,7 +515,7 @@ test "assistant text uses output_text, and no control omits reasoning" {
         .system = "s",
         .items = &items,
         .tools = &.{},
-    }, .openai_api);
+    }, .openai_api_key);
     defer std.testing.allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
@@ -527,7 +533,7 @@ test "assistant text uses output_text, and no control omits reasoning" {
 // above can miss.
 const golden_items = [_]llm.Item{
     .{ .message = .{ .role = .user, .text = "first" } },
-    .{ .reasoning = .{ .replay = .{ .openai_api = .{
+    .{ .reasoning = .{ .replay = .{ .openai_api_key = .{
         .text = "think",
         .id = "rs_1",
         .encrypted_content = "enc1",
@@ -539,7 +545,7 @@ const golden_items = [_]llm.Item{
     } },
     .{ .message = .{ .role = .assistant, .text = "checking" } },
     .{ .tool_result = .{ .call_id = "call_1", .content = "contents", .is_error = false } },
-    .{ .reasoning = .{ .replay = .{ .openai_api = .{
+    .{ .reasoning = .{ .replay = .{ .openai_api_key = .{
         .text = "",
         .id = "rs_2",
         .encrypted_content = "enc2",
@@ -550,7 +556,7 @@ const golden_items = [_]llm.Item{
         .arguments_json = "{\"path\":\"b\"}",
     } },
     .{ .tool_result = .{ .call_id = "call_2", .content = "denied", .is_error = true } },
-    .{ .reasoning = .{ .replay = .{ .openai_subscription = .{
+    .{ .reasoning = .{ .replay = .{ .openai_sub_login = .{
         .text = "foreign",
         .id = "rs_3",
         .encrypted_content = "enc3",
@@ -575,26 +581,26 @@ test "serialized bytes match the expected Responses wire output" {
         .items = &golden_items,
         .tools = &tools,
         .reasoning = .{ .named = .xhigh },
-    }, .openai_api);
+    }, .openai_api_key);
     defer std.testing.allocator.free(body);
     try std.testing.expectEqualStrings(golden, body);
 }
 
 test "an OpenRouter request requires parameters and replays its own proof" {
     const items = [_]llm.Item{
-        .{ .reasoning = .{ .replay = .{ .openrouter_api = .{
+        .{ .reasoning = .{ .replay = .{ .openrouter_api_key = .{
             .text = "think",
             .id = "rs_or",
             .encrypted_content = "enc",
             .raw_text = "raw reasoning",
         } } } },
-        .{ .reasoning = .{ .replay = .{ .openrouter_oauth = .{
+        .{ .reasoning = .{ .replay = .{ .openrouter_api_login = .{
             .text = "foreign summary",
             .id = "rs_foreign",
             .encrypted_content = "",
             .raw_text = "foreign reasoning",
         } } } },
-        .{ .reasoning = .{ .replay = .{ .openrouter_api = .{
+        .{ .reasoning = .{ .replay = .{ .openrouter_api_key = .{
             .text = "",
             .id = "rs_plain",
             .encrypted_content = "",
@@ -612,7 +618,7 @@ test "an OpenRouter request requires parameters and replays its own proof" {
         .system = "s",
         .items = &items,
         .tools = &tools,
-    }, .openrouter_api);
+    }, .openrouter_api_key);
     defer std.testing.allocator.free(body);
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
     defer parsed.deinit();
@@ -635,10 +641,10 @@ test "an OpenRouter request requires parameters and replays its own proof" {
     try std.testing.expectEqualStrings("plain reasoning", plain_part.get("text").?.string);
 
     inline for (.{
-        llm.Account.openai_subscription,
-        llm.Account.openai_api,
-        llm.Account.xai_subscription,
-        llm.Account.xai_api,
+        llm.Account.openai_sub_login,
+        llm.Account.openai_api_key,
+        llm.Account.xai_sub_login,
+        llm.Account.xai_api_key,
     }) |account| {
         const direct = try serialize(std.testing.allocator, &.{
             .model = "model",

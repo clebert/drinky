@@ -1,4 +1,4 @@
-//! The Gemini `streamGenerateContent` transport of Vertex AI. It sends a
+//! The Gemini `streamGenerateContent` transport of the Agent Platform. It sends a
 //! serialized request and exposes the response as a pull stream of decoded SSE
 //! chunks on the shared `sse` engine. It knows nothing about conversation state
 //! or tools. It turns bytes into `Event`s.
@@ -153,7 +153,7 @@ pub const Stream = struct {
         return self.events.items[self.event_index];
     }
 
-    /// Vertex reports no allowance in the head.
+    /// The Agent Platform reports no allowance in the head.
     pub fn quotaSoFar(_: *const Stream) ?llm.Quota {
         return null;
     }

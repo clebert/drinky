@@ -262,14 +262,14 @@ test "the first overflow separates the title from the complete control legend" {
 test "a narrow caption cuts its one-row title and packs whole controls" {
     const gpa = std.testing.allocator;
     const caption: Caption = .{
-        .title = "Model: Anthropic Subscription",
+        .title = "Model: anthropic-sub-login",
         .controls = "↑/↓: Move · Enter: Select · Esc: Cancel",
     };
     try std.testing.expectEqual(@as(usize, 4), caption.rows(14));
     const plain = try plainRendered(gpa, &caption, 14);
     defer gpa.free(plain);
     try std.testing.expectEqualStrings(
-        "Model: Anthro…\r\n↑/↓: Move\r\nEnter: Select\r\nEsc: Cancel",
+        "Model: anthro…\r\n↑/↓: Move\r\nEnter: Select\r\nEsc: Cancel",
         plain,
     );
 }
@@ -296,7 +296,7 @@ test "a lone overwide control segment cuts and never wraps on" {
 test "a bounded split drops the control segments past its row bound" {
     const gpa = std.testing.allocator;
     const caption: Caption = .{
-        .title = "Model: Anthropic Subscription",
+        .title = "Model: anthropic-sub-login",
         .controls = "↑/↓: Move · Enter: Select · Esc: Cancel",
         .rows_max = 3,
     };
@@ -304,7 +304,7 @@ test "a bounded split drops the control segments past its row bound" {
     const plain = try plainRendered(gpa, &caption, 14);
     defer gpa.free(plain);
     try std.testing.expectEqualStrings(
-        "Model: Anthro…\r\n↑/↓: Move\r\nEnter: Select",
+        "Model: anthro…\r\n↑/↓: Move\r\nEnter: Select",
         plain,
     );
 }
@@ -312,14 +312,14 @@ test "a bounded split drops the control segments past its row bound" {
 test "a bounded caption keeps one title row before the controls" {
     const gpa = std.testing.allocator;
     const caption: Caption = .{
-        .title = "Model: Anthropic Subscription",
+        .title = "Model: anthropic-sub-login",
         .controls = "Esc: Close",
         .rows_max = 2,
     };
     try std.testing.expectEqual(@as(usize, 2), caption.rows(14));
     const plain = try plainRendered(gpa, &caption, 14);
     defer gpa.free(plain);
-    try std.testing.expectEqualStrings("Model: Anthro…\r\nEsc: Close", plain);
+    try std.testing.expectEqualStrings("Model: anthro…\r\nEsc: Close", plain);
 }
 
 // One row sheds whole segments from the tail as the window narrows, keeps the

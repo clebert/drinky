@@ -201,7 +201,7 @@ pub fn dropAccount(self: *Catalog, account: llm.Account) void {
     self.gpa.free(self.accounts.get(account));
     self.accounts.set(account, &.{});
     if (self.models_path.len == 0) return;
-    json_store.remove(self.gpa, self.io, self.models_path, @tagName(account)) catch {};
+    json_store.remove(self.gpa, self.io, self.models_path, account.id()) catch {};
 }
 
 /// Replace the public metadata and write it through.
@@ -217,7 +217,7 @@ fn loadAccounts(self: *Catalog) void {
     var file = (json_store.open(self.gpa, self.io, self.models_path) catch return) orelse return;
     defer file.deinit();
     for (std.enums.values(llm.Account)) |account| {
-        const entry = file.entry(@tagName(account)) orelse continue;
+        const entry = file.entry(account.id()) orelse continue;
         const listed = json.array(entry.get(models_key)) orelse continue;
         const models = self.decodeList(listed) catch continue;
         self.gpa.free(self.accounts.get(account));
@@ -260,7 +260,7 @@ fn saveAccount(self: *Catalog, account: llm.Account) !void {
     var arena: std.heap.ArenaAllocator = .init(self.gpa);
     defer arena.deinit();
     const encoded = try encodeList(arena.allocator(), self.accounts.get(account));
-    try json_store.save(self.gpa, self.io, self.models_path, @tagName(account), .{
+    try json_store.save(self.gpa, self.io, self.models_path, account.id(), .{
         .models = encoded,
     }, .{});
 }
@@ -410,13 +410,13 @@ fn vendorModel(name: []const u8, window: ?u64, level: ?llm.Effort) Model {
 test "a catalog with no path holds its models in memory" {
     const gpa = std.testing.allocator;
     var catalog = testCatalog(gpa);
-    defer gpa.free(catalog.accounts.get(.anthropic_api));
+    defer gpa.free(catalog.accounts.get(.anthropic_api_key));
 
     const kept = [_]Model{vendorModel("kept", 10, .high)};
-    try catalog.setAccount(.anthropic_api, &kept);
-    try std.testing.expect(!catalog.isEmpty(.anthropic_api));
-    catalog.dropAccount(.anthropic_api);
-    try std.testing.expect(catalog.isEmpty(.anthropic_api));
+    try catalog.setAccount(.anthropic_api_key, &kept);
+    try std.testing.expect(!catalog.isEmpty(.anthropic_api_key));
+    catalog.dropAccount(.anthropic_api_key);
+    try std.testing.expect(catalog.isEmpty(.anthropic_api_key));
 }
 
 test "the vendor wins every field it states and the aggregator fills the rest" {
@@ -428,8 +428,8 @@ test "the vendor wins every field it states and the aggregator fills the rest" {
     var vendor = vendorModel("gpt-5.6-sol", 272_000, .high);
     vendor.tokens_max = null;
     const vendor_models = [_]Model{vendor};
-    catalog.accounts.set(.openai_subscription, try gpa.dupe(Model, &vendor_models));
-    defer gpa.free(catalog.accounts.get(.openai_subscription));
+    catalog.accounts.set(.openai_sub_login, try gpa.dupe(Model, &vendor_models));
+    defer gpa.free(catalog.accounts.get(.openai_sub_login));
 
     var public = Model.init("gpt-5.6-sol") catch unreachable;
     public.context_window = 1_050_000;
@@ -440,7 +440,7 @@ test "the vendor wins every field it states and the aggregator fills the rest" {
     catalog.metadata = try gpa.dupe(Metadata.Entry, &entries);
     defer gpa.free(catalog.metadata);
 
-    const merged = catalog.find(.openai_subscription, "gpt-5.6-sol").?;
+    const merged = catalog.find(.openai_sub_login, "gpt-5.6-sol").?;
     try std.testing.expectEqual(@as(?u64, 272_000), merged.context_window);
     // The vendor named a level, so its list stands whole.
     try std.testing.expect(merged.offers(.high));
@@ -459,8 +459,8 @@ test "a vendor that states no reasoning keeps every aggregator level out" {
     var vendor = vendorModel("claude-haiku-4-5-20251001", 200_000, null);
     vendor.thinking = .unsupported;
     const vendor_models = [_]Model{vendor};
-    catalog.accounts.set(.anthropic_api, try gpa.dupe(Model, &vendor_models));
-    defer gpa.free(catalog.accounts.get(.anthropic_api));
+    catalog.accounts.set(.anthropic_api_key, try gpa.dupe(Model, &vendor_models));
+    defer gpa.free(catalog.accounts.get(.anthropic_api_key));
 
     var public = Model.init("claude-haiku-4.5") catch unreachable;
     public.thinking = .supported;
@@ -470,7 +470,7 @@ test "a vendor that states no reasoning keeps every aggregator level out" {
     catalog.metadata = try gpa.dupe(Metadata.Entry, &entries);
     defer gpa.free(catalog.metadata);
 
-    const merged = catalog.find(.anthropic_api, "claude-haiku-4-5-20251001").?;
+    const merged = catalog.find(.anthropic_api_key, "claude-haiku-4-5-20251001").?;
     try std.testing.expectEqual(Model.Thinking.unsupported, merged.thinking);
     try std.testing.expectEqual(@as(usize, 0), merged.efforts.count());
     for (std.enums.values(llm.Effort)) |level| {
@@ -487,8 +487,8 @@ test "a vendor that denies the effort control keeps every aggregator level out" 
     var vendor = vendorModel("claude-fable-5", 200_000, null);
     vendor.efforts_denied = true;
     const vendor_models = [_]Model{vendor};
-    catalog.accounts.set(.anthropic_api, try gpa.dupe(Model, &vendor_models));
-    defer gpa.free(catalog.accounts.get(.anthropic_api));
+    catalog.accounts.set(.anthropic_api_key, try gpa.dupe(Model, &vendor_models));
+    defer gpa.free(catalog.accounts.get(.anthropic_api_key));
 
     var public = Model.init("claude-fable-5") catch unreachable;
     public.thinking = .supported;
@@ -497,7 +497,7 @@ test "a vendor that denies the effort control keeps every aggregator level out" 
     catalog.metadata = try gpa.dupe(Metadata.Entry, &entries);
     defer gpa.free(catalog.metadata);
 
-    const merged = catalog.find(.anthropic_api, "claude-fable-5").?;
+    const merged = catalog.find(.anthropic_api_key, "claude-fable-5").?;
     // The aggregator still states the thinking state.
     try std.testing.expectEqual(Model.Thinking.supported, merged.thinking);
     try std.testing.expect(!merged.offers(.high));
@@ -511,8 +511,8 @@ test "an aggregator that states no reasoning keeps the levels of the vendor" {
     var catalog = testCatalog(gpa);
 
     const vendor_models = [_]Model{vendorModel("claude-opus-4-8", 1_000_000, .high)};
-    catalog.accounts.set(.anthropic_api, try gpa.dupe(Model, &vendor_models));
-    defer gpa.free(catalog.accounts.get(.anthropic_api));
+    catalog.accounts.set(.anthropic_api_key, try gpa.dupe(Model, &vendor_models));
+    defer gpa.free(catalog.accounts.get(.anthropic_api_key));
 
     var public = Model.init("claude-opus-4.8") catch unreachable;
     public.thinking = .unsupported;
@@ -520,7 +520,7 @@ test "an aggregator that states no reasoning keeps the levels of the vendor" {
     catalog.metadata = try gpa.dupe(Metadata.Entry, &entries);
     defer gpa.free(catalog.metadata);
 
-    const merged = catalog.find(.anthropic_api, "claude-opus-4-8").?;
+    const merged = catalog.find(.anthropic_api_key, "claude-opus-4-8").?;
     try std.testing.expectEqual(Model.Thinking.unknown, merged.thinking);
     try std.testing.expect(merged.offers(.high));
     try std.testing.expectEqual(llm.Effort.high, merged.reasoning(.high).named);
@@ -536,10 +536,10 @@ test "a model that no source describes is not offered" {
         vendorModel("text-embedding-3-large", null, null),
         vendorModel("gpt-5.6-sol", null, null),
     };
-    catalog.accounts.set(.openai_api, try gpa.dupe(Model, &vendor_models));
-    defer gpa.free(catalog.accounts.get(.openai_api));
+    catalog.accounts.set(.openai_api_key, try gpa.dupe(Model, &vendor_models));
+    defer gpa.free(catalog.accounts.get(.openai_api_key));
 
-    try std.testing.expect(catalog.isEmpty(.openai_api));
+    try std.testing.expect(catalog.isEmpty(.openai_api_key));
 
     var public = Model.init("gpt-5.6-sol") catch unreachable;
     public.context_window = 1_050_000;
@@ -548,12 +548,12 @@ test "a model that no source describes is not offered" {
     catalog.metadata = try gpa.dupe(Metadata.Entry, &entries);
     defer gpa.free(catalog.metadata);
 
-    try std.testing.expect(!catalog.isEmpty(.openai_api));
-    try std.testing.expect(catalog.find(.openai_api, "text-embedding-3-large") == null);
+    try std.testing.expect(!catalog.isEmpty(.openai_api_key));
+    try std.testing.expect(catalog.find(.openai_api_key, "text-embedding-3-large") == null);
 
     var listed: std.ArrayList(Model) = .empty;
     defer listed.deinit(gpa);
-    try catalog.list(.openai_api, &listed, gpa);
+    try catalog.list(.openai_api_key, &listed, gpa);
     try std.testing.expectEqual(@as(usize, 1), listed.items.len);
     try std.testing.expectEqualStrings("gpt-5.6-sol", listed.items[0].name());
     try std.testing.expectEqual(@as(?u64, 1_050_000), listed.items[0].context_window);
@@ -564,8 +564,8 @@ test "metadata of one vendor never reaches the account of another" {
     var catalog = testCatalog(gpa);
 
     const vendor_models = [_]Model{vendorModel("shared-name", null, .high)};
-    catalog.accounts.set(.anthropic_api, try gpa.dupe(Model, &vendor_models));
-    defer gpa.free(catalog.accounts.get(.anthropic_api));
+    catalog.accounts.set(.anthropic_api_key, try gpa.dupe(Model, &vendor_models));
+    defer gpa.free(catalog.accounts.get(.anthropic_api_key));
 
     var public = Model.init("shared-name") catch unreachable;
     public.price = .{ .input = 1, .output = 2, .cache_read = 0, .cache_write = 0 };
@@ -573,7 +573,7 @@ test "metadata of one vendor never reaches the account of another" {
     catalog.metadata = try gpa.dupe(Metadata.Entry, &entries);
     defer gpa.free(catalog.metadata);
 
-    try std.testing.expect(catalog.find(.anthropic_api, "shared-name").?.price == null);
+    try std.testing.expect(catalog.find(.anthropic_api_key, "shared-name").?.price == null);
 }
 
 test "a stored model survives a round trip through both files" {
@@ -609,7 +609,7 @@ test "a stored model survives a round trip through both files" {
     };
     var alias = Model.init("grok-4.20") catch unreachable;
     alias.serveAs("grok-4.20-0309-reasoning") catch unreachable;
-    try written.setAccount(.anthropic_subscription, &.{ model, alias });
+    try written.setAccount(.anthropic_sub_login, &.{ model, alias });
 
     var bare = Model.init("public-only") catch unreachable;
     bare.context_window = 200_000;
@@ -620,7 +620,7 @@ test "a stored model survives a round trip through both files" {
     var read = try init(gpa, io, home);
     defer read.deinit();
 
-    const restored = read.find(.anthropic_subscription, "claude-opus-4-8").?;
+    const restored = read.find(.anthropic_sub_login, "claude-opus-4-8").?;
     try std.testing.expectEqual(@as(?u64, 1_000_000), restored.context_window);
     try std.testing.expectEqual(@as(?u32, 128_000), restored.tokens_max);
     try std.testing.expectEqual(Model.Thinking.supported, restored.thinking);
@@ -644,7 +644,7 @@ test "a stored model survives a round trip through both files" {
     // reads as the model of the alias after a restart.
     try std.testing.expectEqualStrings(
         "grok-4.20-0309-reasoning",
-        read.accounts.get(.anthropic_subscription)[1].servedName(),
+        read.accounts.get(.anthropic_sub_login)[1].servedName(),
     );
     // The metadata file survives its own round trip, under its vendor.
     try std.testing.expectEqual(@as(usize, 1), read.metadata.len);
@@ -655,10 +655,10 @@ test "a stored model survives a round trip through both files" {
 
     // A dropped account leaves the file without its key, and the metadata
     // stands, because it belongs to no principal.
-    read.dropAccount(.anthropic_subscription);
+    read.dropAccount(.anthropic_sub_login);
     var reopened = try init(gpa, io, home);
     defer reopened.deinit();
-    try std.testing.expect(reopened.isEmpty(.anthropic_subscription));
+    try std.testing.expect(reopened.isEmpty(.anthropic_sub_login));
     try std.testing.expectEqual(@as(usize, 1), reopened.metadata.len);
 }
 
@@ -691,9 +691,9 @@ test "a locked cache file keeps the fetched list of this session" {
     defer held.close(io);
 
     const fetched = [_]Model{vendorModel("claude-opus-4-8", 1_000_000, .high)};
-    try std.testing.expectError(error.StoreBusy, catalog.setAccount(.anthropic_api, &fetched));
-    try std.testing.expect(!catalog.isEmpty(.anthropic_api));
-    try std.testing.expect(catalog.find(.anthropic_api, "claude-opus-4-8") != null);
+    try std.testing.expectError(error.StoreBusy, catalog.setAccount(.anthropic_api_key, &fetched));
+    try std.testing.expect(!catalog.isEmpty(.anthropic_api_key));
+    try std.testing.expect(catalog.find(.anthropic_api_key, "claude-opus-4-8") != null);
 }
 
 // A cache holds what a vendor stated, so a limit that is not a count states
@@ -772,7 +772,7 @@ test "a missing or unreadable cache leaves an empty catalog" {
     // rather than with an error.
     var broken = try init(gpa, io, home);
     defer broken.deinit();
-    try std.testing.expect(broken.isEmpty(.anthropic_api));
+    try std.testing.expect(broken.isEmpty(.anthropic_api_key));
     try std.testing.expectEqual(@as(usize, 0), broken.metadata.len);
 }
 
@@ -781,8 +781,8 @@ test "a merged model without tool support is not offered" {
     var catalog = testCatalog(gpa);
 
     const vendor_models = [_]Model{vendorModel("gpt-5.6-sol", 272_000, .high)};
-    catalog.accounts.set(.openai_api, try gpa.dupe(Model, &vendor_models));
-    defer gpa.free(catalog.accounts.get(.openai_api));
+    catalog.accounts.set(.openai_api_key, try gpa.dupe(Model, &vendor_models));
+    defer gpa.free(catalog.accounts.get(.openai_api_key));
 
     var public = Model.init("gpt-5.6-sol") catch unreachable;
     public.tools = .unsupported;
@@ -791,8 +791,8 @@ test "a merged model without tool support is not offered" {
     catalog.metadata = try gpa.dupe(Metadata.Entry, &entries);
     defer gpa.free(catalog.metadata);
 
-    try std.testing.expect(catalog.find(.openai_api, "gpt-5.6-sol") == null);
-    try std.testing.expect(catalog.isEmpty(.openai_api));
+    try std.testing.expect(catalog.find(.openai_api_key, "gpt-5.6-sol") == null);
+    try std.testing.expect(catalog.isEmpty(.openai_api_key));
 }
 
 test "an OpenRouter account reads the public list and never the account cache" {
@@ -802,10 +802,10 @@ test "an OpenRouter account reads the public list and never the account cache" {
     // `setAccount` refuses this account, so the stray list goes in by hand. No
     // read path may return it.
     const stray = [_]Model{vendorModel("ignored", 10, .high)};
-    catalog.accounts.set(.openrouter_api, try gpa.dupe(Model, &stray));
-    defer gpa.free(catalog.accounts.get(.openrouter_api));
-    try std.testing.expect(catalog.isEmpty(.openrouter_api));
-    try std.testing.expect(catalog.isEmpty(.openrouter_oauth));
+    catalog.accounts.set(.openrouter_api_key, try gpa.dupe(Model, &stray));
+    defer gpa.free(catalog.accounts.get(.openrouter_api_key));
+    try std.testing.expect(catalog.isEmpty(.openrouter_api_key));
+    try std.testing.expect(catalog.isEmpty(.openrouter_api_login));
 
     var listed_model = Model.init("openai/gpt-5.6-sol") catch unreachable;
     listed_model.context_window = 1_050_000;
@@ -814,16 +814,16 @@ test "an OpenRouter account reads the public list and never the account cache" {
     catalog.metadata = try gpa.dupe(Metadata.Entry, &entries);
     defer gpa.free(catalog.metadata);
 
-    try std.testing.expect(!catalog.isEmpty(.openrouter_api));
-    try std.testing.expect(!catalog.isEmpty(.openrouter_oauth));
+    try std.testing.expect(!catalog.isEmpty(.openrouter_api_key));
+    try std.testing.expect(!catalog.isEmpty(.openrouter_api_login));
     try std.testing.expectEqualStrings(
         "openai/gpt-5.6-sol",
-        catalog.find(.openrouter_oauth, "openai/gpt-5.6-sol").?.name(),
+        catalog.find(.openrouter_api_login, "openai/gpt-5.6-sol").?.name(),
     );
 
     var listed: std.ArrayList(Model) = .empty;
     defer listed.deinit(gpa);
-    try catalog.list(.openrouter_api, &listed, gpa);
+    try catalog.list(.openrouter_api_key, &listed, gpa);
     try std.testing.expectEqual(@as(usize, 1), listed.items.len);
     try std.testing.expectEqualStrings("openai/gpt-5.6-sol", listed.items[0].name());
 }

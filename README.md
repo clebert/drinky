@@ -9,7 +9,7 @@ in the working directory. Drinky talks to:
 - OpenAI
 - xAI
 - OpenRouter
-- Gemini on Google Vertex AI
+- Gemini Enterprise Agent Platform (Vertex AI)
 
 Drinky is a single Zig program. It needs no Node.js runtime or third-party package tree, so a
 complete review covers Drinky and the Zig standard library. Use Drinky as it is, or fork it and add
@@ -45,20 +45,25 @@ zig build -Doptimize=ReleaseSafe
 
 ## Sign in
 
-Run `/login` to sign in with a subscription account, an Anthropic Console account, or an OpenRouter
-account. The Console login and the OpenRouter login mint an API key in the browser and store it, so
-no environment variable is needed. The xAI subscription (SuperGrok or X Premium) signs in with a
-device code. You can also set `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `XAI_API_KEY`, or
-`OPENROUTER_API_KEY` by hand. For Gemini on Google Vertex AI, set `GOOGLE_APPLICATION_CREDENTIALS`
-to a service account key file and `GOOGLE_CLOUD_LOCATION` to `eu`, `us`, or `global`. Drinky serves
-Gemini 3 and later.
+An account reads `vendor-product-source`, and a model under it reads `account/model`, as in
+`anthropic-sub-login/claude-opus-4-8`.
 
-An API key or a service account key file uses the public provider API. A subscription login uses an
-unsupported provider interface that can change or stop working. The Console key bills at API rates
-over the public API, but the login that mints it is unsupported. See the implementation notes for
-[Anthropic](lib/ai/anthropic/root.zig), [OpenAI](lib/ai/openai/oauth.zig), and
-[xAI](lib/ai/xai/oauth.zig). The [OpenRouter](lib/ai/openrouter/oauth.zig) login follows the
-documented OAuth flow of OpenRouter, and the key it mints bills like any other OpenRouter key.
+| Account                | Credential                                                   |
+| ---------------------- | ------------------------------------------------------------ |
+| `anthropic-sub-login`  | Claude Pro or Max login                                      |
+| `anthropic-api-login`  | Anthropic Console login, which mints and stores an API key   |
+| `anthropic-api-key`    | `ANTHROPIC_API_KEY`                                          |
+| `openai-sub-login`     | ChatGPT login                                                |
+| `openai-api-key`       | `OPENAI_API_KEY`                                             |
+| `xai-sub-login`        | SuperGrok or X Premium login with a device code              |
+| `xai-api-key`          | `XAI_API_KEY`                                                |
+| `openrouter-api-login` | OpenRouter login, which mints and stores an API key          |
+| `openrouter-api-key`   | `OPENROUTER_API_KEY`                                         |
+| `google-cloud-keyfile` | `GOOGLE_APPLICATION_CREDENTIALS` and `GOOGLE_CLOUD_LOCATION` |
+
+Run `/login` to sign in with a `login` account. Set the variable of a `key` account by hand. For
+`google-cloud-keyfile`, set `GOOGLE_APPLICATION_CREDENTIALS` to an Agent Platform service account
+key file and `GOOGLE_CLOUD_LOCATION` to `eu`, `us`, or `global`.
 
 Drinky is not affiliated with Anthropic, OpenAI, xAI, OpenRouter, or Google.
 

@@ -68,7 +68,7 @@ pub fn run(context: *Context) !Context.Outcome {
     var current: ?usize = null;
     const active_account = activeAccount(context);
     for (vendors, 0..) |vendor, index| {
-        try options.print("{s}", .{vendor.label()});
+        try options.print("{s}", .{@tagName(vendor)});
         if (active_account) |account| {
             if (account.provider() == vendor) current = index;
         }
@@ -113,7 +113,7 @@ fn accountStep(context: *Context, vendor: llm.Provider) !Context.Outcome {
     var current: ?usize = null;
     const active_account = activeAccount(context);
     for (list, 0..) |account, index| {
-        try options.print("{s}", .{account.label()});
+        try options.print("{s}", .{account.id()});
         if (active_account) |active| {
             if (active == account) current = index;
         }
@@ -186,7 +186,7 @@ fn authorStep(context: *Context, account: llm.Account) !Context.Outcome {
         gpa,
         .warning,
         "Fetch the model list of {s} with /model in the terminal first.",
-        .{account.label()},
+        .{account.id()},
     );
 
     const authors = try gpa.alloc(AuthorRow, @max(list.items.len, 1));
@@ -314,7 +314,7 @@ fn authorStepOf(comptime account: llm.Account) ModelStep {
                 return authorStep(context, account);
             }
         }.open,
-        .title = comptime "Author: " ++ account.label(),
+        .title = comptime "Author: " ++ account.id(),
     };
 }
 
@@ -382,7 +382,7 @@ fn authorModelsOf(comptime account: llm.Account) ModelStep {
                 return authorStep(context, account);
             }
         }.open,
-        .title = comptime "Model: " ++ account.label(),
+        .title = comptime "Model: " ++ account.id(),
     };
 }
 
@@ -401,7 +401,7 @@ fn modelStep(context: *Context, account: llm.Account) !Context.Outcome {
         gpa,
         .warning,
         "Fetch the model list of {s} with /model in the terminal first.",
-        .{account.label()},
+        .{account.id()},
     );
 
     var options: Context.Outcome.Options = .{ .gpa = gpa };
@@ -484,7 +484,7 @@ fn modelStepOf(comptime account: llm.Account) ModelStep {
                 return modelStep(context, account);
             }
         }.open,
-        .title = comptime "Model: " ++ account.label(),
+        .title = comptime "Model: " ++ account.id(),
     };
 }
 
@@ -498,15 +498,15 @@ fn apply(context: *Context, account: llm.Account, model: *const Model) !Context.
     if (isCurrent(context, account, model)) return Context.Outcome.reportNotice(
         gpa,
         .information,
-        "Drinky already uses {s} with {s}.",
-        .{ model.name(), account.label() },
+        "Drinky already uses {s}/{s}.",
+        .{ account.id(), model.name() },
     );
     context.agent.switchTo(context.accounts.client(account).?, model.*);
     return Context.Outcome.reportEvent(
         gpa,
         .information,
-        "Drinky now uses {s} with {s}.",
-        .{ model.name(), account.label() },
+        "Drinky now uses {s}/{s}.",
+        .{ account.id(), model.name() },
     );
 }
 
@@ -611,14 +611,14 @@ fn fetchFailure(
         gpa,
         .failure,
         "Drinky could not fetch the model list of {s} because of error {t}.",
-        .{ account.label(), models_failure },
+        .{ account.id(), models_failure },
     );
     return Context.Outcome.reportEvent(
         gpa,
         .failure,
         "Drinky could not fetch the model list of {s} because of error {t}. Drinky could not " ++
             "save the public metadata because of error {t}. The metadata serves this session.",
-        .{ account.label(), models_failure, cache_failure },
+        .{ account.id(), models_failure, cache_failure },
     );
 }
 
@@ -657,20 +657,20 @@ fn fetchReport(
             .failure,
             metadata_gone_head ++ " Drinky could not save the model list because of error " ++
                 "{t}. The list serves this session.{s}",
-            .{ account.label(), metadata_failure, save_failure, empty },
+            .{ account.id(), metadata_failure, save_failure, empty },
         );
         if (result.count == 0) return try Context.Outcome.Message.print(
             gpa,
             .failure,
             metadata_gone_head ++ "{s}",
-            .{ account.label(), metadata_failure, empty },
+            .{ account.id(), metadata_failure, empty },
         );
         return try Context.Outcome.Message.print(
             gpa,
             .failure,
             metadata_gone_head ++ " The account offers {d} model{s} now.",
             .{
-                account.label(),
+                account.id(),
                 metadata_failure,
                 result.count,
                 format.pluralSuffix(result.count),
@@ -684,14 +684,14 @@ fn fetchReport(
             "Drinky fetched the model list of {s}. Drinky could not save the model list " ++
                 "because of error {t}. Drinky could not save the public metadata because of " ++
                 "error {t}. Both serve this session.{s}",
-            .{ account.label(), list_failure, metadata_failure, empty },
+            .{ account.id(), list_failure, metadata_failure, empty },
         );
         return try Context.Outcome.Message.print(
             gpa,
             .failure,
             "Drinky fetched the model list of {s}. Drinky could not save the model list " ++
                 "because of error {t}. The list serves this session.{s}",
-            .{ account.label(), list_failure, empty },
+            .{ account.id(), list_failure, empty },
         );
     }
     const metadata_failure = result.metadata_save_error orelse {
@@ -700,7 +700,7 @@ fn fetchReport(
             gpa,
             .warning,
             "Drinky fetched the model list of {s}. The account offers no model now.",
-            .{account.label()},
+            .{account.id()},
         );
     };
     return try Context.Outcome.Message.print(
@@ -708,7 +708,7 @@ fn fetchReport(
         .failure,
         "Drinky fetched the model list of {s}. Drinky could not save the public metadata " ++
             "because of error {t}. The metadata serves this session.{s}",
-        .{ account.label(), metadata_failure, empty },
+        .{ account.id(), metadata_failure, empty },
     );
 }
 
@@ -744,24 +744,30 @@ test "a fetch opens the list that arrived and states what it missed" {
     const gpa = std.testing.allocator;
     var accounts = testing.accounts(.{ .anthropic = "sk-ant" }, .{});
     defer testing.deinitAccounts(&accounts);
-    try testing.seed(&accounts, .anthropic_api, &.{ "claude-fable-5", "claude-sonnet-4-6" });
-    var agent = testing.agent(gpa, .{ .anthropic_api = "sk-ant" });
+    try testing.seed(&accounts, .anthropic_api_key, &.{ "claude-fable-5", "claude-sonnet-4-6" });
+    var agent = testing.agent(gpa, .{ .anthropic_api_key = "sk-ant" });
     defer agent.deinit();
     var context: Context = .{ .gpa = gpa, .io = undefined, .agent = &agent, .accounts = &accounts };
 
     // The account list never arrived, so no list can open.
     try Context.Outcome.expectEvent(
-        try fetchOutcome(&context, .anthropic_api, &.{ .models_error = error.ConnectionRefused }),
+        try fetchOutcome(
+            &context,
+            .anthropic_api_key,
+            &.{ .models_error = error.ConnectionRefused },
+        ),
         .failure,
     );
 
     // Every part arrived, so the list opens and states nothing beside itself.
-    const complete = try expectPick(try fetchOutcome(&context, .anthropic_api, &.{ .count = 2 }));
+    const complete = try expectPick(
+        try fetchOutcome(&context, .anthropic_api_key, &.{ .count = 2 }),
+    );
     defer freePick(gpa, &complete);
     try std.testing.expect(complete.report == null);
 
     // The metadata never arrived, so the list opens beside that failure.
-    const metadata_gone = try expectPick(try fetchOutcome(&context, .anthropic_api, &.{
+    const metadata_gone = try expectPick(try fetchOutcome(&context, .anthropic_api_key, &.{
         .count = 2,
         .metadata_error = error.ConnectionTimedOut,
     }));
@@ -774,26 +780,26 @@ test "a fetch opens the list that arrived and states what it missed" {
         metadata_gone.report.?.severity,
     );
     try std.testing.expectEqualStrings(
-        "Drinky fetched the model list of Anthropic API. Drinky could not fetch the public " ++
+        "Drinky fetched the model list of anthropic-api-key. Drinky could not fetch the public " ++
             "metadata because of error ConnectionTimedOut. The account offers 2 models now.",
         metadata_gone.report.?.content,
     );
 
     // The list write failed, so the list opens beside that failure.
-    const save_gone = try expectPick(try fetchOutcome(&context, .anthropic_api, &.{
+    const save_gone = try expectPick(try fetchOutcome(&context, .anthropic_api_key, &.{
         .count = 2,
         .models_save_error = error.StoreBusy,
     }));
     defer freePick(gpa, &save_gone);
     defer gpa.free(save_gone.report.?.content);
     try std.testing.expectEqualStrings(
-        "Drinky fetched the model list of Anthropic API. Drinky could not save the model list " ++
-            "because of error StoreBusy. The list serves this session.",
+        "Drinky fetched the model list of anthropic-api-key. Drinky could not save the model " ++
+            "list because of error StoreBusy. The list serves this session.",
         save_gone.report.?.content,
     );
 
     // Both failed, so one line states both beside the list.
-    const both_gone = try expectPick(try fetchOutcome(&context, .anthropic_api, &.{
+    const both_gone = try expectPick(try fetchOutcome(&context, .anthropic_api_key, &.{
         .count = 2,
         .metadata_error = error.ConnectionTimedOut,
         .models_save_error = error.StoreBusy,
@@ -801,7 +807,7 @@ test "a fetch opens the list that arrived and states what it missed" {
     defer freePick(gpa, &both_gone);
     defer gpa.free(both_gone.report.?.content);
     try std.testing.expectEqualStrings(
-        "Drinky fetched the model list of Anthropic API. Drinky could not fetch the public " ++
+        "Drinky fetched the model list of anthropic-api-key. Drinky could not fetch the public " ++
             "metadata because of error ConnectionTimedOut. Drinky could not save the model " ++
             "list because of error StoreBusy. The list serves this session.",
         both_gone.report.?.content,
@@ -815,11 +821,11 @@ test "a failed fetch states the cache write that failed with it" {
     const gpa = std.testing.allocator;
     var accounts = testing.accounts(.{ .anthropic = "sk-ant" }, .{});
     defer testing.deinitAccounts(&accounts);
-    var agent = testing.agent(gpa, .{ .anthropic_api = "sk-ant" });
+    var agent = testing.agent(gpa, .{ .anthropic_api_key = "sk-ant" });
     defer agent.deinit();
     var context: Context = .{ .gpa = gpa, .io = undefined, .agent = &agent, .accounts = &accounts };
 
-    switch (try fetchOutcome(&context, .anthropic_api, &.{
+    switch (try fetchOutcome(&context, .anthropic_api_key, &.{
         .models_error = error.ConnectionRefused,
         .metadata_save_error = error.StoreBusy,
     })) {
@@ -827,7 +833,7 @@ test "a failed fetch states the cache write that failed with it" {
             defer gpa.free(event.content);
             try std.testing.expectEqual(Context.Outcome.Severity.failure, event.severity);
             try std.testing.expectEqualStrings(
-                "Drinky could not fetch the model list of Anthropic API because of error " ++
+                "Drinky could not fetch the model list of anthropic-api-key because of error " ++
                     "ConnectionRefused. Drinky could not save the public metadata because of " ++
                     "error StoreBusy. The metadata serves this session.",
                 event.content,
@@ -845,26 +851,26 @@ test "a fetch that meets a replaced credential hands its account to the app" {
     const gpa = std.testing.allocator;
     var accounts = testing.accounts(.{}, .{ .anthropic = true });
     defer testing.deinitAccounts(&accounts);
-    var agent = testing.agent(gpa, .{ .anthropic_subscription = undefined });
+    var agent = testing.agent(gpa, .{ .anthropic_sub_login = undefined });
     defer agent.deinit();
     var context: Context = .{ .gpa = gpa, .io = undefined, .agent = &agent, .accounts = &accounts };
 
-    const outcome = try fetchOutcome(&context, .anthropic_subscription, &.{
+    const outcome = try fetchOutcome(&context, .anthropic_sub_login, &.{
         .models_error = error.CredentialReplaced,
     });
     try std.testing.expectEqual(
-        llm.Account.anthropic_subscription,
+        llm.Account.anthropic_sub_login,
         outcome.credential_replaced,
     );
 
     // The metadata request runs even then. A failed cache write of that metadata
     // changes no principal, so the transition stands alone.
-    const with_save_failure = try fetchOutcome(&context, .anthropic_subscription, &.{
+    const with_save_failure = try fetchOutcome(&context, .anthropic_sub_login, &.{
         .models_error = error.CredentialReplaced,
         .metadata_save_error = error.StoreBusy,
     });
     try std.testing.expectEqual(
-        llm.Account.anthropic_subscription,
+        llm.Account.anthropic_sub_login,
         with_save_failure.credential_replaced,
     );
 }
@@ -873,7 +879,7 @@ test "the first step lists the providers with an authenticated account" {
     const gpa = std.testing.allocator;
     var accounts = testing.accounts(.{ .anthropic = "sk-ant", .openai = "sk-openai" }, .{});
     defer testing.deinitAccounts(&accounts);
-    var agent = testing.agent(gpa, .{ .anthropic_api = "sk-ant" });
+    var agent = testing.agent(gpa, .{ .anthropic_api_key = "sk-ant" });
     defer agent.deinit();
     var context: Context = .{ .gpa = gpa, .io = undefined, .agent = &agent, .accounts = &accounts };
 
@@ -881,8 +887,8 @@ test "the first step lists the providers with an authenticated account" {
     defer freePick(gpa, &pick);
     try std.testing.expectEqualStrings("Provider", pick.title);
     try std.testing.expectEqual(@as(usize, 2), pick.options.len);
-    try std.testing.expectEqualStrings("Anthropic", pick.options[0]);
-    try std.testing.expectEqualStrings("OpenAI", pick.options[1]);
+    try std.testing.expectEqualStrings("anthropic", pick.options[0]);
+    try std.testing.expectEqualStrings("openai", pick.options[1]);
     // The active account marks its provider.
     try std.testing.expectEqual(@as(usize, 0), pick.current.?);
 }
@@ -891,7 +897,7 @@ test "one provider alone opens the account step at once" {
     const gpa = std.testing.allocator;
     var accounts = testing.accounts(.{ .anthropic = "sk-ant" }, .{ .anthropic = true });
     defer testing.deinitAccounts(&accounts);
-    var agent = testing.agent(gpa, .{ .anthropic_api = "sk-ant" });
+    var agent = testing.agent(gpa, .{ .anthropic_api_key = "sk-ant" });
     defer agent.deinit();
     var context: Context = .{ .gpa = gpa, .io = undefined, .agent = &agent, .accounts = &accounts };
 
@@ -899,8 +905,8 @@ test "one provider alone opens the account step at once" {
     defer freePick(gpa, &pick);
     try std.testing.expectEqualStrings("Account", pick.title);
     try std.testing.expectEqual(@as(usize, 2), pick.options.len);
-    try std.testing.expectEqualStrings("Anthropic Subscription", pick.options[0]);
-    try std.testing.expectEqualStrings("Anthropic API", pick.options[1]);
+    try std.testing.expectEqualStrings("anthropic-sub-login", pick.options[0]);
+    try std.testing.expectEqualStrings("anthropic-api-key", pick.options[1]);
     try std.testing.expectEqual(@as(usize, 1), pick.current.?);
 }
 
@@ -908,15 +914,15 @@ test "one account alone opens the model step at once" {
     const gpa = std.testing.allocator;
     var accounts = testing.accounts(.{ .anthropic = "sk-ant" }, .{});
     defer testing.deinitAccounts(&accounts);
-    try testing.seed(&accounts, .anthropic_api, &.{ "claude-fable-5", "claude-sonnet-4-6" });
-    var agent = testing.agent(gpa, .{ .anthropic_api = "sk-ant" });
+    try testing.seed(&accounts, .anthropic_api_key, &.{ "claude-fable-5", "claude-sonnet-4-6" });
+    var agent = testing.agent(gpa, .{ .anthropic_api_key = "sk-ant" });
     defer agent.deinit();
     var context: Context = .{ .gpa = gpa, .io = undefined, .agent = &agent, .accounts = &accounts };
 
     // Both earlier steps hold one row, so the model list is the whole command.
     const pick = try expectPick(try run(&context));
     defer freePick(gpa, &pick);
-    try std.testing.expectEqualStrings("Model: Anthropic API", pick.title);
+    try std.testing.expectEqualStrings("Model: anthropic-api-key", pick.title);
     // The fetch row leads the list, so the user can replace a stale one.
     try std.testing.expectEqual(@as(usize, 3), pick.options.len);
     try std.testing.expectEqualStrings("Refresh the model list", pick.options[0]);
@@ -933,16 +939,16 @@ test "a model row marks an output limit that no source states" {
     const gpa = std.testing.allocator;
     var accounts = testing.accounts(.{ .anthropic = "sk-ant", .openai = "sk-openai" }, .{});
     defer testing.deinitAccounts(&accounts);
-    try testing.seed(&accounts, .anthropic_api, &.{ "claude-fable-5", "claude-sonnet-4-6" });
-    try testing.seed(&accounts, .openai_api, &.{"gpt-5.6-sol"});
+    try testing.seed(&accounts, .anthropic_api_key, &.{ "claude-fable-5", "claude-sonnet-4-6" });
+    try testing.seed(&accounts, .openai_api_key, &.{"gpt-5.6-sol"});
     // No source states an output limit for these two models.
-    accounts.catalog.accounts.get(.anthropic_api)[1].tokens_max = null;
-    accounts.catalog.accounts.get(.openai_api)[0].tokens_max = null;
-    var agent = testing.agent(gpa, .{ .anthropic_api = "sk-ant" });
+    accounts.catalog.accounts.get(.anthropic_api_key)[1].tokens_max = null;
+    accounts.catalog.accounts.get(.openai_api_key)[0].tokens_max = null;
+    var agent = testing.agent(gpa, .{ .anthropic_api_key = "sk-ant" });
     defer agent.deinit();
     var context: Context = .{ .gpa = gpa, .io = undefined, .agent = &agent, .accounts = &accounts };
 
-    const anthropic_models = try expectPick(try modelStep(&context, .anthropic_api));
+    const anthropic_models = try expectPick(try modelStep(&context, .anthropic_api_key));
     defer freePick(gpa, &anthropic_models);
     // The vendor stated the limit of this model, so its row stands as it is.
     try std.testing.expectEqualStrings("claude-fable-5", anthropic_models.options[1]);
@@ -951,7 +957,7 @@ test "a model row marks an output limit that no source states" {
         anthropic_models.options[2],
     );
 
-    const openai_models = try expectPick(try modelStep(&context, .openai_api));
+    const openai_models = try expectPick(try modelStep(&context, .openai_api_key));
     defer freePick(gpa, &openai_models);
     try std.testing.expectEqualStrings("gpt-5.6-sol", openai_models.options[1]);
 }
@@ -962,7 +968,7 @@ test "an account with no model offers the fetch row alone" {
     const gpa = std.testing.allocator;
     var accounts = testing.accounts(.{ .anthropic = "sk-ant" }, .{});
     defer testing.deinitAccounts(&accounts);
-    var agent = testing.agent(gpa, .{ .anthropic_api = "sk-ant" });
+    var agent = testing.agent(gpa, .{ .anthropic_api_key = "sk-ant" });
     defer agent.deinit();
     var context: Context = .{ .gpa = gpa, .io = undefined, .agent = &agent, .accounts = &accounts };
 
@@ -994,25 +1000,25 @@ test "an OpenRouter account opens the author step then the models of that author
     const metadata = try gpa.dupe(Metadata.Entry, &entries);
     defer gpa.free(metadata);
     accounts.catalog.metadata = metadata;
-    var agent = testing.agent(gpa, .{ .openrouter_api = "sk-or" });
+    var agent = testing.agent(gpa, .{ .openrouter_api_key = "sk-or" });
     defer agent.deinit();
     var context: Context = .{ .gpa = gpa, .io = undefined, .agent = &agent, .accounts = &accounts };
 
     const authors = try expectPick(try run(&context));
     defer freePick(gpa, &authors);
-    try std.testing.expectEqualStrings("Author: OpenRouter API", authors.title);
+    try std.testing.expectEqualStrings("Author: openrouter-api-key", authors.title);
     try std.testing.expectEqual(@as(usize, 3), authors.options.len);
     try std.testing.expectEqualStrings("Refresh the model list", authors.options[0]);
     try std.testing.expectEqualStrings("openai · 2 models", authors.options[1]);
     try std.testing.expectEqualStrings("qwen · 1 model", authors.options[2]);
     try std.testing.expectEqual(
-        llm.Account.openrouter_api,
+        llm.Account.openrouter_api_key,
         (try selectRow(&authors, &context, 0)).fetch,
     );
 
     const openai_models = try expectPick(try selectRow(&authors, &context, 1));
     defer freePick(gpa, &openai_models);
-    try std.testing.expectEqualStrings("Model: OpenRouter API", openai_models.title);
+    try std.testing.expectEqualStrings("Model: openrouter-api-key", openai_models.title);
     try std.testing.expectEqual(@as(usize, 2), openai_models.options.len);
     try std.testing.expectEqualStrings("openai/gpt-new", openai_models.options[0]);
     try std.testing.expectEqualStrings("openai/gpt-old", openai_models.options[1]);
@@ -1093,7 +1099,7 @@ test "a remote host lists the authors with no fetch row" {
     };
     accounts.catalog.metadata = try gpa.dupe(Metadata.Entry, &entries);
     defer gpa.free(accounts.catalog.metadata);
-    var agent = testing.agent(gpa, .{ .openrouter_api = "sk-or" });
+    var agent = testing.agent(gpa, .{ .openrouter_api_key = "sk-or" });
     defer agent.deinit();
     var context: Context = .{
         .gpa = gpa,
@@ -1128,7 +1134,7 @@ test "a remote host names the terminal when the OpenRouter list is empty" {
     const gpa = std.testing.allocator;
     var accounts = testing.accounts(.{ .openrouter = "sk-or" }, .{});
     defer testing.deinitAccounts(&accounts);
-    var agent = testing.agent(gpa, .{ .openrouter_api = "sk-or" });
+    var agent = testing.agent(gpa, .{ .openrouter_api_key = "sk-or" });
     defer agent.deinit();
     var context: Context = .{
         .gpa = gpa,
@@ -1141,7 +1147,7 @@ test "a remote host names the terminal when the OpenRouter list is empty" {
     try Context.Outcome.expectNoticeContaining(
         try run(&context),
         .warning,
-        "Fetch the model list of OpenRouter API with /model in the terminal first.",
+        "Fetch the model list of openrouter-api-key with /model in the terminal first.",
     );
 }
 
@@ -1153,8 +1159,8 @@ test "a remote host lists the cached models with no fetch row" {
     const gpa = std.testing.allocator;
     var accounts = testing.accounts(.{ .anthropic = "sk-ant", .openai = "sk-openai" }, .{});
     defer testing.deinitAccounts(&accounts);
-    try testing.seed(&accounts, .anthropic_api, &.{ "claude-fable-5", "claude-sonnet-4-6" });
-    var agent = testing.agent(gpa, .{ .anthropic_api = "sk-ant" });
+    try testing.seed(&accounts, .anthropic_api_key, &.{ "claude-fable-5", "claude-sonnet-4-6" });
+    var agent = testing.agent(gpa, .{ .anthropic_api_key = "sk-ant" });
     defer agent.deinit();
     var context: Context = .{
         .gpa = gpa,
@@ -1164,7 +1170,7 @@ test "a remote host lists the cached models with no fetch row" {
         .remote = true,
     };
 
-    const anthropic_models = try expectPick(try modelStep(&context, .anthropic_api));
+    const anthropic_models = try expectPick(try modelStep(&context, .anthropic_api_key));
     defer freePick(gpa, &anthropic_models);
     try std.testing.expectEqual(@as(usize, 2), anthropic_models.options.len);
     try std.testing.expectEqualStrings("claude-fable-5", anthropic_models.options[0]);
@@ -1181,9 +1187,9 @@ test "a remote host lists the cached models with no fetch row" {
     );
 
     try Context.Outcome.expectNoticeContaining(
-        try modelStep(&context, .openai_api),
+        try modelStep(&context, .openai_api_key),
         .warning,
-        "Fetch the model list of OpenAI API with /model in the terminal first.",
+        "Fetch the model list of openai-api-key with /model in the terminal first.",
     );
 }
 
@@ -1195,8 +1201,8 @@ test "the fetch row hands its account to the app" {
     const gpa = std.testing.allocator;
     var accounts = testing.accounts(.{ .anthropic = "sk-ant", .openai = "sk-openai" }, .{});
     defer testing.deinitAccounts(&accounts);
-    try testing.seed(&accounts, .openai_api, &.{"gpt-5.6-sol"});
-    var agent = testing.agent(gpa, .{ .anthropic_api = "sk-ant" });
+    try testing.seed(&accounts, .openai_api_key, &.{"gpt-5.6-sol"});
+    var agent = testing.agent(gpa, .{ .anthropic_api_key = "sk-ant" });
     defer agent.deinit();
     var context: Context = .{ .gpa = gpa, .io = undefined, .agent = &agent, .accounts = &accounts };
 
@@ -1206,7 +1212,7 @@ test "the fetch row hands its account to the app" {
     defer freePick(gpa, &anthropic_models);
     try std.testing.expectEqualStrings("Fetch the model list", anthropic_models.options[0]);
     try std.testing.expectEqual(
-        llm.Account.anthropic_api,
+        llm.Account.anthropic_api_key,
         (try selectRow(&anthropic_models, &context, 0)).fetch,
     );
 
@@ -1214,11 +1220,11 @@ test "the fetch row hands its account to the app" {
     defer freePick(gpa, &openai_models);
     try std.testing.expectEqualStrings("Refresh the model list", openai_models.options[0]);
     try std.testing.expectEqual(
-        llm.Account.openai_api,
+        llm.Account.openai_api_key,
         (try selectRow(&openai_models, &context, 0)).fetch,
     );
     // The row itself changes nothing: the catalog and the agent stand as before.
-    try std.testing.expect(!accounts.offersModel(.anthropic_api));
+    try std.testing.expect(!accounts.offersModel(.anthropic_api_key));
     try std.testing.expectEqualStrings("claude-sonnet-4-6", agent.model.?.name());
 }
 
@@ -1229,8 +1235,8 @@ test "a provider row opens its accounts, and an account row opens its models" {
         .{ .anthropic = true },
     );
     defer testing.deinitAccounts(&accounts);
-    try testing.seed(&accounts, .openai_api, &.{ "gpt-5.6-sol", "gpt-5.6-luna" });
-    var agent = testing.agent(gpa, .{ .anthropic_api = "sk-ant" });
+    try testing.seed(&accounts, .openai_api_key, &.{ "gpt-5.6-sol", "gpt-5.6-luna" });
+    var agent = testing.agent(gpa, .{ .anthropic_api_key = "sk-ant" });
     defer agent.deinit();
     var context: Context = .{ .gpa = gpa, .io = undefined, .agent = &agent, .accounts = &accounts };
 
@@ -1243,7 +1249,7 @@ test "a provider row opens its accounts, and an account row opens its models" {
     const anthropic_models = try expectPick(try selectRow(&anthropic_accounts, &context, 0));
     defer freePick(gpa, &anthropic_models);
     try std.testing.expectEqualStrings(
-        "Model: Anthropic Subscription",
+        "Model: anthropic-sub-login",
         anthropic_models.title,
     );
     // The subscription is not the active account, so no row is the current one.
@@ -1252,7 +1258,7 @@ test "a provider row opens its accounts, and an account row opens its models" {
     // OpenAI holds one authenticated account, so its row skips the account step.
     const openai_models = try expectPick(try selectRow(&vendors, &context, 1));
     defer freePick(gpa, &openai_models);
-    try std.testing.expectEqualStrings("Model: OpenAI API", openai_models.title);
+    try std.testing.expectEqualStrings("Model: openai-api-key", openai_models.title);
     try std.testing.expectEqual(@as(usize, 3), openai_models.options.len);
     try std.testing.expectEqualStrings("gpt-5.6-sol", openai_models.options[1]);
 }
@@ -1266,7 +1272,7 @@ test "each step names the opener that builds it again" {
         .{ .anthropic = true },
     );
     defer testing.deinitAccounts(&accounts);
-    var agent = testing.agent(gpa, .{ .anthropic_api = "sk-ant" });
+    var agent = testing.agent(gpa, .{ .anthropic_api_key = "sk-ant" });
     defer agent.deinit();
     var context: Context = .{ .gpa = gpa, .io = undefined, .agent = &agent, .accounts = &accounts };
 
@@ -1281,7 +1287,7 @@ test "each step names the opener that builds it again" {
     const anthropic_models = try expectPick(try selectRow(&anthropic_accounts, &context, 0));
     defer freePick(gpa, &anthropic_models);
     try std.testing.expect(
-        anthropic_models.reopen.? == modelStepOf(.anthropic_subscription).open,
+        anthropic_models.reopen.? == modelStepOf(.anthropic_sub_login).open,
     );
 
     // An opener builds the same picker again: the same rows, and the same
@@ -1289,22 +1295,22 @@ test "each step names the opener that builds it again" {
     const reopened = try expectPick(try anthropic_accounts.reopen.?(&context));
     defer freePick(gpa, &reopened);
     try std.testing.expectEqualStrings("Account", reopened.title);
-    try std.testing.expectEqualStrings("Anthropic Subscription", reopened.options[0]);
+    try std.testing.expectEqualStrings("anthropic-sub-login", reopened.options[0]);
     try std.testing.expect(reopened.reopen.? == accountStepOf(.anthropic));
 
     // A step that the flow skipped opens no picker, so it enters no trail and
     // Esc cannot land on it.
     const openai_models = try expectPick(try selectRow(&vendors, &context, 1));
     defer freePick(gpa, &openai_models);
-    try std.testing.expect(openai_models.reopen.? == modelStepOf(.openai_api).open);
+    try std.testing.expect(openai_models.reopen.? == modelStepOf(.openai_api_key).open);
 }
 
 test "a model row switches to the chosen account and model" {
     const gpa = std.testing.allocator;
     var accounts = testing.accounts(.{ .anthropic = "sk-ant", .openai = "sk-openai" }, .{});
     defer testing.deinitAccounts(&accounts);
-    try testing.seed(&accounts, .openai_api, &.{"gpt-5.6-sol"});
-    var agent = testing.agent(gpa, .{ .anthropic_api = "sk-ant" });
+    try testing.seed(&accounts, .openai_api_key, &.{"gpt-5.6-sol"});
+    var agent = testing.agent(gpa, .{ .anthropic_api_key = "sk-ant" });
     defer agent.deinit();
     var context: Context = .{ .gpa = gpa, .io = undefined, .agent = &agent, .accounts = &accounts };
 
@@ -1316,7 +1322,7 @@ test "a model row switches to the chosen account and model" {
     // The selection crosses vendors, so it switches the account too.
     try Context.Outcome.expectEvent(try selectRow(&openai_models, &context, 1), .information);
     try std.testing.expectEqualStrings("gpt-5.6-sol", agent.model.?.name());
-    try std.testing.expectEqual(llm.Account.openai_api, agent.client.?.account());
+    try std.testing.expectEqual(llm.Account.openai_api_key, agent.client.?.account());
 
     try Context.Outcome.expectNotice(try selectRow(&openai_models, &context, 1), .information);
     try std.testing.expectEqualStrings("gpt-5.6-sol", agent.model.?.name());
@@ -1329,8 +1335,8 @@ test "a pick of the active model adopts the fetched description" {
     const gpa = std.testing.allocator;
     var accounts = testing.accounts(.{ .anthropic = "sk-ant" }, .{});
     defer testing.deinitAccounts(&accounts);
-    try testing.seed(&accounts, .anthropic_api, &.{"claude-opus-5"});
-    var agent = testing.agent(gpa, .{ .anthropic_api = "sk-ant" });
+    try testing.seed(&accounts, .anthropic_api_key, &.{"claude-opus-5"});
+    var agent = testing.agent(gpa, .{ .anthropic_api_key = "sk-ant" });
     defer agent.deinit();
 
     // The session runs the description that the fetch replaced.
@@ -1339,7 +1345,7 @@ test "a pick of the active model adopts the fetched description" {
     stale.tokens_max = 11;
     stale.addEffort(.low);
     stale.price = .{ .input = 99, .output = 99, .cache_read = 99, .cache_write = 99 };
-    agent.switchTo(accounts.client(.anthropic_api).?, stale);
+    agent.switchTo(accounts.client(.anthropic_api_key).?, stale);
     var context: Context = .{ .gpa = gpa, .io = undefined, .agent = &agent, .accounts = &accounts };
 
     const pick = try expectPick(try run(&context));
@@ -1366,14 +1372,14 @@ test "a pick of the active model adopts the fetched description" {
 // already reached the disk, and the write that failed stays unnamed.
 test "a report of a failed metadata write names the metadata" {
     const gpa = std.testing.allocator;
-    const report = (try fetchReport(gpa, .anthropic_api, &.{
+    const report = (try fetchReport(gpa, .anthropic_api_key, &.{
         .count = 2,
         .metadata_save_error = error.StoreBusy,
     })).?;
     defer gpa.free(report.content);
     try std.testing.expectEqual(Context.Outcome.Severity.failure, report.severity);
     try std.testing.expectEqualStrings(
-        "Drinky fetched the model list of Anthropic API. Drinky could not save the public " ++
+        "Drinky fetched the model list of anthropic-api-key. Drinky could not save the public " ++
             "metadata because of error StoreBusy. The metadata serves this session.",
         report.content,
     );
@@ -1383,16 +1389,16 @@ test "a report of a failed metadata write names the metadata" {
 // fetch row. Without a line, that result reads like a fetch that never ran.
 test "a report of a fetch that described no model states that result" {
     const gpa = std.testing.allocator;
-    const report = (try fetchReport(gpa, .anthropic_api, &.{ .count = 0 })).?;
+    const report = (try fetchReport(gpa, .anthropic_api_key, &.{ .count = 0 })).?;
     defer gpa.free(report.content);
     try std.testing.expectEqual(Context.Outcome.Severity.warning, report.severity);
     try std.testing.expectEqualStrings(
-        "Drinky fetched the model list of Anthropic API. The account offers no model now.",
+        "Drinky fetched the model list of anthropic-api-key. The account offers no model now.",
         report.content,
     );
 
     // A list that holds a model needs no line, because the list itself shows it.
-    try std.testing.expect(try fetchReport(gpa, .anthropic_api, &.{ .count = 1 }) == null);
+    try std.testing.expect(try fetchReport(gpa, .anthropic_api_key, &.{ .count = 1 }) == null);
 }
 
 // A failed write and a missed metadata leave the picker on the fetch row too
@@ -1406,9 +1412,9 @@ test "every report of a fetch that described no model states that result" {
     }{
         .{
             .result = .{ .count = 0, .models_save_error = error.StoreBusy },
-            .content = "Drinky fetched the model list of Anthropic API. Drinky could not save " ++
-                "the model list because of error StoreBusy. The list serves this session. " ++
-                "The account offers no model now.",
+            .content = "Drinky fetched the model list of anthropic-api-key. Drinky could not " ++
+                "save the model list because of error StoreBusy. The list serves this " ++
+                "session. The account offers no model now.",
         },
         .{
             .result = .{
@@ -1416,16 +1422,16 @@ test "every report of a fetch that described no model states that result" {
                 .metadata_error = error.ConnectionTimedOut,
                 .models_save_error = error.StoreBusy,
             },
-            .content = "Drinky fetched the model list of Anthropic API. Drinky could not " ++
+            .content = "Drinky fetched the model list of anthropic-api-key. Drinky could not " ++
                 "fetch the public metadata because of error ConnectionTimedOut. Drinky could " ++
                 "not save the model list because of error StoreBusy. The list serves this " ++
                 "session. The account offers no model now.",
         },
         .{
             .result = .{ .count = 0, .metadata_save_error = error.StoreBusy },
-            .content = "Drinky fetched the model list of Anthropic API. Drinky could not save " ++
-                "the public metadata because of error StoreBusy. The metadata serves this " ++
-                "session. The account offers no model now.",
+            .content = "Drinky fetched the model list of anthropic-api-key. Drinky could not " ++
+                "save the public metadata because of error StoreBusy. The metadata serves " ++
+                "this session. The account offers no model now.",
         },
         .{
             .result = .{
@@ -1433,21 +1439,21 @@ test "every report of a fetch that described no model states that result" {
                 .models_save_error = error.StoreBusy,
                 .metadata_save_error = error.AccessDenied,
             },
-            .content = "Drinky fetched the model list of Anthropic API. Drinky could not save " ++
-                "the model list because of error StoreBusy. Drinky could not save the public " ++
-                "metadata because of error AccessDenied. Both serve this session. " ++
+            .content = "Drinky fetched the model list of anthropic-api-key. Drinky could not " ++
+                "save the model list because of error StoreBusy. Drinky could not save the " ++
+                "public metadata because of error AccessDenied. Both serve this session. " ++
                 "The account offers no model now.",
         },
         .{
             .result = .{ .count = 0, .metadata_error = error.ConnectionTimedOut },
-            .content = "Drinky fetched the model list of Anthropic API. Drinky could not " ++
+            .content = "Drinky fetched the model list of anthropic-api-key. Drinky could not " ++
                 "fetch the public metadata because of error ConnectionTimedOut. " ++
                 "The account offers no model now.",
         },
     };
 
     for (cases) |case| {
-        const report = (try fetchReport(gpa, .anthropic_api, &case.result)).?;
+        const report = (try fetchReport(gpa, .anthropic_api_key, &case.result)).?;
         defer gpa.free(report.content);
         try std.testing.expectEqual(Context.Outcome.Severity.failure, report.severity);
         try std.testing.expectEqualStrings(case.content, report.content);
@@ -1457,13 +1463,13 @@ test "every report of a fetch that described no model states that result" {
 // A line that counts models must read correctly for one model.
 test "a report of a missed metadata counts one model in the singular" {
     const gpa = std.testing.allocator;
-    const report = (try fetchReport(gpa, .anthropic_api, &.{
+    const report = (try fetchReport(gpa, .anthropic_api_key, &.{
         .count = 1,
         .metadata_error = error.ConnectionTimedOut,
     })).?;
     defer gpa.free(report.content);
     try std.testing.expectEqualStrings(
-        "Drinky fetched the model list of Anthropic API. Drinky could not fetch the public " ++
+        "Drinky fetched the model list of anthropic-api-key. Drinky could not fetch the public " ++
             "metadata because of error ConnectionTimedOut. The account offers 1 model now.",
         report.content,
     );
@@ -1471,28 +1477,28 @@ test "a report of a missed metadata counts one model in the singular" {
 
 test "a report of a failed list write names the list" {
     const gpa = std.testing.allocator;
-    const report = (try fetchReport(gpa, .anthropic_api, &.{
+    const report = (try fetchReport(gpa, .anthropic_api_key, &.{
         .count = 2,
         .models_save_error = error.StoreBusy,
     })).?;
     defer gpa.free(report.content);
     try std.testing.expectEqualStrings(
-        "Drinky fetched the model list of Anthropic API. Drinky could not save the model list " ++
-            "because of error StoreBusy. The list serves this session.",
+        "Drinky fetched the model list of anthropic-api-key. Drinky could not save the model " ++
+            "list because of error StoreBusy. The list serves this session.",
         report.content,
     );
 
     // Both writes can fail together, so one line states both.
-    const both = (try fetchReport(gpa, .anthropic_api, &.{
+    const both = (try fetchReport(gpa, .anthropic_api_key, &.{
         .count = 2,
         .models_save_error = error.StoreBusy,
         .metadata_save_error = error.AccessDenied,
     })).?;
     defer gpa.free(both.content);
     try std.testing.expectEqualStrings(
-        "Drinky fetched the model list of Anthropic API. Drinky could not save the model list " ++
-            "because of error StoreBusy. Drinky could not save the public metadata because of " ++
-            "error AccessDenied. Both serve this session.",
+        "Drinky fetched the model list of anthropic-api-key. Drinky could not save the model " ++
+            "list because of error StoreBusy. Drinky could not save the public metadata " ++
+            "because of error AccessDenied. Both serve this session.",
         both.content,
     );
 }
@@ -1504,8 +1510,8 @@ test "every step reports a row that its list does not hold" {
         .{ .anthropic = true },
     );
     defer testing.deinitAccounts(&accounts);
-    try testing.seed(&accounts, .anthropic_api, &.{"claude-sonnet-4-6"});
-    var agent = testing.agent(gpa, .{ .anthropic_api = "sk-ant" });
+    try testing.seed(&accounts, .anthropic_api_key, &.{"claude-sonnet-4-6"});
+    var agent = testing.agent(gpa, .{ .anthropic_api_key = "sk-ant" });
     defer agent.deinit();
     var context: Context = .{ .gpa = gpa, .io = undefined, .agent = &agent, .accounts = &accounts };
 
@@ -1555,16 +1561,16 @@ test "the active mark matches the account, not just the model name" {
     // under two accounts. The mark must land inside the active account's list.
     var accounts = testing.accounts(.{ .anthropic = "sk-ant" }, .{ .anthropic = true });
     defer testing.deinitAccounts(&accounts);
-    try testing.seed(&accounts, .anthropic_subscription, &.{"claude-sonnet-4-6"});
-    try testing.seed(&accounts, .anthropic_api, &.{"claude-sonnet-4-6"});
-    var agent = testing.agent(gpa, .{ .anthropic_subscription = undefined });
+    try testing.seed(&accounts, .anthropic_sub_login, &.{"claude-sonnet-4-6"});
+    try testing.seed(&accounts, .anthropic_api_key, &.{"claude-sonnet-4-6"});
+    var agent = testing.agent(gpa, .{ .anthropic_sub_login = undefined });
     defer agent.deinit();
     var context: Context = .{ .gpa = gpa, .io = undefined, .agent = &agent, .accounts = &accounts };
 
     const anthropic_accounts = try expectPick(try run(&context));
     defer freePick(gpa, &anthropic_accounts);
     try std.testing.expectEqualStrings(
-        "Anthropic Subscription",
+        "anthropic-sub-login",
         anthropic_accounts.options[anthropic_accounts.current.?],
     );
 
@@ -1587,8 +1593,8 @@ fn runUnderOom(gpa: std.mem.Allocator) !void {
         .{ .anthropic = true },
     );
     defer testing.deinitAccounts(&accounts);
-    try testing.seed(&accounts, .anthropic_subscription, &.{"claude-opus-5"});
-    var agent = testing.agent(gpa, .{ .anthropic_api = "sk-ant" });
+    try testing.seed(&accounts, .anthropic_sub_login, &.{"claude-opus-5"});
+    var agent = testing.agent(gpa, .{ .anthropic_api_key = "sk-ant" });
     defer agent.deinit();
     var context: Context = .{ .gpa = gpa, .io = undefined, .agent = &agent, .accounts = &accounts };
 
