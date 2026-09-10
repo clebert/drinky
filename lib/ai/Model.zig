@@ -71,6 +71,20 @@ pub const Price = struct {
     output: f64,
     cache_read: f64,
     cache_write: f64,
+    /// The rates of a request whose prompt reaches a threshold, or null when
+    /// one set of rates covers every prompt.
+    long_context: ?LongContext = null,
+
+    /// The long-context tier of a vendor. A vendor bills every token of such a
+    /// request at these rates, the output included.
+    pub const LongContext = struct {
+        /// The prompt length, in tokens, from which the tier applies.
+        prompt_tokens_min: u64,
+        input: f64,
+        output: f64,
+        cache_read: f64,
+        cache_write: f64,
+    };
 };
 
 /// A model that states its name alone. A decoder fills whatever its source
@@ -225,13 +239,24 @@ pub fn outputLimitUnknown(self: *const Model, account: llm.Account) bool {
     };
 }
 
-/// The dollar cost of `usage`, or null when no source priced this model.
+/// The dollar cost of `usage`, or null when no source priced this model. A
+/// prompt that reaches the long-context threshold bills the whole request at
+/// the rates of that tier.
 pub fn cost(self: *const Model, usage: *const llm.Usage) ?f64 {
     const price = self.price orelse return null;
-    return (price.input * asFloat(usage.input) +
-        price.output * asFloat(usage.output) +
-        price.cache_read * asFloat(usage.cache_read) +
-        price.cache_write * asFloat(usage.cache_write)) / million;
+    if (price.long_context) |tier| {
+        if (usage.prompt() >= tier.prompt_tokens_min) return charge(&tier, usage);
+    }
+    return charge(&price, usage);
+}
+
+/// The dollar cost of `usage` at `rates`, which name the four token kinds. The
+/// standard price and the long-context tier both fit.
+fn charge(rates: anytype, usage: *const llm.Usage) f64 {
+    return (rates.input * asFloat(usage.input) +
+        rates.output * asFloat(usage.output) +
+        rates.cache_read * asFloat(usage.cache_read) +
+        rates.cache_write * asFloat(usage.cache_write)) / million;
 }
 
 fn asFloat(count: u64) f64 {
@@ -322,6 +347,17 @@ test eql {
     var priced = init("claude-opus-5") catch unreachable;
     priced.price = .{ .input = 3, .output = 15, .cache_read = 0.3, .cache_write = 3.75 };
     try std.testing.expect(!fetched.eql(&priced));
+    // A tier is part of the price, so a fetch that adds one describes the model
+    // anew.
+    var tiered = priced;
+    tiered.price.?.long_context = .{
+        .prompt_tokens_min = 200_000,
+        .input = 6,
+        .output = 30,
+        .cache_read = 0.6,
+        .cache_write = 7.5,
+    };
+    try std.testing.expect(!priced.eql(&tiered));
 
     var denied = init("claude-opus-5") catch unreachable;
     denied.efforts_denied = true;
@@ -491,6 +527,62 @@ test cost {
 
     model.price = .{ .input = 3, .output = 15, .cache_read = 0.3, .cache_write = 3.75 };
     try std.testing.expectApproxEqAbs(@as(f64, 22.05), model.cost(&usage).?, 1e-9);
+}
+
+// A vendor bills every token of a request at the long-context rates once the
+// prompt reaches the threshold. The prompt is the input plus both cache counts,
+// and the output plays no part in the threshold.
+test "a prompt at the threshold bills every token at the long-context rates" {
+    var model = try init("tiered");
+    model.price = .{
+        .input = 2,
+        .output = 10,
+        .cache_read = 0.2,
+        .cache_write = 2.5,
+        .long_context = .{
+            .prompt_tokens_min = 200_000,
+            .input = 4,
+            .output = 20,
+            .cache_read = 0.4,
+            .cache_write = 5,
+        },
+    };
+
+    // One token under the threshold bills at the standard rates, whatever the
+    // output adds.
+    const under: llm.Usage = .{
+        .input = 100_000,
+        .cache_read = 50_000,
+        .cache_write = 49_999,
+        .output = 1_000_000,
+    };
+    try std.testing.expectApproxEqAbs(
+        (2 * 0.1 + 0.2 * 0.05 + 2.5 * 0.049999 + 10),
+        model.cost(&under).?,
+        1e-9,
+    );
+
+    // The prompt reaches the threshold, so the output bills at the higher rate
+    // too.
+    const at: llm.Usage = .{
+        .input = 100_000,
+        .cache_read = 50_000,
+        .cache_write = 50_000,
+        .output = 1_000_000,
+    };
+    try std.testing.expectApproxEqAbs(
+        (4 * 0.1 + 0.4 * 0.05 + 5 * 0.05 + 20),
+        model.cost(&at).?,
+        1e-9,
+    );
+
+    // A price without a tier bills every prompt at the standard rates.
+    model.price.?.long_context = null;
+    try std.testing.expectApproxEqAbs(
+        (2 * 0.1 + 0.2 * 0.05 + 2.5 * 0.05 + 10),
+        model.cost(&at).?,
+        1e-9,
+    );
 }
 
 test "a reasoning control compares by the request bytes it produces" {

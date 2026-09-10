@@ -364,6 +364,18 @@ fn decodePrice(value: ?std.json.Value) ?Model.Price {
         .output = number(object.get("output")) orelse return null,
         .cache_read = number(object.get("cache_read")) orelse 0,
         .cache_write = number(object.get("cache_write")) orelse 0,
+        .long_context = decodeLongContext(object.get("long_context")),
+    };
+}
+
+fn decodeLongContext(value: ?std.json.Value) ?Model.Price.LongContext {
+    const object = json.object(value orelse return null) orelse return null;
+    return .{
+        .prompt_tokens_min = positive(object.get("prompt_tokens_min")) orelse return null,
+        .input = number(object.get("input")) orelse return null,
+        .output = number(object.get("output")) orelse return null,
+        .cache_read = number(object.get("cache_read")) orelse 0,
+        .cache_write = number(object.get("cache_write")) orelse 0,
     };
 }
 
@@ -582,7 +594,19 @@ test "a stored model survives a round trip through both files" {
     model.tools = .supported;
     model.addEffort(.low);
     model.addEffort(.xhigh);
-    model.price = .{ .input = 5, .output = 25, .cache_read = 0.5, .cache_write = 6.25 };
+    model.price = .{
+        .input = 5,
+        .output = 25,
+        .cache_read = 0.5,
+        .cache_write = 6.25,
+        .long_context = .{
+            .prompt_tokens_min = 200_000,
+            .input = 10,
+            .output = 37.5,
+            .cache_read = 1,
+            .cache_write = 12.5,
+        },
+    };
     var alias = Model.init("grok-4.20") catch unreachable;
     alias.serveAs("grok-4.20-0309-reasoning") catch unreachable;
     try written.setAccount(.anthropic_subscription, &.{ model, alias });
@@ -590,6 +614,7 @@ test "a stored model survives a round trip through both files" {
     var bare = Model.init("public-only") catch unreachable;
     bare.context_window = 200_000;
     bare.efforts_denied = true;
+    bare.price = .{ .input = 1, .output = 5, .cache_read = 0.1, .cache_write = 1.25 };
     try written.setMetadata(&.{.{ .provider = .anthropic, .model = bare }});
 
     var read = try init(gpa, io, home);
@@ -604,6 +629,16 @@ test "a stored model survives a round trip through both files" {
     try std.testing.expect(restored.offers(.xhigh));
     try std.testing.expect(!restored.offers(.high));
     try std.testing.expectEqual(@as(f64, 6.25), restored.price.?.cache_write);
+    // The long-context tier survives the file with its threshold and rates.
+    const restored_tier = restored.price.?.long_context.?;
+    try std.testing.expectEqual(@as(u64, 200_000), restored_tier.prompt_tokens_min);
+    try std.testing.expectEqual(@as(f64, 10), restored_tier.input);
+    try std.testing.expectEqual(@as(f64, 37.5), restored_tier.output);
+    try std.testing.expectEqual(@as(f64, 1), restored_tier.cache_read);
+    try std.testing.expectEqual(@as(f64, 12.5), restored_tier.cache_write);
+    // The public-only model states a price without a tier, so the file holds a
+    // null there and the read states none.
+    try std.testing.expect(read.metadata[0].model.price.?.long_context == null);
     try std.testing.expectEqualStrings("", restored.servedName());
     // The id behind an alias survives the file, so a reply under that id still
     // reads as the model of the alias after a restart.
@@ -683,6 +718,37 @@ test "a cached limit that is not a count reads as unstated" {
     const stated = decodeModel(listed.items[2]).?;
     try std.testing.expectEqual(@as(?u64, 200_000), stated.context_window);
     try std.testing.expectEqual(@as(?u32, 64_000), stated.tokens_max);
+}
+
+// A tier without a positive threshold or without an input rate states no tier,
+// and the standard price stands, because the tier is an addition to it.
+test "a cached tier that is not complete reads as no tier" {
+    const gpa = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, gpa,
+        \\[ { "name": "zero-threshold", "price": { "input": 2, "output": 10,
+        \\      "long_context": { "prompt_tokens_min": 0, "input": 4, "output": 20 } } },
+        \\  { "name": "no-input", "price": { "input": 2, "output": 10,
+        \\      "long_context": { "prompt_tokens_min": 200000, "output": 20 } } },
+        \\  { "name": "not-an-object", "price": { "input": 2, "output": 10,
+        \\      "long_context": "tiered" } },
+        \\  { "name": "complete", "price": { "input": 2, "output": 10,
+        \\      "long_context": { "prompt_tokens_min": 200000, "input": 4, "output": 20 } } } ]
+    , .{});
+    defer parsed.deinit();
+    const listed = json.array(parsed.value).?;
+
+    for (listed.items[0..3]) |value| {
+        const model = decodeModel(value).?;
+        try std.testing.expectEqual(@as(f64, 2), model.price.?.input);
+        try std.testing.expect(model.price.?.long_context == null);
+    }
+
+    const complete = decodeModel(listed.items[3]).?;
+    const tier = complete.price.?.long_context.?;
+    try std.testing.expectEqual(@as(u64, 200_000), tier.prompt_tokens_min);
+    try std.testing.expectEqual(@as(f64, 4), tier.input);
+    // A cache rate the file omits reads as zero, like the standard price.
+    try std.testing.expectEqual(@as(f64, 0), tier.cache_read);
 }
 
 test "a missing or unreadable cache leaves an empty catalog" {

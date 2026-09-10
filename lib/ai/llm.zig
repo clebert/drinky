@@ -429,6 +429,12 @@ pub const Usage = struct {
     output: u64 = 0,
     cache_read: u64 = 0,
     cache_write: u64 = 0,
+
+    /// The whole billed prompt. Saturating, because the counts arrive from the
+    /// provider stream unchecked.
+    pub fn prompt(self: *const Usage) u64 {
+        return self.input +| self.cache_read +| self.cache_write;
+    }
 };
 
 /// A subscription account's remaining allowance. Anthropic and OpenAI state it

@@ -6,10 +6,10 @@
 //! `GET https://openrouter.ai/api/v1/models` answers with every model of every
 //! vendor. Drinky keeps a normalized subset: the vendors it reaches, and per
 //! model the context window, the effort levels, the thinking state, the tool
-//! state, and the four rates. The endpoints of a model are deliberately ignored.
-//! They price service tiers, regions, and resellers that Drinky never calls,
-//! while the top-level `pricing` object states the standard rate of the vendor
-//! itself.
+//! state, the four rates, and the long-context tier. The endpoints of a model
+//! are deliberately ignored. They price service tiers, regions, and resellers
+//! that Drinky never calls, while the top-level `pricing` object states the
+//! standard rate of the vendor itself.
 
 const std = @import("std");
 
@@ -296,16 +296,17 @@ fn groupOpenRouter(gpa: std.mem.Allocator, models: []const Model) ![]Model {
     return grouped;
 }
 
-/// The four rates Drinky charges against, converted from dollars per token. A
-/// model priced at zero is a free endpoint rather than a rate, so it states no
-/// price. A missing input or output rate rejects the whole price, because a
-/// half-priced model reports a cost that is wrong rather than absent.
+/// The four rates Drinky charges against and the long-context tier, converted
+/// from dollars per token. A model priced at zero is a free endpoint rather
+/// than a rate, so it states no price. A missing input or output rate rejects
+/// the whole price, because a half-priced model reports a cost that is wrong
+/// rather than absent.
 fn price(value: ?std.json.Value) ?Model.Price {
     const object = json.object(value orelse return null) orelse return null;
     const input = rate(object.get("prompt")) orelse return null;
     const output = rate(object.get("completion")) orelse return null;
     if (input == 0 and output == 0) return null;
-    return .{
+    var priced: Model.Price = .{
         .input = input,
         .output = output,
         .cache_read = rate(object.get("input_cache_read")) orelse 0,
@@ -313,6 +314,27 @@ fn price(value: ?std.json.Value) ?Model.Price {
         // ephemeral entries alone.
         .cache_write = rate(object.get("input_cache_write")) orelse 0,
     };
+    priced.long_context = longContext(&priced, object.get("overrides"));
+    return priced;
+}
+
+/// The long-context tier of `standard`: the first override that names a prompt
+/// threshold. Another override names a time window instead, and Drinky reads no
+/// clock for a rate. A kind the tier omits keeps the rate of the entry.
+fn longContext(standard: *const Model.Price, value: ?std.json.Value) ?Model.Price.LongContext {
+    const listed = json.array(value orelse return null) orelse return null;
+    for (listed.items) |item| {
+        const object = json.object(item) orelse continue;
+        const threshold = positive(object.get("min_prompt_tokens")) orelse continue;
+        return .{
+            .prompt_tokens_min = threshold,
+            .input = rate(object.get("prompt")) orelse standard.input,
+            .output = rate(object.get("completion")) orelse standard.output,
+            .cache_read = rate(object.get("input_cache_read")) orelse standard.cache_read,
+            .cache_write = rate(object.get("input_cache_write")) orelse standard.cache_write,
+        };
+    }
+    return null;
 }
 
 /// One rate, which arrives as a decimal string of dollars per token. The guard
@@ -421,11 +443,22 @@ const sample =
     \\  { "id": "openai/gpt-5.6-sol:batch", "context_length": 1050000,
     \\    "pricing": { "prompt": "0.000001", "completion": "0.000005" } },
     \\  { "id": "google/gemini-3.7-flash", "context_length": 1048576,
-    \\    "pricing": { "prompt": "0.0000004", "completion": "0.000002" },
+    \\    "pricing": { "prompt": "0.0000004", "completion": "0.000002",
+    \\                 "input_cache_read": "0.0000001", "input_cache_write": "0.000001",
+    \\                 "overrides": [
+    \\                   { "utc_days": ["saturday", "sunday"],
+    \\                     "prompt": "0.0000002", "completion": "0.000001" },
+    \\                   { "min_prompt_tokens": 200000,
+    \\                     "prompt": "0.0000008", "completion": "0.000004",
+    \\                     "input_cache_read": "0.0000002" } ] },
     \\    "reasoning": { "supported_efforts": ["high", "medium", "low", "minimal"] } },
     \\  { "id": "x-ai/grok-4.6", "context_length": 500000,
     \\    "pricing": { "prompt": "0.000002", "completion": "0.000006",
-    \\                 "input_cache_read": "0.0000005" },
+    \\                 "input_cache_read": "0.0000005",
+    \\                 "overrides": [
+    \\                   { "min_prompt_tokens": 200000,
+    \\                     "prompt": "0.000004", "completion": "0.000012",
+    \\                     "input_cache_read": "0.000001" } ] },
     \\    "reasoning": { "mandatory": true,
     \\                   "supported_efforts": ["xhigh", "high", "medium", "low"] } },
     \\  { "id": "mistralai/mistral-large", "context_length": 128000,
@@ -455,6 +488,13 @@ test parse {
     try std.testing.expectEqual(@as(?u64, 500_000), grok.context_window);
     try std.testing.expectEqual(@as(f64, 2), grok.price.?.input);
     try std.testing.expectEqual(@as(f64, 0.5), grok.price.?.cache_read);
+    // The override that names a threshold states the long-context tier.
+    const grok_tier = grok.price.?.long_context.?;
+    try std.testing.expectEqual(@as(u64, 200_000), grok_tier.prompt_tokens_min);
+    try std.testing.expectEqual(@as(f64, 4), grok_tier.input);
+    try std.testing.expectEqual(@as(f64, 12), grok_tier.output);
+    try std.testing.expectEqual(@as(f64, 1), grok_tier.cache_read);
+    try std.testing.expectEqual(@as(f64, 0), grok_tier.cache_write);
     try std.testing.expect(grok.offers(.xhigh));
     try std.testing.expectEqual(llm.Effort.xhigh, grok.reasoning(.max).named);
     try std.testing.expect(metadata.lookup(.openai, "grok-4.6") == null);
@@ -464,6 +504,14 @@ test parse {
     const gemini = metadata.lookup(.google, "gemini-3.7-flash").?;
     try std.testing.expectEqual(@as(?u64, 1_048_576), gemini.context_window);
     try std.testing.expectApproxEqAbs(@as(f64, 0.4), gemini.price.?.input, 1e-9);
+    // A time-window override is not a tier, so the threshold override behind it
+    // states the tier. A kind the tier omits keeps the rate of the entry.
+    const gemini_tier = gemini.price.?.long_context.?;
+    try std.testing.expectEqual(@as(u64, 200_000), gemini_tier.prompt_tokens_min);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.8), gemini_tier.input, 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 4), gemini_tier.output, 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.2), gemini_tier.cache_read, 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 1), gemini_tier.cache_write, 1e-9);
     try std.testing.expect(gemini.offers(.medium));
     try std.testing.expect(!gemini.offers(.max));
     try std.testing.expect(metadata.lookup(.anthropic, "gemini-3.7-flash") == null);
@@ -476,6 +524,8 @@ test parse {
     try std.testing.expectEqual(@as(f64, 0.5), opus.price.?.cache_read);
     // The 5-minute write rate wins, because Drinky writes no 1-hour entry.
     try std.testing.expectEqual(@as(f64, 6.25), opus.price.?.cache_write);
+    // An entry without a threshold override bills every prompt at one rate.
+    try std.testing.expect(opus.price.?.long_context == null);
     try std.testing.expectEqual(Model.Thinking.supported, opus.thinking);
     try std.testing.expect(opus.offers(.max));
     // A model with a price but no cache rates charges nothing for a cache hit.
@@ -532,7 +582,13 @@ test "a bad number states no value rather than a wrong one" {
         \\    "pricing": { "prompt": "-0.1", "completion": "0.1" } },
         \\  { "id": "anthropic/unpriced", "context_length": 10, "pricing": {} },
         \\  { "id": "anthropic/huge", "context_length": 10,
-        \\    "pricing": { "prompt": "1e303", "completion": "0.1" } }
+        \\    "pricing": { "prompt": "1e303", "completion": "0.1" } },
+        \\  { "id": "anthropic/bad-tier", "context_length": 10,
+        \\    "pricing": { "prompt": "0.000001", "completion": "0.000005",
+        \\                 "overrides": [ "not-an-object",
+        \\                                { "min_prompt_tokens": 0, "prompt": "0.000002" },
+        \\                                { "min_prompt_tokens": "200000", "prompt": "0.000002" },
+        \\                                { "utc_days": ["sunday"], "prompt": "0.000002" } ] } }
         \\] }
     );
     defer metadata.deinit();
@@ -545,6 +601,11 @@ test "a bad number states no value rather than a wrong one" {
     // A rate that the scale takes past the range of the type states no value,
     // because an infinite number prints as a cost and writes as invalid JSON.
     try std.testing.expect(metadata.lookup(.anthropic, "huge").?.price == null);
+    // A threshold that is not a positive count names no tier, and the standard
+    // price stands.
+    const bad_tier = metadata.lookup(.anthropic, "bad-tier").?;
+    try std.testing.expectEqual(@as(f64, 1), bad_tier.price.?.input);
+    try std.testing.expect(bad_tier.price.?.long_context == null);
 }
 
 test "parse bounds the entry count" {

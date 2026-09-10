@@ -611,7 +611,7 @@ fn writeUsd(out: *std.Io.Writer, amount: f64) !void {
 /// part goes rather than show a 0/0 rate.
 fn writeCache(line: *Line, info: *const Info) !void {
     const usage = &info.cache_usage;
-    const prompt = usage.input +| usage.cache_read +| usage.cache_write;
+    const prompt = usage.prompt();
     if (prompt == 0) return;
     const hit = asFloat(usage.cache_read) / asFloat(prompt) * 100.0;
     try line.out.print("{s}Cache: {d:.0}%", .{ separator, hit });

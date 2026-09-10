@@ -113,8 +113,9 @@ service account key file.
   while signed out, and the next sign-in adopts the level.
 - The session cost counts every attempt, a canceled or rejected one included. A reply that reports
   its charge, as OpenRouter does, adds that charge, and every other reply adds its usage at public
-  rates. Every cost figure reads `~$0.42`, and the tilde marks the estimate. A positive total under
-  one cent reads `~$0.01`.
+  rates. A prompt that reaches the long-context threshold of its model bills the whole request at
+  the long-context rates. Every cost figure reads `~$0.42`, and the tilde marks the estimate. A
+  positive total under one cent reads `~$0.01`.
 
 ## Accounts
 

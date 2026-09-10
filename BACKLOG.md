@@ -30,15 +30,6 @@ extension seams.
 
 ## Improvements
 
-- **Bill a long prompt at the long-context rate** — the session cost applies the long-context rates
-  of a model to a request whose prompt reaches the threshold of that model. _The rates come from
-  `pricing.overrides` of the public metadata entry. Take the override that names
-  `min_prompt_tokens`, because another override can name a time window instead. Such an override
-  states its own rate per token kind, and an omitted kind keeps the rate of the entry. The threshold
-  is 200k tokens for xAI, Gemini Pro, and Claude Sonnet, and 272k for OpenAI. A vendor bills every
-  token of such a request at the higher rate. The xAI list states the same threshold as
-  `long_context_threshold`, and Drinky reads that list for the id and the aliases alone, so the
-  public metadata stays the one price source._
 - **Show a model that no source describes** — such a model takes a disabled picker row that names
   what it lacks, and its selection opens the hint for the config key. _`Catalog.merge` returns null
   and the caller drops the model today, so it leaves the picker with no line. A picker row carries
